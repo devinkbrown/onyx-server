@@ -8,6 +8,7 @@
 const std = @import("std");
 const authority = @import("durable_oper_authority.zig");
 const store_mod = @import("store.zig");
+const os_runtime = @import("os_runtime.zig");
 
 const StorePutError = @typeInfo(@typeInfo(@TypeOf(store_mod.OroStore.put)).@"fn".return_type.?).error_union.error_set;
 
@@ -147,4 +148,37 @@ test "OCG2AUTH boot rejects corrupt marker and snapshot plus undersized stores" 
     var small = try store_mod.OroStore.openWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "ocg2auth-small.wal", too_small);
     defer small.deinit();
     try std.testing.expectError(error.StorageRecordLimitTooSmall, load(std.testing.allocator, &small, config));
+}
+
+test "Windows OCG2AUTH cold boot and restart preserve private durable authority" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(std.testing.io);
+    const config = try testConfig(0x94);
+    const wrong = try testConfig(0x95);
+    {
+        var store = try store_mod.OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/ocg2.wal", accepted_storage);
+        defer store.deinit();
+        var initialized = try initialize(std.testing.allocator, &store, config);
+        defer initialized.deinit();
+        try std.testing.expectEqual(@as(usize, 0), initialized.count());
+        try store.snapshotAndTruncate();
+    }
+    {
+        var store = try store_mod.OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/ocg2.wal", accepted_storage);
+        defer store.deinit();
+        var restored = try load(std.testing.allocator, &store, config);
+        defer restored.deinit();
+        try std.testing.expectEqual(@as(usize, 0), restored.count());
+        try std.testing.expectError(error.InvalidAuthority, load(std.testing.allocator, &store, wrong));
+        try store.delete(.props, authority.snapshot_key);
+    }
+    {
+        var store = try store_mod.OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/ocg2.wal", accepted_storage);
+        defer store.deinit();
+        try std.testing.expectError(error.MissingSnapshot, load(std.testing.allocator, &store, config));
+        try std.testing.expectError(error.PartialInitialization, initialize(std.testing.allocator, &store, config));
+    }
 }

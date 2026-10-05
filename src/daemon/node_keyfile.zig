@@ -6,7 +6,7 @@
 //! When the operator configures no `[node] secret_key`, the daemon still turns
 //! the PQ-secured Mooring mesh on: it loads the 32-byte Ed25519 seed from a
 //! keyfile next to the config (`onyx-server-node.key`), generating a fresh random
-//! seed and persisting it (owner-only, 0600) on first boot. An explicitly
+//! seed and persisting it (owner-only) on first boot. An explicitly
 //! configured `secret_key` always wins and never touches the keyfile.
 //!
 //! The keyfile body is the same format as the config value: 64 lowercase hex
@@ -14,7 +14,9 @@
 //! regenerating would change the node's mesh identity behind the operator's
 //! back and orphan every TOFU pin peers hold for it.
 const std = @import("std");
+const builtin = @import("builtin");
 const node_identity = @import("node_identity.zig");
+const os_runtime = @import("os_runtime.zig");
 
 pub const seed_len = 32;
 pub const hex_len = seed_len * 2;
@@ -26,7 +28,7 @@ pub const default_basename = "onyx-server-node.key";
 /// Largest keyfile we will read: the hex seed plus generous whitespace slack.
 const max_keyfile_bytes = 4096;
 
-/// Owner-only on platforms with POSIX modes; elsewhere the platform default.
+/// Owner-only on platforms with POSIX modes. Windows uses a protected DACL.
 const key_permissions: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
     .fromMode(0o600)
 else
@@ -68,15 +70,15 @@ pub fn parseSeedHex(text: []const u8) ParseError![seed_len]u8 {
 }
 
 /// Load the seed from `path` under `dir`, or generate a fresh random seed and
-/// persist it (0600). A corrupt keyfile is an error so a node never silently
-/// changes identity; the operator must remove or fix the file.
+/// persist it with owner-only access. A corrupt keyfile is an error so a node
+/// never silently changes identity; the operator must remove or fix the file.
 pub fn loadOrCreate(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     path: []const u8,
 ) !LoadResult {
-    if (readSeed(allocator, io, dir, path)) |seed| {
+    if (readSeed(allocator, io, dir, path, .remediate)) |seed| {
         return .{ .seed = seed, .source = .loaded };
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -88,7 +90,7 @@ pub fn loadOrCreate(
     writeSeed(io, dir, path, seed) catch |err| switch (err) {
         // Lost a create race against a concurrent boot: trust whoever won.
         error.PathAlreadyExists => return .{
-            .seed = try readSeed(allocator, io, dir, path),
+            .seed = try readSeed(allocator, io, dir, path, .remediate),
             .source = .loaded,
         },
         else => return err,
@@ -99,13 +101,14 @@ pub fn loadOrCreate(
 /// Read an already-provisioned keyfile without creating or mutating anything.
 /// Deployment preflight uses this path so `--check-config` cannot report an
 /// activation plan as safe when normal boot would load a different identity.
+/// Windows preflight rejects a permissive ACL without changing it.
 pub fn loadExisting(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     path: []const u8,
 ) ![seed_len]u8 {
-    return readSeed(allocator, io, dir, path);
+    return readSeed(allocator, io, dir, path, .verify_only);
 }
 
 /// Prove that an explicit activation public key belongs to the persisted seed.
@@ -139,13 +142,39 @@ pub fn validateExistingPublicKey(
         return error.PublicKeyMismatch;
 }
 
-fn readSeed(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) ![seed_len]u8 {
-    const text = try dir.readFileAlloc(io, path, allocator, .limited(max_keyfile_bytes));
+const ReadPolicy = enum { verify_only, remediate };
+
+fn readSeed(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, policy: ReadPolicy) ![seed_len]u8 {
+    const text = if (comptime builtin.os.tag == .windows) blk: {
+        var file = try openWindowsSeedForRead(dir, path, policy);
+        defer file.close(io);
+        var reader = file.reader(io, &.{});
+        break :blk reader.interface.allocRemaining(allocator, .limited(max_keyfile_bytes)) catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+            error.OutOfMemory, error.StreamTooLong => |e| return e,
+        };
+    } else try dir.readFileAlloc(io, path, allocator, .limited(max_keyfile_bytes));
     defer {
         std.crypto.secureZero(u8, text);
         allocator.free(text);
     }
     return parseSeedHex(text);
+}
+
+fn openWindowsSeedForRead(dir: std.Io.Dir, path: []const u8, policy: ReadPolicy) !std.Io.File {
+    if (policy == .verify_only) return os_runtime.openExistingPrivateWindows(dir, path, .verify_only);
+    // A concurrent first boot may still hold its exclusive newly created
+    // file while finishing the seed write. Wait briefly for that handoff;
+    // persistent readers or writers still fail closed without any read.
+    var busy_retries: u8 = 0;
+    while (true) {
+        return os_runtime.openExistingPrivateWindows(dir, path, .remediate) catch |err| {
+            if (err != error.FileBusy or busy_retries == 20) return err;
+            busy_retries += 1;
+            os_runtime.sleepMillis(10);
+            continue;
+        };
+    }
 }
 
 fn writeSeed(io: std.Io, dir: std.Io.Dir, path: []const u8, seed: [seed_len]u8) !void {
@@ -158,10 +187,12 @@ fn writeSeed(io: std.Io, dir: std.Io.Dir, path: []const u8, seed: [seed_len]u8) 
     }
     line[hex_len] = '\n';
 
-    // `exclusive` so an existing keyfile is never clobbered (the FileNotFound
-    // probe above and this create are not atomic together); 0600 so the seed
-    // is owner-readable only.
-    var file = try dir.createFile(io, path, .{ .exclusive = true, .permissions = key_permissions });
+    // The native Windows create attaches a protected DACL atomically. Both
+    // paths create exclusively so a concurrent boot cannot clobber its seed.
+    var file = if (comptime builtin.os.tag == .windows)
+        try os_runtime.createPrivateExclusiveWindows(dir, path)
+    else
+        try dir.createFile(io, path, .{ .exclusive = true, .permissions = key_permissions });
     defer file.close(io);
     try file.writeStreamingAll(io, &line);
     try file.sync(io);
@@ -243,6 +274,24 @@ test "loadOrCreate refuses to clobber a corrupt keyfile" {
     try testing.expectEqualStrings("not a seed\n", text);
 }
 
+test "Windows node keyfile create collision leaves the persisted identity untouched" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const winner: [seed_len]u8 = @splat(0x42);
+    try writeSeed(testing.io, tmp.dir, default_basename, winner);
+    try testing.expectError(error.PathAlreadyExists, writeSeed(testing.io, tmp.dir, default_basename, @splat(0xa5)));
+
+    const loaded = try loadOrCreate(testing.allocator, testing.io, tmp.dir, default_basename);
+    try testing.expectEqual(Source.loaded, loaded.source);
+    try testing.expectEqual(winner, loaded.seed);
+    const text = try tmp.dir.readFileAlloc(testing.io, default_basename, testing.allocator, .limited(max_keyfile_bytes));
+    defer testing.allocator.free(text);
+    try testing.expectEqual(@as(usize, hex_len + 1), text.len);
+    try testing.expectEqual(winner, try parseSeedHex(text));
+}
+
 test "activation preflight binds public key to an existing persisted seed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -264,11 +313,7 @@ test "activation preflight binds public key to an existing persisted seed" {
         ),
     );
 
-    var seed_line: [hex_len + 1]u8 = undefined;
-    const seed_hex = std.fmt.bytesToHex(seed, .lower);
-    @memcpy(seed_line[0..hex_len], &seed_hex);
-    seed_line[hex_len] = '\n';
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = default_basename, .data = &seed_line });
+    try writeSeed(testing.io, tmp.dir, default_basename, seed);
 
     try validateExistingPublicKey(
         testing.allocator,

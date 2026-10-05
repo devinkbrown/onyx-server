@@ -25,14 +25,63 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const native_windows_socket = @import("helix/native_windows_socket.zig");
 pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 
 const sys = std.posix.system;
 const posix = std.posix;
+const Socket = if (builtin.os.tag == .windows) usize else sys.fd_t;
+
+const invalid_windows_socket = std.math.maxInt(usize);
+const windows_af_inet: i32 = 2;
+const windows_sock_stream: i32 = 1;
+const windows_ipproto_tcp: i32 = 6;
+const windows_sol_socket: i32 = 0xffff;
+const windows_so_type: i32 = 0x1008;
+const windows_so_acceptconn: i32 = 0x0002;
+const windows_so_rcvtimeo: i32 = 0x1006;
+const windows_so_sndtimeo: i32 = 0x1005;
+const windows_so_exclusiveaddruse: i32 = -5;
+const windows_fionbio: u32 = 0x8004667e;
+const windows_would_block: i32 = 10035;
+const windows_interrupted: i32 = 10004;
+const windows_conn_aborted: i32 = 10053;
+
+const WindowsSockAddr4 = extern struct {
+    family: u16,
+    port: u16,
+    addr: u32,
+    zero: [8]u8,
+};
+const WindowsFdSet = extern struct {
+    count: u32,
+    pad: u32 = 0,
+    array: [64]usize = @splat(0),
+};
+const WindowsTimeval = extern struct { sec: i32, usec: i32 };
+
+extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+extern "ws2_32" fn WSASocketW(address_family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+extern "ws2_32" fn bind(socket: usize, addr: *const WindowsSockAddr4, namelen: i32) callconv(.winapi) i32;
+extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+extern "ws2_32" fn getsockname(socket: usize, addr: *WindowsSockAddr4, namelen: *i32) callconv(.winapi) i32;
+extern "ws2_32" fn connect(socket: usize, addr: *const WindowsSockAddr4, namelen: i32) callconv(.winapi) i32;
+extern "ws2_32" fn accept(socket: usize, addr: ?*anyopaque, namelen: ?*i32) callconv(.winapi) usize;
+extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+extern "ws2_32" fn getsockopt(socket: usize, level: i32, name: i32, value: *anyopaque, len: *i32) callconv(.winapi) i32;
+extern "ws2_32" fn setsockopt(socket: usize, level: i32, name: i32, value: *const anyopaque, len: i32) callconv(.winapi) i32;
+extern "ws2_32" fn select(nfds: i32, readfds: ?*WindowsFdSet, writefds: ?*WindowsFdSet, exceptfds: ?*WindowsFdSet, timeout: ?*WindowsTimeval) callconv(.winapi) i32;
+extern "ws2_32" fn recv(socket: usize, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+extern "ws2_32" fn send(socket: usize, buf: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
 
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("metrics_http requires a 64-bit target");
+    if (@sizeOf(WindowsSockAddr4) != 16 or @sizeOf(WindowsFdSet) != 520 or @sizeOf(WindowsTimeval) != 8)
+        @compileError("metrics_http Winsock ABI layout mismatch");
 }
 
 /// Prometheus text format version served in the Content-Type header.
@@ -219,12 +268,13 @@ pub const Config = struct {
 
 pub const MetricsServer = struct {
     snapshot: *MetricsSnapshot,
-    listen_fd: sys.fd_t,
+    listen_fd: Socket,
     port: u16,
     thread: ?std.Thread = null,
     runtime: runtime_pause.WorkerState = .{},
     config: Config = .{},
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
+    windows_wsa_started: bool = false,
     /// Per-connection read timeout (seconds); read by the accept loop.
     conn_read_timeout_sec: u32 = default_conn_read_timeout_sec,
 
@@ -237,40 +287,44 @@ pub const MetricsServer = struct {
     /// Like `init`, but with explicit tunables (including a non-loopback bind).
     /// The returned value must live at a stable address for the thread's lifetime.
     pub fn initWithConfig(snapshot: *MetricsSnapshot, port: u16, config: Config) ListenerError!MetricsServer {
-        const fd = try socketTcp();
-        errdefer closeFd(fd);
+        if (comptime builtin.os.tag == .windows) {
+            return initWithConfigWindows(snapshot, port, config);
+        } else {
+            const fd = try socketTcp();
+            errdefer closeFd(fd);
 
-        var yes: u32 = 1;
-        _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
+            var yes: u32 = 1;
+            _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
 
-        var addr = sys.sockaddr.in{
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = std.mem.nativeToBig(u32, config.bind_addr),
-        };
-        if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS)
-            return error.BindFailed;
-        if (posix.errno(sys.listen(fd, config.listen_backlog)) != .SUCCESS)
-            return error.ListenFailed;
-        setListenerNonblocking(fd) catch return error.ListenFailed;
+            var addr = sys.sockaddr.in{
+                .port = std.mem.nativeToBig(u16, port),
+                .addr = std.mem.nativeToBig(u32, config.bind_addr),
+            };
+            if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in))) != .SUCCESS)
+                return error.BindFailed;
+            if (posix.errno(sys.listen(fd, config.listen_backlog)) != .SUCCESS)
+                return error.ListenFailed;
+            setListenerNonblocking(fd) catch return error.ListenFailed;
 
-        // Receive timeout so a blocked accept4 wakes periodically to re-check the
-        // stop flag (closing the listener from another thread does NOT reliably
-        // wake accept4).
-        const poll_ms = normalizedConfig(config).accept_poll_ms;
-        const tv = sys.timeval{
-            .sec = @intCast(poll_ms / 1000),
-            .usec = @intCast((poll_ms % 1000) * 1000),
-        };
-        const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
-        if (posix.errno(timeout_rc) != .SUCCESS) return error.TimeoutSetupFailed;
+            // Receive timeout so a blocked accept4 wakes periodically to re-check the
+            // stop flag (closing the listener from another thread does NOT reliably
+            // wake accept4).
+            const poll_ms = normalizedConfig(config).accept_poll_ms;
+            const tv = sys.timeval{
+                .sec = @intCast(poll_ms / 1000),
+                .usec = @intCast((poll_ms % 1000) * 1000),
+            };
+            const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+            if (posix.errno(timeout_rc) != .SUCCESS) return error.TimeoutSetupFailed;
 
-        return .{
-            .snapshot = snapshot,
-            .listen_fd = fd,
-            .port = try boundPort(fd),
-            .conn_read_timeout_sec = @max(config.conn_read_timeout_sec, 1),
-            .config = normalizedConfig(config),
-        };
+            return .{
+                .snapshot = snapshot,
+                .listen_fd = fd,
+                .port = try boundPort(fd),
+                .conn_read_timeout_sec = @max(config.conn_read_timeout_sec, 1),
+                .config = normalizedConfig(config),
+            };
+        }
     }
 
     pub fn prepareColdResources(self: *MetricsServer, io: std.Io) !void {
@@ -333,13 +387,40 @@ pub const MetricsServer = struct {
     }
     /// Consumes a received duplicate on entry. Every error closes only this
     /// reference. No status flags, options or shared socket state are changed.
-    pub fn initInherited(snapshot: *MetricsSnapshot, fd: sys.fd_t, carry: *const Snapshot, config: Config, max_bytes: usize) !MetricsServer {
+    pub fn initInherited(snapshot: *MetricsSnapshot, fd: Socket, carry: *const Snapshot, config: Config, max_bytes: usize) !MetricsServer {
         errdefer closeFd(fd);
+        // A raw SOCKET value cannot establish custody across Windows processes;
+        // initTransferred consumes the authenticated transfer instead.
+        if (comptime builtin.os.tag == .windows) return error.Unsupported;
         try carry.validate(config, max_bytes);
         const observed = try observeListener(fd);
         if (!std.meta.eql(observed, carry.listener)) return error.ListenerMismatch;
         try snapshot.set(carry.text);
         return .{ .snapshot = snapshot, .listen_fd = fd, .port = observed.port, .conn_read_timeout_sec = carry.config.conn_read_timeout_sec, .config = carry.config };
+    }
+
+    /// Import a one-use WSADuplicateSocket transfer delivered by the authenticated
+    /// Helix control path. That path must bind this transfer to `carry`. The new
+    /// SOCKET value is process-local, so validate every other observed field.
+    pub fn initTransferred(snapshot: *MetricsSnapshot, transfer: *native_windows_socket.Transfer, carry: *const Snapshot, config: Config, max_bytes: usize) !MetricsServer {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        var startup: [408]u8 align(8) = @splat(0);
+        if (WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+        errdefer _ = WSACleanup();
+        const fd = try transfer.import();
+        errdefer closeFd(fd);
+        try carry.validate(config, max_bytes);
+        const observed = try observeListener(fd);
+        if (!transferredListenerMatches(carry.listener, observed)) return error.ListenerMismatch;
+        try snapshot.set(carry.text);
+        return .{
+            .snapshot = snapshot,
+            .listen_fd = fd,
+            .port = observed.port,
+            .conn_read_timeout_sec = carry.config.conn_read_timeout_sec,
+            .config = carry.config,
+            .windows_wsa_started = true,
+        };
     }
 
     /// Spawn the background accept loop.
@@ -357,10 +438,12 @@ pub const MetricsServer = struct {
             t.join();
             self.thread = null;
         }
-        // This listener never opens on Windows (plaintext PortableServer
-        // only); gate at comptime so `refAllDecls` test builds compile.
-        // Byte-identical elsewhere.
-        if (comptime builtin.os.tag != .windows) {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.listen_fd != invalid_windows_socket) closeFd(self.listen_fd);
+            self.listen_fd = invalid_windows_socket;
+            if (self.windows_wsa_started) _ = WSACleanup();
+            self.windows_wsa_started = false;
+        } else {
             if (self.listen_fd >= 0) closeFd(self.listen_fd);
             self.listen_fd = -1;
         }
@@ -372,41 +455,64 @@ pub const MetricsServer = struct {
         while (!self.stop_flag.load(.acquire)) {
             self.runtime.pause.boundary();
             if (self.stop_flag.load(.acquire)) break;
-            const rc = acceptSocket(self.listen_fd);
-            switch (posix.errno(rc)) {
-                .SUCCESS => self.serveConn(@intCast(rc)),
-                .AGAIN, .INTR, .CONNABORTED => continue, // timeout/interrupt: re-check stop flag
-                else => return, // listener closed (shutdown) or fatal: exit thread
+            if (comptime builtin.os.tag == .windows) {
+                const accepted_socket = acceptSocketWindows(self.listen_fd, self.config.accept_poll_ms) catch |err| switch (err) {
+                    error.WouldBlock => continue,
+                    error.SocketFailed => return,
+                };
+                self.serveConn(accepted_socket);
+            } else {
+                const rc = acceptSocket(self.listen_fd);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => self.serveConn(@intCast(rc)),
+                    .AGAIN, .INTR, .CONNABORTED => continue, // timeout/interrupt: re-check stop flag
+                    else => return, // listener closed (shutdown) or fatal: exit thread
+                }
             }
         }
     }
 
-    fn serveConn(self: *MetricsServer, fd: sys.fd_t) void {
+    fn serveConn(self: *MetricsServer, fd: Socket) void {
         defer closeFd(fd);
         const clock = @import("../substrate/platform.zig");
         const deadline = clock.monotonicMillis() + @as(i64, self.conn_read_timeout_sec) * 1000;
-        // Accepted sockets do not inherit the listener's timeout; cap the read so
-        // a silent/slow client cannot stall the single-threaded accept loop.
-        const tv = sys.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
-        const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
-        if (posix.errno(timeout_rc) != .SUCCESS or posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval))) != .SUCCESS) return;
-
         var req_buf: [max_request]u8 = undefined;
-        var rc: if (builtin.os.tag == .linux) usize else isize = undefined;
-        while (true) {
-            const remaining = deadline - clock.monotonicMillis();
-            if (self.stop_flag.load(.acquire) or remaining <= 0) return;
-            var polls = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-            const ready = sys.poll(&polls, 1, @intCast(@min(remaining, 50)));
-            if (posix.errno(ready) == .INTR) continue;
-            if (posix.errno(ready) != .SUCCESS) return;
-            if (ready == 0) continue;
-            rc = sys.recvfrom(fd, &req_buf, req_buf.len, posix.MSG.DONTWAIT, null, null);
-            if (posix.errno(rc) == .INTR or posix.errno(rc) == .AGAIN) continue;
-            if (posix.errno(rc) != .SUCCESS) return;
-            break;
-        }
-        const n: usize = @intCast(rc);
+        const n: usize = if (comptime builtin.os.tag == .windows) blk: {
+            const timeout_ms = std.math.mul(u32, self.conn_read_timeout_sec, 1000) catch std.math.maxInt(u32);
+            if (!setWindowsTimeout(fd, windows_so_rcvtimeo, timeout_ms) or
+                !setWindowsTimeout(fd, windows_so_sndtimeo, timeout_ms)) return;
+            while (true) {
+                const remaining = deadline - clock.monotonicMillis();
+                if (self.stop_flag.load(.acquire) or remaining <= 0) return;
+                const ready = waitSocketWindows(fd, false, @intCast(@min(remaining, 50))) catch return;
+                if (!ready) continue;
+                const received = recv(fd, &req_buf, req_buf.len, 0);
+                if (received >= 0) break :blk @intCast(received);
+                const socket_error = WSAGetLastError();
+                if (socket_error != windows_interrupted and socket_error != windows_would_block) return;
+            }
+        } else blk: {
+            // Accepted sockets do not inherit the listener's timeout; cap the read so
+            // a silent/slow client cannot stall the single-threaded accept loop.
+            const tv = sys.timeval{ .sec = @intCast(self.conn_read_timeout_sec), .usec = 0 };
+            const timeout_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval));
+            if (posix.errno(timeout_rc) != .SUCCESS or posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(sys.timeval))) != .SUCCESS) return;
+            var rc: if (builtin.os.tag == .linux) usize else isize = undefined;
+            while (true) {
+                const remaining = deadline - clock.monotonicMillis();
+                if (self.stop_flag.load(.acquire) or remaining <= 0) return;
+                var polls = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+                const ready = sys.poll(&polls, 1, @intCast(@min(remaining, 50)));
+                if (posix.errno(ready) == .INTR) continue;
+                if (posix.errno(ready) != .SUCCESS) return;
+                if (ready == 0) continue;
+                rc = sys.recvfrom(fd, &req_buf, req_buf.len, posix.MSG.DONTWAIT, null, null);
+                if (posix.errno(rc) == .INTR or posix.errno(rc) == .AGAIN) continue;
+                if (posix.errno(rc) != .SUCCESS) return;
+                break;
+            }
+            break :blk @intCast(rc);
+        };
         if (n == 0) return;
 
         // Response buffer: header + the full Prometheus body. Sized generously so
@@ -419,7 +525,7 @@ pub const MetricsServer = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Low-level helpers (raw linux syscalls), mirroring acme_http01_listener.
+// Low-level socket helpers, mirroring acme_http01_listener.
 // ---------------------------------------------------------------------------
 
 /// Blocking acquire on the tryLock-only `std.atomic.Mutex`. Contention is
@@ -427,6 +533,76 @@ pub const MetricsServer = struct {
 /// fine.
 fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.Thread.yield() catch {};
+}
+
+fn initWithConfigWindows(snapshot: *MetricsSnapshot, port: u16, config: Config) ListenerError!MetricsServer {
+    if (comptime builtin.os.tag != .windows) unreachable;
+    var startup: [408]u8 align(8) = @splat(0);
+    if (WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+    errdefer _ = WSACleanup();
+    const socket_handle = WSASocketW(windows_af_inet, windows_sock_stream, windows_ipproto_tcp, null, 0, 1);
+    if (socket_handle == invalid_windows_socket) return error.SocketUnavailable;
+    errdefer _ = closesocket(socket_handle);
+
+    // Unlike SO_REUSEADDR, this prevents a second Windows listener from
+    // taking over an address the metrics endpoint already owns.
+    const exclusive: u32 = 1;
+    if (setsockopt(socket_handle, windows_sol_socket, windows_so_exclusiveaddruse, &exclusive, @sizeOf(u32)) != 0)
+        return error.BindFailed;
+    const addr = WindowsSockAddr4{
+        .family = @intCast(windows_af_inet),
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, config.bind_addr),
+        .zero = @splat(0),
+    };
+    if (bind(socket_handle, &addr, @sizeOf(WindowsSockAddr4)) != 0) return error.BindFailed;
+    if (listen(socket_handle, @intCast(config.listen_backlog)) != 0) return error.ListenFailed;
+    var nonblocking: u32 = 1;
+    if (ioctlsocket(socket_handle, windows_fionbio, &nonblocking) != 0) return error.ListenFailed;
+    const normalized = normalizedConfig(config);
+    if (!setWindowsTimeout(socket_handle, windows_so_rcvtimeo, normalized.accept_poll_ms))
+        return error.TimeoutSetupFailed;
+    return .{
+        .snapshot = snapshot,
+        .listen_fd = socket_handle,
+        .port = try boundPort(socket_handle),
+        .conn_read_timeout_sec = normalized.conn_read_timeout_sec,
+        .config = normalized,
+        .windows_wsa_started = true,
+    };
+}
+
+fn setWindowsTimeout(socket_handle: usize, option: i32, millis: u32) bool {
+    const value = millis;
+    return setsockopt(socket_handle, windows_sol_socket, option, &value, @sizeOf(u32)) == 0;
+}
+
+fn waitSocketWindows(socket_handle: usize, writable: bool, timeout_ms: u32) error{SocketFailed}!bool {
+    var descriptors = WindowsFdSet{ .count = 1 };
+    descriptors.array[0] = socket_handle;
+    var timeout = WindowsTimeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    const ready = if (writable)
+        select(0, null, &descriptors, null, &timeout)
+    else
+        select(0, &descriptors, null, null, &timeout);
+    if (ready < 0) {
+        if (WSAGetLastError() == windows_interrupted) return false;
+        return error.SocketFailed;
+    }
+    return ready > 0;
+}
+
+fn acceptSocketWindows(socket_handle: usize, timeout_ms: u32) error{ WouldBlock, SocketFailed }!usize {
+    if (!try waitSocketWindows(socket_handle, false, timeout_ms)) return error.WouldBlock;
+    const accepted_socket = accept(socket_handle, null, null);
+    if (accepted_socket != invalid_windows_socket) return accepted_socket;
+    return switch (WSAGetLastError()) {
+        windows_would_block, windows_interrupted, windows_conn_aborted => error.WouldBlock,
+        else => error.SocketFailed,
+    };
 }
 
 // BSD accept timeout is explicit: listener SO_RCVTIMEO is configuration,
@@ -466,17 +642,29 @@ fn socketTcp() ListenerError!sys.fd_t {
     };
 }
 
-fn boundPort(fd: sys.fd_t) ListenerError!u16 {
-    var storage: posix.sockaddr.storage = undefined;
-    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    if (posix.errno(sys.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS)
-        return error.AddrLookupFailed;
-    const a: *const sys.sockaddr.in = @ptrCast(@alignCast(&storage));
-    return std.mem.bigToNative(u16, a.port);
+fn boundPort(fd: Socket) ListenerError!u16 {
+    if (comptime builtin.os.tag == .windows) {
+        var addr: WindowsSockAddr4 = undefined;
+        var len: i32 = @sizeOf(WindowsSockAddr4);
+        if (getsockname(fd, &addr, &len) != 0 or len != @sizeOf(WindowsSockAddr4) or addr.family != @as(u16, @intCast(windows_af_inet)))
+            return error.AddrLookupFailed;
+        return std.mem.bigToNative(u16, addr.port);
+    } else {
+        var storage: posix.sockaddr.storage = undefined;
+        var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        if (posix.errno(sys.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS)
+            return error.AddrLookupFailed;
+        const a: *const sys.sockaddr.in = @ptrCast(@alignCast(&storage));
+        return std.mem.bigToNative(u16, a.port);
+    }
 }
 
-fn closeFd(fd: sys.fd_t) void {
-    _ = sys.close(fd);
+fn closeFd(fd: Socket) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = closesocket(fd);
+    } else {
+        _ = sys.close(fd);
+    }
 }
 
 fn writeAll(fd: sys.fd_t, bytes: []const u8) void {
@@ -618,6 +806,122 @@ test "MetricsServer serves the snapshot over loopback" {
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nonyx_metrics_probe 1\n"));
 }
 
+test "MetricsServer native Windows serves observed loopback listener" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var snapshot = MetricsSnapshot.init(testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.set("onyx_metrics_probe 1\n");
+
+    var server = try MetricsServer.init(&snapshot, 0);
+    defer server.shutdown();
+    const observed = try observeListener(server.listen_fd);
+    try testing.expectEqual(@as(u16, 2), observed.family);
+    try testing.expectEqual(server.port, observed.port);
+    try testing.expectEqual(loopback_addr, std.mem.readInt(u32, observed.address[0..4], .big));
+    var cut = try server.captureUnstarted(testing.allocator, 1024 * 1024);
+    defer cut.deinit();
+    try testing.expectEqualDeep(observed, cut.listener);
+    try server.spawn();
+
+    const client = WSASocketW(windows_af_inet, windows_sock_stream, windows_ipproto_tcp, null, 0, 1);
+    try testing.expect(client != invalid_windows_socket);
+    defer closeFd(client);
+    const timeout_ms: u32 = 2000;
+    try testing.expectEqual(@as(i32, 0), setsockopt(client, windows_sol_socket, windows_so_rcvtimeo, &timeout_ms, @sizeOf(u32)));
+    const addr = WindowsSockAddr4{
+        .family = 2,
+        .port = std.mem.nativeToBig(u16, server.port),
+        .addr = std.mem.nativeToBig(u32, loopback_addr),
+        .zero = @splat(0),
+    };
+    try testing.expectEqual(@as(i32, 0), connect(client, &addr, @sizeOf(WindowsSockAddr4)));
+    const request = "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+    try testing.expectEqual(@as(i32, request.len), send(client, request, request.len, 0));
+
+    var buf: [1024]u8 = undefined;
+    var used: usize = 0;
+    while (used < buf.len) {
+        const received = recv(client, buf[used..].ptr, @intCast(buf.len - used), 0);
+        try testing.expect(received >= 0);
+        if (received == 0) break;
+        used += @intCast(received);
+    }
+    const response = buf[0..used];
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, response, 1, "Content-Type: " ++ content_type ++ "\r\n"));
+    try testing.expect(std.mem.endsWith(u8, response, "\r\n\r\nonyx_metrics_probe 1\n"));
+}
+
+test "MetricsServer Windows transferred listener validates custody and survives predecessor shutdown" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var source_text = MetricsSnapshot.init(testing.allocator);
+    defer source_text.deinit();
+    try source_text.set("onyx_metrics_transfer 1\n");
+    var source = try MetricsServer.init(&source_text, 0);
+    var source_open = true;
+    defer if (source_open) source.shutdown();
+    var carry = try source.captureUnstarted(testing.allocator, 1024 * 1024);
+    defer carry.deinit();
+    const original = try observeListener(source.listen_fd);
+    var adopted_text = MetricsSnapshot.init(testing.allocator);
+    defer adopted_text.deinit();
+
+    var wrong_config = Config{};
+    wrong_config.accept_poll_ms += 1;
+    var rejected_config = try native_windows_socket.duplicateForProcess(source.listen_fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.ConfigMismatch, MetricsServer.initTransferred(&adopted_text, &rejected_config, &carry, wrong_config, 1024 * 1024));
+    try testing.expect(rejected_config.consumed);
+    try testing.expectEqualDeep(original, try observeListener(source.listen_fd));
+
+    var other_text = MetricsSnapshot.init(testing.allocator);
+    defer other_text.deinit();
+    var other = try MetricsServer.init(&other_text, 0);
+    defer other.shutdown();
+    var rejected_endpoint = try native_windows_socket.duplicateForProcess(other.listen_fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.ListenerMismatch, MetricsServer.initTransferred(&adopted_text, &rejected_endpoint, &carry, .{}, 1024 * 1024));
+    try testing.expect(rejected_endpoint.consumed);
+    try testing.expectEqualDeep(original, try observeListener(source.listen_fd));
+
+    var rejected_capacity = try native_windows_socket.duplicateForProcess(source.listen_fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.Capacity, MetricsServer.initTransferred(&adopted_text, &rejected_capacity, &carry, .{}, 1));
+    try testing.expect(rejected_capacity.consumed);
+
+    var raw_transfer = try native_windows_socket.duplicateForProcess(source.listen_fd, std.os.windows.GetCurrentProcessId());
+    const raw = try raw_transfer.import();
+    try testing.expectError(error.Unsupported, MetricsServer.initInherited(&adopted_text, raw, &carry, .{}, 1024 * 1024));
+    try testing.expectEqualDeep(original, try observeListener(source.listen_fd));
+
+    var transfer = try native_windows_socket.duplicateForProcess(source.listen_fd, std.os.windows.GetCurrentProcessId());
+    var adopted = try MetricsServer.initTransferred(&adopted_text, &transfer, &carry, .{}, 1024 * 1024);
+    defer adopted.shutdown();
+    try testing.expect(transfer.consumed);
+    try testing.expect(adopted.windows_wsa_started);
+    try testing.expect(adopted.listen_fd != source.listen_fd);
+    try testing.expectEqualDeep(original, try observeListener(source.listen_fd));
+    source.shutdown();
+    source_open = false;
+    try adopted.spawn();
+
+    const client = WSASocketW(windows_af_inet, windows_sock_stream, windows_ipproto_tcp, null, 0, 1);
+    try testing.expect(client != invalid_windows_socket);
+    defer closeFd(client);
+    const timeout_ms: u32 = 2000;
+    try testing.expectEqual(@as(i32, 0), setsockopt(client, windows_sol_socket, windows_so_rcvtimeo, &timeout_ms, @sizeOf(u32)));
+    const addr = WindowsSockAddr4{ .family = 2, .port = std.mem.nativeToBig(u16, adopted.port), .addr = std.mem.nativeToBig(u32, loopback_addr), .zero = @splat(0) };
+    try testing.expectEqual(@as(i32, 0), connect(client, &addr, @sizeOf(WindowsSockAddr4)));
+    const request = "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+    try testing.expectEqual(@as(i32, request.len), send(client, request, request.len, 0));
+    var response: [1024]u8 = undefined;
+    var used: usize = 0;
+    while (used < response.len) {
+        const n = recv(client, response[used..].ptr, @intCast(response.len - used), 0);
+        try testing.expect(n >= 0);
+        if (n == 0) break;
+        used += @intCast(n);
+    }
+    try testing.expect(std.mem.endsWith(u8, response[0..used], "\r\n\r\nonyx_metrics_transfer 1\n"));
+}
+
 test "initWithConfig honors a custom backlog and read timeout" {
     if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var snap = MetricsSnapshot.init(testing.allocator);
@@ -676,6 +980,15 @@ fn validateMetricsEndpoint(observed: ListenerObservation, port: u16, config: Con
         observed.scope_id != 0 or observed.flow_info != 0 or !std.mem.eql(u8, &addr, &observed.address)) return error.ListenerMismatch;
     if (observed.recv_timeout_us == 0 or observed.recv_timeout_us > std.math.maxInt(c_int) * @as(u64, 1000)) return error.InvalidListener;
 }
+fn transferredListenerMatches(captured: ListenerObservation, observed: ListenerObservation) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    // SOCKET numbers are local to their process and differ after WSASocketW
+    // imports the provider's transfer record. Every observable socket property
+    // must still match exactly; the typed transfer is the custody proof.
+    var canonical = observed;
+    canonical.inode = captured.inode;
+    return captured.device == 0 and captured.inode != @as(u64, invalid_windows_socket) and std.meta.eql(captured, canonical);
+}
 fn acceptFailure(err: posix.E) if (builtin.os.tag == .linux) usize else c_int {
     if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @intFromEnum(err))) else {
         sys._errno().* = @intFromEnum(err);
@@ -691,57 +1004,94 @@ fn setListenerNonblocking(fd: posix.fd_t) !void {
 }
 /// Validation-only observation. It is NOT an authenticated same-description
 /// proof; the whole owner joins it to the captured manifest and live predecessor.
-pub fn observeListener(fd: posix.fd_t) !ListenerObservation {
-    // No libc-linked getsockopt on Windows; custody cannot be validated.
-    if (comptime builtin.os.tag == .windows) return error.InvalidListener;
-    var kind: u32 = 0;
-    var len: posix.socklen_t = @sizeOf(u32);
-    if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.TYPE, @ptrCast(&kind), &len)) != .SUCCESS or
-        len != @sizeOf(u32) or kind != posix.SOCK.STREAM) return error.InvalidListener;
-    var accepting: u32 = 0;
-    len = @sizeOf(u32);
-    if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ACCEPTCONN, @ptrCast(&accepting), &len)) != .SUCCESS or
-        len != @sizeOf(u32) or accepting == 0) return error.InvalidListener;
-    const mode = sys.fcntl(fd, posix.F.GETFL, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
-    if (posix.errno(mode) != .SUCCESS) return error.InvalidListener;
-    const flags: posix.O = @bitCast(@as(u32, @intCast(mode)));
-    if (!flags.NONBLOCK) return error.InvalidListener;
-    const fd_flags = sys.fcntl(fd, posix.F.GETFD, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
-    if (posix.errno(fd_flags) != .SUCCESS or (fd_flags & posix.FD_CLOEXEC) == 0) return error.InvalidListener;
-    var timeout: sys.timeval = undefined;
-    len = @sizeOf(sys.timeval);
-    if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&timeout), &len)) != .SUCCESS or
-        len != @sizeOf(sys.timeval) or timeout.sec < 0 or timeout.usec < 0 or timeout.usec >= 1_000_000) return error.InvalidListener;
-    const us = std.math.add(u64, std.math.mul(u64, @intCast(timeout.sec), 1_000_000) catch return error.InvalidListener, @intCast(timeout.usec)) catch return error.InvalidListener;
-    if (us == 0 or us > std.math.maxInt(c_int) * @as(u64, 1000)) return error.InvalidListener;
-    var storage: posix.sockaddr.storage = undefined;
-    len = @sizeOf(posix.sockaddr.storage);
-    if (posix.errno(sys.getsockname(fd, @ptrCast(&storage), &len)) != .SUCCESS) return error.InvalidListener;
-    var result: ListenerObservation = .{ .device = 0, .inode = 0, .family = storage.family, .address = @splat(0), .port = 0, .scope_id = 0, .flow_info = 0, .recv_timeout_us = us };
-    if (storage.family == posix.AF.INET and len == @sizeOf(posix.sockaddr.in)) {
-        const addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&storage));
-        std.mem.writeInt(u32, result.address[0..4], std.mem.bigToNative(u32, addr.addr), .big);
-        result.port = std.mem.bigToNative(u16, addr.port);
-    } else if (storage.family == posix.AF.INET6 and len == @sizeOf(posix.sockaddr.in6)) {
-        const addr: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
-        result.address = addr.addr;
-        result.port = std.mem.bigToNative(u16, addr.port);
-        result.scope_id = addr.scope_id;
-        result.flow_info = addr.flowinfo;
-    } else return error.InvalidListener;
-    if (comptime builtin.os.tag == .linux) {
-        var stat: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
-        if (posix.errno(std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true }, &stat)) != .SUCCESS or
-            !stat.mask.TYPE or !stat.mask.INO or (stat.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.InvalidListener;
-        result.device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor;
-        result.inode = stat.ino;
+pub fn observeListener(fd: anytype) !ListenerObservation {
+    if (comptime builtin.os.tag == .windows) {
+        const socket_handle = std.math.cast(usize, fd) orelse return error.InvalidListener;
+        return observeListenerWindows(socket_handle);
     } else {
-        var stat: posix.Stat = undefined;
-        if (posix.errno(sys.fstat(fd, &stat)) != .SUCCESS or (stat.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.InvalidListener;
-        result.device = statIdentityBits(stat.dev);
-        result.inode = statIdentityBits(stat.ino);
+        var kind: u32 = 0;
+        var len: posix.socklen_t = @sizeOf(u32);
+        if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.TYPE, @ptrCast(&kind), &len)) != .SUCCESS or
+            len != @sizeOf(u32) or kind != posix.SOCK.STREAM) return error.InvalidListener;
+        var accepting: u32 = 0;
+        len = @sizeOf(u32);
+        if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ACCEPTCONN, @ptrCast(&accepting), &len)) != .SUCCESS or
+            len != @sizeOf(u32) or accepting == 0) return error.InvalidListener;
+        const mode = sys.fcntl(fd, posix.F.GETFL, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+        if (posix.errno(mode) != .SUCCESS) return error.InvalidListener;
+        const flags: posix.O = @bitCast(@as(u32, @intCast(mode)));
+        if (!flags.NONBLOCK) return error.InvalidListener;
+        const fd_flags = sys.fcntl(fd, posix.F.GETFD, @as(if (@import("builtin").os.tag == .linux) usize else c_int, 0));
+        if (posix.errno(fd_flags) != .SUCCESS or (fd_flags & posix.FD_CLOEXEC) == 0) return error.InvalidListener;
+        var timeout: sys.timeval = undefined;
+        len = @sizeOf(sys.timeval);
+        if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&timeout), &len)) != .SUCCESS or
+            len != @sizeOf(sys.timeval) or timeout.sec < 0 or timeout.usec < 0 or timeout.usec >= 1_000_000) return error.InvalidListener;
+        const us = std.math.add(u64, std.math.mul(u64, @intCast(timeout.sec), 1_000_000) catch return error.InvalidListener, @intCast(timeout.usec)) catch return error.InvalidListener;
+        if (us == 0 or us > std.math.maxInt(c_int) * @as(u64, 1000)) return error.InvalidListener;
+        var storage: posix.sockaddr.storage = undefined;
+        len = @sizeOf(posix.sockaddr.storage);
+        if (posix.errno(sys.getsockname(fd, @ptrCast(&storage), &len)) != .SUCCESS) return error.InvalidListener;
+        var result: ListenerObservation = .{ .device = 0, .inode = 0, .family = storage.family, .address = @splat(0), .port = 0, .scope_id = 0, .flow_info = 0, .recv_timeout_us = us };
+        if (storage.family == posix.AF.INET and len == @sizeOf(posix.sockaddr.in)) {
+            const addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+            std.mem.writeInt(u32, result.address[0..4], std.mem.bigToNative(u32, addr.addr), .big);
+            result.port = std.mem.bigToNative(u16, addr.port);
+        } else if (storage.family == posix.AF.INET6 and len == @sizeOf(posix.sockaddr.in6)) {
+            const addr: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            result.address = addr.addr;
+            result.port = std.mem.bigToNative(u16, addr.port);
+            result.scope_id = addr.scope_id;
+            result.flow_info = addr.flowinfo;
+        } else return error.InvalidListener;
+        if (comptime builtin.os.tag == .linux) {
+            var stat: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
+            if (posix.errno(std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true }, &stat)) != .SUCCESS or
+                !stat.mask.TYPE or !stat.mask.INO or (stat.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.InvalidListener;
+            result.device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor;
+            result.inode = stat.ino;
+        } else {
+            var stat: posix.Stat = undefined;
+            if (posix.errno(sys.fstat(fd, &stat)) != .SUCCESS or (stat.mode & posix.S.IFMT) != posix.S.IFSOCK) return error.InvalidListener;
+            result.device = statIdentityBits(stat.dev);
+            result.inode = statIdentityBits(stat.ino);
+        }
+        return result;
     }
-    return result;
+}
+
+fn observeListenerWindows(socket_handle: usize) !ListenerObservation {
+    if (socket_handle == invalid_windows_socket) return error.InvalidListener;
+    var kind: i32 = 0;
+    var len: i32 = @sizeOf(i32);
+    if (getsockopt(socket_handle, windows_sol_socket, windows_so_type, &kind, &len) != 0 or
+        len != @sizeOf(i32) or kind != windows_sock_stream) return error.InvalidListener;
+    var accepting: i32 = 0;
+    len = @sizeOf(i32);
+    if (getsockopt(socket_handle, windows_sol_socket, windows_so_acceptconn, &accepting, &len) != 0 or
+        len != @sizeOf(i32) or accepting == 0) return error.InvalidListener;
+    var timeout: u32 = 0;
+    len = @sizeOf(u32);
+    if (getsockopt(socket_handle, windows_sol_socket, windows_so_rcvtimeo, &timeout, &len) != 0 or
+        len != @sizeOf(u32) or timeout == 0 or timeout > @as(u32, std.math.maxInt(c_int))) return error.InvalidListener;
+    var addr: WindowsSockAddr4 = undefined;
+    len = @sizeOf(WindowsSockAddr4);
+    if (getsockname(socket_handle, &addr, &len) != 0 or len != @sizeOf(WindowsSockAddr4) or
+        addr.family != @as(u16, @intCast(windows_af_inet)) or addr.port == 0) return error.InvalidListener;
+    var address: [16]u8 = @splat(0);
+    std.mem.writeInt(u32, address[0..4], std.mem.bigToNative(u32, addr.addr), .big);
+    // This SOCKET value is only a same-process cold-resource identity. A
+    // transferred duplicate has a new value; Transfer provides its custody.
+    return .{
+        .device = 0,
+        .inode = socket_handle,
+        .family = addr.family,
+        .address = address,
+        .port = std.mem.bigToNative(u16, addr.port),
+        .scope_id = 0,
+        .flow_info = 0,
+        .recv_timeout_us = @as(u64, timeout) * 1000,
+    };
 }
 fn statIdentityBits(value: anytype) u64 {
     const U = @Int(.unsigned, @bitSizeOf(@TypeOf(value)));
@@ -826,31 +1176,51 @@ test "companion runtime metrics inherited validation never normalizes shared blo
 }
 
 /// A single whole-operation deadline, not a fresh SO_SNDTIMEO per fragment.
-/// Only nonblocking send/poll is used; neither listener nor accepted FD flags
-/// are changed. The caller retains its exact output until this returns.
-pub fn writeUntil(fd: posix.fd_t, bytes: []const u8, stop: *const std.atomic.Value(bool), deadline_ms: i64) bool {
-    // No libc-linked sendto/poll on Windows; report unwritten (caller retains output).
-    if (comptime builtin.os.tag == .windows) return false;
+/// Only nonblocking send and readiness waits are used; no socket flags are
+/// changed. The caller retains its exact output until this returns.
+pub fn writeUntil(fd: anytype, bytes: []const u8, stop: *const std.atomic.Value(bool), deadline_ms: i64) bool {
     const clock = @import("../substrate/platform.zig");
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const remaining = deadline_ms - clock.monotonicMillis();
-        if (stop.load(.acquire) or remaining <= 0) return false;
-        const rc = sys.sendto(fd, bytes[offset..].ptr, bytes.len - offset, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL, null, 0);
-        switch (posix.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return false;
-                offset += @intCast(rc);
-            },
-            .INTR => continue,
-            .AGAIN => {
-                var polls = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-                const ready = sys.poll(&polls, 1, @intCast(@min(remaining, 50)));
-                if (posix.errno(ready) == .INTR) continue;
-                if (posix.errno(ready) != .SUCCESS or (polls[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0) return false;
-            },
-            else => return false,
+    if (comptime builtin.os.tag == .windows) {
+        const socket_handle = std.math.cast(usize, fd) orelse return false;
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const remaining = deadline_ms - clock.monotonicMillis();
+            if (stop.load(.acquire) or remaining <= 0) return false;
+            const ready = waitSocketWindows(socket_handle, true, @intCast(@min(remaining, 50))) catch return false;
+            if (!ready) continue;
+            const chunk = @min(bytes.len - offset, @as(usize, std.math.maxInt(i32)));
+            const sent = send(socket_handle, bytes[offset..].ptr, @intCast(chunk), 0);
+            if (sent > 0) {
+                offset += @intCast(sent);
+            } else if (sent == 0) {
+                return false;
+            } else {
+                const socket_error = WSAGetLastError();
+                if (socket_error != windows_interrupted and socket_error != windows_would_block) return false;
+            }
         }
+        return true;
+    } else {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const remaining = deadline_ms - clock.monotonicMillis();
+            if (stop.load(.acquire) or remaining <= 0) return false;
+            const rc = sys.sendto(fd, bytes[offset..].ptr, bytes.len - offset, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL, null, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return false;
+                    offset += @intCast(rc);
+                },
+                .INTR => continue,
+                .AGAIN => {
+                    var polls = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                    const ready = sys.poll(&polls, 1, @intCast(@min(remaining, 50)));
+                    if (posix.errno(ready) == .INTR) continue;
+                    if (posix.errno(ready) != .SUCCESS or (polls[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0) return false;
+                },
+                else => return false,
+            }
+        }
+        return true;
     }
-    return true;
 }

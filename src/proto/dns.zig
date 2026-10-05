@@ -789,6 +789,76 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 
+// Native Windows DNS configuration and UDP transport. These are direct Win32
+// ABI declarations; no libc resolver or process-global DNS search path is used.
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const af_unspec: u32 = 0;
+    const af_inet: u16 = 2;
+    const af_inet6: u16 = 23;
+    const sock_dgram: i32 = 2;
+    const ipproto_udp: i32 = 17;
+    const sol_socket: i32 = 0xffff;
+    const so_rcvtimeo: i32 = 0x1006;
+    const so_sndtimeo: i32 = 0x1005;
+    const error_buffer_overflow: u32 = 111;
+    const max_adapter_bytes: usize = 256 * 1024;
+
+    const SocketAddress = extern struct {
+        sockaddr: ?*const anyopaque,
+        length: i32,
+    };
+    const DnsServerAddress = extern struct {
+        length: u32,
+        reserved: u32,
+        next: ?*DnsServerAddress,
+        address: SocketAddress,
+    };
+    const AdapterAddresses = extern struct {
+        length: u32,
+        if_index: u32,
+        next: ?*AdapterAddresses,
+        adapter_name: ?[*:0]const u8,
+        first_unicast: ?*anyopaque,
+        first_anycast: ?*anyopaque,
+        first_multicast: ?*anyopaque,
+        first_dns: ?*DnsServerAddress,
+    };
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: [4]u8,
+        zero: [8]u8 = @splat(0),
+    };
+    const SockAddr6 = extern struct {
+        family: u16,
+        port: u16,
+        flowinfo: u32 = 0,
+        addr: [16]u8,
+        scope_id: u32 = 0,
+    };
+
+    comptime {
+        if (@sizeOf(AdapterAddresses) != 56 or @offsetOf(AdapterAddresses, "first_dns") != 48 or
+            @sizeOf(DnsServerAddress) != 32 or @sizeOf(SockAddr4) != 16 or @sizeOf(SockAddr6) != 28)
+            @compileError("Windows DNS socket ABI shape changed");
+    }
+
+    extern "iphlpapi" fn GetAdaptersAddresses(family: u32, flags: u32, reserved: ?*anyopaque, adapters: ?*AdapterAddresses, size: *u32) callconv(.winapi) u32;
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recvfrom(socket: usize, bytes: [*]u8, length: i32, flags: i32, from: *SockAddr4, from_length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn sendto(socket: usize, bytes: [*]const u8, length: i32, flags: i32, to: *const SockAddr4, to_length: i32) callconv(.winapi) i32;
+};
+
 pub const max_nameservers: usize = 4;
 
 pub const ResolveError = error{
@@ -806,6 +876,8 @@ pub const ResolveError = error{
 /// Resolver settings: the nameserver list (UDP) plus timeout/retry policy.
 pub const ResolverConfig = struct {
     nameservers: [max_nameservers]Address = undefined,
+    /// IPv6 link-local DNS servers require the adapter's scope ID on Windows.
+    nameserver_scope_ids: [max_nameservers]u32 = @splat(0),
     nameserver_count: usize = 0,
     port: u16 = 53,
     timeout_ms: u32 = 2000,
@@ -814,6 +886,17 @@ pub const ResolverConfig = struct {
     pub fn addNameserver(self: *ResolverConfig, addr: Address) void {
         if (self.nameserver_count >= max_nameservers) return;
         self.nameservers[self.nameserver_count] = addr;
+        self.nameserver_scope_ids[self.nameserver_count] = 0;
+        self.nameserver_count += 1;
+    }
+
+    fn addSystemNameserver(self: *ResolverConfig, addr: Address, scope_id: u32) void {
+        for (self.nsSlice(), 0..) |existing, index| {
+            if (addressEql(existing, addr) and self.nameserver_scope_ids[index] == scope_id) return;
+        }
+        if (self.nameserver_count >= max_nameservers) return;
+        self.nameservers[self.nameserver_count] = addr;
+        self.nameserver_scope_ids[self.nameserver_count] = scope_id;
         self.nameserver_count += 1;
     }
 
@@ -853,10 +936,15 @@ pub fn parseResolvConf(text: []const u8, cfg: *ResolverConfig) usize {
     return cfg.nameserver_count;
 }
 
-/// Build a resolver config from /etc/resolv.conf, falling back to the public
-/// Cloudflare + Google resolvers when the file is missing or empty.
+/// Build a resolver config from the host's configured DNS servers. Windows
+/// fails closed when adapter discovery is unavailable; POSIX retains its
+/// historical resolv.conf and public-resolver fallback.
 pub fn systemResolverConfig() ResolverConfig {
     var cfg = ResolverConfig{};
+    if (comptime builtin.os.tag == .windows) {
+        windowsSystemNameservers(&cfg);
+        return cfg;
+    }
     var buf: [8192]u8 = undefined;
     if (readFileZ("/etc/resolv.conf", &buf)) |contents| {
         _ = parseResolvConf(contents, &cfg);
@@ -866,6 +954,69 @@ pub fn systemResolverConfig() ResolverConfig {
         cfg.addNameserver(.{ .ipv4 = .{ 8, 8, 8, 8 } });
     }
     return cfg;
+}
+
+fn windowsSystemNameservers(cfg: *ResolverConfig) void {
+    if (comptime builtin.os.tag != .windows) return;
+    var bytes_needed: u32 = 0;
+    if (win.GetAdaptersAddresses(win.af_unspec, 0, null, null, &bytes_needed) != win.error_buffer_overflow or
+        bytes_needed < @sizeOf(win.AdapterAddresses) or bytes_needed > win.max_adapter_bytes) return;
+    const bytes = std.heap.page_allocator.alignedAlloc(u8, .@"8", @intCast(bytes_needed)) catch return;
+    defer std.heap.page_allocator.free(bytes);
+    var actual_size = bytes_needed;
+    const first: *win.AdapterAddresses = @ptrCast(bytes.ptr);
+    if (win.GetAdaptersAddresses(win.af_unspec, 0, null, first, &actual_size) != 0 or
+        @as(usize, actual_size) > bytes.len) return;
+    const filled = bytes[0..@intCast(actual_size)];
+
+    var adapter: ?*win.AdapterAddresses = first;
+    var adapter_count: usize = 0;
+    while (adapter) |item| : (adapter_count += 1) {
+        if (adapter_count == 128 or cfg.nameserver_count == max_nameservers or
+            !windowsPointerInBuffer(win.AdapterAddresses, item, filled) or
+            item.length < @sizeOf(win.AdapterAddresses)) break;
+        var server = item.first_dns;
+        var server_count: usize = 0;
+        while (server) |dns_server| : (server_count += 1) {
+            if (server_count == 128 or cfg.nameserver_count == max_nameservers or
+                !windowsPointerInBuffer(win.DnsServerAddress, dns_server, filled) or
+                dns_server.length < @sizeOf(win.DnsServerAddress)) break;
+            if (dns_server.address.sockaddr) |raw| {
+                if (dns_server.address.length >= @sizeOf(u16) and
+                    windowsPointerInBuffer(u16, raw, filled))
+                {
+                    const family: *const u16 = @ptrCast(@alignCast(raw));
+                    if (family.* == win.af_inet and dns_server.address.length >= @sizeOf(win.SockAddr4) and
+                        windowsPointerInBuffer(win.SockAddr4, raw, filled))
+                    {
+                        const addr: *const win.SockAddr4 = @ptrCast(@alignCast(raw));
+                        if (windowsAddressNonzero(&addr.addr))
+                            cfg.addSystemNameserver(.{ .ipv4 = addr.addr }, 0);
+                    } else if (family.* == win.af_inet6 and dns_server.address.length >= @sizeOf(win.SockAddr6) and
+                        windowsPointerInBuffer(win.SockAddr6, raw, filled))
+                    {
+                        const addr: *const win.SockAddr6 = @ptrCast(@alignCast(raw));
+                        if (windowsAddressNonzero(&addr.addr))
+                            cfg.addSystemNameserver(.{ .ipv6 = addr.addr }, addr.scope_id);
+                    }
+                }
+            }
+            server = dns_server.next;
+        }
+        adapter = item.next;
+    }
+}
+
+fn windowsPointerInBuffer(comptime T: type, ptr: *const anyopaque, bytes: []const u8) bool {
+    const start = @intFromPtr(bytes.ptr);
+    const current = @intFromPtr(ptr);
+    return bytes.len >= @sizeOf(T) and current >= start and current - start <= bytes.len - @sizeOf(T) and
+        current % @alignOf(T) == 0;
+}
+
+fn windowsAddressNonzero(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte != 0) return true;
+    return false;
 }
 
 /// Read a small file into `buf` (no allocator / Io dependency), or null on error.
@@ -886,7 +1037,13 @@ fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
 
 fn randomIdHost() ResolveError!u16 {
     switch (builtin.os.tag) {
-        .linux, .windows => return error.RandomSourceFailed,
+        .linux => return error.RandomSourceFailed,
+        .windows => {
+            var bytes: [2]u8 = undefined;
+            @import("../substrate/platform.zig").fillOsEntropy(&bytes) catch return error.RandomSourceFailed;
+            const id = std.mem.readInt(u16, &bytes, .little);
+            return if (id == 0) 1 else id;
+        },
         else => {
             var b: [2]u8 = undefined;
             std.c.arc4random_buf(&b, b.len);
@@ -1024,12 +1181,9 @@ pub fn forwardConfirms(address: Address, forward_addrs: []const Address) bool {
 
 /// Send one query to a single nameserver over a blocking, recv-timeout UDP
 /// socket and return the raw response bytes (a slice of `recv_buf`).
-fn queryServer(ns: Address, port: u16, query: []const u8, recv_buf: []u8, timeout_ms: u32) ResolveError![]const u8 {
-    // The blocking UDP transport is Linux-only (the daemon's target). Gated via
-    // a comptime os switch so only this prong is analyzed on Linux and the
-    // Windows cross-check compiles the inert `else`. std.os.linux.* always
-    // compiles; std.posix.* members are target-specific, hence the gate.
+fn queryServer(ns: Address, scope_id: u32, port: u16, query: []const u8, recv_buf: []u8, timeout_ms: u32) ResolveError![]const u8 {
     switch (builtin.os.tag) {
+        .windows => return queryServerWindows(ns, scope_id, port, query, recv_buf, timeout_ms),
         .linux => {
             const family: u32 = switch (ns) {
                 .ipv4 => posix.AF.INET,
@@ -1094,6 +1248,40 @@ fn queryServer(ns: Address, port: u16, query: []const u8, recv_buf: []u8, timeou
     }
 }
 
+fn queryServerWindows(ns: Address, scope_id: u32, port: u16, query: []const u8, recv_buf: []u8, timeout_ms: u32) ResolveError![]const u8 {
+    if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
+    var startup: [408]u8 align(8) = @splat(0);
+    if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+    defer _ = win.WSACleanup();
+    const family: i32 = if (ns == .ipv4) win.af_inet else win.af_inet6;
+    const socket = win.WSASocketW(family, win.sock_dgram, win.ipproto_udp, null, 0, 1);
+    if (socket == win.invalid_socket) return error.SocketUnavailable;
+    defer _ = win.closesocket(socket);
+
+    // SO_RCVTIMEO and SO_SNDTIMEO bound each UDP attempt, even when the caller
+    // supplies zero or an arbitrarily large timeout.
+    const finite_ms: u32 = @max(1, @min(timeout_ms, 5000));
+    if (win.setsockopt(socket, win.sol_socket, win.so_rcvtimeo, &finite_ms, @sizeOf(u32)) != 0 or
+        win.setsockopt(socket, win.sol_socket, win.so_sndtimeo, &finite_ms, @sizeOf(u32)) != 0)
+        return error.SocketUnavailable;
+    const connected = switch (ns) {
+        .ipv4 => |bytes| blk: {
+            const addr = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, port), .addr = bytes };
+            break :blk win.connect(socket, &addr, @sizeOf(win.SockAddr4));
+        },
+        .ipv6 => |bytes| blk: {
+            const addr = win.SockAddr6{ .family = win.af_inet6, .port = std.mem.nativeToBig(u16, port), .addr = bytes, .scope_id = scope_id };
+            break :blk win.connect(socket, &addr, @sizeOf(win.SockAddr6));
+        },
+    };
+    if (connected != 0) return error.SendFailed;
+    const sent = win.send(socket, query.ptr, @intCast(query.len), 0);
+    if (sent < 0 or @as(usize, @intCast(sent)) != query.len) return error.SendFailed;
+    const received = win.recv(socket, recv_buf.ptr, @intCast(recv_buf.len), 0);
+    if (received <= 0) return error.Timeout;
+    return recv_buf[0..@intCast(received)];
+}
+
 /// Query every configured nameserver (round-robin over `attempts`) until one
 /// returns a well-formed, id-matched, non-error answer.
 fn queryAll(
@@ -1110,9 +1298,10 @@ fn queryAll(
     var rbuf: [max_message_len]u8 = undefined;
 
     var attempt: u8 = 0;
-    while (attempt < cfg.attempts) : (attempt += 1) {
-        for (cfg.nsSlice()) |ns| {
-            const resp = queryServer(ns, cfg.port, query, &rbuf, cfg.timeout_ms) catch continue;
+    const attempts = if (builtin.os.tag == .windows) @min(cfg.attempts, 3) else cfg.attempts;
+    while (attempt < attempts) : (attempt += 1) {
+        for (cfg.nsSlice(), 0..) |ns, index| {
+            const resp = queryServer(ns, cfg.nameserver_scope_ids[index], cfg.port, query, &rbuf, cfg.timeout_ms) catch continue;
             const msg = parseMessage(maxq, maxa, resp) catch continue;
             if (msg.header.id != id or msg.header.flags & 0x7a00 != 0) continue;
             if (!responseMatchesQuestion(maxq, maxa, &msg, name, qtype)) continue;
@@ -1389,9 +1578,9 @@ test "parses IPv4 and IPv6 nameserver literals" {
     try std.testing.expect(parseIpLiteral("999.1.1.1") == null);
 }
 
-test "systemResolverConfig returns nameservers from the host file or the public fallback" {
+test "systemResolverConfig bounds host DNS entries and retains the POSIX fallback" {
     const cfg = systemResolverConfig();
-    try std.testing.expect(cfg.nameserver_count > 0);
+    if (builtin.os.tag != .windows) try std.testing.expect(cfg.nameserver_count > 0);
     try std.testing.expect(cfg.nameserver_count <= max_nameservers);
 }
 
@@ -1419,6 +1608,74 @@ test "ResolverConfig caps nameservers at max_nameservers" {
     while (i < max_nameservers + 3) : (i += 1) cfg.addNameserver(.{ .ipv4 = .{ 10, 0, 0, @intCast(i) } });
     try std.testing.expectEqual(max_nameservers, cfg.nameserver_count);
     try std.testing.expectEqual(max_nameservers, cfg.nsSlice().len);
+}
+
+test "DNS Windows native UDP A and AAAA replies are identity checked and time bounded" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var startup: [408]u8 align(8) = @splat(0);
+    try std.testing.expectEqual(@as(i32, 0), win.WSAStartup(0x0202, &startup));
+    defer _ = win.WSACleanup();
+    const socket = win.WSASocketW(win.af_inet, win.sock_dgram, win.ipproto_udp, null, 0, 1);
+    try std.testing.expect(socket != win.invalid_socket);
+    defer _ = win.closesocket(socket);
+    var bind_addr = win.SockAddr4{ .family = win.af_inet, .port = 0, .addr = .{ 127, 0, 0, 1 } };
+    try std.testing.expectEqual(@as(i32, 0), win.bind(socket, &bind_addr, @sizeOf(win.SockAddr4)));
+    var addr_len: i32 = @sizeOf(win.SockAddr4);
+    try std.testing.expectEqual(@as(i32, 0), win.getsockname(socket, &bind_addr, &addr_len));
+    const timeout_ms: u32 = 1000;
+    try std.testing.expectEqual(@as(i32, 0), win.setsockopt(socket, win.sol_socket, win.so_rcvtimeo, &timeout_ms, @sizeOf(u32)));
+
+    const Responder = struct {
+        socket: usize,
+        served: std.atomic.Value(u32) = .{ .raw = 0 },
+
+        fn run(self: *@This()) void {
+            for (0..3) |index| {
+                var query_buf: [max_message_len]u8 = undefined;
+                var peer: win.SockAddr4 = undefined;
+                var peer_len: i32 = @sizeOf(win.SockAddr4);
+                const got = win.recvfrom(self.socket, &query_buf, @intCast(query_buf.len), 0, &peer, &peer_len);
+                if (got <= 0) return;
+                const parsed = parseMessage(1, 0, query_buf[0..@intCast(got)]) catch return;
+                if (parsed.question_count != 1) return;
+                const question = parsed.questions[0];
+                const q = Query{ .name = question.name.slice(), .qtype = question.qtype };
+                const data: AnswerData = switch (q.qtype) {
+                    .a => .{ .a = .{ 192, 0, 2, 42 } },
+                    .aaaa => .{ .aaaa = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 } },
+                    else => return,
+                };
+                const answer = Answer{ .name = q.name, .rr_type = q.qtype, .ttl = 30, .data = data };
+                var response_buf: [max_message_len]u8 = undefined;
+                const response = encodeMessage(&response_buf, .{
+                    .id = if (index == 2) parsed.header.id +% 1 else parsed.header.id,
+                    .response = true,
+                    .questions = &.{q},
+                    .answers = &.{answer},
+                }) catch return;
+                if (win.sendto(self.socket, response.ptr, @intCast(response.len), 0, &peer, peer_len) != @as(i32, @intCast(response.len))) return;
+                _ = self.served.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+    var responder = Responder{ .socket = socket };
+    const thread = try std.Thread.spawn(.{}, Responder.run, .{&responder});
+    defer thread.join();
+
+    var cfg = ResolverConfig{ .port = std.mem.bigToNative(u16, bind_addr.port), .timeout_ms = 500, .attempts = 1 };
+    cfg.addNameserver(.{ .ipv4 = .{ 127, 0, 0, 1 } });
+    var addresses: [max_cache_addrs]Address = undefined;
+    const a = try resolveForward(&cfg, "windows-dns.test", false, &addresses);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 192, 0, 2, 42 } }, a[0]);
+    const aaaa = try resolveForward(&cfg, "windows-dns.test", true, &addresses);
+    try std.testing.expectEqual(Address{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 } }, aaaa[0]);
+    try std.testing.expectError(error.Timeout, resolveForward(&cfg, "wrong-id.test", false, &addresses));
+    try std.testing.expectEqual(@as(u32, 3), responder.served.load(.acquire));
+
+    const start_ms = @import("../substrate/platform.zig").monotonicMillis();
+    try std.testing.expectError(error.Timeout, resolveForward(&cfg, "no-reply.test", false, &addresses));
+    const elapsed_ms = @import("../substrate/platform.zig").monotonicMillis() - start_ms;
+    try std.testing.expect(elapsed_ms >= 0 and elapsed_ms < 3000);
 }
 
 test "forwardConfirms implements the FCrDNS match (anti-spoof)" {

@@ -30,6 +30,42 @@ const builtin = @import("builtin");
 const sys = if (builtin.os.tag == .windows) std.os.linux else std.posix.system;
 const posix = std.posix;
 const ice = @import("../proto/ice.zig");
+const Socket = if (builtin.os.tag == .windows) usize else sys.fd_t;
+const invalid_fd: Socket = if (builtin.os.tag == .windows) std.math.maxInt(usize) else -1;
+
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const af_inet: i32 = 2;
+    const af_inet6: i32 = 23;
+    const sock_dgram: i32 = 2;
+    const ipproto_udp: i32 = 17;
+    const ipproto_ipv6: i32 = 41;
+    const ipv6_v6only: i32 = 27;
+    const sol_socket: i32 = 0xffff;
+    const so_type: i32 = 0x1008;
+    const so_exclusiveaddruse: i32 = ~@as(i32, 0x0004);
+    const fionbio: u32 = 0x8004667e;
+    const SockAddr4 = extern struct { family: u16, port: u16, addr: [4]u8, zero: [8]u8 = @splat(0) };
+    const SockAddr6 = extern struct { family: u16, port: u16, flowinfo: u32 = 0, addr: [16]u8, scope_id: u32 = 0 };
+    const FdSet = extern struct { count: u32, sockets: [64]usize };
+    const Timeval = extern struct { seconds: i32, microseconds: i32 };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(SockAddr6) != 28 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8)
+            @compileError("Windows dual-stack UDP socket ABI shape changed");
+    }
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *anyopaque, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn select(ignored_nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
+    extern "ws2_32" fn sendto(socket: usize, bytes: [*]const u8, length: i32, flags: i32, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recvfrom(socket: usize, bytes: [*]u8, length: i32, flags: i32, address: *anyopaque, address_len: *i32) callconv(.winapi) i32;
+};
 
 pub const TransportAddress = ice.TransportAddress;
 
@@ -55,8 +91,8 @@ fn ipv6V6Only() comptime_int {
 }
 
 pub const DualStackUdpSocket = struct {
-    fd: sys.fd_t,
-    ipv4_fd: sys.fd_t = -1,
+    fd: Socket,
+    ipv4_fd: Socket = invalid_fd,
     primary_ipv4: bool = false,
     recv_timeout_ms: u32 = 250,
     prefer_ipv4: bool = false,
@@ -70,7 +106,7 @@ pub const DualStackUdpSocket = struct {
     /// `port` 0 = ephemeral. Linux receives mapped IPv4 on the IPv6 socket;
     /// OpenBSD publishes a socket pair transactionally for `.any`.
     pub fn bind(bind_addr: BindAddr, port: u16) Error!DualStackUdpSocket {
-        if (comptime builtin.os.tag == .windows) return error.SocketUnavailable;
+        if (comptime builtin.os.tag == .windows) return bindWindows(bind_addr, port);
         if (comptime builtin.os.tag != .linux) return bindNative(bind_addr, port);
         const rc = sys.socket(posix.AF.INET6, sys.SOCK.DGRAM | sys.SOCK.CLOEXEC | sys.SOCK.NONBLOCK, sys.IPPROTO.UDP);
         if (posix.errno(rc) != .SUCCESS) return error.SocketUnavailable;
@@ -96,6 +132,33 @@ pub const DualStackUdpSocket = struct {
         if (posix.errno(sys.bind(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.in6))) != .SUCCESS)
             return error.BindFailed;
         return .{ .fd = fd };
+    }
+
+    fn bindWindows(bind_addr: BindAddr, port: u16) Error!DualStackUdpSocket {
+        if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+        errdefer _ = win.WSACleanup();
+        const ipv4 = bind_addr == .v4_mapped;
+        const socket = win.WSASocketW(if (ipv4) win.af_inet else win.af_inet6, win.sock_dgram, win.ipproto_udp, null, 0, 1);
+        if (socket == win.invalid_socket) return error.SocketUnavailable;
+        errdefer _ = win.closesocket(socket);
+        const exclusive: i32 = 1;
+        if (win.setsockopt(socket, win.sol_socket, win.so_exclusiveaddruse, &exclusive, @sizeOf(i32)) != 0)
+            return error.SocketUnavailable;
+        if (ipv4) {
+            const address = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, port), .addr = bind_addr.v4_mapped };
+            if (win.bind(socket, &address, @sizeOf(win.SockAddr4)) != 0) return error.BindFailed;
+        } else {
+            const v6only: i32 = @intFromBool(bind_addr == .loopback_v6);
+            if (win.setsockopt(socket, win.ipproto_ipv6, win.ipv6_v6only, &v6only, @sizeOf(i32)) != 0)
+                return error.BindFailed;
+            const address = win.SockAddr6{ .family = win.af_inet6, .port = std.mem.nativeToBig(u16, port), .addr = bind_addr.toBytes() };
+            if (win.bind(socket, &address, @sizeOf(win.SockAddr6)) != 0) return error.BindFailed;
+        }
+        var nonblocking: u32 = 1;
+        if (win.ioctlsocket(socket, win.fionbio, &nonblocking) != 0) return error.SocketUnavailable;
+        return .{ .fd = socket, .primary_ipv4 = ipv4 };
     }
 
     fn bindNative(bind_addr: BindAddr, port: u16) Error!DualStackUdpSocket {
@@ -166,6 +229,9 @@ pub const DualStackUdpSocket = struct {
 
     pub fn deinit(self: *DualStackUdpSocket) void {
         if (comptime builtin.os.tag == .windows) {
+            _ = win.closesocket(self.fd);
+            if (self.ipv4_fd != invalid_fd) _ = win.closesocket(self.ipv4_fd);
+            _ = win.WSACleanup();
             self.* = undefined;
             return;
         }
@@ -176,7 +242,20 @@ pub const DualStackUdpSocket = struct {
 
     /// The bound local UDP port (host byte order).
     pub fn localPort(self: *const DualStackUdpSocket) Error!u16 {
-        if (comptime builtin.os.tag == .windows) return error.AddrLookupFailed;
+        if (comptime builtin.os.tag == .windows) {
+            if (self.primary_ipv4) {
+                var address: win.SockAddr4 = undefined;
+                var length: i32 = @sizeOf(win.SockAddr4);
+                if (win.getsockname(self.fd, &address, &length) != 0 or length != @sizeOf(win.SockAddr4) or address.family != win.af_inet)
+                    return error.AddrLookupFailed;
+                return std.mem.bigToNative(u16, address.port);
+            }
+            var address: win.SockAddr6 = undefined;
+            var length: i32 = @sizeOf(win.SockAddr6);
+            if (win.getsockname(self.fd, &address, &length) != 0 or length != @sizeOf(win.SockAddr6) or address.family != win.af_inet6)
+                return error.AddrLookupFailed;
+            return std.mem.bigToNative(u16, address.port);
+        }
         if (self.primary_ipv4) {
             var sa4: sys.sockaddr.in = undefined;
             var len4: posix.socklen_t = @sizeOf(@TypeOf(sa4));
@@ -200,7 +279,7 @@ pub const DualStackUdpSocket = struct {
 
     pub fn capture(self: *const DualStackUdpSocket) !Snapshot {
         var carry: Snapshot = .{ .primary = try observeDatagram(self.fd), .ipv4 = null, .primary_ipv4 = self.primary_ipv4, .recv_timeout_ms = self.recv_timeout_ms, .prefer_ipv4 = self.prefer_ipv4 };
-        if (self.ipv4_fd >= 0) {
+        if (self.ipv4_fd != invalid_fd) {
             if (self.ipv4_fd == self.fd) return error.InvalidSocket;
             carry.ipv4 = try observeDatagram(self.ipv4_fd);
         }
@@ -210,6 +289,7 @@ pub const DualStackUdpSocket = struct {
     /// Takes both transferred references on entry, including refusal. It never
     /// binds, sets flags/options, reads or shuts down a shared open description.
     pub fn initInherited(fd: posix.fd_t, ipv4_fd: ?posix.fd_t, carry: *const Snapshot) !DualStackUdpSocket {
+        if (comptime builtin.os.tag == .windows) return error.UnverifiableSocketIdentity;
         errdefer {
             _ = sys.close(fd);
             if (ipv4_fd) |other| if (other != fd) {
@@ -228,14 +308,32 @@ pub const DualStackUdpSocket = struct {
         // inherited open description. Keep adoption closed until a genuine
         // source-custody bridge supplies that proof.
         if (actual.inode == 0 or (carry.ipv4 != null and carry.ipv4.?.inode == 0)) return error.UnverifiableSocketIdentity;
-        return .{ .fd = fd, .ipv4_fd = ipv4_fd orelse -1, .primary_ipv4 = carry.primary_ipv4, .recv_timeout_ms = carry.recv_timeout_ms, .prefer_ipv4 = carry.prefer_ipv4 };
+        return .{ .fd = fd, .ipv4_fd = ipv4_fd orelse invalid_fd, .primary_ipv4 = carry.primary_ipv4, .recv_timeout_ms = carry.recv_timeout_ms, .prefer_ipv4 = carry.prefer_ipv4 };
     }
 
     /// Send `bytes` to `dest`. A v4 `TransportAddress` is re-wrapped as a
     /// v4-mapped `::ffff:a.b.c.d`; a v6 one is copied verbatim. A `TransportAddress`
     /// with an unexpected `ip_len` (neither 4 nor 16) is dropped.
     pub fn sendTo(self: *DualStackUdpSocket, dest: TransportAddress, bytes: []const u8) void {
-        if (comptime builtin.os.tag == .windows) return;
+        if (comptime builtin.os.tag == .windows) {
+            if (dest.port == 0 or bytes.len > std.math.maxInt(i32)) return;
+            if (self.primary_ipv4) {
+                if (dest.ip_len != 4) return;
+                const address = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, dest.port), .addr = dest.ip[0..4].* };
+                _ = win.sendto(self.fd, bytes.ptr, @intCast(bytes.len), 0, &address, @sizeOf(win.SockAddr4));
+                return;
+            }
+            if (dest.ip_len != 4 and dest.ip_len != 16) return;
+            var address = win.SockAddr6{ .family = win.af_inet6, .port = std.mem.nativeToBig(u16, dest.port), .addr = @splat(0) };
+            if (dest.ip_len == 4) {
+                @memcpy(address.addr[0..12], &v4mapped_prefix);
+                @memcpy(address.addr[12..16], dest.ip[0..4]);
+            } else {
+                @memcpy(&address.addr, dest.ip[0..16]);
+            }
+            _ = win.sendto(self.fd, bytes.ptr, @intCast(bytes.len), 0, &address, @sizeOf(win.SockAddr6));
+            return;
+        }
         if (dest.ip_len == 4 and (self.primary_ipv4 or self.ipv4_fd >= 0)) {
             const fd = if (self.primary_ipv4) self.fd else self.ipv4_fd;
             const sa4 = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, dest.port), .addr = @bitCast(dest.ip[0..4].*) };
@@ -253,8 +351,36 @@ pub const DualStackUdpSocket = struct {
     /// `sockaddr_in6` is converted to a `TransportAddress`: an IPv4-mapped source
     /// becomes a 4-byte ipv4 address, anything else a 16-byte ipv6 address.
     pub fn recvFrom(self: *DualStackUdpSocket, buf: []u8) ?Received {
-        if (comptime builtin.os.tag == .windows) return null;
+        if (comptime builtin.os.tag == .windows) return self.recvWindows(buf);
         return self.recvNative(buf);
+    }
+    fn recvWindows(self: *DualStackUdpSocket, buf: []u8) ?Received {
+        if (comptime builtin.os.tag != .windows) return null;
+        var readable = win.FdSet{ .count = 1, .sockets = undefined };
+        readable.sockets[0] = self.fd;
+        const finite_ms = @min(@max(self.recv_timeout_ms, 1), 60_000);
+        const seconds: i32 = @intCast(finite_ms / 1000);
+        const remainder_ms: u32 = finite_ms % 1000;
+        const microseconds: i32 = @intCast(remainder_ms * 1000);
+        var timeout = win.Timeval{ .seconds = seconds, .microseconds = microseconds };
+        if (win.select(0, &readable, null, null, &timeout) <= 0) return null;
+        if (self.primary_ipv4) {
+            var address: win.SockAddr4 = undefined;
+            var length: i32 = @sizeOf(win.SockAddr4);
+            const n = win.recvfrom(self.fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(i32))), 0, &address, &length);
+            if (n < 0 or length != @sizeOf(win.SockAddr4) or address.family != win.af_inet) return null;
+            const from = TransportAddress.fromBytes(&address.addr, std.mem.bigToNative(u16, address.port)) catch return null;
+            return .{ .data = buf[0..@intCast(n)], .from = from };
+        }
+        var address: win.SockAddr6 = undefined;
+        var length: i32 = @sizeOf(win.SockAddr6);
+        const n = win.recvfrom(self.fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(i32))), 0, &address, &length);
+        if (n < 0 or length != @sizeOf(win.SockAddr6) or address.family != win.af_inet6) return null;
+        const from = if (isV4Mapped(address.addr))
+            TransportAddress.fromBytes(address.addr[12..16], std.mem.bigToNative(u16, address.port)) catch return null
+        else
+            TransportAddress.fromBytes(&address.addr, std.mem.bigToNative(u16, address.port)) catch return null;
+        return .{ .data = buf[0..@intCast(n)], .from = from };
     }
     fn recvNative(self: *DualStackUdpSocket, buf: []u8) ?Received {
         var fds = [_]posix.pollfd{
@@ -336,6 +462,58 @@ pub fn toSockaddrIn6(addr: TransportAddress) ?sys.sockaddr.in6 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "Windows dual-stack UDP serves mapped IPv4 and native IPv6 and bounds idle poll" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const MediaSocket = @import("../substrate/media_socket.zig").MediaSocket;
+    const loopback_be = @import("../substrate/media_socket.zig").loopback_be;
+    var server = try DualStackUdpSocket.bind(.any, 0);
+    defer server.deinit();
+    const port = try server.localPort();
+    try testing.expect(port != 0);
+    const observed = try server.capture();
+    try testing.expectEqual(@as(u64, 0), observed.primary.inode);
+    try testing.expectEqual(@as(u64, @intCast(server.fd)), observed.primary.device);
+    try testing.expect(!observed.primary_ipv4 and !observed.primary.v6only);
+
+    var ipv4 = try MediaSocket.bind(loopback_be, 0);
+    defer ipv4.deinit();
+    const v4_target = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, port);
+    ipv4.sendTo(v4_target, "mapped-v4");
+    var buf: [64]u8 = undefined;
+    const from_v4 = server.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("mapped-v4", from_v4.data);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, from_v4.from.bytes());
+    server.sendTo(from_v4.from, "reply-v4");
+    const v4_reply = ipv4.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("reply-v4", v4_reply.data);
+
+    var ipv6 = try DualStackUdpSocket.bind(.loopback_v6, 0);
+    defer ipv6.deinit();
+    var loopback6: [16]u8 = @splat(0);
+    loopback6[15] = 1;
+    const v6_target = try TransportAddress.fromBytes(&loopback6, port);
+    ipv6.sendTo(v6_target, "native-v6");
+    const from_v6 = server.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("native-v6", from_v6.data);
+    try testing.expectEqualSlices(u8, &loopback6, from_v6.from.bytes());
+    server.sendTo(from_v6.from, "reply-v6");
+    const v6_reply = ipv6.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("reply-v6", v6_reply.data);
+
+    var v4_only = try DualStackUdpSocket.bind(.{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    defer v4_only.deinit();
+    try testing.expect((try v4_only.capture()).primary_ipv4);
+    const v4_only_target = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, try v4_only.localPort());
+    ipv4.sendTo(v4_only_target, "v4-only");
+    const got_v4_only = v4_only.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("v4-only", got_v4_only.data);
+
+    server.setRecvTimeoutMs(50);
+    const before = @import("../substrate/platform.zig").monotonicMillis();
+    try testing.expect(server.recvFrom(&buf) == null);
+    try testing.expect(@import("../substrate/platform.zig").monotonicMillis() - before < 1000);
+}
 
 test "isV4Mapped recognises ::ffff:0:0/96 and rejects native v6" {
     var mapped = @as([16]u8, @splat(0));
@@ -620,7 +798,51 @@ pub const Snapshot = struct {
 fn identityBits(value: anytype) u64 {
     return @intCast(@as(@Int(.unsigned, @bitSizeOf(@TypeOf(value))), @bitCast(value)));
 }
-fn observeDatagram(fd: posix.fd_t) !DatagramObservation {
+fn observeDatagram(fd: Socket) !DatagramObservation {
+    if (comptime builtin.os.tag == .windows) {
+        var socket_type: i32 = 0;
+        var length: i32 = @sizeOf(i32);
+        if (win.getsockopt(fd, win.sol_socket, win.so_type, &socket_type, &length) != 0 or
+            length != @sizeOf(i32) or socket_type != win.sock_dgram) return error.InvalidSocket;
+        var family: u16 = 0;
+        length = @sizeOf(u16);
+        // getsockname accepts a full sockaddr; the first two bytes select its
+        // family. Keep the buffer large enough for either IPv4 or IPv6.
+        var storage: [32]u8 align(8) = @splat(0);
+        length = storage.len;
+        if (win.getsockname(fd, &storage, &length) != 0) return error.InvalidSocket;
+        family = std.mem.readInt(u16, storage[0..2], .little);
+        var result = DatagramObservation{
+            .device = @intCast(fd),
+            .inode = 0, // no inherited Windows socket custody claim
+            .family = family,
+            .address = @splat(0),
+            .port = 0,
+            .scope_id = 0,
+            .flowinfo = 0,
+            .v6only = false,
+        };
+        if (family == win.af_inet and length == @sizeOf(win.SockAddr4)) {
+            const address: *const win.SockAddr4 = @ptrCast(@alignCast(&storage));
+            @memcpy(result.address[0..4], &address.addr);
+            result.port = std.mem.bigToNative(u16, address.port);
+        } else if (family == win.af_inet6 and length == @sizeOf(win.SockAddr6)) {
+            const address: *const win.SockAddr6 = @ptrCast(@alignCast(&storage));
+            result.address = address.addr;
+            result.port = std.mem.bigToNative(u16, address.port);
+            result.scope_id = address.scope_id;
+            result.flowinfo = address.flowinfo;
+            var v6only: i32 = 0;
+            length = @sizeOf(i32);
+            const rc = win.getsockopt(fd, win.ipproto_ipv6, win.ipv6_v6only, &v6only, &length);
+            // Winsock may report this boolean option as one byte even when
+            // supplied with a four-byte output buffer.
+            if (rc != 0 or (length != 1 and length != @sizeOf(i32)) or (v6only != 0 and v6only != 1)) return error.InvalidSocket;
+            result.v6only = v6only == 1;
+        } else return error.InvalidSocket;
+        try result.validate();
+        return result;
+    }
     var typ: c_int = 0;
     var len: posix.socklen_t = @sizeOf(c_int);
     if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.TYPE, std.mem.asBytes(&typ), &len)) != .SUCCESS or len != @sizeOf(c_int) or typ != posix.SOCK.DGRAM) return error.InvalidSocket;

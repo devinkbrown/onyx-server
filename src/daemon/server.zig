@@ -1010,6 +1010,13 @@ pub const NativeAdoptBarrier = struct {
     /// Any returned error is strictly pre-COMMIT. After authenticated COMMIT,
     /// return success or terminate; the serving predecessor cannot roll back.
     readyAndAwaitCommit: *const fn (*anyopaque) anyerror!void,
+    /// Windows claims each validated inert state socket only after the complete
+    /// capsule join. Any candidate failure after staging must exit directly so
+    /// Server cleanup cannot shut down a predecessor-owned TCP endpoint.
+    claimInertStateSocket: ?*const fn (*anyopaque, linux.fd_t) anyerror!void = null,
+    /// The candidate claims a listener as soon as Server.init validates and
+    /// adopts it. READY is forbidden until every staged listener is owned.
+    claimInertListenerSocket: ?*const fn (*anyopaque, linux.fd_t) anyerror!void = null,
 };
 
 const listener_token: RingFdToken = .{ .slot = 0, .gen = 0 };
@@ -2447,6 +2454,9 @@ pub const ConnState = struct {
     recv_cancel_pending: bool = false,
     send_cancel_pending: bool = false,
     connect_cancel_pending: bool = false,
+    /// Windows forced close retains the slot until every exact IOCP request
+    /// releases its inline buffers. The timer retries cancels under SQ pressure.
+    windows_force_close_cancel: bool = false,
     /// A CONNECT canceled for a failed Helix attempt is resubmitted before
     /// ordinary RECV/SEND activation. A successful upgrade instead retains the
     /// outbound dial as the existing mesh re-dial hint.
@@ -3198,6 +3208,14 @@ const TestLiveUpgradeCapture = struct {
     s2s_preserved: usize = 0,
 };
 
+/// Winsock gives an exclusive listening socket one IOCP owner. Reactor 0
+/// accepts, then publishes unassociated accepted sockets to their destination
+/// reactor before that reactor submits its first receive.
+const WindowsAcceptedQueue = if (builtin.os.tag == .windows)
+    @import("../substrate/queue.zig").BoundedMpmc(ringlane.AcceptEvent, 256)
+else
+    void;
+
 const Reactor = struct {
     /// This reactor's io_uring (accept/recv/send/poll/timeout completions).
     ring: RingCore,
@@ -3249,6 +3267,8 @@ const Reactor = struct {
     wake: ?reactor_wake.ReactorWake = null,
     wake_armed: bool = false,
     wake_count: std.atomic.Value(u32) = .init(0),
+    accepted_count: std.atomic.Value(u64) = .init(0),
+    windows_accepted: WindowsAcceptedQueue = if (builtin.os.tag == .windows) WindowsAcceptedQueue.init() else {},
     /// Published only after this actual owner completes a successful backend
     /// loop turn. A Gate arrival/release is not an activation acknowledgment.
     runtime_activated: std.atomic.Value(bool) = .init(false),
@@ -3312,6 +3332,9 @@ const Reactor = struct {
         // slot. Tear the ring down first so the kernel releases those references
         // before ClientTable frees/reuses its backing allocation.
         self.ring.deinit();
+        if (comptime builtin.os.tag == .windows) {
+            while (self.windows_accepted.pop()) |accepted| closeFd(accepted.res);
+        }
         self.clients.deinit();
         if (self.wake) |*w| w.deinit();
         closeFd(self.listener_fd);
@@ -3741,7 +3764,7 @@ const flight_recorder_max_file_bytes: usize = 96 * 1024;
 var flight_panic_server: std.atomic.Value(usize) = .init(0);
 
 fn sleepOneMillis() void {
-    if (builtin.os.tag == .openbsd) {
+    if (builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         os_runtime.sleepMillis(1);
         return;
     }
@@ -3749,10 +3772,10 @@ fn sleepOneMillis() void {
     _ = linux.nanosleep(&req, null);
 }
 
-fn writeAllLinux(fd: linux.fd_t, bytes: []const u8) bool {
+fn writeAllNative(fd: linux.fd_t, bytes: []const u8) bool {
     var off: usize = 0;
     while (off < bytes.len) {
-        if (comptime builtin.os.tag == .openbsd) {
+        if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
             const written = os_runtime.write(fd, bytes[off..]) catch |err| switch (err) {
                 error.Interrupted => continue,
                 else => return false,
@@ -4058,6 +4081,9 @@ pub const LinuxServer = struct {
     /// `reactors[0]` is the single-reactor fast path; reached through `rx()` so
     /// every handler resolves to the reactor whose ring produced its completion.
     reactors: []Reactor,
+    /// Reactor 0 alone chooses Windows accept destinations while it owns the
+    /// completion's World lock. Queue saturation falls back to local admission.
+    windows_accept_next: usize = 1,
     /// pidfd_open of this process. Closed in deinit.
     self_pidfd: linux.fd_t = -1,
     /// Surplus inherited listener fds were closed with one close_range.
@@ -4255,6 +4281,8 @@ pub const LinuxServer = struct {
     chanstats_prune_ready_ms: i64 = 0,
     /// Throttle stamp for periodic local backup sets (reactor 0).
     backup_last_write_ms: i64 = 0,
+    /// Failed attempts retry soon without logging or compacting on every timer tick.
+    backup_last_failure_ms: i64 = 0,
     /// Throttle stamp for the Event Spine history-ring snapshot save (reactor 0).
     event_history_last_write_ms: i64 = 0,
     warden: warden.Registry,
@@ -4823,7 +4851,10 @@ pub const LinuxServer = struct {
             if (shard_id == 0 and config.inherited_listener_fds.len == 0) break :blk config.inherited_listener_fd;
             break :blk null;
         };
-        const listener_fd = if (inherited) |fd| blk: {
+        const windows_shared_acceptor_only = builtin.os.tag == .windows and shard_id != 0;
+        const listener_fd: linux.fd_t = if (windows_shared_acceptor_only)
+            -1
+        else if (inherited) |fd| blk: {
             srvLog("onyx-server: adopting inherited listener fd {d} (shard {d})\n", .{ fd, shard_id });
             // Restore exec hygiene: the fd survived ONE execve on purpose;
             // re-arm CLOEXEC so it never leaks into any other child. The next
@@ -4831,6 +4862,8 @@ pub const LinuxServer = struct {
             if (comptime builtin.os.tag == .linux) {
                 _ = linux.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
                 try kernel_linux.applyListenerOptions(fd);
+            } else if (comptime builtin.os.tag == .windows) {
+                _ = try adoptNativeListener(config, fd);
             } else {
                 try os_runtime.setCloexec(fd, true);
                 try os_runtime.setNonblocking(fd);
@@ -4852,7 +4885,7 @@ pub const LinuxServer = struct {
         // state. In sharded mode no other reactor even binds this port.
         const inherited_s2s = nativeManifestListener(config, shard_id, .s2s, false);
         const s2s_listener_fd: linux.fd_t = if (config.s2s_port != 0 and (!reuse_port or shard_id == 0))
-            if (inherited_s2s) |fd| try adoptNativeListener(fd) else try createListener(primaryListenerHost(config.host), config.s2s_port, config.backlog)
+            if (inherited_s2s) |fd| try adoptNativeListener(config, fd) else try createListener(primaryListenerHost(config.host), config.s2s_port, config.backlog)
         else
             -1;
         errdefer if (s2s_listener_fd >= 0) closeFd(s2s_listener_fd);
@@ -4866,9 +4899,9 @@ pub const LinuxServer = struct {
         // chain when [tls] is enabled). Port 0 then means an ephemeral bind, the
         // same convention the plaintext listener uses.
         const inherited_tls = nativeManifestListener(config, shard_id, .tls, false);
-        const tls_listener_fd: linux.fd_t = if (certReady(config))
+        const tls_listener_fd: linux.fd_t = if (certReady(config) and !windows_shared_acceptor_only)
             (if (inherited_tls) |fd|
-                try adoptNativeListener(fd)
+                try adoptNativeListener(config, fd)
             else if (reuse_port)
                 try reuseport.createReusePortListener(primaryListenerHost(config.host), config.tls_port, config.backlog)
             else
@@ -4886,9 +4919,9 @@ pub const LinuxServer = struct {
         // same cert-presence signal as the TLS listener (browsers require wss).
         // The testing-only plain mode stands it up without a certificate.
         const inherited_ws = nativeManifestListener(config, shard_id, .ws, false);
-        const ws_listener_fd: linux.fd_t = if (config.ws_enabled and (certReady(config) or config.ws_allow_plain))
+        const ws_listener_fd: linux.fd_t = if (config.ws_enabled and (certReady(config) or config.ws_allow_plain) and !windows_shared_acceptor_only)
             (if (inherited_ws) |fd|
-                try adoptNativeListener(fd)
+                try adoptNativeListener(config, fd)
             else if (reuse_port)
                 try reuseport.createReusePortListener(primaryListenerHost(config.host), config.ws_port, config.backlog)
             else
@@ -4964,7 +4997,7 @@ pub const LinuxServer = struct {
     }
 
     fn initInPlaceWithAccountSource(self: *LinuxServer, allocator: std.mem.Allocator, raw_config: Config, stage: ?*ManagedLeasedCoreStage) !void {
-        if (builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        if (builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.Unsupported;
 
         const accounts_available = if (stage) |source| blk: {
             const b = managedLeasedStageBacking(source).core;
@@ -4978,8 +5011,8 @@ pub const LinuxServer = struct {
         else
             -1;
         var self_pidfd_owned = self_pidfd >= 0;
-        errdefer if (self_pidfd_owned) {
-            os_runtime.close(self_pidfd);
+        errdefer if (comptime builtin.os.tag == .linux) {
+            if (self_pidfd_owned) os_runtime.close(self_pidfd);
         };
 
         // Ignore SIGPIPE process-wide. The reactors do socket I/O through io_uring
@@ -5475,6 +5508,23 @@ pub const LinuxServer = struct {
         self.startWebhook();
     }
 
+    /// Windows boot treats explicitly configured companions as required. The
+    /// legacy start path logs optional-service failures; check their actual
+    /// worker ownership before the reactor begins serving clients.
+    pub fn startCheckedWindows(self: *LinuxServer) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        self.start();
+        if (self.config.media_enabled and
+            (self.media_routing_owner == null or self.native_media.thread == null or self.media_plane.thread == null))
+            return error.MediaStartupFailed;
+        if (self.config.metrics_port != 0 and
+            (self.metrics_server == null or self.metrics_server.?.thread == null))
+            return error.MetricsStartupFailed;
+        if (self.config.webhook_enabled and
+            (self.webhook_server == null or self.webhook_server.?.thread == null))
+            return error.WebhookStartupFailed;
+    }
+
     /// Actual source resources have been prepared at this final Server address.
     /// Bind both typed owners and fund the complete fixed FIFO before any pump.
     fn prepareMediaRoutingOwner(self: *LinuxServer) !void {
@@ -5902,6 +5952,7 @@ pub const LinuxServer = struct {
         try self.stats.writePrometheus(self.allocator, &out);
         try self.latency_stats.writePrometheus(self.allocator, &out);
         try self.writeNodeHealthPrometheus(self.allocator, &out);
+        try self.writeReactorAcceptPrometheus(self.allocator, &out);
         try self.peer_health.writePrometheus(self.allocator, &out);
         try self.writeE2eeGroupPrometheus(self.allocator, &out);
         const webpush_dropped: usize = if (self.webpush_worker) |worker| worker.dropped.load(.monotonic) else 0;
@@ -5928,6 +5979,17 @@ pub const LinuxServer = struct {
         try writePromGauge(allocator, out, "onyx_mesh_components", "Mesh connected components known to this node", health.mesh_components);
         try writePromGauge(allocator, out, "onyx_mesh_peers_up", "Mesh peers currently established from this node", health.mesh_peers_up);
         try writePromGauge(allocator, out, "onyx_mesh_peers_total", "Mesh peers tracked by this node", health.mesh_peers_total);
+    }
+
+    fn writeReactorAcceptPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try out.appendSlice(allocator, "# HELP onyx_reactor_accepts_total Sockets admitted by reactor shard\n" ++
+            "# TYPE onyx_reactor_accepts_total counter\n");
+        for (self.reactors, 0..) |*reactor, shard| {
+            try out.print(allocator, "onyx_reactor_accepts_total{{shard=\"{d}\"}} {d}\n", .{
+                shard,
+                reactor.accepted_count.load(.acquire),
+            });
+        }
     }
 
     const E2eeGroupOperationalState = struct {
@@ -7631,6 +7693,7 @@ pub const LinuxServer = struct {
         if (self.isMaintenanceReactor()) self.maybeReloadAcmeTls();
         if (self.isMaintenanceReactor()) self.maybeSwapOcspStaple();
         self.retryFailedSessionHandoffs();
+        if (comptime builtin.os.tag == .windows) self.retryWindowsClosingIo();
         self.sweepTimeouts();
         self.sweepDeferredSessionAutojoins();
         // Local channel projection is owner-reactor scoped: every shard applies
@@ -8187,19 +8250,52 @@ pub const LinuxServer = struct {
         const io = self.config.crypto_io orelse return;
         const now = self.nowMs();
         if (self.backup_last_write_ms != 0 and now - self.backup_last_write_ms < self.config.backup_interval_ms) return;
+        const retry_ms = @max(@as(i64, 5_000), @min(self.config.backup_interval_ms, @as(i64, 5 * 60_000)));
+        if (self.backup_last_failure_ms != 0 and now - self.backup_last_failure_ms < retry_ms) return;
         if (self.writeBackupSet(io)) {
             self.backup_last_write_ms = now;
-        }
+            self.backup_last_failure_ms = 0;
+        } else self.backup_last_failure_ms = now;
     }
 
     fn writeBackupSet(self: *LinuxServer, io: std.Io) bool {
         const generated_unix = @divTrunc(platform.realtimeMillis(), 1000);
         const svc = self.account_services orelse return false;
-        svc.compactStoreForBackup() catch return false;
+        svc.compactStoreForBackup() catch |err| {
+            if (comptime builtin.os.tag == .windows) std.debug.print("onyx-server: Windows backup compact failed ({s})\n", .{@errorName(err)});
+            return false;
+        };
+        var private_writer: ?backup_set.PrivateWriterWindows = null;
+        if (comptime builtin.os.tag == .windows) {
+            private_writer = backup_set.PrivateWriterWindows.open(io, self.config.backup_dir) catch |err| {
+                std.debug.print("onyx-server: Windows backup private directory failed ({s})\n", .{@errorName(err)});
+                return false;
+            };
+        }
+        defer if (private_writer) |*writer| writer.deinit();
+        const writer_ptr: ?*backup_set.PrivateWriterWindows = if (private_writer) |*writer| writer else null;
+        var nonce: [16]u8 = undefined;
+        if (comptime builtin.os.tag == .windows) io.random(&nonce);
         var name_buf: [96]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "accounts-{d}.db.snap", .{generated_unix}) catch return false;
+        const name = if (comptime builtin.os.tag == .windows)
+            std.fmt.bufPrint(&name_buf, "accounts-{d}-{s}.db.snap", .{ generated_unix, std.fmt.bytesToHex(nonce, .lower) }) catch return false
+        else
+            std.fmt.bufPrint(&name_buf, "accounts-{d}.db.snap", .{generated_unix}) catch return false;
         const source = if (self.config.account_store_path.len != 0) self.config.account_store_path else svc.store.snapshot_path;
-        if (!self.copyFileToBackup(io, svc.store.snapshot_path, name, backup_set.max_backup_file_bytes)) return false;
+        if (comptime builtin.os.tag == .windows) {
+            const snapshot = svc.store.readPrivateSnapshotAllocWindows(self.allocator, backup_set.max_backup_file_bytes) catch |err| {
+                std.debug.print("onyx-server: Windows backup snapshot read failed ({s})\n", .{@errorName(err)});
+                return false;
+            };
+            defer {
+                std.crypto.secureZero(u8, snapshot);
+                self.allocator.free(snapshot);
+            }
+            writer_ptr.?.writeNewFile(name, snapshot) catch |err| {
+                std.debug.print("onyx-server: Windows backup snapshot publish failed ({s})\n", .{@errorName(err)});
+                return false;
+            };
+        } else if (!self.copyFileToBackup(io, svc.store.snapshot_path, name, backup_set.max_backup_file_bytes, null)) return false;
 
         var files: [2]backup_set.Artifact = undefined;
         files[0] = .{ .kind = "accounts", .name = name, .source = source };
@@ -8210,8 +8306,11 @@ pub const LinuxServer = struct {
             var src_buf: [1024]u8 = undefined;
             const src = std.fmt.bufPrint(&src_buf, "{s}/.chanstats.snapshot", .{self.config.chanstats_dir}) catch return false;
             var stats_name_buf: [96]u8 = undefined;
-            const stats_name = std.fmt.bufPrint(&stats_name_buf, "chanstats-{d}.snapshot", .{generated_unix}) catch return false;
-            if (!self.copyFileToBackup(io, src, stats_name, backup_set.max_backup_file_bytes)) return false;
+            const stats_name = if (comptime builtin.os.tag == .windows)
+                std.fmt.bufPrint(&stats_name_buf, "chanstats-{d}-{s}.snapshot", .{ generated_unix, std.fmt.bytesToHex(nonce, .lower) }) catch return false
+            else
+                std.fmt.bufPrint(&stats_name_buf, "chanstats-{d}.snapshot", .{generated_unix}) catch return false;
+            if (!self.copyFileToBackup(io, src, stats_name, backup_set.max_backup_file_bytes, writer_ptr)) return false;
             files[1] = .{ .kind = backup_set.chanstats_name, .name = stats_name, .source = src };
             file_count = 2;
             chanstats_included = true;
@@ -8219,12 +8318,29 @@ pub const LinuxServer = struct {
 
         var manifest_buf: [4096]u8 = undefined;
         const manifest = backup_set.writeManifest(&manifest_buf, generated_unix, files[0..file_count], chanstats_included) catch return false;
+        if (writer_ptr) |writer| {
+            writer.writeFile("latest.json", manifest) catch |err| {
+                std.debug.print("onyx-server: Windows backup manifest publish failed ({s})\n", .{@errorName(err)});
+                return false;
+            };
+            return true;
+        }
         return writeFileAtomicStatus(io, self.config.backup_dir, "latest.json", manifest);
     }
 
-    fn copyFileToBackup(self: *LinuxServer, io: std.Io, source_path: []const u8, name: []const u8, limit: usize) bool {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, source_path, self.allocator, .limited(limit)) catch return false;
+    fn copyFileToBackup(self: *LinuxServer, io: std.Io, source_path: []const u8, name: []const u8, limit: usize, private_writer: ?*backup_set.PrivateWriterWindows) bool {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, source_path, self.allocator, .limited(limit)) catch |err| {
+            if (comptime builtin.os.tag == .windows) std.debug.print("onyx-server: Windows backup artifact {s} read failed ({s})\n", .{ name, @errorName(err) });
+            return false;
+        };
         defer self.allocator.free(bytes);
+        if (private_writer) |writer| {
+            writer.writeNewFile(name, bytes) catch |err| {
+                if (comptime builtin.os.tag == .windows) std.debug.print("onyx-server: Windows backup artifact {s} publish failed ({s})\n", .{ name, @errorName(err) });
+                return false;
+            };
+            return true;
+        }
         return writeFileAtomicStatus(io, self.config.backup_dir, name, bytes);
     }
 
@@ -8492,7 +8608,9 @@ pub const LinuxServer = struct {
         atomic.file.writeStreamingAll(io, data) catch return false;
         atomic.file.sync(io) catch return false;
         atomic.replace(io) catch return false;
-        syncIoDir(atomic.dir, io) catch return false;
+        // Windows has no directory fsync through std.Io; the file has been
+        // flushed and the atomic replacement has already completed.
+        if (comptime builtin.os.tag != .windows) syncIoDir(atomic.dir, io) catch return false;
         return true;
     }
 
@@ -8758,6 +8876,21 @@ pub const LinuxServer = struct {
         _ = try self.rx().ring.reapCompletions(cqes[0..cqe_batch], 0, &handler);
         if (handler.err) |err| return err;
 
+        if (comptime builtin.os.tag == .windows) {
+            // The one listener owner hands off accepted sockets before they
+            // have an IOCP association. Admit on the destination owner thread
+            // so its first receive binds the socket to that shard's port.
+            var first_accept_error: ?anyerror = null;
+            while (self.rx().windows_accepted.pop()) |accepted| {
+                self.world.lockWrite();
+                self.handleAccept(accepted) catch |err| {
+                    if (first_accept_error == null) first_accept_error = err;
+                };
+                self.world.unlockWrite();
+            }
+            if (first_accept_error) |err| return err;
+        }
+
         // Belt-and-suspenders against a lost wake: drain any cross-shard handoffs
         // addressed to this reactor every iteration, not only on the wake-poll
         // completion. Cheap when empty (one lock-free pop returning 0). Each
@@ -8964,14 +9097,22 @@ pub const LinuxServer = struct {
         var index: usize = 0;
         for (self.reactors) |*r| for (r.acceptOps()) |op| {
             if (op.fd < 0) continue;
-            var address: posix.sockaddr.storage = undefined;
-            var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-            if (posix.errno(socket_system.getsockname(op.fd, @ptrCast(&address), &len)) != .SUCCESS)
-                return error.InvalidInheritedListener;
-            const family: ListenerFamily = switch (address.family) {
-                posix.AF.INET => .ipv4,
-                posix.AF.INET6 => .ipv6,
-                else => return error.InvalidInheritedListener,
+            const family: ListenerFamily = if (comptime builtin.os.tag == .windows) blk: {
+                const observed = io_backend.observeWindowsListeningTcpSocket(op.fd) catch return error.InvalidInheritedListener;
+                break :blk switch (observed.local.address) {
+                    .ipv4 => .ipv4,
+                    .ipv6 => .ipv6,
+                };
+            } else blk: {
+                var address: posix.sockaddr.storage = undefined;
+                var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+                if (posix.errno(socket_system.getsockname(op.fd, @ptrCast(&address), &len)) != .SUCCESS)
+                    return error.InvalidInheritedListener;
+                break :blk switch (address.family) {
+                    posix.AF.INET => .ipv4,
+                    posix.AF.INET6 => .ipv6,
+                    else => return error.InvalidInheritedListener,
+                };
             };
             for (rows[0..index]) |prior| if (prior.fd == op.fd) return error.InvalidInheritedListener;
             rows[index] = .{ .shard = r.shard_id, .kind = op.kind, .family = family, .fd = op.fd };
@@ -9665,6 +9806,23 @@ pub const LinuxServer = struct {
         }
         if (event.res < 0) return error.BadCompletion;
 
+        if (comptime builtin.os.tag == .windows) {
+            if (self.reactors.len > 1 and self.rx() == &self.reactors[0] and !is_s2s) {
+                const target = self.windows_accept_next % self.reactors.len;
+                self.windows_accept_next +%= 1;
+                if (target != 0 and self.reactors[target].wake != null and
+                    self.reactors[target].windows_accepted.push(.{
+                        .token = event.token,
+                        .res = event.res,
+                        .more = false,
+                    }))
+                {
+                    if (self.reactors[target].wake) |*wake| wake.wake();
+                    return;
+                }
+            }
+        }
+
         const fd: linux.fd_t = event.res;
         errdefer closeFd(fd);
 
@@ -9686,6 +9844,7 @@ pub const LinuxServer = struct {
         }
 
         const id = try self.rx().clients.alloc(ConnState.init(fd));
+        _ = self.rx().accepted_count.fetchAdd(1, .monotonic);
         // Free the slot on any later failure so a half-set-up accept never leaves
         // an occupied slot (which deinit would then try to tear down).
         errdefer _ = self.rx().clients.free(id);
@@ -9816,6 +9975,18 @@ pub const LinuxServer = struct {
     /// users never see the raw address. Best-effort: any failure leaves the host
     /// fields empty and the prefix path falls back to the default host.
     fn captureClientHost(self: *LinuxServer, conn: *ConnState) void {
+        if (comptime builtin.os.tag == .windows) {
+            const peer = io_backend.socketPeerAddress(conn.fd) catch return;
+            const addr: dns.Address = switch (peer) {
+                .ipv4 => |bytes| .{ .ipv4 = bytes },
+                .ipv6 => |bytes| if (isV4Mapped(bytes))
+                    .{ .ipv4 = bytes[12..16].* }
+                else
+                    .{ .ipv6 = bytes },
+            };
+            self.applyAcceptedAddress(conn, addr);
+            return;
+        }
         var storage: posix.sockaddr.storage = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         if (comptime builtin.os.tag == .linux) {
@@ -10945,6 +11116,12 @@ pub const LinuxServer = struct {
         const was_cancel_pending = conn.connect_cancel_pending;
         conn.connect_armed = false;
         conn.connect_cancel_pending = false;
+        if (comptime builtin.os.tag == .windows) {
+            if (conn.windows_force_close_cancel) {
+                try self.closeConn(event.token, conn.close_reason);
+                return;
+            }
+        }
         if (was_cancel_pending and event.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
             conn.connect_rearm_pending = true;
             if (!self.rx().socket_io_quiescing) {
@@ -11354,6 +11531,12 @@ pub const LinuxServer = struct {
         const was_cancel_pending = conn.recv_cancel_pending;
         conn.recv_armed = false;
         conn.recv_cancel_pending = false;
+        if (comptime builtin.os.tag == .windows) {
+            if (conn.windows_force_close_cancel) {
+                try self.closeConn(event.token, conn.close_reason);
+                return;
+            }
+        }
 
         // Helix's exact cancel releases the kernel's recv_buf reference without
         // meaning EOF. Preserve the live stream and, while the owner is at its
@@ -11463,6 +11646,12 @@ pub const LinuxServer = struct {
         conn.send_submitted_offset = 0;
         conn.send_armed = false;
         conn.send_cancel_pending = false;
+        if (comptime builtin.os.tag == .windows) {
+            if (conn.windows_force_close_cancel) {
+                try self.closeConn(event.token, conn.close_reason);
+                return;
+            }
+        }
         // Cancellation is not a stream error. No bytes were accepted, so retain
         // the exact unsent [send_offset, send_len) tail for the Helix snapshot.
         if (was_cancel_pending and
@@ -15363,9 +15552,41 @@ pub const LinuxServer = struct {
         conn.close_reason = conn.close_reason_store[0..len];
     }
 
+    fn cancelWindowsClosingIo(self: *LinuxServer, conn: *ConnState) void {
+        if (comptime builtin.os.tag != .windows) return;
+        const ring = &self.rx().ring;
+        if (conn.recv_armed and !conn.recv_cancel_pending) {
+            if (io_backend.submitCancel(ring, .recv, conn.token)) |_| {
+                conn.recv_cancel_pending = true;
+            } else |err| {
+                if (err == error.SubmissionQueueFull) self.wakeReactor();
+            }
+        }
+        if (conn.send_armed and !conn.send_cancel_pending) {
+            if (io_backend.submitCancel(ring, .send, conn.token)) |_| {
+                conn.send_cancel_pending = true;
+            } else |err| {
+                if (err == error.SubmissionQueueFull) self.wakeReactor();
+            }
+        }
+        if (conn.connect_armed and !conn.connect_cancel_pending) {
+            if (io_backend.submitCancel(ring, .connect, conn.token)) |_| {
+                conn.connect_cancel_pending = true;
+            } else |err| {
+                if (err == error.SubmissionQueueFull) self.wakeReactor();
+            }
+        }
+    }
+
+    fn retryWindowsClosingIo(self: *LinuxServer) void {
+        if (comptime builtin.os.tag != .windows) return;
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied or !slot.value.windows_force_close_cancel) continue;
+            self.closeConn(slot.value.token, slot.value.close_reason) catch {};
+        }
+    }
+
     fn closeConn(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
-        // Windows HANDLEs are not i32 fds; connection teardown stays POSIX-only.
-        if (comptime builtin.os.tag == .windows) return error.Unsupported;
         const id = idFromToken(token);
         if (self.rx().clients.get(id)) |conn| {
             // A racing RECV (including cancellation at a Helix safe point) must
@@ -15392,6 +15613,10 @@ pub const LinuxServer = struct {
                 conn.closing = true;
                 conn.io_activation_pending = false;
                 conn.activation_recv_required = false;
+                if (comptime builtin.os.tag == .windows) {
+                    conn.windows_force_close_cancel = true;
+                    self.cancelWindowsClosingIo(conn);
+                }
                 if (comptime builtin.os.tag == .linux)
                     _ = linux.shutdown(conn.fd, linux.SHUT.RDWR)
                 else
@@ -28773,8 +28998,8 @@ pub const LinuxServer = struct {
     };
 
     /// Seal ONE reactor shard's connections for a Helix UPGRADE: every carried
-    /// client gets its capsules queued on `pieces`/`blobs`, its socket fd
-    /// un-CLOEXEC'd, and the fd recorded in `carried_fds` (which must have room
+    /// client gets its capsules queued on `pieces`/`blobs` and its socket ID
+    /// recorded in `carried_fds` (which must have room
     /// for the shard's whole slot table). Established secured mesh links (a
     /// reactor-0-only population) are preserved the same way; other links seal
     /// a re-dial hint. Safe to call for a foreign shard ONLY while that shard's
@@ -28818,9 +29043,9 @@ pub const LinuxServer = struct {
                     // refuses the whole UPGRADE instead of accepting AuthFail/redial.
                     const est = link.established();
                     if (est and self.sealSecuredLink(e.value, link, pieces, blobs)) {
-                        // Preserved: carry the fd across execve; do NOT also seal a
+                        // Preserved: carry the socket across the upgrade; do NOT also seal a
                         // re-dial hint (that would open a duplicate link → churn).
-                        if (!setCloexec(e.value.fd, builtin.os.tag == .openbsd)) {
+                        if (builtin.os.tag != .windows and !setCloexec(e.value.fd, builtin.os.tag == .openbsd)) {
                             counts.fd_prepare_failed = true;
                             continue;
                         }
@@ -29153,8 +29378,8 @@ pub const LinuxServer = struct {
             if (!sidecars_complete) continue;
             if (tls_blob != null) counts.tls += 1;
             if (carry_ws) counts.ws += 1;
-            // Preserve the client socket across execve so the successor re-attaches it.
-            if (!setCloexec(e.value.fd, builtin.os.tag == .openbsd)) {
+            // Preserve the client socket so the successor re-attaches it.
+            if (builtin.os.tag != .windows and !setCloexec(e.value.fd, builtin.os.tag == .openbsd)) {
                 counts.fd_prepare_failed = true;
                 continue;
             }
@@ -29637,6 +29862,10 @@ pub const LinuxServer = struct {
     /// state sockets disjoint from the arena and every inherited/live listener.
     /// A malformed environment must never trick cleanup into closing the port.
     fn inheritedStateFdIsConnectedStreamSocket(fd: linux.fd_t) bool {
+        if (comptime builtin.os.tag == .windows) {
+            _ = io_backend.observeWindowsConnectedTcpSocket(fd) catch return false;
+            return true;
+        }
         if (comptime builtin.os.tag == .openbsd) {
             if (!os_runtime.fdValid(fd)) return false;
             const socket_type = os_runtime.socketType(fd) catch return false;
@@ -29673,7 +29902,7 @@ pub const LinuxServer = struct {
     fn inheritedStateFdManifestTrusted(self: *LinuxServer, arena_fd: linux.fd_t) bool {
         if (!self.config.inherited_state_fd_manifest_present or
             !self.config.inherited_state_fd_manifest_valid or
-            self.config.inherited_state_fds.len == 0 or
+            (self.config.inherited_state_fds.len == 0 and builtin.os.tag == .linux) or
             self.config.inherited_state_fds.len > helix_live.max_inherited_state_fds)
             return false;
 
@@ -29890,11 +30119,11 @@ pub const LinuxServer = struct {
     }
 
     pub fn adoptInheritedSessions(self: *LinuxServer) error{ InvalidInheritedHandoff, DurableDeviceActivationFailed }!void {
-        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) {
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) {
             io_backend.refuseForeignCapsule() catch return error.InvalidInheritedHandoff;
             return error.InvalidInheritedHandoff;
         }
-        const arena_fd: linux.fd_t = if (builtin.os.tag == .openbsd) blk: {
+        const arena_fd: linux.fd_t = if (builtin.os.tag == .openbsd or builtin.os.tag == .windows) blk: {
             if (self.config.native_arena_bytes == null) {
                 if (self.config.resume_arena_fd != null or self.config.inherited_state_fd_manifest_present or
                     self.config.native_adopt_barrier != null or self.config.native_listener_manifest.len != 0) return error.InvalidInheritedHandoff;
@@ -29931,7 +30160,7 @@ pub const LinuxServer = struct {
         // 0, the reactor that owns the inherited listener and every connection
         // adopted below.
         current_reactor = &self.reactors[0];
-        const caps = (if (builtin.os.tag == .openbsd) blk: {
+        const caps = (if (builtin.os.tag == .openbsd or builtin.os.tag == .windows) blk: {
             const bytes = self.config.native_arena_bytes.?;
             if (bytes.len > helix_live.max_arena_bytes) break :blk error.ArenaTooLarge;
             break :blk helix_capsule.decodeStream(self.allocator, bytes);
@@ -31588,7 +31817,7 @@ pub const LinuxServer = struct {
         adoption_stage = "native pre-commit preparation";
         var native_bot_stage: ?NativeBotStage = null;
         defer if (native_bot_stage) |*stage| stage.deinit();
-        if (comptime builtin.os.tag == .openbsd) {
+        if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
             native_bot_stage = self.stageNativeBotGrants(bot_grant_checkpoint) catch |err| {
                 world_replacement.swapWorldInto(&self.world);
                 srvLog("onyx-server: UPGRADE resume fatal — native bot staging failed ({s})\n", .{@errorName(err)});
@@ -31619,6 +31848,17 @@ pub const LinuxServer = struct {
                 }
             }
             const barrier = self.config.native_adopt_barrier.?;
+            if (comptime builtin.os.tag == .windows) {
+                const claim = barrier.claimInertStateSocket orelse {
+                    world_replacement.swapWorldInto(&self.world);
+                    return error.InvalidInheritedHandoff;
+                };
+                for (self.config.inherited_state_fds) |fd| claim(barrier.ctx, fd) catch |err| {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("onyx-server: UPGRADE resume fatal — Windows socket custody claim failed ({s})\n", .{@errorName(err)});
+                    return error.InvalidInheritedHandoff;
+                };
+            }
             barrier.readyAndAwaitCommit(barrier.ctx) catch |err| {
                 world_replacement.swapWorldInto(&self.world);
                 srvLog("onyx-server: UPGRADE resume fatal — native commit barrier failed ({s})\n", .{@errorName(err)});
@@ -31746,7 +31986,7 @@ pub const LinuxServer = struct {
         // the account stays gated. Nothing in this restore sets `is_oper`.
         var bot_grants_restored: usize = 0;
         var bot_grants_dropped: usize = 0;
-        if (comptime builtin.os.tag == .openbsd) {
+        if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
             const stage = &native_bot_stage.?;
             std.mem.swap(bot_grant_snapshot.Table, &self.bot_grants, stage.table);
             std.mem.swap(bot_registry_mod.BotRegistry, &self.bot_registry, &stage.registry);
@@ -33277,8 +33517,6 @@ pub const LinuxServer = struct {
     /// Record `fault`, then replace the operator file with tracelog lines.
     /// An empty path does nothing. IO errors are swallowed so a dump cannot fault.
     fn flushFlightRecorder(self: *LinuxServer, category: tracelog.Category, fault: []const u8) void {
-        // The fault dump uses raw POSIX fds; unsupported where fds are HANDLEs.
-        if (comptime builtin.os.tag == .windows) return;
         const path = self.config.flight_recorder_path;
         if (path.len == 0) return;
         self.traceLog(.fatal, category, fault);
@@ -33287,7 +33525,7 @@ pub const LinuxServer = struct {
         var path_buf: [flight_path_max + 1]u8 = undefined;
         @memcpy(path_buf[0..path.len], path);
         path_buf[path.len] = 0;
-        const fd: linux.fd_t = if (builtin.os.tag == .openbsd)
+        const fd: linux.fd_t = if (builtin.os.tag == .openbsd or builtin.os.tag == .windows)
             os_runtime.openTruncateZ(path_buf[0..path.len :0], 0o600) catch return
         else blk: {
             const opened = linux.open(path_buf[0..path.len :0], .{
@@ -33326,8 +33564,8 @@ pub const LinuxServer = struct {
                 .fields = fields[0..n],
             }, &line) catch continue;
             if (written + rendered.len + 1 > flight_recorder_max_file_bytes) break;
-            if (!writeAllLinux(fd, rendered)) return;
-            if (!writeAllLinux(fd, "\n")) return;
+            if (!writeAllNative(fd, rendered)) return;
+            if (!writeAllNative(fd, "\n")) return;
             written += rendered.len + 1;
         }
     }
@@ -59245,7 +59483,7 @@ fn destroyManagedCoreBacking(b: *ManagedCoreBacking) void {
     b.policy.deinit();
 }
 
-pub const Server = if (builtin.os.tag == .linux or builtin.os.tag == .openbsd) LinuxServer else PortableServer;
+pub const Server = if (builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows) LinuxServer else PortableServer;
 
 const PortableChan = struct {
     name: []u8,
@@ -60994,7 +61232,7 @@ fn restoreCloexec(fds: []const linux.fd_t) void {
 }
 
 fn setCloexec(fd: linux.fd_t, enabled: bool) bool {
-    if (builtin.os.tag == .openbsd) {
+    if (builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         os_runtime.setCloexec(fd, enabled) catch return false;
         return true;
     }
@@ -63224,15 +63462,22 @@ fn expectFlightOnce(haystack: []const u8, needle: []const u8) !void {
 }
 
 test "GAP-O3 a fault writes the tracelog to the named file" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
-    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
-        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
-        else => return err,
+    const server = try allocator.create(Server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| {
+        allocator.destroy(server);
+        return switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => error.SkipZigTest,
+            else => err,
+        };
     };
-    defer server.deinit();
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
     current_reactor = &server.reactors[0];
     server.bindFlightPanicTarget();
 
@@ -67481,7 +67726,7 @@ fn hasSep(s: []const u8) bool {
 fn writeFileAbs(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) void {
     const zpath = allocator.dupeSentinel(u8, path, 0) catch return;
     defer allocator.free(zpath);
-    if (comptime builtin.os.tag == .openbsd) {
+    if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         const fd = os_runtime.openTruncateZ(zpath, 0o600) catch return;
         defer os_runtime.close(fd);
         var off: usize = 0;
@@ -67757,21 +68002,32 @@ fn primaryListenerHost(host: []const u8) []const u8 {
 }
 
 fn nativeManifestListener(config: Config, shard: u12, kind: ListenerKind, companion: bool) ?linux.fd_t {
-    if (comptime builtin.os.tag != .openbsd) return null;
-    const family: ListenerFamily = if (companion or std.mem.indexOfScalar(u8, primaryListenerHost(config.host), ':') != null) .ipv6 else .ipv4;
+    if (comptime builtin.os.tag != .openbsd and builtin.os.tag != .windows) return null;
+    if (builtin.os.tag == .windows and companion) return null;
+    const family: ListenerFamily = if (builtin.os.tag == .windows or companion or std.mem.indexOfScalar(u8, primaryListenerHost(config.host), ':') != null) .ipv6 else .ipv4;
     for (config.native_listener_manifest) |row| {
         if (row.shard == shard and row.kind == kind and row.family == family) return row.fd;
     }
     return null;
 }
 
-fn adoptNativeListener(fd: linux.fd_t) !linux.fd_t {
+fn adoptNativeListener(config: Config, fd: linux.fd_t) !linux.fd_t {
+    if (comptime builtin.os.tag == .windows) {
+        _ = try io_backend.observeWindowsListeningTcpSocket(fd);
+        if (config.native_arena_bytes != null) {
+            const barrier = config.native_adopt_barrier orelse return error.InvalidInheritedListener;
+            const claim = barrier.claimInertListenerSocket orelse return error.InvalidInheritedListener;
+            claim(barrier.ctx, fd) catch return error.InvalidInheritedListener;
+        }
+        return fd;
+    }
     try os_runtime.setCloexec(fd, true);
     try os_runtime.setNonblocking(fd);
     return fd;
 }
 
 fn nativeListenerEnabled(config: Config, shard: u12, kind: ListenerKind) bool {
+    if (builtin.os.tag == .windows and shard != 0) return false;
     return switch (kind) {
         .plain => true,
         .s2s => config.s2s_port != 0 and shard == 0,
@@ -67790,7 +68046,7 @@ fn nativeListenerPort(config: Config, kind: ListenerKind) u16 {
 }
 
 fn validateNativeInheritedListenerClaims(config: Config) !void {
-    if (comptime builtin.os.tag != .openbsd) return;
+    if (comptime builtin.os.tag != .openbsd and builtin.os.tag != .windows) return;
     const rows = config.native_listener_manifest;
     if (config.native_arena_bytes != null or config.native_adopt_barrier != null) {
         if (config.native_arena_bytes == null or config.native_adopt_barrier == null or rows.len == 0 or
@@ -67801,11 +68057,11 @@ fn validateNativeInheritedListenerClaims(config: Config) !void {
             config.inherited_listener_companion_fds.len != 0) return error.InvalidInheritedListener;
         const shards = LinuxServer.clampShards(config);
         const wildcard = wildcardListenerHost(config.host);
-        const primary_family: ListenerFamily = if (std.mem.indexOfScalar(u8, primaryListenerHost(config.host), ':') != null) .ipv6 else .ipv4;
+        const primary_family: ListenerFamily = if (builtin.os.tag == .windows or std.mem.indexOfScalar(u8, primaryListenerHost(config.host), ':') != null) .ipv6 else .ipv4;
         var expected: usize = 0;
         for (0..shards) |shard| {
             for (std.enums.values(ListenerKind)) |kind| {
-                if (nativeListenerEnabled(config, @intCast(shard), kind)) expected += if (wildcard) @as(usize, 2) else 1;
+                if (nativeListenerEnabled(config, @intCast(shard), kind)) expected += if (wildcard and builtin.os.tag == .openbsd) @as(usize, 2) else 1;
             }
         }
         if (rows.len != expected) return error.InvalidInheritedListener;
@@ -67857,6 +68113,26 @@ fn validateNativeInheritedListenerClaims(config: Config) !void {
 }
 
 fn validateNativeListenerAddress(fd: linux.fd_t, host: []const u8, port: u16) !void {
+    if (comptime builtin.os.tag == .windows) {
+        const observed = io_backend.observeWindowsListeningTcpSocket(fd) catch return error.InvalidInheritedListener;
+        const actual = switch (observed.local.address) {
+            .ipv6 => |bytes| bytes,
+            .ipv4 => return error.InvalidInheritedListener,
+        };
+        var expected: [16]u8 = @splat(0);
+        if (host.len != 0 and !std.mem.eql(u8, host, "0.0.0.0") and !std.mem.eql(u8, host, "::")) {
+            if (std.Io.net.Ip6Address.parse(host, port)) |ip6| {
+                if (ip6.interface.index != 0) return error.InvalidInheritedListener;
+                expected = ip6.bytes;
+            } else |_| {
+                const ip4 = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidInheritedListener;
+                expected = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ ip4.bytes;
+            }
+        }
+        if (!std.mem.eql(u8, &actual, &expected) or (port != 0 and observed.local.port != port))
+            return error.InvalidInheritedListener;
+        return;
+    }
     if (comptime builtin.os.tag != .openbsd) return;
     if (!os_runtime.fdValid(fd) or (os_runtime.socketType(fd) catch return error.InvalidInheritedListener) != posix.SOCK.STREAM)
         return error.InvalidInheritedListener;
@@ -67913,6 +68189,8 @@ fn stageListenerCompanion(
 
 fn createListener(host: []const u8, port: u16, backlog: u31) ServerError!linux.fd_t {
     if (comptime builtin.os.tag == .openbsd) return reuseport.createOpenBsdListener(host, port, backlog, false);
+    if (comptime builtin.os.tag == .windows)
+        return reuseport.createWindowsListener(host, port, backlog) catch return error.SocketUnavailable;
     // Dual-stack: a single AF_INET6 socket accepts both IPv6 and IPv4 peers (the
     // latter as IPv4-mapped ::ffff:a.b.c.d, normalized in captureClientHost).
     // V6ONLY is disabled explicitly so this never depends on the host's
@@ -68167,6 +68445,8 @@ fn sockaddrIn6FromV4(addr4: [4]u8, port: u16) posix.sockaddr.in6 {
 const socket_system = if (builtin.os.tag == .openbsd) posix.system else linux;
 
 fn socketTcp() ServerError!linux.fd_t {
+    if (comptime builtin.os.tag == .windows)
+        return io_backend.openWindowsTcpSocket(posix.AF.INET) catch return error.SocketUnavailable;
     // Winsock has no CLOEXEC flag.
     const flags = posix.SOCK.STREAM |
         (if (comptime builtin.os.tag == .windows) 0 else posix.SOCK.CLOEXEC) |
@@ -68181,6 +68461,8 @@ fn socketTcp() ServerError!linux.fd_t {
 }
 
 fn socketTcp6() ServerError!linux.fd_t {
+    if (comptime builtin.os.tag == .windows)
+        return io_backend.openWindowsTcpSocket(posix.AF.INET6) catch return error.SocketUnavailable;
     // Winsock has no CLOEXEC flag.
     const flags = posix.SOCK.STREAM |
         (if (comptime builtin.os.tag == .windows) 0 else posix.SOCK.CLOEXEC) |
@@ -68196,6 +68478,8 @@ fn socketTcp6() ServerError!linux.fd_t {
 
 fn bindSocket(fd: linux.fd_t, addr: *const posix.sockaddr.in) ServerError!void {
     const ptr: *const posix.sockaddr = @ptrCast(addr);
+    if (comptime builtin.os.tag == .windows)
+        return io_backend.bindWindowsSocket(fd, ptr, @sizeOf(posix.sockaddr.in)) catch return error.Unexpected;
     const rc = socket_system.bind(fd, ptr, @sizeOf(posix.sockaddr.in));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
@@ -68228,6 +68512,8 @@ fn sockaddrIn6(host: []const u8, port: u16) ServerError!posix.sockaddr.in6 {
 
 fn bindSocket6(fd: linux.fd_t, addr: *const posix.sockaddr.in6) ServerError!void {
     const ptr: *const posix.sockaddr = @ptrCast(addr);
+    if (comptime builtin.os.tag == .windows)
+        return io_backend.bindWindowsSocket(fd, ptr, @sizeOf(posix.sockaddr.in6)) catch return error.Unexpected;
     const rc = socket_system.bind(fd, ptr, @sizeOf(posix.sockaddr.in6));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
@@ -68238,6 +68524,8 @@ fn bindSocket6(fd: linux.fd_t, addr: *const posix.sockaddr.in6) ServerError!void
 }
 
 fn listenSocket(fd: linux.fd_t, backlog: u31) ServerError!void {
+    if (comptime builtin.os.tag == .windows)
+        return io_backend.listenWindowsSocket(fd, backlog) catch return error.Unexpected;
     const rc = socket_system.listen(fd, @intCast(backlog));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
@@ -68248,6 +68536,8 @@ fn listenSocket(fd: linux.fd_t, backlog: u31) ServerError!void {
 }
 
 fn setsockopt(fd: linux.fd_t, level: i32, optname: u32, opt: []const u8) ServerError!void {
+    if (comptime builtin.os.tag == .windows)
+        return io_backend.setWindowsSocketOption(fd, level, @intCast(optname), opt) catch return error.Unexpected;
     const rc = socket_system.setsockopt(fd, level, @intCast(optname), opt.ptr, @intCast(opt.len));
     switch (posix.errno(rc)) {
         .SUCCESS => return,
@@ -68280,6 +68570,8 @@ fn applyClientKeepalive(fd: linux.fd_t) void {
 }
 
 fn socketPort(fd: linux.fd_t) ServerError!u16 {
+    if (comptime builtin.os.tag == .windows)
+        return io_backend.socketPort(fd) catch return error.Unexpected;
     var storage: posix.sockaddr.storage = undefined;
     var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
     const rc = socket_system.getsockname(fd, @ptrCast(&storage), &len);
@@ -68835,6 +69127,10 @@ fn readFd(fd: linux.fd_t, buf: []u8) ServerError!usize {
 }
 
 fn closeFd(fd: linux.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        io_backend.closeSocket(fd);
+        return;
+    }
     if (comptime builtin.os.tag == .openbsd) {
         // kqueue drops registrations at close; no io_uring reference needs a
         // forced shutdown. SCM_RIGHTS copies share a socket with the serving
@@ -77180,6 +77476,34 @@ test "enforceDnsbl fails open: no resolver, an unresolved IP, and opers all pass
         try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.fromBits(~@as(u64, 0)), "netadmin", "Admin");
         try std.testing.expect(!server.enforceDnsbl(conn));
     } else return error.SkipZigTest;
+}
+
+test "Windows DNSBL listed verdict refuses a remote client and leaves unresolved clients open" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const server = try alloc.create(Server);
+    defer alloc.destroy(server);
+    server.initInPlace(alloc, .{ .host = "127.0.0.1", .port = 0, .max_clients = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var resolver = try dnsbl_resolver.Resolver.init(alloc, &.{"dnsbl.example.test"});
+    defer resolver.deinit();
+    server.config.dnsbl = &resolver;
+
+    var conn = ConnState.init(-1);
+    conn.test_sendq_capture = true;
+    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    try conn.session.setNick("listed");
+    try std.testing.expect(!server.enforceDnsbl(&conn));
+    try std.testing.expect(!conn.closing);
+
+    resolver.remember(conn.peer_addr.?, .{ .listed = true, .code = 4 });
+    try std.testing.expect(server.enforceDnsbl(&conn));
+    try std.testing.expect(conn.closing);
+    try std.testing.expectEqualStrings("DNSBL listed", conn.close_reason);
+    try expectContains(conn.send_buf[0..conn.send_len], "address is listed on a DNS blocklist [4]");
 }
 
 test "threaded server: multi-reactor (num_shards=4) survives concurrent clients" {
@@ -98421,6 +98745,31 @@ test "shared full server: native bot staging is allocation-failure atomic" {
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Sweep.run, .{ server, checkpoint, now });
+}
+
+test "Windows native Helix listener manifest verifies exact bound socket roles" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const listener = try reuseport.createWindowsListener("127.0.0.1", 0, 8);
+    defer closeFd(listener);
+    const port = try socketPort(listener);
+    const row = ListenerDescriptor{ .shard = 0, .kind = .plain, .family = .ipv6, .fd = listener };
+    var cfg = Config{ .host = "127.0.0.1", .port = port, .num_shards = 3, .native_listener_manifest = &.{row} };
+    try validateNativeInheritedListenerClaims(cfg);
+    try std.testing.expectEqual(listener, nativeManifestListener(cfg, 0, .plain, false).?);
+    try std.testing.expect(nativeManifestListener(cfg, 1, .plain, false) == null);
+
+    cfg.host = "127.0.0.2";
+    try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
+    cfg.host = "127.0.0.1";
+    cfg.port = if (port == 1) 2 else 1;
+    try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
+    cfg.port = port;
+    cfg.native_listener_manifest = &.{.{ .shard = 1, .kind = .plain, .family = .ipv6, .fd = listener }};
+    try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
+    cfg.native_listener_manifest = &.{.{ .shard = 0, .kind = .plain, .family = .ipv4, .fd = listener }};
+    try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
+    cfg.native_listener_manifest = &.{.{ .shard = 0, .kind = .tls, .family = .ipv6, .fd = listener }};
+    try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
 }
 
 test "shared full server: OpenBSD native Helix stages live clients until COMMIT and preserves ABORT peers" {

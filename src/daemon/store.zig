@@ -103,6 +103,96 @@ pub const AdmissionLimits = struct {
     max_wal_bytes: usize,
 };
 
+/// The authenticated Helix manifest binds a Windows WAL HANDLE to its exact
+/// disk object and replay cut. FileIdInfo retains the full 128-bit file ID;
+/// std.Io.File.Stat.inode alone is insufficient for this transfer.
+pub const WindowsWalWitness = struct {
+    file: WindowsFileIdInfo,
+    parent_directory: WindowsFileIdInfo,
+    name_digest: [std.crypto.hash.Blake3.digest_length]u8,
+    length: u64,
+};
+
+pub const WindowsWalDescriptor = struct {
+    handle: usize,
+    destination_pid: u32,
+    witness: WindowsWalWitness,
+
+    /// Called by the receiving process if staging fails or is aborted. A
+    /// descriptor in a different PID's handle table is never closed here.
+    pub fn deinitReceived(self: *WindowsWalDescriptor) void {
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (self.handle != 0 and self.destination_pid == GetCurrentProcessId())
+                _ = CloseHandle(self.handle);
+        }
+        self.handle = 0;
+    }
+};
+
+/// Parent-side rollback custody until a descriptor has been sent on the
+/// authenticated control channel. `release` transfers close responsibility to
+/// the child; aborting earlier closes the duplicate in that process.
+pub const WindowsWalTransfer = struct {
+    target_process: usize,
+    descriptor: WindowsWalDescriptor,
+
+    pub fn deinit(self: *WindowsWalTransfer) void {
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (self.descriptor.handle != 0) {
+                var local: usize = 0;
+                if (DuplicateHandle(self.target_process, self.descriptor.handle, GetCurrentProcess(), &local, 0, 0, windows_duplicate_same_access | windows_duplicate_close_source) != 0 and local != 0)
+                    _ = CloseHandle(local);
+            }
+        }
+        self.descriptor.handle = 0;
+    }
+
+    pub fn release(self: *WindowsWalTransfer) WindowsWalDescriptor {
+        const descriptor = self.descriptor;
+        self.descriptor.handle = 0;
+        return descriptor;
+    }
+};
+
+pub const WindowsFileIdInfo = extern struct {
+    volume_serial: u64,
+    file_id: [16]u8,
+};
+comptime {
+    if (@sizeOf(WindowsFileIdInfo) != 24) @compileError("Windows FILE_ID_INFO ABI mismatch");
+}
+const windows_file_id_info_class: i32 = 18;
+const windows_duplicate_same_access: u32 = 2;
+const windows_duplicate_close_source: u32 = 1;
+extern "kernel32" fn GetFileInformationByHandleEx(handle: usize, class: i32, info: *anyopaque, size: u32) callconv(.winapi) i32;
+extern "kernel32" fn DuplicateHandle(source_process: usize, source_handle: usize, target_process: usize, target_handle: *usize, desired_access: u32, inherit_handle: i32, options: u32) callconv(.winapi) i32;
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) usize;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+extern "kernel32" fn GetProcessId(process: usize) callconv(.winapi) u32;
+extern "kernel32" fn CloseHandle(handle: usize) callconv(.winapi) i32;
+
+fn windowsFileIdentity(handle: usize) !WindowsFileIdInfo {
+    if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+    var info: WindowsFileIdInfo = undefined;
+    if (GetFileInformationByHandleEx(handle, windows_file_id_info_class, &info, @sizeOf(WindowsFileIdInfo)) == 0)
+        return StoreError.SnapshotCoverageMismatch;
+    return info;
+}
+
+fn windowsWalWitness(io: std.Io, file: std.Io.File, dir: std.Io.Dir, name: []const u8) !WindowsWalWitness {
+    if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return StoreError.SnapshotCoverageMismatch;
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    std.crypto.hash.Blake3.hash(name, &digest, .{});
+    return .{
+        .file = try windowsFileIdentity(@intFromPtr(file.handle)),
+        .parent_directory = try windowsFileIdentity(@intFromPtr(dir.handle)),
+        .name_digest = digest,
+        .length = stat.size,
+    };
+}
+
 pub const Family = enum(u8) {
     accounts,
     nicks,
@@ -270,7 +360,12 @@ pub const OroStore = struct {
     snapshot_path: []u8,
     wal_file: ?std.Io.File = null,
     staged_read_only: bool = false,
+    /// Daemon account stores require private native custody; generic stores
+    /// retain their existing cross-platform storage policy.
+    private_windows_files: bool = false,
+    owned_private_directory: bool = false,
     staged_write_file: ?std.Io.File = null,
+    transferred_windows_wal: ?WindowsWalWitness = null,
     wal_offset: u64 = 0,
     // Headerless WALs predate epoch records. Give that format a deterministic
     // identity so snapshot coverage never serializes undefined bytes and can
@@ -309,16 +404,103 @@ pub const OroStore = struct {
         wal_path: []const u8,
         cfg: Config,
     ) !OroStore {
-        return openImpl(allocator, io, dir, wal_path, cfg, false);
+        return openImpl(allocator, io, dir, wal_path, cfg, false, false, null);
+    }
+
+    /// Windows account-store lane. The parent directory must already have an
+    /// inheritable private ACL; every existing file is acquired exclusively and
+    /// hardened before replay, and new files are protected before any write.
+    pub fn openPrivateWindowsWithConfig(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, wal_path: []const u8, cfg: Config) !OroStore {
+        if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+        const name = std.fs.path.basename(wal_path);
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidPath;
+        const parent_path = std.fs.path.dirname(wal_path) orelse ".";
+        const private_dir = try cold_runtime.openPrivateDirectoryWindows(io, dir, parent_path);
+        errdefer private_dir.close(io);
+        var store = try openImpl(allocator, io, private_dir, name, cfg, false, true, null);
+        store.owned_private_directory = true;
+        return store;
     }
 
     /// Native Helix staging: replay existing files without creation, repair,
     /// truncation, epoch writes or compaction. Every mutation remains refused.
     pub fn openReadOnlyWithConfig(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, wal_path: []const u8, cfg: Config) !OroStore {
-        return openImpl(allocator, io, dir, wal_path, cfg, true);
+        return openImpl(allocator, io, dir, wal_path, cfg, true, false, null);
     }
 
-    fn openImpl(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, wal_path: []const u8, cfg: Config, read_only: bool) !OroStore {
+    /// Parent-side transfer of the already-open private account WAL. The
+    /// returned duplicate lives in `target_process` and is rolled back by
+    /// WindowsWalTransfer.deinit until its descriptor is authenticated/sent.
+    /// The process HANDLE is borrowed and must stay valid until that cut.
+    pub fn duplicatePrivateWalToWindowsProcess(self: *OroStore, target_process: usize) !WindowsWalTransfer {
+        if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+        if (!self.private_windows_files or self.staged_read_only or self.staged_write_file != null)
+            return StoreError.ReadOnlyStore;
+        if (self.active_prepared != null or self.active_batch != null)
+            return StoreError.PreparedMutationActive;
+        const source = self.wal_file orelse return StoreError.SnapshotCoverageMismatch;
+        try cold_runtime.requireExistingPrivateFileHandleWindows(source);
+        const witness = try windowsWalWitness(self.io, source, self.dir, self.wal_path);
+        if (witness.length != self.wal_offset) return StoreError.SnapshotCoverageMismatch;
+        const pid = GetProcessId(target_process);
+        if (pid == 0) return error.InvalidWindowsProcess;
+        var copy: usize = 0;
+        if (DuplicateHandle(GetCurrentProcess(), @intFromPtr(source.handle), target_process, &copy, 0, 0, windows_duplicate_same_access) == 0 or copy == 0)
+            return error.DuplicateFailed;
+        var transfer = WindowsWalTransfer{ .target_process = target_process, .descriptor = .{ .handle = copy, .destination_pid = pid, .witness = witness } };
+        errdefer transfer.deinit();
+        if (!std.meta.eql(witness, try windowsWalWitness(self.io, source, self.dir, self.wal_path))) return StoreError.SnapshotCoverageMismatch;
+        return transfer;
+    }
+
+    /// Candidate-side read-only replay through the transferred WAL HANDLE.
+    /// The caller owns `descriptor` until this succeeds; every failure closes
+    /// its received duplicate. Snapshot replay remains rooted in a validated
+    /// private directory and is covered by the WAL epoch/digest checks.
+    pub fn openTransferredPrivateWindowsWithConfig(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, wal_path: []const u8, cfg: Config, descriptor: *WindowsWalDescriptor) !OroStore {
+        if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+        if (descriptor.handle == 0 or descriptor.destination_pid != GetCurrentProcessId()) return error.InvalidWindowsTransfer;
+        errdefer descriptor.deinitReceived();
+        const file = std.Io.File{ .handle = @ptrFromInt(descriptor.handle), .flags = .{ .nonblocking = false } };
+        try cold_runtime.requireExistingPrivateFileHandleWindows(file);
+        const name = std.fs.path.basename(wal_path);
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidPath;
+        const parent_path = std.fs.path.dirname(wal_path) orelse ".";
+        const private_dir = try cold_runtime.openPrivateDirectoryWindows(io, dir, parent_path);
+        errdefer private_dir.close(io);
+        if (!std.meta.eql(descriptor.witness, try windowsWalWitness(io, file, private_dir, name)))
+            return StoreError.SnapshotCoverageMismatch;
+        var stage = try openImpl(allocator, io, private_dir, name, cfg, true, true, file);
+        errdefer {
+            stage.wal_file = null; // descriptor still owns the received HANDLE
+            stage.deinit();
+        }
+        if (stage.wal_offset != descriptor.witness.length or
+            !std.meta.eql(descriptor.witness, try windowsWalWitness(io, file, private_dir, name)))
+            return StoreError.SnapshotCoverageMismatch;
+        stage.transferred_windows_wal = descriptor.witness;
+        stage.owned_private_directory = true;
+        descriptor.handle = 0;
+        return stage;
+    }
+
+    /// Replay one exact value through the retained exclusive Windows WAL
+    /// descriptor. Mail's ambiguous-append reconciliation compares file cuts
+    /// before and after this call; a path reopen would break that custody.
+    pub fn replayHeldPrivateWindowsValueAlloc(self: *OroStore, allocator: std.mem.Allocator, family_name: Family, key: []const u8) !?[]u8 {
+        if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+        if (!self.private_windows_files or self.staged_read_only) return error.Unsupported;
+        const wal = self.wal_file orelse return StoreError.BadRecord;
+        var replay = try openImpl(allocator, self.io, self.dir, self.wal_path, self.cfg, true, true, wal);
+        defer {
+            replay.wal_file = null; // borrowed; the writer keeps exclusive custody
+            replay.deinit();
+        }
+        return if (replay.get(family_name, key)) |value| try allocator.dupe(u8, value) else null;
+    }
+
+    fn openImpl(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, wal_path: []const u8, cfg: Config, read_only: bool, private_windows_files: bool, borrowed_wal: ?std.Io.File) !OroStore {
+        std.debug.assert(borrowed_wal == null or read_only);
         const owned_wal = try allocator.dupe(u8, wal_path);
         const owned_snapshot = std.mem.concat(allocator, u8, &.{ wal_path, ".snap" }) catch |err| {
             allocator.free(owned_wal);
@@ -340,11 +522,15 @@ pub const OroStore = struct {
             .changefeed = changefeed,
             .cfg = cfg,
             .staged_read_only = read_only,
+            .private_windows_files = private_windows_files,
         };
         errdefer store.deinit();
+        errdefer {
+            if (borrowed_wal != null) store.wal_file = null;
+        }
 
         if (read_only) {
-            const file = try openExistingPersistenceFile(io, dir, wal_path, .read_only);
+            const file = borrowed_wal orelse try openExistingPersistenceFile(io, dir, wal_path, .read_only);
             store.wal_file = file;
             store.wal_offset = (try file.stat(io)).size;
         } else try store.ensureWal();
@@ -352,7 +538,7 @@ pub const OroStore = struct {
         if (store.wal_offset == 0 and !read_only) try store.initializeEmptyWalAfterSnapshot();
         try store.loadWalEpoch();
         const wal_start = try store.coveredWalReplayStart();
-        const wal_good = if (read_only) try store.replaySource(store.wal_file.?, .wal, wal_start) else try store.replayFile(store.wal_path, .wal, wal_start);
+        const wal_good = if (read_only or private_windows_files) try store.replaySource(store.wal_file.?, .wal, wal_start) else try store.replayFile(store.wal_path, .wal, wal_start);
         // A torn/corrupt WAL tail was tolerated by replay (crash mid-append).
         // Truncate it away NOW: appending after the garbage would poison the
         // log — on the NEXT open the bad bytes are no longer the final record,
@@ -382,6 +568,21 @@ pub const OroStore = struct {
     pub fn preparePromotion(self: *OroStore) !void {
         if (!self.staged_read_only or self.staged_write_file != null) return StoreError.ReadOnlyStore;
         const original = self.wal_file orelse return StoreError.BadRecord;
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (self.transferred_windows_wal) |expected| {
+                if (!self.private_windows_files or !std.meta.eql(expected, try windowsWalWitness(self.io, original, self.dir, self.wal_path)) or self.wal_offset != expected.length)
+                    return StoreError.SnapshotCoverageMismatch;
+                var copy: usize = 0;
+                const process = GetCurrentProcess();
+                if (DuplicateHandle(process, @intFromPtr(original.handle), process, &copy, 0, 0, windows_duplicate_same_access) == 0 or copy == 0)
+                    return error.DuplicateFailed;
+                const prepared = std.Io.File{ .handle = @ptrFromInt(copy), .flags = original.flags };
+                errdefer prepared.close(self.io);
+                if (!std.meta.eql(expected, try windowsWalWitness(self.io, prepared, self.dir, self.wal_path))) return StoreError.SnapshotCoverageMismatch;
+                self.staged_write_file = prepared;
+                return;
+            }
+        }
         const file = try openExistingPersistenceFile(self.io, self.dir, self.wal_path, .read_write);
         errdefer file.close(self.io);
         if (comptime cold_posix) if (!std.meta.eql(try cold_identity.statRegular(original.handle), try cold_identity.statRegular(file.handle))) return StoreError.SnapshotCoverageMismatch;
@@ -409,6 +610,7 @@ pub const OroStore = struct {
         self.wal_file = self.staged_write_file;
         self.staged_write_file = null;
         self.staged_read_only = false;
+        self.transferred_windows_wal = null;
     }
 
     /// Returns the authoritative admission ceilings captured when this store
@@ -430,7 +632,27 @@ pub const OroStore = struct {
         self.changefeed.deinit();
         self.allocator.free(self.wal_path);
         self.allocator.free(self.snapshot_path);
+        if (self.owned_private_directory) self.dir.close(self.io);
         self.* = undefined;
+    }
+
+    /// Read a compacted account snapshot through the validated Windows parent
+    /// HANDLE. The exclusive open verifies its private DACL before any bytes
+    /// are returned to a backup writer.
+    pub fn readPrivateSnapshotAllocWindows(self: *OroStore, allocator: std.mem.Allocator, limit: usize) ![]u8 {
+        if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+        if (!self.private_windows_files) return error.Unsupported;
+        const file = try cold_runtime.openExistingPrivateWindows(self.dir, self.snapshot_path, .verify_only);
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        if (stat.size > limit) return error.FileTooBig;
+        const bytes = try allocator.alloc(u8, @intCast(stat.size));
+        errdefer {
+            std.crypto.secureZero(u8, bytes);
+            allocator.free(bytes);
+        }
+        if (try file.readPositionalAll(self.io, bytes, 0) != bytes.len) return error.UnexpectedEndOfFile;
+        return bytes;
     }
 
     /// Returns the comptime-typed API for one column family.
@@ -886,6 +1108,9 @@ pub const OroStore = struct {
         const snapshot_identity: ?cold_identity.Identity = if (comptime cold_posix) try cold_identity.statRegular(snapshot.file.handle) else null;
         defer if (comptime cold_posix) deinitColdAtomic(self.io, &snapshot, snapshot_identity) else snapshot.deinit(self.io);
         if (comptime cold_posix) try validateColdParent(self.io, self.dir, self.snapshot_path, directory, directory_identity.?, &snapshot);
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (self.private_windows_files) try self.secureAtomicSnapshotWindows(&snapshot);
+        }
 
         var offset: u64 = 0;
         offset = try writeNextSeqRecordAt(self.io, snapshot.file, offset, self.allocator, self.next_seq);
@@ -976,6 +1201,22 @@ pub const OroStore = struct {
         };
     }
 
+    fn secureAtomicSnapshotWindows(self: *OroStore, snapshot: *std.Io.File.Atomic) !void {
+        if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+        if (!snapshot.file_exists or !snapshot.file_open) return error.Unsupported;
+        // Verify the newly created temp has either the exact inherited private
+        // ACL or Zig's exact protected private ACL. No secret bytes exist yet;
+        // close the generic handle and reacquire exclusively. That open checks
+        // the reparse attribute, fails if another reader kept a handle, and
+        // installs the protected file DACL before the first snapshot record.
+        try cold_runtime.requireInheritedPrivateFileWindows(snapshot.file);
+        snapshot.file.close(self.io);
+        snapshot.file_open = false;
+        const name = std.fmt.hex(snapshot.file_basename_hex);
+        snapshot.file = try cold_runtime.openExistingPrivateWindows(snapshot.dir, &name, .remediate_read_write);
+        snapshot.file_open = true;
+    }
+
     /// Compact once the WAL crosses half its replay limit. Admission callers
     /// invoke this before appending; open invokes it after replay.
     fn maybeCompact(self: *OroStore) !void {
@@ -996,7 +1237,15 @@ pub const OroStore = struct {
     fn ensureWal(self: *OroStore) !void {
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.wal_file) |_| return;
-        const file = try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
+        const file = if (comptime @import("builtin").os.tag == .windows) blk: {
+            if (self.private_windows_files) {
+                break :blk cold_runtime.openExistingPrivateWindows(self.dir, self.wal_path, .remediate_read_write) catch |err| switch (err) {
+                    error.FileNotFound => try cold_runtime.createPrivateExclusiveWindows(self.dir, self.wal_path),
+                    else => return err,
+                };
+            }
+            break :blk try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
+        } else try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
         self.wal_file = file;
         self.wal_offset = (try file.stat(self.io)).size;
     }
@@ -1224,7 +1473,11 @@ pub const OroStore = struct {
     /// appending (appending after garbage would poison the log for the next
     /// open, where the tail tolerance no longer applies).
     fn replayFile(self: *OroStore, path: []const u8, replay_kind: ReplayKind, start_offset: u64) !u64 {
-        var file = openExistingPersistenceFile(self.io, self.dir, path, .read_only) catch |err| switch (err) {
+        const opened = if (comptime @import("builtin").os.tag == .windows) blk: {
+            if (self.private_windows_files) break :blk cold_runtime.openExistingPrivateWindows(self.dir, path, if (self.staged_read_only) .verify_only else .remediate);
+            break :blk openExistingPersistenceFile(self.io, self.dir, path, .read_only);
+        } else openExistingPersistenceFile(self.io, self.dir, path, .read_only);
+        var file = opened catch |err| switch (err) {
             error.FileNotFound => return 0,
             else => return err,
         };
@@ -9259,4 +9512,269 @@ test "cold complete epoch empty capture skips invalid coverage slot and rejects 
         defer std.testing.allocator.free(after_snapshot);
         try std.testing.expectEqualSlices(u8, original_snapshot, after_snapshot);
     }
+}
+
+test "Windows private account store rejects broad parent before creating WAL" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "broad", .default_dir);
+    // A normal temp directory inherits the ordinary user profile ACL. Give
+    // the gate an explicit private SDDL in the positive test below.
+    const result = OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "broad/accounts.wal", .{});
+    if (result) |store| {
+        var unexpected = store;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expectEqual(error.InsecurePermissions, err);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "broad/accounts.wal", .{}));
+}
+
+test "Windows private directory handle pins file creation across path replacement" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "private", .default_dir);
+    try cold_runtime.protectEmptyDirectoryWindows(std.testing.io, tmp.dir, "private");
+    const pinned = try cold_runtime.openPrivateDirectoryWindows(std.testing.io, tmp.dir, "private");
+    defer pinned.close(std.testing.io);
+    try tmp.dir.rename("private", tmp.dir, "moved", std.testing.io);
+    try tmp.dir.createDir(std.testing.io, "private", .default_dir);
+    const file = try pinned.createFile(std.testing.io, "bound.txt", .{});
+    file.close(std.testing.io);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "private/bound.txt", .{}));
+    const bound = try tmp.dir.openFile(std.testing.io, "moved/bound.txt", .{});
+    bound.close(std.testing.io);
+}
+
+test "Windows private account store protects WAL and compacted snapshot across restart" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Match production setup: the private inheritable DACL is present at
+    // directory creation, which can yield a child DACL without the AI flag.
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(std.testing.io);
+    try cold_runtime.requirePrivateDirectoryWindows(std.testing.io, tmp.dir, "private/accounts.wal");
+    {
+        const broad_snapshot = try tmp.dir.createFile(std.testing.io, "broad.snap", .{ .read = true });
+        broad_snapshot.close(std.testing.io);
+    }
+    try tmp.dir.rename("broad.snap", tmp.dir, "private/accounts.wal.snap", std.testing.io);
+
+    {
+        var store = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+        defer store.deinit();
+        try store.put(.accounts, "alice", "secret account state");
+        try store.snapshotAndTruncate();
+        const backup_bytes = try store.readPrivateSnapshotAllocWindows(std.testing.allocator, 512 * 1024 * 1024);
+        defer std.testing.allocator.free(backup_bytes);
+        try std.testing.expect(std.mem.indexOf(u8, backup_bytes, "secret account state") != null);
+    }
+    {
+        const wal = try cold_runtime.openExistingPrivateWindows(tmp.dir, "private/accounts.wal", .verify_only);
+        wal.close(std.testing.io);
+        const snapshot = try cold_runtime.openExistingPrivateWindows(tmp.dir, "private/accounts.wal.snap", .verify_only);
+        snapshot.close(std.testing.io);
+    }
+    var recovered = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+    defer recovered.deinit();
+    try std.testing.expectEqualStrings("secret account state", recovered.get(.accounts, "alice").?);
+    try recovered.put(.accounts, "bob", "second persisted account");
+}
+
+test "Windows private held WAL replay returns exact row and rejects a torn tail" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(std.testing.io);
+    var store = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/mail.wal", .{});
+    defer store.deinit();
+    try store.put(.props, "baseline", "snapshot row");
+    try store.snapshotAndTruncate();
+    try store.put(.props, "mailfail:1", "ConnectFailed recipient");
+    const exact = (try store.replayHeldPrivateWindowsValueAlloc(std.testing.allocator, .props, "mailfail:1")) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(exact);
+    try std.testing.expectEqualStrings("ConnectFailed recipient", exact);
+    const baseline = (try store.replayHeldPrivateWindowsValueAlloc(std.testing.allocator, .props, "baseline")) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(baseline);
+    try std.testing.expectEqualStrings("snapshot row", baseline);
+    try store.wal_file.?.writePositionalAll(std.testing.io, &.{ 1, 2, 3 }, store.wal_offset);
+    try std.testing.expectError(StoreError.BadRecord, store.replayHeldPrivateWindowsValueAlloc(std.testing.allocator, .props, "mailfail:1"));
+}
+
+test "Windows private account store refuses a retained reader before ACL remediation" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "private", .default_dir);
+    try cold_runtime.protectEmptyDirectoryWindows(std.testing.io, tmp.dir, "private");
+    {
+        const broad = try tmp.dir.createFile(std.testing.io, "broad.wal", .{ .read = true });
+        broad.close(std.testing.io);
+    }
+    try tmp.dir.rename("broad.wal", tmp.dir, "private/accounts.wal", std.testing.io);
+    const reader = try tmp.dir.openFile(std.testing.io, "private/accounts.wal", .{ .mode = .read_only });
+    try std.testing.expectError(error.FileBusy, OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{}));
+    reader.close(std.testing.io);
+    var store = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+    store.deinit();
+    const secured = try cold_runtime.openExistingPrivateWindows(tmp.dir, "private/accounts.wal", .verify_only);
+    secured.close(std.testing.io);
+}
+
+test "Windows private account store rejects a WAL file reparse point" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "private", .default_dir);
+    try cold_runtime.protectEmptyDirectoryWindows(std.testing.io, tmp.dir, "private");
+    const target = try tmp.dir.createFile(std.testing.io, "broad.wal", .{});
+    target.close(std.testing.io);
+    tmp.dir.symLink(std.testing.io, "../broad.wal", "private/accounts.wal", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectError(error.InsecurePermissions, OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{}));
+}
+
+test "Windows transferred private WAL stages read-only and promotes the held HANDLE after parent release" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(std.testing.io);
+    var parent = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+    var parent_live = true;
+    defer if (parent_live) parent.deinit();
+    try parent.put(.accounts, "alice", "retained");
+
+    var transfer = try parent.duplicatePrivateWalToWindowsProcess(GetCurrentProcess());
+    defer transfer.deinit();
+    var descriptor = transfer.release();
+    defer descriptor.deinitReceived();
+    var stage = try OroStore.openTransferredPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{}, &descriptor);
+    var stage_live = true;
+    defer if (stage_live) stage.deinit();
+    try std.testing.expectEqual(@as(usize, 0), descriptor.handle);
+    try std.testing.expect(stage.isReadOnly());
+    try std.testing.expectEqualStrings("retained", stage.get(.accounts, "alice").?);
+    try std.testing.expectError(StoreError.ReadOnlyStore, stage.put(.accounts, "alice", "too early"));
+    try std.testing.expectError(StoreError.ReadOnlyStore, stage.preparePut(.accounts, "alice", "too early"));
+    try stage.preparePromotion();
+    try stage.releaseReadHandleForPreparedPromotion();
+    try std.testing.expect(stage.isReadOnly());
+    try std.testing.expectError(StoreError.ReadOnlyStore, stage.put(.accounts, "alice", "still early"));
+
+    parent.deinit();
+    parent_live = false;
+    stage.promotePrepared();
+    try stage.put(.accounts, "bob", "after commit");
+    stage.deinit();
+    stage_live = false;
+    var recovered = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+    defer recovered.deinit();
+    try std.testing.expectEqualStrings("retained", recovered.get(.accounts, "alice").?);
+    try std.testing.expectEqualStrings("after commit", recovered.get(.accounts, "bob").?);
+}
+
+test "Windows transferred private WAL rejects wrong file, directory, length, and aborts without changing parent" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(std.testing.io);
+    const other = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "other");
+    other.close(std.testing.io);
+    var parent = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+    defer parent.deinit();
+    try parent.put(.accounts, "alice", "before");
+    var foreign = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/foreign.wal", .{});
+    defer foreign.deinit();
+    try foreign.put(.accounts, "mallory", "foreign");
+
+    var wrong_file_transfer = try foreign.duplicatePrivateWalToWindowsProcess(GetCurrentProcess());
+    defer wrong_file_transfer.deinit();
+    var wrong_file = wrong_file_transfer.release();
+    defer wrong_file.deinitReceived();
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, OroStore.openTransferredPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{}, &wrong_file));
+    try std.testing.expectEqual(@as(usize, 0), wrong_file.handle);
+
+    var wrong_dir_transfer = try parent.duplicatePrivateWalToWindowsProcess(GetCurrentProcess());
+    defer wrong_dir_transfer.deinit();
+    var wrong_dir = wrong_dir_transfer.release();
+    defer wrong_dir.deinitReceived();
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, OroStore.openTransferredPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "other/accounts.wal", .{}, &wrong_dir));
+    try std.testing.expectEqual(@as(usize, 0), wrong_dir.handle);
+
+    var wrong_length_transfer = try parent.duplicatePrivateWalToWindowsProcess(GetCurrentProcess());
+    defer wrong_length_transfer.deinit();
+    var wrong_length = wrong_length_transfer.release();
+    defer wrong_length.deinitReceived();
+    wrong_length.witness.length += 1;
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, OroStore.openTransferredPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{}, &wrong_length));
+    try std.testing.expectEqual(@as(usize, 0), wrong_length.handle);
+
+    var read_only_handle: usize = 0;
+    const process = GetCurrentProcess();
+    try std.testing.expect(DuplicateHandle(process, @intFromPtr(parent.wal_file.?.handle), process, &read_only_handle, 0x8000_0000, 0, 0) != 0);
+    var read_only = WindowsWalDescriptor{ .handle = read_only_handle, .destination_pid = GetCurrentProcessId(), .witness = try windowsWalWitness(std.testing.io, parent.wal_file.?, parent.dir, parent.wal_path) };
+    defer read_only.deinitReceived();
+    try std.testing.expectError(error.PermissionDenied, OroStore.openTransferredPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{}, &read_only));
+    try std.testing.expectEqual(@as(usize, 0), read_only.handle);
+
+    var abort_transfer = try parent.duplicatePrivateWalToWindowsProcess(GetCurrentProcess());
+    defer abort_transfer.deinit();
+    var abort_descriptor = abort_transfer.release();
+    defer abort_descriptor.deinitReceived();
+    var stage = try OroStore.openTransferredPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{}, &abort_descriptor);
+    try parent.put(.accounts, "bob", "parent survived");
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.preparePromotion());
+    stage.deinit();
+    try parent.put(.accounts, "charlie", "still writing");
+    try std.testing.expectEqualStrings("still writing", parent.get(.accounts, "charlie").?);
+}
+
+test "Windows transferred private WAL allocation failures close candidate custody and leave parent bytes intact" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(std.testing.io);
+    var parent = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+    defer parent.deinit();
+    try parent.put(.accounts, "alice", "unchanged");
+    const size: usize = @intCast(parent.wal_offset);
+    const before = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(before);
+    const after = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqual(size, try parent.wal_file.?.readPositionalAll(std.testing.io, before, 0));
+
+    var completed = false;
+    for (0..128) |fail_index| {
+        var transfer = try parent.duplicatePrivateWalToWindowsProcess(GetCurrentProcess());
+        defer transfer.deinit();
+        var descriptor = transfer.release();
+        defer descriptor.deinitReceived();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const result = OroStore.openTransferredPrivateWindowsWithConfig(failing.allocator(), std.testing.io, tmp.dir, "private/accounts.wal", .{}, &descriptor);
+        if (result) |opened| {
+            var stage = opened;
+            try std.testing.expect(stage.isReadOnly());
+            try std.testing.expectEqualStrings("unchanged", stage.get(.accounts, "alice").?);
+            stage.deinit();
+            completed = true;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(@as(usize, 0), descriptor.handle);
+        try std.testing.expectEqual(@as(u64, size), parent.wal_offset);
+        try std.testing.expectEqual(size, try parent.wal_file.?.readPositionalAll(std.testing.io, after, 0));
+        try std.testing.expectEqualSlices(u8, before, after);
+        if (completed) break;
+    }
+    try std.testing.expect(completed);
+    try parent.put(.accounts, "bob", "parent remained writable");
 }

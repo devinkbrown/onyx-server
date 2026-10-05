@@ -30,6 +30,8 @@ const pem = @import("../proto/pem.zig");
 const dns = @import("../proto/dns.zig");
 const resolv_conf = @import("../proto/resolv_conf.zig");
 const toml = @import("../proto/toml.zig");
+const http_fetch = @import("http_fetch.zig");
+const os_runtime = @import("os_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
@@ -44,7 +46,7 @@ pub const Error = error{
     SocketUnavailable,
     UnsupportedAddressFamily,
     ResponseTooLarge,
-} || Allocator.Error || tls_client.Error || http1.Error;
+} || Allocator.Error || tls_client.Error || http1.Error || http_fetch.Error;
 
 /// Resolves an ACME endpoint hostname to an IP address. Injected because this
 /// std build has no DNS resolver and the daemon's S2S path uses configured IPs;
@@ -123,6 +125,20 @@ pub fn httpsRequest(
     max_response_bytes: usize,
 ) Error![]u8 {
     const addr = resolver.resolve(url.host, url.port) catch return error.ConnectFailed;
+    if (comptime builtin.os.tag == .windows) {
+        // Reuse the native Winsock transport: it pins this resolved address,
+        // verifies the CA certificate and bounds connect/read/write waits.
+        // The request bytes are constructed here so ACME's nonce and JWS
+        // headers reach the CA unchanged.
+        var req_buf: [16 * 1024]u8 = undefined;
+        const request = try http1.buildRequest(&req_buf, method, url.host, url.path, extra_headers, body);
+        return http_fetch.getAtAddress(allocator, url.host, url.port, true, request, addr, .{
+            .trust_anchors = trust_anchors,
+            .connect_timeout_ms = 5000,
+            .recv_timeout_ms = 10000,
+            .max_response_bytes = max_response_bytes,
+        });
+    }
     const fd = try connectAddr(addr);
     defer closeFd(fd);
 
@@ -459,12 +475,13 @@ pub fn issue(
 // Built-in blocking DNS resolver (reuses our own dns.zig + resolv_conf)
 // ---------------------------------------------------------------------------
 
-/// Default `Resolver`: parses /etc/resolv.conf and performs a blocking A-record
-/// lookup over UDP using the clean-room `dns.zig` codec. Out-of-band only.
+/// Default `Resolver`: on Unix, parses /etc/resolv.conf and performs a blocking
+/// A-record lookup over UDP using the clean-room `dns.zig` codec. On Windows,
+/// delegates to the DNS Client through GetAddrInfoExW. Out-of-band only.
 ///
-/// Handles IP literals and direct A records. Our minimal codec does not decode
-/// CNAME chains or EDNS additional records, so CDN-fronted endpoints may not
-/// resolve here — inject a custom `Resolver` (or a static host→IP) for those.
+/// Handles IP literals and direct A records. The Unix codec does not decode
+/// CNAME chains or EDNS additional records, so CDN-fronted endpoints may need
+/// a custom `Resolver` (or a static host→IP) there.
 pub const SystemResolver = struct {
     allocator: Allocator,
     io: std.Io,
@@ -481,9 +498,23 @@ pub const SystemResolver = struct {
         const self: *SystemResolver = @ptrCast(@alignCast(ctx));
         // IP-literal fast path (no query needed).
         if (net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
+        // Windows DNS Client resolution applies the host's configured name
+        // service policy. Web Push validates this one result and then connects
+        // to that exact IP, so no second lookup can bypass its SSRF guard.
+        if (comptime builtin.os.tag == .windows)
+            return @import("http_fetch.zig").resolveHostA(host, port, 3000);
         return systemResolveA(self.allocator, self.io, host, port, self.resolv_conf_max_bytes, self.dns_port);
     }
 };
+
+test "acme_runner Windows SystemResolver delegates localhost to DNS Client" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var system = SystemResolver{ .allocator = std.testing.allocator, .io = std.testing.io };
+    const resolver = system.resolver();
+    const address = try resolver.resolveFn(resolver.ctx, "localhost", 443);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &address.ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 443), address.ip4.port);
+}
 
 fn systemResolveA(
     allocator: Allocator,
@@ -727,13 +758,12 @@ fn ecPrivateKeyPem(kp: ecdsa_p256.KeyPair, out: []u8) ![]const u8 {
     return pem.encode(out, "EC PRIVATE KEY", &der) catch return error.NoSpaceLeft;
 }
 
-/// Owner-only (0o600) file mode for the TLS private key. This is umask-monotonic:
+/// Owner-only (0o600) file mode for the POSIX TLS private key. This is umask-monotonic:
 /// a umask can only *clear* bits, never add group/other permission, so the key is
 /// never written group/world-readable regardless of the process umask. On targets
-/// without a POSIX permission model fall back to the default — the daemon deploys
-/// on Linux/musl where the model applies. The discriminant is a `u0` `mode_t`
-/// (Windows and any `mode_t`-less target, e.g. wasm freestanding), not the OS tag,
-/// so the posix-only `.fromMode` is only referenced where it exists.
+/// without a POSIX permission model use the native Windows private-DACL path
+/// below. The discriminant is a `u0` `mode_t` (Windows and any `mode_t`-less
+/// target, e.g. wasm freestanding), so `.fromMode` is only referenced where it exists.
 const key_file_perms: std.Io.File.Permissions = if (std.posix.mode_t == u0 or builtin.os.tag == .windows)
     .default_file
 else
@@ -752,7 +782,39 @@ fn writeCertAtomic(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const 
 /// read the daemon's private key (impersonation/MITM), and a renewal never leaves
 /// a world-readable key behind. Same durability as the chain writer (fsync+rename).
 fn writeKeyAtomic(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return writeKeyAtomicWindows(io, dir, path, data);
     try writeAtomic(io, dir, path, data, key_file_perms);
+}
+
+fn writeKeyAtomicWindows(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const parent_path = std.fs.path.dirname(path) orelse ".";
+    const name = std.fs.path.basename(path);
+    const parent = try os_runtime.openPrivateDirectoryWindows(io, dir, parent_path);
+    defer parent.close(io);
+
+    // If this is a renewal, harden the previous key before publication. An
+    // exclusive open refuses a retained reader of a permissive old file.
+    const old_key: ?std.Io.File = os_runtime.openExistingPrivateWindows(parent, name, .remediate) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (old_key) |file| file.close(io);
+
+    var atomic = try parent.createFileAtomic(io, name, .{ .replace = true, .permissions = .default_file });
+    defer atomic.deinit(io);
+    // The temporary file inherits the private directory ACL before any key
+    // data exists. Reopen it exclusively and install a protected file DACL,
+    // matching the account-store snapshot custody path.
+    try os_runtime.requireInheritedPrivateFileWindows(atomic.file);
+    atomic.file.close(io);
+    atomic.file_open = false;
+    const temp_name = std.fmt.hex(atomic.file_basename_hex);
+    atomic.file = try os_runtime.openExistingPrivateWindows(atomic.dir, &temp_name, .remediate_read_write);
+    atomic.file_open = true;
+    try atomic.file.writeStreamingAll(io, data);
+    try atomic.file.sync(io);
+    try atomic.replace(io);
 }
 
 /// Atomic write with an explicit file mode: create an unnamed/temp file with
@@ -845,6 +907,202 @@ test "acme writeKeyAtomic writes the TLS private key owner-only (0o600)" {
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), mode);
     // Umask-independent security invariant: never any group/other permission.
     try std.testing.expectEqual(@as(std.posix.mode_t, 0), mode & 0o077);
+}
+
+test "Windows ACME private key publication requires a private parent and preserves owner-only ACL" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(io, "broad", .default_dir);
+    try std.testing.expectError(error.InsecurePermissions, writeKeyAtomic(io, tmp.dir, "broad/tls.key", "secret"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "broad/tls.key", .{}));
+
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(io);
+    try writeKeyAtomic(io, tmp.dir, "private/tls.key", "first secret");
+    {
+        const secured = try os_runtime.openExistingPrivateWindows(tmp.dir, "private/tls.key", .verify_only);
+        secured.close(io);
+    }
+    const first = try tmp.dir.readFileAlloc(io, "private/tls.key", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("first secret", first);
+
+    const held_reader = try tmp.dir.openFile(io, "private/tls.key", .{ .mode = .read_only });
+    try std.testing.expectError(error.FileBusy, writeKeyAtomic(io, tmp.dir, "private/tls.key", "second secret"));
+    held_reader.close(io);
+    try writeKeyAtomic(io, tmp.dir, "private/tls.key", "second secret");
+    const final = try tmp.dir.readFileAlloc(io, "private/tls.key", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(final);
+    try std.testing.expectEqualStrings("second secret", final);
+    const secured = try os_runtime.openExistingPrivateWindows(tmp.dir, "private/tls.key", .verify_only);
+    secured.close(io);
+}
+
+test "Windows ACME HTTPS sends JWS request to pinned loopback and verifies CA" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const metrics = @import("metrics_http.zig");
+    const selfsign = @import("../proto/x509_selfsign.zig");
+    const tls_server = @import("../crypto/tls_server.zig");
+    const Win = struct {
+        const invalid_socket = std.math.maxInt(usize);
+        const FdSet = extern struct { count: u32, sockets: [64]usize };
+        const Timeval = extern struct { seconds: i32, microseconds: i32 };
+        extern "ws2_32" fn select(i32, ?*FdSet, ?*FdSet, ?*FdSet, *Timeval) callconv(.winapi) i32;
+        extern "ws2_32" fn accept(usize, ?*anyopaque, ?*i32) callconv(.winapi) usize;
+        extern "ws2_32" fn closesocket(usize) callconv(.winapi) i32;
+        extern "ws2_32" fn ioctlsocket(usize, u32, *u32) callconv(.winapi) i32;
+        extern "ws2_32" fn setsockopt(usize, i32, i32, *const anyopaque, i32) callconv(.winapi) i32;
+        extern "ws2_32" fn recv(usize, [*]u8, i32, i32) callconv(.winapi) i32;
+        extern "ws2_32" fn send(usize, [*]const u8, i32, i32) callconv(.winapi) i32;
+    };
+    const Worker = struct {
+        listener: usize,
+        chain: []const []const u8,
+        key_pair: std.crypto.sign.Ed25519.KeyPair,
+        expect_http: bool,
+        request_seen: bool = false,
+        fallback_seen: bool = false,
+        failure: ?anyerror = null,
+
+        fn readable(fd: usize, timeout_ms: u32) !bool {
+            var reads = Win.FdSet{ .count = 1, .sockets = undefined };
+            reads.sockets[0] = fd;
+            var timeout = Win.Timeval{ .seconds = @intCast(timeout_ms / 1000), .microseconds = @intCast((timeout_ms % 1000) * 1000) };
+            const ready = Win.select(0, &reads, null, null, &timeout);
+            if (ready < 0) return error.TestUnexpectedResult;
+            return ready != 0;
+        }
+
+        fn record(fd: usize, buffer: []u8) ![]u8 {
+            var used: usize = 0;
+            while (used < 5) {
+                const got = Win.recv(fd, buffer[used..].ptr, @intCast(5 - used), 0);
+                if (got <= 0) return error.TestUnexpectedResult;
+                used += @intCast(got);
+            }
+            const record_len = 5 + @as(usize, std.mem.readInt(u16, buffer[3..5], .big));
+            if (record_len > buffer.len) return error.TestUnexpectedResult;
+            while (used < record_len) {
+                const got = Win.recv(fd, buffer[used..].ptr, @intCast(record_len - used), 0);
+                if (got <= 0) return error.TestUnexpectedResult;
+                used += @intCast(got);
+            }
+            return buffer[0..record_len];
+        }
+
+        fn sendAll(fd: usize, bytes: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < bytes.len) {
+                const n = Win.send(fd, bytes[sent..].ptr, @intCast(bytes.len - sent), 0);
+                if (n <= 0) return error.TestUnexpectedResult;
+                sent += @intCast(n);
+            }
+        }
+
+        fn run(self: *@This()) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn exchange(self: *@This()) !void {
+            if (!try readable(self.listener, 2000)) return error.TestUnexpectedResult;
+            const fd = Win.accept(self.listener, null, null);
+            if (fd == Win.invalid_socket) return error.TestUnexpectedResult;
+            defer _ = Win.closesocket(fd);
+            var blocking: u32 = 0;
+            if (Win.ioctlsocket(fd, 0x8004667e, &blocking) != 0) return error.TestUnexpectedResult;
+            const timeout_ms: u32 = 2000;
+            if (Win.setsockopt(fd, 0xffff, 0x1006, &timeout_ms, @sizeOf(u32)) != 0 or
+                Win.setsockopt(fd, 0xffff, 0x1005, &timeout_ms, @sizeOf(u32)) != 0) return error.TestUnexpectedResult;
+
+            var engine = try tls_server.Server.init(std.heap.page_allocator, .{
+                .cert_chain = self.chain,
+                .signing_key = self.key_pair,
+            });
+            defer engine.deinit();
+            var buffer: [max_tls_record]u8 = undefined;
+            while (!engine.handshakeDone()) {
+                switch (try engine.feed(try record(fd, &buffer))) {
+                    .bytes_to_send => |bytes| {
+                        defer std.heap.page_allocator.free(bytes);
+                        try sendAll(fd, bytes);
+                    },
+                    .need_more => {},
+                }
+                if (!self.expect_http) {
+                    // A rejected CA may only produce a fatal alert. No JWS
+                    // request or fallback connection may follow it.
+                    _ = record(fd, &buffer) catch null;
+                    self.fallback_seen = try readable(self.listener, 250);
+                    return;
+                }
+            }
+            const request = try engine.decrypt(try record(fd, &buffer));
+            defer std.heap.page_allocator.free(request);
+            self.request_seen = std.mem.startsWith(u8, request, "POST /new-order HTTP/1.1\r\nHost: 127.0.0.1\r\n") and
+                std.mem.indexOf(u8, request, "Content-Type: application/jose+json\r\n") != null and
+                std.mem.endsWith(u8, request, "\r\n\r\n{\"protected\":\"nonce\"}");
+            const response = try engine.encrypt("HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nOK");
+            defer std.heap.page_allocator.free(response);
+            try sendAll(fd, response);
+        }
+    };
+    const Static = struct {
+        fn resolve(_: *anyopaque, _: []const u8, port: u16) anyerror!net.IpAddress {
+            return .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var snapshot = metrics.MetricsSnapshot.init(allocator);
+    defer snapshot.deinit();
+    var listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer listener.shutdown();
+    const key_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x68));
+    var cert_buffer: [2048]u8 = undefined;
+    const cert = try selfsign.buildSelfSigned(&cert_buffer, .{
+        .common_name = "127.0.0.1",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x68, 1 },
+        .key_pair = key_pair,
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{cert};
+    var ctx: u8 = 0;
+    const resolver = Resolver{ .ctx = &ctx, .resolveFn = Static.resolve };
+    const url = Url{ .host = "127.0.0.1", .port = listener.port, .path = "/new-order" };
+    const headers = [_]http1.Header{.{ .name = "Content-Type", .value = "application/jose+json" }};
+    const body = "{\"protected\":\"nonce\"}";
+
+    var trusted_worker = Worker{ .listener = listener.listen_fd, .chain = &chain, .key_pair = key_pair, .expect_http = true };
+    const trusted_thread = try std.Thread.spawn(.{}, Worker.run, .{&trusted_worker});
+    var trusted_joined = false;
+    defer if (!trusted_joined) trusted_thread.join();
+    const trusted = httpsRequest(allocator, resolver, &chain, "POST", url, &headers, body, 1024);
+    defer if (trusted) |response| allocator.free(response) else |_| {};
+    trusted_thread.join();
+    trusted_joined = true;
+    if (trusted_worker.failure) |err| return err;
+    try std.testing.expect(trusted_worker.request_seen);
+    try std.testing.expectEqualStrings("HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nOK", try trusted);
+
+    var untrusted_worker = Worker{ .listener = listener.listen_fd, .chain = &chain, .key_pair = key_pair, .expect_http = false };
+    const untrusted_thread = try std.Thread.spawn(.{}, Worker.run, .{&untrusted_worker});
+    var untrusted_joined = false;
+    defer if (!untrusted_joined) untrusted_thread.join();
+    const untrusted = httpsRequest(allocator, resolver, &.{}, "POST", url, &headers, body, 1024);
+    defer if (untrusted) |response| allocator.free(response) else |_| {};
+    untrusted_thread.join();
+    untrusted_joined = true;
+    if (untrusted_worker.failure) |err| return err;
+    try std.testing.expectError(error.UnknownCa, untrusted);
+    try std.testing.expect(!untrusted_worker.request_seen and !untrusted_worker.fallback_seen);
 }
 
 test "acme writeCertAtomic leaves the public cert chain default-readable" {

@@ -146,9 +146,11 @@ flow, and a full source map.
 ## Build & run
 
 Onyx Server targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
-The full daemon also has an OpenBSD reactor. Native Windows builds use IOCP
-for a local plaintext IPv4 IRC server with a narrower command and transport
-surface; see the [Windows build and verification guide](docs/guide/windows.md).
+The full daemon also has OpenBSD and native Windows reactors. Windows uses
+IOCP for IRC, TLS, WebSocket, mesh, accounts, and the documented companion
+services. Windows Helix process upgrade remains unavailable; see the
+[Windows build and verification guide](docs/guide/windows.md) for tested
+features and operational limits.
 
 ```sh
 zig build              # build the daemon (and the `armor` crypto CLI) into zig-out/bin

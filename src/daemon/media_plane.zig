@@ -2876,8 +2876,6 @@ const srtp = @import("../proto/srtp.zig");
 const srtcp = @import("../proto/srtcp.zig");
 
 test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     try plane.start(loopback_be, 0);
@@ -2911,8 +2909,6 @@ test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
 }
 
 test "upgrade continuity: MediaPlane ignores idle socket and gates live transport state" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
 
@@ -2938,8 +2934,6 @@ test "upgrade continuity: MediaPlane ignores idle socket and gates live transpor
 }
 
 test "MediaPlane: start/shutdown is clean and re-startable port is reported" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     try plane.start(loopback_be, 0);
@@ -2978,8 +2972,6 @@ test "MediaPlane: offered-fingerprint registry stores, reports, and drops (no le
 }
 
 test "MediaPlane: DTLS off leaves the pump with no terminator and no fingerprint" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     try plane.start(loopback_be, 0);
@@ -2989,8 +2981,6 @@ test "MediaPlane: DTLS off leaves the pump with no terminator and no fingerprint
 }
 
 test "MediaPlane: DTLS-enabled pump demultiplexes a ClientHello into a HelloVerifyRequest" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true;
@@ -3028,8 +3018,6 @@ test "MediaPlane: DTLS-enabled pump demultiplexes a ClientHello into a HelloVeri
 }
 
 test "MediaPlane: DTLS-SRTP on but dtls13 off leaves the 1.3 engine down (1.2-only)" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true; // dtls13_enabled defaults false
@@ -3039,8 +3027,6 @@ test "MediaPlane: DTLS-SRTP on but dtls13 off leaves the 1.3 engine down (1.2-on
 }
 
 test "DTLS-SRTP GAP-V1 hold-off: dtls13 off still answers a DTLS 1.2 ClientHello" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     try testing.expect(dtls13_server.browser_interop_caveat_held);
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
@@ -3076,8 +3062,6 @@ test "DTLS-SRTP GAP-V1 hold-off: dtls13 off still answers a DTLS 1.2 ClientHello
 }
 
 test "MediaPlane: version seam routes a DTLS 1.3 ClientHello to the 1.3 engine (HRR)" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true;
@@ -3247,7 +3231,7 @@ test "active media dispatch causal complete RTP fanout reaches all 130 authentic
 }
 
 test "active media dispatch causal complete RTCP fanout reaches all 130 authenticated endpoints" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
+    // This resource-budget fixture uses POSIX getrlimit/setrlimit and poll.
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     try completeFanoutCausal(true);
 }
@@ -3267,8 +3251,6 @@ const RtcpCaptureSink = struct {
 };
 
 test "MediaPlane: RTCP feedback sink receives canonical feedback for a bound WebRTC peer" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     try plane.start(loopback_be, 0);
@@ -3297,8 +3279,6 @@ test "MediaPlane: RTCP feedback sink receives canonical feedback for a bound Web
 }
 
 test "MediaPlane: cross-thread RTCP egress is direct when DTLS is off and queued when on" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var capture = try MediaSocket.bind(loopback_be, 0);
     defer capture.deinit();
     capture.setRecvTimeoutMs(2000);
@@ -3410,8 +3390,6 @@ fn dtlsHandshakeClient(client: *MediaSocket, server_addr: TransportAddress, seed
 }
 
 test "MediaPlane e2e: DTLS-SRTP media forwards A->B, decrypted then re-encrypted per peer" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true;
@@ -3460,8 +3438,6 @@ test "MediaPlane e2e: DTLS-SRTP media forwards A->B, decrypted then re-encrypted
 }
 
 test "MediaPlane e2e: queued RTCP egress is SRTCP protected for DTLS recipient" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
     plane.dtls_enabled = true;
@@ -3866,7 +3842,7 @@ fn selectAdvertisementHost(discovered: ?TransportAddress, fallback: []const u8) 
     result.host_len = @intCast(selected.len);
     return result;
 }
-const HostSocketObservation = struct { fd: std.posix.fd_t, snapshot: media_socket.Snapshot };
+const HostSocketObservation = struct { fd: media_socket.SocketHandle, snapshot: media_socket.Snapshot };
 const AdvertisementHostPlan = struct {
     owner: *MediaPlane,
     domain: *routing.Domain,
@@ -3926,7 +3902,7 @@ pub const WebrtcAdvertisement = struct {
 };
 const WebrtcOfferAdvertisement = struct {
     preview: WebrtcAdvertisement,
-    socket_fd: std.posix.fd_t,
+    socket_fd: media_socket.SocketHandle,
     socket: media_socket.Snapshot,
     discovered: ?TransportAddress,
     stun_server: ?TransportAddress,
@@ -4642,8 +4618,6 @@ test "physical WebRTC every detached growth failure has same owner retry and ori
 }
 
 test "physical WebRTC advertisement binds actual socket discovery certificate and full agreed policy" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const domain = try routing.Domain.create(testing.allocator);
     defer domain.destroyQuiesced() catch @panic("WebRTC advertisement source custody");
     var owner = try MediaPlane.initFallible(testing.allocator);
@@ -4873,8 +4847,6 @@ test "physical routing producer fence copied old epoch cannot clear current sour
 }
 
 test "physical prepared legacy Plane worker actual join retains exact bound socket and owned queue" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const domain = try routing.Domain.create(testing.allocator);
     defer domain.destroyQuiesced() catch @panic("legacy worker retained Domain");
     var owner = try MediaPlane.initFallible(testing.allocator);
@@ -4955,8 +4927,6 @@ const PhysicalIceFixture = struct {
 };
 
 test "physical ICE actual bound worker authenticates first binding and refuses migration collision and retired credentials" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var fail = testing.FailingAllocator.init(testing.allocator, .{});
     var fixture = try PhysicalIceFixture.init(&fail);
     defer fixture.deinit();
@@ -5030,8 +5000,6 @@ test "physical ICE actual bound worker authenticates first binding and refuses m
 }
 
 test "physical ICE response OOM leaves actual binding unchanged and same request succeeds on retry" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var fail = testing.FailingAllocator.init(testing.allocator, .{});
     var fixture = try PhysicalIceFixture.init(&fail);
     defer fixture.deinit();
@@ -5104,8 +5072,6 @@ fn bindPhysicalGroupPeerTest(peer: *MediaSocket, destination: TransportAddress, 
     try testing.expect(try stun.verifyFingerprint(response.data));
 }
 test "physical WebRTC actual group worker relays and refuses foreign or unbound NACK cache access" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var fail = testing.FailingAllocator.init(testing.allocator, .{});
     var fixture = try PhysicalIceFixture.init(&fail);
     defer fixture.deinit();
@@ -5241,8 +5207,6 @@ const FiveBlockerGroupFixture = struct {
     }
 };
 test "physical media five-blocker causal distinct accepted SSRCs retain independent equal sequence cache" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const fixture = try FiveBlockerGroupFixture.create(true);
     defer fixture.destroy();
     var buffers: [2][128]u8 = undefined;
@@ -5265,8 +5229,6 @@ test "physical media five-blocker causal distinct accepted SSRCs retain independ
     try testing.expectEqualSlices(u8, one, retry.data);
 }
 test "physical media five-blocker causal voice recipient cannot retrieve accepted video through NACK" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const fixture = try FiveBlockerGroupFixture.create(false);
     defer fixture.destroy();
     var packet_buf: [128]u8 = undefined;
@@ -5284,8 +5246,6 @@ test "physical media five-blocker causal voice recipient cannot retrieve accepte
     try testing.expect(fixture.peers[1].recvFrom(&got_buf) == null);
 }
 test "physical media five-blocker causal strict PLI rejects extra FCI before routing any compound member" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const fixture = try FiveBlockerGroupFixture.create(true);
     defer fixture.destroy();
     var packet_buf: [128]u8 = undefined;
@@ -5352,8 +5312,6 @@ test "physical media strict compound validates later feedback padding FIR and NA
 }
 
 test "physical media NACK uses actual current recipient spatial policy and fresh recipient positive" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const fixture = try FiveBlockerGroupFixture.create(true);
     defer fixture.destroy();
     try fixture.physical.domain.setPhysicalSelection("#five-blocker", .{ .shard = 0, .slot = 1, .gen = 0 }, .{ .max_spatial = 0, .max_temporal = 7 });

@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const ringlane = @import("ringlane.zig");
 const capsule = @import("helix/capsule.zig");
+const helix_windows_socket = @import("helix/native_windows_socket.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -48,29 +49,185 @@ pub const Listener = struct {
 /// pointer-sized value. Keep an opaque descriptor at that boundary instead of
 /// narrowing a live SOCKET (or refusing every handle above INT_MAX).
 const WindowsSockets = struct {
+    // File HANDLE descriptors occupy the upper positive-i32 quarter. Split
+    // the socket quarter into a slot and a generation so a closed slot can be
+    // reused without ever making an old descriptor valid again. A slot retires
+    // when its generation is spent; reusing its exact ID would be unsafe.
+    const slot_bits = 20;
+    const slot_count: u32 = 1 << slot_bits;
+    const slot_mask: u32 = slot_count - 1;
+    const max_generation: u16 = (1 << (30 - slot_bits)) - 1;
+    const Carry = enum { ordinary, helix_staged, helix_released, helix_poisoned };
     const Entry = struct {
         handle: usize,
         associated_port: usize = 0,
+        accepted_peer: ?PeerAddress = null,
+        carry: Carry = .ordinary,
+    };
+    const Slot = struct {
+        highest_generation: u16,
+        live_count: u32 = 1,
+        free_next: ?u32 = null,
+        on_free_list: bool = false,
     };
 
     lock: std.atomic.Mutex = .unlocked,
     handles: std.AutoHashMapUnmanaged(linux.fd_t, Entry) = .empty,
+    slots: std.AutoHashMapUnmanaged(u32, Slot) = .empty,
     allocator: Allocator = std.heap.page_allocator,
-    next_fd: linux.fd_t = 1,
+    next_slot: u32 = 1,
+    free_head: ?u32 = null,
+    last_imported_fd: linux.fd_t = 0,
+    ordinary_seen: bool = false,
 
     fn lockSpin(self: *WindowsSockets) void {
         while (!self.lock.tryLock()) std.Thread.yield() catch {};
     }
 
     fn register(self: *WindowsSockets, handle: usize) !linux.fd_t {
+        return self.registerWithPeer(handle, null);
+    }
+
+    fn registerWithPeer(self: *WindowsSockets, handle: usize, peer: ?PeerAddress) !linux.fd_t {
         if (handle == std.math.maxInt(usize)) return error.InvalidSocket;
         self.lockSpin();
         defer self.lock.unlock();
-        if (self.next_fd <= 0) return error.SocketIdsExhausted;
-        const fd = self.next_fd;
-        try self.handles.put(self.allocator, fd, .{ .handle = handle });
-        self.next_fd = if (fd == std.math.maxInt(linux.fd_t)) -1 else fd + 1;
+        if (self.free_head) |slot| {
+            const state = self.slots.getPtr(slot).?;
+            std.debug.assert(state.live_count == 0 and state.on_free_list and state.highest_generation < max_generation);
+            const generation = state.highest_generation + 1;
+            const fd = encodeId(slot, generation);
+            try self.handles.put(self.allocator, fd, .{ .handle = handle, .accepted_peer = peer });
+            self.free_head = state.free_next;
+            state.* = .{ .highest_generation = generation };
+            self.ordinary_seen = true;
+            return fd;
+        }
+        const slot = self.findUnusedSlot() orelse return error.SocketIdsExhausted;
+        const fd = encodeId(slot, 0);
+        try self.slots.put(self.allocator, slot, .{ .highest_generation = 0 });
+        errdefer _ = self.slots.remove(slot);
+        try self.handles.put(self.allocator, fd, .{ .handle = handle, .accepted_peer = peer });
+        self.ordinary_seen = true;
         return fd;
+    }
+
+    fn encodeId(slot: u32, generation: u16) linux.fd_t {
+        return @intCast((@as(u32, generation) << slot_bits) | slot);
+    }
+
+    fn findUnusedSlot(self: *WindowsSockets) ?u32 {
+        // Slot zero exists only for imported canonical IDs with a nonzero
+        // generation. Ordinary IDs start at one, as POSIX descriptors do.
+        var checked: u32 = 0;
+        while (checked < slot_mask) : (checked += 1) {
+            const slot = self.next_slot;
+            self.next_slot = if (slot == slot_mask) 1 else slot + 1;
+            if (!self.slots.contains(slot)) return slot;
+        }
+        return null;
+    }
+
+    fn unlinkFreeSlot(self: *WindowsSockets, slot: u32) void {
+        var link = &self.free_head;
+        while (link.*) |current| {
+            const state = self.slots.getPtr(current).?;
+            if (current == slot) {
+                link.* = state.free_next;
+                state.free_next = null;
+                state.on_free_list = false;
+                return;
+            }
+            link = &state.free_next;
+        }
+        unreachable;
+    }
+
+    fn releaseSlot(self: *WindowsSockets, fd: linux.fd_t) void {
+        const slot: u32 = @as(u32, @intCast(fd)) & slot_mask;
+        const state = self.slots.getPtr(slot).?;
+        std.debug.assert(state.live_count != 0);
+        state.live_count -= 1;
+        if (state.live_count == 0 and state.highest_generation < max_generation) {
+            std.debug.assert(!state.on_free_list);
+            state.free_next = self.free_head;
+            state.on_free_list = true;
+            self.free_head = slot;
+        }
+    }
+
+    /// The successor imports canonical IDs in ascending order before any
+    /// ordinary socket registration. Multiple live IDs can occupy one slot
+    /// when an older monotonic-ID predecessor crosses a slot boundary; that
+    /// slot remains unavailable until every imported ID has been removed.
+    fn registerHelixImported(self: *WindowsSockets, fd: linux.fd_t, handle: usize) !void {
+        if (fd <= 0 or fd >= 0x4000_0000) return error.InvalidSocketId;
+        if (handle == std.math.maxInt(usize)) return error.InvalidSocket;
+        self.lockSpin();
+        defer self.lock.unlock();
+        if (self.handles.contains(fd)) return error.SocketIdCollision;
+        if (self.ordinary_seen or fd <= self.last_imported_fd) return error.ImportOutOfOrder;
+        const slot: u32 = @as(u32, @intCast(fd)) & slot_mask;
+        const generation: u16 = @intCast(@as(u32, @intCast(fd)) >> slot_bits);
+        const prior = self.slots.getPtr(slot);
+        if (prior) |state| {
+            if (generation <= state.highest_generation) return error.ImportOutOfOrder;
+        } else {
+            try self.slots.put(self.allocator, slot, .{ .highest_generation = generation, .live_count = 0 });
+        }
+        errdefer {
+            if (prior == null) _ = self.slots.remove(slot);
+        }
+        try self.handles.put(self.allocator, fd, .{ .handle = handle, .carry = .helix_staged });
+        const state = self.slots.getPtr(slot).?;
+        if (state.on_free_list) self.unlinkFreeSlot(slot);
+        state.highest_generation = generation;
+        state.live_count += 1;
+        self.last_imported_fd = fd;
+        if (generation == 0 and slot >= self.next_slot)
+            self.next_slot = if (slot == slot_mask) 1 else slot + 1;
+    }
+
+    fn helixSourceHandle(self: *WindowsSockets, fd: linux.fd_t) !usize {
+        if (fd <= 0 or fd >= 0x4000_0000) return error.InvalidSocketId;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.get(fd) orelse return error.InvalidSocketId;
+        if (entry.carry != .ordinary) return error.InvalidReleaseState;
+        return entry.handle;
+    }
+
+    fn takeHelixStaged(self: *WindowsSockets, fd: linux.fd_t) !usize {
+        if (fd <= 0 or fd >= 0x4000_0000) return error.InvalidSocketId;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.get(fd) orelse return error.InvalidSocketId;
+        if (entry.carry != .helix_staged) return error.InvalidReleaseState;
+        const handle = (self.handles.fetchRemove(fd) orelse unreachable).value.handle;
+        self.releaseSlot(fd);
+        return handle;
+    }
+
+    fn takeHelixUnassociated(self: *WindowsSockets, fd: linux.fd_t) !usize {
+        if (fd <= 0 or fd >= 0x4000_0000) return error.InvalidSocketId;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.get(fd) orelse return error.InvalidSocketId;
+        if ((entry.carry != .helix_staged and entry.carry != .helix_released) or entry.associated_port != 0)
+            return error.InvalidReleaseState;
+        const handle = (self.handles.fetchRemove(fd) orelse unreachable).value.handle;
+        self.releaseSlot(fd);
+        return handle;
+    }
+
+    /// Called only after the authenticated native successor receives the
+    /// predecessor's release receipt. A staged socket cannot post AFD I/O.
+    fn confirmHelixReleased(self: *WindowsSockets, fd: linux.fd_t) !void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.getPtr(fd) orelse return error.InvalidSocketId;
+        if (entry.carry != .helix_staged or entry.associated_port != 0) return error.InvalidReleaseState;
+        entry.carry = .helix_released;
     }
 
     fn get(self: *WindowsSockets, fd: linux.fd_t) ?usize {
@@ -79,6 +236,14 @@ const WindowsSockets = struct {
         defer self.lock.unlock();
         const entry = self.handles.get(fd) orelse return null;
         return entry.handle;
+    }
+
+    fn acceptedPeer(self: *WindowsSockets, fd: linux.fd_t) ?PeerAddress {
+        if (fd <= 0) return null;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.get(fd) orelse return null;
+        return entry.accepted_peer;
     }
 
     fn associatedPort(self: *WindowsSockets, fd: linux.fd_t) ?usize {
@@ -96,6 +261,7 @@ const WindowsSockets = struct {
         defer self.lock.unlock();
         const entry = self.handles.getPtr(fd) orelse return error.MissingOp;
         if (entry.handle != handle) return error.MissingOp;
+        if (entry.carry == .helix_staged or entry.carry == .helix_poisoned) return error.MissingOp;
         if (entry.associated_port == port) return;
         if (entry.associated_port != 0) return error.MissingOp;
         const w = std.os.windows;
@@ -107,21 +273,27 @@ const WindowsSockets = struct {
             .key = @ptrFromInt(handle),
         };
         var iosb = std.mem.zeroes(w.IO_STATUS_BLOCK);
-        const status = w.ntdll.NtSetInformationFile(
-            @ptrFromInt(handle),
-            &iosb,
-            @ptrCast(&info),
-            @sizeOf(@TypeOf(info)),
-            .Completion,
-        );
-        if (status != .SUCCESS) {
-            std.debug.print("GAP-X1 windows iocp status=0x{x} op=associate\n", .{@intFromEnum(status)});
-            return error.MissingOp;
+        if (entry.carry == .helix_released) {
+            helix_windows_socket.replaceCompletionPort(handle, port, handle) catch return error.MissingOp;
+        } else {
+            const status = w.ntdll.NtSetInformationFile(
+                @ptrFromInt(handle),
+                &iosb,
+                @ptrCast(&info),
+                @sizeOf(@TypeOf(info)),
+                .Completion,
+            );
+            if (status != .SUCCESS) {
+                std.debug.print("GAP-X1 windows iocp status=0x{x} op=associate\n", .{@intFromEnum(status)});
+                return error.MissingOp;
+            }
         }
         // A synchronous success is returned inline. Suppress its otherwise
         // duplicate port packet before the first AFD request is submitted.
-        if (SetFileCompletionNotificationModes(@ptrFromInt(handle), 0x1) == 0)
+        if (SetFileCompletionNotificationModes(@ptrFromInt(handle), 0x1) == 0) {
+            if (entry.carry == .helix_released) entry.carry = .helix_poisoned;
             return error.MissingOp;
+        }
         entry.associated_port = port;
     }
 
@@ -130,22 +302,297 @@ const WindowsSockets = struct {
         self.lockSpin();
         defer self.lock.unlock();
         const removed = self.handles.fetchRemove(fd) orelse return null;
+        self.releaseSlot(fd);
         return removed.value.handle;
     }
 
     fn deinit(self: *WindowsSockets) void {
         self.handles.deinit(self.allocator);
         self.handles = .empty;
+        self.slots.deinit(self.allocator);
+        self.slots = .empty;
     }
 };
 
 var windows_sockets: WindowsSockets = .{};
+var winsock_start_lock: std.atomic.Mutex = .unlocked;
+var winsock_started: bool = false;
+
+fn ensureWinsock() error{SocketUnavailable}!void {
+    if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
+    while (!winsock_start_lock.tryLock()) std.Thread.yield() catch {};
+    defer winsock_start_lock.unlock();
+    if (winsock_started) return;
+    // WSADATA is 408 bytes on Win64. A failed WSAStartup does not acquire a
+    // Winsock reference, so a later call may retry; one success lasts for the
+    // process and is intentionally not paired with per-socket WSACleanup.
+    var startup: [408]u8 = @splat(0);
+    if (WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+    winsock_started = true;
+}
 
 /// Transfer ownership of a Winsock SOCKET created by a caller into the
 /// portable descriptor namespace. On success, close it with `closeSocket`.
 pub fn adoptWindowsSocket(socket: usize) !linux.fd_t {
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
     return windows_sockets.register(socket);
+}
+
+/// Stage an inherited Helix socket under the predecessor's exact opaque ID.
+/// The transfer must come from the authenticated candidate control channel;
+/// call `confirmHelixPredecessorReleasedWindows` only after the predecessor's
+/// owner has drained I/O, closed its completion port, and released custody.
+pub fn stageHelixWindowsSocketAtCanonicalId(fd: linux.fd_t, transfer: *helix_windows_socket.Transfer) !void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    if (fd <= 0 or fd >= 0x4000_0000) return error.InvalidSocketId;
+    const socket = try transfer.import();
+    errdefer _ = closesocket(socket);
+    try windows_sockets.registerHelixImported(fd, socket);
+}
+
+/// Borrow the source's actual ordinary SOCKET while its owner has quiesced
+/// and drained I/O. The caller must retain that registry entry through the
+/// WSADuplicateSocketW call and until rollback is no longer possible.
+pub fn helixWindowsSourceSocket(fd: linux.fd_t) !usize {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    return windows_sockets.helixSourceHandle(fd);
+}
+
+/// Abort custody only while the imported socket is inert. Never shut down the
+/// shared TCP endpoint: closing this duplicate leaves the predecessor live.
+pub fn abortHelixStagedWindowsSocket(fd: linux.fd_t) !void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = try windows_sockets.takeHelixStaged(fd);
+    if (closesocket(socket) != 0) return error.SocketCloseFailed;
+}
+
+/// Failure cleanup while no candidate AFD request has been posted. This also
+/// closes entries already marked released if a later entry fails the same
+/// release batch. It never shuts down the shared TCP endpoint.
+pub fn discardHelixUnassociatedWindowsSocket(fd: linux.fd_t) !void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = try windows_sockets.takeHelixUnassociated(fd);
+    if (closesocket(socket) != 0) return error.SocketCloseFailed;
+}
+
+/// A live successor's authenticated release barrier is responsible for this
+/// call. Until then the imported socket cannot submit to a new IOCP.
+pub fn confirmHelixPredecessorReleasedWindows(fd: linux.fd_t) !void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    try windows_sockets.confirmHelixReleased(fd);
+}
+
+pub fn windowsSocketValid(fd: linux.fd_t) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    return windows_sockets.get(fd) != null;
+}
+
+pub fn windowsSocketType(fd: linux.fd_t) error{SocketFailed}!u32 {
+    if (comptime builtin.os.tag != .windows) return error.SocketFailed;
+    const socket = windows_sockets.get(fd) orelse return error.SocketFailed;
+    var kind: i32 = 0;
+    var kind_len: i32 = @sizeOf(i32);
+    if (getsockopt(socket, 0xFFFF, 0x1008, &kind, &kind_len) != 0 or kind_len != @sizeOf(i32) or kind < 0)
+        return error.SocketFailed;
+    return @intCast(kind);
+}
+
+/// Address family and bytes returned by Winsock for an adopted socket.
+/// Dual-stack IPv4 peers arrive as IPv4-mapped IPv6 addresses.
+pub const PeerAddress = union(enum) {
+    ipv4: [4]u8,
+    ipv6: [16]u8,
+};
+
+pub const WindowsTcpEndpoint = struct {
+    address: PeerAddress,
+    port: u16,
+};
+
+pub const WindowsListenerObservation = struct { local: WindowsTcpEndpoint };
+pub const WindowsConnectedObservation = struct { local: WindowsTcpEndpoint, peer: WindowsTcpEndpoint };
+pub const WindowsTcpObservationError = error{ Unsupported, InvalidSocket, NotTcp, NotListening, NotConnected, SocketFailed };
+
+fn windowsTcpStatus(handle: usize) WindowsTcpObservationError!bool {
+    var info = std.mem.zeroes(helix_windows_socket.ProtocolInfo);
+    var info_len: i32 = @sizeOf(helix_windows_socket.ProtocolInfo);
+    if (getsockopt(handle, 0xFFFF, 0x2005, &info, &info_len) != 0 or
+        info_len != @sizeOf(helix_windows_socket.ProtocolInfo)) return error.SocketFailed;
+    if ((info.address_family != wsa_af_inet and info.address_family != wsa_af_inet6) or
+        info.socket_type != wsa_sock_stream or info.protocol != wsa_ipproto_tcp) return error.NotTcp;
+    var listening: i32 = 0;
+    var listening_len: i32 = @sizeOf(i32);
+    if (getsockopt(handle, 0xFFFF, 0x0002, &listening, &listening_len) != 0 or
+        listening_len != @sizeOf(i32)) return error.SocketFailed;
+    return listening != 0;
+}
+
+fn windowsTcpEndpoint(name: RioSockAddr6) WindowsTcpObservationError!WindowsTcpEndpoint {
+    return .{
+        .address = switch (name.family) {
+            wsa_af_inet => .{ .ipv4 = @bitCast(@as(*const RioSockAddr, @ptrCast(&name)).addr) },
+            wsa_af_inet6 => .{ .ipv6 = name.addr },
+            else => return error.SocketFailed,
+        },
+        .port = std.mem.bigToNative(u16, name.port),
+    };
+}
+
+/// Observe the actual bound endpoint of a registered listening TCP SOCKET.
+/// This is the authoritative family/host/port for the strict listener join.
+pub fn observeWindowsListeningTcpSocket(fd: linux.fd_t) WindowsTcpObservationError!WindowsListenerObservation {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = windows_sockets.get(fd) orelse return error.InvalidSocket;
+    if (!try windowsTcpStatus(socket)) return error.NotListening;
+    const name = socketName(socket) catch return error.SocketFailed;
+    const local = try windowsTcpEndpoint(name);
+    if (local.port == 0) return error.NotListening;
+    return .{ .local = local };
+}
+
+/// A state socket must have a live TCP peer; an unbound or listening stream
+/// cannot stand in for a client or Mooring connection during Helix staging.
+pub fn observeWindowsConnectedTcpSocket(fd: linux.fd_t) WindowsTcpObservationError!WindowsConnectedObservation {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = windows_sockets.get(fd) orelse return error.InvalidSocket;
+    if (try windowsTcpStatus(socket)) return error.NotConnected;
+    const name = socketName(socket) catch return error.NotConnected;
+    var peer_name = std.mem.zeroes(RioSockAddr6);
+    var peer_len: i32 = @sizeOf(RioSockAddr6);
+    if (getpeername(socket, @ptrCast(&peer_name), &peer_len) != 0 or
+        !((peer_name.family == wsa_af_inet and peer_len == @sizeOf(RioSockAddr)) or
+            (peer_name.family == wsa_af_inet6 and peer_len == @sizeOf(RioSockAddr6)))) return error.NotConnected;
+    const local = try windowsTcpEndpoint(name);
+    const peer = try windowsTcpEndpoint(peer_name);
+    if (local.port == 0 or peer.port == 0 or std.meta.activeTag(local.address) != std.meta.activeTag(peer.address))
+        return error.NotConnected;
+    return .{ .local = local, .peer = peer };
+}
+
+test "Windows Helix TCP observation distinguishes listening and connected registry sockets" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    const observed = try observeWindowsListeningTcpSocket(listener.fd);
+    try std.testing.expectEqual(listener.port, observed.local.port);
+    try std.testing.expectEqual(PeerAddress{ .ipv4 = .{ 127, 0, 0, 1 } }, observed.local.address);
+    try std.testing.expectError(error.NotConnected, observeWindowsConnectedTcpSocket(listener.fd));
+
+    const client = try openWindowsTcpSocket(wsa_af_inet);
+    defer closeSocket(client);
+    try std.testing.expectError(error.NotListening, observeWindowsListeningTcpSocket(client));
+    try std.testing.expectError(error.NotConnected, observeWindowsConnectedTcpSocket(client));
+    const destination = RioSockAddr{
+        .family = @intCast(wsa_af_inet),
+        .port = std.mem.nativeToBig(u16, listener.port),
+        .addr = try ipv4Bits("127.0.0.1"),
+        .zero = @splat(0),
+    };
+    const client_raw = windows_sockets.get(client) orelse return error.InvalidSocket;
+    if (connect(client_raw, &destination, @sizeOf(RioSockAddr)) != 0) return error.ConnectFailed;
+    const listener_raw = windows_sockets.get(listener.fd) orelse return error.InvalidSocket;
+    const accepted_raw = accept(listener_raw, null, null);
+    if (accepted_raw == std.math.maxInt(usize)) return error.AcceptFailed;
+    const accepted = adoptWindowsSocket(accepted_raw) catch |err| {
+        _ = closesocket(accepted_raw);
+        return err;
+    };
+    defer closeSocket(accepted);
+    const connected = try observeWindowsConnectedTcpSocket(client);
+    try std.testing.expectEqual(listener.port, connected.peer.port);
+    try std.testing.expectEqual(PeerAddress{ .ipv4 = .{ 127, 0, 0, 1 } }, connected.peer.address);
+    _ = try observeWindowsConnectedTcpSocket(accepted);
+}
+
+pub fn socketPort(fd: linux.fd_t) error{ Unsupported, SocketFailed }!u16 {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const handle = windows_sockets.get(fd) orelse return error.SocketFailed;
+    const name = try socketName(handle);
+    return std.mem.bigToNative(u16, name.port);
+}
+
+pub fn socketPeerAddress(fd: linux.fd_t) error{ Unsupported, SocketFailed }!PeerAddress {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const handle = windows_sockets.get(fd) orelse return error.SocketFailed;
+    if (windows_sockets.acceptedPeer(fd)) |peer| return peer;
+    var name = std.mem.zeroes(RioSockAddr6);
+    var name_len: i32 = @sizeOf(RioSockAddr6);
+    if (getpeername(handle, @ptrCast(&name), &name_len) != 0) return error.SocketFailed;
+    return switch (name.family) {
+        wsa_af_inet => if (name_len >= @sizeOf(RioSockAddr))
+            .{ .ipv4 = @bitCast(@as(*const RioSockAddr, @ptrCast(&name)).addr) }
+        else
+            error.SocketFailed,
+        wsa_af_inet6 => if (name_len >= @sizeOf(RioSockAddr6))
+            .{ .ipv6 = name.addr }
+        else
+            error.SocketFailed,
+        else => error.SocketFailed,
+    };
+}
+
+pub const WindowsSocketError = error{
+    Unsupported,
+    InvalidAddress,
+    PermissionDenied,
+    AddressInUse,
+    SocketUnavailable,
+    Unexpected,
+};
+
+/// Open an overlapped Winsock stream and register its pointer-sized SOCKET in
+/// the descriptor table used by the IOCP reactor. Close with `closeSocket`.
+pub fn openWindowsTcpSocket(family: u16) WindowsSocketError!linux.fd_t {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    if (family != wsa_af_inet and family != wsa_af_inet6) return error.InvalidAddress;
+    try ensureWinsock();
+    const socket = WSASocketW(@intCast(family), wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (socket == std.math.maxInt(usize)) return windowsSocketError();
+    if (family == wsa_af_inet6) {
+        // Mesh dials carry a canonical sockaddr_in6, including mapped IPv4.
+        // Windows defaults IPv6 sockets to V6ONLY, which would reject those
+        // mapped addresses before ConnectEx could reach an IPv4 peer.
+        const no: i32 = 0;
+        if (setsockopt(socket, 41, 27, &no, @sizeOf(i32)) != 0) {
+            const err = windowsSocketError();
+            _ = closesocket(socket);
+            return err;
+        }
+    }
+    return adoptWindowsSocket(socket) catch {
+        _ = closesocket(socket);
+        return error.SocketUnavailable;
+    };
+}
+
+pub fn bindWindowsSocket(fd: linux.fd_t, addr: *const std.posix.sockaddr, addrlen: std.posix.socklen_t) WindowsSocketError!void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = windows_sockets.get(fd) orelse return error.SocketUnavailable;
+    if (addrlen > std.math.maxInt(i32)) return error.InvalidAddress;
+    if (bind(socket, addr, @intCast(addrlen)) != 0) return windowsSocketError();
+}
+
+pub fn listenWindowsSocket(fd: linux.fd_t, backlog: u31) WindowsSocketError!void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = windows_sockets.get(fd) orelse return error.SocketUnavailable;
+    if (listen(socket, @intCast(backlog)) != 0) return windowsSocketError();
+}
+
+pub fn setWindowsSocketOption(fd: linux.fd_t, level: i32, optname: i32, opt: []const u8) WindowsSocketError!void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = windows_sockets.get(fd) orelse return error.SocketUnavailable;
+    if (opt.len > std.math.maxInt(i32)) return error.Unexpected;
+    if (setsockopt(socket, level, optname, @ptrCast(opt.ptr), @intCast(opt.len)) != 0) return windowsSocketError();
+}
+
+fn windowsSocketError() WindowsSocketError {
+    return switch (WSAGetLastError()) {
+        10013 => error.PermissionDenied,
+        10048 => error.AddressInUse,
+        10049 => error.InvalidAddress,
+        10024, 10055 => error.SocketUnavailable,
+        else => error.Unexpected,
+    };
 }
 
 test "Windows socket descriptors preserve pointer-sized handles and retire stale ids" {
@@ -165,6 +612,151 @@ test "Windows socket descriptors preserve pointer-sized handles and retire stale
     try std.testing.expectEqual(@as(?usize, 0), sockets.get(zero));
     try std.testing.expectEqual(@as(?usize, 0), sockets.take(zero));
     try std.testing.expectError(error.InvalidSocket, sockets.register(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(u32, @intCast(first)) & WindowsSockets.slot_mask, @as(u32, @intCast(second)) & WindowsSockets.slot_mask);
+    try std.testing.expectEqual(@as(u32, @intCast(first)) & WindowsSockets.slot_mask, @as(u32, @intCast(zero)) & WindowsSockets.slot_mask);
+    try std.testing.expect(first != second and second != zero);
+}
+
+test "Windows socket IDs recycle slots through generations without reviving stale IDs" {
+    var sockets = WindowsSockets{ .allocator = std.testing.allocator };
+    defer sockets.deinit();
+    const first = try sockets.register(0x1_0000_0001);
+    try std.testing.expectEqual(@as(?usize, 0x1_0000_0001), sockets.take(first));
+
+    // This crosses several generation limits while retaining constant-size
+    // active custody. The allocator moves to a fresh slot at each limit.
+    var last = first;
+    var count: usize = 0;
+    while (count < 5000) : (count += 1) {
+        const current = try sockets.register(count + 1);
+        try std.testing.expect(current != last);
+        try std.testing.expectEqual(@as(?usize, null), sockets.get(last));
+        try std.testing.expectEqual(@as(?usize, null), sockets.take(last));
+        try std.testing.expectEqual(@as(?usize, null), sockets.get(first));
+        try std.testing.expectEqual(@as(?usize, count + 1), sockets.take(current));
+        last = current;
+    }
+    try std.testing.expect(sockets.slots.count() > 1);
+}
+
+test "Windows socket ID generation wrap permanently retires a slot" {
+    var sockets = WindowsSockets{ .allocator = std.testing.allocator };
+    defer sockets.deinit();
+    const slot: u32 = 7;
+    const penultimate = WindowsSockets.encodeId(slot, WindowsSockets.max_generation - 1);
+    try sockets.registerHelixImported(penultimate, 0x1001);
+    try std.testing.expectEqual(@as(?usize, 0x1001), sockets.take(penultimate));
+    const final = try sockets.register(0x2002);
+    try std.testing.expectEqual(WindowsSockets.encodeId(slot, WindowsSockets.max_generation), final);
+    try std.testing.expectEqual(@as(?usize, 0x2002), sockets.take(final));
+    try std.testing.expectEqual(@as(?usize, null), sockets.get(penultimate));
+    try std.testing.expectEqual(@as(?usize, null), sockets.get(final));
+    const next = try sockets.register(0x3003);
+    try std.testing.expect(next != final and next != penultimate);
+    try std.testing.expect((@as(u32, @intCast(next)) & WindowsSockets.slot_mask) != slot);
+    try std.testing.expectEqual(@as(?usize, 0x3003), sockets.take(next));
+}
+
+test "Windows Helix imports overlapping legacy slot generations without aliasing" {
+    var sockets = WindowsSockets{ .allocator = std.testing.allocator };
+    defer sockets.deinit();
+    const old: linux.fd_t = 7;
+    const newer = WindowsSockets.encodeId(7, 1);
+    try sockets.registerHelixImported(old, 0x1001);
+    try sockets.registerHelixImported(newer, 0x2002);
+    try std.testing.expectEqual(@as(?usize, 0x1001), sockets.take(old));
+    try std.testing.expectEqual(@as(?usize, 0x2002), sockets.get(newer));
+    const fresh = try sockets.register(0x3003);
+    try std.testing.expect((@as(u32, @intCast(fresh)) & WindowsSockets.slot_mask) != 7);
+    try std.testing.expectEqual(@as(?usize, 0x2002), sockets.take(newer));
+    try std.testing.expectEqual(@as(?usize, 0x3003), sockets.take(fresh));
+}
+
+test "Windows Helix canonical socket IDs reject collision, invalid IDs and late import" {
+    var sockets = WindowsSockets{ .allocator = std.testing.allocator };
+    defer sockets.deinit();
+    const raw: usize = 0x1234;
+    try std.testing.expectError(error.InvalidSocketId, sockets.registerHelixImported(0, raw));
+    try std.testing.expectError(error.InvalidSocketId, sockets.registerHelixImported(0x4000_0000, raw));
+    try std.testing.expectError(error.InvalidSocket, sockets.registerHelixImported(1, std.math.maxInt(usize)));
+    try sockets.registerHelixImported(7, raw);
+    try std.testing.expectEqual(raw, sockets.get(7).?);
+    try std.testing.expectError(error.SocketIdCollision, sockets.registerHelixImported(7, raw + 1));
+    try std.testing.expectError(error.ImportOutOfOrder, sockets.registerHelixImported(6, raw + 1));
+    try std.testing.expectError(error.InvalidSocketId, sockets.confirmHelixReleased(1));
+    try sockets.confirmHelixReleased(7);
+    try std.testing.expectError(error.InvalidReleaseState, sockets.confirmHelixReleased(7));
+    try std.testing.expectEqual(@as(linux.fd_t, 8), try sockets.register(raw + 1));
+    try std.testing.expectError(error.ImportOutOfOrder, sockets.registerHelixImported(9, raw + 2));
+    try std.testing.expectEqual(@as(?usize, raw), sockets.take(7));
+    try std.testing.expectEqual(@as(?usize, raw + 1), sockets.take(8));
+}
+
+test "Windows Helix source and abort access stay within their custody states" {
+    var source = WindowsSockets{ .allocator = std.testing.allocator };
+    defer source.deinit();
+    const ordinary = try source.register(0x1001);
+    try std.testing.expectEqual(@as(usize, 0x1001), try source.helixSourceHandle(ordinary));
+    try std.testing.expectError(error.InvalidReleaseState, source.takeHelixStaged(ordinary));
+    try std.testing.expectEqual(@as(?usize, 0x1001), source.take(ordinary));
+    try std.testing.expectError(error.InvalidSocketId, source.helixSourceHandle(ordinary));
+
+    var candidate = WindowsSockets{ .allocator = std.testing.allocator };
+    defer candidate.deinit();
+    try candidate.registerHelixImported(7, 0x2002);
+    try std.testing.expectError(error.InvalidReleaseState, candidate.helixSourceHandle(7));
+    try std.testing.expectEqual(@as(usize, 0x2002), try candidate.takeHelixStaged(7));
+    try std.testing.expectError(error.InvalidSocketId, candidate.takeHelixStaged(7));
+    try candidate.registerHelixImported(8, 0x3003);
+    try candidate.confirmHelixReleased(8);
+    try std.testing.expectError(error.InvalidReleaseState, candidate.takeHelixStaged(8));
+    try std.testing.expectEqual(@as(?usize, 0x3003), candidate.take(8));
+}
+
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
+test "Windows Helix imported SOCKET keeps exact ID and replaces IOCP only after release" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    try ensureWinsock();
+    const source = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped | 0x80);
+    if (source == std.math.maxInt(usize)) return error.SocketCreationFailed;
+    var source_open = true;
+    defer if (source_open) {
+        _ = closesocket(source);
+    };
+    var predecessor = WindowsSockets{ .allocator = std.testing.allocator };
+    defer predecessor.deinit();
+    const canonical = try predecessor.register(source);
+    const old_port = try Iocp.openHandle();
+    var old_port_open = true;
+    defer if (old_port_open) {
+        _ = std.os.windows.ntdll.NtClose(@ptrFromInt(old_port));
+    };
+    try predecessor.associate(canonical, source, old_port);
+
+    var transfer = try helix_windows_socket.duplicateForProcess(source, GetCurrentProcessId());
+    const imported = try transfer.import();
+    defer _ = closesocket(imported);
+    var successor = WindowsSockets{ .allocator = std.testing.allocator };
+    defer successor.deinit();
+    try successor.registerHelixImported(canonical, imported);
+    try std.testing.expectEqual(imported, successor.get(canonical).?);
+    const new_port = try Iocp.openHandle();
+    defer _ = std.os.windows.ntdll.NtClose(@ptrFromInt(new_port));
+    try std.testing.expectError(error.MissingOp, successor.associate(canonical, imported, new_port));
+    try std.testing.expectEqual(@as(?usize, 0), successor.associatedPort(canonical));
+
+    _ = predecessor.take(canonical);
+    _ = closesocket(source);
+    source_open = false;
+    _ = std.os.windows.ntdll.NtClose(@ptrFromInt(old_port));
+    old_port_open = false;
+    try successor.confirmHelixReleased(canonical);
+    try successor.associate(canonical, imported, new_port);
+    try successor.associate(canonical, imported, new_port);
+    try std.testing.expectEqual(@as(?usize, new_port), successor.associatedPort(canonical));
+    try std.testing.expectError(error.MissingOp, successor.associate(canonical, imported, old_port));
+    try std.testing.expectEqual(@as(?usize, imported), successor.take(canonical));
 }
 
 test "IOCP transfer completion cannot exceed the submitted buffer" {
@@ -3068,6 +3660,15 @@ const RioSockAddr6 = extern struct {
     scope_id: u32,
 };
 
+fn socketName(handle: usize) error{SocketFailed}!RioSockAddr6 {
+    var name = std.mem.zeroes(RioSockAddr6);
+    var name_len: i32 = @sizeOf(RioSockAddr6);
+    if (getsockname(handle, @ptrCast(&name), &name_len) != 0) return error.SocketFailed;
+    if ((name.family == wsa_af_inet and name_len == @sizeOf(RioSockAddr)) or
+        (name.family == wsa_af_inet6 and name_len == @sizeOf(RioSockAddr6))) return name;
+    return error.SocketFailed;
+}
+
 /// Winsock OVERLAPPED begins with an IO_STATUS_BLOCK-compatible status and
 /// information pair. ConnectEx holds this storage until its port completion.
 const WsaOverlapped = extern struct {
@@ -3161,10 +3762,7 @@ fn loadRioForDaemon() !RioTable {
 fn openRegisteredSocket() !usize {
     if (comptime builtin.os.tag != .windows) return error.MissingOp;
     if (comptime @sizeOf(usize) != 8) return error.MissingOp;
-    // `WSADATA` on Win64 is 408 bytes. The bytes are not interpreted.
-    var startup: [408]u8 = @splat(0);
-    const started = WSAStartup(0x0202, &startup);
-    if (started != 0) return error.MissingOp;
+    ensureWinsock() catch return error.MissingOp;
     const sock = WSASocketW(
         wsa_af_inet,
         wsa_sock_stream,
@@ -3254,7 +3852,11 @@ extern "ws2_32" fn bind(socket: usize, addr: *const anyopaque, namelen: i32) cal
 
 extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
 
-extern "ws2_32" fn getsockname(socket: usize, addr: *RioSockAddr, namelen: *i32) callconv(.winapi) i32;
+extern "ws2_32" fn getsockname(socket: usize, addr: *anyopaque, namelen: *i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn getpeername(socket: usize, addr: *anyopaque, namelen: *i32) callconv(.winapi) i32;
+
+extern "ws2_32" fn getsockopt(socket: usize, level: i32, name: i32, value: *anyopaque, len: *i32) callconv(.winapi) i32;
 
 extern "ws2_32" fn connect(socket: usize, addr: *const RioSockAddr, namelen: i32) callconv(.winapi) i32;
 
@@ -3291,13 +3893,27 @@ fn closedConnection(status: std.os.windows.NTSTATUS) bool {
     };
 }
 
+fn afdAcceptPeer(out: []const u8) ?PeerAddress {
+    // AFD_LISTEN_RESPONSE_INFO_TL starts with a sequence (four bytes) and a
+    // native sockaddr. The peer bytes are authoritative even when Winsock's
+    // getpeername on the adopted socket reports an empty sockaddr.
+    if (out.len < 4 + @sizeOf(RioSockAddr)) return null;
+    const family = std.mem.readInt(u16, out[4..6], .native);
+    if (family == wsa_af_inet) return .{ .ipv4 = out[8..12].* };
+    if (family == wsa_af_inet6 and out.len >= 4 + @sizeOf(RioSockAddr6))
+        return .{ .ipv6 = out[12..28].* };
+    return null;
+}
+
 /// Move the connection named by the wait-for-listen sequence onto a new
 /// overlapped socket. The first four bytes of `out` are that sequence.
 fn acceptSequence(listener: usize, out: []const u8) error{SocketFailed}!i32 {
     const w = std.os.windows;
     if (out.len < 4) return error.SocketFailed;
     const sequence = std.mem.readInt(i32, out[0..4], .little);
-    const sock = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    const peer = afdAcceptPeer(out) orelse return error.SocketFailed;
+    const listener_name = try socketName(listener);
+    const sock = WSASocketW(@intCast(listener_name.family), wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
     if (sock == std.math.maxInt(usize)) return error.SocketFailed;
     errdefer _ = closesocket(sock);
     var event: w.HANDLE = undefined;
@@ -3354,7 +3970,7 @@ fn acceptSequence(listener: usize, out: []const u8) error{SocketFailed}!i32 {
         std.debug.print("windows AFD accept context failed: WSA {d}\n", .{WSAGetLastError()});
         return error.SocketFailed;
     }
-    return windows_sockets.register(sock) catch {
+    return windows_sockets.registerWithPeer(sock, peer) catch {
         return error.SocketFailed;
     };
 }
@@ -3652,6 +4268,18 @@ pub fn shutdownSocketWrite(fd: linux.fd_t) void {
     }
 }
 
+/// Interrupt both TCP directions while retaining the opaque descriptor until
+/// every overlapped completion has retired. Callers must still cancel exact
+/// recv/send/connect requests and drain their completions before freeing the
+/// buffers those requests reference.
+pub fn shutdownSocketBoth(fd: linux.fd_t) void {
+    if (fd < 0) return;
+    if (comptime builtin.os.tag == .windows) {
+        const socket = windows_sockets.get(fd) orelse return;
+        _ = shutdown(socket, 2); // SD_BOTH
+    }
+}
+
 fn listenLinux(host: []const u8, port: u16) ListenError!Listener {
     const ip = try ipv4Bits(host);
     const rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
@@ -3718,11 +4346,13 @@ fn bsdListenError() ListenError {
 
 fn listenWindows(host: []const u8, port: u16) ListenError!Listener {
     const ip = try ipv4Bits(host);
-    var startup: [408]u8 = @splat(0);
-    if (WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+    try ensureWinsock();
     const sock = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
     if (sock == std.math.maxInt(usize)) return error.SocketUnavailable;
     errdefer _ = closesocket(sock);
+    const exclusive: i32 = 1;
+    if (setsockopt(sock, sol_socket, ~@as(i32, 0x0004), &exclusive, @sizeOf(i32)) != 0)
+        return windowsListenError();
     var addr = RioSockAddr{
         .family = @intCast(wsa_af_inet),
         .port = std.mem.nativeToBig(u16, port),
@@ -3742,6 +4372,24 @@ fn windowsListenError() ListenError {
     if (err == 10048) return error.AddressInUse;
     if (err == 10013) return error.PermissionDenied;
     return error.SocketUnavailable;
+}
+
+test "Windows IO backend listener rejects a reuse-address competing bind" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    const competitor = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    try std.testing.expect(competitor != std.math.maxInt(usize));
+    defer _ = closesocket(competitor);
+    const reuse: i32 = 1;
+    try std.testing.expectEqual(@as(i32, 0), setsockopt(competitor, sol_socket, 0x0004, &reuse, @sizeOf(i32)));
+    var address = RioSockAddr{
+        .family = @intCast(wsa_af_inet),
+        .port = std.mem.nativeToBig(u16, listener.port),
+        .addr = try ipv4Bits("127.0.0.1"),
+        .zero = @splat(0),
+    };
+    try std.testing.expect(bind(competitor, &address, @sizeOf(RioSockAddr)) != 0);
 }
 
 fn posixSocket() !linux.fd_t {

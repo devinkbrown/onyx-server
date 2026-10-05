@@ -15,14 +15,17 @@
 //! network I/O happens OUTSIDE the lock.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const net = std.Io.net;
+const Socket = if (builtin.os.tag == .windows) usize else linux.fd_t;
 
 const smtp_client = @import("../proto/smtp_client.zig");
 const tls_client = @import("../crypto/tls_client.zig");
 const tls_client_failure = @import("tls_client_failure.zig");
 const http_fetch = @import("http_fetch.zig");
+const os_runtime = @import("os_runtime.zig");
 const platform = @import("../substrate/platform.zig");
 const store_mod = @import("store.zig");
 pub const runtime_pause = @import("runtime_pause.zig");
@@ -35,6 +38,59 @@ const max_body_len: usize = 12 * 1024; // body truncated to fit under the cap
 const max_tls_record: usize = 16 * 1024 + 512; // largest framed TLS record
 const max_smtp_iterations: usize = 256; // loop bound so a bad relay can't hang us
 const max_job_ms: i64 = 60_000; // hard per-job wall-clock budget (H2: bounds total time)
+
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const af_inet: i32 = 2;
+    const sock_stream: i32 = 1;
+    const ipproto_tcp: i32 = 6;
+    const sol_socket: i32 = 0xffff;
+    const so_error: i32 = 0x1007;
+    const so_exclusiveaddruse: i32 = ~@as(i32, 0x0004);
+    const so_rcvtimeo: i32 = 0x1006;
+    const so_sndtimeo: i32 = 0x1005;
+    const fionbio: u32 = 0x8004667e;
+    const interrupted: i32 = 10004;
+    const would_block: i32 = 10035;
+    const in_progress: i32 = 10036;
+    const already: i32 = 10037;
+    const timed_out: i32 = 10060;
+
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: [4]u8,
+        zero: [8]u8 = @splat(0),
+    };
+    const FdSet = extern struct {
+        count: u32,
+        sockets: [64]usize,
+    };
+    const Timeval = extern struct {
+        seconds: i32,
+        microseconds: i32,
+    };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8)
+            @compileError("Windows SMTP socket ABI shape changed");
+    }
+
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn accept(socket: usize, address: ?*anyopaque, address_len: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn select(ignored_nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, length: i32, flags: i32) callconv(.winapi) i32;
+};
 
 /// Submission parameters; all slices are borrowed (owned by the daemon config).
 pub const Config = struct {
@@ -55,6 +111,9 @@ pub const Config = struct {
     failure_wal: ?[]const u8 = null,
     failure_io: ?std.Io = null,
     failure_dir: ?std.Io.Dir = null,
+    /// Production Windows mail requires a private, handle-bound failure WAL.
+    /// Tests can retain the generic store by leaving this false.
+    private_failure_windows: bool = false,
 };
 
 /// One queued message; the three strings are allocator-owned copies.
@@ -118,12 +177,22 @@ pub const Sender = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Sender {
         if ((config.failure_wal == null) != (config.failure_io == null)) return error.InvalidConfig;
+        if (comptime builtin.os.tag == .windows) {
+            if (config.private_failure_windows) {
+                const wal = config.failure_wal orelse return error.InvalidConfig;
+                const io = config.failure_io orelse return error.InvalidConfig;
+                try os_runtime.requirePrivateDirectoryWindows(io, config.failure_dir orelse std.Io.Dir.cwd(), wal);
+            }
+        }
         const jobs = try allocator.alloc(Job, job_capacity);
         return .{ .allocator = allocator, .config = config, .jobs = jobs };
     }
 
     pub fn prepareColdResources(self: *Sender, io: std.Io) !void {
         if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.failure_wal != null and !self.config.private_failure_windows) return error.InsecureFailureJournal;
+        }
         _ = try configDigest(self.config);
         try self.runtime.pause.bindIo(io);
     }
@@ -134,6 +203,9 @@ pub const Sender = struct {
         try self.runtime.validatePreparation(control, view, slot, .mail, 0, self, dormant_spawn_options);
         if (self.thread != null) return error.AlreadyStarted;
         if (self.config.relay_host.len == 0 or self.config.from.len == 0) return error.NotConfigured;
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.failure_wal != null and !self.config.private_failure_windows) return error.InsecureFailureJournal;
+        }
         self.stop_flag.store(false, .release);
         try self.runtime.prepare(control, view, slot, .mail, 0, Sender, self, worker, dormant_spawn_options);
     }
@@ -307,11 +379,29 @@ pub const Sender = struct {
     /// Spawn the worker. Inert (no thread) when relay/from is unconfigured;
     /// enqueued jobs then sit in the ring and are freed at deinit.
     pub fn start(self: *Sender) void {
-        if (comptime @import("builtin").os.tag == .windows) return;
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.failure_wal != null and !self.config.private_failure_windows) return;
+        }
         if (self.thread != null or self.runtime.view != null) return;
         if (self.config.relay_host.len == 0 or self.config.from.len == 0) return;
         self.stop_flag.store(false, .release);
         self.thread = std.Thread.spawn(.{}, worker, .{self}) catch null;
+    }
+
+    /// Explicit startup for an enabled mail service. Windows requires a
+    /// configured private failure journal before its worker can accept jobs.
+    pub fn startChecked(self: *Sender) !void {
+        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        if (self.config.relay_host.len == 0 or self.config.from.len == 0) return error.NotConfigured;
+        if (comptime builtin.os.tag == .windows) {
+            const wal = self.config.failure_wal orelse return error.FailureJournalUnavailable;
+            const io = self.config.failure_io orelse return error.FailureJournalUnavailable;
+            if (!self.config.private_failure_windows) return error.InsecureFailureJournal;
+            try os_runtime.requirePrivateDirectoryWindows(io, self.config.failure_dir orelse std.Io.Dir.cwd(), wal);
+        }
+        self.stop_flag.store(false, .release);
+        errdefer self.stop_flag.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, worker, .{self});
     }
 
     pub fn stop(self: *Sender) void {
@@ -443,7 +533,8 @@ pub const Sender = struct {
                 pending.message.sequence = self.failure_seq;
             }
             self.mutex.unlock();
-            self.recordFailure(&pending) catch {
+            self.recordFailure(&pending) catch |journal_err| {
+                if (comptime builtin.os.tag == .windows) std.debug.print("onyx-server: Windows mail failure journal rejected delivery error {s} ({s})\n", .{ name, @errorName(journal_err) });
                 if (pending.journal) |journal| pending.cut = captureJournalCut(journal) catch null;
                 lockSpin(&self.mutex);
                 self.pending_failure = pending;
@@ -465,7 +556,12 @@ pub const Sender = struct {
         const io = self.config.failure_io orelse return error.FailureJournalUnavailable;
         const wal = self.config.failure_wal orelse return error.FailureJournalUnavailable;
         const journal = try self.allocator.create(store_mod.OroStore);
-        journal.* = store_mod.OroStore.open(self.allocator, io, self.config.failure_dir orelse std.Io.Dir.cwd(), wal) catch |err| {
+        const opened = if (comptime builtin.os.tag == .windows) blk: {
+            if (self.config.private_failure_windows)
+                break :blk store_mod.OroStore.openPrivateWindowsWithConfig(self.allocator, io, self.config.failure_dir orelse std.Io.Dir.cwd(), wal, .{});
+            break :blk store_mod.OroStore.open(self.allocator, io, self.config.failure_dir orelse std.Io.Dir.cwd(), wal);
+        } else store_mod.OroStore.open(self.allocator, io, self.config.failure_dir orelse std.Io.Dir.cwd(), wal);
+        journal.* = opened catch |err| {
             self.allocator.destroy(journal);
             return err;
         };
@@ -502,13 +598,32 @@ pub const Sender = struct {
         const journal = pending.journal orelse return error.FailureJournalPending;
         const expected = pending.cut orelse return error.FailureJournalPending;
         try requireJournalCut(journal, expected);
-        var replay = try store_mod.OroStore.openReadOnlyWithConfig(self.allocator, journal.io, journal.dir, journal.wal_path, .{});
-        defer replay.deinit();
-        if (!fileCutEqual(try captureFileCut(replay.wal_file orelse return error.FailureJournalPending, journal.io), expected.wal)) return error.JournalCustodyMismatch;
         var key_buf: [48]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "mailfail:{d}", .{pending.message.sequence});
         var val_buf: [220]u8 = undefined;
         const value = try failureValue(&val_buf, &pending.message);
+        if (comptime builtin.os.tag == .windows) {
+            const actual = try journal.replayHeldPrivateWindowsValueAlloc(self.allocator, .props, key) orelse return error.FailureJournalPending;
+            defer {
+                std.crypto.secureZero(u8, actual);
+                self.allocator.free(actual);
+            }
+            if (!std.mem.eql(u8, actual, value)) return error.JournalCustodyMismatch;
+            try requireJournalCut(journal, expected);
+            try journal.wal_file.?.sync(journal.io);
+            try requireJournalCut(journal, expected);
+            lockSpin(&self.mutex);
+            const resolved = self.pending_failure.?;
+            self.pending_failure = null;
+            self.mutex.unlock();
+            resolved.message.job.free(self.allocator);
+            journal.deinit();
+            self.allocator.destroy(journal);
+            return;
+        }
+        var replay = try store_mod.OroStore.openReadOnlyWithConfig(self.allocator, journal.io, journal.dir, journal.wal_path, .{});
+        defer replay.deinit();
+        if (!fileCutEqual(try captureFileCut(replay.wal_file orelse return error.FailureJournalPending, journal.io), expected.wal)) return error.JournalCustodyMismatch;
         const actual = replay.get(.props, key) orelse return error.FailureJournalPending;
         if (!std.mem.eql(u8, actual, value)) return error.JournalCustodyMismatch;
         try requireJournalCut(journal, expected);
@@ -526,6 +641,13 @@ pub const Sender = struct {
     /// Resolve, connect, and run the ESMTP conversation for one job (outside the lock).
     fn deliver(self: *Sender, job: Job) !void {
         const job_start = platform.monotonicMillis();
+        if (comptime builtin.os.tag == .windows) {
+            var startup: [408]u8 align(8) = @splat(0);
+            if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+        }
+        defer {
+            if (comptime builtin.os.tag == .windows) _ = win.WSACleanup();
+        }
         const addr = try http_fetch.resolveHostA(self.config.relay_host, self.config.relay_port, io_timeout_ms);
 
         // Submission credentials must not cross an unverified session to a remote
@@ -533,11 +655,6 @@ pub const Sender = struct {
         const verified = self.config.trust_anchors.len != 0 or self.config.insecure_skip_verify;
         if (self.config.user != null and !isLoopback(addr) and !verified)
             return error.UnverifiedAuthRelay;
-
-        // Apply the AUTH policy before the platform transport gate. IP literal
-        // relays resolve on Windows, so a remote unverified relay is refused
-        // with the same durable reason even while SMTP sockets are unavailable.
-        if (comptime @import("builtin").os.tag == .windows) return error.SocketUnavailable;
 
         const fd = try connectAddr(addr, io_timeout_ms);
         defer closeFd(fd);
@@ -564,7 +681,7 @@ pub const Sender = struct {
     /// Drive the SMTP state machine on a caller-owned socket, doing the TLS
     /// handshake when the driver asks (or up-front for implicit TLS on 465).
     /// `job_start` is the per-job wall-clock origin for the `max_job_ms` budget.
-    fn converse(self: *Sender, fd: linux.fd_t, driver: *smtp_client.Driver, job_start: i64) !void {
+    fn converse(self: *Sender, fd: Socket, driver: *smtp_client.Driver, job_start: i64) !void {
         var tls: ?*tls_client.Client = null;
         defer if (tls) |tc| {
             tc.deinit();
@@ -579,7 +696,7 @@ pub const Sender = struct {
         // fold the client's post-handshake buffer in first — the server commonly
         // coalesces its greeting with the final handshake flight on implicit TLS.
         if (!self.config.starttls) {
-            const tc = try self.handshake(fd);
+            const tc = try self.handshake(fd, job_start);
             tls = tc;
             try pending.appendSlice(self.allocator, tc.pendingBytes());
         }
@@ -597,7 +714,7 @@ pub const Sender = struct {
                     action = driver.feed(try self.readChunk(fd, tls, &pending, &read_buf, job_start));
                 },
                 .start_tls => {
-                    const tc = try self.handshake(fd);
+                    const tc = try self.handshake(fd, job_start);
                     tls = tc;
                     // Drop any pre-TLS plaintext, then seed with the post-handshake
                     // buffer (H1: the server may coalesce its greeting after STARTTLS).
@@ -617,7 +734,7 @@ pub const Sender = struct {
     /// is the per-job origin so a stalled relay can't exceed the `max_job_ms` budget.
     fn readChunk(
         self: *Sender,
-        fd: linux.fd_t,
+        fd: Socket,
         tls: ?*tls_client.Client,
         pending: *std.ArrayList(u8),
         read_buf: *[max_tls_record]u8,
@@ -632,7 +749,7 @@ pub const Sender = struct {
             if (frameRecordLen(pending.items)) |rec_len| {
                 const rec = pending.items[0..rec_len];
                 const read = tc.decryptApp(rec) catch |err| {
-                    tls_client_failure.sendFatal(fd, tc, err);
+                    sendTlsFatal(fd, tc, err);
                     return err;
                 };
                 defer switch (read) {
@@ -664,7 +781,7 @@ pub const Sender = struct {
     }
 
     /// Write SMTP command bytes, TLS-encrypting when a session is active.
-    fn sendBytes(self: *Sender, fd: linux.fd_t, tls: ?*tls_client.Client, bytes: []const u8) !void {
+    fn sendBytes(self: *Sender, fd: Socket, tls: ?*tls_client.Client, bytes: []const u8) !void {
         const tc = tls orelse return writeAll(fd, bytes);
         const record = try tc.encrypt(bytes);
         defer self.allocator.free(record);
@@ -674,7 +791,7 @@ pub const Sender = struct {
     /// TLS 1.3 handshake on `fd`, returning a heap-allocated connected client.
     /// Cert verification uses `trust_anchors`. It is skipped only when
     /// `insecure_skip_verify` is set.
-    fn handshake(self: *Sender, fd: linux.fd_t) !*tls_client.Client {
+    fn handshake(self: *Sender, fd: Socket, job_start: i64) !*tls_client.Client {
         const tc = try self.allocator.create(tls_client.Client);
         errdefer self.allocator.destroy(tc);
         tc.* = try tls_client.Client.init(self.allocator, .{
@@ -691,9 +808,10 @@ pub const Sender = struct {
 
         var read_buf: [max_tls_record]u8 = undefined;
         while (!tc.handshakeDone()) {
+            if (platform.monotonicMillis() - job_start > max_job_ms) return error.SmtpJobTimeout;
             const n = try readSome(fd, &read_buf);
             switch (tc.feed(read_buf[0..n]) catch |err| {
-                tls_client_failure.sendFatal(fd, tc, err);
+                sendTlsFatal(fd, tc, err);
                 return err;
             }) {
                 .need_more => {},
@@ -706,6 +824,19 @@ pub const Sender = struct {
         return tc;
     }
 };
+
+fn sendTlsFatal(fd: Socket, client: *tls_client.Client, failure: tls_client.Error) void {
+    if (comptime builtin.os.tag == .windows) {
+        const alert = client.takeAlert(failure) orelse return;
+        defer client.allocator.free(alert);
+        // The connection closes after this terminal batch. Keep its final
+        // attempt bounded independently of the ordinary SMTP I/O timeout.
+        setRecvTimeout(fd, 1000) catch return;
+        writeAll(fd, alert) catch {};
+        return;
+    }
+    tls_client_failure.sendFatal(fd, client, failure);
+}
 
 /// Assemble the RFC 5322 message into `out`; body truncated to `max_body_len`.
 /// Returns an empty slice if any header field carries a CR/LF (M2: defensive
@@ -746,10 +877,42 @@ test "DST GAP-D7 configured relay with a trust store records a durable delivery 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var relay_port: u16 = 1;
+    var reserved: ?usize = null;
+    var winsock_started = false;
+    defer {
+        if (comptime builtin.os.tag == .windows) {
+            if (reserved) |fd| {
+                _ = win.closesocket(fd);
+            }
+            if (winsock_started) {
+                _ = win.WSACleanup();
+            }
+        }
+    }
+    if (comptime builtin.os.tag == .windows) {
+        // A held, non-listening socket gives this failure proof its own port.
+        // Port 1 can be occupied or filtered, so it cannot establish refusal.
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.TestUnexpectedResult;
+        winsock_started = true;
+        reserved = win.WSASocketW(win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+        if (reserved.? == win.invalid_socket) return error.TestUnexpectedResult;
+        const exclusive: i32 = 1;
+        if (win.setsockopt(reserved.?, win.sol_socket, win.so_exclusiveaddruse, &exclusive, @sizeOf(i32)) != 0)
+            return error.TestUnexpectedResult;
+        var address = win.SockAddr4{ .family = win.af_inet, .port = 0, .addr = .{ 127, 0, 0, 1 } };
+        if (win.bind(reserved.?, &address, @sizeOf(win.SockAddr4)) != 0) return error.TestUnexpectedResult;
+        var address_len: i32 = @sizeOf(win.SockAddr4);
+        if (win.getsockname(reserved.?, &address, &address_len) != 0 or address_len != @sizeOf(win.SockAddr4))
+            return error.TestUnexpectedResult;
+        relay_port = std.mem.bigToNative(u16, address.port);
+        try std.testing.expect(relay_port != 0);
+    }
     const anchors = [_][]const u8{"anchor"};
     var sender = try Sender.init(allocator, .{
         .relay_host = "127.0.0.1",
-        .relay_port = 1,
+        .relay_port = relay_port,
         .ehlo_domain = "onyx.test",
         .from = "onyx@example.test",
         .trust_anchors = &anchors,
@@ -787,6 +950,314 @@ test "DST GAP-D7 configured relay with a trust store records a durable delivery 
     try std.testing.expect(std.mem.indexOf(u8, auth_row, "UnverifiedAuthRelay") != null);
 }
 
+test "Windows SMTP loopback rejection records a private failure WAL" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const metrics = @import("metrics_http.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var unjournaled = try Sender.init(allocator, testConfig());
+    defer unjournaled.deinit();
+    try std.testing.expectError(error.FailureJournalUnavailable, unjournaled.startChecked());
+    try tmp.dir.createDir(io, "mail", .default_dir);
+    try os_runtime.protectEmptyDirectoryWindows(io, tmp.dir, "mail");
+
+    const broad_config = Config{
+        .relay_host = "127.0.0.1",
+        .ehlo_domain = "onyx.test",
+        .from = "onyx@example.test",
+        .failure_wal = "broad.wal",
+        .failure_io = io,
+        .failure_dir = tmp.dir,
+        .private_failure_windows = true,
+    };
+    try std.testing.expectError(error.InsecurePermissions, Sender.init(allocator, broad_config));
+
+    var snapshot = metrics.MetricsSnapshot.init(allocator);
+    defer snapshot.deinit();
+    var listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer listener.shutdown();
+
+    const Relay = struct {
+        listener: usize,
+        saw_ehlo: bool = false,
+        saw_starttls: bool = false,
+        failure: ?anyerror = null,
+
+        fn readLine(fd: usize, out: []u8) ![]const u8 {
+            for (out, 0..) |_, index| {
+                _ = try readSome(fd, out[index .. index + 1]);
+                if (index != 0 and out[index - 1] == '\r' and out[index] == '\n') return out[0 .. index + 1];
+            }
+            return error.SmtpReplyTooLarge;
+        }
+        fn exchange(self: *@This()) !void {
+            var reads = win.FdSet{ .count = 1, .sockets = undefined };
+            reads.sockets[0] = self.listener;
+            var timeout = win.Timeval{ .seconds = 3, .microseconds = 0 };
+            if (win.select(0, &reads, null, null, &timeout) != 1) return error.TestUnexpectedResult;
+            const fd = win.accept(self.listener, null, null);
+            if (fd == win.invalid_socket) return error.TestUnexpectedResult;
+            defer closeFd(fd);
+            var blocking: u32 = 0;
+            if (win.ioctlsocket(fd, win.fionbio, &blocking) != 0) return error.TestUnexpectedResult;
+            try setRecvTimeout(fd, 3000);
+            try writeAll(fd, "220 onyx test relay\r\n");
+            var line: [128]u8 = undefined;
+            self.saw_ehlo = std.mem.eql(u8, try readLine(fd, &line), "EHLO onyx.test\r\n");
+            try writeAll(fd, "250 STARTTLS\r\n");
+            self.saw_starttls = std.mem.eql(u8, try readLine(fd, &line), "STARTTLS\r\n");
+            try writeAll(fd, "454 TLS temporarily unavailable\r\n");
+        }
+        fn run(self: *@This()) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var relay = Relay{ .listener = listener.listen_fd };
+    const thread = try std.Thread.spawn(.{}, Relay.run, .{&relay});
+    var joined = false;
+    defer if (!joined) thread.join();
+    var sender = try Sender.init(allocator, .{
+        .relay_host = "127.0.0.1",
+        .relay_port = listener.port,
+        .ehlo_domain = "onyx.test",
+        .from = "onyx@example.test",
+        .failure_wal = "mail/fail.wal",
+        .failure_io = io,
+        .failure_dir = tmp.dir,
+        .private_failure_windows = true,
+    });
+    defer sender.deinit();
+    try sender.startChecked();
+    try std.testing.expect(sender.thread != null);
+    try sender.settle("user@example.test", "verification", "private code");
+    sender.stop();
+    thread.join();
+    joined = true;
+    if (relay.failure) |err| {
+        std.debug.print("Windows SMTP relay fixture failed: {s}, EHLO={any}, STARTTLS={any}\n", .{ @errorName(err), relay.saw_ehlo, relay.saw_starttls });
+        return err;
+    }
+    try std.testing.expect(relay.saw_ehlo and relay.saw_starttls);
+
+    {
+        var store = try store_mod.OroStore.openPrivateWindowsWithConfig(allocator, io, tmp.dir, "mail/fail.wal", .{});
+        defer store.deinit();
+        const row = store.get(.props, "mailfail:1") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, row, "SmtpFailed") != null);
+        try std.testing.expect(std.mem.indexOf(u8, row, "user@example.test") != null);
+    }
+    const private_dir = try os_runtime.openPrivateDirectoryWindows(io, tmp.dir, "mail");
+    defer private_dir.close(io);
+    const private_wal = try os_runtime.openExistingPrivateWindows(private_dir, "fail.wal", .verify_only);
+    private_wal.close(io);
+}
+
+test "Windows SMTP trusted STARTTLS delivers a complete message" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const metrics = @import("metrics_http.zig");
+    const selfsign = @import("../proto/x509_selfsign.zig");
+    const tls_server = @import("../crypto/tls_server.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "mail", .default_dir);
+    try os_runtime.protectEmptyDirectoryWindows(io, tmp.dir, "mail");
+
+    var snapshot = metrics.MetricsSnapshot.init(allocator);
+    defer snapshot.deinit();
+    var listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer listener.shutdown();
+
+    const key_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x6d));
+    var cert_buffer: [2048]u8 = undefined;
+    const cert = try selfsign.buildSelfSigned(&cert_buffer, .{
+        .common_name = "127.0.0.1",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x6d, 1 },
+        .key_pair = key_pair,
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{cert};
+
+    const Relay = struct {
+        listener: usize,
+        chain: []const []const u8,
+        key_pair: std.crypto.sign.Ed25519.KeyPair,
+        saw_message: bool = false,
+        failure: ?anyerror = null,
+
+        fn readExact(fd: usize, out: []u8) !void {
+            var offset: usize = 0;
+            while (offset < out.len) offset += try readSome(fd, out[offset..]);
+        }
+        fn readRecord(fd: usize, out: *[max_tls_record]u8) ![]const u8 {
+            try readExact(fd, out[0..5]);
+            const length = 5 + @as(usize, std.mem.readInt(u16, out[3..5], .big));
+            if (length > out.len) return error.TestUnexpectedResult;
+            try readExact(fd, out[5..length]);
+            return out[0..length];
+        }
+        fn readLine(fd: usize, out: []u8) ![]const u8 {
+            for (out, 0..) |_, index| {
+                _ = try readSome(fd, out[index .. index + 1]);
+                if (index != 0 and out[index - 1] == '\r' and out[index] == '\n') return out[0 .. index + 1];
+            }
+            return error.SmtpReplyTooLarge;
+        }
+        fn readApp(engine: *tls_server.Server, fd: usize, out: *[max_tls_record]u8) ![]u8 {
+            return engine.decrypt(try readRecord(fd, out));
+        }
+        fn reply(engine: *tls_server.Server, fd: usize, line: []const u8) !void {
+            const encrypted = try engine.encrypt(line);
+            defer std.heap.page_allocator.free(encrypted);
+            try writeAll(fd, encrypted);
+        }
+        fn expectApp(engine: *tls_server.Server, fd: usize, out: *[max_tls_record]u8, prefix: []const u8) !void {
+            const command = try readApp(engine, fd, out);
+            defer std.heap.page_allocator.free(command);
+            if (!std.mem.startsWith(u8, command, prefix)) return error.TestUnexpectedResult;
+        }
+        fn exchange(self: *@This()) !void {
+            var reads = win.FdSet{ .count = 1, .sockets = undefined };
+            reads.sockets[0] = self.listener;
+            var timeout = win.Timeval{ .seconds = 3, .microseconds = 0 };
+            if (win.select(0, &reads, null, null, &timeout) != 1) return error.TestUnexpectedResult;
+            const fd = win.accept(self.listener, null, null);
+            if (fd == win.invalid_socket) return error.TestUnexpectedResult;
+            defer closeFd(fd);
+            var blocking: u32 = 0;
+            if (win.ioctlsocket(fd, win.fionbio, &blocking) != 0) return error.TestUnexpectedResult;
+            try setRecvTimeout(fd, 5000);
+            try writeAll(fd, "220 onyx test relay\r\n");
+            var line: [128]u8 = undefined;
+            if (!std.mem.eql(u8, try readLine(fd, &line), "EHLO onyx.test\r\n")) return error.TestUnexpectedResult;
+            try writeAll(fd, "250 STARTTLS\r\n");
+            if (!std.mem.eql(u8, try readLine(fd, &line), "STARTTLS\r\n")) return error.TestUnexpectedResult;
+            try writeAll(fd, "220 ready for TLS\r\n");
+
+            var engine = try tls_server.Server.init(std.heap.page_allocator, .{
+                .cert_chain = self.chain,
+                .signing_key = self.key_pair,
+            });
+            defer engine.deinit();
+            var buffer: [max_tls_record]u8 = undefined;
+            while (!engine.handshakeDone()) {
+                switch (try engine.feed(try readRecord(fd, &buffer))) {
+                    .bytes_to_send => |bytes| {
+                        defer std.heap.page_allocator.free(bytes);
+                        try writeAll(fd, bytes);
+                    },
+                    .need_more => {},
+                }
+            }
+            try expectApp(&engine, fd, &buffer, "EHLO onyx.test\r\n");
+            try reply(&engine, fd, "250 authenticated TLS\r\n");
+            try expectApp(&engine, fd, &buffer, "MAIL FROM:<onyx@example.test>\r\n");
+            try reply(&engine, fd, "250 sender ok\r\n");
+            try expectApp(&engine, fd, &buffer, "RCPT TO:<user@example.test>\r\n");
+            try reply(&engine, fd, "250 recipient ok\r\n");
+            try expectApp(&engine, fd, &buffer, "DATA\r\n");
+            try reply(&engine, fd, "354 send message\r\n");
+            const message = try readApp(&engine, fd, &buffer);
+            defer std.heap.page_allocator.free(message);
+            if (std.mem.indexOf(u8, message, "private success code") == null or
+                !std.mem.endsWith(u8, message, "\r\n.\r\n")) return error.TestUnexpectedResult;
+            self.saw_message = true;
+            try reply(&engine, fd, "250 queued\r\n");
+            try expectApp(&engine, fd, &buffer, "QUIT\r\n");
+            try reply(&engine, fd, "221 bye\r\n");
+        }
+        fn run(self: *@This()) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var relay = Relay{ .listener = listener.listen_fd, .chain = &chain, .key_pair = key_pair };
+    const thread = try std.Thread.spawn(.{}, Relay.run, .{&relay});
+    var joined = false;
+    defer if (!joined) thread.join();
+    var sender = try Sender.init(allocator, .{
+        .relay_host = "127.0.0.1",
+        .relay_port = listener.port,
+        .ehlo_domain = "onyx.test",
+        .from = "onyx@example.test",
+        .trust_anchors = &chain,
+        .failure_wal = "mail/success.wal",
+        .failure_io = io,
+        .failure_dir = tmp.dir,
+        .private_failure_windows = true,
+    });
+    defer sender.deinit();
+    try sender.settle("user@example.test", "verification", "private success code");
+    thread.join();
+    joined = true;
+    if (relay.failure) |err| return err;
+    try std.testing.expect(relay.saw_message);
+    try std.testing.expectEqual(@as(u64, 0), sender.failure_seq);
+    try std.testing.expect(sender.pending_failure == null);
+}
+
+test "Windows mail ambiguous private WAL append replays its retained handle" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "mail", .default_dir);
+    try os_runtime.protectEmptyDirectoryWindows(io, tmp.dir, "mail");
+
+    var vtable = io.vtable.*;
+    var fault: MailJournalFault = .{ .mode = .synced_then_error, .original_write = vtable.fileWritePositional, .original_sync = vtable.fileSync };
+    mail_journal_fault = &fault;
+    defer mail_journal_fault = null;
+    vtable.fileWritePositional = MailJournalFault.write;
+    vtable.fileSync = MailJournalFault.sync;
+    const faulty_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var sender = try Sender.init(allocator, .{
+        .relay_host = "203.0.113.5",
+        .relay_port = 587,
+        .ehlo_domain = "onyx.test",
+        .from = "onyx@example.test",
+        .user = "submit",
+        .pass = "secret",
+        .failure_wal = "mail/pending.wal",
+        .failure_io = faulty_io,
+        .failure_dir = tmp.dir,
+        .private_failure_windows = true,
+    });
+    defer sender.deinit();
+    try std.testing.expectError(error.FailureJournalPending, sender.settle("user@example.test", "verification", "retained secret code"));
+    try std.testing.expectEqual(@as(usize, 1), fault.attempts);
+    try std.testing.expectEqual(@as(usize, 1), fault.synced);
+    try std.testing.expect(sender.pending_failure != null);
+    try std.testing.expect(sender.pending_failure.?.cut != null);
+    const fence = try sender.fenceProducers();
+    defer sender.resumeProducers(fence) catch {};
+    try std.testing.expectError(error.FailureJournalPending, sender.requireSettled(fence));
+
+    // The caller saw a sync error after the backend actually persisted the row.
+    // Remove the injected error, replay the exact held descriptor, and prove
+    // the original outcome settles without another SMTP attempt or WAL append.
+    fault.mode = .failed_write;
+    try sender.reconcilePendingFailure(fence);
+    try sender.requireSettled(fence);
+    try std.testing.expect(sender.pending_failure == null);
+    try std.testing.expectEqual(@as(usize, 1), fault.attempts);
+    var store = try store_mod.OroStore.openPrivateWindowsWithConfig(allocator, io, tmp.dir, "mail/pending.wal", .{});
+    defer store.deinit();
+    const row = store.get(.props, "mailfail:1") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, row, "UnverifiedAuthRelay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "user@example.test") != null);
+}
+
 /// True if `addr` is a loopback address (IPv4 127.0.0.0/8 or IPv6 ::1). Used to
 /// decide whether AUTH over an unverified TLS session is acceptable.
 fn isLoopback(addr: net.IpAddress) bool {
@@ -818,8 +1289,8 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
 
 const SocketError = error{ SocketUnavailable, ConnectFailed, ConnectTimeout, ConnectionClosed, RecvTimeout };
 
-fn connectAddr(addr: net.IpAddress, timeout_ms: u31) SocketError!linux.fd_t {
-    if (comptime @import("builtin").os.tag == .windows) return error.SocketUnavailable;
+fn connectAddr(addr: net.IpAddress, timeout_ms: u31) SocketError!Socket {
+    if (comptime builtin.os.tag == .windows) return connectAddrWindows(addr, timeout_ms);
     if (comptime @import("builtin").os.tag == .openbsd) return @import("native_network.zig").connect(addr, timeout_ms);
     const a4 = switch (addr) {
         .ip4 => |x| x,
@@ -840,6 +1311,53 @@ fn connectAddr(addr: net.IpAddress, timeout_ms: u31) SocketError!linux.fd_t {
     if (err_val != 0) return error.ConnectFailed;
     setBlocking(fd);
     return fd;
+}
+
+fn connectAddrWindows(addr: net.IpAddress, timeout_ms: u31) SocketError!Socket {
+    if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
+    const a4 = switch (addr) {
+        .ip4 => |value| value,
+        .ip6 => return error.ConnectFailed,
+    };
+    const fd = win.WSASocketW(win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    if (fd == win.invalid_socket) return error.SocketUnavailable;
+    errdefer _ = win.closesocket(fd);
+    var nonblocking: u32 = 1;
+    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
+    const sa = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, a4.port), .addr = a4.bytes };
+    var readiness: WindowsConnectReady = .writable;
+    if (win.connect(fd, &sa, @sizeOf(win.SockAddr4)) != 0) {
+        const err = win.WSAGetLastError();
+        if (err != win.would_block and err != win.in_progress and err != win.already) return error.ConnectFailed;
+        readiness = try windowsWaitConnect(fd, @max(1, @min(timeout_ms, 60_000)));
+        if (readiness == .timed_out) return error.ConnectTimeout;
+    }
+    var socket_error: i32 = 0;
+    var error_len: i32 = @sizeOf(i32);
+    if (win.getsockopt(fd, win.sol_socket, win.so_error, &socket_error, &error_len) != 0 or
+        readiness == .failed or socket_error != 0 or error_len != @sizeOf(i32)) return error.ConnectFailed;
+    nonblocking = 0;
+    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
+    return fd;
+}
+
+const WindowsConnectReady = enum { writable, failed, timed_out };
+
+fn windowsWaitConnect(fd: usize, timeout_ms: u31) SocketError!WindowsConnectReady {
+    if (comptime builtin.os.tag != .windows) return error.ConnectFailed;
+    var writes = win.FdSet{ .count = 1, .sockets = undefined };
+    writes.sockets[0] = fd;
+    var failures = win.FdSet{ .count = 1, .sockets = undefined };
+    failures.sockets[0] = fd;
+    var timeout = win.Timeval{ .seconds = @intCast(timeout_ms / 1000), .microseconds = @intCast((timeout_ms % 1000) * 1000) };
+    // Winsock reports successful nonblocking connects in writefds and failed
+    // connects in exceptfds. Inspect SO_ERROR after either completion.
+    const ready = win.select(0, null, &writes, &failures, &timeout);
+    if (ready < 0) return error.ConnectFailed;
+    if (ready == 0) return .timed_out;
+    if (failures.count != 0) return .failed;
+    if (writes.count != 0) return .writable;
+    return error.ConnectFailed;
 }
 
 fn waitWritable(fd: linux.fd_t, timeout_ms: u31) SocketError!void {
@@ -865,20 +1383,48 @@ fn setBlocking(fd: linux.fd_t) void {
     _ = linux.fcntl(fd, linux.F.SETFL, flags & ~@as(usize, linux.SOCK.NONBLOCK));
 }
 
-fn setRecvTimeout(fd: linux.fd_t, timeout_ms: u31) SocketError!void {
+fn setRecvTimeout(fd: Socket, timeout_ms: u31) SocketError!void {
+    if (comptime builtin.os.tag == .windows) {
+        const finite_ms: u32 = @max(1, @min(timeout_ms, 60_000));
+        if (win.setsockopt(fd, win.sol_socket, win.so_rcvtimeo, &finite_ms, @sizeOf(u32)) != 0 or
+            win.setsockopt(fd, win.sol_socket, win.so_sndtimeo, &finite_ms, @sizeOf(u32)) != 0)
+            return error.RecvTimeout;
+        return;
+    }
     if (comptime @import("builtin").os.tag == .openbsd) return @import("native_network.zig").setTimeout(fd, timeout_ms);
     const tv = linux.timeval{ .sec = @divTrunc(timeout_ms, 1000), .usec = @as(i64, @intCast(timeout_ms % 1000)) * 1000 };
     _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
     _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
 }
 
-fn closeFd(fd: linux.fd_t) void {
-    if (comptime @import("builtin").os.tag == .windows) return;
+fn closeFd(fd: Socket) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = win.closesocket(fd);
+        return;
+    }
     if (comptime @import("builtin").os.tag != .linux) return @import("os_runtime.zig").close(fd);
     _ = linux.close(fd);
 }
 
-fn writeAll(fd: linux.fd_t, bytes: []const u8) SocketError!void {
+fn writeAll(fd: Socket, bytes: []const u8) SocketError!void {
+    if (comptime builtin.os.tag == .windows) {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const amount: i32 = @intCast(@min(bytes.len - offset, std.math.maxInt(i32)));
+            const sent = win.send(fd, bytes[offset..].ptr, amount, 0);
+            if (sent > 0) {
+                offset += @intCast(sent);
+                continue;
+            }
+            if (sent == 0) return error.ConnectionClosed;
+            switch (win.WSAGetLastError()) {
+                win.interrupted => continue,
+                win.timed_out, win.would_block => return error.RecvTimeout,
+                else => return error.ConnectionClosed,
+            }
+        }
+        return;
+    }
     if (comptime @import("builtin").os.tag == .openbsd) return @import("native_network.zig").writeAll(fd, bytes);
     var off: usize = 0;
     while (off < bytes.len) {
@@ -896,7 +1442,19 @@ fn writeAll(fd: linux.fd_t, bytes: []const u8) SocketError!void {
     }
 }
 
-fn readSome(fd: linux.fd_t, buf: []u8) SocketError!usize {
+fn readSome(fd: Socket, buf: []u8) SocketError!usize {
+    if (comptime builtin.os.tag == .windows) {
+        while (true) {
+            const received = win.recv(fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(i32))), 0);
+            if (received > 0) return @intCast(received);
+            if (received == 0) return error.ConnectionClosed;
+            switch (win.WSAGetLastError()) {
+                win.interrupted => continue,
+                win.timed_out, win.would_block => return error.RecvTimeout,
+                else => return error.ConnectionClosed,
+            }
+        }
+    }
     if (comptime @import("builtin").os.tag == .openbsd) return @import("native_network.zig").readSome(fd, buf);
     while (true) {
         const rc = linux.read(fd, buf.ptr, buf.len);
@@ -918,7 +1476,7 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 fn sleepMs(ms: u32) void {
-    if (comptime @import("builtin").os.tag == .windows) return;
+    if (comptime builtin.os.tag == .windows) return os_runtime.sleepMillis(ms);
     if (comptime @import("builtin").os.tag != .linux) {
         @import("os_runtime.zig").sleepMillis(ms);
         return;
@@ -1189,9 +1747,16 @@ fn failureValue(buffer: []u8, message: *const FailedMessage) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s} {s}", .{ message.name(), message.job.to[0..@min(message.job.to.len, 80)] });
 }
 fn captureFileCut(file: std.Io.File, io: std.Io) !FileCut {
-    if (comptime @import("builtin").os.tag == .windows) return error.Unsupported;
-    const identity = try journal_custody.statRegular(file.handle);
-    const size = (try file.stat(io)).size;
+    const before = try file.stat(io);
+    if (before.kind != .file) return error.NotRegular;
+    // Windows FileIndex is unique within one filesystem. The mail WAL and its
+    // snapshot are resolved as basenames from one retained private directory
+    // HANDLE, and the WAL itself remains open with no sharing.
+    const identity: journal_custody.Identity = if (comptime builtin.os.tag == .windows)
+        .{ .device = 0, .inode = @intCast(before.inode) }
+    else
+        try journal_custody.statRegular(file.handle);
+    const size = before.size;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [4096]u8 = undefined;
     var offset: u64 = 0;
@@ -1201,14 +1766,28 @@ fn captureFileCut(file: std.Io.File, io: std.Io) !FileCut {
         hash.update(buffer[0..len]);
         offset += len;
     }
-    const after = try journal_custody.statRegular(file.handle);
-    if (identity.device != after.device or identity.inode != after.inode or (try file.stat(io)).size != size) return error.JournalCustodyMismatch;
+    if (comptime builtin.os.tag == .windows) {
+        const after = try file.stat(io);
+        if (after.kind != .file or after.inode != before.inode or after.size != size) return error.JournalCustodyMismatch;
+    } else {
+        const after = try journal_custody.statRegular(file.handle);
+        if (identity.device != after.device or identity.inode != after.inode or (try file.stat(io)).size != size) return error.JournalCustodyMismatch;
+    }
     return .{ .identity = identity, .length = size, .digest = hash.finalResult() };
 }
 fn fileCutEqual(a: FileCut, b: FileCut) bool {
     return a.identity.device == b.identity.device and a.identity.inode == b.identity.inode and a.length == b.length and std.mem.eql(u8, &a.digest, &b.digest);
 }
 fn captureSnapshotCut(journal: *store_mod.OroStore) !?FileCut {
+    if (comptime builtin.os.tag == .windows) {
+        if (!journal.private_windows_files) return error.InsecureFailureJournal;
+        const file = os_runtime.openExistingPrivateWindows(journal.dir, journal.snapshot_path, .verify_only) catch |err| {
+            if (err == error.FileNotFound) return null;
+            return err;
+        };
+        defer file.close(journal.io);
+        return try captureFileCut(file, journal.io);
+    }
     // `openColdExisting` only supports linux/openbsd/freebsd; elsewhere it
     // returns `Unsupported` (never `FileNotFound`), so compare instead of
     // switching — a `FileNotFound` prong does not compile on those targets.
@@ -1228,6 +1807,10 @@ fn requireJournalCut(journal: *store_mod.OroStore, expected: JournalCut) !void {
     if (expected.snapshot) |snapshot| {
         if (!fileCutEqual(held.snapshot orelse return error.JournalCustodyMismatch, snapshot)) return error.JournalCustodyMismatch;
     } else if (held.snapshot != null) return error.JournalCustodyMismatch;
+    if (comptime builtin.os.tag == .windows) {
+        if (!journal.private_windows_files) return error.InsecureFailureJournal;
+        return;
+    }
     const file = try store_mod.openColdExisting(journal.io, journal.dir, journal.wal_path, .read_only);
     defer file.close(journal.io);
     if (!fileCutEqual(try captureFileCut(file, journal.io), expected.wal)) return error.JournalCustodyMismatch;
@@ -1254,6 +1837,7 @@ pub fn configDigest(config: Config) ![32]u8 {
     try runtime_pause.hashOptional(&hash, config.pass);
     try runtime_pause.hashOptional(&hash, config.failure_wal);
     hash.update(&.{ @intFromBool(config.failure_io != null), @intFromBool(config.failure_dir != null) });
+    if (config.private_failure_windows) hash.update("windows-private-failure-wal");
     return hash.finalResult();
 }
 

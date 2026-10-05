@@ -581,11 +581,38 @@ pub fn configCheckError(io: IoBootConfig, ktls: config_format.Config.KtlsMode) ?
     return null;
 }
 
-/// PortableServer currently opens only the plaintext IRC listener. Refuse
-/// configured transports before certificate loading or listener advertising.
-/// This predicate is shared by preflight and normal boot.
+/// Refuse configured features before certificate loading or listener advertising.
+/// Windows uses the full server with selected native listeners; other
+/// portable targets currently open only the plaintext IRC listener. This
+/// predicate is shared by preflight and normal boot.
 pub fn portableTransportError(os: std.Target.Os.Tag, cfg: config_format.Config) ?[]const u8 {
     if (os == .linux or os == .openbsd) return null;
+    if (os == .windows) {
+        if (cfg.listen.ws != 0 and !cfg.tls.enabled and !cfg.listen.ws_plain)
+            return "Windows WebSocket listener requires TLS or explicit testing-only listen.ws_plain";
+        if (cfg.sts.enabled and !cfg.tls.enabled) return "Windows STS requires the native TLS listener";
+        if (cfg.listen.webtransport != 0 and !cfg.tls.enabled)
+            return "Windows WebTransport listener requires TLS";
+        // Account storage uses the shared std.Io-backed WAL; native boot and
+        // TLS SASL persistence are covered by windows_full_daemon_smoke.py.
+        if (cfg.backup.dir.len != 0 and (!cfg.sasl.enabled or cfg.sasl.account_db == null))
+            return "Windows backups require an enabled SASL account store";
+        if (cfg.webpush.enabled and (!cfg.sasl.enabled or cfg.sasl.account_db == null))
+            return "Windows web push requires an enabled SASL account store";
+        if (cfg.mail.enabled and (!cfg.sasl.enabled or cfg.sasl.account_db == null))
+            return "Windows mail requires an enabled SASL account store";
+        if (cfg.mail.enabled and (cfg.mail.relay_host == null or cfg.mail.from == null))
+            return "Windows mail requires a relay host and sender address";
+        if (cfg.dnsbl.enabled) {
+            if (cfg.dnsbl.zones.len == 0) return "Windows DNS blocklist requires at least one zone";
+            @import("dnsbl_resolver.zig").validateZones(cfg.dnsbl.zones) catch return "Windows DNS blocklist zones are invalid";
+        }
+        if (cfg.acme.enabled and (!cfg.tls.enabled or cfg.tls.cert_path == null or cfg.tls.key_path == null or cfg.acme.domain == null))
+            return "Windows ACME renewal requires TLS cert_path, key_path, and an ACME domain";
+        if (cfg.ocsp.enabled and (!cfg.tls.enabled or cfg.tls.cert_path == null))
+            return "Windows OCSP stapling requires TLS and an on-disk cert_path";
+        return null;
+    }
     if (cfg.tls.enabled) return "the portable reactor does not support a TLS listener yet";
     if (cfg.listen.ws != 0) return "the portable reactor does not support a WebSocket listener yet";
     if (cfg.sts.enabled) return "the portable reactor cannot advertise STS without a supported TLS listener";
@@ -650,19 +677,140 @@ test "GAP-X1 portable preflight refuses unsupported listener intent" {
     try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
     cfg.listen.proxy_protocol = false;
     cfg.webhook.enabled = true;
-    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
     cfg.webhook.enabled = false;
     cfg.sasl.account_db = "accounts.wal";
-    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
     cfg.sasl.account_db = null;
     cfg.wasm.plugin_dir = "plugins";
-    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
     cfg.wasm.plugin_dir = null;
     cfg.stats.dir = "stats";
-    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
     cfg.stats.dir = "";
     try std.testing.expect(portableTransportError(.linux, cfg) == null);
     try std.testing.expect(portableTransportError(.openbsd, cfg) == null);
+}
+
+test "Windows full daemon preflight permits selected listeners and refuses unverified features" {
+    var cfg: config_format.Config = .{};
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.metrics.listen = 9130;
+    cfg.webhook.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    try std.testing.expect(portableTransportError(.freebsd, cfg) != null);
+
+    cfg.limits.num_shards = 2;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.limits.num_shards = 1;
+    cfg.tls.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.listen.ws = 8443;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.tls.enabled = false;
+    try std.testing.expectEqualStrings("Windows WebSocket listener requires TLS or explicit testing-only listen.ws_plain", portableTransportError(.windows, cfg).?);
+    cfg.listen.ws_plain = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.listen.ws_plain = false;
+    cfg.listen.ws = 0;
+    cfg.sts.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.tls.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.tls.enabled = false;
+    cfg.sts.enabled = false;
+    cfg.listen.s2s = 6900;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.listen.s2s = 0;
+    cfg.mesh.connect = &.{"peer.example:6900"};
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.mesh.connect = &.{};
+    cfg.listen.webtransport = 4433;
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.tls.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.tls.enabled = false;
+    cfg.listen.webtransport = 0;
+    cfg.listen.media = 5000;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.listen.media = 0;
+    cfg.listen.native_media = 5001;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.listen.native_media = 0;
+    cfg.listen.proxy_protocol = true;
+    cfg.listen.trusted_proxies = &.{"127.0.0.1"};
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.listen.trusted_proxies = &.{};
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.listen.proxy_protocol = false;
+    cfg.media.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.media.enabled = false;
+    cfg.sasl.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.sasl.enabled = false;
+    cfg.sasl.account_db = "accounts.wal";
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.sasl.account_db = null;
+    cfg.webpush.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.webpush.enabled = false;
+    cfg.mail.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.mail.enabled = false;
+    cfg.dnsbl.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.dnsbl.zones = &.{"dnsbl.example.test"};
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.dnsbl.zones = &.{"bad..zone"};
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.dnsbl.zones = &.{};
+    cfg.dnsbl.enabled = false;
+    cfg.acme.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.tls.enabled = true;
+    cfg.tls.cert_path = "cert.pem";
+    cfg.tls.key_path = "key.pem";
+    cfg.acme.domain = "example.test";
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.acme.enabled = false;
+    cfg.ocsp.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.tls.cert_path = null;
+    try std.testing.expect(portableTransportError(.windows, cfg) != null);
+    cfg.ocsp.enabled = false;
+    cfg.tls.enabled = false;
+    cfg.tls.key_path = null;
+    cfg.geo.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.geo.enabled = false;
+    cfg.wasm.plugin_dir = "plugins";
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.wasm.plugin_dir = null;
+    cfg.stats.dir = "stats";
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.stats.dir = "";
+    cfg.stats.channel_dir = "channels";
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.stats.channel_dir = "";
+    cfg.backup.dir = "backups";
+    try std.testing.expectEqualStrings("Windows backups require an enabled SASL account store", portableTransportError(.windows, cfg).?);
+    cfg.sasl.enabled = true;
+    cfg.sasl.account_db = "accounts.wal";
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.backup.dir = "";
+    cfg.sasl.enabled = false;
+    cfg.sasl.account_db = null;
+    cfg.geoip.database = "geoip.db";
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.geoip.database = "";
+    cfg.geoip.asn_database = "asn.db";
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.geoip.asn_database = "";
+    cfg.oper_ocg2.enabled = true;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
+    cfg.oper_ocg2.enabled = false;
+    try std.testing.expect(portableTransportError(.windows, cfg) == null);
 }
 
 /// A configured `[mesh].connect` peer is a mesh neighbor. v2 authoring, oper

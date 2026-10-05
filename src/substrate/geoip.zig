@@ -947,6 +947,38 @@ test "lookup returns country and asn from synthetic IPv4 MMDB" {
     try std.testing.expectEqual(@as(?Lookup, null), try db.lookup(Ip.fromV4(1, 2, 3, 4)));
 }
 
+test "Windows GeoIP loads a bounded UTF-8 MMDB file and validates its contents" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var encoded = ByteList.init(std.testing.allocator);
+    defer encoded.deinit();
+    const record_pointer: u32 = 1 + data_separator_len;
+    try appendNode24(&encoded, 1, record_pointer);
+    try encoded.appendNTimes(0, data_separator_len);
+    try appendMapHeader(&encoded, 2);
+    try appendString(&encoded, "country");
+    try appendMapHeader(&encoded, 1);
+    try appendString(&encoded, "iso_code");
+    try appendString(&encoded, "JP");
+    try appendString(&encoded, "autonomous_system_number");
+    try appendUint(&encoded, .uint32, 2516);
+    try appendMetadata(&encoded, 1, 24, 4);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "city-東京.mmdb", .{});
+    try file.writePositionalAll(std.testing.io, encoded.items, 0);
+    file.close(std.testing.io);
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/city-東京.mmdb", .{tmp.sub_path});
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(256 << 20));
+    defer std.testing.allocator.free(bytes);
+    const db = try Database.init(bytes);
+    const result = try db.lookup(Ip.fromV4(128, 0, 0, 1)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("JP", result.country_iso.?);
+    try std.testing.expectEqual(@as(u32, 2516), result.asn.?);
+    try std.testing.expectError(error.InvalidDatabase, Database.init(bytes[0 .. bytes.len - 1]));
+}
+
 test "lookup resolves value pointers relative to data section start" {
     var bytes = ByteList.init(std.testing.allocator);
     defer bytes.deinit();

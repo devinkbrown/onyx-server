@@ -49,9 +49,9 @@ jobs:
         run: zig build check
 
   windows-native:
-    name: native Windows IRC
+    name: native Windows full daemon
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install and verify pinned Windows Zig
@@ -77,32 +77,74 @@ jobs:
           }
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $zigExe.DirectoryName
       - name: Semantic check
-        run: zig build check -Dtarget=x86_64-windows --summary all
+        run: zig build -j1 check -Dtarget=x86_64-windows --summary all
       - name: Build (debug)
-        run: zig build -Dtarget=x86_64-windows --summary all
+        run: zig build -j1 -Dtarget=x86_64-windows --summary all
       - name: Run focused Windows tests (Debug)
-        run: zig build test-windows -Dtarget=x86_64-windows --summary all
+        run: zig build -j1 test-windows -Dtarget=x86_64-windows --summary all
       - name: Run focused Windows tests (ReleaseSafe)
-        run: zig build test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+        run: zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+      - name: Run full Windows test suite (Debug)
+        run: zig build -j1 test -Dtarget=x86_64-windows --summary all
       - name: Run portable protocol tests (Debug)
-        run: zig build test-mod -Dtarget=x86_64-windows '-Dtest-filter=runtime capability policy' '-Dtest-filter=limited runtime welcome' --summary all
+        run: zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=runtime capability policy' '-Dtest-filter=limited runtime welcome' --summary all
       - name: Run portable protocol tests (ReleaseSafe)
-        run: zig build test-mod -Dtarget=x86_64-windows -Doptimize=ReleaseSafe '-Dtest-filter=runtime capability policy' '-Dtest-filter=limited runtime welcome' --summary all
+        run: zig build -j1 test-mod -Dtarget=x86_64-windows -Doptimize=ReleaseSafe '-Dtest-filter=runtime capability policy' '-Dtest-filter=limited runtime welcome' --summary all
       - name: Run full protocol module tests (Debug)
-        run: zig build test-mod -Dtarget=x86_64-windows '-Dtest-filter=proto.' --summary all
+        run: zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=proto.' --summary all
       - name: Run native store module tests (Debug)
-        run: zig build test-mod -Dtarget=x86_64-windows '-Dtest-filter=daemon.store.test.' --summary all
+        run: zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=daemon.store.test.' --summary all
       - name: Run native store module tests (ReleaseSafe)
-        run: zig build test-mod -Dtarget=x86_64-windows -Doptimize=ReleaseSafe '-Dtest-filter=daemon.store.test.' --summary all
+        run: zig build -j1 test-mod -Dtarget=x86_64-windows -Doptimize=ReleaseSafe '-Dtest-filter=daemon.store.test.' --summary all
       - name: Run complete native CLI tests (Debug)
-        run: zig build test-cli -Dtarget=x86_64-windows --summary all
+        run: zig build -j1 test-cli -Dtarget=x86_64-windows --summary all
       - name: Run complete native CLI tests (ReleaseSafe)
-        run: zig build test-cli -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+        run: zig build -j1 test-cli -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Run native IRC smoke
-        run: python .\tools\runtime_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native full-daemon IRC, TLS, WSS, metrics, and webhook smoke
+        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --wss --metrics --webhook
+      - name: Run native plaintext WebSocket smoke
+        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --ws-plain
+      - name: Run native PROXY protocol v1/v2 smoke
+        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --proxy
+      - name: Run native account persistence and TLS SASL PLAIN smoke
+        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --accounts
+      - name: Run native stats publication and restart smoke
+        run: python -B .\tools\windows_stats_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native STS advertisement and TLS smoke
+        run: python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native secured three-node mesh smoke
+        run: python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native reusable-session and cold-reconnect smoke
+        run: python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native three-shard plaintext TLS and WSS fanout smoke
+        run: python -B .\tools\windows_multishard_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run private backup publication and restore smoke
+        run: python -B .\tools\windows_backup_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run private Web Push VAPID boot and restart smoke
+        run: python -B .\tools\windows_webpush_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run private OCG2 authority mode and restart smoke
+        run: python -B .\tools\windows_ocg2_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native ACME and OCSP worker smoke
+        run: python -B .\tools\windows_tls_companion_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native OroWasm plugin command smoke
+        run: python -B .\tools\windows_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native mail delivery failure journal smoke
+        run: python -B .\tools\windows_mail_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native GeoIP and news cache smoke
+        run: python -B .\tools\windows_geo_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native WebTransport browser IRC smoke
+        run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native WebTransport browser to IPv6 IRC bind smoke
+        run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --ipv6-irc
+      - name: Run native WebTransport browser to specific IPv4 IRC bind smoke
+        run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --irc-host 127.0.0.2
+      - name: Run native media signaling and UDP forwarding smoke
+        run: python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run configured Windows security and listener failure smoke
+        run: python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 
   build-test:
     name: build & test

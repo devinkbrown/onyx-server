@@ -1451,3 +1451,60 @@ test "snapshot serialize/deserialize round-trips the full aggregate" {
     try std.testing.expect(deserialize(&empty, "OCS2\x01\x00\x00\x00\x00"));
     try std.testing.expectEqual(@as(usize, 0), empty.channels.count());
 }
+
+test "Windows channel stats publish replacement and restore from disk" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+
+    var first = ChanStats.init(std.testing.allocator);
+    defer first.deinit();
+    const now: i64 = 1_700_000_000_000;
+    first.recordMessage("#windows", "alice", "first message", now);
+    first.writeJson(std.testing.io, dir, "Onyx", "win.test", now, .{ .users_online = 1 });
+
+    const index_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/index.json", .{dir});
+    defer std.testing.allocator.free(index_path);
+    const channel_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/windows.json", .{dir});
+    defer std.testing.allocator.free(channel_path);
+    const snapshot_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ dir, snapshot_name });
+    defer std.testing.allocator.free(snapshot_path);
+
+    // Replacing existing files is the important native path: Windows rename
+    // semantics differ from POSIX when a destination already exists.
+    first.recordMessage("#windows", "bob", "second message", now + 1000);
+    first.writeJson(std.testing.io, dir, "Onyx", "win.test", now + 1000, .{ .users_online = 2 });
+
+    const index = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, index_path, std.testing.allocator, .limited(64 << 10));
+    defer std.testing.allocator.free(index);
+    const parsed_index = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, index, .{});
+    defer parsed_index.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_index.value.object.get("users_online").?.integer);
+    const channels = parsed_index.value.object.get("channels").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), channels.len);
+    try std.testing.expectEqual(@as(i64, 2), channels[0].object.get("messages").?.integer);
+
+    const channel = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, channel_path, std.testing.allocator, .limited(64 << 10));
+    defer std.testing.allocator.free(channel);
+    const parsed_channel = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, channel, .{});
+    defer parsed_channel.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_channel.value.object.get("totals").?.object.get("messages").?.integer);
+
+    const snapshot = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, snapshot_path, std.testing.allocator, .limited(64 << 10));
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(std.mem.startsWith(u8, snapshot, snapshot_magic));
+
+    var restored = ChanStats.init(std.testing.allocator);
+    defer restored.deinit();
+    loadSnapshot(&restored, std.testing.io, dir);
+    try std.testing.expectEqual(@as(u64, 2), restored.channelMessageCount("#windows"));
+
+    for ([_][]const u8{ "index.json", "windows.json", snapshot_name }) |name| {
+        const tmp_name = try std.fmt.allocPrint(std.testing.allocator, ".{s}.tmp", .{name});
+        defer std.testing.allocator.free(tmp_name);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, tmp_name, .{}));
+    }
+}

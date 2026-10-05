@@ -23,6 +23,39 @@ const toml = @import("../proto/toml.zig");
 const sys = std.posix.system;
 const posix = std.posix;
 
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: [4]u8,
+        zero: [8]u8 = @splat(0),
+    };
+    const FdSet = extern struct {
+        count: u32,
+        sockets: [64]usize,
+    };
+    const Timeval = extern struct { sec: i32, usec: i32 };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(FdSet) != 520 or @offsetOf(FdSet, "sockets") != 8 or @sizeOf(Timeval) != 8)
+            @compileError("Windows ACME listener socket ABI shape changed");
+    }
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn select(ignored: i32, read: ?*FdSet, write: ?*FdSet, except: ?*FdSet, timeout: *const Timeval) callconv(.winapi) i32;
+    extern "ws2_32" fn accept(socket: usize, address: ?*SockAddr4, address_len: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+};
+
 comptime {
     if (@bitSizeOf(usize) != 64) @compileError("acme_http01_listener requires a 64-bit target");
 }
@@ -81,12 +114,14 @@ pub const Config = struct {
 pub const ChallengeServer = struct {
     store: *http01.TokenStore,
     listen_fd: sys.fd_t,
+    windows_socket: usize = win.invalid_socket,
     port: u16,
     thread: ?std.Thread = null,
     stop_flag: std.atomic.Value(bool) = .{ .raw = false },
     operation_active: std.atomic.Value(bool) = .{ .raw = false },
     /// Per-connection read timeout (seconds); read by the accept loop.
     conn_read_timeout_sec: u32 = default_conn_read_timeout_sec,
+    accept_poll_ms: u32 = default_accept_poll_ms,
 
     /// Bind `127.0.0.1:port` (use port 0 for an ephemeral port) and start
     /// listening with default tunables. No thread is running yet; call `spawn`.
@@ -98,11 +133,9 @@ pub const ChallengeServer = struct {
     /// always 127.0.0.1 (security invariant); only timeouts/backlog are tunable.
     /// The returned value must live at a stable address for the thread's lifetime.
     pub fn initWithConfig(store: *http01.TokenStore, port: u16, config: Config) ListenerError!ChallengeServer {
+        if (comptime builtin.os.tag == .windows) return initWindows(store, port, config);
         const fd = try socketTcp();
         errdefer closeFd(fd);
-        // socketTcp already reports SocketUnavailable on Windows; stop
-        // analysis here so the libc-linked calls below are never instantiated.
-        if (comptime builtin.os.tag == .windows) return error.SocketUnavailable;
 
         var yes: u32 = 1;
         _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(u32));
@@ -138,11 +171,45 @@ pub const ChallengeServer = struct {
             .listen_fd = fd,
             .port = try boundPort(fd),
             .conn_read_timeout_sec = @max(config.conn_read_timeout_sec, 1),
+            .accept_poll_ms = @max(config.accept_poll_ms, 1),
+        };
+    }
+
+    fn initWindows(store: *http01.TokenStore, port: u16, config: Config) ListenerError!ChallengeServer {
+        if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+        errdefer _ = win.WSACleanup();
+        const socket = win.WSASocketW(2, 1, 6, null, 0, 1);
+        if (socket == win.invalid_socket) return error.SocketUnavailable;
+        errdefer _ = win.closesocket(socket);
+
+        // No other local process may take over the challenge port while an
+        // issuance is active. Windows SO_REUSEADDR would permit that bind.
+        const exclusive: i32 = 1;
+        if (win.setsockopt(socket, 0xffff, ~@as(i32, 0x0004), &exclusive, @sizeOf(i32)) != 0)
+            return error.SocketUnavailable;
+        var address = win.SockAddr4{ .family = 2, .port = std.mem.nativeToBig(u16, port), .addr = .{ 127, 0, 0, 1 } };
+        if (win.bind(socket, &address, @sizeOf(win.SockAddr4)) != 0) return error.BindFailed;
+        if (win.listen(socket, @intCast(config.listen_backlog)) != 0) return error.ListenFailed;
+        var nonblocking: u32 = 1;
+        if (win.ioctlsocket(socket, 0x8004667e, &nonblocking) != 0) return error.ListenFailed;
+        var address_len: i32 = @sizeOf(win.SockAddr4);
+        if (win.getsockname(socket, &address, &address_len) != 0 or address_len != @sizeOf(win.SockAddr4))
+            return error.AddrLookupFailed;
+        return .{
+            .store = store,
+            .listen_fd = undefined,
+            .windows_socket = socket,
+            .port = std.mem.bigToNative(u16, address.port),
+            .conn_read_timeout_sec = @max(config.conn_read_timeout_sec, 1),
+            .accept_poll_ms = @max(config.accept_poll_ms, 1),
         };
     }
 
     /// Spawn the background accept loop.
     pub fn spawn(self: *ChallengeServer) std.Thread.SpawnError!void {
+        errdefer self.shutdown();
         self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
 
@@ -154,16 +221,20 @@ pub const ChallengeServer = struct {
             t.join();
             self.thread = null;
         }
-        // This listener never opens on Windows (`socketTcp` refuses and the
-        // portable server stays plaintext-only); gate at comptime so
-        // `refAllDecls` test builds compile. Byte-identical elsewhere.
-        if (comptime builtin.os.tag != .windows) {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.windows_socket != win.invalid_socket) {
+                _ = win.closesocket(self.windows_socket);
+                self.windows_socket = win.invalid_socket;
+                _ = win.WSACleanup();
+            }
+        } else {
             if (self.listen_fd >= 0) closeFd(self.listen_fd);
             self.listen_fd = -1;
         }
     }
 
     fn acceptLoop(self: *ChallengeServer) void {
+        if (comptime builtin.os.tag == .windows) return self.acceptLoopWindows();
         // Linux-only accept loop (`accept4`/`SOCK_CLOEXEC`). Gate at comptime so
         // foreign-target test builds compile; byte-identical on Linux.
         if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
@@ -175,6 +246,54 @@ pub const ChallengeServer = struct {
                     else => return, // listener closed (shutdown) or fatal: exit thread
                 }
             }
+        }
+    }
+
+    fn acceptLoopWindows(self: *ChallengeServer) void {
+        if (comptime builtin.os.tag != .windows) return;
+        while (!self.stop_flag.load(.acquire)) {
+            const ready = waitWindows(self.windows_socket, false, self.accept_poll_ms);
+            if (ready < 0) return;
+            if (ready == 0) continue;
+            const client = win.accept(self.windows_socket, null, null);
+            if (client == win.invalid_socket) continue;
+            self.serveConnWindows(client);
+        }
+    }
+
+    fn serveConnWindows(self: *ChallengeServer, client: usize) void {
+        if (comptime builtin.os.tag != .windows) return;
+        self.operation_active.store(true, .release);
+        defer self.operation_active.store(false, .release);
+        defer _ = win.closesocket(client);
+        const socket_timeout_ms: u32 = 1000;
+        if (win.setsockopt(client, 0xffff, 0x1006, &socket_timeout_ms, @sizeOf(u32)) != 0 or
+            win.setsockopt(client, 0xffff, 0x1005, &socket_timeout_ms, @sizeOf(u32)) != 0) return;
+
+        const deadline = platform.monotonicMillis() +| (@as(i64, self.conn_read_timeout_sec) * 1000);
+        var req_buf: [max_request]u8 = undefined;
+        var used: usize = 0;
+        while (!self.stop_flag.load(.acquire) and platform.monotonicMillis() < deadline) {
+            const ready = waitWindows(client, false, 50);
+            if (ready < 0) return;
+            if (ready == 0) continue;
+            if (used == req_buf.len) return;
+            const received = win.recv(client, req_buf[used..].ptr, @intCast(req_buf.len - used), 0);
+            if (received <= 0) return;
+            used += @intCast(received);
+            if (std.mem.indexOfScalar(u8, req_buf[0..used], '\n') == null) continue;
+            var resp_buf: [max_response]u8 = undefined;
+            const resp = http01.handleRequest(self.store, req_buf[0..used], &resp_buf) catch return;
+            var sent: usize = 0;
+            while (sent < resp.len and !self.stop_flag.load(.acquire) and platform.monotonicMillis() < deadline) {
+                const writable = waitWindows(client, true, 50);
+                if (writable < 0) return;
+                if (writable == 0) continue;
+                const n = win.send(client, resp[sent..].ptr, @intCast(resp.len - sent), 0);
+                if (n <= 0) return;
+                sent += @intCast(n);
+            }
+            return;
         }
     }
 
@@ -214,6 +333,18 @@ pub const ChallengeServer = struct {
         _ = metrics_http.writeUntil(fd, resp, &self.stop_flag, deadline);
     }
 };
+
+fn waitWindows(socket: usize, writable: bool, timeout_ms: u32) i32 {
+    if (comptime builtin.os.tag != .windows) return -1;
+    var set = win.FdSet{ .count = 1, .sockets = undefined };
+    set.sockets[0] = socket;
+    const finite_ms = @max(1, @min(timeout_ms, 5000));
+    const seconds: i32 = @intCast(finite_ms / 1000);
+    const remainder_ms: u32 = finite_ms % 1000;
+    const microseconds: i32 = @intCast(remainder_ms * 1000);
+    const tv = win.Timeval{ .sec = seconds, .usec = microseconds };
+    return win.select(0, if (writable) null else &set, if (writable) &set else null, null, &tv);
+}
 
 // ---------------------------------------------------------------------------
 // Low-level helpers (raw linux syscalls)
@@ -290,6 +421,61 @@ fn writeAll(fd: sys.fd_t, bytes: []const u8) void {
         if (rc == 0) return;
         off += @intCast(rc);
     }
+}
+
+test "Windows ACME HTTP-01 listener serves a challenge and joins a silent client" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var store = http01.TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.put("token_123", "token_123.test-thumbprint");
+    var child = try ChallengeServer.initWithConfig(&store, 0, .{ .accept_poll_ms = 50, .conn_read_timeout_sec = 5 });
+    defer child.shutdown();
+    try child.spawn();
+
+    const client = win.WSASocketW(2, 1, 6, null, 0, 1);
+    try std.testing.expect(client != win.invalid_socket);
+    defer _ = win.closesocket(client);
+    const addr = win.SockAddr4{ .family = 2, .port = std.mem.nativeToBig(u16, child.port), .addr = .{ 127, 0, 0, 1 } };
+    try std.testing.expectEqual(@as(i32, 0), win.connect(client, &addr, @sizeOf(win.SockAddr4)));
+    const timeout_ms: u32 = 2000;
+    try std.testing.expectEqual(@as(i32, 0), win.setsockopt(client, 0xffff, 0x1006, &timeout_ms, @sizeOf(u32)));
+    const first_part = "GET /.well-known/acme-";
+    const final_part = "challenge/token_123 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try std.testing.expectEqual(@as(i32, first_part.len), win.send(client, first_part.ptr, @intCast(first_part.len), 0));
+    @import("os_runtime.zig").sleepMillis(20);
+    try std.testing.expectEqual(@as(i32, final_part.len), win.send(client, final_part.ptr, @intCast(final_part.len), 0));
+    var reply_buf: [max_response]u8 = undefined;
+    var used: usize = 0;
+    while (used < reply_buf.len) {
+        const got = win.recv(client, reply_buf[used..].ptr, @intCast(reply_buf.len - used), 0);
+        if (got <= 0) break;
+        used += @intCast(got);
+        if (std.mem.indexOf(u8, reply_buf[0..used], "token_123.test-thumbprint") != null) break;
+    }
+    const reply = reply_buf[0..used];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "HTTP/1.1 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "token_123.test-thumbprint") != null);
+
+    // A competing SO_REUSEADDR listener must not shadow the live challenge.
+    const competitor = win.WSASocketW(2, 1, 6, null, 0, 1);
+    try std.testing.expect(competitor != win.invalid_socket);
+    defer _ = win.closesocket(competitor);
+    const reuse: i32 = 1;
+    try std.testing.expectEqual(@as(i32, 0), win.setsockopt(competitor, 0xffff, 0x0004, &reuse, @sizeOf(i32)));
+    try std.testing.expect(win.bind(competitor, &addr, @sizeOf(win.SockAddr4)) != 0);
+
+    const silent = win.WSASocketW(2, 1, 6, null, 0, 1);
+    try std.testing.expect(silent != win.invalid_socket);
+    defer _ = win.closesocket(silent);
+    try std.testing.expectEqual(@as(i32, 0), win.connect(silent, &addr, @sizeOf(win.SockAddr4)));
+    const ready_deadline = platform.monotonicMillis() + 1500;
+    while (!child.operation_active.load(.acquire) and platform.monotonicMillis() < ready_deadline)
+        @import("os_runtime.zig").sleepMillis(10);
+    try std.testing.expect(child.operation_active.load(.acquire));
+    const stop_start = platform.monotonicMillis();
+    child.shutdown();
+    try std.testing.expect(platform.monotonicMillis() - stop_start < 1500);
+    try std.testing.expect(child.thread == null and child.windows_socket == win.invalid_socket);
 }
 
 fn parseDurationMs(text: []const u8) !u32 {

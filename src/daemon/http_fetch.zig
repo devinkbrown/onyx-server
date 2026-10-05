@@ -6,9 +6,10 @@
 //!
 //! It is deliberately self-contained and does NOT touch the reactor's io_uring
 //! `Io` (which is not safe to share across threads): DNS, connect, and socket
-//! I/O are raw `linux`/`posix` syscalls, and `/etc/resolv.conf` is read with a
-//! blocking `open`/`read`. Connect and receive are bounded by timeouts so a
-//! stalled upstream can never wedge the fetcher thread.
+//! I/O use raw OS sockets (Winsock on Windows, `linux`/`posix` elsewhere).
+//! Unix resolver configuration comes from `/etc/resolv.conf`; Windows uses
+//! the system hostname resolver. Connect and receive are bounded by
+//! timeouts so a stalled upstream cannot wedge the fetcher thread.
 //!
 //! TLS reuses `crypto/tls_client` (the same client `acme_runner` drives), so
 //! news feeds over HTTPS verify against caller-supplied trust anchors.
@@ -24,11 +25,95 @@ const tls12_client = @import("../crypto/tls12_client.zig");
 const sct = @import("../crypto/sct.zig");
 const http1 = @import("../proto/http1_client.zig");
 const net = std.Io.net;
+const Socket = if (builtin.os.tag == .windows) usize else sys.fd_t;
+
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const af_inet: i32 = 2;
+    const sock_stream: i32 = 1;
+    const ipproto_tcp: i32 = 6;
+    const sol_socket: i32 = 0xffff;
+    const so_error: i32 = 0x1007;
+    const so_rcvtimeo: i32 = 0x1006;
+    const so_sndtimeo: i32 = 0x1005;
+    const fionbio: u32 = 0x8004667e;
+    const interrupted: i32 = 10004;
+    const would_block: i32 = 10035;
+    const in_progress: i32 = 10036;
+    const already: i32 = 10037;
+    const timed_out: i32 = 10060;
+    const io_pending: i32 = 997;
+    const af_inet6: i32 = 23;
+    const ns_dns: u32 = 12;
+    const wait_object_0: u32 = 0;
+    const wait_timeout: u32 = 258;
+
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: [4]u8,
+        zero: [8]u8 = @splat(0),
+    };
+    const FdSet = extern struct {
+        count: u32,
+        sockets: [64]usize,
+    };
+    const Timeval = extern struct {
+        seconds: i32,
+        microseconds: i32,
+    };
+    const Overlapped = extern struct {
+        internal: usize = 0,
+        internal_high: usize = 0,
+        offset_or_pointer: usize = 0,
+        event: ?*anyopaque = null,
+    };
+    const AddrInfoExW = extern struct {
+        flags: i32 = 0,
+        family: i32 = 0,
+        socket_type: i32 = 0,
+        protocol: i32 = 0,
+        addr_len: usize = 0,
+        canonical_name: ?[*:0]u16 = null,
+        addr: ?*anyopaque = null,
+        blob: ?*anyopaque = null,
+        blob_len: usize = 0,
+        provider: ?*anyopaque = null,
+        next: ?*AddrInfoExW = null,
+    };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8 or
+            @sizeOf(Overlapped) != 32 or @sizeOf(AddrInfoExW) != 72)
+            @compileError("Windows HTTP socket ABI shape changed");
+    }
+
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn accept(socket: usize, address: ?*anyopaque, address_len: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn select(ignored_nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn GetAddrInfoExW(name: [*:0]const u16, service: ?[*:0]const u16, namespace: u32, provider: ?*const anyopaque, hints: *const AddrInfoExW, result: *?*AddrInfoExW, timeout: ?*Timeval, overlapped: *Overlapped, completion: *const fn (u32, u32, *Overlapped) callconv(.winapi) void, cancel_handle: *?*anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn GetAddrInfoExCancel(cancel_handle: *?*anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn FreeAddrInfoExW(result: *AddrInfoExW) callconv(.winapi) void;
+    extern "kernel32" fn CreateEventW(attributes: ?*const anyopaque, manual_reset: i32, initial_state: i32, name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, milliseconds: u32) callconv(.winapi) u32;
+    extern "kernel32" fn SetEvent(handle: *anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;
+};
 
 pub const Error = error{
     BadUrl,
     NoNameservers,
     HostNotFound,
+    ResolveTimeout,
     ConnectFailed,
     ConnectTimeout,
     SocketUnavailable,
@@ -111,9 +196,35 @@ pub fn get(
     request_bytes: []const u8,
     opts: Options,
 ) Error![]u8 {
-    if (comptime builtin.os.tag == .windows) return error.SocketUnavailable;
     const addr = try resolveHostA(host, port, opts.recv_timeout_ms);
+    return getAtAddress(allocator, host, port, tls, request_bytes, addr, opts);
+}
 
+/// Send one request to an already selected IP while using `host` for HTTP Host,
+/// TLS SNI, and certificate verification. Security-sensitive callers can screen
+/// the resolved address and connect to exactly that address without a second
+/// DNS lookup or rebinding window.
+pub fn getAtAddress(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    tls: bool,
+    request_bytes: []const u8,
+    addr: net.IpAddress,
+    opts: Options,
+) Error![]u8 {
+    const selected_port = switch (addr) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    if (selected_port != port) return error.ConnectFailed;
+    if (comptime builtin.os.tag == .windows) {
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+    }
+    defer {
+        if (comptime builtin.os.tag == .windows) _ = win.WSACleanup();
+    }
     if (!tls) {
         const fd = try connectAddr(addr, opts.connect_timeout_ms);
         defer closeFd(fd);
@@ -134,13 +245,32 @@ pub fn get(
         if (getTls(allocator, fd, host, request_bytes, opts, &application_phase)) |resp| {
             return resp;
         } else |err| {
-            if (application_phase or err == error.ResponseTooLarge) return err;
+            if (application_phase or err == error.ResponseTooLarge or tlsTrustFailure(err)) return err;
         }
     }
     const fd2 = try connectAddr(addr, opts.connect_timeout_ms);
     defer closeFd(fd2);
     try setRecvTimeout(fd2, opts.recv_timeout_ms);
     return try getTls12(allocator, fd2, host, request_bytes, opts);
+}
+
+fn tlsTrustFailure(err: anyerror) bool {
+    return switch (err) {
+        error.UnknownCa,
+        error.CertificateNameMismatch,
+        error.CertificateRevoked,
+        error.BadCertificate,
+        error.Expired,
+        error.NotYetValid,
+        error.IssuerMismatch,
+        error.NotSelfSigned,
+        error.MissingSignature,
+        error.BadSignature,
+        error.BadSct,
+        error.InsufficientScts,
+        => true,
+        else => false,
+    };
 }
 
 /// Perform one HTTP POST of `body` to `url` with `content_type`, returning the
@@ -206,7 +336,7 @@ fn postWithHeaders(
 /// hosts. Mirrors `getTls` but uses the 1.2 client's `decrypt` (no KeyUpdate).
 fn getTls12(
     allocator: std.mem.Allocator,
-    fd: sys.fd_t,
+    fd: Socket,
     host: []const u8,
     request_bytes: []const u8,
     opts: Options,
@@ -231,7 +361,7 @@ fn getTls12(
     while (!tc.handshakeDone()) {
         const n = try readSome(fd, &read_buf);
         switch (tc.feed(read_buf[0..n]) catch |err| {
-            tls_client_failure.sendFatal(fd, &tc, err);
+            sendFatal(fd, &tc, err);
             return err;
         }) {
             .need_more => {},
@@ -259,7 +389,7 @@ fn getTls12(
             const pt = tc.decrypt(rec) catch |err| switch (err) {
                 error.TlsAlert => break :read_loop, // close_notify ends the stream
                 else => {
-                    tls_client_failure.sendFatal(fd, &tc, err);
+                    sendFatal(fd, &tc, err);
                     return err;
                 },
             };
@@ -282,7 +412,7 @@ fn getTls12(
 
 fn getTls(
     allocator: std.mem.Allocator,
-    fd: sys.fd_t,
+    fd: Socket,
     host: []const u8,
     request_bytes: []const u8,
     opts: Options,
@@ -311,7 +441,7 @@ fn getTls(
     while (!tc.handshakeDone()) {
         const n = try readSome(fd, &read_buf);
         switch (tc.feed(read_buf[0..n]) catch |err| {
-            tls_client_failure.sendFatal(fd, &tc, err);
+            sendFatal(fd, &tc, err);
             return err;
         }) {
             .need_more => {},
@@ -340,7 +470,7 @@ fn getTls(
             const read = tc.decryptApp(rec) catch |err| switch (err) {
                 error.TlsAlert => break :read_loop, // close_notify ends the stream
                 else => {
-                    tls_client_failure.sendFatal(fd, &tc, err);
+                    sendFatal(fd, &tc, err);
                     return err;
                 },
             };
@@ -372,7 +502,7 @@ fn getTls(
     return plaintext.toOwnedSlice(allocator);
 }
 
-fn readHttp(allocator: std.mem.Allocator, fd: sys.fd_t, max_bytes: usize) Error![]u8 {
+fn readHttp(allocator: std.mem.Allocator, fd: Socket, max_bytes: usize) Error![]u8 {
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(allocator);
     var buf: [16 * 1024]u8 = undefined;
@@ -389,8 +519,26 @@ fn readHttp(allocator: std.mem.Allocator, fd: sys.fd_t, max_bytes: usize) Error!
     return acc.toOwnedSlice(allocator);
 }
 
+fn sendFatal(fd: Socket, client: anytype, failure: anytype) void {
+    if (comptime builtin.os.tag == .windows) {
+        const bytes = client.takeAlert(failure) orelse return;
+        defer client.allocator.free(bytes);
+        const timeout_ms: u32 = 1000;
+        if (win.setsockopt(fd, win.sol_socket, win.so_sndtimeo, &timeout_ms, @sizeOf(u32)) != 0) return;
+        writeAll(fd, bytes) catch |err| {
+            std.log.warn("TLS fatal alert write failed: {s}", .{@errorName(err)});
+        };
+        return;
+    }
+    tls_client_failure.sendFatal(fd, client, failure);
+}
+
 /// Wall-clock time in Unix seconds, used to reject expired server certificates.
 fn wallClockSeconds() i64 {
+    if (comptime builtin.os.tag == .windows) {
+        const millis = @import("../substrate/platform.zig").realtimeMillisChecked() orelse return 0;
+        return @divTrunc(millis, 1000);
+    }
     var ts: sys.timespec = undefined;
     if (posix.errno(sys.clock_gettime(posix.CLOCK.REALTIME, &ts)) != .SUCCESS) return 0;
     return @intCast(ts.sec);
@@ -414,13 +562,14 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
 
 // ---- DNS (A-record over UDP, blocking) --------------------------------------
 
-/// Resolve `host` to an address: IP literals parse directly; otherwise a
-/// blocking A-record query against the system resolvers, bounded by
-/// `timeout_ms` per nameserver. Public so the daemon's mesh auto-connect can
-/// dial configured "host:port" peers by name (same blocking-DNS contract).
+/// Resolve `host` to an address: IP literals parse directly; otherwise query
+/// the system resolver with a bounded wait (Windows) or each configured DNS
+/// server (Unix). Public so mesh auto-connect can dial hostname peers.
 pub fn resolveHostA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAddress {
     if (net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
-    if (comptime builtin.os.tag == .windows) return error.NoNameservers;
+    if (comptime builtin.os.tag == .windows) {
+        return resolveHostWindows(host, port, timeout_ms, false);
+    }
 
     var conf_buf: [4096]u8 = undefined;
     const text = readSmallFile("/etc/resolv.conf", &conf_buf) catch return error.NoNameservers;
@@ -476,15 +625,16 @@ fn queryServerPort(ns_v4: [4]u8, port: u16, query: []const u8, timeout_ms: u31) 
     return msg;
 }
 
-/// Like `resolveHostA` but queries AAAA records, returning an IPv6 address.
-/// Used by the mesh dial path so a v6-only peer resolves; the query travels over
-/// the (IPv4) system resolvers exactly like the A path.
+/// Like `resolveHostA` but requests IPv6 addresses. The Unix path queries AAAA
+/// records over configured IPv4 nameservers; Windows uses its system resolver.
 pub fn resolveHostAAAA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAddress {
     if (net.IpAddress.parse(host, port)) |addr| switch (addr) {
         .ip6 => return addr,
         .ip4 => {}, // an IPv4 literal is not an AAAA answer — fall through to DNS
     } else |_| {}
-    if (comptime builtin.os.tag == .windows) return error.NoNameservers;
+    if (comptime builtin.os.tag == .windows) {
+        return resolveHostWindows(host, port, timeout_ms, true);
+    }
 
     var conf_buf: [4096]u8 = undefined;
     const text = readSmallFile("/etc/resolv.conf", &conf_buf) catch return error.NoNameservers;
@@ -510,6 +660,121 @@ pub fn resolveHostAAAA(host: []const u8, port: u16, timeout_ms: u31) Error!net.I
     return error.HostNotFound;
 }
 
+fn resolveHostWindows(host: []const u8, port: u16, timeout_ms: u31, want_v6: bool) Error!net.IpAddress {
+    if (comptime builtin.os.tag != .windows) return error.NoNameservers;
+    if (timeout_ms == 0) return error.ResolveTimeout;
+    if (host.len == 0 or host.len > 1024 or std.mem.indexOfScalar(u8, host, 0) != null)
+        return error.HostNotFound;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, host) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HostNotFound,
+    };
+    var startup: [408]u8 align(8) = @splat(0);
+    if (win.WSAStartup(0x0202, &startup) != 0) {
+        std.heap.page_allocator.free(wide);
+        return error.SocketUnavailable;
+    }
+    const event = win.CreateEventW(null, 1, 0, null) orelse {
+        _ = win.WSACleanup();
+        std.heap.page_allocator.free(wide);
+        return error.SocketUnavailable;
+    };
+    const state = std.heap.page_allocator.create(WinResolveState) catch {
+        _ = win.CloseHandle(event);
+        _ = win.WSACleanup();
+        std.heap.page_allocator.free(wide);
+        return error.OutOfMemory;
+    };
+    state.* = .{
+        .event = event,
+        .name = wide,
+        .family = if (want_v6) win.af_inet6 else win.af_inet,
+        .port = port,
+    };
+    state.hints.family = state.family;
+    state.hints.socket_type = win.sock_stream;
+    state.hints.protocol = win.ipproto_tcp;
+    defer state.release();
+
+    // Callback owns one reference from the time the query is issued. On a
+    // timeout, cancellation signals completion while some namespace providers
+    // may continue internally; the caller can return without freeing storage
+    // still reachable by Winsock. The callback frees the result and last ref.
+    var cancel_handle: ?*anyopaque = null;
+    const rc = win.GetAddrInfoExW(state.name.ptr, null, win.ns_dns, null, &state.hints, &state.result, null, &state.overlapped, winResolveCompleted, &cancel_handle);
+    if (rc != win.io_pending) winResolveCompleted(@bitCast(rc), 0, &state.overlapped);
+
+    const wait_ms: u32 = @min(timeout_ms, 2500);
+    const waited = win.WaitForSingleObject(state.event, wait_ms);
+    if (waited != win.wait_object_0) {
+        if (cancel_handle != null) _ = win.GetAddrInfoExCancel(&cancel_handle);
+        return if (waited == win.wait_timeout) error.ResolveTimeout else error.HostNotFound;
+    }
+    const status = state.status.load(.acquire);
+    if (status == win.timed_out) return error.ResolveTimeout;
+    if (status != 0) return error.HostNotFound;
+    return state.answer orelse error.HostNotFound;
+}
+
+const WinResolveState = struct {
+    // OVERLAPPED and all input/output storage must outlive GetAddrInfoExW.
+    overlapped: win.Overlapped = .{},
+    hints: win.AddrInfoExW = .{},
+    result: ?*win.AddrInfoExW = null,
+    event: *anyopaque,
+    name: [:0]u16,
+    family: i32,
+    port: u16,
+    answer: ?net.IpAddress = null,
+    status: std.atomic.Value(i32) = .init(win.io_pending),
+    refs: std.atomic.Value(u32) = .init(2),
+
+    fn release(self: *WinResolveState) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        _ = win.CloseHandle(self.event);
+        std.heap.page_allocator.free(self.name);
+        _ = win.WSACleanup();
+        std.heap.page_allocator.destroy(self);
+    }
+};
+
+fn winResolveCompleted(status: u32, _: u32, overlapped: *win.Overlapped) callconv(.winapi) void {
+    const state: *WinResolveState = @fieldParentPtr("overlapped", overlapped);
+    if (state.result) |result| {
+        if (status == 0) state.answer = firstWinSystemAddress(result, state.family, state.port);
+        win.FreeAddrInfoExW(result);
+        state.result = null;
+    }
+    state.status.store(@bitCast(status), .release);
+    _ = win.SetEvent(state.event);
+    state.release();
+}
+
+fn firstWinSystemAddress(head: ?*win.AddrInfoExW, family: i32, port: u16) ?net.IpAddress {
+    var cursor = head;
+    for (0..64) |_| {
+        const entry = cursor orelse return null;
+        cursor = entry.next;
+        if (entry.family != family or entry.addr_len > 128) continue;
+        const addr = entry.addr orelse continue;
+        const raw: [*]const u8 = @ptrCast(addr);
+        if (family == win.af_inet) {
+            if (entry.addr_len < 16 or std.mem.readInt(u16, raw[0..2], .little) != win.af_inet) continue;
+            var bytes: [4]u8 = undefined;
+            @memcpy(&bytes, raw[4..8]);
+            return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+        }
+        if (family == win.af_inet6) {
+            if (entry.addr_len < 28 or std.mem.readInt(u16, raw[0..2], .little) != win.af_inet6) continue;
+            var bytes: [16]u8 = undefined;
+            @memcpy(&bytes, raw[8..24]);
+            const scope = std.mem.readInt(u32, raw[24..28], .little);
+            return .{ .ip6 = .{ .bytes = bytes, .port = port, .interface = .{ .index = scope } } };
+        }
+    }
+    return null;
+}
+
 fn queryOneServer6(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![16]u8 {
     const msg = try queryServerPort(ns_v4, 53, query, timeout_ms);
     for (msg.answerSlice()) |rr| switch (rr.data) {
@@ -521,7 +786,8 @@ fn queryOneServer6(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![16]u
 
 // ---- raw socket helpers (mirror acme_runner / server idiom) ------------------
 
-fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!sys.fd_t {
+fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!Socket {
+    if (comptime builtin.os.tag == .windows) return connectAddrWindows(addr, timeout_ms);
     const a4 = switch (addr) {
         .ip4 => |x| x,
         .ip6 => return error.ConnectFailed,
@@ -543,6 +809,42 @@ fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!sys.fd_t {
     if (err_val != 0) return error.ConnectFailed;
     try setBlocking(fd);
     return fd;
+}
+
+fn connectAddrWindows(addr: net.IpAddress, timeout_ms: u31) Error!Socket {
+    if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
+    const a4 = switch (addr) {
+        .ip4 => |value| value,
+        .ip6 => return error.ConnectFailed,
+    };
+    const fd = win.WSASocketW(win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    if (fd == win.invalid_socket) return error.SocketUnavailable;
+    errdefer _ = win.closesocket(fd);
+    var nonblocking: u32 = 1;
+    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
+    const sa = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, a4.port), .addr = a4.bytes };
+    if (win.connect(fd, &sa, @sizeOf(win.SockAddr4)) != 0) {
+        const err = win.WSAGetLastError();
+        if (err != win.would_block and err != win.in_progress and err != win.already) return error.ConnectFailed;
+        if (!try windowsWaitWritable(fd, @max(1, @min(timeout_ms, 60_000)))) return error.ConnectTimeout;
+    }
+    var socket_error: i32 = 0;
+    var error_len: i32 = @sizeOf(i32);
+    if (win.getsockopt(fd, win.sol_socket, win.so_error, &socket_error, &error_len) != 0 or
+        socket_error != 0 or error_len != @sizeOf(i32)) return error.ConnectFailed;
+    nonblocking = 0;
+    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
+    return fd;
+}
+
+fn windowsWaitWritable(fd: usize, timeout_ms: u31) Error!bool {
+    if (comptime builtin.os.tag != .windows) return error.ConnectFailed;
+    var writes = win.FdSet{ .count = 1, .sockets = undefined };
+    writes.sockets[0] = fd;
+    var timeout = win.Timeval{ .seconds = @intCast(timeout_ms / 1000), .microseconds = @intCast((timeout_ms % 1000) * 1000) };
+    const ready = win.select(0, null, &writes, null, &timeout);
+    if (ready < 0) return error.ConnectFailed;
+    return ready != 0;
 }
 
 fn waitWritable(fd: sys.fd_t, timeout_ms: u31) Error!void {
@@ -587,7 +889,14 @@ fn setBlocking(fd: sys.fd_t) Error!void {
     _ = sys.fcntl(fd, posix.F.SETFL, flags & ~@as(usize, posix.SOCK.NONBLOCK));
 }
 
-fn setRecvTimeout(fd: sys.fd_t, timeout_ms: u31) Error!void {
+fn setRecvTimeout(fd: Socket, timeout_ms: u31) Error!void {
+    if (comptime builtin.os.tag == .windows) {
+        const finite_ms: u32 = @max(1, @min(timeout_ms, 60_000));
+        if (win.setsockopt(fd, win.sol_socket, win.so_rcvtimeo, &finite_ms, @sizeOf(u32)) != 0 or
+            win.setsockopt(fd, win.sol_socket, win.so_sndtimeo, &finite_ms, @sizeOf(u32)) != 0)
+            return error.RecvTimeout;
+        return;
+    }
     const finite_ms = if (builtin.os.tag == .linux) timeout_ms else @max(timeout_ms, 1);
     const tv = sys.timeval{ .sec = @intCast(finite_ms / 1000), .usec = @intCast((finite_ms % 1000) * 1000) };
     const recv_rc = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(sys.timeval));
@@ -597,11 +906,33 @@ fn setRecvTimeout(fd: sys.fd_t, timeout_ms: u31) Error!void {
     }
 }
 
-fn closeFd(fd: sys.fd_t) void {
+fn closeFd(fd: Socket) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = win.closesocket(fd);
+        return;
+    }
     _ = sys.close(fd);
 }
 
-fn writeAll(fd: sys.fd_t, bytes: []const u8) Error!void {
+fn writeAll(fd: Socket, bytes: []const u8) Error!void {
+    if (comptime builtin.os.tag == .windows) {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const amount: i32 = @intCast(@min(bytes.len - offset, std.math.maxInt(i32)));
+            const sent = win.send(fd, bytes[offset..].ptr, amount, 0);
+            if (sent > 0) {
+                offset += @intCast(sent);
+                continue;
+            }
+            if (sent == 0) return error.ConnectionClosed;
+            switch (win.WSAGetLastError()) {
+                win.interrupted => continue,
+                win.timed_out, win.would_block => return error.RecvTimeout,
+                else => return error.ConnectionClosed,
+            }
+        }
+        return;
+    }
     var off: usize = 0;
     while (off < bytes.len) {
         const rc = if (comptime builtin.os.tag == .linux) sys.write(fd, bytes[off..].ptr, bytes.len - off) else sys.send(fd, bytes[off..].ptr, bytes.len - off, posix.MSG.NOSIGNAL);
@@ -618,7 +949,19 @@ fn writeAll(fd: sys.fd_t, bytes: []const u8) Error!void {
     }
 }
 
-fn readSome(fd: sys.fd_t, buf: []u8) Error!usize {
+fn readSome(fd: Socket, buf: []u8) Error!usize {
+    if (comptime builtin.os.tag == .windows) {
+        while (true) {
+            const received = win.recv(fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(i32))), 0);
+            if (received > 0) return @intCast(received);
+            if (received == 0) return error.ConnectionClosed;
+            switch (win.WSAGetLastError()) {
+                win.interrupted => continue,
+                win.timed_out, win.would_block => return error.RecvTimeout,
+                else => return error.ConnectionClosed,
+            }
+        }
+    }
     while (true) {
         const rc = sys.read(fd, buf.ptr, buf.len);
         switch (posix.errno(rc)) {
@@ -676,6 +1019,199 @@ fn osEntropy(buf: []u8) void {
 }
 
 // ---- tests ------------------------------------------------------------------
+
+test "http_fetch Windows system resolver handles localhost and bounded failures" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const literal4 = try resolveHostA("127.0.0.9", 6900, 0);
+    const literal6 = try resolveHostAAAA("::1", 6900, 0);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 9 }, &literal4.ip4.bytes);
+    try std.testing.expectEqual(@as(u8, 1), literal6.ip6.bytes[15]);
+    const a = try resolveHostA("localhost", 6900, 1000);
+    const aaaa = try resolveHostAAAA("localhost", 6900, 1000);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &a.ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 6900), a.ip4.port);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, &aaaa.ip6.bytes);
+    try std.testing.expectEqual(@as(u16, 6900), aaaa.ip6.port);
+    try std.testing.expectError(error.ResolveTimeout, resolveHostA("localhost", 6900, 0));
+    try std.testing.expectError(error.HostNotFound, resolveHostA("invalid\xff", 6900, 100));
+
+    // A reserved nonexistent name exercises either immediate negative result
+    // or asynchronous cancellation, independent of hosts-file contents.
+    const clock = @import("../substrate/platform.zig");
+    const started = clock.monotonicMillis();
+    const missing = resolveHostA("onyx-system-resolver-test.invalid.", 6900, 10);
+    if (missing) |_| return error.TestUnexpectedResult else |err| {
+        try std.testing.expect(err == error.HostNotFound or err == error.ResolveTimeout);
+    }
+    try std.testing.expect(clock.monotonicMillis() - started < 5000);
+}
+
+test "http_fetch Windows system result parser rejects short addresses and cycles" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var sockaddr = win.SockAddr4{ .family = win.af_inet, .port = 0, .addr = .{ 127, 0, 0, 42 } };
+    var valid = win.AddrInfoExW{ .family = win.af_inet, .addr_len = @sizeOf(win.SockAddr4), .addr = @ptrCast(&sockaddr) };
+    var short = win.AddrInfoExW{ .family = win.af_inet, .addr_len = 4, .addr = @ptrCast(&sockaddr), .next = &valid };
+    const found = firstWinSystemAddress(&short, win.af_inet, 6900) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 42 }, &found.ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 6900), found.ip4.port);
+    short.next = &short;
+    try std.testing.expect(firstWinSystemAddress(&short, win.af_inet, 6900) == null);
+}
+
+test "http_fetch Windows plaintext loopback timeout and response limit" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const metrics = @import("metrics_http.zig");
+    const a = std.testing.allocator;
+    var snapshot = metrics.MetricsSnapshot.init(a);
+    defer snapshot.deinit();
+    try snapshot.set("windows_fetch_probe 1\n");
+    var server = try metrics.MetricsServer.init(&snapshot, 0);
+    defer server.shutdown();
+    const request = "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+
+    // A connected listener without an HTTP worker must honor the receive bound.
+    try std.testing.expectError(error.RecvTimeout, get(a, "127.0.0.1", server.port, false, request, .{ .recv_timeout_ms = 80 }));
+    try server.spawn();
+    try std.testing.expectError(error.ResponseTooLarge, get(a, "127.0.0.1", server.port, false, request, .{ .max_response_bytes = 32 }));
+    const response = try get(a, "127.0.0.1", server.port, false, request, .{});
+    defer a.free(response);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, response, "windows_fetch_probe 1\n"));
+    const pinned = try net.IpAddress.parse("127.0.0.1", server.port);
+    const bypasses_dns = try getAtAddress(a, "onyx-address-pin.invalid.", server.port, false, request, pinned, .{});
+    defer a.free(bypasses_dns);
+    try std.testing.expect(std.mem.startsWith(u8, bypasses_dns, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expectError(error.ConnectFailed, getAtAddress(a, "onyx-address-pin.invalid.", server.port - 1, false, request, pinned, .{}));
+}
+
+test "http_fetch Windows HTTPS loopback verifies trusted anchor and rejects untrusted anchor" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const metrics = @import("metrics_http.zig");
+    const selfsign = @import("../proto/x509_selfsign.zig");
+    const tls_server = @import("../crypto/tls_server.zig");
+    const a = std.testing.allocator;
+    var snapshot = metrics.MetricsSnapshot.init(a);
+    defer snapshot.deinit();
+    var listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer listener.shutdown();
+
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x67));
+    var cert_buffer: [2048]u8 = undefined;
+    const cert = try selfsign.buildSelfSigned(&cert_buffer, .{
+        .common_name = "127.0.0.1",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x67, 1 },
+        .key_pair = kp,
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{cert};
+    const Worker = struct {
+        listener: usize,
+        chain: []const []const u8,
+        key_pair: std.crypto.sign.Ed25519.KeyPair,
+        expect_http: bool,
+        request_seen: bool = false,
+        fallback_seen: bool = false,
+        failure: ?anyerror = null,
+
+        fn readable(fd: usize, timeout_ms: u32) !bool {
+            var reads = win.FdSet{ .count = 1, .sockets = undefined };
+            reads.sockets[0] = fd;
+            var timeout = win.Timeval{ .seconds = @intCast(timeout_ms / 1000), .microseconds = @intCast((timeout_ms % 1000) * 1000) };
+            const rc = win.select(0, &reads, null, null, &timeout);
+            if (rc < 0) return error.TestUnexpectedResult;
+            return rc > 0;
+        }
+
+        fn readExact(fd: usize, bytes: []u8) !void {
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                offset += try readSome(fd, bytes[offset..]);
+            }
+        }
+
+        fn record(fd: usize, buffer: []u8) ![]u8 {
+            try readExact(fd, buffer[0..5]);
+            const len = 5 + @as(usize, std.mem.readInt(u16, buffer[3..5], .big));
+            if (len > buffer.len) return error.TestUnexpectedResult;
+            try readExact(fd, buffer[5..len]);
+            return buffer[0..len];
+        }
+
+        fn run(self: *@This()) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn exchange(self: *@This()) !void {
+            if (!try readable(self.listener, 2000)) return error.TestUnexpectedResult;
+            const fd = win.accept(self.listener, null, null);
+            if (fd == win.invalid_socket) return error.TestUnexpectedResult;
+            defer closeFd(fd);
+            var blocking: u32 = 0;
+            if (win.ioctlsocket(fd, win.fionbio, &blocking) != 0) return error.TestUnexpectedResult;
+            try setRecvTimeout(fd, 2000);
+
+            var engine = try tls_server.Server.init(std.heap.page_allocator, .{
+                .cert_chain = self.chain,
+                .signing_key = self.key_pair,
+            });
+            defer engine.deinit();
+            var buffer: [max_tls_record]u8 = undefined;
+            while (!engine.handshakeDone()) {
+                switch (try engine.feed(try record(fd, &buffer))) {
+                    .bytes_to_send => |bytes| {
+                        defer std.heap.page_allocator.free(bytes);
+                        try writeAll(fd, bytes);
+                    },
+                    .need_more => {},
+                }
+                if (!self.expect_http) {
+                    // The client must reject the unknown anchor before an HTTP
+                    // request. Drain its fatal alert, then check for a fallback.
+                    const alert: ?[]u8 = record(fd, &buffer) catch null;
+                    _ = alert;
+                    self.fallback_seen = try readable(self.listener, 250);
+                    return;
+                }
+            }
+            const request = try engine.decrypt(try record(fd, &buffer));
+            defer std.heap.page_allocator.free(request);
+            self.request_seen = std.mem.startsWith(u8, request, "GET /trusted HTTP/1.1\r\n");
+            const response = try engine.encrypt("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+            defer std.heap.page_allocator.free(response);
+            try writeAll(fd, response);
+        }
+    };
+
+    const request = "GET /trusted HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    var trusted_worker = Worker{ .listener = listener.listen_fd, .chain = &chain, .key_pair = kp, .expect_http = true };
+    const trusted_thread = try std.Thread.spawn(.{}, Worker.run, .{&trusted_worker});
+    var trusted_joined = false;
+    defer if (!trusted_joined) trusted_thread.join();
+    const trusted = get(a, "127.0.0.1", listener.port, true, request, .{ .trust_anchors = &chain, .recv_timeout_ms = 2000 });
+    defer if (trusted) |response| a.free(response) else |_| {};
+    trusted_thread.join();
+    trusted_joined = true;
+    if (trusted_worker.failure) |err| return err;
+    try std.testing.expect(trusted_worker.request_seen);
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK", try trusted);
+
+    var untrusted_worker = Worker{ .listener = listener.listen_fd, .chain = &chain, .key_pair = kp, .expect_http = false };
+    const untrusted_thread = try std.Thread.spawn(.{}, Worker.run, .{&untrusted_worker});
+    var untrusted_joined = false;
+    defer if (!untrusted_joined) untrusted_thread.join();
+    const untrusted = get(a, "127.0.0.1", listener.port, true, request, .{ .recv_timeout_ms = 2000 });
+    defer if (untrusted) |response| a.free(response) else |_| {};
+    untrusted_thread.join();
+    untrusted_joined = true;
+    if (untrusted_worker.failure) |err| return err;
+    try std.testing.expectError(error.UnknownCa, untrusted);
+    try std.testing.expect(!untrusted_worker.request_seen and !untrusted_worker.fallback_seen);
+}
 
 test "parseUrl splits scheme/host/port/path with defaults" {
     const u = try parseUrl("https://feeds.bbci.co.uk/news/rss.xml");

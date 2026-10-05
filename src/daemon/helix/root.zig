@@ -21,6 +21,12 @@ pub const native_exchange = @import("native_exchange.zig");
 pub const native_manifest = @import("native_manifest.zig");
 pub const native_process = @import("native_process.zig");
 pub const native_bootstrap = @import("native_bootstrap.zig");
+pub const native_windows_socket = @import("native_windows_socket.zig");
+pub const native_windows_arena = @import("native_windows_arena.zig");
+pub const native_windows_control = @import("native_windows_control.zig");
+pub const native_windows_process = @import("native_windows_process.zig");
+pub const native_windows_bootstrap = @import("native_windows_bootstrap.zig");
+pub const native_windows_driver = @import("native_windows_driver.zig");
 pub const native_service_snapshot = @import("native_service_snapshot.zig");
 
 // State-migration capsules (one schema per resumable subsystem).
@@ -79,6 +85,12 @@ test {
     _ = native_manifest;
     _ = native_process;
     _ = native_bootstrap;
+    _ = native_windows_socket;
+    _ = native_windows_arena;
+    _ = native_windows_control;
+    _ = native_windows_process;
+    _ = native_windows_bootstrap;
+    _ = native_windows_driver;
     _ = native_service_snapshot;
     std.testing.refAllDecls(@This());
     _ = thread_snapshot;

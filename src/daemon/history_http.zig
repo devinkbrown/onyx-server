@@ -12,11 +12,11 @@ const metrics_http = @import("metrics_http.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const sys = if (builtin.os.tag == .openbsd) std.posix.system else linux;
+const Socket = if (builtin.os.tag == .windows) usize else linux.fd_t;
 // Pollfd element type must match `sys` above: libc's on OpenBSD,
 // Linux's everywhere else (`posix.pollfd` differs from it on macOS).
 // Both branches resolve on every target, so this container-level `if`
-// stays valid cross-platform. This listener backend only runs on
-// linux/openbsd (live tests skip elsewhere).
+// stays valid cross-platform. Windows uses WSAPoll through the Winsock path.
 const sys_pollfd = if (builtin.os.tag == .openbsd) posix.pollfd else linux.pollfd;
 const runtime = @import("os_runtime.zig");
 const native_network = @import("native_network.zig");
@@ -24,6 +24,66 @@ const platform = @import("../substrate/platform.zig");
 const posix = std.posix;
 const tls_record = @import("../crypto/tls_record.zig");
 const tls_server = @import("../crypto/tls_server.zig");
+const native_windows_socket = @import("helix/native_windows_socket.zig");
+
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const af_inet: i32 = 2;
+    const af_inet6: i32 = 23;
+    const sock_stream: i32 = 1;
+    const ipproto_tcp: i32 = 6;
+    const ipproto_ipv6: i32 = 41;
+    const sol_socket: i32 = 0xffff;
+    const so_type: i32 = 0x1008;
+    const so_acceptconn: i32 = 0x0002;
+    const so_rcvtimeo: i32 = 0x1006;
+    const so_sndtimeo: i32 = 0x1005;
+    const so_exclusiveaddruse: i32 = -5;
+    const ipv6_v6only: i32 = 27;
+    const tcp_nodelay: i32 = 1;
+    const fionbio: u32 = 0x8004667e;
+    const pollin: i16 = 0x0300;
+    const pollout: i16 = 0x0010;
+    const interrupted: i32 = 10004;
+    const would_block: i32 = 10035;
+    const connection_aborted: i32 = 10053;
+
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: u32,
+        zero: [8]u8 = @splat(0),
+    };
+    const SockAddr6 = extern struct {
+        family: u16,
+        port: u16,
+        flowinfo: u32 = 0,
+        addr: [16]u8,
+        scope_id: u32 = 0,
+    };
+    const PollFd = extern struct { fd: usize, events: i16, revents: i16 = 0 };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(SockAddr6) != 28 or @sizeOf(PollFd) != 16)
+            @compileError("history HTTP Winsock ABI layout mismatch");
+    }
+
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, kind: i32, protocol: i32, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, addr: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, addr: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, addr: *anyopaque, length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn accept(socket: usize, addr: ?*anyopaque, length: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn WSAPoll(fds: [*]PollFd, count: u32, timeout_ms: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, length: i32, flags: i32) callconv(.winapi) i32;
+};
 
 pub const loopback_v4 = "127.0.0.1";
 pub const loopback_v6 = "::1";
@@ -135,8 +195,9 @@ pub const BindError = error{
 /// it creates a socket. Call `spawn` to accept; `shutdown` joins that thread.
 pub const HttpsListener = struct {
     allocator: std.mem.Allocator,
-    listen_fd: linux.fd_t,
+    listen_fd: Socket,
     listen_open: bool = false,
+    winsock_started: bool = false,
     v6: bool = false,
     port: u16,
     thread: ?std.Thread = null,
@@ -155,6 +216,7 @@ pub const HttpsListener = struct {
     ) BindError!HttpsListener {
         const spec = try listenAddr(configured);
         const v6 = std.mem.eql(u8, spec, loopback_v6);
+        if (comptime builtin.os.tag == .windows) return openWindows(allocator, v6, port, tls_config, reader);
         const fd = if (v6) try socketTcp6() else try socketTcp4();
         errdefer closeFd(fd);
 
@@ -195,6 +257,45 @@ pub const HttpsListener = struct {
         };
     }
 
+    fn openWindows(allocator: std.mem.Allocator, v6: bool, port: u16, tls_config: tls_server.Config, reader: Reader) BindError!HttpsListener {
+        if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+        errdefer _ = win.WSACleanup();
+        const fd = win.WSASocketW(if (v6) win.af_inet6 else win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+        if (fd == win.invalid_socket) return error.SocketUnavailable;
+        errdefer closeFd(fd);
+        const yes: i32 = 1;
+        if (win.setsockopt(fd, win.sol_socket, win.so_exclusiveaddruse, &yes, @sizeOf(i32)) != 0)
+            return error.SocketUnavailable;
+        if (v6) {
+            if (win.setsockopt(fd, win.ipproto_ipv6, win.ipv6_v6only, &yes, @sizeOf(i32)) != 0)
+                return error.SocketUnavailable;
+            var address = win.SockAddr6{ .family = @intCast(win.af_inet6), .port = std.mem.nativeToBig(u16, port), .addr = @splat(0) };
+            address.addr[15] = 1;
+            if (win.bind(fd, &address, @sizeOf(win.SockAddr6)) != 0) return error.BindFailed;
+        } else {
+            const address = win.SockAddr4{ .family = @intCast(win.af_inet), .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+            if (win.bind(fd, &address, @sizeOf(win.SockAddr4)) != 0) return error.BindFailed;
+        }
+        if (win.listen(fd, 16) != 0) return error.ListenFailed;
+        var nonblocking: u32 = 1;
+        if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.SocketUnavailable;
+        const timeout_ms: u32 = 200;
+        if (win.setsockopt(fd, win.sol_socket, win.so_rcvtimeo, &timeout_ms, @sizeOf(u32)) != 0)
+            return error.TimeoutSetupFailed;
+        return .{
+            .allocator = allocator,
+            .listen_fd = fd,
+            .listen_open = true,
+            .winsock_started = true,
+            .v6 = v6,
+            .port = try boundPort(fd, v6),
+            .tls_config = tls_config,
+            .reader = reader,
+        };
+    }
+
     pub fn spawn(self: *HttpsListener) std.Thread.SpawnError!void {
         if (self.thread != null or self.runtime_worker.view != null) return error.SystemResources;
         self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
@@ -212,11 +313,17 @@ pub const HttpsListener = struct {
             self.listen_open = false;
             closeFd(self.listen_fd);
         }
+        if (comptime builtin.os.tag == .windows) {
+            if (self.winsock_started) {
+                self.winsock_started = false;
+                _ = win.WSACleanup();
+            }
+        }
     }
 
     pub fn prepareColdResources(self: *HttpsListener, io: std.Io) !void {
         if (self.thread != null or self.runtime_worker.view != null) return error.AlreadyStarted;
-        try validateEndpoint(try metrics_http.observeListener(self.listen_fd), self.v6, self.port);
+        try validateEndpoint(try observeHistoryListener(self.listen_fd, self.v6), self.v6, self.port);
         // Actual TLS constructor validation/allocation precedes worker readiness.
         var check = try tls_server.Server.init(self.allocator, self.tls_config);
         defer check.deinit();
@@ -228,7 +335,7 @@ pub const HttpsListener = struct {
     pub fn prepareDormantWorker(self: *HttpsListener, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
         try self.runtime_worker.validatePreparation(control, view, slot, .history, @intFromBool(self.v6), self, dormant_spawn_options);
         if (self.thread != null) return error.AlreadyStarted;
-        try validateEndpoint(try metrics_http.observeListener(self.listen_fd), self.v6, self.port);
+        try validateEndpoint(try observeHistoryListener(self.listen_fd, self.v6), self.v6, self.port);
         self.stop_flag.store(false, .release);
         try self.runtime_worker.prepare(control, view, slot, .history, @intFromBool(self.v6), HttpsListener, self, acceptLoop, dormant_spawn_options);
     }
@@ -269,7 +376,7 @@ pub const HttpsListener = struct {
         // Shared anti-replay state requires its own source-owned carried graph;
         // a pointer or an empty replacement cannot prove 0-RTT continuity.
         if (self.tls_config.max_early_data_size != 0) return error.ActiveTlsContinuityUnsupported;
-        const observed = try metrics_http.observeListener(self.listen_fd);
+        const observed = try observeHistoryListener(self.listen_fd, self.v6);
         try validateEndpoint(observed, self.v6, self.port);
         return .{ .listener = observed, .tls_digest = try tlsConfigDigest(self.tls_config), .execution = execution };
     }
@@ -277,19 +384,50 @@ pub const HttpsListener = struct {
     /// `tls_config` and Reader are real whole-owner reconstructed references,
     /// never pointers decoded from this row. Server's reader authorization and
     /// TLS material custody must remain live through the final worker join.
-    pub fn initInherited(allocator: std.mem.Allocator, configured: []const u8, fd: linux.fd_t, carry: *const Snapshot, tls_config: tls_server.Config, reader: Reader) !HttpsListener {
+    pub fn initInherited(allocator: std.mem.Allocator, configured: []const u8, fd: Socket, carry: *const Snapshot, tls_config: tls_server.Config, reader: Reader) !HttpsListener {
+        errdefer closeFd(fd);
+        // A raw SOCKET value does not prove custody across Windows processes.
+        // Cross-process duplication must arrive with its authenticated manifest.
+        if (comptime builtin.os.tag == .windows) return error.Unsupported;
+        const spec = try listenAddr(configured);
+        const v6 = std.mem.eql(u8, spec, loopback_v6);
+        try carry.validate(v6, tls_config);
+        const observed = try observeHistoryListener(fd, v6);
+        if (!std.meta.eql(observed, carry.listener)) return error.ListenerMismatch;
+        return .{ .allocator = allocator, .listen_fd = fd, .listen_open = true, .v6 = v6, .port = observed.port, .tls_config = tls_config, .reader = reader };
+    }
+
+    /// Import a one-use socket transfer delivered by the authenticated Helix
+    /// control path, which must bind it to `carry`. The imported SOCKET number
+    /// changes, so validate every other captured listener field and TLS policy.
+    pub fn initTransferred(allocator: std.mem.Allocator, configured: []const u8, transfer: *native_windows_socket.Transfer, carry: *const Snapshot, tls_config: tls_server.Config, reader: Reader) !HttpsListener {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+        errdefer _ = win.WSACleanup();
+        const fd = try transfer.import();
         errdefer closeFd(fd);
         const spec = try listenAddr(configured);
         const v6 = std.mem.eql(u8, spec, loopback_v6);
         try carry.validate(v6, tls_config);
-        const observed = try metrics_http.observeListener(fd);
-        if (!std.meta.eql(observed, carry.listener)) return error.ListenerMismatch;
-        return .{ .allocator = allocator, .listen_fd = fd, .listen_open = true, .v6 = v6, .port = observed.port, .tls_config = tls_config, .reader = reader };
+        const observed = try observeHistoryListener(fd, v6);
+        if (!transferredListenerMatches(carry.listener, observed)) return error.ListenerMismatch;
+        return .{
+            .allocator = allocator,
+            .listen_fd = fd,
+            .listen_open = true,
+            .winsock_started = true,
+            .v6 = v6,
+            .port = observed.port,
+            .tls_config = tls_config,
+            .reader = reader,
+        };
     }
 
     fn acceptLoop(self: *HttpsListener) void {
         self.runtime_worker.markEntered();
         defer self.runtime_worker.markExited();
+        if (comptime builtin.os.tag == .windows) return self.acceptLoopWindows();
         while (!self.stop_flag.load(.acquire)) {
             self.runtime_worker.pause.boundary();
             if (self.stop_flag.load(.acquire)) break;
@@ -311,13 +449,43 @@ pub const HttpsListener = struct {
         }
     }
 
-    fn serveConn(self: *HttpsListener, fd: linux.fd_t) void {
+    fn acceptLoopWindows(self: *HttpsListener) void {
+        if (comptime builtin.os.tag != .windows) return;
+        while (!self.stop_flag.load(.acquire)) {
+            self.runtime_worker.pause.boundary();
+            if (self.stop_flag.load(.acquire)) break;
+            const ready = pollWindows(self.listen_fd, false, 50) orelse return;
+            if (!ready or self.stop_flag.load(.acquire)) continue;
+            const fd = win.accept(self.listen_fd, null, null);
+            if (fd == win.invalid_socket) {
+                switch (win.WSAGetLastError()) {
+                    win.interrupted, win.would_block, win.connection_aborted => continue,
+                    else => return,
+                }
+            }
+            var nonblocking: u32 = 1;
+            if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) {
+                closeFd(fd);
+                return;
+            }
+            self.serveConn(fd);
+        }
+    }
+
+    fn serveConn(self: *HttpsListener, fd: Socket) void {
         defer closeFd(fd);
         const on: u32 = 1;
-        _ = sys.setsockopt(fd, sys.IPPROTO.TCP, if (comptime builtin.os.tag == .openbsd) @as(u32, 1) else linux.TCP.NODELAY, std.mem.asBytes(&on), @sizeOf(u32));
-        // This is a new accepted FD, never the inherited shared listener.
-        native_network.setBlocking(fd) catch return;
-        native_network.setTimeout(fd, 5000) catch return;
+        if (comptime builtin.os.tag == .windows) {
+            _ = win.setsockopt(fd, win.ipproto_tcp, win.tcp_nodelay, &on, @sizeOf(u32));
+            const timeout_ms: u32 = 5000;
+            if (win.setsockopt(fd, win.sol_socket, win.so_rcvtimeo, &timeout_ms, @sizeOf(u32)) != 0 or
+                win.setsockopt(fd, win.sol_socket, win.so_sndtimeo, &timeout_ms, @sizeOf(u32)) != 0) return;
+        } else {
+            _ = sys.setsockopt(fd, sys.IPPROTO.TCP, if (comptime builtin.os.tag == .openbsd) @as(u32, 1) else linux.TCP.NODELAY, std.mem.asBytes(&on), @sizeOf(u32));
+            // This is a new accepted FD, never the inherited shared listener.
+            native_network.setBlocking(fd) catch return;
+            native_network.setTimeout(fd, 5000) catch return;
+        }
         self.request_deadline = platform.monotonicMillis() + 5000;
 
         var tls = tls_server.Server.init(self.allocator, self.tls_config) catch return;
@@ -367,7 +535,25 @@ pub const HttpsListener = struct {
         _ = self.writeConn(fd, sealed);
     }
 
-    fn writeConn(self: *HttpsListener, fd: linux.fd_t, bytes: []const u8) bool {
+    fn writeConn(self: *HttpsListener, fd: Socket, bytes: []const u8) bool {
+        if (comptime builtin.os.tag == .windows) {
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const remaining = self.request_deadline - platform.monotonicMillis();
+                if (self.stop_flag.load(.acquire) or remaining <= 0) return false;
+                if (!(pollWindows(fd, true, @intCast(@min(remaining, 50))) orelse return false)) continue;
+                const n = win.send(fd, bytes[offset..].ptr, @intCast(@min(bytes.len - offset, std.math.maxInt(i32))), 0);
+                if (n > 0) {
+                    offset += @intCast(n);
+                } else if (n == 0) {
+                    return false;
+                } else switch (win.WSAGetLastError()) {
+                    win.interrupted, win.would_block => continue,
+                    else => return false,
+                }
+            }
+            return true;
+        }
         var offset: usize = 0;
         while (offset < bytes.len) {
             const remaining = self.request_deadline - platform.monotonicMillis();
@@ -391,7 +577,7 @@ pub const HttpsListener = struct {
         return true;
     }
 
-    fn readRecord(self: *HttpsListener, fd: linux.fd_t, raw: *std.ArrayList(u8)) ![]u8 {
+    fn readRecord(self: *HttpsListener, fd: Socket, raw: *std.ArrayList(u8)) ![]u8 {
         var scratch: [4096]u8 = undefined;
         while (true) {
             if (self.stop_flag.load(.acquire) or platform.monotonicMillis() >= self.request_deadline) return error.Closed;
@@ -401,6 +587,19 @@ pub const HttpsListener = struct {
                 return rec;
             }
             if (raw.items.len > 64 * 1024) return error.Closed;
+            if (comptime builtin.os.tag == .windows) {
+                if (!(pollWindows(fd, false, 50) orelse return error.Closed)) continue;
+                const received = win.recv(fd, &scratch, @intCast(scratch.len), 0);
+                if (received > 0) {
+                    try raw.appendSlice(self.allocator, scratch[0..@intCast(received)]);
+                    continue;
+                }
+                if (received == 0) return error.Closed;
+                switch (win.WSAGetLastError()) {
+                    win.interrupted, win.would_block => continue,
+                    else => return error.Closed,
+                }
+            }
             const rc = blk: {
                 if (self.stop_flag.load(.acquire) or platform.monotonicMillis() >= self.request_deadline) return error.Closed;
                 var polls = [_]sys_pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
@@ -439,7 +638,20 @@ fn dropPrefix(list: *std.ArrayList(u8), n: usize) void {
     list.shrinkRetainingCapacity(rest);
 }
 
-fn socketTcp4() BindError!linux.fd_t {
+/// A bounded readiness probe; no Winsock call may hold the worker beyond its
+/// shutdown or per-request deadline. The socket remains nonblocking throughout.
+fn pollWindows(fd: Socket, writable: bool, timeout_ms: u32) ?bool {
+    if (comptime builtin.os.tag != .windows) return null;
+    const event = if (writable) win.pollout else win.pollin;
+    var polls = [_]win.PollFd{.{ .fd = fd, .events = event }};
+    const rc = win.WSAPoll(&polls, 1, @intCast(@min(timeout_ms, std.math.maxInt(i32))));
+    if (rc < 0) return null;
+    if (rc == 0) return false;
+    if (polls[0].revents & event == 0) return null;
+    return true;
+}
+
+fn socketTcp4() BindError!Socket {
     const rc = sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, sys.IPPROTO.TCP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
@@ -447,7 +659,7 @@ fn socketTcp4() BindError!linux.fd_t {
     };
 }
 
-fn socketTcp6() BindError!linux.fd_t {
+fn socketTcp6() BindError!Socket {
     const rc = sys.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, sys.IPPROTO.TCP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
@@ -455,7 +667,21 @@ fn socketTcp6() BindError!linux.fd_t {
     };
 }
 
-fn boundPort(fd: linux.fd_t, v6: bool) BindError!u16 {
+fn boundPort(fd: Socket, v6: bool) BindError!u16 {
+    if (comptime builtin.os.tag == .windows) {
+        if (v6) {
+            var address: win.SockAddr6 = undefined;
+            var len: i32 = @sizeOf(win.SockAddr6);
+            if (win.getsockname(fd, &address, &len) != 0 or len != @sizeOf(win.SockAddr6) or address.family != @as(u16, @intCast(win.af_inet6)))
+                return error.AddrLookupFailed;
+            return std.mem.bigToNative(u16, address.port);
+        }
+        var address: win.SockAddr4 = undefined;
+        var len: i32 = @sizeOf(win.SockAddr4);
+        if (win.getsockname(fd, &address, &len) != 0 or len != @sizeOf(win.SockAddr4) or address.family != @as(u16, @intCast(win.af_inet)))
+            return error.AddrLookupFailed;
+        return std.mem.bigToNative(u16, address.port);
+    }
     if (v6) {
         var storage: posix.sockaddr.in6 = undefined;
         var slen: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
@@ -471,13 +697,26 @@ fn boundPort(fd: linux.fd_t, v6: bool) BindError!u16 {
     return std.mem.bigToNative(u16, a.port);
 }
 
-fn closeFd(fd: linux.fd_t) void {
+fn closeFd(fd: Socket) void {
     // Ownership is one reference. shutdown would mutate an inherited shared
     // listener and destroy the predecessor's serving/backlog on rollback.
-    _ = sys.close(fd);
+    if (comptime builtin.os.tag == .windows) {
+        if (fd != win.invalid_socket) _ = win.closesocket(fd);
+    } else {
+        _ = sys.close(fd);
+    }
 }
 
-fn writeAll(fd: linux.fd_t, bytes: []const u8) bool {
+fn writeAll(fd: Socket, bytes: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const n = win.send(fd, bytes[offset..].ptr, @intCast(@min(bytes.len - offset, std.math.maxInt(i32))), 0);
+            if (n <= 0) return false;
+            offset += @intCast(n);
+        }
+        return true;
+    }
     if (comptime builtin.os.tag == .openbsd) {
         native_network.writeAll(fd, bytes) catch return false;
         return true;
@@ -514,9 +753,7 @@ fn refuseAll(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) error{Denied}
 }
 
 test "GAP-P12 a public history bind is refused and loopback sockets listen" {
-    // Live loopback listeners: this backend issues raw Linux syscalls except
-    // on OpenBSD, so only linux/openbsd can execute it.
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     const empty: []const []const u8 = &.{};
     const reader = Reader{ .ptr = undefined, .readFn = refuseAll };
     const cfg = tls_server.Config{ .cert_chain = empty };
@@ -565,14 +802,62 @@ const NativeHistoryFixture = struct {
     }
 };
 
+fn connectWindowsHistory(host: []const u8, port: u16) !Socket {
+    if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
+    const v6 = std.mem.eql(u8, host, loopback_v6);
+    if (!v6 and !std.mem.eql(u8, host, loopback_v4)) return error.InvalidAddress;
+    var startup: [408]u8 align(8) = @splat(0);
+    if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+    errdefer _ = win.WSACleanup();
+    const fd = win.WSASocketW(if (v6) win.af_inet6 else win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    if (fd == win.invalid_socket) return error.SocketUnavailable;
+    errdefer closeFd(fd);
+    const timeout_ms: u32 = 1500;
+    if (win.setsockopt(fd, win.sol_socket, win.so_rcvtimeo, &timeout_ms, @sizeOf(u32)) != 0 or
+        win.setsockopt(fd, win.sol_socket, win.so_sndtimeo, &timeout_ms, @sizeOf(u32)) != 0)
+        return error.SocketUnavailable;
+    if (v6) {
+        var address = win.SockAddr6{ .family = @intCast(win.af_inet6), .port = std.mem.nativeToBig(u16, port), .addr = @splat(0) };
+        address.addr[15] = 1;
+        if (win.connect(fd, &address, @sizeOf(win.SockAddr6)) != 0) return error.ConnectFailed;
+    } else {
+        const address = win.SockAddr4{ .family = @intCast(win.af_inet), .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+        if (win.connect(fd, &address, @sizeOf(win.SockAddr4)) != 0) return error.ConnectFailed;
+    }
+    return fd;
+}
+
+fn clientWrite(fd: Socket, bytes: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        if (!writeAll(fd, bytes)) return error.ConnectionClosed;
+    } else try native_network.writeAll(fd, bytes);
+}
+
+fn clientRead(fd: Socket, bytes: []u8) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        const n = win.recv(fd, bytes.ptr, @intCast(@min(bytes.len, std.math.maxInt(i32))), 0);
+        if (n <= 0) return error.ConnectionClosed;
+        return @intCast(n);
+    }
+    return native_network.readSome(fd, bytes);
+}
+
 const NativeHistoryClient = struct {
-    fd: i32,
+    fd: Socket,
     tls: @import("../crypto/tls_client.zig").Client,
+    winsock_started: bool = false,
 
     fn connect(host: []const u8, port: u16, chain: []const []const u8) !NativeHistoryClient {
-        const address = try std.Io.net.IpAddress.parse(host, port);
-        const fd = try native_network.connect(address, 1500);
-        errdefer runtime.close(fd);
+        const fd = if (comptime builtin.os.tag == .windows)
+            try connectWindowsHistory(host, port)
+        else blk: {
+            const address = try std.Io.net.IpAddress.parse(host, port);
+            break :blk try native_network.connect(address, 1500);
+        };
+        errdefer {
+            closeFd(fd);
+            if (comptime builtin.os.tag == .windows) _ = win.WSACleanup();
+        }
         var tls = try @import("../crypto/tls_client.zig").Client.init(std.testing.allocator, .{
             .server_name = "history.test",
             .trust_anchors = chain,
@@ -580,16 +865,16 @@ const NativeHistoryClient = struct {
         errdefer tls.deinit();
         const hello = try tls.start();
         defer std.testing.allocator.free(hello);
-        try native_network.writeAll(fd, hello);
+        try clientWrite(fd, hello);
         var scratch: [8192]u8 = undefined;
         for (0..32) |_| {
-            if (tls.handshakeDone()) return .{ .fd = fd, .tls = tls };
-            const n = try native_network.readSome(fd, &scratch);
+            if (tls.handshakeDone()) return .{ .fd = fd, .tls = tls, .winsock_started = builtin.os.tag == .windows };
+            const n = try clientRead(fd, &scratch);
             switch (try tls.feed(scratch[0..n])) {
                 .need_more => {},
                 .bytes_to_send => |flight| {
                     defer std.testing.allocator.free(flight);
-                    try native_network.writeAll(fd, flight);
+                    try clientWrite(fd, flight);
                 },
             }
         }
@@ -598,7 +883,10 @@ const NativeHistoryClient = struct {
 
     fn deinit(self: *NativeHistoryClient) void {
         self.tls.deinit();
-        runtime.close(self.fd);
+        closeFd(self.fd);
+        if (comptime builtin.os.tag == .windows) {
+            if (self.winsock_started) _ = win.WSACleanup();
+        }
     }
 
     fn get(self: *NativeHistoryClient, account: []const u8, out: []u8) ![]const u8 {
@@ -606,13 +894,13 @@ const NativeHistoryClient = struct {
         const text = try std.fmt.bufPrint(&request, "GET /history?target=%23room HTTP/1.1\r\nHost: history.test\r\nAuthorization: Bearer {s}\r\n\r\n", .{account});
         const sealed = try self.tls.encrypt(text);
         defer std.testing.allocator.free(sealed);
-        try native_network.writeAll(self.fd, sealed);
+        try clientWrite(self.fd, sealed);
         var raw: std.ArrayList(u8) = .empty;
         defer raw.deinit(std.testing.allocator);
         var used: usize = 0;
         var scratch: [8192]u8 = undefined;
         for (0..32) |_| {
-            const n = try native_network.readSome(self.fd, &scratch);
+            const n = try clientRead(self.fd, &scratch);
             try raw.appendSlice(std.testing.allocator, scratch[0..n]);
             while (try framedRecordLen(raw.items)) |length| {
                 switch (try self.tls.decryptApp(raw.items[0..length])) {
@@ -639,7 +927,7 @@ const NativeHistoryClient = struct {
 };
 
 test "history native HTTPS: real IPv4 and IPv6 TLS GET returns authorized body and denies outsider" {
-    if (comptime builtin.os.tag != .openbsd) return;
+    if (comptime builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     for ([_][]const u8{ loopback_v4, loopback_v6 }) |host| {
         var fixture: NativeHistoryFixture = .{};
         try fixture.init();
@@ -744,6 +1032,149 @@ pub const Snapshot = struct {
         if (!std.mem.eql(u8, &self.tls_digest, &try tlsConfigDigest(config))) return error.ConfigMismatch;
     }
 };
+
+fn observeHistoryListener(fd: Socket, v6: bool) !metrics_http.ListenerObservation {
+    if (comptime builtin.os.tag != .windows) return metrics_http.observeListener(fd);
+    if (fd == win.invalid_socket) return error.InvalidListener;
+    var kind: i32 = 0;
+    var len: i32 = @sizeOf(i32);
+    if (win.getsockopt(fd, win.sol_socket, win.so_type, &kind, &len) != 0 or len != @sizeOf(i32) or kind != win.sock_stream)
+        return error.InvalidListener;
+    var accepting: i32 = 0;
+    len = @sizeOf(i32);
+    if (win.getsockopt(fd, win.sol_socket, win.so_acceptconn, &accepting, &len) != 0 or len != @sizeOf(i32) or accepting == 0)
+        return error.InvalidListener;
+    var timeout_ms: u32 = 0;
+    len = @sizeOf(u32);
+    if (win.getsockopt(fd, win.sol_socket, win.so_rcvtimeo, &timeout_ms, &len) != 0 or len != @sizeOf(u32) or timeout_ms != 200)
+        return error.InvalidListener;
+    var address: [16]u8 = @splat(0);
+    var port: u16 = 0;
+    var family: u16 = 0;
+    var scope: u32 = 0;
+    var flow: u32 = 0;
+    if (v6) {
+        var socket_addr: win.SockAddr6 = undefined;
+        len = @sizeOf(win.SockAddr6);
+        if (win.getsockname(fd, &socket_addr, &len) != 0 or len != @sizeOf(win.SockAddr6)) return error.InvalidListener;
+        family = socket_addr.family;
+        port = std.mem.bigToNative(u16, socket_addr.port);
+        address = socket_addr.addr;
+        scope = socket_addr.scope_id;
+        flow = socket_addr.flowinfo;
+    } else {
+        var socket_addr: win.SockAddr4 = undefined;
+        len = @sizeOf(win.SockAddr4);
+        if (win.getsockname(fd, &socket_addr, &len) != 0 or len != @sizeOf(win.SockAddr4)) return error.InvalidListener;
+        family = socket_addr.family;
+        port = std.mem.bigToNative(u16, socket_addr.port);
+        std.mem.writeInt(u32, address[0..4], std.mem.bigToNative(u32, socket_addr.addr), .big);
+    }
+    // Same-process identity only. A transferred duplicate gets a new SOCKET
+    // number; the authenticated transfer supplies cross-process custody.
+    return .{
+        .device = 0,
+        .inode = fd,
+        .family = family,
+        .address = address,
+        .port = port,
+        .scope_id = scope,
+        .flow_info = flow,
+        .recv_timeout_us = @as(u64, timeout_ms) * 1000,
+    };
+}
+
+fn transferredListenerMatches(captured: metrics_http.ListenerObservation, observed: metrics_http.ListenerObservation) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    var canonical = observed;
+    canonical.inode = captured.inode;
+    return captured.device == 0 and captured.inode != @as(u64, win.invalid_socket) and std.meta.eql(captured, canonical);
+}
+
+test "history native Windows shutdown bounds a connected idle TLS client" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: NativeHistoryFixture = .{};
+    try fixture.init();
+    var listener = try fixture.open(loopback_v4);
+    defer listener.shutdown();
+    try listener.spawn();
+    var client = try NativeHistoryClient.connect(loopback_v4, listener.port, &fixture.chain);
+    defer client.deinit();
+    const before = platform.monotonicMillis();
+    listener.shutdown();
+    try std.testing.expect(platform.monotonicMillis() - before < 1000);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls.load(.acquire));
+}
+
+test "history native Windows capture checks loopback TLS and refuses raw inherited socket" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var fixture: NativeHistoryFixture = .{};
+    try fixture.init();
+    var listener = try fixture.open(loopback_v6);
+    defer listener.shutdown();
+    const snap = try listener.captureUnstarted();
+    try snap.validate(true, listener.tls_config);
+    var changed = listener.tls_config;
+    changed.receive_record_size_limit -= 1;
+    try std.testing.expectError(error.ConfigMismatch, snap.validate(true, changed));
+    changed = listener.tls_config;
+    changed.max_early_data_size = 32;
+    try std.testing.expectError(error.ActiveTlsContinuityUnsupported, snap.validate(true, changed));
+    const foreign = win.WSASocketW(win.af_inet6, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    if (foreign == win.invalid_socket) return error.SocketUnavailable;
+    try std.testing.expectError(error.Unsupported, HttpsListener.initInherited(std.testing.allocator, loopback_v6, foreign, &snap, listener.tls_config, listener.reader));
+}
+
+test "history native Windows transferred listener validates TLS and serves after predecessor shutdown" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    for ([_][]const u8{ loopback_v4, loopback_v6 }) |host| {
+        var fixture: NativeHistoryFixture = .{};
+        try fixture.init();
+        var source = try fixture.open(host);
+        var source_open = true;
+        defer if (source_open) source.shutdown();
+        const carry = try source.captureUnstarted();
+        const original = try observeHistoryListener(source.listen_fd, source.v6);
+
+        var wrong_config = source.tls_config;
+        wrong_config.receive_record_size_limit -= 1;
+        var rejected_config = try native_windows_socket.duplicateForProcess(source.listen_fd, std.os.windows.GetCurrentProcessId());
+        try std.testing.expectError(error.ConfigMismatch, HttpsListener.initTransferred(std.testing.allocator, host, &rejected_config, &carry, wrong_config, source.reader));
+        try std.testing.expect(rejected_config.consumed);
+        try std.testing.expectEqualDeep(original, try observeHistoryListener(source.listen_fd, source.v6));
+
+        var rejected_public = try native_windows_socket.duplicateForProcess(source.listen_fd, std.os.windows.GetCurrentProcessId());
+        try std.testing.expectError(error.PublicBind, HttpsListener.initTransferred(std.testing.allocator, "0.0.0.0", &rejected_public, &carry, source.tls_config, source.reader));
+        try std.testing.expect(rejected_public.consumed);
+        try std.testing.expectEqualDeep(original, try observeHistoryListener(source.listen_fd, source.v6));
+
+        var other = try fixture.open(host);
+        defer other.shutdown();
+        var rejected_endpoint = try native_windows_socket.duplicateForProcess(other.listen_fd, std.os.windows.GetCurrentProcessId());
+        try std.testing.expectError(error.ListenerMismatch, HttpsListener.initTransferred(std.testing.allocator, host, &rejected_endpoint, &carry, source.tls_config, source.reader));
+        try std.testing.expect(rejected_endpoint.consumed);
+        try std.testing.expectEqualDeep(original, try observeHistoryListener(source.listen_fd, source.v6));
+
+        var transfer = try native_windows_socket.duplicateForProcess(source.listen_fd, std.os.windows.GetCurrentProcessId());
+        var adopted = try HttpsListener.initTransferred(std.testing.allocator, host, &transfer, &carry, source.tls_config, source.reader);
+        defer adopted.shutdown();
+        try std.testing.expect(transfer.consumed);
+        try std.testing.expect(adopted.winsock_started);
+        try std.testing.expect(adopted.listen_fd != source.listen_fd);
+        source.shutdown();
+        source_open = false;
+        try adopted.spawn();
+
+        var client = try NativeHistoryClient.connect(host, adopted.port, &fixture.chain);
+        defer client.deinit();
+        var out: [2048]u8 = undefined;
+        const response = try client.get("member", &out);
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\nvisible history line\n"));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.acquire));
+    }
+}
+
 fn validateEndpoint(observed: metrics_http.ListenerObservation, v6: bool, port: u16) !void {
     var expected: [16]u8 = @splat(0);
     if (v6) expected[15] = 1 else std.mem.writeInt(u32, expected[0..4], 0x7f000001, .big);

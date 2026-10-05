@@ -16,6 +16,45 @@ const sys = std.posix.system;
 const posix = std.posix;
 const ice = @import("../proto/ice.zig");
 const media_transport = @import("media_transport.zig");
+pub const SocketHandle = if (builtin.os.tag == .windows) usize else sys.fd_t;
+const Socket = SocketHandle;
+
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const af_inet: i32 = 2;
+    const sock_dgram: i32 = 2;
+    const ipproto_udp: i32 = 17;
+    const sol_socket: i32 = 0xffff;
+    const so_type: i32 = 0x1008;
+    const so_exclusiveaddruse: i32 = ~@as(i32, 0x0004);
+    const fionbio: u32 = 0x8004667e;
+    const would_block: i32 = 10035;
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: [4]u8,
+        zero: [8]u8 = @splat(0),
+    };
+    const FdSet = extern struct { count: u32, sockets: [64]usize };
+    const Timeval = extern struct { seconds: i32, microseconds: i32 };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8)
+            @compileError("Windows media socket ABI shape changed");
+    }
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn select(ignored_nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
+    extern "ws2_32" fn sendto(socket: usize, bytes: [*]const u8, length: i32, flags: i32, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recvfrom(socket: usize, bytes: [*]u8, length: i32, flags: i32, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+};
 
 pub const TransportAddress = ice.TransportAddress;
 pub const MediaTransport = media_transport.MediaTransport;
@@ -34,12 +73,28 @@ pub const Error = error{ SocketUnavailable, BindFailed, AddrLookupFailed };
 pub const SendDisposition = enum { sent, would_block, socket_error, invalid_destination };
 
 pub const MediaSocket = struct {
-    fd: sys.fd_t,
+    fd: Socket,
     recv_timeout_ms: u32 = 250,
 
     /// Create and bind a UDP socket. `bind_addr_be` is an IPv4 address already in
     /// network byte order (use `loopback_be` / `any_be`); `port` 0 = ephemeral.
     pub fn bind(bind_addr_be: u32, port: u16) Error!MediaSocket {
+        if (comptime builtin.os.tag == .windows) {
+            var startup: [408]u8 align(8) = @splat(0);
+            if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+            errdefer _ = win.WSACleanup();
+            const socket = win.WSASocketW(win.af_inet, win.sock_dgram, win.ipproto_udp, null, 0, 1);
+            if (socket == win.invalid_socket) return error.SocketUnavailable;
+            errdefer _ = win.closesocket(socket);
+            const exclusive: i32 = 1;
+            if (win.setsockopt(socket, win.sol_socket, win.so_exclusiveaddruse, &exclusive, @sizeOf(i32)) != 0)
+                return error.SocketUnavailable;
+            const address = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(bind_addr_be) };
+            if (win.bind(socket, &address, @sizeOf(win.SockAddr4)) != 0) return error.BindFailed;
+            var nonblocking: u32 = 1;
+            if (win.ioctlsocket(socket, win.fionbio, &nonblocking) != 0) return error.SocketUnavailable;
+            return .{ .fd = socket };
+        }
         // Use each target's native socket ABI. Linux retains its blocking UDP
         // path; OpenBSD uses nonblocking reads after finite readiness polls.
         if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
@@ -56,18 +111,25 @@ pub const MediaSocket = struct {
     }
 
     pub fn deinit(self: *MediaSocket) void {
-        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
-        // bind() already reports SocketUnavailable on Windows.
-        if (comptime builtin.os.tag == .windows) return;
+        if (comptime builtin.os.tag == .windows) {
+            _ = win.closesocket(self.fd);
+            _ = win.WSACleanup();
+            self.* = undefined;
+            return;
+        }
         _ = sys.close(self.fd);
         self.* = undefined;
     }
 
     /// The bound local UDP port (host byte order).
     pub fn localPort(self: *const MediaSocket) Error!u16 {
-        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
-        // bind() already reports SocketUnavailable on Windows.
-        if (comptime builtin.os.tag == .windows) return error.AddrLookupFailed;
+        if (comptime builtin.os.tag == .windows) {
+            var address: win.SockAddr4 = undefined;
+            var length: i32 = @sizeOf(win.SockAddr4);
+            if (win.getsockname(self.fd, &address, &length) != 0 or length != @sizeOf(win.SockAddr4) or address.family != win.af_inet)
+                return error.AddrLookupFailed;
+            return std.mem.bigToNative(u16, address.port);
+        }
         var storage: posix.sockaddr.storage = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         if (posix.errno(sys.getsockname(self.fd, @ptrCast(&storage), &len)) != .SUCCESS)
@@ -92,8 +154,8 @@ pub const MediaSocket = struct {
     /// Consumes one authenticated received duplicate on entry. Kernel identity
     /// is a read-only observation; actual OFD lineage is joined by the manifest.
     pub fn initInherited(fd: posix.fd_t, snapshot: *const Snapshot) !MediaSocket {
-        // No Winsock mapping yet; custody cannot be validated on Windows.
-        if (comptime builtin.os.tag == .windows) return error.InvalidSocket;
+        // Endpoint observation is not proof of a transferred Winsock socket.
+        if (comptime builtin.os.tag == .windows) return error.UnverifiableSocketIdentity;
         errdefer _ = sys.close(fd);
         try snapshot.validate();
         var actual = try observeSocket(fd);
@@ -104,9 +166,10 @@ pub const MediaSocket = struct {
 
     /// Send `bytes` to an IPv4 destination. Non-IPv4 addresses are dropped.
     pub fn sendTo(self: *MediaSocket, dest: TransportAddress, bytes: []const u8) void {
-        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
-        // bind() already reports SocketUnavailable on Windows.
-        if (comptime builtin.os.tag == .windows) return;
+        if (comptime builtin.os.tag == .windows) {
+            _ = self.trySendTo(dest, bytes);
+            return;
+        }
         if (dest.ip_len != 4) return;
         var sa = sys.sockaddr.in{
             .port = std.mem.nativeToBig(u16, dest.port),
@@ -118,9 +181,13 @@ pub const MediaSocket = struct {
     /// Source-owned nonblocking datagram attempt with explicit terminal outcome.
     /// UDP has no partial-write retry; a short result is a socket failure.
     pub fn trySendTo(self: *MediaSocket, dest: TransportAddress, bytes: []const u8) SendDisposition {
-        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
-        // bind() already reports SocketUnavailable on Windows.
-        if (comptime builtin.os.tag == .windows) return .socket_error;
+        if (comptime builtin.os.tag == .windows) {
+            if (dest.ip_len != 4 or dest.port == 0 or bytes.len > std.math.maxInt(i32)) return .invalid_destination;
+            const address = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, dest.port), .addr = dest.ip[0..4].* };
+            const sent = win.sendto(self.fd, bytes.ptr, @intCast(bytes.len), 0, &address, @sizeOf(win.SockAddr4));
+            if (sent >= 0) return if (@as(usize, @intCast(sent)) == bytes.len) .sent else .socket_error;
+            return if (win.WSAGetLastError() == win.would_block) .would_block else .socket_error;
+        }
         if (dest.ip_len != 4 or dest.port == 0) return .invalid_destination;
         var address = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, dest.port), .addr = @bitCast(dest.ip[0..4].*) };
         const rc = sys.sendto(self.fd, bytes.ptr, bytes.len, posix.MSG.DONTWAIT, @ptrCast(&address), @sizeOf(sys.sockaddr.in));
@@ -135,9 +202,22 @@ pub const MediaSocket = struct {
 
     /// Receive one datagram into `buf`. Returns null on timeout/error/non-IPv4.
     pub fn recvFrom(self: *MediaSocket, buf: []u8) ?Received {
-        // No Winsock mapping yet (mirrors dualstack_udp.zig); unreachable:
-        // bind() already reports SocketUnavailable on Windows.
-        if (comptime builtin.os.tag == .windows) return null;
+        if (comptime builtin.os.tag == .windows) {
+            var readable = win.FdSet{ .count = 1, .sockets = undefined };
+            readable.sockets[0] = self.fd;
+            const finite_ms = @min(@max(self.recv_timeout_ms, 1), 60_000);
+            const seconds: i32 = @intCast(finite_ms / 1000);
+            const remainder_ms: u32 = finite_ms % 1000;
+            const microseconds: i32 = @intCast(remainder_ms * 1000);
+            var timeout = win.Timeval{ .seconds = seconds, .microseconds = microseconds };
+            if (win.select(0, &readable, null, null, &timeout) <= 0) return null;
+            var address: win.SockAddr4 = undefined;
+            var length: i32 = @sizeOf(win.SockAddr4);
+            const received = win.recvfrom(self.fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(i32))), 0, &address, &length);
+            if (received < 0 or length != @sizeOf(win.SockAddr4) or address.family != win.af_inet) return null;
+            const from = TransportAddress.fromBytes(&address.addr, std.mem.bigToNative(u16, address.port)) catch return null;
+            return .{ .data = buf[0..@intCast(received)], .from = from };
+        }
         {
             var pfd = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
             const ready = sys.poll(&pfd, 1, @intCast(@min(self.recv_timeout_ms, std.math.maxInt(c_int))));
@@ -217,6 +297,31 @@ pub const MediaSocket = struct {
 
 const testing = std.testing;
 const stun = @import("../proto/stun.zig");
+
+test "Windows MediaSocket binds, sends and receives IPv4 UDP with bounded idle poll" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var server = try MediaSocket.bind(loopback_be, 0);
+    defer server.deinit();
+    var peer = try MediaSocket.bind(loopback_be, 0);
+    defer peer.deinit();
+    const port = try server.localPort();
+    try testing.expect(port != 0);
+    const observed = try server.capture();
+    try testing.expectEqual(@as(u64, @intCast(server.fd)), observed.device);
+    try testing.expectEqual(@as(u64, 0), observed.inode);
+    try testing.expectEqual(port, observed.port);
+    const destination = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, port);
+    try testing.expectEqual(SendDisposition.sent, peer.trySendTo(destination, "cadence"));
+    var buf: [64]u8 = undefined;
+    const got = server.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("cadence", got.data);
+    try testing.expectEqual(@as(u16, try peer.localPort()), got.from.port);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, got.from.bytes());
+    server.setRecvTimeoutMs(50);
+    const before = @import("platform.zig").monotonicMillis();
+    try testing.expect(server.recvFrom(&buf) == null);
+    try testing.expect(@import("platform.zig").monotonicMillis() - before < 1000);
+}
 
 test "loopback STUN binding round-trip binds the peer and answers" {
     // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
@@ -324,9 +429,28 @@ pub const Snapshot = struct {
 fn identityBits(value: anytype) u64 {
     return @intCast(@as(@Int(.unsigned, @bitSizeOf(@TypeOf(value))), @bitCast(value)));
 }
-fn observeSocket(fd: posix.fd_t) !Snapshot {
-    // No Winsock mapping yet; custody cannot be validated on Windows.
-    if (comptime builtin.os.tag == .windows) return error.InvalidSocket;
+fn observeSocket(fd: Socket) !Snapshot {
+    if (comptime builtin.os.tag == .windows) {
+        var socket_type: i32 = 0;
+        var length: i32 = @sizeOf(i32);
+        if (win.getsockopt(fd, win.sol_socket, win.so_type, &socket_type, &length) != 0 or
+            length != @sizeOf(i32) or socket_type != win.sock_dgram) return error.InvalidSocket;
+        var address: win.SockAddr4 = undefined;
+        length = @sizeOf(win.SockAddr4);
+        if (win.getsockname(fd, &address, &length) != 0 or length != @sizeOf(win.SockAddr4) or
+            address.family != win.af_inet) return error.InvalidSocket;
+        const result = Snapshot{
+            // A process-local SOCKET value catches substitution during cold
+            // startup. Zero inode explicitly denies inherited-socket custody.
+            .device = @intCast(fd),
+            .inode = 0,
+            .address_be = @bitCast(address.addr),
+            .port = std.mem.bigToNative(u16, address.port),
+            .recv_timeout_ms = 250,
+        };
+        try result.validate();
+        return result;
+    }
     var typ: u32 = 0;
     var len: posix.socklen_t = @sizeOf(u32);
     if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.TYPE, @ptrCast(&typ), &len)) != .SUCCESS or len != @sizeOf(u32) or typ != posix.SOCK.DGRAM) return error.InvalidSocket;

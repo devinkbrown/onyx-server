@@ -20,6 +20,27 @@ pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 const rdns = @import("rdns.zig");
 
+// The DNSBL worker test uses a real loopback UDP nameserver. Keep its socket
+// declarations local to the fixture; production DNS transport is in proto/dns.
+const test_win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: [4]u8,
+        zero: [8]u8 = @splat(0),
+    };
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recvfrom(socket: usize, bytes: [*]u8, length: i32, flags: i32, from: *SockAddr4, from_length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn sendto(socket: usize, bytes: [*]const u8, length: i32, flags: i32, to: *const SockAddr4, to_length: i32) callconv(.winapi) i32;
+};
+
 /// Maximum number of blocklist zones probed per client IP.
 pub const max_zones: usize = 8;
 
@@ -67,6 +88,7 @@ pub const Resolver = struct {
     job_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, zones: []const []const u8) !Resolver {
+        try validateZones(zones);
         const entries = try allocator.alloc(Entry, cache_slots);
         errdefer allocator.free(entries);
         for (entries) |*e| e.* = .{};
@@ -78,7 +100,6 @@ pub const Resolver = struct {
         };
         errdefer for (self.zones[0..self.zone_count]) |z| allocator.free(z);
         for (zones) |zone| {
-            if (self.zone_count >= max_zones) break;
             self.zones[self.zone_count] = try allocator.dupe(u8, zone);
             self.zone_count += 1;
         }
@@ -237,11 +258,19 @@ pub const Resolver = struct {
     /// configured or no zones are set; requests then simply never become ready
     /// and callers treat every client as not-listed.
     pub fn start(self: *Resolver) void {
-        if (comptime @import("builtin").os.tag == .windows) return;
-        if (self.thread != null or self.runtime.view != null) return;
-        if (self.cfg.nameserver_count == 0 or self.zone_count == 0) return;
+        self.startChecked() catch {};
+    }
+
+    /// Strict startup for an explicitly configured blocklist. The daemon must
+    /// not advertise DNSBL enforcement if DNS discovery or thread creation
+    /// left it inert.
+    pub fn startChecked(self: *Resolver) !void {
+        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        if (self.cfg.nameserver_count == 0) return error.NoNameservers;
+        if (self.zone_count == 0) return error.NoZones;
         self.stop_flag.store(false, .release);
-        self.thread = std.Thread.spawn(.{}, worker, .{self}) catch null;
+        errdefer self.stop_flag.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, worker, .{self});
     }
 
     pub fn stop(self: *Resolver) void {
@@ -374,7 +403,16 @@ pub const Resolver = struct {
     /// outside the mutex. Any per-zone error (NXDOMAIN, no data, timeout) means
     /// "not listed by that zone" and the scan continues.
     fn probe(self: *const Resolver, ip: dns.Address) Verdict {
+        var query_cfg = self.cfg;
+        if (comptime @import("builtin").os.tag == .windows) {
+            // A stop cannot interrupt a blocking Winsock receive. Bound one
+            // zone to at most one second per nameserver, then observe stop
+            // before starting the next of up to eight zones.
+            query_cfg.timeout_ms = @min(query_cfg.timeout_ms, 1000);
+            query_cfg.attempts = @min(query_cfg.attempts, 1);
+        }
         for (self.zones[0..self.zone_count]) |zone| {
+            if (self.stop_flag.load(.acquire)) break;
             var name_buf: [dns.max_domain_text_len]u8 = undefined;
             const name = switch (ip) {
                 .ipv4 => |b| dnsbl.reverseNameV4(b, zone, &name_buf),
@@ -382,7 +420,7 @@ pub const Resolver = struct {
             } catch continue;
 
             var addr_buf: [8]dns.Address = undefined;
-            const answers = dns.resolveForward(&self.cfg, name, false, &addr_buf) catch continue;
+            const answers = dns.resolveForward(&query_cfg, name, false, &addr_buf) catch continue;
 
             var a_records: [8][4]u8 = undefined;
             var n: usize = 0;
@@ -442,7 +480,7 @@ pub const Snapshot = struct {
     }
 };
 pub fn configDigest(cfg: dns.ResolverConfig, zones: []const []const u8) ![32]u8 {
-    if (zones.len > max_zones) return error.InvalidState;
+    try validateZones(zones);
     const dns_digest = try rdns.resolverConfigDigest(cfg);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("onyx/companion/dnsbl-config/v1");
@@ -456,6 +494,19 @@ pub fn configDigest(cfg: dns.ResolverConfig, zones: []const []const u8) ![32]u8 
         hash.update(zone);
     }
     return hash.finalResult();
+}
+
+/// A configured zone must produce a valid A query for both IPv4 and IPv6
+/// clients. Validate at boot rather than silently treating every lookup as a
+/// clean result when the zone can never be queried.
+pub fn validateZones(zones: []const []const u8) !void {
+    if (zones.len > max_zones) return error.TooManyZones;
+    for (zones) |zone| {
+        var name_buf: [dns.max_domain_text_len]u8 = undefined;
+        const name = try dnsbl.reverseNameV6(@splat(0), zone, &name_buf);
+        var query_buf: [dns.max_message_len]u8 = undefined;
+        _ = try dns.encodeQuery(&query_buf, 1, name, .a);
+    }
 }
 
 fn addrEql(a: dns.Address, b: dns.Address) bool {
@@ -476,7 +527,6 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 fn sleepMs(ms: u32) void {
-    if (comptime @import("builtin").os.tag == .windows) return;
     if (comptime @import("builtin").os.tag != .linux) {
         @import("os_runtime.zig").sleepMillis(ms);
         return;
@@ -526,6 +576,131 @@ test "request de-dupes and the job ring stays bounded" {
     r.request(ip);
     r.request(ip);
     try std.testing.expectEqual(@as(usize, 1), r.job_count);
+}
+
+test "DNSBL strict startup refuses missing nameservers and zones" {
+    var missing_nameservers = try Resolver.initConfigured(std.testing.allocator, std.testing.io, .{}, &.{"dnsbl.test"});
+    defer missing_nameservers.deinit();
+    try std.testing.expectError(error.NoNameservers, missing_nameservers.startChecked());
+    try std.testing.expect(missing_nameservers.thread == null);
+
+    var cfg: dns.ResolverConfig = .{};
+    cfg.addNameserver(.{ .ipv4 = .{ 127, 0, 0, 1 } });
+    var missing_zones = try Resolver.initConfigured(std.testing.allocator, std.testing.io, cfg, &.{});
+    defer missing_zones.deinit();
+    try std.testing.expectError(error.NoZones, missing_zones.startChecked());
+    try std.testing.expect(missing_zones.thread == null);
+}
+
+test "DNSBL rejects invalid zones before starting a worker" {
+    try std.testing.expectError(error.InvalidName, validateZones(&.{"bad zone.test"}));
+    const too_many = [_][]const u8{ "a.test", "b.test", "c.test", "d.test", "e.test", "f.test", "g.test", "h.test", "i.test" };
+    try std.testing.expectError(error.TooManyZones, validateZones(&too_many));
+    var too_long: [190]u8 = @splat('a');
+    too_long[63] = '.';
+    too_long[127] = '.';
+    const long_zones = [_][]const u8{too_long[0..]};
+    try std.testing.expectError(error.NameTooLong, validateZones(&long_zones));
+}
+
+test "Windows DNSBL worker resolves listed and clean addresses and stops during a silent query" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+
+    var startup: [408]u8 align(8) = @splat(0);
+    try std.testing.expectEqual(@as(i32, 0), test_win.WSAStartup(0x0202, &startup));
+    defer _ = test_win.WSACleanup();
+    const socket = test_win.WSASocketW(2, 2, 17, null, 0, 1);
+    try std.testing.expect(socket != test_win.invalid_socket);
+    defer _ = test_win.closesocket(socket);
+    var bind_addr = test_win.SockAddr4{ .family = 2, .port = 0, .addr = .{ 127, 0, 0, 1 } };
+    try std.testing.expectEqual(@as(i32, 0), test_win.bind(socket, &bind_addr, @sizeOf(test_win.SockAddr4)));
+    var addr_len: i32 = @sizeOf(test_win.SockAddr4);
+    try std.testing.expectEqual(@as(i32, 0), test_win.getsockname(socket, &bind_addr, &addr_len));
+    const receive_timeout_ms: u32 = 2000;
+    try std.testing.expectEqual(@as(i32, 0), test_win.setsockopt(socket, 0xffff, 0x1006, &receive_timeout_ms, @sizeOf(u32)));
+
+    const Responder = struct {
+        socket: usize,
+        queries: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        valid: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+
+        fn run(self: *@This()) void {
+            for (0..3) |index| {
+                var query_buf: [dns.max_message_len]u8 = undefined;
+                var peer: test_win.SockAddr4 = undefined;
+                var peer_len: i32 = @sizeOf(test_win.SockAddr4);
+                const got = test_win.recvfrom(self.socket, &query_buf, @intCast(query_buf.len), 0, &peer, &peer_len);
+                if (got <= 0) return;
+                const parsed = dns.parseMessage(1, 0, query_buf[0..@intCast(got)]) catch {
+                    self.valid.store(false, .release);
+                    return;
+                };
+                if (parsed.question_count != 1 or parsed.questions[0].qtype != .a) {
+                    self.valid.store(false, .release);
+                    return;
+                }
+                const q = dns.Query{ .name = parsed.questions[0].name.slice(), .qtype = .a };
+                var expected_buf: [dns.max_domain_text_len]u8 = undefined;
+                const expected = dnsbl.reverseNameV4(.{ 203, 0, 113, @intCast(5 + index) }, "dnsbl.test", &expected_buf) catch unreachable;
+                if (!std.mem.eql(u8, q.name, expected)) {
+                    self.valid.store(false, .release);
+                    return;
+                }
+                _ = self.queries.fetchAdd(1, .acq_rel);
+                if (index == 2) return; // Hold the final lookup until its UDP timeout.
+                const answer = dns.Answer{ .name = q.name, .rr_type = .a, .ttl = 30, .data = .{ .a = .{ 127, 0, 0, 7 } } };
+                const answers: []const dns.Answer = if (index == 0) &.{answer} else &.{};
+                var response_buf: [dns.max_message_len]u8 = undefined;
+                const response = dns.encodeMessage(&response_buf, .{
+                    .id = parsed.header.id,
+                    .response = true,
+                    .questions = &.{q},
+                    .answers = answers,
+                    .rcode = if (index == 0) 0 else 3,
+                }) catch {
+                    self.valid.store(false, .release);
+                    return;
+                };
+                if (test_win.sendto(self.socket, response.ptr, @intCast(response.len), 0, &peer, peer_len) != @as(i32, @intCast(response.len))) {
+                    self.valid.store(false, .release);
+                    return;
+                }
+            }
+        }
+    };
+    var responder: Responder = .{ .socket = socket };
+    const responder_thread = try std.Thread.spawn(.{}, Responder.run, .{&responder});
+    defer responder_thread.join();
+
+    // Intentionally use a long caller timeout: the worker must enforce its
+    // Windows stop bound while this final query receives no answer.
+    var cfg: dns.ResolverConfig = .{ .port = std.mem.bigToNative(u16, bind_addr.port), .timeout_ms = 4000, .attempts = 3 };
+    cfg.addNameserver(.{ .ipv4 = .{ 127, 0, 0, 1 } });
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, cfg, &.{"dnsbl.test"});
+    defer resolver.deinit();
+    try resolver.startChecked();
+    try std.testing.expect(resolver.thread != null);
+
+    const listed: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 5 } };
+    const clean: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 6 } };
+    resolver.request(listed);
+    resolver.request(clean);
+    const ready_deadline = platform.monotonicMillis() + 4000;
+    while (platform.monotonicMillis() < ready_deadline and (resolver.lookup(listed) == null or resolver.lookup(clean) == null)) sleepMs(10);
+    try std.testing.expect(resolver.lookup(listed) != null);
+    try std.testing.expectEqual(Verdict{ .listed = true, .code = 7 }, resolver.lookup(listed).?);
+    try std.testing.expectEqual(Verdict{ .listed = false }, resolver.lookup(clean).?);
+
+    resolver.request(.{ .ipv4 = .{ 203, 0, 113, 7 } });
+    const query_deadline = platform.monotonicMillis() + 2000;
+    while (platform.monotonicMillis() < query_deadline and responder.queries.load(.acquire) < 3) sleepMs(10);
+    try std.testing.expectEqual(@as(u32, 3), responder.queries.load(.acquire));
+    const stop_start = platform.monotonicMillis();
+    resolver.stop();
+    try std.testing.expect(platform.monotonicMillis() - stop_start < 2500);
+    try std.testing.expect(resolver.runtime.entered.load(.acquire));
+    try std.testing.expect(resolver.runtime.exited.load(.acquire));
+    try std.testing.expect(responder.valid.load(.acquire));
 }
 
 fn pausedDnsblCaptureAllocation(allocator: std.mem.Allocator, resolver: *Resolver, token: runtime_pause.Token) !void {
@@ -583,9 +758,6 @@ test "companion runtime dnsbl retained pause preserves ready queued state zones 
 }
 
 test "companion cold Io preparation DNSBL configured and legacy owners confirm exact source" {
-    // Resolver worker threads never start on Windows (see `start`); the
-    // lifecycle below cannot proceed there.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var cfg: dns.ResolverConfig = .{};
     cfg.addNameserver(.{ .ipv4 = .{ 127, 0, 0, 1 } });
     const zones = [_][]const u8{"fixture.invalid"};

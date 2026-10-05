@@ -23,6 +23,8 @@ const dlog = @import("dlog.zig");
 const wp_crypto = @import("../crypto/webpush.zig");
 const ecdsa = @import("../crypto/ecdsa_p256.zig");
 const acme_runner = @import("acme_runner.zig");
+const http_fetch = @import("http_fetch.zig");
+const os_runtime = @import("os_runtime.zig");
 const http1 = @import("../proto/http1_client.zig");
 const platform = @import("../substrate/platform.zig");
 const services_mod = @import("services.zig");
@@ -49,8 +51,8 @@ pub const vapid_jwt_ttl_seconds: i64 = 12 * 60 * 60;
 pub const max_queued_jobs: usize = 256;
 /// Oper text published when `enqueue` drops because the queue is full.
 pub const overflow_oper_message = "WEBPUSH queue full; dropped a push";
-/// Printed by the non-Linux boot path. Wave 6 keeps this explicit disable.
-pub const portable_disable_reason = "web push is Linux-only; disabled";
+/// Printed on targets without a verified outbound HTTPS worker.
+pub const portable_disable_reason = "web push requires a supported outbound HTTPS worker";
 
 pub const Config = struct {
     /// Master gate: off = command rejected, no worker, nothing advertised.
@@ -229,6 +231,64 @@ const GuardedResolver = struct {
 
 pub const Vapid = struct {
     key_pair: ecdsa.KeyPair,
+
+    /// Windows account-backed Web Push keeps its VAPID scalar under a private
+    /// parent directory. The validated directory HANDLE remains pinned while
+    /// an existing key is acquired exclusively or a new key is created with
+    /// its final private ACL before the first secret byte is written.
+    pub fn loadOrCreatePrivateWindows(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !Vapid {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        const name = std.fs.path.basename(sub_path);
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidPath;
+        const parent = try os_runtime.openPrivateDirectoryWindows(io, dir, std.fs.path.dirname(sub_path) orelse ".");
+        defer parent.close(io);
+        const existing: ?std.Io.File = os_runtime.openExistingPrivateWindows(parent, name, .remediate) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (existing) |file| {
+            defer file.close(io);
+            return loadPrivateFileWindows(io, file);
+        }
+        const file = try os_runtime.createPrivateExclusiveWindows(parent, name);
+        defer file.close(io);
+        var kp = ecdsa.KeyPair.generate(io);
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+        var hex = std.fmt.bytesToHex(kp.secret_key.toBytes(), .lower);
+        defer std.crypto.secureZero(u8, &hex);
+        try file.writePositionalAll(io, &hex, 0);
+        try file.sync(io);
+        return .{ .key_pair = kp };
+    }
+
+    /// Read-only Windows restore verifies both the pinned parent and private
+    /// file owner/DACL without creating or changing key material.
+    pub fn loadExistingPrivateWindows(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !Vapid {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        const name = std.fs.path.basename(sub_path);
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidPath;
+        const parent = try os_runtime.openPrivateDirectoryWindows(io, dir, std.fs.path.dirname(sub_path) orelse ".");
+        defer parent.close(io);
+        const file = try os_runtime.openExistingPrivateWindows(parent, name, .verify_only);
+        defer file.close(io);
+        return loadPrivateFileWindows(io, file);
+    }
+
+    fn loadPrivateFileWindows(io: std.Io, file: std.Io.File) !Vapid {
+        var text: [256]u8 = undefined;
+        defer std.crypto.secureZero(u8, &text);
+        const stat = try file.stat(io);
+        if (stat.size > text.len) return error.InvalidVapidKey;
+        const count = try file.readPositionalAll(io, text[0..@intCast(stat.size)], 0);
+        if (count != stat.size) return error.InvalidVapidKey;
+        const trimmed = std.mem.trim(u8, text[0..count], " \r\n\t");
+        if (trimmed.len != 64) return error.InvalidVapidKey;
+        var secret: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &secret);
+        _ = std.fmt.hexToBytes(&secret, trimmed) catch return error.InvalidVapidKey;
+        const sk = ecdsa.SecretKey.fromBytes(secret) catch return error.InvalidVapidKey;
+        return .{ .key_pair = ecdsa.KeyPair.fromSecretKey(sk) catch return error.InvalidVapidKey };
+    }
 
     /// Load the VAPID key from `sub_path`, or create + persist a fresh one.
     /// Format on disk: 64 lowercase hex chars of the P-256 secret scalar.
@@ -698,7 +758,27 @@ pub const Worker = struct {
         // resolution the connect uses, so a client-supplied endpoint can never
         // steer the daemon at an internal/loopback/metadata target.
         var guard = GuardedResolver{ .inner = self.resolver };
-        const raw = try acme_runner.httpsRequest(
+        const raw = if (comptime builtin.os.tag == .windows) blk: {
+            const checked = guard.resolver();
+            const addr = try checked.resolveFn(checked.ctx, url.host, url.port);
+            var host_header_buf: [max_endpoint_len]u8 = undefined;
+            const host_header = if (url.port == 443)
+                url.host
+            else
+                try std.fmt.bufPrint(&host_header_buf, "{s}:{d}", .{ url.host, url.port });
+            const cap = std.math.add(usize, body.len, 4096) catch return error.ResponseTooLarge;
+            if (cap > 64 * 1024) return error.ResponseTooLarge;
+            const request_buf = try self.allocator.alloc(u8, cap);
+            defer {
+                std.crypto.secureZero(u8, request_buf);
+                self.allocator.free(request_buf);
+            }
+            const request = try http1.buildRequest(request_buf, "POST", host_header, url.path, &extra, body);
+            break :blk try http_fetch.getAtAddress(self.allocator, url.host, url.port, true, request, addr, .{
+                .trust_anchors = self.trust_anchors,
+                .max_response_bytes = 64 * 1024,
+            });
+        } else try acme_runner.httpsRequest(
             self.allocator,
             guard.resolver(),
             self.trust_anchors,
@@ -759,6 +839,27 @@ fn sleepMs(ms: u32) void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "webpush Windows VAPID key requires private parent and persists with private custody" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "broad", .default_dir);
+    try testing.expectError(error.InsecurePermissions, Vapid.loadOrCreatePrivateWindows(testing.io, tmp.dir, "broad/vapid.key"));
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, "broad/vapid.key", .{}));
+    try tmp.dir.createDir(testing.io, "private", .default_dir);
+    try os_runtime.protectEmptyDirectoryWindows(testing.io, tmp.dir, "private");
+    try testing.expectError(error.FileNotFound, Vapid.loadExistingPrivateWindows(testing.io, tmp.dir, "private/vapid.key"));
+    var created = try Vapid.loadOrCreatePrivateWindows(testing.io, tmp.dir, "private/vapid.key");
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&created));
+    const held = try os_runtime.openExistingPrivateWindows(tmp.dir, "private/vapid.key", .verify_only);
+    held.close(testing.io);
+    var restarted = try Vapid.loadExistingPrivateWindows(testing.io, tmp.dir, "private/vapid.key");
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&restarted));
+    var first_b64: [vapid_pub_b64_len]u8 = undefined;
+    var second_b64: [vapid_pub_b64_len]u8 = undefined;
+    try testing.expectEqualStrings(created.publicB64(&first_b64), restarted.publicB64(&second_b64));
+}
 
 test "subscription list encode/decode round-trip" {
     const ep1 = try testing.allocator.dupe(u8, "https://push.example.net/send/abc123");
@@ -978,9 +1079,9 @@ test "DST GAP-D8 webpush queue overflow increments a metric and emits an oper ev
     const kept = svc.webpushGetAlloc(testing.allocator, "alice") orelse return error.MissingSubscription;
     defer testing.allocator.free(kept);
     try testing.expectEqualSlices(u8, blob, kept);
-    try testing.expectEqualStrings(portable_disable_reason, "web push is Linux-only; disabled");
+    try testing.expectEqualStrings(portable_disable_reason, "web push requires a supported outbound HTTPS worker");
 
-    std.debug.print("GAP-D8 branch=full webpush queue increments onyx_webpush_dropped and emits an oper event; subscription rows in props stay; live mail stays off; non-Linux keeps the explicit disable\n", .{});
+    std.debug.print("GAP-D8 branch=full webpush queue increments onyx_webpush_dropped and emits an oper event; subscription rows in props stay; live mail stays off\n", .{});
 }
 
 pub const Execution = enum(u8) { unstarted, paused };

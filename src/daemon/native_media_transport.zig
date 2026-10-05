@@ -1209,8 +1209,6 @@ fn mkAddr(last: u8, port: u16) TransportAddress {
 }
 
 test "NativeMediaTransport: pump learns sender + forwards an cadence frame to the receiver" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -1237,8 +1235,6 @@ test "NativeMediaTransport: pump learns sender + forwards an cadence frame to th
 }
 
 test "upgrade continuity: NativeMediaTransport ignores idle socket and gates registrations" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
 
@@ -1298,8 +1294,6 @@ test "NativeMediaTransport: MAC flag off preserves untagged datagram behavior" {
 }
 
 test "NativeMediaTransport: media never crosses channels" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -1326,8 +1320,6 @@ test "NativeMediaTransport: media never crosses channels" {
 }
 
 test "NativeMediaTransport: setSelection drops higher layers over the wire" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -1386,8 +1378,6 @@ test "NativeMediaTransport: unregister drops the channel and frees its index" {
 }
 
 test "NativeMediaTransport: register enforces runtime participant cap" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.initConfig(testing.allocator, 2);
     defer nmt.deinit();
 
@@ -1432,8 +1422,6 @@ const TestFeedbackCtx = struct {
 };
 
 test "NativeMediaTransport: pump bridges a native frame to a WebRTC member as RTP" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
 
@@ -1469,8 +1457,6 @@ test "NativeMediaTransport: pump bridges a native frame to a WebRTC member as RT
 }
 
 test "NativeMediaTransport: pump accepts authenticated native feedback envelope" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     const root = @as([16]u8, @splat(0x4B));
@@ -1511,8 +1497,6 @@ test "NativeMediaTransport: pump accepts authenticated native feedback envelope"
 }
 
 test "NativeMediaTransport: pump rejects native feedback with a bad tag" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     const root = @as([16]u8, @splat(0x4B));
@@ -1638,8 +1622,6 @@ test "NativeMediaTransport: valid feedback from the correct source still binds a
 }
 
 test "NativeMediaTransport: start/shutdown is clean and re-startable" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -1796,7 +1778,7 @@ fn nativeCodecs(profile: rooms.CallProfile, kind_bits: u8) !u8 {
 }
 pub const NativeAdvertisement = struct { port: u16 };
 const NativeOfferAdvertisement = struct {
-    socket_fd: std.posix.fd_t,
+    socket_fd: media_socket.SocketHandle,
     socket: media_socket.Snapshot,
     max_frame_bytes: usize,
     max_upload_bytes: u64,
@@ -2219,8 +2201,6 @@ test "physical Native every detached growth failure has same owner retry and ori
 }
 
 test "physical native advertisement binds actual held UDP port full negotiation and current source" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const domain = try routing.Domain.create(std.testing.allocator);
     defer domain.destroyQuiesced() catch @panic("native advertisement source custody");
     var owner = NativeMediaTransport.init(std.testing.allocator);
@@ -2387,8 +2367,6 @@ test "physical native authenticated ingress actual MAC bytes scope serial reuse 
 }
 
 test "physical prepared legacy Native worker actual join retains exact source socket" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var owner = NativeMediaTransport.init(testing.allocator);
     defer owner.deinit();
     try owner.prepareColdResources(testing.io, loopback_be, 0);
@@ -2596,8 +2574,6 @@ const PhysicalNativeWorkerFixture = struct {
 };
 
 test "physical Native actual workers use recipient directional tags same-nick siblings and authenticated feedback" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var fixture = try PhysicalNativeWorkerFixture.init();
     defer fixture.deinit();
     var a = try fixture.offer("#native-physical", .{ .shard = 0, .slot = 0, .gen = 0 });
@@ -2656,8 +2632,6 @@ test "physical Native actual workers use recipient directional tags same-nick si
 }
 
 test "physical media five-blocker causal Native first issued stream refuses colliding RTC SSRC claim" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var fixture = try PhysicalNativeWorkerFixture.init();
     defer fixture.deinit();
     const channel = "#publisher-namespace";
@@ -2700,8 +2674,6 @@ test "physical media five-blocker causal Native first issued stream refuses coll
 }
 
 test "physical media five-blocker causal RTC first SSRC refuses conflicting later Native publication" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var fixture = try PhysicalNativeWorkerFixture.init();
     defer fixture.deinit();
     const channel = "#publisher-namespace";
@@ -2751,8 +2723,6 @@ test "physical media five-blocker causal RTC first SSRC refuses conflicting late
 }
 
 test "physical media namespace collision spans distinct calls and real departure releases accepted RTC claim" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var fixture = try PhysicalNativeWorkerFixture.init();
     defer fixture.deinit();
     const publisher_id = routing.ClientId{ .shard = 0, .slot = 1, .gen = 0 };
@@ -2818,5 +2788,5 @@ test "physical media namespace collision spans distinct calls and real departure
     try fixture.domain.withLocked(Available{ .domain = fixture.domain, .stream = accepted_stream }, Available.run);
     var current_native = try fixture.offer("#native-other-call", .{ .shard = 0, .slot = 0, .gen = 0 });
     defer current_native.wipe();
-    try testing.expect(current_native.identity.stream_id != accepted_stream);
+    try testing.expect(fixture.native.physical_streams.contains(current_native.identity.stream_id));
 }

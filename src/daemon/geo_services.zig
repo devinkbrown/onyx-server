@@ -315,6 +315,21 @@ pub const Service = struct {
         self.thread = std.Thread.spawn(.{}, worker, .{self}) catch null;
     }
 
+    /// Eager startup for explicitly enabled geo service. Preserve the same
+    /// lifecycle/producer exclusion as lazy start, but surface spawn refusal.
+    pub fn startChecked(self: *Service) !void {
+        lockSpin(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.thread != null or self.runtime.view != null or self.lazy_pause_epoch != 0) return error.AlreadyStarted;
+        if (!self.opts.weather_enabled and !self.opts.news_enabled) return error.NotConfigured;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.producers.frozen) return error.ProducersFrozen;
+        self.stop_flag.store(false, .release);
+        errdefer self.stop_flag.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, worker, .{self});
+    }
+
     pub fn stop(self: *Service) void {
         self.runtime.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
         lockSpin(&self.lifecycle_mutex);
@@ -541,6 +556,9 @@ pub const Service = struct {
     /// `#` comments skipped) and cache its headlines. Thread-safe blocking file
     /// read (raw syscalls; never touches the reactor io).
     fn fetchNewsFromFile(self: *Service, k: []const u8) void {
+        // getNews accepts a client-supplied key. Only catalogue entries may
+        // become filenames below the configured cache directory.
+        if (newsUrlForKey(k) == null) return;
         var name_buf: [max_key]u8 = undefined;
         const fname = fileKey(k, &name_buf);
         var path_buf: [512]u8 = undefined;
@@ -597,7 +615,7 @@ fn fileKey(k: []const u8, buf: []u8) []const u8 {
 /// earlier pathname stat, supplies the regular-file proof.
 fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
     const builtin = @import("builtin");
-    if (comptime builtin.os.tag == .windows) return null;
+    if (comptime builtin.os.tag == .windows) return readFileWindows(path, buf);
     const sys = posix.system;
     const flags: posix.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true };
     const raw = if (comptime builtin.os.tag == .linux)
@@ -626,6 +644,45 @@ fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
             .INTR => continue,
             else => return null,
         }
+    }
+    return buf[0..total];
+}
+
+const windows_invalid_handle = std.math.maxInt(usize);
+const windows_file_type_disk: u32 = 1;
+const windows_file_attribute_reparse_point: u32 = 0x400;
+const WindowsFileBasicInfo = extern struct {
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    attributes: u32,
+};
+extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, sharing: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?*anyopaque) callconv(.winapi) usize;
+extern "kernel32" fn GetFileType(handle: usize) callconv(.winapi) u32;
+extern "kernel32" fn GetFileInformationByHandleEx(handle: usize, class: i32, info: *anyopaque, size: u32) callconv(.winapi) i32;
+extern "kernel32" fn ReadFile(handle: usize, bytes: [*]u8, len: u32, count: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn CloseHandle(handle: usize) callconv(.winapi) i32;
+
+fn readFileWindows(path: [*:0]const u8, buf: []u8) ?[]u8 {
+    if (comptime @import("builtin").os.tag != .windows) return null;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, std.mem.span(path)) catch return null;
+    defer std.heap.page_allocator.free(wide);
+    // OPEN_REPARSE_POINT makes the final-file check apply to the opened link
+    // rather than silently reading a target outside the configured cache.
+    const handle = CreateFileW(wide.ptr, 0x80000000, 0x7, null, 3, 0x00200000, null);
+    if (handle == windows_invalid_handle) return null;
+    defer _ = CloseHandle(handle);
+    if (GetFileType(handle) != windows_file_type_disk) return null;
+    var basic: WindowsFileBasicInfo = undefined;
+    if (GetFileInformationByHandleEx(handle, 0, &basic, @sizeOf(WindowsFileBasicInfo)) == 0 or
+        (basic.attributes & windows_file_attribute_reparse_point) != 0) return null;
+    var total: usize = 0;
+    while (total < buf.len) {
+        var count: u32 = 0;
+        if (ReadFile(handle, buf[total..].ptr, @intCast(@min(buf.len - total, std.math.maxInt(u32))), &count, null) == 0) return null;
+        if (count == 0) break;
+        total += @intCast(count);
     }
     return buf[0..total];
 }
@@ -719,6 +776,20 @@ test "cache miss enqueues and reports not-ready" {
     // Same key again must not double-enqueue (entry now pending).
     try std.testing.expect(svc.getWeather("austin", &loc, &desc) == null);
     try std.testing.expectEqual(@as(usize, 1), svc.job_count);
+}
+
+test "Windows geo checked startup refuses disabled and frozen workers then starts" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var disabled = Service.init(std.testing.allocator, .{ .weather_enabled = false, .news_enabled = false });
+    try std.testing.expectError(error.NotConfigured, disabled.startChecked());
+    var service = Service.init(std.testing.allocator, .{ .weather_enabled = false });
+    const fence = try service.fenceProducers();
+    try std.testing.expectError(error.ProducersFrozen, service.startChecked());
+    try service.resumeProducers(fence);
+    try service.startChecked();
+    defer service.stop();
+    try std.testing.expect(service.thread != null);
+    try std.testing.expectError(error.AlreadyStarted, service.startChecked());
 }
 
 test "ready weather entry is served and localized by caller" {
@@ -999,6 +1070,50 @@ test "companion runtime geo cache regular control and FIFO finite refusal" {
         }
         reaped = true;
         try std.testing.expectEqual(@as(i32, 0), status);
+    }
+}
+
+test "Windows geo news cache reads regular UTF-8 files and rejects reparse points" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const control = try tmp.dir.createFile(std.testing.io, "src_bbc.txt", .{});
+    try control.writePositionalAll(std.testing.io, "# updater note\r\nFirst headline\r\nSecond headline\n", 0);
+    control.close(std.testing.io);
+    const unicode = try tmp.dir.createFile(std.testing.io, "news-東京.txt", .{});
+    try unicode.writePositionalAll(std.testing.io, "UTF-8 path", 0);
+    unicode.close(std.testing.io);
+
+    const cache_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(cache_dir);
+    var service = Service.init(std.testing.allocator, .{ .news_cache_dir = cache_dir });
+    service.fetchNewsFromFile("src:bbc");
+    var output: [256]u8 = undefined;
+    var lines: [max_headlines][]const u8 = undefined;
+    const headlines = service.getNews("src:bbc", &output, &lines) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), headlines.len);
+    try std.testing.expectEqualStrings("First headline", headlines[0]);
+    try std.testing.expectEqualStrings("Second headline", headlines[1]);
+    service.fetchNewsFromFile("src:../../escape");
+    try std.testing.expect(service.findNews("src:../../escape") == null);
+
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/news-東京.txt", .{cache_dir}, 0);
+    var read_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("UTF-8 path", readFileZ(path, &read_buf) orelse return error.TestUnexpectedResult);
+    const directory = try std.fmt.bufPrintSentinel(&path_buf, "{s}", .{cache_dir}, 0);
+    try std.testing.expect(readFileZ(directory, &read_buf) == null);
+
+    const linked = blk: {
+        tmp.dir.symLink(std.testing.io, "src_bbc.txt", "src_guardian.txt", .{}) catch |err| switch (err) {
+            error.AccessDenied, error.PermissionDenied => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
+    if (linked) {
+        const link_path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/src_guardian.txt", .{cache_dir}, 0);
+        try std.testing.expect(readFileZ(link_path, &read_buf) == null);
     }
 }
 

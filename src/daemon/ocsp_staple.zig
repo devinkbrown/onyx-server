@@ -215,11 +215,18 @@ pub const Service = struct {
 
     pub fn start(self: *Service) void {
         if (self.thread != null or self.runtime.view != null) return;
-        self.stop_flag.store(false, .release);
-        self.thread = std.Thread.spawn(.{}, worker, .{self}) catch |err| {
+        self.startChecked() catch |err| {
             dlog.log("onyx-server: ocsp stapler start failed ({s}); stapling disabled\n", .{@errorName(err)});
-            return;
         };
+    }
+
+    /// Strict boot path for an explicitly configured staple worker.
+    pub fn startChecked(self: *Service) !void {
+        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        try validateOptions(self.opts);
+        self.stop_flag.store(false, .release);
+        errdefer self.stop_flag.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, worker, .{self});
         dlog.log("onyx-server: ocsp staple scheduler enabled (check interval {d}ms)\n", .{self.opts.check_interval_ms});
     }
 
@@ -412,11 +419,9 @@ pub const Service = struct {
             .keep => return false,
             .publish => |owned| {
                 self.recordPublished(owned, leaf.serial_der, now);
-                // `publishOcspStaple` exists only on the full (linux/openbsd)
-                // server, which takes ownership of the DER. Elsewhere this
-                // Service is unwired (`void` in main): free the body here so
-                // it cannot leak, and report failure so the caller backs off.
-                const full_server = @import("builtin").os.tag == .linux or @import("builtin").os.tag == .openbsd;
+                // The full server takes ownership of the verified DER and
+                // publishes it on reactor 0, including its Windows backend.
+                const full_server = @import("builtin").os.tag == .linux or @import("builtin").os.tag == .openbsd or @import("builtin").os.tag == .windows;
                 if (comptime full_server) {
                     self.server.publishOcspStaple(owned);
                     return true;
@@ -529,6 +534,24 @@ test "extractOcspBody returns body only for a 200 with content" {
         defer allocator.free(raw);
         try std.testing.expect(extractOcspBody(raw) == null);
     }
+}
+
+test "Windows OCSP worker starts and joins without a certificate path" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const server = try std.testing.allocator.create(server_mod.Server);
+    defer std.testing.allocator.destroy(server);
+    const tls: config_format.Config.Tls = .{};
+    var service = Service.init(std.testing.allocator, std.testing.io, server, &tls, .{});
+    try service.startChecked();
+    defer service.stop();
+    try std.testing.expect(service.thread != null);
+    try std.testing.expectError(error.AlreadyStarted, service.startChecked());
+    const start = platform.monotonicMillis();
+    service.stop();
+    try std.testing.expect(platform.monotonicMillis() - start < 2000);
+    try std.testing.expect(service.thread == null);
+    try std.testing.expect(service.runtime.entered.load(.acquire));
+    try std.testing.expect(service.runtime.exited.load(.acquire));
 }
 
 const Ed25519 = std.crypto.sign.Ed25519;

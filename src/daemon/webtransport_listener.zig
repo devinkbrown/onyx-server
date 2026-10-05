@@ -89,6 +89,47 @@ const sys = if (builtin.os.tag == .windows) std.os.linux else std.posix.system;
 const os_runtime = @import("os_runtime.zig");
 const native_network = @import("native_network.zig");
 const posix = std.posix;
+const TcpSocket = if (builtin.os.tag == .windows) usize else sys.fd_t;
+
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const af_inet: i32 = 2;
+    const af_inet6: i32 = 23;
+    const sock_stream: i32 = 1;
+    const ipproto_tcp: i32 = 6;
+    const sol_socket: i32 = 0xffff;
+    const so_error: i32 = 0x1007;
+    const so_exclusiveaddruse: i32 = ~@as(i32, 0x0004);
+    const fionbio: u32 = 0x8004667e;
+    const interrupted: i32 = 10004;
+    const would_block: i32 = 10035;
+    const in_progress: i32 = 10036;
+    const already: i32 = 10037;
+    const SockAddr4 = extern struct { family: u16, port: u16, addr: [4]u8, zero: [8]u8 = @splat(0) };
+    const SockAddr6 = extern struct { family: u16, port: u16, flowinfo: u32 = 0, addr: [16]u8, scope_id: u32 = 0 };
+    const FdSet = extern struct { count: u32, sockets: [64]usize };
+    const Timeval = extern struct { seconds: i32, microseconds: i32 };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(SockAddr6) != 28 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8)
+            @compileError("Windows WebTransport TCP socket ABI shape changed");
+    }
+    extern "ws2_32" fn WSAStartup(version_requested: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn accept(socket: usize, address: ?*anyopaque, address_len: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn select(ignored_nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, length: i32, flags: i32) callconv(.winapi) i32;
+};
 
 const quic_conn = @import("../proto/quic_conn.zig");
 const quic_packet = @import("../proto/quic_packet.zig");
@@ -189,7 +230,7 @@ const Connection = struct {
     conn: *quic_conn.Conn,
     h3: *http3_conn.Http3Conn,
     /// Loopback TCP fd to the daemon's IRC listener, once a session establishes.
-    irc_fd: ?sys.fd_t = null,
+    irc_fd: ?TcpSocket = null,
     /// Whether we already opened a server→client WT bidi stream for IRC output.
     /// We instead reuse the client's first WT bidi data stream; this records it.
     wt_stream_id: ?u64 = null,
@@ -218,6 +259,8 @@ pub const WebTransportListener = struct {
     tls: TlsConfig,
     /// Local TCP port of the daemon's IRC listener (loopback bridge target).
     irc_port: u16,
+    /// Borrowed daemon bind host; Windows bridges to an exact interface bind.
+    irc_host: []const u8 = "127.0.0.1",
     /// Prepend a PROXY-protocol v1 header carrying the real QUIC peer address.
     /// Off by default (loopback identity); see module doc.
     send_proxy_header: bool = false,
@@ -304,7 +347,6 @@ pub const WebTransportListener = struct {
     }
 
     fn startAddress(self: *WebTransportListener, address: DualStackUdpSocket.BindAddr, port: u16) Error!void {
-        if (comptime builtin.os.tag == .windows) return error.BindFailed;
         if (self.socket != null or self.runtime.view != null) return error.AlreadyStarted;
         var sock = DualStackUdpSocket.bind(address, port) catch return error.BindFailed;
         self.port = sock.localPort() catch {
@@ -816,10 +858,13 @@ pub const WebTransportListener = struct {
     /// listener (the daemon will treat this as an ordinary local client).
     fn openBridge(self: *WebTransportListener, conn: *Connection) void {
         if (conn.irc_fd != null) return; // already bridged (one session per conn)
-        const fd = connectLoopbackTcp(self.irc_port) orelse return;
+        const fd = (if (comptime builtin.os.tag == .windows)
+            connectIrcTcpWindows(self.irc_port, self.irc_host)
+        else
+            connectLoopbackTcp(self.irc_port)) orelse return;
         // Non-blocking so the single pump thread never stalls on a slow read.
         if (!setNonBlocking(fd) or (self.send_proxy_header and !self.writeProxyHeader(conn, fd))) {
-            _ = sys.close(fd);
+            closeTcp(fd);
             return;
         }
         conn.irc_fd = fd;
@@ -828,7 +873,7 @@ pub const WebTransportListener = struct {
     fn closeBridge(self: *WebTransportListener, conn: *Connection) void {
         _ = self;
         if (conn.irc_fd) |fd| {
-            _ = sys.close(fd);
+            closeTcp(fd);
             conn.irc_fd = null;
         }
         conn.have_wt_stream = false;
@@ -859,6 +904,29 @@ pub const WebTransportListener = struct {
 
         // TCP → WT stream (IRC daemon → browser).
         while (true) {
+            if (comptime builtin.os.tag == .windows) {
+                const received = win.recv(fd, &buf, @intCast(buf.len), 0);
+                if (received == 0) {
+                    conn.h3.closeSession() catch {};
+                    self.closeBridge(conn);
+                    return true;
+                }
+                if (received < 0) {
+                    switch (win.WSAGetLastError()) {
+                        win.would_block => break,
+                        win.interrupted => continue,
+                        else => {
+                            self.teardownConnection(conn);
+                            return false;
+                        },
+                    }
+                }
+                conn.h3.writeWtStream(sid, buf[0..@intCast(received)], false) catch {
+                    self.teardownConnection(conn);
+                    return false;
+                };
+                continue;
+            }
             const rc = sys.read(fd, &buf, buf.len);
             switch (posix.errno(rc)) {
                 .SUCCESS => {
@@ -906,7 +974,7 @@ pub const WebTransportListener = struct {
     /// 4-byte address) → TCP4 with a 127.0.0.1 destination; a native IPv6 peer →
     /// TCP6 with a ::1 destination. The peer address is already a
     /// `TransportAddress`, so the family is just its `ip_len`.
-    fn writeProxyHeader(self: *WebTransportListener, conn: *Connection, fd: sys.fd_t) bool {
+    fn writeProxyHeader(self: *WebTransportListener, conn: *Connection, fd: TcpSocket) bool {
         _ = self;
         var out: [proxy_protocol.v1_max_line_len]u8 = undefined;
         const peer = conn.peer;
@@ -1129,7 +1197,7 @@ pub const WebTransportListener = struct {
     }
 
     fn destroyConnection(self: *WebTransportListener, conn: *Connection) void {
-        if (conn.irc_fd) |fd| _ = sys.close(fd);
+        if (conn.irc_fd) |fd| closeTcp(fd);
         conn.h3.deinit();
         self.allocator.destroy(conn.h3);
         conn.conn.deinit();
@@ -1389,14 +1457,23 @@ fn envIsSet(name: []const u8) bool {
 }
 
 fn sleepMs(ms: u32) void {
-    if (comptime builtin.os.tag == .windows) return;
+    if (comptime builtin.os.tag == .windows) return os_runtime.sleepMillis(ms);
     if (comptime builtin.os.tag != .linux) return os_runtime.sleepMillis(ms);
     var req = sys.timespec{ .sec = @divTrunc(ms, 1000), .nsec = @as(isize, ms % 1000) * 1_000_000 };
     _ = sys.nanosleep(&req, null);
 }
 
-fn connectLoopbackTcp(port: u16) ?sys.fd_t {
-    if (comptime builtin.os.tag == .windows) return null;
+fn closeTcp(fd: TcpSocket) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = win.closesocket(fd);
+        _ = win.WSACleanup();
+        return;
+    }
+    _ = sys.close(fd);
+}
+
+fn connectLoopbackTcp(port: u16) ?TcpSocket {
+    if (comptime builtin.os.tag == .windows) return connectLoopbackTcpWindows(port);
     if (comptime builtin.os.tag != .linux) return native_network.connect(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }, 1000) catch null;
     const rc = sys.socket(posix.AF.INET, sys.SOCK.STREAM | sys.SOCK.CLOEXEC, sys.IPPROTO.TCP);
     if (posix.errno(rc) != .SUCCESS) return null;
@@ -1412,14 +1489,107 @@ fn connectLoopbackTcp(port: u16) ?sys.fd_t {
     return fd;
 }
 
-fn setNonBlocking(fd: sys.fd_t) bool {
-    if (comptime builtin.os.tag == .windows) return false;
+fn connectLoopbackTcpWindows(port: u16) ?usize {
+    return connectLoopbackTcpWindowsFamily(port, false) orelse connectLoopbackTcpWindowsFamily(port, true);
+}
+
+fn connectLoopbackTcpWindowsFamily(port: u16, ipv6: bool) ?usize {
+    const address: std.Io.net.IpAddress = if (ipv6)
+        .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = port } }
+    else
+        .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    return connectTcpWindowsAddress(address);
+}
+
+fn connectIrcTcpWindows(port: u16, host: []const u8) ?usize {
+    if (comptime builtin.os.tag != .windows) return null;
+    if (std.mem.eql(u8, host, "0.0.0.0") or std.mem.eql(u8, host, "::") or std.mem.eql(u8, host, ""))
+        return connectLoopbackTcpWindows(port);
+    return connectTcpWindowsAddress(std.Io.net.IpAddress.parse(host, port) catch return null);
+}
+
+fn connectTcpWindowsAddress(target: std.Io.net.IpAddress) ?usize {
+    if (comptime builtin.os.tag != .windows) return null;
+    var startup: [408]u8 align(8) = @splat(0);
+    if (win.WSAStartup(0x0202, &startup) != 0) return null;
+    const fd = win.WSASocketW(if (target == .ip6) win.af_inet6 else win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    if (fd == win.invalid_socket) {
+        _ = win.WSACleanup();
+        return null;
+    }
+    var keep = false;
+    defer if (!keep) {
+        _ = win.closesocket(fd);
+        _ = win.WSACleanup();
+    };
+    var nonblocking: u32 = 1;
+    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return null;
+    const connected = switch (target) {
+        .ip6 => |address6| blk: {
+            const address = win.SockAddr6{ .family = win.af_inet6, .port = std.mem.nativeToBig(u16, address6.port), .addr = address6.bytes, .scope_id = address6.interface.index };
+            break :blk win.connect(fd, &address, @sizeOf(win.SockAddr6));
+        },
+        .ip4 => |address4| blk: {
+            const address = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, address4.port), .addr = address4.bytes };
+            break :blk win.connect(fd, &address, @sizeOf(win.SockAddr4));
+        },
+    };
+    if (connected != 0) {
+        switch (win.WSAGetLastError()) {
+            win.would_block, win.in_progress, win.already => {},
+            else => return null,
+        }
+        var writes = win.FdSet{ .count = 1, .sockets = @splat(0) };
+        writes.sockets[0] = fd;
+        var timeout = win.Timeval{ .seconds = 1, .microseconds = 0 };
+        if (win.select(0, null, &writes, null, &timeout) <= 0) return null;
+    }
+    var socket_error: i32 = 0;
+    var error_length: i32 = @sizeOf(i32);
+    if (win.getsockopt(fd, win.sol_socket, win.so_error, &socket_error, &error_length) != 0 or
+        error_length != @sizeOf(i32) or socket_error != 0) return null;
+    keep = true;
+    return fd;
+}
+
+fn setNonBlocking(fd: TcpSocket) bool {
+    if (comptime builtin.os.tag == .windows) {
+        var enabled: u32 = 1;
+        return win.ioctlsocket(fd, win.fionbio, &enabled) == 0;
+    }
     os_runtime.setNonblocking(fd) catch return false;
     return true;
 }
 
-fn writeAllFd(fd: sys.fd_t, bytes: []const u8) bool {
-    if (comptime builtin.os.tag == .windows) return false;
+fn writeAllFd(fd: TcpSocket, bytes: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        const deadline = nowNs() + std.time.ns_per_s;
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            if (nowNs() >= deadline) return false;
+            const amount: i32 = @intCast(@min(bytes.len - sent, std.math.maxInt(i32)));
+            const rc = win.send(fd, bytes[sent..].ptr, amount, 0);
+            if (rc > 0) {
+                sent += @intCast(rc);
+                continue;
+            }
+            if (rc == 0) return false;
+            switch (win.WSAGetLastError()) {
+                win.interrupted => continue,
+                win.would_block => {
+                    const now = nowNs();
+                    if (now >= deadline) return false;
+                    var writes = win.FdSet{ .count = 1, .sockets = @splat(0) };
+                    writes.sockets[0] = fd;
+                    const remaining_ms: u64 = @min((deadline - now) / std.time.ns_per_ms, 50);
+                    var timeout = win.Timeval{ .seconds = 0, .microseconds = @intCast(remaining_ms * 1000) };
+                    if (win.select(0, null, &writes, null, &timeout) < 0) return false;
+                },
+                else => return false,
+            }
+        }
+        return true;
+    }
     if (comptime builtin.os.tag != .linux) {
         // A slow IRC peer cannot pin this single UDP pump indefinitely. Never
         // replay already-sent bytes: failure tears down this bridge.
@@ -1527,8 +1697,6 @@ const TestServerKeys = struct {
 };
 
 test "WebTransportListener: bind, port, and clean re-startable shutdown" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var keys: TestServerKeys = undefined;
     try keys.init();
     var lst = WebTransportListener.init(testing.allocator, .{
@@ -1554,7 +1722,7 @@ test "WebTransportListener: bind, port, and clean re-startable shutdown" {
 /// records what it saw. Stands in for the daemon's IRC listener so the test can
 /// assert the WT→TCP→WT loopback proxy round-trips real bytes.
 const FakeIrcServer = struct {
-    listen_fd: sys.fd_t,
+    listen_fd: TcpSocket,
     port: u16,
     thread: ?std.Thread = null,
     got: [256]u8 = undefined,
@@ -1562,6 +1730,7 @@ const FakeIrcServer = struct {
     reply: []const u8,
 
     fn start(reply: []const u8) !*FakeIrcServer {
+        if (comptime builtin.os.tag == .windows) return startWindows(reply);
         const self = try testing.allocator.create(FakeIrcServer);
         errdefer testing.allocator.destroy(self);
         const rc = sys.socket(posix.AF.INET, sys.SOCK.STREAM | sys.SOCK.CLOEXEC, sys.IPPROTO.TCP);
@@ -1582,7 +1751,34 @@ const FakeIrcServer = struct {
         return self;
     }
 
+    fn startWindows(reply: []const u8) !*FakeIrcServer {
+        if (comptime builtin.os.tag != .windows) return error.SocketFailed;
+        const self = try testing.allocator.create(FakeIrcServer);
+        errdefer testing.allocator.destroy(self);
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketFailed;
+        errdefer _ = win.WSACleanup();
+        const fd = win.WSASocketW(win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+        if (fd == win.invalid_socket) return error.SocketFailed;
+        self.listen_fd = fd;
+        errdefer _ = win.closesocket(fd);
+        const exclusive: i32 = 1;
+        if (win.setsockopt(fd, win.sol_socket, win.so_exclusiveaddruse, &exclusive, @sizeOf(i32)) != 0) return error.SocketFailed;
+        const address = win.SockAddr4{ .family = win.af_inet, .port = 0, .addr = .{ 127, 0, 0, 1 } };
+        if (win.bind(fd, &address, @sizeOf(win.SockAddr4)) != 0) return error.BindFailed;
+        if (win.listen(fd, 4) != 0) return error.ListenFailed;
+        var bound: win.SockAddr4 = undefined;
+        var length: i32 = @sizeOf(win.SockAddr4);
+        if (win.getsockname(fd, &bound, &length) != 0 or length != @sizeOf(win.SockAddr4)) return error.SocketFailed;
+        self.port = std.mem.bigToNative(u16, bound.port);
+        self.got_len = .init(0);
+        self.reply = reply;
+        self.thread = try std.Thread.spawn(.{}, accept, .{self});
+        return self;
+    }
+
     fn accept(self: *FakeIrcServer) void {
+        if (comptime builtin.os.tag == .windows) return self.acceptWindows();
         var polls = [_]posix.pollfd{.{ .fd = self.listen_fd, .events = posix.POLL.IN, .revents = 0 }};
         if (sys.poll(&polls, 1, 5000) <= 0) return;
         const cfd_rc = sys.accept(self.listen_fd, null, null);
@@ -1604,9 +1800,35 @@ const FakeIrcServer = struct {
         sleepMs(50);
     }
 
+    fn acceptWindows(self: *FakeIrcServer) void {
+        if (comptime builtin.os.tag != .windows) return;
+        var reads = win.FdSet{ .count = 1, .sockets = @splat(0) };
+        reads.sockets[0] = self.listen_fd;
+        var timeout = win.Timeval{ .seconds = 5, .microseconds = 0 };
+        if (win.select(0, &reads, null, null, &timeout) <= 0) return;
+        const fd = win.accept(self.listen_fd, null, null);
+        if (fd == win.invalid_socket) return;
+        defer _ = win.closesocket(fd);
+        const receive_timeout_ms: i32 = 2000;
+        if (win.setsockopt(fd, win.sol_socket, 0x1006, &receive_timeout_ms, @sizeOf(i32)) != 0) return;
+        var total: usize = 0;
+        while (total < self.got.len) {
+            const received = win.recv(fd, self.got[total..].ptr, @intCast(self.got.len - total), 0);
+            if (received <= 0) return;
+            total += @intCast(received);
+            if (std.mem.endsWith(u8, self.got[0..total], "NICK wtuser\r\n")) break;
+        }
+        self.got_len.store(total, .release);
+        _ = writeAllFd(fd, self.reply);
+        sleepMs(50);
+    }
+
     fn join(self: *FakeIrcServer) void {
         if (self.thread) |t| t.join();
-        _ = sys.close(self.listen_fd);
+        if (comptime builtin.os.tag == .windows) {
+            _ = win.closesocket(self.listen_fd);
+            _ = win.WSACleanup();
+        } else _ = sys.close(self.listen_fd);
         testing.allocator.destroy(self);
     }
 };
@@ -1620,8 +1842,6 @@ test "WebTransportListener: native IPv6 QUIC/H3/WT bridges IRC with mandatory PR
 }
 
 fn exerciseLiveBridge(ipv6: bool, proxy: bool) !void {
-    // Live UDP/QUIC bridge; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     // End-to-end over the DUAL-STACK socket: `lst.start` now binds an AF_INET6
     // socket with IPV6_V6ONLY=0, and the client below is a plain IPv4 loopback
     // `MediaSocket`. So this also proves the full QUIC/H3/WT handshake + IRC
