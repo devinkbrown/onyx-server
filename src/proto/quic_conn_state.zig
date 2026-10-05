@@ -289,8 +289,9 @@ pub const PacketNumberSpace = struct {
     /// it must emit an ACK frame (RFC 9000 §13.2.1).
     ack_eliciting_pending: bool = false,
 
-    /// The largest received packet number, cached for the ACK delay calc and so
-    /// `buildAck` does not have to rescan. Mirrors `received.max()`.
+    /// Largest packet number ever received, cached for the ACK delay calc. It
+    /// can exceed `received.max()` when the range cap evicts a higher range
+    /// while admitting a much older out-of-order packet.
     largest_received: ?u64 = null,
 
     pub fn init(level: EncryptionLevel, max_ack_ranges: usize) PacketNumberSpace {
@@ -810,6 +811,7 @@ pub const StreamRecv = struct {
         if (end > max_varint) return error.OffsetTooLarge;
 
         // Final-size checks (RFC 9000 §4.5).
+        if (fin and end < self.flow.received) return error.FinalSizeError;
         if (self.final_size) |fsz| {
             // No byte may be delivered at or beyond an established final size,
             // and a new fin must agree on the size.
@@ -1178,7 +1180,363 @@ pub const Engine = struct {
     pub fn setMaxData(self: *Engine, new_limit: u64) void {
         self.conn_flow.setLimit(new_limit);
     }
+
+    /// Capture logical engine state at a quiescent packet boundary. The owned
+    /// DTO never reads unfilled staging bytes; holes are encoded as zeroes.
+    pub fn captureSnapshot(self: *const Engine, allocator: Allocator) SnapshotError!EngineSnapshot {
+        var spaces: [3]?SpaceSnapshot = .{ null, null, null };
+        errdefer for (&spaces) |*item| if (item.*) |*value| value.deinit(allocator);
+        const source_spaces = [_]*const PacketNumberSpace{ &self.spaces.initial, &self.spaces.handshake, &self.spaces.application };
+        const source_acked = [_]*const RangeSet{ &self.acked_initial, &self.acked_handshake, &self.acked_application };
+        for (source_spaces, source_acked, 0..) |space_ptr, acked_ptr, i| {
+            if (space_ptr.level != snapshotLevel(i)) return error.InvalidSnapshot;
+            spaces[i] = try captureSpaceSnapshot(allocator, space_ptr, acked_ptr);
+        }
+
+        var crypto: [3]?ByteWindowSnapshot = .{ null, null, null };
+        errdefer for (&crypto) |*item| if (item.*) |*value| value.deinit(allocator);
+        const source_crypto = [_]*const CryptoStream{ &self.crypto_initial, &self.crypto_handshake, &self.crypto_application };
+        var staged_total: usize = 0;
+        for (source_crypto, 0..) |stream, i| {
+            staged_total = try addSnapshotStaged(staged_total, stream.staged.items.len);
+            crypto[i] = try captureByteWindow(allocator, stream.read_offset, stream.cap, stream.staged.items, stream.filled.items, snapshot_max_crypto_cap);
+        }
+
+        if (self.streams.count() > snapshot_max_streams) return error.SnapshotTooLarge;
+        const ids = try allocator.alloc(u64, self.streams.count());
+        defer allocator.free(ids);
+        var iter = self.streams.iterator();
+        var id_count: usize = 0;
+        while (iter.next()) |entry| {
+            ids[id_count] = entry.key_ptr.*;
+            id_count += 1;
+        }
+        std.mem.sort(u64, ids, {}, std.sort.asc(u64));
+
+        const streams = try allocator.alloc(StreamSnapshot, ids.len);
+        var captured_streams: usize = 0;
+        errdefer {
+            for (streams[0..captured_streams]) |*stream| stream.deinit(allocator);
+            allocator.free(streams);
+        }
+        for (ids, 0..) |id, i| {
+            const source = self.streams.get(id) orelse return error.InvalidSnapshot;
+            if (source.id.raw != id) return error.InvalidSnapshot;
+            staged_total = try addSnapshotStaged(staged_total, source.staged.items.len);
+            streams[i] = .{
+                .id = id,
+                .window = try captureByteWindow(allocator, source.read_offset, source.cap, source.staged.items, source.filled.items, snapshot_max_stream_cap),
+                .flow = source.flow,
+                .final_size = source.final_size,
+                .fin_consumed = source.fin_consumed,
+            };
+            captured_streams += 1;
+        }
+
+        const snapshot: EngineSnapshot = .{
+            .config = self.config,
+            .local = self.local,
+            .spaces = .{ spaces[0].?, spaces[1].?, spaces[2].? },
+            .crypto = .{ crypto[0].?, crypto[1].?, crypto[2].? },
+            .streams = streams,
+            .conn_flow = self.conn_flow,
+            .conn_received_total = self.conn_received_total,
+        };
+        try snapshot.validate();
+        return snapshot;
+    }
+
+    /// Build an independent engine before publication. Validation and any
+    /// allocation failure leave the caller's engine untouched.
+    pub fn restoreSnapshot(allocator: Allocator, snapshot: *const EngineSnapshot) SnapshotError!Engine {
+        try snapshot.validate();
+        var restored = Engine.init(allocator, snapshot.local, snapshot.config);
+        errdefer restored.deinit();
+        for (snapshot.spaces, 0..) |part, i| {
+            const space_ptr = restored.space(snapshotLevel(i));
+            space_ptr.next_outbound = part.next_outbound;
+            space_ptr.largest_acked = part.largest_acked;
+            space_ptr.ack_eliciting_pending = part.ack_eliciting_pending;
+            space_ptr.largest_received = part.largest_received;
+            space_ptr.received.max_ranges = part.received.max_ranges;
+            try space_ptr.received.ranges.appendSlice(allocator, part.received.ranges);
+            const acked = restored.ackedSet(snapshotLevel(i));
+            acked.max_ranges = part.acked.max_ranges;
+            try acked.ranges.appendSlice(allocator, part.acked.ranges);
+        }
+        for (snapshot.crypto, 0..) |part, i| {
+            const stream = restored.cryptoStream(snapshotLevel(i));
+            stream.read_offset = part.read_offset;
+            stream.cap = part.cap;
+            try stream.staged.appendSlice(allocator, part.staged);
+            try stream.filled.appendSlice(allocator, part.filled);
+        }
+        for (snapshot.streams) |part| {
+            {
+                const stream = try allocator.create(StreamRecv);
+                stream.* = StreamRecv.init(StreamId.init(part.id), part.flow.limit, part.window.cap);
+                errdefer {
+                    stream.deinit(allocator);
+                    allocator.destroy(stream);
+                }
+                stream.read_offset = part.window.read_offset;
+                stream.flow = part.flow;
+                stream.final_size = part.final_size;
+                stream.fin_consumed = part.fin_consumed;
+                try stream.staged.appendSlice(allocator, part.window.staged);
+                try stream.filled.appendSlice(allocator, part.window.filled);
+                try restored.streams.put(part.id, stream);
+            }
+        }
+        restored.conn_flow = snapshot.conn_flow;
+        restored.conn_received_total = snapshot.conn_received_total;
+        return restored;
+    }
+
+    /// Replace only after external stream pointers and packet views are
+    /// quiesced; they become invalid when the old engine is deinitialized.
+    pub fn replaceFromSnapshot(self: *Engine, snapshot: *const EngineSnapshot) SnapshotError!void {
+        const replacement = try restoreSnapshot(self.allocator, snapshot);
+        var prior = self.*;
+        self.* = replacement;
+        prior.deinit();
+    }
 };
+
+/// Snapshot bounds are independent of caller-provided Config values. An
+/// oversized live engine fails capture; restore never allocates past these caps.
+pub const snapshot_max_ack_ranges: usize = default_max_ack_ranges;
+pub const snapshot_max_crypto_cap: usize = default_crypto_buffer_cap;
+pub const snapshot_max_stream_cap: usize = default_stream_buffer_cap;
+pub const snapshot_max_streams: usize = 4096;
+pub const snapshot_max_staged_bytes: usize = 64 * 1024 * 1024;
+pub const SnapshotError = error{ InvalidSnapshot, SnapshotTooLarge } || Allocator.Error;
+
+pub const RangeSetSnapshot = struct {
+    max_ranges: usize,
+    ranges: []Range,
+
+    pub fn deinit(self: *RangeSetSnapshot, allocator: Allocator) void {
+        allocator.free(self.ranges);
+        self.* = undefined;
+    }
+
+    fn max(self: *const RangeSetSnapshot) ?u64 {
+        return if (self.ranges.len == 0) null else self.ranges[self.ranges.len - 1].end;
+    }
+
+    fn validate(self: *const RangeSetSnapshot) SnapshotError!void {
+        if (self.max_ranges == 0 or self.max_ranges > snapshot_max_ack_ranges or
+            self.ranges.len > self.max_ranges) return error.InvalidSnapshot;
+        var prior_end: ?u64 = null;
+        for (self.ranges) |range| {
+            if (range.start > range.end or range.end > max_varint) return error.InvalidSnapshot;
+            if (prior_end) |end| {
+                if (end + 1 >= range.start) return error.InvalidSnapshot;
+            }
+            prior_end = range.end;
+        }
+    }
+};
+
+pub const SpaceSnapshot = struct {
+    next_outbound: u64,
+    received: RangeSetSnapshot,
+    largest_acked: ?u64,
+    ack_eliciting_pending: bool,
+    largest_received: ?u64,
+    acked: RangeSetSnapshot,
+
+    pub fn deinit(self: *SpaceSnapshot, allocator: Allocator) void {
+        self.received.deinit(allocator);
+        self.acked.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn validate(self: *const SpaceSnapshot) SnapshotError!void {
+        try self.received.validate();
+        try self.acked.validate();
+        if (self.next_outbound > max_varint or
+            self.largest_acked != self.acked.max() or
+            (self.ack_eliciting_pending and self.largest_received == null))
+            return error.InvalidSnapshot;
+        if (self.received.max()) |retained_max| {
+            if (self.largest_received == null or self.largest_received.? < retained_max or
+                self.largest_received.? > max_varint) return error.InvalidSnapshot;
+        } else if (self.largest_received != null) return error.InvalidSnapshot;
+        if (self.largest_acked) |pn| {
+            if (pn >= self.next_outbound) return error.InvalidSnapshot;
+        }
+    }
+};
+
+/// Staging holes are encoded as zero bytes. The bool slice is the source of
+/// truth; no uninitialized bytes from ArrayList capacity reach the DTO.
+pub const ByteWindowSnapshot = struct {
+    read_offset: u64,
+    cap: usize,
+    staged: []u8,
+    filled: []bool,
+
+    pub fn deinit(self: *ByteWindowSnapshot, allocator: Allocator) void {
+        allocator.free(self.staged);
+        allocator.free(self.filled);
+        self.* = undefined;
+    }
+
+    fn validate(self: *const ByteWindowSnapshot, max_cap: usize) SnapshotError!void {
+        if (self.cap == 0 or self.cap > max_cap or self.staged.len != self.filled.len or
+            self.staged.len > self.cap or self.read_offset > max_varint)
+            return error.InvalidSnapshot;
+        const end = std.math.add(u64, self.read_offset, self.staged.len) catch return error.InvalidSnapshot;
+        if (end > max_varint) return error.InvalidSnapshot;
+        for (self.staged, self.filled) |byte, filled| {
+            if (!filled and byte != 0) return error.InvalidSnapshot;
+        }
+    }
+};
+
+pub const StreamSnapshot = struct {
+    id: u64,
+    window: ByteWindowSnapshot,
+    flow: FlowController,
+    final_size: ?u64,
+    fin_consumed: bool,
+
+    pub fn deinit(self: *StreamSnapshot, allocator: Allocator) void {
+        self.window.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Complete owned state of Engine. Stream entries are sorted by raw stream ID,
+/// so a later field-wise wire codec has one canonical traversal order.
+pub const EngineSnapshot = struct {
+    config: Config,
+    local: Initiator,
+    spaces: [3]SpaceSnapshot,
+    crypto: [3]ByteWindowSnapshot,
+    streams: []StreamSnapshot,
+    conn_flow: FlowController,
+    conn_received_total: u64,
+
+    pub fn deinit(self: *EngineSnapshot, allocator: Allocator) void {
+        for (&self.spaces) |*part| part.deinit(allocator);
+        for (&self.crypto) |*part| part.deinit(allocator);
+        for (self.streams) |*stream| stream.deinit(allocator);
+        allocator.free(self.streams);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: *const EngineSnapshot) SnapshotError!void {
+        if (self.config.max_ack_ranges == 0 or self.config.max_ack_ranges > snapshot_max_ack_ranges or
+            self.config.crypto_buffer_cap == 0 or self.config.crypto_buffer_cap > snapshot_max_crypto_cap or
+            self.config.stream_buffer_cap == 0 or self.config.stream_buffer_cap > snapshot_max_stream_cap or
+            self.config.max_streams > snapshot_max_streams or
+            self.config.initial_max_data > max_varint or
+            self.config.initial_max_stream_data > max_varint or
+            self.streams.len > self.config.max_streams)
+            return error.SnapshotTooLarge;
+        if (self.conn_flow.limit < self.config.initial_max_data or
+            self.conn_flow.limit > max_varint or
+            self.conn_flow.received != self.conn_received_total or
+            self.conn_received_total > self.conn_flow.limit)
+            return error.InvalidSnapshot;
+
+        var staged_total: usize = 0;
+        for (&self.spaces) |*part| {
+            try part.validate();
+            if (part.received.max_ranges != self.config.max_ack_ranges or
+                part.acked.max_ranges != self.config.max_ack_ranges) return error.InvalidSnapshot;
+        }
+        for (&self.crypto) |*part| {
+            try part.validate(snapshot_max_crypto_cap);
+            if (part.cap != self.config.crypto_buffer_cap) return error.InvalidSnapshot;
+            staged_total = try addSnapshotStaged(staged_total, part.staged.len);
+        }
+
+        var previous_id: ?u64 = null;
+        var received_sum: u64 = 0;
+        for (self.streams) |*stream| {
+            if (stream.id > max_varint) return error.InvalidSnapshot;
+            if (previous_id) |id| {
+                if (stream.id <= id) return error.InvalidSnapshot;
+            }
+            previous_id = stream.id;
+            const sid = StreamId.init(stream.id);
+            if (sid.isUnidirectional() and !sid.peerInitiated(self.local)) return error.InvalidSnapshot;
+            try stream.window.validate(snapshot_max_stream_cap);
+            if (stream.window.cap != self.config.stream_buffer_cap) return error.InvalidSnapshot;
+            staged_total = try addSnapshotStaged(staged_total, stream.window.staged.len);
+            if (stream.flow.limit < self.config.initial_max_stream_data or
+                stream.flow.limit > max_varint or stream.flow.received > stream.flow.limit or
+                stream.window.read_offset > stream.flow.received or
+                stream.window.staged.len > stream.flow.received - stream.window.read_offset)
+                return error.InvalidSnapshot;
+            if (stream.final_size) |size| {
+                if (size != stream.flow.received or size < stream.window.read_offset)
+                    return error.InvalidSnapshot;
+            }
+            if (stream.fin_consumed and (stream.final_size == null or
+                stream.window.read_offset != stream.final_size.?)) return error.InvalidSnapshot;
+            received_sum = std.math.add(u64, received_sum, stream.flow.received) catch return error.InvalidSnapshot;
+        }
+        if (received_sum != self.conn_received_total) return error.InvalidSnapshot;
+    }
+};
+
+fn snapshotLevel(i: usize) EncryptionLevel {
+    return switch (i) {
+        0 => .initial,
+        1 => .handshake,
+        2 => .application,
+        else => unreachable,
+    };
+}
+
+fn addSnapshotStaged(current: usize, added: usize) SnapshotError!usize {
+    const total = std.math.add(usize, current, added) catch return error.SnapshotTooLarge;
+    if (total > snapshot_max_staged_bytes) return error.SnapshotTooLarge;
+    return total;
+}
+
+fn captureRangeSet(allocator: Allocator, source: *const RangeSet) SnapshotError!RangeSetSnapshot {
+    if (source.ranges.items.len > snapshot_max_ack_ranges) return error.SnapshotTooLarge;
+    return .{ .max_ranges = source.max_ranges, .ranges = try allocator.dupe(Range, source.ranges.items) };
+}
+
+fn captureSpaceSnapshot(allocator: Allocator, source: *const PacketNumberSpace, acked: *const RangeSet) SnapshotError!SpaceSnapshot {
+    var received = try captureRangeSet(allocator, &source.received);
+    errdefer received.deinit(allocator);
+    const acked_snapshot = try captureRangeSet(allocator, acked);
+    return .{
+        .next_outbound = source.next_outbound,
+        .received = received,
+        .largest_acked = source.largest_acked,
+        .ack_eliciting_pending = source.ack_eliciting_pending,
+        .largest_received = source.largest_received,
+        .acked = acked_snapshot,
+    };
+}
+
+fn captureByteWindow(
+    allocator: Allocator,
+    read_offset: u64,
+    cap: usize,
+    staged: []const u8,
+    filled: []const bool,
+    max_cap: usize,
+) SnapshotError!ByteWindowSnapshot {
+    if (staged.len != filled.len) return error.InvalidSnapshot;
+    if (staged.len > max_cap) return error.SnapshotTooLarge;
+    const bytes = try allocator.alloc(u8, staged.len);
+    errdefer allocator.free(bytes);
+    const flags = try allocator.dupe(bool, filled);
+    for (filled, 0..) |is_filled, i| {
+        bytes[i] = if (is_filled) staged[i] else 0;
+    }
+    return .{ .read_offset = read_offset, .cap = cap, .staged = bytes, .filled = flags };
+}
 
 // ===========================================================================
 // Tests (RFC 9000 §12.3 / §13 / §19.3 / §19.6 / §19.8)
@@ -1579,4 +1937,178 @@ test "range set coalesces and tolerates duplicates" {
     try testing.expectEqual(@as(?u64, 7), rs.max());
     try rs.insert(allocator, 2); // bridges 1..3
     try testing.expectEqual(@as(usize, 2), rs.count()); // {1..3},{5..7}
+}
+
+fn engineSnapshotFixture(allocator: Allocator) !Engine {
+    var engine = Engine.init(allocator, .server, .{
+        .max_ack_ranges = 8,
+        .crypto_buffer_cap = 64,
+        .stream_buffer_cap = 64,
+        .initial_max_data = 100,
+        .initial_max_stream_data = 64,
+        .max_streams = 4,
+    });
+    errdefer engine.deinit();
+    _ = engine.space(.initial).nextPacketNumber();
+    for (0..4) |_| _ = engine.space(.application).nextPacketNumber();
+
+    var newly: std.ArrayList(u64) = .empty;
+    defer newly.deinit(allocator);
+    _ = try engine.intake(.initial, 5, &.{.{ .CRYPTO = .{ .offset = 4, .len = 2, .data = "ef" } }}, &newly);
+    _ = try engine.intake(.initial, 2, &.{.{ .PING = {} }}, &newly);
+    _ = try engine.intake(.application, 7, &.{.{ .STREAM = .{ .stream_id = 4, .offset = 5, .fin = true, .len = 5, .data = "world" } }}, &newly);
+    _ = try engine.intake(.application, 1, &.{.{ .STREAM = .{ .stream_id = 0, .offset = 0, .fin = false, .len = 2, .data = "hi" } }}, &newly);
+    _ = try engine.intake(.application, 3, &.{.{ .ACK = .{ .largest = 2, .first_range = 1 } }}, &newly);
+    _ = engine.getStream(0).?.consume(1);
+    engine.getStream(0).?.flow.setLimit(80);
+    engine.setMaxData(120);
+    return engine;
+}
+
+test "Engine snapshot roundtrips ACK, CRYPTO gaps, sorted streams and flow state" {
+    const allocator = testing.allocator;
+    var source = try engineSnapshotFixture(allocator);
+    defer source.deinit();
+    var snapshot = try source.captureSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+    try snapshot.validate();
+    try testing.expectEqualSlices(u64, &.{ 0, 4 }, &.{ snapshot.streams[0].id, snapshot.streams[1].id });
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 'e', 'f' }, snapshot.crypto[0].staged);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 'w', 'o', 'r', 'l', 'd' }, snapshot.streams[1].window.staged);
+
+    var restored = try Engine.restoreSnapshot(allocator, &snapshot);
+    defer restored.deinit();
+    var recaptured = try restored.captureSnapshot(allocator);
+    defer recaptured.deinit(allocator);
+    try testing.expectEqualDeep(snapshot, recaptured);
+
+    var source_ack = (try source.space(.initial).buildAck(allocator, 7)).?;
+    defer source_ack.deinit(allocator);
+    var restored_ack = (try restored.space(.initial).buildAck(allocator, 7)).?;
+    defer restored_ack.deinit(allocator);
+    try testing.expectEqualDeep(source_ack.frame, restored_ack.frame);
+
+    try source.cryptoStream(.initial).receive(allocator, 0, "abcd");
+    try restored.cryptoStream(.initial).receive(allocator, 0, "abcd");
+    try testing.expectEqualSlices(u8, source.cryptoStream(.initial).peek(), restored.cryptoStream(.initial).peek());
+    var source_newly: std.ArrayList(u64) = .empty;
+    defer source_newly.deinit(allocator);
+    var restored_newly: std.ArrayList(u64) = .empty;
+    defer restored_newly.deinit(allocator);
+    const head = &[_]Frame{.{ .STREAM = .{ .stream_id = 4, .offset = 0, .fin = false, .len = 5, .data = "hello" } }};
+    _ = try source.intake(.application, 8, head, &source_newly);
+    _ = try restored.intake(.application, 8, head, &restored_newly);
+    try testing.expectEqualSlices(u8, source.getStream(4).?.peek(), restored.getStream(4).?.peek());
+    try testing.expectEqual(source.conn_received_total, restored.conn_received_total);
+}
+
+test "Engine snapshot rejects malformed joins and noncanonical staging" {
+    const allocator = testing.allocator;
+    var source = try engineSnapshotFixture(allocator);
+    defer source.deinit();
+    var snapshot = try source.captureSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    snapshot.streams[1].id = snapshot.streams[0].id;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.streams[1].id = 4;
+
+    snapshot.crypto[0].staged[0] = 1;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.crypto[0].staged[0] = 0;
+
+    snapshot.conn_received_total += 1;
+    var target = Engine.init(allocator, .client, .{});
+    defer target.deinit();
+    try testing.expectError(error.InvalidSnapshot, target.replaceFromSnapshot(&snapshot));
+    try testing.expectEqual(@as(usize, 0), target.streams.count());
+    try testing.expectEqual(Initiator.client, target.local);
+    snapshot.conn_received_total -= 1;
+
+    const original_start = snapshot.spaces[0].received.ranges[1].start;
+    snapshot.spaces[0].received.ranges[1].start = snapshot.spaces[0].received.ranges[0].end + 1;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.spaces[0].received.ranges[1].start = original_start;
+
+    snapshot.streams[1].final_size = 9;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.streams[1].final_size = 10;
+
+    snapshot.crypto[0].cap += 1;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.crypto[0].cap -= 1;
+    snapshot.streams[1].window.cap += 1;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.streams[1].window.cap -= 1;
+    snapshot.spaces[0].received.max_ranges += 1;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.spaces[0].received.max_ranges -= 1;
+    try snapshot.validate();
+}
+
+test "Engine snapshot preserves high received PN cache after capped range eviction" {
+    const allocator = testing.allocator;
+    var source = Engine.init(allocator, .server, .{ .max_ack_ranges = 1 });
+    defer source.deinit();
+    try source.space(.application).recordReceived(allocator, 10, true);
+    try source.space(.application).recordReceived(allocator, 0, true);
+    try testing.expectEqual(@as(?u64, 10), source.space(.application).largest_received);
+    try testing.expectEqual(@as(?u64, 0), source.space(.application).received.max());
+    var snapshot = try source.captureSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+    var restored = try Engine.restoreSnapshot(allocator, &snapshot);
+    defer restored.deinit();
+    try testing.expectEqual(@as(?u64, 10), restored.space(.application).largest_received);
+    try testing.expectEqual(@as(?u64, 0), restored.space(.application).received.max());
+}
+
+test "Engine snapshot final-size invariant rejects FIN below received data" {
+    const allocator = testing.allocator;
+    var stream = StreamRecv.init(StreamId.init(0), 64, 64);
+    defer stream.deinit(allocator);
+    try stream.receive(allocator, 0, false, "abcdefghij");
+    try testing.expectError(error.FinalSizeError, stream.receive(allocator, 5, true, ""));
+    try testing.expectEqual(@as(?u64, null), stream.final_size);
+    try testing.expectEqual(@as(u64, 10), stream.flow.received);
+}
+
+test "Engine snapshot capture and replacement are allocation-failure atomic" {
+    const allocator = testing.allocator;
+    var source = try engineSnapshotFixture(allocator);
+    defer source.deinit();
+    var snapshot = try source.captureSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    const CaptureSweep = struct {
+        fn run(failing: Allocator, original: *const Engine) !void {
+            var captured = original.captureSnapshot(failing) catch |err| {
+                try testing.expectEqual(@as(usize, 2), original.streams.count());
+                return err;
+            };
+            captured.deinit(failing);
+        }
+    };
+    try testing.checkAllAllocationFailures(allocator, CaptureSweep.run, .{&source});
+
+    const RestoreSweep = struct {
+        fn run(failing: Allocator, saved: *const EngineSnapshot) !void {
+            var target = Engine.init(failing, .client, .{});
+            defer target.deinit();
+            target.replaceFromSnapshot(saved) catch |err| {
+                try testing.expectEqual(@as(usize, 0), target.streams.count());
+                try testing.expectEqual(Initiator.client, target.local);
+                return err;
+            };
+            try testing.expectEqual(@as(usize, 2), target.streams.count());
+            try testing.expectEqual(Initiator.server, target.local);
+        }
+    };
+    try testing.checkAllAllocationFailures(allocator, RestoreSweep.run, .{&snapshot});
+}
+
+test "Engine snapshot rejects oversized live configuration" {
+    const allocator = testing.allocator;
+    var source = Engine.init(allocator, .server, .{ .stream_buffer_cap = snapshot_max_stream_cap + 1 });
+    defer source.deinit();
+    try testing.expectError(error.SnapshotTooLarge, source.captureSnapshot(allocator));
 }

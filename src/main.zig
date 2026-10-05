@@ -3195,7 +3195,10 @@ pub fn main(init: std.process.Init) !void {
         // with IPV6_V6ONLY=0, so `any_be` binds [::] and serves both IPv6 and
         // IPv4 (mapped) QUIC clients on one socket.
         const wt_start = if (comptime builtin.os.tag == .windows) blk: {
-            try wt_listener.?.prepareColdResources(init.io, .any, srv_cfg.webtransport_port);
+            wt_listener.?.prepareColdResources(init.io, .any, srv_cfg.webtransport_port) catch |err| {
+                std.debug.print("onyx-server: WebTransport bind failed on UDP :{d} ({s})\n", .{ srv_cfg.webtransport_port, @errorName(err) });
+                return err;
+            };
             break :blk wt_listener.?.startPreparedLegacyWorker();
         } else wt_listener.?.start(onyx_server.daemon.webtransport_listener.any_be, srv_cfg.webtransport_port);
         wt_start catch |err| {

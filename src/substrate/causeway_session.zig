@@ -29,6 +29,25 @@ pub const Participant = struct {
     connected: bool = true,
 };
 
+/// A session owns the codec set it uses for forwarding decisions. Bridge
+/// values live in movable hash-map storage, so retaining a slice into a bridge
+/// member would leave a stale pointer after map growth or Helix restoration.
+pub const max_participant_codecs: usize = 8;
+
+pub const StoredParticipant = struct {
+    id: u64,
+    leg: Leg,
+    codecs: [max_participant_codecs]Codec = @splat(.cadencevox),
+    codec_count: u8 = 0,
+    stream_id: u32 = 0,
+    ssrc: u32 = 0,
+    connected: bool = true,
+
+    fn codecSlice(self: *const StoredParticipant) []const Codec {
+        return self.codecs[0..self.codec_count];
+    }
+};
+
 /// One forward destination for a relayed frame.
 pub const Egress = struct {
     id: u64,
@@ -40,9 +59,9 @@ pub const Egress = struct {
 pub fn Session(comptime max_participants: usize) type {
     return struct {
         const Self = @This();
-        pub const Error = error{Full};
+        pub const Error = error{ Full, TooManyCodecs };
 
-        participants: [max_participants]Participant = undefined,
+        participants: [max_participants]StoredParticipant = undefined,
         len: usize = 0,
         /// The codec common to every participant, or null when none is shared
         /// (the SFU never transcodes, so a null here means the call cannot run as
@@ -51,7 +70,17 @@ pub fn Session(comptime max_participants: usize) type {
 
         pub fn join(self: *Self, p: Participant) Error!void {
             if (self.len >= max_participants) return error.Full;
-            self.participants[self.len] = p;
+            if (p.codecs.len > max_participant_codecs) return error.TooManyCodecs;
+            var owned = StoredParticipant{
+                .id = p.id,
+                .leg = p.leg,
+                .codec_count = @intCast(p.codecs.len),
+                .stream_id = p.stream_id,
+                .ssrc = p.ssrc,
+                .connected = p.connected,
+            };
+            @memcpy(owned.codecs[0..p.codecs.len], p.codecs);
+            self.participants[self.len] = owned;
             self.len += 1;
             self.recompute();
         }
@@ -69,7 +98,7 @@ pub fn Session(comptime max_participants: usize) type {
             return false;
         }
 
-        pub fn get(self: *Self, id: u64) ?*Participant {
+        pub fn get(self: *Self, id: u64) ?*StoredParticipant {
             for (self.participants[0..self.len]) |*p| {
                 if (p.id == id) return p;
             }
@@ -83,7 +112,7 @@ pub fn Session(comptime max_participants: usize) type {
                 return;
             }
             var sets: [max_participants][]const Codec = undefined;
-            for (self.participants[0..self.len], 0..) |p, i| sets[i] = p.codecs;
+            for (self.participants[0..self.len], 0..) |*p, i| sets[i] = p.codecSlice();
             self.codec = causeway.selectCommon(sets[0..self.len]);
         }
 
@@ -146,4 +175,16 @@ test "leave recomputes the shared codec; Full at capacity" {
     try testing.expect(s.leave(2));
     try testing.expectEqual(Codec.cadencevox, s.codec.?); // only the native client's first shared codec remains
     try testing.expect(!s.leave(99));
+}
+
+test "session owns the joined codec set after caller storage changes" {
+    var s = Session(3){};
+    var codecs = [_]Codec{ .cadencevox, .cadencevis };
+    try s.join(.{ .id = 1, .leg = .native, .codecs = &codecs });
+    codecs[0] = .raw;
+    try s.join(.{ .id = 2, .leg = .webrtc, .codecs = &.{.cadencevox} });
+    try testing.expectEqual(Codec.cadencevox, s.codec.?);
+    var too_many: [max_participant_codecs + 1]Codec = undefined;
+    @memset(&too_many, .cadencevox);
+    try testing.expectError(error.TooManyCodecs, s.join(.{ .id = 3, .leg = .native, .codecs = &too_many }));
 }

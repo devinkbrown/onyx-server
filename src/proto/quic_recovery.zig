@@ -919,7 +919,236 @@ pub const Recovery = struct {
     pub fn smoothedRtt(self: *const Recovery) u64 {
         return self.rtt.smoothed_rtt;
     }
+
+    /// Capture only logical recovery state. Packet frame tails are normalized so
+    /// no uninitialized inline storage escapes into a later wire encoder.
+    /// The caller must own an operation boundary: scratch slices returned by an
+    /// ACK/timeout call cannot be borrowed while this snapshot is taken.
+    pub fn captureSnapshot(self: *const Recovery, allocator: Allocator) SnapshotError!Snapshot {
+        var owned: [3]?RegistrySnapshot = .{ null, null, null };
+        errdefer for (&owned) |*part| if (part.*) |value| allocator.free(value.packets);
+
+        for (&self.sent, 0..) |*reg, i| {
+            if (reg.max_sent == 0 or reg.max_sent > snapshot_max_packets_per_space or
+                reg.packets.items.len > reg.max_sent) return error.InvalidSnapshot;
+            for (reg.packets.items) |packet| {
+                if (packet.frames.len > FrameList.cap) return error.InvalidSnapshot;
+            }
+            const packets = try allocator.alloc(SentPacket, reg.packets.items.len);
+            for (reg.packets.items, packets) |source, *dst| {
+                dst.* = canonicalPacket(source);
+            }
+            owned[i] = .{
+                .max_sent = reg.max_sent,
+                .packets = packets,
+                .largest_sent_ack_eliciting = reg.largest_sent_ack_eliciting,
+                .last_ack_eliciting_sent_ns = reg.last_ack_eliciting_sent_ns,
+            };
+        }
+        if (self.lost_scratch.items.len > snapshot_max_scratch_frames or
+            self.acked_scratch.items.len > snapshot_max_scratch_frames)
+            return error.SnapshotTooLarge;
+        const lost = try allocator.dupe(LostFrame, self.lost_scratch.items);
+        errdefer allocator.free(lost);
+        const acked = try allocator.dupe(LostFrame, self.acked_scratch.items);
+        errdefer allocator.free(acked);
+
+        const snapshot: Snapshot = .{
+            .rtt = self.rtt,
+            .cc = self.cc,
+            .max_ack_delay_ns = self.max_ack_delay_ns,
+            .handshake_confirmed = self.handshake_confirmed,
+            .pto_count = self.pto_count,
+            .sent = .{ owned[0].?, owned[1].?, owned[2].? },
+            .lost_scratch = lost,
+            .acked_scratch = acked,
+        };
+        try snapshot.validate();
+        return snapshot;
+    }
+
+    /// Build an independent controller before publication. No source field is
+    /// touched on validation or allocation failure.
+    pub fn restoreSnapshot(allocator: Allocator, snapshot: *const Snapshot) SnapshotError!Recovery {
+        try snapshot.validate();
+        var restored = Recovery.init(allocator, .{
+            .max_datagram = snapshot.cc.max_datagram,
+            .max_ack_delay_ns = snapshot.max_ack_delay_ns,
+        });
+        errdefer restored.deinit();
+        for (snapshot.sent, 0..) |part, i| {
+            restored.sent[i].max_sent = part.max_sent;
+            restored.sent[i].largest_sent_ack_eliciting = part.largest_sent_ack_eliciting;
+            restored.sent[i].last_ack_eliciting_sent_ns = part.last_ack_eliciting_sent_ns;
+            try restored.sent[i].packets.appendSlice(allocator, part.packets);
+        }
+        try restored.lost_scratch.appendSlice(allocator, snapshot.lost_scratch);
+        try restored.acked_scratch.appendSlice(allocator, snapshot.acked_scratch);
+        restored.rtt = snapshot.rtt;
+        restored.cc = snapshot.cc;
+        restored.handshake_confirmed = snapshot.handshake_confirmed;
+        restored.pto_count = snapshot.pto_count;
+        return restored;
+    }
+
+    /// Atomic replacement for an owner whose caller-held recovery views have
+    /// already been quiesced. The old controller is released only after the new
+    /// one is fully validated and allocated.
+    pub fn replaceFromSnapshot(self: *Recovery, snapshot: *const Snapshot) SnapshotError!void {
+        const replacement = try restoreSnapshot(self.allocator, snapshot);
+        var prior = self.*;
+        self.* = replacement;
+        prior.deinit();
+    }
 };
+
+/// The DTO is bounded independently of a caller's tunable registry capacity.
+/// Larger live states fail capture and leave the source controller untouched.
+pub const snapshot_max_packets_per_space: usize = default_max_sent;
+pub const snapshot_max_scratch_frames: usize = 3 * snapshot_max_packets_per_space * FrameList.cap;
+pub const SnapshotError = error{ InvalidSnapshot, SnapshotTooLarge } || Allocator.Error;
+
+pub const RegistrySnapshot = struct {
+    max_sent: usize,
+    packets: []SentPacket,
+    largest_sent_ack_eliciting: ?u64,
+    last_ack_eliciting_sent_ns: ?u64,
+};
+
+/// Owned, logically canonical recovery state. A future wire codec must encode
+/// fields, never raw struct memory or allocator-dependent slice pointers.
+pub const Snapshot = struct {
+    rtt: RttEstimator,
+    cc: Congestion,
+    max_ack_delay_ns: u64,
+    handshake_confirmed: bool,
+    pto_count: u32,
+    sent: [3]RegistrySnapshot,
+    lost_scratch: []LostFrame,
+    acked_scratch: []LostFrame,
+
+    pub fn deinit(self: *Snapshot, allocator: Allocator) void {
+        for (self.sent) |part| allocator.free(part.packets);
+        allocator.free(self.lost_scratch);
+        allocator.free(self.acked_scratch);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: *const Snapshot) SnapshotError!void {
+        if (self.cc.max_datagram == 0 or self.cc.max_datagram > 65_535) return error.InvalidSnapshot;
+        const min_window = minimum_window_packets * self.cc.max_datagram;
+        if (self.cc.congestion_window < min_window or self.cc.ssthresh < min_window)
+            return error.InvalidSnapshot;
+        // The sent registry can drop old packets, and path migration resets CC
+        // while retaining them. Its byte count therefore cannot be derived from
+        // the registries, but each scalar must remain safe for its next update.
+        if (self.cc.congestion_window > std.math.maxInt(u64) - self.cc.max_datagram or
+            self.cc.bytes_in_flight > std.math.maxInt(u64) - self.cc.max_datagram or
+            self.pto_count == std.math.maxInt(u32)) return error.InvalidSnapshot;
+        if (self.cc.recovery_start_ns) |start| {
+            if (start > snapshot_max_clock_ns) return error.InvalidSnapshot;
+        }
+        if (!self.rtt.has_sample) {
+            if (self.rtt.latest_rtt != 0 or self.rtt.min_rtt != 0 or
+                self.rtt.smoothed_rtt != 0 or self.rtt.rttvar != 0) return error.InvalidSnapshot;
+        } else if (self.rtt.min_rtt > self.rtt.latest_rtt or
+            self.rtt.min_rtt > self.rtt.smoothed_rtt) return error.InvalidSnapshot;
+        try validateSnapshotTimers(self);
+
+        for (self.sent) |part| {
+            if (part.max_sent == 0 or part.max_sent > snapshot_max_packets_per_space or
+                part.packets.len > part.max_sent) return error.InvalidSnapshot;
+            if ((part.largest_sent_ack_eliciting == null) != (part.last_ack_eliciting_sent_ns == null))
+                return error.InvalidSnapshot;
+            if (part.largest_sent_ack_eliciting) |pn| {
+                if (pn > max_quic_varint or part.last_ack_eliciting_sent_ns.? > snapshot_max_clock_ns)
+                    return error.InvalidSnapshot;
+            }
+            var prior_pn: ?u64 = null;
+            var prior_time: ?u64 = null;
+            for (part.packets) |packet| {
+                if (packet.packet_number > max_quic_varint or packet.time_sent_ns > snapshot_max_clock_ns or
+                    packet.sent_bytes == 0 or
+                    packet.sent_bytes > self.cc.max_datagram or packet.frames.len > FrameList.cap or
+                    (!packet.ack_eliciting and packet.frames.len != 0))
+                    return error.InvalidSnapshot;
+                if (prior_pn) |pn| if (packet.packet_number <= pn) return error.InvalidSnapshot;
+                if (prior_time) |time| if (packet.time_sent_ns < time) return error.InvalidSnapshot;
+                prior_pn = packet.packet_number;
+                prior_time = packet.time_sent_ns;
+                if (packet.ack_eliciting) {
+                    if (part.largest_sent_ack_eliciting == null or
+                        packet.packet_number > part.largest_sent_ack_eliciting.? or
+                        packet.time_sent_ns > part.last_ack_eliciting_sent_ns.?) return error.InvalidSnapshot;
+                }
+                for (packet.frames.items[0..packet.frames.len]) |frame| try validateSnapshotFrame(frame);
+                for (packet.frames.items[packet.frames.len..]) |frame| {
+                    if (std.meta.activeTag(frame) != .ping) return error.InvalidSnapshot;
+                }
+            }
+        }
+        if (self.lost_scratch.len > snapshot_max_scratch_frames or
+            self.acked_scratch.len > snapshot_max_scratch_frames)
+            return error.SnapshotTooLarge;
+        for (self.lost_scratch) |frame| try validateSnapshotFrame(frame);
+        for (self.acked_scratch) |frame| try validateSnapshotFrame(frame);
+    }
+};
+
+const max_quic_varint: u64 = (1 << 62) - 1;
+// A sent timestamp plus either validated loss/PTO duration cannot overflow.
+// This still permits nearly 292 years of nanosecond-clock uptime.
+const snapshot_max_clock_ns: u64 = std.math.maxInt(u64) / 2;
+
+fn validateSnapshotTimers(snapshot: *const Snapshot) SnapshotError!void {
+    const rtt = snapshot.rtt;
+    const smoothed = if (rtt.has_sample) rtt.smoothed_rtt else default_initial_rtt_ns;
+    const rttvar = if (rtt.has_sample) rtt.rttvar else default_initial_rtt_ns / 2;
+    // RttEstimator.update uses 7*smoothed and 3*rttvar before averaging.
+    if (smoothed > std.math.maxInt(u64) / 7) return error.InvalidSnapshot;
+    const loss_base = @max(rtt.smoothed_rtt, rtt.latest_rtt);
+    const loss_scaled = std.math.mul(u64, loss_base, time_threshold_num) catch return error.InvalidSnapshot;
+    if (@max(loss_scaled / time_threshold_den, granularity_ns) > snapshot_max_clock_ns)
+        return error.InvalidSnapshot;
+    const variance = std.math.mul(u64, rttvar, 4) catch return error.InvalidSnapshot;
+    var pto_base = std.math.add(u64, smoothed, @max(variance, granularity_ns)) catch return error.InvalidSnapshot;
+    // Include max_ack_delay even before handshake confirmation: that transition
+    // must not turn an accepted snapshot into an overflowing timer.
+    pto_base = std.math.add(u64, pto_base, snapshot.max_ack_delay_ns) catch return error.InvalidSnapshot;
+    _ = std.math.mul(u64, pto_base, persistent_congestion_threshold) catch return error.InvalidSnapshot;
+    const shift: u6 = @intCast(@min(snapshot.pto_count, 32));
+    const factor = @as(u64, 1) << shift;
+    const pto = std.math.mul(u64, pto_base, factor) catch return error.InvalidSnapshot;
+    if (pto > snapshot_max_clock_ns) return error.InvalidSnapshot;
+}
+
+fn canonicalPacket(source: SentPacket) SentPacket {
+    var frames: FrameList = .{ .items = @splat(.ping), .len = source.frames.len };
+    @memcpy(frames.items[0..source.frames.len], source.frames.items[0..source.frames.len]);
+    return .{
+        .packet_number = source.packet_number,
+        .time_sent_ns = source.time_sent_ns,
+        .in_flight = source.in_flight,
+        .ack_eliciting = source.ack_eliciting,
+        .sent_bytes = source.sent_bytes,
+        .frames = frames,
+        .retired = source.retired,
+    };
+}
+
+fn validateSnapshotFrame(frame: LostFrame) SnapshotError!void {
+    switch (frame) {
+        .crypto => |range| {
+            if (range.offset > max_quic_varint or range.len > max_quic_varint - range.offset)
+                return error.InvalidSnapshot;
+        },
+        .stream => |range| {
+            if (range.stream_id > max_quic_varint or range.offset > max_quic_varint or
+                range.len > max_quic_varint - range.offset) return error.InvalidSnapshot;
+        },
+        .ping => {},
+    }
+}
 
 /// RFC 9002 §6.2.2 kInitialRtt — the assumed RTT before the first sample.
 pub const default_initial_rtt_ns: u64 = 333 * std.time.ns_per_ms;
@@ -1306,4 +1535,214 @@ test "recovery — sent registry bounds and drops oldest on overflow" {
     try testing.expectEqual(@as(usize, 4), reg.packets.items.len);
     try testing.expectEqual(@as(u64, 2), reg.packets.items[0].packet_number);
     try testing.expectEqual(@as(u64, 5), reg.packets.items[3].packet_number);
+}
+
+fn snapshotFixture(allocator: Allocator) !Recovery {
+    var rec = Recovery.init(allocator, .{ .max_datagram = 1252 });
+    errdefer rec.deinit();
+    rec.setHandshakeConfirmed();
+    rec.setMaxAckDelay(15 * ms);
+    rec.rtt.update(50 * ms, 0, 15 * ms, true);
+
+    var first_frames = FrameList{};
+    first_frames.append(.{ .stream = .{ .stream_id = 4, .offset = 20, .len = 80, .fin = false } });
+    try rec.onPacketSent(.application, .{
+        .packet_number = 1,
+        .time_sent_ns = 100 * ms,
+        .in_flight = true,
+        .ack_eliciting = true,
+        .sent_bytes = 1200,
+        .frames = first_frames,
+    });
+    var second_frames = FrameList{};
+    second_frames.append(.ping);
+    try rec.onPacketSent(.application, .{
+        .packet_number = 4,
+        .time_sent_ns = 110 * ms,
+        .in_flight = true,
+        .ack_eliciting = true,
+        .sent_bytes = 1200,
+        .frames = second_frames,
+    });
+    rec.cc.onCongestionEvent(100 * ms, 120 * ms);
+    _ = try rec.onPtoExpired();
+    return rec;
+}
+
+test "Recovery snapshot preserves retransmission, timers, congestion and canonical frame tails" {
+    const allocator = testing.allocator;
+    var source = try snapshotFixture(allocator);
+    defer source.deinit();
+    var snapshot = try source.captureSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+    try snapshot.validate();
+    try testing.expectEqual(@as(usize, 1), snapshot.sent[2].packets[0].frames.len);
+    for (snapshot.sent[2].packets[0].frames.items[1..]) |unused|
+        try testing.expectEqual(@as(std.meta.Tag(LostFrame), .ping), std.meta.activeTag(unused));
+
+    var restored = try Recovery.restoreSnapshot(allocator, &snapshot);
+    defer restored.deinit();
+    var recaptured = try restored.captureSnapshot(allocator);
+    defer recaptured.deinit(allocator);
+    try testing.expectEqualDeep(snapshot, recaptured);
+    try testing.expectEqualDeep(source.nextTimer(130 * ms), restored.nextTimer(130 * ms));
+
+    const expected = try source.onAckReceived(.application, &.{4}, 4, 0, 150 * ms);
+    const actual = try restored.onAckReceived(.application, &.{4}, 4, 0, 150 * ms);
+    try testing.expectEqualDeep(expected.lost_frames, actual.lost_frames);
+    try testing.expectEqualDeep(expected.acked_frames, actual.acked_frames);
+    try testing.expectEqual(@as(usize, 1), actual.lost_frames.len);
+    try testing.expectEqual(@as(u64, 4), actual.lost_frames[0].stream.stream_id);
+    try testing.expectEqual(source.bytesInFlight(), restored.bytesInFlight());
+    try testing.expectEqual(source.congestionWindow(), restored.congestionWindow());
+    try testing.expectEqual(source.pto_count, restored.pto_count);
+}
+
+test "Recovery snapshot rejects duplicate packets, malformed frames and bad counters" {
+    const allocator = testing.allocator;
+    var source = try snapshotFixture(allocator);
+    defer source.deinit();
+    var snapshot = try source.captureSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    const original_pn = snapshot.sent[2].packets[1].packet_number;
+    snapshot.sent[2].packets[1].packet_number = snapshot.sent[2].packets[0].packet_number;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.sent[2].packets[1].packet_number = original_pn;
+
+    snapshot.sent[2].packets[0].frames.len = @intCast(FrameList.cap + 1);
+    try testing.expectError(error.InvalidSnapshot, Recovery.restoreSnapshot(allocator, &snapshot));
+    snapshot.sent[2].packets[0].frames.len = 1;
+
+    snapshot.sent[2].packets[0].frames.items[7] = .{ .crypto = .{ .offset = 0, .len = 1 } };
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.sent[2].packets[0].frames.items[7] = .ping;
+
+    const original_frame = snapshot.sent[2].packets[0].frames.items[0];
+    snapshot.sent[2].packets[0].frames.items[0] = .{ .stream = .{ .stream_id = 4, .offset = max_quic_varint, .len = 1, .fin = false } };
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.sent[2].packets[0].frames.items[0] = original_frame;
+
+    const original_window = snapshot.cc.congestion_window;
+    snapshot.cc.congestion_window = 1;
+    var target = Recovery.init(allocator, .{ .max_datagram = 1252 });
+    defer target.deinit();
+    try testing.expectError(error.InvalidSnapshot, target.replaceFromSnapshot(&snapshot));
+    try testing.expectEqual(@as(usize, 0), target.sent[2].packets.items.len);
+    try testing.expectEqual(@as(u64, initial_window_packets * 1252), target.congestionWindow());
+    snapshot.cc.congestion_window = original_window;
+
+    snapshot.rtt.has_sample = false;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.rtt.has_sample = true;
+
+    const original_bytes = snapshot.cc.bytes_in_flight;
+    snapshot.cc.bytes_in_flight = std.math.maxInt(u64);
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.cc.bytes_in_flight = original_bytes;
+
+    const original_ack_delay = snapshot.max_ack_delay_ns;
+    snapshot.max_ack_delay_ns = std.math.maxInt(u64);
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.max_ack_delay_ns = original_ack_delay;
+
+    const original_time = snapshot.sent[2].packets[1].time_sent_ns;
+    snapshot.sent[2].packets[1].time_sent_ns = std.math.maxInt(u64);
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.sent[2].packets[1].time_sent_ns = original_time;
+
+    const original_pto = snapshot.pto_count;
+    snapshot.pto_count = std.math.maxInt(u32);
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.pto_count = original_pto;
+    try snapshot.validate();
+}
+
+test "Recovery snapshot preserves capped-registry and migrated congestion counters" {
+    const allocator = testing.allocator;
+    var source = Recovery.init(allocator, .{ .max_datagram = 1252, .max_sent = 1 });
+    defer source.deinit();
+    for ([_]u64{ 1, 2 }) |pn| {
+        try source.onPacketSent(.application, .{
+            .packet_number = pn,
+            .time_sent_ns = pn * ms,
+            .in_flight = true,
+            .ack_eliciting = true,
+            .sent_bytes = 1200,
+        });
+    }
+    try testing.expectEqual(@as(usize, 1), source.sent[2].packets.items.len);
+    try testing.expectEqual(@as(u64, 2400), source.bytesInFlight());
+    var capped = try source.captureSnapshot(allocator);
+    defer capped.deinit(allocator);
+    try testing.expectEqual(@as(u64, 2400), capped.cc.bytes_in_flight);
+
+    source.onPathMigration();
+    try testing.expectEqual(@as(u64, 0), source.bytesInFlight());
+    var migrated = try source.captureSnapshot(allocator);
+    defer migrated.deinit(allocator);
+    var restored = try Recovery.restoreSnapshot(allocator, &migrated);
+    defer restored.deinit();
+    try testing.expectEqual(@as(usize, 1), restored.sent[2].packets.items.len);
+    try testing.expectEqual(@as(u64, 0), restored.bytesInFlight());
+    try testing.expectEqual(source.congestionWindow(), restored.congestionWindow());
+}
+
+test "Recovery snapshot preserves padded non-ack-eliciting in-flight packet" {
+    const allocator = testing.allocator;
+    var source = Recovery.init(allocator, .{ .max_datagram = 1252 });
+    defer source.deinit();
+    try source.onPacketSent(.initial, .{
+        .packet_number = 0,
+        .time_sent_ns = 10 * ms,
+        .in_flight = true,
+        .ack_eliciting = false,
+        .sent_bytes = 1200,
+    });
+    try testing.expectEqual(@as(u64, 1200), source.bytesInFlight());
+    var snapshot = try source.captureSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+    var restored = try Recovery.restoreSnapshot(allocator, &snapshot);
+    defer restored.deinit();
+    try testing.expectEqual(@as(u64, 1200), restored.bytesInFlight());
+    try testing.expect(!restored.sent[0].packets.items[0].ack_eliciting);
+    try testing.expect(restored.sent[0].packets.items[0].in_flight);
+    _ = try source.onAckReceived(.initial, &.{0}, 0, 0, 20 * ms);
+    _ = try restored.onAckReceived(.initial, &.{0}, 0, 0, 20 * ms);
+    try testing.expectEqual(@as(u64, 0), source.bytesInFlight());
+    try testing.expectEqual(source.bytesInFlight(), restored.bytesInFlight());
+}
+
+test "Recovery snapshot capture and atomic replacement survive every allocation failure" {
+    const allocator = testing.allocator;
+    var source = try snapshotFixture(allocator);
+    defer source.deinit();
+    var snapshot = try source.captureSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    const CaptureSweep = struct {
+        fn run(failing: Allocator, original: *const Recovery) !void {
+            var captured = original.captureSnapshot(failing) catch |err| {
+                try testing.expectEqual(@as(usize, 2), original.sent[2].packets.items.len);
+                return err;
+            };
+            captured.deinit(failing);
+        }
+    };
+    try testing.checkAllAllocationFailures(allocator, CaptureSweep.run, .{&source});
+
+    const RestoreSweep = struct {
+        fn run(failing: Allocator, saved: *const Snapshot) !void {
+            var target = Recovery.init(failing, .{ .max_datagram = 1252 });
+            defer target.deinit();
+            target.replaceFromSnapshot(saved) catch |err| {
+                try testing.expectEqual(@as(usize, 0), target.sent[2].packets.items.len);
+                try testing.expectEqual(@as(u64, initial_window_packets * 1252), target.congestionWindow());
+                return err;
+            };
+            try testing.expectEqual(@as(usize, 2), target.sent[2].packets.items.len);
+            try testing.expectEqual(saved.cc.congestion_window, target.congestionWindow());
+        }
+    };
+    try testing.checkAllAllocationFailures(allocator, RestoreSweep.run, .{&snapshot});
 }

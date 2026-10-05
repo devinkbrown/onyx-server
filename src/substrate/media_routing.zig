@@ -61,11 +61,11 @@ pub const Error = std.mem.Allocator.Error || error{
     Closing,
 };
 
-const ChannelKey = struct {
+pub const ChannelKey = struct {
     bytes: [client.MAX_CHANNEL_NAME_BYTES]u8 = @splat(0),
     len: u16 = 0,
 
-    fn init(value: []const u8) Error!ChannelKey {
+    pub fn init(value: []const u8) Error!ChannelKey {
         if (value.len == 0 or value.len > client.MAX_CHANNEL_NAME_BYTES) return error.InvalidRequest;
         var key = ChannelKey{ .len = @intCast(value.len) };
         for (value, 0..) |byte, i| {
@@ -75,7 +75,7 @@ const ChannelKey = struct {
         return key;
     }
 };
-const CallRow = struct { id: CallId, offers: u32 = 0, memberships: u32 = 0 };
+pub const CallRow = struct { id: CallId, offers: u32 = 0, memberships: u32 = 0 };
 pub const EndpointObservation = struct {
     reference: EndpointRef,
     stamp: EndpointStamp,
@@ -83,10 +83,10 @@ pub const EndpointObservation = struct {
     mode: SecurityMode,
 };
 const CallMap = std.AutoHashMap(ChannelKey, CallRow);
-const EndpointEntry = struct { observation: EndpointObservation, retiring: bool = false };
+pub const EndpointEntry = struct { observation: EndpointObservation, retiring: bool = false };
 const EndpointMap = std.AutoHashMap(EndpointKey, EndpointEntry);
-const MembershipKey = struct { call: CallId, client: ClientId };
-const MembershipEntry = struct { bits: u8, retiring: bool = false };
+pub const MembershipKey = struct { call: CallId, client: ClientId };
+pub const MembershipEntry = struct { bits: u8, retiring: bool = false };
 const MembershipMap = std.AutoHashMap(MembershipKey, MembershipEntry);
 const InboundPin = struct { binding: *WebrtcBinding, ordinal: u64, source: EndpointStamp, issued_scope: u64 };
 const EgressPin = struct { binding: *WebrtcBinding, ordinal: u64, source: EndpointStamp, target: EndpointStamp, issued_scope: u64 };
@@ -143,6 +143,182 @@ pub const PristineMediaSnapshots = struct {
         self.native.deinit();
     }
 };
+
+pub const max_graph_rows: usize = 4096;
+pub const GraphError = Error || error{ InvalidSnapshot, IncompleteRemap };
+pub const ClientRemap = struct { source: ClientId, target: ClientId };
+pub const GraphCall = struct { channel: ChannelKey, row: CallRow };
+pub const GraphEndpoint = struct { key: EndpointKey, row: EndpointEntry };
+pub const GraphMembership = struct { key: MembershipKey, row: MembershipEntry };
+pub const GraphBridgePolicy = struct { key: EndpointKey, row: BridgePolicyRow };
+
+/// Owned, bounded source graph. It has no Domain/owner pointer, worker, socket,
+/// or publication method. A later joint Helix transaction must authenticate
+/// and install every leaf together after its own validation.
+pub const GraphSnapshot = struct {
+    allocator: std.mem.Allocator,
+    id: DomainId,
+    revision: u64,
+    next_call: u64,
+    next_endpoint: u64,
+    next_stream: u32,
+    next_scope: u64,
+    next_binding: u64,
+    native_binding_serial: u64,
+    webrtc_binding_serial: u64,
+    calls: []GraphCall,
+    endpoints: []GraphEndpoint,
+    memberships: []GraphMembership,
+    bridge_policy: []GraphBridgePolicy,
+
+    pub fn deinit(self: *GraphSnapshot) void {
+        self.allocator.free(self.bridge_policy);
+        self.allocator.free(self.memberships);
+        self.allocator.free(self.endpoints);
+        self.allocator.free(self.calls);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: *const GraphSnapshot) GraphError!void {
+        if (self.id.serial == 0 or self.revision == 0 or self.next_call == 0 or self.next_endpoint == 0 or
+            self.next_stream == 0 or self.next_scope == 0 or self.next_binding == 0 or
+            self.native_binding_serial == 0 or self.webrtc_binding_serial == 0 or
+            self.native_binding_serial == self.webrtc_binding_serial or
+            self.native_binding_serial >= self.next_binding or self.webrtc_binding_serial >= self.next_binding or
+            self.calls.len > max_graph_rows or self.endpoints.len > max_graph_rows or
+            self.memberships.len > max_graph_rows or self.bridge_policy.len > max_graph_rows) return error.InvalidSnapshot;
+        for (self.calls, 0..) |call, i| {
+            if (call.channel.len == 0 or call.channel.len > call.channel.bytes.len or
+                !std.meta.eql(ChannelKey.init(call.channel.bytes[0..call.channel.len]) catch return error.InvalidSnapshot, call.channel) or
+                call.row.id.domain.serial != self.id.serial or call.row.id.serial == 0 or call.row.id.serial >= self.next_call or
+                (call.row.offers == 0 and call.row.memberships == 0)) return error.InvalidSnapshot;
+            for (self.calls[0..i]) |prior| if (std.meta.eql(prior.channel, call.channel) or std.meta.eql(prior.row.id, call.row.id)) return error.InvalidSnapshot;
+            var offers: u32 = 0;
+            var members: u32 = 0;
+            for (self.endpoints) |endpoint| if (std.meta.eql(endpoint.key.call, call.row.id)) {
+                offers += 1;
+            };
+            for (self.memberships) |member| if (std.meta.eql(member.key.call, call.row.id)) {
+                members += 1;
+            };
+            if (offers != call.row.offers or members != call.row.memberships) return error.InvalidSnapshot;
+        }
+        for (self.endpoints, 0..) |endpoint, i| {
+            const key = endpoint.key;
+            const obs = endpoint.row.observation;
+            if (endpoint.row.retiring or key.client.isNone() or key.call.domain.serial != self.id.serial or
+                !self.hasCall(key.call) or obs.reference.offering_client.isNone() or
+                !key.client.eql(obs.reference.offering_client) or !key.client.eql(obs.stamp.offering_client) or
+                !std.meta.eql(obs.reference.endpoint, obs.stamp.endpoint) or
+                !std.meta.eql(obs.reference.endpoint.call, key.call) or obs.reference.endpoint.leg != key.leg or
+                obs.reference.endpoint.serial == 0 or obs.reference.endpoint.serial >= self.next_endpoint or
+                obs.stream_id == 0 or obs.stream_id >= self.next_stream or
+                obs.reference.bridge_policy_revision == 0 or obs.stamp.binding_revision == 0 or obs.stamp.security_revision == 0) return error.InvalidSnapshot;
+            for (self.endpoints[0..i]) |prior| {
+                if (std.meta.eql(prior.key, key) or prior.row.observation.reference.endpoint.serial == obs.reference.endpoint.serial or
+                    prior.row.observation.stream_id == obs.stream_id) return error.InvalidSnapshot;
+            }
+        }
+        for (self.memberships, 0..) |member, i| {
+            if (member.row.retiring or member.key.client.isNone() or member.key.call.domain.serial != self.id.serial or
+                !self.hasCall(member.key.call) or member.row.bits == 0 or member.row.bits & ~@as(u8, 7) != 0) return error.InvalidSnapshot;
+            for (self.memberships[0..i]) |prior| if (std.meta.eql(prior.key, member.key)) return error.InvalidSnapshot;
+        }
+        for (self.bridge_policy, 0..) |policy, i| {
+            const obs = self.findEndpoint(policy.key) orelse return error.InvalidSnapshot;
+            if (!std.meta.eql(policy.row.reference, obs.reference) or policy.row.kind_bits == 0 or
+                policy.row.kind_bits & ~@as(u8, 7) != 0 or
+                !profileCanonical(policy.row.profile)) return error.InvalidSnapshot;
+            const available = media_rooms.agreedKindBits(policy.row.profile) catch return error.InvalidSnapshot;
+            if (policy.row.kind_bits & ~available != 0) return error.InvalidSnapshot;
+            for (self.bridge_policy[0..i]) |prior| if (std.meta.eql(prior.key, policy.key)) return error.InvalidSnapshot;
+        }
+    }
+
+    fn hasCall(self: *const GraphSnapshot, id: CallId) bool {
+        for (self.calls) |call| if (std.meta.eql(call.row.id, id)) return true;
+        return false;
+    }
+
+    fn findEndpoint(self: *const GraphSnapshot, key: EndpointKey) ?EndpointObservation {
+        for (self.endpoints) |endpoint| if (std.meta.eql(endpoint.key, key)) return endpoint.row.observation;
+        return null;
+    }
+
+    fn usesClient(self: *const GraphSnapshot, id: ClientId) bool {
+        for (self.endpoints) |endpoint| if (endpoint.key.client.eql(id)) return true;
+        for (self.memberships) |member| if (member.key.client.eql(id)) return true;
+        return false;
+    }
+};
+
+fn canonicalProfile(profile: media_rooms.CallProfile) GraphError!media_rooms.CallProfile {
+    if (profile.codec_count == 0 or profile.codec_count > media_rooms.max_profile_codecs or
+        @intFromEnum(profile.fec.scheme) > 2) return error.InvalidSnapshot;
+    for (profile.codecs[0..profile.codec_count]) |codec| {
+        const tag = @intFromEnum(codec.tag);
+        if (tag < 1 or tag > 3) return error.InvalidSnapshot;
+    }
+    _ = media_rooms.agreedKindBits(profile) catch return error.InvalidSnapshot;
+    var copy = media_rooms.CallProfile{
+        .codecs = @splat(.{ .tag = .cadencevox, .clock_rate = 0, .params = 0 }),
+        .codec_count = profile.codec_count,
+        .fec = profile.fec,
+    };
+    @memcpy(copy.codecs[0..profile.codec_count], profile.codecs[0..profile.codec_count]);
+    return copy;
+}
+
+fn profileCanonical(profile: media_rooms.CallProfile) bool {
+    const canonical = canonicalProfile(profile) catch return false;
+    return std.meta.eql(profile, canonical);
+}
+
+fn remappedClient(remaps: []const ClientRemap, id: ClientId) GraphError!ClientId {
+    for (remaps) |remap| if (remap.source.eql(id)) return remap.target;
+    return error.IncompleteRemap;
+}
+
+/// Validate the complete old-to-new physical identity mapping before any
+/// mutation. Extras, duplicate sources and duplicate targets all refuse.
+pub fn prepareRemappedGraph(allocator: std.mem.Allocator, source: *const GraphSnapshot, remaps: []const ClientRemap) GraphError!GraphSnapshot {
+    try source.validate();
+    if (remaps.len > max_graph_rows * 2) return error.InvalidSnapshot;
+    for (remaps, 0..) |entry, i| {
+        if (entry.source.isNone() or entry.target.isNone() or !source.usesClient(entry.source)) return error.IncompleteRemap;
+        for (remaps[0..i]) |prior| if (prior.source.eql(entry.source) or prior.target.eql(entry.target)) return error.InvalidSnapshot;
+    }
+    for (source.endpoints) |endpoint| _ = try remappedClient(remaps, endpoint.key.client);
+    for (source.memberships) |member| _ = try remappedClient(remaps, member.key.client);
+    var transferred = false;
+    const calls = try allocator.dupe(GraphCall, source.calls);
+    errdefer if (!transferred) allocator.free(calls);
+    const endpoints = try allocator.dupe(GraphEndpoint, source.endpoints);
+    errdefer if (!transferred) allocator.free(endpoints);
+    const memberships = try allocator.dupe(GraphMembership, source.memberships);
+    errdefer if (!transferred) allocator.free(memberships);
+    const policies = try allocator.dupe(GraphBridgePolicy, source.bridge_policy);
+    var result = source.*;
+    result.allocator = allocator;
+    result.calls = calls;
+    result.endpoints = endpoints;
+    result.memberships = memberships;
+    result.bridge_policy = policies;
+    transferred = true;
+    errdefer result.deinit();
+    for (result.endpoints) |*endpoint| {
+        endpoint.key.client = try remappedClient(remaps, endpoint.key.client);
+        endpoint.row.observation.reference.offering_client = endpoint.key.client;
+        endpoint.row.observation.stamp.offering_client = endpoint.key.client;
+    }
+    for (result.memberships) |*member| member.key.client = try remappedClient(remaps, member.key.client);
+    for (result.bridge_policy) |*policy| {
+        policy.key.client = try remappedClient(remaps, policy.key.client);
+        policy.row.reference.offering_client = policy.key.client;
+    }
+    try result.validate();
+    return result;
+}
 pub const Domain = opaque {
     pub fn create(allocator: std.mem.Allocator) Error!*Domain {
         // Exhaustion refuses before the constructor touches the backend.
@@ -331,6 +507,76 @@ pub const Domain = opaque {
         errdefer native_snapshot.deinit();
         const webrtc_snapshot = try webrtc.capturePausedPristineRoutingLocked(self, token, native, webrtc_token);
         return .{ .native = native_snapshot, .webrtc = webrtc_snapshot };
+    }
+
+    /// Copy the active routing graph only while both exact physical owners are
+    /// paused and the Domain has no in-flight scope, pin, or prepared row. The
+    /// returned DTO carries no owner capability and cannot route packets.
+    pub fn captureGraph(self: *Domain, native: *native_owner.NativeMediaTransport, native_token: runtime_pause.Token, webrtc: *webrtc_owner.MediaPlane, webrtc_token: runtime_pause.Token) !GraphSnapshot {
+        try native.runtime.pause.requirePaused(native_token);
+        try webrtc.runtime.pause.requirePaused(webrtc_token);
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (source.closing) return error.Closing;
+        const native_binding = source.native_binding orelse return error.InvalidIdentity;
+        const webrtc_binding = source.webrtc_binding orelse return error.InvalidIdentity;
+        const native_record: *NativeBindingBacking = @ptrCast(@alignCast(native_binding));
+        const webrtc_record: *WebrtcBindingBacking = @ptrCast(@alignCast(webrtc_binding));
+        if (native_record.source != source or native_record.owner != native or native_record.serial == 0 or
+            webrtc_record.source != source or webrtc_record.owner != webrtc or webrtc_record.serial == 0) return error.InvalidIdentity;
+        if (source.active_scope != null or source.active_inbound != null or source.active_egress != null or
+            source.pending_candidates != 0 or native.physical_pending != 0 or native.active_ingress != null or
+            webrtc.physical_pending != 0 or webrtc.routing_inbound != null or
+            webrtc.retired_routing_egress != null or webrtc.rtcp_out_len != 0) return error.Busy;
+        if (source.calls.count() > max_graph_rows or source.endpoints.count() > max_graph_rows or
+            source.memberships.count() > max_graph_rows or source.bridge_policy.count() > max_graph_rows) return error.Busy;
+        const allocator = source.allocator;
+        const calls = try allocator.alloc(GraphCall, source.calls.count());
+        errdefer allocator.free(calls);
+        const endpoints = try allocator.alloc(GraphEndpoint, source.endpoints.count());
+        errdefer allocator.free(endpoints);
+        const memberships = try allocator.alloc(GraphMembership, source.memberships.count());
+        errdefer allocator.free(memberships);
+        const policies = try allocator.alloc(GraphBridgePolicy, source.bridge_policy.count());
+        errdefer allocator.free(policies);
+        var ci: usize = 0;
+        var call_it = source.calls.iterator();
+        while (call_it.next()) |entry| : (ci += 1) calls[ci] = .{ .channel = entry.key_ptr.*, .row = entry.value_ptr.* };
+        var ei: usize = 0;
+        var endpoint_it = source.endpoints.iterator();
+        while (endpoint_it.next()) |entry| : (ei += 1) endpoints[ei] = .{ .key = entry.key_ptr.*, .row = entry.value_ptr.* };
+        var mi: usize = 0;
+        var member_it = source.memberships.iterator();
+        while (member_it.next()) |entry| : (mi += 1) memberships[mi] = .{ .key = entry.key_ptr.*, .row = entry.value_ptr.* };
+        var pi: usize = 0;
+        var policy_it = source.bridge_policy.iterator();
+        while (policy_it.next()) |entry| : (pi += 1) policies[pi] = .{
+            .key = entry.key_ptr.*,
+            .row = .{
+                .reference = entry.value_ptr.reference,
+                .profile = try canonicalProfile(entry.value_ptr.profile),
+                .kind_bits = entry.value_ptr.kind_bits,
+            },
+        };
+        const graph = GraphSnapshot{
+            .allocator = allocator,
+            .id = source.id,
+            .revision = source.revision,
+            .next_call = source.next_call,
+            .next_endpoint = source.next_endpoint,
+            .next_stream = source.next_stream,
+            .next_scope = source.next_scope,
+            .next_binding = source.next_binding,
+            .native_binding_serial = native_record.serial,
+            .webrtc_binding_serial = webrtc_record.serial,
+            .calls = calls,
+            .endpoints = endpoints,
+            .memberships = memberships,
+            .bridge_policy = policies,
+        };
+        try graph.validate();
+        return graph;
     }
     pub fn releaseNative(self: *Domain, binding: *NativeBinding) Error!void {
         const source = backing(self);
@@ -1865,10 +2111,65 @@ test "Windows Helix configured pristine media captures exact paused owners and r
     };
     try domain.withLocked(CommitMembership{ .domain = domain, .plan = membership }, CommitMembership.run);
     membership.deinit();
+    const sibling = ClientId{ .shard = 0, .slot = 1, .gen = 0 };
+    const sibling_membership = try domain.prepareMembership("#history", sibling, 2);
+    try domain.withLocked(CommitMembership{ .domain = domain, .plan = sibling_membership }, CommitMembership.run);
+    sibling_membership.deinit();
+    var graph = try domain.captureGraph(&native, native_token, &webrtc, webrtc_token);
+    defer graph.deinit();
+    {
+        native.physical_pending = 1;
+        defer native.physical_pending = 0;
+        try testing.expectError(error.Busy, domain.captureGraph(&native, native_token, &webrtc, webrtc_token));
+    }
+    {
+        webrtc.physical_pending = 1;
+        defer webrtc.physical_pending = 0;
+        try testing.expectError(error.Busy, domain.captureGraph(&native, native_token, &webrtc, webrtc_token));
+    }
+    try testing.expectEqual(@as(usize, 2), graph.memberships.len);
+    const target = ClientId{ .shard = 1, .slot = 11, .gen = 2 };
+    const sibling_target = ClientId{ .shard = 1, .slot = 12, .gen = 2 };
+    var remapped = try prepareRemappedGraph(testing.allocator, &graph, &.{ .{ .source = id, .target = target }, .{ .source = sibling, .target = sibling_target } });
+    defer remapped.deinit();
+    try remapped.validate();
+    try testing.expectEqual(graph.id.serial, remapped.id.serial);
+    try testing.expectEqual(graph.next_call, remapped.next_call);
+    try testing.expect(remapped.usesClient(target) and remapped.usesClient(sibling_target));
+    try testing.expect(!remapped.usesClient(id) and !remapped.usesClient(sibling));
+    try testing.expectError(error.IncompleteRemap, prepareRemappedGraph(testing.allocator, &graph, &.{.{ .source = id, .target = target }}));
+    try testing.expectError(error.InvalidSnapshot, prepareRemappedGraph(testing.allocator, &graph, &.{ .{ .source = id, .target = target }, .{ .source = sibling, .target = target } }));
+    try testing.expectError(error.InvalidSnapshot, prepareRemappedGraph(testing.allocator, &graph, &.{ .{ .source = id, .target = target }, .{ .source = id, .target = sibling_target } }));
+    var fail = testing.FailingAllocator.init(testing.allocator, .{});
+    const baseline = fail.allocated_bytes - fail.freed_bytes;
+    var failures: usize = 0;
+    var succeeded = false;
+    for (0..8) |n| {
+        fail.fail_index = fail.alloc_index + n;
+        var retry = prepareRemappedGraph(fail.allocator(), &graph, &.{ .{ .source = id, .target = target }, .{ .source = sibling, .target = sibling_target } }) catch |err| {
+            fail.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(baseline, fail.allocated_bytes - fail.freed_bytes);
+            try graph.validate();
+            failures += 1;
+            continue;
+        };
+        fail.fail_index = std.math.maxInt(usize);
+        retry.deinit();
+        try testing.expectEqual(baseline, fail.allocated_bytes - fail.freed_bytes);
+        succeeded = true;
+        break;
+    }
+    // This fixture has nonempty call and membership slices; zero-length
+    // endpoint/policy slices need no backing allocation.
+    try testing.expect(succeeded and failures >= 2);
     try testing.expectError(error.Busy, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
     const departure = try domain.prepareDeparture(call, id);
     defer departure.deinit();
     try domain.withLocked(DepartureTestCut{ .domain = domain, .plan = departure }, DepartureTestCut.run);
+    const sibling_departure = try domain.prepareDeparture(call, sibling);
+    defer sibling_departure.deinit();
+    try domain.withLocked(DepartureTestCut{ .domain = domain, .plan = sibling_departure }, DepartureTestCut.run);
     try testing.expectError(error.Busy, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
 }
 const DepartureTestCut = struct {
@@ -2305,7 +2606,7 @@ test "media routing both growth maps every failure restores exact OLD and same o
 }
 
 pub const TransportNegotiation = struct { profile: media_rooms.CallProfile, kind_bits: u8 };
-const BridgePolicyRow = struct { reference: EndpointRef, profile: media_rooms.CallProfile, kind_bits: u8 };
+pub const BridgePolicyRow = struct { reference: EndpointRef, profile: media_rooms.CallProfile, kind_bits: u8 };
 const BridgeMap = std.AutoHashMap(EndpointKey, BridgePolicyRow);
 const BridgeCapture = struct { revision: u64, count: u32, capacity: u32, metadata: usize, required: u32, grow: bool };
 const BridgePlan = struct {

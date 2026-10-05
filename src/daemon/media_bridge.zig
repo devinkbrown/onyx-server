@@ -96,6 +96,13 @@ fn memberStableId(id: []const u8) u64 {
     return std.hash.Wyhash.hash(0, id);
 }
 
+fn knownCodec(codec: Codec) bool {
+    return switch (codec) {
+        .cadencevox, .cadencevis, .raw => true,
+        else => false,
+    };
+}
+
 /// One call participant and the transport identity needed to deliver to it.
 pub const Member = struct {
     id_buf: [max_id_bytes]u8 = undefined,
@@ -131,7 +138,56 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
     return struct {
         const Self = @This();
         pub const RegisterError = error{ Full, BadId };
+        pub const SnapshotError = error{InvalidSnapshot};
         const CodecState = enum { unknown, direct, incompatible };
+
+        /// An inline, canonical roster. It borrows no map value, member codec
+        /// slice, or socket address. The caller owns publication of a restored
+        /// bridge under the same lock used for register/unregister.
+        pub const Snapshot = struct {
+            pub const MemberRow = struct {
+                id_buf: [max_id_bytes]u8 = @splat(0),
+                id_len: u8 = 0,
+                leg: Leg = .native,
+                addr: TransportAddress = .{},
+                stream_id: u32 = 0,
+                band_id: u8 = cadence_frame.MEDIA_BAND_FLOOR,
+                ssrc: u32 = 0,
+                codecs: [max_member_codecs]Codec = @splat(.cadencevox),
+                codec_count: u8 = 0,
+
+                fn id(self: *const MemberRow) []const u8 {
+                    return self.id_buf[0..self.id_len];
+                }
+            };
+
+            members: [max_participants]MemberRow = @splat(.{}),
+            len: usize = 0,
+            pt_entries: [8]PtMap.Entry = @splat(.{ .pt = 0, .codec = .cadencevox }),
+            pt_len: usize = 0,
+
+            pub fn validate(self: *const Snapshot) SnapshotError!void {
+                if (self.len > max_participants or self.pt_len > self.pt_entries.len) return error.InvalidSnapshot;
+                for (self.members[0..self.len], 0..) |row, i| {
+                    if (row.id_len == 0 or row.id_len > max_id_bytes or row.codec_count > max_member_codecs or row.addr.ip_len > row.addr.ip.len) return error.InvalidSnapshot;
+                    for (row.id_buf[row.id_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+                    for (row.addr.ip[row.addr.ip_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+                    for (row.codecs[row.codec_count..]) |codec| if (codec != .cadencevox) return error.InvalidSnapshot;
+                    for (row.codecs[0..row.codec_count]) |codec| if (!knownCodec(codec)) return error.InvalidSnapshot;
+                    for (self.members[0..i]) |prior| {
+                        if (std.mem.eql(u8, row.id(), prior.id()) or memberStableId(row.id()) == memberStableId(prior.id())) return error.InvalidSnapshot;
+                        if (row.stream_id != 0 and row.stream_id == prior.stream_id) return error.InvalidSnapshot;
+                        if (row.ssrc != 0 and row.ssrc == prior.ssrc) return error.InvalidSnapshot;
+                    }
+                }
+                for (self.members[self.len..]) |row| if (!std.meta.eql(row, MemberRow{})) return error.InvalidSnapshot;
+                for (self.pt_entries[0..self.pt_len], 0..) |entry, i| {
+                    if (!knownCodec(entry.codec)) return error.InvalidSnapshot;
+                    for (self.pt_entries[0..i]) |prior| if (entry.pt == prior.pt or entry.codec == prior.codec) return error.InvalidSnapshot;
+                }
+                for (self.pt_entries[self.pt_len..]) |entry| if (!std.meta.eql(entry, PtMap.Entry{ .pt = 0, .codec = .cadencevox })) return error.InvalidSnapshot;
+            }
+        };
 
         members: [max_participants]Member = undefined,
         len: usize = 0,
@@ -143,6 +199,76 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
 
         pub fn init() Self {
             return .{ .ptmap = defaultPtMap() };
+        }
+
+        pub fn capture(self: *const Self) SnapshotError!Snapshot {
+            if (self.len > max_participants or self.ptmap.len > self.ptmap.entries.len) return error.InvalidSnapshot;
+            var snapshot: Snapshot = .{ .len = self.len, .pt_len = self.ptmap.len };
+            @memcpy(snapshot.pt_entries[0..snapshot.pt_len], self.ptmap.entries[0..snapshot.pt_len]);
+            for (self.members[0..self.len], 0..) |member, i| {
+                if (member.id_len == 0 or member.id_len > max_id_bytes or member.codec_count > max_member_codecs or member.addr.ip_len > member.addr.ip.len) return error.InvalidSnapshot;
+                var row = Snapshot.MemberRow{
+                    .id_len = member.id_len,
+                    .leg = member.leg,
+                    .stream_id = member.stream_id,
+                    .band_id = member.band_id,
+                    .ssrc = member.ssrc,
+                    .codec_count = member.codec_count,
+                };
+                @memcpy(row.id_buf[0..member.id_len], member.id_buf[0..member.id_len]);
+                row.addr.port = member.addr.port;
+                row.addr.ip_len = member.addr.ip_len;
+                @memcpy(row.addr.ip[0..member.addr.ip_len], member.addr.ip[0..member.addr.ip_len]);
+                @memcpy(row.codecs[0..member.codec_count], member.codecs[0..member.codec_count]);
+                snapshot.members[i] = row;
+            }
+            try snapshot.validate();
+            const rebuilt = try prepareRestore(&snapshot);
+            if (!self.derivedEquals(&rebuilt)) return error.InvalidSnapshot;
+            return snapshot;
+        }
+
+        /// Prepare only. The returned value is not installed into the server's
+        /// channel map and cannot authorize an ingress by itself.
+        pub fn prepareRestore(snapshot: *const Snapshot) SnapshotError!Self {
+            try snapshot.validate();
+            var result = Self.init();
+            result.ptmap.len = snapshot.pt_len;
+            @memcpy(result.ptmap.entries[0..snapshot.pt_len], snapshot.pt_entries[0..snapshot.pt_len]);
+            result.len = snapshot.len;
+            for (snapshot.members[0..snapshot.len], 0..) |row, i| {
+                var member = Member{
+                    .id_buf = @splat(0),
+                    .id_len = row.id_len,
+                    .leg = row.leg,
+                    .addr = row.addr,
+                    .stream_id = row.stream_id,
+                    .band_id = row.band_id,
+                    .ssrc = row.ssrc,
+                    .codecs = @splat(.cadencevox),
+                    .codec_count = row.codec_count,
+                };
+                @memcpy(member.id_buf[0..row.id_len], row.id());
+                @memcpy(member.codecs[0..row.codec_count], row.codecs[0..row.codec_count]);
+                result.members[i] = member;
+            }
+            result.recomputeCodec();
+            return result;
+        }
+
+        fn derivedEquals(self: *const Self, other: *const Self) bool {
+            if (self.codec_state != other.codec_state or self.common_codec != other.common_codec or
+                self.session.len != other.session.len or self.session.codec != other.session.codec or
+                self.ssrcs.len != other.ssrcs.len) return false;
+            for (self.session.participants[0..self.session.len], other.session.participants[0..other.session.len]) |a, b| {
+                if (a.id != b.id or a.leg != b.leg or a.stream_id != b.stream_id or a.ssrc != b.ssrc or
+                    a.connected != b.connected or a.codec_count != b.codec_count or
+                    !std.mem.eql(Codec, a.codecs[0..a.codec_count], b.codecs[0..b.codec_count])) return false;
+            }
+            for (self.ssrcs.entries[0..self.ssrcs.len], other.ssrcs.entries[0..other.ssrcs.len]) |a, b| {
+                if (!std.meta.eql(a, b)) return false;
+            }
+            return true;
         }
 
         fn find(self: *Self, id: []const u8) ?*Member {
@@ -468,6 +594,48 @@ test "unregister drops a member; register updates in place" {
     try testing.expect(br.unregister("a"));
     try testing.expectEqual(@as(usize, 0), br.count());
     try testing.expect(!br.unregister("a"));
+}
+
+test "bridge snapshot roundtrip retains roster and rejects duplicate physical identity" {
+    const Bridge = ChannelBridge(4);
+    var bridge = Bridge.init();
+    var native = Member{ .leg = .native, .stream_id = 17, .addr = addr(1, 7000) };
+    native.setCodecs(&.{ .cadencevox, .cadencevis });
+    var webrtc = Member{ .leg = .webrtc, .ssrc = 91, .addr = addr(2, 7001) };
+    webrtc.setCodecs(&.{.cadencevox});
+    try bridge.register("alice", native);
+    try bridge.register("mobile", webrtc);
+    const snapshot = try bridge.capture();
+    var restored = try Bridge.prepareRestore(&snapshot);
+    try testing.expect(restored.transcodeFree());
+    try testing.expectEqual(@as(usize, 2), restored.count());
+    try testing.expectEqual(@as(?u32, 91), restored.ssrcs.ssrcForStream(0));
+    try testing.expectEqualDeep(snapshot, try restored.capture());
+    var corrupt = snapshot;
+    corrupt.members[1].id_buf = corrupt.members[0].id_buf;
+    corrupt.members[1].id_len = corrupt.members[0].id_len;
+    try testing.expectError(error.InvalidSnapshot, Bridge.prepareRestore(&corrupt));
+}
+
+test "bridge map relocation preserves owned Causeway codec sets" {
+    const Bridge = ChannelBridge(4);
+    var bridges = std.AutoHashMap(u32, Bridge).init(testing.allocator);
+    defer bridges.deinit();
+    var first = Bridge.init();
+    var native = Member{ .leg = .native, .stream_id = 17 };
+    native.setCodecs(&.{ .cadencevox, .cadencevis });
+    var mobile = Member{ .leg = .webrtc, .ssrc = 91 };
+    mobile.setCodecs(&.{.cadencevox});
+    try first.register("alice", native);
+    try first.register("mobile", mobile);
+    try bridges.put(1, first);
+    for (2..96) |index| try bridges.put(@intCast(index), Bridge.init());
+    const moved = bridges.getPtr(1).?;
+    try testing.expectEqual(Codec.cadencevox, moved.session.codec.?);
+    try testing.expectEqual(Codec.cadencevox, moved.session.participants[0].codecs[0]);
+    try testing.expectEqualDeep(try first.capture(), try moved.capture());
+    try testing.expect(moved.unregister("mobile"));
+    try testing.expectEqual(Codec.cadencevox, moved.session.codec.?);
 }
 
 const CountSendCtx = struct {

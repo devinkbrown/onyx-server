@@ -33,6 +33,7 @@ const rtcp_translate = @import("../proto/rtcp_translate.zig");
 const media_bridge = @import("media_bridge.zig");
 const dtls_server = @import("../proto/dtls12_server.zig");
 const dtls13_server = @import("../proto/dtls13_server.zig");
+const dtls_fingerprint = @import("../proto/dtls_fingerprint.zig");
 const peer_verify = @import("../proto/dtls_peer_verify.zig");
 const platform = @import("../substrate/platform.zig");
 const sfu_srtp = @import("sfu_srtp.zig");
@@ -1267,6 +1268,29 @@ pub const MediaPlane = struct {
         try domain.requirePristineConfiguredMediaLocked(scope, native, self);
         try domain.requireWebrtcBindingLocked(scope, self.routing_binding orelse return error.RoutingContinuityUnsupported, self);
         return self.captureIdle(.paused, domain);
+    }
+    /// Active physical rows may be described only after actual pump pause and
+    /// the source-issued producer fence has settled every accepted egress job.
+    /// This is a detached DTO, never independent permission to adopt a graph.
+    pub fn capturePausedPhysicalRoutingLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, token: runtime_pause.Token, allocator: std.mem.Allocator, limits: PhysicalSnapshot.Limits) !PhysicalSnapshot {
+        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        try domain.requireWebrtcBindingLocked(scope, self.routing_binding orelse return error.NotRoutingBound, self);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        lockSpin(&self.fp_mutex);
+        defer self.fp_mutex.unlock();
+        lockSpin(&self.rtcp_out_mutex);
+        defer self.rtcp_out_mutex.unlock();
+        const queue = self.routing_egress orelse return error.QueueUnavailable;
+        lockSpin(&queue.mutex);
+        defer queue.mutex.unlock();
+        if (self.routing_domain != domain or self.routing_closed or self.legacy_joining or
+            self.stop_flag.load(.acquire) or self.retired_routing_egress != null or
+            self.routing_inbound != null or self.physical_pending != 0 or self.rtcp_out_len != 0 or
+            queue.fence == null or queue.len != 0 or queue.inflight != null or queue.poisoned)
+            return error.Busy;
+        return PhysicalSnapshot.captureLocked(self, allocator, limits);
     }
     pub fn captureUnstarted(self: *MediaPlane) !Snapshot {
         if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
@@ -3645,6 +3669,526 @@ pub const Snapshot = struct {
     }
 };
 
+/// Detached active WebRTC/UDP owner state at a settled, producer-fenced cut.
+/// The Domain, MediaRooms, bridge and native owner must still be joined by the
+/// aggregate before any restored map becomes visible to a worker.
+pub const PhysicalSnapshot = struct {
+    pub const Limits = struct {
+        max_rows: usize,
+        max_offered: usize,
+        max_bytes: usize,
+        transport: MediaTransport.SnapshotLimits,
+    };
+    pub const Row = struct {
+        key: routing.EndpointKey,
+        identity: routing.EndpointObservation,
+        profile: media_rooms.CallProfile,
+        kind_bits: u8,
+        expected_fp: ?[peer_verify.digest_len]u8,
+        max_temporal: u3,
+        ufrag: [media_transport.ufrag_len]u8,
+        pwd: [media_transport.pwd_len]u8,
+        remote: ?TransportAddress,
+        max_spatial: u8,
+        ssrc: u32,
+        rx_packets: u64,
+        rx_bytes: u64,
+        rtx: rtp_nack.RetransmitBuffer.Snapshot,
+        cache: rtp_nack.PerSsrcRetransmitBuffer.Snapshot,
+        fn deinit(self: *Row) void {
+            self.rtx.deinit();
+            self.cache.deinit();
+            std.crypto.secureZero(u8, &self.ufrag);
+            std.crypto.secureZero(u8, &self.pwd);
+        }
+        fn fromLive(key: routing.EndpointKey, live: *const PhysicalRtcEndpoint, allocator: std.mem.Allocator, remaining: *usize) !Row {
+            var rtx = try live.endpoint.rtx.capture(allocator, remaining.*);
+            errdefer rtx.deinit();
+            try consumeSnapshotBytes(remaining, rtx.packets.len, @sizeOf(rtp_nack.RetransmitBuffer.Snapshot.Packet));
+            for (rtx.packets) |packet| try consumeSnapshotBytes(remaining, packet.bytes.len, 1);
+            const cache_budget = std.math.add(usize, remaining.*, @sizeOf(rtp_nack.PerSsrcRetransmitBuffer.Snapshot)) catch return error.Capacity;
+            var cache = try live.physical_cache.capture(allocator, cache_budget);
+            errdefer cache.deinit();
+            try consumeSnapshotBytes(remaining, cache.streams.len, @sizeOf(rtp_nack.PerSsrcRetransmitBuffer.Snapshot.Stream));
+            for (cache.streams) |stream| {
+                try consumeSnapshotBytes(remaining, stream.cache.packets.len, @sizeOf(rtp_nack.RetransmitBuffer.Snapshot.Packet));
+                for (stream.cache.packets) |packet| try consumeSnapshotBytes(remaining, packet.bytes.len, 1);
+            }
+            var profile: media_rooms.CallProfile = .{ .codecs = @splat(.{ .tag = .raw, .clock_rate = 0, .params = 0 }), .codec_count = live.profile.codec_count, .fec = live.profile.fec };
+            if (profile.codec_count <= media_rooms.max_profile_codecs) @memcpy(profile.codecs[0..profile.codec_count], live.profile.codecs[0..profile.codec_count]);
+            return .{ .key = key, .identity = live.identity, .profile = profile, .kind_bits = live.kind_bits, .expected_fp = live.expected_fp, .max_temporal = live.max_temporal, .ufrag = live.endpoint.ufrag, .pwd = live.endpoint.pwd, .remote = live.endpoint.remote, .max_spatial = live.endpoint.max_spatial, .ssrc = live.endpoint.ssrc, .rx_packets = live.endpoint.rx_packets, .rx_bytes = live.endpoint.rx_bytes, .rtx = rtx, .cache = cache };
+        }
+        fn validate(self: *const Row, max_bytes: usize) !void {
+            if (self.key.leg != .webrtc or self.identity.reference.endpoint.leg != .webrtc or
+                !std.meta.eql(self.identity.reference.endpoint, self.identity.stamp.endpoint) or
+                !std.meta.eql(self.identity.reference.offering_client, self.identity.stamp.offering_client) or
+                !std.meta.eql(self.key.call, self.identity.reference.endpoint.call) or
+                !std.meta.eql(self.key.client, self.identity.reference.offering_client) or
+                self.profile.codec_count == 0 or self.profile.codec_count > media_rooms.max_profile_codecs or
+                self.kind_bits == 0 or self.kind_bits & ~@as(u8, 7) != 0)
+                return error.InvalidSnapshot;
+            for (self.profile.codecs[self.profile.codec_count..]) |codec| if (codec.tag != .raw or codec.clock_rate != 0 or codec.params != 0) return error.InvalidSnapshot;
+            if (self.identity.mode == .dtls_required and self.expected_fp == null) return error.InvalidSnapshot;
+            if (self.remote) |addr| try validateCarryAddress(addr);
+            try self.rtx.validate(media_transport.rtx_capacity, max_bytes);
+            try self.cache.validate(media_transport.rtx_capacity, sfu_srtp.max_owners, max_bytes);
+        }
+    };
+    pub const Ufrag = struct { value: [media_transport.ufrag_len]u8, key: routing.EndpointKey };
+    pub const Group = struct { call: routing.CallId, key: [media_transport.group_key_len]u8, count: u32 };
+    pub const SsrcSlot = struct { live: bool = false, ssrc: u32 = 0, key: ?routing.EndpointKey = null, endpoint: ?routing.EndpointId = null };
+    pub const CryptoSlot = struct { live: bool = false, endpoint: ?routing.EndpointId = null, binding_revision: u64 = 0, addr: TransportAddress = .{} };
+    pub const Fingerprint = struct { key: []u8, digest: [peer_verify.digest_len]u8 };
+    pub const Queue = struct { capacity: usize, payload_limit: usize, head: usize, next_ordinal: u64, completed: u64, last_disposition: ?RoutingDisposition, next_fence: u64 };
+
+    allocator: std.mem.Allocator,
+    socket: media_socket.Snapshot,
+    csprng: RngState,
+    stun_server: ?TransportAddress,
+    discovered: ?TransportAddress,
+    max_frame_bytes: usize,
+    max_upload_bytes: u64,
+    cross_configured: bool,
+    dtls_enabled: bool,
+    dtls_requested: bool,
+    dtls13_enabled: bool,
+    dtls13_requested: bool,
+    dtls_fingerprint_buf: [128]u8,
+    dtls_fingerprint_len: usize,
+    dtls12: ?dtls_server.Terminator.Snapshot,
+    dtls13: ?dtls13_server.Terminator.Snapshot,
+    srtp: sfu_srtp.SfuSrtp.Snapshot,
+    transport: MediaTransport.Snapshot,
+    rows: []Row,
+    ufrags: []Ufrag,
+    groups: []Group,
+    ssrcs: [sfu_srtp.max_owners]SsrcSlot,
+    crypto: [sfu_srtp.max_peers]CryptoSlot,
+    offered_fps: []Fingerprint,
+    queue: Queue,
+    rtcp_out_head: usize,
+    physical_revision: u64,
+    next_routing_inbound: u64,
+    routing_ingress_refused: u64,
+    routing_ingress_completed: u64,
+    routing_last_ingress_error: ?anyerror,
+
+    pub fn deinit(self: *PhysicalSnapshot) void {
+        for (self.rows) |*row| row.deinit();
+        for (self.groups) |*group| std.crypto.secureZero(u8, &group.key);
+        for (self.offered_fps) |row| self.allocator.free(row.key);
+        self.allocator.free(self.rows);
+        self.allocator.free(self.ufrags);
+        self.allocator.free(self.groups);
+        self.allocator.free(self.offered_fps);
+        self.transport.deinit();
+        self.srtp.deinit();
+        if (self.dtls12) |*term| term.deinit();
+        if (self.dtls13) |*term| term.deinit();
+        std.crypto.secureZero(u8, &self.csprng.state);
+        self.* = undefined;
+    }
+    fn keyLess(a: routing.EndpointKey, b: routing.EndpointKey) bool {
+        if (a.call.domain.serial != b.call.domain.serial) return a.call.domain.serial < b.call.domain.serial;
+        if (a.call.serial != b.call.serial) return a.call.serial < b.call.serial;
+        if (a.client.shard != b.client.shard) return a.client.shard < b.client.shard;
+        if (a.client.slot != b.client.slot) return a.client.slot < b.client.slot;
+        if (a.client.gen != b.client.gen) return a.client.gen < b.client.gen;
+        return @intFromEnum(a.leg) < @intFromEnum(b.leg);
+    }
+    fn callLess(a: routing.CallId, b: routing.CallId) bool {
+        if (a.domain.serial != b.domain.serial) return a.domain.serial < b.domain.serial;
+        return a.serial < b.serial;
+    }
+    fn rowIndex(self: *const PhysicalSnapshot, key: routing.EndpointKey) !usize {
+        var lo: usize = 0;
+        var hi = self.rows.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.meta.eql(self.rows[mid].key, key)) return mid;
+            if (keyLess(self.rows[mid].key, key)) lo = mid + 1 else hi = mid;
+        }
+        return error.InvalidSnapshot;
+    }
+    fn snapshotBytes(self: *const PhysicalSnapshot) !usize {
+        var bytes: usize = @sizeOf(PhysicalSnapshot);
+        inline for (.{ .{ self.rows.len, @sizeOf(Row) }, .{ self.ufrags.len, @sizeOf(Ufrag) }, .{ self.groups.len, @sizeOf(Group) }, .{ self.offered_fps.len, @sizeOf(Fingerprint) } }) |part| {
+            try addSnapshotBytes(&bytes, part[0], part[1]);
+        }
+        for (self.rows) |row| {
+            try addSnapshotBytes(&bytes, row.rtx.packets.len, @sizeOf(rtp_nack.RetransmitBuffer.Snapshot.Packet));
+            for (row.rtx.packets) |packet| bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+            try addSnapshotBytes(&bytes, row.cache.streams.len, @sizeOf(rtp_nack.PerSsrcRetransmitBuffer.Snapshot.Stream));
+            for (row.cache.streams) |stream| {
+                try addSnapshotBytes(&bytes, stream.cache.packets.len, @sizeOf(rtp_nack.RetransmitBuffer.Snapshot.Packet));
+                for (stream.cache.packets) |packet| bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+            }
+        }
+        try addSnapshotBytes(&bytes, self.transport.endpoints.len, @sizeOf(MediaTransport.SnapshotEndpoint));
+        try addSnapshotBytes(&bytes, self.transport.ufrags.len, @sizeOf(MediaTransport.UfragIndex));
+        try addSnapshotBytes(&bytes, self.transport.addresses.len, @sizeOf(MediaTransport.AddressIndex));
+        try addSnapshotBytes(&bytes, self.transport.ssrcs.len, @sizeOf(MediaTransport.SsrcIndex));
+        try addSnapshotBytes(&bytes, self.transport.groups.len, @sizeOf(MediaTransport.SnapshotGroup));
+        for (self.transport.endpoints) |row| {
+            bytes = std.math.add(usize, bytes, row.key.len) catch return error.Capacity;
+            try addSnapshotBytes(&bytes, row.rtx.packets.len, @sizeOf(rtp_nack.RetransmitBuffer.Snapshot.Packet));
+            for (row.rtx.packets) |packet| bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+        }
+        for (self.transport.groups) |row| bytes = std.math.add(usize, bytes, row.channel.len) catch return error.Capacity;
+        for (self.offered_fps) |row| bytes = std.math.add(usize, bytes, row.key.len) catch return error.Capacity;
+        try addSnapshotBytes(&bytes, self.srtp.peers.len, @sizeOf(sfu_srtp.SfuSrtp.Snapshot.Peer));
+        if (self.dtls12) |term| try addSnapshotBytes(&bytes, term.sessions.len, @sizeOf(@TypeOf(term.sessions[0])));
+        if (self.dtls13) |term| try addSnapshotBytes(&bytes, term.sessions.len, @sizeOf(@TypeOf(term.sessions[0])));
+        // Restoration allocates the same funded empty queue before publication.
+        try addSnapshotBytes(&bytes, self.queue.capacity, @sizeOf(RoutingEgressRow));
+        try addSnapshotBytes(&bytes, self.queue.capacity, self.queue.payload_limit);
+        return bytes;
+    }
+
+    fn addSnapshotBytes(bytes: *usize, count: usize, item_size: usize) !void {
+        const part = std.math.mul(usize, count, item_size) catch return error.Capacity;
+        bytes.* = std.math.add(usize, bytes.*, part) catch return error.Capacity;
+    }
+    fn consumeSnapshotBytes(remaining: *usize, count: usize, item_size: usize) !void {
+        const part = std.math.mul(usize, count, item_size) catch return error.Capacity;
+        remaining.* = std.math.sub(usize, remaining.*, part) catch return error.Capacity;
+    }
+    fn consumeTransportBytes(remaining: *usize, transport: *const MediaTransport.Snapshot) !void {
+        try consumeSnapshotBytes(remaining, transport.endpoints.len, @sizeOf(MediaTransport.SnapshotEndpoint));
+        try consumeSnapshotBytes(remaining, transport.ufrags.len, @sizeOf(MediaTransport.UfragIndex));
+        try consumeSnapshotBytes(remaining, transport.addresses.len, @sizeOf(MediaTransport.AddressIndex));
+        try consumeSnapshotBytes(remaining, transport.ssrcs.len, @sizeOf(MediaTransport.SsrcIndex));
+        try consumeSnapshotBytes(remaining, transport.groups.len, @sizeOf(MediaTransport.SnapshotGroup));
+        for (transport.endpoints) |row| {
+            try consumeSnapshotBytes(remaining, row.key.len, 1);
+            try consumeSnapshotBytes(remaining, row.rtx.packets.len, @sizeOf(rtp_nack.RetransmitBuffer.Snapshot.Packet));
+            for (row.rtx.packets) |packet| try consumeSnapshotBytes(remaining, packet.bytes.len, 1);
+        }
+        for (transport.groups) |row| try consumeSnapshotBytes(remaining, row.channel.len, 1);
+    }
+
+    pub fn validateConfiguration(self: *const PhysicalSnapshot, expected: Policy, limits: Limits) !void {
+        try self.validate(limits);
+        const actual: Policy = .{ .max_frame_bytes = self.max_frame_bytes, .max_upload_bytes = self.max_upload_bytes, .stun_server = self.stun_server, .dtls_requested = self.dtls_requested, .dtls13_requested = self.dtls13_requested, .cross_configured = self.cross_configured };
+        if (!std.meta.eql(actual, expected)) return error.ConfigMismatch;
+    }
+    pub fn validate(self: *const PhysicalSnapshot, limits: Limits) !void {
+        try self.socket.validate();
+        try self.csprng.validate();
+        if (self.stun_server) |addr| try validateCarryAddress(addr);
+        if (self.discovered) |addr| try validateCarryAddress(addr);
+        if (self.max_frame_bytes == 0 or self.max_frame_bytes > max_datagram or self.max_upload_bytes == 0 or
+            self.physical_revision == 0 or self.next_routing_inbound == 0 or
+            (self.dtls_enabled and !self.dtls_requested) or self.dtls13_enabled != self.dtls13_requested or
+            self.dtls_enabled != (self.dtls12 != null) or (self.dtls13 != null and (!self.dtls13_enabled or self.dtls12 == null)) or
+            self.rows.len > limits.max_rows or self.offered_fps.len > limits.max_offered or
+            self.groups.len > self.rows.len or self.ufrags.len > self.rows.len or self.rtcp_out_head >= rtcp_egress_queue_cap)
+            return error.InvalidSnapshot;
+        if (self.dtls12) |*term| {
+            if (term.identity.cert_len > term.identity.cert_der.len) return error.InvalidSnapshot;
+            try term.validate(.{ .cert_digest = peer_verify.certDigest(term.identity.cert_der[0..term.identity.cert_len]), .session_capacity = dtls_server.default_max_sessions, .request_client_cert = true });
+        }
+        if (self.dtls13) |*term| {
+            if (term.identity.cert_len > term.identity.cert_der.len) return error.InvalidSnapshot;
+            try term.validate(.{ .cert_digest = peer_verify.certDigest(term.identity.cert_der[0..term.identity.cert_len]), .session_capacity = dtls13_server.default_max_sessions, .request_client_cert = true });
+        }
+        if (self.dtls12 != null and self.dtls13 != null) {
+            const a = &self.dtls12.?.identity;
+            const b = &self.dtls13.?.identity;
+            if (a.cert_len != b.cert_len or !std.mem.eql(u8, a.cert_der[0..a.cert_len], b.cert_der[0..b.cert_len]) or !std.crypto.timing_safe.eql([32]u8, a.secret_key, b.secret_key) or self.dtls12.?.request_client_cert != self.dtls13.?.request_client_cert) return error.InvalidSnapshot;
+        }
+        if (self.dtls_fingerprint_len > self.dtls_fingerprint_buf.len or (self.dtls12 == null and self.dtls_fingerprint_len != 0) or (self.dtls12 != null and self.dtls_fingerprint_len == 0)) return error.InvalidSnapshot;
+        for (self.dtls_fingerprint_buf[self.dtls_fingerprint_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+        if (self.dtls12) |term| {
+            var expected_line: [128]u8 = undefined;
+            const actual = dtls_fingerprint.format(.sha256, term.identity.cert_der[0..term.identity.cert_len], &expected_line) catch return error.InvalidSnapshot;
+            if (actual.len != self.dtls_fingerprint_len or !std.mem.eql(u8, actual, self.dtls_fingerprint_buf[0..self.dtls_fingerprint_len])) return error.InvalidSnapshot;
+        }
+        try self.transport.validate(limits.transport);
+        try self.srtp.validate();
+        var call_participants: usize = 0;
+        for (self.rows, 0..) |*row, i| {
+            if (i != 0 and !keyLess(self.rows[i - 1].key, row.key)) return error.InvalidSnapshot;
+            if (i == 0 or !std.meta.eql(self.rows[i - 1].key.call, row.key.call)) call_participants = 0;
+            call_participants += 1;
+            if (call_participants > sfu_srtp.max_owners) return error.InvalidSnapshot;
+            try row.validate(limits.max_bytes);
+        }
+        for (self.ufrags, 0..) |index, i| {
+            if (i != 0 and std.mem.order(u8, &self.ufrags[i - 1].value, &index.value) != .lt) return error.InvalidSnapshot;
+            const row = self.rows[try self.rowIndex(index.key)];
+            if (!std.mem.eql(u8, &row.ufrag, &index.value)) return error.InvalidSnapshot;
+        }
+        for (self.groups, 0..) |group, i| {
+            if (group.count == 0 or (i != 0 and !callLess(self.groups[i - 1].call, group.call))) return error.InvalidSnapshot;
+            var count: u32 = 0;
+            for (self.rows) |row| if (std.meta.eql(row.key.call, group.call) and row.identity.mode == .legacy_group) {
+                count += 1;
+            };
+            if (count != group.count) return error.InvalidSnapshot;
+        }
+        for (self.ssrcs, 0..) |slot, i| {
+            if (!slot.live) {
+                if (!std.meta.eql(slot, SsrcSlot{})) return error.InvalidSnapshot;
+                continue;
+            }
+            const key = slot.key orelse return error.InvalidSnapshot;
+            const endpoint = slot.endpoint orelse return error.InvalidSnapshot;
+            const row = self.rows[try self.rowIndex(key)];
+            if (slot.ssrc == 0 or row.ssrc != slot.ssrc or !std.meta.eql(row.identity.stamp.endpoint, endpoint)) return error.InvalidSnapshot;
+            for (self.ssrcs[0..i]) |prior| if (prior.live and prior.ssrc == slot.ssrc) return error.InvalidSnapshot;
+        }
+        for (self.crypto, 0..) |slot, i| {
+            if (!slot.live) {
+                if (!std.meta.eql(slot, CryptoSlot{})) return error.InvalidSnapshot;
+                continue;
+            }
+            if (slot.endpoint == null or !validRoutingRemote(slot.addr)) return error.InvalidSnapshot;
+            for (slot.addr.ip[slot.addr.ip_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            var found = false;
+            for (self.rows) |row| if (std.meta.eql(row.identity.stamp.endpoint, slot.endpoint.?)) {
+                found = true;
+                break;
+            };
+            if (!found) return error.InvalidSnapshot;
+            for (self.crypto[0..i]) |prior| if (prior.live and routingAddressEqual(prior.addr, slot.addr)) return error.InvalidSnapshot;
+        }
+        for (self.offered_fps, 0..) |row, i| {
+            if (row.key.len == 0 or row.key.len > 256 or std.mem.indexOfScalar(u8, row.key, 0) == null or
+                (i != 0 and std.mem.order(u8, self.offered_fps[i - 1].key, row.key) != .lt)) return error.InvalidSnapshot;
+        }
+        if (self.queue.capacity == 0 or self.queue.capacity > std.math.maxInt(u16) or self.queue.payload_limit < 12 or self.queue.payload_limit > media_socket.max_datagram or self.queue.head >= self.queue.capacity or self.queue.next_ordinal == 0 or self.queue.next_fence == 0 or self.queue.completed != self.queue.next_ordinal - 1 or self.queue.head != self.queue.completed % self.queue.capacity or (self.queue.last_disposition != null) != (self.queue.completed != 0)) return error.InvalidSnapshot;
+        if (try self.snapshotBytes() > limits.max_bytes) return error.Capacity;
+    }
+
+    fn captureLocked(owner: *MediaPlane, allocator: std.mem.Allocator, limits: Limits) !PhysicalSnapshot {
+        if (owner.physical_rows.count() > limits.max_rows or owner.offered_fps.count() > limits.max_offered) return error.Capacity;
+        const queue = owner.routing_egress orelse return error.QueueUnavailable;
+        var remaining = limits.max_bytes;
+        try consumeSnapshotBytes(&remaining, 1, @sizeOf(PhysicalSnapshot));
+        try consumeSnapshotBytes(&remaining, owner.physical_rows.count(), @sizeOf(Row));
+        try consumeSnapshotBytes(&remaining, owner.physical_ufrags.count(), @sizeOf(Ufrag));
+        try consumeSnapshotBytes(&remaining, owner.physical_groups.count(), @sizeOf(Group));
+        try consumeSnapshotBytes(&remaining, owner.offered_fps.count(), @sizeOf(Fingerprint));
+        try consumeSnapshotBytes(&remaining, queue.rows.len, @sizeOf(RoutingEgressRow));
+        try consumeSnapshotBytes(&remaining, queue.rows.len, queue.payload_limit);
+        var offered_preflight = owner.offered_fps.keyIterator();
+        while (offered_preflight.next()) |key| try consumeSnapshotBytes(&remaining, key.*.len, 1);
+        const socket = if (owner.socket) |*held| try held.capture() else return error.NotPrepared;
+        var transport_limits = limits.transport;
+        const transport_budget = std.math.add(usize, remaining, @sizeOf(MediaTransport.Snapshot)) catch return error.Capacity;
+        transport_limits.max_bytes = @min(transport_limits.max_bytes, transport_budget);
+        var transport = try owner.transport.capture(allocator, transport_limits);
+        errdefer transport.deinit();
+        try consumeTransportBytes(&remaining, &transport);
+        try consumeSnapshotBytes(&remaining, owner.srtp_hub.peers.len, @sizeOf(sfu_srtp.SfuSrtp.Snapshot.Peer));
+        var srtp_snapshot = try owner.srtp_hub.capture(allocator);
+        errdefer srtp_snapshot.deinit();
+        var dtls12: ?dtls_server.Terminator.Snapshot = null;
+        errdefer if (dtls12) |*term| term.deinit();
+        if (owner.dtls) |term| {
+            try consumeSnapshotBytes(&remaining, term.sessions.len, @sizeOf(?dtls_server.Terminator.SessionSnapshot));
+            dtls12 = try term.capture(allocator);
+        }
+        var dtls13: ?dtls13_server.Terminator.Snapshot = null;
+        errdefer if (dtls13) |*term| term.deinit();
+        if (owner.dtls13) |term| {
+            try consumeSnapshotBytes(&remaining, term.sessions.len, @sizeOf(?dtls13_server.Terminator.SessionSnapshot));
+            dtls13 = try term.capture(allocator);
+        }
+
+        const keys = try allocator.alloc(routing.EndpointKey, owner.physical_rows.count());
+        defer allocator.free(keys);
+        var ki = owner.physical_rows.keyIterator();
+        var n: usize = 0;
+        while (ki.next()) |key| : (n += 1) keys[n] = key.*;
+        std.mem.sort(routing.EndpointKey, keys, {}, struct {
+            fn less(_: void, a: routing.EndpointKey, b: routing.EndpointKey) bool {
+                return keyLess(a, b);
+            }
+        }.less);
+        const rows = try allocator.alloc(Row, keys.len);
+        var row_count: usize = 0;
+        errdefer {
+            for (rows[0..row_count]) |*row| row.deinit();
+            allocator.free(rows);
+        }
+        for (keys) |key| {
+            rows[row_count] = try Row.fromLive(key, owner.physical_rows.getPtr(key).?, allocator, &remaining);
+            row_count += 1;
+        }
+        const ufrags = try allocator.alloc(Ufrag, owner.physical_ufrags.count());
+        errdefer allocator.free(ufrags);
+        var ui = owner.physical_ufrags.iterator();
+        n = 0;
+        while (ui.next()) |entry| : (n += 1) ufrags[n] = .{ .value = entry.key_ptr.*, .key = entry.value_ptr.* };
+        std.mem.sort(Ufrag, ufrags, {}, struct {
+            fn less(_: void, a: Ufrag, b: Ufrag) bool {
+                return std.mem.order(u8, &a.value, &b.value) == .lt;
+            }
+        }.less);
+
+        const calls = try allocator.alloc(routing.CallId, owner.physical_groups.count());
+        defer allocator.free(calls);
+        var gi = owner.physical_groups.keyIterator();
+        n = 0;
+        while (gi.next()) |call| : (n += 1) calls[n] = call.*;
+        std.mem.sort(routing.CallId, calls, {}, struct {
+            fn less(_: void, a: routing.CallId, b: routing.CallId) bool {
+                return callLess(a, b);
+            }
+        }.less);
+        const groups = try allocator.alloc(Group, calls.len);
+        var group_count: usize = 0;
+        errdefer {
+            for (groups[0..group_count]) |*group| std.crypto.secureZero(u8, &group.key);
+            allocator.free(groups);
+        }
+        for (calls) |call| {
+            const source = owner.physical_groups.getPtr(call).?;
+            groups[group_count] = .{ .call = call, .key = source.key, .count = source.count };
+            group_count += 1;
+        }
+
+        const offered_fps = try allocator.alloc(Fingerprint, owner.offered_fps.count());
+        var offered_count: usize = 0;
+        errdefer {
+            for (offered_fps[0..offered_count]) |row| allocator.free(row.key);
+            allocator.free(offered_fps);
+        }
+        var fi = owner.offered_fps.iterator();
+        while (fi.next()) |entry| {
+            offered_fps[offered_count] = .{ .key = try allocator.dupe(u8, entry.key_ptr.*), .digest = entry.value_ptr.* };
+            offered_count += 1;
+        }
+        std.mem.sort(Fingerprint, offered_fps, {}, struct {
+            fn less(_: void, a: Fingerprint, b: Fingerprint) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.less);
+        var ssrcs: [sfu_srtp.max_owners]SsrcSlot = @splat(.{});
+        for (owner.physical_ssrcs, &ssrcs) |source, *target| {
+            if (source.live) target.* = .{ .live = true, .ssrc = source.ssrc, .key = source.key, .endpoint = source.endpoint };
+        }
+        var crypto: [sfu_srtp.max_peers]CryptoSlot = @splat(.{});
+        for (owner.routing_crypto, &crypto) |source, *target| {
+            if (source.live) target.* = .{ .live = true, .endpoint = source.endpoint, .binding_revision = source.binding_revision, .addr = source.addr };
+        }
+        var fingerprint_buf: [128]u8 = @splat(0);
+        if (owner.dtls_fingerprint_len > fingerprint_buf.len) return error.InvalidSnapshot;
+        @memcpy(fingerprint_buf[0..owner.dtls_fingerprint_len], owner.dtls_fingerprint_buf[0..owner.dtls_fingerprint_len]);
+        const snapshot: PhysicalSnapshot = .{ .allocator = allocator, .socket = socket, .csprng = RngState.capture(&owner.csprng), .stun_server = owner.stun_server, .discovered = owner.discovered, .max_frame_bytes = owner.max_frame_bytes, .max_upload_bytes = owner.max_upload_bytes, .cross_configured = owner.cross != null, .dtls_enabled = owner.dtls_enabled, .dtls_requested = owner.dtls_requested, .dtls13_enabled = owner.dtls13_enabled, .dtls13_requested = owner.dtls13_requested, .dtls_fingerprint_buf = fingerprint_buf, .dtls_fingerprint_len = owner.dtls_fingerprint_len, .dtls12 = dtls12, .dtls13 = dtls13, .srtp = srtp_snapshot, .transport = transport, .rows = rows, .ufrags = ufrags, .groups = groups, .ssrcs = ssrcs, .crypto = crypto, .offered_fps = offered_fps, .queue = .{ .capacity = queue.rows.len, .payload_limit = queue.payload_limit, .head = queue.head, .next_ordinal = queue.next_ordinal, .completed = queue.completed, .last_disposition = queue.last_disposition, .next_fence = queue.next_fence }, .rtcp_out_head = owner.rtcp_out_head, .physical_revision = owner.physical_revision, .next_routing_inbound = owner.next_routing_inbound, .routing_ingress_refused = owner.routing_ingress_refused, .routing_ingress_completed = owner.routing_ingress_completed, .routing_last_ingress_error = owner.routing_last_ingress_error };
+        try snapshot.validate(limits);
+        return snapshot;
+    }
+
+    /// All allocations and key reconstruction happen off-owner. Publication
+    /// requires a separate authenticated graph join and a no-fail owner swap.
+    fn prepareRestore(self: *const PhysicalSnapshot, allocator: std.mem.Allocator, limits: Limits) !PhysicalState {
+        try self.validate(limits);
+        var candidate = PhysicalState{ .allocator = allocator, .csprng = self.csprng, .socket = self.socket, .stun_server = self.stun_server, .discovered = self.discovered, .max_frame_bytes = self.max_frame_bytes, .max_upload_bytes = self.max_upload_bytes, .cross_configured = self.cross_configured, .dtls_enabled = self.dtls_enabled, .dtls_requested = self.dtls_requested, .dtls13_enabled = self.dtls13_enabled, .dtls13_requested = self.dtls13_requested, .dtls_fingerprint_buf = self.dtls_fingerprint_buf, .dtls_fingerprint_len = self.dtls_fingerprint_len, .transport = MediaTransport.init(allocator), .srtp = sfu_srtp.SfuSrtp.init(allocator), .ssrcs = @splat(.{}), .crypto = @splat(.{}), .queue = null, .rtcp_out_head = self.rtcp_out_head, .physical_revision = self.physical_revision, .next_routing_inbound = self.next_routing_inbound, .routing_ingress_refused = self.routing_ingress_refused, .routing_ingress_completed = self.routing_ingress_completed, .routing_last_ingress_error = self.routing_last_ingress_error };
+        errdefer candidate.deinit();
+        try candidate.rows.ensureTotalCapacity(allocator, @intCast(self.rows.len));
+        try candidate.ufrags.ensureTotalCapacity(allocator, @intCast(self.ufrags.len));
+        try candidate.groups.ensureTotalCapacity(allocator, @intCast(self.groups.len));
+        try candidate.offered_fps.ensureTotalCapacity(allocator, @intCast(self.offered_fps.len));
+        for (self.rows) |row| {
+            var rtx = try rtp_nack.RetransmitBuffer.prepareRestore(allocator, &row.rtx, media_transport.rtx_capacity, limits.max_bytes);
+            errdefer rtx.deinit();
+            const cache = try rtp_nack.PerSsrcRetransmitBuffer.prepareRestore(allocator, &row.cache, media_transport.rtx_capacity, sfu_srtp.max_owners, limits.max_bytes);
+            candidate.rows.putAssumeCapacity(row.key, .{ .identity = row.identity, .profile = row.profile, .kind_bits = row.kind_bits, .expected_fp = row.expected_fp, .max_temporal = row.max_temporal, .physical_cache = cache, .endpoint = .{ .ufrag = row.ufrag, .pwd = row.pwd, .remote = row.remote, .max_spatial = row.max_spatial, .ssrc = row.ssrc, .rx_packets = row.rx_packets, .rx_bytes = row.rx_bytes, .rtx = rtx } });
+        }
+        for (self.ufrags) |row| candidate.ufrags.putAssumeCapacity(row.value, row.key);
+        for (self.groups) |row| candidate.groups.putAssumeCapacity(row.call, .{ .key = row.key, .count = row.count });
+        for (self.ssrcs, &candidate.ssrcs) |source, *target| {
+            if (source.live) target.* = .{ .live = true, .ssrc = source.ssrc, .key = source.key.?, .endpoint = source.endpoint.? };
+        }
+        for (self.crypto, &candidate.crypto) |source, *target| {
+            if (source.live) target.* = .{ .live = true, .endpoint = source.endpoint.?, .binding_revision = source.binding_revision, .addr = source.addr };
+        }
+        candidate.transport = try MediaTransport.prepareRestore(allocator, &self.transport, limits.transport);
+        candidate.srtp = try sfu_srtp.SfuSrtp.prepareRestore(allocator, &self.srtp);
+        if (self.dtls12) |*term| candidate.dtls12 = try dtls_server.Terminator.prepareRestore(allocator, term, .{ .cert_digest = peer_verify.certDigest(term.identity.cert_der[0..term.identity.cert_len]), .session_capacity = dtls_server.default_max_sessions, .request_client_cert = true });
+        if (self.dtls13) |*term| candidate.dtls13 = try dtls13_server.Terminator.prepareRestore(allocator, term, .{ .cert_digest = peer_verify.certDigest(term.identity.cert_der[0..term.identity.cert_len]), .session_capacity = dtls13_server.default_max_sessions, .request_client_cert = true });
+        for (self.offered_fps) |row| {
+            const key = try allocator.dupe(u8, row.key);
+            errdefer allocator.free(key);
+            candidate.offered_fps.putAssumeCapacity(key, row.digest);
+        }
+        const queue = try allocator.create(RoutingEgressQueue);
+        errdefer allocator.destroy(queue);
+        const rows = try allocator.alloc(RoutingEgressRow, self.queue.capacity);
+        errdefer allocator.free(rows);
+        const payloads = try allocator.alloc(u8, try std.math.mul(usize, self.queue.capacity, self.queue.payload_limit));
+        @memset(payloads, 0);
+        queue.* = .{ .rows = rows, .payloads = payloads, .payload_limit = self.queue.payload_limit, .head = self.queue.head, .next_ordinal = self.queue.next_ordinal, .completed = self.queue.completed, .last_disposition = self.queue.last_disposition, .next_fence = self.queue.next_fence };
+        candidate.queue = queue;
+        return candidate;
+    }
+};
+
+const PhysicalState = struct {
+    allocator: std.mem.Allocator,
+    socket: media_socket.Snapshot,
+    csprng: RngState,
+    stun_server: ?TransportAddress,
+    discovered: ?TransportAddress,
+    max_frame_bytes: usize,
+    max_upload_bytes: u64,
+    cross_configured: bool,
+    dtls_enabled: bool,
+    dtls_requested: bool,
+    dtls13_enabled: bool,
+    dtls13_requested: bool,
+    dtls_fingerprint_buf: [128]u8,
+    dtls_fingerprint_len: usize,
+    dtls12: ?dtls_server.Terminator.Restoration = null,
+    dtls13: ?dtls13_server.Terminator.Restoration = null,
+    srtp: sfu_srtp.SfuSrtp,
+    transport: MediaTransport,
+    rows: PhysicalRtcMap = .empty,
+    ufrags: PhysicalUfragMap = .empty,
+    groups: PhysicalGroupMap = .empty,
+    ssrcs: [sfu_srtp.max_owners]PhysicalSsrc,
+    crypto: [sfu_srtp.max_peers]RoutingCryptoAssociation,
+    offered_fps: std.StringHashMapUnmanaged([peer_verify.digest_len]u8) = .empty,
+    queue: ?*RoutingEgressQueue,
+    rtcp_out_head: usize,
+    physical_revision: u64,
+    next_routing_inbound: u64,
+    routing_ingress_refused: u64,
+    routing_ingress_completed: u64,
+    routing_last_ingress_error: ?anyerror,
+    fn deinit(self: *PhysicalState) void {
+        var rows = self.rows.valueIterator();
+        while (rows.next()) |row| {
+            row.endpoint.rtx.deinit();
+            row.physical_cache.deinit();
+            row.wipe();
+        }
+        self.rows.deinit(self.allocator);
+        self.ufrags.deinit(self.allocator);
+        var groups = self.groups.valueIterator();
+        while (groups.next()) |group| std.crypto.secureZero(u8, &group.key);
+        self.groups.deinit(self.allocator);
+        var offered = self.offered_fps.keyIterator();
+        while (offered.next()) |key| self.allocator.free(key.*);
+        self.offered_fps.deinit(self.allocator);
+        self.transport.deinit();
+        self.srtp.wipe();
+        if (self.dtls12) |*term| term.deinit();
+        if (self.dtls13) |*term| term.deinit();
+        if (self.queue) |queue| {
+            std.crypto.secureZero(u8, queue.payloads);
+            self.allocator.free(queue.rows);
+            self.allocator.free(queue.payloads);
+            self.allocator.destroy(queue);
+        }
+        std.crypto.secureZero(u8, &self.csprng.state);
+        self.* = undefined;
+    }
+};
+
 test "Windows Helix media plane imports idle DTLS owner and parks inherited worker" {
     if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
     var source = try MediaPlane.initFallible(testing.allocator);
@@ -4993,12 +5537,16 @@ const PhysicalIceFixture = struct {
     binding: *routing.WebrtcBinding,
     fail: *testing.FailingAllocator,
     fn init(fail: *testing.FailingAllocator) !@This() {
+        return initWithDtls(fail, false);
+    }
+    fn initWithDtls(fail: *testing.FailingAllocator, enabled: bool) !@This() {
         const domain = try routing.Domain.create(testing.allocator);
         errdefer domain.destroyQuiesced() catch unreachable;
         const owner = try testing.allocator.create(MediaPlane);
         errdefer testing.allocator.destroy(owner);
         owner.* = try MediaPlane.initFallible(fail.allocator());
         errdefer owner.deinit();
+        owner.dtls_enabled = enabled;
         try owner.prepareColdResources(testing.io, loopback_be, 0);
         const binding = try domain.bindWebrtc(owner);
         errdefer domain.releaseWebrtc(binding) catch unreachable;
@@ -5039,6 +5587,100 @@ const PhysicalIceFixture = struct {
         return token;
     }
 };
+
+test "media physical DTO preserves retransmit state and refuses in-flight egress" {
+    var fail = testing.FailingAllocator.init(testing.allocator, .{});
+    var fixture = try PhysicalIceFixture.init(&fail);
+    defer fixture.deinit();
+    var offer = try fixture.offer(.{ .shard = 0, .slot = 7, .gen = 1 });
+    defer std.crypto.secureZero(u8, &offer.creds.pwd);
+    const packet = [13]u8{ 0x80, 111, 0, 9, 0, 0, 0, 1, 0, 0, 1, 145, 'x' };
+    const row = fixture.owner.physical_rows.getPtr(offer.key).?;
+    const rtx = try row.endpoint.rtx.prepareSent(9, &packet);
+    defer rtx.deinit();
+    try rtx.validate();
+    rtx.commitRetainingMetadata();
+    const cache = try row.physical_cache.prepareSent(401, 9, &packet);
+    defer cache.deinit();
+    try cache.validate();
+    cache.commitRetainingMetadata();
+    try fixture.owner.startPreparedLegacyWorker();
+    const token = try fixture.paused(1);
+    defer fixture.owner.resumePaused(token) catch unreachable;
+    const limits: PhysicalSnapshot.Limits = .{ .max_rows = 8, .max_offered = 8, .max_bytes = 8 * 1024 * 1024, .transport = .{ .max_endpoints = 8, .max_groups = 8, .max_bytes = 8 * 1024 * 1024 } };
+    const Cut = struct {
+        fixture: *PhysicalIceFixture,
+        token: runtime_pause.Token,
+        limits: PhysicalSnapshot.Limits,
+        fn run(scope: *routing.Locked, ctx: @This()) !PhysicalSnapshot {
+            const fence = try ctx.fixture.owner.fenceRoutingProducersLocked(ctx.fixture.domain, scope);
+            defer ctx.fixture.owner.resumeRoutingProducersLocked(ctx.fixture.domain, scope, fence) catch unreachable;
+            const queue = ctx.fixture.owner.routing_egress.?;
+            queue.inflight = 1;
+            try testing.expectError(error.Busy, ctx.fixture.owner.capturePausedPhysicalRoutingLocked(ctx.fixture.domain, scope, ctx.token, testing.allocator, ctx.limits));
+            queue.inflight = null;
+            try ctx.fixture.owner.requireRoutingEgressSettledLocked(ctx.fixture.domain, scope, fence);
+            return ctx.fixture.owner.capturePausedPhysicalRoutingLocked(ctx.fixture.domain, scope, ctx.token, testing.allocator, ctx.limits);
+        }
+    };
+    var carry = try fixture.domain.withLocked(Cut{ .fixture = &fixture, .token = token, .limits = limits }, Cut.run);
+    defer carry.deinit();
+    try testing.expectEqual(@as(usize, 1), carry.rows.len);
+    var restored = try carry.prepareRestore(testing.allocator, limits);
+    defer restored.deinit();
+    const adopted = restored.rows.getPtr(offer.key).?;
+    try testing.expectEqualSlices(u8, &packet, adopted.endpoint.rtx.lookup(9).?);
+    try testing.expectEqualSlices(u8, &packet, adopted.physical_cache.lookup(401, 9).?);
+    try testing.expectEqual(carry.queue.next_ordinal, restored.queue.?.next_ordinal);
+    const saved = carry.rows[0].ufrag;
+    carry.rows[0].ufrag = @splat(0);
+    try testing.expectError(error.InvalidSnapshot, carry.validate(limits));
+    carry.rows[0].ufrag = saved;
+    carry.queue.completed += 1;
+    try testing.expectError(error.InvalidSnapshot, carry.validate(limits));
+    carry.queue.completed -= 1;
+    var too_small = limits;
+    too_small.max_bytes = (try carry.snapshotBytes()) - 1;
+    try testing.expectError(error.Capacity, carry.validate(too_small));
+}
+
+test "media physical DTO DTLS fingerprint and configured session capacity are joined" {
+    var fail = testing.FailingAllocator.init(testing.allocator, .{});
+    var fixture = try PhysicalIceFixture.initWithDtls(&fail, true);
+    defer fixture.deinit();
+    try testing.expect(fixture.owner.dtls != null);
+    try fixture.owner.startPreparedLegacyWorker();
+    const token = try fixture.paused(1);
+    defer fixture.owner.resumePaused(token) catch unreachable;
+    const limits: PhysicalSnapshot.Limits = .{ .max_rows = 8, .max_offered = 8, .max_bytes = 32 * 1024 * 1024, .transport = .{ .max_endpoints = 8, .max_groups = 8, .max_bytes = 32 * 1024 * 1024 } };
+    const Cut = struct {
+        fixture: *PhysicalIceFixture,
+        token: runtime_pause.Token,
+        limits: PhysicalSnapshot.Limits,
+        fn run(scope: *routing.Locked, ctx: @This()) !PhysicalSnapshot {
+            const fence = try ctx.fixture.owner.fenceRoutingProducersLocked(ctx.fixture.domain, scope);
+            defer ctx.fixture.owner.resumeRoutingProducersLocked(ctx.fixture.domain, scope, fence) catch unreachable;
+            return ctx.fixture.owner.capturePausedPhysicalRoutingLocked(ctx.fixture.domain, scope, ctx.token, testing.allocator, ctx.limits);
+        }
+    };
+    var carry = try fixture.domain.withLocked(Cut{ .fixture = &fixture, .token = token, .limits = limits }, Cut.run);
+    defer carry.deinit();
+    try carry.validate(limits);
+    carry.dtls_fingerprint_buf[0] ^= 1;
+    try testing.expectError(error.InvalidSnapshot, carry.validate(limits));
+    carry.dtls_fingerprint_buf[0] ^= 1;
+    const sessions = carry.dtls12.?.sessions;
+    carry.dtls12.?.sessions = sessions[0 .. sessions.len - 1];
+    try testing.expectError(error.ConfigMismatch, carry.validate(limits));
+    carry.dtls12.?.sessions = sessions;
+    carry.dtls12.?.request_client_cert = false;
+    try testing.expectError(error.ConfigMismatch, carry.validate(limits));
+    carry.dtls12.?.request_client_cert = true;
+    var restored = try carry.prepareRestore(testing.allocator, limits);
+    defer restored.deinit();
+    try testing.expect(restored.dtls12 != null);
+    try testing.expectEqualSlices(u8, carry.dtls_fingerprint_buf[0..carry.dtls_fingerprint_len], restored.dtls_fingerprint_buf[0..restored.dtls_fingerprint_len]);
+}
 
 test "physical ICE actual bound worker authenticates first binding and refuses migration collision and retired credentials" {
     var fail = testing.FailingAllocator.init(testing.allocator, .{});

@@ -570,6 +570,100 @@ pub const NativeMediaTransport = struct {
             return error.ActiveMediaContinuityUnsupported;
         return self.captureCutLocked(.paused, true);
     }
+    /// A detached physical DTO for a later aggregate media handoff. The caller
+    /// owns the Domain cut and a genuinely parked pump; this does not authorize
+    /// an active upgrade by itself.
+    pub fn capturePausedPhysicalRoutingLocked(self: *NativeMediaTransport, domain: *routing.Domain, scope: *const routing.Locked, token: runtime_pause.Token, allocator: std.mem.Allocator, max_bytes: usize) !PhysicalSnapshot {
+        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        try domain.requireNativeBindingLocked(scope, self.routing_binding orelse return error.NotRoutingBound, self);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.routing_domain != domain or self.routing_closed or self.legacy_joining or
+            self.stop_flag.load(.acquire) or self.active_ingress != null or self.physical_pending != 0)
+            return error.Busy;
+        return self.capturePhysicalCutLocked(allocator, max_bytes);
+    }
+
+    fn capturePhysicalCutLocked(self: *NativeMediaTransport, allocator: std.mem.Allocator, max_bytes: usize) !PhysicalSnapshot {
+        var bytes = try physicalSnapshotBytes(self.physical_endpoints.count(), self.physical_streams.count(), self.channels.count(), self.stream_index.count());
+        var names = self.channels.keyIterator();
+        while (names.next()) |name| bytes = std.math.add(usize, bytes, name.len) catch return error.Capacity;
+        if (bytes > max_bytes) return error.Capacity;
+
+        const sorted_keys = try allocator.alloc(routing.EndpointKey, self.physical_endpoints.count());
+        defer allocator.free(sorted_keys);
+        var ei = self.physical_endpoints.keyIterator();
+        var key_count: usize = 0;
+        while (ei.next()) |key| : (key_count += 1) sorted_keys[key_count] = key.*;
+        std.mem.sort(routing.EndpointKey, sorted_keys, {}, struct {
+            fn less(_: void, a: routing.EndpointKey, b: routing.EndpointKey) bool {
+                return endpointKeyLess(a, b);
+            }
+        }.less);
+        const endpoints = try allocator.alloc(PhysicalSnapshot.Endpoint, self.physical_endpoints.count());
+        var endpoint_count: usize = 0;
+        errdefer {
+            for (endpoints[0..endpoint_count]) |*row| row.wipe();
+            allocator.free(endpoints);
+        }
+        for (sorted_keys) |key| {
+            endpoints[endpoint_count] = PhysicalSnapshot.Endpoint.fromLive(key, self.physical_endpoints.getPtr(key).?);
+            endpoint_count += 1;
+        }
+
+        const streams = try allocator.alloc(PhysicalSnapshot.Stream, self.physical_streams.count());
+        errdefer allocator.free(streams);
+        var si = self.physical_streams.iterator();
+        var i: usize = 0;
+        while (si.next()) |entry| : (i += 1) streams[i] = .{ .stream_id = entry.key_ptr.*, .key = entry.value_ptr.* };
+        std.mem.sort(PhysicalSnapshot.Stream, streams, {}, struct {
+            fn less(_: void, a: PhysicalSnapshot.Stream, b: PhysicalSnapshot.Stream) bool {
+                return a.stream_id < b.stream_id;
+            }
+        }.less);
+
+        const channels = try allocator.alloc(PhysicalSnapshot.Channel, self.channels.count());
+        var channel_count: usize = 0;
+        errdefer {
+            for (channels[0..channel_count]) |row| allocator.free(row.name);
+            allocator.free(channels);
+        }
+        var ci = self.channels.iterator();
+        while (ci.next()) |entry| {
+            const name = try allocator.dupe(u8, entry.key_ptr.*);
+            channels[channel_count] = .{ .name = name, .link = entry.value_ptr.capture() catch |err| {
+                allocator.free(name);
+                return err;
+            } };
+            channel_count += 1;
+        }
+        std.mem.sort(PhysicalSnapshot.Channel, channels, {}, struct {
+            fn less(_: void, a: PhysicalSnapshot.Channel, b: PhysicalSnapshot.Channel) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.less);
+
+        const stream_index = try allocator.alloc(PhysicalSnapshot.ChannelIndex, self.stream_index.count());
+        errdefer allocator.free(stream_index);
+        var ii = self.stream_index.iterator();
+        i = 0;
+        while (ii.next()) |entry| : (i += 1) {
+            // The live value must borrow the exact owned channel key. Capture
+            // its ordinal, never an address that could dangle after the cut.
+            const key = self.channels.getKey(entry.value_ptr.*) orelse return error.InvalidSnapshot;
+            if (key.ptr != entry.value_ptr.ptr or key.len != entry.value_ptr.len) return error.InvalidSnapshot;
+            stream_index[i] = .{ .stream_id = entry.key_ptr.*, .channel = try PhysicalSnapshot.channelIndex(channels, key) };
+        }
+        std.mem.sort(PhysicalSnapshot.ChannelIndex, stream_index, {}, struct {
+            fn less(_: void, a: PhysicalSnapshot.ChannelIndex, b: PhysicalSnapshot.ChannelIndex) bool {
+                return a.stream_id < b.stream_id;
+            }
+        }.less);
+        const snapshot: PhysicalSnapshot = .{ .allocator = allocator, .endpoints = endpoints, .streams = streams, .channels = channels, .stream_index = stream_index, .physical_revision = self.physical_revision, .next_ingress_serial = self.next_ingress_serial, .routed_accepted = self.routed_accepted.load(.acquire), .routed_refused = self.routed_refused.load(.acquire), .routed_errors = self.routed_errors.load(.acquire) };
+        try snapshot.validate(self.max_participants, max_bytes);
+        return snapshot;
+    }
     pub fn captureUnstarted(self: *NativeMediaTransport) !Snapshot {
         if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
         return self.captureCut(.unstarted);
@@ -1845,6 +1939,334 @@ fn nativeEndpointEqual(a: ?NativeEndpoint, b: ?NativeEndpoint) bool {
 }
 const NativeEndpointMap = std.AutoHashMapUnmanaged(routing.EndpointKey, NativeEndpoint);
 const NativeStreamMap = std.AutoHashMapUnmanaged(u32, routing.EndpointKey);
+fn endpointKeyLess(a: routing.EndpointKey, b: routing.EndpointKey) bool {
+    if (a.call.domain.serial != b.call.domain.serial) return a.call.domain.serial < b.call.domain.serial;
+    if (a.call.serial != b.call.serial) return a.call.serial < b.call.serial;
+    if (a.client.shard != b.client.shard) return a.client.shard < b.client.shard;
+    if (a.client.slot != b.client.slot) return a.client.slot < b.client.slot;
+    if (a.client.gen != b.client.gen) return a.client.gen < b.client.gen;
+    return @intFromEnum(a.leg) < @intFromEnum(b.leg);
+}
+fn physicalSnapshotBytes(endpoints: usize, streams: usize, channels: usize, indexes: usize) !usize {
+    var bytes: usize = 0;
+    inline for (.{ .{ endpoints, @sizeOf(PhysicalSnapshot.Endpoint) }, .{ streams, @sizeOf(PhysicalSnapshot.Stream) }, .{ channels, @sizeOf(PhysicalSnapshot.Channel) }, .{ indexes, @sizeOf(PhysicalSnapshot.ChannelIndex) } }) |part| {
+        bytes = std.math.add(usize, bytes, std.math.mul(usize, part[0], part[1]) catch return error.Capacity) catch return error.Capacity;
+    }
+    return bytes;
+}
+
+/// Logical native UDP state only. Every key and credential is owned; no live
+/// map pointer, socket, Domain authority, or raw map backing crosses this DTO.
+/// The aggregate Helix graph must independently join these rows to its Domain.
+pub const PhysicalSnapshot = struct {
+    pub const Endpoint = struct {
+        key: routing.EndpointKey,
+        selection: Selection,
+        profile: rooms.CallProfile,
+        identity: routing.EndpointObservation,
+        kind_bits: u8,
+        codecs: u8,
+        master: [32]u8,
+        keys: capability.Keys,
+        remote: ?TransportAddress,
+        display_nick: [64]u8,
+        display_len: u8,
+
+        fn fromLive(key: routing.EndpointKey, live: *const NativeEndpoint) Endpoint {
+            // CallProfile's unused inline tail is undefined in live rows. Give
+            // the DTO a canonical, fully initialized tail before encoding.
+            var profile: rooms.CallProfile = .{ .codecs = @splat(.{ .tag = .raw, .clock_rate = 0, .params = 0 }), .codec_count = live.profile.codec_count, .fec = live.profile.fec };
+            if (profile.codec_count <= rooms.max_profile_codecs) @memcpy(profile.codecs[0..profile.codec_count], live.profile.codecs[0..profile.codec_count]);
+            return .{ .key = key, .selection = live.selection, .profile = profile, .identity = live.identity, .kind_bits = live.kind_bits, .codecs = live.codecs, .master = live.master, .keys = live.keys, .remote = live.remote, .display_nick = live.display_nick, .display_len = live.display_len };
+        }
+        fn toLive(self: Endpoint) NativeEndpoint {
+            return .{ .selection = self.selection, .profile = self.profile, .identity = self.identity, .kind_bits = self.kind_bits, .codecs = self.codecs, .master = self.master, .keys = self.keys, .remote = self.remote, .display_nick = self.display_nick, .display_len = self.display_len };
+        }
+        fn wipe(self: *Endpoint) void {
+            std.crypto.secureZero(u8, &self.master);
+            self.keys.wipe();
+        }
+        fn validate(self: *const Endpoint) !void {
+            const identity = self.identity;
+            if (self.key.leg != .native or identity.stream_id == 0 or
+                !std.meta.eql(identity.reference.endpoint, identity.stamp.endpoint) or
+                !std.meta.eql(identity.reference.offering_client, identity.stamp.offering_client) or
+                !std.meta.eql(self.key.call, identity.reference.endpoint.call) or
+                !std.meta.eql(self.key.client, identity.reference.offering_client) or
+                identity.reference.endpoint.leg != .native or self.display_len > self.display_nick.len)
+                return error.InvalidSnapshot;
+            for (self.display_nick[self.display_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            if (self.profile.codec_count == 0 or self.profile.codec_count > rooms.max_profile_codecs) return error.InvalidSnapshot;
+            for (self.profile.codecs[self.profile.codec_count..]) |codec| {
+                if (codec.tag != .raw or codec.clock_rate != 0 or codec.params != 0) return error.InvalidSnapshot;
+            }
+            if (self.codecs != (nativeCodecs(self.profile, self.kind_bits) catch return error.InvalidSnapshot)) return error.InvalidSnapshot;
+            if (self.remote) |addr| {
+                if (!validIngressAddress(addr)) return error.InvalidSnapshot;
+                for (addr.ip[addr.ip_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
+            }
+            var expected = try capability.derive(&self.master, identity.stream_id);
+            defer expected.wipe();
+            if (!std.meta.eql(expected, self.keys)) return error.InvalidSnapshot;
+        }
+    };
+    pub const Stream = struct { stream_id: u32, key: routing.EndpointKey };
+    pub const Channel = struct { name: []u8, link: Link.Snapshot };
+    pub const ChannelIndex = struct { stream_id: u32, channel: usize };
+
+    allocator: std.mem.Allocator,
+    endpoints: []Endpoint,
+    streams: []Stream,
+    channels: []Channel,
+    stream_index: []ChannelIndex,
+    physical_revision: u64,
+    next_ingress_serial: u64,
+    routed_accepted: u64,
+    routed_refused: u64,
+    routed_errors: u64,
+
+    pub fn deinit(self: *PhysicalSnapshot) void {
+        for (self.endpoints) |*row| row.wipe();
+        for (self.channels) |row| self.allocator.free(row.name);
+        self.allocator.free(self.endpoints);
+        self.allocator.free(self.streams);
+        self.allocator.free(self.channels);
+        self.allocator.free(self.stream_index);
+        self.* = undefined;
+    }
+    fn endpointIndex(self: *const PhysicalSnapshot, key: routing.EndpointKey) !usize {
+        var lo: usize = 0;
+        var hi = self.endpoints.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.meta.eql(self.endpoints[mid].key, key)) return mid;
+            if (endpointKeyLess(self.endpoints[mid].key, key)) lo = mid + 1 else hi = mid;
+        }
+        return error.InvalidSnapshot;
+    }
+    fn channelIndex(channels: []const Channel, name: []const u8) !usize {
+        var lo: usize = 0;
+        var hi = channels.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (std.mem.order(u8, channels[mid].name, name)) {
+                .eq => return mid,
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+            }
+        }
+        return error.InvalidSnapshot;
+    }
+    fn streamIndex(self: *const PhysicalSnapshot, stream_id: u32) !usize {
+        var lo: usize = 0;
+        var hi = self.streams.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.streams[mid].stream_id == stream_id) return mid;
+            if (self.streams[mid].stream_id < stream_id) lo = mid + 1 else hi = mid;
+        }
+        return error.InvalidSnapshot;
+    }
+    pub fn validate(self: *const PhysicalSnapshot, expected_max_participants: usize, max_bytes: usize) !void {
+        if (self.physical_revision == 0 or self.next_ingress_serial == 0 or expected_max_participants == 0 or expected_max_participants > max_call_participants or self.streams.len != self.endpoints.len) return error.InvalidSnapshot;
+        var bytes = try physicalSnapshotBytes(self.endpoints.len, self.streams.len, self.channels.len, self.stream_index.len);
+        var call_participants: usize = 0;
+        for (self.endpoints, 0..) |*row, i| {
+            if (i != 0 and !endpointKeyLess(self.endpoints[i - 1].key, row.key)) return error.InvalidSnapshot;
+            if (i == 0 or !std.meta.eql(self.endpoints[i - 1].key.call, row.key.call)) call_participants = 0;
+            call_participants += 1;
+            if (call_participants > expected_max_participants) return error.InvalidSnapshot;
+            try row.validate();
+            const stream = self.streams[try self.streamIndex(row.identity.stream_id)];
+            if (!std.meta.eql(stream.key, row.key)) return error.InvalidSnapshot;
+        }
+        for (self.streams, 0..) |row, i| {
+            if (i != 0 and self.streams[i - 1].stream_id >= row.stream_id) return error.InvalidSnapshot;
+            const endpoint = self.endpoints[try self.endpointIndex(row.key)];
+            if (endpoint.identity.stream_id != row.stream_id) return error.InvalidSnapshot;
+        }
+        for (self.channels, 0..) |row, i| {
+            if (i != 0 and std.mem.order(u8, self.channels[i - 1].name, row.name) != .lt) return error.InvalidSnapshot;
+            try row.link.validate(expected_max_participants);
+            bytes = std.math.add(usize, bytes, row.name.len) catch return error.Capacity;
+        }
+        for (self.stream_index, 0..) |row, i| {
+            if (i != 0 and self.stream_index[i - 1].stream_id >= row.stream_id) return error.InvalidSnapshot;
+            if (row.channel >= self.channels.len) return error.InvalidSnapshot;
+            var found = false;
+            for (self.channels[row.channel].link.entries[0..self.channels[row.channel].link.len]) |entry| {
+                if (entry.stream_id == row.stream_id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.InvalidSnapshot;
+        }
+        if (bytes > max_bytes) return error.Capacity;
+    }
+
+    /// Build disjoint maps first. The aggregate may publish them only after its
+    /// own Domain and companion-owner cross-checks; no owner is mutated here.
+    fn prepareRestore(self: *const PhysicalSnapshot, allocator: std.mem.Allocator, expected_max_participants: usize, max_bytes: usize) !PhysicalState {
+        try self.validate(expected_max_participants, max_bytes);
+        var candidate = PhysicalState{ .allocator = allocator, .physical_revision = self.physical_revision, .next_ingress_serial = self.next_ingress_serial, .routed_accepted = self.routed_accepted, .routed_refused = self.routed_refused, .routed_errors = self.routed_errors };
+        errdefer candidate.deinit();
+        try candidate.endpoints.ensureTotalCapacity(allocator, @intCast(self.endpoints.len));
+        try candidate.streams.ensureTotalCapacity(allocator, @intCast(self.streams.len));
+        try candidate.channels.ensureTotalCapacity(allocator, @intCast(self.channels.len));
+        try candidate.stream_index.ensureTotalCapacity(allocator, @intCast(self.stream_index.len));
+        for (self.endpoints) |row| candidate.endpoints.putAssumeCapacity(row.key, row.toLive());
+        for (self.streams) |row| candidate.streams.putAssumeCapacity(row.stream_id, row.key);
+        for (self.channels) |row| {
+            const name = try allocator.dupe(u8, row.name);
+            errdefer allocator.free(name);
+            const link = try Link.prepareRestore(&row.link, expected_max_participants);
+            candidate.channels.putAssumeCapacity(name, link);
+        }
+        for (self.stream_index) |row| {
+            const key = candidate.channels.getKey(self.channels[row.channel].name).?;
+            candidate.stream_index.putAssumeCapacity(row.stream_id, key);
+        }
+        return candidate;
+    }
+};
+const PhysicalState = struct {
+    allocator: std.mem.Allocator,
+    endpoints: NativeEndpointMap = .empty,
+    streams: NativeStreamMap = .empty,
+    channels: std.StringHashMapUnmanaged(Link) = .empty,
+    stream_index: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
+    physical_revision: u64,
+    next_ingress_serial: u64,
+    routed_accepted: u64,
+    routed_refused: u64,
+    routed_errors: u64,
+    fn deinit(self: *PhysicalState) void {
+        var endpoints = self.endpoints.valueIterator();
+        while (endpoints.next()) |row| row.wipe();
+        self.endpoints.deinit(self.allocator);
+        self.streams.deinit(self.allocator);
+        var names = self.channels.keyIterator();
+        while (names.next()) |name| self.allocator.free(name.*);
+        self.channels.deinit(self.allocator);
+        self.stream_index.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+fn populateNativePhysicalDtoFixture(owner: *NativeMediaTransport) !routing.EndpointKey {
+    const key: routing.EndpointKey = .{ .call = .{ .domain = .{ .serial = 17 }, .serial = 29 }, .client = .{ .shard = 2, .slot = 3, .gen = 4 }, .leg = .native };
+    const endpoint: routing.EndpointId = .{ .call = key.call, .serial = 31, .leg = .native };
+    const identity: routing.EndpointObservation = .{
+        .reference = .{ .endpoint = endpoint, .offering_client = key.client, .bridge_policy_revision = 5 },
+        .stamp = .{ .endpoint = endpoint, .binding_revision = 6, .security_revision = 7, .offering_client = key.client },
+        .stream_id = 401,
+        .mode = .legacy_group,
+    };
+    var row: NativeEndpoint = .{ .profile = candidateTestProfile(), .identity = identity, .kind_bits = 1, .codecs = 1, .master = @splat(0x5a) };
+    defer row.wipe();
+    row.keys = try capability.derive(&row.master, identity.stream_id);
+    row.remote = mkAddr(9, 9001);
+    @memcpy(row.display_nick[0..5], "alice");
+    row.display_len = 5;
+    try owner.physical_endpoints.put(owner.allocator, key, row);
+    try owner.physical_streams.put(owner.allocator, identity.stream_id, key);
+    try owner.register("#one", "alice", .voice, 401, mkAddr(1, 8001));
+    try owner.register("#one", "bob", .voice, 402, mkAddr(2, 8002));
+    try owner.register("#two", "carol", .voice, 403, mkAddr(3, 8003));
+    // register can commit the Link before a fallible index put. Keep the real
+    // negative routing state rather than inferring index entries from Link.
+    _ = owner.stream_index.remove(402);
+    owner.channels.getPtr("#one").?.entries[0].rx_packets = 11;
+    owner.channels.getPtr("#one").?.entries[0].rx_bytes = 155;
+    owner.physical_revision = 19;
+    owner.next_ingress_serial = 23;
+    owner.routed_accepted.store(7, .release);
+    owner.routed_refused.store(8, .release);
+    owner.routed_errors.store(9, .release);
+    return key;
+}
+
+test "native physical DTO preserves endpoint keys, credentials, indexes, and link counters" {
+    var source = NativeMediaTransport.init(testing.allocator);
+    defer source.deinit();
+    const key = try populateNativePhysicalDtoFixture(&source);
+    const source_name = source.channels.getKey("#one").?.ptr;
+    const source_master = source.physical_endpoints.get(key).?.master;
+    var carry = try source.capturePhysicalCutLocked(testing.allocator, 1 << 20);
+    defer carry.deinit();
+    try testing.expectEqual(@as(usize, 1), carry.endpoints.len);
+    try testing.expectEqual(@as(usize, 1), carry.streams.len);
+    try testing.expectEqual(@as(usize, 2), carry.channels.len);
+    try testing.expectEqual(@as(usize, 2), carry.stream_index.len);
+    var restored = try carry.prepareRestore(testing.allocator, source.max_participants, 1 << 20);
+    defer restored.deinit();
+    try testing.expect(nativeEndpointEqual(source.physical_endpoints.get(key), restored.endpoints.get(key)));
+    try testing.expectEqualDeep(source_master, restored.endpoints.get(key).?.master);
+    try testing.expect(restored.channels.getKey("#one").?.ptr != source_name);
+    try testing.expectEqual(@as(u32, 1), restored.streams.count());
+    try testing.expectEqual(@as(u32, 2), restored.stream_index.count());
+    try testing.expect(restored.stream_index.get(402) == null);
+    const indexed_name = restored.stream_index.get(401).?;
+    try testing.expect(indexed_name.ptr == restored.channels.getKey("#one").?.ptr);
+    try testing.expectEqual(@as(u64, 11), restored.channels.getPtr("#one").?.entries[0].rx_packets);
+    try testing.expectEqual(@as(u64, 155), restored.channels.getPtr("#one").?.entries[0].rx_bytes);
+    try testing.expectEqual(@as(u64, 19), restored.physical_revision);
+    try testing.expectEqual(@as(u64, 23), restored.next_ingress_serial);
+    try testing.expectEqual(@as(u64, 7), restored.routed_accepted);
+    try testing.expectEqual(@as(u64, 8), restored.routed_refused);
+    try testing.expectEqual(@as(u64, 9), restored.routed_errors);
+    try testing.expectEqualDeep(source_master, source.physical_endpoints.get(key).?.master);
+}
+
+test "native physical DTO rejects forged credentials, indexes, and over-budget state" {
+    var source = NativeMediaTransport.init(testing.allocator);
+    defer source.deinit();
+    _ = try populateNativePhysicalDtoFixture(&source);
+    var carry = try source.capturePhysicalCutLocked(testing.allocator, 1 << 20);
+    defer carry.deinit();
+    try testing.expectError(error.Capacity, carry.validate(source.max_participants, 1));
+    const original_key = carry.endpoints[0].keys.c2s_frame[0];
+    carry.endpoints[0].keys.c2s_frame[0] ^= 1;
+    try testing.expectError(error.InvalidSnapshot, carry.validate(source.max_participants, 1 << 20));
+    carry.endpoints[0].keys.c2s_frame[0] = original_key;
+    const original_index = carry.stream_index[0].channel;
+    carry.stream_index[0].channel = carry.channels.len;
+    try testing.expectError(error.InvalidSnapshot, carry.prepareRestore(testing.allocator, source.max_participants, 1 << 20));
+    carry.stream_index[0].channel = original_index;
+    const original_stream = carry.streams[0].stream_id;
+    carry.streams[0].stream_id += 1;
+    try testing.expectError(error.InvalidSnapshot, carry.validate(source.max_participants, 1 << 20));
+    carry.streams[0].stream_id = original_stream;
+    try carry.validate(source.max_participants, 1 << 20);
+}
+
+fn nativePhysicalDtoOom(allocator: std.mem.Allocator) !void {
+    var source = NativeMediaTransport.init(testing.allocator);
+    defer source.deinit();
+    const key = try populateNativePhysicalDtoFixture(&source);
+    const original_name = source.channels.getKey("#one").?.ptr;
+    const original_keys = source.physical_endpoints.get(key).?.keys;
+    var carry = source.capturePhysicalCutLocked(allocator, 1 << 20) catch |err| {
+        try testing.expect(source.channels.getKey("#one").?.ptr == original_name);
+        try testing.expectEqualDeep(original_keys, source.physical_endpoints.get(key).?.keys);
+        var retry = try source.capturePhysicalCutLocked(testing.allocator, 1 << 20);
+        defer retry.deinit();
+        return err;
+    };
+    defer carry.deinit();
+    var candidate = carry.prepareRestore(allocator, source.max_participants, 1 << 20) catch |err| {
+        var retry = try carry.prepareRestore(testing.allocator, source.max_participants, 1 << 20);
+        defer retry.deinit();
+        return err;
+    };
+    defer candidate.deinit();
+    try testing.expect(source.channels.getKey("#one").?.ptr == original_name);
+    try testing.expectEqualDeep(original_keys, source.physical_endpoints.get(key).?.keys);
+}
+test "native physical DTO allocation failures leave source and snapshot retryable" {
+    try testing.checkAllAllocationFailures(testing.allocator, nativePhysicalDtoOom, .{});
+}
 const NativeMapState = struct { metadata: usize, count: u32, capacity: u32 };
 fn nativeMapState(map: anytype) NativeMapState {
     return .{ .metadata = if (map.metadata) |ptr| @intFromPtr(ptr) else 0, .count = map.count(), .capacity = map.capacity() };

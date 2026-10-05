@@ -791,6 +791,112 @@ pub const PerSsrcRetransmitBuffer = struct {
     revision: u64 = 1,
     const Cell = struct { cache: RetransmitBuffer };
     const StreamMap = std.AutoHashMapUnmanaged(u32, *Cell);
+
+    /// Exact owned retransmit history for one physical WebRTC publisher. The
+    /// caller excludes packet admission while capturing; no live cell or packet
+    /// storage is borrowed by the result. Stream IDs are sorted so duplicate or
+    /// missing ownership cannot be hidden by hash-map iteration order.
+    pub const Snapshot = struct {
+        allocator: Allocator,
+        packet_capacity: usize,
+        stream_capacity: usize,
+        revision: u64,
+        streams: []Stream,
+
+        pub const Stream = struct {
+            ssrc: u32,
+            cache: RetransmitBuffer.Snapshot,
+        };
+
+        pub fn deinit(self: *Snapshot) void {
+            for (self.streams) |*stream| stream.cache.deinit();
+            self.allocator.free(self.streams);
+            self.* = undefined;
+        }
+
+        /// `max_bytes` covers the DTO and every retained packet, not just the
+        /// RTP payloads. The aggregate chooses its own bound before decoding.
+        pub fn validate(self: *const Snapshot, expected_packet_capacity: usize, expected_stream_capacity: usize, max_bytes: usize) !void {
+            if (self.packet_capacity != expected_packet_capacity or self.stream_capacity != expected_stream_capacity or
+                self.revision == 0 or self.streams.len > self.stream_capacity)
+                return error.InvalidSnapshot;
+            var bytes = try snapshotBaseBytes(self.streams.len);
+            for (self.streams, 0..) |*stream, index| {
+                if (index != 0 and self.streams[index - 1].ssrc >= stream.ssrc) return error.InvalidSnapshot;
+                try stream.cache.validate(self.packet_capacity, max_bytes);
+                for (stream.cache.packets) |packet| {
+                    if (!matchesPacket(packet.bytes, stream.ssrc, packet.seq)) return error.InvalidSnapshot;
+                    bytes = std.math.add(usize, bytes, @sizeOf(RetransmitBuffer.Snapshot.Packet)) catch return error.Capacity;
+                    bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+                }
+            }
+            if (bytes > max_bytes) return error.Capacity;
+        }
+    };
+
+    fn snapshotBaseBytes(streams: usize) !usize {
+        return std.math.add(usize, @sizeOf(Snapshot), std.math.mul(usize, streams, @sizeOf(Snapshot.Stream)) catch return error.Capacity) catch return error.Capacity;
+    }
+
+    pub fn capture(self: *const @This(), allocator: Allocator, max_bytes: usize) !Snapshot {
+        if (self.revision == 0 or self.streams.count() > self.stream_capacity) return error.InvalidSnapshot;
+        var bytes = try snapshotBaseBytes(self.streams.count());
+        var preflight = self.streams.iterator();
+        while (preflight.next()) |entry| {
+            const cache = &entry.value_ptr.*.cache;
+            if (cache.capacity != self.packet_capacity or cache.packets.items.len > cache.capacity) return error.InvalidSnapshot;
+            for (cache.packets.items) |packet| {
+                if (!matchesPacket(packet.bytes, entry.key_ptr.*, packet.seq)) return error.InvalidSnapshot;
+                bytes = std.math.add(usize, bytes, @sizeOf(RetransmitBuffer.Snapshot.Packet)) catch return error.Capacity;
+                bytes = std.math.add(usize, bytes, packet.bytes.len) catch return error.Capacity;
+            }
+        }
+        if (bytes > max_bytes) return error.Capacity;
+
+        const streams = try allocator.alloc(Snapshot.Stream, self.streams.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (streams[0..initialized]) |*stream| stream.cache.deinit();
+            allocator.free(streams);
+        }
+        var remaining = max_bytes - try snapshotBaseBytes(streams.len);
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const cache = try entry.value_ptr.*.cache.capture(allocator, remaining);
+            streams[initialized] = .{ .ssrc = entry.key_ptr.*, .cache = cache };
+            initialized += 1;
+            for (cache.packets) |packet| {
+                remaining -= @sizeOf(RetransmitBuffer.Snapshot.Packet) + packet.bytes.len;
+            }
+        }
+        std.mem.sort(Snapshot.Stream, streams, {}, struct {
+            fn less(_: void, a: Snapshot.Stream, b: Snapshot.Stream) bool {
+                return a.ssrc < b.ssrc;
+            }
+        }.less);
+        const snapshot: Snapshot = .{ .allocator = allocator, .packet_capacity = self.packet_capacity, .stream_capacity = self.stream_capacity, .revision = self.revision, .streams = streams };
+        try snapshot.validate(self.packet_capacity, self.stream_capacity, max_bytes);
+        return snapshot;
+    }
+
+    /// Build a private candidate. The caller joins it with the physical owner
+    /// and routing graph before a no-fail publication; failure leaves source
+    /// history and retransmit sequence extension unchanged.
+    pub fn prepareRestore(allocator: Allocator, snapshot: *const Snapshot, expected_packet_capacity: usize, expected_stream_capacity: usize, max_bytes: usize) !@This() {
+        try snapshot.validate(expected_packet_capacity, expected_stream_capacity, max_bytes);
+        var candidate = init(allocator, expected_packet_capacity, expected_stream_capacity);
+        errdefer candidate.deinit();
+        try candidate.streams.ensureTotalCapacity(allocator, @intCast(snapshot.streams.len));
+        for (snapshot.streams) |stream| {
+            const cell = try allocator.create(Cell);
+            errdefer allocator.destroy(cell);
+            cell.* = .{ .cache = try RetransmitBuffer.prepareRestore(allocator, &stream.cache, expected_packet_capacity, max_bytes) };
+            candidate.streams.putAssumeCapacity(stream.ssrc, cell);
+        }
+        candidate.revision = snapshot.revision;
+        return candidate;
+    }
+
     pub fn init(allocator: Allocator, packet_capacity: usize, stream_capacity: usize) @This() {
         return .{ .allocator = allocator, .packet_capacity = packet_capacity, .stream_capacity = stream_capacity };
     }
@@ -925,6 +1031,95 @@ fn perSsrcPacketTest(ssrc: u32, seq: u16, label: u8) [13]u8 {
     std.mem.writeInt(u16, packet[2..4], seq, .big);
     std.mem.writeInt(u32, packet[8..12], ssrc, .big);
     return packet;
+}
+fn perSsrcStore(source: *PerSsrcRetransmitBuffer, ssrc: u32, seq: u16, label: u8) !void {
+    const packet = perSsrcPacketTest(ssrc, seq, label);
+    const plan = try source.prepareSent(ssrc, seq, &packet);
+    defer plan.deinit();
+    try plan.validate();
+    plan.commitRetainingMetadata();
+}
+test "physical media per-SSRC owned snapshot restores packet and rollover authority" {
+    const testing = std.testing;
+    var source = PerSsrcRetransmitBuffer.init(testing.allocator, 3, 2);
+    defer source.deinit();
+    try perSsrcStore(&source, 7, 65535, 'a');
+    try perSsrcStore(&source, 9, 42, 'b');
+    try perSsrcStore(&source, 7, 0, 'c');
+    const old = source.observationDigest();
+
+    var snapshot = try source.capture(testing.allocator, 4096);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(u32, 7), snapshot.streams[0].ssrc);
+    try testing.expectEqual(@as(u32, 9), snapshot.streams[1].ssrc);
+    try testing.expectEqual(@as(?i64, 65536), snapshot.streams[0].cache.newest_ext_seq);
+    var restored = try PerSsrcRetransmitBuffer.prepareRestore(testing.allocator, &snapshot, 3, 2, 4096);
+    defer restored.deinit();
+    try testing.expectEqual(source.revision, restored.revision);
+    try testing.expectEqualSlices(u8, source.lookup(7, 65535).?, restored.lookup(7, 65535).?);
+    try testing.expectEqualSlices(u8, source.lookup(7, 0).?, restored.lookup(7, 0).?);
+    try testing.expectEqualSlices(u8, source.lookup(9, 42).?, restored.lookup(9, 42).?);
+    try testing.expectEqualSlices(u8, &old, &source.observationDigest());
+
+    // The next packet extends the same SSRC sequence cycle in both owners.
+    try perSsrcStore(&source, 7, 1, 'd');
+    try perSsrcStore(&restored, 7, 1, 'd');
+    var next = try restored.capture(testing.allocator, 4096);
+    defer next.deinit();
+    try testing.expectEqual(@as(?i64, 65537), next.streams[0].cache.newest_ext_seq);
+    try testing.expectEqualSlices(u8, source.lookup(7, 1).?, restored.lookup(7, 1).?);
+}
+
+test "physical media per-SSRC snapshot rejects missing index packet substitution and truncated budget" {
+    const testing = std.testing;
+    var source = PerSsrcRetransmitBuffer.init(testing.allocator, 2, 2);
+    defer source.deinit();
+    try perSsrcStore(&source, 7, 1, 'a');
+    try perSsrcStore(&source, 9, 1, 'b');
+    var snapshot = try source.capture(testing.allocator, 4096);
+    defer snapshot.deinit();
+    const old = source.observationDigest();
+
+    try testing.expectError(error.InvalidSnapshot, PerSsrcRetransmitBuffer.prepareRestore(testing.allocator, &snapshot, 2, 1, 4096));
+    try testing.expectError(error.Capacity, PerSsrcRetransmitBuffer.prepareRestore(testing.allocator, &snapshot, 2, 2, 16));
+    std.mem.swap(PerSsrcRetransmitBuffer.Snapshot.Stream, &snapshot.streams[0], &snapshot.streams[1]);
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate(2, 2, 4096));
+    std.mem.swap(PerSsrcRetransmitBuffer.Snapshot.Stream, &snapshot.streams[0], &snapshot.streams[1]);
+    snapshot.streams[0].cache.packets[0].bytes[8] ^= 1;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate(2, 2, 4096));
+    snapshot.streams[0].cache.packets[0].bytes[8] ^= 1;
+    snapshot.streams[0].cache.newest_ext_seq = null;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate(2, 2, 4096));
+    snapshot.streams[0].cache.newest_ext_seq = 1;
+    snapshot.revision = 0;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate(2, 2, 4096));
+    snapshot.revision = source.revision;
+    try snapshot.validate(2, 2, 4096);
+    try testing.expectEqualSlices(u8, &old, &source.observationDigest());
+}
+
+fn perSsrcSnapshotAllocationSweep(allocator: Allocator) !void {
+    var source = PerSsrcRetransmitBuffer.init(allocator, 2, 2);
+    defer source.deinit();
+    try perSsrcStore(&source, 7, 65535, 'a');
+    try perSsrcStore(&source, 7, 0, 'b');
+    try perSsrcStore(&source, 9, 2, 'c');
+    const before = source.observationDigest();
+    var snapshot = source.capture(allocator, 4096) catch |err| {
+        try std.testing.expectEqualSlices(u8, &before, &source.observationDigest());
+        return err;
+    };
+    defer snapshot.deinit();
+    var restored = PerSsrcRetransmitBuffer.prepareRestore(allocator, &snapshot, 2, 2, 4096) catch |err| {
+        try std.testing.expectEqualSlices(u8, &before, &source.observationDigest());
+        return err;
+    };
+    defer restored.deinit();
+    try std.testing.expectEqualSlices(u8, source.lookup(7, 0).?, restored.lookup(7, 0).?);
+    try std.testing.expectEqualSlices(u8, &before, &source.observationDigest());
+}
+test "physical media per-SSRC snapshot allocation failures leave source and retries exact" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, perSsrcSnapshotAllocationSweep, .{});
 }
 test "physical media per-SSRC cache retains independent equal sequence rollover and bounded stream custody" {
     var source = PerSsrcRetransmitBuffer.init(std.testing.allocator, 3, 2);

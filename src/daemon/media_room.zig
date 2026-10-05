@@ -43,8 +43,8 @@ pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
 pub const Error = std.mem.Allocator.Error || media.SessionError;
 pub const PreparedError = Error || routing.Error || error{ InvalidSnapshot, InvalidProfile };
 pub const PhysicalProfileKey = routing.PhysicalProfileKey;
-const PhysicalMemberKey = struct { call: routing.CallId, client: routing.ClientId };
-const PhysicalMember = struct { display: media.ParticipantId, kind_bits: u8 };
+pub const PhysicalMemberKey = struct { call: routing.CallId, client: routing.ClientId };
+pub const PhysicalMember = struct { display: media.ParticipantId, kind_bits: u8 };
 const PhysicalMemberMap = std.AutoHashMap(PhysicalMemberKey, PhysicalMember);
 fn transportChannel(value: []const u8, out: *[128]u8) PreparedError![]const u8 {
     if (value.len == 0 or value.len > out.len) return error.InvalidRequest;
@@ -134,6 +134,393 @@ pub fn agreedKindBits(profile: CallProfile) error{InvalidProfile}!u8 {
         .raw => @as(u8, 7),
     };
     return bits;
+}
+
+pub const max_snapshot_rows: usize = 4096;
+pub const max_snapshot_rooms: usize = 256;
+pub const SnapshotError = std.mem.Allocator.Error || error{ InvalidSnapshot, IncompleteRemap };
+pub fn StringRow(comptime T: type) type {
+    return struct { key: []u8, value: T };
+}
+pub const PhysicalProfileRow = struct { key: PhysicalProfileKey, profile: CallProfile };
+pub const PhysicalMemberRow = struct { key: PhysicalMemberKey, member: PhysicalMember };
+pub const RoomRow = struct { key: []u8, room: Room.Snapshot };
+pub const QueueRow = struct { key: []u8, items: [][]u8 };
+
+/// Complete owned control graph. Keys and nested queue payloads are copied;
+/// unused codec and recording tails are canonicalized before they enter a DTO.
+/// It carries no socket, worker, lock, or publication method.
+pub const Snapshot = struct {
+    allocator: std.mem.Allocator,
+    config: Config,
+    transport_revision: u64,
+    physical_profiles: []PhysicalProfileRow,
+    physical_members: []PhysicalMemberRow,
+    rooms: []RoomRow,
+    breakouts: []StringRow([]u8),
+    positions: []StringRow(Position),
+    hands: []StringRow(void),
+    profiles: []StringRow(CallProfile),
+    participant_profiles: []StringRow(CallProfile),
+    consents: []StringRow(void),
+    recordings: []StringRow(Recording),
+    qualities: []StringRow(Quality),
+    queues: []QueueRow,
+
+    pub fn deinit(self: *Snapshot) void {
+        freeQueueRows(self.allocator, self.queues);
+        freeStringRows(Quality, self.allocator, self.qualities);
+        freeStringRows(Recording, self.allocator, self.recordings);
+        freeStringRows(void, self.allocator, self.consents);
+        freeStringRows(CallProfile, self.allocator, self.participant_profiles);
+        freeStringRows(CallProfile, self.allocator, self.profiles);
+        freeStringRows(void, self.allocator, self.hands);
+        freeStringRows(Position, self.allocator, self.positions);
+        freeStringRows([]u8, self.allocator, self.breakouts);
+        for (self.rooms) |row| self.allocator.free(row.key);
+        self.allocator.free(self.rooms);
+        self.allocator.free(self.physical_members);
+        self.allocator.free(self.physical_profiles);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: *const Snapshot) SnapshotError!void {
+        if (self.config.max_participants == 0 or self.config.max_participants > max_participants or
+            self.config.max_breakout_bytes > 256 or self.transport_revision == 0 or
+            self.physical_profiles.len > max_snapshot_rows or self.physical_members.len > max_snapshot_rows or
+            self.rooms.len > max_snapshot_rooms or self.breakouts.len > max_snapshot_rows or
+            self.positions.len > max_snapshot_rows or self.hands.len > max_snapshot_rows or
+            self.profiles.len > max_snapshot_rows or self.participant_profiles.len > max_snapshot_rows or
+            self.consents.len > max_snapshot_rows or self.recordings.len > max_snapshot_rows or
+            self.qualities.len > max_snapshot_rows or self.queues.len > max_snapshot_rows) return error.InvalidSnapshot;
+        for (self.physical_profiles, 0..) |row, i| {
+            if (row.key.client.isNone() or row.key.call.domain.serial == 0 or row.key.call.serial == 0 or !profileCanonical(row.profile)) return error.InvalidSnapshot;
+            for (self.physical_profiles[0..i]) |prior| if (std.meta.eql(prior.key, row.key)) return error.InvalidSnapshot;
+        }
+        for (self.physical_members, 0..) |row, i| {
+            if (row.key.client.isNone() or row.key.call.domain.serial == 0 or row.key.call.serial == 0 or
+                row.member.kind_bits == 0 or row.member.kind_bits & ~@as(u8, 7) != 0) return error.InvalidSnapshot;
+            media.validateParticipantId(row.member.display) catch return error.InvalidSnapshot;
+            for (self.physical_members[0..i]) |prior| if (std.meta.eql(prior.key, row.key)) return error.InvalidSnapshot;
+        }
+        for (self.rooms, 0..) |row, i| {
+            if (!validChannelKey(row.key) or row.room.len == 0 or row.room.len > self.config.max_participants) return error.InvalidSnapshot;
+            row.room.validate() catch return error.InvalidSnapshot;
+            for (self.rooms[0..i]) |prior| if (std.mem.eql(u8, prior.key, row.key)) return error.InvalidSnapshot;
+        }
+        try validateStringRows([]u8, self.breakouts, .composite);
+        for (self.breakouts) |row| if (row.value.len > self.config.max_breakout_bytes) return error.InvalidSnapshot;
+        try validateStringRows(Position, self.positions, .composite);
+        try validateStringRows(void, self.hands, .composite);
+        try validateStringRows(CallProfile, self.profiles, .channel);
+        try validateStringRows(CallProfile, self.participant_profiles, .composite);
+        try validateStringRows(void, self.consents, .composite);
+        try validateStringRows(Recording, self.recordings, .channel);
+        try validateStringRows(Quality, self.qualities, .composite);
+        for (self.queues, 0..) |queue, i| {
+            if (!validChannelKey(queue.key) or queue.items.len == 0 or queue.items.len > max_participants) return error.InvalidSnapshot;
+            for (self.queues[0..i]) |prior| if (std.mem.eql(u8, prior.key, queue.key)) return error.InvalidSnapshot;
+            var room: ?Room.Snapshot = null;
+            for (self.rooms) |row| if (std.mem.eql(u8, row.key, queue.key)) {
+                room = row.room;
+                break;
+            };
+            const actual_room = room orelse return error.InvalidSnapshot;
+            for (queue.items, 0..) |item, n| {
+                _ = media.ParticipantId.init(item) catch return error.InvalidSnapshot;
+                for (queue.items[0..n]) |prior| if (std.mem.eql(u8, prior, item)) return error.InvalidSnapshot;
+                var joined = false;
+                for (actual_room.participants[0..actual_room.len]) |participant| if (std.mem.eql(u8, participant.id.slice(), item)) {
+                    joined = true;
+                    break;
+                };
+                if (!joined) return error.InvalidSnapshot;
+                var raised = false;
+                for (self.hands) |hand| if (hand.key.len == queue.key.len + 1 + item.len and
+                    std.mem.eql(u8, hand.key[0..queue.key.len], queue.key) and
+                    hand.key[queue.key.len] == 0 and
+                    std.mem.eql(u8, hand.key[queue.key.len + 1 ..], item))
+                {
+                    raised = true;
+                    break;
+                };
+                if (!raised) return error.InvalidSnapshot;
+            }
+        }
+    }
+
+    /// Read-only physical join proof for a later joint Helix transaction.
+    /// Every Domain endpoint has exactly one physical profile and every Domain
+    /// membership has exactly one physical member with the same kind bits.
+    /// The member's display must exist in the corresponding Room. Legacy
+    /// nickname-only metadata remains independent and is preserved as-is.
+    pub fn validateAgainstGraph(self: *const Snapshot, graph: *const routing.GraphSnapshot) SnapshotError!void {
+        try self.validate();
+        graph.validate() catch return error.InvalidSnapshot;
+        for (self.physical_profiles) |profile| {
+            var found = false;
+            for (graph.endpoints) |endpoint| if (std.meta.eql(endpoint.key, profile.key)) {
+                found = true;
+                break;
+            };
+            if (!found) return error.InvalidSnapshot;
+        }
+        for (graph.endpoints) |endpoint| {
+            var found = false;
+            for (self.physical_profiles) |profile| if (std.meta.eql(profile.key, endpoint.key)) {
+                found = true;
+                break;
+            };
+            if (!found) return error.InvalidSnapshot;
+        }
+        for (self.physical_members) |member| {
+            var found = false;
+            for (graph.memberships) |row| if (std.meta.eql(row.key.call, member.key.call) and row.key.client.eql(member.key.client) and
+                row.row.bits == member.member.kind_bits)
+            {
+                found = true;
+                break;
+            };
+            if (!found) return error.InvalidSnapshot;
+            var channel: ?[]const u8 = null;
+            for (graph.calls) |call| if (std.meta.eql(call.row.id, member.key.call)) {
+                channel = call.channel.bytes[0..call.channel.len];
+                break;
+            };
+            const name = channel orelse return error.InvalidSnapshot;
+            var display_found = false;
+            for (self.rooms) |room| if (std.mem.eql(u8, room.key, name)) {
+                for (room.room.participants[0..room.room.len]) |participant| if (participant.id.eql(&member.member.display) and
+                    participant.joined.bits & member.member.kind_bits == member.member.kind_bits)
+                {
+                    display_found = true;
+                    break;
+                };
+                break;
+            };
+            if (!display_found) return error.InvalidSnapshot;
+        }
+        for (graph.memberships) |row| {
+            var found = false;
+            for (self.physical_members) |member| if (std.meta.eql(member.key.call, row.key.call) and member.key.client.eql(row.key.client) and
+                member.member.kind_bits == row.row.bits)
+            {
+                found = true;
+                break;
+            };
+            if (!found) return error.InvalidSnapshot;
+        }
+    }
+};
+
+const KeyKind = enum { channel, composite };
+
+fn validChannelKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > 128) return false;
+    for (key) |byte| if (byte == 0) return false;
+    return true;
+}
+
+fn validCompositeKey(key: []const u8) bool {
+    const divider = std.mem.indexOfScalar(u8, key, 0) orelse return false;
+    if (!validChannelKey(key[0..divider]) or key.len > 256) return false;
+    _ = media.ParticipantId.init(key[divider + 1 ..]) catch return false;
+    return true;
+}
+
+fn canonicalProfile(profile: CallProfile) SnapshotError!CallProfile {
+    if (profile.codec_count > max_profile_codecs or @intFromEnum(profile.fec.scheme) > 2) return error.InvalidSnapshot;
+    var copy = CallProfile{
+        .codecs = @splat(.{ .tag = .cadencevox, .clock_rate = 0, .params = 0 }),
+        .codec_count = profile.codec_count,
+        .fec = profile.fec,
+    };
+    for (profile.codecs[0..profile.codec_count], 0..) |codec, i| {
+        if (@intFromEnum(codec.tag) < 1 or @intFromEnum(codec.tag) > 3) return error.InvalidSnapshot;
+        copy.codecs[i] = codec;
+    }
+    return copy;
+}
+
+fn profileCanonical(profile: CallProfile) bool {
+    const copy = canonicalProfile(profile) catch return false;
+    return std.meta.eql(copy, profile);
+}
+
+fn canonicalRecording(recording: Recording) SnapshotError!Recording {
+    if (recording.by_len > recording.by_buf.len) return error.InvalidSnapshot;
+    var copy = Recording{ .by_buf = @splat(0), .by_len = recording.by_len, .active = recording.active };
+    @memcpy(copy.by_buf[0..recording.by_len], recording.by_buf[0..recording.by_len]);
+    return copy;
+}
+
+fn validateStringRows(comptime T: type, rows: []const StringRow(T), kind: KeyKind) SnapshotError!void {
+    for (rows, 0..) |row, i| {
+        if (!(if (kind == .channel) validChannelKey(row.key) else validCompositeKey(row.key))) return error.InvalidSnapshot;
+        for (rows[0..i]) |prior| if (std.mem.eql(u8, prior.key, row.key)) return error.InvalidSnapshot;
+        if (T == CallProfile and !profileCanonical(row.value)) return error.InvalidSnapshot;
+        if (T == Recording) {
+            const canonical = try canonicalRecording(row.value);
+            if (!std.meta.eql(canonical, row.value)) return error.InvalidSnapshot;
+        }
+    }
+}
+
+fn freeStringRows(comptime T: type, allocator: std.mem.Allocator, rows: []StringRow(T)) void {
+    for (rows) |row| {
+        allocator.free(row.key);
+        if (T == []u8) allocator.free(row.value);
+    }
+    allocator.free(rows);
+}
+
+fn freeQueueRows(allocator: std.mem.Allocator, rows: []QueueRow) void {
+    for (rows) |row| {
+        allocator.free(row.key);
+        for (row.items) |item| allocator.free(item);
+        allocator.free(row.items);
+    }
+    allocator.free(rows);
+}
+
+fn capturePhysicalProfiles(allocator: std.mem.Allocator, map: *std.AutoHashMap(PhysicalProfileKey, CallProfile)) SnapshotError![]PhysicalProfileRow {
+    const rows = try allocator.alloc(PhysicalProfileRow, map.count());
+    errdefer allocator.free(rows);
+    var i: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| : (i += 1) rows[i] = .{ .key = entry.key_ptr.*, .profile = try canonicalProfile(entry.value_ptr.*) };
+    return rows;
+}
+
+fn capturePhysicalMembers(allocator: std.mem.Allocator, map: *PhysicalMemberMap) SnapshotError![]PhysicalMemberRow {
+    const rows = try allocator.alloc(PhysicalMemberRow, map.count());
+    var i: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |entry| : (i += 1) rows[i] = .{ .key = entry.key_ptr.*, .member = entry.value_ptr.* };
+    return rows;
+}
+
+fn captureRooms(allocator: std.mem.Allocator, map: *std.StringHashMap(*Room)) SnapshotError![]RoomRow {
+    const rows = try allocator.alloc(RoomRow, map.count());
+    var i: usize = 0;
+    errdefer {
+        for (rows[0..i]) |row| allocator.free(row.key);
+        allocator.free(rows);
+    }
+    var it = map.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        const room = entry.value_ptr.*.capture() catch return error.InvalidSnapshot;
+        rows[i] = .{ .key = try allocator.dupe(u8, entry.key_ptr.*), .room = room };
+    }
+    return rows;
+}
+
+fn captureStringRows(comptime T: type, allocator: std.mem.Allocator, map: *std.StringHashMap(T)) SnapshotError![]StringRow(T) {
+    const rows = try allocator.alloc(StringRow(T), map.count());
+    var i: usize = 0;
+    errdefer {
+        for (rows[0..i]) |row| {
+            allocator.free(row.key);
+            if (T == []u8) allocator.free(row.value);
+        }
+        allocator.free(rows);
+    }
+    var it = map.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        const value: T = if (T == []u8)
+            allocator.dupe(u8, entry.value_ptr.*) catch |err| {
+                allocator.free(key);
+                return err;
+            }
+        else if (T == CallProfile)
+            canonicalProfile(entry.value_ptr.*) catch |err| {
+                allocator.free(key);
+                return err;
+            }
+        else if (T == Recording)
+            canonicalRecording(entry.value_ptr.*) catch |err| {
+                allocator.free(key);
+                return err;
+            }
+        else
+            entry.value_ptr.*;
+        rows[i] = .{ .key = key, .value = value };
+    }
+    return rows;
+}
+
+fn captureOneQueue(allocator: std.mem.Allocator, key: []const u8, items: []const []u8) SnapshotError!QueueRow {
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    const owned_items = try allocator.alloc([]u8, items.len);
+    var i: usize = 0;
+    errdefer {
+        for (owned_items[0..i]) |item| allocator.free(item);
+        allocator.free(owned_items);
+    }
+    for (items, 0..) |item, n| {
+        owned_items[n] = try allocator.dupe(u8, item);
+        i += 1;
+    }
+    return .{ .key = owned_key, .items = owned_items };
+}
+
+fn captureQueues(allocator: std.mem.Allocator, map: *std.StringHashMap(std.ArrayList([]u8))) SnapshotError![]QueueRow {
+    const rows = try allocator.alloc(QueueRow, map.count());
+    var i: usize = 0;
+    errdefer {
+        for (rows[0..i]) |row| {
+            allocator.free(row.key);
+            for (row.items) |item| allocator.free(item);
+            allocator.free(row.items);
+        }
+        allocator.free(rows);
+    }
+    var it = map.iterator();
+    while (it.next()) |entry| : (i += 1) rows[i] = try captureOneQueue(allocator, entry.key_ptr.*, entry.value_ptr.items);
+    return rows;
+}
+
+fn remapPhysicalClient(remaps: []const routing.ClientRemap, old: routing.ClientId) SnapshotError!routing.ClientId {
+    for (remaps) |entry| if (entry.source.eql(old)) return entry.target;
+    return error.IncompleteRemap;
+}
+
+fn putRoomRow(result: *MediaRooms, row: RoomRow) SnapshotError!void {
+    const room = try result.allocator.create(Room);
+    errdefer result.allocator.destroy(room);
+    room.* = Room.prepareRestore(&row.room) catch return error.InvalidSnapshot;
+    const key = try result.allocator.dupe(u8, row.key);
+    errdefer result.allocator.free(key);
+    try result.rooms.put(key, room);
+}
+
+fn putStringRow(comptime T: type, allocator: std.mem.Allocator, map: *std.StringHashMap(T), row: StringRow(T)) SnapshotError!void {
+    const key = try allocator.dupe(u8, row.key);
+    errdefer allocator.free(key);
+    const value: T = if (T == []u8) try allocator.dupe(u8, row.value) else row.value;
+    errdefer if (T == []u8) allocator.free(value);
+    try map.put(key, value);
+}
+
+fn putQueueRow(result: *MediaRooms, row: QueueRow) SnapshotError!void {
+    const allocator = result.allocator;
+    const key = try allocator.dupe(u8, row.key);
+    errdefer allocator.free(key);
+    var list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+    for (row.items) |item| {
+        const owned = try allocator.dupe(u8, item);
+        list.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+    }
+    try result.queues.put(key, list);
 }
 
 pub const MediaRooms = struct {
@@ -265,6 +652,103 @@ pub const MediaRooms = struct {
             self.recordings.count() == 0 and
             self.qualities.count() == 0 and
             self.queues.count() == 0;
+    }
+
+    /// Caller holds the World write lock across this whole copy, excluding
+    /// every control-plane mutation and physical publication candidate.
+    pub fn capture(self: *MediaRooms) SnapshotError!Snapshot {
+        if (self.physical_profiles.count() > max_snapshot_rows or self.physical_members.count() > max_snapshot_rows or
+            self.rooms.count() > max_snapshot_rooms or self.breakouts.count() > max_snapshot_rows or
+            self.positions.count() > max_snapshot_rows or self.hands.count() > max_snapshot_rows or
+            self.profiles.count() > max_snapshot_rows or self.participant_profiles.count() > max_snapshot_rows or
+            self.consents.count() > max_snapshot_rows or self.recordings.count() > max_snapshot_rows or
+            self.qualities.count() > max_snapshot_rows or self.queues.count() > max_snapshot_rows) return error.InvalidSnapshot;
+        const a = self.allocator;
+        const physical_profiles = try capturePhysicalProfiles(a, &self.physical_profiles);
+        errdefer a.free(physical_profiles);
+        const physical_members = try capturePhysicalMembers(a, &self.physical_members);
+        errdefer a.free(physical_members);
+        const rooms = try captureRooms(a, &self.rooms);
+        errdefer {
+            for (rooms) |row| a.free(row.key);
+            a.free(rooms);
+        }
+        const breakouts = try captureStringRows([]u8, a, &self.breakouts);
+        errdefer freeStringRows([]u8, a, breakouts);
+        const positions = try captureStringRows(Position, a, &self.positions);
+        errdefer freeStringRows(Position, a, positions);
+        const hands = try captureStringRows(void, a, &self.hands);
+        errdefer freeStringRows(void, a, hands);
+        const profiles = try captureStringRows(CallProfile, a, &self.profiles);
+        errdefer freeStringRows(CallProfile, a, profiles);
+        const participant_profiles = try captureStringRows(CallProfile, a, &self.participant_profiles);
+        errdefer freeStringRows(CallProfile, a, participant_profiles);
+        const consents = try captureStringRows(void, a, &self.consents);
+        errdefer freeStringRows(void, a, consents);
+        const recordings = try captureStringRows(Recording, a, &self.recordings);
+        errdefer freeStringRows(Recording, a, recordings);
+        const qualities = try captureStringRows(Quality, a, &self.qualities);
+        errdefer freeStringRows(Quality, a, qualities);
+        const queues = try captureQueues(a, &self.queues);
+        errdefer freeQueueRows(a, queues);
+        const snapshot = Snapshot{
+            .allocator = a,
+            .config = self.config,
+            .transport_revision = self.transport_revision,
+            .physical_profiles = physical_profiles,
+            .physical_members = physical_members,
+            .rooms = rooms,
+            .breakouts = breakouts,
+            .positions = positions,
+            .hands = hands,
+            .profiles = profiles,
+            .participant_profiles = participant_profiles,
+            .consents = consents,
+            .recordings = recordings,
+            .qualities = qualities,
+            .queues = queues,
+        };
+        try snapshot.validate();
+        return snapshot;
+    }
+
+    /// Build an independent control graph. The caller supplies the same full
+    /// physical remap used by Domain; this leaf checks every ClientId it owns
+    /// and refuses duplicate source or target identities before allocating.
+    /// Returning this value does not install it into the daemon.
+    pub fn prepareRestore(allocator: std.mem.Allocator, snapshot: *const Snapshot, remaps: []const routing.ClientRemap) SnapshotError!MediaRooms {
+        try snapshot.validate();
+        if (remaps.len > routing.max_graph_rows * 2) return error.InvalidSnapshot;
+        for (remaps, 0..) |entry, i| {
+            if (entry.source.isNone() or entry.target.isNone()) return error.InvalidSnapshot;
+            for (remaps[0..i]) |prior| if (prior.source.eql(entry.source) or prior.target.eql(entry.target)) return error.InvalidSnapshot;
+        }
+        for (snapshot.physical_profiles) |row| _ = try remapPhysicalClient(remaps, row.key.client);
+        for (snapshot.physical_members) |row| _ = try remapPhysicalClient(remaps, row.key.client);
+        var result = MediaRooms.initConfig(allocator, snapshot.config);
+        errdefer result.deinit();
+        result.transport_revision = snapshot.transport_revision;
+        for (snapshot.physical_profiles) |row| {
+            var key = row.key;
+            key.client = try remapPhysicalClient(remaps, key.client);
+            try result.physical_profiles.put(key, row.profile);
+        }
+        for (snapshot.physical_members) |row| {
+            var key = row.key;
+            key.client = try remapPhysicalClient(remaps, key.client);
+            try result.physical_members.put(key, row.member);
+        }
+        for (snapshot.rooms) |row| try putRoomRow(&result, row);
+        for (snapshot.breakouts) |row| try putStringRow([]u8, allocator, &result.breakouts, row);
+        for (snapshot.positions) |row| try putStringRow(Position, allocator, &result.positions, row);
+        for (snapshot.hands) |row| try putStringRow(void, allocator, &result.hands, row);
+        for (snapshot.profiles) |row| try putStringRow(CallProfile, allocator, &result.profiles, row);
+        for (snapshot.participant_profiles) |row| try putStringRow(CallProfile, allocator, &result.participant_profiles, row);
+        for (snapshot.consents) |row| try putStringRow(void, allocator, &result.consents, row);
+        for (snapshot.recordings) |row| try putStringRow(Recording, allocator, &result.recordings, row);
+        for (snapshot.qualities) |row| try putStringRow(Quality, allocator, &result.qualities, row);
+        for (snapshot.queues) |row| try putQueueRow(&result, row);
+        return result;
     }
 
     /// Build the "channel\x00participant" composite key into `buf`.
@@ -955,6 +1439,164 @@ test "upgrade continuity: MediaRooms is ready only without live control state" {
 
     try testing.expect(m.leaveAll("#c", "alice"));
     try testing.expect(m.upgradeContinuityReady());
+}
+
+fn graphObservationForRoomsTest(call: routing.CallId, owner: routing.ClientId, leg: routing.Leg, serial: u64, stream: u32) routing.EndpointObservation {
+    const endpoint = routing.EndpointId{ .call = call, .serial = serial, .leg = leg };
+    return .{
+        .reference = .{ .endpoint = endpoint, .offering_client = owner, .bridge_policy_revision = 1 },
+        .stamp = .{ .endpoint = endpoint, .binding_revision = 1, .security_revision = 1, .offering_client = owner },
+        .stream_id = stream,
+        .mode = if (leg == .webrtc) .dtls_required else .legacy_group,
+    };
+}
+
+test "media rooms owned graph snapshot roundtrip preserves all control maps and physical remap" {
+    var rooms = MediaRooms.initConfig(testing.allocator, .{ .max_participants = 8, .max_breakout_bytes = 16 });
+    defer rooms.deinit();
+    const call = routing.CallId{ .domain = .{ .serial = 9 }, .serial = 4 };
+    const old_a = routing.ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const old_b = routing.ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    const new_a = routing.ClientId{ .shard = 2, .slot = 11, .gen = 3 };
+    const new_b = routing.ClientId{ .shard = 2, .slot = 12, .gen = 3 };
+    const codec = sdp.Codec{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 };
+    const profile = CallProfile{ .codecs = .{ codec, undefined, undefined, undefined }, .codec_count = 1 };
+    try rooms.physical_profiles.put(.{ .call = call, .client = old_a, .leg = .native }, profile);
+    try rooms.physical_profiles.put(.{ .call = call, .client = old_b, .leg = .webrtc }, profile);
+    try rooms.physical_members.put(.{ .call = call, .client = old_a }, .{ .display = try media.ParticipantId.init("alice"), .kind_bits = 1 });
+    try rooms.physical_members.put(.{ .call = call, .client = old_b }, .{ .display = try media.ParticipantId.init("bob"), .kind_bits = 2 });
+    rooms.transport_revision = 17;
+    try rooms.join("#media", "alice", .voice);
+    try rooms.join("#media", "bob", .video);
+    try rooms.setBreakout("#media", "alice", "stage");
+    try rooms.setPosition("#media", "alice", .{ .x = 7, .y = -4 });
+    try rooms.setHand("#media", "alice", true);
+    try rooms.setProfile("#media", &.{codec}, .{ .scheme = .none, .redundancy = 0 });
+    try rooms.setParticipantProfile("#media", "alice", &.{codec}, .{ .scheme = .none, .redundancy = 0 });
+    try testing.expect(try rooms.setConsent("#media", "alice", true));
+    try testing.expect(try rooms.setConsent("#media", "bob", true));
+    try testing.expect(try rooms.startRecording("#media", "alice"));
+    try testing.expect(try rooms.setQuality("#media", "alice", .{ .loss_pct = 3, .rtt_ms = 41, .bitrate_kbps = 256 }));
+    var snapshot = try rooms.capture();
+    defer snapshot.deinit();
+    try snapshot.validate();
+    const graph_calls = try testing.allocator.dupe(routing.GraphCall, &.{.{ .channel = try routing.ChannelKey.init("#media"), .row = .{ .id = call, .offers = 2, .memberships = 2 } }});
+    defer testing.allocator.free(graph_calls);
+    const graph_endpoints = try testing.allocator.dupe(routing.GraphEndpoint, &.{
+        .{ .key = .{ .call = call, .client = old_a, .leg = .native }, .row = .{ .observation = graphObservationForRoomsTest(call, old_a, .native, 5, 5) } },
+        .{ .key = .{ .call = call, .client = old_b, .leg = .webrtc }, .row = .{ .observation = graphObservationForRoomsTest(call, old_b, .webrtc, 6, 6) } },
+    });
+    defer testing.allocator.free(graph_endpoints);
+    const graph_memberships = try testing.allocator.dupe(routing.GraphMembership, &.{
+        .{ .key = .{ .call = call, .client = old_a }, .row = .{ .bits = 1 } },
+        .{ .key = .{ .call = call, .client = old_b }, .row = .{ .bits = 2 } },
+    });
+    defer testing.allocator.free(graph_memberships);
+    const graph_profile = CallProfile{
+        .codecs = .{ codec, .{ .tag = .cadencevox, .clock_rate = 0, .params = 0 }, .{ .tag = .cadencevox, .clock_rate = 0, .params = 0 }, .{ .tag = .cadencevox, .clock_rate = 0, .params = 0 } },
+        .codec_count = 1,
+    };
+    const graph_policies = try testing.allocator.dupe(routing.GraphBridgePolicy, &.{.{
+        .key = .{ .call = call, .client = old_a, .leg = .native },
+        .row = .{ .reference = graphObservationForRoomsTest(call, old_a, .native, 5, 5).reference, .profile = graph_profile, .kind_bits = 1 },
+    }});
+    defer testing.allocator.free(graph_policies);
+    const graph = routing.GraphSnapshot{
+        .allocator = testing.allocator,
+        .id = .{ .serial = 9 },
+        .revision = 17,
+        .next_call = 5,
+        .next_endpoint = 7,
+        .next_stream = 7,
+        .next_scope = 1,
+        .next_binding = 3,
+        .native_binding_serial = 1,
+        .webrtc_binding_serial = 2,
+        .calls = graph_calls,
+        .endpoints = graph_endpoints,
+        .memberships = graph_memberships,
+        .bridge_policy = graph_policies,
+    };
+    try snapshot.validateAgainstGraph(&graph);
+    graph_policies[0].row.kind_bits = 2;
+    try testing.expectError(error.InvalidSnapshot, graph.validate());
+    graph_policies[0].row.kind_bits = 1;
+    const original_profile_client = snapshot.physical_profiles[0].key.client;
+    snapshot.physical_profiles[0].key.client = new_a;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validateAgainstGraph(&graph));
+    snapshot.physical_profiles[0].key.client = original_profile_client;
+    const original_display = snapshot.physical_members[0].member.display;
+    snapshot.physical_members[0].member.display = try media.ParticipantId.init("stranger");
+    try testing.expectError(error.InvalidSnapshot, snapshot.validateAgainstGraph(&graph));
+    snapshot.physical_members[0].member.display = original_display;
+    snapshot.queues[0].items[0][0] = 'x';
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.queues[0].items[0][0] = 'a';
+    try testing.expectEqual(@as(usize, 2), snapshot.physical_profiles.len);
+    try testing.expectEqual(@as(usize, 2), snapshot.physical_members.len);
+    try testing.expectEqual(@as(usize, 1), snapshot.rooms.len);
+    try testing.expectEqual(@as(usize, 1), snapshot.queues.len);
+    try testing.expectEqual(@as(usize, 1), snapshot.recordings.len);
+    var restored = try MediaRooms.prepareRestore(testing.allocator, &snapshot, &.{ .{ .source = old_a, .target = new_a }, .{ .source = old_b, .target = new_b } });
+    defer restored.deinit();
+    try testing.expectEqual(@as(u64, 17), restored.transport_revision);
+    try testing.expect(restored.physical_profiles.contains(.{ .call = call, .client = new_a, .leg = .native }));
+    try testing.expect(restored.physical_profiles.contains(.{ .call = call, .client = new_b, .leg = .webrtc }));
+    try testing.expect(!restored.physical_members.contains(.{ .call = call, .client = old_a }));
+    try testing.expectEqual(@as(usize, 2), restored.roster("#media").len);
+    try testing.expect(std.mem.eql(u8, "stage", restored.breakoutOf("#media", "alice")));
+    try testing.expectEqual(Position{ .x = 7, .y = -4 }, restored.positionOf("#media", "alice"));
+    try testing.expect(restored.handRaised("#media", "alice"));
+    try testing.expect(restored.hasConsent("#media", "bob"));
+    try testing.expect(restored.recordingOf("#media").?.active);
+    try testing.expectEqual(@as(u8, 3), restored.qualityOf("#media", "alice").?.loss_pct);
+    var queue: [2][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), restored.copySpeakQueue("#media", &queue));
+    try testing.expect(std.mem.eql(u8, "alice", queue[0]));
+    var recaptured = try restored.capture();
+    defer recaptured.deinit();
+    try recaptured.validate();
+    var remapped_graph = try routing.prepareRemappedGraph(testing.allocator, &graph, &.{ .{ .source = old_a, .target = new_a }, .{ .source = old_b, .target = new_b } });
+    defer remapped_graph.deinit();
+    try recaptured.validateAgainstGraph(&remapped_graph);
+    try testing.expectError(error.IncompleteRemap, MediaRooms.prepareRestore(testing.allocator, &snapshot, &.{.{ .source = old_a, .target = new_a }}));
+    try testing.expectError(error.InvalidSnapshot, MediaRooms.prepareRestore(testing.allocator, &snapshot, &.{ .{ .source = old_a, .target = new_a }, .{ .source = old_b, .target = new_a } }));
+    const saved = snapshot.rooms[0].room.participants[0].id.len;
+    snapshot.rooms[0].room.participants[0].id.len = 0;
+    try testing.expectError(error.InvalidSnapshot, MediaRooms.prepareRestore(testing.allocator, &snapshot, &.{ .{ .source = old_a, .target = new_a }, .{ .source = old_b, .target = new_b } }));
+    snapshot.rooms[0].room.participants[0].id.len = saved;
+}
+
+test "media rooms prepared graph every allocation failure leaves source and permits retry" {
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    try rooms.join("#oom", "alice", .voice);
+    try rooms.setHand("#oom", "alice", true);
+    try rooms.setBreakout("#oom", "alice", "stage");
+    var snapshot = try rooms.capture();
+    defer snapshot.deinit();
+    var fail = testing.FailingAllocator.init(testing.allocator, .{});
+    const baseline = fail.allocated_bytes - fail.freed_bytes;
+    var failures: usize = 0;
+    var succeeded = false;
+    for (0..128) |n| {
+        fail.fail_index = fail.alloc_index + n;
+        var restored = MediaRooms.prepareRestore(fail.allocator(), &snapshot, &.{}) catch |err| {
+            fail.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(baseline, fail.allocated_bytes - fail.freed_bytes);
+            try snapshot.validate();
+            try testing.expectEqual(@as(u32, 1), rooms.rooms.count());
+            failures += 1;
+            continue;
+        };
+        fail.fail_index = std.math.maxInt(usize);
+        restored.deinit();
+        try testing.expectEqual(baseline, fail.allocated_bytes - fail.freed_bytes);
+        succeeded = true;
+        break;
+    }
+    try testing.expect(succeeded and failures >= 3);
 }
 
 test "call profile persists then clears when the call ends" {

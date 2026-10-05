@@ -222,6 +222,8 @@ pub const SfuSrtp = struct {
         peers: []Peer,
         owners: [max_owners]Owner,
         clock: u64,
+        ingress_source: u64,
+        next_ingress: u64,
 
         pub fn deinit(self: *Snapshot) void {
             for (self.peers) |*peer| std.crypto.secureZero(u8, std.mem.asBytes(&peer.material));
@@ -262,6 +264,7 @@ pub const SfuSrtp = struct {
         }
 
         pub fn validate(self: *const Snapshot) !void {
+            if (self.next_ingress == 0 or (self.ingress_source == 0 and self.next_ingress != 1) or (self.ingress_source != 0 and self.next_ingress == 1)) return error.InvalidSnapshot;
             if (self.peers.len != 0 and self.peers.len != max_peers) return error.InvalidSnapshot;
             for (self.peers, 0..) |peer, i| {
                 if (!peer.active) {
@@ -340,7 +343,7 @@ pub const SfuSrtp = struct {
             } else if (!std.meta.eql(source, PeerCtx{})) return error.InvalidSnapshot;
             dest.* = .{ .addr = source.addr, .active = source.active, .last_use = source.last_use, .material = source.material, .srtcp_out_index = source.srtcp_out_index, .srtcp_in = source.srtcp_in, .in_streams = source.in_streams, .out_streams = source.out_streams };
         }
-        const snapshot: Snapshot = .{ .allocator = allocator, .peers = peers, .owners = self.owners, .clock = self.clock };
+        const snapshot: Snapshot = .{ .allocator = allocator, .peers = peers, .owners = self.owners, .clock = self.clock, .ingress_source = self.ingress_source, .next_ingress = self.next_ingress };
         try snapshot.validate();
         return snapshot;
     }
@@ -359,6 +362,21 @@ pub const SfuSrtp = struct {
         candidate.peers = peers;
         candidate.owners = snapshot.owners;
         candidate.clock = snapshot.clock;
+        // No tentative receipt crosses the cut. Preserve its high water, but
+        // mint a candidate-local issuer so old-process receipts cannot name a
+        // newly staged pending slot. Do this after every allocation succeeds.
+        if (snapshot.ingress_source != 0) {
+            var issuer = ingressSourceIdentity() orelse {
+                candidate.wipe();
+                return error.SequenceExhausted;
+            };
+            if (issuer == snapshot.ingress_source) issuer = ingressSourceIdentity() orelse {
+                candidate.wipe();
+                return error.SequenceExhausted;
+            };
+            candidate.ingress_source = issuer;
+        }
+        candidate.next_ingress = snapshot.next_ingress;
         return candidate;
     }
 
@@ -1835,4 +1853,50 @@ test "physical media SFU last issued ingress completes without new serial and ex
     try testing.expectEqualDeep(original_owners, source.owners);
     try testing.expectEqual(original_clock, source.clock);
     try testing.expect(source.pending_ingress == null);
+}
+
+test "active media DTO SRTP restore rotates receipt issuer and retains ingress high water" {
+    const address = mkAddr(6);
+    const material = mkKeys(6);
+    var source = SfuSrtp.init(testing.allocator);
+    defer source.wipe();
+    try testing.expect(source.noteEstablished(address, material));
+    var canonical_storage: [128]u8 = undefined;
+    const canonical = rtpPacket(91, 606, "issuer-cut", &canonical_storage);
+    var wire_storage: [256]u8 = undefined;
+    const client = srtp.deriveSessionKeys(material.clientMaster(), material.clientSalt());
+    const wire = try srtp.protect(client, 0, canonical, &wire_storage);
+    var plain: [256]u8 = undefined;
+    const old = source.prepareIngressRtp(address, wire, &plain) orelse return error.TestUnexpectedResult;
+    try source.abortIngress(old.receipt);
+    var snapshot = try source.capture(testing.allocator);
+    defer snapshot.deinit();
+    try testing.expect(snapshot.ingress_source != 0);
+    try testing.expectEqual(@as(u64, 2), snapshot.next_ingress);
+
+    var existing_candidate = SfuSrtp.init(testing.allocator);
+    defer existing_candidate.wipe();
+    try testing.expect(existing_candidate.noteEstablished(address, material));
+    const other = existing_candidate.prepareIngressRtp(address, wire, &plain) orelse return error.TestUnexpectedResult;
+    defer if (existing_candidate.pending_ingress != null) existing_candidate.abortIngress(other.receipt) catch unreachable;
+    var restored = try SfuSrtp.prepareRestore(testing.allocator, &snapshot);
+    defer restored.wipe();
+    try testing.expect(restored.ingress_source != snapshot.ingress_source);
+    try testing.expect(restored.ingress_source != existing_candidate.ingress_source);
+    try testing.expectEqual(snapshot.next_ingress, restored.next_ingress);
+    const current = restored.prepareIngressRtp(address, wire, &plain) orelse return error.TestUnexpectedResult;
+    defer if (restored.pending_ingress != null) restored.abortIngress(current.receipt) catch unreachable;
+    try testing.expect(current.receipt != old.receipt);
+    try testing.expect(current.receipt != other.receipt);
+    try testing.expectError(error.StaleIngress, restored.validateIngress(old.receipt));
+    try testing.expectError(error.StaleIngress, restored.validateIngress(other.receipt));
+    try restored.validateIngress(current.receipt);
+    restored.commitIngress(current.receipt);
+
+    const saved_source = snapshot.ingress_source;
+    snapshot.ingress_source = 0;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.ingress_source = saved_source;
+    snapshot.next_ingress = 0;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
 }
