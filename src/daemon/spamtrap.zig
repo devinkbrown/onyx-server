@@ -273,6 +273,32 @@ pub fn Spamtrap(comptime params: Params) type {
             return out[0..self.recent.items.len];
         }
 
+        /// Helix-only import into a detached registry. Keys must be the same
+        /// lowercase form produced by `triggered`; no counter is recomputed.
+        pub fn checkpointImportOffender(self: *Self, actor_key: []const u8, count: u64) (SpamtrapError || error{InvalidCheckpoint})!void {
+            var buf: [params.max_actor_bytes]u8 = undefined;
+            const normalized = try normalizeActor(actor_key, &buf);
+            if (!std.mem.eql(u8, normalized, actor_key) or count == 0 or
+                self.offender_trips.contains(actor_key)) return error.InvalidCheckpoint;
+            if (self.offender_trips.count() >= params.max_offenders) return error.TrapFull;
+            const owned_key = try self.allocator.dupe(u8, actor_key);
+            errdefer self.allocator.free(owned_key);
+            try self.offender_trips.putNoClobber(owned_key, count);
+        }
+
+        /// Helix-only import of one retained trip in oldest-to-newest order.
+        /// Original actor and target casing is kept even if a trap was removed.
+        pub fn checkpointAppendRecent(self: *Self, trip: Trip) (SpamtrapError || error{InvalidCheckpoint})!void {
+            try validateActor(trip.actor);
+            switch (trip.kind) {
+                .nick => try validateNick(trip.target),
+                .channel => try validateChannel(trip.target),
+            }
+            if (trip.count_for_actor == 0 or self.recent.items.len >= params.max_recent_trips)
+                return error.InvalidCheckpoint;
+            try self.appendRecent(trip.actor, trip.kind, trip.target, trip.count_for_actor);
+        }
+
         fn incrementActor(self: *Self, actor: []const u8) SpamtrapError!u64 {
             var key_buf: [params.max_actor_bytes]u8 = undefined;
             const key = try normalizeActor(actor, &key_buf);

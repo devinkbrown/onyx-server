@@ -7,7 +7,7 @@
 //! TLS listener state. Each cycle it re-reads the leaf + issuer from the
 //! configured cert file, builds an OCSP request for the leaf's AIA responder URL,
 //! POSTs it over the off-reactor blocking `http_fetch` transport, verifies +
-//! freshness-gates the response with `ocsp.isStapleServable`, and — only on a
+//! freshness-gates the response with `ocsp.isStapleServableForCertId`, and — only on a
 //! good, in-window, issuer-signed response — hands the raw DER to the server via
 //! `publishOcspStaple`, which reactor 0 swaps into `config.tls_ocsp_staple`.
 //!
@@ -100,6 +100,37 @@ pub fn ocspTransportOptions(trust_anchors: []const []const u8, opts: Options) ht
     };
 }
 
+/// Reactor-0 publication and Helix adoption must bind a fetched response to
+/// the certificate that is actually serving, rather than to the on-disk leaf
+/// the worker happened to read. ACME can replace that file before its separate
+/// TLS reload signal is consumed. Call while holding the server's World lock;
+/// this function only borrows the live chain and allocates nothing. A returned
+/// deadline is exclusive: the staple must not be served at or after that Unix
+/// second, even if a refresh has not yet succeeded.
+pub fn stapleValidUntilForChain(der: []const u8, live_chain: []const []const u8, now_unix: i64, skew_seconds: i64) ?i64 {
+    if (live_chain.len < 2 or der.len == 0 or skew_seconds < 0) return null;
+    const leaf = x509.parse(live_chain[0]) catch return null;
+    const issuer = x509.parse(live_chain[1]) catch return null;
+    if (!std.mem.eql(u8, leaf.issuer_der, issuer.subject_der)) return null;
+    const identity: ocsp.CertIdInput = .{
+        .issuer_name_der = issuer.subject_der,
+        .issuer_key_bytes = issuer.subject_public_key,
+        .serial_der = leaf.serial_der,
+    };
+    // Keep the existing strict gate for signature, delegated signer authority,
+    // complete CertID, good status, and freshness before extracting the bound.
+    if (!ocsp.isStapleServableForCertId(der, issuer.spki_der, identity, now_unix, skew_seconds)) return null;
+    const parsed = ocsp.parse(der) catch return null;
+    const single = ocsp.singleForCertId(parsed, identity) orelse return null;
+    const next_update = single.next_update orelse return null;
+    const next_epoch = x509.generalizedTimeToEpoch(next_update) catch return null;
+    return next_epoch +| skew_seconds;
+}
+
+pub fn stapleServableForChain(der: []const u8, live_chain: []const []const u8, now_unix: i64, skew_seconds: i64) bool {
+    return stapleValidUntilForChain(der, live_chain, now_unix, skew_seconds) != null;
+}
+
 /// Outcome of one responder fetch. `.keep` means the previous staple stays
 /// (transport failure, bad certificate, bad signature, or a revoked leaf).
 /// `.publish` is an owned DER body the caller hands to the server.
@@ -118,7 +149,7 @@ pub fn fetchAndDecide(
     trust_anchors: []const []const u8,
     opts: Options,
     issuer_spki: []const u8,
-    serial: []const u8,
+    identity: ocsp.CertIdInput,
     now: i64,
 ) StapleDecision {
     const http_resp = http_fetch.post(allocator, url, ocsp_request_content_type, request_der, ocspTransportOptions(trust_anchors, opts)) catch |err| {
@@ -137,8 +168,8 @@ pub fn fetchAndDecide(
     // delegated responder). An unsigned body cannot forge a revocation.
     if (ocsp.parse(der)) |parsed| {
         if (ocsp.verifyResponseSignatureWithChain(parsed, issuer_spki, now)) {
-            if (ocsp.statusForSerial(parsed, serial)) |status| {
-                if (status == .revoked) {
+            if (ocsp.singleForCertId(parsed, identity)) |single| {
+                if (single.cert_status == .revoked) {
                     dlog.log("onyx-server: CRITICAL ocsp responder reports THIS server's certificate REVOKED — not stapling\n", .{});
                     return .keep;
                 }
@@ -146,7 +177,7 @@ pub fn fetchAndDecide(
         }
     } else |_| {}
 
-    if (!ocsp.isStapleServable(der, issuer_spki, serial, now, opts.skew_seconds)) {
+    if (!ocsp.isStapleServableForCertId(der, issuer_spki, identity, now, opts.skew_seconds)) {
         dlog.log("onyx-server: ocsp response not servable (bad sig/status/freshness); keeping current staple\n", .{});
         return .keep;
     }
@@ -301,6 +332,18 @@ pub const Service = struct {
     pub fn restoreSnapshot(self: *Service, snapshot: *const Snapshot) !void {
         if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0) return error.NotQuiescent;
         try snapshot.validate(self.tls, self.opts, self.trust_anchors);
+        self.publishSnapshot(snapshot);
+    }
+    /// Gate-prepared candidate restore: the worker is parked before and after
+    /// config/shape validation, and the final scalar copy cannot fail.
+    pub fn restoreSnapshotParked(self: *Service, snapshot: *const Snapshot) !void {
+        if (self.thread != null or self.runtime.pause.request_epoch != 0) return error.NotQuiescent;
+        try self.requireParked();
+        try snapshot.validate(self.tls, self.opts, self.trust_anchors);
+        try self.requireParked();
+        self.publishSnapshot(snapshot);
+    }
+    fn publishSnapshot(self: *Service, snapshot: *const Snapshot) void {
         self.last_serial = snapshot.last_serial;
         self.last_serial_len = snapshot.last_serial_len;
         self.next_refresh_unix = snapshot.next_refresh_unix;
@@ -320,6 +363,7 @@ pub const Service = struct {
             // separate final graph barrier, not inferred from this arrival.
             self.runtime.pause.boundary();
             if (self.stop_flag.load(.acquire)) break;
+            if (self.resetIfRejected()) self.next_check_ms = 0;
             const now = platform.monotonicMillis();
             if (now < self.next_check_ms) {
                 sleepMs(@intCast(@min(self.next_check_ms - now, wake_poll_ms)));
@@ -333,6 +377,21 @@ pub const Service = struct {
             self.completed_checks += 1;
             self.next_check_ms = platform.monotonicMillis() +| @as(i64, @intCast(self.opts.check_interval_ms));
         }
+    }
+
+    fn resetIfRejected(self: *Service) bool {
+        const full_server = @import("builtin").os.tag == .linux or @import("builtin").os.tag == .openbsd or @import("builtin").os.tag == .windows;
+        if (comptime full_server) {
+            if (self.server.takeOcspStapleRejected()) {
+                self.last_serial = @splat(0);
+                self.last_serial_len = 0;
+                self.next_refresh_unix = 0;
+                self.next_retry_unix = 0;
+                self.fail_count = 0;
+                return true;
+            }
+        }
+        return false;
     }
 
     fn checkOnce(self: *Service) void {
@@ -363,6 +422,10 @@ pub const Service = struct {
             dlog.log("onyx-server: ocsp staple skipped: cannot parse issuer cert ({s})\n", .{@errorName(err)});
             return;
         };
+        if (!std.mem.eql(u8, leaf.issuer_der, issuer.subject_der)) {
+            dlog.log("onyx-server: ocsp staple skipped: issuer cert does not name the leaf's issuer\n", .{});
+            return;
+        }
         if (leaf.aia_ocsp_url.len == 0) {
             if (!self.warned_no_aia) {
                 dlog.log("onyx-server: ocsp staple disabled: leaf has no AIA OCSP responder URL\n", .{});
@@ -373,6 +436,11 @@ pub const Service = struct {
         self.warned_no_aia = false;
 
         const now = @divTrunc(platform.realtimeMillis(), 1000);
+
+        // A successful live TLS reload can discard the prior staple when the
+        // new leaf needs a fresh response. Cancel the previous scheduler
+        // receipt and retry against the new disk leaf promptly.
+        _ = self.resetIfRejected();
 
         // A cert rotation (new serial vs the last published one) deserves a fresh
         // attempt, not the backoff accumulated against the previous leaf.
@@ -414,11 +482,16 @@ pub const Service = struct {
             dlog.log("onyx-server: ocsp staple skipped: malformed AIA URL\n", .{});
             return false;
         };
-        const decision = fetchAndDecide(self.allocator, url, req, self.trust_anchors, self.opts, issuer.spki_der, leaf.serial_der, now);
+        const identity: ocsp.CertIdInput = .{
+            .issuer_name_der = issuer.subject_der,
+            .issuer_key_bytes = issuer.subject_public_key,
+            .serial_der = leaf.serial_der,
+        };
+        const decision = fetchAndDecide(self.allocator, url, req, self.trust_anchors, self.opts, issuer.spki_der, identity, now);
         switch (decision) {
             .keep => return false,
             .publish => |owned| {
-                self.recordPublished(owned, leaf.serial_der, now);
+                self.recordPublished(owned, identity, now);
                 // The full server takes ownership of the verified DER and
                 // publishes it on reactor 0, including its Windows backend.
                 const full_server = @import("builtin").os.tag == .linux or @import("builtin").os.tag == .openbsd or @import("builtin").os.tag == .windows;
@@ -442,20 +515,20 @@ pub const Service = struct {
 
     /// Record the serial + schedule the next responder contact from the freshly
     /// published response's thisUpdate/nextUpdate (falls back to min interval).
-    fn recordPublished(self: *Service, der: []const u8, serial: []const u8, now: i64) void {
+    fn recordPublished(self: *Service, der: []const u8, identity: ocsp.CertIdInput, now: i64) void {
         // A successful publish clears the failure backoff.
         self.fail_count = 0;
         self.next_retry_unix = 0;
-        if (serial.len <= max_serial_len) {
-            @memcpy(self.last_serial[0..serial.len], serial);
-            self.last_serial_len = serial.len;
+        if (identity.serial_der.len <= max_serial_len) {
+            @memcpy(self.last_serial[0..identity.serial_der.len], identity.serial_der);
+            self.last_serial_len = identity.serial_der.len;
         } else {
             self.last_serial_len = 0; // unexpectedly long serial: always re-fetch
         }
 
         var delay = self.opts.min_refresh_seconds;
         if (ocsp.parse(der)) |parsed| {
-            if (ocsp.singleForSerial(parsed, serial)) |single| {
+            if (ocsp.singleForCertId(parsed, identity)) |single| {
                 if (single.next_update) |next_bytes| {
                     const this_e = x509.generalizedTimeToEpoch(single.this_update) catch now;
                     const next_e = x509.generalizedTimeToEpoch(next_bytes) catch (now + self.opts.min_refresh_seconds);
@@ -747,11 +820,12 @@ test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the
     try std.testing.expectEqual(@as(usize, 1), transport.trust_anchors.len);
     try std.testing.expectEqual(good_der.ptr, transport.trust_anchors[0].ptr);
 
-    const untrusted = fetchAndDecide(allocator, url, "ocsp-request", &.{bad_der}, opts, "issuer-spki", "serial", 1_700_000_000);
+    const test_identity: ocsp.CertIdInput = .{ .issuer_name_der = "issuer-name", .issuer_key_bytes = "issuer-key", .serial_der = "serial" };
+    const untrusted = fetchAndDecide(allocator, url, "ocsp-request", &.{bad_der}, opts, "issuer-spki", test_identity, 1_700_000_000);
     try std.testing.expect(untrusted == .keep);
     try std.testing.expectEqual(@as(u32, 0), posts.load(.monotonic));
 
-    const trusted_garbage = fetchAndDecide(allocator, url, "ocsp-request", &.{good_der}, opts, "issuer-spki", "serial", 1_700_000_000);
+    const trusted_garbage = fetchAndDecide(allocator, url, "ocsp-request", &.{good_der}, opts, "issuer-spki", test_identity, 1_700_000_000);
     switch (trusted_garbage) {
         .keep => {},
         .publish => |owned| {
@@ -762,6 +836,91 @@ test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the
     try std.testing.expect(posts.load(.monotonic) >= 1);
     try std.testing.expectEqualStrings("previous-staple", previous);
     std.debug.print("GAP-A8 branch=trust-store bad-cert=keep signature-fail=keep previous={s}\n", .{previous});
+}
+
+test "OCSP publication refuses missing issuer, malformed live leaf, and malformed response" {
+    try std.testing.expect(!stapleServableForChain("der", &.{}, 1_700_000_000, 0));
+    try std.testing.expect(!stapleServableForChain("der", &.{"leaf"}, 1_700_000_000, 0));
+    try std.testing.expect(!stapleServableForChain("der", &.{ "bad-leaf", "bad-issuer" }, 1_700_000_000, 0));
+    try std.testing.expect(!stapleServableForChain("", &.{ "bad-leaf", "bad-issuer" }, 1_700_000_000, 0));
+    try std.testing.expect(!stapleServableForChain("der", &.{ "bad-leaf", "bad-issuer" }, 1_700_000_000, -1));
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain("der", &.{ "bad-leaf", "bad-issuer" }, 1_700_000_000, 0));
+}
+
+test "OCSP publication binds a signed response to the live leaf and issuer CertID" {
+    const allocator = std.testing.allocator;
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x6b));
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try x509_selfsign.buildSelfSigned(&leaf_buf, .{
+        .common_name = "ocsp.example",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x44},
+        .key_pair = key,
+        .dns_names = &.{"ocsp.example"},
+        .is_ca = true,
+    });
+    const cert = try x509.parse(leaf);
+    const identity: ocsp.CertIdInput = .{
+        .issuer_name_der = cert.subject_der,
+        .issuer_key_bytes = cert.subject_public_key,
+        .serial_der = cert.serial_der,
+    };
+    const response = try ocsp.testSignedOcspResponseForCertId(allocator, key, identity, .good, "20260202030405Z");
+    defer allocator.free(response);
+    const now = try x509.generalizedTimeToEpoch("20260115030405Z");
+    const next_epoch = try x509.generalizedTimeToEpoch("20260202030405Z");
+    try std.testing.expect(stapleServableForChain(response, &.{ leaf, leaf }, now, 0));
+    try std.testing.expectEqual(@as(?i64, next_epoch), stapleValidUntilForChain(response, &.{ leaf, leaf }, now, 0));
+    try std.testing.expectEqual(@as(?i64, next_epoch + 300), stapleValidUntilForChain(response, &.{ leaf, leaf }, next_epoch + 299, 300));
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain(response, &.{ leaf, leaf }, next_epoch + 300, 300));
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain(response, &.{ leaf, leaf }, now, -1));
+
+    const no_next = try ocsp.testSignedOcspResponseForCertId(allocator, key, identity, .good, null);
+    defer allocator.free(no_next);
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain(no_next, &.{ leaf, leaf }, now, 0));
+    const revoked = try ocsp.testSignedOcspResponseForCertId(allocator, key, identity, .revoked, "20260202030405Z");
+    defer allocator.free(revoked);
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain(revoked, &.{ leaf, leaf }, now, 0));
+    const tampered = try allocator.dupe(u8, response);
+    defer allocator.free(tampered);
+    tampered[tampered.len - 1] ^= 1;
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain(tampered, &.{ leaf, leaf }, now, 0));
+
+    var rotated_buf: [1024]u8 = undefined;
+    const rotated = try x509_selfsign.buildSelfSigned(&rotated_buf, .{
+        .common_name = "ocsp.example",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{0x45},
+        .key_pair = key,
+        .dns_names = &.{"ocsp.example"},
+        .is_ca = true,
+    });
+    try std.testing.expect(!stapleServableForChain(response, &.{ rotated, rotated }, now, 0));
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain(response, &.{ rotated, rotated }, now, 0));
+
+    // The same issuer key and leaf serial still authenticate the signature,
+    // but a different issuer Name hash must invalidate the signed CertID.
+    const wrong_name = try ocsp.testSignedOcspResponseForCertId(allocator, key, .{
+        .issuer_name_der = "different-issuer-name",
+        .issuer_key_bytes = cert.subject_public_key,
+        .serial_der = cert.serial_der,
+    }, .good, "20260202030405Z");
+    defer allocator.free(wrong_name);
+    try std.testing.expect(ocsp.verifyResponseSignature(try ocsp.parse(wrong_name), cert.spki_der));
+    try std.testing.expect(!stapleServableForChain(wrong_name, &.{ leaf, leaf }, now, 0));
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain(wrong_name, &.{ leaf, leaf }, now, 0));
+
+    const wrong_key = try ocsp.testSignedOcspResponseForCertId(allocator, key, .{
+        .issuer_name_der = cert.subject_der,
+        .issuer_key_bytes = "different-issuer-key",
+        .serial_der = cert.serial_der,
+    }, .good, "20260202030405Z");
+    defer allocator.free(wrong_key);
+    try std.testing.expect(ocsp.verifyResponseSignature(try ocsp.parse(wrong_key), cert.spki_der));
+    try std.testing.expect(!stapleServableForChain(wrong_key, &.{ leaf, leaf }, now, 0));
+    try std.testing.expectEqual(@as(?i64, null), stapleValidUntilForChain(wrong_key, &.{ leaf, leaf }, now, 0));
 }
 
 test {

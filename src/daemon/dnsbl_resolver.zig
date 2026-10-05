@@ -238,6 +238,21 @@ pub const Resolver = struct {
     pub fn restoreSnapshot(self: *Resolver, snapshot: *const Snapshot) !void {
         if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0) return error.AlreadyStarted;
         try snapshot.validate(self.cfg, self.zones[0..self.zone_count]);
+        try self.publishSnapshot(snapshot);
+    }
+
+    /// The successor can prepare its actual DNSBL worker under the Windows
+    /// Gate before decoding. Prove that owner is still parked on both sides of
+    /// validation, then publish the already allocated carry without failure.
+    pub fn restoreSnapshotParked(self: *Resolver, snapshot: *const Snapshot) !void {
+        if (self.thread != null or self.runtime.pause.request_epoch != 0) return error.AlreadyStarted;
+        try self.requireParked();
+        try snapshot.validate(self.cfg, self.zones[0..self.zone_count]);
+        try self.requireParked();
+        try self.publishSnapshot(snapshot);
+    }
+
+    fn publishSnapshot(self: *Resolver, snapshot: *const Snapshot) !void {
         if (self.entries.len != cache_slots) return error.InvalidState;
         for (snapshot.entries, self.entries) |entry, *out| out.* = .{ .key = entry.key, .has_key = entry.has_key, .state = entry.state, .verdict = entry.verdict, .resolved_ms = entry.resolved_ms };
         for (snapshot.jobs[0..snapshot.job_count], 0..) |ip, i| self.jobs[i] = .{ .ip = ip };
@@ -464,12 +479,16 @@ pub const Snapshot = struct {
     }
     pub fn validate(self: *const Snapshot, cfg: dns.ResolverConfig, zones: []const []const u8) !void {
         if (self.entries.len != cache_slots or self.jobs.len != job_capacity or self.job_count > job_capacity or self.zones.len != zones.len) return error.InvalidState;
+        if (self.captured_monotonic_ms < 0) return error.InvalidState;
         if (!std.mem.eql(u8, &self.config_digest, &try configDigest(cfg, zones))) return error.ConfigMismatch;
         for (self.zones, zones) |carried, actual| if (!std.mem.eql(u8, carried, actual)) return error.ConfigMismatch;
         for (self.entries, 0..) |entry, i| {
             if (!entry.has_key and (entry.state != .empty or entry.verdict.listed or entry.verdict.code != 0 or
                 entry.resolved_ms != 0 or !addrEql(entry.key, .{ .ipv4 = .{ 0, 0, 0, 0 } }))) return error.InvalidState;
             if (entry.has_key and entry.state == .empty) return error.InvalidState;
+            if (entry.state != .ready and (entry.verdict.listed or entry.verdict.code != 0 or entry.resolved_ms != 0)) return error.InvalidState;
+            if (entry.state == .ready and ((!entry.verdict.listed and entry.verdict.code != 0) or
+                entry.resolved_ms < 0 or entry.resolved_ms > self.captured_monotonic_ms)) return error.InvalidState;
             if (entry.has_key) for (self.entries[0..i]) |prior| {
                 if (prior.has_key and addrEql(prior.key, entry.key)) return error.InvalidState;
             };

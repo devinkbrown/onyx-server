@@ -295,6 +295,10 @@ const WindowsSockets = struct {
             return error.MissingOp;
         }
         entry.associated_port = port;
+        // After the successor has associated and activated the imported socket,
+        // it is an ordinary live owner again and may be sealed by the next
+        // Helix generation.
+        if (entry.carry == .helix_released) entry.carry = .ordinary;
     }
 
     fn take(self: *WindowsSockets, fd: linux.fd_t) ?usize {
@@ -459,14 +463,40 @@ pub fn observeWindowsConnectedTcpSocket(fd: linux.fd_t) WindowsTcpObservationErr
     const name = socketName(socket) catch return error.NotConnected;
     var peer_name = std.mem.zeroes(RioSockAddr6);
     var peer_len: i32 = @sizeOf(RioSockAddr6);
-    if (getpeername(socket, @ptrCast(&peer_name), &peer_len) != 0 or
-        !((peer_name.family == wsa_af_inet and peer_len == @sizeOf(RioSockAddr)) or
-            (peer_name.family == wsa_af_inet6 and peer_len == @sizeOf(RioSockAddr6)))) return error.NotConnected;
+    if (getpeername(socket, @ptrCast(&peer_name), &peer_len) != 0) return error.NotConnected;
+    if (!((peer_name.family == wsa_af_inet and peer_len == @sizeOf(RioSockAddr)) or
+        (peer_name.family == wsa_af_inet6 and peer_len == @sizeOf(RioSockAddr6))))
+        return error.NotConnected;
     const local = try windowsTcpEndpoint(name);
     const peer = try windowsTcpEndpoint(peer_name);
     if (local.port == 0 or peer.port == 0 or std.meta.activeTag(local.address) != std.meta.activeTag(peer.address))
         return error.NotConnected;
     return .{ .local = local, .peer = peer };
+}
+
+/// AcceptEx sockets can report an empty peer sockaddr even while the TCP
+/// connection is established. SO_CONNECT_TIME verifies that state without
+/// consuming I/O or depending on per-descriptor accept context.
+pub fn observeWindowsHelixConnectedTcpSocket(fd: linux.fd_t) WindowsTcpObservationError!void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = windows_sockets.get(fd) orelse return error.InvalidSocket;
+    if (try windowsTcpStatus(socket)) return error.NotConnected;
+    var connected_seconds: u32 = std.math.maxInt(u32);
+    var length: i32 = @sizeOf(u32);
+    if (getsockopt(socket, 0xFFFF, 0x700C, @ptrCast(&connected_seconds), &length) != 0 or
+        length != @sizeOf(u32) or connected_seconds == std.math.maxInt(u32))
+    {
+        std.debug.print("onyx-server: Windows Helix SO_CONNECT_TIME failed for socket {d} (WSA {d}, length {d}, value {d})\n", .{ fd, WSAGetLastError(), length, connected_seconds });
+        return error.NotConnected;
+    }
+    const local = try windowsTcpEndpoint(socketName(socket) catch {
+        std.debug.print("onyx-server: Windows Helix local endpoint failed for socket {d} (WSA {d})\n", .{ fd, WSAGetLastError() });
+        return error.NotConnected;
+    });
+    if (local.port == 0) {
+        std.debug.print("onyx-server: Windows Helix local port is zero for socket {d}\n", .{fd});
+        return error.NotConnected;
+    }
 }
 
 test "Windows Helix TCP observation distinguishes listening and connected registry sockets" {
@@ -477,11 +507,13 @@ test "Windows Helix TCP observation distinguishes listening and connected regist
     try std.testing.expectEqual(listener.port, observed.local.port);
     try std.testing.expectEqual(PeerAddress{ .ipv4 = .{ 127, 0, 0, 1 } }, observed.local.address);
     try std.testing.expectError(error.NotConnected, observeWindowsConnectedTcpSocket(listener.fd));
+    try std.testing.expectError(error.NotConnected, observeWindowsHelixConnectedTcpSocket(listener.fd));
 
     const client = try openWindowsTcpSocket(wsa_af_inet);
     defer closeSocket(client);
     try std.testing.expectError(error.NotListening, observeWindowsListeningTcpSocket(client));
     try std.testing.expectError(error.NotConnected, observeWindowsConnectedTcpSocket(client));
+    try std.testing.expectError(error.NotConnected, observeWindowsHelixConnectedTcpSocket(client));
     const destination = RioSockAddr{
         .family = @intCast(wsa_af_inet),
         .port = std.mem.nativeToBig(u16, listener.port),
@@ -502,6 +534,8 @@ test "Windows Helix TCP observation distinguishes listening and connected regist
     try std.testing.expectEqual(listener.port, connected.peer.port);
     try std.testing.expectEqual(PeerAddress{ .ipv4 = .{ 127, 0, 0, 1 } }, connected.peer.address);
     _ = try observeWindowsConnectedTcpSocket(accepted);
+    try observeWindowsHelixConnectedTcpSocket(client);
+    try observeWindowsHelixConnectedTcpSocket(accepted);
 }
 
 pub fn socketPort(fd: linux.fd_t) error{ Unsupported, SocketFailed }!u16 {

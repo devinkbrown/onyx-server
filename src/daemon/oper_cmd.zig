@@ -1182,6 +1182,11 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     // Commit: replace the previous reloaded generation, then point the live
     // registry at the new bindings. `parsed`'s strings (incl. the TLS cert/key
     // paths consulted just below) now live in `self.reload_parsed`.
+    // The boot source no longer proves the effective Windows policy once any
+    // REHASH mutation begins. A failed later notice or TLS reload must leave
+    // native process handoff refused rather than trust the old source hash.
+    if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid"))
+        self.windows_helix_source_valid.store(false, .release);
     self.allocator.free(self.reload_bindings);
     if (self.reload_parsed) |*p| p.deinit(self.allocator);
     self.reload_parsed = parsed;

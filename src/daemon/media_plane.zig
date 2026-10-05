@@ -25,6 +25,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const media_transport = @import("../substrate/media_transport.zig");
 const media_socket = @import("../substrate/media_socket.zig");
+const windows_udp = @import("helix/native_windows_udp_socket.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 const rtp_nack = @import("../substrate/rtp_nack.zig");
 const native_feedback = @import("../substrate/native_feedback.zig");
@@ -844,7 +845,16 @@ pub const MediaPlane = struct {
         lockSpin(&self.rtcp_out_mutex);
         defer self.rtcp_out_mutex.unlock();
 
-        return self.routing_binding == null and self.transport.endpoints.count() == 0 and
+        // The server installs a routing binding even when media is disabled.
+        // That inert binding has no process-owned transport state to preserve.
+        const binding_idle = self.routing_binding == null or
+            (self.routing_egress == null and self.cross == null and self.socket == null);
+        if (!binding_idle or self.routing_inbound != null or self.physical_pending != 0 or
+            self.physical_rows.count() != 0 or self.physical_ufrags.count() != 0 or
+            self.physical_groups.count() != 0) return false;
+        for (self.physical_ssrcs) |entry| if (entry.live) return false;
+        for (self.routing_crypto) |entry| if (entry.live) return false;
+        return self.transport.endpoints.count() == 0 and
             self.transport.by_ufrag.count() == 0 and
             self.transport.by_addr.count() == 0 and
             self.transport.by_ssrc.count() == 0 and
@@ -1247,22 +1257,60 @@ pub const MediaPlane = struct {
     pub fn capturePaused(self: *MediaPlane, token: runtime_pause.Token) !Snapshot {
         if (self.thread == null and self.runtime.view == null) return error.NotRunning;
         try self.runtime.pause.requirePaused(token);
-        return self.captureIdle(.paused);
+        return self.captureIdle(.paused, null);
+    }
+    /// Called only inside the original Domain's paused configured-media cut.
+    /// The source's owner and funded FIFO remain locked through the snapshot.
+    pub fn capturePausedPristineRoutingLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, native: *@import("native_media_transport.zig").NativeMediaTransport, token: runtime_pause.Token) !Snapshot {
+        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        try domain.requirePristineConfiguredMediaLocked(scope, native, self);
+        try domain.requireWebrtcBindingLocked(scope, self.routing_binding orelse return error.RoutingContinuityUnsupported, self);
+        return self.captureIdle(.paused, domain);
     }
     pub fn captureUnstarted(self: *MediaPlane) !Snapshot {
         if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
-        return self.captureIdle(.unstarted);
+        return self.captureIdle(.unstarted, null);
     }
     // Caller freezes all signaling/bridge producers across this complete cut.
     // Pump-owned crypto is read only after actual source arrival or before spawn.
-    fn captureIdle(self: *MediaPlane, execution: Execution) !Snapshot {
+    fn captureIdle(self: *MediaPlane, execution: Execution, pristine_domain: ?*routing.Domain) !Snapshot {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        if (self.routing_binding != null) return error.RoutingContinuityUnsupported;
+        if (pristine_domain == null and self.routing_binding != null) return error.RoutingContinuityUnsupported;
         lockSpin(&self.fp_mutex);
         defer self.fp_mutex.unlock();
         lockSpin(&self.rtcp_out_mutex);
         defer self.rtcp_out_mutex.unlock();
+        const queue: ?*RoutingEgressQueue = if (pristine_domain != null) (self.routing_egress orelse return error.ActiveMediaContinuityUnsupported) else null;
+        if (queue) |q| lockSpin(&q.mutex);
+        defer if (queue) |q| q.mutex.unlock();
+        if (pristine_domain) |domain| {
+            if (self.routing_domain != domain or self.routing_binding == null or self.routing_closed or
+                self.legacy_joining or self.stop_flag.load(.acquire) or self.retired_routing_egress != null or
+                self.physical_revision != 1 or self.next_routing_inbound != 1 or
+                self.routing_inbound != null or self.routing_ingress_refused != 0 or
+                self.routing_ingress_completed != 0 or self.routing_last_ingress_error != null or
+                self.physical_pending != 0 or self.physical_rows.count() != 0 or
+                self.physical_ufrags.count() != 0 or self.physical_groups.count() != 0 or
+                self.rtcp_out_head != 0 or self.srtp_hub.clock != 0 or self.srtp_hub.ingress_source != 0 or
+                self.srtp_hub.next_ingress != 1 or self.srtp_hub.pending_ingress != null or
+                self.srtp_hub.peers.len != 0)
+                return error.ActiveMediaContinuityUnsupported;
+            for (self.physical_ssrcs) |entry| if (entry.live) return error.ActiveMediaContinuityUnsupported;
+            for (self.routing_crypto) |entry| if (entry.live) return error.ActiveMediaContinuityUnsupported;
+            if (self.dtls) |term| {
+                if (term.verify_bindings.tick != 0 or term.verify_bindings.exhausted) return error.ActiveMediaContinuityUnsupported;
+            }
+            if (self.dtls13) |term| {
+                if (term.verify_bindings.tick != 0 or term.verify_bindings.exhausted) return error.ActiveMediaContinuityUnsupported;
+            }
+            const q = queue.?;
+            if (q.head != 0 or q.len != 0 or q.next_ordinal != 1 or q.completed != 0 or
+                q.last_disposition != null or q.inflight != null or q.poisoned or
+                q.next_fence != 1 or q.fence != null)
+                return error.ActiveMediaContinuityUnsupported;
+        }
         if (self.transport.endpoints.count() != 0 or self.transport.by_ufrag.count() != 0 or self.transport.by_addr.count() != 0 or self.transport.by_ssrc.count() != 0 or self.transport.group_keys.count() != 0 or self.offered_fps.count() != 0 or self.rtcp_out_len != 0) return error.ActiveMediaContinuityUnsupported;
         for (self.srtp_hub.peers) |peer| if (peer.active) return error.ActiveMediaContinuityUnsupported;
         for (self.srtp_hub.owners) |owner| if (owner.active) return error.ActiveMediaContinuityUnsupported;
@@ -1282,8 +1330,22 @@ pub const MediaPlane = struct {
             _ = std.posix.system.close(fd);
             return err;
         };
-        var socket = try MediaSocket.initInherited(fd, &carry.socket);
-        errdefer socket.deinit();
+        const socket = try MediaSocket.initInherited(fd, &carry.socket);
+        return initRestored(allocator, socket, carry, cross);
+    }
+
+    /// Consume an authenticated Windows UDP duplicate into the exact idle
+    /// media owner. DTLS identity is restored from the snapshot; no cold bind,
+    /// entropy, STUN discovery, or worker start occurs here.
+    pub fn initTransferred(allocator: std.mem.Allocator, transfer: *windows_udp.Transfer, carry: *const Snapshot, cross: ?media_bridge.RtpCrossSink) !MediaPlane {
+        const socket = try MediaSocket.initTransferred(transfer, &carry.socket);
+        return initRestored(allocator, socket, carry, cross);
+    }
+
+    fn initRestored(allocator: std.mem.Allocator, socket: MediaSocket, carry: *const Snapshot, cross: ?media_bridge.RtpCrossSink) !MediaPlane {
+        var held = socket;
+        errdefer held.deinit();
+        try carry.validate();
         if (carry.cross_configured != (cross != null)) return error.ConfigMismatch;
         var owner: MediaPlane = .{ .allocator = allocator, .transport = MediaTransport.init(allocator), .csprng = carry.csprng.restore(), .srtp_hub = sfu_srtp.SfuSrtp.init(allocator) };
         errdefer owner.deinit();
@@ -1315,7 +1377,7 @@ pub const MediaPlane = struct {
             owner.dtls13_sessions = sessions;
             owner.dtls13 = term;
         }
-        owner.socket = socket;
+        owner.socket = held;
         owner.port = carry.socket.port;
         return owner;
     }
@@ -3582,6 +3644,58 @@ pub const Snapshot = struct {
         }
     }
 };
+
+test "Windows Helix media plane imports idle DTLS owner and parks inherited worker" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var source = try MediaPlane.initFallible(testing.allocator);
+    defer source.deinit();
+    source.dtls_enabled = true;
+    source.dtls13_enabled = true;
+    try source.prepareColdResources(testing.io, loopback_be, 0);
+    var consumed: [19]u8 = undefined;
+    source.csprng.random().bytes(&consumed);
+    source.srtp_hub.clock = 123;
+    var carry = try source.captureUnstarted();
+    defer carry.deinit();
+    try testing.expect(carry.dtls12 != null);
+    const source_fd = source.socket.?.fd;
+
+    var transfer = try windows_udp.duplicateForProcess(source_fd, std.os.windows.GetCurrentProcessId());
+    var successor = try MediaPlane.initTransferred(testing.allocator, &transfer, &carry, null);
+    defer successor.deinit();
+    try testing.expect(transfer.consumed);
+    try testing.expect(successor.socket.?.fd != source_fd);
+    try testing.expectEqual(carry.socket.port, successor.port);
+    var restored = try successor.captureUnstarted();
+    defer restored.deinit();
+    try testing.expectEqualDeep(carry.csprng, restored.csprng);
+    try testing.expectEqualDeep(carry.dtls12, restored.dtls12);
+    try testing.expectEqualDeep(carry.dtls13, restored.dtls13);
+    try testing.expectEqual(carry.srtp_clock, restored.srtp_clock);
+    try testing.expectEqualDeep(carry.socket, try source.socket.?.capture());
+
+    try successor.prepareInheritedResources(testing.io);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .media_plane, .instance = 0, .owner_identity = &successor }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    defer {
+        successor.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        successor.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    try successor.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.media_plane, 0, &successor));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try successor.requireParked();
+    try testing.expect(!successor.runtime.entered.load(.acquire));
+
+    var invalid = carry;
+    defer invalid.deinit();
+    invalid.max_frame_bytes = 0;
+    var rejected = try windows_udp.duplicateForProcess(source_fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.InvalidSnapshot, MediaPlane.initTransferred(testing.allocator, &rejected, &invalid, null));
+    try testing.expect(rejected.consumed);
+    try testing.expectEqualDeep(carry.socket, try source.socket.?.capture());
+}
 
 test "companion runtime media plane actual pause idle DTLS identity random stream and rollback" {
     // Raw-fd fcntl has no libc-free Windows mapping yet.

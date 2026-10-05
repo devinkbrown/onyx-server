@@ -6,7 +6,7 @@
 //! route is GET /history over TLS 1.3. This is not an admin API.
 
 const std = @import("std");
-const runtime_pause = @import("runtime_pause.zig");
+pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 const metrics_http = @import("metrics_http.zig");
 const builtin = @import("builtin");
@@ -24,6 +24,8 @@ const platform = @import("../substrate/platform.zig");
 const posix = std.posix;
 const tls_record = @import("../crypto/tls_record.zig");
 const tls_server = @import("../crypto/tls_server.zig");
+const managed_ocsp = @import("ocsp_staple.zig");
+const ocsp = @import("../crypto/ocsp.zig");
 const native_windows_socket = @import("helix/native_windows_socket.zig");
 
 const win = struct {
@@ -488,7 +490,14 @@ pub const HttpsListener = struct {
         }
         self.request_deadline = platform.monotonicMillis() + 5000;
 
-        var tls = tls_server.Server.init(self.allocator, self.tls_config) catch return;
+        var tls_config = self.tls_config;
+        if (tls_config.ocsp_staple.len != 0 and !managed_ocsp.stapleServableForChain(
+            tls_config.ocsp_staple,
+            tls_config.cert_chain,
+            @divFloor(platform.realtimeMillis(), 1000),
+            ocsp.default_staple_skew_seconds,
+        )) tls_config.ocsp_staple = &.{};
+        var tls = tls_server.Server.init(self.allocator, tls_config) catch return;
         defer tls.deinit();
         var raw: std.ArrayList(u8) = .empty;
         defer raw.deinit(self.allocator);

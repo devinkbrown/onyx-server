@@ -21,6 +21,7 @@ pub const Pending = struct {
 
     fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
         allocator.free(self.account);
+        std.crypto.secureZero(u8, @constCast(self.token));
         allocator.free(self.token);
         self.* = undefined;
     }

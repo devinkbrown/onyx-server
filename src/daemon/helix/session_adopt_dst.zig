@@ -48,9 +48,9 @@ fn sampleSnap(fd: i32, secured: bool) session_snapshot.Snapshot {
     };
 }
 
-/// Encode an exact current-schema v5 `.clients` capsule, exactly as this binary seals a
+/// Encode an exact current-schema v7 `.clients` capsule, exactly as this binary seals a
 /// carried client at UPGRADE. Caller owns the returned bytes.
-fn v5Capsule(allocator: Allocator, snap: session_snapshot.Snapshot) ![]u8 {
+fn v7Capsule(allocator: Allocator, snap: session_snapshot.Snapshot) ![]u8 {
     const blob = try session_snapshot.encode(allocator, snap);
     defer allocator.free(blob);
     var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = blob }};
@@ -58,7 +58,7 @@ fn v5Capsule(allocator: Allocator, snap: session_snapshot.Snapshot) ![]u8 {
 }
 
 /// Construct an old-version wire without asking the current encoder to bless it.
-/// The exact v5 registry intentionally makes `capsule.encode` reject v1..v4, so
+/// The exact v7 registry intentionally makes `capsule.encode` reject v1..v6, so
 /// tests start from a valid current wire and rewrite only its fixed header range.
 /// Payload bytes are immaterial: negotiation rejects the outer header first.
 fn legacyCapsuleWire(
@@ -66,8 +66,8 @@ fn legacyCapsuleWire(
     snap: session_snapshot.Snapshot,
     version: u16,
 ) ![]u8 {
-    std.debug.assert(version >= 1 and version < 5);
-    const wire = try v5Capsule(allocator, snap);
+    std.debug.assert(version >= 1 and version < 7);
+    const wire = try v7Capsule(allocator, snap);
     // Capsule header: magic[4], schema[4], kind[1], then version/min/max u16.
     std.mem.writeInt(u16, wire[9..11], version, .little);
     std.mem.writeInt(u16, wire[11..13], version, .little);
@@ -75,8 +75,8 @@ fn legacyCapsuleWire(
     return wire;
 }
 
-/// Encode a v5 outer capsule whose client payload omits the mandatory final
-/// `was_websocket` byte. Outer negotiation succeeds, but `decodeCurrent` must
+/// Encode a v7 outer capsule whose client payload omits the mandatory
+/// `was_websocket`, absent-peer, mode, FloodGuard presence, and clone-accounting tails. Outer negotiation succeeds, but `decodeCurrent` must
 /// reject the structurally truncated client and recover its inherited fd.
 fn truncatedTransportCapsule(
     allocator: Allocator,
@@ -85,7 +85,10 @@ fn truncatedTransportCapsule(
     const current = try session_snapshot.encode(allocator, snap);
     defer allocator.free(current);
     std.debug.assert(current.len > 0);
-    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = current[0 .. current.len - 1] }};
+    // The absent-peer current suffix is websocket(1) + family/count(2) +
+    // gagged/ircx/unfurl flags(3) + last_search_ms(8) + keytrans_require(1)
+    // + nick_claimed_at_ms(8) + FloodGuard presence(1) + clone accounting(10).
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = current[0 .. current.len - 34] }};
     return capsule.encode(allocator, capsule.make(.clients, fields[0..]));
 }
 
@@ -223,7 +226,7 @@ fn joinCaps(allocator: Allocator, parts: []const []u8) ![]u8 {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "clients v5 decodeCurrent preserves WebSocket state and recovers fd under decode fault" {
+test "clients v7 decodeCurrent preserves WebSocket state and recovers fd under decode fault" {
     const allocator = testing.allocator;
 
     var loom: fault_loom.Registry = .{};
@@ -237,9 +240,9 @@ test "clients v5 decodeCurrent preserves WebSocket state and recovers fd under d
     var websocket = sampleSnap(40, false);
     websocket.was_websocket = true;
     const parts = [_][]u8{
-        try v5Capsule(allocator, websocket),
+        try v7Capsule(allocator, websocket),
         try siblingCapsule(allocator, 0xA1),
-        try v5Capsule(allocator, sampleSnap(41, false)),
+        try v7Capsule(allocator, sampleSnap(41, false)),
     };
     const stream = try joinCaps(allocator, parts[0..]);
     defer allocator.free(stream);
@@ -264,9 +267,9 @@ test "session_snapshot was_secured client without TLS engine is dropped not adop
     // dropped, never adopted as plaintext; (c) a plaintext client → adopts. Every fd is
     // accounted for; the secured-but-engineless socket is closed, not leaked.
     const parts = [_][]u8{
-        try v5Capsule(allocator, sampleSnap(50, true)), // secured, tls present
-        try v5Capsule(allocator, sampleSnap(51, true)), // secured, NO tls → drop
-        try v5Capsule(allocator, sampleSnap(52, false)), // plaintext
+        try v7Capsule(allocator, sampleSnap(50, true)), // secured, tls present
+        try v7Capsule(allocator, sampleSnap(51, true)), // secured, NO tls → drop
+        try v7Capsule(allocator, sampleSnap(52, false)), // plaintext
     };
     const stream = try joinCaps(allocator, parts[0..]);
     defer allocator.free(stream);
@@ -284,17 +287,17 @@ test "session_snapshot was_secured client without TLS engine is dropped not adop
     try testing.expectEqual(@as(usize, 0), res.fds_leaked);
 }
 
-test "clients exact v5 descriptor rejects every legacy v1 through v4 range" {
+test "clients exact v7 descriptor rejects every legacy v1 through v6 range" {
     const allocator = testing.allocator;
 
-    inline for (.{ 1, 2, 3, 4 }) |legacy_version| {
+    inline for (.{ 1, 2, 3, 4, 5, 6 }) |legacy_version| {
         const wire = try legacyCapsuleWire(allocator, sampleSnap(60 + legacy_version, false), legacy_version);
         defer allocator.free(wire);
         try testing.expectError(error.VersionUnsupported, capsule.decodeStream(allocator, wire));
     }
 }
 
-test "clients v5 missing WebSocket tail fails closed while current sibling adopts" {
+test "clients v7 missing WebSocket tail fails closed while current sibling adopts" {
     const allocator = testing.allocator;
 
     var websocket = sampleSnap(61, false);
@@ -302,7 +305,7 @@ test "clients v5 missing WebSocket tail fails closed while current sibling adopt
     const parts = [_][]u8{
         try truncatedTransportCapsule(allocator, sampleSnap(60, false)),
         try siblingCapsule(allocator, 0xC3),
-        try v5Capsule(allocator, websocket),
+        try v7Capsule(allocator, websocket),
     };
     const stream = try joinCaps(allocator, parts[0..]);
     defer allocator.free(stream);
@@ -357,9 +360,9 @@ fn runCampaign(allocator: Allocator, seed: u64) !void {
     // at decode is recovered; whatever survives adopts. All three fds must be accounted for.
     const parts = [_][]u8{
         try siblingCapsule(allocator, 0xE5),
-        try v5Capsule(allocator, sampleSnap(70, true)),
-        try v5Capsule(allocator, sampleSnap(71, false)),
-        try v5Capsule(allocator, sampleSnap(72, true)),
+        try v7Capsule(allocator, sampleSnap(70, true)),
+        try v7Capsule(allocator, sampleSnap(71, false)),
+        try v7Capsule(allocator, sampleSnap(72, true)),
         try siblingCapsule(allocator, 0xF6),
     };
     const stream = try joinCaps(allocator, parts[0..]);

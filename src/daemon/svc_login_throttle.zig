@@ -23,6 +23,80 @@
 
 const std = @import("std");
 
+pub const max_checkpoint_bytes: usize = @import("helix/live.zig").max_arena_bytes;
+pub const max_checkpoint_entries_per_scope: usize = 1_048_576;
+pub const max_checkpoint_key_bytes: usize = 65_535;
+pub const checkpoint_magic = [_]u8{ 'S', 'L', 'T', 'H' };
+pub const checkpoint_version: u8 = 1;
+const checkpoint_header_len: usize = 4 + 1 + 3 + 4 + 6 * 8 + 2 * 4;
+const checkpoint_checksum_len: usize = 32;
+const checkpoint_row_min_len: usize = 4 + 8 + 8 + 8;
+const checkpoint_domain = "onyx-service-login-throttle-checkpoint-v1";
+
+pub const CheckpointError = error{
+    BadMagic,
+    UnsupportedVersion,
+    Truncated,
+    TrailingBytes,
+    InvalidField,
+    ConfigMismatch,
+    NonCanonicalOrder,
+    ChecksumMismatch,
+    CheckpointTooLarge,
+} || std.mem.Allocator.Error;
+
+pub fn isUpgradeCheckpoint(bytes: []const u8) bool {
+    return bytes.len >= checkpoint_magic.len and std.mem.eql(u8, bytes[0..checkpoint_magic.len], &checkpoint_magic);
+}
+
+/// Validate a complete checkpoint without allocation or changing any live
+/// throttle. The final restore also compares the successor's exact policy.
+pub fn validateUpgradeCheckpoint(bytes: []const u8) CheckpointError!void {
+    if (bytes.len < checkpoint_header_len + checkpoint_checksum_len) return error.Truncated;
+    if (bytes.len > max_checkpoint_bytes) return error.CheckpointTooLarge;
+    if (!isUpgradeCheckpoint(bytes)) return error.BadMagic;
+    if (bytes[4] != checkpoint_version) return error.UnsupportedVersion;
+    if (!std.mem.eql(u8, bytes[5..8], &.{ 0, 0, 0 })) return error.InvalidField;
+    const body_len: usize = std.mem.readInt(u32, bytes[8..12], .little);
+    const expected_len = std.math.add(usize, checkpoint_header_len + checkpoint_checksum_len, body_len) catch return error.CheckpointTooLarge;
+    if (expected_len > max_checkpoint_bytes) return error.CheckpointTooLarge;
+    if (bytes.len < expected_len) return error.Truncated;
+    if (bytes.len > expected_len) return error.TrailingBytes;
+    var digest: [checkpoint_checksum_len]u8 = undefined;
+    checkpointChecksum(bytes[0 .. bytes.len - checkpoint_checksum_len], &digest);
+    const saved_digest: [checkpoint_checksum_len]u8 = bytes[bytes.len - checkpoint_checksum_len ..][0..checkpoint_checksum_len].*;
+    if (!std.crypto.timing_safe.eql([checkpoint_checksum_len]u8, digest, saved_digest)) return error.ChecksumMismatch;
+
+    var reader = CheckpointReader{ .bytes = bytes[12 .. bytes.len - checkpoint_checksum_len] };
+    const params = try reader.readParams();
+    if (!validCheckpointParams(params)) return error.InvalidField;
+    const account_count: usize = try reader.readU32();
+    const ip_count: usize = try reader.readU32();
+    if (account_count > max_checkpoint_entries_per_scope or ip_count > max_checkpoint_entries_per_scope or
+        (params.max_tracked_per_scope != 0 and (account_count > params.max_tracked_per_scope or ip_count > params.max_tracked_per_scope)))
+        return error.CheckpointTooLarge;
+    if (account_count + ip_count > body_len / checkpoint_row_min_len) return error.Truncated;
+
+    inline for (.{ account_count, ip_count }) |count| {
+        var previous_key: ?[]const u8 = null;
+        for (0..count) |_| {
+            const key_len: usize = try reader.readU32();
+            if (key_len > max_checkpoint_key_bytes) return error.CheckpointTooLarge;
+            const key = try reader.take(key_len);
+            if (!isCanonicalKey(key)) return error.InvalidField;
+            if (previous_key) |previous| {
+                if (std.mem.order(u8, previous, key) != .lt) return error.NonCanonicalOrder;
+            }
+            previous_key = key;
+            const score: f64 = @bitCast(try reader.readU64());
+            if (!std.math.isFinite(score)) return error.InvalidField;
+            _ = try reader.readI64(); // exact decay anchor
+            _ = try reader.readI64(); // exact lockout deadline
+        }
+    }
+    if (reader.remaining() != 0) return error.TrailingBytes;
+}
+
 /// Which namespace a key belongs to. The two namespaces share no state: the
 /// same string in `.account` and `.ip` is two different records.
 pub const Scope = enum(u1) {
@@ -107,6 +181,113 @@ pub const Throttle = struct {
     /// Total keys tracked across both scopes.
     pub fn countAll(self: *const Throttle) usize {
         return self.count(.account) + self.count(.ip);
+    }
+
+    /// Seal exact scores, decay anchors, and lockout deadlines in both scopes.
+    /// Expired and low-score rows remain present until the ordinary sweep runs;
+    /// omitting them would change future capacity and decay decisions.
+    pub fn exportUpgradeCheckpoint(self: *const Throttle, allocator: std.mem.Allocator) CheckpointError![]u8 {
+        if (!validCheckpointParams(self.params)) return error.InvalidField;
+        const account_count = self.tables[@intFromEnum(Scope.account)].count();
+        const ip_count = self.tables[@intFromEnum(Scope.ip)].count();
+        if (account_count > max_checkpoint_entries_per_scope or ip_count > max_checkpoint_entries_per_scope or
+            (self.params.max_tracked_per_scope != 0 and
+                (account_count > self.params.max_tracked_per_scope or ip_count > self.params.max_tracked_per_scope)))
+            return error.CheckpointTooLarge;
+
+        const account_keys = try allocator.alloc([]const u8, account_count);
+        defer allocator.free(account_keys);
+        const ip_keys = try allocator.alloc([]const u8, ip_count);
+        defer allocator.free(ip_keys);
+        const keys_by_scope = [_][][]const u8{ account_keys, ip_keys };
+        var total_len: usize = checkpoint_header_len + checkpoint_checksum_len;
+        for (keys_by_scope, 0..) |keys, scope_index| {
+            var it = self.tables[scope_index].iterator();
+            var i: usize = 0;
+            while (it.next()) |row| : (i += 1) {
+                if (i >= keys.len) return error.InvalidField;
+                keys[i] = row.key_ptr.*;
+            }
+            if (i != keys.len) return error.InvalidField;
+            std.mem.sort([]const u8, keys, {}, keyLess);
+            for (keys) |key| {
+                const row = self.tables[scope_index].get(key) orelse return error.InvalidField;
+                if (key.len > max_checkpoint_key_bytes) return error.CheckpointTooLarge;
+                if (!isCanonicalKey(key)) return error.InvalidField;
+                if (!std.math.isFinite(row.score)) return error.InvalidField;
+                try checkpointAddLen(&total_len, checkpoint_row_min_len);
+                try checkpointAddLen(&total_len, key.len);
+            }
+        }
+
+        const out = try allocator.alloc(u8, total_len);
+        errdefer allocator.free(out);
+        var writer = CheckpointWriter{ .bytes = out };
+        writer.writeBytes(&checkpoint_magic);
+        writer.writeByte(checkpoint_version);
+        writer.writeBytes(&.{ 0, 0, 0 });
+        writer.writeU32(@intCast(total_len - checkpoint_header_len - checkpoint_checksum_len));
+        writer.writeParams(self.params);
+        writer.writeU32(@intCast(account_count));
+        writer.writeU32(@intCast(ip_count));
+        for (keys_by_scope, 0..) |keys, scope_index| {
+            for (keys) |key| {
+                const row = self.tables[scope_index].get(key).?;
+                writer.writeU32(@intCast(key.len));
+                writer.writeBytes(key);
+                writer.writeU64(@bitCast(row.score));
+                writer.writeI64(row.score_ts_ms);
+                writer.writeI64(row.locked_until_ms);
+            }
+        }
+        std.debug.assert(writer.pos + checkpoint_checksum_len == out.len);
+        var digest: [checkpoint_checksum_len]u8 = undefined;
+        checkpointChecksum(out[0..writer.pos], &digest);
+        writer.writeBytes(&digest);
+        return out;
+    }
+
+    /// Build a complete replacement before COMMIT. Policy is matched bit for
+    /// bit, including signed zero in floating-point tuning values.
+    pub fn restoreUpgradeCheckpoint(
+        allocator: std.mem.Allocator,
+        expected_params: Params,
+        bytes: []const u8,
+    ) CheckpointError!Throttle {
+        if (!validCheckpointParams(expected_params)) return error.InvalidField;
+        try validateUpgradeCheckpoint(bytes);
+        var reader = CheckpointReader{ .bytes = bytes[12 .. bytes.len - checkpoint_checksum_len] };
+        const saved_params = try reader.readParams();
+        if (!checkpointParamsEqual(expected_params, saved_params)) return error.ConfigMismatch;
+        const counts = [_]usize{ try reader.readU32(), try reader.readU32() };
+        var restored = Throttle.init(allocator, expected_params);
+        errdefer restored.deinit();
+        for (counts, 0..) |row_count, scope_index| {
+            for (0..row_count) |_| {
+                const key_len: usize = try reader.readU32();
+                const key = try reader.take(key_len);
+                const saved_score: f64 = @bitCast(try reader.readU64());
+                const score_ts_ms = try reader.readI64();
+                const locked_until_ms = try reader.readI64();
+                const owned_key = try allocator.dupe(u8, key);
+                errdefer allocator.free(owned_key);
+                try restored.tables[scope_index].putNoClobber(allocator, owned_key, .{
+                    .score = saved_score,
+                    .score_ts_ms = score_ts_ms,
+                    .locked_until_ms = locked_until_ms,
+                });
+            }
+        }
+        std.debug.assert(reader.remaining() == 0);
+        return restored;
+    }
+
+    pub fn replaceFromUpgradeCheckpoint(self: *Throttle, bytes: []const u8) CheckpointError!void {
+        var replacement = try restoreUpgradeCheckpoint(self.allocator, self.params, bytes);
+        const old = self.*;
+        self.* = replacement;
+        replacement = old;
+        replacement.deinit();
     }
 
     /// Report how long `key` in `scope` must wait before another attempt, or
@@ -288,6 +469,128 @@ fn normalizeInto(buf: []u8, key: []const u8) ?[]const u8 {
 fn saturatingAdd(a: i64, b: i64) i64 {
     return std.math.add(i64, a, b) catch if (b > 0) std.math.maxInt(i64) else std.math.minInt(i64);
 }
+
+fn validCheckpointParams(params: Params) bool {
+    return std.math.isFinite(params.failure_weight) and
+        std.math.isFinite(params.lock_threshold) and params.lock_threshold > 0 and
+        params.score_half_life_ms > 0 and
+        std.math.isFinite(params.sweep_score_floor) and params.sweep_score_floor >= 0;
+}
+
+fn checkpointParamsEqual(a: Params, b: Params) bool {
+    return @as(u64, @bitCast(a.failure_weight)) == @as(u64, @bitCast(b.failure_weight)) and
+        @as(u64, @bitCast(a.lock_threshold)) == @as(u64, @bitCast(b.lock_threshold)) and
+        a.cooldown_ms == b.cooldown_ms and
+        a.score_half_life_ms == b.score_half_life_ms and
+        @as(u64, @bitCast(a.sweep_score_floor)) == @as(u64, @bitCast(b.sweep_score_floor)) and
+        a.max_tracked_per_scope == b.max_tracked_per_scope;
+}
+
+fn isCanonicalKey(key: []const u8) bool {
+    for (key) |c| if (c != std.ascii.toLower(c)) return false;
+    return true;
+}
+
+fn keyLess(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn checkpointAddLen(total: *usize, amount: usize) CheckpointError!void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.CheckpointTooLarge;
+    if (total.* > max_checkpoint_bytes) return error.CheckpointTooLarge;
+}
+
+fn checkpointChecksum(bytes: []const u8, out: *[checkpoint_checksum_len]u8) void {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(checkpoint_domain);
+    hasher.update(bytes);
+    hasher.final(out);
+}
+
+const CheckpointWriter = struct {
+    bytes: []u8,
+    pos: usize = 0,
+
+    fn writeBytes(self: *CheckpointWriter, value: []const u8) void {
+        @memcpy(self.bytes[self.pos..][0..value.len], value);
+        self.pos += value.len;
+    }
+
+    fn writeByte(self: *CheckpointWriter, value: u8) void {
+        self.bytes[self.pos] = value;
+        self.pos += 1;
+    }
+
+    fn writeU32(self: *CheckpointWriter, value: u32) void {
+        std.mem.writeInt(u32, self.bytes[self.pos..][0..4], value, .little);
+        self.pos += 4;
+    }
+
+    fn writeU64(self: *CheckpointWriter, value: u64) void {
+        std.mem.writeInt(u64, self.bytes[self.pos..][0..8], value, .little);
+        self.pos += 8;
+    }
+
+    fn writeI64(self: *CheckpointWriter, value: i64) void {
+        std.mem.writeInt(i64, self.bytes[self.pos..][0..8], value, .little);
+        self.pos += 8;
+    }
+
+    fn writeParams(self: *CheckpointWriter, params: Params) void {
+        self.writeU64(@bitCast(params.failure_weight));
+        self.writeU64(@bitCast(params.lock_threshold));
+        self.writeI64(params.cooldown_ms);
+        self.writeI64(params.score_half_life_ms);
+        self.writeU64(@bitCast(params.sweep_score_floor));
+        self.writeU64(@intCast(params.max_tracked_per_scope));
+    }
+};
+
+const CheckpointReader = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    fn remaining(self: *const CheckpointReader) usize {
+        return self.bytes.len - self.pos;
+    }
+
+    fn take(self: *CheckpointReader, len: usize) CheckpointError![]const u8 {
+        if (len > self.remaining()) return error.Truncated;
+        const result = self.bytes[self.pos..][0..len];
+        self.pos += len;
+        return result;
+    }
+
+    fn readU32(self: *CheckpointReader) CheckpointError!u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
+    }
+
+    fn readU64(self: *CheckpointReader) CheckpointError!u64 {
+        return std.mem.readInt(u64, (try self.take(8))[0..8], .little);
+    }
+
+    fn readI64(self: *CheckpointReader) CheckpointError!i64 {
+        return std.mem.readInt(i64, (try self.take(8))[0..8], .little);
+    }
+
+    fn readParams(self: *CheckpointReader) CheckpointError!Params {
+        const failure_weight: f64 = @bitCast(try self.readU64());
+        const lock_threshold: f64 = @bitCast(try self.readU64());
+        const cooldown_ms = try self.readI64();
+        const score_half_life_ms = try self.readI64();
+        const sweep_score_floor: f64 = @bitCast(try self.readU64());
+        const max_tracked_per_scope = try self.readU64();
+        if (max_tracked_per_scope > std.math.maxInt(usize)) return error.InvalidField;
+        return .{
+            .failure_weight = failure_weight,
+            .lock_threshold = lock_threshold,
+            .cooldown_ms = cooldown_ms,
+            .score_half_life_ms = score_half_life_ms,
+            .sweep_score_floor = sweep_score_floor,
+            .max_tracked_per_scope = @intCast(max_tracked_per_scope),
+        };
+    }
+};
 
 const testing = std.testing;
 
@@ -577,4 +880,138 @@ test "deinit frees all keys across both scopes with no leaks" {
     // Assert: teardown under the testing allocator catches any leak.
     try testing.expectEqual(@as(usize, 3), thr.countAll());
     thr.deinit();
+}
+
+test "service login checkpoint preserves lockout and decay clocks in both scopes" {
+    const params = Params{
+        .failure_weight = 2,
+        .lock_threshold = 3,
+        .cooldown_ms = 700,
+        .score_half_life_ms = 1000,
+        .sweep_score_floor = 0.1,
+        .max_tracked_per_scope = 8,
+    };
+    var source = Throttle.init(testing.allocator, params);
+    defer source.deinit();
+    _ = source.recordFailure(.account, "Bob", 100);
+    _ = source.recordFailure(.account, "bOb", 200);
+    _ = source.recordFailure(.ip, "BOB", 150);
+    _ = source.recordFailure(.account, "", -10);
+    const long_key = &@as([300]u8, @splat('X'));
+    _ = source.recordFailure(.ip, long_key, 300);
+
+    const wire = try source.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    try validateUpgradeCheckpoint(wire);
+    var restored = try Throttle.restoreUpgradeCheckpoint(testing.allocator, params, wire);
+    defer restored.deinit();
+    try testing.expectEqual(@as(usize, 2), restored.count(.account));
+    try testing.expectEqual(@as(usize, 2), restored.count(.ip));
+    try testing.expectEqualDeep(source.tables[0].get("bob").?, restored.tables[0].get("bob").?);
+    try testing.expectEqualDeep(source.tables[1].get("bob").?, restored.tables[1].get("bob").?);
+    try testing.expectEqual(source.isLocked(.account, "bob", 400), restored.isLocked(.account, "bob", 400));
+    try testing.expectApproxEqAbs(source.score(.account, "bob", 900), restored.score(.account, "bob", 900), 1e-12);
+    const reencoded = try restored.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(reencoded);
+    try testing.expectEqualSlices(u8, wire, reencoded);
+
+    var reverse = Throttle.init(testing.allocator, params);
+    defer reverse.deinit();
+    _ = reverse.recordFailure(.ip, long_key, 300);
+    _ = reverse.recordFailure(.account, "", -10);
+    _ = reverse.recordFailure(.ip, "BOB", 150);
+    _ = reverse.recordFailure(.account, "Bob", 100);
+    _ = reverse.recordFailure(.account, "bOb", 200);
+    const reverse_wire = try reverse.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(reverse_wire);
+    try testing.expectEqualSlices(u8, wire, reverse_wire);
+}
+
+test "service login checkpoint rejects malformed rows and policy mismatch" {
+    const params = Params{ .max_tracked_per_scope = 2 };
+    var source = Throttle.init(testing.allocator, params);
+    defer source.deinit();
+    _ = source.recordFailure(.account, "aa", 1);
+    _ = source.recordFailure(.account, "bb", 2);
+    const wire = try source.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    for (0..wire.len) |n| {
+        try testing.expectError(error.Truncated, Throttle.restoreUpgradeCheckpoint(testing.allocator, params, wire[0..n]));
+    }
+    try testing.expectError(error.ConfigMismatch, Throttle.restoreUpgradeCheckpoint(
+        testing.allocator,
+        .{ .max_tracked_per_scope = 3 },
+        wire,
+    ));
+
+    var damaged = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(damaged);
+    damaged[4] = 2;
+    try testing.expectError(error.UnsupportedVersion, validateUpgradeCheckpoint(damaged));
+    damaged[4] = checkpoint_version;
+    damaged[checkpoint_header_len + 4] ^= 1;
+    try testing.expectError(error.ChecksumMismatch, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    // Two sorted two-byte account keys: make the second a duplicate.
+    const second_key_offset = checkpoint_header_len + (checkpoint_row_min_len + 2) + 4;
+    @memcpy(damaged[second_key_offset..][0..2], "aa");
+    testRechecksum(damaged);
+    try testing.expectError(error.NonCanonicalOrder, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    damaged[checkpoint_header_len + 4] = 'A';
+    testRechecksum(damaged);
+    try testing.expectError(error.InvalidField, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    std.mem.writeInt(u64, damaged[checkpoint_header_len + 4 + 2 ..][0..8], 0x7ff8_0000_0000_0001, .little);
+    testRechecksum(damaged);
+    try testing.expectError(error.InvalidField, validateUpgradeCheckpoint(damaged));
+
+    const trailing = try testing.allocator.alloc(u8, wire.len + 1);
+    defer testing.allocator.free(trailing);
+    @memcpy(trailing[0..wire.len], wire);
+    trailing[wire.len] = 0;
+    try testing.expectError(error.TrailingBytes, validateUpgradeCheckpoint(trailing));
+}
+
+test "service login checkpoint replacement is atomic across allocation failures" {
+    const params = Params{ .lock_threshold = 1, .max_tracked_per_scope = 4 };
+    var source = Throttle.init(testing.allocator, params);
+    defer source.deinit();
+    _ = source.recordFailure(.account, "alice", 10);
+    _ = source.recordFailure(.ip, "192.0.2.1", 11);
+    const EncodeSweep = struct {
+        fn run(allocator: std.mem.Allocator, thr: *const Throttle) !void {
+            const bytes = try thr.exportUpgradeCheckpoint(allocator);
+            defer allocator.free(bytes);
+            try testing.expectEqual(@as(usize, 2), thr.countAll());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, EncodeSweep.run, .{&source});
+    const wire = try source.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    const RestoreSweep = struct {
+        fn run(allocator: std.mem.Allocator, cfg: Params, bytes: []const u8) !void {
+            var target = Throttle.init(allocator, cfg);
+            defer target.deinit();
+            _ = target.recordFailure(.account, "keeper", 1);
+            if (target.countAll() == 0) return error.OutOfMemory;
+            target.replaceFromUpgradeCheckpoint(bytes) catch |err| {
+                try testing.expectEqual(@as(usize, 1), target.countAll());
+                try testing.expect(target.isLocked(.account, "keeper", 1) != null);
+                return err;
+            };
+            try testing.expectEqual(@as(usize, 2), target.countAll());
+            try testing.expectEqual(@as(?i64, null), target.isLocked(.account, "keeper", 1));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, RestoreSweep.run, .{ params, wire });
+}
+
+fn testRechecksum(bytes: []u8) void {
+    var digest: [checkpoint_checksum_len]u8 = undefined;
+    checkpointChecksum(bytes[0 .. bytes.len - checkpoint_checksum_len], &digest);
+    @memcpy(bytes[bytes.len - checkpoint_checksum_len ..], &digest);
 }

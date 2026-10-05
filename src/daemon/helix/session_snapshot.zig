@@ -26,6 +26,11 @@
 //!   [u8 tlen][token]      OPTIONAL trailing session reclaim token (past the flag)
 //!   [u64 umode_bits][u32 ilen][pending_in][u32 olen][pending_out]  OPTIONAL v4 tail
 //!   [u8 was_websocket]    current-schema transport flag (past the v4 tail)
+//!   [u8 address_family][4 or 16 address bytes][u8 clone_counted]  current v6 tail
+//!   [u8 gagged][u8 ircx][u8 unfurl_opt_in][i64 last_search_ms]
+//!   [u8 keytrans_require][i64 nick_claimed_at_ms]  current v6 tail
+//!   [u8 flood_present][fixed 539-byte FloodGuard carry if present]  current v6 tail
+//!   [u8 mesh_clone_counted][u64 mesh_clone_hash][u8 throttle_counted]  current v7 tail
 //!
 //! The oper-grant block (OPTIONAL, written after the caps block) carries the
 //! operator's privilege bits (OperPrivileges.toBits — append-only ordinals) plus
@@ -58,7 +63,7 @@
 //! `was_secured = false` under the tolerant `decode`, which is exactly the
 //! historical (never-drop) behavior. This field was introduced as `.clients`
 //! schema v2; the `.clients` descriptor has since advanced to an EXACT current
-//! contract (`current_version = min_supported = max_supported = 5`, see
+//! contract (`current_version = min_supported = max_supported = 7`, see
 //! helix/capsule.zig), so current adoption uses the strict `decodeCurrent` and a
 //! rollback is a cold restart. The tolerant `decode` that reads this byte
 //! optionally survives only for explicit legacy/test fixtures.
@@ -101,15 +106,34 @@
 //! remains deliberately tolerant for explicitly-versioned legacy capsules;
 //! `decodeCurrent` requires this byte and every preceding current block exactly,
 //! so a current capsule can never silently downgrade a WebSocket to raw IRC.
-//! The `.clients` descriptor is consequently exact version 5: legacy payloads
-//! remain testable through `decode`, but are never negotiated as current state.
+//! Version 5 remains testable through `decode`, but is never negotiated as
+//! current state. Version 6 appends the accepted peer's typed IP address and
+//! local clone-registration bit. The address family is 0 (absent), 4 (IPv4),
+//! or 6 (IPv6); a counted connection must have an address. This lets the
+//! successor restore clone-limit occupancy before it serves the carried client.
+//! The same exact tail preserves server-controlled GAG, IRCX opt-in, link-preview
+//! opt-in, the monotonic SEARCH rate-limit timestamp, and the client's strict
+//! key-transparency requirement, and the wall-clock nick-claim grace start.
+//! FloodGuard carry stores the exact policy and all metering state. The
+//! successor checks its policy against the independently derived connection
+//! class and rejects a future monotonic timestamp before adoption. Every
+//! boolean is 0/1; all carried integers use explicit little-endian fields.
+//! Version 7 appends per-attachment mesh-clone and CloneDetector accounting so
+//! closing an adopted connection decrements both restored maps exactly once.
+//! An uncounted mesh clone has a zero hash.
 const std = @import("std");
+const dns = @import("../../proto/dns.zig");
+const flood_guard = @import("../flood_guard.zig");
 
 pub const Error = error{
     Truncated,
     TooLong,
     InvalidBoolean,
     InvalidTokenLength,
+    InvalidPeerAddress,
+    InvalidCountedState,
+    InvalidFloodState,
+    InvalidMeshCloneState,
     UnknownFlags,
     TrailingData,
 };
@@ -147,6 +171,34 @@ pub const Snapshot = struct {
     /// The current-schema decoder requires the canonical trailing 0/1 byte so
     /// adoption cannot silently reinterpret a WebSocket as a raw IRC stream.
     was_websocket: bool = false,
+    /// Accepted kernel peer or trusted PROXY address. This is a typed IP, not
+    /// the client's mutable display host. Absent only when no peer was known.
+    peer_addr: ?dns.Address = null,
+    /// Whether this physical connection occupied a local clone-limit slot at
+    /// seal time. A true value requires `peer_addr` for exact re-registration.
+    clone_counted: bool = false,
+    /// This attachment contributes one local MeshClones count under its salted
+    /// peer-IP hash. When uncounted, the hash must be zero.
+    mesh_clone_counted: bool = false,
+    mesh_clone_hash: u64 = 0,
+    /// This attachment contributes one active CloneDetector count for its IP.
+    throttle_counted: bool = false,
+    /// Server-controlled IRCX +z GAG and session IRCX opt-in state.
+    gagged: bool = false,
+    ircx: bool = false,
+    /// Link-preview opt-in belongs to this physical client attachment.
+    unfurl_opt_in: bool = false,
+    /// Monotonic timestamp of this client's last SEARCH, or 0 if none.
+    last_search_ms: i64 = 0,
+    /// Client demanded strict key-transparency replies. Losing this bit would
+    /// silently downgrade missing-log failures into observational responses.
+    keytrans_require: bool = false,
+    /// Unix-ms grace start for an unauthenticated registered nick, or 0 when
+    /// the nick is free or account-owned. This is wall time, not monotonic time.
+    nick_claimed_at_ms: i64 = 0,
+    /// Exact per-connection rate-limit state. Absence is allowed for a client
+    /// whose class has no active guard; server adoption decides that policy.
+    flood_guard: ?flood_guard.CarryState = null,
     /// The client's 16-byte multi-session reclaim token (sessions.zig `Token`),
     /// carried as an OPTIONAL trailing block so the successor re-tracks the
     /// adopted connection in the SessionStore under the SAME token. Empty = no
@@ -196,9 +248,197 @@ const flag_is_oper: u8 = 1 << 2;
 const known_flags = flag_logged_in | flag_away_active | flag_is_oper;
 const known_member_mode_flags: u8 = 0x0f;
 const session_token_len: usize = 16;
+const current_peer_tail_min_len: usize = 2;
+const current_mode_tail_len: usize = 3 + 8 + 1 + 8;
+const current_flood_presence_len: usize = 1;
+const current_clone_tail_len: usize = 1 + 8 + 1;
+/// Enabled byte + policy numerics + four buckets + excess + target ring.
+const flood_carry_body_len: usize = 1 + (4 * 3 + 3 + 5) * 8 + (4 * 3 + 3) * 8 + flood_guard.target_slots * 2 * 8 + 2;
+comptime {
+    if (flood_carry_body_len != 539) @compileError("FloodGuard carry wire length changed");
+}
+
+const ModeTail = struct {
+    gagged: bool,
+    ircx: bool,
+    unfurl_opt_in: bool,
+    last_search_ms: i64,
+    keytrans_require: bool,
+    nick_claimed_at_ms: i64,
+};
+
+fn readModeTail(r: *Reader) Error!ModeTail {
+    return .{
+        .gagged = try r.boolean(),
+        .ircx = try r.boolean(),
+        .unfurl_opt_in = try r.boolean(),
+        .last_search_ms = try r.i64le(),
+        .keytrans_require = try r.boolean(),
+        .nick_claimed_at_ms = try r.i64le(),
+    };
+}
+
+const PeerTail = struct {
+    address: ?dns.Address,
+    clone_counted: bool,
+};
+
+fn readPeerTail(r: *Reader) Error!PeerTail {
+    const family = try r.byte();
+    const address: ?dns.Address = switch (family) {
+        0 => null,
+        4 => .{ .ipv4 = (try r.take(4))[0..4].* },
+        6 => .{ .ipv6 = (try r.take(16))[0..16].* },
+        else => return error.InvalidPeerAddress,
+    };
+    const clone_counted = try r.boolean();
+    if (clone_counted and address == null) return error.InvalidCountedState;
+    return .{ .address = address, .clone_counted = clone_counted };
+}
+
+const CloneTail = struct {
+    mesh_clone_counted: bool,
+    mesh_clone_hash: u64,
+    throttle_counted: bool,
+};
+
+fn readCloneTail(r: *Reader) Error!CloneTail {
+    const mesh_clone_counted = try r.boolean();
+    const mesh_clone_hash = try r.u64le();
+    const throttle_counted = try r.boolean();
+    if (!mesh_clone_counted and mesh_clone_hash != 0) return error.InvalidMeshCloneState;
+    return .{
+        .mesh_clone_counted = mesh_clone_counted,
+        .mesh_clone_hash = mesh_clone_hash,
+        .throttle_counted = throttle_counted,
+    };
+}
+
+fn validateFloodCarry(state: flood_guard.CarryState) Error!void {
+    // This is structural validation only. Adoption must import again with the
+    // successor's independently derived policy and actual monotonic time.
+    _ = flood_guard.FloodGuard.importCarry(state.policy, std.math.maxInt(i64), state) catch
+        return error.InvalidFloodState;
+}
+
+fn appendFloodU64(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u64) std.mem.Allocator.Error!void {
+    var le: [8]u8 = undefined;
+    std.mem.writeInt(u64, &le, value, .little);
+    try out.appendSlice(allocator, &le);
+}
+
+fn appendFloodI64(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i64) std.mem.Allocator.Error!void {
+    var le: [8]u8 = undefined;
+    std.mem.writeInt(i64, &le, value, .little);
+    try out.appendSlice(allocator, &le);
+}
+
+fn appendBucketConfig(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: flood_guard.BucketCfg) std.mem.Allocator.Error!void {
+    try appendFloodU64(out, allocator, cfg.capacity);
+    try appendFloodU64(out, allocator, cfg.refill_tokens);
+    try appendFloodU64(out, allocator, cfg.refill_period_ms);
+}
+
+fn readBucketConfig(r: *Reader) Error!flood_guard.BucketCfg {
+    return .{
+        .capacity = try r.u64le(),
+        .refill_tokens = try r.u64le(),
+        .refill_period_ms = try r.u64le(),
+    };
+}
+
+fn appendBucketCarry(out: *std.ArrayList(u8), allocator: std.mem.Allocator, bucket: flood_guard.BucketCarry) std.mem.Allocator.Error!void {
+    try appendFloodU64(out, allocator, bucket.tokens);
+    try appendFloodI64(out, allocator, bucket.last_ms);
+    try appendFloodU64(out, allocator, bucket.carry);
+}
+
+fn readBucketCarry(r: *Reader) Error!flood_guard.BucketCarry {
+    return .{
+        .tokens = try r.u64le(),
+        .last_ms = try r.i64le(),
+        .carry = try r.u64le(),
+    };
+}
+
+fn appendFloodCarry(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: flood_guard.CarryState) std.mem.Allocator.Error!void {
+    const start = out.items.len;
+    const policy = state.policy;
+    try out.append(allocator, @intFromBool(policy.enabled));
+    inline for (.{ policy.messages, policy.bytes, policy.commands, policy.target_changes }) |cfg|
+        try appendBucketConfig(out, allocator, cfg);
+    try appendFloodU64(out, allocator, policy.excess.threshold);
+    try appendFloodU64(out, allocator, policy.excess.decay_points);
+    try appendFloodU64(out, allocator, policy.excess.decay_period_ms);
+    inline for (.{ policy.throttle_penalty, policy.target_change_penalty, policy.privmsg_weight, policy.join_weight, policy.default_weight }) |value|
+        try appendFloodU64(out, allocator, value);
+    inline for (.{ state.message_rate, state.byte_rate, state.command_rate, state.target_change_rate }) |bucket|
+        try appendBucketCarry(out, allocator, bucket);
+    try appendFloodU64(out, allocator, state.excess.points);
+    try appendFloodI64(out, allocator, state.excess.last_ms);
+    try appendFloodU64(out, allocator, state.excess.carry);
+    for (state.targets) |key| {
+        try appendFloodU64(out, allocator, key.hash);
+        try appendFloodU64(out, allocator, key.len);
+    }
+    try out.append(allocator, state.target_count);
+    try out.append(allocator, state.next_target_slot);
+    std.debug.assert(out.items.len - start == flood_carry_body_len);
+}
+
+fn readFloodCarry(r: *Reader) Error!flood_guard.CarryState {
+    const start = r.pos;
+    const policy: flood_guard.GuardConfig = .{
+        .enabled = try r.boolean(),
+        .messages = try readBucketConfig(r),
+        .bytes = try readBucketConfig(r),
+        .commands = try readBucketConfig(r),
+        .target_changes = try readBucketConfig(r),
+        .excess = .{
+            .threshold = try r.u64le(),
+            .decay_points = try r.u64le(),
+            .decay_period_ms = try r.u64le(),
+        },
+        .throttle_penalty = try r.u64le(),
+        .target_change_penalty = try r.u64le(),
+        .privmsg_weight = try r.u64le(),
+        .join_weight = try r.u64le(),
+        .default_weight = try r.u64le(),
+    };
+    var targets: [flood_guard.target_slots]flood_guard.TargetCarry = undefined;
+    const message_rate = try readBucketCarry(r);
+    const byte_rate = try readBucketCarry(r);
+    const command_rate = try readBucketCarry(r);
+    const target_change_rate = try readBucketCarry(r);
+    const excess: flood_guard.ExcessCarry = .{
+        .points = try r.u64le(),
+        .last_ms = try r.i64le(),
+        .carry = try r.u64le(),
+    };
+    for (&targets) |*key| {
+        key.* = .{ .hash = try r.u64le(), .len = try r.u64le() };
+    }
+    const state: flood_guard.CarryState = .{
+        .policy = policy,
+        .message_rate = message_rate,
+        .byte_rate = byte_rate,
+        .command_rate = command_rate,
+        .target_change_rate = target_change_rate,
+        .excess = excess,
+        .targets = targets,
+        .target_count = try r.byte(),
+        .next_target_slot = try r.byte(),
+    };
+    std.debug.assert(r.pos - start == flood_carry_body_len);
+    try validateFloodCarry(state);
+    return state;
+}
 
 /// Encode `snap` into a freshly-allocated buffer the caller owns.
 pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Allocator.Error)![]u8 {
+    if (snap.clone_counted and snap.peer_addr == null) return error.InvalidCountedState;
+    if (!snap.mesh_clone_counted and snap.mesh_clone_hash != 0) return error.InvalidMeshCloneState;
+    if (snap.flood_guard) |state| try validateFloodCarry(state);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     inline for (.{ snap.nick, snap.realname, snap.account, snap.real_host, snap.host, snap.away }) |s| {
@@ -295,6 +535,37 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     // the complete v4 tail, making every strict prefix unambiguously incomplete.
     // It is the payload change guarded by the exact `.clients` v5 descriptor.
     try out.append(allocator, @intFromBool(snap.was_websocket));
+    // Current v6 peer/count tail. The address is the actual accepted or trusted
+    // PROXY IP, not the display host, so the successor can restore the exact
+    // clone-limiter registration and release it once on disconnect.
+    if (snap.peer_addr) |address| {
+        switch (address) {
+            .ipv4 => |bytes| {
+                try out.append(allocator, 4);
+                try out.appendSlice(allocator, &bytes);
+            },
+            .ipv6 => |bytes| {
+                try out.append(allocator, 6);
+                try out.appendSlice(allocator, &bytes);
+            },
+        }
+    } else try out.append(allocator, 0);
+    try out.append(allocator, @intFromBool(snap.clone_counted));
+    try out.append(allocator, @intFromBool(snap.gagged));
+    try out.append(allocator, @intFromBool(snap.ircx));
+    try out.append(allocator, @intFromBool(snap.unfurl_opt_in));
+    var last_search_le: [8]u8 = undefined;
+    std.mem.writeInt(i64, &last_search_le, snap.last_search_ms, .little);
+    try out.appendSlice(allocator, &last_search_le);
+    try out.append(allocator, @intFromBool(snap.keytrans_require));
+    var nick_claim_le: [8]u8 = undefined;
+    std.mem.writeInt(i64, &nick_claim_le, snap.nick_claimed_at_ms, .little);
+    try out.appendSlice(allocator, &nick_claim_le);
+    try out.append(allocator, @intFromBool(snap.flood_guard != null));
+    if (snap.flood_guard) |state| try appendFloodCarry(&out, allocator, state);
+    try out.append(allocator, @intFromBool(snap.mesh_clone_counted));
+    try appendFloodU64(&out, allocator, snap.mesh_clone_hash);
+    try out.append(allocator, @intFromBool(snap.throttle_counted));
     return out.toOwnedSlice(allocator);
 }
 
@@ -325,6 +596,18 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
     var username: []const u8 = "";
     var was_secured: bool = false;
     var was_websocket: bool = false;
+    var peer_addr: ?dns.Address = null;
+    var clone_counted: bool = false;
+    var mesh_clone_counted: bool = false;
+    var mesh_clone_hash: u64 = 0;
+    var throttle_counted: bool = false;
+    var gagged: bool = false;
+    var ircx: bool = false;
+    var unfurl_opt_in: bool = false;
+    var last_search_ms: i64 = 0;
+    var keytrans_require: bool = false;
+    var nick_claimed_at_ms: i64 = 0;
+    var flood_carry: ?flood_guard.CarryState = null;
     var session_token: []const u8 = &.{};
     var umode_bits: u64 = 0;
     var pending_in: []const u8 = &.{};
@@ -409,6 +692,48 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
                                                 // therefore defaults to false.
                                                 if (r.buf.len - p >= 1) {
                                                     was_websocket = r.buf[p] != 0;
+                                                    p += 1;
+                                                    // Explicit legacy decode may
+                                                    // end at the v5 byte. A valid
+                                                    // v6 tail is observed when
+                                                    // present; a malformed tail
+                                                    // defaults without shifting
+                                                    // earlier borrowed fields.
+                                                    if (r.buf.len - p >= current_peer_tail_min_len) {
+                                                        var tail = Reader{ .buf = r.buf[p..] };
+                                                        if (readPeerTail(&tail)) |decoded| {
+                                                            peer_addr = decoded.address;
+                                                            clone_counted = decoded.clone_counted;
+                                                            if (tail.buf.len - tail.pos >= current_mode_tail_len) {
+                                                                if (readModeTail(&tail)) |mode| {
+                                                                    gagged = mode.gagged;
+                                                                    ircx = mode.ircx;
+                                                                    unfurl_opt_in = mode.unfurl_opt_in;
+                                                                    last_search_ms = mode.last_search_ms;
+                                                                    keytrans_require = mode.keytrans_require;
+                                                                    nick_claimed_at_ms = mode.nick_claimed_at_ms;
+                                                                    if (tail.buf.len - tail.pos >= current_flood_presence_len) {
+                                                                        if (tail.boolean()) |present| {
+                                                                            var flood_valid = !present;
+                                                                            if (present) {
+                                                                                if (readFloodCarry(&tail)) |state| {
+                                                                                    flood_carry = state;
+                                                                                    flood_valid = true;
+                                                                                } else |_| {}
+                                                                            }
+                                                                            if (flood_valid and tail.buf.len - tail.pos >= current_clone_tail_len) {
+                                                                                if (readCloneTail(&tail)) |clone| {
+                                                                                    mesh_clone_counted = clone.mesh_clone_counted;
+                                                                                    mesh_clone_hash = clone.mesh_clone_hash;
+                                                                                    throttle_counted = clone.throttle_counted;
+                                                                                } else |_| {}
+                                                                            }
+                                                                        } else |_| {}
+                                                                    }
+                                                                } else |_| {}
+                                                            }
+                                                        } else |_| {}
+                                                    }
                                                 }
                                             }
                                         }
@@ -442,6 +767,18 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
         .username = username,
         .was_secured = was_secured,
         .was_websocket = was_websocket,
+        .peer_addr = peer_addr,
+        .clone_counted = clone_counted,
+        .mesh_clone_counted = mesh_clone_counted,
+        .mesh_clone_hash = mesh_clone_hash,
+        .throttle_counted = throttle_counted,
+        .gagged = gagged,
+        .ircx = ircx,
+        .unfurl_opt_in = unfurl_opt_in,
+        .last_search_ms = last_search_ms,
+        .keytrans_require = keytrans_require,
+        .nick_claimed_at_ms = nick_claimed_at_ms,
+        .flood_guard = flood_carry,
         .session_token = session_token,
         .umode_bits = umode_bits,
         .pending_in = pending_in,
@@ -452,9 +789,9 @@ pub fn decode(bytes: []const u8) Error!Snapshot {
 /// Decode exactly the schema emitted by this binary.
 ///
 /// Unlike `decode`, this entry point is intentionally not cross-version
-/// tolerant: every block through `was_websocket` must be present, every bounded
+/// tolerant: every block through the v7 clone-accounting tail must be present, every bounded
 /// region must end where its declared length says it ends, flag values must be
-/// canonical, and no byte may follow the final transport discriminator. It is
+/// canonical, and no byte may follow the v7 clone-accounting tail. It is
 /// allocation-free and returns views borrowing `bytes`.
 pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
     var r = Reader{ .buf = bytes };
@@ -500,6 +837,11 @@ pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
     const pending_in = try r.lenPrefixed32();
     const pending_out = try r.lenPrefixed32();
     const was_websocket = try r.boolean();
+    const peer = try readPeerTail(&r);
+    const mode = try readModeTail(&r);
+    const flood_present = try r.boolean();
+    const flood_carry = if (flood_present) try readFloodCarry(&r) else null;
+    const clone = try readCloneTail(&r);
     if (r.pos != bytes.len) return error.TrailingData;
 
     return .{
@@ -515,6 +857,18 @@ pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
         .is_oper = flags & flag_is_oper != 0,
         .was_secured = was_secured,
         .was_websocket = was_websocket,
+        .peer_addr = peer.address,
+        .clone_counted = peer.clone_counted,
+        .mesh_clone_counted = clone.mesh_clone_counted,
+        .mesh_clone_hash = clone.mesh_clone_hash,
+        .throttle_counted = clone.throttle_counted,
+        .gagged = mode.gagged,
+        .ircx = mode.ircx,
+        .unfurl_opt_in = mode.unfurl_opt_in,
+        .last_search_ms = mode.last_search_ms,
+        .keytrans_require = mode.keytrans_require,
+        .nick_claimed_at_ms = mode.nick_claimed_at_ms,
+        .flood_guard = flood_carry,
         .session_token = session_token,
         .fd = fd,
         .channels_blob = channels_blob,
@@ -748,8 +1102,8 @@ test "decode tolerates a pre-signon snapshot (no trailing blocks)" {
     defer allocator.free(bytes);
     // Strip every trailing block: signon(16) + empty caps(2) + oper(12) +
     // empty username(2) + secured(1) + empty token(1) + v4 tail(16) + current
-    // WebSocket flag(1) = 51 bytes.
-    const old = bytes[0 .. bytes.len - 51];
+    // WebSocket flag(1) + v6 absent-peer/count tail(2) + mode tail(20).
+    const old = bytes[0 .. bytes.len - 51 - current_peer_tail_min_len - current_mode_tail_len - current_flood_presence_len - current_clone_tail_len];
 
     const got = try decode(old);
     try testing.expectEqualStrings("bob", got.nick);
@@ -785,7 +1139,7 @@ test "decode tolerates a pre-caps snapshot (signon present, caps absent)" {
     const token_block = 1; // empty session-token len prefix
     const v4_tail = 8 + 4 + 4; // umode bits + two empty pending len prefixes
     const websocket_block = 1; // current transport discriminator
-    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block - token_block - v4_tail - websocket_block];
+    const old = bytes[0 .. bytes.len - caps_block - oper_block - username_block - secured_block - token_block - v4_tail - websocket_block - current_peer_tail_min_len - current_mode_tail_len - current_flood_presence_len - current_clone_tail_len];
 
     const got = try decode(old);
     try testing.expectEqualStrings("carol", got.nick);
@@ -819,11 +1173,11 @@ test "decode tolerates a pre-oper-grant snapshot (caps present, oper block absen
     const allocator = testing.allocator;
     // A capsule from the caps-carry build: signon + caps blocks, but no oper block.
     // Strip the oper block onward: 8+2+2 oper + 2 username + 1 secured + 1 token
-    // + 16 v4 tail + 1 current WebSocket flag (the decoder needs < 8 bytes
+    // + 16 v4 tail + 1 current WebSocket flag + 2 peer/count + 20 mode bytes (the decoder needs < 8 bytes
     // after caps to default the rest).
     const bytes = try encode(allocator, .{ .nick = "dan", .caps = "echo-message", .is_oper = true });
     defer allocator.free(bytes);
-    const old = bytes[0 .. bytes.len - 33];
+    const old = bytes[0 .. bytes.len - 33 - current_peer_tail_min_len - current_mode_tail_len - current_flood_presence_len - current_clone_tail_len];
     const got = try decode(old);
     try testing.expectEqualStrings("dan", got.nick);
     try testing.expectEqualStrings("echo-message", got.caps);
@@ -910,7 +1264,7 @@ test "session_snapshot decode tolerates a pre-was_secured capsule (legacy upgrad
     defer allocator.free(bytes);
     // Strip the current WebSocket byte (1), v4 tail (16), trailing session-token
     // block (1 empty len byte), and was_secured byte to emulate pre-flag v1.
-    const old = bytes[0 .. bytes.len - 19];
+    const old = bytes[0 .. bytes.len - 19 - current_peer_tail_min_len - current_mode_tail_len - current_flood_presence_len - current_clone_tail_len];
 
     const got = try decode(old);
     try testing.expect(!got.was_secured); // legacy blob → defaults false
@@ -962,7 +1316,7 @@ test "cross-version: a v2 (pre-token) capsule decodes with an empty token (v2→
     defer allocator.free(bytes);
     // A v2 build's blob is exactly this one minus the current WebSocket byte,
     // v4 tail (16), and trailing token block ([u8 tlen=16][16 bytes]).
-    const v2 = bytes[0 .. bytes.len - 34];
+    const v2 = bytes[0 .. bytes.len - 34 - current_peer_tail_min_len - current_mode_tail_len - current_flood_presence_len - current_clone_tail_len];
 
     const got = try decode(v2);
     try testing.expectEqual(@as(usize, 0), got.session_token.len); // defaults empty
@@ -1042,7 +1396,7 @@ test "cross-version: a v3 (pre-v4-tail) capsule decodes with defaults (v3->v4)" 
     defer allocator.free(bytes);
     // A v3 build's blob is this one minus the v4 tail and current WebSocket byte:
     // [u64 umode][u32 ilen=4]["torn"][u32 olen=4]["tear"] + bool = 24+1.
-    const v3 = bytes[0 .. bytes.len - 25];
+    const v3 = bytes[0 .. bytes.len - 25 - current_peer_tail_min_len - current_mode_tail_len - current_flood_presence_len - current_clone_tail_len];
 
     const got = try decode(v3);
     try testing.expectEqual(@as(u64, 0), got.umode_bits); // defaults
@@ -1072,6 +1426,17 @@ test "decodeCurrent round-trips every current block including WebSocket transpor
         .is_oper = true,
         .was_secured = true,
         .was_websocket = true,
+        .peer_addr = .{ .ipv4 = .{ 192, 0, 2, 4 } },
+        .clone_counted = true,
+        .mesh_clone_counted = true,
+        .mesh_clone_hash = 0xA5A6_A7A8_A9AA_ABAC,
+        .throttle_counted = true,
+        .gagged = true,
+        .ircx = true,
+        .unfurl_opt_in = true,
+        .last_search_ms = 123_321,
+        .keytrans_require = true,
+        .nick_claimed_at_ms = 1_700_000_123_456,
         .session_token = &token,
         .fd = 91,
         .channels = &.{
@@ -1100,6 +1465,14 @@ test "decodeCurrent round-trips every current block including WebSocket transpor
     try testing.expectEqualStrings("ocean", got.username);
     try testing.expect(got.logged_in and got.away_active and got.is_oper);
     try testing.expect(got.was_secured and got.was_websocket);
+    try testing.expectEqualDeep(@as(?dns.Address, .{ .ipv4 = .{ 192, 0, 2, 4 } }), got.peer_addr);
+    try testing.expect(got.clone_counted);
+    try testing.expect(got.mesh_clone_counted and got.throttle_counted);
+    try testing.expectEqual(@as(u64, 0xA5A6_A7A8_A9AA_ABAC), got.mesh_clone_hash);
+    try testing.expect(got.gagged and got.ircx and got.unfurl_opt_in);
+    try testing.expectEqual(@as(i64, 123_321), got.last_search_ms);
+    try testing.expect(got.keytrans_require);
+    try testing.expectEqual(@as(i64, 1_700_000_123_456), got.nick_claimed_at_ms);
     try testing.expectEqualSlices(u8, &token, got.session_token);
     try testing.expectEqual(@as(i32, 91), got.fd);
     try testing.expectEqual(@as(i64, 123_456), got.connected_at_ms);
@@ -1120,6 +1493,217 @@ test "decodeCurrent round-trips every current block including WebSocket transpor
     try testing.expect(channels.next() == null);
     // The tolerant legacy decoder also observes the append-only current byte.
     try testing.expect((try decode(bytes)).was_websocket);
+    try testing.expectEqualDeep(got.peer_addr, (try decode(bytes)).peer_addr);
+    try testing.expect((try decode(bytes)).gagged);
+}
+
+test "current peer tail round-trips IPv6 and legacy v5 defaults" {
+    const allocator = testing.allocator;
+    const ipv6: dns.Address = .{ .ipv6 = .{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 } };
+    const bytes = try encode(allocator, .{ .fd = 54, .peer_addr = ipv6, .clone_counted = true });
+    defer allocator.free(bytes);
+    const current = try decodeCurrent(bytes);
+    try testing.expectEqualDeep(@as(?dns.Address, ipv6), current.peer_addr);
+    try testing.expect(current.clone_counted);
+    const tolerant = try decode(bytes);
+    try testing.expectEqualDeep(@as(?dns.Address, ipv6), tolerant.peer_addr);
+    try testing.expect(tolerant.clone_counted);
+
+    // The explicit legacy decoder recognizes an exact v5 body without the
+    // peer/count tail, but the current decoder refuses the incomplete layout.
+    const v5 = bytes[0 .. bytes.len - (1 + 16 + 1) - current_mode_tail_len - current_flood_presence_len - current_clone_tail_len];
+    const old = try decode(v5);
+    try testing.expect(old.peer_addr == null);
+    try testing.expect(!old.clone_counted);
+    try testing.expect(!old.gagged and !old.ircx and !old.unfurl_opt_in);
+    try testing.expectEqual(@as(i64, 0), old.last_search_ms);
+    try testing.expect(!old.keytrans_require);
+    try testing.expectEqual(@as(i64, 0), old.nick_claimed_at_ms);
+    try testing.expectError(error.Truncated, decodeCurrent(v5));
+}
+
+test "current peer tail rejects invalid address and clone accounting" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.InvalidCountedState, encode(allocator, .{ .clone_counted = true }));
+    const empty = try encode(allocator, .{});
+    defer allocator.free(empty);
+    try testing.expectEqual(@as(usize, 103), empty.len);
+    // The exact empty layout ends with [websocket=0][family=0][counted=0].
+    empty[70] = 5;
+    try testing.expectError(error.InvalidPeerAddress, decodeCurrent(empty));
+    empty[70] = 0;
+    empty[71] = 1;
+    try testing.expectError(error.InvalidCountedState, decodeCurrent(empty));
+    empty[71] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(empty));
+    empty[71] = 0;
+    empty[70] = 4;
+    try testing.expectError(error.Truncated, decodeCurrent(empty));
+    empty[70] = 6;
+    try testing.expectError(error.Truncated, decodeCurrent(empty));
+
+    const ipv4 = try encode(allocator, .{ .peer_addr = .{ .ipv4 = .{ 203, 0, 113, 9 } } });
+    defer allocator.free(ipv4);
+    try testing.expectError(error.Truncated, decodeCurrent(ipv4[0 .. ipv4.len - 1]));
+    const extra = try allocator.alloc(u8, ipv4.len + 1);
+    defer allocator.free(extra);
+    @memcpy(extra[0..ipv4.len], ipv4);
+    extra[ipv4.len] = 0;
+    try testing.expectError(error.TrailingData, decodeCurrent(extra));
+}
+
+test "current client mode tail is exact and uses canonical booleans" {
+    const allocator = testing.allocator;
+    const wire = try encode(allocator, .{
+        .gagged = true,
+        .ircx = true,
+        .unfurl_opt_in = true,
+        .last_search_ms = 0x0102_0304_0506_0708,
+        .keytrans_require = true,
+        .nick_claimed_at_ms = 0x1112_1314_1516_1718,
+    });
+    defer allocator.free(wire);
+    try testing.expectEqual(@as(usize, 103), wire.len);
+    try testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1 }, wire[75..83]);
+    try testing.expectEqual(@as(u8, 1), wire[83]);
+    try testing.expectEqualSlices(u8, &.{ 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11 }, wire[84..92]);
+    const got = try decodeCurrent(wire);
+    try testing.expect(got.gagged and got.ircx and got.unfurl_opt_in);
+    try testing.expectEqual(@as(i64, 0x0102_0304_0506_0708), got.last_search_ms);
+    try testing.expect(got.keytrans_require);
+    try testing.expectEqual(@as(i64, 0x1112_1314_1516_1718), got.nick_claimed_at_ms);
+    try testing.expectEqual(@as(u8, 0), wire[92]);
+
+    const altered = try allocator.dupe(u8, wire);
+    defer allocator.free(altered);
+    inline for (.{ 72, 73, 74 }) |offset| {
+        altered[offset] = 2;
+        try testing.expectError(error.InvalidBoolean, decodeCurrent(altered));
+        altered[offset] = 1;
+    }
+    altered[83] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(altered));
+    altered[83] = 1;
+    altered[92] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(altered));
+    try testing.expectError(error.Truncated, decodeCurrent(wire[0 .. wire.len - 1]));
+}
+
+fn testFloodCarry() !flood_guard.CarryState {
+    const cfg: flood_guard.GuardConfig = .{
+        .enabled = true,
+        .messages = .{ .capacity = 4, .refill_tokens = 1, .refill_period_ms = 1000 },
+        .bytes = .{ .capacity = 256, .refill_tokens = 5, .refill_period_ms = 1000 },
+        .commands = .{ .capacity = 1, .refill_tokens = 1, .refill_period_ms = 1000 },
+        .target_changes = .{ .capacity = 4, .refill_tokens = 1, .refill_period_ms = 1000 },
+        .excess = .{ .threshold = 10, .decay_points = 1, .decay_period_ms = 1000 },
+        .throttle_penalty = 2,
+        .target_change_penalty = 3,
+        .privmsg_weight = 1,
+        .join_weight = 2,
+        .default_weight = 1,
+    };
+    var guard = flood_guard.FloodGuard.init(cfg, 100);
+    try testing.expectEqual(flood_guard.Decision.allow, guard.classifyRaw(100, "PRIVMSG #alpha :hi\r\n"));
+    try testing.expectEqual(flood_guard.Decision.throttle, guard.classifyRaw(100, "WHOIS a\r\n"));
+    guard.decay(175);
+    return guard.exportCarry();
+}
+
+test "current FloodGuard carry has exact fixed-size typed round-trip" {
+    const allocator = testing.allocator;
+    const state = try testFloodCarry();
+    const wire = try encode(allocator, .{ .flood_guard = state });
+    defer allocator.free(wire);
+    try testing.expectEqual(@as(usize, 103 + flood_carry_body_len), wire.len);
+    try testing.expectEqual(@as(u8, 1), wire[92]);
+    try testing.expectEqual(@as(u8, 1), wire[93]); // policy.enabled
+    const current = try decodeCurrent(wire);
+    try testing.expectEqualDeep(state, current.flood_guard.?);
+    try testing.expectEqualDeep(state, (try decode(wire)).flood_guard.?);
+    // The typed image remains directly importable at its original policy.
+    _ = try flood_guard.FloodGuard.importCarry(state.policy, 175, current.flood_guard.?);
+}
+
+test "current FloodGuard carry rejects truncated, noncanonical, and invalid state" {
+    const allocator = testing.allocator;
+    const state = try testFloodCarry();
+    const wire = try encode(allocator, .{ .flood_guard = state });
+    defer allocator.free(wire);
+    const altered = try allocator.dupe(u8, wire);
+    defer allocator.free(altered);
+
+    // The marker alone never means a valid present image.
+    try testing.expectError(error.Truncated, decodeCurrent(wire[0..93]));
+    try testing.expectError(error.Truncated, decodeCurrent(wire[0 .. wire.len - 1]));
+    altered[93] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(altered));
+    altered[93] = 1;
+
+    // Four bucket images start after the 161-byte policy. A balance above its
+    // configured capacity cannot be accepted as freshly minted credit.
+    std.mem.writeInt(u64, altered[254..262], std.math.maxInt(u64), .little);
+    try testing.expectError(error.InvalidFloodState, decodeCurrent(altered));
+    @memcpy(altered, wire);
+    // The first target's length must be nonzero, and ring counts are bounded.
+    std.mem.writeInt(u64, altered[382..390], 0, .little);
+    try testing.expectError(error.InvalidFloodState, decodeCurrent(altered));
+    @memcpy(altered, wire);
+    altered[wire.len - current_clone_tail_len - 2] = flood_guard.target_slots + 1;
+    try testing.expectError(error.InvalidFloodState, decodeCurrent(altered));
+    @memcpy(altered, wire);
+    // A malformed source image must fail before the encoder allocates a blob.
+    var malformed = state;
+    malformed.command_rate.carry = state.policy.commands.refill_period_ms;
+    try testing.expectError(error.InvalidFloodState, encode(allocator, .{ .flood_guard = malformed }));
+}
+
+test "v7 clone accounting tail round-trips and older bodies default uncounted" {
+    const allocator = testing.allocator;
+    const hash: u64 = 0x0102_0304_0506_0708;
+    const wire = try encode(allocator, .{
+        .peer_addr = .{ .ipv4 = .{ 192, 0, 2, 17 } },
+        .mesh_clone_counted = true,
+        .mesh_clone_hash = hash,
+        .throttle_counted = true,
+    });
+    defer allocator.free(wire);
+    const tail = wire.len - current_clone_tail_len;
+    try testing.expectEqual(@as(u8, 1), wire[tail]);
+    try testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1 }, wire[tail + 1 .. tail + 9]);
+    try testing.expectEqual(@as(u8, 1), wire[tail + 9]);
+    const current = try decodeCurrent(wire);
+    try testing.expect(current.mesh_clone_counted and current.throttle_counted);
+    try testing.expectEqual(hash, current.mesh_clone_hash);
+    const tolerant = try decode(wire);
+    try testing.expect(tolerant.mesh_clone_counted and tolerant.throttle_counted);
+    try testing.expectEqual(hash, tolerant.mesh_clone_hash);
+
+    const old_v6 = wire[0..tail];
+    const legacy = try decode(old_v6);
+    try testing.expect(!legacy.mesh_clone_counted and !legacy.throttle_counted);
+    try testing.expectEqual(@as(u64, 0), legacy.mesh_clone_hash);
+    try testing.expectError(error.Truncated, decodeCurrent(old_v6));
+}
+
+test "v7 clone accounting tail rejects malformed booleans and uncounted hash" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.InvalidMeshCloneState, encode(allocator, .{ .mesh_clone_hash = 1 }));
+    const wire = try encode(allocator, .{});
+    defer allocator.free(wire);
+    const tail = wire.len - current_clone_tail_len;
+    const altered = try allocator.dupe(u8, wire);
+    defer allocator.free(altered);
+
+    altered[tail] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(altered));
+    altered[tail] = 0;
+    altered[tail + 1] = 1;
+    try testing.expectError(error.InvalidMeshCloneState, decodeCurrent(altered));
+    altered[tail + 1] = 0;
+    altered[tail + 9] = 2;
+    try testing.expectError(error.InvalidBoolean, decodeCurrent(altered));
+    try testing.expectError(error.Truncated, decodeCurrent(wire[0 .. wire.len - 1]));
 }
 
 test "current snapshot encoding is leak-free across every allocation failure" {
@@ -1141,6 +1725,17 @@ test "current snapshot encoding is leak-free across every allocation failure" {
         .is_oper = true,
         .was_secured = true,
         .was_websocket = true,
+        .peer_addr = .{ .ipv6 = .{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10 } },
+        .clone_counted = true,
+        .mesh_clone_counted = true,
+        .mesh_clone_hash = 0x0102_0304_0506_0708,
+        .throttle_counted = true,
+        .gagged = true,
+        .ircx = true,
+        .unfurl_opt_in = true,
+        .last_search_ms = 321_555,
+        .keytrans_require = true,
+        .nick_claimed_at_ms = 1_700_001_234_567,
         .session_token = &token,
         .fd = 92,
         .channels = &channels,
@@ -1164,6 +1759,14 @@ test "current snapshot encoding is leak-free across every allocation failure" {
             try testing.expectEqualSlices(u8, snapshot.session_token, restored.session_token);
             try testing.expectEqualStrings(snapshot.pending_out, restored.pending_out);
             try testing.expect(restored.was_websocket);
+            try testing.expectEqualDeep(snapshot.peer_addr, restored.peer_addr);
+            try testing.expect(restored.clone_counted);
+            try testing.expect(restored.mesh_clone_counted and restored.throttle_counted);
+            try testing.expectEqual(snapshot.mesh_clone_hash, restored.mesh_clone_hash);
+            try testing.expect(restored.gagged and restored.ircx and restored.unfurl_opt_in);
+            try testing.expectEqual(snapshot.last_search_ms, restored.last_search_ms);
+            try testing.expect(restored.keytrans_require);
+            try testing.expectEqual(snapshot.nick_claimed_at_ms, restored.nick_claimed_at_ms);
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{snap});
@@ -1177,13 +1780,13 @@ test "decodeCurrent rejects every proper prefix and every trailing byte" {
     // Empty current snapshot has a deliberately stable structural minimum:
     // every proper prefix, including a complete v4 blob without was_websocket,
     // is incomplete for the current decoder.
-    try testing.expectEqual(@as(usize, 70), bytes.len);
+    try testing.expectEqual(@as(usize, 103), bytes.len);
     for (0..bytes.len) |end| {
         try testing.expectError(error.Truncated, decodeCurrent(bytes[0..end]));
     }
     _ = try decodeCurrent(bytes);
 
-    var with_trailing: [71]u8 = undefined;
+    var with_trailing: [104]u8 = undefined;
     @memcpy(with_trailing[0..bytes.len], bytes);
     with_trailing[bytes.len] = 0;
     try testing.expectError(error.TrailingData, decodeCurrent(&with_trailing));
@@ -1193,7 +1796,7 @@ test "decodeCurrent rejects noncanonical booleans and unknown flag bits" {
     const allocator = testing.allocator;
     const empty = try encode(allocator, .{});
     defer allocator.free(empty);
-    try testing.expectEqual(@as(usize, 70), empty.len);
+    try testing.expectEqual(@as(usize, 103), empty.len);
 
     // Six empty u16 strings precede the primary flag byte.
     empty[12] = 0x08;

@@ -202,9 +202,12 @@ pub const JupeStore = struct {
         reason: []const u8,
         setter: []const u8,
     ) JupeError!void {
-        try validatePatternWithLimit(pattern, self.params.max_pattern);
-        if (reason.len > self.params.max_reason) return error.ReasonTooLong;
-        if (setter.len > self.params.max_setter) return error.SetterTooLong;
+        try validateStoredEntry(self.params, .{
+            .pattern = pattern,
+            .reason = reason,
+            .setter = setter,
+            .created_ms = 0,
+        });
     }
 
     fn clone(
@@ -236,6 +239,14 @@ pub const JupeStore = struct {
         return null;
     }
 };
+
+/// Validate a stored row against the exact limits of its owning registry.
+/// Helix calls this without allocation while checking a custody image.
+pub fn validateStoredEntry(params: Params, entry: Entry) JupeError!void {
+    try validatePatternWithLimit(entry.pattern, params.max_pattern);
+    if (entry.reason.len > params.max_reason) return error.ReasonTooLong;
+    if (entry.setter.len > params.max_setter) return error.SetterTooLong;
+}
 
 fn freeEntry(allocator: std.mem.Allocator, entry: *Entry) void {
     allocator.free(entry.pattern);

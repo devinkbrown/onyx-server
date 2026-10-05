@@ -11,6 +11,7 @@ const client = @import("../daemon/client.zig");
 const media_rooms = @import("../daemon/media_room.zig");
 const native_owner = @import("../daemon/native_media_transport.zig");
 const webrtc_owner = @import("../daemon/media_plane.zig");
+const runtime_pause = @import("../daemon/runtime_pause.zig");
 
 pub const ClientId = client.ClientId;
 pub const Leg = enum { native, webrtc };
@@ -133,6 +134,15 @@ fn checkedNext(comptime T: type, current: T, count: T) Error!T {
 }
 
 pub const Locked = opaque {};
+pub const PristineMediaSnapshots = struct {
+    native: native_owner.Snapshot,
+    webrtc: webrtc_owner.Snapshot,
+
+    pub fn deinit(self: *PristineMediaSnapshots) void {
+        self.webrtc.deinit();
+        self.native.deinit();
+    }
+};
 pub const Domain = opaque {
     pub fn create(allocator: std.mem.Allocator) Error!*Domain {
         // Exhaustion refuses before the constructor touches the backend.
@@ -281,6 +291,46 @@ pub const Domain = opaque {
         if (source.webrtc_binding != binding) return error.InvalidIdentity;
         const record: *WebrtcBindingBacking = @ptrCast(@alignCast(binding));
         if (record.source != source or record.owner != owner or record.serial == 0) return error.InvalidIdentity;
+    }
+
+    /// The initial graph issuers prove that an empty graph was never a live
+    /// graph later retired. Binding issuers may advance only for the original
+    /// native and WebRTC registrations. The lexical Domain lock excludes a
+    /// concurrent graph publication throughout both owner snapshots.
+    pub fn requirePristineConfiguredMediaLocked(self: *Domain, token: *const Locked, native: *native_owner.NativeMediaTransport, webrtc: *webrtc_owner.MediaPlane) Error!void {
+        _ = try self.requireScope(token);
+        const source = backing(self);
+        const native_binding = source.native_binding orelse return error.InvalidIdentity;
+        const webrtc_binding = source.webrtc_binding orelse return error.InvalidIdentity;
+        try self.requireNativeBindingLocked(token, native_binding, native);
+        try self.requireWebrtcBindingLocked(token, webrtc_binding, webrtc);
+        if (source.closing or source.next_binding != 3 or source.revision != 1 or
+            source.next_call != 1 or source.next_endpoint != 1 or source.next_stream != 1 or
+            source.pending_candidates != 0 or source.active_inbound != null or source.active_egress != null or
+            source.calls.count() != 0 or source.endpoints.count() != 0 or
+            source.memberships.count() != 0 or source.bridge_policy.count() != 0)
+            return error.Busy;
+    }
+
+    /// Capture the exact original owners while both workers are paused. This
+    /// dedicated cut permits only read-only local socket identity observation
+    /// under the Domain lock; no networking, allocation, or external callback.
+    pub fn capturePausedPristineMedia(self: *Domain, native: *native_owner.NativeMediaTransport, native_token: runtime_pause.Token, webrtc: *webrtc_owner.MediaPlane, webrtc_token: runtime_pause.Token) !PristineMediaSnapshots {
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (source.closing) return error.Closing;
+        if (source.next_scope == std.math.maxInt(u64)) return error.SequenceExhausted;
+        var scope = Scope{ .source = source, .serial = source.next_scope };
+        source.next_scope += 1;
+        const token: *Locked = @ptrCast(&scope);
+        source.active_scope = token;
+        defer source.active_scope = null;
+        try self.requirePristineConfiguredMediaLocked(token, native, webrtc);
+        var native_snapshot = try native.capturePausedPristineRoutingLocked(self, token, webrtc, native_token);
+        errdefer native_snapshot.deinit();
+        const webrtc_snapshot = try webrtc.capturePausedPristineRoutingLocked(self, token, native, webrtc_token);
+        return .{ .native = native_snapshot, .webrtc = webrtc_snapshot };
     }
     pub fn releaseNative(self: *Domain, binding: *NativeBinding) Error!void {
         const source = backing(self);
@@ -1735,6 +1785,91 @@ fn cleanupBoundNativeRoutingTest(domain: *Domain, binding: *NativeBinding) void 
         domain.withTerminalLocked(DepartureTestCut{ .domain = domain, .plan = departure }, DepartureTestCut.run) catch @panic("routing fixture failed exact terminal retirement");
     }
     domain.releaseNative(binding) catch @panic("routing fixture retained native binding");
+}
+test "Windows Helix configured pristine media captures exact paused owners and rejects retired graph" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const domain = try Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("pristine media test retained Domain");
+    var native = native_owner.NativeMediaTransport.init(testing.allocator);
+    defer native.deinit();
+    var webrtc = try webrtc_owner.MediaPlane.initFallible(testing.allocator);
+    defer webrtc.deinit();
+    webrtc.dtls_enabled = true;
+    webrtc.dtls13_enabled = true;
+    const Sink = struct {
+        fn nativeFrame(_: *anyopaque, _: []const u8, _: []const u8) void {}
+        fn rtpFrame(_: *anyopaque, _: []const u8, _: []const u8, _: bool) void {}
+    };
+    var sink_ctx: u8 = 0;
+    native.setCrossLegSink(.{ .ctx = &sink_ctx, .on_native_frame = Sink.nativeFrame });
+    webrtc.setCrossLegSink(.{ .ctx = &sink_ctx, .on_rtp_frame = Sink.rtpFrame });
+    try native.prepareColdResources(testing.io, native_owner.loopback_be, 0);
+    try webrtc.prepareColdResources(testing.io, webrtc_owner.loopback_be, 0);
+    const native_binding = try domain.bindNative(&native);
+    defer domain.releaseNative(native_binding) catch @panic("pristine media test retained native binding");
+    const webrtc_binding = try domain.bindWebrtc(&webrtc);
+    defer domain.releaseWebrtc(webrtc_binding) catch @panic("pristine media test retained WebRTC binding");
+    try webrtc.prepareRoutingEgress(domain, 4, 256);
+    defer webrtc.disposeRoutingEgress(domain) catch @panic("pristine media test retained FIFO");
+    try native.startPreparedLegacyWorker();
+    defer {
+        native.requestStopAndWake();
+        native.joinLegacyAfterStop() catch @panic("pristine native worker did not join");
+    }
+    try webrtc.startPreparedLegacyWorker();
+    defer {
+        webrtc.requestStopAndWake();
+        webrtc.joinLegacyAfterStop() catch @panic("pristine WebRTC worker did not join");
+    }
+    const native_token = try native.requestPause(1);
+    const webrtc_token = try webrtc.requestPause(1);
+    const native_deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(3) });
+    const webrtc_deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(3) });
+    try native.awaitPaused(native_token, native_deadline);
+    try webrtc.awaitPaused(webrtc_token, webrtc_deadline);
+    try testing.expectError(error.RoutingContinuityUnsupported, native.capturePaused(native_token));
+    try testing.expectError(error.RoutingContinuityUnsupported, webrtc.capturePaused(webrtc_token));
+    var carry = try domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token);
+    defer carry.deinit();
+    try testing.expect(carry.native.cross_configured and carry.webrtc.cross_configured);
+    try testing.expect(carry.webrtc.dtls12 != null and carry.webrtc.dtls13 != null);
+    try testing.expect(carry.native.socket.port != 0 and carry.webrtc.socket.port != 0);
+    try testing.expectEqual(native.port, carry.native.socket.port);
+    try testing.expectEqual(webrtc.port, carry.webrtc.socket.port);
+
+    var foreign = native_owner.NativeMediaTransport.init(testing.allocator);
+    defer foreign.deinit();
+    try testing.expectError(error.InvalidIdentity, domain.capturePausedPristineMedia(&foreign, native_token, &webrtc, webrtc_token));
+    const queue = webrtc.routing_egress.?;
+    queue.next_ordinal = 2; // Settled, empty FIFO with prior accepted ordinal.
+    try testing.expectError(error.ActiveMediaContinuityUnsupported, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
+    queue.next_ordinal = 1;
+    native.next_ingress_serial = 2; // No current ingress, but one was issued.
+    try testing.expectError(error.ActiveMediaContinuityUnsupported, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
+    native.next_ingress_serial = 1;
+    webrtc.next_routing_inbound = 2;
+    try testing.expectError(error.ActiveMediaContinuityUnsupported, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
+    webrtc.next_routing_inbound = 1;
+
+    const id = ClientId{ .shard = 0, .slot = 0, .gen = 0 };
+    const membership = try domain.prepareMembership("#history", id, 1);
+    const call = membership.preview().call;
+    const CommitMembership = struct {
+        domain: *Domain,
+        plan: *PreparedMembership,
+        fn run(scope: *Locked, ctx: @This()) Error!void {
+            try ctx.plan.validateLocked(ctx.domain, scope);
+            ctx.plan.commitLocked(ctx.domain, scope);
+        }
+    };
+    try domain.withLocked(CommitMembership{ .domain = domain, .plan = membership }, CommitMembership.run);
+    membership.deinit();
+    try testing.expectError(error.Busy, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
+    const departure = try domain.prepareDeparture(call, id);
+    defer departure.deinit();
+    try domain.withLocked(DepartureTestCut{ .domain = domain, .plan = departure }, DepartureTestCut.run);
+    try testing.expectError(error.Busy, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
 }
 const DepartureTestCut = struct {
     domain: *Domain,

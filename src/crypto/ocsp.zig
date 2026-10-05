@@ -189,6 +189,48 @@ pub fn singleForSerial(parsed: anytype, serial: []const u8) ?SingleResponse {
     return null;
 }
 
+/// Find the unique SingleResponse for the complete RFC 6960 CertID. A serial
+/// alone is not an identity: different issuing CAs can assign the same serial.
+/// Unsupported hash OIDs and duplicate matching entries fail closed.
+pub fn singleForCertId(parsed: anytype, identity: CertIdInput) ?SingleResponse {
+    var found: ?SingleResponse = null;
+    for (parsed.responses[0..parsed.response_count]) |single| {
+        if (!certIdMatches(single, identity)) continue;
+        if (found != null) return null;
+        found = single;
+    }
+    return found;
+}
+
+fn certIdMatches(single: SingleResponse, identity: CertIdInput) bool {
+    if (identity.issuer_name_der.len == 0 or identity.issuer_key_bytes.len == 0 or
+        !serialsEqual(single.serial, identity.serial_der)) return false;
+    if (oidEq(single.hash_algorithm_oid, &oid_sha1)) {
+        return certIdHashesMatch(std.crypto.hash.Sha1, single, identity);
+    }
+    if (oidEq(single.hash_algorithm_oid, &oid_sha256)) {
+        return certIdHashesMatch(std.crypto.hash.sha2.Sha256, single, identity);
+    }
+    if (oidEq(single.hash_algorithm_oid, &oid_sha384)) {
+        return certIdHashesMatch(std.crypto.hash.sha2.Sha384, single, identity);
+    }
+    if (oidEq(single.hash_algorithm_oid, &oid_sha512)) {
+        return certIdHashesMatch(std.crypto.hash.sha2.Sha512, single, identity);
+    }
+    return false;
+}
+
+fn certIdHashesMatch(comptime Hash: type, single: SingleResponse, identity: CertIdInput) bool {
+    if (single.issuer_name_hash.len != Hash.digest_length or
+        single.issuer_key_hash.len != Hash.digest_length) return false;
+    var name_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(identity.issuer_name_der, &name_hash, .{});
+    var key_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(identity.issuer_key_bytes, &key_hash, .{});
+    return std.mem.eql(u8, single.issuer_name_hash, &name_hash) and
+        std.mem.eql(u8, single.issuer_key_hash, &key_hash);
+}
+
 /// OID 1.3.6.1.4.1.11129.2.4.5 — the OCSP-delivered `SignedCertificateTimestampList`
 /// extension (RFC 6962 §3.3), carried in a `SingleResponse`'s `singleExtensions`.
 /// One digit past the X.509 embedded-SCT extension (`...2.4.2`).
@@ -229,11 +271,10 @@ pub fn sctListFromSingleExtensions(single_extensions_der: []const u8) Error!?[]c
 /// revocation-freshness guarantee.
 pub const default_staple_skew_seconds: i64 = 300;
 
-/// Decide whether a raw DER OCSP response is safe to staple *right now* for the
-/// certificate with serial `leaf_serial`, given the daemon wall-clock `now_unix`
-/// (Unix seconds) and the issuer SubjectPublicKeyInfo used to authenticate the
-/// responder signature. This is the security gate the fetch service applies
-/// before caching/publishing a staple (OCSP-stapling design §5 step 4):
+/// Legacy serial-only OCSP freshness/signature check for callers that do not
+/// have the issuer Name and raw public-key bytes available. The daemon's
+/// publication gate uses `isStapleServableForCertId` to bind all CertID fields.
+/// Given the wall-clock `now_unix` (Unix seconds) and issuer SPKI, this checks:
 ///   - parse succeeds and `responseStatus == successful`;
 ///   - the BasicOCSPResponse signature verifies against `issuer_spki_der`,
 ///     accepting either direct-issuer signing OR an issuer-authorized delegated
@@ -255,14 +296,34 @@ pub fn isStapleServable(
     if (!verifyResponseSignatureWithChain(parsed, issuer_spki_der, now_unix)) return false;
 
     const single = singleForSerial(parsed, leaf_serial) orelse return false;
-    if (single.cert_status != .good) return false;
+    return singleServable(single, now_unix, skew_seconds);
+}
 
+/// Strict daemon publication gate: authenticate the response signer, then bind
+/// the status/freshness entry to the live leaf and *both* issuer hash fields.
+/// `identity` must come from the live leaf and its issuer certificate.
+pub fn isStapleServableForCertId(
+    response_der: []const u8,
+    issuer_spki_der: []const u8,
+    identity: CertIdInput,
+    now_unix: i64,
+    skew_seconds: i64,
+) bool {
+    const parsed = parse(response_der) catch return false;
+    if (parsed.response_status != .successful) return false;
+    if (!verifyResponseSignatureWithChain(parsed, issuer_spki_der, now_unix)) return false;
+    const single = singleForCertId(parsed, identity) orelse return false;
+    return singleServable(single, now_unix, skew_seconds);
+}
+
+fn singleServable(single: SingleResponse, now_unix: i64, skew_seconds: i64) bool {
+    if (single.cert_status != .good or skew_seconds < 0) return false;
     const next_bytes = single.next_update orelse return false;
     const this_epoch = x509.generalizedTimeToEpoch(single.this_update) catch return false;
     const next_epoch = x509.generalizedTimeToEpoch(next_bytes) catch return false;
     if (next_epoch <= this_epoch) return false;
-    if (now_unix + skew_seconds < this_epoch) return false; // not yet valid
-    if (now_unix >= next_epoch + skew_seconds) return false; // expired
+    if (now_unix +| skew_seconds < this_epoch) return false;
+    if (now_unix >= next_epoch +| skew_seconds) return false;
     return true;
 }
 
@@ -1128,6 +1189,35 @@ pub fn testSignedOcspResponse(
     status: CertStatus,
     next_update: ?[]const u8,
 ) ![]u8 {
+    return testSignedOcspResponseWithHashes(allocator, kp, serial, status, next_update, &oid_sha1, &(@as([20]u8, @splat(0x11))), &(@as([20]u8, @splat(0x22))));
+}
+
+/// Test-only response whose signed CertID hashes the issuer fields from a real
+/// certificate. The production request builder uses SHA-1 for this identifier.
+pub fn testSignedOcspResponseForCertId(
+    allocator: std.mem.Allocator,
+    kp: Ed25519.KeyPair,
+    identity: CertIdInput,
+    status: CertStatus,
+    next_update: ?[]const u8,
+) ![]u8 {
+    var name_hash: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(identity.issuer_name_der, &name_hash, .{});
+    var key_hash: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(identity.issuer_key_bytes, &key_hash, .{});
+    return testSignedOcspResponseWithHashes(allocator, kp, identity.serial_der, status, next_update, &oid_sha1, &name_hash, &key_hash);
+}
+
+fn testSignedOcspResponseWithHashes(
+    allocator: std.mem.Allocator,
+    kp: Ed25519.KeyPair,
+    serial: []const u8,
+    status: CertStatus,
+    next_update: ?[]const u8,
+    hash_oid: []const u8,
+    name_hash: []const u8,
+    key_hash: []const u8,
+) ![]u8 {
     var tbs_body: std.ArrayList(u8) = .empty;
     defer tbs_body.deinit(allocator);
     try appendDerTlv(allocator, &tbs_body, Asn1Tag.context_2_primitive, &(@as([20]u8, @splat(0xA5))));
@@ -1139,9 +1229,9 @@ pub fn testSignedOcspResponse(
     defer single_body.deinit(allocator);
     var cert_id_body: std.ArrayList(u8) = .empty;
     defer cert_id_body.deinit(allocator);
-    try appendAlgId(allocator, &cert_id_body, &oid_sha1, true);
-    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &(@as([20]u8, @splat(0x11))));
-    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, &(@as([20]u8, @splat(0x22))));
+    try appendAlgId(allocator, &cert_id_body, hash_oid, true);
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, name_hash);
+    try appendDerTlv(allocator, &cert_id_body, x509.Tag.octet_string, key_hash);
     try appendDerTlv(allocator, &cert_id_body, x509.Tag.integer, serial);
     try appendDerSeq(allocator, &single_body, cert_id_body.items);
     switch (status) {
@@ -1196,6 +1286,60 @@ pub fn testSignedOcspResponse(
     errdefer outer.deinit(allocator);
     try appendDerSeq(allocator, &outer, outer_body.items);
     return outer.toOwnedSlice(allocator);
+}
+
+fn testSignedOcspResponseWithCertIdHash(
+    comptime Hash: type,
+    allocator: std.mem.Allocator,
+    kp: Ed25519.KeyPair,
+    identity: CertIdInput,
+    hash_oid: []const u8,
+) ![]u8 {
+    var name_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(identity.issuer_name_der, &name_hash, .{});
+    var key_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(identity.issuer_key_bytes, &key_hash, .{});
+    return testSignedOcspResponseWithHashes(allocator, kp, identity.serial_der, .good, "20260202030405Z", hash_oid, &name_hash, &key_hash);
+}
+
+test "strict OCSP CertID matches issuer name and key under supported hash OIDs" {
+    const allocator = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@splat(0x32));
+    const spki = try testEd25519Spki(allocator, kp.public_key.toBytes());
+    defer allocator.free(spki);
+    const key_bytes = kp.public_key.toBytes();
+    const identity: CertIdInput = .{
+        .issuer_name_der = "\x30\x03\x31\x01\x00",
+        .issuer_key_bytes = &key_bytes,
+        .serial_der = &.{0x44},
+    };
+    const now = try x509.generalizedTimeToEpoch("20260115030405Z");
+
+    inline for (.{
+        .{ std.crypto.hash.Sha1, &oid_sha1 },
+        .{ std.crypto.hash.sha2.Sha256, &oid_sha256 },
+        .{ std.crypto.hash.sha2.Sha384, &oid_sha384 },
+        .{ std.crypto.hash.sha2.Sha512, &oid_sha512 },
+    }) |variant| {
+        const response = try testSignedOcspResponseWithCertIdHash(variant[0], allocator, kp, identity, variant[1]);
+        defer allocator.free(response);
+        try std.testing.expect(isStapleServableForCertId(response, spki, identity, now, 0));
+        try std.testing.expect(!isStapleServableForCertId(response, spki, .{
+            .issuer_name_der = "different issuer name",
+            .issuer_key_bytes = identity.issuer_key_bytes,
+            .serial_der = identity.serial_der,
+        }, now, 0));
+        try std.testing.expect(!isStapleServableForCertId(response, spki, .{
+            .issuer_name_der = identity.issuer_name_der,
+            .issuer_key_bytes = "different issuer key",
+            .serial_der = identity.serial_der,
+        }, now, 0));
+    }
+
+    const unknown_oid = [_]u8{ 0x2A, 0x03, 0x04 };
+    const unknown = try testSignedOcspResponseWithCertIdHash(std.crypto.hash.Sha1, allocator, kp, identity, &unknown_oid);
+    defer allocator.free(unknown);
+    try std.testing.expect(!isStapleServableForCertId(unknown, spki, identity, now, 0));
 }
 
 /// Build a BasicOCSPResponse signed by a DELEGATED responder (ECDSA-P256):
@@ -1613,3 +1757,6 @@ fn appendDerLen(allocator: std.mem.Allocator, out: *std.ArrayList(u8), len: usiz
 }
 
 const oid_sha1 = [_]u8{ 0x2B, 0x0E, 0x03, 0x02, 0x1A };
+const oid_sha256 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+const oid_sha384 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
+const oid_sha512 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03 };

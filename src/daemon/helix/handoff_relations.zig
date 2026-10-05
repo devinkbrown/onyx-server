@@ -24,6 +24,43 @@ const oper_grant_snapshot = @import("oper_grant_snapshot.zig");
 const bot_grant_snapshot = @import("bot_grant_snapshot.zig");
 const thread_snapshot = @import("thread_snapshot.zig");
 const schedule_snapshot = @import("schedule_snapshot.zig");
+const clone_detect = @import("../clone_detect.zig");
+const mesh_clones = @import("../mesh_clones.zig");
+const native_windows_rdns = @import("native_windows_rdns.zig");
+const native_windows_dnsbl = @import("native_windows_dnsbl.zig");
+const svc_login_throttle = @import("../svc_login_throttle.zig");
+const nick_delay = @import("../nick_delay.zig");
+const svc_tempmode = @import("../svc_tempmode.zig");
+const raid_shield = @import("../raid_shield.zig");
+const slowmode_checkpoint = @import("slowmode_checkpoint.zig");
+const metadata_checkpoint = @import("metadata_checkpoint.zig");
+const mlock_checkpoint = @import("mlock_checkpoint.zig");
+const drain_checkpoint = @import("drain_checkpoint.zig");
+const chanstats_checkpoint = @import("chanstats_checkpoint.zig");
+const access_checkpoint = @import("access_checkpoint.zig");
+const saccess_checkpoint = @import("saccess_checkpoint.zig");
+const akick_checkpoint = @import("akick_checkpoint.zig");
+const ward_checkpoint = @import("ward_checkpoint.zig");
+const resv_jupe_checkpoint = @import("resv_jupe_checkpoint.zig");
+const native_windows_webpush = @import("native_windows_webpush.zig");
+const native_windows_geo = @import("native_windows_geo.zig");
+const native_windows_mail = @import("native_windows_mail.zig");
+const native_windows_acme = @import("native_windows_acme.zig");
+const native_windows_ocsp = @import("native_windows_ocsp.zig");
+const native_windows_ocsp_state = @import("native_windows_ocsp_state.zig");
+const native_windows_tls_material = @import("native_windows_tls_material.zig");
+const native_windows_wasm = @import("native_windows_wasm.zig");
+const policy_checkpoint = @import("policy_checkpoint.zig");
+const native_windows_operator_state = @import("native_windows_operator_state.zig");
+const native_windows_account_flow = @import("native_windows_account_flow.zig");
+const native_windows_memo_state = @import("native_windows_memo_state.zig");
+const native_windows_user_settings = @import("native_windows_user_settings.zig");
+const gag_checkpoint = @import("gag_checkpoint.zig");
+const shun_checkpoint = @import("shun_checkpoint.zig");
+const account_abuse_checkpoint = @import("account_abuse_checkpoint.zig");
+const content_filter_checkpoint = @import("content_filter_checkpoint.zig");
+const reputation_checkpoint = @import("reputation_checkpoint.zig");
+const spamtrap_checkpoint = @import("spamtrap_checkpoint.zig");
 const monitor_capsule = @import("monitor_capsule.zig");
 const prop_checkpoint = @import("prop_checkpoint.zig");
 const s2s_snapshot = @import("s2s_snapshot.zig");
@@ -98,6 +135,86 @@ pub const Error = error{
     InvalidThreads,
     DuplicateSchedules,
     InvalidSchedules,
+    DuplicateCloneDetector,
+    InvalidCloneDetector,
+    DuplicateMeshClones,
+    InvalidMeshClones,
+    DuplicateRdns,
+    InvalidRdns,
+    DuplicateDnsbl,
+    InvalidDnsbl,
+    DuplicateLoginThrottle,
+    InvalidLoginThrottle,
+    DuplicateNickDelay,
+    InvalidNickDelay,
+    DuplicateTempMode,
+    InvalidTempMode,
+    DuplicateRaidShield,
+    InvalidRaidShield,
+    DuplicateSlowmode,
+    InvalidSlowmode,
+    DuplicateMetadata,
+    InvalidMetadata,
+    DuplicateMlock,
+    InvalidMlock,
+    DuplicateDrain,
+    InvalidDrain,
+    DuplicateChanstats,
+    InvalidChanstats,
+    DuplicateAccess,
+    InvalidAccess,
+    DuplicateSaccess,
+    InvalidSaccess,
+    DuplicateAkick,
+    InvalidAkick,
+    DuplicateWard,
+    InvalidWard,
+    DuplicateResv,
+    InvalidResv,
+    DuplicateJupe,
+    InvalidJupe,
+    DuplicateWebpush,
+    InvalidWebpush,
+    DuplicateGeo,
+    InvalidGeo,
+    DuplicateMail,
+    InvalidMail,
+    DuplicateAcme,
+    InvalidAcme,
+    DuplicateOcsp,
+    InvalidOcsp,
+    DuplicateOcspState,
+    InvalidOcspState,
+    DuplicateTlsMaterial,
+    InvalidTlsMaterial,
+    DuplicateWasm,
+    InvalidWasm,
+    DuplicatePolicy,
+    InvalidPolicy,
+    DuplicateOperatorState,
+    InvalidOperatorState,
+    DuplicateAccountFlow,
+    InvalidAccountFlow,
+    DuplicateMemoForward,
+    InvalidMemoForward,
+    DuplicateMemoIgnore,
+    InvalidMemoIgnore,
+    DuplicateFirstHold,
+    InvalidFirstHold,
+    DuplicateUserSettings,
+    InvalidUserSettings,
+    DuplicateGags,
+    InvalidGags,
+    DuplicateShuns,
+    InvalidShuns,
+    DuplicateAccountAbuse,
+    InvalidAccountAbuse,
+    DuplicateContentFilter,
+    InvalidContentFilter,
+    DuplicateReputation,
+    InvalidReputation,
+    DuplicateSpamtrap,
+    InvalidSpamtrap,
     UnknownMeshCheckpoint,
 };
 
@@ -120,6 +237,46 @@ pub const Summary = struct {
     bot_grants: usize = 0,
     threads: usize = 0,
     schedules: usize = 0,
+    clone_detector: usize = 0,
+    mesh_clones: usize = 0,
+    rdns: usize = 0,
+    dnsbl: usize = 0,
+    login_throttle: usize = 0,
+    nick_delay: usize = 0,
+    temp_mode: usize = 0,
+    raid_shield: usize = 0,
+    slowmode: usize = 0,
+    metadata: usize = 0,
+    mlock: usize = 0,
+    drain: usize = 0,
+    chanstats: usize = 0,
+    access: usize = 0,
+    saccess: usize = 0,
+    akick: usize = 0,
+    ward: usize = 0,
+    resv: usize = 0,
+    jupe: usize = 0,
+    webpush: usize = 0,
+    geo: usize = 0,
+    mail: usize = 0,
+    acme: usize = 0,
+    ocsp: usize = 0,
+    ocsp_state: usize = 0,
+    tls_material: usize = 0,
+    wasm: usize = 0,
+    policy: usize = 0,
+    operator_state: usize = 0,
+    account_flow: usize = 0,
+    memo_forward: usize = 0,
+    memo_ignore: usize = 0,
+    first_hold: usize = 0,
+    user_settings: usize = 0,
+    gags: usize = 0,
+    shuns: usize = 0,
+    account_abuse: usize = 0,
+    content_filter: usize = 0,
+    reputation: usize = 0,
+    spamtrap: usize = 0,
 };
 
 /// Validate decoded capsules after `live.verifyHandoffManifest` and before any
@@ -374,6 +531,286 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             summary.schedules = 1;
             continue;
         }
+        if (clone_detect.isUpgradeCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidCloneDetector;
+            clone_detect.validateUpgradeCheckpoint(bytes) catch return error.InvalidCloneDetector;
+            if (summary.clone_detector != 0) return error.DuplicateCloneDetector;
+            summary.clone_detector = 1;
+            continue;
+        }
+        if (mesh_clones.isUpgradeCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidMeshClones;
+            mesh_clones.validateUpgradeCheckpoint(bytes) catch return error.InvalidMeshClones;
+            if (summary.mesh_clones != 0) return error.DuplicateMeshClones;
+            summary.mesh_clones = 1;
+            continue;
+        }
+        if (native_windows_rdns.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidRdns;
+            native_windows_rdns.validateCheckpoint(bytes) catch return error.InvalidRdns;
+            if (summary.rdns != 0) return error.DuplicateRdns;
+            summary.rdns = 1;
+            continue;
+        }
+        if (native_windows_dnsbl.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidDnsbl;
+            native_windows_dnsbl.validateCheckpoint(bytes) catch return error.InvalidDnsbl;
+            if (summary.dnsbl != 0) return error.DuplicateDnsbl;
+            summary.dnsbl = 1;
+            continue;
+        }
+        if (svc_login_throttle.isUpgradeCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidLoginThrottle;
+            svc_login_throttle.validateUpgradeCheckpoint(bytes) catch return error.InvalidLoginThrottle;
+            if (summary.login_throttle != 0) return error.DuplicateLoginThrottle;
+            summary.login_throttle = 1;
+            continue;
+        }
+        if (nick_delay.isUpgradeCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidNickDelay;
+            nick_delay.validateUpgradeCheckpoint(bytes) catch return error.InvalidNickDelay;
+            if (summary.nick_delay != 0) return error.DuplicateNickDelay;
+            summary.nick_delay = 1;
+            continue;
+        }
+        if (svc_tempmode.isUpgradeCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidTempMode;
+            svc_tempmode.validateUpgradeCheckpoint(bytes) catch return error.InvalidTempMode;
+            if (summary.temp_mode != 0) return error.DuplicateTempMode;
+            summary.temp_mode = 1;
+            continue;
+        }
+        if (raid_shield.isUpgradeCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidRaidShield;
+            raid_shield.validateUpgradeCheckpoint(bytes) catch return error.InvalidRaidShield;
+            if (summary.raid_shield != 0) return error.DuplicateRaidShield;
+            summary.raid_shield = 1;
+            continue;
+        }
+        if (slowmode_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidSlowmode;
+            slowmode_checkpoint.validateCheckpoint(bytes) catch return error.InvalidSlowmode;
+            if (summary.slowmode != 0) return error.DuplicateSlowmode;
+            summary.slowmode = 1;
+            continue;
+        }
+        if (metadata_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidMetadata;
+            metadata_checkpoint.validateCheckpoint(bytes) catch return error.InvalidMetadata;
+            if (summary.metadata != 0) return error.DuplicateMetadata;
+            summary.metadata = 1;
+            continue;
+        }
+        if (mlock_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidMlock;
+            mlock_checkpoint.validateCheckpoint(bytes) catch return error.InvalidMlock;
+            if (summary.mlock != 0) return error.DuplicateMlock;
+            summary.mlock = 1;
+            continue;
+        }
+        if (drain_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidDrain;
+            drain_checkpoint.validateCheckpoint(bytes) catch return error.InvalidDrain;
+            if (summary.drain != 0) return error.DuplicateDrain;
+            summary.drain = 1;
+            continue;
+        }
+        if (chanstats_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidChanstats;
+            chanstats_checkpoint.validateCheckpoint(bytes) catch return error.InvalidChanstats;
+            if (summary.chanstats != 0) return error.DuplicateChanstats;
+            summary.chanstats = 1;
+            continue;
+        }
+        if (access_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidAccess;
+            access_checkpoint.validateCheckpoint(bytes) catch return error.InvalidAccess;
+            if (summary.access != 0) return error.DuplicateAccess;
+            summary.access = 1;
+            continue;
+        }
+        if (saccess_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidSaccess;
+            saccess_checkpoint.validateCheckpoint(bytes) catch return error.InvalidSaccess;
+            if (summary.saccess != 0) return error.DuplicateSaccess;
+            summary.saccess = 1;
+            continue;
+        }
+        if (akick_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidAkick;
+            akick_checkpoint.validateCheckpoint(bytes) catch return error.InvalidAkick;
+            if (summary.akick != 0) return error.DuplicateAkick;
+            summary.akick = 1;
+            continue;
+        }
+        if (ward_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidWard;
+            ward_checkpoint.validateCheckpoint(bytes) catch return error.InvalidWard;
+            if (summary.ward != 0) return error.DuplicateWard;
+            summary.ward = 1;
+            continue;
+        }
+        if (resv_jupe_checkpoint.channel.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidResv;
+            resv_jupe_checkpoint.channel.validateCheckpoint(bytes) catch return error.InvalidResv;
+            if (summary.resv != 0) return error.DuplicateResv;
+            summary.resv = 1;
+            continue;
+        }
+        if (resv_jupe_checkpoint.server.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidJupe;
+            resv_jupe_checkpoint.server.validateCheckpoint(bytes) catch return error.InvalidJupe;
+            if (summary.jupe != 0) return error.DuplicateJupe;
+            summary.jupe = 1;
+            continue;
+        }
+        if (native_windows_webpush.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidWebpush;
+            native_windows_webpush.validateCheckpoint(bytes) catch return error.InvalidWebpush;
+            if (summary.webpush != 0) return error.DuplicateWebpush;
+            summary.webpush = 1;
+            continue;
+        }
+        if (native_windows_geo.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidGeo;
+            native_windows_geo.validateCheckpoint(bytes) catch return error.InvalidGeo;
+            if (summary.geo != 0) return error.DuplicateGeo;
+            summary.geo = 1;
+            continue;
+        }
+        if (native_windows_mail.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidMail;
+            native_windows_mail.validateCheckpoint(bytes) catch return error.InvalidMail;
+            if (summary.mail != 0) return error.DuplicateMail;
+            summary.mail = 1;
+            continue;
+        }
+        if (native_windows_acme.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidAcme;
+            native_windows_acme.validateCheckpoint(bytes) catch return error.InvalidAcme;
+            if (summary.acme != 0) return error.DuplicateAcme;
+            summary.acme = 1;
+            continue;
+        }
+        if (native_windows_ocsp.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidOcsp;
+            native_windows_ocsp.validateCheckpoint(bytes) catch return error.InvalidOcsp;
+            if (summary.ocsp != 0) return error.DuplicateOcsp;
+            summary.ocsp = 1;
+            continue;
+        }
+        if (native_windows_ocsp_state.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidOcspState;
+            native_windows_ocsp_state.validateCheckpoint(bytes) catch return error.InvalidOcspState;
+            if (summary.ocsp_state != 0) return error.DuplicateOcspState;
+            summary.ocsp_state = 1;
+            continue;
+        }
+        if (native_windows_tls_material.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidTlsMaterial;
+            native_windows_tls_material.validateCheckpoint(bytes) catch return error.InvalidTlsMaterial;
+            if (summary.tls_material != 0) return error.DuplicateTlsMaterial;
+            summary.tls_material = 1;
+            continue;
+        }
+        if (native_windows_wasm.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidWasm;
+            native_windows_wasm.validateCheckpoint(bytes) catch return error.InvalidWasm;
+            if (summary.wasm != 0) return error.DuplicateWasm;
+            summary.wasm = 1;
+            continue;
+        }
+        if (policy_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidPolicy;
+            policy_checkpoint.validateCheckpoint(bytes) catch return error.InvalidPolicy;
+            if (summary.policy != 0) return error.DuplicatePolicy;
+            summary.policy = 1;
+            continue;
+        }
+        if (native_windows_operator_state.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidOperatorState;
+            native_windows_operator_state.validateCheckpoint(bytes) catch return error.InvalidOperatorState;
+            if (summary.operator_state != 0) return error.DuplicateOperatorState;
+            summary.operator_state = 1;
+            continue;
+        }
+        if (native_windows_account_flow.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidAccountFlow;
+            native_windows_account_flow.validateCheckpoint(bytes) catch return error.InvalidAccountFlow;
+            if (summary.account_flow != 0) return error.DuplicateAccountFlow;
+            summary.account_flow = 1;
+            continue;
+        }
+        if (native_windows_memo_state.isForward(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidMemoForward;
+            native_windows_memo_state.validateForward(bytes) catch return error.InvalidMemoForward;
+            if (summary.memo_forward != 0) return error.DuplicateMemoForward;
+            summary.memo_forward = 1;
+            continue;
+        }
+        if (native_windows_memo_state.isIgnore(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidMemoIgnore;
+            native_windows_memo_state.validateIgnore(bytes) catch return error.InvalidMemoIgnore;
+            if (summary.memo_ignore != 0) return error.DuplicateMemoIgnore;
+            summary.memo_ignore = 1;
+            continue;
+        }
+        if (native_windows_memo_state.isFirstHold(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidFirstHold;
+            native_windows_memo_state.validateFirstHold(bytes) catch return error.InvalidFirstHold;
+            if (summary.first_hold != 0) return error.DuplicateFirstHold;
+            summary.first_hold = 1;
+            continue;
+        }
+        if (native_windows_user_settings.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidUserSettings;
+            native_windows_user_settings.validateCheckpoint(bytes) catch return error.InvalidUserSettings;
+            if (summary.user_settings != 0) return error.DuplicateUserSettings;
+            summary.user_settings = 1;
+            continue;
+        }
+        if (gag_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidGags;
+            gag_checkpoint.validateCheckpoint(bytes) catch return error.InvalidGags;
+            if (summary.gags != 0) return error.DuplicateGags;
+            summary.gags = 1;
+            continue;
+        }
+        if (shun_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidShuns;
+            shun_checkpoint.validateCheckpoint(bytes) catch return error.InvalidShuns;
+            if (summary.shuns != 0) return error.DuplicateShuns;
+            summary.shuns = 1;
+            continue;
+        }
+        if (account_abuse_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidAccountAbuse;
+            account_abuse_checkpoint.validateCheckpoint(bytes) catch return error.InvalidAccountAbuse;
+            if (summary.account_abuse != 0) return error.DuplicateAccountAbuse;
+            summary.account_abuse = 1;
+            continue;
+        }
+        if (content_filter_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidContentFilter;
+            content_filter_checkpoint.validateCheckpoint(bytes) catch return error.InvalidContentFilter;
+            if (summary.content_filter != 0) return error.DuplicateContentFilter;
+            summary.content_filter = 1;
+            continue;
+        }
+        if (reputation_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidReputation;
+            reputation_checkpoint.validateCheckpoint(bytes) catch return error.InvalidReputation;
+            if (summary.reputation != 0) return error.DuplicateReputation;
+            summary.reputation = 1;
+            continue;
+        }
+        if (spamtrap_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidSpamtrap;
+            spamtrap_checkpoint.validateCheckpoint(bytes) catch return error.InvalidSpamtrap;
+            if (summary.spamtrap != 0) return error.DuplicateSpamtrap;
+            summary.spamtrap = 1;
+            continue;
+        }
         if (item.header.min_supported != descriptor.min_supported)
             return error.UnknownMeshCheckpoint;
         if (session_replica.Store.isUpgradeCheckpoint(bytes)) continue;
@@ -569,6 +1006,128 @@ fn testMeshClockCap(bytes: []const u8, field: *[1]capsule.Field) capsule.Capsule
     var cap = capsule.make(.mesh_checkpoint, field);
     cap.header.min_supported = 2;
     return cap;
+}
+
+test "current handoff relations validate unique POLY HXOP HXTM HXAC and HXWM custody" {
+    const allocator = std.testing.allocator;
+    const event_replay = try testEventSpineReplayCheckpoint(allocator);
+    defer allocator.free(event_replay);
+    const relay_replay = try testRelayV2ReplayCheckpoint(allocator);
+    defer allocator.free(relay_replay);
+    const relay_outbox = try testRelayV2OutboxCheckpoint(allocator);
+    defer allocator.free(relay_outbox);
+    const relay_event_log = try testRelayV2EventLogCheckpoint(allocator);
+    defer allocator.free(relay_event_log);
+    const attachment_delivery = try testAttachmentDeliveryCheckpoint(allocator);
+    defer allocator.free(attachment_delivery);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
+    const policy = try policy_checkpoint.encode(allocator, .{
+        .generations = .{ .ward = 1, .filter = 1, .class = 1, .ban = 1, .proof = 1 },
+    });
+    defer allocator.free(policy);
+    const operator_state = try native_windows_operator_state.encode(allocator, .{
+        .method = .pow,
+        .question = "",
+        .answer = "",
+        .issued = 7,
+    });
+    defer allocator.free(operator_state);
+    const ed = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x45));
+    var cert_buf: [4096]u8 = undefined;
+    const cert = try @import("../../proto/x509_selfsign.zig").buildSelfSigned(&cert_buf, .{
+        .common_name = "helix.test",
+        .not_before = 1_700_000_000,
+        .not_after = 1_900_000_000,
+        .serial = &.{5},
+        .key_pair = ed,
+    });
+    const chain = [_][]const u8{cert};
+    const tls_material = try native_windows_tls_material.encodeSnapshot(allocator, .{
+        .default = .{ .cert_chain = &chain, .signing_key = &ed },
+        .tls12_mode = .disabled,
+    });
+    defer native_windows_tls_material.freeEncoded(allocator, tls_material);
+    var unused_server: @import("../server.zig").Server = undefined;
+    const tls_config: @import("../config_format.zig").Config.Tls = .{};
+    var acme_owner = @import("../acme_renewal.zig").Service.init(allocator, std.testing.io, &unused_server, .{ .enabled = true }, &tls_config);
+    const acme = try native_windows_acme.captureUnstartedEncoded(allocator, &acme_owner);
+    defer allocator.free(acme);
+    var wasm_bridge = @import("../../wasm/host/bridge.zig").Bridge.init(allocator);
+    defer wasm_bridge.deinit();
+    const wasm_state = try native_windows_wasm.encode(allocator, &wasm_bridge, "plugins");
+    defer native_windows_wasm.freeEncoded(allocator, wasm_state);
+
+    const pieces = [_]TestPiece{
+        .{ .kind = .mesh_checkpoint, .bytes = event_replay },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_replay },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_outbox },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_event_log },
+        .{ .kind = .mesh_checkpoint, .bytes = attachment_delivery },
+        .{ .kind = .mesh_checkpoint, .bytes = e2ee_group },
+        .{ .kind = .mesh_checkpoint, .bytes = &clock },
+        .{ .kind = .mesh_checkpoint, .bytes = policy },
+        .{ .kind = .mesh_checkpoint, .bytes = operator_state },
+        .{ .kind = .mesh_checkpoint, .bytes = tls_material },
+        .{ .kind = .mesh_checkpoint, .bytes = acme },
+        .{ .kind = .mesh_checkpoint, .bytes = wasm_state },
+    };
+    var fields: [pieces.len][1]capsule.Field = undefined;
+    var caps: [pieces.len]capsule.Capsule = undefined;
+    _ = makeTestCaps(&pieces, &fields, &caps);
+    for (&caps) |*cap| cap.header.min_supported = 2;
+    const summary = try validateCurrent(&caps, &.{});
+    try std.testing.expectEqual(@as(usize, 1), summary.policy);
+    try std.testing.expectEqual(@as(usize, 1), summary.operator_state);
+    try std.testing.expectEqual(@as(usize, 1), summary.tls_material);
+    try std.testing.expectEqual(@as(usize, 1), summary.acme);
+    try std.testing.expectEqual(@as(usize, 1), summary.wasm);
+    try std.testing.expectError(error.DuplicatePolicy, validateCurrent(&.{ caps[7], caps[7] }, &.{}));
+    try std.testing.expectError(error.DuplicateOperatorState, validateCurrent(&.{ caps[8], caps[8] }, &.{}));
+    try std.testing.expectError(error.DuplicateTlsMaterial, validateCurrent(&.{ caps[9], caps[9] }, &.{}));
+    try std.testing.expectError(error.DuplicateAcme, validateCurrent(&.{ caps[10], caps[10] }, &.{}));
+    try std.testing.expectError(error.DuplicateWasm, validateCurrent(&.{ caps[11], caps[11] }, &.{}));
+
+    const corrupt_policy = try allocator.dupe(u8, policy);
+    defer allocator.free(corrupt_policy);
+    corrupt_policy[corrupt_policy.len - 1] ^= 1;
+    var corrupt_policy_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_policy }};
+    var corrupt_policy_cap = capsule.make(.mesh_checkpoint, &corrupt_policy_field);
+    corrupt_policy_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidPolicy, validateCurrent(&.{corrupt_policy_cap}, &.{}));
+
+    const corrupt_operator = try allocator.dupe(u8, operator_state);
+    defer allocator.free(corrupt_operator);
+    corrupt_operator[corrupt_operator.len - 1] ^= 1;
+    var corrupt_operator_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_operator }};
+    var corrupt_operator_cap = capsule.make(.mesh_checkpoint, &corrupt_operator_field);
+    corrupt_operator_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidOperatorState, validateCurrent(&.{corrupt_operator_cap}, &.{}));
+
+    const corrupt_tls = try allocator.dupe(u8, tls_material);
+    defer native_windows_tls_material.freeEncoded(allocator, corrupt_tls);
+    corrupt_tls[corrupt_tls.len - 1] ^= 1;
+    var corrupt_tls_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_tls }};
+    var corrupt_tls_cap = capsule.make(.mesh_checkpoint, &corrupt_tls_field);
+    corrupt_tls_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidTlsMaterial, validateCurrent(&.{corrupt_tls_cap}, &.{}));
+
+    const corrupt_acme = try allocator.dupe(u8, acme);
+    defer allocator.free(corrupt_acme);
+    corrupt_acme[corrupt_acme.len - 1] ^= 1;
+    var corrupt_acme_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_acme }};
+    var corrupt_acme_cap = capsule.make(.mesh_checkpoint, &corrupt_acme_field);
+    corrupt_acme_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidAcme, validateCurrent(&.{corrupt_acme_cap}, &.{}));
+
+    const corrupt_wasm = try allocator.dupe(u8, wasm_state);
+    defer native_windows_wasm.freeEncoded(allocator, corrupt_wasm);
+    corrupt_wasm[corrupt_wasm.len - 1] ^= 1;
+    var corrupt_wasm_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_wasm }};
+    var corrupt_wasm_cap = capsule.make(.mesh_checkpoint, &corrupt_wasm_field);
+    corrupt_wasm_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidWasm, validateCurrent(&.{corrupt_wasm_cap}, &.{}));
 }
 
 test "current handoff relations accept exact mixed client sidecars S2S and redial" {

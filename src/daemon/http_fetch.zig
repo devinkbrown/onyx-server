@@ -520,16 +520,6 @@ fn readHttp(allocator: std.mem.Allocator, fd: Socket, max_bytes: usize) Error![]
 }
 
 fn sendFatal(fd: Socket, client: anytype, failure: anytype) void {
-    if (comptime builtin.os.tag == .windows) {
-        const bytes = client.takeAlert(failure) orelse return;
-        defer client.allocator.free(bytes);
-        const timeout_ms: u32 = 1000;
-        if (win.setsockopt(fd, win.sol_socket, win.so_sndtimeo, &timeout_ms, @sizeOf(u32)) != 0) return;
-        writeAll(fd, bytes) catch |err| {
-            std.log.warn("TLS fatal alert write failed: {s}", .{@errorName(err)});
-        };
-        return;
-    }
     tls_client_failure.sendFatal(fd, client, failure);
 }
 
@@ -1113,6 +1103,7 @@ test "http_fetch Windows HTTPS loopback verifies trusted anchor and rejects untr
         key_pair: std.crypto.sign.Ed25519.KeyPair,
         expect_http: bool,
         request_seen: bool = false,
+        alert_seen: bool = false,
         fallback_seen: bool = false,
         failure: ?anyerror = null,
 
@@ -1172,8 +1163,8 @@ test "http_fetch Windows HTTPS loopback verifies trusted anchor and rejects untr
                 if (!self.expect_http) {
                     // The client must reject the unknown anchor before an HTTP
                     // request. Drain its fatal alert, then check for a fallback.
-                    const alert: ?[]u8 = record(fd, &buffer) catch null;
-                    _ = alert;
+                    try std.testing.expectError(error.TlsAlert, engine.feed(try record(fd, &buffer)));
+                    self.alert_seen = true;
                     self.fallback_seen = try readable(self.listener, 250);
                     return;
                 }
@@ -1210,7 +1201,7 @@ test "http_fetch Windows HTTPS loopback verifies trusted anchor and rejects untr
     untrusted_joined = true;
     if (untrusted_worker.failure) |err| return err;
     try std.testing.expectError(error.UnknownCa, untrusted);
-    try std.testing.expect(!untrusted_worker.request_seen and !untrusted_worker.fallback_seen);
+    try std.testing.expect(untrusted_worker.alert_seen and !untrusted_worker.request_seen and !untrusted_worker.fallback_seen);
 }
 
 test "parseUrl splits scheme/host/port/path with defaults" {
@@ -1352,6 +1343,16 @@ test "TLS client fatal transport: http_fetch socket writer preserves control cus
     // Unix-socketpair proof; no `socketpair` on Windows.
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     try tls_client_failure.testFatalTransportProof(true, writeAll);
+}
+
+test "TLS client fatal transport: http_fetch Windows socket writer preserves control custody" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const Callback = struct {
+        fn send(fd: usize, client: *tls_client.Client, failure: tls_client.Error) void {
+            sendFatal(fd, client, failure);
+        }
+    };
+    try tls_client_failure.testWindowsFatalTransportProof(true, Callback.send);
 }
 
 test "TLS client fatal transport: HTTP POST response failure never opens a fallback connection" {

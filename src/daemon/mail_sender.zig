@@ -32,6 +32,7 @@ pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 
 const job_capacity: usize = 64; // bounded ring; enqueue drops past this
+pub const max_queued_jobs: usize = job_capacity;
 const io_timeout_ms: u31 = 15000; // per-job connect + recv/send timeout
 const max_message_len: usize = 16 * 1024; // assembled RFC 5322 message cap
 const max_body_len: usize = 12 * 1024; // body truncated to fit under the cap
@@ -152,6 +153,24 @@ pub const FailedMessage = struct {
 };
 pub const FileCut = struct { identity: journal_custody.Identity, length: u64, digest: [32]u8 };
 pub const JournalCut = struct { wal: FileCut, snapshot: ?FileCut };
+/// Full Windows file IDs and byte digests for the private failure journal.
+/// This cut is only valid after the source worker parks and producers freeze.
+pub const PrivateFileCut = struct {
+    identity: store_mod.WindowsFileIdInfo,
+    length: u64,
+    digest: [32]u8,
+};
+pub const PrivateWalCut = struct {
+    parent: store_mod.WindowsFileIdInfo,
+    name_digest: [32]u8,
+    wal: PrivateFileCut,
+    snapshot: ?PrivateFileCut,
+};
+const PrivateWalStage = struct {
+    expected: PrivateWalCut,
+    wal: std.Io.File,
+    snapshot: ?std.Io.File,
+};
 const PendingFailure = struct {
     message: FailedMessage,
     journal: ?*store_mod.OroStore = null,
@@ -174,18 +193,24 @@ pub const Sender = struct {
     failure_seq: u64 = 0,
     producers: runtime_pause.ProducerState = .{},
     pending_failure: ?PendingFailure = null,
+    /// The Windows failure WAL always resolves beneath this retained private
+    /// directory HANDLE, even if an ancestor pathname changes after boot.
+    private_failure_dir: ?std.Io.Dir = null,
+    private_wal_stage: ?PrivateWalStage = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Sender {
         if ((config.failure_wal == null) != (config.failure_io == null)) return error.InvalidConfig;
+        var private_dir: ?std.Io.Dir = null;
         if (comptime builtin.os.tag == .windows) {
             if (config.private_failure_windows) {
                 const wal = config.failure_wal orelse return error.InvalidConfig;
                 const io = config.failure_io orelse return error.InvalidConfig;
-                try os_runtime.requirePrivateDirectoryWindows(io, config.failure_dir orelse std.Io.Dir.cwd(), wal);
+                private_dir = try os_runtime.openPrivateDirectoryWindows(io, config.failure_dir orelse std.Io.Dir.cwd(), std.fs.path.dirname(wal) orelse ".");
             }
         }
+        errdefer if (private_dir) |dir| dir.close(config.failure_io.?);
         const jobs = try allocator.alloc(Job, job_capacity);
-        return .{ .allocator = allocator, .config = config, .jobs = jobs };
+        return .{ .allocator = allocator, .config = config, .jobs = jobs, .private_failure_dir = private_dir };
     }
 
     pub fn prepareColdResources(self: *Sender, io: std.Io) !void {
@@ -290,8 +315,23 @@ pub const Sender = struct {
     /// All candidate bytes are allocated before replacing the accepted queue.
     /// Failure preserves the actual owner's sequence, payloads and FIFO.
     pub fn restoreSnapshot(self: *Sender, snapshot: *const Snapshot, max_bytes: usize) !void {
-        if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0 or
-            self.active_settles.load(.acquire) != 0) return error.AlreadyStarted;
+        try self.restoreSnapshotAt(snapshot, max_bytes, false);
+    }
+    /// Candidate's real mail worker must be parked behind the shared Gate.
+    /// The original WAL descriptor cannot be reconstructed from a snapshot;
+    /// Windows Helix callers reject pending_failure before using this method.
+    pub fn restoreSnapshotParked(self: *Sender, snapshot: *const Snapshot, max_bytes: usize) !void {
+        try self.restoreSnapshotAt(snapshot, max_bytes, true);
+    }
+    fn requireRestoreCut(self: *Sender, comptime parked: bool) !void {
+        if (self.thread != null or self.runtime.pause.request_epoch != 0 or
+            self.active_settles.load(.acquire) != 0 or self.stop_flag.load(.acquire)) return error.AlreadyStarted;
+        if (parked) {
+            try self.runtime.requireParked();
+        } else if (self.runtime.view != null) return error.AlreadyStarted;
+    }
+    fn restoreSnapshotAt(self: *Sender, snapshot: *const Snapshot, max_bytes: usize, comptime parked: bool) !void {
+        try self.requireRestoreCut(parked);
         try snapshot.validate(self.config, max_bytes);
         const candidate = try self.allocator.alloc(Job, snapshot.jobs.len);
         defer self.allocator.free(candidate);
@@ -302,12 +342,14 @@ pub const Sender = struct {
             copied += 1;
         }
         var failed: ?PendingFailure = null;
+        errdefer if (failed) |pending| pending.message.job.free(self.allocator);
         if (snapshot.pending_failure) |message| {
             failed = .{ .message = message, .cut = snapshot.journal_cut };
             failed.?.message.job = try cloneJob(self.allocator, message.job);
         }
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        try self.requireRestoreCut(parked);
         if (self.pending_failure) |pending| {
             pending.message.job.free(self.allocator);
             if (pending.journal) |journal| {
@@ -343,6 +385,97 @@ pub const Sender = struct {
         defer self.mutex.unlock();
         try self.producers.resumeLocked(token);
     }
+    /// Seals the exact private directory and journal files under the same
+    /// source cut as the mail queue. A missing WAL is initialized as a private
+    /// zero-length file only after proving there is no orphan snapshot; the
+    /// normal OroStore open will write its epoch on the next failure.
+    pub fn capturePrivateWalCut(self: *Sender, fence: ProducerFence, token: ?runtime_pause.Token) !PrivateWalCut {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (!self.config.private_failure_windows) return error.InsecureFailureJournal;
+        try self.requireProducersFrozen(fence);
+        _ = try self.requireCaptureCut(token);
+        lockSpin(&self.mutex);
+        const unsettled = self.pending_failure != null or self.active_settles.load(.acquire) != 0;
+        self.mutex.unlock();
+        if (unsettled) return error.FailureJournalPending;
+        const dir = self.private_failure_dir orelse return error.InsecureFailureJournal;
+        const io = self.config.failure_io orelse return error.FailureJournalUnavailable;
+        const name = std.fs.path.basename(self.config.failure_wal orelse return error.FailureJournalUnavailable);
+        var snap_buf: [512]u8 = undefined;
+        const snap_name = try privateSnapshotName(name, &snap_buf);
+        const wal = os_runtime.openExistingPrivateWindows(dir, name, .verify_only) catch |err| blk: {
+            if (err != error.FileNotFound) return err;
+            // An orphan snapshot cannot be given a new WAL lineage here.
+            const orphan = os_runtime.openExistingPrivateWindows(dir, snap_name, .verify_only) catch |snap_err| {
+                if (snap_err != error.FileNotFound) return snap_err;
+                break :blk try os_runtime.createPrivateExclusiveWindows(dir, name);
+            };
+            orphan.close(io);
+            return error.JournalCustodyMismatch;
+        };
+        defer wal.close(io);
+        const wal_cut = try privateFileCut(wal, io);
+        // Store replay treats an empty snapshot as no records. Materializing
+        // that private name lets the candidate hold both exact file objects
+        // exclusively through COMMIT, including an initially absent snapshot.
+        const snapshot_file = os_runtime.openExistingPrivateWindows(dir, snap_name, .verify_only) catch |err| blk: {
+            if (err != error.FileNotFound) return err;
+            break :blk try os_runtime.createPrivateExclusiveWindows(dir, snap_name);
+        };
+        defer snapshot_file.close(io);
+        const snapshot_cut = try privateFileCut(snapshot_file, io);
+        try self.requireProducersFrozen(fence);
+        _ = try self.requireCaptureCut(token);
+        return .{ .parent = try privateFileIdentity(@intFromPtr(dir.handle)), .name_digest = privateNameDigest(name), .wal = wal_cut, .snapshot = snapshot_cut };
+    }
+
+    /// Candidate-owned exclusive read handles keep the source WAL and optional
+    /// snapshot from being renamed or replaced through COMMIT. All fallible
+    /// checks finish before the stage is published into this Sender.
+    pub fn stagePrivateWalCut(self: *Sender, expected: PrivateWalCut) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (!self.config.private_failure_windows or self.private_wal_stage != null) return error.InvalidState;
+        const dir = self.private_failure_dir orelse return error.InsecureFailureJournal;
+        const io = self.config.failure_io orelse return error.FailureJournalUnavailable;
+        const name = std.fs.path.basename(self.config.failure_wal orelse return error.FailureJournalUnavailable);
+        if (!std.meta.eql(expected.parent, try privateFileIdentity(@intFromPtr(dir.handle))) or
+            !std.mem.eql(u8, &expected.name_digest, &privateNameDigest(name))) return error.JournalCustodyMismatch;
+        const wal = try os_runtime.openExistingPrivateWindows(dir, name, .verify_only);
+        errdefer wal.close(io);
+        if (!privateFileCutEqual(expected.wal, try privateFileCut(wal, io))) return error.JournalCustodyMismatch;
+        var snap_buf: [512]u8 = undefined;
+        const snap_name = try privateSnapshotName(name, &snap_buf);
+        const snapshot_file = try os_runtime.openExistingPrivateWindows(dir, snap_name, .verify_only);
+        errdefer snapshot_file.close(io);
+        const cut = expected.snapshot orelse return error.JournalCustodyMismatch;
+        if (!privateFileCutEqual(cut, try privateFileCut(snapshot_file, io))) return error.JournalCustodyMismatch;
+        self.private_wal_stage = .{ .expected = expected, .wal = wal, .snapshot = snapshot_file };
+    }
+
+    /// Call at the candidate's pre-COMMIT edge while the Gate is still parked.
+    pub fn requireStagedWalCut(self: *Sender) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        const stage = self.private_wal_stage orelse return error.NotPrepared;
+        const dir = self.private_failure_dir orelse return error.InsecureFailureJournal;
+        const io = self.config.failure_io orelse return error.FailureJournalUnavailable;
+        const name = std.fs.path.basename(self.config.failure_wal orelse return error.FailureJournalUnavailable);
+        if (!std.meta.eql(stage.expected.parent, try privateFileIdentity(@intFromPtr(dir.handle))) or
+            !std.mem.eql(u8, &stage.expected.name_digest, &privateNameDigest(name)) or
+            !privateFileCutEqual(stage.expected.wal, try privateFileCut(stage.wal, io))) return error.JournalCustodyMismatch;
+        const file = stage.snapshot orelse return error.JournalCustodyMismatch;
+        const cut = stage.expected.snapshot orelse return error.JournalCustodyMismatch;
+        if (!privateFileCutEqual(cut, try privateFileCut(file, io))) return error.JournalCustodyMismatch;
+    }
+
+    /// After authenticated COMMIT and before the Gate releases the mail worker.
+    pub fn releaseStagedWalCut(self: *Sender) void {
+        if (self.private_wal_stage) |stage| {
+            const io = self.config.failure_io orelse unreachable;
+            if (stage.snapshot) |file| file.close(io);
+            stage.wal.close(io);
+            self.private_wal_stage = null;
+        }
+    }
     /// Only this source can prove settlement under its producer fence. Pending
     /// failure custody includes failed AND ambiguous WAL outcomes.
     pub fn requireSettled(self: *Sender, token: ProducerFence) !void {
@@ -372,6 +505,8 @@ pub const Sender = struct {
                 self.allocator.destroy(journal);
             }
         }
+        self.releaseStagedWalCut();
+        if (self.private_failure_dir) |dir| dir.close(self.config.failure_io.?);
         self.allocator.free(self.jobs);
         self.* = undefined;
     }
@@ -553,12 +688,13 @@ pub const Sender = struct {
 
     fn recordFailure(self: *Sender, pending: *PendingFailure) !void {
         if (pending.message.sequence == 0) return error.SequenceExhausted;
+        if (self.private_wal_stage != null) return error.StagedWalActive;
         const io = self.config.failure_io orelse return error.FailureJournalUnavailable;
         const wal = self.config.failure_wal orelse return error.FailureJournalUnavailable;
         const journal = try self.allocator.create(store_mod.OroStore);
         const opened = if (comptime builtin.os.tag == .windows) blk: {
             if (self.config.private_failure_windows)
-                break :blk store_mod.OroStore.openPrivateWindowsWithConfig(self.allocator, io, self.config.failure_dir orelse std.Io.Dir.cwd(), wal, .{});
+                break :blk store_mod.OroStore.openPrivateWindowsWithConfig(self.allocator, io, self.private_failure_dir orelse return error.InsecureFailureJournal, std.fs.path.basename(wal), .{});
             break :blk store_mod.OroStore.open(self.allocator, io, self.config.failure_dir orelse std.Io.Dir.cwd(), wal);
         } else store_mod.OroStore.open(self.allocator, io, self.config.failure_dir orelse std.Io.Dir.cwd(), wal);
         journal.* = opened catch |err| {
@@ -826,15 +962,6 @@ pub const Sender = struct {
 };
 
 fn sendTlsFatal(fd: Socket, client: *tls_client.Client, failure: tls_client.Error) void {
-    if (comptime builtin.os.tag == .windows) {
-        const alert = client.takeAlert(failure) orelse return;
-        defer client.allocator.free(alert);
-        // The connection closes after this terminal batch. Keep its final
-        // attempt bounded independently of the ordinary SMTP I/O timeout.
-        setRecvTimeout(fd, 1000) catch return;
-        writeAll(fd, alert) catch {};
-        return;
-    }
     tls_client_failure.sendFatal(fd, client, failure);
 }
 
@@ -1592,6 +1719,11 @@ test "TLS client fatal transport: mail_sender socket writer preserves control cu
     try tls_client_failure.testFatalTransportProof(true, writeAll);
 }
 
+test "TLS client fatal transport: mail_sender Windows socket writer preserves control custody" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    try tls_client_failure.testWindowsFatalTransportProof(true, sendTlsFatal);
+}
+
 test "TLS client fatal transport: SMTP read path drains real KeyUpdate before reply" {
     // Unix-socketpair proof; no `socketpair` on Windows.
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
@@ -1777,6 +1909,47 @@ fn captureFileCut(file: std.Io.File, io: std.Io) !FileCut {
 }
 fn fileCutEqual(a: FileCut, b: FileCut) bool {
     return a.identity.device == b.identity.device and a.identity.inode == b.identity.inode and a.length == b.length and std.mem.eql(u8, &a.digest, &b.digest);
+}
+const private_file_id_info_class: i32 = 18;
+const max_private_cut_bytes: u64 = 512 * 1024 * 1024;
+extern "kernel32" fn GetFileInformationByHandleEx(handle: usize, class: i32, info: *anyopaque, size: u32) callconv(.winapi) i32;
+
+fn privateFileIdentity(handle: usize) !store_mod.WindowsFileIdInfo {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    var info: store_mod.WindowsFileIdInfo = undefined;
+    if (GetFileInformationByHandleEx(handle, private_file_id_info_class, &info, @sizeOf(@TypeOf(info))) == 0)
+        return error.JournalCustodyMismatch;
+    return info;
+}
+fn privateNameDigest(name: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(name, &digest, .{});
+    return digest;
+}
+fn privateSnapshotName(name: []const u8, buffer: *[512]u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}.snap", .{name});
+}
+fn privateFileCut(file: std.Io.File, io: std.Io) !PrivateFileCut {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const identity = try privateFileIdentity(@intFromPtr(file.handle));
+    const stat = try file.stat(io);
+    if (stat.kind != .file or stat.size > max_private_cut_bytes) return error.JournalCustodyMismatch;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [4096]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < stat.size) {
+        const len: usize = @intCast(@min(stat.size - offset, buffer.len));
+        if (try file.readPositionalAll(io, buffer[0..len], offset) != len) return error.JournalCustodyMismatch;
+        hash.update(buffer[0..len]);
+        offset += len;
+    }
+    const after = try file.stat(io);
+    if (after.kind != .file or after.size != stat.size or
+        !std.meta.eql(identity, try privateFileIdentity(@intFromPtr(file.handle)))) return error.JournalCustodyMismatch;
+    return .{ .identity = identity, .length = stat.size, .digest = hash.finalResult() };
+}
+fn privateFileCutEqual(a: PrivateFileCut, b: PrivateFileCut) bool {
+    return std.meta.eql(a.identity, b.identity) and a.length == b.length and std.mem.eql(u8, &a.digest, &b.digest);
 }
 fn captureSnapshotCut(journal: *store_mod.OroStore) !?FileCut {
     if (comptime builtin.os.tag == .windows) {

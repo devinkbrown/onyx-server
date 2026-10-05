@@ -90,7 +90,7 @@ fn stopWinsock() void {
 
 const webhook = @import("webhook.zig");
 const webhook_render = @import("webhook_render.zig");
-const runtime_pause = @import("runtime_pause.zig");
+pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 const metrics_http = @import("metrics_http.zig");
 const native_windows_socket = @import("helix/native_windows_socket.zig");
@@ -462,6 +462,16 @@ pub const WebhookServer = struct {
         if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
         return self.captureCut(.unstarted);
     }
+    /// The upgrade producer has joined the only HTTP worker but retained the
+    /// bound listener. Hold the lifecycle lock through observation so rollback
+    /// cannot resume the worker between the quiescence check and capture.
+    pub fn captureQuiescedAfterJoin(self: *WebhookServer) !Snapshot {
+        try self.runtime.requireDetached();
+        lockLifecycle(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (self.thread != null or !self.stop_flag.load(.acquire)) return error.NotQuiescent;
+        return self.captureCut(.paused);
+    }
     fn captureCut(self: *WebhookServer, execution: Execution) !Snapshot {
         const observed = try metrics_http.observeListener(self.listen_fd);
         try validateEndpoint(observed, self.port, self.config);
@@ -590,6 +600,25 @@ pub const WebhookServer = struct {
         _ = metrics_http.writeUntil(fd, resp, &self.stop_flag, deadline);
     }
 };
+
+test "webhook joined source capture retains exact listener and refuses an active producer" {
+    var store = webhook.WebhookStore.init();
+    var counted = CountingSink{};
+    var server = try WebhookServer.init(&store, counted.sink(), 0, .{ .accept_poll_ms = 10, .conn_read_timeout_sec = 1 });
+    defer server.shutdown();
+    try std.testing.expectError(error.NotQuiescent, server.captureQuiescedAfterJoin());
+    try server.spawn();
+    try std.testing.expectError(error.NotQuiescent, server.captureQuiescedAfterJoin());
+    const before = try metrics_http.observeListener(server.listen_fd);
+    server.pause();
+    const carry = try server.captureQuiescedAfterJoin();
+    try std.testing.expectEqual(Execution.paused, carry.execution);
+    try std.testing.expectEqualDeep(before, carry.listener);
+    try std.testing.expectEqualDeep(server.config, carry.config);
+    try server.resumeServing();
+    try std.testing.expectError(error.NotQuiescent, server.captureQuiescedAfterJoin());
+    try std.testing.expectEqualDeep(before, try metrics_http.observeListener(server.listen_fd));
+}
 
 /// Read a full HTTP request (headers + declared body) into `buf`. Returns the
 /// byte count, or null on read error before any bytes. Stops early once the

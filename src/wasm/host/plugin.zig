@@ -10,6 +10,7 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const interp = @import("interp.zig");
 const registry = @import("../../daemon/registry.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const PluginHandle = u32;
 
@@ -53,15 +54,32 @@ pub const HostHookRegistration = struct {
 const LoadedPlugin = struct {
     handle: PluginHandle,
     name: []u8,
+    wasm: []u8,
     grants: abi.CapabilitySet,
     intents: abi.IntentSet,
     instance: interp.Instance,
 
     fn deinit(self: *LoadedPlugin, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
+        std.crypto.secureZero(u8, self.wasm);
+        allocator.free(self.wasm);
+        std.crypto.secureZero(u8, self.instance.memory);
         self.instance.deinit();
         self.* = undefined;
     }
+};
+
+/// Borrowed only while the owner is frozen at its Helix cut.
+pub const CheckpointPlugin = struct {
+    handle: PluginHandle,
+    name: []const u8,
+    wasm: []const u8,
+    memory: []const u8,
+};
+
+pub const CheckpointState = struct {
+    next_handle: PluginHandle,
+    deterministic_rand: u64,
 };
 
 pub const HostcallResult = union(enum) {
@@ -107,25 +125,112 @@ pub const PluginStore = struct {
 
         const handle = self.next_handle;
         self.next_handle += 1;
-        var instance = try interp.Instance.init(self.allocator, wasm, .{ .max_memory_bytes = self.policy.max_memory_bytes });
-        errdefer instance.deinit();
+        {
+            var instance = try interp.Instance.init(self.allocator, wasm, .{ .max_memory_bytes = self.policy.max_memory_bytes });
+            errdefer instance.deinit();
+            const name = try self.allocator.dupe(u8, manifest.name);
+            errdefer self.allocator.free(name);
+            const wasm_copy = try self.allocator.dupe(u8, wasm);
+            errdefer self.allocator.free(wasm_copy);
+            try self.plugins.append(self.allocator, .{
+                .handle = handle,
+                .name = name,
+                .wasm = wasm_copy,
+                .grants = grant.granted_caps,
+                .intents = grant.granted_intents,
+                .instance = instance,
+            });
+        }
+        errdefer {
+            var popped = self.plugins.pop().?;
+            popped.deinit(self.allocator);
+        }
 
-        const name = try self.allocator.dupe(u8, manifest.name);
-        errdefer self.allocator.free(name);
-        try self.plugins.append(self.allocator, .{
-            .handle = handle,
-            .name = name,
-            .grants = grant.granted_caps,
-            .intents = grant.granted_intents,
-            .instance = instance,
-        });
-        errdefer _ = self.plugins.pop();
-
-        for (manifest.commands) |command| try self.addCommand(handle, command);
         errdefer self.removeCommands(handle);
-        for (manifest.hooks) |hook| try self.addHook(handle, hook);
         errdefer self.removeHooks(handle);
+        for (manifest.commands) |command| try self.addCommand(handle, command);
+        for (manifest.hooks) |hook| try self.addHook(handle, hook);
         return handle;
+    }
+
+    pub fn checkpointState(self: *const PluginStore) CheckpointState {
+        return .{ .next_handle = self.next_handle, .deterministic_rand = self.deterministic_rand };
+    }
+
+    pub fn checkpointPlugin(self: *const PluginStore, index: usize) ?CheckpointPlugin {
+        if (index >= self.plugins.items.len) return null;
+        const row = self.plugins.items[index];
+        return .{ .handle = row.handle, .name = row.name, .wasm = row.wasm, .memory = row.instance.memory };
+    }
+
+    /// The staged bridge has parsed and authorized the exact module bytes.
+    /// Install only the source's mutable linear memory; module structure stays
+    /// derived from that validated module, never from the checkpoint's pointers.
+    pub fn restoreCheckpointMemory(self: *PluginStore, index: usize, name: []const u8, wasm: []const u8, memory: []const u8) error{InvalidCheckpoint}!void {
+        if (index >= self.plugins.items.len) return error.InvalidCheckpoint;
+        const row = &self.plugins.items[index];
+        if (!std.mem.eql(u8, row.name, name) or !std.mem.eql(u8, row.wasm, wasm) or row.instance.memory.len != memory.len) return error.InvalidCheckpoint;
+        @memcpy(row.instance.memory, memory);
+    }
+
+    /// Restore handles after every module is loaded. The two registration
+    /// tables refer to the temporary sequential handles until this no-alloc
+    /// remap, and a later layout digest verifies their exact source order.
+    pub fn restoreCheckpointIdentity(self: *PluginStore, handles: []const PluginHandle, state: CheckpointState) error{InvalidCheckpoint}!void {
+        if (handles.len != self.plugins.items.len or state.next_handle == 0) return error.InvalidCheckpoint;
+        var max_handle: PluginHandle = 0;
+        for (handles, 0..) |handle, index| {
+            if (handle == 0 or handle >= state.next_handle) return error.InvalidCheckpoint;
+            for (handles[0..index]) |prior| if (prior == handle) return error.InvalidCheckpoint;
+            max_handle = @max(max_handle, handle);
+        }
+        if (handles.len != 0 and state.next_handle <= max_handle) return error.InvalidCheckpoint;
+        for (self.plugins.items, 0..) |*row, index| row.handle = handles[index];
+        for (self.commands.items) |*row| {
+            const index: usize = @intCast(row.plugin - 1);
+            if (index >= handles.len) return error.InvalidCheckpoint;
+            row.plugin = handles[index];
+        }
+        for (self.hooks.items) |*row| {
+            const index: usize = @intCast(row.plugin - 1);
+            if (index >= handles.len) return error.InvalidCheckpoint;
+            row.plugin = handles[index];
+        }
+        self.next_handle = state.next_handle;
+        self.deterministic_rand = state.deterministic_rand;
+    }
+
+    /// Names, grants, command/hook priority and registration order are part
+    /// of execution semantics. The candidate compares this after re-parsing
+    /// every original module, before it can publish the staged bridge.
+    pub fn checkpointLayoutDigest(self: *const PluginStore) [32]u8 {
+        var hash = Sha256.init(.{});
+        hash.update("onyx-orowasm-helix-layout-v1");
+        digestU64(&hash, self.plugins.items.len);
+        for (self.plugins.items) |row| {
+            digestU64(&hash, row.handle);
+            digestBytes(&hash, row.name);
+            digestBytes(&hash, row.wasm);
+            digestCaps(&hash, row.grants);
+            digestIntents(&hash, row.intents);
+        }
+        digestU64(&hash, self.commands.items.len);
+        for (self.commands.items) |row| {
+            digestU64(&hash, row.plugin);
+            digestBytes(&hash, row.name);
+            digestU64(&hash, row.min_params);
+            digestBytes(&hash, row.export_name);
+        }
+        digestU64(&hash, self.hooks.items.len);
+        for (self.hooks.items) |row| {
+            digestU64(&hash, row.plugin);
+            digestBytes(&hash, row.hook);
+            digestU64(&hash, @intFromEnum(row.priority));
+            digestBytes(&hash, row.export_name);
+        }
+        var out: [32]u8 = undefined;
+        hash.final(&out);
+        return out;
     }
 
     pub fn unload(self: *PluginStore, handle: PluginHandle) Error!void {
@@ -258,6 +363,31 @@ pub const PluginStore = struct {
         return .none;
     }
 };
+
+fn digestU64(hash: *Sha256, value: anytype) void {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, @intCast(value), .little);
+    hash.update(&encoded);
+}
+
+fn digestBytes(hash: *Sha256, value: []const u8) void {
+    digestU64(hash, value.len);
+    hash.update(value);
+}
+
+fn digestCaps(hash: *Sha256, caps: abi.CapabilitySet) void {
+    for (abi.all_capabilities) |cap| {
+        const bit = [_]u8{@intFromBool(caps.has(cap))};
+        hash.update(&bit);
+    }
+}
+
+fn digestIntents(hash: *Sha256, intents: abi.IntentSet) void {
+    for (abi.all_intents) |intent| {
+        const bit = [_]u8{@intFromBool(intents.has(intent))};
+        hash.update(&bit);
+    }
+}
 
 fn toRegistryPriority(priority: abi.HookPriority) registry.HookPriority {
     return switch (priority) {

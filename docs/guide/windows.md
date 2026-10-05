@@ -151,6 +151,9 @@ message to a plain IRC client; it also checks missing-TLS preflight and a held
 UDP port causing a fatal bind error. The bridge follows the IRC bind address,
 including IPv6 loopback and a specific local IPv4 address. This smoke needs
 PowerShell 7, Node.js, and Chrome or Edge.
+On Windows, pathless TLS with WebTransport mints a seven-day P-256 bootstrap
+leaf with DNS and loopback SANs so a browser can use certificate-hash pinning.
+For a long-running public node, configure a managed certificate and key.
 
 The IRC listener accepts PROXY protocol v1/v2 when
 `[listen].proxy_protocol = true` and the connecting source IP appears in
@@ -201,8 +204,11 @@ checks both link health and channel messages across the hub. The session smoke
 attaches four and then five physical clients to one token across those nodes,
 checks exact per-recipient delivery, cold-restarts the hub, and confirms that
 the surviving edge sockets and token continue to work after reconnection. A
-cold restart does not provide Windows Helix process upgrade or preserve the
-hub's physical sockets.
+cold restart closes the hub's physical sockets. The separate Windows Helix
+smoke holds IRC sockets across two consecutive `UPGRADE` process swaps and
+checks that the local reusable-session token stays identical. A second smoke
+holds TLS IRC and WSS sockets through two swaps and accepts fresh connections
+on both secure listeners after each swap.
 
 Web Push requires an enabled account store, a private parent directory for
 `[webpush].vapid_key_path`, and a PEM CA bundle at
@@ -263,11 +269,102 @@ the private account directory above, copy the quickstart config into `$runDir`,
 and change the account path to `accounts-private/accounts.db`. The other
 quickstart settings pass config preflight. The quickstart is for local
 evaluation; configure TLS before sending account credentials across a network.
-Windows also does not provide Linux systemd packaging or the
-Helix `USR2` hot-upgrade path. Windows socket and private-WAL transfer building
-blocks have focused tests, but process upgrade remains disabled until the
-candidate's effective configuration and all live resource owners are bound to
-one authenticated handoff and a cross-process upgrade smoke passes.
+Windows does not provide Linux systemd packaging or the POSIX `USR2` upgrade
+signal. Use the operator `UPGRADE` command for its guarded native process
+handoff.
+
+## Guarded Windows Helix upgrade
+
+Windows Helix launches a successor from the daemon's executable path and
+transfers authenticated custody of TCP listeners and client or mesh-link
+sockets, the metrics listener and snapshot, the webhook listener and binding
+store, an idle WebTransport UDP listener with its Retry/replay state, plus the
+private account WAL when configured. The candidate validates
+the carried state while inert, then publishes it only after authenticated
+COMMIT and predecessor exit. The native smoke first rejects a changed candidate
+configuration and proves the predecessor's sockets and WAL remain usable, then
+exercises two consecutive swaps with held plaintext IRC sockets, account reads
+and writes, and an unchanged local session token. It has not yet exercised a
+swap between different binary versions. A separate native smoke exercises
+two swaps with held TLS IRC and WSS sockets, checks WebSocket control frames,
+and opens fresh TLS and WSS connections after each swap.
+The native v15 capability challenge requires ACME scheduler, TLS-material,
+OroWasm, active history-listener, and UDP owner custody support; an older
+candidate is rejected before socket transfer.
+A third native smoke upgrades a node with a held secured Mooring link, keeps
+attachments on both nodes connected, and checks exact cross-node deliveries.
+A fourth runs continuous `/metrics` scrapes through two swaps and checks held
+and fresh IRC clients after each one. A fifth keeps the same webhook endpoint
+through two swaps and verifies that one POST reaches each held channel member
+exactly once after a rejected candidate and after each committed successor.
+The primary two-swap smoke also enables connection-rate and mesh-wide clone
+limits, exercising their exact admission checkpoints alongside held clients.
+The handoff also carries login lockout scores, nick-delay holds, reverse DNS
+and DNSBL cache and pending lookup queues, and raid-shield correlation state
+through the authenticated arena. Queued TEMPMODE reversals retain their
+deadlines and action order.
+
+`UPGRADE` requires a config file with explicit `[node].secret_key` and
+`[cloak].secret`. TLS may use configured files or daemon-generated default
+and TLS 1.2 certificates. The predecessor and candidate must reproduce the
+same loaded source, ordered `env:` and `@file:` substitutions, static TLS
+settings, identity material, and OAuth JWKS bytes. The authenticated TLS
+material checkpoint supplies the exact serving certificate and key generations
+before COMMIT. A `REHASH` invalidates the boot source proof; a fresh normal
+boot is needed before a later Windows Helix upgrade. ACME renewal does not
+invalidate that static proof.
+
+The guarded path carries Web Push worker state, mail queue and private journal
+custody, Geo worker cache and pinned GeoIP/ASN databases, channel statistics,
+connection-rate windows, network clone counts, and active DRAIN, SLOWMODE,
+metadata, moderation, and access policy. Mandatory checkpoints also carry
+POLICY generations and the one-step ROLLBACK state, operator challenge policy
+and pending two-person approval, account verification and password-reset tokens
+and TOTP replay state, account autojoin and nick-group settings, welcome lines,
+memo forwarding and ignore lists, and accepted first-message holds. OCSP
+checkpoints carry the fetch scheduler and current, pending, and retained staple
+state. ACME checkpoints carry the renewal scheduler and exact live default and
+TLS 1.2 serving material. The successor checks checkpoint ownership and
+configuration identity before COMMIT. Native smokes exercise Web Push, mail,
+Geo, POLICY ROLLBACK, account settings, memo preferences, and a pending
+password-reset token through two committed swaps. The TLS/WSS smoke exercises
+configured ACME and OCSP schedulers; its generated variant preserves the same
+default and TLS 1.2 certificates through two swaps. The self-signed fixture
+has no issuer or AIA, so these smokes do not verify public ACME issuance or
+live OCSP DER publication.
+
+When `[wasm].plugin_dir` is configured, its mandatory checkpoint carries the
+authorized plugin source bytes, policy, registration order, mutable linear
+memory, and deterministic random state. A native smoke changes the plugin file
+after boot and checks that a counter shared by two held IRC clients continues
+through a rejected candidate and two committed swaps. Fresh clients also use
+the carried module and memory.
+
+An idle configured WebTransport listener transfers its exact UDP socket and
+Retry/replay state before READY. The two-swap browser smoke opens a new QUIC
+session on the same port after each swap while held IRC and TLS clients remain
+connected. An active QUIC connection blocks the handoff until it closes. A
+candidate validates the WebTransport owner against the source's authenticated
+serving TLS checkpoint before READY, including generated bootstrap material.
+ACME and REHASH certificate reloads update the WebTransport owner only at an
+idle QUIC boundary; a busy owner keeps serving the old generation and the
+reload is retried or refused without changing either TLS view.
+
+An enabled, pristine `[media]` graph transfers its original WebRTC and native
+media UDP sockets, initial secret state, and native stream key before READY.
+The media Helix smoke holds TLS clients through two swaps and then exercises
+ICE and authenticated native UDP forwarding on the inherited ports. Any media
+room, transport, or cross-leg bridge activity blocks a further upgrade because
+its live graph has no exact checkpoint yet. A standalone native-media port
+without `[media]` also blocks the handoff. An
+opened loopback `history_https` listener transfers its listening socket when
+the candidate reproduces its complete TLS configuration; other runtime TLS
+settings cause a safe pre-COMMIT refusal. OroWasm plugin directories and media
+remain available on ordinary Windows boot under their preflight rules. A live
+session-drop transaction, deferred
+MESSAGE_V2 authority, or accepted Web Push overflow delivery blocks the
+handoff until it settles. An open multiline batch defers the handoff until it
+closes.
 
 Windows outbound HTTP hostname lookup now uses `GetAddrInfoExW`, but enterprise
 DNS policy and hosts-file variations have not had live acceptance tests. Socket
@@ -289,6 +386,19 @@ python -B .\tools\windows_stats_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
+python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_webhook_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_mesh_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --generated
+python -B .\tools\windows_webpush_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_geo_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_mail_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_account_flow_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_multishard_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_backup_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webpush_smoke.py .\zig-out\bin\onyx-server.exe
@@ -301,6 +411,7 @@ python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --ipv6-irc
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --irc-host 127.0.0.2
 python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 ```
 
@@ -310,11 +421,12 @@ command checks TLS, WSS, metrics, and webhook together; the second checks
 testing-only plaintext WebSocket without TLS; the third checks trusted PROXY
 protocol and header refusal; the fourth checks durable accounts and TLS SASL
 PLAIN; the fifth checks stats publication and cold-restart restore. The
-remaining commands probe STS, secured mesh, reusable sessions, private
-backup/restore, Web Push startup, OCG2 authority restore, and ACME/OCSP worker
-startup, and OroWasm plugin dispatch. Omit a flag to check a narrower configuration. A passing build
-check alone establishes only that the daemon
-type-checks for the Windows target.
+remaining commands probe STS, secured mesh, reusable sessions, guarded Helix
+swaps with OroWasm memory continuity, private backup and restore, Web Push,
+account token continuity, OCG2 authority restore, ACME/OCSP workers, and
+OroWasm plugin dispatch. Omit a flag to check a narrower configuration. A
+passing build check establishes only that the daemon type-checks for the
+Windows target.
 The startup-intent smoke verifies that invalid configured keys, trust bundles,
 and other security inputs fail preflight. It also verifies that occupied IRC,
 TLS, WebSocket, metrics, webhook, and media ports fail startup.
@@ -340,6 +452,17 @@ python -B .\tools\windows_stats_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
+python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_webhook_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_mesh_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_webpush_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_geo_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_mail_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_account_flow_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_multishard_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_backup_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_ocg2_smoke.py .\zig-out\bin\onyx-server.exe
@@ -352,6 +475,7 @@ python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --ipv6-irc
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --irc-host 127.0.0.2
 python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 ```
 

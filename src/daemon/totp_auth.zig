@@ -170,9 +170,15 @@ pub const TotpStore = struct {
 
     fn insert(self: *TotpStore, account: []const u8, secret_b32: []const u8, phase: Phase) Error!void {
         const secret = try self.decodeSecret(secret_b32);
-        errdefer self.allocator.free(secret);
+        errdefer {
+            std.crypto.secureZero(u8, @constCast(secret));
+            self.allocator.free(secret);
+        }
         const owned_b32 = try self.allocator.dupe(u8, secret_b32);
-        errdefer self.allocator.free(owned_b32);
+        errdefer {
+            std.crypto.secureZero(u8, owned_b32);
+            self.allocator.free(owned_b32);
+        }
         const next: Enrollment = .{ .phase = phase, .secret = secret, .secret_b32 = owned_b32, .last_step = null };
 
         if (self.findEntry(account)) |entry| {
@@ -249,7 +255,10 @@ pub const TotpStore = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidSecret,
         };
-        errdefer self.allocator.free(secret);
+        errdefer {
+            std.crypto.secureZero(u8, secret);
+            self.allocator.free(secret);
+        }
         if (secret.len == 0) return error.InvalidSecret;
         return secret;
     }

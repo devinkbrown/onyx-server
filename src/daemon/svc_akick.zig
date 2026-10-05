@@ -105,6 +105,13 @@ pub const AkickStore = struct {
         return .{ .alloc = alloc, .max_per_channel = max_per_channel };
     }
 
+    /// Restore an empty channel row as well as nonempty lists. An ordinary ADD
+    /// may leave this row behind after a later allocation failure, and purge
+    /// keeps the channel row after removing its last entry.
+    pub fn checkpointEnsureChannel(self: *AkickStore, channel: []const u8) Error!void {
+        _ = try self.ensureChannel(channel);
+    }
+
     pub fn deinit(self: *AkickStore) void {
         var it = self.channels.iterator();
         while (it.next()) |kv| {

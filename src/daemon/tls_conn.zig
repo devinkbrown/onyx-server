@@ -148,6 +148,9 @@ pub const TlsConn = struct {
     /// Optional hardened TLS 1.2 config. When null the listener is 1.3-only and
     /// a non-1.3 ClientHello is rejected with `error.ProtocolVersion`.
     cfg12: ?tls12_server.Config,
+    /// Pins the live OCSP generation while a handshake can still reference it.
+    ocsp_owned13: ?[]u8 = null,
+    ocsp_owned12: ?[]u8 = null,
 
     /// Inbound socket bytes not yet split into a complete record.
     recv_buf: std.ArrayList(u8) = .empty,
@@ -188,6 +191,24 @@ pub const TlsConn = struct {
     /// TLS 1.3-only adapter (back-compatible): the engine is fixed to the TLS 1.3
     /// server and a 1.2 ClientHello is rejected.
     pub fn init(allocator: Allocator, config: tls_server.Config) Error!TlsConn {
+        var owned: ?[]u8 = null;
+        if (config.ocsp_staple.len != 0) owned = try allocator.dupe(u8, config.ocsp_staple);
+        errdefer if (owned) |bytes| allocator.free(bytes);
+        var pinned = config;
+        if (owned) |bytes| pinned.ocsp_staple = bytes;
+        return .{
+            .allocator = allocator,
+            .engine = .{ .tls13 = try tls_server.Server.init(allocator, pinned) },
+            .cfg13 = pinned,
+            .cfg12 = null,
+            .ocsp_owned13 = owned,
+        };
+    }
+
+    /// TLS 1.3-only accept path with a borrowed OCSP staple. The caller must
+    /// keep the staple alive until the handshake finishes or this adapter is
+    /// deinitialized, including across certificate and staple reloads.
+    pub fn initBorrowed(allocator: Allocator, config: tls_server.Config) Error!TlsConn {
         return .{
             .allocator = allocator,
             .engine = .{ .tls13 = try tls_server.Server.init(allocator, config) },
@@ -203,6 +224,34 @@ pub const TlsConn = struct {
         return .{ .allocator = allocator, .engine = .undecided, .cfg13 = cfg13, .cfg12 = cfg12 };
     }
 
+    /// Production dual-version accept path. Each live staple is detached from
+    /// the Server generation before the engine can borrow it.
+    pub fn initDualOwnedStaple(allocator: Allocator, cfg13: tls_server.Config, cfg12: tls12_server.Config) Error!TlsConn {
+        var pinned13 = cfg13;
+        var pinned12 = cfg12;
+        var owned13: ?[]u8 = null;
+        var owned12: ?[]u8 = null;
+        errdefer {
+            if (owned12) |bytes| allocator.free(bytes);
+            if (owned13) |bytes| allocator.free(bytes);
+        }
+        if (cfg13.ocsp_staple.len != 0) {
+            owned13 = try allocator.dupe(u8, cfg13.ocsp_staple);
+            pinned13.ocsp_staple = owned13.?;
+        }
+        if (cfg12.ocsp_staple.len != 0) {
+            if (owned13 != null and cfg12.ocsp_staple.ptr == cfg13.ocsp_staple.ptr and
+                cfg12.ocsp_staple.len == cfg13.ocsp_staple.len)
+            {
+                pinned12.ocsp_staple = owned13.?;
+            } else {
+                owned12 = try allocator.dupe(u8, cfg12.ocsp_staple);
+                pinned12.ocsp_staple = owned12.?;
+            }
+        }
+        return .{ .allocator = allocator, .engine = .undecided, .cfg13 = pinned13, .cfg12 = pinned12, .ocsp_owned13 = owned13, .ocsp_owned12 = owned12 };
+    }
+
     pub fn deinit(self: *TlsConn) void {
         switch (self.engine) {
             .undecided => {},
@@ -215,6 +264,8 @@ pub const TlsConn = struct {
         self.unpublished.deinit(self.allocator);
         self.plain_buf.deinit(self.allocator);
         self.write_buf.deinit(self.allocator);
+        if (self.ocsp_owned12) |bytes| self.allocator.free(bytes);
+        if (self.ocsp_owned13) |bytes| self.allocator.free(bytes);
         self.* = undefined;
     }
 
@@ -632,12 +683,35 @@ pub const TlsConn = struct {
 
     pub fn onInboundWithControlCustody(self: *TlsConn, socket_bytes: []const u8, allow_requested: bool) Error!Outcome {
         if (self.hasPreparedWrite() or self.control_turn_active or self.ktls_rx_offloaded or self.terminal_error != null) return error.BadState;
-        return self.onInboundCandidate(socket_bytes, allow_requested) catch |err| {
+        const outcome = self.onInboundCandidate(socket_bytes, allow_requested) catch |err| {
             self.terminal_error = err;
             self.plain_buf.clearRetainingCapacity();
             if (err == error.TlsAlert) self.discardTerminalOutput();
             return err;
         };
+        self.releaseCompletedOcsp();
+        return outcome;
+    }
+
+    fn releaseCompletedOcsp(self: *TlsConn) void {
+        if (!self.handshakeDone()) return;
+        const borrowed12 = if (self.cfg12) |cfg| cfg.ocsp_staple.len != 0 else false;
+        if (self.cfg13.ocsp_staple.len == 0 and !borrowed12 and
+            self.ocsp_owned13 == null and self.ocsp_owned12 == null) return;
+        // Certificate and CertificateStatus have already been encoded into
+        // owned handshake output. TLS renegotiation is disabled; connected
+        // engines never read these config slices again.
+        self.cfg13.ocsp_staple = &.{};
+        if (self.cfg12) |*cfg| cfg.ocsp_staple = &.{};
+        switch (self.engine) {
+            .undecided => unreachable,
+            .tls13 => |*engine| engine.config.ocsp_staple = &.{},
+            .tls12 => |*engine| engine.config.ocsp_staple = &.{},
+        }
+        if (self.ocsp_owned12) |bytes| self.allocator.free(bytes);
+        if (self.ocsp_owned13) |bytes| self.allocator.free(bytes);
+        self.ocsp_owned12 = null;
+        self.ocsp_owned13 = null;
     }
 
     fn onInboundCandidate(self: *TlsConn, socket_bytes: []const u8, allow_requested: bool) Error!Outcome {
@@ -1004,17 +1078,23 @@ pub const TlsConn = struct {
     /// Any carried partial inbound record is re-buffered so the byte stream
     /// continues exactly where the predecessor stopped.
     pub fn resumeFrom(allocator: Allocator, cfg13: tls_server.Config, cfg12: ?tls12_server.Config, st: ResumeState) Error!TlsConn {
+        // Inherited TLS states are connected and never renegotiate, so they
+        // have no reason to borrow the candidate's mutable staple generation.
+        var connected13 = cfg13;
+        connected13.ocsp_staple = &.{};
+        var connected12 = cfg12;
+        if (connected12) |*cfg| cfg.ocsp_staple = &.{};
         var self = TlsConn{
             .allocator = allocator,
             .engine = .undecided,
-            .cfg13 = cfg13,
-            .cfg12 = cfg12,
+            .cfg13 = connected13,
+            .cfg12 = connected12,
         };
         errdefer self.deinit();
         switch (st.engine) {
-            .tls13 => |s13| self.engine = .{ .tls13 = try tls_server.Server.resumeConnected(allocator, cfg13, s13) },
+            .tls13 => |s13| self.engine = .{ .tls13 = try tls_server.Server.resumeConnected(allocator, connected13, s13) },
             .tls12 => |s12| {
-                const c12 = cfg12 orelse return error.ProtocolVersion;
+                const c12 = connected12 orelse return error.ProtocolVersion;
                 self.engine = .{ .tls12 = try tls12_server.Server.resumeConnected(allocator, c12, s12) };
             },
         }
@@ -2816,6 +2896,79 @@ test "prepared application output TLS1.2 negotiated fragmentation and empty batc
 
 const tls12_client = @import("../crypto/tls12_client.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
+
+test "owned OCSP staples survive source publication and share only aliased generations" {
+    const allocator = std.testing.allocator;
+    var shared = [_]u8{ 1, 2, 3, 4 };
+    var conn = try TlsConn.initDualOwnedStaple(
+        allocator,
+        .{ .cert_chain = &.{}, .ocsp_staple = &shared },
+        .{ .cert_chain = &.{}, .ocsp_staple = &shared },
+    );
+    defer conn.deinit();
+    shared[0] = 9;
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, conn.cfg13.ocsp_staple);
+    try std.testing.expect(conn.cfg13.ocsp_staple.ptr == conn.cfg12.?.ocsp_staple.ptr);
+    try std.testing.expect(conn.ocsp_owned13 != null and conn.ocsp_owned12 == null);
+
+    var other = [_]u8{ 5, 6, 7 };
+    var distinct = try TlsConn.initDualOwnedStaple(
+        allocator,
+        .{ .cert_chain = &.{}, .ocsp_staple = &shared },
+        .{ .cert_chain = &.{}, .ocsp_staple = &other },
+    );
+    defer distinct.deinit();
+    other[0] = 8;
+    try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7 }, distinct.cfg12.?.ocsp_staple);
+    try std.testing.expect(distinct.cfg13.ocsp_staple.ptr != distinct.cfg12.?.ocsp_staple.ptr);
+}
+
+test "borrowed OCSP staple stays live through incomplete handshake and clears on completion" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x6b)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const leaf = try @import("../crypto/x509.zig").parse(der);
+    const staple = try @import("../crypto/ocsp.zig").testSignedOcspResponse(alloc, kp, leaf.serial_der, .good, null);
+    defer alloc.free(staple);
+
+    for (0..2) |variant| {
+        const cfg13 = tls_server.Config{ .cert_chain = &.{der}, .signing_key = kp, .ocsp_staple = staple };
+        var conn = if (variant == 0)
+            try TlsConn.initBorrowed(alloc, cfg13)
+        else
+            TlsConn.initDual(alloc, cfg13, .{ .cert_chain = &.{}, .ocsp_staple = staple });
+        defer conn.deinit();
+        try std.testing.expect(conn.ocsp_owned13 == null and conn.ocsp_owned12 == null);
+        try std.testing.expect(conn.cfg13.ocsp_staple.ptr == staple.ptr);
+        if (conn.cfg12) |cfg| try std.testing.expect(cfg.ocsp_staple.ptr == staple.ptr);
+
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+        defer client.deinit();
+        const ch = try client.start();
+        defer alloc.free(ch);
+        const split = ch.len / 2;
+        const partial = try conn.onInbound(ch[0..split]);
+        try std.testing.expectEqual(@as(usize, 0), partial.handshake_bytes.len);
+        try std.testing.expect(!conn.handshakeDone());
+        try std.testing.expect(conn.cfg13.ocsp_staple.ptr == staple.ptr);
+
+        const flight = try conn.onInbound(ch[split..]);
+        try std.testing.expect(flight.handshake_bytes.len != 0);
+        try std.testing.expect(!conn.handshakeDone());
+        try std.testing.expect(conn.cfg13.ocsp_staple.ptr == staple.ptr);
+        const finished = switch (try client.feed(flight.handshake_bytes)) {
+            .bytes_to_send => |bytes| bytes,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer alloc.free(finished);
+        _ = try conn.onInbound(finished);
+        try std.testing.expect(conn.handshakeDone());
+        try std.testing.expectEqual(@as(usize, 0), conn.cfg13.ocsp_staple.len);
+        if (conn.cfg12) |cfg| try std.testing.expectEqual(@as(usize, 0), cfg.ocsp_staple.len);
+        try std.testing.expectEqual(@as(usize, 0), conn.engine.tls13.config.ocsp_staple.len);
+    }
+}
 
 test "version-dispatch: a TLS 1.3 client completes through a dual TlsConn" {
     const alloc = std.testing.allocator;

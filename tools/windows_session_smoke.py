@@ -12,9 +12,10 @@ and exact per-recipient msgid/time. By default it also cold-restarts the hub B
 and verifies that surviving edge sockets remain live and a new B attachment
 can resume after mesh reconnection.
 
-Windows has no Helix USR2 adoption. A cold restart is not an upgrade and cannot
-prove preservation of sockets or tokens on the restarted process. This fixture
-never labels its hub-restart check as sequential Helix acceptance.
+Windows uses the `UPGRADE` command for guarded native Helix handoff, rather
+than the POSIX USR2 signal. This fixture deliberately cold-restarts the hub:
+that check does not prove preservation of its physical sockets across Helix.
+The separate windows_helix_smoke.py fixture tests sequential process upgrades.
 
 Test-vector node seeds are public; all listeners bind 127.0.0.1. Client account
 passwords are generated per run and are never printed.

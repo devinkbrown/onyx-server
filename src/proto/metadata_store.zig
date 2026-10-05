@@ -239,6 +239,35 @@ pub fn MetadataStore(comptime params: Params) type {
             return self.target_count;
         }
 
+        /// Borrow every retained target, including a zero-key target left by
+        /// an earlier allocation failure. The order is stable for checkpoint
+        /// encoding even though the backing hash map's order is not.
+        pub fn listTargets(self: *const Self, out: [][]const u8) MetadataStoreError![][]const u8 {
+            if (self.target_count > out.len) return error.OUTPUT_TOO_SMALL;
+            var count: usize = 0;
+            var it = self.targets.iterator();
+            while (it.next()) |entry| {
+                if (count == out.len) return error.OUTPUT_TOO_SMALL;
+                out[count] = entry.key_ptr.*;
+                count += 1;
+            }
+            const listed = out[0..count];
+            std.sort.insertion([]const u8, listed, {}, struct {
+                fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.lessThan(u8, lhs, rhs);
+                }
+            }.less);
+            return listed;
+        }
+
+        /// Restore a target with no keys. Such a target is still counted by
+        /// the live store and consumes one capacity slot, so a checkpoint must
+        /// carry it instead of silently dropping it.
+        pub fn ensureTargetForSnapshot(self: *Self, target: []const u8) MetadataStoreError!void {
+            try validateTarget(target);
+            _ = try self.getOrCreateTarget(target);
+        }
+
         pub fn countKeys(self: *const Self, target: []const u8) MetadataStoreError!usize {
             try validateTarget(target);
             const state = self.targets.getPtr(target) orelse return 0;

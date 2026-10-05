@@ -160,6 +160,20 @@ pub const Service = struct {
     pub fn restoreSnapshot(self: *Service, snapshot: *const Snapshot) !void {
         if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0) return error.NotQuiescent;
         try snapshot.validate(self.acme, self.tls);
+        self.publishSnapshot(snapshot);
+    }
+    /// The successor's real worker may be prepared behind the shared Gate
+    /// before HELIX state is decoded. It cannot run until COMMIT releases the
+    /// Gate, so validate on both sides of the parked-owner check and publish
+    /// these scalar fields without allocation.
+    pub fn restoreSnapshotParked(self: *Service, snapshot: *const Snapshot) !void {
+        if (self.thread != null or self.runtime.pause.request_epoch != 0) return error.NotQuiescent;
+        try self.requireParked();
+        try snapshot.validate(self.acme, self.tls);
+        try self.requireParked();
+        self.publishSnapshot(snapshot);
+    }
+    fn publishSnapshot(self: *Service, snapshot: *const Snapshot) void {
         self.next_check_ms = snapshot.next_check_ms;
         self.completed_checks = snapshot.completed_checks;
         self.last_outcome = snapshot.last_outcome;

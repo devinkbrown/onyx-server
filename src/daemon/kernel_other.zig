@@ -5,7 +5,7 @@
 //! FreeBSD limits a listening socket with Capsicum and sets SO_REUSEPORT_LB,
 //! which is not Linux SO_REUSEPORT. OpenBSD unveils a directory list and
 //! pledges the daemon. Windows assigns the process to a job that dies on an
-//! unhandled exception and is killed when the job handle closes. Any other
+//! unhandled exception. A Helix successor inherits that job. Any other
 //! OS, a closed fd, or a kernel status other than success returns MissingOp.
 //! This host does not execute those calls. FreeBSD kernel TLS is
 //! `setsockopt(IPPROTO_TCP, TCP_TXTLS_ENABLE)` with `struct tls_enable`.
@@ -349,6 +349,12 @@ pub fn pledgeInheritedRuntime() Error!void {
 pub fn assignDaemonJob() Error!void {
     if (comptime builtin.os.tag != .windows) return error.MissingOp;
     const windows = std.os.windows;
+    const current: windows.HANDLE = @ptrFromInt(std.math.maxInt(usize));
+    var in_job: i32 = 0;
+    if (IsProcessInJob(current, null, &in_job) == 0) return error.MissingOp;
+    // CreateProcess inherits the predecessor's job chain. Reusing it avoids
+    // nesting one permanent job per successful Helix generation.
+    if (in_job != 0) return;
     var job: windows.HANDLE = undefined;
     const created = NtCreateJobObject(&job, windows.ACCESS_MASK.Specific.JobObject.ALL_ACCESS, null);
     if (created != .SUCCESS) {
@@ -358,13 +364,11 @@ pub fn assignDaemonJob() Error!void {
     // Build 22621 rejects the basic class and the combined flags with
     // STATUS_INVALID_PARAMETER. Try the documented flag sets, then assign
     // even if every limit write is refused: a job with default limits still
-    // contains the process. WinPE often already has the process in a job, and
-    // nesting a fresh job is denied; that existing job is the sandbox.
+    // contains the process. An already contained process returned above,
+    // including a Helix successor and a WinPE process.
     var limits = std.mem.zeroes(JobExtendedLimit);
     const flag_sets = [_]u32{
-        job_limit_die_on_unhandled | job_limit_kill_on_close,
         job_limit_die_on_unhandled,
-        job_limit_kill_on_close,
         0,
     };
     var applied = false;
@@ -379,19 +383,20 @@ pub fn assignDaemonJob() Error!void {
         std.debug.print("onyx-server: job limit flags=0x{x} status=0x{x}\n", .{ flags, @intFromEnum(set) });
     }
     if (!applied) std.debug.print("onyx-server: job limits left at the kernel default\n", .{});
-    const current: windows.HANDLE = @ptrFromInt(std.math.maxInt(usize));
     const assigned = NtAssignProcessToJobObject(job, current);
     if (assigned != .SUCCESS) {
         std.debug.print("onyx-server: NtAssignProcessToJobObject status=0x{x}\n", .{@intFromEnum(assigned)});
         _ = NtClose(job);
-        var in_job: i32 = 0;
-        if (IsProcessInJob(current, null, &in_job) != 0 and in_job != 0) {
+        var raced_in_job: i32 = 0;
+        if (IsProcessInJob(current, null, &raced_in_job) != 0 and raced_in_job != 0) {
             std.debug.print("onyx-server: process is already in a windows job\n", .{});
             return;
         }
         return error.MissingOp;
     }
-    // The job stays open. Closing a kill-on-close job would kill this process.
+    // Keep the job open for process lifetime. Kill-on-close is deliberately
+    // absent: after Helix COMMIT the predecessor exits while its successor
+    // serves the same live sockets.
     return;
 }
 
@@ -530,7 +535,7 @@ test "GAP-X3 FreeBSD Capsicum and SO_REUSEPORT_LB, OpenBSD pledge, and a Windows
         try std.testing.expectEqual(@as(u32, 0), val);
     }
 
-    std.debug.print("GAP-X3 branch=freebsd capsicum and SO_REUSEPORT_LB, openbsd pledge and unveil, windows job kill-on-close; this host did not execute them; windows RIO stays unmet\n", .{});
+    std.debug.print("GAP-X3 branch=freebsd capsicum and SO_REUSEPORT_LB, openbsd pledge and unveil, windows job confinement; this host did not execute them; windows RIO stays unmet\n", .{});
 }
 
 test "GAP-X3 FreeBSD kernel TLS fails closed off FreeBSD" {

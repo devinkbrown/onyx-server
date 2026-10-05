@@ -256,6 +256,45 @@ pub const Bridge = struct {
         };
     }
 
+    /// Exact policy identity for a Windows Helix candidate. Registry order,
+    /// signatures, revocations and disabled names all affect admission, so a
+    /// source/candidate mismatch refuses the checkpoint before COMMIT.
+    pub fn checkpointPolicyDigest(self: *const Bridge) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("onyx-orowasm-helix-policy-v1");
+        policyDigestU64(&hash, self.options.max_plugin_bytes);
+        policyDigestU64(&hash, self.options.max_memory_bytes);
+        policyDigestU64(&hash, self.options.default_fuel);
+        for (abi.all_capabilities) |cap| {
+            const bit = [_]u8{@intFromBool(self.options.allowed_caps.has(cap))};
+            hash.update(&bit);
+        }
+        for (abi.all_intents) |intent| {
+            const bit = [_]u8{@intFromBool(self.options.allowed_intents.has(intent))};
+            hash.update(&bit);
+        }
+        policyDigestU64(&hash, self.options.registry.len);
+        for (self.options.registry) |pin| {
+            policyDigestBytes(&hash, pin.name);
+            hash.update(&pin.blake3);
+            const tier = [_]u8{@intFromEnum(pin.tier)};
+            hash.update(&tier);
+            const pub_present = [_]u8{@intFromBool(pin.publisher != null)};
+            hash.update(&pub_present);
+            if (pin.publisher) |value| hash.update(&value);
+            const sig_present = [_]u8{@intFromBool(pin.signature != null)};
+            hash.update(&sig_present);
+            if (pin.signature) |value| hash.update(&value);
+        }
+        policyDigestU64(&hash, self.options.revoked_hashes.len);
+        for (self.options.revoked_hashes) |value| hash.update(&value);
+        policyDigestU64(&hash, self.options.disabled_plugins.len);
+        for (self.options.disabled_plugins) |name| policyDigestBytes(&hash, name);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+
     pub fn pluginSummary(self: *const Bridge, index: usize) ?PluginSummary {
         if (index >= self.store.plugins.items.len) return null;
         const item = self.store.plugins.items[index];
@@ -366,6 +405,17 @@ pub const Bridge = struct {
         return total;
     }
 };
+
+fn policyDigestU64(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, @intCast(value), .little);
+    hash.update(&bytes);
+}
+
+fn policyDigestBytes(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    policyDigestU64(hash, value.len);
+    hash.update(value);
+}
 
 fn pluginNameMatches(name: []const u8, candidate: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
@@ -745,6 +795,7 @@ const intent_wasm_bytes = [_]u8{
 };
 
 pub const testing = struct {
+    pub const reply_plugin_wasm: []const u8 = &reply_wasm;
     pub const stop_hook_wasm: []const u8 = &stop_hook_wasm_bytes;
 };
 

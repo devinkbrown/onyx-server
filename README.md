@@ -148,9 +148,12 @@ flow, and a full source map.
 Onyx Server targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
 The full daemon also has OpenBSD and native Windows reactors. Windows uses
 IOCP for IRC, TLS, WebSocket, mesh, accounts, and the documented companion
-services. Windows Helix process upgrade remains unavailable; see the
-[Windows build and verification guide](docs/guide/windows.md) for tested
-features and operational limits.
+services. Native Windows Helix supports guarded `UPGRADE` handoff of live TCP
+sessions, mesh links, companion listeners and workers, the private account
+WAL, and idle WebTransport and pristine media UDP listeners. Active QUIC and
+media sessions currently block an upgrade before handoff; see the
+[Windows build and verification guide](docs/guide/windows.md) for the exact
+scope and acceptance checks.
 
 ```sh
 zig build              # build the daemon (and the `armor` crypto CLI) into zig-out/bin

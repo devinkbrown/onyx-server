@@ -140,6 +140,7 @@ const quic_handshake = @import("../proto/quic_handshake.zig");
 const proxy_protocol = @import("../proto/proxy_protocol.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const dualstack_udp = @import("dualstack_udp.zig");
+const windows_udp = @import("helix/native_windows_udp_socket.zig");
 
 pub const MediaSocket = media_socket.MediaSocket;
 pub const DualStackUdpSocket = dualstack_udp.DualStackUdpSocket;
@@ -185,6 +186,10 @@ const proxy_chunk_len: usize = 4096;
 /// Periodic timer tick: how often (in pump iterations of `recv_timeout_ms`) we
 /// run `onTimeout` on every live connection to drive idle/PTO timers.
 const recv_timeout_ms: u32 = 100;
+
+fn lockSpin(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
+}
 
 pub const Error = error{
     AlreadyStarted,
@@ -288,6 +293,9 @@ pub const WebTransportListener = struct {
 
     socket: ?DualStackUdpSocket = null,
     thread: ?std.Thread = null,
+    worker_mutex: std.atomic.Mutex = .unlocked,
+    legacy_joining: bool = false,
+    worker_id: ?std.Thread.Id = null,
     runtime: runtime_pause.WorkerState = .{},
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bound local UDP port (0 until started).
@@ -386,7 +394,9 @@ pub const WebTransportListener = struct {
         self.port = actual_port;
     }
     pub fn prepareInheritedResources(self: *WebTransportListener, io: std.Io) !void {
-        if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
+        lockSpin(&self.worker_mutex);
+        defer self.worker_mutex.unlock();
+        if (self.legacy_joining or self.thread != null or self.worker_id != null or self.runtime.view != null) return error.AlreadyStarted;
         const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
         _ = try socket.capture();
         try self.runtime.pause.bindIo(io);
@@ -396,12 +406,51 @@ pub const WebTransportListener = struct {
     }
     pub fn prepareDormantWorker(self: *WebTransportListener, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
         try self.runtime.validatePreparation(control, view, slot, .webtransport, 0, self, dormant_spawn_options);
-        if (self.thread != null) return error.AlreadyStarted;
+        lockSpin(&self.worker_mutex);
+        defer self.worker_mutex.unlock();
+        if (self.legacy_joining or self.thread != null or self.worker_id != null) return error.AlreadyStarted;
         try self.validatePolicy();
         const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
         _ = try socket.capture();
         self.stop_flag.store(false, .release);
         try self.runtime.prepare(control, view, slot, .webtransport, 0, WebTransportListener, self, pumpLoop, dormant_spawn_options);
+    }
+    /// Start only the already-bound cold owner. The temporary latch retains
+    /// its socket through spawn, and a failed spawn leaves cleanup to the
+    /// caller rather than closing a resource already published for Helix.
+    pub fn startPreparedLegacyWorker(self: *WebTransportListener) !void {
+        lockSpin(&self.worker_mutex);
+        if (self.runtime.view != null or self.legacy_joining or self.thread != null or self.worker_id != null) {
+            self.worker_mutex.unlock();
+            return error.Busy;
+        }
+        if (self.runtime.pause.io == null or self.socket == null) {
+            self.worker_mutex.unlock();
+            return error.NotPrepared;
+        }
+        self.validatePolicy() catch |err| {
+            self.worker_mutex.unlock();
+            return err;
+        };
+        _ = self.socket.?.capture() catch |err| {
+            self.worker_mutex.unlock();
+            return err;
+        };
+        self.legacy_joining = true;
+        self.stop_flag.store(false, .release);
+        self.worker_mutex.unlock();
+        const thread = std.Thread.spawn(dormant_spawn_options, pumpLoop, .{self}) catch |err| {
+            lockSpin(&self.worker_mutex);
+            self.stop_flag.store(true, .release);
+            self.legacy_joining = false;
+            self.worker_mutex.unlock();
+            return err;
+        };
+        lockSpin(&self.worker_mutex);
+        std.debug.assert(self.legacy_joining and self.thread == null);
+        self.thread = thread;
+        self.legacy_joining = false;
+        self.worker_mutex.unlock();
     }
     /// Signals this owner only. Runtime Control owns all actual joins.
     pub fn requestStopAndWake(self: *WebTransportListener) void {
@@ -451,12 +500,27 @@ pub const WebTransportListener = struct {
         try self.runtime.pause.resumePaused(token);
     }
     pub fn capturePaused(self: *WebTransportListener, token: runtime_pause.Token) !Snapshot {
-        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        lockSpin(&self.worker_mutex);
+        const running = self.thread != null or self.runtime.view != null;
+        self.worker_mutex.unlock();
+        if (!running) return error.NotRunning;
         try self.runtime.pause.requirePaused(token);
         return self.captureIdle(.paused);
     }
+    /// Publish a new serving certificate only while the pump is parked and no
+    /// QUIC connection can still borrow the previous generation. The caller
+    /// keeps replacement storage alive for this listener's full lifetime.
+    pub fn replaceTlsPausedIdle(self: *WebTransportListener, token: runtime_pause.Token, replacement: TlsConfig) !void {
+        try self.runtime.pause.requirePaused(token);
+        try validateTls(replacement);
+        var prior = try self.captureIdle(.paused);
+        defer prior.deinit();
+        self.tls = replacement;
+    }
     pub fn captureUnstarted(self: *WebTransportListener) !Snapshot {
-        if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
+        lockSpin(&self.worker_mutex);
+        defer self.worker_mutex.unlock();
+        if (self.legacy_joining or self.thread != null or self.worker_id != null or self.runtime.view != null) return error.NotQuiescent;
         return self.captureIdle(.unstarted);
     }
     // All pump-owned state is read at actual arrival; configured callback/TLS
@@ -484,8 +548,23 @@ pub const WebTransportListener = struct {
             return err;
         };
         const socket = try DualStackUdpSocket.initInherited(fd, ipv4_fd, &carry.socket);
+        return initRestored(allocator, tls, socket, carry);
+    }
+
+    /// Consume one authenticated Windows UDP duplicate and restore the idle
+    /// QUIC owner without binding or starting its worker. The socket import
+    /// checks the source handle and complete endpoint before owner publication.
+    pub fn initTransferred(allocator: std.mem.Allocator, tls: TlsConfig, transfer: *windows_udp.Transfer, carry: *const Snapshot) !WebTransportListener {
+        const socket = try DualStackUdpSocket.initTransferred(transfer, &carry.socket);
+        return initRestored(allocator, tls, socket, carry);
+    }
+
+    fn initRestored(allocator: std.mem.Allocator, tls: TlsConfig, socket: DualStackUdpSocket, carry: *const Snapshot) !WebTransportListener {
+        var held = socket;
+        errdefer held.deinit();
+        try carry.validate(tls);
         var owner = init(allocator, tls, carry.irc_port);
-        owner.socket = socket;
+        owner.socket = held;
         owner.port = carry.socket.primary.port;
         owner.send_proxy_header = carry.send_proxy_header;
         owner.echo_wt_datagrams = carry.echo_wt_datagrams;
@@ -505,16 +584,26 @@ pub const WebTransportListener = struct {
     /// Signal the pump to stop, join it, and close the UDP socket. Idempotent.
     pub fn shutdown(self: *WebTransportListener) void {
         self.runtime.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
-        self.stop_flag.store(true, .release);
-        self.runtime.wakeForStop();
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
+        lockSpin(&self.worker_mutex);
+        if (self.legacy_joining or self.worker_id == std.Thread.getCurrentId()) {
+            self.worker_mutex.unlock();
+            @panic("WebTransport worker must finish spawn or be joined from another thread");
         }
+        self.legacy_joining = true;
+        self.stop_flag.store(true, .release);
+        const thread = self.thread;
+        self.thread = null;
+        self.worker_mutex.unlock();
+        self.runtime.wakeForStop();
+        if (thread) |t| t.join();
+        lockSpin(&self.worker_mutex);
+        defer self.worker_mutex.unlock();
+        std.debug.assert(self.worker_id == null);
         if (self.socket) |*s| {
             s.deinit();
             self.socket = null;
         }
+        self.legacy_joining = false;
     }
 
     // -----------------------------------------------------------------------
@@ -522,6 +611,14 @@ pub const WebTransportListener = struct {
     // -----------------------------------------------------------------------
 
     fn pumpLoop(self: *WebTransportListener) void {
+        lockSpin(&self.worker_mutex);
+        self.worker_id = std.Thread.getCurrentId();
+        self.worker_mutex.unlock();
+        defer {
+            lockSpin(&self.worker_mutex);
+            self.worker_id = null;
+            self.worker_mutex.unlock();
+        }
         self.runtime.markEntered();
         defer self.runtime.markExited();
         var buf: [recv_buf_len]u8 = undefined;
@@ -2739,6 +2836,86 @@ fn hashTlsValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) !void {
         },
         else => try runtime_pause.hashConfigValue(hash, value),
     }
+}
+
+test "Windows WebTransport cold legacy worker pauses and captures its bound UDP owner" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var keys: TestServerKeys = undefined;
+    try keys.init();
+    const tls: TlsConfig = .{ .cert_chain = &keys.cert_chain, .signing_key = .{ .ed25519 = keys.kp } };
+    var owner = WebTransportListener.init(testing.allocator, tls, 6667);
+    defer owner.deinit();
+    try testing.expectError(error.NotPrepared, owner.startPreparedLegacyWorker());
+    try owner.prepareColdResources(testing.io, .any, 0);
+    const source_fd = owner.socket.?.fd;
+    const source_port = owner.port;
+    try owner.startPreparedLegacyWorker();
+    try testing.expectError(error.Busy, owner.startPreparedLegacyWorker());
+    const token = try owner.requestPause(1);
+    try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    var carry = try owner.capturePaused(token);
+    defer carry.deinit();
+    try testing.expectEqual(Execution.paused, carry.execution);
+    try testing.expectEqual(@as(u64, @intCast(source_fd)), carry.socket.primary.device);
+    try testing.expectEqual(source_port, carry.socket.primary.port);
+    try testing.expect(carry.retry_secret != null);
+    try owner.resumePaused(token);
+    owner.shutdown();
+    try testing.expect(owner.thread == null and owner.worker_id == null and !owner.legacy_joining and owner.socket == null);
+}
+
+test "Windows Helix WebTransport imports idle QUIC owner and parks inherited worker" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var keys: TestServerKeys = undefined;
+    try keys.init();
+    const tls: TlsConfig = .{ .cert_chain = &keys.cert_chain, .signing_key = .{ .ed25519 = keys.kp } };
+    var source = WebTransportListener.init(testing.allocator, tls, 6667);
+    defer source.deinit();
+    source.retry_policy = .always;
+    source.send_proxy_header = true;
+    try source.prepareColdResources(testing.io, .loopback_v6, 0);
+    source.scid_counter = 18;
+    source.reset_tokens = 3.5;
+    var carry = try source.captureUnstarted();
+    defer carry.deinit();
+    const source_fd = source.socket.?.fd;
+
+    var transfer = try windows_udp.duplicateForProcess(source_fd, std.os.windows.GetCurrentProcessId());
+    var successor = try WebTransportListener.initTransferred(testing.allocator, tls, &transfer, &carry);
+    defer successor.deinit();
+    try testing.expect(transfer.consumed);
+    try testing.expect(successor.socket.?.fd != source_fd);
+    try testing.expectEqual(carry.socket.primary.port, successor.port);
+    var restored = try successor.captureUnstarted();
+    defer restored.deinit();
+    try testing.expectEqualDeep(carry.retry_secret, restored.retry_secret);
+    try testing.expectEqualDeep(carry.token_replay, restored.token_replay);
+    try testing.expectEqual(carry.scid_counter, restored.scid_counter);
+    try testing.expectEqual(carry.reset_tokens, restored.reset_tokens);
+    try testing.expectEqualDeep(carry.socket, try source.socket.?.capture());
+
+    try successor.prepareInheritedResources(testing.io);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .webtransport, .instance = 0, .owner_identity = &successor }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    defer {
+        successor.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        successor.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    try successor.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.webtransport, 0, &successor));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    const expected: Policy = .{ .irc_port = 6667, .send_proxy_header = true, .echo_wt_datagrams = false, .max_connections = default_max_connections, .retry_policy = .always, .retry_load_threshold = default_retry_load_threshold, .reset_rate_per_s = default_reset_rate_per_s, .reset_burst = default_reset_burst };
+    try successor.requirePreparedConfiguration(tls, expected);
+    try testing.expect(!successor.runtime.entered.load(.acquire));
+
+    var invalid = carry;
+    defer invalid.deinit();
+    invalid.tls_digest[0] ^= 1;
+    var rejected = try windows_udp.duplicateForProcess(source_fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.ConfigMismatch, WebTransportListener.initTransferred(testing.allocator, tls, &rejected, &invalid));
+    try testing.expect(rejected.consumed);
+    try testing.expectEqualDeep(carry.socket, try source.socket.?.capture());
 }
 
 test "companion runtime webtransport real pump preserves Retry replay reset state and active guard" {

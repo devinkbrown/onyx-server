@@ -193,9 +193,7 @@ pub const ChannelResv = struct {
     }
 
     fn validateReservation(self: *const ChannelResv, reservation: Reservation) ResvError!void {
-        try validatePatternWithLimit(reservation.pattern, self.params.max_pattern);
-        if (reservation.reason.len > self.params.max_reason) return error.ReasonTooLong;
-        if (reservation.set_by.len > self.params.max_setter) return error.SetterTooLong;
+        try validateStoredEntry(self.params, reservation);
     }
 
     fn clone(self: *ChannelResv, reservation: Reservation) std.mem.Allocator.Error!Reservation {
@@ -220,6 +218,14 @@ pub const ChannelResv = struct {
         return null;
     }
 };
+
+/// Validate a stored row against the exact limits of its owning registry.
+/// Helix uses this before sealing and before allocating a detached replacement.
+pub fn validateStoredEntry(params: Params, reservation: Reservation) ResvError!void {
+    try validatePatternWithLimit(reservation.pattern, params.max_pattern);
+    if (reservation.reason.len > params.max_reason) return error.ReasonTooLong;
+    if (reservation.set_by.len > params.max_setter) return error.SetterTooLong;
+}
 
 /// Parse a real server command and its parameters. Use `RESV` for add/list/sweep
 /// and `UNRESV` for removal. `duration-ms` is converted to absolute expiry with

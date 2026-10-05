@@ -119,6 +119,28 @@ jobs:
         run: python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native reusable-session and cold-reconnect smoke
         run: python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix sequential upgrade smoke
+        run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix TLS and WSS upgrade smoke
+        run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix generated TLS and WSS upgrade smoke
+        run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
+      - name: Run guarded native Windows Helix metrics upgrade smoke
+        run: python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix webhook upgrade smoke
+        run: python -B .\tools\windows_helix_webhook_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix secured mesh upgrade smoke
+        run: python -B .\tools\windows_helix_mesh_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix OroWasm upgrade smoke
+        run: python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix Web Push upgrade smoke
+        run: python -B .\tools\windows_webpush_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix geo policy upgrade smoke
+        run: python -B .\tools\windows_geo_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix mail upgrade smoke
+        run: python -B .\tools\windows_mail_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded native Windows Helix account flow upgrade smoke
+        run: python -B .\tools\windows_account_flow_helix_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native three-shard plaintext TLS and WSS fanout smoke
         run: python -B .\tools\windows_multishard_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run private backup publication and restore smoke
@@ -137,12 +159,18 @@ jobs:
         run: python -B .\tools\windows_geo_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native WebTransport browser IRC smoke
         run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native WebTransport two-swap Helix browser smoke
+        run: python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native generated-certificate WebTransport Helix browser smoke
+        run: python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --generated
       - name: Run native WebTransport browser to IPv6 IRC bind smoke
         run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --ipv6-irc
       - name: Run native WebTransport browser to specific IPv4 IRC bind smoke
         run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --irc-host 127.0.0.2
       - name: Run native media signaling and UDP forwarding smoke
         run: python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native media two-swap Helix UDP smoke
+        run: python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run configured Windows security and listener failure smoke
         run: python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 

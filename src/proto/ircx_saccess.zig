@@ -233,6 +233,12 @@ pub const ServerAccessStore = struct {
         return out[0..count];
     }
 
+    /// Borrow one row in its physical match order for an exact Helix seal.
+    pub fn snapshotAt(self: *const ServerAccessStore, index: usize) ?Entry {
+        if (index >= self.entries.items.len) return null;
+        return self.entries.items[index].view();
+    }
+
     pub fn matchHostmask(self: *const ServerAccessStore, entry_type: EntryType, hostmask: []const u8) ?Entry {
         for (self.entries.items) |*entry| {
             if (entry.entry_type != entry_type) continue;
@@ -478,6 +484,11 @@ fn parseReasonWith(comptime limits: Params, raw: []const u8) SaccessError![]cons
     const reason = if (raw.len > 0 and raw[0] == ':') raw[1..] else raw;
     try validateReasonWith(limits, reason);
     return reason;
+}
+
+/// Apply the same invariants to a decoded checkpoint row as to `add`.
+pub fn validateStoredEntry(entry: Entry) SaccessError!void {
+    try validateEntryWith(.{}, entry);
 }
 
 fn validateEntryWith(comptime limits: Params, entry: Entry) SaccessError!void {

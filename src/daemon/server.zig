@@ -183,6 +183,38 @@ const backoff = @import("../substrate/backoff.zig");
 const geoip = @import("../substrate/geoip.zig");
 const geo_services = @import("geo_services.zig");
 const rdns = @import("rdns.zig");
+const native_windows_rdns = @import("helix/native_windows_rdns.zig");
+const native_windows_dnsbl = @import("helix/native_windows_dnsbl.zig");
+const slowmode_checkpoint = @import("helix/slowmode_checkpoint.zig");
+const metadata_checkpoint = @import("helix/metadata_checkpoint.zig");
+const mlock_checkpoint = @import("helix/mlock_checkpoint.zig");
+const drain_checkpoint = @import("helix/drain_checkpoint.zig");
+const chanstats_checkpoint = @import("helix/chanstats_checkpoint.zig");
+const access_checkpoint = @import("helix/access_checkpoint.zig");
+const saccess_checkpoint = @import("helix/saccess_checkpoint.zig");
+const akick_checkpoint = @import("helix/akick_checkpoint.zig");
+const ward_checkpoint = @import("helix/ward_checkpoint.zig");
+const resv_jupe_checkpoint = @import("helix/resv_jupe_checkpoint.zig");
+const native_windows_webpush = @import("helix/native_windows_webpush.zig");
+const native_windows_geo = @import("helix/native_windows_geo.zig");
+const native_windows_mail = @import("helix/native_windows_mail.zig");
+const native_windows_acme = @import("helix/native_windows_acme.zig");
+const native_windows_tls_material = @import("helix/native_windows_tls_material.zig");
+const native_windows_tls_proof = @import("helix/native_windows_tls_proof.zig");
+const native_windows_wasm = @import("helix/native_windows_wasm.zig");
+const policy_checkpoint = @import("helix/policy_checkpoint.zig");
+const native_windows_operator_state = @import("helix/native_windows_operator_state.zig");
+const native_windows_account_flow = @import("helix/native_windows_account_flow.zig");
+const native_windows_ocsp = @import("helix/native_windows_ocsp.zig");
+const native_windows_ocsp_state = @import("helix/native_windows_ocsp_state.zig");
+const native_windows_user_settings = @import("helix/native_windows_user_settings.zig");
+const native_windows_memo_state = @import("helix/native_windows_memo_state.zig");
+const gag_checkpoint = @import("helix/gag_checkpoint.zig");
+const shun_checkpoint = @import("helix/shun_checkpoint.zig");
+const account_abuse_checkpoint = @import("helix/account_abuse_checkpoint.zig");
+const content_filter_checkpoint = @import("helix/content_filter_checkpoint.zig");
+const reputation_checkpoint = @import("helix/reputation_checkpoint.zig");
+const spamtrap_checkpoint = @import("helix/spamtrap_checkpoint.zig");
 const dnsbl_resolver = @import("dnsbl_resolver.zig");
 const mail_sender = @import("mail_sender.zig");
 const news_sources = @import("../proto/news_sources.zig");
@@ -219,6 +251,8 @@ const simulcast_select = @import("../substrate/simulcast_select.zig");
 const helix_capsule = @import("helix/capsule.zig");
 const helix_handoff = @import("helix/handoff.zig");
 const helix_live = @import("helix/live.zig");
+const helix_native_windows_socket = @import("helix/native_windows_socket.zig");
+const helix_native_windows_udp_socket = @import("helix/native_windows_udp_socket.zig");
 const handoff_relations = @import("helix/handoff_relations.zig");
 const handoff_manifest = @import("helix/handoff_manifest.zig");
 const world_checkpoint = @import("helix/world_checkpoint.zig");
@@ -986,12 +1020,68 @@ pub const ListenerDescriptor = struct {
 
 /// Borrowed only for the duration of transferAndCommit, while every socket
 /// owner is quiescent and World remains locked at the authoritative seal.
+pub const NativeWindowsMetricsCarry = struct {
+    owner: *metrics_http.MetricsServer,
+    carry: *const metrics_http.Snapshot,
+};
+
+pub const NativeWindowsWebhookCarry = struct {
+    owner: *webhook_http.WebhookServer,
+    carry: *const webhook_http.Snapshot,
+    pause_token: webhook_http.runtime_pause.Token,
+};
+
+pub const NativeWindowsHistoryCarry = struct {
+    owner: *history_http.HttpsListener,
+    carry: *const history_http.Snapshot,
+    pause_token: history_http.runtime_pause.Token,
+};
+
+pub const NativeWindowsWebTransportCarry = struct {
+    owner: *managed_wt.WebTransportListener,
+    carry: *const managed_wt.Snapshot,
+    pause_token: ?@import("runtime_pause.zig").Token = null,
+};
+
+pub const NativeWindowsWebrtcMediaCarry = struct {
+    owner: *media_plane_mod.MediaPlane,
+    carry: *const media_plane_mod.Snapshot,
+    pause_token: ?@import("runtime_pause.zig").Token = null,
+};
+
+pub const NativeWindowsNativeMediaCarry = struct {
+    owner: *native_media_mod.NativeMediaTransport,
+    carry: *const native_media_mod.Snapshot,
+    pause_token: ?@import("runtime_pause.zig").Token = null,
+};
+
+pub const NativeWindowsUdpCarry = struct {
+    webtransport: ?NativeWindowsWebTransportCarry = null,
+    webrtc_media: ?NativeWindowsWebrtcMediaCarry = null,
+    native_media: ?NativeWindowsNativeMediaCarry = null,
+    /// The exact original graph jointly authenticates both media snapshots.
+    media_domain: ?*media_routing.Domain = null,
+};
+
 pub const NativeUpgradeSnapshot = struct {
     pieces: []const helix_live.StatePiece,
     state_fds: []const linux.fd_t,
     listeners: []const ListenerDescriptor,
     epoch: u64,
     now_ms: i64,
+    /// Windows-only live source authority. Absent after any partial REHASH.
+    windows_source_digest: ?[32]u8 = null,
+    /// Borrowed exact private WAL owner; the native leaf duplicates its held
+    /// HANDLE into the verified candidate before authenticated READY.
+    windows_account_store: ?*services_mod.OroStore = null,
+    /// Paused listener and exact exposition image, owned through COMMIT.
+    windows_metrics: ?NativeWindowsMetricsCarry = null,
+    /// Parked HTTP producer and exact bound listener, owned through COMMIT.
+    windows_webhook: ?NativeWindowsWebhookCarry = null,
+    /// Parked loopback HTTPS history listener, owned through COMMIT.
+    windows_history: ?NativeWindowsHistoryCarry = null,
+    /// Exact paused UDP listeners and secrets, borrowed through COMMIT.
+    windows_udp: NativeWindowsUdpCarry = .{},
 };
 
 pub const NativeUpgradeHooks = struct {
@@ -1823,6 +1913,16 @@ pub const Config = struct {
     /// every enabled role/family/shard; no missing row is replaced by a bind.
     native_listener_manifest: []const ListenerDescriptor = &.{},
     native_upgrade_hooks: ?NativeUpgradeHooks = null,
+    /// Exact Windows boot source and ordered config indirection commitment.
+    /// This is populated only after a successful single config-file read.
+    windows_helix_source_digest: ?[32]u8 = null,
+    /// Auto-created node keyfiles are outside the boot-source commitment.
+    windows_helix_explicit_node_secret: bool = false,
+    /// A per-boot cloak key would change accepted host masks at handoff.
+    windows_helix_explicit_cloak_secret: bool = false,
+    /// External trust/key material consulted by background companions is not
+    /// part of the current exact native handoff transcript.
+    windows_helix_external_companions_safe: bool = false,
     /// Authenticated decrypted arena, borrowed from the native process owner.
     /// It stays in memory and never passes through Linux memfd readArena.
     native_arena_bytes: ?[]const u8 = null,
@@ -3873,12 +3973,7 @@ fn twoPersonIdentity(conn: *const ConnState) []const u8 {
 
 const PolicyKind = enum { ward, filter, class, ban };
 
-const PolicyBanRow = struct {
-    channel: []u8,
-    mask: []u8,
-    setter: []u8,
-    set_at: i64,
-};
+const PolicyBanRow = policy_checkpoint.BanRow;
 
 /// One undo step. `generation` is the number that was live before the change.
 const PolicyUndo = union(PolicyKind) {
@@ -3963,9 +4058,24 @@ const webpush_overflow_delivery_slots: usize = 8;
 
 const RuntimePhase = enum(u8) { idle, resources, workers, published, joined };
 
+const RetiredTlsGeneration = struct {
+    primary: ?tls_certs.Loaded = null,
+    side: ?tls_certs.Tls12 = null,
+
+    fn deinit(self: *RetiredTlsGeneration, allocator: std.mem.Allocator) void {
+        if (self.primary) |*loaded| loaded.deinit(allocator);
+        if (self.side) |*loaded| loaded.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    /// REHASH can leave effective settings different from the boot source.
+    /// Windows native process handoff may use the source proof only while this
+    /// remains true; a future exact live-policy proof can reauthorize it.
+    windows_helix_source_valid: std.atomic.Value(bool) = .init(false),
     owned_disabled_features: ?[][]const u8 = null,
     /// Process-wide TLS 1.3 resumption key. Generated once at daemon init when
     /// resumption is enabled, then copied into every per-connection TLS config so
@@ -4279,6 +4389,7 @@ pub const LinuxServer = struct {
     /// known public snapshot instead of mistaking an empty projection for a
     /// deleted room.
     chanstats_prune_ready_ms: i64 = 0,
+    inherited_chanstats_restored: bool = false,
     /// Throttle stamp for periodic local backup sets (reactor 0).
     backup_last_write_ms: i64 = 0,
     /// Failed attempts retry soon without logging or compacting on every timer tick.
@@ -4430,6 +4541,24 @@ pub const LinuxServer = struct {
     /// Started in `start()` when `config.metrics_port != 0`, joined in `deinit()`.
     /// On hot-upgrade it is torn down and re-created on the new process.
     metrics_server: ?metrics_http.MetricsServer = null,
+    /// Strictly increasing token source for repeated Windows metrics pauses.
+    windows_metrics_pause_epoch: u64 = 0,
+    /// Strictly increasing token source for repeated Windows webhook pauses.
+    windows_webhook_pause_epoch: u64 = 0,
+    windows_history_pause_epoch: u64 = 0,
+    windows_webtransport_pause_epoch: u64 = 0,
+    windows_webrtc_media_pause_epoch: u64 = 0,
+    windows_native_media_pause_epoch: u64 = 0,
+    /// MAIN owns this optional external listener at a stable address. It is
+    /// registered before serving and cleared only after reactor joins.
+    windows_webtransport_owner: ?*managed_wt.WebTransportListener = null,
+    windows_rdns_pause_epoch: u64 = 0,
+    windows_dnsbl_pause_epoch: u64 = 0,
+    windows_webpush_pause_epoch: u64 = 0,
+    windows_geo_pause_epoch: u64 = 0,
+    windows_mail_pause_epoch: u64 = 0,
+    windows_ocsp_pause_epoch: u64 = 0,
+    windows_acme_pause_epoch: u64 = 0,
     /// Loopback TLS listener for GET /history. Joined in deinit.
     history_https: ?history_http.HttpsListener = null,
     /// Discord-compatible incoming webhook bindings (id → channel). Shared
@@ -4440,6 +4569,9 @@ pub const LinuxServer = struct {
     /// replaced the fresh boot store. `startWebhook` must then preserve that
     /// exact image instead of appending the potentially stale disk snapshot.
     inherited_webhook_store_restored: bool = false,
+    /// A carried grant checkpoint, including revocation tombstones, is the
+    /// authoritative successor image. Never re-mint stale TSV rows over it.
+    inherited_oper_grants_restored: bool = false,
     /// Validated, sanitised webhook posts handed from the HTTP listener thread to
     /// reactor 0, which fans each into its bound channel on-thread. Lock-free MPMC.
     webhook_posts: webhook_mod.PostQueue = webhook_mod.PostQueue.init(),
@@ -4619,6 +4751,9 @@ pub const LinuxServer = struct {
     media_bridges_mu: std.atomic.Mutex = .unlocked,
     /// Memo: per-account offline messages, delivered on next login.
     memo: memo_mod.MemoBox,
+    /// An accepted in-memory memo is ahead of its durable image after a failed
+    /// append/snapshot. Windows Helix must not restore that older image.
+    memo_durable_dirty: bool = false,
     /// Memo forward chains: an account may auto-forward its incoming memos to
     /// another account (hop/cycle-bounded). In-memory, matching the memo store itself.
     memo_forward: svc_memo_forward.MemoForwardStore,
@@ -4650,22 +4785,18 @@ pub const LinuxServer = struct {
     /// reloaded 1.3 leaf is neither ECDSA-P256 nor RSA (so the 1.2 leg needs its
     /// own ECDSA-P256 leaf). Same ownership/lifetime rules as `reload_tls`.
     reload_tls12: ?tls_certs.Tls12 = null,
-    /// The PREVIOUS reload generation, kept alive for one extra swap cycle so a
-    /// TLS handshake that captured a cert-chain slice at accept time cannot read
-    /// freed bytes if a reload commits mid-handshake (the superseded generation
-    /// is freed only on the *next* reload — reloads are cadenced in hours/days,
-    /// handshakes complete in milliseconds, so no live handshake can reference a
-    /// generation two reloads old). Freed on the next reload and on deinit.
-    /// Boundary: this buys safety across exactly ONE reload; correctness relies on
-    /// handshake lifetime ≪ reload cadence (true given ACME/REHASH ≫ handshake +
-    /// idle-reap). A handshake straddling two reloads is not covered — not
-    /// reachable in practice.
+    /// The immediately superseded generation remains available to TLS engines
+    /// that copied its config at accept. Older generations remain in the list
+    /// below until no incomplete handshake borrows their chain or RSA key.
     reload_tls_prev: ?tls_certs.Loaded = null,
     reload_tls12_prev: ?tls_certs.Tls12 = null,
+    reload_tls_retired: std.ArrayList(RetiredTlsGeneration) = .empty,
     /// Cross-thread ACME signal: the renewal worker sets this only after writing
     /// new cert/key files. Reactor 0 consumes it on the housekeeping tick and
     /// performs the actual live TLS reload, so ACME never mutates listener state.
     acme_reload_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    acme_reload_retry_after_ms: i64 = 0,
+    acme_worker: ?*@import("acme_renewal.zig").Service = null,
     /// Boot-time `[tls]` view used for ACME-triggered reloads. Changing `[tls]`
     /// paths through live REHASH while ACME is enabled is intentionally unsupported;
     /// REHASH still uses `reload_parsed` for its own operator-requested reload.
@@ -4675,6 +4806,9 @@ pub const LinuxServer = struct {
     /// consumes it on the housekeeping tick (`maybeSwapOcspStaple`) and swaps the
     /// live `config.tls_ocsp_staple`, so the worker never touches listener state.
     ocsp_staple_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// A live TLS reload changed the serving leaf and cleared its staple.
+    /// The worker consumes this signal to refresh against the new leaf.
+    ocsp_staple_rejected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Worker→reactor-0 handoff slot for the next staple DER (server-owned).
     /// Guarded by `ocsp_staple_lock` because the fetch worker writes it off the
     /// reactor thread. Non-null only between `publishOcspStaple` and the reactor
@@ -4682,14 +4816,20 @@ pub const LinuxServer = struct {
     ocsp_staple_incoming: ?[]u8 = null,
     ocsp_staple_lock: std.atomic.Mutex = .unlocked,
     /// The live staple generation `config.tls_ocsp_staple` borrows. Reactor 0 owns
-    /// it; on a new publish it becomes `ocsp_staple_prev` (freed one cycle later)
-    /// so an in-flight handshake that captured the staple slice can't read freed
-    /// bytes. Freed on deinit. Null until the first staple is published.
+    /// it; on a new publish it becomes `ocsp_staple_prev`. Incomplete handshakes
+    /// borrow its immutable bytes until they finish or close.
     ocsp_staple_owned: ?[]u8 = null,
-    /// The previous staple generation, retained one extra swap cycle for the same
-    /// cross-completion reason as `reload_tls_prev`. Freed on the next swap and on
-    /// deinit.
+    /// Exclusive wall-clock deadline of the active, validated OCSP response.
+    /// Config construction checks it without repeating signature work for
+    /// every unauthenticated socket; maintenance clears the stale active view.
+    ocsp_staple_valid_until_unix: i64 = 0,
+    /// A delegated responder certificate can expire before nextUpdate. Recheck
+    /// the full signer and CertID once per wall-clock second while serving.
+    ocsp_staple_validated_at_unix: i64 = std.math.minInt(i64),
+    /// The previous staple generation, retained through the next swap. If an
+    /// unfinished handshake still borrows it, it moves to the retired list.
     ocsp_staple_prev: ?[]u8 = null,
+    ocsp_staple_retired: std.ArrayList([]u8) = .empty,
     /// Monotonically increasing seed fed to S2sLink.feed for deterministic gossip
     /// rng. (The S2S/TLS listener fds, accept-armed flags, and the cross-reactor
     /// wake eventfd now live on `reactor`.)
@@ -4752,6 +4892,7 @@ pub const LinuxServer = struct {
     ocg2_runtime_terminal_logged: bool = false,
     /// Web Push delivery worker (borrowed; owned by main; null = disabled).
     webpush_worker: ?*webpush_mod.Worker = null,
+    ocsp_worker: ?*managed_ocsp.Service = null,
     /// Accepted downstream outputs remain here until source fanout and every
     /// configured HTTP destination returns a real 2xx response.
     webpush_overflow_deliveries: [webpush_overflow_delivery_slots]?WebpushOverflowDelivery = @splat(null),
@@ -5288,6 +5429,7 @@ pub const LinuxServer = struct {
             .runtime_inherited_image = config.resume_arena_fd != null or config.native_arena_bytes != null or config.inherited_state_fd_manifest_present,
             .allocator = allocator,
             .config = config,
+            .windows_helix_source_valid = .init(config.windows_helix_source_digest != null),
             .owned_disabled_features = runtime_features.owned_disabled_features,
             .wasm = wasm_bridge.Bridge.initWithOptions(allocator, .{
                 .max_plugin_bytes = config.wasm_max_plugin_bytes,
@@ -5486,7 +5628,8 @@ pub const LinuxServer = struct {
                 .max_per_account = self.config.session_max_per_account,
             });
         }
-        // Restore mesh display OCG1 grants persisted by a previous run.
+        // Restore cold-boot grants only. An inherited exact checkpoint already
+        // includes revocation tombstones and its mint high-water mark.
         self.loadGrants();
         // Restore per-channel statistics persisted by a previous run so they
         // survive a restart or USR2 hot-upgrade.
@@ -5494,10 +5637,10 @@ pub const LinuxServer = struct {
         // Restore the Event Spine history ring (EVENT REPLAY) the same way.
         self.restoreEventHistoryAtStart();
         if (self.config.media_enabled) {
-            self.startMediaRoutingLegacy() catch |err| {
+            if (self.media_routing_owner == null) self.startMediaRoutingLegacy() catch |err| {
                 srvLog("onyx-server: media routing disabled ({s})\n", .{@errorName(err)});
             };
-        } else {
+        } else if (self.media_routing_owner == null) {
             // WS call membership is independent of UDP configuration. This
             // owns actual empty typed sources, not a fake UDP readiness row.
             self.prepareMediaRoutingOwner() catch |err| {
@@ -5515,14 +5658,21 @@ pub const LinuxServer = struct {
         if (comptime builtin.os.tag != .windows) return error.Unsupported;
         self.start();
         if (self.config.media_enabled and
-            (self.media_routing_owner == null or self.native_media.thread == null or self.media_plane.thread == null))
+            (self.media_routing_owner == null or
+                (self.native_media.thread == null and self.native_media.runtime.view == null) or
+                (self.media_plane.thread == null and self.media_plane.runtime.view == null)))
             return error.MediaStartupFailed;
         if (self.config.metrics_port != 0 and
-            (self.metrics_server == null or self.metrics_server.?.thread == null))
+            (self.metrics_server == null or
+                (self.metrics_server.?.thread == null and self.metrics_server.?.runtime.view == null)))
             return error.MetricsStartupFailed;
         if (self.config.webhook_enabled and
-            (self.webhook_server == null or self.webhook_server.?.thread == null))
+            (self.webhook_server == null or
+                (self.webhook_server.?.thread == null and self.webhook_server.?.runtime.view == null)))
             return error.WebhookStartupFailed;
+        if (self.history_https != null and
+            self.history_https.?.thread == null and self.history_https.?.runtime_worker.view == null)
+            return error.HistoryStartupFailed;
     }
 
     /// Actual source resources have been prepared at this final Server address.
@@ -5918,6 +6068,8 @@ pub const LinuxServer = struct {
     /// exposition text instead of an empty body.
     fn startMetrics(self: *LinuxServer) void {
         if (self.config.metrics_port == 0) return;
+        // A native successor has already imported and parked this exact owner.
+        if (self.metrics_server != null) return;
         self.refreshMetricsSnapshot();
         self.metrics_server = metrics_http.MetricsServer.initWithConfig(
             &self.metrics_snapshot,
@@ -5927,6 +6079,14 @@ pub const LinuxServer = struct {
             srvLog("onyx-server: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
             return;
         };
+        if (comptime builtin.os.tag == .windows) {
+            self.metrics_server.?.prepareColdResources(self.config.crypto_io orelse @panic("Windows metrics requires configured I/O")) catch |e| {
+                srvLog("onyx-server: /metrics endpoint disabled ({s})\n", .{@errorName(e)});
+                self.metrics_server.?.shutdown();
+                self.metrics_server = null;
+                return;
+            };
+        }
         // Spawn on the stored field so the accept loop's `self` pointer is stable
         // for the listener thread's lifetime.
         self.metrics_server.?.spawn() catch |e| {
@@ -6177,6 +6337,9 @@ pub const LinuxServer = struct {
         // (matching the IRC listener). When disabled this is a no-op and the
         // daemon is byte-identical to a build without the feature.
         if (!self.config.webhook_enabled) return;
+        // The Windows Helix candidate has already adopted the exact store and
+        // bound listener. Its worker remains parked until COMMIT.
+        if (self.webhook_server != null) return;
         if (self.config.webhook_store_path.len == 0) {
             srvLog("onyx-server: webhook endpoint has no [webhook] store_path — bindings will NOT survive a restart or USR2 upgrade\n", .{});
         }
@@ -6197,6 +6360,14 @@ pub const LinuxServer = struct {
             srvLog("onyx-server: webhook endpoint disabled ({s})\n", .{@errorName(e)});
             return;
         };
+        if (comptime builtin.os.tag == .windows) {
+            self.webhook_server.?.prepareColdResources(self.config.crypto_io orelse @panic("Windows webhook requires configured I/O")) catch |e| {
+                srvLog("onyx-server: webhook endpoint disabled ({s})\n", .{@errorName(e)});
+                self.webhook_server.?.shutdown();
+                self.webhook_server = null;
+                return;
+            };
+        }
         self.webhook_server.?.spawn() catch |e| {
             srvLog("onyx-server: webhook endpoint disabled ({s})\n", .{@errorName(e)});
             self.webhook_server.?.shutdown();
@@ -6204,6 +6375,33 @@ pub const LinuxServer = struct {
             return;
         };
         srvLog("onyx-server: webhook endpoint on TCP :{d}\n", .{self.webhook_server.?.port});
+    }
+
+    /// Construct the Windows successor's inert webhook owner at the final
+    /// Server address. The authenticated transfer owns the listener socket;
+    /// the mandatory checkpoint has already restored the binding/rate store.
+    pub fn stageWindowsInheritedWebhook(self: *LinuxServer, transfer: *helix_native_windows_socket.Transfer, carry: *const webhook_http.Snapshot, io: std.Io) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (!self.config.webhook_enabled or self.webhook_server != null) return error.InvalidRuntime;
+        const sink = webhook_mod.PostSink{ .ctx = self, .submit = webhookSubmit };
+        self.webhook_server = try webhook_http.WebhookServer.initTransferred(
+            &self.webhook_store,
+            sink,
+            transfer,
+            carry,
+            .{
+                .bind_addr = self.config.webhook_bind_addr,
+                .handler = .{
+                    .max_body = self.config.webhook_max_body,
+                    .rate = self.webhookRate(),
+                },
+            },
+        );
+        errdefer {
+            self.webhook_server.?.shutdown();
+            self.webhook_server = null;
+        }
+        try self.webhook_server.?.prepareColdResources(io);
     }
 
     /// `PostSink` callback: enqueue a validated post for reactor 0 and nudge it.
@@ -6967,6 +7165,7 @@ pub const LinuxServer = struct {
     /// abort the handshake (close 1006, "opening handshake was canceled"), which
     /// silently breaks every browser client. See startAcceptedWs.
     fn tls13Config(self: *LinuxServer, request_client_cert: bool) tls_server.Config {
+        self.retireExpiredActiveOcspStaple();
         var cfg = tls_server.Config{
             .cert_chain = self.config.tls_cert_chain,
             .signing_key = self.config.tls_signing_key,
@@ -6977,7 +7176,10 @@ pub const LinuxServer = struct {
             .ech_keys = self.config.tls_ech_keys,
             .enable_raw_public_key = self.config.tls_raw_public_key,
         };
-        if (self.config.tls_ocsp_staple) |staple| cfg.ocsp_staple = staple;
+        if (self.config.tls_ocsp_staple) |staple| {
+            if (@divFloor(platform.realtimeMillis(), 1000) < self.ocsp_staple_valid_until_unix)
+                cfg.ocsp_staple = staple;
+        }
         if (self.config.tls_enable_resumption) {
             cfg.enable_session_tickets = true;
             cfg.ticket_key = self.tls_ticket_key;
@@ -6996,6 +7198,7 @@ pub const LinuxServer = struct {
     /// When resumption is off these fields stay at their defaults and the 1.2
     /// engine behaves exactly as before (full handshakes only).
     fn tls12Config(self: *LinuxServer) tls12_server.Config {
+        self.retireExpiredActiveOcspStaple();
         var cfg = tls12_server.Config{
             .cert_chain = self.config.tls12_cert_chain,
             .ecdsa_p256_signing_key = self.config.tls12_signing_key,
@@ -7007,7 +7210,8 @@ pub const LinuxServer = struct {
         // minted ECDSA 1.2 leaf whose serial the staple does not cover, so it must
         // not be stapled (design §6 signing-key independence).
         if (self.config.tls_ocsp_staple) |staple| {
-            if (self.config.tls12_cert_chain.len != 0 and self.config.tls_cert_chain.len != 0 and
+            if (@divFloor(platform.realtimeMillis(), 1000) < self.ocsp_staple_valid_until_unix and
+                self.config.tls12_cert_chain.len != 0 and self.config.tls_cert_chain.len != 0 and
                 self.config.tls12_cert_chain[0].ptr == self.config.tls_cert_chain[0].ptr)
                 cfg.ocsp_staple = staple;
         }
@@ -7037,8 +7241,115 @@ pub const LinuxServer = struct {
             self.history_https.?.shutdown();
             self.history_https = null;
         }
+        try self.history_https.?.prepareColdResources(self.config.crypto_io orelse return error.MissingCryptoIo);
         try self.history_https.?.spawn();
         return self.history_https.?.port;
+    }
+
+    /// Build the Windows successor's history HTTPS owner at its final Server
+    /// address. HXHH authenticates the loopback endpoint and TLS policy before
+    /// this one-use socket import; the worker stays parked until COMMIT.
+    pub fn stageWindowsInheritedHistory(self: *LinuxServer, transfer: *helix_native_windows_socket.Transfer, carry: *const history_http.Snapshot, tls_config: tls_server.Config, io: std.Io) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (self.history_https != null) return error.InvalidRuntime;
+        const configured = if (carry.listener.family == 23) "::1" else "127.0.0.1";
+        self.history_https = try history_http.HttpsListener.initTransferred(
+            self.allocator,
+            configured,
+            transfer,
+            carry,
+            tls_config,
+            .{ .ptr = self, .readFn = historyHttpsRead },
+        );
+        errdefer {
+            self.history_https.?.shutdown();
+            self.history_https = null;
+        }
+        try self.history_https.?.prepareColdResources(io);
+    }
+
+    pub fn setWindowsWebTransportOwner(self: *LinuxServer, owner: ?*managed_wt.WebTransportListener) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (owner) |candidate| {
+            if (self.config.webtransport_port == 0 or candidate.port != self.config.webtransport_port or
+                self.windows_webtransport_owner != null) return error.ConfiguredOwnerMismatch;
+            self.windows_webtransport_owner = candidate;
+        } else {
+            self.windows_webtransport_owner = null;
+        }
+    }
+
+    /// Restore the exact two UDP media owners before the Windows Gate is
+    /// created. Both sockets and pump-owned idle secrets come from the
+    /// authenticated HXUD handoff; neither owner binds a replacement port or
+    /// starts a worker here. Any later failure aborts the inert candidate.
+    pub fn stageWindowsInheritedMedia(
+        self: *LinuxServer,
+        webrtc_transfer: *helix_native_windows_udp_socket.Transfer,
+        webrtc_carry: *const media_plane_mod.Snapshot,
+        native_transfer: *helix_native_windows_udp_socket.Transfer,
+        native_carry: *const native_media_mod.Snapshot,
+        io: std.Io,
+    ) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (!self.config.media_enabled or self.media_routing_owner != null or
+            self.media_plane.socket != null or self.native_media.socket != null or
+            self.media_plane.thread != null or self.native_media.thread != null)
+            return error.InvalidRuntime;
+        const stun_server: ?media_plane_mod.TransportAddress = if (self.config.media_stun_port == 0) null else blk: {
+            const ip4 = parseIp4(self.config.media_stun_host) orelse return error.InvalidMediaStunAddress;
+            break :blk try media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port);
+        };
+        try webrtc_carry.validateConfiguration(.{
+            .max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram))),
+            .max_upload_bytes = self.config.media_max_upload_bytes,
+            .stun_server = stun_server,
+            .dtls_requested = self.config.media_dtls_srtp,
+            .dtls13_requested = self.config.media_dtls13,
+            .cross_configured = true,
+        });
+        if (!native_carry.mac_key_configured) return error.ConfiguredOwnerMismatch;
+        try native_carry.validateConfiguration(.{
+            .max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, native_media_mod.max_datagram))),
+            .max_upload_bytes = self.config.media_max_upload_bytes,
+            .max_participants = @min(self.config.media_max_participants, native_media_mod.max_call_participants),
+            .require_mac = self.config.native_media_require_mac,
+            .mac_stream_key = native_carry.mac_stream_key,
+            .mac_key_configured = true,
+            .cross_configured = true,
+        });
+        if ((self.config.media_port != 0 and self.config.media_port != webrtc_carry.socket.port) or
+            (self.config.native_media_port != 0 and self.config.native_media_port != native_carry.socket.port))
+            return error.ConfiguredOwnerMismatch;
+        var native = try native_media_mod.NativeMediaTransport.initTransferred(self.allocator, native_transfer, native_carry, .{
+            .ctx = self,
+            .on_native_frame = bridgeOnNativeFrame,
+            .on_native_feedback = bridgeOnNativeFeedback,
+        });
+        errdefer native.deinit();
+        var webrtc = try media_plane_mod.MediaPlane.initTransferred(self.allocator, webrtc_transfer, webrtc_carry, .{
+            .ctx = self,
+            .on_rtp_frame = bridgeOnRtpFrame,
+            .on_rtcp_feedback = bridgeOnRtcpFeedback,
+        });
+        errdefer webrtc.deinit();
+        try native.prepareInheritedResources(io);
+        try webrtc.prepareInheritedResources(io);
+        self.native_media.deinit();
+        self.media_plane.deinit();
+        self.native_stream_key = native_carry.mac_stream_key;
+        self.native_media = native;
+        self.media_plane = webrtc;
+    }
+
+    /// Rebuild the empty graph/FIFO at the final Server address. The active
+    /// routing state has no HXUD checkpoint and remains a source-side blocker.
+    pub fn prepareWindowsInheritedMediaRouting(self: *LinuxServer) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (!self.config.media_enabled or self.media_routing_owner != null or
+            self.native_media.socket == null or self.media_plane.socket == null)
+            return error.InvalidRuntime;
+        try self.prepareMediaRoutingOwner();
     }
 
     fn historyHttpsRead(ptr: *anyopaque, account: []const u8, target: []const u8, out: []u8) error{Denied}!usize {
@@ -7279,9 +7590,13 @@ pub const LinuxServer = struct {
         if (self.reload_tls12) |*t| t.deinit(self.allocator);
         if (self.reload_tls_prev) |*t| t.deinit(self.allocator);
         if (self.reload_tls12_prev) |*t| t.deinit(self.allocator);
-        // Free the live + retained-previous + not-yet-consumed OCSP staple gens.
+        for (self.reload_tls_retired.items) |*retired| retired.deinit(self.allocator);
+        self.reload_tls_retired.deinit(self.allocator);
+        // Free all server-owned OCSP generations after the connection tables.
         if (self.ocsp_staple_owned) |owned| self.allocator.free(owned);
         if (self.ocsp_staple_prev) |prev| self.allocator.free(prev);
+        for (self.ocsp_staple_retired.items) |retired| self.allocator.free(retired);
+        self.ocsp_staple_retired.deinit(self.allocator);
         if (self.ocsp_staple_incoming) |incoming| self.allocator.free(incoming);
         self.read_markers.deinit();
         self.deinitReadMarkerFacts(&self.read_marker_facts);
@@ -7692,6 +8007,10 @@ pub const LinuxServer = struct {
         }
         if (self.isMaintenanceReactor()) self.maybeReloadAcmeTls();
         if (self.isMaintenanceReactor()) self.maybeSwapOcspStaple();
+        if (self.isMaintenanceReactor() and self.reload_tls_retired.items.len != 0)
+            self.pruneRetiredTlsGenerations();
+        if (self.isMaintenanceReactor() and self.ocsp_staple_retired.items.len != 0)
+            self.pruneRetiredOcspStaples();
         self.retryFailedSessionHandoffs();
         if (comptime builtin.os.tag == .windows) self.retryWindowsClosingIo();
         self.sweepTimeouts();
@@ -9214,7 +9533,58 @@ pub const LinuxServer = struct {
             self.runtimePreparationFailed(run, err);
             return;
         };
-        const expected = if (self.reactors.len == 1) 0 else self.reactors.len;
+        const reactor_workers = if (self.reactors.len == 1) 0 else self.reactors.len;
+        const metrics_owner: ?*metrics_http.MetricsServer = if (self.metrics_server) |*owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const webhook_owner: ?*webhook_http.WebhookServer = if (self.webhook_server) |*owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const history_owner: ?*history_http.HttpsListener = if (self.history_https) |*owner|
+            if (owner.runtime_worker.view == self.runtime_gate) owner else null
+        else
+            null;
+        const webtransport_owner: ?*managed_wt.WebTransportListener = if (self.windows_webtransport_owner) |owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const native_media_owner: ?*native_media_mod.NativeMediaTransport = if (self.native_media.runtime.view == self.runtime_gate) &self.native_media else null;
+        const webrtc_media_owner: ?*media_plane_mod.MediaPlane = if (self.media_plane.runtime.view == self.runtime_gate) &self.media_plane else null;
+        const rdns_owner: ?*rdns.Resolver = if (self.config.rdns) |owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const dnsbl_owner: ?*dnsbl_resolver.Resolver = if (self.config.dnsbl) |owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const webpush_owner: ?*webpush_mod.Worker = if (self.webpush_worker) |owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const geo_owner: ?*geo_services.Service = if (self.geo.runtime.view == self.runtime_gate) self.geo else null;
+        const mail_owner: ?*mail_sender.Sender = if (self.config.mail_sender) |owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const acme_owner: ?*@import("acme_renewal.zig").Service = if (self.acme_worker) |owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const ocsp_owner: ?*managed_ocsp.Service = if (self.ocsp_worker) |owner|
+            if (owner.runtime.view == self.runtime_gate) owner else null
+        else
+            null;
+        const expected = reactor_workers + @intFromBool(metrics_owner != null) +
+            @intFromBool(webhook_owner != null) + @intFromBool(rdns_owner != null) +
+            @intFromBool(dnsbl_owner != null) + @intFromBool(history_owner != null) +
+            @intFromBool(webtransport_owner != null) + @intFromBool(native_media_owner != null) +
+            @intFromBool(webrtc_media_owner != null) +
+            @intFromBool(webpush_owner != null) + @intFromBool(geo_owner != null) +
+            @intFromBool(mail_owner != null) + @intFromBool(acme_owner != null) +
+            @intFromBool(ocsp_owner != null);
         if (self.runtime_gate.?.inspect().expected != expected) {
             self.runtimePreparationFailed(run, error.InvalidRuntime);
             return;
@@ -9222,7 +9592,28 @@ pub const LinuxServer = struct {
         if (self.reactors.len == 1) {
             current_reactor = &self.reactors[0];
             self.runLoopResilient(run);
+        } else if (metrics_owner != null or webhook_owner != null or history_owner != null or webtransport_owner != null or native_media_owner != null or webrtc_media_owner != null or rdns_owner != null or dnsbl_owner != null or webpush_owner != null or geo_owner != null or mail_owner != null or acme_owner != null or ocsp_owner != null) {
+            // Retained companions must not keep joinAll blocked after the
+            // reactor fleet exits. Join the reactor rows first, then signal
+            // the companion workers and join their exact Gate-owned handles.
+            for (0..reactor_workers) |index| {
+                const slot = self.runtime_gate.?.slot(.reactor, @intCast(index), self) catch @panic("missing Windows reactor slot");
+                control.joinParticipant(slot) catch @panic("Windows reactor slot join failed");
+            }
         }
+        if (metrics_owner) |owner| owner.requestStopAndWake();
+        if (webhook_owner) |owner| owner.requestStopAndWake();
+        if (history_owner) |owner| owner.requestStopAndWake();
+        if (webtransport_owner) |owner| owner.requestStopAndWake();
+        if (native_media_owner) |owner| owner.requestStopAndWake();
+        if (webrtc_media_owner) |owner| owner.requestStopAndWake();
+        if (rdns_owner) |owner| owner.requestStopAndWake();
+        if (dnsbl_owner) |owner| owner.requestStopAndWake();
+        if (webpush_owner) |owner| owner.requestStopAndWake();
+        if (geo_owner) |owner| owner.requestStopAndWake();
+        if (mail_owner) |owner| owner.requestStopAndWake();
+        if (acme_owner) |owner| owner.requestStopAndWake();
+        if (ocsp_owner) |owner| owner.requestStopAndWake();
         control.joinAll();
         self.detachRuntimeAfterJoined() catch @panic("runtime returned before actual owner joins");
         self.runtime_phase.store(.joined, .release);
@@ -10381,7 +10772,7 @@ pub const LinuxServer = struct {
         if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
             tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, self.tls12Config());
         } else {
-            tls.* = tls_conn.TlsConn.init(self.allocator, tls_cfg) catch {
+            tls.* = tls_conn.TlsConn.initBorrowed(self.allocator, tls_cfg) catch {
                 self.allocator.destroy(tls);
                 self.noteClientRefusedBeforeLive(conn);
                 closeFd(conn.fd);
@@ -10426,7 +10817,7 @@ pub const LinuxServer = struct {
             if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
                 tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, self.tls12Config());
             } else {
-                tls.* = tls_conn.TlsConn.init(self.allocator, tls_cfg) catch {
+                tls.* = tls_conn.TlsConn.initBorrowed(self.allocator, tls_cfg) catch {
                     self.allocator.destroy(tls);
                     conn.ws = null;
                     self.allocator.destroy(ws);
@@ -21186,19 +21577,6 @@ pub const LinuxServer = struct {
             }
         }
 
-        // Channel RESV: a services-reserved channel name refuses entry for
-        // non-opers (blocks both creation and join). Opers bypass.
-        if (!conn.session.isOper()) {
-            if (self.chan_resv.match(channel, self.nowMs())) |resv| {
-                if (!quiet) try queueNumeric(conn, .ERR_UNAVAILRESOURCE, &.{channel}, resv.reason);
-                return true;
-            }
-        } else if (active_override) {
-            if (self.chan_resv.match(channel, self.nowMs()) != null) {
-                self.auditOverrideUse(conn, "JOIN", channel, "bypassed channel RESV");
-            }
-        }
-
         var mask_buf: [256]u8 = undefined;
         const mask = try clientPrefix(conn, &mask_buf);
         // Extended-ban context (account/realname/channels + host glob fallthrough).
@@ -21383,10 +21761,23 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_UNAVAILRESOURCE, &.{channel}, serverAccessReason(entry, "Channel blocked by SACCESS"));
             return;
         }
+        const wid = worldIdFromClient(id);
+        // Channel RESV applies before the existing-channel mode gates. A
+        // reserved name must be refused when its first member would create it
+        // as well as when a later client tries to join it.
+        const active_override = overrideActive(conn);
+        if (!self.world.isMember(channel, wid)) {
+            if (self.chan_resv.match(channel, self.nowMs())) |resv| {
+                if (!conn.session.isOper()) {
+                    try queueNumeric(conn, .ERR_UNAVAILRESOURCE, &.{channel}, resv.reason);
+                    return;
+                }
+                if (active_override) self.auditOverrideUse(conn, "JOIN", channel, "bypassed channel RESV");
+            }
+        }
 
         // Enforce channel modes only when joining an EXISTING channel as a new
-        // member. Creating a fresh channel (founder path) bypasses all gates.
-        const wid = worldIdFromClient(id);
+        // member. Creating a fresh channel (founder path) bypasses channel-mode gates.
         // CHANLIMIT: cap how many channels a non-oper may be in. Only a NEW join
         // counts; re-JOIN of a channel already joined is a no-op and exempt. The
         // connection class may override the global limit (`max_channels`, 0 =
@@ -21402,7 +21793,6 @@ pub const LinuxServer = struct {
         var fwd_buf: [80]u8 = undefined;
         var join_target = channel;
         var clone_parent: ?[]const u8 = null;
-        const active_override = overrideActive(conn);
         if (self.world.channelExists(channel) and !self.world.isMember(channel, wid)) {
             const invited = self.world.hasInvite(channel, wid);
             // +f forward: when refused, redirect to the forward target (one hop).
@@ -24625,6 +25015,7 @@ pub const LinuxServer = struct {
         const n = try self.memo.send(account, from, text, now_ms);
         if (self.account_services) |svc| {
             memo_durable.append(svc.store, account, from, text, now_ms) catch |err| {
+                self.memo_durable_dirty = true;
                 srvLog("onyx-server: memo durable append failed ({s})\n", .{@errorName(err)});
             };
         }
@@ -24634,9 +25025,13 @@ pub const LinuxServer = struct {
     fn clearOfflineMemo(self: *LinuxServer, account: []const u8) usize {
         const n = self.memo.clear(account);
         if (self.account_services) |svc| {
+            var synced = true;
             memo_durable.replaceAll(svc.store, &self.memo) catch |err| {
+                synced = false;
+                self.memo_durable_dirty = true;
                 srvLog("onyx-server: memo durable snapshot failed ({s})\n", .{@errorName(err)});
             };
+            if (synced) self.memo_durable_dirty = false;
         }
         return n;
     }
@@ -25834,9 +26229,13 @@ pub const LinuxServer = struct {
         if (removed_history) self.snapshotDurableHistory();
         if (removed_memos != 0) {
             if (self.account_services) |svc| {
+                var synced = true;
                 memo_durable.replaceAll(svc.store, &self.memo) catch |err| {
+                    synced = false;
+                    self.memo_durable_dirty = true;
                     srvLog("onyx-server: memo durable snapshot failed ({s})\n", .{@errorName(err)});
                 };
+                if (synced) self.memo_durable_dirty = false;
             }
         }
     }
@@ -29078,6 +29477,12 @@ pub const LinuxServer = struct {
             // connected-client guarantee.
             counts.clients_expected += 1;
             if (!e.value.session.registered()) continue;
+            // An open draft/multiline batch owns accepted chunks that are not
+            // part of the session capsule. Refuse the whole upgrade until the
+            // batch closes, instead of losing its prefix after COMMIT.
+            if (e.value.multiline != null) continue;
+            var flood_carry: ?flood_guard.CarryState = null;
+            if (e.value.flood_guard) |*guard| flood_carry = guard.exportCarry() catch continue;
             // A carried client's socket fd is the exact join key for every
             // transport and per-client sidecar. Synthetic/half-constructed
             // entries with no live descriptor make the seal incomplete; never
@@ -29142,6 +29547,23 @@ pub const LinuxServer = struct {
             }
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
+            // AcceptEx does not reliably expose the peer sockaddr on an
+            // imported socket. Preserve the already-authenticated kernel or
+            // trusted PROXY address and its exact clone-limit accounting.
+            snap.peer_addr = e.value.peer_addr;
+            snap.clone_counted = e.value.clone_counted;
+            snap.throttle_counted = e.value.throttle_counted;
+            snap.mesh_clone_counted = e.value.mesh_clone_counted;
+            snap.mesh_clone_hash = e.value.mesh_clone_hash;
+            // Preserve attachment-scoped access and client feature decisions.
+            // SACCESS GAG is not necessarily present in the durable gag table.
+            snap.gagged = e.value.gagged;
+            snap.ircx = e.value.ircx;
+            snap.unfurl_opt_in = e.value.unfurl_opt_in;
+            snap.last_search_ms = e.value.last_search_ms;
+            snap.keytrans_require = e.value.keytrans_require;
+            snap.nick_claimed_at_ms = e.value.nick_claimed_at_ms;
+            snap.flood_guard = flood_carry;
             // Record whether this connection was secured (had a live TLS engine).
             // The successor uses it as the fail-safe join: a secured client that
             // arrives without a decodable TLS-engine capsule is DROPPED, never
@@ -29399,6 +29821,21 @@ pub const LinuxServer = struct {
             defer hooks.abort(hooks.ctx);
             return self.performUpgradeAfterCompatibleTarget(request, -1, exe_target);
         }
+        if (comptime builtin.os.tag == .windows) {
+            const hooks = self.config.native_upgrade_hooks orelse return error.NativeUpgradeUnavailable;
+            const exe_target = self.config.exe_path orelse return error.NativeUpgradeUnavailable;
+            if (!self.windows_helix_source_valid.load(.acquire) or self.config.windows_helix_source_digest == null or
+                self.config.config_path == null or !self.config.windows_helix_explicit_node_secret or
+                !self.config.windows_helix_explicit_cloak_secret or
+                !self.config.windows_helix_external_companions_safe)
+            {
+                self.deferredUpgradeNotice(request, "UPGRADE refused: Windows config or external material has no exact source proof");
+                return error.NativeUpgradeUnavailable;
+            }
+            try hooks.begin(hooks.ctx, exe_target);
+            defer hooks.abort(hooks.ctx);
+            return self.performUpgradeAfterCompatibleTarget(request, -1, exe_target);
+        }
         if (comptime builtin.os.tag != .linux) {
             self.deferredUpgradeNotice(request, "UPGRADE is unavailable on this target");
             return;
@@ -29425,6 +29862,7 @@ pub const LinuxServer = struct {
     }
 
     const UpgradeContinuityBlocker = enum {
+        windows_memo_authority,
         session_drop_transaction,
         relay_v2_deferred,
         webpush_overflow_delivery,
@@ -29441,6 +29879,10 @@ pub const LinuxServer = struct {
     /// mutation boundary for MediaRooms/signaling. Transport predicates take
     /// their own pump locks; bridge values are inspected under their owner lock.
     fn upgradeContinuityBlockerLocked(self: *LinuxServer) ?UpgradeContinuityBlocker {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.memo_durable_dirty or (self.account_services == null and self.memo.boxes.count() != 0))
+                return .windows_memo_authority;
+        }
         // DROP reservations are RAM-only two-owner latches. Refuse rather than
         // serializing a half-committed identity transfer into the successor.
         if (self.session_drop_journal.activeCount() != 0) return .session_drop_transaction;
@@ -29448,11 +29890,20 @@ pub const LinuxServer = struct {
         // RVG2. Until it has a Helix capsule, exec must never discard it.
         if (self.relay_v2_deferred_len != 0) return .relay_v2_deferred;
         if (self.hasRetainedWebpushOverflow()) return .webpush_overflow_delivery;
-        if (self.config.webtransport_port != 0) return .webtransport_listener;
-        if (self.acme_reload_tls != null) return .acme_companion;
+        if (self.config.webtransport_port != 0 and
+            (builtin.os.tag != .windows or self.windows_webtransport_owner == null))
+            return .webtransport_listener;
+        if (self.acme_reload_tls != null and (builtin.os.tag != .windows or self.acme_worker == null))
+            return .acme_companion;
         if (!self.media_rooms.upgradeContinuityReady()) return .media_rooms;
-        if (!self.media_plane.upgradeContinuityReady()) return .media_plane;
-        if (!self.native_media.upgradeContinuityReady()) return .native_media;
+        // Windows seals a configured, strictly pristine media Domain with its
+        // two paused UDP owners at the native transfer cut below. The ordinary
+        // owner predicates reject every routing binding, including that safe
+        // initial graph; the Domain proof is authoritative for this one case.
+        if (builtin.os.tag != .windows or !self.config.media_enabled) {
+            if (!self.media_plane.upgradeContinuityReady()) return .media_plane;
+            if (!self.native_media.upgradeContinuityReady()) return .native_media;
+        }
         lockSpin(&self.media_bridges_mu);
         defer self.media_bridges_mu.unlock();
         var bridges = self.media_bridges.valueIterator();
@@ -29464,6 +29915,7 @@ pub const LinuxServer = struct {
 
     fn upgradeContinuityBlockerName(blocker: UpgradeContinuityBlocker) []const u8 {
         return switch (blocker) {
+            .windows_memo_authority => "Windows memo policy or unsynced memo",
             .session_drop_transaction => "SESSION DROP transaction",
             .relay_v2_deferred => "deferred MESSAGE_V2 authority",
             .webpush_overflow_delivery => "accepted Webpush overflow delivery",
@@ -29488,17 +29940,246 @@ pub const LinuxServer = struct {
         exe_target: []const u8,
     ) !void {
 
-        // Stop and join the only off-reactor producer before socket-owner
-        // quiescence. Its retained listener keeps the port/backlog stable if the
-        // upgrade later refuses; failure unwind resumes the same listener.
-        var webhook_paused = false;
-        lockSpin(&self.webhook_lifecycle_gate);
-        if (self.webhook_server) |*ws| {
-            self.webhook_upgrade_pause_active.store(true, .release);
-            ws.pause();
-            webhook_paused = true;
+        // The metrics listener is a separate socket owner. Park its accept
+        // loop at an operation boundary before freezing reactors and World;
+        // rollback resumes the same bound listener and retained snapshot.
+        var windows_metrics_pause: ?metrics_http.runtime_pause.Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_metrics_pause) |token| {
+                if (self.metrics_server) |*owner| owner.resumePaused(token) catch @panic("Windows metrics pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.metrics_server) |*owner| {
+                const epoch = std.math.add(u64, self.windows_metrics_pause_epoch, 1) catch return error.InvalidRuntime;
+                const token = try owner.requestPause(epoch);
+                self.windows_metrics_pause_epoch = epoch;
+                windows_metrics_pause = token;
+                const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+            }
         }
-        self.webhook_lifecycle_gate.unlock();
+
+        // A Windows webhook worker parks after finishing the complete current
+        // request. This works for both cold-boot and Gate-managed successors,
+        // preserving the same bound listener through sequential upgrades.
+        var windows_webhook_pause: ?webhook_http.runtime_pause.Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_webhook_pause) |token| {
+                if (self.webhook_server) |*owner| owner.resumePaused(token) catch @panic("Windows webhook pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.webhook_server) |*owner| {
+                const epoch = std.math.add(u64, self.windows_webhook_pause_epoch, 1) catch return error.InvalidRuntime;
+                const token = try owner.requestPause(epoch);
+                self.windows_webhook_pause_epoch = epoch;
+                windows_webhook_pause = token;
+                const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+            }
+        }
+
+        var windows_history_pause: ?history_http.runtime_pause.Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_history_pause) |token| {
+                if (self.history_https) |*owner| owner.resumePaused(token) catch @panic("Windows history HTTPS pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.history_https) |*owner| {
+                const epoch = std.math.add(u64, self.windows_history_pause_epoch, 1) catch return error.InvalidRuntime;
+                const token = try owner.requestPause(epoch);
+                self.windows_history_pause_epoch = epoch;
+                windows_history_pause = token;
+                const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+            }
+        }
+
+        var windows_webtransport_pause: ?@import("runtime_pause.zig").Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_webtransport_pause) |token| {
+                if (self.windows_webtransport_owner) |owner| owner.resumePaused(token) catch @panic("Windows WebTransport pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.windows_webtransport_owner) |owner| {
+                if (owner.thread != null or owner.runtime.view != null) {
+                    const epoch = std.math.add(u64, self.windows_webtransport_pause_epoch, 1) catch return error.InvalidRuntime;
+                    const token = try owner.requestPause(epoch);
+                    self.windows_webtransport_pause_epoch = epoch;
+                    windows_webtransport_pause = token;
+                    const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                    try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+                }
+            }
+        }
+
+        var windows_native_media_pause: ?@import("runtime_pause.zig").Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_native_media_pause) |token|
+                self.native_media.resumePaused(token) catch @panic("Windows native media pause could not resume");
+        };
+        var windows_webrtc_media_pause: ?@import("runtime_pause.zig").Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_webrtc_media_pause) |token|
+                self.media_plane.resumePaused(token) catch @panic("Windows WebRTC media pause could not resume");
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.media_enabled) {
+                const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) });
+                const native_epoch = std.math.add(u64, self.windows_native_media_pause_epoch, 1) catch return error.InvalidRuntime;
+                const native_token = try self.native_media.requestPause(native_epoch);
+                self.windows_native_media_pause_epoch = native_epoch;
+                windows_native_media_pause = native_token;
+                try self.native_media.awaitPaused(native_token, deadline);
+                const webrtc_epoch = std.math.add(u64, self.windows_webrtc_media_pause_epoch, 1) catch return error.InvalidRuntime;
+                const webrtc_token = try self.media_plane.requestPause(webrtc_epoch);
+                self.windows_webrtc_media_pause_epoch = webrtc_epoch;
+                windows_webrtc_media_pause = webrtc_token;
+                try self.media_plane.awaitPaused(webrtc_token, deadline);
+            }
+        }
+
+        // Reverse DNS has a separate worker and queued FCrDNS jobs. Park it
+        // before the reactor cut, then freeze producers only after all accepted
+        // socket work has drained so no accepted client loses its lookup.
+        var windows_rdns_pause: ?rdns.runtime_pause.Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_rdns_pause) |token| {
+                if (self.config.rdns) |owner| owner.resumePaused(token) catch @panic("Windows rDNS pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            const owner = self.config.rdns orelse return error.InvalidRuntime;
+            if (owner.thread != null or owner.runtime.view != null) {
+                const epoch = std.math.add(u64, self.windows_rdns_pause_epoch, 1) catch return error.InvalidRuntime;
+                const token = try owner.requestPause(epoch);
+                self.windows_rdns_pause_epoch = epoch;
+                windows_rdns_pause = token;
+                const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+            }
+        }
+        var windows_dnsbl_pause: ?dnsbl_resolver.runtime_pause.Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_dnsbl_pause) |token| {
+                if (self.config.dnsbl) |owner| owner.resumePaused(token) catch @panic("Windows DNSBL pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.dnsbl) |owner| {
+                if (owner.thread != null or owner.runtime.view != null) {
+                    const epoch = std.math.add(u64, self.windows_dnsbl_pause_epoch, 1) catch return error.InvalidRuntime;
+                    const token = try owner.requestPause(epoch);
+                    self.windows_dnsbl_pause_epoch = epoch;
+                    windows_dnsbl_pause = token;
+                    const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                    try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+                }
+            }
+        }
+        var windows_webpush_pause: ?webpush_mod.runtime_pause.Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_webpush_pause) |token| {
+                if (self.webpush_worker) |owner| owner.resumePaused(token) catch @panic("Windows Web Push pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.webpush_worker) |owner| {
+                if (owner.thread != null or owner.runtime.view != null) {
+                    const epoch = std.math.add(u64, self.windows_webpush_pause_epoch, 1) catch return error.InvalidRuntime;
+                    const token = try owner.requestPause(epoch);
+                    self.windows_webpush_pause_epoch = epoch;
+                    windows_webpush_pause = token;
+                    const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                    try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+                }
+            }
+        }
+        var windows_geo_pause: ?geo_services.runtime_pause.Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_geo_pause) |token| self.geo.resumePaused(token) catch @panic("Windows Geo pause could not resume");
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.geo.thread != null or self.geo.runtime.view != null) {
+                const epoch = std.math.add(u64, self.windows_geo_pause_epoch, 1) catch return error.InvalidRuntime;
+                const token = try self.geo.requestPause(epoch);
+                self.windows_geo_pause_epoch = epoch;
+                windows_geo_pause = token;
+                const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                try self.geo.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+            }
+        }
+        var windows_mail_pause: ?mail_sender.runtime_pause.Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_mail_pause) |token| {
+                if (self.config.mail_sender) |owner| owner.resumePaused(token) catch @panic("Windows mail pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.mail_sender) |owner| {
+                if (owner.thread != null or owner.runtime.view != null) {
+                    const epoch = std.math.add(u64, self.windows_mail_pause_epoch, 1) catch return error.InvalidRuntime;
+                    const token = try owner.requestPause(epoch);
+                    self.windows_mail_pause_epoch = epoch;
+                    windows_mail_pause = token;
+                    const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                    try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+                }
+            }
+        }
+        var windows_acme_pause: ?@import("runtime_pause.zig").Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_acme_pause) |token| {
+                if (self.acme_worker) |owner| owner.resumePaused(token) catch @panic("Windows ACME pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.acme_worker) |owner| {
+                if (owner.thread != null or owner.runtime.view != null) {
+                    const epoch = std.math.add(u64, self.windows_acme_pause_epoch, 1) catch return error.InvalidRuntime;
+                    const token = try owner.requestPause(epoch);
+                    self.windows_acme_pause_epoch = epoch;
+                    windows_acme_pause = token;
+                    const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                    try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+                }
+            }
+        }
+        var windows_ocsp_pause: ?@import("runtime_pause.zig").Token = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_ocsp_pause) |token| {
+                if (self.ocsp_worker) |owner| owner.resumePaused(token) catch @panic("Windows OCSP pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.ocsp_worker) |owner| {
+                if (owner.thread != null or owner.runtime.view != null) {
+                    const epoch = std.math.add(u64, self.windows_ocsp_pause_epoch, 1) catch return error.InvalidRuntime;
+                    const token = try owner.requestPause(epoch);
+                    self.windows_ocsp_pause_epoch = epoch;
+                    windows_ocsp_pause = token;
+                    const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                    try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+                }
+            }
+        }
+
+        // POSIX workers retain their listener while the one HTTP producer joins;
+        // failure unwind resumes its same owner after the reactor fleet.
+        var webhook_paused = false;
+        if (comptime builtin.os.tag != .windows) {
+            lockSpin(&self.webhook_lifecycle_gate);
+            if (self.webhook_server) |*ws| {
+                self.webhook_upgrade_pause_active.store(true, .release);
+                ws.pause();
+                webhook_paused = true;
+            }
+            self.webhook_lifecycle_gate.unlock();
+        }
         defer if (webhook_paused) {
             // This defer runs after the later World-unlock and reactor-resume
             // defers. Only now may reactor 0's retry lane accept new HTTP work.
@@ -29523,10 +30204,27 @@ pub const LinuxServer = struct {
         defer self.resumeSiblingReactors();
         self.world.lockWrite();
         defer self.world.unlockWrite();
+        // Native candidates may already own duplicate sockets by any later
+        // failure. Terminate and reap them before World's lock releases and
+        // the serving predecessor resumes its socket owners.
+        defer if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
+            if (self.config.native_upgrade_hooks) |hooks| hooks.abort(hooks.ctx);
+        };
+
+        // REHASH or a TLS reload may invalidate the boot proof while the
+        // candidate is negotiating or reactors are quiescing. Recheck at the
+        // authoritative World-locked cut before sealing any state.
+        if (comptime builtin.os.tag == .windows) {
+            if (!self.windows_helix_source_valid.load(.acquire)) {
+                self.deferredUpgradeNotice(request, "UPGRADE refused: Windows source proof changed before the handoff cut");
+                return error.NativeUpgradeUnavailable;
+            }
+        }
 
         if (self.upgradeContinuityBlockerLocked()) |blocker| {
             var blocker_buf: [192]u8 = undefined;
             const blocker_name = upgradeContinuityBlockerName(blocker);
+            srvLog("onyx-server: UPGRADE refused — {s} has no exact Helix checkpoint\n", .{blocker_name});
             self.deferredUpgradeNotice(
                 request,
                 std.fmt.bufPrint(
@@ -29539,7 +30237,8 @@ pub const LinuxServer = struct {
             return error.SessionReplicaConverging;
         }
 
-        // No HTTP thread can push behind this drain: pause() joined it above.
+        // No HTTP worker can push behind this drain: the producer is joined or
+        // parked at a complete request boundary above.
         // Any channel/mesh work produced here is then absorbed by the same
         // preflight + all-shard fixed-point loop as socket-originated work.
         self.drainWebhookPostsForUpgradeLocked();
@@ -29576,6 +30275,46 @@ pub const LinuxServer = struct {
             self.publishOperEvent(.oper_action, .warn, "UPGRADE refused: exact replica/fabric boundary is still converging") catch {};
             return error.SessionReplicaConverging;
         }
+        var windows_rdns_fence: ?rdns.runtime_pause.ProducerFence = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_rdns_fence) |fence| {
+                if (self.config.rdns) |owner| owner.resumeProducers(fence) catch @panic("Windows rDNS producer fence could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows)
+            windows_rdns_fence = try (self.config.rdns orelse return error.InvalidRuntime).fenceProducers();
+        var windows_dnsbl_fence: ?dnsbl_resolver.runtime_pause.ProducerFence = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_dnsbl_fence) |fence| {
+                if (self.config.dnsbl) |owner| owner.resumeProducers(fence) catch @panic("Windows DNSBL producer fence could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.dnsbl) |owner| windows_dnsbl_fence = try owner.fenceProducers();
+        }
+        var windows_webpush_fence: ?webpush_mod.runtime_pause.ProducerFence = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_webpush_fence) |fence| {
+                if (self.webpush_worker) |owner| owner.resumeProducers(fence) catch @panic("Windows Web Push producer fence could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.webpush_worker) |owner| windows_webpush_fence = try owner.fenceProducers();
+        }
+        var windows_geo_fence: ?geo_services.runtime_pause.ProducerFence = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_geo_fence) |fence| self.geo.resumeProducers(fence) catch @panic("Windows Geo producer fence could not resume");
+        };
+        if (comptime builtin.os.tag == .windows) windows_geo_fence = try self.geo.fenceProducers();
+        var windows_mail_fence: ?mail_sender.runtime_pause.ProducerFence = null;
+        defer if (comptime builtin.os.tag == .windows) {
+            if (windows_mail_fence) |fence| {
+                if (self.config.mail_sender) |owner| owner.resumeProducers(fence) catch @panic("Windows mail producer fence could not resume");
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.mail_sender) |owner| windows_mail_fence = try owner.fenceProducers();
+        }
         // From this point through client seal and exec planning there are no
         // mutation-producing drains, success notices, or event publications.
         const upgrade_mesh_clock = self.preparePropertyUpgradeClockBoundary() orelse {
@@ -29584,7 +30323,7 @@ pub const LinuxServer = struct {
             return error.PropertyStateConverging;
         };
 
-        if (comptime builtin.os.tag == .openbsd) {
+        if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
             self.prepareNativeDurableHistoryUpgradeBoundary() catch |err| {
                 srvLog("onyx-server: UPGRADE refused — native durable history synchronization failed ({s})\n", .{@errorName(err)});
                 self.deferredUpgradeNotice(request, "UPGRADE refused: exact durable history could not be synchronized before sealing");
@@ -29600,6 +30339,33 @@ pub const LinuxServer = struct {
         }
         var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
         defer pieces.deinit(self.allocator);
+        var windows_webpush_wire: ?[]u8 = null;
+        defer if (windows_webpush_wire) |wire| native_windows_webpush.freeEncoded(self.allocator, wire);
+        var windows_mail_wire: ?[]u8 = null;
+        defer if (windows_mail_wire) |wire| native_windows_mail.freeEncoded(self.allocator, wire);
+        var windows_acme_wire: ?[]u8 = null;
+        defer if (windows_acme_wire) |wire| self.allocator.free(wire);
+        var windows_tls_material_wire: ?[]u8 = null;
+        defer if (windows_tls_material_wire) |wire| native_windows_tls_material.freeEncoded(self.allocator, wire);
+        var windows_wasm_wire: ?[]u8 = null;
+        defer if (windows_wasm_wire) |wire| native_windows_wasm.freeEncoded(self.allocator, wire);
+        var windows_account_wire: ?[]u8 = null;
+        defer if (windows_account_wire) |wire| native_windows_account_flow.freeEncoded(self.allocator, wire);
+        var windows_user_settings_wire: ?[]u8 = null;
+        defer if (windows_user_settings_wire) |wire| self.allocator.free(wire);
+        var windows_memo_forward_wire: ?[]u8 = null;
+        defer if (windows_memo_forward_wire) |wire| self.allocator.free(wire);
+        var windows_memo_ignore_wire: ?[]u8 = null;
+        defer if (windows_memo_ignore_wire) |wire| self.allocator.free(wire);
+        var windows_first_hold_wire: ?[]u8 = null;
+        defer if (windows_first_hold_wire) |wire| {
+            std.crypto.secureZero(u8, wire);
+            self.allocator.free(wire);
+        };
+        var windows_ocsp_wire: ?[]u8 = null;
+        defer if (windows_ocsp_wire) |wire| self.allocator.free(wire);
+        var windows_ocsp_state_wire: ?[]u8 = null;
+        defer if (windows_ocsp_state_wire) |wire| native_windows_ocsp_state.freeEncoded(self.allocator, wire);
         // Preserve the process-global HLC high-water mark before any state
         // capsules. A successor that reset it could reuse or regress event ids
         // immediately after execve, breaking deduplication and LWW ordering.
@@ -29626,6 +30392,349 @@ pub const LinuxServer = struct {
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete mandatory state checkpoint") catch {};
             return error.SessionReplicaConverging;
         };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.dnsbl) |owner| {
+                const dnsbl_wire = native_windows_dnsbl.captureFrozenEncoded(
+                    self.allocator,
+                    owner,
+                    windows_dnsbl_fence.?,
+                    windows_dnsbl_pause,
+                ) catch |err| {
+                    srvLog("onyx-server: UPGRADE DNSBL checkpoint seal failed ({s})\n", .{@errorName(err)});
+                    return err;
+                };
+                blobs.append(self.allocator, dnsbl_wire) catch |err| {
+                    self.allocator.free(dnsbl_wire);
+                    return err;
+                };
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = dnsbl_wire, .min_supported = 2 });
+            }
+            const login_wire = try self.login_throttle.exportUpgradeCheckpoint(self.allocator);
+            blobs.append(self.allocator, login_wire) catch |err| {
+                self.allocator.free(login_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = login_wire, .min_supported = 2 });
+            const nick_wire = try self.nick_delay.exportUpgradeCheckpoint(self.allocator, self.config.nick_delay_ms);
+            blobs.append(self.allocator, nick_wire) catch |err| {
+                self.allocator.free(nick_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = nick_wire, .min_supported = 2 });
+            const temp_mode_wire = try self.temp_modes.exportUpgradeCheckpoint(self.allocator);
+            blobs.append(self.allocator, temp_mode_wire) catch |err| {
+                self.allocator.free(temp_mode_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = temp_mode_wire, .min_supported = 2 });
+            const raid_wire = try self.raid_shield.exportUpgradeCheckpoint(self.allocator);
+            blobs.append(self.allocator, raid_wire) catch |err| {
+                self.allocator.free(raid_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = raid_wire, .min_supported = 2 });
+            const slowmode_wire = try slowmode_checkpoint.encode(self.allocator, &self.slowmode_last);
+            blobs.append(self.allocator, slowmode_wire) catch |err| {
+                self.allocator.free(slowmode_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = slowmode_wire, .min_supported = 2 });
+            const metadata_wire = try metadata_checkpoint.encodeSnapshot(self.allocator, &self.metadata);
+            blobs.append(self.allocator, metadata_wire) catch |err| {
+                self.allocator.free(metadata_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = metadata_wire, .min_supported = 2 });
+            const mlock_wire = try mlock_checkpoint.encode(self.allocator, &self.mlocks);
+            blobs.append(self.allocator, mlock_wire) catch |err| {
+                self.allocator.free(mlock_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = mlock_wire, .min_supported = 2 });
+            const drain_fixed = drain_checkpoint.encode(self.draining);
+            const drain_wire = try self.allocator.dupe(u8, &drain_fixed);
+            blobs.append(self.allocator, drain_wire) catch |err| {
+                self.allocator.free(drain_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = drain_wire, .min_supported = 2 });
+            if (self.config.chanstats_dir.len != 0) {
+                const stats_wire = try chanstats_checkpoint.encodeSnapshot(
+                    self.allocator,
+                    &self.chanstats,
+                    self.chanstats_last_write_ms,
+                    self.chanstats_prune_ready_ms,
+                    .{
+                        .chanstats_dir = self.config.chanstats_dir,
+                        .stats_interval_ms = self.config.stats_interval_ms,
+                        .ignored_nicks = self.config.chanstats_ignore_nicks,
+                    },
+                );
+                blobs.append(self.allocator, stats_wire) catch |err| {
+                    self.allocator.free(stats_wire);
+                    return err;
+                };
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = stats_wire, .min_supported = 2 });
+            }
+            const access_wire = try access_checkpoint.encode(self.allocator, &self.access);
+            blobs.append(self.allocator, access_wire) catch |err| {
+                self.allocator.free(access_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = access_wire, .min_supported = 2 });
+            const saccess_wire = try saccess_checkpoint.encode(self.allocator, &self.saccess);
+            blobs.append(self.allocator, saccess_wire) catch |err| {
+                self.allocator.free(saccess_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = saccess_wire, .min_supported = 2 });
+            const akick_wire = try akick_checkpoint.encode(self.allocator, &self.chan_akick);
+            blobs.append(self.allocator, akick_wire) catch |err| {
+                self.allocator.free(akick_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = akick_wire, .min_supported = 2 });
+            const ward_wire = try ward_checkpoint.encode(self.allocator, &self.warden);
+            blobs.append(self.allocator, ward_wire) catch |err| {
+                self.allocator.free(ward_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = ward_wire, .min_supported = 2 });
+            const policy_wire = try policy_checkpoint.encode(self.allocator, self.windowsPolicySnapshot());
+            blobs.append(self.allocator, policy_wire) catch |err| {
+                self.allocator.free(policy_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = policy_wire, .min_supported = 2 });
+            const operator_pending: ?native_windows_operator_state.PendingView = if (self.two_person_pending) |*pending| .{
+                .kind = switch (pending.kind) {
+                    .die => .die,
+                    .restart => .restart,
+                    .ward_add => .ward_add,
+                    .ward_del => .ward_del,
+                },
+                .target = pending.targetSlice(),
+                .identity = pending.identitySlice(),
+                .at_ms = pending.at_ms,
+            } else null;
+            const operator_wire = try native_windows_operator_state.encode(self.allocator, .{
+                .method = self.challenge_method,
+                .question = self.challenge_question[0..self.challenge_question_len],
+                .answer = self.challenge_answer[0..self.challenge_answer_len],
+                .issued = self.challenge_issued,
+                .pending = operator_pending,
+            });
+            blobs.append(self.allocator, operator_wire) catch |err| {
+                self.allocator.free(operator_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = operator_wire, .min_supported = 2 });
+            const account_wire = try native_windows_account_flow.encode(
+                self.allocator,
+                &self.account_verifies,
+                &self.reset_store,
+                &self.totp,
+            );
+            windows_account_wire = account_wire;
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = account_wire, .min_supported = 2 });
+            const settings_wire = try native_windows_user_settings.encode(
+                self.allocator,
+                &self.autojoins,
+                &self.nick_groups,
+                &self.welcome,
+                &self.host_requests,
+                &self.slash_cmds,
+            );
+            windows_user_settings_wire = settings_wire;
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = settings_wire, .min_supported = 2 });
+            const forward_wire = try native_windows_memo_state.encodeForward(self.allocator, &self.memo_forward);
+            windows_memo_forward_wire = forward_wire;
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = forward_wire, .min_supported = 2 });
+            const ignore_wire = try native_windows_memo_state.encodeIgnore(self.allocator, &self.memo_ignore);
+            windows_memo_ignore_wire = ignore_wire;
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = ignore_wire, .min_supported = 2 });
+            const held_wire = try native_windows_memo_state.encodeFirstHold(self.allocator, &self.first_holds);
+            windows_first_hold_wire = held_wire;
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = held_wire, .min_supported = 2 });
+            const resv_wire = try resv_jupe_checkpoint.channel.encode(self.allocator, &self.chan_resv);
+            blobs.append(self.allocator, resv_wire) catch |err| {
+                self.allocator.free(resv_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = resv_wire, .min_supported = 2 });
+            const jupe_wire = try resv_jupe_checkpoint.server.encode(self.allocator, &self.server_jupe);
+            blobs.append(self.allocator, jupe_wire) catch |err| {
+                self.allocator.free(jupe_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = jupe_wire, .min_supported = 2 });
+            const gag_wire = try gag_checkpoint.encode(self.allocator, &self.gags);
+            blobs.append(self.allocator, gag_wire) catch |err| {
+                self.allocator.free(gag_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = gag_wire, .min_supported = 2 });
+            const shun_wire = try shun_checkpoint.encode(self.allocator, &self.shuns);
+            blobs.append(self.allocator, shun_wire) catch |err| {
+                self.allocator.free(shun_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = shun_wire, .min_supported = 2 });
+            const account_abuse_wire = try account_abuse_checkpoint.encode(self.allocator, &self.account_abuse);
+            blobs.append(self.allocator, account_abuse_wire) catch |err| {
+                self.allocator.free(account_abuse_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = account_abuse_wire, .min_supported = 2 });
+            const content_filter_wire = try content_filter_checkpoint.encode(self.allocator, &self.content_filter);
+            blobs.append(self.allocator, content_filter_wire) catch |err| {
+                self.allocator.free(content_filter_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = content_filter_wire, .min_supported = 2 });
+            const reputation_wire = try reputation_checkpoint.encode(self.allocator, &self.reputation);
+            blobs.append(self.allocator, reputation_wire) catch |err| {
+                self.allocator.free(reputation_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = reputation_wire, .min_supported = 2 });
+            const spamtrap_wire = blk: {
+                lockSpin(&self.spamtrap_mu);
+                defer self.spamtrap_mu.unlock();
+                break :blk try spamtrap_checkpoint.encode(self.allocator, &self.spamtrap);
+            };
+            blobs.append(self.allocator, spamtrap_wire) catch |err| {
+                self.allocator.free(spamtrap_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = spamtrap_wire, .min_supported = 2 });
+            if (self.webpush_worker) |owner| {
+                const wire = native_windows_webpush.captureFrozenEncoded(
+                    self.allocator,
+                    owner,
+                    windows_webpush_fence orelse return error.InvalidRuntime,
+                    windows_webpush_pause,
+                ) catch |err| {
+                    srvLog("onyx-server: UPGRADE Web Push checkpoint seal failed ({s})\n", .{@errorName(err)});
+                    return err;
+                };
+                windows_webpush_wire = wire;
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 });
+            }
+            const geo_wire = native_windows_geo.captureFrozenEncoded(
+                self.allocator,
+                self.geo,
+                windows_geo_fence.?,
+                windows_geo_pause,
+            ) catch |err| {
+                srvLog("onyx-server: UPGRADE Geo checkpoint seal failed ({s})\n", .{@errorName(err)});
+                return err;
+            };
+            blobs.append(self.allocator, geo_wire) catch |err| {
+                self.allocator.free(geo_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = geo_wire, .min_supported = 2 });
+            if (self.config.mail_sender) |owner| {
+                const wire = native_windows_mail.captureFrozenEncoded(
+                    self.allocator,
+                    owner,
+                    windows_mail_fence orelse return error.InvalidRuntime,
+                    windows_mail_pause,
+                ) catch |err| {
+                    srvLog("onyx-server: UPGRADE mail checkpoint seal failed ({s})\n", .{@errorName(err)});
+                    return err;
+                };
+                windows_mail_wire = wire;
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 });
+            }
+            if (self.acme_worker) |owner| {
+                const wire = if (windows_acme_pause) |token|
+                    try native_windows_acme.capturePausedEncoded(self.allocator, owner, token)
+                else
+                    try native_windows_acme.captureUnstartedEncoded(self.allocator, owner);
+                windows_acme_wire = wire;
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 });
+            }
+            if (self.config.tls_cert_chain.len != 0) {
+                const snapshot = try self.windowsServingTlsSnapshot();
+                const wire = try native_windows_tls_material.encodeSnapshot(self.allocator, snapshot);
+                windows_tls_material_wire = wire;
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 });
+            }
+            if (self.config.wasm_plugin_dir.len != 0) {
+                const wire = try native_windows_wasm.encode(self.allocator, &self.wasm, self.config.wasm_plugin_dir);
+                windows_wasm_wire = wire;
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 });
+            }
+            if (self.ocsp_worker) |owner| {
+                // A response can cross its expiry while the fetch worker is
+                // failing. Carry retained DER, but never claim it is active.
+                self.retireExpiredActiveOcspStaple();
+                const wire = if (windows_ocsp_pause) |token|
+                    try native_windows_ocsp.capturePausedEncoded(self.allocator, owner, token)
+                else
+                    try native_windows_ocsp.captureUnstartedEncoded(self.allocator, owner);
+                windows_ocsp_wire = wire;
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 });
+                const state_wire = blk: {
+                    lockSpin(&self.ocsp_staple_lock);
+                    defer self.ocsp_staple_lock.unlock();
+                    const active = self.config.tls_ocsp_staple;
+                    if (active) |der| {
+                        const current = self.ocsp_staple_owned orelse return error.InvalidRuntime;
+                        if (der.ptr != current.ptr or der.len != current.len) return error.InvalidRuntime;
+                    }
+                    break :blk try native_windows_ocsp_state.encodeSnapshot(self.allocator, .{
+                        .pending = self.ocsp_staple_pending.load(.acquire),
+                        .active = active != null,
+                        .rejected = self.ocsp_staple_rejected.load(.acquire),
+                        .incoming = self.ocsp_staple_incoming,
+                        .current = self.ocsp_staple_owned,
+                        .previous = self.ocsp_staple_prev,
+                    });
+                };
+                windows_ocsp_state_wire = state_wire;
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = state_wire, .min_supported = 2 });
+            }
+            const rdns_wire = native_windows_rdns.captureFrozenEncoded(
+                self.allocator,
+                self.config.rdns orelse return error.InvalidRuntime,
+                windows_rdns_fence.?,
+                windows_rdns_pause,
+            ) catch |err| {
+                srvLog("onyx-server: UPGRADE rDNS checkpoint seal failed ({s})\n", .{@errorName(err)});
+                return err;
+            };
+            blobs.append(self.allocator, rdns_wire) catch |err| {
+                self.allocator.free(rdns_wire);
+                return err;
+            };
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = rdns_wire, .min_supported = 2 });
+            if (self.config.throttle_connects != 0) {
+                const detector = if (self.conn_throttle) |*value| value else return error.InvalidRuntime;
+                const wire = detector.exportUpgradeCheckpoint(self.allocator) catch |err| {
+                    srvLog("onyx-server: UPGRADE connection-throttle checkpoint seal failed ({s})\n", .{@errorName(err)});
+                    return err;
+                };
+                blobs.append(self.allocator, wire) catch |err| {
+                    self.allocator.free(wire);
+                    return err;
+                };
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 });
+            }
+            if (self.config.max_clones_per_ip_net != 0) {
+                const wire = self.mesh_clones.exportUpgradeCheckpoint(self.allocator) catch |err| {
+                    srvLog("onyx-server: UPGRADE mesh-clone checkpoint seal failed ({s})\n", .{@errorName(err)});
+                    return err;
+                };
+                blobs.append(self.allocator, wire) catch |err| {
+                    self.allocator.free(wire);
+                    return err;
+                };
+                try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 });
+            }
+        }
         if (!self.sealPropertyUpgradeCheckpoint(&pieces, &blobs)) {
             self.deferredUpgradeNotice(request, "UPGRADE refused: exact property and tombstone state could not be sealed completely");
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete property-state checkpoint") catch {};
@@ -29725,10 +30834,71 @@ pub const LinuxServer = struct {
         // Seal the complete state arena. Any failure refuses UPGRADE and restores
         // descriptor hygiene; listener-only re-exec is RESTART-only.
         const now = self.nowMs();
-        if (comptime builtin.os.tag == .openbsd) {
+        if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
             const hooks = self.config.native_upgrade_hooks orelse return error.NativeUpgradeUnavailable;
             const listeners = try self.collectListenerManifest(self.allocator);
             defer self.allocator.free(listeners);
+            var windows_metrics_snapshot: ?metrics_http.Snapshot = null;
+            defer if (windows_metrics_snapshot) |*snapshot| snapshot.deinit();
+            var windows_metrics_carry: ?NativeWindowsMetricsCarry = null;
+            var windows_webhook_snapshot: ?webhook_http.Snapshot = null;
+            var windows_webhook_carry: ?NativeWindowsWebhookCarry = null;
+            var windows_history_snapshot: ?history_http.Snapshot = null;
+            var windows_history_carry: ?NativeWindowsHistoryCarry = null;
+            var windows_webtransport_snapshot: ?managed_wt.Snapshot = null;
+            defer if (windows_webtransport_snapshot) |*snapshot| snapshot.deinit();
+            var windows_media_snapshots: ?media_routing.PristineMediaSnapshots = null;
+            defer if (windows_media_snapshots) |*snapshots| snapshots.deinit();
+            var windows_udp_carry: NativeWindowsUdpCarry = .{};
+            if (comptime builtin.os.tag == .windows) {
+                if (self.metrics_server) |*owner| {
+                    const token = windows_metrics_pause orelse return error.InvalidRuntime;
+                    windows_metrics_snapshot = try owner.capturePaused(self.allocator, token, 1024 * 1024);
+                    windows_metrics_carry = .{ .owner = owner, .carry = &windows_metrics_snapshot.? };
+                }
+                if (self.webhook_server) |*owner| {
+                    const token = windows_webhook_pause orelse return error.InvalidRuntime;
+                    windows_webhook_snapshot = try owner.capturePaused(token);
+                    windows_webhook_carry = .{ .owner = owner, .carry = &windows_webhook_snapshot.?, .pause_token = token };
+                }
+                if (self.history_https) |*owner| {
+                    const token = windows_history_pause orelse return error.InvalidRuntime;
+                    windows_history_snapshot = try owner.capturePaused(token);
+                    windows_history_carry = .{ .owner = owner, .carry = &windows_history_snapshot.?, .pause_token = token };
+                }
+                if (self.windows_webtransport_owner) |owner| {
+                    windows_webtransport_snapshot = if (windows_webtransport_pause) |token|
+                        try owner.capturePaused(token)
+                    else
+                        try owner.captureUnstarted();
+                    windows_udp_carry.webtransport = .{
+                        .owner = owner,
+                        .carry = &windows_webtransport_snapshot.?,
+                        .pause_token = windows_webtransport_pause,
+                    };
+                }
+                if (self.config.media_enabled) {
+                    const routing_owner = self.media_routing_owner orelse return error.InvalidRuntime;
+                    const domain = mediaRoutingBacking(routing_owner).domain;
+                    windows_media_snapshots = try domain.capturePausedPristineMedia(
+                        &self.native_media,
+                        windows_native_media_pause orelse return error.InvalidRuntime,
+                        &self.media_plane,
+                        windows_webrtc_media_pause orelse return error.InvalidRuntime,
+                    );
+                    windows_udp_carry.media_domain = domain;
+                    windows_udp_carry.native_media = .{
+                        .owner = &self.native_media,
+                        .carry = &windows_media_snapshots.?.native,
+                        .pause_token = windows_native_media_pause,
+                    };
+                    windows_udp_carry.webrtc_media = .{
+                        .owner = &self.media_plane,
+                        .carry = &windows_media_snapshots.?.webrtc,
+                        .pause_token = windows_webrtc_media_pause,
+                    };
+                }
+            }
             // The native leaf appends the same whole-handoff manifest and
             // encrypts before any file write. A return is pre-COMMIT only;
             // success exits this process without shutting down shared sockets.
@@ -29738,7 +30908,21 @@ pub const LinuxServer = struct {
                 .listeners = listeners,
                 .epoch = @intCast(@max(0, now)),
                 .now_ms = now,
-            }) catch |err| return err;
+                .windows_source_digest = if (comptime builtin.os.tag == .windows) self.config.windows_helix_source_digest else null,
+                .windows_account_store = if (comptime builtin.os.tag == .windows) blk: {
+                    break :blk if (self.account_services) |svc| svc.store else null;
+                } else null,
+                .windows_metrics = windows_metrics_carry,
+                .windows_webhook = windows_webhook_carry,
+                .windows_history = windows_history_carry,
+                .windows_udp = windows_udp_carry,
+            }) catch |err| {
+                // A native candidate may already hold duplicate sockets or a
+                // read-only WAL view. Reap it while World and reactor owners
+                // remain quiescent, before rollback resumes parent I/O.
+                hooks.abort(hooks.ctx);
+                return err;
+            };
         }
         var prepared = helix_live.prepare(self.allocator, .{
             .epoch = @intCast(@max(0, now)),
@@ -29863,7 +31047,10 @@ pub const LinuxServer = struct {
     /// A malformed environment must never trick cleanup into closing the port.
     fn inheritedStateFdIsConnectedStreamSocket(fd: linux.fd_t) bool {
         if (comptime builtin.os.tag == .windows) {
-            _ = io_backend.observeWindowsConnectedTcpSocket(fd) catch return false;
+            io_backend.observeWindowsHelixConnectedTcpSocket(fd) catch |err| {
+                srvLog("onyx-server: Windows Helix inherited state socket {d} invalid ({s})\n", .{ fd, @errorName(err) });
+                return false;
+            };
             return true;
         }
         if (comptime builtin.os.tag == .openbsd) {
@@ -30118,6 +31305,60 @@ pub const LinuxServer = struct {
         return .{ .allocator = self.allocator, .table = table, .registry = registry };
     }
 
+    fn validateInheritedAdmissionRelation(
+        self: *LinuxServer,
+        detector: ?*clone_detect_mod.CloneDetector,
+        clones: ?*mesh_clones_mod.MeshClones,
+    ) (error{InvalidAdmissionRelation} || std.mem.Allocator.Error)!void {
+        var throttle_counts = std.StringHashMap(usize).init(self.allocator);
+        defer throttle_counts.deinit();
+        if (detector) |value| {
+            var ips = value.ips.iterator();
+            while (ips.next()) |entry| try throttle_counts.put(entry.key_ptr.*, 0);
+        }
+        var clone_counts = std.AutoHashMap(u64, usize).init(self.allocator);
+        defer clone_counts.deinit();
+        if (clones) |value| {
+            var locals = value.local.iterator();
+            while (locals.next()) |entry| try clone_counts.put(entry.key_ptr.*, 0);
+        }
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (conn.throttle_counted) {
+                    if (detector == null) return error.InvalidAdmissionRelation;
+                    const addr = conn.peer_addr orelse return error.InvalidAdmissionRelation;
+                    var ip_buf: [128]u8 = undefined;
+                    const ip = addrText(addr, &ip_buf) orelse return error.InvalidAdmissionRelation;
+                    const count = throttle_counts.getPtr(ip) orelse return error.InvalidAdmissionRelation;
+                    count.* = std.math.add(usize, count.*, 1) catch return error.InvalidAdmissionRelation;
+                }
+                if (conn.mesh_clone_counted) {
+                    if (clones == null) return error.InvalidAdmissionRelation;
+                    const hash = self.meshCloneHash(conn) orelse return error.InvalidAdmissionRelation;
+                    if (hash != conn.mesh_clone_hash) return error.InvalidAdmissionRelation;
+                    const count = clone_counts.getPtr(conn.mesh_clone_hash) orelse return error.InvalidAdmissionRelation;
+                    count.* = std.math.add(usize, count.*, 1) catch return error.InvalidAdmissionRelation;
+                }
+            }
+        }
+        if (detector) |value| {
+            var counts = throttle_counts.iterator();
+            while (counts.next()) |entry| {
+                if (entry.value_ptr.* != value.activeCount(entry.key_ptr.*))
+                    return error.InvalidAdmissionRelation;
+            }
+        }
+        if (clones) |value| {
+            var counts = clone_counts.iterator();
+            while (counts.next()) |entry| {
+                if (entry.value_ptr.* != value.localCount(entry.key_ptr.*))
+                    return error.InvalidAdmissionRelation;
+            }
+        }
+    }
+
     pub fn adoptInheritedSessions(self: *LinuxServer) error{ InvalidInheritedHandoff, DurableDeviceActivationFailed }!void {
         if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) {
             io_backend.refuseForeignCapsule() catch return error.InvalidInheritedHandoff;
@@ -30130,7 +31371,12 @@ pub const LinuxServer = struct {
                 return;
             }
             if (self.config.resume_arena_fd != null or self.config.native_adopt_barrier == null or
-                self.config.native_listener_manifest.len == 0) return error.InvalidInheritedHandoff;
+                self.config.native_listener_manifest.len == 0)
+            {
+                if (comptime builtin.os.tag == .windows)
+                    srvLog("onyx-server: Windows Helix incomplete native adoption inputs (arena_fd={any}, barrier={any}, listeners={d})\n", .{ self.config.resume_arena_fd, self.config.native_adopt_barrier != null, self.config.native_listener_manifest.len });
+                return error.InvalidInheritedHandoff;
+            }
             break :blk -1;
         } else self.config.resume_arena_fd orelse {
             // A state-fd manifest without its arena is an incomplete handoff. A
@@ -30155,7 +31401,11 @@ pub const LinuxServer = struct {
         // kernel close the inherited table atomically before a cold restart.
         if (self.config.inherited_state_fd_manifest_present and
             !self.inheritedStateFdManifestTrusted(arena_fd))
+        {
+            if (comptime builtin.os.tag == .windows)
+                srvLog("onyx-server: Windows Helix inherited state manifest refused ({d} socket(s), {d} listener(s))\n", .{ self.config.inherited_state_fds.len, self.config.native_listener_manifest.len });
             return error.InvalidInheritedHandoff;
+        }
         // Boot-time only (before the reactor loop): bind this thread to reactor
         // 0, the reactor that owns the inherited listener and every connection
         // adopted below.
@@ -30186,7 +31436,7 @@ pub const LinuxServer = struct {
             self.abandonInheritedSessionState(caps, arena_fd, reason);
             return error.InvalidInheritedHandoff;
         };
-        _ = handoff_relations.validateCurrent(caps, self.config.inherited_state_fds) catch |e| {
+        const relations = handoff_relations.validateCurrent(caps, self.config.inherited_state_fds) catch |e| {
             var reason_buf: [128]u8 = undefined;
             const reason = std.fmt.bufPrint(
                 &reason_buf,
@@ -30196,6 +31446,536 @@ pub const LinuxServer = struct {
             self.abandonInheritedSessionState(caps, arena_fd, reason);
             return error.InvalidInheritedHandoff;
         };
+        var throttle_replacement: ?clone_detect_mod.CloneDetector = null;
+        defer if (throttle_replacement) |*replacement| replacement.deinit();
+        var mesh_clones_replacement: ?mesh_clones_mod.MeshClones = null;
+        defer if (mesh_clones_replacement) |*replacement| replacement.deinit();
+        var login_throttle_replacement: ?svc_login_throttle.Throttle = null;
+        defer if (login_throttle_replacement) |*replacement| replacement.deinit();
+        var nick_delay_replacement: ?nick_delay_mod.NickDelay = null;
+        defer if (nick_delay_replacement) |*replacement| replacement.deinit();
+        var temp_mode_replacement: ?svc_tempmode.TempModeQueue = null;
+        defer if (temp_mode_replacement) |*replacement| replacement.deinit();
+        var raid_shield_replacement: ?raid_shield.Shield = null;
+        defer if (raid_shield_replacement) |*replacement| replacement.deinit();
+        var slowmode_replacement: ?slowmode_checkpoint.Map = null;
+        defer if (slowmode_replacement) |*replacement| slowmode_checkpoint.deinit(self.allocator, replacement);
+        var metadata_replacement: ?metadata_store.DefaultStore = null;
+        defer if (metadata_replacement) |*replacement| replacement.deinit();
+        var mlock_replacement: ?mlock_checkpoint.Map = null;
+        defer if (mlock_replacement) |*replacement| mlock_checkpoint.deinit(self.allocator, replacement);
+        var drain_replacement: ?bool = null;
+        var chanstats_replacement: ?chanstats_checkpoint.Owned = null;
+        defer if (chanstats_replacement) |*replacement| replacement.deinit();
+        var access_replacement: ?ircx_access_store.AccessStore = null;
+        defer if (access_replacement) |*replacement| replacement.deinit();
+        var saccess_replacement: ?ircx_saccess.ServerAccessStore = null;
+        defer if (saccess_replacement) |*replacement| replacement.deinit();
+        var akick_replacement: ?svc_akick.AkickStore = null;
+        defer if (akick_replacement) |*replacement| replacement.deinit();
+        var ward_replacement: ?warden.Registry = null;
+        defer if (ward_replacement) |*replacement| replacement.deinit();
+        var policy_replacement: ?policy_checkpoint.OwnedSnapshot = null;
+        defer if (policy_replacement) |*replacement| replacement.deinit();
+        var policy_undo_replacement: ?PolicyUndo = null;
+        defer if (policy_undo_replacement) |*replacement| self.destroyPolicyUndo(replacement);
+        var operator_replacement: ?native_windows_operator_state.Decoded = null;
+        var account_flow_replacement: ?native_windows_account_flow.Staged = null;
+        defer if (account_flow_replacement) |*replacement| replacement.deinit();
+        var user_settings_replacement: ?native_windows_user_settings.Staged = null;
+        defer if (user_settings_replacement) |*replacement| replacement.deinit();
+        var memo_forward_replacement: ?svc_memo_forward.MemoForwardStore = null;
+        defer if (memo_forward_replacement) |*replacement| replacement.deinit();
+        var memo_ignore_replacement: ?svc_memo_ignore.MemoIgnoreList = null;
+        defer if (memo_ignore_replacement) |*replacement| replacement.deinit();
+        var first_hold_replacement: ?first_hold.Table = null;
+        defer if (first_hold_replacement) |*replacement| replacement.deinit();
+        var ocsp_state_replacement: ?native_windows_ocsp_state.Owned = null;
+        defer if (ocsp_state_replacement) |*replacement| replacement.deinit();
+        var ocsp_restored_valid_until_unix: i64 = 0;
+        var tls_material_replacement: ?native_windows_tls_material.Owned = null;
+        defer if (tls_material_replacement) |*replacement| replacement.deinit();
+        var wasm_replacement: ?native_windows_wasm.Owned = null;
+        defer if (wasm_replacement) |*replacement| replacement.deinit();
+        var resv_replacement: ?svc_resv.ChannelResv = null;
+        defer if (resv_replacement) |*replacement| replacement.deinit();
+        var jupe_replacement: ?svc_jupe.JupeStore = null;
+        defer if (jupe_replacement) |*replacement| replacement.deinit();
+        var gag_replacement: ?gag_set.GagSet = null;
+        defer if (gag_replacement) |*replacement| replacement.deinit();
+        var shun_replacement: ?shun_mod.ShunList = null;
+        defer if (shun_replacement) |*replacement| replacement.deinit();
+        var account_abuse_replacement: ?account_abuse_mod.AccountAbuse = null;
+        defer if (account_abuse_replacement) |*replacement| replacement.deinit();
+        var content_filter_replacement: ?content_filter_mod.ContentFilter = null;
+        defer if (content_filter_replacement) |*replacement| replacement.deinit();
+        var reputation_replacement: ?ip_reputation_mod.IpReputation = null;
+        defer if (reputation_replacement) |*replacement| replacement.deinit();
+        var spamtrap_replacement: ?spamtrap_mod.DefaultSpamtrap = null;
+        defer if (spamtrap_replacement) |*replacement| replacement.deinit();
+        if (comptime builtin.os.tag == .windows) {
+            if (relations.rdns != 1 or self.config.rdns == null or
+                relations.login_throttle != 1 or relations.nick_delay != 1 or
+                relations.temp_mode != 1 or relations.raid_shield != 1 or
+                relations.slowmode != 1 or relations.metadata != 1 or
+                relations.mlock != 1 or relations.drain != 1 or
+                relations.access != 1 or relations.saccess != 1 or
+                relations.akick != 1 or relations.ward != 1 or
+                relations.policy != 1 or relations.operator_state != 1 or relations.account_flow != 1 or
+                relations.user_settings != 1 or relations.memo_forward != 1 or
+                relations.memo_ignore != 1 or relations.first_hold != 1 or
+                relations.resv != 1 or relations.jupe != 1 or
+                relations.gags != 1 or relations.shuns != 1 or
+                relations.account_abuse != 1 or relations.content_filter != 1 or
+                relations.reputation != 1 or relations.spamtrap != 1 or
+                relations.geo != 1)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory Windows handoff checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            if (relations.webpush != @as(usize, @intFromBool(self.webpush_worker != null))) {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows Web Push checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            if (relations.mail != @as(usize, @intFromBool(self.config.mail_sender != null))) {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows mail checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            if (relations.acme != @as(usize, @intFromBool(self.acme_worker != null)) or
+                relations.tls_material != @as(usize, @intFromBool(self.config.tls_cert_chain.len != 0)))
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows ACME/TLS material checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            if (relations.wasm != @as(usize, @intFromBool(self.config.wasm_plugin_dir.len != 0))) {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows WASM checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            if (relations.ocsp != @as(usize, @intFromBool(self.ocsp_worker != null)) or
+                relations.ocsp_state != @as(usize, @intFromBool(self.ocsp_worker != null)))
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows OCSP checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            if (relations.dnsbl != @as(usize, @intFromBool(self.config.dnsbl != null))) {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows DNSBL checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            if (relations.chanstats != @as(usize, @intFromBool(self.config.chanstats_dir.len != 0))) {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows channel-statistics checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            // A configured admission authority is a mandatory part of this
+            // native handoff. Its absence cannot silently reset rate windows or
+            // network clone occupancy while physical clients stay attached.
+            if (relations.clone_detector != @as(usize, @intFromBool(self.config.throttle_connects != 0)) or
+                relations.mesh_clones != @as(usize, @intFromBool(self.config.max_clones_per_ip_net != 0)))
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows admission checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            for (caps) |c| {
+                if (c.header.kind != .mesh_checkpoint or c.fields.len != 1) continue;
+                const bytes = c.fields[0].bytes;
+                if (native_windows_rdns.isCheckpoint(bytes)) {
+                    const owner = self.config.rdns.?;
+                    const result = if (owner.runtime.view != null)
+                        native_windows_rdns.restoreEncodedParked(self.allocator, owner, bytes)
+                    else
+                        native_windows_rdns.restoreEncoded(self.allocator, owner, bytes);
+                    result catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible Windows rDNS checkpoint");
+                        srvLog("onyx-server: Windows rDNS restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_dnsbl.isCheckpoint(bytes)) {
+                    const owner = self.config.dnsbl orelse unreachable;
+                    const result = if (owner.runtime.view != null)
+                        native_windows_dnsbl.restoreEncodedParked(self.allocator, owner, bytes)
+                    else
+                        native_windows_dnsbl.restoreEncoded(self.allocator, owner, bytes);
+                    result catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible Windows DNSBL checkpoint");
+                        srvLog("onyx-server: Windows DNSBL restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (svc_login_throttle.isUpgradeCheckpoint(bytes)) {
+                    login_throttle_replacement = svc_login_throttle.Throttle.restoreUpgradeCheckpoint(
+                        self.allocator,
+                        self.login_throttle.params,
+                        bytes,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows login-throttle checkpoint");
+                        srvLog("onyx-server: Windows login-throttle restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (nick_delay_mod.isUpgradeCheckpoint(bytes)) {
+                    nick_delay_replacement = nick_delay_mod.NickDelay.restoreUpgradeCheckpoint(
+                        self.allocator,
+                        self.config.nick_delay_ms,
+                        bytes,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows nick-delay checkpoint");
+                        srvLog("onyx-server: Windows nick-delay restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (svc_tempmode.isUpgradeCheckpoint(bytes)) {
+                    temp_mode_replacement = svc_tempmode.TempModeQueue.restoreUpgradeCheckpoint(
+                        self.allocator,
+                        bytes,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows temporary-mode checkpoint");
+                        srvLog("onyx-server: Windows temporary-mode restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (raid_shield.isUpgradeCheckpoint(bytes)) {
+                    raid_shield_replacement = raid_shield.Shield.restoreUpgradeCheckpoint(
+                        self.allocator,
+                        bytes,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows raid-shield checkpoint");
+                        srvLog("onyx-server: Windows raid-shield restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (slowmode_checkpoint.isCheckpoint(bytes)) {
+                    slowmode_replacement = slowmode_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows slowmode checkpoint");
+                        srvLog("onyx-server: Windows slowmode restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (metadata_checkpoint.isCheckpoint(bytes)) {
+                    metadata_replacement = metadata_checkpoint.decodeOwned(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows metadata checkpoint");
+                        srvLog("onyx-server: Windows metadata restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (mlock_checkpoint.isCheckpoint(bytes)) {
+                    mlock_replacement = mlock_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows MLOCK checkpoint");
+                        srvLog("onyx-server: Windows MLOCK restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (drain_checkpoint.isCheckpoint(bytes)) {
+                    drain_replacement = drain_checkpoint.decode(bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows DRAIN checkpoint");
+                        srvLog("onyx-server: Windows DRAIN restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (chanstats_checkpoint.isCheckpoint(bytes)) {
+                    chanstats_replacement = chanstats_checkpoint.decodeOwned(self.allocator, bytes, .{
+                        .chanstats_dir = self.config.chanstats_dir,
+                        .stats_interval_ms = self.config.stats_interval_ms,
+                        .ignored_nicks = self.config.chanstats_ignore_nicks,
+                    }) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows channel-statistics checkpoint");
+                        srvLog("onyx-server: Windows channel-statistics restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (access_checkpoint.isCheckpoint(bytes)) {
+                    access_replacement = access_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows ACCESS checkpoint");
+                        srvLog("onyx-server: Windows ACCESS restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    const restored = &access_replacement.?;
+                    if (restored.max_entries != self.access.max_entries or
+                        restored.max_tombstones != self.access.max_tombstones or
+                        restored.tombstone_ttl_seconds != self.access.tombstone_ttl_seconds)
+                    {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows ACCESS checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (saccess_checkpoint.isCheckpoint(bytes)) {
+                    saccess_replacement = saccess_checkpoint.decodeOwned(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows SACCESS checkpoint");
+                        srvLog("onyx-server: Windows SACCESS restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (saccess_replacement.?.max_entries != self.saccess.max_entries) {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows SACCESS checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (akick_checkpoint.isCheckpoint(bytes)) {
+                    akick_replacement = akick_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows AKICK checkpoint");
+                        srvLog("onyx-server: Windows AKICK restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (akick_replacement.?.max_per_channel != self.chan_akick.max_per_channel) {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows AKICK checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (ward_checkpoint.isCheckpoint(bytes)) {
+                    ward_replacement = ward_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows WARD checkpoint");
+                        srvLog("onyx-server: Windows WARD restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (!std.meta.eql(ward_replacement.?.params, self.warden.params)) {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows WARD checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (policy_checkpoint.isCheckpoint(bytes)) {
+                    policy_replacement = policy_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows POLICY checkpoint");
+                        srvLog("onyx-server: Windows POLICY restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (policy_replacement.?.takeUndo()) |owned|
+                        policy_undo_replacement = windowsPolicyUndoFromOwned(owned, policy_replacement.?.previous_generation);
+                } else if (native_windows_operator_state.isCheckpoint(bytes)) {
+                    operator_replacement = native_windows_operator_state.decode(bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows operator-state checkpoint");
+                        srvLog("onyx-server: Windows operator-state restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_account_flow.isCheckpoint(bytes)) {
+                    account_flow_replacement = native_windows_account_flow.stageFor(
+                        bytes,
+                        &self.account_verifies,
+                        &self.reset_store,
+                        &self.totp,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows account-flow checkpoint");
+                        srvLog("onyx-server: Windows account-flow restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_user_settings.isCheckpoint(bytes)) {
+                    user_settings_replacement = native_windows_user_settings.stageFor(
+                        bytes,
+                        &self.autojoins,
+                        &self.nick_groups,
+                        &self.welcome,
+                        &self.host_requests,
+                        &self.slash_cmds,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows user-settings checkpoint");
+                        srvLog("onyx-server: Windows user-settings restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_memo_state.isForward(bytes)) {
+                    memo_forward_replacement = native_windows_memo_state.decodeForward(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows memo-forward checkpoint");
+                        srvLog("onyx-server: Windows memo-forward restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_memo_state.isIgnore(bytes)) {
+                    memo_ignore_replacement = native_windows_memo_state.decodeIgnore(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows memo-ignore checkpoint");
+                        srvLog("onyx-server: Windows memo-ignore restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_memo_state.isFirstHold(bytes)) {
+                    first_hold_replacement = native_windows_memo_state.decodeFirstHold(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows first-hold checkpoint");
+                        srvLog("onyx-server: Windows first-hold restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (resv_jupe_checkpoint.channel.isCheckpoint(bytes)) {
+                    resv_replacement = resv_jupe_checkpoint.channel.decodeOwned(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows RESV checkpoint");
+                        srvLog("onyx-server: Windows RESV restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (!std.meta.eql(resv_replacement.?.params, self.chan_resv.params)) {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows RESV checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (resv_jupe_checkpoint.server.isCheckpoint(bytes)) {
+                    jupe_replacement = resv_jupe_checkpoint.server.decodeOwned(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows JUPE checkpoint");
+                        srvLog("onyx-server: Windows JUPE restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (!std.meta.eql(jupe_replacement.?.params, self.server_jupe.params)) {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows JUPE checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (gag_checkpoint.isCheckpoint(bytes)) {
+                    gag_replacement = gag_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows GAG checkpoint");
+                        srvLog("onyx-server: Windows GAG restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (!std.meta.eql(gag_replacement.?.params, self.gags.params)) {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows GAG checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (shun_checkpoint.isCheckpoint(bytes)) {
+                    shun_replacement = shun_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows SHUN checkpoint");
+                        srvLog("onyx-server: Windows SHUN restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (!std.meta.eql(shun_replacement.?.params, self.shuns.params)) {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows SHUN checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (account_abuse_checkpoint.isCheckpoint(bytes)) {
+                    account_abuse_replacement = account_abuse_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows account-abuse checkpoint");
+                        srvLog("onyx-server: Windows account-abuse restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (content_filter_checkpoint.isCheckpoint(bytes)) {
+                    content_filter_replacement = content_filter_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows content-filter checkpoint");
+                        srvLog("onyx-server: Windows content-filter restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    if (!std.meta.eql(content_filter_replacement.?.cfg, self.content_filter.cfg)) {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows content-filter checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (reputation_checkpoint.isCheckpoint(bytes)) {
+                    reputation_replacement = reputation_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows reputation checkpoint");
+                        srvLog("onyx-server: Windows reputation restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    const restored = reputation_replacement.?.config;
+                    const expected = self.reputation.config;
+                    if (restored.half_life_ms != expected.half_life_ms or
+                        @as(u64, @bitCast(restored.refuse_threshold)) != @as(u64, @bitCast(expected.refuse_threshold)) or
+                        @as(u64, @bitCast(restored.negligible)) != @as(u64, @bitCast(expected.negligible)))
+                    {
+                        self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible Windows reputation checkpoint");
+                        return error.InvalidInheritedHandoff;
+                    }
+                } else if (spamtrap_checkpoint.isCheckpoint(bytes)) {
+                    spamtrap_replacement = spamtrap_checkpoint.decode(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows spamtrap checkpoint");
+                        srvLog("onyx-server: Windows spamtrap restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_webpush.isCheckpoint(bytes)) {
+                    const owner = self.webpush_worker orelse unreachable;
+                    const result = if (owner.runtime.view != null)
+                        native_windows_webpush.restoreEncodedParked(self.allocator, owner, bytes)
+                    else
+                        native_windows_webpush.restoreEncoded(self.allocator, owner, bytes);
+                    result catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows Web Push checkpoint");
+                        srvLog("onyx-server: Windows Web Push restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_geo.isCheckpoint(bytes)) {
+                    const result = if (self.geo.runtime.view != null)
+                        native_windows_geo.restoreEncodedParked(self.allocator, self.geo, bytes)
+                    else
+                        native_windows_geo.restoreEncoded(self.allocator, self.geo, bytes);
+                    result catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows Geo checkpoint");
+                        srvLog("onyx-server: Windows Geo restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_mail.isCheckpoint(bytes)) {
+                    const owner = self.config.mail_sender orelse unreachable;
+                    const result = if (owner.runtime.view != null)
+                        native_windows_mail.restoreEncodedParked(self.allocator, owner, bytes)
+                    else
+                        native_windows_mail.restoreEncoded(self.allocator, owner, bytes);
+                    result catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows mail checkpoint");
+                        srvLog("onyx-server: Windows mail restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_acme.isCheckpoint(bytes)) {
+                    const owner = self.acme_worker orelse unreachable;
+                    native_windows_acme.restoreEncodedParked(owner, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows ACME scheduler checkpoint");
+                        srvLog("onyx-server: Windows ACME scheduler restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_tls_material.isCheckpoint(bytes)) {
+                    tls_material_replacement = native_windows_tls_material.decodeOwned(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows TLS material checkpoint");
+                        srvLog("onyx-server: Windows TLS material restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                    _ = tls_material_replacement.?.servingDigest() catch {
+                        self.abandonInheritedSessionState(caps, arena_fd, "Windows TLS material has invalid serving identity");
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_wasm.isCheckpoint(bytes)) {
+                    wasm_replacement = native_windows_wasm.stage(
+                        self.allocator,
+                        bytes,
+                        self.wasm.options,
+                        self.config.wasm_plugin_dir,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows OroWasm checkpoint");
+                        srvLog("onyx-server: Windows OroWasm restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_ocsp.isCheckpoint(bytes)) {
+                    const owner = self.ocsp_worker orelse unreachable;
+                    native_windows_ocsp.restoreEncodedParked(owner, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows OCSP scheduler checkpoint");
+                        srvLog("onyx-server: Windows OCSP scheduler restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (native_windows_ocsp_state.isCheckpoint(bytes)) {
+                    if (self.ocsp_staple_owned != null or self.ocsp_staple_prev != null or
+                        self.ocsp_staple_incoming != null or self.config.tls_ocsp_staple != null)
+                    {
+                        self.abandonInheritedSessionState(caps, arena_fd, "Windows OCSP candidate has preexisting staple ownership");
+                        return error.InvalidInheritedHandoff;
+                    }
+                    ocsp_state_replacement = native_windows_ocsp_state.decodeOwned(self.allocator, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows OCSP staple checkpoint");
+                        srvLog("onyx-server: Windows OCSP staple restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (clone_detect_mod.isUpgradeCheckpoint(bytes)) {
+                    const expected = if (self.conn_throttle) |*detector| detector.params else unreachable;
+                    throttle_replacement = clone_detect_mod.CloneDetector.restoreUpgradeCheckpoint(
+                        self.allocator,
+                        expected,
+                        bytes,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid or configuration-incompatible Windows connection-throttle checkpoint");
+                        srvLog("onyx-server: Windows connection-throttle restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                } else if (mesh_clones_mod.isUpgradeCheckpoint(bytes)) {
+                    mesh_clones_replacement = mesh_clones_mod.MeshClones.restoreUpgradeCheckpoint(
+                        self.allocator,
+                        bytes,
+                    ) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows mesh-clone checkpoint");
+                        srvLog("onyx-server: Windows mesh-clone restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
+                }
+            }
+        }
+
+        if (comptime builtin.os.tag == .windows) {
+            if (tls_material_replacement) |*replacement| {
+                if (replacement.reload_pending and self.acme_worker == null) {
+                    self.abandonInheritedSessionState(caps, arena_fd, "Windows TLS reload intent has no ACME owner");
+                    return error.InvalidInheritedHandoff;
+                }
+            }
+            if (ocsp_state_replacement) |*replacement| {
+                if (replacement.active) {
+                    const serving_chain = if (tls_material_replacement) |*material|
+                        material.default.?.cert_chain
+                    else
+                        self.config.tls_cert_chain;
+                    ocsp_restored_valid_until_unix = managed_ocsp.stapleValidUntilForChain(
+                        replacement.current.?,
+                        serving_chain,
+                        @divFloor(platform.realtimeMillis(), 1000),
+                        @import("../crypto/ocsp.zig").default_staple_skew_seconds,
+                    ) orelse {
+                        self.abandonInheritedSessionState(caps, arena_fd, "Windows OCSP staple is incompatible with transferred TLS leaf");
+                        return error.InvalidInheritedHandoff;
+                    };
+                }
+            }
+        }
 
         // Before publishing ANY restored state, bind every ownership-bearing
         // client/S2S capsule to the exact version-independent descriptor set.
@@ -30707,6 +32487,12 @@ pub const LinuxServer = struct {
                 self.abandonInheritedSessionState(caps, arena_fd, "malformed oper-grant checkpoint");
                 return error.InvalidInheritedHandoff;
             };
+        }
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.native_arena_bytes != null and oper_grant_checkpoint == null) {
+                self.abandonInheritedSessionState(caps, arena_fd, "missing mandatory Windows oper-grant checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
         }
 
         // Same at-most-once rule as oper grants: a pre-checkpoint arena lacks
@@ -31361,6 +33147,16 @@ pub const LinuxServer = struct {
             srvLog("onyx-server: UPGRADE resume fatal — orphan TLS/WebSocket sidecar(s) remain after exact client join\n", .{});
             return error.InvalidInheritedHandoff;
         }
+        if (comptime builtin.os.tag == .windows) {
+            self.validateInheritedAdmissionRelation(
+                if (throttle_replacement) |*value| value else null,
+                if (mesh_clones_replacement) |*value| value else null,
+            ) catch |e| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("onyx-server: UPGRADE resume fatal — Windows admission/client relation failed ({s})\n", .{@errorName(e)});
+                return error.InvalidInheritedHandoff;
+            };
+        }
         adoption_stage = "World client relations";
         const adopted_world_resolver = self.helixWorldRelationResolver();
         world_replacement.validateAdoptedMembersResolved(
@@ -31842,6 +33638,14 @@ pub const LinuxServer = struct {
                         srvLog("onyx-server: UPGRADE resume fatal — native store promotion preparation failed ({s})\n", .{@errorName(err)});
                         return error.InvalidInheritedHandoff;
                     };
+                    // After validation the reserved writer is the sole WAL
+                    // owner. Close the replay handle before READY so the
+                    // post-COMMIT authority swap performs no fallible I/O.
+                    svc.store.releaseReadHandleForPreparedPromotion() catch |err| {
+                        world_replacement.swapWorldInto(&self.world);
+                        srvLog("onyx-server: UPGRADE resume fatal — native WAL replay release failed ({s})\n", .{@errorName(err)});
+                        return error.InvalidInheritedHandoff;
+                    };
                 } else {
                     world_replacement.swapWorldInto(&self.world);
                     return error.InvalidInheritedHandoff;
@@ -31858,6 +33662,11 @@ pub const LinuxServer = struct {
                     srvLog("onyx-server: UPGRADE resume fatal — Windows socket custody claim failed ({s})\n", .{@errorName(err)});
                     return error.InvalidInheritedHandoff;
                 };
+                if (self.config.mail_sender) |owner| owner.requireStagedWalCut() catch |err| {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("onyx-server: UPGRADE resume fatal — Windows mail WAL custody changed before COMMIT ({s})\n", .{@errorName(err)});
+                    return error.InvalidInheritedHandoff;
+                };
             }
             barrier.readyAndAwaitCommit(barrier.ctx) catch |err| {
                 world_replacement.swapWorldInto(&self.world);
@@ -31866,6 +33675,9 @@ pub const LinuxServer = struct {
             };
             // The authenticated control owner returned only after COMMIT.
             // Promotion and all remaining authority swaps cannot fail.
+            if (comptime builtin.os.tag == .windows) {
+                if (self.config.mail_sender) |owner| owner.releaseStagedWalCut();
+            }
             if (self.account_services) |svc| {
                 if (comptime @hasDecl(@TypeOf(svc.store.*), "promotePrepared")) svc.store.promotePrepared();
             }
@@ -31885,6 +33697,190 @@ pub const LinuxServer = struct {
             &self.e2ee_group_mesh_authority,
             &e2ee_group_replay_replacement,
         );
+        if (comptime builtin.os.tag == .windows) {
+            if (login_throttle_replacement) |*replacement|
+                std.mem.swap(svc_login_throttle.Throttle, &self.login_throttle, replacement)
+            else
+                unreachable;
+            if (nick_delay_replacement) |*replacement|
+                std.mem.swap(nick_delay_mod.NickDelay, &self.nick_delay, replacement)
+            else
+                unreachable;
+            if (temp_mode_replacement) |*replacement|
+                std.mem.swap(svc_tempmode.TempModeQueue, &self.temp_modes, replacement)
+            else
+                unreachable;
+            if (raid_shield_replacement) |*replacement|
+                std.mem.swap(raid_shield.Shield, &self.raid_shield, replacement)
+            else
+                unreachable;
+            if (slowmode_replacement) |*replacement|
+                std.mem.swap(slowmode_checkpoint.Map, &self.slowmode_last, replacement)
+            else
+                unreachable;
+            if (metadata_replacement) |*replacement|
+                std.mem.swap(metadata_store.DefaultStore, &self.metadata, replacement)
+            else
+                unreachable;
+            if (mlock_replacement) |*replacement|
+                std.mem.swap(mlock_checkpoint.Map, &self.mlocks, replacement)
+            else
+                unreachable;
+            self.draining = drain_replacement orelse unreachable;
+            if (chanstats_replacement) |*replacement| {
+                std.mem.swap(chanstats_mod.ChanStats, &self.chanstats, &replacement.stats);
+                std.mem.swap(i64, &self.chanstats_last_write_ms, &replacement.last_write_ms);
+                std.mem.swap(i64, &self.chanstats_prune_ready_ms, &replacement.prune_ready_ms);
+                self.inherited_chanstats_restored = true;
+            }
+            if (access_replacement) |*replacement|
+                std.mem.swap(ircx_access_store.AccessStore, &self.access, replacement)
+            else
+                unreachable;
+            if (saccess_replacement) |*replacement|
+                std.mem.swap(ircx_saccess.ServerAccessStore, &self.saccess, replacement)
+            else
+                unreachable;
+            if (akick_replacement) |*replacement|
+                std.mem.swap(svc_akick.AkickStore, &self.chan_akick, replacement)
+            else
+                unreachable;
+            if (ward_replacement) |*replacement|
+                std.mem.swap(warden.Registry, &self.warden, replacement)
+            else
+                unreachable;
+            if (policy_replacement) |*replacement| {
+                std.mem.swap(?PolicyUndo, &self.policy_undo, &policy_undo_replacement);
+                self.policy_gen_ward = replacement.generations.ward;
+                self.policy_gen_filter = replacement.generations.filter;
+                self.policy_gen_class = replacement.generations.class;
+                self.policy_gen_ban = replacement.generations.ban;
+                self.proof_policy_version = replacement.generations.proof;
+            } else unreachable;
+            if (operator_replacement) |restored| {
+                self.challenge_method = restored.method;
+                self.challenge_question = restored.question;
+                self.challenge_question_len = restored.question_len;
+                self.challenge_answer = restored.answer;
+                self.challenge_answer_len = restored.answer_len;
+                self.challenge_issued = restored.issued;
+                self.two_person_pending = if (restored.pending) |pending| blk: {
+                    var next = TwoPersonPending{
+                        .kind = switch (pending.kind) {
+                            .die => .die,
+                            .restart => .restart,
+                            .ward_add => .ward_add,
+                            .ward_del => .ward_del,
+                        },
+                        .at_ms = pending.at_ms,
+                    };
+                    @memcpy(next.target[0..pending.target_len], pending.target[0..pending.target_len]);
+                    next.target_len = @intCast(pending.target_len);
+                    @memcpy(next.identity[0..pending.identity_len], pending.identity[0..pending.identity_len]);
+                    next.identity_len = @intCast(pending.identity_len);
+                    break :blk next;
+                } else null;
+            } else unreachable;
+            if (account_flow_replacement) |*replacement| replacement.commit() else unreachable;
+            if (user_settings_replacement) |*replacement| replacement.commit() else unreachable;
+            if (memo_forward_replacement) |*replacement|
+                std.mem.swap(svc_memo_forward.MemoForwardStore, &self.memo_forward, replacement)
+            else
+                unreachable;
+            if (memo_ignore_replacement) |*replacement|
+                std.mem.swap(svc_memo_ignore.MemoIgnoreList, &self.memo_ignore, replacement)
+            else
+                unreachable;
+            if (first_hold_replacement) |*replacement|
+                std.mem.swap(first_hold.Table, &self.first_holds, replacement)
+            else
+                unreachable;
+            if (tls_material_replacement) |*replacement| {
+                const state = replacement.release();
+                std.debug.assert(self.reload_tls == null and self.reload_tls12 == null and
+                    self.reload_tls_prev == null and self.reload_tls12_prev == null);
+                self.reload_tls = state.default;
+                self.reload_tls12 = state.generated_tls12;
+                self.config.tls_cert_chain = state.default.cert_chain;
+                self.config.tls_signing_key = state.default.signing_key;
+                self.config.tls_ecdsa_signing_key = state.default.ecdsa_p256_signing_key;
+                self.config.tls_rsa_signing_key = state.default.rsa_signing_key;
+                switch (state.tls12_mode) {
+                    .disabled => {
+                        self.config.tls12_cert_chain = &.{};
+                        self.config.tls12_signing_key = null;
+                    },
+                    .shared_default => {
+                        self.config.tls12_cert_chain = state.default.cert_chain;
+                        self.config.tls12_signing_key = state.default.ecdsa_p256_signing_key;
+                    },
+                    .generated => {
+                        self.config.tls12_cert_chain = state.generated_tls12.?.cert_chain;
+                        self.config.tls12_signing_key = state.generated_tls12.?.key;
+                    },
+                }
+                self.acme_reload_requested.store(state.reload_pending, .release);
+                self.acme_reload_retry_after_ms = state.reload_retry_after_ms;
+            }
+            if (wasm_replacement) |*replacement| {
+                var prior = self.wasm;
+                self.wasm = replacement.release();
+                prior.deinit();
+            }
+            if (self.ocsp_worker != null) {
+                const state = if (ocsp_state_replacement) |*replacement| replacement.release() else unreachable;
+                self.ocsp_staple_pending.store(state.pending, .release);
+                self.ocsp_staple_rejected.store(state.rejected, .release);
+                self.ocsp_staple_incoming = state.incoming;
+                self.ocsp_staple_owned = state.current;
+                self.ocsp_staple_prev = state.previous;
+                self.config.tls_ocsp_staple = if (state.active) state.current else null;
+                self.ocsp_staple_valid_until_unix = ocsp_restored_valid_until_unix;
+                self.ocsp_staple_validated_at_unix = std.math.minInt(i64);
+            }
+            if (resv_replacement) |*replacement|
+                std.mem.swap(svc_resv.ChannelResv, &self.chan_resv, replacement)
+            else
+                unreachable;
+            if (jupe_replacement) |*replacement|
+                std.mem.swap(svc_jupe.JupeStore, &self.server_jupe, replacement)
+            else
+                unreachable;
+            if (gag_replacement) |*replacement|
+                std.mem.swap(gag_set.GagSet, &self.gags, replacement)
+            else
+                unreachable;
+            if (shun_replacement) |*replacement|
+                std.mem.swap(shun_mod.ShunList, &self.shuns, replacement)
+            else
+                unreachable;
+            if (account_abuse_replacement) |*replacement|
+                std.mem.swap(account_abuse_mod.AccountAbuse, &self.account_abuse, replacement)
+            else
+                unreachable;
+            if (content_filter_replacement) |*replacement|
+                std.mem.swap(content_filter_mod.ContentFilter, &self.content_filter, replacement)
+            else
+                unreachable;
+            if (reputation_replacement) |*replacement|
+                std.mem.swap(ip_reputation_mod.IpReputation, &self.reputation, replacement)
+            else
+                unreachable;
+            if (spamtrap_replacement) |*replacement| {
+                lockSpin(&self.spamtrap_mu);
+                std.mem.swap(spamtrap_mod.DefaultSpamtrap, &self.spamtrap, replacement);
+                self.spamtrap_active.store(self.spamtrap.trapNickCount() + self.spamtrap.trapChannelCount() > 0, .release);
+                self.spamtrap_mu.unlock();
+            } else unreachable;
+            if (throttle_replacement) |*replacement| {
+                if (self.conn_throttle) |*live|
+                    std.mem.swap(clone_detect_mod.CloneDetector, live, replacement)
+                else
+                    unreachable;
+            }
+            if (mesh_clones_replacement) |*replacement|
+                std.mem.swap(mesh_clones_mod.MeshClones, &self.mesh_clones, replacement);
+        }
         self.webhook_store.publishUpgradeReplacement(&webhook_replacement);
         self.inherited_webhook_store_restored = true;
         // DPROP1/PRPC and their causal boundary publish together only here.
@@ -31955,13 +33951,12 @@ pub const LinuxServer = struct {
         // fail, and the io loop (the only place a peer's post-RESYNC grant
         // re-mint is processed) has not started, so `applyMeshGrant` sees the
         // converged `had_oper_override` state and never announces a false +Y
-        // transition. Merge (not replace): `loadGrants` may already have
-        // re-minted this node's own persisted grants with a fresh incarnation,
-        // and upsert keeps whichever is newest per account. Tombstones ride
-        // along, preserving the incarnation replay guard across the exec.
+        // transition. The checkpoint supersedes the best-effort grants file:
+        // a stale file must never re-mint a revoked row past its tombstone.
         var oper_grants_restored: usize = 0;
         var oper_grants_dropped: usize = 0;
         if (oper_grant_checkpoint) |snap| {
+            self.inherited_oper_grants_restored = true;
             self.grant_incarnation = @max(self.grant_incarnation, snap.mint_incarnation);
             var grant_it = snap.iterator();
             while (grant_it.next()) |g| {
@@ -32410,6 +34405,10 @@ pub const LinuxServer = struct {
             if (close_fd) closeFd(fd);
             return;
         };
+        if (conn.clone_counted) {
+            if (conn.peer_addr) |addr| self.clone_limit.release(addr);
+            conn.clone_counted = false;
+        }
         self.world.removeClient(worldIdFromClient(id));
         if (conn.session.account()) |acct| _ = self.removeTrackedSession(acct, monitorIdFromClient(id));
         conn.session_list_cache.reset();
@@ -32470,11 +34469,46 @@ pub const LinuxServer = struct {
         };
         const conn = self.rx().clients.get(id).?;
         conn.overflow_allocator = self.allocator; // backs the SendQ overflow heap
+        conn.gagged = snap.gagged;
+        conn.ircx = snap.ircx;
+        conn.unfurl_opt_in = snap.unfurl_opt_in;
+        conn.last_search_ms = snap.last_search_ms;
+        conn.keytrans_require = snap.keytrans_require;
+        conn.nick_claimed_at_ms = snap.nick_claimed_at_ms;
         conn.token = tokenFromId(id) catch {
             _ = self.rx().clients.free(id);
             if (close_fd_on_failure) closeFd(snap.fd);
             return false;
         };
+        conn.peer_addr = snap.peer_addr;
+        conn.throttle_counted = snap.throttle_counted;
+        conn.mesh_clone_counted = snap.mesh_clone_counted;
+        conn.mesh_clone_hash = snap.mesh_clone_hash;
+        if (comptime builtin.os.tag == .windows) {
+            const expected_mesh_hash = self.meshCloneHash(conn);
+            if (self.config.native_adopt_barrier != null and conn.peer_addr == null) {
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                return false;
+            }
+            if (self.config.native_adopt_barrier != null and
+                ((conn.throttle_counted and (self.conn_throttle == null or self.ipCloneExempt(conn))) or
+                    (conn.mesh_clone_counted and (expected_mesh_hash == null or expected_mesh_hash.? != conn.mesh_clone_hash))))
+            {
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                return false;
+            }
+        }
+        if (snap.clone_counted) {
+            const addr = conn.peer_addr orelse {
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                return false;
+            };
+            self.clone_limit.register(addr) catch {
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                return false;
+            };
+            conn.clone_counted = true;
+        }
         // Restore the carried monotonic signon/last-message clocks so WHOIS idle
         // and signon stay continuous across the UPGRADE; a pre-signon snapshot
         // (or a fresh session) carries 0 → fall back to "now". last_activity is a
@@ -32503,6 +34537,21 @@ pub const LinuxServer = struct {
         // Determine the destination physical cap before validating any carried
         // wire/tail/control charge. A smaller new policy refuses the whole adopt.
         self.assignConnClass(conn);
+        if (snap.flood_guard) |carry| {
+            const derived = conn.flood_guard orelse {
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                return false;
+            };
+            conn.flood_guard = flood_guard.FloodGuard.importCarry(derived.config, now, carry) catch {
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                return false;
+            };
+        } else if (comptime builtin.os.tag == .windows) {
+            if (self.config.native_adopt_barrier != null and conn.flood_guard != null) {
+                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                return false;
+            }
+        }
         // TLS client: rebuild the live engine BEFORE anything else can touch the
         // socket. Any failure cleans up the fd/slot and propagates whole-startup
         // refusal — a TLS connection must never be adopted as plaintext.
@@ -40744,6 +42793,7 @@ pub const LinuxServer = struct {
     /// local sessions; remote `*` / +Y projection follows the override edge.
     /// Called once from `start`; no-op without a configured path / readable file.
     fn loadGrants(self: *LinuxServer) void {
+        if (self.inherited_oper_grants_restored) return;
         if (self.config.oper_grants_path.len == 0) return;
         const io = self.config.crypto_io orelse return;
         const text = std.Io.Dir.cwd().readFileAlloc(io, self.config.oper_grants_path, self.allocator, .limited(1 << 20)) catch return;
@@ -40769,6 +42819,7 @@ pub const LinuxServer = struct {
     /// Restore the per-channel statistics snapshot persisted by a previous run,
     /// invoked once from `start`. No-op without a configured dir / readable file.
     fn loadChanstats(self: *LinuxServer) void {
+        if (self.inherited_chanstats_restored) return;
         if (self.config.chanstats_dir.len == 0) return;
         const io = self.config.crypto_io orelse return;
         chanstats_mod.loadSnapshot(&self.chanstats, io, self.config.chanstats_dir);
@@ -51476,6 +53527,39 @@ pub const LinuxServer = struct {
         self.proof_policy_version = slot.*;
     }
 
+    fn windowsPolicySnapshot(self: *LinuxServer) policy_checkpoint.SnapshotView {
+        var view = policy_checkpoint.SnapshotView{ .generations = .{
+            .ward = self.policy_gen_ward,
+            .filter = self.policy_gen_filter,
+            .class = self.policy_gen_class,
+            .ban = self.policy_gen_ban,
+            .proof = self.proof_policy_version,
+        } };
+        if (self.policy_undo) |*undo| {
+            view.previous_generation = undo.generation();
+            view.undo = switch (undo.*) {
+                .ward => |*snap| .{ .ward = .{ .params = self.warden.params, .rows = snap.wards.items } },
+                .filter => |*snap| .{ .filter = .{
+                    .max_patterns = self.content_filter.cfg.max_patterns,
+                    .max_pattern_len = self.content_filter.cfg.max_pattern_len,
+                    .patterns = snap.patterns,
+                } },
+                .class => |*snap| .{ .class = if (snap.registry) |*registry| registry else null },
+                .ban => |*snap| .{ .ban = snap.rows },
+            };
+        }
+        return view;
+    }
+
+    fn windowsPolicyUndoFromOwned(owned: policy_checkpoint.OwnedUndo, generation: u32) PolicyUndo {
+        return switch (owned) {
+            .ward => |snap| .{ .ward = .{ .generation = generation, .wards = snap.rows } },
+            .filter => |snap| .{ .filter = .{ .generation = generation, .patterns = snap.patterns } },
+            .class => |registry| .{ .class = .{ .generation = generation, .registry = registry } },
+            .ban => |rows| .{ .ban = .{ .generation = generation, .rows = rows } },
+        };
+    }
+
     fn snapshotWard(self: *LinuxServer) !PolicyUndo {
         return .{ .ward = .{
             .generation = self.policy_gen_ward,
@@ -53185,6 +55269,42 @@ pub const LinuxServer = struct {
         self.acme_reload_tls = tls;
     }
 
+    /// Read the exact serving TLS generations under the World lock. The
+    /// candidate may have loaded different bytes from disk after ACME wrote a
+    /// renewal or may have minted a different TLS 1.2 side certificate.
+    fn windowsServingTlsSnapshot(self: *LinuxServer) !native_windows_tls_material.Snapshot {
+        if (self.config.tls_cert_chain.len == 0) return error.InvalidRuntime;
+        const default = native_windows_tls_proof.Material{
+            .cert_chain = self.config.tls_cert_chain,
+            .signing_key = if (self.config.tls_signing_key) |*key| key else null,
+            .ecdsa_p256_signing_key = if (self.config.tls_ecdsa_signing_key) |*key| key else null,
+            .rsa_signing_key = if (self.config.tls_rsa_signing_key) |*key| key else null,
+        };
+        const mode: native_windows_tls_proof.Tls12Mode = if (self.config.tls12_cert_chain.len == 0)
+            .disabled
+        else if (self.config.tls_signing_key != null)
+            .generated
+        else
+            .shared_default;
+        const side_key: ?*const ecdsa_p256.KeyPair = if (self.config.tls12_signing_key) |*key| key else null;
+        const tls12_serving: ?native_windows_tls_proof.Material = if (mode == .disabled) null else .{
+            .cert_chain = self.config.tls12_cert_chain,
+            .ecdsa_p256_signing_key = side_key,
+            .rsa_signing_key = if (mode == .shared_default and default.rsa_signing_key != null) default.rsa_signing_key else null,
+        };
+        return .{
+            .default = default,
+            .tls12_serving = tls12_serving,
+            .tls12_mode = mode,
+            .generated_tls12 = if (mode == .generated) .{
+                .cert_chain = self.config.tls12_cert_chain,
+                .signing_key = side_key orelse return error.InvalidRuntime,
+            } else null,
+            .reload_pending = self.acme_reload_requested.load(.acquire),
+            .reload_retry_after_ms = self.acme_reload_retry_after_ms,
+        };
+    }
+
     pub fn requestAcmeTlsReload(self: *LinuxServer) void {
         self.acme_reload_requested.store(true, .release);
     }
@@ -53202,31 +55322,119 @@ pub const LinuxServer = struct {
         self.ocsp_staple_pending.store(true, .release);
     }
 
+    pub fn takeOcspStapleRejected(self: *LinuxServer) bool {
+        return self.ocsp_staple_rejected.swap(false, .acq_rel);
+    }
+
     /// Reactor-0 side of the OCSP-staple handoff: swap in the newest staple. Runs
     /// only on reactor 0 (like `maybeReloadAcmeTls`). The `world.lockWrite` around
     /// each completion serializes this swap against per-connection `tls*Config`
-    /// reads, exactly as for `config.tls_cert_chain`. That lock does not cover a
-    /// slice value already captured into an in-flight handshake before the swap,
-    /// so the superseded generation is retained one extra cycle (`ocsp_staple_prev`)
-    /// and freed on the NEXT swap rather than inline — closing the cross-completion
-    /// window. The published buffer is Service-allocated and freed with the same
-    /// `self.allocator`.
+    /// reads, exactly as for `config.tls_cert_chain`. A previously captured
+    /// slice remains server-owned until no incomplete handshake borrows it.
+    /// The published buffer is Service-allocated and freed with `self.allocator`.
+    fn ocspGenerationBorrowed(self: *LinuxServer, generation: []const u8) bool {
+        if (self.history_https) |*history| {
+            const held = history.tls_config.ocsp_staple;
+            if (held.len == generation.len and held.ptr == generation.ptr) return true;
+        }
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const tls = slot.value.tls orelse continue;
+                if (tls.handshakeDone()) continue;
+                if (tls.cfg13.ocsp_staple.len == generation.len and tls.cfg13.ocsp_staple.ptr == generation.ptr)
+                    return true;
+                if (tls.cfg12) |cfg| {
+                    if (cfg.ocsp_staple.len == generation.len and cfg.ocsp_staple.ptr == generation.ptr)
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn pruneRetiredOcspStaples(self: *LinuxServer) void {
+        var index: usize = 0;
+        while (index < self.ocsp_staple_retired.items.len) {
+            if (self.ocspGenerationBorrowed(self.ocsp_staple_retired.items[index])) {
+                index += 1;
+            } else {
+                self.allocator.free(self.ocsp_staple_retired.orderedRemove(index));
+            }
+        }
+    }
+
+    fn retireExpiredActiveOcspStaple(self: *LinuxServer) void {
+        const active = self.config.tls_ocsp_staple orelse return;
+        const now_unix = @divFloor(platform.realtimeMillis(), 1000);
+        if (now_unix == self.ocsp_staple_validated_at_unix and now_unix < self.ocsp_staple_valid_until_unix) return;
+        if (now_unix < self.ocsp_staple_valid_until_unix and managed_ocsp.stapleServableForChain(
+            active,
+            self.config.tls_cert_chain,
+            now_unix,
+            @import("../crypto/ocsp.zig").default_staple_skew_seconds,
+        )) {
+            self.ocsp_staple_validated_at_unix = now_unix;
+            return;
+        }
+        // Keep the server-owned generation for incomplete handshakes and Helix
+        // custody, but hide it from every new handshake after its deadline.
+        self.config.tls_ocsp_staple = null;
+        self.ocsp_staple_valid_until_unix = 0;
+        self.ocsp_staple_validated_at_unix = std.math.minInt(i64);
+    }
+
     fn maybeSwapOcspStaple(self: *LinuxServer) void {
+        self.retireExpiredActiveOcspStaple();
         if (!self.ocsp_staple_pending.swap(false, .acq_rel)) return;
         lockSpin(&self.ocsp_staple_lock);
         const incoming = self.ocsp_staple_incoming;
         self.ocsp_staple_incoming = null;
         self.ocsp_staple_lock.unlock();
         const next = incoming orelse return;
+        const valid_until_unix = managed_ocsp.stapleValidUntilForChain(
+            next,
+            self.config.tls_cert_chain,
+            @divFloor(platform.realtimeMillis(), 1000),
+            @import("../crypto/ocsp.zig").default_staple_skew_seconds,
+        ) orelse {
+            self.allocator.free(next);
+            // The worker may have read a newly renewed disk leaf while the
+            // serving TLS reload is still pending. Re-fetching now would
+            // contact the same responder for the same unusable response.
+            // The successful live reload below requests a fresh check.
+            return;
+        };
+        const retiring = self.ocsp_staple_prev;
+        const retain_retiring = if (retiring) |old| self.ocspGenerationBorrowed(old) else false;
+        if (retain_retiring) self.ocsp_staple_retired.ensureUnusedCapacity(self.allocator, 1) catch {
+            // Keep the already-fetched, verified DER for the next housekeeping
+            // attempt. Re-fetching the responder cannot repair a local
+            // allocation failure and may leave Must-Staple clients stranded.
+            lockSpin(&self.ocsp_staple_lock);
+            if (self.ocsp_staple_incoming == null) {
+                self.ocsp_staple_incoming = next;
+            } else {
+                self.allocator.free(next);
+            }
+            self.ocsp_staple_lock.unlock();
+            self.ocsp_staple_pending.store(true, .release);
+            return;
+        };
+        // All fallible work is done. Publication and old-generation custody
+        // now advance together under the World write lock.
         self.config.tls_ocsp_staple = next;
-        // Defer the free by one generation (see `reload_tls_prev`): a handshake
-        // that captured the old staple slice must not read freed bytes.
-        if (self.ocsp_staple_prev) |old| self.allocator.free(old);
+        self.ocsp_staple_valid_until_unix = valid_until_unix;
+        self.ocsp_staple_validated_at_unix = @divFloor(platform.realtimeMillis(), 1000);
+        if (retiring) |old| {
+            if (retain_retiring) self.ocsp_staple_retired.appendAssumeCapacity(old) else self.allocator.free(old);
+        }
         self.ocsp_staple_prev = self.ocsp_staple_owned;
         self.ocsp_staple_owned = next;
     }
 
     fn maybeReloadAcmeTls(self: *LinuxServer) void {
+        if (platform.monotonicMillis() < self.acme_reload_retry_after_ms) return;
         if (!self.acme_reload_requested.swap(false, .acq_rel)) return;
         const tls = self.acme_reload_tls orelse {
             srvLog("onyx-server: acme TLS reload requested but no [tls] config is registered\n", .{});
@@ -53238,8 +55446,14 @@ pub const LinuxServer = struct {
         };
         const outcome = self.reloadTlsCerts(io, tls) catch |err| {
             srvLog("onyx-server: acme TLS reload failed ({s}); keeping current certificates\n", .{@errorName(err)});
+            // A freshly written cert/key pair can be temporarily unreadable or
+            // incomplete. Preserve the intent and retry without hammering disk
+            // on every reactor housekeeping tick.
+            self.acme_reload_retry_after_ms = platform.monotonicMillis() +| 30_000;
+            self.acme_reload_requested.store(true, .release);
             return;
         };
+        self.acme_reload_retry_after_ms = 0;
         srvLog("onyx-server: acme TLS reload on reactor 0: {s}\n", .{outcome.note()});
     }
 
@@ -53255,20 +55469,67 @@ pub const LinuxServer = struct {
         return self.reloadTlsCertsLocked(io, tls);
     }
 
+    /// The caller holds the accepted-event boundary. A TLS engine keeps its
+    /// certificate config until its handshake finishes, so reload cadence is
+    /// never a safe proxy for the lifetime of a borrowed chain or RSA key.
+    fn tlsGenerationBorrowed(self: *LinuxServer, generation: *const RetiredTlsGeneration) bool {
+        if (self.history_https) |*history| {
+            if (generation.primary) |loaded| {
+                if (history.tls_config.cert_chain.ptr == loaded.cert_chain.ptr) return true;
+            }
+            if (generation.side) |loaded| {
+                if (history.tls_config.cert_chain.ptr == loaded.cert_chain.ptr) return true;
+            }
+        }
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const tls = slot.value.tls orelse continue;
+                if (tls.handshakeDone()) continue;
+                if (generation.primary) |loaded| {
+                    if (tls.cfg13.cert_chain.ptr == loaded.cert_chain.ptr) return true;
+                    if (tls.cfg12) |cfg| if (cfg.cert_chain.ptr == loaded.cert_chain.ptr) return true;
+                }
+                if (generation.side) |loaded| {
+                    if (tls.cfg13.cert_chain.ptr == loaded.cert_chain.ptr) return true;
+                    if (tls.cfg12) |cfg| if (cfg.cert_chain.ptr == loaded.cert_chain.ptr) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn pruneRetiredTlsGenerations(self: *LinuxServer) void {
+        var index: usize = 0;
+        while (index < self.reload_tls_retired.items.len) {
+            if (self.tlsGenerationBorrowed(&self.reload_tls_retired.items[index])) {
+                index += 1;
+            } else {
+                var retired = self.reload_tls_retired.orderedRemove(index);
+                retired.deinit(self.allocator);
+            }
+        }
+    }
+
     fn reloadTlsCertsLocked(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
         // Mirror the boot gate in main.zig: only [tls] enabled nodes load certs.
         if (!tls.enabled or self.config.tls_cert_chain.len == 0) return .not_configured;
 
         // Load + validate the new material BEFORE touching any live field, so a
         // failure cannot leave the listener half-swapped.
-        var loaded = try tls_certs.loadOrBootstrap(self.allocator, io, .{
+        const tls_options: tls_certs.Options = .{
             .enabled = true,
             .cert_path = tls.cert_path,
             .key_path = tls.key_path,
             .dns_name = tls.dns_name,
-        });
+        };
+        var loaded = if (builtin.os.tag == .windows and self.config.webtransport_port != 0)
+            try tls_certs.loadOrBootstrapWebTransport(self.allocator, io, tls_options)
+        else
+            try tls_certs.loadOrBootstrap(self.allocator, io, tls_options);
         errdefer loaded.deinit(self.allocator);
         try validateReloadedChain(loaded.cert_chain);
+        try native_windows_tls_proof.validateIdentity(native_windows_tls_proof.fromLoaded(&loaded));
 
         // Resolve the hardened TLS 1.2 leg the same way main.zig does at boot:
         // an ECDSA-P256 or RSA leaf serves 1.2 natively (reusing the 1.3 chain);
@@ -53297,9 +55558,52 @@ pub const LinuxServer = struct {
             }
         }
 
-        // Commit: swap the live config fields, then free the PRIOR reload
-        // generation (the boot generation is main-owned and never freed here).
-        // Everything above succeeded, so no error can leave a torn swap.
+        const still_servable_expiry: ?i64 = if (self.ocsp_staple_owned) |der|
+            managed_ocsp.stapleValidUntilForChain(
+                der,
+                loaded.cert_chain,
+                @divFloor(platform.realtimeMillis(), 1000),
+                @import("../crypto/ocsp.zig").default_staple_skew_seconds,
+            )
+        else
+            null;
+        const still_servable_staple: ?[]u8 = if (still_servable_expiry != null) self.ocsp_staple_owned else null;
+
+        self.pruneRetiredTlsGenerations();
+        const retiring = RetiredTlsGeneration{ .primary = self.reload_tls_prev, .side = self.reload_tls12_prev };
+        const retain_retiring = self.tlsGenerationBorrowed(&retiring);
+        if (retain_retiring) try self.reload_tls_retired.ensureUnusedCapacity(self.allocator, 1);
+
+        // WebTransport owns its own QUIC TLS view. Park its pump and require
+        // that no connection still borrows the old certificate before changing
+        // the serving generation. A busy listener retries the reload later;
+        // the ordinary TLS and QUIC views never diverge after publication.
+        const windows_wt_owner: ?*managed_wt.WebTransportListener =
+            if (builtin.os.tag == .windows and self.config.webtransport_port != 0)
+                self.windows_webtransport_owner orelse return error.InvalidRuntime
+            else
+                null;
+        var windows_wt_pause: ?@import("runtime_pause.zig").Token = null;
+        defer if (windows_wt_owner) |owner| {
+            if (windows_wt_pause) |token|
+                owner.resumePaused(token) catch @panic("WebTransport TLS reload pause could not resume");
+        };
+        if (windows_wt_owner) |owner| {
+            const epoch = std.math.add(u64, self.windows_webtransport_pause_epoch, 1) catch return error.InvalidRuntime;
+            const token = try owner.requestPause(epoch);
+            self.windows_webtransport_pause_epoch = epoch;
+            windows_wt_pause = token;
+            try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(2_000),
+            }));
+            const signing_key: @TypeOf(owner.tls.signing_key) =
+                if (loaded.ecdsa_p256_signing_key) |key| .{ .ecdsa_p256 = key } else if (loaded.signing_key) |key| .{ .ed25519 = key } else if (loaded.rsa_signing_key) |key| .{ .rsa = key } else return error.InvalidRuntime;
+            try owner.replaceTlsPausedIdle(token, .{ .cert_chain = loaded.cert_chain, .signing_key = signing_key });
+        }
+
+        // Commit the live config after reserving any retired-generation custody.
+        // The boot generation is main-owned and never freed here.
         self.config.tls_cert_chain = loaded.cert_chain;
         self.config.tls_signing_key = loaded.signing_key;
         self.config.tls_ecdsa_signing_key = loaded.ecdsa_p256_signing_key;
@@ -53309,21 +55613,28 @@ pub const LinuxServer = struct {
             self.config.tls12_signing_key = tls12_key;
         }
 
-        // Defer the free by one generation: an in-flight handshake may still alias
-        // the just-replaced generation's cert bytes, so keep it as `*_prev` and
-        // free only the generation from two reloads ago (which no live handshake
-        // can reference). The boot generation is main-owned and never freed here.
-        if (self.reload_tls_prev) |*old| old.deinit(self.allocator);
-        if (self.reload_tls12_prev) |*old| old.deinit(self.allocator);
+        // Keep a generation older than `*_prev` for as long as any unfinished
+        // TLS handshake still borrows it. The retired-list reservation above
+        // makes this ownership transfer allocation-free after publication.
+        if (retain_retiring) {
+            self.reload_tls_retired.appendAssumeCapacity(retiring);
+        } else {
+            var unused = retiring;
+            unused.deinit(self.allocator);
+        }
         self.reload_tls_prev = self.reload_tls;
         self.reload_tls12_prev = self.reload_tls12;
         self.reload_tls = loaded;
         self.reload_tls12 = new_tls12;
 
-        // The new leaf has a new serial, so any cached staple no longer covers it.
-        // Stop stapling until the OCSP fetch worker publishes a fresh response for
-        // the new serial; the owned buffer is freed on the next publish/deinit.
-        self.config.tls_ocsp_staple = null;
+        // An unchanged leaf can keep its still-valid response. A rotated or
+        // expired leaf clears the active view and wakes the worker's retry lane;
+        // it must not wait out the former certificate's refresh deadline.
+        self.config.tls_ocsp_staple = still_servable_staple;
+        self.ocsp_staple_valid_until_unix = still_servable_expiry orelse 0;
+        self.ocsp_staple_validated_at_unix = std.math.minInt(i64);
+        if (self.ocsp_worker != null and still_servable_staple == null)
+            self.ocsp_staple_rejected.store(true, .release);
         return .reloaded;
     }
 
@@ -61232,6 +63543,11 @@ fn restoreCloexec(fds: []const linux.fd_t) void {
 }
 
 fn setCloexec(fd: linux.fd_t, enabled: bool) bool {
+    if (builtin.os.tag == .windows and fd > 0 and fd < 0x4000_0000) {
+        // Native Helix imports sockets with WSA_FLAG_NO_HANDLE_INHERIT.
+        // Their canonical IDs are registry keys, not kernel file handles.
+        return enabled and io_backend.windowsSocketValid(fd);
+    }
     if (builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         os_runtime.setCloexec(fd, enabled) catch return false;
         return true;
@@ -71413,6 +73729,7 @@ test "UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, t
     defer successor.deinit();
     _ = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-oper-grants");
     current_reactor = null;
+    try std.testing.expect(successor.inherited_oper_grants_restored);
 
     // The successor's inactive compatibility registry converges before its I/O
     // loop, but the restored record remains telemetry and cannot project any
@@ -71496,6 +73813,7 @@ test "UPGRADE arena without an oper-grant checkpoint (pre-checkpoint predecessor
     current_reactor = null;
     try std.testing.expectEqual(@as(usize, 0), successor.oper_grants.count());
     try std.testing.expectEqual(@as(u64, 0), successor.grant_incarnation);
+    try std.testing.expect(!successor.inherited_oper_grants_restored);
 }
 
 test "UPGRADE legacy v3 session mints stable AID and nonempty ADS1 follows it across two hops" {
@@ -73751,7 +76069,7 @@ test "MESSAGE_V2 Helix activation is staged exact and monotonic across current h
 }
 
 test "UPGRADE continuity gate accepts idle state and refuses every media or companion owner" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -73817,6 +76135,22 @@ test "UPGRADE continuity gate accepts idle state and refuses every media or comp
     try std.testing.expectEqual(Server.UpgradeContinuityBlocker.acme_companion, blocker(&server).?);
     server.acme_reload_tls = null;
     try std.testing.expect(blocker(&server) == null);
+
+    if (comptime builtin.os.tag == .windows) {
+        server.policy_gen_filter = 2;
+        try std.testing.expect(blocker(&server) == null);
+        server.policy_gen_filter = 1;
+        server.memo_durable_dirty = true;
+        try std.testing.expectEqual(Server.UpgradeContinuityBlocker.windows_memo_authority, blocker(&server).?);
+        server.memo_durable_dirty = false;
+        server.challenge_method = .question;
+        try std.testing.expect(blocker(&server) == null);
+        server.challenge_method = .pow;
+        try server.autojoins.add("alice", "#autojoin");
+        try std.testing.expect(blocker(&server) == null);
+        _ = server.autojoins.remove("alice", "#autojoin") catch unreachable;
+        try std.testing.expect(blocker(&server) == null);
+    }
 }
 
 fn gapA4ReplayShowsPeer(server: *Server, alloc: std.mem.Allocator) !void {
@@ -95230,6 +97564,49 @@ test "threaded server: OROWASM reports ABI budgets and plugin registrations to o
     try recvUntil(&admin, "handle=1 name=guard tier=verified signed=true commands=0 hooks=1 grants=(none) intents=(none)", 200);
 }
 
+test "Helix grant checkpoint ignores stale persisted grant after revocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "oper-grants.tsv",
+        .data = "revoked_oper\t1\tnetadmin\tStale grant\n",
+    });
+    var tmp_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPath(std.testing.io, &tmp_path_buf);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const grants_path = try std.fmt.bufPrint(&path_buf, "{s}/oper-grants.tsv", .{tmp_path_buf[0..tmp_path_len]});
+    const successor = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .oper_grants_path = grants_path,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.destroy(successor);
+    defer successor.deinit();
+    const now = successor.grantNowU64();
+    const incarnation = now + 5;
+    _ = successor.oper_grants.upsert(.{
+        .account = "revoked_oper",
+        .privilege_bits = 0,
+        .class = "revoked",
+        .title = "",
+        .issuer_node = protocol_inventory.currentServerName(),
+        .incarnation = incarnation,
+        .issued_ms = now,
+        .expiry_ms = now + Server.oper_grant_ttl_ms,
+    });
+    successor.grant_incarnation = incarnation;
+    successor.inherited_oper_grants_restored = true;
+    successor.loadGrants();
+    const carried = successor.oper_grants.lookup("revoked_oper", now) orelse return error.TestExpectedGrant;
+    try std.testing.expectEqual(@as(u64, 0), carried.privilege_bits);
+    try std.testing.expectEqual(incarnation, carried.incarnation);
+    try std.testing.expectEqual(incarnation, successor.grant_incarnation);
+}
+
 test "threaded server: SASL oper elevation persists inactive OCG1 compatibility record" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -98770,6 +101147,47 @@ test "Windows native Helix listener manifest verifies exact bound socket roles" 
     try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
     cfg.native_listener_manifest = &.{.{ .shard = 0, .kind = .tls, .family = .ipv6, .fd = listener }};
     try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
+}
+
+test "Windows Helix admission checkpoints match the carried physical clients" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_clients = 2,
+        .throttle_connects = 5,
+        .max_clones_per_ip_net = 6,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try server.reactors[0].clients.alloc(ConnState.init(-1));
+    defer _ = server.reactors[0].clients.free(id);
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    conn.throttle_counted = true;
+    const hash = server.meshCloneHash(conn).?;
+    conn.mesh_clone_counted = true;
+    conn.mesh_clone_hash = hash;
+
+    var detector = clone_detect_mod.CloneDetector.init(allocator, server.conn_throttle.?.params);
+    defer detector.deinit();
+    try std.testing.expectEqual(clone_detect_mod.Decision.allow, try detector.classifyConnect(100, "203.0.113.7"));
+    var clones = mesh_clones_mod.MeshClones.init(allocator);
+    defer clones.deinit();
+    try std.testing.expectEqual(@as(u32, 1), try clones.addLocal(hash));
+    try server.validateInheritedAdmissionRelation(&detector, &clones);
+
+    try std.testing.expect(detector.disconnect("203.0.113.7"));
+    try std.testing.expectError(error.InvalidAdmissionRelation, server.validateInheritedAdmissionRelation(&detector, &clones));
+    try std.testing.expectEqual(clone_detect_mod.Decision.allow, try detector.classifyConnect(101, "203.0.113.7"));
+    try std.testing.expectEqual(@as(u32, 0), clones.removeLocal(hash));
+    try std.testing.expectError(error.InvalidAdmissionRelation, server.validateInheritedAdmissionRelation(&detector, &clones));
 }
 
 test "shared full server: OpenBSD native Helix stages live clients until COMMIT and preserves ABORT peers" {
@@ -122528,7 +124946,7 @@ fn rehashTmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, name: []
 }
 
 test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior reload gen, keeps boot certs" {
-    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         const allocator = std.testing.allocator;
         const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
         const pem = @import("../proto/pem.zig");
@@ -122546,6 +124964,7 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
             .tls_port = 0,
             .tls_cert_chain = &boot_chain,
             .tls_signing_key = a.kp,
+            .crypto_io = std.testing.io,
         }) catch |err| switch (err) {
             error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
             else => return err,
@@ -122588,6 +125007,29 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
         try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, outcome_b);
         try std.testing.expectEqualSlices(u8, b.der, server.config.tls_cert_chain[0]);
         try std.testing.expect(server.reload_tls != null);
+        if (comptime builtin.os.tag == .windows) {
+            // This companion borrows the same B generation independently of
+            // reactor clients; later reloads must retain it until shutdown.
+            _ = server.openHistoryHttps("127.0.0.1", 0, server.tls13Config(false)) catch |err| switch (err) {
+                error.SocketUnavailable, error.BindFailed, error.ListenFailed => return error.SkipZigTest,
+                else => return err,
+            };
+        }
+        // Leave a ClientHello incomplete across two further reloads. The TLS
+        // adapter borrows B's chain until that handshake finishes or closes.
+        const pending_tls = try allocator.create(tls_conn.TlsConn);
+        pending_tls.* = try tls_conn.TlsConn.init(allocator, server.tls13Config(false));
+        const pending_id = try server.rx().clients.alloc(ConnState.init(-1));
+        const pending = server.rx().clients.get(pending_id).?;
+        pending.tls = pending_tls;
+        var pending_live = true;
+        defer if (pending_live) {
+            pending.tls = null;
+            pending_tls.deinit();
+            allocator.destroy(pending_tls);
+            _ = server.rx().clients.free(pending_id);
+        };
+        try std.testing.expect(!pending_tls.handshakeDone());
         // Boot cert A is untouched: its stack bytes are unchanged (the swap pointed the
         // live chain at the server-owned reload gen and never freed the boot bytes —
         // the testing allocator doesn't even own `a.der`, so any free attempt aborts).
@@ -122639,10 +125081,8 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
         try std.testing.expect(server.reload_tls_prev != null);
         try std.testing.expectEqualSlices(u8, b.der, server.reload_tls_prev.?.cert_chain[0]);
 
-        // Third reload to cert D: this is what actually fires the deferred-free branch
-        // on the live reload path — B (now two generations old) is freed here, C is
-        // retained as the new `reload_tls_prev`. Under the testing allocator a leak or
-        // double-free of B fails; the boot cert A is still never freed.
+        // Third reload to cert D would previously free B while its incomplete
+        // handshake still borrowed the chain. B must move into retained custody.
         var d_buf: [1024]u8 = undefined;
         const d = try mintRehashTlsLeaf(&d_buf, 0x77, "d.test");
         const d_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x77));
@@ -122669,6 +125109,21 @@ test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior relo
         // C is now the retained previous generation (B was freed by this reload).
         try std.testing.expect(server.reload_tls_prev != null);
         try std.testing.expectEqualSlices(u8, c.der, server.reload_tls_prev.?.cert_chain[0]);
+        try std.testing.expectEqual(@as(usize, 1), server.reload_tls_retired.items.len);
+        try std.testing.expectEqualSlices(u8, b.der, server.reload_tls_retired.items[0].primary.?.cert_chain[0]);
+        pending.tls = null;
+        pending_tls.deinit();
+        allocator.destroy(pending_tls);
+        _ = server.rx().clients.free(pending_id);
+        pending_live = false;
+        server.pruneRetiredTlsGenerations();
+        if (comptime builtin.os.tag == .windows) {
+            try std.testing.expectEqual(@as(usize, 1), server.reload_tls_retired.items.len);
+            server.history_https.?.shutdown();
+            server.history_https = null;
+            server.pruneRetiredTlsGenerations();
+        }
+        try std.testing.expectEqual(@as(usize, 0), server.reload_tls_retired.items.len);
     } else return error.SkipZigTest;
 }
 
@@ -122708,6 +125163,145 @@ test "REHASH cert hot-reload: invalid cert path keeps current certs and errors" 
             &a.kp.public_key.toBytes(),
             &server.config.tls_signing_key.?.public_key.toBytes(),
         );
+    } else return error.SkipZigTest;
+}
+
+test "REHASH cert hot-reload rejects mismatched leaf and private key before publication" {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
+        const allocator = std.testing.allocator;
+        const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
+        const pem = @import("../proto/pem.zig");
+
+        var a_buf: [1024]u8 = undefined;
+        const a = try mintRehashTlsLeaf(&a_buf, 0x81, "a.test");
+        const boot_chain = [_][]const u8{a.der};
+        var server = Server.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &boot_chain,
+            .tls_signing_key = a.kp,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        var b_buf: [1024]u8 = undefined;
+        const b = try mintRehashTlsLeaf(&b_buf, 0x82, "b.test");
+        const c_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x83));
+        var c_key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+        const c_key_der = try ed25519_pkcs8.encode(&c_key_der_buf, c_seed);
+        var cert_pem_buf: [4096]u8 = undefined;
+        const cert_pem = try pem.encode(&cert_pem_buf, "CERTIFICATE", b.der);
+        var key_pem_buf: [4096]u8 = undefined;
+        const key_pem = try pem.encode(&key_pem_buf, "PRIVATE KEY", c_key_der);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "mismatch.pem", .data = cert_pem });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "mismatch.key", .data = key_pem });
+        const cert_path = try rehashTmpPath(allocator, tmp, "mismatch.pem");
+        defer allocator.free(cert_path);
+        const key_path = try rehashTmpPath(allocator, tmp, "mismatch.key");
+        defer allocator.free(key_path);
+        const tls = config_format.Config.Tls{
+            .enabled = true,
+            .cert_path = cert_path,
+            .key_path = key_path,
+            .dns_name = "b.test",
+        };
+        try std.testing.expectError(error.TlsKeyMismatch, server.reloadTlsCerts(std.testing.io, &tls));
+        try std.testing.expectEqualSlices(u8, a.der, server.config.tls_cert_chain[0]);
+        try std.testing.expectEqualSlices(u8, &a.kp.public_key.toBytes(), &server.config.tls_signing_key.?.public_key.toBytes());
+        try std.testing.expect(server.reload_tls == null);
+    } else return error.SkipZigTest;
+}
+
+test "expired OCSP active view is withheld and Windows custody stays inactive" {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
+        const allocator = std.testing.allocator;
+        var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        const retained = try allocator.dupe(u8, "stale DER");
+        server.ocsp_staple_owned = retained;
+        server.config.tls_ocsp_staple = retained;
+        server.ocsp_staple_valid_until_unix = @divFloor(platform.realtimeMillis(), 1000) - 1;
+        try std.testing.expectEqual(@as(usize, 0), server.tls13Config(false).ocsp_staple.len);
+        try std.testing.expect(server.config.tls_ocsp_staple == null);
+        try std.testing.expectEqualSlices(u8, "stale DER", server.ocsp_staple_owned.?);
+        const wire = try native_windows_ocsp_state.encodeSnapshot(allocator, .{
+            .pending = false,
+            .active = server.config.tls_ocsp_staple != null,
+            .current = server.ocsp_staple_owned,
+        });
+        defer native_windows_ocsp_state.freeEncoded(allocator, wire);
+        var state = try native_windows_ocsp_state.decodeOwned(allocator, wire);
+        defer state.deinit();
+        try std.testing.expect(!state.active);
+        try std.testing.expectEqualSlices(u8, "stale DER", state.current.?);
+    } else return error.SkipZigTest;
+}
+
+test "retired OCSP generation stays live through an incomplete borrowed TLS handshake" {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
+        const allocator = std.testing.allocator;
+        var cert_buf: [1024]u8 = undefined;
+        const cert = try mintRehashTlsLeaf(&cert_buf, 0x84, "ocsp.test");
+        const chain = [_][]const u8{cert.der};
+        var server = Server.init(allocator, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .tls_port = 0,
+            .tls_cert_chain = &chain,
+            .tls_signing_key = cert.kp,
+            .crypto_io = std.testing.io,
+        }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+
+        const old = try allocator.dupe(u8, "retired staple");
+        try server.ocsp_staple_retired.append(allocator, old);
+        const pending_tls = try allocator.create(tls_conn.TlsConn);
+        var tls_cfg = server.tls13Config(false);
+        tls_cfg.ocsp_staple = old;
+        pending_tls.* = try tls_conn.TlsConn.initBorrowed(allocator, tls_cfg);
+        const pending_id = try server.rx().clients.alloc(ConnState.init(-1));
+        const pending = server.rx().clients.get(pending_id).?;
+        pending.tls = pending_tls;
+        var pending_live = true;
+        defer if (pending_live) {
+            pending.tls = null;
+            pending_tls.deinit();
+            allocator.destroy(pending_tls);
+            _ = server.rx().clients.free(pending_id);
+        };
+        try std.testing.expect(!pending_tls.handshakeDone());
+        try std.testing.expect(server.ocspGenerationBorrowed(old));
+        server.pruneRetiredOcspStaples();
+        try std.testing.expectEqual(@as(usize, 1), server.ocsp_staple_retired.items.len);
+        try std.testing.expect(pending_tls.ocsp_owned13 == null);
+        // The independent HTTPS companion may borrow the same generation for
+        // longer than a reactor TLS handshake.
+        _ = server.openHistoryHttps("127.0.0.1", 0, tls_cfg) catch |err| switch (err) {
+            error.SocketUnavailable, error.BindFailed, error.ListenFailed => return error.SkipZigTest,
+            else => return err,
+        };
+        pending.tls = null;
+        pending_tls.deinit();
+        allocator.destroy(pending_tls);
+        _ = server.rx().clients.free(pending_id);
+        pending_live = false;
+        server.pruneRetiredOcspStaples();
+        try std.testing.expectEqual(@as(usize, 1), server.ocsp_staple_retired.items.len);
+        server.history_https.?.shutdown();
+        server.history_https = null;
+        server.pruneRetiredOcspStaples();
+        try std.testing.expectEqual(@as(usize, 0), server.ocsp_staple_retired.items.len);
     } else return error.SkipZigTest;
 }
 
@@ -127359,7 +129953,7 @@ test "GAP-P12 a loopback history read matches CHATHISTORY visibility" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const Ed25519 = std.crypto.sign.Ed25519;
     defer current_reactor = null;
-    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p12.test" };
+    const config = Config{ .host = "127.0.0.1", .port = 0, .server_name = "p12.test", .crypto_io = std.testing.io };
     const server = createTestServer(alloc, config) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,

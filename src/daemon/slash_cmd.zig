@@ -12,7 +12,7 @@ pub const max_help: usize = 80;
 pub const max_args: u8 = 8;
 pub const max_account: usize = 64;
 
-const Slot = struct {
+pub const Slot = struct {
     used: bool = false,
     account: [max_account]u8 = @splat(0),
     account_len: usize = 0,
@@ -52,6 +52,18 @@ pub const Table = struct {
             return;
         }
         const slot = self.freeSlot() orelse return error.Full;
+        write(slot, account, name, help, argc);
+        slot.used = true;
+    }
+
+    /// Restore a checkpointed command at its original slot. Keeping holes is
+    /// necessary because list order and the next free slot are observable.
+    pub fn restoreAt(self: *Table, index: usize, account: []const u8, name: []const u8, help: []const u8, argc: u8) !void {
+        if (index >= self.slots.len or self.slots[index].used) return error.Rejected;
+        if (account.len == 0 or account.len > max_account) return error.Rejected;
+        if (!validName(name) or help.len == 0 or help.len > max_help or argc > max_args) return error.Rejected;
+        if (self.findSlot(account, name) != null) return error.Rejected;
+        const slot = &self.slots[index];
         write(slot, account, name, help, argc);
         slot.used = true;
     }

@@ -10,6 +10,12 @@ const io_backend = @import("../io_backend.zig");
 const control = @import("native_windows_control.zig");
 const process = @import("native_windows_process.zig");
 const bootstrap = @import("native_windows_bootstrap.zig");
+const wal_mod = @import("native_windows_wal.zig");
+const metrics_mod = @import("native_windows_metrics.zig");
+const webhook_mod = @import("native_windows_webhook.zig");
+const history_mod = @import("native_windows_history.zig");
+const udp_mod = @import("native_windows_udp_custody.zig");
+const store = @import("../store.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const ready_magic = "HXWR";
@@ -18,9 +24,10 @@ const ready_body_len = 64;
 const wait_object_0: u32 = 0;
 const wait_timeout: u32 = 258;
 const wait_failed: u32 = 0xffff_ffff;
-const digest_domain = "onyx-helix-windows-ready-v1";
+const digest_domain = "onyx-helix-windows-ready-v6";
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) usize;
 extern "kernel32" fn GetProcessId(handle: usize) callconv(.winapi) u32;
 extern "kernel32" fn WaitForSingleObject(handle: usize, ms: u32) callconv(.winapi) u32;
 extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
@@ -36,7 +43,7 @@ const TestProcessInformation = extern struct {
 };
 
 pub const Digest = [32]u8;
-pub const Error = control.Error || bootstrap.Error || io_backend.WindowsTcpObservationError || platform.EntropyError || error{
+pub const Error = control.Error || bootstrap.Error || wal_mod.Error || io_backend.WindowsTcpObservationError || platform.EntropyError || error{
     InvalidCandidate,
     InvalidReady,
     InvalidDecision,
@@ -45,7 +52,7 @@ pub const Error = control.Error || bootstrap.Error || io_backend.WindowsTcpObser
     WaitFailed,
 };
 
-const Phase = enum(u16) { challenge = 1, response = 2, commit = 3, abort = 4 };
+const Phase = enum(u16) { challenge = 1, response = 2, commit = 3, abort = 4, commit_ack = 5 };
 
 const Ticket = struct {
     identity: control.Identity,
@@ -87,10 +94,57 @@ fn hashRow(hash: *Sha256, canonical: i32, shard: u16, role: bootstrap.Role, fami
 /// socket manifest that it sent. A zero-state or listener-only manifest is
 /// valid; no client row is synthesized.
 pub fn sourceDigest(plaintext: []const u8, rows: []const bootstrap.SourceRow) Error!Digest {
+    return sourceDigestWithWal(plaintext, rows, null, 1);
+}
+
+/// READY binds the exact candidate-local WAL HANDLE and witnessed file, or
+/// the canonical absent frame, after the ordered state/socket manifest.
+pub fn sourceDigestWithWal(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32) Error!Digest {
+    return sourceDigestWithWalAndConfig(plaintext, rows, wal, target_pid, @splat(0));
+}
+
+/// The production challenge also binds the config source transcript delivered
+/// over the authenticated control channel. A candidate compares that source
+/// to its own boot parse before it can answer READY.
+pub fn sourceDigestWithWalAndConfig(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8) Error!Digest {
+    return sourceDigestWithWalConfigAndMetrics(plaintext, rows, wal, target_pid, source_digest, metrics_mod.absentFrame());
+}
+
+/// The companion frame includes the exact source exposition digest and
+/// candidate-local read-only section/socket capabilities. READY binds those
+/// authenticated bytes even after the one-use Winsock record is consumed.
+pub fn sourceDigestWithWalConfigAndMetrics(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8, metrics_body: metrics_mod.Frame) Error!Digest {
+    return sourceDigestWithWalConfigMetricsAndWebhook(plaintext, rows, wal, target_pid, source_digest, metrics_body, webhook_mod.absentFrame());
+}
+
+pub fn sourceDigestWithWalConfigMetricsAndWebhook(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame) Error!Digest {
+    return sourceDigestWithWalConfigMetricsWebhookAndHistory(plaintext, rows, wal, target_pid, source_digest, metrics_body, webhook_body, history_mod.absentFrame());
+}
+
+pub fn sourceDigestWithWalConfigMetricsWebhookAndHistory(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame) Error!Digest {
+    return sourceDigestWithWalConfigMetricsWebhookHistoryAndUdp(plaintext, rows, wal, target_pid, source_digest, metrics_body, webhook_body, history_body, udp_mod.absentFrame(.webtransport), udp_mod.absentFrame(.media), udp_mod.absentFrame(.native_media));
+}
+
+pub fn sourceDigestWithWalConfigMetricsWebhookHistoryAndUdp(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame, wt_body: udp_mod.Frame, webrtc_body: udp_mod.Frame, native_body: udp_mod.Frame) Error!Digest {
     if (rows.len > bootstrap.max_sockets) return error.InvalidReady;
+    _ = try metrics_mod.parseFrame(&metrics_body, target_pid, &.{});
+    _ = try webhook_mod.parseFrame(&webhook_body, target_pid);
+    _ = try history_mod.parseFrame(&history_body, target_pid);
+    _ = try udp_mod.validateFrame(&wt_body, .webtransport, target_pid);
+    _ = try udp_mod.validateFrame(&webrtc_body, .media, target_pid);
+    _ = try udp_mod.validateFrame(&native_body, .native_media, target_pid);
     var hash = Sha256.init(.{});
     hashPrefix(&hash, plaintext, rows.len);
     for (rows) |row| hashRow(&hash, row.canonical, row.shard, row.role, row.family);
+    const wal_body = try wal_mod.encode(wal, target_pid);
+    hash.update(&wal_body);
+    hash.update(&source_digest);
+    hash.update(&metrics_body);
+    hash.update(&webhook_body);
+    hash.update(&history_body);
+    hash.update(&wt_body);
+    hash.update(&webrtc_body);
+    hash.update(&native_body);
     var digest: Digest = undefined;
     hash.final(&digest);
     return digest;
@@ -100,6 +154,16 @@ fn incomingDigest(incoming: *const bootstrap.Incoming) Digest {
     var hash = Sha256.init(.{});
     hashPrefix(&hash, incoming.plaintext, incoming.rows.len);
     for (incoming.rows) |row| hashRow(&hash, row.canonical, row.shard, row.role, row.family);
+    // Bootstrap retains the authenticated bytes even after the candidate
+    // transfers HANDLE custody to its read-only staged store before READY.
+    hash.update(&incoming.wal_body);
+    hash.update(&incoming.source_digest);
+    hash.update(&incoming.metrics_body);
+    hash.update(&incoming.webhook_body);
+    hash.update(&incoming.history_body);
+    hash.update(&incoming.webtransport_udp_body);
+    hash.update(&incoming.webrtc_media_udp_body);
+    hash.update(&incoming.native_media_udp_body);
     var digest: Digest = undefined;
     hash.final(&digest);
     return digest;
@@ -158,7 +222,7 @@ fn observeRoles(incoming: *const bootstrap.Incoming) Error!void {
                 (row.family == 6 and std.meta.activeTag(observed.local.address) != .ipv6))
                 return error.InvalidReady;
         },
-        .client, .s2s_state => _ = try io_backend.observeWindowsConnectedTcpSocket(row.canonical),
+        .client, .s2s_state => try io_backend.observeWindowsHelixConnectedTcpSocket(row.canonical),
     };
 }
 
@@ -206,6 +270,11 @@ fn answerChallenge(endpoint: *control.Endpoint, incoming: *bootstrap.Incoming, v
     try observeRoles(incoming);
     try validator.run(validator.context, incoming);
     for (incoming.rows) |row| if (!row.server_owned) return error.InvalidReady;
+    // A PID-scoped UDP provider record is only custody after the inert owner
+    // imports it. READY cannot authorize COMMIT with an unused record.
+    if (incoming.webtransport_udp) |received| if (!received.transfer.consumed) return error.InvalidReady;
+    if (incoming.webrtc_media_udp) |received| if (!received.transfer.consumed) return error.InvalidReady;
+    if (incoming.native_media_udp) |received| if (!received.transfer.consumed) return error.InvalidReady;
     const response = body(.response, ticket);
     try endpoint.send(.ready, &response, deadline);
     answered = true;
@@ -227,6 +296,17 @@ fn sendDecision(endpoint: *control.Endpoint, phase: Phase, ticket: ParentReady, 
     try endpoint.send(if (phase == .commit) .commit else .abort, &decision, deadline);
 }
 
+fn awaitCommitAck(endpoint: *control.Endpoint, ticket: ParentReady, deadline: i64) Error!void {
+    var response = try endpoint.receive(deadline);
+    defer response.deinit();
+    if (!matches(&response, .commit_ack, .commit_ack, ticket)) return error.InvalidDecision;
+}
+
+fn sendCommitAck(endpoint: *control.Endpoint, ticket: ChildReady, deadline: i64) Error!void {
+    const acknowledgement = body(.commit_ack, ticket);
+    try endpoint.send(.commit_ack, &acknowledgement, deadline);
+}
+
 /// A successful COMMIT never returns to the predecessor event loop. Its
 /// process exit closes old SOCKET and IOCP handles; the child observes that
 /// exact process HANDLE before authorizing replacement association. The
@@ -236,6 +316,10 @@ pub fn parentCommitAndExit(candidate: *process.Process, ticket: ParentReady, dea
     try validateParent(candidate);
     if (!std.meta.eql(ticket.identity, candidate.identity)) return error.InvalidReady;
     try sendDecision(&candidate.endpoint, .commit, ticket, deadline);
+    // The predecessor retains authority until the child proves it received
+    // COMMIT. A child timing out at the old bootstrap deadline is rollback-
+    // safe only while this process is still alive to resume every socket.
+    try awaitCommitAck(&candidate.endpoint, ticket, deadline);
     candidate.committed = true;
     ExitProcess(0);
 }
@@ -257,12 +341,17 @@ fn receiveDecision(endpoint: *control.Endpoint, ticket: ChildReady, deadline: i6
     if (!matches(&message, .commit, .commit, ticket)) return error.InvalidDecision;
 }
 
-fn waitForPredecessorExit(parent_process: usize, parent_pid: u32, deadline: i64) Error!void {
+fn waitForPredecessorExit(parent_process: usize, parent_pid: u32, deadline: ?i64) Error!void {
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
     if (parent_process == 0 or parent_pid == 0 or parent_pid == GetCurrentProcessId() or
         GetProcessId(parent_process) != parent_pid) return error.InvalidCandidate;
-    const now = platform.monotonicMillis();
-    const remaining: u32 = if (deadline <= now) 0 else @intCast(@min(@as(i64, std.math.maxInt(u32) - 1), deadline - now));
+    // COMMIT is irreversible: the predecessor has promised to exit. Once that
+    // authenticated decision arrives, never abandon live attachments because
+    // the earlier bootstrap lease expired a moment before process exit.
+    const remaining: u32 = if (deadline) |until| blk: {
+        const now = platform.monotonicMillis();
+        break :blk if (until <= now) 0 else @intCast(@min(@as(i64, std.math.maxInt(u32) - 1), until - now));
+    } else 0xffff_ffff;
     switch (WaitForSingleObject(parent_process, remaining)) {
         wait_object_0 => {},
         wait_timeout => return error.Timeout,
@@ -282,7 +371,8 @@ pub fn childAwaitCommit(child: *process.Incoming, incoming: *bootstrap.Incoming,
         incoming.release_confirmed or incoming.staged_count != incoming.rows.len)
         return error.InvalidReleaseState;
     try receiveDecision(&child.endpoint, ticket, deadline);
-    try waitForPredecessorExit(child.parent_process, child.parent_pid, deadline);
+    try sendCommitAck(&child.endpoint, ticket, deadline);
+    try waitForPredecessorExit(child.parent_process, child.parent_pid, null);
     try incoming.releaseAfterWitness();
 }
 
@@ -345,6 +435,8 @@ test "Windows Helix READY challenge clears final ACK alternation and authenticat
     try std.testing.expectEqual(@as(bool, true), child.awaiting_response);
     try sendDecision(&parent, .commit, ticket, deadline);
     try receiveDecision(&child, runner.ticket.?, deadline);
+    try sendCommitAck(&child, runner.ticket.?, deadline);
+    try awaitCommitAck(&parent, ticket, deadline);
 }
 
 test "Windows Helix READY digest binds zero-state and listener-only manifests" {
@@ -353,6 +445,33 @@ test "Windows Helix READY digest binds zero-state and listener-only manifests" {
     try std.testing.expect(!std.mem.eql(u8, &none, &listener));
     const changed = try sourceDigest("different", &.{});
     try std.testing.expect(!std.mem.eql(u8, &none, &changed));
+}
+
+test "Windows Helix READY digest binds exact WAL custody and candidate PID" {
+    const no_wal = try sourceDigestWithWal("capsules", &.{}, null, 17);
+    const descriptor = store.WindowsWalDescriptor{
+        .handle = 91,
+        .destination_pid = 17,
+        .witness = .{
+            .file = .{ .volume_serial = 3, .file_id = @splat(4) },
+            .parent_directory = .{ .volume_serial = 5, .file_id = @splat(6) },
+            .name_digest = @splat(7),
+            .length = 123,
+        },
+    };
+    const with_wal = try sourceDigestWithWal("capsules", &.{}, &descriptor, 17);
+    try std.testing.expect(!std.mem.eql(u8, &no_wal, &with_wal));
+    var altered = descriptor;
+    altered.witness.length += 1;
+    const changed_length = try sourceDigestWithWal("capsules", &.{}, &altered, 17);
+    try std.testing.expect(!std.mem.eql(u8, &with_wal, &changed_length));
+    altered = descriptor;
+    altered.handle += 1;
+    const changed_handle = try sourceDigestWithWal("capsules", &.{}, &altered, 17);
+    try std.testing.expect(!std.mem.eql(u8, &with_wal, &changed_handle));
+    try std.testing.expectError(error.InvalidFrame, sourceDigestWithWal("capsules", &.{}, &descriptor, 18));
+    const config_bound = try sourceDigestWithWalAndConfig("capsules", &.{}, &descriptor, 17, @splat(8));
+    try std.testing.expect(!std.mem.eql(u8, &with_wal, &config_bound));
 }
 
 test "Windows Helix READY mismatch sends authenticated ABORT before staging" {
@@ -472,7 +591,40 @@ test "Windows Helix zero-state child commits only after authenticated READY and 
     try std.testing.expect(!incoming.release_confirmed);
     try sendDecision(&parent, .commit, ticket, deadline);
     try childAwaitCommit(&child, &incoming, runner.ticket orelse return error.InvalidReady, deadline);
+    try awaitCommitAck(&parent, ticket, deadline);
     try std.testing.expect(incoming.release_confirmed);
     try std.testing.expectError(error.InvalidReleaseState, incoming.releaseAfterWitness());
     try std.testing.expectError(error.InvalidCandidate, waitForPredecessorExit(witness.process, witness.pid + 1, deadline));
+}
+
+test "Windows READY digest binds the exact webhook frame after provider record consumption" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const webhook_http = @import("../webhook_http.zig");
+    const webhook_store = @import("../webhook.zig");
+    const Sink = struct {
+        fn submit(_: *anyopaque, _: *const webhook_store.PendingPost) bool {
+            return false;
+        }
+    };
+    var marker: u8 = 0;
+    const sink = webhook_store.PostSink{ .ctx = &marker, .submit = Sink.submit };
+    var bindings = webhook_store.WebhookStore.init();
+    var source = try webhook_http.WebhookServer.init(&bindings, sink, 0, .{});
+    defer source.shutdown();
+    try source.spawn();
+    source.pause();
+    const carry = try source.captureQuiescedAfterJoin();
+    const pid = GetCurrentProcessId();
+    var prepared = try webhook_mod.prepareSource(.{ .owner = &source, .carry = &carry }, GetCurrentProcess(), pid);
+    defer prepared.deinit();
+    const source_proof: [32]u8 = @splat(0x69);
+    const expected = try sourceDigestWithWalConfigMetricsAndWebhook("fixed point", &.{}, null, pid, source_proof, metrics_mod.absentFrame(), prepared.body);
+    const absent = try sourceDigestWithWalConfigMetricsAndWebhook("fixed point", &.{}, null, pid, source_proof, metrics_mod.absentFrame(), webhook_mod.absentFrame());
+    try std.testing.expect(!std.mem.eql(u8, &expected, &absent));
+    var received = (try webhook_mod.receive(&prepared.body, pid)) orelse return error.InvalidReady;
+    defer received.deinit();
+    var imported = try webhook_http.WebhookServer.initTransferred(&bindings, sink, &received.transfer, &received.carry, .{});
+    defer imported.shutdown();
+    try std.testing.expect(received.transfer.consumed);
+    try std.testing.expectEqual(expected, try sourceDigestWithWalConfigMetricsAndWebhook("fixed point", &.{}, null, pid, source_proof, metrics_mod.absentFrame(), prepared.body));
 }

@@ -16,6 +16,145 @@
 
 const std = @import("std");
 
+pub const max_checkpoint_bytes: usize = @import("helix/live.zig").max_arena_bytes;
+pub const max_checkpoint_entries: usize = 1_048_576;
+pub const checkpoint_magic = [_]u8{ 'M', 'C', 'L', 'N' };
+pub const checkpoint_version: u8 = 1;
+const checkpoint_header_len: usize = 4 + 1 + 3 + 4 + 4 + 4;
+const checkpoint_checksum_len: usize = 32;
+const checkpoint_domain = "onyx-mesh-clones-checkpoint-v1";
+
+pub const CheckpointError = error{
+    BadMagic,
+    UnsupportedVersion,
+    Truncated,
+    TrailingBytes,
+    InvalidField,
+    NonCanonicalOrder,
+    ChecksumMismatch,
+    CheckpointTooLarge,
+} || std.mem.Allocator.Error;
+
+pub fn isUpgradeCheckpoint(bytes: []const u8) bool {
+    return bytes.len >= checkpoint_magic.len and std.mem.eql(u8, bytes[0..checkpoint_magic.len], &checkpoint_magic);
+}
+
+/// Allocation-free structural validation for the Helix relation pass.
+pub fn validateUpgradeCheckpoint(bytes: []const u8) CheckpointError!void {
+    if (bytes.len < checkpoint_header_len + checkpoint_checksum_len) return error.Truncated;
+    if (bytes.len > max_checkpoint_bytes) return error.CheckpointTooLarge;
+    if (!isUpgradeCheckpoint(bytes)) return error.BadMagic;
+    if (bytes[4] != checkpoint_version) return error.UnsupportedVersion;
+    if (!std.mem.eql(u8, bytes[5..8], &.{ 0, 0, 0 })) return error.InvalidField;
+    const body_len: usize = std.mem.readInt(u32, bytes[8..12], .little);
+    const local_count: usize = std.mem.readInt(u32, bytes[12..16], .little);
+    const remote_count: usize = std.mem.readInt(u32, bytes[16..20], .little);
+    if (local_count > max_checkpoint_entries or remote_count > max_checkpoint_entries) return error.CheckpointTooLarge;
+    const local_bytes = std.math.mul(usize, local_count, 12) catch return error.CheckpointTooLarge;
+    const remote_bytes = std.math.mul(usize, remote_count, 20) catch return error.CheckpointTooLarge;
+    const expected_body_len = std.math.add(usize, local_bytes, remote_bytes) catch return error.CheckpointTooLarge;
+    if (body_len != expected_body_len) return error.InvalidField;
+    const expected_len = std.math.add(usize, checkpoint_header_len + checkpoint_checksum_len, body_len) catch return error.CheckpointTooLarge;
+    if (expected_len > max_checkpoint_bytes) return error.CheckpointTooLarge;
+    if (bytes.len < expected_len) return error.Truncated;
+    if (bytes.len > expected_len) return error.TrailingBytes;
+    var digest: [checkpoint_checksum_len]u8 = undefined;
+    checkpointChecksum(bytes[0 .. bytes.len - checkpoint_checksum_len], &digest);
+    const saved_digest: [checkpoint_checksum_len]u8 = bytes[bytes.len - checkpoint_checksum_len ..][0..checkpoint_checksum_len].*;
+    if (!std.crypto.timing_safe.eql([checkpoint_checksum_len]u8, digest, saved_digest)) return error.ChecksumMismatch;
+
+    var reader = CheckpointReader{ .bytes = bytes[checkpoint_header_len .. bytes.len - checkpoint_checksum_len] };
+    var previous_local: ?u64 = null;
+    for (0..local_count) |_| {
+        const hash = try reader.readU64();
+        const count = try reader.readU32();
+        if (count == 0) return error.InvalidField;
+        if (previous_local) |previous| if (hash <= previous) return error.NonCanonicalOrder;
+        previous_local = hash;
+    }
+    var previous_remote: ?RemoteRow = null;
+    for (0..remote_count) |_| {
+        const hash = try reader.readU64();
+        const node = try reader.readU64();
+        const count = try reader.readU32();
+        if (count == 0) return error.InvalidField;
+        const row = RemoteRow{ .key = .{ .hash = hash, .node = node }, .count = count };
+        if (previous_remote) |previous| if (!remoteLess({}, previous, row)) return error.NonCanonicalOrder;
+        previous_remote = row;
+    }
+    if (reader.remaining() != 0) return error.TrailingBytes;
+}
+
+const RemoteRow = struct {
+    key: MeshClones.RemoteKey,
+    count: u32,
+};
+
+fn localLess(_: void, a: Entry, b: Entry) bool {
+    return a.hash < b.hash;
+}
+
+fn remoteLess(_: void, a: RemoteRow, b: RemoteRow) bool {
+    if (a.key.hash != b.key.hash) return a.key.hash < b.key.hash;
+    return a.key.node < b.key.node;
+}
+
+fn checkpointChecksum(bytes: []const u8, out: *[checkpoint_checksum_len]u8) void {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(checkpoint_domain);
+    hasher.update(bytes);
+    hasher.final(out);
+}
+
+const CheckpointWriter = struct {
+    bytes: []u8,
+    pos: usize = 0,
+
+    fn writeBytes(self: *CheckpointWriter, value: []const u8) void {
+        @memcpy(self.bytes[self.pos..][0..value.len], value);
+        self.pos += value.len;
+    }
+
+    fn writeByte(self: *CheckpointWriter, value: u8) void {
+        self.bytes[self.pos] = value;
+        self.pos += 1;
+    }
+
+    fn writeU32(self: *CheckpointWriter, value: u32) void {
+        std.mem.writeInt(u32, self.bytes[self.pos..][0..4], value, .little);
+        self.pos += 4;
+    }
+
+    fn writeU64(self: *CheckpointWriter, value: u64) void {
+        std.mem.writeInt(u64, self.bytes[self.pos..][0..8], value, .little);
+        self.pos += 8;
+    }
+};
+
+const CheckpointReader = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    fn remaining(self: *const CheckpointReader) usize {
+        return self.bytes.len - self.pos;
+    }
+
+    fn take(self: *CheckpointReader, len: usize) CheckpointError![]const u8 {
+        if (len > self.remaining()) return error.Truncated;
+        const result = self.bytes[self.pos..][0..len];
+        self.pos += len;
+        return result;
+    }
+
+    fn readU32(self: *CheckpointReader) CheckpointError!u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
+    }
+
+    fn readU64(self: *CheckpointReader) CheckpointError!u64 {
+        return std.mem.readInt(u64, (try self.take(8))[0..8], .little);
+    }
+};
+
 /// Hash an address's raw bytes with the mesh-wide `key` (16 bytes). Stable across
 /// nodes that share the secret, so a given IP collapses to one hash network-wide.
 pub fn hashIp(key: [16]u8, ip_bytes: []const u8) u64 {
@@ -70,18 +209,28 @@ pub const MeshClones = struct {
     }
 
     /// Apply a peer's authoritative count for `(node, hash)`. A `0` count clears
-    /// the entry. `remote_total` is updated by the delta so it stays consistent.
+    /// the entry. Both maps reserve space before either is changed, so OOM
+    /// leaves the admitted counts untouched. Saturated totals are recomputed
+    /// when a peer lowers its contribution, recovering the true remaining sum.
     pub fn setRemote(self: *MeshClones, node: u64, hash: u64, count: u32) std.mem.Allocator.Error!void {
         const key = RemoteKey{ .node = node, .hash = hash };
         const old: u32 = self.remote.get(key) orelse 0;
         if (count == old) return;
+        const total = self.totalAfterRemoteUpdate(key, old, count);
+        if (old == 0 and count != 0) try self.remote.ensureUnusedCapacity(self.allocator, 1);
+        if (total != 0 and self.remote_total.get(hash) == null)
+            try self.remote_total.ensureUnusedCapacity(self.allocator, 1);
 
         if (count == 0) {
             _ = self.remote.remove(key);
         } else {
-            try self.remote.put(self.allocator, key, count);
+            self.remote.putAssumeCapacity(key, count);
         }
-        try self.applyTotalDelta(hash, old, count);
+        if (total == 0) {
+            _ = self.remote_total.remove(hash);
+        } else {
+            self.remote_total.putAssumeCapacity(hash, total);
+        }
     }
 
     /// Drop every contribution from `node` (on link-down / SQUIT) so a vanished
@@ -102,9 +251,11 @@ pub const MeshClones = struct {
             }
             if (n == 0) break;
             for (batch[0..n]) |k| {
-                const old = self.remote.get(k) orelse continue;
-                _ = self.remote.remove(k);
-                self.applyTotalDelta(k.hash, old, 0) catch {};
+                // In a consistent live map, a removal cannot allocate: the
+                // aggregate key is already present, or its result is zero.
+                // On a previously inconsistent map, retain a contribution if
+                // its correction cannot be represented under OOM.
+                self.setRemote(k.node, k.hash, 0) catch return;
             }
         }
     }
@@ -121,18 +272,152 @@ pub const MeshClones = struct {
         return self.local.iterator();
     }
 
-    /// Adjust `remote_total[hash]` by `new - old` (saturating; a drained entry is
-    /// removed). `remote_total` only ever shrinks to what the per-node entries
-    /// sum to, so it never underflows in practice; saturation guards regardless.
-    fn applyTotalDelta(self: *MeshClones, hash: u64, old: u32, new: u32) std.mem.Allocator.Error!void {
-        const gop = try self.remote_total.getOrPut(self.allocator, hash);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        if (new >= old) {
-            gop.value_ptr.* +|= (new - old);
-        } else {
-            gop.value_ptr.* -|= (old - new);
+    /// Serialize local and per-peer counts in canonical order. The cached
+    /// aggregate is checked against those rows before sealing; an inconsistent
+    /// live aggregate must abort the upgrade rather than change admission on
+    /// restore. The caller owns the returned bytes.
+    pub fn exportUpgradeCheckpoint(self: *const MeshClones, allocator: std.mem.Allocator) CheckpointError![]u8 {
+        const local_count = self.local.count();
+        const remote_count = self.remote.count();
+        if (local_count > max_checkpoint_entries or remote_count > max_checkpoint_entries or
+            self.remote_total.count() > max_checkpoint_entries)
+            return error.CheckpointTooLarge;
+
+        const locals = try allocator.alloc(Entry, local_count);
+        defer allocator.free(locals);
+        const remotes = try allocator.alloc(RemoteRow, remote_count);
+        defer allocator.free(remotes);
+        var local_it = self.local.iterator();
+        var n: usize = 0;
+        while (local_it.next()) |entry| : (n += 1) {
+            if (n >= locals.len) return error.InvalidField;
+            locals[n] = .{ .hash = entry.key_ptr.*, .count = entry.value_ptr.* };
         }
-        if (gop.value_ptr.* == 0) _ = self.remote_total.remove(hash);
+        if (n != locals.len) return error.InvalidField;
+        std.mem.sort(Entry, locals, {}, localLess);
+        for (locals) |row| if (row.count == 0) return error.InvalidField;
+
+        var remote_it = self.remote.iterator();
+        n = 0;
+        while (remote_it.next()) |entry| : (n += 1) {
+            if (n >= remotes.len) return error.InvalidField;
+            remotes[n] = .{ .key = entry.key_ptr.*, .count = entry.value_ptr.* };
+        }
+        if (n != remotes.len) return error.InvalidField;
+        std.mem.sort(RemoteRow, remotes, {}, remoteLess);
+        var previous_hash: ?u64 = null;
+        var sum: u64 = 0;
+        var total_count: usize = 0;
+        for (remotes) |row| {
+            if (row.count == 0) return error.InvalidField;
+            if (previous_hash) |hash| {
+                if (row.key.hash != hash) {
+                    if (self.remote_total.get(hash) != @as(u32, @intCast(@min(sum, std.math.maxInt(u32)))))
+                        return error.InvalidField;
+                    total_count += 1;
+                    sum = 0;
+                }
+            }
+            sum += row.count;
+            previous_hash = row.key.hash;
+        }
+        if (previous_hash) |hash| {
+            if (self.remote_total.get(hash) != @as(u32, @intCast(@min(sum, std.math.maxInt(u32)))))
+                return error.InvalidField;
+            total_count += 1;
+        }
+        if (total_count != self.remote_total.count()) return error.InvalidField;
+
+        const local_bytes = std.math.mul(usize, local_count, 12) catch return error.CheckpointTooLarge;
+        const remote_bytes = std.math.mul(usize, remote_count, 20) catch return error.CheckpointTooLarge;
+        const body_len = std.math.add(usize, local_bytes, remote_bytes) catch return error.CheckpointTooLarge;
+        const total_len = std.math.add(usize, checkpoint_header_len + checkpoint_checksum_len, body_len) catch return error.CheckpointTooLarge;
+        if (total_len > max_checkpoint_bytes) return error.CheckpointTooLarge;
+        const out = try allocator.alloc(u8, total_len);
+        errdefer allocator.free(out);
+        var writer = CheckpointWriter{ .bytes = out };
+        writer.writeBytes(&checkpoint_magic);
+        writer.writeByte(checkpoint_version);
+        writer.writeBytes(&.{ 0, 0, 0 });
+        writer.writeU32(@intCast(body_len));
+        writer.writeU32(@intCast(local_count));
+        writer.writeU32(@intCast(remote_count));
+        for (locals) |row| {
+            writer.writeU64(row.hash);
+            writer.writeU32(row.count);
+        }
+        for (remotes) |row| {
+            writer.writeU64(row.key.hash);
+            writer.writeU64(row.key.node);
+            writer.writeU32(row.count);
+        }
+        std.debug.assert(writer.pos + checkpoint_checksum_len == out.len);
+        var digest: [checkpoint_checksum_len]u8 = undefined;
+        checkpointChecksum(out[0..writer.pos], &digest);
+        writer.writeBytes(&digest);
+        return out;
+    }
+
+    /// Decode into a fresh object so the caller can stage it before COMMIT.
+    /// remote_total is rebuilt only from canonical, nonzero per-peer rows.
+    pub fn restoreUpgradeCheckpoint(allocator: std.mem.Allocator, bytes: []const u8) CheckpointError!MeshClones {
+        try validateUpgradeCheckpoint(bytes);
+        const local_count: usize = std.mem.readInt(u32, bytes[12..16], .little);
+        const remote_count: usize = std.mem.readInt(u32, bytes[16..20], .little);
+
+        var restored = MeshClones.init(allocator);
+        errdefer restored.deinit();
+        var reader = CheckpointReader{ .bytes = bytes[checkpoint_header_len .. bytes.len - checkpoint_checksum_len] };
+        var previous_local: ?u64 = null;
+        for (0..local_count) |_| {
+            const hash = try reader.readU64();
+            const count = try reader.readU32();
+            if (count == 0) return error.InvalidField;
+            if (previous_local) |previous| if (hash <= previous) return error.NonCanonicalOrder;
+            try restored.local.put(allocator, hash, count);
+            previous_local = hash;
+        }
+        var previous_remote: ?RemoteRow = null;
+        for (0..remote_count) |_| {
+            const hash = try reader.readU64();
+            const node = try reader.readU64();
+            const count = try reader.readU32();
+            if (count == 0) return error.InvalidField;
+            const row = RemoteRow{ .key = .{ .hash = hash, .node = node }, .count = count };
+            if (previous_remote) |previous| if (!remoteLess({}, previous, row)) return error.NonCanonicalOrder;
+            try restored.setRemote(node, hash, count);
+            previous_remote = row;
+        }
+        if (reader.remaining() != 0) return error.TrailingBytes;
+        return restored;
+    }
+
+    /// Replace this map only after the complete staged decode succeeds.
+    pub fn replaceFromUpgradeCheckpoint(self: *MeshClones, bytes: []const u8) CheckpointError!void {
+        var replacement = try restoreUpgradeCheckpoint(self.allocator, bytes);
+        const old = self.*;
+        self.* = replacement;
+        replacement = old;
+        replacement.deinit();
+    }
+
+    fn totalAfterRemoteUpdate(self: *const MeshClones, key: RemoteKey, old: u32, new: u32) u32 {
+        const cached = self.remote_total.get(key.hash) orelse 0;
+        if (cached >= old and (cached != std.math.maxInt(u32) or new >= old)) {
+            const next = @as(u64, cached - old) + new;
+            return @intCast(@min(next, std.math.maxInt(u32)));
+        }
+
+        // A saturated aggregate loses the excess above u32. On a decrease,
+        // derive the true sum from all peers instead of subtracting from the
+        // saturated value. This also repairs an older missing/low cache entry.
+        var sum: u128 = new;
+        var it = self.remote.iterator();
+        while (it.next()) |entry| {
+            const other = entry.key_ptr.*;
+            if (other.hash == key.hash and other.node != key.node) sum += entry.value_ptr.*;
+        }
+        return @intCast(@min(sum, std.math.maxInt(u32)));
     }
 };
 
@@ -291,4 +576,163 @@ test "dropNode removes exactly that node's contributions" {
     mc.dropNode(1); // node 1 vanishes
     try std.testing.expectEqual(@as(u32, 2), mc.networkCount(5)); // local 1 + node2 1
     try std.testing.expectEqual(@as(u32, 0), mc.networkCount(8)); // only node 1 was here
+}
+
+test "remote updates remain atomic on OOM" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var mc = MeshClones.init(allocator);
+            defer mc.deinit();
+            mc.setRemote(1, 9, 4) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), mc.remote.count());
+                try std.testing.expectEqual(@as(usize, 0), mc.remote_total.count());
+                return err;
+            };
+            try std.testing.expectEqual(@as(u32, 4), mc.networkCount(9));
+            try std.testing.expectEqual(@as(u32, 4), mc.remote.get(.{ .node = 1, .hash = 9 }).?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+}
+
+test "lowering a saturated remote total restores remaining peer contributions" {
+    var mc = MeshClones.init(std.testing.allocator);
+    defer mc.deinit();
+    try mc.setRemote(1, 9, std.math.maxInt(u32));
+    try mc.setRemote(2, 9, 1);
+    try std.testing.expectEqual(std.math.maxInt(u32), mc.networkCount(9));
+    try mc.setRemote(1, 9, 0);
+    try std.testing.expectEqual(@as(u32, 1), mc.networkCount(9));
+    const wire = try mc.exportUpgradeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(wire);
+    var restored = try MeshClones.restoreUpgradeCheckpoint(std.testing.allocator, wire);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u32, 1), restored.networkCount(9));
+    restored.dropNode(2);
+    try std.testing.expectEqual(@as(u32, 0), restored.networkCount(9));
+
+    try mc.setRemote(1, 9, std.math.maxInt(u32));
+    try mc.setRemote(3, 9, std.math.maxInt(u32));
+    mc.dropNode(1);
+    try std.testing.expectEqual(std.math.maxInt(u32), mc.networkCount(9));
+    mc.dropNode(3);
+    try std.testing.expectEqual(@as(u32, 1), mc.networkCount(9));
+}
+
+test "mesh clones checkpoint preserves each peer and derived totals" {
+    var source = MeshClones.init(std.testing.allocator);
+    defer source.deinit();
+    _ = try source.addLocal(9);
+    _ = try source.addLocal(9);
+    _ = try source.addLocal(4);
+    try source.setRemote(7, 9, 3);
+    try source.setRemote(2, 9, 5);
+    try source.setRemote(7, 4, 1);
+    const wire = try source.exportUpgradeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(wire);
+    try validateUpgradeCheckpoint(wire);
+    var restored = try MeshClones.restoreUpgradeCheckpoint(std.testing.allocator, wire);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u32, 10), restored.networkCount(9));
+    try std.testing.expectEqual(@as(u32, 2), restored.networkCount(4));
+    try std.testing.expectEqual(@as(u32, 3), restored.remote.get(.{ .node = 7, .hash = 9 }).?);
+    try std.testing.expectEqual(@as(u32, 5), restored.remote.get(.{ .node = 2, .hash = 9 }).?);
+    const reencoded = try restored.exportUpgradeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(reencoded);
+    try std.testing.expectEqualSlices(u8, wire, reencoded);
+    restored.dropNode(7);
+    try std.testing.expectEqual(@as(u32, 7), restored.networkCount(9));
+    try std.testing.expectEqual(@as(u32, 1), restored.networkCount(4));
+
+    var reverse = MeshClones.init(std.testing.allocator);
+    defer reverse.deinit();
+    try reverse.setRemote(7, 4, 1);
+    try reverse.setRemote(2, 9, 5);
+    try reverse.setRemote(7, 9, 3);
+    _ = try reverse.addLocal(4);
+    _ = try reverse.addLocal(9);
+    _ = try reverse.addLocal(9);
+    const reverse_wire = try reverse.exportUpgradeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(reverse_wire);
+    try std.testing.expectEqualSlices(u8, wire, reverse_wire);
+}
+
+test "mesh clones checkpoint rejects malformed order, counts and stale total" {
+    var source = MeshClones.init(std.testing.allocator);
+    defer source.deinit();
+    _ = try source.addLocal(9);
+    try source.setRemote(2, 9, 5);
+    try source.setRemote(7, 9, 3);
+    const wire = try source.exportUpgradeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(wire);
+    for (0..wire.len) |n| {
+        try std.testing.expectError(error.Truncated, MeshClones.restoreUpgradeCheckpoint(std.testing.allocator, wire[0..n]));
+    }
+    var damaged = try std.testing.allocator.dupe(u8, wire);
+    defer std.testing.allocator.free(damaged);
+    damaged[4] = 2;
+    try std.testing.expectError(error.UnsupportedVersion, validateUpgradeCheckpoint(damaged));
+    damaged[4] = checkpoint_version;
+    damaged[checkpoint_header_len] ^= 1;
+    try std.testing.expectError(error.ChecksumMismatch, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    std.mem.writeInt(u32, damaged[checkpoint_header_len + 8 ..][0..4], 0, .little);
+    testRechecksum(damaged);
+    try std.testing.expectError(error.InvalidField, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    // Two remote rows share hash 9; making their node ids equal duplicates a key.
+    const second_node_offset = checkpoint_header_len + 12 + 20 + 8;
+    std.mem.writeInt(u64, damaged[second_node_offset..][0..8], 2, .little);
+    testRechecksum(damaged);
+    try std.testing.expectError(error.NonCanonicalOrder, validateUpgradeCheckpoint(damaged));
+
+    const trailing = try std.testing.allocator.alloc(u8, wire.len + 1);
+    defer std.testing.allocator.free(trailing);
+    @memcpy(trailing[0..wire.len], wire);
+    trailing[wire.len] = 0;
+    try std.testing.expectError(error.TrailingBytes, validateUpgradeCheckpoint(trailing));
+
+    source.remote_total.getPtr(9).?.* = 1;
+    try std.testing.expectError(error.InvalidField, source.exportUpgradeCheckpoint(std.testing.allocator));
+}
+
+test "mesh clones checkpoint allocation failures never publish partial state" {
+    var source = MeshClones.init(std.testing.allocator);
+    defer source.deinit();
+    _ = try source.addLocal(1);
+    try source.setRemote(2, 1, 3);
+    try source.setRemote(3, 5, 2);
+    const EncodeSweep = struct {
+        fn run(allocator: std.mem.Allocator, mc: *const MeshClones) !void {
+            const bytes = try mc.exportUpgradeCheckpoint(allocator);
+            defer allocator.free(bytes);
+            try std.testing.expectEqual(@as(u32, 4), mc.networkCount(1));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, EncodeSweep.run, .{&source});
+    const wire = try source.exportUpgradeCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(wire);
+    const RestoreSweep = struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var target = MeshClones.init(allocator);
+            defer target.deinit();
+            _ = try target.addLocal(77);
+            target.replaceFromUpgradeCheckpoint(bytes) catch |err| {
+                try std.testing.expectEqual(@as(u32, 1), target.networkCount(77));
+                return err;
+            };
+            try std.testing.expectEqual(@as(u32, 4), target.networkCount(1));
+            try std.testing.expectEqual(@as(u32, 2), target.networkCount(5));
+            try std.testing.expectEqual(@as(u32, 0), target.networkCount(77));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, RestoreSweep.run, .{wire});
+}
+
+fn testRechecksum(bytes: []u8) void {
+    var digest: [checkpoint_checksum_len]u8 = undefined;
+    checkpointChecksum(bytes[0 .. bytes.len - checkpoint_checksum_len], &digest);
+    @memcpy(bytes[bytes.len - checkpoint_checksum_len ..], &digest);
 }

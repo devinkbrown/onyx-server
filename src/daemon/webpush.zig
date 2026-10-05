@@ -512,13 +512,31 @@ pub const Worker = struct {
         return .{ .allocator = allocator, .jobs = jobs, .dead = dead, .sent = self.sent, .failed = self.failed, .dropped = self.dropped.load(.acquire), .overflow_events = self.overflow_events, .config_digest = digest, .execution = execution };
     }
     pub fn restoreSnapshot(self: *Worker, snapshot: *const Snapshot, bounds: SnapshotBounds) !void {
+        try self.restoreSnapshotAt(snapshot, bounds, false);
+    }
+
+    /// A successor may prepare this worker under the runtime Gate before
+    /// inheriting queued output. The Gate's real thread has not entered `run`;
+    /// recheck that exact parked owner after cloning and before the no-fail swap.
+    pub fn restoreSnapshotParked(self: *Worker, snapshot: *const Snapshot, bounds: SnapshotBounds) !void {
+        try self.restoreSnapshotAt(snapshot, bounds, true);
+    }
+
+    fn requireRestoreCut(self: *Worker, comptime parked: bool) !void {
+        if (self.thread != null or self.runtime.pause.request_epoch != 0) return error.AlreadyStarted;
+        if (parked) {
+            try self.requireParked();
+        } else if (self.runtime.view != null) return error.AlreadyStarted;
+        if (self.stop_flag.load(.acquire)) return error.Stopped;
+        if (self.delivery_inflight) return error.NotQuiescent;
+    }
+
+    fn restoreSnapshotAt(self: *Worker, snapshot: *const Snapshot, bounds: SnapshotBounds, comptime parked: bool) !void {
         // Construction/restore and source teardown require external exclusion
         // from all producer calls. The mutex also protects the whole clone/swap.
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0) return error.AlreadyStarted;
-        if (self.stop_flag.load(.acquire)) return error.Stopped;
-        if (self.delivery_inflight) return error.NotQuiescent;
+        try self.requireRestoreCut(parked);
         try snapshot.validate(self, bounds);
         var jobs: std.ArrayListUnmanaged(Job) = .empty;
         errdefer {
@@ -534,6 +552,7 @@ pub const Worker = struct {
         }
         try dead.ensureTotalCapacityPrecise(self.allocator, snapshot.dead.len);
         for (snapshot.dead) |endpoint| dead.appendAssumeCapacity(try self.allocator.dupe(u8, endpoint));
+        try self.requireRestoreCut(parked);
         for (self.queue.items) |*job| job.deinit(self.allocator);
         self.queue.deinit(self.allocator);
         for (self.dead.items) |endpoint| freeEndpoint(self.allocator, endpoint);

@@ -221,6 +221,14 @@ pub fn MemoIgnoreListWith(comptime params: Params) type {
             return set.items.items.len;
         }
 
+        /// Helix may need to restore a recipient row whose first add failed
+        /// after creating the row. It has no entries, but is still live state.
+        pub fn checkpointEnsureRecipient(self: *Self, recipient: []const u8) Error!void {
+            var recipient_buf: [params.max_account_bytes]u8 = undefined;
+            const recipient_key = try accountKeyWith(params, recipient, &recipient_buf);
+            _ = try self.ensureRecipient(recipient_key);
+        }
+
         fn ensureRecipient(self: *Self, recipient_key: []const u8) Error!*SenderSet {
             if (self.accounts.getPtr(recipient_key)) |set| return set;
             if (self.accounts.count() >= params.max_accounts) return error.TooManyAccounts;

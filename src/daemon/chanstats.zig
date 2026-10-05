@@ -40,6 +40,15 @@ const spark_days: usize = 14; // recent-daily sparkline length in index.json
 const min_word_len: usize = 4;
 const max_word_len: usize = 32;
 
+/// Wire policy for the exact Windows Helix owner checkpoint. Keep these tied
+/// to the recorder's actual caps rather than duplicating numeric policy.
+pub const helix_max_channels = max_channels;
+pub const helix_max_users_per_channel = max_users_per_channel;
+pub const helix_max_words_per_channel = max_words_per_channel;
+pub const helix_max_days_kept = max_days_kept;
+pub const helix_max_topics_kept = max_topics_kept;
+pub const helix_max_word_len = max_word_len;
+
 pub const EventKind = enum { join, part, quit, kick };
 
 pub const UserAgg = struct {

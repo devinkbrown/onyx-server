@@ -27,6 +27,7 @@ pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 const native_media_link = @import("native_media_link.zig");
 const media_bridge = @import("media_bridge.zig");
 const media_socket = @import("../substrate/media_socket.zig");
+const windows_udp = @import("helix/native_windows_udp_socket.zig");
 const cadence_frame = @import("../substrate/cadence_frame.zig");
 const native_feedback = @import("../substrate/native_feedback.zig");
 
@@ -406,7 +407,14 @@ pub const NativeMediaTransport = struct {
     pub fn upgradeContinuityReady(self: *NativeMediaTransport) bool {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        return self.routing_binding == null and self.channels.count() == 0 and self.stream_index.count() == 0 and self.physical_pending == 0 and self.physical_endpoints.count() == 0 and self.physical_streams.count() == 0;
+        // A configured binding alone is inert when media is disabled. The
+        // successor reconstructs that binding from configuration.
+        const binding_idle = self.routing_binding == null or
+            (self.cross == null and self.socket == null);
+        return binding_idle and self.active_ingress == null and !self.legacy_joining and
+            self.channels.count() == 0 and self.stream_index.count() == 0 and
+            self.physical_pending == 0 and self.physical_endpoints.count() == 0 and
+            self.physical_streams.count() == 0;
     }
 
     /// Bind on `bind_be`:`port` (port 0 = ephemeral) and spawn the pump thread.
@@ -545,6 +553,23 @@ pub const NativeMediaTransport = struct {
         try self.runtime.pause.requirePaused(token);
         return self.captureCut(.paused);
     }
+    /// Only the original Domain's pristine configured-media cut may use this
+    /// route. The Domain lock is already held; this owner lock closes its graph
+    /// and ingress high-water observation around the snapshot.
+    pub fn capturePausedPristineRoutingLocked(self: *NativeMediaTransport, domain: *routing.Domain, scope: *const routing.Locked, webrtc: *@import("media_plane.zig").MediaPlane, token: runtime_pause.Token) !Snapshot {
+        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        try domain.requirePristineConfiguredMediaLocked(scope, self, webrtc);
+        try domain.requireNativeBindingLocked(scope, self.routing_binding orelse return error.RoutingContinuityUnsupported, self);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.routing_domain != domain or self.routing_closed or self.legacy_joining or
+            self.stop_flag.load(.acquire) or self.physical_revision != 1 or self.next_ingress_serial != 1 or
+            self.active_ingress != null or self.routed_accepted.load(.acquire) != 0 or
+            self.routed_refused.load(.acquire) != 0 or self.routed_errors.load(.acquire) != 0)
+            return error.ActiveMediaContinuityUnsupported;
+        return self.captureCutLocked(.paused, true);
+    }
     pub fn captureUnstarted(self: *NativeMediaTransport) !Snapshot {
         if (self.thread != null or self.runtime.view != null) return error.NotQuiescent;
         return self.captureCut(.unstarted);
@@ -552,7 +577,10 @@ pub const NativeMediaTransport = struct {
     fn captureCut(self: *NativeMediaTransport, execution: Execution) !Snapshot {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        if (self.routing_binding != null) return error.RoutingContinuityUnsupported;
+        return self.captureCutLocked(execution, false);
+    }
+    fn captureCutLocked(self: *NativeMediaTransport, execution: Execution, pristine_routing: bool) !Snapshot {
+        if (self.routing_binding != null and !pristine_routing) return error.RoutingContinuityUnsupported;
         // Exact active forward/MAC/replay state is not approximated by an empty
         // registry. Main freezes producers while retaining this source cut.
         if (self.channels.count() != 0 or self.stream_index.count() != 0 or self.physical_pending != 0 or self.physical_endpoints.count() != 0 or self.physical_streams.count() != 0) return error.ActiveMediaContinuityUnsupported;
@@ -568,11 +596,25 @@ pub const NativeMediaTransport = struct {
             _ = std.posix.system.close(fd);
             return err;
         };
-        var socket = try MediaSocket.initInherited(fd, &carry.socket);
-        errdefer socket.deinit();
+        const socket = try MediaSocket.initInherited(fd, &carry.socket);
+        return initRestored(allocator, socket, carry, cross);
+    }
+
+    /// Consume an authenticated Windows UDP duplicate into an inert owner.
+    /// The existing inherited-resource and dormant-worker preparation paths
+    /// can then bind its runtime and park its pump before READY.
+    pub fn initTransferred(allocator: std.mem.Allocator, transfer: *windows_udp.Transfer, carry: *const Snapshot, cross: ?media_bridge.CrossLegSink) !NativeMediaTransport {
+        const socket = try MediaSocket.initTransferred(transfer, &carry.socket);
+        return initRestored(allocator, socket, carry, cross);
+    }
+
+    fn initRestored(allocator: std.mem.Allocator, socket: MediaSocket, carry: *const Snapshot, cross: ?media_bridge.CrossLegSink) !NativeMediaTransport {
+        var held = socket;
+        errdefer held.deinit();
+        try carry.validate();
         if (carry.cross_configured != (cross != null)) return error.ConfigMismatch;
         var owner = initConfig(allocator, carry.max_participants);
-        owner.socket = socket;
+        owner.socket = held;
         owner.port = carry.socket.port;
         owner.max_frame_bytes = carry.max_frame_bytes;
         owner.max_upload_bytes = carry.max_upload_bytes;
@@ -1658,6 +1700,53 @@ pub const Snapshot = struct {
         if (!self.mac_key_configured) for (self.mac_stream_key) |byte| if (byte != 0) return error.InvalidSnapshot;
     }
 };
+
+test "Windows Helix native media imports idle socket and parks inherited worker" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var source = NativeMediaTransport.init(testing.allocator);
+    defer source.deinit();
+    source.configureMac(&@as([16]u8, @splat(0x5a)), true);
+    source.max_upload_bytes = 3456;
+    try source.prepareColdResources(testing.io, loopback_be, 0);
+    var carry = try source.captureUnstarted();
+    defer carry.deinit();
+    const source_fd = source.socket.?.fd;
+
+    var transfer = try windows_udp.duplicateForProcess(source_fd, std.os.windows.GetCurrentProcessId());
+    var successor = try NativeMediaTransport.initTransferred(testing.allocator, &transfer, &carry, null);
+    defer successor.deinit();
+    try testing.expect(transfer.consumed);
+    try testing.expect(successor.socket.?.fd != source_fd);
+    try testing.expectEqual(carry.socket.port, successor.port);
+    try testing.expectEqual(carry.socket.recv_timeout_ms, successor.socket.?.recv_timeout_ms);
+    var restored = try successor.captureUnstarted();
+    defer restored.deinit();
+    try testing.expectEqualSlices(u8, &carry.mac_stream_key, &restored.mac_stream_key);
+    try testing.expectEqual(carry.max_upload_bytes, restored.max_upload_bytes);
+    try testing.expectEqualDeep(carry.socket, try source.socket.?.capture());
+
+    try successor.prepareInheritedResources(testing.io);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .native_media, .instance = 0, .owner_identity = &successor }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    defer {
+        successor.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        successor.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    try successor.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.native_media, 0, &successor));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try successor.requireParked();
+    try testing.expect(!successor.runtime.entered.load(.acquire));
+
+    var invalid = carry;
+    defer invalid.deinit();
+    invalid.max_frame_bytes = 0;
+    var rejected = try windows_udp.duplicateForProcess(source_fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.InvalidSnapshot, NativeMediaTransport.initTransferred(testing.allocator, &rejected, &invalid, null));
+    try testing.expect(rejected.consumed);
+    try testing.expectEqualDeep(carry.socket, try source.socket.?.capture());
+}
 
 test "companion runtime native media actual pump idle MAC snapshot active refusal and owned socket" {
     // Raw-fd fcntl has no libc-free Windows mapping yet.

@@ -14,6 +14,91 @@ pub const MAX_PARAM_BYTES: usize = 256;
 pub const MAX_ENTRIES: usize = 4096;
 pub const MAX_IRC_PARAMS: usize = 15;
 
+/// The maximum legal queue fits under 2 MiB; this is also below the Helix
+/// arena ceiling and rejects absurd lengths before allocation.
+pub const max_checkpoint_bytes: usize = @min(@import("helix/live.zig").max_arena_bytes, 2 * 1024 * 1024);
+pub const checkpoint_magic = [_]u8{ 'T', 'M', 'O', 'D' };
+pub const checkpoint_version: u8 = 1;
+const checkpoint_header_len: usize = 4 + 1 + 3 + 4 + 8 + 4;
+const checkpoint_checksum_len: usize = 32;
+const checkpoint_row_min_len: usize = 8 + 1 + 2 + 1 + 1 + 8 + 8;
+const checkpoint_domain = "onyx-service-tempmode-checkpoint-v1";
+
+pub const CheckpointError = error{
+    BadMagic,
+    UnsupportedVersion,
+    Truncated,
+    TrailingBytes,
+    InvalidField,
+    NonCanonicalOrder,
+    DuplicateId,
+    ChecksumMismatch,
+    CheckpointTooLarge,
+} || std.mem.Allocator.Error;
+
+pub fn isUpgradeCheckpoint(bytes: []const u8) bool {
+    return bytes.len >= checkpoint_magic.len and std.mem.eql(u8, bytes[0..checkpoint_magic.len], &checkpoint_magic);
+}
+
+/// Validate exact queue shape without allocating. The ID check is quadratic
+/// over at most 4096 rows, so corrupt checkpoints cannot create unbounded work.
+pub fn validateUpgradeCheckpoint(bytes: []const u8) CheckpointError!void {
+    if (bytes.len < checkpoint_header_len + checkpoint_checksum_len) return error.Truncated;
+    if (bytes.len > max_checkpoint_bytes) return error.CheckpointTooLarge;
+    if (!isUpgradeCheckpoint(bytes)) return error.BadMagic;
+    if (bytes[4] != checkpoint_version) return error.UnsupportedVersion;
+    if (!std.mem.eql(u8, bytes[5..8], &.{ 0, 0, 0 })) return error.InvalidField;
+    const body_len: usize = std.mem.readInt(u32, bytes[8..12], .little);
+    const expected_len = std.math.add(usize, checkpoint_header_len + checkpoint_checksum_len, body_len) catch return error.CheckpointTooLarge;
+    if (expected_len > max_checkpoint_bytes) return error.CheckpointTooLarge;
+    if (bytes.len < expected_len) return error.Truncated;
+    if (bytes.len > expected_len) return error.TrailingBytes;
+    var digest: [checkpoint_checksum_len]u8 = undefined;
+    checkpointChecksum(bytes[0 .. bytes.len - checkpoint_checksum_len], &digest);
+    const saved_digest: [checkpoint_checksum_len]u8 = bytes[bytes.len - checkpoint_checksum_len ..][0..checkpoint_checksum_len].*;
+    if (!std.crypto.timing_safe.eql([checkpoint_checksum_len]u8, digest, saved_digest)) return error.ChecksumMismatch;
+
+    var reader = CheckpointReader{ .bytes = bytes[12 .. bytes.len - checkpoint_checksum_len] };
+    const next_id = try reader.readU64();
+    if (next_id == 0) return error.InvalidField;
+    const row_count: usize = try reader.readU32();
+    if (row_count > MAX_ENTRIES) return error.CheckpointTooLarge;
+    if (row_count > body_len / checkpoint_row_min_len) return error.Truncated;
+    var seen_ids: [MAX_ENTRIES]EntryId = undefined;
+    var previous: ?OrderKey = null;
+    for (0..row_count) |index| {
+        const id = try reader.readU64();
+        if (id == 0 or id >= next_id) return error.InvalidField;
+        for (seen_ids[0..index]) |prior_id| if (prior_id == id) return error.DuplicateId;
+        seen_ids[index] = id;
+        const channel_len: usize = try reader.readByte();
+        if (channel_len < 2 or channel_len > MAX_CHANNEL_BYTES) return error.InvalidField;
+        const channel = try reader.take(channel_len);
+        validateChannel(channel) catch return error.InvalidField;
+        const mode_letter = try reader.readByte();
+        validateModeLetter(mode_letter) catch return error.InvalidField;
+        const param_tag = try reader.readByte();
+        switch (param_tag) {
+            0 => {},
+            1 => {
+                const param_len: usize = try reader.readU16();
+                if (param_len == 0 or param_len > MAX_PARAM_BYTES) return error.InvalidField;
+                validateParam(try reader.take(param_len)) catch return error.InvalidField;
+            },
+            else => return error.InvalidField,
+        }
+        const set_at_ms = try reader.readI64();
+        const revert_at_ms = try reader.readI64();
+        if (revert_at_ms <= set_at_ms) return error.InvalidField;
+        const order = OrderKey{ .revert_at_ms = revert_at_ms, .id = id };
+        if (previous) |prior| {
+            if (!orderLess(prior, order)) return error.NonCanonicalOrder;
+        }
+        previous = order;
+    }
+    if (reader.remaining() != 0) return error.TrailingBytes;
+}
+
 pub const EntryId = u64;
 pub const TimestampMs = i64;
 
@@ -235,6 +320,113 @@ pub const TempModeQueue = struct {
     pub fn nextDueMs(self: *const TempModeQueue) ?TimestampMs {
         if (self.entries.items.len == 0) return null;
         return self.entries.items[0].revert_at_ms;
+    }
+
+    /// Serialize every pending action and the next ID. Already-due entries
+    /// stay queued until the daemon has applied their MODE revert and swept.
+    pub fn exportUpgradeCheckpoint(self: *const TempModeQueue, allocator: std.mem.Allocator) CheckpointError![]u8 {
+        const row_count = self.entries.items.len;
+        if (row_count > MAX_ENTRIES or self.next_id == 0) return error.InvalidField;
+        var seen_ids: [MAX_ENTRIES]EntryId = undefined;
+        var previous: ?OrderKey = null;
+        var total_len: usize = checkpoint_header_len + checkpoint_checksum_len;
+        for (self.entries.items, 0..) |entry, index| {
+            if (entry.id == 0 or entry.id >= self.next_id or entry.revert_at_ms <= entry.set_at_ms)
+                return error.InvalidField;
+            for (seen_ids[0..index]) |prior_id| if (prior_id == entry.id) return error.DuplicateId;
+            seen_ids[index] = entry.id;
+            validateChannel(entry.channel) catch return error.InvalidField;
+            validateModeLetter(entry.mode_letter) catch return error.InvalidField;
+            const order = OrderKey{ .revert_at_ms = entry.revert_at_ms, .id = entry.id };
+            if (previous) |prior| {
+                if (!orderLess(prior, order)) return error.NonCanonicalOrder;
+            }
+            previous = order;
+            try checkpointAddLen(&total_len, checkpoint_row_min_len - 2);
+            try checkpointAddLen(&total_len, entry.channel.len);
+            if (entry.param) |value| {
+                validateParam(value) catch return error.InvalidField;
+                try checkpointAddLen(&total_len, 2);
+                try checkpointAddLen(&total_len, value.len);
+            }
+        }
+
+        const out = try allocator.alloc(u8, total_len);
+        errdefer allocator.free(out);
+        var writer = CheckpointWriter{ .bytes = out };
+        writer.writeBytes(&checkpoint_magic);
+        writer.writeByte(checkpoint_version);
+        writer.writeBytes(&.{ 0, 0, 0 });
+        writer.writeU32(@intCast(total_len - checkpoint_header_len - checkpoint_checksum_len));
+        writer.writeU64(self.next_id);
+        writer.writeU32(@intCast(row_count));
+        for (self.entries.items) |entry| {
+            writer.writeU64(entry.id);
+            writer.writeByte(@intCast(entry.channel.len));
+            writer.writeBytes(entry.channel);
+            writer.writeByte(entry.mode_letter);
+            if (entry.param) |value| {
+                writer.writeByte(1);
+                writer.writeU16(@intCast(value.len));
+                writer.writeBytes(value);
+            } else {
+                writer.writeByte(0);
+            }
+            writer.writeI64(entry.set_at_ms);
+            writer.writeI64(entry.revert_at_ms);
+        }
+        std.debug.assert(writer.pos + checkpoint_checksum_len == out.len);
+        var digest: [checkpoint_checksum_len]u8 = undefined;
+        checkpointChecksum(out[0..writer.pos], &digest);
+        writer.writeBytes(&digest);
+        return out;
+    }
+
+    /// Stage an independent exact queue before the upgrade commits.
+    pub fn restoreUpgradeCheckpoint(allocator: std.mem.Allocator, bytes: []const u8) CheckpointError!TempModeQueue {
+        try validateUpgradeCheckpoint(bytes);
+        var reader = CheckpointReader{ .bytes = bytes[12 .. bytes.len - checkpoint_checksum_len] };
+        const next_id = try reader.readU64();
+        const row_count: usize = try reader.readU32();
+        var restored = TempModeQueue.init(allocator);
+        errdefer restored.deinit();
+        restored.next_id = next_id;
+        try restored.entries.ensureTotalCapacityPrecise(allocator, row_count);
+        for (0..row_count) |_| {
+            const id = try reader.readU64();
+            const channel_len: usize = try reader.readByte();
+            const channel = try reader.take(channel_len);
+            const mode_letter = try reader.readByte();
+            const param_tag = try reader.readByte();
+            const param: ?[]const u8 = if (param_tag == 1) blk: {
+                const param_len: usize = try reader.readU16();
+                break :blk try reader.take(param_len);
+            } else null;
+            const set_at_ms = try reader.readI64();
+            const revert_at_ms = try reader.readI64();
+            const owned_channel = try allocator.dupe(u8, channel);
+            errdefer allocator.free(owned_channel);
+            const owned_param: ?[]u8 = if (param) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (owned_param) |value| allocator.free(value);
+            try restored.entries.append(allocator, .{
+                .id = id,
+                .channel = owned_channel,
+                .mode_letter = mode_letter,
+                .param = owned_param,
+                .set_at_ms = set_at_ms,
+                .revert_at_ms = revert_at_ms,
+            });
+        }
+        std.debug.assert(reader.remaining() == 0);
+        return restored;
+    }
+
+    pub fn replaceFromUpgradeCheckpoint(self: *TempModeQueue, bytes: []const u8) CheckpointError!void {
+        var replacement = try restoreUpgradeCheckpoint(self.allocator, bytes);
+        const old = self.*;
+        self.* = replacement;
+        replacement = old;
+        replacement.deinit();
     }
 
     fn insertIndex(self: *const TempModeQueue, revert_at_ms: TimestampMs, id: EntryId) usize {
@@ -505,6 +697,99 @@ fn isControl(ch: u8) bool {
     return ch < 0x20 or ch == 0x7f;
 }
 
+const OrderKey = struct {
+    revert_at_ms: TimestampMs,
+    id: EntryId,
+};
+
+fn orderLess(a: OrderKey, b: OrderKey) bool {
+    if (a.revert_at_ms != b.revert_at_ms) return a.revert_at_ms < b.revert_at_ms;
+    return a.id < b.id;
+}
+
+fn checkpointAddLen(total: *usize, amount: usize) CheckpointError!void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.CheckpointTooLarge;
+    if (total.* > max_checkpoint_bytes) return error.CheckpointTooLarge;
+}
+
+fn checkpointChecksum(bytes: []const u8, out: *[checkpoint_checksum_len]u8) void {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(checkpoint_domain);
+    hasher.update(bytes);
+    hasher.final(out);
+}
+
+const CheckpointWriter = struct {
+    bytes: []u8,
+    pos: usize = 0,
+
+    fn writeBytes(self: *CheckpointWriter, value: []const u8) void {
+        @memcpy(self.bytes[self.pos..][0..value.len], value);
+        self.pos += value.len;
+    }
+
+    fn writeByte(self: *CheckpointWriter, value: u8) void {
+        self.bytes[self.pos] = value;
+        self.pos += 1;
+    }
+
+    fn writeU16(self: *CheckpointWriter, value: u16) void {
+        std.mem.writeInt(u16, self.bytes[self.pos..][0..2], value, .little);
+        self.pos += 2;
+    }
+
+    fn writeU32(self: *CheckpointWriter, value: u32) void {
+        std.mem.writeInt(u32, self.bytes[self.pos..][0..4], value, .little);
+        self.pos += 4;
+    }
+
+    fn writeU64(self: *CheckpointWriter, value: u64) void {
+        std.mem.writeInt(u64, self.bytes[self.pos..][0..8], value, .little);
+        self.pos += 8;
+    }
+
+    fn writeI64(self: *CheckpointWriter, value: i64) void {
+        std.mem.writeInt(i64, self.bytes[self.pos..][0..8], value, .little);
+        self.pos += 8;
+    }
+};
+
+const CheckpointReader = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    fn remaining(self: *const CheckpointReader) usize {
+        return self.bytes.len - self.pos;
+    }
+
+    fn take(self: *CheckpointReader, len: usize) CheckpointError![]const u8 {
+        if (len > self.remaining()) return error.Truncated;
+        const result = self.bytes[self.pos..][0..len];
+        self.pos += len;
+        return result;
+    }
+
+    fn readByte(self: *CheckpointReader) CheckpointError!u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn readU16(self: *CheckpointReader) CheckpointError!u16 {
+        return std.mem.readInt(u16, (try self.take(2))[0..2], .little);
+    }
+
+    fn readU32(self: *CheckpointReader) CheckpointError!u32 {
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
+    }
+
+    fn readU64(self: *CheckpointReader) CheckpointError!u64 {
+        return std.mem.readInt(u64, (try self.take(8))[0..8], .little);
+    }
+
+    fn readI64(self: *CheckpointReader) CheckpointError!i64 {
+        return std.mem.readInt(i64, (try self.take(8))[0..8], .little);
+    }
+};
+
 const testing = std.testing;
 
 test "add stores owned entries sorted by revert time" {
@@ -716,4 +1001,130 @@ test "formatRevertMode reports small output buffer" {
     };
     var tiny: [4]u8 = undefined;
     try testing.expectError(error.OutputTooSmall, formatRevertMode(tiny[0..], action));
+}
+
+test "tempmode checkpoint preserves due rows order and next id" {
+    var source = TempModeQueue.init(testing.allocator);
+    defer source.deinit();
+    const cancelled = try source.add("#ops", 'm', null, 0, 100);
+    const earliest = try source.add("#ops", 'b', "bad!*@*", -50, 50);
+    const tied = try source.add("#chat", 'i', null, 0, 100);
+    try testing.expect(source.cancelId(cancelled));
+    try testing.expectEqual(@as(EntryId, 4), source.next_id);
+    const wire = try source.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    try validateUpgradeCheckpoint(wire);
+
+    var restored = try TempModeQueue.restoreUpgradeCheckpoint(testing.allocator, wire);
+    defer restored.deinit();
+    try testing.expectEqual(@as(usize, 2), restored.len());
+    try testing.expectEqual(@as(EntryId, 4), restored.next_id);
+    try testing.expectEqual(earliest, restored.entries.items[0].id);
+    try testing.expectEqual(tied, restored.entries.items[1].id);
+    try testing.expectEqual(@as(usize, 1), restored.dueCount(60));
+    try testing.expectEqual(@as(?TimestampMs, 50), restored.nextDueMs());
+    try testing.expectEqualStrings("bad!*@*", restored.entries.items[0].param.?);
+    const reencoded = try restored.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(reencoded);
+    try testing.expectEqualSlices(u8, wire, reencoded);
+    try testing.expectEqual(@as(EntryId, 4), try restored.add("#new", 's', null, 100, 200));
+
+    // An empty queue still carries the ID high-water mark after cancellation.
+    try testing.expect(source.cancelId(earliest));
+    try testing.expect(source.cancelId(tied));
+    const empty_wire = try source.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(empty_wire);
+    var empty_restored = try TempModeQueue.restoreUpgradeCheckpoint(testing.allocator, empty_wire);
+    defer empty_restored.deinit();
+    try testing.expectEqual(@as(usize, 0), empty_restored.len());
+    try testing.expectEqual(@as(EntryId, 4), try empty_restored.add("#next", 'm', null, 0, 1));
+}
+
+test "tempmode checkpoint rejects malformed rows and ordering" {
+    var source = TempModeQueue.init(testing.allocator);
+    defer source.deinit();
+    _ = try source.add("#a", 'm', null, 0, 100);
+    _ = try source.add("#b", 'i', null, 0, 200);
+    const wire = try source.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    for (0..wire.len) |n| {
+        try testing.expectError(error.Truncated, TempModeQueue.restoreUpgradeCheckpoint(testing.allocator, wire[0..n]));
+    }
+
+    var damaged = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(damaged);
+    damaged[4] = 2;
+    try testing.expectError(error.UnsupportedVersion, validateUpgradeCheckpoint(damaged));
+    damaged[4] = checkpoint_version;
+    damaged[checkpoint_header_len + 8 + 1] ^= 1;
+    try testing.expectError(error.ChecksumMismatch, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    std.mem.writeInt(u64, damaged[checkpoint_header_len + checkpoint_row_min_len ..][0..8], 1, .little);
+    testRechecksum(damaged);
+    try testing.expectError(error.DuplicateId, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    std.mem.writeInt(i64, damaged[checkpoint_header_len + checkpoint_row_min_len - 8 ..][0..8], 300, .little);
+    testRechecksum(damaged);
+    try testing.expectError(error.NonCanonicalOrder, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    damaged[checkpoint_header_len + 8 + 1] = ' ';
+    testRechecksum(damaged);
+    try testing.expectError(error.InvalidField, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    damaged[checkpoint_header_len + 8 + 1 + 2 + 1] = 2;
+    testRechecksum(damaged);
+    try testing.expectError(error.InvalidField, validateUpgradeCheckpoint(damaged));
+
+    @memcpy(damaged, wire);
+    std.mem.writeInt(i64, damaged[checkpoint_header_len + checkpoint_row_min_len - 8 ..][0..8], 0, .little);
+    testRechecksum(damaged);
+    try testing.expectError(error.InvalidField, validateUpgradeCheckpoint(damaged));
+
+    const trailing = try testing.allocator.alloc(u8, wire.len + 1);
+    defer testing.allocator.free(trailing);
+    @memcpy(trailing[0..wire.len], wire);
+    trailing[wire.len] = 0;
+    try testing.expectError(error.TrailingBytes, validateUpgradeCheckpoint(trailing));
+}
+
+test "tempmode checkpoint replacement is atomic across allocation failures" {
+    var source = TempModeQueue.init(testing.allocator);
+    defer source.deinit();
+    _ = try source.add("#one", 'b', "bad!*@*", 1, 100);
+    _ = try source.add("#two", 'm', null, 2, 200);
+    const EncodeSweep = struct {
+        fn run(allocator: std.mem.Allocator, queue: *const TempModeQueue) !void {
+            const bytes = try queue.exportUpgradeCheckpoint(allocator);
+            defer allocator.free(bytes);
+            try testing.expectEqual(@as(usize, 2), queue.len());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, EncodeSweep.run, .{&source});
+    const wire = try source.exportUpgradeCheckpoint(testing.allocator);
+    defer testing.allocator.free(wire);
+    const RestoreSweep = struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var target = TempModeQueue.init(allocator);
+            defer target.deinit();
+            _ = try target.add("#keeper", 'i', null, 0, 999);
+            target.replaceFromUpgradeCheckpoint(bytes) catch |err| {
+                try testing.expectEqual(@as(usize, 1), target.len());
+                try testing.expectEqualStrings("#keeper", target.entries.items[0].channel);
+                return err;
+            };
+            try testing.expectEqual(@as(usize, 2), target.len());
+            try testing.expectEqualStrings("#one", target.entries.items[0].channel);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, RestoreSweep.run, .{wire});
+}
+
+fn testRechecksum(bytes: []u8) void {
+    var digest: [checkpoint_checksum_len]u8 = undefined;
+    checkpointChecksum(bytes[0 .. bytes.len - checkpoint_checksum_len], &digest);
+    @memcpy(bytes[bytes.len - checkpoint_checksum_len ..], &digest);
 }

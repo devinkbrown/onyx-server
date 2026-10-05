@@ -53,6 +53,7 @@ const max_file_bytes: usize = 256 * 1024;
 /// skew, valid for roughly one year.
 const bootstrap_backdate_s: i64 = 3600;
 const bootstrap_lifetime_s: i64 = 365 * 24 * 3600;
+const webtransport_bootstrap_lifetime_s: i64 = 7 * 24 * 3600;
 
 pub const Error = error{
     /// `cert_path` set without `key_path` (or vice versa).
@@ -68,6 +69,7 @@ pub const Error = error{
     rsa_pkcs.ParseError ||
     ec_pkcs.ParseError ||
     x509_selfsign.Error ||
+    ecdsa_p256.DerError ||
     std.crypto.errors.IdentityElementError ||
     std.crypto.errors.NonCanonicalError ||
     std.crypto.errors.KeyMismatchError ||
@@ -136,6 +138,15 @@ pub fn loadOrBootstrap(allocator: std.mem.Allocator, io: std.Io, opts: Options) 
     }
     if (!opts.enabled) return error.NothingToLoad;
     return bootstrap(allocator, io, opts.dns_name);
+}
+
+/// Keep explicit disk material on the ordinary loader path. A pathless
+/// WebTransport listener instead needs a short-lived P-256 leaf for browser
+/// certificate-hash pinning, including the loopback IP used by local clients.
+pub fn loadOrBootstrapWebTransport(allocator: std.mem.Allocator, io: std.Io, opts: Options) Error!Loaded {
+    if (opts.cert_path != null or opts.key_path != null or !opts.enabled)
+        return loadOrBootstrap(allocator, io, opts);
+    return bootstrapWebTransport(allocator, io, opts.dns_name);
 }
 
 /// Read and decode an on-disk certificate + private key pair.
@@ -334,6 +345,28 @@ fn bootstrap(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) Err
     return .{ .cert_chain = chain, .key_kind = .ed25519, .signing_key = key_pair };
 }
 
+fn bootstrapWebTransport(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) Error!Loaded {
+    const key_pair = ecdsa_p256.KeyPair.generate(io);
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    var der_buf: [2048]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSignedEcdsaP256(&der_buf, .{
+        .common_name = dns_name,
+        .not_before = now - bootstrap_backdate_s,
+        .not_after = now - bootstrap_backdate_s + webtransport_bootstrap_lifetime_s,
+        .serial = &bootstrap_serial,
+        .key_pair = key_pair,
+        .dns_names = &.{dns_name},
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = false,
+        .key_usage_digital_signature = true,
+    });
+    const owned = try allocator.dupe(u8, der);
+    errdefer allocator.free(owned);
+    const chain = try allocator.alloc([]const u8, 1);
+    chain[0] = owned;
+    return .{ .cert_chain = chain, .key_kind = .ecdsa_p256, .ecdsa_p256_signing_key = key_pair };
+}
+
 /// Resolved hardened-TLS-1.2 material: an ECDSA-P256 leaf chain + key. The 1.2
 /// engine signs ServerKeyExchange with ecdsa_secp256r1_sha256, so its leg always
 /// uses an ECDSA-P256 cert regardless of the (possibly Ed25519) 1.3 cert.
@@ -419,6 +452,40 @@ test "loadOrBootstrap: no paths mints a verifiable self-signed leaf for dns_name
         }
         try testing.expect(found);
     }
+}
+
+test "loadOrBootstrapWebTransport: pathless leaf is short-lived P-256 with DNS and loopback SANs" {
+    const x509_verify = @import("../crypto/x509_verify.zig");
+    const allocator = testing.allocator;
+    var loaded = try loadOrBootstrapWebTransport(allocator, testing.io, .{
+        .enabled = true,
+        .dns_name = "localhost",
+    });
+    defer loaded.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), loaded.cert_chain.len);
+    try testing.expectEqual(KeyKind.ecdsa_p256, loaded.key_kind);
+    try testing.expect(loaded.ecdsa_p256_signing_key != null);
+    try testing.expect(loaded.signing_key == null);
+
+    const cert = try x509.parse(loaded.cert_chain[0]);
+    try testing.expectEqual(webtransport_bootstrap_lifetime_s, cert.not_after.epoch_seconds - cert.not_before.epoch_seconds);
+    try testing.expectEqual(@as(usize, 1), cert.san_dns_count);
+    try testing.expectEqualStrings("localhost", cert.san_dns[0]);
+    try testing.expectEqual(@as(usize, 1), cert.san_ip_count);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, cert.san_ips[0].slice());
+    try testing.expect(!cert.basic_constraints_ca);
+    try testing.expect(cert.key_usage_present);
+    try testing.expect(cert.key_usage_digital_signature);
+    try testing.expect(!cert.key_usage_cert_sign);
+
+    const sec1 = loaded.ecdsa_p256_signing_key.?.public_key.toUncompressedSec1();
+    switch (try x509.extractPublicKey(cert.spki_der)) {
+        .ecdsa_p256 => |embedded| try testing.expectEqualSlices(u8, &sec1, embedded),
+        else => return error.TestUnexpectedResult,
+    }
+    const link = try x509_verify.linkInfo(loaded.cert_chain[0]);
+    try x509_verify.verifyCertSignature(link.tbs_der, link.signature_der, link.sig_alg_oid, link.sig_alg_params, link.spki_der);
 }
 
 test "loadOrBootstrap: bootstrap keypairs differ across calls" {

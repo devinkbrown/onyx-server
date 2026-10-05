@@ -275,6 +275,21 @@ const Tombstone = struct {
     recorded_at: u64,
 };
 
+/// Exact Helix custody uses these owned row types to rebuild the store without
+/// replaying writes (which would change expiry, insertion order, and clocks).
+pub const CheckpointEntry = Entry;
+pub const CheckpointTombstone = Tombstone;
+
+/// The store's live ADD and remote-apply paths use these same default bounds.
+pub fn validateCheckpointIdentity(channel: []const u8, mask: []const u8) AccessError!void {
+    try validateChannelWith(.{}, channel);
+    try validateMaskWith(.{}, mask);
+}
+
+pub fn validateCheckpointSetBy(set_by: []const u8) AccessError!void {
+    try validateSetByWith(.{}, set_by);
+}
+
 /// Absolute expiry for `duration` relative to `now` (wall-clock seconds). A
 /// null or zero duration is permanent (no expiry). Saturating add avoids wrap.
 fn computeExpiry(now: u64, duration: ?u64) ?u64 {

@@ -30,6 +30,7 @@ const builtin = @import("builtin");
 const sys = if (builtin.os.tag == .windows) std.os.linux else std.posix.system;
 const posix = std.posix;
 const ice = @import("../proto/ice.zig");
+const windows_udp = @import("helix/native_windows_udp_socket.zig");
 const Socket = if (builtin.os.tag == .windows) usize else sys.fd_t;
 const invalid_fd: Socket = if (builtin.os.tag == .windows) std.math.maxInt(usize) else -1;
 
@@ -44,6 +45,7 @@ const win = struct {
     const sol_socket: i32 = 0xffff;
     const so_type: i32 = 0x1008;
     const so_exclusiveaddruse: i32 = ~@as(i32, 0x0004);
+    const wsa_flag_no_handle_inherit: u32 = 0x80;
     const fionbio: u32 = 0x8004667e;
     const SockAddr4 = extern struct { family: u16, port: u16, addr: [4]u8, zero: [8]u8 = @splat(0) };
     const SockAddr6 = extern struct { family: u16, port: u16, flowinfo: u32 = 0, addr: [16]u8, scope_id: u32 = 0 };
@@ -140,7 +142,7 @@ pub const DualStackUdpSocket = struct {
         if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
         errdefer _ = win.WSACleanup();
         const ipv4 = bind_addr == .v4_mapped;
-        const socket = win.WSASocketW(if (ipv4) win.af_inet else win.af_inet6, win.sock_dgram, win.ipproto_udp, null, 0, 1);
+        const socket = win.WSASocketW(if (ipv4) win.af_inet else win.af_inet6, win.sock_dgram, win.ipproto_udp, null, 0, 1 | win.wsa_flag_no_handle_inherit);
         if (socket == win.invalid_socket) return error.SocketUnavailable;
         errdefer _ = win.closesocket(socket);
         const exclusive: i32 = 1;
@@ -309,6 +311,31 @@ pub const DualStackUdpSocket = struct {
         // source-custody bridge supplies that proof.
         if (actual.inode == 0 or (carry.ipv4 != null and carry.ipv4.?.inode == 0)) return error.UnverifiableSocketIdentity;
         return .{ .fd = fd, .ipv4_fd = ipv4_fd orelse invalid_fd, .primary_ipv4 = carry.primary_ipv4, .recv_timeout_ms = carry.recv_timeout_ms, .prefer_ipv4 = carry.prefer_ipv4 };
+    }
+
+    /// Windows binds exactly one UDP socket for either a mapped dual-stack or
+    /// configured IPv4 endpoint. Consume a one-use PID-scoped duplicate and
+    /// verify the complete bound endpoint before publishing this owner.
+    pub fn initTransferred(transfer: *windows_udp.Transfer, carry: *const Snapshot) !DualStackUdpSocket {
+        if (comptime builtin.os.tag != .windows) return error.UnverifiableSocketIdentity;
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+        errdefer _ = win.WSACleanup();
+        const socket = try transfer.import();
+        errdefer _ = win.closesocket(socket);
+        try carry.validate();
+        if (carry.ipv4 != null or carry.primary.inode != 0 or
+            carry.primary.device != transfer.source_socket)
+            return error.SocketMismatch;
+        var actual = try observeDatagram(socket);
+        actual.device = carry.primary.device;
+        if (!std.meta.eql(actual, carry.primary)) return error.SocketMismatch;
+        return .{
+            .fd = socket,
+            .primary_ipv4 = carry.primary_ipv4,
+            .recv_timeout_ms = carry.recv_timeout_ms,
+            .prefer_ipv4 = carry.prefer_ipv4,
+        };
     }
 
     /// Send `bytes` to `dest`. A v4 `TransportAddress` is re-wrapped as a
@@ -513,6 +540,81 @@ test "Windows dual-stack UDP serves mapped IPv4 and native IPv6 and bounds idle 
     const before = @import("../substrate/platform.zig").monotonicMillis();
     try testing.expect(server.recvFrom(&buf) == null);
     try testing.expect(@import("../substrate/platform.zig").monotonicMillis() - before < 1000);
+}
+
+test "Windows UDP custody dual-stack imports the exact bound socket and rejects endpoint substitution" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const MediaSocket = @import("../substrate/media_socket.zig").MediaSocket;
+    const loopback_be = @import("../substrate/media_socket.zig").loopback_be;
+    var old = try DualStackUdpSocket.bind(.any, 0);
+    defer old.deinit();
+    old.setRecvTimeoutMs(37);
+    const carry = try old.capture();
+    var transfer = try windows_udp.duplicateForProcess(old.fd, std.os.windows.GetCurrentProcessId());
+    var adopted = try DualStackUdpSocket.initTransferred(&transfer, &carry);
+    defer adopted.deinit();
+    try testing.expect(transfer.consumed);
+    try testing.expect(adopted.fd != old.fd);
+    try testing.expectEqual(carry.primary.port, try adopted.localPort());
+    try testing.expectEqual(carry.recv_timeout_ms, adopted.recv_timeout_ms);
+    try testing.expectEqualDeep(carry, try old.capture());
+
+    var sender4 = try MediaSocket.bind(loopback_be, 0);
+    defer sender4.deinit();
+    const target4 = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, carry.primary.port);
+    sender4.sendTo(target4, "mapped-adopted");
+    var buf: [64]u8 = undefined;
+    const mapped = adopted.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("mapped-adopted", mapped.data);
+    try testing.expectEqual(@as(u8, 4), mapped.from.ip_len);
+    sender4.sendTo(target4, "mapped-source");
+    const original = old.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("mapped-source", original.data);
+
+    var sender6 = try DualStackUdpSocket.bind(.loopback_v6, 0);
+    defer sender6.deinit();
+    var loopback6: [16]u8 = @splat(0);
+    loopback6[15] = 1;
+    sender6.sendTo(try TransportAddress.fromBytes(&loopback6, carry.primary.port), "v6-adopted");
+    const native = adopted.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("v6-adopted", native.data);
+    try testing.expectEqual(@as(u8, 16), native.from.ip_len);
+
+    var stale = carry;
+    stale.primary.address[15] = 1;
+    var rejected = try windows_udp.duplicateForProcess(old.fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.SocketMismatch, DualStackUdpSocket.initTransferred(&rejected, &stale));
+    try testing.expect(rejected.consumed);
+    var substitute = try windows_udp.duplicateForProcess(sender6.fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.SocketMismatch, DualStackUdpSocket.initTransferred(&substitute, &carry));
+    try testing.expect(substitute.consumed);
+    try testing.expectEqualDeep(carry, try old.capture());
+}
+
+test "Windows UDP custody preserves IPv4-only and IPv6-only bind modes after transfer" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var only4 = try DualStackUdpSocket.bind(.{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    defer only4.deinit();
+    const carry4 = try only4.capture();
+    var transfer4 = try windows_udp.duplicateForProcess(only4.fd, std.os.windows.GetCurrentProcessId());
+    var adopted4 = try DualStackUdpSocket.initTransferred(&transfer4, &carry4);
+    defer adopted4.deinit();
+    try testing.expect(adopted4.primary_ipv4);
+    try testing.expectEqualDeep(carry4.primary, blk: {
+        var actual = try observeDatagram(adopted4.fd);
+        actual.device = carry4.primary.device;
+        break :blk actual;
+    });
+
+    var only6 = try DualStackUdpSocket.bind(.loopback_v6, 0);
+    defer only6.deinit();
+    const carry6 = try only6.capture();
+    var transfer6 = try windows_udp.duplicateForProcess(only6.fd, std.os.windows.GetCurrentProcessId());
+    var adopted6 = try DualStackUdpSocket.initTransferred(&transfer6, &carry6);
+    defer adopted6.deinit();
+    try testing.expect(!adopted6.primary_ipv4);
+    try testing.expect((try adopted6.capture()).primary.v6only);
+    try testing.expectEqual(carry6.primary.port, try adopted6.localPort());
 }
 
 test "isV4Mapped recognises ::ffff:0:0/96 and rejects native v6" {

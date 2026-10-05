@@ -163,6 +163,10 @@ const RuntimeBucket = struct {
     /// Adopt new policy live. Token balance is clamped into the new capacity so a
     /// REHASH that lowers a limit cannot leave a client holding stale credit.
     fn reconfigure(self: *RuntimeBucket, cfg: BucketCfg) void {
+        // Fractional refill units belong to the old rate denominator. A new
+        // period or refill amount cannot interpret them canonically.
+        if (self.cfg.refill_tokens != cfg.refill_tokens or self.cfg.refill_period_ms != cfg.refill_period_ms)
+            self.carry = 0;
         self.cfg = cfg;
         if (cfg.capacity == 0) {
             self.tokens = 0;
@@ -222,6 +226,8 @@ const RuntimeExcess = struct {
     }
 
     fn reconfigure(self: *RuntimeExcess, cfg: ExcessCfg) void {
+        if (self.cfg.decay_points != cfg.decay_points or self.cfg.decay_period_ms != cfg.decay_period_ms)
+            self.carry = 0;
         self.cfg = cfg;
     }
 };
@@ -240,6 +246,90 @@ const TargetKey = struct {
         return self.hash == other.hash and self.len == other.len;
     }
 };
+
+/// Fixed-size, allocation-free image of one live guard. The later Helix codec
+/// serializes these typed fields explicitly; raw struct bytes are not a wire
+/// format because Zig may insert padding. The policy is carried so import can
+/// prove it matches the successor's independently derived connection class.
+pub const CarryState = struct {
+    policy: GuardConfig,
+    message_rate: BucketCarry,
+    byte_rate: BucketCarry,
+    command_rate: BucketCarry,
+    target_change_rate: BucketCarry,
+    excess: ExcessCarry,
+    targets: [target_slots]TargetCarry,
+    target_count: u8,
+    next_target_slot: u8,
+};
+
+pub const BucketCarry = struct {
+    tokens: u64,
+    last_ms: i64,
+    carry: u64,
+};
+
+pub const ExcessCarry = struct {
+    points: u64,
+    last_ms: i64,
+    carry: u64,
+};
+
+pub const TargetCarry = struct {
+    hash: u64,
+    len: u64,
+
+    pub const empty: TargetCarry = .{ .hash = 0, .len = 0 };
+};
+
+pub const CarryError = GuardConfig.Error || error{
+    InvalidCarryState,
+    PolicyMismatch,
+    ClockRegression,
+};
+
+fn bucketCarry(bucket: RuntimeBucket) BucketCarry {
+    return .{ .tokens = bucket.tokens, .last_ms = bucket.last_ms, .carry = bucket.carry };
+}
+
+fn excessCarry(excess: RuntimeExcess) ExcessCarry {
+    return .{ .points = excess.points, .last_ms = excess.last_ms, .carry = excess.carry };
+}
+
+fn validateBucketCarry(state: BucketCarry, cfg: BucketCfg, now_ms: ?i64) CarryError!void {
+    if (cfg.capacity == 0) {
+        if (state.tokens != 0 or state.carry != 0) return error.InvalidCarryState;
+    } else if (state.tokens > cfg.capacity) return error.InvalidCarryState;
+    if (cfg.capacity != 0 and cfg.refill_tokens != 0 and cfg.refill_period_ms != 0 and
+        state.carry >= cfg.refill_period_ms) return error.InvalidCarryState;
+    if (now_ms) |now| if (state.last_ms > now) return error.ClockRegression;
+}
+
+fn validateCarry(state: CarryState, expected_policy: GuardConfig, now_ms: ?i64) CarryError!void {
+    try expected_policy.validate();
+    try state.policy.validate();
+    if (!std.meta.eql(state.policy, expected_policy)) return error.PolicyMismatch;
+    try validateBucketCarry(state.message_rate, expected_policy.messages, now_ms);
+    try validateBucketCarry(state.byte_rate, expected_policy.bytes, now_ms);
+    try validateBucketCarry(state.command_rate, expected_policy.commands, now_ms);
+    try validateBucketCarry(state.target_change_rate, expected_policy.target_changes, now_ms);
+    if (now_ms) |now| if (state.excess.last_ms > now) return error.ClockRegression;
+    if (expected_policy.excess.decay_points != 0 and expected_policy.excess.decay_period_ms != 0 and
+        state.excess.carry >= expected_policy.excess.decay_period_ms) return error.InvalidCarryState;
+    if (state.target_count > target_slots or state.next_target_slot >= target_slots or
+        (state.target_count < target_slots and state.next_target_slot != 0))
+        return error.InvalidCarryState;
+    for (state.targets, 0..) |key, index| {
+        if (index >= state.target_count) {
+            if (!std.meta.eql(key, TargetCarry.empty)) return error.InvalidCarryState;
+            continue;
+        }
+        if (key.len == 0 or key.len > std.math.maxInt(usize)) return error.InvalidCarryState;
+        for (state.targets[0..index]) |prior| {
+            if (std.meta.eql(key, prior)) return error.InvalidCarryState;
+        }
+    }
+}
 
 /// Per-connection flood guard. Bounded, allocation-free, deterministic.
 pub const FloodGuard = struct {
@@ -350,6 +440,68 @@ pub const FloodGuard = struct {
             .excess_points = self.excess.current(),
             .tracked_targets = self.target_count,
         };
+    }
+
+    /// Seal every metering dimension and target-ring cursor without decaying it.
+    /// A malformed live image fails the pre-COMMIT snapshot instead of granting
+    /// the successor fresh flood credit.
+    pub fn exportCarry(self: *const FloodGuard) CarryError!CarryState {
+        if (!std.meta.eql(self.message_rate.cfg, self.config.messages) or
+            !std.meta.eql(self.byte_rate.cfg, self.config.bytes) or
+            !std.meta.eql(self.command_rate.cfg, self.config.commands) or
+            !std.meta.eql(self.target_change_rate.cfg, self.config.target_changes) or
+            !std.meta.eql(self.excess.cfg, self.config.excess) or
+            self.target_count > target_slots or self.next_target_slot >= target_slots)
+            return error.InvalidCarryState;
+        var targets: [target_slots]TargetCarry = @splat(TargetCarry.empty);
+        for (self.targets, 0..) |key, index| {
+            targets[index] = .{
+                .hash = key.hash,
+                .len = std.math.cast(u64, key.len) orelse return error.InvalidCarryState,
+            };
+        }
+        const state = CarryState{
+            .policy = self.config,
+            .message_rate = bucketCarry(self.message_rate),
+            .byte_rate = bucketCarry(self.byte_rate),
+            .command_rate = bucketCarry(self.command_rate),
+            .target_change_rate = bucketCarry(self.target_change_rate),
+            .excess = excessCarry(self.excess),
+            .targets = targets,
+            .target_count = std.math.cast(u8, self.target_count) orelse return error.InvalidCarryState,
+            .next_target_slot = std.math.cast(u8, self.next_target_slot) orelse return error.InvalidCarryState,
+        };
+        try validateCarry(state, self.config, null);
+        return state;
+    }
+
+    /// Restore only under the exact policy independently derived for this
+    /// connection on the successor. All checks precede construction, so a
+    /// failed import cannot publish partial credit or target history.
+    pub fn importCarry(expected_policy: GuardConfig, now_ms: i64, state: CarryState) CarryError!FloodGuard {
+        try validateCarry(state, expected_policy, now_ms);
+        var guard = FloodGuard.init(expected_policy, now_ms);
+        guard.message_rate.tokens = state.message_rate.tokens;
+        guard.message_rate.last_ms = state.message_rate.last_ms;
+        guard.message_rate.carry = state.message_rate.carry;
+        guard.byte_rate.tokens = state.byte_rate.tokens;
+        guard.byte_rate.last_ms = state.byte_rate.last_ms;
+        guard.byte_rate.carry = state.byte_rate.carry;
+        guard.command_rate.tokens = state.command_rate.tokens;
+        guard.command_rate.last_ms = state.command_rate.last_ms;
+        guard.command_rate.carry = state.command_rate.carry;
+        guard.target_change_rate.tokens = state.target_change_rate.tokens;
+        guard.target_change_rate.last_ms = state.target_change_rate.last_ms;
+        guard.target_change_rate.carry = state.target_change_rate.carry;
+        guard.excess.points = state.excess.points;
+        guard.excess.last_ms = state.excess.last_ms;
+        guard.excess.carry = state.excess.carry;
+        for (state.targets, 0..) |key, index| {
+            guard.targets[index] = .{ .hash = key.hash, .len = @intCast(key.len) };
+        }
+        guard.target_count = state.target_count;
+        guard.next_target_slot = state.next_target_slot;
+        return guard;
     }
 
     fn commandWeight(self: *const FloodGuard, command: []const u8) u64 {
@@ -583,6 +735,121 @@ test "reconfigure clamps tokens and retunes live" {
     tighter.commands = .{ .capacity = 1, .refill_tokens = 1, .refill_period_ms = 1000 };
     guard.reconfigure(tighter);
     try testing.expect(guard.snapshot().command_tokens <= 1);
+}
+
+test "carry state preserves all flood dimensions, excess decay, and wrapped target ring" {
+    var cfg = testConfig();
+    cfg.messages = .{ .capacity = 18, .refill_tokens = 1, .refill_period_ms = 1000 };
+    cfg.bytes = .{ .capacity = 2048, .refill_tokens = 5, .refill_period_ms = 1000 };
+    cfg.commands = .{ .capacity = 18, .refill_tokens = 1, .refill_period_ms = 1000 };
+    cfg.target_changes = .{ .capacity = 18, .refill_tokens = 1, .refill_period_ms = 1000 };
+    cfg.excess = .{ .threshold = 10, .decay_points = 1, .decay_period_ms = 1000 };
+    var source = FloodGuard.init(cfg, 100);
+    for (0..target_slots + 1) |index| {
+        var line_buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "PRIVMSG #t{d} :hello\r\n", .{index});
+        try testing.expectEqual(Decision.allow, source.classifyRaw(100, line));
+    }
+    try testing.expectEqual(Decision.allow, source.classifyRaw(100, "WHOIS x\r\n"));
+    try testing.expectEqual(Decision.throttle, source.classifyRaw(100, "WHOIS x\r\n"));
+    source.decay(175);
+
+    const sealed = try source.exportCarry();
+    try testing.expectEqual(@as(u8, target_slots), sealed.target_count);
+    try testing.expectEqual(@as(u8, 1), sealed.next_target_slot);
+    try testing.expectEqual(@as(u64, 1), sealed.excess.points);
+    try testing.expect(sealed.message_rate.carry != 0);
+    try testing.expect(sealed.byte_rate.carry != 0);
+    try testing.expect(sealed.command_rate.carry != 0);
+    try testing.expect(sealed.target_change_rate.carry != 0);
+    try testing.expect(sealed.excess.carry != 0);
+
+    var restored = try FloodGuard.importCarry(cfg, 200, sealed);
+    try testing.expectEqualDeep(sealed, try restored.exportCarry());
+    const lines = [_][]const u8{ "PRIVMSG #t1 :repeat\r\n", "PRIVMSG #new :new\r\n", "WHOIS x\r\n" };
+    const times = [_]i64{ 200, 1200, 1200 };
+    for (lines, times) |line, now_ms| {
+        try testing.expectEqual(source.classifyRaw(now_ms, line), restored.classifyRaw(now_ms, line));
+        try testing.expectEqualDeep(try source.exportCarry(), try restored.exportCarry());
+    }
+}
+
+test "carry import rejects policy drift, future clocks, and malformed bounded state" {
+    const cfg = testConfig();
+    var source = FloodGuard.init(cfg, 100);
+    try testing.expectEqual(Decision.allow, source.classifyRaw(100, "PRIVMSG #a :hi\r\n"));
+    const sealed = try source.exportCarry();
+
+    var changed_policy = cfg;
+    changed_policy.commands.capacity += 1;
+    try testing.expectError(error.PolicyMismatch, FloodGuard.importCarry(changed_policy, 101, sealed));
+    var altered = sealed;
+    altered.command_rate.tokens = cfg.commands.capacity + 1;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 101, altered));
+    altered = sealed;
+    altered.message_rate.last_ms = 102;
+    try testing.expectError(error.ClockRegression, FloodGuard.importCarry(cfg, 101, altered));
+    altered = sealed;
+    altered.excess.last_ms = 102;
+    try testing.expectError(error.ClockRegression, FloodGuard.importCarry(cfg, 101, altered));
+    altered = sealed;
+    altered.target_count = target_slots + 1;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 101, altered));
+    altered = sealed;
+    altered.next_target_slot = 1;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 101, altered));
+    altered = sealed;
+    altered.targets[1] = altered.targets[0];
+    altered.target_count = 2;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 101, altered));
+    altered = sealed;
+    altered.targets[1] = .{ .hash = 0x55, .len = 2 };
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 101, altered));
+
+    source.command_rate.tokens = cfg.commands.capacity + 1;
+    try testing.expectError(error.InvalidCarryState, source.exportCarry());
+}
+
+test "carry import rejects out-of-range fractional refill and decay" {
+    var cfg = testConfig();
+    cfg.messages = .{ .capacity = 2, .refill_tokens = 1, .refill_period_ms = 101 };
+    cfg.bytes = .{ .capacity = 20, .refill_tokens = 3, .refill_period_ms = 103 };
+    cfg.commands.refill_period_ms = 107;
+    cfg.target_changes.refill_period_ms = 109;
+    cfg.excess.decay_period_ms = 113;
+    var source = FloodGuard.init(cfg, 100);
+    const sealed = try source.exportCarry();
+
+    var altered = sealed;
+    altered.message_rate.carry = cfg.messages.refill_period_ms;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 100, altered));
+    altered = sealed;
+    altered.byte_rate.carry = cfg.bytes.refill_period_ms;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 100, altered));
+    altered = sealed;
+    altered.command_rate.carry = cfg.commands.refill_period_ms;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 100, altered));
+    altered = sealed;
+    altered.target_change_rate.carry = cfg.target_changes.refill_period_ms;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 100, altered));
+    altered = sealed;
+    altered.excess.carry = cfg.excess.decay_period_ms;
+    try testing.expectError(error.InvalidCarryState, FloodGuard.importCarry(cfg, 100, altered));
+
+    source.command_rate.carry = cfg.commands.refill_period_ms;
+    try testing.expectError(error.InvalidCarryState, source.exportCarry());
+}
+
+test "reconfigure resets fractional carry when a rate denominator changes" {
+    var cfg = testConfig();
+    var source = FloodGuard.init(cfg, 100);
+    _ = source.classifyRaw(100, "WHOIS a\r\n");
+    source.decay(175);
+    try testing.expect(source.command_rate.carry != 0);
+    cfg.commands.refill_period_ms = 50;
+    source.reconfigure(cfg);
+    try testing.expectEqual(@as(u64, 0), source.command_rate.carry);
+    _ = try source.exportCarry();
 }
 
 test "deterministic for identical inputs" {

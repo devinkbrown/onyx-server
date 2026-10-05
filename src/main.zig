@@ -6,6 +6,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const onyx_server = @import("onyx_server");
 const delegated_credential_cli = @import("daemon/delegated_credential_cli.zig");
+const windows_config_proof = onyx_server.daemon.helix.native_windows_config_proof;
+const windows_process = onyx_server.daemon.helix.native_windows_process;
+const windows_bootstrap = onyx_server.daemon.helix.native_windows_bootstrap;
+const windows_driver = onyx_server.daemon.helix.native_windows_driver;
+const windows_runtime = onyx_server.daemon.helix.native_windows_runtime;
+const windows_tls_material = onyx_server.daemon.helix.native_windows_tls_material;
 const native_service = onyx_server.daemon.native_service;
 const service_helper = onyx_server.daemon.native_service_helper;
 
@@ -28,6 +34,44 @@ const OwnedTrustAnchors = struct {
         for (self.anchors.items) |der| self.allocator.free(der);
         self.anchors.deinit(self.allocator);
         self.anchors = .empty;
+    }
+};
+
+/// Windows Helix must serve from the same MMDB bytes preflight parsed and
+/// committed to the effective config digest. The database borrows `bytes`;
+/// only this owner (or Server after transfer) may free them.
+const WindowsGeoDatabase = struct {
+    bytes: []u8,
+    database: onyx_server.substrate.geoip.Database,
+
+    fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !WindowsGeoDatabase {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 << 20));
+        errdefer allocator.free(bytes);
+        return .{ .bytes = bytes, .database = try onyx_server.substrate.geoip.Database.init(bytes) };
+    }
+
+    fn deinit(self: *WindowsGeoDatabase, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+const WindowsGeoOwned = struct {
+    city: ?WindowsGeoDatabase = null,
+    asn: ?WindowsGeoDatabase = null,
+
+    fn deinit(self: *WindowsGeoOwned, allocator: std.mem.Allocator) void {
+        if (self.city) |*owner| owner.deinit(allocator);
+        if (self.asn) |*owner| owner.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn cityBytes(self: *const WindowsGeoOwned) ?[]const u8 {
+        return if (self.city) |owner| owner.bytes else null;
+    }
+
+    fn asnBytes(self: *const WindowsGeoOwned) ?[]const u8 {
+        return if (self.asn) |owner| owner.bytes else null;
     }
 };
 
@@ -129,6 +173,207 @@ const ManagedConfigCommitment = struct {
     }
 };
 
+fn parseWindowsCandidateNumber(comptime T: type, text: []const u8) error{InvalidWindowsCandidate}!T {
+    if (text.len == 0 or (text.len > 1 and text[0] == '0')) return error.InvalidWindowsCandidate;
+    for (text) |digit| if (digit < '0' or digit > '9') return error.InvalidWindowsCandidate;
+    const value = std.fmt.parseInt(T, text, 10) catch return error.InvalidWindowsCandidate;
+    if (value == 0) return error.InvalidWindowsCandidate;
+    return value;
+}
+
+test "Windows Helix candidate numeric arguments are canonical decimal" {
+    try std.testing.expectEqual(@as(usize, 123), try parseWindowsCandidateNumber(usize, "123"));
+    try std.testing.expectError(error.InvalidWindowsCandidate, parseWindowsCandidateNumber(usize, "0"));
+    try std.testing.expectError(error.InvalidWindowsCandidate, parseWindowsCandidateNumber(usize, "01"));
+    try std.testing.expectError(error.InvalidWindowsCandidate, parseWindowsCandidateNumber(usize, "+1"));
+    try std.testing.expectError(error.InvalidWindowsCandidate, parseWindowsCandidateNumber(usize, "1x"));
+    try std.testing.expectError(error.InvalidWindowsCandidate, parseWindowsCandidateNumber(u32, "4294967296"));
+}
+
+const WindowsInheritedRows = struct {
+    allocator: std.mem.Allocator,
+    listeners: []onyx_server.daemon.server.ListenerDescriptor,
+    state_fds: []i32,
+
+    fn init(allocator: std.mem.Allocator, rows: []const windows_bootstrap.ReceivedRow) !WindowsInheritedRows {
+        var listener_count: usize = 0;
+        for (rows) |row| switch (row.role) {
+            .client, .s2s_state => {},
+            .plain_listener, .tls_listener, .websocket_listener, .s2s_listener => listener_count += 1,
+        };
+        const listeners = try allocator.alloc(onyx_server.daemon.server.ListenerDescriptor, listener_count);
+        errdefer allocator.free(listeners);
+        const state_fds = try allocator.alloc(i32, rows.len - listener_count);
+        errdefer allocator.free(state_fds);
+        var li: usize = 0;
+        var si: usize = 0;
+        for (rows) |row| switch (row.role) {
+            .client, .s2s_state => {
+                state_fds[si] = row.canonical;
+                si += 1;
+            },
+            .plain_listener, .tls_listener, .websocket_listener, .s2s_listener => {
+                if (row.shard > std.math.maxInt(u12)) return error.InvalidWindowsCandidate;
+                listeners[li] = .{
+                    .fd = row.canonical,
+                    .shard = @intCast(row.shard),
+                    .family = std.enums.fromInt(onyx_server.daemon.server.ListenerFamily, row.family) orelse return error.InvalidWindowsCandidate,
+                    .kind = switch (row.role) {
+                        .plain_listener => .plain,
+                        .tls_listener => .tls,
+                        .websocket_listener => .ws,
+                        .s2s_listener => .s2s,
+                        else => unreachable,
+                    },
+                };
+                li += 1;
+            },
+        };
+        if (li == 0 or li != listeners.len or si != state_fds.len) return error.InvalidWindowsCandidate;
+        return .{ .allocator = allocator, .listeners = listeners, .state_fds = state_fds };
+    }
+
+    fn deinit(self: *WindowsInheritedRows) void {
+        self.allocator.free(self.listeners);
+        self.allocator.free(self.state_fds);
+    }
+};
+
+const WindowsCandidateBarrier = struct {
+    child: *windows_process.Incoming,
+    transfer: *windows_bootstrap.Incoming,
+    deadline: i64,
+
+    fn asServerBarrier(self: *WindowsCandidateBarrier) onyx_server.daemon.server.NativeAdoptBarrier {
+        return .{
+            .ctx = self,
+            .readyAndAwaitCommit = readyAndAwaitCommit,
+            .claimInertListenerSocket = claimSocket,
+            .claimInertStateSocket = claimSocket,
+        };
+    }
+
+    fn claimSocket(ctx: *anyopaque, canonical: i32) anyerror!void {
+        const self: *WindowsCandidateBarrier = @ptrCast(@alignCast(ctx));
+        try self.transfer.claimStagedForServer(canonical);
+    }
+
+    // Server.adoptInheritedSessions invokes this barrier only after its strict
+    // capsule decode, relation checks, and physical connection join. The
+    // driver additionally requires every imported socket to be claimed.
+    fn verifyServerStage(ctx: ?*anyopaque, transfer: *windows_bootstrap.Incoming) anyerror!void {
+        const self: *WindowsCandidateBarrier = @ptrCast(@alignCast(ctx orelse return error.InvalidWindowsCandidate));
+        if (self.transfer != transfer) return error.InvalidWindowsCandidate;
+    }
+
+    fn readyAndAwaitCommit(ctx: *anyopaque) anyerror!void {
+        const self: *WindowsCandidateBarrier = @ptrCast(@alignCast(ctx));
+        const ticket = windows_driver.childAnswerReady(self.child, self.transfer, .{
+            .context = self,
+            .run = verifyServerStage,
+        }, self.deadline) catch |err| {
+            std.debug.print("onyx-server: Windows Helix READY validation failed ({s})\n", .{@errorName(err)});
+            windows_driver.candidateAbortNow();
+        };
+        windows_driver.childAwaitCommit(self.child, self.transfer, ticket, self.deadline) catch |err| {
+            std.debug.print("onyx-server: Windows Helix COMMIT release failed ({s})\n", .{@errorName(err)});
+            windows_driver.candidateAbortNow();
+        };
+    }
+};
+
+fn recordWindowsTlsMaterial(proof: *windows_config_proof.EffectiveBuilder, loaded: *const onyx_server.daemon.tls_certs.Loaded) !void {
+    try proof.record(.tls, "key-kind", &.{@intFromEnum(loaded.key_kind)});
+    try proof.recordCount(.tls, "certificate-count", loaded.cert_chain.len);
+    for (loaded.cert_chain) |der| try proof.record(.tls, "certificate-der", der);
+    switch (loaded.key_kind) {
+        .ed25519 => {
+            const key = loaded.signing_key orelse return error.InvalidWindowsTlsMaterial;
+            var secret = key.secret_key.toBytes();
+            defer std.crypto.secureZero(u8, &secret);
+            try proof.record(.tls, "ed25519-private", &secret);
+        },
+        .ecdsa_p256 => {
+            const key = loaded.ecdsa_p256_signing_key orelse return error.InvalidWindowsTlsMaterial;
+            var secret = key.secret_key.toBytes();
+            defer std.crypto.secureZero(u8, &secret);
+            try proof.record(.tls, "p256-private", &secret);
+        },
+        .rsa => try proof.record(.tls, "rsa-private-der", loaded.rsa_key_storage orelse return error.InvalidWindowsTlsMaterial),
+    }
+}
+
+/// Static inputs stay byte-identical across an ACME renewal. The actual
+/// serving default/TLS 1.2 generations are carried by mandatory HXTM and
+/// checked under the authenticated World cut before READY.
+fn windowsStaticEffectiveConfigDigest(
+    source_digest: windows_config_proof.Digest,
+    tls_default_present: bool,
+    tls_sni: []const onyx_server.daemon.tls_certs.Loaded,
+    ech: []const onyx_server.crypto.tls_server.EchKey,
+    vapid: ?*const onyx_server.daemon.webpush.Vapid,
+    oauth_jwks: ?[]const u8,
+    node: ?*const onyx_server.daemon.node_identity.NodeIdentity,
+    cloak: ?onyx_server.proto.cloak.SecretKey,
+    previous_cloak: ?onyx_server.proto.cloak.SecretKey,
+    geo_city: ?[]const u8,
+    geo_asn: ?[]const u8,
+) !windows_config_proof.Digest {
+    var proof = windows_config_proof.EffectiveBuilder.init(source_digest);
+    defer proof.deinit();
+    try proof.recordCount(.tls, "default-present", @intFromBool(tls_default_present));
+    try proof.recordCount(.tls, "sni-count", tls_sni.len);
+    for (tls_sni, 0..) |*loaded, index| {
+        try proof.recordCount(.tls, "sni-index", index);
+        try recordWindowsTlsMaterial(&proof, loaded);
+    }
+    try proof.recordCount(.ech, "ech-count", ech.len);
+    for (ech) |key| {
+        try proof.record(.ech, "config-list", key.config);
+        try proof.record(.ech, "recipient-private", &key.private_key);
+    }
+    try proof.recordCount(.vapid, "present", @intFromBool(vapid != null));
+    if (vapid) |key| {
+        var secret = key.key_pair.secret_key.toBytes();
+        defer std.crypto.secureZero(u8, &secret);
+        try proof.record(.vapid, "p256-private", &secret);
+        const public = key.key_pair.public_key.toUncompressedSec1();
+        try proof.record(.vapid, "p256-public", &public);
+    }
+    try proof.recordCount(.oauth, "jwks-present", @intFromBool(oauth_jwks != null));
+    if (oauth_jwks) |bytes| try proof.record(.oauth, "jwks", bytes);
+    try proof.recordCount(.node, "present", @intFromBool(node != null));
+    if (node) |identity| {
+        try proof.record(.node, "realm", &identity.realm);
+        try proof.record(.node, "node-id", &identity.node_id);
+        try proof.record(.node, "sign-public", &identity.sign_kp.public_key);
+        try proof.record(.node, "kem-public", &identity.kem_kp.public_key);
+    }
+    try proof.recordCount(.cloak, "present", @intFromBool(cloak != null));
+    if (cloak) |key| try proof.record(.cloak, "current", &key.bytes);
+    try proof.recordCount(.cloak, "previous-present", @intFromBool(previous_cloak != null));
+    if (previous_cloak) |key| try proof.record(.cloak, "previous", &key.bytes);
+    try windows_config_proof.recordGeoipMaterial(&proof, geo_city, geo_asn);
+    return proof.finish();
+}
+
+test "Windows static Helix proof binds TLS presence and SNI material" {
+    const source: windows_config_proof.Digest = @splat(0x37);
+    const base = try windowsStaticEffectiveConfigDigest(source, true, &.{}, &.{}, null, null, null, null, null, null, null);
+    const absent = try windowsStaticEffectiveConfigDigest(source, false, &.{}, &.{}, null, null, null, null, null, null, null);
+    try std.testing.expect(!std.crypto.timing_safe.eql(windows_config_proof.Digest, base, absent));
+
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x52));
+    const chain = [_][]const u8{"sni-leaf"};
+    const sni = [_]onyx_server.daemon.tls_certs.Loaded{.{
+        .cert_chain = @constCast(&chain),
+        .key_kind = .ed25519,
+        .signing_key = key,
+    }};
+    const with_sni = try windowsStaticEffectiveConfigDigest(source, true, &sni, &.{}, null, null, null, null, null, null, null);
+    try std.testing.expect(!std.crypto.timing_safe.eql(windows_config_proof.Digest, base, with_sni));
+}
+
 /// Shared context for the config-string resolver. Both `env:NAME` and
 /// `@file:path` indirection run through a single `?*anyopaque` ctx, so it
 /// carries everything either lookup needs: the process environment map and an
@@ -140,6 +385,7 @@ const ResolverCtx = struct {
     file_paths: std.ArrayList([]u8) = .empty,
     record_paths: bool = true,
     managed_commitment: ?*ManagedConfigCommitment = null,
+    windows_helix_proof: ?*windows_config_proof.Builder = null,
 
     fn deinit(self: *ResolverCtx) void {
         for (self.file_paths.items) |path| self.path_allocator.free(path);
@@ -154,6 +400,7 @@ fn envLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) a
     const rc: *ResolverCtx = @ptrCast(@alignCast(ctx orelse return error.EnvironmentVariableNotFound));
     const value = rc.environ_map.get(name) orelse return error.EnvironmentVariableNotFound;
     if (rc.managed_commitment) |commitment| commitment.record(2, name, value);
+    if (rc.windows_helix_proof) |proof| try proof.recordEnvironment(name, value);
     return allocator.dupe(u8, value);
 }
 
@@ -170,7 +417,9 @@ fn fileLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) 
         }
     }
     const value = try std.Io.Dir.cwd().readFileAlloc(rc.io, path, allocator, .limited(1 << 20));
+    errdefer allocator.free(value);
     if (rc.managed_commitment) |commitment| commitment.record(3, path, value);
+    if (rc.windows_helix_proof) |proof| try proof.recordFile(path, value);
     return value;
 }
 
@@ -185,8 +434,9 @@ fn validateTlsChain(chain: []const []const u8) anyerror!void {
 
 /// Check native Windows companion inputs during --check-config and before the
 /// live server binds.
-fn validateWindowsCompanionInputs(allocator: std.mem.Allocator, io: std.Io, cfg: onyx_server.daemon.config_format.Config) !void {
+fn validateWindowsCompanionInputs(allocator: std.mem.Allocator, io: std.Io, cfg: onyx_server.daemon.config_format.Config, geo_out: ?*WindowsGeoOwned) !void {
     if (comptime builtin.os.tag != .windows) return;
+    try onyx_server.daemon.config_boot.validateWindowsStatsOutputDirs(io, cfg.stats);
     if (cfg.node.secret_key) |secret| {
         var identity = try onyx_server.daemon.node_identity.fromConfig(secret, cfg.mesh.realm);
         defer identity.deinit();
@@ -278,11 +528,16 @@ fn validateWindowsCompanionInputs(allocator: std.mem.Allocator, io: std.Io, cfg:
         const dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
         dir.close(io);
     };
-    for ([_][]const u8{ cfg.geoip.database, cfg.geoip.asn_database }) |path| {
-        if (path.len == 0) continue;
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 << 20));
-        defer allocator.free(bytes);
-        _ = try onyx_server.substrate.geoip.Database.init(bytes);
+    var geo: WindowsGeoOwned = .{};
+    defer geo.deinit(allocator);
+    if (cfg.geoip.database.len != 0)
+        geo.city = try WindowsGeoDatabase.load(allocator, io, cfg.geoip.database);
+    if (cfg.geoip.asn_database.len != 0)
+        geo.asn = try WindowsGeoDatabase.load(allocator, io, cfg.geoip.asn_database);
+    if (geo_out) |out| {
+        if (out.city != null or out.asn != null) return error.InvalidWindowsGeoOwner;
+        out.* = geo;
+        geo = .{};
     }
 }
 
@@ -543,6 +798,23 @@ pub fn main(init: std.process.Init) !void {
     var srv_cfg = onyx_server.daemon.server.Config{ .port = 6680 };
     var native_incoming: ?onyx_server.daemon.helix.native_bootstrap.Incoming = null;
     defer if (native_incoming) |*incoming| incoming.deinit();
+    var windows_child: ?windows_process.Incoming = null;
+    defer if (windows_child) |*child| child.deinit();
+    var windows_transfer: ?windows_bootstrap.Incoming = null;
+    defer if (windows_transfer) |*transfer| transfer.deinit();
+    // A WebTransport candidate borrows the source's authenticated serving
+    // certificate before READY. Keep this detached copy until its UDP owner
+    // has joined and been destroyed on process exit.
+    var windows_wt_tls_material: ?windows_tls_material.Owned = null;
+    defer if (windows_wt_tls_material) |*material| material.deinit();
+    var windows_deadline: i64 = 0;
+    var windows_rows: ?WindowsInheritedRows = null;
+    defer if (windows_rows) |*rows| rows.deinit();
+    var windows_barrier: ?WindowsCandidateBarrier = null;
+    var windows_source_digest_boot: ?windows_config_proof.Digest = null;
+    var windows_geo: WindowsGeoOwned = .{};
+    defer windows_geo.deinit(allocator);
+    var windows_runtime_driver = windows_runtime.Driver{ .allocator = allocator };
     // Outer lifetime custody survives Server and every companion cleanup. The
     // Prelude admits only a root-created channel; it cannot publish readiness.
     var managed_prelude: ?*service_helper.ManagedPrelude = null;
@@ -577,8 +849,8 @@ pub fn main(init: std.process.Init) !void {
     // which would re-run the old in-memory image), so a swapped-in new binary is
     // what actually boots across a hot upgrade.
     if (args.next()) |exe| srv_cfg.exe_path = exe;
-    if (comptime builtin.os.tag == .openbsd) {
-        try onyx_server.daemon.os_runtime.raiseOpenBsdFdAllowance();
+    if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
+        if (comptime builtin.os.tag == .openbsd) try onyx_server.daemon.os_runtime.raiseOpenBsdFdAllowance();
         native_executable = try std.process.executablePathAlloc(init.io, allocator);
         srv_cfg.exe_path = native_executable.?;
     }
@@ -625,6 +897,35 @@ pub fn main(init: std.process.Init) !void {
                     config_path_arg = path;
                 };
             } else return error.InvalidNativeCandidate;
+        } else if (std.mem.eql(u8, first, windows_process.candidate_arg)) {
+            if (comptime builtin.os.tag == .windows) {
+                const read_handle = try parseWindowsCandidateNumber(usize, args.next() orelse return error.InvalidWindowsCandidate);
+                const write_handle = try parseWindowsCandidateNumber(usize, args.next() orelse return error.InvalidWindowsCandidate);
+                const parent_process = try parseWindowsCandidateNumber(usize, args.next() orelse return error.InvalidWindowsCandidate);
+                const parent_pid = try parseWindowsCandidateNumber(u32, args.next() orelse return error.InvalidWindowsCandidate);
+                const path = args.next() orelse return error.InvalidWindowsCandidate;
+                if (path.len == 0 or path.len > windows_config_proof.max_path_bytes or
+                    std.mem.indexOfAny(u8, path, "\x00\r\n") != null or args.next() != null)
+                    return error.InvalidWindowsCandidate;
+                var handles = windows_process.CandidateHandles{
+                    .read_handle = read_handle,
+                    .write_handle = write_handle,
+                    .parent_process = parent_process,
+                };
+                defer handles.deinit();
+                windows_deadline = try std.math.add(i64, onyx_server.substrate.platform.monotonicMillis(), 30_000);
+                windows_child = try windows_process.accept(&handles, parent_pid, windows_deadline);
+                windows_transfer = windows_bootstrap.receive(allocator, &windows_child.?.endpoint, windows_deadline) catch |err| {
+                    // Return a bounded authenticated diagnostic before the
+                    // inert candidate exits; the predecessor remains live.
+                    windows_child.?.endpoint.send(.abort, @errorName(err), windows_deadline) catch {};
+                    windows_driver.candidateAbortNow();
+                };
+                const zero_digest: windows_config_proof.Digest = @splat(0);
+                if (std.crypto.timing_safe.eql(windows_config_proof.Digest, windows_transfer.?.source_digest, zero_digest))
+                    windows_driver.candidateAbortNow();
+                config_path_arg = path;
+            } else return error.InvalidWindowsCandidate;
         } else if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.upgrade_capability_arg)) {
             // Advertise the current contract plus the exact predecessor token.
             // The latter lets a deployed HSSN v3 writer upgrade into this v4
@@ -768,7 +1069,7 @@ pub fn main(init: std.process.Init) !void {
                                 std.process.exit(1);
                             };
                         }
-                        validateWindowsCompanionInputs(allocator, init.io, l.parsed) catch |err| {
+                        validateWindowsCompanionInputs(allocator, init.io, l.parsed, null) catch |err| {
                             std.debug.print("config ERROR in {s}: Windows companion preflight: {s}\n", .{ path, @errorName(err) });
                             std.process.exit(1);
                         };
@@ -1001,13 +1302,44 @@ pub fn main(init: std.process.Init) !void {
             .env = envLookup,
             .file = fileLookup,
         };
-        if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
+        // Read through the same normalized source path that enters the Windows
+        // Helix proof. The resolver records the values actually used by parse.
+        const windows_source_path: ?[:0]u8 = if (comptime builtin.os.tag == .windows)
+            try std.Io.Dir.cwd().realPathFileAlloc(init.io, path, allocator)
+        else
+            null;
+        defer if (windows_source_path) |canonical| allocator.free(canonical);
+        const source_path = if (windows_source_path) |canonical| canonical else path;
+        if (std.Io.Dir.cwd().readFileAlloc(init.io, source_path, allocator, .limited(1 << 20))) |text| {
             defer allocator.free(text); // string fields are duped by the parser
+            var windows_source_proof: ?windows_config_proof.Builder = null;
+            defer if (windows_source_proof) |*proof| proof.deinit();
+            defer resolver_ctx.windows_helix_proof = null;
+            if (comptime builtin.os.tag == .windows) {
+                windows_source_proof = try windows_config_proof.Builder.initCanonical(windows_source_path.?, text);
+                resolver_ctx.windows_helix_proof = &windows_source_proof.?;
+            }
             if (managed_prelude != null) {
                 managed_commitment.record(1, path, text);
                 resolver_ctx.managed_commitment = &managed_commitment;
             }
             if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
+                const windows_source_digest: ?windows_config_proof.Digest = if (comptime builtin.os.tag == .windows) blk: {
+                    const proof = if (windows_source_proof) |*p| p else unreachable;
+                    break :blk try proof.finish();
+                } else null;
+                resolver_ctx.windows_helix_proof = null;
+                if (windows_transfer) |*transfer| {
+                    // The static source proof is compared after read-only
+                    // config material loads. HXTM carries the exact serving
+                    // TLS generation separately; a provisional candidate
+                    // bootstrap leaf cannot serve before its COMMIT swap.
+                    if (loaded.parsed.node.secret_key == null or loaded.parsed.cloak.secret == null)
+                        windows_driver.candidateAbortNow();
+                    if (loaded.config.sasl_enabled and loaded.parsed.sasl.account_db != null) {
+                        if (transfer.wal == null) windows_driver.candidateAbortNow();
+                    } else if (transfer.wal != null) windows_driver.candidateAbortNow();
+                }
                 if (managed_prelude != null) {
                     managed_config_digest = managed_commitment.finish();
                     resolver_ctx.managed_commitment = null;
@@ -1036,7 +1368,7 @@ pub fn main(init: std.process.Init) !void {
                             std.process.exit(1);
                         };
                     }
-                    validateWindowsCompanionInputs(allocator, init.io, loaded.parsed) catch |err| {
+                    validateWindowsCompanionInputs(allocator, init.io, loaded.parsed, &windows_geo) catch |err| {
                         std.debug.print("onyx-server: fatal Windows companion preflight: {s}\n", .{@errorName(err)});
                         std.process.exit(1);
                     };
@@ -1063,6 +1395,7 @@ pub fn main(init: std.process.Init) !void {
                 const carried_state_manifest_present = srv_cfg.inherited_state_fd_manifest_present;
                 const carried_state_manifest_valid = srv_cfg.inherited_state_fd_manifest_valid;
                 srv_cfg = loaded.config;
+                windows_source_digest_boot = windows_source_digest;
                 srv_cfg.exe_path = carried_exe;
                 srv_cfg.resume_arena_fd = carried_resume;
                 srv_cfg.inherited_listener_fd = carried_listen;
@@ -1073,6 +1406,23 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.num_shards = loaded.num_shards;
                 srv_cfg.config_path = path;
                 srv_cfg.config_resolver = resolver;
+                if (comptime builtin.os.tag == .windows) {
+                    // stats_web_dir only selects reactor-0 derived file output;
+                    // it has no process-owned state or socket to hand off.
+                    // Connection throttle, mesh clone occupancy, DNSBL, and
+                    // live channel statistics, mail, ACME, OCSP, Web Push,
+                    // Geo, and serving TLS material have mandatory checkpoints.
+                    // GeoIP/ASN databases are pinned from preflight and bound to
+                    // the exact source/candidate effective config proof.
+                    // Configured media is carried only when the source proves
+                    // the original Domain and both UDP owners are pristine at
+                    // its World-locked transfer cut. A standalone native-media
+                    // port without that graph has no matching custody path.
+                    srv_cfg.windows_helix_external_companions_safe =
+                        loaded.config.media_enabled or loaded.config.native_media_port == 0;
+                    if (windows_transfer != null and !srv_cfg.windows_helix_external_companions_safe)
+                        windows_driver.candidateAbortNow();
+                }
                 std.debug.print("onyx-server: loaded config from {s}\n", .{path});
             } else |err| {
                 std.debug.print("onyx-server: fatal config error in {s} ({s})\n", .{ path, @errorName(err) });
@@ -1122,12 +1472,17 @@ pub fn main(init: std.process.Init) !void {
     defer if (tls_ech_loaded) |*e| e.deinit(allocator);
     if (held) |h| {
         if (h.tls.enabled) {
-            if (onyx_server.daemon.tls_certs.loadOrBootstrap(allocator, init.io, .{
+            const tls_options: onyx_server.daemon.tls_certs.Options = .{
                 .enabled = true,
                 .cert_path = h.tls.cert_path,
                 .key_path = h.tls.key_path,
                 .dns_name = h.tls.dns_name,
-            })) |loaded| tls_material: {
+            };
+            const loaded_tls = if (builtin.os.tag == .windows and srv_cfg.webtransport_port != 0)
+                onyx_server.daemon.tls_certs.loadOrBootstrapWebTransport(allocator, init.io, tls_options)
+            else
+                onyx_server.daemon.tls_certs.loadOrBootstrap(allocator, init.io, tls_options);
+            if (loaded_tls) |loaded| tls_material: {
                 validateTlsChain(loaded.cert_chain) catch |err| {
                     var rejected = loaded;
                     rejected.deinit(allocator);
@@ -1257,7 +1612,6 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
-
     // Native secure-WebSocket (wss) browser listener (`[listen] ws`): rides the
     // SAME cert chain + signing key loaded for the implicit-TLS listener above,
     // so the leg is genuine wss under the daemon's real certificate. Browsers
@@ -1320,7 +1674,10 @@ pub fn main(init: std.process.Init) !void {
     if (held) |h| {
         if (h.parsed.webpush.enabled and (builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) {
             const loaded_vapid = if (comptime builtin.os.tag == .windows)
-                onyx_server.daemon.webpush.Vapid.loadOrCreatePrivateWindows(init.io, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path)
+                if (windows_transfer != null)
+                    onyx_server.daemon.webpush.Vapid.loadExistingPrivateWindows(init.io, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path)
+                else
+                    onyx_server.daemon.webpush.Vapid.loadOrCreatePrivateWindows(init.io, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path)
             else if (native_incoming != null)
                 onyx_server.daemon.webpush.Vapid.loadExisting(init.io, allocator, std.Io.Dir.cwd(), h.parsed.webpush.vapid_key_path)
             else
@@ -1379,6 +1736,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("onyx-server: node identity error ({s}); S2S stays plaintext\n", .{@errorName(err)});
         }
     } else auto: {
+        if (windows_transfer != null) windows_driver.candidateAbortNow();
         const key_path = onyx_server.daemon.node_keyfile.derivePath(allocator, srv_cfg.config_path) catch |err| {
             if (builtin.os.tag == .windows or native_incoming != null) return err;
             break :auto;
@@ -1423,6 +1781,8 @@ pub fn main(init: std.process.Init) !void {
             if (h.parsed.mesh.mesh_pass) |mp| srv_cfg.mesh_pass = mp;
         }
     }
+    if (comptime builtin.os.tag == .windows)
+        srv_cfg.windows_helix_explicit_node_secret = configured_key != null and node_id_holder != null;
     if (dprop_requested and (srv_cfg.node_identity == null or srv_cfg.node_identity.?.shortId() == 0)) {
         std.debug.print("onyx-server: fatal — configured SASL account storage requires a non-zero DPROP1 node identity\n", .{});
         return error.DurableDeviceActivationFailed;
@@ -1501,7 +1861,17 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (h.parsed.sasl.account_db) |db| {
             const opened = if (comptime builtin.os.tag == .windows)
-                onyx_server.daemon.services.OroStore.openPrivateWindowsWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage)
+                if (windows_transfer) |*transfer|
+                    onyx_server.daemon.services.OroStore.openTransferredPrivateWindowsWithConfig(
+                        allocator,
+                        init.io,
+                        std.Io.Dir.cwd(),
+                        db,
+                        h.parsed.storage,
+                        if (transfer.wal) |*wal| wal else windows_driver.candidateAbortNow(),
+                    )
+                else
+                    onyx_server.daemon.services.OroStore.openPrivateWindowsWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage)
             else if (native_incoming != null)
                 onyx_server.daemon.services.OroStore.openReadOnlyWithConfig(allocator, init.io, std.Io.Dir.cwd(), db, h.parsed.storage)
             else
@@ -1727,7 +2097,9 @@ pub fn main(init: std.process.Init) !void {
         if (h.parsed.cloak.secret) |secret| {
             if (onyx_server.crypto.argon2_kdf.deriveKey(allocator, &cloak_key_bytes, secret, cloak_kdf_salt, cloak_kdf_params)) {
                 srv_cfg.cloak_key = onyx_server.proto.cloak.SecretKey.init(cloak_key_bytes);
+                if (comptime builtin.os.tag == .windows) srv_cfg.windows_helix_explicit_cloak_secret = true;
             } else |err| {
+                if (windows_transfer != null) windows_driver.candidateAbortNow();
                 // Only reachable under catastrophic conditions (OOM for the
                 // 64 MiB scratch / thread-spawn failure). Leave cloak_key null so
                 // the random per-boot fallback below still keeps privacy on, and
@@ -1743,6 +2115,8 @@ pub fn main(init: std.process.Init) !void {
             if (onyx_server.crypto.argon2_kdf.deriveKey(allocator, &prev_bytes, prev, cloak_kdf_salt, cloak_kdf_params)) {
                 srv_cfg.cloak_prev_key = onyx_server.proto.cloak.SecretKey.init(prev_bytes);
             } else |err| {
+                if (comptime builtin.os.tag == .windows) srv_cfg.windows_helix_explicit_cloak_secret = false;
+                if (windows_transfer != null) windows_driver.candidateAbortNow();
                 std.debug.print("onyx-server: previous cloak key derivation failed ({s}); rotation grace disabled this boot\n", .{@errorName(err)});
             }
             std.crypto.secureZero(u8, &prev_bytes);
@@ -1762,6 +2136,7 @@ pub fn main(init: std.process.Init) !void {
         srv_cfg.cloak_anon_epoch_secs = h.parsed.cloak.anon_epoch_secs;
     }
     if (srv_cfg.cloak_key == null) {
+        if (windows_transfer != null) windows_driver.candidateAbortNow();
         init.io.random(&cloak_key_bytes);
         srv_cfg.cloak_key = onyx_server.proto.cloak.SecretKey.init(cloak_key_bytes);
         std.debug.print("onyx-server: cloak key generated (per-boot; set [cloak] secret to persist)\n", .{});
@@ -1779,13 +2154,63 @@ pub fn main(init: std.process.Init) !void {
     // it — no live key material should linger on main's stack.
     std.crypto.secureZero(u8, &cloak_key_bytes);
 
+    if (comptime builtin.os.tag == .windows) {
+        if (windows_source_digest_boot) |source| {
+            if ((srv_cfg.geoip_db_path.len != 0) != (windows_geo.city != null) or
+                (srv_cfg.geoip_asn_db_path.len != 0) != (windows_geo.asn != null))
+            {
+                if (windows_transfer != null) windows_driver.candidateAbortNow();
+                return error.InvalidWindowsGeoOwner;
+            }
+            const effective: ?windows_config_proof.Digest = windowsStaticEffectiveConfigDigest(
+                source,
+                tls_loaded != null,
+                tls_sni_loaded.items,
+                if (tls_ech_loaded) |loaded| loaded.keys else &.{},
+                if (webpush_vapid) |*key| key else null,
+                oauth_jwks_text,
+                if (node_id_holder) |*identity| identity else null,
+                srv_cfg.cloak_key,
+                srv_cfg.cloak_prev_key,
+                windows_geo.cityBytes(),
+                windows_geo.asnBytes(),
+            ) catch |err| blk: {
+                if (windows_transfer != null) windows_driver.candidateAbortNow();
+                std.debug.print("onyx-server: Windows Helix config proof unavailable ({s})\n", .{@errorName(err)});
+                break :blk null;
+            };
+            srv_cfg.windows_helix_source_digest = effective;
+            windows_runtime_driver.config_path = srv_cfg.config_path;
+            windows_runtime_driver.source_digest = effective;
+            if (windows_transfer == null and effective != null)
+                srv_cfg.native_upgrade_hooks = windows_runtime_driver.hooks();
+            if (windows_transfer) |*transfer| {
+                const own = effective orelse windows_driver.candidateAbortNow();
+                if (!std.crypto.timing_safe.eql(windows_config_proof.Digest, own, transfer.source_digest))
+                    windows_driver.candidateAbortNow();
+            }
+        } else if (windows_transfer != null) windows_driver.candidateAbortNow();
+    }
+
     // Background forward-confirmed reverse-DNS resolver: client IPs are resolved
     // off the accept path so hosts present a cloaked hostname rather than a
-    // cloaked IP. Inert (no thread) when /etc/resolv.conf yields no nameservers.
-    var rdns_resolver = onyx_server.daemon.rdns.Resolver.init(allocator) catch null;
+    // cloaked IP. Inert (no thread) when system DNS has no nameservers.
+    var rdns_resolver: ?onyx_server.daemon.rdns.Resolver = if (comptime builtin.os.tag == .windows)
+        try onyx_server.daemon.rdns.Resolver.initConfigured(
+            allocator,
+            init.io,
+            onyx_server.proto.dns.systemResolverConfig(),
+        )
+    else
+        onyx_server.daemon.rdns.Resolver.init(allocator) catch null;
     defer if (rdns_resolver) |*r| r.deinit();
     if (rdns_resolver) |*r| {
-        if (native_incoming == null) r.start();
+        if (native_incoming == null and windows_transfer == null) {
+            r.start();
+            if (comptime builtin.os.tag == .windows) {
+                if (r.cfg.nameserver_count != 0 and r.thread == null) return error.RdnsWorkerUnavailable;
+            }
+        }
         srv_cfg.rdns = r;
     }
 
@@ -1799,13 +2224,23 @@ pub fn main(init: std.process.Init) !void {
             if (h.parsed.dnsbl.enabled and h.parsed.dnsbl.zones.len == 0) return error.DnsblNoZones;
         }
         if (h.parsed.dnsbl.enabled and h.parsed.dnsbl.zones.len != 0) {
-            dnsbl_res = onyx_server.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch |err| blk: {
-                if (comptime builtin.os.tag == .windows) return err;
-                if (native_incoming != null) return err;
-                break :blk null;
-            };
+            dnsbl_res = if (comptime builtin.os.tag == .windows)
+                try onyx_server.daemon.dnsbl_resolver.Resolver.initConfigured(
+                    allocator,
+                    init.io,
+                    onyx_server.proto.dns.systemResolverConfig(),
+                    h.parsed.dnsbl.zones,
+                )
+            else
+                onyx_server.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch |err| blk: {
+                    if (native_incoming != null) return err;
+                    break :blk null;
+                };
             if (dnsbl_res) |*r| {
-                if (native_incoming == null) {
+                if (comptime builtin.os.tag == .windows) {
+                    if (windows_transfer != null and r.cfg.nameserver_count == 0) windows_driver.candidateAbortNow();
+                }
+                if (native_incoming == null and windows_transfer == null) {
                     if (comptime builtin.os.tag == .windows) try r.startChecked() else r.start();
                 }
                 srv_cfg.dnsbl = r;
@@ -1865,7 +2300,12 @@ pub fn main(init: std.process.Init) !void {
                     break :blk null;
                 };
                 if (mail_send) |*s| {
-                    if (native_incoming == null) {
+                    if (comptime builtin.os.tag == .windows) {
+                        // HXMA source capture and candidate parked restore both
+                        // require the actual bound pause clock before start.
+                        try s.prepareColdResources(init.io);
+                    }
+                    if (native_incoming == null and windows_transfer == null) {
                         if (comptime builtin.os.tag == .windows) try s.startChecked() else s.start();
                     }
                     srv_cfg.mail_sender = s;
@@ -1932,6 +2372,17 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
+    if (windows_transfer) |*transfer| {
+        windows_rows = WindowsInheritedRows.init(allocator, transfer.rows) catch windows_driver.candidateAbortNow();
+        windows_barrier = .{ .child = &windows_child.?, .transfer = transfer, .deadline = windows_deadline };
+        srv_cfg.native_listener_manifest = windows_rows.?.listeners;
+        srv_cfg.inherited_state_fds = windows_rows.?.state_fds;
+        srv_cfg.inherited_state_fd_manifest_present = true;
+        srv_cfg.inherited_state_fd_manifest_valid = true;
+        srv_cfg.native_arena_bytes = transfer.plaintext;
+        srv_cfg.native_adopt_barrier = windows_barrier.?.asServerBarrier();
+    }
+
     const Server = onyx_server.daemon.server.Server;
     // `init` copies LinuxServer onto the caller stack, which no longer fits
     // the default 8MB main thread. `initInPlace` fills this heap slot.
@@ -1940,7 +2391,15 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer allocator.destroy(srv);
+    if (windows_transfer) |*transfer| transfer.stageInert() catch |err| {
+        std.debug.print("onyx-server: Windows Helix socket staging failed ({s})\n", .{@errorName(err)});
+        windows_driver.candidateAbortNow();
+    };
     srv.initInPlace(allocator, srv_cfg) catch |err| {
+        if (windows_transfer != null) {
+            std.debug.print("onyx-server: Windows Helix inert server init failed ({s})\n", .{@errorName(err)});
+            windows_driver.candidateAbortNow();
+        }
         // The reactor requires io_uring on a 64-bit Linux kernel. If it is
         // unavailable (old kernel / restricted sandbox) the daemon cannot serve,
         // so fail loudly and exit non-zero rather than pretending to have started.
@@ -1954,21 +2413,262 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer srv.deinit();
-
+    // This owner borrows TLS material retained by main and, on Windows, is
+    // published to Server for the source's exact paused Helix capture. Gate
+    // workers must join before this defer closes the inherited UDP socket.
+    var wt_listener: ?onyx_server.daemon.webtransport_listener.WebTransportListener = null;
+    defer if (wt_listener) |*owner| {
+        if (comptime builtin.os.tag == .windows) srv.setWindowsWebTransportOwner(null) catch @panic("Windows WebTransport owner could not detach");
+        owner.deinit();
+    };
+    // Declare Web Push custody before the Windows Gate cleanup defer. A
+    // Gate-owned worker must be joined and detached before shutdown frees its
+    // queue, resolver, VAPID key, or trust anchors.
+    const WebpushWorker = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) onyx_server.daemon.webpush.Worker else void;
+    var webpush_trust_anchors: ?OwnedTrustAnchors = null;
+    defer if (webpush_trust_anchors) |*owner| owner.deinit();
+    var webpush_worker: ?*WebpushWorker = null;
+    var webpush_resolver: ?*onyx_server.daemon.acme_runner.SystemResolver = null;
+    defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) {
+        if (webpush_worker) |w| {
+            w.shutdown();
+            if (srv.webpush_worker == w) srv.webpush_worker = null;
+            allocator.destroy(w);
+        }
+        if (webpush_resolver) |r| allocator.destroy(r);
+    };
     if (comptime builtin.os.tag == .windows) {
-        if (held) |h| {
-            if (h.parsed.geo.enabled) try srv.geo.startChecked();
+        // The proof above covered these exact retained buffers. Transfer their
+        // ownership to Server before any inherited state is adopted or served;
+        // a later disk change cannot alter GeoIP/ASN results in either image.
+        if (windows_geo.city) |owner| {
+            srv.geoip_bytes = owner.bytes;
+            srv.geoip_db = owner.database;
+            windows_geo.city = null;
+        }
+        if (windows_geo.asn) |owner| {
+            srv.geoip_asn_bytes = owner.bytes;
+            srv.geoip_asn_db = owner.database;
+            windows_geo.asn = null;
+        }
+        srv.geoip_tried = true;
+        srv.geoip_asn_tried = true;
+        if (windows_transfer) |*transfer| {
+            if ((transfer.metrics != null) != (srv_cfg.metrics_port != 0)) windows_driver.candidateAbortNow();
+            if (transfer.metrics) |*metrics| {
+                srv.metrics_server = onyx_server.daemon.metrics_http.MetricsServer.initTransferred(
+                    &srv.metrics_snapshot,
+                    &metrics.transfer,
+                    &metrics.carry,
+                    .{ .bind_addr = srv_cfg.metrics_bind_addr },
+                    1024 * 1024,
+                ) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix metrics import failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                srv.metrics_server.?.prepareColdResources(init.io) catch windows_driver.candidateAbortNow();
+            }
+            if ((transfer.webhook != null) != srv_cfg.webhook_enabled) windows_driver.candidateAbortNow();
+            if (transfer.webhook) |*webhook| {
+                srv.stageWindowsInheritedWebhook(&webhook.transfer, &webhook.carry, init.io) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix webhook import failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (transfer.history) |*history| {
+                // HXHH pins the source's entire TLS policy. Candidate boot
+                // material must reproduce it exactly before the source can
+                // retire; a history endpoint with other runtime-only material
+                // is refused instead of silently changing its TLS identity.
+                if (srv_cfg.tls_cert_chain.len == 0) windows_driver.candidateAbortNow();
+                srv.stageWindowsInheritedHistory(&history.transfer, &history.carry, .{
+                    .cert_chain = srv_cfg.tls_cert_chain,
+                    .signing_key = srv_cfg.tls_signing_key,
+                    .ecdsa_p256_signing_key = srv_cfg.tls_ecdsa_signing_key,
+                    .rsa_signing_key = srv_cfg.tls_rsa_signing_key,
+                    .sni_certs = srv_cfg.tls_sni_certs,
+                    .ech_keys = srv_cfg.tls_ech_keys,
+                    .enable_raw_public_key = srv_cfg.tls_raw_public_key,
+                }, init.io) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix history HTTPS import failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                if (!history.transfer.consumed) windows_driver.candidateAbortNow();
+            }
+            if ((transfer.history != null) != (srv.history_https != null)) windows_driver.candidateAbortNow();
+            if ((transfer.webrtc_media_udp != null) != srv_cfg.media_enabled or
+                (transfer.native_media_udp != null) != srv_cfg.media_enabled)
+                windows_driver.candidateAbortNow();
+            if (srv_cfg.media_enabled) {
+                const webrtc = if (transfer.webrtc_media_udp) |*owner| owner else windows_driver.candidateAbortNow();
+                const native = if (transfer.native_media_udp) |*owner| owner else windows_driver.candidateAbortNow();
+                srv.stageWindowsInheritedMedia(
+                    &webrtc.transfer,
+                    &webrtc.carry,
+                    &native.transfer,
+                    &native.carry,
+                    init.io,
+                ) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix media UDP import failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                srv.prepareWindowsInheritedMediaRouting() catch |err| {
+                    std.debug.print("onyx-server: Windows Helix media routing preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if ((transfer.webtransport_udp != null) != (srv_cfg.webtransport_port != 0))
+                windows_driver.candidateAbortNow();
+            if (transfer.webtransport_udp) |*webtransport| {
+                // Import the exact idle QUIC owner before READY. Binding a new
+                // socket after COMMIT would strand the predecessor's UDP port.
+                windows_wt_tls_material = windows_tls_material.preflightOwnedFromArena(
+                    allocator,
+                    transfer.plaintext,
+                ) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix serving TLS preflight failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                const source_tls = windows_wt_tls_material.?.default orelse windows_driver.candidateAbortNow();
+                const signing_key: onyx_server.proto.quic_handshake.SigningKey =
+                    if (source_tls.ecdsa_p256_signing_key) |key| .{ .ecdsa_p256 = key } else if (source_tls.signing_key) |key| .{ .ed25519 = key } else if (source_tls.rsa_signing_key) |key| .{ .rsa = key } else windows_driver.candidateAbortNow();
+                const irc_port = srv.boundPort() catch windows_driver.candidateAbortNow();
+                const wt_tls: onyx_server.daemon.webtransport_listener.TlsConfig = .{
+                    .cert_chain = source_tls.cert_chain,
+                    .signing_key = signing_key,
+                };
+                const wt_expected = onyx_server.daemon.webtransport_listener.WebTransportListener.init(allocator, wt_tls, irc_port);
+                webtransport.carry.validateConfiguration(wt_tls, .{
+                    .irc_port = wt_expected.irc_port,
+                    .send_proxy_header = wt_expected.send_proxy_header,
+                    .echo_wt_datagrams = wt_expected.echo_wt_datagrams,
+                    .max_connections = wt_expected.max_connections,
+                    .retry_policy = wt_expected.retry_policy,
+                    .retry_load_threshold = wt_expected.retry_load_threshold,
+                    .reset_rate_per_s = wt_expected.reset_rate_per_s,
+                    .reset_burst = wt_expected.reset_burst,
+                }) catch windows_driver.candidateAbortNow();
+                wt_listener = onyx_server.daemon.webtransport_listener.WebTransportListener.initTransferred(
+                    allocator,
+                    wt_tls,
+                    &webtransport.transfer,
+                    &webtransport.carry,
+                ) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix WebTransport import failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                if (wt_listener.?.port != srv_cfg.webtransport_port or wt_listener.?.irc_port != irc_port)
+                    windows_driver.candidateAbortNow();
+                wt_listener.?.irc_host = srv_cfg.host;
+                wt_listener.?.prepareInheritedResources(init.io) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix WebTransport preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                srv.setWindowsWebTransportOwner(&wt_listener.?) catch windows_driver.candidateAbortNow();
+            }
         }
     }
-
+    // A Windows successor must own its complete reactor runtime before READY.
+    // Otherwise COMMIT can retire the predecessor and a later allocation or
+    // shard spawn failure can strand every inherited client.
+    // These owners outlive Gate cleanup. A parked OCSP worker must be joined
+    // and detached before its owner and retained trust anchors are freed.
     const AcmeRenewalService = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) onyx_server.daemon.acme_renewal.Service else void;
     var acme_renewal: ?*AcmeRenewalService = null;
     defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) {
         if (acme_renewal) |s| {
             s.stop();
+            if (comptime builtin.os.tag == .windows) {
+                if (srv.acme_worker == s) srv.acme_worker = null;
+            }
             allocator.destroy(s);
         }
     };
+    const OcspStapleService = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) onyx_server.daemon.ocsp_staple.Service else void;
+    var ocsp_trust_anchors: ?OwnedTrustAnchors = null;
+    defer if (ocsp_trust_anchors) |*owner| owner.deinit();
+    var ocsp_staple: ?*OcspStapleService = null;
+    defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) {
+        if (ocsp_staple) |s| {
+            s.stop();
+            if (srv.ocsp_worker == s) srv.ocsp_worker = null;
+            allocator.destroy(s);
+        }
+    };
+    const gate_mod = onyx_server.daemon.reactor_pool.runtime_start_gate;
+    var run = std.atomic.Value(bool).init(true);
+    var windows_runtime_gate: ?gate_mod.Created = null;
+    defer if (comptime builtin.os.tag == .windows) {
+        if (windows_runtime_gate) |gate| {
+            if (gate.view.inspect().phase == .preparing) {
+                gate.control.cancelAllAndJoin();
+            } else {
+                srv.requestStop(&run);
+                if (srv.metrics_server) |*owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (srv.webhook_server) |*owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (srv.history_https) |*owner| if (owner.runtime_worker.view != null) owner.requestStopAndWake();
+                if (wt_listener) |*owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (srv.native_media.runtime.view != null) srv.native_media.requestStopAndWake();
+                if (srv.media_plane.runtime.view != null) srv.media_plane.requestStopAndWake();
+                if (rdns_resolver) |*owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (dnsbl_res) |*owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (mail_send) |*owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (acme_renewal) |owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (ocsp_staple) |owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (webpush_worker) |owner| if (owner.runtime.view != null) owner.requestStopAndWake();
+                if (srv.geo.runtime.view != null) srv.geo.requestStopAndWake();
+                gate.control.joinAll();
+            }
+            if (srv.metrics_server) |*owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows metrics cleanup without joined owner");
+            if (srv.webhook_server) |*owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows webhook cleanup without joined owner");
+            if (srv.history_https) |*owner| if (owner.runtime_worker.view != null)
+                owner.detachAfterJoined() catch @panic("Windows history HTTPS cleanup without joined owner");
+            if (wt_listener) |*owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows WebTransport cleanup without joined owner");
+            if (srv.native_media.runtime.view != null)
+                srv.native_media.detachAfterJoined() catch @panic("Windows native media cleanup without joined owner");
+            if (srv.media_plane.runtime.view != null)
+                srv.media_plane.detachAfterJoined() catch @panic("Windows media plane cleanup without joined owner");
+            if (rdns_resolver) |*owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows rDNS cleanup without joined owner");
+            if (dnsbl_res) |*owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows DNSBL cleanup without joined owner");
+            if (mail_send) |*owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows mail cleanup without joined owner");
+            if (acme_renewal) |owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows ACME cleanup without joined owner");
+            if (ocsp_staple) |owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows OCSP cleanup without joined owner");
+            if (webpush_worker) |owner| if (owner.runtime.view != null)
+                owner.detachAfterJoined() catch @panic("Windows Web Push cleanup without joined owner");
+            if (srv.geo.runtime.view != null)
+                srv.geo.detachAfterJoined() catch @panic("Windows Geo cleanup without joined owner");
+            srv.detachRuntimeAfterJoined() catch @panic("Windows runtime cleanup without joined shard owners");
+            srv.pool.deinit();
+            srv.pool = onyx_server.daemon.reactor_pool.ReactorPool(*Server).init(allocator);
+            gate.control.destroyJoined();
+        }
+    };
+    // Before COMMIT, ordinary cleanup could shutdown predecessor-owned sockets.
+    // Once adoption succeeds, this process owns them and must never abort via
+    // ExitProcess for an optional worker failure.
+    var windows_commit_confirmed = false;
+    errdefer if (windows_transfer != null and !windows_commit_confirmed) windows_driver.candidateAbortNow();
+
+    if (comptime builtin.os.tag == .windows) {
+        if (held) |h| {
+            if (h.parsed.geo.enabled) {
+                // Source pause and candidate HXGE restore need the same bound
+                // clock before any thread can run. The successor's real worker
+                // is prepared below under the shared Gate instead of here.
+                try srv.geo.prepareColdResources(init.io);
+                if (windows_transfer == null) try srv.geo.startChecked();
+            }
+        }
+    }
+
     // `|*h|`: `setAcmeTlsReloadConfig` and the renewal worker both retain
     // `&h.parsed.tls` past this block, so it must point at `held`'s function-scope
     // payload rather than a block-local copy.
@@ -1979,6 +2679,11 @@ pub fn main(init: std.process.Init) !void {
                 const svc = try allocator.create(AcmeRenewalService);
                 svc.* = AcmeRenewalService.init(allocator, init.io, srv, h.parsed.acme, &h.parsed.tls);
                 acme_renewal = svc;
+                if (comptime builtin.os.tag == .windows) {
+                    // Pause and parked-restore both require the bound clock.
+                    try svc.prepareColdResources(init.io);
+                    srv.acme_worker = svc;
+                }
             } else {
                 std.debug.print("onyx-server: [acme] renewal is unavailable on this platform\n", .{});
             }
@@ -1991,16 +2696,6 @@ pub fn main(init: std.process.Init) !void {
     // (1.3) / CertificateStatus (1.2) then carries it when a client offers
     // status_request. Needs a real cert file (self-signed bootstrap leaves have
     // no AIA responder URL, so the worker simply no-ops there).
-    const OcspStapleService = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) onyx_server.daemon.ocsp_staple.Service else void;
-    var ocsp_trust_anchors: ?OwnedTrustAnchors = null;
-    defer if (ocsp_trust_anchors) |*owner| owner.deinit();
-    var ocsp_staple: ?*OcspStapleService = null;
-    defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) {
-        if (ocsp_staple) |s| {
-            s.stop();
-            allocator.destroy(s);
-        }
-    };
     // Capture by pointer (`|*h|`): the worker thread holds `&h.parsed.tls` for its
     // whole lifetime, so it must target `held`'s function-scope payload, not a
     // block-local copy that dies at the end of this `if`.
@@ -2027,11 +2722,14 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
                 const svc = try allocator.create(OcspStapleService);
+                errdefer allocator.destroy(svc);
                 svc.* = OcspStapleService.init(allocator, init.io, srv, &h.parsed.tls, .{
                     .check_interval_ms = h.parsed.ocsp.check_interval_ms,
                 });
                 svc.trust_anchors = trust_anchors;
+                if (comptime builtin.os.tag == .windows) try svc.prepareColdResources(init.io);
                 ocsp_staple = svc;
+                if (comptime builtin.os.tag == .windows) srv.ocsp_worker = svc;
             } else {
                 std.debug.print("onyx-server: [ocsp] staple fetching is unavailable on this platform\n", .{});
             }
@@ -2044,18 +2742,6 @@ pub fn main(init: std.process.Init) !void {
     // ── Web Push delivery worker ([webpush] enabled + account store) ────────
     // Offline DMs (memo) nudge the recipient's browser through their push
     // service — payloads are RFC 8291-encrypted end-to-end to the browser.
-    const WebpushWorker = if ((builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) onyx_server.daemon.webpush.Worker else void;
-    var webpush_trust_anchors: ?OwnedTrustAnchors = null;
-    defer if (webpush_trust_anchors) |*owner| owner.deinit();
-    var webpush_worker: ?*WebpushWorker = null;
-    var webpush_resolver: ?*onyx_server.daemon.acme_runner.SystemResolver = null;
-    defer if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) {
-        if (webpush_worker) |w| {
-            w.shutdown();
-            allocator.destroy(w);
-        }
-        if (webpush_resolver) |r| allocator.destroy(r);
-    };
     if (held) |h| {
         if (h.parsed.webpush.enabled) {
             if (comptime (builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows)) webpush_blk: {
@@ -2105,6 +2791,17 @@ pub fn main(init: std.process.Init) !void {
                     .trust_anchors = webpush_trust_anchors.?.items(),
                 };
                 webpush_worker = w;
+                if (comptime builtin.os.tag == .windows) {
+                    // Source capture and candidate restore both require the
+                    // bound pause clock and authenticated resolver identity.
+                    // This happens while the worker is still cold, before the
+                    // candidate can decode inherited Web Push state.
+                    w.prepareColdResources(init.io, resolver) catch |err| {
+                        if (windows_transfer != null) windows_driver.candidateAbortNow();
+                        return err;
+                    };
+                    srv.webpush_worker = w;
+                }
                 std.debug.print("onyx-server: web push live ({d} trust anchors; VAPID {s})\n", .{ webpush_trust_anchors.?.items().len, srv_cfg.webpush_vapid_pub });
             } else {
                 std.debug.print("onyx-server: [webpush] enabled but {s}\n", .{onyx_server.daemon.webpush.portable_disable_reason});
@@ -2116,6 +2813,233 @@ pub fn main(init: std.process.Init) !void {
     // off-reactor producer (webhook/media/metrics workers). Starting first left
     // a window in which a new-process webhook could acknowledge and enqueue an
     // event behind the still-unapplied inherited World/session boundary.
+    if (comptime builtin.os.tag == .windows) {
+        if (windows_transfer != null) {
+            // The inherited listener must be observable before predecessor
+            // retirement. All worker threads park under this one owned Gate.
+            _ = srv.boundPort() catch windows_driver.candidateAbortNow();
+            srv.prepareRuntimeResources(srv.config.crypto_io orelse init.io, &run) catch |err| {
+                std.debug.print("onyx-server: Windows Helix reactor resource preparation failed ({s})\n", .{@errorName(err)});
+                windows_driver.candidateAbortNow();
+            };
+            var specs: [onyx_server.daemon.shard.max_shards + 13]gate_mod.ParticipantSpec = undefined;
+            var slots: [onyx_server.daemon.shard.max_shards]gate_mod.Slot = undefined;
+            const worker_count = if (srv.reactors.len == 1) 0 else srv.reactors.len;
+            for (specs[0..worker_count], 0..) |*spec, index|
+                spec.* = .{ .kind = .reactor, .instance = @intCast(index), .owner_identity = srv };
+            var gate_count = worker_count;
+            if (rdns_resolver) |*owner| {
+                if (owner.cfg.nameserver_count != 0) {
+                    specs[gate_count] = .{ .kind = .rdns, .instance = 0, .owner_identity = owner };
+                    gate_count += 1;
+                }
+            }
+            if (dnsbl_res) |*owner| {
+                if (owner.cfg.nameserver_count == 0) windows_driver.candidateAbortNow();
+                specs[gate_count] = .{ .kind = .dnsbl, .instance = 0, .owner_identity = owner };
+                gate_count += 1;
+            }
+            if (mail_send) |*owner| {
+                specs[gate_count] = .{
+                    .kind = .mail,
+                    .instance = 0,
+                    .owner_identity = owner,
+                    .options = onyx_server.daemon.mail_sender.dormant_spawn_options,
+                };
+                gate_count += 1;
+            }
+            if (acme_renewal) |owner| {
+                specs[gate_count] = .{
+                    .kind = .acme,
+                    .instance = 0,
+                    .owner_identity = owner,
+                    .options = onyx_server.daemon.acme_renewal.dormant_spawn_options,
+                };
+                gate_count += 1;
+            }
+            if (ocsp_staple) |owner| {
+                specs[gate_count] = .{
+                    .kind = .ocsp,
+                    .instance = 0,
+                    .owner_identity = owner,
+                    .options = onyx_server.daemon.ocsp_staple.dormant_spawn_options,
+                };
+                gate_count += 1;
+            }
+            if (webpush_worker) |owner| {
+                specs[gate_count] = .{
+                    .kind = .webpush,
+                    .instance = 0,
+                    .owner_identity = owner,
+                    .options = onyx_server.daemon.webpush.dormant_spawn_options,
+                };
+                gate_count += 1;
+            }
+            if (srv.metrics_server) |*owner| {
+                specs[gate_count] = .{ .kind = .metrics, .instance = 0, .owner_identity = owner };
+                gate_count += 1;
+            }
+            if (srv.webhook_server) |*owner| {
+                specs[gate_count] = .{ .kind = .webhook, .instance = 0, .owner_identity = owner };
+                gate_count += 1;
+            }
+            if (srv.history_https) |*owner| {
+                specs[gate_count] = .{
+                    .kind = .history,
+                    .instance = @intFromBool(owner.v6),
+                    .owner_identity = owner,
+                    .options = onyx_server.daemon.history_http.dormant_spawn_options,
+                };
+                gate_count += 1;
+            }
+            if (srv_cfg.media_enabled) {
+                if (srv.native_media.socket == null or srv.media_plane.socket == null)
+                    windows_driver.candidateAbortNow();
+                specs[gate_count] = .{
+                    .kind = .native_media,
+                    .instance = 0,
+                    .owner_identity = &srv.native_media,
+                    .options = onyx_server.daemon.native_media_transport.dormant_spawn_options,
+                };
+                gate_count += 1;
+                specs[gate_count] = .{
+                    .kind = .media_plane,
+                    .instance = 0,
+                    .owner_identity = &srv.media_plane,
+                    .options = onyx_server.daemon.media_plane.dormant_spawn_options,
+                };
+                gate_count += 1;
+            }
+            if (wt_listener) |*owner| {
+                specs[gate_count] = .{
+                    .kind = .webtransport,
+                    .instance = 0,
+                    .owner_identity = owner,
+                    .options = onyx_server.daemon.webtransport_listener.dormant_spawn_options,
+                };
+                gate_count += 1;
+            }
+            if (srv_cfg.geo_enabled) {
+                specs[gate_count] = .{
+                    .kind = .geo,
+                    .instance = 0,
+                    .owner_identity = srv.geo,
+                    .options = onyx_server.daemon.geo_services.dormant_spawn_options,
+                };
+                gate_count += 1;
+            }
+            const gate = gate_mod.create(allocator, srv.config.crypto_io orelse init.io, specs[0..gate_count]) catch |err| {
+                std.debug.print("onyx-server: Windows Helix reactor gate preparation failed ({s})\n", .{@errorName(err)});
+                windows_driver.candidateAbortNow();
+            };
+            windows_runtime_gate = gate;
+            for (slots[0..worker_count], 0..) |*slot, index|
+                slot.* = gate.view.slot(.reactor, @intCast(index), srv) catch windows_driver.candidateAbortNow();
+            srv.prepareRuntimeWorkers(gate.control, gate.view, slots[0..worker_count]) catch |err| {
+                std.debug.print("onyx-server: Windows Helix reactor worker preparation failed ({s})\n", .{@errorName(err)});
+                windows_driver.candidateAbortNow();
+            };
+            if (srv_cfg.media_enabled) {
+                srv.native_media.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.native_media, 0, &srv.native_media) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix native media worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                srv.media_plane.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.media_plane, 0, &srv.media_plane) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix media plane worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (rdns_resolver) |*owner| {
+                if (owner.cfg.nameserver_count != 0) {
+                    owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.rdns, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix rDNS worker preparation failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    };
+                }
+            }
+            if (dnsbl_res) |*owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.dnsbl, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix DNSBL worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (mail_send) |*owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.mail, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix mail worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (acme_renewal) |owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.acme, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix ACME worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (ocsp_staple) |owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.ocsp, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix OCSP worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (webpush_worker) |owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.webpush, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix Web Push worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (srv.metrics_server) |*owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.metrics, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix metrics worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (srv.webhook_server) |*owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.webhook, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix webhook worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (srv.history_https) |*owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.history, @intFromBool(owner.v6), owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix history HTTPS worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (wt_listener) |*owner| {
+                owner.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.webtransport, 0, owner) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix WebTransport worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            if (srv_cfg.geo_enabled) {
+                srv.geo.prepareDormantWorker(gate.control, gate.view, gate.view.slot(.geo, 0, srv.geo) catch windows_driver.candidateAbortNow()) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix Geo worker preparation failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+            }
+            gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(srv.config.crypto_io orelse init.io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) })) catch |err| {
+                std.debug.print("onyx-server: Windows Helix reactor workers did not park ({s})\n", .{@errorName(err)});
+                windows_driver.candidateAbortNow();
+            };
+            srv.requirePreparedRuntime() catch windows_driver.candidateAbortNow();
+            if (srv.metrics_server) |*owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (srv.webhook_server) |*owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (srv.history_https) |*owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (wt_listener) |*owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (srv_cfg.media_enabled) {
+                srv.native_media.requireParked() catch windows_driver.candidateAbortNow();
+                srv.media_plane.requireParked() catch windows_driver.candidateAbortNow();
+            }
+            if (rdns_resolver) |*owner| if (owner.cfg.nameserver_count != 0)
+                owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (dnsbl_res) |*owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (mail_send) |*owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (acme_renewal) |owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (ocsp_staple) |owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (webpush_worker) |owner| owner.requireParked() catch windows_driver.candidateAbortNow();
+            if (srv_cfg.geo_enabled) srv.geo.requireParked() catch windows_driver.candidateAbortNow();
+        }
+    }
     if (comptime builtin.os.tag == .openbsd) {
         srv.adoptInheritedSessions() catch |err| {
             std.debug.print("onyx-server: native Helix adoption failed ({s})\n", .{@errorName(err)});
@@ -2123,36 +3047,87 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
     } else if (comptime builtin.os.tag == .linux) try srv.adoptInheritedSessions();
+    if (comptime builtin.os.tag == .windows) {
+        if (windows_transfer != null) {
+            srv.adoptInheritedSessions() catch |err| {
+                std.debug.print("onyx-server: Windows Helix adoption failed ({s})\n", .{@errorName(err)});
+                windows_driver.candidateAbortNow();
+            };
+            std.debug.print("onyx-server: Windows Helix adoption committed; starting reactors\n", .{});
+            windows_commit_confirmed = true;
+            // A committed candidate becomes the next predecessor. Keep hooks
+            // absent throughout inert staging and install them only after the
+            // authenticated COMMIT and no-fail adoption edge have completed.
+            srv.config.native_upgrade_hooks = windows_runtime_driver.hooks();
+        }
+    }
 
-    if (native_incoming != null) {
-        if (rdns_resolver) |*r| r.start();
-        if (dnsbl_res) |*r| r.start();
-        if (mail_send) |*sender| sender.start();
+    if (native_incoming != null or windows_transfer != null) {
+        if (rdns_resolver) |*r| {
+            if (comptime builtin.os.tag == .windows) {
+                // The native successor's actual worker is already Gate-owned.
+                // Its release after COMMIT starts it without a late spawn.
+                if (windows_transfer == null) r.start();
+            } else r.start();
+        }
+        if (dnsbl_res) |*r| {
+            if (comptime builtin.os.tag == .windows) {
+                // The native successor's actual worker is already Gate-owned
+                // and starts when COMMIT releases that Gate.
+                if (windows_transfer == null) try r.startChecked();
+            } else r.start();
+        }
+        if (mail_send) |*sender| {
+            if (comptime builtin.os.tag == .windows) {
+                // The successor's actual sender is Gate-owned and starts on
+                // release after COMMIT; a late spawn would create a second one.
+                if (windows_transfer == null)
+                    sender.startChecked() catch |err| std.debug.print("onyx-server: [mail] worker start failed ({s}); delivery unavailable\n", .{@errorName(err)});
+            } else sender.start();
+        }
     }
 
     // Drive the SerpentRegistry module init→ready lifecycle now that the server
     // is at its final address (init() returns by value, so `self` is not stable
     // inside it). No-op until a module declares lifecycle fns.
-    if (comptime builtin.os.tag == .windows) try srv.startCheckedWindows() else srv.start();
+    if (comptime builtin.os.tag == .windows) {
+        srv.startCheckedWindows() catch |err| {
+            if (windows_transfer != null)
+                std.debug.print("onyx-server: Windows Helix post-COMMIT start failed ({s})\n", .{@errorName(err)});
+            return err;
+        };
+    } else srv.start();
 
     // All fallible companion allocation/configuration is staged before READY.
     // Launch only after adoption has transferred ownership. A worker thread
     // failure must not tear down committed physical client attachments.
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         if (acme_renewal) |svc| {
-            if (comptime builtin.os.tag == .windows) try svc.startChecked() else svc.start();
+            if (comptime builtin.os.tag == .windows) {
+                // A successor's real worker is Gate-owned and starts on
+                // release after COMMIT; cold boot still starts it here.
+                if (windows_transfer == null) try svc.startChecked();
+            } else svc.start();
         }
         if (ocsp_staple) |svc| {
-            if (comptime builtin.os.tag == .windows) try svc.startChecked() else svc.start();
+            if (comptime builtin.os.tag == .windows) {
+                // A Windows successor's real OCSP worker is already parked in
+                // the Gate; COMMIT releases it without a second thread spawn.
+                if (windows_transfer == null) try svc.startChecked();
+            } else svc.start();
         }
     }
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         if (webpush_worker) |w| {
-            w.spawn() catch |err| {
-                if (native_incoming == null) return err;
-                std.debug.print("onyx-server: [webpush] worker start failed ({s}); delivery unavailable\n", .{@errorName(err)});
-            };
-            if (w.thread != null) srv.webpush_worker = w;
+            if (windows_transfer == null) {
+                w.spawn() catch |err| {
+                    if (native_incoming == null) return err;
+                    std.debug.print("onyx-server: [webpush] worker start failed ({s}); delivery unavailable\n", .{@errorName(err)});
+                };
+                if (w.thread != null) srv.webpush_worker = w;
+            }
+            // A Windows successor already owns its real worker in the Gate;
+            // releaseAll starts it after COMMIT without a second thread spawn.
         }
     }
 
@@ -2164,13 +3139,18 @@ pub fn main(init: std.process.Init) !void {
             .create_channel = svcCreateChannel,
             .drop_channel = svcDropChannel,
         };
-        srv.replayServicesLiveState(&account_services);
+        // A Windows successor already adopted the exact live World and policy
+        // checkpoints. Replaying persisted services rows after COMMIT could
+        // resurrect a stale MLOCK, AKICK, WARD, or SACCESS authority.
+        if (windows_transfer == null) srv.replayServicesLiveState(&account_services);
     }
 
     // OroWasm: load any *.wasm control-plane plugins from [wasm] plugin_dir.
     if (comptime builtin.os.tag == .windows) {
         // An explicitly configured plugin failure must be visible at boot.
-        const count = try srv.loadWasmPluginsFallible();
+        // An inherited image installed its exact module bytes and mutable
+        // state before READY. Never reload a changed directory after COMMIT.
+        const count = if (windows_transfer == null) try srv.loadWasmPluginsFallible() else srv.wasm.count();
         if (count != 0) std.debug.print("onyx-server: loaded {d} OroWasm plugin(s) from {s}\n", .{ count, srv_cfg.wasm_plugin_dir });
     } else {
         srv.loadWasmPlugins();
@@ -2188,9 +3168,7 @@ pub fn main(init: std.process.Init) !void {
     // bridges each session to the daemon's IRC listener over a loopback TCP
     // proxy (the WT user is handled as an ordinary local IRC client — no reactor
     // changes). Requires the TLS cert chain + a signing key matching the leaf.
-    var wt_listener: ?onyx_server.daemon.webtransport_listener.WebTransportListener = null;
-    defer if (wt_listener) |*l| l.deinit();
-    if (srv_cfg.webtransport_port != 0) wt: {
+    if (srv_cfg.webtransport_port != 0 and wt_listener == null) wt: {
         if (srv_cfg.tls_cert_chain.len == 0) {
             if (comptime builtin.os.tag == .windows) return error.WebTransportCertificateRequired;
             std.debug.print("onyx-server: [listen] webtransport={d} ignored — no TLS certificate loaded (enable [tls]; QUIC needs a cert)\n", .{srv_cfg.webtransport_port});
@@ -2216,14 +3194,21 @@ pub fn main(init: std.process.Init) !void {
         // Bind on all interfaces, dual-stack: the listener's socket is AF_INET6
         // with IPV6_V6ONLY=0, so `any_be` binds [::] and serves both IPv6 and
         // IPv4 (mapped) QUIC clients on one socket.
-        wt_listener.?.start(onyx_server.daemon.webtransport_listener.any_be, srv_cfg.webtransport_port) catch |err| {
+        const wt_start = if (comptime builtin.os.tag == .windows) blk: {
+            try wt_listener.?.prepareColdResources(init.io, .any, srv_cfg.webtransport_port);
+            break :blk wt_listener.?.startPreparedLegacyWorker();
+        } else wt_listener.?.start(onyx_server.daemon.webtransport_listener.any_be, srv_cfg.webtransport_port);
+        wt_start catch |err| {
             std.debug.print("onyx-server: WebTransport bind failed on UDP :{d} ({s}); disabled\n", .{ srv_cfg.webtransport_port, @errorName(err) });
             wt_listener = null;
             if (comptime builtin.os.tag == .windows) return err;
             break :wt;
         };
+        if (comptime builtin.os.tag == .windows) try srv.setWindowsWebTransportOwner(&wt_listener.?);
         std.debug.print("onyx-server: WebTransport listening on UDP :{d} (QUIC/HTTP3 → loopback IRC :{d})\n", .{ wt_listener.?.port, irc_port });
     }
+    if (comptime builtin.os.tag == .windows) if (windows_transfer != null) if (wt_listener) |*owner|
+        std.debug.print("onyx-server: WebTransport inherited UDP :{d} (QUIC/HTTP3 → loopback IRC :{d})\n", .{ owner.port, owner.irc_port });
 
     const reactor = switch (comptime builtin.os.tag) {
         .windows => "IOCP",
@@ -2236,8 +3221,13 @@ pub fn main(init: std.process.Init) !void {
     );
     // Sharded multi-reactor run loop (one worker thread per shard, joined here).
     // runThreaded transparently runs a single in-line reactor when num_shards==1.
-    var run = std.atomic.Value(bool).init(true);
-    srv.runThreaded(&run);
+    if (comptime builtin.os.tag == .windows) {
+        if (windows_runtime_gate) |gate| {
+            srv.publishPreparedRuntime();
+            gate.control.releaseAll();
+            srv.runPreparedRuntime(gate.control, &run);
+        } else srv.runThreaded(&run);
+    } else srv.runThreaded(&run);
     if (srv.runtimeFailure()) |err| return err;
 }
 

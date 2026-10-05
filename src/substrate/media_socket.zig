@@ -16,6 +16,7 @@ const sys = std.posix.system;
 const posix = std.posix;
 const ice = @import("../proto/ice.zig");
 const media_transport = @import("media_transport.zig");
+const windows_udp = @import("../daemon/helix/native_windows_udp_socket.zig");
 pub const SocketHandle = if (builtin.os.tag == .windows) usize else sys.fd_t;
 const Socket = SocketHandle;
 
@@ -27,6 +28,7 @@ const win = struct {
     const sol_socket: i32 = 0xffff;
     const so_type: i32 = 0x1008;
     const so_exclusiveaddruse: i32 = ~@as(i32, 0x0004);
+    const wsa_flag_no_handle_inherit: u32 = 0x80;
     const fionbio: u32 = 0x8004667e;
     const would_block: i32 = 10035;
     const SockAddr4 = extern struct {
@@ -83,7 +85,7 @@ pub const MediaSocket = struct {
             var startup: [408]u8 align(8) = @splat(0);
             if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
             errdefer _ = win.WSACleanup();
-            const socket = win.WSASocketW(win.af_inet, win.sock_dgram, win.ipproto_udp, null, 0, 1);
+            const socket = win.WSASocketW(win.af_inet, win.sock_dgram, win.ipproto_udp, null, 0, 1 | win.wsa_flag_no_handle_inherit);
             if (socket == win.invalid_socket) return error.SocketUnavailable;
             errdefer _ = win.closesocket(socket);
             const exclusive: i32 = 1;
@@ -162,6 +164,27 @@ pub const MediaSocket = struct {
         actual.recv_timeout_ms = snapshot.recv_timeout_ms;
         if (!std.meta.eql(actual, snapshot.*)) return error.SocketMismatch;
         return .{ .fd = fd, .recv_timeout_ms = snapshot.recv_timeout_ms };
+    }
+
+    /// Adopt an authenticated, PID-scoped Winsock UDP duplicate. The record is
+    /// consumed on entry, including refusal, and the imported handle is closed
+    /// on any mismatch. Only the real duplicate proves lineage; matching a
+    /// rebound endpoint or a process-local socket value is insufficient.
+    pub fn initTransferred(transfer: *windows_udp.Transfer, snapshot: *const Snapshot) !MediaSocket {
+        if (comptime builtin.os.tag != .windows) return error.UnverifiableSocketIdentity;
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+        errdefer _ = win.WSACleanup();
+        const socket = try transfer.import();
+        errdefer _ = win.closesocket(socket);
+        try snapshot.validate();
+        if (snapshot.inode != 0 or snapshot.device != transfer.source_socket)
+            return error.SocketMismatch;
+        var actual = try observeSocket(socket);
+        actual.device = snapshot.device;
+        actual.recv_timeout_ms = snapshot.recv_timeout_ms;
+        if (!std.meta.eql(actual, snapshot.*)) return error.SocketMismatch;
+        return .{ .fd = socket, .recv_timeout_ms = snapshot.recv_timeout_ms };
     }
 
     /// Send `bytes` to an IPv4 destination. Non-IPv4 addresses are dropped.
@@ -321,6 +344,44 @@ test "Windows MediaSocket binds, sends and receives IPv4 UDP with bounded idle p
     const before = @import("platform.zig").monotonicMillis();
     try testing.expect(server.recvFrom(&buf) == null);
     try testing.expect(@import("platform.zig").monotonicMillis() - before < 1000);
+}
+
+test "Windows UDP custody MediaSocket imports a real duplicate without changing source custody" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var old = try MediaSocket.bind(loopback_be, 0);
+    defer old.deinit();
+    old.setRecvTimeoutMs(43);
+    const carry = try old.capture();
+    var transfer = try windows_udp.duplicateForProcess(old.fd, std.os.windows.GetCurrentProcessId());
+    var adopted = try MediaSocket.initTransferred(&transfer, &carry);
+    defer adopted.deinit();
+    try testing.expect(transfer.consumed);
+    try testing.expect(old.fd != adopted.fd);
+    try testing.expectEqual(carry.port, try adopted.localPort());
+    try testing.expectEqual(carry.recv_timeout_ms, adopted.recv_timeout_ms);
+    try testing.expectEqualDeep(carry, try old.capture());
+
+    var peer = try MediaSocket.bind(loopback_be, 0);
+    defer peer.deinit();
+    const destination = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, carry.port);
+    try testing.expectEqual(SendDisposition.sent, peer.trySendTo(destination, "adopted"));
+    var buf: [64]u8 = undefined;
+    const first = adopted.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("adopted", first.data);
+    try testing.expectEqual(SendDisposition.sent, peer.trySendTo(destination, "source"));
+    const second = old.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("source", second.data);
+    try testing.expectError(error.AlreadyConsumed, transfer.import());
+
+    var stale = carry;
+    stale.port = if (stale.port == 65535) 65534 else stale.port + 1;
+    var rejected = try windows_udp.duplicateForProcess(old.fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.SocketMismatch, MediaSocket.initTransferred(&rejected, &stale));
+    try testing.expect(rejected.consumed);
+    var substitute = try windows_udp.duplicateForProcess(peer.fd, std.os.windows.GetCurrentProcessId());
+    try testing.expectError(error.SocketMismatch, MediaSocket.initTransferred(&substitute, &carry));
+    try testing.expect(substitute.consumed);
+    try testing.expectEqualDeep(carry, try old.capture());
 }
 
 test "loopback STUN binding round-trip binds the peer and answers" {

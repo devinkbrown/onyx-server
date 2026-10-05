@@ -27,6 +27,79 @@ const durable_oper_authority_boot = @import("durable_oper_authority_boot.zig");
 const node_identity = @import("node_identity.zig");
 const store_mod = @import("store.zig");
 
+/// The derived web writer uses a 1024-byte path buffer. Its longest filename
+/// is `chan_` + a 64-byte slug + `.html`.
+pub const windows_stats_web_dir_max_bytes: usize = 1024 - 1 - "chan_".len - 64 - ".html".len;
+/// The channel writer also uses a 1024-byte path buffer. A 128-byte slug,
+/// `.json`, and the atomic sibling's leading dot/`.tmp` are its longest path.
+pub const windows_chanstats_dir_max_bytes: usize = 1024 - 1 - 1 - 128 - ".json".len - ".tmp".len;
+
+pub fn validateWindowsStatsOutputPathLengths(web_dir: []const u8, channel_dir: []const u8) error{
+    StatsWebDirTooLong,
+    ChannelStatsDirTooLong,
+}!void {
+    if (web_dir.len > windows_stats_web_dir_max_bytes) return error.StatsWebDirTooLong;
+    if (channel_dir.len > windows_chanstats_dir_max_bytes) return error.ChannelStatsDirTooLong;
+}
+
+fn requireWritableStatsDir(io: std.Io, path: []const u8) !void {
+    if (path.len == 0) return;
+    const dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+    defer dir.close(io);
+    var nonce: [8]u8 = undefined;
+    io.random(&nonce);
+    var source_buf: [24]u8 = undefined;
+    var target_buf: [24]u8 = undefined;
+    const source = try std.fmt.bufPrint(&source_buf, ".sp{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+    const target = try std.fmt.bufPrint(&target_buf, ".sd{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+    const file = try dir.createFile(io, source, .{ .exclusive = true });
+    var live_name: ?[]const u8 = source;
+    defer if (live_name) |name| dir.deleteFile(io, name) catch {};
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    try file.writeStreamingAll(io, "stats preflight");
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    try dir.rename(source, dir, target, io);
+    live_name = target;
+    try dir.deleteFile(io, target);
+    live_name = null;
+}
+
+/// Check existing output directories with the same create/write/sync/rename/
+/// delete rights used by their atomic publishers. Random exclusive probe names
+/// cannot replace a published file, and cleanup runs on every error path.
+pub fn validateWindowsStatsOutputDirs(io: std.Io, stats: config_format.Config.Stats) !void {
+    try validateWindowsStatsOutputPathLengths(stats.dir, stats.channel_dir);
+    try requireWritableStatsDir(io, stats.dir);
+    try requireWritableStatsDir(io, stats.channel_dir);
+}
+
+test "Windows stats output path preflight covers longest atomic filenames" {
+    var web: [windows_stats_web_dir_max_bytes + 1]u8 = undefined;
+    var channel: [windows_chanstats_dir_max_bytes + 1]u8 = undefined;
+    @memset(&web, 'w');
+    @memset(&channel, 'c');
+    try validateWindowsStatsOutputPathLengths(web[0..windows_stats_web_dir_max_bytes], channel[0..windows_chanstats_dir_max_bytes]);
+    try std.testing.expectError(error.StatsWebDirTooLong, validateWindowsStatsOutputPathLengths(&web, ""));
+    try std.testing.expectError(error.ChannelStatsDirTooLong, validateWindowsStatsOutputPathLengths("", &channel));
+}
+
+test "Windows stats output preflight requires writable existing directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    try validateWindowsStatsOutputDirs(std.testing.io, .{ .dir = path, .channel_dir = path });
+    const missing = try std.fmt.allocPrint(allocator, "{s}/missing", .{path});
+    defer allocator.free(missing);
+    if (validateWindowsStatsOutputDirs(std.testing.io, .{ .channel_dir = missing })) |_| {
+        return error.TestExpectedError;
+    } else |_| {}
+}
+
 /// Deliberately staged OCG2 runtime authority. `observe` is the historical
 /// enabled-only behavior: boot and verify the durable image without allowing it
 /// to alter live sessions or mint authority records.

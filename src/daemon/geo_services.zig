@@ -272,12 +272,24 @@ pub const Service = struct {
         return result;
     }
     pub fn restoreSnapshot(self: *Service, snapshot: *const Snapshot, max_bytes: usize) !void {
+        try self.restoreSnapshotAt(snapshot, max_bytes, false);
+    }
+    /// Install a fully decoded image into a candidate whose real Geo worker is
+    /// parked behind the shared start Gate. No fallible step follows the copy.
+    pub fn restoreSnapshotParked(self: *Service, snapshot: *const Snapshot, max_bytes: usize) !void {
+        try self.restoreSnapshotAt(snapshot, max_bytes, true);
+    }
+    fn restoreSnapshotAt(self: *Service, snapshot: *const Snapshot, max_bytes: usize, comptime parked: bool) !void {
         lockSpin(&self.lifecycle_mutex);
         defer self.lifecycle_mutex.unlock();
-        if (self.thread != null or self.runtime.view != null or self.runtime.pause.request_epoch != 0) return error.AlreadyStarted;
+        if (self.thread != null or self.runtime.pause.request_epoch != 0 or self.stop_flag.load(.acquire)) return error.AlreadyStarted;
+        if (parked) {
+            try self.runtime.requireParked();
+        } else if (self.runtime.view != null) return error.AlreadyStarted;
         try snapshot.validate(self.opts, max_bytes);
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (parked) try self.runtime.requireParked();
         for (snapshot.weather, &self.weather) |entry, *out| {
             out.* = .{ .state = entry.state, .key_len = entry.key_len, .loc_len = entry.loc_len, .desc_len = entry.desc_len, .temp_c = @bitCast(entry.temp_c_bits), .wind_kph = @bitCast(entry.wind_kph_bits), .fetched_ms = entry.fetched_ms };
             @memcpy(out.key_buf[0..entry.key_len], entry.key[0..entry.key_len]);
