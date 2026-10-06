@@ -166,18 +166,23 @@ pub fn validEndpoint(endpoint: []const u8) bool {
 
 // ── SSRF guard for outbound push delivery ────────────────────────────────────
 
-/// True when a resolved IPv4 target sits in a range a client must never be able
-/// to aim the daemon at: unspecified, private (RFC 1918), loopback, link-local
-/// (cloud-metadata `169.254.169.254`), or the limited broadcast.
+/// True when a resolved IPv4 target is private, shared, or reserved for a
+/// purpose other than public unicast delivery.
 fn isDisallowedIp4(b: [4]u8) bool {
     return switch (b[0]) {
         0 => true, // 0.0.0.0/8 (incl. unspecified)
         10 => true, // 10.0.0.0/8 private
+        100 => b[1] >= 64 and b[1] <= 127, // 100.64.0.0/10 shared address space
         127 => true, // 127.0.0.0/8 loopback
         169 => b[1] == 254, // 169.254.0.0/16 link-local
         172 => b[1] >= 16 and b[1] <= 31, // 172.16.0.0/12 private
-        192 => b[1] == 168, // 192.168.0.0/16 private
-        255 => b[1] == 255 and b[2] == 255 and b[3] == 255, // 255.255.255.255 broadcast
+        192 => (b[1] == 168) or // 192.168.0.0/16 private
+            (b[1] == 0 and (b[2] == 0 or b[2] == 2)) or // protocol assignments and TEST-NET-1
+            (b[1] == 88 and b[2] == 99), // deprecated 6to4 relay anycast
+        198 => (b[1] == 18 or b[1] == 19) or // 198.18.0.0/15 benchmarking
+            (b[1] == 51 and b[2] == 100), // TEST-NET-2
+        203 => b[1] == 0 and b[2] == 113, // TEST-NET-3
+        224...255 => true, // multicast and reserved future-use space
         else => false,
     };
 }
@@ -926,18 +931,33 @@ test "webpush tls SSRF guard classifies push endpoint addresses" {
             return .{ .ip4 = .{ .bytes = b, .port = 443 } };
         }
     }.a;
-    // Disallowed: loopback / metadata / RFC-1918 / broadcast / unspecified.
+    // Disallowed: loopback / metadata / private / shared / reserved.
     try testing.expect(isDisallowedPushAddr(ip4(.{ 127, 0, 0, 1 })));
     try testing.expect(isDisallowedPushAddr(ip4(.{ 169, 254, 169, 254 })));
     try testing.expect(isDisallowedPushAddr(ip4(.{ 10, 0, 0, 5 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 100, 64, 0, 0 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 100, 127, 255, 255 })));
     try testing.expect(isDisallowedPushAddr(ip4(.{ 172, 16, 0, 1 })));
     try testing.expect(isDisallowedPushAddr(ip4(.{ 172, 31, 255, 255 })));
     try testing.expect(isDisallowedPushAddr(ip4(.{ 192, 168, 1, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 192, 0, 0, 8 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 192, 0, 2, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 192, 88, 99, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 198, 18, 0, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 198, 19, 255, 255 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 198, 51, 100, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 203, 0, 113, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 224, 0, 0, 1 })));
+    try testing.expect(isDisallowedPushAddr(ip4(.{ 240, 0, 0, 1 })));
     try testing.expect(isDisallowedPushAddr(ip4(.{ 0, 0, 0, 0 })));
     try testing.expect(isDisallowedPushAddr(ip4(.{ 255, 255, 255, 255 })));
-    // Allowed: public IPv4 (example.com) and a neighbouring 172.x outside /12.
+    // Allowed: public addresses adjacent to blocked ranges.
     try testing.expect(!isDisallowedPushAddr(ip4(.{ 93, 184, 216, 34 })));
+    try testing.expect(!isDisallowedPushAddr(ip4(.{ 100, 63, 255, 255 })));
+    try testing.expect(!isDisallowedPushAddr(ip4(.{ 100, 128, 0, 0 })));
     try testing.expect(!isDisallowedPushAddr(ip4(.{ 172, 32, 0, 1 })));
+    try testing.expect(!isDisallowedPushAddr(ip4(.{ 198, 17, 255, 255 })));
+    try testing.expect(!isDisallowedPushAddr(ip4(.{ 198, 20, 0, 0 })));
     try testing.expect(!isDisallowedPushAddr(ip4(.{ 8, 8, 8, 8 })));
 
     // IPv6: ::1 loopback, fe80:: link-local, fc00:: ULA, and ::ffff-mapped

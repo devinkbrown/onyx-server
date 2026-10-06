@@ -79,6 +79,13 @@ pub fn buildRequest(out: []u8, host: []const u8, path: []const u8) error{TooSmal
     return line;
 }
 
+/// Preserve a nonstandard HTTPS port in Host as well as in the connection target.
+pub fn buildTargetRequest(out: []u8, target: Target) error{TooSmall}![]const u8 {
+    if (target.port == 443) return buildRequest(out, target.host, target.path);
+    const line = std.fmt.bufPrint(out, "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nAccept: text/html\r\nConnection: close\r\n\r\n", .{ target.path, target.host, target.port }) catch return error.TooSmall;
+    return line;
+}
+
 pub fn parse(html: []const u8, title_buf: []u8, desc_buf: []u8, image_buf: []u8) Preview {
     const body = html[0..@min(html.len, max_body)];
     return .{
@@ -107,40 +114,11 @@ fn parseV4(text: []const u8) ?[4]u8 {
 fn parseV6Literal(host: []const u8, port: u16) ?net.IpAddress {
     if (host.len < 3 or host[0] != '[' or host[host.len - 1] != ']') return null;
     const inner = host[1 .. host.len - 1];
-    if (std.ascii.eqlIgnoreCase(inner, "::1")) {
-        var bytes: [16]u8 = @splat(0);
-        bytes[15] = 1;
-        return .{ .ip6 = .{ .bytes = bytes, .port = port } };
-    }
-    if (std.mem.indexOf(u8, inner, "::ffff:")) |pos| {
-        const tail = inner[pos + "::ffff:".len ..];
-        if (parseV4(tail)) |v4| {
-            var bytes: [16]u8 = @splat(0);
-            bytes[10] = 0xff;
-            bytes[11] = 0xff;
-            bytes[12] = v4[0];
-            bytes[13] = v4[1];
-            bytes[14] = v4[2];
-            bytes[15] = v4[3];
-            return .{ .ip6 = .{ .bytes = bytes, .port = port } };
-        }
-    }
-    // fe80::/10 and fc00::/7 are denied even when the rest of the text is short.
-    if (inner.len >= 4 and std.ascii.eqlIgnoreCase(inner[0..4], "fe80")) {
-        var bytes: [16]u8 = @splat(0);
-        bytes[0] = 0xfe;
-        bytes[1] = 0x80;
-        return .{ .ip6 = .{ .bytes = bytes, .port = port } };
-    }
-    if (inner.len >= 2 and (std.ascii.eqlIgnoreCase(inner[0..2], "fc") or std.ascii.eqlIgnoreCase(inner[0..2], "fd"))) {
-        var bytes: [16]u8 = @splat(0);
-        bytes[0] = if (std.ascii.eqlIgnoreCase(inner[0..2], "fd")) 0xfd else 0xfc;
-        return .{ .ip6 = .{ .bytes = bytes, .port = port } };
-    }
-    var bytes: [16]u8 = @splat(0);
-    bytes[0] = 0x20;
-    bytes[1] = 0x01;
-    return .{ .ip6 = .{ .bytes = bytes, .port = port } };
+    const parsed = net.IpAddress.parse(inner, port) catch return null;
+    return switch (parsed) {
+        .ip6 => parsed,
+        .ip4 => null,
+    };
 }
 
 fn copyField(dest: []u8, raw: []const u8) []const u8 {
@@ -238,4 +216,38 @@ test "GAP-P6 unfurl parses a bounded preview and refuses private targets" {
     const pubaddr = try parseHttps("https://1.1.1.1/a");
     try std.testing.expect(!deniedAddress(pubaddr.literal.?));
     try std.testing.expectError(error.NotHttps, parseHttps("http://1.1.1.1/a"));
+}
+
+test "unfurl preserves exact IPv6 literals and rejects malformed brackets" {
+    const public = try parseHttps("https://[2606:4700:4700::1111]:8443/a");
+    const expected = try net.IpAddress.parse("2606:4700:4700::1111", 8443);
+    try std.testing.expectEqualDeep(expected, public.literal.?);
+    try std.testing.expect(!deniedAddress(public.literal.?));
+
+    const local = try parseHttps("https://[fd12:3456::abcd]/a");
+    try std.testing.expectEqualDeep(try net.IpAddress.parse("fd12:3456::abcd", 443), local.literal.?);
+    try std.testing.expect(deniedAddress(local.literal.?));
+
+    const mapped = try parseHttps("https://[::ffff:100.64.0.1]/a");
+    try std.testing.expectEqualDeep(try net.IpAddress.parse("::ffff:100.64.0.1", 443), mapped.literal.?);
+    try std.testing.expect(deniedAddress(mapped.literal.?));
+
+    inline for (.{ "https://[not-ipv6]/", "https://[fe80garbage]/", "https://[::ffff:127.0.0.1junk]/", "https://[127.0.0.1]/", "https://[::1", "https://[]/" }) |url| {
+        try std.testing.expectError(error.BadUrl, parseHttps(url));
+    }
+}
+
+test "unfurl Host header includes nondefault target port" {
+    var request: [256]u8 = undefined;
+    const ipv6 = try parseHttps("https://[2606:4700:4700::1111]:8443/a");
+    const v6_bytes = try buildTargetRequest(&request, ipv6);
+    try std.testing.expect(std.mem.indexOf(u8, v6_bytes, "Host: [2606:4700:4700::1111]:8443\r\n") != null);
+
+    const named = try parseHttps("https://example.com:9443/a");
+    const named_bytes = try buildTargetRequest(&request, named);
+    try std.testing.expect(std.mem.indexOf(u8, named_bytes, "Host: example.com:9443\r\n") != null);
+
+    const standard = try parseHttps("https://example.com/a");
+    const standard_bytes = try buildTargetRequest(&request, standard);
+    try std.testing.expect(std.mem.indexOf(u8, standard_bytes, "Host: example.com\r\n") != null);
 }

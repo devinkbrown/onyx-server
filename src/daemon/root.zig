@@ -79,6 +79,7 @@ pub const nick_enforcement = @import("nick_enforcement.zig");
 pub const node_identity = @import("node_identity.zig");
 pub const node_keyfile = @import("node_keyfile.zig");
 pub const oauth_jwt = @import("oauth_jwt.zig");
+pub const outbound_trust = @import("outbound_trust.zig");
 pub const observe = @import("observe.zig");
 pub const ocsp_staple = @import("ocsp_staple.zig");
 pub const operator_groups = @import("operator_groups.zig");
@@ -461,6 +462,7 @@ test {
     _ = node_identity;
     _ = node_keyfile;
     _ = oauth_jwt;
+    _ = outbound_trust;
     _ = observe;
     _ = ocsp_staple;
     _ = operator_groups;

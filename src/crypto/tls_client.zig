@@ -155,6 +155,9 @@ pub const Options = struct {
     receive_record_size_limit: u16 = tls_record.record_size_limit_max,
     server_name: []const u8,
     trust_anchors: []const []const u8,
+    /// Exact DER certificates forbidden anywhere in the presented X.509 chain.
+    /// Borrowed for the client's lifetime, including the outer slice.
+    disallowed_certs: []const []const u8 = &.{},
     alpn_protocols: []const []const u8 = &.{},
     /// Current wall-clock time (Unix seconds) used to reject expired and
     /// not-yet-valid certificates in the chain. When null the validity window is
@@ -411,6 +414,7 @@ pub const Client = struct {
     allocator: Allocator,
     server_name: []u8,
     trust_anchors: []const []const u8,
+    disallowed_certs: []const []const u8,
     alpn_protocols: []const []const u8,
     /// Owned copy of the caller-supplied CRL DER (see `Options.crl`), or null.
     crl: ?[]u8 = null,
@@ -699,6 +703,7 @@ pub const Client = struct {
             .server_name = name,
             .receive_record_size_limit = options.receive_record_size_limit,
             .trust_anchors = anchors,
+            .disallowed_certs = options.disallowed_certs,
             .alpn_protocols = alpn,
             .crl = crl_owned,
             .ech_config_list = ech_list_owned,
@@ -2408,6 +2413,7 @@ pub const Client = struct {
         }
         if (count == 0) return error.EmptyCertificateChain;
         const chain = chain_buf[0..count];
+        try rejectDisallowedCerts(chain, self.disallowed_certs);
         if (!self.skip_cert_verify_for_test) {
             try verifyChainToTrustAnchors(chain, self.trust_anchors, self.effectiveVerifyName(), self.verify_time);
         }
@@ -3671,6 +3677,14 @@ fn verifySignatureScheme(key: LeafPublicKey, scheme: tls_signature_scheme.Signat
     }
 }
 
+fn rejectDisallowedCerts(chain: []const []const u8, disallowed_certs: []const []const u8) Error!void {
+    for (chain) |cert_der| {
+        for (disallowed_certs) |disallowed_der| {
+            if (std.mem.eql(u8, cert_der, disallowed_der)) return error.BadCertificate;
+        }
+    }
+}
+
 fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const u8, server_name: []const u8, now: ?i64) Error!void {
     if (chain.len == 0) return error.EmptyCertificateChain;
     if (anchors.len == 0) return error.UnknownCa;
@@ -3691,6 +3705,8 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
         try verifyIssuedBy(chain[i], chain[i + 1]);
         const issuer = try x509.parse(chain[i + 1]);
         if (!issuer.basic_constraints_ca) return error.BadCertificate;
+        // A CA's EKU, when present, constrains every server certificate below it.
+        if (issuer.eku_present and !issuer.eku_server_auth) return error.BadCertificate;
         // A CA in the path must be allowed to sign certificates and be valid now.
         if (issuer.key_usage_present and !issuer.key_usage_cert_sign) return error.BadCertificate;
         if (now) |t| try x509_verify.validateParsedAt(issuer, t);
@@ -3728,6 +3744,8 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
             dbg("trust-anchor DN matched but signature check failed: {s}", .{@errorName(err)});
             continue;
         };
+        const anchor = x509.parse(anchor_der) catch continue;
+        if (anchor.eku_present and !anchor.eku_server_auth) continue;
         // The anchor's own name constraints and pathLenConstraint bind the
         // path even when that certificate is not resent in the chain.
         try x509_verify.enforceExternalAnchor(chain, anchor_der);
@@ -6671,6 +6689,102 @@ test "Client deep-copies pinned CT logs and frees them (no leak, no dangle)" {
 // ===========================================================================
 
 const chain_test_san = "leaf.tls13.onyx.test";
+
+test "TLS 1.3 disallowed certificates reject leaf, intermediate, and presented root" {
+    const a = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const root_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x71)));
+    const mid_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x72)));
+    const leaf_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x73)));
+    var root_buf: [1024]u8 = undefined;
+    var mid_buf: [1024]u8 = undefined;
+    var leaf_buf: [1024]u8 = undefined;
+    const root = try x509_verify.mintEd25519CertExt(&root_buf, "Deny Root", "Deny Root", root_kp.public_key.toBytes(), root_kp, 1_704_067_200, 1_924_991_999, .{ .is_ca = true });
+    const mid = try x509_verify.mintEd25519CertExt(&mid_buf, "Deny Root", "Deny Mid", mid_kp.public_key.toBytes(), root_kp, 1_704_067_200, 1_924_991_999, .{ .is_ca = true });
+    const leaf = try x509_verify.mintEd25519CertExt(&leaf_buf, "Deny Mid", "deny.test", leaf_kp.public_key.toBytes(), mid_kp, 1_704_067_200, 1_924_991_999, .{ .dns_names = &.{"deny.test"} });
+    const chain = [_][]const u8{ leaf, mid, root };
+    const anchors = [_][]const u8{root};
+    try verifyChainToTrustAnchors(&chain, &anchors, "deny.test", null);
+
+    var entries: std.ArrayList(u8) = .empty;
+    defer entries.deinit(a);
+    for (chain) |cert| {
+        try appendU24(a, &entries, cert.len);
+        try entries.appendSlice(a, cert);
+        try entries.appendSlice(a, &.{ 0, 0 }); // CertificateEntry extensions
+    }
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.append(a, 0); // request_context
+    try appendU24(a, &body, entries.items.len);
+    try body.appendSlice(a, entries.items);
+
+    // An empty policy accepts the same complete, trusted Certificate message.
+    var allowed = try Client.init(a, .{ .server_name = "deny.test", .trust_anchors = &anchors });
+    defer allowed.deinit();
+    try allowed.parseAndVerifyCertificate(body.items);
+    try std.testing.expect(allowed.leaf_key != null);
+
+    for (chain) |cert| {
+        const blocked = [_][]const u8{cert};
+        var denied = try Client.init(a, .{ .server_name = "deny.test", .trust_anchors = &anchors, .disallowed_certs = &blocked });
+        defer denied.deinit();
+        try std.testing.expectError(error.BadCertificate, denied.parseAndVerifyCertificate(body.items));
+        try std.testing.expect(denied.leaf_key == null);
+    }
+
+    // Matching is on the full DER bytes, not a name, prefix, or issuer.
+    var near_leaf = try a.dupe(u8, leaf);
+    defer a.free(near_leaf);
+    near_leaf[near_leaf.len - 1] ^= 1;
+    try rejectDisallowedCerts(&chain, &.{near_leaf});
+}
+
+test "TLS 1.3 rejects a presented CA restricted to OCSP signing" {
+    const ca_kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x81)));
+    const leaf_kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x82)));
+    const ca_params: x509_selfsign.EcdsaP256Params = .{
+        .common_name = "EKU CA",
+        .not_before = 1_704_067_200,
+        .not_after = 1_924_991_999,
+        .serial = &.{0x81},
+        .key_pair = ca_kp,
+        .is_ca = true,
+    };
+    const leaf_params: x509_selfsign.EcdsaP256Params = .{
+        .common_name = "EKU CA", // buildEcdsaP256IssuedBy uses this for issuer and subject DN
+        .not_before = 1_704_067_200,
+        .not_after = 1_924_991_999,
+        .serial = &.{0x82},
+        .key_pair = leaf_kp,
+        .dns_names = &.{"eku.test"},
+    };
+    var ca_buf: [2048]u8 = undefined;
+    var ocsp_buf: [2048]u8 = undefined;
+    var leaf_buf: [2048]u8 = undefined;
+    const leaf = try x509_selfsign.buildEcdsaP256IssuedBy(&leaf_buf, leaf_params, ca_kp);
+    const unrestricted = try x509_selfsign.buildSelfSignedEcdsaP256(&ca_buf, ca_params);
+    const ok_chain = [_][]const u8{ leaf, unrestricted };
+    try verifyChainToTrustAnchors(&ok_chain, &.{unrestricted}, "eku.test", null);
+
+    const ocsp_only = try x509_selfsign.buildSelfSignedEcdsaP256(&ocsp_buf, .{
+        .common_name = ca_params.common_name,
+        .not_before = ca_params.not_before,
+        .not_after = ca_params.not_after,
+        .serial = ca_params.serial,
+        .key_pair = ca_kp,
+        .is_ca = true,
+        .eku_ocsp_signing = true,
+    });
+    const denied_chain = [_][]const u8{ leaf, ocsp_only };
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&denied_chain, &.{ocsp_only}, "eku.test", null));
+
+    // The server may omit the root. A restricted candidate is skipped, while
+    // another valid anchor with the same name and key remains usable.
+    const leaf_only = [_][]const u8{leaf};
+    try std.testing.expectError(error.UnknownCa, verifyChainToTrustAnchors(&leaf_only, &.{ocsp_only}, "eku.test", null));
+    try verifyChainToTrustAnchors(&leaf_only, &.{ ocsp_only, unrestricted }, "eku.test", null);
+}
 
 fn hexConst(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;

@@ -451,16 +451,22 @@ handoff until it settles. An open multiline batch defers the handoff until it
 closes.
 
 Windows outbound HTTP hostname lookup uses `GetAddrInfoExW`. The guarded Web
-Push resolver and ACME resolver fall back from an absent A answer to AAAA;
-other HTTP callers keep A-only resolution until their address checks can pin the
-selected result. Native Winsock connects to IPv4 and IPv6 targets, and focused
-loopback tests cover plaintext requests and a verified TLS request to a pinned
-IPv6 address. Enterprise DNS policy and hosts-file variations have not had live
-acceptance tests. Socket
-IDs use generation-safe slot reuse, so a closed descriptor never becomes valid
-again. The 30-bit socket namespace and the separate file-handle namespace each
-have a finite per-process lifetime. At half of either range, the daemon queues
-a connection-preserving Helix rollover into the exact image measured at boot;
+Push and outbound webhook resolvers, along with ACME, fall back from an absent
+A answer to AAAA. Outbound webhooks and link previews connect to the same
+address they screened, including webhook retries; link previews still resolve
+hostnames through A records. Other HTTP callers keep A-only resolution. Native
+Winsock connects to IPv4 and IPv6 targets, and focused loopback tests cover
+plaintext requests and a verified TLS request to a pinned IPv6 address.
+HTTPS webhooks and link previews verify peers against the native Windows ROOT
+certificate store and reject certificates present in Windows Disallowed; an
+unavailable or empty store stops delivery. Windows certificate trust lists are
+not yet enforced by this pure-Zig TLS client. This path uses Zig and Windows
+APIs without OpenSSL. Enterprise DNS policy and hosts-file variations have not
+had live acceptance tests. Socket IDs use generation-safe
+slot reuse, so a closed descriptor never becomes valid again. The 30-bit
+socket namespace and separate file-handle namespace each have a finite
+per-process lifetime. At half of either range, the daemon queues a
+connection-preserving Helix rollover into the exact image measured at boot;
 failed attempts retry no sooner than 60 seconds later. A staged replacement
 image does not enter this automatic path. Manual upgrades retain priority.
 If image proof or Helix handoff remains unavailable, the daemon continues

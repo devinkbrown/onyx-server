@@ -161,20 +161,43 @@ pub fn parseUrl(url: []const u8) Error!Url {
 
     var host = authority;
     var port: u16 = if (tls) 443 else 80;
-    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |c| {
-        // Guard against an IPv6 literal (not supported upstream anyway).
-        if (std.mem.indexOfScalar(u8, authority, ']') == null) {
+    if (authority[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, authority, ']') orelse return error.BadUrl;
+        if (end <= 1) return error.BadUrl;
+        const literal = net.IpAddress.parse(authority[1..end], port) catch return error.BadUrl;
+        if (literal != .ip6) return error.BadUrl;
+        host = authority[0 .. end + 1];
+        if (end + 1 < authority.len) {
+            if (authority[end + 1] != ':') return error.BadUrl;
+            port = std.fmt.parseInt(u16, authority[end + 2 ..], 10) catch return error.BadUrl;
+        }
+    } else {
+        if (std.mem.indexOfAny(u8, authority, "[]@") != null) return error.BadUrl;
+        if (std.mem.lastIndexOfScalar(u8, authority, ':')) |c| {
             host = authority[0..c];
             port = std.fmt.parseInt(u16, authority[c + 1 ..], 10) catch return error.BadUrl;
         }
     }
+    if (host.len == 0 or port == 0) return error.BadUrl;
+    for (authority) |c| {
+        if (c <= 0x20 or c == 0x7f) return error.BadUrl;
+    }
     return .{ .tls = tls, .host = host, .port = port, .path = path };
+}
+
+/// Brackets belong in the HTTP Host field but not DNS lookups or TLS identity.
+fn endpointHost(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
 }
 
 pub const Options = struct {
     /// Trust anchors (DER certs) for TLS verification; required when `url.tls`
     /// unless `insecure_skip_verify` is set.
     trust_anchors: []const []const u8 = &.{},
+    /// Exact DER certificates that must never appear in the presented chain.
+    /// Windows outbound HTTPS supplies its Disallowed store here.
+    disallowed_certs: []const []const u8 = &.{},
     /// Skip server-certificate verification (TLS transport only). Intended as a
     /// documented escape hatch for public read-only feeds when a usable system
     /// CA bundle is unavailable; off by default.
@@ -206,7 +229,7 @@ pub fn get(
     request_bytes: []const u8,
     opts: Options,
 ) Error![]u8 {
-    const addr = try resolveHostA(host, port, opts.recv_timeout_ms);
+    const addr = try resolveHostA(endpointHost(host), port, opts.recv_timeout_ms);
     return getAtAddress(allocator, host, port, tls, request_bytes, addr, opts);
 }
 
@@ -252,7 +275,7 @@ pub fn getAtAddress(
         defer closeFd(fd);
         try setRecvTimeout(fd, opts.recv_timeout_ms);
         var application_phase = false;
-        if (getTls(allocator, fd, host, request_bytes, opts, &application_phase)) |resp| {
+        if (getTls(allocator, fd, endpointHost(host), request_bytes, opts, &application_phase)) |resp| {
             return resp;
         } else |err| {
             if (application_phase or err == error.ResponseTooLarge or tlsTrustFailure(err)) return err;
@@ -261,7 +284,7 @@ pub fn getAtAddress(
     const fd2 = try connectAddr(addr, opts.connect_timeout_ms);
     defer closeFd(fd2);
     try setRecvTimeout(fd2, opts.recv_timeout_ms);
-    return try getTls12(allocator, fd2, host, request_bytes, opts);
+    return try getTls12(allocator, fd2, endpointHost(host), request_bytes, opts);
 }
 
 fn tlsTrustFailure(err: anyerror) bool {
@@ -303,7 +326,7 @@ pub fn post(
         .{ .name = "Accept", .value = "application/ocsp-response" },
         .{ .name = "Connection", .value = "close" },
     };
-    return postWithHeaders(allocator, url, &headers, body, opts);
+    return postWithHeaders(allocator, url, &headers, body, null, opts);
 }
 
 /// POST a JSON body with `X-Onyx-Signature`. The signature is the caller's
@@ -320,7 +343,25 @@ pub fn postSigned(
         .{ .name = "X-Onyx-Signature", .value = signature },
         .{ .name = "Connection", .value = "close" },
     };
-    return postWithHeaders(allocator, url, &headers, body, opts);
+    return postWithHeaders(allocator, url, &headers, body, null, opts);
+}
+
+/// Signed webhook POST to an already screened address. The HTTP Host and TLS
+/// identity still use `url.host`; no second hostname resolution is performed.
+pub fn postSignedAtAddress(
+    allocator: std.mem.Allocator,
+    url: Url,
+    body: []const u8,
+    signature: []const u8,
+    addr: net.IpAddress,
+    opts: Options,
+) Error![]u8 {
+    const headers = [_]http1.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-Onyx-Signature", .value = signature },
+        .{ .name = "Connection", .value = "close" },
+    };
+    return postWithHeaders(allocator, url, &headers, body, addr, opts);
 }
 
 fn postWithHeaders(
@@ -328,17 +369,25 @@ fn postWithHeaders(
     url: Url,
     headers: []const http1.Header,
     body: []const u8,
+    pinned_addr: ?net.IpAddress,
     opts: Options,
 ) Error![]u8 {
     // buildRequest writes method/path/Host + each header + Content-Length + body.
-    var extra: usize = url.host.len + url.path.len + 256;
+    const default_port: u16 = if (url.tls) 443 else 80;
+    const owned_host: ?[]u8 = if (url.port == default_port) null else try std.fmt.allocPrint(allocator, "{s}:{d}", .{ url.host, url.port });
+    defer if (owned_host) |value| allocator.free(value);
+    const host_header: []const u8 = if (owned_host) |value| value else url.host;
+    var extra: usize = host_header.len + url.path.len + 256;
     for (headers) |h| extra += h.name.len + h.value.len + 4;
     const cap = std.math.add(usize, body.len, extra) catch return error.ResponseTooLarge;
     const req_buf = try allocator.alloc(u8, cap);
     defer allocator.free(req_buf);
-    const request_bytes = http1.buildRequest(req_buf, "POST", url.host, url.path, headers, body) catch
+    const request_bytes = http1.buildRequest(req_buf, "POST", host_header, url.path, headers, body) catch
         return error.ResponseTooLarge;
-    return get(allocator, url.host, url.port, url.tls, request_bytes, opts);
+    return if (pinned_addr) |addr|
+        getAtAddress(allocator, url.host, url.port, url.tls, request_bytes, addr, opts)
+    else
+        get(allocator, url.host, url.port, url.tls, request_bytes, opts);
 }
 
 /// TLS 1.2 variant of `getTls` (hardened `tls12_client`). Used as the fallback
@@ -354,6 +403,7 @@ fn getTls12(
     var tc = try tls12_client.Client.init(allocator, .{
         .server_name = host,
         .trust_anchors = opts.trust_anchors,
+        .disallowed_certs = opts.disallowed_certs,
         .alpn_protocols = &.{"http/1.1"},
         .now_unix_seconds = wallClockSeconds(),
         .crl = opts.crl,
@@ -431,6 +481,7 @@ fn getTls(
     var tc = try tls_client.Client.init(allocator, .{
         .server_name = host,
         .trust_anchors = opts.trust_anchors,
+        .disallowed_certs = opts.disallowed_certs,
         .alpn_protocols = &.{"http/1.1"},
         .now_unix_seconds = wallClockSeconds(),
         .crl = opts.crl,
@@ -788,14 +839,18 @@ fn queryOneServer6(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![16]u
 
 fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!Socket {
     if (comptime builtin.os.tag == .windows) return connectAddrWindows(addr, timeout_ms);
-    const a4 = switch (addr) {
-        .ip4 => |x| x,
-        .ip6 => return error.ConnectFailed,
-    };
-    const fd = try socketTcpNonblock();
+    const fd = try socketTcpNonblock(if (addr == .ip4) posix.AF.INET else posix.AF.INET6);
     errdefer closeFd(fd);
-    var sa = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, a4.port), .addr = @bitCast(a4.bytes) };
-    const rc = sys.connect(fd, @ptrCast(&sa), @sizeOf(sys.sockaddr.in));
+    const rc = switch (addr) {
+        .ip4 => |a4| blk: {
+            var sa = posix.sockaddr.in{ .port = std.mem.nativeToBig(u16, a4.port), .addr = @bitCast(a4.bytes) };
+            break :blk sys.connect(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+        },
+        .ip6 => |a6| blk: {
+            var sa = posix.sockaddr.in6{ .port = std.mem.nativeToBig(u16, a6.port), .addr = a6.bytes, .flowinfo = 0, .scope_id = a6.interface.index };
+            break :blk sys.connect(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+        },
+    };
     switch (posix.errno(rc)) {
         .SUCCESS => {},
         .INPROGRESS, .INTR => try waitWritable(fd, timeout_ms),
@@ -869,8 +924,8 @@ fn waitWritable(fd: sys.fd_t, timeout_ms: u31) Error!void {
     if (pfd[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return error.ConnectFailed;
 }
 
-fn socketTcpNonblock() Error!sys.fd_t {
-    const rc = sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+fn socketTcpNonblock(family: u32) Error!sys.fd_t {
+    const rc = sys.socket(family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => error.SocketUnavailable,
@@ -1110,6 +1165,7 @@ test "http_fetch Windows IPv6 pinned and literal loopback HTTP" {
     const port = std.mem.bigToNative(u16, address.port);
     const Worker = struct {
         listener: usize,
+        port: u16,
         failure: ?anyerror = null,
 
         fn run(self: *@This()) void {
@@ -1119,7 +1175,7 @@ test "http_fetch Windows IPv6 pinned and literal loopback HTTP" {
         }
 
         fn serve(self: *@This()) !void {
-            for (0..2) |_| {
+            for (0..3) |index| {
                 var reads = win.FdSet{ .count = 1, .sockets = undefined };
                 reads.sockets[0] = self.listener;
                 var timeout = win.Timeval{ .seconds = 3, .microseconds = 0 };
@@ -1130,14 +1186,27 @@ test "http_fetch Windows IPv6 pinned and literal loopback HTTP" {
                     defer _ = win.closesocket(client);
                     try setRecvTimeout(client, 2000);
                     var request: [512]u8 = undefined;
-                    const size = try readSome(client, &request);
-                    if (!std.mem.startsWith(u8, request[0..size], "GET /ipv6 HTTP/1.1\r\n")) return error.TestUnexpectedResult;
+                    var size: usize = 0;
+                    while (std.mem.indexOf(u8, request[0..size], "\r\n\r\n") == null) {
+                        if (size == request.len) return error.TestUnexpectedResult;
+                        size += try readSome(client, request[size..]);
+                    }
+                    if (index == 2) {
+                        var host_header_buf: [80]u8 = undefined;
+                        const host_header = try std.fmt.bufPrint(&host_header_buf, "Host: onyx-address-pin.invalid.:{d}\r\n", .{self.port});
+                        if (!std.mem.startsWith(u8, request[0..size], "POST /signed HTTP/1.1\r\n") or
+                            std.mem.indexOf(u8, request[0..size], "X-Onyx-Signature: sha256=test") == null or
+                            std.mem.indexOf(u8, request[0..size], host_header) == null)
+                            return error.TestUnexpectedResult;
+                    } else if (!std.mem.startsWith(u8, request[0..size], "GET /ipv6 HTTP/1.1\r\n")) {
+                        return error.TestUnexpectedResult;
+                    }
                     try writeAll(client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
                 }
             }
         }
     };
-    var worker = Worker{ .listener = listener };
+    var worker = Worker{ .listener = listener, .port = port };
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
     var joined = false;
     defer if (!joined) thread.join();
@@ -1149,6 +1218,14 @@ test "http_fetch Windows IPv6 pinned and literal loopback HTTP" {
     const second = try get(std.testing.allocator, "::1", port, false, request, .{});
     defer std.testing.allocator.free(second);
     try std.testing.expect(std.mem.endsWith(u8, second, "\r\n\r\nOK"));
+    const signed = try postSignedAtAddress(std.testing.allocator, .{
+        .tls = false,
+        .host = "onyx-address-pin.invalid.",
+        .port = port,
+        .path = "/signed",
+    }, "{}", "sha256=test", pinned, .{});
+    defer std.testing.allocator.free(signed);
+    try std.testing.expect(std.mem.endsWith(u8, signed, "\r\n\r\nOK"));
     thread.join();
     joined = true;
     if (worker.failure) |err| return err;
@@ -1337,6 +1414,15 @@ test "parseUrl splits scheme/host/port/path with defaults" {
     try std.testing.expectEqual(@as(u16, 8080), q.port);
     try std.testing.expectEqualStrings("/a/b?c=d", q.path);
 
+    const v6 = try parseUrl("https://[2001:db8::1]:8443/health");
+    try std.testing.expectEqualStrings("[2001:db8::1]", v6.host);
+    try std.testing.expectEqualStrings("2001:db8::1", endpointHost(v6.host));
+    try std.testing.expectEqual(@as(u16, 8443), v6.port);
+    try std.testing.expectEqualStrings("/health", v6.path);
+    try std.testing.expectError(error.BadUrl, parseUrl("https://[not-ipv6]:8443/"));
+    try std.testing.expectError(error.BadUrl, parseUrl("https://[::1]extra/"));
+    try std.testing.expectError(error.BadUrl, parseUrl("https://[::1]:0/"));
+
     try std.testing.expectError(error.BadUrl, parseUrl("ftp://nope"));
 }
 
@@ -1386,6 +1472,66 @@ test "http_fetch native loopback request timeout entropy and descriptor failure"
         try std.testing.expectError(error.RecvTimeout, setRecvTimeout(-1, 1));
         try std.testing.expectError(error.ConnectFailed, setBlocking(-1));
     }
+}
+
+test "http_fetch Linux IPv6 pinned loopback HTTP" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const listener_rc = sys.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    if (posix.errno(listener_rc) != .SUCCESS) return error.SkipZigTest;
+    const listener: sys.fd_t = @intCast(listener_rc);
+    defer closeFd(listener);
+    var loopback: [16]u8 = @splat(0);
+    loopback[15] = 1;
+    var address = posix.sockaddr.in6{ .port = 0, .addr = loopback, .flowinfo = 0, .scope_id = 0 };
+    if (posix.errno(sys.bind(listener, @ptrCast(&address), @sizeOf(@TypeOf(address)))) != .SUCCESS or
+        posix.errno(sys.listen(listener, 1)) != .SUCCESS) return error.SkipZigTest;
+    var address_len: posix.socklen_t = @sizeOf(@TypeOf(address));
+    if (posix.errno(sys.getsockname(listener, @ptrCast(&address), &address_len)) != .SUCCESS) return error.TestUnexpectedResult;
+    const port = std.mem.bigToNative(u16, address.port);
+    const Worker = struct {
+        listener: sys.fd_t,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn serve(self: *@This()) !void {
+            var polls = [_]posix.pollfd{.{ .fd = self.listener, .events = posix.POLL.IN, .revents = 0 }};
+            if (posix.errno(sys.poll(&polls, 1, 3000)) != .SUCCESS or polls[0].revents & posix.POLL.IN == 0)
+                return error.TestUnexpectedResult;
+            const client_rc = sys.accept(self.listener, null, null);
+            if (posix.errno(client_rc) != .SUCCESS) return error.TestUnexpectedResult;
+            const client: sys.fd_t = @intCast(client_rc);
+            defer closeFd(client);
+            var request: [256]u8 = undefined;
+            var size: usize = 0;
+            while (std.mem.indexOf(u8, request[0..size], "\r\n\r\n") == null) {
+                if (size == request.len) return error.TestUnexpectedResult;
+                const n = sys.read(client, request[size..].ptr, request.len - size);
+                if (posix.errno(n) != .SUCCESS or n == 0) return error.TestUnexpectedResult;
+                size += @intCast(n);
+            }
+            if (!std.mem.startsWith(u8, request[0..size], "GET /ipv6 HTTP/1.1\r\n"))
+                return error.TestUnexpectedResult;
+            const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+            try writeAll(client, response);
+        }
+    };
+    var worker = Worker{ .listener = listener };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) thread.join();
+    const pinned = try net.IpAddress.parse("::1", port);
+    const request = "GET /ipv6 HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n";
+    const response = try getAtAddress(std.testing.allocator, "[::1]", port, false, request, pinned, .{});
+    defer std.testing.allocator.free(response);
+    thread.join();
+    joined = true;
+    if (worker.failure) |err| return err;
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\nOK"));
 }
 
 test "http_fetch native DNS UDP transport binds replies to query identity" {

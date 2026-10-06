@@ -282,6 +282,7 @@ const tls_server = @import("../crypto/tls_server.zig");
 const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const http_fetch = @import("http_fetch.zig");
+const outbound_trust = @import("outbound_trust.zig");
 const unfurl = @import("unfurl.zig");
 const appeal = @import("appeal.zig");
 const challenge_mod = @import("challenge.zig");
@@ -5299,6 +5300,9 @@ pub const LinuxServer = struct {
     /// Test stand-ins for the unfurl resolver and fetch. Null uses DNS and HTTPS.
     unfurl_resolve_for_test: ?unfurl.ResolveFn = null,
     unfurl_fetch_for_test: ?unfurl.FetchFn = null,
+    unfurl_fetch_at_address_for_test: ?*const fn ([]const u8, std.Io.net.IpAddress, []u8) anyerror!usize = null,
+    outbound_resolve_for_test: ?*const fn ([]const u8, u16) anyerror!std.Io.net.IpAddress = null,
+    outbound_trust_anchors_for_test: ?[]const []const u8 = null,
     /// Strictly-increasing incarnation counter for minted oper grants, so a later
     /// GRANT/REVOKE always supersedes an earlier one (even within one ms).
     grant_incarnation: u64 = 0,
@@ -7208,7 +7212,7 @@ pub const LinuxServer = struct {
 
     /// `OUTHOOK ADD <url> <secret> <categories>` registers a push target.
     /// `DEL` removes one. `LIST` shows URLs and categories, never the secret.
-    /// Loopback and link-local targets are refused unless
+    /// Private, loopback, and link-local targets are refused unless
     /// `webhook_allow_private` is set. Inbound `WEBHOOK` is unchanged.
     pub fn handleOutboundWebhook(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!conn.session.isOper()) {
@@ -7271,7 +7275,7 @@ pub const LinuxServer = struct {
             return;
         };
         if (!self.config.webhook_allow_private and outboundHostPrivate(parsed_url.host)) {
-            try self.noticeTo(conn, "OUTHOOK: refusing link-local or loopback target");
+            try self.noticeTo(conn, "OUTHOOK: refusing private or local target");
             return;
         }
         const mask = parseOutboundCategories(p[3]) orelse {
@@ -7452,21 +7456,32 @@ pub const LinuxServer = struct {
             self.outbound_webhook_dropped += 1;
             return;
         };
-        if (self.outboundDeliveryBlocked(parsed.host, parsed.port)) {
+        const addr = self.resolveOutboundWebhookAddress(parsed.host, parsed.port) catch {
             self.outbound_webhook_dropped += 1;
             return;
-        }
+        };
+        const test_anchors = self.outboundTrustOverrideForTest();
+        var trust: ?outbound_trust.Store = if (parsed.tls and test_anchors == null)
+            self.loadOutboundTrust() catch {
+                self.outbound_webhook_dropped += 1;
+                return;
+            }
+        else
+            null;
+        defer if (trust) |*store| store.deinit();
         var sig_buf: [71]u8 = undefined;
         const signature = outboundSignature(sub.secret, body, &sig_buf);
-        const opts = http_fetch.Options{
+        var opts = http_fetch.Options{
             .connect_timeout_ms = 400,
             .recv_timeout_ms = 400,
             .max_response_bytes = 4096,
         };
+        opts.trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{};
+        opts.disallowed_certs = if (trust) |*store| store.disallowed() else &.{};
         var attempt: u8 = 0;
         while (attempt < outbound_webhook_attempt_cap) : (attempt += 1) {
             self.outbound_webhook_attempts += 1;
-            const resp = http_fetch.postSigned(self.allocator, parsed, body, signature, opts) catch continue;
+            const resp = http_fetch.postSignedAtAddress(self.allocator, parsed, body, signature, addr, opts) catch continue;
             defer self.allocator.free(resp);
             if (httpStatus2xx(resp)) {
                 self.outbound_webhook_delivered += 1;
@@ -7476,13 +7491,37 @@ pub const LinuxServer = struct {
         self.outbound_webhook_dropped += 1;
     }
 
-    fn outboundDeliveryBlocked(self: *LinuxServer, host: []const u8, port: u16) bool {
-        if (self.config.webhook_allow_private) return false;
-        if (outboundHostPrivate(host)) return true;
-        if (http_fetch.resolveHostA(host, port, 400)) |addr| {
-            return outboundAddrPrivate(addr);
-        } else |_| {}
-        return false;
+    fn resolveOutboundWebhookAddress(self: *LinuxServer, host: []const u8, port: u16) !std.Io.net.IpAddress {
+        if (!self.config.webhook_allow_private and outboundHostPrivate(host)) return error.PrivateOutboundAddress;
+        var host_buf: [256]u8 = undefined;
+        const lookup_host = outboundNormalizeHost(host, &host_buf);
+        if (lookup_host.len == 0) return error.BadUrl;
+        const addr = if (self.outbound_resolve_for_test) |resolve|
+            try resolve(lookup_host, port)
+        else
+            http_fetch.resolveHostA(lookup_host, port, 400) catch |err| blk: {
+                // Windows system DNS may return only an AAAA answer. This
+                // fallback remains inside the screened, pinned webhook path.
+                if (comptime builtin.os.tag == .windows) {
+                    if (err == error.HostNotFound) break :blk try http_fetch.resolveHostAAAA(lookup_host, port, 400);
+                }
+                return err;
+            };
+        if (!self.config.webhook_allow_private and outboundAddrPrivate(addr)) return error.PrivateOutboundAddress;
+        return addr;
+    }
+
+    fn loadOutboundTrust(self: *LinuxServer) !outbound_trust.Store {
+        if (self.runtime_io) |io| return outbound_trust.load(self.allocator, io);
+        if (self.config.crypto_io) |io| return outbound_trust.load(self.allocator, io);
+        var local_io = std.Io.Threaded.init(std.heap.smp_allocator, .{});
+        defer local_io.deinit();
+        return outbound_trust.load(self.allocator, local_io.io());
+    }
+
+    fn outboundTrustOverrideForTest(self: *LinuxServer) ?[]const []const u8 {
+        if (comptime builtin.is_test) return self.outbound_trust_anchors_for_test;
+        return null;
     }
 
     test "server start gates media transports on media_enabled" {
@@ -27575,29 +27614,17 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "UNFURL: https URLs only");
             return;
         };
-        const addr = if (target.literal) |literal|
-            literal
-        else if (self.unfurl_resolve_for_test) |resolve|
-            resolve(target.host) catch {
-                try self.noticeTo(conn, "UNFURL: could not resolve");
-                return;
-            }
-        else
-            http_fetch.resolveHostA(target.host, target.port, 2000) catch {
-                try self.noticeTo(conn, "UNFURL: could not resolve");
-                return;
-            };
-        if (unfurl.deniedAddress(addr)) {
-            try self.noticeTo(conn, "UNFURL: address refused");
+        const addr = self.resolveUnfurlAddress(target) catch |err| {
+            try self.noticeTo(conn, if (err == error.PrivateUnfurlAddress) "UNFURL: address refused" else "UNFURL: could not resolve");
             return;
-        }
+        };
         var request_buf: [512]u8 = undefined;
-        const request = unfurl.buildRequest(&request_buf, target.host, target.path) catch {
+        const request = unfurl.buildTargetRequest(&request_buf, target) catch {
             try self.noticeTo(conn, "UNFURL: url is too long");
             return;
         };
         var body_buf: [unfurl.max_body]u8 = undefined;
-        const body = self.unfurlBody(request, &body_buf) catch {
+        const body = self.unfurlBody(request, target.host, target.port, addr, &body_buf) catch {
             try self.noticeTo(conn, "UNFURL: could not fetch");
             return;
         };
@@ -27613,14 +27640,33 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, notice);
     }
 
-    fn unfurlBody(self: *LinuxServer, request: []const u8, dest: []u8) ![]const u8 {
+    fn resolveUnfurlAddress(self: *LinuxServer, target: unfurl.Target) !std.Io.net.IpAddress {
+        const addr = if (target.literal) |literal|
+            literal
+        else if (self.unfurl_resolve_for_test) |resolve|
+            try resolve(target.host)
+        else
+            try http_fetch.resolveHostA(target.host, target.port, 2000);
+        if (unfurl.deniedAddress(addr)) return error.PrivateUnfurlAddress;
+        return addr;
+    }
+
+    fn unfurlBody(self: *LinuxServer, request: []const u8, host: []const u8, port: u16, addr: std.Io.net.IpAddress, dest: []u8) ![]const u8 {
         if (self.unfurl_fetch_for_test) |fetch| {
             const n = try fetch(request, dest);
             return dest[0..@min(n, dest.len)];
         }
-        const host = requestHost(request) orelse return error.BadUrl;
-        const raw = try http_fetch.get(self.allocator, host, 443, true, request, .{
+        if (self.unfurl_fetch_at_address_for_test) |fetch| {
+            const n = try fetch(request, addr, dest);
+            return dest[0..@min(n, dest.len)];
+        }
+        const test_anchors = self.outboundTrustOverrideForTest();
+        var trust: ?outbound_trust.Store = if (test_anchors == null) try self.loadOutboundTrust() else null;
+        defer if (trust) |*store| store.deinit();
+        const raw = try http_fetch.getAtAddress(self.allocator, host, port, true, request, addr, .{
             .max_response_bytes = unfurl.max_body,
+            .trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{},
+            .disallowed_certs = if (trust) |*store| store.disallowed() else &.{},
         });
         defer self.allocator.free(raw);
         const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return dest[0..0];
@@ -27628,15 +27674,6 @@ pub const LinuxServer = struct {
         const n = @min(body.len, dest.len);
         @memcpy(dest[0..n], body[0..n]);
         return dest[0..n];
-    }
-
-    fn requestHost(request: []const u8) ?[]const u8 {
-        const marker = "Host: ";
-        const at = std.mem.indexOf(u8, request, marker) orelse return null;
-        const rest = request[at + marker.len ..];
-        const end = std.mem.indexOf(u8, rest, "\r\n") orelse return null;
-        if (end == 0) return null;
-        return rest[0..end];
     }
 
     /// `APPEAL <text>` files one structured appeal per host per window. The
@@ -53098,16 +53135,25 @@ pub const LinuxServer = struct {
             if (!delivery.fanout_published) continue;
             const sub = delivery.destinations[delivery.next_destination].?;
             const parsed = http_fetch.parseUrl(sub.url) catch return;
-            if (self.outboundDeliveryBlocked(parsed.host, parsed.port)) return;
+            const addr = self.resolveOutboundWebhookAddress(parsed.host, parsed.port) catch return;
+            const test_anchors = self.outboundTrustOverrideForTest();
+            var trust: ?outbound_trust.Store = if (parsed.tls and test_anchors == null)
+                self.loadOutboundTrust() catch return
+            else
+                null;
+            defer if (trust) |*store| store.deinit();
             var signature_buffer: [71]u8 = undefined;
             const body = delivery.body[0..delivery.body_len];
             const signature = outboundSignature(sub.secret, body, &signature_buffer);
-            self.outbound_webhook_attempts += 1;
-            const response = http_fetch.postSigned(self.allocator, parsed, body, signature, .{
+            var opts = http_fetch.Options{
                 .connect_timeout_ms = 400,
                 .recv_timeout_ms = 400,
                 .max_response_bytes = 4096,
-            }) catch return;
+            };
+            opts.trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{};
+            opts.disallowed_certs = if (trust) |*store| store.disallowed() else &.{};
+            self.outbound_webhook_attempts += 1;
+            const response = http_fetch.postSignedAtAddress(self.allocator, parsed, body, signature, addr, opts) catch return;
             defer self.allocator.free(response);
             if (!self.retainedWebhookResponseAccepted(response)) return;
             self.outbound_webhook_delivered += 1;
@@ -128974,22 +129020,12 @@ fn outboundNormalizeHost(raw: []const u8, buf: []u8) []const u8 {
     return buf[0..host.len];
 }
 
-fn ipv4Private(bytes: [4]u8) bool {
-    if (bytes[0] == 127) return true;
-    if (bytes[0] == 169 and bytes[1] == 254) return true;
-    return false;
+fn outboundAddrPrivate(addr: std.Io.net.IpAddress) bool {
+    return webpush_mod.isDisallowedPushAddr(addr);
 }
 
-fn outboundAddrPrivate(addr: std.Io.net.IpAddress) bool {
-    switch (addr) {
-        .ip4 => |a| return ipv4Private(a.bytes),
-        .ip6 => |a| {
-            if (std.Io.net.Ip4Address.fromIp6(a)) |mapped| return ipv4Private(mapped.bytes);
-            if (a.bytes[0] == 0xfe and (a.bytes[1] & 0xc0) == 0x80) return true;
-            const loopback = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-            return std.mem.eql(u8, &a.bytes, &loopback);
-        },
-    }
+fn pinOutboundLoopbackForTest(_: []const u8, port: u16) anyerror!std.Io.net.IpAddress {
+    return .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
 }
 
 fn outboundHostPrivate(raw: []const u8) bool {
@@ -129366,7 +129402,7 @@ test "GAP-O11 outbound webhooks sign retries and refuse loopback" {
     var refuse_cmd = try irc_line.parseLine(refuse_line);
     oper.send_len = 0;
     try server.handleOutboundWebhook(oper, &refuse_cmd);
-    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "refusing link-local or loopback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "refusing private or local") != null);
     try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
     try std.testing.expectEqual(@as(u64, 0), server.outbound_webhook_attempts);
     lockSpin(&probe.mu);
@@ -129381,6 +129417,11 @@ test "GAP-O11 outbound webhooks sign retries and refuse loopback" {
         "http://[::1]/hook",
         "http://[fe80::1]/hook",
         "http://[::ffff:127.0.0.1]/hook",
+        "http://10.1.2.3/hook",
+        "http://172.16.1.2/hook",
+        "http://192.168.0.2/hook",
+        "http://[fd00::1]/hook",
+        "http://203.0.113.5/hook",
     };
     for (private_urls) |url| {
         var line_buf: [192]u8 = undefined;
@@ -129388,38 +129429,34 @@ test "GAP-O11 outbound webhooks sign retries and refuse loopback" {
         var cmd = try irc_line.parseLine(line);
         oper.send_len = 0;
         try server.handleOutboundWebhook(oper, &cmd);
-        try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "refusing link-local or loopback") != null);
+        try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "refusing private or local") != null);
     }
     try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
 
-    var public_cmd = try irc_line.parseLine("OUTHOOK ADD http://203.0.113.5/hook s3cret-token KILL,POLICY");
+    var public_cmd = try irc_line.parseLine("OUTHOOK ADD http://1.1.1.1/hook s3cret-token KILL,POLICY");
     oper.send_len = 0;
     try server.handleOutboundWebhook(oper, &public_cmd);
     try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "OUTHOOK: registered") != null);
     try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "s3cret-token") == null);
-    var rfc1918 = try irc_line.parseLine("OUTHOOK ADD http://10.1.2.3/hook s3cret-token KILL");
-    try server.handleOutboundWebhook(oper, &rfc1918);
-    var v6doc = try irc_line.parseLine("OUTHOOK ADD http://[2001:db8::1]/hook s3cret-token KILL");
-    try server.handleOutboundWebhook(oper, &v6doc);
-    try std.testing.expectEqual(@as(usize, 3), server.outboundWebhookCount());
+    var public_v6 = try irc_line.parseLine("OUTHOOK ADD http://[2606:4700:4700::1111]/hook s3cret-token KILL");
+    try server.handleOutboundWebhook(oper, &public_v6);
+    try std.testing.expectEqual(@as(usize, 2), server.outboundWebhookCount());
     var list_cmd = try irc_line.parseLine("OUTHOOK LIST");
     oper.send_len = 0;
     try server.handleOutboundWebhook(oper, &list_cmd);
     const listed = oper.send_buf[0..oper.send_len];
-    try std.testing.expect(std.mem.indexOf(u8, listed, "203.0.113.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "1.1.1.1") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "KILL") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "POLICY") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "s3cret-token") == null);
-    var bad_cat = try irc_line.parseLine("OUTHOOK ADD http://203.0.113.9/hook s3cret-token NOTACAT");
+    var bad_cat = try irc_line.parseLine("OUTHOOK ADD http://1.1.1.9/hook s3cret-token NOTACAT");
     oper.send_len = 0;
     try server.handleOutboundWebhook(oper, &bad_cat);
     try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "unknown category") != null);
-    try std.testing.expectEqual(@as(usize, 3), server.outboundWebhookCount());
-    var del_public = try irc_line.parseLine("OUTHOOK DEL http://203.0.113.5/hook");
+    try std.testing.expectEqual(@as(usize, 2), server.outboundWebhookCount());
+    var del_public = try irc_line.parseLine("OUTHOOK DEL http://1.1.1.1/hook");
     try server.handleOutboundWebhook(oper, &del_public);
-    var del_rfc = try irc_line.parseLine("OUTHOOK DEL http://10.1.2.3/hook");
-    try server.handleOutboundWebhook(oper, &del_rfc);
-    var del_v6 = try irc_line.parseLine("OUTHOOK DEL http://[2001:db8::1]/hook");
+    var del_v6 = try irc_line.parseLine("OUTHOOK DEL http://[2606:4700:4700::1111]/hook");
     try server.handleOutboundWebhook(oper, &del_v6);
     try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
 
@@ -129446,7 +129483,12 @@ test "GAP-O11 outbound webhooks sign retries and refuse loopback" {
     try server.handleOutboundWebhook(oper, &del_dead);
     try std.testing.expectEqual(@as(usize, 0), server.outboundWebhookCount());
 
-    var add_live = try irc_line.parseLine(refuse_line);
+    server.outbound_resolve_for_test = pinOutboundLoopbackForTest;
+    var pinned_url: [96]u8 = undefined;
+    const pinned = try std.fmt.bufPrint(&pinned_url, "http://pinned.invalid:{d}/hook", .{listener.port});
+    var pinned_line: [160]u8 = undefined;
+    const pinned_text = try std.fmt.bufPrint(&pinned_line, "OUTHOOK ADD {s} s3cret-token KILL", .{pinned});
+    var add_live = try irc_line.parseLine(pinned_text);
     oper.send_len = 0;
     try server.handleOutboundWebhook(oper, &add_live);
     try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "OUTHOOK: registered") != null);
@@ -129462,6 +129504,7 @@ test "GAP-O11 outbound webhooks sign retries and refuse loopback" {
     try std.testing.expect(probe.req_len[1] > 0);
     const first = probe.req[0][0..probe.req_len[0]];
     const second = probe.req[1][0..probe.req_len[1]];
+    try std.testing.expect(std.mem.indexOf(u8, first, "Host: pinned.invalid") != null);
     try std.testing.expect(outboundRequestSigned("s3cret-token", first));
     try std.testing.expect(outboundRequestSigned("s3cret-token", second));
     const body = outboundRequestBody(first) orelse return error.TestUnexpectedResult;
@@ -129476,7 +129519,204 @@ test "GAP-O11 outbound webhooks sign retries and refuse loopback" {
     try server.handleWebhook(oper_id, oper, &inbound);
     try std.testing.expect(std.mem.indexOf(u8, oper.send_buf[0..oper.send_len], "not enabled") != null);
 
-    std.debug.print("GAP-O11 branch=outbound webhooks sign and retry with a cap; link-local and loopback stay refused unless config allows them\n", .{});
+    std.debug.print("GAP-O11 branch=outbound webhooks sign and retry with a cap; private and local targets stay refused unless config allows them\n", .{});
+}
+
+test "outbound webhook forwards screened address and fails closed" {
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+
+    const Fixture = struct {
+        var selected: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 1, 1, 7 }, .port = 443 } };
+        var fail: bool = false;
+        var resolutions: usize = 0;
+        fn resolve(host: []const u8, port: u16) anyerror!std.Io.net.IpAddress {
+            try std.testing.expectEqualStrings("public.example", host);
+            try std.testing.expectEqual(@as(u16, 443), port);
+            resolutions += 1;
+            if (fail) return error.TestDnsFailure;
+            return selected;
+        }
+    };
+    Fixture.resolutions = 0;
+    Fixture.fail = false;
+    server.outbound_resolve_for_test = Fixture.resolve;
+    const public = try server.resolveOutboundWebhookAddress("public.example", 443);
+    try std.testing.expectEqualDeep(Fixture.selected, public);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.resolutions);
+
+    const denied = [_][]const u8{ "10.1.2.3", "172.16.1.2", "192.168.0.2", "169.254.169.254", "fd00::1", "fe80::1", "::ffff:10.1.2.3" };
+    for (denied) |raw| {
+        Fixture.selected = try std.Io.net.IpAddress.parse(raw, 443);
+        try std.testing.expectError(error.PrivateOutboundAddress, server.resolveOutboundWebhookAddress("public.example", 443));
+    }
+    try std.testing.expectEqual(@as(usize, 1 + denied.len), Fixture.resolutions);
+    Fixture.fail = true;
+    try std.testing.expectError(error.TestDnsFailure, server.resolveOutboundWebhookAddress("public.example", 443));
+    Fixture.fail = false;
+    server.config.webhook_allow_private = true;
+    try std.testing.expectEqualDeep(Fixture.selected, try server.resolveOutboundWebhookAddress("public.example", 443));
+}
+
+test "HTTPS webhook and UNFURL refuse when trust roots cannot load" {
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+
+    const Resolver = struct {
+        fn resolve(_: []const u8, port: u16) anyerror!std.Io.net.IpAddress {
+            return .{ .ip4 = .{ .bytes = .{ 1, 1, 1, 7 }, .port = port } };
+        }
+    };
+    server.outbound_resolve_for_test = Resolver.resolve;
+    var url = "https://public.example/hook".*;
+    var secret = "test-secret".*;
+    const original_allocator = server.allocator;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    server.allocator = failing.allocator();
+    server.postOutboundWebhook(.{ .url = &url, .secret = &secret, .mask = event_spine.CategoryMask.all() }, "{}");
+    server.allocator = original_allocator;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 0), server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_dropped);
+
+    const target = try unfurl.parseHttps("https://public.example/a");
+    const addr = try std.Io.net.IpAddress.parse("1.1.1.7", target.port);
+    var request_buf: [512]u8 = undefined;
+    const request = try unfurl.buildTargetRequest(&request_buf, target);
+    var body_buf: [unfurl.max_body]u8 = undefined;
+    failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    server.allocator = failing.allocator();
+    const result = server.unfurlBody(request, target.host, target.port, addr, &body_buf);
+    server.allocator = original_allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "HTTPS outbound webhook reaches pinned address with injected trust anchor" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x79));
+    var cert_buf: [2048]u8 = undefined;
+    const cert = try @import("../proto/x509_selfsign.zig").buildSelfSigned(&cert_buf, .{
+        .common_name = "hook.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x79, 1 },
+        .key_pair = kp,
+        .dns_names = &.{"hook.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{cert};
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io, .webhook_allow_private = true }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    server.outbound_resolve_for_test = pinOutboundLoopbackForTest;
+    server.outbound_trust_anchors_for_test = &chain;
+
+    const Probe = struct {
+        listener: linux.fd_t,
+        chain: []const []const u8,
+        key_pair: std.crypto.sign.Ed25519.KeyPair,
+        request: [2048]u8 = undefined,
+        request_len: usize = 0,
+        failure: ?anyerror = null,
+
+        fn readExact(fd: linux.fd_t, bytes: []u8) !void {
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const rc = linux.read(fd, bytes[offset..].ptr, bytes.len - offset);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc == 0) return error.TestConnectionClosed;
+                        offset += @intCast(rc);
+                    },
+                    .INTR => continue,
+                    else => return error.TestReadFailed,
+                }
+            }
+        }
+
+        fn record(fd: linux.fd_t, buffer: []u8) ![]u8 {
+            try readExact(fd, buffer[0..5]);
+            const len = 5 + @as(usize, std.mem.readInt(u16, buffer[3..5], .big));
+            if (len > buffer.len) return error.TestRecordTooLarge;
+            try readExact(fd, buffer[5..len]);
+            return buffer[0..len];
+        }
+
+        fn run(self: *@This()) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn exchange(self: *@This()) !void {
+            var ready = [_]posix.pollfd{.{ .fd = self.listener, .events = posix.POLL.IN, .revents = 0 }};
+            if (try posix.poll(&ready, 2000) == 0) return error.TestNoConnection;
+            const accepted = linux.accept4(self.listener, null, null, posix.SOCK.CLOEXEC);
+            if (posix.errno(accepted) != .SUCCESS) return error.TestAcceptFailed;
+            const fd: linux.fd_t = @intCast(accepted);
+            defer closeFd(fd);
+            const tv = linux.timeval{ .sec = 2, .usec = 0 };
+            try setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+            var engine = try tls_server.Server.init(std.heap.page_allocator, .{ .cert_chain = self.chain, .signing_key = self.key_pair });
+            defer engine.deinit();
+            var buffer: [17 * 1024]u8 = undefined;
+            while (!engine.handshakeDone()) {
+                switch (try engine.feed(try record(fd, &buffer))) {
+                    .bytes_to_send => |bytes| {
+                        defer std.heap.page_allocator.free(bytes);
+                        try writeAllFd(fd, bytes);
+                    },
+                    .need_more => {},
+                }
+            }
+            const plaintext = try engine.decrypt(try record(fd, &buffer));
+            defer std.heap.page_allocator.free(plaintext);
+            if (plaintext.len > self.request.len) return error.TestRequestTooLarge;
+            @memcpy(self.request[0..plaintext.len], plaintext);
+            self.request_len = plaintext.len;
+            const response = try engine.encrypt("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            defer std.heap.page_allocator.free(response);
+            try writeAllFd(fd, response);
+        }
+    };
+    const listener = try bindLoopback(true);
+    defer closeFd(listener.fd);
+    var probe = Probe{ .listener = listener.fd, .chain = &chain, .key_pair = kp };
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://hook.test:{d}/signed", .{listener.port});
+    var secret = "live-secret".*;
+    server.postOutboundWebhook(.{ .url = url, .secret = &secret, .mask = event_spine.CategoryMask.all() }, "{\"live\":true}");
+    thread.join();
+    joined = true;
+    if (probe.failure) |err| return err;
+    try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_delivered);
+    try std.testing.expectEqual(@as(u64, 0), server.outbound_webhook_dropped);
+    const request = probe.request[0..probe.request_len];
+    try std.testing.expect(std.mem.startsWith(u8, request, "POST /signed HTTP/1.1\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, request, "Host: hook.test:") != null);
+    try std.testing.expect(outboundRequestSigned("live-secret", request));
 }
 
 test "GAP-O12 scoped expiring bot grants survive USR2 and are not an oper bit" {
@@ -130782,6 +131022,61 @@ test "GAP-P6 unfurl is opt-in, bounded, and refuses private addresses" {
     try std.testing.expect(std.mem.indexOf(u8, alice.send_buf[0..alice.send_len], "client refused") != null);
     current_reactor = null;
     std.debug.print("GAP-P6 branch=unfurl defaults off, the client can refuse, and private addresses are not fetched\n", .{});
+}
+
+test "UNFURL forwards the screened address to its fetch" {
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .unfurl_enabled = true, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+
+    const Fixture = struct {
+        var answer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 1, 1, 9 }, .port = 443 } };
+        var fail: bool = false;
+        var resolves: usize = 0;
+        var fetches: usize = 0;
+        fn resolve(host: []const u8) anyerror!std.Io.net.IpAddress {
+            try std.testing.expectEqualStrings("preview.invalid", host);
+            resolves += 1;
+            if (fail) return error.TestDnsFailure;
+            return answer;
+        }
+        fn fetch(request: []const u8, addr: std.Io.net.IpAddress, dest: []u8) anyerror!usize {
+            try std.testing.expect(std.mem.indexOf(u8, request, "Host: preview.invalid") != null);
+            try std.testing.expectEqualDeep(answer, addr);
+            fetches += 1;
+            const html = "<title>Pinned preview</title>";
+            @memcpy(dest[0..html.len], html);
+            return html.len;
+        }
+    };
+    Fixture.resolves = 0;
+    Fixture.fetches = 0;
+    Fixture.fail = false;
+    server.unfurl_resolve_for_test = Fixture.resolve;
+    server.unfurl_fetch_at_address_for_test = Fixture.fetch;
+    const target = try unfurl.parseHttps("https://preview.invalid/a");
+    const addr = try server.resolveUnfurlAddress(target);
+    var request_buf: [512]u8 = undefined;
+    const request = try unfurl.buildTargetRequest(&request_buf, target);
+    var body_buf: [unfurl.max_body]u8 = undefined;
+    const body = try server.unfurlBody(request, target.host, target.port, addr, &body_buf);
+    try std.testing.expectEqualStrings("<title>Pinned preview</title>", body);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.resolves);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.fetches);
+
+    Fixture.answer = try std.Io.net.IpAddress.parse("fd00::1", 443);
+    try std.testing.expectError(error.PrivateUnfurlAddress, server.resolveUnfurlAddress(target));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.fetches);
+    Fixture.fail = true;
+    try std.testing.expectError(error.TestDnsFailure, server.resolveUnfurlAddress(target));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.fetches);
 }
 
 test "GAP-P7 a banned connection files one appeal and the oper answer is audited" {
@@ -133196,7 +133491,8 @@ test "webpush consumer: accepted signed overflow retains exact downstream body a
     probe.thread = try std.Thread.spawn(.{}, OutboundHookProbe.run, .{&probe});
     probe.started = true;
     var url_buffer: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/retained", .{listener.port});
+    const url = try std.fmt.bufPrint(&url_buffer, "http://retained.invalid:{d}/retained", .{listener.port});
+    server.outbound_resolve_for_test = pinOutboundLoopbackForTest;
     const url_copy = try allocator.dupe(u8, url);
     errdefer if (server.outbound_webhooks[0] == null) allocator.free(url_copy);
     server.outbound_webhooks[0] = .{ .url = url_copy, .secret = try allocator.dupe(u8, "original-output-secret"), .mask = event_spine.CategoryMask.all() };
@@ -133260,6 +133556,7 @@ test "webpush consumer: accepted signed overflow retains exact downstream body a
     try std.testing.expectEqual(@as(usize, 2), probe.hits);
     for (0..2) |index| {
         const request = probe.req[index][0..probe.req_len[index]];
+        try std.testing.expect(std.mem.indexOf(u8, request, "Host: retained.invalid") != null);
         try std.testing.expect(outboundRequestSigned("original-output-secret", request));
         try std.testing.expectEqualSlices(u8, original_body, outboundRequestBody(request).?);
     }
