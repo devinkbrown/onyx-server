@@ -1030,6 +1030,19 @@ pub fn build(b: *std.Build) void {
     const bogo_shim_step = b.step("bogo-shim", "Build the standalone BoGo (BoringSSL runner) TLS shim");
     bogo_shim_step.dependOn(&bogo_shim_install.step);
 
+    const windows_helix_early_client = b.addExecutable(.{
+        .name = "windows-helix-early-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/windows_helix_early_client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
+        }),
+    });
+    const windows_helix_early_client_step = b.step("windows-helix-early-client", "Build the native Zig TLS 0-RTT smoke client");
+    windows_helix_early_client_step.dependOn(&b.addInstallArtifact(windows_helix_early_client, .{}).step);
+
     // `zig build bogo-shim-test` — the self-driven proof: builds+installs the
     // shim, then runs the shim file's own `test` blocks (parse + framing units,
     // plus subprocess exit-code smokes that spawn the installed binary and drive

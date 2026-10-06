@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Exercise real TLS 1.3 0-RTT IRC registration through two Windows Helix swaps.
+"""Exercise native Armor TLS 1.3 0-RTT through two Windows Helix swaps.
 
-OpenSSL supplies a fresh early-data ClientHello at each stage to prove
-acceptance and application delivery. The optional --exact-replay mode uses a
-TCP proxy to resend one byte-identical first flight across the first swap.
+A pure-Zig client supplies the first flight and captures session tickets. The
+optional --exact-replay mode resends one byte-identical first flight across
+the first swap through a TCP proxy.
 
 Usage: python -B tools/windows_helix_early_data_smoke.py zig-out/bin/onyx-server.exe
 """
@@ -41,11 +41,11 @@ def wait_for(path: Path, needle: bytes, process: subprocess.Popen[bytes],
             return data
         if process.poll() is not None:
             raise AssertionError(
-                f"OpenSSL exited {process.returncode} before {needle!r}: {data[-6000:]!r}"
+                f"native TLS client exited {process.returncode} before {needle!r}: {data[-6000:]!r}"
             )
         time.sleep(0.05)
     data = path.read_bytes() if path.exists() else b""
-    raise TimeoutError(f"OpenSSL did not report {needle!r}: {data[-6000:]!r}")
+    raise TimeoutError(f"native TLS client did not report {needle!r}: {data[-6000:]!r}")
 
 
 def stop_process(process: subprocess.Popen[bytes]) -> None:
@@ -65,98 +65,87 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=2)
 
 
-def openssl_connection(openssl: Path, root: Path, port: int, label: str,
-                       *, session_in: Path | None = None,
-                       early_data: Path | None = None,
-                       session_out: Path | None = None,
-                       active: list[subprocess.Popen[bytes]]) -> tuple[subprocess.Popen[bytes], Path]:
-    output = root / f"openssl-{label}.log"
-    command = [
-        str(openssl), "s_client", "-connect", f"127.0.0.1:{port}",
-        "-servername", "localhost", "-tls1_3", "-ign_eof",
-    ]
-    if session_in is not None:
-        command += ["-sess_in", str(session_in)]
-    if early_data is not None:
-        command += ["-early_data", str(early_data)]
-    if session_out is not None:
-        command += ["-sess_out", str(session_out)]
+def native_connection(client: Path, root: Path, port: int, label: str,
+                      *, session_in: tuple[Path, float] | None = None,
+                      early_data: bytes = b"", fallback: bytes = b"",
+                      active: list[subprocess.Popen[bytes]]) -> tuple[subprocess.Popen[bytes], Path]:
+    output = root / f"native-tls-{label}.log"
+    command = [str(client), str(port),
+               session_in[0].read_bytes().hex() if session_in else "-",
+               str(max(0, int((time.monotonic() - session_in[1]) * 1000))) if session_in else "0",
+               early_data.hex() if early_data else "-",
+               fallback.hex() if fallback else "-"]
     with output.open("wb") as log:
         process = subprocess.Popen(
-            command, cwd=root, stdin=subprocess.PIPE, stdout=log,
+            command, cwd=root, stdin=subprocess.DEVNULL, stdout=log,
             stderr=subprocess.STDOUT,
         )
     active.append(process)
     return process, output
 
 
-def session_ready(path: Path, log: Path, process: subprocess.Popen[bytes],
-                  *, timeout: float = 12) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists() and b"-----BEGIN SSL SESSION PARAMETERS-----" in path.read_bytes():
-            return
-        if process.poll() is not None:
-            raise AssertionError(
-                f"OpenSSL exited before the post-handshake session ticket: "
-                f"{log.read_bytes()[-6000:]!r}"
-            )
-        time.sleep(0.05)
-    raise TimeoutError(
-        f"post-handshake session ticket absent: {log.read_bytes()[-6000:]!r}"
-    )
-
-
-def seed_ticket(openssl: Path, root: Path, port: int,
-                active: list[subprocess.Popen[bytes]]) -> Path:
-    ticket = root / "private" / "early-session.pem"
-    process, log = openssl_connection(
-        openssl, root, port, "ticket-seed", session_out=ticket, active=active,
+def seed_ticket(client: Path, root: Path, port: int,
+                active: list[subprocess.Popen[bytes]]) -> tuple[Path, float]:
+    ticket = root / "private" / "early-session.bin"
+    process, log = native_connection(
+        client, root, port, "ticket-seed",
+        fallback=b"NICK seedearly\r\nUSER smoke 0 * :0RTT ticket seed\r\n",
+        active=active,
     )
     try:
-        assert process.stdin is not None
-        process.stdin.write(b"NICK seedearly\r\nUSER smoke 0 * :0RTT ticket seed\r\n")
-        process.stdin.flush()
         wait_for(log, b" 001 seedearly ", process)
-        session_ready(ticket, log, process)
-        return ticket
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            output = log.read_bytes()
+            marker = output.find(b"TICKET=")
+            if marker >= 0:
+                start = marker + len(b"TICKET=")
+                end = output.find(b"\n", start)
+                if end >= 0:
+                    encoded = output[start:end].removesuffix(b"\r")
+                    if not encoded or len(encoded) % 2:
+                        raise AssertionError("native client emitted a malformed session ticket")
+                    try:
+                        ticket.write_bytes(bytes.fromhex(encoded.decode("ascii")))
+                    except (ValueError, UnicodeDecodeError) as error:
+                        raise AssertionError("native client emitted a malformed session ticket") from error
+                    return ticket, time.monotonic()
+            if process.poll() is not None:
+                raise AssertionError(f"native client exited before complete session ticket: {output[-6000:]!r}")
+            time.sleep(0.05)
+        raise TimeoutError(f"complete post-handshake session ticket absent: {log.read_bytes()[-6000:]!r}")
     finally:
         stop_process(process)
         active.remove(process)
 
 
-def accepted_early_registration(openssl: Path, root: Path, port: int,
-                                ticket: Path, label: str,
+def accepted_early_registration(client: Path, root: Path, port: int,
+                                ticket: tuple[Path, float], label: str,
                                 active: list[subprocess.Popen[bytes]]) -> None:
     nick = f"early{label}".encode("ascii")
     nonce = secrets.token_hex(8).encode("ascii")
-    early = root / f"early-{label}.irc"
-    early.write_bytes(
+    early = (
         b"NICK " + nick + b"\r\nUSER smoke 0 * :0RTT Helix delivery\r\n"
         + b"PING :" + nonce + b"\r\n"
     )
-    process, log = openssl_connection(
-        openssl, root, port, label, session_in=ticket, early_data=early,
+    process, log = native_connection(
+        client, root, port, label, session_in=ticket, early_data=early,
         active=active,
     )
     try:
-        output = wait_for(log, b"Early data was accepted", process)
-        if b"Reused, TLSv1.3" not in output:
-            output = wait_for(log, b"Reused, TLSv1.3", process)
-        if b"Early data was rejected" in output:
-            raise AssertionError(f"{label}: OpenSSL also reported 0-RTT rejection")
+        output = wait_for(log, b"EARLY=accepted", process)
+        if b"RESUMED=yes" not in output:
+            raise AssertionError(f"{label}: native TLS client did not resume")
         output = wait_for(log, b" 001 " + nick + b" ", process)
         output = wait_for(log, b" PONG onyx.local :" + nonce, process)
-        if b"Early data was rejected" in output:
-            raise AssertionError(f"{label}: OpenSSL later reported 0-RTT rejection")
-        # No IRC bytes are sent on stdin. The unique PONG proves the early-data
-        # file reached the application, not just that a session resumed.
+        # No 1-RTT IRC bytes are sent. The unique PONG proves the early-data
+        # payload reached the application, not just that a session resumed.
         if output.count(b" 001 " + nick + b" ") != 1:
             raise AssertionError(f"{label}: early registration delivered more than once")
         if output.count(b" PONG onyx.local :" + nonce) != 1:
             raise AssertionError(f"{label}: early nonce delivered more than once")
         print(
-            f"PASS: {label}: resumed TLS 1.3, OpenSSL accepted 0-RTT, "
+            f"PASS: {label}: resumed native TLS 1.3, accepted 0-RTT, "
             f"IRC registered early nonce {nonce.decode('ascii')}", flush=True,
         )
     finally:
@@ -178,7 +167,7 @@ def capture_first_flight(client: socket.socket) -> bytes:
                 return bytes(first_flight)
             continue
         if not chunk:
-            raise AssertionError("OpenSSL closed before sending 0-RTT first flight")
+            raise AssertionError("native TLS client closed before sending 0-RTT first flight")
         first_flight.extend(chunk)
         if len(first_flight) > 32768:
             raise AssertionError("0-RTT first flight exceeded fixture bound")
@@ -193,7 +182,7 @@ def capture_first_flight(client: socket.socket) -> bytes:
             types.append(first_flight[offset])
             offset += 5 + length
         complete_at = time.monotonic() if offset == len(first_flight) and 22 in types and 23 in types else None
-    raise TimeoutError("OpenSSL did not send a complete TLS 0-RTT first flight")
+    raise TimeoutError("native TLS client did not send a complete TLS 0-RTT first flight")
 
 
 def relay_tls(client: socket.socket, server: socket.socket, stop: threading.Event,
@@ -211,27 +200,32 @@ def relay_tls(client: socket.socket, server: socket.socket, stop: threading.Even
             failures.append(str(error))
 
 
-def exact_replay_across_swap(openssl: Path, root: Path, tls_port: int,
-                             ticket: Path, oper: helix.Client,
+def exact_replay_across_swap(client_binary: Path, root: Path, tls_port: int,
+                             ticket: tuple[Path, float], oper: helix.Client,
                              owner: helix.Client, binary: Path, serving_pid: int,
                              active: list[subprocess.Popen[bytes]]) -> int:
     """Replay one byte-identical CH/0-RTT flight after transferring the guard."""
     early_nick = b"exactreplay"
     fallback_nick = b"replayfallback"
-    nonce = secrets.token_hex(8).encode("ascii")
-    early = root / "early-exact-replay.irc"
-    early.write_bytes(
+    early_nonce = secrets.token_hex(8).encode("ascii")
+    fallback_nonce = secrets.token_hex(8).encode("ascii")
+    early = (
         b"NICK " + early_nick + b"\r\nUSER smoke 0 * :exact replay probe\r\n"
-        + b"PING :" + nonce + b"\r\n"
+        + b"PING :" + early_nonce + b"\r\n"
+    )
+    fallback = (
+        b"NICK " + fallback_nick + b"\r\n"
+        b"USER smoke 0 * :replay fallback\r\n"
+        b"PING :" + fallback_nonce + b"\r\n"
     )
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         listener.settimeout(5)
         proxy_port = listener.getsockname()[1]
-        process, output = openssl_connection(
-            openssl, root, proxy_port, "exact-replay",
-            session_in=ticket, early_data=early, active=active,
+        process, output = native_connection(
+            client_binary, root, proxy_port, "exact-replay",
+            session_in=ticket, early_data=early, fallback=fallback, active=active,
         )
         stop = threading.Event()
         failures: list[str] = []
@@ -241,16 +235,17 @@ def exact_replay_across_swap(openssl: Path, root: Path, tls_port: int,
             with client:
                 first_flight = capture_first_flight(client)
                 flight_at = time.monotonic()
-                # Receiving a TLS ServerHello from the predecessor establishes
-                # that it processed this exact binder. Its response is discarded:
-                # the waiting OpenSSL client will handshake with the successor.
+                # The predecessor answers this exact ClientHello. A TLS handshake
+                # alone does not prove that it accepted the early data. Its
+                # response is discarded so the native client can finish with
+                # the successor using the byte-identical first flight.
                 with socket.create_connection(("127.0.0.1", tls_port), timeout=3) as predecessor:
                     predecessor.settimeout(3)
                     predecessor.sendall(first_flight)
                     first_response = predecessor.recv(4096)
                     if not first_response or first_response[0] != 22:
                         raise AssertionError(
-                            f"predecessor did not answer captured ClientHello: {first_response[:32]!r}"
+                            f"predecessor did not send a handshake response: {first_response[:32]!r}"
                         )
 
                 oper.send(b"UPGRADE")
@@ -272,32 +267,26 @@ def exact_replay_across_swap(openssl: Path, root: Path, tls_port: int,
                         target=relay_tls, args=(client, successor, stop, failures), daemon=True,
                     )
                     relay.start()
-                    rejected = wait_for(output, b"Early data was rejected", process)
-                    if b"Reused, TLSv1.3" not in rejected:
-                        rejected = wait_for(output, b"Reused, TLSv1.3", process)
-                    if b"Early data was accepted" in rejected:
-                        raise AssertionError("replayed first flight was accepted")
+                    rejected = wait_for(output, b"EARLY=rejected", process)
+                    if b"RESUMED=yes" not in rejected:
+                        raise AssertionError("replayed first flight did not resume")
                     if b" 001 " + early_nick + b" " in rejected:
                         raise AssertionError("rejected early IRC registration reached application")
-                    if b" PONG onyx.local :" + nonce in rejected:
+                    if b" PONG onyx.local :" + early_nonce in rejected:
                         raise AssertionError("rejected early nonce reached application")
-                    assert process.stdin is not None
-                    process.stdin.write(
-                        b"NICK " + fallback_nick + b"\r\n"
-                        b"USER smoke 0 * :replay fallback\r\n"
-                        b"PING :" + nonce + b"\r\n"
-                    )
-                    process.stdin.flush()
                     final = wait_for(output, b" 001 " + fallback_nick + b" ", process)
-                    final = wait_for(output, b" PONG onyx.local :" + nonce, process)
+                    final = wait_for(output, b" PONG onyx.local :" + fallback_nonce, process)
                     if b" 001 " + early_nick + b" " in final:
                         raise AssertionError("rejected early IRC registration reached application")
+                    if b" PONG onyx.local :" + early_nonce in final:
+                        raise AssertionError("rejected early nonce reached application")
                     if failures:
                         raise AssertionError(f"TLS proxy relay failed: {failures}")
                 print(
-                    "PASS: byte-identical CH/early TLS records "
+                    "PASS: duplicate CH/early TLS records "
                     f"SHA-256 {hashlib.sha256(first_flight).hexdigest()[:16]} "
-                    f"rejected after Helix in {elapsed:.2f}s; resumed 1-RTT fallback registered",
+                    f"rejected after Helix in {elapsed:.2f}s; resumed 1-RTT fallback registered "
+                    "(predecessor acceptance of this exact flight was not observed)",
                     flush=True,
                 )
                 return successor_pid
@@ -312,8 +301,8 @@ def exact_replay_across_swap(openssl: Path, root: Path, tls_port: int,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
-    parser.add_argument("--openssl", type=Path,
-                        help="native OpenSSL 3 executable (defaults to PATH or Git for Windows)")
+    parser.add_argument("--client", type=Path,
+                        help="native Zig TLS client executable (default: zig-out/bin/windows-helix-early-client.exe)")
     parser.add_argument("--exact-replay", action="store_true",
                         help="also replay one byte-identical 0-RTT first flight across the first swap")
     args = parser.parse_args()
@@ -322,16 +311,10 @@ def main() -> int:
     binary_source = args.binary.resolve()
     if not binary_source.is_file():
         parser.error(f"binary not found: {binary_source}")
-    default_openssl = Path(r"C:\Program Files\Git\usr\bin\openssl.exe")
-    openssl = args.openssl or Path(shutil.which("openssl") or default_openssl)
-    if not openssl.is_file():
-        parser.error(f"native OpenSSL executable not found: {openssl}")
-    version = subprocess.run(
-        [str(openssl), "version"], capture_output=True, text=True,
-        timeout=5, check=True,
-    ).stdout
-    if not version.startswith("OpenSSL 3."):
-        parser.error(f"OpenSSL 3 is required for this fixture: {version.strip()}")
+    default_client = Path(__file__).resolve().parent.parent / "zig-out" / "bin" / "windows-helix-early-client.exe"
+    native_client = (args.client or default_client).resolve()
+    if not native_client.is_file():
+        parser.error(f"native Zig client not found: {native_client}; build with `zig build windows-helix-early-client`")
 
     with tempfile.TemporaryDirectory(prefix="onyx-windows-helix-early-") as temporary:
         root = Path(temporary)
@@ -407,18 +390,18 @@ def main() -> int:
             oper.send(b"USER smoke 0 * :Windows 0RTT Helix operator")
             oper.wait(b" 381 ", start=start)
 
-            ticket = seed_ticket(openssl, root, tls_port, active)
+            ticket = seed_ticket(native_client, root, tls_port, active)
             serving_pid = parent.pid
             accepted_early_registration(
-                openssl, root, tls_port, ticket, "before", active,
+                native_client, root, tls_port, ticket, "before", active,
             )
             if args.exact_replay:
                 serving_pid = exact_replay_across_swap(
-                    openssl, root, tls_port, ticket, oper, owner, binary,
+                    native_client, root, tls_port, ticket, oper, owner, binary,
                     serving_pid, active,
                 )
                 accepted_early_registration(
-                    openssl, root, tls_port, ticket, "swap1", active,
+                    native_client, root, tls_port, ticket, "swap1", active,
                 )
                 remaining_swaps = (2,)
             else:
@@ -433,20 +416,20 @@ def main() -> int:
                 oper.ping(stage.encode("ascii"))
                 serving_pid = successor_pid
                 accepted_early_registration(
-                    openssl, root, tls_port, ticket, stage, active,
+                    native_client, root, tls_port, ticket, stage, active,
                 )
             if parent.wait(timeout=5) != 0:
                 raise AssertionError("original predecessor did not exit cleanly")
             if not args.exact_replay:
                 print(
-                    "LIMIT: OpenSSL generates a new binder per connection; "
+                    "LIMIT: a fresh TLS client generates a new binder per connection; "
                     "byte-identical 0-RTT replay rejection was not exercised.", flush=True,
                 )
             return 0
         except Exception:
             log.flush()
             print(log_path.read_text(encoding="utf-8", errors="replace")[-12000:])
-            for path in sorted(root.glob("openssl-*.log")):
+            for path in sorted(root.glob("native-tls-*.log")):
                 print(f"{path.name}: {path.read_text(encoding='utf-8', errors='replace')[-6000:]}")
             raise
         finally:
