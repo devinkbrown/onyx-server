@@ -8,6 +8,25 @@
 //! `encrypt()` / `decrypt()` once `handshakeDone()` is true.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const windows_chain_policy = @import("windows_chain_policy.zig");
+
+test "required Windows chain policy refuses raw keys and resumption" {
+    const testing = std.testing;
+    try testing.expectError(error.BadHandshake, Client.init(testing.allocator, .{
+        .server_name = "example.com",
+        .trust_anchors = &.{},
+        .windows_chain_policy = true,
+        .offer_raw_public_key = true,
+    }));
+    var client = try Client.init(testing.allocator, .{
+        .server_name = "example.com",
+        .trust_anchors = &.{},
+        .windows_chain_policy = true,
+    });
+    defer client.deinit();
+    try testing.expectError(error.BadState, client.setSessionTicket("invalid", 0));
+}
 
 const hkdf_tls13 = @import("hkdf_tls13.zig");
 const tls_resumption = @import("tls_resumption.zig");
@@ -158,6 +177,9 @@ pub const Options = struct {
     /// Exact DER certificates forbidden anywhere in the presented X.509 chain.
     /// Borrowed for the client's lifetime, including the outer slice.
     disallowed_certs: []const []const u8 = &.{},
+    /// Require Windows' native HTTPS chain and CTL policy after Zig verifies
+    /// the presented chain. Used only for daemon outbound HTTPS.
+    windows_chain_policy: bool = false,
     alpn_protocols: []const []const u8 = &.{},
     /// Current wall-clock time (Unix seconds) used to reject expired and
     /// not-yet-valid certificates in the chain. When null the validity window is
@@ -415,6 +437,7 @@ pub const Client = struct {
     server_name: []u8,
     trust_anchors: []const []const u8,
     disallowed_certs: []const []const u8,
+    windows_chain_policy: bool,
     alpn_protocols: []const []const u8,
     /// Owned copy of the caller-supplied CRL DER (see `Options.crl`), or null.
     crl: ?[]u8 = null,
@@ -667,6 +690,8 @@ pub const Client = struct {
 
     pub fn init(allocator: Allocator, options: Options) Error!Client {
         if (options.server_name.len == 0) return error.BadHandshake;
+        // Raw public keys carry no X.509 chain for the required native policy.
+        if (options.windows_chain_policy and options.offer_raw_public_key) return error.BadHandshake;
         if (options.receive_record_size_limit < tls_record.record_size_limit_min or options.receive_record_size_limit > tls_record.record_size_limit_max) return error.BadHandshake;
         var seed: [kx.X25519Kx.seed_len]u8 = undefined;
         try osEntropy(&seed);
@@ -704,6 +729,7 @@ pub const Client = struct {
             .receive_record_size_limit = options.receive_record_size_limit,
             .trust_anchors = anchors,
             .disallowed_certs = options.disallowed_certs,
+            .windows_chain_policy = options.windows_chain_policy,
             .alpn_protocols = alpn,
             .crl = crl_owned,
             .ech_config_list = ech_list_owned,
@@ -882,6 +908,8 @@ pub const Client = struct {
     /// A ticket older than its advertised lifetime, or older than the RFC 8446
     /// 7-day cap, is not offered and cannot carry early data.
     pub fn setSessionTicket(self: *Client, serialized: []const u8, ticket_age_ms: u64) Error!void {
+        // An abbreviated handshake does not present a chain to the native gate.
+        if (self.windows_chain_policy) return error.BadState;
         const decoded = try tls_resumption.decodeStoredSession(serialized);
         const suite = try CipherSuite.fromWire(decoded.suite);
         if (decoded.psk.len != suite.hashLen()) return error.BadSession;
@@ -2205,6 +2233,7 @@ pub const Client = struct {
         self.selected_suite = suite;
         self.psk_accepted = false;
         if (selected_psk) |idx| {
+            if (self.windows_chain_policy) return error.BadCertificate;
             if (idx != 0) return error.BadHandshake;
             const offer = self.resume_offer orelse return error.BadHandshake;
             if (offer.suite != suite or offer.psk_len != suite.hashLen()) return error.BadHandshake;
@@ -2414,8 +2443,12 @@ pub const Client = struct {
         if (count == 0) return error.EmptyCertificateChain;
         const chain = chain_buf[0..count];
         try rejectDisallowedCerts(chain, self.disallowed_certs);
-        if (!self.skip_cert_verify_for_test) {
+        if (!self.skip_cert_verify_for_test or self.windows_chain_policy) {
             try verifyChainToTrustAnchors(chain, self.trust_anchors, self.effectiveVerifyName(), self.verify_time);
+            if (self.windows_chain_policy) {
+                if (builtin.os.tag != .windows) return error.BadCertificate;
+                try windows_chain_policy.verify(chain, self.effectiveVerifyName());
+            }
         }
         {
             const leaf = try x509.parse(chain[0]);

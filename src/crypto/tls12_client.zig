@@ -11,6 +11,17 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const windows_chain_policy = @import("windows_chain_policy.zig");
+
+test "required Windows chain policy refuses TLS 1.2 resumption" {
+    var client = try Client.init(std.testing.allocator, .{
+        .server_name = "example.com",
+        .trust_anchors = &.{},
+        .windows_chain_policy = true,
+    });
+    defer client.deinit();
+    try std.testing.expectError(error.BadState, client.setSessionTicket("invalid"));
+}
 
 const tls12 = @import("tls12.zig");
 const tls_record = @import("tls_record.zig");
@@ -113,6 +124,9 @@ pub const Options = struct {
     /// Exact DER certificates forbidden anywhere in the presented X.509 chain.
     /// Borrowed for the client's lifetime, including the outer slice.
     disallowed_certs: []const []const u8 = &.{},
+    /// Require Windows' native HTTPS chain and CTL policy after Zig verifies
+    /// the presented chain. Used only for daemon outbound HTTPS.
+    windows_chain_policy: bool = false,
     alpn_protocols: []const []const u8 = &.{},
     now_unix_seconds: ?i64 = null,
     /// RFC 7627 Extended Master Secret policy. REQUIRED by default in this
@@ -174,6 +188,7 @@ pub const Client = struct {
     server_name: []u8,
     trust_anchors: []const []const u8,
     disallowed_certs: []const []const u8,
+    windows_chain_policy: bool,
     alpn_protocols: []const []const u8,
     now_unix_seconds: ?i64,
 
@@ -296,6 +311,7 @@ pub const Client = struct {
             .server_name = name,
             .trust_anchors = options.trust_anchors,
             .disallowed_certs = options.disallowed_certs,
+            .windows_chain_policy = options.windows_chain_policy,
             .alpn_protocols = options.alpn_protocols,
             .now_unix_seconds = options.now_unix_seconds,
             .require_ems = options.require_extended_master_secret,
@@ -526,6 +542,8 @@ pub const Client = struct {
     /// the next `start()` for an abbreviated handshake. Valid only before the
     /// handshake. Falls back to a full handshake if the server declines.
     pub fn setSessionTicket(self: *Client, serialized: []const u8) Error!void {
+        // An abbreviated handshake does not present a chain to the native gate.
+        if (self.windows_chain_policy) return error.BadState;
         if (self.state != .idle) return error.BadState;
         const decoded = try tls_resumption.decodeStoredSession(serialized);
         const suite = try tls12.CipherSuite.fromWire(decoded.suite);
@@ -789,6 +807,7 @@ pub const Client = struct {
     /// the recovered suite/master_secret and derive directional keys from the
     /// fresh server_random the server just sent.
     fn beginResumedHandshake(self: *Client) Error!void {
+        if (self.windows_chain_policy) return error.BadCertificate;
         const suite = self.selected_suite orelse return error.BadState;
         // RFC 7627 §5.3: this client only stores sessions that negotiated EMS
         // (see captureNewSessionTicket), so the abbreviated ServerHello MUST
@@ -938,8 +957,12 @@ pub const Client = struct {
         defer freeChain(self.allocator, chain);
         if (chain.len == 0) return error.EmptyCertificateChain;
         try rejectDisallowedCerts(chain, self.disallowed_certs);
-        if (!self.skip_cert_verify_for_test) {
+        if (!self.skip_cert_verify_for_test or self.windows_chain_policy) {
             try verifyChainToTrustAnchors(chain, self.trust_anchors, self.server_name, self.now_unix_seconds);
+            if (self.windows_chain_policy) {
+                if (builtin.os.tag != .windows) return error.BadCertificate;
+                try windows_chain_policy.verify(chain, self.server_name);
+            }
             try self.captureLeafRevocationInputs(chain);
         }
         const leaf = try x509_verify.linkInfo(chain[0]);

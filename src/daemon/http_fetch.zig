@@ -198,6 +198,9 @@ pub const Options = struct {
     /// Exact DER certificates that must never appear in the presented chain.
     /// Windows outbound HTTPS supplies its Disallowed store here.
     disallowed_certs: []const []const u8 = &.{},
+    /// Require the Windows native HTTPS chain and CTL policy in addition to
+    /// the Zig verifier. Production daemon HTTPS sets this with system roots.
+    windows_chain_policy: bool = false,
     /// Skip server-certificate verification (TLS transport only). Intended as a
     /// documented escape hatch for public read-only feeds when a usable system
     /// CA bundle is unavailable; off by default.
@@ -229,6 +232,7 @@ pub fn get(
     request_bytes: []const u8,
     opts: Options,
 ) Error![]u8 {
+    if (opts.windows_chain_policy and (!tls or opts.insecure_skip_verify)) return error.BadCertificate;
     const addr = try resolveHostA(endpointHost(host), port, opts.recv_timeout_ms);
     return getAtAddress(allocator, host, port, tls, request_bytes, addr, opts);
 }
@@ -246,6 +250,7 @@ pub fn getAtAddress(
     addr: net.IpAddress,
     opts: Options,
 ) Error![]u8 {
+    if (opts.windows_chain_policy and (!tls or opts.insecure_skip_verify)) return error.BadCertificate;
     const selected_port = switch (addr) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
@@ -404,6 +409,7 @@ fn getTls12(
         .server_name = host,
         .trust_anchors = opts.trust_anchors,
         .disallowed_certs = opts.disallowed_certs,
+        .windows_chain_policy = opts.windows_chain_policy,
         .alpn_protocols = &.{"http/1.1"},
         .now_unix_seconds = wallClockSeconds(),
         .crl = opts.crl,
@@ -482,6 +488,7 @@ fn getTls(
         .server_name = host,
         .trust_anchors = opts.trust_anchors,
         .disallowed_certs = opts.disallowed_certs,
+        .windows_chain_policy = opts.windows_chain_policy,
         .alpn_protocols = &.{"http/1.1"},
         .now_unix_seconds = wallClockSeconds(),
         .crl = opts.crl,
@@ -1433,6 +1440,30 @@ test "http_fetch Options default CT and CRL policy is fail-open" {
     try std.testing.expectEqual(@as(u8, 0), opts.require_sct);
     try std.testing.expect(opts.crl == null);
     try std.testing.expect(!opts.require_crl);
+    try std.testing.expect(!opts.windows_chain_policy);
+}
+
+test "http_fetch required Windows chain policy rejects insecure transport options" {
+    const addr = try net.IpAddress.parse("127.0.0.1", 443);
+    const options: Options = .{ .windows_chain_policy = true, .insecure_skip_verify = true };
+    try std.testing.expectError(error.BadCertificate, getAtAddress(
+        std.testing.allocator,
+        "example.com",
+        443,
+        true,
+        "GET / HTTP/1.1\r\n\r\n",
+        addr,
+        options,
+    ));
+    try std.testing.expectError(error.BadCertificate, getAtAddress(
+        std.testing.allocator,
+        "example.com",
+        443,
+        false,
+        "GET / HTTP/1.1\r\n\r\n",
+        addr,
+        .{ .windows_chain_policy = true },
+    ));
 }
 
 test "GAP-K6 CRL and CT callers pass DER and the fetch defaults stay fail-open" {

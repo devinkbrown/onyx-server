@@ -7478,6 +7478,7 @@ pub const LinuxServer = struct {
         };
         opts.trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{};
         opts.disallowed_certs = if (trust) |*store| store.disallowed() else &.{};
+        opts.windows_chain_policy = builtin.os.tag == .windows and trust != null;
         var attempt: u8 = 0;
         while (attempt < outbound_webhook_attempt_cap) : (attempt += 1) {
             self.outbound_webhook_attempts += 1;
@@ -27667,6 +27668,7 @@ pub const LinuxServer = struct {
             .max_response_bytes = unfurl.max_body,
             .trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{},
             .disallowed_certs = if (trust) |*store| store.disallowed() else &.{},
+            .windows_chain_policy = builtin.os.tag == .windows and trust != null,
         });
         defer self.allocator.free(raw);
         const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return dest[0..0];
@@ -53152,6 +53154,7 @@ pub const LinuxServer = struct {
             };
             opts.trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{};
             opts.disallowed_certs = if (trust) |*store| store.disallowed() else &.{};
+            opts.windows_chain_policy = builtin.os.tag == .windows and trust != null;
             self.outbound_webhook_attempts += 1;
             const response = http_fetch.postSignedAtAddress(self.allocator, parsed, body, signature, addr, opts) catch return;
             defer self.allocator.free(response);

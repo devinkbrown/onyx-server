@@ -459,10 +459,14 @@ Winsock connects to IPv4 and IPv6 targets, and focused loopback tests cover
 plaintext requests and a verified TLS request to a pinned IPv6 address.
 HTTPS webhooks and link previews verify peers against the native Windows ROOT
 certificate store and reject certificates present in Windows Disallowed; an
-unavailable or empty store stops delivery. Windows certificate trust lists are
-not yet enforced by this pure-Zig TLS client. This path uses Zig and Windows
-APIs without OpenSSL. Enterprise DNS policy and hosts-file variations have not
-had live acceptance tests. Socket IDs use generation-safe
+unavailable or empty store stops delivery. After Zig verifies the TLS chain,
+Windows also applies its SSL chain policy, including cached certificate trust
+lists and current system distrust. Chain construction uses cached objects only;
+it does not fetch CTLs, roots, or issuers during a handshake. Missing policy
+or failed chain checks stop delivery. This path uses Zig and Windows APIs
+without OpenSSL.
+Enterprise DNS policy and hosts-file variations have not had live acceptance
+tests. Socket IDs use generation-safe
 slot reuse, so a closed descriptor never becomes valid again. The 30-bit
 socket namespace and separate file-handle namespace each have a finite
 per-process lifetime. At half of either range, the daemon queues a
