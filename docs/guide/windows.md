@@ -364,7 +364,9 @@ and authenticated native UDP forwarding through a third active swap. Its
 `--active` mode keeps the same call, ICE peers, UDP sockets, and MAC-keyed native
 traffic across two consecutive active swaps. A configured native-media port
 with `[media].enabled = false` binds no UDP owner and requires no socket
-handoff. An
+handoff. The combined smoke holds an active WebTransport browser stream and an
+active native/WebRTC call in the same daemon through two swaps, checking the
+browser's exact deliveries and both media transports after each one. An
 opened loopback `history_https` listener transfers its listening socket when
 the candidate reproduces its complete TLS configuration; other runtime TLS
 settings cause a safe pre-COMMIT refusal. OroWasm plugin directories and media
@@ -423,6 +425,7 @@ python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --
 python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
+python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 ```
 
@@ -490,6 +493,7 @@ python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --
 python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
+python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 ```
 
