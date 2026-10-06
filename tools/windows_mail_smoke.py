@@ -76,7 +76,7 @@ def register_mail(binary, config, run_dir, log, tls_port, account):
         raise
 
 
-def wait_private_failure(proc, wal):
+def wait_private_failure(proc, wal, expected_errors):
     # A refused Winsock connect can consume the sender's full 15-second
     # timeout before the worker records its failure.
     end = time.monotonic() + 25
@@ -86,13 +86,13 @@ def wait_private_failure(proc, wal):
         try:
             data = wal.read_bytes()
             if (b"mailfail:1" in data and b"recipient@example.test" in data
-                    and (b"ConnectFailed" in data or b"ConnectTimeout" in data)):
+                    and any(name in data for name in expected_errors)):
                 return
         except OSError:
             pass
         time.sleep(0.1)
     entries = [(item.name, item.stat().st_size) for item in wal.parent.iterdir()]
-    raise TimeoutError(f"mail worker did not record a private SMTP connection failure; private entries={entries!r}")
+    raise TimeoutError(f"mail worker did not record the expected private SMTP failure {expected_errors!r}; private entries={entries!r}")
 
 
 def main():
@@ -116,15 +116,17 @@ def main():
         run_dir = Path(scratch)
         private = run_dir / "accounts-private"
         success_private = run_dir / "accounts-success-private"
+        rejected_private = run_dir / "accounts-rejected-private"
         broad = run_dir / "accounts-broad"
         create_private_directory(private)
         create_private_directory(success_private)
+        create_private_directory(rejected_private)
         broad.mkdir()
         config = run_dir / "mail.toml"
         broad_config = run_dir / "broad.toml"
         log = run_dir / "daemon.log"
         relay_log = run_dir / "relay.log"
-        irc_port, tls_port, success_port = reserve_ports(3)
+        irc_port, tls_port, success_port, reject_port = reserve_ports(4)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as closed_relay:
             closed_relay.bind(("127.0.0.1", 0))
             relay_port = closed_relay.getsockname()[1]
@@ -142,11 +144,13 @@ def main():
 
                 stage = "trusted STARTTLS delivery through live daemon"
                 cert = run_dir / "mail-cert.der"
+                alternate = run_dir / "mail-other.der"
                 with relay_log.open("w", encoding="utf-8") as relay_file:
-                    relay = subprocess.Popen([str(relay_binary), str(success_port), str(cert)],
+                    relay = subprocess.Popen([str(relay_binary), str(success_port), str(cert), str(alternate)],
                                              cwd=run_dir, stdout=relay_file,
                                              stderr=subprocess.STDOUT)
                 wait_cert(relay, cert)
+                wait_cert(relay, alternate)
                 write_config(config, irc_port, tls_port, success_port,
                              "accounts-success-private/accounts.wal", trust_store="mail-cert.der")
                 checked = run_cli(binary, run_dir, "--check-config", config)
@@ -165,10 +169,30 @@ def main():
                     stop(proc)
                     proc = None
 
+                stage = "wrong trust anchor refuses live STARTTLS delivery"
+                rejected_cert = run_dir / "mail-rejected-relay.der"
+                with relay_log.open("w", encoding="utf-8") as relay_file:
+                    relay = subprocess.Popen([str(relay_binary), str(reject_port), str(rejected_cert)],
+                                             cwd=run_dir, stdout=relay_file,
+                                             stderr=subprocess.STDOUT)
+                wait_cert(relay, rejected_cert)
+                write_config(config, irc_port, tls_port, reject_port,
+                             "accounts-rejected-private/accounts.wal", trust_store="mail-other.der")
+                proc = register_mail(binary, config, run_dir, log, tls_port, "rejectedacct")
+                try:
+                    wait_private_failure(proc, rejected_private / "mail-failures.wal", (b"UnknownCa",))
+                    if relay.wait(timeout=10) == 0:
+                        raise AssertionError("relay reported successful mail despite wrong trust anchor")
+                    relay = None
+                    print("PASS: live Windows mail refused a valid but untrusted relay certificate")
+                finally:
+                    stop(proc)
+                    proc = None
+
                 stage = "mail worker startup and failure journal"
                 write_config(config, irc_port, tls_port, relay_port, "accounts-private/accounts.wal")
                 proc = register_mail(binary, config, run_dir, log, tls_port, "mailacct")
-                wait_private_failure(proc, private / "mail-failures.wal")
+                wait_private_failure(proc, private / "mail-failures.wal", (b"ConnectFailed", b"ConnectTimeout"))
                 print("PASS: enabled Windows mail worker recorded a real SMTP connection failure in the private WAL")
                 return 0
             except Exception as exc:

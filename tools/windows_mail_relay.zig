@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! One-shot, loopback-only pure Zig STARTTLS relay for the live Windows mail smoke.
-//! Arguments: port, DER trust-anchor output path. No certificate key is written.
+//! Arguments: port, DER certificate output path, optional alternate anchor path.
+//! No certificate key is written.
 const std = @import("std");
 const onyx = @import("onyx_server");
 const metrics = onyx.daemon.metrics_http;
@@ -120,6 +121,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     const port_arg = args.next() orelse return error.InvalidArguments;
     const cert_path = args.next() orelse return error.InvalidArguments;
+    const alternate_path = args.next();
     if (args.next() != null) return error.InvalidArguments;
     const port = try std.fmt.parseInt(u16, port_arg, 10);
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x6d));
@@ -138,6 +140,20 @@ pub fn main(init: std.process.Init) !void {
     var listener = try metrics.MetricsServer.init(&snapshot, port);
     defer listener.shutdown();
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = cert_path, .data = cert });
+    if (alternate_path) |path| {
+        const other_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x6e));
+        var other_buffer: [2048]u8 = undefined;
+        const other = try selfsign.buildSelfSigned(&other_buffer, .{
+            .common_name = "127.0.0.1",
+            .not_before = 1_704_067_200,
+            .not_after = 4_102_444_800,
+            .serial = &.{ 0x6e, 1 },
+            .key_pair = other_pair,
+            .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+            .is_ca = true,
+        });
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = other });
+    }
     var reads = win.FdSet{ .count = 1, .sockets = undefined };
     reads.sockets[0] = listener.listen_fd;
     var timeout = win.Timeval{ .seconds = 30, .microseconds = 0 };

@@ -244,8 +244,9 @@ it from IRC, and verifies that a malformed configured plugin aborts boot.
 Mail delivery uses a Windows worker and a private failure journal beside the
 account WAL. The native smoke registers an account with an email address,
 observes the queued verification notice, delivers the message to a local pure
-Zig trusted STARTTLS relay, and verifies that a deliberately closed relay
-causes a durable failure row. Build the disposable relay with
+Zig trusted STARTTLS relay, refuses the same relay under a different valid
+trust anchor, and verifies that a deliberately closed relay causes a durable
+failure row. Build the disposable relay with
 `zig build windows-mail-relay`, then run `python -B tools/windows_mail_smoke.py`.
 The mail trust store accepts PEM certificate bundles or a DER certificate;
 the daemon owns decoded anchors through worker shutdown. A real remote SMTP
