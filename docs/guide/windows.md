@@ -179,9 +179,11 @@ already created at `$runDir`:
 
 ```powershell
 $accountDir = Join-Path $runDir 'accounts-private'
-python -B .\tools\windows_private_account_dir.py $accountDir
+& .\zig-out\bin\onyx-server.exe --init-private-dir $accountDir
 ```
 
+The command accepts an existing directory only if it already has the required
+private ACL. It rejects broad directories instead of changing their permissions.
 Set `account_db = "accounts-private/accounts.wal"` in the config and start the
 daemon from `$runDir`. Windows preflight rejects a broad account directory,
 before opening any account file. On boot, existing WAL and snapshot files are
@@ -192,7 +194,7 @@ directory private throughout the daemon's lifetime.
 
 When `[backup].dir` is configured, `[sasl].enabled` and `account_db` are
 required. Create the backup directory with
-`tools/windows_private_account_dir.py` as above. The daemon publishes a
+`onyx-server.exe --init-private-dir <path>` as above. The daemon publishes a
 private account snapshot followed by `latest.json`; each snapshot gets a
 random suffix so a later backup cannot replace an artifact named by an older
 manifest. `--restore-drill <backup-dir> --into <scratch-dir>` requires an
@@ -222,7 +224,7 @@ targets; focused native tests cover the pinned-address HTTPS request path.
 ACME renewal and the `acme-issue` command use native Windows HTTP-01 and
 HTTPS transports. Set `[tls].cert_path`, `[tls].key_path`, `[acme].domain`,
 and `[acme].ca_bundle_path` to a PEM trust bundle when enabling renewal.
-Create the key file's parent with `tools/windows_private_account_dir.py`;
+Create the key file's parent with `onyx-server.exe --init-private-dir <path>`;
 preflight refuses a broad parent directory or an unreadable trust bundle.
 OCSP stapling uses the same trust bundle and requires an on-disk TLS fullchain
 at `[tls].cert_path`. Native module tests cover the HTTP-01 listener, pinned
@@ -273,14 +275,31 @@ STUN binding success from the WebRTC listener, and verifies that a Cadence
 frame crosses the native listener with its directional MAC and exact payload.
 Focused native tests also cover UDP pump restart and idle/live continuity.
 
-The repository's `packaging/onyx-server.quickstart.toml` selects one shard,
-plaintext IRC and WebSocket, and an account store. Its `account_db =
-"accounts.db"` points to the current directory, so ordinary Windows checkouts
-with broad directory ACLs fail account preflight. To use it on Windows, create
-the private account directory above, copy the quickstart config into `$runDir`,
-and change the account path to `accounts-private/accounts.db`. The other
-quickstart settings pass config preflight. The quickstart is for local
-evaluation; configure TLS before sending account credentials across a network.
+The Windows quickstart template selects one shard, loopback-only plaintext IRC
+and WebSocket, and an account store in a private directory. From the repository
+root, after building the binary:
+
+```powershell
+$serverExe = (Resolve-Path .\zig-out\bin\onyx-server.exe).Path
+$template = (Resolve-Path .\packaging\onyx-server.windows.quickstart.toml).Path
+$runDir = Join-Path $env:TEMP 'onyx-server-quickstart'
+New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+Copy-Item $template (Join-Path $runDir 'onyx-server.toml')
+Push-Location $runDir
+try {
+    & $serverExe --init-private-dir accounts-private
+    & $serverExe --check-config .\onyx-server.toml
+    & $serverExe .\onyx-server.toml
+} finally {
+    Pop-Location
+}
+```
+
+Connect locally at `irc://127.0.0.1:6667` or `ws://127.0.0.1:8080`.
+The quickstart is for local evaluation; configure TLS before sending account
+credentials across a network. The native acceptance check is
+`python -B tools/windows_quickstart_smoke.py` and uses Python only as a test
+harness. The Linux quickstart remains `packaging/onyx-server.quickstart.toml`.
 Windows does not provide Linux systemd packaging or the POSIX `USR2` upgrade
 signal. Use the operator `UPGRADE` command for its guarded native process
 handoff.

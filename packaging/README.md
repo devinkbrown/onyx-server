@@ -86,6 +86,14 @@ The node's **sovereign identity key** (`onyx-server-node.key`) and the account s
 (`accounts.db`) are generated in the working directory on first run — nothing to
 configure for local evaluation. For production, see [Production TLS card](#production-tls-card).
 
+## Quickstart (Windows)
+
+Use `onyx-server.windows.quickstart.toml` on Windows. Its account store lives in
+`accounts-private`, which must be created with the daemon's native
+`--init-private-dir` command before config preflight. The template binds IRC and
+WebSocket to loopback only. See the [Windows guide](../docs/guide/windows.md)
+for the PowerShell setup and native acceptance check.
+
 ## Quickstart (Docker)
 
 ```sh

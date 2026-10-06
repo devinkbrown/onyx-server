@@ -1,0 +1,29 @@
+# Onyx Server local Windows quickstart. Bind plaintext listeners to loopback.
+# Before starting, run: onyx-server.exe --init-private-dir accounts-private
+# Run the daemon from this config's directory so the relative account path
+# and generated node key stay beside it. Configure TLS for network clients.
+
+[node]
+id = 1
+
+[network]
+name = "Onyx"
+server_name = "localhost"
+description = "A self-hosted Onyx node."
+
+[listen]
+host = "127.0.0.1"
+irc = 6667
+ws = 8080
+ws_plain = true
+
+[sasl]
+enabled = true
+realm = "Onyx"
+account_db = "accounts-private/accounts.db"
+
+[limits]
+num_shards = 1
+
+[motd]
+text = "Welcome to Onyx, {nick}."

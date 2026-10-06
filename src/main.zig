@@ -825,6 +825,20 @@ fn installOpenBsdSandbox(
     resolver_ctx.record_paths = false;
 }
 
+fn initPrivateDirectoryWindows(io: std.Io, path: []const u8) !void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    if (path.len == 0 or std.fs.path.isSep(path[path.len - 1])) return error.InvalidPath;
+    const parent_path = std.fs.path.dirname(path) orelse ".";
+    const name = std.fs.path.basename(path);
+    const parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{ .follow_symlinks = false });
+    defer parent.close(io);
+    const private = onyx_server.daemon.os_runtime.createPrivateDirectoryWindows(parent, name) catch |err| switch (err) {
+        error.PathAlreadyExists => try onyx_server.daemon.os_runtime.openPrivateDirectoryWindows(io, parent, name),
+        else => return err,
+    };
+    private.close(io);
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -1075,6 +1089,25 @@ pub fn main(init: std.process.Init) !void {
             defer result.deinit(allocator);
             std.debug.print("{s}", .{result.lines});
             if (result.failed) std.process.exit(1);
+            return;
+        } else
+        // Create the final owner-only, inheritable DACL at publication time.
+        // Reruns accept an existing directory only after the same object-level
+        // privacy check used by the account store. Never repair a broad ACL.
+        if (std.mem.eql(u8, first, "--init-private-dir")) {
+            const path = args.next() orelse {
+                std.debug.print("usage: onyx-server --init-private-dir <path>\n", .{});
+                std.process.exit(2);
+            };
+            if (args.next() != null) {
+                std.debug.print("usage: onyx-server --init-private-dir <path>\n", .{});
+                std.process.exit(2);
+            }
+            initPrivateDirectoryWindows(init.io, path) catch |err| {
+                std.debug.print("private directory ERROR for {s}: {s}\n", .{ path, @errorName(err) });
+                std.process.exit(1);
+            };
+            std.debug.print("private directory ready: {s}\n", .{path});
             return;
         } else
         // `onyx-server --check-config <path> [--against <running.toml>]` parses a
@@ -1337,6 +1370,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print(
                 \\usage: onyx-server [CONFIG_PATH]
                 \\       onyx-server --check-config <path>
+                \\       onyx-server --init-private-dir <path>  (Windows)
                 \\       {s}
                 \\       onyx-server doctor <config> [metrics-url]
                 \\       onyx-server --version
