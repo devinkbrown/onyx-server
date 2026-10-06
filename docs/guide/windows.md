@@ -346,6 +346,10 @@ then installs it in the existing guard without allocating or changing its
 address. Previously consumed TLS 1.2 tickets and TLS 1.3 early-data binders
 remain consumed across sequential swaps. A missing or malformed mandatory
 checkpoint aborts adoption.
+The OpenSSL-driven early-data smoke sends IRC registration and PING only in
+0-RTT, then replays the identical ClientHello and early records across a swap.
+It checks rejection, usable 1-RTT fallback, and fresh-binder acceptance on
+both successors.
 
 The guarded path carries Web Push worker state, mail queue and private journal
 custody, Geo worker cache and pinned GeoIP/ASN databases, channel statistics,
@@ -437,6 +441,7 @@ python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-n
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --early-data
+python -B .\tools\windows_helix_early_data_smoke.py .\zig-out\bin\onyx-server.exe --exact-replay
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption-tls12
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative rotation
@@ -513,6 +518,7 @@ python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-n
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --early-data
+python -B .\tools\windows_helix_early_data_smoke.py .\zig-out\bin\onyx-server.exe --exact-replay
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption-tls12
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative rotation
