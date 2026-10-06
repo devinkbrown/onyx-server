@@ -2313,9 +2313,6 @@ pub const Config = struct {
     windows_helix_explicit_node_secret: bool = false,
     /// A per-boot cloak key would change accepted host masks at handoff.
     windows_helix_explicit_cloak_secret: bool = false,
-    /// External trust/key material consulted by background companions is not
-    /// part of the current exact native handoff transcript.
-    windows_helix_external_companions_safe: bool = false,
     /// Authenticated decrypted arena, borrowed from the native process owner.
     /// It stays in memory and never passes through Linux memfd readArena.
     native_arena_bytes: ?[]const u8 = null,
@@ -30341,8 +30338,7 @@ pub const LinuxServer = struct {
             const exe_target = self.config.exe_path orelse return error.NativeUpgradeUnavailable;
             if (!self.windows_helix_source_valid.load(.acquire) or self.config.windows_helix_source_digest == null or
                 self.config.config_path == null or !self.config.windows_helix_explicit_node_secret or
-                !self.config.windows_helix_explicit_cloak_secret or
-                !self.config.windows_helix_external_companions_safe)
+                !self.config.windows_helix_explicit_cloak_secret)
             {
                 self.deferredUpgradeNotice(request, "UPGRADE refused: Windows config or external material has no exact source proof");
                 return error.NativeUpgradeUnavailable;

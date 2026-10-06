@@ -362,8 +362,9 @@ and publishes them after the adoption commit. The default media smoke holds
 TLS clients through two pristine swaps, establishes a call, then verifies ICE
 and authenticated native UDP forwarding through a third active swap. Its
 `--active` mode keeps the same call, ICE peers, UDP sockets, and MAC-keyed native
-traffic across two consecutive active swaps. A standalone native-media port
-without `[media]` still blocks the handoff. An
+traffic across two consecutive active swaps. A configured native-media port
+with `[media].enabled = false` binds no UDP owner and requires no socket
+handoff. An
 opened loopback `history_https` listener transfers its listening socket when
 the candidate reproduces its complete TLS configuration; other runtime TLS
 settings cause a safe pre-COMMIT refusal. OroWasm plugin directories and media
@@ -394,6 +395,7 @@ python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
 python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe
@@ -462,6 +464,7 @@ python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
 python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe

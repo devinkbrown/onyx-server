@@ -182,6 +182,8 @@ def abuse_value(oper: Client, nick: bytes, field: bytes) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--inert-native-port", action="store_true",
+                        help="configure a native-media port while media stays disabled")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("this fixture requires native Windows")
@@ -199,6 +201,8 @@ def main() -> int:
         chanstats_dir.mkdir()
         config = root / "server.toml"
         port = free_port()
+        native_port = free_port() if args.inert_native_port else None
+        native_line = f"native_media = {native_port}\n" if native_port is not None else ""
         password = secrets.token_urlsafe(22)
         config.write_text(
             "[node]\nid = 1\nsecret_key = \"" + secrets.token_hex(32) + "\"\n"
@@ -209,7 +213,7 @@ def main() -> int:
             "[mesh]\npass = \"" + secrets.token_urlsafe(32) + "\"\n"
             "[dnsbl]\nenabled = true\nzones = [\"dnsbl.invalid\"]\n"
             f"[stats]\nchannel_dir = \"{chanstats_dir.as_posix()}\"\ninterval = \"10m\"\n"
-            f"[listen]\nirc = {port}\n"
+            f"[listen]\nirc = {port}\n{native_line}"
             f"[sasl]\naccount_db = \"{(private / 'accounts.wal').as_posix()}\"\n"
             "[[oper_groups]]\nname = \"netadmin\"\nprivileges = [\"server_restart\", \"server_admin\", \"client_moderate\", \"service_admin\"]\n"
             "[[opers]]\naccount = \"helixadmin\"\nclass = \"netadmin\"\n",

@@ -1414,23 +1414,9 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.num_shards = loaded.num_shards;
                 srv_cfg.config_path = path;
                 srv_cfg.config_resolver = resolver;
-                if (comptime builtin.os.tag == .windows) {
-                    // stats_web_dir only selects reactor-0 derived file output;
-                    // it has no process-owned state or socket to hand off.
-                    // Connection throttle, mesh clone occupancy, DNSBL, and
-                    // live channel statistics, mail, ACME, OCSP, Web Push,
-                    // Geo, and serving TLS material have mandatory checkpoints.
-                    // GeoIP/ASN databases are pinned from preflight and bound to
-                    // the exact source/candidate effective config proof.
-                    // Configured media carries the exact pristine or active
-                    // Domain and both UDP owners at its World-locked cut. A
-                    // standalone native-media port without that graph has no
-                    // matching custody path.
-                    srv_cfg.windows_helix_external_companions_safe =
-                        loaded.config.media_enabled or loaded.config.native_media_port == 0;
-                    if (windows_transfer != null and !srv_cfg.windows_helix_external_companions_safe)
-                        windows_driver.candidateAbortNow();
-                }
+                // Windows pins every live companion to the effective config
+                // proof and carries its process-owned state. A configured
+                // native-media port has no socket when media is disabled.
                 std.debug.print("onyx-server: loaded config from {s}\n", .{path});
             } else |err| {
                 std.debug.print("onyx-server: fatal config error in {s} ({s})\n", .{ path, @errorName(err) });
