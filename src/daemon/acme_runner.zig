@@ -501,8 +501,13 @@ pub const SystemResolver = struct {
         // Windows DNS Client resolution applies the host's configured name
         // service policy. Web Push validates this one result and then connects
         // to that exact IP, so no second lookup can bypass its SSRF guard.
-        if (comptime builtin.os.tag == .windows)
-            return @import("http_fetch.zig").resolveHostA(host, port, 3000);
+        if (comptime builtin.os.tag == .windows) {
+            const fetch = @import("http_fetch.zig");
+            return fetch.resolveHostA(host, port, 3000) catch |err| switch (err) {
+                error.HostNotFound => try fetch.resolveHostAAAA(host, port, 3000),
+                else => return err,
+            };
+        }
         return systemResolveA(self.allocator, self.io, host, port, self.resolv_conf_max_bytes, self.dns_port);
     }
 };

@@ -54,6 +54,13 @@ const win = struct {
         addr: [4]u8,
         zero: [8]u8 = @splat(0),
     };
+    const SockAddr6 = extern struct {
+        family: u16,
+        port: u16,
+        flowinfo: u32 = 0,
+        addr: [16]u8,
+        scope_id: u32 = 0,
+    };
     const FdSet = extern struct {
         count: u32,
         sockets: [64]usize,
@@ -82,7 +89,7 @@ const win = struct {
         next: ?*AddrInfoExW = null,
     };
     comptime {
-        if (@sizeOf(SockAddr4) != 16 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8 or
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(SockAddr6) != 28 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8 or
             @sizeOf(Overlapped) != 32 or @sizeOf(AddrInfoExW) != 72)
             @compileError("Windows HTTP socket ABI shape changed");
     }
@@ -93,7 +100,10 @@ const win = struct {
     extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
     extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
     extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
-    extern "ws2_32" fn connect(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *anyopaque, address_len: *i32) callconv(.winapi) i32;
     extern "ws2_32" fn accept(socket: usize, address: ?*anyopaque, address_len: ?*i32) callconv(.winapi) usize;
     extern "ws2_32" fn select(ignored_nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
     extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
@@ -803,17 +813,26 @@ fn connectAddr(addr: net.IpAddress, timeout_ms: u31) Error!Socket {
 
 fn connectAddrWindows(addr: net.IpAddress, timeout_ms: u31) Error!Socket {
     if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
-    const a4 = switch (addr) {
-        .ip4 => |value| value,
-        .ip6 => return error.ConnectFailed,
+    const family: i32 = switch (addr) {
+        .ip4 => win.af_inet,
+        .ip6 => win.af_inet6,
     };
-    const fd = win.WSASocketW(win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    const fd = win.WSASocketW(family, win.sock_stream, win.ipproto_tcp, null, 0, 1);
     if (fd == win.invalid_socket) return error.SocketUnavailable;
     errdefer _ = win.closesocket(fd);
     var nonblocking: u32 = 1;
     if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
-    const sa = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, a4.port), .addr = a4.bytes };
-    if (win.connect(fd, &sa, @sizeOf(win.SockAddr4)) != 0) {
+    const connected = switch (addr) {
+        .ip4 => |a4| blk: {
+            const sa = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, a4.port), .addr = a4.bytes };
+            break :blk win.connect(fd, &sa, @sizeOf(win.SockAddr4));
+        },
+        .ip6 => |a6| blk: {
+            const sa = win.SockAddr6{ .family = win.af_inet6, .port = std.mem.nativeToBig(u16, a6.port), .addr = a6.bytes, .scope_id = a6.interface.index };
+            break :blk win.connect(fd, &sa, @sizeOf(win.SockAddr6));
+        },
+    };
+    if (connected != 0) {
         const err = win.WSAGetLastError();
         if (err != win.would_block and err != win.in_progress and err != win.already) return error.ConnectFailed;
         if (!try windowsWaitWritable(fd, @max(1, @min(timeout_ms, 60_000)))) return error.ConnectTimeout;
@@ -1074,6 +1093,67 @@ test "http_fetch Windows plaintext loopback timeout and response limit" {
     try std.testing.expectError(error.ConnectFailed, getAtAddress(a, "onyx-address-pin.invalid.", server.port - 1, false, request, pinned, .{}));
 }
 
+test "http_fetch Windows IPv6 pinned and literal loopback HTTP" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var startup: [408]u8 align(8) = @splat(0);
+    if (win.WSAStartup(0x0202, &startup) != 0) return error.TestUnexpectedResult;
+    defer _ = win.WSACleanup();
+    const listener = win.WSASocketW(win.af_inet6, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    if (listener == win.invalid_socket) return error.TestUnexpectedResult;
+    defer _ = win.closesocket(listener);
+    var address = win.SockAddr6{ .family = win.af_inet6, .port = 0, .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    if (win.bind(listener, &address, @sizeOf(win.SockAddr6)) != 0 or win.listen(listener, 2) != 0)
+        return error.TestUnexpectedResult;
+    var address_len: i32 = @sizeOf(win.SockAddr6);
+    if (win.getsockname(listener, &address, &address_len) != 0 or address_len != @sizeOf(win.SockAddr6))
+        return error.TestUnexpectedResult;
+    const port = std.mem.bigToNative(u16, address.port);
+    const Worker = struct {
+        listener: usize,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn serve(self: *@This()) !void {
+            for (0..2) |_| {
+                var reads = win.FdSet{ .count = 1, .sockets = undefined };
+                reads.sockets[0] = self.listener;
+                var timeout = win.Timeval{ .seconds = 3, .microseconds = 0 };
+                if (win.select(0, &reads, null, null, &timeout) != 1) return error.TestUnexpectedResult;
+                const client = win.accept(self.listener, null, null);
+                if (client == win.invalid_socket) return error.TestUnexpectedResult;
+                {
+                    defer _ = win.closesocket(client);
+                    try setRecvTimeout(client, 2000);
+                    var request: [512]u8 = undefined;
+                    const size = try readSome(client, &request);
+                    if (!std.mem.startsWith(u8, request[0..size], "GET /ipv6 HTTP/1.1\r\n")) return error.TestUnexpectedResult;
+                    try writeAll(client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+                }
+            }
+        }
+    };
+    var worker = Worker{ .listener = listener };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) thread.join();
+    const request = "GET /ipv6 HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n";
+    const pinned = try net.IpAddress.parse("::1", port);
+    const first = try getAtAddress(std.testing.allocator, "localhost", port, false, request, pinned, .{});
+    defer std.testing.allocator.free(first);
+    try std.testing.expect(std.mem.endsWith(u8, first, "\r\n\r\nOK"));
+    const second = try get(std.testing.allocator, "::1", port, false, request, .{});
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(std.mem.endsWith(u8, second, "\r\n\r\nOK"));
+    thread.join();
+    joined = true;
+    if (worker.failure) |err| return err;
+}
+
 test "http_fetch Windows HTTPS loopback verifies trusted anchor and rejects untrusted anchor" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const metrics = @import("metrics_http.zig");
@@ -1202,6 +1282,43 @@ test "http_fetch Windows HTTPS loopback verifies trusted anchor and rejects untr
     if (untrusted_worker.failure) |err| return err;
     try std.testing.expectError(error.UnknownCa, untrusted);
     try std.testing.expect(untrusted_worker.alert_seen and !untrusted_worker.request_seen and !untrusted_worker.fallback_seen);
+
+    // A pinned IPv6 connection must keep the hostname for SNI and certificate
+    // verification, exactly as the IPv4 path does.
+    const listener6 = win.WSASocketW(win.af_inet6, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    if (listener6 == win.invalid_socket) return error.TestUnexpectedResult;
+    defer _ = win.closesocket(listener6);
+    var address6 = win.SockAddr6{ .family = win.af_inet6, .port = 0, .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    if (win.bind(listener6, &address6, @sizeOf(win.SockAddr6)) != 0 or win.listen(listener6, 1) != 0)
+        return error.TestUnexpectedResult;
+    var address6_len: i32 = @sizeOf(win.SockAddr6);
+    if (win.getsockname(listener6, &address6, &address6_len) != 0 or address6_len != @sizeOf(win.SockAddr6))
+        return error.TestUnexpectedResult;
+    const port6 = std.mem.bigToNative(u16, address6.port);
+    var cert_buffer6: [2048]u8 = undefined;
+    const cert6 = try selfsign.buildSelfSigned(&cert_buffer6, .{
+        .common_name = "localhost",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x67, 6 },
+        .key_pair = kp,
+        .dns_names = &.{"localhost"},
+        .is_ca = true,
+    });
+    const chain6 = [_][]const u8{cert6};
+    var ipv6_worker = Worker{ .listener = listener6, .chain = &chain6, .key_pair = kp, .expect_http = true };
+    const ipv6_thread = try std.Thread.spawn(.{}, Worker.run, .{&ipv6_worker});
+    var ipv6_joined = false;
+    defer if (!ipv6_joined) ipv6_thread.join();
+    const pinned6 = try net.IpAddress.parse("::1", port6);
+    const request6 = "GET /trusted HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    const ipv6_response = getAtAddress(a, "localhost", port6, true, request6, pinned6, .{ .trust_anchors = &chain6, .recv_timeout_ms = 2000 });
+    defer if (ipv6_response) |response| a.free(response) else |_| {};
+    ipv6_thread.join();
+    ipv6_joined = true;
+    if (ipv6_worker.failure) |err| return err;
+    try std.testing.expect(ipv6_worker.request_seen);
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK", try ipv6_response);
 }
 
 test "parseUrl splits scheme/host/port/path with defaults" {

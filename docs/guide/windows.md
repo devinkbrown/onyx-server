@@ -450,8 +450,13 @@ MESSAGE_V2 authority, or accepted Web Push overflow delivery blocks the
 handoff until it settles. An open multiline batch defers the handoff until it
 closes.
 
-Windows outbound HTTP hostname lookup now uses `GetAddrInfoExW`, but enterprise
-DNS policy and hosts-file variations have not had live acceptance tests. Socket
+Windows outbound HTTP hostname lookup uses `GetAddrInfoExW`. The guarded Web
+Push resolver and ACME resolver fall back from an absent A answer to AAAA;
+other HTTP callers keep A-only resolution until their address checks can pin the
+selected result. Native Winsock connects to IPv4 and IPv6 targets, and focused
+loopback tests cover plaintext requests and a verified TLS request to a pinned
+IPv6 address. Enterprise DNS policy and hosts-file variations have not had live
+acceptance tests. Socket
 IDs use generation-safe slot reuse, so a closed descriptor never becomes valid
 again. The 30-bit socket namespace and the separate file-handle namespace each
 have a finite per-process lifetime. At half of either range, the daemon queues
