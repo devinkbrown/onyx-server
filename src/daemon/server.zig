@@ -200,6 +200,8 @@ const native_windows_geo = @import("helix/native_windows_geo.zig");
 const native_windows_mail = @import("helix/native_windows_mail.zig");
 const native_windows_acme = @import("helix/native_windows_acme.zig");
 const native_windows_tls_material = @import("helix/native_windows_tls_material.zig");
+const native_windows_tls_replay = @import("helix/native_windows_tls_replay.zig");
+const native_windows_history_material = @import("helix/native_windows_history_material.zig");
 const native_windows_tls_proof = @import("helix/native_windows_tls_proof.zig");
 const native_windows_wasm = @import("helix/native_windows_wasm.zig");
 const policy_checkpoint = @import("helix/policy_checkpoint.zig");
@@ -7652,12 +7654,21 @@ pub const LinuxServer = struct {
         return self.history_https.?.port;
     }
 
+    fn historyTlsReplayCustodyValid(self: *LinuxServer, tls_config: tls_server.Config) bool {
+        const replay_required = tls_config.enable_session_tickets or tls_config.max_early_data_size != 0;
+        return if (replay_required)
+            self.config.tls_enable_resumption and tls_config.replay_guard == &self.tls_replay_guard
+        else
+            tls_config.replay_guard == null;
+    }
+
     /// Build the Windows successor's history HTTPS owner at its final Server
     /// address. HXHH authenticates the loopback endpoint and TLS policy before
     /// this one-use socket import; the worker stays parked until COMMIT.
     pub fn stageWindowsInheritedHistory(self: *LinuxServer, transfer: *helix_native_windows_socket.Transfer, carry: *const history_http.Snapshot, tls_config: tls_server.Config, io: std.Io) !void {
         if (comptime builtin.os.tag != .windows) return error.Unsupported;
         if (self.history_https != null) return error.InvalidRuntime;
+        if (!self.historyTlsReplayCustodyValid(tls_config)) return error.InvalidInheritedHandoff;
         const configured = if (carry.listener.family == 23) "::1" else "127.0.0.1";
         self.history_https = try history_http.HttpsListener.initTransferred(
             self.allocator,
@@ -29940,6 +29951,48 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    fn sealTlsReplayUpgradeCheckpoint(
+        allocator: std.mem.Allocator,
+        guard: *tls_resumption.ReplayGuard,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+    ) ![]u8 {
+        const wire = try native_windows_tls_replay.encodeSnapshot(allocator, guard);
+        errdefer {
+            std.crypto.secureZero(u8, wire);
+            allocator.free(wire);
+        }
+        try pieces.append(allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = wire,
+            .min_supported = 2,
+        });
+        return wire;
+    }
+
+    fn stageTlsReplayUpgradeCheckpoint(
+        allocator: std.mem.Allocator,
+        resumption_enabled: bool,
+        caps: []const helix_capsule.Capsule,
+    ) !?native_windows_tls_replay.Owned {
+        const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+        var replacement: ?native_windows_tls_replay.Owned = null;
+        errdefer if (replacement) |*owned| owned.deinit();
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint or c.fields.len == 0 or
+                !native_windows_tls_replay.isCheckpoint(c.fields[0].bytes)) continue;
+            if (!resumption_enabled or replacement != null or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+                return error.InvalidInheritedHandoff;
+            replacement = try native_windows_tls_replay.decodeOwned(allocator, c.fields[0].bytes);
+        }
+        if (resumption_enabled and replacement == null) return error.InvalidInheritedHandoff;
+        return replacement;
+    }
+
     fn sealMeshRedialUpgradeHint(
         allocator: std.mem.Allocator,
         hint: mesh_redial.Peer,
@@ -30402,21 +30455,6 @@ pub const LinuxServer = struct {
             return self.performUpgradeAfterCompatibleTarget(request, -1, exe_target);
         }
         if (comptime builtin.os.tag == .windows) {
-            // The ticket keys survive Helix, but the shared replay guard does
-            // not. Its loss could admit accepted TLS 1.3 early data again or
-            // reuse a consumed TLS 1.2 ticket, so refuse before launch. REHASH
-            // publishes the TLS 1.2 chain under World; take the same lock for
-            // this preflight read, then recheck at the later frozen-state cut.
-            self.world.lockRead();
-            const tls_replay_continuity_blocked = self.config.tls_enable_resumption and
-                (self.config.tls_early_data_max_size != 0 or self.config.tls12_cert_chain.len != 0);
-            self.world.unlockRead();
-            if (tls_replay_continuity_blocked) {
-                const reason = "UPGRADE refused: Windows TLS replay guard has no exact Helix checkpoint";
-                srvLog("onyx-server: {s}\n", .{reason});
-                self.deferredUpgradeNotice(request, reason);
-                return error.TlsReplayContinuityUnsupported;
-            }
             const hooks = self.config.native_upgrade_hooks orelse return error.NativeUpgradeUnavailable;
             const exe_target = switch (request) {
                 .client_target => |target| target.executable,
@@ -30857,12 +30895,6 @@ pub const LinuxServer = struct {
                 self.deferredUpgradeNotice(request, "UPGRADE refused: Windows source proof changed before the handoff cut");
                 return error.NativeUpgradeUnavailable;
             }
-            if (self.config.tls_enable_resumption and
-                (self.config.tls_early_data_max_size != 0 or self.config.tls12_cert_chain.len != 0))
-            {
-                self.deferredUpgradeNotice(request, "UPGRADE refused: Windows TLS replay guard has no exact checkpoint at the handoff cut");
-                return error.TlsReplayContinuityUnsupported;
-            }
         }
 
         if (self.upgradeContinuityBlockerLocked()) |blocker| {
@@ -30991,6 +31023,14 @@ pub const LinuxServer = struct {
         defer if (windows_acme_wire) |wire| self.allocator.free(wire);
         var windows_tls_material_wire: ?[]u8 = null;
         defer if (windows_tls_material_wire) |wire| native_windows_tls_material.freeEncoded(self.allocator, wire);
+        var windows_tls_replay_wire: ?[]u8 = null;
+        defer if (windows_tls_replay_wire) |wire| {
+            std.crypto.secureZero(u8, wire);
+            self.allocator.free(wire);
+        };
+        var windows_history_material_wire: ?[]u8 = null;
+        defer if (windows_history_material_wire) |wire|
+            native_windows_history_material.freeEncoded(self.allocator, wire);
         var windows_wasm_wire: ?[]u8 = null;
         defer if (windows_wasm_wire) |wire| native_windows_wasm.freeEncoded(self.allocator, wire);
         var windows_account_wire: ?[]u8 = null;
@@ -31400,6 +31440,23 @@ pub const LinuxServer = struct {
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete TLS ticket-key seal") catch {};
             return error.SessionReplicaConverging;
         }
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.tls_enable_resumption) {
+                // Every TLS owner is paused at the World-locked handoff cut.
+                // Ticket keys and the exact shared replay ring are one logical
+                // authority: never let a candidate inherit one without both.
+                const wire = sealTlsReplayUpgradeCheckpoint(
+                    self.allocator,
+                    &self.tls_replay_guard,
+                    &pieces,
+                ) catch |err| {
+                    self.deferredUpgradeNotice(request, "UPGRADE refused: TLS replay history could not be sealed exactly");
+                    srvLog("onyx-server: UPGRADE TLS replay checkpoint seal failed ({s})\n", .{@errorName(err)});
+                    return error.SessionReplicaConverging;
+                };
+                windows_tls_replay_wire = wire;
+            }
+        }
         const replica_now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
         const replica_checkpoint = self.session_replica_store.encodeUpgradeCheckpoint(self.allocator, replica_now_wall) catch {
             self.deferredUpgradeNotice(request, "UPGRADE refused: signed session replica authority could not be sealed completely");
@@ -31511,7 +31568,23 @@ pub const LinuxServer = struct {
                 }
                 if (self.history_https) |*owner| {
                     const token = windows_history_pause orelse return error.InvalidRuntime;
+                    if (!self.historyTlsReplayCustodyValid(owner.tls_config))
+                        return error.InvalidRuntime;
                     windows_history_snapshot = try owner.capturePaused(token);
+                    // HXHL is the pinned history listener's certificate/key and
+                    // staple, which can lag the Server generation after ACME or
+                    // REHASH. Seal it at the same paused World cut as HXHH.
+                    const wire = native_windows_history_material.encodeSnapshot(self.allocator, owner.tls_config) catch |err| {
+                        srvLog("onyx-server: UPGRADE history TLS material seal failed ({s})\n", .{@errorName(err)});
+                        self.deferredUpgradeNotice(request, "UPGRADE refused: history HTTPS TLS material could not be sealed exactly");
+                        return error.SessionReplicaConverging;
+                    };
+                    windows_history_material_wire = wire;
+                    pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = wire, .min_supported = 2 }) catch |err| {
+                        srvLog("onyx-server: UPGRADE history TLS material plan failed ({s})\n", .{@errorName(err)});
+                        self.deferredUpgradeNotice(request, "UPGRADE refused: history HTTPS TLS material could not enter the state plan");
+                        return error.SessionReplicaConverging;
+                    };
                     windows_history_carry = .{ .owner = owner, .carry = &windows_history_snapshot.?, .pause_token = token };
                 }
                 if (self.windows_webtransport_owner) |owner| {
@@ -32128,6 +32201,27 @@ pub const LinuxServer = struct {
             self.abandonInheritedSessionState(caps, arena_fd, reason);
             return error.InvalidInheritedHandoff;
         };
+        if (relations.tls_replay != @as(usize, @intFromBool(builtin.os.tag == .windows and self.config.tls_enable_resumption))) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows TLS replay authority");
+            return error.InvalidInheritedHandoff;
+        }
+        if (relations.history_material != @as(usize, @intFromBool(builtin.os.tag == .windows and self.history_https != null))) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows history HTTPS TLS material");
+            return error.InvalidInheritedHandoff;
+        }
+        var tls_replay_replacement: ?native_windows_tls_replay.Owned = null;
+        defer if (tls_replay_replacement) |*replacement| replacement.deinit();
+        if (comptime builtin.os.tag == .windows) {
+            tls_replay_replacement = stageTlsReplayUpgradeCheckpoint(
+                self.allocator,
+                self.config.tls_enable_resumption,
+                caps,
+            ) catch |err| {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows TLS replay checkpoint");
+                srvLog("onyx-server: Windows TLS replay stage failed ({s})\n", .{@errorName(err)});
+                return error.InvalidInheritedHandoff;
+            };
+        }
         var throttle_replacement: ?clone_detect_mod.CloneDetector = null;
         defer if (throttle_replacement) |*replacement| replacement.deinit();
         var mesh_clones_replacement: ?mesh_clones_mod.MeshClones = null;
@@ -34385,6 +34479,13 @@ pub const LinuxServer = struct {
         // client/session restore, redial append, and preserved-link rebuild has
         // completed. The boot stores displaced by swaps remain owned by the
         // replacement values and are destroyed by the existing defers.
+        if (comptime builtin.os.tag == .windows) {
+            if (tls_replay_replacement) |*replacement| {
+                // TLS configs borrow this exact address. Install the fully
+                // decoded ring in place only after authenticated COMMIT.
+                replacement.install(&self.tls_replay_guard);
+            }
+        }
         std.mem.swap(
             event_spine_replay_guard.Guard,
             &self.event_spine_replay_guard,
@@ -72464,6 +72565,24 @@ fn appendCurrentMandatoryUpgradeStateForTest(
         pieces,
         blobs,
     )) return error.TlsTicketKeySealFailed;
+    if (comptime builtin.os.tag == .windows) {
+        if (server.config.tls_enable_resumption) {
+            const wire = try native_windows_tls_replay.encodeSnapshot(
+                server.allocator,
+                &server.tls_replay_guard,
+            );
+            blobs.append(server.allocator, wire) catch |err| {
+                std.crypto.secureZero(u8, wire);
+                server.allocator.free(wire);
+                return err;
+            };
+            try pieces.append(server.allocator, .{
+                .kind = .mesh_checkpoint,
+                .bytes = wire,
+                .min_supported = 2,
+            });
+        }
+    }
 }
 
 /// Keep the multi-megabyte `LinuxServer.init` return frame out of already-large
@@ -78289,6 +78408,88 @@ test "UPGRADE TLS ticket-key capsule allocation failure is fatal to the seal" {
     ));
     try std.testing.expectEqual(@as(usize, 0), pieces.items.len);
     try std.testing.expectEqual(@as(usize, 0), blobs.items.len);
+}
+
+test "Windows HXRG seal and stage retain TLS ticket and binder replay across no-fail install" {
+    const allocator = std.testing.allocator;
+    var source = tls_resumption.ReplayGuard{};
+    const ticket_tag: [16]u8 = @splat(0x16);
+    const binder32: [32]u8 = @splat(0x32);
+    const binder48: [48]u8 = @splat(0x48);
+    try std.testing.expect(source.checkAndRecord(&ticket_tag));
+    try std.testing.expect(source.checkAndRecord(&binder32));
+    try std.testing.expect(source.checkAndRecord(&binder48));
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(allocator);
+    const wire = try Server.sealTlsReplayUpgradeCheckpoint(allocator, &source, &pieces);
+    defer {
+        std.crypto.secureZero(u8, wire);
+        allocator.free(wire);
+    }
+    try std.testing.expectEqual(@as(usize, 1), pieces.items.len);
+    try std.testing.expectEqual(helix_capsule.CapsuleKind.mesh_checkpoint, pieces.items[0].kind);
+    try std.testing.expectEqual(@as(?u16, 2), pieces.items[0].min_supported);
+    var field = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = wire }};
+    var cap = helix_capsule.make(.mesh_checkpoint, &field);
+    cap.header.min_supported = 2;
+
+    var candidate = tls_resumption.ReplayGuard{};
+    const candidate_address = @intFromPtr(&candidate);
+    var replacement = (try Server.stageTlsReplayUpgradeCheckpoint(allocator, true, &.{cap})) orelse
+        return error.TestUnexpectedResult;
+    defer replacement.deinit();
+    try std.testing.expect(candidate.checkAndRecord(&(@as([16]u8, @splat(0x71)))));
+    replacement.install(&candidate);
+    try std.testing.expectEqual(candidate_address, @intFromPtr(&candidate));
+    try std.testing.expect(!candidate.checkAndRecord(&ticket_tag));
+    try std.testing.expect(!candidate.checkAndRecord(&binder32));
+    try std.testing.expect(!candidate.checkAndRecord(&binder48));
+    try std.testing.expect(try Server.stageTlsReplayUpgradeCheckpoint(allocator, false, &.{}) == null);
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageTlsReplayUpgradeCheckpoint(allocator, true, &.{}));
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageTlsReplayUpgradeCheckpoint(allocator, false, &.{cap}));
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageTlsReplayUpgradeCheckpoint(allocator, true, &.{ cap, cap }));
+
+    const corrupt = try allocator.dupe(u8, wire);
+    defer allocator.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    var corrupt_field = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
+    var corrupt_cap = helix_capsule.make(.mesh_checkpoint, &corrupt_field);
+    corrupt_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidSnapshot, Server.stageTlsReplayUpgradeCheckpoint(allocator, true, &.{corrupt_cap}));
+    var downgraded = cap;
+    downgraded.header.min_supported = 1;
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageTlsReplayUpgradeCheckpoint(allocator, true, &.{downgraded}));
+    var future = cap;
+    future.header.version += 1;
+    future.header.max_supported += 1;
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageTlsReplayUpgradeCheckpoint(allocator, true, &.{future}));
+
+    // The source ring is read-only during sealing. Every injected allocation
+    // failure leaves the plan empty and the consumed identities unchanged.
+    var saw_success = false;
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var fail_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+        defer fail_pieces.deinit(failing.allocator());
+        if (Server.sealTlsReplayUpgradeCheckpoint(failing.allocator(), &source, &fail_pieces)) |encoded| {
+            try std.testing.expectEqual(@as(usize, 1), fail_pieces.items.len);
+            std.crypto.secureZero(u8, encoded);
+            failing.allocator().free(encoded);
+            saw_success = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), fail_pieces.items.len);
+            try std.testing.expect(!source.checkAndRecord(&ticket_tag));
+            try std.testing.expect(!source.checkAndRecord(&binder32));
+            try std.testing.expect(!source.checkAndRecord(&binder48));
+        }
+    }
+    try std.testing.expect(saw_success);
+    var failing_decode = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, Server.stageTlsReplayUpgradeCheckpoint(failing_decode.allocator(), true, &.{cap}));
+    try std.testing.expect(!source.checkAndRecord(&ticket_tag));
 }
 
 test "UPGRADE successor adopts one canonical TLS ticket-key authority atomically" {
@@ -101851,7 +102052,7 @@ test "Windows native Helix listener manifest verifies exact bound socket roles" 
     try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
 }
 
-test "Windows UPGRADE refuses replay-backed TLS before launching a candidate" {
+test "Windows UPGRADE with replay-backed TLS reaches candidate preflight without consuming history" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const server = try allocator.create(Server);
@@ -101871,6 +102072,7 @@ test "Windows UPGRADE refuses replay-backed TLS before launching a candidate" {
         fn begin(ctx: *anyopaque, _: []const u8) anyerror!void {
             const started: *bool = @ptrCast(@alignCast(ctx));
             started.* = true;
+            return error.TestCandidateBegin;
         }
         fn transferAndCommit(_: *anyopaque, _: NativeUpgradeSnapshot) anyerror!noreturn {
             return error.TestUnexpectedResult;
@@ -101894,8 +102096,8 @@ test "Windows UPGRADE refuses replay-backed TLS before launching a candidate" {
     const binder: [32]u8 = @splat(0x57);
     try std.testing.expect(server.tls_replay_guard.checkAndRecord(&binder));
     const ticket_key_before = server.tls_ticket_key;
-    try std.testing.expectError(error.TlsReplayContinuityUnsupported, server.performUpgrade(.signal));
-    try std.testing.expect(!candidate_started);
+    try std.testing.expectError(error.TestCandidateBegin, server.performUpgrade(.signal));
+    try std.testing.expect(candidate_started);
     try std.testing.expectEqual(ticket_key_before, server.tls_ticket_key);
     try std.testing.expect(!server.tls_replay_guard.checkAndRecord(&binder));
 
@@ -101903,10 +102105,137 @@ test "Windows UPGRADE refuses replay-backed TLS before launching a candidate" {
     // when TLS 1.3 early data is disabled. Preserve that replay barrier too.
     server.config.tls_early_data_max_size = 0;
     server.config.tls12_cert_chain = &.{"fixture-der"};
-    try std.testing.expectError(error.TlsReplayContinuityUnsupported, server.performUpgrade(.signal));
-    try std.testing.expect(!candidate_started);
+    candidate_started = false;
+    try std.testing.expectError(error.TestCandidateBegin, server.performUpgrade(.signal));
+    try std.testing.expect(candidate_started);
     try std.testing.expectEqual(ticket_key_before, server.tls_ticket_key);
     try std.testing.expect(!server.tls_replay_guard.checkAndRecord(&binder));
+}
+
+test "Windows history HTTPS stages old TLS material long OCSP and mandatory HXRG" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const native_history = @import("helix/native_windows_history.zig");
+    const allocator = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const cert = try mintRehashTlsLeaf(&cert_buf, 0x95, "history-replay.test");
+    const chain = [_][]const u8{cert.der};
+    var renewed_cert_buf: [1024]u8 = undefined;
+    const renewed_cert = try mintRehashTlsLeaf(&renewed_cert_buf, 0x96, "history-replay.test");
+    const renewed_chain = [_][]const u8{renewed_cert.der};
+    const long_staple: [2048]u8 = @splat(0x5a);
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = cert.kp,
+        .tls_enable_resumption = true,
+        .tls_early_data_max_size = 4096,
+        .crypto_io = std.testing.io,
+    };
+
+    const source = try allocator.create(Server);
+    defer allocator.destroy(source);
+    source.initInPlace(allocator, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer source.deinit();
+    source.tls_ticket_key = @splat(0x21);
+    var history_config = source.tls13Config(false);
+    history_config.ocsp_staple = &long_staple;
+    _ = source.openHistoryHttps("127.0.0.1", 0, history_config) catch |err| switch (err) {
+        error.SocketUnavailable, error.BindFailed, error.ListenFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    const history_key = source.history_https.?.tls_config.ticket_key.?;
+    const history_clock = source.history_https.?.tls_config.now_unix_seconds.?;
+    // Model a later ACME renewal: the current Server generation is B while
+    // the independent history listener is still pinned to A and its staple.
+    source.config.tls_cert_chain = &renewed_chain;
+    source.config.tls_signing_key = renewed_cert.kp;
+    source.rotateTicketKey();
+    try std.testing.expectEqualSlices(u8, cert.der, source.history_https.?.tls_config.cert_chain[0]);
+    try std.testing.expectEqualSlices(u8, renewed_cert.der, source.config.tls_cert_chain[0]);
+    try std.testing.expect(!std.mem.eql(u8, &history_key, &source.tls_ticket_key));
+    try std.testing.expect(source.historyTlsReplayCustodyValid(source.history_https.?.tls_config));
+
+    const tag16: [16]u8 = @splat(0x16);
+    const binder32: [32]u8 = @splat(0x32);
+    const binder48: [48]u8 = @splat(0x48);
+    try std.testing.expect(source.tls_replay_guard.checkAndRecord(&tag16));
+    try std.testing.expect(source.tls_replay_guard.checkAndRecord(&binder32));
+    try std.testing.expect(source.tls_replay_guard.checkAndRecord(&binder48));
+
+    const token = try source.history_https.?.requestPause(1);
+    try source.history_https.?.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    defer source.history_https.?.resumePaused(token) catch {};
+    const carry = try source.history_https.?.capturePaused(token);
+    const process = @intFromPtr(std.os.windows.GetCurrentProcess());
+    const pid = std.os.windows.GetCurrentProcessId();
+    var prepared = try native_history.prepareSource(.{ .owner = &source.history_https.?, .carry = &carry, .pause_token = token }, process, pid);
+    defer prepared.deinit();
+    var received = (try native_history.receive(&prepared.body, pid)) orelse return error.TestUnexpectedResult;
+    defer received.deinit();
+    const history_material_wire = try native_windows_history_material.encodeSnapshot(allocator, source.history_https.?.tls_config);
+    defer native_windows_history_material.freeEncoded(allocator, history_material_wire);
+    try native_windows_history_material.validateCheckpoint(history_material_wire);
+    var history_material = try native_windows_history_material.decodeOwned(allocator, history_material_wire);
+    defer history_material.deinit();
+
+    const candidate = try allocator.create(Server);
+    defer allocator.destroy(candidate);
+    var renewed_config = config;
+    renewed_config.tls_cert_chain = &renewed_chain;
+    renewed_config.tls_signing_key = renewed_cert.kp;
+    candidate.initInPlace(allocator, renewed_config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer candidate.deinit();
+    candidate.tls_ticket_key = @splat(0x99);
+    const stable_guard = @intFromPtr(&candidate.tls_replay_guard);
+    const candidate_base = candidate.tls13Config(false);
+    const without_history_material = try received.tlsConfig(candidate_base, &candidate.tls_replay_guard);
+    try std.testing.expectError(error.ConfigMismatch, received.carry.validate(false, without_history_material));
+    const restored = try received.tlsConfig(history_material.tlsConfig(candidate_base), &candidate.tls_replay_guard);
+    try std.testing.expectEqualSlices(u8, cert.der, restored.cert_chain[0]);
+    try std.testing.expectEqualSlices(u8, &long_staple, restored.ocsp_staple);
+    try std.testing.expectEqualSlices(u8, &history_key, &restored.ticket_key.?);
+    try std.testing.expectEqual(history_clock, restored.now_unix_seconds.?);
+    try std.testing.expectEqual(@as(u32, 4096), restored.max_early_data_size);
+    try std.testing.expect(restored.replay_guard == &candidate.tls_replay_guard);
+    try std.testing.expect(!std.mem.eql(u8, &candidate.tls_ticket_key, &restored.ticket_key.?));
+    try std.testing.expectEqual(carry.tls_digest, try history_http.tlsConfigDigest(restored));
+
+    var foreign_guard = tls_resumption.ReplayGuard{};
+    var wrong_guard = restored;
+    wrong_guard.replay_guard = &foreign_guard;
+    try std.testing.expectError(error.InvalidInheritedHandoff, candidate.stageWindowsInheritedHistory(&received.transfer, &received.carry, wrong_guard, std.testing.io));
+    try std.testing.expect(!received.transfer.consumed);
+
+    // A resumed ticket or early-data binder in history HTTPS must hit the same
+    // server guard after its socket and pinned TLS policy are staged.
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(allocator);
+    const wire = try Server.sealTlsReplayUpgradeCheckpoint(allocator, &source.tls_replay_guard, &pieces);
+    defer {
+        std.crypto.secureZero(u8, wire);
+        allocator.free(wire);
+    }
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageTlsReplayUpgradeCheckpoint(allocator, true, &.{}));
+    var field = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = wire }};
+    var cap = helix_capsule.make(.mesh_checkpoint, &field);
+    cap.header.min_supported = 2;
+    var replacement = (try Server.stageTlsReplayUpgradeCheckpoint(allocator, true, &.{cap})) orelse return error.TestUnexpectedResult;
+    defer replacement.deinit();
+    try candidate.stageWindowsInheritedHistory(&received.transfer, &received.carry, restored, std.testing.io);
+    try std.testing.expect(received.transfer.consumed);
+    try std.testing.expect(candidate.history_https.?.tls_config.replay_guard == &candidate.tls_replay_guard);
+    replacement.install(&candidate.tls_replay_guard);
+    try std.testing.expectEqual(stable_guard, @intFromPtr(&candidate.tls_replay_guard));
+    try std.testing.expect(!candidate.tls_replay_guard.checkAndRecord(&tag16));
+    try std.testing.expect(!candidate.tls_replay_guard.checkAndRecord(&binder32));
+    try std.testing.expect(!candidate.tls_replay_guard.checkAndRecord(&binder48));
 }
 
 test "Windows Helix admission checkpoints match the carried physical clients" {

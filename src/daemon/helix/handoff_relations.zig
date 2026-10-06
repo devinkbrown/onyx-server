@@ -49,6 +49,8 @@ const native_windows_acme = @import("native_windows_acme.zig");
 const native_windows_ocsp = @import("native_windows_ocsp.zig");
 const native_windows_ocsp_state = @import("native_windows_ocsp_state.zig");
 const native_windows_tls_material = @import("native_windows_tls_material.zig");
+const native_windows_tls_replay = @import("native_windows_tls_replay.zig");
+const native_windows_history_material = @import("native_windows_history_material.zig");
 const native_windows_wasm = @import("native_windows_wasm.zig");
 const policy_checkpoint = @import("policy_checkpoint.zig");
 const native_windows_operator_state = @import("native_windows_operator_state.zig");
@@ -187,6 +189,10 @@ pub const Error = error{
     InvalidOcspState,
     DuplicateTlsMaterial,
     InvalidTlsMaterial,
+    DuplicateTlsReplay,
+    InvalidTlsReplay,
+    DuplicateHistoryMaterial,
+    InvalidHistoryMaterial,
     DuplicateWasm,
     InvalidWasm,
     DuplicatePolicy,
@@ -263,6 +269,8 @@ pub const Summary = struct {
     ocsp: usize = 0,
     ocsp_state: usize = 0,
     tls_material: usize = 0,
+    tls_replay: usize = 0,
+    history_material: usize = 0,
     wasm: usize = 0,
     policy: usize = 0,
     operator_state: usize = 0,
@@ -713,6 +721,20 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             summary.tls_material = 1;
             continue;
         }
+        if (native_windows_tls_replay.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidTlsReplay;
+            native_windows_tls_replay.validateCheckpoint(bytes) catch return error.InvalidTlsReplay;
+            if (summary.tls_replay != 0) return error.DuplicateTlsReplay;
+            summary.tls_replay = 1;
+            continue;
+        }
+        if (native_windows_history_material.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidHistoryMaterial;
+            native_windows_history_material.validateCheckpoint(bytes) catch return error.InvalidHistoryMaterial;
+            if (summary.history_material != 0) return error.DuplicateHistoryMaterial;
+            summary.history_material = 1;
+            continue;
+        }
         if (native_windows_wasm.isCheckpoint(bytes)) {
             if (item.header.min_supported != 2) return error.InvalidWasm;
             native_windows_wasm.validateCheckpoint(bytes) catch return error.InvalidWasm;
@@ -1008,7 +1030,7 @@ fn testMeshClockCap(bytes: []const u8, field: *[1]capsule.Field) capsule.Capsule
     return cap;
 }
 
-test "current handoff relations validate unique POLY HXOP HXTM HXAC and HXWM custody" {
+test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC and HXWM custody" {
     const allocator = std.testing.allocator;
     const event_replay = try testEventSpineReplayCheckpoint(allocator);
     defer allocator.free(event_replay);
@@ -1049,6 +1071,20 @@ test "current handoff relations validate unique POLY HXOP HXTM HXAC and HXWM cus
         .tls12_mode = .disabled,
     });
     defer native_windows_tls_material.freeEncoded(allocator, tls_material);
+    var replay_guard = @import("../../crypto/tls_resumption.zig").ReplayGuard{};
+    const consumed_ticket: [16]u8 = @splat(0x72);
+    try std.testing.expect(replay_guard.checkAndRecord(&consumed_ticket));
+    const tls_replay = try native_windows_tls_replay.encodeSnapshot(allocator, &replay_guard);
+    defer {
+        std.crypto.secureZero(u8, tls_replay);
+        allocator.free(tls_replay);
+    }
+    const history_material = try native_windows_history_material.encodeSnapshot(allocator, .{
+        .cert_chain = &chain,
+        .signing_key = ed,
+        .ocsp_staple = "history-staple",
+    });
+    defer native_windows_history_material.freeEncoded(allocator, history_material);
     var unused_server: @import("../server.zig").Server = undefined;
     const tls_config: @import("../config_format.zig").Config.Tls = .{};
     var acme_owner = @import("../acme_renewal.zig").Service.init(allocator, std.testing.io, &unused_server, .{ .enabled = true }, &tls_config);
@@ -1070,8 +1106,10 @@ test "current handoff relations validate unique POLY HXOP HXTM HXAC and HXWM cus
         .{ .kind = .mesh_checkpoint, .bytes = policy },
         .{ .kind = .mesh_checkpoint, .bytes = operator_state },
         .{ .kind = .mesh_checkpoint, .bytes = tls_material },
+        .{ .kind = .mesh_checkpoint, .bytes = tls_replay },
         .{ .kind = .mesh_checkpoint, .bytes = acme },
         .{ .kind = .mesh_checkpoint, .bytes = wasm_state },
+        .{ .kind = .mesh_checkpoint, .bytes = history_material },
     };
     var fields: [pieces.len][1]capsule.Field = undefined;
     var caps: [pieces.len]capsule.Capsule = undefined;
@@ -1081,13 +1119,17 @@ test "current handoff relations validate unique POLY HXOP HXTM HXAC and HXWM cus
     try std.testing.expectEqual(@as(usize, 1), summary.policy);
     try std.testing.expectEqual(@as(usize, 1), summary.operator_state);
     try std.testing.expectEqual(@as(usize, 1), summary.tls_material);
+    try std.testing.expectEqual(@as(usize, 1), summary.tls_replay);
+    try std.testing.expectEqual(@as(usize, 1), summary.history_material);
     try std.testing.expectEqual(@as(usize, 1), summary.acme);
     try std.testing.expectEqual(@as(usize, 1), summary.wasm);
     try std.testing.expectError(error.DuplicatePolicy, validateCurrent(&.{ caps[7], caps[7] }, &.{}));
     try std.testing.expectError(error.DuplicateOperatorState, validateCurrent(&.{ caps[8], caps[8] }, &.{}));
     try std.testing.expectError(error.DuplicateTlsMaterial, validateCurrent(&.{ caps[9], caps[9] }, &.{}));
-    try std.testing.expectError(error.DuplicateAcme, validateCurrent(&.{ caps[10], caps[10] }, &.{}));
-    try std.testing.expectError(error.DuplicateWasm, validateCurrent(&.{ caps[11], caps[11] }, &.{}));
+    try std.testing.expectError(error.DuplicateTlsReplay, validateCurrent(&.{ caps[10], caps[10] }, &.{}));
+    try std.testing.expectError(error.DuplicateHistoryMaterial, validateCurrent(&.{ caps[13], caps[13] }, &.{}));
+    try std.testing.expectError(error.DuplicateAcme, validateCurrent(&.{ caps[11], caps[11] }, &.{}));
+    try std.testing.expectError(error.DuplicateWasm, validateCurrent(&.{ caps[12], caps[12] }, &.{}));
 
     const corrupt_policy = try allocator.dupe(u8, policy);
     defer allocator.free(corrupt_policy);
@@ -1112,6 +1154,36 @@ test "current handoff relations validate unique POLY HXOP HXTM HXAC and HXWM cus
     var corrupt_tls_cap = capsule.make(.mesh_checkpoint, &corrupt_tls_field);
     corrupt_tls_cap.header.min_supported = 2;
     try std.testing.expectError(error.InvalidTlsMaterial, validateCurrent(&.{corrupt_tls_cap}, &.{}));
+
+    const corrupt_replay = try allocator.dupe(u8, tls_replay);
+    defer allocator.free(corrupt_replay);
+    corrupt_replay[corrupt_replay.len - 1] ^= 1;
+    var corrupt_replay_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_replay }};
+    var corrupt_replay_cap = capsule.make(.mesh_checkpoint, &corrupt_replay_field);
+    corrupt_replay_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidTlsReplay, validateCurrent(&.{corrupt_replay_cap}, &.{}));
+    var downgraded_replay_cap = caps[10];
+    downgraded_replay_cap.header.min_supported = 1;
+    try std.testing.expectError(error.InvalidTlsReplay, validateCurrent(&.{downgraded_replay_cap}, &.{}));
+    var future_replay_cap = caps[10];
+    future_replay_cap.header.version += 1;
+    future_replay_cap.header.max_supported += 1;
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{future_replay_cap}, &.{}));
+
+    const corrupt_history = try allocator.dupe(u8, history_material);
+    defer native_windows_history_material.freeEncoded(allocator, corrupt_history);
+    corrupt_history[corrupt_history.len - 1] ^= 1;
+    var corrupt_history_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_history }};
+    var corrupt_history_cap = capsule.make(.mesh_checkpoint, &corrupt_history_field);
+    corrupt_history_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidHistoryMaterial, validateCurrent(&.{corrupt_history_cap}, &.{}));
+    var downgraded_history_cap = caps[13];
+    downgraded_history_cap.header.min_supported = 1;
+    try std.testing.expectError(error.InvalidHistoryMaterial, validateCurrent(&.{downgraded_history_cap}, &.{}));
+    var future_history_cap = caps[13];
+    future_history_cap.header.version += 1;
+    future_history_cap.header.max_supported += 1;
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{future_history_cap}, &.{}));
 
     const corrupt_acme = try allocator.dupe(u8, acme);
     defer allocator.free(corrupt_acme);

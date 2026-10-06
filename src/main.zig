@@ -12,6 +12,7 @@ const windows_bootstrap = onyx_server.daemon.helix.native_windows_bootstrap;
 const windows_driver = onyx_server.daemon.helix.native_windows_driver;
 const windows_runtime = onyx_server.daemon.helix.native_windows_runtime;
 const windows_tls_material = onyx_server.daemon.helix.native_windows_tls_material;
+const windows_history_material = onyx_server.daemon.helix.native_windows_history.material;
 const native_service = onyx_server.daemon.native_service;
 const service_helper = onyx_server.daemon.native_service_helper;
 
@@ -802,6 +803,10 @@ pub fn main(init: std.process.Init) !void {
     defer if (windows_child) |*child| child.deinit();
     var windows_transfer: ?windows_bootstrap.Incoming = null;
     defer if (windows_transfer) |*transfer| transfer.deinit();
+    // HXHL is detached before history SOCKET import. The inherited listener
+    // borrows this exact source generation through Server teardown.
+    var windows_history_tls_material: ?windows_history_material.Owned = null;
+    defer if (windows_history_tls_material) |*material| material.deinit();
     // A WebTransport candidate borrows the source's authenticated serving
     // certificate before READY. Keep this detached copy until its UDP owner
     // has joined and been destroyed on process exit.
@@ -2471,12 +2476,14 @@ pub fn main(init: std.process.Init) !void {
                 };
             }
             if (transfer.history) |*history| {
-                // HXHH pins the source's entire TLS policy. Candidate boot
-                // material must reproduce it exactly before the source can
-                // retire; a history endpoint with other runtime-only material
-                // is refused instead of silently changing its TLS identity.
-                if (srv_cfg.tls_cert_chain.len == 0) windows_driver.candidateAbortNow();
-                srv.stageWindowsInheritedHistory(&history.transfer, &history.carry, .{
+                // HXHL supplies the source listener's own certificate and
+                // OCSP generation; HXHH supplies its pinned scalar and ticket
+                // policy. Their merged config must match the full HXHH digest.
+                windows_history_tls_material = windows_history_material.decodeFromArena(allocator, transfer.plaintext) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix history TLS material preflight failed ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                const history_base: onyx_server.crypto.tls_server.Config = .{
                     .cert_chain = srv_cfg.tls_cert_chain,
                     .signing_key = srv_cfg.tls_signing_key,
                     .ecdsa_p256_signing_key = srv_cfg.tls_ecdsa_signing_key,
@@ -2484,7 +2491,14 @@ pub fn main(init: std.process.Init) !void {
                     .sni_certs = srv_cfg.tls_sni_certs,
                     .ech_keys = srv_cfg.tls_ech_keys,
                     .enable_raw_public_key = srv_cfg.tls_raw_public_key,
-                }, init.io) catch |err| {
+                };
+                const history_with_material = windows_history_tls_material.?.tlsConfig(history_base);
+                const history_tls = history.tlsConfig(history_with_material, &srv.tls_replay_guard) catch |err| {
+                    std.debug.print("onyx-server: Windows Helix history TLS custody invalid ({s})\n", .{@errorName(err)});
+                    windows_driver.candidateAbortNow();
+                };
+                // Both detached HXHL and HXHH owners outlive srv.deinit.
+                srv.stageWindowsInheritedHistory(&history.transfer, &history.carry, history_tls, init.io) catch |err| {
                     std.debug.print("onyx-server: Windows Helix history HTTPS import failed ({s})\n", .{@errorName(err)});
                     windows_driver.candidateAbortNow();
                 };

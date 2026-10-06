@@ -21,6 +21,7 @@ frontmatter_value() {
   local file="$1"
   local key="$2"
   awk -v key="$key" '
+    { sub(/\r$/, "") }
     $0 == "---" { section += 1; next }
     section == 1 && index($0, key ":") == 1 {
       sub("^[^:]+:[[:space:]]*", "")

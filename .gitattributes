@@ -2,3 +2,6 @@
 # even when a Windows checkout enables core.autocrlf.
 src/crypto/*_sigver_acvp.txt text eol=lf
 tools/bogo/expected-baseline.txt text eol=lf
+# WSL executes these from Windows checkouts; CRLF breaks interpreter shebangs.
+*.sh text eol=lf
+*.py text eol=lf

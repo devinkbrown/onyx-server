@@ -375,9 +375,11 @@ pub const HttpsListener = struct {
         return self.captureCut(.unstarted);
     }
     fn captureCut(self: *HttpsListener, execution: Execution) !Snapshot {
-        // Shared anti-replay state requires its own source-owned carried graph;
-        // a pointer or an empty replacement cannot prove 0-RTT continuity.
-        if (self.tls_config.max_early_data_size != 0) return error.ActiveTlsContinuityUnsupported;
+        // Windows Helix carries the shared replay guard in its mandatory HXRG
+        // checkpoint. Other handoff paths still lack that custody.
+        if (self.tls_config.max_early_data_size != 0 and
+            (builtin.os.tag != .windows or self.tls_config.replay_guard == null))
+            return error.ActiveTlsContinuityUnsupported;
         const observed = try observeHistoryListener(self.listen_fd, self.v6);
         try validateEndpoint(observed, self.v6, self.port);
         return .{ .listener = observed, .tls_digest = try tlsConfigDigest(self.tls_config), .execution = execution };
@@ -1036,7 +1038,9 @@ pub const Snapshot = struct {
     tls_digest: [32]u8,
     execution: Execution,
     pub fn validate(self: *const Snapshot, v6: bool, config: tls_server.Config) !void {
-        if (config.max_early_data_size != 0) return error.ActiveTlsContinuityUnsupported;
+        if (config.max_early_data_size != 0 and
+            (builtin.os.tag != .windows or config.replay_guard == null))
+            return error.ActiveTlsContinuityUnsupported;
         try validateEndpoint(self.listener, v6, self.listener.port);
         if (!std.mem.eql(u8, &self.tls_digest, &try tlsConfigDigest(config))) return error.ConfigMismatch;
     }
@@ -1191,8 +1195,9 @@ fn validateEndpoint(observed: metrics_http.ListenerObservation, v6: bool, port: 
         observed.scope_id != 0 or observed.flow_info != 0 or !std.mem.eql(u8, &observed.address, &expected) or
         observed.recv_timeout_us < 200_000 or observed.recv_timeout_us > 210_000) return error.ListenerMismatch;
 }
-/// Complete material/policy pin, with replay-guard presence only. Its actual
-/// mutable graph is not hashed without its owner; active 0-RTT carry refuses.
+/// Complete material/policy pin, with replay-guard presence only. Windows
+/// Helix carries that mutable graph in mandatory HXRG and the listener's exact
+/// certificate/key/OCSP generation in mandatory HXHL.
 pub fn tlsConfigDigest(config: tls_server.Config) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("onyx/companion/history/tls-config/1");

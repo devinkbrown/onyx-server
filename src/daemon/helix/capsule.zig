@@ -71,9 +71,10 @@ pub const CapsuleKind = enum(u8) {
         };
     }
 
-    /// Whether a capsule of this kind carries raw cryptographic key material in
-    /// its field payloads, so `Capsule.deinit` secure-zeroes the owned bytes
-    /// before freeing them. Key material sealed into the successor's memfd arena
+    /// Whether a capsule of this kind can carry raw cryptographic key material
+    /// or replay authority in its field payloads, so `Capsule.deinit` zeroes
+    /// the owned bytes before freeing them. Key material sealed into the
+    /// successor's memfd arena
     /// (TLS 1.3/1.2 traffic secrets, the Mooring directional record keys, and the
     /// STEK ticket keys) must never linger in freed heap across a USR2 — the
     /// arena lives only in memory, but a freed-then-reused allocation could leak
@@ -81,11 +82,15 @@ pub const CapsuleKind = enum(u8) {
     /// kind is a compile error until this decision is made for it.
     pub fn carriesSecrets(kind: CapsuleKind) bool {
         return switch (kind) {
-            .tls_session, .mooring_ratchet, .s2s_link, .tls_ticket_keys => true,
+            .tls_session,
+            .mooring_ratchet,
+            .s2s_link,
+            .tls_ticket_keys,
+            .mesh_checkpoint,
+            => true,
             .clients,
             .channels,
             .sessions,
-            .mesh_checkpoint,
             .send_queue,
             .ws_session,
             .pending_migration,
@@ -324,10 +329,16 @@ pub fn validate(capsule: Capsule) Error!void {
 }
 
 pub fn encode(allocator: Allocator, capsule: Capsule) Error![]u8 {
-    try validate(capsule);
+    const exact_len = try encodedLen(capsule);
 
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer {
+        std.crypto.secureZero(u8, out.items);
+        out.deinit(allocator);
+    }
+    // Some checkpoint fields contain private keys. Allocate once so growth
+    // cannot release an earlier plaintext copy without wiping it.
+    try out.ensureTotalCapacityPrecise(allocator, exact_len);
 
     try out.appendSlice(allocator, &magic);
     try appendU32(allocator, &out, capsule.header.schema_id);
@@ -341,7 +352,31 @@ pub fn encode(allocator: Allocator, capsule: Capsule) Error![]u8 {
         try appendBytes(allocator, &out, field.bytes);
     }
 
-    return try out.toOwnedSlice(allocator);
+    // `toOwnedSlice` may allocate a second buffer if remap is unavailable,
+    // freeing the first one with plaintext still in it. Capacity is exact, so
+    // transfer this allocation directly to the caller.
+    std.debug.assert(out.items.len == exact_len and out.capacity == exact_len);
+    return out.items;
+}
+
+fn varintLen(value: usize) usize {
+    var n = value;
+    var len: usize = 1;
+    while (n >= 0x80) : (n >>= 7) len += 1;
+    return len;
+}
+
+/// Exact wire length, also used to reserve the whole Windows plaintext arena
+/// before any secret-bearing capsule is appended.
+pub fn encodedLen(value: Capsule) Error!usize {
+    try validate(value);
+    var len: usize = 15; // magic, schema, kind, and three version fields
+    len = std.math.add(usize, len, varintLen(value.fields.len)) catch return error.OutOfMemory;
+    for (value.fields) |field| {
+        len = std.math.add(usize, len, 4 + varintLen(field.bytes.len)) catch return error.OutOfMemory;
+        len = std.math.add(usize, len, field.bytes.len) catch return error.OutOfMemory;
+    }
+    return len;
 }
 
 pub fn decode(allocator: Allocator, bytes: []const u8) Error!Capsule {
@@ -507,6 +542,7 @@ test "capsule encodes, decodes, and validates ordinal order" {
 
     const encoded = try encode(allocator, original);
     defer allocator.free(encoded);
+    try std.testing.expectEqual(try encodedLen(original), encoded.len);
 
     var decoded = try decode(allocator, encoded);
     defer decoded.deinit(allocator);
@@ -695,6 +731,7 @@ test "wipeSecretPayloads zeroes secret-bearing payloads and leaves plain ones" {
     try std.testing.expect(CapsuleKind.s2s_link.carriesSecrets());
     try std.testing.expect(CapsuleKind.mooring_ratchet.carriesSecrets());
     try std.testing.expect(CapsuleKind.tls_ticket_keys.carriesSecrets());
+    try std.testing.expect(CapsuleKind.mesh_checkpoint.carriesSecrets());
     try std.testing.expect(!CapsuleKind.clients.carriesSecrets());
     try std.testing.expect(!CapsuleKind.channels.carriesSecrets());
     try std.testing.expect(!CapsuleKind.ws_session.carriesSecrets());
@@ -704,13 +741,17 @@ test "wipeSecretPayloads zeroes secret-bearing payloads and leaves plain ones" {
     // field bytes just before freeing them, so this exercises the real wipe path.
     var secret_buf = "traffic-secret-material".*;
     var plain_buf = "world-checkpoint-state".*;
+    var mesh_buf = "history-private-key".*;
     var secret_field = [_]Field{.{ .ordinal = 1, .bytes = &secret_buf }};
     var plain_field = [_]Field{.{ .ordinal = 1, .bytes = &plain_buf }};
+    var mesh_field = [_]Field{.{ .ordinal = 1, .bytes = &mesh_buf }};
 
     wipeSecretPayloads(.tls_session, &secret_field); // secret-bearing → wiped
+    wipeSecretPayloads(.mesh_checkpoint, &mesh_field);
     wipeSecretPayloads(.clients, &plain_field); // plain → untouched
 
     for (secret_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (mesh_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
     try std.testing.expectEqualStrings("world-checkpoint-state", &plain_buf);
 }
 

@@ -1207,9 +1207,7 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     };
     const proof_candidate = if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid"))
         self.windows_helix_source_valid.load(.acquire) and
-            self.config.windows_helix_raw_source_digest != null and
-            self.config.tls_early_data_max_size == 0 and
-            (!self.config.tls_enable_resumption or self.config.tls12_cert_chain.len == 0)
+            self.config.windows_helix_raw_source_digest != null
     else
         false;
     const tls_digest_before: ?windows_tls_proof.Digest = if (proof_candidate)

@@ -157,6 +157,18 @@ pub const Driver = struct {
             std.crypto.secureZero(u8, plaintext.items);
             plaintext.deinit(self.allocator);
         }
+        var total_len: usize = 0;
+        for (manifested.pieces) |piece| {
+            var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
+            var cap = capsule.make(piece.kind, &fields);
+            if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+            const encoded_len = try capsule.encodedLen(cap);
+            if (encoded_len > live.max_arena_bytes - total_len) return error.ArenaTooLarge;
+            total_len += encoded_len;
+        }
+        // The arena can contain HXHL private keys, ticket keys, and replay
+        // authority. No append below may move and free a plaintext prefix.
+        try plaintext.ensureTotalCapacityPrecise(self.allocator, total_len);
         for (manifested.pieces) |piece| {
             var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
             var cap = capsule.make(piece.kind, &fields);
@@ -166,8 +178,8 @@ pub const Driver = struct {
                 std.crypto.secureZero(u8, encoded);
                 self.allocator.free(encoded);
             }
-            if (encoded.len > live.max_arena_bytes - plaintext.items.len) return error.ArenaTooLarge;
-            try plaintext.appendSlice(self.allocator, encoded);
+            if (encoded.len > total_len - plaintext.items.len) return error.ArenaTooLarge;
+            plaintext.appendSliceAssumeCapacity(encoded);
         }
 
         const rows = try self.allocator.alloc(bootstrap.SourceRow, snapshot.state_fds.len + snapshot.listeners.len);

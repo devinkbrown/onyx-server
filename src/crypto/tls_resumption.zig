@@ -88,6 +88,15 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 pub const ReplayGuard = struct {
     pub const capacity: usize = 2048;
 
+    /// Entries in oldest-to-newest order. This detached form lets a Helix
+    /// candidate validate and own the complete ring before changing the live
+    /// guard. Only the first `count` entries and their declared bytes are live.
+    pub const Snapshot = struct {
+        count: usize = 0,
+        entries: [capacity][max_binder_len]u8 = @splat(@splat(0)),
+        lens: [capacity]u8 = @splat(0),
+    };
+
     mutex: std.atomic.Mutex = .unlocked,
     entries: [capacity][max_binder_len]u8 = undefined,
     lens: [capacity]u8 = @splat(0),
@@ -102,6 +111,43 @@ pub const ReplayGuard = struct {
         return self.checkAndRecordLocked(binder);
     }
 
+    /// Capture one synchronized logical ring image. Allocation happens before
+    /// the lock, so failure cannot change the live guard. The caller owns and
+    /// must securely clear the returned image before freeing it.
+    pub fn captureSnapshot(self: *ReplayGuard, allocator: Allocator) Allocator.Error!*Snapshot {
+        const snapshot = try allocator.create(Snapshot);
+        snapshot.* = .{};
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        snapshot.count = if (self.wrapped) capacity else self.next;
+        for (0..snapshot.count) |ordinal| {
+            const source = if (self.wrapped) (self.next + ordinal) % capacity else ordinal;
+            const len = self.lens[source];
+            snapshot.lens[ordinal] = len;
+            @memcpy(snapshot.entries[ordinal][0..len], self.entries[source][0..len]);
+        }
+        return snapshot;
+    }
+
+    /// Commit a previously validated snapshot without allocation or moving
+    /// this guard: TLS configs retain pointers to its stable address. The next
+    /// insert evicts the same oldest entry as it would on the source.
+    pub fn installSnapshot(self: *ReplayGuard, snapshot: *const Snapshot) void {
+        std.debug.assert(snapshot.count <= capacity);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.entries));
+        @memset(&self.lens, 0);
+        for (0..snapshot.count) |ordinal| {
+            const len = snapshot.lens[ordinal];
+            std.debug.assert(len == 16 or len == 32 or len == 48);
+            self.lens[ordinal] = len;
+            @memcpy(self.entries[ordinal][0..len], snapshot.entries[ordinal][0..len]);
+        }
+        self.next = if (snapshot.count == capacity) 0 else snapshot.count;
+        self.wrapped = snapshot.count == capacity;
+    }
+
     /// Locked implementation for the bounded ring lookup + insert.
     fn checkAndRecordLocked(self: *ReplayGuard, binder: []const u8) bool {
         if (binder.len == 0 or binder.len > max_binder_len) return false;
@@ -114,6 +160,7 @@ pub const ReplayGuard = struct {
                 return false;
             }
         }
+        std.crypto.secureZero(u8, &self.entries[self.next]);
         @memcpy(self.entries[self.next][0..binder.len], binder);
         self.lens[self.next] = @intCast(binder.len);
         self.next += 1;

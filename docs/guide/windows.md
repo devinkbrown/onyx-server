@@ -299,9 +299,9 @@ cross-build swap; a compatible prior build has passed that held-client and WAL
 check. A TLS/WSS smoke exercises two swaps with held TLS IRC and WSS sockets,
 checks WebSocket control frames,
 and opens fresh TLS and WSS connections after each swap.
-The native v16 capability challenge requires ACME scheduler, TLS-material,
-OroWasm, active history-listener, and UDP owner custody support; an older
-candidate is rejected before socket transfer.
+The native v17 capability challenge requires ACME scheduler, TLS material,
+TLS replay history, OroWasm, active history listener, and UDP owner custody;
+an older candidate is rejected before socket transfer.
 The two-node mesh smoke upgrades a node with a held secured Mooring link, keeps
 attachments on both nodes connected, and checks exact cross-node deliveries.
 A three-node sequence smoke upgrades A and then B while four same-token
@@ -327,9 +327,9 @@ settings, identity material, and OAuth JWKS bytes. The authenticated TLS
 material checkpoint supplies the exact serving certificate and key generations
 before COMMIT. A completed `REHASH` retains Windows Helix eligibility when
 the canonical config source and every ordered `env:` and `@file:` value still
-match startup and TLS 0-RTT early data is disabled. TLS 1.3 1-RTT session
-tickets may remain enabled when TLS 1.2 is disabled; their current and
-previous keys cross the handoff. With
+match startup. TLS 1.3 session tickets, including 0-RTT, and TLS 1.2 tickets
+may remain enabled; their current and previous keys and consumed-ticket
+history cross the handoff. With
 TLS enabled, the reload must succeed and leave the full serving
 certificate/key generation and TLS 1.2 leg byte-identical; the authenticated
 checkpoint then carries that generation.
@@ -340,9 +340,12 @@ that process, even if a later REHASH restores the original inputs; a normal
 boot is then needed before another upgrade. ACME renewal does not invalidate
 the static proof.
 
-Windows `UPGRADE` refuses configurations with TLS 0-RTT early data or TLS 1.2
-session ticket resumption enabled. Their shared replay ring is process-local;
-the current Windows handoff carries ticket keys but cannot transfer the ring.
+For TLS resumption, the authenticated HXRG checkpoint carries the shared replay
+ring in chronological order. The successor validates and stages it before COMMIT,
+then installs it in the existing guard without allocating or changing its
+address. Previously consumed TLS 1.2 tickets and TLS 1.3 early-data binders
+remain consumed across sequential swaps. A missing or malformed mandatory
+checkpoint aborts adoption.
 
 The guarded path carries Web Push worker state, mail queue and private journal
 custody, Geo worker cache and pinned GeoIP/ASN databases, channel statistics,
@@ -397,9 +400,12 @@ with `[media].enabled = false` binds no UDP owner and requires no socket
 handoff. The combined smoke holds an active WebTransport browser stream and an
 active native/WebRTC call in the same daemon through two swaps, checking the
 browser's exact deliveries and both media transports after each one. An
-opened loopback `history_https` listener transfers its listening socket when
-the candidate reproduces its complete TLS configuration; other runtime TLS
-settings cause a safe pre-COMMIT refusal. OroWasm plugin directories and media
+opened loopback `history_https` listener transfers its listening socket and
+pinned TLS runtime settings after REHASH. HXHH carries the scalar policy and
+clock. The encrypted HXHL arena carries that listener's ticket keys, exact
+certificate/key generation after ACME renewal, and OCSP staple. HXRG preserves
+the shared replay ring for 0-RTT handshakes. The candidate checks the complete
+TLS configuration before COMMIT. OroWasm plugin directories and media
 remain available on ordinary Windows boot under their preflight rules. A live
 session-drop transaction, deferred
 MESSAGE_V2 authority, or accepted Web Push overflow delivery blocks the
@@ -430,6 +436,8 @@ python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --early-data
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption-tls12
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative rotation
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative failed-reload
@@ -504,6 +512,8 @@ python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --early-data
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption-tls12
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative rotation
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative failed-reload

@@ -106,11 +106,19 @@ def main() -> int:
                         help="after two swaps, REHASH rotated or unreadable TLS files and require UPGRADE refusal")
     parser.add_argument("--resumption", action="store_true",
                         help="prove 1-RTT TLS ticket reuse across unchanged REHASH and two swaps")
+    parser.add_argument("--early-data", action="store_true",
+                        help="prove two swaps with TLS 1.3 early data enabled and 1-RTT ticket reuse")
+    parser.add_argument("--resumption-tls12", action="store_true",
+                        help="prove single-use TLS 1.2 tickets and replay history across REHASH and two swaps")
     args = parser.parse_args()
     if args.generated and args.negative:
         parser.error("--generated and --negative require separate fixture runs")
-    if args.resumption and (args.generated or args.negative):
-        parser.error("--resumption requires the positive on-disk certificate fixture")
+    if (args.resumption or args.early_data) and (args.generated or args.negative):
+        parser.error("--resumption and --early-data require the positive on-disk certificate fixture")
+    if args.resumption and args.early_data:
+        parser.error("--resumption and --early-data require separate fixture runs")
+    if args.resumption_tls12 and (args.generated or args.negative or args.resumption or args.early_data):
+        parser.error("--resumption-tls12 requires the positive on-disk certificate fixture")
     if os.name != "nt":
         parser.error("this fixture requires native Windows")
     original = args.binary.resolve()
@@ -148,8 +156,13 @@ def main() -> int:
             "dns_name = \"localhost\"\ncert_path = \"leaf.pem\"\n"
             "key_path = \"keys-private/server.key\"\n"
         )
-        if args.resumption:
-            tls_settings += "enable_resumption = true\nearly_data_max_size = 0\n"
+        if args.resumption_tls12:
+            tls_settings += "enable_tls12 = true\n"
+        if args.resumption or args.resumption_tls12 or args.early_data:
+            tls_settings += (
+                "enable_resumption = true\n"
+                f"early_data_max_size = {4096 if args.early_data else 0}\n"
+            )
         acme_settings = (
             "[acme]\nenabled = false\n"
             if args.generated else
@@ -192,13 +205,15 @@ def main() -> int:
             held_tls.register(b"heldtls")
             certificate = held_tls.certificate_digest()
             tls12_certificate = None
-            if args.generated:
+            if args.generated or args.resumption_tls12:
                 held_tls12 = connect_tls(tls_port, tls12_context, parent)
                 clients.append(held_tls12)
                 held_tls12.register(b"heldtls12")
                 tls12_certificate = held_tls12.certificate_digest()
-                if tls12_certificate == certificate:
+                if args.generated and tls12_certificate == certificate:
                     raise AssertionError("generated TLS 1.2 leg reused the TLS 1.3 leaf")
+                if args.resumption_tls12 and tls12_certificate != certificate:
+                    raise AssertionError("on-disk P-256 TLS 1.2 leg changed the serving leaf")
 
             held_wss = connect_wss(ws_port, context, parent)
             clients.append(held_wss)
@@ -219,9 +234,9 @@ def main() -> int:
             oper.send(b"USER smoke 0 * :Windows TLS Helix operator")
             oper.wait(b" 381 ", start=start)
             original_token = token(oper)
-            if args.generated:
+            if args.generated or args.resumption_tls12:
                 helix.wait_log_contains(root / "daemon.log", "hardened TLS 1.2 also accepted")
-            else:
+            if not args.generated:
                 helix.wait_log_contains(root / "daemon.log", "acme renewal scheduler enabled")
                 helix.wait_log_contains(root / "daemon.log", "acme renewal not due for localhost")
                 helix.wait_log_contains(root / "daemon.log", "ocsp staple scheduler enabled")
@@ -277,7 +292,7 @@ def main() -> int:
                             (different_from is None or candidate.id != different_from.id)):
                         return candidate
                     client.ping(f"ticket-{label}".encode())
-                raise AssertionError(f"{label}: fresh TLS 1.3 session ticket was not issued")
+                raise AssertionError(f"{label}: fresh TLS session ticket was not issued")
 
             def assert_resumed(saved: ssl.SSLSession, label: str) -> ssl.SSLSession:
                 resumed = connect_tls(tls_port, context, None, resume_session=saved)
@@ -290,12 +305,42 @@ def main() -> int:
                 finally:
                     resumed.close()
 
+            def assert_tls12_ticket_use(saved: ssl.SSLSession, expected: bool, label: str) -> None:
+                probe = connect_tls(tls_port, tls12_context, None, resume_session=saved)
+                try:
+                    if probe.socket.session_reused != expected:
+                        raise AssertionError(
+                            f"{label}: TLS 1.2 ticket reuse was {probe.socket.session_reused}, expected {expected}"
+                        )
+                    probe.register(label.encode())
+                    probe.ping(f"{label}-pong".encode())
+                finally:
+                    probe.close()
+
             startup_ticket: ssl.SSLSession | None = None
             post_rehash_ticket: ssl.SSLSession | None = None
-            if args.resumption:
+            held_tls12_ticket: ssl.SSLSession | None = None
+            consumed_tls12_ticket: ssl.SSLSession | None = None
+            post_rehash_tls12_ticket: ssl.SSLSession | None = None
+            if args.resumption or args.early_data:
                 startup_ticket = ticket_from(owner, "startup")
                 assert_resumed(startup_ticket, "resbefore")
-                print("PASS: startup TLS 1.3 session ticket resumed with early data disabled", flush=True)
+                print(
+                    "PASS: startup TLS 1.3 session ticket resumed"
+                    + (" with early data enabled" if args.early_data else " with early data disabled"),
+                    flush=True,
+                )
+            if args.resumption_tls12:
+                held_tls12_ticket = ticket_from(held_tls12, "held12")
+                fresh_tls12 = connect_tls(tls_port, tls12_context, None)
+                try:
+                    fresh_tls12.register(b"seed12")
+                    consumed_tls12_ticket = ticket_from(fresh_tls12, "seed12")
+                finally:
+                    fresh_tls12.close()
+                assert_tls12_ticket_use(consumed_tls12_ticket, True, "used12")
+                assert_tls12_ticket_use(consumed_tls12_ticket, False, "replay12")
+                print("PASS: TLS 1.2 ticket resumed once and its replay fell back to a full handshake", flush=True)
 
             if not args.generated:
                 oper.command(b"REHASH", b"Configuration reloaded")
@@ -304,10 +349,17 @@ def main() -> int:
                 assert_held("unchanged-tls-rehash")
                 if fresh_fingerprint("rehash") != certificate:
                     raise AssertionError("unchanged TLS REHASH changed the serving certificate")
-                if args.resumption:
+                if args.resumption or args.early_data:
                     assert startup_ticket is not None
                     post_rehash_ticket = assert_resumed(startup_ticket, "resrehash")
                     print("PASS: pre-REHASH TLS 1.3 ticket resumed after key rotation", flush=True)
+                if args.resumption_tls12:
+                    fresh_tls12 = connect_tls(tls_port, tls12_context, None)
+                    try:
+                        fresh_tls12.register(b"postrh12")
+                        post_rehash_tls12_ticket = ticket_from(fresh_tls12, "postrh12")
+                    finally:
+                        fresh_tls12.close()
                 print("PASS: unchanged on-disk TLS REHASH kept held TLS/WSS, token and certificate", flush=True)
 
             held_baseline = len(clients)
@@ -357,11 +409,21 @@ def main() -> int:
                     + (" with generated TLS 1.2" if args.generated else " with ACME/OCSP"),
                     flush=True,
                 )
-                if args.resumption:
+                if args.resumption or args.early_data:
                     assert startup_ticket is not None and post_rehash_ticket is not None
                     assert_resumed(startup_ticket, f"resold{sequence}")
                     assert_resumed(post_rehash_ticket, f"resnew{sequence}")
                     print(f"PASS: swap {sequence} retained pre- and post-REHASH TLS ticket keys", flush=True)
+                if args.resumption_tls12:
+                    assert held_tls12_ticket is not None
+                    assert consumed_tls12_ticket is not None
+                    assert post_rehash_tls12_ticket is not None
+                    assert_tls12_ticket_use(consumed_tls12_ticket, False, f"used12s{sequence}")
+                    assert_tls12_ticket_use(held_tls12_ticket, sequence == 1, f"old12s{sequence}")
+                    if sequence == 2:
+                        assert_tls12_ticket_use(post_rehash_tls12_ticket, True, "new12s2")
+                        assert_tls12_ticket_use(post_rehash_tls12_ticket, False, "dup12s2")
+                    print(f"PASS: swap {sequence} retained TLS 1.2 ticket replay history", flush=True)
                 serving_pid = next_pid
 
             # The first swap's fresh probes remain open through the second
