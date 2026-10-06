@@ -11,6 +11,7 @@ const cloak = @import("../proto/cloak.zig");
 const command_usage = @import("command_usage.zig");
 const config_format = @import("config_format.zig");
 const windows_config_proof = @import("helix/native_windows_config_proof.zig");
+const windows_tls_proof = @import("helix/native_windows_tls_proof.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const kill_relay = @import("../proto/kill_relay.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
@@ -30,6 +31,31 @@ const tracelog = @import("../substrate/trace.zig");
 const userip = @import("../proto/userip.zig");
 const warden = @import("warden.zig");
 const wildcard_limit = @import("../proto/wildcard_limit.zig");
+
+/// The accepted-event boundary holds the World lock while REHASH reads these
+/// borrowed key and certificate generations. A reload can replace them, so
+/// retain only the digest across the mutation below.
+fn windowsRehashServingTlsDigest(self: anytype) ?windows_tls_proof.Digest {
+    if (self.config.tls_cert_chain.len == 0) return null;
+    const default: windows_tls_proof.Material = .{
+        .cert_chain = self.config.tls_cert_chain,
+        .signing_key = if (self.config.tls_signing_key) |*key| key else null,
+        .ecdsa_p256_signing_key = if (self.config.tls_ecdsa_signing_key) |*key| key else null,
+        .rsa_signing_key = if (self.config.tls_rsa_signing_key) |*key| key else null,
+    };
+    const mode: windows_tls_proof.Tls12Mode = if (self.config.tls12_cert_chain.len == 0)
+        .disabled
+    else if (self.config.tls_signing_key != null)
+        .generated
+    else
+        .shared_default;
+    const side_key = if (self.config.tls12_signing_key) |*key| key else null;
+    const generated: ?windows_tls_proof.GeneratedTls12 = if (mode == .generated) .{
+        .cert_chain = self.config.tls12_cert_chain,
+        .signing_key = side_key orelse return null,
+    } else null;
+    return windows_tls_proof.digestServing(default, mode, generated) catch null;
+}
 
 pub fn handleUnreject(self: anytype, conn: anytype, parsed: anytype) !void {
     const Server = @TypeOf(self.*);
@@ -1182,10 +1208,14 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     const proof_candidate = if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid"))
         self.windows_helix_source_valid.load(.acquire) and
             self.config.windows_helix_raw_source_digest != null and
-            self.config.tls_port == 0 and self.config.tls_cert_chain.len == 0 and
-            !self.config.tls_enable_resumption and self.config.wasm_plugin_dir.len == 0
+            self.config.tls_early_data_max_size == 0 and
+            (!self.config.tls_enable_resumption or self.config.tls12_cert_chain.len == 0)
     else
         false;
+    const tls_digest_before: ?windows_tls_proof.Digest = if (proof_candidate)
+        windowsRehashServingTlsDigest(self)
+    else
+        null;
     const canonical_path: ?[:0]u8 = if (proof_candidate)
         std.Io.Dir.cwd().realPathFileAlloc(io, path, self.allocator) catch null
     else
@@ -1253,14 +1283,16 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
             }
         }
     }
-    const retain_boot_source = source_unchanged and !parsed.tls.enabled and
-        (parsed.wasm.plugin_dir == null or parsed.wasm.plugin_dir.?.len == 0);
+    const retain_boot_source = source_unchanged;
 
     // Commit: replace the previous reloaded generation, then point the live
     // registry at the new bindings. `parsed`'s strings (incl. the TLS cert/key
     // paths consulted just below) now live in `self.reload_parsed`.
     // Any failure after mutation starts leaves native handoff refused. Only a
-    // completed, byte-identical plaintext REHASH can restore the boot proof.
+    // A completed, byte-identical REHASH can retain the boot proof only when
+    // the serving TLS generation is also unchanged. The Windows HXWM checkpoint
+    // carries the actual post-REHASH WASM modules and mutable state; the
+    // candidate revalidates their policy.
     if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid"))
         self.windows_helix_source_valid.store(false, .release);
     self.allocator.free(self.reload_bindings);
@@ -1306,7 +1338,17 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     ) catch "Configuration reloaded";
     try self.replyNumeric(conn, .RPL_REHASHING, &.{path}, note);
     if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid")) {
-        if (retain_boot_source and tls_outcome == .not_configured)
+        const tls_unchanged = switch (tls_outcome) {
+            .not_configured => !self.reload_parsed.?.tls.enabled and self.config.tls_cert_chain.len == 0,
+            .reloaded => blk: {
+                if (!self.reload_parsed.?.tls.enabled) break :blk false;
+                const before = tls_digest_before orelse break :blk false;
+                const after = windowsRehashServingTlsDigest(self) orelse break :blk false;
+                break :blk windows_tls_proof.equal(before, after);
+            },
+            .kept => false,
+        };
+        if (retain_boot_source and tls_unchanged)
             self.windows_helix_source_valid.store(true, .release);
     }
 }

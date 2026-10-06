@@ -327,11 +327,22 @@ settings, identity material, and OAuth JWKS bytes. The authenticated TLS
 material checkpoint supplies the exact serving certificate and key generations
 before COMMIT. A completed `REHASH` retains Windows Helix eligibility when
 the canonical config source and every ordered `env:` and `@file:` value still
-match startup, TLS and resumption are disabled, and no WASM plugin directory
-is configured. A changed REHASH invalidates eligibility for that process,
-even if a later REHASH restores the original text; a normal boot is then
-needed before another upgrade. ACME renewal does not invalidate the static
-proof.
+match startup and TLS 0-RTT early data is disabled. TLS 1.3 1-RTT session
+tickets may remain enabled when TLS 1.2 is disabled; their current and
+previous keys cross the handoff. With
+TLS enabled, the reload must succeed and leave the full serving
+certificate/key generation and TLS 1.2 leg byte-identical; the authenticated
+checkpoint then carries that generation.
+With WASM enabled, the checkpoint carries the actual post-REHASH modules and
+mutable state, and the candidate revalidates their policy. A changed REHASH,
+failed TLS reload, or changed serving TLS material invalidates eligibility for
+that process, even if a later REHASH restores the original inputs; a normal
+boot is then needed before another upgrade. ACME renewal does not invalidate
+the static proof.
+
+Windows `UPGRADE` refuses configurations with TLS 0-RTT early data or TLS 1.2
+session ticket resumption enabled. Their shared replay ring is process-local;
+the current Windows handoff carries ticket keys but cannot transfer the ring.
 
 The guarded path carries Web Push worker state, mail queue and private journal
 custody, Geo worker cache and pinned GeoIP/ASN databases, channel statistics,
@@ -418,11 +429,15 @@ python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative rotation
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative failed-reload
 python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_webhook_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe --rehash
 python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --generated
 python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --active
@@ -488,11 +503,15 @@ python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative rotation
+python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative failed-reload
 python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_webhook_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe --rehash
 python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_webpush_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_geo_helix_smoke.py .\zig-out\bin\onyx-server.exe

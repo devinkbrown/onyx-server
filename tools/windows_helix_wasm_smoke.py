@@ -5,6 +5,7 @@
 """Keep mutable OroWasm memory and held IRC clients through two Windows Helix swaps.
 
 Usage: python -B tools/windows_helix_wasm_smoke.py zig-out/bin/onyx-server.exe
+       python -B tools/windows_helix_wasm_smoke.py --rehash zig-out/bin/onyx-server.exe
 """
 
 from __future__ import annotations
@@ -70,8 +71,23 @@ def count(client: helix.Client, nick: bytes, expected: int) -> None:
         raise AssertionError(f"OroWasm counter expected {expected}, received {line!r}")
 
 
+def session_token(client: helix.Client) -> bytes:
+    line = client.command(b"SESSION TOKEN", b" :SESSION TOKEN ")
+    token = line.split(b" :SESSION TOKEN ", 1)[1].split()[0]
+    if len(token) != 32 or any(byte not in b"0123456789abcdef" for byte in token):
+        raise AssertionError(f"invalid local session token: {token!r}")
+    return token
+
+
+def reply(client: helix.Client, nick: bytes) -> None:
+    line = client.command(b"COUNTME", b" NOTICE " + nick + b" :", timeout=15)
+    if not line.endswith(b" NOTICE " + nick + b" :ok"):
+        raise AssertionError(f"OroWasm reply module expected ok, received {line!r}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rehash", action="store_true", help="reload changed plugin bytes before the two Helix swaps")
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
     if os.name != "nt":
@@ -87,7 +103,7 @@ def main() -> int:
         plugins = root / "plugins"
         plugins.mkdir()
         module = plugins / "COUNTME.wasm"
-        module.write_bytes(COUNTER_WASM)
+        module.write_bytes(REPLY_WASM if args.rehash else COUNTER_WASM)
         port = helix.free_port()
         password = secrets.token_urlsafe(22)
         config = root / "server.toml"
@@ -96,10 +112,10 @@ def main() -> int:
             "[cloak]\nsecret = \"" + secrets.token_urlsafe(32) + "\"\n"
             "[limits]\nnum_shards = 2\n"
             f"[listen]\nhost = \"127.0.0.1\"\nirc = {port}\n"
-            '[wasm]\nplugin_dir = "plugins"\n'
+            '[wasm]\nplugin_dir = "plugins"\ndefault_fuel = 16384\n'
             '[sasl]\nenabled = true\naccount_db = "private/accounts.wal"\n'
             '[accounts]\npbkdf2_rounds = 10000\n'
-            '[[oper_groups]]\nname = "netadmin"\nprivileges = ["server_restart"]\n'
+            '[[oper_groups]]\nname = "netadmin"\nprivileges = ["server_restart", "server_rehash"]\n'
             '[[opers]]\naccount = "helixadmin"\nclass = "netadmin"\n',
             encoding="utf-8",
         )
@@ -134,37 +150,55 @@ def main() -> int:
             oper.send(b"USER smoke 0 * :Windows OroWasm Helix operator")
             oper.wait(b" 381 ", start=start)
 
-            count(user, b"wasmuser", 1)
-            count(oper, b"wasmadmin", 2)
             serving_pid = parent.pid
-            # The successor must use the authorized source bytes in the
-            # checkpoint; the mutable directory now contains another module.
-            module.write_bytes(REPLY_WASM)
-            print("PASS: OroWasm counter is shared by two held IRC clients", flush=True)
-
+            token_before = session_token(oper)
             original_config = config.read_text(encoding="utf-8")
-            changed_config = original_config.replace("num_shards = 2", "num_shards = 3", 1)
-            if changed_config == original_config:
-                raise AssertionError("rollback fixture did not change config")
-            config.write_text(changed_config, encoding="utf-8")
-            try:
-                oper.send(b"UPGRADE")
-                helix.wait_log_contains(log_path, "deferred UPGRADE failed")
-            finally:
-                config.write_text(original_config, encoding="utf-8")
-            if helix.image_pids(binary) != {serving_pid}:
-                raise AssertionError("failed Helix left a successor or lost the OroWasm predecessor")
-            for held in clients:
-                held.ping(b"wasm-after-abort")
-            count(user, b"wasmuser", 3)
-            print("PASS: rejected candidate kept held clients and mutable OroWasm memory", flush=True)
+            if args.rehash:
+                reply(user, b"wasmuser")
+                module.write_bytes(COUNTER_WASM)
+                oper.command(b"REHASH", b"Configuration reloaded", timeout=30)
+                if config.read_text(encoding="utf-8") != original_config:
+                    raise AssertionError("unchanged-source REHASH altered config text")
+                if session_token(oper) != token_before:
+                    raise AssertionError("unchanged-source REHASH changed the local session token")
+                count(user, b"wasmuser", 1)
+                count(oper, b"wasmadmin", 2)
+                if helix.image_pids(binary) != {serving_pid}:
+                    raise AssertionError("REHASH replaced the serving process")
+                # The candidate must inherit the post-REHASH module and memory,
+                # even though the disk now contains the old reply module again.
+                module.write_bytes(REPLY_WASM)
+                print("PASS: unchanged-source REHASH activated changed OroWasm bytes and shared counter state", flush=True)
+                next_count = 3
+            else:
+                count(user, b"wasmuser", 1)
+                count(oper, b"wasmadmin", 2)
+                module.write_bytes(REPLY_WASM)
+                print("PASS: OroWasm counter is shared by two held IRC clients", flush=True)
+
+                changed_config = original_config.replace("num_shards = 2", "num_shards = 3", 1)
+                if changed_config == original_config:
+                    raise AssertionError("rollback fixture did not change config")
+                config.write_text(changed_config, encoding="utf-8")
+                try:
+                    oper.send(b"UPGRADE")
+                    helix.wait_log_contains(log_path, "deferred UPGRADE failed")
+                finally:
+                    config.write_text(original_config, encoding="utf-8")
+                if helix.image_pids(binary) != {serving_pid}:
+                    raise AssertionError("failed Helix left a successor or lost the OroWasm predecessor")
+                for held in clients:
+                    held.ping(b"wasm-after-abort")
+                count(user, b"wasmuser", 3)
+                print("PASS: rejected candidate kept held clients and mutable OroWasm memory", flush=True)
+                next_count = 4
 
             for sequence in (1, 2):
                 oper.send(b"UPGRADE")
                 successor_pid = helix.sole_image_pid(binary, different_from=serving_pid, timeout=45)
                 for held in clients:
                     held.ping(f"wasm-after-swap-{sequence}".encode("ascii"))
-                first_count = 4 + (sequence - 1) * 3
+                first_count = next_count
                 count(user, b"wasmuser", first_count)
                 count(oper, b"wasmadmin", first_count + 1)
                 fresh = helix.Client(port)
@@ -172,12 +206,31 @@ def main() -> int:
                 fresh_nick = f"wasmfresh{sequence}".encode("ascii")
                 fresh.register(fresh_nick)
                 count(fresh, fresh_nick, first_count + 2)
+                next_count += 3
+                if session_token(oper) != token_before:
+                    raise AssertionError(f"Helix swap {sequence} changed the local session token")
                 print(
                     f"PASS: OroWasm Helix swap {sequence}, {serving_pid} -> {successor_pid}; "
                     "held and fresh IRC, source bytes, mutable memory",
                     flush=True,
                 )
                 serving_pid = successor_pid
+            if args.rehash:
+                changed_config = original_config.replace("default_fuel = 16384", "default_fuel = 16385", 1)
+                if changed_config == original_config:
+                    raise AssertionError("WASM policy negative did not change config")
+                config.write_text(changed_config, encoding="utf-8")
+                oper.command(b"REHASH", b"Configuration reloaded", timeout=30)
+                oper.command(b"OROWASM STATUS", b"default_fuel=16385", timeout=15)
+                oper.send(b"UPGRADE")
+                helix.wait_log_contains(log_path, "deferred UPGRADE failed: NativeUpgradeUnavailable")
+                if helix.image_pids(binary) != {serving_pid}:
+                    raise AssertionError("changed WASM policy REHASH replaced the serving process")
+                for held in clients:
+                    held.ping(b"wasm-after-policy-refusal")
+                if session_token(oper) != token_before:
+                    raise AssertionError("changed WASM policy REHASH changed the local session token")
+                print("PASS: changed WASM policy REHASH refused Helix and kept held clients live", flush=True)
             if parent.wait(timeout=5) != 0:
                 raise AssertionError("original predecessor did not exit cleanly")
             return 0

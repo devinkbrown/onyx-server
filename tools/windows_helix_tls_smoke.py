@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Keep TLS IRC and WSS alive through two Windows Helix swaps.
+"""Keep TLS IRC and WSS alive through Windows REHASH and Helix.
 
 The default fixture enables both ACME and OCSP schedulers without contacting
-public endpoints. --generated checks daemon-minted default and TLS 1.2 leaves.
+public endpoints. It performs an unchanged, on-disk TLS REHASH before two
+swaps. --generated first checks two pristine swaps, then confirms that REHASH
+minted a new TLS 1.2 side leaf and UPGRADE refuses. Optional negative modes
+exercise valid cert rotation and failed cert reload after the positive swaps.
 
 Usage: python -B tools/windows_helix_tls_smoke.py zig-out/bin/onyx-server.exe
 """
@@ -32,10 +35,13 @@ from windows_tls_companion_smoke import create_fixture, reserve_ports
 
 
 class TlsClient(helix.Client):
-    def __init__(self, port: int, context: ssl.SSLContext):
+    def __init__(self, port: int, context: ssl.SSLContext,
+                 resume_session: ssl.SSLSession | None = None):
         raw = socket.create_connection(("127.0.0.1", port), timeout=5)
         try:
-            self.socket = context.wrap_socket(raw, server_hostname="localhost")
+            self.socket = context.wrap_socket(
+                raw, server_hostname="localhost", session=resume_session,
+            )
         except Exception:
             raw.close()
             raise
@@ -48,13 +54,13 @@ class TlsClient(helix.Client):
 
 
 def connect_tls(port: int, context: ssl.SSLContext, process: subprocess.Popen | None,
-                timeout: float = 30) -> TlsClient:
+                timeout: float = 30, resume_session: ssl.SSLSession | None = None) -> TlsClient:
     until = time.monotonic() + timeout
     while time.monotonic() < until:
         if process is not None and process.poll() is not None:
             raise RuntimeError(f"daemon exited before TLS listener opened: {process.returncode}")
         try:
-            return TlsClient(port, context)
+            return TlsClient(port, context, resume_session)
         except (OSError, ssl.SSLError):
             time.sleep(0.2)
     raise TimeoutError(f"TLS IRC listener did not open on port {port}")
@@ -95,8 +101,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--generated", action="store_true",
-                        help="carry daemon-generated default and TLS 1.2 certificates")
+                        help="carry generated certificates, then refuse UPGRADE after REHASH")
+    parser.add_argument("--negative", choices=("rotation", "failed-reload"),
+                        help="after two swaps, REHASH rotated or unreadable TLS files and require UPGRADE refusal")
+    parser.add_argument("--resumption", action="store_true",
+                        help="prove 1-RTT TLS ticket reuse across unchanged REHASH and two swaps")
     args = parser.parse_args()
+    if args.generated and args.negative:
+        parser.error("--generated and --negative require separate fixture runs")
+    if args.resumption and (args.generated or args.negative):
+        parser.error("--resumption requires the positive on-disk certificate fixture")
     if os.name != "nt":
         parser.error("this fixture requires native Windows")
     original = args.binary.resolve()
@@ -134,6 +148,8 @@ def main() -> int:
             "dns_name = \"localhost\"\ncert_path = \"leaf.pem\"\n"
             "key_path = \"keys-private/server.key\"\n"
         )
+        if args.resumption:
+            tls_settings += "enable_resumption = true\nearly_data_max_size = 0\n"
         acme_settings = (
             "[acme]\nenabled = false\n"
             if args.generated else
@@ -154,7 +170,7 @@ def main() -> int:
             +
             "[sasl]\nenabled = true\naccount_db = \"private/accounts.wal\"\n"
             "[accounts]\npbkdf2_rounds = 10000\n"
-            "[[oper_groups]]\nname = \"netadmin\"\nprivileges = [\"server_restart\"]\n"
+            "[[oper_groups]]\nname = \"netadmin\"\nprivileges = [\"server_restart\", \"server_rehash\"]\n"
             "[[opers]]\naccount = \"helixadmin\"\nclass = \"netadmin\"\n",
             encoding="utf-8",
         )
@@ -211,6 +227,90 @@ def main() -> int:
                 helix.wait_log_contains(root / "daemon.log", "ocsp staple scheduler enabled")
 
             serving_pid = parent.pid
+
+            def assert_held(marker: str) -> None:
+                for held in clients:
+                    if isinstance(held, TlsClient):
+                        held.ping(marker.encode())
+                    else:
+                        held.ping(marker)
+                held_wss.control_ping()
+                if token(oper) != original_token:
+                    raise AssertionError("local reusable session token changed across REHASH or Helix")
+                held_tls.send(f"PRIVMSG heldwss :{marker}".encode())
+                held_wss.until(f"PRIVMSG heldwss :{marker}")
+
+            def fresh_fingerprint(label: str) -> bytes:
+                fresh_tls = connect_tls(tls_port, context, None)
+                clients.append(fresh_tls)
+                fresh_tls.register(f"{label}tls".encode())
+                fresh_tls.ping(label.encode())
+                fingerprint = fresh_tls.certificate_digest()
+                fresh_wss = connect_wss(ws_port, context, None)
+                clients.append(fresh_wss)
+                fresh_wss.register(f"{label}wss")
+                fresh_wss.ping(label)
+                if hashlib.sha256(fresh_wss.sock.getpeercert(binary_form=True)).digest() != fingerprint:
+                    raise AssertionError("fresh TLS IRC and WSS served different certificates")
+                return fingerprint
+
+            def require_refusal(label: str) -> None:
+                oper.send(b"UPGRADE")
+                # The source-proof branch logs this exact refusal before
+                # hooks.begin can launch a candidate. A generic failed upgrade
+                # could instead hide an unrelated candidate abort.
+                helix.wait_log_contains(
+                    root / "daemon.log",
+                    "UPGRADE refused: Windows config or external material has no exact source proof",
+                )
+                if helix.image_pids(binary) != {serving_pid}:
+                    raise AssertionError(f"{label}: refused UPGRADE lost predecessor or left a successor")
+                assert_held(f"{label}-refused")
+                print(f"PASS: {label}: REHASH refused UPGRADE; held TLS/WSS and token stayed live", flush=True)
+
+            def ticket_from(client: TlsClient, label: str,
+                            different_from: ssl.SSLSession | None = None) -> ssl.SSLSession:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    candidate = client.socket.session
+                    if (candidate is not None and candidate.has_ticket and
+                            (different_from is None or candidate.id != different_from.id)):
+                        return candidate
+                    client.ping(f"ticket-{label}".encode())
+                raise AssertionError(f"{label}: fresh TLS 1.3 session ticket was not issued")
+
+            def assert_resumed(saved: ssl.SSLSession, label: str) -> ssl.SSLSession:
+                resumed = connect_tls(tls_port, context, None, resume_session=saved)
+                try:
+                    if not resumed.socket.session_reused:
+                        raise AssertionError(f"{label}: TLS 1.3 session was not resumed")
+                    resumed.register(label.encode())
+                    resumed.ping(f"{label}-pong".encode())
+                    return ticket_from(resumed, label, different_from=saved)
+                finally:
+                    resumed.close()
+
+            startup_ticket: ssl.SSLSession | None = None
+            post_rehash_ticket: ssl.SSLSession | None = None
+            if args.resumption:
+                startup_ticket = ticket_from(owner, "startup")
+                assert_resumed(startup_ticket, "resbefore")
+                print("PASS: startup TLS 1.3 session ticket resumed with early data disabled", flush=True)
+
+            if not args.generated:
+                oper.command(b"REHASH", b"Configuration reloaded")
+                if helix.image_pids(binary) != {serving_pid}:
+                    raise AssertionError("unchanged TLS REHASH changed the serving process")
+                assert_held("unchanged-tls-rehash")
+                if fresh_fingerprint("rehash") != certificate:
+                    raise AssertionError("unchanged TLS REHASH changed the serving certificate")
+                if args.resumption:
+                    assert startup_ticket is not None
+                    post_rehash_ticket = assert_resumed(startup_ticket, "resrehash")
+                    print("PASS: pre-REHASH TLS 1.3 ticket resumed after key rotation", flush=True)
+                print("PASS: unchanged on-disk TLS REHASH kept held TLS/WSS, token and certificate", flush=True)
+
+            held_baseline = len(clients)
             for sequence in (1, 2):
                 acme_checks_before = (
                     (root / "daemon.log").read_text(encoding="utf-8", errors="replace").count(
@@ -219,17 +319,7 @@ def main() -> int:
                 oper.send(b"UPGRADE")
                 next_pid = helix.sole_image_pid(binary, different_from=serving_pid)
                 marker = f"tls-wss-helix-{sequence}"
-                for held in clients:
-                    if isinstance(held, TlsClient):
-                        held.ping(marker.encode())
-                    else:
-                        held.ping(marker)
-                held_wss.control_ping()
-                if token(oper) != original_token:
-                    raise AssertionError("local reusable session token changed across Helix")
-
-                held_tls.send(f"PRIVMSG heldwss :{marker}".encode())
-                held_wss.until(f"PRIVMSG heldwss :{marker}")
+                assert_held(marker)
 
                 fresh_tls = connect_tls(tls_port, context, None)
                 clients.append(fresh_tls)
@@ -267,7 +357,65 @@ def main() -> int:
                     + (" with generated TLS 1.2" if args.generated else " with ACME/OCSP"),
                     flush=True,
                 )
+                if args.resumption:
+                    assert startup_ticket is not None and post_rehash_ticket is not None
+                    assert_resumed(startup_ticket, f"resold{sequence}")
+                    assert_resumed(post_rehash_ticket, f"resnew{sequence}")
+                    print(f"PASS: swap {sequence} retained pre- and post-REHASH TLS ticket keys", flush=True)
                 serving_pid = next_pid
+
+            # The first swap's fresh probes remain open through the second
+            # swap. Release them now so refusal cases measure REHASH rather
+            # than the fixture's accumulated short-lived probe connections.
+            for probe in clients[held_baseline:]:
+                if isinstance(probe, TlsClient):
+                    probe.close()
+                else:
+                    probe.sock.close()
+            del clients[held_baseline:]
+
+            if args.generated:
+                # REHASH always mints a new default Ed25519 leaf and a separate
+                # P-256 TLS 1.2 leg. The bounded same-material proof must reject
+                # the next upgrade even though the TOML source is unchanged.
+                oper.command(b"REHASH", b"Configuration reloaded")
+                assert_held("generated-rehash")
+                fresh_tls12 = connect_tls(tls_port, tls12_context, None)
+                clients.append(fresh_tls12)
+                fresh_tls12.register(b"rehashfresh12")
+                fresh_tls12.ping(b"generated-rehash")
+                if fresh_tls12.certificate_digest() == tls12_certificate:
+                    raise AssertionError("generated REHASH did not replace the TLS 1.2 side leaf")
+                if fresh_fingerprint("genrh") == certificate:
+                    raise AssertionError("generated REHASH did not replace the default TLS leaf")
+                require_refusal("generated TLS 1.2 material changed")
+            elif args.negative == "rotation":
+                staged = root / "rotated"
+                staged.mkdir()
+                create_private_directory(staged / "keys-private")
+                create_fixture(staged)
+                (staged / "leaf.pem").replace(root / "leaf.pem")
+                (staged / "keys-private" / "server.key").replace(root / "keys-private" / "server.key")
+                oper.command(b"REHASH", b"Configuration reloaded")
+                assert_held("rotated-rehash")
+                if fresh_fingerprint("rotated") == certificate:
+                    raise AssertionError("valid TLS cert rotation did not change the serving leaf")
+                require_refusal("valid TLS cert rotation")
+            elif args.negative == "failed-reload":
+                key_path = root / "keys-private" / "server.key"
+                hidden_key = root / "keys-private" / "server.key.held"
+                key_path.replace(hidden_key)
+                try:
+                    start = len(oper.lines)
+                    oper.send(b"REHASH")
+                    oper.wait(b"TLS cert reload failed", start=start)
+                    oper.wait(b"Configuration reloaded", start=start)
+                finally:
+                    hidden_key.replace(key_path)
+                assert_held("failed-reload")
+                if fresh_fingerprint("failedreload") != certificate:
+                    raise AssertionError("failed TLS reload changed the serving leaf")
+                require_refusal("failed TLS cert reload")
             if parent.wait(timeout=2) != 0:
                 raise AssertionError("original predecessor did not exit cleanly")
             return 0

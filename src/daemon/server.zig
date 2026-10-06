@@ -30402,6 +30402,21 @@ pub const LinuxServer = struct {
             return self.performUpgradeAfterCompatibleTarget(request, -1, exe_target);
         }
         if (comptime builtin.os.tag == .windows) {
+            // The ticket keys survive Helix, but the shared replay guard does
+            // not. Its loss could admit accepted TLS 1.3 early data again or
+            // reuse a consumed TLS 1.2 ticket, so refuse before launch. REHASH
+            // publishes the TLS 1.2 chain under World; take the same lock for
+            // this preflight read, then recheck at the later frozen-state cut.
+            self.world.lockRead();
+            const tls_replay_continuity_blocked = self.config.tls_enable_resumption and
+                (self.config.tls_early_data_max_size != 0 or self.config.tls12_cert_chain.len != 0);
+            self.world.unlockRead();
+            if (tls_replay_continuity_blocked) {
+                const reason = "UPGRADE refused: Windows TLS replay guard has no exact Helix checkpoint";
+                srvLog("onyx-server: {s}\n", .{reason});
+                self.deferredUpgradeNotice(request, reason);
+                return error.TlsReplayContinuityUnsupported;
+            }
             const hooks = self.config.native_upgrade_hooks orelse return error.NativeUpgradeUnavailable;
             const exe_target = switch (request) {
                 .client_target => |target| target.executable,
@@ -30411,7 +30426,9 @@ pub const LinuxServer = struct {
                 self.config.config_path == null or !self.config.windows_helix_explicit_node_secret or
                 !self.config.windows_helix_explicit_cloak_secret)
             {
-                self.deferredUpgradeNotice(request, "UPGRADE refused: Windows config or external material has no exact source proof");
+                const reason = "UPGRADE refused: Windows config or external material has no exact source proof";
+                srvLog("onyx-server: {s}\n", .{reason});
+                self.deferredUpgradeNotice(request, reason);
                 return error.NativeUpgradeUnavailable;
             }
             if (self.windows_helix_upgrade_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
@@ -30839,6 +30856,12 @@ pub const LinuxServer = struct {
             if (!self.windows_helix_source_valid.load(.acquire)) {
                 self.deferredUpgradeNotice(request, "UPGRADE refused: Windows source proof changed before the handoff cut");
                 return error.NativeUpgradeUnavailable;
+            }
+            if (self.config.tls_enable_resumption and
+                (self.config.tls_early_data_max_size != 0 or self.config.tls12_cert_chain.len != 0))
+            {
+                self.deferredUpgradeNotice(request, "UPGRADE refused: Windows TLS replay guard has no exact checkpoint at the handoff cut");
+                return error.TlsReplayContinuityUnsupported;
             }
         }
 
@@ -101826,6 +101849,64 @@ test "Windows native Helix listener manifest verifies exact bound socket roles" 
     try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
     cfg.native_listener_manifest = &.{.{ .shard = 0, .kind = .tls, .family = .ipv6, .fd = listener }};
     try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
+}
+
+test "Windows UPGRADE refuses replay-backed TLS before launching a candidate" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_enable_resumption = true,
+        .tls_early_data_max_size = 4096,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const Hooks = struct {
+        fn begin(ctx: *anyopaque, _: []const u8) anyerror!void {
+            const started: *bool = @ptrCast(@alignCast(ctx));
+            started.* = true;
+        }
+        fn transferAndCommit(_: *anyopaque, _: NativeUpgradeSnapshot) anyerror!noreturn {
+            return error.TestUnexpectedResult;
+        }
+        fn abort(_: *anyopaque) void {}
+    };
+    var candidate_started = false;
+    server.config.native_upgrade_hooks = .{
+        .ctx = &candidate_started,
+        .begin = Hooks.begin,
+        .transferAndCommit = Hooks.transferAndCommit,
+        .abort = Hooks.abort,
+    };
+    server.config.exe_path = "unused-native-test-image";
+    server.config.config_path = "unused-native-test-config";
+    server.config.windows_helix_source_digest = @splat(0x44);
+    server.config.windows_helix_explicit_node_secret = true;
+    server.config.windows_helix_explicit_cloak_secret = true;
+    server.windows_helix_source_valid.store(true, .release);
+
+    const binder: [32]u8 = @splat(0x57);
+    try std.testing.expect(server.tls_replay_guard.checkAndRecord(&binder));
+    const ticket_key_before = server.tls_ticket_key;
+    try std.testing.expectError(error.TlsReplayContinuityUnsupported, server.performUpgrade(.signal));
+    try std.testing.expect(!candidate_started);
+    try std.testing.expectEqual(ticket_key_before, server.tls_ticket_key);
+    try std.testing.expect(!server.tls_replay_guard.checkAndRecord(&binder));
+
+    // TLS 1.2 consumes the same guard for single-use RFC 5077 tickets even
+    // when TLS 1.3 early data is disabled. Preserve that replay barrier too.
+    server.config.tls_early_data_max_size = 0;
+    server.config.tls12_cert_chain = &.{"fixture-der"};
+    try std.testing.expectError(error.TlsReplayContinuityUnsupported, server.performUpgrade(.signal));
+    try std.testing.expect(!candidate_started);
+    try std.testing.expectEqual(ticket_key_before, server.tls_ticket_key);
+    try std.testing.expect(!server.tls_replay_guard.checkAndRecord(&binder));
 }
 
 test "Windows Helix admission checkpoints match the carried physical clients" {
