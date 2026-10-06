@@ -97,6 +97,7 @@ const Backing = struct {
     id: DomainId,
     revision: u64 = 1,
     closing: bool = false,
+    restore_pending: bool = false,
     next_call: u64 = 1,
     next_endpoint: u64 = 1,
     next_stream: u32 = 1,
@@ -108,12 +109,48 @@ const Backing = struct {
     active_egress: ?EgressPin = null,
     active_inbound: ?InboundPin = null,
     pending_candidates: usize = 0,
+    registry_next: ?*Backing = null,
     calls: CallMap,
     endpoints: EndpointMap,
     memberships: MembershipMap,
     bridge_policy: BridgeMap,
 };
 var next_domain = std.atomic.Value(u64).init(1);
+var domain_registry_mutex: std.atomic.Mutex = .unlocked;
+var domain_registry: ?*Backing = null;
+
+/// The registry includes unpublished restore candidates. A successful
+/// reservation prevents another in-process Domain from claiming the same
+/// identity while the candidate waits for the outer Helix transaction.
+fn reserveRestoredDomain(source: *Backing) Error!void {
+    lock(&domain_registry_mutex);
+    defer domain_registry_mutex.unlock();
+    var current = domain_registry;
+    while (current) |item| : (current = item.registry_next) {
+        if (item.id.serial == source.id.serial) return error.PublisherCollision;
+    }
+    const next = std.math.add(u64, source.id.serial, 1) catch return error.InvalidIdentity;
+    const issued = next_domain.load(.monotonic);
+    if (issued == 0) return error.SequenceExhausted;
+    if (next > issued) next_domain.store(next, .monotonic);
+    source.registry_next = domain_registry;
+    domain_registry = source;
+}
+
+fn unreserveDomain(source: *Backing) void {
+    lock(&domain_registry_mutex);
+    defer domain_registry_mutex.unlock();
+    var link = &domain_registry;
+    while (link.*) |item| {
+        if (item == source) {
+            link.* = source.registry_next;
+            source.registry_next = null;
+            return;
+        }
+        link = &item.registry_next;
+    }
+    @panic("unregistered media routing Domain");
+}
 
 fn issueDomain(counter: *std.atomic.Value(u64)) Error!DomainId {
     var current = counter.load(.monotonic);
@@ -180,7 +217,7 @@ pub const GraphSnapshot = struct {
     }
 
     pub fn validate(self: *const GraphSnapshot) GraphError!void {
-        if (self.id.serial == 0 or self.revision == 0 or self.next_call == 0 or self.next_endpoint == 0 or
+        if (self.id.serial == 0 or self.id.serial == std.math.maxInt(u64) or self.revision == 0 or self.next_call == 0 or self.next_endpoint == 0 or
             self.next_stream == 0 or self.next_scope == 0 or self.next_binding == 0 or
             self.native_binding_serial == 0 or self.webrtc_binding_serial == 0 or
             self.native_binding_serial == self.webrtc_binding_serial or
@@ -319,12 +356,184 @@ pub fn prepareRemappedGraph(allocator: std.mem.Allocator, source: *const GraphSn
     try result.validate();
     return result;
 }
+
+fn attachRestoredOwners(source: *Backing, native: *native_owner.NativeMediaTransport, webrtc: *webrtc_owner.MediaPlane) Error!void {
+    const domain: *Domain = @ptrCast(source);
+    lock(&source.mutex);
+    defer source.mutex.unlock();
+    var scope = Scope{ .source = source, .serial = source.next_scope };
+    const token: *Locked = @ptrCast(&scope);
+    source.active_scope = token;
+    defer source.active_scope = null;
+    const native_binding = source.native_binding.?;
+    const webrtc_binding = source.webrtc_binding.?;
+    try native.attachRoutingLocked(domain, token, native_binding);
+    webrtc.attachRoutingLocked(domain, token, webrtc_binding) catch |err| {
+        native.detachRoutingLocked(domain, token, native_binding);
+        return err;
+    };
+}
+
+fn detachRestoredOwners(source: *Backing, native: *native_owner.NativeMediaTransport, webrtc: *webrtc_owner.MediaPlane) void {
+    const domain: *Domain = @ptrCast(source);
+    lock(&source.mutex);
+    defer source.mutex.unlock();
+    var scope = Scope{ .source = source, .serial = source.next_scope };
+    const token: *Locked = @ptrCast(&scope);
+    source.active_scope = token;
+    defer source.active_scope = null;
+    webrtc.detachRoutingLocked(domain, token, source.webrtc_binding.?);
+    native.detachRoutingLocked(domain, token, source.native_binding.?);
+}
+
+pub const RestoredGraph = struct {
+    domain: *Domain,
+    native_binding: *NativeBinding,
+    webrtc_binding: *WebrtcBinding,
+};
+
+/// Owns a closed, reserved Domain. Its graph and exact binding serials are
+/// ready, but ordinary routing entry points refuse it until publish. The
+/// caller must dispose any prepared egress queue and physical owner state
+/// before aborting.
+pub const PreparedGraphRestore = struct {
+    source: *Backing,
+    native: *native_owner.NativeMediaTransport,
+    webrtc: *webrtc_owner.MediaPlane,
+    published: bool = false,
+
+    pub fn domain(self: *const PreparedGraphRestore) *Domain {
+        return @ptrCast(self.source);
+    }
+
+    /// Final Helix cut: no allocator, validation, socket, or worker operation.
+    /// The returned pointers join the caller's existing owner lifecycle.
+    pub fn publish(self: *PreparedGraphRestore) RestoredGraph {
+        std.debug.assert(!self.published);
+        lock(&self.source.mutex);
+        std.debug.assert(self.source.closing and self.source.restore_pending and self.source.active_scope == null and
+            self.source.native_binding != null and self.source.webrtc_binding != null);
+        self.source.restore_pending = false;
+        self.source.closing = false;
+        self.source.mutex.unlock();
+        self.published = true;
+        return .{
+            .domain = @ptrCast(self.source),
+            .native_binding = self.source.native_binding.?,
+            .webrtc_binding = self.source.webrtc_binding.?,
+        };
+    }
+
+    pub fn deinit(self: *PreparedGraphRestore) void {
+        if (self.published) {
+            self.* = undefined;
+            return;
+        }
+        const source = self.source;
+        std.debug.assert(source.restore_pending and source.pending_candidates == 0 and source.active_scope == null);
+        self.native.requireRoutingReleasable() catch @panic("restored native physical custody must be discarded before Domain abort");
+        self.webrtc.requireRoutingReleasable() catch @panic("restored WebRTC physical custody must be discarded before Domain abort");
+        detachRestoredOwners(source, self.native, self.webrtc);
+        unreserveDomain(source);
+        source.bridge_policy.deinit();
+        source.memberships.deinit();
+        source.endpoints.deinit();
+        source.calls.deinit();
+        source.allocator.destroy(@as(*WebrtcBindingBacking, @ptrCast(@alignCast(source.webrtc_binding.?))));
+        source.allocator.destroy(@as(*NativeBindingBacking, @ptrCast(@alignCast(source.native_binding.?))));
+        source.allocator.destroy(source);
+        self.* = undefined;
+    }
+};
+
+/// Build a complete private candidate from an authenticated, remapped graph.
+/// Every map and binding allocation finishes before owner attachment; a
+/// failed attach rolls back both owners. Only the final successful candidate
+/// reserves its DomainId, so an allocation failure leaves global issuers and
+/// all live domains untouched. The candidate stays closed until publish.
+pub fn prepareGraphRestore(allocator: std.mem.Allocator, graph: *const GraphSnapshot, native: *native_owner.NativeMediaTransport, webrtc: *webrtc_owner.MediaPlane) GraphError!PreparedGraphRestore {
+    try graph.validate();
+    try native.requireRoutingAttachable();
+    try webrtc.requireRoutingAttachable();
+    const source = try allocator.create(Backing);
+    errdefer allocator.destroy(source);
+    source.* = .{
+        .allocator = allocator,
+        .id = graph.id,
+        .revision = graph.revision,
+        .closing = true,
+        .restore_pending = true,
+        .next_call = graph.next_call,
+        .next_endpoint = graph.next_endpoint,
+        .next_stream = graph.next_stream,
+        .next_scope = graph.next_scope,
+        .next_binding = graph.next_binding,
+        .calls = CallMap.init(allocator),
+        .endpoints = EndpointMap.init(allocator),
+        .memberships = MembershipMap.init(allocator),
+        .bridge_policy = BridgeMap.init(allocator),
+    };
+    errdefer {
+        source.bridge_policy.deinit();
+        source.memberships.deinit();
+        source.endpoints.deinit();
+        source.calls.deinit();
+    }
+    try source.calls.ensureTotalCapacity(@intCast(graph.calls.len));
+    try source.endpoints.ensureTotalCapacity(@intCast(graph.endpoints.len));
+    try source.memberships.ensureTotalCapacity(@intCast(graph.memberships.len));
+    try source.bridge_policy.ensureTotalCapacity(@intCast(graph.bridge_policy.len));
+    for (graph.calls) |row| source.calls.putAssumeCapacity(row.channel, row.row);
+    for (graph.endpoints) |row| source.endpoints.putAssumeCapacity(row.key, row.row);
+    for (graph.memberships) |row| source.memberships.putAssumeCapacity(row.key, row.row);
+    for (graph.bridge_policy) |row| source.bridge_policy.putAssumeCapacity(row.key, row.row);
+    const native_record = try allocator.create(NativeBindingBacking);
+    errdefer allocator.destroy(native_record);
+    native_record.* = .{ .source = source, .owner = native, .serial = graph.native_binding_serial };
+    const webrtc_record = try allocator.create(WebrtcBindingBacking);
+    errdefer allocator.destroy(webrtc_record);
+    webrtc_record.* = .{ .source = source, .owner = webrtc, .serial = graph.webrtc_binding_serial };
+    source.native_binding = @ptrCast(native_record);
+    source.webrtc_binding = @ptrCast(webrtc_record);
+    try attachRestoredOwners(source, native, webrtc);
+    errdefer detachRestoredOwners(source, native, webrtc);
+    try reserveRestoredDomain(source);
+    return .{ .source = source, .native = native, .webrtc = webrtc };
+}
+
 pub const Domain = opaque {
+    /// Read-only proof for no-fail physical owner installation before READY.
+    /// The candidate graph is still closed, and both exact binding records
+    /// belong to the caller's freshly attached native and WebRTC owners.
+    pub fn requirePendingRestoreOwner(self: *Domain, native: *native_owner.NativeMediaTransport, webrtc: *webrtc_owner.MediaPlane) Error!void {
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (!source.restore_pending or !source.closing or source.active_scope != null or
+            source.active_inbound != null or source.active_egress != null or source.pending_candidates != 0)
+            return error.Busy;
+        const native_binding = source.native_binding orelse return error.InvalidIdentity;
+        const webrtc_binding = source.webrtc_binding orelse return error.InvalidIdentity;
+        const native_record: *NativeBindingBacking = @ptrCast(@alignCast(native_binding));
+        const webrtc_record: *WebrtcBindingBacking = @ptrCast(@alignCast(webrtc_binding));
+        if (native_record.source != source or native_record.owner != native or native_record.serial == 0 or
+            webrtc_record.source != source or webrtc_record.owner != webrtc or webrtc_record.serial == 0)
+            return error.InvalidIdentity;
+    }
+
     pub fn create(allocator: std.mem.Allocator) Error!*Domain {
-        // Exhaustion refuses before the constructor touches the backend.
-        const id = try issueDomain(&next_domain);
+        // Cheap exhaustion check before touching the allocator; the registry
+        // lock below repeats it to cover a concurrent issuance or restore.
+        const issued = next_domain.load(.monotonic);
+        if (issued == 0 or issued == std.math.maxInt(u64)) return error.SequenceExhausted;
         const source = try allocator.create(Backing);
+        errdefer allocator.destroy(source);
+        lock(&domain_registry_mutex);
+        defer domain_registry_mutex.unlock();
+        const id = try issueDomain(&next_domain);
         source.* = .{ .allocator = allocator, .id = id, .calls = CallMap.init(allocator), .endpoints = EndpointMap.init(allocator), .memberships = MembershipMap.init(allocator), .bridge_policy = BridgeMap.init(allocator) };
+        source.registry_next = domain_registry;
+        domain_registry = source;
         return @ptrCast(source);
     }
 
@@ -333,11 +542,12 @@ pub const Domain = opaque {
     pub fn destroyQuiesced(self: *Domain) Error!void {
         const source = backing(self);
         lock(&source.mutex);
-        if (source.active_inbound != null or source.active_egress != null or source.native_binding != null or source.webrtc_binding != null or source.pending_candidates != 0 or source.endpoints.count() != 0 or source.calls.count() != 0 or source.memberships.count() != 0 or source.bridge_policy.count() != 0) {
+        if (source.restore_pending or source.active_inbound != null or source.active_egress != null or source.native_binding != null or source.webrtc_binding != null or source.pending_candidates != 0 or source.endpoints.count() != 0 or source.calls.count() != 0 or source.memberships.count() != 0 or source.bridge_policy.count() != 0) {
             source.mutex.unlock();
             return error.Busy;
         }
         const allocator = source.allocator;
+        unreserveDomain(source);
         // Release the embedded mutex before all backend destruction.
         source.mutex.unlock();
         source.bridge_policy.deinit();
@@ -729,6 +939,7 @@ pub const Domain = opaque {
         const source = backing(self);
         lock(&source.mutex);
         defer source.mutex.unlock();
+        if (source.restore_pending) return error.Busy;
         if (source.closing) return;
         if (source.pending_candidates != 0 or source.active_egress != null or source.active_inbound != null) return error.Busy;
         if (source.native_binding) |binding| {
@@ -762,7 +973,7 @@ pub const Domain = opaque {
         const source = backing(self);
         lock(&source.mutex);
         defer source.mutex.unlock();
-        if (!source.closing) return error.Busy;
+        if (!source.closing or source.restore_pending) return error.Busy;
         var scope = Scope{ .source = source, .serial = std.math.maxInt(u64) };
         const token: *Locked = @ptrCast(&scope);
         source.active_scope = token;
@@ -1341,6 +1552,10 @@ pub const Domain = opaque {
         const source = backing(self);
         if (owner.isNone() or call.domain.serial != source.id.serial or call.serial == 0) return error.InvalidIdentity;
         lock(&source.mutex);
+        if (source.restore_pending) {
+            source.mutex.unlock();
+            return error.Busy;
+        }
         var found: ?struct { channel: ChannelKey, row: CallRow } = null;
         var it = source.calls.iterator();
         while (it.next()) |entry| if (std.meta.eql(entry.value_ptr.id, call)) {
@@ -1408,6 +1623,10 @@ pub const Domain = opaque {
         if (owner.isNone()) return error.InvalidIdentity;
         const source = backing(self);
         lock(&source.mutex);
+        if (source.restore_pending) {
+            source.mutex.unlock();
+            return error.Busy;
+        }
         var count: usize = 0;
         var calls = source.calls.valueIterator();
         while (calls.next()) |row| if (clientOwnsCall(source, row.id, owner)) {
@@ -2172,6 +2391,201 @@ test "Windows Helix configured pristine media captures exact paused owners and r
     try domain.withLocked(DepartureTestCut{ .domain = domain, .plan = sibling_departure }, DepartureTestCut.run);
     try testing.expectError(error.Busy, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
 }
+
+const GraphRestoreFixture = struct {
+    id: DomainId = .{ .serial = 50_000_007 },
+    owner: ClientId = .{ .shard = 3, .slot = 9, .gen = 2 },
+    calls: [1]GraphCall = undefined,
+    endpoints: [1]GraphEndpoint = undefined,
+    memberships: [1]GraphMembership = undefined,
+    policies: [1]GraphBridgePolicy = undefined,
+
+    fn init(self: *GraphRestoreFixture) !void {
+        const call = CallId{ .domain = self.id, .serial = 2 };
+        const key = EndpointKey{ .call = call, .client = self.owner, .leg = .native };
+        const endpoint = EndpointId{ .call = call, .serial = 2, .leg = .native };
+        const reference = EndpointRef{ .endpoint = endpoint, .offering_client = self.owner, .bridge_policy_revision = 3 };
+        const observation = EndpointObservation{
+            .reference = reference,
+            .stamp = .{ .endpoint = endpoint, .binding_revision = 4, .security_revision = 5, .offering_client = self.owner },
+            .stream_id = 3,
+            .mode = .legacy_group,
+        };
+        const profile = try canonicalProfile(.{ .codecs = @splat(.{ .tag = .cadencevox, .clock_rate = 48_000, .params = 0 }), .codec_count = 1 });
+        self.calls[0] = .{ .channel = try ChannelKey.init("#restored"), .row = .{ .id = call, .offers = 1, .memberships = 1 } };
+        self.endpoints[0] = .{ .key = key, .row = .{ .observation = observation } };
+        self.memberships[0] = .{ .key = .{ .call = call, .client = self.owner }, .row = .{ .bits = 1 } };
+        self.policies[0] = .{ .key = key, .row = .{ .reference = reference, .profile = profile, .kind_bits = 1 } };
+    }
+
+    fn snapshot(self: *GraphRestoreFixture) GraphSnapshot {
+        return .{
+            .allocator = std.testing.allocator,
+            .id = self.id,
+            .revision = 8,
+            .next_call = 3,
+            .next_endpoint = 4,
+            .next_stream = 4,
+            .next_scope = 12,
+            .next_binding = 7,
+            .native_binding_serial = 2,
+            .webrtc_binding_serial = 5,
+            .calls = &self.calls,
+            .endpoints = &self.endpoints,
+            .memberships = &self.memberships,
+            .bridge_policy = &self.policies,
+        };
+    }
+};
+
+fn retireRestoredGraph(restored: RestoredGraph, call: CallId, owner: ClientId) !void {
+    try restored.domain.closeForTerminal();
+    {
+        const departure = try restored.domain.prepareDeparture(call, owner);
+        defer departure.deinit();
+        try restored.domain.withTerminalLocked(DepartureTestCut{ .domain = restored.domain, .plan = departure }, DepartureTestCut.run);
+    }
+    try restored.domain.releaseWebrtc(restored.webrtc_binding);
+    try restored.domain.releaseNative(restored.native_binding);
+    try restored.domain.destroyQuiesced();
+}
+
+test "media routing restored active graph remains closed until publication and preserves issuers" {
+    var fixture: GraphRestoreFixture = .{};
+    try fixture.init();
+    const graph = fixture.snapshot();
+    try graph.validate();
+    var native = native_owner.NativeMediaTransport.init(std.testing.allocator);
+    defer native.deinit();
+    var webrtc = try webrtc_owner.MediaPlane.initFallible(std.testing.allocator);
+    defer webrtc.deinit();
+    var prepared = try prepareGraphRestore(std.testing.allocator, &graph, &native, &webrtc);
+    try prepared.domain().requirePendingRestoreOwner(&native, &webrtc);
+    var foreign_native = native_owner.NativeMediaTransport.init(std.testing.allocator);
+    defer foreign_native.deinit();
+    try std.testing.expectError(error.InvalidIdentity, prepared.domain().requirePendingRestoreOwner(&foreign_native, &webrtc));
+    const closed = struct {
+        fn run(_: *Locked, _: void) Error!void {}
+    };
+    try std.testing.expectError(error.Closing, prepared.domain().withLocked({}, closed.run));
+    try std.testing.expectError(error.Busy, prepared.domain().withTerminalLocked({}, closed.run));
+    try std.testing.expectError(error.Busy, prepared.domain().closeForTerminal());
+    try std.testing.expectError(error.Busy, prepared.domain().destroyQuiesced());
+    try std.testing.expectError(error.Busy, prepared.domain().prepareDeparture(graph.calls[0].row.id, fixture.owner));
+    try std.testing.expectError(error.Busy, prepared.domain().prepareClientDeparture(fixture.owner));
+    const source = backing(prepared.domain());
+    try std.testing.expectEqualDeep(graph.id, source.id);
+    try std.testing.expectEqual(graph.revision, source.revision);
+    try std.testing.expectEqual(graph.next_call, source.next_call);
+    try std.testing.expectEqual(graph.next_endpoint, source.next_endpoint);
+    try std.testing.expectEqual(graph.next_stream, source.next_stream);
+    try std.testing.expectEqual(graph.next_scope, source.next_scope);
+    try std.testing.expectEqual(graph.next_binding, source.next_binding);
+    try std.testing.expectEqual(graph.native_binding_serial, (@as(*NativeBindingBacking, @ptrCast(@alignCast(source.native_binding.?)))).serial);
+    try std.testing.expectEqual(graph.webrtc_binding_serial, (@as(*WebrtcBindingBacking, @ptrCast(@alignCast(source.webrtc_binding.?)))).serial);
+    try std.testing.expectEqual(@as(u32, 1), source.calls.count());
+    try std.testing.expectEqual(@as(u32, 1), source.endpoints.count());
+    try std.testing.expectEqual(@as(u32, 1), source.memberships.count());
+    try std.testing.expectEqual(@as(u32, 1), source.bridge_policy.count());
+    try std.testing.expectEqualDeep(graph.calls[0].row, source.calls.get(graph.calls[0].channel).?);
+    try std.testing.expectEqualDeep(graph.endpoints[0].row, source.endpoints.get(graph.endpoints[0].key).?);
+    try std.testing.expectEqualDeep(graph.memberships[0].row, source.memberships.get(graph.memberships[0].key).?);
+    try std.testing.expectEqualDeep(graph.bridge_policy[0].row, source.bridge_policy.get(graph.bridge_policy[0].key).?);
+    const restored = prepared.publish();
+    prepared.deinit();
+    try std.testing.expectError(error.Busy, restored.domain.requirePendingRestoreOwner(&native, &webrtc));
+    const Read = struct {
+        domain: *Domain,
+        expected: EndpointStamp,
+        fn run(scope: *Locked, ctx: @This()) Error!void {
+            _ = try ctx.domain.requireCurrentLocked(scope, ctx.expected);
+        }
+    };
+    try restored.domain.withLocked(Read{ .domain = restored.domain, .expected = graph.endpoints[0].row.observation.stamp }, Read.run);
+    try std.testing.expectEqual(graph.next_scope + 1, backing(restored.domain).next_scope);
+    try retireRestoredGraph(restored, graph.calls[0].row.id, fixture.owner);
+    try graph.validate();
+}
+
+test "media routing restore reserves one live identity and never rolls global issuance back" {
+    var fixture: GraphRestoreFixture = .{};
+    try fixture.init();
+    const graph = fixture.snapshot();
+    var native = native_owner.NativeMediaTransport.init(std.testing.allocator);
+    defer native.deinit();
+    var webrtc = try webrtc_owner.MediaPlane.initFallible(std.testing.allocator);
+    defer webrtc.deinit();
+    var other_native = native_owner.NativeMediaTransport.init(std.testing.allocator);
+    defer other_native.deinit();
+    var other_webrtc = try webrtc_owner.MediaPlane.initFallible(std.testing.allocator);
+    defer other_webrtc.deinit();
+    {
+        var reserved = try prepareGraphRestore(std.testing.allocator, &graph, &native, &webrtc);
+        try std.testing.expectError(error.PublisherCollision, prepareGraphRestore(std.testing.allocator, &graph, &other_native, &other_webrtc));
+        try std.testing.expect(other_native.routing_domain == null and other_webrtc.routing_domain == null);
+        reserved.deinit();
+    }
+    try std.testing.expect(native.routing_domain == null and webrtc.routing_domain == null);
+    try std.testing.expect(next_domain.load(.monotonic) > graph.id.serial);
+    const fresh = try Domain.create(std.testing.allocator);
+    try std.testing.expect(backing(fresh).id.serial > graph.id.serial);
+    try fresh.destroyQuiesced();
+    var retry = try prepareGraphRestore(std.testing.allocator, &graph, &native, &webrtc);
+    const restored = retry.publish();
+    retry.deinit();
+    try std.testing.expectError(error.PublisherCollision, prepareGraphRestore(std.testing.allocator, &graph, &other_native, &other_webrtc));
+    try retireRestoredGraph(restored, graph.calls[0].row.id, fixture.owner);
+    // A later process generation has fresh physical owners but retains the
+    // same logical DomainId after the previous generation is fully retired.
+    var sequential = try prepareGraphRestore(std.testing.allocator, &graph, &other_native, &other_webrtc);
+    sequential.deinit();
+}
+
+fn graphRestoreAllocationSweep(allocator: std.mem.Allocator) !void {
+    var fixture: GraphRestoreFixture = .{};
+    try fixture.init();
+    const graph = fixture.snapshot();
+    var native = native_owner.NativeMediaTransport.init(std.testing.allocator);
+    defer native.deinit();
+    var webrtc = try webrtc_owner.MediaPlane.initFallible(std.testing.allocator);
+    defer webrtc.deinit();
+    const issued_before = next_domain.load(.monotonic);
+    var candidate = prepareGraphRestore(allocator, &graph, &native, &webrtc) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(issued_before, next_domain.load(.monotonic));
+        try std.testing.expect(native.routing_domain == null and webrtc.routing_domain == null);
+        try graph.validate();
+        return err;
+    };
+    candidate.deinit();
+    try std.testing.expect(native.routing_domain == null and webrtc.routing_domain == null);
+    try graph.validate();
+}
+
+test "media routing restored graph allocation failures leave source and owners unchanged" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, graphRestoreAllocationSweep, .{});
+}
+
+test "media routing restore rejects invalid graph rows and impossible identity" {
+    var fixture: GraphRestoreFixture = .{};
+    try fixture.init();
+    var graph = fixture.snapshot();
+    var native = native_owner.NativeMediaTransport.init(std.testing.allocator);
+    defer native.deinit();
+    var webrtc = try webrtc_owner.MediaPlane.initFallible(std.testing.allocator);
+    defer webrtc.deinit();
+    var duplicate = [_]GraphCall{ graph.calls[0], graph.calls[0] };
+    graph.calls = &duplicate;
+    try std.testing.expectError(error.InvalidSnapshot, prepareGraphRestore(std.testing.allocator, &graph, &native, &webrtc));
+    graph = fixture.snapshot();
+    graph.endpoints[0].row.observation.stream_id = graph.next_stream;
+    try std.testing.expectError(error.InvalidSnapshot, prepareGraphRestore(std.testing.allocator, &graph, &native, &webrtc));
+    graph.endpoints[0].row.observation.stream_id = 3;
+    graph.id.serial = std.math.maxInt(u64);
+    try std.testing.expectError(error.InvalidSnapshot, prepareGraphRestore(std.testing.allocator, &graph, &native, &webrtc));
+    try std.testing.expect(native.routing_domain == null and webrtc.routing_domain == null);
+}
+
 const DepartureTestCut = struct {
     domain: *Domain,
     plan: *PreparedDeparture,

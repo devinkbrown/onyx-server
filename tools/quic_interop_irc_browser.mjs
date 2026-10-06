@@ -25,11 +25,12 @@
 //
 // Usage:
 //   node tools/quic_interop_irc_browser.mjs --port <UDP> --certhash <HEX>
-//     [--http-port <N>] [--chromium <path>] [--timeout-ms <N>]
+//     [--http-port <N>] [--chromium <path>] [--timeout-ms <N>] [--held]
 //   (or via env: ONYX_WT_PORT / ONYX_WT_CERTHASH / CHROMIUM)
 //
 // Exit 0 when the browser completed IRC registration (real 001) + JOIN + PRIVMSG
-// against the live daemon; non-zero with detail otherwise.
+// against the live daemon; in --held mode, exit after two controlled probes on
+// the same session/stream. Non-zero with detail otherwise.
 
 import http from 'node:http';
 import { spawn } from 'node:child_process';
@@ -47,6 +48,7 @@ const certHashHex = (argOf('certhash') ?? process.env.ONYX_WT_CERTHASH ?? '').tr
 const httpPort = parseInt(argOf('http-port') ?? '0', 10); // 0 -> ephemeral
 const chromiumBin = argOf('chromium') ?? process.env.CHROMIUM ?? '/usr/bin/chromium';
 const hardTimeoutMs = parseInt(argOf('timeout-ms') ?? '25000', 10);
+const heldMode = process.argv.includes('--held');
 
 function die(msg) {
   console.error(`[irc-browser-harness] FAIL: ${msg}`);
@@ -60,6 +62,7 @@ if (!/^[0-9a-f]{64}$/.test(certHashHex)) die(`missing/invalid --certhash (need 6
 const NICK = 'webuser';
 const CHANNEL = '#web';
 const MESSAGE = 'hello from a browser';
+const HELD_BASELINE = 'wt-held-baseline';
 
 // ---- the test page --------------------------------------------------------
 
@@ -71,9 +74,14 @@ const CERT_HASH_HEX = ${JSON.stringify(certHashHex)};
 const NICK = ${JSON.stringify(NICK)};
 const CHANNEL = ${JSON.stringify(CHANNEL)};
 const MESSAGE = ${JSON.stringify(MESSAGE)};
+const HELD = ${JSON.stringify(heldMode)};
+const HELD_BASELINE = ${JSON.stringify(HELD_BASELINE)};
 
 const logEl = document.getElementById('log');
 function log(m) { logEl.textContent += m + "\\n"; }
+const sessionId = crypto.randomUUID();
+let heldPhase = 0;
+let wtClosed = false;
 
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
@@ -81,15 +89,32 @@ function hexToBytes(hex) {
   return out;
 }
 
-async function report(ok, detail, lines) {
+async function report(ok, detail, lines, phase = heldPhase, nonce = null) {
   try {
     await fetch('/result', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ok, detail, lines: lines || [] }),
+      body: JSON.stringify({ ok, detail, lines: lines || [], phase, nonce, sessionId }),
     });
   } catch (e) {
     log('report failed: ' + (e && e.message));
+  }
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function nextHeldProbe(after) {
+  for (;;) {
+    if (wtClosed) throw new Error('WebTransport closed while awaiting held probe');
+    const response = await fetch('/next?after=' + after, { cache: 'no-store' });
+    if (response.status === 204) {
+      await delay(150);
+      continue;
+    }
+    if (!response.ok) throw new Error('held probe control failed: HTTP ' + response.status);
+    const probe = await response.json();
+    if (probe.phase !== after + 1 || typeof probe.nonce !== 'string' || !/^[a-z0-9-]{1,64}$/.test(probe.nonce))
+      throw new Error('invalid held probe sequence');
+    return probe;
   }
 }
 
@@ -164,8 +189,8 @@ async function run() {
     return;
   }
 
-  wt.closed.then((info) => log('wt.closed resolved: ' + JSON.stringify(info)))
-          .catch((e) => log('wt.closed rejected: ' + (e && (e.message || e))));
+  wt.closed.then((info) => { wtClosed = true; log('wt.closed resolved: ' + JSON.stringify(info)); })
+          .catch((e) => { wtClosed = true; log('wt.closed rejected: ' + (e && (e.message || e))); });
 
   try {
     await wt.ready;
@@ -179,6 +204,7 @@ async function run() {
     stream = await wt.createBidirectionalStream();
     writer = stream.writable.getWriter();
     lineReader = new IrcLineReader(stream.readable);
+    if (HELD) window.__heldTransport = { wt, stream, writer, lineReader };
   } catch (e) {
     await report(false, 'failed to open WT bidi stream: ' + (e && (e.stack || e.message || String(e))));
     return;
@@ -230,13 +256,15 @@ async function run() {
   // probe with a PING afterwards: when its PONG returns with no preceding error
   // numeric, the PRIVMSG was accepted and processed in order.
   try {
-    await send('PRIVMSG ' + CHANNEL + ' :' + MESSAGE + '\\r\\nPING :ircwtprobe\\r\\n');
+    const baselineMessage = HELD ? HELD_BASELINE : MESSAGE;
+    const baselinePing = HELD ? 'wt-held-baseline-ping' : 'ircwtprobe';
+    await send('PRIVMSG ' + CHANNEL + ' :' + baselineMessage + '\\r\\nPING :' + baselinePing + '\\r\\n');
     let sawError = null;
     const r = await lineReader.until((l) => {
       // An IRC error numeric is a 3-digit 4xx/5xx code in the " <code> " slot.
       const m = l.match(/^\\S+ (\\d{3}) /) || l.match(/ (\\d{3}) /);
       if (m && (m[1][0] === '4' || m[1][0] === '5')) { sawError = l; return true; }
-      return /PONG/.test(l) && l.indexOf('ircwtprobe') !== -1;
+      return /PONG/.test(l) && l.indexOf(baselinePing) !== -1;
     }, 6000);
     record(r.lines);
     if (sawError) {
@@ -249,6 +277,37 @@ async function run() {
     }
   } catch (e) {
     await report(false, 'PRIVMSG leg failed: ' + (e && (e.stack || e.message || String(e))), all);
+    return;
+  }
+
+  if (HELD) {
+    if (wtClosed || lineReader.closed) {
+      await report(false, 'held WebTransport closed before first upgrade', all, 0);
+      return;
+    }
+    await report(true, 'held browser IRC ready', all, 0);
+    for (let phase = 1; phase <= 2; phase++) {
+      let probe;
+      try {
+        probe = await nextHeldProbe(heldPhase);
+        if (wtClosed || lineReader.closed) throw new Error('held WebTransport or IRC stream closed');
+        await send('PRIVMSG ' + CHANNEL + ' :' + probe.nonce + '\\r\\nPING :' + probe.nonce + '\\r\\n');
+        let sawError = null;
+        const r = await lineReader.until((l) => {
+          const m = l.match(/^\\S+ (\\d{3}) /) || l.match(/ (\\d{3}) /);
+          if (m && (m[1][0] === '4' || m[1][0] === '5')) { sawError = l; return true; }
+          return /PONG/.test(l) && l.indexOf(probe.nonce) !== -1;
+        }, 12000);
+        record(r.lines);
+        if (sawError) throw new Error('held PRIVMSG rejected: ' + sawError);
+        if (!r.matched || wtClosed || lineReader.closed) throw new Error('held PONG missing or stream closed');
+        heldPhase = phase;
+        await report(true, 'held WebTransport stream survived swap ' + phase, all, phase, probe.nonce);
+      } catch (e) {
+        await report(false, 'held probe ' + phase + ' failed: ' + (e && (e.stack || e.message || String(e))), all, phase, probe && probe.nonce);
+        return;
+      }
+    }
     return;
   }
 
@@ -268,6 +327,33 @@ run().catch((e) => report(false, 'run() threw: ' + (e && (e.stack || e.message |
 
 let resolveResult;
 const resultPromise = new Promise((res) => { resolveResult = res; });
+let heldStatus = { ok: null, phase: -1, detail: 'starting', sessionId: null, lines: [] };
+let pendingProbe = null;
+
+function jsonResponse(res, code, value) {
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(value));
+}
+
+function readJson(req, res, callback) {
+  let body = '';
+  req.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 1 << 20) req.destroy();
+  });
+  req.on('end', () => {
+    let parsed;
+    try { parsed = JSON.parse(body); } catch {
+      jsonResponse(res, 400, { error: 'invalid JSON' });
+      return;
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      jsonResponse(res, 400, { error: 'expected JSON object' });
+      return;
+    }
+    callback(parsed);
+  });
+}
 
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && (req.url === '/' || req.url.startsWith('/?'))) {
@@ -275,15 +361,67 @@ const server = http.createServer((req, res) => {
     res.end(pageHtml());
     return;
   }
+  if (heldMode && req.method === 'GET' && req.url === '/status') {
+    jsonResponse(res, 200, heldStatus);
+    return;
+  }
+  if (heldMode && req.method === 'GET' && req.url.startsWith('/next?')) {
+    const after = Number(new URL(req.url, 'http://127.0.0.1').searchParams.get('after'));
+    if (!Number.isInteger(after) || after < 0 || after > 2) {
+      jsonResponse(res, 400, { error: 'invalid phase' });
+    } else if (pendingProbe && pendingProbe.phase > after) {
+      jsonResponse(res, 200, pendingProbe);
+    } else {
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      res.end();
+    }
+    return;
+  }
+  if (heldMode && req.method === 'POST' && req.url === '/probe') {
+    readJson(req, res, (probe) => {
+      if (heldStatus.ok !== true || ![1, 2].includes(probe.phase) ||
+          probe.phase !== heldStatus.phase + 1 || pendingProbe !== null ||
+          typeof probe.nonce !== 'string' || !/^[a-z0-9-]{1,64}$/.test(probe.nonce)) {
+        jsonResponse(res, 409, { error: 'probe is out of sequence or invalid' });
+        return;
+      }
+      pendingProbe = { phase: probe.phase, nonce: probe.nonce };
+      jsonResponse(res, 202, pendingProbe);
+    });
+    return;
+  }
+  if (heldMode && req.method === 'POST' && req.url === '/finish') {
+    res.writeHead(204);
+    res.end();
+    resolveResult(heldStatus.ok === true && heldStatus.phase === 2 && pendingProbe === null
+      ? heldStatus : { ok: false, detail: 'held browser ended before both swaps passed', lines: heldStatus.lines || [] });
+    return;
+  }
   if (req.method === 'POST' && req.url === '/result') {
-    let body = '';
-    req.on('data', (c) => { body += c; if (body.length > 1 << 20) req.destroy(); });
-    req.on('end', () => {
+    readJson(req, res, (parsed) => {
       res.writeHead(204);
       res.end();
-      let parsed;
-      try { parsed = JSON.parse(body); } catch { parsed = { ok: false, detail: 'unparseable result: ' + body }; }
-      resolveResult(parsed);
+      if (!heldMode) {
+        resolveResult(parsed);
+        return;
+      }
+      if (heldStatus.ok === false) return; // The first browser failure is terminal.
+      if (parsed.ok !== true) {
+        heldStatus = { ...parsed, ok: false, detail: parsed.detail || 'browser failed' };
+        return;
+      }
+      if (parsed.phase === 0 && heldStatus.phase === -1 &&
+          typeof parsed.sessionId === 'string' && parsed.sessionId.length > 0) {
+        heldStatus = parsed;
+        return;
+      }
+      if (pendingProbe && parsed.phase === pendingProbe.phase &&
+          parsed.nonce === pendingProbe.nonce && parsed.sessionId === heldStatus.sessionId) {
+        heldStatus = parsed;
+        pendingProbe = null;
+        return;
+      }
+      heldStatus = { ok: false, phase: parsed.phase, detail: 'browser result violated held phase or session identity', lines: parsed.lines || [] };
     });
     return;
   }
@@ -312,11 +450,19 @@ server.listen(httpPort, '127.0.0.1', () => {
 
   let chromeStderr = '';
   child.stdout.on('data', (d) => { process.stderr.write(`[chromium:out] ${d}`); });
-  child.stderr.on('data', (d) => { chromeStderr += d; process.stderr.write(`[chromium:err] ${d}`); });
+  child.stderr.on('data', (d) => { chromeStderr = (chromeStderr + d).slice(-16000); process.stderr.write(`[chromium:err] ${d}`); });
   child.on('error', (e) => die(`failed to launch chromium (${chromiumBin}): ${e.message}`));
+  process.once('exit', () => { try { child.kill('SIGKILL'); } catch {} });
+  const interrupted = () => {
+    try { child.kill('SIGKILL'); } catch {}
+    server.close();
+    process.exit(3);
+  };
+  process.once('SIGINT', interrupted);
+  process.once('SIGTERM', interrupted);
 
   const hardTimer = setTimeout(() => {
-    resolveResult({ ok: false, detail: `hard timeout (${hardTimeoutMs}ms): no /result POST from the page` });
+    resolveResult({ ok: false, detail: `hard timeout (${hardTimeoutMs}ms): browser smoke did not finish` });
   }, hardTimeoutMs);
 
   resultPromise.then((result) => {

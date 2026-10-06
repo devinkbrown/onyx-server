@@ -86,6 +86,9 @@ pub const NativeMediaTransport = struct {
     routed_refused: std.atomic.Value(u64) = .init(0),
     routed_errors: std.atomic.Value(u64) = .init(0),
     active_ingress: ?ActiveIngress = null,
+    /// Set only after a complete prepared physical state is moved into this
+    /// inherited owner while its reconstructed Domain is still closed.
+    physical_restored: bool = false,
     physical_pending: usize = 0,
     physical_endpoints: NativeEndpointMap = .empty,
     physical_streams: NativeStreamMap = .empty,
@@ -342,16 +345,27 @@ pub const NativeMediaTransport = struct {
 
     /// Mechanical source binding: no worker or live graph can be adopted by
     /// merely passing its address. Domain owns the issued canonical binding.
+    /// A successor Gate row is acceptable only while it is actually parked
+    /// before release; its worker has never entered the owner pump.
+    fn requireRoutingWorkerQuiescent(self: *NativeMediaTransport) routing.Error!void {
+        if (self.runtime.view != null) {
+            if (self.runtime.slot == null or self.runtime.entered.load(.acquire) or self.runtime.exited.load(.acquire)) return error.Busy;
+            self.runtime.requireParked() catch return error.Busy;
+        } else if (self.runtime.slot != null) return error.Busy;
+    }
+
     pub fn requireRoutingAttachable(self: *NativeMediaTransport) routing.Error!void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        if (self.routing_domain != null or self.routing_binding != null or self.thread != null or self.runtime.view != null or self.channels.count() != 0 or self.stream_index.count() != 0 or self.physical_pending != 0 or self.physical_endpoints.count() != 0 or self.physical_streams.count() != 0) return error.Busy;
+        if (self.routing_domain != null or self.routing_binding != null or self.thread != null or self.channels.count() != 0 or self.stream_index.count() != 0 or self.physical_pending != 0 or self.physical_endpoints.count() != 0 or self.physical_streams.count() != 0) return error.Busy;
+        try self.requireRoutingWorkerQuiescent();
     }
     pub fn attachRoutingLocked(self: *NativeMediaTransport, domain: *routing.Domain, scope: *const routing.Locked, binding: *routing.NativeBinding) routing.Error!void {
         try domain.requireNativeBindingLocked(scope, binding, self);
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        if (self.routing_domain != null or self.routing_binding != null or self.thread != null or self.runtime.view != null or self.channels.count() != 0 or self.stream_index.count() != 0 or self.physical_pending != 0 or self.physical_endpoints.count() != 0 or self.physical_streams.count() != 0) return error.Busy;
+        if (self.routing_domain != null or self.routing_binding != null or self.thread != null or self.channels.count() != 0 or self.stream_index.count() != 0 or self.physical_pending != 0 or self.physical_endpoints.count() != 0 or self.physical_streams.count() != 0) return error.Busy;
+        try self.requireRoutingWorkerQuiescent();
         self.routing_domain = domain;
         self.routing_binding = binding;
     }
@@ -371,7 +385,8 @@ pub const NativeMediaTransport = struct {
     pub fn requireRoutingReleasable(self: *NativeMediaTransport) routing.Error!void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        if (self.legacy_joining or self.thread != null or self.runtime.view != null or self.channels.count() != 0 or self.stream_index.count() != 0 or self.physical_pending != 0 or self.physical_endpoints.count() != 0 or self.physical_streams.count() != 0 or self.active_ingress != null) return error.Busy;
+        if (self.legacy_joining or self.thread != null or self.channels.count() != 0 or self.stream_index.count() != 0 or self.physical_pending != 0 or self.physical_endpoints.count() != 0 or self.physical_streams.count() != 0 or self.active_ingress != null) return error.Busy;
+        try self.requireRoutingWorkerQuiescent();
     }
     pub fn detachRoutingLocked(self: *NativeMediaTransport, domain: *routing.Domain, scope: *const routing.Locked, binding: *routing.NativeBinding) void {
         domain.requireNativeBindingLocked(scope, binding, self) catch @panic("unissued routing source release");
@@ -387,16 +402,30 @@ pub const NativeMediaTransport = struct {
         self.runtime.requireDetached() catch @panic("managed worker must join and detach before deinit");
         self.shutdown();
         std.crypto.secureZero(u8, self.mac_stream_key[0..]);
+        self.disposePhysicalState();
+        self.* = undefined;
+    }
+
+    fn disposePhysicalState(self: *NativeMediaTransport) void {
         var it = self.channels.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.channels.deinit(self.allocator);
+        self.channels = .empty;
         self.stream_index.deinit(self.allocator);
+        self.stream_index = .empty;
         std.debug.assert(self.physical_pending == 0);
         var physical = self.physical_endpoints.valueIterator();
         while (physical.next()) |row| row.wipe();
         self.physical_endpoints.deinit(self.allocator);
+        self.physical_endpoints = .empty;
         self.physical_streams.deinit(self.allocator);
-        self.* = undefined;
+        self.physical_streams = .empty;
+        self.physical_revision = 1;
+        self.next_ingress_serial = 1;
+        self.routed_accepted.store(0, .release);
+        self.routed_refused.store(0, .release);
+        self.routed_errors.store(0, .release);
+        self.physical_restored = false;
     }
 
     /// Whether this native transport has no registered call state that would be
@@ -585,6 +614,34 @@ pub const NativeMediaTransport = struct {
         return self.capturePhysicalCutLocked(allocator, max_bytes);
     }
 
+    /// The active HXNA body deliberately excludes socket custody and daemon
+    /// policy. Capture those separately under the same paused Domain cut, so a
+    /// candidate can import the original UDP socket without claiming the
+    /// physical registry was idle.
+    pub fn capturePausedPhysicalTransportRoutingLocked(self: *NativeMediaTransport, domain: *routing.Domain, scope: *const routing.Locked, token: runtime_pause.Token) !PhysicalTransportSnapshot {
+        if (self.thread == null and self.runtime.view == null) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        try domain.requireNativeBindingLocked(scope, self.routing_binding orelse return error.NotRoutingBound, self);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.routing_domain != domain or self.routing_closed or self.legacy_joining or
+            self.stop_flag.load(.acquire) or self.active_ingress != null or self.physical_pending != 0)
+            return error.Busy;
+        try self.validatePolicy();
+        const socket = if (self.socket) |*held| held else return error.NotPrepared;
+        const carry: PhysicalTransportSnapshot = .{ .socket = try socket.capture(), .policy = .{
+            .max_frame_bytes = self.max_frame_bytes,
+            .max_upload_bytes = self.max_upload_bytes,
+            .max_participants = self.max_participants,
+            .require_mac = self.require_mac,
+            .mac_stream_key = self.mac_stream_key,
+            .mac_key_configured = self.mac_key_configured,
+            .cross_configured = self.cross != null,
+        } };
+        try carry.validate();
+        return carry;
+    }
+
     fn capturePhysicalCutLocked(self: *NativeMediaTransport, allocator: std.mem.Allocator, max_bytes: usize) !PhysicalSnapshot {
         var bytes = try physicalSnapshotBytes(self.physical_endpoints.count(), self.physical_streams.count(), self.channels.count(), self.stream_index.count());
         var names = self.channels.keyIterator();
@@ -700,6 +757,72 @@ pub const NativeMediaTransport = struct {
     pub fn initTransferred(allocator: std.mem.Allocator, transfer: *windows_udp.Transfer, carry: *const Snapshot, cross: ?media_bridge.CrossLegSink) !NativeMediaTransport {
         const socket = try MediaSocket.initTransferred(transfer, &carry.socket);
         return initRestored(allocator, socket, carry, cross);
+    }
+
+    /// Consume the authenticated active-media UDP duplicate into an inert
+    /// owner. Physical rows are installed only after a closed Domain is built.
+    pub fn initTransferredPhysical(allocator: std.mem.Allocator, transfer: *windows_udp.Transfer, carry: *const PhysicalTransportSnapshot, expected: Policy, cross: ?media_bridge.CrossLegSink) !NativeMediaTransport {
+        try carry.validateConfiguration(expected);
+        if (carry.policy.cross_configured != (cross != null)) return error.ConfigMismatch;
+        const socket = try MediaSocket.initTransferred(transfer, &carry.socket);
+        var owner = initConfig(allocator, carry.policy.max_participants);
+        owner.socket = socket;
+        owner.port = carry.socket.port;
+        owner.max_frame_bytes = carry.policy.max_frame_bytes;
+        owner.max_upload_bytes = carry.policy.max_upload_bytes;
+        owner.require_mac = carry.policy.require_mac;
+        owner.mac_stream_key = carry.policy.mac_stream_key;
+        owner.mac_key_configured = carry.policy.mac_key_configured;
+        owner.cross = cross;
+        return owner;
+    }
+
+    fn requirePendingPhysicalRestore(self: *NativeMediaTransport, prepared: *const routing.PreparedGraphRestore) void {
+        if (prepared.published or prepared.native != self)
+            @panic("native physical restore requires its closed candidate Domain");
+        prepared.domain().requirePendingRestoreOwner(prepared.native, prepared.webrtc) catch
+            @panic("native physical restore Domain authority lost");
+    }
+
+    /// No allocation or socket operation after the aggregate has validated
+    /// this complete state against its closed Domain. The preparation becomes
+    /// inert, while this inherited owner takes sole responsibility for cleanup.
+    pub fn installPreparedPhysicalState(self: *NativeMediaTransport, state: *PhysicalState, prepared: *const routing.PreparedGraphRestore) void {
+        self.requirePendingPhysicalRestore(prepared);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.requireRoutingWorkerQuiescent() catch @panic("native physical restore worker is not parked");
+        if (self.routing_domain != prepared.domain() or self.routing_binding == null or self.routing_closed or
+            self.thread != null or self.physical_restored or state.moved or
+            !std.meta.eql(self.allocator, state.allocator) or
+            self.physical_pending != 0 or self.active_ingress != null or self.channels.count() != 0 or
+            self.stream_index.count() != 0 or self.physical_endpoints.count() != 0 or self.physical_streams.count() != 0)
+            @panic("native physical restore owner is not blank");
+        self.physical_endpoints = state.endpoints;
+        self.physical_streams = state.streams;
+        self.channels = state.channels;
+        self.stream_index = state.stream_index;
+        self.physical_revision = state.physical_revision;
+        self.next_ingress_serial = state.next_ingress_serial;
+        self.routed_accepted.store(state.routed_accepted, .release);
+        self.routed_refused.store(state.routed_refused, .release);
+        self.routed_errors.store(state.routed_errors, .release);
+        self.physical_restored = true;
+        state.moved = true;
+    }
+
+    /// Candidate abort before Domain publication. No worker has been released,
+    /// so the moved physical state and credentials can be destroyed in place.
+    pub fn discardPreparedPhysicalState(self: *NativeMediaTransport, prepared: *const routing.PreparedGraphRestore) void {
+        self.requirePendingPhysicalRestore(prepared);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.requireRoutingWorkerQuiescent() catch @panic("native physical restore worker is not parked");
+        if (self.routing_domain != prepared.domain() or self.routing_binding == null or self.routing_closed or
+            self.thread != null or !self.physical_restored or
+            self.physical_pending != 0 or self.active_ingress != null)
+            @panic("native physical restore was not installed");
+        self.disposePhysicalState();
     }
 
     fn initRestored(allocator: std.mem.Allocator, socket: MediaSocket, carry: *const Snapshot, cross: ?media_bridge.CrossLegSink) !NativeMediaTransport {
@@ -1832,6 +1955,16 @@ test "Windows Helix native media imports idle socket and parks inherited worker"
     try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
     try successor.requireParked();
     try testing.expect(!successor.runtime.entered.load(.acquire));
+    try successor.requireRoutingAttachable();
+    const candidate_domain = try routing.Domain.create(testing.allocator);
+    const candidate_binding = try candidate_domain.bindNative(&successor);
+    try successor.requireRoutingReleasable();
+    try candidate_domain.releaseNative(candidate_binding);
+    try candidate_domain.destroyQuiesced();
+
+    gate.control.releaseAll();
+    try testing.expectError(error.Busy, successor.requireRoutingAttachable());
+    try testing.expectError(error.Busy, successor.requireRoutingReleasable());
 
     var invalid = carry;
     defer invalid.deinit();
@@ -1909,6 +2042,32 @@ pub const Policy = struct {
     mac_stream_key: [16]u8,
     mac_key_configured: bool,
     cross_configured: bool,
+};
+
+/// Authenticated socket/policy companion to the active native physical body.
+/// This deliberately has no idle-execution claim and carries no graph rows.
+pub const PhysicalTransportSnapshot = struct {
+    socket: media_socket.Snapshot,
+    policy: Policy,
+
+    pub fn deinit(self: *PhysicalTransportSnapshot) void {
+        std.crypto.secureZero(u8, &self.policy.mac_stream_key);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: *const PhysicalTransportSnapshot) !void {
+        try self.socket.validate();
+        const p = self.policy;
+        if (p.max_frame_bytes == 0 or p.max_frame_bytes > max_datagram or p.max_upload_bytes == 0 or
+            p.max_participants == 0 or p.max_participants > max_call_participants or
+            (p.require_mac and !p.mac_key_configured)) return error.InvalidSnapshot;
+        if (!p.mac_key_configured) for (p.mac_stream_key) |byte| if (byte != 0) return error.InvalidSnapshot;
+    }
+
+    pub fn validateConfiguration(self: *const PhysicalTransportSnapshot, expected: Policy) !void {
+        try self.validate();
+        if (!std.meta.eql(self.policy, expected)) return error.ConfigMismatch;
+    }
 };
 
 const NativeEndpoint = struct {
@@ -2067,6 +2226,25 @@ pub const PhysicalSnapshot = struct {
         }
         return error.InvalidSnapshot;
     }
+    fn remappedClient(remaps: []const routing.ClientRemap, old: routing.ClientId) !routing.ClientId {
+        for (remaps) |entry| if (entry.source.eql(old)) return entry.target;
+        return error.IncompleteRemap;
+    }
+    fn remappedKey(remaps: []const routing.ClientRemap, source: routing.EndpointKey) !routing.EndpointKey {
+        var key = source;
+        key.client = try remappedClient(remaps, source.client);
+        return key;
+    }
+    fn validateRemaps(self: *const PhysicalSnapshot, remaps: []const routing.ClientRemap) !void {
+        if (remaps.len > routing.max_graph_rows * 2) return error.InvalidSnapshot;
+        for (remaps, 0..) |entry, i| {
+            if (entry.source.isNone() or entry.target.isNone()) return error.InvalidSnapshot;
+            for (remaps[0..i]) |prior| {
+                if (prior.source.eql(entry.source) or prior.target.eql(entry.target)) return error.InvalidSnapshot;
+            }
+        }
+        for (self.endpoints) |row| _ = try remappedClient(remaps, row.key.client);
+    }
     pub fn validate(self: *const PhysicalSnapshot, expected_max_participants: usize, max_bytes: usize) !void {
         if (self.physical_revision == 0 or self.next_ingress_serial == 0 or expected_max_participants == 0 or expected_max_participants > max_call_participants or self.streams.len != self.endpoints.len) return error.InvalidSnapshot;
         var bytes = try physicalSnapshotBytes(self.endpoints.len, self.streams.len, self.channels.len, self.stream_index.len);
@@ -2105,18 +2283,26 @@ pub const PhysicalSnapshot = struct {
         if (bytes > max_bytes) return error.Capacity;
     }
 
-    /// Build disjoint maps first. The aggregate may publish them only after its
-    /// own Domain and companion-owner cross-checks; no owner is mutated here.
-    fn prepareRestore(self: *const PhysicalSnapshot, allocator: std.mem.Allocator, expected_max_participants: usize, max_bytes: usize) !PhysicalState {
+    /// Build disjoint maps with the complete graph-wide physical ClientId
+    /// remap. The aggregate must join these rows to its remapped Domain before
+    /// publication; no owner is mutated here.
+    pub fn prepareRemappedRestore(self: *const PhysicalSnapshot, allocator: std.mem.Allocator, remaps: []const routing.ClientRemap, expected_max_participants: usize, max_bytes: usize) !PhysicalState {
         try self.validate(expected_max_participants, max_bytes);
+        try self.validateRemaps(remaps);
         var candidate = PhysicalState{ .allocator = allocator, .physical_revision = self.physical_revision, .next_ingress_serial = self.next_ingress_serial, .routed_accepted = self.routed_accepted, .routed_refused = self.routed_refused, .routed_errors = self.routed_errors };
         errdefer candidate.deinit();
         try candidate.endpoints.ensureTotalCapacity(allocator, @intCast(self.endpoints.len));
         try candidate.streams.ensureTotalCapacity(allocator, @intCast(self.streams.len));
         try candidate.channels.ensureTotalCapacity(allocator, @intCast(self.channels.len));
         try candidate.stream_index.ensureTotalCapacity(allocator, @intCast(self.stream_index.len));
-        for (self.endpoints) |row| candidate.endpoints.putAssumeCapacity(row.key, row.toLive());
-        for (self.streams) |row| candidate.streams.putAssumeCapacity(row.stream_id, row.key);
+        for (self.endpoints) |row| {
+            const key = try remappedKey(remaps, row.key);
+            var endpoint = row.toLive();
+            endpoint.identity.reference.offering_client = key.client;
+            endpoint.identity.stamp.offering_client = key.client;
+            candidate.endpoints.putAssumeCapacity(key, endpoint);
+        }
+        for (self.streams) |row| candidate.streams.putAssumeCapacity(row.stream_id, try remappedKey(remaps, row.key));
         for (self.channels) |row| {
             const name = try allocator.dupe(u8, row.name);
             errdefer allocator.free(name);
@@ -2130,7 +2316,7 @@ pub const PhysicalSnapshot = struct {
         return candidate;
     }
 };
-const PhysicalState = struct {
+pub const PhysicalState = struct {
     allocator: std.mem.Allocator,
     endpoints: NativeEndpointMap = .empty,
     streams: NativeStreamMap = .empty,
@@ -2141,7 +2327,14 @@ const PhysicalState = struct {
     routed_accepted: u64,
     routed_refused: u64,
     routed_errors: u64,
-    fn deinit(self: *PhysicalState) void {
+    /// After install the receiver owns all allocations; a deferred deinit of
+    /// the preparation remains harmless on both success and rollback paths.
+    moved: bool = false,
+    pub fn deinit(self: *PhysicalState) void {
+        if (self.moved) {
+            self.* = undefined;
+            return;
+        }
         var endpoints = self.endpoints.valueIterator();
         while (endpoints.next()) |row| row.wipe();
         self.endpoints.deinit(self.allocator);
@@ -2153,6 +2346,104 @@ const PhysicalState = struct {
         self.* = undefined;
     }
 };
+
+test "Windows active native owner imports paused transport and rolls back physical custody" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const source_domain = try routing.Domain.create(testing.allocator);
+    var source_domain_live = true;
+    defer if (source_domain_live) source_domain.destroyQuiesced() catch @panic("source Domain retained native binding");
+    var source = NativeMediaTransport.init(testing.allocator);
+    defer source.deinit();
+    source.configureMac(&@as([16]u8, @splat(0x63)), true);
+    try source.prepareColdResources(testing.io, loopback_be, 0);
+    const source_binding = try source_domain.bindNative(&source);
+    var source_binding_live = true;
+    defer if (source_binding_live) source_domain.releaseNative(source_binding) catch @panic("source native binding retained");
+    try source.startPreparedLegacyWorker();
+    var source_worker_live = true;
+    defer if (source_worker_live) {
+        source.requestStopAndWake();
+        source.joinLegacyAfterStop() catch @panic("source native worker retained");
+    };
+    const token = try source.requestPause(1);
+    try source.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    source.routed_accepted.store(7, .release);
+    source.routed_refused.store(8, .release);
+    const ActiveCut = struct {
+        physical: PhysicalSnapshot,
+        transport: PhysicalTransportSnapshot,
+        fn deinit(self: *@This()) void {
+            self.transport.deinit();
+            self.physical.deinit();
+        }
+    };
+    const Capture = struct {
+        domain: *routing.Domain,
+        owner: *NativeMediaTransport,
+        token: runtime_pause.Token,
+        fn run(scope: *routing.Locked, ctx: @This()) !ActiveCut {
+            var physical = try ctx.owner.capturePausedPhysicalRoutingLocked(ctx.domain, scope, ctx.token, testing.allocator, 1 << 20);
+            errdefer physical.deinit();
+            return .{ .physical = physical, .transport = try ctx.owner.capturePausedPhysicalTransportRoutingLocked(ctx.domain, scope, ctx.token) };
+        }
+    };
+    var carry = try source_domain.withLocked(Capture{ .domain = source_domain, .owner = &source, .token = token }, Capture.run);
+    defer carry.deinit();
+    // The predecessor process owns the socket but its Domain is not in the
+    // candidate's address space. Retire only this test's source Domain before
+    // reserving its independent candidate identity.
+    source.requestStopAndWake();
+    try source.joinLegacyAfterStop();
+    source_worker_live = false;
+    try source_domain.releaseNative(source_binding);
+    source_binding_live = false;
+    try source_domain.destroyQuiesced();
+    source_domain_live = false;
+    try testing.expectEqual(@as(u64, 7), carry.physical.routed_accepted);
+    const expected = carry.transport.policy;
+    var rejected = try windows_udp.duplicateForProcess(source.socket.?.fd, std.os.windows.GetCurrentProcessId());
+    var wrong = expected;
+    wrong.max_upload_bytes += 1;
+    try testing.expectError(error.ConfigMismatch, NativeMediaTransport.initTransferredPhysical(testing.allocator, &rejected, &carry.transport, wrong, null));
+    try testing.expect(!rejected.consumed);
+    var transfer = try windows_udp.duplicateForProcess(source.socket.?.fd, std.os.windows.GetCurrentProcessId());
+    var candidate = try NativeMediaTransport.initTransferredPhysical(testing.allocator, &transfer, &carry.transport, expected, null);
+    defer candidate.deinit();
+    try testing.expect(transfer.consumed);
+    try testing.expect(candidate.socket.?.fd != source.socket.?.fd);
+    try testing.expectEqualDeep(carry.transport.socket, try source.socket.?.capture());
+    try candidate.prepareInheritedResources(testing.io);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .native_media, .instance = 0, .owner_identity = &candidate }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    defer {
+        candidate.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        candidate.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    try candidate.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.native_media, 0, &candidate));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try candidate.requireParked();
+    var state = try carry.physical.prepareRemappedRestore(testing.allocator, &.{}, expected.max_participants, 1 << 20);
+    defer state.deinit();
+    var webrtc = try @import("media_plane.zig").MediaPlane.initFallible(testing.allocator);
+    defer webrtc.deinit();
+    var calls: [0]routing.GraphCall = .{};
+    var endpoints: [0]routing.GraphEndpoint = .{};
+    var memberships: [0]routing.GraphMembership = .{};
+    var policies: [0]routing.GraphBridgePolicy = .{};
+    const graph: routing.GraphSnapshot = .{ .allocator = testing.allocator, .id = .{ .serial = 80_000_002 }, .revision = 2, .next_call = 1, .next_endpoint = 1, .next_stream = 1, .next_scope = 1, .next_binding = 3, .native_binding_serial = 1, .webrtc_binding_serial = 2, .calls = &calls, .endpoints = &endpoints, .memberships = &memberships, .bridge_policy = &policies };
+    var prepared = try routing.prepareGraphRestore(testing.allocator, &graph, &candidate, &webrtc);
+    defer prepared.deinit();
+    defer if (candidate.physical_restored) candidate.discardPreparedPhysicalState(&prepared);
+    candidate.installPreparedPhysicalState(&state, &prepared);
+    try testing.expect(state.moved and candidate.physical_restored);
+    try testing.expectEqual(@as(u64, 7), candidate.routed_accepted.load(.acquire));
+    try testing.expectEqual(@as(u64, 8), candidate.routed_refused.load(.acquire));
+    candidate.discardPreparedPhysicalState(&prepared);
+    try candidate.requireRoutingReleasable();
+    try testing.expect(candidate.socket != null and !candidate.physical_restored);
+}
 
 fn populateNativePhysicalDtoFixture(owner: *NativeMediaTransport) !routing.EndpointKey {
     const key: routing.EndpointKey = .{ .call = .{ .domain = .{ .serial = 17 }, .serial = 29 }, .client = .{ .shard = 2, .slot = 3, .gen = 4 }, .leg = .native };
@@ -2199,7 +2490,7 @@ test "native physical DTO preserves endpoint keys, credentials, indexes, and lin
     try testing.expectEqual(@as(usize, 1), carry.streams.len);
     try testing.expectEqual(@as(usize, 2), carry.channels.len);
     try testing.expectEqual(@as(usize, 2), carry.stream_index.len);
-    var restored = try carry.prepareRestore(testing.allocator, source.max_participants, 1 << 20);
+    var restored = try carry.prepareRemappedRestore(testing.allocator, &.{.{ .source = key.client, .target = key.client }}, source.max_participants, 1 << 20);
     defer restored.deinit();
     try testing.expect(nativeEndpointEqual(source.physical_endpoints.get(key), restored.endpoints.get(key)));
     try testing.expectEqualDeep(source_master, restored.endpoints.get(key).?.master);
@@ -2222,7 +2513,7 @@ test "native physical DTO preserves endpoint keys, credentials, indexes, and lin
 test "native physical DTO rejects forged credentials, indexes, and over-budget state" {
     var source = NativeMediaTransport.init(testing.allocator);
     defer source.deinit();
-    _ = try populateNativePhysicalDtoFixture(&source);
+    const key = try populateNativePhysicalDtoFixture(&source);
     var carry = try source.capturePhysicalCutLocked(testing.allocator, 1 << 20);
     defer carry.deinit();
     try testing.expectError(error.Capacity, carry.validate(source.max_participants, 1));
@@ -2232,13 +2523,37 @@ test "native physical DTO rejects forged credentials, indexes, and over-budget s
     carry.endpoints[0].keys.c2s_frame[0] = original_key;
     const original_index = carry.stream_index[0].channel;
     carry.stream_index[0].channel = carry.channels.len;
-    try testing.expectError(error.InvalidSnapshot, carry.prepareRestore(testing.allocator, source.max_participants, 1 << 20));
+    try testing.expectError(error.InvalidSnapshot, carry.prepareRemappedRestore(testing.allocator, &.{.{ .source = key.client, .target = key.client }}, source.max_participants, 1 << 20));
     carry.stream_index[0].channel = original_index;
     const original_stream = carry.streams[0].stream_id;
     carry.streams[0].stream_id += 1;
     try testing.expectError(error.InvalidSnapshot, carry.validate(source.max_participants, 1 << 20));
     carry.streams[0].stream_id = original_stream;
     try carry.validate(source.max_participants, 1 << 20);
+}
+
+test "native physical DTO requires a collision-free complete client remap" {
+    var source = NativeMediaTransport.init(testing.allocator);
+    defer source.deinit();
+    const old_key = try populateNativePhysicalDtoFixture(&source);
+    var carry = try source.capturePhysicalCutLocked(testing.allocator, 1 << 20);
+    defer carry.deinit();
+    const target = routing.ClientId{ .shard = 7, .slot = 8, .gen = 9 };
+    const unrelated = routing.ClientId{ .shard = 6, .slot = 5, .gen = 4 };
+    try testing.expectError(error.IncompleteRemap, carry.prepareRemappedRestore(testing.allocator, &.{}, source.max_participants, 1 << 20));
+    try testing.expectError(error.IncompleteRemap, carry.prepareRemappedRestore(testing.allocator, &.{.{ .source = unrelated, .target = target }}, source.max_participants, 1 << 20));
+    try testing.expectError(error.InvalidSnapshot, carry.prepareRemappedRestore(testing.allocator, &.{ .{ .source = old_key.client, .target = target }, .{ .source = old_key.client, .target = unrelated } }, source.max_participants, 1 << 20));
+    try testing.expectError(error.InvalidSnapshot, carry.prepareRemappedRestore(testing.allocator, &.{ .{ .source = old_key.client, .target = target }, .{ .source = unrelated, .target = target } }, source.max_participants, 1 << 20));
+    var candidate = try carry.prepareRemappedRestore(testing.allocator, &.{ .{ .source = unrelated, .target = unrelated }, .{ .source = old_key.client, .target = target } }, source.max_participants, 1 << 20);
+    defer candidate.deinit();
+    var new_key = old_key;
+    new_key.client = target;
+    try testing.expect(candidate.endpoints.get(old_key) == null);
+    const row = candidate.endpoints.get(new_key).?;
+    try testing.expectEqualDeep(target, row.identity.reference.offering_client);
+    try testing.expectEqualDeep(target, row.identity.stamp.offering_client);
+    try testing.expectEqualDeep(new_key, candidate.streams.get(row.identity.stream_id).?);
+    try testing.expectEqualDeep(old_key.client, carry.endpoints[0].key.client);
 }
 
 fn nativePhysicalDtoOom(allocator: std.mem.Allocator) !void {
@@ -2255,12 +2570,18 @@ fn nativePhysicalDtoOom(allocator: std.mem.Allocator) !void {
         return err;
     };
     defer carry.deinit();
-    var candidate = carry.prepareRestore(allocator, source.max_participants, 1 << 20) catch |err| {
-        var retry = try carry.prepareRestore(testing.allocator, source.max_participants, 1 << 20);
+    const target = routing.ClientId{ .shard = 7, .slot = 8, .gen = 9 };
+    const remaps = [_]routing.ClientRemap{.{ .source = key.client, .target = target }};
+    var candidate = carry.prepareRemappedRestore(allocator, &remaps, source.max_participants, 1 << 20) catch |err| {
+        var retry = try carry.prepareRemappedRestore(testing.allocator, &remaps, source.max_participants, 1 << 20);
         defer retry.deinit();
         return err;
     };
     defer candidate.deinit();
+    var mapped_key = key;
+    mapped_key.client = target;
+    try testing.expect(!candidate.endpoints.contains(key));
+    try testing.expect(candidate.endpoints.contains(mapped_key));
     try testing.expect(source.channels.getKey("#one").?.ptr == original_name);
     try testing.expectEqualDeep(original_keys, source.physical_endpoints.get(key).?.keys);
 }

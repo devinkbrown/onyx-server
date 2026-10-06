@@ -278,7 +278,7 @@ handoff.
 Windows Helix launches a successor from the daemon's executable path and
 transfers authenticated custody of TCP listeners and client or mesh-link
 sockets, the metrics listener and snapshot, the webhook listener and binding
-store, an idle WebTransport UDP listener with its Retry/replay state, plus the
+store, a WebTransport UDP listener with its Retry/replay and active QUIC state, plus the
 private account WAL when configured. The candidate validates
 the carried state while inert, then publishes it only after authenticated
 COMMIT and predecessor exit. The native smoke first rejects a changed candidate
@@ -288,7 +288,7 @@ and writes, and an unchanged local session token. It has not yet exercised a
 swap between different binary versions. A separate native smoke exercises
 two swaps with held TLS IRC and WSS sockets, checks WebSocket control frames,
 and opens fresh TLS and WSS connections after each swap.
-The native v15 capability challenge requires ACME scheduler, TLS-material,
+The native v16 capability challenge requires ACME scheduler, TLS-material,
 OroWasm, active history-listener, and UDP owner custody support; an older
 candidate is rejected before socket transfer.
 A third native smoke upgrades a node with a held secured Mooring link, keeps
@@ -343,20 +343,27 @@ the carried module and memory.
 An idle configured WebTransport listener transfers its exact UDP socket and
 Retry/replay state before READY. The two-swap browser smoke opens a new QUIC
 session on the same port after each swap while held IRC and TLS clients remain
-connected. An active QUIC connection blocks the handoff until it closes. A
-candidate validates the WebTransport owner against the source's authenticated
-serving TLS checkpoint before READY, including generated bootstrap material.
+connected. For active QUIC sessions, the candidate also restores the paused
+connection, HTTP/3 streams, and accepted IRC socket roster before READY. The
+active browser smoke keeps the same registered stream and held IRC/TLS clients
+across two consecutive swaps. A candidate validates the WebTransport owner
+against the source's authenticated serving TLS checkpoint before READY,
+including generated bootstrap material.
 ACME and REHASH certificate reloads update the WebTransport owner only at an
 idle QUIC boundary; a busy owner keeps serving the old generation and the
 reload is retried or refused without changing either TLS view.
 
 An enabled, pristine `[media]` graph transfers its original WebRTC and native
 media UDP sockets, initial secret state, and native stream key before READY.
-The media Helix smoke holds TLS clients through two swaps and then exercises
-ICE and authenticated native UDP forwarding on the inherited ports. Any media
-room, transport, or cross-leg bridge activity blocks a further upgrade because
-its live graph has no exact checkpoint yet. A standalone native-media port
-without `[media]` also blocks the handoff. An
+An active graph transfers its call rooms, routing graph, bridges, client
+attachments, negotiated WebRTC and native physical state, and the same UDP
+sockets before READY. The candidate joins all three authenticated media bodies
+and publishes them after the adoption commit. The default media smoke holds
+TLS clients through two pristine swaps, establishes a call, then verifies ICE
+and authenticated native UDP forwarding through a third active swap. Its
+`--active` mode keeps the same call, ICE peers, UDP sockets, and MAC-keyed native
+traffic across two consecutive active swaps. A standalone native-media port
+without `[media]` still blocks the handoff. An
 opened loopback `history_https` listener transfers its listening socket when
 the candidate reproduces its complete TLS configuration; other runtime TLS
 settings cause a safe pre-COMMIT refusal. OroWasm plugin directories and media
@@ -395,6 +402,7 @@ python -B .\tools\windows_helix_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --generated
+python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_webpush_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_geo_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mail_helix_smoke.py .\zig-out\bin\onyx-server.exe
@@ -412,6 +420,7 @@ python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --irc-host 127.0.0.2
 python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 ```
 
@@ -459,6 +468,7 @@ python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_webhook_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_webpush_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_geo_helix_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mail_helix_smoke.py .\zig-out\bin\onyx-server.exe
@@ -476,6 +486,7 @@ python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --irc-host 127.0.0.2
 python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 ```
 

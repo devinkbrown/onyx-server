@@ -3,6 +3,9 @@
 
 """Exercise two Windows Helix swaps with the same WebTransport UDP listener.
 
+With --active, one registered browser WebTransport stream stays connected
+across both swaps. The default keeps the existing fresh-browser idle smoke.
+
 Usage: python -B tools/windows_helix_webtransport_smoke.py zig-out/bin/onyx-server.exe
 """
 
@@ -11,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 from contextlib import closing
+import json
 import os
 from pathlib import Path
 import secrets
@@ -18,13 +22,16 @@ import shutil
 import socket
 import ssl
 import subprocess
-import tempfile
 import time
+import urllib.error
+import urllib.request
 
 import windows_helix_smoke as helix
 import windows_helix_tls_smoke as helix_tls
 import windows_webtransport_smoke as wt
 from windows_private_account_dir import create_private_directory
+
+_LOOPBACK_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def browser_message(root: Path, port: int, cert_hash: str, browser: Path) -> None:
@@ -42,12 +49,65 @@ def browser_message(root: Path, port: int, cert_hash: str, browser: Path) -> Non
         )
 
 
+def held_control(port: int, path: str, payload: dict | None = None) -> dict | None:
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=body,
+        headers={"content-type": "application/json"} if body is not None else {},
+        method="POST" if body is not None or path == "/finish" else "GET",
+    )
+    with _LOOPBACK_HTTP.open(request, timeout=3) as response:
+        return None if response.status == 204 else json.load(response)
+
+
+def held_log_tail(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")[-12000:] if path.exists() else ""
+
+
+def wait_held_status(proc: subprocess.Popen, control_port: int, phase: int,
+                     log_path: Path, timeout: float = 35) -> dict:
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(f"held browser exited {proc.returncode} before phase {phase}:\n{held_log_tail(log_path)}")
+        try:
+            status = held_control(control_port, "/status")
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            last = str(exc)
+            time.sleep(0.15)
+            continue
+        if not isinstance(status, dict):
+            raise AssertionError(f"held browser returned invalid status: {status!r}")
+        if status.get("ok") is False:
+            raise AssertionError(f"held browser phase {phase} failed: {status.get('detail')}\n{held_log_tail(log_path)}")
+        if status.get("ok") is True and status.get("phase") == phase:
+            return status
+        if isinstance(status.get("phase"), int) and status["phase"] > phase:
+            raise AssertionError(f"held browser skipped phase {phase}: {status}")
+        time.sleep(0.15)
+    raise AssertionError(f"held browser phase {phase} timed out ({last}):\n{held_log_tail(log_path)}")
+
+
+def require_held_identity(status: dict, session_id: str) -> None:
+    if status.get("sessionId") != session_id:
+        raise AssertionError("held browser replaced its WebTransport session")
+    lines = status.get("lines")
+    if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines) or \
+            sum(" 001 webuser " in line for line in lines) != 1:
+        raise AssertionError("held browser did not retain exactly one IRC registration")
+    if sum(" JOIN " in line and "#web" in line for line in lines) != 1:
+        raise AssertionError("held browser rejoined or lost its original IRC stream")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--chromium", type=Path)
     parser.add_argument("--generated", action="store_true",
                         help="exercise the daemon's process-random bootstrap TLS material")
+    parser.add_argument("--active", action="store_true",
+                        help="hold one registered browser WebTransport stream across both upgrades")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("this fixture requires native Windows")
@@ -59,8 +119,7 @@ def main() -> int:
         parser.error("PowerShell 7 and Node.js are required for this browser fixture")
     browser = wt.browser_path(args.chromium)
 
-    with tempfile.TemporaryDirectory(prefix="onyx-windows-helix-wt-") as temporary:
-        root = Path(temporary)
+    with wt.disposable_run_dir() as root:
         binary = root / "onyx-server.exe"
         shutil.copy2(binary_source, binary)
         create_private_directory(root / "private")
@@ -68,7 +127,9 @@ def main() -> int:
         cert_hash = None if args.generated else wt.make_certificate(root, pwsh)
         with closing(wt.udp_socket()) as reserved:
             wt_port = reserved.getsockname()[1]
-        irc_port, tls_port = wt.tcp_ports(2)
+        ports = wt.tcp_ports(3 if args.active else 2)
+        irc_port, tls_port = ports[:2]
+        control_port = ports[2] if args.active else None
         password = secrets.token_urlsafe(22)
         config = root / "server.toml"
         config.write_text(
@@ -95,6 +156,9 @@ def main() -> int:
                                       stderr=subprocess.STDOUT)
             clients: list[helix.Client] = []
             observer_socket: socket.socket | None = None
+            held_proc: subprocess.Popen | None = None
+            held_log = None
+            held_log_path = root / "held-browser.log"
             try:
                 wt.wait_ready(parent, irc_port, log_path)
                 owner = helix_tls.connect_tls(tls_port, context, parent)
@@ -126,7 +190,37 @@ def main() -> int:
                 observer_socket.sendall(b"JOIN #web\r\n")
                 observer.until(lambda line: b" 366 wtobserver #web " in line, 8)
 
+                held_session_id = None
+                if args.active:
+                    env = os.environ.copy()
+                    env["TMPDIR"] = str(root)
+                    held_log = held_log_path.open("wb")
+                    held_proc = subprocess.Popen(
+                        [shutil.which("node") or "node", str(wt.HARNESS),
+                         "--port", str(wt_port), "--certhash", cert_hash,
+                         "--chromium", str(browser), "--http-port", str(control_port),
+                         "--timeout-ms", "240000", "--held"],
+                        cwd=root, env=env, stdout=held_log, stderr=subprocess.STDOUT,
+                    )
+                    ready = wait_held_status(held_proc, control_port, 0, held_log_path)
+                    held_session_id = ready.get("sessionId")
+                    if not isinstance(held_session_id, str) or not held_session_id:
+                        raise AssertionError("held browser omitted session identity")
+                    require_held_identity(ready, held_session_id)
+                    observer.until(
+                        lambda line: line.startswith(b":webuser!")
+                        and b"PRIVMSG #web :wt-held-baseline" in line, 10,
+                    )
+                    baseline_count = sum(
+                        line.startswith(b":webuser!")
+                        and b"PRIVMSG #web :wt-held-baseline" in line
+                        for line in observer.lines
+                    )
+                    if baseline_count != 1:
+                        raise AssertionError(f"expected one held browser baseline delivery, got {baseline_count}")
+
                 serving_pid = parent.pid
+                held_nonces: list[bytes] = []
                 for sequence in (1, 2):
                     oper.send(b"UPGRADE")
                     next_pid = helix.sole_image_pid(binary, different_from=serving_pid)
@@ -143,24 +237,60 @@ def main() -> int:
                             raise AssertionError("WebTransport serving certificate changed across Helix")
                     finally:
                         fresh.close()
-                    browser_message(root, wt_port, cert_hash, browser)
-                    observer.until(
-                        lambda line: line.startswith(b":webuser!")
-                        and b"PRIVMSG #web :hello from a browser" in line, 10,
-                    )
-                    observer_socket.sendall(b"PING :delivery-cut\r\n")
-                    observer.until(lambda line: b" PONG " in line and b"delivery-cut" in line, 10)
-                    deliveries = sum(b"PRIVMSG #web :hello from a browser" in line
-                                     and line.startswith(b":webuser!") for line in observer.lines)
-                    if deliveries != sequence:
-                        raise AssertionError(f"expected {sequence} exact browser deliveries, got {deliveries}")
+                    if args.active:
+                        nonce = f"wt-held-{sequence}-{secrets.token_hex(4)}".encode()
+                        probe = held_control(control_port, "/probe", {
+                            "phase": sequence, "nonce": nonce.decode("ascii"),
+                        })
+                        if probe != {"phase": sequence, "nonce": nonce.decode("ascii")}:
+                            raise AssertionError(f"held browser probe was not accepted: {probe}")
+                        status = wait_held_status(held_proc, control_port, sequence,
+                                                  held_log_path, timeout=25)
+                        require_held_identity(status, held_session_id)
+                        if status.get("nonce") != nonce.decode("ascii"):
+                            raise AssertionError("held browser acknowledged a different post-upgrade probe")
+                        held_nonces.append(nonce)
+                        observer.until(
+                            lambda line: line.startswith(b":webuser!")
+                            and b"PRIVMSG #web :" + nonce in line, 10,
+                        )
+                    else:
+                        browser_message(root, wt_port, cert_hash, browser)
+                        observer.until(
+                            lambda line: line.startswith(b":webuser!")
+                            and b"PRIVMSG #web :hello from a browser" in line, 10,
+                        )
+                    delivery_cut = f"delivery-cut-{sequence}".encode()
+                    observer_socket.sendall(b"PING :" + delivery_cut + b"\r\n")
+                    observer.until(lambda line: b" PONG " in line and delivery_cut in line, 10)
+                    if args.active:
+                        for expected in held_nonces:
+                            deliveries = sum(
+                                line.startswith(b":webuser!") and
+                                b"PRIVMSG #web :" + expected in line
+                                for line in observer.lines
+                            )
+                            if deliveries != 1:
+                                raise AssertionError(
+                                    f"expected one delivery for {expected!r}, got {deliveries}"
+                                )
+                    else:
+                        deliveries = sum(b"PRIVMSG #web :hello from a browser" in line
+                                         and line.startswith(b":webuser!") for line in observer.lines)
+                        if deliveries != sequence:
+                            raise AssertionError(f"expected {sequence} exact browser deliveries, got {deliveries}")
+                    mode = "same registered browser stream" if args.active else "fresh browser UDP"
                     print(f"PASS: Windows WebTransport Helix swap {sequence}, "
-                          f"{serving_pid} -> {next_pid}; held IRC/TLS and fresh browser UDP", flush=True)
+                          f"{serving_pid} -> {next_pid}; held IRC/TLS and {mode}", flush=True)
                     serving_pid = next_pid
-                    if sequence == 1:
+                    if sequence == 1 and not args.active:
                         # Wait for the browser's closed QUIC connection to leave
                         # the source demux before the next strictly idle capture.
                         time.sleep(32)
+                if args.active:
+                    held_control(control_port, "/finish")
+                    if held_proc.wait(timeout=10) != 0:
+                        raise AssertionError(f"held browser exited {held_proc.returncode}:\n{held_log_tail(held_log_path)}")
                 if parent.wait(timeout=2) != 0:
                     raise AssertionError("original predecessor did not exit cleanly")
                 return 0
@@ -170,6 +300,19 @@ def main() -> int:
                 print(contents.encode("ascii", "backslashreplace").decode("ascii"))
                 raise
             finally:
+                if held_proc is not None and held_proc.poll() is None:
+                    try:
+                        held_control(control_port, "/finish")
+                        held_proc.wait(timeout=5)
+                    except (OSError, urllib.error.URLError, subprocess.TimeoutExpired):
+                        if held_proc.poll() is None:
+                            subprocess.run(["taskkill", "/PID", str(held_proc.pid), "/T", "/F"],
+                                           capture_output=True, text=True, timeout=10, check=False)
+                            if held_proc.poll() is None:
+                                held_proc.kill()
+                            held_proc.wait(timeout=10)
+                if held_log is not None:
+                    held_log.close()
                 if observer_socket is not None:
                     observer_socket.close()
                 for client in clients:

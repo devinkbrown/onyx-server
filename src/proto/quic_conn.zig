@@ -90,6 +90,7 @@ const quic_handshake = @import("quic_handshake.zig");
 const quic_transport_params = @import("quic_transport_params.zig");
 const quic_recovery = @import("quic_recovery.zig");
 const secure_fns = @import("secure_fns.zig");
+const kx = @import("../crypto/kx.zig");
 
 pub const EncryptionLevel = quic_protect.EncryptionLevel;
 pub const KeySet = quic_protect.KeySet;
@@ -510,6 +511,458 @@ const KeyUpdate = struct {
     }
 };
 
+/// An authenticated handoff may carry at most this much Conn-owned variable
+/// data in addition to the separately bounded Engine and Recovery snapshots.
+pub const snapshot_max_owned_bytes: usize = 64 * 1024 * 1024;
+pub const snapshot_max_stream_senders: usize = 4096;
+pub const snapshot_max_flow_entries: usize = 4096;
+pub const snapshot_max_datagrams: usize = 1024;
+pub const snapshot_max_handshake_bytes: usize = 4 * 1024 * 1024;
+pub const SnapshotError = error{ InvalidSnapshot, SnapshotTooLarge, ConfigMismatch } || Allocator.Error;
+const snapshot_max_varint: u64 = (1 << 62) - 1;
+
+const CryptoSendSnapshot = struct {
+    base_offset: u64,
+    send_offset: u64,
+    bytes: []u8,
+
+    fn deinit(self: *CryptoSendSnapshot, allocator: Allocator) void {
+        std.crypto.secureZero(u8, self.bytes);
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+
+    fn validate(self: *const CryptoSendSnapshot) SnapshotError!void {
+        if (self.bytes.len > snapshot_max_handshake_bytes or self.base_offset > snapshot_max_varint or
+            self.bytes.len > snapshot_max_varint - self.base_offset or
+            self.send_offset < self.base_offset or self.send_offset > self.base_offset + self.bytes.len)
+            return error.InvalidSnapshot;
+    }
+};
+
+const ServerHandshakeSnapshot = struct {
+    /// The cert chain, ALPN preferences and local transport parameters are
+    /// immutable external config; the candidate supplies them from its owned
+    /// TLS material and stable per-connection CID storage. This digest binds the
+    /// exact public configuration while the listener verifies key possession.
+    config_digest: [32]u8,
+    selected_alpn_index: ?u16,
+    peer_params_present: bool,
+    peer_params_wire: []u8,
+    suite: quic_handshake.CipherSuite,
+    x25519_pair: kx.X25519Kx.KeyPair,
+    server_random: [32]u8,
+    selected_group: u8,
+    hybrid_keyshare: @FieldType(quic_handshake.Server, "hybrid_keyshare"),
+    transcript: []u8,
+    recv: []u8,
+    out_initial: []u8,
+    out_handshake: []u8,
+    handshake_secret: @FieldType(quic_handshake.Server, "handshake_secret"),
+    client_hs_secret: @FieldType(quic_handshake.Server, "client_hs_secret"),
+    server_hs_secret: @FieldType(quic_handshake.Server, "server_hs_secret"),
+    client_ap_secret: @FieldType(quic_handshake.Server, "client_ap_secret"),
+    server_ap_secret: @FieldType(quic_handshake.Server, "server_ap_secret"),
+    handshake_keys: KeySet,
+    application_keys: KeySet,
+
+    fn deinit(self: *ServerHandshakeSnapshot, allocator: Allocator) void {
+        self.x25519_pair.wipe();
+        inline for (.{ "handshake_secret", "client_hs_secret", "server_hs_secret", "client_ap_secret", "server_ap_secret" }) |field| {
+            std.crypto.secureZero(u8, &@field(self, field));
+        }
+        for ([_][]u8{ self.peer_params_wire, self.transcript, self.recv, self.out_initial, self.out_handshake }) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            allocator.free(bytes);
+        }
+        self.* = undefined;
+    }
+
+    fn validate(self: *const ServerHandshakeSnapshot) SnapshotError!void {
+        if (self.selected_group > 1 or self.peer_params_wire.len > snapshot_max_handshake_bytes or
+            self.transcript.len > snapshot_max_handshake_bytes or self.recv.len > snapshot_max_handshake_bytes or
+            self.out_initial.len > snapshot_max_handshake_bytes or self.out_handshake.len > snapshot_max_handshake_bytes)
+            return error.SnapshotTooLarge;
+        if (!self.peer_params_present and self.peer_params_wire.len != 0) return error.InvalidSnapshot;
+        if (self.peer_params_present) _ = quic_transport_params.decode(self.peer_params_wire) catch return error.InvalidSnapshot;
+        const expected_suite: quic_protect.CipherSuite = switch (self.suite) {
+            .tls_aes_128_gcm_sha256 => .aes128gcm,
+            .tls_aes_256_gcm_sha384 => .aes256gcm,
+            .tls_chacha20_poly1305_sha256 => .chacha20poly1305,
+        };
+        if (self.handshake_keys.level != .handshake or self.application_keys.level != .application or
+            self.handshake_keys.write.suite != self.handshake_keys.read.suite or
+            self.application_keys.write.suite != self.application_keys.read.suite or
+            self.handshake_keys.write.suite != expected_suite or self.application_keys.write.suite != expected_suite)
+            return error.InvalidSnapshot;
+        if (self.selected_group == 0 and !std.mem.allEqual(u8, &self.hybrid_keyshare, 0))
+            return error.InvalidSnapshot;
+    }
+};
+
+const StreamSenderSnapshot = struct {
+    id: u64,
+    acked_offset: u64,
+    send_offset: u64,
+    fin_offset: ?u64,
+    fin_sent: bool,
+    bytes: []u8,
+
+    fn deinit(self: *StreamSenderSnapshot, allocator: Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+const FlowEntrySnapshot = struct { id: u64, limit: u64 };
+
+/// Owned logical state for one established server QUIC connection. The
+/// certificate/signing key and local CID storage are supplied by the candidate
+/// owner; they are compared before a restored connection can be published.
+/// Call only while the source pump is paused at a packet boundary.
+pub const ConnSnapshot = struct {
+    handshake: ServerHandshakeSnapshot,
+    engine: quic_conn_state.EngineSnapshot,
+    recovery: quic_recovery.Snapshot,
+    crypto_initial: CryptoSendSnapshot,
+    crypto_handshake: CryptoSendSnapshot,
+    initial_keys: ?KeySet,
+    handshake_keys: ?KeySet,
+    app_keys: KeySet,
+    initial_discarded: bool,
+    key_update: KeyUpdate,
+    dcid: ConnectionId,
+    scid: ConnectionId,
+    initial_secret_dcid: [quic_packet.max_connection_id_len]u8,
+    initial_secret_dcid_len: u8,
+    started: bool,
+    server_cid_learned: bool,
+    established: bool,
+    closing: bool,
+    close_error: ?u64,
+    close_pending: bool,
+    handshake_done_pending: bool,
+    buffered: []BufferedSnapshot,
+    max_buffered: usize,
+    newly_acked: []u64,
+    bytes_received: u64,
+    bytes_sent_unvalidated: u64,
+    address_validated: bool,
+    path: PathAddress,
+    path_validation: PathValidation,
+    pending_path_responses: [][8]u8,
+    max_pending_path_responses: usize,
+    pending_path_challenge: ?[8]u8,
+    last_recv_ns: u64,
+    timer_deadline_ns: ?u64,
+    timer_kind: quic_recovery.TimerKind,
+    idle_timeout_ns: u64,
+    senders: []StreamSenderSnapshot,
+    stream_order: []u64,
+    pending_datagrams: [][]u8,
+    peer_max_data: ?u64,
+    fc_data_sent: u64,
+    peer_max_stream_data: []FlowEntrySnapshot,
+    recv_datagrams: [][]u8,
+    max_recv_datagrams: usize,
+    next_bidi_stream: u64,
+    next_uni_stream: u64,
+
+    pub const BufferedSnapshot = struct { level: EncryptionLevel, bytes: []u8 };
+
+    pub fn deinit(self: *ConnSnapshot, allocator: Allocator) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.handshake.handshake_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.handshake.application_keys));
+        self.handshake.deinit(allocator);
+        for (&self.engine.crypto) |*part| std.crypto.secureZero(u8, part.staged);
+        self.engine.deinit(allocator);
+        self.recovery.deinit(allocator);
+        self.crypto_initial.deinit(allocator);
+        self.crypto_handshake.deinit(allocator);
+        for (self.buffered) |packet| allocator.free(packet.bytes);
+        allocator.free(self.buffered);
+        allocator.free(self.newly_acked);
+        allocator.free(self.pending_path_responses);
+        for (self.senders) |*sender| sender.deinit(allocator);
+        allocator.free(self.senders);
+        allocator.free(self.stream_order);
+        for (self.pending_datagrams) |bytes| allocator.free(bytes);
+        allocator.free(self.pending_datagrams);
+        allocator.free(self.peer_max_stream_data);
+        for (self.recv_datagrams) |bytes| allocator.free(bytes);
+        allocator.free(self.recv_datagrams);
+        std.crypto.secureZero(u8, &self.initial_secret_dcid);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.initial_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.handshake_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.app_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.key_update));
+        self.* = undefined;
+    }
+
+    pub fn validate(self: *const ConnSnapshot) SnapshotError!void {
+        try self.handshake.validate();
+        try self.engine.validate();
+        try self.recovery.validate();
+        try self.crypto_initial.validate();
+        try self.crypto_handshake.validate();
+        if (self.engine.local != .server or !self.established or self.closing or self.started or
+            !self.initial_discarded or self.initial_keys != null or self.handshake_keys == null or
+            !self.recovery.handshake_confirmed or self.server_cid_learned or
+            self.dcid.len > quic_packet.max_connection_id_len or self.scid.len > quic_packet.max_connection_id_len or
+            self.initial_secret_dcid_len > quic_packet.max_connection_id_len or
+            self.close_error != null or self.close_pending or self.idle_timeout_ns == 0)
+            return error.InvalidSnapshot;
+        if (!std.mem.allEqual(u8, self.dcid.bytes[self.dcid.len..], 0) or
+            !std.mem.allEqual(u8, self.scid.bytes[self.scid.len..], 0) or
+            !std.mem.allEqual(u8, self.initial_secret_dcid[self.initial_secret_dcid_len..], 0))
+            return error.InvalidSnapshot;
+        if (!std.meta.eql(self.handshake_keys.?, self.handshake.handshake_keys) or
+            self.app_keys.level != .application or self.app_keys.write.suite != self.handshake.application_keys.write.suite or
+            self.app_keys.read.suite != self.handshake.application_keys.read.suite)
+            return error.InvalidSnapshot;
+        for (self.recovery.sent, self.engine.spaces, 0..) |registry, space, i| {
+            for (registry.packets) |packet| {
+                if (packet.packet_number >= space.next_outbound) return error.InvalidSnapshot;
+            }
+            // Initial keys are discarded at establishment. Handshake keys can
+            // still send a pending ACK afterward, repopulating that registry.
+            if (i == 0 and (registry.packets.len != 0 or registry.largest_sent_ack_eliciting != null))
+                return error.InvalidSnapshot;
+        }
+        if ((self.timer_kind == .none) != (self.timer_deadline_ns == null) or
+            self.last_recv_ns > std.math.maxInt(u64) / 2 or
+            (self.timer_deadline_ns != null and self.timer_deadline_ns.? > std.math.maxInt(u64) / 2) or
+            (self.last_recv_ns != 0 and self.idle_timeout_ns > std.math.maxInt(u64) - self.last_recv_ns))
+            return error.InvalidSnapshot;
+        if (self.max_buffered == 0 or self.max_buffered > 16 or self.buffered.len > self.max_buffered or
+            self.newly_acked.len > 4096 or self.max_pending_path_responses == 0 or
+            self.max_pending_path_responses > 8 or self.pending_path_responses.len > self.max_pending_path_responses or
+            self.max_recv_datagrams == 0 or self.max_recv_datagrams > 256 or self.recv_datagrams.len > self.max_recv_datagrams or
+            self.pending_datagrams.len > snapshot_max_datagrams or self.senders.len > snapshot_max_stream_senders or
+            self.peer_max_stream_data.len > snapshot_max_flow_entries or self.stream_order.len > snapshot_max_stream_senders)
+            return error.SnapshotTooLarge;
+        var total: usize = 0;
+        inline for (.{ self.handshake.peer_params_wire, self.handshake.transcript, self.handshake.recv, self.handshake.out_initial, self.handshake.out_handshake, self.crypto_initial.bytes, self.crypto_handshake.bytes }) |bytes| try snapshotAddBytes(&total, bytes.len);
+        for (self.buffered) |packet| {
+            if (packet.bytes.len == 0 or packet.bytes.len > 2048) return error.InvalidSnapshot;
+            try snapshotAddBytes(&total, packet.bytes.len);
+        }
+        for (self.senders, 0..) |sender, i| {
+            if (sender.id > snapshot_max_varint or sender.acked_offset > snapshot_max_varint or
+                sender.bytes.len > snapshot_max_varint - sender.acked_offset or
+                sender.send_offset < sender.acked_offset or
+                sender.send_offset > sender.acked_offset + sender.bytes.len or
+                (sender.fin_offset != null and sender.fin_offset.? > snapshot_max_varint) or
+                (sender.fin_sent and sender.fin_offset == null)) return error.InvalidSnapshot;
+            if (i > 0 and self.senders[i - 1].id >= sender.id) return error.InvalidSnapshot;
+            try snapshotAddBytes(&total, sender.bytes.len);
+        }
+        for (self.pending_datagrams) |bytes| {
+            if (bytes.len > max_datagram) return error.InvalidSnapshot;
+            try snapshotAddBytes(&total, bytes.len);
+        }
+        for (self.recv_datagrams) |bytes| {
+            if (bytes.len > 2048) return error.InvalidSnapshot;
+            try snapshotAddBytes(&total, bytes.len);
+        }
+        for (self.stream_order, 0..) |id, i| {
+            if (findSenderSnapshot(self.senders, id) == null) return error.InvalidSnapshot;
+            for (self.stream_order[0..i]) |prior| if (prior == id) return error.InvalidSnapshot;
+        }
+        for (self.peer_max_stream_data, 0..) |entry, i| {
+            if (entry.id > snapshot_max_varint or entry.limit > snapshot_max_varint or
+                (i > 0 and self.peer_max_stream_data[i - 1].id >= entry.id)) return error.InvalidSnapshot;
+        }
+        if (self.peer_max_data) |limit| if (limit > snapshot_max_varint) return error.InvalidSnapshot;
+        if (self.fc_data_sent > snapshot_max_varint or
+            self.bytes_sent_unvalidated > self.bytes_received *| 3) return error.InvalidSnapshot;
+        if (self.next_bidi_stream > snapshot_max_varint or self.next_uni_stream > snapshot_max_varint or
+            self.next_bidi_stream % 4 != 1 or self.next_uni_stream % 4 != 3) return error.InvalidSnapshot;
+        try validateSnapshotPath(self.path);
+        try validateSnapshotPath(self.path_validation.candidate);
+        if (self.path_validation.active and (!self.path_validation.candidate.isSet() or
+            self.path_validation.bytes_sent > self.path_validation.bytes_received *| 3)) return error.InvalidSnapshot;
+        if (!self.path_validation.active and (!std.meta.eql(self.path_validation, PathValidation{})))
+            return error.InvalidSnapshot;
+        if (self.key_update.ready != (self.handshake.suite != .tls_aes_256_gcm_sha384))
+            return error.InvalidSnapshot;
+        if (self.key_update.ready) {
+            if (self.key_update.suite != self.app_keys.write.suite or
+                self.key_update.suite != self.app_keys.read.suite or
+                !std.mem.eql(u8, &self.key_update.next_read_secret, &quic_tls.nextGenerationSecret(self.key_update.read_secret)) or
+                !std.meta.eql(self.key_update.next_read, quic_protect.keyUpdateDirection(self.app_keys.read, self.key_update.next_read_secret)))
+                return error.InvalidSnapshot;
+            const write = quic_tls.derivePacketKeys(self.key_update.write_secret, self.key_update.suite);
+            const read = quic_tls.derivePacketKeys(self.key_update.read_secret, self.key_update.suite);
+            if (!std.mem.eql(u8, write.keyBytes(), self.app_keys.write.keyBytes()) or
+                !std.mem.eql(u8, &write.iv, &self.app_keys.write.iv) or
+                !std.mem.eql(u8, read.keyBytes(), self.app_keys.read.keyBytes()) or
+                !std.mem.eql(u8, &read.iv, &self.app_keys.read.iv) or
+                !std.mem.eql(u8, self.app_keys.write.hpBytes(), self.handshake.application_keys.write.hpBytes()) or
+                !std.mem.eql(u8, self.app_keys.read.hpBytes(), self.handshake.application_keys.read.hpBytes()))
+                return error.InvalidSnapshot;
+        } else if (self.key_update.phase != 0 or self.key_update.prev_read != null or
+            self.key_update.initiated or self.key_update.have_updated or
+            !std.meta.eql(self.app_keys, self.handshake.application_keys)) return error.InvalidSnapshot;
+    }
+};
+
+fn snapshotAddBytes(total: *usize, amount: usize) SnapshotError!void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.SnapshotTooLarge;
+    if (total.* > snapshot_max_owned_bytes) return error.SnapshotTooLarge;
+}
+
+fn findSenderSnapshot(senders: []const StreamSenderSnapshot, id: u64) ?usize {
+    for (senders, 0..) |sender, i| if (sender.id == id) return i;
+    return null;
+}
+
+fn validateSnapshotPath(path: PathAddress) SnapshotError!void {
+    if (path.ip_len > 16) return error.InvalidSnapshot;
+    if (!std.mem.allEqual(u8, path.ip[path.ip_len..], 0)) return error.InvalidSnapshot;
+}
+
+fn canonicalSnapshotPath(path: PathAddress) PathAddress {
+    var out = path;
+    if (out.ip_len <= 16) @memset(out.ip[out.ip_len..], 0);
+    return out;
+}
+
+fn snapshotConfigDigest(allocator: Allocator, config: quic_handshake.Config) SnapshotError![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/quic/established-server-config/1");
+    hashSizedInt(&hash, config.cert_chain.len);
+    for (config.cert_chain) |cert| hashSizedBytes(&hash, cert);
+    switch (config.signing_key) {
+        .ed25519 => |key| {
+            hash.update(&.{1});
+            hash.update(&key.public_key.bytes);
+        },
+        .ecdsa_p256 => |key| {
+            hash.update(&.{2});
+            const sec1 = key.public_key.toUncompressedSec1();
+            hash.update(&sec1);
+        },
+        .rsa => |key| {
+            hash.update(&.{3});
+            hashSizedBytes(&hash, key.n);
+            hashSizedBytes(&hash, key.e);
+        },
+    }
+    hashSizedInt(&hash, config.alpn_protocols.len);
+    for (config.alpn_protocols) |alpn| hashSizedBytes(&hash, alpn);
+    var params: std.ArrayList(u8) = .empty;
+    defer params.deinit(allocator);
+    quic_transport_params.encode(&params, allocator, config.transport_params) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSnapshot,
+    };
+    hashSizedBytes(&hash, params.items);
+    return hash.finalResult();
+}
+
+fn hashSizedInt(hash: *std.crypto.hash.sha2.Sha256, value: usize) void {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, @intCast(value), .big);
+    hash.update(&encoded);
+}
+
+fn hashSizedBytes(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+    hashSizedInt(hash, bytes.len);
+    hash.update(bytes);
+}
+
+fn captureCryptoSend(allocator: Allocator, source: *const quic_conn_state.CryptoSendBuffer) SnapshotError!CryptoSendSnapshot {
+    const part: CryptoSendSnapshot = .{
+        .base_offset = source.base_offset,
+        .send_offset = source.send_offset,
+        .bytes = try allocator.dupe(u8, source.buf.items),
+    };
+    errdefer allocator.free(part.bytes);
+    try part.validate();
+    return part;
+}
+
+fn captureServerHandshake(allocator: Allocator, source: *const quic_handshake.Server) SnapshotError!ServerHandshakeSnapshot {
+    if (!source.isComplete() or source.suite == null or source.handshake_keys == null or source.application_keys == null)
+        return error.InvalidSnapshot;
+    var selected_index: ?u16 = null;
+    if (source.selected_alpn) |selected| {
+        for (source.config.alpn_protocols, 0..) |alpn, i| {
+            if (std.mem.eql(u8, selected, alpn)) {
+                selected_index = std.math.cast(u16, i) orelse return error.SnapshotTooLarge;
+                break;
+            }
+        }
+        if (selected_index == null) return error.InvalidSnapshot;
+    }
+    const peer = try allocator.dupe(u8, source.peer_params_storage.items);
+    errdefer allocator.free(peer);
+    const transcript = try allocator.dupe(u8, source.transcript.items);
+    errdefer allocator.free(transcript);
+    const recv = try allocator.dupe(u8, source.recv.items);
+    errdefer allocator.free(recv);
+    const out_initial = try allocator.dupe(u8, source.out_initial.items);
+    errdefer allocator.free(out_initial);
+    const out_handshake = try allocator.dupe(u8, source.out_handshake.items);
+    errdefer allocator.free(out_handshake);
+    var pair = source.x25519_pair;
+    defer pair.wipe();
+    const group: u8 = @intFromEnum(source.selected_group);
+    const hybrid = if (group == 1) source.hybrid_keyshare else @as(@FieldType(quic_handshake.Server, "hybrid_keyshare"), @splat(0));
+    const part: ServerHandshakeSnapshot = .{
+        .config_digest = try snapshotConfigDigest(allocator, source.config),
+        .selected_alpn_index = selected_index,
+        .peer_params_present = source.peer_params != null,
+        .peer_params_wire = peer,
+        .suite = source.suite.?,
+        .x25519_pair = pair,
+        .server_random = source.server_random,
+        .selected_group = group,
+        .hybrid_keyshare = hybrid,
+        .transcript = transcript,
+        .recv = recv,
+        .out_initial = out_initial,
+        .out_handshake = out_handshake,
+        .handshake_secret = source.handshake_secret,
+        .client_hs_secret = source.client_hs_secret,
+        .server_hs_secret = source.server_hs_secret,
+        .client_ap_secret = source.client_ap_secret,
+        .server_ap_secret = source.server_ap_secret,
+        .handshake_keys = source.handshake_keys.?,
+        .application_keys = source.application_keys.?,
+    };
+    try part.validate();
+    return part;
+}
+
+fn captureSnapshotDatagrams(allocator: Allocator, source: []const PendingDatagram) SnapshotError![][]u8 {
+    if (source.len > snapshot_max_datagrams) return error.SnapshotTooLarge;
+    const out = try allocator.alloc([]u8, source.len);
+    var copied: usize = 0;
+    errdefer {
+        for (out[0..copied]) |bytes| allocator.free(bytes);
+        allocator.free(out);
+    }
+    for (source, 0..) |item, i| {
+        out[i] = try allocator.dupe(u8, item.data);
+        copied += 1;
+    }
+    return out;
+}
+
+fn restoreSnapshotDatagrams(allocator: Allocator, target: *std.ArrayList(PendingDatagram), source: [][]u8) Allocator.Error!void {
+    for (source) |bytes| {
+        const copy = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(copy);
+        try target.append(allocator, .{ .data = copy });
+    }
+}
+
+fn zeroSnapshotPacketKeys() PacketKeys {
+    return .{ .suite = .aes128gcm, .key = @splat(0), .iv = @splat(0), .hp = @splat(0) };
+}
+
 /// The connection. One per peer 4-tuple. Socketless: feed `recvDatagram`,
 /// drain `sendDatagrams`, tick `onTimeout`.
 pub const Conn = struct {
@@ -768,7 +1221,293 @@ pub const Conn = struct {
         self.pending_path_responses.deinit(self.allocator);
         for (self.recv_datagrams.items) |p| self.allocator.free(p.data);
         self.recv_datagrams.deinit(self.allocator);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.initial_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.handshake_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.app_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.key_update));
+        std.crypto.secureZero(u8, &self.initial_secret_dcid);
         self.* = undefined;
+    }
+
+    /// Capture the complete mutable state of an established server connection
+    /// after the listener pump has stopped at a packet boundary. External TLS
+    /// material and the local transport-parameter CID slices remain the
+    /// listener's responsibility; restore checks their public configuration.
+    pub fn captureEstablishedServerSnapshot(self: *const Conn, allocator: Allocator) SnapshotError!ConnSnapshot {
+        if (self.role != .server or !self.established or self.closing or self.recv_src != null or self.recv_len != 0)
+            return error.InvalidSnapshot;
+        const server = switch (self.handshake) {
+            .server => |*value| value,
+            else => return error.InvalidSnapshot,
+        };
+        var handshake = try captureServerHandshake(allocator, server);
+        errdefer handshake.deinit(allocator);
+        var engine = try self.engine.captureSnapshot(allocator);
+        errdefer engine.deinit(allocator);
+        var recovery = try self.recovery.captureSnapshot(allocator);
+        errdefer recovery.deinit(allocator);
+        var crypto_initial = try captureCryptoSend(allocator, &self.send.crypto_initial);
+        errdefer crypto_initial.deinit(allocator);
+        var crypto_handshake = try captureCryptoSend(allocator, &self.send.crypto_handshake);
+        errdefer crypto_handshake.deinit(allocator);
+
+        const buffered = try allocator.alloc(ConnSnapshot.BufferedSnapshot, self.buffered.items.len);
+        var buffered_count: usize = 0;
+        errdefer {
+            for (buffered[0..buffered_count]) |packet| allocator.free(packet.bytes);
+            allocator.free(buffered);
+        }
+        for (self.buffered.items, 0..) |packet, i| {
+            buffered[i] = .{ .level = packet.level, .bytes = try allocator.dupe(u8, packet.bytes) };
+            buffered_count += 1;
+        }
+        const newly_acked = try allocator.dupe(u64, self.newly_acked.items);
+        errdefer allocator.free(newly_acked);
+        const pending_path_responses = try allocator.dupe([8]u8, self.pending_path_responses.items);
+        errdefer allocator.free(pending_path_responses);
+
+        if (self.stream_senders.count() > snapshot_max_stream_senders) return error.SnapshotTooLarge;
+        const senders = try allocator.alloc(StreamSenderSnapshot, self.stream_senders.count());
+        var sender_count: usize = 0;
+        errdefer {
+            for (senders[0..sender_count]) |*sender| sender.deinit(allocator);
+            allocator.free(senders);
+        }
+        var sender_it = self.stream_senders.iterator();
+        while (sender_it.next()) |entry| {
+            const sender = entry.value_ptr.*;
+            senders[sender_count] = .{
+                .id = entry.key_ptr.*,
+                .acked_offset = sender.acked_offset,
+                .send_offset = sender.send_offset,
+                .fin_offset = sender.fin_offset,
+                .fin_sent = sender.fin_sent,
+                .bytes = try allocator.dupe(u8, sender.buf.items),
+            };
+            sender_count += 1;
+        }
+        std.mem.sort(StreamSenderSnapshot, senders, {}, struct {
+            fn less(_: void, a: StreamSenderSnapshot, b: StreamSenderSnapshot) bool {
+                return a.id < b.id;
+            }
+        }.less);
+        const stream_order = try allocator.dupe(u64, self.stream_order.items);
+        errdefer allocator.free(stream_order);
+        const pending_datagrams = try captureSnapshotDatagrams(allocator, self.pending_datagrams.items);
+        errdefer {
+            for (pending_datagrams) |bytes| allocator.free(bytes);
+            allocator.free(pending_datagrams);
+        }
+        if (self.peer_max_stream_data.count() > snapshot_max_flow_entries) return error.SnapshotTooLarge;
+        const peer_flow = try allocator.alloc(FlowEntrySnapshot, self.peer_max_stream_data.count());
+        errdefer allocator.free(peer_flow);
+        var flow_it = self.peer_max_stream_data.iterator();
+        var flow_count: usize = 0;
+        while (flow_it.next()) |entry| {
+            peer_flow[flow_count] = .{ .id = entry.key_ptr.*, .limit = entry.value_ptr.* };
+            flow_count += 1;
+        }
+        std.mem.sort(FlowEntrySnapshot, peer_flow, {}, struct {
+            fn less(_: void, a: FlowEntrySnapshot, b: FlowEntrySnapshot) bool {
+                return a.id < b.id;
+            }
+        }.less);
+        const recv_datagrams = try captureSnapshotDatagrams(allocator, self.recv_datagrams.items);
+        errdefer {
+            for (recv_datagrams) |bytes| allocator.free(bytes);
+            allocator.free(recv_datagrams);
+        }
+
+        var initial_secret_dcid: [quic_packet.max_connection_id_len]u8 = @splat(0);
+        defer std.crypto.secureZero(u8, &initial_secret_dcid);
+        if (self.initial_secret_dcid_len > initial_secret_dcid.len) return error.InvalidSnapshot;
+        @memcpy(initial_secret_dcid[0..self.initial_secret_dcid_len], self.initial_secret_dcid[0..self.initial_secret_dcid_len]);
+        var key_update = self.key_update;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&key_update));
+        if (!key_update.ready) {
+            key_update = .{};
+            key_update.next_read = zeroSnapshotPacketKeys();
+        }
+        var path_validation = self.path_validation;
+        path_validation.candidate = canonicalSnapshotPath(path_validation.candidate);
+        const snapshot: ConnSnapshot = .{
+            .handshake = handshake,
+            .engine = engine,
+            .recovery = recovery,
+            .crypto_initial = crypto_initial,
+            .crypto_handshake = crypto_handshake,
+            .initial_keys = self.initial_keys,
+            .handshake_keys = self.handshake_keys,
+            .app_keys = self.app_keys orelse return error.InvalidSnapshot,
+            .initial_discarded = self.initial_discarded,
+            .key_update = key_update,
+            .dcid = self.dcid,
+            .scid = self.scid,
+            .initial_secret_dcid = initial_secret_dcid,
+            .initial_secret_dcid_len = self.initial_secret_dcid_len,
+            .started = self.started,
+            .server_cid_learned = self.server_cid_learned,
+            .established = self.established,
+            .closing = self.closing,
+            .close_error = self.close_error,
+            .close_pending = self.close_pending,
+            .handshake_done_pending = self.handshake_done_pending,
+            .buffered = buffered,
+            .max_buffered = self.max_buffered,
+            .newly_acked = newly_acked,
+            .bytes_received = self.bytes_received,
+            .bytes_sent_unvalidated = self.bytes_sent_unvalidated,
+            .address_validated = self.address_validated,
+            .path = canonicalSnapshotPath(self.path),
+            .path_validation = path_validation,
+            .pending_path_responses = pending_path_responses,
+            .max_pending_path_responses = self.max_pending_path_responses,
+            .pending_path_challenge = self.pending_path_challenge,
+            .last_recv_ns = self.last_recv_ns,
+            .timer_deadline_ns = self.timer_deadline_ns,
+            .timer_kind = self.timer_kind,
+            .idle_timeout_ns = self.idle_timeout_ns,
+            .senders = senders,
+            .stream_order = stream_order,
+            .pending_datagrams = pending_datagrams,
+            .peer_max_data = self.peer_max_data,
+            .fc_data_sent = self.fc_data_sent,
+            .peer_max_stream_data = peer_flow,
+            .recv_datagrams = recv_datagrams,
+            .max_recv_datagrams = self.max_recv_datagrams,
+            .next_bidi_stream = self.next_bidi_stream,
+            .next_uni_stream = self.next_uni_stream,
+        };
+        try snapshot.validate();
+        return snapshot;
+    }
+
+    /// Restore into a detached Conn. `config` must borrow candidate-owned TLS
+    /// material and stable CID arrays that outlive this Conn. In particular,
+    /// moving the enclosing listener Connection after this call is forbidden.
+    /// On error the candidate is fully destroyed and the source stays untouched.
+    pub fn restoreEstablishedServerSnapshot(allocator: Allocator, snapshot: *const ConnSnapshot, config: ServerConfig) SnapshotError!Conn {
+        try snapshot.validate();
+        if (!std.mem.eql(u8, config.local_cid, snapshot.scid.slice())) return error.ConfigMismatch;
+        const hs_config: quic_handshake.Config = .{
+            .cert_chain = config.cert_chain,
+            .signing_key = config.signing_key,
+            .alpn_protocols = config.alpn_protocols,
+            .transport_params = config.transport_params,
+        };
+        if (!std.mem.eql(u8, &snapshot.handshake.config_digest, &try snapshotConfigDigest(allocator, hs_config)))
+            return error.ConfigMismatch;
+        if (!std.meta.eql(config.engine, snapshot.engine.config)) return error.ConfigMismatch;
+        if (snapshot.handshake.selected_alpn_index) |index| {
+            if (index >= config.alpn_protocols.len) return error.ConfigMismatch;
+        }
+        var result = Conn.initServer(allocator, .{
+            .cert_chain = config.cert_chain,
+            .signing_key = config.signing_key,
+            .alpn_protocols = config.alpn_protocols,
+            .transport_params = config.transport_params,
+            .local_cid = config.local_cid,
+            .engine = config.engine,
+            .x25519_seed = @splat(0),
+            .server_random = snapshot.handshake.server_random,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidSnapshot,
+        };
+        errdefer result.deinit();
+        result.handshake.server.x25519_pair.wipe();
+        result.handshake.server.x25519_pair = snapshot.handshake.x25519_pair;
+        const hs = &result.handshake.server;
+        hs.state = .connected;
+        hs.suite = snapshot.handshake.suite;
+        hs.selected_alpn = if (snapshot.handshake.selected_alpn_index) |index| config.alpn_protocols[index] else null;
+        try hs.peer_params_storage.appendSlice(allocator, snapshot.handshake.peer_params_wire);
+        hs.peer_params = if (snapshot.handshake.peer_params_present)
+            quic_transport_params.decode(hs.peer_params_storage.items) catch return error.InvalidSnapshot
+        else
+            null;
+        hs.selected_group = @enumFromInt(snapshot.handshake.selected_group);
+        hs.hybrid_keyshare = snapshot.handshake.hybrid_keyshare;
+        try hs.transcript.appendSlice(allocator, snapshot.handshake.transcript);
+        try hs.recv.appendSlice(allocator, snapshot.handshake.recv);
+        try hs.out_initial.appendSlice(allocator, snapshot.handshake.out_initial);
+        try hs.out_handshake.appendSlice(allocator, snapshot.handshake.out_handshake);
+        hs.handshake_secret = snapshot.handshake.handshake_secret;
+        hs.client_hs_secret = snapshot.handshake.client_hs_secret;
+        hs.server_hs_secret = snapshot.handshake.server_hs_secret;
+        hs.client_ap_secret = snapshot.handshake.client_ap_secret;
+        hs.server_ap_secret = snapshot.handshake.server_ap_secret;
+        hs.handshake_keys = snapshot.handshake.handshake_keys;
+        hs.application_keys = snapshot.handshake.application_keys;
+
+        const restored_engine = try Engine.restoreSnapshot(allocator, &snapshot.engine);
+        result.engine.deinit();
+        result.engine = restored_engine;
+        const restored_recovery = try quic_recovery.Recovery.restoreSnapshot(allocator, &snapshot.recovery);
+        result.recovery.deinit();
+        result.recovery = restored_recovery;
+        try result.send.crypto_initial.buf.appendSlice(allocator, snapshot.crypto_initial.bytes);
+        result.send.crypto_initial.base_offset = snapshot.crypto_initial.base_offset;
+        result.send.crypto_initial.send_offset = snapshot.crypto_initial.send_offset;
+        try result.send.crypto_handshake.buf.appendSlice(allocator, snapshot.crypto_handshake.bytes);
+        result.send.crypto_handshake.base_offset = snapshot.crypto_handshake.base_offset;
+        result.send.crypto_handshake.send_offset = snapshot.crypto_handshake.send_offset;
+        for (snapshot.buffered) |packet| {
+            const copy = try allocator.dupe(u8, packet.bytes);
+            errdefer allocator.free(copy);
+            try result.buffered.append(allocator, .{ .level = packet.level, .bytes = copy });
+        }
+        try result.newly_acked.appendSlice(allocator, snapshot.newly_acked);
+        try result.pending_path_responses.appendSlice(allocator, snapshot.pending_path_responses);
+        for (snapshot.senders) |sender| {
+            const gop = try result.stream_senders.getOrPut(allocator, sender.id);
+            gop.value_ptr.* = .{
+                .acked_offset = sender.acked_offset,
+                .send_offset = sender.send_offset,
+                .fin_offset = sender.fin_offset,
+                .fin_sent = sender.fin_sent,
+            };
+            try gop.value_ptr.buf.appendSlice(allocator, sender.bytes);
+        }
+        try result.stream_order.appendSlice(allocator, snapshot.stream_order);
+        try restoreSnapshotDatagrams(allocator, &result.pending_datagrams, snapshot.pending_datagrams);
+        for (snapshot.peer_max_stream_data) |entry| try result.peer_max_stream_data.put(allocator, entry.id, entry.limit);
+        try restoreSnapshotDatagrams(allocator, &result.recv_datagrams, snapshot.recv_datagrams);
+
+        result.initial_keys = snapshot.initial_keys;
+        result.handshake_keys = snapshot.handshake_keys;
+        result.app_keys = snapshot.app_keys;
+        result.initial_discarded = snapshot.initial_discarded;
+        result.key_update = snapshot.key_update;
+        result.dcid = snapshot.dcid;
+        result.scid = snapshot.scid;
+        result.initial_secret_dcid = snapshot.initial_secret_dcid;
+        result.initial_secret_dcid_len = snapshot.initial_secret_dcid_len;
+        result.started = snapshot.started;
+        result.server_cid_learned = snapshot.server_cid_learned;
+        result.established = snapshot.established;
+        result.closing = snapshot.closing;
+        result.close_error = snapshot.close_error;
+        result.close_pending = snapshot.close_pending;
+        result.handshake_done_pending = snapshot.handshake_done_pending;
+        result.max_buffered = snapshot.max_buffered;
+        result.bytes_received = snapshot.bytes_received;
+        result.bytes_sent_unvalidated = snapshot.bytes_sent_unvalidated;
+        result.address_validated = snapshot.address_validated;
+        result.path = snapshot.path;
+        result.path_validation = snapshot.path_validation;
+        result.max_pending_path_responses = snapshot.max_pending_path_responses;
+        result.pending_path_challenge = snapshot.pending_path_challenge;
+        result.last_recv_ns = snapshot.last_recv_ns;
+        result.timer_deadline_ns = snapshot.timer_deadline_ns;
+        result.timer_kind = snapshot.timer_kind;
+        result.idle_timeout_ns = snapshot.idle_timeout_ns;
+        result.peer_max_data = snapshot.peer_max_data;
+        result.fc_data_sent = snapshot.fc_data_sent;
+        result.max_recv_datagrams = snapshot.max_recv_datagrams;
+        result.next_bidi_stream = snapshot.next_bidi_stream;
+        result.next_uni_stream = snapshot.next_uni_stream;
+        return result;
     }
 
     // -----------------------------------------------------------------------
@@ -2855,6 +3594,93 @@ fn driveHandshake(alloc: Allocator, lb: *Loopback) !void {
         if (lb.client.isEstablished() and lb.server.isEstablished()) return;
     }
     return error.HandshakeDidNotComplete;
+}
+
+test "quic conn snapshot restores established server stream loss and owned handshake state" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+    try lb.server.sendStream(0, "retransmit-me", true);
+    try lb.server.sendDatagram("queued-datagram");
+    try lb.server.captureRecvDatagram("received-datagram");
+
+    // Put the STREAM bytes on the wire, but drop that packet. The restored
+    // recovery registry and retained sender bytes must retransmit it later.
+    var dropped: std.ArrayList(OutDatagram) = .empty;
+    defer {
+        for (dropped.items) |packet| alloc.free(packet.bytes);
+        dropped.deinit(alloc);
+    }
+    _ = try lb.server.sendDatagramsAt(&dropped, 10 * std.time.ns_per_s);
+    try testing.expect(dropped.items.len > 0);
+    lb.server.startPathValidation(PathAddress.fromParts(&.{ 10, 0, 0, 2 }, 4444), 10 * std.time.ns_per_s);
+    // A sent challenge leaves the compatibility field populated even when the
+    // pending bit is clear. Both values must round-trip independently.
+    lb.server.path_validation.challenge_pending = false;
+
+    var snapshot = try lb.server.captureEstablishedServerSnapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try snapshot.validate();
+    const config: ServerConfig = .{
+        .cert_chain = &lb.cert_chain,
+        .signing_key = .{ .ed25519 = lb.kp },
+        .alpn_protocols = &test_alpn,
+        .transport_params = test_server_params,
+        .local_cid = &test_server_cid,
+    };
+    var restored = try Conn.restoreEstablishedServerSnapshot(alloc, &snapshot, config);
+    defer restored.deinit();
+    var again = try restored.captureEstablishedServerSnapshot(alloc);
+    defer again.deinit(alloc);
+    try testing.expectEqualDeep(snapshot, again);
+    try testing.expect(restored.peerTransportParams() != null);
+    try testing.expectEqualStrings("h3", restored.selectedAlpn().?);
+    try testing.expect(restored.key_update.ready);
+    const received = restored.recvDatagramPayload().?;
+    defer alloc.free(received);
+    try testing.expectEqualSlices(u8, "received-datagram", received);
+
+    // The source and candidate produce identical protected retransmissions
+    // after the same timeout. Only one would ever be resumed by Helix.
+    _ = try lb.server.onTimeout(11 * std.time.ns_per_s);
+    _ = try restored.onTimeout(11 * std.time.ns_per_s);
+    var source_out: std.ArrayList(OutDatagram) = .empty;
+    defer {
+        for (source_out.items) |packet| alloc.free(packet.bytes);
+        source_out.deinit(alloc);
+    }
+    var restored_out: std.ArrayList(OutDatagram) = .empty;
+    defer {
+        for (restored_out.items) |packet| alloc.free(packet.bytes);
+        restored_out.deinit(alloc);
+    }
+    _ = try lb.server.sendDatagramsAt(&source_out, 11 * std.time.ns_per_s);
+    _ = try restored.sendDatagramsAt(&restored_out, 11 * std.time.ns_per_s);
+    try testing.expectEqual(source_out.items.len, restored_out.items.len);
+    for (source_out.items, restored_out.items) |a, b| try testing.expectEqualSlices(u8, a.bytes, b.bytes);
+}
+
+test "quic conn snapshot rejects altered sender and external configuration" {
+    const alloc = testing.allocator;
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+    try lb.server.sendStream(0, "abc", false);
+    var snapshot = try lb.server.captureEstablishedServerSnapshot(alloc);
+    defer snapshot.deinit(alloc);
+    const prior = snapshot.senders[0].send_offset;
+    snapshot.senders[0].send_offset = 999;
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+    snapshot.senders[0].send_offset = prior;
+    const wrong: ServerConfig = .{
+        .cert_chain = &lb.cert_chain,
+        .signing_key = .{ .ed25519 = lb.kp },
+        .alpn_protocols = &[_][]const u8{"wrong"},
+        .transport_params = test_server_params,
+        .local_cid = &test_server_cid,
+    };
+    try testing.expectError(error.ConfigMismatch, Conn.restoreEstablishedServerSnapshot(alloc, &snapshot, wrong));
 }
 
 // ---------------------------------------------------------------------------

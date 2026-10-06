@@ -122,6 +122,7 @@ const win = struct {
     extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
     extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
     extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getpeername(socket: usize, address: *anyopaque, address_len: *i32) callconv(.winapi) i32;
     extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
     extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
     extern "ws2_32" fn connect(socket: usize, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
@@ -141,6 +142,7 @@ const proxy_protocol = @import("../proto/proxy_protocol.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const dualstack_udp = @import("dualstack_udp.zig");
 const windows_udp = @import("helix/native_windows_udp_socket.zig");
+const windows_tcp = @import("helix/native_windows_socket.zig");
 
 pub const MediaSocket = media_socket.MediaSocket;
 pub const DualStackUdpSocket = dualstack_udp.DualStackUdpSocket;
@@ -507,6 +509,68 @@ pub const WebTransportListener = struct {
         try self.runtime.pause.requirePaused(token);
         return self.captureIdle(.paused);
     }
+    /// Capture the settled listener graph while its sole pump is parked at a
+    /// packet boundary. This owns QUIC and H3 state but only *describes* bridge
+    /// TCP sockets; their physical transfer belongs to the Helix control path.
+    pub fn capturePausedActive(self: *WebTransportListener, token: runtime_pause.Token, allocator: std.mem.Allocator) !ActiveSnapshot {
+        lockSpin(&self.worker_mutex);
+        const running = self.thread != null or self.runtime.view != null;
+        self.worker_mutex.unlock();
+        if (!running) return error.NotRunning;
+        try self.runtime.pause.requirePaused(token);
+        return self.captureActive(allocator, .paused);
+    }
+    /// The same detached graph capture for a source whose worker has not been
+    /// started yet. This is also useful for deterministic socket-level tests.
+    pub fn captureUnstartedActive(self: *WebTransportListener, allocator: std.mem.Allocator) !ActiveSnapshot {
+        lockSpin(&self.worker_mutex);
+        defer self.worker_mutex.unlock();
+        if (self.legacy_joining or self.thread != null or self.worker_id != null or self.runtime.view != null) return error.NotQuiescent;
+        return self.captureActive(allocator, .unstarted);
+    }
+    fn captureActive(self: *WebTransportListener, allocator: std.mem.Allocator, execution: Execution) !ActiveSnapshot {
+        if (self.conns.items.len > snapshot_max_slots or self.liveCount() > self.max_connections) return error.SnapshotTooLarge;
+        var base = try self.captureCommon(execution);
+        errdefer base.deinit();
+        var rows: std.ArrayList(ActiveConnectionSnapshot) = .empty;
+        errdefer {
+            for (rows.items) |*row| row.deinit(allocator);
+            rows.deinit(allocator);
+        }
+        for (self.conns.items, 0..) |maybe, slot| {
+            const conn = maybe orelse continue;
+            if (!conn.conn.isEstablished() or conn.conn.isClosing()) return error.ActiveQuicContinuityUnsupported;
+            if (self.by_cid.get(conn.scidSlice()) != slot or self.by_cid.get(conn.initDcidSlice()) != slot)
+                return error.InvalidSnapshot;
+            var quic = try conn.conn.captureEstablishedServerSnapshot(allocator);
+            errdefer quic.deinit(allocator);
+            var h3 = try conn.h3.captureServerSnapshot(allocator);
+            errdefer h3.deinit(allocator);
+            const bridge: ?BridgeIdentity = if (conn.irc_fd) |fd| try observeBridge(fd) else null;
+            try rows.append(allocator, .{
+                .slot = slot,
+                .scid = canonicalCid(conn.scidSlice()),
+                .scid_len = conn.scid_len,
+                .init_dcid = canonicalCid(conn.initDcidSlice()),
+                .init_dcid_len = conn.init_dcid_len,
+                .orig_dcid = canonicalCid(conn.origDcidSlice()),
+                .orig_dcid_len = conn.orig_dcid_len,
+                .retry_scid = canonicalCid(conn.retryScidSlice() orelse &.{}),
+                .retry_scid_len = conn.retry_scid_len,
+                .peer = conn.peer,
+                .bridge = bridge,
+                .wt_stream_id = conn.wt_stream_id,
+                .have_wt_stream = conn.have_wt_stream,
+                .quic = quic,
+                .h3 = h3,
+            });
+        }
+        var result: ActiveSnapshot = .{ .base = base, .irc_host_digest = ircHostDigest(self.irc_host), .slot_count = self.conns.items.len, .connections = try rows.toOwnedSlice(allocator) };
+        errdefer result.deinit(allocator);
+        try result.validate(self.tls);
+        if (self.by_cid.count() != result.cidCount()) return error.InvalidSnapshot;
+        return result;
+    }
     /// Publish a new serving certificate only while the pump is parked and no
     /// QUIC connection can still borrow the previous generation. The caller
     /// keeps replacement storage alive for this listener's full lifetime.
@@ -528,11 +592,129 @@ pub const WebTransportListener = struct {
     fn captureIdle(self: *WebTransportListener, execution: Execution) !Snapshot {
         if (self.by_cid.count() != 0) return error.ActiveQuicContinuityUnsupported;
         for (self.conns.items) |conn| if (conn != null) return error.ActiveQuicContinuityUnsupported;
+        return self.captureCommon(execution);
+    }
+    fn captureCommon(self: *WebTransportListener, execution: Execution) !Snapshot {
         try self.validatePolicy();
         const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
         const carry: Snapshot = .{ .socket = try socket.capture(), .tls_digest = try tlsDigest(self.tls), .irc_port = self.irc_port, .send_proxy_header = self.send_proxy_header, .echo_wt_datagrams = self.echo_wt_datagrams, .max_connections = self.max_connections, .retry_policy = self.retry_policy, .retry_load_threshold = self.retry_load_threshold, .retry_secret = self.retry_secret, .token_replay = self.token_replay, .scid_counter = self.scid_counter, .reset_tokens = self.reset_tokens, .reset_last_refill_ns = self.reset_last_refill_ns, .reset_rate_per_s = self.reset_rate_per_s, .reset_burst = self.reset_burst, .execution = execution };
         try carry.validate(self.tls);
         return carry;
+    }
+
+    /// Prepare the detached successor's entire QUIC/H3/CID graph. `self` must
+    /// already own the transferred UDP socket via initTransferred, and its pump
+    /// must not have started. Bridge records come from the authenticated Helix
+    /// control path, one per live IRC-side TCP socket. The accepted daemon-side
+    /// TCP clients remain an external whole-server join. A failure destroys all
+    /// candidate state and never mutates the paused source.
+    pub fn prepareActiveConnectionsWindows(self: *WebTransportListener, carry: *const ActiveSnapshot, bridges: []BridgeTransfer) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        lockSpin(&self.worker_mutex);
+        defer self.worker_mutex.unlock();
+        if (self.legacy_joining or self.thread != null or self.worker_id != null or self.runtime.view != null or
+            self.conns.items.len != 0 or self.by_cid.count() != 0) return error.NotQuiescent;
+        try carry.validate(self.tls);
+        var present = try self.captureIdle(.unstarted);
+        defer present.deinit();
+        present.execution = carry.base.execution;
+        // Winsock assigns a new process-local SOCKET value to the imported
+        // duplicate. initTransferred already checked its endpoint against the
+        // source observation and authenticated source handle.
+        present.socket.primary.device = carry.base.socket.primary.device;
+        if (!std.meta.eql(present, carry.base)) return error.ConfigMismatch;
+        if (!std.mem.eql(u8, &carry.irc_host_digest, &ircHostDigest(self.irc_host))) return error.ConfigMismatch;
+
+        var bridge_count: usize = 0;
+        for (carry.connections) |row| if (row.bridge != null) {
+            bridge_count += 1;
+        };
+        if (bridges.len != bridge_count) return error.ConfigMismatch;
+        var cursor: usize = 0;
+        for (carry.connections) |row| if (row.bridge) |bridge| {
+            const transfer = bridges[cursor];
+            if (transfer.slot != row.slot or transfer.source_socket != bridge.source_socket or
+                transfer.target_pid != std.os.windows.GetCurrentProcessId() or transfer.transfer.consumed)
+                return error.ConfigMismatch;
+            cursor += 1;
+        };
+
+        try self.conns.resize(self.allocator, carry.slot_count);
+        @memset(self.conns.items, null);
+        errdefer self.clearPreparedConnections();
+        for (carry.connections) |*row| {
+            const conn = try self.restoreActiveConnection(row);
+            self.conns.items[row.slot] = conn;
+            try self.indexCid(conn.initDcidSlice(), row.slot);
+            try self.indexCid(conn.scidSlice(), row.slot);
+        }
+        cursor = 0;
+        for (carry.connections) |row| if (row.bridge) |expected| {
+            const fd = try bridges[cursor].transfer.import();
+            cursor += 1;
+            // closeTcp balances one Winsock startup per bridge, including for
+            // an imported duplicate that did not originate in connectIrcTcp.
+            var startup: [408]u8 align(8) = @splat(0);
+            if (win.WSAStartup(0x0202, &startup) != 0) {
+                _ = win.closesocket(fd);
+                return error.WinsockUnavailable;
+            }
+            var owned = true;
+            errdefer if (owned) closeTcp(fd);
+            const observed = try observeBridge(fd);
+            if (!TransportAddress.eql(observed.local, expected.local) or
+                !TransportAddress.eql(observed.peer, expected.peer)) return error.BridgeIdentityMismatch;
+            if (!setNonBlocking(fd)) return error.BridgeModeFailed;
+            const conn = self.conns.items[row.slot].?;
+            conn.irc_fd = fd;
+            owned = false;
+        };
+    }
+
+    fn restoreActiveConnection(self: *WebTransportListener, row: *const ActiveConnectionSnapshot) !*Connection {
+        const conn = try self.allocator.create(Connection);
+        errdefer self.allocator.destroy(conn);
+        conn.* = .{
+            .scid = row.scid,
+            .scid_len = row.scid_len,
+            .init_dcid = row.init_dcid,
+            .init_dcid_len = row.init_dcid_len,
+            .orig_dcid = row.orig_dcid,
+            .orig_dcid_len = row.orig_dcid_len,
+            .retry_scid = row.retry_scid,
+            .retry_scid_len = row.retry_scid_len,
+            .peer = row.peer,
+            .conn = undefined,
+            .h3 = undefined,
+            .irc_fd = null,
+            .wt_stream_id = row.wt_stream_id,
+            .have_wt_stream = row.have_wt_stream,
+        };
+        const qconn = try self.allocator.create(quic_conn.Conn);
+        errdefer self.allocator.destroy(qconn);
+        qconn.* = try quic_conn.Conn.restoreEstablishedServerSnapshot(self.allocator, &row.quic, .{
+            .cert_chain = self.tls.cert_chain,
+            .signing_key = self.tls.signing_key,
+            .alpn_protocols = &[_][]const u8{"h3"},
+            .transport_params = serverTransportParams(conn.scidSlice(), conn.origDcidSlice(), conn.retryScidSlice()),
+            .local_cid = conn.scidSlice(),
+        });
+        errdefer qconn.deinit();
+        const h3 = try self.allocator.create(http3_conn.Http3Conn);
+        errdefer self.allocator.destroy(h3);
+        h3.* = try http3_conn.Http3Conn.restoreServerSnapshot(self.allocator, qconn, &row.h3);
+        conn.conn = qconn;
+        conn.h3 = h3;
+        return conn;
+    }
+
+    fn clearPreparedConnections(self: *WebTransportListener) void {
+        for (self.conns.items) |maybe| if (maybe) |conn| self.destroyConnection(conn);
+        self.conns.items.len = 0;
+        var keys = self.by_cid.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.by_cid.deinit(self.allocator);
+        self.by_cid = .empty;
     }
     fn validatePolicy(self: *const WebTransportListener) !void {
         if (self.irc_port == 0 or self.max_connections == 0 or self.retry_load_threshold == 0 or !std.math.isFinite(self.reset_rate_per_s) or self.reset_rate_per_s <= 0 or self.reset_burst == 0 or !std.math.isFinite(self.reset_tokens) or self.reset_tokens < 0 or self.reset_tokens > @as(f64, @floatFromInt(self.reset_burst))) return error.InvalidConfig;
@@ -2774,6 +2956,201 @@ pub const Snapshot = struct {
         }
     }
 };
+
+/// The table is physically capped even if an operator configures a larger
+/// live-connection limit. Every nested QUIC/H3 snapshot has its own byte and
+/// row bounds; this caps their aggregate multiplication during Helix staging.
+pub const snapshot_max_slots: usize = 256;
+
+fn canonicalCid(cid: []const u8) [quic_packet.max_connection_id_len]u8 {
+    var result: [quic_packet.max_connection_id_len]u8 = @splat(0);
+    @memcpy(result[0..cid.len], cid);
+    return result;
+}
+
+fn ircHostDigest(host: []const u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/companion/webtransport/irc-host/1");
+    hash.update(host);
+    return hash.finalResult();
+}
+
+fn validAddress(address: TransportAddress) bool {
+    return (address.ip_len == 4 or address.ip_len == 16) and address.port != 0 and
+        std.mem.allEqual(u8, address.ip[address.ip_len..], 0);
+}
+
+/// Source-side physical identity for an IRC bridge. An authenticated external
+/// Helix transfer row must name this exact source SOCKET; the candidate then
+/// verifies both endpoints on the imported connected TCP socket before use.
+pub const BridgeIdentity = struct {
+    source_socket: usize,
+    local: TransportAddress,
+    peer: TransportAddress,
+
+    fn validate(self: BridgeIdentity, irc_port: u16) !void {
+        if (self.source_socket == win.invalid_socket or !validAddress(self.local) or
+            !validAddress(self.peer) or self.local.ip_len != self.peer.ip_len or
+            self.peer.port != irc_port) return error.InvalidSnapshot;
+    }
+};
+
+fn windowsBridgeAddress(address: win.SockAddr6, len: i32) !TransportAddress {
+    switch (address.family) {
+        win.af_inet => {
+            if (len != @sizeOf(win.SockAddr4)) return error.InvalidBridgeSocket;
+            const v4: *const win.SockAddr4 = @ptrCast(&address);
+            return TransportAddress.fromBytes(&v4.addr, std.mem.bigToNative(u16, v4.port));
+        },
+        win.af_inet6 => {
+            if (len != @sizeOf(win.SockAddr6)) return error.InvalidBridgeSocket;
+            const mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            if (std.mem.eql(u8, address.addr[0..12], &mapped))
+                return TransportAddress.fromBytes(address.addr[12..16], std.mem.bigToNative(u16, address.port));
+            return TransportAddress.fromBytes(&address.addr, std.mem.bigToNative(u16, address.port));
+        },
+        else => return error.InvalidBridgeSocket,
+    }
+}
+
+fn observeBridge(fd: TcpSocket) !BridgeIdentity {
+    if (comptime builtin.os.tag != .windows) return error.ActiveBridgeContinuityUnsupported;
+    var local = std.mem.zeroes(win.SockAddr6);
+    var peer = std.mem.zeroes(win.SockAddr6);
+    var local_len: i32 = @sizeOf(win.SockAddr6);
+    var peer_len: i32 = @sizeOf(win.SockAddr6);
+    if (win.getsockname(fd, @ptrCast(&local), &local_len) != 0 or
+        win.getpeername(fd, &peer, &peer_len) != 0) return error.InvalidBridgeSocket;
+    return .{
+        .source_socket = fd,
+        .local = try windowsBridgeAddress(local, local_len),
+        .peer = try windowsBridgeAddress(peer, peer_len),
+    };
+}
+
+pub const ActiveConnectionSnapshot = struct {
+    slot: usize,
+    scid: [quic_packet.max_connection_id_len]u8,
+    scid_len: u8,
+    init_dcid: [quic_packet.max_connection_id_len]u8,
+    init_dcid_len: u8,
+    orig_dcid: [quic_packet.max_connection_id_len]u8,
+    orig_dcid_len: u8,
+    retry_scid: [quic_packet.max_connection_id_len]u8,
+    retry_scid_len: u8,
+    peer: TransportAddress,
+    bridge: ?BridgeIdentity,
+    wt_stream_id: ?u64,
+    have_wt_stream: bool,
+    quic: quic_conn.ConnSnapshot,
+    h3: http3_conn.Http3Snapshot,
+
+    fn deinit(self: *ActiveConnectionSnapshot, allocator: std.mem.Allocator) void {
+        self.h3.deinit(allocator);
+        self.quic.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn scidSlice(self: *const ActiveConnectionSnapshot) []const u8 {
+        return self.scid[0..self.scid_len];
+    }
+    fn initDcidSlice(self: *const ActiveConnectionSnapshot) []const u8 {
+        return self.init_dcid[0..self.init_dcid_len];
+    }
+    fn origDcidSlice(self: *const ActiveConnectionSnapshot) []const u8 {
+        return self.orig_dcid[0..self.orig_dcid_len];
+    }
+    fn retryScidSlice(self: *const ActiveConnectionSnapshot) ?[]const u8 {
+        return if (self.retry_scid_len == 0) null else self.retry_scid[0..self.retry_scid_len];
+    }
+
+    fn validate(self: *const ActiveConnectionSnapshot, base: *const Snapshot) !void {
+        if (self.slot >= snapshot_max_slots or self.scid_len != 8 or
+            self.init_dcid_len == 0 or self.init_dcid_len > quic_packet.max_connection_id_len or
+            self.orig_dcid_len == 0 or self.orig_dcid_len > quic_packet.max_connection_id_len or
+            (self.retry_scid_len != 0 and self.retry_scid_len != self.init_dcid_len) or
+            !std.mem.allEqual(u8, self.scid[self.scid_len..], 0) or
+            !std.mem.allEqual(u8, self.init_dcid[self.init_dcid_len..], 0) or
+            !std.mem.allEqual(u8, self.orig_dcid[self.orig_dcid_len..], 0) or
+            !std.mem.allEqual(u8, self.retry_scid[self.retry_scid_len..], 0) or
+            !validAddress(self.peer) or
+            (self.have_wt_stream != (self.wt_stream_id != null))) return error.InvalidSnapshot;
+        if (self.retry_scid_len == 0 and !std.mem.eql(u8, self.initDcidSlice(), self.origDcidSlice())) return error.InvalidSnapshot;
+        if (self.retryScidSlice()) |retry| if (!std.mem.eql(u8, retry, self.initDcidSlice())) return error.InvalidSnapshot;
+        if (std.mem.readInt(u64, self.scid[0..8], .big) >= base.scid_counter) return error.InvalidSnapshot;
+        try self.quic.validate();
+        try self.h3.validate();
+        if (!std.mem.eql(u8, self.quic.scid.slice(), self.scidSlice()) or
+            !quic_conn.PathAddress.eql(self.quic.path, pathFromAddr(self.peer))) return error.InvalidSnapshot;
+        if (self.bridge) |bridge| {
+            try bridge.validate(base.irc_port);
+            if (self.h3.session == null or self.h3.session.?.closed) return error.InvalidSnapshot;
+        }
+        if (self.wt_stream_id) |sid| {
+            const session = self.h3.session orelse return error.InvalidSnapshot;
+            if (session.closed or self.bridge == null) return error.InvalidSnapshot;
+            var found = false;
+            for (session.streams) |stream| {
+                if (stream.stream_id == sid and stream.is_bidirectional and sid != session.session_id) found = true;
+            }
+            if (!found) return error.InvalidSnapshot;
+        }
+    }
+};
+
+/// Owned settled active graph. The source TCP SOCKET numbers are manifests,
+/// never portable handles. No candidate may run this graph until all matching
+/// bridge duplicates and the daemon's accepted-side clients are prepared.
+pub const ActiveSnapshot = struct {
+    base: Snapshot,
+    irc_host_digest: [32]u8,
+    slot_count: usize,
+    connections: []ActiveConnectionSnapshot,
+
+    pub fn deinit(self: *ActiveSnapshot, allocator: std.mem.Allocator) void {
+        for (self.connections) |*row| row.deinit(allocator);
+        allocator.free(self.connections);
+        self.base.deinit();
+        self.* = undefined;
+    }
+
+    fn cidCount(self: *const ActiveSnapshot) usize {
+        var total: usize = 0;
+        for (self.connections) |*row| total += if (std.mem.eql(u8, row.scidSlice(), row.initDcidSlice())) @as(usize, 1) else 2;
+        return total;
+    }
+
+    pub fn validate(self: *const ActiveSnapshot, tls: TlsConfig) !void {
+        try self.base.validate(tls);
+        if (self.slot_count > snapshot_max_slots or self.connections.len > self.slot_count or
+            self.connections.len > self.base.max_connections) return error.SnapshotTooLarge;
+        for (self.connections, 0..) |*row, i| {
+            if (row.slot >= self.slot_count or (i > 0 and self.connections[i - 1].slot >= row.slot)) return error.InvalidSnapshot;
+            try row.validate(&self.base);
+            for (self.connections[0..i]) |*prior| {
+                if (std.mem.eql(u8, prior.scidSlice(), row.scidSlice()) or
+                    std.mem.eql(u8, prior.scidSlice(), row.initDcidSlice()) or
+                    std.mem.eql(u8, prior.initDcidSlice(), row.scidSlice()) or
+                    std.mem.eql(u8, prior.initDcidSlice(), row.initDcidSlice())) return error.InvalidSnapshot;
+                if (row.bridge) |bridge| if (prior.bridge) |other| {
+                    if (bridge.source_socket == other.source_socket or
+                        (TransportAddress.eql(bridge.local, other.local) and
+                            TransportAddress.eql(bridge.peer, other.peer))) return error.InvalidSnapshot;
+                };
+            }
+        }
+    }
+};
+
+/// The Helix control layer authenticates these rows alongside ActiveSnapshot.
+/// Each record is one-use and must come from WSADuplicateSocketW for the exact
+/// source SOCKET and target PID stated here. Candidate preparation consumes it.
+pub const BridgeTransfer = struct {
+    slot: usize,
+    source_socket: usize,
+    target_pid: u32,
+    transfer: windows_tcp.Transfer,
+};
 fn tlsDigest(tls: TlsConfig) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("onyx/companion/webtransport/tls-config/1");
@@ -2916,6 +3293,78 @@ test "Windows Helix WebTransport imports idle QUIC owner and parks inherited wor
     try testing.expectError(error.ConfigMismatch, WebTransportListener.initTransferred(testing.allocator, tls, &rejected, &invalid));
     try testing.expect(rejected.consumed);
     try testing.expectEqualDeep(carry.socket, try source.socket.?.capture());
+}
+
+test "Windows WebTransport active snapshot restores an established QUIC and H3 table without a bridge" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var keys: TestServerKeys = undefined;
+    try keys.init();
+    const tls: TlsConfig = .{ .cert_chain = &keys.cert_chain, .signing_key = .{ .ed25519 = keys.kp } };
+    var source = WebTransportListener.init(testing.allocator, tls, 6667);
+    defer source.deinit();
+    try source.prepareColdResources(testing.io, .{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    try source.startPreparedLegacyWorker();
+
+    var peer_socket = try DualStackUdpSocket.bind(.{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    defer peer_socket.deinit();
+    peer_socket.setRecvTimeoutMs(100);
+    const server_address = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, source.port);
+    const client_cid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    const initial_dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
+    var client = try quic_conn.Conn.initClient(testing.allocator, .{
+        .alpn_protocols = &[_][]const u8{"h3"},
+        .transport_params = .{
+            .initial_source_connection_id = &client_cid,
+            .initial_max_data = 1 << 20,
+            .initial_max_stream_data_bidi_local = 256 * 1024,
+            .initial_max_stream_data_bidi_remote = 256 * 1024,
+            .initial_max_streams_bidi = 100,
+        },
+        .local_cid = &client_cid,
+        .initial_dcid = &initial_dcid,
+        .x25519_seed = @as([32]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+    });
+    defer client.deinit();
+    var round: usize = 0;
+    while (round < 40 and !client.isEstablished()) : (round += 1) {
+        try sendQuic(testing.allocator, &client, &peer_socket, server_address);
+        try recvQuicAll(&client, &peer_socket);
+    }
+    try testing.expect(client.isEstablished());
+    try sendControlAndConnect(testing.allocator, &client, "irc.example", "/wt");
+    const connect_stream = lastOpenedBidi(&client);
+    round = 0;
+    while (round < 40 and !(connectAnswered200(testing.allocator, &client, connect_stream) catch false)) : (round += 1) {
+        try sendQuic(testing.allocator, &client, &peer_socket, server_address);
+        try recvQuicAll(&client, &peer_socket);
+    }
+    try testing.expect(round < 40);
+
+    const pause = try source.requestPause(100);
+    try source.awaitPaused(pause, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    defer source.resumePaused(pause) catch {};
+    var active = try source.capturePausedActive(pause, testing.allocator);
+    defer active.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), active.connections.len);
+    try testing.expect(active.connections[0].bridge == null);
+    try testing.expectEqual(@as(usize, 2), active.cidCount());
+    const old_slot = active.connections[0].slot;
+    active.connections[0].slot = active.slot_count;
+    try testing.expectError(error.InvalidSnapshot, active.validate(tls));
+    active.connections[0].slot = old_slot;
+    var transfer = try windows_udp.duplicateForProcess(source.socket.?.fd, std.os.windows.GetCurrentProcessId());
+    var candidate = try WebTransportListener.initTransferred(testing.allocator, tls, &transfer, &active.base);
+    defer candidate.deinit();
+    active.irc_host_digest[0] ^= 1;
+    try testing.expectError(error.ConfigMismatch, candidate.prepareActiveConnectionsWindows(&active, &.{}));
+    active.irc_host_digest[0] ^= 1;
+    try candidate.prepareActiveConnectionsWindows(&active, &.{});
+    var restored = try candidate.captureUnstartedActive(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqualDeep(active.connections[0].scid, restored.connections[0].scid);
+    try testing.expectEqualDeep(active.connections[0].h3, restored.connections[0].h3);
+    try testing.expectEqualDeep(active.connections[0].quic, restored.connections[0].quic);
 }
 
 test "companion runtime webtransport real pump preserves Retry replay reset state and active guard" {

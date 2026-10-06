@@ -807,6 +807,14 @@ pub fn main(init: std.process.Init) !void {
     // has joined and been destroyed on process exit.
     var windows_wt_tls_material: ?windows_tls_material.Owned = null;
     defer if (windows_wt_tls_material) |*material| material.deinit();
+    var windows_wt_active_body: ?onyx_server.daemon.helix.native_windows_active_webtransport_snapshot.Body = null;
+    defer if (windows_wt_active_body) |*body| body.deinit(allocator);
+    var windows_active_media_graph: ?onyx_server.daemon.helix.media_graph_checkpoint.Snapshot = null;
+    defer if (windows_active_media_graph) |*body| body.deinit();
+    var windows_active_media_native: ?onyx_server.daemon.native_media_transport.PhysicalSnapshot = null;
+    defer if (windows_active_media_native) |*body| body.deinit();
+    var windows_active_media_webrtc: ?onyx_server.daemon.media_plane.PhysicalSnapshot = null;
+    defer if (windows_active_media_webrtc) |*body| body.deinit();
     var windows_deadline: i64 = 0;
     var windows_rows: ?WindowsInheritedRows = null;
     defer if (windows_rows) |*rows| rows.deinit();
@@ -1414,10 +1422,10 @@ pub fn main(init: std.process.Init) !void {
                     // Geo, and serving TLS material have mandatory checkpoints.
                     // GeoIP/ASN databases are pinned from preflight and bound to
                     // the exact source/candidate effective config proof.
-                    // Configured media is carried only when the source proves
-                    // the original Domain and both UDP owners are pristine at
-                    // its World-locked transfer cut. A standalone native-media
-                    // port without that graph has no matching custody path.
+                    // Configured media carries the exact pristine or active
+                    // Domain and both UDP owners at its World-locked cut. A
+                    // standalone native-media port without that graph has no
+                    // matching custody path.
                     srv_cfg.windows_helix_external_companions_safe =
                         loaded.config.media_enabled or loaded.config.native_media_port == 0;
                     if (windows_transfer != null and !srv_cfg.windows_helix_external_companions_safe)
@@ -2496,32 +2504,91 @@ pub fn main(init: std.process.Init) !void {
                 if (!history.transfer.consumed) windows_driver.candidateAbortNow();
             }
             if ((transfer.history != null) != (srv.history_https != null)) windows_driver.candidateAbortNow();
-            if ((transfer.webrtc_media_udp != null) != srv_cfg.media_enabled or
-                (transfer.native_media_udp != null) != srv_cfg.media_enabled)
+            const active_media = transfer.media_graph_receiver != null;
+            if (active_media and (transfer.webrtc_media_udp != null or transfer.native_media_udp != null))
                 windows_driver.candidateAbortNow();
+            if (!active_media and ((transfer.webrtc_media_udp != null) != srv_cfg.media_enabled or
+                (transfer.native_media_udp != null) != srv_cfg.media_enabled))
+                windows_driver.candidateAbortNow();
+            if (active_media and !srv_cfg.media_enabled) windows_driver.candidateAbortNow();
             if (srv_cfg.media_enabled) {
-                const webrtc = if (transfer.webrtc_media_udp) |*owner| owner else windows_driver.candidateAbortNow();
-                const native = if (transfer.native_media_udp) |*owner| owner else windows_driver.candidateAbortNow();
-                srv.stageWindowsInheritedMedia(
-                    &webrtc.transfer,
-                    &webrtc.carry,
-                    &native.transfer,
-                    &native.carry,
-                    init.io,
-                ) catch |err| {
-                    std.debug.print("onyx-server: Windows Helix media UDP import failed ({s})\n", .{@errorName(err)});
-                    windows_driver.candidateAbortNow();
-                };
-                srv.prepareWindowsInheritedMediaRouting() catch |err| {
-                    std.debug.print("onyx-server: Windows Helix media routing preparation failed ({s})\n", .{@errorName(err)});
-                    windows_driver.candidateAbortNow();
-                };
+                if (active_media) {
+                    const max_wire_bytes = onyx_server.daemon.helix.native_windows_active_media_snapshot.max_wire_bytes;
+                    const native_limits: onyx_server.daemon.helix.native_windows_active_media_snapshot.Limits = .{
+                        .max_participants = @min(srv_cfg.media_max_participants, onyx_server.daemon.native_media_transport.max_call_participants),
+                        .max_state_bytes = max_wire_bytes,
+                    };
+                    const webrtc_limits: onyx_server.daemon.media_plane.PhysicalSnapshot.Limits = .{
+                        .max_rows = onyx_server.daemon.helix.media_graph_checkpoint.max_rows / 2,
+                        .max_offered = onyx_server.daemon.helix.media_graph_checkpoint.max_rows / 2,
+                        .max_bytes = max_wire_bytes,
+                        .transport = .{ .max_endpoints = onyx_server.daemon.helix.media_graph_checkpoint.max_rows / 2, .max_groups = onyx_server.daemon.helix.media_graph_checkpoint.max_rows / 2, .max_bytes = max_wire_bytes },
+                    };
+                    windows_active_media_graph = (transfer.takeMediaGraph(allocator) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix active media graph decode failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    }) orelse windows_driver.candidateAbortNow();
+                    windows_active_media_native = (transfer.takeMediaNative(allocator, native_limits) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix native media decode failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    }) orelse windows_driver.candidateAbortNow();
+                    windows_active_media_webrtc = (transfer.takeMediaWebrtc(allocator, webrtc_limits) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix WebRTC media decode failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    }) orelse windows_driver.candidateAbortNow();
+                    var native_udp = (transfer.takeActiveNativeUdp(allocator) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix active native UDP custody failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    }) orelse windows_driver.candidateAbortNow();
+                    defer native_udp.deinit();
+                    const webrtc_udp = (transfer.takeActiveWebrtcUdp(allocator, &windows_active_media_webrtc.?) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix active WebRTC UDP custody failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    }) orelse windows_driver.candidateAbortNow();
+                    srv.stageWindowsInheritedActiveMedia(
+                        native_udp.transfer,
+                        &native_udp.carry,
+                        webrtc_udp.transfer,
+                        &windows_active_media_webrtc.?,
+                        webrtc_limits,
+                        init.io,
+                    ) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix active media UDP import failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    };
+                    srv.setWindowsActiveMediaCandidate(.{
+                        .graph = &windows_active_media_graph.?,
+                        .native = &windows_active_media_native.?,
+                        .webrtc = &windows_active_media_webrtc.?,
+                        .native_limits = native_limits,
+                        .webrtc_limits = webrtc_limits,
+                    }) catch windows_driver.candidateAbortNow();
+                } else {
+                    const webrtc = if (transfer.webrtc_media_udp) |*owner| owner else windows_driver.candidateAbortNow();
+                    const native = if (transfer.native_media_udp) |*owner| owner else windows_driver.candidateAbortNow();
+                    srv.stageWindowsInheritedMedia(
+                        &webrtc.transfer,
+                        &webrtc.carry,
+                        &native.transfer,
+                        &native.carry,
+                        init.io,
+                    ) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix media UDP import failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    };
+                    srv.prepareWindowsInheritedMediaRouting() catch |err| {
+                        std.debug.print("onyx-server: Windows Helix media routing preparation failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    };
+                }
             }
-            if ((transfer.webtransport_udp != null) != (srv_cfg.webtransport_port != 0))
+            const active_wt = transfer.active_webtransport_receiver != null;
+            if ((transfer.webtransport_udp != null and active_wt) or
+                ((transfer.webtransport_udp != null or active_wt) != (srv_cfg.webtransport_port != 0)))
                 windows_driver.candidateAbortNow();
-            if (transfer.webtransport_udp) |*webtransport| {
-                // Import the exact idle QUIC owner before READY. Binding a new
-                // socket after COMMIT would strand the predecessor's UDP port.
+            if (transfer.webtransport_udp != null or active_wt) {
+                // Both idle and established QUIC owners borrow the exact
+                // serving certificate authenticated by the source arena.
                 windows_wt_tls_material = windows_tls_material.preflightOwnedFromArena(
                     allocator,
                     transfer.plaintext,
@@ -2537,8 +2604,15 @@ pub fn main(init: std.process.Init) !void {
                     .cert_chain = source_tls.cert_chain,
                     .signing_key = signing_key,
                 };
+                if (active_wt)
+                    windows_wt_active_body = (transfer.takeActiveWebtransport(allocator, wt_tls) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix active WebTransport custody failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    }) orelse windows_driver.candidateAbortNow();
                 const wt_expected = onyx_server.daemon.webtransport_listener.WebTransportListener.init(allocator, wt_tls, irc_port);
-                webtransport.carry.validateConfiguration(wt_tls, .{
+                const carry: *const onyx_server.daemon.webtransport_listener.Snapshot =
+                    if (windows_wt_active_body) |*body| &body.snapshot.base else if (transfer.webtransport_udp) |*owner| &owner.carry else windows_driver.candidateAbortNow();
+                carry.validateConfiguration(wt_tls, .{
                     .irc_port = wt_expected.irc_port,
                     .send_proxy_header = wt_expected.send_proxy_header,
                     .echo_wt_datagrams = wt_expected.echo_wt_datagrams,
@@ -2548,23 +2622,44 @@ pub fn main(init: std.process.Init) !void {
                     .reset_rate_per_s = wt_expected.reset_rate_per_s,
                     .reset_burst = wt_expected.reset_burst,
                 }) catch windows_driver.candidateAbortNow();
-                wt_listener = onyx_server.daemon.webtransport_listener.WebTransportListener.initTransferred(
-                    allocator,
-                    wt_tls,
-                    &webtransport.transfer,
-                    &webtransport.carry,
-                ) catch |err| {
-                    std.debug.print("onyx-server: Windows Helix WebTransport import failed ({s})\n", .{@errorName(err)});
-                    windows_driver.candidateAbortNow();
-                };
+                if (windows_wt_active_body) |*body| {
+                    wt_listener = onyx_server.daemon.webtransport_listener.WebTransportListener.initTransferred(
+                        allocator,
+                        wt_tls,
+                        &body.udp_transfer,
+                        carry,
+                    ) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix active WebTransport UDP import failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    };
+                } else {
+                    const webtransport = if (transfer.webtransport_udp) |*owner| owner else windows_driver.candidateAbortNow();
+                    wt_listener = onyx_server.daemon.webtransport_listener.WebTransportListener.initTransferred(
+                        allocator,
+                        wt_tls,
+                        &webtransport.transfer,
+                        carry,
+                    ) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix WebTransport import failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    };
+                }
                 if (wt_listener.?.port != srv_cfg.webtransport_port or wt_listener.?.irc_port != irc_port)
                     windows_driver.candidateAbortNow();
                 wt_listener.?.irc_host = srv_cfg.host;
+                if (windows_wt_active_body) |*body| {
+                    wt_listener.?.prepareActiveConnectionsWindows(&body.snapshot, body.bridges) catch |err| {
+                        std.debug.print("onyx-server: Windows Helix active WebTransport restore failed ({s})\n", .{@errorName(err)});
+                        windows_driver.candidateAbortNow();
+                    };
+                }
                 wt_listener.?.prepareInheritedResources(init.io) catch |err| {
                     std.debug.print("onyx-server: Windows Helix WebTransport preparation failed ({s})\n", .{@errorName(err)});
                     windows_driver.candidateAbortNow();
                 };
                 srv.setWindowsWebTransportOwner(&wt_listener.?) catch windows_driver.candidateAbortNow();
+                if (windows_wt_active_body) |*body|
+                    srv.setWindowsActiveWebTransportCandidate(&body.snapshot, body.accepted) catch windows_driver.candidateAbortNow();
             }
         }
     }

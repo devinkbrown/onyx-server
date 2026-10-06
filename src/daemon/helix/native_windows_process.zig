@@ -8,8 +8,8 @@ const builtin = @import("builtin");
 const platform = @import("../../substrate/platform.zig");
 const control = @import("native_windows_control.zig");
 
-pub const candidate_arg = "--helix-windows-successor-v15";
-pub const capability = "onyx-native-helix-windows-v15;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v2;udp-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;wasm-custody-v1;inert-ready;commit-ack;release-before-iocp";
+pub const candidate_arg = "--helix-windows-successor-v16";
+pub const capability = "onyx-native-helix-windows-v16;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;wasm-custody-v1;inert-ready;commit-ack;release-before-iocp";
 const process_query_limited_information: u32 = 0x1000;
 const synchronize: u32 = 0x0010_0000;
 const extended_startupinfo_present: u32 = 0x0008_0000;
@@ -335,7 +335,7 @@ test "Windows Helix candidate command line keeps paths and handles distinct" {
     defer allocator.free(command);
     const utf8 = try std.unicode.wtf16LeToWtf8Alloc(allocator, command);
     defer allocator.free(utf8);
-    try std.testing.expectEqualStrings("\"C:\\Program Files\\Onyx\\onyx-server.exe\" \"--helix-windows-successor-v15\" \"12\" \"24\" \"36\" \"48\" \"C:\\Onyx Data\\config\\live.toml\"", utf8);
+    try std.testing.expectEqualStrings("\"C:\\Program Files\\Onyx\\onyx-server.exe\" \"--helix-windows-successor-v16\" \"12\" \"24\" \"36\" \"48\" \"C:\\Onyx Data\\config\\live.toml\"", utf8);
     try std.testing.expectError(error.InvalidCandidate, commandLine(allocator, "C:\\Onyx\\server.exe", 1, 2, 3, 4, "bad\x00path"));
 }
 
@@ -349,7 +349,7 @@ test "Windows Helix rejects previous custody capability during candidate negotia
     defer parent.endpoint.deinit();
     var child = pair.takeChild(identity, key);
     defer child.deinit();
-    const previous_capability = "onyx-native-helix-windows-v14;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v2;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;wasm-custody-v1;inert-ready;commit-ack;release-before-iocp";
+    const previous_capability = "onyx-native-helix-windows-v15;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v2;udp-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;wasm-custody-v1;inert-ready;commit-ack;release-before-iocp";
     const Runner = struct {
         endpoint: *control.Endpoint,
         failure: ?anyerror = null,

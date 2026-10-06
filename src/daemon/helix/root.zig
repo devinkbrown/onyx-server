@@ -65,6 +65,11 @@ pub const native_windows_driver = @import("native_windows_driver.zig");
 pub const native_windows_config_proof = @import("native_windows_config_proof.zig");
 pub const native_windows_runtime = @import("native_windows_runtime.zig");
 pub const native_service_snapshot = @import("native_service_snapshot.zig");
+pub const media_graph_checkpoint = @import("media_graph_checkpoint.zig");
+pub const native_windows_active_media_snapshot = @import("native_windows_active_media_snapshot.zig");
+pub const native_windows_media_custody = @import("native_windows_media_custody.zig");
+pub const native_windows_active_webtransport_snapshot = @import("native_windows_active_webtransport_snapshot.zig");
+pub const native_windows_active_webtransport_custody = @import("native_windows_active_webtransport_custody.zig");
 
 // State-migration capsules (one schema per resumable subsystem).
 pub const conn_capsule = @import("conn_capsule.zig");

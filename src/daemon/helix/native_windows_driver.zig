@@ -15,6 +15,9 @@ const metrics_mod = @import("native_windows_metrics.zig");
 const webhook_mod = @import("native_windows_webhook.zig");
 const history_mod = @import("native_windows_history.zig");
 const udp_mod = @import("native_windows_udp_custody.zig");
+const media_mod = @import("native_windows_media_custody.zig");
+const active_udp_mod = @import("native_windows_active_media_udp_custody.zig");
+const active_wt_mod = @import("native_windows_active_webtransport_custody.zig");
 const store = @import("../store.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -24,7 +27,7 @@ const ready_body_len = 64;
 const wait_object_0: u32 = 0;
 const wait_timeout: u32 = 258;
 const wait_failed: u32 = 0xffff_ffff;
-const digest_domain = "onyx-helix-windows-ready-v6";
+const digest_domain = "onyx-helix-windows-ready-v9";
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) usize;
@@ -126,6 +129,18 @@ pub fn sourceDigestWithWalConfigMetricsWebhookAndHistory(plaintext: []const u8, 
 }
 
 pub fn sourceDigestWithWalConfigMetricsWebhookHistoryAndUdp(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame, wt_body: udp_mod.Frame, webrtc_body: udp_mod.Frame, native_body: udp_mod.Frame) Error!Digest {
+    return sourceDigestWithWalConfigMetricsWebhookHistoryUdpAndMedia(plaintext, rows, wal, target_pid, source_digest, metrics_body, webhook_body, history_body, wt_body, webrtc_body, native_body, media_mod.absentFrame(.graph), media_mod.absentFrame(.native_physical), media_mod.absentFrame(.webrtc_physical));
+}
+
+pub fn sourceDigestWithWalConfigMetricsWebhookHistoryUdpAndMedia(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame, wt_body: udp_mod.Frame, webrtc_body: udp_mod.Frame, native_body: udp_mod.Frame, media_body: media_mod.Frame, native_physical_body: media_mod.Frame, webrtc_physical_body: media_mod.Frame) Error!Digest {
+    return sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveWebtransport(plaintext, rows, wal, target_pid, source_digest, metrics_body, webhook_body, history_body, wt_body, webrtc_body, native_body, media_body, native_physical_body, webrtc_physical_body, active_wt_mod.absentFrame());
+}
+
+pub fn sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveWebtransport(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame, wt_body: udp_mod.Frame, webrtc_body: udp_mod.Frame, native_body: udp_mod.Frame, media_body: media_mod.Frame, native_physical_body: media_mod.Frame, webrtc_physical_body: media_mod.Frame, active_webtransport_body: active_wt_mod.Frame) Error!Digest {
+    return sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveTransfers(plaintext, rows, wal, target_pid, source_digest, metrics_body, webhook_body, history_body, wt_body, webrtc_body, native_body, media_body, native_physical_body, webrtc_physical_body, active_udp_mod.absentFrame(.native), active_udp_mod.absentFrame(.webrtc), active_webtransport_body);
+}
+
+pub fn sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveTransfers(plaintext: []const u8, rows: []const bootstrap.SourceRow, wal: ?*const store.WindowsWalDescriptor, target_pid: u32, source_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame, wt_body: udp_mod.Frame, webrtc_body: udp_mod.Frame, native_body: udp_mod.Frame, media_body: media_mod.Frame, native_physical_body: media_mod.Frame, webrtc_physical_body: media_mod.Frame, active_native_udp_body: active_udp_mod.Frame, active_webrtc_udp_body: active_udp_mod.Frame, active_webtransport_body: active_wt_mod.Frame) Error!Digest {
     if (rows.len > bootstrap.max_sockets) return error.InvalidReady;
     _ = try metrics_mod.parseFrame(&metrics_body, target_pid, &.{});
     _ = try webhook_mod.parseFrame(&webhook_body, target_pid);
@@ -133,6 +148,43 @@ pub fn sourceDigestWithWalConfigMetricsWebhookHistoryAndUdp(plaintext: []const u
     _ = try udp_mod.validateFrame(&wt_body, .webtransport, target_pid);
     _ = try udp_mod.validateFrame(&webrtc_body, .media, target_pid);
     _ = try udp_mod.validateFrame(&native_body, .native_media, target_pid);
+    const graph_present = try media_mod.validateFrame(&media_body, .graph, target_pid);
+    const native_present = try media_mod.validateFrame(&native_physical_body, .native_physical, target_pid);
+    const webrtc_present = try media_mod.validateFrame(&webrtc_physical_body, .webrtc_physical, target_pid);
+    if (graph_present != native_present or graph_present != webrtc_present) return error.InvalidReady;
+    const active_native_present = try active_udp_mod.validateFrame(&active_native_udp_body, .native, target_pid);
+    const active_webrtc_present = try active_udp_mod.validateFrame(&active_webrtc_udp_body, .webrtc, target_pid);
+    if (active_native_present != graph_present or active_webrtc_present != graph_present) return error.InvalidReady;
+    if (graph_present and (try udp_mod.validateFrame(&webrtc_body, .media, target_pid) or
+        try udp_mod.validateFrame(&native_body, .native_media, target_pid))) return error.InvalidReady;
+    const active_present = try active_wt_mod.validateFrame(&active_webtransport_body, target_pid);
+    if (active_present and try udp_mod.validateFrame(&wt_body, .webtransport, target_pid)) return error.InvalidReady;
+    if (graph_present) {
+        const handles = [_]u64{
+            std.mem.readInt(u64, media_body[16..24], .big),
+            std.mem.readInt(u64, native_physical_body[16..24], .big),
+            std.mem.readInt(u64, webrtc_physical_body[16..24], .big),
+        };
+        if (handles[0] == handles[1] or handles[0] == handles[2] or handles[1] == handles[2])
+            return error.InvalidReady;
+        if (active_present) {
+            const active_handle = std.mem.readInt(u64, active_webtransport_body[16..24], .big);
+            for (handles) |handle| if (handle == active_handle) return error.InvalidReady;
+        }
+        const native_udp_handle = std.mem.readInt(u64, active_native_udp_body[16..24], .big);
+        const webrtc_udp_handle = std.mem.readInt(u64, active_webrtc_udp_body[16..24], .big);
+        if (native_udp_handle == webrtc_udp_handle) return error.InvalidReady;
+        const socket_offset = active_udp_mod.frame_len - @import("native_windows_udp_socket.zig").frame_len + 12;
+        if (std.mem.readInt(u64, active_native_udp_body[socket_offset..][0..8], .big) ==
+            std.mem.readInt(u64, active_webrtc_udp_body[socket_offset..][0..8], .big)) return error.InvalidReady;
+        for (handles) |handle| {
+            if (handle == native_udp_handle or handle == webrtc_udp_handle) return error.InvalidReady;
+        }
+        if (active_present) {
+            const active_handle = std.mem.readInt(u64, active_webtransport_body[16..24], .big);
+            if (active_handle == native_udp_handle or active_handle == webrtc_udp_handle) return error.InvalidReady;
+        }
+    }
     var hash = Sha256.init(.{});
     hashPrefix(&hash, plaintext, rows.len);
     for (rows) |row| hashRow(&hash, row.canonical, row.shard, row.role, row.family);
@@ -145,6 +197,12 @@ pub fn sourceDigestWithWalConfigMetricsWebhookHistoryAndUdp(plaintext: []const u
     hash.update(&wt_body);
     hash.update(&webrtc_body);
     hash.update(&native_body);
+    hash.update(&media_body);
+    hash.update(&native_physical_body);
+    hash.update(&webrtc_physical_body);
+    hash.update(&active_native_udp_body);
+    hash.update(&active_webrtc_udp_body);
+    hash.update(&active_webtransport_body);
     var digest: Digest = undefined;
     hash.final(&digest);
     return digest;
@@ -164,6 +222,12 @@ fn incomingDigest(incoming: *const bootstrap.Incoming) Digest {
     hash.update(&incoming.webtransport_udp_body);
     hash.update(&incoming.webrtc_media_udp_body);
     hash.update(&incoming.native_media_udp_body);
+    hash.update(&incoming.media_graph_body);
+    hash.update(&incoming.native_physical_body);
+    hash.update(&incoming.webrtc_physical_body);
+    hash.update(&incoming.active_native_udp_body);
+    hash.update(&incoming.active_webrtc_udp_body);
+    hash.update(&incoming.active_webtransport_body);
     var digest: Digest = undefined;
     hash.final(&digest);
     return digest;
@@ -275,6 +339,8 @@ fn answerChallenge(endpoint: *control.Endpoint, incoming: *bootstrap.Incoming, v
     if (incoming.webtransport_udp) |received| if (!received.transfer.consumed) return error.InvalidReady;
     if (incoming.webrtc_media_udp) |received| if (!received.transfer.consumed) return error.InvalidReady;
     if (incoming.native_media_udp) |received| if (!received.transfer.consumed) return error.InvalidReady;
+    if (!incoming.mediaCustodyReady()) return error.InvalidReady;
+    if (!incoming.activeWebtransportCustodyReady()) return error.InvalidReady;
     const response = body(.response, ticket);
     try endpoint.send(.ready, &response, deadline);
     answered = true;
@@ -447,6 +513,83 @@ test "Windows Helix READY digest binds zero-state and listener-only manifests" {
     try std.testing.expect(!std.mem.eql(u8, &none, &changed));
 }
 
+test "Windows READY digest binds ordered media custody bytes" {
+    const pid: u32 = 74;
+    const absent = try sourceDigestWithWalConfigMetricsWebhookHistoryUdpAndMedia("capsules", &.{}, null, pid, @splat(7), metrics_mod.absentFrame(), webhook_mod.absentFrame(), history_mod.absentFrame(), udp_mod.absentFrame(.webtransport), udp_mod.absentFrame(.media), udp_mod.absentFrame(.native_media), media_mod.absentFrame(.graph), media_mod.absentFrame(.native_physical), media_mod.absentFrame(.webrtc_physical));
+    const Fake = struct {
+        fn frame(kind: media_mod.Kind, target_pid: u32, handle: u64) media_mod.Frame {
+            var result = media_mod.absentFrame(kind);
+            result[7] = 1;
+            std.mem.writeInt(u32, result[8..12], target_pid, .big);
+            std.mem.writeInt(u64, result[16..24], handle, .big);
+            std.mem.writeInt(u64, result[24..32], @import("native_arena_envelope.zig").header_len + @import("native_arena_envelope.zig").tag_len + 1, .big);
+            @memset(result[32..64], 0x43);
+            @memset(result[64..96], 0x65);
+            return result;
+        }
+        fn active(kind: active_udp_mod.Kind, target_pid: u32, handle: u64, source_socket: usize) !active_udp_mod.Frame {
+            const udp_socket = @import("native_windows_udp_socket.zig");
+            var result = active_udp_mod.absentFrame(kind);
+            result[7] = 1;
+            std.mem.writeInt(u32, result[8..12], target_pid, .big);
+            std.mem.writeInt(u64, result[16..24], handle, .big);
+            std.mem.writeInt(u64, result[24..32], @import("native_arena_envelope.zig").header_len + @import("native_arena_envelope.zig").tag_len + 128, .big);
+            var transfer = udp_socket.Transfer{ .info = std.mem.zeroes(udp_socket.ProtocolInfo), .source_socket = source_socket, .target_pid = target_pid };
+            transfer.info.address_family = 2;
+            transfer.info.socket_type = 2;
+            transfer.info.protocol = 17;
+            const socket_frame = try udp_socket.encodeFrame(&transfer, if (kind == .native) .native_media else .media);
+            @memcpy(result[96..], &socket_frame);
+            return result;
+        }
+    };
+    const graph = Fake.frame(.graph, pid, 101);
+    const native = Fake.frame(.native_physical, pid, 102);
+    var webrtc = Fake.frame(.webrtc_physical, pid, 103);
+    var active_native = try Fake.active(.native, pid, 104, 11);
+    const active_webrtc = try Fake.active(.webrtc, pid, 105, 12);
+    try std.testing.expectError(error.InvalidReady, sourceDigestWithWalConfigMetricsWebhookHistoryUdpAndMedia("capsules", &.{}, null, pid, @splat(7), metrics_mod.absentFrame(), webhook_mod.absentFrame(), history_mod.absentFrame(), udp_mod.absentFrame(.webtransport), udp_mod.absentFrame(.media), udp_mod.absentFrame(.native_media), graph, native, webrtc));
+    const present = try sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveTransfers("capsules", &.{}, null, pid, @splat(7), metrics_mod.absentFrame(), webhook_mod.absentFrame(), history_mod.absentFrame(), udp_mod.absentFrame(.webtransport), udp_mod.absentFrame(.media), udp_mod.absentFrame(.native_media), graph, native, webrtc, active_native, active_webrtc, active_wt_mod.absentFrame());
+    try std.testing.expect(!std.mem.eql(u8, &absent, &present));
+    webrtc[64] ^= 1;
+    const changed = try sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveTransfers("capsules", &.{}, null, pid, @splat(7), metrics_mod.absentFrame(), webhook_mod.absentFrame(), history_mod.absentFrame(), udp_mod.absentFrame(.webtransport), udp_mod.absentFrame(.media), udp_mod.absentFrame(.native_media), graph, native, webrtc, active_native, active_webrtc, active_wt_mod.absentFrame());
+    try std.testing.expect(!std.mem.eql(u8, &present, &changed));
+    webrtc[64] ^= 1;
+    active_native[64] ^= 1;
+    const udp_changed = try sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveTransfers("capsules", &.{}, null, pid, @splat(7), metrics_mod.absentFrame(), webhook_mod.absentFrame(), history_mod.absentFrame(), udp_mod.absentFrame(.webtransport), udp_mod.absentFrame(.media), udp_mod.absentFrame(.native_media), graph, native, webrtc, active_native, active_webrtc, active_wt_mod.absentFrame());
+    try std.testing.expect(!std.mem.eql(u8, &present, &udp_changed));
+    try std.testing.expectError(error.InvalidReady, sourceDigestWithWalConfigMetricsWebhookHistoryUdpAndMedia("capsules", &.{}, null, pid, @splat(7), metrics_mod.absentFrame(), webhook_mod.absentFrame(), history_mod.absentFrame(), udp_mod.absentFrame(.webtransport), udp_mod.absentFrame(.media), udp_mod.absentFrame(.native_media), graph, native, media_mod.absentFrame(.webrtc_physical)));
+}
+
+test "Windows READY digest binds active WebTransport custody and rejects malformed frame" {
+    const pid: u32 = 75;
+    const metrics = metrics_mod.absentFrame();
+    const webhook = webhook_mod.absentFrame();
+    const history = history_mod.absentFrame();
+    const wt = udp_mod.absentFrame(.webtransport);
+    const wrtc = udp_mod.absentFrame(.media);
+    const native = udp_mod.absentFrame(.native_media);
+    const graph = media_mod.absentFrame(.graph);
+    const hxna = media_mod.absentFrame(.native_physical);
+    const hxwa = media_mod.absentFrame(.webrtc_physical);
+    const absent = try sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveWebtransport("capsules", &.{}, null, pid, @splat(4), metrics, webhook, history, wt, wrtc, native, graph, hxna, hxwa, active_wt_mod.absentFrame());
+    var active = active_wt_mod.absentFrame();
+    active[7] = 1;
+    std.mem.writeInt(u32, active[8..12], pid, .big);
+    std.mem.writeInt(u64, active[16..24], 123, .big);
+    std.mem.writeInt(u64, active[24..32], @import("native_arena_envelope.zig").header_len + @import("native_arena_envelope.zig").tag_len + 1, .big);
+    @memset(active[32..64], 0x15);
+    @memset(active[64..96], 0x26);
+    const present = try sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveWebtransport("capsules", &.{}, null, pid, @splat(4), metrics, webhook, history, wt, wrtc, native, graph, hxna, hxwa, active);
+    try std.testing.expect(!std.mem.eql(u8, &absent, &present));
+    active[64] ^= 1;
+    const changed = try sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveWebtransport("capsules", &.{}, null, pid, @splat(4), metrics, webhook, history, wt, wrtc, native, graph, hxna, hxwa, active);
+    try std.testing.expect(!std.mem.eql(u8, &present, &changed));
+    try std.testing.expectError(error.InvalidFrame, sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveWebtransport("capsules", &.{}, null, pid + 1, @splat(4), metrics, webhook, history, wt, wrtc, native, graph, hxna, hxwa, active));
+    active[6] = 2;
+    try std.testing.expectError(error.InvalidFrame, sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveWebtransport("capsules", &.{}, null, pid, @splat(4), metrics, webhook, history, wt, wrtc, native, graph, hxna, hxwa, active));
+}
+
 test "Windows Helix READY digest binds exact WAL custody and candidate PID" {
     const no_wal = try sourceDigestWithWal("capsules", &.{}, null, 17);
     const descriptor = store.WindowsWalDescriptor{
@@ -512,6 +655,65 @@ test "Windows Helix READY mismatch sends authenticated ABORT before staging" {
     try std.testing.expectError(error.Aborted, result);
     try std.testing.expectEqual(error.InvalidReady, runner.failure orelse return error.MissingRefusal);
     try std.testing.expect(!incoming.stage_attempted);
+}
+
+test "Windows READY refuses unconsumed media and active WebTransport custody" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try control.Pair.init();
+    defer pair.deinit();
+    const identity: control.Identity = .{ .generation = 36, .upgrade_id = @splat(0x43) };
+    var parent = pair.takeParent(identity, @splat(0x51));
+    defer parent.deinit();
+    var child = pair.takeChild(identity, @splat(0x51));
+    defer child.deinit();
+    const plaintext = try allocator.dupe(u8, "media cut");
+    const rows = try allocator.alloc(bootstrap.ReceivedRow, 0);
+    var incoming = bootstrap.Incoming{ .allocator = allocator, .identity = identity, .plaintext = plaintext, .rows = rows };
+    defer incoming.deinit();
+    const pid = GetCurrentProcessId();
+    const Media = struct {
+        fn frame(kind: media_mod.Kind, target_pid: u32, handle: u64) media_mod.Frame {
+            var result = media_mod.absentFrame(kind);
+            result[7] = 1;
+            std.mem.writeInt(u32, result[8..12], target_pid, .big);
+            std.mem.writeInt(u64, result[16..24], handle, .big);
+            std.mem.writeInt(u64, result[24..32], @import("native_arena_envelope.zig").header_len + @import("native_arena_envelope.zig").tag_len + 1, .big);
+            return result;
+        }
+    };
+    incoming.media_graph_body = Media.frame(.graph, pid, 101);
+    incoming.native_physical_body = Media.frame(.native_physical, pid, 102);
+    incoming.webrtc_physical_body = Media.frame(.webrtc_physical, pid, 103);
+    var active = active_wt_mod.absentFrame();
+    active[7] = 1;
+    std.mem.writeInt(u32, active[8..12], pid, .big);
+    std.mem.writeInt(u64, active[16..24], 104, .big);
+    std.mem.writeInt(u64, active[24..32], @import("native_arena_envelope.zig").header_len + @import("native_arena_envelope.zig").tag_len + 1, .big);
+    incoming.active_webtransport_body = active;
+    try std.testing.expect(!incoming.mediaCustodyReady());
+    try std.testing.expect(!incoming.activeWebtransportCustodyReady());
+    const ValidatorImpl = struct {
+        fn run(_: ?*anyopaque, _: *bootstrap.Incoming) anyerror!void {}
+    };
+    const Runner = struct {
+        endpoint: *control.Endpoint,
+        incoming: *bootstrap.Incoming,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            _ = answerChallenge(self.endpoint, self.incoming, .{ .context = null, .run = ValidatorImpl.run }, platform.monotonicMillis() + 3000) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.failure = error.UnexpectedReady;
+        }
+    };
+    var runner = Runner{ .endpoint = &child, .incoming = &incoming };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+    const result = challenge(&parent, identity, incomingDigest(&incoming), 0, platform.monotonicMillis() + 3000);
+    thread.join();
+    try std.testing.expectError(error.Aborted, result);
+    try std.testing.expectEqual(error.InvalidReady, runner.failure orelse return error.MissingRefusal);
 }
 
 fn spawnExitedTestProcess(allocator: std.mem.Allocator) !TestProcessInformation {

@@ -174,6 +174,8 @@ pub const MediaPlane = struct {
     routing_ingress_completed: u64 = 0,
     routing_last_ingress_error: ?anyerror = null,
     routing_crypto: [sfu_srtp.max_peers]RoutingCryptoAssociation = @splat(.{}),
+    physical_restored: bool = false,
+    physical_socket_snapshot: ?media_socket.Snapshot = null,
     physical_pending: usize = 0,
     physical_rows: PhysicalRtcMap = .empty,
     physical_ufrags: PhysicalUfragMap = .empty,
@@ -705,6 +707,15 @@ pub const MediaPlane = struct {
         self.allocator.destroy(queue);
     }
 
+    /// Candidate workers may be attached only while their Gate row is parked
+    /// and no worker has entered the owner pump.
+    fn requireRoutingWorkerQuiescent(self: *MediaPlane) routing.Error!void {
+        if (self.runtime.view != null) {
+            if (self.runtime.slot == null or self.runtime.entered.load(.acquire) or self.runtime.exited.load(.acquire)) return error.Busy;
+            self.runtime.requireParked() catch return error.Busy;
+        } else if (self.runtime.slot != null) return error.Busy;
+    }
+
     pub fn requireRoutingAttachable(self: *MediaPlane) routing.Error!void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
@@ -712,7 +723,8 @@ pub const MediaPlane = struct {
         defer self.fp_mutex.unlock();
         lockSpin(&self.rtcp_out_mutex);
         defer self.rtcp_out_mutex.unlock();
-        if (self.retired_routing_egress != null or self.routing_egress != null or self.legacy_joining or self.physical_pending != 0 or self.physical_rows.count() != 0 or self.physical_ufrags.count() != 0 or self.physical_groups.count() != 0 or self.routing_domain != null or self.routing_binding != null or self.thread != null or self.runtime.view != null or self.transport.endpoints.count() != 0 or self.transport.by_ufrag.count() != 0 or self.transport.by_addr.count() != 0 or self.transport.by_ssrc.count() != 0 or self.transport.group_keys.count() != 0 or self.offered_fps.count() != 0 or self.rtcp_out_len != 0) return error.Busy;
+        if (self.retired_routing_egress != null or self.routing_egress != null or self.legacy_joining or self.physical_pending != 0 or self.physical_rows.count() != 0 or self.physical_ufrags.count() != 0 or self.physical_groups.count() != 0 or self.routing_domain != null or self.routing_binding != null or self.thread != null or self.transport.endpoints.count() != 0 or self.transport.by_ufrag.count() != 0 or self.transport.by_addr.count() != 0 or self.transport.by_ssrc.count() != 0 or self.transport.group_keys.count() != 0 or self.offered_fps.count() != 0 or self.rtcp_out_len != 0) return error.Busy;
+        try self.requireRoutingWorkerQuiescent();
     }
     pub fn attachRoutingLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, binding: *routing.WebrtcBinding) routing.Error!void {
         try domain.requireWebrtcBindingLocked(scope, binding, self);
@@ -722,7 +734,7 @@ pub const MediaPlane = struct {
         defer self.fp_mutex.unlock();
         lockSpin(&self.rtcp_out_mutex);
         defer self.rtcp_out_mutex.unlock();
-        if (self.retired_routing_egress != null or self.routing_egress != null or self.legacy_joining or self.physical_pending != 0 or self.physical_rows.count() != 0 or self.physical_ufrags.count() != 0 or self.physical_groups.count() != 0 or self.routing_domain != null or self.routing_binding != null or self.thread != null or self.runtime.view != null or self.transport.endpoints.count() != 0 or self.transport.by_ufrag.count() != 0 or self.transport.by_addr.count() != 0 or self.transport.by_ssrc.count() != 0 or self.transport.group_keys.count() != 0 or self.offered_fps.count() != 0 or self.rtcp_out_len != 0) return error.Busy;
+        try self.requireRoutingWorkerQuiescent();
         self.routing_domain = domain;
         self.routing_binding = binding;
     }
@@ -792,7 +804,8 @@ pub const MediaPlane = struct {
         defer self.fp_mutex.unlock();
         lockSpin(&self.rtcp_out_mutex);
         defer self.rtcp_out_mutex.unlock();
-        if (self.routing_inbound != null or self.routing_egress != null or self.retired_routing_egress != null or self.physical_pending != 0 or self.physical_rows.count() != 0 or self.physical_ufrags.count() != 0 or self.physical_groups.count() != 0 or self.thread != null or self.runtime.view != null or self.transport.endpoints.count() != 0 or self.transport.by_ufrag.count() != 0 or self.transport.by_addr.count() != 0 or self.transport.by_ssrc.count() != 0 or self.transport.group_keys.count() != 0 or self.offered_fps.count() != 0 or self.rtcp_out_len != 0) return error.Busy;
+        if (self.routing_inbound != null or self.routing_egress != null or self.retired_routing_egress != null or self.physical_pending != 0 or self.physical_rows.count() != 0 or self.physical_ufrags.count() != 0 or self.physical_groups.count() != 0 or self.thread != null or self.transport.endpoints.count() != 0 or self.transport.by_ufrag.count() != 0 or self.transport.by_addr.count() != 0 or self.transport.by_ssrc.count() != 0 or self.transport.group_keys.count() != 0 or self.offered_fps.count() != 0 or self.rtcp_out_len != 0) return error.Busy;
+        try self.requireRoutingWorkerQuiescent();
         for (self.srtp_hub.peers) |peer| if (peer.active) return error.Busy;
         for (self.srtp_hub.owners) |owner| if (owner.active) return error.Busy;
     }
@@ -810,6 +823,20 @@ pub const MediaPlane = struct {
         self.runtime.requireDetached() catch @panic("managed worker must join and detach before deinit");
         self.shutdown();
         std.crypto.secureZero(u8, std.mem.asBytes(&self.csprng));
+        self.disposePhysicalState();
+        self.* = undefined;
+    }
+
+    fn disposePhysicalState(self: *MediaPlane) void {
+        if (self.routing_egress) |queue| {
+            std.debug.assert(queue.pump_id == null and queue.inflight == null and queue.len == 0);
+            std.crypto.secureZero(u8, queue.payloads);
+            self.allocator.free(queue.rows);
+            self.allocator.free(queue.payloads);
+            self.allocator.destroy(queue);
+            self.routing_egress = null;
+        }
+        self.stopDtls();
         std.debug.assert(self.physical_pending == 0);
         var physical = self.physical_rows.valueIterator();
         while (physical.next()) |row| {
@@ -818,15 +845,30 @@ pub const MediaPlane = struct {
             row.wipe();
         }
         self.physical_rows.deinit(self.allocator);
+        self.physical_rows = .empty;
         self.physical_ufrags.deinit(self.allocator);
+        self.physical_ufrags = .empty;
         var groups = self.physical_groups.valueIterator();
         while (groups.next()) |group| std.crypto.secureZero(u8, &group.key);
         self.physical_groups.deinit(self.allocator);
+        self.physical_groups = .empty;
         self.transport.deinit();
+        self.transport = MediaTransport.init(self.allocator);
         var it = self.offered_fps.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.offered_fps.deinit(self.allocator);
-        self.* = undefined;
+        self.offered_fps = .empty;
+        self.physical_ssrcs = @splat(.{});
+        self.routing_crypto = @splat(.{});
+        self.rtcp_out_head = 0;
+        self.rtcp_out_len = 0;
+        self.physical_revision = 1;
+        self.next_routing_inbound = 1;
+        self.routing_ingress_refused = 0;
+        self.routing_ingress_completed = 0;
+        self.routing_last_ingress_error = null;
+        self.physical_socket_snapshot = null;
+        self.physical_restored = false;
     }
 
     /// Whether no live WebRTC transport state would be lost by an in-place
@@ -1364,6 +1406,123 @@ pub const MediaPlane = struct {
     pub fn initTransferred(allocator: std.mem.Allocator, transfer: *windows_udp.Transfer, carry: *const Snapshot, cross: ?media_bridge.RtpCrossSink) !MediaPlane {
         const socket = try MediaSocket.initTransferred(transfer, &carry.socket);
         return initRestored(allocator, socket, carry, cross);
+    }
+
+    /// Import the exact active WebRTC UDP socket against the authenticated
+    /// physical body. DTLS/SRTP and route maps remain detached preparations
+    /// until the aggregate has built its closed Domain and joined every row.
+    pub fn initTransferredPhysical(allocator: std.mem.Allocator, transfer: *windows_udp.Transfer, carry: *const PhysicalSnapshot, expected: Policy, limits: PhysicalSnapshot.Limits, cross: ?media_bridge.RtpCrossSink) !MediaPlane {
+        try carry.validateConfiguration(expected, limits);
+        if (carry.cross_configured != (cross != null)) return error.ConfigMismatch;
+        const socket = try MediaSocket.initTransferred(transfer, &carry.socket);
+        var owner: MediaPlane = .{
+            .allocator = allocator,
+            .transport = MediaTransport.init(allocator),
+            .csprng = carry.csprng.restore(),
+            .srtp_hub = sfu_srtp.SfuSrtp.init(allocator),
+        };
+        owner.socket = socket;
+        owner.port = carry.socket.port;
+        owner.physical_socket_snapshot = carry.socket;
+        owner.max_frame_bytes = carry.max_frame_bytes;
+        owner.max_upload_bytes = carry.max_upload_bytes;
+        owner.stun_server = carry.stun_server;
+        owner.discovered = carry.discovered;
+        owner.dtls_enabled = carry.dtls_enabled;
+        owner.dtls_requested = carry.dtls_requested;
+        owner.dtls13_enabled = carry.dtls13_enabled;
+        owner.dtls13_requested = carry.dtls13_requested;
+        owner.dtls_fingerprint_buf = carry.dtls_fingerprint_buf;
+        owner.dtls_fingerprint_len = carry.dtls_fingerprint_len;
+        owner.cross = cross;
+        return owner;
+    }
+
+    fn requirePendingPhysicalRestore(self: *MediaPlane, prepared: *const routing.PreparedGraphRestore) void {
+        if (prepared.published or prepared.webrtc != self)
+            @panic("WebRTC physical restore requires its closed candidate Domain");
+        prepared.domain().requirePendingRestoreOwner(prepared.native, prepared.webrtc) catch
+            @panic("WebRTC physical restore Domain authority lost");
+    }
+
+    /// Move the complete prepared physical state with no allocation, entropy,
+    /// socket operation, or worker publication. The closed Domain was prepared
+    /// against this same owner, so no route can observe a partial installation.
+    pub fn installPreparedPhysicalState(self: *MediaPlane, state: *PhysicalState, prepared: *const routing.PreparedGraphRestore) void {
+        self.requirePendingPhysicalRestore(prepared);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.requireRoutingWorkerQuiescent() catch @panic("WebRTC physical restore worker is not parked");
+        lockSpin(&self.fp_mutex);
+        defer self.fp_mutex.unlock();
+        lockSpin(&self.rtcp_out_mutex);
+        defer self.rtcp_out_mutex.unlock();
+        if (self.routing_domain != prepared.domain() or self.routing_binding == null or self.routing_closed or
+            self.thread != null or self.physical_restored or state.moved or
+            !std.meta.eql(self.allocator, state.allocator) or
+            self.physical_socket_snapshot == null or !std.meta.eql(self.physical_socket_snapshot.?, state.socket) or
+            self.physical_pending != 0 or self.routing_inbound != null or self.routing_egress != null or
+            self.retired_routing_egress != null or self.physical_rows.count() != 0 or
+            self.physical_ufrags.count() != 0 or self.physical_groups.count() != 0 or
+            self.transport.endpoints.count() != 0 or self.offered_fps.count() != 0 or
+            self.dtls != null or self.dtls13 != null or self.rtcp_out_len != 0 or
+            self.max_frame_bytes != state.max_frame_bytes or self.max_upload_bytes != state.max_upload_bytes or
+            (self.cross != null) != state.cross_configured or self.dtls_requested != state.dtls_requested or
+            self.dtls13_requested != state.dtls13_requested or !std.meta.eql(self.stun_server, state.stun_server))
+            @panic("WebRTC physical restore owner is not blank or policy mismatched");
+        self.transport.deinit();
+        self.srtp_hub.wipe();
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.csprng));
+        self.csprng = state.csprng.restore();
+        self.stun_server = state.stun_server;
+        self.discovered = state.discovered;
+        self.dtls_enabled = state.dtls_enabled;
+        self.dtls_requested = state.dtls_requested;
+        self.dtls13_enabled = state.dtls13_enabled;
+        self.dtls13_requested = state.dtls13_requested;
+        self.dtls_fingerprint_buf = state.dtls_fingerprint_buf;
+        self.dtls_fingerprint_len = state.dtls_fingerprint_len;
+        self.transport = state.transport;
+        self.srtp_hub = state.srtp;
+        self.dtls = state.dtls12;
+        self.dtls_sessions = if (state.dtls12) |term| term.sessions else &.{};
+        self.dtls13 = state.dtls13;
+        self.dtls13_sessions = if (state.dtls13) |term| term.sessions else &.{};
+        self.physical_rows = state.rows;
+        self.physical_ufrags = state.ufrags;
+        self.physical_groups = state.groups;
+        self.physical_ssrcs = state.ssrcs;
+        self.routing_crypto = state.crypto;
+        self.offered_fps = state.offered_fps;
+        self.routing_egress = state.queue;
+        self.rtcp_out_head = state.rtcp_out_head;
+        self.physical_revision = state.physical_revision;
+        self.next_routing_inbound = state.next_routing_inbound;
+        self.routing_ingress_refused = state.routing_ingress_refused;
+        self.routing_ingress_completed = state.routing_ingress_completed;
+        self.routing_last_ingress_error = state.routing_last_ingress_error;
+        self.physical_restored = true;
+        std.crypto.secureZero(u8, &state.csprng.state);
+        state.moved = true;
+    }
+
+    /// Drop the moved state before an aborted candidate Domain is detached.
+    /// The transferred UDP reference remains owned by the inert owner and is
+    /// closed by its ordinary teardown after the Domain rollback.
+    pub fn discardPreparedPhysicalState(self: *MediaPlane, prepared: *const routing.PreparedGraphRestore) void {
+        self.requirePendingPhysicalRestore(prepared);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.requireRoutingWorkerQuiescent() catch @panic("WebRTC physical restore worker is not parked");
+        lockSpin(&self.fp_mutex);
+        defer self.fp_mutex.unlock();
+        lockSpin(&self.rtcp_out_mutex);
+        defer self.rtcp_out_mutex.unlock();
+        if (self.routing_domain != prepared.domain() or self.routing_binding == null or self.routing_closed or
+            self.thread != null or !self.physical_restored or
+            self.physical_pending != 0 or self.routing_inbound != null)
+            @panic("WebRTC physical restore was not installed");
+        self.disposePhysicalState();
     }
 
     fn initRestored(allocator: std.mem.Allocator, socket: MediaSocket, carry: *const Snapshot, cross: ?media_bridge.RtpCrossSink) !MediaPlane {
@@ -3810,6 +3969,25 @@ pub const PhysicalSnapshot = struct {
         }
         return error.InvalidSnapshot;
     }
+    fn remappedClient(remaps: []const routing.ClientRemap, old: routing.ClientId) !routing.ClientId {
+        for (remaps) |entry| if (entry.source.eql(old)) return entry.target;
+        return error.IncompleteRemap;
+    }
+    fn remappedKey(remaps: []const routing.ClientRemap, source: routing.EndpointKey) !routing.EndpointKey {
+        var key = source;
+        key.client = try remappedClient(remaps, source.client);
+        return key;
+    }
+    fn validateRemaps(self: *const PhysicalSnapshot, remaps: []const routing.ClientRemap) !void {
+        if (remaps.len > routing.max_graph_rows * 2) return error.InvalidSnapshot;
+        for (remaps, 0..) |entry, i| {
+            if (entry.source.isNone() or entry.target.isNone()) return error.InvalidSnapshot;
+            for (remaps[0..i]) |prior| {
+                if (prior.source.eql(entry.source) or prior.target.eql(entry.target)) return error.InvalidSnapshot;
+            }
+        }
+        for (self.rows) |row| _ = try remappedClient(remaps, row.key.client);
+    }
     fn snapshotBytes(self: *const PhysicalSnapshot) !usize {
         var bytes: usize = @sizeOf(PhysicalSnapshot);
         inline for (.{ .{ self.rows.len, @sizeOf(Row) }, .{ self.ufrags.len, @sizeOf(Ufrag) }, .{ self.groups.len, @sizeOf(Group) }, .{ self.offered_fps.len, @sizeOf(Fingerprint) } }) |part| {
@@ -4082,10 +4260,12 @@ pub const PhysicalSnapshot = struct {
         return snapshot;
     }
 
-    /// All allocations and key reconstruction happen off-owner. Publication
-    /// requires a separate authenticated graph join and a no-fail owner swap.
-    fn prepareRestore(self: *const PhysicalSnapshot, allocator: std.mem.Allocator, limits: Limits) !PhysicalState {
+    /// All allocations and key reconstruction happen off-owner using the same
+    /// complete physical ClientId remap as Domain. Publication requires a
+    /// separate authenticated graph join and a no-fail owner swap.
+    pub fn prepareRemappedRestore(self: *const PhysicalSnapshot, allocator: std.mem.Allocator, remaps: []const routing.ClientRemap, limits: Limits) !PhysicalState {
         try self.validate(limits);
+        try self.validateRemaps(remaps);
         var candidate = PhysicalState{ .allocator = allocator, .csprng = self.csprng, .socket = self.socket, .stun_server = self.stun_server, .discovered = self.discovered, .max_frame_bytes = self.max_frame_bytes, .max_upload_bytes = self.max_upload_bytes, .cross_configured = self.cross_configured, .dtls_enabled = self.dtls_enabled, .dtls_requested = self.dtls_requested, .dtls13_enabled = self.dtls13_enabled, .dtls13_requested = self.dtls13_requested, .dtls_fingerprint_buf = self.dtls_fingerprint_buf, .dtls_fingerprint_len = self.dtls_fingerprint_len, .transport = MediaTransport.init(allocator), .srtp = sfu_srtp.SfuSrtp.init(allocator), .ssrcs = @splat(.{}), .crypto = @splat(.{}), .queue = null, .rtcp_out_head = self.rtcp_out_head, .physical_revision = self.physical_revision, .next_routing_inbound = self.next_routing_inbound, .routing_ingress_refused = self.routing_ingress_refused, .routing_ingress_completed = self.routing_ingress_completed, .routing_last_ingress_error = self.routing_last_ingress_error };
         errdefer candidate.deinit();
         try candidate.rows.ensureTotalCapacity(allocator, @intCast(self.rows.len));
@@ -4095,21 +4275,44 @@ pub const PhysicalSnapshot = struct {
         for (self.rows) |row| {
             var rtx = try rtp_nack.RetransmitBuffer.prepareRestore(allocator, &row.rtx, media_transport.rtx_capacity, limits.max_bytes);
             errdefer rtx.deinit();
-            const cache = try rtp_nack.PerSsrcRetransmitBuffer.prepareRestore(allocator, &row.cache, media_transport.rtx_capacity, sfu_srtp.max_owners, limits.max_bytes);
-            candidate.rows.putAssumeCapacity(row.key, .{ .identity = row.identity, .profile = row.profile, .kind_bits = row.kind_bits, .expected_fp = row.expected_fp, .max_temporal = row.max_temporal, .physical_cache = cache, .endpoint = .{ .ufrag = row.ufrag, .pwd = row.pwd, .remote = row.remote, .max_spatial = row.max_spatial, .ssrc = row.ssrc, .rx_packets = row.rx_packets, .rx_bytes = row.rx_bytes, .rtx = rtx } });
+            var cache = try rtp_nack.PerSsrcRetransmitBuffer.prepareRestore(allocator, &row.cache, media_transport.rtx_capacity, sfu_srtp.max_owners, limits.max_bytes);
+            errdefer cache.deinit();
+            const key = try remappedKey(remaps, row.key);
+            var identity = row.identity;
+            identity.reference.offering_client = key.client;
+            identity.stamp.offering_client = key.client;
+            candidate.rows.putAssumeCapacity(key, .{ .identity = identity, .profile = row.profile, .kind_bits = row.kind_bits, .expected_fp = row.expected_fp, .max_temporal = row.max_temporal, .physical_cache = cache, .endpoint = .{ .ufrag = row.ufrag, .pwd = row.pwd, .remote = row.remote, .max_spatial = row.max_spatial, .ssrc = row.ssrc, .rx_packets = row.rx_packets, .rx_bytes = row.rx_bytes, .rtx = rtx } });
         }
-        for (self.ufrags) |row| candidate.ufrags.putAssumeCapacity(row.value, row.key);
+        for (self.ufrags) |row| candidate.ufrags.putAssumeCapacity(row.value, try remappedKey(remaps, row.key));
         for (self.groups) |row| candidate.groups.putAssumeCapacity(row.call, .{ .key = row.key, .count = row.count });
         for (self.ssrcs, &candidate.ssrcs) |source, *target| {
-            if (source.live) target.* = .{ .live = true, .ssrc = source.ssrc, .key = source.key.?, .endpoint = source.endpoint.? };
+            if (source.live) target.* = .{ .live = true, .ssrc = source.ssrc, .key = try remappedKey(remaps, source.key.?), .endpoint = source.endpoint.? };
         }
         for (self.crypto, &candidate.crypto) |source, *target| {
             if (source.live) target.* = .{ .live = true, .endpoint = source.endpoint.?, .binding_revision = source.binding_revision, .addr = source.addr };
         }
         candidate.transport = try MediaTransport.prepareRestore(allocator, &self.transport, limits.transport);
         candidate.srtp = try sfu_srtp.SfuSrtp.prepareRestore(allocator, &self.srtp);
-        if (self.dtls12) |*term| candidate.dtls12 = try dtls_server.Terminator.prepareRestore(allocator, term, .{ .cert_digest = peer_verify.certDigest(term.identity.cert_der[0..term.identity.cert_len]), .session_capacity = dtls_server.default_max_sessions, .request_client_cert = true });
-        if (self.dtls13) |*term| candidate.dtls13 = try dtls13_server.Terminator.prepareRestore(allocator, term, .{ .cert_digest = peer_verify.certDigest(term.identity.cert_der[0..term.identity.cert_len]), .session_capacity = dtls13_server.default_max_sessions, .request_client_cert = true });
+        if (self.dtls12) |*term| {
+            var restored = try dtls_server.Terminator.prepareRestore(allocator, term, .{ .cert_digest = peer_verify.certDigest(term.identity.cert_der[0..term.identity.cert_len]), .session_capacity = dtls_server.default_max_sessions, .request_client_cert = true });
+            const boxed = allocator.create(dtls_server.Terminator) catch |err| {
+                restored.deinit();
+                return err;
+            };
+            boxed.* = restored.term;
+            std.crypto.secureZero(u8, std.mem.asBytes(&restored.term));
+            candidate.dtls12 = boxed;
+        }
+        if (self.dtls13) |*term| {
+            var restored = try dtls13_server.Terminator.prepareRestore(allocator, term, .{ .cert_digest = peer_verify.certDigest(term.identity.cert_der[0..term.identity.cert_len]), .session_capacity = dtls13_server.default_max_sessions, .request_client_cert = true });
+            const boxed = allocator.create(dtls13_server.Terminator) catch |err| {
+                restored.deinit();
+                return err;
+            };
+            boxed.* = restored.term;
+            std.crypto.secureZero(u8, std.mem.asBytes(&restored.term));
+            candidate.dtls13 = boxed;
+        }
         for (self.offered_fps) |row| {
             const key = try allocator.dupe(u8, row.key);
             errdefer allocator.free(key);
@@ -4127,7 +4330,7 @@ pub const PhysicalSnapshot = struct {
     }
 };
 
-const PhysicalState = struct {
+pub const PhysicalState = struct {
     allocator: std.mem.Allocator,
     socket: media_socket.Snapshot,
     csprng: RngState,
@@ -4142,8 +4345,8 @@ const PhysicalState = struct {
     dtls13_requested: bool,
     dtls_fingerprint_buf: [128]u8,
     dtls_fingerprint_len: usize,
-    dtls12: ?dtls_server.Terminator.Restoration = null,
-    dtls13: ?dtls13_server.Terminator.Restoration = null,
+    dtls12: ?*dtls_server.Terminator = null,
+    dtls13: ?*dtls13_server.Terminator = null,
     srtp: sfu_srtp.SfuSrtp,
     transport: MediaTransport,
     rows: PhysicalRtcMap = .empty,
@@ -4159,7 +4362,12 @@ const PhysicalState = struct {
     routing_ingress_refused: u64,
     routing_ingress_completed: u64,
     routing_last_ingress_error: ?anyerror,
-    fn deinit(self: *PhysicalState) void {
+    moved: bool = false,
+    pub fn deinit(self: *PhysicalState) void {
+        if (self.moved) {
+            self.* = undefined;
+            return;
+        }
         var rows = self.rows.valueIterator();
         while (rows.next()) |row| {
             row.endpoint.rtx.deinit();
@@ -4176,8 +4384,18 @@ const PhysicalState = struct {
         self.offered_fps.deinit(self.allocator);
         self.transport.deinit();
         self.srtp.wipe();
-        if (self.dtls12) |*term| term.deinit();
-        if (self.dtls13) |*term| term.deinit();
+        if (self.dtls13) |term| {
+            const sessions = term.sessions;
+            term.deinit();
+            self.allocator.free(sessions);
+            self.allocator.destroy(term);
+        }
+        if (self.dtls12) |term| {
+            const sessions = term.sessions;
+            term.deinit();
+            self.allocator.free(sessions);
+            self.allocator.destroy(term);
+        }
         if (self.queue) |queue| {
             std.crypto.secureZero(u8, queue.payloads);
             self.allocator.free(queue.rows);
@@ -4188,6 +4406,74 @@ const PhysicalState = struct {
         self.* = undefined;
     }
 };
+
+test "Windows active WebRTC owner imports one socket and rolls back prepared physical state" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const source_domain = try routing.Domain.create(testing.allocator);
+    var source_domain_live = true;
+    defer if (source_domain_live) source_domain.destroyQuiesced() catch @panic("source Domain retained WebRTC binding");
+    var source = try MediaPlane.initFallible(testing.allocator);
+    defer source.deinit();
+    source.dtls_enabled = true;
+    source.dtls13_enabled = true;
+    try source.prepareColdResources(testing.io, loopback_be, 0);
+    const source_binding = try source_domain.bindWebrtc(&source);
+    var source_binding_live = true;
+    defer if (source_binding_live) source_domain.releaseWebrtc(source_binding) catch @panic("source WebRTC binding retained");
+    try source.prepareRoutingEgress(source_domain, 2, 512);
+    var source_queue_live = true;
+    defer if (source_queue_live) source.disposeRoutingEgress(source_domain) catch @panic("source WebRTC queue retained");
+    const limits: PhysicalSnapshot.Limits = .{ .max_rows = 8, .max_offered = 8, .max_bytes = 8 * 1024 * 1024, .transport = .{ .max_endpoints = 8, .max_groups = 8, .max_bytes = 8 * 1024 * 1024 } };
+    var carry = try PhysicalSnapshot.captureLocked(&source, testing.allocator, limits);
+    defer carry.deinit();
+    try source.disposeRoutingEgress(source_domain);
+    source_queue_live = false;
+    try source_domain.releaseWebrtc(source_binding);
+    source_binding_live = false;
+    try source_domain.destroyQuiesced();
+    source_domain_live = false;
+    const expected: Policy = .{ .max_frame_bytes = source.max_frame_bytes, .max_upload_bytes = source.max_upload_bytes, .stun_server = source.stun_server, .dtls_requested = source.dtls_requested, .dtls13_requested = source.dtls13_requested, .cross_configured = false };
+    var transfer = try windows_udp.duplicateForProcess(source.socket.?.fd, std.os.windows.GetCurrentProcessId());
+    var candidate = try MediaPlane.initTransferredPhysical(testing.allocator, &transfer, &carry, expected, limits, null);
+    defer candidate.deinit();
+    try testing.expect(transfer.consumed);
+    try testing.expect(candidate.socket.?.fd != source.socket.?.fd);
+    try testing.expectEqual(carry.socket.port, candidate.port);
+    try testing.expect(candidate.dtls == null and candidate.dtls13 == null and candidate.routing_egress == null);
+    try candidate.prepareInheritedResources(testing.io);
+    const specs = [_]runtime_pause.start_gate.ParticipantSpec{.{ .kind = .media_plane, .instance = 0, .owner_identity = &candidate }};
+    const gate = try runtime_pause.start_gate.create(testing.allocator, testing.io, &specs);
+    defer {
+        candidate.requestStopAndWake();
+        if (gate.view.inspect().phase == .preparing) gate.control.cancelAllAndJoin() else gate.control.joinAll();
+        candidate.detachAfterJoined() catch unreachable;
+        gate.control.destroyJoined();
+    }
+    try candidate.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.media_plane, 0, &candidate));
+    try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try candidate.requireParked();
+    var state = try carry.prepareRemappedRestore(testing.allocator, &.{}, limits);
+    defer state.deinit();
+    var native = @import("native_media_transport.zig").NativeMediaTransport.init(testing.allocator);
+    defer native.deinit();
+    var calls: [0]routing.GraphCall = .{};
+    var endpoints: [0]routing.GraphEndpoint = .{};
+    var memberships: [0]routing.GraphMembership = .{};
+    var policies: [0]routing.GraphBridgePolicy = .{};
+    const graph: routing.GraphSnapshot = .{ .allocator = testing.allocator, .id = .{ .serial = 80_000_001 }, .revision = 2, .next_call = 1, .next_endpoint = 1, .next_stream = 1, .next_scope = 1, .next_binding = 3, .native_binding_serial = 1, .webrtc_binding_serial = 2, .calls = &calls, .endpoints = &endpoints, .memberships = &memberships, .bridge_policy = &policies };
+    var prepared = try routing.prepareGraphRestore(testing.allocator, &graph, &native, &candidate);
+    defer prepared.deinit();
+    defer if (candidate.physical_restored) candidate.discardPreparedPhysicalState(&prepared);
+    candidate.installPreparedPhysicalState(&state, &prepared);
+    try testing.expect(state.moved and candidate.physical_restored);
+    try testing.expect(candidate.routing_egress != null and candidate.routing_egress.?.rows.len == carry.queue.capacity);
+    try testing.expectEqual(carry.dtls12 != null, candidate.dtls != null);
+    try testing.expectEqual(carry.dtls13 != null, candidate.dtls13 != null);
+    try testing.expectEqualDeep(carry.csprng, RngState.capture(&candidate.csprng));
+    candidate.discardPreparedPhysicalState(&prepared);
+    try candidate.requireRoutingReleasable();
+    try testing.expect(candidate.socket != null and candidate.routing_egress == null and candidate.dtls == null and !candidate.physical_restored);
+}
 
 test "Windows Helix media plane imports idle DTLS owner and parks inherited worker" {
     if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
@@ -4231,6 +4517,16 @@ test "Windows Helix media plane imports idle DTLS owner and parks inherited work
     try gate.control.awaitAllParked(std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
     try successor.requireParked();
     try testing.expect(!successor.runtime.entered.load(.acquire));
+    try successor.requireRoutingAttachable();
+    const candidate_domain = try routing.Domain.create(testing.allocator);
+    const candidate_binding = try candidate_domain.bindWebrtc(&successor);
+    try successor.requireRoutingReleasable();
+    try candidate_domain.releaseWebrtc(candidate_binding);
+    try candidate_domain.destroyQuiesced();
+
+    gate.control.releaseAll();
+    try testing.expectError(error.Busy, successor.requireRoutingAttachable());
+    try testing.expectError(error.Busy, successor.requireRoutingReleasable());
 
     var invalid = carry;
     defer invalid.deinit();
@@ -5626,9 +5922,16 @@ test "media physical DTO preserves retransmit state and refuses in-flight egress
     var carry = try fixture.domain.withLocked(Cut{ .fixture = &fixture, .token = token, .limits = limits }, Cut.run);
     defer carry.deinit();
     try testing.expectEqual(@as(usize, 1), carry.rows.len);
-    var restored = try carry.prepareRestore(testing.allocator, limits);
+    const new_client = routing.ClientId{ .shard = 7, .slot = 8, .gen = 9 };
+    var new_key = offer.key;
+    new_key.client = new_client;
+    var restored = try carry.prepareRemappedRestore(testing.allocator, &.{.{ .source = offer.key.client, .target = new_client }}, limits);
     defer restored.deinit();
-    const adopted = restored.rows.getPtr(offer.key).?;
+    try testing.expect(restored.rows.getPtr(offer.key) == null);
+    const adopted = restored.rows.getPtr(new_key).?;
+    try testing.expectEqualDeep(new_client, adopted.identity.reference.offering_client);
+    try testing.expectEqualDeep(new_client, adopted.identity.stamp.offering_client);
+    try testing.expectEqualDeep(new_key, restored.ufrags.get(offer.creds.ufrag).?);
     try testing.expectEqualSlices(u8, &packet, adopted.endpoint.rtx.lookup(9).?);
     try testing.expectEqualSlices(u8, &packet, adopted.physical_cache.lookup(401, 9).?);
     try testing.expectEqual(carry.queue.next_ordinal, restored.queue.?.next_ordinal);
@@ -5642,6 +5945,87 @@ test "media physical DTO preserves retransmit state and refuses in-flight egress
     var too_small = limits;
     too_small.max_bytes = (try carry.snapshotBytes()) - 1;
     try testing.expectError(error.Capacity, carry.validate(too_small));
+}
+
+test "media physical DTO remaps every client join and leaves allocation failures retryable" {
+    var fixture_allocator = testing.FailingAllocator.init(testing.allocator, .{});
+    var fixture = try PhysicalIceFixture.init(&fixture_allocator);
+    defer fixture.deinit();
+    const old_a = routing.ClientId{ .shard = 0, .slot = 7, .gen = 1 };
+    const old_b = routing.ClientId{ .shard = 0, .slot = 8, .gen = 1 };
+    const new_a = routing.ClientId{ .shard = 4, .slot = 5, .gen = 6 };
+    const new_b = routing.ClientId{ .shard = 4, .slot = 6, .gen = 6 };
+    var offer_a = try fixture.offer(old_a);
+    defer std.crypto.secureZero(u8, &offer_a.creds.pwd);
+    var offer_b = try fixture.offer(old_b);
+    defer std.crypto.secureZero(u8, &offer_b.creds.pwd);
+    try fixture.owner.startPreparedLegacyWorker();
+    const token = try fixture.paused(1);
+    defer fixture.owner.resumePaused(token) catch unreachable;
+    const limits: PhysicalSnapshot.Limits = .{ .max_rows = 8, .max_offered = 8, .max_bytes = 8 * 1024 * 1024, .transport = .{ .max_endpoints = 8, .max_groups = 8, .max_bytes = 8 * 1024 * 1024 } };
+    const Cut = struct {
+        fixture: *PhysicalIceFixture,
+        token: runtime_pause.Token,
+        limits: PhysicalSnapshot.Limits,
+        fn run(scope: *routing.Locked, ctx: @This()) !PhysicalSnapshot {
+            const fence = try ctx.fixture.owner.fenceRoutingProducersLocked(ctx.fixture.domain, scope);
+            defer ctx.fixture.owner.resumeRoutingProducersLocked(ctx.fixture.domain, scope, fence) catch unreachable;
+            return ctx.fixture.owner.capturePausedPhysicalRoutingLocked(ctx.fixture.domain, scope, ctx.token, testing.allocator, ctx.limits);
+        }
+    };
+    var carry = try fixture.domain.withLocked(Cut{ .fixture = &fixture, .token = token, .limits = limits }, Cut.run);
+    defer carry.deinit();
+    try testing.expectEqual(@as(usize, 2), carry.rows.len);
+    // Exercise the fixed SSRC index as well as the ufrag map. The snapshot
+    // validator confirms this synthetic slot joins the same captured row.
+    carry.rows[0].ssrc = 7001;
+    carry.ssrcs[0] = .{ .live = true, .ssrc = 7001, .key = carry.rows[0].key, .endpoint = carry.rows[0].identity.stamp.endpoint };
+    try carry.validate(limits);
+    const remaps = [_]routing.ClientRemap{ .{ .source = old_a, .target = new_a }, .{ .source = old_b, .target = new_b } };
+    try testing.expectError(error.IncompleteRemap, carry.prepareRemappedRestore(testing.allocator, remaps[0..1], limits));
+    try testing.expectError(error.IncompleteRemap, carry.prepareRemappedRestore(testing.allocator, &.{ .{ .source = old_a, .target = new_a }, .{ .source = .{ .shard = 9, .slot = 9, .gen = 9 }, .target = new_b } }, limits));
+    try testing.expectError(error.InvalidSnapshot, carry.prepareRemappedRestore(testing.allocator, &.{ .{ .source = old_a, .target = new_a }, .{ .source = old_b, .target = new_a } }, limits));
+    try testing.expectError(error.InvalidSnapshot, carry.prepareRemappedRestore(testing.allocator, &.{ .{ .source = old_a, .target = new_a }, .{ .source = old_a, .target = new_b } }, limits));
+    var restored = try carry.prepareRemappedRestore(testing.allocator, &remaps, limits);
+    defer restored.deinit();
+    var key_a = offer_a.key;
+    key_a.client = new_a;
+    var key_b = offer_b.key;
+    key_b.client = new_b;
+    try testing.expect(restored.rows.get(offer_a.key) == null and restored.rows.get(offer_b.key) == null);
+    try testing.expectEqualDeep(new_a, restored.rows.get(key_a).?.identity.reference.offering_client);
+    try testing.expectEqualDeep(new_a, restored.rows.get(key_a).?.identity.stamp.offering_client);
+    try testing.expectEqualDeep(new_b, restored.rows.get(key_b).?.identity.reference.offering_client);
+    try testing.expectEqualDeep(key_a, restored.ufrags.get(offer_a.creds.ufrag).?);
+    try testing.expectEqualDeep(key_b, restored.ufrags.get(offer_b.creds.ufrag).?);
+    var indexed = carry.ssrcs[0].key.?;
+    indexed.client = if (indexed.client.eql(old_a)) new_a else new_b;
+    try testing.expectEqualDeep(indexed, restored.ssrcs[0].key);
+    try testing.expectEqualDeep(old_a, offer_a.key.client);
+    try testing.expectEqualDeep(old_b, offer_b.key.client);
+
+    var fail = testing.FailingAllocator.init(testing.allocator, .{});
+    const baseline = fail.allocated_bytes - fail.freed_bytes;
+    var failures: usize = 0;
+    var succeeded = false;
+    for (0..128) |n| {
+        fail.fail_index = fail.alloc_index + n;
+        var candidate = carry.prepareRemappedRestore(fail.allocator(), &remaps, limits) catch |err| {
+            fail.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(baseline, fail.allocated_bytes - fail.freed_bytes);
+            try carry.validate(limits);
+            try testing.expect(fixture.owner.physical_rows.contains(offer_a.key));
+            failures += 1;
+            continue;
+        };
+        fail.fail_index = std.math.maxInt(usize);
+        candidate.deinit();
+        try testing.expectEqual(baseline, fail.allocated_bytes - fail.freed_bytes);
+        succeeded = true;
+        break;
+    }
+    try testing.expect(failures > 0 and succeeded);
 }
 
 test "media physical DTO DTLS fingerprint and configured session capacity are joined" {
@@ -5676,7 +6060,7 @@ test "media physical DTO DTLS fingerprint and configured session capacity are jo
     carry.dtls12.?.request_client_cert = false;
     try testing.expectError(error.ConfigMismatch, carry.validate(limits));
     carry.dtls12.?.request_client_cert = true;
-    var restored = try carry.prepareRestore(testing.allocator, limits);
+    var restored = try carry.prepareRemappedRestore(testing.allocator, &.{}, limits);
     defer restored.deinit();
     try testing.expect(restored.dtls12 != null);
     try testing.expectEqualSlices(u8, carry.dtls_fingerprint_buf[0..carry.dtls_fingerprint_len], restored.dtls_fingerprint_buf[0..restored.dtls_fingerprint_len]);

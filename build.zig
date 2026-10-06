@@ -442,6 +442,10 @@ pub fn build(b: *std.Build) void {
         "NativeMedia",
         "WebTransport",
         "webtransport",
+        "quic conn snapshot",
+        "http3 snapshot",
+        "HXWT",
+        "HXQC",
         "RTP",
         "RTCP",
     };
@@ -531,6 +535,11 @@ pub fn build(b: *std.Build) void {
         "resume",
         "capsule",
         "handoff",
+        "media graph checkpoint",
+        "Windows active",
+        "Windows media custody",
+        "HXWT",
+        "HXQC",
         "HSSN",
         "capability",
     };

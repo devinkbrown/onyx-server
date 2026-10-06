@@ -18,6 +18,15 @@ const metrics_mod = @import("native_windows_metrics.zig");
 const webhook_mod = @import("native_windows_webhook.zig");
 const history_mod = @import("native_windows_history.zig");
 const udp_mod = @import("native_windows_udp_custody.zig");
+const media_mod = @import("native_windows_media_custody.zig");
+const active_udp_mod = @import("native_windows_active_media_udp_custody.zig");
+const active_wt_mod = @import("native_windows_active_webtransport_custody.zig");
+const active_wt_codec = @import("native_windows_active_webtransport_snapshot.zig");
+const webtransport_listener = @import("../webtransport_listener.zig");
+const media_graph = @import("media_graph_checkpoint.zig");
+const media_physical = @import("native_windows_active_media_snapshot.zig");
+const native_media = @import("../native_media_transport.zig");
+const webrtc_media = @import("../media_plane.zig");
 const store = @import("../store.zig");
 
 pub const max_listeners = @import("live.zig").max_inherited_listeners;
@@ -34,6 +43,9 @@ pub const metrics_body_len = metrics_mod.frame_len;
 pub const webhook_body_len = webhook_mod.frame_len;
 pub const history_body_len = history_mod.frame_len;
 pub const udp_body_len = udp_mod.frame_len;
+pub const media_body_len = media_mod.frame_len;
+pub const active_media_udp_body_len = active_udp_mod.frame_len;
+pub const active_webtransport_body_len = active_wt_mod.frame_len;
 const version: u16 = 1;
 const max_canonical_id: i32 = 0x3fff_ffff;
 const invalid_socket = std.math.maxInt(usize);
@@ -46,7 +58,7 @@ comptime {
     if (descriptor_header_len + rows_per_frame * descriptor_row_len > control.max_body or
         source_digest_body_len > control.max_body or metrics_body_len > control.max_body or
         webhook_body_len > control.max_body or history_body_len > control.max_body or
-        udp_body_len > control.max_body or
+        udp_body_len > control.max_body or media_body_len > control.max_body or active_media_udp_body_len > control.max_body or active_webtransport_body_len > control.max_body or
         descriptor_row_len != 12 + @sizeOf(socket_mod.ProtocolInfo))
         @compileError("Windows Helix descriptor frame exceeds the authenticated control body");
 }
@@ -56,7 +68,7 @@ extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 extern "kernel32" fn GetProcessId(handle: usize) callconv(.winapi) u32;
 extern "kernel32" fn CloseHandle(handle: usize) callconv(.winapi) i32;
 
-pub const Error = control.Error || arena_mod.Error || socket_mod.Error || wal_mod.Error || metrics_mod.Error || webhook_mod.Error || history_mod.Error || udp_mod.Error || error{
+pub const Error = control.Error || arena_mod.Error || socket_mod.Error || wal_mod.Error || metrics_mod.Error || webhook_mod.Error || history_mod.Error || udp_mod.Error || media_mod.Error || active_udp_mod.Error || active_wt_mod.Error || error{
     InvalidCandidate,
     InvalidManifest,
     InvalidAck,
@@ -129,7 +141,7 @@ fn validateSources(rows: []const SourceRow) Error!void {
     }
 }
 
-const AckPhase = enum(u16) { arena = 1, descriptors = 2, wal_custody = 3, source_digest = 4, metrics_custody = 5, webhook_custody = 6, history_custody = 7, udp_custody = 8 };
+const AckPhase = enum(u16) { arena = 1, descriptors = 2, wal_custody = 3, source_digest = 4, metrics_custody = 5, webhook_custody = 6, history_custody = 7, udp_custody = 8, media_custody = 9, webtransport_custody = 10, active_media_udp_custody = 11 };
 
 fn ackBody(phase: AckPhase, next_index: usize, total: usize) [ack_body_len]u8 {
     var body: [ack_body_len]u8 = undefined;
@@ -293,6 +305,12 @@ pub const SentCustody = struct {
     webtransport_udp_body: udp_mod.Frame,
     webrtc_media_udp_body: udp_mod.Frame,
     native_media_udp_body: udp_mod.Frame,
+    media_graph_body: media_mod.Frame,
+    native_physical_body: media_mod.Frame,
+    webrtc_physical_body: media_mod.Frame,
+    active_native_udp_body: active_udp_mod.Frame,
+    active_webrtc_udp_body: active_udp_mod.Frame,
+    active_webtransport_body: active_wt_mod.Frame,
 };
 
 pub const UdpPrepared = struct {
@@ -300,6 +318,55 @@ pub const UdpPrepared = struct {
     webrtc_media: ?*const udp_mod.Prepared = null,
     native_media: ?*const udp_mod.Prepared = null,
 };
+
+/// Active media is one optional aggregate. Supplying only one or two leaves
+/// would make a candidate READY witness that cannot describe a complete cut.
+pub const MediaPrepared = struct {
+    graph: ?*const media_mod.Prepared = null,
+    native_physical: ?*const media_mod.Prepared = null,
+    webrtc_physical: ?*const media_mod.Prepared = null,
+};
+
+pub const ActiveMediaUdpPrepared = struct {
+    native: ?*const active_udp_mod.Prepared = null,
+    webrtc: ?*const active_udp_mod.Prepared = null,
+};
+
+fn validateMediaAggregate(graph_body: *const media_mod.Frame, native_body: *const media_mod.Frame, webrtc_body: *const media_mod.Frame, target_pid: u32) Error!bool {
+    const graph_present = try media_mod.validateFrame(graph_body, .graph, target_pid);
+    const native_present = try media_mod.validateFrame(native_body, .native_physical, target_pid);
+    const webrtc_present = try media_mod.validateFrame(webrtc_body, .webrtc_physical, target_pid);
+    if (graph_present != native_present or graph_present != webrtc_present) return error.InvalidManifest;
+    if (graph_present) {
+        const handles = [_]u64{
+            std.mem.readInt(u64, graph_body[16..24], .big),
+            std.mem.readInt(u64, native_body[16..24], .big),
+            std.mem.readInt(u64, webrtc_body[16..24], .big),
+        };
+        if (handles[0] == handles[1] or handles[0] == handles[2] or handles[1] == handles[2])
+            return error.InvalidManifest;
+    }
+    return graph_present;
+}
+
+fn validateActiveMediaUdpAggregate(native_udp: *const active_udp_mod.Frame, webrtc_udp: *const active_udp_mod.Frame, media_present: bool, native_physical_frame: *const media_mod.Frame, webrtc_physical_frame: *const media_mod.Frame, idle_webrtc: *const udp_mod.Frame, idle_native: *const udp_mod.Frame, target_pid: u32) Error!void {
+    const native_present = try active_udp_mod.validateFrame(native_udp, .native, target_pid);
+    const webrtc_present = try active_udp_mod.validateFrame(webrtc_udp, .webrtc, target_pid);
+    if (native_present != media_present or webrtc_present != media_present) return error.InvalidManifest;
+    if (!media_present) return;
+    if (try udp_mod.validateFrame(idle_webrtc, .media, target_pid) or
+        try udp_mod.validateFrame(idle_native, .native_media, target_pid)) return error.InvalidManifest;
+    const handles = [_]u64{
+        std.mem.readInt(u64, native_physical_frame[16..24], .big),
+        std.mem.readInt(u64, webrtc_physical_frame[16..24], .big),
+        std.mem.readInt(u64, native_udp[16..24], .big),
+        std.mem.readInt(u64, webrtc_udp[16..24], .big),
+    };
+    for (handles, 0..) |handle, i| for (handles[i + 1 ..]) |other| if (handle == other) return error.InvalidManifest;
+    const native_socket = std.mem.readInt(u64, native_udp[active_udp_mod.frame_len - @import("native_windows_udp_socket.zig").frame_len + 12 ..][0..8], .big);
+    const webrtc_socket = std.mem.readInt(u64, webrtc_udp[active_udp_mod.frame_len - @import("native_windows_udp_socket.zig").frame_len + 12 ..][0..8], .big);
+    if (native_socket == webrtc_socket) return error.InvalidManifest;
+}
 
 /// Production variant with optional metrics listener custody. A canonical
 /// absent frame is still sent when metrics is disabled so the child cannot
@@ -321,14 +388,26 @@ pub fn sendWithWalDigestMetricsWebhookAndHistory(candidate: *process.Process, ar
 /// Three ordered, explicit present-or-absent UDP turns follow all TCP and
 /// companion custody. READY binds their exact authenticated bodies.
 pub fn sendWithWalDigestMetricsWebhookHistoryAndUdp(candidate: *process.Process, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_prepared: ?*const metrics_mod.Prepared, webhook_prepared: ?*const webhook_mod.Prepared, history_prepared: ?*const history_mod.Prepared, udp: UdpPrepared, deadline: i64) Error!SentCustody {
-    return sendWithWalImplUdp(candidate, arena, sealer, rows, wal_transfer, expected_digest, metrics_prepared, webhook_prepared, history_prepared, udp, true, deadline);
+    return sendWithWalImplUdpMedia(candidate, arena, sealer, rows, wal_transfer, expected_digest, metrics_prepared, webhook_prepared, history_prepared, udp, .{}, .{}, null, true, deadline);
+}
+
+pub fn sendWithWalDigestMetricsWebhookHistoryUdpAndMedia(candidate: *process.Process, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_prepared: ?*const metrics_mod.Prepared, webhook_prepared: ?*const webhook_mod.Prepared, history_prepared: ?*const history_mod.Prepared, udp: UdpPrepared, media: MediaPrepared, deadline: i64) Error!SentCustody {
+    return sendWithWalImplUdpMedia(candidate, arena, sealer, rows, wal_transfer, expected_digest, metrics_prepared, webhook_prepared, history_prepared, udp, media, .{}, null, true, deadline);
+}
+
+pub fn sendWithWalDigestMetricsWebhookHistoryUdpMediaAndActiveWebtransport(candidate: *process.Process, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_prepared: ?*const metrics_mod.Prepared, webhook_prepared: ?*const webhook_mod.Prepared, history_prepared: ?*const history_mod.Prepared, udp: UdpPrepared, media: MediaPrepared, active_webtransport: ?*const active_wt_mod.Prepared, deadline: i64) Error!SentCustody {
+    return sendWithWalImplUdpMedia(candidate, arena, sealer, rows, wal_transfer, expected_digest, metrics_prepared, webhook_prepared, history_prepared, udp, media, .{}, active_webtransport, true, deadline);
+}
+
+pub fn sendWithWalDigestMetricsWebhookHistoryUdpMediaAndActiveTransfers(candidate: *process.Process, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_prepared: ?*const metrics_mod.Prepared, webhook_prepared: ?*const webhook_mod.Prepared, history_prepared: ?*const history_mod.Prepared, udp: UdpPrepared, media: MediaPrepared, active_udp: ActiveMediaUdpPrepared, active_webtransport: ?*const active_wt_mod.Prepared, deadline: i64) Error!SentCustody {
+    return sendWithWalImplUdpMedia(candidate, arena, sealer, rows, wal_transfer, expected_digest, metrics_prepared, webhook_prepared, history_prepared, udp, media, active_udp, active_webtransport, true, deadline);
 }
 
 fn sendWithWalImpl(candidate: *process.Process, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_prepared: ?*const metrics_mod.Prepared, webhook_prepared: ?*const webhook_mod.Prepared, history_prepared: ?*const history_mod.Prepared, require_nonzero_digest: bool, deadline: i64) Error!SentCustody {
-    return sendWithWalImplUdp(candidate, arena, sealer, rows, wal_transfer, expected_digest, metrics_prepared, webhook_prepared, history_prepared, .{}, require_nonzero_digest, deadline);
+    return sendWithWalImplUdpMedia(candidate, arena, sealer, rows, wal_transfer, expected_digest, metrics_prepared, webhook_prepared, history_prepared, .{}, .{}, .{}, null, require_nonzero_digest, deadline);
 }
 
-fn sendWithWalImplUdp(candidate: *process.Process, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_prepared: ?*const metrics_mod.Prepared, webhook_prepared: ?*const webhook_mod.Prepared, history_prepared: ?*const history_mod.Prepared, udp: UdpPrepared, require_nonzero_digest: bool, deadline: i64) Error!SentCustody {
+fn sendWithWalImplUdpMedia(candidate: *process.Process, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_prepared: ?*const metrics_mod.Prepared, webhook_prepared: ?*const webhook_mod.Prepared, history_prepared: ?*const history_mod.Prepared, udp: UdpPrepared, media: MediaPrepared, active_udp: ActiveMediaUdpPrepared, active_webtransport: ?*const active_wt_mod.Prepared, require_nonzero_digest: bool, deadline: i64) Error!SentCustody {
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
     if (candidate.committed or candidate.pid == 0 or candidate.pid == GetCurrentProcessId() or
         candidate.process_handle == 0 or GetProcessId(candidate.process_handle) != candidate.pid or
@@ -363,7 +442,23 @@ fn sendWithWalImplUdp(candidate: *process.Process, arena: *const arena_mod.Arena
         (try udp_mod.validateFrame(&webrtc_body, .media, candidate.pid)) != (udp.webrtc_media != null) or
         (try udp_mod.validateFrame(&native_body, .native_media, candidate.pid)) != (udp.native_media != null))
         return error.InvalidManifest;
-    return sendToWithWalDigestMetricsWebhookHistoryAndUdp(&candidate.endpoint, candidate.process_handle, candidate.pid, arena, sealer, rows, wal_transfer, expected_digest, metrics_body, webhook_body, history_body, wt_body, webrtc_body, native_body, deadline);
+    const media_body = if (media.graph) |prepared| prepared.body else media_mod.absentFrame(.graph);
+    const native_physical_body = if (media.native_physical) |prepared| prepared.body else media_mod.absentFrame(.native_physical);
+    const webrtc_physical_body = if (media.webrtc_physical) |prepared| prepared.body else media_mod.absentFrame(.webrtc_physical);
+    const media_present = try validateMediaAggregate(&media_body, &native_physical_body, &webrtc_physical_body, candidate.pid);
+    if ((media.graph != null) != (media.native_physical != null) or
+        (media.graph != null) != (media.webrtc_physical != null) or
+        (try media_mod.validateFrame(&media_body, .graph, candidate.pid)) != (media.graph != null))
+        return error.InvalidManifest;
+    const active_native_udp_body = if (active_udp.native) |prepared| prepared.body else active_udp_mod.absentFrame(.native);
+    const active_webrtc_udp_body = if (active_udp.webrtc) |prepared| prepared.body else active_udp_mod.absentFrame(.webrtc);
+    try validateActiveMediaUdpAggregate(&active_native_udp_body, &active_webrtc_udp_body, media_present, &native_physical_body, &webrtc_physical_body, &webrtc_body, &native_body, candidate.pid);
+    if ((active_udp.native != null) != media_present or (active_udp.webrtc != null) != media_present)
+        return error.InvalidManifest;
+    const active_body = if (active_webtransport) |prepared| prepared.body else active_wt_mod.absentFrame();
+    if ((try active_wt_mod.validateFrame(&active_body, candidate.pid)) != (active_webtransport != null) or
+        (active_webtransport != null and udp.webtransport != null)) return error.InvalidManifest;
+    return sendToWithWalDigestMetricsWebhookHistoryUdpMediaAndActiveWebtransport(&candidate.endpoint, candidate.process_handle, candidate.pid, arena, sealer, rows, wal_transfer, expected_digest, metrics_body, webhook_body, history_body, wt_body, webrtc_body, native_body, media_body, native_physical_body, webrtc_physical_body, active_native_udp_body, active_webrtc_udp_body, active_body, deadline);
 }
 
 fn sendTo(endpoint: *control.Endpoint, target_process: usize, target_pid: u32, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, deadline: i64) Error!void {
@@ -392,6 +487,14 @@ fn sendToWithWalDigestMetricsWebhookAndHistory(endpoint: *control.Endpoint, targ
 }
 
 fn sendToWithWalDigestMetricsWebhookHistoryAndUdp(endpoint: *control.Endpoint, target_process: usize, target_pid: u32, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame, wt_body: udp_mod.Frame, webrtc_body: udp_mod.Frame, native_body: udp_mod.Frame, deadline: i64) Error!SentCustody {
+    return sendToWithWalDigestMetricsWebhookHistoryUdpAndMedia(endpoint, target_process, target_pid, arena, sealer, rows, wal_transfer, expected_digest, metrics_body, webhook_body, history_body, wt_body, webrtc_body, native_body, media_mod.absentFrame(.graph), media_mod.absentFrame(.native_physical), media_mod.absentFrame(.webrtc_physical), deadline);
+}
+
+fn sendToWithWalDigestMetricsWebhookHistoryUdpAndMedia(endpoint: *control.Endpoint, target_process: usize, target_pid: u32, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame, wt_body: udp_mod.Frame, webrtc_body: udp_mod.Frame, native_body: udp_mod.Frame, media_body: media_mod.Frame, native_physical_body: media_mod.Frame, webrtc_physical_body: media_mod.Frame, deadline: i64) Error!SentCustody {
+    return sendToWithWalDigestMetricsWebhookHistoryUdpMediaAndActiveWebtransport(endpoint, target_process, target_pid, arena, sealer, rows, wal_transfer, expected_digest, metrics_body, webhook_body, history_body, wt_body, webrtc_body, native_body, media_body, native_physical_body, webrtc_physical_body, active_udp_mod.absentFrame(.native), active_udp_mod.absentFrame(.webrtc), active_wt_mod.absentFrame(), deadline);
+}
+
+fn sendToWithWalDigestMetricsWebhookHistoryUdpMediaAndActiveWebtransport(endpoint: *control.Endpoint, target_process: usize, target_pid: u32, arena: *const arena_mod.Arena, sealer: *const envelope.Sealer, rows: []const SourceRow, wal_transfer: ?*store.WindowsWalTransfer, expected_digest: [32]u8, metrics_body: metrics_mod.Frame, webhook_body: webhook_mod.Frame, history_body: history_mod.Frame, wt_body: udp_mod.Frame, webrtc_body: udp_mod.Frame, native_body: udp_mod.Frame, media_body: media_mod.Frame, native_physical_body: media_mod.Frame, webrtc_physical_body: media_mod.Frame, active_native_udp_body: active_udp_mod.Frame, active_webrtc_udp_body: active_udp_mod.Frame, active_webtransport_body: active_wt_mod.Frame, deadline: i64) Error!SentCustody {
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
     if (target_process == 0 or target_pid == 0 or GetProcessId(target_process) != target_pid or
         endpoint.role != .parent or !sealer.sealed or
@@ -406,6 +509,17 @@ fn sendToWithWalDigestMetricsWebhookHistoryAndUdp(endpoint: *control.Endpoint, t
     _ = try udp_mod.validateFrame(&wt_body, .webtransport, target_pid);
     _ = try udp_mod.validateFrame(&webrtc_body, .media, target_pid);
     _ = try udp_mod.validateFrame(&native_body, .native_media, target_pid);
+    const media_present = try validateMediaAggregate(&media_body, &native_physical_body, &webrtc_physical_body, target_pid);
+    try validateActiveMediaUdpAggregate(&active_native_udp_body, &active_webrtc_udp_body, media_present, &native_physical_body, &webrtc_physical_body, &webrtc_body, &native_body, target_pid);
+    const active_present = try active_wt_mod.validateFrame(&active_webtransport_body, target_pid);
+    if (active_present and try udp_mod.validateFrame(&wt_body, .webtransport, target_pid)) return error.InvalidManifest;
+    if (active_present) {
+        const active_handle = std.mem.readInt(u64, active_webtransport_body[16..24], .big);
+        for ([_]media_mod.Frame{ media_body, native_physical_body, webrtc_physical_body }) |frame| {
+            if (frame[7] == 1 and std.mem.readInt(u64, frame[16..24], .big) == active_handle)
+                return error.InvalidManifest;
+        }
+    }
     // The child owns this duplicate. On any later error the public caller
     // terminates/reaps that child; never close a possibly reused remote value.
     const remote_handle = try arena.duplicateReadOnlyForProcess(target_process);
@@ -497,6 +611,28 @@ fn sendToWithWalDigestMetricsWebhookHistoryAndUdp(endpoint: *control.Endpoint, t
             return err;
         };
     }
+    for ([_]media_mod.Frame{ media_body, native_physical_body, webrtc_physical_body }, 0..) |frame, index| {
+        endpoint.send(.media_custody, &frame, deadline) catch |err| {
+            std.debug.print("onyx-server: Windows Helix media custody send failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        awaitAck(endpoint, .media_custody, index + 1, 3, deadline) catch |err| {
+            std.debug.print("onyx-server: Windows Helix media custody ACK failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+    }
+    for ([_]active_udp_mod.Frame{ active_native_udp_body, active_webrtc_udp_body }, 0..) |frame, index| {
+        try endpoint.send(.active_media_udp_custody, &frame, deadline);
+        try awaitAck(endpoint, .active_media_udp_custody, index + 1, 2, deadline);
+    }
+    endpoint.send(.webtransport_custody, &active_webtransport_body, deadline) catch |err| {
+        std.debug.print("onyx-server: Windows Helix active WebTransport custody send failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    awaitAck(endpoint, .webtransport_custody, 1, 1, deadline) catch |err| {
+        std.debug.print("onyx-server: Windows Helix active WebTransport custody ACK failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
     return .{
         .wal = if (wal_transfer) |transfer| transfer.release() else null,
         .metrics_body = metrics_body,
@@ -505,6 +641,12 @@ fn sendToWithWalDigestMetricsWebhookHistoryAndUdp(endpoint: *control.Endpoint, t
         .webtransport_udp_body = wt_body,
         .webrtc_media_udp_body = webrtc_body,
         .native_media_udp_body = native_body,
+        .media_graph_body = media_body,
+        .native_physical_body = native_physical_body,
+        .webrtc_physical_body = webrtc_physical_body,
+        .active_native_udp_body = active_native_udp_body,
+        .active_webrtc_udp_body = active_webrtc_udp_body,
+        .active_webtransport_body = active_webtransport_body,
     };
 }
 
@@ -537,6 +679,24 @@ pub const Incoming = struct {
     webrtc_media_udp_body: udp_mod.Frame = udp_mod.absentFrame(.media),
     native_media_udp: ?udp_mod.ReceivedNative = null,
     native_media_udp_body: udp_mod.Frame = udp_mod.absentFrame(.native_media),
+    media_graph_receiver: ?media_mod.Receiver = null,
+    media_graph_body: media_mod.Frame = media_mod.absentFrame(.graph),
+    media_graph_consumed: bool = false,
+    native_physical_receiver: ?media_mod.Receiver = null,
+    native_physical_body: media_mod.Frame = media_mod.absentFrame(.native_physical),
+    native_physical_consumed: bool = false,
+    webrtc_physical_receiver: ?media_mod.Receiver = null,
+    webrtc_physical_body: media_mod.Frame = media_mod.absentFrame(.webrtc_physical),
+    webrtc_physical_consumed: bool = false,
+    active_native_udp_receiver: ?active_udp_mod.Receiver = null,
+    active_native_udp_body: active_udp_mod.Frame = active_udp_mod.absentFrame(.native),
+    active_native_udp_consumed: bool = false,
+    active_webrtc_udp_receiver: ?active_udp_mod.Receiver = null,
+    active_webrtc_udp_body: active_udp_mod.Frame = active_udp_mod.absentFrame(.webrtc),
+    active_webrtc_udp_consumed: bool = false,
+    active_webtransport_receiver: ?active_wt_mod.Receiver = null,
+    active_webtransport_body: active_wt_mod.Frame = active_wt_mod.absentFrame(),
+    active_webtransport_consumed: bool = false,
     stage_attempted: bool = false,
     staged_count: usize = 0,
     release_confirmed: bool = false,
@@ -550,6 +710,12 @@ pub const Incoming = struct {
         if (self.webtransport_udp) |*received| received.deinit();
         if (self.webrtc_media_udp) |*received| received.deinit();
         if (self.native_media_udp) |*received| received.deinit();
+        if (self.media_graph_receiver) |*receiver| receiver.deinit();
+        if (self.native_physical_receiver) |*receiver| receiver.deinit();
+        if (self.webrtc_physical_receiver) |*receiver| receiver.deinit();
+        if (self.active_native_udp_receiver) |*receiver| receiver.deinit();
+        if (self.active_webrtc_udp_receiver) |*receiver| receiver.deinit();
+        if (self.active_webtransport_receiver) |*receiver| receiver.deinit();
         for (self.rows) |*row| std.crypto.secureZero(u8, std.mem.asBytes(&row.transfer.info));
         self.allocator.free(self.rows);
         std.crypto.secureZero(u8, self.plaintext);
@@ -563,6 +729,12 @@ pub const Incoming = struct {
         self.webtransport_udp = null;
         self.webrtc_media_udp = null;
         self.native_media_udp = null;
+        self.media_graph_receiver = null;
+        self.native_physical_receiver = null;
+        self.webrtc_physical_receiver = null;
+        self.active_native_udp_receiver = null;
+        self.active_webrtc_udp_receiver = null;
+        self.active_webtransport_receiver = null;
         std.crypto.secureZero(u8, &self.wal_body);
         std.crypto.secureZero(u8, &self.source_digest);
         std.crypto.secureZero(u8, &self.metrics_body);
@@ -571,6 +743,87 @@ pub const Incoming = struct {
         std.crypto.secureZero(u8, &self.webtransport_udp_body);
         std.crypto.secureZero(u8, &self.webrtc_media_udp_body);
         std.crypto.secureZero(u8, &self.native_media_udp_body);
+        std.crypto.secureZero(u8, &self.media_graph_body);
+        std.crypto.secureZero(u8, &self.native_physical_body);
+        std.crypto.secureZero(u8, &self.webrtc_physical_body);
+        std.crypto.secureZero(u8, &self.active_native_udp_body);
+        std.crypto.secureZero(u8, &self.active_webrtc_udp_body);
+        std.crypto.secureZero(u8, &self.active_webtransport_body);
+        self.media_graph_consumed = false;
+        self.native_physical_consumed = false;
+        self.webrtc_physical_consumed = false;
+        self.active_native_udp_consumed = false;
+        self.active_webrtc_udp_consumed = false;
+        self.active_webtransport_consumed = false;
+    }
+
+    /// A present graph body is consumed only after authenticated decode succeeds.
+    pub fn takeMediaGraph(self: *Incoming, allocator: std.mem.Allocator) Error!?media_graph.Snapshot {
+        const receiver = if (self.media_graph_receiver) |*value| value else return null;
+        const snapshot = (try receiver.takeGraph(allocator, self.identity.upgrade_id)) orelse return error.InvalidManifest;
+        self.media_graph_consumed = true;
+        return snapshot;
+    }
+
+    pub fn takeMediaNative(self: *Incoming, allocator: std.mem.Allocator, limits: media_physical.Limits) Error!?native_media.PhysicalSnapshot {
+        const receiver = if (self.native_physical_receiver) |*value| value else return null;
+        const snapshot = (try receiver.takeNative(allocator, self.identity.upgrade_id, limits)) orelse return error.InvalidManifest;
+        self.native_physical_consumed = true;
+        return snapshot;
+    }
+
+    pub fn takeMediaWebrtc(self: *Incoming, allocator: std.mem.Allocator, limits: webrtc_media.PhysicalSnapshot.Limits) Error!?webrtc_media.PhysicalSnapshot {
+        const receiver = if (self.webrtc_physical_receiver) |*value| value else return null;
+        const snapshot = (try receiver.takeWebrtc(allocator, self.identity.upgrade_id, limits)) orelse return error.InvalidManifest;
+        self.webrtc_physical_consumed = true;
+        return snapshot;
+    }
+
+    pub fn takeActiveNativeUdp(self: *Incoming, allocator: std.mem.Allocator) Error!?active_udp_mod.NativeReceived {
+        const receiver = if (self.active_native_udp_receiver) |*value| value else return null;
+        const received = (try receiver.takeNative(allocator, self.identity.upgrade_id, &self.native_physical_body)) orelse return error.InvalidManifest;
+        self.active_native_udp_consumed = true;
+        return received;
+    }
+
+    pub fn takeActiveWebrtcUdp(self: *Incoming, allocator: std.mem.Allocator, carry: *const webrtc_media.PhysicalSnapshot) Error!?active_udp_mod.WebrtcReceived {
+        const receiver = if (self.active_webrtc_udp_receiver) |*value| value else return null;
+        const received = (try receiver.takeWebrtc(allocator, self.identity.upgrade_id, &self.webrtc_physical_body, carry)) orelse return error.InvalidManifest;
+        self.active_webrtc_udp_consumed = true;
+        return received;
+    }
+
+    /// READY requires all three present bodies to have been decoded through
+    /// the typed one-use helpers. An absent aggregate requires no receiver.
+    pub fn mediaCustodyReady(self: *const Incoming) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+        const present = validateMediaAggregate(&self.media_graph_body, &self.native_physical_body, &self.webrtc_physical_body, GetCurrentProcessId()) catch return false;
+        if (!present) return self.media_graph_receiver == null and self.native_physical_receiver == null and self.webrtc_physical_receiver == null and
+            self.active_native_udp_receiver == null and self.active_webrtc_udp_receiver == null and
+            !self.media_graph_consumed and !self.native_physical_consumed and !self.webrtc_physical_consumed and
+            !self.active_native_udp_consumed and !self.active_webrtc_udp_consumed;
+        return self.media_graph_receiver != null and self.native_physical_receiver != null and self.webrtc_physical_receiver != null and
+            self.active_native_udp_receiver != null and self.active_webrtc_udp_receiver != null and
+            self.media_graph_consumed and self.native_physical_consumed and self.webrtc_physical_consumed and
+            self.active_native_udp_consumed and self.active_webrtc_udp_consumed and
+            self.active_native_udp_receiver.?.imported() and self.active_webrtc_udp_receiver.?.imported();
+    }
+
+    /// Decode after the candidate has loaded and verified its TLS material.
+    /// The caller owns the returned detached body and its imported-socket join.
+    pub fn takeActiveWebtransport(self: *Incoming, allocator: std.mem.Allocator, tls: webtransport_listener.TlsConfig) Error!?active_wt_codec.Body {
+        const receiver = if (self.active_webtransport_receiver) |*value| value else return null;
+        const body = (try receiver.take(allocator, tls, self.identity.upgrade_id)) orelse return error.InvalidManifest;
+        self.active_webtransport_consumed = true;
+        return body;
+    }
+
+    pub fn activeWebtransportCustodyReady(self: *const Incoming) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+        const present = active_wt_mod.validateFrame(&self.active_webtransport_body, GetCurrentProcessId()) catch return false;
+        if (present and self.webtransport_udp != null) return false;
+        if (!present) return self.active_webtransport_receiver == null and !self.active_webtransport_consumed;
+        return self.active_webtransport_receiver != null and self.active_webtransport_consumed;
     }
 
     /// The exact-ID registry accepts these only before ordinary registrations.
@@ -741,7 +994,71 @@ pub fn receive(allocator: std.mem.Allocator, endpoint: *control.Endpoint, deadli
         webrtc != null and native != null and webrtc.?.transfer.source_socket == native.?.transfer.source_socket)
         return error.InvalidManifest;
     try sendAck(endpoint, .udp_custody, 3, 3, deadline);
-    return .{ .allocator = allocator, .identity = endpoint.identity, .plaintext = plaintext, .rows = rows, .wal = wal, .wal_body = wal_body, .source_digest = source_digest, .metrics = companion, .metrics_body = metrics_body, .webhook = webhook, .webhook_body = webhook_body, .history = history, .history_body = history_body, .webtransport_udp = wt, .webtransport_udp_body = wt_body, .webrtc_media_udp = webrtc, .webrtc_media_udp_body = webrtc_body, .native_media_udp = native, .native_media_udp_body = native_body };
+    var graph_message = try endpoint.receive(deadline);
+    defer graph_message.deinit();
+    if (graph_message.kind != .media_custody or graph_message.bytes().len != media_mod.frame_len) return error.InvalidManifest;
+    const graph_body: media_mod.Frame = graph_message.bytes()[0..media_mod.frame_len].*;
+    const graph_present = try media_mod.validateFrame(&graph_body, .graph, GetCurrentProcessId());
+    var graph_receiver: ?media_mod.Receiver = if (graph_present) try media_mod.Receiver.init(&graph_body, .graph, &forbidden) else null;
+    errdefer if (graph_receiver) |*receiver| receiver.deinit();
+    try sendAck(endpoint, .media_custody, 1, 3, deadline);
+
+    var native_physical_message = try endpoint.receive(deadline);
+    defer native_physical_message.deinit();
+    if (native_physical_message.kind != .media_custody or native_physical_message.bytes().len != media_mod.frame_len) return error.InvalidManifest;
+    const native_physical_body: media_mod.Frame = native_physical_message.bytes()[0..media_mod.frame_len].*;
+    const native_physical_present = try media_mod.validateFrame(&native_physical_body, .native_physical, GetCurrentProcessId());
+    const graph_handle: usize = if (graph_present) @intCast(std.mem.readInt(u64, graph_body[16..24], .big)) else 0;
+    const native_forbidden = [_]usize{ endpoint.read_handle, endpoint.write_handle, header.handle, if (wal) |descriptor| descriptor.handle else 0, graph_handle };
+    var native_physical_receiver: ?media_mod.Receiver = if (native_physical_present) try media_mod.Receiver.init(&native_physical_body, .native_physical, &native_forbidden) else null;
+    errdefer if (native_physical_receiver) |*receiver| receiver.deinit();
+    try sendAck(endpoint, .media_custody, 2, 3, deadline);
+
+    var webrtc_physical_message = try endpoint.receive(deadline);
+    defer webrtc_physical_message.deinit();
+    if (webrtc_physical_message.kind != .media_custody or webrtc_physical_message.bytes().len != media_mod.frame_len) return error.InvalidManifest;
+    const webrtc_physical_body: media_mod.Frame = webrtc_physical_message.bytes()[0..media_mod.frame_len].*;
+    const webrtc_physical_present = try media_mod.validateFrame(&webrtc_physical_body, .webrtc_physical, GetCurrentProcessId());
+    const native_physical_handle: usize = if (native_physical_present) @intCast(std.mem.readInt(u64, native_physical_body[16..24], .big)) else 0;
+    const webrtc_forbidden = [_]usize{ endpoint.read_handle, endpoint.write_handle, header.handle, if (wal) |descriptor| descriptor.handle else 0, graph_handle, native_physical_handle };
+    var webrtc_physical_receiver: ?media_mod.Receiver = if (webrtc_physical_present) try media_mod.Receiver.init(&webrtc_physical_body, .webrtc_physical, &webrtc_forbidden) else null;
+    errdefer if (webrtc_physical_receiver) |*receiver| receiver.deinit();
+    const media_present = try validateMediaAggregate(&graph_body, &native_physical_body, &webrtc_physical_body, GetCurrentProcessId());
+    try sendAck(endpoint, .media_custody, 3, 3, deadline);
+    var active_native_udp_message = try endpoint.receive(deadline);
+    defer active_native_udp_message.deinit();
+    if (active_native_udp_message.kind != .active_media_udp_custody or active_native_udp_message.bytes().len != active_udp_mod.frame_len) return error.InvalidManifest;
+    const active_native_udp_body: active_udp_mod.Frame = active_native_udp_message.bytes()[0..active_udp_mod.frame_len].*;
+    const active_native_present = try active_udp_mod.validateFrame(&active_native_udp_body, .native, GetCurrentProcessId());
+    const webrtc_physical_handle: usize = if (webrtc_physical_present) @intCast(std.mem.readInt(u64, webrtc_physical_body[16..24], .big)) else 0;
+    const active_native_forbidden = [_]usize{ endpoint.read_handle, endpoint.write_handle, header.handle, if (wal) |descriptor| descriptor.handle else 0, graph_handle, native_physical_handle, webrtc_physical_handle };
+    var active_native_receiver: ?active_udp_mod.Receiver = if (active_native_present) try active_udp_mod.Receiver.init(&active_native_udp_body, .native, &active_native_forbidden) else null;
+    errdefer if (active_native_receiver) |*receiver| receiver.deinit();
+    try sendAck(endpoint, .active_media_udp_custody, 1, 2, deadline);
+
+    var active_webrtc_udp_message = try endpoint.receive(deadline);
+    defer active_webrtc_udp_message.deinit();
+    if (active_webrtc_udp_message.kind != .active_media_udp_custody or active_webrtc_udp_message.bytes().len != active_udp_mod.frame_len) return error.InvalidManifest;
+    const active_webrtc_udp_body: active_udp_mod.Frame = active_webrtc_udp_message.bytes()[0..active_udp_mod.frame_len].*;
+    const active_webrtc_present = try active_udp_mod.validateFrame(&active_webrtc_udp_body, .webrtc, GetCurrentProcessId());
+    const active_native_handle: usize = if (active_native_present) @intCast(std.mem.readInt(u64, active_native_udp_body[16..24], .big)) else 0;
+    const active_webrtc_forbidden = [_]usize{ endpoint.read_handle, endpoint.write_handle, header.handle, if (wal) |descriptor| descriptor.handle else 0, graph_handle, native_physical_handle, webrtc_physical_handle, active_native_handle };
+    var active_webrtc_receiver: ?active_udp_mod.Receiver = if (active_webrtc_present) try active_udp_mod.Receiver.init(&active_webrtc_udp_body, .webrtc, &active_webrtc_forbidden) else null;
+    errdefer if (active_webrtc_receiver) |*receiver| receiver.deinit();
+    try validateActiveMediaUdpAggregate(&active_native_udp_body, &active_webrtc_udp_body, media_present, &native_physical_body, &webrtc_physical_body, &webrtc_body, &native_body, GetCurrentProcessId());
+    try sendAck(endpoint, .active_media_udp_custody, 2, 2, deadline);
+    var active_message = try endpoint.receive(deadline);
+    defer active_message.deinit();
+    if (active_message.kind != .webtransport_custody or active_message.bytes().len != active_wt_mod.frame_len) return error.InvalidManifest;
+    const active_body: active_wt_mod.Frame = active_message.bytes()[0..active_wt_mod.frame_len].*;
+    const active_present = try active_wt_mod.validateFrame(&active_body, GetCurrentProcessId());
+    if (active_present and wt != null) return error.InvalidManifest;
+    const active_webrtc_handle: usize = if (active_webrtc_present) @intCast(std.mem.readInt(u64, active_webrtc_udp_body[16..24], .big)) else 0;
+    const active_forbidden = [_]usize{ endpoint.read_handle, endpoint.write_handle, header.handle, if (wal) |descriptor| descriptor.handle else 0, graph_handle, native_physical_handle, webrtc_physical_handle, active_native_handle, active_webrtc_handle };
+    var active_receiver: ?active_wt_mod.Receiver = if (active_present) try active_wt_mod.Receiver.init(&active_body, &active_forbidden) else null;
+    errdefer if (active_receiver) |*receiver| receiver.deinit();
+    try sendAck(endpoint, .webtransport_custody, 1, 1, deadline);
+    return .{ .allocator = allocator, .identity = endpoint.identity, .plaintext = plaintext, .rows = rows, .wal = wal, .wal_body = wal_body, .source_digest = source_digest, .metrics = companion, .metrics_body = metrics_body, .webhook = webhook, .webhook_body = webhook_body, .history = history, .history_body = history_body, .webtransport_udp = wt, .webtransport_udp_body = wt_body, .webrtc_media_udp = webrtc, .webrtc_media_udp_body = webrtc_body, .native_media_udp = native, .native_media_udp_body = native_body, .media_graph_receiver = graph_receiver, .media_graph_body = graph_body, .native_physical_receiver = native_physical_receiver, .native_physical_body = native_physical_body, .webrtc_physical_receiver = webrtc_physical_receiver, .webrtc_physical_body = webrtc_physical_body, .active_native_udp_receiver = active_native_receiver, .active_native_udp_body = active_native_udp_body, .active_webrtc_udp_receiver = active_webrtc_receiver, .active_webrtc_udp_body = active_webrtc_udp_body, .active_webtransport_receiver = active_receiver, .active_webtransport_body = active_body };
 }
 
 test "Windows Helix typed record rejects malformed, duplicate and out-of-order socket IDs" {
@@ -766,6 +1083,88 @@ test "Windows Helix typed record rejects malformed, duplicate and out-of-order s
     wire[8] = 1;
     wire[6] = 255;
     try std.testing.expectError(error.InvalidManifest, decodeRow(&wire, 0));
+}
+
+test "Windows Helix media custody aggregate rejects partial wrong-kind and handle replay" {
+    const pid: u32 = 73;
+    const absent_graph = media_mod.absentFrame(.graph);
+    const absent_native = media_mod.absentFrame(.native_physical);
+    const absent_webrtc = media_mod.absentFrame(.webrtc_physical);
+    try std.testing.expect(!(try validateMediaAggregate(&absent_graph, &absent_native, &absent_webrtc, pid)));
+    const Fake = struct {
+        fn frame(kind: media_mod.Kind, target_pid: u32, handle: u64) media_mod.Frame {
+            var body = media_mod.absentFrame(kind);
+            body[7] = 1;
+            std.mem.writeInt(u32, body[8..12], target_pid, .big);
+            std.mem.writeInt(u64, body[16..24], handle, .big);
+            std.mem.writeInt(u64, body[24..32], envelope.header_len + envelope.tag_len + 1, .big);
+            @memset(body[32..64], 0x51);
+            @memset(body[64..96], 0x72);
+            return body;
+        }
+    };
+    const graph = Fake.frame(.graph, pid, 101);
+    const native = Fake.frame(.native_physical, pid, 102);
+    var webrtc = Fake.frame(.webrtc_physical, pid, 103);
+    try std.testing.expect(try validateMediaAggregate(&graph, &native, &webrtc, pid));
+    try std.testing.expectError(error.InvalidManifest, validateMediaAggregate(&graph, &native, &absent_webrtc, pid));
+    try std.testing.expectError(error.InvalidFrame, validateMediaAggregate(&graph, &webrtc, &native, pid));
+    std.mem.writeInt(u64, webrtc[16..24], 102, .big);
+    try std.testing.expectError(error.InvalidManifest, validateMediaAggregate(&graph, &native, &webrtc, pid));
+    try std.testing.expectError(error.InvalidFrame, validateMediaAggregate(&graph, &native, &webrtc, pid + 1));
+    const ack = ackBody(.media_custody, 2, 3);
+    try std.testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, ack[6..8], .big));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, ack[8..12], .big));
+}
+
+test "Windows Helix active media UDP aggregate requires both exact transfers" {
+    const pid: u32 = 73;
+    const udp_socket = @import("native_windows_udp_socket.zig");
+    const absent_native = active_udp_mod.absentFrame(.native);
+    const absent_webrtc = active_udp_mod.absentFrame(.webrtc);
+    const idle_webrtc = udp_mod.absentFrame(.media);
+    const idle_native = udp_mod.absentFrame(.native_media);
+    const absent_hxna = media_mod.absentFrame(.native_physical);
+    const absent_hxwa = media_mod.absentFrame(.webrtc_physical);
+    try validateActiveMediaUdpAggregate(&absent_native, &absent_webrtc, false, &absent_hxna, &absent_hxwa, &idle_webrtc, &idle_native, pid);
+    const Fake = struct {
+        fn media(kind: media_mod.Kind, handle: u64, target_pid: u32) media_mod.Frame {
+            var frame = media_mod.absentFrame(kind);
+            frame[7] = 1;
+            std.mem.writeInt(u32, frame[8..12], target_pid, .big);
+            std.mem.writeInt(u64, frame[16..24], handle, .big);
+            std.mem.writeInt(u64, frame[24..32], envelope.header_len + envelope.tag_len + 1, .big);
+            return frame;
+        }
+        fn active(kind: active_udp_mod.Kind, handle: u64, source_socket: usize, target_pid: u32) !active_udp_mod.Frame {
+            var frame = active_udp_mod.absentFrame(kind);
+            frame[7] = 1;
+            std.mem.writeInt(u32, frame[8..12], target_pid, .big);
+            std.mem.writeInt(u64, frame[16..24], handle, .big);
+            std.mem.writeInt(u64, frame[24..32], envelope.header_len + envelope.tag_len + 128, .big);
+            var transfer = udp_socket.Transfer{ .info = std.mem.zeroes(udp_socket.ProtocolInfo), .source_socket = source_socket, .target_pid = target_pid };
+            transfer.info.address_family = 2;
+            transfer.info.socket_type = 2;
+            transfer.info.protocol = 17;
+            const socket_frame = try udp_socket.encodeFrame(&transfer, if (kind == .native) .native_media else .media);
+            @memcpy(frame[96..], &socket_frame);
+            return frame;
+        }
+    };
+    const hxna = Fake.media(.native_physical, 101, pid);
+    const hxwa = Fake.media(.webrtc_physical, 102, pid);
+    var native_frame = try Fake.active(.native, 103, 71, pid);
+    var webrtc_frame = try Fake.active(.webrtc, 104, 72, pid);
+    try validateActiveMediaUdpAggregate(&native_frame, &webrtc_frame, true, &hxna, &hxwa, &idle_webrtc, &idle_native, pid);
+    try std.testing.expectError(error.InvalidManifest, validateActiveMediaUdpAggregate(&native_frame, &absent_webrtc, true, &hxna, &hxwa, &idle_webrtc, &idle_native, pid));
+    std.mem.writeInt(u64, webrtc_frame[16..24], 103, .big);
+    try std.testing.expectError(error.InvalidManifest, validateActiveMediaUdpAggregate(&native_frame, &webrtc_frame, true, &hxna, &hxwa, &idle_webrtc, &idle_native, pid));
+    std.mem.writeInt(u64, webrtc_frame[16..24], 104, .big);
+    std.mem.writeInt(u64, webrtc_frame[96 + 12 .. 96 + 20], 71, .big);
+    try std.testing.expectError(error.InvalidManifest, validateActiveMediaUdpAggregate(&native_frame, &webrtc_frame, true, &hxna, &hxwa, &idle_webrtc, &idle_native, pid));
+    std.mem.writeInt(u64, webrtc_frame[96 + 12 .. 96 + 20], 72, .big);
+    native_frame[6] = 2;
+    try std.testing.expectError(error.InvalidFrame, validateActiveMediaUdpAggregate(&native_frame, &webrtc_frame, true, &hxna, &hxwa, &idle_webrtc, &idle_native, pid));
 }
 
 test "Windows Helix transfer header bounds precede mapping and socket allocation" {

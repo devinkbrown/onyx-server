@@ -21,6 +21,74 @@ const metrics_mod = @import("native_windows_metrics.zig");
 const webhook_mod = @import("native_windows_webhook.zig");
 const history_mod = @import("native_windows_history.zig");
 const udp_mod = @import("native_windows_udp_custody.zig");
+const active_wt_custody = @import("native_windows_active_webtransport_custody.zig");
+const media_custody = @import("native_windows_media_custody.zig");
+const active_media_udp = @import("native_windows_active_media_udp_custody.zig");
+
+/// The three detached media bodies must describe the same physical endpoints
+/// before any one of them is sealed for the candidate. Socket continuity and
+/// publication remain separate, guarded transaction steps.
+fn validateActiveMediaSource(source: server.NativeWindowsActiveMediaCarry) !void {
+    try source.native_owner.runtime.pause.requirePaused(source.native_token);
+    try source.webrtc_owner.runtime.pause.requirePaused(source.webrtc_token);
+    try source.native_transport.validate();
+    const native_socket = source.native_owner.socket orelse return error.InvalidSnapshot;
+    const webrtc_socket = source.webrtc_owner.socket orelse return error.InvalidSnapshot;
+    if (source.native_transport.socket.device != native_socket.fd or source.webrtc.socket.device != webrtc_socket.fd or
+        source.native_transport.socket.inode != 0 or source.webrtc.socket.inode != 0 or
+        native_socket.fd == webrtc_socket.fd) return error.InvalidSnapshot;
+    try source.graph.validate();
+    try source.native.validate(source.native_limits.max_participants, source.native_limits.max_state_bytes);
+    try source.webrtc.validate(source.webrtc_limits);
+    const physical_count = std.math.add(usize, source.native.endpoints.len, source.webrtc.rows.len) catch return error.InvalidSnapshot;
+    if (source.graph.graph.endpoints.len != physical_count) {
+        std.debug.print("onyx-server: Windows active media endpoint count mismatch: graph={d} native={d} webrtc={d}\n", .{ source.graph.graph.endpoints.len, source.native.endpoints.len, source.webrtc.rows.len });
+        return error.InvalidSnapshot;
+    }
+    for (source.graph.graph.endpoints, 0..) |endpoint, endpoint_index| {
+        var profile_count: usize = 0;
+        for (source.graph.rooms.physical_profiles) |profile| if (std.meta.eql(profile.key, endpoint.key)) {
+            profile_count += 1;
+        };
+        if (profile_count != 1) {
+            std.debug.print("onyx-server: Windows active media graph endpoint {d} ({s}) has {d} room profiles\n", .{ endpoint_index, @tagName(endpoint.key.leg), profile_count });
+            return error.InvalidSnapshot;
+        }
+        var physical_matches: usize = 0;
+        switch (endpoint.key.leg) {
+            .native => for (source.native.endpoints) |physical| if (std.meta.eql(physical.key, endpoint.key)) {
+                if (!std.meta.eql(physical.identity, endpoint.row.observation)) {
+                    std.debug.print("onyx-server: Windows active media native endpoint {d} observation mismatch\n", .{endpoint_index});
+                    return error.InvalidSnapshot;
+                }
+                for (source.graph.rooms.physical_profiles) |profile| if (std.meta.eql(profile.key, endpoint.key) and
+                    !profile.profile.eql(physical.profile))
+                {
+                    std.debug.print("onyx-server: Windows active media native endpoint {d} negotiated profile mismatch\n", .{endpoint_index});
+                    return error.InvalidSnapshot;
+                };
+                physical_matches += 1;
+            },
+            .webrtc => for (source.webrtc.rows) |physical| if (std.meta.eql(physical.key, endpoint.key)) {
+                if (!std.meta.eql(physical.identity, endpoint.row.observation)) {
+                    std.debug.print("onyx-server: Windows active media WebRTC endpoint {d} observation mismatch\n", .{endpoint_index});
+                    return error.InvalidSnapshot;
+                }
+                for (source.graph.rooms.physical_profiles) |profile| if (std.meta.eql(profile.key, endpoint.key) and
+                    !profile.profile.eql(physical.profile))
+                {
+                    std.debug.print("onyx-server: Windows active media WebRTC endpoint {d} negotiated profile mismatch\n", .{endpoint_index});
+                    return error.InvalidSnapshot;
+                };
+                physical_matches += 1;
+            },
+        }
+        if (physical_matches != 1) {
+            std.debug.print("onyx-server: Windows active media graph endpoint {d} ({s}) has {d} physical rows\n", .{ endpoint_index, @tagName(endpoint.key.leg), physical_matches });
+            return error.InvalidSnapshot;
+        }
+    }
+}
 
 pub const timeout_ms: i64 = 30_000;
 
@@ -175,6 +243,26 @@ pub const Driver = struct {
         defer if (wt_prepared) |*prepared| prepared.deinit();
         if (snapshot.windows_udp.webtransport) |source|
             wt_prepared = try udp_mod.prepareWebtransport(self.allocator, .{ .owner = source.owner, .carry = source.carry, .pause_token = source.pause_token }, candidate.process_handle, candidate.pid, candidate.identity.upgrade_id);
+        if (wt_prepared != null and snapshot.windows_active_webtransport != null) return error.InvalidSnapshot;
+        var wt_active_prepared: ?active_wt_custody.Prepared = null;
+        defer if (wt_active_prepared) |*prepared| prepared.deinit();
+        if (snapshot.windows_active_webtransport) |source| {
+            var accepted: std.ArrayList(active_wt_custody.AcceptedIrcSocket) = .empty;
+            defer accepted.deinit(self.allocator);
+            for (rows) |row| {
+                if (row.role != .client) continue;
+                try accepted.append(self.allocator, try active_wt_custody.observeAcceptedIrcSocket(@intCast(row.canonical)));
+            }
+            wt_active_prepared = try active_wt_custody.prepare(
+                self.allocator,
+                source.owner,
+                source.pause_token,
+                accepted.items,
+                candidate.process_handle,
+                candidate.pid,
+                candidate.identity.upgrade_id,
+            );
+        }
         if ((snapshot.windows_udp.webrtc_media != null) != (snapshot.windows_udp.native_media != null) or
             (snapshot.windows_udp.media_domain != null) != (snapshot.windows_udp.webrtc_media != null))
             return error.InvalidSnapshot;
@@ -193,7 +281,44 @@ pub const Driver = struct {
         defer if (native_prepared) |*prepared| prepared.deinit();
         if (snapshot.windows_udp.native_media) |source|
             native_prepared = try udp_mod.prepareNative(self.allocator, .{ .owner = source.owner, .carry = source.carry, .pause_token = source.pause_token, .pristine = media_proof }, candidate.process_handle, candidate.pid, candidate.identity.upgrade_id);
-        var sent = try bootstrap.sendWithWalDigestMetricsWebhookHistoryAndUdp(
+        var graph_prepared: ?media_custody.Prepared = null;
+        defer if (graph_prepared) |*prepared| prepared.deinit();
+        var native_physical_prepared: ?media_custody.Prepared = null;
+        defer if (native_physical_prepared) |*prepared| prepared.deinit();
+        var webrtc_physical_prepared: ?media_custody.Prepared = null;
+        defer if (webrtc_physical_prepared) |*prepared| prepared.deinit();
+        var active_native_udp_prepared: ?active_media_udp.Prepared = null;
+        defer if (active_native_udp_prepared) |*prepared| prepared.deinit();
+        var active_webrtc_udp_prepared: ?active_media_udp.Prepared = null;
+        defer if (active_webrtc_udp_prepared) |*prepared| prepared.deinit();
+        if (snapshot.windows_active_media) |source| {
+            if (media_proof != null) return error.InvalidSnapshot;
+            validateActiveMediaSource(source) catch |err| {
+                std.debug.print("onyx-server: Windows active media source join rejected: {s}\n", .{@errorName(err)});
+                return err;
+            };
+            graph_prepared = media_custody.prepareGraph(self.allocator, source.graph, candidate.process_handle, candidate.pid, candidate.identity.upgrade_id) catch |err| {
+                std.debug.print("onyx-server: Windows active media HXMG preparation failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+            native_physical_prepared = media_custody.prepareNative(self.allocator, source.native, source.native_limits, candidate.process_handle, candidate.pid, candidate.identity.upgrade_id) catch |err| {
+                std.debug.print("onyx-server: Windows active media HXNA preparation failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+            webrtc_physical_prepared = media_custody.prepareWebrtc(self.allocator, source.webrtc, source.webrtc_limits, candidate.process_handle, candidate.pid, candidate.identity.upgrade_id) catch |err| {
+                std.debug.print("onyx-server: Windows active media HXWA preparation failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+            active_native_udp_prepared = active_media_udp.prepareNative(self.allocator, source.native_transport, &native_physical_prepared.?.body, candidate.process_handle, candidate.pid, candidate.identity.upgrade_id) catch |err| {
+                std.debug.print("onyx-server: Windows active media native HXAU preparation failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+            active_webrtc_udp_prepared = active_media_udp.prepareWebrtc(self.allocator, source.webrtc, &webrtc_physical_prepared.?.body, candidate.process_handle, candidate.pid, candidate.identity.upgrade_id) catch |err| {
+                std.debug.print("onyx-server: Windows active media WebRTC HXAU preparation failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
+        }
+        var sent = try bootstrap.sendWithWalDigestMetricsWebhookHistoryUdpMediaAndActiveTransfers(
             candidate,
             &arena,
             &sealer,
@@ -208,9 +333,19 @@ pub const Driver = struct {
                 .webrtc_media = if (webrtc_prepared) |*prepared| prepared else null,
                 .native_media = if (native_prepared) |*prepared| prepared else null,
             },
+            .{
+                .graph = if (graph_prepared) |*prepared| prepared else null,
+                .native_physical = if (native_physical_prepared) |*prepared| prepared else null,
+                .webrtc_physical = if (webrtc_physical_prepared) |*prepared| prepared else null,
+            },
+            .{
+                .native = if (active_native_udp_prepared) |*prepared| prepared else null,
+                .webrtc = if (active_webrtc_udp_prepared) |*prepared| prepared else null,
+            },
+            if (wt_active_prepared) |*prepared| prepared else null,
             self.deadline,
         );
-        const digest = try driver.sourceDigestWithWalConfigMetricsWebhookHistoryAndUdp(
+        const digest = try driver.sourceDigestWithWalConfigMetricsWebhookHistoryUdpMediaAndActiveTransfers(
             plaintext.items,
             rows,
             if (sent.wal) |*descriptor| descriptor else null,
@@ -222,6 +357,12 @@ pub const Driver = struct {
             sent.webtransport_udp_body,
             sent.webrtc_media_udp_body,
             sent.native_media_udp_body,
+            sent.media_graph_body,
+            sent.native_physical_body,
+            sent.webrtc_physical_body,
+            sent.active_native_udp_body,
+            sent.active_webrtc_udp_body,
+            sent.active_webtransport_body,
         );
         const ready = driver.parentAwaitReady(candidate, digest, rows.len, self.deadline) catch |err| {
             std.debug.print("onyx-server: Windows Helix READY failed: {s}\n", .{@errorName(err)});

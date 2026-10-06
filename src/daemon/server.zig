@@ -253,6 +253,9 @@ const helix_handoff = @import("helix/handoff.zig");
 const helix_live = @import("helix/live.zig");
 const helix_native_windows_socket = @import("helix/native_windows_socket.zig");
 const helix_native_windows_udp_socket = @import("helix/native_windows_udp_socket.zig");
+const helix_native_windows_active_wt_custody = @import("helix/native_windows_active_webtransport_custody.zig");
+const helix_media_graph = @import("helix/media_graph_checkpoint.zig");
+const helix_active_media = @import("helix/native_windows_active_media_snapshot.zig");
 const handoff_relations = @import("helix/handoff_relations.zig");
 const handoff_manifest = @import("helix/handoff_manifest.zig");
 const world_checkpoint = @import("helix/world_checkpoint.zig");
@@ -1043,6 +1046,391 @@ pub const NativeWindowsWebTransportCarry = struct {
     pause_token: ?@import("runtime_pause.zig").Token = null,
 };
 
+pub const NativeWindowsActiveWebTransportCarry = struct {
+    owner: *managed_wt.WebTransportListener,
+    pause_token: @import("runtime_pause.zig").Token,
+};
+
+pub const NativeWindowsActiveMediaCarry = struct {
+    graph: helix_media_graph.Source,
+    native: *const native_media_mod.PhysicalSnapshot,
+    webrtc: *const media_plane_mod.PhysicalSnapshot,
+    native_transport: *const native_media_mod.PhysicalTransportSnapshot,
+    native_owner: *native_media_mod.NativeMediaTransport,
+    webrtc_owner: *media_plane_mod.MediaPlane,
+    native_token: @import("runtime_pause.zig").Token,
+    webrtc_token: @import("runtime_pause.zig").Token,
+    native_limits: helix_active_media.Limits,
+    webrtc_limits: media_plane_mod.PhysicalSnapshot.Limits,
+};
+
+pub const NativeWindowsActiveMediaCandidate = struct {
+    graph: *const helix_media_graph.Snapshot,
+    native: *const native_media_mod.PhysicalSnapshot,
+    webrtc: *const media_plane_mod.PhysicalSnapshot,
+    native_limits: helix_active_media.Limits,
+    webrtc_limits: media_plane_mod.PhysicalSnapshot.Limits,
+};
+
+const NativeWindowsActiveMediaOwned = struct {
+    allocator: std.mem.Allocator,
+    graph: media_routing.GraphSnapshot,
+    rooms: media_room.Snapshot,
+    bridges: []helix_media_graph.BridgeRow,
+    clients: []helix_media_graph.ClientSocket,
+    attachments: []helix_media_graph.Attachment,
+    bindings: []helix_media_graph.CallBinding,
+    native: native_media_mod.PhysicalSnapshot,
+    native_transport: native_media_mod.PhysicalTransportSnapshot,
+    webrtc: media_plane_mod.PhysicalSnapshot,
+    native_limits: helix_active_media.Limits,
+    webrtc_limits: media_plane_mod.PhysicalSnapshot.Limits,
+
+    fn deinit(self: *NativeWindowsActiveMediaOwned) void {
+        self.webrtc.deinit();
+        self.native_transport.deinit();
+        self.native.deinit();
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.bindings));
+        self.allocator.free(self.bindings);
+        self.allocator.free(self.attachments);
+        self.allocator.free(self.clients);
+        self.allocator.free(self.bridges);
+        self.rooms.deinit();
+        self.graph.deinit();
+        self.* = undefined;
+    }
+
+    fn carry(self: *NativeWindowsActiveMediaOwned, server: *LinuxServer, native_token: @import("runtime_pause.zig").Token, webrtc_token: @import("runtime_pause.zig").Token) NativeWindowsActiveMediaCarry {
+        return .{
+            .graph = .{ .graph = &self.graph, .rooms = &self.rooms, .bridges = self.bridges, .clients = self.clients, .attachments = self.attachments, .bindings = self.bindings },
+            .native = &self.native,
+            .webrtc = &self.webrtc,
+            .native_transport = &self.native_transport,
+            .native_owner = &server.native_media,
+            .webrtc_owner = &server.media_plane,
+            .native_token = native_token,
+            .webrtc_token = webrtc_token,
+            .native_limits = self.native_limits,
+            .webrtc_limits = self.webrtc_limits,
+        };
+    }
+};
+
+fn windowsMediaGraphUsesClient(graph: *const media_routing.GraphSnapshot, id: media_routing.ClientId) bool {
+    for (graph.endpoints) |row| if (row.key.client.eql(id)) return true;
+    for (graph.memberships) |row| if (row.key.client.eql(id)) return true;
+    return false;
+}
+
+/// World and every reactor are frozen; both original media pumps are paused
+/// after accepted WebRTC egress settled. This captures each graph/physical
+/// owner without making a second listener or routing Domain visible.
+fn captureWindowsActiveMedia(server: *LinuxServer, domain: *media_routing.Domain, native_token: @import("runtime_pause.zig").Token, webrtc_token: @import("runtime_pause.zig").Token, sealed_fds: []const linux.fd_t) !NativeWindowsActiveMediaOwned {
+    const allocator = server.allocator;
+    var graph = domain.captureGraph(&server.native_media, native_token, &server.media_plane, webrtc_token) catch |err| {
+        srvLog("onyx-server: Windows active media graph source cut failed ({s})\n", .{@errorName(err)});
+        return err;
+    };
+    errdefer graph.deinit();
+    var rooms = server.media_rooms.capture() catch |err| {
+        srvLog("onyx-server: Windows active media rooms source cut failed ({s})\n", .{@errorName(err)});
+        return err;
+    };
+    errdefer rooms.deinit();
+    const bridges = try allocator.alloc(helix_media_graph.BridgeRow, server.media_bridges.count());
+    errdefer allocator.free(bridges);
+    lockSpin(&server.media_bridges_mu);
+    var bridge_it = server.media_bridges.iterator();
+    var bridge_count: usize = 0;
+    while (bridge_it.next()) |entry| : (bridge_count += 1) {
+        if (bridge_count >= bridges.len) {
+            server.media_bridges_mu.unlock();
+            return error.InvalidRuntime;
+        }
+        const image = entry.value_ptr.capture() catch |err| {
+            server.media_bridges_mu.unlock();
+            return err;
+        };
+        bridges[bridge_count] = .{ .channel = entry.key_ptr.*, .snapshot = image };
+    }
+    server.media_bridges_mu.unlock();
+    if (bridge_count != bridges.len) return error.InvalidRuntime;
+    var clients: std.ArrayList(helix_media_graph.ClientSocket) = .empty;
+    errdefer clients.deinit(allocator);
+    var bindings: std.ArrayList(helix_media_graph.CallBinding) = .empty;
+    errdefer bindings.deinit(allocator);
+    for (server.reactors) |*reactor| {
+        for (reactor.clients.slots.items, 0..) |*slot, index| {
+            if (!slot.occupied) continue;
+            const id: client_model.ClientId = .{ .shard = reactor.shard_id, .slot = @intCast(index), .gen = slot.gen };
+            const conn = &slot.value;
+            if (windowsMediaGraphUsesClient(&graph, id)) {
+                if (conn.fd < 0 or std.mem.indexOfScalar(linux.fd_t, sealed_fds, conn.fd) == null) return error.InvalidInheritedHandoff;
+                try clients.append(allocator, .{ .source = id, .fd = conn.fd });
+            }
+            if (conn.mediaCallChannel()) |channel| {
+                if (conn.fd < 0 or std.mem.indexOfScalar(linux.fd_t, sealed_fds, conn.fd) == null) return error.InvalidInheritedHandoff;
+                try bindings.append(allocator, try helix_media_graph.CallBinding.init(
+                    id,
+                    channel,
+                    conn.mediaCallParticipant(),
+                    if (conn.media_e2ee_attachment_bound) conn.media_e2ee_attachment else null,
+                ));
+            } else if (conn.media_e2ee_attachment_bound) return error.InvalidInheritedHandoff;
+        }
+    }
+    var attachments: std.ArrayList(helix_media_graph.Attachment) = .empty;
+    errdefer attachments.deinit(allocator);
+    for (server.media_physical_attachments.items) |*row|
+        try attachments.append(allocator, try helix_media_graph.Attachment.init(row.client, row.channelSlice(), row.nickSlice(), row.kind_bits));
+
+    const native_limits: helix_active_media.Limits = .{
+        .max_participants = @min(server.config.media_max_participants, native_media_mod.max_call_participants),
+        .max_state_bytes = helix_active_media.max_wire_bytes,
+    };
+    const webrtc_limits: media_plane_mod.PhysicalSnapshot.Limits = .{
+        .max_rows = media_routing.max_graph_rows,
+        .max_offered = media_routing.max_graph_rows,
+        .max_bytes = helix_active_media.max_wire_bytes,
+        .transport = .{ .max_endpoints = media_routing.max_graph_rows, .max_groups = media_routing.max_graph_rows, .max_bytes = helix_active_media.max_wire_bytes },
+    };
+    const Leaves = struct { native: native_media_mod.PhysicalSnapshot, transport: native_media_mod.PhysicalTransportSnapshot, webrtc: media_plane_mod.PhysicalSnapshot };
+    const Cut = struct {
+        server: *LinuxServer,
+        domain: *media_routing.Domain,
+        native_token: @import("runtime_pause.zig").Token,
+        webrtc_token: @import("runtime_pause.zig").Token,
+        webrtc_limits: media_plane_mod.PhysicalSnapshot.Limits,
+        fn take(scope: *media_routing.Locked, ctx: @This()) !Leaves {
+            var native = try ctx.server.native_media.capturePausedPhysicalRoutingLocked(ctx.domain, scope, ctx.native_token, ctx.server.allocator, helix_active_media.max_wire_bytes);
+            errdefer native.deinit();
+            var transport = try ctx.server.native_media.capturePausedPhysicalTransportRoutingLocked(ctx.domain, scope, ctx.native_token);
+            errdefer transport.deinit();
+            const webrtc = try ctx.server.media_plane.capturePausedPhysicalRoutingLocked(ctx.domain, scope, ctx.webrtc_token, ctx.server.allocator, ctx.webrtc_limits);
+            return .{ .native = native, .transport = transport, .webrtc = webrtc };
+        }
+    };
+    var leaves = domain.withLocked(Cut{ .server = server, .domain = domain, .native_token = native_token, .webrtc_token = webrtc_token, .webrtc_limits = webrtc_limits }, Cut.take) catch |err| {
+        srvLog("onyx-server: Windows active media physical source cut failed ({s})\n", .{@errorName(err)});
+        return err;
+    };
+    errdefer {
+        leaves.webrtc.deinit();
+        leaves.transport.deinit();
+        leaves.native.deinit();
+    }
+    const clients_owned = try clients.toOwnedSlice(allocator);
+    errdefer allocator.free(clients_owned);
+    const attachments_owned = try attachments.toOwnedSlice(allocator);
+    errdefer allocator.free(attachments_owned);
+    const bindings_owned = try bindings.toOwnedSlice(allocator);
+    errdefer allocator.free(bindings_owned);
+    const image = NativeWindowsActiveMediaOwned{
+        .allocator = allocator,
+        .graph = graph,
+        .rooms = rooms,
+        .bridges = bridges,
+        .clients = clients_owned,
+        .attachments = attachments_owned,
+        .bindings = bindings_owned,
+        .native = leaves.native,
+        .native_transport = leaves.transport,
+        .webrtc = leaves.webrtc,
+        .native_limits = native_limits,
+        .webrtc_limits = webrtc_limits,
+    };
+    (helix_media_graph.Source{ .graph = &image.graph, .rooms = &image.rooms, .bridges = image.bridges, .clients = image.clients, .attachments = image.attachments, .bindings = image.bindings }).validate() catch |err| {
+        srvLog("onyx-server: Windows active media source graph join failed ({s}); calls={d} endpoints={d} memberships={d} rooms={d} bridges={d} clients={d} attachments={d} bindings={d}\n", .{
+            @errorName(err), image.graph.calls.len, image.graph.endpoints.len, image.graph.memberships.len, image.rooms.rooms.len, image.bridges.len, image.clients.len, image.attachments.len, image.bindings.len,
+        });
+        return err;
+    };
+    return image;
+}
+
+fn windowsMediaAdoptedConn(server: *LinuxServer, id: media_routing.ClientId) ?*ConnState {
+    for (server.reactors) |*reactor| {
+        if (reactor.shard_id != id.shard) continue;
+        return reactor.clients.get(id);
+    }
+    return null;
+}
+
+/// Bind all three independently decoded media bodies before preparing any
+/// candidate owner. A valid body alone cannot prove the physical legs belong
+/// to the graph that will be published.
+fn validateWindowsActiveMediaCandidate(candidate: NativeWindowsActiveMediaCandidate) !void {
+    try candidate.graph.validate();
+    try candidate.native.validate(candidate.native_limits.max_participants, candidate.native_limits.max_state_bytes);
+    try candidate.webrtc.validate(candidate.webrtc_limits);
+    const physical_count = std.math.add(usize, candidate.native.endpoints.len, candidate.webrtc.rows.len) catch return error.InvalidSnapshot;
+    if (candidate.graph.graph.endpoints.len != physical_count) return error.InvalidSnapshot;
+    for (candidate.graph.graph.endpoints) |endpoint| {
+        var profile_count: usize = 0;
+        for (candidate.graph.rooms.physical_profiles) |profile| {
+            if (!std.meta.eql(profile.key, endpoint.key)) continue;
+            profile_count += 1;
+            switch (endpoint.key.leg) {
+                .native => {
+                    var matches: usize = 0;
+                    for (candidate.native.endpoints) |physical| {
+                        if (!std.meta.eql(physical.key, endpoint.key)) continue;
+                        if (!std.meta.eql(physical.identity, endpoint.row.observation) or !profile.profile.eql(physical.profile))
+                            return error.InvalidSnapshot;
+                        matches += 1;
+                    }
+                    if (matches != 1) return error.InvalidSnapshot;
+                },
+                .webrtc => {
+                    var matches: usize = 0;
+                    for (candidate.webrtc.rows) |physical| {
+                        if (!std.meta.eql(physical.key, endpoint.key)) continue;
+                        if (!std.meta.eql(physical.identity, endpoint.row.observation) or !profile.profile.eql(physical.profile))
+                            return error.InvalidSnapshot;
+                        matches += 1;
+                    }
+                    if (matches != 1) return error.InvalidSnapshot;
+                },
+            }
+        }
+        if (profile_count != 1) return error.InvalidSnapshot;
+    }
+}
+
+/// All allocations and semantic checks for an inherited live media graph.
+/// Until commit the Domain is closed and both physical owners are inert. Any
+/// later candidate refusal drops these values and leaves the source serving.
+const WindowsActiveMediaStage = struct {
+    allocator: std.mem.Allocator,
+    prepared: helix_media_graph.Prepared,
+    native_state: native_media_mod.PhysicalState,
+    webrtc_state: media_plane_mod.PhysicalState,
+    graph_restore: media_routing.PreparedGraphRestore,
+    routing_owner: *MediaRoutingBacking,
+    attachments: std.ArrayList(MediaPhysicalAttachment),
+    installed: bool = false,
+    published: bool = false,
+
+    fn prepare(server: *LinuxServer, candidate: NativeWindowsActiveMediaCandidate) !WindowsActiveMediaStage {
+        if (server.media_routing_owner != null or server.media_physical_attachments.items.len != 0 or
+            server.media_bridges.count() != 0 or server.native_media.socket == null or server.media_plane.socket == null)
+            return error.InvalidInheritedHandoff;
+        try validateWindowsActiveMediaCandidate(candidate);
+        var adopted: std.ArrayList(helix_media_graph.AdoptedClient) = .empty;
+        defer adopted.deinit(server.allocator);
+        for (server.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, index| {
+                if (!slot.occupied or slot.value.s2s != null or slot.value.s2s_secured != null) continue;
+                if (slot.value.fd < 0) return error.InvalidInheritedHandoff;
+                try adopted.append(server.allocator, .{
+                    .fd = slot.value.fd,
+                    .target = .{ .shard = reactor.shard_id, .slot = @intCast(index), .gen = slot.gen },
+                });
+            }
+        }
+        var prepared = candidate.graph.prepare(server.allocator, adopted.items) catch |err| {
+            srvLog("onyx-server: Windows active media remap preparation failed ({s})\n", .{@errorName(err)});
+            return err;
+        };
+        errdefer prepared.deinit();
+        if (!std.meta.eql(prepared.rooms.config, server.media_rooms.config)) return error.ConfiguredOwnerMismatch;
+        var native_state = candidate.native.prepareRemappedRestore(server.allocator, prepared.remaps, candidate.native_limits.max_participants, candidate.native_limits.max_state_bytes) catch |err| {
+            srvLog("onyx-server: Windows active native media physical preparation failed ({s})\n", .{@errorName(err)});
+            return err;
+        };
+        errdefer native_state.deinit();
+        var webrtc_state = candidate.webrtc.prepareRemappedRestore(server.allocator, prepared.remaps, candidate.webrtc_limits) catch |err| {
+            srvLog("onyx-server: Windows active WebRTC media physical preparation failed ({s})\n", .{@errorName(err)});
+            return err;
+        };
+        errdefer webrtc_state.deinit();
+        var graph_restore = media_routing.prepareGraphRestore(server.allocator, &prepared.graph, &server.native_media, &server.media_plane) catch |err| {
+            srvLog("onyx-server: Windows active media Domain preparation failed ({s})\n", .{@errorName(err)});
+            return err;
+        };
+        errdefer graph_restore.deinit();
+        const routing_owner = try server.allocator.create(MediaRoutingBacking);
+        errdefer server.allocator.destroy(routing_owner);
+        var attachments: std.ArrayList(MediaPhysicalAttachment) = .empty;
+        errdefer attachments.deinit(server.allocator);
+        for (prepared.attachments) |*row| {
+            var restored: MediaPhysicalAttachment = .{
+                .client = row.client,
+                .channel_len = row.channel_len,
+                .nick_len = row.nick_len,
+                .kind_bits = row.kind_bits,
+            };
+            @memcpy(restored.channel[0..row.channel_len], row.channelSlice());
+            @memcpy(restored.nick[0..row.nick_len], row.nickSlice());
+            try attachments.append(server.allocator, restored);
+        }
+        for (prepared.bindings) |*binding| {
+            const conn = windowsMediaAdoptedConn(server, binding.client) orelse return error.IncompleteRemap;
+            if (conn.ws == null or conn.mediaCallChannel() != null or conn.media_e2ee_attachment_bound)
+                return error.InvalidInheritedHandoff;
+        }
+        return .{
+            .allocator = server.allocator,
+            .prepared = prepared,
+            .native_state = native_state,
+            .webrtc_state = webrtc_state,
+            .graph_restore = graph_restore,
+            .routing_owner = routing_owner,
+            .attachments = attachments,
+        };
+    }
+
+    fn deinit(self: *WindowsActiveMediaStage) void {
+        if (self.installed and !self.published) {
+            self.graph_restore.native.discardPreparedPhysicalState(&self.graph_restore);
+            self.graph_restore.webrtc.discardPreparedPhysicalState(&self.graph_restore);
+        }
+        self.graph_restore.deinit();
+        self.webrtc_state.deinit();
+        self.native_state.deinit();
+        self.attachments.deinit(self.allocator);
+        self.prepared.deinit();
+        if (!self.published) self.allocator.destroy(self.routing_owner);
+        self.* = undefined;
+    }
+
+    /// Every operation after this point is allocation-free and nonfallible.
+    /// The server and owners take the prepared rooms, bridge map, queue, and
+    /// physical attachments before opening the Domain to routing.
+    fn commit(self: *WindowsActiveMediaStage, server: *LinuxServer) void {
+        std.debug.assert(!self.installed and !self.published and server.media_routing_owner == null);
+        server.native_media.installPreparedPhysicalState(&self.native_state, &self.graph_restore);
+        server.media_plane.installPreparedPhysicalState(&self.webrtc_state, &self.graph_restore);
+        self.installed = true;
+        const previous_rooms = server.media_rooms;
+        server.media_rooms = self.prepared.rooms;
+        self.prepared.rooms = previous_rooms;
+        const previous_bridges = server.media_bridges;
+        server.media_bridges = self.prepared.bridges;
+        self.prepared.bridges = previous_bridges;
+        const previous_attachments = server.media_physical_attachments;
+        server.media_physical_attachments = self.attachments;
+        self.attachments = previous_attachments;
+        for (self.prepared.bindings) |*binding| {
+            const conn = windowsMediaAdoptedConn(server, binding.client) orelse unreachable;
+            conn.setMediaCall(binding.channelSlice(), binding.participantSlice());
+            if (binding.e2ee_bound) conn.bindMediaE2eeAttachment(binding.e2ee_attachment);
+        }
+        const restored = self.graph_restore.publish();
+        self.routing_owner.* = .{
+            .server = server,
+            .allocator = server.allocator,
+            .domain = restored.domain,
+            .native_binding = restored.native_binding,
+            .webrtc_binding = restored.webrtc_binding,
+            .prepared_egress = if (server.media_plane.routing_egress) |queue| @ptrCast(queue) else null,
+            .queue_retired = false,
+        };
+        server.media_routing_owner = @ptrCast(self.routing_owner);
+        self.published = true;
+    }
+};
+
 pub const NativeWindowsWebrtcMediaCarry = struct {
     owner: *media_plane_mod.MediaPlane,
     carry: *const media_plane_mod.Snapshot,
@@ -1082,6 +1470,11 @@ pub const NativeUpgradeSnapshot = struct {
     windows_history: ?NativeWindowsHistoryCarry = null,
     /// Exact paused UDP listeners and secrets, borrowed through COMMIT.
     windows_udp: NativeWindowsUdpCarry = .{},
+    /// Established QUIC/H3 sessions use a distinct authenticated aggregate.
+    windows_active_webtransport: ?NativeWindowsActiveWebTransportCarry = null,
+    /// Exact media graph and physical rows; the source guard remains until the
+    /// joined UDP and candidate publication transaction is complete.
+    windows_active_media: ?NativeWindowsActiveMediaCarry = null,
 };
 
 pub const NativeUpgradeHooks = struct {
@@ -4552,6 +4945,12 @@ pub const LinuxServer = struct {
     /// MAIN owns this optional external listener at a stable address. It is
     /// registered before serving and cleared only after reactor joins.
     windows_webtransport_owner: ?*managed_wt.WebTransportListener = null,
+    /// Borrowed only during inert native adoption; main owns the authenticated
+    /// active listener body until the pre-READY accepted-socket join completes.
+    windows_wt_active_candidate_snapshot: ?*const managed_wt.ActiveSnapshot = null,
+    windows_wt_active_candidate_accepted: ?[]const helix_native_windows_active_wt_custody.AcceptedIrcSocket = null,
+    /// Main retains all three authenticated active-media DTOs until adoption.
+    windows_active_media_candidate: ?NativeWindowsActiveMediaCandidate = null,
     windows_rdns_pause_epoch: u64 = 0,
     windows_dnsbl_pause_epoch: u64 = 0,
     windows_webpush_pause_epoch: u64 = 0,
@@ -7279,6 +7678,45 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// The WebTransport bridge's connected loopback socket must have exactly
+    /// one reverse four-tuple among the successor's adopted IRC clients. This
+    /// pointer never grants socket authority and is cleared at the commit edge.
+    pub fn setWindowsActiveWebTransportCandidate(self: *LinuxServer, snapshot: *const managed_wt.ActiveSnapshot, accepted: []const helix_native_windows_active_wt_custody.AcceptedIrcSocket) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (self.config.native_adopt_barrier == null or self.windows_webtransport_owner == null or
+            self.windows_wt_active_candidate_snapshot != null or self.windows_wt_active_candidate_accepted != null) return error.InvalidRuntime;
+        self.windows_wt_active_candidate_snapshot = snapshot;
+        self.windows_wt_active_candidate_accepted = accepted;
+    }
+
+    fn validateWindowsActiveWebTransportAcceptedJoin(self: *LinuxServer) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        const snapshot = self.windows_wt_active_candidate_snapshot orelse return;
+        const source_accepted = self.windows_wt_active_candidate_accepted orelse return error.InvalidInheritedHandoff;
+        var observed: std.ArrayList(helix_native_windows_active_wt_custody.AcceptedIrcSocket) = .empty;
+        defer observed.deinit(self.allocator);
+        for (self.reactors) |*reactor| {
+            var it = reactor.clients.iterator();
+            while (it.next()) |entry| {
+                const conn = entry.value;
+                if (conn.s2s != null or conn.s2s_secured != null) continue;
+                if (conn.fd < 0) return error.InvalidInheritedHandoff;
+                const fd: usize = @intCast(conn.fd);
+                var source_row: ?helix_native_windows_active_wt_custody.AcceptedIrcSocket = null;
+                for (source_accepted) |row| if (row.fd == fd) {
+                    if (source_row != null) return error.InvalidInheritedHandoff;
+                    source_row = row;
+                };
+                try observed.append(self.allocator, try helix_native_windows_active_wt_custody.verifyImportedAcceptedIrcSocket(
+                    fd,
+                    source_row orelse return error.InvalidInheritedHandoff,
+                ));
+            }
+        }
+        if (observed.items.len != source_accepted.len) return error.InvalidInheritedHandoff;
+        try helix_native_windows_active_wt_custody.validateAcceptedJoin(snapshot, observed.items);
+    }
+
     /// Restore the exact two UDP media owners before the Windows Gate is
     /// created. Both sockets and pump-owned idle secrets come from the
     /// authenticated HXUD handoff; neither owner binds a replacement port or
@@ -7342,8 +7780,85 @@ pub const LinuxServer = struct {
         self.media_plane = webrtc;
     }
 
-    /// Rebuild the empty graph/FIFO at the final Server address. The active
-    /// routing state has no HXUD checkpoint and remains a source-side blocker.
+    /// Import both exact active UDP sockets while their physical registries
+    /// and graph remain detached. The candidate's later inherited-client cut
+    /// supplies the sole ClientId remap before either pump can run.
+    pub fn stageWindowsInheritedActiveMedia(
+        self: *LinuxServer,
+        native_transfer: *helix_native_windows_udp_socket.Transfer,
+        native_carry: *const native_media_mod.PhysicalTransportSnapshot,
+        webrtc_transfer: *helix_native_windows_udp_socket.Transfer,
+        webrtc_carry: *const media_plane_mod.PhysicalSnapshot,
+        webrtc_limits: media_plane_mod.PhysicalSnapshot.Limits,
+        io: std.Io,
+    ) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (!self.config.media_enabled or self.media_routing_owner != null or
+            self.media_plane.socket != null or self.native_media.socket != null or
+            self.media_plane.thread != null or self.native_media.thread != null)
+            return error.InvalidRuntime;
+        const stun_server: ?media_plane_mod.TransportAddress = if (self.config.media_stun_port == 0) null else blk: {
+            const ip4 = parseIp4(self.config.media_stun_host) orelse return error.InvalidMediaStunAddress;
+            break :blk try media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port);
+        };
+        const expected_native: native_media_mod.Policy = .{
+            .max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, native_media_mod.max_datagram))),
+            .max_upload_bytes = self.config.media_max_upload_bytes,
+            .max_participants = @min(self.config.media_max_participants, native_media_mod.max_call_participants),
+            .require_mac = self.config.native_media_require_mac,
+            .mac_stream_key = native_carry.policy.mac_stream_key,
+            .mac_key_configured = true,
+            .cross_configured = true,
+        };
+        const expected_webrtc: media_plane_mod.Policy = .{
+            .max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, media_plane_mod.max_datagram))),
+            .max_upload_bytes = self.config.media_max_upload_bytes,
+            .stun_server = stun_server,
+            .dtls_requested = self.config.media_dtls_srtp,
+            .dtls13_requested = self.config.media_dtls13,
+            .cross_configured = true,
+        };
+        if ((self.config.native_media_port != 0 and self.config.native_media_port != native_carry.socket.port) or
+            (self.config.media_port != 0 and self.config.media_port != webrtc_carry.socket.port))
+            return error.ConfiguredOwnerMismatch;
+        var native = try native_media_mod.NativeMediaTransport.initTransferredPhysical(
+            self.allocator,
+            native_transfer,
+            native_carry,
+            expected_native,
+            .{ .ctx = self, .on_native_frame = bridgeOnNativeFrame, .on_native_feedback = bridgeOnNativeFeedback },
+        );
+        errdefer native.deinit();
+        var webrtc = try media_plane_mod.MediaPlane.initTransferredPhysical(
+            self.allocator,
+            webrtc_transfer,
+            webrtc_carry,
+            expected_webrtc,
+            webrtc_limits,
+            .{ .ctx = self, .on_rtp_frame = bridgeOnRtpFrame, .on_rtcp_feedback = bridgeOnRtcpFeedback },
+        );
+        errdefer webrtc.deinit();
+        try native.prepareInheritedResources(io);
+        try webrtc.prepareInheritedResources(io);
+        self.native_media.deinit();
+        self.media_plane.deinit();
+        self.native_stream_key = native_carry.policy.mac_stream_key;
+        self.native_media = native;
+        self.media_plane = webrtc;
+    }
+
+    pub fn setWindowsActiveMediaCandidate(self: *LinuxServer, candidate: NativeWindowsActiveMediaCandidate) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        if (self.config.native_adopt_barrier == null or !self.config.media_enabled or
+            self.media_routing_owner != null or self.native_media.socket == null or
+            self.media_plane.socket == null or self.windows_active_media_candidate != null)
+            return error.InvalidRuntime;
+        try candidate.graph.validate();
+        self.windows_active_media_candidate = candidate;
+    }
+
+    /// Rebuild the pristine graph/FIFO at the final Server address. Active
+    /// routing state uses the separately authenticated HXMG/HXNA/HXWA bodies.
     pub fn prepareWindowsInheritedMediaRouting(self: *LinuxServer) !void {
         if (comptime builtin.os.tag != .windows) return error.Unsupported;
         if (!self.config.media_enabled or self.media_routing_owner != null or
@@ -29895,20 +30410,22 @@ pub const LinuxServer = struct {
             return .webtransport_listener;
         if (self.acme_reload_tls != null and (builtin.os.tag != .windows or self.acme_worker == null))
             return .acme_companion;
-        if (!self.media_rooms.upgradeContinuityReady()) return .media_rooms;
-        // Windows seals a configured, strictly pristine media Domain with its
-        // two paused UDP owners at the native transfer cut below. The ordinary
-        // owner predicates reject every routing binding, including that safe
-        // initial graph; the Domain proof is authoritative for this one case.
+        const windows_media_checkpoint = builtin.os.tag == .windows and self.config.media_enabled;
+        if (!windows_media_checkpoint and !self.media_rooms.upgradeContinuityReady()) return .media_rooms;
+        // Windows seals a configured media Domain with both paused UDP owners
+        // at the native transfer cut below. The pristine and active captures
+        // each prove their own exact continuity before transfer.
         if (builtin.os.tag != .windows or !self.config.media_enabled) {
             if (!self.media_plane.upgradeContinuityReady()) return .media_plane;
             if (!self.native_media.upgradeContinuityReady()) return .native_media;
         }
-        lockSpin(&self.media_bridges_mu);
-        defer self.media_bridges_mu.unlock();
-        var bridges = self.media_bridges.valueIterator();
-        while (bridges.next()) |bridge| {
-            if (!bridge.upgradeContinuityReady()) return .media_bridge;
+        if (!windows_media_checkpoint) {
+            lockSpin(&self.media_bridges_mu);
+            defer self.media_bridges_mu.unlock();
+            var bridges = self.media_bridges.valueIterator();
+            while (bridges.next()) |bridge| {
+                if (!bridge.upgradeContinuityReady()) return .media_bridge;
+            }
         }
         return null;
     }
@@ -30013,6 +30530,38 @@ pub const LinuxServer = struct {
                     const io = self.config.crypto_io orelse return error.InvalidRuntime;
                     try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
                 }
+            }
+        }
+
+        // A live WebRTC owner may have accepted routed egress that is still in
+        // its queue. Fence producers and let its worker drain that exact queue
+        // before parking either media pump. On any refused upgrade, restore the
+        // same producer authority after both paused workers have resumed.
+        var windows_media_upgrade_fence: ?*MediaRoutingBacking = null;
+        errdefer if (comptime builtin.os.tag == .windows) {
+            if (windows_media_upgrade_fence) |owner| {
+                const Cut = struct {
+                    owner: *MediaRoutingBacking,
+                    fn restore(scope: *media_routing.Locked, ctx: @This()) !void {
+                        try ctx.owner.server.media_plane.resumeRoutingProducersLocked(
+                            ctx.owner.domain,
+                            scope,
+                            ctx.owner.producer_fence orelse return error.InvalidRuntime,
+                        );
+                    }
+                };
+                owner.domain.withLocked(Cut{ .owner = owner }, Cut.restore) catch
+                    @panic("Windows media producer fence could not resume after refused upgrade");
+                owner.producer_fence = null;
+            }
+        };
+        if (comptime builtin.os.tag == .windows) {
+            if (self.config.media_enabled) {
+                const owner = mediaRoutingBacking(self.media_routing_owner orelse return error.InvalidRuntime);
+                if (owner.producer_fence != null) return error.InvalidRuntime;
+                windows_media_upgrade_fence = owner;
+                const deadline_ms = try checkedMonotonicDeadlineMillis(30_000);
+                try self.settleMediaRoutingBeforeStop(deadline_ms);
             }
         }
 
@@ -30847,8 +31396,12 @@ pub const LinuxServer = struct {
             var windows_history_carry: ?NativeWindowsHistoryCarry = null;
             var windows_webtransport_snapshot: ?managed_wt.Snapshot = null;
             defer if (windows_webtransport_snapshot) |*snapshot| snapshot.deinit();
+            var windows_active_webtransport: ?NativeWindowsActiveWebTransportCarry = null;
             var windows_media_snapshots: ?media_routing.PristineMediaSnapshots = null;
             defer if (windows_media_snapshots) |*snapshots| snapshots.deinit();
+            var windows_active_media_owned: ?NativeWindowsActiveMediaOwned = null;
+            defer if (windows_active_media_owned) |*owned| owned.deinit();
+            var windows_active_media_carry: ?NativeWindowsActiveMediaCarry = null;
             var windows_udp_carry: NativeWindowsUdpCarry = .{};
             if (comptime builtin.os.tag == .windows) {
                 if (self.metrics_server) |*owner| {
@@ -30867,36 +31420,68 @@ pub const LinuxServer = struct {
                     windows_history_carry = .{ .owner = owner, .carry = &windows_history_snapshot.?, .pause_token = token };
                 }
                 if (self.windows_webtransport_owner) |owner| {
-                    windows_webtransport_snapshot = if (windows_webtransport_pause) |token|
-                        try owner.capturePaused(token)
-                    else
-                        try owner.captureUnstarted();
-                    windows_udp_carry.webtransport = .{
-                        .owner = owner,
-                        .carry = &windows_webtransport_snapshot.?,
-                        .pause_token = windows_webtransport_pause,
-                    };
+                    if (windows_webtransport_pause) |token| {
+                        if (owner.capturePaused(token)) |snapshot| {
+                            windows_webtransport_snapshot = snapshot;
+                        } else |err| switch (err) {
+                            error.ActiveQuicContinuityUnsupported => windows_active_webtransport = .{ .owner = owner, .pause_token = token },
+                            else => return err,
+                        }
+                    } else {
+                        windows_webtransport_snapshot = try owner.captureUnstarted();
+                    }
+                    if (windows_webtransport_snapshot) |*snapshot|
+                        windows_udp_carry.webtransport = .{
+                            .owner = owner,
+                            .carry = snapshot,
+                            .pause_token = windows_webtransport_pause,
+                        };
                 }
                 if (self.config.media_enabled) {
                     const routing_owner = self.media_routing_owner orelse return error.InvalidRuntime;
                     const domain = mediaRoutingBacking(routing_owner).domain;
-                    windows_media_snapshots = try domain.capturePausedPristineMedia(
-                        &self.native_media,
-                        windows_native_media_pause orelse return error.InvalidRuntime,
-                        &self.media_plane,
-                        windows_webrtc_media_pause orelse return error.InvalidRuntime,
-                    );
-                    windows_udp_carry.media_domain = domain;
-                    windows_udp_carry.native_media = .{
-                        .owner = &self.native_media,
-                        .carry = &windows_media_snapshots.?.native,
-                        .pause_token = windows_native_media_pause,
-                    };
-                    windows_udp_carry.webrtc_media = .{
-                        .owner = &self.media_plane,
-                        .carry = &windows_media_snapshots.?.webrtc,
-                        .pause_token = windows_webrtc_media_pause,
-                    };
+                    const native_token = windows_native_media_pause orelse return error.InvalidRuntime;
+                    const webrtc_token = windows_webrtc_media_pause orelse return error.InvalidRuntime;
+                    var active_media = !self.media_rooms.upgradeContinuityReady() or
+                        self.media_physical_attachments.items.len != 0 or self.media_bridges.count() != 0;
+                    for (self.reactors) |*reactor| {
+                        for (reactor.clients.slots.items) |*slot| {
+                            if (slot.occupied and (slot.value.mediaCallChannel() != null or slot.value.media_e2ee_attachment_bound))
+                                active_media = true;
+                        }
+                    }
+                    if (!active_media) {
+                        const pristine: ?media_routing.PristineMediaSnapshots = domain.capturePausedPristineMedia(
+                            &self.native_media,
+                            native_token,
+                            &self.media_plane,
+                            webrtc_token,
+                        ) catch |err| switch (err) {
+                            error.Busy, error.ActiveMediaContinuityUnsupported => null,
+                            else => return err,
+                        };
+                        if (pristine) |captured| windows_media_snapshots = captured else active_media = true;
+                    }
+                    if (windows_media_snapshots) |*pristine| {
+                        windows_udp_carry.media_domain = domain;
+                        windows_udp_carry.native_media = .{
+                            .owner = &self.native_media,
+                            .carry = &pristine.native,
+                            .pause_token = windows_native_media_pause,
+                        };
+                        windows_udp_carry.webrtc_media = .{
+                            .owner = &self.media_plane,
+                            .carry = &pristine.webrtc,
+                            .pause_token = windows_webrtc_media_pause,
+                        };
+                    }
+                    if (active_media) {
+                        windows_active_media_owned = captureWindowsActiveMedia(self, domain, native_token, webrtc_token, carried_fds[0..carried_fd_count]) catch |err| {
+                            srvLog("onyx-server: Windows active media source capture failed ({s})\n", .{@errorName(err)});
+                            return err;
+                        };
+                        windows_active_media_carry = windows_active_media_owned.?.carry(self, native_token, webrtc_token);
+                    }
                 }
             }
             // The native leaf appends the same whole-handoff manifest and
@@ -30916,6 +31501,8 @@ pub const LinuxServer = struct {
                 .windows_webhook = windows_webhook_carry,
                 .windows_history = windows_history_carry,
                 .windows_udp = windows_udp_carry,
+                .windows_active_webtransport = windows_active_webtransport,
+                .windows_active_media = windows_active_media_carry,
             }) catch |err| {
                 // A native candidate may already hold duplicate sockets or a
                 // read-only WAL view. Reap it while World and reactor owners
@@ -33611,6 +34198,22 @@ pub const LinuxServer = struct {
         }
 
         adoption_stage = "native pre-commit preparation";
+        var windows_active_media_stage: ?WindowsActiveMediaStage = null;
+        defer if (windows_active_media_stage) |*stage| stage.deinit();
+        if (comptime builtin.os.tag == .windows) {
+            self.validateWindowsActiveWebTransportAcceptedJoin() catch |err| {
+                world_replacement.swapWorldInto(&self.world);
+                srvLog("onyx-server: UPGRADE resume fatal — active WebTransport accepted-socket join failed ({s})\n", .{@errorName(err)});
+                return error.InvalidInheritedHandoff;
+            };
+            if (self.windows_active_media_candidate) |candidate| {
+                windows_active_media_stage = WindowsActiveMediaStage.prepare(self, candidate) catch |err| {
+                    world_replacement.swapWorldInto(&self.world);
+                    srvLog("onyx-server: UPGRADE resume fatal — active media graph join failed ({s})\n", .{@errorName(err)});
+                    return error.InvalidInheritedHandoff;
+                };
+            }
+        }
         var native_bot_stage: ?NativeBotStage = null;
         defer if (native_bot_stage) |*stage| stage.deinit();
         if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
@@ -34039,10 +34642,14 @@ pub const LinuxServer = struct {
         // Transfer descriptor ownership immediately at the commit edge. Every
         // later action is retryable/best-effort derived work and must never
         // re-enter handoff abandonment.
+        if (windows_active_media_stage) |*stage| stage.commit(self);
+        self.windows_active_media_candidate = null;
         closeFd(arena_fd);
         self.config.resume_arena_fd = null;
         self.config.native_arena_bytes = null;
         self.config.native_adopt_barrier = null;
+        self.windows_wt_active_candidate_snapshot = null;
+        self.windows_wt_active_candidate_accepted = null;
         self.config.native_listener_manifest = &.{};
         // Every carried descriptor is now reactor-owned. Drop the manifest
         // without closing it; ordinary connection teardown owns them from here.

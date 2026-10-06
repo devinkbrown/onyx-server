@@ -61,7 +61,7 @@ const WindowsSockets = struct {
     const Entry = struct {
         handle: usize,
         associated_port: usize = 0,
-        accepted_peer: ?PeerAddress = null,
+        accepted_peer: ?WindowsTcpEndpoint = null,
         carry: Carry = .ordinary,
     };
     const Slot = struct {
@@ -88,7 +88,7 @@ const WindowsSockets = struct {
         return self.registerWithPeer(handle, null);
     }
 
-    fn registerWithPeer(self: *WindowsSockets, handle: usize, peer: ?PeerAddress) !linux.fd_t {
+    fn registerWithPeer(self: *WindowsSockets, handle: usize, peer: ?WindowsTcpEndpoint) !linux.fd_t {
         if (handle == std.math.maxInt(usize)) return error.InvalidSocket;
         self.lockSpin();
         defer self.lock.unlock();
@@ -243,7 +243,25 @@ const WindowsSockets = struct {
         self.lockSpin();
         defer self.lock.unlock();
         const entry = self.handles.get(fd) orelse return null;
+        return if (entry.accepted_peer) |peer| peer.address else null;
+    }
+
+    fn acceptedEndpoint(self: *WindowsSockets, fd: linux.fd_t) ?WindowsTcpEndpoint {
+        if (fd <= 0) return null;
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.get(fd) orelse return null;
         return entry.accepted_peer;
+    }
+
+    fn rememberHelixAcceptedEndpoint(self: *WindowsSockets, fd: linux.fd_t, peer: WindowsTcpEndpoint) WindowsTcpObservationError!void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        const entry = self.handles.getPtr(fd) orelse return error.InvalidSocket;
+        if (entry.carry != .helix_staged or peer.port == 0) return error.NotConnected;
+        if (entry.accepted_peer) |prior| {
+            if (!std.meta.eql(prior, peer)) return error.NotConnected;
+        } else entry.accepted_peer = peer;
     }
 
     fn associatedPort(self: *WindowsSockets, fd: linux.fd_t) ?usize {
@@ -415,6 +433,7 @@ pub const WindowsTcpEndpoint = struct {
 
 pub const WindowsListenerObservation = struct { local: WindowsTcpEndpoint };
 pub const WindowsConnectedObservation = struct { local: WindowsTcpEndpoint, peer: WindowsTcpEndpoint };
+pub const WindowsHelixConnectedObservation = struct { local: WindowsTcpEndpoint, peer: ?WindowsTcpEndpoint };
 pub const WindowsTcpObservationError = error{ Unsupported, InvalidSocket, NotTcp, NotListening, NotConnected, SocketFailed };
 
 fn windowsTcpStatus(handle: usize) WindowsTcpObservationError!bool {
@@ -461,17 +480,25 @@ pub fn observeWindowsConnectedTcpSocket(fd: linux.fd_t) WindowsTcpObservationErr
     const socket = windows_sockets.get(fd) orelse return error.InvalidSocket;
     if (try windowsTcpStatus(socket)) return error.NotConnected;
     const name = socketName(socket) catch return error.NotConnected;
+    const local = try windowsTcpEndpoint(name);
     var peer_name = std.mem.zeroes(RioSockAddr6);
     var peer_len: i32 = @sizeOf(RioSockAddr6);
-    if (getpeername(socket, @ptrCast(&peer_name), &peer_len) != 0) return error.NotConnected;
-    if (!((peer_name.family == wsa_af_inet and peer_len == @sizeOf(RioSockAddr)) or
-        (peer_name.family == wsa_af_inet6 and peer_len == @sizeOf(RioSockAddr6))))
+    var peer: ?WindowsTcpEndpoint = null;
+    if (getpeername(socket, @ptrCast(&peer_name), &peer_len) == 0 and
+        ((peer_name.family == wsa_af_inet and peer_len == @sizeOf(RioSockAddr)) or
+            (peer_name.family == wsa_af_inet6 and peer_len == @sizeOf(RioSockAddr6))))
+        peer = try windowsTcpEndpoint(peer_name);
+    if (peer == null or peer.?.port == 0) {
+        // AFD's accept completion captured this peer from the kernel. Some
+        // connected AcceptEx sockets still report an empty getpeername until
+        // after a process-local duplicate is imported. Require the live TCP
+        // connection as well as the saved completion endpoint.
+        try observeWindowsHelixConnectedTcpSocket(fd);
+        peer = windows_sockets.acceptedEndpoint(fd) orelse return error.NotConnected;
+    }
+    if (local.port == 0 or peer.?.port == 0 or std.meta.activeTag(local.address) != std.meta.activeTag(peer.?.address))
         return error.NotConnected;
-    const local = try windowsTcpEndpoint(name);
-    const peer = try windowsTcpEndpoint(peer_name);
-    if (local.port == 0 or peer.port == 0 or std.meta.activeTag(local.address) != std.meta.activeTag(peer.address))
-        return error.NotConnected;
-    return .{ .local = local, .peer = peer };
+    return .{ .local = local, .peer = peer.? };
 }
 
 /// AcceptEx sockets can report an empty peer sockaddr even while the TCP
@@ -497,6 +524,41 @@ pub fn observeWindowsHelixConnectedTcpSocket(fd: linux.fd_t) WindowsTcpObservati
         std.debug.print("onyx-server: Windows Helix local port is zero for socket {d}\n", .{fd});
         return error.NotConnected;
     }
+}
+
+/// Imported AcceptEx sockets can lose their process-local peer observation.
+/// Return the verified live local endpoint and any Winsock peer observation;
+/// an authenticated handoff may then compare its source peer witness with
+/// this socket only after the established TCP check succeeds.
+pub fn observeWindowsHelixConnectedTcpSocketEndpoints(fd: linux.fd_t) WindowsTcpObservationError!WindowsHelixConnectedObservation {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    try observeWindowsHelixConnectedTcpSocket(fd);
+    const socket = windows_sockets.get(fd) orelse return error.InvalidSocket;
+    const local = try windowsTcpEndpoint(socketName(socket) catch return error.NotConnected);
+    var peer_name = std.mem.zeroes(RioSockAddr6);
+    var peer_len: i32 = @sizeOf(RioSockAddr6);
+    const peer: ?WindowsTcpEndpoint = if (getpeername(socket, @ptrCast(&peer_name), &peer_len) == 0 and
+        ((peer_name.family == wsa_af_inet and peer_len == @sizeOf(RioSockAddr)) or
+            (peer_name.family == wsa_af_inet6 and peer_len == @sizeOf(RioSockAddr6))))
+    blk: {
+        const observed = try windowsTcpEndpoint(peer_name);
+        break :blk if (observed.port == 0) null else observed;
+    } else null;
+    return .{ .local = local, .peer = peer };
+}
+
+/// Preserve the signed predecessor's accepted peer witness on a staged socket.
+/// AcceptEx does not always expose getpeername after WSADuplicateSocket, and a
+/// successor can itself become the next Helix source. The caller supplies the
+/// peer only after authenticating its source roster; this function independently
+/// checks the imported canonical descriptor and established local endpoint.
+pub fn rememberWindowsHelixAcceptedTcpPeer(fd: linux.fd_t, local: WindowsTcpEndpoint, peer: WindowsTcpEndpoint) WindowsTcpObservationError!void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    if (peer.port == 0 or std.meta.activeTag(local.address) != std.meta.activeTag(peer.address)) return error.NotConnected;
+    const observed = try observeWindowsHelixConnectedTcpSocketEndpoints(fd);
+    if (!std.meta.eql(observed.local, local)) return error.NotConnected;
+    if (observed.peer) |actual| if (!std.meta.eql(actual, peer)) return error.NotConnected;
+    try windows_sockets.rememberHelixAcceptedEndpoint(fd, peer);
 }
 
 test "Windows Helix TCP observation distinguishes listening and connected registry sockets" {
@@ -3927,16 +3989,30 @@ fn closedConnection(status: std.os.windows.NTSTATUS) bool {
     };
 }
 
-fn afdAcceptPeer(out: []const u8) ?PeerAddress {
+fn afdAcceptPeer(out: []const u8) ?WindowsTcpEndpoint {
     // AFD_LISTEN_RESPONSE_INFO_TL starts with a sequence (four bytes) and a
     // native sockaddr. The peer bytes are authoritative even when Winsock's
     // getpeername on the adopted socket reports an empty sockaddr.
     if (out.len < 4 + @sizeOf(RioSockAddr)) return null;
     const family = std.mem.readInt(u16, out[4..6], .native);
-    if (family == wsa_af_inet) return .{ .ipv4 = out[8..12].* };
+    const port = std.mem.readInt(u16, out[6..8], .big);
+    if (port == 0) return null;
+    if (family == wsa_af_inet) return .{ .address = .{ .ipv4 = out[8..12].* }, .port = port };
     if (family == wsa_af_inet6 and out.len >= 4 + @sizeOf(RioSockAddr6))
-        return .{ .ipv6 = out[12..28].* };
+        return .{ .address = .{ .ipv6 = out[12..28].* }, .port = port };
     return null;
+}
+
+test "AFD accept peer keeps the exact TCP port for Windows Helix joins" {
+    var v4: [4 + @sizeOf(RioSockAddr)]u8 = @splat(0);
+    std.mem.writeInt(u16, v4[4..6], wsa_af_inet, .native);
+    std.mem.writeInt(u16, v4[6..8], 49152, .big);
+    @memcpy(v4[8..12], &[_]u8{ 127, 0, 0, 1 });
+    const peer = afdAcceptPeer(&v4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 49152), peer.port);
+    try std.testing.expectEqualDeep(PeerAddress{ .ipv4 = .{ 127, 0, 0, 1 } }, peer.address);
+    std.mem.writeInt(u16, v4[6..8], 0, .big);
+    try std.testing.expect(afdAcceptPeer(&v4) == null);
 }
 
 /// Move the connection named by the wait-for-listen sequence onto a new

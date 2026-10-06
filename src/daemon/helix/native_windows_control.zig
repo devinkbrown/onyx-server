@@ -10,7 +10,7 @@ const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const Key = [32]u8;
 pub const Identity = struct { generation: u64, upgrade_id: [16]u8 };
-pub const Kind = enum(u16) { hello = 1, capabilities, arena, descriptors, ack, ready, commit, abort, wal_custody, source_digest, commit_ack, metrics_custody, webhook_custody, history_custody, udp_custody };
+pub const Kind = enum(u16) { hello = 1, capabilities, arena, descriptors, ack, ready, commit, abort, wal_custody, source_digest, commit_ack, metrics_custody, webhook_custody, history_custody, udp_custody, media_custody, webtransport_custody, active_media_udp_custody };
 pub const max_body = 2048;
 pub const header_len = 48;
 pub const tag_len = Hmac.mac_length;
