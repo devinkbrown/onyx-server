@@ -296,16 +296,20 @@ two distinct staged filenames in sequence and checks refusal of relative,
 malformed, and incompatible paths with held clients and account WAL continuity.
 Its `--stage-b-binary` mode requires a different binary hash and exercises one
 cross-build swap; a compatible prior build has passed that held-client and WAL
-check. A separate native smoke exercises
-two swaps with held TLS IRC and WSS sockets, checks WebSocket control frames,
+check. A TLS/WSS smoke exercises two swaps with held TLS IRC and WSS sockets,
+checks WebSocket control frames,
 and opens fresh TLS and WSS connections after each swap.
 The native v16 capability challenge requires ACME scheduler, TLS-material,
 OroWasm, active history-listener, and UDP owner custody support; an older
 candidate is rejected before socket transfer.
-A third native smoke upgrades a node with a held secured Mooring link, keeps
+The two-node mesh smoke upgrades a node with a held secured Mooring link, keeps
 attachments on both nodes connected, and checks exact cross-node deliveries.
-A fourth runs continuous `/metrics` scrapes through two swaps and checks held
-and fresh IRC clients after each one. A fifth keeps the same webhook endpoint
+A three-node sequence smoke upgrades A and then B while four same-token
+attachments across A/B/C keep their physical sockets and exchange exact
+channel and direct messages. It requires the 1/2/1 secured-link, TCP, and peer
+gauges before and after each swap, then resumes a fifth attachment from C.
+The metrics smoke runs continuous `/metrics` scrapes through two swaps and checks held
+and fresh IRC clients after each one. The webhook smoke keeps the same endpoint
 through two swaps and verifies that one POST reaches each held channel member
 exactly once after a rejected candidate and after each committed successor.
 The primary two-swap smoke also enables connection-rate and mesh-wide clone
