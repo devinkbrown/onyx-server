@@ -243,11 +243,15 @@ it from IRC, and verifies that a malformed configured plugin aborts boot.
 
 Mail delivery uses a Windows worker and a private failure journal beside the
 account WAL. The native smoke registers an account with an email address,
-observes the queued verification notice, and verifies that a deliberately
-closed relay causes a durable failure row. A real remote SMTP relay and its
-trust policy still need an acceptance test. DNS blocklist lookups use native
-UDP with a checked worker start; the module test covers listed and clean
-answers, and registration policy has a focused server test.
+observes the queued verification notice, delivers the message to a local pure
+Zig trusted STARTTLS relay, and verifies that a deliberately closed relay
+causes a durable failure row. Build the disposable relay with
+`zig build windows-mail-relay`, then run `python -B tools/windows_mail_smoke.py`.
+The mail trust store accepts PEM certificate bundles or a DER certificate;
+the daemon owns decoded anchors through worker shutdown. A real remote SMTP
+relay and its trust policy still need an acceptance test. DNS blocklist lookups
+use native UDP with a checked worker start; the module test covers listed and
+clean answers, and registration policy has a focused server test.
 
 GeoIP and ASN MMDB files load on Windows, including UTF-8 paths. Preflight
 rejects a malformed database before the listener binds. The geo worker starts

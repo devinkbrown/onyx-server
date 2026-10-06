@@ -25,7 +25,19 @@ const OwnedTrustAnchors = struct {
     anchors: std.ArrayList([]u8),
 
     fn load(allocator: std.mem.Allocator, text: []const u8) !OwnedTrustAnchors {
-        return .{ .allocator = allocator, .anchors = try onyx_server.daemon.acme_cli.loadTrustAnchors(allocator, text) };
+        var anchors = try onyx_server.daemon.acme_cli.loadTrustAnchors(allocator, text);
+        errdefer {
+            for (anchors.items) |der| allocator.free(der);
+            anchors.deinit(allocator);
+        }
+        if (anchors.items.len == 0 and text.len != 0) {
+            if (onyx_server.crypto.x509.parse(text)) |_| {
+                const der = try allocator.dupe(u8, text);
+                errdefer allocator.free(der);
+                try anchors.append(allocator, der);
+            } else |_| {}
+        }
+        return .{ .allocator = allocator, .anchors = anchors };
     }
 
     fn items(self: *const OwnedTrustAnchors) []const []const u8 {
@@ -109,6 +121,34 @@ test "managed anchors: empty and malformed bundles remain allocation-free" {
     try std.testing.expectEqual(@as(usize, 0), empty.items().len);
     try std.testing.expectEqual(@as(usize, 0), malformed.items().len);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "managed anchors: valid DER is accepted and invalid DER stays empty" {
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x4d));
+    var buffer: [2048]u8 = undefined;
+    const der = try onyx_server.proto.x509_selfsign.buildSelfSigned(&buffer, .{
+        .common_name = "relay.example.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x4d, 1 },
+        .key_pair = pair,
+        .is_ca = true,
+    });
+    var trusted = try OwnedTrustAnchors.load(std.testing.allocator, der);
+    defer trusted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), trusted.items().len);
+    try std.testing.expectEqualSlices(u8, der, trusted.items()[0]);
+    var invalid = try OwnedTrustAnchors.load(std.testing.allocator, der[0 .. der.len - 1]);
+    defer invalid.deinit();
+    try std.testing.expectEqual(@as(usize, 0), invalid.items().len);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testDerAnchorAllocationPath, .{der});
+}
+
+fn testDerAnchorAllocationPath(allocator: std.mem.Allocator, der: []const u8) !void {
+    var trusted = try OwnedTrustAnchors.load(allocator, der);
+    defer trusted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), trusted.items().len);
+    try std.testing.expectEqualSlices(u8, der, trusted.items()[0]);
 }
 
 const TrustAnchorBorrowFixture = if (builtin.is_test) struct {
@@ -2262,11 +2302,10 @@ pub fn main(init: std.process.Init) !void {
     // Background SMTP submission sender: built only when `[mail]` is enabled with
     // a relay host + sender address. Delivers account email-verification codes
     // out-of-band. Inert otherwise (emails are recorded unverified).
-    var mail_trust: ?[]u8 = null;
-    defer if (mail_trust) |bytes| allocator.free(bytes);
+    var mail_trust: ?OwnedTrustAnchors = null;
+    defer if (mail_trust) |*owner| owner.deinit();
     var mail_failure_path: ?[]u8 = null;
     defer if (mail_failure_path) |path| allocator.free(path);
-    var mail_anchor_slot: [1][]const u8 = undefined;
     var mail_send: ?onyx_server.daemon.mail_sender.Sender = null;
     defer if (mail_send) |*m| m.deinit();
     if (held) |h| {
@@ -2279,16 +2318,18 @@ pub fn main(init: std.process.Init) !void {
                 }
                 var anchors: []const []const u8 = &.{};
                 if (m.trust_store_path) |path| {
-                    mail_trust = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| blk: {
+                    const trust_text: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| blk: {
                         if (comptime builtin.os.tag == .windows) return err;
                         if (native_incoming != null) return err;
                         std.debug.print("mail: cannot read trust store {s}: {s}\n", .{ path, @errorName(err) });
                         break :blk null;
                     };
-                    if (mail_trust) |bytes| if (bytes.len != 0) {
-                        mail_anchor_slot[0] = bytes;
-                        anchors = &mail_anchor_slot;
-                    };
+                    if (trust_text) |bytes| {
+                        defer allocator.free(bytes);
+                        mail_trust = try OwnedTrustAnchors.load(allocator, bytes);
+                        if (mail_trust.?.items().len == 0) return error.NoTrustAnchors;
+                        anchors = mail_trust.?.items();
+                    }
                 }
                 mail_send = onyx_server.daemon.mail_sender.Sender.init(allocator, .{
                     .relay_host = relay,

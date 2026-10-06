@@ -1043,6 +1043,19 @@ pub fn build(b: *std.Build) void {
     const windows_helix_early_client_step = b.step("windows-helix-early-client", "Build the native Zig TLS 0-RTT smoke client");
     windows_helix_early_client_step.dependOn(&b.addInstallArtifact(windows_helix_early_client, .{}).step);
 
+    const windows_mail_relay = b.addExecutable(.{
+        .name = "windows-mail-relay",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/windows_mail_relay.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
+        }),
+    });
+    const windows_mail_relay_step = b.step("windows-mail-relay", "Build the pure Zig Windows STARTTLS mail smoke relay");
+    windows_mail_relay_step.dependOn(&b.addInstallArtifact(windows_mail_relay, .{}).step);
+
     // `zig build bogo-shim-test` — the self-driven proof: builds+installs the
     // shim, then runs the shim file's own `test` blocks (parse + framing units,
     // plus subprocess exit-code smokes that spawn the installed binary and drive
