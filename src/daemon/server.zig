@@ -2309,6 +2309,9 @@ pub const Config = struct {
     /// Exact Windows boot source and ordered config indirection commitment.
     /// This is populated only after a successful single config-file read.
     windows_helix_source_digest: ?[32]u8 = null,
+    /// Raw source transcript, before static effective material is added. A
+    /// matching REHASH can retain upgrade eligibility for unchanged policy.
+    windows_helix_raw_source_digest: ?[32]u8 = null,
     /// Auto-created node keyfiles are outside the boot-source commitment.
     windows_helix_explicit_node_secret: bool = false,
     /// A per-boot cloak key would change accepted host masks at handoff.
@@ -3681,6 +3684,10 @@ const WakeBatch = struct {
 const DeferredUpgradeRequest = union(enum) {
     signal,
     client: client_model.ClientId,
+    client_target: struct {
+        id: client_model.ClientId,
+        executable: [:0]u8,
+    },
 };
 
 /// Test-only result buffer for an in-process exec-equivalent Helix handoff.
@@ -4466,6 +4473,9 @@ pub const LinuxServer = struct {
     /// Windows native process handoff may use the source proof only while this
     /// remains true; a future exact live-policy proof can reauthorize it.
     windows_helix_source_valid: std.atomic.Value(bool) = .init(false),
+    /// One native candidate owns the shared Windows process driver at a time,
+    /// including the interval before the reactor handoff barrier is claimed.
+    windows_helix_upgrade_claimed: std.atomic.Value(bool) = .init(false),
     owned_disabled_features: ?[][]const u8 = null,
     /// Process-wide TLS 1.3 resumption key. Generated once at daemon init when
     /// resumption is enabled, then copied into every per-connection TLS config so
@@ -8126,7 +8136,13 @@ pub const LinuxServer = struct {
             closeFd(self.self_pidfd);
             self.self_pidfd = -1;
         }
-        for (self.reactors) |*reactor| reactor.deinit();
+        for (self.reactors) |*reactor| {
+            if (reactor.deferred_upgrade) |pending| switch (pending) {
+                .client_target => |target| self.allocator.free(target.executable),
+                else => {},
+            };
+            reactor.deinit();
+        }
         self.allocator.free(self.reactors);
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
         self.inherited_mesh_redials.deinit(self.allocator);
@@ -9775,6 +9791,10 @@ pub const LinuxServer = struct {
         }
         const request = self.rx().deferred_upgrade orelse return;
         self.rx().deferred_upgrade = null;
+        defer switch (request) {
+            .client_target => |target| self.allocator.free(target.executable),
+            else => {},
+        };
         self.performUpgrade(request) catch |err| {
             srvLog("onyx-server: deferred UPGRADE failed: {s}\n", .{@errorName(err)});
         };
@@ -28959,11 +28979,59 @@ pub const LinuxServer = struct {
     /// state rides the v2 `.ws_session` capsule (see wsCarryable), so even a
     /// mid-frame browser client survives with no lost bytes.
     pub fn handleUpgrade(self: *LinuxServer, conn: *ConnState) !void {
+        return self.handleUpgradeCommand(conn, &.{});
+    }
+
+    /// An explicit Windows target is copied into the deferred request because
+    /// the parsed IRC line is gone before the owner reactor reaches its safe
+    /// handoff point. No socket custody moves until that image is challenged.
+    pub fn handleUpgradeCommand(self: *LinuxServer, conn: *ConnState, params: []const []const u8) !void {
         if (!self.requirePriv(conn, .server_restart)) return;
+        if (params.len > 1 or (params.len == 1 and (builtin.os.tag != .windows or
+            params[0].len < 3 or !std.ascii.isAlphabetic(params[0][0]) or
+            params[0][1] != ':' or (params[0][2] != '\\' and params[0][2] != '/') or
+            std.mem.indexOfAny(u8, params[0], "\x00\r\n\"") != null)))
+        {
+            try self.noticeTo(conn, "UPGRADE refused: use one fully qualified local Windows executable path");
+            return;
+        }
         // Compare the on-disk listener set before the upgrade is queued. SIGUSR2
         // is the signal the operator sends after this command, or after
         // `--check-config --against`, has already refused.
         if (try self.upgradeRefusedForListenerChange(conn)) return;
+        if (params.len == 1) {
+            if (self.rx().deferred_upgrade != null) {
+                try self.noticeTo(conn, "UPGRADE already pending on this reactor");
+                return;
+            }
+            const io = self.config.crypto_io orelse return error.NativeUpgradeUnavailable;
+            const running = self.config.exe_path orelse return error.NativeUpgradeUnavailable;
+            const running_canonical = std.Io.Dir.cwd().realPathFileAlloc(io, running, self.allocator) catch {
+                try self.noticeTo(conn, "UPGRADE refused: cannot verify running executable directory");
+                return;
+            };
+            defer self.allocator.free(running_canonical);
+            const executable = std.Io.Dir.cwd().realPathFileAlloc(io, params[0], self.allocator) catch {
+                try self.noticeTo(conn, "UPGRADE refused: cannot open staged executable");
+                return;
+            };
+            var queued = false;
+            defer if (!queued) self.allocator.free(executable);
+            const running_dir = std.fs.path.dirname(running_canonical) orelse return error.NativeUpgradeUnavailable;
+            const target_dir = std.fs.path.dirname(executable) orelse return error.NativeUpgradeUnavailable;
+            const target_name = std.fs.path.basename(executable);
+            if (!std.ascii.eqlIgnoreCase(running_dir, target_dir) or
+                target_name.len < "onyx-server.exe".len or
+                !std.ascii.eqlIgnoreCase(target_name[0.."onyx-server".len], "onyx-server") or
+                !std.ascii.eqlIgnoreCase(target_name[target_name.len - ".exe".len ..], ".exe"))
+            {
+                try self.noticeTo(conn, "UPGRADE refused: staged onyx-server executable must be beside the running image");
+                return;
+            }
+            self.deferUpgrade(.{ .client_target = .{ .id = idFromToken(conn.token), .executable = executable } });
+            queued = true;
+            return;
+        }
         self.deferUpgrade(.{ .client = idFromToken(conn.token) });
     }
 
@@ -29093,13 +29161,13 @@ pub const LinuxServer = struct {
     }
 
     fn deferredUpgradeRequester(self: *LinuxServer, request: DeferredUpgradeRequest) ?*ConnState {
-        return switch (request) {
+        const id = switch (request) {
             .signal => null,
-            .client => |id| blk: {
-                if (id.shard != self.rx().shard_id) break :blk null;
-                break :blk self.rx().clients.get(id);
-            },
-        };
+            .client => |client| client,
+            .client_target => |target| target.id,
+        } orelse return null;
+        if (id.shard != self.rx().shard_id) return null;
+        return self.rx().clients.get(id);
     }
 
     fn deferredUpgradeNotice(self: *LinuxServer, request: DeferredUpgradeRequest, msg: []const u8) void {
@@ -30335,7 +30403,10 @@ pub const LinuxServer = struct {
         }
         if (comptime builtin.os.tag == .windows) {
             const hooks = self.config.native_upgrade_hooks orelse return error.NativeUpgradeUnavailable;
-            const exe_target = self.config.exe_path orelse return error.NativeUpgradeUnavailable;
+            const exe_target = switch (request) {
+                .client_target => |target| target.executable,
+                else => self.config.exe_path orelse return error.NativeUpgradeUnavailable,
+            };
             if (!self.windows_helix_source_valid.load(.acquire) or self.config.windows_helix_source_digest == null or
                 self.config.config_path == null or !self.config.windows_helix_explicit_node_secret or
                 !self.config.windows_helix_explicit_cloak_secret)
@@ -30343,6 +30414,11 @@ pub const LinuxServer = struct {
                 self.deferredUpgradeNotice(request, "UPGRADE refused: Windows config or external material has no exact source proof");
                 return error.NativeUpgradeUnavailable;
             }
+            if (self.windows_helix_upgrade_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+                self.deferredUpgradeNotice(request, "UPGRADE refused: another Windows candidate is active");
+                return error.UpgradeAlreadyActive;
+            }
+            defer self.windows_helix_upgrade_claimed.store(false, .release);
             try hooks.begin(hooks.ctx, exe_target);
             defer hooks.abort(hooks.ctx);
             return self.performUpgradeAfterCompatibleTarget(request, -1, exe_target);

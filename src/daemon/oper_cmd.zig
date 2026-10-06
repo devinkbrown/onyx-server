@@ -10,6 +10,7 @@ const client_model = @import("client.zig");
 const cloak = @import("../proto/cloak.zig");
 const command_usage = @import("command_usage.zig");
 const config_format = @import("config_format.zig");
+const windows_config_proof = @import("helix/native_windows_config_proof.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const kill_relay = @import("../proto/kill_relay.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
@@ -1131,6 +1132,41 @@ pub fn handleRehashParsed(self: anytype, conn: anytype, parsed_line: anytype) !v
     try rehashFromConn(self, conn, dry);
 }
 
+/// Capture the values consumed by this parse, rather than resolving a second
+/// time after REHASH has already changed live state. Proof exhaustion only
+/// disqualifies Helix; it does not change ordinary REHASH parsing semantics.
+const WindowsRehashProof = struct {
+    inner: config_format.Resolver,
+    proof: *windows_config_proof.Builder,
+    failed: bool = false,
+
+    fn resolver(self: *WindowsRehashProof) config_format.Resolver {
+        return .{
+            .ctx = self,
+            .env = if (self.inner.env != null) environment else null,
+            .file = if (self.inner.file != null) file else null,
+        };
+    }
+
+    fn environment(ctx: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
+        const self: *WindowsRehashProof = @ptrCast(@alignCast(ctx.?));
+        const value = try self.inner.env.?(self.inner.ctx, allocator, name);
+        if (!self.failed) self.proof.recordEnvironment(name, value) catch {
+            self.failed = true;
+        };
+        return value;
+    }
+
+    fn file(ctx: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8) anyerror![]const u8 {
+        const self: *WindowsRehashProof = @ptrCast(@alignCast(ctx.?));
+        const value = try self.inner.file.?(self.inner.ctx, allocator, path);
+        if (!self.failed) self.proof.recordFile(path, value) catch {
+            self.failed = true;
+        };
+        return value;
+    }
+};
+
 fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     const Server = @TypeOf(self.*);
     if (!self.requirePriv(conn, .server_rehash)) return;
@@ -1143,13 +1179,37 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
         try self.replyNumeric(conn, .RPL_REHASHING, &.{path}, "No I/O available; cannot reload");
         return;
     };
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(1 << 20)) catch {
+    const proof_candidate = if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid"))
+        self.windows_helix_source_valid.load(.acquire) and
+            self.config.windows_helix_raw_source_digest != null and
+            self.config.tls_port == 0 and self.config.tls_cert_chain.len == 0 and
+            !self.config.tls_enable_resumption and self.config.wasm_plugin_dir.len == 0
+    else
+        false;
+    const canonical_path: ?[:0]u8 = if (proof_candidate)
+        std.Io.Dir.cwd().realPathFileAlloc(io, path, self.allocator) catch null
+    else
+        null;
+    defer if (canonical_path) |canonical| self.allocator.free(canonical);
+    const source_path = if (canonical_path) |canonical| canonical else path;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, source_path, self.allocator, .limited(1 << 20)) catch {
         try self.noticeTo(conn, "REHASH: cannot read config file");
         return;
     };
     defer self.allocator.free(text);
 
-    var parsed = config_format.parseToml(self.allocator, text, self.config.config_resolver) catch {
+    var proof: ?windows_config_proof.Builder = if (canonical_path) |canonical|
+        windows_config_proof.Builder.initCanonical(canonical, text) catch null
+    else
+        null;
+    defer if (proof) |*p| p.deinit();
+    var capture: ?WindowsRehashProof = null;
+    var parse_resolver = self.config.config_resolver;
+    if (proof) |*p| {
+        capture = .{ .inner = parse_resolver, .proof = p };
+        parse_resolver = (&capture.?).resolver();
+    }
+    var parsed = config_format.parseToml(self.allocator, text, parse_resolver) catch {
         try self.noticeTo(conn, "REHASH: config parse error; keeping current config");
         return;
     };
@@ -1179,12 +1239,28 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     else
         null;
 
+    var source_unchanged = false;
+    if (capture) |*recorded| {
+        if (!recorded.failed) {
+            if (proof) |*p| {
+                if (p.finish()) |actual| {
+                    source_unchanged = std.crypto.timing_safe.eql(
+                        windows_config_proof.Digest,
+                        actual,
+                        self.config.windows_helix_raw_source_digest.?,
+                    );
+                } else |_| {}
+            }
+        }
+    }
+    const retain_boot_source = source_unchanged and !parsed.tls.enabled and
+        (parsed.wasm.plugin_dir == null or parsed.wasm.plugin_dir.?.len == 0);
+
     // Commit: replace the previous reloaded generation, then point the live
     // registry at the new bindings. `parsed`'s strings (incl. the TLS cert/key
     // paths consulted just below) now live in `self.reload_parsed`.
-    // The boot source no longer proves the effective Windows policy once any
-    // REHASH mutation begins. A failed later notice or TLS reload must leave
-    // native process handoff refused rather than trust the old source hash.
+    // Any failure after mutation starts leaves native handoff refused. Only a
+    // completed, byte-identical plaintext REHASH can restore the boot proof.
     if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid"))
         self.windows_helix_source_valid.store(false, .release);
     self.allocator.free(self.reload_bindings);
@@ -1229,6 +1305,10 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
         .{ bindings.len, tls_outcome.note() },
     ) catch "Configuration reloaded";
     try self.replyNumeric(conn, .RPL_REHASHING, &.{path}, note);
+    if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid")) {
+        if (retain_boot_source and tls_outcome == .not_configured)
+            self.windows_helix_source_valid.store(true, .release);
+    }
 }
 
 pub fn handleMesh(self: anytype, conn: anytype, parsed: anytype) !void {

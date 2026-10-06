@@ -1404,6 +1404,7 @@ pub fn main(init: std.process.Init) !void {
                 const carried_state_manifest_valid = srv_cfg.inherited_state_fd_manifest_valid;
                 srv_cfg = loaded.config;
                 windows_source_digest_boot = windows_source_digest;
+                srv_cfg.windows_helix_raw_source_digest = windows_source_digest;
                 srv_cfg.exe_path = carried_exe;
                 srv_cfg.resume_arena_fd = carried_resume;
                 srv_cfg.inherited_listener_fd = carried_listen;

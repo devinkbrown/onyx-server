@@ -275,7 +275,14 @@ handoff.
 
 ## Guarded Windows Helix upgrade
 
-Windows Helix launches a successor from the daemon's executable path and
+Windows Helix launches a successor from the daemon's executable path by
+default. An operator with `server_restart` privilege can select a staged image
+with `UPGRADE :C:\\path\\beside-current\\onyx-server-next.exe`. The target must
+be a fully qualified local path to an `onyx-server*.exe` in the running image's
+directory. Keep that directory writable only by the deployment administrator:
+the candidate process starts before its capability challenge, although no
+socket or state custody moves until the actual child passes that challenge.
+A rejected image leaves the serving process and its clients active. The handoff
 transfers authenticated custody of TCP listeners and client or mesh-link
 sockets, the metrics listener and snapshot, the webhook listener and binding
 store, a WebTransport UDP listener with its Retry/replay and active QUIC state, plus the
@@ -284,8 +291,12 @@ the carried state while inert, then publishes it only after authenticated
 COMMIT and predecessor exit. The native smoke first rejects a changed candidate
 configuration and proves the predecessor's sockets and WAL remain usable, then
 exercises two consecutive swaps with held plaintext IRC sockets, account reads
-and writes, and an unchanged local session token. It has not yet exercised a
-swap between different binary versions. A separate native smoke exercises
+and writes, and an unchanged local session token. A staged-path smoke selects
+two distinct staged filenames in sequence and checks refusal of relative,
+malformed, and incompatible paths with held clients and account WAL continuity.
+Its `--stage-b-binary` mode requires a different binary hash and exercises one
+cross-build swap; a compatible prior build has passed that held-client and WAL
+check. A separate native smoke exercises
 two swaps with held TLS IRC and WSS sockets, checks WebSocket control frames,
 and opens fresh TLS and WSS connections after each swap.
 The native v16 capability challenge requires ACME scheduler, TLS-material,
@@ -310,9 +321,13 @@ and TLS 1.2 certificates. The predecessor and candidate must reproduce the
 same loaded source, ordered `env:` and `@file:` substitutions, static TLS
 settings, identity material, and OAuth JWKS bytes. The authenticated TLS
 material checkpoint supplies the exact serving certificate and key generations
-before COMMIT. A `REHASH` invalidates the boot source proof; a fresh normal
-boot is needed before a later Windows Helix upgrade. ACME renewal does not
-invalidate that static proof.
+before COMMIT. A completed `REHASH` retains Windows Helix eligibility when
+the canonical config source and every ordered `env:` and `@file:` value still
+match startup, TLS and resumption are disabled, and no WASM plugin directory
+is configured. A changed REHASH invalidates eligibility for that process,
+even if a later REHASH restores the original text; a normal boot is then
+needed before another upgrade. ACME renewal does not invalidate the static
+proof.
 
 The guarded path carries Web Push worker state, mail queue and private journal
 custody, Geo worker cache and pinned GeoIP/ASN databases, channel statistics,

@@ -3,19 +3,18 @@
 
 //! ops.upgrade module — UPGRADE operator command (Helix hot in-place upgrade).
 //!
-//! Thin dispatch wrapper: the real work lives in `LinuxServer.handleUpgrade`,
-//! which serializes every registered session into a sealed memfd arena and
-//! re-execs `--supervisor` preserving the listening socket + the arena (the
-//! successor recovers the session state). Oper-gated, Linux-only.
+//! Thin dispatch wrapper: the real work lives in `LinuxServer.handleUpgrade`.
+//! Windows may select a staged absolute executable path; the native candidate
+//! must pass the same capability and authenticated state checks as the default.
 const std = @import("std");
 const registry = @import("../registry.zig");
 const module_core = @import("../module_core.zig");
 
 const Core = module_core.Core;
 
-fn upgrade(ctx: *anyopaque, _: registry.CommandInvocation) anyerror!void {
+fn upgrade(ctx: *anyopaque, invocation: registry.CommandInvocation) anyerror!void {
     const core = Core.from(ctx);
-    try core.server.handleUpgrade(core.conn);
+    try core.server.handleUpgradeCommand(core.conn, invocation.params);
 }
 
 pub const module = registry.Module{

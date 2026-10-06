@@ -82,8 +82,11 @@ def free_port() -> int:
 
 
 def image_pids(binary: Path) -> set[int]:
+    image_name = binary.name
+    if not image_name or not all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in image_name):
+        raise ValueError("unsafe executable name for Windows process query")
     script = (
-        "Get-CimInstance Win32_Process -Filter \"Name='onyx-server.exe'\" | "
+        f"Get-CimInstance Win32_Process -Filter \"Name='{image_name}'\" | "
         "ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.ExecutablePath }"
     )
     result = subprocess.run(
