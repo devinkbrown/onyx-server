@@ -1484,6 +1484,9 @@ pub const NativeUpgradeHooks = struct {
     /// Execute the inert successor and authenticate its actual capabilities
     /// before the server freezes any service/socket owner.
     begin: *const fn (*anyopaque, []const u8) anyerror!void,
+    /// Launch the pinned boot image for automatic Windows descriptor rollover.
+    /// Missing custody refuses the request before any owner is paused.
+    beginSameImage: ?*const fn (*anyopaque) anyerror!void = null,
     /// Error returns are pre-COMMIT only. Success exits the predecessor without
     /// shutdown/deinit of sockets shared with the committed successor.
     transferAndCommit: *const fn (*anyopaque, NativeUpgradeSnapshot) anyerror!noreturn,
@@ -3685,12 +3688,14 @@ const WakeBatch = struct {
 /// slot. The full generational ClientId is revalidated at the safe point.
 const DeferredUpgradeRequest = union(enum) {
     signal,
+    windows_descriptor_rollover,
     client: client_model.ClientId,
     client_target: struct {
         id: client_model.ClientId,
         executable: [:0]u8,
     },
 };
+const windows_descriptor_rollover_retry_ms: i64 = 60_000;
 
 /// Test-only result buffer for an in-process exec-equivalent Helix handoff.
 /// The producer writes every field before publishing `completed` with release;
@@ -3784,6 +3789,9 @@ const Reactor = struct {
     /// One stable deferred request per owner. Concurrent requests coalesce while
     /// the first is waiting for the end-of-batch safe point.
     deferred_upgrade: ?DeferredUpgradeRequest = null,
+    /// True while this owner's manual request contributes to the process-wide
+    /// Windows upgrade priority count. It stays counted during handoff.
+    deferred_upgrade_counted: bool = false,
 
     /// Fan-out wake coalescer, touched ONLY by this reactor's own thread while it
     /// runs a broadcast (`beginWakeBatch`/`endWakeBatch`). During a batch, each
@@ -4478,6 +4486,14 @@ pub const LinuxServer = struct {
     /// One native candidate owns the shared Windows process driver at a time,
     /// including the interval before the reactor handoff barrier is claimed.
     windows_helix_upgrade_claimed: std.atomic.Value(bool) = .init(false),
+    /// Orders manual request publication on every reactor against reactor 0's
+    /// automatic descriptor rollover candidate claim. A manual request remains
+    /// counted until its handoff attempt has finished.
+    windows_upgrade_priority_lock: std.atomic.Mutex = .unlocked,
+    windows_manual_upgrade_pending: usize = 0,
+    /// Reactor-0 monotonic retry guard for automatic Windows descriptor-ID
+    /// rollover. The successor starts fresh after Helix imports only live IDs.
+    windows_descriptor_rollover_retry_after_ms: i64 = 0,
     owned_disabled_features: ?[][]const u8 = null,
     /// Process-wide TLS 1.3 resumption key. Generated once at daemon init when
     /// resumption is enabled, then copied into every per-connection TLS config so
@@ -8148,12 +8164,10 @@ pub const LinuxServer = struct {
             self.self_pidfd = -1;
         }
         for (self.reactors) |*reactor| {
-            if (reactor.deferred_upgrade) |pending| switch (pending) {
-                .client_target => |target| self.allocator.free(target.executable),
-                else => {},
-            };
+            self.discardDeferredUpgrade(reactor);
             reactor.deinit();
         }
+        if (comptime builtin.os.tag == .windows) std.debug.assert(self.windows_manual_upgrade_pending == 0);
         self.allocator.free(self.reactors);
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
         self.inherited_mesh_redials.deinit(self.allocator);
@@ -8543,6 +8557,15 @@ pub const LinuxServer = struct {
         // failure is logged and the daemon keeps serving.
         if (self.isMaintenanceReactor() and upgrade_signal_requested.swap(false, .seq_cst)) {
             self.deferUpgrade(.signal);
+        }
+        if (comptime builtin.os.tag == .windows) {
+            if (self.isMaintenanceReactor()) {
+                _ = self.maybeDeferWindowsDescriptorRollover(
+                    self.nowMs(),
+                    io_backend.windowsSocketIdRolloverDue(),
+                    os_runtime.windowsFileIdRolloverDue(),
+                );
+            }
         }
         if (self.isMaintenanceReactor()) self.maybeReloadAcmeTls();
         if (self.isMaintenanceReactor()) self.maybeSwapOcspStaple();
@@ -9779,7 +9802,94 @@ pub const LinuxServer = struct {
     }
 
     fn deferUpgrade(self: *LinuxServer, request: DeferredUpgradeRequest) void {
-        if (self.rx().deferred_upgrade == null) self.rx().deferred_upgrade = request;
+        if (comptime builtin.os.tag == .windows) {
+            lockSpin(&self.windows_upgrade_priority_lock);
+            defer self.windows_upgrade_priority_lock.unlock();
+            // A manual request is published while holding the same lock used by
+            // the automatic candidate claim. An earlier manual request wins,
+            // even when its owner is another reactor or already handing off.
+            if (std.meta.activeTag(request) == .windows_descriptor_rollover and
+                self.windows_manual_upgrade_pending != 0) return;
+            if (self.rx().deferred_upgrade) |pending| {
+                switch (pending) {
+                    .windows_descriptor_rollover => {
+                        self.rx().deferred_upgrade = request;
+                        if (std.meta.activeTag(request) != .windows_descriptor_rollover) {
+                            self.windows_manual_upgrade_pending += 1;
+                            self.rx().deferred_upgrade_counted = true;
+                        }
+                    },
+                    else => {},
+                }
+            } else {
+                if (std.meta.activeTag(request) != .windows_descriptor_rollover) {
+                    self.windows_manual_upgrade_pending += 1;
+                    self.rx().deferred_upgrade_counted = true;
+                }
+                self.rx().deferred_upgrade = request;
+            }
+            return;
+        }
+        if (self.rx().deferred_upgrade) |pending| {
+            // A human request or SIGUSR2 received later in the same CQE batch
+            // takes precedence over an automatic rollover attempt.
+            switch (pending) {
+                .windows_descriptor_rollover => self.rx().deferred_upgrade = request,
+                else => {},
+            }
+        } else self.rx().deferred_upgrade = request;
+    }
+
+    fn finishCountedManualUpgrade(self: *LinuxServer) void {
+        if (comptime builtin.os.tag != .windows) return;
+        lockSpin(&self.windows_upgrade_priority_lock);
+        defer self.windows_upgrade_priority_lock.unlock();
+        std.debug.assert(self.windows_manual_upgrade_pending != 0);
+        self.windows_manual_upgrade_pending -= 1;
+    }
+
+    fn discardDeferredUpgrade(self: *LinuxServer, reactor: *Reactor) void {
+        if (reactor.deferred_upgrade) |request| switch (request) {
+            .client_target => |target| self.allocator.free(target.executable),
+            else => {},
+        };
+        reactor.deferred_upgrade = null;
+        if (reactor.deferred_upgrade_counted) self.finishCountedManualUpgrade();
+        reactor.deferred_upgrade_counted = false;
+    }
+
+    fn noteWindowsDescriptorRolloverAttempt(self: *LinuxServer, now_ms: i64) void {
+        self.windows_descriptor_rollover_retry_after_ms = std.math.add(
+            i64,
+            @max(@as(i64, 0), now_ms),
+            windows_descriptor_rollover_retry_ms,
+        ) catch std.math.maxInt(i64);
+    }
+
+    /// Only reactor 0 may queue this maintenance request. A failed candidate
+    /// keeps serving and is retried at most once per minute, well before either
+    /// process-local ID namespace reaches exhaustion. Helix imports live IDs;
+    /// retired predecessor IDs disappear only when that process exits.
+    fn maybeDeferWindowsDescriptorRollover(self: *LinuxServer, now_ms: i64, socket_due: bool, file_due: bool) bool {
+        if (comptime builtin.os.tag != .windows) return false;
+        if (!self.isMaintenanceReactor() or (!socket_due and !file_due) or
+            now_ms < self.windows_descriptor_rollover_retry_after_ms) return false;
+        lockSpin(&self.windows_upgrade_priority_lock);
+        if (self.windows_manual_upgrade_pending != 0 or
+            self.rx().deferred_upgrade != null or
+            self.windows_helix_upgrade_claimed.load(.acquire))
+        {
+            self.windows_upgrade_priority_lock.unlock();
+            return false;
+        }
+        self.rx().deferred_upgrade = .windows_descriptor_rollover;
+        self.windows_upgrade_priority_lock.unlock();
+        self.noteWindowsDescriptorRolloverAttempt(now_ms);
+        srvLog(
+            "onyx-server: Windows descriptor ID rollover due (socket={any}, file={any}); scheduling pinned-image Helix UPGRADE, with 60s retry interval\n",
+            .{ socket_due, file_due },
+        );
+        return true;
     }
 
     /// Run only after `runOnce` dispatched the entire copied CQE batch. The
@@ -9801,13 +9911,22 @@ pub const LinuxServer = struct {
             }
         }
         const request = self.rx().deferred_upgrade orelse return;
+        const was_counted = self.rx().deferred_upgrade_counted;
         self.rx().deferred_upgrade = null;
+        self.rx().deferred_upgrade_counted = false;
+        defer if (was_counted) self.finishCountedManualUpgrade();
         defer switch (request) {
             .client_target => |target| self.allocator.free(target.executable),
             else => {},
         };
         self.performUpgrade(request) catch |err| {
-            srvLog("onyx-server: deferred UPGRADE failed: {s}\n", .{@errorName(err)});
+            switch (request) {
+                .windows_descriptor_rollover => {
+                    self.noteWindowsDescriptorRolloverAttempt(self.nowMs());
+                    srvLog("onyx-server: Windows descriptor rollover UPGRADE failed ({s}); will retry no sooner than 60s\n", .{@errorName(err)});
+                },
+                else => srvLog("onyx-server: deferred UPGRADE failed: {s}\n", .{@errorName(err)}),
+            }
         };
     }
 
@@ -29011,10 +29130,13 @@ pub const LinuxServer = struct {
         // `--check-config --against`, has already refused.
         if (try self.upgradeRefusedForListenerChange(conn)) return;
         if (params.len == 1) {
-            if (self.rx().deferred_upgrade != null) {
-                try self.noticeTo(conn, "UPGRADE already pending on this reactor");
-                return;
-            }
+            if (self.rx().deferred_upgrade) |pending| switch (pending) {
+                .windows_descriptor_rollover => {},
+                else => {
+                    try self.noticeTo(conn, "UPGRADE already pending on this reactor");
+                    return;
+                },
+            };
             const io = self.config.crypto_io orelse return error.NativeUpgradeUnavailable;
             const running = self.config.exe_path orelse return error.NativeUpgradeUnavailable;
             const running_canonical = std.Io.Dir.cwd().realPathFileAlloc(io, running, self.allocator) catch {
@@ -29173,7 +29295,7 @@ pub const LinuxServer = struct {
 
     fn deferredUpgradeRequester(self: *LinuxServer, request: DeferredUpgradeRequest) ?*ConnState {
         const id = switch (request) {
-            .signal => null,
+            .signal, .windows_descriptor_rollover => null,
             .client => |client| client,
             .client_target => |target| target.id,
         } orelse return null;
@@ -29183,6 +29305,14 @@ pub const LinuxServer = struct {
 
     fn deferredUpgradeNotice(self: *LinuxServer, request: DeferredUpgradeRequest, msg: []const u8) void {
         self.upgradeNotice(self.deferredUpgradeRequester(request), msg);
+    }
+
+    fn deferredUpgradeActor(self: *LinuxServer, request: DeferredUpgradeRequest) []const u8 {
+        if (self.deferredUpgradeRequester(request)) |conn| return conn.session.displayName();
+        return switch (request) {
+            .windows_descriptor_rollover => "Windows descriptor rollover",
+            else => "SIGUSR2",
+        };
     }
 
     /// Open the target image once, execute that exact open file through
@@ -30469,12 +30599,30 @@ pub const LinuxServer = struct {
                 self.deferredUpgradeNotice(request, reason);
                 return error.NativeUpgradeUnavailable;
             }
-            if (self.windows_helix_upgrade_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            const candidate_claimed = if (std.meta.activeTag(request) == .windows_descriptor_rollover) blk: {
+                lockSpin(&self.windows_upgrade_priority_lock);
+                defer self.windows_upgrade_priority_lock.unlock();
+                // The same lock publishes manual intent across all reactors.
+                // Claiming before the pinned-image launch is the ordering cut:
+                // any operator request already published must run first.
+                if (self.windows_manual_upgrade_pending != 0) {
+                    srvLog("onyx-server: Windows descriptor rollover UPGRADE deferred: operator UPGRADE is pending\n", .{});
+                    return error.OperatorUpgradePending;
+                }
+                break :blk self.windows_helix_upgrade_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
+            } else self.windows_helix_upgrade_claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
+            if (!candidate_claimed) {
                 self.deferredUpgradeNotice(request, "UPGRADE refused: another Windows candidate is active");
                 return error.UpgradeAlreadyActive;
             }
             defer self.windows_helix_upgrade_claimed.store(false, .release);
-            try hooks.begin(hooks.ctx, exe_target);
+            switch (request) {
+                .windows_descriptor_rollover => {
+                    const begin_same_image = hooks.beginSameImage orelse return error.NativeUpgradeUnavailable;
+                    try begin_same_image(hooks.ctx);
+                },
+                else => try hooks.begin(hooks.ctx, exe_target),
+            }
             defer hooks.abort(hooks.ctx);
             return self.performUpgradeAfterCompatibleTarget(request, -1, exe_target);
         }
@@ -30920,7 +31068,7 @@ pub const LinuxServer = struct {
         self.drainWebhookPostsForUpgradeLocked();
 
         var nbuf: [128]u8 = undefined;
-        const requested_by = if (self.deferredUpgradeRequester(request)) |c| c.session.displayName() else "SIGUSR2";
+        const requested_by = self.deferredUpgradeActor(request);
         const note = std.fmt.bufPrint(&nbuf, "UPGRADE requested by {s}", .{requested_by}) catch "UPGRADE";
         try self.publishOperEvent(.oper_action, .critical, note);
         // Queue the requester acknowledgement before the authoritative drain.
@@ -102110,6 +102258,200 @@ test "Windows UPGRADE with replay-backed TLS reaches candidate preflight without
     try std.testing.expect(candidate_started);
     try std.testing.expectEqual(ticket_key_before, server.tls_ticket_key);
     try std.testing.expect(!server.tls_replay_guard.checkAndRecord(&binder));
+}
+
+test "Windows descriptor rollover defers once and backs off without replacing operator requests" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+
+    try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(1_000, false, false));
+    try std.testing.expect(server.maybeDeferWindowsDescriptorRollover(1_000, true, false));
+    try std.testing.expect(std.meta.activeTag(server.reactors[0].deferred_upgrade.?) == .windows_descriptor_rollover);
+    try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(1_001, true, true));
+    server.deferUpgrade(.signal);
+    try std.testing.expect(std.meta.activeTag(server.reactors[0].deferred_upgrade.?) == .signal);
+    try std.testing.expectEqual(@as(usize, 1), server.windows_manual_upgrade_pending);
+    server.discardDeferredUpgrade(&server.reactors[0]);
+    try std.testing.expectEqual(@as(usize, 0), server.windows_manual_upgrade_pending);
+    try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(60_999, true, false));
+    try std.testing.expect(server.maybeDeferWindowsDescriptorRollover(61_000, false, true));
+    server.discardDeferredUpgrade(&server.reactors[0]);
+    server.noteWindowsDescriptorRolloverAttempt(62_000); // failed candidate
+    try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(121_999, true, true));
+    try std.testing.expect(server.maybeDeferWindowsDescriptorRollover(122_000, true, true));
+    server.discardDeferredUpgrade(&server.reactors[0]);
+    server.windows_helix_upgrade_claimed.store(true, .release);
+    try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(182_000, true, true));
+    server.windows_helix_upgrade_claimed.store(false, .release);
+    server.deferUpgrade(.signal);
+    try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(182_000, true, true));
+    try std.testing.expect(std.meta.activeTag(server.reactors[0].deferred_upgrade.?) == .signal);
+    server.discardDeferredUpgrade(&server.reactors[0]);
+    current_reactor = null;
+    try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(182_000, true, true));
+    try std.testing.expect(server.reactors[0].deferred_upgrade == null);
+    try std.testing.expectEqualStrings("Windows descriptor rollover", server.deferredUpgradeActor(.windows_descriptor_rollover));
+    try std.testing.expectEqualStrings("SIGUSR2", server.deferredUpgradeActor(.signal));
+}
+
+test "Windows rollover yields to signal and target UPGRADE on another reactor" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    defer current_reactor = null;
+    try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+
+    const Hooks = struct {
+        const State = struct {
+            server: *Server,
+            manual_started: usize = 0,
+            pinned_started: usize = 0,
+            in_flight_refused: usize = 0,
+        };
+        fn beginPath(raw: *anyopaque, _: []const u8) anyerror!void {
+            const state: *State = @ptrCast(@alignCast(raw));
+            state.manual_started += 1;
+            // The owning reactor has removed its slot, but its manual claim
+            // must still block maintenance on reactor 0 until this returns.
+            try std.testing.expectEqual(@as(usize, 1), state.server.windows_manual_upgrade_pending);
+            try std.testing.expectError(error.OperatorUpgradePending, state.server.performUpgrade(.windows_descriptor_rollover));
+            state.in_flight_refused += 1;
+            return error.TestManualBegin;
+        }
+        fn beginPinned(raw: *anyopaque) anyerror!void {
+            const state: *State = @ptrCast(@alignCast(raw));
+            state.pinned_started += 1;
+            return error.TestUnexpectedPinnedBegin;
+        }
+        fn transferAndCommit(_: *anyopaque, _: NativeUpgradeSnapshot) anyerror!noreturn {
+            return error.TestUnexpectedResult;
+        }
+        fn abort(_: *anyopaque) void {}
+    };
+    var state = Hooks.State{ .server = server };
+    server.config.native_upgrade_hooks = .{
+        .ctx = &state,
+        .begin = Hooks.beginPath,
+        .beginSameImage = Hooks.beginPinned,
+        .transferAndCommit = Hooks.transferAndCommit,
+        .abort = Hooks.abort,
+    };
+    server.config.exe_path = "unused-native-test-image";
+    server.config.config_path = "unused-native-test-config";
+    server.config.windows_helix_source_digest = @splat(0x44);
+    server.config.windows_helix_explicit_node_secret = true;
+    server.config.windows_helix_explicit_cloak_secret = true;
+    server.windows_helix_source_valid.store(true, .release);
+
+    for (0..2) |kind| {
+        current_reactor = &server.reactors[1];
+        if (kind == 0) {
+            server.deferUpgrade(.signal);
+        } else {
+            const executable = try allocator.dupeSentinel(u8, "unused-operator-target", 0);
+            server.deferUpgrade(.{ .client_target = .{ .id = client_model.ClientId.invalid, .executable = executable } });
+        }
+        try std.testing.expectEqual(@as(usize, 1), server.windows_manual_upgrade_pending);
+        current_reactor = &server.reactors[0];
+        try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(@as(i64, @intCast(1_000 + kind * 61_000)), true, true));
+        try std.testing.expect(server.reactors[0].deferred_upgrade == null);
+        try std.testing.expectError(error.OperatorUpgradePending, server.performUpgrade(.windows_descriptor_rollover));
+        try std.testing.expectEqual(@as(usize, 0), state.pinned_started);
+
+        current_reactor = &server.reactors[1];
+        server.runDeferredUpgrade();
+        try std.testing.expectEqual(kind + 1, state.manual_started);
+        try std.testing.expectEqual(kind + 1, state.in_flight_refused);
+        try std.testing.expectEqual(@as(usize, 0), server.windows_manual_upgrade_pending);
+        try std.testing.expect(server.reactors[1].deferred_upgrade == null);
+        current_reactor = &server.reactors[0];
+        try std.testing.expect(server.maybeDeferWindowsDescriptorRollover(@as(i64, @intCast(1_000 + kind * 61_000)), true, true));
+        server.discardDeferredUpgrade(&server.reactors[0]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.pinned_started);
+}
+
+test "Windows descriptor rollover requires pinned-image launch hook" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const Hooks = struct {
+        const Counts = struct { path: usize = 0, pinned: usize = 0 };
+        fn beginPath(ctx: *anyopaque, _: []const u8) anyerror!void {
+            const counts: *Counts = @ptrCast(@alignCast(ctx));
+            counts.path += 1;
+            return error.TestPathBegin;
+        }
+        fn beginPinned(ctx: *anyopaque) anyerror!void {
+            const counts: *Counts = @ptrCast(@alignCast(ctx));
+            counts.pinned += 1;
+            return error.TestPinnedBegin;
+        }
+        fn transferAndCommit(_: *anyopaque, _: NativeUpgradeSnapshot) anyerror!noreturn {
+            return error.TestUnexpectedResult;
+        }
+        fn abort(_: *anyopaque) void {}
+    };
+    var counts = Hooks.Counts{};
+    server.config.native_upgrade_hooks = .{
+        .ctx = &counts,
+        .begin = Hooks.beginPath,
+        .beginSameImage = Hooks.beginPinned,
+        .transferAndCommit = Hooks.transferAndCommit,
+        .abort = Hooks.abort,
+    };
+    server.config.exe_path = "unused-native-test-image";
+    server.config.config_path = "unused-native-test-config";
+    server.config.windows_helix_source_digest = @splat(0x44);
+    server.config.windows_helix_explicit_node_secret = true;
+    server.config.windows_helix_explicit_cloak_secret = true;
+    server.windows_helix_source_valid.store(true, .release);
+    try std.testing.expectError(error.TestPinnedBegin, server.performUpgrade(.windows_descriptor_rollover));
+    try std.testing.expectEqual(@as(usize, 0), counts.path);
+    try std.testing.expectEqual(@as(usize, 1), counts.pinned);
+    try std.testing.expect(!server.windows_helix_upgrade_claimed.load(.acquire));
+    server.config.native_upgrade_hooks.?.beginSameImage = null;
+    try std.testing.expectError(error.NativeUpgradeUnavailable, server.performUpgrade(.windows_descriptor_rollover));
+    try std.testing.expectEqual(@as(usize, 0), counts.path);
+    try std.testing.expectEqual(@as(usize, 1), counts.pinned);
+}
+
+test "Linux maintenance never defers a Windows descriptor rollover" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(!server.maybeDeferWindowsDescriptorRollover(1_000, true, true));
+    try std.testing.expect(server.reactors[0].deferred_upgrade == null);
 }
 
 test "Windows history HTTPS stages old TLS material long OCSP and mandatory HXRG" {

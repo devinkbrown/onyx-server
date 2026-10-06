@@ -96,11 +96,17 @@ pub const Driver = struct {
     allocator: std.mem.Allocator,
     config_path: ?[]const u8 = null,
     source_digest: ?[32]u8 = null,
+    /// Absolute path reported for this process image at boot; kept alive by
+    /// main for the daemon lifetime.
+    boot_image_path: ?[]const u8 = null,
+    /// Digest of the executable at startup. Maintenance may launch only these
+    /// exact bytes, even if an operator has since staged a replacement image.
+    boot_image_digest: ?[32]u8 = null,
     candidate: ?process.Process = null,
     deadline: i64 = 0,
 
     pub fn hooks(self: *Driver) server.NativeUpgradeHooks {
-        return .{ .ctx = self, .begin = begin, .transferAndCommit = transferAndCommit, .abort = abort };
+        return .{ .ctx = self, .begin = begin, .beginSameImage = beginSameImage, .transferAndCommit = transferAndCommit, .abort = abort };
     }
 
     fn begin(ctx: *anyopaque, executable: []const u8) !void {
@@ -112,6 +118,19 @@ pub const Driver = struct {
         self.deadline = platform.monotonicMillis() + timeout_ms;
         const generation: u64 = @intCast(@max(1, platform.monotonicMillis()));
         self.candidate = try process.Process.spawn(self.allocator, executable, self.config_path, generation, self.deadline);
+    }
+
+    fn beginSameImage(ctx: *anyopaque) !void {
+        if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        const self: *Driver = @ptrCast(@alignCast(ctx));
+        if (self.candidate != null) return error.UpgradeAlreadyActive;
+        if (self.source_digest == null or self.config_path == null or self.config_path.?.len == 0)
+            return error.UnprovenConfigSource;
+        const boot_digest = self.boot_image_digest orelse return error.UnprovenRunningImage;
+        const executable = self.boot_image_path orelse return error.UnprovenRunningImage;
+        self.deadline = platform.monotonicMillis() + timeout_ms;
+        const generation: u64 = @intCast(@max(1, platform.monotonicMillis()));
+        self.candidate = try process.spawnSameImage(self.allocator, executable, self.config_path, generation, self.deadline, boot_digest);
     }
 
     fn abort(ctx: *anyopaque) void {

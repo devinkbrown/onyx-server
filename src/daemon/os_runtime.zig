@@ -20,6 +20,7 @@ pub const AddressLength = posix.socklen_t;
 pub const Error = error{ Interrupted, WouldBlock, PermissionDenied, FileBusy, InsecurePermissions, InvalidDescriptor, FileNotFound, PathAlreadyExists, InvalidPath, OutOfMemory, DescriptorExhausted, Unexpected, Unsupported };
 
 const windows_file_fd_first: Fd = 0x4000_0000;
+const windows_file_rollover_at: Fd = 0x6000_0000;
 const invalid_windows_handle = std.math.maxInt(usize);
 const windows_generic_read: u32 = 0x8000_0000;
 const windows_generic_write: u32 = 0x4000_0000;
@@ -94,6 +95,12 @@ const WindowsFiles = struct {
         self.handles.put(std.heap.page_allocator, fd, handle) catch return error.OutOfMemory;
         self.next_fd = if (fd == std.math.maxInt(Fd)) -1 else fd + 1;
         return fd;
+    }
+
+    fn rolloverDue(self: *WindowsFiles) bool {
+        self.lockSpin();
+        defer self.lock.unlock();
+        return self.next_fd < windows_file_fd_first or self.next_fd >= windows_file_rollover_at;
     }
 
     fn valid(self: *WindowsFiles, fd: Fd) bool {
@@ -186,6 +193,13 @@ pub fn raiseOpenBsdFdAllowance() Error!void {
         limit.cur = limit.max;
         try check(sys.setrlimit(.NOFILE, &limit));
     }
+}
+
+/// Preserve the same half-range retry headroom for the disjoint Windows file
+/// HANDLE namespace as for IOCP sockets. Helix starts a fresh registry.
+pub fn windowsFileIdRolloverDue() bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    return windows_files.rolloverDue();
 }
 
 pub fn read(fd: Fd, bytes: []u8) Error!usize {
@@ -806,6 +820,17 @@ test "Windows runtime shutdown uses opaque IOCP socket descriptor" {
     try std.testing.expect(!fdValid(accepted));
     try std.testing.expectError(error.InvalidDescriptor, socketType(accepted));
     try std.testing.expectError(error.Unsupported, duplicate(listener.fd));
+}
+
+test "Windows file ID rollover starts halfway and remains due after exhaustion" {
+    var files = WindowsFiles{};
+    try std.testing.expect(!files.rolloverDue());
+    files.next_fd = windows_file_rollover_at - 1;
+    try std.testing.expect(!files.rolloverDue());
+    files.next_fd = windows_file_rollover_at;
+    try std.testing.expect(files.rolloverDue());
+    files.next_fd = -1;
+    try std.testing.expect(files.rolloverDue());
 }
 
 test "Windows runtime file HANDLE registry roundtrips UTF-8 paths and duplicates" {

@@ -866,6 +866,15 @@ pub fn main(init: std.process.Init) !void {
         if (comptime builtin.os.tag == .openbsd) try onyx_server.daemon.os_runtime.raiseOpenBsdFdAllowance();
         native_executable = try std.process.executablePathAlloc(init.io, allocator);
         srv_cfg.exe_path = native_executable.?;
+        if (comptime builtin.os.tag == .windows) {
+            windows_runtime_driver.boot_image_path = native_executable.?;
+            // Capture the currently running image at boot. Automatic descriptor
+            // maintenance refuses to launch if this image cannot be proven.
+            windows_runtime_driver.boot_image_digest = windows_process.digestImageAtPath(allocator, native_executable.?) catch |err| blk: {
+                std.debug.print("onyx-server: Windows image pin unavailable ({s}); descriptor maintenance disabled\n", .{@errorName(err)});
+                break :blk null;
+            };
+        }
     }
     var config_path_arg: ?[]const u8 = null;
     const first_arg = args.next();

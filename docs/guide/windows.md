@@ -419,9 +419,16 @@ closes.
 Windows outbound HTTP hostname lookup now uses `GetAddrInfoExW`, but enterprise
 DNS policy and hosts-file variations have not had live acceptance tests. Socket
 IDs use generation-safe slot reuse, so a closed descriptor never becomes valid
-again. The 30-bit namespace still has a lifetime limit of roughly 1.07 billion
-IDs per process (about 12.4 days at 1,000 new sockets per second); restart
-before reaching that limit.
+again. The 30-bit socket namespace and the separate file-handle namespace each
+have a finite per-process lifetime. At half of either range, the daemon queues
+a connection-preserving Helix rollover into the exact image measured at boot;
+failed attempts retry no sooner than 60 seconds later. A staged replacement
+image does not enter this automatic path. Manual upgrades retain priority.
+If image proof or Helix handoff remains unavailable, the daemon continues
+serving until the namespace is exhausted; operators must then arrange a
+compatible upgrade while there is remaining headroom. The socket trigger is
+roughly 537 million claimed IDs (about 6.2 days at 1,000 registrations per
+second).
 
 ## Runtime check
 

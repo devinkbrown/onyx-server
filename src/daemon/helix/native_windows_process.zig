@@ -21,6 +21,40 @@ const std_input_handle: u32 = 0xffff_fff6;
 const startf_use_std_handles: u32 = 0x0000_0100;
 const duplicate_same_access: u32 = 2;
 const infinite: u32 = 0xffff_ffff;
+const generic_read: u32 = 0x8000_0000;
+const generic_write: u32 = 0x4000_0000;
+const file_share_read: u32 = 1;
+const file_share_write: u32 = 2;
+const open_existing: u32 = 3;
+const file_attribute_normal: u32 = 0x80;
+const file_attribute_directory: u32 = 0x10;
+const file_attribute_reparse_point: u32 = 0x400;
+const file_type_disk: u32 = 1;
+const file_read_attributes: u32 = 0x80;
+const file_flag_open_reparse_point: u32 = 0x0020_0000;
+const file_flag_backup_semantics: u32 = 0x0200_0000;
+const file_id_info: u32 = 18;
+
+const ByHandleFileInformation = extern struct {
+    file_attributes: u32,
+    creation_time_low: u32,
+    creation_time_high: u32,
+    access_time_low: u32,
+    access_time_high: u32,
+    write_time_low: u32,
+    write_time_high: u32,
+    volume_serial: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    link_count: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+};
+
+const FileIdInfo = extern struct {
+    volume_serial: u64,
+    file_id: [16]u8,
+};
 
 const StartupInfoEx = extern struct {
     startup: std.os.windows.STARTUPINFOW,
@@ -54,12 +88,22 @@ extern "kernel32" fn TerminateProcess(process: usize, exit_code: u32) callconv(.
 extern "kernel32" fn WaitForSingleObject(handle: usize, ms: u32) callconv(.winapi) u32;
 extern "kernel32" fn CloseHandle(handle: usize) callconv(.winapi) i32;
 extern "kernel32" fn GetSystemDirectoryW(buffer: [*]u16, size: u32) callconv(.winapi) u32;
+extern "kernel32" fn CreateFileW(path: [*:0]const u16, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: usize) callconv(.winapi) usize;
+extern "kernel32" fn ReadFile(handle: usize, buffer: [*]u8, count: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetFinalPathNameByHandleW(handle: usize, buffer: ?[*]u16, length: u32, flags: u32) callconv(.winapi) u32;
+extern "kernel32" fn GetFileInformationByHandle(handle: usize, information: *ByHandleFileInformation) callconv(.winapi) i32;
+extern "kernel32" fn GetFileInformationByHandleEx(handle: usize, information_class: u32, information: *FileIdInfo, size: u32) callconv(.winapi) i32;
 
 pub const Error = control.Error || std.mem.Allocator.Error || error{
     InvalidCandidate,
     RandomSourceFailed,
     AttributeFailed,
     ProcessCreateFailed,
+    ImageOpenFailed,
+    ImageReadFailed,
+    ImageChanged,
+    ImageIdentityFailed,
+    DirectoryOpenFailed,
 };
 
 fn closeOwned(handle: *usize) void {
@@ -67,6 +111,153 @@ fn closeOwned(handle: *usize) void {
         if (handle.* != 0) _ = CloseHandle(handle.*);
     }
     handle.* = 0;
+}
+
+/// Open without write or delete sharing so the checked image cannot be
+/// rewritten or replaced while the candidate is launched and authenticated.
+fn openPinnedImageWithFlags(allocator: std.mem.Allocator, executable: []const u8, flags: u32) Error!usize {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    if (executable.len == 0 or !std.fs.path.isAbsolute(executable) or
+        std.mem.indexOfAny(u8, executable, "\x00\r\n\"") != null) return error.InvalidCandidate;
+    const path = std.unicode.wtf8ToWtf16LeAllocZ(allocator, executable) catch return error.InvalidCandidate;
+    defer allocator.free(path);
+    const handle = CreateFileW(path.ptr, generic_read, file_share_read, null, open_existing, flags, 0);
+    if (handle == std.math.maxInt(usize)) return error.ImageOpenFailed;
+    if (GetFileType(handle) != file_type_disk) {
+        _ = CloseHandle(handle);
+        return error.InvalidCandidate;
+    }
+    return handle;
+}
+
+fn openPinnedImage(allocator: std.mem.Allocator, executable: []const u8) Error!usize {
+    return openPinnedImageWithFlags(allocator, executable, file_attribute_normal);
+}
+
+/// Open the final launch name itself, without following a last-component link.
+fn openPinnedFinalImage(allocator: std.mem.Allocator, final_path: []const u8) Error!usize {
+    var handle = try openPinnedImageWithFlags(allocator, final_path, file_attribute_normal | file_flag_open_reparse_point);
+    errdefer closeOwned(&handle);
+    var information: ByHandleFileInformation = undefined;
+    if (GetFileInformationByHandle(handle, &information) == 0 or
+        information.file_attributes & file_attribute_reparse_point != 0 or
+        information.file_attributes & file_attribute_directory != 0)
+        return error.InvalidCandidate;
+    return handle;
+}
+
+fn digestPinnedImage(handle: usize) Error![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        var count: u32 = 0;
+        if (ReadFile(handle, &buffer, buffer.len, &count, null) == 0) return error.ImageReadFailed;
+        if (count == 0) break;
+        hash.update(buffer[0..count]);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+/// The boot path is measured once before maintenance can begin. A later
+/// same-image attempt compares against this exact digest.
+pub fn digestImageAtPath(allocator: std.mem.Allocator, executable: []const u8) Error![32]u8 {
+    var image = try openPinnedImage(allocator, executable);
+    defer closeOwned(&image);
+    return digestPinnedImage(image);
+}
+
+/// Resolve the file handle to its final local DOS path before CreateProcessW.
+/// This removes caller-path symlinks and rejects remote shares, whose server
+/// need not honor local share locks.
+fn pinnedImagePath(allocator: std.mem.Allocator, handle: usize) Error![]u8 {
+    const length = GetFinalPathNameByHandleW(handle, null, 0, 0);
+    if (length == 0 or length > 32767) return error.InvalidCandidate;
+    const wide = try allocator.alloc(u16, length + 1);
+    defer allocator.free(wide);
+    const actual = GetFinalPathNameByHandleW(handle, wide.ptr, @intCast(wide.len), 0);
+    if (actual == 0 or actual >= wide.len) return error.InvalidCandidate;
+    const path = std.unicode.wtf16LeToWtf8Alloc(allocator, wide[0..actual]) catch return error.InvalidCandidate;
+    if (path.len < 7 or !std.mem.startsWith(u8, path, "\\\\?\\") or
+        !std.ascii.isAlphabetic(path[4]) or path[5] != ':' or path[6] != '\\')
+    {
+        allocator.free(path);
+        return error.InvalidCandidate;
+    }
+    return path;
+}
+
+fn imageIdentity(handle: usize) Error!FileIdInfo {
+    var result: FileIdInfo = undefined;
+    if (GetFileInformationByHandleEx(handle, file_id_info, &result, @sizeOf(FileIdInfo)) == 0)
+        return error.ImageIdentityFailed;
+    return result;
+}
+
+/// Lock the volume root and each directory above the executable. A rename or
+/// reparse replacement needs DELETE access, which these handles do not share.
+const PinnedAncestors = struct {
+    allocator: std.mem.Allocator,
+    handles: std.ArrayList(usize) = .empty,
+
+    fn deinit(self: *PinnedAncestors) void {
+        for (self.handles.items) |handle| _ = CloseHandle(handle);
+        self.handles.deinit(self.allocator);
+        self.handles = .empty;
+    }
+};
+
+fn pinImageAncestors(allocator: std.mem.Allocator, final_path: []const u8) Error!PinnedAncestors {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    if (final_path.len < 8 or !std.mem.startsWith(u8, final_path, "\\\\?\\") or
+        !std.ascii.isAlphabetic(final_path[4]) or final_path[5] != ':' or final_path[6] != '\\')
+        return error.InvalidCandidate;
+    var pins = PinnedAncestors{ .allocator = allocator };
+    errdefer pins.deinit();
+    var end: usize = 7;
+    while (true) {
+        const wide = std.unicode.wtf8ToWtf16LeAllocZ(allocator, final_path[0..end]) catch return error.InvalidCandidate;
+        const handle = CreateFileW(wide.ptr, file_read_attributes, file_share_read | file_share_write, null, open_existing, file_flag_backup_semantics | file_flag_open_reparse_point, 0);
+        allocator.free(wide);
+        if (handle == std.math.maxInt(usize)) return error.DirectoryOpenFailed;
+        pins.handles.append(allocator, handle) catch |err| {
+            _ = CloseHandle(handle);
+            return err;
+        };
+        var information: ByHandleFileInformation = undefined;
+        if (GetFileInformationByHandle(handle, &information) == 0 or
+            information.file_attributes & file_attribute_directory == 0 or
+            information.file_attributes & file_attribute_reparse_point != 0)
+            return error.InvalidCandidate;
+        const component_start = if (end == 7) end else end + 1;
+        const separator = std.mem.indexOfScalarPos(u8, final_path, component_start, '\\') orelse break;
+        if (separator == component_start) return error.InvalidCandidate;
+        end = separator;
+    }
+    return pins;
+}
+
+/// Maintenance-only successor. Keep the checked file locked until the actual
+/// child completes the private capability exchange; transfer starts afterward.
+pub fn spawnSameImage(allocator: std.mem.Allocator, executable: []const u8, config: ?[]const u8, generation: u64, deadline: i64, boot_digest: [32]u8) Error!Process {
+    var image = try openPinnedImage(allocator, executable);
+    defer closeOwned(&image);
+    const digest = try digestPinnedImage(image);
+    if (!std.crypto.timing_safe.eql([32]u8, digest, boot_digest)) return error.ImageChanged;
+    const final_path = try pinnedImagePath(allocator, image);
+    defer allocator.free(final_path);
+    var ancestors = try pinImageAncestors(allocator, final_path);
+    defer ancestors.deinit();
+    var final_image = try openPinnedFinalImage(allocator, final_path);
+    defer closeOwned(&final_image);
+    if (!std.meta.eql(try imageIdentity(image), try imageIdentity(final_image)) or
+        !std.crypto.timing_safe.eql([32]u8, digest, try digestPinnedImage(final_image)))
+        return error.ImageChanged;
+    var candidate = try launchUnverified(allocator, final_path, config, generation, true);
+    errdefer candidate.deinit();
+    try candidate.negotiate(deadline);
+    return candidate;
 }
 
 fn appendQuoted(allocator: std.mem.Allocator, output: *std.ArrayList(u8), arg: []const u8) Error!void {
@@ -305,9 +496,20 @@ test "Windows Helix candidate spawn keeps unverified process abortable" {
     @memcpy(system_dir[length..][0..suffix.len], suffix);
     const executable = try std.unicode.wtf16LeToWtf8Alloc(allocator, system_dir[0 .. length + suffix.len]);
     defer allocator.free(executable);
+    var pinned = try openPinnedImage(allocator, executable);
+    defer closeOwned(&pinned);
+    const final_path = try pinnedImagePath(allocator, pinned);
+    defer allocator.free(final_path);
+    var ancestors = try pinImageAncestors(allocator, final_path);
+    defer ancestors.deinit();
+    try std.testing.expect(ancestors.handles.items.len >= 3);
+    var final_image = try openPinnedFinalImage(allocator, final_path);
+    defer closeOwned(&final_image);
+    try std.testing.expectEqualDeep(try imageIdentity(pinned), try imageIdentity(final_image));
     // cmd.exe writes to stdout for an unknown private flag. Keep it off Zig's
     // test-runner protocol pipe; production launch preserves standard streams.
-    var candidate = try launchUnverified(allocator, executable, null, 7, false);
+    // Exercise CreateProcessW with the resolved \\?\ path while its image is locked.
+    var candidate = try launchUnverified(allocator, final_path, null, 7, false);
     try std.testing.expect(candidate.process_handle != 0 and candidate.pid != 0);
     try std.testing.expect(!candidate.committed);
     candidate.deinit();
@@ -317,6 +519,82 @@ test "Windows Helix candidate spawn keeps unverified process abortable" {
     if (incompatible.negotiate(platform.monotonicMillis() + 300)) |_| {
         return error.UnverifiedCandidateAccepted;
     } else |_| {}
+}
+
+test "Windows Helix same-image digest mismatch refuses launch" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var system_dir: [300]u16 = undefined;
+    const length: usize = GetSystemDirectoryW(system_dir[0..].ptr, system_dir.len);
+    if (length == 0 or length + 8 >= system_dir.len) return error.InvalidCandidate;
+    const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\\cmd.exe");
+    @memcpy(system_dir[length..][0..suffix.len], suffix);
+    const executable = try std.unicode.wtf16LeToWtf8Alloc(allocator, system_dir[0 .. length + suffix.len]);
+    defer allocator.free(executable);
+    var wrong_digest = try digestImageAtPath(allocator, executable);
+    wrong_digest[0] ^= 0xff;
+    try std.testing.expectError(error.ImageChanged, spawnSameImage(allocator, executable, null, 9, platform.monotonicMillis() + 300, wrong_digest));
+}
+
+test "Windows Helix pinned image refuses replacement until released" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "image.bin", .{});
+    try file.writePositionalAll(std.testing.io, "original image", 0);
+    file.close(std.testing.io);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "image.bin", allocator);
+    defer allocator.free(path);
+    var pinned = try openPinnedImage(allocator, path);
+    defer closeOwned(&pinned);
+    const before = try digestPinnedImage(pinned);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("original image", &expected, .{});
+    try std.testing.expectEqual(expected, before);
+    const wide = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, path);
+    defer allocator.free(wide);
+    const writable = CreateFileW(wide.ptr, generic_write, file_share_read, null, open_existing, file_attribute_normal, 0);
+    if (writable != std.math.maxInt(usize)) {
+        _ = CloseHandle(writable);
+        return error.PinnedImageWritable;
+    }
+    if (tmp.dir.deleteFile(std.testing.io, "image.bin")) |_| {
+        return error.PinnedImageReplaceable;
+    } else |_| {}
+    closeOwned(&pinned);
+    try tmp.dir.deleteFile(std.testing.io, "image.bin");
+    const replacement = try tmp.dir.createFile(std.testing.io, "image.bin", .{});
+    try replacement.writePositionalAll(std.testing.io, "changed image", 0);
+    replacement.close(std.testing.io);
+    const after = try digestImageAtPath(allocator, path);
+    try std.testing.expect(!std.mem.eql(u8, &before, &after));
+}
+
+test "Windows Helix nested image ancestors refuse rename until released" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "outer", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "outer/inner", .default_dir);
+    const file = try tmp.dir.createFile(std.testing.io, "outer/inner/image.bin", .{});
+    try file.writePositionalAll(std.testing.io, "pinned", 0);
+    file.close(std.testing.io);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "outer/inner/image.bin", allocator);
+    defer allocator.free(path);
+    var image = try openPinnedImage(allocator, path);
+    defer closeOwned(&image);
+    const final_path = try pinnedImagePath(allocator, image);
+    defer allocator.free(final_path);
+    var ancestors = try pinImageAncestors(allocator, final_path);
+    defer ancestors.deinit();
+    closeOwned(&image);
+    if (tmp.dir.rename("outer", tmp.dir, "moved", std.testing.io)) |_| {
+        return error.PinnedAncestorReplaceable;
+    } else |_| {}
+    ancestors.deinit();
+    try tmp.dir.rename("outer", tmp.dir, "moved", std.testing.io);
 }
 
 test "Windows Helix candidate rejects a forged parent process identity" {

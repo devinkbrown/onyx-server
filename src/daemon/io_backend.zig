@@ -57,6 +57,9 @@ const WindowsSockets = struct {
     const slot_count: u32 = 1 << slot_bits;
     const slot_mask: u32 = slot_count - 1;
     const max_generation: u16 = (1 << (30 - slot_bits)) - 1;
+    // Start a same-image Helix rollover with half the namespace still free.
+    // The successor imports only live IDs into a fresh process registry.
+    const rollover_claimed_ids: u64 = 1 << 29;
     const Carry = enum { ordinary, helix_staged, helix_released, helix_poisoned };
     const Entry = struct {
         handle: usize,
@@ -79,6 +82,9 @@ const WindowsSockets = struct {
     free_head: ?u32 = null,
     last_imported_fd: linux.fd_t = 0,
     ordinary_seen: bool = false,
+    /// Number of unique IDs no longer available in this process. Imports also
+    /// claim lower generations in their slots, even if those IDs are not live.
+    claimed_id_count: u64 = 0,
 
     fn lockSpin(self: *WindowsSockets) void {
         while (!self.lock.tryLock()) std.Thread.yield() catch {};
@@ -101,6 +107,7 @@ const WindowsSockets = struct {
             self.free_head = state.free_next;
             state.* = .{ .highest_generation = generation };
             self.ordinary_seen = true;
+            self.claimed_id_count += 1;
             return fd;
         }
         const slot = self.findUnusedSlot() orelse return error.SocketIdsExhausted;
@@ -109,7 +116,14 @@ const WindowsSockets = struct {
         errdefer _ = self.slots.remove(slot);
         try self.handles.put(self.allocator, fd, .{ .handle = handle, .accepted_peer = peer });
         self.ordinary_seen = true;
+        self.claimed_id_count += 1;
         return fd;
+    }
+
+    fn rolloverDue(self: *WindowsSockets) bool {
+        self.lockSpin();
+        defer self.lock.unlock();
+        return self.claimed_id_count >= rollover_claimed_ids;
     }
 
     fn encodeId(slot: u32, generation: u16) linux.fd_t {
@@ -175,6 +189,10 @@ const WindowsSockets = struct {
         } else {
             try self.slots.put(self.allocator, slot, .{ .highest_generation = generation, .live_count = 0 });
         }
+        const newly_claimed: u64 = if (prior) |state|
+            @as(u64, generation - state.highest_generation)
+        else
+            @as(u64, generation) + 1;
         errdefer {
             if (prior == null) _ = self.slots.remove(slot);
         }
@@ -184,6 +202,7 @@ const WindowsSockets = struct {
         state.highest_generation = generation;
         state.live_count += 1;
         self.last_imported_fd = fd;
+        self.claimed_id_count += newly_claimed;
         if (generation == 0 and slot >= self.next_slot)
             self.next_slot = if (slot == slot_mask) 1 else slot + 1;
     }
@@ -358,6 +377,13 @@ fn ensureWinsock() error{SocketUnavailable}!void {
 pub fn adoptWindowsSocket(socket: usize) !linux.fd_t {
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
     return windows_sockets.register(socket);
+}
+
+/// True once half the per-process socket-ID namespace is claimed. Reactor 0
+/// can then schedule a same-image Helix rollover with ample retry headroom.
+pub fn windowsSocketIdRolloverDue() bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    return windows_sockets.rolloverDue();
 }
 
 /// Stage an inherited Helix socket under the predecessor's exact opaque ID.
@@ -751,6 +777,31 @@ test "Windows socket ID generation wrap permanently retires a slot" {
     try std.testing.expect(next != final and next != penultimate);
     try std.testing.expect((@as(u32, @intCast(next)) & WindowsSockets.slot_mask) != slot);
     try std.testing.expectEqual(@as(?usize, 0x3003), sockets.take(next));
+}
+
+test "Windows socket ID rollover starts before exhaustion and preserves stale rejection" {
+    var sockets = WindowsSockets{ .allocator = std.testing.allocator };
+    defer sockets.deinit();
+    try std.testing.expect(!sockets.rolloverDue());
+    sockets.claimed_id_count = WindowsSockets.rollover_claimed_ids - 1;
+    const fd = try sockets.register(0x2002);
+    try std.testing.expect(sockets.rolloverDue());
+    try std.testing.expectEqual(@as(?usize, 0x2002), sockets.take(fd));
+    try std.testing.expectEqual(@as(?usize, null), sockets.get(fd));
+    try std.testing.expect(sockets.rolloverDue());
+}
+
+test "Windows Helix import credits skipped generations to rollover budget" {
+    var sockets = WindowsSockets{ .allocator = std.testing.allocator };
+    defer sockets.deinit();
+    const first = WindowsSockets.encodeId(7, 5);
+    const later = WindowsSockets.encodeId(7, 8);
+    try sockets.registerHelixImported(first, 0x1001);
+    try std.testing.expectEqual(@as(u64, 6), sockets.claimed_id_count);
+    try sockets.registerHelixImported(later, 0x2002);
+    try std.testing.expectEqual(@as(u64, 9), sockets.claimed_id_count);
+    try std.testing.expectEqual(@as(?usize, 0x1001), sockets.take(first));
+    try std.testing.expectEqual(@as(?usize, 0x2002), sockets.take(later));
 }
 
 test "Windows Helix imports overlapping legacy slot generations without aliasing" {
