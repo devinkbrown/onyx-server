@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! One-shot, loopback-only pure Zig STARTTLS relay for the live Windows mail smoke.
-//! Arguments: port, DER certificate output path, optional alternate anchor path.
+//! One-shot, loopback-only pure Zig SMTP relay for the live Windows mail smoke.
+//! Arguments: port, DER certificate output path, starttls|implicit_auth,
+//! optional alternate anchor path.
 //! No certificate key is written.
 const std = @import("std");
 const onyx = @import("onyx_server");
@@ -10,6 +11,7 @@ const metrics = onyx.daemon.metrics_http;
 const selfsign = onyx.proto.x509_selfsign;
 const tls_server = onyx.crypto.tls_server;
 const max_record = 16 * 1024 + 512;
+const Mode = enum { starttls, implicit_auth };
 
 const win = struct {
     const FdSet = extern struct { count: u32, sockets: [64]usize };
@@ -71,23 +73,29 @@ fn expectCommand(engine: *tls_server.Server, fd: usize, buffer: *[max_record]u8,
     const bytes = try command(engine, fd, buffer, prefix);
     std.heap.page_allocator.free(bytes);
 }
-fn exchange(fd: usize, chain: []const []const u8, key_pair: std.crypto.sign.Ed25519.KeyPair) !void {
+fn exchange(fd: usize, chain: []const []const u8, key_pair: std.crypto.sign.Ed25519.KeyPair, mode: Mode) !void {
     var blocking: u32 = 0;
     if (win.ioctlsocket(fd, 0x8004667e, &blocking) != 0) return error.SocketSetupFailed;
     const timeout: u32 = 15_000;
     if (win.setsockopt(fd, 0xffff, 0x1006, &timeout, @sizeOf(u32)) != 0 or
         win.setsockopt(fd, 0xffff, 0x1005, &timeout, @sizeOf(u32)) != 0) return error.SocketSetupFailed;
-    try writeAll(fd, "220 onyx test relay\r\n");
-    var line: [256]u8 = undefined;
-    if (!std.mem.eql(u8, try readLine(fd, &line), "EHLO onyx.test\r\n")) return error.UnexpectedEhlo;
-    try writeAll(fd, "250 STARTTLS\r\n");
-    if (!std.mem.eql(u8, try readLine(fd, &line), "STARTTLS\r\n")) return error.ExpectedStarttls;
-    try writeAll(fd, "220 ready for TLS\r\n");
+    if (mode == .starttls) {
+        try writeAll(fd, "220 onyx test relay\r\n");
+        var line: [256]u8 = undefined;
+        if (!std.mem.eql(u8, try readLine(fd, &line), "EHLO onyx.test\r\n")) return error.UnexpectedEhlo;
+        try writeAll(fd, "250 STARTTLS\r\n");
+        if (!std.mem.eql(u8, try readLine(fd, &line), "STARTTLS\r\n")) return error.ExpectedStarttls;
+        try writeAll(fd, "220 ready for TLS\r\n");
+    }
     var engine = try tls_server.Server.init(std.heap.page_allocator, .{ .cert_chain = chain, .signing_key = key_pair });
     defer engine.deinit();
     var buffer: [max_record]u8 = undefined;
+    var first_record = true;
     while (!engine.handshakeDone()) {
-        switch (try engine.feed(try readRecord(fd, &buffer))) {
+        const record = try readRecord(fd, &buffer);
+        if (mode == .implicit_auth and first_record and record[0] != 0x16) return error.ExpectedClientHelloFirst;
+        first_record = false;
+        switch (try engine.feed(record)) {
             .bytes_to_send => |bytes| {
                 defer std.heap.page_allocator.free(bytes);
                 try writeAll(fd, bytes);
@@ -95,8 +103,18 @@ fn exchange(fd: usize, chain: []const []const u8, key_pair: std.crypto.sign.Ed25
             .need_more => {},
         }
     }
+    if (mode == .implicit_auth) try reply(&engine, fd, "220 onyx implicit test relay\r\n");
     try expectCommand(&engine, fd, &buffer, "EHLO onyx.test\r\n");
-    try reply(&engine, fd, "250 TLS ready\r\n");
+    try reply(&engine, fd, if (mode == .implicit_auth)
+        "250-onyx.test\r\n250-AUTH PLAIN\r\n250 TLS ready\r\n"
+    else
+        "250 TLS ready\r\n");
+    if (mode == .implicit_auth) {
+        const auth = try command(&engine, fd, &buffer, "AUTH PLAIN ");
+        defer std.heap.page_allocator.free(auth);
+        if (!std.mem.eql(u8, auth, "AUTH PLAIN AG1haWx1c2VyAG1haWwtcGFzcw==\r\n")) return error.InvalidAuth;
+        try reply(&engine, fd, "235 authenticated\r\n");
+    }
     try expectCommand(&engine, fd, &buffer, "MAIL FROM:<noreply@example.test>\r\n");
     try reply(&engine, fd, "250 sender ok\r\n");
     try expectCommand(&engine, fd, &buffer, "RCPT TO:<recipient@example.test>\r\n");
@@ -121,8 +139,10 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     const port_arg = args.next() orelse return error.InvalidArguments;
     const cert_path = args.next() orelse return error.InvalidArguments;
+    const mode_arg = args.next() orelse return error.InvalidArguments;
     const alternate_path = args.next();
     if (args.next() != null) return error.InvalidArguments;
+    const mode: Mode = std.meta.stringToEnum(Mode, mode_arg) orelse return error.InvalidArguments;
     const port = try std.fmt.parseInt(u16, port_arg, 10);
     const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x6d));
     var cert_buffer: [2048]u8 = undefined;
@@ -162,6 +182,6 @@ pub fn main(init: std.process.Init) !void {
     if (fd == std.math.maxInt(usize)) return error.AcceptFailed;
     defer _ = win.closesocket(fd);
     const chain = [_][]const u8{cert};
-    try exchange(fd, &chain, pair);
-    std.debug.print("PASS: trusted STARTTLS accepted verification mail\n", .{});
+    try exchange(fd, &chain, pair, mode);
+    std.debug.print("PASS: trusted {s} accepted verification mail\n", .{@tagName(mode)});
 }

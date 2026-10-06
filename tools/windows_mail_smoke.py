@@ -27,7 +27,8 @@ DEFAULT_BINARY = ROOT / "zig-out" / "bin" / "onyx-server.exe"
 DEFAULT_RELAY = ROOT / "zig-out" / "bin" / "windows-mail-relay.exe"
 
 
-def write_config(path, irc_port, tls_port, relay_port, account_db, *, trust_store=None):
+def write_config(path, irc_port, tls_port, relay_port, account_db, *, trust_store=None,
+                 starttls=True, auth=False):
     lines = [
         "[node]", "id = 1", "",
         "[network]", 'server_name = "onyx.test"', "",
@@ -40,6 +41,10 @@ def write_config(path, irc_port, tls_port, relay_port, account_db, *, trust_stor
     ]
     if trust_store:
         lines.append(f'trust_store_path = "{trust_store}"')
+    if not starttls:
+        lines.append("starttls = false")
+    if auth:
+        lines.extend(['user = "mailuser"', 'pass = "mail-pass"'])
     path.write_text("\n".join([*lines, ""]), encoding="utf-8")
 
 
@@ -116,17 +121,21 @@ def main():
         run_dir = Path(scratch)
         private = run_dir / "accounts-private"
         success_private = run_dir / "accounts-success-private"
+        implicit_private = run_dir / "accounts-implicit-private"
         rejected_private = run_dir / "accounts-rejected-private"
+        implicit_rejected_private = run_dir / "accounts-implicit-rejected-private"
         broad = run_dir / "accounts-broad"
         create_private_directory(private)
         create_private_directory(success_private)
+        create_private_directory(implicit_private)
         create_private_directory(rejected_private)
+        create_private_directory(implicit_rejected_private)
         broad.mkdir()
         config = run_dir / "mail.toml"
         broad_config = run_dir / "broad.toml"
         log = run_dir / "daemon.log"
         relay_log = run_dir / "relay.log"
-        irc_port, tls_port, success_port, reject_port = reserve_ports(4)
+        irc_port, tls_port, success_port, implicit_port, reject_port, implicit_reject_port = reserve_ports(6)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as closed_relay:
             closed_relay.bind(("127.0.0.1", 0))
             relay_port = closed_relay.getsockname()[1]
@@ -146,7 +155,7 @@ def main():
                 cert = run_dir / "mail-cert.der"
                 alternate = run_dir / "mail-other.der"
                 with relay_log.open("w", encoding="utf-8") as relay_file:
-                    relay = subprocess.Popen([str(relay_binary), str(success_port), str(cert), str(alternate)],
+                    relay = subprocess.Popen([str(relay_binary), str(success_port), str(cert), "starttls", str(alternate)],
                                              cwd=run_dir, stdout=relay_file,
                                              stderr=subprocess.STDOUT)
                 wait_cert(relay, cert)
@@ -169,10 +178,36 @@ def main():
                     stop(proc)
                     proc = None
 
+                stage = "trusted implicit TLS delivery through live daemon"
+                implicit_cert = run_dir / "mail-implicit.der"
+                with relay_log.open("w", encoding="utf-8") as relay_file:
+                    relay = subprocess.Popen([str(relay_binary), str(implicit_port),
+                                              str(implicit_cert), "implicit_auth"], cwd=run_dir,
+                                             stdout=relay_file, stderr=subprocess.STDOUT)
+                wait_cert(relay, implicit_cert)
+                write_config(config, irc_port, tls_port, implicit_port,
+                             "accounts-implicit-private/accounts.wal",
+                             trust_store="mail-implicit.der", starttls=False, auth=True)
+                checked = run_cli(binary, run_dir, "--check-config", config)
+                if checked.returncode != 0:
+                    raise AssertionError(f"implicit TLS mail config rejected: {(checked.stdout + checked.stderr).strip()}")
+                proc = register_mail(binary, config, run_dir, log, tls_port, "deliveredacct")
+                try:
+                    if relay.wait(timeout=25) != 0:
+                        raise AssertionError("pure Zig implicit TLS relay rejected mail")
+                    relay = None
+                    failure_wal = implicit_private / "mail-failures.wal"
+                    if failure_wal.exists() and b"mailfail:" in failure_wal.read_bytes():
+                        raise AssertionError("implicit TLS delivery wrote a failure row")
+                    print("PASS: live Windows account mail used implicit TLS and AUTH PLAIN")
+                finally:
+                    stop(proc)
+                    proc = None
+
                 stage = "wrong trust anchor refuses live STARTTLS delivery"
                 rejected_cert = run_dir / "mail-rejected-relay.der"
                 with relay_log.open("w", encoding="utf-8") as relay_file:
-                    relay = subprocess.Popen([str(relay_binary), str(reject_port), str(rejected_cert)],
+                    relay = subprocess.Popen([str(relay_binary), str(reject_port), str(rejected_cert), "starttls"],
                                              cwd=run_dir, stdout=relay_file,
                                              stderr=subprocess.STDOUT)
                 wait_cert(relay, rejected_cert)
@@ -185,6 +220,29 @@ def main():
                         raise AssertionError("relay reported successful mail despite wrong trust anchor")
                     relay = None
                     print("PASS: live Windows mail refused a valid but untrusted relay certificate")
+                finally:
+                    stop(proc)
+                    proc = None
+
+                stage = "wrong trust anchor refuses live implicit TLS delivery"
+                implicit_rejected_cert = run_dir / "mail-implicit-rejected-relay.der"
+                with relay_log.open("w", encoding="utf-8") as relay_file:
+                    relay = subprocess.Popen([str(relay_binary), str(implicit_reject_port),
+                                              str(implicit_rejected_cert), "implicit_auth"],
+                                             cwd=run_dir, stdout=relay_file,
+                                             stderr=subprocess.STDOUT)
+                wait_cert(relay, implicit_rejected_cert)
+                write_config(config, irc_port, tls_port, implicit_reject_port,
+                             "accounts-implicit-rejected-private/accounts.wal",
+                             trust_store="mail-other.der", starttls=False, auth=True)
+                proc = register_mail(binary, config, run_dir, log, tls_port, "rejectedacct")
+                try:
+                    wait_private_failure(proc, implicit_rejected_private / "mail-failures.wal",
+                                         (b"UnknownCa",))
+                    if relay.wait(timeout=10) == 0:
+                        raise AssertionError("implicit relay reported mail success despite wrong trust anchor")
+                    relay = None
+                    print("PASS: live Windows implicit TLS refused an untrusted relay certificate")
                 finally:
                     stop(proc)
                     proc = None
