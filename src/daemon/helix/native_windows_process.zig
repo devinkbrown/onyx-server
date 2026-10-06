@@ -75,6 +75,7 @@ comptime {
 
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) usize;
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+extern "kernel32" fn GetConsoleWindow() callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) usize;
 extern "kernel32" fn GetProcessId(process: usize) callconv(.winapi) u32;
 extern "kernel32" fn GetFileType(handle: usize) callconv(.winapi) u32;
@@ -413,7 +414,12 @@ fn launchUnverified(allocator: std.mem.Allocator, executable: []const u8, config
         startup.startup.hStdError = @ptrFromInt(child_stderr);
     }
     var information: ProcessInformation = undefined;
-    if (CreateProcessW(executable_w.ptr, line.ptr, null, null, 1, extended_startupinfo_present | create_no_window, null, null, &startup, &information) == 0)
+    // A foreground successor must stay in the predecessor's console process
+    // group so Ctrl+C/Ctrl+Break still reach it after COMMIT. A detached parent
+    // retains CREATE_NO_WINDOW to avoid opening a new console at every swap.
+    const creation_flags = extended_startupinfo_present |
+        (if (GetConsoleWindow() == null) create_no_window else @as(u32, 0));
+    if (CreateProcessW(executable_w.ptr, line.ptr, null, null, 1, creation_flags, null, null, &startup, &information) == 0)
         return error.ProcessCreateFailed;
     _ = CloseHandle(information.thread);
     pair.closeChildCopies();

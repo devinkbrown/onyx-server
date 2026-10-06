@@ -11,6 +11,7 @@ const windows_process = onyx_server.daemon.helix.native_windows_process;
 const windows_bootstrap = onyx_server.daemon.helix.native_windows_bootstrap;
 const windows_driver = onyx_server.daemon.helix.native_windows_driver;
 const windows_runtime = onyx_server.daemon.helix.native_windows_runtime;
+const windows_console_stop = @import("daemon/windows_console_stop.zig");
 const windows_tls_material = onyx_server.daemon.helix.native_windows_tls_material;
 const windows_history_material = onyx_server.daemon.helix.native_windows_history.material;
 const native_service = onyx_server.daemon.native_service;
@@ -3327,6 +3328,25 @@ pub fn main(init: std.process.Init) !void {
         "onyx-server: listening on {s}:{d} ({s})\n",
         .{ srv_cfg.host, try srv.boundPort(), reactor },
     );
+    // The Windows console handler uses the same cooperative stop as DIE/RESTART.
+    // Its borrowed stack context is disarmed before the runtime owners unwind.
+    const ConsoleStopContext = struct {
+        server: *Server,
+        run: *std.atomic.Value(bool),
+
+        fn request(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.server.requestStop(self.run);
+        }
+    };
+    var console_context = ConsoleStopContext{ .server = srv, .run = &run };
+    var console_guard = windows_console_stop.Guard{ .hook = .{
+        .context = &console_context,
+        .request = ConsoleStopContext.request,
+    } };
+    if (comptime builtin.os.tag == .windows) try console_guard.install();
+    defer if (comptime builtin.os.tag == .windows) console_guard.deinit();
+
     // Sharded multi-reactor run loop (one worker thread per shard, joined here).
     // runThreaded transparently runs a single in-line reactor when num_shards==1.
     if (comptime builtin.os.tag == .windows) {

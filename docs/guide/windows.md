@@ -94,7 +94,8 @@ try {
 ```
 
 Use a separate terminal to connect an IRC client to `127.0.0.1:16667`. Stop
-the foreground daemon with Ctrl+C. To remove this disposable node's config and
+the foreground daemon with Ctrl+C or Ctrl+Break. Both use the cooperative
+multi-shard stop path. To remove this disposable node's config and
 generated key, verify that the run directory is under the system temporary
 directory before deleting it:
 
@@ -485,6 +486,9 @@ python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix
+python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix --ctrl-c
 ```
 
 The script starts the daemon from its own temporary run directory, so its
@@ -561,6 +565,9 @@ python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix
+python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix --ctrl-c
 ```
 
 The repository pins LF line endings for embedded cryptographic test vectors
