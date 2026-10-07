@@ -63,6 +63,9 @@ zig build -j1 -Dtarget=x86_64-windows
 
 `check` performs semantic analysis without producing an executable. The build
 places `onyx-server.exe` in `zig-out\bin`.
+For a staged ReleaseFast bundle with the Windows quickstart and reference
+configs, run `zig build -j1 package -Dtarget=x86_64-windows`. The bundle puts
+the executable in `zig-out\bin` and both configs in `zig-out\etc\onyx-server`.
 
 ## Start a local node
 

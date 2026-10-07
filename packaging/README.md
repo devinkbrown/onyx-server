@@ -11,7 +11,7 @@ run is the one from source.
 | Path | What it produces | When to use it |
 |---|---|---|
 | `zig build` | `zig-out/bin/onyx-server` (debug / local) | Development, smoke tests |
-| `zig build package --prefix <dir>` | staged `bin/onyx-server` + reference config + systemd unit | Production install from a built tree |
+| `zig build package --prefix <dir>` | staged daemon + reference config + target-specific deployment assets | Production install from a built tree |
 | `packaging/release.sh` | `dist/onyx-server-<version>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance | Reproducible attested static binary |
 
 Current source version is **0.7.0** (`build.zig.zon:18`). The first verified
@@ -93,6 +93,9 @@ Use `onyx-server.windows.quickstart.toml` on Windows. Its account store lives in
 `--init-private-dir` command before config preflight. The template binds IRC and
 WebSocket to loopback only. See the [Windows guide](../docs/guide/windows.md)
 for the PowerShell setup and native acceptance check.
+The Windows `zig build package -Dtarget=x86_64-windows` bundle stages the
+ReleaseFast executable in `bin/` and the reference and quickstart configs in
+`etc/onyx-server/`.
 
 ## Quickstart (Docker)
 

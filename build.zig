@@ -1343,6 +1343,7 @@ pub fn build(b: *std.Build) void {
     // Layout under <prefix>:
     //   bin/onyx-server                              (ReleaseFast, stripped)
     //   etc/onyx-server/onyx-server.reference.toml   (annotated reference config)
+    //   etc/onyx-server/onyx-server.windows.quickstart.toml (Windows only)
     //   lib/systemd/system/onyx-server.service       (Linux only)
     //   libexec/onyx-server-helper                   (OpenBSD only)
     //   libexec/onyx-server-policy                   (OpenBSD only)
@@ -1425,6 +1426,8 @@ pub fn build(b: *std.Build) void {
     package_step.dependOn(&reference_install.step);
     if (os_tag == .linux) {
         package_step.dependOn(&b.addInstallFile(b.path("etc/systemd/onyx-server.service"), "lib/systemd/system/onyx-server.service").step);
+    } else if (os_tag == .windows) {
+        package_step.dependOn(&b.addInstallFile(b.path("packaging/onyx-server.windows.quickstart.toml"), "etc/onyx-server/onyx-server.windows.quickstart.toml").step);
     }
     if (openbsd_package_permissions) |permissions| package_step.dependOn(&permissions.step);
 

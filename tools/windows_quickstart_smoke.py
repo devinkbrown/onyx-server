@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Run the shipped Windows quickstart with the daemon's private-dir CLI."""
+"""Run a Windows quickstart template with the daemon's private-dir CLI."""
 
 import argparse
 from contextlib import ExitStack
@@ -71,11 +71,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", nargs="?", type=Path,
                         default=ROOT / "zig-out/bin/onyx-server.exe")
+    parser.add_argument("--template", type=Path,
+                        default=ROOT / "packaging/onyx-server.windows.quickstart.toml")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("this smoke requires native Windows")
     binary = args.binary.resolve(strict=True)
-    template = ROOT / "packaging/onyx-server.windows.quickstart.toml"
+    template = args.template.resolve(strict=True)
 
     with tempfile.TemporaryDirectory(prefix="onyx-quickstart-") as temp:
         run_dir = Path(temp)
