@@ -378,7 +378,6 @@ pub const OroStore = struct {
     /// Daemon account stores require private native custody; generic stores
     /// retain their existing cross-platform storage policy.
     private_windows_files: bool = false,
-    windows_first_provision_store: bool = false,
     owned_private_directory: bool = false,
     staged_write_file: ?std.Io.File = null,
     transferred_windows_wal: ?WindowsWalWitness = null,
@@ -1099,19 +1098,18 @@ pub const OroStore = struct {
     pub fn snapshotAndTruncate(self: *OroStore) !void {
         if (comptime cold_posix) return self.snapshotAndReplaceEpoch();
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
-        // First-provision stores require a held, write-through snapshot
-        // publication before the WAL can be truncated. The generic Windows
-        // path below has no durable namespace barrier for that transaction.
-        if (comptime @import("builtin").os.tag == .windows) {
-            if (self.windows_first_provision_store) return error.Unsupported;
-        }
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
         if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
         try self.ensureWal();
         const directory = try self.openSyncParent();
         defer directory.close(self.io);
-        const directory_identity: ?cold_identity.Identity = if (comptime cold_posix) try coldDirectoryIdentity(directory.handle) else null;
+        const private_windows = @import("builtin").os.tag == .windows and self.private_windows_files;
+        const directory_identity: ?cold_identity.Identity = if (cold_posix or private_windows) try coldDirectoryIdentity(directory.handle) else null;
         if (comptime cold_posix) try self.validateConfiguredWal();
+        if (private_windows) {
+            _ = try cold_runtime.requirePrivateDirectoryHandleWindows(.{ .handle = directory.handle });
+            try requireColdWriteThroughVolumeWindows(directory);
+        }
         var coverage_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
         try self.hashWalPrefix(self.wal_offset, &coverage_digest);
         const old_coverage = CoverageSlot{ .covered_len = self.wal_offset, .epoch = self.wal_epoch, .digest = coverage_digest };
@@ -1126,10 +1124,19 @@ pub const OroStore = struct {
         std.crypto.hash.Blake3.hash(&next_epoch_record, &next_digest, .{});
         const rotated_coverage = CoverageSlot{ .covered_len = next_epoch_record.len, .epoch = next_epoch, .digest = next_digest };
         const coverage = SnapshotCoverage{ .slots = .{ old_coverage, rotated_coverage }, .count = 2 };
-        var snapshot = try self.dir.createFileAtomic(self.io, self.snapshot_path, .{ .replace = true });
-        const snapshot_identity: ?cold_identity.Identity = if (comptime cold_posix) try cold_identity.statRegular(snapshot.file.handle) else null;
-        defer if (comptime cold_posix) deinitColdAtomic(self.io, &snapshot, snapshot_identity) else snapshot.deinit(self.io);
-        if (comptime cold_posix) try validateColdParent(self.io, self.dir, self.snapshot_path, directory, directory_identity.?, &snapshot);
+        var snapshot = if (private_windows)
+            try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(self.io, std.fs.path.basename(self.snapshot_path), .{ .replace = true })
+        else
+            try self.dir.createFileAtomic(self.io, self.snapshot_path, .{ .replace = true });
+        var snapshot_identity: ?cold_identity.Identity = null;
+        defer if (cold_posix or private_windows) deinitColdAtomic(self.io, &snapshot, snapshot_identity) else snapshot.deinit(self.io);
+        snapshot_identity = if (private_windows)
+            try windowsColdAtomicIdentity(snapshot.file.handle)
+        else if (cold_posix)
+            try cold_identity.statRegular(snapshot.file.handle)
+        else
+            null;
+        if (cold_posix or private_windows) try validateColdParent(self.io, self.dir, self.snapshot_path, directory, directory_identity.?, &snapshot);
         if (comptime @import("builtin").os.tag == .windows) {
             if (self.private_windows_files) try self.secureAtomicSnapshotWindows(&snapshot);
         }
@@ -1161,11 +1168,16 @@ pub const OroStore = struct {
         offset = try writeSnapshotCoverageRecordAt(self.io, snapshot.file, offset, self.allocator, &coverage);
         if (self.prepared_io_fault.snapshot_sync) return StoreError.SnapshotSyncFailed;
         try snapshot.file.sync(self.io);
-        if (comptime cold_posix) {
+        if (cold_posix or private_windows) {
             try validateColdParent(self.io, self.dir, self.snapshot_path, directory, directory_identity.?, &snapshot);
-            try validateColdAtomicName(self.io, &snapshot, snapshot_identity.?);
+            if (comptime cold_posix) try validateColdAtomicName(self.io, &snapshot, snapshot_identity.?);
         }
-        try snapshot.replace(self.io);
+        if (private_windows) {
+            renameHeldColdAtomicWindows(self.io, &snapshot, self.dir, self.snapshot_path, directory, directory_identity.?, snapshot_identity.?, true) catch {
+                self.poisonPreparedStore();
+                return StoreError.IoAmbiguous;
+            };
+        } else try snapshot.replace(self.io);
         self.syncHeldParent(directory, directory_identity) catch {
             // The snapshot path may already be replaced while its directory
             // entry is not known durable; the old WAL must not be appended to
@@ -1226,16 +1238,26 @@ pub const OroStore = struct {
     fn secureAtomicSnapshotWindows(self: *OroStore, snapshot: *std.Io.File.Atomic) !void {
         if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
         if (!snapshot.file_exists or !snapshot.file_open) return error.Unsupported;
+        const original = try windowsColdAtomicIdentity(snapshot.file.handle);
         // Verify the newly created temp has either the exact inherited private
         // ACL or Zig's exact protected private ACL. No secret bytes exist yet;
-        // close the generic handle and reacquire exclusively. That open checks
-        // the reparse attribute, fails if another reader kept a handle, and
-        // installs the protected file DACL before the first snapshot record.
+        // close the generic handle and reacquire exclusively to protect its
+        // DACL, then reopen with write-through and DELETE access for the held
+        // rename. Compare full file identities across both reopen boundaries.
         try cold_runtime.requireInheritedPrivateFileWindows(snapshot.file);
         snapshot.file.close(self.io);
         snapshot.file_open = false;
         const name = std.fmt.hex(snapshot.file_basename_hex);
-        snapshot.file = try cold_runtime.openExistingPrivateWindows(snapshot.dir, &name, .remediate_read_write);
+        {
+            const remediated = try cold_runtime.openExistingPrivateWindows(snapshot.dir, &name, .remediate_read_write);
+            defer remediated.close(self.io);
+            if (!std.meta.eql(original, try windowsColdAtomicIdentity(remediated.handle))) return StoreError.SnapshotCoverageMismatch;
+        }
+        const through = try openColdAtomicWindows(self.io, snapshot);
+        errdefer through.close(self.io);
+        if (!std.meta.eql(original, try windowsColdAtomicIdentity(through.handle))) return StoreError.SnapshotCoverageMismatch;
+        try cold_runtime.requireExistingPrivateFileHandleWindows(through);
+        snapshot.file = through;
         snapshot.file_open = true;
     }
 
@@ -1706,7 +1728,9 @@ pub const OroStore = struct {
     }
 
     fn openSyncParent(self: *const OroStore) !std.Io.File {
-        if (comptime cold_posix) return coldOpenParent(self.io, self.dir, self.wal_path);
+        if (comptime cold_posix or @import("builtin").os.tag == .windows) {
+            if (cold_posix or self.private_windows_files) return coldOpenParent(self.io, self.dir, self.wal_path);
+        }
         return self.dir.openFile(self.io, std.fs.path.dirname(self.wal_path) orelse ".", .{ .mode = .read_only, .allow_directory = true });
     }
 
@@ -2082,7 +2106,7 @@ pub const FirstProvisionStage = struct {
         errdefer allocator.destroy(store);
         var epoch: [wal_epoch_len]u8 = undefined;
         io.random(&epoch);
-        store.* = .{ .allocator = allocator, .io = io, .dir = dir, .wal_path = owned_path, .snapshot_path = snapshot_path, .maps = initMaps(allocator), .changefeed = feed, .cfg = config, .wal_epoch = epoch, .wal_epoch_known = true, .staged_read_only = true, .private_windows_files = @import("builtin").os.tag == .windows, .windows_first_provision_store = @import("builtin").os.tag == .windows, .wal_offset = cold_epoch_record_len };
+        store.* = .{ .allocator = allocator, .io = io, .dir = dir, .wal_path = owned_path, .snapshot_path = snapshot_path, .maps = initMaps(allocator), .changefeed = feed, .cfg = config, .wal_epoch = epoch, .wal_epoch_known = true, .staged_read_only = true, .private_windows_files = @import("builtin").os.tag == .windows, .wal_offset = cold_epoch_record_len };
         const directory = try coldOpenParent(io, dir, path);
         errdefer directory.close(io);
         if (comptime @import("builtin").os.tag == .windows)
@@ -2868,7 +2892,7 @@ test "Windows first provision commit publishes held WAL and cold recovery replay
     try std.testing.expectEqualStrings("cut", published.get(.props, "new").?);
     try std.testing.expect(published.private_windows_files);
     try published.put(.props, "later", "still safe");
-    try std.testing.expectError(error.Unsupported, published.snapshotAndTruncate());
+    try published.snapshotAndTruncate();
     try std.testing.expectError(error.FileBusy, openColdExisting(std.testing.io, private, "first.wal", .read_only));
     published.deinit();
     try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, &temp_name, .read_only));
@@ -3431,9 +3455,13 @@ fn renameHeldColdAtomicWindows(
     _ = try cold_runtime.requirePrivateDirectoryHandleWindows(.{ .handle = held_parent.handle });
     try requireColdWriteThroughVolumeWindows(held_parent);
     try validateColdParent(io, configured_dir, configured_path, held_parent, expected_parent, atomic);
+    const windows = std.os.windows;
+    var mode_status: windows.IO_STATUS_BLOCK = undefined;
+    var mode: u32 = 0;
+    if (windows.ntdll.NtQueryInformationFile(atomic.file.handle, &mode_status, &mode, @sizeOf(u32), .Mode) != .SUCCESS or
+        (mode & 0x2) == 0) return error.Unsupported; // FILE_WRITE_THROUGH
     if (!std.meta.eql(expected_file, try cold_identity.statRegular(atomic.file.handle))) return StoreError.SnapshotCoverageMismatch;
     var name_w = try std.Io.Threaded.sliceToPrefixedFileW(held_parent.handle, name, .{});
-    const windows = std.os.windows;
     var info: windows.FILE.RENAME_INFORMATION = .init(.{
         .Flags = .{ .REPLACE_IF_EXISTS = replace, .POSIX_SEMANTICS = replace },
         .RootDirectory = held_parent.handle,
@@ -7944,6 +7972,23 @@ test "Windows held cold atomic rename publishes exact file and retains exclusive
     try std.testing.expectEqualStrings("NEW!", &bytes);
 }
 
+test "Windows held cold atomic rename requires a write-through source handle" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const parent = try openColdExisting(std.testing.io, private, ".", .directory);
+    defer parent.close(std.testing.io);
+    const parent_id = try coldDirectoryIdentity(parent.handle);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    const file_id = try windowsColdAtomicIdentity(atomic.file.handle);
+    defer deinitColdAtomic(std.testing.io, &atomic, file_id);
+    try std.testing.expectError(error.Unsupported, renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", parent, parent_id, file_id, false));
+    try std.testing.expect(atomic.file_exists);
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "state.wal", .read_only));
+}
+
 test "Windows held cold atomic replacement keeps old destination handle readable" {
     if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -10700,6 +10745,34 @@ test "Windows private account store protects WAL and compacted snapshot across r
     defer recovered.deinit();
     try std.testing.expectEqualStrings("secret account state", recovered.get(.accounts, "alice").?);
     try recovered.put(.accounts, "bob", "second persisted account");
+}
+
+test "Windows private compaction publishes snapshot before injected WAL refusal" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(std.testing.io);
+    {
+        var store = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+        defer store.deinit();
+        try store.put(.accounts, "alice", "retained");
+        const length: usize = @intCast(store.wal_offset);
+        const before = try std.testing.allocator.alloc(u8, length);
+        defer std.testing.allocator.free(before);
+        try std.testing.expectEqual(length, try store.wal_file.?.readPositionalAll(std.testing.io, before, 0));
+        store.setPreparedIoFault(.{ .wal_sync = true });
+        try std.testing.expectError(StoreError.IoAmbiguous, store.snapshotAndTruncate());
+        try std.testing.expect(store.preparedWritesPoisoned());
+        try std.testing.expectEqual(@as(u64, length), (try store.wal_file.?.stat(std.testing.io)).size);
+        const after = try std.testing.allocator.alloc(u8, length);
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqual(length, try store.wal_file.?.readPositionalAll(std.testing.io, after, 0));
+        try std.testing.expectEqualSlices(u8, before, after);
+    }
+    var reopened = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/accounts.wal", .{});
+    defer reopened.deinit();
+    try std.testing.expectEqualStrings("retained", reopened.get(.accounts, "alice").?);
 }
 
 test "Windows private held WAL replay returns exact row and rejects a torn tail" {
