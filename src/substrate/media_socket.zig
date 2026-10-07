@@ -385,8 +385,6 @@ test "Windows UDP custody MediaSocket imports a real duplicate without changing 
 }
 
 test "loopback STUN binding round-trip binds the peer and answers" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     var mt = MediaTransport.init(testing.allocator);
     defer mt.deinit();
@@ -448,8 +446,6 @@ fn reflectorThread(sock: *MediaSocket) void {
 }
 
 test "queryReflexive learns the reflexive address from a STUN server" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var server = try MediaSocket.bind(loopback_be, 0);
     defer server.deinit();
     server.setRecvTimeoutMs(2000);
