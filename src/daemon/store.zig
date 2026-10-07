@@ -172,6 +172,7 @@ extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 extern "kernel32" fn GetProcessId(process: usize) callconv(.winapi) u32;
 extern "kernel32" fn CloseHandle(handle: usize) callconv(.winapi) i32;
 extern "kernel32" fn SetFileInformationByHandle(handle: usize, class: i32, info: *const anyopaque, size: u32) callconv(.winapi) i32;
+extern "kernel32" fn GetVolumeInformationByHandleW(handle: usize, volume_name: ?[*]u16, volume_name_len: u32, serial: ?*u32, max_component: ?*u32, flags: ?*u32, fs_name: ?[*]u16, fs_name_len: u32) callconv(.winapi) i32;
 
 fn windowsFileIdentity(handle: usize) !WindowsFileIdInfo {
     if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
@@ -377,6 +378,7 @@ pub const OroStore = struct {
     /// Daemon account stores require private native custody; generic stores
     /// retain their existing cross-platform storage policy.
     private_windows_files: bool = false,
+    windows_first_provision_store: bool = false,
     owned_private_directory: bool = false,
     staged_write_file: ?std.Io.File = null,
     transferred_windows_wal: ?WindowsWalWitness = null,
@@ -1097,6 +1099,12 @@ pub const OroStore = struct {
     pub fn snapshotAndTruncate(self: *OroStore) !void {
         if (comptime cold_posix) return self.snapshotAndReplaceEpoch();
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
+        // First-provision stores require a held, write-through snapshot
+        // publication before the WAL can be truncated. The generic Windows
+        // path below has no durable namespace barrier for that transaction.
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (self.windows_first_provision_store) return error.Unsupported;
+        }
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
         if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
         try self.ensureWal();
@@ -2074,7 +2082,7 @@ pub const FirstProvisionStage = struct {
         errdefer allocator.destroy(store);
         var epoch: [wal_epoch_len]u8 = undefined;
         io.random(&epoch);
-        store.* = .{ .allocator = allocator, .io = io, .dir = dir, .wal_path = owned_path, .snapshot_path = snapshot_path, .maps = initMaps(allocator), .changefeed = feed, .cfg = config, .wal_epoch = epoch, .wal_epoch_known = true, .staged_read_only = true, .wal_offset = cold_epoch_record_len };
+        store.* = .{ .allocator = allocator, .io = io, .dir = dir, .wal_path = owned_path, .snapshot_path = snapshot_path, .maps = initMaps(allocator), .changefeed = feed, .cfg = config, .wal_epoch = epoch, .wal_epoch_known = true, .staged_read_only = true, .private_windows_files = @import("builtin").os.tag == .windows, .windows_first_provision_store = @import("builtin").os.tag == .windows, .wal_offset = cold_epoch_record_len };
         const directory = try coldOpenParent(io, dir, path);
         errdefer directory.close(io);
         if (comptime @import("builtin").os.tag == .windows)
@@ -2122,8 +2130,6 @@ pub const FirstProvisionStage = struct {
     }
 
     pub fn commit(self: *FirstProvisionStage) !void {
-        // Cold provisioning needs POSIX fds; unreachable in Windows production.
-        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
         const store = self.store orelse return StoreError.PreparedAlreadyConsumed;
         const active = store.active_batch orelse return StoreError.PreparedAlreadyConsumed;
         if (self.consumed) return StoreError.PreparedAlreadyConsumed;
@@ -2143,12 +2149,19 @@ pub const FirstProvisionStage = struct {
         if (try file.readPositionalAll(store.io, &epoch_bytes, 0) != epoch_bytes.len or !std.mem.eql(u8, &epoch_bytes, &self.epoch)) return StoreError.SnapshotCoverageMismatch;
         try validateColdPreparedRange(store.io, file, active.record.?, cold_epoch_record_len);
         if (!std.meta.eql(try cold_identity.statRegular(file.handle), try cold_identity.statRegular(self.atomic.?.file.handle))) return StoreError.SnapshotCoverageMismatch;
-        try validateColdAtomicName(store.io, &self.atomic.?, self.atomic_identity.?);
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (!self.atomic.?.file_exists or !self.atomic.?.file_open) return StoreError.SnapshotCoverageMismatch;
+            try requireColdWriteThroughVolumeWindows(self.directory);
+        } else try validateColdAtomicName(store.io, &self.atomic.?, self.atomic_identity.?);
         try validateColdParent(store.io, store.dir, store.wal_path, self.directory, self.directory_identity, &self.atomic.?);
         self.consumed = true;
         errdefer store.poisonPreparedStore();
-        try self.atomic.?.link(store.io);
-        try self.directory.sync(store.io);
+        if (comptime @import("builtin").os.tag == .windows) {
+            try renameHeldColdAtomicWindows(store.io, &self.atomic.?, store.dir, store.wal_path, self.directory, self.directory_identity, self.atomic_identity.?, false);
+        } else {
+            try self.atomic.?.link(store.io);
+            try self.directory.sync(store.io);
+        }
         store.staged_read_only = false;
         store.publishBatch(active.generation);
         self.committed = true;
@@ -2788,7 +2801,7 @@ test "Windows first provision init holds a private lease without publishing file
         var stage = try FirstProvisionStage.init(std.testing.allocator, std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 });
         defer stage.deinit();
         try std.testing.expect(stage.store.?.isReadOnly());
-        try std.testing.expectError(error.SkipZigTest, stage.commit());
+        try std.testing.expectError(StoreError.PreparedAlreadyConsumed, stage.commit());
         try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
         try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal.snap", .read_only));
     }
@@ -2826,12 +2839,127 @@ test "Windows first provision preparation keeps bytes on a held private temp unt
     try std.testing.expectEqualSlices(u8, &stage.epoch, &epoch);
     try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
     try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal.snap", .read_only));
-    try std.testing.expectError(error.SkipZigTest, stage.commit());
     stage.deinit();
     live = false;
     try cold_identity.reaffirmExclusive(lease.handle);
     try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, &temp_name, .read_only));
     try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
+}
+
+test "Windows first provision commit publishes held WAL and cold recovery replays it" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const lease = try private.createFile(std.testing.io, "first.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    var stage = try FirstProvisionStage.init(failing.allocator(), std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 });
+    try stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "cut" }});
+    const temp_name = std.fmt.hex(stage.atomic.?.file_basename_hex);
+    failing.fail_index = failing.alloc_index;
+    try stage.commit();
+    failing.fail_index = std.math.maxInt(usize);
+    var published = stage.takeCommittedStore();
+    stage.deinit();
+    try std.testing.expectEqualStrings("cut", published.get(.props, "new").?);
+    try std.testing.expect(published.private_windows_files);
+    try published.put(.props, "later", "still safe");
+    try std.testing.expectError(error.Unsupported, published.snapshotAndTruncate());
+    try std.testing.expectError(error.FileBusy, openColdExisting(std.testing.io, private, "first.wal", .read_only));
+    published.deinit();
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, &temp_name, .read_only));
+    var cold = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 });
+    defer cold.deinit();
+    try cold.validate();
+    try std.testing.expectEqualStrings("cut", cold.view().get(.props, "new").?);
+    try std.testing.expectEqualStrings("still safe", cold.view().get(.props, "later").?);
+}
+
+test "Windows first provision commit refuses a raced WAL without replacing it" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const lease = try private.createFile(std.testing.io, "first.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var stage = try FirstProvisionStage.init(std.testing.allocator, std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 });
+    try stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "cut" }});
+    const temp_name = std.fmt.hex(stage.atomic.?.file_basename_hex);
+    const foreign = try private.createFile(std.testing.io, "first.wal", .{});
+    try foreign.writePositionalAll(std.testing.io, "FOREIGN", 0);
+    foreign.close(std.testing.io);
+    try std.testing.expectError(error.PathAlreadyExists, stage.commit());
+    try std.testing.expect(stage.store.?.preparedWritesPoisoned());
+    stage.deinit();
+    const bytes = try private.readFileAlloc(std.testing.io, "first.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("FOREIGN", bytes);
+    const orphan = try openColdExisting(std.testing.io, private, &temp_name, .read_only);
+    orphan.close(std.testing.io);
+}
+
+test "Windows first provision commit revalidates lease and snapshot before publish" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const lease = try private.createFile(std.testing.io, "first.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var stage = try FirstProvisionStage.init(std.testing.allocator, std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 });
+    var stage_live = true;
+    errdefer if (stage_live) stage.deinit();
+    try stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "cut" }});
+    const reopened = try openColdExisting(std.testing.io, private, "first.wal.lock", .read_write);
+    stage.lease = reopened;
+    try std.testing.expectError(error.WouldBlock, stage.commit());
+    stage.lease = lease;
+    reopened.close(std.testing.io);
+    const snapshot = try private.createFile(std.testing.io, "first.wal.snap", .{});
+    snapshot.close(std.testing.io);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.commit());
+    try private.deleteFile(std.testing.io, "first.wal.snap");
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
+    try stage.commit();
+    var published = stage.takeCommittedStore();
+    defer published.deinit();
+    stage.deinit();
+    stage_live = false;
+    try std.testing.expectEqualStrings("cut", published.get(.props, "new").?);
+}
+
+test "Windows first provision commit poisons on a full temp identity mismatch" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const lease = try private.createFile(std.testing.io, "first.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var stage = try FirstProvisionStage.init(std.testing.allocator, std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 });
+    var live = true;
+    defer if (live) stage.deinit();
+    try stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "cut" }});
+    const temp_name = std.fmt.hex(stage.atomic.?.file_basename_hex);
+    stage.atomic_identity.?.inode_high ^= 1;
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.commit());
+    try std.testing.expect(stage.store.?.preparedWritesPoisoned());
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
+    stage.atomic_identity.?.inode_high ^= 1;
+    stage.deinit();
+    live = false;
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, &temp_name, .read_only));
 }
 
 test "Windows first provision preparation refuses a reopened lease before temp creation" {
@@ -3274,6 +3402,16 @@ fn makeColdAtomicReadable(io: std.Io, atomic: *std.Io.File.Atomic) !void {
 /// particular, no cold stage uses this until its whole Windows transaction is
 /// available. FILE_WRITE_THROUGH requests NTFS metadata flush for the rename;
 /// this does not establish power-loss durability on every filesystem.
+fn requireColdWriteThroughVolumeWindows(parent: std.Io.File) !void {
+    if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+    // Windows documents rename metadata flushing for write-through requests on
+    // NTFS. Reject other filesystems before treating a rename as a durable cut.
+    var fs_name: [16]u16 = @splat(0);
+    if (GetVolumeInformationByHandleW(@intFromPtr(parent.handle), null, 0, null, null, null, &fs_name, fs_name.len) == 0)
+        return error.Unsupported;
+    if (!std.mem.eql(u16, fs_name[0..5], &.{ 'N', 'T', 'F', 'S', 0 })) return error.Unsupported;
+}
+
 fn renameHeldColdAtomicWindows(
     io: std.Io,
     atomic: *std.Io.File.Atomic,
@@ -3291,6 +3429,7 @@ fn renameHeldColdAtomicWindows(
         std.mem.indexOfAny(u8, name, "/\\:\x00") != null or name[name.len - 1] == '.' or name[name.len - 1] == ' ' or
         !std.mem.eql(u8, name, std.fs.path.basename(atomic.dest_sub_path))) return StoreError.SnapshotCoverageMismatch;
     _ = try cold_runtime.requirePrivateDirectoryHandleWindows(.{ .handle = held_parent.handle });
+    try requireColdWriteThroughVolumeWindows(held_parent);
     try validateColdParent(io, configured_dir, configured_path, held_parent, expected_parent, atomic);
     if (!std.meta.eql(expected_file, try cold_identity.statRegular(atomic.file.handle))) return StoreError.SnapshotCoverageMismatch;
     var name_w = try std.Io.Threaded.sliceToPrefixedFileW(held_parent.handle, name, .{});
