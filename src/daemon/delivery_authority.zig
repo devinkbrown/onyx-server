@@ -1206,7 +1206,7 @@ test "delivery authority: Windows held private directory validates exact ACL and
 }
 fn validateName(name: []const u8) !void {
     if (name.len == 0 or name.len > 128 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidName;
-    for (name) |byte| if (byte == '/' or byte == '\\' or byte <= 0x20 or byte >= 0x7f) return error.InvalidName;
+    for (name) |byte| if (byte == '/' or byte == '\\' or byte <= 0x20 or byte >= 0x7f or (builtin.os.tag == .windows and byte == ':')) return error.InvalidName;
 }
 fn existingNamespace(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
     const snapshot = try std.mem.concat(a, u8, &.{ name, ".snap" });
@@ -1220,20 +1220,199 @@ fn existingNamespace(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []
     return false;
 }
 fn acquireLease(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8, cold: bool) !std.Io.File {
-    // Lease custody needs POSIX fds and `Permissions.fromMode`; unreachable in
-    // Windows production (plaintext PortableServer only), tests skip via this.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try validateName(name);
     const path = try std.mem.concat(a, u8, &.{ name, ".lock" });
     defer a.free(path);
-    const file = if (cold) try store_mod.openColdExisting(io, dir, path, .read_write) else dir.createFile(io, path, .{ .read = true, .truncate = false, .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
-        error.PathAlreadyExists => try store_mod.openColdExisting(io, dir, path, .read_write),
-        else => return err,
-    };
+    const file = if (cold)
+        try store_mod.openColdExisting(io, dir, path, .read_write)
+    else if (comptime builtin.os.tag == .windows)
+        dir.createFile(io, path, .{ .read = true, .truncate = false, .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => try store_mod.openColdExisting(io, dir, path, .read_write),
+            else => return err,
+        }
+    else
+        dir.createFile(io, path, .{ .read = true, .truncate = false, .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
+            error.PathAlreadyExists => try store_mod.openColdExisting(io, dir, path, .read_write),
+            else => return err,
+        };
     errdefer file.close(io);
     const identity = try lease_mod.statRegular(file.handle);
-    try lease_mod.reaffirmExclusive(file.handle);
-    _ = try lease_mod.validateInherited(a, io, dir, name, file, identity);
+    if (comptime builtin.os.tag == .windows) {
+        // A private parent must never bless a lock file moved in with a broad
+        // ACL. Reject it before either cold custody or a marker write.
+        try os_runtime.requireInheritedPrivateFileWindows(file);
+        if (!try file.tryLock(io, .exclusive)) return error.WouldBlock;
+        // Reopen the configured path without following a reparse point. The
+        // marker is written only after full 128-bit identity and path agree.
+        const configured = try store_mod.openColdExisting(io, dir, path, .read_only);
+        defer configured.close(io);
+        if (!std.meta.eql(identity, try lease_mod.statRegular(configured.handle))) return error.IdentityMismatch;
+        if (cold) {
+            // The locked byte is required as local custody proof. EOF is not
+            // evidence of ownership, and a cold open never repairs the file.
+            _ = try lease_mod.validateInherited(a, io, dir, name, file, identity);
+        } else {
+            if ((try file.stat(io)).size == 0) {
+                try file.writePositionalAll(io, "L", 0);
+                try file.sync(io);
+            }
+            _ = try lease_mod.validateInherited(a, io, dir, name, file, identity);
+        }
+    } else {
+        try lease_mod.reaffirmExclusive(file.handle);
+        _ = try lease_mod.validateInherited(a, io, dir, name, file, identity);
+    }
     return file;
+}
+
+const WindowsLeaseTest = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn CreateHardLinkW(new_name: [*:0]const u16, existing_name: [*:0]const u16, security: ?*anyopaque) callconv(.winapi) i32;
+} else struct {};
+
+test "delivery authority Windows local cold lease never creates or repairs a marker" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    try std.testing.expectError(error.FileNotFound, acquireLease(std.testing.allocator, std.testing.io, private, "cold.wal", true));
+    try std.testing.expectError(error.FileNotFound, store_mod.openColdExisting(std.testing.io, private, "cold.wal.lock", .read_only));
+    const empty = try private.createFile(std.testing.io, "cold.wal.lock", .{ .read = true });
+    defer empty.close(std.testing.io);
+    try std.testing.expectError(error.LockFailed, acquireLease(std.testing.allocator, std.testing.io, private, "cold.wal", true));
+    try std.testing.expectEqual(@as(u64, 0), (try empty.stat(std.testing.io)).size);
+    const provisioned = try acquireLease(std.testing.allocator, std.testing.io, private, "cold.wal", false);
+    defer provisioned.close(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 1), (try provisioned.stat(std.testing.io)).size);
+}
+
+test "delivery authority Windows local lease contention and cold marker preservation" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    {
+        const existing = try private.createFile(std.testing.io, "kept.wal.lock", .{ .read = true });
+        defer existing.close(std.testing.io);
+        try existing.writePositionalAll(std.testing.io, "Q", 0);
+    }
+    {
+        const owner = try acquireLease(std.testing.allocator, std.testing.io, private, "kept.wal", false);
+        defer owner.close(std.testing.io);
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try owner.readPositionalAll(std.testing.io, &byte, 0));
+        try std.testing.expectEqual(@as(u8, 'Q'), byte[0]);
+        try std.testing.expectError(error.WouldBlock, acquireLease(std.testing.allocator, std.testing.io, private, "kept.wal", true));
+        try std.testing.expectError(error.WouldBlock, acquireLease(std.testing.allocator, std.testing.io, private, "kept.wal", false));
+        try std.testing.expectEqual(@as(u64, 1), (try owner.stat(std.testing.io)).size);
+    }
+    const cold = try acquireLease(std.testing.allocator, std.testing.io, private, "kept.wal", true);
+    defer cold.close(std.testing.io);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try cold.readPositionalAll(std.testing.io, &byte, 0));
+    try std.testing.expectEqual(@as(u8, 'Q'), byte[0]);
+    try std.testing.expectEqual(@as(u64, 1), (try cold.stat(std.testing.io)).size);
+}
+
+test "delivery authority Windows local lease rejects wrong path type hardlink and ADS" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const owner = try acquireLease(std.testing.allocator, std.testing.io, private, "good.wal", false);
+    defer owner.close(std.testing.io);
+    const identity = try lease_mod.statRegular(owner.handle);
+    try std.testing.expectError(error.FileNotFound, lease_mod.validateInherited(std.testing.allocator, std.testing.io, private, "missing.wal", owner, identity));
+    const other = try acquireLease(std.testing.allocator, std.testing.io, private, "other.wal", false);
+    defer other.close(std.testing.io);
+    try std.testing.expectError(error.IdentityMismatch, lease_mod.validateInherited(std.testing.allocator, std.testing.io, private, "other.wal", owner, identity));
+    var wrong = identity;
+    wrong.inode_high ^= 1;
+    try std.testing.expectError(error.IdentityMismatch, lease_mod.validateInherited(std.testing.allocator, std.testing.io, private, "good.wal", owner, wrong));
+    try private.createDir(std.testing.io, "folder.wal.lock", .default_dir);
+    try std.testing.expectError(error.NotRegular, acquireLease(std.testing.allocator, std.testing.io, private, "folder.wal", true));
+    try std.testing.expectError(error.InvalidName, acquireLease(std.testing.allocator, std.testing.io, private, "good.wal:stream", false));
+    try std.testing.expectError(error.InvalidName, acquireLease(std.testing.allocator, std.testing.io, private, "good.wal:stream", true));
+
+    const target = try private.createFile(std.testing.io, "target.wal.lock", .{ .read = true });
+    defer target.close(std.testing.io);
+    const target_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/private/target.wal.lock", .{&tmp.sub_path});
+    defer std.testing.allocator.free(target_path);
+    const alias_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/private/alias.wal.lock", .{&tmp.sub_path});
+    defer std.testing.allocator.free(alias_path);
+    const target_w = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, target_path);
+    defer std.testing.allocator.free(target_w);
+    const alias_w = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, alias_path);
+    defer std.testing.allocator.free(alias_w);
+    try std.testing.expect(WindowsLeaseTest.CreateHardLinkW(alias_w.ptr, target_w.ptr, null) != 0);
+    try std.testing.expectError(error.NotRegular, acquireLease(std.testing.allocator, std.testing.io, private, "alias.wal", false));
+    try std.testing.expectEqual(@as(u64, 0), (try target.stat(std.testing.io)).size);
+}
+
+test "delivery authority Windows local lease rejects configured path rebind" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const owner = try acquireLease(std.testing.allocator, std.testing.io, private, "held.wal", false);
+    defer owner.close(std.testing.io);
+    const identity = try lease_mod.statRegular(owner.handle);
+    try private.rename("held.wal.lock", private, "moved.wal.lock", std.testing.io);
+    try std.testing.expectError(error.FileNotFound, lease_mod.validateInherited(std.testing.allocator, std.testing.io, private, "held.wal", owner, identity));
+    const replacement = try private.createFile(std.testing.io, "held.wal.lock", .{ .read = true });
+    defer replacement.close(std.testing.io);
+    try replacement.writePositionalAll(std.testing.io, "R", 0);
+    try std.testing.expectError(error.IdentityMismatch, lease_mod.validateInherited(std.testing.allocator, std.testing.io, private, "held.wal", owner, identity));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try owner.readPositionalAll(std.testing.io, &byte, 0));
+    try std.testing.expectEqual(@as(u8, 'L'), byte[0]);
+}
+
+test "delivery authority Windows local lease refuses symlink before marker write" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const target = try private.createFile(std.testing.io, "target.wal.lock", .{ .read = true });
+    defer target.close(std.testing.io);
+    private.symLink(std.testing.io, "target.wal.lock", "alias.wal.lock", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    if (acquireLease(std.testing.allocator, std.testing.io, private, "alias.wal", false)) |unexpected| {
+        unexpected.close(std.testing.io);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqual(@as(u64, 0), (try target.stat(std.testing.io)).size);
+}
+
+test "delivery authority Windows local lease rejects broad ACL before any marker mutation" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    for ([_]struct { name: []const u8, cold: bool, bytes: []const u8 }{
+        .{ .name = "provision.wal", .cold = false, .bytes = "" },
+        .{ .name = "cold.wal", .cold = true, .bytes = "Q" },
+    }) |scenario| {
+        const lock_name = try std.mem.concat(std.testing.allocator, u8, &.{ scenario.name, ".lock" });
+        defer std.testing.allocator.free(lock_name);
+        {
+            const broad = try tmp.dir.createFile(std.testing.io, lock_name, .{ .read = true });
+            defer broad.close(std.testing.io);
+            if (scenario.bytes.len != 0) try broad.writePositionalAll(std.testing.io, scenario.bytes, 0);
+        }
+        try tmp.dir.rename(lock_name, private, lock_name, std.testing.io);
+        try std.testing.expectError(error.InsecurePermissions, acquireLease(std.testing.allocator, std.testing.io, private, scenario.name, scenario.cold));
+        const unchanged = try private.readFileAlloc(std.testing.io, lock_name, std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(unchanged);
+        try std.testing.expectEqualSlices(u8, scenario.bytes, unchanged);
+    }
 }
 fn create(a: std.mem.Allocator, io: std.Io, input_dir: std.Io.Dir, name: []const u8, input_context: Context, key: *const sign.KeyPair, config: Config, cold: bool) !*Authority {
     // Same Windows gate as `openCold` above: POSIX fds and file modes.

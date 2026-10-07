@@ -171,6 +171,7 @@ extern "kernel32" fn GetCurrentProcess() callconv(.winapi) usize;
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 extern "kernel32" fn GetProcessId(process: usize) callconv(.winapi) u32;
 extern "kernel32" fn CloseHandle(handle: usize) callconv(.winapi) i32;
+extern "kernel32" fn SetFileInformationByHandle(handle: usize, class: i32, info: *const anyopaque, size: u32) callconv(.winapi) i32;
 
 fn windowsFileIdentity(handle: usize) !WindowsFileIdInfo {
     if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
@@ -178,6 +179,18 @@ fn windowsFileIdentity(handle: usize) !WindowsFileIdInfo {
     if (GetFileInformationByHandleEx(handle, windows_file_id_info_class, &info, @sizeOf(WindowsFileIdInfo)) == 0)
         return StoreError.SnapshotCoverageMismatch;
     return info;
+}
+
+fn windowsColdAtomicIdentity(handle: std.Io.File.Handle) !cold_identity.Identity {
+    if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+    // Zig's initial Atomic handle is GENERIC_WRITE. FileIdInfo remains
+    // queryable even when FileAttributeTagInfo is denied on that handle.
+    const id = try windowsFileIdentity(@intFromPtr(handle));
+    return .{
+        .device = id.volume_serial,
+        .inode = std.mem.readInt(u64, id.file_id[0..8], .little),
+        .inode_high = std.mem.readInt(u64, id.file_id[8..16], .little),
+    };
 }
 
 fn windowsWalWitness(io: std.Io, file: std.Io.File, dir: std.Io.Dir, name: []const u8) !WindowsWalWitness {
@@ -2956,11 +2969,20 @@ fn validateColdAtomicName(io: std.Io, atomic: *const std.Io.File.Atomic, identit
 }
 
 // std.Atomic.deinit unconditionally unlinks its remembered temporary name.
-// Suppress that unlink unless the name still denotes this stage's inode; close
-// the owned descriptor regardless, leaving a foreign replacement untouched.
+// On Windows delete through a verified handle; never ask std to unlink a name
+// which might have been substituted while the stage was preparing.
 fn deinitColdAtomic(io: std.Io, atomic: *std.Io.File.Atomic, known_identity: ?cold_identity.Identity) void {
-    // No cold atomics are ever created on Windows (creation gates skip first).
-    if (comptime @import("builtin").os.tag == .windows) return;
+    if (comptime @import("builtin").os.tag == .windows) {
+        if (atomic.file_exists) {
+            const identity = known_identity orelse if (atomic.file_open) windowsColdAtomicIdentity(atomic.file.handle) catch null else null;
+            if (identity) |owned| deleteColdAtomicWindows(io, atomic, owned) catch {};
+            // A failed proof or disposition leaves an owned orphan. It must
+            // never fall through to std's unguarded name-based deletion.
+            atomic.file_exists = false;
+        }
+        atomic.deinit(io);
+        return;
+    }
     if (atomic.file_exists) {
         const identity = known_identity orelse if (atomic.file_open) cold_identity.statRegular(atomic.file.handle) catch null else null;
         if (identity) |owned| {
@@ -2972,11 +2994,89 @@ fn deinitColdAtomic(io: std.Io, atomic: *std.Io.File.Atomic, known_identity: ?co
     atomic.deinit(io);
 }
 
-// Zig's named Atomic default is write-only. Reserve a readable handle to the
-// SAME private regular inode before publication; never reopen for authority.
+fn openColdAtomicWindows(io: std.Io, atomic: *const std.Io.File.Atomic) !std.Io.File {
+    if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+    _ = try cold_runtime.requirePrivateDirectoryHandleWindows(atomic.dir);
+    const windows = std.os.windows;
+    const name = std.fmt.hex(atomic.file_basename_hex);
+    var name_w = try std.Io.Threaded.sliceToPrefixedFileW(atomic.dir.handle, &name, .{});
+    var object_name = name_w.string();
+    const attributes: windows.OBJECT.ATTRIBUTES = .{ .RootDirectory = atomic.dir.handle, .ObjectName = &object_name };
+    var io_status: windows.IO_STATUS_BLOCK = undefined;
+    var handle: windows.HANDLE = undefined;
+    const status = windows.ntdll.NtCreateFile(
+        &handle,
+        .{ .STANDARD = .{ .SYNCHRONIZE = true, .RIGHTS = .{ .READ_CONTROL = true, .DELETE = true } }, .GENERIC = .{ .READ = true, .WRITE = true } },
+        &attributes,
+        &io_status,
+        null,
+        .{ .NORMAL = true },
+        .{},
+        .OPEN,
+        .{ .NON_DIRECTORY_FILE = true, .IO = .SYNCHRONOUS_NONALERT, .OPEN_REPARSE_POINT = true },
+        null,
+        0,
+    );
+    switch (status) {
+        .SUCCESS => {},
+        .OBJECT_NAME_NOT_FOUND, .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
+        .ACCESS_DENIED => return error.AccessDenied,
+        .SHARING_VIOLATION => return error.FileBusy,
+        else => return error.Unexpected,
+    }
+    const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+    errdefer file.close(io);
+    _ = try cold_identity.statRegular(file.handle);
+    try cold_runtime.requireInheritedPrivateFileWindows(file);
+    return file;
+}
+
+fn markColdAtomicDeletedWindows(file: std.Io.File) bool {
+    if (comptime @import("builtin").os.tag != .windows) return false;
+    // FileDispositionInfo marks this exact held file for deletion on close.
+    // The reopened atomic handle requests DELETE and excludes other openers.
+    const disposition: u8 = 1;
+    return SetFileInformationByHandle(@intFromPtr(file.handle), 4, &disposition, @sizeOf(u8)) != 0;
+}
+
+fn deleteColdAtomicWindows(io: std.Io, atomic: *std.Io.File.Atomic, identity: cold_identity.Identity) !void {
+    if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+    if (!atomic.file_exists) return;
+    if (atomic.file_open and std.meta.eql(identity, windowsColdAtomicIdentity(atomic.file.handle) catch return StoreError.SnapshotCoverageMismatch)) {
+        if (markColdAtomicDeletedWindows(atomic.file)) return;
+    }
+    if (atomic.file_open) {
+        atomic.file.close(io);
+        atomic.file_open = false;
+    }
+    const candidate = try openColdAtomicWindows(io, atomic);
+    defer candidate.close(io);
+    if (!std.meta.eql(identity, try cold_identity.statRegular(candidate.handle))) return StoreError.SnapshotCoverageMismatch;
+    if (!markColdAtomicDeletedWindows(candidate)) return error.Unexpected;
+}
+
+// Zig's named Atomic default is write-only. Reacquire a readable, deletable
+// handle before writing secrets, and bind it to the full original file ID.
 fn makeColdAtomicReadable(io: std.Io, atomic: *std.Io.File.Atomic) !void {
-    // Cold custody needs POSIX fds; Windows handles cannot compile here.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").os.tag == .windows) {
+        if (!atomic.file_exists or !atomic.file_open) return error.InvalidDescriptor;
+        _ = try cold_runtime.requirePrivateDirectoryHandleWindows(atomic.dir);
+        try cold_runtime.requireInheritedPrivateFileWindows(atomic.file);
+        const original = try windowsColdAtomicIdentity(atomic.file.handle);
+        atomic.file.close(io);
+        atomic.file_open = false;
+        errdefer {
+            deleteColdAtomicWindows(io, atomic, original) catch {};
+            // The caller's errdefer may lack this captured identity.
+            atomic.file_exists = false;
+        }
+        const file = try openColdAtomicWindows(io, atomic);
+        errdefer file.close(io);
+        if (!std.meta.eql(original, try cold_identity.statRegular(file.handle))) return StoreError.SnapshotCoverageMismatch;
+        atomic.file = file;
+        atomic.file_open = true;
+        return;
+    }
     const name = std.fmt.hex(atomic.file_basename_hex);
     const file = try openColdExisting(io, atomic.dir, &name, .read_write);
     errdefer file.close(io);
@@ -7331,6 +7431,118 @@ test "cold recovery abort named provisioning temporary never unlinks a substitut
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("FOREIGN", bytes);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "initial.wal", .{}));
+}
+
+test "Windows private cold atomic becomes readable and duplicate survives original close" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    try makeColdAtomicReadable(std.testing.io, &atomic);
+    const identity = try cold_identity.statRegular(atomic.file.handle);
+    const name = std.fmt.hex(atomic.file_basename_hex);
+    try atomic.file.writePositionalAll(std.testing.io, "private record", 0);
+    const copy = try cold_runtime.duplicateFile(atomic.file);
+    try std.testing.expectEqualDeep(identity, try cold_identity.statRegular(copy.handle));
+    atomic.file.close(std.testing.io);
+    atomic.file_open = false;
+    var bytes: [14]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try copy.readPositionalAll(std.testing.io, &bytes, 0));
+    try std.testing.expectEqualStrings("private record", &bytes);
+    copy.close(std.testing.io);
+    deinitColdAtomic(std.testing.io, &atomic, identity);
+    try std.testing.expectError(error.FileNotFound, private.openFile(std.testing.io, &name, .{}));
+    try std.testing.expectError(error.FileNotFound, private.openFile(std.testing.io, "state.wal", .{}));
+}
+
+test "Windows cold atomic abort removes own write-only temp before readable reopen" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    const name = std.fmt.hex(atomic.file_basename_hex);
+    deinitColdAtomic(std.testing.io, &atomic, null);
+    try std.testing.expectError(error.FileNotFound, private.openFile(std.testing.io, &name, .{}));
+}
+
+test "Windows cold atomic refuses broad parent before secret bytes" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var atomic = try tmp.dir.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    const name = std.fmt.hex(atomic.file_basename_hex);
+    try std.testing.expectError(error.InsecurePermissions, makeColdAtomicReadable(std.testing.io, &atomic));
+    deinitColdAtomic(std.testing.io, &atomic, null);
+    // A failed private-parent proof deliberately leaves only an empty temp;
+    // std's name-based cleanup is forbidden on this path.
+    const empty = try tmp.dir.openFile(std.testing.io, &name, .{});
+    defer empty.close(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 0), (try empty.stat(std.testing.io)).size);
+}
+
+test "Windows cold atomic abort preserves a substituted foreign name" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    try makeColdAtomicReadable(std.testing.io, &atomic);
+    const identity = try cold_identity.statRegular(atomic.file.handle);
+    const name = std.fmt.hex(atomic.file_basename_hex);
+    atomic.file.close(std.testing.io);
+    atomic.file_open = false;
+    try private.rename(&name, private, "owned-away", std.testing.io);
+    const foreign = try private.createFile(std.testing.io, &name, .{});
+    try foreign.writePositionalAll(std.testing.io, "FOREIGN", 0);
+    foreign.close(std.testing.io);
+    deinitColdAtomic(std.testing.io, &atomic, identity);
+    const bytes = try private.readFileAlloc(std.testing.io, &name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("FOREIGN", bytes);
+}
+
+test "Windows cold atomic nofollow reopen rejects a substituted reparse name" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    const identity = try windowsColdAtomicIdentity(atomic.file.handle);
+    defer deinitColdAtomic(std.testing.io, &atomic, identity);
+    const name = std.fmt.hex(atomic.file_basename_hex);
+    atomic.file.close(std.testing.io);
+    atomic.file_open = false;
+    try private.rename(&name, private, "owned-away", std.testing.io);
+    private.symLink(std.testing.io, "owned-away", &name, .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectError(error.NotRegular, openColdAtomicWindows(std.testing.io, &atomic));
+    const owned = try private.openFile(std.testing.io, "owned-away", .{});
+    owned.close(std.testing.io);
+}
+
+test "Windows cold atomic failed readable reopen leaves no foreign deletion" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    const name = std.fmt.hex(atomic.file_basename_hex);
+    const copy = try cold_runtime.duplicateFile(atomic.file);
+    try std.testing.expectError(error.FileBusy, makeColdAtomicReadable(std.testing.io, &atomic));
+    try std.testing.expect(!atomic.file_exists);
+    copy.close(std.testing.io);
+    deinitColdAtomic(std.testing.io, &atomic, null);
+    const orphan = try private.openFile(std.testing.io, &name, .{});
+    orphan.close(std.testing.io);
 }
 
 /// testing.tmpDir owns `.zig-cache/tmp/<sub_path>` relative to the current

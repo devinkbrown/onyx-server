@@ -251,6 +251,19 @@ pub fn duplicate(fd: Fd) Error!Fd {
     return @intCast(rc);
 }
 
+/// Duplicate a native std.Io.File HANDLE rather than a registry-backed runtime
+/// descriptor. The copy retains the exact same file object and I/O flags.
+pub fn duplicateFile(file: std.Io.File) Error!std.Io.File {
+    if (comptime builtin.os.tag == .windows) {
+        var copy: usize = invalid_windows_handle;
+        const process = GetCurrentProcess();
+        if (DuplicateHandle(process, @intFromPtr(file.handle), process, &copy, 0, 0, windows_duplicate_same_access) == 0 or copy == invalid_windows_handle)
+            return windowsFileError(GetLastError());
+        return .{ .handle = @ptrFromInt(copy), .flags = file.flags };
+    }
+    return .{ .handle = try duplicate(file.handle), .flags = file.flags };
+}
+
 pub fn setCloexec(fd: Fd, enabled: bool) Error!void {
     if (comptime builtin.os.tag == .windows) {
         if (fd < windows_file_fd_first) return error.Unsupported;
