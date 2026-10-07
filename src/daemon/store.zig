@@ -2504,11 +2504,10 @@ pub const ColdRecoveryStage = struct {
     }
 
     fn prepareBatchMode(self: *ColdRecoveryStage, mutations: []const BatchMutation, complete_epoch: bool) !PreparedColdRecovery {
-        // Ordinary recovery can append after publication. Windows opens only
-        // the complete-epoch preparation lane until its two-file cut is proven.
-        if (comptime @import("builtin").os.tag == .windows) {
-            if (!complete_epoch) return error.SkipZigTest;
-        }
+        // Windows always prepares a whole successor: it can retire an unknown
+        // old tail without appending into a captured file after publication.
+        // The explicit complete API still requires a complete source cut.
+        const whole_successor = complete_epoch or @import("builtin").os.tag == .windows;
         try self.validate();
         const owned = self.backing.?;
         const store = &owned.store;
@@ -2518,7 +2517,7 @@ pub const ColdRecoveryStage = struct {
         const payload_len = try batchPayloadLen(mutations, store.cfg.max_record_bytes);
         const record_len = std.math.add(usize, batch_guard_len + record_header_len, payload_len) catch return StoreError.RecordTooLarge;
         const projected = std.math.add(u64, owned.valid_end, record_len) catch return StoreError.RecordTooLarge;
-        const rotate = complete_epoch or owned.selected_epoch != null or owned.wal.bytes.len == 0 or projected > store.cfg.max_wal_bytes or projected >= store.cfg.max_wal_bytes / 2;
+        const rotate = whole_successor or owned.selected_epoch != null or owned.wal.bytes.len == 0 or projected > store.cfg.max_wal_bytes or projected >= store.cfg.max_wal_bytes / 2;
         const offset: u64 = if (rotate) cold_epoch_record_len else owned.valid_end;
         const final = std.math.add(u64, offset, record_len) catch return StoreError.RecordTooLarge;
         if (final > store.cfg.max_wal_bytes) return StoreError.RecordTooLarge;
@@ -2528,13 +2527,18 @@ pub const ColdRecoveryStage = struct {
         // Retain an independent canonical packet after publication ambiguity
         // poisons/frees the ordinary active batch. The held full successor and
         // this private witness belong to the stage until explicit cleanup.
-        const complete_record: ?[]u8 = if (complete_epoch) try self.allocator.dupe(u8, store.active_batch.?.record.?) else null;
+        const complete_record: ?[]u8 = if (whole_successor) try self.allocator.dupe(u8, store.active_batch.?.record.?) else null;
         errdefer if (complete_record) |bytes| self.allocator.free(bytes);
         var epoch = store.wal_epoch;
         if (rotate and owned.selected_epoch == null) store.io.random(&epoch);
         const record = coldEpoch(epoch);
         const rotated: CoverageSlot = .{ .covered_len = record.len, .epoch = epoch, .digest = coldDigest(&record) };
-        const coverage: ?SnapshotCoverage = if (rotate and owned.selected_epoch == null and owned.wal.bytes.len != 0) .{ .count = 2, .slots = .{ .{ .covered_len = owned.valid_end, .epoch = store.wal_epoch, .digest = coldDigest(owned.wal.bytes[0..@intCast(owned.valid_end)]) }, rotated } } else null;
+        // Windows cannot publish a snapshot ahead of a malformed nonempty
+        // WAL with no authenticated old epoch: an interrupted two-file cut
+        // would leave that old namespace unreopenable. Keep POSIX coverage
+        // behavior unchanged in this Windows portability slice.
+        const coverage: ?SnapshotCoverage = if (rotate and owned.selected_epoch == null and owned.wal.bytes.len != 0 and
+            (@import("builtin").os.tag != .windows or owned.valid_end != 0)) .{ .count = 2, .slots = .{ .{ .covered_len = owned.valid_end, .epoch = store.wal_epoch, .digest = coldDigest(owned.wal.bytes[0..@intCast(owned.valid_end)]) }, rotated } } else null;
         const snapshot_bytes: ?[]u8 = if (coverage) |*proof| try encodeColdSnapshot(store, proof) else null;
         errdefer if (snapshot_bytes) |bytes| self.allocator.free(bytes);
         const directory = try coldOpenParent(store.io, store.dir, store.wal_path);
@@ -2586,7 +2590,7 @@ pub const ColdRecoveryStage = struct {
         errdefer writer.close(store.io);
         const writer_identity = try cold_identity.statRegular(writer.handle);
         if (!rotate and !std.meta.eql(writer_identity, owned.wal.identity)) return StoreError.SnapshotCoverageMismatch;
-        owned.plan = .{ .batch = batch, .writer = writer, .writer_identity = writer_identity, .directory = directory, .directory_identity = directory_identity, .wal_atomic = wal_atomic, .snapshot_atomic = snapshot_atomic, .snapshot_bytes = snapshot_bytes, .snapshot_identity = if (snapshot_atomic) |file| try cold_identity.statRegular(file.file.handle) else null, .epoch = record, .coverage = coverage, .rotate = rotate, .complete_epoch = complete_epoch, .complete_record = complete_record };
+        owned.plan = .{ .batch = batch, .writer = writer, .writer_identity = writer_identity, .directory = directory, .directory_identity = directory_identity, .wal_atomic = wal_atomic, .snapshot_atomic = snapshot_atomic, .snapshot_bytes = snapshot_bytes, .snapshot_identity = if (snapshot_atomic) |file| try cold_identity.statRegular(file.file.handle) else null, .epoch = record, .coverage = coverage, .rotate = rotate, .complete_epoch = whole_successor, .complete_record = complete_record };
         errdefer owned.plan = null;
         owned.plan.?.prepared_digest = try coldPreparedDigest(owned);
         return .{ .stage = self, .owner = owned, .generation = batch.generation };
@@ -3265,7 +3269,7 @@ test "Windows cold recovery opens a captured read-only view and leaves preparati
     try std.testing.expect(stage.view().isReadOnly());
     try std.testing.expectEqualStrings("durable", stage.view().get(.props, "original").?);
     const mutation: BatchMutation = .{ .family = .props, .kind = .put, .key = "new", .value = "forbidden" };
-    try std.testing.expectError(error.SkipZigTest, stage.prepareBatch(&.{mutation}));
+    try std.testing.expectError(error.InsecurePermissions, stage.prepareBatch(&.{mutation}));
     try std.testing.expectError(error.InsecurePermissions, stage.prepareCompleteBatch(&.{mutation}));
     try std.testing.expect(stage.backing.?.plan == null);
     try std.testing.expect(stage.backing.?.store.active_batch == null);
@@ -3420,7 +3424,8 @@ test "Windows complete cold recovery publishes held private successors" {
     {
         var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
         defer stage.deinit();
-        try std.testing.expectError(error.SkipZigTest, stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "prepared" }}));
+        var ordinary = try stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "prepared" }});
+        ordinary.abort();
         var prepared = try stage.prepareCompleteBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "prepared" }});
         defer prepared.abort();
         const plan = &stage.backing.?.plan.?;
@@ -3561,6 +3566,114 @@ test "Windows cold recovery checks nested private parent before captured WAL byt
     try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
     try lease.writePositionalAll(std.testing.io, "L", 0);
     try std.testing.expectError(error.InsecurePermissions, ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "private/state.wal", lease, .{ .changefeed_capacity = 0 }));
+}
+
+test "Windows ordinary cold recovery retires unknown WAL tail through whole successor" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |fault_before_wal| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+        defer private.close(std.testing.io);
+        {
+            var seed = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/state.wal", .{});
+            defer seed.deinit();
+            try seed.put(.props, "old", "accepted");
+        }
+        const writer = try openColdExisting(std.testing.io, private, "state.wal", .read_write);
+        const end = (try writer.stat(std.testing.io)).size;
+        try writer.writePositionalAll(std.testing.io, "unknown tail", end);
+        try writer.sync(std.testing.io);
+        writer.close(std.testing.io);
+        const lease = try private.createFile(std.testing.io, "state.wal.lock", .{ .read = true });
+        defer lease.close(std.testing.io);
+        try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+        try lease.writePositionalAll(std.testing.io, "L", 0);
+        if (fault_before_wal) {
+            var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+            defer stage.deinit();
+            try std.testing.expect(stage.backing.?.valid_end < stage.backing.?.wal.bytes.len);
+            try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.prepareCompleteBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "recovered" }}));
+            var prepared = try stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "recovered" }});
+            defer prepared.abort();
+            try std.testing.expect(stage.backing.?.plan.?.complete_epoch);
+            stage.setPublicationFault(.wal_replace);
+            try std.testing.expectError(StoreError.IoAmbiguous, prepared.commit());
+        }
+        {
+            var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+            defer stage.deinit();
+            try std.testing.expectEqualStrings("accepted", stage.view().get(.props, "old").?);
+            try std.testing.expect(stage.view().get(.props, "new") == null);
+            try std.testing.expect(stage.backing.?.valid_end < stage.backing.?.wal.bytes.len);
+            var prepared = try stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "recovered" }});
+            defer prepared.abort();
+            try prepared.commit();
+            var published = stage.takeCommittedStore();
+            defer published.deinit();
+            try std.testing.expectEqualStrings("accepted", published.get(.props, "old").?);
+            try std.testing.expectEqualStrings("recovered", published.get(.props, "new").?);
+        }
+        var restart = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+        defer restart.deinit();
+        try std.testing.expectEqualStrings("accepted", restart.view().get(.props, "old").?);
+        try std.testing.expectEqualStrings("recovered", restart.view().get(.props, "new").?);
+        try std.testing.expectEqual(restart.backing.?.wal.bytes.len, restart.backing.?.valid_end);
+    }
+}
+
+test "Windows ordinary cold recovery replaces malformed first record without an old snapshot" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |truncated_epoch| {
+        for ([_]ColdPublicationFault{ .wal_replace, .wal_dir_sync }) |fault| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+            defer private.close(std.testing.io);
+            const epoch = coldEpoch(@splat(7));
+            const malformed: []const u8 = if (truncated_epoch) epoch[0 .. record_header_len + 1] else "partial";
+            const file = try cold_runtime.createPrivateExclusiveWindows(private, "state.wal");
+            try file.writePositionalAll(std.testing.io, malformed, 0);
+            try file.sync(std.testing.io);
+            file.close(std.testing.io);
+            const lease = try private.createFile(std.testing.io, "state.wal.lock", .{ .read = true });
+            defer lease.close(std.testing.io);
+            try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+            try lease.writePositionalAll(std.testing.io, "L", 0);
+            {
+                var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+                defer stage.deinit();
+                try std.testing.expectEqual(@as(u64, 0), stage.backing.?.valid_end);
+                try std.testing.expect(!stage.view().wal_epoch_known);
+                try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.prepareCompleteBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "recovered" }}));
+                var prepared = try stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "recovered" }});
+                defer prepared.abort();
+                try std.testing.expect(stage.backing.?.plan.?.snapshot_atomic == null);
+                stage.setPublicationFault(fault);
+                try std.testing.expectError(StoreError.IoAmbiguous, prepared.commit());
+            }
+            {
+                var restart = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+                defer restart.deinit();
+                if (fault == .wal_replace) {
+                    try std.testing.expect(restart.view().get(.props, "new") == null);
+                    try std.testing.expectEqual(@as(u64, 0), restart.backing.?.valid_end);
+                    var retry = try restart.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "recovered" }});
+                    defer retry.abort();
+                    try retry.commit();
+                    var published = restart.takeCommittedStore();
+                    defer published.deinit();
+                    try std.testing.expectEqualStrings("recovered", published.get(.props, "new").?);
+                } else {
+                    try std.testing.expectEqualStrings("recovered", restart.view().get(.props, "new").?);
+                }
+            }
+            var final = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+            defer final.deinit();
+            try std.testing.expectEqualStrings("recovered", final.view().get(.props, "new").?);
+            try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "state.wal.snap", .read_only));
+        }
+    }
 }
 
 test "Windows complete cold recovery publication faults restart on whole old or new epoch" {

@@ -824,6 +824,8 @@ pub fn build(b: *std.Build) void {
             "Windows complete cold recovery selects covered empty WAL without replacing snapshot",
             "Windows complete cold recovery rejects a permissive snapshot before capture",
             "Windows cold recovery checks nested private parent before captured WAL bytes",
+            "Windows ordinary cold recovery retires unknown WAL tail through whole successor",
+            "Windows ordinary cold recovery replaces malformed first record without an old snapshot",
             "Windows complete cold recovery publication faults restart on whole old or new epoch",
             "Windows complete cold recovery refuses tampered held successor before publication",
             "Windows complete cold recovery preparation allocation failures retry without publication",
