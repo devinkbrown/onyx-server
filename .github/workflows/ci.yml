@@ -51,7 +51,7 @@ jobs:
   windows-native:
     name: native Windows full daemon
     runs-on: windows-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Install and verify pinned Windows Zig
@@ -103,6 +103,8 @@ jobs:
         run: python -B .\tools\windows_quic_interop_smoke.py .\zig-out\bin\quic_interop_wt_server.exe
       - name: Run full Windows test suite (Debug)
         run: zig build -j1 test -Dtarget=x86_64-windows --summary all
+      - name: Run full Windows test suite with native Zig codegen (Debug)
+        run: zig build -j1 test -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
       - name: Build native-codegen Windows test runners
         run: zig build -j1 test-artifacts -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
       - name: Verify Windows test-runner stack reserves
