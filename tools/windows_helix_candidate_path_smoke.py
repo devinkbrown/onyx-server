@@ -9,7 +9,7 @@ must launch B, then B must launch C, while held IRC clients, the local session
 token, and account WAL reads/writes survive. With --stage-b-binary, B is a
 different compatible build and the smoke stops after one cross-build swap.
 Relative and malformed candidate paths must refuse without disturbing A.
-Supply --incompatible-binary to exercise authenticated capability rejection.
+Supply --incompatible-binary to verify an older image cannot take custody.
 
 Usage: python -B tools/windows_helix_candidate_path_smoke.py zig-out/bin/onyx-server.exe
 """
@@ -145,7 +145,7 @@ def main() -> int:
     parser.add_argument("--stage-b-binary", type=Path,
                         help="different compatible Onyx build for a single A-to-B swap")
     parser.add_argument("--incompatible-binary", type=Path,
-                        help="optional older/incompatible onyx-server.exe for rollback")
+                        help="optional older/incompatible onyx-server.exe for refusal check")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("this fixture requires native Windows")

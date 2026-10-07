@@ -348,6 +348,8 @@ exercises two consecutive swaps with held plaintext IRC sockets, account reads
 and writes, and an unchanged local session token. A staged-path smoke selects
 two distinct staged filenames in sequence and checks refusal of relative,
 malformed, and incompatible paths with held clients and account WAL continuity.
+Windows CI builds a pinned historical v17 image and supplies it to this
+smoke, making the incompatible-image refusal a required process check.
 Its `--stage-b-binary` mode requires a different binary hash and exercises one
 cross-build swap; a compatible prior build has passed that held-client and WAL
 check. A TLS/WSS smoke exercises two swaps with held TLS IRC and WSS sockets,

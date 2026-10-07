@@ -162,8 +162,19 @@ jobs:
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded Windows Helix with an inert native media port
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
+      # This ancestor still speaks the v17 Windows Helix protocol. Build it
+      # with the same pinned Zig so the refusal path cannot silently skip.
+      - name: Check out incompatible Windows Helix v17 fixture
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: 1cd9c5040d7c08551b6a2c401973d842b64f0c17
+          path: .ci/helix-v17
+      - name: Build incompatible Windows Helix v17 fixture
+        working-directory: .ci/helix-v17
+        run: zig build -j1 package -Dtarget=x86_64-windows --summary all
       - name: Run guarded Windows Helix staged-image selection smoke
-        run: python -B .\tools\windows_helix_candidate_path_smoke.py .\zig-out\bin\onyx-server.exe
+        run: python -B .\tools\windows_helix_candidate_path_smoke.py .\zig-out\bin\onyx-server.exe --incompatible-binary .\.ci\helix-v17\zig-out\bin\onyx-server.exe
       - name: Run Windows REHASH source-proof and Helix continuity smoke
         run: python -B .\tools\windows_helix_rehash_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Build automatic descriptor rollover smoke executable
