@@ -619,9 +619,25 @@ test "Windows Helix nested image ancestors refuse rename until released" {
     closeOwned(&image);
     if (tmp.dir.rename("outer", tmp.dir, "moved", std.testing.io)) |_| {
         return error.PinnedAncestorReplaceable;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.FileBusy, error.AccessDenied => {},
+        else => return err,
+    }
     ancestors.deinit();
-    try tmp.dir.rename("outer", tmp.dir, "moved", std.testing.io);
+    var moved = false;
+    for (0..6) |attempt| {
+        tmp.dir.rename("outer", tmp.dir, "moved", std.testing.io) catch |err| switch (err) {
+            error.FileBusy, error.AccessDenied => {
+                if (attempt == 5) return err;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        moved = true;
+        break;
+    }
+    try std.testing.expect(moved);
 }
 
 test "Windows Helix candidate rejects a forged parent process identity" {

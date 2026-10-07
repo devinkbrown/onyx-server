@@ -1660,7 +1660,8 @@ test "DNS Windows native UDP A and AAAA replies are identity checked and time bo
     };
     var responder = Responder{ .socket = socket };
     const thread = try std.Thread.spawn(.{}, Responder.run, .{&responder});
-    defer thread.join();
+    var joined = false;
+    defer if (!joined) thread.join();
 
     var cfg = ResolverConfig{ .port = std.mem.bigToNative(u16, bind_addr.port), .timeout_ms = 500, .attempts = 1 };
     cfg.addNameserver(.{ .ipv4 = .{ 127, 0, 0, 1 } });
@@ -1670,6 +1671,8 @@ test "DNS Windows native UDP A and AAAA replies are identity checked and time bo
     const aaaa = try resolveForward(&cfg, "windows-dns.test", true, &addresses);
     try std.testing.expectEqual(Address{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 } }, aaaa[0]);
     try std.testing.expectError(error.Timeout, resolveForward(&cfg, "wrong-id.test", false, &addresses));
+    thread.join();
+    joined = true;
     try std.testing.expectEqual(@as(u32, 3), responder.served.load(.acquire));
 
     const start_ms = @import("../substrate/platform.zig").monotonicMillis();
