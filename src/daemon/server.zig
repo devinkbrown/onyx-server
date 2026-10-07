@@ -5299,9 +5299,13 @@ pub const LinuxServer = struct {
     slash_cmds: slash_cmd.Table = .{},
     /// Test stand-ins for the unfurl resolver and fetch. Null uses DNS and HTTPS.
     unfurl_resolve_for_test: ?unfurl.ResolveFn = null,
+    unfurl_resolve_aaaa_for_test: ?unfurl.ResolveFn = null,
     unfurl_fetch_for_test: ?unfurl.FetchFn = null,
     unfurl_fetch_at_address_for_test: ?*const fn ([]const u8, std.Io.net.IpAddress, []u8) anyerror!usize = null,
+    unfurl_get_at_address_for_test: ?*const fn (std.mem.Allocator, []const u8, u16, []const u8, std.Io.net.IpAddress, http_fetch.Options) anyerror![]u8 = null,
     outbound_resolve_for_test: ?*const fn ([]const u8, u16) anyerror!std.Io.net.IpAddress = null,
+    outbound_resolve_aaaa_for_test: ?*const fn ([]const u8, u16) anyerror!std.Io.net.IpAddress = null,
+    outbound_post_at_address_for_test: ?*const fn (std.mem.Allocator, http_fetch.Url, []const u8, []const u8, std.Io.net.IpAddress, http_fetch.Options) anyerror![]u8 = null,
     outbound_trust_anchors_for_test: ?[]const []const u8 = null,
     /// Strictly-increasing incarnation counter for minted oper grants, so a later
     /// GRANT/REVOKE always supersedes an earlier one (even within one ms).
@@ -7479,10 +7483,25 @@ pub const LinuxServer = struct {
         opts.trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{};
         opts.disallowed_certs = if (trust) |*store| store.disallowed() else &.{};
         opts.windows_chain_policy = builtin.os.tag == .windows and trust != null;
+        var selected_addr = addr;
+        var tried_aaaa = false;
+        const hostname = outboundHostIsHostname(parsed.host, parsed.port);
         var attempt: u8 = 0;
         while (attempt < outbound_webhook_attempt_cap) : (attempt += 1) {
+            var connected = false;
+            opts.connect_established = &connected;
             self.outbound_webhook_attempts += 1;
-            const resp = http_fetch.postSignedAtAddress(self.allocator, parsed, body, signature, addr, opts) catch continue;
+            const resp = self.postOutboundAtAddress(parsed, body, signature, selected_addr, opts) catch |err| {
+                if (!tried_aaaa and shouldWindowsPinnedAAAAFallback(selected_addr, hostname, connected, err)) {
+                    selected_addr = self.resolveOutboundWebhookAAAAAddress(parsed.host, parsed.port) catch break;
+                    tried_aaaa = true;
+                    continue;
+                }
+                // A connected POST may have reached the peer. Transport errors
+                // after that point cannot justify an automatic replay.
+                if (connected) break;
+                continue;
+            };
             defer self.allocator.free(resp);
             if (httpStatus2xx(resp)) {
                 self.outbound_webhook_delivered += 1;
@@ -7512,12 +7531,33 @@ pub const LinuxServer = struct {
         return addr;
     }
 
+    fn resolveOutboundWebhookAAAAAddress(self: *LinuxServer, host: []const u8, port: u16) !std.Io.net.IpAddress {
+        if (!self.config.webhook_allow_private and outboundHostPrivate(host)) return error.PrivateOutboundAddress;
+        var host_buf: [256]u8 = undefined;
+        const lookup_host = outboundNormalizeHost(host, &host_buf);
+        if (lookup_host.len == 0) return error.BadUrl;
+        const addr = if (self.outbound_resolve_aaaa_for_test) |resolve|
+            try resolve(lookup_host, port)
+        else
+            try http_fetch.resolveHostAAAA(lookup_host, port, 400);
+        if (addr != .ip6) return error.HostNotFound;
+        if (!self.config.webhook_allow_private and outboundAddrPrivate(addr)) return error.PrivateOutboundAddress;
+        return addr;
+    }
+
     fn loadOutboundTrust(self: *LinuxServer) !outbound_trust.Store {
         if (self.runtime_io) |io| return outbound_trust.load(self.allocator, io);
         if (self.config.crypto_io) |io| return outbound_trust.load(self.allocator, io);
         var local_io = std.Io.Threaded.init(std.heap.smp_allocator, .{});
         defer local_io.deinit();
         return outbound_trust.load(self.allocator, local_io.io());
+    }
+
+    fn postOutboundAtAddress(self: *LinuxServer, url: http_fetch.Url, body: []const u8, signature: []const u8, addr: std.Io.net.IpAddress, opts: http_fetch.Options) ![]u8 {
+        if (comptime builtin.is_test) {
+            if (self.outbound_post_at_address_for_test) |post| return post(self.allocator, url, body, signature, addr, opts);
+        }
+        return http_fetch.postSignedAtAddress(self.allocator, url, body, signature, addr, opts);
     }
 
     fn outboundTrustOverrideForTest(self: *LinuxServer) ?[]const []const u8 {
@@ -27625,7 +27665,7 @@ pub const LinuxServer = struct {
             return;
         };
         var body_buf: [unfurl.max_body]u8 = undefined;
-        const body = self.unfurlBody(request, target.host, target.port, addr, &body_buf) catch {
+        const body = self.unfurlBody(request, target, addr, &body_buf) catch {
             try self.noticeTo(conn, "UNFURL: could not fetch");
             return;
         };
@@ -27667,7 +27707,18 @@ pub const LinuxServer = struct {
         };
     }
 
-    fn unfurlBody(self: *LinuxServer, request: []const u8, host: []const u8, port: u16, addr: std.Io.net.IpAddress, dest: []u8) ![]const u8 {
+    fn resolveUnfurlAAAAAddress(self: *LinuxServer, target: unfurl.Target) !std.Io.net.IpAddress {
+        if (target.literal != null) return error.PrivateUnfurlAddress;
+        const addr = if (self.unfurl_resolve_aaaa_for_test) |resolve|
+            try resolve(target.host)
+        else
+            try http_fetch.resolveHostAAAA(target.host, target.port, 2000);
+        if (addr != .ip6) return error.HostNotFound;
+        if (unfurl.deniedAddress(addr)) return error.PrivateUnfurlAddress;
+        return addr;
+    }
+
+    fn unfurlBody(self: *LinuxServer, request: []const u8, target: unfurl.Target, addr: std.Io.net.IpAddress, dest: []u8) ![]const u8 {
         if (self.unfurl_fetch_for_test) |fetch| {
             const n = try fetch(request, dest);
             return dest[0..@min(n, dest.len)];
@@ -27679,18 +27730,33 @@ pub const LinuxServer = struct {
         const test_anchors = self.outboundTrustOverrideForTest();
         var trust: ?outbound_trust.Store = if (test_anchors == null) try self.loadOutboundTrust() else null;
         defer if (trust) |*store| store.deinit();
-        const raw = try http_fetch.getAtAddress(self.allocator, host, port, true, request, addr, .{
+        var connected = false;
+        const opts = http_fetch.Options{
             .max_response_bytes = unfurl.max_body,
             .trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{},
             .disallowed_certs = if (trust) |*store| store.disallowed() else &.{},
             .windows_chain_policy = builtin.os.tag == .windows and trust != null,
-        });
+            .connect_established = &connected,
+        };
+        const raw = self.getUnfurlAtAddress(target, request, addr, opts) catch |err| blk: {
+            if (!shouldWindowsPinnedAAAAFallback(addr, target.literal == null, connected, err)) return err;
+            const fallback_addr = try self.resolveUnfurlAAAAAddress(target);
+            connected = false;
+            break :blk try self.getUnfurlAtAddress(target, request, fallback_addr, opts);
+        };
         defer self.allocator.free(raw);
         const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return dest[0..0];
         const body = raw[split + 4 ..];
         const n = @min(body.len, dest.len);
         @memcpy(dest[0..n], body[0..n]);
         return dest[0..n];
+    }
+
+    fn getUnfurlAtAddress(self: *LinuxServer, target: unfurl.Target, request: []const u8, addr: std.Io.net.IpAddress, opts: http_fetch.Options) ![]u8 {
+        if (comptime builtin.is_test) {
+            if (self.unfurl_get_at_address_for_test) |get| return get(self.allocator, target.host, target.port, request, addr, opts);
+        }
+        return http_fetch.getAtAddress(self.allocator, target.host, target.port, true, request, addr, opts);
     }
 
     /// `APPEAL <text>` files one structured appeal per host per window. The
@@ -53170,8 +53236,16 @@ pub const LinuxServer = struct {
             opts.trust_anchors = if (test_anchors) |anchors| anchors else if (trust) |*store| store.anchors() else &.{};
             opts.disallowed_certs = if (trust) |*store| store.disallowed() else &.{};
             opts.windows_chain_policy = builtin.os.tag == .windows and trust != null;
+            var connected = false;
+            opts.connect_established = &connected;
             self.outbound_webhook_attempts += 1;
-            const response = http_fetch.postSignedAtAddress(self.allocator, parsed, body, signature, addr, opts) catch return;
+            const response = self.postOutboundAtAddress(parsed, body, signature, addr, opts) catch |err| blk: {
+                if (!shouldWindowsPinnedAAAAFallback(addr, outboundHostIsHostname(parsed.host, parsed.port), connected, err)) return;
+                const fallback_addr = self.resolveOutboundWebhookAAAAAddress(parsed.host, parsed.port) catch return;
+                connected = false;
+                self.outbound_webhook_attempts += 1;
+                break :blk self.postOutboundAtAddress(parsed, body, signature, fallback_addr, opts) catch return;
+            };
             defer self.allocator.free(response);
             if (!self.retainedWebhookResponseAccepted(response)) return;
             self.outbound_webhook_delivered += 1;
@@ -129042,6 +129116,19 @@ fn outboundAddrPrivate(addr: std.Io.net.IpAddress) bool {
     return webpush_mod.isDisallowedPushAddr(addr);
 }
 
+fn outboundHostIsHostname(raw: []const u8, port: u16) bool {
+    var host_buf: [256]u8 = undefined;
+    const host = outboundNormalizeHost(raw, &host_buf);
+    if (host.len == 0) return false;
+    _ = std.Io.net.IpAddress.parse(host, port) catch return true;
+    return false;
+}
+
+fn shouldWindowsPinnedAAAAFallback(addr: std.Io.net.IpAddress, hostname: bool, connected: bool, err: anyerror) bool {
+    return builtin.os.tag == .windows and hostname and addr == .ip4 and !connected and
+        (err == error.ConnectFailed or err == error.ConnectTimeout);
+}
+
 fn pinOutboundLoopbackForTest(_: []const u8, port: u16) anyerror!std.Io.net.IpAddress {
     return .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
 }
@@ -129582,6 +129669,109 @@ test "outbound webhook forwards screened address and fails closed" {
     try std.testing.expectEqualDeep(Fixture.selected, try server.resolveOutboundWebhookAddress("public.example", 443));
 }
 
+test "Windows pinned webhook failover screens AAAA and stops after connection" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io });
+    defer allocator.destroy(server);
+    defer server.deinit();
+    const IpAddress = std.Io.net.IpAddress;
+    const Fixture = struct {
+        var aaaa: IpAddress = undefined;
+        var aaaa_calls: usize = 0;
+        var posts: usize = 0;
+        var post_addrs: [2]IpAddress = undefined;
+        var connected_on_failure: bool = false;
+
+        fn resolveA(host: []const u8, port: u16) anyerror!IpAddress {
+            try std.testing.expectEqualStrings("hook.test", host);
+            return IpAddress.parse("1.1.1.7", port);
+        }
+        fn resolveAAAA(host: []const u8, port: u16) anyerror!IpAddress {
+            try std.testing.expectEqualStrings("hook.test", host);
+            try std.testing.expectEqual(@as(u16, 8443), port);
+            aaaa_calls += 1;
+            return aaaa;
+        }
+        fn post(a: std.mem.Allocator, url: http_fetch.Url, body: []const u8, signature: []const u8, addr: IpAddress, opts: http_fetch.Options) anyerror![]u8 {
+            try std.testing.expectEqualStrings("hook.test", url.host);
+            try std.testing.expectEqualStrings("{}", body);
+            try std.testing.expect(std.mem.startsWith(u8, signature, "sha256="));
+            try std.testing.expect(opts.connect_established != null);
+            if (posts >= post_addrs.len) return error.TestUnexpectedPost;
+            post_addrs[posts] = addr;
+            posts += 1;
+            if (posts == 1) {
+                opts.connect_established.?.* = connected_on_failure;
+                return if (connected_on_failure) error.ConnectionClosed else error.ConnectFailed;
+            }
+            opts.connect_established.?.* = true;
+            return a.dupe(u8, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        }
+    };
+    server.outbound_resolve_for_test = Fixture.resolveA;
+    server.outbound_resolve_aaaa_for_test = Fixture.resolveAAAA;
+    server.outbound_post_at_address_for_test = Fixture.post;
+    server.outbound_trust_anchors_for_test = &.{};
+    var url = "https://hook.test:8443/hook".*;
+    var secret = "secret".*;
+    const sub = OutboundWebhook{ .url = &url, .secret = &secret, .mask = event_spine.CategoryMask.all() };
+    Fixture.aaaa = try IpAddress.parse("2606:4700:4700::1111", 8443);
+    Fixture.aaaa_calls = 0;
+    Fixture.posts = 0;
+    Fixture.connected_on_failure = false;
+    server.postOutboundWebhook(sub, "{}");
+    try std.testing.expectEqual(@as(usize, 2), Fixture.posts);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.aaaa_calls);
+    try std.testing.expectEqualDeep(try IpAddress.parse("1.1.1.7", 8443), Fixture.post_addrs[0]);
+    try std.testing.expectEqualDeep(Fixture.aaaa, Fixture.post_addrs[1]);
+    try std.testing.expectEqual(@as(u64, 2), server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_delivered);
+
+    Fixture.aaaa = try IpAddress.parse("fd00::1", 8443);
+    Fixture.aaaa_calls = 0;
+    Fixture.posts = 0;
+    server.postOutboundWebhook(sub, "{}");
+    try std.testing.expectEqual(@as(usize, 1), Fixture.posts);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.aaaa_calls);
+    try std.testing.expectEqual(@as(u64, 3), server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_dropped);
+
+    Fixture.aaaa = try IpAddress.parse("2606:4700:4700::1111", 8443);
+    Fixture.aaaa_calls = 0;
+    Fixture.posts = 0;
+    Fixture.connected_on_failure = true;
+    server.postOutboundWebhook(sub, "{}");
+    try std.testing.expectEqual(@as(usize, 1), Fixture.posts);
+    try std.testing.expectEqual(@as(usize, 0), Fixture.aaaa_calls);
+    try std.testing.expectEqual(@as(u64, 4), server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 2), server.outbound_webhook_dropped);
+
+    Fixture.posts = 0;
+    Fixture.connected_on_failure = false;
+    var retained = WebpushOverflowDelivery{
+        .origin = try allocator.dupe(u8, "origin.test"),
+        .origin_node = 1,
+        .hlc = 1,
+        .fanout_published = true,
+    };
+    @memcpy(retained.body[0..2], "{}");
+    retained.body_len = 2;
+    retained.destinations[0] = .{
+        .url = try allocator.dupe(u8, &url),
+        .secret = try allocator.dupe(u8, &secret),
+        .mask = event_spine.CategoryMask.all(),
+    };
+    server.webpush_overflow_deliveries[0] = retained;
+    server.retryWebpushOverflowOutputsLocked();
+    try std.testing.expectEqual(@as(usize, 2), Fixture.posts);
+    try std.testing.expectEqualDeep(try IpAddress.parse("1.1.1.7", 8443), Fixture.post_addrs[0]);
+    try std.testing.expectEqualDeep(Fixture.aaaa, Fixture.post_addrs[1]);
+    try std.testing.expect(!server.hasRetainedWebpushOverflow());
+    try std.testing.expectEqual(@as(u64, 6), server.outbound_webhook_attempts);
+    try std.testing.expectEqual(@as(u64, 2), server.outbound_webhook_delivered);
+}
+
 test "HTTPS webhook and UNFURL refuse when trust roots cannot load" {
     if (comptime builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -129616,7 +129806,7 @@ test "HTTPS webhook and UNFURL refuse when trust roots cannot load" {
     var body_buf: [unfurl.max_body]u8 = undefined;
     failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     server.allocator = failing.allocator();
-    const result = server.unfurlBody(request, target.host, target.port, addr, &body_buf);
+    const result = server.unfurlBody(request, target, addr, &body_buf);
     server.allocator = original_allocator;
     try std.testing.expectError(error.OutOfMemory, result);
     try std.testing.expect(failing.has_induced_failure);
@@ -131084,7 +131274,7 @@ test "UNFURL forwards the screened address to its fetch" {
     var request_buf: [512]u8 = undefined;
     const request = try unfurl.buildTargetRequest(&request_buf, target);
     var body_buf: [unfurl.max_body]u8 = undefined;
-    const body = try server.unfurlBody(request, target.host, target.port, addr, &body_buf);
+    const body = try server.unfurlBody(request, target, addr, &body_buf);
     try std.testing.expectEqualStrings("<title>Pinned preview</title>", body);
     try std.testing.expectEqual(@as(usize, 1), Fixture.resolves);
     try std.testing.expectEqual(@as(usize, 1), Fixture.fetches);
@@ -131152,6 +131342,93 @@ test "Windows UNFURL hostname lookup uses AAAA only after missing A" {
     try std.testing.expectError(error.TestAAAAFailure, LinuxServer.resolveUnfurlHostname(host, 8443, Fixture.a, Fixture.aaaa));
     try std.testing.expectEqual(@as(usize, 4), Fixture.a_calls);
     try std.testing.expectEqual(@as(usize, 2), Fixture.aaaa_calls);
+}
+
+test "Windows pinned UNFURL failover screens AAAA and stops after connection" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io });
+    defer allocator.destroy(server);
+    defer server.deinit();
+    const IpAddress = std.Io.net.IpAddress;
+    const Fixture = struct {
+        var aaaa: IpAddress = undefined;
+        var aaaa_calls: usize = 0;
+        var gets: usize = 0;
+        var get_addrs: [2]IpAddress = undefined;
+        var connected_on_failure: bool = false;
+        var first_error: anyerror = error.ConnectTimeout;
+
+        fn resolveA(host: []const u8) anyerror!IpAddress {
+            try std.testing.expectEqualStrings("preview.test", host);
+            return IpAddress.parse("1.1.1.7", 8443);
+        }
+        fn resolveAAAA(host: []const u8) anyerror!IpAddress {
+            try std.testing.expectEqualStrings("preview.test", host);
+            aaaa_calls += 1;
+            return aaaa;
+        }
+        fn get(a: std.mem.Allocator, _: []const u8, port: u16, request: []const u8, addr: IpAddress, opts: http_fetch.Options) anyerror![]u8 {
+            try std.testing.expectEqual(@as(u16, 8443), port);
+            try std.testing.expect(std.mem.startsWith(u8, request, "GET "));
+            try std.testing.expect(opts.connect_established != null);
+            if (gets >= get_addrs.len) return error.TestUnexpectedGet;
+            get_addrs[gets] = addr;
+            gets += 1;
+            if (gets == 1) {
+                opts.connect_established.?.* = connected_on_failure;
+                return first_error;
+            }
+            opts.connect_established.?.* = true;
+            return a.dupe(u8, "HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\n<title>IPv6</title>");
+        }
+    };
+    server.unfurl_resolve_for_test = Fixture.resolveA;
+    server.unfurl_resolve_aaaa_for_test = Fixture.resolveAAAA;
+    server.unfurl_get_at_address_for_test = Fixture.get;
+    server.outbound_trust_anchors_for_test = &.{};
+    const target = try unfurl.parseHttps("https://preview.test:8443/preview");
+    const addr = try server.resolveUnfurlAddress(target);
+    var request_buf: [512]u8 = undefined;
+    const request = try unfurl.buildTargetRequest(&request_buf, target);
+    var body_buf: [unfurl.max_body]u8 = undefined;
+    Fixture.aaaa = try IpAddress.parse("2606:4700:4700::1111", 8443);
+    Fixture.aaaa_calls = 0;
+    Fixture.gets = 0;
+    Fixture.connected_on_failure = false;
+    Fixture.first_error = error.ConnectTimeout;
+    const body = try server.unfurlBody(request, target, addr, &body_buf);
+    try std.testing.expectEqualStrings("<title>IPv6</title>", body);
+    try std.testing.expectEqual(@as(usize, 2), Fixture.gets);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.aaaa_calls);
+    try std.testing.expectEqualDeep(addr, Fixture.get_addrs[0]);
+    try std.testing.expectEqualDeep(Fixture.aaaa, Fixture.get_addrs[1]);
+
+    Fixture.aaaa = try IpAddress.parse("fd00::1", 8443);
+    Fixture.aaaa_calls = 0;
+    Fixture.gets = 0;
+    try std.testing.expectError(error.PrivateUnfurlAddress, server.unfurlBody(request, target, addr, &body_buf));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.gets);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.aaaa_calls);
+
+    Fixture.aaaa = try IpAddress.parse("2606:4700:4700::1111", 8443);
+    Fixture.aaaa_calls = 0;
+    Fixture.gets = 0;
+    Fixture.connected_on_failure = true;
+    Fixture.first_error = error.ConnectionClosed;
+    try std.testing.expectError(error.ConnectionClosed, server.unfurlBody(request, target, addr, &body_buf));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.gets);
+    try std.testing.expectEqual(@as(usize, 0), Fixture.aaaa_calls);
+
+    Fixture.connected_on_failure = false;
+    Fixture.first_error = error.ConnectTimeout;
+    Fixture.gets = 0;
+    const literal = try unfurl.parseHttps("https://1.1.1.7:8443/preview");
+    const literal_addr = try server.resolveUnfurlAddress(literal);
+    const literal_request = try unfurl.buildTargetRequest(&request_buf, literal);
+    try std.testing.expectError(error.ConnectTimeout, server.unfurlBody(literal_request, literal, literal_addr, &body_buf));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.gets);
+    try std.testing.expectEqual(@as(usize, 0), Fixture.aaaa_calls);
 }
 
 test "GAP-P7 a banned connection files one appeal and the oper answer is audited" {

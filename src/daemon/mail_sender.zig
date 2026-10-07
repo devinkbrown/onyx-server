@@ -798,10 +798,7 @@ pub const Sender = struct {
         // Submission credentials must not cross an unverified session to a remote
         // relay. A non-empty trust store, or an explicit insecure opt-in, is required.
         const verified = self.config.trust_anchors.len != 0 or self.config.insecure_skip_verify;
-        if (self.config.user != null and !isLoopback(addr) and !verified)
-            return error.UnverifiedAuthRelay;
-
-        const fd = try connectAddr(addr, io_timeout_ms);
+        const fd = try connectRelayAddress(self.config.relay_host, self.config.relay_port, addr, io_timeout_ms, self.config.user != null, verified);
         defer closeFd(fd);
         try setRecvTimeout(fd, io_timeout_ms);
 
@@ -1434,6 +1431,25 @@ fn resolveRelayAddressWith(comptime resolve_a: anytype, comptime resolve_aaaa: a
     };
 }
 
+fn connectRelayAddress(host: []const u8, port: u16, first_addr: net.IpAddress, timeout_ms: u31, has_credentials: bool, verified: bool) !Socket {
+    if (has_credentials and !isLoopback(first_addr) and !verified) return error.UnverifiedAuthRelay;
+    return connectAddr(first_addr, timeout_ms) catch |err| {
+        // Only an unsuccessful TCP dial can move to another address. No SMTP
+        // greeting, TLS flight, or command has been exchanged at this point.
+        if (comptime builtin.os.tag == .windows) {
+            const literal = net.IpAddress.parse(host, port) catch null;
+            if (first_addr == .ip4 and literal == null and
+                (err == error.ConnectFailed or err == error.ConnectTimeout))
+            {
+                const next = try http_fetch.resolveHostAAAA(host, port, timeout_ms);
+                if (has_credentials and !isLoopback(next) and !verified) return error.UnverifiedAuthRelay;
+                return connectAddr(next, timeout_ms);
+            }
+        }
+        return err;
+    };
+}
+
 const SocketError = error{ SocketUnavailable, ConnectFailed, ConnectTimeout, ConnectionClosed, RecvTimeout };
 
 fn connectAddr(addr: net.IpAddress, timeout_ms: u31) SocketError!Socket {
@@ -1493,7 +1509,7 @@ fn connectAddrWindows(addr: net.IpAddress, timeout_ms: u31) SocketError!Socket {
     if (win.getsockopt(fd, win.sol_socket, win.so_error, &socket_error, &error_len) != 0 or
         readiness == .failed or socket_error != 0 or error_len != @sizeOf(i32)) return error.ConnectFailed;
     nonblocking = 0;
-    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
+    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.SocketUnavailable;
     return fd;
 }
 
@@ -1794,7 +1810,9 @@ test "Windows SMTP connects to IPv6 loopback relay" {
     const address = try resolveRelayAddress("::1", port, 1000);
     try std.testing.expect(address == .ip6);
     try std.testing.expect(isLoopback(address));
-    const client = try connectAddrWindows(address, 1000);
+    const primary = try resolveRelayAddress("localhost", port, 1000);
+    try std.testing.expect(primary == .ip4);
+    const client = try connectRelayAddress("localhost", port, primary, 1000, false, true);
     defer closeFd(client);
     var reads = win.FdSet{ .count = 1, .sockets = undefined };
     reads.sockets[0] = listener;

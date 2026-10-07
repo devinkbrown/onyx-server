@@ -205,6 +205,10 @@ pub const Options = struct {
     /// documented escape hatch for public read-only feeds when a usable system
     /// CA bundle is unavailable; off by default.
     insecure_skip_verify: bool = false,
+    /// Set after the first TCP connection succeeds. A caller may retry a
+    /// different address only while this remains false; later failures could
+    /// follow TLS or application bytes on the wire.
+    connect_established: ?*bool = null,
     connect_timeout_ms: u31 = 5000,
     recv_timeout_ms: u31 = 10000,
     max_response_bytes: usize = 512 * 1024,
@@ -232,6 +236,7 @@ pub fn get(
     request_bytes: []const u8,
     opts: Options,
 ) Error![]u8 {
+    if (opts.connect_established) |connected| connected.* = false;
     if (opts.windows_chain_policy and (!tls or opts.insecure_skip_verify)) return error.BadCertificate;
     const lookup_host = endpointHost(host);
     const addr = resolveHostA(lookup_host, port, opts.recv_timeout_ms) catch |err| blk: {
@@ -242,7 +247,21 @@ pub fn get(
         }
         return err;
     };
-    return getAtAddress(allocator, host, port, tls, request_bytes, addr, opts);
+    var connected = false;
+    var first_opts = opts;
+    first_opts.connect_established = opts.connect_established orelse &connected;
+    return getAtAddress(allocator, host, port, tls, request_bytes, addr, first_opts) catch |err| {
+        if (comptime builtin.os.tag == .windows) {
+            const literal = net.IpAddress.parse(lookup_host, port) catch null;
+            if (addr == .ip4 and literal == null and !first_opts.connect_established.?.* and
+                (err == error.ConnectFailed or err == error.ConnectTimeout))
+            {
+                const next = try resolveHostAAAA(lookup_host, port, opts.recv_timeout_ms);
+                return getAtAddress(allocator, host, port, tls, request_bytes, next, first_opts);
+            }
+        }
+        return err;
+    };
 }
 
 /// Send one request to an already selected IP while using `host` for HTTP Host,
@@ -258,6 +277,7 @@ pub fn getAtAddress(
     addr: net.IpAddress,
     opts: Options,
 ) Error![]u8 {
+    if (opts.connect_established) |connected| connected.* = false;
     if (opts.windows_chain_policy and (!tls or opts.insecure_skip_verify)) return error.BadCertificate;
     const selected_port = switch (addr) {
         .ip4 => |a| a.port,
@@ -274,6 +294,7 @@ pub fn getAtAddress(
     if (!tls) {
         const fd = try connectAddr(addr, opts.connect_timeout_ms);
         defer closeFd(fd);
+        if (opts.connect_established) |connected| connected.* = true;
         try setRecvTimeout(fd, opts.recv_timeout_ms);
         try writeAll(fd, request_bytes);
         return try readHttp(allocator, fd, opts.max_response_bytes);
@@ -286,6 +307,7 @@ pub fn getAtAddress(
     {
         const fd = try connectAddr(addr, opts.connect_timeout_ms);
         defer closeFd(fd);
+        if (opts.connect_established) |connected| connected.* = true;
         try setRecvTimeout(fd, opts.recv_timeout_ms);
         var application_phase = false;
         if (getTls(allocator, fd, endpointHost(host), request_bytes, opts, &application_phase)) |resp| {
@@ -891,7 +913,7 @@ fn connectAddrWindows(addr: net.IpAddress, timeout_ms: u31) Error!Socket {
     if (fd == win.invalid_socket) return error.SocketUnavailable;
     errdefer _ = win.closesocket(fd);
     var nonblocking: u32 = 1;
-    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
+    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.SocketUnavailable;
     const connected = switch (addr) {
         .ip4 => |a4| blk: {
             const sa = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, a4.port), .addr = a4.bytes };
@@ -912,7 +934,7 @@ fn connectAddrWindows(addr: net.IpAddress, timeout_ms: u31) Error!Socket {
     if (win.getsockopt(fd, win.sol_socket, win.so_error, &socket_error, &error_len) != 0 or
         socket_error != 0 or error_len != @sizeOf(i32)) return error.ConnectFailed;
     nonblocking = 0;
-    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
+    if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.SocketUnavailable;
     return fd;
 }
 
@@ -920,10 +942,16 @@ fn windowsWaitWritable(fd: usize, timeout_ms: u31) Error!bool {
     if (comptime builtin.os.tag != .windows) return error.ConnectFailed;
     var writes = win.FdSet{ .count = 1, .sockets = undefined };
     writes.sockets[0] = fd;
+    var failures = win.FdSet{ .count = 1, .sockets = undefined };
+    failures.sockets[0] = fd;
     var timeout = win.Timeval{ .seconds = @intCast(timeout_ms / 1000), .microseconds = @intCast((timeout_ms % 1000) * 1000) };
-    const ready = win.select(0, null, &writes, null, &timeout);
+    // Winsock reports a failed nonblocking connect in exceptfds, not writefds.
+    const ready = win.select(0, null, &writes, &failures, &timeout);
     if (ready < 0) return error.ConnectFailed;
-    return ready != 0;
+    if (ready == 0) return false;
+    if (failures.count != 0) return error.ConnectFailed;
+    if (writes.count == 0) return error.ConnectFailed;
+    return true;
 }
 
 fn waitWritable(fd: sys.fd_t, timeout_ms: u31) Error!void {
@@ -1150,6 +1178,12 @@ test "http_fetch Windows plaintext loopback timeout and response limit" {
 
     // A connected listener without an HTTP worker must honor the receive bound.
     try std.testing.expectError(error.RecvTimeout, get(a, "127.0.0.1", server.port, false, request, .{ .recv_timeout_ms = 80 }));
+    var established = false;
+    try std.testing.expectError(error.RecvTimeout, get(a, "localhost", server.port, false, request, .{
+        .recv_timeout_ms = 80,
+        .connect_established = &established,
+    }));
+    try std.testing.expect(established); // A connected request must not replay on AAAA.
     try server.spawn();
     try std.testing.expectError(error.ResponseTooLarge, get(a, "127.0.0.1", server.port, false, request, .{ .max_response_bytes = 32 }));
     const response = try get(a, "127.0.0.1", server.port, false, request, .{});
@@ -1190,7 +1224,7 @@ test "http_fetch Windows IPv6 pinned and literal loopback HTTP" {
         }
 
         fn serve(self: *@This()) !void {
-            for (0..3) |index| {
+            for (0..4) |index| {
                 var reads = win.FdSet{ .count = 1, .sockets = undefined };
                 reads.sockets[0] = self.listener;
                 var timeout = win.Timeval{ .seconds = 3, .microseconds = 0 };
@@ -1206,7 +1240,7 @@ test "http_fetch Windows IPv6 pinned and literal loopback HTTP" {
                         if (size == request.len) return error.TestUnexpectedResult;
                         size += try readSome(client, request[size..]);
                     }
-                    if (index == 2) {
+                    if (index == 3) {
                         var host_header_buf: [80]u8 = undefined;
                         const host_header = try std.fmt.bufPrint(&host_header_buf, "Host: onyx-address-pin.invalid.:{d}\r\n", .{self.port});
                         if (!std.mem.startsWith(u8, request[0..size], "POST /signed HTTP/1.1\r\n") or
@@ -1233,6 +1267,16 @@ test "http_fetch Windows IPv6 pinned and literal loopback HTTP" {
     const second = try get(std.testing.allocator, "::1", port, false, request, .{});
     defer std.testing.allocator.free(second);
     try std.testing.expect(std.mem.endsWith(u8, second, "\r\n\r\nOK"));
+    // localhost has an A answer, but only the IPv6 listener is open. The
+    // failed IPv4 dial must fall through to the AAAA address before any send.
+    var established = false;
+    const third = try get(std.testing.allocator, "localhost", port, false, request, .{
+        .connect_established = &established,
+        .connect_timeout_ms = 250,
+    });
+    defer std.testing.allocator.free(third);
+    try std.testing.expect(established);
+    try std.testing.expect(std.mem.endsWith(u8, third, "\r\n\r\nOK"));
     const signed = try postSignedAtAddress(std.testing.allocator, .{
         .tls = false,
         .host = "onyx-address-pin.invalid.",
