@@ -11,7 +11,8 @@ const windows_process = onyx_server.daemon.helix.native_windows_process;
 const windows_bootstrap = onyx_server.daemon.helix.native_windows_bootstrap;
 const windows_driver = onyx_server.daemon.helix.native_windows_driver;
 const windows_runtime = onyx_server.daemon.helix.native_windows_runtime;
-const windows_console_stop = @import("daemon/windows_console_stop.zig");
+const windows_console_stop = onyx_server.daemon.windows_console_stop;
+const windows_scm = onyx_server.daemon.windows_scm;
 const windows_tls_material = onyx_server.daemon.helix.native_windows_tls_material;
 const windows_history_material = onyx_server.daemon.helix.native_windows_history.material;
 const native_service = onyx_server.daemon.native_service;
@@ -841,6 +842,15 @@ fn initPrivateDirectoryWindows(io: std.Io, path: []const u8) !void {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    var windows_service_worker: ?windows_scm.WorkerHandles = null;
+    var windows_service_live = false;
+    var windows_service_clean_exit = false;
+    defer if (comptime builtin.os.tag == .windows) {
+        if (windows_service_worker) |*worker| {
+            if (windows_service_live) worker.reportExit(windows_service_clean_exit) catch {};
+            worker.deinit();
+        }
+    };
 
     // Resolver context for `env:`/`@file:` config indirection. Lives on `main`'s
     // frame for the whole process, so the resolver stored on the live config
@@ -943,11 +953,31 @@ pub fn main(init: std.process.Init) !void {
         , .{onyx_server.version_full});
     }
     if (first_arg) |first| {
+        if (comptime builtin.os.tag == .windows) {
+            if (windows_scm.isServiceArg(first) or windows_scm.isConsoleHostArg(first)) {
+                const config_path = args.next() orelse return error.InvalidWindowsService;
+                if (args.next() != null) return error.InvalidWindowsService;
+                if (windows_scm.isServiceArg(first)) return windows_scm.runHost(allocator, init.io, config_path);
+                return windows_scm.runConsoleHost(allocator, init.io, config_path);
+            }
+            if (windows_scm.isWorkerArg(first)) {
+                const stop_text = args.next() orelse return error.InvalidWindowsService;
+                const lease_text = args.next() orelse return error.InvalidWindowsService;
+                const ready_text = args.next() orelse return error.InvalidWindowsService;
+                const path = args.next() orelse return error.InvalidWindowsService;
+                if (!std.fs.path.isAbsolute(path) or args.next() != null) return error.InvalidWindowsService;
+                windows_service_worker = try windows_scm.WorkerHandles.parse(stop_text, lease_text, ready_text);
+                try windows_service_worker.?.activate();
+                config_path_arg = path;
+            }
+        }
         // Private, side-effect-free Helix compatibility handshake. The running
         // predecessor executes the exact already-open target image with this
         // flag and refuses a hot handoff unless the complete token matches.
         // This branch must stay ahead of all config, socket, and daemon setup.
-        if (std.mem.eql(u8, first, service_helper.activation_arg)) {
+        if (windows_scm.isWorkerArg(first)) {
+            if (comptime builtin.os.tag != .windows) return error.Unsupported;
+        } else if (std.mem.eql(u8, first, service_helper.activation_arg)) {
             if (comptime builtin.os.tag == .openbsd) {
                 if (!std.mem.eql(u8, args.next() orelse return error.InvalidManagedActivation, service_helper.managed_arg)) return error.InvalidManagedActivation;
                 const fd_text = args.next() orelse return error.InvalidManagedActivation;
@@ -981,9 +1011,17 @@ pub fn main(init: std.process.Init) !void {
                 const parent_process = try parseWindowsCandidateNumber(usize, args.next() orelse return error.InvalidWindowsCandidate);
                 const parent_pid = try parseWindowsCandidateNumber(u32, args.next() orelse return error.InvalidWindowsCandidate);
                 const path = args.next() orelse return error.InvalidWindowsCandidate;
+                const service_stop = args.next() orelse return error.InvalidWindowsCandidate;
+                const service_lease = args.next() orelse return error.InvalidWindowsCandidate;
                 if (path.len == 0 or path.len > windows_config_proof.max_path_bytes or
                     std.mem.indexOfAny(u8, path, "\x00\r\n") != null or args.next() != null)
                     return error.InvalidWindowsCandidate;
+                if (std.mem.eql(u8, service_stop, "0") and std.mem.eql(u8, service_lease, "0")) {
+                    // Foreground Helix has no SCM host or inherited service lease.
+                } else {
+                    windows_service_worker = try windows_scm.WorkerHandles.parse(service_stop, service_lease, null);
+                    try windows_service_worker.?.activate();
+                }
                 var handles = windows_process.CandidateHandles{
                     .read_handle = read_handle,
                     .write_handle = write_handle,
@@ -3421,6 +3459,17 @@ pub fn main(init: std.process.Init) !void {
     } };
     if (comptime builtin.os.tag == .windows) try console_guard.install();
     defer if (comptime builtin.os.tag == .windows) console_guard.deinit();
+    var service_stop_guard = windows_scm.StopGuard{ .stop_event = 0, .hook = .{
+        .context = &console_context,
+        .request = ConsoleStopContext.request,
+    } };
+    if (comptime builtin.os.tag == .windows) if (windows_service_worker) |*worker| {
+        service_stop_guard.stop_event = worker.stop_event;
+        try service_stop_guard.install();
+        try worker.signalReady();
+        windows_service_live = true;
+    };
+    defer if (comptime builtin.os.tag == .windows) service_stop_guard.deinit();
 
     // Sharded multi-reactor run loop (one worker thread per shard, joined here).
     // runThreaded transparently runs a single in-line reactor when num_shards==1.
@@ -3432,6 +3481,7 @@ pub fn main(init: std.process.Init) !void {
         } else srv.runThreaded(&run);
     } else srv.runThreaded(&run);
     if (srv.runtimeFailure()) |err| return err;
+    windows_service_clean_exit = true;
 }
 
 // Public test vector shared with x509_selfsign's RSA certificate controls.

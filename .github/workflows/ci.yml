@@ -271,6 +271,8 @@ jobs:
         run: python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix
       - name: Run Windows post-Helix console Ctrl+C stop smoke
         run: python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix --ctrl-c
+      - name: Run Windows SCM host and two-swap cooperative stop smoke
+        run: python -B .\tools\windows_scm_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run configured Windows security and listener failure smoke
         run: python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 

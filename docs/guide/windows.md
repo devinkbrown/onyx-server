@@ -111,6 +111,37 @@ if (-not $resolvedRunDir.StartsWith($tempRoot, [StringComparison]::OrdinalIgnore
 Remove-Item -LiteralPath $resolvedRunDir -Recurse -Force
 ```
 
+## Run under Windows Service Control Manager
+
+Install the service from an elevated PowerShell session after staging the
+Windows package and creating an absolute config path in a persistent runtime
+directory. The service command must name the staged executable and config;
+`--check-config` should pass before installation:
+
+```powershell
+$serverExe = (Resolve-Path -LiteralPath .\zig-out\bin\onyx-server.exe).Path
+$configPath = (Resolve-Path -LiteralPath C:\ProgramData\OnyxServer\onyx-server.local.toml).Path
+& $serverExe --check-config $configPath
+$serviceCommand = '"' + $serverExe + '" --windows-service "' + $configPath + '"'
+New-Service -Name onyx-server -DisplayName 'Onyx Server' -BinaryPathName $serviceCommand -StartupType Automatic
+Start-Service onyx-server
+Get-Service onyx-server
+```
+
+Use a dedicated service identity with access to the config, generated node key,
+private stores, and logs in that runtime directory. `Stop-Service onyx-server`
+signals the same cooperative stop path used by foreground Ctrl+C. A stable
+service host stays registered while Helix replaces daemon workers; an inherited
+stop event and liveness lease follow each accepted successor. A failed or
+incompatible candidate leaves the serving worker in place. The host reports
+`RUNNING` only after the initial worker has prepared its listeners, and it
+reports `STOPPED` after the final worker releases the lease.
+
+For a non-elevated local process test of that host and two Helix swaps, run
+`python -B tools/windows_scm_smoke.py zig-out/bin/onyx-server.exe`. This fixture
+uses the same worker, job, and stop/lease protocol, with a private console in
+place of SCM registration.
+
 The full daemon's plaintext listener accepts concurrent clients and provides
 its normal IRC command, CAP, and ISUPPORT handling. The native smoke checks
 registration, VERSION, PING/PONG, direct and channel PRIVMSG, JOIN fanout,
@@ -358,7 +389,8 @@ cross-build swap; a compatible prior build has passed that held-client and WAL
 check. A TLS/WSS smoke exercises two swaps with held TLS IRC and WSS sockets,
 checks WebSocket control frames,
 and opens fresh TLS and WSS connections after each swap.
-The native v18 capability challenge requires exact memo inbox custody,
+The native v19 capability challenge requires service stop and liveness custody
+when running under SCM, plus exact memo inbox custody,
 including RAM-only messages and pending durable reconciliation, plus ACME
 scheduler, TLS material, TLS replay history, OroWasm, active history listener,
 and UDP owner custody. An older candidate is rejected before socket transfer.

@@ -7,9 +7,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("../../substrate/platform.zig");
 const control = @import("native_windows_control.zig");
+const windows_scm = @import("../windows_scm.zig");
 
-pub const candidate_arg = "--helix-windows-successor-v18";
-pub const capability = "onyx-native-helix-windows-v18;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;inert-ready;commit-ack;release-before-iocp";
+pub const candidate_arg = "--helix-windows-successor-v19";
+pub const capability = "onyx-native-helix-windows-v19;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;scm-custody-v1;inert-ready;commit-ack;release-before-iocp";
 const process_query_limited_information: u32 = 0x1000;
 const synchronize: u32 = 0x0010_0000;
 const extended_startupinfo_present: u32 = 0x0008_0000;
@@ -282,7 +283,7 @@ fn appendQuoted(allocator: std.mem.Allocator, output: *std.ArrayList(u8), arg: [
     try output.append(allocator, '"');
 }
 
-fn commandLine(allocator: std.mem.Allocator, executable: []const u8, child_read: usize, child_write: usize, parent_process: usize, parent_pid: u32, config: ?[]const u8) Error![:0]u16 {
+fn commandLine(allocator: std.mem.Allocator, executable: []const u8, child_read: usize, child_write: usize, parent_process: usize, parent_pid: u32, config: ?[]const u8, service_stop: usize, service_lease: usize) Error![:0]u16 {
     var args: std.ArrayList(u8) = .empty;
     defer args.deinit(allocator);
     try appendQuoted(allocator, &args, executable);
@@ -296,6 +297,12 @@ fn commandLine(allocator: std.mem.Allocator, executable: []const u8, child_read:
     }
     try args.append(allocator, ' ');
     try appendQuoted(allocator, &args, config orelse "");
+    inline for (.{ service_stop, service_lease }) |number| {
+        var buffer: [32]u8 = undefined;
+        const decimal = std.fmt.bufPrint(&buffer, "{d}", .{number}) catch return error.InvalidCandidate;
+        try args.append(allocator, ' ');
+        try appendQuoted(allocator, &args, decimal);
+    }
     return std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.items) catch return error.InvalidCandidate;
 }
 
@@ -372,9 +379,18 @@ fn launchUnverified(allocator: std.mem.Allocator, executable: []const u8, config
     var child_stdin: usize = 0;
     var child_stdout: usize = 0;
     var child_stderr: usize = 0;
+    var child_service_stop: usize = 0;
+    var child_service_lease: usize = 0;
     defer closeOwned(&child_stdin);
     defer closeOwned(&child_stdout);
     defer closeOwned(&child_stderr);
+    defer closeOwned(&child_service_stop);
+    defer closeOwned(&child_service_lease);
+    if (windows_scm.activeForHelix()) |service| {
+        if (DuplicateHandle(own, service.stop_event, own, &child_service_stop, 0, 1, duplicate_same_access) == 0 or
+            DuplicateHandle(own, service.lease_write, own, &child_service_lease, 0, 1, duplicate_same_access) == 0)
+            return error.DuplicateFailed;
+    }
     if (inherit_standard_streams) {
         inline for (.{ .{ std_input_handle, &child_stdin }, .{ std_output_handle, &child_stdout }, .{ std_error_handle, &child_stderr } }) |row| {
             const parent_handle = GetStdHandle(row[0]);
@@ -383,9 +399,14 @@ fn launchUnverified(allocator: std.mem.Allocator, executable: []const u8, config
                 return error.DuplicateFailed;
         }
     }
-    var child_handles = [_]usize{ pair.child_read, pair.child_write, child_parent, 0, 0, 0 };
+    var child_handles = [_]usize{ pair.child_read, pair.child_write, child_parent, 0, 0, 0, 0, 0 };
     var child_handle_count: usize = 3;
     for ([_]usize{ child_stdin, child_stdout, child_stderr }) |handle| {
+        if (handle == 0) continue;
+        child_handles[child_handle_count] = handle;
+        child_handle_count += 1;
+    }
+    for ([_]usize{ child_service_stop, child_service_lease }) |handle| {
         if (handle == 0) continue;
         child_handles[child_handle_count] = handle;
         child_handle_count += 1;
@@ -403,7 +424,7 @@ fn launchUnverified(allocator: std.mem.Allocator, executable: []const u8, config
 
     const executable_w = std.unicode.wtf8ToWtf16LeAllocZ(allocator, executable) catch return error.InvalidCandidate;
     defer allocator.free(executable_w);
-    const line = try commandLine(allocator, executable, pair.child_read, pair.child_write, child_parent, parent_pid, config);
+    const line = try commandLine(allocator, executable, pair.child_read, pair.child_write, child_parent, parent_pid, config, child_service_stop, child_service_lease);
     defer allocator.free(line);
     var startup = StartupInfoEx{ .startup = std.mem.zeroes(std.os.windows.STARTUPINFOW), .attributes = attributes };
     startup.startup.cb = @sizeOf(StartupInfoEx);
@@ -615,15 +636,15 @@ test "Windows Helix candidate rejects a forged parent process identity" {
 
 test "Windows Helix candidate command line keeps paths and handles distinct" {
     const allocator = std.testing.allocator;
-    const command = try commandLine(allocator, "C:\\Program Files\\Onyx\\onyx-server.exe", 12, 24, 36, 48, "C:\\Onyx Data\\config\\live.toml");
+    const command = try commandLine(allocator, "C:\\Program Files\\Onyx\\onyx-server.exe", 12, 24, 36, 48, "C:\\Onyx Data\\config\\live.toml", 55, 66);
     defer allocator.free(command);
     const utf8 = try std.unicode.wtf16LeToWtf8Alloc(allocator, command);
     defer allocator.free(utf8);
-    try std.testing.expectEqualStrings("\"C:\\Program Files\\Onyx\\onyx-server.exe\" \"--helix-windows-successor-v18\" \"12\" \"24\" \"36\" \"48\" \"C:\\Onyx Data\\config\\live.toml\"", utf8);
-    try std.testing.expectError(error.InvalidCandidate, commandLine(allocator, "C:\\Onyx\\server.exe", 1, 2, 3, 4, "bad\x00path"));
+    try std.testing.expectEqualStrings("\"C:\\Program Files\\Onyx\\onyx-server.exe\" \"--helix-windows-successor-v19\" \"12\" \"24\" \"36\" \"48\" \"C:\\Onyx Data\\config\\live.toml\" \"55\" \"66\"", utf8);
+    try std.testing.expectError(error.InvalidCandidate, commandLine(allocator, "C:\\Onyx\\server.exe", 1, 2, 3, 4, "bad\x00path", 0, 0));
 }
 
-test "Windows Helix v18 rejects v17 capability before candidate transfer" {
+test "Windows Helix v19 rejects v18 capability before candidate transfer" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     var pair = try control.Pair.init();
     defer pair.deinit();
@@ -633,7 +654,7 @@ test "Windows Helix v18 rejects v17 capability before candidate transfer" {
     defer parent.endpoint.deinit();
     var child = pair.takeChild(identity, key);
     defer child.deinit();
-    const previous_capability = "onyx-native-helix-windows-v17;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;inert-ready;commit-ack;release-before-iocp";
+    const previous_capability = "onyx-native-helix-windows-v18;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;inert-ready;commit-ack;release-before-iocp";
     const Runner = struct {
         endpoint: *control.Endpoint,
         failure: ?anyerror = null,
