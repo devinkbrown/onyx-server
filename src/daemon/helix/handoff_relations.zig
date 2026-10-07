@@ -56,6 +56,7 @@ const policy_checkpoint = @import("policy_checkpoint.zig");
 const native_windows_operator_state = @import("native_windows_operator_state.zig");
 const native_windows_account_flow = @import("native_windows_account_flow.zig");
 const native_windows_memo_state = @import("native_windows_memo_state.zig");
+const native_windows_memo_inbox = @import("native_windows_memo_inbox.zig");
 const native_windows_user_settings = @import("native_windows_user_settings.zig");
 const gag_checkpoint = @import("gag_checkpoint.zig");
 const shun_checkpoint = @import("shun_checkpoint.zig");
@@ -207,6 +208,8 @@ pub const Error = error{
     InvalidMemoIgnore,
     DuplicateFirstHold,
     InvalidFirstHold,
+    DuplicateMemoInbox,
+    InvalidMemoInbox,
     DuplicateUserSettings,
     InvalidUserSettings,
     DuplicateGags,
@@ -278,6 +281,7 @@ pub const Summary = struct {
     memo_forward: usize = 0,
     memo_ignore: usize = 0,
     first_hold: usize = 0,
+    memo_inbox: usize = 0,
     user_settings: usize = 0,
     gags: usize = 0,
     shuns: usize = 0,
@@ -784,6 +788,13 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             summary.first_hold = 1;
             continue;
         }
+        if (native_windows_memo_inbox.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidMemoInbox;
+            native_windows_memo_inbox.validateCheckpoint(bytes) catch return error.InvalidMemoInbox;
+            if (summary.memo_inbox != 0) return error.DuplicateMemoInbox;
+            summary.memo_inbox = 1;
+            continue;
+        }
         if (native_windows_user_settings.isCheckpoint(bytes)) {
             if (item.header.min_supported != 2) return error.InvalidUserSettings;
             native_windows_user_settings.validateCheckpoint(bytes) catch return error.InvalidUserSettings;
@@ -1094,6 +1105,11 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     defer wasm_bridge.deinit();
     const wasm_state = try native_windows_wasm.encode(allocator, &wasm_bridge, "plugins");
     defer native_windows_wasm.freeEncoded(allocator, wasm_state);
+    var memo_box = @import("../memo.zig").MemoBox.init(allocator);
+    defer memo_box.deinit();
+    _ = try memo_box.send("acct", "sender", "body", 9);
+    const memo_inbox = try native_windows_memo_inbox.encode(allocator, &memo_box, true);
+    defer allocator.free(memo_inbox);
 
     const pieces = [_]TestPiece{
         .{ .kind = .mesh_checkpoint, .bytes = event_replay },
@@ -1110,6 +1126,7 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
         .{ .kind = .mesh_checkpoint, .bytes = acme },
         .{ .kind = .mesh_checkpoint, .bytes = wasm_state },
         .{ .kind = .mesh_checkpoint, .bytes = history_material },
+        .{ .kind = .mesh_checkpoint, .bytes = memo_inbox },
     };
     var fields: [pieces.len][1]capsule.Field = undefined;
     var caps: [pieces.len]capsule.Capsule = undefined;
@@ -1123,6 +1140,7 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     try std.testing.expectEqual(@as(usize, 1), summary.history_material);
     try std.testing.expectEqual(@as(usize, 1), summary.acme);
     try std.testing.expectEqual(@as(usize, 1), summary.wasm);
+    try std.testing.expectEqual(@as(usize, 1), summary.memo_inbox);
     try std.testing.expectError(error.DuplicatePolicy, validateCurrent(&.{ caps[7], caps[7] }, &.{}));
     try std.testing.expectError(error.DuplicateOperatorState, validateCurrent(&.{ caps[8], caps[8] }, &.{}));
     try std.testing.expectError(error.DuplicateTlsMaterial, validateCurrent(&.{ caps[9], caps[9] }, &.{}));
@@ -1130,6 +1148,18 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     try std.testing.expectError(error.DuplicateHistoryMaterial, validateCurrent(&.{ caps[13], caps[13] }, &.{}));
     try std.testing.expectError(error.DuplicateAcme, validateCurrent(&.{ caps[11], caps[11] }, &.{}));
     try std.testing.expectError(error.DuplicateWasm, validateCurrent(&.{ caps[12], caps[12] }, &.{}));
+    try std.testing.expectError(error.DuplicateMemoInbox, validateCurrent(&.{ caps[14], caps[14] }, &.{}));
+
+    const corrupt_memo = try allocator.dupe(u8, memo_inbox);
+    defer allocator.free(corrupt_memo);
+    corrupt_memo[corrupt_memo.len - 1] ^= 1;
+    var corrupt_memo_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_memo }};
+    var corrupt_memo_cap = capsule.make(.mesh_checkpoint, &corrupt_memo_field);
+    corrupt_memo_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidMemoInbox, validateCurrent(&.{corrupt_memo_cap}, &.{}));
+    var downgraded_memo_cap = caps[14];
+    downgraded_memo_cap.header.min_supported = 1;
+    try std.testing.expectError(error.InvalidMemoInbox, validateCurrent(&.{downgraded_memo_cap}, &.{}));
 
     const corrupt_policy = try allocator.dupe(u8, policy);
     defer allocator.free(corrupt_policy);

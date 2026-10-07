@@ -50,6 +50,7 @@ pub const policy_checkpoint = @import("policy_checkpoint.zig");
 pub const native_windows_operator_state = @import("native_windows_operator_state.zig");
 pub const native_windows_account_flow = @import("native_windows_account_flow.zig");
 pub const native_windows_memo_state = @import("native_windows_memo_state.zig");
+pub const native_windows_memo_inbox = @import("native_windows_memo_inbox.zig");
 pub const native_windows_user_settings = @import("native_windows_user_settings.zig");
 pub const gag_checkpoint = @import("gag_checkpoint.zig");
 pub const shun_checkpoint = @import("shun_checkpoint.zig");
@@ -156,6 +157,7 @@ test {
     _ = native_windows_operator_state;
     _ = native_windows_account_flow;
     _ = native_windows_memo_state;
+    _ = native_windows_memo_inbox;
     _ = native_windows_user_settings;
     _ = gag_checkpoint;
     _ = shun_checkpoint;

@@ -343,6 +343,9 @@ def main() -> int:
             abuse_probe.command(b"REGISTER heldabuse * " + abuse_secret, b"REGISTER SUCCESS", timeout=45)
             owner.command(b"MEMO FORWARD heldabuse", b"MEMO: Forwarding your offline memos to heldabuse")
             owner.command(b"MEMO IGNORE ADD heldabuse", b"MEMO: now ignoring memos from heldabuse")
+            inbox_marker = b"held-inbox-through-two-upgrades"
+            owner.command(b"MEMO SEND heldabuse :" + inbox_marker, b"MEMO: message stored for delivery")
+            abuse_probe.command(b"MEMO LIST", inbox_marker)
             for _ in range(20):
                 abuse_probe.send(b"WHO nobody")
             abuse_probe.ping(b"account-abuse-recorded")
@@ -420,6 +423,7 @@ def main() -> int:
                 oper.command(b"WELCOME SHOW", b"WELCOME :held welcome line")
                 owner.command(b"MEMO FORWARD", b"MEMO: Forwarding your offline memos to heldabuse")
                 owner.command(b"MEMO IGNORE LIST", b"MEMO: ignoring heldabuse")
+                abuse_probe.command(b"MEMO LIST", inbox_marker)
                 owner.command(b"CHANSTATS RECORD #slow-helix", b"messages=1")
                 fresh = Client(port)
                 clients.append(fresh)
@@ -456,6 +460,8 @@ def main() -> int:
                 clients.append(verified)
                 print(f"PASS: Windows Helix swap {sequence}, {serving_pid} -> {next_pid}; sockets, token and WAL reads/writes survived")
                 serving_pid = next_pid
+            abuse_probe.command(b"MEMO CLEAR", b"MEMO: Cleared 1 message(s)")
+            abuse_probe.command(b"MEMO LIST", b"MEMO: End of offline memos (0)")
             oper.command(b"POLICY", b"POLICY: ward=2 filter=2 class=1 ban=1")
             oper.command(b"POLICY ROLLBACK", b"POLICY: rolled filter back to generation 1")
             oper.command(b"FILTER LIST", b"FILTER: End of filter list (0)")

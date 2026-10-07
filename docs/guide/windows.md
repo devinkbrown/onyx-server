@@ -332,9 +332,12 @@ cross-build swap; a compatible prior build has passed that held-client and WAL
 check. A TLS/WSS smoke exercises two swaps with held TLS IRC and WSS sockets,
 checks WebSocket control frames,
 and opens fresh TLS and WSS connections after each swap.
-The native v17 capability challenge requires ACME scheduler, TLS material,
-TLS replay history, OroWasm, active history listener, and UDP owner custody;
-an older candidate is rejected before socket transfer.
+The native v18 capability challenge requires exact memo inbox custody,
+including RAM-only messages and pending durable reconciliation, plus ACME
+scheduler, TLS material, TLS replay history, OroWasm, active history listener,
+and UDP owner custody. An older candidate is rejected before socket transfer.
+If the encoded inbox exceeds the 256 MiB checkpoint limit, UPGRADE refuses
+and the current process keeps serving its clients and memos.
 The two-node mesh smoke upgrades a node with a held secured Mooring link, keeps
 attachments on both nodes connected, and checks exact cross-node deliveries.
 A three-node sequence smoke upgrades A and then B while four same-token

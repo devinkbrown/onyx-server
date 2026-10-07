@@ -211,6 +211,7 @@ const native_windows_ocsp = @import("helix/native_windows_ocsp.zig");
 const native_windows_ocsp_state = @import("helix/native_windows_ocsp_state.zig");
 const native_windows_user_settings = @import("helix/native_windows_user_settings.zig");
 const native_windows_memo_state = @import("helix/native_windows_memo_state.zig");
+const native_windows_memo_inbox = @import("helix/native_windows_memo_inbox.zig");
 const gag_checkpoint = @import("helix/gag_checkpoint.zig");
 const shun_checkpoint = @import("helix/shun_checkpoint.zig");
 const account_abuse_checkpoint = @import("helix/account_abuse_checkpoint.zig");
@@ -5179,6 +5180,9 @@ pub const LinuxServer = struct {
     /// An accepted in-memory memo is ahead of its durable image after a failed
     /// append/snapshot. Windows Helix must not restore that older image.
     memo_durable_dirty: bool = false,
+    /// Retry a failed durable memo snapshot at most once per minute while
+    /// serving; the HXMB successor starts with zero and retries after COMMIT.
+    memo_durable_retry_after_ms: i64 = 0,
     /// Memo forward chains: an account may auto-forward its incoming memos to
     /// another account (hop/cycle-bounded). In-memory, matching the memo store itself.
     memo_forward: svc_memo_forward.MemoForwardStore,
@@ -8628,6 +8632,7 @@ pub const LinuxServer = struct {
             // Network retry is outside the Worker mutex. The terminal consumer
             // only observes this retained outbox; it never runs synchronous HTTP.
             self.retryWebpushOverflowOutputsLocked();
+            self.retryDirtyDurableMemos();
         }
         // SIGUSR2 → connection-preserving Helix UPGRADE. Polled here (out of
         // signal context) and gated to reactor 0 — the reactor that owns the
@@ -25754,27 +25759,49 @@ pub const LinuxServer = struct {
     }
 
     fn storeOfflineMemo(self: *LinuxServer, account: []const u8, from: []const u8, text: []const u8, now_ms: i64) !usize {
+        // Reject a row that cannot fit the durable wire or configured store
+        // record before accepting it into RAM, even if MemoBox limits rose.
+        if (self.account_services) |svc|
+            memo_durable.validateRowForStore(svc.store, account, from, text) catch return error.MessageInvalid;
         const n = try self.memo.send(account, from, text, now_ms);
         if (self.account_services) |svc| {
-            memo_durable.append(svc.store, account, from, text, now_ms) catch |err| {
-                self.memo_durable_dirty = true;
-                srvLog("onyx-server: memo durable append failed ({s})\n", .{@errorName(err)});
-            };
+            // Once an append failed, another append can succeed while leaving
+            // the earlier accepted message out of the durable generation.
+            if (self.memo_durable_dirty) {
+                self.snapshotDurableMemos(self.nowMs());
+            } else {
+                memo_durable.append(svc.store, account, from, text, now_ms) catch |err| {
+                    self.memo_durable_dirty = true;
+                    self.memo_durable_retry_after_ms = self.nowMs() +| 60_000;
+                    srvLog("onyx-server: memo durable append failed ({s})\n", .{@errorName(err)});
+                };
+            }
         }
         return n;
     }
 
+    fn snapshotDurableMemos(self: *LinuxServer, now_ms: i64) void {
+        const svc = self.account_services orelse return;
+        memo_durable.replaceAll(svc.store, &self.memo) catch |err| {
+            self.memo_durable_dirty = true;
+            self.memo_durable_retry_after_ms = now_ms +| 60_000;
+            srvLog("onyx-server: memo durable snapshot failed ({s})\n", .{@errorName(err)});
+            return;
+        };
+        self.memo_durable_dirty = false;
+        self.memo_durable_retry_after_ms = 0;
+    }
+
+    fn retryDirtyDurableMemos(self: *LinuxServer) void {
+        if (!self.memo_durable_dirty or self.account_services == null) return;
+        const now = self.nowMs();
+        if (now < self.memo_durable_retry_after_ms) return;
+        self.snapshotDurableMemos(now);
+    }
+
     fn clearOfflineMemo(self: *LinuxServer, account: []const u8) usize {
         const n = self.memo.clear(account);
-        if (self.account_services) |svc| {
-            var synced = true;
-            memo_durable.replaceAll(svc.store, &self.memo) catch |err| {
-                synced = false;
-                self.memo_durable_dirty = true;
-                srvLog("onyx-server: memo durable snapshot failed ({s})\n", .{@errorName(err)});
-            };
-            if (synced) self.memo_durable_dirty = false;
-        }
+        self.snapshotDurableMemos(self.nowMs());
         return n;
     }
 
@@ -26970,15 +26997,7 @@ pub const LinuxServer = struct {
         }
         if (removed_history) self.snapshotDurableHistory();
         if (removed_memos != 0) {
-            if (self.account_services) |svc| {
-                var synced = true;
-                memo_durable.replaceAll(svc.store, &self.memo) catch |err| {
-                    synced = false;
-                    self.memo_durable_dirty = true;
-                    srvLog("onyx-server: memo durable snapshot failed ({s})\n", .{@errorName(err)});
-                };
-                if (synced) self.memo_durable_dirty = false;
-            }
+            self.snapshotDurableMemos(self.nowMs());
         }
     }
 
@@ -30243,6 +30262,48 @@ pub const LinuxServer = struct {
         return replacement;
     }
 
+    fn sealMemoInboxUpgradeCheckpoint(
+        allocator: std.mem.Allocator,
+        box: *const memo_mod.MemoBox,
+        dirty: bool,
+        pieces: *std.ArrayList(helix_live.StatePiece),
+    ) ![]u8 {
+        const wire = try native_windows_memo_inbox.encode(allocator, box, dirty);
+        errdefer {
+            std.crypto.secureZero(u8, wire);
+            allocator.free(wire);
+        }
+        try pieces.append(allocator, .{
+            .kind = .mesh_checkpoint,
+            .bytes = wire,
+            .min_supported = 2,
+        });
+        return wire;
+    }
+
+    fn stageMemoInboxUpgradeCheckpoint(
+        allocator: std.mem.Allocator,
+        config: memo_mod.Config,
+        caps: []const helix_capsule.Capsule,
+    ) !native_windows_memo_inbox.State {
+        const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+        var replacement: ?native_windows_memo_inbox.State = null;
+        errdefer if (replacement) |*owned| owned.deinit();
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint or c.fields.len == 0 or
+                !native_windows_memo_inbox.isCheckpoint(c.fields[0].bytes)) continue;
+            if (replacement != null or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+                return error.InvalidInheritedHandoff;
+            replacement = try native_windows_memo_inbox.decode(allocator, c.fields[0].bytes, config);
+        }
+        return replacement orelse error.InvalidInheritedHandoff;
+    }
+
     fn sealMeshRedialUpgradeHint(
         allocator: std.mem.Allocator,
         hint: mesh_redial.Peer,
@@ -30772,7 +30833,6 @@ pub const LinuxServer = struct {
     }
 
     const UpgradeContinuityBlocker = enum {
-        windows_memo_authority,
         session_drop_transaction,
         relay_v2_deferred,
         webpush_overflow_delivery,
@@ -30789,10 +30849,6 @@ pub const LinuxServer = struct {
     /// mutation boundary for MediaRooms/signaling. Transport predicates take
     /// their own pump locks; bridge values are inspected under their owner lock.
     fn upgradeContinuityBlockerLocked(self: *LinuxServer) ?UpgradeContinuityBlocker {
-        if (comptime builtin.os.tag == .windows) {
-            if (self.memo_durable_dirty or (self.account_services == null and self.memo.boxes.count() != 0))
-                return .windows_memo_authority;
-        }
         // DROP reservations are RAM-only two-owner latches. Refuse rather than
         // serializing a half-committed identity transfer into the successor.
         if (self.session_drop_journal.activeCount() != 0) return .session_drop_transaction;
@@ -30827,7 +30883,6 @@ pub const LinuxServer = struct {
 
     fn upgradeContinuityBlockerName(blocker: UpgradeContinuityBlocker) []const u8 {
         return switch (blocker) {
-            .windows_memo_authority => "Windows memo policy or unsynced memo",
             .session_drop_transaction => "SESSION DROP transaction",
             .relay_v2_deferred => "deferred MESSAGE_V2 authority",
             .webpush_overflow_delivery => "accepted Webpush overflow delivery",
@@ -31309,6 +31364,11 @@ pub const LinuxServer = struct {
         defer if (windows_memo_forward_wire) |wire| self.allocator.free(wire);
         var windows_memo_ignore_wire: ?[]u8 = null;
         defer if (windows_memo_ignore_wire) |wire| self.allocator.free(wire);
+        var windows_memo_inbox_wire: ?[]u8 = null;
+        defer if (windows_memo_inbox_wire) |wire| {
+            std.crypto.secureZero(u8, wire);
+            self.allocator.free(wire);
+        };
         var windows_first_hold_wire: ?[]u8 = null;
         defer if (windows_first_hold_wire) |wire| {
             std.crypto.secureZero(u8, wire);
@@ -31499,6 +31559,16 @@ pub const LinuxServer = struct {
             );
             windows_user_settings_wire = settings_wire;
             try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = settings_wire, .min_supported = 2 });
+            // The frozen source gets one last chance to publish its accepted
+            // RAM image. If storage remains unavailable, HXMB carries dirty
+            // and the successor retries only after its COMMIT boundary.
+            if (self.memo_durable_dirty) self.snapshotDurableMemos(self.nowMs());
+            windows_memo_inbox_wire = try sealMemoInboxUpgradeCheckpoint(
+                self.allocator,
+                &self.memo,
+                self.memo_durable_dirty,
+                &pieces,
+            );
             const forward_wire = try native_windows_memo_state.encodeForward(self.allocator, &self.memo_forward);
             windows_memo_forward_wire = forward_wire;
             try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = forward_wire, .min_supported = 2 });
@@ -32477,6 +32547,10 @@ pub const LinuxServer = struct {
             self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows history HTTPS TLS material");
             return error.InvalidInheritedHandoff;
         }
+        if (relations.memo_inbox != @as(usize, @intFromBool(builtin.os.tag == .windows))) {
+            self.abandonInheritedSessionState(caps, arena_fd, "missing or unexpected Windows memo inbox checkpoint");
+            return error.InvalidInheritedHandoff;
+        }
         var tls_replay_replacement: ?native_windows_tls_replay.Owned = null;
         defer if (tls_replay_replacement) |*replacement| replacement.deinit();
         if (comptime builtin.os.tag == .windows) {
@@ -32532,10 +32606,19 @@ pub const LinuxServer = struct {
         defer if (memo_forward_replacement) |*replacement| replacement.deinit();
         var memo_ignore_replacement: ?svc_memo_ignore.MemoIgnoreList = null;
         defer if (memo_ignore_replacement) |*replacement| replacement.deinit();
+        var memo_inbox_replacement: ?native_windows_memo_inbox.State = null;
+        defer if (memo_inbox_replacement) |*replacement| replacement.deinit();
         var first_hold_replacement: ?first_hold.Table = null;
         defer if (first_hold_replacement) |*replacement| replacement.deinit();
         var ocsp_state_replacement: ?native_windows_ocsp_state.Owned = null;
         defer if (ocsp_state_replacement) |*replacement| replacement.deinit();
+        if (comptime builtin.os.tag == .windows) {
+            memo_inbox_replacement = stageMemoInboxUpgradeCheckpoint(self.allocator, self.memo.cfg, caps) catch |err| {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows memo inbox checkpoint");
+                srvLog("onyx-server: Windows memo inbox stage failed ({s})\n", .{@errorName(err)});
+                return error.InvalidInheritedHandoff;
+            };
+        }
         var ocsp_restored_valid_until_unix: i64 = 0;
         var tls_material_replacement: ?native_windows_tls_material.Owned = null;
         defer if (tls_material_replacement) |*replacement| replacement.deinit();
@@ -34858,6 +34941,10 @@ pub const LinuxServer = struct {
                 std.mem.swap(svc_memo_ignore.MemoIgnoreList, &self.memo_ignore, replacement)
             else
                 unreachable;
+            if (memo_inbox_replacement) |*replacement| {
+                std.mem.swap(memo_mod.MemoBox, &self.memo, &replacement.box);
+                self.memo_durable_dirty = replacement.dirty;
+            } else unreachable;
             if (first_hold_replacement) |*replacement|
                 std.mem.swap(first_hold.Table, &self.first_holds, replacement)
             else
@@ -77248,8 +77335,12 @@ test "UPGRADE continuity gate accepts idle state and refuses every media or comp
         try std.testing.expect(blocker(&server) == null);
         server.policy_gen_filter = 1;
         server.memo_durable_dirty = true;
-        try std.testing.expectEqual(Server.UpgradeContinuityBlocker.windows_memo_authority, blocker(&server).?);
+        try std.testing.expect(blocker(&server) == null);
         server.memo_durable_dirty = false;
+        try std.testing.expect(server.account_services == null);
+        _ = try server.memo.send("alice", "bob", "RAM-only memo", 100);
+        try std.testing.expect(blocker(&server) == null);
+        _ = server.memo.clear("alice");
         server.challenge_method = .question;
         try std.testing.expect(blocker(&server) == null);
         server.challenge_method = .pow;
@@ -78776,6 +78867,212 @@ test "Windows HXRG seal and stage retain TLS ticket and binder replay across no-
     var failing_decode = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, Server.stageTlsReplayUpgradeCheckpoint(failing_decode.allocator(), true, &.{cap}));
     try std.testing.expect(!source.checkAndRecord(&ticket_tag));
+}
+
+test "Windows HXMB seal and staged adopt retain RAM inbox and dirty reconciliation" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const source = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(source);
+    defer source.deinit();
+    const candidate = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(candidate);
+    defer candidate.deinit();
+    try std.testing.expect(source.account_services == null);
+    try std.testing.expect(candidate.account_services == null);
+    _ = try source.storeOfflineMemo("alice", "bob", "first", 101);
+    _ = try source.storeOfflineMemo("alice", "carol", "second", 102);
+    source.memo_durable_dirty = true;
+    _ = try candidate.storeOfflineMemo("stale", "mallory", "old", 1);
+    try std.testing.expect(source.upgradeContinuityBlockerLocked() == null);
+    try std.testing.expect(!candidate.memo_durable_dirty);
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(allocator);
+    const wire = try Server.sealMemoInboxUpgradeCheckpoint(allocator, &source.memo, source.memo_durable_dirty, &pieces);
+    defer {
+        std.crypto.secureZero(u8, wire);
+        allocator.free(wire);
+    }
+    try std.testing.expectEqual(@as(usize, 1), pieces.items.len);
+    try std.testing.expectEqual(helix_capsule.CapsuleKind.mesh_checkpoint, pieces.items[0].kind);
+    try std.testing.expectEqual(@as(?u16, 2), pieces.items[0].min_supported);
+    var field = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = wire }};
+    var cap = helix_capsule.make(.mesh_checkpoint, &field);
+    cap.header.min_supported = 2;
+
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageMemoInboxUpgradeCheckpoint(allocator, candidate.memo.cfg, &.{}));
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageMemoInboxUpgradeCheckpoint(allocator, candidate.memo.cfg, &.{ cap, cap }));
+    var downgraded = cap;
+    downgraded.header.min_supported = 1;
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageMemoInboxUpgradeCheckpoint(allocator, candidate.memo.cfg, &.{downgraded}));
+    var future = cap;
+    future.header.version += 1;
+    future.header.max_supported += 1;
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.stageMemoInboxUpgradeCheckpoint(allocator, candidate.memo.cfg, &.{future}));
+    var wrong_config = candidate.memo.cfg;
+    wrong_config.max_text_bytes += 1;
+    try std.testing.expectError(error.ConfigMismatch, Server.stageMemoInboxUpgradeCheckpoint(allocator, wrong_config, &.{cap}));
+    const corrupt = try allocator.dupe(u8, wire);
+    defer allocator.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    var corrupt_field = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
+    var corrupt_cap = helix_capsule.make(.mesh_checkpoint, &corrupt_field);
+    corrupt_cap.header.min_supported = 2;
+    try std.testing.expectError(error.ChecksumMismatch, Server.stageMemoInboxUpgradeCheckpoint(allocator, candidate.memo.cfg, &.{corrupt_cap}));
+    var failing_decode = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, Server.stageMemoInboxUpgradeCheckpoint(failing_decode.allocator(), candidate.memo.cfg, &.{cap}));
+    try std.testing.expectEqualStrings("old", candidate.memo.pending("stale")[0].text);
+    try std.testing.expectEqual(@as(usize, 0), candidate.memo.count("alice"));
+
+    var failing_encode = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var failed_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer failed_pieces.deinit(failing_encode.allocator());
+    try std.testing.expectError(error.OutOfMemory, Server.sealMemoInboxUpgradeCheckpoint(failing_encode.allocator(), &source.memo, true, &failed_pieces));
+    try std.testing.expectEqual(@as(usize, 0), failed_pieces.items.len);
+    try std.testing.expectEqual(@as(usize, 2), source.memo.count("alice"));
+    try std.testing.expect(source.memo_durable_dirty);
+
+    var replacement = try Server.stageMemoInboxUpgradeCheckpoint(allocator, candidate.memo.cfg, &.{cap});
+    defer replacement.deinit();
+    try std.testing.expect(replacement.dirty);
+    try std.testing.expectEqualStrings("old", candidate.memo.pending("stale")[0].text);
+    std.mem.swap(memo_mod.MemoBox, &candidate.memo, &replacement.box);
+    candidate.memo_durable_dirty = replacement.dirty;
+    try std.testing.expect(candidate.memo_durable_dirty);
+    try std.testing.expectEqual(@as(usize, 0), candidate.memo.count("stale"));
+    const messages = candidate.memo.pending("alice");
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("bob", messages[0].from);
+    try std.testing.expectEqualStrings("first", messages[0].text);
+    try std.testing.expectEqual(@as(i64, 101), messages[0].sent_ms);
+    try std.testing.expectEqualStrings("carol", messages[1].from);
+    try std.testing.expectEqualStrings("second", messages[1].text);
+    try std.testing.expectEqual(@as(i64, 102), messages[1].sent_ms);
+    try std.testing.expectEqual(@as(usize, 2), source.memo.count("alice"));
+}
+
+test "Windows malformed HXMB actual adopt preserves boot inbox" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const candidate = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(candidate);
+    defer candidate.deinit();
+    _ = try candidate.storeOfflineMemo("boot", "sender", "retained", 7);
+    const rows = try candidate.collectListenerManifest(allocator);
+    defer allocator.free(rows);
+    try std.testing.expect(rows.len != 0);
+    const Barrier = struct {
+        calls: usize = 0,
+        fn ready(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+    var barrier = Barrier{};
+    candidate.config.native_listener_manifest = rows;
+    candidate.config.native_adopt_barrier = .{ .ctx = &barrier, .readyAndAwaitCommit = Barrier.ready };
+    candidate.config.inherited_state_fd_manifest_present = true;
+    candidate.config.inherited_state_fd_manifest_valid = true;
+
+    var source_box = memo_mod.MemoBox.init(allocator);
+    defer source_box.deinit();
+    _ = try source_box.send("carried", "sender", "source", 8);
+    const valid = try native_windows_memo_inbox.encode(allocator, &source_box, true);
+    defer {
+        std.crypto.secureZero(u8, valid);
+        allocator.free(valid);
+    }
+    const corrupt = try allocator.dupe(u8, valid);
+    defer {
+        std.crypto.secureZero(u8, corrupt);
+        allocator.free(corrupt);
+    }
+    corrupt[corrupt.len - 1] ^= 1;
+    const malformed = [_]helix_live.StatePiece{.{ .kind = .mesh_checkpoint, .bytes = corrupt, .min_supported = 2 }};
+    const stream = try encodeUpgradeStreamWithWidenedHeaderForTest(allocator, &malformed, .handoff_manifest);
+    defer allocator.free(stream);
+    candidate.config.native_arena_bytes = stream;
+    try std.testing.expectError(error.InvalidInheritedHandoff, candidate.adoptInheritedSessions());
+    try std.testing.expectEqual(@as(usize, 0), barrier.calls);
+    try std.testing.expectEqualStrings("retained", candidate.memo.pending("boot")[0].text);
+    try std.testing.expectEqual(@as(usize, 0), candidate.memo.count("carried"));
+    try std.testing.expect(os_runtime.fdValid(rows[0].fd));
+    try std.testing.expectEqual(@as(usize, 1), source_box.count("carried"));
+}
+
+test "dirty memo repair snapshots accepted RAM image on send and timer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.openWithConfig(allocator, std.testing.io, tmp.dir, "dirty-memos.wal", .{ .max_record_bytes = 128 });
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .memo_config = .{ .max_text_bytes = 65_536 },
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    var server_open = true;
+    defer if (server_open) {
+        server.deinit();
+        allocator.destroy(server);
+    };
+    const unencodable = try allocator.alloc(u8, 65_536);
+    defer allocator.free(unencodable);
+    @memset(unencodable, 'x');
+    try std.testing.expectError(error.MessageInvalid, server.storeOfflineMemo("oversize", "bob", unencodable, 0));
+    try std.testing.expectEqual(@as(usize, 0), server.memo.count("oversize"));
+    const too_wide_record = try allocator.alloc(u8, 128);
+    defer allocator.free(too_wide_record);
+    @memset(too_wide_record, 'y');
+    try std.testing.expectError(error.MessageInvalid, server.storeOfflineMemo("too-wide-record", "bob", too_wide_record, 0));
+    try std.testing.expectEqual(@as(usize, 0), server.memo.count("too-wide-record"));
+    _ = try server.memo.send("alice", "bob", "missed append", 1);
+    server.memo_durable_dirty = true;
+    _ = try server.storeOfflineMemo("alice", "carol", "next append", 2);
+    try std.testing.expect(!server.memo_durable_dirty);
+    _ = try server.memo.send("alice", "dave", "timer repair", 3);
+    server.memo_durable_dirty = true;
+    server.memo_durable_retry_after_ms = server.nowMs() +| 60_000;
+    server.retryDirtyDurableMemos();
+    try std.testing.expect(server.memo_durable_dirty);
+    server.memo_durable_retry_after_ms = 0;
+    server.retryDirtyDurableMemos();
+    try std.testing.expect(!server.memo_durable_dirty);
+    server.deinit();
+    allocator.destroy(server);
+    server_open = false;
+    store.deinit();
+    store_open = false;
+
+    var restored_store = try services_mod.OroStore.openWithConfig(allocator, std.testing.io, tmp.dir, "dirty-memos.wal", .{ .max_record_bytes = 128 });
+    defer restored_store.deinit();
+    var restored = memo_mod.MemoBox.init(allocator);
+    defer restored.deinit();
+    try memo_durable.restoreInto(&restored_store, &restored);
+    const messages = restored.pending("alice");
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("missed append", messages[0].text);
+    try std.testing.expectEqualStrings("next append", messages[1].text);
+    try std.testing.expectEqualStrings("timer repair", messages[2].text);
 }
 
 test "UPGRADE successor adopts one canonical TLS ticket-key authority atomically" {
