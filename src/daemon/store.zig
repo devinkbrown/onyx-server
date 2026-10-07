@@ -1773,7 +1773,7 @@ const cold_posix = switch (@import("builtin").os.tag) {
     else => false,
 };
 
-pub const ColdOpenMode = enum { read_only, read_write, directory };
+pub const ColdOpenMode = enum { read_only, read_only_share_delete, read_write, directory };
 
 /// Existing cold namespace acquisition never creates and cannot wait for a FIFO
 /// peer. Force directory type for parent custody; held regular descriptors are
@@ -1803,7 +1803,7 @@ pub fn openColdExisting(io: std.Io, dir: std.Io.Dir, path: []const u8, mode: Col
             &io_status,
             null,
             .{ .NORMAL = true },
-            .VALID_FLAGS,
+            if (mode == .read_only_share_delete) .{ .READ = true, .DELETE = true } else .VALID_FLAGS,
             .OPEN,
             .{
                 .DIRECTORY_FILE = mode == .directory,
@@ -8028,6 +8028,90 @@ test "Windows held cold atomic replacement keeps old destination handle readable
     var bytes: [3]u8 = undefined;
     try std.testing.expectEqual(bytes.len, try installed.readPositionalAll(std.testing.io, &bytes, 0));
     try std.testing.expectEqualStrings("NEW", &bytes);
+}
+
+test "Windows held cold atomic replacement refuses an exclusive old destination" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const parent = try openColdExisting(std.testing.io, private, ".", .directory);
+    defer parent.close(std.testing.io);
+    const parent_id = try coldDirectoryIdentity(parent.handle);
+    const seed = try private.createFile(std.testing.io, "state.wal", .{ .read = true });
+    try seed.writePositionalAll(std.testing.io, "OLD", 0);
+    seed.close(std.testing.io);
+    const old = try cold_runtime.openExistingPrivateWindows(private, "state.wal", .remediate);
+    var old_open = true;
+    defer if (old_open) old.close(std.testing.io);
+    const old_id = try cold_identity.statRegular(old.handle);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    try makeColdAtomicReadable(std.testing.io, &atomic);
+    const file_id = try cold_identity.statRegular(atomic.file.handle);
+    const temp_name = std.fmt.hex(atomic.file_basename_hex);
+    var atomic_open = true;
+    defer if (atomic_open) deinitColdAtomic(std.testing.io, &atomic, file_id);
+    try atomic.file.writePositionalAll(std.testing.io, "NEW", 0);
+    try atomic.file.sync(std.testing.io);
+    try std.testing.expectError(StoreError.IoAmbiguous, renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", parent, parent_id, file_id, true));
+    try std.testing.expect(!atomic.file_exists);
+    var old_bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(old_bytes.len, try old.readPositionalAll(std.testing.io, &old_bytes, 0));
+    try std.testing.expectEqualStrings("OLD", &old_bytes);
+    deinitColdAtomic(std.testing.io, &atomic, file_id);
+    atomic_open = false;
+    old.close(std.testing.io);
+    old_open = false;
+    const installed = try openColdExisting(std.testing.io, private, "state.wal", .read_only);
+    defer installed.close(std.testing.io);
+    try std.testing.expectEqualDeep(old_id, try cold_identity.statRegular(installed.handle));
+    var new_bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(new_bytes.len, try installed.readPositionalAll(std.testing.io, &new_bytes, 0));
+    try std.testing.expectEqualStrings("OLD", &new_bytes);
+    const orphan = try openColdExisting(std.testing.io, private, &temp_name, .read_only);
+    defer orphan.close(std.testing.io);
+    try std.testing.expectEqualDeep(file_id, try cold_identity.statRegular(orphan.handle));
+}
+
+test "Windows held cold atomic replacement accepts a read-only delete-share destination" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const parent = try openColdExisting(std.testing.io, private, ".", .directory);
+    defer parent.close(std.testing.io);
+    const parent_id = try coldDirectoryIdentity(parent.handle);
+    const seed = try private.createFile(std.testing.io, "state.wal", .{ .read = true });
+    try seed.writePositionalAll(std.testing.io, "OLD", 0);
+    seed.close(std.testing.io);
+    const old = try openColdExisting(std.testing.io, private, "state.wal", .read_only_share_delete);
+    var old_open = true;
+    defer if (old_open) old.close(std.testing.io);
+    const old_id = try cold_identity.statRegular(old.handle);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    try makeColdAtomicReadable(std.testing.io, &atomic);
+    const file_id = try cold_identity.statRegular(atomic.file.handle);
+    var atomic_open = true;
+    defer if (atomic_open) deinitColdAtomic(std.testing.io, &atomic, file_id);
+    try atomic.file.writePositionalAll(std.testing.io, "NEW", 0);
+    try atomic.file.sync(std.testing.io);
+    try renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", parent, parent_id, file_id, true);
+    var old_bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(old_bytes.len, try old.readPositionalAll(std.testing.io, &old_bytes, 0));
+    try std.testing.expectEqualStrings("OLD", &old_bytes);
+    try std.testing.expect(!std.meta.eql(old_id, file_id));
+    deinitColdAtomic(std.testing.io, &atomic, file_id);
+    atomic_open = false;
+    old.close(std.testing.io);
+    old_open = false;
+    const installed = try openColdExisting(std.testing.io, private, "state.wal", .read_only);
+    defer installed.close(std.testing.io);
+    try std.testing.expectEqualDeep(file_id, try cold_identity.statRegular(installed.handle));
+    var new_bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(new_bytes.len, try installed.readPositionalAll(std.testing.io, &new_bytes, 0));
+    try std.testing.expectEqualStrings("NEW", &new_bytes);
 }
 
 test "Windows held cold atomic rename refuses collision and wrong preconditions" {

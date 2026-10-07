@@ -829,6 +829,8 @@ pub fn build(b: *std.Build) void {
             "Windows held cold atomic rename publishes exact file and retains exclusive duplicate",
             "Windows held cold atomic rename requires a write-through source handle",
             "Windows held cold atomic replacement keeps old destination handle readable",
+            "Windows held cold atomic replacement refuses an exclusive old destination",
+            "Windows held cold atomic replacement accepts a read-only delete-share destination",
             "Windows held cold atomic rename refuses collision and wrong preconditions",
             "Windows held cold atomic failed rename leaves safe orphan",
             "Windows first provision init holds a private lease without publishing files",
