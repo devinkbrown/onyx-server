@@ -365,16 +365,17 @@ pub fn decodeOwned(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     try validateCheckpoint(bytes);
     const h = try parseHeader(bytes);
     var reader = Reader{ .payload = h.payload };
+    const default_chain = try decodeChain(allocator, &reader, h.chain13_count);
     var result = Owned{ .allocator = allocator, .tls12_mode = h.mode, .reload_pending = h.reload_pending, .reload_retry_after_ms = h.reload_retry_after_ms };
-    errdefer result.deinit();
     result.default = .{
-        .cert_chain = try decodeChain(allocator, &reader, h.chain13_count),
+        .cert_chain = default_chain,
         .key_kind = switch (h.kind) {
             .ed25519 => .ed25519,
             .ecdsa_p256 => .ecdsa_p256,
             .rsa => .rsa,
         },
     };
+    errdefer result.deinit();
     if (result.default) |*loaded| switch (h.kind) {
         .ed25519 => {
             const encoded = try reader.take(Ed25519.SecretKey.encoded_length);

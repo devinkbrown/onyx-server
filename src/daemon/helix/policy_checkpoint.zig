@@ -203,7 +203,6 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!OwnedSnapsh
         .previous_generation = h.previous_generation,
         .undo = null,
     };
-    errdefer result.deinit();
     var reader = wire.Reader{ .bytes = h.body };
     if (h.kind) |kind| result.undo = switch (kind) {
         .ward => .{ .ward = try decodeWards(allocator, &reader, h.count) },
