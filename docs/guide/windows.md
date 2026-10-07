@@ -289,8 +289,10 @@ at `[tls].cert_path`. A native Windows module test completes ACME issuance
 against a pure Zig loopback CA: it checks the live HTTP-01 challenge, trusted
 HTTPS exchange, published fullchain and matching private key, and key ACL. The
 disposable daemon smoke checks private preflight, a TLS handshake, both worker
-starts, and a CLI error path. Public ACME issuance and live OCSP publication
-still require an end-to-end acceptance run.
+starts, and a CLI error path. The local live OCSP smoke verifies the daemon's
+fetch, publication, and exact stapled response in a TLS handshake. Public ACME
+issuance and OCSP responses from a public responder still need external
+acceptance.
 
 Configured OCG2 mint, project, and observe modes load the durable authority
 from the private account store on Windows. The native smoke initializes it,
@@ -480,8 +482,10 @@ The native Windows OCSP test loads two PEM blocks of the same self-signed
 certificate, POSTs to a pure-Zig HTTPS responder, verifies a current signed
 response from that issuer, and checks the server's pending-staple handoff. A
 separate native server test checks reactor publication into the TLS config,
-exclusive expiry, and rejection after leaf rotation. These local tests do not
-exercise the timer dispatch, a client wire handshake, or a public responder.
+exclusive expiry, and rejection after leaf rotation. The live process smoke
+checks the timer-driven fetch, an unstapled must-staple rejection before
+publication, and the exact stapled DER in a later native TLS handshake. It uses
+a local responder; a public responder has not been tested here.
 
 When `[wasm].plugin_dir` is configured, its mandatory checkpoint carries the
 authorized plugin source bytes, policy, registration order, mutable linear
