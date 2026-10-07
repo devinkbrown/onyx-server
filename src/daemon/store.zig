@@ -1988,8 +1988,6 @@ fn coldOpenParent(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
     return openColdExisting(io, dir, std.fs.path.dirname(path) orelse ".", .directory);
 }
 fn validateColdParent(io: std.Io, dir: std.Io.Dir, path: []const u8, held: std.Io.File, expected: cold_identity.Identity, atomic: ?*const std.Io.File.Atomic) !void {
-    // Cold custody needs POSIX fds; unreachable in Windows production.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     if (!std.meta.eql(expected, try coldDirectoryIdentity(held.handle))) return StoreError.SnapshotCoverageMismatch;
     const configured = try coldOpenParent(io, dir, path);
     defer configured.close(io);
@@ -2001,6 +1999,32 @@ fn validateColdParent(io: std.Io, dir: std.Io.Dir, path: []const u8, held: std.I
         defer actual.close(io);
         if (!std.meta.eql(expected, try coldDirectoryIdentity(actual.handle))) return StoreError.SnapshotCoverageMismatch;
     }
+}
+
+test "Windows cold parent validation binds held and configured directories before effects" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "state", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "foreign", .default_dir);
+    const held = try openColdExisting(std.testing.io, tmp.dir, "state", .directory);
+    defer held.close(std.testing.io);
+    const wrong = try openColdExisting(std.testing.io, tmp.dir, "foreign", .directory);
+    defer wrong.close(std.testing.io);
+    const expected = try coldDirectoryIdentity(held.handle);
+    try validateColdParent(std.testing.io, tmp.dir, "state/custody.wal", held, expected, null);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, validateColdParent(std.testing.io, tmp.dir, "state/custody.wal", wrong, expected, null));
+    var foreign_atomic = try tmp.dir.createFileAtomic(std.testing.io, "foreign/custody.wal", .{ .replace = true });
+    defer foreign_atomic.deinit(std.testing.io);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, validateColdParent(std.testing.io, tmp.dir, "state/custody.wal", held, expected, &foreign_atomic));
+    var wrong_high = expected;
+    wrong_high.inode_high ^= 1;
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, validateColdParent(std.testing.io, tmp.dir, "state/custody.wal", held, wrong_high, null));
+    try tmp.dir.rename("state", tmp.dir, "previous", std.testing.io);
+    try tmp.dir.createDir(std.testing.io, "state", .default_dir);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, validateColdParent(std.testing.io, tmp.dir, "state/custody.wal", held, expected, null));
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, tmp.dir, "state/custody.wal", .read_only));
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, tmp.dir, "previous/custody.wal", .read_only));
 }
 
 /// Detached explicit first provisioning. Every allocator request precedes WAL
@@ -2261,6 +2285,8 @@ pub const ColdRecoveryStage = struct {
     backing: ?*ColdBacking,
 
     pub fn open(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, lease: std.Io.File, config: Config) !ColdRecoveryStage {
+        // Windows cold custody still lacks transactional publication support.
+        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
         const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
         errdefer allocator.free(lock_path);
         const lease_identity = try cold_identity.statRegular(lease.handle);
@@ -2683,13 +2709,52 @@ fn coldPreparedDigest(owned: *const ColdBacking) ![32]u8 {
 }
 
 fn validateColdLease(io: std.Io, dir: std.Io.Dir, lease: std.Io.File, path: []const u8, identity: cold_identity.Identity) !void {
-    // Cold custody needs POSIX fds; unreachable in Windows production.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     if (!std.meta.eql(identity, try cold_identity.statRegular(lease.handle))) return StoreError.SnapshotCoverageMismatch;
     const configured = try openColdExisting(io, dir, path, .read_only);
     defer configured.close(io);
     if (!std.meta.eql(identity, try cold_identity.statRegular(configured.handle))) return StoreError.SnapshotCoverageMismatch;
     try cold_identity.reaffirmExclusive(lease.handle);
+}
+
+test "Windows cold lease accepts only the local locked marker handle at its path" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const owner = try tmp.dir.createFile(std.testing.io, "custody.wal.lock", .{ .read = true });
+    defer owner.close(std.testing.io);
+    try std.testing.expect(try owner.tryLock(std.testing.io, .exclusive));
+    try owner.writePositionalAll(std.testing.io, "L", 0);
+    const identity = try cold_identity.statRegular(owner.handle);
+    try validateColdLease(std.testing.io, tmp.dir, owner, "custody.wal.lock", identity);
+    try std.testing.expectError(error.SkipZigTest, FirstProvisionStage.init(std.testing.allocator, std.testing.io, tmp.dir, "custody.wal", owner, .{}));
+    try std.testing.expectError(error.SkipZigTest, ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "custody.wal", owner, .{}));
+    const reopened = try openColdExisting(std.testing.io, tmp.dir, "custody.wal.lock", .read_write);
+    defer reopened.close(std.testing.io);
+    try std.testing.expectError(error.WouldBlock, validateColdLease(std.testing.io, tmp.dir, reopened, "custody.wal.lock", identity));
+    const foreign = try tmp.dir.createFile(std.testing.io, "foreign.wal.lock", .{ .read = true });
+    defer foreign.close(std.testing.io);
+    try foreign.writePositionalAll(std.testing.io, "L", 0);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, validateColdLease(std.testing.io, tmp.dir, owner, "foreign.wal.lock", identity));
+    var wrong_high = identity;
+    wrong_high.inode_high ^= 1;
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, validateColdLease(std.testing.io, tmp.dir, owner, "custody.wal.lock", wrong_high));
+    var marker: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try owner.readPositionalAll(std.testing.io, &marker, 0));
+    try std.testing.expectEqual(@as(u8, 'L'), marker[0]);
+}
+
+test "Windows cold lease rejects an unlocked marker without changing it" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const unlocked = try tmp.dir.createFile(std.testing.io, "unlocked.wal.lock", .{ .read = true });
+    defer unlocked.close(std.testing.io);
+    try unlocked.writePositionalAll(std.testing.io, "L", 0);
+    const identity = try cold_identity.statRegular(unlocked.handle);
+    try std.testing.expectError(error.WouldBlock, validateColdLease(std.testing.io, tmp.dir, unlocked, "unlocked.wal.lock", identity));
+    var marker: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try unlocked.readPositionalAll(std.testing.io, &marker, 0));
+    try std.testing.expectEqual(@as(u8, 'L'), marker[0]);
 }
 
 fn validateColdPreparedWal(owned: *const ColdBacking) !void {
