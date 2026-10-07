@@ -424,19 +424,25 @@ same loaded source, ordered `env:` and `@file:` substitutions, static TLS
 settings, identity material, and OAuth JWKS bytes. The authenticated TLS
 material checkpoint supplies the exact serving certificate and key generations
 before COMMIT. A completed `REHASH` retains Windows Helix eligibility when
-the canonical config source and every ordered `env:` and `@file:` value still
-match startup. TLS 1.3 session tickets, including 0-RTT, and TLS 1.2 tickets
-may remain enabled; their current and previous keys and consumed-ticket
-history cross the handoff. With
-TLS enabled, the reload must succeed and leave the full serving
-certificate/key generation and TLS 1.2 leg byte-identical; the authenticated
-checkpoint then carries that generation.
+every parsed setting outside `[limits].max_clones_per_ip` still matches
+boot. The supported live change is a nonzero exact-IP clone cap raised above
+its previous value. This preserves the existing connection count during
+adoption. Other changed limits require a normal boot after REHASH because
+their live counters or restore policy may differ. The new canonical source
+and ordered substitutions are bound to the pinned external material before
+`UPGRADE`.
+TLS 1.3 session tickets, including 0-RTT, and TLS 1.2 tickets may remain
+enabled; their current and previous keys and consumed-ticket history cross
+the handoff. A successful TLS reload may rotate the serving default and TLS
+1.2 certificates because their exact generation crosses in the authenticated
+checkpoint. A failed TLS reload invalidates Helix eligibility.
 With WASM enabled, the checkpoint carries the actual post-REHASH modules and
-mutable state, and the candidate revalidates their policy. A changed REHASH,
-failed TLS reload, or changed serving TLS material invalidates eligibility for
-that process, even if a later REHASH restores the original inputs; a normal
-boot is then needed before another upgrade. ACME renewal does not invalidate
-the static proof.
+mutable state, and the candidate revalidates their policy. Changed
+restart-only settings, operator bindings, classes, or WASM policy keep the
+ordinary REHASH result but invalidate Helix eligibility for that process,
+even if a later REHASH restores the original inputs; a normal boot is then
+needed before another upgrade. ACME renewal does not invalidate the static
+proof.
 
 For TLS resumption, the authenticated HXRG checkpoint carries the shared replay
 ring in chronological order. The successor validates and stages it before COMMIT,

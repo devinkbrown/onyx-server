@@ -92,10 +92,15 @@ fn validateActiveMediaSource(source: server.NativeWindowsActiveMediaCarry) !void
 
 pub const timeout_ms: i64 = 30_000;
 
+fn lockSourceDigest(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
+}
+
 pub const Driver = struct {
     allocator: std.mem.Allocator,
     config_path: ?[]const u8 = null,
     source_digest: ?[32]u8 = null,
+    source_digest_lock: std.atomic.Mutex = .unlocked,
     /// Absolute path reported for this process image at boot; kept alive by
     /// main for the daemon lifetime.
     boot_image_path: ?[]const u8 = null,
@@ -106,14 +111,34 @@ pub const Driver = struct {
     deadline: i64 = 0,
 
     pub fn hooks(self: *Driver) server.NativeUpgradeHooks {
-        return .{ .ctx = self, .begin = begin, .beginSameImage = beginSameImage, .transferAndCommit = transferAndCommit, .abort = abort };
+        return .{ .ctx = self, .begin = begin, .beginSameImage = beginSameImage, .transferAndCommit = transferAndCommit, .abort = abort, .setSourceDigest = setSourceDigest };
+    }
+
+    fn setSourceDigest(ctx: *anyopaque, digest: [32]u8) void {
+        const self: *Driver = @ptrCast(@alignCast(ctx));
+        lockSourceDigest(&self.source_digest_lock);
+        defer self.source_digest_lock.unlock();
+        self.source_digest = digest;
+    }
+
+    fn hasSourceDigest(self: *Driver) bool {
+        lockSourceDigest(&self.source_digest_lock);
+        defer self.source_digest_lock.unlock();
+        return self.source_digest != null;
+    }
+
+    fn matchesSourceDigest(self: *Driver, expected: [32]u8) bool {
+        lockSourceDigest(&self.source_digest_lock);
+        defer self.source_digest_lock.unlock();
+        const source = self.source_digest orelse return false;
+        return std.crypto.timing_safe.eql([32]u8, source, expected);
     }
 
     fn begin(ctx: *anyopaque, executable: []const u8) !void {
         if (comptime builtin.os.tag != .windows) return error.Unsupported;
         const self: *Driver = @ptrCast(@alignCast(ctx));
         if (self.candidate != null) return error.UpgradeAlreadyActive;
-        if (self.source_digest == null or self.config_path == null or self.config_path.?.len == 0)
+        if (!self.hasSourceDigest() or self.config_path == null or self.config_path.?.len == 0)
             return error.UnprovenConfigSource;
         self.deadline = platform.monotonicMillis() + timeout_ms;
         const generation: u64 = @intCast(@max(1, platform.monotonicMillis()));
@@ -124,7 +149,7 @@ pub const Driver = struct {
         if (comptime builtin.os.tag != .windows) return error.Unsupported;
         const self: *Driver = @ptrCast(@alignCast(ctx));
         if (self.candidate != null) return error.UpgradeAlreadyActive;
-        if (self.source_digest == null or self.config_path == null or self.config_path.?.len == 0)
+        if (!self.hasSourceDigest() or self.config_path == null or self.config_path.?.len == 0)
             return error.UnprovenConfigSource;
         const boot_digest = self.boot_image_digest orelse return error.UnprovenRunningImage;
         const executable = self.boot_image_path orelse return error.UnprovenRunningImage;
@@ -164,8 +189,7 @@ pub const Driver = struct {
         const self: *Driver = @ptrCast(@alignCast(ctx));
         const candidate = if (self.candidate) |*p| p else return error.NoCandidate;
         const source_digest = snapshot.windows_source_digest orelse return error.UnprovenConfigSource;
-        if (self.source_digest == null or
-            !std.crypto.timing_safe.eql([32]u8, self.source_digest.?, source_digest))
+        if (!self.matchesSourceDigest(source_digest))
             return error.UnprovenConfigSource;
         for (snapshot.pieces) |piece| if (piece.kind == .native_service) return error.UnboundNativeService;
 

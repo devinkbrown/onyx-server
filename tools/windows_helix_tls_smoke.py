@@ -7,8 +7,9 @@
 The default fixture enables both ACME and OCSP schedulers without contacting
 public endpoints. It performs an unchanged, on-disk TLS REHASH before two
 swaps. --generated first checks two pristine swaps, then confirms that REHASH
-minted a new TLS 1.2 side leaf and UPGRADE refuses. Optional negative modes
-exercise valid cert rotation and failed cert reload after the positive swaps.
+mints new default and TLS 1.2 leaves and carries them through another swap.
+The rotation mode checks the same for a valid on-disk leaf. A failed reload
+must still refuse UPGRADE after the positive swaps.
 
 Usage: python -B tools/windows_helix_tls_smoke.py zig-out/bin/onyx-server.exe
 """
@@ -101,9 +102,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--generated", action="store_true",
-                        help="carry generated certificates, then refuse UPGRADE after REHASH")
+                        help="carry generated certificates, including a post-REHASH rotation")
     parser.add_argument("--negative", choices=("rotation", "failed-reload"),
-                        help="after two swaps, REHASH rotated or unreadable TLS files and require UPGRADE refusal")
+                        help="after two swaps, prove rotated-cert continuation or failed-reload refusal")
     parser.add_argument("--resumption", action="store_true",
                         help="prove 1-RTT TLS ticket reuse across unchanged REHASH and two swaps")
     parser.add_argument("--early-data", action="store_true",
@@ -283,6 +284,25 @@ def main() -> int:
                 assert_held(f"{label}-refused")
                 print(f"PASS: {label}: REHASH refused UPGRADE; held TLS/WSS and token stayed live", flush=True)
 
+            def require_rotated_swap(label: str, expected_default: bytes,
+                                     expected_tls12: bytes | None = None) -> None:
+                nonlocal serving_pid
+                nick_seed = "gen3" if expected_tls12 is not None else "rot3"
+                before = serving_pid
+                oper.send(b"UPGRADE")
+                serving_pid = helix.sole_image_pid(binary, different_from=before)
+                assert_held(f"{label}-swap")
+                if fresh_fingerprint(nick_seed) != expected_default:
+                    raise AssertionError(f"{label}: successor lost the rotated default certificate")
+                if expected_tls12 is not None:
+                    probe = connect_tls(tls_port, tls12_context, None)
+                    clients.append(probe)
+                    probe.register(f"{nick_seed}12".encode())
+                    probe.ping(f"{nick_seed}12".encode())
+                    if probe.certificate_digest() != expected_tls12:
+                        raise AssertionError(f"{label}: successor lost the rotated TLS 1.2 leaf")
+                print(f"PASS: {label}: {before} -> {serving_pid}; rotated TLS material, held TLS/WSS, and token survived", flush=True)
+
             def ticket_from(client: TlsClient, label: str,
                             different_from: ssl.SSLSession | None = None) -> ssl.SSLSession:
                 deadline = time.monotonic() + 10
@@ -438,19 +458,20 @@ def main() -> int:
 
             if args.generated:
                 # REHASH always mints a new default Ed25519 leaf and a separate
-                # P-256 TLS 1.2 leg. The bounded same-material proof must reject
-                # the next upgrade even though the TOML source is unchanged.
+                # P-256 TLS 1.2 leg. HXTM carries both exact new generations.
                 oper.command(b"REHASH", b"Configuration reloaded")
                 assert_held("generated-rehash")
                 fresh_tls12 = connect_tls(tls_port, tls12_context, None)
                 clients.append(fresh_tls12)
                 fresh_tls12.register(b"rehashfresh12")
                 fresh_tls12.ping(b"generated-rehash")
-                if fresh_tls12.certificate_digest() == tls12_certificate:
+                rotated_tls12 = fresh_tls12.certificate_digest()
+                if rotated_tls12 == tls12_certificate:
                     raise AssertionError("generated REHASH did not replace the TLS 1.2 side leaf")
-                if fresh_fingerprint("genrh") == certificate:
+                rotated_default = fresh_fingerprint("genrh")
+                if rotated_default == certificate:
                     raise AssertionError("generated REHASH did not replace the default TLS leaf")
-                require_refusal("generated TLS 1.2 material changed")
+                require_rotated_swap("generated-rehash", rotated_default, rotated_tls12)
             elif args.negative == "rotation":
                 staged = root / "rotated"
                 staged.mkdir()
@@ -460,9 +481,10 @@ def main() -> int:
                 (staged / "keys-private" / "server.key").replace(root / "keys-private" / "server.key")
                 oper.command(b"REHASH", b"Configuration reloaded")
                 assert_held("rotated-rehash")
-                if fresh_fingerprint("rotated") == certificate:
+                rotated_default = fresh_fingerprint("rotated")
+                if rotated_default == certificate:
                     raise AssertionError("valid TLS cert rotation did not change the serving leaf")
-                require_refusal("valid TLS cert rotation")
+                require_rotated_swap("valid-cert-rotation", rotated_default)
             elif args.negative == "failed-reload":
                 key_path = root / "keys-private" / "server.key"
                 hidden_key = root / "keys-private" / "server.key.held"

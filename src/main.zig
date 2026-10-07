@@ -2284,6 +2284,27 @@ pub fn main(init: std.process.Init) !void {
                 if (windows_transfer != null) windows_driver.candidateAbortNow();
                 return error.InvalidWindowsGeoOwner;
             }
+            // A REHASH may change only a proven live scalar while all external
+            // material stays pinned to this process. Keep its source-independent
+            // commitment so the new source can be bound without rereading
+            // mutable certificate, identity, or companion files.
+            const material: ?windows_config_proof.Digest = windowsStaticEffectiveConfigDigest(
+                @splat(0),
+                tls_loaded != null,
+                tls_sni_loaded.items,
+                if (tls_ech_loaded) |loaded| loaded.keys else &.{},
+                if (webpush_vapid) |*key| key else null,
+                oauth_jwks_text,
+                if (node_id_holder) |*identity| identity else null,
+                srv_cfg.cloak_key,
+                srv_cfg.cloak_prev_key,
+                windows_geo.cityBytes(),
+                windows_geo.asnBytes(),
+            ) catch |err| blk: {
+                if (windows_transfer != null) windows_driver.candidateAbortNow();
+                std.debug.print("onyx-server: Windows Helix material proof unavailable ({s})\n", .{@errorName(err)});
+                break :blk null;
+            };
             const effective: ?windows_config_proof.Digest = windowsStaticEffectiveConfigDigest(
                 source,
                 tls_loaded != null,
@@ -2301,6 +2322,8 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("onyx-server: Windows Helix config proof unavailable ({s})\n", .{@errorName(err)});
                 break :blk null;
             };
+            srv_cfg.windows_helix_static_material_digest = material;
+            if (held) |*h| srv_cfg.windows_helix_boot_parsed = &h.parsed;
             srv_cfg.windows_helix_source_digest = effective;
             windows_runtime_driver.config_path = srv_cfg.config_path;
             windows_runtime_driver.source_digest = effective;
@@ -2308,7 +2331,10 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.native_upgrade_hooks = windows_runtime_driver.hooks();
             if (windows_transfer) |*transfer| {
                 const own = effective orelse windows_driver.candidateAbortNow();
-                if (!std.crypto.timing_safe.eql(windows_config_proof.Digest, own, transfer.source_digest))
+                const pinned = material orelse windows_driver.candidateAbortNow();
+                const rebased = windows_config_proof.rebaseEffectiveDigest(source, pinned);
+                if (!std.crypto.timing_safe.eql(windows_config_proof.Digest, own, transfer.source_digest) and
+                    !std.crypto.timing_safe.eql(windows_config_proof.Digest, rebased, transfer.source_digest))
                     windows_driver.candidateAbortNow();
             }
         } else if (windows_transfer != null) windows_driver.candidateAbortNow();

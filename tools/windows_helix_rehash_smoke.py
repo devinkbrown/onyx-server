@@ -4,11 +4,10 @@
 
 """Exercise Windows REHASH source proof and guarded Helix continuity.
 
-The positive case performs an unchanged real REHASH, then two UPGRADE swaps
-with held IRC sockets, a stable local session token, and WAL reads/writes.
+The positive cases perform unchanged and live-limit REHASH, then two UPGRADE
+swaps with held IRC sockets, a stable local session token, and WAL reads/writes.
 Each negative case has its own cold boot so a prior invalidation cannot hide
-another one. Use --negative-only with a binary that still refuses all REHASH
-handoffs.
+another one. Use --negative-only to isolate the refusal cases.
 
 The environment case switches a TOML env: reference between two variables
 seeded before daemon launch. An external fixture cannot change the environment
@@ -132,11 +131,14 @@ class Fixture:
         finally:
             reader.close()
 
-    def refuse_upgrade(self, label: str) -> None:
+    def refuse_upgrade(self, label: str, *, notice: bytes | None = None) -> None:
         assert self.oper is not None
         serving_pid = self.parent.pid
-        self.oper.send(b"UPGRADE")
-        wait_log_contains(self.log_path, "deferred UPGRADE failed: NativeUpgradeUnavailable")
+        if notice is None:
+            self.oper.send(b"UPGRADE")
+            wait_log_contains(self.log_path, "deferred UPGRADE failed: NativeUpgradeUnavailable")
+        else:
+            self.oper.command(b"UPGRADE", notice)
         if image_pids(self.binary) != {serving_pid}:
             raise AssertionError(f"{label}: refused UPGRADE changed the serving process")
         marker = f"refused-{label}".encode("ascii")
@@ -233,15 +235,67 @@ def positive(source: Path) -> None:
             print(f"PASS: unchanged REHASH Helix swap {sequence}, {serving_pid} -> {next_pid}; held sockets, token, and WAL survived", flush=True)
             serving_pid = next_pid
 
-
-def negatives(source: Path) -> None:
-    with fixture(source, "toml") as run:
+    with fixture(source, "live-limit") as run:
         changed = run.original_config.replace("max_clones_per_ip = 8", "max_clones_per_ip = 9", 1)
         if changed == run.original_config:
-            raise AssertionError("TOML negative did not change the limit")
+            raise AssertionError("live-limit fixture did not change the limit")
         run.config.write_text(changed, encoding="utf-8")
         run.rehash()
-        run.refuse_upgrade("changed-toml")
+        assert run.oper is not None
+        policy = run.oper.command(b"CLONES", b"CLONES policy: max_per_ip=9")
+        if b"max_per_ip=9" not in policy:
+            raise AssertionError("REHASH did not install the new clone limit")
+        run.assert_held(b"after-live-limit-rehash")
+        serving_pid = run.parent.pid
+        for sequence in (1, 2):
+            run.oper.send(b"UPGRADE")
+            next_pid = sole_image_pid(run.binary, different_from=serving_pid)
+            run.assert_held(f"after-live-limit-swap-{sequence}".encode("ascii"))
+            run.assert_wal(f"live{sequence}")
+            policy = run.oper.command(b"CLONES", b"CLONES policy: max_per_ip=9")
+            if b"max_per_ip=9" not in policy:
+                raise AssertionError("successor lost the live clone limit")
+            if sequence == 1 and run.parent.wait(timeout=10) != 0:
+                raise AssertionError("original predecessor did not exit cleanly")
+            print(f"PASS: live-limit REHASH Helix swap {sequence}, {serving_pid} -> {next_pid}; held sockets, token, limit, and WAL survived", flush=True)
+            serving_pid = next_pid
+
+
+def negatives(source: Path) -> None:
+    with fixture(source, "mixed-static") as run:
+        changed = run.original_config.replace("max_clones_per_ip = 8", "max_clones_per_ip = 9", 1)
+        changed = changed.replace("num_shards = 1", "num_shards = 2", 1)
+        if changed == run.original_config:
+            raise AssertionError("mixed static negative did not change the config")
+        run.config.write_text(changed, encoding="utf-8")
+        run.rehash()
+        run.refuse_upgrade("live-limit-plus-static-shards")
+
+    with fixture(source, "listener") as run:
+        changed = run.original_config.replace(f"irc = {run.port}", f"irc = {free_port()}", 1)
+        if changed == run.original_config:
+            raise AssertionError("listener negative did not change the port")
+        run.config.write_text(changed, encoding="utf-8")
+        run.rehash()
+        run.refuse_upgrade("changed-listener", notice=b"cold restart required")
+
+    with fixture(source, "lower-cap") as run:
+        changed = run.original_config.replace("max_clones_per_ip = 8", "max_clones_per_ip = 4", 1)
+        if changed == run.original_config:
+            raise AssertionError("lower-cap negative did not change the limit")
+        run.config.write_text(changed, encoding="utf-8")
+        run.rehash()
+        run.refuse_upgrade("lowered-live-cap")
+
+    with fixture(source, "network-cap") as run:
+        changed = run.original_config.replace(
+            "max_clones_per_ip = 8", "max_clones_per_ip = 8\nmax_clones_per_ip_net = 3", 1,
+        )
+        if changed == run.original_config:
+            raise AssertionError("network-cap negative did not change the limit")
+        run.config.write_text(changed, encoding="utf-8")
+        run.rehash()
+        run.refuse_upgrade("enabled-network-cap")
 
     with fixture(source, "env") as run:
         changed = run.original_config.replace(f"env:{ENV_A}", f"env:{ENV_B}", 1)
@@ -259,7 +313,9 @@ def negatives(source: Path) -> None:
         run.refuse_upgrade("changed-file-value")
 
     with fixture(source, "restored") as run:
-        changed = run.original_config.replace("max_clones_per_ip = 8", "max_clones_per_ip = 9", 1)
+        changed = run.original_config.replace("num_shards = 1", "num_shards = 2", 1)
+        if changed == run.original_config:
+            raise AssertionError("restored-source negative did not change shards")
         run.config.write_text(changed, encoding="utf-8")
         run.rehash()
         run.config.write_text(run.original_config, encoding="utf-8")
@@ -272,9 +328,9 @@ def main() -> int:
     parser.add_argument("binary", type=Path)
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--negative-only", action="store_true",
-                       help="run only refusal cases against a pre-fix binary")
+                       help="run only restart-only and unresolved-source refusal cases")
     scope.add_argument("--positive-only", action="store_true",
-                       help="run only the identical-REHASH two-swap case")
+                       help="run unchanged and changed live-limit two-swap cases")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("this fixture requires native Windows")
@@ -288,7 +344,7 @@ def main() -> int:
     if args.negative_only:
         print("ALL WINDOWS REHASH HELIX REFUSAL CHECKS PASSED", flush=True)
     elif args.positive_only:
-        print("WINDOWS REHASH HELIX TWO-SWAP CHECK PASSED", flush=True)
+        print("WINDOWS REHASH HELIX TWO-SWAP CHECKS PASSED", flush=True)
     else:
         print("ALL WINDOWS REHASH HELIX CHECKS PASSED", flush=True)
     return 0

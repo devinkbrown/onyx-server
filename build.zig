@@ -308,7 +308,10 @@ pub fn build(b: *std.Build) void {
                 .verbose_compile = verbose_compile,
                 .verbose_run = b.addRunArtifact(verbose_compile),
             };
-            test_mod_step.dependOn(&test_shards[index].run.step);
+            // The default Zig test protocol times out on a few intentionally
+            // expensive pure-Zig RSA cases in Windows Debug. The simple runner
+            // has no per-test response watchdog and reports exact pass counts.
+            test_mod_step.dependOn(&test_shards[index].verbose_run.step);
             test_mod_verbose_step.dependOn(&test_shards[index].verbose_run.step);
         }
     } else {

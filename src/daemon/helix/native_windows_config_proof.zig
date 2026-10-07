@@ -160,6 +160,28 @@ pub const EffectiveBuilder = struct {
     }
 };
 
+/// Bind a new, fully observed source transcript to the external material
+/// loaded at boot. The latter is an EffectiveBuilder transcript with a zero
+/// source input, so it cannot be forged by editing TOML during REHASH.
+pub fn rebaseEffectiveDigest(source_digest: Digest, static_material_digest: Digest) Digest {
+    var hash = Sha256.init(.{});
+    hash.update("onyx/helix/windows-effective-rebase/v1\x00");
+    hash.update(&source_digest);
+    hash.update(&static_material_digest);
+    var digest: Digest = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+test "Windows Helix rebased proof binds source and pinned external material" {
+    const a = rebaseEffectiveDigest(@splat(0x11), @splat(0x22));
+    const changed_source = rebaseEffectiveDigest(@splat(0x12), @splat(0x22));
+    const changed_material = rebaseEffectiveDigest(@splat(0x11), @splat(0x23));
+    try std.testing.expectEqual(a, rebaseEffectiveDigest(@splat(0x11), @splat(0x22)));
+    try std.testing.expect(!std.mem.eql(u8, &a, &changed_source));
+    try std.testing.expect(!std.mem.eql(u8, &a, &changed_material));
+}
+
 /// Commit the exact bytes pinned as the live city/ASN databases. An absent pair
 /// adds no records, preserving the proof of existing Windows deployments whose
 /// GeoIP feature is disabled. The caller must retain the same bytes for the

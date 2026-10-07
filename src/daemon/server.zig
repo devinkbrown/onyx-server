@@ -203,6 +203,7 @@ const native_windows_tls_material = @import("helix/native_windows_tls_material.z
 const native_windows_tls_replay = @import("helix/native_windows_tls_replay.zig");
 const native_windows_history_material = @import("helix/native_windows_history_material.zig");
 const native_windows_tls_proof = @import("helix/native_windows_tls_proof.zig");
+const native_windows_config_proof = @import("helix/native_windows_config_proof.zig");
 const native_windows_wasm = @import("helix/native_windows_wasm.zig");
 const policy_checkpoint = @import("helix/policy_checkpoint.zig");
 const native_windows_operator_state = @import("helix/native_windows_operator_state.zig");
@@ -1492,6 +1493,9 @@ pub const NativeUpgradeHooks = struct {
     /// Error returns are pre-COMMIT only. Success exits the predecessor without
     /// shutdown/deinit of sockets shared with the committed successor.
     transferAndCommit: *const fn (*anyopaque, NativeUpgradeSnapshot) anyerror!noreturn,
+    /// Update the native driver's expected effective config commitment at the
+    /// same World-locked cut as a proven live REHASH. Null refuses rebinding.
+    setSourceDigest: ?*const fn (*anyopaque, [32]u8) void = null,
     abort: *const fn (*anyopaque) void,
 };
 
@@ -2319,6 +2323,13 @@ pub const Config = struct {
     /// Raw source transcript, before static effective material is added. A
     /// matching REHASH can retain upgrade eligibility for unchanged policy.
     windows_helix_raw_source_digest: ?[32]u8 = null,
+    /// Source-independent static external material, captured at boot. Combined
+    /// with a fresh source transcript only after an exact live-policy check.
+    windows_helix_static_material_digest: ?[32]u8 = null,
+    /// Borrowed from main's owned parsed boot config for the process lifetime.
+    /// REHASH may only rebind its Windows proof when restart-only and partially
+    /// applied config fields remain semantically equal to this snapshot.
+    windows_helix_boot_parsed: ?*const config_format.Config = null,
     /// Auto-created node keyfiles are outside the boot-source commitment.
     windows_helix_explicit_node_secret: bool = false,
     /// A per-boot cloak key would change accepted host masks at handoff.
@@ -56257,6 +56268,63 @@ pub const LinuxServer = struct {
 
     pub fn ocg2RehashHasUnsupportedRuntimeMode(_: config_format.Config.OperOcg2) bool {
         return false;
+    }
+
+    /// The exact per-IP clone count is tracked even while its cap is disabled.
+    /// All other parsed fields, including listener/shard topology and limits
+    /// with reset or optional state, must equal boot before Windows can advance
+    /// its Helix source proof. A separate monotonic-cap gate below prevents the
+    /// successor from rejecting an already-attached client during adoption.
+    /// The recursive comparison follows slice contents rather than allocator
+    /// addresses, including secrets resolved through env:/@file: indirection.
+    pub fn windowsRehashEligibleParsed(boot: *const config_format.Config, proposed: *const config_format.Config) bool {
+        var before = boot.*;
+        var after = proposed.*;
+        before.limits.max_clones_per_ip = 0;
+        after.limits.max_clones_per_ip = 0;
+        return rehashDeepEqual(config_format.Config, before, after);
+    }
+
+    pub fn windowsRehashIpCapSafe(current: u32, proposed: u32) bool {
+        return proposed == current or (current != 0 and proposed > current);
+    }
+
+    fn rehashDeepEqual(comptime T: type, before: T, after: T) bool {
+        switch (@typeInfo(T)) {
+            .pointer => |info| {
+                if (info.size != .slice) return before == after;
+                if (before.len != after.len) return false;
+                for (before, after) |a, b| {
+                    if (!rehashDeepEqual(info.child, a, b)) return false;
+                }
+                return true;
+            },
+            .optional => |info| {
+                const a = before orelse return after == null;
+                const b = after orelse return false;
+                return rehashDeepEqual(info.child, a, b);
+            },
+            .@"struct" => |info| {
+                inline for (info.field_names, info.field_types) |name, FieldType| {
+                    if (!rehashDeepEqual(FieldType, @field(before, name), @field(after, name))) return false;
+                }
+                return true;
+            },
+            .array => |info| {
+                for (before, after) |a, b| {
+                    if (!rehashDeepEqual(info.child, a, b)) return false;
+                }
+                return true;
+            },
+            .@"union" => |info| {
+                if (info.tag_type == null) return false;
+                if (std.meta.activeTag(before) != std.meta.activeTag(after)) return false;
+                return switch (before) {
+                    inline else => |value, tag| rehashDeepEqual(@TypeOf(value), value, @field(after, @tagName(tag))),
+                };
+            },
+            else => return std.meta.eql(before, after),
+        }
     }
 
     fn liveListenerSet(self: *const LinuxServer) config_format.ListenerSet {
@@ -129387,6 +129455,244 @@ test "OCG2 REHASH reports every restart-only authority intent" {
     try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .enabled = true }));
     try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .projection_enabled = true }));
     try std.testing.expect(!LinuxServer.ocg2RehashHasUnsupportedRuntimeMode(.{ .minting_enabled = true }));
+}
+
+test "Windows REHASH proof admits only a safe per-IP clone cap projection" {
+    var boot = config_format.Config{};
+    boot.network.name = "Onyx";
+    boot.limits.max_clones_per_ip = 2;
+    boot.limits.num_shards = 2;
+    boot.listen.irc = 6680;
+    var same = boot;
+    same.network.name = "Onyx"[0..];
+    try std.testing.expect(LinuxServer.windowsRehashEligibleParsed(&boot, &same));
+
+    var live = same;
+    live.limits.max_clones_per_ip = 9;
+    try std.testing.expect(LinuxServer.windowsRehashEligibleParsed(&boot, &live));
+    try std.testing.expect(LinuxServer.windowsRehashIpCapSafe(2, 9));
+    try std.testing.expect(LinuxServer.windowsRehashIpCapSafe(2, 2));
+    try std.testing.expect(!LinuxServer.windowsRehashIpCapSafe(0, 9));
+    try std.testing.expect(!LinuxServer.windowsRehashIpCapSafe(9, 2));
+
+    var excluded = live;
+    excluded.limits.max_clones_per_net = 12;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &excluded));
+    excluded = live;
+    excluded.limits.max_clones_per_ip_net = 7;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &excluded));
+    excluded = live;
+    excluded.limits.throttle_connects = 5;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &excluded));
+    excluded = live;
+    excluded.limits.throttle_window_ms = 20_000;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &excluded));
+    excluded = live;
+    excluded.limits.nick_delay_ms = 3_000;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &excluded));
+    excluded = live;
+    excluded.limits.raid_joins = 4;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &excluded));
+    excluded = live;
+    excluded.limits.raid_window_ms = 30_000;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &excluded));
+
+    var restart_only = live;
+    restart_only.limits.num_shards = 3;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &restart_only));
+    restart_only = live;
+    restart_only.listen.irc = 6681;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &restart_only));
+    restart_only = live;
+    var changed_opers = [_]config_format.Config.Oper{.{ .account = "a", .class = "network" }};
+    restart_only.opers = &changed_opers;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &restart_only));
+    restart_only = live;
+    restart_only.tls.enabled = true;
+    try std.testing.expect(!LinuxServer.windowsRehashEligibleParsed(&boot, &restart_only));
+}
+
+test "Windows REHASH advances proven clone cap and permanently disqualifies later static drift" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const boot_text = "[node]\nid = 1\n[listen]\nirc = 6680\n[limits]\nmax_clones_per_ip = 2\n";
+    const live_text = "[node]\nid = 1\n[listen]\nirc = 6680\n[limits]\nmax_clones_per_ip = 9\n";
+    const static_text = "[node]\nid = 1\n[listen]\nirc = 6681\n[limits]\nmax_clones_per_ip = 11\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash.toml", .data = boot_text });
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/rehash.toml", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, path, allocator);
+    defer allocator.free(canonical);
+    var source_proof = try native_windows_config_proof.Builder.initCanonical(canonical, boot_text);
+    const boot_source = try source_proof.finish();
+    var boot = try config_format.parseToml(allocator, boot_text, .{});
+    defer boot.deinit(allocator);
+
+    var server = try Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const material: [32]u8 = @splat(0x71);
+    const Hooks = struct {
+        digest: [32]u8,
+        sets: usize = 0,
+        fn begin(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.Unused;
+        }
+        fn transfer(_: *anyopaque, _: NativeUpgradeSnapshot) anyerror!noreturn {
+            return error.Unused;
+        }
+        fn abort(_: *anyopaque) void {}
+        fn set(ctx: *anyopaque, digest: [32]u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.digest = digest;
+            self.sets += 1;
+        }
+    };
+    var legacy = native_windows_config_proof.EffectiveBuilder.init(boot_source);
+    const legacy_effective = try legacy.finish();
+    var hooks = Hooks{ .digest = legacy_effective };
+    server.config.config_path = path;
+    server.config.crypto_io = std.testing.io;
+    server.config.max_clones_per_ip = 2;
+    server.clone_limit.config.max_per_ip = 2;
+    server.config.windows_helix_raw_source_digest = boot_source;
+    server.config.windows_helix_source_digest = hooks.digest;
+    server.config.windows_helix_static_material_digest = material;
+    server.config.windows_helix_boot_parsed = &boot;
+    server.config.native_upgrade_hooks = .{
+        .ctx = &hooks,
+        .begin = Hooks.begin,
+        .transferAndCommit = Hooks.transfer,
+        .abort = Hooks.abort,
+        .setSourceDigest = Hooks.set,
+    };
+    server.windows_helix_source_valid.store(true, .release);
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.send_armed = true;
+    defer {
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(allocator);
+        if (server.rx().clients.get(id)) |live| {
+            live.send_armed = false;
+            _ = server.rx().clients.free(id);
+        }
+    }
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_rehash});
+    try conn.session.setNick("oper");
+
+    try server.handleRehash(conn);
+    try std.testing.expect(server.windows_helix_source_valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), hooks.sets);
+    try std.testing.expectEqual(legacy_effective, server.config.windows_helix_source_digest.?);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash.toml", .data = live_text });
+    try server.handleRehash(conn);
+    try std.testing.expectEqual(@as(u32, 9), server.config.max_clones_per_ip);
+    try std.testing.expect(server.windows_helix_source_valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), hooks.sets);
+    try std.testing.expectEqual(hooks.digest, server.config.windows_helix_source_digest.?);
+    try std.testing.expect(!std.mem.eql(u8, &boot_source, &server.config.windows_helix_raw_source_digest.?));
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash.toml", .data = static_text });
+    try server.handleRehash(conn);
+    try std.testing.expectEqual(@as(u32, 11), server.config.max_clones_per_ip);
+    try std.testing.expect(!server.windows_helix_source_valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), hooks.sets);
+    try std.testing.expectEqual(hooks.digest, server.config.windows_helix_source_digest.?);
+
+    // Once an earlier partial REHASH has disqualified the source, a later
+    // matching file must not silently reauthorize the already-diverged runtime.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash.toml", .data = live_text });
+    try server.handleRehash(conn);
+    try std.testing.expect(!server.windows_helix_source_valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), hooks.sets);
+}
+
+test "Windows REHASH failed TLS reload keeps a live limit but refuses proof advance" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const common = "[node]\nid = 1\n[listen]\nirc = 6680\n[tls]\nenabled = true\ncert_path = \"missing-leaf.pem\"\nkey_path = \"missing-key.pem\"\n[limits]\n";
+    const boot_text = common ++ "max_clones_per_ip = 2\n";
+    const live_text = common ++ "max_clones_per_ip = 9\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash.toml", .data = boot_text });
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/rehash.toml", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, path, allocator);
+    defer allocator.free(canonical);
+    var proof = try native_windows_config_proof.Builder.initCanonical(canonical, boot_text);
+    const boot_source = try proof.finish();
+    var boot = try config_format.parseToml(allocator, boot_text, .{});
+    defer boot.deinit(allocator);
+
+    var server = try Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const Hooks = struct {
+        sets: usize = 0,
+        fn begin(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.Unused;
+        }
+        fn transfer(_: *anyopaque, _: NativeUpgradeSnapshot) anyerror!noreturn {
+            return error.Unused;
+        }
+        fn abort(_: *anyopaque) void {}
+        fn set(ctx: *anyopaque, _: [32]u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.sets += 1;
+        }
+    };
+    var hooks = Hooks{};
+    server.config.config_path = path;
+    server.config.crypto_io = std.testing.io;
+    server.config.max_clones_per_ip = 2;
+    server.clone_limit.config.max_per_ip = 2;
+    server.config.tls_cert_chain = &.{"previous-serving-leaf"};
+    server.config.windows_helix_raw_source_digest = boot_source;
+    server.config.windows_helix_static_material_digest = @splat(0x31);
+    server.config.windows_helix_boot_parsed = &boot;
+    server.config.native_upgrade_hooks = .{
+        .ctx = &hooks,
+        .begin = Hooks.begin,
+        .transferAndCommit = Hooks.transfer,
+        .abort = Hooks.abort,
+        .setSourceDigest = Hooks.set,
+    };
+    server.windows_helix_source_valid.store(true, .release);
+
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.send_armed = true;
+    defer {
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(allocator);
+        if (server.rx().clients.get(id)) |live| {
+            live.send_armed = false;
+            _ = server.rx().clients.free(id);
+        }
+    }
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_rehash});
+    try conn.session.setNick("oper");
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash.toml", .data = live_text });
+    try server.handleRehash(conn);
+    try std.testing.expectEqual(@as(u32, 9), server.config.max_clones_per_ip);
+    try std.testing.expect(!server.windows_helix_source_valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), hooks.sets);
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "TLS cert reload failed") != null);
 }
 
 test "OCG2 server runtime is inert by default and reactor zero owns terminal cadence" {
