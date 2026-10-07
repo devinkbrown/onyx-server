@@ -7,6 +7,7 @@
 //! descriptor custody during future Helix transfer; this leaf has no hot-adopt
 //! constructor yet. All mutations require one external owner lock.
 const std = @import("std");
+const target = @import("builtin");
 const persistence = @import("store.zig");
 const sign = @import("../crypto/sign.zig");
 const presence = @import("../proto/mesh_presence.zig");
@@ -66,10 +67,37 @@ fn digest(original: []const u8) [32]u8 {
 pub fn acquireLease(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
     const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
     defer allocator.free(lock_path);
-    const file = try dir.createFile(io, lock_path, .{ .read = true, .truncate = false, .permissions = permissions });
+    const file = if (comptime target.os.tag == .windows)
+        dir.createFile(io, lock_path, .{ .read = true, .truncate = false, .exclusive = true, .permissions = permissions }) catch |err| switch (err) {
+            error.PathAlreadyExists => blk: {
+                var opened = try dir.openFile(io, lock_path, .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false });
+                // Zig's no-follow Windows open uses NT asynchronous I/O, but
+                // reports blocking flags. Keep positional writes/sync honest.
+                opened.flags.nonblocking = true;
+                break :blk opened;
+            },
+            else => return err,
+        }
+    else
+        try dir.createFile(io, lock_path, .{ .read = true, .truncate = false, .permissions = permissions });
     errdefer file.close(io);
     if ((try file.stat(io)).kind != .file) return error.InvalidState;
+    if (comptime target.os.tag == .windows) _ = try @import("mesh_presence_lease.zig").statRegular(file.handle);
     if (!try file.tryLock(io, .exclusive)) return error.WouldBlock;
+    if (comptime target.os.tag == .windows) {
+        const lease = @import("mesh_presence_lease.zig");
+        const identity = try lease.statRegular(file.handle);
+        const configured = try dir.openFile(io, lock_path, .{ .mode = .read_only, .follow_symlinks = false, .allow_directory = false });
+        defer configured.close(io);
+        if (!std.meta.eql(identity, try lease.statRegular(configured.handle))) return error.IdentityMismatch;
+        // Windows byte-range custody validation must read within the locked
+        // range. Preserve an existing lock-file byte; initialize an empty file
+        // only after this handle owns the lock.
+        if ((try file.stat(io)).size == 0) {
+            try file.writePositionalAll(io, "L", 0);
+            try file.sync(io);
+        }
+    }
     return file;
 }
 
