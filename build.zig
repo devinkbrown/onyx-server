@@ -1238,6 +1238,20 @@ pub fn build(b: *std.Build) void {
     const windows_helix_early_client_step = b.step("windows-helix-early-client", "Build the native Zig TLS 0-RTT smoke client");
     windows_helix_early_client_step.dependOn(&b.addInstallArtifact(windows_helix_early_client, .{}).step);
 
+    const windows_ocsp_client = b.addExecutable(.{
+        .name = "windows-ocsp-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/windows_ocsp_client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
+        }),
+    });
+    if (windows_self_hosted) windows_ocsp_client.use_llvm = false;
+    const windows_ocsp_client_step = b.step("windows-ocsp-client", "Build the native Zig OCSP staple smoke client");
+    windows_ocsp_client_step.dependOn(&b.addInstallArtifact(windows_ocsp_client, .{}).step);
+
     const windows_mail_relay = b.addExecutable(.{
         .name = "windows-mail-relay",
         .root_module = b.createModule(.{

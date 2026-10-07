@@ -146,6 +146,8 @@ jobs:
         run: zig build -j1 test-cli -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
       - name: Run native full-daemon IRC, TLS, WSS, metrics, and webhook smoke
         run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --wss --metrics --webhook
+      - name: Run shared IRC runtime contract on native Windows
+        run: python -B .\tools\runtime_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run shipped Windows quickstart smoke
         run: python -B .\tools\windows_quickstart_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native plaintext WebSocket smoke
@@ -233,6 +235,10 @@ jobs:
         run: python -B .\tools\windows_ocg2_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native ACME and OCSP worker smoke
         run: python -B .\tools\windows_tls_companion_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Build native Windows OCSP handshake client
+        run: zig build -j1 windows-ocsp-client -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+      - name: Run live Windows OCSP fetch and stapling smoke
+        run: python -B .\tools\windows_ocsp_live_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native OroWasm plugin command smoke
         run: python -B .\tools\windows_wasm_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Build pure Zig Windows SMTP relay fixture

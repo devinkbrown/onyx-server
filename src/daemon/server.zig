@@ -58799,9 +58799,9 @@ pub const LinuxServer = struct {
         return false;
     }
 
-    /// Deliver a reassembled multiline message: split the joined value on the
-    /// inter-chunk newline and emit each segment as an individual PRIVMSG/NOTICE
-    /// (server-side splitting is spec-permitted for any recipient).
+    /// Deliver a reassembled multiline message as the existing per-newline
+    /// PRIVMSG/NOTICE events. Reject an overlong concatenated segment before
+    /// any event is minted: outbound multiline BATCH fan-out is not implemented.
     fn deliverMultiline(
         self: *LinuxServer,
         id: client_model.ClientId,
@@ -58815,10 +58815,19 @@ pub const LinuxServer = struct {
         const is_notice = command == .notice;
         if (!try self.messageContentGates(id, conn, cmd, target, value, is_notice)) return;
 
+        const budget = (try ordinaryMessageTextBudget(conn, cmd, target)) orelse {
+            try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Multiline target exceeds the IRC line limit");
+            return;
+        };
         var it = std.mem.splitScalar(u8, value, '\n');
         while (it.next()) |segment| {
-            try self.messageOne(id, conn, cmd, target, segment, null);
+            if (segment.len > budget) {
+                try self.failReply(conn, "BATCH", "MULTILINE_INVALID", "Multiline segment exceeds the IRC line limit");
+                return;
+            }
         }
+        var deliver_it = std.mem.splitScalar(u8, value, '\n');
+        while (deliver_it.next()) |segment| try self.messageOneLong(id, conn, cmd, target, segment, null);
     }
 
     /// Free and clear a connection's open multiline batch state, if any.
@@ -58830,7 +58839,49 @@ pub const LinuxServer = struct {
         }
     }
 
+    /// The ordinary IRC message limit includes the server-added source prefix
+    /// and CRLF. Bound the text before minting an event identity so live
+    /// delivery, history, and mesh forwarding all contain the same UTF-8 text.
+    /// Room envelopes have their own explicit 4096-byte Onyx capability bound.
     fn messageOne(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        command: []const u8,
+        target: []const u8,
+        text: []const u8,
+        client_tags: ?[]const u8,
+    ) !void {
+        const room_target = if (target.len >= 2 and statusPrefixRank(target[0]) > 0 and
+            world_model.isChannelName(target[1..])) target[1..] else target;
+        if (world_model.isChannelName(room_target) and
+            self.channelEncryptionPolicy(room_target) == .required and
+            e2ee_policy.requiredEncryptedTagPresent(client_tags) and
+            e2ee_policy.isCanonicalRoomEnvelope(text))
+            return self.messageOneLong(id, conn, command, target, text, client_tags);
+
+        const budget = (try ordinaryMessageTextBudget(conn, command, target)) orelse {
+            if (!std.ascii.eqlIgnoreCase(command, "NOTICE"))
+                try self.failReply(conn, command, "INPUT_TOO_LONG", "Message target leaves no room for text");
+            return;
+        };
+        const bounded_text = utf8PrefixWithin(text, budget);
+        if (bounded_text.len == 0) {
+            if (!std.ascii.eqlIgnoreCase(command, "NOTICE"))
+                try self.failReply(conn, command, "INPUT_TOO_LONG", "Message text does not fit in an IRC line");
+            return;
+        }
+        return self.messageOneLong(id, conn, command, target, bounded_text, client_tags);
+    }
+
+    fn ordinaryMessageTextBudget(conn: *ConnState, command: []const u8, target: []const u8) ServerError!?usize {
+        var prefix_buf: [320]u8 = undefined;
+        const prefix = try clientPrefix(conn, &prefix_buf);
+        const fixed_bytes = 1 + prefix.len + 1 + command.len + 1 + target.len + 2 + 2;
+        return if (fixed_bytes <= 512) 512 - fixed_bytes else null;
+    }
+
+    fn messageOneLong(
         self: *LinuxServer,
         id: client_model.ClientId,
         conn: *ConnState,
@@ -71137,6 +71188,20 @@ fn formatMessage(
     }
     try out.append("\r\n");
     return out.written();
+}
+
+/// Return the longest prefix within the byte budget without ending inside a
+/// UTF-8 codepoint. Callers validate the whole text before this helper.
+fn utf8PrefixWithin(text: []const u8, max_bytes: usize) []const u8 {
+    var end = @min(text.len, max_bytes);
+    while (end < text.len and end > 0 and (text[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return text[0..end];
+}
+
+test "UTF-8 IRC line budget ends before a split codepoint" {
+    try std.testing.expectEqualStrings("a", utf8PrefixWithin("aéz", 2));
+    try std.testing.expectEqualStrings("aé", utf8PrefixWithin("aéz", 3));
+    try std.testing.expectEqualStrings("aéz", utf8PrefixWithin("aéz", 8));
 }
 
 /// RFC-ish nick validation: 1..64 bytes, no space/comma/'*'/'?'/'!'/'@'/'.' and
@@ -90163,6 +90228,55 @@ fn testMaxRoomEnvelope(out: []u8) []const u8 {
     return out[0..need];
 }
 
+test "required E2EE room alone exempts its tagged envelope from the ordinary IRC line limit" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const alice_id = try addTestLocalClient(&server, "alice", null);
+    const bob_id = try addTestLocalClient(&server, "bob", null);
+    const alice = server.connFor(alice_id).?;
+    const bob = server.connFor(bob_id).?;
+    alice.session.addCap(.onyx_e2ee);
+    bob.session.addCap(.onyx_e2ee);
+    var envelope_buf: [e2ee_policy.max_room_envelope_wire_len]u8 = undefined;
+    const envelope = testMaxRoomEnvelope(&envelope_buf);
+    const tags = "+onyx/e2ee=mls";
+
+    // A syntactically valid encrypted envelope does not extend a nick's line.
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "bob", envelope, tags);
+    try std.testing.expectEqual(@as(usize, 512), bob.send_len);
+    try std.testing.expect(std.mem.startsWith(u8, bob.send_buf[0..bob.send_len], ":alice!"));
+    try std.testing.expect(std.mem.endsWith(u8, bob.send_buf[0..bob.send_len], "\r\n"));
+
+    _ = try server.world.join("#optional", worldIdFromClient(alice_id));
+    _ = try server.world.join("#optional", worldIdFromClient(bob_id));
+    const optional = ircx_prop_store.Entity{ .kind = .channel, .id = "#optional" };
+    _ = try server.props.setProp(optional, e2ee_policy.policy_prop, "optional", .{ .id = "op", .access = .owner });
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#optional", envelope, tags);
+    try std.testing.expectEqual(@as(usize, 512), bob.send_len);
+    var prefix_buf: [320]u8 = undefined;
+    const prefix = try clientPrefix(alice, &prefix_buf);
+    const ordinary_text_len = 512 - (1 + prefix.len + 1 + "PRIVMSG".len + 1 + "#optional".len + 2 + 2);
+    var history_buf: [1]lotus.Message = undefined;
+    const recorded = try server.history.latest("#optional", history_buf.len, &history_buf);
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    try std.testing.expectEqualStrings(envelope[0..ordinary_text_len], recorded[0].text);
+
+    _ = try server.world.join("#required", worldIdFromClient(alice_id));
+    _ = try server.world.join("#required", worldIdFromClient(bob_id));
+    const required = ircx_prop_store.Entity{ .kind = .channel, .id = "#required" };
+    _ = try server.props.setProp(required, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
+    resetTestSendQ(bob);
+    try server.messageOne(alice_id, alice, "PRIVMSG", "#required", envelope, tags);
+    try std.testing.expect(bob.send_len > 512);
+    try expectContains(bob.send_buf[0..bob.send_len], envelope);
+}
+
 test "E2EEPOLICYBODY required rooms reject tagged plaintext locally and on mesh" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -94704,6 +94818,98 @@ test "threaded server: real end-to-end registration, JOIN, PRIVMSG (T1)" {
     try writeAllFd(fd_a, "PRIVMSG #x :hi\r\n");
     // Real username (alice) now flows through (not the old "user" placeholder).
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #x :hi\r\n", 200);
+}
+
+test "threaded server: ordinary PRIVMSG and NOTICE fit the recipient line with UTF-8 and stable history" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    const thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "CAP REQ :echo-message message-tags\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try writeAllFd(fd_b, "CAP REQ :draft/chathistory batch message-tags\r\nNICK B\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+
+    const direct_head = ":A!alice@localhost PRIVMSG B :";
+    const direct_budget = 512 - direct_head.len - 2;
+    const input_text_len = 510 - "PRIVMSG B :".len;
+    try std.testing.expect(input_text_len > direct_budget + 2);
+    var input_text: [input_text_len]u8 = @splat('x');
+    var input_line: [512]u8 = undefined;
+    const direct_input = try std.fmt.bufPrint(&input_line, "PRIVMSG B :{s}\r\n", .{&input_text});
+    try std.testing.expectEqual(@as(usize, 512), direct_input.len);
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, direct_input);
+    var expected: [512]u8 = undefined;
+    const direct_out = try std.fmt.bufPrint(&expected, "{s}{s}\r\n", .{ direct_head, input_text[0..direct_budget] });
+    try std.testing.expectEqual(@as(usize, 512), direct_out.len);
+    try recvUntil(&b, direct_out, 200);
+    try recvUntil(&a, direct_out, 200);
+
+    // The cut lands on the first byte of a two-byte codepoint. Both recipients
+    // see the same valid prefix and no partial UTF-8 sequence.
+    @memset(input_text[0 .. direct_budget - 1], 'a');
+    @memcpy(input_text[direct_budget - 1 .. direct_budget + 1], "é");
+    @memset(input_text[direct_budget + 1 ..], 'b');
+    const utf8_input = try std.fmt.bufPrint(&input_line, "PRIVMSG B :{s}\r\n", .{&input_text});
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, utf8_input);
+    const utf8_out = try std.fmt.bufPrint(&expected, "{s}{s}\r\n", .{ direct_head, input_text[0 .. direct_budget - 1] });
+    try recvUntil(&b, utf8_out, 200);
+    try recvUntil(&a, utf8_out, 200);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(b.written()));
+
+    // NOTICE shares the same authored-message path and remains silent on errors.
+    @memset(&input_text, 'n');
+    const notice_input = try std.fmt.bufPrint(&input_line, "NOTICE B :{s}\r\n", .{&input_text});
+    const notice_head = ":A!alice@localhost NOTICE B :";
+    const notice_budget = 512 - notice_head.len - 2;
+    b.reset();
+    try writeAllFd(fd_a, notice_input);
+    const notice_out = try std.fmt.bufPrint(&expected, "{s}{s}\r\n", .{ notice_head, input_text[0..notice_budget] });
+    try recvUntil(&b, notice_out, 200);
+    try std.testing.expectEqual(@as(usize, 512), notice_out.len);
+
+    try writeAllFd(fd_a, "JOIN #x\r\n");
+    try recvUntil(&a, " 366 A #x ", 200);
+    try writeAllFd(fd_b, "JOIN #x\r\n");
+    try recvUntil(&b, " 366 B #x ", 200);
+    const channel_head = ":A!alice@localhost PRIVMSG #x :";
+    const channel_budget = 512 - channel_head.len - 2;
+    @memset(&input_text, 'c');
+    const channel_input = try std.fmt.bufPrint(&input_line, "PRIVMSG #x :{s}\r\n", .{input_text[0 .. 510 - "PRIVMSG #x :".len]});
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, channel_input);
+    const channel_out = try std.fmt.bufPrint(&expected, "{s}{s}\r\n", .{ channel_head, input_text[0..channel_budget] });
+    try recvUntil(&b, channel_out, 200);
+    try std.testing.expectEqual(@as(usize, 512), channel_out.len);
+    const live_id = extractMsgid(b.written()) orelse return error.TestExpectedEqual;
+    var id_copy: [msgid_mod.id_len]u8 = undefined;
+    @memcpy(id_copy[0..live_id.len], live_id);
+    b.reset();
+    try writeAllFd(fd_b, "CHATHISTORY LATEST #x * 1\r\n");
+    try recvUntil(&b, channel_out, 200);
+    try expectContains(b.written(), id_copy[0..live_id.len]);
 }
 
 test "threaded server: CERTLIST and CERTDEL use authenticated account bindings" {
@@ -102316,6 +102522,53 @@ test "threaded server: draft/multiline batch reassembles + splits to recipient" 
         "BATCH -z\r\n");
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line1more\r\n", 200);
     try recvUntil(&b, ":A!alice@localhost PRIVMSG #m :Line2\r\n", 200);
+}
+
+test "threaded server: overlong multiline concat rejects before delivery and history" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    const thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+    try writeAllFd(fd_a, "CAP REQ :draft/multiline standard-replies\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_a, "JOIN #m\r\n");
+    try recvUntil(&a, " 366 A #m ", 200);
+    try writeAllFd(fd_b, "JOIN #m\r\n");
+    try recvUntil(&b, " 366 B #m ", 200);
+
+    const first: [300]u8 = @splat('a');
+    const second: [300]u8 = @splat('b');
+    var line_buf: [512]u8 = undefined;
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "BATCH +z draft/multiline #m\r\n");
+    try writeAllFd(fd_a, try std.fmt.bufPrint(&line_buf, "@batch=z PRIVMSG #m :{s}\r\n", .{&first}));
+    try writeAllFd(fd_a, try std.fmt.bufPrint(&line_buf, "@batch=z;draft/multiline-concat PRIVMSG #m :{s}\r\n", .{&second}));
+    try writeAllFd(fd_a, "BATCH -z\r\n");
+    try recvUntil(&a, "FAIL BATCH MULTILINE_INVALID", 200);
+    try writeAllFd(fd_b, "PING :multiline-barrier\r\n");
+    try recvUntil(&b, "PONG onyx.local :multiline-barrier", 200);
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "PRIVMSG #m") == null);
+    var history_buf: [1]lotus.Message = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try server.history.latest("#m", history_buf.len, &history_buf)).len);
 }
 
 test "threaded server: draft/multiline CAP value follows runtime config" {

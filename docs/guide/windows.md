@@ -568,6 +568,7 @@ python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --w
 python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --proxy
 python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --accounts
 python -B .\tools\windows_stats_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\runtime_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
@@ -602,6 +603,8 @@ python -B .\tools\windows_backup_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webpush_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_ocg2_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_tls_companion_smoke.py .\zig-out\bin\onyx-server.exe
+zig build -j1 windows-ocsp-client -Dtarget=x86_64-windows -Dwindows-self-hosted=true
+python -B .\tools\windows_ocsp_live_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_wasm_smoke.py .\zig-out\bin\onyx-server.exe
 zig build -j1 windows-mail-relay -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 python -B .\tools\windows_mail_smoke.py .\zig-out\bin\onyx-server.exe
@@ -626,12 +629,13 @@ command checks TLS, WSS, metrics, and webhook together; the second checks
 testing-only plaintext WebSocket without TLS; the third checks trusted PROXY
 protocol and header refusal; the fourth checks durable accounts and TLS SASL
 PLAIN; the fifth checks stats publication and cold-restart restore. The
-remaining commands probe STS, secured mesh, reusable sessions, guarded Helix
-swaps with OroWasm memory continuity, private backup and restore, Web Push,
-account token continuity, OCG2 authority restore, ACME/OCSP workers, and
-OroWasm plugin dispatch. Omit a flag to check a narrower configuration. A
-passing build check establishes only that the daemon type-checks for the
-Windows target.
+shared runtime smoke checks full Windows CAP/ISUPPORT, IRC message bounds,
+multiline refusal before delivery, and 140 concurrent clients. The remaining
+commands probe STS, secured mesh, reusable sessions, guarded Helix swaps with
+OroWasm memory continuity, private backup and restore, Web Push, account token
+continuity, OCG2 authority restore, ACME and OCSP workers, live OCSP stapling,
+and OroWasm plugin dispatch. Omit a flag to check a narrower configuration. A
+passing build check establishes only that the daemon type-checks for Windows.
 The startup-intent smoke verifies that invalid configured keys, trust bundles,
 and other security inputs fail preflight. It also verifies that occupied IRC,
 TLS, WebSocket, metrics, webhook, and media ports fail startup.
@@ -655,6 +659,7 @@ python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --w
 python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --proxy
 python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --accounts
 python -B .\tools\windows_stats_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\runtime_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
@@ -685,6 +690,8 @@ python -B .\tools\windows_backup_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_ocg2_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webpush_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_tls_companion_smoke.py .\zig-out\bin\onyx-server.exe
+zig build -j1 windows-ocsp-client -Dtarget=x86_64-windows -Dwindows-self-hosted=true
+python -B .\tools\windows_ocsp_live_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_wasm_smoke.py .\zig-out\bin\onyx-server.exe
 zig build -j1 windows-mail-relay -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 python -B .\tools\windows_mail_smoke.py .\zig-out\bin\onyx-server.exe

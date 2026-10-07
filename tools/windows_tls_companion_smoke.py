@@ -80,11 +80,11 @@ try {
 
 
 def config_text(irc_port, tls_port, challenge_port, *, key_path="keys-private/server.key",
-                ca_path="roots.pem", acme=True, ocsp=True):
+                ca_path="roots.pem", acme=True, ocsp=True, tls12=False):
     lines = [
         "[node]", "id = 1", "",
         "[listen]", f'host = "{HOST}"', f"irc = {irc_port}", "",
-        "[tls]", "enabled = true", f"port = {tls_port}",
+        "[tls]", "enabled = true", f"enable_tls12 = {'true' if tls12 else 'false'}", f"port = {tls_port}",
         'dns_name = "localhost"', 'cert_path = "leaf.pem"',
         f'key_path = "{key_path}"', "",
         "[acme]", f"enabled = {'true' if acme else 'false'}",

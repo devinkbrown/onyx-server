@@ -10,7 +10,9 @@ This one proves a COLD boot from a config file serves IRC end-to-end:
   * the daemon boots from a minimal temp config (TCP listener, ephemeral port),
   * a plain TCP client registers (NICK/USER) and gets RPL_WELCOME (001),
   * PING gets a PONG from the same image,
-  * three clients prove direct and channel delivery, NAMES, PART, and rejoin,
+  * three clients prove direct and channel delivery, bounded IRC lines,
+    NAMES, PART, and rejoin,
+  * Windows advertises the full IRCv3 CAP and ISUPPORT surface,
   * Windows keeps the first client responsive through 140 concurrent peers,
   * QUIT tears the clients down cleanly,
   * the daemon is stopped cleanly.
@@ -32,16 +34,13 @@ import time
 import traceback
 
 HOST = "127.0.0.1"
-# Ephemeral-range port distinct from upgrade_smoke.py's 16720 so the two can run
-# back-to-back without a TIME_WAIT collision.
-PORT = 16721
 NICK = "smoke"
+STATUS_PREFIXES = "~&@%+*!."
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BIN = os.path.join(ROOT, "zig-out", "bin", "onyx-server" + (".exe" if os.name == "nt" else ""))
 
 # Hard ceiling on the whole run so a wedged daemon never hangs CI.
 DEADLINE_S = 90.0
-BOOT_WAIT_S = 2.5
 _START = time.monotonic()
 
 
@@ -126,11 +125,18 @@ class IrcClient:
         return pong
 
 
-def connect():
-    timeout = remaining()
-    if timeout <= 0:
-        raise TimeoutError("runtime smoke deadline expired before connecting")
-    return socket.create_connection((HOST, PORT), timeout=min(4, timeout))
+def connect(port, process=None):
+    deadline = time.monotonic() + min(30 if process else 4, remaining())
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(f"daemon exited before IRC listener opened ({process.returncode})")
+        try:
+            return socket.create_connection((HOST, port), timeout=min(1, remaining()))
+        except OSError:
+            if process is None:
+                raise
+            time.sleep(0.05)
+    raise TimeoutError("IRC listener did not open before the smoke deadline")
 
 
 def cleanup(proc):
@@ -169,6 +175,9 @@ def main():
     if not os.path.exists(binary):
         fail(f"binary not found: {binary} (run `zig build` first)")
     binary = os.path.abspath(binary)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+        held.bind((HOST, 0))
+        port = held.getsockname()[1]
 
     # Minimal config: a single plaintext TCP listener on an ephemeral port. Bind
     # to loopback only so the smoke never exposes a port off-box. Mirrors the key
@@ -179,7 +188,7 @@ def main():
         with open(conf, "w", encoding="utf-8") as f:
             f.write(
                 "[node]\nid = 1\n"
-                f"[listen]\nhost = \"{HOST}\"\nirc = {PORT}\n"
+                f"[listen]\nhost = \"{HOST}\"\nirc = {port}\n"
             )
 
         proc = None
@@ -187,35 +196,34 @@ def main():
         try:
             with open(log, "w", encoding="utf-8") as log_file:
                 proc = subprocess.Popen([binary, conf], cwd=run_dir, stdout=log_file, stderr=subprocess.STDOUT)
-            time.sleep(BOOT_WAIT_S)
-            if proc.poll() is not None:
-                fail("daemon exited during boot", proc, log)
-            print(f"PASS: daemon booted from config (PID {proc.pid})")
-
             stage = "register first client"
-            with connect() as c_sock:
+            with connect(port, proc) as c_sock:
+                print(f"PASS: daemon booted from config (PID {proc.pid})")
                 c = IrcClient(c_sock)
                 if os.name == "nt":
-                    stage = "portable CAP policy"
+                    stage = "full Windows CAP policy"
                     c.send("CAP LS 302")
-                    advertised = c.until(" CAP * LS :")
-                    for unsupported in ("server-time", "draft/chathistory", "sasl", "message-tags"):
-                        if unsupported in advertised:
-                            raise AssertionError(f"portable server advertised {unsupported}: {advertised!r}")
-                    c.send("CAP REQ :server-time")
-                    c.until(" CAP * NAK :server-time")
+                    advertised = []
+                    while True:
+                        line = c.until(" CAP * LS ")
+                        advertised.extend(line.split(" :", 1)[-1].split())
+                        if " CAP * LS :" in line:
+                            break
+                    for required in ("server-time", "draft/chathistory", "message-tags"):
+                        if required not in advertised:
+                            raise AssertionError(f"full Windows server omitted {required}: {advertised!r}")
                     c.send("CAP END")
-                    print("PASS: native Windows CAP policy rejects unsupported extensions")
+                    print("PASS: native Windows advertises full IRCv3 CAP extensions")
                     stage = "register first client"
                 c.send(f"NICK {NICK}")
                 c.send(f"USER {NICK} 0 * :{NICK}")
                 c.until(" 001 ")
                 if os.name == "nt":
                     isupport = c.until(" 005 ")
-                    for unsupported in ("CHANMODES=", "MONITOR=", "CHATHISTORY="):
-                        if unsupported in isupport:
-                            raise AssertionError(f"portable ISUPPORT advertises {unsupported}: {isupport!r}")
-                    print("PASS: native Windows ISUPPORT matches portable commands")
+                    for required in ("CHANMODES=", "MONITOR=", "CHATHISTORY="):
+                        if required not in isupport:
+                            raise AssertionError(f"full Windows server omitted {required}: {isupport!r}")
+                    print("PASS: native Windows advertises full IRC ISUPPORT")
                 print("PASS: first client registered (RPL_WELCOME 001)")
 
                 stage = "PING/PONG on first client"
@@ -226,7 +234,7 @@ def main():
                 print("PASS: PING answered with matching PONG")
 
                 stage = "register second client"
-                with connect() as peer_sock:
+                with connect(port) as peer_sock:
                     peer = IrcClient(peer_sock)
                     peer_nick = NICK + "2"
                     peer.send(f"NICK {peer_nick}")
@@ -234,7 +242,7 @@ def main():
                     peer.until(" 001 ")
 
                     stage = "register third client"
-                    with connect() as outsider_sock:
+                    with connect(port) as outsider_sock:
                         outsider = IrcClient(outsider_sock)
                         outsider_nick = NICK + "3"
                         outsider.send(f"NICK {outsider_nick}")
@@ -266,14 +274,14 @@ def main():
                         wire_text = "x" * (510 - len(f"PRIVMSG {peer_nick} :".encode()))
                         c.send(f"PRIVMSG {peer_nick} :{wire_text}")
                         delivered = peer.until("x" * 20)
-                        if len(delivered.encode()) + 2 > 512:
-                            raise AssertionError(f"direct message exceeded IRC wire limit: {len(delivered.encode()) + 2}")
+                        if len(delivered.encode()) + 2 != 512 or not delivered.endswith("x" * 20):
+                            raise AssertionError(f"direct message did not fill the IRC wire limit: {len(delivered.encode()) + 2}")
                         print("PASS: nick PRIVMSG reached only its target")
 
                         stage = "channel outsider rejection"
                         denied = "runtime-outsider-denied"
                         outsider.send(f"PRIVMSG {channel} :{denied}")
-                        refusal = outsider.until(" 442 ")
+                        refusal = outsider.until(" 404 ")
                         if channel not in refusal:
                             raise AssertionError(f"outsider refusal lacks channel: {refusal!r}")
                         c.barrier_without(denied, "smoke-first-outsider-barrier")
@@ -289,8 +297,8 @@ def main():
                         wire_text = "y" * (510 - len(f"PRIVMSG {channel} :".encode()))
                         c.send(f"PRIVMSG {channel} :{wire_text}")
                         delivered = peer.until("y" * 20)
-                        if len(delivered.encode()) + 2 > 512:
-                            raise AssertionError(f"channel message exceeded IRC wire limit: {len(delivered.encode()) + 2}")
+                        if len(delivered.encode()) + 2 != 512 or not delivered.endswith("y" * 20):
+                            raise AssertionError(f"channel message did not fill the IRC wire limit: {len(delivered.encode()) + 2}")
                         outsider.barrier_without(message, "smoke-third-channel-barrier")
                         print("PASS: channel PRIVMSG reached member, not outsider")
 
@@ -298,7 +306,7 @@ def main():
                         peer.send(f"NAMES {channel}")
                         names = peer.until(" 353 ")
                         peer.until(" 366 ")
-                        roster = {name.lstrip("~&@%+").lower() for name in names.rsplit(" :", 1)[-1].split()}
+                        roster = {name.lstrip(STATUS_PREFIXES).lower() for name in names.rsplit(" :", 1)[-1].split()}
                         if roster != {NICK, peer_nick}:
                             raise AssertionError(f"wrong NAMES roster: {names!r}")
                         print("PASS: explicit NAMES reported current channel members")
@@ -312,12 +320,12 @@ def main():
                         c.send(f"NAMES {channel}")
                         names = c.until(" 353 ")
                         c.until(" 366 ")
-                        roster = {name.lstrip("~&@%+").lower() for name in names.rsplit(" :", 1)[-1].split()}
+                        roster = {name.lstrip(STATUS_PREFIXES).lower() for name in names.rsplit(" :", 1)[-1].split()}
                         if roster != {NICK}:
                             raise AssertionError(f"PART left stale NAMES member: {names!r}")
                         denied = "runtime-after-part-denied"
                         peer.send(f"PRIVMSG {channel} :{denied}")
-                        peer.until(" 442 ")
+                        peer.until(" 404 ")
                         c.barrier_without(denied, "smoke-first-part-barrier")
                         print("PASS: PART removed only the departing member")
 
@@ -359,7 +367,7 @@ def main():
                         recv_to_eof(outsider_sock, timeout=2.0)
 
                 stage = "abrupt disconnect fanout"
-                with connect() as abrupt_sock:
+                with connect(port) as abrupt_sock:
                     abrupt = IrcClient(abrupt_sock)
                     abrupt.send("NICK sudden")
                     abrupt.send("USER sudden 0 * :sudden")
@@ -367,10 +375,37 @@ def main():
                     abrupt.send(f"JOIN {channel}")
                     abrupt.until(" 366 ")
                     c.until(f" JOIN {channel}")
-                quit_other = c.until(" QUIT :Connection closed")
+                quit_other = c.until(" QUIT :")
                 if not quit_other.startswith(":sudden!"):
                     raise AssertionError(f"abrupt disconnect lacked QUIT fanout: {quit_other!r}")
                 print("PASS: abrupt disconnect emitted QUIT to shared peer")
+
+                if os.name == "nt":
+                    stage = "Windows multiline overlong concat refusal"
+                    with connect(port) as multiline_sock:
+                        multiline = IrcClient(multiline_sock)
+                        multiline.send("CAP REQ :draft/multiline standard-replies")
+                        multiline.until(" CAP * ACK :")
+                        multiline.send("CAP END")
+                        multiline.send("NICK multiline")
+                        multiline.send("USER multiline 0 * :multiline")
+                        multiline.until(" 001 ")
+                        multiline.send(f"JOIN {channel}")
+                        multiline.until(" 366 ")
+                        c.until(f" JOIN {channel}")
+                        multiline.send(f"BATCH +z draft/multiline {channel}")
+                        multiline.send(f"@batch=z PRIVMSG {channel} :{'a' * 300}")
+                        multiline.send(f"@batch=z;draft/multiline-concat PRIVMSG {channel} :{'b' * 300}")
+                        multiline.send("BATCH -z")
+                        multiline.until("FAIL BATCH MULTILINE_INVALID")
+                        c.barrier_without("a" * 20, "smoke-multiline-first-barrier")
+                        c.barrier_without("b" * 20, "smoke-multiline-second-barrier")
+                        multiline.send("QUIT :bye")
+                        departed = c.until(" QUIT :bye")
+                        if not departed.startswith(":multiline!"):
+                            raise AssertionError(f"wrong multiline-client QUIT fanout: {departed!r}")
+                        recv_to_eof(multiline_sock, timeout=2.0)
+                    print("PASS: oversized multiline concat was refused before delivery")
 
                 stage = "large NAMES roster"
                 roster_channel = "#smoke-roster"
@@ -380,7 +415,7 @@ def main():
                 with ExitStack() as stack:
                     for i in range(40):
                         stage = f"large NAMES roster member {i}"
-                        sock = stack.enter_context(connect())
+                        sock = stack.enter_context(connect(port))
                         member = IrcClient(sock)
                         nick = f"roster{i:02d}" + "x" * 50
                         expected_roster.add(nick)
@@ -401,7 +436,7 @@ def main():
                         if len(line.encode("utf-8")) + 2 > 512:
                             raise AssertionError(f"oversized NAMES line: {line!r}")
                         names_lines += 1
-                        roster.update(line.rsplit(" :", 1)[-1].split())
+                        roster.update(name.lstrip(STATUS_PREFIXES) for name in line.rsplit(" :", 1)[-1].split())
                     if names_lines < 2 or roster != expected_roster:
                         raise AssertionError(f"incomplete NAMES roster: {names_lines} lines, {len(roster)} nicks")
                     c.send(f"PART {roster_channel} :done")
@@ -421,7 +456,7 @@ def main():
                         peers = []
                         for i in range(140):
                             stage = f"register concurrent Windows client {i + 1}/140"
-                            sock = stack.enter_context(connect())
+                            sock = stack.enter_context(connect(port))
                             member = IrcClient(sock)
                             peers.append((sock, member))
                             nick = f"concurrent{i:03d}"
