@@ -228,6 +228,8 @@ jobs:
         run: python -B .\tools\windows_geo_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native WebTransport browser IRC smoke
         run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run native QUIC, HTTP/3 and WebTransport debug-trace smoke
+        run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --debug-trace
       - name: Run native WebTransport two-swap Helix browser smoke
         run: python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native generated-certificate WebTransport Helix browser smoke

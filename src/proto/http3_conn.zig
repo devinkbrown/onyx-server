@@ -1668,19 +1668,22 @@ fn parseSizeQuery(query: []const u8) usize {
 }
 
 /// HTTP/3 interop tracing, gated on `ONYX_QUIC_DEBUG` (any non-empty value).
-/// Off by default; only read by interop triage. Linux-only (reads
-/// /proc/self/environ; no-libc Linux lacks std.posix.getenv / std.os.environ).
-var h3_dbg_enabled: ?bool = null;
+/// Off by default; only read by interop triage. Linux reads
+/// /proc/self/environ; Windows reads the native process environment.
+// 0 = unread, 1 = disabled, 2 = enabled; multiple reactor shards may log.
+var h3_dbg_enabled: std.atomic.Value(u8) = .init(0);
 fn h3Dbg(comptime fmt: []const u8, args: anytype) void {
-    const on = h3_dbg_enabled orelse blk: {
+    const cached = h3_dbg_enabled.load(.monotonic);
+    const on = if (cached == 0) blk: {
         const e = h3EnvFlagSet("ONYX_QUIC_DEBUG");
-        h3_dbg_enabled = e;
+        h3_dbg_enabled.store(if (e) 2 else 1, .monotonic);
         break :blk e;
-    };
+    } else cached == 2;
     if (!on) return;
     std.debug.print("[h3] " ++ fmt ++ "\n", args);
 }
-fn h3EnvFlagSet(name: []const u8) bool {
+fn h3EnvFlagSet(comptime name: []const u8) bool {
+    if (comptime @import("builtin").os.tag == .windows) return @import("../substrate/platform.zig").windowsEnvFlagSet(name);
     if (@import("builtin").os.tag != .linux) return false;
     const linux = std.os.linux;
     const rc = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);

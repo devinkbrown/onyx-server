@@ -212,6 +212,7 @@ def main():
     parser.add_argument("--chromium", type=Path, help="Chrome/Edge executable")
     parser.add_argument("--ipv6-irc", action="store_true", help="bind the IRC bridge on ::1 while WebTransport remains dual-stack")
     parser.add_argument("--irc-host", help="bind the IRC bridge to a specific local interface address")
+    parser.add_argument("--debug-trace", action="store_true", help="verify native Windows QUIC/HTTP3 diagnostic tracing")
     args = parser.parse_args()
     if args.ipv6_irc and args.irc_host:
         parser.error("choose --ipv6-irc or --irc-host")
@@ -246,9 +247,13 @@ def main():
         log = run_dir / "daemon.log"
         proc = None
         try:
+            daemon_env = os.environ.copy()
+            if args.debug_trace:
+                daemon_env["ONYX_QUIC_DEBUG"] = "1"
             with log.open("w", encoding="utf-8") as output:
                 proc = subprocess.Popen([str(binary), str(valid)], cwd=run_dir,
-                                        stdout=output, stderr=subprocess.STDOUT)
+                                        stdout=output, stderr=subprocess.STDOUT,
+                                        env=daemon_env)
                 wait_ready(proc, irc_port, log, irc_host)
                 with closing(socket.create_connection((irc_host, irc_port), timeout=3)) as sock:
                     observer = IrcObserver(sock)
@@ -276,6 +281,18 @@ def main():
                     )
                     if proc.poll() is not None:
                         raise AssertionError(f"daemon exited after browser session: {log.read_text(errors='replace')}")
+                    if args.debug_trace:
+                        expected = ("[quic-dbg]", "[quic-conn]", "[h3]")
+                        deadline = time.monotonic() + 5
+                        while True:
+                            trace = log.read_text(encoding="utf-8", errors="replace")
+                            missing = [marker for marker in expected if marker not in trace]
+                            if not missing:
+                                break
+                            if time.monotonic() >= deadline:
+                                raise AssertionError(f"Windows QUIC debug markers missing: {missing}; daemon log:\n{trace[-12000:]}")
+                            time.sleep(0.1)
+                        print("PASS: Windows QUIC, HTTP/3 and WebTransport diagnostic tracing enabled")
             print("PASS: Chrome/Edge WebTransport registered, joined, and delivered IRC PRIVMSG to a second client")
         finally:
             stop(proc)

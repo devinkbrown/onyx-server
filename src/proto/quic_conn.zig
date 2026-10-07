@@ -3424,23 +3424,24 @@ const PnDecodeCtx = struct {
 /// QUIC handshake/interop tracing, gated on `ONYX_QUIC_DEBUG` (any non-empty
 /// value). Off by default; only read by interop triage (`tools/quic_interop.sh`)
 /// and never on the normal data path beyond the cached env check.
-var conn_dbg_enabled: ?bool = null;
+// 0 = unread, 1 = disabled, 2 = enabled; multiple reactor shards may log.
+var conn_dbg_enabled: std.atomic.Value(u8) = .init(0);
 fn connDbgEnabled() bool {
-    return conn_dbg_enabled orelse blk: {
+    const cached = conn_dbg_enabled.load(.monotonic);
+    return if (cached == 0) blk: {
         const on = envFlagSet("ONYX_QUIC_DEBUG");
-        conn_dbg_enabled = on;
+        conn_dbg_enabled.store(if (on) 2 else 1, .monotonic);
         break :blk on;
-    };
+    } else cached == 2;
 }
 fn connDbg(comptime fmt: []const u8, args: anytype) void {
     if (!connDbgEnabled()) return;
     std.debug.print("[quic-conn] " ++ fmt ++ "\n", args);
 }
-/// Whether env var `name` is present and non-empty (reads /proc/self/environ;
-/// no-libc Linux has neither `std.posix.getenv` nor `std.os.environ`). On
-/// non-Linux targets tracing is simply unavailable (returns false) — it is a
-/// Linux-only interop-debug aid.
-fn envFlagSet(name: []const u8) bool {
+/// Whether env var `name` is present and non-empty. Linux reads
+/// /proc/self/environ; Windows reads the native process environment.
+fn envFlagSet(comptime name: []const u8) bool {
+    if (comptime @import("builtin").os.tag == .windows) return @import("../substrate/platform.zig").windowsEnvFlagSet(name);
     if (@import("builtin").os.tag != .linux) return false;
     const rc = std.os.linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
     const sfd: isize = @bitCast(rc);

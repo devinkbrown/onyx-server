@@ -1685,23 +1685,24 @@ fn nowNs() u64 {
 /// Off by default and zero-cost on the hot path beyond the env check; intended
 /// for `tools/quic_interop.sh` runs and field interop triage, never normal
 /// operation.
-var dbg_enabled: ?bool = null;
+// 0 = unread, 1 = disabled, 2 = enabled; multiple reactor shards may log.
+var dbg_enabled: std.atomic.Value(u8) = .init(0);
 fn dbg(comptime fmt: []const u8, args: anytype) void {
-    const on = dbg_enabled orelse blk: {
+    const cached = dbg_enabled.load(.monotonic);
+    const on = if (cached == 0) blk: {
         const enabled = envIsSet("ONYX_QUIC_DEBUG");
-        dbg_enabled = enabled;
+        dbg_enabled.store(if (enabled) 2 else 1, .monotonic);
         break :blk enabled;
-    };
+    } else cached == 2;
     if (!on) return;
     dlog.log("[quic-dbg] " ++ fmt ++ "\n", args);
 }
 
 /// Whether environment variable `name` is present and non-empty. Reads
-/// `/proc/self/environ` (NUL-separated `KEY=VALUE` records) via raw syscalls —
-/// Zig 0.16 dropped `std.posix.getenv`/`std.os.environ` on a no-libc Linux
-/// target, and this layer has no `std.process.Init.environ_map` handle.
-fn envIsSet(name: []const u8) bool {
-    if (comptime builtin.os.tag == .windows) return false;
+/// `/proc/self/environ` via raw syscalls on Linux and the native process
+/// environment on Windows. The no-libc Linux target has no getenv wrapper.
+fn envIsSet(comptime name: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) return @import("../substrate/platform.zig").windowsEnvFlagSet(name);
     if (comptime builtin.os.tag != .linux) {
         var key: [128:0]u8 = undefined;
         if (name.len >= key.len or std.mem.indexOfScalar(u8, name, 0) != null) return false;

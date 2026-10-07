@@ -23,6 +23,16 @@ extern "advapi32" fn SystemFunction036(buffer: [*]u8, length: u32) callconv(.win
 
 // Windows wall clock (std's kernel32 binding lacks this); declare the extern.
 extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
+extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, value: [*]u16, size: u32) callconv(.winapi) u32;
+extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) i32;
+
+/// A non-empty Windows process environment value enables a diagnostic flag.
+/// A one-code-unit buffer is enough: a longer value returns its required size.
+pub fn windowsEnvFlagSet(comptime name: []const u8) bool {
+    if (comptime os_tag != .windows) return false;
+    var value: [1]u16 = undefined;
+    return GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral(name), &value, value.len) != 0;
+}
 
 /// Monotonic clock in milliseconds. Never wall-clock; safe for intervals and
 /// timeouts across suspend. Sourced per-target so no `std.os.linux` leaks into
@@ -174,4 +184,19 @@ test "realtime clock is a plausible Unix-epoch millisecond value" {
     // After 2020-01-01 and before year ~2100.
     try std.testing.expect(ms > 1_577_836_800_000);
     try std.testing.expect(ms < 4_102_444_800_000);
+}
+
+test "Windows environment flag distinguishes absent, empty and non-empty values" {
+    if (comptime os_tag != .windows) return error.SkipZigTest;
+    const key = "ONYX_TEST_WINDOWS_ENV_FLAG_79ADDFAB";
+    const wide_key = std.unicode.utf8ToUtf16LeStringLiteral(key);
+    var previous: [1]u16 = undefined;
+    if (GetEnvironmentVariableW(wide_key, &previous, previous.len) != 0) return error.SkipZigTest;
+    defer _ = SetEnvironmentVariableW(wide_key, null);
+
+    try std.testing.expect(!windowsEnvFlagSet(key));
+    try std.testing.expect(SetEnvironmentVariableW(wide_key, std.unicode.utf8ToUtf16LeStringLiteral("enabled")) != 0);
+    try std.testing.expect(windowsEnvFlagSet(key));
+    try std.testing.expect(SetEnvironmentVariableW(wide_key, std.unicode.utf8ToUtf16LeStringLiteral("")) != 0);
+    try std.testing.expect(!windowsEnvFlagSet(key));
 }

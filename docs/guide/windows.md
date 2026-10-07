@@ -152,6 +152,9 @@ message to a plain IRC client; it also checks missing-TLS preflight and a held
 UDP port causing a fatal bind error. The bridge follows the IRC bind address,
 including IPv6 loopback and a specific local IPv4 address. This smoke needs
 PowerShell 7, Node.js, and Chrome or Edge.
+Set `ONYX_QUIC_DEBUG=1` in the daemon's environment to emit QUIC, HTTP/3,
+and WebTransport diagnostics. The `--debug-trace` smoke verifies all three
+streams during a browser session on Windows.
 On Windows, pathless TLS with WebTransport mints a seven-day P-256 bootstrap
 leaf with DNS and loopback SANs so a browser can use certificate-hash pinning.
 For a long-running public node, configure a managed certificate and key.
@@ -563,6 +566,7 @@ zig build -j1 windows-mail-relay -Dtarget=x86_64-windows -Dwindows-self-hosted=t
 python -B .\tools\windows_mail_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_geo_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --debug-trace
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --ipv6-irc
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --irc-host 127.0.0.2
 python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
@@ -644,6 +648,7 @@ zig build -j1 windows-mail-relay -Dtarget=x86_64-windows -Dwindows-self-hosted=t
 python -B .\tools\windows_mail_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_geo_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --debug-trace
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --ipv6-irc
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --irc-host 127.0.0.2
 python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
