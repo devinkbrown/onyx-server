@@ -412,6 +412,10 @@ configured ACME and OCSP schedulers; its generated variant preserves the same
 default and TLS 1.2 certificates through two swaps. The self-signed fixture
 has no issuer or AIA, so these smokes do not verify public ACME issuance or
 live OCSP DER publication.
+The native Windows OCSP test loads two PEM blocks of the same self-signed
+certificate, POSTs to a pure-Zig HTTPS responder, verifies a current signed
+response from that issuer, and checks the server's pending-staple handoff. It
+does not observe the reactor's TLS staple swap or a public responder.
 
 When `[wasm].plugin_dir` is configured, its mandatory checkpoint carries the
 authorized plugin source bytes, policy, registration order, mutable linear

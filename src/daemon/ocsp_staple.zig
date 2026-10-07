@@ -838,6 +838,215 @@ test "tls ocsp fetch uses the daemon trust store and a bad certificate keeps the
     std.debug.print("GAP-A8 branch=trust-store bad-cert=keep signature-fail=keep previous={s}\n", .{previous});
 }
 
+const WindowsOcspResponder = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const sol_socket: i32 = 0xffff;
+    const so_rcvtimeo: i32 = 0x1006;
+    const so_sndtimeo: i32 = 0x1005;
+    const FdSet = extern struct {
+        count: u32 = 1,
+        pad: u32 = 0,
+        sockets: [64]usize = @splat(0),
+    };
+    const Timeval = extern struct { seconds: i32, microseconds: i32 };
+
+    extern "ws2_32" fn accept(socket: usize, address: ?*anyopaque, address_len: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+    extern "ws2_32" fn select(nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, length: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, length: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, length: i32, flags: i32) callconv(.winapi) i32;
+
+    listener: usize,
+    cert: []const u8,
+    key: Ed25519.KeyPair,
+    request_der: []const u8,
+    response_der: []const u8,
+    request_seen: bool = false,
+    failure: ?anyerror = null,
+
+    fn run(self: *WindowsOcspResponder) void {
+        self.serve() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn serve(self: *WindowsOcspResponder) !void {
+        const tls_server = @import("../crypto/tls_server.zig");
+        const allocator = std.heap.page_allocator;
+        var readable = FdSet{};
+        readable.sockets[0] = self.listener;
+        var timeout = Timeval{ .seconds = 3, .microseconds = 0 };
+        if (select(0, &readable, null, null, &timeout) != 1) return error.TestUnexpectedResult;
+        const fd = accept(self.listener, null, null);
+        if (fd == invalid_socket) return error.TestUnexpectedResult;
+        defer _ = closesocket(fd);
+        var blocking: u32 = 0;
+        if (ioctlsocket(fd, 0x8004667e, &blocking) != 0) return error.TestUnexpectedResult;
+        const finite_ms: u32 = 3000;
+        if (setsockopt(fd, sol_socket, so_rcvtimeo, &finite_ms, @sizeOf(u32)) != 0 or
+            setsockopt(fd, sol_socket, so_sndtimeo, &finite_ms, @sizeOf(u32)) != 0)
+            return error.TestUnexpectedResult;
+
+        var tls = try tls_server.Server.init(allocator, .{ .cert_chain = &.{self.cert}, .signing_key = self.key });
+        defer tls.deinit();
+        var record_buf: [17 * 1024]u8 = undefined;
+        while (!tls.handshakeDone()) {
+            switch (try tls.feed(try readRecord(fd, &record_buf))) {
+                .bytes_to_send => |bytes| {
+                    defer allocator.free(bytes);
+                    try writeAll(fd, bytes);
+                },
+                .need_more => {},
+            }
+        }
+        const request = try tls.decrypt(try readRecord(fd, &record_buf));
+        defer allocator.free(request);
+        const separator = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return error.TestUnexpectedResult;
+        self.request_seen = std.mem.startsWith(u8, request, "POST /ocsp HTTP/1.1\r\n") and
+            std.mem.indexOf(u8, request[0..separator], "Content-Type: application/ocsp-request") != null and
+            std.mem.eql(u8, request[separator + 4 ..], self.request_der);
+        if (!self.request_seen) return error.TestUnexpectedResult;
+
+        const header = try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{self.response_der.len});
+        defer allocator.free(header);
+        const plain = try allocator.alloc(u8, header.len + self.response_der.len);
+        defer allocator.free(plain);
+        @memcpy(plain[0..header.len], header);
+        @memcpy(plain[header.len..], self.response_der);
+        const encrypted = try tls.encrypt(plain);
+        defer allocator.free(encrypted);
+        try writeAll(fd, encrypted);
+    }
+
+    fn readRecord(fd: usize, out: []u8) ![]u8 {
+        try readExact(fd, out[0..5]);
+        const length = 5 + @as(usize, std.mem.readInt(u16, out[3..5], .big));
+        if (length > out.len) return error.TestUnexpectedResult;
+        try readExact(fd, out[5..length]);
+        return out[0..length];
+    }
+
+    fn readExact(fd: usize, out: []u8) !void {
+        var off: usize = 0;
+        while (off < out.len) {
+            const n = recv(fd, out[off..].ptr, @intCast(out.len - off), 0);
+            if (n <= 0) return error.TestUnexpectedResult;
+            off += @intCast(n);
+        }
+    }
+
+    fn writeAll(fd: usize, bytes: []const u8) !void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = send(fd, bytes[off..].ptr, @intCast(bytes.len - off), 0);
+            if (n <= 0) return error.TestUnexpectedResult;
+            off += @intCast(n);
+        }
+    }
+};
+
+test "Windows OCSP service accepts current issuer-signed HTTPS response and hands off staple" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const asn1_time = @import("../proto/asn1_time.zig");
+    const metrics = @import("metrics_http.zig");
+    const pem = @import("../proto/pem.zig");
+    var snapshot = metrics.MetricsSnapshot.init(allocator);
+    defer snapshot.deinit();
+    // The metrics listener supplies a native Winsock loopback socket. Its
+    // normal metrics worker is not started; the responder above owns accepts.
+    var listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer listener.shutdown();
+
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(0x6c));
+    const now = @divFloor(platform.realtimeMillis(), 1000);
+    var cert_buf: [2048]u8 = undefined;
+    const aia = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/ocsp", .{listener.port});
+    defer allocator.free(aia);
+    const cert_der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "127.0.0.1",
+        .not_before = now - 3600,
+        .not_after = now + 86_400,
+        .serial = &.{ 0x6c, 0x01 },
+        .key_pair = key,
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = true,
+        .ocsp_url = aia,
+    });
+    const cert = try x509.parse(cert_der);
+    try std.testing.expectEqualStrings(aia, cert.aia_ocsp_url);
+    const identity: ocsp.CertIdInput = .{
+        .issuer_name_der = cert.subject_der,
+        .issuer_key_bytes = cert.subject_public_key,
+        .serial_der = cert.serial_der,
+    };
+    var produced_buf: [asn1_time.generalized_der_len]u8 = undefined;
+    var this_buf: [asn1_time.generalized_der_len]u8 = undefined;
+    var next_buf: [asn1_time.generalized_der_len]u8 = undefined;
+    const response = try ocsp.testSignedOcspResponseForCertIdAt(
+        allocator,
+        key,
+        identity,
+        .good,
+        (try asn1_time.encodeGeneralizedTime(&produced_buf, now - 60)).value,
+        (try asn1_time.encodeGeneralizedTime(&this_buf, now - 60)).value,
+        (try asn1_time.encodeGeneralizedTime(&next_buf, now + 3600)).value,
+    );
+    defer allocator.free(response);
+    // This small fixture uses the same self-signed cert as leaf and issuer. A
+    // two-block fullchain exercises the real on-disk chain loader and CertID.
+    const chain = [_][]const u8{ cert_der, cert_der };
+    try std.testing.expect(stapleServableForChain(response, &chain, now, 0));
+    const request_der = try ocsp.buildRequestForCerts(allocator, cert, cert);
+    defer allocator.free(request_der);
+    var pem_buf: [4096]u8 = undefined;
+    const block = try pem.encode(&pem_buf, "CERTIFICATE", cert_der);
+    const fullchain = try allocator.alloc(u8, block.len * 2);
+    defer allocator.free(fullchain);
+    @memcpy(fullchain[0..block.len], block);
+    @memcpy(fullchain[block.len..], block);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fullchain.pem", .data = fullchain });
+    const cert_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/fullchain.pem", .{tmp.sub_path});
+    defer allocator.free(cert_path);
+
+    var server = try server_mod.Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = key,
+    });
+    defer server.deinit();
+    const tls: config_format.Config.Tls = .{ .enabled = true, .cert_path = cert_path };
+    var service = Service.init(allocator, std.testing.io, &server, &tls, .{ .connect_timeout_ms = 2000, .recv_timeout_ms = 3000 });
+    service.trust_anchors = &.{cert_der};
+    var responder = WindowsOcspResponder{
+        .listener = listener.listen_fd,
+        .cert = cert_der,
+        .key = key,
+        .request_der = request_der,
+        .response_der = response,
+    };
+    const thread = try std.Thread.spawn(.{}, WindowsOcspResponder.run, .{&responder});
+    var joined = false;
+    defer if (!joined) thread.join();
+    service.checkOnce();
+    thread.join();
+    joined = true;
+    if (responder.failure) |err| return err;
+    try std.testing.expect(responder.request_seen);
+    try std.testing.expectEqual(@as(u32, 0), service.fail_count);
+    try std.testing.expectEqualSlices(u8, cert.serial_der, service.last_serial[0..service.last_serial_len]);
+    try std.testing.expect(service.next_refresh_unix > now);
+    try std.testing.expect(server.ocsp_staple_pending.load(.acquire));
+    try std.testing.expectEqualSlices(u8, response, server.ocsp_staple_incoming.?);
+    try std.testing.expect(server.ocsp_staple_incoming.?.ptr != response.ptr);
+}
+
 test "OCSP publication refuses missing issuer, malformed live leaf, and malformed response" {
     try std.testing.expect(!stapleServableForChain("der", &.{}, 1_700_000_000, 0));
     try std.testing.expect(!stapleServableForChain("der", &.{"leaf"}, 1_700_000_000, 0));

@@ -762,6 +762,7 @@ pub fn build(b: *std.Build) void {
             "Windows TLS ACME loopback issuance serves HTTP-01 and publishes a private matching key",
             "Windows ACME renewal worker starts and joins without a certificate path",
             "Windows OCSP worker starts and joins without a certificate path",
+            "Windows OCSP service accepts current issuer-signed HTTPS response and hands off staple",
             "webpush Windows VAPID key requires private parent and persists with private custody",
             "webpush Windows HTTPS delivers encrypted POST and records 201 and 410",
             "Windows OCG2AUTH cold boot and restart preserve private durable authority",

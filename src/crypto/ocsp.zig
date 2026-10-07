@@ -1208,6 +1208,25 @@ pub fn testSignedOcspResponseForCertId(
     return testSignedOcspResponseWithHashes(allocator, kp, identity.serial_der, status, next_update, &oid_sha1, &name_hash, &key_hash);
 }
 
+/// Test-only variant with caller-controlled signed times. Live service tests use
+/// this to keep the response inside the wall-clock freshness window without
+/// changing the fixed-time parser and signature vectors above.
+pub fn testSignedOcspResponseForCertIdAt(
+    allocator: std.mem.Allocator,
+    kp: Ed25519.KeyPair,
+    identity: CertIdInput,
+    status: CertStatus,
+    produced_at: []const u8,
+    this_update: []const u8,
+    next_update: ?[]const u8,
+) ![]u8 {
+    var name_hash: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(identity.issuer_name_der, &name_hash, .{});
+    var key_hash: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(identity.issuer_key_bytes, &key_hash, .{});
+    return testSignedOcspResponseWithHashesAt(allocator, kp, identity.serial_der, status, produced_at, this_update, next_update, &oid_sha1, &name_hash, &key_hash);
+}
+
 fn testSignedOcspResponseWithHashes(
     allocator: std.mem.Allocator,
     kp: Ed25519.KeyPair,
@@ -1218,10 +1237,30 @@ fn testSignedOcspResponseWithHashes(
     name_hash: []const u8,
     key_hash: []const u8,
 ) ![]u8 {
+    return testSignedOcspResponseWithHashesAt(allocator, kp, serial, status, "20260102030405Z", "20260102030405Z", next_update, hash_oid, name_hash, key_hash);
+}
+
+fn testSignedOcspResponseWithHashesAt(
+    allocator: std.mem.Allocator,
+    kp: Ed25519.KeyPair,
+    serial: []const u8,
+    status: CertStatus,
+    produced_at: []const u8,
+    this_update: []const u8,
+    next_update: ?[]const u8,
+    hash_oid: []const u8,
+    name_hash: []const u8,
+    key_hash: []const u8,
+) ![]u8 {
     var tbs_body: std.ArrayList(u8) = .empty;
     defer tbs_body.deinit(allocator);
-    try appendDerTlv(allocator, &tbs_body, Asn1Tag.context_2_primitive, &(@as([20]u8, @splat(0xA5))));
-    try appendDerTlv(allocator, &tbs_body, x509.Tag.generalized_time, "20260102030405Z");
+    const responder_key = kp.public_key.toBytes();
+    var responder_key_hash: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(&responder_key, &responder_key_hash, .{});
+    const responder_id = try ridByKeyExplicit(allocator, &responder_key_hash);
+    defer allocator.free(responder_id);
+    try tbs_body.appendSlice(allocator, responder_id);
+    try appendDerTlv(allocator, &tbs_body, x509.Tag.generalized_time, produced_at);
 
     var responses_body: std.ArrayList(u8) = .empty;
     defer responses_body.deinit(allocator);
@@ -1240,11 +1279,11 @@ fn testSignedOcspResponseWithHashes(
         .revoked => {
             var revoked_body: std.ArrayList(u8) = .empty;
             defer revoked_body.deinit(allocator);
-            try appendDerTlv(allocator, &revoked_body, x509.Tag.generalized_time, "20260102030405Z");
+            try appendDerTlv(allocator, &revoked_body, x509.Tag.generalized_time, this_update);
             try appendDerTlv(allocator, &single_body, x509.Tag.context_1_constructed, revoked_body.items);
         },
     }
-    try appendDerTlv(allocator, &single_body, x509.Tag.generalized_time, "20260102030405Z");
+    try appendDerTlv(allocator, &single_body, x509.Tag.generalized_time, this_update);
     if (next_update) |nu| {
         // nextUpdate is [0] EXPLICIT GeneralizedTime.
         var next_body: std.ArrayList(u8) = .empty;
