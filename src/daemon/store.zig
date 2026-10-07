@@ -2254,6 +2254,29 @@ const ColdFile = struct {
         self.file.close(io);
         allocator.free(self.bytes);
     }
+    fn pinDeleteShareWindows(self: *ColdFile, io: std.Io, parent: std.Io.Dir, name: []const u8) !void {
+        if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+        _ = try cold_runtime.requirePrivateDirectoryHandleWindows(parent);
+        const pinned = try openColdExisting(io, parent, name, .read_only_share_delete);
+        errdefer pinned.close(io);
+        if (!std.meta.eql(self.identity, try cold_identity.statRegular(pinned.handle)) or
+            (try pinned.stat(io)).size != self.bytes.len) return StoreError.SnapshotCoverageMismatch;
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        var scratch: [4096]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < self.bytes.len) {
+            const take = @min(scratch.len, self.bytes.len - offset);
+            if (try pinned.readPositionalAll(io, scratch[0..take], offset) != take or
+                !std.mem.eql(u8, scratch[0..take], self.bytes[offset..][0..take])) return StoreError.SnapshotCoverageMismatch;
+            hasher.update(scratch[0..take]);
+            offset += take;
+        }
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        if (!std.mem.eql(u8, &digest, &self.digest)) return StoreError.SnapshotCoverageMismatch;
+        self.file.close(io);
+        self.file = pinned;
+    }
     fn validate(self: *const ColdFile, io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
         const configured = try openColdExisting(io, dir, path, .read_only);
         defer configured.close(io);
@@ -2308,9 +2331,9 @@ const ColdPlan = struct {
         // corrupted/copy-edited generic token's store pointer.
         owner.discardActiveBatch();
         if (self.writer_owned) self.writer.close(io);
-        self.directory.close(io);
         if (self.wal_atomic) |*file| deinitColdAtomic(io, file, self.writer_identity);
         if (self.snapshot_atomic) |*file| deinitColdAtomic(io, file, self.snapshot_identity);
+        self.directory.close(io);
         if (self.snapshot_bytes) |bytes| allocator.free(bytes);
         if (self.complete_record) |bytes| allocator.free(bytes);
     }
@@ -2459,9 +2482,11 @@ pub const ColdRecoveryStage = struct {
     }
 
     fn prepareBatchMode(self: *ColdRecoveryStage, mutations: []const BatchMutation, complete_epoch: bool) !PreparedColdRecovery {
-        // Windows cold capture is read-only until transactional temporary-file
-        // publication and cleanup have their own platform custody proof.
-        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+        // Ordinary recovery can append after publication. Windows opens only
+        // the complete-epoch preparation lane until its two-file cut is proven.
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (!complete_epoch) return error.SkipZigTest;
+        }
         try self.validate();
         const owned = self.backing.?;
         const store = &owned.store;
@@ -2493,10 +2518,21 @@ pub const ColdRecoveryStage = struct {
         const directory = try coldOpenParent(store.io, store.dir, store.wal_path);
         errdefer directory.close(store.io);
         const directory_identity = try coldDirectoryIdentity(directory.handle);
+        if (comptime @import("builtin").os.tag == .windows) {
+            _ = try cold_runtime.requirePrivateDirectoryHandleWindows(.{ .handle = directory.handle });
+            try requireColdWriteThroughVolumeWindows(directory);
+            try validateColdParent(store.io, store.dir, store.wal_path, directory, directory_identity, null);
+            try owned.wal.pinDeleteShareWindows(store.io, .{ .handle = directory.handle }, std.fs.path.basename(store.wal_path));
+            if (owned.snapshot) |*file| try file.pinDeleteShareWindows(store.io, .{ .handle = directory.handle }, std.fs.path.basename(store.snapshot_path));
+            try self.validate();
+        }
         var snapshot_atomic: ?std.Io.File.Atomic = null;
         errdefer if (snapshot_atomic) |*file| deinitColdAtomic(store.io, file, null);
         if (snapshot_bytes) |bytes| {
-            snapshot_atomic = try store.dir.createFileAtomic(store.io, store.snapshot_path, .{ .replace = true });
+            snapshot_atomic = if (comptime @import("builtin").os.tag == .windows)
+                try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(store.io, std.fs.path.basename(store.snapshot_path), .{ .replace = true })
+            else
+                try store.dir.createFileAtomic(store.io, store.snapshot_path, .{ .replace = true });
             try makeColdAtomicReadable(store.io, &snapshot_atomic.?);
             try snapshot_atomic.?.file.writePositionalAll(store.io, bytes, 0);
             try snapshot_atomic.?.file.sync(store.io);
@@ -2504,19 +2540,26 @@ pub const ColdRecoveryStage = struct {
         var wal_atomic: ?std.Io.File.Atomic = null;
         errdefer if (wal_atomic) |*file| deinitColdAtomic(store.io, file, null);
         const writer: std.Io.File = if (rotate) block: {
-            wal_atomic = try store.dir.createFileAtomic(store.io, store.wal_path, .{ .replace = true });
+            wal_atomic = if (comptime @import("builtin").os.tag == .windows)
+                try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(store.io, std.fs.path.basename(store.wal_path), .{ .replace = true })
+            else
+                try store.dir.createFileAtomic(store.io, store.wal_path, .{ .replace = true });
             try makeColdAtomicReadable(store.io, &wal_atomic.?);
             try wal_atomic.?.file.writePositionalAll(store.io, &record, 0);
             if (complete_record) |bytes| try wal_atomic.?.file.writePositionalAll(store.io, bytes, cold_epoch_record_len);
             try wal_atomic.?.file.sync(store.io);
             // Atomic.replace closes its descriptor. Reserve a duplicate now;
             // the exact same replacement OFD receives the successor batch.
-            break :block .{ .handle = try cold_runtime.duplicate(wal_atomic.?.file.handle), .flags = wal_atomic.?.file.flags };
+            break :block if (comptime @import("builtin").os.tag == .windows)
+                try cold_runtime.duplicateFile(wal_atomic.?.file)
+            else
+                .{ .handle = try cold_runtime.duplicate(wal_atomic.?.file.handle), .flags = wal_atomic.?.file.flags };
         } else try openColdExisting(store.io, store.dir, store.wal_path, .read_write);
         errdefer writer.close(store.io);
         const writer_identity = try cold_identity.statRegular(writer.handle);
         if (!rotate and !std.meta.eql(writer_identity, owned.wal.identity)) return StoreError.SnapshotCoverageMismatch;
         owned.plan = .{ .batch = batch, .writer = writer, .writer_identity = writer_identity, .directory = directory, .directory_identity = directory_identity, .wal_atomic = wal_atomic, .snapshot_atomic = snapshot_atomic, .snapshot_bytes = snapshot_bytes, .snapshot_identity = if (snapshot_atomic) |file| try cold_identity.statRegular(file.file.handle) else null, .epoch = record, .coverage = coverage, .rotate = rotate, .complete_epoch = complete_epoch, .complete_record = complete_record };
+        errdefer owned.plan = null;
         owned.plan.?.prepared_digest = try coldPreparedDigest(owned);
         return .{ .stage = self, .owner = owned, .generation = batch.generation };
     }
@@ -2565,6 +2608,9 @@ pub const PreparedColdRecovery = struct {
     /// Caller reaffirms its lease and exact authenticated application cut
     /// immediately before entry. All private file/phase/ticket checks are here.
     pub fn commit(self: *PreparedColdRecovery) !void {
+        // The Windows complete-epoch successor is prepared, but a separate
+        // two-file namespace transaction must be proven before publication.
+        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
         const owned = self.stage.backing orelse return StoreError.PreparedAlreadyConsumed;
         if (owned != self.owner) return StoreError.PreparedAlreadyConsumed;
         const plan = if (owned.plan) |*value| value else return StoreError.PreparedAlreadyConsumed;
@@ -3131,7 +3177,7 @@ test "Windows cold recovery opens a captured read-only view and leaves preparati
     try std.testing.expectEqualStrings("durable", stage.view().get(.props, "original").?);
     const mutation: BatchMutation = .{ .family = .props, .kind = .put, .key = "new", .value = "forbidden" };
     try std.testing.expectError(error.SkipZigTest, stage.prepareBatch(&.{mutation}));
-    try std.testing.expectError(error.SkipZigTest, stage.prepareCompleteBatch(&.{mutation}));
+    try std.testing.expectError(error.InsecurePermissions, stage.prepareCompleteBatch(&.{mutation}));
     try std.testing.expect(stage.backing.?.plan == null);
     try std.testing.expect(stage.backing.?.store.active_batch == null);
     try stage.validate();
@@ -3259,6 +3305,109 @@ test "Windows cold recovery replays a covered snapshot and retains an unknown WA
     try snapshot_writer.writePositionalAll(std.testing.io, "X", 0);
     snapshot_writer.close(std.testing.io);
     try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.validate());
+}
+
+test "Windows complete cold recovery prepares held private successors without publishing" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    {
+        var seed = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/state.wal", .{});
+        defer seed.deinit();
+        try seed.put(.props, "old", "captured");
+        try seed.snapshotAndTruncate();
+        try seed.put(.props, "later", "held WAL");
+    }
+    const before = try private.readFileAlloc(std.testing.io, "state.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    const snapshot_before = try private.readFileAlloc(std.testing.io, "state.wal.snap", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(snapshot_before);
+    const lease = try private.createFile(std.testing.io, "state.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+    defer stage.deinit();
+    try std.testing.expectError(error.SkipZigTest, stage.prepareBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "prepared" }}));
+    var prepared = try stage.prepareCompleteBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "prepared" }});
+    const plan = &stage.backing.?.plan.?;
+    const wal_temp = std.fmt.hex(plan.wal_atomic.?.file_basename_hex);
+    const snapshot_temp = std.fmt.hex(plan.snapshot_atomic.?.file_basename_hex);
+    try cold_runtime.requireInheritedPrivateFileWindows(plan.wal_atomic.?.file);
+    try cold_runtime.requireInheritedPrivateFileWindows(plan.snapshot_atomic.?.file);
+    try validateColdPreparedWal(stage.backing.?);
+    try validateColdPreparedFile(std.testing.io, plan.snapshot_atomic.?.file, plan.snapshot_bytes.?, plan.snapshot_identity.?);
+    try std.testing.expectError(error.FileBusy, openColdExisting(std.testing.io, private, "state.wal", .read_write));
+    try stage.validate();
+    try std.testing.expectError(error.SkipZigTest, prepared.commit());
+    prepared.abort();
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, &wal_temp, .read_only));
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, &snapshot_temp, .read_only));
+    const after = try private.readFileAlloc(std.testing.io, "state.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    const snapshot_after = try private.readFileAlloc(std.testing.io, "state.wal.snap", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(snapshot_after);
+    try std.testing.expectEqualSlices(u8, snapshot_before, snapshot_after);
+    try std.testing.expectEqualStrings("captured", stage.view().get(.props, "old").?);
+    try std.testing.expectEqualStrings("held WAL", stage.view().get(.props, "later").?);
+    try std.testing.expect(stage.view().get(.props, "new") == null);
+}
+
+test "Windows complete cold recovery preparation allocation failures retry without publication" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    {
+        var seed = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/state.wal", .{});
+        defer seed.deinit();
+        try seed.put(.props, "old", "captured");
+    }
+    const before = try private.readFileAlloc(std.testing.io, "state.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    const lease = try private.createFile(std.testing.io, "state.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    const mutations: []const BatchMutation = &.{.{ .family = .props, .kind = .put, .key = "new", .value = "prepared" }};
+    var control = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    var success = try ColdRecoveryStage.open(control.allocator(), std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+    const start = control.alloc_index;
+    var successful = try success.prepareCompleteBatch(mutations);
+    const allocation_count = control.alloc_index - start;
+    successful.abort();
+    success.deinit();
+    try std.testing.expect(allocation_count > 0);
+    for (0..allocation_count) |offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+        var stage = try ColdRecoveryStage.open(failing.allocator(), std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
+        failing.fail_index = failing.alloc_index + offset;
+        try std.testing.expectError(error.OutOfMemory, stage.prepareCompleteBatch(mutations));
+        try std.testing.expect(stage.backing.?.plan == null);
+        try std.testing.expect(stage.backing.?.store.active_batch == null);
+        failing.fail_index = std.math.maxInt(usize);
+        var retry = try stage.prepareCompleteBatch(mutations);
+        retry.abort();
+        stage.deinit();
+        try cold_identity.reaffirmExclusive(lease.handle);
+        const after = try private.readFileAlloc(std.testing.io, "state.wal", std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+        try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "state.wal.snap", .read_only));
+        const listing = try private.openDir(std.testing.io, ".", .{ .iterate = true });
+        defer listing.close(std.testing.io);
+        var entries = listing.iterate();
+        var count: usize = 0;
+        while (try entries.next(std.testing.io)) |entry| {
+            try std.testing.expect(std.mem.eql(u8, entry.name, "state.wal") or std.mem.eql(u8, entry.name, "state.wal.lock"));
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), count);
+    }
 }
 
 fn validateColdPreparedWal(owned: *const ColdBacking) !void {

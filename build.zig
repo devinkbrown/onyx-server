@@ -820,6 +820,8 @@ pub fn build(b: *std.Build) void {
             "Windows cold recovery detects high identity and namespace or byte tampering",
             "Windows cold recovery allocation failures preserve the existing WAL",
             "Windows cold recovery replays a covered snapshot and retains an unknown WAL tail",
+            "Windows complete cold recovery prepares held private successors without publishing",
+            "Windows complete cold recovery preparation allocation failures retry without publication",
             "Windows private cold atomic becomes readable and duplicate survives original close",
             "Windows cold atomic abort removes own write-only temp before readable reopen",
             "Windows cold atomic refuses broad parent before secret bytes",
