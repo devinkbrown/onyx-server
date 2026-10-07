@@ -2245,8 +2245,12 @@ const ColdFile = struct {
     digest: [32]u8,
 
     fn capture(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, limit: ?usize) !ColdFile {
+        return captureWithPrivateAcl(allocator, io, dir, path, limit, false);
+    }
+    fn captureWithPrivateAcl(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, limit: ?usize, private_acl: bool) !ColdFile {
         const file = try openColdExisting(io, dir, path, .read_only);
         errdefer file.close(io);
+        if (private_acl) try cold_runtime.requireOwnerOnlyPrivateFileHandleWindows(file);
         const identity = try cold_identity.statRegular(file.handle);
         const size = std.math.cast(usize, (try file.stat(io)).size) orelse return StoreError.RecordTooLarge;
         if (limit) |maximum| if (size > maximum) return StoreError.RecordTooLarge;
@@ -2376,6 +2380,19 @@ pub const ColdRecoveryStage = struct {
     backing: ?*ColdBacking,
 
     pub fn open(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, lease: std.Io.File, config: Config) !ColdRecoveryStage {
+        // A Windows private parent can hold account, delivery, or mesh secrets.
+        // Reject inherited/broad file ACLs before capturing any WAL or snapshot
+        // bytes. Generic read-only inspection of a nonprivate parent remains
+        // available, but publication later requires a private NTFS parent.
+        const private_windows_parent = if (comptime @import("builtin").os.tag == .windows) blk: {
+            const parent = try coldOpenParent(io, dir, path);
+            defer parent.close(io);
+            _ = cold_runtime.requirePrivateDirectoryHandleWindows(.{ .handle = parent.handle }) catch |err| switch (err) {
+                error.InsecurePermissions => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        } else false;
         const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
         errdefer allocator.free(lock_path);
         const lease_identity = try cold_identity.statRegular(lease.handle);
@@ -2386,11 +2403,11 @@ pub const ColdRecoveryStage = struct {
         errdefer allocator.free(snapshot_path);
         var feed = try ChangeFeed.init(allocator, config.changefeed_capacity);
         errdefer feed.deinit();
-        var wal = try ColdFile.capture(allocator, io, dir, path, config.max_wal_bytes);
+        var wal = try ColdFile.captureWithPrivateAcl(allocator, io, dir, path, config.max_wal_bytes, private_windows_parent);
         errdefer wal.deinit(allocator, io);
         // `ColdFile.capture` funnels through `openColdExisting`. Keep the
         // optional snapshot absent only for an actual missing namespace entry.
-        var snapshot: ?ColdFile = ColdFile.capture(allocator, io, dir, snapshot_path, null) catch |err| blk: {
+        var snapshot: ?ColdFile = ColdFile.captureWithPrivateAcl(allocator, io, dir, snapshot_path, null, private_windows_parent) catch |err| blk: {
             if (err != error.FileNotFound) return err;
             break :blk null;
         };
@@ -2709,6 +2726,8 @@ pub const PreparedColdRecovery = struct {
         if (!plan.complete_epoch or !plan.rotate or plan.wal_atomic == null) return StoreError.SnapshotCoverageMismatch;
         _ = try cold_runtime.requirePrivateDirectoryHandleWindows(.{ .handle = plan.directory.handle });
         try requireColdWriteThroughVolumeWindows(plan.directory);
+        try cold_runtime.requireOwnerOnlyPrivateFileHandleWindows(owned.wal.file);
+        if (owned.snapshot) |file| try cold_runtime.requireOwnerOnlyPrivateFileHandleWindows(file.file);
         try cold_runtime.requireExistingPrivateFileHandleWindows(plan.wal_atomic.?.file);
         try cold_runtime.requireExistingPrivateFileHandleWindows(plan.writer);
         if (plan.snapshot_atomic) |file|
@@ -3486,7 +3505,7 @@ test "Windows complete cold recovery selects covered empty WAL without replacing
     try std.testing.expectEqualStrings("prepared", restart.view().get(.props, "new").?);
 }
 
-test "Windows complete cold recovery rejects a permissive retained snapshot before WAL cut" {
+test "Windows complete cold recovery rejects a permissive snapshot before capture" {
     if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3512,14 +3531,36 @@ test "Windows complete cold recovery rejects a permissive retained snapshot befo
     defer lease.close(std.testing.io);
     try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
     try lease.writePositionalAll(std.testing.io, "L", 0);
-    var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 });
-    defer stage.deinit();
-    var prepared = try stage.prepareCompleteBatch(&.{.{ .family = .props, .kind = .put, .key = "new", .value = "prepared" }});
-    defer prepared.abort();
-    try std.testing.expect(stage.backing.?.plan.?.snapshot_atomic == null);
-    try std.testing.expectError(error.InsecurePermissions, prepared.commit());
-    try std.testing.expect(!stage.backing.?.consumed);
-    try std.testing.expect(stage.view().get(.props, "new") == null);
+    try std.testing.expectError(error.InsecurePermissions, ColdRecoveryStage.open(std.testing.allocator, std.testing.io, private, "state.wal", lease, .{ .changefeed_capacity = 0 }));
+    const unchanged = try private.readFileAlloc(std.testing.io, "state.wal.snap", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualSlices(u8, snapshot_bytes, unchanged);
+}
+
+test "Windows cold recovery checks nested private parent before captured WAL bytes" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    {
+        var seed = try OroStore.openPrivateWindowsWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "private/state.wal", .{});
+        defer seed.deinit();
+        try seed.put(.props, "old", "captured");
+    }
+    const original = try private.readFileAlloc(std.testing.io, "state.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(original);
+    try private.deleteFile(std.testing.io, "state.wal");
+    const permissive = try private.createFile(std.testing.io, "state.wal", .{ .read = true });
+    try permissive.writePositionalAll(std.testing.io, original, 0);
+    try permissive.sync(std.testing.io);
+    permissive.close(std.testing.io);
+    try std.testing.expectError(error.InsecurePermissions, cold_runtime.openExistingPrivateWindows(private, "state.wal", .verify_only));
+    const lease = try private.createFile(std.testing.io, "state.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    try std.testing.expectError(error.InsecurePermissions, ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "private/state.wal", lease, .{ .changefeed_capacity = 0 }));
 }
 
 test "Windows complete cold recovery publication faults restart on whole old or new epoch" {

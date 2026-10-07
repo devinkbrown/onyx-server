@@ -67,9 +67,6 @@ pub const Authority = opaque {
     /// Existing state and lease are open-only. Authenticate the complete OLD
     /// package before preparing any cold WAL recovery publication.
     pub fn openCold(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8, context: Context, key: *const sign.KeyPair, config: Config) !*Authority {
-        // Lease custody needs POSIX fds and `Permissions.fromMode`; unreachable
-        // in Windows production, so tests skip via this one gate.
-        if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
         return create(allocator, io, dir, name, context, key, config, true);
     }
     pub fn observe(self: *Authority) !Observation {
@@ -1415,8 +1412,6 @@ test "delivery authority Windows local lease rejects broad ACL before any marker
     }
 }
 fn create(a: std.mem.Allocator, io: std.Io, input_dir: std.Io.Dir, name: []const u8, input_context: Context, key: *const sign.KeyPair, config: Config, cold: bool) !*Authority {
-    // Same Windows gate as `openCold` above: POSIX fds and file modes.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     if (config.max_issued_tokens == 0) return error.InvalidConfig;
     try requireKey(input_context, key);
     try validateName(name);
@@ -1451,7 +1446,13 @@ fn create(a: std.mem.Allocator, io: std.Io, input_dir: std.Io.Dir, name: []const
         head.images = .{ digest(encoded.guard), digest(encoded.history), digest(encoded.deliveries) };
         const head_bytes = try head.encode(key);
         const mutations = encoded.mutations(&head_bytes);
-        var batch = try recovery.prepareBatch(&mutations);
+        // Windows publishes an already-synced complete successor epoch. The
+        // ordinary append lane remains unavailable there; refuse an unknown
+        // tail rather than authorize an incomplete application cut.
+        var batch = if (comptime builtin.os.tag == .windows)
+            try recovery.prepareCompleteBatch(&mutations)
+        else
+            try recovery.prepareBatch(&mutations);
         defer batch.abort();
         if (!std.meta.eql(directory_identity, try protectedDirectory(dir))) return error.IdentityMismatch;
         try recovery.validate();
@@ -1652,6 +1653,135 @@ test "delivery authority: actual leased four-row admission progress and original
     const finished = try cold.prepareProgress(id, 1, &key);
     _ = try finished.commit();
     try std.testing.expectEqual(@as(usize, 0), (try cold.observe()).pending_deliveries);
+}
+
+test "delivery authority Windows private first provision and complete cold recovery retain signed delivery" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    var key = try sign.KeyPair.fromSeed(@splat(81));
+    defer key.deinit();
+    const event = try TestEvent.init(&key, 1000 << 16);
+    var original: Observation = undefined;
+    const id = blk: {
+        const owner = try Authority.initialize(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{});
+        defer owner.close() catch @panic("Windows original source close");
+        original = try owner.observe();
+        const accepted = try testCommit(owner, &event, &test_destinations, &key);
+        const loan = try owner.borrow();
+        const output = try loan.delivery(0);
+        try std.testing.expectEqualSlices(u8, &accepted, &output.id);
+        try std.testing.expectEqualStrings(test_destinations[0].url, output.url);
+        try std.testing.expectEqualStrings(test_destinations[0].secret, output.secret);
+        try loan.release();
+        break :blk accepted;
+    };
+    {
+        const cold = try Authority.openCold(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{});
+        defer cold.close() catch @panic("Windows cold source close");
+        const observation = try cold.observe();
+        try std.testing.expectEqualSlices(u8, &original.logical_store_id, &observation.logical_store_id);
+        try std.testing.expectEqualSlices(u8, &original.logical_store_epoch, &observation.logical_store_epoch);
+        try std.testing.expectError(error.Duplicate, cold.prepareEvent(event.event(), &test_destinations, 1000, &key));
+        const loan = try cold.borrow();
+        const output = try loan.delivery(0);
+        try std.testing.expectEqual(@as(usize, 0), output.destination);
+        try std.testing.expectEqualStrings(test_destinations[0].url, output.url);
+        try loan.release();
+        const progress = try cold.prepareProgress(id, 0, &key);
+        _ = try progress.commit();
+    }
+    const restart = try Authority.openCold(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{});
+    defer restart.close() catch @panic("Windows restart source close");
+    const loan = try restart.borrow();
+    const output = try loan.delivery(0);
+    try std.testing.expectEqual(@as(usize, 1), output.destination);
+    try std.testing.expectEqualStrings(test_destinations[1].url, output.url);
+    try loan.release();
+}
+
+test "delivery authority Windows cold reopen retains compacted signed state" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    var key = try sign.KeyPair.fromSeed(@splat(82));
+    defer key.deinit();
+    const event = try TestEvent.init(&key, 1000 << 16);
+    const id = blk: {
+        const owner = try Authority.initialize(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{});
+        defer owner.close() catch @panic("Windows compacted source close");
+        const accepted = try testCommit(owner, &event, &test_destinations, &key);
+        try backing(owner).state.store.snapshotAndTruncate();
+        break :blk accepted;
+    };
+    const cold = try Authority.openCold(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{});
+    defer cold.close() catch @panic("Windows compacted cold source close");
+    const loan = try cold.borrow();
+    const output = try loan.delivery(0);
+    try std.testing.expectEqualSlices(u8, &id, &output.id);
+    try std.testing.expectEqualStrings(test_destinations[0].url, output.url);
+    try loan.release();
+    try std.testing.expectError(error.Duplicate, cold.prepareEvent(event.event(), &test_destinations, 1000, &key));
+}
+
+test "delivery authority Windows cold reopen rejects unknown WAL tail unchanged" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    var key = try sign.KeyPair.fromSeed(@splat(83));
+    defer key.deinit();
+    {
+        const owner = try Authority.initialize(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{});
+        defer owner.close() catch @panic("Windows original source close");
+    }
+    const wal = try store_mod.openColdExisting(std.testing.io, private, "delivery.wal", .read_write);
+    const end = (try wal.stat(std.testing.io)).size;
+    try wal.writePositionalAll(std.testing.io, "unknown tail", end);
+    try wal.sync(std.testing.io);
+    wal.close(std.testing.io);
+    const before = try private.readFileAlloc(std.testing.io, "delivery.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    try std.testing.expectError(error.SnapshotCoverageMismatch, Authority.openCold(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{}));
+    const after = try private.readFileAlloc(std.testing.io, "delivery.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "delivery authority Windows cold refuses permissive WAL and snapshot before reading" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    for ([_][]const u8{ "delivery.wal", "delivery.wal.snap" }) |target| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+        defer private.close(std.testing.io);
+        var key = try sign.KeyPair.fromSeed(@splat(84));
+        defer key.deinit();
+        const event = try TestEvent.init(&key, 1000 << 16);
+        {
+            const owner = try Authority.initialize(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{});
+            defer owner.close() catch @panic("Windows original source close");
+            _ = try testCommit(owner, &event, &test_destinations, &key);
+            try backing(owner).state.store.snapshotAndTruncate();
+        }
+        const original = try private.readFileAlloc(std.testing.io, target, std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(original);
+        try private.deleteFile(std.testing.io, target);
+        const permissive = try private.createFile(std.testing.io, target, .{ .read = true });
+        try permissive.writePositionalAll(std.testing.io, original, 0);
+        try permissive.sync(std.testing.io);
+        permissive.close(std.testing.io);
+        try std.testing.expectError(error.InsecurePermissions, os_runtime.openExistingPrivateWindows(private, target, .verify_only));
+        try std.testing.expectError(error.InsecurePermissions, Authority.openCold(std.testing.allocator, std.testing.io, private, "delivery.wal", testContext(&key), &key, .{}));
+        const unchanged = try private.readFileAlloc(std.testing.io, target, std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(unchanged);
+        try std.testing.expectEqualSlices(u8, original, unchanged);
+    }
 }
 
 test "delivery authority: every live event staging allocation failure preserves exact source four rows and same-owner retry" {
