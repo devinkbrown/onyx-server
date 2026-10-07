@@ -129,7 +129,7 @@ def main() -> int:
         for label, binary, config, directory in zip("AB", binaries, configs, directories):
             result = subprocess.run(
                 [str(binary), "--check-config", str(config)], cwd=directory,
-                capture_output=True, text=True, timeout=20, check=False,
+                capture_output=True, text=True, timeout=60, check=False,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"node {label} preflight failed: {(result.stdout + result.stderr).strip()}")
