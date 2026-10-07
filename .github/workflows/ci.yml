@@ -51,7 +51,7 @@ jobs:
   windows-native:
     name: native Windows full daemon
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: Install and verify pinned Windows Zig
@@ -142,6 +142,8 @@ jobs:
         run: zig build -j1 test-cli -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
       - name: Run native full-daemon IRC, TLS, WSS, metrics, and webhook smoke
         run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --wss --metrics --webhook
+      - name: Run shipped Windows quickstart smoke
+        run: python -B .\tools\windows_quickstart_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native plaintext WebSocket smoke
         run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --ws-plain
       - name: Run native PROXY protocol v1/v2 smoke
@@ -158,6 +160,8 @@ jobs:
         run: python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix sequential upgrade smoke
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded Windows Helix staged-image selection smoke
+        run: python -B .\tools\windows_helix_candidate_path_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Build automatic descriptor rollover smoke executable
         run: zig build -j1 windows-rollover-smoke-server -Dtarget=x86_64-windows --summary all
       - name: Run automatic Windows descriptor rollover process smoke
@@ -166,12 +170,18 @@ jobs:
         run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix generated TLS and WSS upgrade smoke
         run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
+      - name: Build native Windows TLS early-data smoke client
+        run: zig build -j1 windows-helix-early-client -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+      - name: Run exact TLS early-data replay through Windows Helix
+        run: python -B .\tools\windows_helix_early_data_smoke.py .\zig-out\bin\onyx-server.exe --exact-replay
       - name: Run guarded native Windows Helix metrics upgrade smoke
         run: python -B .\tools\windows_helix_metrics_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix webhook upgrade smoke
         run: python -B .\tools\windows_helix_webhook_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix secured mesh upgrade smoke
         run: python -B .\tools\windows_helix_mesh_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run sequential three-node Windows Helix session mesh smoke
+        run: python -B .\tools\windows_helix_mesh_sequence_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix OroWasm upgrade smoke
         run: python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix Web Push upgrade smoke
