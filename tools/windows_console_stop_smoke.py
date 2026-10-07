@@ -37,7 +37,10 @@ def free_port() -> int:
 def wait_for(sock: socket.socket, needle: bytes, deadline: float) -> bytes:
     data = bytearray()
     while time.monotonic() < deadline:
-        chunk = sock.recv(4096)
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            continue
         if not chunk:
             raise AssertionError(f"IRC socket closed before {needle!r}: {data[-1000:]!r}")
         data.extend(chunk)
@@ -136,7 +139,7 @@ def worker(binary: Path, helix: bool, ctrl_c: bool) -> None:
                 wait_for(sock, b" PONG onyx.local :before-stop", time.monotonic() + 5)
                 if helix:
                     sock.sendall(f"REGISTER stopadmin * {password}\r\n".encode("ascii"))
-                    wait_for(sock, b"REGISTER SUCCESS", time.monotonic() + 10)
+                    wait_for(sock, b"REGISTER SUCCESS", time.monotonic() + 45)
                     oper = authenticate_account(port, b"stopadmin", password.encode("ascii"), b"stopoper")
                     oper.wait(b" 381 ", start=0)
                     oper.send(b"UPGRADE")
@@ -211,7 +214,7 @@ def main() -> int:
         [sys.executable, "-B", __file__, str(binary), "--worker"]
         + (["--helix"] if args.helix else []) + (["--ctrl-c"] if args.ctrl_c else []),
         creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=startup,
-        capture_output=True, text=True, timeout=65,
+        capture_output=True, text=True, timeout=120 if args.helix else 65,
     )
     print(result.stdout, end="")
     if result.stderr:

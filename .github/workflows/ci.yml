@@ -212,6 +212,16 @@ jobs:
         run: python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native media two-swap Helix UDP smoke
         run: python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run active WebTransport and media combined Helix smoke
+        run: python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run Windows cold console Ctrl+Break stop smoke
+        run: python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run Windows cold console Ctrl+C stop smoke
+        run: python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --ctrl-c
+      - name: Run Windows post-Helix console Ctrl+Break stop smoke
+        run: python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix
+      - name: Run Windows post-Helix console Ctrl+C stop smoke
+        run: python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix --ctrl-c
       - name: Run configured Windows security and listener failure smoke
         run: python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 
