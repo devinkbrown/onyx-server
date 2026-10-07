@@ -706,12 +706,7 @@ pub fn requireInheritedPrivateFileWindows(file: std.Io.File) Error!void {
 /// be reopened while the predecessor retains an exclusive WAL handle.
 pub fn requireExistingPrivateFileHandleWindows(file: std.Io.File) Error!void {
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
-    var status: windows.IO_STATUS_BLOCK = undefined;
-    var basic: windows.FILE.BASIC_INFORMATION = undefined;
-    if (windows.ntdll.NtQueryInformationFile(file.handle, &status, &basic, @sizeOf(@TypeOf(basic)), .Basic) != .SUCCESS)
-        return error.InvalidDescriptor;
-    if (basic.FileAttributes.REPARSE_POINT or basic.FileAttributes.DIRECTORY)
-        return error.InsecurePermissions;
+    try requireOwnerOnlyPrivateFileHandleWindows(file);
     var access_status: windows.IO_STATUS_BLOCK = undefined;
     var granted_access: u32 = 0;
     if (windows.ntdll.NtQueryInformationFile(file.handle, &access_status, &granted_access, @sizeOf(u32), .Access) != .SUCCESS)
@@ -720,6 +715,18 @@ pub fn requireExistingPrivateFileHandleWindows(file: std.Io.File) Error!void {
     // predecessor releases its copy. A read-only duplicate would stage fine
     // and fail only after COMMIT, so reject it before READY.
     if ((granted_access & 0x0003) != 0x0003) return error.PermissionDenied;
+}
+
+/// Check the owner-only DACL on a captured read-only private snapshot or WAL.
+/// The write-capable variant above also validates granted write access.
+pub fn requireOwnerOnlyPrivateFileHandleWindows(file: std.Io.File) Error!void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    var status: windows.IO_STATUS_BLOCK = undefined;
+    var basic: windows.FILE.BASIC_INFORMATION = undefined;
+    if (windows.ntdll.NtQueryInformationFile(file.handle, &status, &basic, @sizeOf(@TypeOf(basic)), .Basic) != .SUCCESS)
+        return error.InvalidDescriptor;
+    if (basic.FileAttributes.REPARSE_POINT or basic.FileAttributes.DIRECTORY)
+        return error.InsecurePermissions;
     if (!try windowsDaclIsOwnerOnly(@intFromPtr(file.handle)))
         return error.InsecurePermissions;
 }
