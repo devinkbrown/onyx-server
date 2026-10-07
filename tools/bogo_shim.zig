@@ -47,6 +47,39 @@ const onyx_server = @import("onyx_server");
 
 const posix = std.posix;
 const linux = std.os.linux;
+const Socket = if (builtin.os.tag == .windows) usize else linux.fd_t;
+
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: [4]u8,
+        zero: [8]u8 = @splat(0),
+    };
+    const FdSet = extern struct { count: u32, sockets: [64]usize };
+    const Timeval = extern struct { sec: i32, usec: i32 };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8)
+            @compileError("Windows socket ABI shape changed");
+    }
+    extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, kind: i32, protocol: i32, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, address: *const SockAddr4, len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn select(ignored: i32, read: ?*FdSet, write: ?*FdSet, except: ?*FdSet, timeout: *const Timeval) callconv(.winapi) i32;
+    extern "ws2_32" fn accept(socket: usize, address: ?*SockAddr4, len: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
+    extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) usize;
+    extern "kernel32" fn WriteFile(handle: usize, bytes: [*]const u8, len: u32, written: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, value: [*]u16, size: u32) callconv(.winapi) u32;
+};
 
 const tls_conn = onyx_server.daemon.tls_conn;
 const tls_certs = onyx_server.daemon.tls_certs;
@@ -198,6 +231,7 @@ pub fn main(init: std.process.Init) void {
 /// Set SIGPIPE to ignore so a raw-socket write to a peer-closed fd returns EPIPE
 /// instead of terminating the process (mirrors the daemon's own disposition).
 fn ignoreSigpipe() void {
+    if (comptime builtin.os.tag == .windows) return;
     const act = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.sigemptyset(),
@@ -248,8 +282,10 @@ fn shimRun(alloc: std.mem.Allocator, init: std.process.Init) u8 {
 }
 
 fn doConnection(alloc: std.mem.Allocator, io: std.Io, flags: Flags) !void {
+    if (comptime builtin.os.tag == .windows) try socketStartup();
+    defer socketCleanup();
     const fd = try tcpConnect(flags.port);
-    defer _ = linux.close(fd);
+    defer socketClose(fd);
 
     if (flags.have_shim_id) {
         var idb: [8]u8 = undefined;
@@ -266,7 +302,7 @@ fn doConnection(alloc: std.mem.Allocator, io: std.Io, flags: Flags) !void {
 
 // ── Server role (TlsConn: TLS 1.3 + hardened TLS 1.2) ─────────────────────────
 
-fn runServerRole(alloc: std.mem.Allocator, io: std.Io, fd: linux.fd_t, flags: Flags) !void {
+fn runServerRole(alloc: std.mem.Allocator, io: std.Io, fd: Socket, flags: Flags) !void {
     // BoGo supplies PEM `-cert-file`/`-key-file`; with neither we bootstrap a
     // self-signed Ed25519 leaf (loopback-only, matches the daemon's own loader).
     var loaded = try tls_certs.loadOrBootstrap(alloc, io, .{
@@ -330,7 +366,7 @@ fn runServerRole(alloc: std.mem.Allocator, io: std.Io, fd: linux.fd_t, flags: Fl
     try echoServer(alloc, fd, &conn);
 }
 
-fn driveServerHandshake(fd: linux.fd_t, conn: *TlsConn) !void {
+fn driveServerHandshake(fd: Socket, conn: *TlsConn) !void {
     var buf: [max_read]u8 = undefined;
     while (!conn.handshakeDone()) {
         const n = try sockReadSome(fd, &buf);
@@ -354,7 +390,7 @@ fn checkServerExpect(conn: *const TlsConn, flags: Flags) !void {
     }
 }
 
-fn echoServer(alloc: std.mem.Allocator, fd: linux.fd_t, conn: *TlsConn) !void {
+fn echoServer(alloc: std.mem.Allocator, fd: Socket, conn: *TlsConn) !void {
     var buf: [max_read]u8 = undefined;
     while (true) {
         const n = try sockReadSome(fd, &buf);
@@ -378,7 +414,7 @@ fn echoServer(alloc: std.mem.Allocator, fd: linux.fd_t, conn: *TlsConn) !void {
 
 // ── Client role (tls_client.Client: TLS 1.3) ──────────────────────────────────
 
-fn runClientRole(alloc: std.mem.Allocator, fd: linux.fd_t, flags: Flags) !void {
+fn runClientRole(alloc: std.mem.Allocator, fd: Socket, flags: Flags) !void {
     var client = try Client.init(alloc, .{
         .server_name = "localhost",
         .trust_anchors = &.{},
@@ -407,7 +443,7 @@ fn runClientRole(alloc: std.mem.Allocator, fd: linux.fd_t, flags: Flags) !void {
     try echoClient(alloc, fd, &client);
 }
 
-fn driveClientHandshake(alloc: std.mem.Allocator, fd: linux.fd_t, client: *Client) !void {
+fn driveClientHandshake(alloc: std.mem.Allocator, fd: Socket, client: *Client) !void {
     const hello = try client.start();
     {
         defer alloc.free(hello);
@@ -436,7 +472,7 @@ fn checkClientExpect(client: *const Client, flags: Flags) !void {
     }
 }
 
-fn echoClient(alloc: std.mem.Allocator, fd: linux.fd_t, client: *Client) !void {
+fn echoClient(alloc: std.mem.Allocator, fd: Socket, client: *Client) !void {
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
     var buf: [max_read]u8 = undefined;
@@ -491,13 +527,40 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
     list.items.len = remaining;
 }
 
-// ── Raw socket helpers (Linux; the shim owns the socket, engines are pure) ────
+// ── Raw socket helpers (the shim owns the socket, engines are pure) ───────────
 
-fn tcpConnect(port: u16) !linux.fd_t {
+fn socketStartup() !void {
+    if (comptime builtin.os.tag == .windows) {
+        var data: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &data) != 0) return error.SocketFailed;
+    }
+}
+
+fn socketCleanup() void {
+    if (comptime builtin.os.tag == .windows) _ = win.WSACleanup();
+}
+
+fn socketClose(fd: Socket) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = win.closesocket(fd);
+    } else {
+        _ = linux.close(fd);
+    }
+}
+
+fn tcpConnect(port: u16) !Socket {
+    if (comptime builtin.os.tag == .windows) {
+        const fd = win.WSASocketW(2, 1, 6, null, 0, 1);
+        if (fd == win.invalid_socket) return error.SocketFailed;
+        errdefer socketClose(fd);
+        const addr = win.SockAddr4{ .family = 2, .port = std.mem.nativeToBig(u16, port), .addr = .{ 127, 0, 0, 1 } };
+        if (win.connect(fd, &addr, @sizeOf(win.SockAddr4)) != 0) return error.ConnectFailed;
+        return fd;
+    }
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
     if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
-    const fd: linux.fd_t = @intCast(rc);
-    errdefer _ = linux.close(fd);
+    const fd: Socket = @intCast(rc);
+    errdefer socketClose(fd);
     var addr: linux.sockaddr.in = .{
         .port = std.mem.nativeToBig(u16, port),
         .addr = std.mem.nativeToBig(u32, 0x7f00_0001), // 127.0.0.1
@@ -508,9 +571,15 @@ fn tcpConnect(port: u16) !linux.fd_t {
     return fd;
 }
 
-fn sockWriteAll(fd: linux.fd_t, bytes: []const u8) !void {
+fn sockWriteAll(fd: Socket, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
+        if (comptime builtin.os.tag == .windows) {
+            const n = win.send(fd, bytes[off..].ptr, @intCast(@min(bytes.len - off, std.math.maxInt(i32))), 0);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+            continue;
+        }
         const rc = linux.write(fd, bytes.ptr + off, bytes.len - off);
         const signed: isize = @bitCast(rc);
         if (signed <= 0) return error.WriteFailed;
@@ -519,7 +588,12 @@ fn sockWriteAll(fd: linux.fd_t, bytes: []const u8) !void {
 }
 
 /// Read up to `buf.len` bytes; returns 0 on EOF.
-fn sockReadSome(fd: linux.fd_t, buf: []u8) !usize {
+fn sockReadSome(fd: Socket, buf: []u8) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        const n = win.recv(fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(i32))), 0);
+        if (n < 0) return error.ReadFailed;
+        return @intCast(n);
+    }
     const rc = linux.read(fd, buf.ptr, buf.len);
     const signed: isize = @bitCast(rc);
     if (signed < 0) return error.ReadFailed;
@@ -534,9 +608,16 @@ fn outWrite(bytes: []const u8) void {
     fdWrite(1, bytes);
 }
 
-fn fdWrite(fd: linux.fd_t, bytes: []const u8) void {
+fn fdWrite(fd: Socket, bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
+        if (comptime builtin.os.tag == .windows) {
+            const handle = win.GetStdHandle(if (fd == 2) @as(u32, @bitCast(@as(i32, -12))) else @as(u32, @bitCast(@as(i32, -11))));
+            var written: u32 = 0;
+            if (win.WriteFile(handle, bytes[off..].ptr, @intCast(@min(bytes.len - off, std.math.maxInt(u32))), &written, null) == 0 or written == 0) return;
+            off += written;
+            continue;
+        }
         const rc = linux.write(fd, bytes.ptr + off, bytes.len - off);
         const signed: isize = @bitCast(rc);
         if (signed <= 0) return;
@@ -643,14 +724,22 @@ test "consumePrefix: slides the remainder to the front" {
 }
 
 /// Absolute path to the built shim, injected as BOGO_SHIM_BIN by the
-/// `bogo-shim-test` build step (read here straight from `/proc/self/environ`,
-/// since this Io-model std exposes the environment only through the entry-point
-/// `Init`, which test blocks do not receive). The returned slice borrows `out`.
+/// `bogo-shim-test` build step. Test blocks do not receive process Init, so read
+/// `/proc/self/environ` on Linux and the native process environment on Windows.
+/// The returned slice borrows `out`.
 /// Absent ⇒ subprocess tests skip (the pure parse/framing tests still run).
 fn shimBinPath(out: []u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("BOGO_SHIM_BIN");
+        var wide: [2048]u16 = undefined;
+        const len = win.GetEnvironmentVariableW(name, &wide, wide.len);
+        if (len == 0 or len >= wide.len) return null;
+        const n = std.unicode.utf16LeToUtf8(out, wide[0..len]) catch return null;
+        return out[0..n];
+    }
     const rc = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
     if (@as(isize, @bitCast(rc)) < 0) return null;
-    const fd: linux.fd_t = @intCast(rc);
+    const fd: Socket = @intCast(rc);
     defer _ = linux.close(fd);
 
     var block: [65536]u8 = undefined; // large enough for any realistic CI environ
@@ -687,10 +776,21 @@ fn makeEd25519Leaf(out: []u8, kp: Ed25519.KeyPair) ![]const u8 {
     });
 }
 
-fn listenLoopback() !linux.fd_t {
+fn listenLoopback() !Socket {
+    if (comptime builtin.os.tag == .windows) {
+        try socketStartup();
+        errdefer socketCleanup();
+        const fd = win.WSASocketW(2, 1, 6, null, 0, 1);
+        if (fd == win.invalid_socket) return error.SocketFailed;
+        errdefer socketClose(fd);
+        const addr = win.SockAddr4{ .family = 2, .port = 0, .addr = .{ 127, 0, 0, 1 } };
+        if (win.bind(fd, &addr, @sizeOf(win.SockAddr4)) != 0) return error.BindFailed;
+        if (win.listen(fd, 1) != 0) return error.ListenFailed;
+        return fd;
+    }
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
     if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
-    const fd: linux.fd_t = @intCast(rc);
+    const fd: Socket = @intCast(rc);
     errdefer _ = linux.close(fd);
     var addr: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
     if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
@@ -698,7 +798,13 @@ fn listenLoopback() !linux.fd_t {
     return fd;
 }
 
-fn loopbackPort(listen_fd: linux.fd_t) !u16 {
+fn loopbackPort(listen_fd: Socket) !u16 {
+    if (comptime builtin.os.tag == .windows) {
+        var addr = win.SockAddr4{ .family = 2, .port = 0, .addr = .{ 127, 0, 0, 1 } };
+        var len: i32 = @sizeOf(win.SockAddr4);
+        if (win.getsockname(listen_fd, &addr, &len) != 0 or len != @sizeOf(win.SockAddr4)) return error.AddrLookupFailed;
+        return std.mem.bigToNative(u16, addr.port);
+    }
     var storage: posix.sockaddr.storage = undefined;
     var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
     if (posix.errno(linux.getsockname(listen_fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.SkipZigTest;
@@ -706,7 +812,16 @@ fn loopbackPort(listen_fd: linux.fd_t) !u16 {
     return std.mem.bigToNative(u16, in.port);
 }
 
-fn acceptWithTimeout(listen_fd: linux.fd_t, timeout_ms: i32) !linux.fd_t {
+fn acceptWithTimeout(listen_fd: Socket, timeout_ms: i32) !Socket {
+    if (comptime builtin.os.tag == .windows) {
+        var read = win.FdSet{ .count = 1, .sockets = @splat(0) };
+        read.sockets[0] = listen_fd;
+        const timeout = win.Timeval{ .sec = @divTrunc(timeout_ms, 1000), .usec = @rem(timeout_ms, 1000) * 1000 };
+        if (win.select(0, &read, null, null, &timeout) != 1) return error.AcceptTimeout;
+        const fd = win.accept(listen_fd, null, null);
+        if (fd == win.invalid_socket) return error.AcceptFailed;
+        return fd;
+    }
     var pfd = [_]linux.pollfd{.{ .fd = listen_fd, .events = linux.POLL.IN, .revents = 0 }};
     const pr = linux.poll(&pfd, 1, timeout_ms);
     if (posix.errno(pr) != .SUCCESS or pr == 0) return error.AcceptTimeout;
@@ -716,12 +831,16 @@ fn acceptWithTimeout(listen_fd: linux.fd_t, timeout_ms: i32) !linux.fd_t {
 }
 
 /// Best-effort read timeout so a misbehaving shim can't hang the suite.
-fn setReadTimeout(fd: linux.fd_t, ms: u32) void {
+fn setReadTimeout(fd: Socket, ms: u32) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = win.setsockopt(fd, 0xffff, 0x1006, &ms, @sizeOf(u32));
+        return;
+    }
     const tv: linux.timeval = .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
     _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
 }
 
-fn readExact(fd: linux.fd_t, buf: []u8) !void {
+fn readExact(fd: Socket, buf: []u8) !void {
     var off: usize = 0;
     while (off < buf.len) {
         const n = try sockReadSome(fd, buf[off..]);
@@ -735,7 +854,7 @@ const probe_msg = "onyx-bogo-shim-probe";
 /// Drive the accepted socket as a TLS 1.3 CLIENT peer (the shim is the server):
 /// complete the handshake, send `probe_msg`, and assert the shim echoed it back
 /// XOR 0xff. When `alpn` is set, offer it and require the shim to select it.
-fn peerClientVerifyEcho(alloc: std.mem.Allocator, afd: linux.fd_t, alpn: []const []const u8) !void {
+fn peerClientVerifyEcho(alloc: std.mem.Allocator, afd: Socket, alpn: []const []const u8) !void {
     var client = try Client.init(alloc, .{
         .server_name = "localhost",
         .trust_anchors = &.{},
@@ -770,7 +889,7 @@ fn peerClientVerifyEcho(alloc: std.mem.Allocator, afd: linux.fd_t, alpn: []const
     try readXorEchoClient(alloc, afd, &client);
 }
 
-fn readXorEchoClient(alloc: std.mem.Allocator, afd: linux.fd_t, client: *Client) !void {
+fn readXorEchoClient(alloc: std.mem.Allocator, afd: Socket, client: *Client) !void {
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
     var got: [probe_msg.len]u8 = undefined;
@@ -798,7 +917,7 @@ fn readXorEchoClient(alloc: std.mem.Allocator, afd: linux.fd_t, client: *Client)
 
 /// Drive the accepted socket as a TLS 1.3 SERVER peer (the shim is the client):
 /// complete the handshake, send `probe_msg`, and assert the XOR echo.
-fn peerServerVerifyEcho(alloc: std.mem.Allocator, afd: linux.fd_t, cert_der: []const u8, kp: Ed25519.KeyPair) !void {
+fn peerServerVerifyEcho(alloc: std.mem.Allocator, afd: Socket, cert_der: []const u8, kp: Ed25519.KeyPair) !void {
     var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{cert_der}, .signing_key = kp });
     defer conn.deinit();
 
@@ -829,6 +948,25 @@ fn peerServerVerifyEcho(alloc: std.mem.Allocator, afd: linux.fd_t, cert_der: []c
 }
 
 fn spawnShim(io: std.Io, argv: []const []const u8) !std.process.Child {
+    if (comptime builtin.os.tag == .windows) {
+        // Threaded.init's default environment is empty. Winsock's provider
+        // loader needs SystemRoot to locate its DLLs in a spawned child.
+        var wide: [1024]u16 = undefined;
+        const len = win.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("SystemRoot"), &wide, wide.len);
+        if (len == 0 or len >= wide.len) return error.MissingSystemRoot;
+        var root: [2048]u8 = undefined;
+        const root_len = try std.unicode.utf16LeToUtf8(&root, wide[0..len]);
+        var environ = std.process.Environ.Map.init(testing.allocator);
+        defer environ.deinit();
+        try environ.put("SystemRoot", root[0..root_len]);
+        return std.process.spawn(io, .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .environ_map = &environ,
+        });
+    }
     return std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
@@ -845,13 +983,16 @@ fn expectExit(term: std.process.Child.Term, code: u8) !void {
 }
 
 test "subprocess: shim as TLS 1.3 server completes handshake, selects ALPN, echoes, exits 0" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
     var pathbuf: [1024]u8 = undefined;
     const bin = shimBinPath(&pathbuf) orelse return error.SkipZigTest;
     const alloc = testing.allocator;
 
     const listen_fd = try listenLoopback();
-    defer _ = linux.close(listen_fd);
+    defer {
+        socketClose(listen_fd);
+        socketCleanup();
+    }
     const port = try loopbackPort(listen_fd);
 
     var io_t = std.Io.Threaded.init(alloc, .{});
@@ -866,20 +1007,20 @@ test "subprocess: shim as TLS 1.3 server completes handshake, selects ALPN, echo
 
     const afd = try acceptWithTimeout(listen_fd, 5000);
     {
-        errdefer _ = linux.close(afd);
+        errdefer socketClose(afd);
         setReadTimeout(afd, 5000);
         var idbuf: [8]u8 = undefined;
         try readExact(afd, &idbuf);
         try testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, &idbuf, .little));
         try peerClientVerifyEcho(alloc, afd, &.{"h2"});
     }
-    _ = linux.close(afd); // TCP FIN ⇒ shim echo loop hits EOF ⇒ exits 0.
+    socketClose(afd); // TCP FIN ⇒ shim echo loop hits EOF ⇒ exits 0.
 
     try expectExit(try child.wait(io), 0);
 }
 
 test "subprocess: shim as TLS 1.3 client completes handshake, echoes, exits 0" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
     var pathbuf: [1024]u8 = undefined;
     const bin = shimBinPath(&pathbuf) orelse return error.SkipZigTest;
     const alloc = testing.allocator;
@@ -889,7 +1030,10 @@ test "subprocess: shim as TLS 1.3 client completes handshake, echoes, exits 0" {
     const cert_der = try makeEd25519Leaf(&cert_buf, kp);
 
     const listen_fd = try listenLoopback();
-    defer _ = linux.close(listen_fd);
+    defer {
+        socketClose(listen_fd);
+        socketCleanup();
+    }
     const port = try loopbackPort(listen_fd);
 
     var io_t = std.Io.Threaded.init(alloc, .{});
@@ -904,20 +1048,20 @@ test "subprocess: shim as TLS 1.3 client completes handshake, echoes, exits 0" {
 
     const afd = try acceptWithTimeout(listen_fd, 5000);
     {
-        errdefer _ = linux.close(afd);
+        errdefer socketClose(afd);
         setReadTimeout(afd, 5000);
         var idbuf: [8]u8 = undefined;
         try readExact(afd, &idbuf);
         try testing.expectEqual(@as(u64, 77), std.mem.readInt(u64, &idbuf, .little));
         try peerServerVerifyEcho(alloc, afd, cert_der, kp);
     }
-    _ = linux.close(afd);
+    socketClose(afd);
 
     try expectExit(try child.wait(io), 0);
 }
 
 test "subprocess: shim client honors -curves 23 (secp256r1), exits 0" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
     var pathbuf: [1024]u8 = undefined;
     const bin = shimBinPath(&pathbuf) orelse return error.SkipZigTest;
     const alloc = testing.allocator;
@@ -927,7 +1071,10 @@ test "subprocess: shim client honors -curves 23 (secp256r1), exits 0" {
     const cert_der = try makeEd25519Leaf(&cert_buf, kp);
 
     const listen_fd = try listenLoopback();
-    defer _ = linux.close(listen_fd);
+    defer {
+        socketClose(listen_fd);
+        socketCleanup();
+    }
     const port = try loopbackPort(listen_fd);
 
     var io_t = std.Io.Threaded.init(alloc, .{});
@@ -942,19 +1089,19 @@ test "subprocess: shim client honors -curves 23 (secp256r1), exits 0" {
 
     const afd = try acceptWithTimeout(listen_fd, 5000);
     {
-        errdefer _ = linux.close(afd);
+        errdefer socketClose(afd);
         setReadTimeout(afd, 5000);
         var idbuf: [8]u8 = undefined;
         try readExact(afd, &idbuf);
         try peerServerVerifyEcho(alloc, afd, cert_der, kp);
     }
-    _ = linux.close(afd);
+    socketClose(afd);
 
     try expectExit(try child.wait(io), 0);
 }
 
 test "subprocess: unimplemented flag ⇒ exit 89 (no dial)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
     var pathbuf: [1024]u8 = undefined;
     const bin = shimBinPath(&pathbuf) orelse return error.SkipZigTest;
     const alloc = testing.allocator;
@@ -970,13 +1117,16 @@ test "subprocess: unimplemented flag ⇒ exit 89 (no dial)" {
 }
 
 test "subprocess: malformed ClientHello ⇒ handshake failure, nonzero (not 89)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
     var pathbuf: [1024]u8 = undefined;
     const bin = shimBinPath(&pathbuf) orelse return error.SkipZigTest;
     const alloc = testing.allocator;
 
     const listen_fd = try listenLoopback();
-    defer _ = linux.close(listen_fd);
+    defer {
+        socketClose(listen_fd);
+        socketCleanup();
+    }
     const port = try loopbackPort(listen_fd);
 
     var io_t = std.Io.Threaded.init(alloc, .{});
@@ -991,7 +1141,7 @@ test "subprocess: malformed ClientHello ⇒ handshake failure, nonzero (not 89)"
 
     const afd = try acceptWithTimeout(listen_fd, 5000);
     {
-        errdefer _ = linux.close(afd);
+        errdefer socketClose(afd);
         setReadTimeout(afd, 5000);
         var idbuf: [8]u8 = undefined;
         try readExact(afd, &idbuf);
@@ -1000,7 +1150,7 @@ test "subprocess: malformed ClientHello ⇒ handshake failure, nonzero (not 89)"
         const bad = [_]u8{ 0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00 };
         try sockWriteAll(afd, &bad);
     }
-    _ = linux.close(afd);
+    socketClose(afd);
 
     switch (try child.wait(io)) {
         .exited => |c| {

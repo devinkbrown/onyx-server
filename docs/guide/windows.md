@@ -657,14 +657,16 @@ and matching target architecture:
 zig build -j1 -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
 zig build -j1 test-windows -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
+zig build -j1 bogo-shim-test -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 ```
 
 The build validates and corrects the self-hosted test PE stack
 reserve to 64 MiB before each test run. This backend produces larger binaries
-and can start more slowly. The full unfiltered suite and release gates remain
-required before shipping; focused and native gates alone do not establish full
-Windows support.
+and can start more slowly. The in-repo BoGo shim tests use native Winsock and
+Onyx's Zig TLS engine; they need no OpenSSL library or executable. The full
+unfiltered suite and release gates remain required before shipping; focused
+and native gates alone do not establish full Windows support.
 
 For the complete build and test command list, see [Build guide](build.md) and
 [Testing guide](testing.md).

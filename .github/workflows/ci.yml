@@ -51,7 +51,7 @@ jobs:
   windows-native:
     name: native Windows full daemon
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - name: Install and verify pinned Windows Zig
@@ -84,6 +84,19 @@ jobs:
         run: zig build -j1 test-windows -Dtarget=x86_64-windows --summary all
       - name: Run focused Windows tests (ReleaseSafe)
         run: zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+      - name: Run Windows BoGo shim loopback tests
+        run: zig build -j1 bogo-shim-test -Dtarget=x86_64-windows --summary all
+      - name: Run focused Windows tests with native Zig codegen
+        run: zig build -j1 test-windows -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+      - name: Run ReleaseSafe Windows tests with native Zig codegen
+        run: zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true --summary all
+      - name: Build native-codegen Windows release package
+        run: zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true --prefix .\zig-out-selfhosted --summary all
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Smoke native-codegen Windows release package
+        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --tls --wss --metrics --webhook
       - name: Run full Windows test suite (Debug)
         run: zig build -j1 test -Dtarget=x86_64-windows --summary all
       - name: Run portable protocol tests (Debug)
@@ -100,9 +113,6 @@ jobs:
         run: zig build -j1 test-cli -Dtarget=x86_64-windows --summary all
       - name: Run complete native CLI tests (ReleaseSafe)
         run: zig build -j1 test-cli -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
       - name: Run native full-daemon IRC, TLS, WSS, metrics, and webhook smoke
         run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --wss --metrics --webhook
       - name: Run native plaintext WebSocket smoke
