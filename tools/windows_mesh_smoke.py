@@ -101,6 +101,9 @@ def node_config(
         f"require_secured = true\nrequire_signed_frames = true\ntrust_roots = [{roots_text}]\n{connect}{relay}"
         f"[cloak]\nsecret = \"test-only-shared-cloak-secret\"\n"
         f"{tls_config}{account_config}"
+        # Link gauges use the periodic stats snapshot. Keep the acceptance
+        # oracle fresh during the cold-reconnect window.
+        f"[stats]\ninterval = \"1s\"\n"
         f"[metrics]\nbind = \"{HOST}\"\nlisten = {metrics}\n"
     )
 
