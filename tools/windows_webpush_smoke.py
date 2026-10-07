@@ -2,20 +2,23 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Probe native Windows Web Push VAPID custody and worker boot.
+"""Probe native Windows Web Push VAPID custody, memo enqueue, and worker boot.
 
 The local SSRF guard intentionally rejects loopback delivery endpoints, so
-this smoke checks private key preflight, live worker startup, and key identity
-across restart. Native module tests cover the pinned-address HTTPS path.
+this smoke checks private key preflight, live worker startup, memo-triggered
+delivery refusal, and key/subscription identity across restart. Native module
+tests cover the pinned-address HTTPS path.
 
 Usage: python -B tools/windows_webpush_smoke.py [zig-out/bin/onyx-server.exe]
 """
 
 import argparse
+import base64
 from contextlib import closing
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import ssl
 import subprocess
@@ -23,11 +26,17 @@ import tempfile
 import time
 
 from windows_private_account_dir import create_private_directory
+from windows_helix_smoke import Client, authenticate_account, wait_log_contains
 
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BINARY = ROOT / "zig-out" / "bin" / "onyx-server.exe"
 HOST = "127.0.0.1"
+P256_GENERATOR = bytes.fromhex(
+    "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+    "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+)
+PUSH_ENDPOINT = b"https://127.0.0.1/onyx-webpush-smoke"
 
 
 def reserve_port():
@@ -98,6 +107,52 @@ def stop(proc):
         proc.wait(timeout=5)
 
 
+def exercise_memo_push(port, log_path, attempt, recipient_password, sender_password, auth):
+    if attempt == 1:
+        recipient = Client(port)
+        try:
+            recipient.register(b"pushrecipient")
+            recipient.command(b"REGISTER pushrecipient * " + recipient_password,
+                              b"REGISTER SUCCESS", timeout=45)
+            recipient.command(
+                b"WEBPUSH SUBSCRIBE " + PUSH_ENDPOINT + b" "
+                + base64.urlsafe_b64encode(P256_GENERATOR).rstrip(b"=") + b" "
+                + base64.urlsafe_b64encode(auth).rstrip(b"="),
+                b"WEBPUSH: subscription stored",
+            )
+        finally:
+            recipient.close()
+    else:
+        recipient = authenticate_account(port, b"pushrecipient", recipient_password,
+                                         b"pushrecipient")
+        try:
+            start = len(recipient.lines)
+            recipient.command(b"WEBPUSH LIST", b"subscription(s)")
+            if not any(PUSH_ENDPOINT in line for line in recipient.lines[start:]):
+                raise AssertionError("Web Push subscription did not survive cold restart")
+        finally:
+            recipient.close()
+
+    if attempt == 1:
+        sender = Client(port)
+    else:
+        sender = authenticate_account(port, b"pushsender", sender_password,
+                                      b"pushsender")
+    try:
+        if attempt == 1:
+            sender.register(b"pushsender")
+            sender.command(b"REGISTER pushsender * " + sender_password,
+                           b"REGISTER SUCCESS", timeout=45)
+        marker = f"offline-push-{attempt}".encode("ascii")
+        sender.command(b"MEMO SEND pushrecipient :" + marker,
+                       b"MEMO: message stored for delivery")
+        wait_log_contains(log_path,
+                          "webpush: delivery to " + PUSH_ENDPOINT.decode("ascii")
+                          + " failed: DisallowedPushEndpoint", timeout=15)
+    finally:
+        sender.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", nargs="?", type=Path, default=DEFAULT_BINARY)
@@ -137,6 +192,9 @@ def main():
 
         public = None
         key_bytes = None
+        recipient_password = secrets.token_urlsafe(22).encode("ascii")
+        sender_password = secrets.token_urlsafe(22).encode("ascii")
+        auth = secrets.token_bytes(16)
         for attempt in (1, 2):
             log = run_dir / f"daemon-{attempt}.log"
             proc = None
@@ -153,6 +211,8 @@ def main():
                         raise AssertionError(f"worker did not report live startup: {log.read_text(encoding='utf-8', errors='replace')}")
                     if proc.poll() is not None:
                         raise AssertionError("daemon exited after Web Push worker startup")
+                    exercise_memo_push(port, log, attempt, recipient_password,
+                                       sender_password, auth)
             finally:
                 stop(proc)
             persisted = (run_dir / "vapid-private" / "vapid.key").read_bytes()
@@ -162,7 +222,7 @@ def main():
                 public, key_bytes = advertised, persisted
             elif advertised != public or persisted != key_bytes:
                 raise AssertionError("VAPID key or advertised public identity changed after restart")
-        print("PASS: live Windows Web Push worker booted and retained VAPID identity across restart")
+        print("PASS: Windows Web Push memo enqueue and loopback guard; VAPID and subscription persist across restart")
 
 
 if __name__ == "__main__":

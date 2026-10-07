@@ -217,9 +217,12 @@ Web Push requires an enabled account store, a private parent directory for
 `[webpush].vapid_key_path`, and a PEM CA bundle at
 `[acme].ca_bundle_path`. Windows boot fails if the key or trust bundle cannot
 be loaded. The native smoke checks private key preflight, VAPID advertisement,
-worker startup, and stable key identity after restart. Its local endpoint
-cannot test delivery because the production SSRF guard refuses loopback push
-targets; focused native tests cover the pinned-address HTTPS request path.
+worker startup, a stored subscription across restart, and an offline memo that
+reaches the worker. Its loopback endpoint is rejected by the production SSRF
+guard after the worker encrypts the payload. A native Windows module test uses
+a pure Zig trusted HTTPS peer to decrypt the POST payload and check 201 and 410
+outcomes through the pinned-address request path. Delivery to a real push
+service still needs external acceptance.
 
 ACME renewal and the `acme-issue` command use native Windows HTTP-01 and
 HTTPS transports. Set `[tls].cert_path`, `[tls].key_path`, `[acme].domain`,
@@ -227,11 +230,12 @@ and `[acme].ca_bundle_path` to a PEM trust bundle when enabling renewal.
 Create the key file's parent with `onyx-server.exe --init-private-dir <path>`;
 preflight refuses a broad parent directory or an unreadable trust bundle.
 OCSP stapling uses the same trust bundle and requires an on-disk TLS fullchain
-at `[tls].cert_path`. Native module tests cover the HTTP-01 listener, pinned
-CA request, private key publication, and worker lifecycle. The disposable
-daemon smoke checks private preflight, a TLS handshake, both worker starts,
-and a CLI error path. Public ACME issuance and live OCSP publication still
-require an end-to-end acceptance run.
+at `[tls].cert_path`. A native Windows module test completes ACME issuance
+against a pure Zig loopback CA: it checks the live HTTP-01 challenge, trusted
+HTTPS exchange, published fullchain and matching private key, and key ACL. The
+disposable daemon smoke checks private preflight, a TLS handshake, both worker
+starts, and a CLI error path. Public ACME issuance and live OCSP publication
+still require an end-to-end acceptance run.
 
 Configured OCG2 mint, project, and observe modes load the durable authority
 from the private account store on Windows. The native smoke initializes it,

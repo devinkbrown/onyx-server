@@ -407,6 +407,9 @@ pub const Worker = struct {
     producers: runtime_pause.ProducerState = .{},
     system_resolver: ?*acme_runner.SystemResolver = null,
     delivery_fixture: if (builtin.is_test) ?*DeliveryFixture else void = if (builtin.is_test) null else {},
+    /// Native HTTPS loopback tests pin only the transport address. Production
+    /// builds have no override and always pass through GuardedResolver.
+    test_delivery_addr: if (builtin.is_test) ?net.IpAddress else void = if (builtin.is_test) null else {},
 
     /// Delivery stats (worker-thread writes, oper-command reads are racy-read
     /// tolerable: monotonically increasing counters).
@@ -810,7 +813,10 @@ pub const Worker = struct {
         var guard = GuardedResolver{ .inner = self.resolver };
         const raw = if (comptime builtin.os.tag == .windows) blk: {
             const checked = guard.resolver();
-            const addr = try checked.resolveFn(checked.ctx, url.host, url.port);
+            const addr = if (comptime builtin.is_test) test_addr: {
+                if (self.test_delivery_addr) |pinned| break :test_addr pinned;
+                break :test_addr try checked.resolveFn(checked.ctx, url.host, url.port);
+            } else try checked.resolveFn(checked.ctx, url.host, url.port);
             var host_header_buf: [max_endpoint_len]u8 = undefined;
             const host_header = if (url.port == 443)
                 url.host
@@ -909,6 +915,233 @@ test "webpush Windows VAPID key requires private parent and persists with privat
     var first_b64: [vapid_pub_b64_len]u8 = undefined;
     var second_b64: [vapid_pub_b64_len]u8 = undefined;
     try testing.expectEqualStrings(created.publicB64(&first_b64), restarted.publicB64(&second_b64));
+}
+
+test "webpush Windows HTTPS delivers encrypted POST and records 201 and 410" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const metrics = @import("metrics_http.zig");
+    const selfsign = @import("../proto/x509_selfsign.zig");
+    const tls_server = @import("../crypto/tls_server.zig");
+    const ecdh = @import("../crypto/ecdh_p256.zig");
+    const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Win = struct {
+        const invalid_socket = std.math.maxInt(usize);
+        const FdSet = extern struct { count: u32, sockets: [64]usize };
+        const Timeval = extern struct { seconds: i32, microseconds: i32 };
+        extern "ws2_32" fn select(i32, ?*FdSet, ?*FdSet, ?*FdSet, *Timeval) callconv(.winapi) i32;
+        extern "ws2_32" fn accept(usize, ?*anyopaque, ?*i32) callconv(.winapi) usize;
+        extern "ws2_32" fn closesocket(usize) callconv(.winapi) i32;
+        extern "ws2_32" fn ioctlsocket(usize, u32, *u32) callconv(.winapi) i32;
+        extern "ws2_32" fn setsockopt(usize, i32, i32, *const anyopaque, i32) callconv(.winapi) i32;
+        extern "ws2_32" fn recv(usize, [*]u8, i32, i32) callconv(.winapi) i32;
+        extern "ws2_32" fn send(usize, [*]const u8, i32, i32) callconv(.winapi) i32;
+    };
+    const Peer = struct {
+        listener: usize,
+        port: u16,
+        chain: []const []const u8,
+        key_pair: std.crypto.sign.Ed25519.KeyPair,
+        ua: ecdh.KeyPair,
+        auth: [16]u8,
+        seen: [2]bool = .{ false, false },
+        failure: ?anyerror = null,
+
+        fn readRecord(fd: usize, buffer: []u8) ![]u8 {
+            var used: usize = 0;
+            while (used < 5) {
+                const got = Win.recv(fd, buffer[used..].ptr, @intCast(5 - used), 0);
+                if (got <= 0) return error.TestUnexpectedResult;
+                used += @intCast(got);
+            }
+            const len = 5 + @as(usize, std.mem.readInt(u16, buffer[3..5], .big));
+            if (len > buffer.len) return error.TestUnexpectedResult;
+            while (used < len) {
+                const got = Win.recv(fd, buffer[used..].ptr, @intCast(len - used), 0);
+                if (got <= 0) return error.TestUnexpectedResult;
+                used += @intCast(got);
+            }
+            return buffer[0..len];
+        }
+
+        fn sendAll(fd: usize, bytes: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < bytes.len) {
+                const got = Win.send(fd, bytes[sent..].ptr, @intCast(bytes.len - sent), 0);
+                if (got <= 0) return error.TestUnexpectedResult;
+                sent += @intCast(got);
+            }
+        }
+
+        fn checkEncryptedBody(self: *@This(), body: []const u8, expected: []const u8) !void {
+            try testing.expectEqual(@as(usize, 86 + expected.len + wp_crypto.record_overhead), body.len);
+            const salt = body[0..16].*;
+            try testing.expectEqual(wp_crypto.record_size, std.mem.readInt(u32, body[16..20], .big));
+            try testing.expectEqual(@as(u8, 65), body[20]);
+            const as_public = body[21..86].*;
+            const secret = try ecdh.sharedSecret(self.ua.secret, as_public);
+            const prk_key = HkdfSha256.extract(&self.auth, &secret);
+            var key_info: ["WebPush: info".len + 1 + 130]u8 = undefined;
+            @memcpy(key_info[0..13], "WebPush: info");
+            key_info[13] = 0;
+            @memcpy(key_info[14..79], &self.ua.public_sec1);
+            @memcpy(key_info[79..144], &as_public);
+            var ikm: [32]u8 = undefined;
+            HkdfSha256.expand(&ikm, &key_info, prk_key);
+            const prk = HkdfSha256.extract(&salt, &ikm);
+            var cek: [16]u8 = undefined;
+            HkdfSha256.expand(&cek, "Content-Encoding: aes128gcm\x00", prk);
+            var nonce: [12]u8 = undefined;
+            HkdfSha256.expand(&nonce, "Content-Encoding: nonce\x00", prk);
+            const ciphertext = body[86 .. body.len - 16];
+            const tag = body[body.len - 16 ..][0..16].*;
+            const plaintext = try std.heap.page_allocator.alloc(u8, ciphertext.len);
+            defer std.heap.page_allocator.free(plaintext);
+            try Aes128Gcm.decrypt(plaintext, ciphertext, tag, "", nonce, cek);
+            try testing.expectEqual(@as(u8, 0x02), plaintext[plaintext.len - 1]);
+            try testing.expectEqualStrings(expected, plaintext[0 .. plaintext.len - 1]);
+        }
+
+        fn run(self: *@This()) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn exchange(self: *@This()) !void {
+            const paths = [_][]const u8{ "/send/accepted", "/send/gone" };
+            const payloads = [_][]const u8{ "first encrypted push", "second encrypted push" };
+            const responses = [_][]const u8{
+                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n",
+                "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\n\r\n",
+            };
+            for (paths, payloads, responses, 0..) |path, payload, response_text, i| {
+                var reads = Win.FdSet{ .count = 1, .sockets = undefined };
+                reads.sockets[0] = self.listener;
+                var timeout = Win.Timeval{ .seconds = 5, .microseconds = 0 };
+                if (Win.select(0, &reads, null, null, &timeout) != 1) return error.TestUnexpectedResult;
+                const fd = Win.accept(self.listener, null, null);
+                if (fd == Win.invalid_socket) return error.TestUnexpectedResult;
+                defer _ = Win.closesocket(fd);
+                var blocking: u32 = 0;
+                if (Win.ioctlsocket(fd, 0x8004667e, &blocking) != 0) return error.TestUnexpectedResult;
+                const timeout_ms: u32 = 5000;
+                if (Win.setsockopt(fd, 0xffff, 0x1006, &timeout_ms, @sizeOf(u32)) != 0 or
+                    Win.setsockopt(fd, 0xffff, 0x1005, &timeout_ms, @sizeOf(u32)) != 0) return error.TestUnexpectedResult;
+                var engine = try tls_server.Server.init(std.heap.page_allocator, .{
+                    .cert_chain = self.chain,
+                    .signing_key = self.key_pair,
+                });
+                defer engine.deinit();
+                var buffer: [16 * 1024 + 512]u8 = undefined;
+                while (!engine.handshakeDone()) {
+                    switch (try engine.feed(try readRecord(fd, &buffer))) {
+                        .bytes_to_send => |bytes| {
+                            defer std.heap.page_allocator.free(bytes);
+                            try sendAll(fd, bytes);
+                        },
+                        .need_more => {},
+                    }
+                }
+                const request = try engine.decrypt(try readRecord(fd, &buffer));
+                defer std.heap.page_allocator.free(request);
+                const head_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return error.TestUnexpectedResult;
+                const head = request[0..head_end];
+                const body = request[head_end + 4 ..];
+                var request_line_buf: [128]u8 = undefined;
+                const request_line = try std.fmt.bufPrint(&request_line_buf, "POST {s} HTTP/1.1\r\n", .{path});
+                try testing.expect(std.mem.startsWith(u8, head, request_line));
+                var host_buf: [64]u8 = undefined;
+                const host = try std.fmt.bufPrint(&host_buf, "Host: 127.0.0.1:{d}", .{self.port});
+                try testing.expect(std.mem.indexOf(u8, head, host) != null);
+                try testing.expect(std.mem.indexOf(u8, head, "authorization: vapid t=") != null);
+                try testing.expect(std.mem.indexOf(u8, head, ", k=") != null);
+                try testing.expect(std.mem.indexOf(u8, head, "content-encoding: aes128gcm") != null);
+                try testing.expect(std.mem.indexOf(u8, head, "content-type: application/octet-stream") != null);
+                try testing.expect(std.mem.indexOf(u8, head, "ttl: 43200") != null);
+                try testing.expect(std.mem.indexOf(u8, head, "urgency: high") != null);
+                const length_pos = std.mem.lastIndexOf(u8, head, "Content-Length: ") orelse return error.TestUnexpectedResult;
+                const declared_length = try std.fmt.parseInt(usize, head[length_pos + "Content-Length: ".len ..], 10);
+                try testing.expectEqual(body.len, declared_length);
+                try self.checkEncryptedBody(body, payload);
+                self.seen[i] = true;
+                const response = try engine.encrypt(response_text);
+                defer std.heap.page_allocator.free(response);
+                try sendAll(fd, response);
+            }
+        }
+    };
+    const StaticResolver = struct {
+        fn resolve(_: *anyopaque, _: []const u8, port: u16) anyerror!net.IpAddress {
+            return net.IpAddress.parse("127.0.0.1", port);
+        }
+    };
+
+    var snapshot = metrics.MetricsSnapshot.init(testing.allocator);
+    defer snapshot.deinit();
+    var listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer listener.shutdown();
+    const key_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x69));
+    var cert_buffer: [2048]u8 = undefined;
+    const cert = try selfsign.buildSelfSigned(&cert_buffer, .{
+        .common_name = "127.0.0.1",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x69, 1 },
+        .key_pair = key_pair,
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{cert};
+    const ua = try ecdh.generate();
+    const auth: [16]u8 = @splat(0x69);
+    var peer = Peer{ .listener = listener.listen_fd, .port = listener.port, .chain = &chain, .key_pair = key_pair, .ua = ua, .auth = auth };
+    const thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, Peer.run, .{&peer});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    const vapid_secret = try ecdsa.SecretKey.fromBytes(@splat(1));
+    var resolver_ctx: u8 = 0;
+    var worker = Worker{
+        .allocator = testing.allocator,
+        .vapid = try ecdsa.KeyPair.fromSecretKey(vapid_secret),
+        .subject = "mailto:push@example.test",
+        .resolver = .{ .ctx = &resolver_ctx, .resolveFn = StaticResolver.resolve },
+        .trust_anchors = &chain,
+        .test_delivery_addr = try net.IpAddress.parse("127.0.0.1", listener.port),
+    };
+    defer worker.shutdown();
+    // The test-only pin never changes the production resolver's refusal.
+    var guard = GuardedResolver{ .inner = worker.resolver };
+    const checked = guard.resolver();
+    try testing.expectError(error.DisallowedPushEndpoint, checked.resolveFn(checked.ctx, "127.0.0.1", listener.port));
+
+    const paths = [_][]const u8{ "/send/accepted", "/send/gone" };
+    const payloads = [_][]const u8{ "first encrypted push", "second encrypted push" };
+    for (paths, payloads, 0..) |path, payload, i| {
+        var endpoint_buf: [128]u8 = undefined;
+        const endpoint = try std.fmt.bufPrint(&endpoint_buf, "https://127.0.0.1:{d}{s}", .{ listener.port, path });
+        try testing.expectEqual(Worker.EnqueueResult.queued, worker.enqueue(endpoint, ua.public_sec1, auth, payload));
+        var job = (try worker.beginDelivery()) orelse return error.TestUnexpectedResult;
+        defer {
+            worker.finishDelivery();
+            job.deinit(testing.allocator);
+        }
+        try worker.deliver(&job);
+        if (i == 0) {
+            try testing.expectEqual(@as(usize, 1), worker.sent);
+            try testing.expectEqual(@as(usize, 0), worker.failed);
+        } else {
+            try testing.expectEqual(@as(usize, 1), worker.sent);
+            try testing.expectEqual(@as(usize, 1), worker.failed);
+            try testing.expectEqual(@as(usize, 1), worker.dead.items.len);
+            try testing.expectEqualStrings(endpoint, worker.dead.items[0]);
+        }
+    }
+    thread.join();
+    joined = true;
+    if (peer.failure) |err| return err;
+    try testing.expectEqualSlices(bool, &.{ true, true }, &peer.seen);
 }
 
 test "subscription list encode/decode round-trip" {

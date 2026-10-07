@@ -1110,6 +1110,426 @@ test "Windows ACME HTTPS sends JWS request to pinned loopback and verifies CA" {
     try std.testing.expect(!untrusted_worker.request_seen and !untrusted_worker.fallback_seen);
 }
 
+test "Windows TLS ACME loopback issuance serves HTTP-01 and publishes a private matching key" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const metrics = @import("metrics_http.zig");
+    const listener = @import("acme_http01_listener.zig");
+    const selfsign = @import("../proto/x509_selfsign.zig");
+    const tls_server = @import("../crypto/tls_server.zig");
+    const tls_certs = @import("tls_certs.zig");
+    const jwk = @import("../proto/acme_jwk.zig");
+    const challenge = @import("../proto/acme_challenge.zig");
+    const base64url = @import("../proto/base64url.zig");
+    const csr = @import("../proto/csr.zig");
+    const order = @import("../proto/acme_order.zig");
+    const x509 = @import("../crypto/x509.zig");
+
+    const Win = struct {
+        const invalid_socket = std.math.maxInt(usize);
+        const SockAddr4 = extern struct {
+            family: u16 = 2,
+            port: u16,
+            addr: [4]u8 = .{ 127, 0, 0, 1 },
+            zero: [8]u8 = @splat(0),
+        };
+        const FdSet = extern struct { count: u32, sockets: [64]usize };
+        const Timeval = extern struct { seconds: i32, microseconds: i32 };
+        extern "ws2_32" fn select(i32, ?*FdSet, ?*FdSet, ?*FdSet, *Timeval) callconv(.winapi) i32;
+        extern "ws2_32" fn accept(usize, ?*anyopaque, ?*i32) callconv(.winapi) usize;
+        extern "ws2_32" fn closesocket(usize) callconv(.winapi) i32;
+        extern "ws2_32" fn WSASocketW(i32, i32, i32, ?*anyopaque, u32, u32) callconv(.winapi) usize;
+        extern "ws2_32" fn connect(usize, *const SockAddr4, i32) callconv(.winapi) i32;
+        extern "ws2_32" fn ioctlsocket(usize, u32, *u32) callconv(.winapi) i32;
+        extern "ws2_32" fn setsockopt(usize, i32, i32, *const anyopaque, i32) callconv(.winapi) i32;
+        extern "ws2_32" fn recv(usize, [*]u8, i32, i32) callconv(.winapi) i32;
+        extern "ws2_32" fn send(usize, [*]const u8, i32, i32) callconv(.winapi) i32;
+    };
+    const Ca = struct {
+        socket: usize,
+        port: u16,
+        challenge_port: u16,
+        api_cert: []const u8,
+        api_key: std.crypto.sign.Ed25519.KeyPair,
+        account_public_key: ecdsa_p256.PublicKey,
+        expected_contact: []const u8,
+        expected_finalize_payload: []const u8,
+        issued_chain_pem: []const u8,
+        expected_authorization: []const u8,
+        steps_done: usize = 0,
+        challenge_checked: bool = false,
+        failure: ?anyerror = null,
+
+        fn sendAll(fd: usize, bytes: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < bytes.len) {
+                const n = Win.send(fd, bytes[sent..].ptr, @intCast(bytes.len - sent), 0);
+                if (n <= 0) return error.TestUnexpectedResult;
+                sent += @intCast(n);
+            }
+        }
+
+        fn readable(fd: usize) !bool {
+            var reads = Win.FdSet{ .count = 1, .sockets = undefined };
+            reads.sockets[0] = fd;
+            var timeout = Win.Timeval{ .seconds = 5, .microseconds = 0 };
+            const ready = Win.select(0, &reads, null, null, &timeout);
+            if (ready < 0) return error.TestUnexpectedResult;
+            return ready != 0;
+        }
+
+        fn record(fd: usize, buffer: []u8) ![]u8 {
+            var used: usize = 0;
+            while (used < 5) {
+                const got = Win.recv(fd, buffer[used..].ptr, @intCast(5 - used), 0);
+                if (got <= 0) return error.TestUnexpectedResult;
+                used += @intCast(got);
+            }
+            const len = 5 + @as(usize, std.mem.readInt(u16, buffer[3..5], .big));
+            if (len > buffer.len) return error.TestUnexpectedResult;
+            while (used < len) {
+                const got = Win.recv(fd, buffer[used..].ptr, @intCast(len - used), 0);
+                if (got <= 0) return error.TestUnexpectedResult;
+                used += @intCast(got);
+            }
+            return buffer[0..len];
+        }
+
+        fn stringMember(value: std.json.Value, name: []const u8) ![]const u8 {
+            if (value != .object) return error.TestUnexpectedResult;
+            const member = value.object.get(name) orelse return error.TestUnexpectedResult;
+            if (member != .string) return error.TestUnexpectedResult;
+            return member.string;
+        }
+
+        fn checkJws(self: *@This(), step: usize, request: []const u8) !void {
+            const head_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return error.TestUnexpectedResult;
+            const body = request[head_end + 4 ..];
+            var flattened = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{});
+            defer flattened.deinit();
+            const protected_b64 = try stringMember(flattened.value, "protected");
+            const payload_b64 = try stringMember(flattened.value, "payload");
+            const signature_b64 = try stringMember(flattened.value, "signature");
+
+            var protected_buf: [1024]u8 = undefined;
+            const protected_json = try base64url.decode(&protected_buf, protected_b64);
+            var protected = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, protected_json, .{});
+            defer protected.deinit();
+            if (!std.mem.eql(u8, try stringMember(protected.value, "alg"), "ES256")) return error.TestUnexpectedResult;
+            var nonce_buf: [24]u8 = undefined;
+            const nonce = try std.fmt.bufPrint(&nonce_buf, "n{d}", .{step - 1});
+            if (!std.mem.eql(u8, try stringMember(protected.value, "nonce"), nonce)) return error.TestUnexpectedResult;
+            const first_space = std.mem.indexOfScalar(u8, request, ' ') orelse return error.TestUnexpectedResult;
+            const rest = request[first_space + 1 ..];
+            const path_end = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.TestUnexpectedResult;
+            var url_buf: [160]u8 = undefined;
+            const expected_url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}{s}", .{ self.port, rest[0..path_end] });
+            if (!std.mem.eql(u8, try stringMember(protected.value, "url"), expected_url)) return error.TestUnexpectedResult;
+            if (step == 1) {
+                const key = protected.value.object.get("jwk") orelse return error.TestUnexpectedResult;
+                if (!std.mem.eql(u8, try stringMember(key, "kty"), "EC") or
+                    !std.mem.eql(u8, try stringMember(key, "crv"), "P-256")) return error.TestUnexpectedResult;
+                const point = self.account_public_key.toUncompressedSec1();
+                var x_buf: [jwk.thumbprint_b64_len]u8 = undefined;
+                var y_buf: [jwk.thumbprint_b64_len]u8 = undefined;
+                const x = std.base64.url_safe_no_pad.Encoder.encode(&x_buf, point[1..33]);
+                const y = std.base64.url_safe_no_pad.Encoder.encode(&y_buf, point[33..65]);
+                if (!std.mem.eql(u8, try stringMember(key, "x"), x) or
+                    !std.mem.eql(u8, try stringMember(key, "y"), y)) return error.TestUnexpectedResult;
+            } else {
+                var kid_buf: [160]u8 = undefined;
+                const kid = try std.fmt.bufPrint(&kid_buf, "https://127.0.0.1:{d}/acct/9", .{self.port});
+                if (!std.mem.eql(u8, try stringMember(protected.value, "kid"), kid)) return error.TestUnexpectedResult;
+            }
+
+            var sig_buf: [ecdsa_p256.raw_signature_length]u8 = undefined;
+            const sig_bytes = try base64url.decode(&sig_buf, signature_b64);
+            if (sig_bytes.len != sig_buf.len) return error.TestUnexpectedResult;
+            var signing_buf: [8192]u8 = undefined;
+            const signing_input = try std.fmt.bufPrint(&signing_buf, "{s}.{s}", .{ protected_b64, payload_b64 });
+            if (!ecdsa_p256.verify(ecdsa_p256.Signature.fromBytes(sig_buf), signing_input, self.account_public_key))
+                return error.TestUnexpectedResult;
+
+            var payload_buf: [8192]u8 = undefined;
+            const payload = try base64url.decode(&payload_buf, payload_b64);
+            if (step == 1 or step == 2) {
+                var parsed_payload = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload, .{});
+                defer parsed_payload.deinit();
+                if (parsed_payload.value != .object) return error.TestUnexpectedResult;
+                if (step == 1) {
+                    const agreed = parsed_payload.value.object.get("termsOfServiceAgreed") orelse return error.TestUnexpectedResult;
+                    const contacts = parsed_payload.value.object.get("contact") orelse return error.TestUnexpectedResult;
+                    if (agreed != .bool or !agreed.bool or contacts != .array or contacts.array.items.len != 1 or
+                        contacts.array.items[0] != .string or
+                        !std.mem.eql(u8, contacts.array.items[0].string, self.expected_contact))
+                        return error.TestUnexpectedResult;
+                } else {
+                    const identifiers = parsed_payload.value.object.get("identifiers") orelse return error.TestUnexpectedResult;
+                    if (identifiers != .array or identifiers.array.items.len != 1) return error.TestUnexpectedResult;
+                    const identifier = identifiers.array.items[0];
+                    if (!std.mem.eql(u8, try stringMember(identifier, "type"), "dns") or
+                        !std.mem.eql(u8, try stringMember(identifier, "value"), "localhost"))
+                        return error.TestUnexpectedResult;
+                }
+            }
+            if (step == 6 and !std.mem.eql(u8, payload, self.expected_finalize_payload)) return error.TestUnexpectedResult;
+            if (step == 4 and !std.mem.eql(u8, payload, "{}")) return error.TestUnexpectedResult;
+            if ((step == 3 or step == 5 or step >= 7) and payload.len != 0) return error.TestUnexpectedResult;
+        }
+
+        fn checkChallenge(self: *@This()) !void {
+            const fd = Win.WSASocketW(2, 1, 6, null, 0, 1);
+            if (fd == Win.invalid_socket) return error.TestUnexpectedResult;
+            defer _ = Win.closesocket(fd);
+            const address = Win.SockAddr4{ .port = std.mem.nativeToBig(u16, self.challenge_port) };
+            if (Win.connect(fd, &address, @sizeOf(Win.SockAddr4)) != 0) return error.TestUnexpectedResult;
+            const timeout_ms: u32 = 2000;
+            if (Win.setsockopt(fd, 0xffff, 0x1006, &timeout_ms, @sizeOf(u32)) != 0) return error.TestUnexpectedResult;
+            try sendAll(fd, "GET /.well-known/acme-challenge/tok123 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            var response: [4096]u8 = undefined;
+            var used: usize = 0;
+            while (used < response.len) {
+                const got = Win.recv(fd, response[used..].ptr, @intCast(response.len - used), 0);
+                if (got <= 0) return error.TestUnexpectedResult;
+                used += @intCast(got);
+                if (std.mem.indexOf(u8, response[0..used], self.expected_authorization) != null) break;
+            }
+            if (!std.mem.startsWith(u8, response[0..used], "HTTP/1.1 200 OK\r\n") or
+                std.mem.indexOf(u8, response[0..used], self.expected_authorization) == null)
+                return error.TestUnexpectedResult;
+            self.challenge_checked = true;
+        }
+
+        fn responseBody(self: *@This(), step: usize, out: []u8) ![]const u8 {
+            const base = try std.fmt.bufPrint(out, "https://127.0.0.1:{d}", .{self.port});
+            var body: [4096]u8 = undefined;
+            const result = switch (step) {
+                0 => try std.fmt.bufPrint(&body, "{{\"newNonce\":\"{s}/nonce\",\"newAccount\":\"{s}/acct\",\"newOrder\":\"{s}/order\",\"revokeCert\":\"{s}/revoke\",\"keyChange\":\"{s}/keychange\"}}", .{ base, base, base, base, base }),
+                1 => "{\"status\":\"valid\"}",
+                2 => try std.fmt.bufPrint(&body, "{{\"status\":\"pending\",\"identifiers\":[{{\"type\":\"dns\",\"value\":\"localhost\"}}],\"authorizations\":[\"{s}/authz/1\"],\"finalize\":\"{s}/finalize/1\"}}", .{ base, base }),
+                3, 4 => try std.fmt.bufPrint(&body, "{{\"status\":\"pending\",\"identifier\":{{\"type\":\"dns\",\"value\":\"localhost\"}},\"challenges\":[{{\"type\":\"http-01\",\"url\":\"{s}/chal/1\",\"token\":\"tok123\",\"status\":\"pending\"}}]}}", .{base}),
+                5 => try std.fmt.bufPrint(&body, "{{\"status\":\"valid\",\"identifier\":{{\"type\":\"dns\",\"value\":\"localhost\"}},\"challenges\":[{{\"type\":\"http-01\",\"url\":\"{s}/chal/1\",\"token\":\"tok123\",\"status\":\"valid\"}}]}}", .{base}),
+                6, 7 => try std.fmt.bufPrint(&body, "{{\"status\":\"processing\",\"identifiers\":[{{\"type\":\"dns\",\"value\":\"localhost\"}}],\"authorizations\":[\"{s}/authz/1\"],\"finalize\":\"{s}/finalize/1\"}}", .{ base, base }),
+                8 => try std.fmt.bufPrint(&body, "{{\"status\":\"valid\",\"identifiers\":[{{\"type\":\"dns\",\"value\":\"localhost\"}}],\"authorizations\":[\"{s}/authz/1\"],\"finalize\":\"{s}/finalize/1\",\"certificate\":\"{s}/cert/1\"}}", .{ base, base, base }),
+                9 => self.issued_chain_pem,
+                else => return error.TestUnexpectedResult,
+            };
+            if (result.len > out.len) return error.TestUnexpectedResult;
+            @memcpy(out[0..result.len], result);
+            return out[0..result.len];
+        }
+
+        fn exchange(self: *@This(), step: usize) !void {
+            if (!try readable(self.socket)) return error.TestUnexpectedResult;
+            const fd = Win.accept(self.socket, null, null);
+            if (fd == Win.invalid_socket) return error.TestUnexpectedResult;
+            defer _ = Win.closesocket(fd);
+            var blocking: u32 = 0;
+            if (Win.ioctlsocket(fd, 0x8004667e, &blocking) != 0) return error.TestUnexpectedResult;
+            const timeout_ms: u32 = 3000;
+            if (Win.setsockopt(fd, 0xffff, 0x1006, &timeout_ms, @sizeOf(u32)) != 0 or
+                Win.setsockopt(fd, 0xffff, 0x1005, &timeout_ms, @sizeOf(u32)) != 0) return error.TestUnexpectedResult;
+            var engine = try tls_server.Server.init(std.heap.page_allocator, .{
+                .cert_chain = &.{self.api_cert},
+                .signing_key = self.api_key,
+            });
+            defer engine.deinit();
+            var record_buf: [max_tls_record]u8 = undefined;
+            while (!engine.handshakeDone()) {
+                switch (try engine.feed(try record(fd, &record_buf))) {
+                    .bytes_to_send => |bytes| {
+                        defer std.heap.page_allocator.free(bytes);
+                        try sendAll(fd, bytes);
+                    },
+                    .need_more => {},
+                }
+            }
+            const request = try engine.decrypt(try record(fd, &record_buf));
+            defer std.heap.page_allocator.free(request);
+            const paths = [_][]const u8{
+                "GET /directory HTTP/1.1\r\n",   "POST /acct HTTP/1.1\r\n",
+                "POST /order HTTP/1.1\r\n",      "POST /authz/1 HTTP/1.1\r\n",
+                "POST /chal/1 HTTP/1.1\r\n",     "POST /authz/1 HTTP/1.1\r\n",
+                "POST /finalize/1 HTTP/1.1\r\n", "POST /order/1 HTTP/1.1\r\n",
+                "POST /order/1 HTTP/1.1\r\n",    "POST /cert/1 HTTP/1.1\r\n",
+            };
+            if (!std.mem.startsWith(u8, request, paths[step])) return error.TestUnexpectedResult;
+            if (step != 0) {
+                if (std.mem.indexOf(u8, request, "Content-Type: application/jose+json\r\n") == null)
+                    return error.TestUnexpectedResult;
+                try self.checkJws(step, request);
+            }
+            // The state machine publishes the token after the challenge POST
+            // returns. A real CA validates asynchronously; do so on the next
+            // authorization poll, after the runner has handled that effect.
+            if (step == 5) try self.checkChallenge();
+
+            var body_buf: [4096]u8 = undefined;
+            const body = try self.responseBody(step, &body_buf);
+            var location_buf: [160]u8 = undefined;
+            const location: []const u8 = switch (step) {
+                1 => try std.fmt.bufPrint(&location_buf, "Location: https://127.0.0.1:{d}/acct/9\r\n", .{self.port}),
+                2 => try std.fmt.bufPrint(&location_buf, "Location: https://127.0.0.1:{d}/order/1\r\n", .{self.port}),
+                else => "",
+            };
+            var http_buf: [8192]u8 = undefined;
+            const http_response = try std.fmt.bufPrint(&http_buf, "HTTP/1.1 {s}\r\nReplay-Nonce: n{d}\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+                if (step == 1 or step == 2) @as([]const u8, "201 Created") else "200 OK",
+                step,
+                location,
+                body.len,
+                body,
+            });
+            const encrypted = try engine.encrypt(http_response);
+            defer std.heap.page_allocator.free(encrypted);
+            try sendAll(fd, encrypted);
+            self.steps_done += 1;
+        }
+
+        fn run(self: *@This()) void {
+            for (0..10) |step| self.exchange(step) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    const Static = struct {
+        fn resolve(_: *anyopaque, host: []const u8, port: u16) anyerror!net.IpAddress {
+            if (!std.mem.eql(u8, host, "127.0.0.1")) return error.TestUnexpectedResult;
+            return .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var snapshot = metrics.MetricsSnapshot.init(allocator);
+    defer snapshot.deinit();
+    var ca_listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer ca_listener.shutdown();
+    var store = http01.TokenStore.init(allocator);
+    defer store.deinit();
+    var challenge_listener = try listener.ChallengeServer.init(&store, 0);
+    defer challenge_listener.shutdown();
+    try challenge_listener.spawn();
+
+    const api_key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x69));
+    var api_der_buf: [2048]u8 = undefined;
+    const api_cert = try selfsign.buildSelfSigned(&api_der_buf, .{
+        .common_name = "127.0.0.1",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x69, 1 },
+        .key_pair = api_key,
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = true,
+    });
+    const account_key = ecdsa_p256.KeyPair.generate(io);
+    const cert_key = ecdsa_p256.KeyPair.generate(io);
+    const issuer_key = ecdsa_p256.KeyPair.generate(io);
+    var issuer_der_buf: [2048]u8 = undefined;
+    const issuer_der = try selfsign.buildSelfSignedEcdsaP256(&issuer_der_buf, .{
+        .common_name = "localhost",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x70, 1 },
+        .key_pair = issuer_key,
+        .is_ca = true,
+    });
+    var leaf_der_buf: [2048]u8 = undefined;
+    const leaf_der = try selfsign.buildEcdsaP256IssuedBy(&leaf_der_buf, .{
+        .common_name = "localhost",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x70, 2 },
+        .key_pair = cert_key,
+        .dns_names = &.{"localhost"},
+    }, issuer_key);
+    const leaf_view = try x509.parse(leaf_der);
+    var cri_buf: [4096]u8 = undefined;
+    const cri = try csr.certificationRequestInfo(&cri_buf, .{
+        .common_name = "localhost",
+        .dns_names = &.{"localhost"},
+        .spki_der = leaf_view.spki_der,
+    });
+    const csr_signature = try ecdsa_p256.sign(cri, cert_key);
+    var csr_sig_buf: [80]u8 = undefined;
+    const csr_sig_der = try ecdsa_p256.signatureToDer(csr_signature, &csr_sig_buf);
+    const ecdsa_sha256_sig_alg = [_]u8{ 0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
+    var csr_buf: [4096]u8 = undefined;
+    const expected_csr = try csr.assemble(&csr_buf, cri, &ecdsa_sha256_sig_alg, csr_sig_der);
+    var finalize_buf: [8192]u8 = undefined;
+    const expected_finalize_payload = try order.buildFinalize(&finalize_buf, expected_csr);
+    var leaf_pem_buf: [4096]u8 = undefined;
+    var issuer_pem_buf: [4096]u8 = undefined;
+    const leaf_pem = try pem.encode(&leaf_pem_buf, "CERTIFICATE", leaf_der);
+    const issuer_pem = try pem.encode(&issuer_pem_buf, "CERTIFICATE", issuer_der);
+    var fullchain_buf: [8192]u8 = undefined;
+    const fullchain = try std.fmt.bufPrint(&fullchain_buf, "{s}{s}", .{ leaf_pem, issuer_pem });
+
+    var account_es = Es256Signer.init(account_key);
+    const account_public = account_es.signer();
+    var thumb_digest: [32]u8 = undefined;
+    jwk.thumbprintEc(account_public.public_key_x, account_public.public_key_y, &thumb_digest);
+    var thumb_buf: [jwk.thumbprint_b64_len]u8 = undefined;
+    const thumb = std.base64.url_safe_no_pad.Encoder.encode(&thumb_buf, &thumb_digest);
+    var authorization_buf: [512]u8 = undefined;
+    const expected_authorization = try challenge.keyAuthorization("tok123", thumb, &authorization_buf);
+
+    var ca = Ca{
+        .socket = ca_listener.listen_fd,
+        .port = ca_listener.port,
+        .challenge_port = challenge_listener.port,
+        .api_cert = api_cert,
+        .api_key = api_key,
+        .account_public_key = account_key.public_key,
+        .expected_contact = "mailto:admin@localhost",
+        .expected_finalize_payload = expected_finalize_payload,
+        .issued_chain_pem = fullchain,
+        .expected_authorization = expected_authorization,
+    };
+    const ca_thread = try std.Thread.spawn(.{}, Ca.run, .{&ca});
+    var ca_joined = false;
+    defer if (!ca_joined) ca_thread.join();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    private.close(io);
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cert_path = try std.fs.path.join(allocator, &.{ tmp_path, "fullchain.pem" });
+    defer allocator.free(cert_path);
+    const key_path = try std.fs.path.join(allocator, &.{ tmp_path, "private", "server.key" });
+    defer allocator.free(key_path);
+    const directory_url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/directory", .{ca_listener.port});
+    defer allocator.free(directory_url);
+    var resolver_ctx: u8 = 0;
+    const result = issue(allocator, io, .{
+        .directory_url = directory_url,
+        .domains = &.{"localhost"},
+        .contacts = &.{"mailto:admin@localhost"},
+        .trust_anchors = &.{api_cert},
+        .cert_out_path = cert_path,
+        .key_out_path = key_path,
+    }, account_key, cert_key, &store, .{ .ctx = &resolver_ctx, .resolveFn = Static.resolve });
+    ca_thread.join();
+    ca_joined = true;
+    if (ca.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 10), ca.steps_done);
+    try std.testing.expect(ca.challenge_checked);
+    const issued = try result;
+    try std.testing.expectEqual(acme.State.done, issued.state);
+    try std.testing.expect(issued.cert_written);
+    var loaded = try tls_certs.loadOrBootstrap(allocator, io, .{ .cert_path = cert_path, .key_path = key_path });
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(tls_certs.KeyKind.ecdsa_p256, loaded.key_kind);
+    try std.testing.expectEqual(@as(usize, 2), loaded.cert_chain.len);
+    try std.testing.expectEqualSlices(u8, leaf_der, loaded.cert_chain[0]);
+    try std.testing.expectEqualSlices(u8, issuer_der, loaded.cert_chain[1]);
+    try std.testing.expectEqualSlices(u8, &cert_key.public_key.toUncompressedSec1(), &loaded.ecdsa_p256_signing_key.?.public_key.toUncompressedSec1());
+    const secured = try os_runtime.openExistingPrivateWindows(std.Io.Dir.cwd(), key_path, .verify_only);
+    secured.close(io);
+}
+
 test "acme writeCertAtomic leaves the public cert chain default-readable" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const io = std.testing.io;
