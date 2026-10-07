@@ -157,6 +157,11 @@ three-shard smoke verifies each shard accepts clients and that plaintext, TLS,
 and WSS clients exchange channel messages across shards. Configure
 `[limits].num_shards` to use more than one shard.
 
+Accepted client TCP sockets request a 30-second idle period and a 3-second
+keepalive probe interval through Winsock. With the usual ten-probe default,
+an unresponsive peer is normally reaped in about a minute. If the per-socket
+request fails, ordinary TCP keepalive and the IRC PING timeout remain in effect.
+
 TLS, metrics, and webhook listeners use native Windows sockets. The smoke
 starts all three in one disposable process: a TLS client completes registration
 and PING/QUIT, `GET /metrics` returns HTTP 200, and a channel founder creates a

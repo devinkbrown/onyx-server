@@ -792,6 +792,7 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
         .filters = &.{
             "Windows socket descriptors preserve pointer-sized handles and retire stale ids",
+            "Windows accepted TCP keepalive sets state and per-socket timing",
             "IOCP transfer completion cannot exceed the submitted buffer",
             "IOCP cancellation identifies the original request",
             "Windows IOCP associates each socket lifetime and drains cancellation",

@@ -11137,6 +11137,11 @@ pub const LinuxServer = struct {
             return;
         }
 
+        // Every accepted client transport uses the same TCP fd. Enable
+        // kernel-level dead-peer detection before a trusted PROXY preamble can
+        // defer TLS/WS/plain IRC setup.
+        applyClientKeepalive(conn.fd);
+
         // Capture the peer host (real + auto-cloak) before client setup. A
         // trusted PROXY preamble may replace this with the original client IP
         // before TLS/WS/plain IRC bytes are consumed.
@@ -11705,10 +11710,6 @@ pub const LinuxServer = struct {
     }
 
     fn startAcceptedClient(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, kind: AcceptKind, arm_recv: bool) !bool {
-        // Kernel-level dead-connection detection for every client transport
-        // (plain/TLS/WS share the same underlying TCP fd). Keeps channel rosters
-        // honest when a client disappears without a clean close.
-        applyClientKeepalive(conn.fd);
         return switch (kind) {
             .plain => try self.startAcceptedPlain(conn, arm_recv),
             .tls => try self.startAcceptedTls(id, conn, arm_recv),
@@ -72266,7 +72267,9 @@ fn setsockopt(fd: linux.fd_t, level: i32, optname: u32, opt: []const u8) ServerE
 /// vanished without a clean close — laptop sleep, network change, crash, killed
 /// tab with no FIN — is reaped by the kernel in ~60s instead of lingering as a
 /// channel "ghost" until the much slower app-level PING timeout (interval +
-/// timeout). Idle-but-alive clients are unaffected: the kernel answers keepalive
+/// timeout). Linux uses 30s idle + 3 probes 10s apart; Windows uses 30s idle
+/// + 3s intervals with the OS probe count (normally ten). Idle-but-alive
+/// clients are unaffected: the kernel answers keepalive
 /// probes itself, regardless of whether the client app is doing anything, so a
 /// quiet-but-connected session is never dropped. NODELAY also flushes small IRC
 /// lines immediately. Best-effort — setsockopt failures are non-fatal (the PING
@@ -72281,6 +72284,11 @@ fn applyClientKeepalive(fd: linux.fd_t) void {
         setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
         setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
         setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPCNT, std.mem.asBytes(&cnt)) catch {};
+    } else if (builtin.os.tag == .windows) {
+        io_backend.setWindowsTcpKeepalive(fd, true, 30_000, 3_000) catch {
+            // Keep the default-timing SO_KEEPALIVE backstop if the IOCTL fails.
+            setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&on)) catch {};
+        };
     }
     io_backend.setTcpNoDelay(fd);
 }

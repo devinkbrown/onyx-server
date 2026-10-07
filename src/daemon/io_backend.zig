@@ -707,6 +707,87 @@ pub fn setWindowsSocketOption(fd: linux.fd_t, level: i32, optname: i32, opt: []c
     if (setsockopt(socket, level, optname, @ptrCast(opt.ptr), @intCast(opt.len)) != 0) return windowsSocketError();
 }
 
+/// Set per-socket TCP keepalive state and timing. Winsock's
+/// SIO_KEEPALIVE_VALS uses milliseconds and leaves the probe count at the OS
+/// setting (normally ten on modern Windows).
+/// A synchronous call (null OVERLAPPED) completes before this returns.
+pub fn setWindowsTcpKeepalive(fd: linux.fd_t, enabled: bool, idle_ms: u32, interval_ms: u32) WindowsSocketError!void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const socket = windows_sockets.get(fd) orelse return error.SocketUnavailable;
+    const values = TcpKeepalive{
+        .onoff = @intFromBool(enabled),
+        .keepalivetime = idle_ms,
+        .keepaliveinterval = interval_ms,
+    };
+    var bytes: u32 = 0;
+    if (WSAIoctl(socket, sio_keepalive_vals, &values, @sizeOf(TcpKeepalive), null, 0, &bytes, null, null) != 0)
+        return windowsSocketError();
+}
+
+const TcpKeepalive = extern struct {
+    onoff: u32,
+    keepalivetime: u32,
+    keepaliveinterval: u32,
+};
+
+// _WSAIOW(IOC_VENDOR, 4), from Winsock's mstcpip.h/winsock2.h.
+const sio_keepalive_vals: u32 = 0x9800_0004;
+
+test "Windows accepted TCP keepalive sets state and per-socket timing" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(TcpKeepalive));
+    try std.testing.expectEqual(@as(u32, 0x9800_0004), sio_keepalive_vals);
+
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    const client = try openWindowsTcpSocket(wsa_af_inet);
+    defer closeSocket(client);
+    const destination = RioSockAddr{
+        .family = @intCast(wsa_af_inet),
+        .port = std.mem.nativeToBig(u16, listener.port),
+        .addr = try ipv4Bits("127.0.0.1"),
+        .zero = @splat(0),
+    };
+    const client_raw = windows_sockets.get(client) orelse return error.InvalidSocket;
+    if (connect(client_raw, &destination, @sizeOf(RioSockAddr)) != 0) return error.ConnectFailed;
+    const listener_raw = windows_sockets.get(listener.fd) orelse return error.InvalidSocket;
+    const accepted_raw = accept(listener_raw, null, null);
+    if (accepted_raw == std.math.maxInt(usize)) return error.AcceptFailed;
+    const accepted = adoptWindowsSocket(accepted_raw) catch |err| {
+        _ = closesocket(accepted_raw);
+        return err;
+    };
+    defer closeSocket(accepted);
+
+    try setWindowsTcpKeepalive(accepted, true, 30_000, 3_000);
+    var keepalive: i32 = 0;
+    var length: i32 = @sizeOf(i32);
+    try std.testing.expectEqual(@as(i32, 0), getsockopt(accepted_raw, sol_socket, 0x0008, &keepalive, &length));
+    try std.testing.expect(length == 1 or length == @sizeOf(i32));
+    try std.testing.expect(keepalive != 0);
+
+    // TCP_KEEPIDLE (3) and TCP_KEEPINTVL (17) report seconds on Windows 10
+    // version 1709 and later. The native Windows test host supports both.
+    var idle_seconds: u32 = 0;
+    length = @sizeOf(u32);
+    try std.testing.expectEqual(@as(i32, 0), getsockopt(accepted_raw, wsa_ipproto_tcp, 3, &idle_seconds, &length));
+    try std.testing.expectEqual(@as(i32, @sizeOf(u32)), length);
+    try std.testing.expectEqual(@as(u32, 30), idle_seconds);
+    var interval_seconds: u32 = 0;
+    length = @sizeOf(u32);
+    try std.testing.expectEqual(@as(i32, 0), getsockopt(accepted_raw, wsa_ipproto_tcp, 17, &interval_seconds, &length));
+    try std.testing.expectEqual(@as(i32, @sizeOf(u32)), length);
+    try std.testing.expectEqual(@as(u32, 3), interval_seconds);
+
+    try setWindowsTcpKeepalive(accepted, false, 30_000, 3_000);
+    length = @sizeOf(i32);
+    try std.testing.expectEqual(@as(i32, 0), getsockopt(accepted_raw, sol_socket, 0x0008, &keepalive, &length));
+    try std.testing.expectEqual(@as(i32, 0), keepalive);
+
+    closeSocket(accepted);
+    try std.testing.expectError(error.SocketUnavailable, setWindowsTcpKeepalive(accepted, true, 30_000, 3_000));
+}
+
 fn windowsSocketError() WindowsSocketError {
     return switch (WSAGetLastError()) {
         10013 => error.PermissionDenied,
