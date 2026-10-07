@@ -2058,10 +2058,10 @@ pub const FirstProvisionStage = struct {
     consumed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, lease: std.Io.File, config: Config) !FirstProvisionStage {
-        // Cold provisioning needs POSIX fds; unreachable in Windows production.
-        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
         const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
         errdefer allocator.free(lock_path);
+        if (comptime @import("builtin").os.tag == .windows)
+            try cold_runtime.requireInheritedPrivateFileWindows(lease);
         const identity = try cold_identity.statRegular(lease.handle);
         try validateColdLease(io, dir, lease, lock_path, identity);
         const owned_path = try allocator.dupe(u8, path);
@@ -2077,6 +2077,8 @@ pub const FirstProvisionStage = struct {
         store.* = .{ .allocator = allocator, .io = io, .dir = dir, .wal_path = owned_path, .snapshot_path = snapshot_path, .maps = initMaps(allocator), .changefeed = feed, .cfg = config, .wal_epoch = epoch, .wal_epoch_known = true, .staged_read_only = true, .wal_offset = cold_epoch_record_len };
         const directory = try coldOpenParent(io, dir, path);
         errdefer directory.close(io);
+        if (comptime @import("builtin").os.tag == .windows)
+            _ = try cold_runtime.requirePrivateDirectoryHandleWindows(.{ .handle = directory.handle });
         const directory_identity = try coldDirectoryIdentity(directory.handle);
         return .{ .allocator = allocator, .store = store, .lease = lease, .identity = identity, .lock_path = lock_path, .directory = directory, .directory_identity = directory_identity, .io = io, .epoch = coldEpoch(epoch) };
     }
@@ -2743,7 +2745,7 @@ test "Windows cold lease accepts only the local locked marker handle at its path
     try owner.writePositionalAll(std.testing.io, "L", 0);
     const identity = try cold_identity.statRegular(owner.handle);
     try validateColdLease(std.testing.io, tmp.dir, owner, "custody.wal.lock", identity);
-    try std.testing.expectError(error.SkipZigTest, FirstProvisionStage.init(std.testing.allocator, std.testing.io, tmp.dir, "custody.wal", owner, .{}));
+    try std.testing.expectError(error.InsecurePermissions, FirstProvisionStage.init(std.testing.allocator, std.testing.io, tmp.dir, "custody.wal", owner, .{}));
     try std.testing.expectError(error.FileNotFound, ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "custody.wal", owner, .{}));
     const reopened = try openColdExisting(std.testing.io, tmp.dir, "custody.wal.lock", .read_write);
     defer reopened.close(std.testing.io);
@@ -2758,6 +2760,87 @@ test "Windows cold lease accepts only the local locked marker handle at its path
     var marker: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try owner.readPositionalAll(std.testing.io, &marker, 0));
     try std.testing.expectEqual(@as(u8, 'L'), marker[0]);
+}
+
+test "Windows first provision init holds a private lease without publishing files" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const lease = try private.createFile(std.testing.io, "first.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    try lease.sync(std.testing.io);
+    {
+        var stage = try FirstProvisionStage.init(std.testing.allocator, std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 });
+        defer stage.deinit();
+        try std.testing.expect(stage.store.?.isReadOnly());
+        try std.testing.expectError(error.SkipZigTest, stage.prepareBatch(&.{}));
+        try std.testing.expectError(error.SkipZigTest, stage.commit());
+        try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
+        try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal.snap", .read_only));
+    }
+    try cold_identity.reaffirmExclusive(lease.handle);
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal.snap", .read_only));
+    var marker: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try lease.readPositionalAll(std.testing.io, &marker, 0));
+    try std.testing.expectEqual(@as(u8, 'L'), marker[0]);
+}
+
+test "Windows first provision init rejects a broad parent with a private lease" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const created = try cold_runtime.createPrivateExclusiveWindows(tmp.dir, "first.wal.lock");
+    created.close(std.testing.io);
+    const lease = try openColdExisting(std.testing.io, tmp.dir, "first.wal.lock", .read_write);
+    defer lease.close(std.testing.io);
+    try cold_runtime.requireInheritedPrivateFileWindows(lease);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    try std.testing.expectError(error.InsecurePermissions, FirstProvisionStage.init(std.testing.allocator, std.testing.io, tmp.dir, "first.wal", lease, .{}));
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, tmp.dir, "first.wal", .read_only));
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, tmp.dir, "first.wal.snap", .read_only));
+}
+
+test "Windows first provision init rejects unlocked lease and leaves no namespace" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const lease = try private.createFile(std.testing.io, "first.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    try std.testing.expectError(error.WouldBlock, FirstProvisionStage.init(std.testing.allocator, std.testing.io, private, "first.wal", lease, .{}));
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
+}
+
+test "Windows first provision init allocation failures leave only the held marker" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const lease = try private.createFile(std.testing.io, "first.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var control = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    {
+        var stage = try FirstProvisionStage.init(control.allocator(), std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 });
+        stage.deinit();
+    }
+    for (0..control.alloc_index) |index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        try std.testing.expectError(error.OutOfMemory, FirstProvisionStage.init(failing.allocator(), std.testing.io, private, "first.wal", lease, .{ .changefeed_capacity = 0 }));
+        try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal", .read_only));
+        try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, "first.wal.snap", .read_only));
+        try cold_identity.reaffirmExclusive(lease.handle);
+    }
 }
 
 test "Windows cold lease rejects an unlocked marker without changing it" {
