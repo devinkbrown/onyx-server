@@ -165,6 +165,7 @@ const windows_file_id_info_class: i32 = 18;
 const windows_duplicate_same_access: u32 = 2;
 const windows_duplicate_close_source: u32 = 1;
 extern "kernel32" fn GetFileInformationByHandleEx(handle: usize, class: i32, info: *anyopaque, size: u32) callconv(.winapi) i32;
+extern "kernel32" fn CreateHardLinkW(new_name: [*:0]const u16, existing_name: [*:0]const u16, security: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn DuplicateHandle(source_process: usize, source_handle: usize, target_process: usize, target_handle: *usize, desired_access: u32, inherit_handle: i32, options: u32) callconv(.winapi) i32;
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) usize;
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
@@ -1734,6 +1735,56 @@ pub const ColdOpenMode = enum { read_only, read_write, directory };
 /// type checked before reading any application bytes.
 pub fn openColdExisting(io: std.Io, dir: std.Io.Dir, path: []const u8, mode: ColdOpenMode) !std.Io.File {
     const os = @import("builtin").os.tag;
+    if (comptime os == .windows) {
+        const windows = std.os.windows;
+        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.BadPathName;
+        const final_name = path[(if (std.mem.lastIndexOfAny(u8, path, "/\\")) |separator| separator + 1 else 0)..];
+        if (std.mem.indexOfScalar(u8, final_name, ':') != null) return error.BadPathName;
+        var path_w = try std.Io.Threaded.sliceToPrefixedFileW(dir.handle, path, .{});
+        var name = path_w.string();
+        const attributes: windows.OBJECT.ATTRIBUTES = .{
+            .RootDirectory = if (std.Io.Dir.path.isAbsoluteWindowsWtf16(path_w.span())) null else dir.handle,
+            .ObjectName = &name,
+        };
+        var io_status: windows.IO_STATUS_BLOCK = undefined;
+        var handle: windows.HANDLE = undefined;
+        const status = windows.ntdll.NtCreateFile(
+            &handle,
+            .{
+                .STANDARD = .{ .SYNCHRONIZE = true },
+                .GENERIC = .{ .READ = true, .WRITE = mode == .read_write },
+            },
+            &attributes,
+            &io_status,
+            null,
+            .{ .NORMAL = true },
+            .VALID_FLAGS,
+            .OPEN,
+            .{
+                .DIRECTORY_FILE = mode == .directory,
+                .NON_DIRECTORY_FILE = mode != .directory,
+                .IO = .ASYNCHRONOUS,
+                .OPEN_REPARSE_POINT = true,
+                .OPEN_FOR_BACKUP_INTENT = mode == .directory,
+            },
+            null,
+            0,
+        );
+        switch (status) {
+            .SUCCESS => {},
+            .OBJECT_NAME_NOT_FOUND, .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
+            .OBJECT_NAME_INVALID, .OBJECT_PATH_SYNTAX_BAD => return error.BadPathName,
+            .NOT_A_DIRECTORY => return error.NotDir,
+            .FILE_IS_A_DIRECTORY => return error.NotRegular,
+            .ACCESS_DENIED => return error.AccessDenied,
+            .SHARING_VIOLATION => return error.FileBusy,
+            else => return error.Unexpected,
+        }
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = true } };
+        errdefer file.close(io);
+        if (mode == .directory) _ = try coldDirectoryIdentity(handle) else _ = try cold_identity.statRegular(handle);
+        return file;
+    }
     if (comptime os != .linux and os != .openbsd and os != .freebsd) return error.Unsupported;
     if (path.len >= std.fs.max_path_bytes or std.mem.indexOfScalar(u8, path, 0) != null) return error.NameTooLong;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1779,7 +1830,31 @@ fn coldIdentityBits(value: anytype) u64 {
 }
 fn coldDirectoryIdentity(fd: std.posix.fd_t) !cold_identity.Identity {
     const os = @import("builtin").os.tag;
-    if (comptime os == .linux) {
+    if (comptime os == .windows) {
+        const FileStandardInfo = extern struct {
+            allocation_size: i64,
+            end_of_file: i64,
+            links: u32,
+            delete_pending: u8,
+            directory: u8,
+        };
+        const FileAttributeTagInfo = extern struct { attributes: u32, tag: u32 };
+        comptime {
+            if (@sizeOf(FileStandardInfo) != 24) @compileError("Windows FILE_STANDARD_INFO ABI mismatch");
+        }
+        var standard: FileStandardInfo = undefined;
+        if (GetFileInformationByHandleEx(@intFromPtr(fd), 1, &standard, @sizeOf(FileStandardInfo)) == 0) return error.StatFailed;
+        if (standard.directory == 0 or standard.delete_pending != 0) return error.NotDir;
+        var attributes: FileAttributeTagInfo = undefined;
+        if (GetFileInformationByHandleEx(@intFromPtr(fd), 9, &attributes, @sizeOf(FileAttributeTagInfo)) == 0) return error.StatFailed;
+        if ((attributes.attributes & 0x400) != 0) return error.NotDir; // FILE_ATTRIBUTE_REPARSE_POINT
+        const identity = try windowsFileIdentity(@intFromPtr(fd));
+        return .{
+            .device = identity.volume_serial,
+            .inode = std.mem.readInt(u64, identity.file_id[0..8], .little),
+            .inode_high = std.mem.readInt(u64, identity.file_id[8..16], .little),
+        };
+    } else if (comptime os == .linux) {
         var stat: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
         while (true) switch (std.os.linux.errno(std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true }, &stat))) {
             .SUCCESS => break,
@@ -1799,6 +1874,114 @@ fn coldDirectoryIdentity(fd: std.posix.fd_t) !cold_identity.Identity {
         if ((stat.mode & std.posix.S.IFMT) != std.posix.S.IFDIR) return error.NotDir;
         return .{ .device = coldIdentityBits(stat.dev), .inode = coldIdentityBits(stat.ino) };
     } else return error.Unsupported;
+}
+
+test "Windows cold existing file modes preserve bytes on open and permit writes" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const created = try tmp.dir.createFile(std.testing.io, "existing.wal", .{ .read = true });
+    try created.writePositionalAll(std.testing.io, "before", 0);
+    created.close(std.testing.io);
+
+    const reader = try openColdExisting(std.testing.io, tmp.dir, "existing.wal", .read_only);
+    defer reader.close(std.testing.io);
+    try std.testing.expect(reader.flags.nonblocking);
+    var bytes: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try reader.readPositionalAll(std.testing.io, &bytes, 0));
+    try std.testing.expectEqualStrings("before", &bytes);
+
+    const writer = try openColdExisting(std.testing.io, tmp.dir, "existing.wal", .read_write);
+    defer writer.close(std.testing.io);
+    try std.testing.expect(writer.flags.nonblocking);
+    try std.testing.expectEqual(@as(u64, 6), (try writer.stat(std.testing.io)).size);
+    try writer.writePositionalAll(std.testing.io, "after!", 0);
+    try std.testing.expectEqual(@as(usize, 6), try reader.readPositionalAll(std.testing.io, &bytes, 0));
+    try std.testing.expectEqualStrings("after!", &bytes);
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, tmp.dir, "missing.wal", .read_write));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "missing.wal", .{}));
+}
+
+test "Windows cold directory identity is stable and types are checked" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "state", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "other", .default_dir);
+    const regular = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    regular.close(std.testing.io);
+    const first = try openColdExisting(std.testing.io, tmp.dir, "state", .directory);
+    defer first.close(std.testing.io);
+    const second = try openColdExisting(std.testing.io, tmp.dir, "state", .directory);
+    defer second.close(std.testing.io);
+    const other = try openColdExisting(std.testing.io, tmp.dir, "other", .directory);
+    defer other.close(std.testing.io);
+    try std.testing.expect(first.flags.nonblocking);
+    try std.testing.expectEqualDeep(try coldDirectoryIdentity(first.handle), try coldDirectoryIdentity(second.handle));
+    try std.testing.expect(!std.meta.eql(try coldDirectoryIdentity(first.handle), try coldDirectoryIdentity(other.handle)));
+    try std.testing.expectError(error.NotDir, openColdExisting(std.testing.io, tmp.dir, "plain", .directory));
+    try std.testing.expectError(error.NotRegular, openColdExisting(std.testing.io, tmp.dir, "state", .read_only));
+    try std.testing.expectError(error.NotRegular, openColdExisting(std.testing.io, tmp.dir, "state", .read_write));
+}
+
+test "Windows cold existing refuses file and directory reparse points" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try tmp.dir.createFile(std.testing.io, "target.wal", .{});
+    target.close(std.testing.io);
+    try tmp.dir.createDir(std.testing.io, "target-dir", .default_dir);
+    tmp.dir.symLink(std.testing.io, "target.wal", "file-link.wal", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectError(error.NotRegular, openColdExisting(std.testing.io, tmp.dir, "file-link.wal", .read_only));
+    tmp.dir.symLink(std.testing.io, "target-dir", "dir-link", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectError(error.NotDir, openColdExisting(std.testing.io, tmp.dir, "dir-link", .directory));
+}
+
+test "Windows cold existing refuses hardlink alias" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try tmp.dir.createFile(std.testing.io, "target.wal", .{});
+    target.close(std.testing.io);
+    const target_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/target.wal", .{&tmp.sub_path});
+    defer std.testing.allocator.free(target_path);
+    const alias_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/alias.wal", .{&tmp.sub_path});
+    defer std.testing.allocator.free(alias_path);
+    const target_w = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, target_path);
+    defer std.testing.allocator.free(target_w);
+    const alias_w = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, alias_path);
+    defer std.testing.allocator.free(alias_w);
+    try std.testing.expect(CreateHardLinkW(alias_w.ptr, target_w.ptr, null) != 0);
+    try std.testing.expectError(error.NotRegular, openColdExisting(std.testing.io, tmp.dir, "alias.wal", .read_only));
+    try std.testing.expectError(error.NotRegular, openColdExisting(std.testing.io, tmp.dir, "target.wal", .read_write));
+}
+
+test "Windows cold existing rejects alternate data streams without changing base file" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const created = try tmp.dir.createFile(std.testing.io, "target.wal", .{});
+    try created.writePositionalAll(std.testing.io, "base", 0);
+    created.close(std.testing.io);
+    const absolute = try tmp.dir.realPathFileAlloc(std.testing.io, "target.wal", std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const accepted = try openColdExisting(std.testing.io, .cwd(), absolute, .read_only);
+    accepted.close(std.testing.io);
+    const stream = try std.fmt.allocPrint(std.testing.allocator, "{s}:alternate", .{absolute});
+    defer std.testing.allocator.free(stream);
+    try std.testing.expectError(error.BadPathName, openColdExisting(std.testing.io, tmp.dir, "target.wal:alternate", .read_only));
+    try std.testing.expectError(error.BadPathName, openColdExisting(std.testing.io, .cwd(), stream, .read_write));
+    try std.testing.expectError(error.BadPathName, openColdExisting(std.testing.io, tmp.dir, "missing.wal:alternate", .read_write));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "missing.wal", .{}));
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "target.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("base", bytes);
 }
 
 fn coldOpenParent(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
