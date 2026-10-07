@@ -1279,7 +1279,7 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     // and atomically swap the live `config.tls_*` fields so NEW TLS handshakes
     // present the rotated leaf. Established sessions are untouched (no
     // renegotiation). Any failure keeps the current certs and only NOTICEs.
-    const tls_outcome = self.reloadTlsCerts(io, &self.reload_parsed.?.tls) catch |err| blk: {
+    const tls_outcome = self.reloadTlsCertsForRehash(io, &self.reload_parsed.?.tls, rebind_live_source) catch |err| blk: {
         var ebuf: [Server.reply_scratch_bytes]u8 = undefined;
         const msg = std.fmt.bufPrint(&ebuf, "REHASH: TLS cert reload failed ({s}); keeping current certificates", .{@errorName(err)}) catch "REHASH: TLS cert reload failed; keeping current certificates";
         try self.noticeTo(conn, msg);

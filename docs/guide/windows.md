@@ -438,6 +438,13 @@ enabled; their current and previous keys and consumed-ticket history cross
 the handoff. A successful TLS reload may rotate the serving default and TLS
 1.2 certificates because their exact generation crosses in the authenticated
 checkpoint. A failed TLS reload invalidates Helix eligibility.
+With an active WebTransport session, a cap-only REHASH validates configured
+certificate/key files and retains the serving TLS, TLS 1.2, OCSP, and QUIC
+generation when those files match the serving material. For pathless generated
+WebTransport TLS, the same source-proven REHASH retains the serving generation
+when active QUIC prevents rotation; an idle listener still rotates. Changed
+configured material is refused while QUIC is active and invalidates Helix
+eligibility without disconnecting held clients.
 With WASM enabled, the checkpoint carries the actual post-REHASH modules and
 mutable state, and the candidate revalidates their policy. Changed
 restart-only settings, operator bindings, classes, or WASM policy keep the
@@ -503,9 +510,16 @@ active browser smoke keeps the same registered stream and held IRC/TLS clients
 across two consecutive swaps. A candidate validates the WebTransport owner
 against the source's authenticated serving TLS checkpoint before READY,
 including generated bootstrap material.
-ACME and REHASH certificate reloads update the WebTransport owner only at an
-idle QUIC boundary; a busy owner keeps serving the old generation and the
-reload is retried or refused without changing either TLS view.
+ACME and certificate-changing REHASH reloads update the WebTransport owner only
+at an idle QUIC boundary; a busy owner keeps serving the old generation and
+the reload is retried or refused without changing either TLS view. The combined
+live smoke accepts a source-proven cap increase with an active browser and
+native/WebRTC call in both configured and generated TLS modes:
+
+```powershell
+python -B tools/windows_helix_combined_smoke.py zig-out/bin/onyx-server.exe --rehash-cap --rotate-active-refusal
+python -B tools/windows_helix_combined_smoke.py zig-out/bin/onyx-server.exe --generated --rehash-cap
+```
 
 An enabled, pristine `[media]` graph transfers its original WebRTC and native
 media UDP sockets, initial secret state, and native stream key before READY.

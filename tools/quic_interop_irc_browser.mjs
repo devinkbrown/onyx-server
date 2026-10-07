@@ -26,11 +26,12 @@
 // Usage:
 //   node tools/quic_interop_irc_browser.mjs --port <UDP> --certhash <HEX>
 //     [--http-port <N>] [--chromium <path>] [--timeout-ms <N>] [--held]
+//     [--held-probes <N>]
 //   (or via env: ONYX_WT_PORT / ONYX_WT_CERTHASH / CHROMIUM)
 //
 // Exit 0 when the browser completed IRC registration (real 001) + JOIN + PRIVMSG
-// against the live daemon; in --held mode, exit after two controlled probes on
-// the same session/stream. Non-zero with detail otherwise.
+// against the live daemon; in --held mode, exit after the requested number of
+// controlled probes (two by default) on the same session/stream.
 
 import http from 'node:http';
 import { spawn } from 'node:child_process';
@@ -49,6 +50,7 @@ const httpPort = parseInt(argOf('http-port') ?? '0', 10); // 0 -> ephemeral
 const chromiumBin = argOf('chromium') ?? process.env.CHROMIUM ?? '/usr/bin/chromium';
 const hardTimeoutMs = parseInt(argOf('timeout-ms') ?? '25000', 10);
 const heldMode = process.argv.includes('--held');
+const heldProbes = Number(argOf('held-probes') ?? '2');
 
 function die(msg) {
   console.error(`[irc-browser-harness] FAIL: ${msg}`);
@@ -57,6 +59,7 @@ function die(msg) {
 
 if (!udpPort || !/^\d+$/.test(String(udpPort))) die('missing/invalid --port (server UDP port)');
 if (!/^[0-9a-f]{64}$/.test(certHashHex)) die(`missing/invalid --certhash (need 64 hex chars), got '${certHashHex}'`);
+if (!Number.isInteger(heldProbes) || heldProbes < 1 || heldProbes > 4) die('invalid --held-probes (expected 1-4)');
 
 // The IRC identity + channel the browser registers/joins/messages with.
 const NICK = 'webuser';
@@ -75,6 +78,7 @@ const NICK = ${JSON.stringify(NICK)};
 const CHANNEL = ${JSON.stringify(CHANNEL)};
 const MESSAGE = ${JSON.stringify(MESSAGE)};
 const HELD = ${JSON.stringify(heldMode)};
+const HELD_PROBES = ${JSON.stringify(heldProbes)};
 const HELD_BASELINE = ${JSON.stringify(HELD_BASELINE)};
 
 const logEl = document.getElementById('log');
@@ -286,7 +290,7 @@ async function run() {
       return;
     }
     await report(true, 'held browser IRC ready', all, 0);
-    for (let phase = 1; phase <= 2; phase++) {
+    for (let phase = 1; phase <= HELD_PROBES; phase++) {
       let probe;
       try {
         probe = await nextHeldProbe(heldPhase);
@@ -367,7 +371,7 @@ const server = http.createServer((req, res) => {
   }
   if (heldMode && req.method === 'GET' && req.url.startsWith('/next?')) {
     const after = Number(new URL(req.url, 'http://127.0.0.1').searchParams.get('after'));
-    if (!Number.isInteger(after) || after < 0 || after > 2) {
+    if (!Number.isInteger(after) || after < 0 || after > heldProbes) {
       jsonResponse(res, 400, { error: 'invalid phase' });
     } else if (pendingProbe && pendingProbe.phase > after) {
       jsonResponse(res, 200, pendingProbe);
@@ -379,7 +383,8 @@ const server = http.createServer((req, res) => {
   }
   if (heldMode && req.method === 'POST' && req.url === '/probe') {
     readJson(req, res, (probe) => {
-      if (heldStatus.ok !== true || ![1, 2].includes(probe.phase) ||
+      if (heldStatus.ok !== true || !Number.isInteger(probe.phase) ||
+          probe.phase < 1 || probe.phase > heldProbes ||
           probe.phase !== heldStatus.phase + 1 || pendingProbe !== null ||
           typeof probe.nonce !== 'string' || !/^[a-z0-9-]{1,64}$/.test(probe.nonce)) {
         jsonResponse(res, 409, { error: 'probe is out of sequence or invalid' });
@@ -393,8 +398,8 @@ const server = http.createServer((req, res) => {
   if (heldMode && req.method === 'POST' && req.url === '/finish') {
     res.writeHead(204);
     res.end();
-    resolveResult(heldStatus.ok === true && heldStatus.phase === 2 && pendingProbe === null
-      ? heldStatus : { ok: false, detail: 'held browser ended before both swaps passed', lines: heldStatus.lines || [] });
+    resolveResult(heldStatus.ok === true && heldStatus.phase === heldProbes && pendingProbe === null
+      ? heldStatus : { ok: false, detail: 'held browser ended before all probes passed', lines: heldStatus.lines || [] });
     return;
   }
   if (req.method === 'POST' && req.url === '/result') {

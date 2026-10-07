@@ -56542,6 +56542,9 @@ pub const LinuxServer = struct {
         not_configured,
         /// Cert/key material was re-read and the live config was swapped.
         reloaded,
+        /// The existing serving generation was retained after a proven no-op
+        /// reload; no TLS, WebTransport, TLS 1.2, or OCSP view was replaced.
+        unchanged,
         /// A failure (validation/decode/OOM) was reported via NOTICE; the current
         /// certs remain live.
         kept,
@@ -56550,6 +56553,7 @@ pub const LinuxServer = struct {
             return switch (self) {
                 .not_configured => "TLS not configured",
                 .reloaded => "TLS certificates reloaded",
+                .unchanged => "TLS certificates unchanged (validated)",
                 .kept => "TLS certificates unchanged",
             };
         }
@@ -56756,7 +56760,15 @@ pub const LinuxServer = struct {
     /// outlive the reload call; REHASH uses `self.reload_parsed`, while ACME uses
     /// main's held boot config on reactor 0.
     pub fn reloadTlsCerts(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
-        return self.reloadTlsCertsLocked(io, tls);
+        return self.reloadTlsCertsLocked(io, tls, false);
+    }
+
+    /// REHASH may keep a pathless WebTransport bootstrap certificate when an
+    /// active QUIC connection makes replacement impossible, but only after
+    /// the caller proved the parsed TLS settings are unchanged. Explicit ACME
+    /// reload requests and normal reload callers retain strict rotation.
+    pub fn reloadTlsCertsForRehash(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls, unchanged_tls_proven: bool) !TlsReloadOutcome {
+        return self.reloadTlsCertsLocked(io, tls, unchanged_tls_proven);
     }
 
     /// The caller holds the accepted-event boundary. A TLS engine keeps its
@@ -56801,7 +56813,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn reloadTlsCertsLocked(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
+    fn reloadTlsCertsLocked(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls, unchanged_tls_proven: bool) !TlsReloadOutcome {
         // Mirror the boot gate in main.zig: only [tls] enabled nodes load certs.
         if (!tls.enabled or self.config.tls_cert_chain.len == 0) return .not_configured;
 
@@ -56820,6 +56832,24 @@ pub const LinuxServer = struct {
         errdefer loaded.deinit(self.allocator);
         try validateReloadedChain(loaded.cert_chain);
         try native_windows_tls_proof.validateIdentity(native_windows_tls_proof.fromLoaded(&loaded));
+
+        // A REHASH that only changes live limits must not rotate the TLS
+        // generation just because it re-read the same on-disk certificate.
+        // Active QUIC streams cannot release WebTransport's old generation;
+        // exact material equality lets them continue without a pause or swap.
+        // Do this before minting an unrelated TLS 1.2 side leaf, and retain
+        // the existing OCSP view and all server-owned generation custody.
+        if (builtin.os.tag == .windows and self.config.webtransport_port != 0 and
+            tls.cert_path != null and tls.key_path != null)
+        {
+            const serving = try self.windowsServingTlsSnapshot();
+            const disk_digest = try native_windows_tls_proof.digestLoaded(&loaded);
+            const serving_digest = try native_windows_tls_proof.digest(serving.default);
+            if (native_windows_tls_proof.equal(disk_digest, serving_digest)) {
+                loaded.deinit(self.allocator);
+                return .unchanged;
+            }
+        }
 
         // Resolve the hardened TLS 1.2 leg the same way main.zig does at boot:
         // an ECDSA-P256 or RSA leaf serves 1.2 natively (reusing the 1.3 chain);
@@ -56889,7 +56919,22 @@ pub const LinuxServer = struct {
             }));
             const signing_key: @TypeOf(owner.tls.signing_key) =
                 if (loaded.ecdsa_p256_signing_key) |key| .{ .ecdsa_p256 = key } else if (loaded.signing_key) |key| .{ .ed25519 = key } else if (loaded.rsa_signing_key) |key| .{ .rsa = key } else return error.InvalidRuntime;
-            try owner.replaceTlsPausedIdle(token, .{ .cert_chain = loaded.cert_chain, .signing_key = signing_key });
+            owner.replaceTlsPausedIdle(token, .{ .cert_chain = loaded.cert_chain, .signing_key = signing_key }) catch |err| {
+                // Pathless WebTransport bootstrap mints a fresh leaf on every
+                // reload. A proven cap-only REHASH has no TLS rotation intent:
+                // if active QUIC still borrows the old view, keep it and the
+                // generated TLS 1.2/OCSP generations exactly as they serve.
+                // Other callers and all explicit disk material changes keep
+                // the normal busy-owner refusal.
+                if (err == error.ActiveQuicContinuityUnsupported and unchanged_tls_proven and
+                    tls.cert_path == null and tls.key_path == null)
+                {
+                    if (new_tls12) |*side| side.deinit(self.allocator);
+                    loaded.deinit(self.allocator);
+                    return .unchanged;
+                }
+                return err;
+            };
         }
 
         // Commit the live config after reserving any retired-generation custody.
@@ -127188,6 +127233,111 @@ fn mintRehashTlsLeaf(buf: []u8, seed_byte: u8, cn: []const u8) !struct {
 /// so `std.Io.Dir.cwd()` reads resolve to the `.zig-cache/tmp/<sub>/<name>` file).
 fn rehashTmpPath(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "Windows REHASH TLS identical disk material preserves active WebTransport generation and TLS side state" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
+    const pem = @import("../proto/pem.zig");
+
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0x64, "rehash-wt.test");
+    const boot_chain = [_][]const u8{leaf.der};
+    var side = try tls_certs.bootstrapTls12(allocator, std.testing.io, "rehash-wt.test");
+    defer side.deinit(allocator);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &boot_chain,
+        .tls_signing_key = leaf.kp,
+        .tls12_cert_chain = side.cert_chain,
+        .tls12_signing_key = side.key,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    // A configured WebTransport listener requires an owner for a real TLS
+    // rotation. The identical-material path must never need to pause it.
+    server.config.webtransport_port = 4433;
+    const staple = try allocator.dupe(u8, "retained OCSP generation");
+    server.ocsp_staple_owned = staple;
+    server.config.tls_ocsp_staple = staple;
+
+    const seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x64));
+    var key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+    const key_der = try ed25519_pkcs8.encode(&key_der_buf, seed);
+    var cert_pem_buf: [4096]u8 = undefined;
+    const cert_pem = try pem.encode(&cert_pem_buf, "CERTIFICATE", leaf.der);
+    var key_pem_buf: [4096]u8 = undefined;
+    const key_pem = try pem.encode(&key_pem_buf, "PRIVATE KEY", key_der);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "same.pem", .data = cert_pem });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "same.key", .data = key_pem });
+    const cert_path = try rehashTmpPath(allocator, tmp, "same.pem");
+    defer allocator.free(cert_path);
+    const key_path = try rehashTmpPath(allocator, tmp, "same.key");
+    defer allocator.free(key_path);
+    const tls = config_format.Config.Tls{
+        .enabled = true,
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .dns_name = "rehash-wt.test",
+    };
+
+    const boot_ptr = @intFromPtr(server.config.tls_cert_chain.ptr);
+    const side_ptr = @intFromPtr(server.config.tls12_cert_chain.ptr);
+    const staple_ptr = @intFromPtr(server.config.tls_ocsp_staple.?.ptr);
+    const side_digest = try native_windows_tls_proof.digestGeneratedTls12(.{
+        .cert_chain = server.config.tls12_cert_chain,
+        .signing_key = &server.config.tls12_signing_key.?,
+    });
+    const outcome = try server.reloadTlsCerts(std.testing.io, &tls);
+    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.unchanged, outcome);
+    try std.testing.expectEqual(boot_ptr, @intFromPtr(server.config.tls_cert_chain.ptr));
+    try std.testing.expectEqual(side_ptr, @intFromPtr(server.config.tls12_cert_chain.ptr));
+    try std.testing.expectEqual(staple_ptr, @intFromPtr(server.config.tls_ocsp_staple.?.ptr));
+    try std.testing.expectEqual(side_digest, try native_windows_tls_proof.digestGeneratedTls12(.{
+        .cert_chain = server.config.tls12_cert_chain,
+        .signing_key = &server.config.tls12_signing_key.?,
+    }));
+    try std.testing.expect(server.reload_tls == null and server.reload_tls12 == null);
+    try std.testing.expectEqual(@as(u64, 0), server.windows_webtransport_pause_epoch);
+
+    var rotated_buf: [1024]u8 = undefined;
+    const rotated = try mintRehashTlsLeaf(&rotated_buf, 0x65, "rehash-wt.test");
+    const rotated_pem = try pem.encode(&cert_pem_buf, "CERTIFICATE", rotated.der);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "same.pem", .data = rotated_pem });
+    // A changed leaf with the old key fails identity validation before it can
+    // be mistaken for a no-op or alter the serving WebTransport generation.
+    try std.testing.expectError(error.TlsKeyMismatch, server.reloadTlsCerts(std.testing.io, &tls));
+    try std.testing.expectEqual(boot_ptr, @intFromPtr(server.config.tls_cert_chain.ptr));
+    try std.testing.expectEqual(side_ptr, @intFromPtr(server.config.tls12_cert_chain.ptr));
+    try std.testing.expectEqual(staple_ptr, @intFromPtr(server.config.tls_ocsp_staple.?.ptr));
+
+    const rotated_seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(0x65));
+    const rotated_key_der = try ed25519_pkcs8.encode(&key_der_buf, rotated_seed);
+    const rotated_key_pem = try pem.encode(&key_pem_buf, "PRIVATE KEY", rotated_key_der);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "same.key", .data = rotated_key_pem });
+    // A valid rotation still takes the owner path. With no owner installed in
+    // this fixture it must refuse, leaving all current generations untouched.
+    try std.testing.expectError(error.InvalidRuntime, server.reloadTlsCerts(std.testing.io, &tls));
+    try std.testing.expectEqual(boot_ptr, @intFromPtr(server.config.tls_cert_chain.ptr));
+    try std.testing.expectEqual(side_ptr, @intFromPtr(server.config.tls12_cert_chain.ptr));
+    try std.testing.expectEqual(staple_ptr, @intFromPtr(server.config.tls_ocsp_staple.?.ptr));
+    try std.testing.expect(server.reload_tls == null and server.reload_tls12 == null);
+
+    // Eligibility alone cannot make a generated reload succeed without the
+    // configured owner actually reporting an active QUIC borrower.
+    const pathless = config_format.Config.Tls{ .enabled = true, .dns_name = "rehash-wt.test" };
+    try std.testing.expectError(error.InvalidRuntime, server.reloadTlsCertsForRehash(std.testing.io, &pathless, true));
+    try std.testing.expectEqual(boot_ptr, @intFromPtr(server.config.tls_cert_chain.ptr));
+    try std.testing.expectEqual(side_ptr, @intFromPtr(server.config.tls12_cert_chain.ptr));
+    try std.testing.expectEqual(staple_ptr, @intFromPtr(server.config.tls_ocsp_staple.?.ptr));
 }
 
 test "REHASH cert hot-reload: swaps live chain to rotated cert, frees prior reload gen, keeps boot certs" {

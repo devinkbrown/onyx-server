@@ -6,6 +6,9 @@
 
 Usage: python -B tools/windows_helix_combined_smoke.py zig-out/bin/onyx-server.exe
        python -B tools/windows_helix_combined_smoke.py zig-out/bin/onyx-server.exe --chromium C:/path/to/msedge.exe
+       python -B tools/windows_helix_combined_smoke.py zig-out/bin/onyx-server.exe --rehash-cap
+       python -B tools/windows_helix_combined_smoke.py zig-out/bin/onyx-server.exe --generated --rehash-cap
+       python -B tools/windows_helix_combined_smoke.py zig-out/bin/onyx-server.exe --rehash-cap --rotate-active-refusal
 """
 
 from __future__ import annotations
@@ -56,7 +59,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--chromium", type=Path, help="Chrome or Edge executable")
+    parser.add_argument("--rehash-cap", action="store_true",
+                        help="raise the live per-IP clone cap before active browser/media handoff")
+    parser.add_argument("--generated", action="store_true",
+                        help="serve a generated TLS leaf without configured cert/key paths")
+    parser.add_argument("--rotate-active-refusal", action="store_true",
+                        help="after swaps, refuse changed configured cert/key while the browser is active")
     args = parser.parse_args()
+    if args.rotate_active_refusal and args.generated:
+        parser.error("--rotate-active-refusal requires configured cert/key files")
     if os.name != "nt":
         parser.error("this fixture requires native Windows")
     source = args.binary.resolve()
@@ -64,8 +75,8 @@ def main() -> int:
         parser.error(f"binary not found: {source}")
     pwsh = shutil.which("pwsh")
     node = shutil.which("node")
-    if not pwsh or not node:
-        parser.error("PowerShell 7 and Node.js are required for this browser fixture")
+    if not node or (not args.generated and not pwsh):
+        parser.error("Node.js is required, and configured-cert mode also requires PowerShell 7")
     browser = wt.browser_path(args.chromium)
 
     with wt.disposable_run_dir() as root:
@@ -73,26 +84,30 @@ def main() -> int:
         shutil.copy2(source, binary)
         create_private_directory(root / "private")
         create_private_directory(root / "keys-private")
-        cert_hash = wt.make_certificate(root, pwsh)
+        cert_hash = None if args.generated else wt.make_certificate(root, pwsh)
         with closing(wt.udp_socket()) as reserved_wt:
             wt_port = reserved_wt.getsockname()[1]
             media_port, native_port = media.reserve_udp_ports(2)
         irc_port, tls_port, control_port = wt.tcp_ports(3)
         password = secrets.token_urlsafe(22)
         config = root / "server.toml"
+        limits = "[limits]\nnum_shards = 2\n"
+        if args.rehash_cap:
+            limits += "max_clones_per_ip = 8\n"
         config.write_text(
             "[node]\nid = 1\nsecret_key = \"" + secrets.token_hex(32) + "\"\n"
             "[cloak]\nsecret = \"" + secrets.token_urlsafe(32) + "\"\n"
-            "[limits]\nnum_shards = 2\n"
+            + limits +
             f"[listen]\nhost = \"127.0.0.1\"\nirc = {irc_port}\n"
             f"webtransport = {wt_port}\nmedia = {media_port}\n"
             f"native_media = {native_port}\nmedia_host = \"127.0.0.1\"\n"
             f"[tls]\nenabled = true\nport = {tls_port}\ndns_name = \"localhost\"\n"
-            "cert_path = \"leaf.pem\"\nkey_path = \"keys-private/server.key\"\n"
-            "[media]\nenabled = true\nnative_media_require_mac = true\n"
+            + ("" if args.generated else
+               "cert_path = \"leaf.pem\"\nkey_path = \"keys-private/server.key\"\n")
+            + "[media]\nenabled = true\nnative_media_require_mac = true\n"
             "[sasl]\nenabled = true\naccount_db = \"private/accounts.wal\"\n"
             "[accounts]\npbkdf2_rounds = 10000\n"
-            "[[oper_groups]]\nname = \"netadmin\"\nprivileges = [\"server_restart\"]\n"
+            "[[oper_groups]]\nname = \"netadmin\"\nprivileges = [\"server_restart\", \"server_rehash\"]\n"
             "[[opers]]\naccount = \"helixadmin\"\nclass = \"netadmin\"\n",
             encoding="utf-8",
         )
@@ -116,6 +131,8 @@ def main() -> int:
                 wt.wait_ready(parent, irc_port, log_path)
                 owner = helix_tls.connect_tls(tls_port, context, parent)
                 clients.append(owner)
+                if args.generated:
+                    cert_hash = owner.certificate_digest().hex()
                 owner.register(b"tlsowner")
                 owner.command(f"REGISTER helixadmin * {password}".encode(),
                               b"REGISTER SUCCESS", timeout=45)
@@ -147,7 +164,8 @@ def main() -> int:
                 held_proc = subprocess.Popen(
                     [node, str(wt.HARNESS), "--port", str(wt_port), "--certhash", cert_hash,
                      "--chromium", str(browser), "--http-port", str(control_port),
-                     "--timeout-ms", "240000", "--held"],
+                     "--timeout-ms", "240000", "--held",
+                     *(["--held-probes", "3"] if args.rotate_active_refusal else [])],
                     cwd=root, env=env, stdout=held_log, stderr=subprocess.STDOUT,
                 )
                 ready = wt_helix.wait_held_status(held_proc, control_port, 0, held_log_path)
@@ -179,6 +197,26 @@ def main() -> int:
                 media_helix.require_call_roster(b, "mediaa")
                 print("PASS: held browser stream and native/WebRTC call established together", flush=True)
 
+                if args.rehash_cap:
+                    original = config.read_text(encoding="utf-8")
+                    changed = original.replace("max_clones_per_ip = 8", "max_clones_per_ip = 16", 1)
+                    if changed == original:
+                        raise AssertionError("combined REHASH fixture omitted the boot clone cap")
+                    config.write_text(changed, encoding="utf-8")
+                    reply_start = len(oper.lines)
+                    oper.command(b"REHASH", b"Configuration reloaded", timeout=30)
+                    reload_errors = [line for line in oper.lines[reply_start:]
+                                     if b"TLS cert reload failed" in line]
+                    if reload_errors:
+                        raise AssertionError(f"active browser rejected TLS reload: {reload_errors!r}")
+                    oper.command(b"CLONES", b"CLONES policy: max_per_ip=16")
+                    owner.ping(b"combined-after-rehash")
+                    oper.ping(b"combined-after-rehash-oper")
+                    for ice in ice_peers:
+                        ice.check()
+                    native_peer.check()
+                    print("PASS: active browser/media daemon raised the live clone cap by REHASH", flush=True)
+
                 serving_pid = parent.pid
                 nonces: list[bytes] = []
                 for sequence in (1, 2):
@@ -191,6 +229,8 @@ def main() -> int:
                     observer.until(lambda line: b" PONG " in line and marker in line, 10)
                     if helix_tls.token(oper) != token:
                         raise AssertionError("held local session token changed across Helix")
+                    if args.rehash_cap:
+                        oper.command(b"CLONES", b"CLONES policy: max_per_ip=16")
                     fresh = helix_tls.connect_tls(tls_port, context, None)
                     try:
                         if fresh.certificate_digest().hex() != cert_hash:
@@ -233,6 +273,42 @@ def main() -> int:
                           f"{serving_pid} -> {next_pid}; same browser session, exact delivery, "
                           f"call, ICE peers and native sequence {native_peer.sequence}", flush=True)
                     serving_pid = next_pid
+
+                if args.rotate_active_refusal:
+                    rotated_hash = wt.make_certificate(root, pwsh)
+                    if rotated_hash == cert_hash:
+                        raise AssertionError("fixture did not rotate the configured leaf")
+                    reply_start = len(oper.lines)
+                    oper.send(b"REHASH")
+                    oper.wait(b"TLS cert reload failed", start=reply_start, timeout=30)
+                    oper.wait(b"Configuration reloaded", start=reply_start, timeout=30)
+                    owner.ping(b"combined-rotation-refused")
+                    oper.ping(b"combined-rotation-refused-oper")
+                    fresh = helix_tls.connect_tls(tls_port, context, None)
+                    try:
+                        if fresh.certificate_digest().hex() != cert_hash:
+                            raise AssertionError("active WebTransport refusal changed the serving TLS leaf")
+                    finally:
+                        fresh.close()
+                    nonce = f"combined-refusal-{secrets.token_hex(4)}"
+                    wt_helix.held_control(control_port, "/probe", {"phase": 3, "nonce": nonce})
+                    status = wt_helix.wait_held_status(held_proc, control_port, 3, held_log_path)
+                    wt_helix.require_held_identity(status, session_id)
+                    observer.until(lambda line: line.startswith(b":webuser!") and
+                                   b"PRIVMSG #web :" + nonce.encode("ascii") in line, 10)
+                    for ice in ice_peers:
+                        ice.check()
+                    native_peer.check()
+                    oper.send(b"UPGRADE")
+                    helix.wait_log_contains(
+                        log_path,
+                        "UPGRADE refused: Windows config or external material has no exact source proof",
+                    )
+                    if helix.image_pids(binary) != {serving_pid}:
+                        raise AssertionError("failed TLS REHASH launched an upgrade candidate")
+                    if helix_tls.token(oper) != token:
+                        raise AssertionError("failed TLS REHASH changed the local session token")
+                    print("PASS: changed configured TLS material refused; browser/media live and Helix disqualified", flush=True)
 
                 wt_helix.held_control(control_port, "/finish")
                 if held_proc.wait(timeout=10) != 0:
