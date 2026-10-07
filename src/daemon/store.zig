@@ -2285,8 +2285,6 @@ pub const ColdRecoveryStage = struct {
     backing: ?*ColdBacking,
 
     pub fn open(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, lease: std.Io.File, config: Config) !ColdRecoveryStage {
-        // Windows cold custody still lacks transactional publication support.
-        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
         const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
         errdefer allocator.free(lock_path);
         const lease_identity = try cold_identity.statRegular(lease.handle);
@@ -2299,9 +2297,8 @@ pub const ColdRecoveryStage = struct {
         errdefer feed.deinit();
         var wal = try ColdFile.capture(allocator, io, dir, path, config.max_wal_bytes);
         errdefer wal.deinit(allocator, io);
-        // `ColdFile.capture` funnels through `openColdExisting`, which only
-        // supports linux/openbsd/freebsd; elsewhere `FileNotFound` is absent
-        // from the error set, so compare instead of switching.
+        // `ColdFile.capture` funnels through `openColdExisting`. Keep the
+        // optional snapshot absent only for an actual missing namespace entry.
         var snapshot: ?ColdFile = ColdFile.capture(allocator, io, dir, snapshot_path, null) catch |err| blk: {
             if (err != error.FileNotFound) return err;
             break :blk null;
@@ -2399,6 +2396,9 @@ pub const ColdRecoveryStage = struct {
     }
 
     fn prepareBatchMode(self: *ColdRecoveryStage, mutations: []const BatchMutation, complete_epoch: bool) !PreparedColdRecovery {
+        // Windows cold capture is read-only until transactional temporary-file
+        // publication and cleanup have their own platform custody proof.
+        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
         try self.validate();
         const owned = self.backing.?;
         const store = &owned.store;
@@ -2595,6 +2595,13 @@ fn coldHashBytes(hasher: *std.crypto.hash.Blake3, value: []const u8) void {
     coldHashInt(hasher, value.len);
     hasher.update(value);
 }
+fn coldHashIdentity(hasher: *std.crypto.hash.Blake3, identity: cold_identity.Identity) void {
+    coldHashInt(hasher, identity.device);
+    coldHashInt(hasher, identity.inode);
+    // Windows FILE_ID_INFO has 128 identifier bits. Preserve existing POSIX
+    // receipt bytes while authenticating the high half on Windows.
+    if (comptime @import("builtin").os.tag == .windows) coldHashInt(hasher, identity.inode_high);
+}
 fn coldHashCoverage(hasher: *std.crypto.hash.Blake3, coverage: ?SnapshotCoverage) !void {
     coldHashInt(hasher, if (coverage) |proof| proof.count else 0);
     if (coverage) |proof| {
@@ -2616,14 +2623,12 @@ fn coldCutDigest(owned: *const ColdBacking) ![32]u8 {
     coldHashBytes(&hash, store.wal_path);
     coldHashBytes(&hash, store.snapshot_path);
     coldHashBytes(&hash, owned.lock_path);
-    coldHashInt(&hash, owned.wal.identity.device);
-    coldHashInt(&hash, owned.wal.identity.inode);
+    coldHashIdentity(&hash, owned.wal.identity);
     coldHashInt(&hash, owned.wal.bytes.len);
     hash.update(&owned.wal.digest);
     coldHashInt(&hash, @intFromBool(owned.snapshot != null));
     if (owned.snapshot) |snapshot| {
-        coldHashInt(&hash, snapshot.identity.device);
-        coldHashInt(&hash, snapshot.identity.inode);
+        coldHashIdentity(&hash, snapshot.identity);
         coldHashInt(&hash, snapshot.bytes.len);
         hash.update(&snapshot.digest);
     }
@@ -2666,8 +2671,7 @@ fn coldPreparedDigest(owned: *const ColdBacking) ![32]u8 {
     if (batch.count == 0 or batch.count > batch.entries.len) return StoreError.SnapshotCoverageMismatch;
     var hash = std.crypto.hash.Blake3.init(.{});
     coldHashInt(&hash, plan.batch.generation);
-    coldHashInt(&hash, plan.directory_identity.device);
-    coldHashInt(&hash, plan.directory_identity.inode);
+    coldHashIdentity(&hash, plan.directory_identity);
     coldHashInt(&hash, batch.generation);
     coldHashInt(&hash, batch.final_wal_offset);
     coldHashInt(&hash, batch.next_seq_after);
@@ -2727,7 +2731,7 @@ test "Windows cold lease accepts only the local locked marker handle at its path
     const identity = try cold_identity.statRegular(owner.handle);
     try validateColdLease(std.testing.io, tmp.dir, owner, "custody.wal.lock", identity);
     try std.testing.expectError(error.SkipZigTest, FirstProvisionStage.init(std.testing.allocator, std.testing.io, tmp.dir, "custody.wal", owner, .{}));
-    try std.testing.expectError(error.SkipZigTest, ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "custody.wal", owner, .{}));
+    try std.testing.expectError(error.FileNotFound, ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "custody.wal", owner, .{}));
     const reopened = try openColdExisting(std.testing.io, tmp.dir, "custody.wal.lock", .read_write);
     defer reopened.close(std.testing.io);
     try std.testing.expectError(error.WouldBlock, validateColdLease(std.testing.io, tmp.dir, reopened, "custody.wal.lock", identity));
@@ -2755,6 +2759,158 @@ test "Windows cold lease rejects an unlocked marker without changing it" {
     var marker: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try unlocked.readPositionalAll(std.testing.io, &marker, 0));
     try std.testing.expectEqual(@as(u8, 'L'), marker[0]);
+}
+
+test "Windows cold recovery opens a captured read-only view and leaves preparation inert" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var seed = try openTestStore(tmp, "cold-read.wal");
+        defer seed.deinit();
+        try seed.put(.props, "original", "durable");
+    }
+    const before = try readWalForTest(tmp, "cold-read.wal");
+    defer std.testing.allocator.free(before);
+    const lease = try tmp.dir.createFile(std.testing.io, "cold-read.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "cold-read.wal", lease, .{ .changefeed_capacity = 0 });
+    defer stage.deinit();
+    try stage.validate();
+    try std.testing.expect(stage.view().isReadOnly());
+    try std.testing.expectEqualStrings("durable", stage.view().get(.props, "original").?);
+    const mutation: BatchMutation = .{ .family = .props, .kind = .put, .key = "new", .value = "forbidden" };
+    try std.testing.expectError(error.SkipZigTest, stage.prepareBatch(&.{mutation}));
+    try std.testing.expectError(error.SkipZigTest, stage.prepareCompleteBatch(&.{mutation}));
+    try std.testing.expect(stage.backing.?.plan == null);
+    try std.testing.expect(stage.backing.?.store.active_batch == null);
+    try stage.validate();
+    const after = try readWalForTest(tmp, "cold-read.wal");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, tmp.dir, "cold-read.wal.snap", .read_only));
+}
+
+test "Windows cold recovery detects high identity and namespace or byte tampering" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var seed = try openTestStore(tmp, "cold-tamper.wal");
+        defer seed.deinit();
+        try seed.put(.props, "original", "durable");
+    }
+    const original = try readWalForTest(tmp, "cold-tamper.wal");
+    defer std.testing.allocator.free(original);
+    const lease = try tmp.dir.createFile(std.testing.io, "cold-tamper.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "cold-tamper.wal", lease, .{ .changefeed_capacity = 0 });
+    defer stage.deinit();
+    const owned = stage.backing.?;
+    const digest = owned.cut_digest;
+    owned.wal.identity.inode_high ^= 1;
+    try std.testing.expect(!std.mem.eql(u8, &digest, &try coldCutDigest(owned)));
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.validate());
+    owned.wal.identity.inode_high ^= 1;
+    try stage.validate();
+
+    const writer = try openColdExisting(std.testing.io, tmp.dir, "cold-tamper.wal", .read_write);
+    try writer.writePositionalAll(std.testing.io, "X", 0);
+    writer.close(std.testing.io);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.validate());
+    const restore = try openColdExisting(std.testing.io, tmp.dir, "cold-tamper.wal", .read_write);
+    try restore.writePositionalAll(std.testing.io, original[0..1], 0);
+    restore.close(std.testing.io);
+    try stage.validate();
+
+    try tmp.dir.rename("cold-tamper.wal", tmp.dir, "moved.wal", std.testing.io);
+    const replacement = try tmp.dir.createFile(std.testing.io, "cold-tamper.wal", .{ .read = true });
+    try replacement.writePositionalAll(std.testing.io, original, 0);
+    replacement.close(std.testing.io);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.validate());
+}
+
+test "Windows cold recovery allocation failures preserve the existing WAL" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var seed = try openTestStore(tmp, "cold-oom-read.wal");
+        defer seed.deinit();
+        try seed.put(.props, "original", "durable");
+    }
+    const before = try readWalForTest(tmp, "cold-oom-read.wal");
+    defer std.testing.allocator.free(before);
+    const lease = try tmp.dir.createFile(std.testing.io, "cold-oom-read.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        var result = ColdRecoveryStage.open(failing.allocator(), std.testing.io, tmp.dir, "cold-oom-read.wal", lease, .{ .changefeed_capacity = 0 });
+        if (result) |*stage| {
+            defer stage.deinit();
+            try std.testing.expect(!failing.has_induced_failure);
+            try stage.validate();
+            try std.testing.expectEqualStrings("durable", stage.view().get(.props, "original").?);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+        }
+        const after = try readWalForTest(tmp, "cold-oom-read.wal");
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+        try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, tmp.dir, "cold-oom-read.wal.snap", .read_only));
+    }
+    try std.testing.expect(index > 0);
+}
+
+test "Windows cold recovery replays a covered snapshot and retains an unknown WAL tail" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var seed = try openTestStore(tmp, "cold-covered.wal");
+        defer seed.deinit();
+        try seed.put(.props, "covered", "snapshot state");
+        try seed.snapshotAndTruncate();
+        try seed.put(.props, "later", "WAL state");
+    }
+    const good_wal = try readWalForTest(tmp, "cold-covered.wal");
+    defer std.testing.allocator.free(good_wal);
+    const writer = try openColdExisting(std.testing.io, tmp.dir, "cold-covered.wal", .read_write);
+    try writer.writePositionalAll(std.testing.io, "unknown tail", good_wal.len);
+    writer.close(std.testing.io);
+    const before = try readWalForTest(tmp, "cold-covered.wal");
+    defer std.testing.allocator.free(before);
+    const lease = try tmp.dir.createFile(std.testing.io, "cold-covered.wal.lock", .{ .read = true });
+    defer lease.close(std.testing.io);
+    try std.testing.expect(try lease.tryLock(std.testing.io, .exclusive));
+    try lease.writePositionalAll(std.testing.io, "L", 0);
+    var stage = try ColdRecoveryStage.open(std.testing.allocator, std.testing.io, tmp.dir, "cold-covered.wal", lease, .{ .changefeed_capacity = 0 });
+    defer stage.deinit();
+    try stage.validate();
+    try std.testing.expectEqualStrings("snapshot state", stage.view().get(.props, "covered").?);
+    try std.testing.expectEqualStrings("WAL state", stage.view().get(.props, "later").?);
+    try std.testing.expectEqual(@as(u64, good_wal.len), stage.backing.?.valid_end);
+    const after = try readWalForTest(tmp, "cold-covered.wal");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    const snapshot = &stage.backing.?.snapshot.?;
+    snapshot.identity.inode_high ^= 1;
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.validate());
+    snapshot.identity.inode_high ^= 1;
+    try stage.validate();
+    const snapshot_writer = try openColdExisting(std.testing.io, tmp.dir, "cold-covered.wal.snap", .read_write);
+    try snapshot_writer.writePositionalAll(std.testing.io, "X", 0);
+    snapshot_writer.close(std.testing.io);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, stage.validate());
 }
 
 fn validateColdPreparedWal(owned: *const ColdBacking) !void {

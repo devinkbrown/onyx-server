@@ -11,6 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const store_mod = @import("store.zig");
 const lease_mod = @import("mesh_presence_lease.zig");
+const os_runtime = @import("os_runtime.zig");
 const sign = @import("../crypto/sign.zig");
 const oper = @import("../proto/oper_event.zig");
 const guard_mod = @import("event_spine_replay_guard.zig");
@@ -1136,13 +1137,17 @@ fn restoreCandidate(a: std.mem.Allocator, store: *const store_mod.OroStore, cont
     return .{ .candidate = value, .head = head, .head_digest = digest(head_bytes) };
 }
 
-const DirectoryIdentity = struct { device: u64, inode: u64 };
-// Native syscall observation precedes every creation/write. Store's atomic
-// files may use default modes; the held, exact 0700 directory protects secrets
-// BEFORE those bytes exist. This leaf does not claim every snapshot mode0600.
+const DirectoryIdentity = struct { device: u64, inode: u64, inode_high: u64 = 0 };
+// Native handle observation precedes every creation/write. Store's atomic
+// files may use default modes; the held, exact private directory protects
+// secrets before those bytes exist. This leaf does not claim every snapshot
+// has a private file mode on POSIX.
 fn protectedDirectory(dir: std.Io.Dir) !DirectoryIdentity {
     const posix = std.posix;
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .windows) {
+        const identity = try os_runtime.requirePrivateDirectoryHandleWindows(dir);
+        return .{ .device = identity.volume_serial, .inode = identity.file_id_low, .inode_high = identity.file_id_high };
+    } else if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var stat: linux.Statx = std.mem.zeroes(linux.Statx);
         while (true) switch (linux.errno(linux.statx(dir.handle, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true, .UID = true, .INO = true }, &stat))) {
@@ -1163,6 +1168,41 @@ fn protectedDirectory(dir: std.Io.Dir) !DirectoryIdentity {
         if ((stat.mode & posix.S.IFMT) != posix.S.IFDIR or stat.mode & 0o7777 != 0o700 or stat.uid != posix.system.geteuid()) return error.UnprotectedDirectory;
         return .{ .device = @as(@Int(.unsigned, @bitSizeOf(@TypeOf(stat.dev))), @bitCast(stat.dev)), .inode = @intCast(stat.ino) };
     } else return error.Unsupported;
+}
+
+test "delivery authority: Windows held private directory validates exact ACL and full identity" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const first = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "first");
+    defer first.close(std.testing.io);
+    const second = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "second");
+    defer second.close(std.testing.io);
+    const first_identity = try protectedDirectory(first);
+    const duplicate = try first.openDir(std.testing.io, ".", .{});
+    defer duplicate.close(std.testing.io);
+    try std.testing.expectEqualDeep(first_identity, try protectedDirectory(duplicate));
+    try std.testing.expect(!std.meta.eql(first_identity, try protectedDirectory(second)));
+    var changed_high = first_identity;
+    changed_high.inode_high ^= 1;
+    try std.testing.expect(!std.meta.eql(first_identity, changed_high));
+
+    try tmp.dir.rename("first", tmp.dir, "moved", std.testing.io);
+    const replacement = try os_runtime.createPrivateDirectoryWindows(tmp.dir, "first");
+    defer replacement.close(std.testing.io);
+    try std.testing.expectEqualDeep(first_identity, try protectedDirectory(first));
+    try std.testing.expect(!std.meta.eql(first_identity, try protectedDirectory(replacement)));
+    const named = try tmp.dir.openDir(std.testing.io, "first", .{});
+    defer named.close(std.testing.io);
+    try std.testing.expectEqualDeep(try protectedDirectory(replacement), try protectedDirectory(named));
+
+    const regular = try tmp.dir.createFile(std.testing.io, "regular", .{});
+    defer regular.close(std.testing.io);
+    try std.testing.expectError(error.InsecurePermissions, protectedDirectory(.{ .handle = regular.handle }));
+    try tmp.dir.createDir(std.testing.io, "ordinary", .default_dir);
+    const ordinary = try tmp.dir.openDir(std.testing.io, "ordinary", .{});
+    defer ordinary.close(std.testing.io);
+    try std.testing.expectError(error.InsecurePermissions, protectedDirectory(ordinary));
 }
 fn validateName(name: []const u8) !void {
     if (name.len == 0 or name.len > 128 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidName;

@@ -312,6 +312,7 @@ extern "kernel32" fn ReadFile(handle: usize, buffer: [*]u8, len: u32, read_count
 extern "kernel32" fn WriteFile(handle: usize, buffer: [*]const u8, len: u32, write_count: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn CloseHandle(handle: usize) callconv(.winapi) i32;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+extern "kernel32" fn GetFileInformationByHandleEx(handle: usize, class: i32, info: *anyopaque, size: u32) callconv(.winapi) i32;
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) usize;
 extern "kernel32" fn DuplicateHandle(source_process: usize, source_handle: usize, target_process: usize, target_handle: *usize, desired_access: u32, inherit_handle: i32, options: u32) callconv(.winapi) i32;
 extern "kernel32" fn SetHandleInformation(handle: usize, mask: u32, flags: u32) callconv(.winapi) i32;
@@ -602,6 +603,66 @@ pub fn requirePrivateDirectoryWindows(io: std.Io, dir: std.Io.Dir, path: []const
     parent.close(io);
 }
 
+pub const WindowsPrivateDirectoryIdentity = struct {
+    volume_serial: u64,
+    file_id_low: u64,
+    file_id_high: u64,
+};
+
+/// Inspect the supplied directory HANDLE, not a path that could name a
+/// different object after a rename. The DACL check also verifies its owner.
+pub fn requirePrivateDirectoryHandleWindows(dir: std.Io.Dir) Error!WindowsPrivateDirectoryIdentity {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const FileStandardInfo = extern struct {
+        allocation_size: i64,
+        end_of_file: i64,
+        links: u32,
+        delete_pending: u8,
+        directory: u8,
+    };
+    const FileAttributeTagInfo = extern struct { attributes: u32, tag: u32 };
+    const FileIdInfo = extern struct { volume_serial: u64, file_id: [16]u8 };
+    comptime {
+        if (@sizeOf(FileStandardInfo) != 24 or @sizeOf(FileIdInfo) != 24)
+            @compileError("Windows private directory information ABI mismatch");
+    }
+    const handle = @intFromPtr(dir.handle);
+    var standard: FileStandardInfo = undefined;
+    if (GetFileInformationByHandleEx(handle, 1, &standard, @sizeOf(FileStandardInfo)) == 0)
+        return windowsFileError(GetLastError());
+    if (standard.directory == 0 or standard.delete_pending != 0)
+        return error.InsecurePermissions;
+    var attributes: FileAttributeTagInfo = undefined;
+    if (GetFileInformationByHandleEx(handle, 9, &attributes, @sizeOf(FileAttributeTagInfo)) == 0)
+        return windowsFileError(GetLastError());
+    if (attributes.attributes & 0x400 != 0) return error.InsecurePermissions; // FILE_ATTRIBUTE_REPARSE_POINT
+    if (!try windowsDaclMatches(handle, private_directory_sddl, private_directory_sddl_auto_inherited))
+        return error.InsecurePermissions;
+    var identity: FileIdInfo = undefined;
+    if (GetFileInformationByHandleEx(handle, 18, &identity, @sizeOf(FileIdInfo)) == 0)
+        return windowsFileError(GetLastError());
+    return .{
+        .volume_serial = identity.volume_serial,
+        .file_id_low = std.mem.readInt(u64, identity.file_id[0..8], .little),
+        .file_id_high = std.mem.readInt(u64, identity.file_id[8..16], .little),
+    };
+}
+
+test "Windows held private directory refuses a reparse handle" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try createPrivateDirectoryWindows(tmp.dir, "target");
+    defer target.close(std.testing.io);
+    tmp.dir.symLink(std.testing.io, "target", "link", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    const handle = try openDirectoryHandleWindows(tmp.dir, "link", false);
+    defer windows.CloseHandle(handle);
+    try std.testing.expectError(error.InsecurePermissions, requirePrivateDirectoryHandleWindows(.{ .handle = handle }));
+}
+
 /// Open and validate a private directory as one object. Keep the returned
 /// HANDLE for all relative file operations, so a rename or ancestor retarget
 /// cannot redirect later WAL, snapshot, or atomic temporary file accesses.
@@ -609,13 +670,7 @@ pub fn openPrivateDirectoryWindows(io: std.Io, dir: std.Io.Dir, path: []const u8
     if (comptime builtin.os.tag != .windows) return error.Unsupported;
     const parent = try dir.openDir(io, path, .{ .follow_symlinks = false });
     errdefer parent.close(io);
-    var status: windows.IO_STATUS_BLOCK = undefined;
-    var info: windows.FILE.BASIC_INFORMATION = undefined;
-    if (windows.ntdll.NtQueryInformationFile(parent.handle, &status, &info, @sizeOf(@TypeOf(info)), .Basic) != .SUCCESS)
-        return error.Unexpected;
-    if (info.FileAttributes.REPARSE_POINT) return error.InsecurePermissions;
-    if (!try windowsDaclMatches(@intFromPtr(parent.handle), private_directory_sddl, private_directory_sddl_auto_inherited))
-        return error.InsecurePermissions;
+    _ = try requirePrivateDirectoryHandleWindows(parent);
     return parent;
 }
 
