@@ -121,6 +121,10 @@ jobs:
         run: python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix sequential upgrade smoke
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Build automatic descriptor rollover smoke executable
+        run: zig build -j1 windows-rollover-smoke-server -Dtarget=x86_64-windows --summary all
+      - name: Run automatic Windows descriptor rollover process smoke
+        run: python -B .\tools\windows_descriptor_rollover_smoke.py .\zig-out\bin\onyx-server-rollover-smoke.exe
       - name: Run guarded native Windows Helix TLS and WSS upgrade smoke
         run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix generated TLS and WSS upgrade smoke

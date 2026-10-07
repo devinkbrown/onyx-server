@@ -485,6 +485,10 @@ serving until the namespace is exhausted; operators must then arrange a
 compatible upgrade while there is remaining headroom. The socket trigger is
 roughly 537 million claimed IDs (about 6.2 days at 1,000 registrations per
 second).
+The dedicated rollover smoke executable has a compile-time-only, PID-bound
+trigger. Its native process test checks pinned-image candidate refusal,
+the 60-second retry, and a later automatic swap with held clients. This
+trigger is absent from the normal daemon and release builds.
 
 ## Runtime check
 
@@ -500,6 +504,8 @@ python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+zig build windows-rollover-smoke-server -Dtarget=x86_64-windows
+python -B .\tools\windows_descriptor_rollover_smoke.py .\zig-out\bin\onyx-server-rollover-smoke.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption

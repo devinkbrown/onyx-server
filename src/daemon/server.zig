@@ -3699,6 +3699,30 @@ const DeferredUpgradeRequest = union(enum) {
 };
 const windows_descriptor_rollover_retry_ms: i64 = 60_000;
 
+const WindowsRolloverSmokeMode = enum { fail, pass };
+
+/// The dedicated smoke executable alone reads a small marker beside its
+/// config. Binding it to the source PID prevents the committed successor from
+/// immediately scheduling another rollover on the inherited test file.
+fn parseWindowsRolloverSmokeMarker(bytes: []const u8, source_pid: u32) ?WindowsRolloverSmokeMode {
+    const body = if (std.mem.endsWith(u8, bytes, "\r\n"))
+        bytes[0 .. bytes.len - 2]
+    else if (std.mem.endsWith(u8, bytes, "\n"))
+        bytes[0 .. bytes.len - 1]
+    else
+        bytes;
+    const space = std.mem.indexOfScalar(u8, body, ' ') orelse return null;
+    const pid_text = body[0..space];
+    if (pid_text.len == 0 or pid_text.len > 10 or (pid_text.len > 1 and pid_text[0] == '0')) return null;
+    for (pid_text) |digit| if (digit < '0' or digit > '9') return null;
+    const marker_pid = std.fmt.parseInt(u32, pid_text, 10) catch return null;
+    if (marker_pid != source_pid) return null;
+    const mode = body[space + 1 ..];
+    if (std.mem.eql(u8, mode, "fail")) return .fail;
+    if (std.mem.eql(u8, mode, "pass")) return .pass;
+    return null;
+}
+
 /// Test-only result buffer for an in-process exec-equivalent Helix handoff.
 /// The producer writes every field before publishing `completed` with release;
 /// the harness reads them only after an acquire load observes completion.
@@ -8645,9 +8669,12 @@ pub const LinuxServer = struct {
         }
         if (comptime builtin.os.tag == .windows) {
             if (self.isMaintenanceReactor()) {
+                var socket_due = io_backend.windowsSocketIdRolloverDue();
+                if (comptime build_info.windows_rollover_smoke)
+                    socket_due = socket_due or self.windowsRolloverSmokeMode() != null;
                 _ = self.maybeDeferWindowsDescriptorRollover(
                     self.nowMs(),
-                    io_backend.windowsSocketIdRolloverDue(),
+                    socket_due,
                     os_runtime.windowsFileIdRolloverDue(),
                 );
             }
@@ -9949,6 +9976,17 @@ pub const LinuxServer = struct {
             @max(@as(i64, 0), now_ms),
             windows_descriptor_rollover_retry_ms,
         ) catch std.math.maxInt(i64);
+    }
+
+    fn windowsRolloverSmokeMode(self: *LinuxServer) ?WindowsRolloverSmokeMode {
+        if (comptime builtin.os.tag != .windows or !build_info.windows_rollover_smoke) return null;
+        const config_path = self.config.config_path orelse return null;
+        const io = self.runtime_io orelse self.config.crypto_io orelse return null;
+        var path_buf: [4096]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}.rollover-smoke", .{config_path}) catch return null;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(64)) catch return null;
+        defer self.allocator.free(bytes);
+        return parseWindowsRolloverSmokeMarker(bytes, @bitCast(platform.currentPid()));
     }
 
     /// Only reactor 0 may queue this maintenance request. A failed candidate
@@ -30805,6 +30843,14 @@ pub const LinuxServer = struct {
                 else => try hooks.begin(hooks.ctx, exe_target),
             }
             defer hooks.abort(hooks.ctx);
+            if (comptime build_info.windows_rollover_smoke) {
+                if (std.meta.activeTag(request) == .windows_descriptor_rollover) {
+                    if (self.windowsRolloverSmokeMode()) |mode| {
+                        srvLog("onyx-server: Windows rollover smoke pinned candidate negotiated (mode={s})\n", .{@tagName(mode)});
+                        if (mode == .fail) return error.TestRolloverSmokeAbort;
+                    }
+                }
+            }
             return self.performUpgradeAfterCompatibleTarget(request, -1, exe_target);
         }
         if (comptime builtin.os.tag != .linux) {
@@ -102693,6 +102739,18 @@ test "Windows UPGRADE with replay-backed TLS reaches candidate preflight without
     try std.testing.expect(candidate_started);
     try std.testing.expectEqual(ticket_key_before, server.tls_ticket_key);
     try std.testing.expect(!server.tls_replay_guard.checkAndRecord(&binder));
+}
+
+test "Windows rollover smoke marker is strict and source-PID bound" {
+    try std.testing.expectEqual(WindowsRolloverSmokeMode.fail, parseWindowsRolloverSmokeMarker("123 fail", 123).?);
+    try std.testing.expectEqual(WindowsRolloverSmokeMode.pass, parseWindowsRolloverSmokeMarker("123 pass\r\n", 123).?);
+    try std.testing.expect(parseWindowsRolloverSmokeMarker("123 fail", 124) == null);
+    try std.testing.expect(parseWindowsRolloverSmokeMarker("0123 fail", 123) == null);
+    try std.testing.expect(parseWindowsRolloverSmokeMarker("+123 fail", 123) == null);
+    try std.testing.expect(parseWindowsRolloverSmokeMarker("123  fail", 123) == null);
+    try std.testing.expect(parseWindowsRolloverSmokeMarker("123 pass extra", 123) == null);
+    try std.testing.expect(parseWindowsRolloverSmokeMarker("123 pass\n\n", 123) == null);
+    try std.testing.expect(parseWindowsRolloverSmokeMarker("4294967296 pass", 123) == null);
 }
 
 test "Windows descriptor rollover defers once and backs off without replacing operator requests" {

@@ -114,6 +114,7 @@ pub fn build(b: *std.Build) void {
     // comes from build.zig.zon (single source of truth); the hash pins the
     // exact commit. This is what the banner, 002/004, and RPL_VERSION report.
     build_info.addOption([]const u8, "version", b.fmt("{s}+{s}", .{ manifestVersion(), git }));
+    build_info.addOption(bool, "windows_rollover_smoke", false);
     const build_info_mod = build_info.createModule();
     mod.addImport("build_info", build_info_mod);
 
@@ -166,6 +167,36 @@ pub fn build(b: *std.Build) void {
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
+
+    // A separate, explicitly requested Windows executable exercises automatic
+    // descriptor rollover at process scale. Its marker hook is absent from the
+    // normal daemon, checks, tests, and release artifact.
+    const windows_rollover_smoke_step = b.step("windows-rollover-smoke-server", "Build the Windows automatic-rollover process smoke executable");
+    if (os_tag == .windows) {
+        const smoke_info = b.addOptions();
+        smoke_info.addOption([]const u8, "git_commit", git);
+        smoke_info.addOption([]const u8, "version", b.fmt("{s}+{s}", .{ manifestVersion(), git }));
+        smoke_info.addOption(bool, "windows_rollover_smoke", true);
+        const smoke_mod = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+        });
+        smoke_mod.addImport("build_info", smoke_info.createModule());
+        const smoke_exe = b.addExecutable(.{
+            .name = "onyx-server-rollover-smoke",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = needs_libc,
+                .strip = strip_release,
+                .imports = &.{.{ .name = "onyx_server", .module = smoke_mod }},
+            }),
+        });
+        windows_rollover_smoke_step.dependOn(&b.addInstallArtifact(smoke_exe, .{}).step);
+    }
 
     // Build-only: these probes must execute on an isolated OpenBSD machine.
     const openbsd_probes = b.step("openbsd-probes", "Build native OpenBSD Helix and worker acceptance probes");
