@@ -2350,14 +2350,16 @@ pub const MediaPlane = struct {
             }; // timeout/idle
             if (physically_routed) {
                 if (got.data.len == 0 or got.data.len > self.max_frame_bytes) continue;
-                if (MediaSocket.isStun(got.data[0])) {
-                    self.handleRoutingStun(sock, got.from, got.data) catch |err| {
+                // DTLS content types also satisfy the broad STUN top-bit test.
+                // Route them first so a real Finished record reaches its terminator.
+                if (got.data[0] >= 20 and got.data[0] <= 63) {
+                    self.handleRoutingDtls(sock, got.from, got.data) catch |err| {
                         self.noteRoutingIngressError(err);
                         continue;
                     };
                     self.noteRoutingIngressComplete();
-                } else if (got.data[0] >= 20 and got.data[0] <= 63) {
-                    self.handleRoutingDtls(sock, got.from, got.data) catch |err| {
+                } else if (MediaSocket.isStun(got.data[0])) {
+                    self.handleRoutingStun(sock, got.from, got.data) catch |err| {
                         self.noteRoutingIngressError(err);
                         continue;
                     };
@@ -2691,12 +2693,11 @@ pub const MediaPlane = struct {
             try testing.expectEqualSlices(u8, canonical, got.data);
             try testing.expectEqual(@as(usize, 1), probe.calls);
         } else {
-            var polls = [_]posix.pollfd{.{ .fd = receiver.fd, .events = posix.POLL.IN, .revents = 0 }};
-            try testing.expect(posix.system.poll(&polls, polls.len, 0) == 0);
+            try testing.expect(!try receiver.testOnlyReadableNow());
             try testing.expectEqual(@as(usize, 0), probe.calls);
             // Also exercise attempted cleartext ingress after the same denial.
             if (rtcp) self.handleRtcp(&socket, addr, canonical) else self.relay(&socket, addr, canonical, 991, sequence);
-            try testing.expect(posix.system.poll(&polls, polls.len, 0) == 0);
+            try testing.expect(!try receiver.testOnlyReadableNow());
             try testing.expectEqual(@as(usize, 0), probe.calls);
         }
     }
@@ -2728,8 +2729,7 @@ pub const MediaPlane = struct {
         const Oracle = struct {
             fn receive(client: *MediaSocket, keys: @import("../proto/srtp.zig").SessionKeys, canonical: []const u8, rtcp: bool, delivery: bool) !void {
                 if (!delivery) {
-                    var polls = [_]posix.pollfd{.{ .fd = client.fd, .events = posix.POLL.IN, .revents = 0 }};
-                    try testing.expect(posix.system.poll(&polls, polls.len, 0) == 0);
+                    try testing.expect(!try client.testOnlyReadableNow());
                     return;
                 }
                 var wire: [128]u8 = undefined;

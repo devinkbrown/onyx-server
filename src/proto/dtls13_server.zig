@@ -2268,8 +2268,6 @@ test "active media dispatch causal actual DTLS13 supported negotiated profile us
 }
 
 test "active media dispatch packet DTLS13 real supported ingress denial and same-key replay" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var old = try makeTerminator(0xDE);
     defer old.deinit();
     old.term.request_client_cert = true;

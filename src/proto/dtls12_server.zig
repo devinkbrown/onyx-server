@@ -2057,8 +2057,6 @@ test "active media dispatch causal DTLS12 actual mutual denied exporter never pl
 }
 
 test "active media dispatch packet DTLS12 real ingress denial reapproval incomplete and exhaustion" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var old = try makeTerminator(0xDD);
     defer testing.allocator.free(old.sessions);
     defer old.term.deinit();
@@ -2114,8 +2112,6 @@ test "active media dispatch packet DTLS12 real ingress denial reapproval incompl
 }
 
 test "physical media five-blocker causal genuine mutual SRTP cache OOM preserves identical packet retry" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const plane = @import("../daemon/media_plane.zig");
     var peer = try plane.MediaSocket.bind(plane.loopback_be, 0);
     defer peer.deinit();
@@ -2137,8 +2133,6 @@ test "physical media five-blocker causal genuine mutual SRTP cache OOM preserves
 }
 
 test "physical media genuine mutual SRTP every NEW cache allocation refusal preserves identical authentic retry" {
-    // Loopback UDP via posix poll/sendto has no Winsock mapping yet.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const plane = @import("../daemon/media_plane.zig");
     // Plan, stable SSRC cell, detached map, packet plan, payload and row backing.
     // Each fresh real handshake isolates one exact allocation, not replay reset.

@@ -147,6 +147,24 @@ pub const MediaSocket = struct {
         self.recv_timeout_ms = @min(@max(ms, 1), std.math.maxInt(c_int));
     }
 
+    /// Zero-timeout readiness check for packet-denial fixtures. A broken socket
+    /// must fail the oracle instead of looking like an absent datagram.
+    pub fn testOnlyReadableNow(self: *const MediaSocket) error{PollFailed}!bool {
+        if (!builtin.is_test) @compileError("test-only UDP readiness oracle");
+        if (comptime builtin.os.tag == .windows) {
+            var readable = win.FdSet{ .count = 1, .sockets = undefined };
+            readable.sockets[0] = self.fd;
+            var timeout = win.Timeval{ .seconds = 0, .microseconds = 0 };
+            const ready = win.select(0, &readable, null, null, &timeout);
+            if (ready < 0) return error.PollFailed;
+            return ready > 0;
+        }
+        var pfd = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = sys.poll(&pfd, 1, 0);
+        if (ready < 0 or (ready > 0 and pfd[0].revents & posix.POLL.IN == 0)) return error.PollFailed;
+        return ready > 0;
+    }
+
     pub fn capture(self: *const MediaSocket) !Snapshot {
         var result = try observeSocket(self.fd);
         result.recv_timeout_ms = self.recv_timeout_ms;
