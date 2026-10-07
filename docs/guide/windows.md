@@ -641,6 +641,8 @@ python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe --rehash-cap --rotate-active-refusal
+python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe --generated --rehash-cap
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix
@@ -728,6 +730,8 @@ python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
 python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe --rehash-cap --rotate-active-refusal
+python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe --generated --rehash-cap
 python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe --helix

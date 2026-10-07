@@ -269,6 +269,10 @@ jobs:
         run: python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
       - name: Run active WebTransport and media combined Helix smoke
         run: python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Preserve active WebTransport and media across configured TLS cap REHASH
+        run: python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe --rehash-cap --rotate-active-refusal
+      - name: Preserve active WebTransport and media across generated TLS cap REHASH
+        run: python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe --generated --rehash-cap
       - name: Run Windows cold console Ctrl+Break stop smoke
         run: python -B .\tools\windows_console_stop_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run Windows cold console Ctrl+C stop smoke
