@@ -671,6 +671,7 @@ and matching target architecture:
 zig build -j1 -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
 zig build -j1 test-windows -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
+zig build -j1 test -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
 zig build -j1 bogo-shim-test -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 ```
