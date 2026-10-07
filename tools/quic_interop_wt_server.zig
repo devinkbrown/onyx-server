@@ -42,6 +42,7 @@
 //!   Then it blocks until killed.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const onyx_server = @import("onyx_server");
 
 const WebTransportListener = onyx_server.daemon.webtransport_listener.WebTransportListener;
@@ -51,6 +52,36 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const linux = std.os.linux;
 const posix = std.posix;
+const TcpSocket = if (builtin.os.tag == .windows) usize else linux.fd_t;
+
+const win = struct {
+    const invalid_socket = std.math.maxInt(usize);
+    const SockAddr4 = extern struct {
+        family: u16,
+        port: u16,
+        addr: [4]u8,
+        zero: [8]u8 = @splat(0),
+    };
+    comptime {
+        if (@sizeOf(SockAddr4) != 16) @compileError("Windows TCP socket ABI shape changed");
+    }
+    extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) i32;
+    extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+    extern "ws2_32" fn WSASocketW(family: i32, kind: i32, protocol: i32, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+    extern "ws2_32" fn setsockopt(socket: usize, level: i32, option: i32, value: *const anyopaque, len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn accept(socket: usize, address: ?*SockAddr4, len: ?*i32) callconv(.winapi) usize;
+    extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
+    extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
+    extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) usize;
+    extern "kernel32" fn WriteFile(handle: usize, bytes: [*]const u8, len: u32, written: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, value: [*]u16, size: u32) callconv(.winapi) u32;
+};
 
 /// Validity window for Chrome's serverCertificateHashes: must be <= 14 days
 /// (~1209600 s). We use ~12 days and set not_before ~1h in the past for clock
@@ -68,7 +99,7 @@ pub fn main() !void {
     try osEntropy(&seed);
     const kp = try ecdsa_p256.KeyPair.generateDeterministic(seed);
 
-    const now: i64 = wallClockSeconds();
+    const now: i64 = try wallClockSeconds();
     const not_before = now - cert_skew_back_s;
     const not_after = now + cert_validity_s;
 
@@ -138,8 +169,12 @@ pub fn main() !void {
 
     // --- 5. Block forever; the harness kills us when done. -------------------
     while (true) {
-        var req = std.os.linux.timespec{ .sec = 60, .nsec = 0 };
-        _ = std.os.linux.nanosleep(&req, &req);
+        if (comptime builtin.os.tag == .windows) {
+            win.Sleep(60_000);
+        } else {
+            var req = linux.timespec{ .sec = 60, .nsec = 0 };
+            _ = linux.nanosleep(&req, &req);
+        }
     }
 }
 
@@ -152,6 +187,26 @@ pub fn main() !void {
 /// until the peer closes. Single-threaded per connection is fine: there is at
 /// most one bridge per QUIC connection and the harness drives one session.
 fn startTcpEchoServer(allocator: std.mem.Allocator) !u16 {
+    if (comptime builtin.os.tag == .windows) {
+        var startup: [408]u8 align(8) = @splat(0);
+        if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketFailed;
+        errdefer _ = win.WSACleanup();
+        const fd = win.WSASocketW(2, 1, 6, null, 0, 1);
+        if (fd == win.invalid_socket) return error.SocketFailed;
+        errdefer _ = win.closesocket(fd);
+        const exclusive: i32 = 1;
+        if (win.setsockopt(fd, 0xffff, ~@as(i32, 0x0004), &exclusive, @sizeOf(i32)) != 0) return error.SocketFailed;
+        const addr = win.SockAddr4{ .family = 2, .port = 0, .addr = .{ 127, 0, 0, 1 } };
+        if (win.bind(fd, &addr, @sizeOf(win.SockAddr4)) != 0) return error.BindFailed;
+        if (win.listen(fd, 16) != 0) return error.ListenFailed;
+        var bound: win.SockAddr4 = undefined;
+        var slen: i32 = @sizeOf(win.SockAddr4);
+        if (win.getsockname(fd, &bound, &slen) != 0 or slen != @sizeOf(win.SockAddr4)) return error.GetSockNameFailed;
+        const t = try std.Thread.spawn(.{}, echoAcceptLoop, .{fd});
+        t.detach();
+        _ = allocator;
+        return std.mem.bigToNative(u16, bound.port);
+    }
     const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
     const fd: linux.fd_t = @intCast(rc);
@@ -187,8 +242,18 @@ fn startTcpEchoServer(allocator: std.mem.Allocator) !u16 {
     return port;
 }
 
-fn echoAcceptLoop(listen_fd: linux.fd_t) void {
+fn echoAcceptLoop(listen_fd: TcpSocket) void {
     while (true) {
+        if (comptime builtin.os.tag == .windows) {
+            const conn_fd = win.accept(listen_fd, null, null);
+            if (conn_fd == win.invalid_socket) {
+                win.Sleep(1);
+                continue;
+            }
+            echoConnLoop(conn_fd);
+            _ = win.closesocket(conn_fd);
+            continue;
+        }
         const arc = linux.accept(listen_fd, null, null);
         if (posix.errno(arc) != .SUCCESS) {
             // Transient accept error: yield and retry.
@@ -202,9 +267,16 @@ fn echoAcceptLoop(listen_fd: linux.fd_t) void {
     }
 }
 
-fn echoConnLoop(fd: linux.fd_t) void {
+fn echoConnLoop(fd: TcpSocket) void {
     var buf: [4096]u8 = undefined;
     while (true) {
+        if (comptime builtin.os.tag == .windows) {
+            const n = win.recv(fd, &buf, buf.len, 0);
+            if (n < 0 and win.WSAGetLastError() == 10004) continue;
+            if (n <= 0) return;
+            if (!writeAllFd(fd, buf[0..@intCast(n)])) return;
+            continue;
+        }
         const rc = linux.read(fd, &buf, buf.len);
         switch (posix.errno(rc)) {
             .SUCCESS => {
@@ -218,9 +290,16 @@ fn echoConnLoop(fd: linux.fd_t) void {
     }
 }
 
-fn writeAllFd(fd: linux.fd_t, bytes: []const u8) bool {
+fn writeAllFd(fd: TcpSocket, bytes: []const u8) bool {
     var sent: usize = 0;
     while (sent < bytes.len) {
+        if (comptime builtin.os.tag == .windows) {
+            const n = win.send(fd, bytes[sent..].ptr, @intCast(@min(bytes.len - sent, std.math.maxInt(i32))), 0);
+            if (n < 0 and win.WSAGetLastError() == 10004) continue;
+            if (n <= 0) return false;
+            sent += @intCast(n);
+            continue;
+        }
         const rc = linux.write(fd, bytes.ptr + sent, bytes.len - sent);
         switch (posix.errno(rc)) {
             .SUCCESS => {
@@ -236,12 +315,19 @@ fn writeAllFd(fd: linux.fd_t, bytes: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Small syscall helpers (Linux-only harness)
+// Small OS helpers
 // ---------------------------------------------------------------------------
 
 fn writeAll(fd: i32, bytes: []const u8) void {
     var sent: usize = 0;
     while (sent < bytes.len) {
+        if (comptime builtin.os.tag == .windows) {
+            const handle = win.GetStdHandle(if (fd == 2) @as(u32, @bitCast(@as(i32, -12))) else @as(u32, @bitCast(@as(i32, -11))));
+            var written: u32 = 0;
+            if (win.WriteFile(handle, bytes[sent..].ptr, @intCast(@min(bytes.len - sent, std.math.maxInt(u32))), &written, null) == 0 or written == 0) return;
+            sent += written;
+            continue;
+        }
         const rc = std.os.linux.write(fd, bytes.ptr + sent, bytes.len - sent);
         const signed: isize = @bitCast(rc);
         if (signed <= 0) return;
@@ -249,9 +335,12 @@ fn writeAll(fd: i32, bytes: []const u8) void {
     }
 }
 
-/// Wall-clock seconds since the Unix epoch via the raw `clock_gettime`
-/// syscall (Linux-only harness). Used only to anchor the cert validity window.
-fn wallClockSeconds() i64 {
+/// Wall-clock seconds since the Unix epoch, used to anchor cert validity.
+fn wallClockSeconds() !i64 {
+    if (comptime builtin.os.tag == .windows) {
+        const millis = onyx_server.substrate.platform.realtimeMillisChecked() orelse return error.ClockUnavailable;
+        return @divTrunc(millis, 1000);
+    }
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
     return @intCast(ts.sec);
@@ -262,8 +351,18 @@ fn wallClockSeconds() i64 {
 /// parse as a non-zero u16. Zig 0.16 dropped `std.os.environ`/`getEnvVarOwned`
 /// on a no-libc Linux target (this harness builds without libc), so we read the
 /// raw `/proc/self/environ` blob (NUL-separated `KEY=VALUE` records) exactly as
-/// `webtransport_listener.zig` does — no allocation, bounded buffer.
+/// `webtransport_listener.zig` does — no allocation, bounded buffer. Windows
+/// reads the same variable through its native UTF-16 process environment.
 fn bridgePortArg() !?u16 {
+    if (comptime builtin.os.tag == .windows) {
+        var wide: [256]u16 = undefined;
+        const n = win.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ONYX_WT_BRIDGE_PORT"), &wide, wide.len);
+        if (n == 0) return null;
+        if (n >= wide.len) return error.InvalidBridgePort;
+        var utf8: [wide.len * 3]u8 = undefined;
+        const len = std.unicode.utf16LeToUtf8(&utf8, wide[0..n]) catch return error.InvalidBridgePort;
+        return try parsePort(utf8[0..len]);
+    }
     var buf: [16384]u8 = undefined;
     const env = readSelfEnviron(&buf) orelse return null;
     const key = "ONYX_WT_BRIDGE_PORT=";
@@ -305,6 +404,10 @@ fn parsePort(s: []const u8) !u16 {
 }
 
 fn osEntropy(buf: []u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        onyx_server.substrate.platform.fillOsEntropy(buf) catch return error.Entropy;
+        return;
+    }
     var filled: usize = 0;
     while (filled < buf.len) {
         const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);

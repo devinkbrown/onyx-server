@@ -19,6 +19,7 @@
 //!   * Runs until killed (SIGTERM/SIGKILL).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const onyx_server = @import("onyx_server");
 
 const WebTransportListener = onyx_server.daemon.webtransport_listener.WebTransportListener;
@@ -26,6 +27,15 @@ const any_be = onyx_server.daemon.webtransport_listener.any_be;
 const x509_selfsign = onyx_server.proto.x509_selfsign;
 
 const Ed25519 = std.crypto.sign.Ed25519;
+
+const win = struct {
+    extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
+    extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) usize;
+    extern "kernel32" fn WriteFile(handle: usize, bytes: [*]const u8, len: u32, written: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
+    extern "kernel32" fn LocalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "shell32" fn CommandLineToArgvW(command_line: [*:0]const u16, argc: *i32) callconv(.winapi) ?[*][*:0]u16;
+};
 
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -81,15 +91,26 @@ pub fn main() !void {
     // Block forever; the harness kills the process when done. The listener runs
     // its own pump thread, so the main thread just parks.
     while (true) {
-        var req = std.os.linux.timespec{ .sec = 60, .nsec = 0 };
-        _ = std.os.linux.nanosleep(&req, &req);
+        if (comptime builtin.os.tag == .windows) {
+            win.Sleep(60_000);
+        } else {
+            var req = std.os.linux.timespec{ .sec = 60, .nsec = 0 };
+            _ = std.os.linux.nanosleep(&req, &req);
+        }
     }
 }
 
-/// Write all of `bytes` to file descriptor `fd` via the raw Linux write syscall.
+/// Write all of `bytes` to stdout or stderr through the native OS API.
 fn writeAll(fd: i32, bytes: []const u8) void {
     var sent: usize = 0;
     while (sent < bytes.len) {
+        if (comptime builtin.os.tag == .windows) {
+            const handle = win.GetStdHandle(if (fd == 2) @as(u32, @bitCast(@as(i32, -12))) else @as(u32, @bitCast(@as(i32, -11))));
+            var written: u32 = 0;
+            if (win.WriteFile(handle, bytes[sent..].ptr, @intCast(@min(bytes.len - sent, std.math.maxInt(u32))), &written, null) == 0 or written == 0) return;
+            sent += written;
+            continue;
+        }
         const rc = std.os.linux.write(fd, bytes.ptr + sent, bytes.len - sent);
         const signed: isize = @bitCast(rc);
         if (signed <= 0) return;
@@ -98,10 +119,27 @@ fn writeAll(fd: i32, bytes: []const u8) void {
 }
 
 /// Whether the process command line contains `flag` (exact NUL-delimited argv
-/// token). Reads `/proc/self/cmdline` via raw syscalls — the harness is
-/// Linux-only and this avoids depending on the Zig-version-specific args API.
-/// The arguments are NUL-separated, so a token match is an exact match.
+/// token). Linux reads `/proc/self/cmdline`; Windows uses CommandLineToArgvW.
+/// Only ASCII flags are accepted by the Windows comparison.
 fn cmdlineHasFlag(flag: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        var argc: i32 = 0;
+        const argv = win.CommandLineToArgvW(win.GetCommandLineW(), &argc) orelse return false;
+        defer _ = win.LocalFree(@ptrCast(argv));
+        for (0..@intCast(argc)) |i| {
+            const arg = std.mem.span(argv[i]);
+            if (arg.len != flag.len) continue;
+            var equal = true;
+            for (arg, flag) |code_unit, byte| {
+                if (code_unit != byte) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) return true;
+        }
+        return false;
+    }
     const linux = std.os.linux;
     const rc = linux.open("/proc/self/cmdline", .{ .ACCMODE = .RDONLY }, 0);
     const sfd: isize = @bitCast(rc);
@@ -125,9 +163,12 @@ fn cmdlineHasFlag(flag: []const u8) bool {
     return false;
 }
 
-/// Fill `buf` from the OS CSPRNG via the raw Linux getrandom syscall (matching
-/// the daemon's own entropy path; the harness is Linux-only).
+/// Fill `buf` from the OS CSPRNG.
 fn osEntropy(buf: []u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        onyx_server.substrate.platform.fillOsEntropy(buf) catch return error.Entropy;
+        return;
+    }
     var filled: usize = 0;
     while (filled < buf.len) {
         const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);

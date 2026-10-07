@@ -97,6 +97,10 @@ jobs:
           python-version: '3.12'
       - name: Smoke native-codegen Windows release package
         run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --tls --wss --metrics --webhook
+      - name: Build native Windows QUIC interop tools
+        run: zig build -j1 quic-interop-server quic-interop-wt-server -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+      - name: Run standalone Windows WebTransport browser interop
+        run: python -B .\tools\windows_quic_interop_smoke.py .\zig-out\bin\quic_interop_wt_server.exe
       - name: Run full Windows test suite (Debug)
         run: zig build -j1 test -Dtarget=x86_64-windows --summary all
       - name: Run portable protocol tests (Debug)
