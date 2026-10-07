@@ -204,7 +204,9 @@ jobs:
         run: python -B .\tools\windows_tls_companion_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native OroWasm plugin command smoke
         run: python -B .\tools\windows_wasm_smoke.py .\zig-out\bin\onyx-server.exe
-      - name: Run native mail delivery failure journal smoke
+      - name: Build pure Zig Windows SMTP relay fixture
+        run: zig build -j1 windows-mail-relay -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+      - name: Run native trusted SMTP delivery and failure journal smoke
         run: python -B .\tools\windows_mail_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native GeoIP and news cache smoke
         run: python -B .\tools\windows_geo_smoke.py .\zig-out\bin\onyx-server.exe

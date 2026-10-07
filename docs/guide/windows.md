@@ -558,6 +558,7 @@ python -B .\tools\windows_webpush_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_ocg2_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_tls_companion_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+zig build -j1 windows-mail-relay -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 python -B .\tools\windows_mail_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_geo_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
@@ -637,6 +638,7 @@ python -B .\tools\windows_ocg2_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webpush_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_tls_companion_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+zig build -j1 windows-mail-relay -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 python -B .\tools\windows_mail_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_geo_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
