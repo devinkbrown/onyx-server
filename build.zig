@@ -45,6 +45,14 @@ pub fn build(b: *std.Build) void {
     // uses ntdll/advapi32, so libc is linked only on the libc-mandatory targets.
     const os_tag = target.result.os.tag;
     const needs_libc = os_tag != .linux and os_tag != .windows;
+    // The pinned Windows Zig compiler can abort without a diagnostic while
+    // lowering the complete daemon through LLVM. Keep an explicit native
+    // backend path so the executable and test gates remain buildable there.
+    const windows_self_hosted = b.option(bool, "windows-self-hosted", "Use Zig's self-hosted Windows code generator for the daemon and test gates") orelse false;
+    if (windows_self_hosted and (os_tag != .windows or
+        b.graph.host.result.os.tag != .windows or
+        target.result.cpu.arch != b.graph.host.result.cpu.arch))
+        std.debug.panic("-Dwindows-self-hosted requires a native Windows target", .{});
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -161,6 +169,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (windows_self_hosted) exe.use_llvm = false;
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -195,6 +204,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "onyx_server", .module = smoke_mod }},
             }),
         });
+        if (windows_self_hosted) smoke_exe.use_llvm = false;
         windows_rollover_smoke_step.dependOn(&b.addInstallArtifact(smoke_exe, .{}).step);
     }
 
@@ -626,6 +636,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (windows_self_hosted) armor_exe.use_llvm = false;
     b.installArtifact(armor_exe);
 
     const cli_tests = b.addTest(.{
@@ -794,6 +805,15 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
         .filters = &.{},
     });
+    const run_windows_exe_tests = b.addRunArtifact(windows_exe_tests);
+    const stack_tool = if (windows_self_hosted) b.addExecutable(.{
+        .name = "windows-pe-stack",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/windows_pe_stack.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    }) else null;
     // Several full-server fixtures still construct Server by value before
     // initInPlace can place it on the heap. Their Debug frames exceed the
     // default Windows PE stack, including in focused suites that reuse `mod`.
@@ -815,9 +835,55 @@ pub fn build(b: *std.Build) void {
             cli_tests,              cli_tests_verbose,
             windows_io_tests,       windows_exe_tests,
         };
-        for (windows_test_steps) |step| step.stack_size = 64 * 1024 * 1024;
+        for (windows_test_steps) |step| {
+            step.stack_size = 64 * 1024 * 1024;
+            if (windows_self_hosted) step.use_llvm = false;
+        }
+        if (windows_self_hosted) {
+            // Zig's self-hosted PE writer currently emits a 16 MiB stack even
+            // when `--stack 67108864` is present. Patch the validated header
+            // after compilation, before each test runner starts.
+            const TestRun = struct {
+                compile: *std.Build.Step.Compile,
+                run: *std.Build.Step.Run,
+            };
+            const runs = [_]TestRun{
+                .{ .compile = mod_tests, .run = run_mod_tests },
+                .{ .compile = mod_tests_verbose, .run = run_mod_tests_verbose },
+                .{ .compile = exe_tests, .run = run_exe_tests },
+                .{ .compile = exe_tests_verbose, .run = run_exe_tests_verbose },
+                .{ .compile = tls_tests, .run = run_tls_tests },
+                .{ .compile = tls_tests_verbose, .run = run_tls_tests_verbose },
+                .{ .compile = server_tests, .run = run_server_tests },
+                .{ .compile = server_tests_verbose, .run = run_server_tests_verbose },
+                .{ .compile = exploit_tests, .run = run_exploit_tests },
+                .{ .compile = config_tests, .run = run_config_tests },
+                .{ .compile = config_tests_verbose, .run = run_config_tests_verbose },
+                .{ .compile = ircx_tests, .run = run_ircx_tests },
+                .{ .compile = ircx_tests_verbose, .run = run_ircx_tests_verbose },
+                .{ .compile = event_tests, .run = run_event_tests },
+                .{ .compile = event_tests_verbose, .run = run_event_tests_verbose },
+                .{ .compile = mesh_tests, .run = run_mesh_tests },
+                .{ .compile = mesh_tests_verbose, .run = run_mesh_tests_verbose },
+                .{ .compile = media_tests, .run = run_media_tests },
+                .{ .compile = media_tests_verbose, .run = run_media_tests_verbose },
+                .{ .compile = services_tests, .run = run_services_tests },
+                .{ .compile = services_tests_verbose, .run = run_services_tests_verbose },
+                .{ .compile = session_tests, .run = run_session_tests },
+                .{ .compile = session_tests_verbose, .run = run_session_tests_verbose },
+                .{ .compile = helix_tests, .run = run_helix_tests },
+                .{ .compile = helix_tests_verbose, .run = run_helix_tests_verbose },
+                .{ .compile = dst_tests, .run = run_dst_tests },
+                .{ .compile = cli_tests, .run = run_cli_tests },
+                .{ .compile = cli_tests_verbose, .run = run_cli_tests_verbose },
+                .{ .compile = windows_io_tests, .run = run_windows_io_tests },
+                .{ .compile = windows_exe_tests, .run = run_windows_exe_tests },
+            };
+            for (runs) |entry| {
+                patchWindowsTestStack(b, stack_tool.?, entry.compile, entry.run);
+            }
+        }
     }
-    const run_windows_exe_tests = b.addRunArtifact(windows_exe_tests);
     const test_windows_step = b.step("test-windows", "Run native Windows socket/IOCP and daemon entry-point tests");
     test_windows_step.dependOn(&check_exe.step);
     test_windows_step.dependOn(&run_windows_io_tests.step);
@@ -886,6 +952,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = ct_onyx_mod }},
         }),
     });
+    if (windows_self_hosted) ct_check_exe.use_llvm = false;
     const ct_check_run = b.addRunArtifact(ct_check_exe);
     const ct_check_step = b.step("ct-check", "Run the opt-in dudect-style constant-time verification harness (roadmap 0.4)");
     ct_check_step.dependOn(&ct_check_run.step);
@@ -927,6 +994,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = bench_onyx_mod }},
         }),
     });
+    if (windows_self_hosted) bench_exe.use_llvm = false;
     // Installed into zig-out/bin so `tools/bench.sh` can invoke it directly (and
     // re-run it under `taskset`/`nice` without going through the build graph).
     const bench_install = b.addInstallArtifact(bench_exe, .{});
@@ -951,6 +1019,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = bench_onyx_mod }},
         }),
     });
+    if (windows_self_hosted) bench_live_exe.use_llvm = false;
     const bench_live_run = b.addSystemCommand(&.{"python3"});
     bench_live_run.addFileArg(b.path("tools/bench_live.py"));
     bench_live_run.addArg("--bin");
@@ -971,6 +1040,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = bench_onyx_mod }},
         }),
     });
+    if (windows_self_hosted) bench_x5_exe.use_llvm = false;
     const bench_x5_run = b.addRunArtifact(bench_x5_exe);
     bench_x5_run.addPassthruArgs();
     const bench_x5_step = b.step("bench-gap-x5", "GAP-X5: bytes per connection and microseconds per fan-out recipient (no shrink)");
@@ -1005,6 +1075,13 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"cov-fuzz:"},
     });
     const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    if (os_tag == .windows) {
+        fuzz_tests.stack_size = 64 * 1024 * 1024;
+        if (windows_self_hosted) {
+            fuzz_tests.use_llvm = false;
+            patchWindowsTestStack(b, stack_tool.?, fuzz_tests, run_fuzz_tests);
+        }
+    }
     const fuzz_step = b.step("fuzz", "Run the coverage-guided TLS-parser fuzz targets (roadmap 0.2); add --fuzz to drive them coverage-guided");
     fuzz_step.dependOn(&run_fuzz_tests.step);
 
@@ -1023,6 +1100,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
+    if (windows_self_hosted) interop_exe.use_llvm = false;
     const interop_step = b.step("quic-interop-server", "Build the standalone QUIC/HTTP3 interop test server");
     interop_step.dependOn(&b.addInstallArtifact(interop_exe, .{}).step);
 
@@ -1041,6 +1119,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
+    if (windows_self_hosted) interop_wt_exe.use_llvm = false;
     const interop_wt_step = b.step("quic-interop-wt-server", "Build the standalone WebTransport (browser) interop test server");
     interop_wt_step.dependOn(&b.addInstallArtifact(interop_wt_exe, .{}).step);
 
@@ -1061,6 +1140,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
+    if (windows_self_hosted) bogo_shim_exe.use_llvm = false;
     const bogo_shim_install = b.addInstallArtifact(bogo_shim_exe, .{});
     const bogo_shim_step = b.step("bogo-shim", "Build the standalone BoGo (BoringSSL runner) TLS shim");
     bogo_shim_step.dependOn(&bogo_shim_install.step);
@@ -1075,6 +1155,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
+    if (windows_self_hosted) windows_helix_early_client.use_llvm = false;
     const windows_helix_early_client_step = b.step("windows-helix-early-client", "Build the native Zig TLS 0-RTT smoke client");
     windows_helix_early_client_step.dependOn(&b.addInstallArtifact(windows_helix_early_client, .{}).step);
 
@@ -1088,6 +1169,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = mod }},
         }),
     });
+    if (windows_self_hosted) windows_mail_relay.use_llvm = false;
     const windows_mail_relay_step = b.step("windows-mail-relay", "Build the pure Zig Windows STARTTLS mail smoke relay");
     windows_mail_relay_step.dependOn(&b.addInstallArtifact(windows_mail_relay, .{}).step);
 
@@ -1106,6 +1188,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_bogo_shim_tests = b.addRunArtifact(bogo_shim_tests);
+    if (os_tag == .windows) {
+        bogo_shim_tests.stack_size = 64 * 1024 * 1024;
+        if (windows_self_hosted) {
+            bogo_shim_tests.use_llvm = false;
+            patchWindowsTestStack(b, stack_tool.?, bogo_shim_tests, run_bogo_shim_tests);
+        }
+    }
     // The subprocess smokes spawn the freshly-installed binary via BOGO_SHIM_BIN.
     // This assumes the DEFAULT install prefix (`<build_root>/zig-out`); a `-p`
     // override is not resolved here, so run this step without `-p`. (When the
@@ -1113,7 +1202,7 @@ pub fn build(b: *std.Build) void {
     // unset and the subprocess smokes skip; the pure parse/framing tests run.)
     run_bogo_shim_tests.setEnvironmentVariable(
         "BOGO_SHIM_BIN",
-        b.pathJoin(&.{ b.root.root_dir.path orelse ".", "zig-out", "bin", "bogo_shim" }),
+        b.pathJoin(&.{ b.root.root_dir.path orelse ".", "zig-out", "bin", if (os_tag == .windows) "bogo_shim.exe" else "bogo_shim" }),
     );
     run_bogo_shim_tests.step.dependOn(&bogo_shim_install.step);
     const bogo_shim_test_step = b.step("bogo-shim-test", "Build + self-drive the BoGo shim (loopback exit-code smokes; no external harness)");
@@ -1162,6 +1251,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "onyx_server", .module = release_mod }},
         }),
     });
+    if (windows_self_hosted) release_exe.use_llvm = false;
     const release_install = b.addInstallArtifact(release_exe, .{});
     release_step.dependOn(&release_install.step);
 
@@ -1270,6 +1360,12 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn patchWindowsTestStack(b: *std.Build, stack_tool: *std.Build.Step.Compile, compile: *std.Build.Step.Compile, run: *std.Build.Step.Run) void {
+    const patch_stack = b.addRunArtifact(stack_tool);
+    patch_stack.addFileArg(compile.getEmittedBin());
+    run.step.dependOn(&patch_stack.step);
 }
 
 /// Extract the semantic version from build.zig.zon — the manifest is the single

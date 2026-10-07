@@ -80,6 +80,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "tools/windows_pe_stack.zig",
         // For example...
         //"LICENSE",
         //"README.md",

@@ -648,5 +648,23 @@ tests skip platform-specific Linux/OpenBSD facilities. The process smokes
 exercise configured listeners and services that unit tests cannot cover;
 the Windows operational limits above remain in force.
 
+If the pinned Zig compiler aborts while lowering the full Windows daemon
+through LLVM, `-Dwindows-self-hosted=true` selects Zig's native code generator
+for the daemon and Windows test artifacts. Use it with a native Windows host
+and matching target architecture:
+
+```powershell
+zig build -j1 -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
+zig build -j1 test-windows -Dtarget=x86_64-windows -Dwindows-self-hosted=true
+zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
+zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true
+```
+
+The build validates and corrects the self-hosted test PE stack
+reserve to 64 MiB before each test run. This backend produces larger binaries
+and can start more slowly. The full unfiltered suite and release gates remain
+required before shipping; focused and native gates alone do not establish full
+Windows support.
+
 For the complete build and test command list, see [Build guide](build.md) and
 [Testing guide](testing.md).
