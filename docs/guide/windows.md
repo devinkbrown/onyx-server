@@ -610,6 +610,7 @@ full-daemon smoke:
 zig build -j1 test-windows -Dtarget=x86_64-windows --summary all
 zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
 zig build -j1 test -Dtarget=x86_64-windows --summary all
+zig build -j1 test -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
 zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=proto.' --summary all
 zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=daemon.store.test.' --summary all
 zig build -j1 test-cli -Dtarget=x86_64-windows --summary all
@@ -686,6 +687,7 @@ zig build -j1 -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-host
 zig build -j1 test-windows -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
 zig build -j1 test -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+zig build -j1 test -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true --summary all
 zig build -j1 bogo-shim-test -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 ```
@@ -694,8 +696,11 @@ The build validates and corrects the self-hosted test PE stack
 reserve to 64 MiB before each test run. This backend produces larger binaries
 and can start more slowly. The in-repo BoGo shim tests use native Winsock and
 Onyx's Zig TLS engine; they need no OpenSSL library or executable. The full
-unfiltered suite and release gates remain required before shipping; focused
-and native gates alone do not establish full Windows support.
+unfiltered Debug and ReleaseSafe suites are configured in CI with native
+codegen. A local LLVM ReleaseSafe run passed on 2026-10-07; its compiler peaked
+near 7 GiB.
+Release gates and live process smokes remain required before shipping; unit
+tests alone do not establish full Windows support.
 
 For the complete build and test command list, see [Build guide](build.md) and
 [Testing guide](testing.md).

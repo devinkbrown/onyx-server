@@ -107,6 +107,8 @@ jobs:
         run: zig build -j1 test -Dtarget=x86_64-windows --summary all
       - name: Run full Windows test suite with native Zig codegen (Debug)
         run: zig build -j1 test -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+      - name: Run full Windows test suite with native Zig codegen (ReleaseSafe)
+        run: zig build -j1 test -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true --summary all
       - name: Build native-codegen Windows test runners
         run: zig build -j1 test-artifacts -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
       - name: Verify Windows test-runner stack reserves
