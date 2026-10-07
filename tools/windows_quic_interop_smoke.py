@@ -2,16 +2,18 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Exercise the standalone WebTransport interop server with a real browser.
+"""Exercise HTTP/3 and standalone WebTransport with a real browser.
 
-The server's in-process Windows TCP echo bridge must return a byte-exact bidi
-stream, and its WebTransport datagram echo must return a byte-exact datagram.
+Chrome must receive the expected HTTP/3 GET body. The server's in-process
+Windows TCP echo bridge must return a byte-exact bidi stream, and its
+WebTransport datagram echo must return a byte-exact datagram.
 Usage: python -B tools/windows_quic_interop_smoke.py [server.exe]
 """
 
 import argparse
 import base64
 from contextlib import contextmanager
+import html
 import os
 from pathlib import Path
 import queue
@@ -76,7 +78,7 @@ def disposable_run_dir():
                 time.sleep(0.2)
 
 
-def announced_values(server: subprocess.Popen[str]) -> tuple[int, str]:
+def announced_values(server: subprocess.Popen[str]) -> tuple[int, str, str]:
     lines: queue.Queue[str] = queue.Queue()
     transcript: list[str] = []
 
@@ -90,7 +92,7 @@ def announced_values(server: subprocess.Popen[str]) -> tuple[int, str]:
     threading.Thread(target=read_output, daemon=True).start()
     values: dict[str, str] = {}
     deadline = time.monotonic() + 60
-    required = {"PORT", "CERTHASH", "CERTHASHB64"}
+    required = {"PORT", "CERTHASH", "CERTHASHB64", "SPKIB64"}
     while not required.issubset(values) and time.monotonic() < deadline:
         try:
             line = lines.get(timeout=0.25)
@@ -109,7 +111,48 @@ def announced_values(server: subprocess.Popen[str]) -> tuple[int, str]:
         raise AssertionError(f"invalid interop announcement: {values}")
     if base64.b64decode(values["CERTHASHB64"], validate=True) != bytes.fromhex(digest):
         raise AssertionError("interop certificate hashes disagree")
-    return port, digest
+    spki_hash = base64.b64decode(values["SPKIB64"], validate=True)
+    if len(spki_hash) != 32:
+        raise AssertionError("invalid interop SPKI hash")
+    return port, digest, values["SPKIB64"]
+
+
+def smoke_http3_get(chromium: Path, port: int, spki_hash: str, run_dir: Path) -> None:
+    """Navigate directly over HTTP/3 with a pin for this fresh test leaf."""
+    command = [
+        str(chromium), "--headless=new", "--no-first-run",
+        f"--user-data-dir={run_dir / 'chrome-get'}",
+        f"--origin-to-force-quic-on=127.0.0.1:{port}",
+        f"--ignore-certificate-errors-spki-list={spki_hash}",
+        "--dump-dom", f"https://127.0.0.1:{port}/",
+    ]
+    browser = subprocess.Popen(
+        command, cwd=run_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        stdout, stderr = browser.communicate(timeout=45)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(browser.pid), "/T", "/F"],
+                capture_output=True, check=False, timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        finally:
+            if browser.poll() is None:
+                browser.kill()
+            browser.wait(timeout=5)
+        raise TimeoutError("browser HTTP/3 GET timed out") from exc
+    match = re.search(r"<pre(?:\s[^>]*)?>(.*?)</pre>", stdout, re.DOTALL)
+    body = html.unescape(match.group(1)).strip() if match else None
+    if browser.returncode != 0 or body != "onyx quic ok":
+        raise AssertionError(
+            f"browser HTTP/3 GET failed (exit {browser.returncode}, body {body!r}):\n"
+            f"{stdout[-6000:]}\n{stderr[-6000:]}"
+        )
 
 
 def main() -> int:
@@ -136,8 +179,10 @@ def main() -> int:
             bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW, env=server_env,
         )
         try:
-            port, digest = announced_values(server)
-            print("PASS: standalone WebTransport server announced matching certificate hashes", flush=True)
+            port, digest, spki_hash = announced_values(server)
+            print("PASS: standalone WebTransport server announced certificate and SPKI hashes", flush=True)
+            smoke_http3_get(chromium, port, spki_hash, run_dir)
+            print("PASS: Chrome/Edge HTTP/3 GET returned the expected body", flush=True)
             env = os.environ.copy()
             env["TMPDIR"] = str(run_dir)
             browser = subprocess.Popen(

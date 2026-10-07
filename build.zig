@@ -269,7 +269,6 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_mod_step = b.step("test-mod", "Run only the library/module test artifact; accepts -Dtest-filter=<text>");
-    test_mod_step.dependOn(&run_mod_tests.step);
     const mod_tests_verbose = b.addTest(.{
         .root_module = mod,
         .filters = test_filters,
@@ -277,7 +276,45 @@ pub fn build(b: *std.Build) void {
     });
     const run_mod_tests_verbose = b.addRunArtifact(mod_tests_verbose);
     const test_mod_verbose_step = b.step("test-mod-verbose", "Run module tests with per-test progress output; accepts -Dtest-filter=<text>");
-    test_mod_verbose_step.dependOn(&run_mod_tests_verbose.step);
+    // The pinned Zig Windows compiler exits without a diagnostic when emitting
+    // the unfiltered ~10k-test root artifact. Filter by top-level source path
+    // while retaining src/root.zig as the module root: direct package roots
+    // cannot resolve their cross-package relative imports. The source root
+    // imports only these five path families; anonymous root tests are included
+    // by Zig in every filtered runner.
+    const windows_full_shards = os_tag == .windows and test_filters.len == 0;
+    const shard_names = [_][]const u8{ "crypto", "daemon", "proto", "substrate", "wasm" };
+    const TestShard = struct {
+        name: []const u8,
+        compile: *std.Build.Step.Compile,
+        run: *std.Build.Step.Run,
+        verbose_compile: *std.Build.Step.Compile,
+        verbose_run: *std.Build.Step.Run,
+    };
+    var test_shards: [shard_names.len]TestShard = undefined;
+    if (windows_full_shards) {
+        for (shard_names, 0..) |name, index| {
+            const filters: []const []const u8 = &.{b.fmt("{s}.", .{name})};
+            const compile = b.addTest(.{ .root_module = mod, .filters = filters });
+            const verbose_compile = b.addTest(.{
+                .root_module = mod,
+                .filters = filters,
+                .test_runner = verbose_test_runner,
+            });
+            test_shards[index] = .{
+                .name = name,
+                .compile = compile,
+                .run = b.addRunArtifact(compile),
+                .verbose_compile = verbose_compile,
+                .verbose_run = b.addRunArtifact(verbose_compile),
+            };
+            test_mod_step.dependOn(&test_shards[index].run.step);
+            test_mod_verbose_step.dependOn(&test_shards[index].verbose_run.step);
+        }
+    } else {
+        test_mod_step.dependOn(&run_mod_tests.step);
+        test_mod_verbose_step.dependOn(&run_mod_tests_verbose.step);
+    }
 
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
@@ -657,19 +694,37 @@ pub fn build(b: *std.Build) void {
 
     // Cross-compiled test runners are copied to the target machine explicitly.
     const test_artifacts = b.step("test-artifacts", "Build and install module, daemon, and CLI test runners without executing them");
-    test_artifacts.dependOn(&b.addInstallFile(mod_tests.getEmittedBin(), "bin/onyx-server-module-tests").step);
-    test_artifacts.dependOn(&b.addInstallFile(exe_tests.getEmittedBin(), "bin/onyx-server-daemon-tests").step);
-    test_artifacts.dependOn(&b.addInstallFile(cli_tests.getEmittedBin(), "bin/onyx-server-cli-tests").step);
+    const test_exe_suffix = if (os_tag == .windows) ".exe" else "";
+    var shard_install_steps: [shard_names.len]*std.Build.Step = undefined;
+    var mod_install_step: ?*std.Build.Step = null;
+    if (windows_full_shards) {
+        for (test_shards, 0..) |shard, index| {
+            const install = b.addInstallFile(
+                shard.compile.getEmittedBin(),
+                b.fmt("bin/onyx-server-module-tests-{s}{s}", .{ shard.name, test_exe_suffix }),
+            );
+            shard_install_steps[index] = &install.step;
+            test_artifacts.dependOn(&install.step);
+        }
+    } else {
+        const install = b.addInstallFile(mod_tests.getEmittedBin(), b.fmt("bin/onyx-server-module-tests{s}", .{test_exe_suffix}));
+        mod_install_step = &install.step;
+        test_artifacts.dependOn(&install.step);
+    }
+    const exe_install = b.addInstallFile(exe_tests.getEmittedBin(), b.fmt("bin/onyx-server-daemon-tests{s}", .{test_exe_suffix}));
+    const cli_install = b.addInstallFile(cli_tests.getEmittedBin(), b.fmt("bin/onyx-server-cli-tests{s}", .{test_exe_suffix}));
+    test_artifacts.dependOn(&exe_install.step);
+    test_artifacts.dependOn(&cli_install.step);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(test_mod_step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     const test_verbose_step = b.step("test-verbose", "Run full tests with per-test progress output");
-    test_verbose_step.dependOn(&run_mod_tests_verbose.step);
+    test_verbose_step.dependOn(test_mod_verbose_step);
     test_verbose_step.dependOn(&run_exe_tests_verbose.step);
     test_verbose_step.dependOn(&run_cli_tests_verbose.step);
 
@@ -839,6 +894,16 @@ pub fn build(b: *std.Build) void {
             step.stack_size = 64 * 1024 * 1024;
             if (windows_self_hosted) step.use_llvm = false;
         }
+        if (windows_full_shards) {
+            for (test_shards) |shard| {
+                shard.compile.stack_size = 64 * 1024 * 1024;
+                shard.verbose_compile.stack_size = 64 * 1024 * 1024;
+                if (windows_self_hosted) {
+                    shard.compile.use_llvm = false;
+                    shard.verbose_compile.use_llvm = false;
+                }
+            }
+        }
         if (windows_self_hosted) {
             // Zig's self-hosted PE writer currently emits a 16 MiB stack even
             // when `--stack 67108864` is present. Patch the validated header
@@ -880,7 +945,21 @@ pub fn build(b: *std.Build) void {
                 .{ .compile = windows_exe_tests, .run = run_windows_exe_tests },
             };
             for (runs) |entry| {
-                patchWindowsTestStack(b, stack_tool.?, entry.compile, entry.run);
+                const patch_stack = patchWindowsTestStack(b, stack_tool.?, entry.compile, entry.run);
+                if (entry.compile == mod_tests) {
+                    if (mod_install_step) |install| install.dependOn(patch_stack);
+                } else if (entry.compile == exe_tests) {
+                    exe_install.step.dependOn(patch_stack);
+                } else if (entry.compile == cli_tests) {
+                    cli_install.step.dependOn(patch_stack);
+                }
+            }
+            if (windows_full_shards) {
+                for (test_shards, 0..) |shard, index| {
+                    const patch_stack = patchWindowsTestStack(b, stack_tool.?, shard.compile, shard.run);
+                    shard_install_steps[index].dependOn(patch_stack);
+                    _ = patchWindowsTestStack(b, stack_tool.?, shard.verbose_compile, shard.verbose_run);
+                }
             }
         }
     }
@@ -1079,7 +1158,7 @@ pub fn build(b: *std.Build) void {
         fuzz_tests.stack_size = 64 * 1024 * 1024;
         if (windows_self_hosted) {
             fuzz_tests.use_llvm = false;
-            patchWindowsTestStack(b, stack_tool.?, fuzz_tests, run_fuzz_tests);
+            _ = patchWindowsTestStack(b, stack_tool.?, fuzz_tests, run_fuzz_tests);
         }
     }
     const fuzz_step = b.step("fuzz", "Run the coverage-guided TLS-parser fuzz targets (roadmap 0.2); add --fuzz to drive them coverage-guided");
@@ -1192,7 +1271,7 @@ pub fn build(b: *std.Build) void {
         bogo_shim_tests.stack_size = 64 * 1024 * 1024;
         if (windows_self_hosted) {
             bogo_shim_tests.use_llvm = false;
-            patchWindowsTestStack(b, stack_tool.?, bogo_shim_tests, run_bogo_shim_tests);
+            _ = patchWindowsTestStack(b, stack_tool.?, bogo_shim_tests, run_bogo_shim_tests);
         }
     }
     // The subprocess smokes spawn the freshly-installed binary via BOGO_SHIM_BIN.
@@ -1362,10 +1441,11 @@ pub fn build(b: *std.Build) void {
     // and reading its source code will allow you to master it.
 }
 
-fn patchWindowsTestStack(b: *std.Build, stack_tool: *std.Build.Step.Compile, compile: *std.Build.Step.Compile, run: *std.Build.Step.Run) void {
+fn patchWindowsTestStack(b: *std.Build, stack_tool: *std.Build.Step.Compile, compile: *std.Build.Step.Compile, run: *std.Build.Step.Run) *std.Build.Step {
     const patch_stack = b.addRunArtifact(stack_tool);
     patch_stack.addFileArg(compile.getEmittedBin());
     run.step.dependOn(&patch_stack.step);
+    return &patch_stack.step;
 }
 
 /// Extract the semantic version from build.zig.zon — the manifest is the single

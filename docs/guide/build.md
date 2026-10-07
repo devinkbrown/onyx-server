@@ -152,6 +152,12 @@ executing them on the build host; native execution is a separate gate. Run the i
 matching source checkout on OpenBSD: source-witness tests also read repository
 files at runtime. Copying only the executables is insufficient.
 
+For an unfiltered Windows target, the module runner is split into five files:
+`onyx-server-module-tests-crypto`, `-daemon`, `-proto`, `-substrate`, and
+`-wasm` (all with `.exe` suffix). Run all five for full module coverage. The
+daemon and CLI runner names also get `.exe` on Windows. A filtered Windows
+build still installs the single `onyx-server-module-tests.exe` runner.
+
 ## Optimization
 
 Use Zig's standard `-Doptimize=` modes. Debug builds keep symbols; optimized

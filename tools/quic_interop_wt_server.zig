@@ -39,6 +39,7 @@
 //!   * `PORT=<udp>\n`      — the bound UDP port (bind is 127.0.0.1 only).
 //!   * `CERTHASH=<hex>\n`  — lowercase hex SHA-256 of the leaf cert DER.
 //!   * `CERTHASHB64=<b64>\n`— standard base64 of the same 32-byte hash.
+//!   * `SPKIB64=<b64>\n`    — base64 SHA-256 of the leaf SPKI for Chrome GET.
 //!   Then it blocks until killed.
 
 const std = @import("std");
@@ -47,6 +48,7 @@ const onyx_server = @import("onyx_server");
 
 const WebTransportListener = onyx_server.daemon.webtransport_listener.WebTransportListener;
 const x509_selfsign = onyx_server.proto.x509_selfsign;
+const x509 = onyx_server.crypto.x509;
 const ecdsa_p256 = onyx_server.crypto.ecdsa_p256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -121,6 +123,7 @@ pub fn main() !void {
     // serverCertificateHashes match.
     var hash: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(cert, &hash, .{});
+    const spki_hash = (try x509.parse(cert)).spkiSha256();
 
     // --- 2. Decide the WT bidi bridge target. --------------------------------
     // `--bridge-port <P>` / `ONYX_WT_BRIDGE_PORT` points the bridge at an
@@ -164,6 +167,13 @@ pub fn main() !void {
         var b64_buf: [Enc.calcSize(Sha256.digest_length)]u8 = undefined;
         const b64 = Enc.encode(&b64_buf, &hash);
         const line = std.fmt.bufPrint(&out_buf, "CERTHASHB64={s}\n", .{b64}) catch unreachable;
+        writeAll(1, line);
+    }
+    {
+        const Enc = std.base64.standard.Encoder;
+        var b64_buf: [Enc.calcSize(Sha256.digest_length)]u8 = undefined;
+        const b64 = Enc.encode(&b64_buf, &spki_hash);
+        const line = std.fmt.bufPrint(&out_buf, "SPKIB64={s}\n", .{b64}) catch unreachable;
         writeAll(1, line);
     }
 

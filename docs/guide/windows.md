@@ -158,16 +158,17 @@ For a long-running public node, configure a managed certificate and key.
 
 The standalone QUIC and WebTransport interop servers also run on Windows.
 The WebTransport server's local TCP echo bridge uses Winsock, and the browser
-fixture verifies byte-exact bidi-stream and datagram echo without OpenSSL:
+fixture verifies an HTTP/3 GET plus byte-exact bidi-stream and datagram echo
+without OpenSSL:
 
 ```powershell
 zig build -j1 quic-interop-server quic-interop-wt-server -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 python -B .\tools\windows_quic_interop_smoke.py .\zig-out\bin\quic_interop_wt_server.exe
 ```
 
-The plain QUIC helper's native startup and Retry response are verified. A
-separate Windows HTTP/3 GET needs an independent HTTP/3 client; the installed
-Windows curl on this development host does not provide one.
+The plain QUIC helper's native startup and Retry response are verified. Its
+Ed25519 test certificate is rejected by Chrome's QUIC client; the HTTP/3 GET
+uses the P-256 WebTransport helper with its freshly generated SPKI pin.
 
 The IRC listener accepts PROXY protocol v1/v2 when
 `[listen].proxy_protocol = true` and the connecting source IP appears in

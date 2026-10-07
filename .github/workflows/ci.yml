@@ -103,6 +103,27 @@ jobs:
         run: python -B .\tools\windows_quic_interop_smoke.py .\zig-out\bin\quic_interop_wt_server.exe
       - name: Run full Windows test suite (Debug)
         run: zig build -j1 test -Dtarget=x86_64-windows --summary all
+      - name: Build native-codegen Windows test runners
+        run: zig build -j1 test-artifacts -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+      - name: Verify Windows test-runner stack reserves
+        shell: pwsh
+        run: |
+          $names = @(
+            'onyx-server-module-tests-crypto.exe',
+            'onyx-server-module-tests-daemon.exe',
+            'onyx-server-module-tests-proto.exe',
+            'onyx-server-module-tests-substrate.exe',
+            'onyx-server-module-tests-wasm.exe',
+            'onyx-server-daemon-tests.exe',
+            'onyx-server-cli-tests.exe'
+          )
+          foreach ($name in $names) {
+            $path = Join-Path (Resolve-Path .\zig-out\bin) $name
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            $pe = [BitConverter]::ToInt32($bytes, 60)
+            $reserve = [BitConverter]::ToUInt64($bytes, $pe + 96)
+            if ($reserve -ne 67108864) { throw "$name reserves $reserve bytes of stack" }
+          }
       - name: Run portable protocol tests (Debug)
         run: zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=runtime capability policy' '-Dtest-filter=limited runtime welcome' --summary all
       - name: Run portable protocol tests (ReleaseSafe)
