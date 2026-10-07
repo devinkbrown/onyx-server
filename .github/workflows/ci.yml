@@ -162,6 +162,8 @@ jobs:
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded Windows Helix staged-image selection smoke
         run: python -B .\tools\windows_helix_candidate_path_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run Windows REHASH source-proof and Helix continuity smoke
+        run: python -B .\tools\windows_helix_rehash_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Build automatic descriptor rollover smoke executable
         run: zig build -j1 windows-rollover-smoke-server -Dtarget=x86_64-windows --summary all
       - name: Run automatic Windows descriptor rollover process smoke

@@ -528,6 +528,7 @@ python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_rehash_smoke.py .\zig-out\bin\onyx-server.exe
 zig build windows-rollover-smoke-server -Dtarget=x86_64-windows
 python -B .\tools\windows_descriptor_rollover_smoke.py .\zig-out\bin\onyx-server-rollover-smoke.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
@@ -612,6 +613,7 @@ python -B .\tools\windows_sts_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_mesh_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+python -B .\tools\windows_helix_rehash_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
 python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption
