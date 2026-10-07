@@ -2412,8 +2412,6 @@ const PolicyFixture = struct {
 };
 
 test "version negotiation — an Initial with version 0xff000099 yields a VN listing v1 and no connection" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -2443,8 +2441,6 @@ test "version negotiation — an Initial with version 0xff000099 yields a VN lis
 }
 
 test "retry — a tokenless Initial under .always policy is answered with a Retry and no connection" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.always);
     defer fx.deinit();
@@ -2472,8 +2468,6 @@ test "retry — a tokenless Initial under .always policy is answered with a Retr
 }
 
 test "retry — a client returning a valid token is address-validated immediately (no 3x cap)" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.always);
     defer fx.deinit();
@@ -2519,8 +2513,6 @@ test "retry — a client returning a valid token is address-validated immediatel
 }
 
 test "retry — a token from a different client IP is rejected" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.always);
     defer fx.deinit();
@@ -2544,8 +2536,6 @@ test "retry — a token from a different client IP is rejected" {
 }
 
 test "retry policy .never mints a connection directly (default fast path unaffected)" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -2580,8 +2570,6 @@ fn buildShortHeaderDatagram(out: []u8, dcid: [8]u8, body_len: usize) []const u8 
 }
 
 test "stateless reset — an unknown short-header DCID yields a reset carrying the HMAC-derived token" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -2612,8 +2600,6 @@ test "stateless reset — an unknown short-header DCID yields a reset carrying t
 }
 
 test "stateless reset — a too-small datagram yields nothing (never amplify)" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();
@@ -2632,8 +2618,6 @@ test "stateless reset — a too-small datagram yields nothing (never amplify)" {
 }
 
 test "stateless reset — the emit is rate-limited (token bucket)" {
-    // Live UDP sockets; no Windows datagram backend here.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var fx: PolicyFixture = undefined;
     try fx.init(.never);
     defer fx.deinit();

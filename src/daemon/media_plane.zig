@@ -3376,21 +3376,37 @@ fn stunBindPeer(client: *MediaSocket, server_addr: TransportAddress, creds: Cred
 /// packet enters the actual pump. The deadline bounds missing datagrams; it is
 /// not a sleep used to infer that the worker reached an operation boundary.
 fn completeFanoutCausal(rtcp: bool) !void {
-    // FD-budget fixture via `getrlimit`; unavailable on Windows.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const previous_limit = try posix.getrlimit(.NOFILE);
-    if (previous_limit.max < 512) return error.FdBudgetPrecondition;
-    var selected_limit = previous_limit;
-    selected_limit.cur = @max(previous_limit.cur, 512);
-    try posix.setrlimit(.NOFILE, selected_limit);
-    defer {
-        posix.setrlimit(.NOFILE, previous_limit) catch @panic("media fanout fixture FD limit restore");
-        const restored = posix.getrlimit(.NOFILE) catch @panic("media fanout fixture FD limit observation");
-        if (!std.meta.eql(previous_limit, restored)) @panic("media fanout fixture FD limit mismatch");
-    }
-    const observed_limit = try posix.getrlimit(.NOFILE);
-    try testing.expectEqualDeep(selected_limit, observed_limit);
-    std.debug.print("complete fanout fixture NOFILE old={d}/{d} selected={d}/{d}\n", .{ previous_limit.cur, previous_limit.max, observed_limit.cur, observed_limit.max });
+    const FdBudget = if (@import("builtin").os.tag == .windows) struct {
+        fn begin() !@This() {
+            return .{};
+        }
+        fn end(_: *@This()) void {}
+    } else struct {
+        previous: posix.rlimit,
+        fn begin() !@This() {
+            const previous = try posix.getrlimit(.NOFILE);
+            if (previous.max < 512) return error.FdBudgetPrecondition;
+            var selected = previous;
+            selected.cur = @max(previous.cur, 512);
+            try posix.setrlimit(.NOFILE, selected);
+            errdefer {
+                posix.setrlimit(.NOFILE, previous) catch @panic("media fanout fixture FD limit restore");
+                const restored = posix.getrlimit(.NOFILE) catch @panic("media fanout fixture FD limit observation");
+                if (!std.meta.eql(previous, restored)) @panic("media fanout fixture FD limit mismatch");
+            }
+            const observed = try posix.getrlimit(.NOFILE);
+            try testing.expectEqualDeep(selected, observed);
+            std.debug.print("complete fanout fixture NOFILE old={d}/{d} selected={d}/{d}\n", .{ previous.cur, previous.max, observed.cur, observed.max });
+            return .{ .previous = previous };
+        }
+        fn end(self: *@This()) void {
+            posix.setrlimit(.NOFILE, self.previous) catch @panic("media fanout fixture FD limit restore");
+            const restored = posix.getrlimit(.NOFILE) catch @panic("media fanout fixture FD limit observation");
+            if (!std.meta.eql(self.previous, restored)) @panic("media fanout fixture FD limit mismatch");
+        }
+    };
+    var budget = try FdBudget.begin();
+    defer budget.end();
     const receivers = 130;
     var plane = MediaPlane.init(testing.allocator);
     defer plane.deinit();
@@ -3432,41 +3448,57 @@ fn completeFanoutCausal(rtcp: bool) !void {
     const rtcp_packet = [_]u8{ 0x80, 200, 0, 6, 0xFA, 0x70, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2 };
     const packet: []const u8 = if (rtcp) &rtcp_packet else &rtp_packet;
     sender.sendTo(server_addr, packet);
-    var polls: [receivers]posix.pollfd = undefined;
     var received: [receivers]bool = @splat(false);
-    for (&polls, &clients) |*pfd, *client| pfd.* = .{ .fd = client.fd, .events = posix.POLL.IN, .revents = 0 };
     const deadline = platform.monotonicMillis() + 2000;
     var count: usize = 0;
     var buf: [2048]u8 = undefined;
-    while (count < receivers) {
-        const now = platform.monotonicMillis();
-        if (now >= deadline) break;
-        const ready = posix.system.poll(&polls, polls.len, @intCast(deadline - now));
-        switch (posix.errno(ready)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return error.TestUnexpectedResult,
+    if (comptime @import("builtin").os.tag == .windows) {
+        while (count < receivers and platform.monotonicMillis() < deadline) {
+            for (&clients, 0..) |*client, i| {
+                if (received[i] or !try client.testOnlyReadableNow()) continue;
+                const got = client.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+                try testing.expectEqualSlices(u8, packet, got.data);
+                received[i] = true;
+                count += 1;
+            }
+            if (count < receivers) std.Thread.yield() catch {};
         }
-        if (ready == 0) break;
-        for (&polls, &clients, 0..) |*pfd, *client, i| {
-            if (pfd.revents & posix.POLL.IN == 0) continue;
-            const got = client.recvFrom(&buf) orelse return error.TestUnexpectedResult;
-            try testing.expectEqualSlices(u8, packet, got.data);
-            try testing.expect(!received[i]);
-            received[i] = true;
-            count += 1;
-            pfd.events = 0;
+        for (&clients) |*client| try testing.expect(!try client.testOnlyReadableNow());
+        try testing.expect(!try sender.testOnlyReadableNow());
+        try testing.expect(!try foreign.testOnlyReadableNow());
+    } else {
+        var polls: [receivers]posix.pollfd = undefined;
+        for (&polls, &clients) |*pfd, *client| pfd.* = .{ .fd = client.fd, .events = posix.POLL.IN, .revents = 0 };
+        while (count < receivers) {
+            const now = platform.monotonicMillis();
+            if (now >= deadline) break;
+            const ready = posix.system.poll(&polls, polls.len, @intCast(deadline - now));
+            switch (posix.errno(ready)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.TestUnexpectedResult,
+            }
+            if (ready == 0) break;
+            for (&polls, &clients, 0..) |*pfd, *client, i| {
+                if (pfd.revents & posix.POLL.IN == 0) continue;
+                const got = client.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+                try testing.expectEqualSlices(u8, packet, got.data);
+                try testing.expect(!received[i]);
+                received[i] = true;
+                count += 1;
+                pfd.events = 0;
+            }
         }
+        // Probe all eligible sockets again: one source packet may produce at most
+        // one datagram at each recipient, including across a chunk boundary.
+        for (&polls) |*pfd| pfd.events = posix.POLL.IN;
+        try testing.expect(posix.system.poll(&polls, polls.len, 0) == 0);
+        var excluded = [_]posix.pollfd{
+            .{ .fd = sender.fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = foreign.fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        try testing.expect(posix.system.poll(&excluded, excluded.len, 0) == 0);
     }
-    // Probe all eligible sockets again: one source packet may produce at most
-    // one datagram at each recipient, including across a chunk boundary.
-    for (&polls) |*pfd| pfd.events = posix.POLL.IN;
-    try testing.expect(posix.system.poll(&polls, polls.len, 0) == 0);
-    var excluded = [_]posix.pollfd{
-        .{ .fd = sender.fd, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = foreign.fd, .events = posix.POLL.IN, .revents = 0 },
-    };
-    try testing.expect(posix.system.poll(&excluded, excluded.len, 0) == 0);
     std.debug.print("complete fanout causal rtcp={any} authenticated_receivers={d} actual_datagrams={d}\n", .{ rtcp, receivers, count });
     try testing.expectEqual(@as(usize, receivers), count);
 }
@@ -3476,8 +3508,6 @@ test "active media dispatch causal complete RTP fanout reaches all 130 authentic
 }
 
 test "active media dispatch causal complete RTCP fanout reaches all 130 authenticated endpoints" {
-    // This resource-budget fixture uses POSIX getrlimit/setrlimit and poll.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     try completeFanoutCausal(true);
 }
 
