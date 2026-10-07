@@ -60441,7 +60441,7 @@ const ManagedCorePolicySeal = struct {
 
     fn requireInstalled(self: ManagedCorePolicySeal, b: *ManagedCoreBacking) !void {
         // Install validation compares full-server config absent from PortableServer.
-        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.Unsupported;
         const server = b.server orelse return error.ConfiguredOwnerMismatch;
         if (self.owner != b or b.owned_identity != server.config.node_identity or
             !std.mem.eql(u8, self.canonical_name, server.config.server_name) or
@@ -60485,7 +60485,7 @@ const ManagedCoreInstallSeal = struct {
 
     fn issue(b: *ManagedCoreBacking) !ManagedCoreInstallSeal {
         // Install seals pin the full-server World; no portable equivalent exists.
-        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.Unsupported;
         try (b.policy_seal orelse return error.ConfiguredOwnerMismatch).requireInstalled(b);
         const services = if (b.services) |*owner| owner else null;
         return .{ .owner = b, .server = b.server.?, .world = &b.server.?.world, .services = services, .services_lock = if (services) |owner| &owner.lock else null, .services_config = if (services) |owner| owner.cfg else null, .leased_authority = b.leased_authority, .leased_loan = b.leased_loan };
@@ -60493,7 +60493,7 @@ const ManagedCoreInstallSeal = struct {
 
     fn requireOriginal(self: ManagedCoreInstallSeal, b: *ManagedCoreBacking) !void {
         // Install seals pin the full-server World; no portable equivalent exists.
-        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.Unsupported;
         try (b.policy_seal orelse return error.ConfiguredOwnerMismatch).requireInstalled(b);
         const server = b.server orelse return error.ConfiguredOwnerMismatch;
         const services = if (b.services) |*owner| owner else null;
@@ -60838,9 +60838,9 @@ fn managedLeasedContextDigest(b: *ManagedCoreBacking) ![32]u8 {
 }
 
 fn releaseManagedLeasedSources(b: *ManagedCoreBacking) !void {
-    // Source release reads full-server leases absent from PortableServer.
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
     const owner = b.leased_authority orelse return;
+    // Ordinary Windows cold cores own no lease and still need full teardown.
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
     const loan = b.leased_loan;
     const stage: *ManagedLeasedCoreStage = @ptrCast(&b.leased_stage);
     try delivery_authority.StateContext.requireCoreReleaseable(stage, owner, loan);
@@ -60909,6 +60909,12 @@ fn cloneManagedConfig(b: *ManagedCoreBacking, input: Config) !Config {
                 .user_idx = registry.user_idx,
                 .server_idx = registry.server_idx,
             } else null;
+        } else if (comptime std.mem.eql(u8, name, "windows_helix_boot_parsed")) {
+            out.windows_helix_boot_parsed = if (input.windows_helix_boot_parsed) |source| blk: {
+                const copy = try allocator.create(config_format.Config);
+                copy.* = try clonePolicyValue(allocator, source.*);
+                break :blk copy;
+            } else null;
         } else @field(out, name) = try clonePolicyValue(allocator, @field(input, name));
     }
     // TLS1.2 OCSP selection intentionally recognizes a shared default leaf.
@@ -60945,8 +60951,9 @@ pub const ManagedCore = opaque {
         return createColdImpl(allocator, io, inputs, binding, leased);
     }
     fn createColdImpl(allocator: std.mem.Allocator, io: std.Io, inputs: ManagedCoreInputs, binding: RuntimeCreatedBindings, leased: ?ManagedLeasedAccountInputs) !*ManagedCore {
-        // Cold install constructs the full LinuxServer; PortableServer cannot host it.
-        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        // Cold install constructs the full Server; PortableServer cannot host it.
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.Unsupported;
+        if (builtin.os.tag == .windows and leased != null) return error.ClosedAuthorityNotIntegrated;
         try validateManagedColdConfig(inputs.config);
         const wants_accounts = inputs.config.sasl_enabled and inputs.parsed.sasl.account_db != null;
         if (wants_accounts != (inputs.accounts != null or leased != null)) return error.InvalidAccountBinding;
@@ -61033,7 +61040,7 @@ pub const ManagedCore = opaque {
 
     pub fn prepareColdResources(self: *ManagedCore, run: *reactor_pool_mod.RunFlag) !void {
         // Cold resource preparation drives full-server transports absent from PortableServer.
-        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.Unsupported;
         const b = managedBacking(self);
         if (b.leased_request != null) return error.ClosedAuthorityNotIntegrated;
         if (b.phase != .constructed) return error.AlreadyPrepared;
@@ -61382,7 +61389,7 @@ pub const ManagedCore = opaque {
     }
     pub fn destroyDetached(self: *ManagedCore) void {
         // Detached teardown walks full-server gates absent from PortableServer.
-        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return;
+        if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return;
         const b = managedBacking(self);
         if (b.inline_borrowed.load(.acquire) or b.server.?.runtime_gate != null or
             b.server.?.hasRetainedWebpushOverflow() or
@@ -61619,6 +61626,9 @@ fn managedConfigDigestFor(config: Config, comptime cold: bool) ![32]u8 {
                 try hashManagedPolicyValue(&hash, registry.user_idx);
                 try hashManagedPolicyValue(&hash, registry.server_idx);
             }
+        } else if (comptime std.mem.eql(u8, name, "windows_helix_boot_parsed")) {
+            hash.update(&.{@intFromBool(config.windows_helix_boot_parsed != null)});
+            if (config.windows_helix_boot_parsed) |parsed| try hashManagedPolicyValue(&hash, parsed.*);
         } else try hashManagedPolicyValue(&hash, @field(config, name));
     }
     return hash.finalResult();
@@ -61788,7 +61798,7 @@ pub const ManagedCoreFixture = if (builtin.is_test) struct {
         port: u16,
         fabric_present: bool,
         pool_count: usize,
-        webhook_fd: ?linux.fd_t,
+        webhook_fd: ?webhook_http.Socket,
         webhook_port: ?u16,
         geo_entered: bool,
         webhook_entered: bool,
@@ -62859,8 +62869,90 @@ const ManagedStopTest = if (builtin.is_test) struct {
     }
 } else struct {};
 
+const ManagedTestClient = if (builtin.os.tag == .windows) struct {
+    const windows = struct {
+        const SockAddr4 = extern struct { family: u16, port: u16, addr: u32, zero: [8]u8 = @splat(0) };
+        const PollFd = extern struct { fd: usize, events: i16, revents: i16 };
+        extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) i32;
+        extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+        extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+        extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+        extern "ws2_32" fn connect(socket: usize, address: *const SockAddr4, len: i32) callconv(.winapi) i32;
+        extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
+        extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+        extern "ws2_32" fn WSAPoll(fds: [*]PollFd, count: u32, timeout_ms: i32) callconv(.winapi) i32;
+    };
+    socket: usize,
+    buf: [default_reply_bytes]u8 = undefined,
+    len: usize = 0,
+
+    fn init(port: u16) !@This() {
+        var startup: [408]u8 align(8) = @splat(0);
+        if (windows.WSAStartup(0x0202, &startup) != 0) return error.TestSocketStartup;
+        errdefer _ = windows.WSACleanup();
+        const socket = windows.WSASocketW(2, 1, 6, null, 0, 0);
+        if (socket == std.math.maxInt(usize)) return error.TestSocketOpen;
+        errdefer _ = windows.closesocket(socket);
+        const address: windows.SockAddr4 = .{ .family = 2, .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        if (windows.connect(socket, &address, @sizeOf(windows.SockAddr4)) != 0) return error.TestSocketConnect;
+        return .{ .socket = socket };
+    }
+    fn deinit(self: *@This()) void {
+        _ = windows.closesocket(self.socket);
+        _ = windows.WSACleanup();
+    }
+    fn write(self: *@This(), bytes: []const u8) !void {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const count = windows.send(self.socket, bytes[offset..].ptr, @intCast(@min(bytes.len - offset, std.math.maxInt(i32))), 0);
+            if (count <= 0) return error.TestSocketWrite;
+            offset += @intCast(count);
+        }
+    }
+    fn wait(self: *@This(), needle: []const u8) !void {
+        const deadline = platform.monotonicMillis() + 20_000;
+        while (std.mem.indexOf(u8, self.written(), needle) == null) {
+            if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+            var fds = [_]windows.PollFd{.{ .fd = self.socket, .events = 0x0300, .revents = 0 }};
+            const ready = windows.WSAPoll(&fds, 1, 50);
+            if (ready < 0) return error.TestSocketPoll;
+            if (ready == 0) continue;
+            if (self.len == self.buf.len) return error.OutputTooSmall;
+            const count = windows.recv(self.socket, self.buf[self.len..].ptr, @intCast(self.buf.len - self.len), 0);
+            if (count <= 0) return error.ConnectionReset;
+            self.len += @intCast(count);
+        }
+    }
+    fn reset(self: *@This()) void {
+        self.len = 0;
+    }
+    fn written(self: *const @This()) []const u8 {
+        return self.buf[0..self.len];
+    }
+} else struct {
+    live: LiveClient,
+    fn init(port: u16) !@This() {
+        return .{ .live = .{ .fd = try connectLoopback(port) } };
+    }
+    fn deinit(self: *@This()) void {
+        closeFd(self.live.fd);
+    }
+    fn write(self: *@This(), bytes: []const u8) !void {
+        try writeAllFd(self.live.fd, bytes);
+    }
+    fn wait(self: *@This(), needle: []const u8) !void {
+        try recvUntil(&self.live, needle, 200);
+    }
+    fn reset(self: *@This()) void {
+        self.live.reset();
+    }
+    fn written(self: *const @This()) []const u8 {
+        return self.live.written();
+    }
+};
+
 test "managed core: original policy and install seals normalize before actual Services and live IRC" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, temporary.dir, "core-policy.wal");
@@ -62912,21 +63004,24 @@ test "managed core: original policy and install seals normalize before actual Se
 
     fixture.publish();
     try fixture.awaitActivated();
-    const fd = try connectLoopback((try fixture.core.?.observe()).bound_port);
-    defer closeFd(fd);
-    var client: LiveClient = .{ .fd = fd };
-    try writeAllFd(fd, "NICK PolicyProof\r\nUSER policy 0 * :Policy proof\r\n");
-    try recvUntil(&client, " 001 PolicyProof ", 200);
+    var client = try ManagedTestClient.init((try fixture.core.?.observe()).bound_port);
+    defer client.deinit();
+    try client.write("NICK PolicyProof\r\nUSER policy 0 * :Policy proof\r\n");
+    try client.wait(" 001 PolicyProof ");
     try expectContains(client.written(), ":onyx.local 001 PolicyProof ");
     client.reset();
-    try writeAllFd(fd, "PING :original-policy-live\r\n");
-    try recvUntil(&client, "original-policy-live", 200);
+    try client.write("PING :original-policy-live\r\n");
+    try client.wait("original-policy-live");
     try expectContains(client.written(), "PONG");
 }
 
 test "managed core: inconsistent actual full key refuses before occupied listener acquisition" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
-    const listener = try bindLoopback(true);
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
+    const listener = if (comptime builtin.os.tag == .windows) blk: {
+        const fd = try reuseport.createWindowsListener("127.0.0.1", 0, 16);
+        errdefer closeFd(fd);
+        break :blk BoundTcp{ .fd = fd, .port = try socketPort(fd) };
+    } else try bindLoopback(true);
     defer closeFd(listener.fd);
     var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
     defer resolver.deinit();
@@ -62952,6 +63047,40 @@ test "managed core: inconsistent actual full key refuses before occupied listene
     try std.testing.expectEqual(listener.port, try socketPort(listener.fd));
 }
 
+test "managed core: Windows cold boot proof owns its parsed policy and refuses leased custody before allocation" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
+    var boot: config_format.Config = .{};
+    const inputs: ManagedCoreInputs = .{
+        .config = .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .windows_helix_boot_parsed = &boot, .crypto_io = std.testing.io },
+        .parsed = boot,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.ClosedAuthorityNotIntegrated, ManagedCore.createLeasedCold(
+        failing.allocator(),
+        std.testing.io,
+        inputs,
+        .{ .mode = .provision, .storage = .{ .dir = std.Io.Dir.cwd(), .name = "must-not-open.wal" } },
+        binding,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+
+    const core = try ManagedCore.createCold(std.testing.allocator, std.testing.io, inputs, binding);
+    defer core.destroyDetached();
+    const b = managedBacking(core);
+    const owned = b.server.?.config.windows_helix_boot_parsed.?;
+    try std.testing.expect(owned != &boot);
+    try b.install_seal.?.requireOriginal(b);
+    boot.accounts.pbkdf2_rounds += 1;
+    try b.install_seal.?.requireOriginal(b);
+    const original = owned.accounts.pbkdf2_rounds;
+    @constCast(owned).accounts.pbkdf2_rounds += 1;
+    defer @constCast(owned).accounts.pbkdf2_rounds = original;
+    try std.testing.expectError(error.ConfiguredOwnerMismatch, b.install_seal.?.requireOriginal(b));
+}
+
 fn managedPolicyAllocationCampaign(allocator: std.mem.Allocator, resolver: *rdns.Resolver, store: *services_mod.OroStore, identity: *const node_identity.NodeIdentity) !void {
     const core = try ManagedCore.createCold(allocator, std.testing.io, .{
         .config = .{ .host = "127.0.0.1", .port = 0, .max_clients = 16, .server_name = "", .node_identity = identity, .sasl_enabled = true, .crypto_io = std.testing.io },
@@ -62965,7 +63094,7 @@ fn managedPolicyAllocationCampaign(allocator: std.mem.Allocator, resolver: *rdns
 }
 
 test "managed core: actual policy normalization and install construction unwind every allocation failure" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, temporary.dir, "core-policy-oom.wal");
@@ -62986,7 +63115,7 @@ test "managed core: actual policy normalization and install construction unwind 
 }
 
 test "managed core: ordered stop joins actual producers while real IRC reactors still serve" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     var fixture: ManagedStopTest = .{};
     try fixture.init(2, null);
     errdefer fixture.deinit() catch |cleanup_error| {
@@ -63007,11 +63136,10 @@ test "managed core: ordered stop joins actual producers while real IRC reactors 
     try std.testing.expect(std.meta.eql(before, graph.view.inspect()));
     try std.testing.expectError(error.ProducersNotJoined, fixture.core.?.requestReactorStopAndWake(graph.control, try checkedMonotonicDeadlineMillis(0)));
     try std.testing.expect(fixture.run.load(.acquire));
-    const fd = try connectLoopback((try fixture.core.?.observe()).bound_port);
-    defer closeFd(fd);
-    var client: LiveClient = .{ .fd = fd };
-    try writeAllFd(fd, "NICK StopProof\r\nUSER stop 0 * :Stop proof\r\n");
-    try recvUntil(&client, " 001 StopProof ", 200);
+    var client = try ManagedTestClient.init((try fixture.core.?.observe()).bound_port);
+    defer client.deinit();
+    try client.write("NICK StopProof\r\nUSER stop 0 * :Stop proof\r\n");
+    try client.wait(" 001 StopProof ");
     try fixture.core.?.requestProducerStopAndWake(graph.control);
     try fixture.core.?.joinProducers(graph.control, managedStopTestDeadline());
     const joined = graph.view.inspect();
@@ -63022,14 +63150,14 @@ test "managed core: ordered stop joins actual producers while real IRC reactors 
     try fixture.core.?.joinProducers(graph.control, managedStopTestDeadline());
     try std.testing.expectEqual(joined.joined, graph.view.inspect().joined);
     client.reset();
-    try writeAllFd(fd, "PING :after-real-producer-join\r\n");
-    try recvUntil(&client, "after-real-producer-join", 200);
+    try client.write("PING :after-real-producer-join\r\n");
+    try client.wait("after-real-producer-join");
     try expectContains(client.written(), "PONG");
     try fixture.deinit();
 }
 
 test "managed core: ordered stop owns actual inline invocation until exit and rejects late entry" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     var fixture: ManagedStopTest = .{};
     try fixture.init(1, null);
     errdefer fixture.deinit() catch |cleanup_error| {
@@ -63066,7 +63194,7 @@ test "managed core: ordered stop owns actual inline invocation until exit and re
 }
 
 test "managed core: rejected late inline invocation retains custody through its actual caller join" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     var fixture: ManagedStopTest = .{};
     try fixture.init(1, null);
     errdefer fixture.deinit() catch |cleanup_error| {
@@ -63096,14 +63224,14 @@ test "managed core: rejected late inline invocation retains custody through its 
 }
 
 test "managed core: actual second-spawn cancellation unwinds every fixture source and handle" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     var fixture: ManagedStopTest = .{};
     try std.testing.expectError(error.SystemResources, fixture.init(2, 1));
     try std.testing.expect(fixture.core == null and fixture.graph == null and fixture.resolver == null);
 }
 
 test "managed core: prepared media retains original callbacks Domain registrations and funded FIFO" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
     var fixture: ManagedStopTest = .{};
     try fixture.initWithMedia(2, null, true);
     errdefer fixture.deinit() catch |cleanup_error| {

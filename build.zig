@@ -793,6 +793,12 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "Windows socket descriptors preserve pointer-sized handles and retire stale ids",
             "Windows accepted TCP keepalive sets state and per-socket timing",
+            "configured runtime: real cold listeners and complete worker inventory stay inert behind one Gate",
+            "configured runtime: every owned allocation failure refunds construction and permits the same frozen inputs and source borrows to retry",
+            "configured runtime: original graph publishes inline and sharded real transports then joins every source before disposal",
+            "configured runtime: cloned full Mail policy rejects TLS credential trust and journal lineage mutation",
+            "managed core: Windows cold boot proof owns its parsed policy and refuses leased custody before allocation",
+            "managed core: original policy and install seals normalize before actual Services and live IRC",
             "IOCP transfer completion cannot exceed the submitted buffer",
             "IOCP cancellation identifies the original request",
             "Windows IOCP associates each socket lifetime and drains cancellation",

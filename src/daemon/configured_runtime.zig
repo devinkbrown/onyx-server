@@ -19,7 +19,7 @@ const wt = @import("webtransport_listener.zig");
 const dns = @import("../proto/dns.zig");
 const ecdsa = @import("../crypto/ecdsa_p256.zig");
 const lock_mod = @import("../substrate/rwlock.zig");
-const supported = builtin.os.tag == .linux or builtin.os.tag == .openbsd;
+const supported = builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows;
 const pause_mod = @import("runtime_pause.zig");
 
 /// The journal branch retains the caller's actual Io/Dir owners through all
@@ -439,6 +439,7 @@ fn createColdImpl(allocator: std.mem.Allocator, io: std.Io, inputs: ColdInputs, 
             .from = parsed.from.?,
             .user = parsed.user,
             .pass = parsed.pass,
+            .private_failure_windows = builtin.os.tag == .windows and delivery.failure == .journal,
         };
         b.expected_mail_failure = switch (delivery.failure) {
             .terminal_without_wal => .terminal_without_wal,
@@ -686,7 +687,7 @@ const FixtureState = if (builtin.is_test) struct {
     snapshot_allocator: ?std.mem.Allocator = null,
     canceled: ?gate_mod.Status = null,
     any_body_entered: bool = false,
-    webhook_fd: ?std.posix.fd_t = null,
+    webhook_fd: ?@import("webhook_http.zig").Socket = null,
     core_destroyed: bool = false,
 } else void;
 
@@ -831,6 +832,7 @@ const TestTls = struct {
 fn unusedTcpPort() !u16 {
     const fd = try @import("reuseport.zig").createReusePortListener("127.0.0.1", 0, 8);
     defer @import("os_runtime.zig").close(fd);
+    if (comptime builtin.os.tag == .windows) return @import("io_backend.zig").socketPort(fd);
     // Linux reuseport deliberately binds IPv4 hosts through a dual-stack IPv6
     // socket; OpenBSD binds the host's native family. Observe the actual ABI.
     var address: std.posix.sockaddr.storage = undefined;
@@ -845,6 +847,80 @@ fn unusedTcpPort() !u16 {
     const port = std.mem.bigToNative(u16, encoded_port);
     if (port == 0) return error.TestSocketObservation;
     return port;
+}
+fn webhookSocketValid(fd: @import("webhook_http.zig").Socket) bool {
+    if (comptime builtin.os.tag == .windows) {
+        _ = @import("metrics_http.zig").observeListener(fd) catch return false;
+        return true;
+    }
+    return @import("os_runtime.zig").fdValid(fd);
+}
+const TestPeer = if (builtin.os.tag == .windows) usize else i32;
+const WindowsSockAddr4 = extern struct { family: u16, port: u16, addr: u32, zero: [8]u8 = @splat(0) };
+const WindowsPollFd = extern struct { fd: usize, events: i16, revents: i16 };
+extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) i32;
+extern "ws2_32" fn WSACleanup() callconv(.winapi) i32;
+extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
+extern "ws2_32" fn connect(socket: usize, address: *const WindowsSockAddr4, len: i32) callconv(.winapi) i32;
+extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
+extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+extern "ws2_32" fn WSAPoll(fds: [*]WindowsPollFd, count: u32, timeout_ms: i32) callconv(.winapi) i32;
+fn testConnect(port: u16) !TestPeer {
+    if (comptime builtin.os.tag == .windows) {
+        var startup: [408]u8 align(8) = @splat(0);
+        if (WSAStartup(0x0202, &startup) != 0) return error.TestSocketStartup;
+        errdefer _ = WSACleanup();
+        const socket = WSASocketW(2, 1, 6, null, 0, 0);
+        if (socket == std.math.maxInt(usize)) return error.TestSocketOpen;
+        errdefer _ = closesocket(socket);
+        const address: WindowsSockAddr4 = .{
+            .family = 2,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        };
+        if (connect(socket, &address, @sizeOf(WindowsSockAddr4)) != 0) return error.TestSocketConnect;
+        return socket;
+    }
+    return @import("native_network.zig").connect(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }, 1000);
+}
+fn testClose(peer: TestPeer) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = closesocket(peer);
+        _ = WSACleanup();
+        return;
+    }
+    @import("os_runtime.zig").close(peer);
+}
+fn testWriteAll(peer: TestPeer, bytes: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const count = send(peer, bytes[offset..].ptr, @intCast(@min(bytes.len - offset, std.math.maxInt(i32))), 0);
+            if (count <= 0) return error.TestSocketWrite;
+            offset += @intCast(count);
+        }
+        return;
+    }
+    try @import("native_network.zig").writeAll(peer, bytes);
+}
+fn testPeerReady(peer: TestPeer, timeout_ms: i32) !bool {
+    if (comptime builtin.os.tag == .windows) {
+        var fds = [_]WindowsPollFd{.{ .fd = peer, .events = 0x0300, .revents = 0 }};
+        const ready = WSAPoll(&fds, 1, timeout_ms);
+        if (ready < 0) return error.TestSocketPoll;
+        return ready != 0;
+    }
+    var fds = [_]std.posix.pollfd{.{ .fd = peer, .events = std.posix.POLL.IN, .revents = 0 }};
+    return (try std.posix.poll(&fds, timeout_ms)) != 0;
+}
+fn testRead(peer: TestPeer, buffer: []u8) anyerror!usize {
+    if (comptime builtin.os.tag == .windows) {
+        const count = recv(peer, buffer.ptr, @intCast(@min(buffer.len, std.math.maxInt(i32))), 0);
+        if (count < 0) return error.TestSocketRead;
+        return @intCast(count);
+    }
+    return @import("os_runtime.zig").read(peer, buffer);
 }
 fn unusedUdpPort() !u16 {
     const sockets = @import("../substrate/media_socket.zig");
@@ -943,19 +1019,18 @@ test "configured runtime: real cold listeners and complete worker inventory stay
     try std.testing.expect(core.fabric_present and core.pool_count == 3 and !core.any_reactor_entered);
     try std.testing.expect(!core.geo_entered and !core.webhook_entered);
     try std.testing.expect(!b.rdns.?.runtime.entered.load(.acquire));
-    const network = @import("native_network.zig");
-    const os = @import("os_runtime.zig");
-    const peer = try network.connect(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = core.webhook_port.? } }, 1000);
-    defer os.close(peer);
-    try network.writeAll(peer, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    var polls = [_]std.posix.pollfd{.{ .fd = peer, .events = std.posix.POLL.IN, .revents = 0 }};
-    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&polls, 25));
-    try os.setNonblocking(peer);
-    var bytes: [64]u8 = undefined;
-    try std.testing.expectError(error.WouldBlock, os.read(peer, &bytes));
+    const peer = try testConnect(core.webhook_port.?);
+    defer testClose(peer);
+    try testWriteAll(peer, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try std.testing.expect(!try testPeerReady(peer, 25));
+    if (comptime builtin.os.tag != .windows) {
+        try @import("os_runtime.zig").setNonblocking(peer);
+        var bytes: [64]u8 = undefined;
+        try std.testing.expectError(error.WouldBlock, testRead(peer, &bytes));
+    }
     runtime.deinit();
     destroyed = true;
-    try std.testing.expect(!os.fdValid(core.webhook_fd.?));
+    try std.testing.expect(!webhookSocketValid(core.webhook_fd.?));
 }
 
 test "configured runtime: inline shard has zero worker rows and no fabric" {
@@ -1053,7 +1128,7 @@ test "configured runtime: partial actual spawn is canceled and joined before own
     try std.testing.expectEqual(status.spawned, status.joined);
     try std.testing.expect(!fixture.any_body_entered);
     try std.testing.expect(fixture.core_destroyed);
-    try std.testing.expect(!@import("os_runtime.zig").fdValid(fixture.webhook_fd.?));
+    try std.testing.expect(!webhookSocketValid(fixture.webhook_fd.?));
 }
 
 test "configured runtime: synchronous media bind failure refunds earlier prepared resources and preserves the unrelated socket" {
@@ -1097,7 +1172,7 @@ test "configured runtime: Gate allocation sweep destroys every failed unpublishe
             try std.testing.expectEqual(error.OutOfMemory, err);
             try std.testing.expect(failing.has_induced_failure);
             try std.testing.expect(fixture.core_destroyed);
-            try std.testing.expect(!@import("os_runtime.zig").fdValid(fixture.webhook_fd.?));
+            try std.testing.expect(!webhookSocketValid(fixture.webhook_fd.?));
             failures += 1;
         }
     }
@@ -1147,10 +1222,14 @@ test "configured runtime: cloned full Mail policy rejects TLS credential trust a
     var relay: [9]u8 = "127.0.0.1".*;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    if (comptime builtin.os.tag == .windows) {
+        try tmp.dir.createDir(std.testing.io, "mail", .default_dir);
+        try @import("os_runtime.zig").protectEmptyDirectoryWindows(std.testing.io, tmp.dir, "mail");
+    }
     var inputs = testInputs(1);
     inputs.core.parsed.mail = .{ .enabled = true, .relay_host = &relay, .from = "sender@localhost", .insecure_skip_verify = false, .user = "name", .pass = &password };
     const anchors = keys.chain;
-    inputs.mail_delivery = .{ .trust_anchors = &anchors, .failure = .{ .journal = .{ .io = std.testing.io, .dir = tmp.dir, .path = "failed-delivery.wal" } } };
+    inputs.mail_delivery = .{ .trust_anchors = &anchors, .failure = .{ .journal = .{ .io = std.testing.io, .dir = tmp.dir, .path = if (builtin.os.tag == .windows) "mail/failed-delivery.wal" else "failed-delivery.wal" } } };
     const runtime = try Runtime.createCold(std.testing.allocator, std.testing.io, inputs, testDeadline());
     defer runtime.deinit();
     const b = backing(runtime);
@@ -1302,11 +1381,10 @@ test "configured runtime: real WebTransport and Metrics resources retain indepen
     try std.testing.expect(b.webtransport.?.tls.cert_chain[0].ptr != b.expected_wt_tls.?.cert_chain[0].ptr);
     try std.testing.expectEqual(gate_mod.Phase.preparing, b.view.?.inspect().phase);
     const inspection = try server_mod.ManagedCoreFixture.inspect(b.core.?);
-    const peer = try @import("native_network.zig").connect(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = inputs.core.config.metrics_port } }, 1000);
-    defer @import("os_runtime.zig").close(peer);
-    try @import("native_network.zig").writeAll(peer, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    var polls = [_]std.posix.pollfd{.{ .fd = peer, .events = std.posix.POLL.IN, .revents = 0 }};
-    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&polls, 25));
+    const peer = try testConnect(inputs.core.config.metrics_port);
+    defer testClose(peer);
+    try testWriteAll(peer, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try std.testing.expect(!try testPeerReady(peer, 25));
     try std.testing.expect(!inspection.any_reactor_entered);
 }
 
@@ -1324,9 +1402,14 @@ test "configured runtime: every owned allocation failure refunds construction an
     // Actual unrelated listener remains owned by its source throughout failure.
     const listener = try @import("reuseport.zig").createReusePortListener("127.0.0.1", 0, 8);
     defer @import("os_runtime.zig").close(listener);
-    try @import("os_runtime.zig").setNonblocking(listener);
-    try @import("native_network.zig").setTimeout(listener, 1000);
-    const before = try @import("metrics_http.zig").observeListener(listener);
+    if (comptime builtin.os.tag != .windows) {
+        try @import("os_runtime.zig").setNonblocking(listener);
+        try @import("native_network.zig").setTimeout(listener, 1000);
+    }
+    const before = if (comptime builtin.os.tag == .windows)
+        try @import("io_backend.zig").socketPort(listener)
+    else
+        try @import("metrics_http.zig").observeListener(listener);
     var unlimited = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const complete = try Runtime.createCold(unlimited.allocator(), std.testing.io, inputs, testDeadline());
     try complete.requirePrepared();
@@ -1345,14 +1428,22 @@ test "configured runtime: every owned allocation failure refunds construction an
             try std.testing.expectEqual(state.spawned, state.joined);
             try std.testing.expect(!fixture.any_body_entered);
         }
-        if (fixture.webhook_fd) |fd| try std.testing.expect(!@import("os_runtime.zig").fdValid(fd));
-        try std.testing.expect(std.meta.eql(before, try @import("metrics_http.zig").observeListener(listener)));
+        if (fixture.webhook_fd) |fd| try std.testing.expect(!webhookSocketValid(fd));
+        const after = if (comptime builtin.os.tag == .windows)
+            try @import("io_backend.zig").socketPort(listener)
+        else
+            try @import("metrics_http.zig").observeListener(listener);
+        try std.testing.expect(std.meta.eql(before, after));
         failing.fail_index = std.math.maxInt(usize);
         const retry = try Runtime.createCold(failing.allocator(), std.testing.io, inputs, testDeadline());
         try retry.requirePrepared();
         retry.deinit();
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-        try std.testing.expect(std.meta.eql(before, try @import("metrics_http.zig").observeListener(listener)));
+        const after_retry = if (comptime builtin.os.tag == .windows)
+            try @import("io_backend.zig").socketPort(listener)
+        else
+            try @import("metrics_http.zig").observeListener(listener);
+        try std.testing.expect(std.meta.eql(before, after_retry));
     }
 }
 
@@ -1449,7 +1540,7 @@ test "configured runtime: same real Core retries every Gate allocation failure a
         try std.testing.expect(std.meta.eql(listener_before, try @import("metrics_http.zig").observeListener(source_before.webhook_fd.?)));
         owner.deinit();
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-        try std.testing.expect(!@import("os_runtime.zig").fdValid(source_before.webhook_fd.?));
+        try std.testing.expect(!webhookSocketValid(source_before.webhook_fd.?));
         if (!induced) {
             try std.testing.expectEqual(@as(usize, 2), failures);
             return;
@@ -1502,8 +1593,8 @@ test "configured runtime: two real Core Gate pairs reject valid foreign and mixe
     first.deinit();
     try second.core.?.requirePrepared();
     try std.testing.expect(std.meta.eql(b_parked, b.view.inspect()));
-    try std.testing.expect(!@import("os_runtime.zig").fdValid(first_before.webhook_fd.?));
-    try std.testing.expect(@import("os_runtime.zig").fdValid(second_before.webhook_fd.?));
+    try std.testing.expect(!webhookSocketValid(first_before.webhook_fd.?));
+    try std.testing.expect(webhookSocketValid(second_before.webhook_fd.?));
 }
 
 fn awaitRuntimeActivated(runtime: *Runtime) !void {
@@ -1518,18 +1609,17 @@ fn awaitRuntimeActivated(runtime: *Runtime) !void {
     }
 }
 fn expectRuntimePing(runtime: *Runtime) !void {
-    const network = @import("native_network.zig");
-    const os = @import("os_runtime.zig");
     const port = (try backing(runtime).core.?.observe()).bound_port;
-    const peer = try network.connect(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }, 1000);
-    defer os.close(peer);
-    try network.writeAll(peer, "NICK runtime_peer\r\nUSER runtime_peer 0 * :Runtime peer\r\nPING :runtime_owned_graph\r\n");
-    try os.setNonblocking(peer);
+    const peer = try testConnect(port);
+    defer testClose(peer);
+    try testWriteAll(peer, "NICK runtime_peer\r\nUSER runtime_peer 0 * :Runtime peer\r\nPING :runtime_owned_graph\r\n");
+    if (comptime builtin.os.tag != .windows) try @import("os_runtime.zig").setNonblocking(peer);
     var received: [4096]u8 = undefined;
     var used: usize = 0;
     const deadline = testDeadline();
     while (used < received.len) {
-        const count = os.read(peer, received[used..]) catch |err| switch (err) {
+        if (!try testPeerReady(peer, 25)) continue;
+        const count = testRead(peer, received[used..]) catch |err| switch (err) {
             error.WouldBlock => 0,
             else => return err,
         };
@@ -1575,7 +1665,7 @@ test "configured runtime: original graph publishes inline and sharded real trans
         try std.testing.expect(observation.inline_joined);
         try std.testing.expect(b.rdns_retained != null and b.dnsbl_retained != null);
         try std.testing.expect(b.rdns.?.runtime.view == null and b.mail.?.runtime.view == null);
-        try std.testing.expect(@import("os_runtime.zig").fdValid(listener));
+        try std.testing.expect(webhookSocketValid(listener));
         try std.testing.expectError(error.NotPublished, runtime.requireActivated());
         // A repeated stop observes the same retained ownership and exact joins.
         try std.testing.expect(std.meta.eql(observation, try runtime.stop(testDeadline())));
