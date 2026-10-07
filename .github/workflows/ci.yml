@@ -160,6 +160,8 @@ jobs:
         run: python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix sequential upgrade smoke
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run guarded Windows Helix with an inert native media port
+        run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
       - name: Run guarded Windows Helix staged-image selection smoke
         run: python -B .\tools\windows_helix_candidate_path_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run Windows REHASH source-proof and Helix continuity smoke
@@ -172,6 +174,16 @@ jobs:
         run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix generated TLS and WSS upgrade smoke
         run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --generated
+      - name: Run Windows Helix TLS 1.3 ticket resumption smoke
+        run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption
+      - name: Run Windows Helix TLS 1.3 early-data smoke
+        run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --early-data
+      - name: Run Windows Helix TLS 1.2 ticket resumption smoke
+        run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --resumption-tls12
+      - name: Run Windows Helix certificate rotation refusal smoke
+        run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative rotation
+      - name: Run Windows Helix failed certificate reload refusal smoke
+        run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out\bin\onyx-server.exe --negative failed-reload
       - name: Build native Windows TLS early-data smoke client
         run: zig build -j1 windows-helix-early-client -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
       - name: Run exact TLS early-data replay through Windows Helix
@@ -186,6 +198,8 @@ jobs:
         run: python -B .\tools\windows_helix_mesh_sequence_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix OroWasm upgrade smoke
         run: python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run Windows post-REHASH OroWasm Helix smoke
+        run: python -B .\tools\windows_helix_wasm_smoke.py .\zig-out\bin\onyx-server.exe --rehash
       - name: Run guarded native Windows Helix Web Push upgrade smoke
         run: python -B .\tools\windows_webpush_helix_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix geo policy upgrade smoke
@@ -218,6 +232,8 @@ jobs:
         run: python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native generated-certificate WebTransport Helix browser smoke
         run: python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --generated
+      - name: Run active WebTransport session Helix browser smoke
+        run: python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --active
       - name: Run native WebTransport browser to IPv6 IRC bind smoke
         run: python -B .\tools\windows_webtransport_smoke.py .\zig-out\bin\onyx-server.exe --ipv6-irc
       - name: Run native WebTransport browser to specific IPv4 IRC bind smoke
@@ -226,6 +242,8 @@ jobs:
         run: python -B .\tools\windows_media_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run native media two-swap Helix UDP smoke
         run: python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe
+      - name: Run active native media and WebRTC Helix smoke
+        run: python -B .\tools\windows_helix_media_smoke.py .\zig-out\bin\onyx-server.exe --active
       - name: Run active WebTransport and media combined Helix smoke
         run: python -B .\tools\windows_helix_combined_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run Windows cold console Ctrl+Break stop smoke
