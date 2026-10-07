@@ -3013,7 +3013,7 @@ fn openColdAtomicWindows(io: std.Io, atomic: *const std.Io.File.Atomic) !std.Io.
         .{ .NORMAL = true },
         .{},
         .OPEN,
-        .{ .NON_DIRECTORY_FILE = true, .IO = .SYNCHRONOUS_NONALERT, .OPEN_REPARSE_POINT = true },
+        .{ .NON_DIRECTORY_FILE = true, .IO = .SYNCHRONOUS_NONALERT, .OPEN_REPARSE_POINT = true, .WRITE_THROUGH = true },
         null,
         0,
     );
@@ -3083,6 +3083,51 @@ fn makeColdAtomicReadable(io: std.Io, atomic: *std.Io.File.Atomic) !void {
     if (!std.meta.eql(try cold_identity.statRegular(file.handle), try cold_identity.statRegular(atomic.file.handle))) return StoreError.SnapshotCoverageMismatch;
     atomic.file.close(io);
     atomic.file = file;
+}
+
+/// Rename the exact held, no-share temporary into a verified private parent.
+/// This is only a namespace primitive: callers must separately prove prepared
+/// bytes, lease custody, configured reopen, and the publication cut. In
+/// particular, no cold stage uses this until its whole Windows transaction is
+/// available. FILE_WRITE_THROUGH requests NTFS metadata flush for the rename;
+/// this does not establish power-loss durability on every filesystem.
+fn renameHeldColdAtomicWindows(
+    io: std.Io,
+    atomic: *std.Io.File.Atomic,
+    configured_dir: std.Io.Dir,
+    configured_path: []const u8,
+    held_parent: std.Io.File,
+    expected_parent: cold_identity.Identity,
+    expected_file: cold_identity.Identity,
+    replace: bool,
+) !void {
+    if (comptime @import("builtin").os.tag != .windows) return error.Unsupported;
+    if (!atomic.file_exists or !atomic.file_open) return StoreError.SnapshotCoverageMismatch;
+    const name = std.fs.path.basename(configured_path);
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+        std.mem.indexOfAny(u8, name, "/\\:\x00") != null or name[name.len - 1] == '.' or name[name.len - 1] == ' ' or
+        !std.mem.eql(u8, name, std.fs.path.basename(atomic.dest_sub_path))) return StoreError.SnapshotCoverageMismatch;
+    _ = try cold_runtime.requirePrivateDirectoryHandleWindows(.{ .handle = held_parent.handle });
+    try validateColdParent(io, configured_dir, configured_path, held_parent, expected_parent, atomic);
+    if (!std.meta.eql(expected_file, try cold_identity.statRegular(atomic.file.handle))) return StoreError.SnapshotCoverageMismatch;
+    var name_w = try std.Io.Threaded.sliceToPrefixedFileW(held_parent.handle, name, .{});
+    const windows = std.os.windows;
+    var info: windows.FILE.RENAME_INFORMATION = .init(.{
+        .Flags = .{ .REPLACE_IF_EXISTS = replace, .POSIX_SEMANTICS = replace },
+        .RootDirectory = held_parent.handle,
+        .FileName = name_w.span(),
+    });
+    const buffer = info.toBuffer();
+    var io_status: windows.IO_STATUS_BLOCK = undefined;
+    // NtSetInformationFile may have changed the namespace even if it reports a
+    // failure. Deinit must never unlink a path after this boundary.
+    atomic.file_exists = false;
+    const status = windows.ntdll.NtSetInformationFile(atomic.file.handle, &io_status, buffer.ptr, @intCast(buffer.len), .RenameEx);
+    switch (status) {
+        .SUCCESS => {},
+        .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
+        else => return StoreError.IoAmbiguous,
+    }
 }
 
 fn encodeColdSnapshot(store: *const OroStore, coverage: *const SnapshotCoverage) ![]u8 {
@@ -7543,6 +7588,142 @@ test "Windows cold atomic failed readable reopen leaves no foreign deletion" {
     deinitColdAtomic(std.testing.io, &atomic, null);
     const orphan = try private.openFile(std.testing.io, &name, .{});
     orphan.close(std.testing.io);
+}
+
+test "Windows held cold atomic rename publishes exact file and retains exclusive duplicate" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const parent = try openColdExisting(std.testing.io, private, ".", .directory);
+    defer parent.close(std.testing.io);
+    const parent_id = try coldDirectoryIdentity(parent.handle);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    try makeColdAtomicReadable(std.testing.io, &atomic);
+    const file_id = try cold_identity.statRegular(atomic.file.handle);
+    const temp_name = std.fmt.hex(atomic.file_basename_hex);
+    try atomic.file.writePositionalAll(std.testing.io, "NEW", 0);
+    try atomic.file.sync(std.testing.io);
+    const writer = try cold_runtime.duplicateFile(atomic.file);
+    try renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", parent, parent_id, file_id, false);
+    try std.testing.expect(!atomic.file_exists);
+    try std.testing.expectError(error.FileBusy, openColdExisting(std.testing.io, private, "state.wal", .read_only));
+    deinitColdAtomic(std.testing.io, &atomic, file_id);
+    try std.testing.expectError(error.FileBusy, openColdExisting(std.testing.io, private, "state.wal", .read_only));
+    try writer.writePositionalAll(std.testing.io, "!", 3);
+    writer.close(std.testing.io);
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, &temp_name, .read_only));
+    const installed = try openColdExisting(std.testing.io, private, "state.wal", .read_only);
+    defer installed.close(std.testing.io);
+    try std.testing.expectEqualDeep(file_id, try cold_identity.statRegular(installed.handle));
+    var bytes: [4]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try installed.readPositionalAll(std.testing.io, &bytes, 0));
+    try std.testing.expectEqualStrings("NEW!", &bytes);
+}
+
+test "Windows held cold atomic replacement keeps old destination handle readable" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const parent = try openColdExisting(std.testing.io, private, ".", .directory);
+    defer parent.close(std.testing.io);
+    const parent_id = try coldDirectoryIdentity(parent.handle);
+    const old = try private.createFile(std.testing.io, "state.wal", .{ .read = true });
+    try old.writePositionalAll(std.testing.io, "OLD", 0);
+    old.close(std.testing.io);
+    const old_reader = try openColdExisting(std.testing.io, private, "state.wal", .read_only);
+    defer old_reader.close(std.testing.io);
+    const old_id = try cold_identity.statRegular(old_reader.handle);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    try makeColdAtomicReadable(std.testing.io, &atomic);
+    const file_id = try cold_identity.statRegular(atomic.file.handle);
+    const temp_name = std.fmt.hex(atomic.file_basename_hex);
+    try atomic.file.writePositionalAll(std.testing.io, "NEW", 0);
+    try atomic.file.sync(std.testing.io);
+    const writer = try cold_runtime.duplicateFile(atomic.file);
+    try renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", parent, parent_id, file_id, true);
+    try std.testing.expect(!atomic.file_exists);
+    var old_bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(old_bytes.len, try old_reader.readPositionalAll(std.testing.io, &old_bytes, 0));
+    try std.testing.expectEqualStrings("OLD", &old_bytes);
+    try std.testing.expectError(error.FileBusy, openColdExisting(std.testing.io, private, "state.wal", .read_only));
+    deinitColdAtomic(std.testing.io, &atomic, file_id);
+    try std.testing.expectError(error.FileBusy, openColdExisting(std.testing.io, private, "state.wal", .read_only));
+    writer.close(std.testing.io);
+    try std.testing.expectError(error.FileNotFound, openColdExisting(std.testing.io, private, &temp_name, .read_only));
+    const installed = try openColdExisting(std.testing.io, private, "state.wal", .read_only);
+    defer installed.close(std.testing.io);
+    try std.testing.expectEqualDeep(file_id, try cold_identity.statRegular(installed.handle));
+    try std.testing.expect(!std.meta.eql(old_id, try cold_identity.statRegular(installed.handle)));
+    var bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try installed.readPositionalAll(std.testing.io, &bytes, 0));
+    try std.testing.expectEqualStrings("NEW", &bytes);
+}
+
+test "Windows held cold atomic rename refuses collision and wrong preconditions" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    const foreign = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "foreign");
+    defer foreign.close(std.testing.io);
+    const parent = try openColdExisting(std.testing.io, private, ".", .directory);
+    defer parent.close(std.testing.io);
+    const wrong_parent = try openColdExisting(std.testing.io, foreign, ".", .directory);
+    defer wrong_parent.close(std.testing.io);
+    const parent_id = try coldDirectoryIdentity(parent.handle);
+    const old = try private.createFile(std.testing.io, "state.wal", .{ .read = true });
+    try old.writePositionalAll(std.testing.io, "OLD", 0);
+    old.close(std.testing.io);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    try makeColdAtomicReadable(std.testing.io, &atomic);
+    const file_id = try cold_identity.statRegular(atomic.file.handle);
+    const temp_name = std.fmt.hex(atomic.file_basename_hex);
+    try atomic.file.writePositionalAll(std.testing.io, "NEW", 0);
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "wrong.wal", parent, parent_id, file_id, true));
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", wrong_parent, parent_id, file_id, true));
+    var wrong_id = file_id;
+    wrong_id.inode_high ^= 1;
+    try std.testing.expectError(StoreError.SnapshotCoverageMismatch, renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", parent, parent_id, wrong_id, true));
+    try std.testing.expect(atomic.file_exists);
+    try std.testing.expectError(error.PathAlreadyExists, renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", parent, parent_id, file_id, false));
+    try std.testing.expect(!atomic.file_exists);
+    deinitColdAtomic(std.testing.io, &atomic, file_id);
+    const old_bytes = try private.readFileAlloc(std.testing.io, "state.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(old_bytes);
+    try std.testing.expectEqualStrings("OLD", old_bytes);
+    const orphan = try openColdExisting(std.testing.io, private, &temp_name, .read_only);
+    defer orphan.close(std.testing.io);
+    try std.testing.expectEqualDeep(file_id, try cold_identity.statRegular(orphan.handle));
+}
+
+test "Windows held cold atomic failed rename leaves safe orphan" {
+    if (comptime @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    try private.createDir(std.testing.io, "state.wal", .default_dir);
+    const parent = try openColdExisting(std.testing.io, private, ".", .directory);
+    defer parent.close(std.testing.io);
+    const parent_id = try coldDirectoryIdentity(parent.handle);
+    var atomic = try private.createFileAtomic(std.testing.io, "state.wal", .{ .replace = true });
+    try makeColdAtomicReadable(std.testing.io, &atomic);
+    const file_id = try cold_identity.statRegular(atomic.file.handle);
+    const temp_name = std.fmt.hex(atomic.file_basename_hex);
+    try atomic.file.writePositionalAll(std.testing.io, "SECRET", 0);
+    try std.testing.expectError(StoreError.IoAmbiguous, renameHeldColdAtomicWindows(std.testing.io, &atomic, private, "state.wal", parent, parent_id, file_id, true));
+    try std.testing.expect(!atomic.file_exists);
+    deinitColdAtomic(std.testing.io, &atomic, file_id);
+    const destination = try openColdExisting(std.testing.io, private, "state.wal", .directory);
+    destination.close(std.testing.io);
+    const orphan = try openColdExisting(std.testing.io, private, &temp_name, .read_only);
+    defer orphan.close(std.testing.io);
+    try std.testing.expectEqualDeep(file_id, try cold_identity.statRegular(orphan.handle));
 }
 
 /// testing.tmpDir owns `.zig-cache/tmp/<sub_path>` relative to the current
