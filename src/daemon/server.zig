@@ -127141,6 +127141,114 @@ test "REHASH cert hot-reload rejects mismatched leaf and private key before publ
     } else return error.SkipZigTest;
 }
 
+test "Windows OCSP publication reaches TLS config with exact DER and exclusive expiry" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const ocsp = @import("../crypto/ocsp.zig");
+    const asn1_time = @import("../proto/asn1_time.zig");
+    const x509 = @import("../crypto/x509.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x6d));
+    const now = @divFloor(platform.realtimeMillis(), 1000);
+    var leaf_buf: [2048]u8 = undefined;
+    const leaf = try x509_selfsign.buildSelfSigned(&leaf_buf, .{
+        .common_name = "ocsp-server.test",
+        .not_before = now - 3600,
+        .not_after = now + 86_400,
+        .serial = &.{ 0x6d, 0x01 },
+        .key_pair = key,
+        .dns_names = &.{"ocsp-server.test"},
+        .is_ca = true,
+    });
+    const cert = try x509.parse(leaf);
+    const identity: ocsp.CertIdInput = .{
+        .issuer_name_der = cert.subject_der,
+        .issuer_key_bytes = cert.subject_public_key,
+        .serial_der = cert.serial_der,
+    };
+    var produced_buf: [asn1_time.generalized_der_len]u8 = undefined;
+    var this_buf: [asn1_time.generalized_der_len]u8 = undefined;
+    var next_buf: [asn1_time.generalized_der_len]u8 = undefined;
+    const response = try ocsp.testSignedOcspResponseForCertIdAt(
+        allocator,
+        key,
+        identity,
+        .good,
+        (try asn1_time.encodeGeneralizedTime(&produced_buf, now - 60)).value,
+        (try asn1_time.encodeGeneralizedTime(&this_buf, now - 60)).value,
+        (try asn1_time.encodeGeneralizedTime(&next_buf, now + 3600)).value,
+    );
+    defer allocator.free(response);
+    // This bounded fixture uses the same self-signed certificate as leaf and
+    // issuer, so the live chain and signed CertID agree exactly.
+    const chain = [_][]const u8{ leaf, leaf };
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = key,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+    const incoming = try allocator.dupe(u8, response);
+    server.publishOcspStaple(incoming);
+    try std.testing.expect(server.ocsp_staple_pending.load(.acquire));
+    {
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        server.maybeSwapOcspStaple();
+        try std.testing.expect(!server.ocsp_staple_pending.load(.acquire));
+        try std.testing.expect(server.ocsp_staple_incoming == null);
+        try std.testing.expectEqual(now + 3600 + ocsp.default_staple_skew_seconds, server.ocsp_staple_valid_until_unix);
+        try std.testing.expectEqualSlices(u8, response, server.config.tls_ocsp_staple.?);
+        try std.testing.expectEqualSlices(u8, response, server.tls13Config(false).ocsp_staple);
+        try std.testing.expectEqual(@intFromPtr(incoming.ptr), @intFromPtr(server.tls13Config(false).ocsp_staple.ptr));
+
+        // The deadline is exclusive. Force the server-owned deadline to the
+        // current second without waiting an hour for the signed nextUpdate.
+        server.ocsp_staple_valid_until_unix = @divFloor(platform.realtimeMillis(), 1000);
+        try std.testing.expectEqual(@as(usize, 0), server.tls13Config(false).ocsp_staple.len);
+        try std.testing.expect(server.config.tls_ocsp_staple == null);
+        try std.testing.expectEqualSlices(u8, response, server.ocsp_staple_owned.?);
+    }
+
+    // A later worker result for the old leaf cannot become active after an
+    // ACME-style leaf rotation, even though the issuer key is unchanged.
+    var rotated_buf: [2048]u8 = undefined;
+    const rotated = try x509_selfsign.buildSelfSigned(&rotated_buf, .{
+        .common_name = "ocsp-server.test",
+        .not_before = now - 3600,
+        .not_after = now + 86_400,
+        .serial = &.{ 0x6d, 0x02 },
+        .key_pair = key,
+        .dns_names = &.{"ocsp-server.test"},
+        .is_ca = true,
+    });
+    const rotated_chain = [_][]const u8{ rotated, rotated };
+    {
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        server.config.tls_cert_chain = &rotated_chain;
+    }
+    server.publishOcspStaple(try allocator.dupe(u8, response));
+    {
+        server.world.lockWrite();
+        defer server.world.unlockWrite();
+        server.maybeSwapOcspStaple();
+        try std.testing.expect(server.config.tls_ocsp_staple == null);
+        try std.testing.expectEqual(@as(usize, 0), server.tls13Config(false).ocsp_staple.len);
+        try std.testing.expect(!server.ocsp_staple_pending.load(.acquire));
+        try std.testing.expect(server.ocsp_staple_incoming == null);
+    }
+}
+
 test "expired OCSP active view is withheld and Windows custody stays inactive" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
         const allocator = std.testing.allocator;
