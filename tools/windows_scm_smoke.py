@@ -100,7 +100,16 @@ def main() -> int:
     parser.add_argument("binary", type=Path)
     parser.add_argument("--skip-upgrades", action="store_true",
                         help="exercise startup and cooperative stop only")
+    parser.add_argument("--kill-host", action="store_true",
+                        help="kill the host after upgrades and prove job containment")
+    parser.add_argument("--invalid-config", action="store_true",
+                        help="prove worker startup failure stops the host")
+    parser.add_argument("--direct-scm", action="store_true",
+                        help="prove SCM mode refuses a foreground launch")
     args = parser.parse_args()
+    refusal_mode = args.invalid_config or args.direct_scm
+    if (refusal_mode and (args.kill_host or args.skip_upgrades)) or (args.invalid_config and args.direct_scm):
+        parser.error("startup refusal modes cannot be combined with other modes")
     if os.name != "nt":
         parser.error("this fixture requires native Windows")
     original = args.binary.resolve()
@@ -129,15 +138,27 @@ def main() -> int:
             "[[opers]]\naccount = \"scmadmin\"\nclass = \"netadmin\"\n",
             encoding="utf-8",
         )
+        if args.invalid_config:
+            config.unlink()
         with log_path.open("wb") as log:
             host = subprocess.Popen(
-                [str(binary), "--windows-service-console-test", str(config)],
+                [str(binary), "--windows-service" if args.direct_scm else
+                 "--windows-service-console-test", str(config)],
                 cwd=root, stdout=log, stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
             clients: list[Client] = []
             stopped = False
             try:
+                if args.invalid_config or args.direct_scm:
+                    code = host.wait(timeout=30)
+                    if code == 0:
+                        raise AssertionError("service host accepted invalid startup mode")
+                    wait_gone(binary)
+                    port_rebound(port)
+                    reason = "foreground SCM dispatch" if args.direct_scm else "missing config"
+                    print(f"PASS: {reason} failed startup; host and worker exited without binding", flush=True)
+                    return 0
                 worker = wait_worker(binary, host)
                 held = wait_client(port, host)
                 clients.append(held)
@@ -158,6 +179,15 @@ def main() -> int:
                             raise AssertionError("SCM host did not survive Helix")
                         print(f"PASS: Helix {generation} replaced {worker} -> {next_worker}; held IRC socket and host survived", flush=True)
                         worker = next_worker
+
+                if args.kill_host:
+                    host.kill()
+                    host.wait(timeout=15)
+                    wait_gone(binary)
+                    port_rebound(port)
+                    stopped = True
+                    print("PASS: host loss killed the final Helix worker and released the IRC listener", flush=True)
+                    return 0
 
                 host.send_signal(signal.CTRL_BREAK_EVENT)
                 code = host.wait(timeout=35)

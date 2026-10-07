@@ -123,13 +123,14 @@ $serverExe = (Resolve-Path -LiteralPath .\zig-out\bin\onyx-server.exe).Path
 $configPath = (Resolve-Path -LiteralPath C:\ProgramData\OnyxServer\onyx-server.local.toml).Path
 & $serverExe --check-config $configPath
 $serviceCommand = '"' + $serverExe + '" --windows-service "' + $configPath + '"'
-New-Service -Name onyx-server -DisplayName 'Onyx Server' -BinaryPathName $serviceCommand -StartupType Automatic
+$serviceCredential = Get-Credential -Message 'Enter the dedicated Onyx Server service account'
+New-Service -Name onyx-server -DisplayName 'Onyx Server' -BinaryPathName $serviceCommand -StartupType Automatic -Credential $serviceCredential
 Start-Service onyx-server
 Get-Service onyx-server
 ```
 
-Use a dedicated service identity with access to the config, generated node key,
-private stores, and logs in that runtime directory. `Stop-Service onyx-server`
+Grant that identity service-logon rights and access to the config, generated
+node key, private stores, and logs in the runtime directory. `Stop-Service onyx-server`
 signals the same cooperative stop path used by foreground Ctrl+C. A stable
 service host stays registered while Helix replaces daemon workers; an inherited
 stop event and liveness lease follow each accepted successor. A failed or
@@ -140,7 +141,10 @@ reports `STOPPED` after the final worker releases the lease.
 For a non-elevated local process test of that host and two Helix swaps, run
 `python -B tools/windows_scm_smoke.py zig-out/bin/onyx-server.exe`. This fixture
 uses the same worker, job, and stop/lease protocol, with a private console in
-place of SCM registration.
+place of SCM registration. Add `--kill-host` to verify that the host-owned job
+terminates the final successor after two swaps, or `--invalid-config` to verify
+that worker startup failure does not leave a listener or service host running.
+`--direct-scm` verifies that SCM mode refuses a foreground launch.
 
 The full daemon's plaintext listener accepts concurrent clients and provides
 its normal IRC command, CAP, and ISUPPORT handling. The native smoke checks
