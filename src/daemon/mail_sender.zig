@@ -43,6 +43,7 @@ const max_job_ms: i64 = 60_000; // hard per-job wall-clock budget (H2: bounds to
 const win = struct {
     const invalid_socket = std.math.maxInt(usize);
     const af_inet: i32 = 2;
+    const af_inet6: i32 = 23;
     const sock_stream: i32 = 1;
     const ipproto_tcp: i32 = 6;
     const sol_socket: i32 = 0xffff;
@@ -63,6 +64,13 @@ const win = struct {
         addr: [4]u8,
         zero: [8]u8 = @splat(0),
     };
+    const SockAddr6 = extern struct {
+        family: u16,
+        port: u16,
+        flowinfo: u32 = 0,
+        addr: [16]u8,
+        scope_id: u32 = 0,
+    };
     const FdSet = extern struct {
         count: u32,
         sockets: [64]usize,
@@ -72,7 +80,7 @@ const win = struct {
         microseconds: i32,
     };
     comptime {
-        if (@sizeOf(SockAddr4) != 16 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8)
+        if (@sizeOf(SockAddr4) != 16 or @sizeOf(SockAddr6) != 28 or @sizeOf(FdSet) != 520 or @sizeOf(Timeval) != 8)
             @compileError("Windows SMTP socket ABI shape changed");
     }
 
@@ -82,9 +90,10 @@ const win = struct {
     extern "ws2_32" fn WSASocketW(family: i32, socket_type: i32, protocol: i32, protocol_info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
     extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) i32;
     extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
-    extern "ws2_32" fn connect(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
-    extern "ws2_32" fn bind(socket: usize, address: *const SockAddr4, address_len: i32) callconv(.winapi) i32;
-    extern "ws2_32" fn getsockname(socket: usize, address: *SockAddr4, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn connect(socket: usize, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn bind(socket: usize, address: *const anyopaque, address_len: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn getsockname(socket: usize, address: *anyopaque, address_len: *i32) callconv(.winapi) i32;
+    extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
     extern "ws2_32" fn accept(socket: usize, address: ?*anyopaque, address_len: ?*i32) callconv(.winapi) usize;
     extern "ws2_32" fn select(ignored_nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
     extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
@@ -784,7 +793,7 @@ pub const Sender = struct {
         defer {
             if (comptime builtin.os.tag == .windows) _ = win.WSACleanup();
         }
-        const addr = try http_fetch.resolveHostA(self.config.relay_host, self.config.relay_port, io_timeout_ms);
+        const addr = try resolveRelayAddress(self.config.relay_host, self.config.relay_port, io_timeout_ms);
 
         // Submission credentials must not cross an unverified session to a remote
         // relay. A non-empty trust store, or an explicit insecure opt-in, is required.
@@ -1411,8 +1420,19 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
 }
 
 // ---- raw socket helpers (mirror http_fetch) ---------------------------------
-// `resolveHostA` only ever yields an IPv4 address, so (like http_fetch's own
-// `connectAddr`) the v6 case is unreachable and treated as a connect failure.
+
+fn resolveRelayAddress(host: []const u8, port: u16, timeout_ms: u31) !net.IpAddress {
+    return resolveRelayAddressWith(http_fetch.resolveHostA, http_fetch.resolveHostAAAA, host, port, timeout_ms);
+}
+
+fn resolveRelayAddressWith(comptime resolve_a: anytype, comptime resolve_aaaa: anytype, host: []const u8, port: u16, timeout_ms: u31) !net.IpAddress {
+    return resolve_a(host, port, timeout_ms) catch |err| {
+        if (comptime builtin.os.tag == .windows) {
+            if (err == error.HostNotFound) return resolve_aaaa(host, port, timeout_ms);
+        }
+        return err;
+    };
+}
 
 const SocketError = error{ SocketUnavailable, ConnectFailed, ConnectTimeout, ConnectionClosed, RecvTimeout };
 
@@ -1442,18 +1462,27 @@ fn connectAddr(addr: net.IpAddress, timeout_ms: u31) SocketError!Socket {
 
 fn connectAddrWindows(addr: net.IpAddress, timeout_ms: u31) SocketError!Socket {
     if (comptime builtin.os.tag != .windows) return error.SocketUnavailable;
-    const a4 = switch (addr) {
-        .ip4 => |value| value,
-        .ip6 => return error.ConnectFailed,
+    const family: i32 = switch (addr) {
+        .ip4 => win.af_inet,
+        .ip6 => win.af_inet6,
     };
-    const fd = win.WSASocketW(win.af_inet, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    const fd = win.WSASocketW(family, win.sock_stream, win.ipproto_tcp, null, 0, 1);
     if (fd == win.invalid_socket) return error.SocketUnavailable;
     errdefer _ = win.closesocket(fd);
     var nonblocking: u32 = 1;
     if (win.ioctlsocket(fd, win.fionbio, &nonblocking) != 0) return error.ConnectFailed;
-    const sa = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, a4.port), .addr = a4.bytes };
+    const connected = switch (addr) {
+        .ip4 => |a4| blk: {
+            const sa = win.SockAddr4{ .family = win.af_inet, .port = std.mem.nativeToBig(u16, a4.port), .addr = a4.bytes };
+            break :blk win.connect(fd, &sa, @sizeOf(win.SockAddr4));
+        },
+        .ip6 => |a6| blk: {
+            const sa = win.SockAddr6{ .family = win.af_inet6, .port = std.mem.nativeToBig(u16, a6.port), .addr = a6.bytes, .scope_id = a6.interface.index };
+            break :blk win.connect(fd, &sa, @sizeOf(win.SockAddr6));
+        },
+    };
     var readiness: WindowsConnectReady = .writable;
-    if (win.connect(fd, &sa, @sizeOf(win.SockAddr4)) != 0) {
+    if (connected != 0) {
         const err = win.WSAGetLastError();
         if (err != win.would_block and err != win.in_progress and err != win.already) return error.ConnectFailed;
         readiness = try windowsWaitConnect(fd, @max(1, @min(timeout_ms, 60_000)));
@@ -1711,6 +1740,78 @@ test "isLoopback detects 127.0.0.0/8 and ::1, rejects public addresses" {
     try testing.expect(isLoopback(.{ .ip6 = .{ .bytes = v6_loop, .port = 587 } }));
     const v6_pub = [_]u8{ 0x20, 0x01 } ++ @as([13]u8, @splat(0)) ++ [_]u8{1};
     try testing.expect(!isLoopback(.{ .ip6 = .{ .bytes = v6_pub, .port = 587 } }));
+}
+
+test "SMTP relay resolver keeps A preference and timeout, with Windows AAAA fallback" {
+    const Fake = struct {
+        fn found4(_: []const u8, port: u16, _: u31) !net.IpAddress {
+            return .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+        }
+        fn missing4(_: []const u8, _: u16, _: u31) !net.IpAddress {
+            return error.HostNotFound;
+        }
+        fn timedOut4(_: []const u8, _: u16, _: u31) !net.IpAddress {
+            return error.ResolveTimeout;
+        }
+        fn found6(_: []const u8, port: u16, _: u31) !net.IpAddress {
+            return .{ .ip6 = .{ .bytes = @as([15]u8, @splat(0)) ++ [_]u8{1}, .port = port } };
+        }
+        fn unexpected6(_: []const u8, _: u16, _: u31) !net.IpAddress {
+            return error.UnexpectedAaaaLookup;
+        }
+    };
+    const a = try resolveRelayAddressWith(Fake.found4, Fake.unexpected6, "relay.test", 587, 1000);
+    try std.testing.expect(a == .ip4);
+    try std.testing.expectEqual(@as(u16, 587), a.ip4.port);
+    try std.testing.expectError(error.ResolveTimeout, resolveRelayAddressWith(Fake.timedOut4, Fake.unexpected6, "relay.test", 587, 0));
+    if (comptime builtin.os.tag == .windows) {
+        const aaaa = try resolveRelayAddressWith(Fake.missing4, Fake.found6, "relay.test", 587, 1000);
+        try std.testing.expect(aaaa == .ip6);
+        try std.testing.expectEqual(@as(u8, 1), aaaa.ip6.bytes[15]);
+    } else {
+        try std.testing.expectError(error.HostNotFound, resolveRelayAddressWith(Fake.missing4, Fake.unexpected6, "relay.test", 587, 1000));
+    }
+}
+
+test "Windows SMTP connects to IPv6 loopback relay" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var startup: [408]u8 align(8) = @splat(0);
+    if (win.WSAStartup(0x0202, &startup) != 0) return error.SocketUnavailable;
+    defer _ = win.WSACleanup();
+
+    const listener = win.WSASocketW(win.af_inet6, win.sock_stream, win.ipproto_tcp, null, 0, 1);
+    if (listener == win.invalid_socket) return error.SocketUnavailable;
+    defer closeFd(listener);
+    var local = win.SockAddr6{ .family = win.af_inet6, .port = 0, .addr = @as([15]u8, @splat(0)) ++ [_]u8{1} };
+    if (win.bind(listener, &local, @sizeOf(win.SockAddr6)) != 0 or win.listen(listener, 1) != 0)
+        return error.TestUnexpectedResult;
+    var local_len: i32 = @sizeOf(win.SockAddr6);
+    if (win.getsockname(listener, &local, &local_len) != 0 or local_len != @sizeOf(win.SockAddr6))
+        return error.TestUnexpectedResult;
+    const port = std.mem.bigToNative(u16, local.port);
+    try std.testing.expect(port != 0);
+
+    const address = try resolveRelayAddress("::1", port, 1000);
+    try std.testing.expect(address == .ip6);
+    try std.testing.expect(isLoopback(address));
+    const client = try connectAddrWindows(address, 1000);
+    defer closeFd(client);
+    var reads = win.FdSet{ .count = 1, .sockets = undefined };
+    reads.sockets[0] = listener;
+    var timeout = win.Timeval{ .seconds = 1, .microseconds = 0 };
+    if (win.select(0, &reads, null, null, &timeout) != 1) return error.TestUnexpectedResult;
+    const peer = win.accept(listener, null, null);
+    if (peer == win.invalid_socket) return error.TestUnexpectedResult;
+    defer closeFd(peer);
+    try setRecvTimeout(peer, 1000);
+    try writeAll(client, "6");
+    var received: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try readSome(peer, &received));
+    try std.testing.expectEqual(@as(u8, '6'), received[0]);
+
+    const a = try resolveRelayAddress("127.0.0.1", port, 1000);
+    try std.testing.expect(a == .ip4);
+    try std.testing.expectError(error.ResolveTimeout, resolveRelayAddress("localhost", port, 0));
 }
 
 test "TLS client fatal transport: mail_sender socket writer preserves control custody" {

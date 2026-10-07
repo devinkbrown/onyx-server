@@ -233,7 +233,15 @@ pub fn get(
     opts: Options,
 ) Error![]u8 {
     if (opts.windows_chain_policy and (!tls or opts.insecure_skip_verify)) return error.BadCertificate;
-    const addr = try resolveHostA(endpointHost(host), port, opts.recv_timeout_ms);
+    const lookup_host = endpointHost(host);
+    const addr = resolveHostA(lookup_host, port, opts.recv_timeout_ms) catch |err| blk: {
+        // The Windows system resolver can have an AAAA answer with no A
+        // answer. Keep the chosen address pinned for the entire request.
+        if (comptime builtin.os.tag == .windows) {
+            if (err == error.HostNotFound) break :blk try resolveHostAAAA(lookup_host, port, opts.recv_timeout_ms);
+        }
+        return err;
+    };
     return getAtAddress(allocator, host, port, tls, request_bytes, addr, opts);
 }
 

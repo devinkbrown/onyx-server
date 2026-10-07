@@ -206,11 +206,37 @@ pub fn isDisallowedPushAddr(addr: net.IpAddress) bool {
                 }
             }
             if (hi_zero) return true; // ::, ::1, and the deprecated ::a.b.c.d space
-            if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
-            if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7 ULA
-            return false;
+            // Require an IANA-allocated public unicast prefix. A newly allocated
+            // prefix remains denied until this fail-closed table is updated.
+            // This also excludes site-local, multicast, ULA, link-local,
+            // NAT64, transition, benchmarking, and documentation targets.
+            return !isAllocatedPublicIp6(b);
         },
     }
+}
+
+/// Current broad public allocations from the IANA IPv6 Global Unicast Address
+/// Space registry (2025-10), excluding special-purpose 2001:db8::/32. IPv4-
+/// mapped addresses are handled by `isDisallowedIp4` before this function.
+fn isAllocatedPublicIp6(b: [16]u8) bool {
+    const first = std.mem.readInt(u16, b[0..2], .big);
+    const second = std.mem.readInt(u16, b[2..4], .big);
+    if (first == 0x2001) {
+        if (second == 0x0db8) return false;
+        return (second >= 0x0200 and second <= 0x0fff) or
+            (second >= 0x1200 and second <= 0x4dff) or
+            (second >= 0x5000 and second <= 0x5fff) or
+            (second >= 0x8000 and second <= 0xbfff);
+    }
+    if (first == 0x2003) return second < 0x4000; // 2003::/18
+    if (first >= 0x2400 and first <= 0x241f) return true;
+    if (first >= 0x2600 and first <= 0x260f) return true;
+    if ((first == 0x2610 or first == 0x2620) and second < 0x0200) return true;
+    if (first >= 0x2630 and first <= 0x263f) return true;
+    if (first >= 0x2800 and first <= 0x280f) return true;
+    if (first >= 0x2a00 and first <= 0x2a1f) return true;
+    if (first >= 0x2c00 and first <= 0x2c0f) return true;
+    return false;
 }
 
 /// Wraps a resolver so every resolved push target is SSRF-screened inline with
@@ -972,6 +998,30 @@ test "webpush tls SSRF guard classifies push endpoint addresses" {
     var ula6: [16]u8 = @splat(0);
     ula6[0] = 0xfd;
     try testing.expect(isDisallowedPushAddr(.{ .ip6 = .{ .bytes = ula6, .port = 443 } }));
+    for ([_][]const u8{
+        "fec0::1", // deprecated site-local
+        "ff02::1", // link-scoped multicast
+        "64:ff9b::a00:1", // NAT64 can translate to a private IPv4 target
+        "2001::1", // Teredo embeds an IPv4 endpoint
+        "2001:2::1", // IANA benchmarking
+        "2001:10::1", // deprecated ORCHID
+        "2001:db8::1", // documentation
+        "2002:0a00:0001::1", // 6to4 embeds 10.0.0.1
+        "3fff::1", // documentation
+        "3ffe::1", // reserved former 6bone
+        "2d00::1", // reserved global-unicast-format block
+        "2001:1000::1", // gap in IANA public allocation
+        "2001:4e00::1", // gap in IANA public allocation
+        "2001:6000::1", // gap in IANA public allocation
+        "2003:4000::1", // outside allocated 2003::/18
+        "2420::1", // outside allocated 2400::/11
+        "2610:200::1", // outside allocated 2610::/23
+        "2640::1", // outside allocated 2630::/12
+        "2a20::1", // outside allocated 2a00::/11
+        "2c10::1", // outside allocated 2c00::/12
+    }) |text| {
+        try testing.expect(isDisallowedPushAddr(try net.IpAddress.parse(text, 443)));
+    }
     var mapped: [16]u8 = @splat(0);
     mapped[10] = 0xff;
     mapped[11] = 0xff;
@@ -983,6 +1033,13 @@ test "webpush tls SSRF guard classifies push endpoint addresses" {
     var pub6: [16]u8 = @splat(0);
     pub6[0] = 0x2a; // 2a00::/… global unicast
     try testing.expect(!isDisallowedPushAddr(.{ .ip6 = .{ .bytes = pub6, .port = 443 } }));
+    try testing.expect(!isDisallowedPushAddr(try net.IpAddress.parse("2001:4860::1", 443)));
+    try testing.expect(!isDisallowedPushAddr(try net.IpAddress.parse("2606:4700:4700::1111", 443)));
+    try testing.expect(!isDisallowedPushAddr(try net.IpAddress.parse("2001:db7::1", 443)));
+    try testing.expect(!isDisallowedPushAddr(try net.IpAddress.parse("2003:3fff::1", 443)));
+    try testing.expect(!isDisallowedPushAddr(try net.IpAddress.parse("241f::1", 443)));
+    try testing.expect(!isDisallowedPushAddr(try net.IpAddress.parse("2610:1ff::1", 443)));
+    try testing.expect(!isDisallowedPushAddr(try net.IpAddress.parse("2c0f::1", 443)));
 }
 
 test "webpush tls SSRF guard refuses an internal-IP endpoint before connect" {

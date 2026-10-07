@@ -27647,9 +27647,24 @@ pub const LinuxServer = struct {
         else if (self.unfurl_resolve_for_test) |resolve|
             try resolve(target.host)
         else
-            try http_fetch.resolveHostA(target.host, target.port, 2000);
+            try resolveUnfurlHostname(target.host, target.port, http_fetch.resolveHostA, http_fetch.resolveHostAAAA);
         if (unfurl.deniedAddress(addr)) return error.PrivateUnfurlAddress;
         return addr;
+    }
+
+    fn resolveUnfurlHostname(
+        host: []const u8,
+        port: u16,
+        resolve_a: *const fn ([]const u8, u16, u31) anyerror!std.Io.net.IpAddress,
+        resolve_aaaa: *const fn ([]const u8, u16, u31) anyerror!std.Io.net.IpAddress,
+    ) !std.Io.net.IpAddress {
+        return resolve_a(host, port, 2000) catch |err| {
+            // Windows DNS can report HostNotFound when only AAAA answers exist.
+            if (comptime builtin.os.tag == .windows) {
+                if (err == error.HostNotFound) return resolve_aaaa(host, port, 2000);
+            }
+            return err;
+        };
     }
 
     fn unfurlBody(self: *LinuxServer, request: []const u8, host: []const u8, port: u16, addr: std.Io.net.IpAddress, dest: []u8) ![]const u8 {
@@ -131080,6 +131095,63 @@ test "UNFURL forwards the screened address to its fetch" {
     Fixture.fail = true;
     try std.testing.expectError(error.TestDnsFailure, server.resolveUnfurlAddress(target));
     try std.testing.expectEqual(@as(usize, 1), Fixture.fetches);
+}
+
+test "Windows UNFURL hostname lookup uses AAAA only after missing A" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const IpAddress = std.Io.net.IpAddress;
+    const Fixture = struct {
+        var a_answer: IpAddress = undefined;
+        var a_failure: ?anyerror = null;
+        var aaaa_answer: IpAddress = undefined;
+        var aaaa_failure: ?anyerror = null;
+        var a_calls: usize = 0;
+        var aaaa_calls: usize = 0;
+
+        fn a(host: []const u8, port: u16, timeout_ms: u31) anyerror!IpAddress {
+            try std.testing.expectEqualStrings("preview.invalid", host);
+            try std.testing.expectEqual(@as(u16, 8443), port);
+            try std.testing.expectEqual(@as(u31, 2000), timeout_ms);
+            a_calls += 1;
+            if (a_failure) |err| return err;
+            return a_answer;
+        }
+
+        fn aaaa(host: []const u8, port: u16, timeout_ms: u31) anyerror!IpAddress {
+            try std.testing.expectEqualStrings("preview.invalid", host);
+            try std.testing.expectEqual(@as(u16, 8443), port);
+            try std.testing.expectEqual(@as(u31, 2000), timeout_ms);
+            aaaa_calls += 1;
+            if (aaaa_failure) |err| return err;
+            return aaaa_answer;
+        }
+    };
+    Fixture.a_answer = try IpAddress.parse("1.1.1.9", 8443);
+    Fixture.aaaa_answer = try IpAddress.parse("2606:4700:4700::1111", 8443);
+    Fixture.a_failure = null;
+    Fixture.aaaa_failure = null;
+    Fixture.a_calls = 0;
+    Fixture.aaaa_calls = 0;
+    const host = "preview.invalid";
+    try std.testing.expectEqualDeep(Fixture.a_answer, try LinuxServer.resolveUnfurlHostname(host, 8443, Fixture.a, Fixture.aaaa));
+    try std.testing.expectEqual(@as(usize, 1), Fixture.a_calls);
+    try std.testing.expectEqual(@as(usize, 0), Fixture.aaaa_calls);
+
+    Fixture.a_failure = error.HostNotFound;
+    try std.testing.expectEqualDeep(Fixture.aaaa_answer, try LinuxServer.resolveUnfurlHostname(host, 8443, Fixture.a, Fixture.aaaa));
+    try std.testing.expectEqual(@as(usize, 2), Fixture.a_calls);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.aaaa_calls);
+
+    Fixture.a_failure = error.TestDnsFailure;
+    try std.testing.expectError(error.TestDnsFailure, LinuxServer.resolveUnfurlHostname(host, 8443, Fixture.a, Fixture.aaaa));
+    try std.testing.expectEqual(@as(usize, 3), Fixture.a_calls);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.aaaa_calls);
+
+    Fixture.a_failure = error.HostNotFound;
+    Fixture.aaaa_failure = error.TestAAAAFailure;
+    try std.testing.expectError(error.TestAAAAFailure, LinuxServer.resolveUnfurlHostname(host, 8443, Fixture.a, Fixture.aaaa));
+    try std.testing.expectEqual(@as(usize, 4), Fixture.a_calls);
+    try std.testing.expectEqual(@as(usize, 2), Fixture.aaaa_calls);
 }
 
 test "GAP-P7 a banned connection files one appeal and the oper answer is audited" {

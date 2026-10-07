@@ -252,7 +252,9 @@ deliberately closed relay causes a durable failure row. Build the disposable
 relay with
 `zig build windows-mail-relay`, then run `python -B tools/windows_mail_smoke.py`.
 The mail trust store accepts PEM certificate bundles or a DER certificate;
-the daemon owns decoded anchors through worker shutdown. A real remote SMTP
+the daemon owns decoded anchors through worker shutdown. Windows relay hostnames
+try AAAA when no A address exists, and the mail worker can connect over IPv6.
+A real remote SMTP
 relay and its trust policy still need an acceptance test. For an implicit TLS
 submission relay, set `[mail].starttls = false` and
 `[mail].relay_port = 465`. With `trust_store_path` set and the default
@@ -452,9 +454,9 @@ closes.
 
 Windows outbound HTTP hostname lookup uses `GetAddrInfoExW`. The guarded Web
 Push and outbound webhook resolvers, along with ACME, fall back from an absent
-A answer to AAAA. Outbound webhooks and link previews connect to the same
-address they screened, including webhook retries; link previews still resolve
-hostnames through A records. Other HTTP callers keep A-only resolution. Native
+A answer to AAAA. Link previews and generic outbound HTTP now use the same
+Windows A-to-AAAA fallback. Outbound webhooks and link previews connect to the
+same address they screened, including webhook retries. Native
 Winsock connects to IPv4 and IPv6 targets, and focused loopback tests cover
 plaintext requests and a verified TLS request to a pinned IPv6 address.
 HTTPS webhooks and link previews verify peers against the native Windows ROOT
