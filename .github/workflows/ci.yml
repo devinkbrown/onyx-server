@@ -370,6 +370,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Verify native ARM64 process identity lookup
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ARCH -ne 'ARM64') { throw "Wrong runner architecture: $env:RUNNER_ARCH" }
+          python -B -c 'import os, sys; sys.path.insert(0, "tools"); from pathlib import Path; from windows_helix_smoke import image_pids; assert os.getpid() in image_pids(Path(sys.executable))'
       - name: Semantic check (Windows ARM64)
         run: zig build -j1 check -Dtarget=aarch64-windows --summary all
       - name: Build Windows ARM64 release package
