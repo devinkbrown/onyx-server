@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+from ctypes import wintypes
 import os
 from pathlib import Path
 import secrets
@@ -85,37 +87,83 @@ def image_pids(binary: Path) -> set[int]:
     image_name = binary.name
     if not image_name or not all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in image_name):
         raise ValueError("unsafe executable name for Windows process query")
-    script = (
-        f"Get-CimInstance Win32_Process -Filter \"Name='{image_name}'\" | "
-        "ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.ExecutablePath }"
+    if os.name != "nt":
+        raise OSError("Windows process enumeration requires Windows")
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry))
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry))
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
     )
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        check=True, text=True, capture_output=True, timeout=15,
-    )
-    pids = set()
-    for line in result.stdout.splitlines():
-        pid, separator, executable = line.partition("|")
-        if not separator or not pid.isdigit() or not executable:
-            continue
-        try:
-            if os.path.samefile(binary, executable):
-                pids.add(int(pid))
-        except OSError:
-            continue
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    pids: set[int] = set()
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        while True:
+            if entry.szExeFile.casefold() == image_name.casefold():
+                process = kernel32.OpenProcess(0x1000, False, entry.th32ProcessID)  # PROCESS_QUERY_LIMITED_INFORMATION
+                if process:
+                    try:
+                        executable = ctypes.create_unicode_buffer(32768)
+                        length = wintypes.DWORD(len(executable))
+                        if kernel32.QueryFullProcessImageNameW(process, 0, executable, ctypes.byref(length)):
+                            try:
+                                if os.path.samefile(binary, executable.value):
+                                    pids.add(entry.th32ProcessID)
+                            except OSError:
+                                pass  # The process may have exited after the snapshot.
+                    finally:
+                        kernel32.CloseHandle(process)
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+                    raise ctypes.WinError(ctypes.get_last_error())
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
     return pids
 
 
 def sole_image_pid(binary: Path, *, different_from: int | None = None, timeout: float = 35) -> int:
     until = time.monotonic() + timeout
+    last_pids: set[int] = set()
     while time.monotonic() < until:
-        pids = image_pids(binary)
-        if len(pids) == 1:
-            pid = next(iter(pids))
+        last_pids = image_pids(binary)
+        if len(last_pids) == 1:
+            pid = next(iter(last_pids))
             if pid != different_from:
                 return pid
-        time.sleep(0.3)
-    raise TimeoutError(f"successor PID did not replace {different_from}; live={image_pids(binary)}")
+        time.sleep(min(0.3, max(0, until - time.monotonic())))
+    raise TimeoutError(f"successor PID did not replace {different_from}; live={last_pids}")
 
 
 def authenticate_account(port: int, account: bytes, password: bytes, nick: bytes) -> Client:
