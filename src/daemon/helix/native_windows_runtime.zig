@@ -306,9 +306,16 @@ pub const Driver = struct {
             defer accepted.deinit(self.allocator);
             for (rows) |row| {
                 if (row.role != .client) continue;
-                try accepted.append(self.allocator, try active_wt_custody.observeAcceptedIrcSocket(@intCast(row.canonical)));
+                const observed = active_wt_custody.observeAcceptedIrcSocket(@intCast(row.canonical)) catch |err| {
+                    std.debug.print("onyx-server: Windows active WebTransport accepted roster observation failed: {s}\n", .{@errorName(err)});
+                    return err;
+                };
+                accepted.append(self.allocator, observed) catch |err| {
+                    std.debug.print("onyx-server: Windows active WebTransport accepted roster allocation failed: {s}\n", .{@errorName(err)});
+                    return err;
+                };
             }
-            wt_active_prepared = try active_wt_custody.prepare(
+            wt_active_prepared = active_wt_custody.prepare(
                 self.allocator,
                 source.owner,
                 source.pause_token,
@@ -316,7 +323,10 @@ pub const Driver = struct {
                 candidate.process_handle,
                 candidate.pid,
                 candidate.identity.upgrade_id,
-            );
+            ) catch |err| {
+                std.debug.print("onyx-server: Windows active WebTransport HXWC preparation failed: {s}\n", .{@errorName(err)});
+                return err;
+            };
         }
         if ((snapshot.windows_udp.webrtc_media != null) != (snapshot.windows_udp.native_media != null) or
             (snapshot.windows_udp.media_domain != null) != (snapshot.windows_udp.webrtc_media != null))

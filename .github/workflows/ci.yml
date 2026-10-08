@@ -78,6 +78,8 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $zigExe.DirectoryName
       - name: Semantic check
         run: zig build -j1 check -Dtarget=x86_64-windows --summary all
+      - name: Semantic check (Windows ARM64 cross target)
+        run: zig build -j1 check -Dtarget=aarch64-windows --summary all
       - name: Build (debug)
         run: zig build -j1 -Dtarget=x86_64-windows --summary all
       - name: Run focused Windows tests (Debug)
@@ -92,17 +94,6 @@ jobs:
         run: zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true --summary all
       - name: Build native-codegen Windows release package
         run: zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true --prefix .\zig-out-selfhosted --summary all
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Smoke native-codegen Windows release package
-        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --tls --wss --metrics --webhook
-      - name: Smoke packaged Windows quickstart
-        run: python -B .\tools\windows_quickstart_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --template .\zig-out-selfhosted\etc\onyx-server\onyx-server.windows.quickstart.toml
-      - name: Build native Windows QUIC interop tools
-        run: zig build -j1 quic-interop-server quic-interop-wt-server -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
-      - name: Run standalone Windows WebTransport browser interop
-        run: python -B .\tools\windows_quic_interop_smoke.py .\zig-out\bin\quic_interop_wt_server.exe
       - name: Run full Windows test suite (Debug)
         run: zig build -j1 test -Dtarget=x86_64-windows --summary all
       - name: Run full Windows test suite with native Zig codegen (Debug)
@@ -144,6 +135,56 @@ jobs:
         run: zig build -j1 test-cli -Dtarget=x86_64-windows --summary all
       - name: Run complete native CLI tests (ReleaseSafe)
         run: zig build -j1 test-cli -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+
+  # Live fixtures build their own artifacts on a separate runner so the full
+  # test suites and process smokes have independent time budgets.
+  windows-smokes:
+    name: native Windows live smokes
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and verify pinned Windows Zig
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://pkg.hexops.org/zig/zig-x86_64-windows-0.17.0-dev.1282+c0f9b51d8.zip'
+          $expectedSha256 = 'DF1CA8156908BD51B417265773092DDF41A1D307F0E93B28BB3E8A0B912D0681'
+          $archive = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows.zip'
+          $installRoot = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Zig archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $installRoot
+          $zigExe = Get-ChildItem -LiteralPath $installRoot -Filter zig.exe -File -Recurse | Select-Object -First 1
+          if ($null -eq $zigExe) { throw 'Pinned Zig archive contains no zig.exe' }
+          $actualVersion = (& $zigExe.FullName version).Trim()
+          if ($actualVersion -ne $env:ZIG_VERSION) {
+            throw "Zig version mismatch: expected $env:ZIG_VERSION, got $actualVersion"
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $zigExe.DirectoryName
+      - name: Build (debug)
+        run: zig build -j1 -Dtarget=x86_64-windows --summary all
+      - name: Build native-codegen Windows release package
+        run: zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true --prefix .\zig-out-selfhosted --summary all
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Smoke native-codegen Windows release package
+        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --tls --wss --metrics --webhook
+      - name: Smoke packaged Windows quickstart
+        run: python -B .\tools\windows_quickstart_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --template .\zig-out-selfhosted\etc\onyx-server\onyx-server.windows.quickstart.toml
+      # The hosted Windows runner is disposable and elevated. The fixture
+      # refuses installation if an exact-name service already exists.
+      - name: Smoke real Windows SCM service and Helix lifecycle
+        run: python -B .\tools\windows_scm_service_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --allow-service-install
+      - name: Build native Windows QUIC interop tools
+        run: zig build -j1 quic-interop-server quic-interop-wt-server -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
+      - name: Run standalone Windows WebTransport browser interop
+        run: python -B .\tools\windows_quic_interop_smoke.py .\zig-out\bin\quic_interop_wt_server.exe
       - name: Run native full-daemon IRC, TLS, WSS, metrics, and webhook smoke
         run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --wss --metrics --webhook
       - name: Run shared IRC runtime contract on native Windows
@@ -166,6 +207,9 @@ jobs:
         run: python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix sequential upgrade smoke
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      # The smoke prints SKIP when no preferred assigned link-local IPv6 address exists.
+      - name: Run scoped IPv6 Windows Helix listener smoke
+        run: python -B .\tools\windows_helix_scoped_ipv6_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded Windows Helix with an inert native media port
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
       # This ancestor still speaks the v17 Windows Helix protocol. Build it
@@ -291,6 +335,77 @@ jobs:
         run: python -B .\tools\windows_scm_smoke.py .\zig-out\bin\onyx-server.exe --direct-scm
       - name: Run configured Windows security and listener failure smoke
         run: python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
+
+  # The pinned x86_64 Zig compiler runs under Windows 11 ARM64 emulation. The
+  # explicit target produces a native ARM64 daemon, which the smokes launch
+  # directly so Zig does not need to run a cross-target build artifact.
+  windows-arm64:
+    name: native Windows ARM64 package and runtime
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and verify pinned Windows Zig
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://pkg.hexops.org/zig/zig-x86_64-windows-0.17.0-dev.1282+c0f9b51d8.zip'
+          $expectedSha256 = 'DF1CA8156908BD51B417265773092DDF41A1D307F0E93B28BB3E8A0B912D0681'
+          $archive = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows.zip'
+          $installRoot = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Zig archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $installRoot
+          $zigExe = Get-ChildItem -LiteralPath $installRoot -Filter zig.exe -File -Recurse | Select-Object -First 1
+          if ($null -eq $zigExe) { throw 'Pinned Zig archive contains no zig.exe' }
+          $actualVersion = (& $zigExe.FullName version).Trim()
+          if ($actualVersion -ne $env:ZIG_VERSION) {
+            throw "Zig version mismatch: expected $env:ZIG_VERSION, got $actualVersion"
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $zigExe.DirectoryName
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify native ARM64 process identity lookup
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ARCH -ne 'ARM64') { throw "Wrong runner architecture: $env:RUNNER_ARCH" }
+          python -B -c 'import os, sys; sys.path.insert(0, "tools"); from pathlib import Path; from windows_helix_smoke import image_pids; assert os.getpid() in image_pids(Path(sys.executable))'
+      - name: Semantic check (Windows ARM64)
+        run: zig build -j1 check -Dtarget=aarch64-windows --summary all
+      - name: Build Windows ARM64 release package
+        run: zig build -j1 package -Dtarget=aarch64-windows --prefix .\zig-out-arm64 --summary all
+      - name: Verify native ARM64 package image
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ARCH -ne 'ARM64') { throw "Wrong runner architecture: $env:RUNNER_ARCH" }
+          $binary = (Resolve-Path '.\zig-out-arm64\bin\onyx-server.exe').Path
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0xAA64) { throw ('Wrong PE machine: 0x{0:X4}' -f $machine) }
+      - name: Smoke Windows ARM64 packaged quickstart
+        run: python -B .\tools\windows_quickstart_smoke.py .\zig-out-arm64\bin\onyx-server.exe --template .\zig-out-arm64\etc\onyx-server\onyx-server.windows.quickstart.toml
+      - name: Smoke Windows ARM64 full daemon
+        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out-arm64\bin\onyx-server.exe --tls --wss --metrics --webhook
+      - name: Smoke real Windows ARM64 SCM service and Helix lifecycle
+        run: python -B .\tools\windows_scm_service_smoke.py .\zig-out-arm64\bin\onyx-server.exe --allow-service-install
+      - name: Smoke Windows ARM64 secured mesh through Helix
+        run: python -B .\tools\windows_helix_mesh_smoke.py .\zig-out-arm64\bin\onyx-server.exe
+      - name: Smoke Windows ARM64 TLS and WSS through Helix
+        run: python -B .\tools\windows_helix_tls_smoke.py .\zig-out-arm64\bin\onyx-server.exe
+      - name: Smoke Windows ARM64 active media through Helix
+        run: python -B .\tools\windows_helix_media_smoke.py .\zig-out-arm64\bin\onyx-server.exe --active
+      - name: Smoke Windows ARM64 WebTransport browser
+        run: python -B .\tools\windows_webtransport_smoke.py .\zig-out-arm64\bin\onyx-server.exe
+      - name: Smoke Windows ARM64 active WebTransport through Helix
+        run: python -B .\tools\windows_helix_webtransport_smoke.py .\zig-out-arm64\bin\onyx-server.exe --active
+      - name: Smoke Windows ARM64 combined WebTransport and media Helix
+        run: python -B .\tools\windows_helix_combined_smoke.py .\zig-out-arm64\bin\onyx-server.exe
 
   build-test:
     name: build & test

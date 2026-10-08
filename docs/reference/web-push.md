@@ -10,10 +10,15 @@ service, only ciphertext it forwards. The message crypto is a pure, deterministi
 module (`crypto/webpush.zig`); the daemon glue — subscription store, VAPID key,
 delivery worker — lives in `daemon/webpush.zig`.
 
-Web push is **off by default** and Linux-only. Enabling it needs an account store
-(subscriptions are account-scoped) and outbound HTTPS (it reuses the ACME transport
-and CA trust anchors; `src/daemon/config_format.zig:717-727`,
-`src/main.zig:292-299`, `src/main.zig:824-879`).
+Web Push is **off by default** and available on Linux, OpenBSD, and Windows. Enabling it
+needs an account store (subscriptions are account-scoped) and outbound HTTPS;
+delivery reuses the ACME transport and PEM trust anchors. On Windows, set
+`[acme].ca_bundle_path` to a readable PEM bundle and place
+`[webpush].vapid_key_path` under a private directory. Boot fails if these
+requirements cannot be met. Windows smoke tests cover VAPID boot and restart,
+subscription persistence, worker startup, and a trusted local HTTPS delivery;
+delivery to a public push service still needs external acceptance. See the
+[Windows guide](../guide/windows.md).
 
 Source of truth: `src/crypto/webpush.zig`, `src/daemon/webpush.zig`, the launch
 wiring in `src/main.zig`, and the command/trigger wiring in

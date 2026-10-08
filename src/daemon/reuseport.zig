@@ -24,6 +24,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const kernel_linux = @import("kernel_linux.zig");
 const io_backend = @import("io_backend.zig");
+const windows_ipv6_scope = @import("windows_ipv6_scope.zig");
 
 pub const ReusePortError = error{
     Unsupported,
@@ -254,6 +255,153 @@ test "Windows exclusive dual-stack listener accepts through IOCP" {
     }
 }
 
+test "Windows listener preserves IPv6 numeric zone" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const scoped = try sockaddrIn6("fe80::1%7", 6900);
+    try std.testing.expectEqual(@as(u32, 7), scoped.scope_id);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 6900), scoped.port);
+    try std.testing.expectEqual(@as(u8, 0xfe), scoped.addr[0]);
+    try std.testing.expectEqual(@as(u8, 1), scoped.addr[15]);
+    try std.testing.expectError(error.InvalidAddress, sockaddrIn6("127.0.0.1%7", 6900));
+}
+
+const win_adapter_probe = if (builtin.os.tag == .windows) struct {
+    const SocketAddress = extern struct {
+        address: ?*const posix.sockaddr,
+        length: i32,
+    };
+    const Unicast = extern struct {
+        alignment: u64,
+        next: ?*Unicast,
+        address: SocketAddress,
+        prefix_origin: u32,
+        suffix_origin: u32,
+        dad_state: u32,
+    };
+    const Adapter = extern struct {
+        alignment: u64,
+        next: ?*Adapter,
+        adapter_name: ?[*:0]const u8,
+        first_unicast: ?*Unicast,
+        first_anycast: ?*anyopaque,
+        first_multicast: ?*anyopaque,
+        first_dns: ?*anyopaque,
+        dns_suffix: ?[*:0]const u16,
+        description: ?[*:0]const u16,
+        friendly_name: ?[*:0]const u16,
+        physical_address: [8]u8,
+        physical_address_length: u32,
+        flags: u32,
+        mtu: u32,
+        if_type: u32,
+        oper_status: u32,
+        ipv6_if_index: u32,
+    };
+
+    comptime {
+        const ptr_size = @sizeOf(usize);
+        if (ptr_size != 4 and ptr_size != 8) @compileError("unsupported Windows pointer width");
+        if (@offsetOf(SocketAddress, "length") != ptr_size or
+            @offsetOf(Unicast, "next") != 8 or
+            @offsetOf(Unicast, "address") != 8 + ptr_size or
+            @offsetOf(Unicast, "dad_state") != 8 + ptr_size + @sizeOf(SocketAddress) + 8 or
+            @offsetOf(Adapter, "next") != 8 or
+            @offsetOf(Adapter, "friendly_name") != 8 + 8 * ptr_size or
+            @offsetOf(Adapter, "ipv6_if_index") != 8 + 9 * ptr_size + 28)
+        {
+            @compileError("IP Helper adapter ABI prefix does not match the Windows SDK");
+        }
+    }
+
+    extern "iphlpapi" fn GetAdaptersAddresses(
+        family: u32,
+        flags: u32,
+        reserved: ?*anyopaque,
+        first: ?*Adapter,
+        size: *u32,
+    ) callconv(.winapi) u32;
+} else struct {};
+
+test "Windows listener binds assigned link-local IPv6 by adapter alias" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    // Query the machine rather than hardcode an interface index or alias. The
+    // address must be assigned and preferred so a bind failure is meaningful.
+    var size: u32 = 15 * 1024;
+    for (0..3) |_| {
+        const words = try std.testing.allocator.alloc(u64, (size + 7) / 8);
+        defer std.testing.allocator.free(words);
+        const status = win_adapter_probe.GetAdaptersAddresses(
+            @intCast(posix.AF.INET6),
+            0,
+            null,
+            @ptrCast(&words[0]),
+            &size,
+        );
+        if (status == 111) continue; // ERROR_BUFFER_OVERFLOW
+        if (status != 0) return error.SkipZigTest;
+
+        var saw_candidate = false;
+        var adapter: ?*win_adapter_probe.Adapter = @ptrCast(&words[0]);
+        while (adapter) |a| : (adapter = a.next) {
+            if (@as(u32, @truncate(a.alignment)) < @as(u32, @intCast(@offsetOf(win_adapter_probe.Adapter, "ipv6_if_index") + @sizeOf(u32)))) continue;
+            if (a.oper_status != 1 or a.ipv6_if_index == 0) continue; // IfOperStatusUp
+            const friendly_name = a.friendly_name orelse continue;
+            const name_w = std.mem.span(friendly_name);
+            if (name_w.len == 0 or name_w.len > 256) continue;
+            var name_buf: [1024]u8 = undefined;
+            const name_len = std.unicode.utf16LeToUtf8(&name_buf, name_w) catch continue;
+            const name = name_buf[0..name_len];
+            if (std.mem.indexOfAny(u8, name, "\x00%") != null) continue;
+
+            var unicast = a.first_unicast;
+            while (unicast) |u| : (unicast = u.next) {
+                if (@as(u32, @truncate(u.alignment)) < @as(u32, @intCast(@offsetOf(win_adapter_probe.Unicast, "dad_state") + @sizeOf(u32)))) continue;
+                if (u.dad_state != 4 or u.address.length < @sizeOf(posix.sockaddr.in6)) continue; // IpDadStatePreferred
+                const raw = u.address.address orelse continue;
+                if (raw.family != posix.AF.INET6) continue;
+                const assigned: *const posix.sockaddr.in6 = @ptrCast(@alignCast(raw));
+                if (assigned.addr[0] != 0xfe or (assigned.addr[1] & 0xc0) != 0x80) continue;
+                saw_candidate = true;
+
+                const parts: [8]u16 = .{
+                    std.mem.readInt(u16, assigned.addr[0..2], .big),
+                    std.mem.readInt(u16, assigned.addr[2..4], .big),
+                    std.mem.readInt(u16, assigned.addr[4..6], .big),
+                    std.mem.readInt(u16, assigned.addr[6..8], .big),
+                    std.mem.readInt(u16, assigned.addr[8..10], .big),
+                    std.mem.readInt(u16, assigned.addr[10..12], .big),
+                    std.mem.readInt(u16, assigned.addr[12..14], .big),
+                    std.mem.readInt(u16, assigned.addr[14..16], .big),
+                };
+                var host_buf: [1024]u8 = undefined;
+                const host = std.fmt.bufPrint(&host_buf, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}%{s}", .{
+                    parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7], name,
+                }) catch unreachable;
+                const parsed = try sockaddrIn6(host, 0);
+                try std.testing.expectEqual(a.ipv6_if_index, parsed.scope_id);
+                try std.testing.expectEqualSlices(u8, &assigned.addr, &parsed.addr);
+                const listener = createWindowsListener(host, 0, 8) catch continue;
+                defer io_backend.closeSocket(listener);
+                const bound_port = try io_backend.socketPort(listener);
+                try std.testing.expect(bound_port != 0);
+                const observed = try io_backend.observeWindowsListeningTcpSocket(listener);
+                try std.testing.expect(observed.scope_id != 0);
+                try std.testing.expectEqual(a.ipv6_if_index, observed.scope_id);
+                try std.testing.expectEqual(bound_port, observed.local.port);
+                switch (observed.local.address) {
+                    .ipv6 => |bytes| try std.testing.expectEqualSlices(u8, &assigned.addr, &bytes),
+                    else => return error.TestUnexpectedResult,
+                }
+                return;
+            }
+        }
+        if (saw_candidate) return error.TestUnexpectedResult;
+        return error.SkipZigTest;
+    }
+    return error.SkipZigTest;
+}
+
 fn socketTcp() ReusePortError!linux.fd_t {
     const rc = linux.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
     switch (posix.errno(rc)) {
@@ -270,9 +418,15 @@ fn socketTcp() ReusePortError!linux.fd_t {
 /// IPv4-mapped form (::ffff:a.b.c.d). Anything else is rejected.
 fn sockaddrIn6(host: []const u8, port: u16) ReusePortError!posix.sockaddr.in6 {
     var addr: [16]u8 = @splat(0); // in6addr_any (dual-stack wildcard)
+    var scope_id: u32 = 0;
     if (host.len != 0 and !std.mem.eql(u8, host, "0.0.0.0") and !std.mem.eql(u8, host, "::")) {
-        if (std.Io.net.Ip6Address.parse(host, port)) |a6| {
+        const parsed6 = if (comptime builtin.os.tag == .windows)
+            windows_ipv6_scope.parseLiteral(host, port)
+        else
+            std.Io.net.Ip6Address.parse(host, port);
+        if (parsed6) |a6| {
             addr = a6.bytes;
+            scope_id = a6.interface.index;
         } else |_| {
             const a4 = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidAddress;
             addr = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ a4.bytes;
@@ -282,7 +436,7 @@ fn sockaddrIn6(host: []const u8, port: u16) ReusePortError!posix.sockaddr.in6 {
         .port = std.mem.nativeToBig(u16, port),
         .flowinfo = 0,
         .addr = addr,
-        .scope_id = 0,
+        .scope_id = scope_id,
     };
 }
 

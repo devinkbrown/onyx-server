@@ -72,11 +72,11 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 
 ## UPGRADE
 
-- Syntax: `UPGRADE`
-- Description: Helix hot in-place upgrade. The handler serializes the complete mandatory state into a sealed memfd arena, opens and probes the configured executable path's exact capability token (falling back to `/proc/self/exe` only when no path was recorded), and re-execs that pinned image with `--supervisor` while preserving listeners, clients, and the converged mesh view (each link's remote-member roster and the cross-mesh oper-grant registry, so reconverge raises no spurious remote `JOIN`/`+Y`/`TOPIC`). Incomplete state, sealing, capability, or adoption validation refuses the UPGRADE; the current path does not intentionally fall back to listener-only or partial adoption. It is Linux-only.
-- Privileges: Registered command with oper check inside handler; non-opers receive `ERR_NOPRIVILEGES 481`.
-- Parameters: None.
+- Syntax: `UPGRADE` or, on Windows, `UPGRADE :<absolute-path-to-onyx-server.exe>`
+- Description: Helix hot in-place upgrade preserves listeners, clients, and the converged mesh view (including each link's remote-member roster and the cross-mesh oper-grant registry). Mandatory state and candidate capability must validate before adoption; incomplete state or a failed candidate leaves the serving process active. On Linux, the handler seals a memfd arena, probes the configured executable path's exact capability token (falling back to `/proc/self/exe` only when no path was recorded), and re-execs the pinned image with `--supervisor`. On Windows, it launches a native successor from the current executable path or an explicitly staged image, passes authenticated state and socket custody, and commits only after candidate validation. The Windows path requires a config file with explicit `[node].secret_key` and `[cloak].secret`; a staged image must be an absolute local `onyx-server*.exe` path beside the running image. See the [Windows guide](../../guide/windows.md#guarded-windows-helix-upgrade) for the handoff rules and smoke coverage.
+- Privileges: Registered command with a `server_restart` oper privilege check inside the handler; other clients receive `ERR_NOPRIVILEGES 481`.
+- Parameters: None by default; on Windows, one optional staged executable path.
 - Replies: Server notices such as sealed-session count or fail-closed refusal messages.
-- Errors: `ERR_NOPRIVILEGES 481`; notices for Linux-only, seal, plan, or exec failures.
-- Example: `UPGRADE`
-- Sources: `src/daemon/modules/upgrade.zig`, `src/daemon/server.zig` `handleMesh`, `handleUpgrade`, and `performUpgrade`
+- Errors: `ERR_NOPRIVILEGES 481`; notices for state, capability, config, seal, plan, or process-launch failures.
+- Example: `UPGRADE` or `UPGRADE :C:\onyx\onyx-server-next.exe` on Windows.
+- Sources: `src/daemon/modules/upgrade.zig` (`upgrade`), `src/daemon/server.zig` (`handleUpgradeCommand`, `performUpgrade`, `performUpgradeAfterCompatibleTarget`), and `src/daemon/helix/native_windows_runtime.zig` (`Driver.begin`, `Driver.transferAndCommit`).

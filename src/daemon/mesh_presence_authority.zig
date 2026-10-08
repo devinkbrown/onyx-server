@@ -18,6 +18,8 @@ const retained = @import("mesh_presence_retained.zig");
 const package = @import("mesh_presence_package.zig");
 const persistence = @import("store.zig");
 const lease_custody = @import("mesh_presence_lease.zig");
+const cold_runtime = @import("os_runtime.zig");
+const builtin = @import("builtin");
 
 pub const Error = error{ InvalidState, AlreadyInitialized, AuthoringDisabled, MutationActive, AlreadyConsumed, GenerationExhausted, InvalidClock, InvalidFrontier, MigrationRequired };
 pub const Config = struct {
@@ -29,6 +31,7 @@ pub const Authority = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     lease: std.Io.File,
+    owned_cold_dir: ?std.Io.Dir = null,
     durable: persistence.OroStore,
     retained_store: presence.Store,
     context: retained.LocalContext,
@@ -44,11 +47,15 @@ pub const Authority = struct {
     pub fn initialize(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, context: retained.LocalContext, store_id: [16]u8, key: *const sign.KeyPair, now_ms: i64, config: Config) !Authority {
         try requireKey(context, key);
         if (now_ms < 0) return error.InvalidClock;
-        if (try existingColdNamespace(allocator, io, dir, path)) return error.AlreadyInitialized;
-        const lease = try acquireProvisioningLease(allocator, io, dir, path);
+        const cold_dir: ?std.Io.Dir = if (comptime builtin.os.tag == .windows) try coldRuntimeDirectory(io, dir, path) else null;
+        errdefer if (cold_dir) |owned| owned.close(io);
+        const held_dir = if (cold_dir) |owned| owned else dir;
+        const held_path = if (comptime builtin.os.tag == .windows) std.fs.path.basename(path) else path;
+        if (try existingColdNamespace(allocator, io, held_dir, held_path)) return error.AlreadyInitialized;
+        const lease = try acquireProvisioningLease(allocator, io, held_dir, held_path);
         errdefer lease.close(io);
-        if (try existingColdNamespace(allocator, io, dir, path)) return error.AlreadyInitialized;
-        var provisioning = try persistence.FirstProvisionStage.init(allocator, io, dir, path, lease, config.storage);
+        if (try existingColdNamespace(allocator, io, held_dir, held_path)) return error.AlreadyInitialized;
+        var provisioning = try persistence.FirstProvisionStage.init(allocator, io, held_dir, held_path, lease, config.storage);
         defer provisioning.deinit();
         var store = try presence.Store.init(allocator, config.retained);
         errdefer store.deinit();
@@ -71,21 +78,22 @@ pub const Authority = struct {
         });
         try provisioning.commit();
         const durable = provisioning.takeCommittedStore();
-        return .{ .allocator = allocator, .io = io, .lease = lease, .durable = durable, .retained_store = store, .context = context, .metadata = metadata, .head = assembled.head.head, .local_authoring_disabled = assembled.local_authoring_disabled, .published_generation = store.generation };
+        return .{ .allocator = allocator, .io = io, .lease = lease, .owned_cold_dir = cold_dir, .durable = durable, .retained_store = store, .context = context, .metadata = metadata, .head = assembled.head.head, .local_authoring_disabled = assembled.local_authoring_disabled, .published_generation = store.generation };
     }
 
     /// Strict existing cold boot. Authenticate/reconstruct the entire OLD cut
     /// before staging the new epoch and retirement proof. No state is exposed
     /// until all four successor rows have durably committed together.
     pub fn openCold(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, context: retained.LocalContext, key: *const sign.KeyPair, now_ms: i64, config: Config) !Authority {
-        // Cold custody needs POSIX fds; unreachable in Windows production
-        // (plaintext PortableServer only), so tests skip via this one gate.
-        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
         try requireKey(context, key);
         if (now_ms < 0) return error.InvalidClock;
-        const lease = try acquireExistingColdLease(allocator, io, dir, path);
+        const cold_dir: ?std.Io.Dir = if (comptime builtin.os.tag == .windows) try coldRuntimeDirectory(io, dir, path) else null;
+        errdefer if (cold_dir) |owned| owned.close(io);
+        const held_dir = if (cold_dir) |owned| owned else dir;
+        const held_path = if (comptime builtin.os.tag == .windows) std.fs.path.basename(path) else path;
+        const lease = try acquireExistingColdLease(allocator, io, held_dir, held_path);
         errdefer lease.close(io);
-        var recovery = try persistence.ColdRecoveryStage.open(allocator, io, dir, path, lease, config.storage);
+        var recovery = try persistence.ColdRecoveryStage.open(allocator, io, held_dir, held_path, lease, config.storage);
         defer recovery.deinit();
         const durable = recovery.view();
         if (durable.get(.props, retained.head_key)) |raw_head| {
@@ -123,7 +131,7 @@ pub const Authority = struct {
         try batch.commit();
         _ = plan.commit();
         const published = recovery.takeCommittedStore();
-        return .{ .allocator = allocator, .io = io, .lease = lease, .durable = published, .retained_store = restored.store, .context = context, .metadata = metadata, .head = assembled.head.head, .local_authoring_disabled = assembled.local_authoring_disabled, .published_generation = restored.store.generation };
+        return .{ .allocator = allocator, .io = io, .lease = lease, .owned_cold_dir = cold_dir, .durable = published, .retained_store = restored.store, .context = context, .metadata = metadata, .head = assembled.head.head, .local_authoring_disabled = assembled.local_authoring_disabled, .published_generation = restored.store.generation };
     }
 
     /// Capture under the quiesced graph lock before sealing mandatory hot state.
@@ -151,6 +159,7 @@ pub const Authority = struct {
         self.durable.deinit();
         // Close only: an eventual hot duplicate must retain its shared lock.
         self.lease.close(self.io);
+        if (self.owned_cold_dir) |owned| owned.close(self.io);
         self.* = undefined;
     }
 
@@ -469,8 +478,28 @@ fn publish(owner: *Authority, value: wire.Record, origin: *const sign.KeyPair, l
     try plan.commit();
 }
 
+const TestTmpDir = struct {
+    backing: @TypeOf(std.testing.tmpDir(.{})),
+    dir: std.Io.Dir,
+
+    fn cleanup(self: *TestTmpDir) void {
+        if (comptime builtin.os.tag == .windows) self.dir.close(std.testing.io);
+        self.backing.cleanup();
+    }
+};
+
+fn testTmpDir() !TestTmpDir {
+    var backing = std.testing.tmpDir(.{});
+    errdefer backing.cleanup();
+    const dir = if (comptime builtin.os.tag == .windows)
+        try cold_runtime.createPrivateDirectoryWindows(backing.dir, "private")
+    else
+        backing.dir;
+    return .{ .backing = backing, .dir = dir };
+}
+
 test "mesh presence authority atomically provisions reserves publishes and advances cold epoch" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(131));
     defer key.deinit();
@@ -508,8 +537,92 @@ test "mesh presence authority atomically provisions reserves publishes and advan
     try std.testing.expectEqualDeep(cold.head, restored.head);
 }
 
-test "mesh presence authority durable expiry floor survives rollback renewal and cold boot" {
+test "mesh presence authority Windows holds its private cold directory after caller close" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    var private_open = true;
+    defer if (private_open) private.close(std.testing.io);
+    var key = try sign.KeyPair.fromSeed(@splat(247));
+    defer key.deinit();
+    var owner = try Authority.initialize(std.testing.allocator, std.testing.io, private, "presence.wal", contextFor(&key), @splat(51), &key, 1000, .{});
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    private.close(std.testing.io);
+    private_open = false;
+    try std.testing.expectError(error.WouldBlock, Authority.openCold(std.testing.allocator, std.testing.io, tmp.dir, "private/presence.wal", contextFor(&key), &key, 1100, .{}));
+    _ = try owner.reserveSubject(&key);
+    owner.deinit();
+    owner_live = false;
+    var cold = try Authority.openCold(std.testing.allocator, std.testing.io, tmp.dir, "private/presence.wal", contextFor(&key), &key, 1100, .{});
+    defer cold.deinit();
+    try std.testing.expectEqual(@as(u64, 2), cold.metadata.epoch);
+    try std.testing.expectEqual(@as(u64, 0), cold.metadata.issued_through);
+}
+
+test "mesh presence authority Windows rejects broad parent and lock ACL before state mutation" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var key = try sign.KeyPair.fromSeed(@splat(248));
+    defer key.deinit();
+    try std.testing.expectError(error.InsecurePermissions, Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "broad.wal", contextFor(&key), @splat(52), &key, 1000, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "broad.wal.lock", .{}));
+    const private = try cold_runtime.createPrivateDirectoryWindows(tmp.dir, "private");
+    defer private.close(std.testing.io);
+    {
+        var owner = try Authority.initialize(std.testing.allocator, std.testing.io, private, "protected.wal", contextFor(&key), @splat(52), &key, 1000, .{});
+        owner.deinit();
+    }
+    const before = try private.readFileAlloc(std.testing.io, "protected.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    try private.rename("protected.wal.lock", private, "saved.lock", std.testing.io);
+    {
+        const broad = try tmp.dir.createFile(std.testing.io, "protected.wal.lock", .{ .read = true });
+        defer broad.close(std.testing.io);
+        try broad.writePositionalAll(std.testing.io, "L", 0);
+    }
+    try tmp.dir.rename("protected.wal.lock", private, "protected.wal.lock", std.testing.io);
+    try std.testing.expectError(error.InsecurePermissions, Authority.openCold(std.testing.allocator, std.testing.io, private, "protected.wal", contextFor(&key), &key, 1100, .{}));
+    const after = try private.readFileAlloc(std.testing.io, "protected.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    const imported_lock = try private.readFileAlloc(std.testing.io, "protected.wal.lock", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(imported_lock);
+    try std.testing.expectEqualSlices(u8, "L", imported_lock);
+}
+
+test "mesh presence authority Windows cold refuses empty marker without repair" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = try testTmpDir();
+    defer tmp.cleanup();
+    var key = try sign.KeyPair.fromSeed(@splat(249));
+    defer key.deinit();
+    {
+        var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "empty-marker.wal", contextFor(&key), @splat(53), &key, 1000, .{});
+        owner.deinit();
+    }
+    const before = try tmp.dir.readFileAlloc(std.testing.io, "empty-marker.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    {
+        const lock = try tmp.dir.openFile(std.testing.io, "empty-marker.wal.lock", .{ .mode = .read_write });
+        defer lock.close(std.testing.io);
+        try lock.setLength(std.testing.io, 0);
+        try lock.sync(std.testing.io);
+    }
+    try std.testing.expectError(error.LockFailed, Authority.openCold(std.testing.allocator, std.testing.io, tmp.dir, "empty-marker.wal", contextFor(&key), &key, 1100, .{}));
+    try std.testing.expectError(error.AlreadyInitialized, Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "empty-marker.wal", contextFor(&key), @splat(53), &key, 1100, .{}));
+    const after = try tmp.dir.readFileAlloc(std.testing.io, "empty-marker.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    const lock = try tmp.dir.openFile(std.testing.io, "empty-marker.wal.lock", .{});
+    defer lock.close(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 0), (try lock.stat(std.testing.io)).size);
+}
+
+test "mesh presence authority durable expiry floor survives rollback renewal and cold boot" {
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var local = try sign.KeyPair.fromSeed(@splat(132));
     defer local.deinit();
@@ -572,10 +685,11 @@ test "mesh presence authority abort and poisoned four row frontier commit never 
     var remote = try sign.KeyPair.fromSeed(@splat(135));
     defer remote.deinit();
     for ([_]persistence.PreparedIoFault{ .{ .write = .failed }, .{ .write = .short }, .{ .sync = true } }) |fault| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "fault.wal", contextFor(&local), @splat(3), &local, 1000, .{});
-        defer owner.deinit();
+        var owner_live = true;
+        defer if (owner_live) owner.deinit();
         try publish(&owner, try recordFor(remote.public_key, .{ .epoch = 1, .counter = 1 }), &remote, &local, 1000);
         const before = owner.head;
         const generation = owner.retained_store.generation;
@@ -596,22 +710,26 @@ test "mesh presence authority abort and poisoned four row frontier commit never 
         try std.testing.expectEqual(@as(usize, 1), owner.retained_store.entries.items.len);
         try std.testing.expect(owner.winner("Guest", 1500, &.{remote.public_key}) == null);
         try std.testing.expectError(error.StorePoisoned, owner.reserveSubject(&local));
-        // Test-only replay under the held lease; poisoned owner cannot write.
+        // Windows keeps the live WAL HANDLE exclusive. Close the poisoned
+        // owner before independent replay; all RAM assertions precede close.
+        const metadata = owner.metadata;
+        owner.deinit();
+        owner_live = false;
         var recovered = try persistence.OroStore.openWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "fault.wal", .{ .changefeed_capacity = 0 });
         defer recovered.deinit();
-        var restored = try image.stageRestore(std.testing.allocator, &recovered, owner.context, .{});
+        var restored = try image.stageRestore(std.testing.allocator, &recovered, contextFor(&local), .{});
         defer restored.deinit();
         const old = restored.head.commit_generation == before.commit_generation;
         try std.testing.expect(old or restored.head.commit_generation == before.commit_generation + 1);
         try std.testing.expectEqual(if (old) @as(usize, 1) else 0, restored.store.entries.items.len);
         try std.testing.expectEqual(if (old) @as(usize, 1) else 2, restored.store.frontiers.items.len);
-        try std.testing.expectEqual(owner.metadata.epoch, restored.head.epoch);
-        try std.testing.expectEqual(owner.metadata.issued_through, restored.head.issued_through);
+        try std.testing.expectEqual(metadata.epoch, restored.head.epoch);
+        try std.testing.expectEqual(metadata.issued_through, restored.head.issued_through);
     }
 }
 
 test "mesh presence authority preserves local quarantine across cold epoch and disables issuance" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(136));
     defer key.deinit();
@@ -636,10 +754,7 @@ test "mesh presence authority preserves local quarantine across cold epoch and d
 }
 
 test "mesh presence authority uses actual WAL limits and refuses partial enabled state" {
-    // Cold authority custody is POSIX-only; Windows cannot run this end-to-end
-    // lease/provisioning proof until native cold custody is implemented.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(137));
     defer key.deinit();
@@ -665,7 +780,7 @@ test "mesh presence authority uses actual WAL limits and refuses partial enabled
 }
 
 fn constructorAllocationScenario(allocator: std.mem.Allocator, key: *const sign.KeyPair, cold: bool) !void {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     const context = contextFor(key);
     const config: Config = .{ .retained = .{ .max_entries = 4, .max_origins = 4 } };
@@ -722,7 +837,7 @@ test "mesh presence authority exhaustive constructor allocation failures preserv
 }
 
 fn mutationAllocationScenario(allocator: std.mem.Allocator, local: *const sign.KeyPair, remote: *const sign.KeyPair, retire: bool) !void {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     const config: Config = .{ .retained = .{ .max_entries = 4, .max_origins = 4 } };
     var owner = try Authority.initialize(allocator, std.testing.io, tmp.dir, "mutation.wal", contextFor(local), @splat(7), local, 1000, config);
@@ -783,10 +898,11 @@ test "mesh presence authority reservation and expiry faults leave cache old and 
     var local = try sign.KeyPair.fromSeed(@splat(141));
     defer local.deinit();
     for ([_]bool{ false, true }) |expiry| for ([_]persistence.PreparedIoFault{ .{ .write = .failed }, .{ .write = .short }, .{ .sync = true } }) |fault| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "headfault.wal", contextFor(&local), @splat(8), &local, 1000, .{});
-        defer owner.deinit();
+        var owner_live = true;
+        defer if (owner_live) owner.deinit();
         const before = owner.head;
         owner.durable.setPreparedIoFault(fault);
         if (expiry) {
@@ -796,9 +912,11 @@ test "mesh presence authority reservation and expiry faults leave cache old and 
         try std.testing.expectEqual(@as(u64, 0), owner.metadata.issued_through);
         try std.testing.expectError(error.StorePoisoned, owner.observeExpiry(2200, &local));
         try std.testing.expectError(error.StorePoisoned, owner.reserveSubject(&local));
+        owner.deinit();
+        owner_live = false;
         var recovered = try persistence.OroStore.openWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "headfault.wal", .{ .changefeed_capacity = 0 });
         defer recovered.deinit();
-        var restored = try image.stageRestore(std.testing.allocator, &recovered, owner.context, .{});
+        var restored = try image.stageRestore(std.testing.allocator, &recovered, contextFor(&local), .{});
         defer restored.deinit();
         const old = restored.head.commit_generation == before.commit_generation;
         try std.testing.expect(old or restored.head.commit_generation == before.commit_generation + 1);
@@ -810,7 +928,7 @@ test "mesh presence authority reservation and expiry faults leave cache old and 
 }
 
 test "mesh presence authority enabled package excludes legacy issuer with byte identical WAL" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(150));
     defer key.deinit();
@@ -834,7 +952,7 @@ test "mesh presence authority enabled package excludes legacy issuer with byte i
 }
 
 test "mesh presence authority every four row negative cut append prefix recovers whole package and retries" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var local = try sign.KeyPair.fromSeed(@splat(151));
     defer local.deinit();
@@ -846,7 +964,7 @@ test "mesh presence authority every four row negative cut append prefix recovers
     var append_offset: usize = undefined;
     var old_head: retained.Head = undefined;
     var new_head: retained.Head = undefined;
-    const bytes = block: {
+    {
         var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "complete.wal", context, @splat(10), &local, 1000, .{});
         defer owner.deinit();
         try publish(&owner, try recordFor(remote.public_key, .{ .epoch = 1, .counter = 1 }), &remote, &local, 1000);
@@ -856,14 +974,18 @@ test "mesh presence authority every four row negative cut append prefix recovers
         defer plan.abort();
         try plan.commit();
         new_head = owner.head;
-        break :block try tmp.dir.readFileAlloc(std.testing.io, "complete.wal", std.testing.allocator, .unlimited);
-    };
+    }
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "complete.wal", std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(bytes);
     // Include the complete append, not only torn prefixes. The negative proof
     // must become permanent exactly when the whole four-row record is present.
     for (append_offset..bytes.len + 1) |cut| {
         {
-            const file = try tmp.dir.createFile(std.testing.io, "cut.wal", .{ .read = true, .truncate = true });
+            const file: std.Io.File = if (comptime builtin.os.tag == .windows) blk: {
+                tmp.dir.deleteFile(std.testing.io, "cut.wal") catch |err| if (err != error.FileNotFound) return err;
+                tmp.dir.deleteFile(std.testing.io, "cut.wal.snap") catch |err| if (err != error.FileNotFound) return err;
+                break :blk try cold_runtime.createPrivateExclusiveWindows(tmp.dir, "cut.wal");
+            } else try tmp.dir.createFile(std.testing.io, "cut.wal", .{ .read = true, .truncate = true });
             defer file.close(std.testing.io);
             try file.writePositionalAll(std.testing.io, bytes[0..cut], 0);
             try file.sync(std.testing.io);
@@ -886,6 +1008,10 @@ test "mesh presence authority every four row negative cut append prefix recovers
         // itself proves authenticated-prefix recovery, not a pre-repaired input.
         {
             const fixture_lock = try tmp.dir.createFile(std.testing.io, "cut.wal.lock", .{ .read = true, .truncate = false });
+            if (comptime builtin.os.tag == .windows) {
+                try fixture_lock.writePositionalAll(std.testing.io, "L", 0);
+                try fixture_lock.sync(std.testing.io);
+            }
             fixture_lock.close(std.testing.io);
             const file = try tmp.dir.openFile(std.testing.io, "cut.wal", .{ .mode = .read_write });
             defer file.close(std.testing.io);
@@ -925,7 +1051,7 @@ test "mesh presence authority snapshot truncate faults preserve authenticated ne
     var buffer: [frontier.prefix_len + sign.signature_len]u8 = undefined;
     const proof = try frontier.encode(.{ .origin = remote.public_key, .epoch = 1, .revision = 1, .through = 1, .issued_ms = 1000, .active = &.{} }, &remote, &buffer);
     for (faults, 0..) |fault, index| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var before: retained.Head = undefined;
         {
@@ -1024,7 +1150,7 @@ test "mesh presence authority actual Linux SIGKILL at prepared WAL boundaries re
     var buffer: [frontier.prefix_len + sign.signature_len]u8 = undefined;
     const proof = try frontier.encode(.{ .origin = remote.public_key, .epoch = 1, .revision = 1, .through = 1, .issued_ms = 1000, .active = &.{} }, &remote, &buffer);
     for (0..4) |boundary| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var expected: retained.Head = undefined;
         {
@@ -1079,6 +1205,18 @@ fn expectAuthorityDiskProjection(owner: *Authority) !void {
     try std.testing.expectEqualSlices(u8, current.bytes, disk.bytes);
     try std.testing.expectEqualSlices(u8, current.bytes, owner.durable.get(.props, retained.image_key).?);
 }
+
+// The live Windows WAL HANDLE is exclusive. Inspect exact bytes through that
+// same owned object while authority remains active, then use an independent
+// opener only after owner.deinit() releases custody.
+fn ownedWalBytesForTest(owner: *Authority) ![]u8 {
+    const file = owner.durable.wal_file orelse return error.TestUnexpectedResult;
+    const size = (try file.stat(owner.io)).size;
+    const bytes = try std.testing.allocator.alloc(u8, std.math.cast(usize, size) orelse return error.TestUnexpectedResult);
+    errdefer std.testing.allocator.free(bytes);
+    if (try file.readPositionalAll(owner.io, bytes, 0) != bytes.len) return error.TestUnexpectedResult;
+    return bytes;
+}
 fn publishLifecycle(owner: *Authority, value: wire.Record, through: u64, active: []const u64, now_ms: i64, key: *const sign.KeyPair) !void {
     var buffer: [wire.max_wire_len]u8 = undefined;
     const generation = owner.retained_store.generation;
@@ -1094,7 +1232,7 @@ fn publishLifecycle(owner: *Authority, value: wire.Record, through: u64, active:
 }
 
 test "mesh presence authority compound lifecycle replaces at capacity renews renames and certifies quit" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(157));
     defer key.deinit();
@@ -1151,7 +1289,7 @@ test "mesh presence authority compound lifecycle replaces at capacity renews ren
 }
 
 test "mesh presence authority compound stale plan fails before WAL and abort remains owned" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(158));
     defer key.deinit();
@@ -1178,7 +1316,7 @@ test "mesh presence authority compound stale plan fails before WAL and abort rem
 }
 
 fn lifecycleAllocationScenario(allocator: std.mem.Allocator, key: *const sign.KeyPair) !void {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     const config: Config = .{ .retained = .{ .max_entries = 1, .max_origins = 2 } };
     var owner = try Authority.initialize(allocator, std.testing.io, tmp.dir, "lifecycle-oom.wal", contextFor(key), @splat(16), key, 1000, config);
@@ -1228,7 +1366,7 @@ test "mesh presence authority compound lifecycle exhaustive allocation failures 
 }
 
 test "mesh presence authority compound WAL quit every append prefix restores old or whole terminal cut" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(160));
     defer key.deinit();
@@ -1236,7 +1374,7 @@ test "mesh presence authority compound WAL quit every append prefix restores old
     var append_offset: usize = undefined;
     var old_head: retained.Head = undefined;
     var new_head: retained.Head = undefined;
-    const bytes = block: {
+    {
         var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "quit-complete.wal", context, @splat(17), &key, 1000, .{});
         defer owner.deinit();
         var value = try recordFor(key.public_key, try owner.reserveSubject(&key));
@@ -1250,12 +1388,16 @@ test "mesh presence authority compound WAL quit every append prefix restores old
         defer plan.abort();
         try plan.commit();
         new_head = owner.head;
-        break :block try tmp.dir.readFileAlloc(std.testing.io, "quit-complete.wal", std.testing.allocator, .unlimited);
-    };
+    }
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "quit-complete.wal", std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(bytes);
     for (append_offset..bytes.len + 1) |cut| {
         {
-            const file = try tmp.dir.createFile(std.testing.io, "quit-cut.wal", .{ .read = true, .truncate = true });
+            const file: std.Io.File = if (comptime builtin.os.tag == .windows) blk: {
+                tmp.dir.deleteFile(std.testing.io, "quit-cut.wal") catch |err| if (err != error.FileNotFound) return err;
+                tmp.dir.deleteFile(std.testing.io, "quit-cut.wal.snap") catch |err| if (err != error.FileNotFound) return err;
+                break :blk try cold_runtime.createPrivateExclusiveWindows(tmp.dir, "quit-cut.wal");
+            } else try tmp.dir.createFile(std.testing.io, "quit-cut.wal", .{ .read = true, .truncate = true });
             defer file.close(std.testing.io);
             try file.writePositionalAll(std.testing.io, bytes[0..cut], 0);
             try file.sync(std.testing.io);
@@ -1280,6 +1422,10 @@ test "mesh presence authority compound WAL quit every append prefix restores old
         // itself proves authenticated-prefix recovery, not a pre-repaired input.
         {
             const fixture_lock = try tmp.dir.createFile(std.testing.io, "quit-cut.wal.lock", .{ .read = true, .truncate = false });
+            if (comptime builtin.os.tag == .windows) {
+                try fixture_lock.writePositionalAll(std.testing.io, "L", 0);
+                try fixture_lock.sync(std.testing.io);
+            }
             fixture_lock.close(std.testing.io);
             const file = try tmp.dir.openFile(std.testing.io, "quit-cut.wal", .{ .mode = .read_write });
             defer file.close(std.testing.io);
@@ -1302,10 +1448,11 @@ test "mesh presence authority compound ambiguous commit keeps old RAM and recove
     var key = try sign.KeyPair.fromSeed(@splat(161));
     defer key.deinit();
     for ([_]persistence.PreparedIoFault{ .{ .write = .failed }, .{ .write = .short }, .{ .sync = true } }) |fault| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "compound-fault.wal", contextFor(&key), @splat(18), &key, 1000, .{});
-        defer owner.deinit();
+        var owner_live = true;
+        defer if (owner_live) owner.deinit();
         var value = try recordFor(key.public_key, try owner.reserveSubject(&key));
         try publishLifecycle(&owner, value, 1, &.{1}, 1000, &key);
         const before = owner.head;
@@ -1323,11 +1470,13 @@ test "mesh presence authority compound ambiguous commit keeps old RAM and recove
         try std.testing.expectEqual(@as(usize, 1), owner.retained_store.entries.items.len);
         try std.testing.expect(owner.winner("Guest", 1500, &.{key.public_key}) == null);
         try std.testing.expectError(error.StorePoisoned, owner.reserveSubject(&key));
-        // Test-only inspection while poisoned owner holds custody. No further
-        // writes or output are authorized until it closes and cold reconstruction.
+        // Replay independently after the exclusive Windows WAL owner closes.
+        // All poisoned-RAM assertions above retain its original custody.
+        owner.deinit();
+        owner_live = false;
         var recovered = try persistence.OroStore.openWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "compound-fault.wal", .{ .changefeed_capacity = 0 });
         defer recovered.deinit();
-        var restored = try image.stageRestore(std.testing.allocator, &recovered, owner.context, .{});
+        var restored = try image.stageRestore(std.testing.allocator, &recovered, contextFor(&key), .{});
         defer restored.deinit();
         const old = restored.head.commit_generation == before.commit_generation;
         try std.testing.expectEqualDeep(if (old) before else successor, restored.head);
@@ -1341,8 +1490,7 @@ test "mesh presence authority compound ambiguous commit keeps old RAM and recove
 // Safe namespace revalidation for capture/adoption as well as cold constructors.
 // This does not change the inherited-description proof or activation boundary.
 fn validateAuthorityLease(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, file: std.Io.File, expected: lease_custody.Identity) !void {
-    // Cold custody needs POSIX fds; unreachable in Windows production
-    // (plaintext PortableServer only), so tests skip via this one gate.
+    // Cross-process hot custody still requires a POSIX inherited description.
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     if (!std.meta.eql(expected, try lease_custody.statRegular(file.handle))) return error.IdentityMismatch;
     const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
@@ -1351,6 +1499,18 @@ fn validateAuthorityLease(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.
     defer configured.close(io);
     if (!std.meta.eql(expected, try lease_custody.statRegular(configured.handle))) return error.IdentityMismatch;
     try lease_custody.reaffirmExclusive(file.handle);
+}
+
+// Windows cold storage borrows the caller's path only long enough to open its
+// actual protected parent. All later lease, WAL, snapshot, and temporary-file
+// operations use the held directory HANDLE and a single validated leaf name.
+fn coldRuntimeDirectory(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.Dir {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    const name = std.fs.path.basename(path);
+    if (name.len == 0 or name.len > 128 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+        name[name.len - 1] == '.' or name[name.len - 1] == ' ') return error.BadPathName;
+    for (name) |byte| if (byte == '/' or byte == '\\' or byte == ':' or byte < 0x20) return error.BadPathName;
+    return cold_runtime.openPrivateDirectoryWindows(io, dir, std.fs.path.dirname(path) orelse ".");
 }
 
 // Existing-state custody is open-only; provisioning is the sole creator.
@@ -1362,57 +1522,71 @@ fn existingColdNamespace(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.D
             file.close(io);
             return true;
         } else |err| {
-            // `openColdExisting` only supports linux/openbsd/freebsd; compare
-            // so this compiles where `FileNotFound` is absent from its set.
-            if (err != error.FileNotFound) {
-                // Windows has no cold namespace at all; report absent so
-                // callers reach their own Windows gates (SkipZigTest).
-                if (@import("builtin").os.tag == .windows and err == error.Unsupported) return false;
-                return err;
-            }
+            if (err != error.FileNotFound) return err;
         }
     }
     return false;
 }
 
 fn acquireExistingColdLease(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
-    // Raw-fd lease custody; Windows HANDLEs cannot compile the body below.
-    // Unreachable in Windows production; tests skip via this.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    return acquireExistingLease(allocator, io, dir, path, false);
+}
+
+fn acquireExistingLease(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, provisioning: bool) !std.Io.File {
     const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
     defer allocator.free(lock_path);
     const file = try persistence.openColdExisting(io, dir, lock_path, .read_write);
     errdefer file.close(io);
     const identity = try lease_custody.statRegular(file.handle);
-    try lease_custody.reaffirmExclusive(file.handle);
+    if (comptime builtin.os.tag == .windows) {
+        // Cold entry must never fix a missing marker or permissive ACL.
+        try cold_runtime.requireInheritedPrivateFileWindows(file);
+        if (!try file.tryLock(io, .exclusive)) return error.WouldBlock;
+    } else try lease_custody.reaffirmExclusive(file.handle);
     const configured = try persistence.openColdExisting(io, dir, lock_path, .read_only);
     defer configured.close(io);
     if (!std.meta.eql(identity, try lease_custody.statRegular(configured.handle))) return error.IdentityMismatch;
+    if (comptime builtin.os.tag == .windows) {
+        if (provisioning and (try file.stat(io)).size == 0) {
+            try file.writePositionalAll(io, "L", 0);
+            try file.sync(io);
+        }
+        _ = try lease_custody.validateInherited(allocator, io, dir, path, file, identity);
+    }
     return file;
 }
 
 fn acquireProvisioningLease(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
-    // Same Windows gate as `acquireExistingColdLease`: raw-fd custody below.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
     defer allocator.free(lock_path);
     const permissions: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file;
     const file = dir.createFile(io, lock_path, .{ .read = true, .truncate = false, .exclusive = true, .permissions = permissions }) catch |err| switch (err) {
-        error.PathAlreadyExists => return acquireExistingColdLease(allocator, io, dir, path),
+        error.PathAlreadyExists => return acquireExistingLease(allocator, io, dir, path, true),
         else => return err,
     };
     errdefer file.close(io);
     const identity = try lease_custody.statRegular(file.handle);
-    try lease_custody.reaffirmExclusive(file.handle);
+    if (comptime builtin.os.tag == .windows) {
+        try cold_runtime.requireInheritedPrivateFileWindows(file);
+        if (!try file.tryLock(io, .exclusive)) return error.WouldBlock;
+    } else try lease_custody.reaffirmExclusive(file.handle);
     const configured = try persistence.openColdExisting(io, dir, lock_path, .read_only);
     defer configured.close(io);
     if (!std.meta.eql(identity, try lease_custody.statRegular(configured.handle))) return error.IdentityMismatch;
+    if (comptime builtin.os.tag == .windows) {
+        // Only provisioning may initialize the locked custody byte.
+        if ((try file.stat(io)).size == 0) {
+            try file.writePositionalAll(io, "L", 0);
+            try file.sync(io);
+        }
+        _ = try lease_custody.validateInherited(allocator, io, dir, path, file, identity);
+    }
     return file;
 }
 
 const hot_runtime = @import("os_runtime.zig");
 test "retained v2 causal existing cold state must not create missing lock" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(231));
     defer key.deinit();
@@ -1445,7 +1619,7 @@ fn hotSupported() bool {
 
 test "mesh presence hot authority stage preserves exact epoch floor negatives and readonly barrier" {
     if (comptime !hotSupported()) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var local = try sign.KeyPair.fromSeed(@splat(180));
     defer local.deinit();
@@ -1501,7 +1675,7 @@ test "mesh presence hot authority stage preserves exact epoch floor negatives an
 
 test "mesh presence hot authority abort closes duplicate only and leaves predecessor WAL custody" {
     if (comptime !hotSupported()) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(182));
     defer key.deinit();
@@ -1528,7 +1702,7 @@ test "mesh presence hot authority abort closes duplicate only and leaves predece
 
 test "mesh presence hot authority rejects reopened type inode context UUID and stale head before publication" {
     if (comptime !hotSupported()) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(183));
     defer key.deinit();
@@ -1574,7 +1748,7 @@ test "mesh presence hot authority rejects reopened type inode context UUID and s
 }
 
 fn hotStageAllocationScenario(allocator: std.mem.Allocator, key: *const sign.KeyPair, remote: *const sign.KeyPair) !void {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var parent = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "hot-oom.wal", contextFor(key), @splat(21), key, 1000, .{});
     defer parent.deinit();
@@ -1618,7 +1792,7 @@ test "mesh presence hot authority exhaustive allocation failures close only and 
 
 test "mesh presence hot checkpoint refuses active mutations readonly poison generation and cached authority mismatch" {
     if (comptime !hotSupported()) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(187));
     defer key.deinit();
@@ -1658,7 +1832,7 @@ fn hotForbiddenClose(_: ?*anyopaque, _: []const std.Io.File) void {
 }
 
 test "mesh presence group causal grouped rejection preserves both then atomic rename advances once" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(189));
     defer key.deinit();
@@ -1722,12 +1896,13 @@ fn initializeGroupFixture(owner: *Authority, key: *const sign.KeyPair) ![2]wire.
 }
 
 test "mesh presence group authority mixed quit rename owns originals and strictly restores normalized package" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(190));
     defer key.deinit();
     var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "group-mixed.wal", contextFor(&key), @splat(25), &key, 1000, .{ .retained = .{ .max_entries = 2, .max_origins = 1 } });
-    defer owner.deinit();
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
     var values = try initializeGroupFixture(&owner, &key);
     values[0].operation = .quit;
     values[0].revision = 2;
@@ -1757,19 +1932,23 @@ test "mesh presence group authority mixed quit rename owns originals and strictl
     }
     try std.testing.expectError(error.AlreadyConsumed, plan.commit());
     try expectAuthorityDiskProjection(&owner);
-    var restored_disk = try persistence.OroStore.openReadOnlyWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "group-mixed.wal", .{ .changefeed_capacity = 0 });
-    defer restored_disk.deinit();
-    var restored = try image.stageRestore(std.testing.allocator, &restored_disk, owner.context, owner.retained_store.config);
-    defer restored.deinit();
-    try std.testing.expectEqualDeep(owner.head, restored.head);
-    try std.testing.expectEqual(@as(usize, 1), restored.store.entries.items.len);
-    try std.testing.expectEqualSlices(u8, originals[1], restored.store.entries.items[0].original);
+    const committed = owner.head;
+    const config = owner.retained_store.config;
     plan.deinit();
     try std.testing.expectEqual(@as(usize, 0), plan.originalCount());
+    owner.deinit();
+    owner_live = false;
+    var restored_disk = try persistence.OroStore.openReadOnlyWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "group-mixed.wal", .{ .changefeed_capacity = 0 });
+    defer restored_disk.deinit();
+    var restored = try image.stageRestore(std.testing.allocator, &restored_disk, contextFor(&key), config);
+    defer restored.deinit();
+    try std.testing.expectEqualDeep(committed, restored.head);
+    try std.testing.expectEqual(@as(usize, 1), restored.store.entries.items.len);
+    try std.testing.expectEqualSlices(u8, originals[1], restored.store.entries.items[0].original);
 }
 
 test "mesh presence group authority rejects empty duplicate foreign epoch highwater active and tampered tickets before WAL" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(191));
     defer key.deinit();
@@ -1783,7 +1962,7 @@ test "mesh presence group authority rejects empty duplicate foreign epoch highwa
     const a = try wire.encode(values[0], &key, &buffers[0]);
     var b = try wire.encode(values[1], &key, &buffers[1]);
     const before = owner.head;
-    const before_wal = try tmp.dir.readFileAlloc(std.testing.io, "group-invalid.wal", std.testing.allocator, .unlimited);
+    const before_wal = try ownedWalBytesForTest(&owner);
     defer std.testing.allocator.free(before_wal);
     try std.testing.expectError(error.InvalidLocalLifecycle, owner.prepareLocalLifecycles(&.{}, 2, &.{ 1, 2 }, 1000, &key));
     try std.testing.expectError(error.InvalidLocalLifecycle, owner.prepareLocalLifecycles(&.{ a, a }, 2, &.{ 1, 2 }, 1000, &key));
@@ -1812,7 +1991,7 @@ test "mesh presence group authority rejects empty duplicate foreign epoch highwa
     owner.retained_store.generation += 1;
     try std.testing.expectError(error.InvalidPlan, plan.commit());
     owner.retained_store.generation -= 1;
-    const after_wal = try tmp.dir.readFileAlloc(std.testing.io, "group-invalid.wal", std.testing.allocator, .unlimited);
+    const after_wal = try ownedWalBytesForTest(&owner);
     defer std.testing.allocator.free(after_wal);
     try std.testing.expectEqualSlices(u8, before_wal, after_wal);
     try std.testing.expectEqualDeep(before, owner.head);
@@ -1827,7 +2006,7 @@ test "mesh presence group authority exhaustive allocation rollback retry and no 
     defer key.deinit();
     var index: usize = 0;
     while (index < 10000) : (index += 1) {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         var owner = try Authority.initialize(failing.allocator(), std.testing.io, tmp.dir, "group-oom.wal", contextFor(&key), @splat(27), &key, 1000, .{ .retained = .{ .max_entries = 2, .max_origins = 1 } });
@@ -1841,7 +2020,7 @@ test "mesh presence group authority exhaustive allocation rollback retry and no 
         const originals = [_][]const u8{ try wire.encode(values[0], &key, &buffers[0]), try wire.encode(values[1], &key, &buffers[1]) };
         const before = owner.head;
         const generation = owner.retained_store.generation;
-        const wal = try tmp.dir.readFileAlloc(std.testing.io, "group-oom.wal", std.testing.allocator, .unlimited);
+        const wal = try ownedWalBytesForTest(&owner);
         defer std.testing.allocator.free(wal);
         failing.fail_index = failing.alloc_index + index;
         var plan = owner.prepareLocalLifecycles(&originals, 2, &.{}, 1000, &key) catch |err| {
@@ -1851,7 +2030,7 @@ test "mesh presence group authority exhaustive allocation rollback retry and no 
             try std.testing.expect(owner.active_generation == null);
             try std.testing.expect(owner.durable.active_batch == null);
             try std.testing.expect(!owner.durable.preparedWritesPoisoned());
-            const after = try tmp.dir.readFileAlloc(std.testing.io, "group-oom.wal", std.testing.allocator, .unlimited);
+            const after = try ownedWalBytesForTest(&owner);
             defer std.testing.allocator.free(after);
             try std.testing.expectEqualSlices(u8, wal, after);
             try std.testing.expect(owner.winner("First", 1000, &.{key.public_key}) != null);
@@ -1889,7 +2068,7 @@ test "mesh presence group authority failed and ambiguous WAL never publish parti
     var key = try sign.KeyPair.fromSeed(@splat(194));
     defer key.deinit();
     for ([_]persistence.PreparedIoFault{ .{ .write = .failed }, .{ .write = .short }, .{ .sync = true } }, 0..) |fault, i| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "group-fault.wal", contextFor(&key), @splat(28), &key, 1000, .{});
         var owned = true;
@@ -1937,14 +2116,14 @@ test "mesh presence group authority failed and ambiguous WAL never publish parti
 }
 
 test "mesh presence group authority every multi quit append prefix restores old or whole group" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(195));
     defer key.deinit();
     var offset: usize = undefined;
     var old_head: retained.Head = undefined;
     var new_head: retained.Head = undefined;
-    const bytes = block: {
+    {
         var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "group-complete.wal", contextFor(&key), @splat(29), &key, 1000, .{});
         defer owner.deinit();
         var values = try initializeGroupFixture(&owner, &key);
@@ -1960,8 +2139,8 @@ test "mesh presence group authority every multi quit append prefix restores old 
         defer plan.deinit();
         try plan.commit();
         new_head = owner.head;
-        break :block try tmp.dir.readFileAlloc(std.testing.io, "group-complete.wal", std.testing.allocator, .unlimited);
-    };
+    }
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "group-complete.wal", std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(bytes);
     for (offset..bytes.len + 1) |cut| {
         {
@@ -2028,7 +2207,7 @@ test "mesh presence group authority actual supported POSIX SIGKILL at grouped pr
     var key = try sign.KeyPair.fromSeed(@splat(196));
     defer key.deinit();
     for (0..4) |boundary| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var expected: retained.Head = undefined;
         {
@@ -2067,7 +2246,7 @@ test "mesh presence group authority actual supported POSIX SIGKILL at grouped pr
 
 test "mesh presence hot activation preserves local quarantine with no allocation or descriptor close" {
     if (comptime !hotSupported()) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(188));
     defer key.deinit();
@@ -2108,7 +2287,7 @@ test "mesh presence hot activation preserves local quarantine with no allocation
 
 test "mesh presence retained v2 grouped class changes preserve hot exact originals and cold negatives" {
     if (comptime !hotSupported()) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(233));
     defer key.deinit();
@@ -2204,14 +2383,12 @@ fn legacyHeadForTest(head: retained.Head, image_bytes: []const u8, key: *const s
 }
 
 test "mesh presence retained v2 cold refuses legacy unknown mixed realm and key without repairing suffix" {
-    // Raw-fd lease custody; Windows HANDLEs cannot compile it.
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var key = try sign.KeyPair.fromSeed(@splat(234));
     defer key.deinit();
     var wrong = try sign.KeyPair.fromSeed(@splat(235));
     defer wrong.deinit();
     for (0..5) |kind| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         {
             var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "schema.wal", contextFor(&key), @splat(34), &key, 1000, .{});
@@ -2407,7 +2584,7 @@ test "mesh presence retained v2 actual POSIX SIGKILL cold snapshot epoch and suc
     const context = contextFor(&key);
     for ([_]bool{ false, true }) |empty_covered| {
         for (0..34) |boundary| {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = try testTmpDir();
             defer tmp.cleanup();
             var expected: retained.Head = undefined;
             var before_seq: u64 = undefined;
@@ -2515,7 +2692,7 @@ test "mesh presence retained v2 every cold replacement successor prefix authenti
     defer key.deinit();
     const context = contextFor(&key);
     for ([_]bool{ false, true }) |empty| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         {
             var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "prefix-source.wal", context, @splat(36), &key, 1000, .{});
@@ -2604,7 +2781,7 @@ test "mesh presence retained v2 refuses bad lease symlink and existing partial n
     var key = try sign.KeyPair.fromSeed(@splat(243));
     defer key.deinit();
     for (0..4) |kind| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         {
             var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "bad-path.wal", contextFor(&key), @splat(37), &key, 1000, .{});
@@ -2632,7 +2809,7 @@ test "mesh presence retained v2 refuses bad lease symlink and existing partial n
         try std.testing.expectEqualSlices(u8, bytes, after);
     }
     for ([_][]const u8{ "partial.wal", "partial.wal.snap" }) |path| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         const file = try tmp.dir.createFile(std.testing.io, path, .{});
         file.close(std.testing.io);
@@ -2644,7 +2821,7 @@ test "mesh presence retained v2 refuses bad lease symlink and existing partial n
     // An interrupted genuinely absent provisioning attempt may leave only its
     // stable lock. Explicit initialize reopens that inode and retries; it never
     // guesses absence from any existing WAL or snapshot, even an empty file.
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     const lock = try tmp.dir.createFile(std.testing.io, "retry.wal.lock", .{ .read = true });
     const identity = try lease_custody.statRegular(lock.handle);
@@ -2660,7 +2837,7 @@ test "mesh presence retained v2 legacy every tolerated append prefix and empty c
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     var key = try sign.KeyPair.fromSeed(@splat(244));
     defer key.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var legacy_packet: []u8 = undefined;
     var before_wal: []u8 = undefined;
@@ -2738,7 +2915,7 @@ test "mesh presence retained v2 legacy every tolerated append prefix and empty c
 fn hotCaptureMismatchScenario(kind: enum { cached_class, admission, signed_original }) !void {
     // Raw-fd lease custody; Windows HANDLEs cannot compile it.
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(245));
     defer key.deinit();
@@ -2786,7 +2963,7 @@ test "retained v2 causal hot capture refuses another self consistent signed orig
 fn captureAllocationScenario(allocator: std.mem.Allocator, key: *const sign.KeyPair) !void {
     // Raw-fd lease custody; Windows HANDLEs cannot compile it.
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "capture-oom.wal", contextFor(key), @splat(54), key, 1000, .{});
     defer owner.deinit();
@@ -2925,7 +3102,7 @@ test "retained v2 causal actual live Authority threshold compaction every epoch 
     defer remote.deinit();
     var refusals: usize = 0;
     for (0..26) |prefix| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try testTmpDir();
         defer tmp.cleanup();
         var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "live-prefix.wal", contextFor(&key), @splat(68), &key, 1000, .{});
         var owner_live = true;
@@ -2990,7 +3167,7 @@ test "retained v2 causal actual live Authority threshold compaction every epoch 
 fn liveCompactionBoundaryScenario(mode: LiveKillMode, prefix: usize) !usize {
     const os = @import("builtin").os.tag;
     if (comptime os != .linux and os != .openbsd and os != .freebsd) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try testTmpDir();
     defer tmp.cleanup();
     var key = try sign.KeyPair.fromSeed(@splat(205));
     defer key.deinit();

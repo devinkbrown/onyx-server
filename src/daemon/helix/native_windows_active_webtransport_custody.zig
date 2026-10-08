@@ -61,6 +61,10 @@ pub const Prepared = struct {
 /// provide every candidate client row (not only suspected WebTransport peers).
 pub const AcceptedIrcSocket = codec.AcceptedIrcSocket;
 
+fn logPrepareFailure(comptime stage: []const u8, err: anyerror) void {
+    std.debug.print("onyx-server: Windows active WebTransport {s} failed: {s}\n", .{ stage, @errorName(err) });
+}
+
 fn canonicalTcpEndpoint(endpoint: io_backend.WindowsTcpEndpoint) !listener.TransportAddress {
     const bytes: []const u8 = switch (endpoint.address) {
         .ipv4 => |*address| address,
@@ -173,18 +177,36 @@ pub fn prepare(
     target_pid: u32,
     upgrade_id: envelope.UpgradeId,
 ) Error!Prepared {
-    try validateTarget(target_process, target_pid);
-    var snapshot = owner.capturePausedActive(token, allocator) catch |err|
+    validateTarget(target_process, target_pid) catch |err| {
+        logPrepareFailure("target validation", err);
+        return err;
+    };
+    var snapshot = owner.capturePausedActive(token, allocator) catch |err| {
+        logPrepareFailure("paused QUIC snapshot capture", err);
         return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidSnapshot;
+    };
     var snapshot_owned = true;
     defer if (snapshot_owned) snapshot.deinit(allocator);
-    if (accepted.len > codec.max_accepted_clients) return error.InvalidSnapshot;
-    for (accepted) |entry| {
-        const current = observeAcceptedIrcSocket(entry.fd) catch return error.InvalidSnapshot;
-        if (!listener.TransportAddress.eql(current.local, entry.local) or
-            !listener.TransportAddress.eql(current.peer, entry.peer)) return error.InvalidSnapshot;
+    if (accepted.len > codec.max_accepted_clients) {
+        logPrepareFailure("accepted roster capacity", error.InvalidSnapshot);
+        return error.InvalidSnapshot;
     }
-    const accepted_copy = try allocator.dupe(AcceptedIrcSocket, accepted);
+    for (accepted) |entry| {
+        const current = observeAcceptedIrcSocket(entry.fd) catch |err| {
+            logPrepareFailure("accepted socket observation", err);
+            return error.InvalidSnapshot;
+        };
+        if (!listener.TransportAddress.eql(current.local, entry.local) or
+            !listener.TransportAddress.eql(current.peer, entry.peer))
+        {
+            logPrepareFailure("accepted socket identity", error.InvalidSnapshot);
+            return error.InvalidSnapshot;
+        }
+    }
+    const accepted_copy = allocator.dupe(AcceptedIrcSocket, accepted) catch |err| {
+        logPrepareFailure("accepted roster allocation", err);
+        return err;
+    };
     var accepted_owned = true;
     defer if (accepted_owned) allocator.free(accepted_copy);
     std.mem.sort(AcceptedIrcSocket, accepted_copy, {}, struct {
@@ -192,11 +214,24 @@ pub fn prepare(
             return a.fd < b.fd;
         }
     }.less);
-    try codec.validateSortedAccepted(&snapshot, accepted_copy);
-    const socket = owner.socket orelse return error.InvalidSnapshot;
+    codec.validateSortedAccepted(&snapshot, accepted_copy) catch |err| {
+        logPrepareFailure("accepted bridge join", err);
+        return err;
+    };
+    const socket = owner.socket orelse {
+        logPrepareFailure("UDP owner lookup", error.InvalidSnapshot);
+        return error.InvalidSnapshot;
+    };
     if (socket.fd == invalid_handle or socket.ipv4_fd != invalid_handle or
-        snapshot.base.socket.primary.device != socket.fd) return error.InvalidSnapshot;
-    var udp_transfer = try udp.duplicateForProcess(socket.fd, target_pid);
+        snapshot.base.socket.primary.device != socket.fd)
+    {
+        logPrepareFailure("UDP owner identity", error.InvalidSnapshot);
+        return error.InvalidSnapshot;
+    }
+    var udp_transfer = udp.duplicateForProcess(socket.fd, target_pid) catch |err| {
+        logPrepareFailure("UDP socket duplication", err);
+        return err;
+    };
     defer std.crypto.secureZero(u8, std.mem.asBytes(&udp_transfer.info));
     var bridges: std.ArrayList(listener.BridgeTransfer) = .empty;
     defer {
@@ -204,34 +239,55 @@ pub fn prepare(
         bridges.deinit(allocator);
     }
     for (snapshot.connections) |row| if (row.bridge) |bridge| {
-        const duplicate = try tcp.duplicateForProcess(bridge.source_socket, target_pid);
-        try bridges.append(allocator, .{
+        const duplicate = tcp.duplicateForProcess(bridge.source_socket, target_pid) catch |err| {
+            logPrepareFailure("bridge socket duplication", err);
+            return err;
+        };
+        bridges.append(allocator, .{
             .slot = row.slot,
             .source_socket = bridge.source_socket,
             .target_pid = target_pid,
             .transfer = duplicate,
-        });
+        }) catch |err| {
+            logPrepareFailure("bridge roster allocation", err);
+            return err;
+        };
     };
     var body: codec.Body = .{
         .snapshot = snapshot,
         .udp_transfer = udp_transfer,
-        .bridges = try bridges.toOwnedSlice(allocator),
+        .bridges = bridges.toOwnedSlice(allocator) catch |err| {
+            logPrepareFailure("bridge roster allocation", err);
+            return err;
+        },
         .accepted = accepted_copy,
     };
     snapshot_owned = false;
     accepted_owned = false;
     defer body.deinit(allocator);
-    const plaintext = try codec.encode(allocator, &body, owner.tls, target_pid);
+    const plaintext = codec.encode(allocator, &body, owner.tls, target_pid) catch |err| {
+        logPrepareFailure("snapshot encoding", err);
+        return err;
+    };
     defer codec.freeEncoded(allocator, plaintext);
     var digest: [32]u8 = undefined;
     defer std.crypto.secureZero(u8, &digest);
     std.crypto.hash.sha2.Sha256.hash(plaintext, &digest, .{});
-    var sealer = try envelope.Sealer.initRandom();
+    var sealer = envelope.Sealer.initRandom() catch |err| {
+        logPrepareFailure("envelope sealer creation", err);
+        return err;
+    };
     errdefer sealer.deinit();
     sealer.upgrade_id = upgrade_id;
-    var arena = try arena_mod.Arena.create(allocator, &sealer, plaintext);
+    var arena = arena_mod.Arena.create(allocator, &sealer, plaintext) catch |err| {
+        logPrepareFailure("encrypted arena creation", err);
+        return err;
+    };
     errdefer arena.deinit();
-    const remote = try arena.duplicateReadOnlyForProcess(target_process);
+    const remote = arena.duplicateReadOnlyForProcess(target_process) catch |err| {
+        logPrepareFailure("arena handle duplication", err);
+        return err;
+    };
     return .{ .arena = arena, .sealer = sealer, .body = presentFrame(target_pid, body.bridges.len, remote, arena.size, sealer.key, digest) };
 }
 

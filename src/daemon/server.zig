@@ -458,6 +458,7 @@ const reactor_wake = @import("reactor_wake.zig");
 const shard_mod = @import("shard.zig");
 const reactor_pool_mod = @import("reactor_pool.zig");
 const reuseport = @import("reuseport.zig");
+const windows_ipv6_scope = @import("windows_ipv6_scope.zig");
 const reactor_fabric = @import("reactor_fabric.zig");
 const session_drop_tx = @import("session_drop_tx.zig");
 const deliver_handle = @import("deliver_handle.zig");
@@ -5373,13 +5374,26 @@ pub const LinuxServer = struct {
     /// creation line. Kept separate from `start_ms`, which is monotonic.
     boot_unix: i64 = 0,
 
-    /// The reactor this call is running on. Single embedded reactor today, so it
-    /// is just `&self.reactor`; when the daemon shards into N reactor threads this
-    /// resolves to the thread-local current reactor (set at each thread's loop
-    /// entry). Centralizing the lookup keeps every handler's `self.rx().ring` /
-    /// `self.rx().clients` access shard-correct with no signature changes.
+    /// A test or a caller between Server lifetimes can retain a thread-local
+    /// reactor from another Server. Compare addresses without dereferencing that
+    /// possibly dead pointer before using it as this Server's shard authority.
+    inline fn currentOwnedReactor(self: *const LinuxServer) ?*Reactor {
+        const reactor = current_reactor orelse return null;
+        const first = &self.reactors[0];
+        if (reactor == first) return reactor;
+        if (self.reactors.len == 1) return null;
+        const base = @intFromPtr(first);
+        const address = @intFromPtr(reactor);
+        if (address < base) return null;
+        const offset = address - base;
+        if (offset % @sizeOf(Reactor) != 0 or offset / @sizeOf(Reactor) >= self.reactors.len) return null;
+        return reactor;
+    }
+
+    /// Resolve the reactor bound to this Server, or reactor 0 for an off-reactor
+    /// caller. A reactor from another Server must never select its connection slab.
     pub inline fn rx(self: *LinuxServer) *Reactor {
-        return current_reactor orelse &self.reactors[0];
+        return self.currentOwnedReactor() orelse &self.reactors[0];
     }
 
     /// True only on reactor 0's thread. Unlike `rx()`, an unset
@@ -5390,8 +5404,8 @@ pub const LinuxServer = struct {
         return current_reactor == &self.reactors[0];
     }
 
-    fn latencyReactorIndex() usize {
-        return if (current_reactor) |reactor| reactor.shard_id else 0;
+    fn latencyReactorIndex(self: *const LinuxServer) usize {
+        return if (self.currentOwnedReactor()) |reactor| reactor.shard_id else 0;
     }
 
     fn recordElapsedLatency(
@@ -5400,7 +5414,7 @@ pub const LinuxServer = struct {
         started_at_ms: i64,
     ) void {
         const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), self.nowMs() - started_at_ms));
-        self.latency_stats.record(series, latencyReactorIndex(), elapsed_ms *| 1000);
+        self.latency_stats.record(series, self.latencyReactorIndex(), elapsed_ms *| 1000);
     }
 
     /// Effective worker-reactor count, clamped to `[1, max_shards]`. Multi-reactor
@@ -6352,7 +6366,10 @@ pub const LinuxServer = struct {
         defer webrtc.deinit();
         const rooms = try self.media_rooms.prepareClientDeparture(departure);
         defer rooms.deinit();
-        var physical = try PreparedMediaPhysicalClientDeparture.prepare(self, id, conn);
+        var physical = if (terminal)
+            try PreparedMediaPhysicalClientDeparture.prepareTerminal(self, id, conn)
+        else
+            try PreparedMediaPhysicalClientDeparture.prepare(self, id, conn);
         defer physical.deinit();
         const Cut = struct {
             domain: *media_routing.Domain,
@@ -9848,7 +9865,7 @@ pub const LinuxServer = struct {
     pub fn runOnce(self: *LinuxServer) !void {
         if (comptime builtin.is_test) {
             if (self.reactor_fail_for_test) return error.ReactorGiveUp;
-            if (current_reactor) |r| {
+            if (self.currentOwnedReactor()) |r| {
                 if (self.reactor_poison_shard_for_test.load(.acquire) == r.shard_id)
                     return error.BackendPoisoned;
             }
@@ -9857,7 +9874,7 @@ pub const LinuxServer = struct {
         // reactor whose ring produced the completions. A multi-reactor worker has
         // already bound its own shard before looping (so we never clobber it);
         // single-reactor callers and direct-test invocations bind shard 0 here.
-        if (current_reactor == null) current_reactor = &self.reactors[0];
+        if (self.currentOwnedReactor() == null) current_reactor = &self.reactors[0];
         // Control SQEs always win the turn. Helix activation and mesh connects
         // are deliberately staged below them so a full inherited population can
         // neither wedge accept/wake/timer nor drop quiet clients on SQ-full.
@@ -9880,20 +9897,7 @@ pub const LinuxServer = struct {
         _ = try self.rx().ring.reapCompletions(cqes[0..cqe_batch], 0, &handler);
         if (handler.err) |err| return err;
 
-        if (comptime builtin.os.tag == .windows) {
-            // The one listener owner hands off accepted sockets before they
-            // have an IOCP association. Admit on the destination owner thread
-            // so its first receive binds the socket to that shard's port.
-            var first_accept_error: ?anyerror = null;
-            while (self.rx().windows_accepted.pop()) |accepted| {
-                self.world.lockWrite();
-                self.handleAccept(accepted) catch |err| {
-                    if (first_accept_error == null) first_accept_error = err;
-                };
-                self.world.unlockWrite();
-            }
-            if (first_accept_error) |err| return err;
-        }
+        _ = try self.drainWindowsAccepted();
 
         // Belt-and-suspenders against a lost wake: drain any cross-shard handoffs
         // addressed to this reactor every iteration, not only on the wake-poll
@@ -10554,6 +10558,41 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// The listener owner publishes unassociated Winsock sockets to another
+    /// reactor's queue. Admit them on that owner even during Helix quiesce;
+    /// `armRecv` remains disabled until rollback reactivates the socket. The
+    /// all-owner barrier calls this after reactor 0 can no longer enqueue.
+    fn drainWindowsAccepted(self: *LinuxServer) !usize {
+        if (comptime builtin.os.tag == .windows) {
+            var drained: usize = 0;
+            var first_err: ?anyerror = null;
+            while (self.rx().windows_accepted.pop()) |accepted| {
+                self.world.lockWrite();
+                self.handleAccept(accepted) catch |err| {
+                    if (first_err == null) first_err = err;
+                };
+                self.world.unlockWrite();
+                drained += 1;
+            }
+            if (first_err) |err| return err;
+            return drained;
+        }
+        return 0;
+    }
+
+    /// After all owners have stopped accepting, a published queue slot must
+    /// either enter its destination slab or refuse the Helix seal. Reading the
+    /// reserved tail as well as the consumed head also catches an in-flight
+    /// publication conservatively.
+    fn windowsAcceptedQueuesEmpty(self: *LinuxServer) bool {
+        if (comptime builtin.os.tag == .windows) {
+            for (self.reactors) |*r| {
+                if (r.windows_accepted.head.load(.acquire) != r.windows_accepted.tail.load(.acquire)) return false;
+            }
+        }
+        return true;
+    }
+
     /// Owner-thread socket safe point. Queue exact user_data cancels for every
     /// armed RECV/SEND, submit them, and keep reaping through the ordinary
     /// CompletionHandler until the matching original CQEs release every buffer.
@@ -10652,7 +10691,12 @@ pub const LinuxServer = struct {
     /// After every owner stopped socket input, drain this owner's final mailbox.
     /// At that point no later RECV can enqueue behind this drain, so the sealed
     /// SendQ includes every cross-shard delivery accepted before the boundary.
-    fn drainUpgradeFabric(self: *LinuxServer) void {
+    fn drainUpgradeFabric(self: *LinuxServer) !void {
+        // Reactor 0 may have published an accepted socket while reaping an
+        // ACCEPT completion after this owner finished its first quiesce pass.
+        // The IO barrier above now rules out further publications, so every
+        // owner must admit its final queue before advertising a parked slab.
+        _ = try self.drainWindowsAccepted();
         if (self.fabric == null) return;
         self.world.lockWrite();
         self.abortPoisonedDeliveries();
@@ -10670,6 +10714,8 @@ pub const LinuxServer = struct {
     fn drainAllUpgradeFabricFixedPointLocked(self: *LinuxServer) !usize {
         const saved_reactor = current_reactor;
         defer current_reactor = saved_reactor;
+
+        if (!self.windowsAcceptedQueuesEmpty()) return error.UpgradeSocketOwnerNotQuiesced;
 
         var total_slots: usize = 0;
         const inline_fallback = self.pool.count() == 0;
@@ -10728,6 +10774,7 @@ pub const LinuxServer = struct {
                             return error.UpgradeSocketOwnerNotQuiesced;
                     }
                 }
+                if (!self.windowsAcceptedQueuesEmpty()) return error.UpgradeSocketOwnerNotQuiesced;
                 return total_progress;
             }
             total_progress = std.math.add(usize, total_progress, progress) catch
@@ -10842,7 +10889,9 @@ pub const LinuxServer = struct {
             self.resumeUpgradeSiblingAndWait(run);
             return;
         }
-        self.drainUpgradeFabric();
+        self.drainUpgradeFabric() catch {
+            self.upgrade_io_failed.store(true, .release);
+        };
         _ = self.upgrade_parked.fetchAdd(1, .acq_rel);
         while (self.upgrade_quiesce_shard.load(.acquire) == q) {
             sleepOneMillis();
@@ -10907,7 +10956,11 @@ pub const LinuxServer = struct {
         }
         self.upgrade_drain_ready.store(true, .release);
         self.wakeAllReactors();
-        self.drainUpgradeFabric();
+        self.drainUpgradeFabric() catch |err| {
+            self.upgrade_io_failed.store(true, .release);
+            self.resumeSiblingReactors();
+            return err;
+        };
 
         waited_ms = 0;
         while (true) {
@@ -10924,6 +10977,10 @@ pub const LinuxServer = struct {
             sleepOneMillis();
             waited_ms += 1;
             if (waited_ms % 200 == 0) self.wakeAllReactors();
+        }
+        if (self.upgrade_io_failed.load(.acquire)) {
+            self.resumeSiblingReactors();
+            return error.SocketIoQuiesceFailed;
         }
     }
 
@@ -31892,6 +31949,10 @@ pub const LinuxServer = struct {
         // Seal EVERY shard's clients. Siblings are parked (see the quiesce
         // above), so reading foreign per-connection state here cannot race the
         // owning reactor thread. The carried-fd scratch spans all shards.
+        if (!self.windowsAcceptedQueuesEmpty()) {
+            self.deferredUpgradeNotice(request, "UPGRADE refused: a Windows accepted socket has not reached its owner slab");
+            return error.UpgradeSocketOwnerNotQuiesced;
+        }
         var total_slots: usize = 0;
         for (self.reactors) |*r| total_slots += r.clients.slots.items.len;
         const carried_fds = try self.allocator.alloc(linux.fd_t, total_slots);
@@ -57715,7 +57776,7 @@ pub const LinuxServer = struct {
     /// Fold a live mesh RTT sample into the peer health table (status.json / MESH).
     fn syncPeerRtt(self: *LinuxServer, name: []const u8, rtt_ms: ?u32) void {
         const sample = rtt_ms orelse return;
-        self.latency_stats.record(.mooring_rtt, latencyReactorIndex(), @as(u64, sample) * 1000);
+        self.latency_stats.record(.mooring_rtt, self.latencyReactorIndex(), @as(u64, sample) * 1000);
         if (name.len == 0) return;
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         const h = self.peer_health.get(name) orelse return;
@@ -66210,6 +66271,7 @@ const PreparedMediaPhysicalClientDeparture = struct {
     server: *LinuxServer,
     id: client_model.ClientId,
     conn: *ConnState,
+    terminal: bool,
     allocator: std.mem.Allocator,
     old_ptr: usize,
     old_capacity: usize,
@@ -66229,15 +66291,25 @@ const PreparedMediaPhysicalClientDeparture = struct {
             std.mem.eql(u8, a.nickSlice(), b.nickSlice());
     }
 
-    fn requireOwner(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+    fn requireOwner(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, terminal: bool) !void {
         // Closing is legal here: retirement precedes slab/World removal. An
-        // active signalling requirement would strand a just-closed owner.
+        // active signalling requirement would strand a just-closed owner. At
+        // terminal teardown, unregistered and S2S slab rows also need their
+        // exact ClientId retirement before the Domain can be destroyed.
         if (id.isNone() or id.shard != server.rx().shard_id or
-            server.connFor(id) != conn or !conn.session.registered()) return error.BadState;
+            server.connFor(id) != conn or (!terminal and !conn.session.registered())) return error.BadState;
     }
 
     fn prepare(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !PreparedMediaPhysicalClientDeparture {
-        try requireOwner(server, id, conn);
+        return prepareMode(server, id, conn, false);
+    }
+
+    fn prepareTerminal(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !PreparedMediaPhysicalClientDeparture {
+        return prepareMode(server, id, conn, true);
+    }
+
+    fn prepareMode(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, terminal: bool) !PreparedMediaPhysicalClientDeparture {
+        try requireOwner(server, id, conn, terminal);
         const allocator = server.allocator;
         const rows = server.media_physical_attachments.items;
         var removed: usize = 0;
@@ -66248,6 +66320,7 @@ const PreparedMediaPhysicalClientDeparture = struct {
             .server = server,
             .id = id,
             .conn = conn,
+            .terminal = terminal,
             .allocator = allocator,
             .old_ptr = PreparedMediaPhysicalJoin.arrayPtr(&server.media_physical_attachments),
             .old_capacity = server.media_physical_attachments.capacity,
@@ -66270,7 +66343,7 @@ const PreparedMediaPhysicalClientDeparture = struct {
 
     fn validate(self: *const PreparedMediaPhysicalClientDeparture) !void {
         if (self.done) return error.BadState;
-        try requireOwner(self.server, self.id, self.conn);
+        try requireOwner(self.server, self.id, self.conn, self.terminal);
         const source = &self.server.media_physical_attachments;
         if (!std.meta.eql(self.allocator, self.server.allocator) or
             PreparedMediaPhysicalJoin.arrayPtr(source) != self.old_ptr or
@@ -71960,21 +72033,8 @@ fn validateNativeInheritedListenerClaims(config: Config) !void {
 fn validateNativeListenerAddress(fd: linux.fd_t, host: []const u8, port: u16) !void {
     if (comptime builtin.os.tag == .windows) {
         const observed = io_backend.observeWindowsListeningTcpSocket(fd) catch return error.InvalidInheritedListener;
-        const actual = switch (observed.local.address) {
-            .ipv6 => |bytes| bytes,
-            .ipv4 => return error.InvalidInheritedListener,
-        };
-        var expected: [16]u8 = @splat(0);
-        if (host.len != 0 and !std.mem.eql(u8, host, "0.0.0.0") and !std.mem.eql(u8, host, "::")) {
-            if (std.Io.net.Ip6Address.parse(host, port)) |ip6| {
-                if (ip6.interface.index != 0) return error.InvalidInheritedListener;
-                expected = ip6.bytes;
-            } else |_| {
-                const ip4 = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidInheritedListener;
-                expected = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ ip4.bytes;
-            }
-        }
-        if (!std.mem.eql(u8, &actual, &expected) or (port != 0 and observed.local.port != port))
+        const expected = sockaddrIn6(host, port) catch return error.InvalidInheritedListener;
+        if (!windowsNativeListenerAddressMatches(observed, expected, port))
             return error.InvalidInheritedListener;
         return;
     }
@@ -72004,6 +72064,20 @@ fn validateNativeListenerAddress(fd: linux.fd_t, host: []const u8, port: u16) !v
         if (actual.addr != @as(u32, @bitCast(expected.bytes)) or
             (port != 0 and actual.port != std.mem.nativeToBig(u16, port))) return error.InvalidInheritedListener;
     }
+}
+
+fn windowsNativeListenerAddressMatches(
+    observed: io_backend.WindowsListenerObservation,
+    expected: posix.sockaddr.in6,
+    requested_port: u16,
+) bool {
+    const actual = switch (observed.local.address) {
+        .ipv6 => |bytes| bytes,
+        .ipv4 => return false,
+    };
+    return std.mem.eql(u8, &actual, &expected.addr) and
+        observed.scope_id == expected.scope_id and
+        (requested_port == 0 or observed.local.port == requested_port);
 }
 
 fn stageListenerCompanion(
@@ -72261,22 +72335,26 @@ fn sockaddrIn(host: []const u8, port: u16) ServerError!posix.sockaddr.in {
 /// still resolves. Linux dials both through AF_INET6; OpenBSD translates the
 /// canonical mapped address and selects a native AF_INET socket for IPv4.
 fn sockaddrForHost(host: []const u8, port: u16, timeout_ms: u31) ServerError!posix.sockaddr.in6 {
-    if (sockaddrIn6(host, port)) |addr| return addr else |_| {}
+    if (sockaddrIn6(host, port)) |addr| return addr else |err| {
+        // A zone marker is a literal-only form. Reject malformed scope here
+        // instead of treating it as a hostname and waiting on DNS.
+        if (std.mem.indexOfScalar(u8, host, '%') != null) return err;
+    }
     if (http_fetch.resolveHostA(host, port, timeout_ms)) |resolved| {
         switch (resolved) {
             .ip4 => |a4| return sockaddrIn6FromV4(a4.bytes, port),
-            .ip6 => |a6| return sockaddrIn6FromV6(a6.bytes, port),
+            .ip6 => |a6| return sockaddrIn6FromV6(a6, port),
         }
     } else |_| {}
     const resolved6 = http_fetch.resolveHostAAAA(host, port, timeout_ms) catch return error.InvalidAddress;
     switch (resolved6) {
         .ip4 => |a4| return sockaddrIn6FromV4(a4.bytes, port),
-        .ip6 => |a6| return sockaddrIn6FromV6(a6.bytes, port),
+        .ip6 => |a6| return sockaddrIn6FromV6(a6, port),
     }
 }
 
-fn sockaddrIn6FromV6(addr: [16]u8, port: u16) posix.sockaddr.in6 {
-    return .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = addr, .scope_id = 0 };
+fn sockaddrIn6FromV6(addr: std.Io.net.Ip6Address, port: u16) posix.sockaddr.in6 {
+    return .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = addr.bytes, .scope_id = addr.interface.index };
 }
 
 fn sockaddrIn6FromV4(addr4: [4]u8, port: u16) posix.sockaddr.in6 {
@@ -72284,7 +72362,31 @@ fn sockaddrIn6FromV4(addr4: [4]u8, port: u16) posix.sockaddr.in6 {
     a[10] = 0xff;
     a[11] = 0xff;
     @memcpy(a[12..16], &addr4);
-    return sockaddrIn6FromV6(a, port);
+    return .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = a, .scope_id = 0 };
+}
+
+fn numericIpv6Scope(text: []const u8) ServerError!u32 {
+    if (text.len == 0 or text.len > 10) return error.InvalidAddress;
+    for (text) |digit| if (digit < '0' or digit > '9') return error.InvalidAddress;
+    const index = std.fmt.parseInt(u32, text, 10) catch return error.InvalidAddress;
+    if (index == 0) return error.InvalidAddress;
+    return index;
+}
+
+test "mesh dial IPv6 sockaddr preserves resolved interface scope" {
+    const scoped: std.Io.net.Ip6Address = .{
+        .bytes = .{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .port = 6900,
+        .interface = .{ .index = 7 },
+    };
+    const converted = sockaddrIn6FromV6(scoped, 6900);
+    try std.testing.expectEqual(@as(u32, 7), converted.scope_id);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 6900), converted.port);
+    try std.testing.expectEqualSlices(u8, &scoped.bytes, &converted.addr);
+
+    const mapped = sockaddrIn6FromV4(.{ 127, 0, 0, 1 }, 6900);
+    try std.testing.expectEqual(@as(u32, 0), mapped.scope_id);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, mapped.addr[12..16]);
 }
 
 const socket_system = if (builtin.os.tag == .openbsd) posix.system else linux;
@@ -72339,9 +72441,18 @@ fn bindSocket(fd: linux.fd_t, addr: *const posix.sockaddr.in) ServerError!void {
 /// binds as its IPv4-mapped form (::ffff:a.b.c.d). Anything else is rejected.
 fn sockaddrIn6(host: []const u8, port: u16) ServerError!posix.sockaddr.in6 {
     var addr: [16]u8 = @splat(0); // in6addr_any (dual-stack wildcard)
+    var scope_id: u32 = 0;
     if (host.len != 0 and !std.mem.eql(u8, host, "0.0.0.0") and !std.mem.eql(u8, host, "::")) {
-        if (std.Io.net.Ip6Address.parse(host, port)) |a6| {
+        if (std.mem.indexOfScalar(u8, host, '%')) |percent| {
+            const a6 = if (comptime builtin.os.tag == .windows)
+                windows_ipv6_scope.parseLiteral(host, port) catch return error.InvalidAddress
+            else
+                std.Io.net.Ip6Address.parse(host[0..percent], port) catch return error.InvalidAddress;
             addr = a6.bytes;
+            scope_id = if (comptime builtin.os.tag == .windows) a6.interface.index else try numericIpv6Scope(host[percent + 1 ..]);
+        } else if (std.Io.net.Ip6Address.parse(host, port)) |a6| {
+            addr = a6.bytes;
+            scope_id = a6.interface.index;
         } else |_| {
             const a4 = std.Io.net.Ip4Address.parse(host, port) catch return error.InvalidAddress;
             addr = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ a4.bytes;
@@ -72351,8 +72462,42 @@ fn sockaddrIn6(host: []const u8, port: u16) ServerError!posix.sockaddr.in6 {
         .port = std.mem.nativeToBig(u16, port),
         .flowinfo = 0,
         .addr = addr,
-        .scope_id = 0,
+        .scope_id = scope_id,
     };
+}
+
+test "mesh scoped IPv6 literal keeps numeric zone and rejects malformed scopes" {
+    const peer = parseHostPort("[fe80::1%7]:6900").?;
+    const dial = try sockaddrForHost(peer.host, peer.port, 1);
+    const bind = try sockaddrIn6(peer.host, peer.port);
+    try std.testing.expect(sameSockaddrIn(dial, bind));
+    try std.testing.expectEqual(@as(u32, 7), dial.scope_id);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 6900), dial.port);
+    try std.testing.expectEqual(@as(u8, 0xfe), dial.addr[0]);
+    try std.testing.expectEqual(@as(u8, 0x80), dial.addr[1]);
+    try std.testing.expectEqual(@as(u8, 1), dial.addr[15]);
+
+    for ([_][]const u8{ "fe80::1%", "fe80::1%0", "fe80::1%4294967296", "fe80::1%7\x00x", "fe80::1%7%8", "127.0.0.1%7" }) |host| {
+        try std.testing.expectError(error.InvalidAddress, sockaddrForHost(host, 6900, 1));
+    }
+}
+
+test "mesh scoped IPv6 Windows adapter alias reaches dial and bind" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    for ([_][]const u8{ "Wi-Fi 2", "Wi-Fi", "Ethernet 2", "Ethernet", "vEthernet (WSL (Hyper-V firewall))" }) |alias| {
+        const expected = windows_ipv6_scope.resolveZone(alias) catch continue;
+        var host_buf: [128]u8 = undefined;
+        const host = try std.fmt.bufPrint(&host_buf, "fe80::1%{s}", .{alias});
+        const dial = try sockaddrForHost(host, 6900, 1);
+        const bind = try sockaddrIn6(host, 6900);
+        try std.testing.expect(sameSockaddrIn(dial, bind));
+        try std.testing.expectEqual(expected, dial.scope_id);
+        try std.testing.expectEqual(std.mem.nativeToBig(u16, 6900), dial.port);
+        try std.testing.expectEqual(@as(u8, 0xfe), dial.addr[0]);
+        try std.testing.expectEqual(@as(u8, 1), dial.addr[15]);
+        return;
+    }
+    return error.SkipZigTest;
 }
 
 fn bindSocket6(fd: linux.fd_t, addr: *const posix.sockaddr.in6) ServerError!void {
@@ -73330,6 +73475,46 @@ noinline fn createTestServer(
     errdefer allocator.destroy(server);
     try server.initInPlace(allocator, config);
     return server;
+}
+
+test "Server reactor lookup never borrows another Server connection slab" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const first = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer {
+        first.deinit();
+        allocator.destroy(first);
+    }
+    const second = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 });
+    defer {
+        second.deinit();
+        allocator.destroy(second);
+    }
+
+    current_reactor = &first.reactors[0];
+    try std.testing.expect(second.rx() == &second.reactors[0]);
+    const id = try second.rx().clients.alloc(ConnState.init(-1));
+    try std.testing.expect(second.reactors[0].clients.get(id) != null);
+    try std.testing.expectEqual(@as(usize, 0), first.reactors[0].clients.slots.items.len);
+
+    current_reactor = &second.reactors[1];
+    try std.testing.expect(second.rx() == &second.reactors[1]);
+}
+
+test "Server teardown retires unregistered slab rows through media sources" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    current_reactor = null;
+    const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer allocator.destroy(server);
+    errdefer server.deinit();
+    server.start();
+    try std.testing.expect(server.media_routing_owner != null);
+    const id = try server.reactors[0].clients.alloc(ConnState.init(-1));
+    try std.testing.expect(!server.reactors[0].clients.get(id).?.session.registered());
+    server.deinit();
 }
 
 fn upgradePieceBytesForTest(
@@ -91395,9 +91580,9 @@ test "GAP-O1 merges reactor latency samples once into the metrics snapshot" {
     try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
 
     current_reactor = &server.reactors[0];
-    server.latency_stats.record(.tls_handshake, LinuxServer.latencyReactorIndex(), 100);
+    server.latency_stats.record(.tls_handshake, server.latencyReactorIndex(), 100);
     current_reactor = &server.reactors[1];
-    server.latency_stats.record(.tls_handshake, LinuxServer.latencyReactorIndex(), 500);
+    server.latency_stats.record(.tls_handshake, server.latencyReactorIndex(), 500);
 
     const buf = try allocator.alloc(u8, 65_536);
     defer allocator.free(buf);
@@ -91412,7 +91597,7 @@ test "GAP-O1 merges reactor latency samples once into the metrics snapshot" {
     try std.testing.expect(std.mem.indexOf(u8, metrics_text, "onyx_tls_handshake_us_count 2\n") != null);
 
     current_reactor = &server.reactors[0];
-    server.latency_stats.record(.tls_handshake, LinuxServer.latencyReactorIndex(), 1000);
+    server.latency_stats.record(.tls_handshake, server.latencyReactorIndex(), 1000);
     server.refreshMetricsSnapshot();
     metrics_text = try server.metrics_snapshot.copyInto(buf);
     try std.testing.expect(std.mem.indexOf(u8, metrics_text, "onyx_tls_handshake_us_count 3\n") != null);
@@ -103183,6 +103368,112 @@ test "Windows native Helix listener manifest verifies exact bound socket roles" 
     try std.testing.expectError(error.InvalidInheritedListener, validateNativeInheritedListenerClaims(cfg));
 }
 
+test "Windows native Helix listener validation binds IPv6 scope to inherited socket" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const expected = try sockaddrIn6("fe80::1%7", 6900);
+    var observed: io_backend.WindowsListenerObservation = .{
+        .local = .{ .address = .{ .ipv6 = expected.addr }, .port = 6900 },
+        .scope_id = 7,
+    };
+    try std.testing.expect(windowsNativeListenerAddressMatches(observed, expected, 6900));
+
+    observed.scope_id = 8;
+    try std.testing.expect(!windowsNativeListenerAddressMatches(observed, expected, 6900));
+    observed.scope_id = 7;
+    observed.local.port = 6901;
+    try std.testing.expect(!windowsNativeListenerAddressMatches(observed, expected, 6900));
+    observed.local.port = 6900;
+    observed.local.address = .{ .ipv4 = .{ 127, 0, 0, 1 } };
+    try std.testing.expect(!windowsNativeListenerAddressMatches(observed, expected, 6900));
+}
+
+test "Windows Helix drains an accepted shard queue before the seal and keeps rollback live" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const server = try createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2, .max_clients = 16 });
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    try std.testing.expectEqual(@as(usize, 2), server.reactors.len);
+    try std.testing.expect(server.reactors[1].wake != null);
+    // Shard 1 has already reached its first socket-I/O safe point when the
+    // listener owner publishes this late accepted socket to its queue.
+    server.reactors[1].socket_io_quiescing = true;
+    defer {
+        current_reactor = &server.reactors[0];
+        if (server.reactors[0].socket_io_quiescing) server.resumeOwnedSocketIo();
+        current_reactor = &server.reactors[1];
+        if (server.reactors[1].socket_io_quiescing) server.resumeOwnedSocketIo();
+    }
+    current_reactor = &server.reactors[0];
+    var client = try ManagedTestClient.init(try server.boundPort());
+    defer client.deinit();
+
+    // Exercise the real reactor-0 accept distribution, but leave shard 1
+    // between turns with the socket still outside its connection slab.
+    var turns: usize = 0;
+    while (server.windowsAcceptedQueuesEmpty() and turns < 4) : (turns += 1) try server.runOnce();
+    try std.testing.expect(!server.windowsAcceptedQueuesEmpty());
+    try std.testing.expectEqual(@as(usize, 0), server.reactors[1].clients.len());
+
+    try server.quiesceOwnedSocketIo();
+    server.world.lockWrite();
+    const before_drain = server.drainAllUpgradeFabricFixedPointLocked();
+    server.world.unlockWrite();
+    try std.testing.expectError(error.UpgradeSocketOwnerNotQuiesced, before_drain);
+
+    current_reactor = &server.reactors[1];
+    try server.drainUpgradeFabric();
+    try std.testing.expect(server.windowsAcceptedQueuesEmpty());
+    try std.testing.expectEqual(@as(usize, 1), server.reactors[1].clients.len());
+    var accepted_it = server.reactors[1].clients.iterator();
+    const entry = accepted_it.next() orelse return error.TestUnexpectedResult;
+    const id = entry.id;
+    try std.testing.expect(!entry.value.recv_armed);
+    try std.testing.expect(!entry.value.session.registered());
+    server.world.lockWrite();
+    const after_drain = server.drainAllUpgradeFabricFixedPointLocked();
+    server.world.unlockWrite();
+    try std.testing.expectEqual(@as(usize, 0), try after_drain);
+
+    // A newly accepted, unregistered socket is now counted by the ordinary
+    // client sealer, which refuses a hot swap rather than dropping it. The
+    // predecessor then reactivates that exact socket and finishes registration.
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(allocator);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| allocator.free(blob);
+        blobs.deinit(allocator);
+    }
+    var carried_fds: [1]linux.fd_t = undefined;
+    var fd_count: usize = 0;
+    var counts = Server.SealCounts{};
+    server.world.lockWrite();
+    server.sealShardClients(&server.reactors[1], &pieces, &blobs, &carried_fds, &fd_count, &counts);
+    server.world.unlockWrite();
+    try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
+    try std.testing.expectEqual(@as(usize, 0), counts.clients);
+    try std.testing.expectEqual(@as(usize, 0), fd_count);
+
+    server.resumeOwnedSocketIo();
+    current_reactor = &server.reactors[0];
+    server.resumeOwnedSocketIo();
+    current_reactor = &server.reactors[1];
+    try client.write("NICK boundary\r\nUSER boundary 0 * :Boundary\r\n");
+    for (0..8) |_| {
+        try server.runOnce();
+        if (server.reactors[1].clients.get(id)) |conn| {
+            if (conn.session.registered()) break;
+        }
+    }
+    const retained = server.reactors[1].clients.get(id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(retained.session.registered());
+    try std.testing.expectEqualStrings("boundary", retained.session.displayName());
+}
+
 test "Windows UPGRADE with replay-backed TLS reaches candidate preflight without consuming history" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -103865,7 +104156,7 @@ test "shared full server: OpenBSD native Helix stages live clients until COMMIT 
             // releasing the old run's pool/fabric and starting a fresh run.
             for (predecessor.reactors) |*r| {
                 current_reactor = r;
-                predecessor.drainUpgradeFabric();
+                try predecessor.drainUpgradeFabric();
             }
             predecessor.world.lockWrite();
             const drained = predecessor.drainAllUpgradeFabricFixedPointLocked();

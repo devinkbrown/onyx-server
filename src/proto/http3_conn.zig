@@ -423,6 +423,17 @@ pub const Event = union(enum) {
 };
 
 pub const SnapshotError = error{ InvalidSnapshot, SnapshotTooLarge, ConfigMismatch } || Allocator.Error;
+
+fn logServerSnapshotFailure(comptime stage: []const u8, err: anyerror) void {
+    if (comptime @import("builtin").os.tag == .windows) {
+        std.debug.print("onyx-server: Windows H3 snapshot {s} failed: {s}\n", .{ stage, @errorName(err) });
+    }
+}
+
+fn invalidServerSnapshot(comptime stage: []const u8) error{InvalidSnapshot} {
+    logServerSnapshotFailure(stage, error.InvalidSnapshot);
+    return error.InvalidSnapshot;
+}
 pub const snapshot_max_streams: usize = 64;
 pub const snapshot_max_wt_streams: usize = 256;
 pub const snapshot_max_events: usize = 256;
@@ -515,82 +526,112 @@ pub const Http3Snapshot = struct {
     }
 
     pub fn validate(self: *const Http3Snapshot) SnapshotError!void {
-        try validateSnapshotSettings(self.local_settings);
-        if (self.peer_settings) |settings| try validateSnapshotSettings(settings);
+        validateSnapshotSettings(self.local_settings) catch |err| {
+            logServerSnapshotFailure("local settings validation", err);
+            return err;
+        };
+        if (self.peer_settings) |settings| validateSnapshotSettings(settings) catch |err| {
+            logServerSnapshotFailure("peer settings validation", err);
+            return err;
+        };
         if (self.local_settings.qpack_max_table_capacity != 0 or self.local_settings.qpack_blocked_streams != 0 or
             self.uni.len > snapshot_max_streams or self.bidi.len > snapshot_max_streams or
             self.bidi_handled.len > snapshot_max_streams or self.events.len > snapshot_max_events)
             return error.SnapshotTooLarge;
         if (self.settings_sent and (self.control_stream_id == null or self.qpack_encoder_stream_id == null))
-            return error.InvalidSnapshot;
-        if (self.control_stream_id) |id| try validateSnapshotStreamId(id, 3);
-        if (self.qpack_encoder_stream_id) |id| try validateSnapshotStreamId(id, 3);
+            return invalidServerSnapshot("local control stream presence");
+        if (self.control_stream_id) |id| validateSnapshotStreamId(id, 3) catch |err| {
+            logServerSnapshotFailure("local control stream ID", err);
+            return err;
+        };
+        if (self.qpack_encoder_stream_id) |id| validateSnapshotStreamId(id, 3) catch |err| {
+            logServerSnapshotFailure("QPACK stream ID", err);
+            return err;
+        };
         if (self.control_stream_id != null and self.qpack_encoder_stream_id != null and
-            self.control_stream_id.? == self.qpack_encoder_stream_id.?) return error.InvalidSnapshot;
-        if (self.peer_control_stream_id) |id| try validateSnapshotStreamId(id, 2);
+            self.control_stream_id.? == self.qpack_encoder_stream_id.?) return invalidServerSnapshot("local control stream uniqueness");
+        if (self.peer_control_stream_id) |id| validateSnapshotStreamId(id, 2) catch |err| {
+            logServerSnapshotFailure("peer control stream ID", err);
+            return err;
+        };
         var total: usize = 0;
         if (self.session) |session| {
             if (session.session_id > snapshot_max_varint or session.session_id % 4 != 0 or
                 session.authority.len > snapshot_max_text or session.path.len > snapshot_max_text or
-                session.streams.len > snapshot_max_wt_streams) return error.InvalidSnapshot;
+                session.streams.len > snapshot_max_wt_streams) return invalidServerSnapshot("session shape");
             if (!self.settings_sent or self.peer_settings == null or
-                !self.peer_settings.?.supportsWebTransport()) return error.InvalidSnapshot;
+                !self.peer_settings.?.supportsWebTransport()) return invalidServerSnapshot("session settings relation");
             try snapshotAddBytes(&total, session.authority.len);
             try snapshotAddBytes(&total, session.path.len);
             for (session.streams) |stream| {
                 if (stream.stream_id > snapshot_max_varint or
                     (stream.is_bidirectional and stream.stream_id & 2 != 0) or
-                    (!stream.is_bidirectional and stream.stream_id & 2 == 0)) return error.InvalidSnapshot;
+                    (!stream.is_bidirectional and stream.stream_id & 2 == 0)) return invalidServerSnapshot("session stream ID");
             }
         }
         for (self.uni, 0..) |entry, i| {
-            try validateSnapshotStreamId(entry.id, 2);
-            if (i > 0 and self.uni[i - 1].id >= entry.id) return error.InvalidSnapshot;
-            if (entry.stream_type) |value| if (value > snapshot_max_varint) return error.InvalidSnapshot;
-            if (entry.wt_session_id) |value| if (value > snapshot_max_varint) return error.InvalidSnapshot;
+            validateSnapshotStreamId(entry.id, 2) catch |err| {
+                logServerSnapshotFailure("unidirectional stream ID", err);
+                return err;
+            };
+            if (i > 0 and self.uni[i - 1].id >= entry.id) return invalidServerSnapshot("unidirectional stream order");
+            if (entry.stream_type) |value| if (value > snapshot_max_varint) return invalidServerSnapshot("unidirectional stream type");
+            if (entry.wt_session_id) |value| if (value > snapshot_max_varint) return invalidServerSnapshot("unidirectional WT session ID");
             if (entry.prefix.len > snapshot_max_buffer or entry.body.len > snapshot_max_buffer or
                 (entry.stream_type == null and (entry.settings_done or entry.wt_session_id != null)) or
                 (entry.stream_type == null and entry.body.len != 0) or
                 (entry.stream_type != null and entry.prefix.len != 0) or
                 (entry.settings_done and (entry.stream_type == null or entry.stream_type.? != UniStreamType.control)) or
                 (entry.wt_session_id != null and (entry.stream_type == null or entry.stream_type.? != UniStreamType.webtransport)))
-                return error.InvalidSnapshot;
+                return invalidServerSnapshot("unidirectional stream state");
             try snapshotAddBytes(&total, entry.prefix.len);
             try snapshotAddBytes(&total, entry.body.len);
         }
         for (self.bidi, 0..) |entry, i| {
-            try validateSnapshotStreamId(entry.id, 0);
+            validateSnapshotStreamId(entry.id, 0) catch |err| {
+                logServerSnapshotFailure("bidirectional stream ID", err);
+                return err;
+            };
             if (i > 0 and self.bidi[i - 1].id >= entry.id or entry.bytes.len > snapshot_max_buffer)
-                return error.InvalidSnapshot;
+                return invalidServerSnapshot("bidirectional stream state");
             try snapshotAddBytes(&total, entry.bytes.len);
         }
         for (self.bidi_handled, 0..) |id, i| {
-            try validateSnapshotStreamId(id, 0);
-            if (i > 0 and self.bidi_handled[i - 1] >= id) return error.InvalidSnapshot;
+            validateSnapshotStreamId(id, 0) catch |err| {
+                logServerSnapshotFailure("handled bidirectional stream ID", err);
+                return err;
+            };
+            if (i > 0 and self.bidi_handled[i - 1] >= id) return invalidServerSnapshot("handled bidirectional stream order");
         }
         if (self.peer_control_stream_id) |id| {
-            const entry = findUniSnapshot(self.uni, id) orelse return error.InvalidSnapshot;
-            if (entry.stream_type == null or entry.stream_type.? != UniStreamType.control) return error.InvalidSnapshot;
-            if ((self.peer_settings != null) != entry.settings_done) return error.InvalidSnapshot;
-        } else if (self.peer_settings != null) return error.InvalidSnapshot;
+            const entry = findUniSnapshot(self.uni, id) orelse return invalidServerSnapshot("peer control stream membership");
+            if (entry.stream_type == null or entry.stream_type.? != UniStreamType.control) return invalidServerSnapshot("peer control stream type");
+            if ((self.peer_settings != null) != entry.settings_done) return invalidServerSnapshot("peer control settings relation");
+        } else if (self.peer_settings != null) return invalidServerSnapshot("peer control presence");
         for (self.events) |event| {
             switch (event) {
                 .session_established => |id| {
-                    if (self.session == null or self.session.?.session_id != id) return error.InvalidSnapshot;
+                    if (self.session == null or self.session.?.session_id != id) return invalidServerSnapshot("established event relation");
                 },
                 .session_closed => |id| {
                     if (self.session == null or self.session.?.session_id != id or !self.session.?.closed)
-                        return error.InvalidSnapshot;
+                        return invalidServerSnapshot("closed event relation");
                 },
                 .connect_rejected => |item| {
-                    try validateSnapshotStreamId(item.stream_id, 0);
+                    validateSnapshotStreamId(item.stream_id, 0) catch |err| {
+                        logServerSnapshotFailure("rejected event stream ID", err);
+                        return err;
+                    };
                     if (item.status != .method_405 and item.status != .conflict_409 and item.status != .unsupported_501)
-                        return error.InvalidSnapshot;
+                        return invalidServerSnapshot("rejected event status");
                 },
                 .http_responded => |item| {
-                    try validateSnapshotStreamId(item.stream_id, 0);
+                    validateSnapshotStreamId(item.stream_id, 0) catch |err| {
+                        logServerSnapshotFailure("response event stream ID", err);
+                        return err;
+                    };
                     if (item.status != .ok_200 and item.status != .not_found_404 or item.path.len > snapshot_max_text)
-                        return error.InvalidSnapshot;
+                        return invalidServerSnapshot("response event state");
                     try snapshotAddBytes(&total, item.path.len);
                 },
             }
@@ -623,27 +664,53 @@ fn findUniSnapshot(entries: []const UniSnapshot, id: u64) ?UniSnapshot {
 fn snapshotConnJoin(conn: *quic_conn.Conn, snapshot: *const Http3Snapshot) bool {
     if (snapshot.settings_sent and
         (!conn.stream_senders.contains(snapshot.control_stream_id.?) or
-            !conn.stream_senders.contains(snapshot.qpack_encoder_stream_id.?))) return false;
+            !conn.stream_senders.contains(snapshot.qpack_encoder_stream_id.?)))
+    {
+        logServerSnapshotFailure("QUIC join local control senders", error.InvalidSnapshot);
+        return false;
+    }
     if (snapshot.peer_control_stream_id) |id| {
-        if (conn.engine.getStream(id) == null) return false;
+        if (conn.engine.getStream(id) == null) {
+            logServerSnapshotFailure("QUIC join peer control stream", error.InvalidSnapshot);
+            return false;
+        }
     }
     if (snapshot.session) |session| {
         if (conn.engine.getStream(session.session_id) == null or
-            !conn.stream_senders.contains(session.session_id)) return false;
+            !conn.stream_senders.contains(session.session_id))
+        {
+            logServerSnapshotFailure("QUIC join session stream", error.InvalidSnapshot);
+            return false;
+        }
         for (session.streams) |stream| {
             if (stream.stream_id & 1 == 0) {
-                if (conn.engine.getStream(stream.stream_id) == null) return false;
-            } else if (!conn.stream_senders.contains(stream.stream_id)) return false;
+                if (conn.engine.getStream(stream.stream_id) == null) {
+                    logServerSnapshotFailure("QUIC join received WT stream", error.InvalidSnapshot);
+                    return false;
+                }
+            } else if (!conn.stream_senders.contains(stream.stream_id)) {
+                logServerSnapshotFailure("QUIC join sent WT stream", error.InvalidSnapshot);
+                return false;
+            }
         }
     }
     for (snapshot.uni) |entry| {
-        if (conn.engine.getStream(entry.id) == null) return false;
+        if (conn.engine.getStream(entry.id) == null) {
+            logServerSnapshotFailure("QUIC join unidirectional stream", error.InvalidSnapshot);
+            return false;
+        }
     }
     for (snapshot.bidi) |entry| {
-        if (conn.engine.getStream(entry.id) == null) return false;
+        if (conn.engine.getStream(entry.id) == null) {
+            logServerSnapshotFailure("QUIC join bidirectional stream", error.InvalidSnapshot);
+            return false;
+        }
     }
     for (snapshot.bidi_handled) |id| {
-        if (conn.engine.getStream(id) == null) return false;
+        if (conn.engine.getStream(id) == null) {
+            logServerSnapshotFailure("QUIC join handled bidirectional stream", error.InvalidSnapshot);
+            return false;
+        }
     }
     return true;
 }
@@ -764,9 +831,9 @@ pub const Http3Conn = struct {
     /// the source/candidate ownership switch.
     pub fn captureServerSnapshot(self: *const Http3Conn, allocator: Allocator) SnapshotError!Http3Snapshot {
         if (self.role != .server or self.conn.role != .server or !self.conn.isEstablished())
-            return error.InvalidSnapshot;
-        const alpn = self.conn.selectedAlpn() orelse return error.InvalidSnapshot;
-        if (!std.mem.eql(u8, alpn, "h3")) return error.InvalidSnapshot;
+            return invalidServerSnapshot("capture connection state");
+        const alpn = self.conn.selectedAlpn() orelse return invalidServerSnapshot("capture missing ALPN");
+        if (!std.mem.eql(u8, alpn, "h3")) return invalidServerSnapshot("capture ALPN relation");
         var session: ?SessionSnapshot = null;
         errdefer if (session) |*item| item.deinit(allocator);
         if (self.session) |source| {
@@ -877,8 +944,11 @@ pub const Http3Conn = struct {
             .bidi_handled = bidi_handled,
             .events = events,
         };
-        try snapshot.validate();
-        if (!snapshotConnJoin(self.conn, &snapshot)) return error.InvalidSnapshot;
+        snapshot.validate() catch |err| {
+            logServerSnapshotFailure("capture result validation", err);
+            return err;
+        };
+        if (!snapshotConnJoin(self.conn, &snapshot)) return invalidServerSnapshot("capture QUIC stream join");
         return snapshot;
     }
 

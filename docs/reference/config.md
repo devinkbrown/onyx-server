@@ -125,7 +125,7 @@ Source: struct at `src/daemon/config_format.zig:75`, parsing at `src/daemon/conf
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `host` | string | `"127.0.0.1"` | any string accepted by bind helpers | Bind address for runtime listeners (`src/daemon/config_boot.zig:25`). |
+| `host` | string | `"127.0.0.1"` | IPv4 or IPv6 literal, or a wildcard bind address | Bind address for runtime listeners. On Windows, an IPv6 literal may include a numeric interface index or local interface alias after `%` (`src/daemon/config_boot.zig:25`, `src/daemon/windows_ipv6_scope.zig`). |
 | `irc` | port integer | `0` before validation | required, `1..65535` | Plain IRC listener port. Current parser requires this even for TLS-first deployments. |
 | `ws` | port integer | `0` | `0..65535` | Secure-WebSocket browser listener intent. `mapToServerConfig` overlays it into `ws_enabled`/`ws_port`; the listener stands up when TLS certificates are loaded, or with testing-only `ws_plain` (`src/daemon/config_format.zig:462`, `src/daemon/config_boot.zig:45`, `src/main.zig:350`, `src/daemon/server.zig:1862`). |
 | `webtransport` | port integer | `0` | `0..65535` | UDP WebTransport/HTTP3 listener port. `mapToServerConfig` overlays it into `webtransport_port`, and `main.zig` starts `webtransport_listener.zig` when TLS certificate/signing material and the IRC listener are available (`src/daemon/config_boot.zig:45`, `src/main.zig:472`, `src/main.zig:494`). |
@@ -136,6 +136,8 @@ Source: struct at `src/daemon/config_format.zig:75`, parsing at `src/daemon/conf
 | `media` | port integer | `0` | `0..65535` | UDP media transport plane port; `0` means ephemeral (`src/daemon/config_boot.zig:27`, `src/daemon/server.zig:963`). |
 | `native_media` | port integer | `0` | `0..65535` | Native CadenceVox/CadenceVis media UDP port; `0` means ephemeral (`src/daemon/config_boot.zig:28`, `src/daemon/server.zig:971`). |
 | `media_host` | string | `"127.0.0.1"` | any string | Advertised media candidate host/IP for native Cadence UDP and WebRTC ICE. Default `127.0.0.1` is local-only; production native/WebRTC needs a public address or `[media].stun_host`/`stun_port`. Browser WS media does not use this candidate — enable `ws_media_relay` (MACKEY + binary WS). Loopback candidates are suppressed for WS clients (`src/daemon/config_boot.zig:29`, `src/daemon/server.zig` `provisionMediaTransports`). |
+
+For a Windows link-local bind, set `host = "fe80::abcd%7"` or `host = "fe80::abcd%Wi-Fi 2"`, replacing the address and zone with an address assigned to the local interface. The zone identifies the local interface, not a remote host. Windows Helix adoption checks the inherited listener's address, port, and scope against this configuration (`src/daemon/server.zig` `validateNativeListenerAddress`).
 
 ## `[mesh]`
 
@@ -152,9 +154,11 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 | `relay_v2_authoring` | string | `"compat"` | `"compat"`, `"active"` | Controls only local MESSAGE_V2 authoring. Compatibility nodes receive, ACK, retain, and forward V2 but author legacy only. Active nodes author each V2-eligible mesh event as V2 only; an admitted event never falls back to a legacy twin. Active mode requires a complete staged epoch/roster plan. |
 | `relay_v2_activation_epoch` | integer | `0` | `0..i64_max` | Monotonic operator rollout generation, not a timestamp. Zero means no plan. A non-zero value requires `relay_v2_roster`; the exact value is bound into current Helix state. |
 | `relay_v2_roster` | array of strings | `[]` | 2..4096 unique hex/base64 Ed25519 public keys | Complete secured-mesh node roster for the activation generation, distinct from direct-neighbor `trust_roots`. Onyx Server decodes and sorts the full keys, requires the local key and every direct-neighbor pin, and binds a domain-separated BLAKE3 digest into Helix. |
-| `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; IPv6 hosts must be bracketed (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:2249`). |
+| `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; bracket IPv6 literals, including scoped literals (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig` `parseHostPort` / `sockaddrForHost`). |
 | `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
 | `require_signed_frames` | bool | `true` | `true`/`false` | For secured S2S peers with a node signing key, require the remote handshake to advertise signed-frame support and reject unsigned direct-owned mesh state frames. Set false only for an explicit mixed-rollout window. |
+
+On Windows, a link-local peer can use `connect = ["[fe80::abcd%7]:6900"]` or `connect = ["[fe80::abcd%Wi-Fi 2]:6900"]`. The `%` zone names the **local outbound interface** by index or Windows interface alias; replace the sample address and zone for each node. A malformed scoped literal is rejected rather than sent to DNS (`src/daemon/windows_ipv6_scope.zig`, `src/daemon/server.zig` `sockaddrForHost`).
 
 Plaintext S2S applies when no node identity is available and `require_secured` is false. Secured S2S uses `[node].secret_key` when set; otherwise the daemon loads or creates `onyx-server-node.key` beside the config. Signed MeshPass admission is not available on plaintext S2S: if `admission_roots` is non-empty but the secured S2S identity path is unavailable, server initialization fails closed.
 
@@ -517,7 +521,7 @@ Source: struct at `src/daemon/config_format.zig:193`, parsing at `src/daemon/con
 
 Source: struct `Acme` at `src/daemon/config_format.zig:351`, parsing at `src/daemon/config_format.zig:625`, scheduler at `src/daemon/acme_renewal.zig`, reactor-0 hot-swap at `src/daemon/server.zig` (`maybeReloadAcmeTls`).
 
-Automatic in-daemon TLS certificate renewal (Linux only). A background thread checks the `[tls].cert_path` leaf expiry every `check_interval`; within `renew_before_days` of `notAfter` it issues a new certificate off the reactor and signals reactor 0 to hot-swap it without a restart. This requires `[tls]` with `cert_path` and `key_path`. Changing those paths via live REHASH while `[acme]` is enabled is unsupported.
+Automatic in-daemon TLS certificate renewal on Linux, OpenBSD, and Windows. A background thread checks the `[tls].cert_path` leaf expiry every `check_interval`; within `renew_before_days` of `notAfter` it issues a new certificate off the reactor and signals reactor 0 to hot-swap it without a restart. This requires `[tls]` with `cert_path` and `key_path`. Changing those paths via live REHASH while `[acme]` is enabled is unsupported. On Windows, set `ca_bundle_path` to a readable PEM trust bundle (the default is a Linux path) and create the key file's private parent directory with `onyx-server.exe --init-private-dir <path>`. Windows boot rejects an unreadable bundle or a broadly accessible key parent. Native loopback ACME issuance and worker startup are tested; issuance against a public CA still needs external acceptance. See the [Windows guide](../guide/windows.md).
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
@@ -527,15 +531,15 @@ Automatic in-daemon TLS certificate renewal (Linux only). A background thread ch
 | `contact` | string or null | unset | `mailto:…` | ACME account contact. |
 | `renew_before_days` | integer | `30` | `1..89` | Renew when the leaf is within N days of `notAfter`. |
 | `check_interval` | duration string | `"12h"` | positive `ms/s/m/h` duration | How often to check the leaf expiry. |
-| `ca_bundle_path` | string | `/etc/ssl/certs/ca-certificates.crt` | file path | PEM trust bundle used to verify the ACME API endpoint. Also used by Web Push trust-anchor loading. |
+| `ca_bundle_path` | string | `/etc/ssl/certs/ca-certificates.crt` | file path | PEM trust bundle used to verify the ACME API endpoint and load Web Push and OCSP trust anchors. Set a Windows path explicitly. |
 | `ca_bundle_max_bytes` | integer | `4194304` | `65536..67108864` | Maximum CA bundle file size read into memory. |
-| `challenge_port` | integer | `14402` | `1..65535` | Loopback HTTP-01 listener port that nginx proxies to. |
+| `challenge_port` | integer | `14402` | `1..65535` | Loopback HTTP-01 listener port to which the public HTTP endpoint forwards challenge requests. |
 | `max_steps` | integer | `64` | `8..1024` | ACME state-machine step limit before aborting. |
 | `debug` | bool | `false` | `true` or `false` | Log every ACME HTTP exchange; error bodies are still logged when false. |
 | `max_response_bytes` | integer | `262144` | `16384..4194304` | Maximum decrypted HTTP response body accepted from the ACME server. |
 | `error_body_preview_bytes` | integer | `512` | `0..4096` | Maximum RFC 7807 problem-body bytes included in ACME error logs. |
-| `resolv_conf_max_bytes` | integer | `65536` | `4096..1048576` | Maximum `/etc/resolv.conf` bytes read by the built-in resolver. |
-| `dns_port` | integer | `53` | `1..65535` | UDP port used for ACME endpoint A-record lookups. |
+| `resolv_conf_max_bytes` | integer | `65536` | `4096..1048576` | Maximum `/etc/resolv.conf` bytes read by the Unix built-in resolver; unused by the Windows DNS Client path. |
+| `dns_port` | integer | `53` | `1..65535` | UDP port used for Unix ACME endpoint A-record lookups; unused by the Windows DNS Client path. |
 | `http01_listen_backlog` | integer | `16` | `1..1024` | TCP listen backlog for the loopback HTTP-01 listener. |
 | `http01_accept_poll` | duration string | `"250ms"` | `50ms..5s` | Accept-loop wake interval used to re-check shutdown. |
 | `http01_conn_read_timeout` | duration string | `"5s"` | `1s..60s` | Per-challenge-connection read timeout. Whole seconds only. |
