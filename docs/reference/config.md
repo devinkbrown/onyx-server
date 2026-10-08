@@ -521,7 +521,7 @@ Source: struct at `src/daemon/config_format.zig:193`, parsing at `src/daemon/con
 
 Source: struct `Acme` at `src/daemon/config_format.zig:351`, parsing at `src/daemon/config_format.zig:625`, scheduler at `src/daemon/acme_renewal.zig`, reactor-0 hot-swap at `src/daemon/server.zig` (`maybeReloadAcmeTls`).
 
-Automatic in-daemon TLS certificate renewal (Linux only). A background thread checks the `[tls].cert_path` leaf expiry every `check_interval`; within `renew_before_days` of `notAfter` it issues a new certificate off the reactor and signals reactor 0 to hot-swap it without a restart. This requires `[tls]` with `cert_path` and `key_path`. Changing those paths via live REHASH while `[acme]` is enabled is unsupported.
+Automatic in-daemon TLS certificate renewal on Linux, OpenBSD, and Windows. A background thread checks the `[tls].cert_path` leaf expiry every `check_interval`; within `renew_before_days` of `notAfter` it issues a new certificate off the reactor and signals reactor 0 to hot-swap it without a restart. This requires `[tls]` with `cert_path` and `key_path`. Changing those paths via live REHASH while `[acme]` is enabled is unsupported. On Windows, set `ca_bundle_path` to a readable PEM trust bundle (the default is a Linux path) and create the key file's private parent directory with `onyx-server.exe --init-private-dir <path>`. Windows boot rejects an unreadable bundle or a broadly accessible key parent. Native loopback ACME issuance and worker startup are tested; issuance against a public CA still needs external acceptance. See the [Windows guide](../guide/windows.md).
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
@@ -531,15 +531,15 @@ Automatic in-daemon TLS certificate renewal (Linux only). A background thread ch
 | `contact` | string or null | unset | `mailto:…` | ACME account contact. |
 | `renew_before_days` | integer | `30` | `1..89` | Renew when the leaf is within N days of `notAfter`. |
 | `check_interval` | duration string | `"12h"` | positive `ms/s/m/h` duration | How often to check the leaf expiry. |
-| `ca_bundle_path` | string | `/etc/ssl/certs/ca-certificates.crt` | file path | PEM trust bundle used to verify the ACME API endpoint. Also used by Web Push trust-anchor loading. |
+| `ca_bundle_path` | string | `/etc/ssl/certs/ca-certificates.crt` | file path | PEM trust bundle used to verify the ACME API endpoint and load Web Push and OCSP trust anchors. Set a Windows path explicitly. |
 | `ca_bundle_max_bytes` | integer | `4194304` | `65536..67108864` | Maximum CA bundle file size read into memory. |
-| `challenge_port` | integer | `14402` | `1..65535` | Loopback HTTP-01 listener port that nginx proxies to. |
+| `challenge_port` | integer | `14402` | `1..65535` | Loopback HTTP-01 listener port to which the public HTTP endpoint forwards challenge requests. |
 | `max_steps` | integer | `64` | `8..1024` | ACME state-machine step limit before aborting. |
 | `debug` | bool | `false` | `true` or `false` | Log every ACME HTTP exchange; error bodies are still logged when false. |
 | `max_response_bytes` | integer | `262144` | `16384..4194304` | Maximum decrypted HTTP response body accepted from the ACME server. |
 | `error_body_preview_bytes` | integer | `512` | `0..4096` | Maximum RFC 7807 problem-body bytes included in ACME error logs. |
-| `resolv_conf_max_bytes` | integer | `65536` | `4096..1048576` | Maximum `/etc/resolv.conf` bytes read by the built-in resolver. |
-| `dns_port` | integer | `53` | `1..65535` | UDP port used for ACME endpoint A-record lookups. |
+| `resolv_conf_max_bytes` | integer | `65536` | `4096..1048576` | Maximum `/etc/resolv.conf` bytes read by the Unix built-in resolver; unused by the Windows DNS Client path. |
+| `dns_port` | integer | `53` | `1..65535` | UDP port used for Unix ACME endpoint A-record lookups; unused by the Windows DNS Client path. |
 | `http01_listen_backlog` | integer | `16` | `1..1024` | TCP listen backlog for the loopback HTTP-01 listener. |
 | `http01_accept_poll` | duration string | `"250ms"` | `50ms..5s` | Accept-loop wake interval used to re-check shutdown. |
 | `http01_conn_read_timeout` | duration string | `"5s"` | `1s..60s` | Per-challenge-connection read timeout. Whole seconds only. |
