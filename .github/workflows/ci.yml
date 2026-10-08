@@ -336,6 +336,58 @@ jobs:
       - name: Run configured Windows security and listener failure smoke
         run: python -B .\tools\windows_startup_intent_smoke.py .\zig-out\bin\onyx-server.exe
 
+  # The pinned x86_64 Zig compiler runs under Windows 11 ARM64 emulation. The
+  # explicit target produces a native ARM64 daemon, which the smokes launch
+  # directly so Zig does not need to run a cross-target build artifact.
+  windows-arm64:
+    name: native Windows ARM64 package and runtime
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and verify pinned Windows Zig
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://pkg.hexops.org/zig/zig-x86_64-windows-0.17.0-dev.1282+c0f9b51d8.zip'
+          $expectedSha256 = 'DF1CA8156908BD51B417265773092DDF41A1D307F0E93B28BB3E8A0B912D0681'
+          $archive = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows.zip'
+          $installRoot = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Zig archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $installRoot
+          $zigExe = Get-ChildItem -LiteralPath $installRoot -Filter zig.exe -File -Recurse | Select-Object -First 1
+          if ($null -eq $zigExe) { throw 'Pinned Zig archive contains no zig.exe' }
+          $actualVersion = (& $zigExe.FullName version).Trim()
+          if ($actualVersion -ne $env:ZIG_VERSION) {
+            throw "Zig version mismatch: expected $env:ZIG_VERSION, got $actualVersion"
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $zigExe.DirectoryName
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Semantic check (Windows ARM64)
+        run: zig build -j1 check -Dtarget=aarch64-windows --summary all
+      - name: Build Windows ARM64 release package
+        run: zig build -j1 package -Dtarget=aarch64-windows --prefix .\zig-out-arm64 --summary all
+      - name: Verify native ARM64 package image
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ARCH -ne 'ARM64') { throw "Wrong runner architecture: $env:RUNNER_ARCH" }
+          $binary = (Resolve-Path '.\zig-out-arm64\bin\onyx-server.exe').Path
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0xAA64) { throw ('Wrong PE machine: 0x{0:X4}' -f $machine) }
+      - name: Smoke Windows ARM64 packaged quickstart
+        run: python -B .\tools\windows_quickstart_smoke.py .\zig-out-arm64\bin\onyx-server.exe --template .\zig-out-arm64\etc\onyx-server\onyx-server.windows.quickstart.toml
+      - name: Smoke Windows ARM64 full daemon
+        run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out-arm64\bin\onyx-server.exe --tls --wss --metrics --webhook
+
   build-test:
     name: build & test
     runs-on: ubuntu-latest
