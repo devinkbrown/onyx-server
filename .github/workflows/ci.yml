@@ -101,6 +101,10 @@ jobs:
         run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --tls --wss --metrics --webhook
       - name: Smoke packaged Windows quickstart
         run: python -B .\tools\windows_quickstart_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --template .\zig-out-selfhosted\etc\onyx-server\onyx-server.windows.quickstart.toml
+      # The hosted Windows runner is disposable and elevated. The fixture
+      # refuses installation if an exact-name service already exists.
+      - name: Smoke real Windows SCM service and Helix lifecycle
+        run: python -B .\tools\windows_scm_service_smoke.py .\zig-out-selfhosted\bin\onyx-server.exe --allow-service-install
       - name: Build native Windows QUIC interop tools
         run: zig build -j1 quic-interop-server quic-interop-wt-server -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
       - name: Run standalone Windows WebTransport browser interop
