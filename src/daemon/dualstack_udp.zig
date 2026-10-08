@@ -542,6 +542,24 @@ test "Windows dual-stack UDP serves mapped IPv4 and native IPv6 and bounds idle 
     try testing.expect(@import("../substrate/platform.zig").monotonicMillis() - before < 1000);
 }
 
+test "Windows dual-stack UDP keeps an exclusive wildcard bind until close" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const MediaSocket = @import("../substrate/media_socket.zig").MediaSocket;
+    const loopback_be = @import("../substrate/media_socket.zig").loopback_be;
+    const port = blk: {
+        var owner = try DualStackUdpSocket.bind(.any, 0);
+        defer owner.deinit();
+        const bound_port = try owner.localPort();
+        try testing.expectError(error.BindFailed, DualStackUdpSocket.bind(.any, bound_port));
+        try testing.expectError(error.BindFailed, DualStackUdpSocket.bind(.{ .v4_mapped = .{ 127, 0, 0, 1 } }, bound_port));
+        try testing.expectError(error.BindFailed, MediaSocket.bind(loopback_be, bound_port));
+        break :blk bound_port;
+    };
+    var replacement = try DualStackUdpSocket.bind(.any, port);
+    defer replacement.deinit();
+    try testing.expectEqual(port, try replacement.localPort());
+}
+
 test "Windows UDP custody dual-stack imports the exact bound socket and rejects endpoint substitution" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const MediaSocket = @import("../substrate/media_socket.zig").MediaSocket;
@@ -702,8 +720,34 @@ test "toSockaddrIn6 drops a TransportAddress with an unexpected ip_len" {
 }
 
 test "dualstack socket: bind on [::], ephemeral port, clean shutdown, v4 receive" {
-    // `bindNative` has no Windows support (`SOCK_CLOEXEC`); skip there.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .windows) {
+        const MediaSocket = @import("../substrate/media_socket.zig").MediaSocket;
+        const loopback_be = @import("../substrate/media_socket.zig").loopback_be;
+        var server = try DualStackUdpSocket.bind(.any, 0);
+        defer server.deinit();
+        server.setRecvTimeoutMs(2000);
+        const port = try server.localPort();
+        try testing.expect(port != 0);
+
+        // Use an independent AF_INET socket, so this proves that the wildcard
+        // IPv6 bind also receives a real IPv4 datagram on Windows.
+        var client = try MediaSocket.bind(loopback_be, 0);
+        defer client.deinit();
+        client.setRecvTimeoutMs(2000);
+        const client_port = try client.localPort();
+        client.sendTo(try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, port), "v4-hello");
+
+        var buf: [64]u8 = undefined;
+        const received = server.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("v4-hello", received.data);
+        try testing.expectEqual(@as(u8, 4), received.from.ip_len);
+        try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, received.from.bytes());
+        try testing.expectEqual(client_port, received.from.port);
+        server.sendTo(received.from, "v4-reply");
+        const reply = client.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("v4-reply", reply.data);
+        return;
+    }
     // The server binds [::]:0 (dual-stack). An IPv4 loopback client must reach it
     // as a v4-mapped source surfaced as an ipv4 TransportAddress.
     var server = DualStackUdpSocket.bind(.any, 0) catch return error.SkipZigTest;
@@ -752,8 +796,29 @@ test "dualstack socket: bind on [::], ephemeral port, clean shutdown, v4 receive
 }
 
 test "dualstack socket: IPv6 loopback receive (skips if no v6 loopback)" {
-    // `bindNative` has no Windows support (`SOCK_CLOEXEC`); skip there.
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .windows) {
+        var server = try DualStackUdpSocket.bind(.any, 0);
+        defer server.deinit();
+        server.setRecvTimeoutMs(2000);
+        var client = try DualStackUdpSocket.bind(.loopback_v6, 0);
+        defer client.deinit();
+        client.setRecvTimeoutMs(2000);
+        const client_port = try client.localPort();
+        var loopback: [16]u8 = @splat(0);
+        loopback[15] = 1;
+        client.sendTo(try TransportAddress.fromBytes(&loopback, try server.localPort()), "v6-hello");
+
+        var buf: [64]u8 = undefined;
+        const received = server.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("v6-hello", received.data);
+        try testing.expectEqual(@as(u8, 16), received.from.ip_len);
+        try testing.expectEqualSlices(u8, &loopback, received.from.bytes());
+        try testing.expectEqual(client_port, received.from.port);
+        server.sendTo(received.from, "v6-reply");
+        const reply = client.recvFrom(&buf) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("v6-reply", reply.data);
+        return;
+    }
     var server = DualStackUdpSocket.bind(.any, 0) catch return error.SkipZigTest;
     defer server.deinit();
     server.setRecvTimeoutMs(2000);
@@ -988,7 +1053,8 @@ fn observeDatagram(fd: Socket) !DatagramObservation {
 }
 
 test "companion runtime dualstack native pair exact inherited custody and live OLD traffic" {
-    // Direct `bindNative`/`capture` use; no Windows support (`SOCK_CLOEXEC`).
+    // This exercises the POSIX two-descriptor custody path. Windows uses a
+    // single Winsock socket with PID-scoped duplicate custody, tested above.
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     // Exercise the native pair algorithm on Linux too, rather than relying on
     // the mapped one-FD implementation to stand in for native pair custody.
@@ -1044,7 +1110,8 @@ test "companion runtime dualstack native pair exact inherited custody and live O
 }
 
 test "companion runtime native socket observation refuses a rebound endpoint as original custody" {
-    // Direct `bindNative` use; no Windows support (`SOCK_CLOEXEC`).
+    // This exercises POSIX descriptor identity. Windows uses PID-scoped
+    // duplicate custody and rejects endpoint substitution in the tests above.
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const loopback = DualStackUdpSocket.BindAddr{ .v4_mapped = .{ 127, 0, 0, 1 } };
     const carry = blk: {

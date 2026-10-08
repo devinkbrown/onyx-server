@@ -78,6 +78,8 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $zigExe.DirectoryName
       - name: Semantic check
         run: zig build -j1 check -Dtarget=x86_64-windows --summary all
+      - name: Semantic check (Windows ARM64 cross target)
+        run: zig build -j1 check -Dtarget=aarch64-windows --summary all
       - name: Build (debug)
         run: zig build -j1 -Dtarget=x86_64-windows --summary all
       - name: Run focused Windows tests (Debug)
@@ -166,6 +168,9 @@ jobs:
         run: python -B .\tools\windows_session_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded native Windows Helix sequential upgrade smoke
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe
+      # The smoke prints SKIP when no preferred assigned link-local IPv6 address exists.
+      - name: Run scoped IPv6 Windows Helix listener smoke
+        run: python -B .\tools\windows_helix_scoped_ipv6_smoke.py .\zig-out\bin\onyx-server.exe
       - name: Run guarded Windows Helix with an inert native media port
         run: python -B .\tools\windows_helix_smoke.py .\zig-out\bin\onyx-server.exe --inert-native-port
       # This ancestor still speaks the v17 Windows Helix protocol. Build it

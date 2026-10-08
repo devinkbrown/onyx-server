@@ -8,10 +8,10 @@
 //! Windows implements them on an I/O completion port: AFD receive and send,
 //! AFD wait-for-listen and AFD poll, ConnectEx, `NtCancelIoFileEx`, and
 //! monotonic timers.
-//! `Iocp.open` loads the Winsock Registered I/O function table and returns
-//! `error.MissingOp` when that table is missing. `dequeueRegistered` is what
-//! calls those pointers. `reap` reports one-shot completions: the ring
-//! reports the completion, kqueue performs the syscall, and IOCP collects
+//! `Iocp.open` probes the optional Winsock Registered I/O function table;
+//! ordinary IOCP operations work when that table is missing.
+//! `dequeueRegistered` is what calls those pointers. `reap` reports one-shot
+//! completions: the ring reports the completion, kqueue performs the syscall, and IOCP collects
 //! `NtRemoveIoCompletion` then adopts a waited listen. A failed individual
 //! request has a negative result; an unusable port or queue fails closed.
 //! Helix USR2 adoption stays on `LinuxServer`.
@@ -457,7 +457,7 @@ pub const WindowsTcpEndpoint = struct {
     port: u16,
 };
 
-pub const WindowsListenerObservation = struct { local: WindowsTcpEndpoint };
+pub const WindowsListenerObservation = struct { local: WindowsTcpEndpoint, scope_id: u32 = 0 };
 pub const WindowsConnectedObservation = struct { local: WindowsTcpEndpoint, peer: WindowsTcpEndpoint };
 pub const WindowsHelixConnectedObservation = struct { local: WindowsTcpEndpoint, peer: ?WindowsTcpEndpoint };
 pub const WindowsTcpObservationError = error{ Unsupported, InvalidSocket, NotTcp, NotListening, NotConnected, SocketFailed };
@@ -487,6 +487,10 @@ fn windowsTcpEndpoint(name: RioSockAddr6) WindowsTcpObservationError!WindowsTcpE
     };
 }
 
+fn windowsListenerScopeId(name: RioSockAddr6) u32 {
+    return if (name.family == wsa_af_inet6) name.scope_id else 0;
+}
+
 /// Observe the actual bound endpoint of a registered listening TCP SOCKET.
 /// This is the authoritative family/host/port for the strict listener join.
 pub fn observeWindowsListeningTcpSocket(fd: linux.fd_t) WindowsTcpObservationError!WindowsListenerObservation {
@@ -496,7 +500,7 @@ pub fn observeWindowsListeningTcpSocket(fd: linux.fd_t) WindowsTcpObservationErr
     const name = socketName(socket) catch return error.SocketFailed;
     const local = try windowsTcpEndpoint(name);
     if (local.port == 0) return error.NotListening;
-    return .{ .local = local };
+    return .{ .local = local, .scope_id = windowsListenerScopeId(name) };
 }
 
 /// A state socket must have a live TCP peer; an unbound or listening stream
@@ -594,6 +598,7 @@ test "Windows Helix TCP observation distinguishes listening and connected regist
     const observed = try observeWindowsListeningTcpSocket(listener.fd);
     try std.testing.expectEqual(listener.port, observed.local.port);
     try std.testing.expectEqual(PeerAddress{ .ipv4 = .{ 127, 0, 0, 1 } }, observed.local.address);
+    try std.testing.expectEqual(@as(u32, 0), observed.scope_id);
     try std.testing.expectError(error.NotConnected, observeWindowsConnectedTcpSocket(listener.fd));
     try std.testing.expectError(error.NotConnected, observeWindowsHelixConnectedTcpSocket(listener.fd));
 
@@ -624,6 +629,44 @@ test "Windows Helix TCP observation distinguishes listening and connected regist
     _ = try observeWindowsConnectedTcpSocket(accepted);
     try observeWindowsHelixConnectedTcpSocket(client);
     try observeWindowsHelixConnectedTcpSocket(accepted);
+}
+
+test "Windows listener observation preserves IPv6 scope identity" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var synthetic = RioSockAddr6{
+        .family = @intCast(wsa_af_inet6),
+        .port = 0,
+        .flowinfo = 0,
+        .addr = @splat(0),
+        .scope_id = 19,
+    };
+    try std.testing.expectEqual(@as(u32, 19), windowsListenerScopeId(synthetic));
+    synthetic.family = @intCast(wsa_af_inet);
+    try std.testing.expectEqual(@as(u32, 0), windowsListenerScopeId(synthetic));
+
+    const fd = openWindowsTcpSocket(wsa_af_inet6) catch |err| switch (err) {
+        error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeSocket(fd);
+    const loopback = RioSockAddr6{
+        .family = @intCast(wsa_af_inet6),
+        .port = 0,
+        .flowinfo = 0,
+        .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .scope_id = 0,
+    };
+    bindWindowsSocket(fd, @ptrCast(&loopback), @sizeOf(RioSockAddr6)) catch |err| switch (err) {
+        error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    try listenWindowsSocket(fd, 8);
+    const handle = windows_sockets.get(fd) orelse return error.InvalidSocket;
+    const name = try socketName(handle);
+    const observed = try observeWindowsListeningTcpSocket(fd);
+    try std.testing.expectEqual(PeerAddress{ .ipv6 = loopback.addr }, observed.local.address);
+    try std.testing.expect(observed.local.port != 0);
+    try std.testing.expectEqual(name.scope_id, observed.scope_id);
 }
 
 pub fn socketPort(fd: linux.fd_t) error{ Unsupported, SocketFailed }!u16 {
@@ -1311,6 +1354,74 @@ test "Windows IOCP associates each socket lifetime and drains cancellation" {
     }
 }
 
+test "Windows IOCP accepts and receives when optional RIO probe is missing" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const Probe = struct {
+        fn missing() error{MissingOp}!RioTable {
+            return error.MissingOp;
+        }
+
+        fn unexpected() error{RioProbeFailure}!RioTable {
+            return error.RioProbeFailure;
+        }
+
+        fn malformed() error{ MissingOp, MalformedRioTable }!RioTable {
+            return validateRioIoctlResult(0, .{ .cb_size = @sizeOf(RioTable) }, @sizeOf(RioTable));
+        }
+    };
+    try std.testing.expectError(error.RioProbeFailure, Iocp.openWithRioProbe(8, Probe.unexpected));
+    try std.testing.expectError(error.MalformedRioTable, Iocp.openWithRioProbe(8, Probe.malformed));
+    try std.testing.expectError(error.MissingOp, validateRioIoctlResult(-1, .{}, 0));
+    try std.testing.expectError(error.MalformedRioTable, validateRioIoctlResult(0, .{}, @sizeOf(RioTable) - 1));
+
+    var port = try Iocp.openWithRioProbe(8, Probe.missing);
+    defer port.deinit();
+    var backend = IoBackend{ .family = .iocp, .entries = 8, .iocp = &port };
+    try backend.requireAll();
+    try std.testing.expect(port.port != 0);
+    try std.testing.expect(!rioTableUsable(&port.rio));
+    const witness = backend.dequeueRegistered();
+    try std.testing.expect(!witness.ok);
+    try std.testing.expectEqualStrings("unavailable", witness.stage);
+
+    const listener = try listenTcp("127.0.0.1", 0);
+    defer closeSocket(listener.fd);
+    const peer = WSASocketW(wsa_af_inet, wsa_sock_stream, wsa_ipproto_tcp, null, 0, wsa_flag_overlapped);
+    if (!socketLive(peer)) return error.SocketUnavailable;
+    defer _ = closesocket(peer);
+    var accepted: linux.fd_t = -1;
+    defer closeSocket(accepted);
+    defer backend.quiesce() catch @panic("IOCP missing-RIO test left requests live");
+
+    const accept_token = ringlane.FdToken{ .slot = 61, .gen = 1 };
+    try backend.accept(accept_token, listener.fd);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    const addr = RioSockAddr{
+        .family = @intCast(wsa_af_inet),
+        .port = std.mem.nativeToBig(u16, listener.port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .zero = @splat(0),
+    };
+    if (connect(peer, &addr, @sizeOf(RioSockAddr)) != 0) return error.SocketUnavailable;
+    var events: [1]Reaped = undefined;
+    try std.testing.expectEqual(@as(u32, 1), try backend.reap(&events, 1000));
+    try std.testing.expectEqual(Op.accept, events[0].op);
+    try std.testing.expectEqual(accept_token, events[0].token);
+    try std.testing.expect(events[0].result >= 0);
+    accepted = events[0].result;
+
+    var received: [4]u8 = undefined;
+    const recv_token = ringlane.FdToken{ .slot = 62, .gen = 1 };
+    try backend.recv(recv_token, accepted, &received);
+    try std.testing.expectEqual(@as(u32, 1), try backend.submit());
+    try std.testing.expectEqual(@as(i32, 4), send(peer, "IOCP", 4, 0));
+    try std.testing.expectEqual(@as(u32, 1), try backend.reap(&events, 1000));
+    try std.testing.expectEqual(Op.recv, events[0].op);
+    try std.testing.expectEqual(recv_token, events[0].token);
+    try std.testing.expectEqual(@as(i32, 4), events[0].result);
+    try std.testing.expectEqualSlices(u8, "IOCP", &received);
+}
+
 test "Windows IOCP quiesce drains more than 64 pending requests" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     var backend = try IoBackend.openOwned(.iocp, 128, .{});
@@ -1489,7 +1600,7 @@ test "Windows AFD adopted sockets can half-close with a TCP FIN" {
 
 pub const ListenError = error{ InvalidAddress, SocketUnavailable, AddressInUse, PermissionDenied, Unsupported };
 
-/// One `RIODequeueCompletion` against the table `Iocp.open` stored.
+/// One `RIODequeueCompletion` against the optional table `Iocp.open` stored.
 /// `ok` is true only when that call returned a 4-byte success and the peer
 /// socket read those same bytes. A closed port, a non-Windows host, or a
 /// kernel error leaves `ok` false and names the failing `stage`.
@@ -1856,7 +1967,8 @@ pub const IoBackend = struct {
     pub fn dequeueRegistered(self: *IoBackend) RioWitness {
         if (comptime builtin.os.tag != .windows) return .{ .stage = "off-windows" };
         const iocp = self.iocp orelse return .{ .stage = "closed" };
-        if (iocp.port == 0 or !rioTableUsable(&iocp.rio)) return .{ .stage = "closed" };
+        if (iocp.port == 0) return .{ .stage = "closed" };
+        if (!rioTableUsable(&iocp.rio)) return .{ .stage = "unavailable" };
         return dequeueLoadedRio(&iocp.rio);
     }
 
@@ -2728,9 +2840,10 @@ const Kqueue = struct {
 /// receive is `STATUS_CONNECTION_RESET`, so the sequence from the wait is
 /// what adopts the connection.
 ///
-/// Open also loads `RIO_EXTENSION_FUNCTION_TABLE` through `WSAIoctl`. A failed
-/// or partial table closes the new port and returns `error.MissingOp`.
-/// `dequeueRegistered` calls that stored table; nothing else does.
+/// Open also probes `RIO_EXTENSION_FUNCTION_TABLE` through `WSAIoctl`.
+/// An unsupported probe leaves ordinary IOCP available; a malformed
+/// successful probe closes the port. `dequeueRegistered` calls the table
+/// only when the probe succeeded.
 ///
 /// `ntdll` and `ws2_32` calls sit in functions that are not analyzed unless
 /// `builtin.os.tag == .windows`. This Linux host does not execute them.
@@ -2794,7 +2907,7 @@ const Iocp = struct {
     port: usize = 0,
     cap: u16 = 0,
     n: u16 = 0,
-    /// Empty unless `open` stored a table `rioTableUsable` accepted.
+    /// Empty when the optional Registered I/O probe was unsupported.
     rio: RioTable = .{},
     packets: [submit_batch]Packet = @splat(.{}),
     regs: []Reg = &.{},
@@ -2887,6 +3000,10 @@ const Iocp = struct {
     }
 
     pub fn open(entries: u16) !Iocp {
+        return openWithRioProbe(entries, loadRioForDaemon);
+    }
+
+    fn openWithRioProbe(entries: u16, comptime probe: anytype) !Iocp {
         if (entries == 0) return error.MissingOp;
         if (comptime builtin.os.tag != .windows) return error.MissingOp;
         const port = try openHandle();
@@ -2894,16 +3011,21 @@ const Iocp = struct {
             .port = port,
             .cap = batchCap(entries),
         };
-        // The Registered I/O table is part of opening the Windows backend.
-        // A missing table is not an open port with ordinary sockets underneath.
-        opened.rio = loadRioForDaemon() catch |err| {
-            opened.deinit();
-            return err;
+        // Registered I/O is optional. Only its explicit witness needs this
+        // table; ordinary accept, recv, and send use AFD on the IOCP port.
+        const probed: anyerror!RioTable = probe();
+        const table = probed catch |err| switch (err) {
+            error.MissingOp => return opened,
+            else => {
+                opened.deinit();
+                return err;
+            },
         };
-        if (!rioTableUsable(&opened.rio)) {
+        if (!rioTableUsable(&table)) {
             opened.deinit();
-            return error.MissingOp;
+            return error.MalformedRioTable;
         }
+        opened.rio = table;
         return opened;
     }
 
@@ -3983,7 +4105,7 @@ fn loadRioForDaemon() !RioTable {
     const sock = try openRegisteredSocket();
     defer closeRegisteredSocket(sock);
     const table = try loadRegisteredIo(sock);
-    if (!rioTableUsable(&table)) return error.MissingOp;
+    if (!rioTableUsable(&table)) return error.MalformedRioTable;
     return table;
 }
 
@@ -4023,9 +4145,12 @@ fn ioctlRegisteredIo(socket: usize) !RioTable {
         null,
         null,
     );
+    return validateRioIoctlResult(rc, table, bytes);
+}
+
+fn validateRioIoctlResult(rc: i32, table: RioTable, bytes: u32) error{ MissingOp, MalformedRioTable }!RioTable {
     if (rc != 0) return error.MissingOp;
-    if (bytes < @sizeOf(RioTable)) return error.MissingOp;
-    if (!rioTableUsable(&table)) return error.MissingOp;
+    if (bytes < @sizeOf(RioTable) or !rioTableUsable(&table)) return error.MalformedRioTable;
     return table;
 }
 
@@ -5186,7 +5311,7 @@ test "GAP-X3 Windows RIO fails closed off Windows" {
     try std.testing.expectError(error.MissingOp, loadRioForDaemon());
     try std.testing.expectError(error.Unsupported, refusePortableReactor(.windows, 32));
 
-    std.debug.print("GAP-X3 branch=windows RIO loads the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; dequeueRegistered calls that stored table; off Windows it returns stage off-windows before any pointer call; a null or short table is MissingOp and the port is closed; recv and send on the IOCP path are IOCTL_AFD_RECEIVE and IOCTL_AFD_SEND; this host did not execute WSAIoctl or RIODequeueCompletion; heading stays unmarked; whole-accept not claimed\n", .{});
+    std.debug.print("GAP-X3 branch=windows RIO probes the function table with WSAIoctl SIO 0xC8000024 and GUID 8509e081-96dd-4005-b165-9e2ee8c79e3f on a WSA_FLAG_REGISTERED_IO socket during Iocp.open; dequeueRegistered calls that stored table; off Windows it returns stage off-windows before any pointer call; an unsupported probe leaves ordinary IOCP usable, while a successful malformed table closes the port with MalformedRioTable; recv and send on the IOCP path are IOCTL_AFD_RECEIVE and IOCTL_AFD_SEND; this host did not execute WSAIoctl or RIODequeueCompletion; heading stays unmarked; whole-accept not claimed\n", .{});
 }
 
 test "kqueue: full-runtime canceled original is reserved before successful delete publication" {

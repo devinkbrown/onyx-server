@@ -802,7 +802,8 @@ const win = struct {
     const so_rcvtimeo: i32 = 0x1006;
     const so_sndtimeo: i32 = 0x1005;
     const error_buffer_overflow: u32 = 111;
-    const max_adapter_bytes: usize = 256 * 1024;
+    const max_adapter_bytes: usize = 4 * 1024 * 1024;
+    const if_oper_status_up: u32 = 1;
 
     const SocketAddress = extern struct {
         sockaddr: ?*const anyopaque,
@@ -823,6 +824,16 @@ const win = struct {
         first_anycast: ?*anyopaque,
         first_multicast: ?*anyopaque,
         first_dns: ?*DnsServerAddress,
+        dns_suffix: ?[*:0]const u16,
+        description: ?[*:0]const u16,
+        friendly_name: ?[*:0]const u16,
+        physical_address: [8]u8,
+        physical_address_length: u32,
+        flags: u32,
+        mtu: u32,
+        if_type: u32,
+        oper_status: u32,
+        ipv6_if_index: u32,
     };
     const SockAddr4 = extern struct {
         family: u16,
@@ -839,7 +850,8 @@ const win = struct {
     };
 
     comptime {
-        if (@sizeOf(AdapterAddresses) != 56 or @offsetOf(AdapterAddresses, "first_dns") != 48 or
+        if (@sizeOf(AdapterAddresses) != 112 or @offsetOf(AdapterAddresses, "first_dns") != 48 or
+            @offsetOf(AdapterAddresses, "oper_status") != 104 or
             @sizeOf(DnsServerAddress) != 32 or @sizeOf(SockAddr4) != 16 or @sizeOf(SockAddr6) != 28)
             @compileError("Windows DNS socket ABI shape changed");
     }
@@ -958,52 +970,185 @@ pub fn systemResolverConfig() ResolverConfig {
 
 fn windowsSystemNameservers(cfg: *ResolverConfig) void {
     if (comptime builtin.os.tag != .windows) return;
-    var bytes_needed: u32 = 0;
-    if (win.GetAdaptersAddresses(win.af_unspec, 0, null, null, &bytes_needed) != win.error_buffer_overflow or
-        bytes_needed < @sizeOf(win.AdapterAddresses) or bytes_needed > win.max_adapter_bytes) return;
-    const bytes = std.heap.page_allocator.alignedAlloc(u8, .@"8", @intCast(bytes_needed)) catch return;
-    defer std.heap.page_allocator.free(bytes);
-    var actual_size = bytes_needed;
-    const first: *win.AdapterAddresses = @ptrCast(bytes.ptr);
-    if (win.GetAdaptersAddresses(win.af_unspec, 0, null, first, &actual_size) != 0 or
-        @as(usize, actual_size) > bytes.len) return;
-    const filled = bytes[0..@intCast(actual_size)];
+    // Microsoft recommends a 15 KiB starting buffer. Retry if the adapter
+    // list changes between sizing and filling instead of dropping DNS entirely.
+    var bytes_needed: u32 = 15 * 1024;
+    for (0..4) |_| {
+        if (bytes_needed > win.max_adapter_bytes) return;
+        const bytes = std.heap.page_allocator.alignedAlloc(u8, .@"8", @intCast(bytes_needed)) catch return;
+        defer std.heap.page_allocator.free(bytes);
+        var actual_size = bytes_needed;
+        const first: *win.AdapterAddresses = @ptrCast(bytes.ptr);
+        const status = win.GetAdaptersAddresses(win.af_unspec, 0, null, first, &actual_size);
+        if (status == win.error_buffer_overflow) {
+            if (actual_size <= bytes_needed) return;
+            bytes_needed = actual_size;
+            continue;
+        }
+        if (status != 0 or actual_size < @sizeOf(win.AdapterAddresses) or
+            @as(usize, actual_size) > bytes.len) return;
+        if (windowsCollectNameservers(cfg, first, bytes[0..@intCast(actual_size)]))
+            std.log.warn("Windows exposes more DNS servers than the resolver's {} slots; selected servers across operational adapters by priority", .{max_nameservers});
+        return;
+    }
+}
 
+const WindowsDnsCandidate = struct {
+    address: Address,
+    scope_id: u32,
+    // Prefer the first usable server on each adapter before its backups so
+    // four entries from one adapter cannot hide another adapter's resolver.
+    backup: bool,
+    // GetAdaptersAddresses orders adapters by route metric on Windows 10+.
+    // Its native order also reflects the user-set binding order on older OSes.
+    adapter_order: usize,
+    sequence: usize,
+
+    fn before(a: @This(), b: @This()) bool {
+        if (a.backup != b.backup) return !a.backup;
+        if (a.adapter_order != b.adapter_order) return a.adapter_order < b.adapter_order;
+        return a.sequence < b.sequence;
+    }
+
+    fn queryBefore(a: @This(), b: @This()) bool {
+        if (a.adapter_order != b.adapter_order) return a.adapter_order < b.adapter_order;
+        return a.sequence < b.sequence;
+    }
+};
+
+const WindowsDnsSelection = struct {
+    candidates: [max_nameservers]WindowsDnsCandidate = undefined,
+    count: usize = 0,
+    overflowed: bool = false,
+
+    fn consider(self: *@This(), candidate: WindowsDnsCandidate) void {
+        var selected = candidate;
+        for (self.candidates[0..self.count], 0..) |existing, index| {
+            if (!addressEql(existing.address, candidate.address) or existing.scope_id != candidate.scope_id) continue;
+            // Keep the first query position, but count the endpoint as an
+            // adapter primary if any adapter lists it first. Otherwise a
+            // later primary could be evicted merely because it also appears
+            // as an earlier adapter's backup.
+            if (!existing.backup or candidate.backup) return;
+            selected = existing;
+            selected.backup = false;
+            var shift = index;
+            while (shift + 1 < self.count) : (shift += 1) self.candidates[shift] = self.candidates[shift + 1];
+            self.count -= 1;
+            break;
+        }
+
+        var insert_at: usize = 0;
+        while (insert_at < self.count and !selected.before(self.candidates[insert_at])) : (insert_at += 1) {}
+        if (self.count == max_nameservers and insert_at == max_nameservers) {
+            self.overflowed = true;
+            return;
+        }
+        if (self.count == max_nameservers) {
+            self.overflowed = true;
+        } else {
+            self.count += 1;
+        }
+        var shift = self.count - 1;
+        while (shift > insert_at) : (shift -= 1) self.candidates[shift] = self.candidates[shift - 1];
+        self.candidates[insert_at] = selected;
+    }
+
+    fn write(self: *const @This(), cfg: *ResolverConfig) void {
+        // Selection favors adapter diversity; query order must still honor
+        // Windows' adapter priority and each adapter's DNS server order. A
+        // lower-priority adapter's NXDOMAIN must not preempt a preferred
+        // adapter's backup server in a split-DNS setup.
+        var ordered: [max_nameservers]WindowsDnsCandidate = undefined;
+        @memcpy(ordered[0..self.count], self.candidates[0..self.count]);
+        if (self.count > 1) {
+            for (1..self.count) |index| {
+                const candidate = ordered[index];
+                var insert_at = index;
+                while (insert_at > 0 and candidate.queryBefore(ordered[insert_at - 1])) : (insert_at -= 1)
+                    ordered[insert_at] = ordered[insert_at - 1];
+                ordered[insert_at] = candidate;
+            }
+        }
+        for (ordered[0..self.count]) |candidate|
+            cfg.addSystemNameserver(candidate.address, candidate.scope_id);
+    }
+};
+
+fn windowsCollectNameservers(cfg: *ResolverConfig, first: *win.AdapterAddresses, filled: []const u8) bool {
+    var selection = WindowsDnsSelection{};
     var adapter: ?*win.AdapterAddresses = first;
     var adapter_count: usize = 0;
+    var sequence: usize = 0;
     while (adapter) |item| : (adapter_count += 1) {
-        if (adapter_count == 128 or cfg.nameserver_count == max_nameservers or
+        if (adapter_count >= filled.len / @sizeOf(win.AdapterAddresses) or
             !windowsPointerInBuffer(win.AdapterAddresses, item, filled) or
             item.length < @sizeOf(win.AdapterAddresses)) break;
+        adapter = item.next;
+        if (item.oper_status != win.if_oper_status_up) continue;
+
         var server = item.first_dns;
         var server_count: usize = 0;
+        var usable_count: usize = 0;
         while (server) |dns_server| : (server_count += 1) {
-            if (server_count == 128 or cfg.nameserver_count == max_nameservers or
+            if (server_count >= filled.len / @sizeOf(win.DnsServerAddress) or
                 !windowsPointerInBuffer(win.DnsServerAddress, dns_server, filled) or
                 dns_server.length < @sizeOf(win.DnsServerAddress)) break;
-            if (dns_server.address.sockaddr) |raw| {
-                if (dns_server.address.length >= @sizeOf(u16) and
-                    windowsPointerInBuffer(u16, raw, filled))
-                {
-                    const family: *const u16 = @ptrCast(@alignCast(raw));
-                    if (family.* == win.af_inet and dns_server.address.length >= @sizeOf(win.SockAddr4) and
-                        windowsPointerInBuffer(win.SockAddr4, raw, filled))
-                    {
-                        const addr: *const win.SockAddr4 = @ptrCast(@alignCast(raw));
-                        if (windowsAddressNonzero(&addr.addr))
-                            cfg.addSystemNameserver(.{ .ipv4 = addr.addr }, 0);
-                    } else if (family.* == win.af_inet6 and dns_server.address.length >= @sizeOf(win.SockAddr6) and
-                        windowsPointerInBuffer(win.SockAddr6, raw, filled))
-                    {
-                        const addr: *const win.SockAddr6 = @ptrCast(@alignCast(raw));
-                        if (windowsAddressNonzero(&addr.addr))
-                            cfg.addSystemNameserver(.{ .ipv6 = addr.addr }, addr.scope_id);
-                    }
-                }
-            }
             server = dns_server.next;
+            const raw = dns_server.address.sockaddr orelse continue;
+            if (dns_server.address.length < @sizeOf(u16) or
+                !windowsPointerInBuffer(u16, raw, filled)) continue;
+            const family: *const u16 = @ptrCast(@alignCast(raw));
+            const address: Address = if (family.* == win.af_inet and
+                dns_server.address.length >= @sizeOf(win.SockAddr4) and
+                windowsPointerInBuffer(win.SockAddr4, raw, filled))
+            blk: {
+                const addr: *const win.SockAddr4 = @ptrCast(@alignCast(raw));
+                break :blk .{ .ipv4 = addr.addr };
+            } else if (family.* == win.af_inet6 and
+                dns_server.address.length >= @sizeOf(win.SockAddr6) and
+                windowsPointerInBuffer(win.SockAddr6, raw, filled))
+            blk: {
+                const addr: *const win.SockAddr6 = @ptrCast(@alignCast(raw));
+                break :blk .{ .ipv6 = addr.addr };
+            } else continue;
+            const raw_scope: u32 = if (address == .ipv6) (@as(*const win.SockAddr6, @ptrCast(@alignCast(raw)))).scope_id else 0;
+            const scope_id = windowsUsableDnsScope(address, raw_scope, item.ipv6_if_index) orelse continue;
+            selection.consider(.{
+                .address = address,
+                .scope_id = scope_id,
+                .backup = usable_count != 0,
+                .adapter_order = adapter_count,
+                .sequence = sequence,
+            });
+            usable_count += 1;
+            sequence += 1;
         }
-        adapter = item.next;
+    }
+    selection.write(cfg);
+    return selection.overflowed;
+}
+
+fn windowsUsableDnsScope(address: Address, raw_scope: u32, adapter_scope: u32) ?u32 {
+    switch (address) {
+        .ipv4 => |ip| {
+            // 0/8 is not a remote endpoint; 224/4 and above are multicast or
+            // reserved. Loopback remains valid for a local resolver service.
+            if (ip[0] == 0 or ip[0] >= 224) return null;
+            return 0;
+        },
+        .ipv6 => |ip| {
+            if (!windowsAddressNonzero(&ip) or ip[0] == 0xff) return null;
+            // Windows can expose these deprecated site-local defaults when no
+            // real IPv6 DNS server was configured.
+            const placeholder_prefix = [_]u8{ 0xfe, 0xc0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0 };
+            if (std.mem.eql(u8, ip[0..15], placeholder_prefix[0..15]) and ip[15] >= 1 and ip[15] <= 3) return null;
+            if (ip[0] == 0xfe and (ip[1] & 0xc0) == 0x80) {
+                const scope = if (raw_scope != 0) raw_scope else adapter_scope;
+                return if (scope != 0) scope else null;
+            }
+            return raw_scope;
+        },
     }
 }
 
@@ -1582,6 +1727,112 @@ test "systemResolverConfig bounds host DNS entries and retains the POSIX fallbac
     const cfg = systemResolverConfig();
     if (builtin.os.tag != .windows) try std.testing.expect(cfg.nameserver_count > 0);
     try std.testing.expect(cfg.nameserver_count <= max_nameservers);
+}
+
+test "Windows DNS candidates reject placeholders and repair link-local scope" {
+    try std.testing.expect(windowsUsableDnsScope(.{ .ipv4 = .{ 0, 1, 2, 3 } }, 0, 0) == null);
+    try std.testing.expect(windowsUsableDnsScope(.{ .ipv4 = .{ 224, 0, 0, 1 } }, 0, 0) == null);
+    try std.testing.expectEqual(@as(?u32, 0), windowsUsableDnsScope(.{ .ipv4 = .{ 127, 0, 0, 1 } }, 0, 0));
+    try std.testing.expect(windowsUsableDnsScope(parseIpLiteral("::").?, 0, 0) == null);
+    try std.testing.expect(windowsUsableDnsScope(parseIpLiteral("ff02::1").?, 0, 0) == null);
+    for ([_][]const u8{ "fec0:0:0:ffff::1", "fec0:0:0:ffff::2", "fec0:0:0:ffff::3" }) |placeholder|
+        try std.testing.expect(windowsUsableDnsScope(parseIpLiteral(placeholder).?, 0, 0) == null);
+    const link_local = parseIpLiteral("fe80::53").?;
+    try std.testing.expect(windowsUsableDnsScope(link_local, 0, 0) == null);
+    try std.testing.expectEqual(@as(?u32, 9), windowsUsableDnsScope(link_local, 0, 9));
+    try std.testing.expectEqual(@as(?u32, 11), windowsUsableDnsScope(link_local, 11, 9));
+    try std.testing.expectEqual(@as(?u32, 0), windowsUsableDnsScope(parseIpLiteral("::1").?, 0, 0));
+}
+
+test "Windows DNS discovery scans beyond four entries and honors live adapter order" {
+    const Fixture = struct {
+        adapters: [3]win.AdapterAddresses,
+        servers: [6]win.DnsServerAddress,
+        addresses: [6]win.SockAddr4,
+    };
+    var fixture = std.mem.zeroes(Fixture);
+    for (&fixture.adapters) |*adapter| adapter.length = @sizeOf(win.AdapterAddresses);
+    for (&fixture.servers, 0..) |*server, index| {
+        server.length = @sizeOf(win.DnsServerAddress);
+        fixture.addresses[index] = .{ .family = win.af_inet, .port = 0, .addr = .{ 10, 0, 0, @intCast(index + 1) } };
+        server.address = .{ .sockaddr = @ptrCast(&fixture.addresses[index]), .length = @sizeOf(win.SockAddr4) };
+    }
+    fixture.adapters[0].next = &fixture.adapters[1];
+    fixture.adapters[0].first_dns = &fixture.servers[0];
+    fixture.adapters[0].oper_status = 2; // disconnected, even though DNS is configured
+    fixture.adapters[1].next = &fixture.adapters[2];
+    fixture.adapters[1].first_dns = &fixture.servers[5];
+    fixture.adapters[1].oper_status = win.if_oper_status_up;
+    fixture.adapters[2].first_dns = &fixture.servers[1];
+    fixture.adapters[2].oper_status = win.if_oper_status_up;
+    for (1..4) |index| fixture.servers[index].next = &fixture.servers[index + 1];
+
+    var cfg = ResolverConfig{};
+    try std.testing.expect(windowsCollectNameservers(&cfg, &fixture.adapters[0], std.mem.asBytes(&fixture)));
+    try std.testing.expectEqual(max_nameservers, cfg.nameserver_count);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 6 } }, cfg.nameservers[0]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 2 } }, cfg.nameservers[1]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 3 } }, cfg.nameservers[2]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 4 } }, cfg.nameservers[3]);
+}
+
+test "Windows DNS discovery handles down and empty adapters with no candidates" {
+    var adapter = std.mem.zeroes(win.AdapterAddresses);
+    adapter.length = @sizeOf(win.AdapterAddresses);
+    for ([_]u32{ 2, win.if_oper_status_up }) |status| {
+        adapter.oper_status = status;
+        var cfg = ResolverConfig{};
+        try std.testing.expect(!windowsCollectNameservers(&cfg, &adapter, std.mem.asBytes(&adapter)));
+        try std.testing.expectEqual(@as(usize, 0), cfg.nameserver_count);
+    }
+}
+
+test "Windows DNS selection keeps the earliest duplicate in native query order" {
+    var selection = WindowsDnsSelection{};
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 1 } }, .scope_id = 0, .backup = false, .adapter_order = 0, .sequence = 0 });
+    selection.consider(.{ .address = .{ .ipv4 = .{ 192, 0, 2, 53 } }, .scope_id = 0, .backup = true, .adapter_order = 0, .sequence = 1 });
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 3 } }, .scope_id = 0, .backup = true, .adapter_order = 0, .sequence = 2 });
+    selection.consider(.{ .address = .{ .ipv4 = .{ 192, 0, 2, 53 } }, .scope_id = 0, .backup = false, .adapter_order = 1, .sequence = 3 });
+    var cfg = ResolverConfig{};
+    selection.write(&cfg);
+    try std.testing.expectEqual(@as(usize, 3), cfg.nameserver_count);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 1 } }, cfg.nameservers[0]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 192, 0, 2, 53 } }, cfg.nameservers[1]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 3 } }, cfg.nameservers[2]);
+    try std.testing.expect(!selection.overflowed);
+}
+
+test "Windows DNS duplicate primary survives capacity without moving its query position" {
+    var selection = WindowsDnsSelection{};
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 1 } }, .scope_id = 0, .backup = false, .adapter_order = 0, .sequence = 0 }); // A: P
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 2 } }, .scope_id = 0, .backup = true, .adapter_order = 0, .sequence = 1 }); // A: X
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 3 } }, .scope_id = 0, .backup = true, .adapter_order = 0, .sequence = 2 }); // A: Y
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 4 } }, .scope_id = 0, .backup = true, .adapter_order = 0, .sequence = 3 }); // A: Z
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 2 } }, .scope_id = 0, .backup = false, .adapter_order = 1, .sequence = 4 }); // B: X
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 5 } }, .scope_id = 0, .backup = false, .adapter_order = 2, .sequence = 5 }); // C: Q
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 6 } }, .scope_id = 0, .backup = false, .adapter_order = 3, .sequence = 6 }); // D: R
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 7 } }, .scope_id = 0, .backup = false, .adapter_order = 4, .sequence = 7 }); // E: S
+    var cfg = ResolverConfig{};
+    selection.write(&cfg);
+    try std.testing.expect(selection.overflowed);
+    try std.testing.expectEqual(max_nameservers, cfg.nameserver_count);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 1 } }, cfg.nameservers[0]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 2 } }, cfg.nameservers[1]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 5 } }, cfg.nameservers[2]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 6 } }, cfg.nameservers[3]);
+}
+
+test "Windows DNS query order tries preferred adapter backup before another adapter" {
+    var selection = WindowsDnsSelection{};
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 1 } }, .scope_id = 0, .backup = false, .adapter_order = 0, .sequence = 0 });
+    selection.consider(.{ .address = .{ .ipv4 = .{ 10, 0, 0, 2 } }, .scope_id = 0, .backup = true, .adapter_order = 0, .sequence = 1 });
+    selection.consider(.{ .address = .{ .ipv4 = .{ 203, 0, 113, 53 } }, .scope_id = 0, .backup = false, .adapter_order = 1, .sequence = 2 });
+    var cfg = ResolverConfig{};
+    selection.write(&cfg);
+    try std.testing.expectEqual(@as(usize, 3), cfg.nameserver_count);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 1 } }, cfg.nameservers[0]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 10, 0, 0, 2 } }, cfg.nameservers[1]);
+    try std.testing.expectEqual(Address{ .ipv4 = .{ 203, 0, 113, 53 } }, cfg.nameservers[2]);
 }
 
 test "parseResolvConf extracts nameservers and ignores noise" {

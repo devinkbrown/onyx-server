@@ -3,7 +3,7 @@
 
 //! Guest execution of the shipped FreeBSD kqueue submit path, FreeBSD
 //! `enableKernelTls`, OpenBSD `pledgeDaemonPaths`, and the Windows IOCP
-//! submit path. Windows open loads the RIO table; the guest then calls
+//! submit path. Windows probes the optional RIO table; the guest then calls
 //! `dequeueRegistered` on that same table. Each test returns
 //! `error.SkipZigTest` unless it is compiled for that kernel, so a Linux
 //! suite does not pretend the syscall ran. `main` is the guest entry point
@@ -300,29 +300,38 @@ fn windowsPair() !struct { listener: usize, client: usize, accepted: usize } {
     return .{ .listener = listener, .client = client, .accepted = accepted };
 }
 
-pub fn executeWindowsIocp() !void {
+fn windowsIocpWitnessAccepted(submitted: u32, witness: io_backend.RioWitness, require_rio: bool) bool {
+    if (submitted == 0) return false;
+    if (witness.ok) return true;
+    return !require_rio and std.mem.eql(u8, witness.stage, "unavailable");
+}
+
+fn executeWindowsIocpWithRioRequirement(require_rio: bool) !void {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     var com = WinCom.open();
     defer com.close();
     // The completion port and the receive buffer stay mapped until process
     // exit. A pending AFD request writes them after submit returns.
     var backend = io_backend.IoBackend.openOwned(.iocp, 32, .{}) catch |err| {
-        com.write("GAP-X3 windows rio result=missing stage=open");
+        com.write("GAP-X1 windows iocp result=missing stage=open");
         com.write("GUEST_EXIT:1");
         return err;
     };
-    com.write("GAP-X3 windows rio result=ok");
     const witness = backend.dequeueRegistered();
-    var dequeue_ok = false;
     var line_buf: [96]u8 = undefined;
     if (witness.ok) {
-        dequeue_ok = true;
+        com.write("GAP-X3 windows rio result=ok");
         if (std.fmt.bufPrint(&line_buf, "GAP-X3 windows rio dequeue={d} bytes={d} status={d}", .{ witness.count, witness.bytes, witness.status })) |text| {
             com.write(text);
         } else |_| com.write("GAP-X3 windows rio dequeue=fmt");
-    } else if (std.fmt.bufPrint(&line_buf, "GAP-X3 windows rio dequeue=fail stage={s} errno={d} bytes={d}", .{ witness.stage, witness.errno, witness.bytes })) |text| {
-        com.write(text);
-    } else |_| com.write("GAP-X3 windows rio dequeue=fmt");
+    } else {
+        if (std.fmt.bufPrint(&line_buf, "GAP-X3 windows rio result=missing stage={s}", .{witness.stage})) |text| {
+            com.write(text);
+        } else |_| com.write("GAP-X3 windows rio result=fmt");
+        if (std.fmt.bufPrint(&line_buf, "GAP-X3 windows rio dequeue=fail stage={s} errno={d} bytes={d}", .{ witness.stage, witness.errno, witness.bytes })) |text| {
+            com.write(text);
+        } else |_| com.write("GAP-X3 windows rio dequeue=fmt");
+    }
     const pair = windowsPair() catch |err| {
         com.write("GAP-X1 windows iocp submitted=missing stage=socket");
         com.write("GUEST_EXIT:1");
@@ -398,13 +407,17 @@ pub fn executeWindowsIocp() !void {
     } else |_| {
         com.write("GAP-X1 windows iocp submitted=fmt");
     }
-    if (submitted == 0 or !dequeue_ok) {
+    if (!windowsIocpWitnessAccepted(submitted, witness, require_rio)) {
         com.write("GUEST_EXIT:1");
         return error.MissingOp;
     }
     com.write("GUEST_EXIT:0");
     // `backend` and `buf` are deliberately not freed. A pending AFD request
     // can still write them, and process exit reclaims the pages.
+}
+
+pub fn executeWindowsIocp() !void {
+    try executeWindowsIocpWithRioRequirement(true);
 }
 
 pub fn main() !void {
@@ -466,7 +479,17 @@ test "GAP-X3 OpenBSD pledge executes on this kernel" {
     }
 }
 
-test "GAP-X1 Windows IOCP and RIO executes on this kernel" {
+test "GAP-X1 Windows IOCP executes with optional RIO on this kernel" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-    try executeWindowsIocp();
+    try executeWindowsIocpWithRioRequirement(false);
+}
+
+test "Windows IOCP witness policy accepts only optional unavailable RIO" {
+    const unavailable = io_backend.RioWitness{ .stage = "unavailable" };
+    try std.testing.expect(windowsIocpWitnessAccepted(1, unavailable, false));
+    try std.testing.expect(!windowsIocpWitnessAccepted(0, unavailable, false));
+    try std.testing.expect(!windowsIocpWitnessAccepted(1, unavailable, true));
+    try std.testing.expect(!windowsIocpWitnessAccepted(1, .{ .stage = "dequeue" }, false));
+    try std.testing.expect(!windowsIocpWitnessAccepted(1, .{ .stage = "closed" }, false));
+    try std.testing.expect(windowsIocpWitnessAccepted(1, .{ .ok = true }, true));
 }

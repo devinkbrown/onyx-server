@@ -667,13 +667,25 @@ test "Windows held private directory refuses a reparse handle" {
     defer tmp.cleanup();
     const target = try createPrivateDirectoryWindows(tmp.dir, "target");
     defer target.close(std.testing.io);
+    // Positive control: the exact helper used for the link grants enough
+    // metadata access to inspect a genuine private directory on this host.
+    const valid_handle = try openDirectoryHandleWindows(tmp.dir, "target", false);
+    defer windows.CloseHandle(valid_handle);
+    _ = try requirePrivateDirectoryHandleWindows(.{ .handle = valid_handle });
     tmp.dir.symLink(std.testing.io, "target", "link", .{ .is_directory = true }) catch |err| switch (err) {
         error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
     const handle = try openDirectoryHandleWindows(tmp.dir, "link", false);
     defer windows.CloseHandle(handle);
-    try std.testing.expectError(error.InsecurePermissions, requirePrivateDirectoryHandleWindows(.{ .handle = handle }));
+    // Some Windows builds deny metadata queries on an opened reparse point
+    // before FILE_ATTRIBUTE_REPARSE_POINT can be inspected. Both errors refuse
+    // the directory without exposing its contents as a private parent.
+    if (requirePrivateDirectoryHandleWindows(.{ .handle = handle })) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err == error.InsecurePermissions or err == error.PermissionDenied);
+    }
 }
 
 /// Open and validate a private directory as one object. Keep the returned
@@ -813,7 +825,10 @@ fn openDirectoryHandleWindows(dir: std.Io.Dir, path: []const u8, write_dac: bool
     var handle: windows.HANDLE = undefined;
     const status = windows.ntdll.NtCreateFile(
         &handle,
-        .{ .STANDARD = .{ .SYNCHRONIZE = true, .RIGHTS = .{ .READ_CONTROL = true, .WRITE_DAC = write_dac } } },
+        .{
+            .STANDARD = .{ .SYNCHRONIZE = true, .RIGHTS = .{ .READ_CONTROL = true, .WRITE_DAC = write_dac } },
+            .SPECIFIC = .{ .FILE_DIRECTORY = .{ .READ_ATTRIBUTES = true } },
+        },
         &attributes,
         &io_status,
         null,

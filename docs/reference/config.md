@@ -125,7 +125,7 @@ Source: struct at `src/daemon/config_format.zig:75`, parsing at `src/daemon/conf
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `host` | string | `"127.0.0.1"` | any string accepted by bind helpers | Bind address for runtime listeners (`src/daemon/config_boot.zig:25`). |
+| `host` | string | `"127.0.0.1"` | IPv4 or IPv6 literal, or a wildcard bind address | Bind address for runtime listeners. On Windows, an IPv6 literal may include a numeric interface index or local interface alias after `%` (`src/daemon/config_boot.zig:25`, `src/daemon/windows_ipv6_scope.zig`). |
 | `irc` | port integer | `0` before validation | required, `1..65535` | Plain IRC listener port. Current parser requires this even for TLS-first deployments. |
 | `ws` | port integer | `0` | `0..65535` | Secure-WebSocket browser listener intent. `mapToServerConfig` overlays it into `ws_enabled`/`ws_port`; the listener stands up when TLS certificates are loaded, or with testing-only `ws_plain` (`src/daemon/config_format.zig:462`, `src/daemon/config_boot.zig:45`, `src/main.zig:350`, `src/daemon/server.zig:1862`). |
 | `webtransport` | port integer | `0` | `0..65535` | UDP WebTransport/HTTP3 listener port. `mapToServerConfig` overlays it into `webtransport_port`, and `main.zig` starts `webtransport_listener.zig` when TLS certificate/signing material and the IRC listener are available (`src/daemon/config_boot.zig:45`, `src/main.zig:472`, `src/main.zig:494`). |
@@ -136,6 +136,8 @@ Source: struct at `src/daemon/config_format.zig:75`, parsing at `src/daemon/conf
 | `media` | port integer | `0` | `0..65535` | UDP media transport plane port; `0` means ephemeral (`src/daemon/config_boot.zig:27`, `src/daemon/server.zig:963`). |
 | `native_media` | port integer | `0` | `0..65535` | Native CadenceVox/CadenceVis media UDP port; `0` means ephemeral (`src/daemon/config_boot.zig:28`, `src/daemon/server.zig:971`). |
 | `media_host` | string | `"127.0.0.1"` | any string | Advertised media candidate host/IP for native Cadence UDP and WebRTC ICE. Default `127.0.0.1` is local-only; production native/WebRTC needs a public address or `[media].stun_host`/`stun_port`. Browser WS media does not use this candidate — enable `ws_media_relay` (MACKEY + binary WS). Loopback candidates are suppressed for WS clients (`src/daemon/config_boot.zig:29`, `src/daemon/server.zig` `provisionMediaTransports`). |
+
+For a Windows link-local bind, set `host = "fe80::abcd%7"` or `host = "fe80::abcd%Wi-Fi 2"`, replacing the address and zone with an address assigned to the local interface. The zone identifies the local interface, not a remote host. Windows Helix adoption checks the inherited listener's address, port, and scope against this configuration (`src/daemon/server.zig` `validateNativeListenerAddress`).
 
 ## `[mesh]`
 
@@ -152,9 +154,11 @@ Source: struct at `src/daemon/config_format.zig:109`, parsing at `src/daemon/con
 | `relay_v2_authoring` | string | `"compat"` | `"compat"`, `"active"` | Controls only local MESSAGE_V2 authoring. Compatibility nodes receive, ACK, retain, and forward V2 but author legacy only. Active nodes author each V2-eligible mesh event as V2 only; an admitted event never falls back to a legacy twin. Active mode requires a complete staged epoch/roster plan. |
 | `relay_v2_activation_epoch` | integer | `0` | `0..i64_max` | Monotonic operator rollout generation, not a timestamp. Zero means no plan. A non-zero value requires `relay_v2_roster`; the exact value is bound into current Helix state. |
 | `relay_v2_roster` | array of strings | `[]` | 2..4096 unique hex/base64 Ed25519 public keys | Complete secured-mesh node roster for the activation generation, distinct from direct-neighbor `trust_roots`. Onyx Server decodes and sorts the full keys, requires the local key and every direct-neighbor pin, and binds a domain-separated BLAKE3 digest into Helix. |
-| `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; IPv6 hosts must be bracketed (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:2249`). |
+| `connect` | array of strings | `[]` | `host:port` strings | Peers auto-dialed at boot and retried while down; bracket IPv6 literals, including scoped literals (`src/daemon/config_format.zig:179`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig` `parseHostPort` / `sockaddrForHost`). |
 | `require_secured` | bool | `false` | `true`/`false` | Refuse plaintext S2S: reject inbound plaintext peers and never dial plaintext outbound. When secured S2S is unavailable, all S2S is dropped rather than falling back to clear (`src/main.zig` mesh wiring, `src/daemon/server.zig` handleAccept / initiateS2sConnectToAddr). |
 | `require_signed_frames` | bool | `true` | `true`/`false` | For secured S2S peers with a node signing key, require the remote handshake to advertise signed-frame support and reject unsigned direct-owned mesh state frames. Set false only for an explicit mixed-rollout window. |
+
+On Windows, a link-local peer can use `connect = ["[fe80::abcd%7]:6900"]` or `connect = ["[fe80::abcd%Wi-Fi 2]:6900"]`. The `%` zone names the **local outbound interface** by index or Windows interface alias; replace the sample address and zone for each node. A malformed scoped literal is rejected rather than sent to DNS (`src/daemon/windows_ipv6_scope.zig`, `src/daemon/server.zig` `sockaddrForHost`).
 
 Plaintext S2S applies when no node identity is available and `require_secured` is false. Secured S2S uses `[node].secret_key` when set; otherwise the daemon loads or creates `onyx-server-node.key` beside the config. Signed MeshPass admission is not available on plaintext S2S: if `admission_roots` is non-empty but the secured S2S identity path is unavailable, server initialization fails closed.
 

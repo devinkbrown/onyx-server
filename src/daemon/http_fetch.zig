@@ -1165,6 +1165,32 @@ test "http_fetch Windows system result parser rejects short addresses and cycles
     try std.testing.expect(firstWinSystemAddress(&short, win.af_inet, 6900) == null);
 }
 
+test "http_fetch Windows system result parser preserves IPv6 scope id" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const address = [16]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42 };
+    var sockaddr = win.SockAddr6{
+        .family = win.af_inet6,
+        .port = std.mem.nativeToBig(u16, 7),
+        .addr = address,
+        .scope_id = 0x01020304,
+    };
+    var valid = win.AddrInfoExW{
+        .family = win.af_inet6,
+        .addr_len = @sizeOf(win.SockAddr6),
+        .addr = @ptrCast(&sockaddr),
+    };
+    var other_family = win.AddrInfoExW{
+        .family = win.af_inet,
+        .addr_len = @sizeOf(win.SockAddr6),
+        .addr = @ptrCast(&sockaddr),
+        .next = &valid,
+    };
+    const found = firstWinSystemAddress(&other_family, win.af_inet6, 6900) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &address, &found.ip6.bytes);
+    try std.testing.expectEqual(@as(u16, 6900), found.ip6.port);
+    try std.testing.expectEqual(@as(u32, 0x01020304), found.ip6.interface.index);
+}
+
 test "http_fetch Windows plaintext loopback timeout and response limit" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const metrics = @import("metrics_http.zig");
