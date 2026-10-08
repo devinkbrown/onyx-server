@@ -67,6 +67,19 @@ For a staged ReleaseFast bundle with the Windows quickstart and reference
 configs, run `zig build -j1 package -Dtarget=x86_64-windows`. The bundle puts
 the executable in `zig-out\bin` and both configs in `zig-out\etc\onyx-server`.
 
+On Windows 11 ARM64, the same pinned x86_64 Zig compiler runs under Windows
+emulation. Build a native ARM64 package by selecting its target explicitly:
+
+```powershell
+zig build -j1 check -Dtarget=aarch64-windows
+zig build -j1 package -Dtarget=aarch64-windows --prefix .\zig-out-arm64
+python -B .\tools\windows_quickstart_smoke.py .\zig-out-arm64\bin\onyx-server.exe --template .\zig-out-arm64\etc\onyx-server\onyx-server.windows.quickstart.toml
+```
+
+The ARM64 package uses Zig's LLVM backend. The `-Dwindows-self-hosted=true`
+option requires a compiler whose host architecture matches the target, so it
+does not apply to the pinned x86_64 compiler targeting ARM64.
+
 ## Start a local node
 
 Create a disposable run directory outside the checkout. Resolve the executable
