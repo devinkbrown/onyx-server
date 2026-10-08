@@ -387,6 +387,10 @@ jobs:
         run: python -B .\tools\windows_quickstart_smoke.py .\zig-out-arm64\bin\onyx-server.exe --template .\zig-out-arm64\etc\onyx-server\onyx-server.windows.quickstart.toml
       - name: Smoke Windows ARM64 full daemon
         run: python -B .\tools\windows_full_daemon_smoke.py .\zig-out-arm64\bin\onyx-server.exe --tls --wss --metrics --webhook
+      - name: Smoke Windows ARM64 secured mesh through Helix
+        run: python -B .\tools\windows_helix_mesh_smoke.py .\zig-out-arm64\bin\onyx-server.exe
+      - name: Smoke Windows ARM64 active media through Helix
+        run: python -B .\tools\windows_helix_media_smoke.py .\zig-out-arm64\bin\onyx-server.exe --active
 
   build-test:
     name: build & test
