@@ -530,7 +530,10 @@ pub const WebTransportListener = struct {
     }
     fn captureActive(self: *WebTransportListener, allocator: std.mem.Allocator, execution: Execution) !ActiveSnapshot {
         if (self.conns.items.len > snapshot_max_slots or self.liveCount() > self.max_connections) return error.SnapshotTooLarge;
-        var base = try self.captureCommon(execution);
+        var base = self.captureCommon(execution) catch |err| {
+            logActiveSnapshotFailure("base capture", err);
+            return err;
+        };
         errdefer base.deinit();
         var rows: std.ArrayList(ActiveConnectionSnapshot) = .empty;
         errdefer {
@@ -541,12 +544,21 @@ pub const WebTransportListener = struct {
             const conn = maybe orelse continue;
             if (!conn.conn.isEstablished() or conn.conn.isClosing()) return error.ActiveQuicContinuityUnsupported;
             if (self.by_cid.get(conn.scidSlice()) != slot or self.by_cid.get(conn.initDcidSlice()) != slot)
-                return error.InvalidSnapshot;
-            var quic = try conn.conn.captureEstablishedServerSnapshot(allocator);
+                return invalidActiveSnapshot("CID registry relation");
+            var quic = conn.conn.captureEstablishedServerSnapshot(allocator) catch |err| {
+                logActiveSnapshotFailure("QUIC capture", err);
+                return err;
+            };
             errdefer quic.deinit(allocator);
-            var h3 = try conn.h3.captureServerSnapshot(allocator);
+            var h3 = conn.h3.captureServerSnapshot(allocator) catch |err| {
+                logActiveSnapshotFailure("H3 capture", err);
+                return err;
+            };
             errdefer h3.deinit(allocator);
-            const bridge: ?BridgeIdentity = if (conn.irc_fd) |fd| try observeBridge(fd) else null;
+            const bridge: ?BridgeIdentity = if (conn.irc_fd) |fd| observeBridge(fd) catch |err| {
+                logActiveSnapshotFailure("bridge observation", err);
+                return err;
+            } else null;
             try rows.append(allocator, .{
                 .slot = slot,
                 .scid = canonicalCid(conn.scidSlice()),
@@ -567,8 +579,11 @@ pub const WebTransportListener = struct {
         }
         var result: ActiveSnapshot = .{ .base = base, .irc_host_digest = ircHostDigest(self.irc_host), .slot_count = self.conns.items.len, .connections = try rows.toOwnedSlice(allocator) };
         errdefer result.deinit(allocator);
-        try result.validate(self.tls);
-        if (self.by_cid.count() != result.cidCount()) return error.InvalidSnapshot;
+        result.validate(self.tls) catch |err| {
+            logActiveSnapshotFailure("result validation", err);
+            return err;
+        };
+        if (self.by_cid.count() != result.cidCount()) return invalidActiveSnapshot("CID registry count");
         return result;
     }
     /// Publish a new serving certificate only while the pump is parked and no
@@ -595,10 +610,24 @@ pub const WebTransportListener = struct {
         return self.captureCommon(execution);
     }
     fn captureCommon(self: *WebTransportListener, execution: Execution) !Snapshot {
-        try self.validatePolicy();
+        self.validatePolicy() catch |err| {
+            logActiveSnapshotFailure("listener policy validation", err);
+            return err;
+        };
         const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
-        const carry: Snapshot = .{ .socket = try socket.capture(), .tls_digest = try tlsDigest(self.tls), .irc_port = self.irc_port, .send_proxy_header = self.send_proxy_header, .echo_wt_datagrams = self.echo_wt_datagrams, .max_connections = self.max_connections, .retry_policy = self.retry_policy, .retry_load_threshold = self.retry_load_threshold, .retry_secret = self.retry_secret, .token_replay = self.token_replay, .scid_counter = self.scid_counter, .reset_tokens = self.reset_tokens, .reset_last_refill_ns = self.reset_last_refill_ns, .reset_rate_per_s = self.reset_rate_per_s, .reset_burst = self.reset_burst, .execution = execution };
-        try carry.validate(self.tls);
+        const captured_socket = socket.capture() catch |err| {
+            logActiveSnapshotFailure("listener socket capture", err);
+            return err;
+        };
+        const digest = tlsDigest(self.tls) catch |err| {
+            logActiveSnapshotFailure("listener TLS digest", err);
+            return err;
+        };
+        const carry: Snapshot = .{ .socket = captured_socket, .tls_digest = digest, .irc_port = self.irc_port, .send_proxy_header = self.send_proxy_header, .echo_wt_datagrams = self.echo_wt_datagrams, .max_connections = self.max_connections, .retry_policy = self.retry_policy, .retry_load_threshold = self.retry_load_threshold, .retry_secret = self.retry_secret, .token_replay = self.token_replay, .scid_counter = self.scid_counter, .reset_tokens = self.reset_tokens, .reset_last_refill_ns = self.reset_last_refill_ns, .reset_rate_per_s = self.reset_rate_per_s, .reset_burst = self.reset_burst, .execution = execution };
+        carry.validate(self.tls) catch |err| {
+            logActiveSnapshotFailure("listener snapshot validation", err);
+            return err;
+        };
         return carry;
     }
 
@@ -2947,6 +2976,17 @@ pub const Snapshot = struct {
 /// row bounds; this caps their aggregate multiplication during Helix staging.
 pub const snapshot_max_slots: usize = 256;
 
+fn logActiveSnapshotFailure(comptime stage: []const u8, err: anyerror) void {
+    if (comptime builtin.os.tag == .windows) {
+        std.debug.print("onyx-server: Windows WebTransport snapshot {s} failed: {s}\n", .{ stage, @errorName(err) });
+    }
+}
+
+fn invalidActiveSnapshot(comptime stage: []const u8) error{InvalidSnapshot} {
+    logActiveSnapshotFailure(stage, error.InvalidSnapshot);
+    return error.InvalidSnapshot;
+}
+
 fn canonicalCid(cid: []const u8) [quic_packet.max_connection_id_len]u8 {
     var result: [quic_packet.max_connection_id_len]u8 = @splat(0);
     @memcpy(result[0..cid.len], cid);
@@ -3059,26 +3099,35 @@ pub const ActiveConnectionSnapshot = struct {
             !std.mem.allEqual(u8, self.orig_dcid[self.orig_dcid_len..], 0) or
             !std.mem.allEqual(u8, self.retry_scid[self.retry_scid_len..], 0) or
             !validAddress(self.peer) or
-            (self.have_wt_stream != (self.wt_stream_id != null))) return error.InvalidSnapshot;
-        if (self.retry_scid_len == 0 and !std.mem.eql(u8, self.initDcidSlice(), self.origDcidSlice())) return error.InvalidSnapshot;
-        if (self.retryScidSlice()) |retry| if (!std.mem.eql(u8, retry, self.initDcidSlice())) return error.InvalidSnapshot;
-        if (std.mem.readInt(u64, self.scid[0..8], .big) >= base.scid_counter) return error.InvalidSnapshot;
-        try self.quic.validate();
-        try self.h3.validate();
+            (self.have_wt_stream != (self.wt_stream_id != null))) return invalidActiveSnapshot("row shape");
+        if (self.retry_scid_len == 0 and !std.mem.eql(u8, self.initDcidSlice(), self.origDcidSlice())) return invalidActiveSnapshot("row original CID relation");
+        if (self.retryScidSlice()) |retry| if (!std.mem.eql(u8, retry, self.initDcidSlice())) return invalidActiveSnapshot("row retry CID relation");
+        if (std.mem.readInt(u64, self.scid[0..8], .big) >= base.scid_counter) return invalidActiveSnapshot("row SCID counter");
+        self.quic.validate() catch |err| {
+            logActiveSnapshotFailure("row QUIC validation", err);
+            return err;
+        };
+        self.h3.validate() catch |err| {
+            logActiveSnapshotFailure("row H3 validation", err);
+            return err;
+        };
         if (!std.mem.eql(u8, self.quic.scid.slice(), self.scidSlice()) or
-            !quic_conn.PathAddress.eql(self.quic.path, pathFromAddr(self.peer))) return error.InvalidSnapshot;
+            !quic_conn.PathAddress.eql(self.quic.path, pathFromAddr(self.peer))) return invalidActiveSnapshot("row QUIC identity");
         if (self.bridge) |bridge| {
-            try bridge.validate(base.irc_port);
-            if (self.h3.session == null or self.h3.session.?.closed) return error.InvalidSnapshot;
+            bridge.validate(base.irc_port) catch |err| {
+                logActiveSnapshotFailure("row bridge validation", err);
+                return err;
+            };
+            if (self.h3.session == null or self.h3.session.?.closed) return invalidActiveSnapshot("row bridge session");
         }
         if (self.wt_stream_id) |sid| {
-            const session = self.h3.session orelse return error.InvalidSnapshot;
-            if (session.closed or self.bridge == null) return error.InvalidSnapshot;
+            const session = self.h3.session orelse return invalidActiveSnapshot("row WT session");
+            if (session.closed or self.bridge == null) return invalidActiveSnapshot("row WT bridge");
             var found = false;
             for (session.streams) |stream| {
                 if (stream.stream_id == sid and stream.is_bidirectional and sid != session.session_id) found = true;
             }
-            if (!found) return error.InvalidSnapshot;
+            if (!found) return invalidActiveSnapshot("row WT stream");
         }
     }
 };
@@ -3106,21 +3155,24 @@ pub const ActiveSnapshot = struct {
     }
 
     pub fn validate(self: *const ActiveSnapshot, tls: TlsConfig) !void {
-        try self.base.validate(tls);
+        self.base.validate(tls) catch |err| {
+            logActiveSnapshotFailure("table base validation", err);
+            return err;
+        };
         if (self.slot_count > snapshot_max_slots or self.connections.len > self.slot_count or
             self.connections.len > self.base.max_connections) return error.SnapshotTooLarge;
         for (self.connections, 0..) |*row, i| {
-            if (row.slot >= self.slot_count or (i > 0 and self.connections[i - 1].slot >= row.slot)) return error.InvalidSnapshot;
+            if (row.slot >= self.slot_count or (i > 0 and self.connections[i - 1].slot >= row.slot)) return invalidActiveSnapshot("table row order");
             try row.validate(&self.base);
             for (self.connections[0..i]) |*prior| {
                 if (std.mem.eql(u8, prior.scidSlice(), row.scidSlice()) or
                     std.mem.eql(u8, prior.scidSlice(), row.initDcidSlice()) or
                     std.mem.eql(u8, prior.initDcidSlice(), row.scidSlice()) or
-                    std.mem.eql(u8, prior.initDcidSlice(), row.initDcidSlice())) return error.InvalidSnapshot;
+                    std.mem.eql(u8, prior.initDcidSlice(), row.initDcidSlice())) return invalidActiveSnapshot("table CID uniqueness");
                 if (row.bridge) |bridge| if (prior.bridge) |other| {
                     if (bridge.source_socket == other.source_socket or
                         (TransportAddress.eql(bridge.local, other.local) and
-                            TransportAddress.eql(bridge.peer, other.peer))) return error.InvalidSnapshot;
+                            TransportAddress.eql(bridge.peer, other.peer))) return invalidActiveSnapshot("table bridge uniqueness");
                 };
             }
         }
