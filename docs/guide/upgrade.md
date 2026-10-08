@@ -1,20 +1,39 @@
 # Helix upgrade
 
-*Hot-restart Onyx Server in place with the Helix workflow, preserving every shard's listener and live sessions.*
+*Hot-restart Onyx Server in place with the Helix workflow, preserving live listeners and sessions.*
 
 Helix is Onyx Server's in-place upgrade workflow. The operator-facing command is
-`UPGRADE`, implemented by `LinuxServer.handleUpgrade` as an oper-only hot re-exec
-on Linux.
+`UPGRADE`. Linux uses hot re-exec; Windows launches a native successor and
+transfers live state after an authenticated capability check. The `UPGRADE`
+command requires the `server_restart` operator privilege.
 
 ## Preconditions
 
 | Requirement | Detail | Source |
 |---|---|---|
-| Linux | Non-Linux builds reply that `UPGRADE` is Linux-only. | `LinuxServer.performUpgrade` |
-| Operator privilege | The command requires the `server_restart` privilege before proceeding. | `LinuxServer.handleUpgrade` |
-| Re-exec path | The daemon probes and retains the exact configured on-disk launch image, falling back to `/proc/self/exe`. | `LinuxServer.openCompatibleUpgradeTarget`, `LinuxServer.performUpgrade` |
+| Platform | Linux hot re-exec or native 64-bit Windows successor handoff. Windows does not use `SIGUSR2`. | `LinuxServer.performUpgrade`, `helix/native_windows_runtime.zig` |
+| Operator privilege | The command requires `server_restart` before proceeding. | `LinuxServer.handleUpgradeCommand` |
+| Linux re-exec path | The daemon probes and retains the exact configured on-disk launch image, falling back to `/proc/self/exe`. | `LinuxServer.openCompatibleUpgradeTarget`, `LinuxServer.performUpgrade` |
+| Windows source and target | The config needs explicit `[node].secret_key` and `[cloak].secret`. With no argument, `UPGRADE` uses the running executable path; an explicit target must be a fully qualified `onyx-server*.exe` path beside that image. | `LinuxServer.handleUpgradeCommand`, `LinuxServer.performUpgrade` |
 
-## Workflow
+## Windows workflow and checks
+
+Run `onyx-server.exe --check-config <config.toml>` before starting or upgrading a
+node. If a config file changed, use
+`onyx-server.exe --check-config <config.toml> --against <boot-copy.toml>` to check
+the listener set against an unchanged copy of the running node's boot config.
+An operator can then send `UPGRADE` to select the running image, or
+`UPGRADE :C:\path\beside-current\onyx-server-next.exe` to select a staged image.
+The target must pass the native capability challenge; a rejected candidate leaves
+the current worker serving. Windows Service Control Manager installations keep
+the service host running across a successful worker swap. See the
+[native Windows guide](windows.md#guarded-windows-helix-upgrade) for the source
+proof, custody rules, and live checks. The sequential IRC and secured mesh
+smokes are `tools/windows_helix_smoke.py` and
+`tools/windows_helix_mesh_smoke.py`; media and WebTransport have separate live
+smokes in that guide.
+
+## Linux workflow
 
 1. The old process publishes an operator event and selects every live client,
    including the requesting oper connection. The requester is retained only as
