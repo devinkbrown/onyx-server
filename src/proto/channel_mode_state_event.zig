@@ -13,7 +13,7 @@ const std = @import("std");
 pub const max_channel_len = 128;
 pub const max_key_len = 128;
 pub const max_forward_len = 128;
-pub const ext_flag_mask: u32 = (1 << 20) - 1;
+pub const ext_flag_mask: u32 = (1 << 23) - 1;
 
 const flag_private: u8 = 1 << 0;
 const flag_hidden: u8 = 1 << 1;

@@ -14,8 +14,9 @@ existing substrate makes unusually cheap to build.
 ~590k lines, and ~180 commands across 13 dispatch modules. Those figures are
 retained to explain the design survey and must not be read as current inventory.
 
-**Current reconciliation (2026-09-06):** source version `0.7.0` at source-code baseline commit
-`ae78d490`; the enabled module manifest registers 158 canonical commands and the
+**Reconciliation (2026-09-06):** source version was `0.7.0` at commit
+`ae78d490`. The source manifest is now `0.8.0`. That bump is not a fleet
+deploy, and this catalog is still not a release checklist. The enabled module manifest registers 158 canonical commands and the
 complete index contains 165 rows including aliases, pre-registration commands,
 and compound service surfaces.
 See [`docs/reference/commands/_index.md`](../reference/commands/_index.md) and

@@ -1,8 +1,11 @@
 # Onyx Server continuous-wave checkpoint — 2026-08-13
 
 > **Historical checkpoint.** This wave is an immutable 2026-08-13 evidence
-> packet, not a current deployment claim. Reconciled 2026-09-06: the source-code
-> baseline is `ae78d490` (`0.7.0`), and the live pair is `0.7.0+ae78d490` under
+> packet, not a current deployment claim. Reconciled 2026-09-06: the source
+> baseline of that date was `ae78d490` (`0.7.0`), and the live pair was
+> `0.7.0+ae78d490` under `onyx-server.service`. The source manifest is now
+> `0.8.0` and has not replaced that image. The live pair record remains
+> `0.7.0+ae78d490` under
 > `onyx-server.service` with current mesh evidence in
 > [`docs/ops/onyx-server-paths.md`](docs/ops/onyx-server-paths.md). Preserve the
 > original hashes, test counts, and rollback paths below as historical records.

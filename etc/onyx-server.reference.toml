@@ -462,9 +462,11 @@ reputation_half_life = "1m"    # decay half-life of the reputation penalty
 [io]
 ring_entries = 32      # io_uring SQ entries per reactor (8..4096)
 cqe_batch = 256        # max CQEs reaped per event-loop drain (16..4096)
-# Ownership-safe kernel flags (P0-2). Default off. Copied onto the live
-# ring features; RingCore.init fail-closes if the kernel rejects them.
-# defer_taskrun = false  # IORING_SETUP_DEFER_TASKRUN (+ SINGLE_ISSUER)
+# Kernel flags. Default off. defer_taskrun is parsed and then ignored by
+# the live ring: Ring.init never requests DEFER_TASKRUN or SINGLE_ISSUER.
+# Setting it together with sqpoll fails --check-config. sqpoll is opt-in
+# and falls back if the kernel rejects the setup.
+# defer_taskrun = false
 # sqpoll = false         # IORING_SETUP_SQPOLL
 
 

@@ -84,13 +84,13 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 
 ## ACCOUNTINFO
 
-- Syntax: `ACCOUNTINFO [account]`
-- Description: Reports account name and flags. Without an argument, uses the caller's logged-in account.
-- Privileges: Registered client.
-- Parameters: Optional account.
-- Replies: Server `NOTICE` `account=<name> flags=<n> suspended=<bool> forbidden=<bool> noexpire=<bool>`.
-- Errors: `ERR_NEEDMOREPARAMS 461` when neither argument nor login exists; `FAIL ACCOUNTINFO ACCOUNT_UNKNOWN`; `FAIL ACCOUNTINFO TEMPORARILY_UNAVAILABLE`.
-- Example: `ACCOUNTINFO alice`
+- Syntax: `ACCOUNTINFO [account]` and `ACCOUNTINFO LOGINS [account]`
+- Description: Reports account name and flags, including `passkey_only`. Without an argument, uses the caller's logged-in account. `LOGINS` lists up to eight recent sign-ins (time in milliseconds, mechanism, TLS, and an 8-byte prefix). The word `LOGINS` is the subcommand. A caller reads their own rows. An operator may name another account. The full certificate is not shown.
+- Privileges: Registered client. Another account's login rows require an operator.
+- Parameters: Optional account. For `LOGINS`, an optional account after the subcommand.
+- Replies: Server `NOTICE` `account=<name> flags=<n> suspended=<bool> forbidden=<bool> noexpire=<bool> passkey_only=<bool>`. Login rows are `LOGINS: time=<ms> mechanism=<name> tls=<clear|tls|unknown> prefix=<text|->`, or `LOGINS: none`.
+- Errors: `ERR_NEEDMOREPARAMS 461` when neither argument nor login exists; `ERR_NOPRIVILEGES 481` when a non-operator names another account's logins; `FAIL ACCOUNTINFO ACCOUNT_UNKNOWN`; `FAIL ACCOUNTINFO BAD_ACCOUNT`; `FAIL ACCOUNTINFO TEMPORARILY_UNAVAILABLE`.
+- Example: `ACCOUNTINFO alice` and `ACCOUNTINFO LOGINS`
 - Sources: `src/daemon/modules/accounts.zig:134`, `src/daemon/server.zig:23457`, `src/daemon/services.zig:1284`
 
 ## SASLINFO
@@ -280,7 +280,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## SUCCESSOR
 
 - Syntax: `SUCCESSOR <#channel> SHOW | SET <account> | CLEAR`
-- Description: Reads or sets the registered channel founder's successor. When the founder account is dropped, the successor is promoted and the stored successor is cleared. `SET` and `CLEAR` are founder-only unless the caller is an oper.
+- Description: Reads or sets the registered channel founder's successor. `SHOW` returns the armed successor. `SET` of a different account waits 10 minutes before it replaces that name; `CLEAR` during the wait cancels the replacement and leaves the armed successor. A drop during the wait still hands the channel to the armed successor. The first successor is held the same way, so it cannot take the channel in that window. After the hold, a drop promotes the successor `SHOW` returns and then clears the stored successor. `SET` and `CLEAR` are founder-only unless the caller is an oper.
 - Privileges: Registered client for `SHOW`; channel founder or oper for `SET`/`CLEAR`.
 - Replies: Notices describing the current, changed, or cleared successor.
 - Errors: `FAIL SUCCESSOR ACCOUNT_UNKNOWN`, `NOT_FOUNDER`, `INVALID_VALUE`, `INVALID_SUBCOMMAND`, `NEED_MORE_PARAMS`, or temporary account-store errors.
@@ -309,11 +309,11 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 
 ## WEBAUTHN
 
-- Syntax: `WEBAUTHN STATUS | REGISTER [label] | REGISTER-FINISH <cred-id> <client-data-json> <authdata> [attestation] | AUTH <account> | AUTH-FINISH <cred-id> <client-data-json> <authdata> <signature> | LIST | REMOVE <cred-id> | RENAME <cred-id> :<label>`
-- Description: Passkey (WebAuthn) registration and passwordless login. `REGISTER`/`REGISTER-FINISH` bind a credential to the logged-in account; `AUTH`/`AUTH-FINISH` issue and verify a single-use challenge; `LIST`, `REMOVE`, `RENAME`, and `STATUS` manage that account's credentials. Attestation and user-verification requirements follow `[webauthn]` configuration.
-- Privileges: Registration and management require a logged-in account; authentication challenge may name an account while logged out. All ceremonies require a configured WebAuthn relying party and fail closed on malformed base64, origin, RP-ID, credential, or signature data.
-- Replies: `WEBAUTHN` challenge/allow-credential lines, status/list notices, and a normal account login notice after a successful assertion.
-- Errors: `FAIL WEBAUTHN NOT_CONFIGURED`, `NOT_LOGGED_IN`, `NO_PENDING`, `BAD_CREDENTIAL_ID`, `BAD_CLIENT_DATA`, `BAD_AUTHDATA`, `BAD_SIGNATURE`, `BAD_ORIGIN`, `RP_MISMATCH`, `ASSERTION_FAILED`, `UNKNOWN_CREDENTIAL`, `CREDENTIAL_ACCOUNT_MISMATCH`, `INVALID_SUBCOMMAND`, and policy/temporary errors.
+- Syntax: `WEBAUTHN STATUS | REGISTER [label] | REGISTER-FINISH <cred-id> <client-data-json> <authdata> [attestation] | AUTH <account> | AUTH-FINISH <cred-id> <client-data-json> <authdata> <signature> | LIST | REMOVE <cred-id> | RENAME <cred-id> :<label> | LOCK`
+- Description: Passkey (WebAuthn) registration and passwordless login. `REGISTER`/`REGISTER-FINISH` bind a credential to the logged-in account; `AUTH`/`AUTH-FINISH` issue and verify a single-use challenge; `LIST`, `REMOVE`, `RENAME`, and `STATUS` manage that account's credentials. `LOCK` refuses password, PLAIN, and SCRAM until a recovery code replaces the password. It requires a passkey that is already stored. Attestation and user-verification requirements follow `[webauthn]` configuration.
+- Privileges: Registration, management, and `LOCK` require a logged-in account; authentication challenge may name an account while logged out. All ceremonies require a configured WebAuthn relying party and fail closed on malformed base64, origin, RP-ID, credential, or signature data.
+- Replies: `WEBAUTHN` challenge/allow-credential lines, status/list notices, `WEBAUTHN LOCKED :password login disabled`, and a normal account login notice after a successful assertion.
+- Errors: `FAIL WEBAUTHN NOT_CONFIGURED`, `NOT_LOGGED_IN`, `NO_PENDING`, `BAD_CREDENTIAL_ID`, `BAD_CLIENT_DATA`, `BAD_AUTHDATA`, `BAD_SIGNATURE`, `BAD_ORIGIN`, `RP_MISMATCH`, `ASSERTION_FAILED`, `UNKNOWN_CREDENTIAL`, `CREDENTIAL_ACCOUNT_MISMATCH`, `PASSKEY_REQUIRED`, `INVALID_SUBCOMMAND`, and policy/temporary errors.
 - Example: `WEBAUTHN REGISTER phone`
 - Sources: `src/daemon/modules/accounts.zig:155`, `src/daemon/server.zig:38838` (`handleWebauthn`), `src/crypto/webauthn.zig`, `src/daemon/webauthn_creds.zig`
 

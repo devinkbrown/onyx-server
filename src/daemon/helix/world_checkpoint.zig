@@ -560,7 +560,7 @@ fn decodeChannel(
     const base_mode_bits = try row.readU16();
     if ((base_mode_bits & ~@as(u16, 0x3fff)) != 0) return error.InvalidModeBits;
     const ext_mode_bits = try row.readU32();
-    if ((ext_mode_bits & ~@as(u32, 0x000f_ffff)) != 0) return error.InvalidModeBits;
+    if ((ext_mode_bits & ~@as(u32, 0x007f_ffff)) != 0) return error.InvalidModeBits;
     const private = try row.readBool();
     const hidden = try row.readBool();
     const key = try row.readOptStr();
@@ -788,7 +788,7 @@ fn decodeList(
 fn validateChannelView(channel: world_mod.World.CheckpointChannelView) Error!void {
     if (!world_mod.isChannelName(channel.name)) return error.InvalidChannelName;
     if ((channel.base_mode_bits & ~@as(u16, 0x3fff)) != 0 or
-        (channel.ext_mode_bits & ~@as(u32, 0x000f_ffff)) != 0)
+        (channel.ext_mode_bits & ~@as(u32, 0x007f_ffff)) != 0)
         return error.InvalidModeBits;
     if (channel.bans.len > max_list_entries or channel.exempts.len > max_list_entries or
         channel.invex.len > max_list_entries or channel.mutes.len > max_list_entries)
@@ -1204,7 +1204,7 @@ test "World v2 checkpoint round trips every channel field and nick relation" {
     try testing.expectEqualStrings("Alice!u@host", rich.topic_setter.?);
     try testing.expectEqual(@as(i64, 1_700_000_123), rich.topic_time);
     try testing.expectEqual(@as(u16, 0x3fff), rich.base_mode_bits);
-    try testing.expectEqual(@as(u32, 0x000f_ffff), rich.ext_mode_bits);
+    try testing.expectEqual(@as(u32, 0x007f_ffff), rich.ext_mode_bits);
     try testing.expect(rich.private and rich.hidden);
     try testing.expectEqualStrings("sekret", rich.key.?);
     try testing.expectEqual(@as(?u32, 42), rich.limit);

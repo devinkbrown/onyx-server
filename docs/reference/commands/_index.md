@@ -45,7 +45,7 @@ Last reconciled **2026-09-06** against the enabled module manifest and command r
 | `SEEN` | Show an account's last-seen/login history. | [accounts-services.md](accounts-services.md#seen) |
 | `ISON` | Return online subset of nick list. | [queries.md](queries.md#ison) |
 | `USERHOST` | Return user/host tuples for nicks. | [queries.md](queries.md#userhost) |
-| `WHOIS` | Return local WHOIS sequence. | [queries.md](queries.md#whois) |
+| `WHOIS` | Return a WHOIS sequence. Ordinary guests resolve from signed mesh presence. | [queries.md](queries.md#whois) |
 | `LIST` | List visible channels. | [queries.md](queries.md#list) |
 | `WHO` | Return WHO or WHOX rows. | [queries.md](queries.md#who) |
 | `WHOX` | Alias for WHOX-style field-selected WHO rows. | [queries.md](queries.md#who) |

@@ -17,7 +17,7 @@ voice/video), adds class-based connection policy with bounded growable SendQ/Rec
 nick-delay protection, and replaces the legacy TS6 server-to-server protocol with the
 native **Undertow + Mooring** cryptographic mesh.
 
-**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.7.0** (`build.zig.zon`) · [verified live fleet](docs/ops/onyx-server-paths.md) · [Quickstart](docs/guide/00-quickstart.md) · [Windows build and smoke](docs/guide/windows.md) ·
+**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.8.0** (`build.zig.zon`) · [verified live fleet](docs/ops/onyx-server-paths.md) · [Quickstart](docs/guide/00-quickstart.md) · [Windows build and smoke](docs/guide/windows.md) ·
 [Documentation](docs/README.md) · [Architecture](docs/architecture/00-overview.md) ·
 [Command reference](docs/reference/commands/_index.md) ·
 [Contributing](CONTRIBUTING.md) · [Runbook](docs/RUNBOOK.md) ·
@@ -38,16 +38,16 @@ docker build -f packaging/Dockerfile -t onyx-server:latest .
 docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 ```
 
-**Native (fastest to a running node).** Current source version is **0.7.0**
-(`build.zig.zon:18`). The latest published GitHub Release is still
-[`v0.5.6`](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6); build
-locally for 0.7.0:
+**Native (fastest to a running node).** Current source version is **0.8.0**
+(`build.zig.zon`). The latest published GitHub Release is still
+[`v0.5.6`](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6). The
+verified fleet is still `0.7.0+ae78d490`. Build the source tree locally for 0.8.0:
 
 ```sh
 git clone https://github.com/devinkbrown/onyx-server && cd onyx-server
-packaging/release.sh                                   # → dist/onyx-server-0.7.0-x86_64-linux-musl
-./dist/onyx-server-0.7.0-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
-./dist/onyx-server-0.7.0-x86_64-linux-musl packaging/onyx-server.quickstart.toml
+packaging/release.sh                                   # → dist/onyx-server-0.8.0-x86_64-linux-musl
+./dist/onyx-server-0.8.0-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.8.0-x86_64-linux-musl packaging/onyx-server.quickstart.toml
 ```
 
 Or download the published **v0.5.6** prebuilt:
@@ -81,8 +81,8 @@ As of **2026-09-06**, `eshmaki.me` and `ircx.us` are both running
 SHA-256 `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` and
 both report `links_active=1`, `peers_up=1`, `partitioned=0` on the loopback
 metrics endpoint. This is a live-deployment baseline, not a promise that a
-fresh clone is already deployed; the source-code baseline is `ae78d490` and the
-documentation commit may be newer.
+fresh clone is already deployed. Source version **0.8.0** is ahead of that
+image. The 2026-09-06 source baseline was `ae78d490`.
 
 ## Highlights
 
@@ -135,10 +135,10 @@ documentation commit may be newer.
 
 | Package | Role |
 |---|---|
-| `src/substrate` | Ringlane `io_uring` reactor, lock-free queues, allocators, the Undertow math (HLC/vector clocks, delta-state CRDTs, Merkle sync, Ripple, sketches), and the Deterministic Ocean simulator |
+| `src/substrate` | Undertow math (HLC/vector clocks, delta-state CRDTs, Merkle sync, Ripple, sketches), lock-free queues, allocators, and the Deterministic Ocean simulator. The production Ringlane ring lives in `src/daemon/ringlane.zig`. |
 | `src/crypto` | `Secret(T)`, SHA-2/HMAC/HKDF, AEADs, X25519 + ML-KEM key schedule, the Mooring ratchet, and the Armor TLS stack |
 | `src/proto` | zero-copy IRCv3 parser, CoilPack wire codec, CAP state machine, Undertow frame layer, SASL |
-| `src/daemon` | SerpentRegistry (comptime modules), client/channel model, connection classes, growable SendQ/RecvQ, nick delay and nick services, runtime flood guard, `+j` raid guard, spam-trap, command dispatch, OroStore, `STATS`/`INFO`, and the live mesh server |
+| `src/daemon` | SerpentRegistry, the production Ringlane ring, ordinary guest presence, connection classes, growable SendQ/RecvQ, nick services, flood and raid guards, command dispatch, OroStore, `STATS`/`INFO`, and the live mesh server |
 
 See the [architecture overview](docs/architecture/00-overview.md) for subsystems, request
 flow, and a full source map.

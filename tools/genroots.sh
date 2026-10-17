@@ -17,6 +17,15 @@ gen() {
     # substrate/root.zig would put `@import("onyx_server")` INSIDE the onyx_server
     # module, where that name is not available — breaking `zig build test`.
     [ "$dir" = "$SRC/substrate" ] && [ "$b" = bench.zig ] && continue
+    # These daemon leaves are compiled by hand-written guards that fail the
+    # build if the name is exported. Keep them out of the generated block.
+    if [ "$dir" = "$SRC/daemon" ]; then
+      case "$b" in
+        ocg2_authority_issuer.zig|ocg2_reconcile_schedule.zig|ocg2_reconcile_workset.zig|ocg2_transaction_dst.zig)
+          continue
+          ;;
+      esac
+    fi
     entries+=("${b%.zig}|$b")
   done
   for sub in "$dir"/*/; do
@@ -28,9 +37,23 @@ gen() {
     entries+=("$s|$s/root.zig")
   done
   IFS=$'\n' read -r -d '' -a entries < <(printf '%s\n' "${entries[@]}" | sort && printf '\0') || true
+  # A pub const declared outside the generated block is the one export.
+  # Emitting it again inside the block does not compile. The test reference
+  # stays, so the manual declaration still pulls that module's tests.
+  local outside
+  outside="$(awk '
+    /gen:mods:begin/{skip=1; next}
+    /gen:mods:end/{skip=0; next}
+    skip{next}
+    /^pub const [A-Za-z0-9_]+ =/{print $3}
+  ' "$rootf")"
   local imp="" tst=""
   for e in "${entries[@]}"; do
     n="${e%%|*}"; p="${e##*|}"
+    if printf '%s\n' "$outside" | grep -qx "$n"; then
+      tst+="    _ = $n;"$'\n'
+      continue
+    fi
     imp+="pub const $n = @import(\"$p\");"$'\n'
     tst+="    _ = $n;"$'\n'
   done

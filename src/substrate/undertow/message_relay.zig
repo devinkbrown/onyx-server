@@ -1063,8 +1063,8 @@ test "semantic validation preserves supported UTF8 IRCX and prefix forms" {
     try expectRoundTrip(.{
         .verb = .privmsg,
         .target = "%#\xe9\x83\xa8\xe5\xb1\x8b",
-        .source_nick = "\xce\x94elta",
-        .source_prefix = "\xce\x94elta!~user@[2001:db8::1]",
+        .source_nick = "\xce\x94\xce\xb5\xce\xbb\xcf\x84\xce\xb1",
+        .source_prefix = "\xce\x94\xce\xb5\xce\xbb\xcf\x84\xce\xb1!~user@[2001:db8::1]",
         .tags = "+draft/reply=one\\stwo;+vendor.example/tag=ok",
         .text = "mesh UTF8",
         .origin_node = 20,

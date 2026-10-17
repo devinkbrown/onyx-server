@@ -324,6 +324,13 @@ pub fn buildPathFacts(chain: []const []const u8, out: []CaPathFact) usize {
 /// Apply every presented CA's dNSName constraints to each certificate below
 /// it. An intermediate's own dNSName is held to the CA that issued it.
 pub fn enforcePresentedNameConstraints(chain: []const []const u8) Error!void {
+    try enforcePresentedNameConstraintsFor(chain, null);
+}
+
+/// `enforcePresentedNameConstraints`, plus the DNS name the handshake accepts.
+/// A wildcard SAN is not that accepted name: hostname matching expands it
+/// after the SAN walk.
+pub fn enforcePresentedNameConstraintsFor(chain: []const []const u8, accepted_dns: ?[]const u8) Error!void {
     var ancestor: usize = 1;
     while (ancestor < chain.len) : (ancestor += 1) {
         const issuer = try x509.parse(chain[ancestor]);
@@ -332,6 +339,7 @@ pub fn enforcePresentedNameConstraints(chain: []const []const u8) Error!void {
             const subject = try x509.parse(chain[below]);
             try enforceNameConstraints(issuer, subject);
         }
+        if (accepted_dns) |name| try enforceAcceptedDnsConstraints(issuer, name);
     }
 }
 
@@ -339,12 +347,19 @@ pub fn enforcePresentedNameConstraints(chain: []const []const u8) Error!void {
 /// anchor. A normal TLS chain omits that certificate, so the anchor from the
 /// caller's trust store is applied after its signature has matched.
 pub fn enforceExternalAnchor(chain: []const []const u8, anchor_der: []const u8) Error!void {
+    try enforceExternalAnchorFor(chain, anchor_der, null);
+}
+
+/// `enforceExternalAnchor`, and `accepted_dns` is constrained even when the
+/// anchor certificate is resent.
+pub fn enforceExternalAnchorFor(chain: []const []const u8, anchor_der: []const u8, accepted_dns: ?[]const u8) Error!void {
     const anchor = try x509.parse(anchor_der);
     for (chain) |der| {
         if (std.mem.eql(u8, der, anchor_der)) continue;
         const subject = try x509.parse(der);
         try enforceNameConstraints(anchor, subject);
     }
+    if (accepted_dns) |name| try enforceAcceptedDnsConstraints(anchor, name);
     if (chain.len > 0 and std.mem.eql(u8, chain[chain.len - 1], anchor_der)) return;
     var facts_buf: [17]CaPathFact = undefined;
     const n = buildPathFacts(chain, facts_buf[0..16]);
@@ -356,14 +371,14 @@ pub fn enforceExternalAnchor(chain: []const []const u8, anchor_der: []const u8) 
     try enforcePathLen(facts_buf[0 .. n + 1]);
 }
 
-/// Enforce an issuing CA's NameConstraints (dNSName) against the leaf's SAN
-/// dNSNames (RFC 5280 §4.2.1.10). Each leaf name must match no excluded
-/// subtree and, when permitted dNSName subtrees exist, at least one permitted
-/// subtree. Shared by the TLS 1.3 and hardened TLS 1.2 clients so a
-/// name-constrained CA in the anchor set is enforced identically by both —
-/// previously the TLS 1.2 client omitted this check entirely, letting a
-/// name-constrained sub-CA mint an out-of-scope leaf that TLS 1.3 correctly
-/// rejected but TLS 1.2 silently accepted.
+/// Enforce an issuing CA's NameConstraints (dNSName) against the subject's SAN
+/// dNSNames (RFC 5280 §4.2.1.10). Each name must match no excluded subtree
+/// and, when permitted dNSName subtrees exist, at least one permitted subtree.
+/// A `*.` SAN is the set of names a single left-most label expands to, not the
+/// literal pattern: an excluded subtree matches if any expansion is inside,
+/// and a permitted subtree matches only if every expansion is inside.
+/// `*.example.com` is inside permitted `example.com` and is not the excluded
+/// name `bad.example.com`, but it still authorizes that name.
 pub fn enforceNameConstraints(issuer: x509.Certificate, leaf: x509.Certificate) Error!void {
     if (!issuer.name_constraints_present) return;
     // RFC 5280 §4.2.1.10: a constraint we cannot match (iPAddress, rfc822Name,
@@ -373,23 +388,96 @@ pub fn enforceNameConstraints(issuer: x509.Certificate, leaf: x509.Certificate) 
     if (issuer.nc_unsupported_name_form) return error.BadCertificate;
     var li: usize = 0;
     while (li < leaf.san_dns_count) : (li += 1) {
-        const name = leaf.san_dns[li];
-        var ei: usize = 0;
-        while (ei < issuer.nc_excluded_dns_count) : (ei += 1) {
-            if (dnsConstraintMatches(issuer.nc_excluded_dns[ei], name)) return error.BadCertificate;
-        }
-        if (issuer.nc_permitted_dns_count > 0) {
-            var ok = false;
-            var pi: usize = 0;
-            while (pi < issuer.nc_permitted_dns_count) : (pi += 1) {
-                if (dnsConstraintMatches(issuer.nc_permitted_dns[pi], name)) {
-                    ok = true;
-                    break;
-                }
-            }
-            if (!ok) return error.BadCertificate;
-        }
+        try enforceDnsConstraintName(issuer, leaf.san_dns[li]);
     }
+}
+
+/// The DNS name a handshake accepts has to satisfy the same dNSName
+/// constraints as the SANs. Hostname matching expands `*.example.com` to one
+/// left-most label after the SAN walk, so comparing only that pattern does
+/// not bind `bad.example.com`. An iPAddress is a different GeneralName.
+fn enforceAcceptedDnsConstraints(issuer: x509.Certificate, dns_name: []const u8) Error!void {
+    if (!issuer.name_constraints_present) return;
+    if (issuer.nc_unsupported_name_form) return error.BadCertificate;
+    if (x509.IpAddress.parseLiteral(dns_name) != null) return;
+    if (std.mem.indexOfScalar(u8, dns_name, ':') != null) return;
+    try dnsNameObeysConstraints(issuer, dns_name);
+}
+
+fn enforceDnsConstraintName(issuer: x509.Certificate, name: []const u8) Error!void {
+    if (singleLabelWildcardRest(name)) |rest| {
+        try enforceWildcardDnsConstraints(issuer, rest);
+        return;
+    }
+    try dnsNameObeysConstraints(issuer, name);
+}
+
+fn dnsNameObeysConstraints(issuer: x509.Certificate, name: []const u8) Error!void {
+    var ei: usize = 0;
+    while (ei < issuer.nc_excluded_dns_count) : (ei += 1) {
+        if (dnsConstraintMatches(issuer.nc_excluded_dns[ei], name)) return error.BadCertificate;
+    }
+    if (issuer.nc_permitted_dns_count == 0) return;
+    var pi: usize = 0;
+    while (pi < issuer.nc_permitted_dns_count) : (pi += 1) {
+        if (dnsConstraintMatches(issuer.nc_permitted_dns[pi], name)) return;
+    }
+    return error.BadCertificate;
+}
+
+fn enforceWildcardDnsConstraints(issuer: x509.Certificate, rest: []const u8) Error!void {
+    var ei: usize = 0;
+    while (ei < issuer.nc_excluded_dns_count) : (ei += 1) {
+        if (wildcardIntersectsConstraint(issuer.nc_excluded_dns[ei], rest)) return error.BadCertificate;
+    }
+    if (issuer.nc_permitted_dns_count == 0) return;
+    var pi: usize = 0;
+    while (pi < issuer.nc_permitted_dns_count) : (pi += 1) {
+        if (wildcardCoveredByConstraint(issuer.nc_permitted_dns[pi], rest)) return;
+    }
+    return error.BadCertificate;
+}
+
+/// `*.example.com` -> `example.com`. Same shape hostname matching expands.
+fn singleLabelWildcardRest(name: []const u8) ?[]const u8 {
+    if (name.len < 3 or name[0] != '*' or name[1] != '.') return null;
+    return name[2..];
+}
+
+fn wildcardIntersectsConstraint(constraint: []const u8, rest: []const u8) bool {
+    if (constraint.len == 0) return true;
+    if (constraint[0] == '.') return dotRestEndsWith(rest, constraint);
+    if (oneLabelExpansionEquals(constraint, rest)) return true;
+    if (asciiEqlIgnoreCase(rest, constraint)) return true;
+    return restEndsWithDotName(rest, constraint);
+}
+
+fn wildcardCoveredByConstraint(constraint: []const u8, rest: []const u8) bool {
+    if (constraint.len == 0) return true;
+    if (constraint[0] == '.') return dotRestEndsWith(rest, constraint);
+    if (asciiEqlIgnoreCase(rest, constraint)) return true;
+    return restEndsWithDotName(rest, constraint);
+}
+
+fn oneLabelExpansionEquals(constraint: []const u8, rest: []const u8) bool {
+    if (constraint.len < rest.len + 2) return false;
+    const dot = constraint.len - rest.len - 1;
+    if (constraint[dot] != '.') return false;
+    if (!asciiEqlIgnoreCase(constraint[dot + 1 ..], rest)) return false;
+    const head = constraint[0..dot];
+    return head.len > 0 and std.mem.indexOfScalar(u8, head, '.') == null;
+}
+
+fn restEndsWithDotName(rest: []const u8, name: []const u8) bool {
+    if (name.len == 0 or rest.len < name.len + 1) return false;
+    if (rest[rest.len - name.len - 1] != '.') return false;
+    return asciiEqlIgnoreCase(rest[rest.len - name.len ..], name);
+}
+
+fn dotRestEndsWith(rest: []const u8, suffix: []const u8) bool {
+    if (suffix.len == 0) return true;
+    if (suffix.len == rest.len + 1 and suffix[0] == '.' and asciiEqlIgnoreCase(suffix[1..], rest)) return true;
+    return asciiEndsWithIgnoreCase(rest, suffix);
 }
 
 /// dNSName name-constraint match (RFC 5280): the constraint matches the name
@@ -494,6 +582,68 @@ test "enforceNameConstraints applies permitted + excluded dNSName subtrees" {
     const plain = std.mem.zeroes(x509.Certificate);
     leaf.san_dns[0] = "anything.test";
     try enforceNameConstraints(plain, leaf);
+}
+
+test "exploit: wildcard dNSName cannot expand into an excluded subtree" {
+    var issuer = std.mem.zeroes(x509.Certificate);
+    issuer.name_constraints_present = true;
+    issuer.nc_permitted_dns[0] = "example.com";
+    issuer.nc_permitted_dns_count = 1;
+    issuer.nc_excluded_dns[0] = "bad.example.com";
+    issuer.nc_excluded_dns_count = 1;
+
+    var leaf = std.mem.zeroes(x509.Certificate);
+    leaf.san_dns_count = 1;
+    leaf.san_dns[0] = "*.example.com";
+    // Literal pattern is inside example.com and is not bad.example.com, but
+    // one left-most label expands to that excluded name.
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
+    try std.testing.expectError(error.BadCertificate, enforceAcceptedDnsConstraints(issuer, "bad.example.com"));
+    try std.testing.expectError(error.BadCertificate, enforceAcceptedDnsConstraints(issuer, "BAD.example.com"));
+    try enforceAcceptedDnsConstraints(issuer, "host.example.com");
+    // A permitted dNSName subtree does not apply to an address literal.
+    try enforceAcceptedDnsConstraints(issuer, "1.2.3.4");
+    try enforceAcceptedDnsConstraints(issuer, "2001:db8::1");
+
+    issuer.nc_excluded_dns_count = 0;
+    try enforceNameConstraints(issuer, leaf);
+
+    issuer.nc_excluded_dns[0] = "a.b.example.com";
+    issuer.nc_excluded_dns_count = 1;
+    try enforceNameConstraints(issuer, leaf);
+    issuer.nc_excluded_dns[0] = "notexample.com";
+    try enforceNameConstraints(issuer, leaf);
+    issuer.nc_excluded_dns[0] = "WWW.example.com";
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
+
+    issuer.nc_excluded_dns_count = 0;
+    issuer.nc_permitted_dns[0] = "www.example.com";
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
+    leaf.san_dns[0] = "*.www.example.com";
+    try enforceNameConstraints(issuer, leaf);
+
+    issuer.nc_permitted_dns[0] = "example.com";
+    issuer.nc_permitted_dns_count = 1;
+    issuer.nc_excluded_dns[0] = "bad.example.com";
+    issuer.nc_excluded_dns_count = 1;
+    leaf.san_dns[0] = "*.good.example.com";
+    try enforceNameConstraints(issuer, leaf);
+    leaf.san_dns[0] = "host.example.com";
+    try enforceNameConstraints(issuer, leaf);
+
+    // Leading-dot permitted `.example.com` covers every one-label expansion.
+    issuer.nc_excluded_dns_count = 0;
+    issuer.nc_permitted_dns[0] = ".example.com";
+    leaf.san_dns[0] = "*.example.com";
+    try enforceNameConstraints(issuer, leaf);
+    // `.bad.example.com` excludes only names under that label, not `bad.example.com`
+    // itself, so no one-label expansion of `*.example.com` is inside it.
+    issuer.nc_permitted_dns[0] = "example.com";
+    issuer.nc_excluded_dns[0] = ".bad.example.com";
+    issuer.nc_excluded_dns_count = 1;
+    try enforceNameConstraints(issuer, leaf);
+    issuer.nc_excluded_dns[0] = ".example.com";
+    try std.testing.expectError(error.BadCertificate, enforceNameConstraints(issuer, leaf));
 }
 
 test "exploit: NameConstraints with an unenforced name form fail closed" {

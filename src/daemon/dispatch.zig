@@ -26,6 +26,7 @@ const node_short_id = @import("../crypto/node_short_id.zig");
 const session_snapshot = @import("helix/session_snapshot.zig");
 const labeled_response = @import("../proto/labeled_response.zig");
 const msgid = @import("../proto/msgid.zig");
+const ident_utf8 = @import("../substrate/utf8.zig");
 
 pub const UserMode = usermode.UserMode;
 
@@ -284,6 +285,7 @@ pub const CapId = enum(u6) {
     netsplit,
     netjoin,
     onyx_2fa,
+    onyx_privacy,
 };
 
 const CapSet = struct {
@@ -444,6 +446,10 @@ const cap_specs = [_]CapSpec{
     // Accounts with 2FA complete login through IDENTIFY. Surface this before
     // clients choose a SASL mechanism, without treating IDENTIFY as one.
     .{ .id = .onyx_2fa, .name = "onyx/2fa", .value_302 = "IDENTIFY" },
+    // onyx/privacy: the user and channel modes enforced by this build.
+    // umode lists the receive and direct-message privacy letters. cmode lists
+    // the extended channel moderation letters. Both sets are live gates.
+    .{ .id = .onyx_privacy, .name = "onyx/privacy", .value_302 = "umode=DGIZTVW,cmode=cBK" },
 };
 
 /// Exact upper bound on the rendered, space-separated negotiated-cap-name list
@@ -818,6 +824,20 @@ pub const RegistrationState = struct {
     registered: bool = false,
 };
 
+/// Optional login-audit callback. Null keeps dispatch tests unchanged.
+/// The hook must not fail SASL: a store error is the callback's problem.
+pub const LoginAuditHook = struct {
+    ptr: *anyopaque,
+    record: *const fn (
+        ptr: *anyopaque,
+        session: *ClientSession,
+        account: []const u8,
+        mechanism: sasl.Mechanism,
+        tls: bool,
+        certfp: []const u8,
+    ) void,
+};
+
 /// Per-local-client dispatch state.
 pub const ClientSession = struct {
     client: Client = .{},
@@ -832,6 +852,9 @@ pub const ClientSession = struct {
     /// Injected PLAIN verifier. The live server sets this to a services-backed
     /// checker; left null (e.g. no account store yet) SASL PLAIN fails closed.
     sasl_plain: ?sasl.PlainChecker = null,
+    /// PLAIN and SCRAM may be advertised and completed. The live server sets
+    /// this false on a plaintext accept. Dispatch tests leave the default.
+    password_sasl_allowed: bool = true,
     /// Injected EXTERNAL verifier (account ←→ TLS certfp). Null fails closed.
     sasl_external: ?sasl_mechrouter.ExternalLookup = null,
     /// Injected SCRAM-SHA-256 credential lookup. Null fails closed.
@@ -897,6 +920,9 @@ pub const ClientSession = struct {
     /// can issue and deliver a fresh session token once the live connection layer
     /// regains control.
     sasl_issue_session_token: bool = false,
+    /// Set by the live server when account services are attached. Dispatch
+    /// calls it after a non-guest SASL success. Password checks stay silent.
+    login_audit: ?LoginAuditHook = null,
 
     /// Real peer host/IP captured at accept (never shown to other users once a
     /// cloak/vhost is set). `host_store` is the *visible* host: the auto-cloak of
@@ -1247,7 +1273,7 @@ pub const ClientSession = struct {
         self.ircx_event_subject_masks[@intFromEnum(typ)].len = 0;
     }
 
-    /// Render active user modes as "+iB" into `out` (caller-owned, >= 16 bytes
+    /// Render active user modes as "+iB" into `out` (caller-owned, >= 32 bytes
     /// to hold '+', the derived 'o', and every catalog letter).
     pub fn umodeString(self: *const ClientSession, out: []u8) []const u8 {
         var n: usize = 0;
@@ -1528,13 +1554,17 @@ pub const ClientSession = struct {
     }
 };
 
+fn passwordMechEnabled(session: *const ClientSession, configured: bool) bool {
+    return configured and session.password_sasl_allowed;
+}
+
 fn writeSaslCapValue(session: *const ClientSession, out: []u8) ?[]const u8 {
     var len: usize = 0;
-    appendSaslMechanism(out, &len, session.sasl_plain != null, "PLAIN") catch return null;
+    appendSaslMechanism(out, &len, passwordMechEnabled(session, session.sasl_plain != null), "PLAIN") catch return null;
     appendSaslMechanism(out, &len, session.sasl_external != null, "EXTERNAL") catch return null;
-    appendSaslMechanism(out, &len, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-256") catch return null;
-    appendSaslMechanism(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-512") catch return null;
-    appendSaslMechanism(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0 and session.tls_exporter != null, "SCRAM-SHA-512-PLUS") catch return null;
+    appendSaslMechanism(out, &len, passwordMechEnabled(session, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0), "SCRAM-SHA-256") catch return null;
+    appendSaslMechanism(out, &len, passwordMechEnabled(session, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0), "SCRAM-SHA-512") catch return null;
+    appendSaslMechanism(out, &len, passwordMechEnabled(session, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0 and session.tls_exporter != null), "SCRAM-SHA-512-PLUS") catch return null;
     appendSaslMechanism(out, &len, session.sasl_session_token != null, "SESSION-TOKEN") catch return null;
     appendSaslMechanism(out, &len, session.sasl_oauthbearer != null, "OAUTHBEARER") catch return null;
     appendSaslMechanism(out, &len, session.sasl_allow_anonymous, "ANONYMOUS") catch return null;
@@ -1543,11 +1573,11 @@ fn writeSaslCapValue(session: *const ClientSession, out: []u8) ?[]const u8 {
 
 fn writeSaslMechanismList(session: *const ClientSession, out: []u8) ?[]const u8 {
     var len: usize = 0;
-    appendSaslMechanismSep(out, &len, session.sasl_plain != null, "PLAIN", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, passwordMechEnabled(session, session.sasl_plain != null), "PLAIN", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_external != null, "EXTERNAL", ' ') catch return null;
-    appendSaslMechanismSep(out, &len, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-256", ' ') catch return null;
-    appendSaslMechanismSep(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0, "SCRAM-SHA-512", ' ') catch return null;
-    appendSaslMechanismSep(out, &len, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0 and session.tls_exporter != null, "SCRAM-SHA-512-PLUS", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, passwordMechEnabled(session, session.sasl_scram256 != null and session.sasl_server_nonce.len != 0), "SCRAM-SHA-256", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, passwordMechEnabled(session, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0), "SCRAM-SHA-512", ' ') catch return null;
+    appendSaslMechanismSep(out, &len, passwordMechEnabled(session, session.sasl_scram512 != null and session.sasl_server_nonce.len != 0 and session.tls_exporter != null), "SCRAM-SHA-512-PLUS", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_session_token != null, "SESSION-TOKEN", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_oauthbearer != null, "OAUTHBEARER", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_allow_anonymous, "ANONYMOUS", ' ') catch return null;
@@ -1853,7 +1883,7 @@ fn handlePass(ctx: DispatchCtx) DispatchError!void {
 
 fn handleNick(ctx: DispatchCtx) DispatchError!void {
     const nick = ctx.params()[0];
-    if (hasControlByte(nick)) {
+    if (hasControlByte(nick) or ident_utf8.containsIdentifierSpoof(nick)) {
         try ctx.replies.numeric(ctx.session, .ERR_ERRONEUSNICKNAME, &.{"*"}, "Erroneous nickname");
         return;
     }
@@ -1942,6 +1972,11 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
             try ctx.replies.numeric(ctx.session, .ERR_SASLABORTED, &.{}, "SASL authentication aborted");
             return;
         }
+        if (sasl.Mechanism.parse(payload)) |mech| {
+            if (sasl.mechanismIsKnowledgeFactor(mech) and !ctx.session.password_sasl_allowed) {
+                return saslUnsupportedMechanism(ctx);
+            }
+        }
 
         var router = sasl_mechrouter.Router.initWithLimit(.{
             .plain = saslPlainAdapter(ctx.session),
@@ -2026,6 +2061,13 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
 
             const oper_elevation_allowed = saslMechanismAllowsOperElevation(ctx.session.sasl_pending);
             const mechanism = ctx.session.sasl_pending;
+            if (mechanism) |mech| {
+                if (sasl.mechanismIsKnowledgeFactor(mech) and !ctx.session.password_sasl_allowed) {
+                    ctx.session.sasl_router = null;
+                    ctx.session.sasl_pending = null;
+                    return saslFail(ctx, "SASL authentication failed");
+                }
+            }
             ctx.session.sasl_router = null;
             ctx.session.sasl_pending = null;
 
@@ -2061,6 +2103,13 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
                 ctx.session.loginAs(account);
                 ctx.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
                 ctx.session.sasl_issue_session_token = result.issue_session_token;
+                if (ctx.session.login_audit) |hook| if (mechanism) |mech| {
+                    if (mech != .anonymous) {
+                        const tls_on = ctx.session.tls_cipher != null or ctx.session.tls_exporter != null or ctx.session.tls_certfp != null;
+                        const fp = ctx.session.tls_certfp orelse "";
+                        hook.record(hook.ptr, ctx.session, account, mech, tls_on, fp);
+                    }
+                };
             }
 
             if (final_copy) |final| {
@@ -3266,7 +3315,7 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
     for ("beIZ") |letter| try std.testing.expect(std.mem.indexOfScalar(u8, class_a, letter) != null);
     try std.testing.expectEqualStrings("k", class_b);
     for ("lfj") |letter| try std.testing.expect(std.mem.indexOfScalar(u8, class_c, letter) != null);
-    for ("phuadErzxw") |letter| try std.testing.expect(std.mem.indexOfScalar(u8, class_d, letter) != null);
+    for ("phuadErzxwcBK") |letter| try std.testing.expect(std.mem.indexOfScalar(u8, class_d, letter) != null);
 
     // Letters backed by the compact chanmode.ChannelMode enum must resolve in the
     // catalog with the matching protocol class.
@@ -3287,14 +3336,14 @@ test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
     // intentionally NOT in the compact enum (and U is distinct from the enum's
     // 'O' oper-only), but are still real, handled modes. Their absence from the
     // enum must be deliberate, not an oversight.
-    for ("fjZVUFD") |letter| {
+    for ("fjZVUFDcBK") |letter| {
         try std.testing.expect(chanmode.specFromLetter(letter) == null);
     }
 
     // The advertisement must not leak any letter the handler does not enforce.
     // The full enforced set across both layers (V = NOCOMICDATA, U = OPMODERATE,
     // F = FREETARGET, D = DISFORWARD).
-    const enforced = "beIZklfjimnstCTNMSgWOAVUFDphuadErzxw";
+    const enforced = "beIZklfjimnstCTNMSgWOAVUFDphuadErzxwcBK";
     for (class_a) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_b) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);
     for (class_c) |c| try std.testing.expect(std.mem.indexOfScalar(u8, enforced, c) != null);

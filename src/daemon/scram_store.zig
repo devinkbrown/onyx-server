@@ -101,6 +101,13 @@ const Entry = struct {
     server_key_512: [digest512_len]u8 = @splat(0),
 };
 
+/// Refuse password-derived SCRAM without revealing why. `allowed` returns false
+/// when the account may not use a password mechanism.
+pub const PasswordGate = struct {
+    ptr: *anyopaque,
+    allowed: *const fn (ptr: *anyopaque, account: []const u8) bool,
+};
+
 /// In-memory registry of per-account SCRAM-SHA-256 credentials.
 pub const ScramStore = struct {
     allocator: std.mem.Allocator,
@@ -114,6 +121,9 @@ pub const ScramStore = struct {
     lock: rwlock.RwLock = .{},
     /// Optional durable backfill source consulted by `resolve` on a miss.
     loader: ?Loader = null,
+    /// When set, a false answer refuses password-derived SCRAM for that account
+    /// before any salt is copied out. The callback must not take this store's lock.
+    password_gate: ?PasswordGate = null,
 
     /// Create an empty store backed by `allocator`.
     pub fn init(allocator: std.mem.Allocator) ScramStore {
@@ -444,6 +454,11 @@ pub const ScramStore = struct {
     /// Backfill the account from the durable loader on a live-store miss, caching
     /// the loaded record. Returns true when the entry now exists in the live
     /// store. Shared by the SHA-256 and SHA-512 resolve paths.
+    fn passwordMechanismAllowed(self: *ScramStore, account: []const u8) bool {
+        const gate = self.password_gate orelse return true;
+        return gate.allowed(gate.ptr, account);
+    }
+
     fn backfill(self: *ScramStore, account: []const u8) bool {
         const loader = blk: {
             self.lock.lockShared();
@@ -458,6 +473,7 @@ pub const ScramStore = struct {
     /// uses, so a SCRAM login works after a restart even before any in-memory
     /// entry exists. Returns null when unknown everywhere.
     pub fn resolve(self: *ScramStore, account: []const u8) ?sasl.ScramRecord {
+        if (!self.passwordMechanismAllowed(account)) return null;
         if (self.lookup(account)) |r| return r;
         if (!self.backfill(account)) return null;
         return self.lookup(account);
@@ -468,6 +484,7 @@ pub const ScramStore = struct {
     /// has no SHA-512 material (e.g. an account loaded from an old SHA-256-only
     /// durable record, until it is re-provisioned).
     pub fn resolve512(self: *ScramStore, account: []const u8) ?scram512.Credential {
+        if (!self.passwordMechanismAllowed(account)) return null;
         if (self.lookup512(account)) |r| return r;
         if (!self.backfill(account)) return null;
         return self.lookup512(account);

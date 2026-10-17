@@ -2,7 +2,7 @@
 
 *Build Onyx Server, write a minimal config, and start the daemon.*
 
-Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon. The build package declares
+Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon. The source manifest is **0.8.0**. The verified fleet is still the older `0.7.0+ae78d490` image, and a fresh build of this tree is not that deploy. The build package declares
 Zig `0.17.0-dev.1282+c0f9b51d8` as the minimum supported compiler, and the
 daemon build rejects 32-bit targets. The browser WASM artifacts are the only
 deliberate 32-bit exception.

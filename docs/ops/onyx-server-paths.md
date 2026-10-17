@@ -4,8 +4,10 @@
 
 This is the canonical current-topology document. It was refreshed from both
 systemd units, `/proc/<pid>/exe`, executable hashes, and loopback metrics on
-**2026-09-06**. Re-run the commands below after any deployment; release notes
-preserve the exact historical inputs and are not substitutes for this table.
+**2026-09-06**. The source manifest is now **0.8.0** and has not replaced the
+image in the table below. Re-run the commands below after any deployment;
+release notes preserve the exact historical inputs and are not substitutes
+for this table.
 
 | | eshmaki.me | ircx.us |
 |--|------------|---------|

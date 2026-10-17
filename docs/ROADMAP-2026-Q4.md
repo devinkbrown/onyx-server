@@ -5,10 +5,13 @@ organized as a **feature spine in four waves** plus three **release tracks**
 (performance, hardening, polish) that cut across every wave. Ambitious about
 where the stack goes; honest about what is in the tree today.
 
-Current daemon version: **0.7.0** (`build.zig.zon:18`), source-code baseline
-`ae78d490` (reconciled 2026-09-06). The original 0.7 acceptance work is
-closed; this roadmap remains the forward-looking feature spine and labels
-historical gap analyses where they no longer describe the tree.
+Current daemon version: **0.8.0** (`build.zig.zon`). The 2026-09-06
+reconciliation recorded source baseline `ae78d490` at `0.7.0` and the live
+fleet `0.7.0+ae78d490`. That fleet record is unchanged. This roadmap is a
+forward-looking spine. It is not a claim that the 0.8.0 tree has passed a
+full suite. Where a section below still cites an inline `ringlane` namespace
+inside `server.zig`, read [the reactor page](architecture/01-reactor-threading.md)
+instead: the production ring is `src/daemon/ringlane.zig`.
 
 ## What 0.7 is
 
@@ -711,7 +714,9 @@ regression-vs-baseline on the same host, not a leaderboard.
 
 ### P-02 — Turn on the io_uring fast path
 
-**P0** · `src/daemon/server.zig`, `src/daemon/config_format.zig` · **client: none**
+**Correction (2026-10-17).** The audit below describes an older tree. The production ring is now `src/daemon/ringlane.zig`, not an inline namespace at `server.zig:860`. It probes multishot accept and multishot wake-poll, sizes the completion queue to at least 256, and requests cooperative task-work. It does not request `DEFER_TASKRUN` or `SINGLE_ISSUER`. Recv, send, buffer rings, zero-copy send, and fixed files stay off. `[io]` exposes `ring_entries`, `cqe_batch`, `defer_taskrun`, and `sqpoll`. `defer_taskrun` is parsed and not armed. This item is not closed: the full suite has not been re-run green, and the measurement gate has not been repeated.
+
+**P0** · `src/daemon/ringlane.zig`, `src/daemon/server.zig`, `src/daemon/config_format.zig` · **client: none**
 **Owner:** `onyx-server-reactor` (correctness) + `onyx-server-perf` (measurement) · **Complexity:** L · **Gate:** `zig build test-server` + `zig build bench`
 
 This is the single largest known performance gap in the tree, and it is a

@@ -129,6 +129,9 @@ pub const mode_table = [_]ModeSpec{
     // the forward path, so the MODEX rows carry no advertise-without-enforce risk.
     .{ .name = "FREETARGET", .letter = 'F', .kind = .channel },
     .{ .name = "DISFORWARD", .letter = 'D', .kind = .channel },
+    .{ .name = "NOCOLOR", .letter = 'c', .kind = .channel },
+    .{ .name = "NOBOT", .letter = 'B', .kind = .channel },
+    .{ .name = "FOUNDERKICK", .letter = 'K', .kind = .channel },
     .{ .name = "FOUNDER", .letter = 'Q', .kind = .member, .status_prefix = '~' },
     .{ .name = "OWNER", .letter = 'q', .kind = .member, .status_prefix = '.' },
     .{ .name = "HOST", .letter = 'o', .kind = .member, .status_prefix = '@' },
@@ -136,6 +139,9 @@ pub const mode_table = [_]ModeSpec{
 };
 
 comptime {
+    // Name and letter uniqueness scans every pair. The added rows exceed
+    // Zig's default comptime branch quota.
+    @setEvalBranchQuota(10_000);
     for (mode_table, 0..) |left, left_index| {
         for (mode_table[left_index + 1 ..]) |right| {
             if (asciiEqlComptime(left.name, right.name)) {

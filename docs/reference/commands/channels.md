@@ -7,7 +7,7 @@ The channel command module registers the base membership and moderation commands
 ## JOIN
 
 - Syntax: `JOIN <#chan[,#chan...]> [key[,key...]]` or `JOIN 0`
-- Description: Joins channels from positional comma lists. `joinOne` enforces channel-name length, `CHANLIMIT`, Warden quarantine, TLS/account/invite/key/ban gates, join throttle, limit forwarding, IRCX tier keys, automatic topic and NAMES, bouncer rewind, and mesh membership propagation.
+- Description: Joins channels from positional comma lists. `joinOne` enforces channel-name length, `CHANLIMIT`, Warden quarantine, TLS/account/invite/key/ban gates, join throttle, limit forwarding, IRCX tier keys, automatic topic and NAMES, bouncer rewind, and mesh membership propagation. A parameter of `0` plus eight hex digits is that channel's IRCX object id and joins the canonical name when the channel is public, or when it is secret, private, or hidden and the caller is already a member or a network operator; unknown and invisible ids, including `000000000`, both return `403` with trailing `No such channel` and the caller's original token, and `IRCX` advertises the shortcut as `OID=visible`.
 - Privileges: Registered client.
 - Parameters: Channel list; optional key list. The special target `0` parts every current channel.
 - Replies: `JOIN` broadcast, `RPL_TOPIC 332` or `RPL_NOTOPIC 331`, `RPL_NAMREPLY 353`, `RPL_ENDOFNAMES 366`; may emit `ERR_LINKCHANNEL 470` for forward.
@@ -111,7 +111,7 @@ The channel command module registers the base membership and moderation commands
 - Description: IRCX channel creation. The target must not already exist. With a clone source, the source channel's channel-level modes and portable room metadata are copied before requested initial modes are applied on top. Creation delegates through the normal JOIN path after parsing, so the creator receives founder status through the channel creation path.
 - Privileges: Registered client.
 - Parameters: Channel; optional initial mode string; optional clone-source channel.
-- Replies: Same join/topic/NAMES surface as `JOIN`, plus inherited or requested `MODE` broadcasts when modes are applied.
+- Replies: Same join/topic/NAMES surface as `JOIN`, plus inherited or requested `MODE` broadcasts when modes are applied. The creator receives `CREATE <channel> <oid>` with oid `0` plus 8 hex digits.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid create syntax, `ERR_CHANNELEXIST 926` when the target already exists, `ERR_NOSUCHCHANNEL 403` for a missing clone source; join and mode errors from delegated paths.
 - Example: `CREATE #new`
 - Sources: `src/daemon/modules/channel_ops.zig:67`, `src/proto/ircx_create.zig:63`, `src/proto/ircx_create.zig:111`, `src/daemon/server.zig:21225`, `src/daemon/server.zig:21235`, `src/daemon/server.zig:21239`, `src/daemon/server.zig:21262`, `src/daemon/server.zig:21275`

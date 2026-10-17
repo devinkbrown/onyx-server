@@ -132,6 +132,12 @@ pub const WhoisSubject = struct {
     /// receives private messages from senders on its ACCEPT list. Like
     /// `regonly_msgs`, a public messaging hint rather than a privacy field.
     callerid: bool = false,
+    /// RPL_WHOISSPECIAL (320): +G requires a shared channel or ACCEPT.
+    common_chan: bool = false,
+    /// RPL_WHOISSPECIAL (320): +Z requires the sender to be on TLS.
+    tls_only_pm: bool = false,
+    /// RPL_WHOISSPECIAL (320): +V refuses ordinary invites.
+    no_invite: bool = false,
     channels: []const ChannelMembership = &.{},
 };
 
@@ -242,6 +248,15 @@ pub fn writeWhoisWith(
     }
     if (subject.callerid) {
         try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is only accepting private messages from users on its accept list");
+    }
+    if (subject.common_chan) {
+        try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is only accepting private messages from users who share a channel");
+    }
+    if (subject.tls_only_pm) {
+        try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is only accepting private messages over TLS");
+    }
+    if (subject.no_invite) {
+        try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is not accepting invites");
     }
     if (subject.away) |away_message| {
         try writeAwayLine(params, sink, server_name, requester_nick, subject.nick, away_message);
@@ -1163,6 +1178,28 @@ test "restriction 320s coexist with a geo 320 (multiple RPL_WHOISSPECIAL lines)"
         if (std.mem.indexOf(u8, line.bytes, " 320 ") != null) count_320 += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), count_320); // geo + regonly + callerid
+}
+
+test "common-channel, TLS-only, and no-invite modes emit fixed 320 lines" {
+    var storage: [2048]u8 = undefined;
+    var lines_storage: [16]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.common_chan = true;
+    subject.tls_only_pm = true;
+    subject.no_invite = true;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    var saw_common = false;
+    var saw_tls = false;
+    var saw_invite = false;
+    for (sink.slice()) |line| {
+        if (std.mem.indexOf(u8, line.bytes, "share a channel") != null) saw_common = true;
+        if (std.mem.indexOf(u8, line.bytes, "over TLS") != null) saw_tls = true;
+        if (std.mem.indexOf(u8, line.bytes, "not accepting invites") != null) saw_invite = true;
+    }
+    try std.testing.expect(saw_common and saw_tls and saw_invite);
 }
 
 test "ERR_NOSUCHNICK builder emits 401" {

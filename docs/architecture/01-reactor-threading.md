@@ -1,21 +1,34 @@
 # Reactor and threading
 
-_The Ringlane io_uring reactor, per-reactor connection state, worker shards, cross-shard delivery, world locking, and the live multithreading status._
+_The live Ringlane io_uring reactor, per-reactor connection state, worker shards, cross-shard delivery, world locking, and the live multithreading status._
 
-Onyx Server's live Linux server still owns an embedded Ringlane wrapper in `src/daemon/server.zig`, while the reusable substrate Ringlane backend now lives under `src/substrate/io/`. The live server comment defines the socket path as TCP accept, receive IRC bytes through `Ring`, feed complete LF-terminated lines into the pure command core, and send queued replies back through `Ring`. Evidence: `src/daemon/server.zig:4`, `src/daemon/server.zig:6`, `src/daemon/server.zig:7`, `src/daemon/server.zig:8`.
+The production Linux ring is `src/daemon/ringlane.zig`. The daemon imports it at `src/daemon/server.zig:981`, and `src/daemon/reactor_backend.zig` selects `ringlane.Ring` on Linux. `src/substrate/io/ring.zig` is an unfinished prototype. It does not connect, poll, or cancel, and it is not the daemon backend. `src/substrate/reactor.zig` is the separate clock seam. Its header still treats submit, poll, accept, recv, and send as future work for that seam.
+
+The socket path is unchanged: accept TCP, receive IRC bytes through the ring, feed complete LF-terminated lines into the command core, and send queued replies back through the ring.
 
 ## Ringlane reactor core
 
-| Component | Current behavior | Evidence |
+This section is the 2026-10-17 source contract. It is not a green full-suite result. A focused Debug compile of the Ringlane filters on that date failed before the later compile fixes, and no later full `zig build test` has been recorded.
+
+| Behavior | Contract | Evidence |
 | --- | --- | --- |
-| Live server Ringlane | `server.zig`'s embedded `ringlane.Ring` owns `linux.IoUring` plus feature flags and exposes init/deinit/submit/submitAndWait for the daemon loop. | `src/daemon/server.zig:711`, `src/daemon/server.zig:863`, `src/daemon/server.zig:867`, `src/daemon/server.zig:875`, `src/daemon/server.zig:879` |
-| Live server operations | The embedded wrapper encodes accept, recv, send, timeout, connect, and poll completions in `user_data`, and queues accept, recv, connect, send, timeout, and poll-add SQEs. | `src/daemon/server.zig:739`, `src/daemon/server.zig:749`, `src/daemon/server.zig:883`, `src/daemon/server.zig:898`, `src/daemon/server.zig:902`, `src/daemon/server.zig:906`, `src/daemon/server.zig:911`, `src/daemon/server.zig:918` |
-| Completion demux | `reapCompletions` copies CQEs, decodes each completion, skips undecodable CQEs, and calls the provided handler for decoded completions. | `src/daemon/server.zig:922`, `src/daemon/server.zig:923`, `src/daemon/server.zig:924`, `src/daemon/server.zig:925`, `src/daemon/server.zig:926` |
-| Substrate Ringlane backend | `src/substrate/io/root.zig` exports `ring` and `buf_ring`; `ring.zig` defines the Linux-only reusable `Ring` wrapper, pure `user_data` codec, typed completion decoder, and init/submit helpers. | `src/substrate/io/root.zig:4`, `src/substrate/io/root.zig:7`, `src/substrate/io/root.zig:8`, `src/substrate/io/ring.zig:170`, `src/substrate/io/ring.zig:194`, `src/substrate/io/ring.zig:268`, `src/substrate/io/ring.zig:323`, `src/substrate/io/ring.zig:331` |
-| Provided-buffer rings | `buf_ring.zig` owns the provided-buffer-ring bookkeeping: live `setup_buf_ring`/publish/free, pure inline `BufRing` storage, lease creation from recv completions, and checked recycle/replenish. | `src/substrate/io/buf_ring.zig:56`, `src/substrate/io/buf_ring.zig:70`, `src/substrate/io/buf_ring.zig:82`, `src/substrate/io/buf_ring.zig:106`, `src/substrate/io/buf_ring.zig:151`, `src/substrate/io/buf_ring.zig:171` |
-| Feature gating | The reusable backend declares baseline, `linux_6_1_safe`, and `linux_6_8_fast` profiles. `defer_taskrun` sets both `IORING_SETUP_DEFER_TASKRUN` and `IORING_SETUP_SINGLE_ISSUER`; `narrow` fails closed and keeps multishot recv coupled to buffer-ring support. | `src/substrate/io/ring.zig:57`, `src/substrate/io/ring.zig:61`, `src/substrate/io/ring.zig:71`, `src/substrate/io/ring.zig:81`, `src/substrate/io/ring.zig:87`, `src/substrate/io/ring.zig:98`, `src/substrate/io/ring.zig:101`, `src/substrate/io/ring.zig:108` |
-| Live fast-path status | The live server config defaults to `RingFeatureSet.baseline`; the embedded server helper currently queues ordinary accept/recv on caller-owned buffers. The reusable substrate backend has `submitRecvBufRing`, but that helper is not the live server's current recv path. | `src/daemon/server.zig:1704`, `src/daemon/server.zig:883`, `src/daemon/server.zig:895`, `src/daemon/server.zig:898`, `src/daemon/server.zig:899`, `src/substrate/io/ring.zig:372`, `src/substrate/io/ring.zig:375`, `src/substrate/io/ring.zig:376` |
-| Deterministic seam | `src/substrate/reactor.zig` is the separate vtable seam for monotonic and wall-clock time. The real backend reads platform clocks; deterministic backends expose caller-controlled or simulated-network clocks. The header still says submit/poll/accept/recv/send are future work for this seam. | `src/substrate/reactor.zig:4`, `src/substrate/reactor.zig:6`, `src/substrate/reactor.zig:9`, `src/substrate/reactor.zig:15`, `src/substrate/reactor.zig:23`, `src/substrate/reactor.zig:29`, `src/substrate/reactor.zig:41`, `src/substrate/reactor.zig:66`, `src/substrate/reactor.zig:93` |
+| Open | `Ring.init` probes multishot accept and multishot wake-poll, then opens the ring. A probe that cannot decide leaves that operation one-shot. A definitive yes or no is cached for the process. | `src/daemon/ringlane.zig:9`, `src/daemon/ringlane.zig:361` |
+| Completion queue | At least 256 entries, four times the submission queue, capped at 32768, then rounded up to a power of two. The default submission queue is 32 and the default reap batch is 256, so the old kernel default of twice the submission queue was too small. | `src/daemon/ringlane.zig:22`, `src/daemon/ringlane.zig:301` |
+| Cooperative task work | The first setup attempt requests `IORING_SETUP_COOP_TASKRUN`, `IORING_SETUP_TASKRUN_FLAG`, and `IORING_SETUP_CQSIZE`. Only `error.ArgumentsInvalid` walks a shorter ladder. | `src/daemon/ringlane.zig:321`, `src/daemon/ringlane.zig:332` |
+| Closed setup bits | `IORING_SETUP_DEFER_TASKRUN` and `IORING_SETUP_SINGLE_ISSUER` are never passed to the kernel, including when `[io].defer_taskrun` is true. | `src/daemon/ringlane.zig:11`, `src/daemon/ringlane.zig:37` |
+| SQPOLL | Opt-in through `[io].sqpoll`. The flag stays on every ladder attempt until the kernel returns `ArgumentsInvalid`. | `src/daemon/ringlane.zig:321` |
+| Accept | Multishot accept with `SOCK_CLOEXEC` when the probe succeeded. The arm stays up while `IORING_CQE_F_MORE` is set and clears on the terminal completion. | `src/daemon/ringlane.zig:404` |
+| Wake poll | Multishot poll on the reactor eventfd when the probe succeeded. `wake_armed` clears only when MORE is clear. Each completion drains the eventfd. | `src/daemon/ringlane.zig:465`, `src/daemon/server.zig:8375`, `src/daemon/server.zig:8415` |
+| Recv and send | One-shot copy operations. The first completion releases the connection buffer and is the Helix snapshot point. Multishot recv, zero-copy send, provided-buffer rings, and fixed files are not on this path. | `src/daemon/ringlane.zig:12` |
+| Overflow | Submit flushes `IORING_SQ_CQ_OVERFLOW` and retries once when the completion queue is overcommitted. | `src/daemon/ringlane.zig:380` |
+| Listener adoption | Shard 0, when `s2s_port` is not 0, dups an inherited S2S listener and adopts that fd. The caller keeps the original. Port 0 still means no S2S listener. | `src/daemon/server.zig:2316`, `src/daemon/server.zig:5548`, `src/daemon/server.zig:124254` |
+| World lock | Completions are handled under the shared world write lock. Reactors parallelize I/O and serialize command processing. | `src/daemon/server.zig:9907` |
+
+`[io].defer_taskrun` remains a parsed key. `--check-config` still rejects it together with `sqpoll`. That rejection does not mean the live ring arms deferred task-run.
+
+`src/substrate/io/buf_ring.zig` is provided-buffer bookkeeping for the prototype. The daemon does not register a buffer ring.
+
+Line numbers in the sections below were taken against an older `server.zig`. Read the named symbol before trusting a citation there. The threading model those sections describe is still the model: one reactor owns its ring, clients, and listener fds; another reactor does not touch those fds.
 
 ## Per-reactor state and connection classes
 

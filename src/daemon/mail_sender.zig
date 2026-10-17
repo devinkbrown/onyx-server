@@ -353,8 +353,12 @@ pub const Sender = struct {
         var failed: ?PendingFailure = null;
         errdefer if (failed) |pending| pending.message.job.free(self.allocator);
         if (snapshot.pending_failure) |message| {
-            failed = .{ .message = message, .cut = snapshot.journal_cut };
-            failed.?.message.job = try cloneJob(self.allocator, message.job);
+            // Clone before the pending value exists. Copying `message` first
+            // would point `failed` at the snapshot's job, and an allocation
+            // failure would free that snapshot out from under the caller.
+            var owned = message;
+            owned.job = try cloneJob(self.allocator, message.job);
+            failed = .{ .message = owned, .cut = snapshot.journal_cut };
         }
         lockSpin(&self.mutex);
         defer self.mutex.unlock();

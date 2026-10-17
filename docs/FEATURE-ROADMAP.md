@@ -16,8 +16,9 @@ IRCX adaptation, and the harden pass live in
 still lists the original tag blockers; the major tracks are additional 0.7
 work, not a later version.
 
-**Current versions:** daemon `0.7.0` (`build.zig.zon`) · client `0.1.3`
-(`onyx/package.json`).
+**Current versions:** daemon `0.8.0` (`build.zig.zon`) · client `0.1.3`
+(`onyx/package.json`). The 0.8.0 manifest is source-only. The verified fleet
+is still `0.7.0+ae78d490`, and this index does not mark the suite green.
 
 **Status snapshot (2026-09-06):** the original daemon P0-0…P0-7 acceptance work is
 closed in source. The source-code baseline is `ae78d490`; both production nodes run the same

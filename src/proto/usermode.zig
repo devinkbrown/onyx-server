@@ -11,7 +11,7 @@ const std = @import("std");
 pub const MAX_MODE_CHANGES: usize = mode_count;
 
 /// Stable Onyx Server user-mode identifiers.
-pub const UserMode = enum(u4) {
+pub const UserMode = enum(u6) {
     invisible,
     bot,
     registered,
@@ -29,6 +29,13 @@ pub const UserMode = enum(u4) {
     admin, // a: network administrator. Server-managed; derived from the
     // server_admin oper privilege on auto-elevation, never client-settable.
     override, // j: operator channel override plus SYSTEM kill attribution.
+    // Appended modes keep the ordinals above stable in the u64 Helix tail.
+    common_chan, // G: direct messages require a shared channel or ACCEPT
+    tls_only_pm, // Z: direct messages require a TLS sender
+    hide_idle, // I: hide WHOIS idle from other users
+    no_invite, // V: refuse INVITE unless the inviter is oper or the same account
+    whois_notify, // W: NOTICE this user when someone else runs WHOIS
+    no_chan_notice, // T: drop channel NOTICE while still receiving channel PRIVMSG
 };
 
 const mode_count: usize = @typeInfo(UserMode).@"enum".field_names.len;
@@ -161,6 +168,12 @@ pub const default_specs = [_]ModeSpec{
     .{ .mode = .media_presence_private, .letter = 'P', .name = "media-presence-private" },
     .{ .mode = .admin, .letter = 'a', .name = "admin", .policy = .server_managed },
     .{ .mode = .override, .letter = 'j', .name = "override" },
+    .{ .mode = .common_chan, .letter = 'G', .name = "common-chan" },
+    .{ .mode = .tls_only_pm, .letter = 'Z', .name = "tls-only-pm" },
+    .{ .mode = .hide_idle, .letter = 'I', .name = "hide-idle" },
+    .{ .mode = .no_invite, .letter = 'V', .name = "no-invite" },
+    .{ .mode = .whois_notify, .letter = 'W', .name = "whois-notify" },
+    .{ .mode = .no_chan_notice, .letter = 'T', .name = "no-chan-notice" },
 };
 
 pub const derived_operator_letter = 'o';
@@ -435,6 +448,31 @@ test "override user mode uses non-colliding +j catalog letter" {
     var modes = UmodeSet.empty();
     _ = try apply(&modes, changes, .client);
     try std.testing.expect(modes.contains(.override));
+}
+
+test "privacy user modes are client-writable and keep earlier ordinals" {
+    try std.testing.expectEqual(@as(u6, 15), @intFromEnum(UserMode.override));
+    try std.testing.expectEqual(@as(u6, 16), @intFromEnum(UserMode.common_chan));
+    try std.testing.expectEqual(@as(?UserMode, .common_chan), modeFromLetter('G'));
+    try std.testing.expectEqual(@as(?UserMode, .tls_only_pm), modeFromLetter('Z'));
+    try std.testing.expectEqual(@as(?UserMode, .hide_idle), modeFromLetter('I'));
+    try std.testing.expectEqual(@as(?UserMode, .no_invite), modeFromLetter('V'));
+    try std.testing.expectEqual(@as(?UserMode, .whois_notify), modeFromLetter('W'));
+    try std.testing.expectEqual(@as(?UserMode, .no_chan_notice), modeFromLetter('T'));
+    inline for (.{ UserMode.common_chan, .tls_only_pm, .hide_idle, .no_invite, .whois_notify, .no_chan_notice, .deaf }) |mode| {
+        try std.testing.expect(DefaultCatalog.isClientWritable(mode));
+    }
+
+    var changes_buf: [MAX_MODE_CHANGES]ModeChange = undefined;
+    const changes = try parse("+GZIVWT", &changes_buf);
+    var modes = UmodeSet.empty();
+    _ = try apply(&modes, changes, .client);
+    try std.testing.expect(modes.contains(.common_chan));
+    try std.testing.expect(modes.contains(.tls_only_pm));
+    try std.testing.expect(modes.contains(.hide_idle));
+    try std.testing.expect(modes.contains(.no_invite));
+    try std.testing.expect(modes.contains(.whois_notify));
+    try std.testing.expect(modes.contains(.no_chan_notice));
 }
 
 test "unknown mode rejected" {

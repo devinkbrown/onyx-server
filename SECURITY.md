@@ -50,7 +50,8 @@ surfaces. The direction and coverage plan live in
 ## Supported versions
 
 Onyx Server is developed on a rolling basis; fixes land on `main`. The current
-source release line is **0.7.0** (`build.zig.zon:18`). The currently verified
+source release line is **0.8.0** (`build.zig.zon`). That manifest bump is not a
+fleet deploy. The currently verified
 production pair (`eshmaki.me` and `ircx.us`) runs the `0.7.0+ae78d490` artifact
 under `onyx-server.service`; the public GitHub artifact channel still publishes
 `v0.5.6`. These are deliberately separate source, deployed-image, and public-tag

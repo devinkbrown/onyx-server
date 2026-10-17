@@ -470,11 +470,13 @@ pub const Config = struct {
     pub const Io = struct {
         ring_entries: u32 = 32,
         cqe_batch: u32 = 256,
-        /// IORING_SETUP_DEFER_TASKRUN (+ SINGLE_ISSUER). Default off.
-        /// `config_boot` copies this onto `server.Config.features`;
-        /// `RingCore.init` fail-closes if the kernel rejects the flags.
+        /// Parsed and stored. Default off. The live ring never requests
+        /// `IORING_SETUP_DEFER_TASKRUN` or `IORING_SETUP_SINGLE_ISSUER`.
+        /// `--check-config` still rejects this key together with `sqpoll`.
         defer_taskrun: bool = false,
-        /// IORING_SETUP_SQPOLL. Default off; same fail-closed init probe.
+        /// `IORING_SETUP_SQPOLL` when set. Default off. The live ring keeps
+        /// the flag through its setup ladder and falls back only on
+        /// `error.ArgumentsInvalid`.
         sqpoll: bool = false,
     };
 

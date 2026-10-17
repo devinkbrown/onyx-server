@@ -9,6 +9,7 @@ const std = @import("std");
 const rwlock = @import("../substrate/rwlock.zig");
 const ebr = @import("../substrate/ebr.zig");
 const world_rcu = @import("world_rcu.zig");
+const ident_utf8 = @import("../substrate/utf8.zig");
 
 /// Lazily-created RCU mirror of the nick registry (the lock-free read path).
 /// Heap-allocated so the EBR domain has a stable address: registered writer and
@@ -284,7 +285,7 @@ fn defaultChannelModes() chanmode.ChannelModes {
 }
 
 const checkpoint_base_mode_mask: u16 = (1 << 14) - 1;
-const checkpoint_ext_mode_mask: u32 = (1 << 20) - 1;
+const checkpoint_ext_mode_mask: u32 = (1 << 23) - 1;
 
 fn checkpointBaseModeBits(modes: chanmode.ChannelModes) u16 {
     var bits: u16 = 0;
@@ -3382,6 +3383,25 @@ pub const World = struct {
         return channel.oid;
     }
 
+    /// Copy the canonical name of the single channel whose IRCX object id is
+    /// `oid` into `out`. Null when `oid` is 0, no channel owns it, more than
+    /// one channel owns it, or the stored name does not fit in `out`. The
+    /// returned slice borrows `out`, never a map key.
+    pub fn channelNameForOid(self: *World, oid: u32, out: []u8) ?[]const u8 {
+        if (oid == 0) return null;
+        var matched: ?[]const u8 = null;
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.oid != oid) continue;
+            if (matched != null) return null;
+            matched = entry.key_ptr.*;
+        }
+        const key = matched orelse return null;
+        if (key.len > out.len) return null;
+        @memcpy(out[0..key.len], key);
+        return out[0..key.len];
+    }
+
     fn cloneListEntries(self: *World, src: []const ListEntry) WorldError!std.ArrayListUnmanaged(ListEntry) {
         var out: std.ArrayListUnmanaged(ListEntry) = .empty;
         errdefer deinitListEntries(self.allocator, &out);
@@ -4862,14 +4882,17 @@ fn foldName(name: []const u8, buf: []u8) []const u8 {
 ///   `&`  — local channel (RFC1459)
 ///   `%#` / `%&` — IRCX UTF8 channel (the `%` marks a UTF8-named variant)
 /// The IRCX `^` UTF8→hex display form is intentionally NOT accepted yet (it needs
-/// a transliteration layer; tracked separately).
+/// a transliteration layer; tracked separately). Bidi overrides, invisible
+/// scalars, and mixed letter scripts are rejected. `%#` and `%&` stay accepted.
 pub fn isChannelName(name: []const u8) bool {
     if (name.len == 0) return false;
-    return switch (name[0]) {
+    const prefixed = switch (name[0]) {
         '#', '&' => true,
         '%' => name.len >= 2 and (name[1] == '#' or name[1] == '&'),
         else => false,
     };
+    if (!prefixed) return false;
+    return !ident_utf8.containsIdentifierSpoof(name);
 }
 
 fn testClient(slot: u20) ClientId {
@@ -6132,6 +6155,30 @@ test "channel list modes are capped at max_list_entries" {
     try std.testing.expect(!try world.addBan("#c", "a!*@*", "setter", 4));
 }
 
+test "channel oid lookup returns the owning name and null for oid 0" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const client = testClient(7);
+    _ = try world.join("#named", client);
+    const oid = world.channelOid("#named") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(oid != 0);
+    var buf: [256]u8 = undefined;
+    const found = world.channelNameForOid(oid, &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("#named", found);
+    try std.testing.expectEqual(@intFromPtr(&buf[0]), @intFromPtr(found.ptr));
+    try std.testing.expect(world.channelNameForOid(0, &buf) == null);
+    try std.testing.expect(world.channelNameForOid(oid +% 1, &buf) == null);
+
+    // A stored 0 is unset, not a resolvable object id.
+    world.channels.getPtr("#named").?.oid = 0;
+    try std.testing.expect(world.channelNameForOid(0, &buf) == null);
+
+    world.channels.getPtr("#named").?.oid = oid;
+    _ = try world.join("#other", client);
+    world.channels.getPtr("#other").?.oid = oid;
+    try std.testing.expect(world.channelNameForOid(oid, &buf) == null);
+}
+
 test "isChannelName accepts #, &, and %#/%& but not bare names or ^" {
     try std.testing.expect(isChannelName("#chan"));
     try std.testing.expect(isChannelName("&local"));
@@ -6143,6 +6190,9 @@ test "isChannelName accepts #, &, and %#/%& but not bare names or ^" {
     try std.testing.expect(!isChannelName("%"));
     try std.testing.expect(!isChannelName("%nope"));
     try std.testing.expect(!isChannelName("^hexchan"));
+    try std.testing.expect(!isChannelName("#room\u{202E}"));
+    try std.testing.expect(!isChannelName("#A\u{0430}"));
+    try std.testing.expect(isChannelName("#\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}"));
 }
 
 test "nick registry rejects collisions and supports lookup" {

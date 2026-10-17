@@ -3,7 +3,8 @@
 
 //! Signed physical presence with explicit routing-class provenance. Structural
 //! validity and class chronology do not admit an origin or authorize routing.
-//! Existing v1 bytes/domains remain separate; this staging leaf has no live user.
+//! The live ordinary-guest path encodes and forwards this record only.
+//! Mesh-presence v1 stays a separate codec and is not a fallback.
 const std = @import("std");
 const sign = @import("../crypto/sign.zig");
 const v1 = @import("mesh_presence.zig");

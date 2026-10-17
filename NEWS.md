@@ -6,9 +6,47 @@
 Release notes for the Onyx Server daemon. Newest first. Onyx Server is a clean-room,
 pure-Zig IRC/IRCX server with a post-quantum CRDT mesh, an in-house TLS 1.3
 stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
-`build.zig.zon`. Dates are the deploy date to the live Onyx nodes.
+`build.zig.zon`. Dates on deployed lines are the deploy date to the live Onyx nodes.
+A source-only line is dated when the manifest changes and says so.
 
 ---
+
+## 0.8.0 (2026-10-17)
+
+Source version in `build.zig.zon`. This is not a fleet deploy, not a GitHub
+Release, and not a `v0.8.0` tag. The verified production pair remains
+`0.7.0+ae78d490` with SHA-256
+`0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c`.
+The full `zig build test` suite has not been re-run green on this tree.
+The last full Debug run had three failures and the last full ReleaseSafe run
+had two. Later focused filters passed: far ordinary-nick WHOIS and direct
+message, the Helix MARKREAD port case, and the delivery fan-out slice
+(89 passed, 0 failed). That is not a full-suite result. Do not read this
+note as acceptance.
+
+- **One ordinary-guest presence.** Account-less clients publish mesh-presence
+  v2 only (`onyx-mesh-presence-v2`). The origin signature is unchanged across
+  hops. Mesh-presence v1 stays in the tree and is not encoded, admitted, or
+  forwarded on the live path. There is no second version and no legacy
+  nick-relay fallback once a verified guest subject exists.
+- **Guest-direct PRIVMSG.** `GUEST_DIRECT` (`0x2D`) carries one ordinary-guest
+  direct message to the recipient's next hop. NOTICE does not use it. Unknown
+  nicks stay on the existing 401 path. No new handshake capability bit: an
+  older peer skips the tag.
+- **S2S listener ownership.** Tests that need a stable loopback S2S port hold
+  the listening socket and hand the daemon a dup. The successor adopts that
+  fd when it still listens. `s2s_port = 0` still means no listener. This is
+  not `SO_REUSEPORT` papering over `AddressInUse`.
+- **Ringlane.** The production ring is `src/daemon/ringlane.zig`. It probes
+  multishot accept and multishot wake-poll, sizes the completion queue to at
+  least 256 entries, and requests cooperative task-work. It never requests
+  `IORING_SETUP_DEFER_TASKRUN` or `IORING_SETUP_SINGLE_ISSUER`. Recv and send
+  stay one-shot. `[io].defer_taskrun` is parsed and ignored by the ring.
+  `[io].sqpoll` stays opt-in. `src/substrate/io/ring.zig` remains an
+  unfinished prototype.
+- **Helix capsules unchanged.** Guest identity is runtime-only. The world
+  checkpoint stays version 2. No capsule version moves with this manifest bump.
+- **`/INFO`.** The body names Ringlane and the one-shot recv/send rule.
 
 ## 0.7.0 (2026-09-04)
 

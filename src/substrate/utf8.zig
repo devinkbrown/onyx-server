@@ -319,6 +319,7 @@ fn isValidAsciiNick(nick: []const u8) bool {
 }
 
 fn isValidUtf8Nick(nick: []const u8) bool {
+    if (containsIdentifierSpoof(nick)) return false;
     var index: usize = 0;
     const first = readScalar(nick, &index) catch return false;
     if (!isNickFirstScalar(first)) return false;
@@ -340,6 +341,7 @@ fn isValidAsciiChannelRest(rest: []const u8) bool {
 }
 
 fn isValidUtf8ChannelRest(rest: []const u8) bool {
+    if (containsIdentifierSpoof(rest)) return false;
     var index: usize = 0;
     while (index < rest.len) {
         const scalar = readScalar(rest, &index) catch return false;
@@ -352,6 +354,86 @@ fn validChannelPrefix(prefix: u8, comptime options: NameOptions) bool {
     return prefix == '#' or
         (options.allow_ampersand_channel and prefix == '&') or
         (options.allow_bang_channel and prefix == '!');
+}
+
+/// True when `text` would let one identifier be confused with another.
+/// ASCII is never spoofed. A bidi override, an invisible scalar, a
+/// confusable presentation form, or two letter scripts in one name is.
+/// `%#` and other ASCII prefixes are not a second script.
+pub fn containsIdentifierSpoof(text: []const u8) bool {
+    var index: usize = 0;
+    var seen: u8 = 0;
+    while (index < text.len) {
+        if (text[index] < 0x80) {
+            const byte = text[index];
+            index += 1;
+            if (asciiAlpha(byte)) {
+                if (seen != 0 and seen != 1) return true;
+                seen = 1;
+            }
+            continue;
+        }
+        const scalar = readScalar(text, &index) catch return true;
+        if (isSpoofScalar(scalar)) return true;
+        if (letterScript(scalar)) |script| {
+            if (seen != 0 and seen != script) return true;
+            seen = script;
+        }
+    }
+    return false;
+}
+
+fn isSpoofScalar(scalar: u21) bool {
+    return switch (scalar) {
+        0x00AD, 0x061C, 0x180E, 0xFEFF, 0xE0001 => true,
+        0x0300...0x036F,
+        0x1AB0...0x1AFF,
+        0x1DC0...0x1DFF,
+        0x200B...0x200F,
+        0x202A...0x202E,
+        0x2060...0x2064,
+        0x2066...0x206F,
+        0x20D0...0x20FF,
+        0x2100...0x214F,
+        0xFE00...0xFE0F,
+        0xFE20...0xFE2F,
+        0xFF01...0xFF5E,
+        0x1D400...0x1D7FF,
+        0xE0020...0xE007F,
+        0xE0100...0xE01EF,
+        => true,
+        else => false,
+    };
+}
+
+/// One letter-script id. ASCII letters are Latin (1). Common punctuation
+/// and symbols return null so they can sit beside a single script.
+fn letterScript(scalar: u21) ?u8 {
+    if (scalar <= 0x7F) {
+        if (asciiAlpha(@intCast(scalar))) return 1;
+        return null;
+    }
+    if ((scalar >= 0x00C0 and scalar <= 0x00D6) or
+        (scalar >= 0x00D8 and scalar <= 0x00F6) or
+        (scalar >= 0x00F8 and scalar <= 0x024F) or
+        (scalar >= 0x1E00 and scalar <= 0x1EFF) or
+        (scalar >= 0x2C60 and scalar <= 0x2C7F) or
+        (scalar >= 0xA720 and scalar <= 0xA7FF) or
+        (scalar >= 0xAB30 and scalar <= 0xAB6F)) return 1;
+    if ((scalar >= 0x0370 and scalar <= 0x03FF) or (scalar >= 0x1F00 and scalar <= 0x1FFF)) return 2;
+    if ((scalar >= 0x0400 and scalar <= 0x052F) or
+        (scalar >= 0x1C80 and scalar <= 0x1C8F) or
+        (scalar >= 0x2DE0 and scalar <= 0x2DFF) or
+        (scalar >= 0xA640 and scalar <= 0xA69F)) return 3;
+    if (scalar >= 0x0590 and scalar <= 0x05FF) return 4;
+    if ((scalar >= 0x0600 and scalar <= 0x06FF) or
+        (scalar >= 0x0750 and scalar <= 0x077F) or
+        (scalar >= 0x08A0 and scalar <= 0x08FF)) return 5;
+    if ((scalar >= 0x3040 and scalar <= 0x30FF) or
+        (scalar >= 0x3400 and scalar <= 0x9FFF) or
+        (scalar >= 0xF900 and scalar <= 0xFAFF)) return 6;
+    if ((scalar >= 0x1100 and scalar <= 0x11FF) or (scalar >= 0xAC00 and scalar <= 0xD7AF)) return 7;
+    return null;
 }
 
 fn isNickFirstAscii(byte: u8) bool {
@@ -457,8 +539,23 @@ test "nick validity is bounded and mapping aware" {
     try std.testing.expect(!isValidNick(.ascii, "4lice"));
     try std.testing.expect(!isValidNick(.ascii, "bad,nick"));
     try std.testing.expect(!isValidNickWith(.ascii, "toolong", .{ .max_nick_bytes = 3 }));
-    try std.testing.expect(isValidNick(.utf8_only, "\xCE\x94elta"));
+    try std.testing.expect(isValidNick(.utf8_only, "\xCE\x94\xCE\xB5\xCE\xBB\xCF\x84\xCE\xB1"));
+    try std.testing.expect(!isValidNick(.utf8_only, "\xCE\x94elta"));
     try std.testing.expect(!isValidNick(.utf8_only, "\xC0\xAF"));
+}
+
+test "identifier spoof rejects bidi overrides and mixed scripts" {
+    try std.testing.expect(!containsIdentifierSpoof("Ann"));
+    try std.testing.expect(!containsIdentifierSpoof("#onyx"));
+    try std.testing.expect(!containsIdentifierSpoof("%#room"));
+    try std.testing.expect(!containsIdentifierSpoof("\xCE\x94\xCE\xB5\xCE\xBB\xCF\x84\xCE\xB1"));
+    try std.testing.expect(!containsIdentifierSpoof("#d\xC3\xA9j\xC3\xA0"));
+    try std.testing.expect(containsIdentifierSpoof("Ann\u{202E}"));
+    try std.testing.expect(containsIdentifierSpoof("A\u{0430}"));
+    try std.testing.expect(containsIdentifierSpoof("\u{FF21}lice"));
+    try std.testing.expect(containsIdentifierSpoof("#room\u{200B}"));
+    try std.testing.expect(!isValidChannel(.utf8_only, "#room\u{202E}"));
+    try std.testing.expect(isValidChannel(.utf8_only, "#d\xC3\xA9j\xC3\xA0"));
 }
 
 test "channel name validity rejects missing prefixes separators and invalid utf8" {

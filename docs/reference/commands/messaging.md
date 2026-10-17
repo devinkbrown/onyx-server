@@ -17,7 +17,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 ## PRIVMSG
 
 - Syntax: `PRIVMSG <target>[,<target>...] :<text>`
-- Description: Sends text to a nick, a channel, or a status-prefixed channel target. The handler applies sender silence gates, UTF-8 and content gates, channel mode gates, direct-message gates, `SILENCE`, echo-message, history recording, away and CTCP auto-replies, mesh relay, and the caller's `MAXTARGETS` fan-out cap. A connection class can tighten that cap with `max_targets`.
+- Description: Sends text to a nick, a channel, or a status-prefixed channel target. The handler applies sender silence gates, UTF-8 and content gates, channel mode gates, direct-message gates, `SILENCE`, echo-message, history recording, away and CTCP auto-replies, mesh relay, and the caller's `MAXTARGETS` fan-out cap. A connection class can tighten that cap with `max_targets`. An ordinary account-less nick with a live signed guest-presence record is delivered once, as guest-direct, only along that record's next hop, and echoed once to the sender. A nick with no such record keeps the existing unknown-nick and legacy relay behavior. This guest path is source. The full suite has not been re-run green on it.
 - Privileges: Registered client.
 - Parameters: One or more comma-separated targets and non-empty text.
 - Replies: Delivery line to recipients; `RPL_AWAY 301` when messaging an away user; CTCP `VERSION`, `PING`, `TIME`, `CLIENTINFO`, and `SOURCE` requests can produce a CTCP `NOTICE` reply.
@@ -28,7 +28,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 ## NOTICE
 
 - Syntax: `NOTICE <target>[,<target>...] :<text>`
-- Description: Uses the same delivery engine as `PRIVMSG`, including channel and direct-message gates, echo-message, message tags, mesh relay, and the caller's fan-out cap. `NOTICE` does not reset idle time, does not record direct-message history, does not emit away or CTCP auto-replies, and suppresses parameter, content, channel, and target delivery errors to avoid automatic reply loops.
+- Description: Uses the same delivery engine as `PRIVMSG`, including channel and direct-message gates, echo-message, message tags, mesh relay, and the caller's fan-out cap. `NOTICE` does not use guest-direct. `NOTICE` does not reset idle time, does not record direct-message history, does not emit away or CTCP auto-replies, and suppresses parameter, content, channel, and target delivery errors to avoid automatic reply loops.
 - Privileges: Registered client.
 - Parameters: One or more comma-separated targets and text; missing target or missing text is silently dropped.
 - Replies: Delivery line to recipients.
@@ -112,7 +112,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 ## WHISPER
 
 - Syntax: `WHISPER <channel> <nick[,nick...]> :<text>`
-- Description: Sends an IRCX channel-scoped private message. The sender must be on the channel, `+w` NOWHISPER must be absent, and every local recipient must also be on the same channel. Remote recipients are relayed only when the mesh roster shows the nick as a co-member of the channel; unknown remote recipients fail closed instead of flooding peers.
+- Description: Sends an IRCX channel-scoped private message. The sender must be on the channel, `+w` NOWHISPER must be absent, and every local recipient must also be on the same channel. On `+x`, a local member the sender cannot see gets `441` and no delivery, the same reply as a nick that is not on the channel. A remote nick the sender cannot see gets `401`, the same reply as a nick the roster does not list, and is not relayed. Remote recipients the sender can see are relayed only when the mesh roster shows the nick as a co-member of the channel. `+w` denies everyone, including an operator.
 - Privileges: Registered client using the IRCX command surface.
 - Parameters: Channel, one or more comma-separated nicks, and non-empty text.
 - Replies: `:sender WHISPER <channel> <nick> :<text>` to each valid recipient.

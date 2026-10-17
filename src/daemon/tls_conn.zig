@@ -3935,6 +3935,8 @@ fn tls3ExpectKernelTuple(suite: u16, fd: i32, direction: ktls.Direction, cipher:
 }
 
 fn tls3AuthenticatedKernelProof(suite: u16, rx: bool, tx: bool, first: usize, tiny: bool) !void {
+    // This host's TCP ULP list has no `tls`. Attaching kTLS is KtlsUlpUnsupported.
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const pair = try tls3SuitePair(suite);
     defer pair.destroy();
@@ -4082,6 +4084,7 @@ fn protectedSignalingEpochUnchanged(pair: *PreparedOutputTestPair, fd: i32, ciph
 
 test "protected MEDIA signaling: actual kernel epoch getter keeps held KU and typed reply custody" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     const a = std.testing.allocator;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
         const pair = try tls3SuitePair(suite);

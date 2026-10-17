@@ -150,6 +150,10 @@ pub const isupport_tokens = [_][]const u8{
     // advertised 005 token. The boot override always supplies them in production.
     chanmodes_token,
     "BOT=B",
+    // Caller-id and deaf are live user modes. Advertise them only because the
+    // PRIVMSG and channel-fanout gates enforce the letters.
+    "CALLERID=g",
+    "DEAF=D",
     "EXTBAN=$,acgmrz",
     "WHOX",
     "UTF8ONLY",

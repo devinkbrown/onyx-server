@@ -17,6 +17,12 @@ computed reads are `channelBuiltinGet`; validated writes are
 `SUBJECT`, `CLIENT`, `ONJOIN`, `ONPART`, `LAG`, `ACCOUNT`, `CLIENTGUID`,
 `SERVICEPATH`, `no-ai`, `local-only`, `server-ai-ok`, `history-policy`.
 
+`ONJOIN` is sent only to the client that just joined, as a `PRIVMSG` with the
+channel name as the sender. `ONPART` is sent only to the client that just
+parted, as a `NOTICE` from that same sender. The stored characters `\` and `n`
+start another line. Other members do not receive either message. A stored
+control byte is dropped instead of being split into a second wire command.
+
 ### Computed / linked (answered ahead of the generic store)
 
 | Key | Source | Notes |

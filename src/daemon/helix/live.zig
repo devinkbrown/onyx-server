@@ -1172,12 +1172,57 @@ test "HSSN v4 predecessor rejects rollback to v3-only reader" {
     ));
 }
 
+/// Open an image that exits 0 for any argv[0]. This host's `/bin/true` is a
+/// multicall binary, so argv[0] selects the applet and a foreign argv[0] does
+/// not exit 0. On x86_64 the image is a static exit(0) ELF at vaddr 0x400000.
+fn openArgv0InsensitiveExitImage() !handoff.Fd {
+    if (comptime builtin.cpu.arch != .x86_64) {
+        const open_rc = linux.open("/bin/true", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(open_rc) != .SUCCESS) return error.SkipZigTest;
+        return @intCast(open_rc);
+    }
+    const image = [_]u8{
+        0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xb8, 0x3c, 0x00, 0x00, 0x00, 0x31, 0xff, 0x0f, 0x05,
+    };
+    // MFD_CLOEXEC is 1. The standard library has no named constant for it.
+    const fd_rc = linux.memfd_create("onyx-exit0", 1);
+    if (linux.errno(fd_rc) != .SUCCESS) return error.TestUnexpectedResult;
+    const fd: handoff.Fd = @intCast(fd_rc);
+    var off: usize = 0;
+    while (off < image.len) {
+        const wrote = linux.write(fd, image[off..].ptr, image.len - off);
+        switch (linux.errno(wrote)) {
+            .SUCCESS => {
+                if (wrote == 0) {
+                    _ = linux.close(fd);
+                    return error.TestUnexpectedResult;
+                }
+                off += wrote;
+            },
+            .INTR => {},
+            else => {
+                _ = linux.close(fd);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    return fd;
+}
+
 test "std.process.run can execute a CLOEXEC image through proc self fd" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const open_rc = linux.open("/bin/true", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(open_rc) != .SUCCESS) return error.SkipZigTest;
-    const executable_fd: handoff.Fd = @intCast(open_rc);
+    const executable_fd = try openArgv0InsensitiveExitImage();
     defer _ = linux.close(executable_fd);
 
     var proc_path_buf: [64]u8 = undefined;
@@ -1199,9 +1244,7 @@ test "std.process.run can execute a CLOEXEC image through proc self fd" {
 test "ExecPlan.commitExecutableFd executes the already-open image" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const open_rc = linux.open("/bin/true", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(open_rc) != .SUCCESS) return error.SkipZigTest;
-    const executable_fd: handoff.Fd = @intCast(open_rc);
+    const executable_fd = try openArgv0InsensitiveExitImage();
     defer _ = linux.close(executable_fd);
 
     var plan = try buildListenerExecPlan(allocator, "/ignored/after-open", 0, null);

@@ -167,6 +167,12 @@ pub const FrameType = enum(u8) {
     /// head with a higher entry count replaces the stored one; an older head
     /// does not.
     KEYTRANS_HEAD = 0x2B,
+    /// Original mesh-presence v2 bytes. The outer envelope authenticates only
+    /// the immediate hop; receivers must not resign the origin record.
+    GUEST_PRESENCE = 0x2C,
+    /// One ordinary-guest direct message. Distinct from legacy MESSAGE and
+    /// from MESSAGE_V2 so a known guest is never also nick-relayed.
+    GUEST_DIRECT = 0x2D,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -217,6 +223,8 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.SEARCH_QUERY) => .SEARCH_QUERY,
             @intFromEnum(FrameType.SEARCH_REPLY) => .SEARCH_REPLY,
             @intFromEnum(FrameType.KEYTRANS_HEAD) => .KEYTRANS_HEAD,
+            @intFromEnum(FrameType.GUEST_PRESENCE) => .GUEST_PRESENCE,
+            @intFromEnum(FrameType.GUEST_DIRECT) => .GUEST_DIRECT,
             else => null,
         };
     }
@@ -421,6 +429,8 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .SEARCH_QUERY, .token = "SEARCH_QUERY", .family = .relay, .auth = .signed, .summary = "Signed history search request for one target. Gated by a PING extension, not a new handshake bit." },
     .{ .frame_type = .SEARCH_REPLY, .token = "SEARCH_REPLY", .family = .relay, .auth = .signed, .summary = "Signed history search hits. The asker authorizes each hit and drops ciphertext." },
     .{ .frame_type = .KEYTRANS_HEAD, .token = "KEYTRANS_HEAD", .family = .relay, .auth = .signed, .summary = "Signed key-transparency log head. Gated by a PING extension. A higher entry count replaces the stored head; an older head does not." },
+    .{ .frame_type = .GUEST_PRESENCE, .token = "GUEST_PRESENCE", .family = .relay, .auth = .secured_signed, .summary = "Original mesh-presence v2 record. The hop envelope authenticates the immediate peer; the origin signature is unchanged." },
+    .{ .frame_type = .GUEST_DIRECT, .token = "GUEST_DIRECT", .family = .relay, .auth = .secured_signed, .summary = "Exact ordinary-guest direct message bound to both guest incarnations. Forward only toward the recipient." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {

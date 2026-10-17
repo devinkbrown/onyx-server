@@ -1187,6 +1187,35 @@ pub const SecuredLink = struct {
         return link.takeRejectedOperEventV2Frames();
     }
 
+    pub fn supportsGuestPresence(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsGuestPresence();
+    }
+
+    pub fn forwardGuestPresence(self: *SecuredLink, original: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.forwardGuestPresence(original);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn forwardGuestDirect(self: *SecuredLink, original: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.forwardGuestDirect(original);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn takeGuestPresence(self: *SecuredLink) anyerror![]s2s_link.InboundGuestFrame {
+        const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundGuestFrame, 0);
+        return link.takeGuestPresence();
+    }
+
+    pub fn takeGuestDirects(self: *SecuredLink) anyerror![]s2s_link.InboundGuestFrame {
+        const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundGuestFrame, 0);
+        return link.takeGuestDirects();
+    }
+
     /// Emit a signed OBSERVE_EVENT over the encrypted leg, then flush ciphertext.
     pub fn sendObserveEvent(self: *SecuredLink, action: u8, origin_server: []const u8, nick: []const u8, user: []const u8, host: []const u8, account: ?[]const u8, detail: []const u8) anyerror!void {
         const link = self.inner orelse return;

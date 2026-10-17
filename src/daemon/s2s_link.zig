@@ -41,6 +41,7 @@ pub const E2eeGroupRelayId = s2s_peer.E2eeGroupRelayId;
 pub const InboundE2eeGroup = s2s_peer.InboundE2eeGroup;
 pub const SignedOperEventV2 = s2s_peer.SignedOperEventV2;
 pub const InboundOperEventV2 = s2s_peer.InboundOperEventV2;
+pub const InboundGuestFrame = s2s_peer.InboundGuestFrame;
 const channel_crdt = @import("../substrate/undertow/channel_crdt.zig");
 const peer_link = @import("../substrate/undertow/peer_link.zig");
 
@@ -859,6 +860,26 @@ pub const S2sLink = struct {
 
     pub fn takeRejectedOperEventV2Frames(self: *S2sLink) u64 {
         return self.peer.takeRejectedOperEventV2Frames();
+    }
+
+    pub fn supportsGuestPresence(self: *const S2sLink) bool {
+        return self.peer.supportsGuestPresence();
+    }
+
+    pub fn forwardGuestPresence(self: *S2sLink, original: []const u8) !bool {
+        return self.peer.forwardGuestPresence(self.sink(), original);
+    }
+
+    pub fn forwardGuestDirect(self: *S2sLink, original: []const u8) !bool {
+        return self.peer.forwardGuestDirect(self.sink(), original);
+    }
+
+    pub fn takeGuestPresence(self: *S2sLink) ![]InboundGuestFrame {
+        return self.peer.takeGuestPresence();
+    }
+
+    pub fn takeGuestDirects(self: *S2sLink) ![]InboundGuestFrame {
+        return self.peer.takeGuestDirects();
     }
 
     /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).

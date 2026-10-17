@@ -29,7 +29,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## AUTH
 
 - Syntax: `AUTH <package> [mechanism/payload]` (repeat with the package-specific SASL exchange)
-- Description: IRCX's SASL-backed authentication transport. The package name selects the same configured mechanisms exposed by IRCv3 SASL (`PLAIN`, `SCRAM-SHA-256`, and `EXTERNAL` in the IRCX discovery list); payloads are handled by the shared SASL router and account success gate. Use IRCv3 `AUTHENTICATE` when the client does not need IRCX framing. ANON, GateKeeper, and GateKeeperPassport answer with numeric 912 and stay outside the SASL mechanism list.
+- Description: IRCX's SASL-backed authentication transport. The package name selects the same configured mechanisms exposed by IRCv3 SASL. On a TLS connection that list can include `PLAIN` and `SCRAM`. On a plaintext connection those password mechanisms are omitted from numeric 800 and from `CAP LS`, and `AUTH` or `AUTHENTICATE` for them fails. `EXTERNAL`, `OAUTHBEARER`, and `SESSION-TOKEN` are not password mechanisms. `IDENTIFY`, `RESETPASS`, and TOTP enrollment are unchanged. Use IRCv3 `AUTHENTICATE` when the client does not need IRCX framing. ANON, GateKeeper, and GateKeeperPassport answer with numeric 912 and stay outside the SASL mechanism list.
 - Privileges: IRCX-enabled client; registration/account effects follow the selected SASL mechanism.
 - Replies: `RPL_IRCXAUTH` challenge/success/failure lines and the normal account numerics on completion.
 - Errors: Package parsing, SASL, TLS, and account lockout errors from the shared router; malformed exchanges fail closed.
@@ -39,18 +39,18 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## DATA
 
 - Syntax: `DATA <target> <tag> :<message>`
-- Description: Sends an IRCX typed message to a nick or channel. Tags must match `[A-Za-z][A-Za-z0-9.]{0,14}`. `SYS`/`ADM` prefixes require oper; `OWN`/`HST` require channel operator/host authority or oper. A remote SYS or ADM tag stays closed for every sender, including an operator account.
+- Description: Sends an IRCX typed message to a nick or channel. Tags must match `[A-Za-z][A-Za-z0-9.]{0,14}`. `SYS`/`ADM` prefixes require oper; `OWN`/`HST` require channel operator/host authority or oper. A remote SYS or ADM tag stays closed for every sender, including an operator account. A client line is prefixed `nick!user@host`, including a reserved tag sent by an operator or a channel operator. A line this server authors uses the bare server name, which contains no `!`, and that line is not relayed as a client prefix.
 - Privileges: Registered client, with reserved tag restrictions.
 - Parameters: Target nick/channel, tag, message.
-- Replies: Relayed `DATA` line to target(s).
+- Replies: Relayed `DATA` line to target(s). A server-authored line is `:{server} DATA <target> <tag> :<message>`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_BADTAG 904`, `ERR_NOACCESS 913`, `ERR_NOTONCHANNEL 442`, `ERR_NOSUCHNICK 401`.
 - Example: `DATA #zig app.status :green`
-- Sources: `src/daemon/modules/ircx.zig:50`, `src/daemon/server.zig:7716`
+- Sources: `src/daemon/modules/ircx.zig` (`DATA`), `src/daemon/server.zig` (`handleData`, `deliverServerOriginData`)
 
 ## REQUEST
 
 - Syntax: `REQUEST <target> <tag> :<message>`
-- Description: Same handler and validation as `DATA`, but preserves the command verb in the relayed line.
+- Description: Same handler and validation as `DATA`, but preserves the command verb in the relayed line. The prefix stays `nick!user@host`.
 - Privileges: Same as `DATA`.
 - Parameters: Same as `DATA`.
 - Replies: Relayed `REQUEST` line.
@@ -61,7 +61,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## REPLY
 
 - Syntax: `REPLY <target> <tag> :<message>`
-- Description: Same handler and validation as `DATA`, but preserves the command verb in the relayed line.
+- Description: Same handler and validation as `DATA`, but preserves the command verb in the relayed line. The prefix stays `nick!user@host`.
 - Privileges: Same as `DATA`.
 - Parameters: Same as `DATA`.
 - Replies: Relayed `REPLY` line.
@@ -72,7 +72,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## WHISPER
 
 - Syntax: `WHISPER <#channel> <nick[,nick...]> :<text>`
-- Description: Sends a channel-scoped private message to listed recipients only if sender and recipients are on the channel. Channel `+w` nowhisper blocks it.
+- Description: Sends a channel-scoped private message to listed recipients only if sender and recipients are on the channel and, when the channel is `+x`, the sender is allowed to see that member. A local member the sender cannot see gets the same `441` as a nick that is not on the channel, and the text is not delivered. A remote nick the sender cannot see gets the same `401` as a nick the roster does not list. Channel `+w` nowhisper blocks every whisper, including from an operator.
 - Privileges: Registered channel member.
 - Parameters: Channel, recipient list, text.
 - Replies: `WHISPER` lines to valid recipients.
@@ -83,7 +83,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 ## PROP
 
 - Syntax: `PROP <entity> [<key[,key...]> [:<value>]]`
-- Description: IRCX property list/get/set/delete. One parameter lists all; two gets keys; three sets a value, and an empty trailing value deletes. Built-in channel properties such as `NAME`, `OID`, `CREATION`, `MEMBERCOUNT`, `MEMBERLIMIT`, and write-through `MEMBERKEY`/`MEMBERLIMIT` reflect live channel state. Policy properties including `history-policy`, AI consent flags (`no-ai`, `local-only`, `server-ai-ok`), and `encryption-policy` persist through the ordinary signed PROP store; `encryption-policy=required` rejects plaintext channel messages unless they carry the negotiated `+onyx/e2ee` client tag.
+- Description: IRCX property list/get/set/delete. One parameter lists all; two gets keys; three sets a value, and an empty trailing value deletes. Built-in channel properties such as `NAME`, `OID`, `CREATION`, `MEMBERCOUNT`, `MEMBERLIMIT`, and write-through `MEMBERKEY`/`MEMBERLIMIT` reflect live channel state. `LAG` is `0`, `1`, or `2` seconds between one member's channel messages, including voice, channel operators, and network operators. A longer `SLOWMODE` still wins for senders that `SLOWMODE` covers; voice and network operators stay exempt from `SLOWMODE` only. `ONJOIN` is delivered only to the joining client as a `PRIVMSG` whose sender is the channel name. `ONPART` is delivered only to the parting client as a `NOTICE` from that same sender. The stored characters `\` and `n` start another line. A stored control byte is not delivered. Policy properties including `history-policy`, AI consent flags (`no-ai`, `local-only`, `server-ai-ok`), and `encryption-policy` persist through the ordinary signed PROP store; `encryption-policy=required` rejects plaintext channel messages unless they carry the negotiated `+onyx/e2ee` client tag.
 - Privileges: Registered client; writes require channel operator/owner, user self-ownership, or oper.
 - Parameters: Entity, optional key list, optional value.
 - Replies: `RPL_PROPLIST 818`, `RPL_PROPEND 819`; mode broadcasts for linked built-ins.
@@ -136,10 +136,10 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 
 ## LISTX
 
-- Syntax: `LISTX [filter]`
-- Description: IRCX extended channel list. Secret and hidden channels are skipped. Filters use live channel metadata including creation time, topic time, subject/language properties, member count, and registered state; member-count filters and `C`/`T` age filters accept strict `>`/`<` and inclusive `>=`/`<=`. The handler lists the mesh-wide union of local and remote-only channels, caps oversized result sets with `RPL_LISTXTRUNC 816`, and emits `RPL_LISTXPICS 813` after an entry when the channel has a non-empty `PICS` property. A remote-only channel's 812 entry carries the topic the peer published.
+- Syntax: `LISTX [filter [limit]]`
+- Description: IRCX extended channel list. Secret and hidden channels are skipped. Filters use live channel metadata including creation time, topic time, subject/language properties, member count, and registered state; member-count filters and `C`/`T` age filters accept strict `>`/`<` and inclusive `>=`/`<=`. A trailing whole-number limit caps how many `812` entries are returned; `0` and a missing limit use the server cap of 1024. Hitting either cap while another match remains emits `RPL_LISTXTRUNC 816`. The handler lists the mesh-wide union of local and remote-only channels and emits `RPL_LISTXPICS 813` after an entry when the channel has a non-empty `PICS` property. A remote-only channel's 812 entry carries the topic the peer published.
 - Privileges: Registered client.
-- Parameters: Optional LISTX filter.
+- Parameters: Optional comma-separated filter, then an optional query limit.
 - Replies: IRCX list start/entry/PICS/truncation/end numerics `811`, `812`, `813`, `816`, `817`.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid filters.
 - Example: `LISTX >=10,C<=3600000`

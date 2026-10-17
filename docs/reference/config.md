@@ -324,10 +324,10 @@ Source: struct at `src/daemon/config_format.zig:153`, parsing at `src/daemon/con
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `ring_entries` | integer | `32` | `8..4096` | io_uring SQ entries per reactor (`src/daemon/server.zig:981`). |
+| `ring_entries` | integer | `32` | `8..4096` | io_uring submission-queue entries per reactor. The live ring sizes the completion queue to at least 256, and to four times this value, capped at 32768. |
 | `cqe_batch` | integer | `256` | `16..4096` | Maximum io_uring completion events reaped per event-loop drain. Larger values improve burst throughput; smaller values cap per-iteration work. |
-| `defer_taskrun` | bool | `false` | — | `IORING_SETUP_DEFER_TASKRUN` (+ SINGLE_ISSUER). `config_boot` copies this onto `server.Config.features`. `RingCore.init` fail-closes if the kernel rejects the flags. Default off. |
-| `sqpoll` | bool | `false` | — | `IORING_SETUP_SQPOLL`. Same projection and fail-closed init probe. Default off; do not enable until a P0-1 before/after exists. |
+| `defer_taskrun` | bool | `false` | — | Parsed and stored. The live `Ring.init` never requests `IORING_SETUP_DEFER_TASKRUN` or `IORING_SETUP_SINGLE_ISSUER`. `--check-config` still rejects this key together with `sqpoll`. Default off. |
+| `sqpoll` | bool | `false` | — | `IORING_SETUP_SQPOLL` when true. The live ring keeps the flag through its setup ladder and falls back only on `error.ArgumentsInvalid`. Default off. |
 
 ## `[reputation]`
 

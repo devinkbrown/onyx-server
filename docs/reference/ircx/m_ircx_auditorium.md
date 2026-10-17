@@ -31,10 +31,16 @@ see the full roster. Visibility is by rank (`auditorium.Rank`):
 - A plain **regular** member sees only ops (and always their own record).
 
 This filter is applied wherever the roster is projected — `NAMES`/`WHO`
-(`renderNames`, ~`server.zig:26014`), and `JOIN`/`PART` relays
-(`server.zig:9551` / `:10201`): a regular member's join/part is relayed only to
+and `JOIN`/`PART` relays: a regular member's join/part is relayed only to
 ops and voiced members (`auditorium.shouldRelayJoinPart`). It applies across the
 mesh — remote members are rank-filtered the same way when merged into `NAMES`.
+
+`WHISPER` uses the same rank rule. A local member the sender cannot see gets
+numeric 441 `They aren't on that channel`, and the text is not delivered or
+relayed. A remote nick the sender cannot see gets numeric 401 `No such nick`,
+the same reply as a nick the roster does not list. The sender's own nick is
+not hidden from the sender. An unknown rank counts as regular. `+w` remains a
+separate total denial (numeric 923) and is not an operator exception.
 
 ### `+h` HIDDEN (`chanmode_ext` letter `h`)
 

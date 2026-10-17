@@ -34,6 +34,9 @@ pub const ExtChannelFlag = enum(u5) {
     opmoderate,
     freetarget,
     disforward,
+    nocolor,
+    nobot,
+    founderkick,
 };
 
 pub const ModeSpec = struct {
@@ -69,15 +72,21 @@ pub const mode_specs = [_]ModeSpec{
     .{ .flag = .opmoderate, .letter = 'U', .name = "OPMODERATE" },
     .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
     .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
+    .{ .flag = .nocolor, .letter = 'c', .name = "NOCOLOR" },
+    .{ .flag = .nobot, .letter = 'B', .name = "NOBOT" },
+    .{ .flag = .founderkick, .letter = 'K', .name = "FOUNDERKICK" },
 };
 
 const render_specs = [_]ModeSpec{
+    .{ .flag = .nobot, .letter = 'B', .name = "NOBOT" },
     .{ .flag = .disforward, .letter = 'D', .name = "DISFORWARD" },
     .{ .flag = .clone, .letter = 'E', .name = "CLONE", .requires_oper = true },
     .{ .flag = .freetarget, .letter = 'F', .name = "FREETARGET" },
+    .{ .flag = .founderkick, .letter = 'K', .name = "FOUNDERKICK" },
     .{ .flag = .opmoderate, .letter = 'U', .name = "OPMODERATE" },
     .{ .flag = .nocomicdata, .letter = 'V', .name = "NOCOMICDATA" },
     .{ .flag = .authonly, .letter = 'a', .name = "AUTHONLY" },
+    .{ .flag = .nocolor, .letter = 'c', .name = "NOCOLOR" },
     .{ .flag = .cloneable, .letter = 'd', .name = "CLONEABLE" },
     .{ .flag = .noformat, .letter = 'f', .name = "NOFORMAT" },
     .{ .flag = .hidden, .letter = 'h', .name = "HIDDEN" },
@@ -95,6 +104,9 @@ const render_specs = [_]ModeSpec{
 };
 
 comptime {
+    // The duplicate and sort checks nest a scan per flag. Three new flags
+    // push that over Zig's default comptime branch quota.
+    @setEvalBranchQuota(10_000);
     const flag_count = @typeInfo(ExtChannelFlag).@"enum".field_names.len;
     if (mode_specs.len != flag_count) @compileError("missing IRCX channel flag mode");
     if (render_specs.len != flag_count) @compileError("missing render spec");
@@ -136,7 +148,10 @@ pub const ExtChannelFlags = packed struct(u32) {
     opmoderate: bool = false,
     freetarget: bool = false,
     disforward: bool = false,
-    reserved: u12 = 0,
+    nocolor: bool = false,
+    nobot: bool = false,
+    founderkick: bool = false,
+    reserved: u9 = 0,
 
     pub fn empty() ExtChannelFlags {
         return .{};
@@ -176,6 +191,9 @@ pub const ExtChannelFlags = packed struct(u32) {
             .opmoderate => self.opmoderate = true,
             .freetarget => self.freetarget = true,
             .disforward => self.disforward = true,
+            .nocolor => self.nocolor = true,
+            .nobot => self.nobot = true,
+            .founderkick => self.founderkick = true,
         }
     }
 
@@ -201,6 +219,9 @@ pub const ExtChannelFlags = packed struct(u32) {
             .opmoderate => self.opmoderate = false,
             .freetarget => self.freetarget = false,
             .disforward => self.disforward = false,
+            .nocolor => self.nocolor = false,
+            .nobot => self.nobot = false,
+            .founderkick => self.founderkick = false,
         }
     }
 
@@ -226,6 +247,9 @@ pub const ExtChannelFlags = packed struct(u32) {
             .opmoderate => self.opmoderate,
             .freetarget => self.freetarget,
             .disforward => self.disforward,
+            .nocolor => self.nocolor,
+            .nobot => self.nobot,
+            .founderkick => self.founderkick,
         };
     }
 
@@ -383,6 +407,20 @@ test "renderModes returns active letters sorted by letter" {
     });
 
     try std.testing.expectEqualStrings("+EVahpz", try renderModes(flags, out));
+}
+
+test "NOCOLOR NOBOT and FOUNDERKICK use the spare extended bits" {
+    try std.testing.expectEqual(ExtChannelFlag.nocolor, letterToFlag('c').?);
+    try std.testing.expectEqual(ExtChannelFlag.nobot, letterToFlag('B').?);
+    try std.testing.expectEqual(ExtChannelFlag.founderkick, letterToFlag('K').?);
+    var flags = ExtChannelFlags.empty();
+    flags.set(.nocolor);
+    flags.set(.nobot);
+    flags.set(.founderkick);
+    try std.testing.expectEqual(@as(u32, (1 << 20) | (1 << 21) | (1 << 22)), @as(u32, @bitCast(flags)));
+    try std.testing.expect(!requiresOper(.nocolor));
+    try std.testing.expect(!requiresOper(.nobot));
+    try std.testing.expect(!requiresOper(.founderkick));
 }
 
 test "requiresOper is true for CLONE REGISTERED SERVICE" {

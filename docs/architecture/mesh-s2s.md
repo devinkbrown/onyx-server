@@ -67,11 +67,25 @@ The daemon also keeps operational mesh state outside the substrate: peer health,
 | `REPAIR_RESPONSE` | `0x1B` | repair | signed | `repair-frames` | Repair records that backfill requested CRDT entities. |
 | `MEMO_PUSH` | `0x1C` | notification | secured-signed | - | Secured-only Web Push hint for offline memo delivery (`src/proto/s2s_frame.zig:109`, `src/proto/memo_push_relay.zig:4`). |
 | `MEDIA_WS_DATAGRAM` | `0x25` | media | secured-signed | - | Origin-only cascade of an already-validated browser Cadence WS binary media datagram (`src/proto/media_ws_relay.zig`, `src/proto/s2s_frame.zig`). Receivers local-fanout only; never re-mesh. |
+| `GUEST_PRESENCE` | `0x2C` | relay | secured-signed | - | Original mesh-presence v2 record. The hop envelope authenticates the immediate peer. The origin signature is unchanged. No new handshake bit. |
+| `GUEST_DIRECT` | `0x2D` | relay | secured-signed | - | Ordinary-guest PRIVMSG bound to both guest incarnations. Forward only toward the recipient's next hop. No new handshake bit. |
 
-> Unknown frame tags are forward-tolerant as long as the length header is valid:
-> the decoder skips unknown length-delimited frames instead of tearing the link
-> down. Emitting a new frame still needs an upgrade or handshake-capability gate;
-> otherwise the receiver will discard behavior it does not understand.
+> Unknown frame tags are skipped when the length header is valid. They do not
+> tear the link down. `GUEST_PRESENCE` and `GUEST_DIRECT` are the current
+> ordinary-guest frames. A peer that does not know the tag skips it. The
+> sender does not wait for a new PONG and does not advertise a second version.
+
+## Ordinary guest presence
+
+Account-less clients publish one mesh-presence v2 record (`onyx-mesh-presence-v2`, magic `OPRS`). The live path does not encode, admit, or forward mesh-presence v1. The v1 codec and the v1 issuer remain in the tree and are not the route.
+
+The origin signs the record. Each hop wraps its own envelope and leaves the origin bytes unchanged. The next hop is the secured link that should receive the record. Hop 0 means local. A remote admit with hop 0 is refused. On a duplicate, the first path stays. On an update, the next hop is replaced. A quarantined contradiction is hidden. An expired record fails the clock check and is not returned. A full table fails closed. It does not evict a live subject.
+
+WHOIS for a live ordinary guest renders 311, 312, and 318 from that record, including the signed home server. PRIVMSG to that guest is one guest-direct frame (`onyx-guest-direct-v1`, magic `OGDM`): the sender's node writes it only to the recipient's next hop, an intermediate node forwards the original bytes only onward, and the home node delivers only when the recipient origin is that node and the local guest id matches. Guest counters restart on each node, so the id alone is not a mesh-wide identity. The sender is echoed once. NOTICE does not use this path. A nick with no signed guest subject stays on the existing unknown-nick path. A known guest subject does not fall through to the legacy MESSAGE nick relay.
+
+The guest id is a runtime epoch and counter. It is not a session token, and Helix does not snapshot it. The Helix world checkpoint stays version 2.
+
+This section describes the source contract. The full `zig build test` suite has not been re-run green after the path was wired.
 
 > Origin authentication, the per-link vs multi-hop signing modes, and the
 > handshake-negotiated signing capability are documented in

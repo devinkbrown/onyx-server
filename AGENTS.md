@@ -72,7 +72,9 @@ Metrics: `:9130/metrics` — `links_active` = established Mooring; `tcp_active` 
 Health: `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`  
 As verified on 2026-09-06, both nodes run `0.7.0+ae78d490` with artifact SHA-256
 `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` and report
-`links_active=1`, `peers_up=1`, and `partitioned=0`. Details and refresh commands:
+`links_active=1`, `peers_up=1`, and `partitioned=0`. The source manifest is
+now `0.8.0` and has not replaced that image. The full suite has not been
+re-run green on 0.8.0. Details and refresh commands:
 `docs/ops/onyx-server-paths.md`, `docs/ops/mesh-metrics-deploy-checklist.md`, and
 skill `onyx-server-mesh-ops`.
 

@@ -53,7 +53,7 @@ PROP <object> <prop> :             ; delete
 Channel properties are read-only or string/numeric, with per-visibility read and
 write rules: `OID` (R/O), `NAME` (R/O, 63), `CREATION` (R/O), `LANGUAGE` (31),
 `OWNERKEY`/`HOSTKEY`/`MEMBERKEY` (31, never readable), `PICS` (255), `TOPIC` (160),
-`SUBJECT` (31), `CLIENT` (255), `ONJOIN` (255), `ONPART` (255), `LAG` (0–2s),
+`SUBJECT` (31), `CLIENT` (255), `ONJOIN` (255; PRIVMSG from the channel name to the joiner only; a backslash followed by `n` starts another line), `ONPART` (255; NOTICE from the channel name to the parter only; same line break), `LAG` (0–2s),
 `ACCOUNT` (31), `CLIENTGUID`, `SERVICEPATH`.
 
 ## EVENT

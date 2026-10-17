@@ -127,6 +127,9 @@ pub fn RequestType(comptime max_filters: usize) type {
 
         filters: [max_filters]Filter = undefined,
         count: usize = 0,
+        /// Draft query limit. Null means the client asked for the server cap
+        /// (the parameter was absent, or it was `0`).
+        query_limit: ?u32 = null,
 
         pub fn slice(self: *const Self) []const Filter {
             return self.filters[0..self.count];
@@ -177,13 +180,35 @@ pub fn parseWithMax(
     comptime max_filters: usize,
     params: []const []const u8,
 ) ListxError!RequestType(max_filters) {
-    if (params.len > 1) return error.InvalidParameter;
+    if (params.len > 2) return error.InvalidParameter;
 
     var request = RequestType(max_filters){};
+    if (params.len == 2) request.query_limit = try parseQueryLimit(params[1]);
     if (params.len == 0 or params[0].len == 0) return request;
 
     try parseFilterTextWith(.{ .max_filters = max_filters }, params[0], &request);
     return request;
+}
+
+/// Parse the draft LISTX query limit. `0` is unlimited and returns null so the
+/// caller keeps its own cap. A non-numeric token is `InvalidParameter` (a
+/// filter that was split into a second argument). Overflow and leading zeros
+/// are `InvalidValue`.
+pub fn parseQueryLimit(token: []const u8) ListxError!?u32 {
+    if (token.len == 0 or token.len > 10) return error.InvalidValue;
+    for (token) |byte| {
+        if (byte < '0' or byte > '9') return error.InvalidParameter;
+    }
+    if (token.len > 1 and token[0] == '0') return error.InvalidValue;
+    const value = std.fmt.parseInt(u32, token, 10) catch return error.InvalidValue;
+    if (value == 0) return null;
+    return value;
+}
+
+/// Smaller of the client's query limit and the server's hard cap.
+pub fn resultCap(requested: ?u32, server_max: usize) usize {
+    const asked = requested orelse return server_max;
+    return @min(@as(usize, asked), server_max);
 }
 
 /// Parse one comma-separated LISTX filter parameter into caller-owned storage.
@@ -971,6 +996,24 @@ test "malformed filters are rejected" {
     try std.testing.expectError(error.InvalidMask, parse(&.{"#"}));
     try std.testing.expectError(error.InvalidFilter, parse(&.{"#bad\rmask"}));
     try std.testing.expectError(error.InvalidParameter, parse(&.{ "#zig*", ">10" }));
+}
+
+test "LISTX query limit is a trailing whole number and zero means the server cap" {
+    const limited = try parse(&.{ ">10", "2" });
+    try std.testing.expectEqual(@as(?u32, 2), limited.query_limit);
+    try std.testing.expectEqual(@as(usize, 1), limited.slice().len);
+    try std.testing.expectEqual(@as(u64, 10), limited.slice()[0].criterion.member_count.value);
+
+    const open = try parse(&.{ "#zig*", "0" });
+    try std.testing.expect(open.query_limit == null);
+    try std.testing.expectEqual(@as(usize, 2), resultCap(open.query_limit, 2));
+    try std.testing.expectEqual(@as(usize, 2), resultCap(limited.query_limit, 1024));
+    try std.testing.expectEqual(@as(usize, 1024), resultCap(try parseQueryLimit("5000"), 1024));
+
+    try std.testing.expect((try parse(&.{"#zig*"})).query_limit == null);
+    try std.testing.expectError(error.InvalidValue, parse(&.{ "#zig*", "01" }));
+    try std.testing.expectError(error.InvalidValue, parse(&.{ "#zig*", "4294967296" }));
+    try std.testing.expectError(error.InvalidParameter, parse(&.{ "#zig*", "2", "3" }));
 }
 
 test "parse filters uses caller-owned storage" {

@@ -19,6 +19,9 @@ const mod_registry = @import("registry.zig");
 const wasm_abi = @import("../wasm/host/abi.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
 const crypto_sign = @import("../crypto/sign.zig");
+const mesh_presence_v2 = @import("../proto/mesh_presence_v2.zig");
+const guest_direct = @import("../proto/guest_direct.zig");
+const guest_presence_route = @import("guest_presence_route.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/undertow/message_relay.zig");
 const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
@@ -112,6 +115,7 @@ const whowas_reply = @import("../proto/whowas_reply.zig");
 const monitor = @import("../proto/monitor.zig");
 const extended_monitor_store = @import("../proto/extended_monitor_store.zig");
 const utf8_guard = @import("../proto/utf8_guard.zig");
+const ident_utf8 = @import("../substrate/utf8.zig");
 const whisper = @import("../proto/whisper.zig");
 const read_marker_store = @import("../proto/read_marker_store.zig");
 const silence = @import("../proto/silence.zig");
@@ -1764,6 +1768,7 @@ const Numeric = enum(u16) {
     RPL_UMODEGMSG = 718,
     RPL_KNOCK = 710,
     RPL_KNOCKDLVR = 711,
+    ERR_TOOMANYKNOCK = 712,
     ERR_CHANOPEN = 713,
     ERR_KNOCKONCHAN = 714,
     RPL_MONONLINE = 730,
@@ -2304,6 +2309,11 @@ pub const Config = struct {
     /// (Helix hot-UPGRADE listener handoff: the port stays bound across execve).
     /// null = bind a new listener normally. Linux only.
     inherited_listener_fd: ?linux.fd_t = null,
+    /// Already-bound listening S2S socket. Shard 0 duplicates it and adopts the
+    /// duplicate, so the caller closes the original exactly once and the port
+    /// never has a bind gap. Null binds `s2s_port` in the normal way. A zero
+    /// `s2s_port` still means there is no S2S listener.
+    inherited_s2s_fd: ?linux.fd_t = null,
     /// Multi-shard Helix handoff: per-shard client-listener fds in shard order
     /// (`[k]` adopted by reactor `k`). Takes precedence over
     /// `inherited_listener_fd` (whose fd duplicates entry 0) when non-empty.
@@ -2439,6 +2449,9 @@ pub const Config = struct {
     /// take on the account store's I/O lifecycle: a caller that has a store wires
     /// `sasl_bridge.ServicesPlainChecker.checker()` here. Null = SASL fails closed.
     sasl_checker: ?sasl.PlainChecker = null,
+    /// Password SASL (PLAIN and SCRAM) completes only on TLS. There is no TOML
+    /// key. Test configs that log in over the plaintext listener set this true.
+    allow_plaintext_password_sasl: bool = false,
     /// Optional SASL SCRAM-SHA-256 credential lookup (account -> SCRAM record).
     /// Injected from the SCRAM credential store; null = SCRAM fails closed. When
     /// set, each accepted connection also gets a fresh CSPRNG server nonce.
@@ -2929,6 +2942,10 @@ pub const ConnState = struct {
     remote_quit_nick_hash: u64 = 0,
     remote_quit_at_ms: i64 = 0,
     remote_quit_seen: bool = false,
+    /// Per-connection KNOCK notify budget. Runtime only: a missing or hidden
+    /// name does not consume it, and the session capsule does not store it.
+    knock_window_start_ms: i64 = 0,
+    knock_count: u8 = 0,
     session: dispatch.ClientSession = dispatch.ClientSession.init(),
     /// Set only when the registration SASL exchange itself completed through
     /// EXTERNAL. A presented certificate without a successful EXTERNAL proof is
@@ -3119,6 +3136,13 @@ pub const ConnState = struct {
     /// ghost) session. 0 = unknown → fail-safe "never reclaim" (a live session is
     /// never wrongly killed by a stale remote claim).
     mesh_nick_hlc: u64 = 0,
+    /// Runtime ordinary-guest incarnation (epoch 1, monotonic counter). Zero
+    /// means this connection has no mesh-presence subject. Helix does not
+    /// preserve it, and the durable v1 issuer is not consulted.
+    guest_id: [16]u8 = @splat(0),
+    guest_revision: u64 = 0,
+    guest_claim_revision: u64 = 0,
+    guest_claim_hlc: u64 = 0,
     /// Monotonic ms of the last `SEARCH` (draft/search) this client issued, or 0
     /// if never. The handler rate-limits searches against it (anti-abuse): a
     /// second SEARCH within `search_rate_limit_ms` is rejected with a FAIL.
@@ -4669,6 +4693,11 @@ pub const LinuxServer = struct {
     /// Decoded `[mesh].trust_roots` Ed25519 node signing keys. Empty preserves
     /// TOFU; non-empty requires secured peers to present one of these keys.
     mesh_trusted_node_keys: [][32]u8 = &.{},
+    /// Live mesh-presence v2 subjects and their separate next hops. Null until
+    /// the first ordinary guest is published. Not part of the Helix capsule.
+    guest_presence: ?*guest_presence_route.Authority = null,
+    /// Next runtime guest counter. The on-wire epoch stays 1 for this process.
+    guest_serial: u64 = 0,
     /// Immutable sorted event-time membership used by RVL2: this node plus the
     /// exact configured direct-neighbor identity pins. For this release
     /// `[mesh].trust_roots` is deliberately the direct-neighbor set, not a broad
@@ -5509,12 +5538,25 @@ pub const LinuxServer = struct {
         // S2S peers must be accepted on reactor 0: the mesh dial table,
         // collision resolver, and link-establish side effects are reactor-0
         // state. In sharded mode no other reactor even binds this port.
-        const inherited_s2s = nativeManifestListener(config, shard_id, .s2s, false);
-        const s2s_listener_fd: linux.fd_t = if (config.s2s_port != 0 and (!reuse_port or shard_id == 0))
-            if (inherited_s2s) |fd| try adoptNativeListener(config, fd) else try createListener(primaryListenerHost(config.host), config.s2s_port, config.backlog)
-        else
-            -1;
+        const manifest_s2s = nativeManifestListener(config, shard_id, .s2s, false);
+        const bind_s2s = config.s2s_port != 0 and (!reuse_port or shard_id == 0);
+        var s2s_listener_fd: linux.fd_t = -1;
         errdefer if (s2s_listener_fd >= 0) closeFd(s2s_listener_fd);
+        if (bind_s2s) {
+            if (manifest_s2s) |fd| {
+                s2s_listener_fd = try adoptNativeListener(config, fd);
+            } else if (config.inherited_s2s_fd) |fd| {
+                // Duplicate so the caller can always close the original, including
+                // when adoption or a later init step fails.
+                if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+                const copy = try duplicateListenerFd(fd);
+                s2s_listener_fd = copy;
+                s2s_listener_fd = try adoptNativeListener(config, copy);
+            } else {
+                s2s_listener_fd = try createListener(primaryListenerHost(config.host), config.s2s_port, config.backlog);
+            }
+        }
+        const inherited_s2s = manifest_s2s orelse if (config.inherited_s2s_fd != null and s2s_listener_fd >= 0) s2s_listener_fd else null;
         const s2s_listener_companion_fd = if (s2s_listener_fd >= 0)
             try stageListenerCompanion(config.host, config.s2s_port, s2s_listener_fd, config.backlog, false, inherited_s2s, nativeManifestListener(config, shard_id, .s2s, true))
         else
@@ -8307,6 +8349,7 @@ pub const LinuxServer = struct {
         self.allocator.free(self.reactors);
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
         self.inherited_mesh_redials.deinit(self.allocator);
+        if (self.guest_presence) |auth| auth.destroy();
         if (self.mesh_trusted_node_keys.len != 0) self.allocator.free(self.mesh_trusted_node_keys);
         if (self.relay_v2_required_nodes.len != 0) self.allocator.free(self.relay_v2_required_nodes);
         if (self.meshpass_roots.len != 0) self.allocator.free(self.meshpass_roots);
@@ -8326,8 +8369,9 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Keep exactly one poll on the cross-reactor wake eventfd in flight, so a
-    /// foreign reactor's `wakeReactor()` makes this loop run.
+    /// Keep one poll on the cross-reactor wake eventfd. A multishot poll stays
+    /// armed while its completion still has MORE set; a one-shot completion
+    /// clears `wake_armed` and the next turn submits the replacement.
     fn armWake(self: *LinuxServer) !void {
         if (self.rx().wake) |w| {
             if (!self.rx().wake_armed) {
@@ -8365,12 +8409,10 @@ pub const LinuxServer = struct {
         self.wakeAllReactors();
     }
 
-    /// Handle the wake-fd poll completion: drain the eventfd, mark the poll
-    /// consumed (re-armed next `runOnce`), record the wake, then drain this
-    /// shard's cross-shard mailbox and flush the handed-off bytes to the local
-    /// connections they target.
+    /// Handle the wake-fd poll completion. The caller clears `wake_armed` only
+    /// when MORE is clear, so a multishot poll is not submitted again while
+    /// the kernel still holds it. Drain the eventfd before mailbox work.
     fn onWakePoll(self: *LinuxServer) void {
-        self.rx().wake_armed = false;
         if (self.rx().wake) |*w| w.drain();
         _ = self.rx().wake_count.fetchAdd(1, .monotonic);
         // A source may have published poison without successfully queueing a
@@ -12072,6 +12114,8 @@ pub const LinuxServer = struct {
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainOperEventsV2(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainGuestFrames(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         self.drainObserveEvents(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainKills(conn, link);
@@ -13487,11 +13531,25 @@ pub const LinuxServer = struct {
         bytes: []const u8,
         out: []u8,
     ) ![]const u8 {
+        return self.renderTaggedRecordCached(id, tags, bytes, out, null);
+    }
+
+    fn renderTaggedRecordCached(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        tags: MsgTags,
+        bytes: []const u8,
+        out: []u8,
+        prefix_cache: ?*TagPrefixCache,
+    ) ![]const u8 {
         const conn = self.connFor(id) orelse return error.ClientNotFound;
         if (conn.closing) return error.ClientNotFound;
         if (bytes.len > default_reply_bytes) return error.OutputTooSmall;
         var tagbuf: [max_delivery_prefix_bytes]u8 = undefined;
-        const prefix = buildTagPrefix(&conn.session, tags, &tagbuf);
+        const prefix = if (prefix_cache) |cache|
+            cache.prefix(&conn.session, tags)
+        else
+            buildTagPrefix(&conn.session, tags, &tagbuf);
         const total = std.math.add(usize, prefix.len, bytes.len) catch return error.OutputTooSmall;
         if (total > out.len or total > max_prefixed_delivery_bytes) return error.OutputTooSmall;
         @memcpy(out[0..prefix.len], prefix);
@@ -13578,6 +13636,103 @@ pub const LinuxServer = struct {
                 self.poisonOwnedDelivery(conn);
             };
         }
+    }
+
+    /// Drain every current-shard head that can enter SendQ, not only the first
+    /// 64. A full SendQ leaves that head retained and does not poison it. The
+    /// walk stops once a complete pass commits nothing, so a stuck recipient
+    /// cannot spin the reactor.
+    fn drainAttachmentSpoolForCurrentReactorDeep(self: *LinuxServer) void {
+        const shard = self.rx().shard_id;
+        lockSpin(&self.attachment_delivery_mu);
+        defer self.attachment_delivery_mu.unlock();
+        const page = 64;
+        const pending_count = self.attachment_delivery_spool.len();
+        if (pending_count == 0) return;
+        const stall_limit = (self.attachment_delivery_spool.attachmentCount() / page) + 2;
+        const guard_limit = pending_count + stall_limit + 2;
+        var stall: usize = 0;
+        var guard: usize = 0;
+        while (guard < guard_limit) : (guard += 1) {
+            var pending_buf: [page]attachment_delivery_spool.PendingRecord = undefined;
+            const pending = self.attachment_delivery_spool.collectPending(&pending_buf);
+            if (pending.len == 0) break;
+            var committed: usize = 0;
+            for (pending) |record| {
+                const id = clientIdFromMonitor(record.client);
+                if (id.shard != shard) continue;
+                const conn = self.rx().clients.get(id) orelse continue;
+                if (conn.closing) continue;
+                appendToConn(conn, record.bytes) catch continue;
+                if (!self.attachment_delivery_spool.commitHeadToSendq(
+                    record.client,
+                    record.sequence,
+                    record.event_id,
+                )) continue;
+                committed += 1;
+                self.armSendIfNeeded(conn) catch {
+                    self.poisonOwnedDelivery(conn);
+                };
+            }
+            if (committed == 0) {
+                stall += 1;
+                if (stall >= stall_limit or pending.len < page) break;
+            } else {
+                stall = 0;
+            }
+        }
+    }
+
+    fn noteFanoutWake(self: *LinuxServer, shard: u12) void {
+        const batch = &self.rx().wake_batch;
+        if (batch.active()) {
+            batch.mark(shard);
+        } else {
+            self.wakeShard(shard);
+        }
+    }
+
+    /// One Blake3 and one spool transaction for every reusable recipient of this
+    /// ordinary event. A failed batch falls back per recipient: reserve what
+    /// still fits, and SendQ the rest. Nothing that was adopted is also copied
+    /// onto the SendQ.
+    /// Returns true when at least one body was adopted or was already retained.
+    /// A total miss leaves the spool untouched so an unrelated retained row is
+    /// not drained by this fan-out.
+    fn publishOwnedAttachmentBatch(
+        self: *LinuxServer,
+        owned: []attachment_delivery_spool.OwnedBatchRecord,
+    ) bool {
+        lockSpin(&self.attachment_delivery_mu);
+        const reserved = self.attachment_delivery_spool.reserveOwnedBatch(owned);
+        self.attachment_delivery_mu.unlock();
+        if (reserved) |result| {
+            for (owned) |rec| self.noteFanoutWake(clientIdFromMonitor(rec.client).shard);
+            return result.inserted != 0 or result.exact_duplicates != 0;
+        } else |_| {}
+        var retained = false;
+        for (owned) |*rec| {
+            if (rec.bytes.len == 0) continue;
+            var single = [1]attachment_delivery_spool.OwnedBatchRecord{rec.*};
+            lockSpin(&self.attachment_delivery_mu);
+            const one = self.attachment_delivery_spool.reserveOwnedBatch(&single);
+            self.attachment_delivery_mu.unlock();
+            if (one) |result| {
+                rec.* = single[0];
+                if (rec.bytes.len != 0) {
+                    self.allocator.free(rec.bytes);
+                    rec.bytes = &.{};
+                }
+                self.noteFanoutWake(clientIdFromMonitor(rec.client).shard);
+                if (result.inserted != 0 or result.exact_duplicates != 0) retained = true;
+            } else |_| {
+                const id = clientIdFromMonitor(rec.client);
+                _ = self.enqueueDeliveryMaybeClose(id, rec.bytes, false, "Client quit");
+                self.allocator.free(rec.bytes);
+                rec.bytes = &.{};
+            }
+        }
+        return retained;
     }
 
     fn transferAttachmentDeliveries(
@@ -13667,27 +13822,26 @@ pub const LinuxServer = struct {
         bytes: []const u8,
     ) !PreparedAttachmentDeliveryBatch {
         const msgid = tags.msgid orelse return .{ .server = self };
-        var owned: std.ArrayList([]u8) = .empty;
+        const event_id = attachmentEventId(msgid);
+        var records: std.ArrayList(attachment_delivery_spool.OwnedBatchRecord) = .empty;
         defer {
-            for (owned.items) |record| self.allocator.free(record);
-            owned.deinit(self.allocator);
+            for (records.items) |record| if (record.bytes.len != 0) self.allocator.free(record.bytes);
+            records.deinit(self.allocator);
         }
-        var records: std.ArrayList(attachment_delivery_spool.BatchRecord) = .empty;
-        defer records.deinit(self.allocator);
+        var prefix_cache = TagPrefixCache{};
         for (recipients) |id| {
             if (!self.attachmentHasReusableSession(id)) continue;
             var rendered_buf: [max_prefixed_delivery_bytes]u8 = undefined;
-            const rendered = try self.renderTaggedRecord(id, tags, bytes, &rendered_buf);
+            const rendered = try self.renderTaggedRecordCached(id, tags, bytes, &rendered_buf, &prefix_cache);
             const copy = try self.allocator.dupe(u8, rendered);
-            owned.append(self.allocator, copy) catch |err| {
+            records.append(self.allocator, .{
+                .client = monitorIdFromClient(id),
+                .event_id = event_id,
+                .bytes = copy,
+            }) catch |err| {
                 self.allocator.free(copy);
                 return err;
             };
-            try records.append(self.allocator, .{
-                .client = monitorIdFromClient(id),
-                .event_id = attachmentEventId(msgid),
-                .bytes = copy,
-            });
         }
         if (records.items.len == 0) return .{ .server = self };
 
@@ -13695,7 +13849,7 @@ pub const LinuxServer = struct {
         errdefer self.attachment_delivery_mu.unlock();
         return .{
             .server = self,
-            .prepared = try self.attachment_delivery_spool.prepareBatch(records.items),
+            .prepared = try self.attachment_delivery_spool.prepareOwnedBatch(records.items),
             .locked = true,
         };
     }
@@ -13774,6 +13928,29 @@ pub const LinuxServer = struct {
         return clientTagsForSession(&conn.session, tags, &visible).len != 0;
     }
 
+    const ChannelChatter = enum { none, speech, notice };
+
+    /// +D drops channel PRIVMSG, NOTICE, and TAGMSG. +T drops channel NOTICE
+    /// only. JOIN, MODE, KICK, and DATA stay visible.
+    fn channelChatterOf(bytes: []const u8) ChannelChatter {
+        return switch (channelLineKind(bytes)) {
+            .other => .none,
+            .privmsg, .tagmsg => .speech,
+            .notice => .notice,
+        };
+    }
+
+    fn skipsChannelChatter(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8) bool {
+        return self.memberSkipsChatter(id, channelChatterOf(bytes));
+    }
+
+    fn memberSkipsChatter(self: *LinuxServer, id: client_model.ClientId, chatter: ChannelChatter) bool {
+        if (chatter == .none) return false;
+        const conn = self.connFor(id) orelse return false;
+        if (conn.session.umodes.contains(.deaf)) return true;
+        return chatter == .notice and conn.session.umodes.contains(.no_chan_notice);
+    }
+
     fn collectChannelDeliveryIds(
         self: *LinuxServer,
         channel: []const u8,
@@ -13781,6 +13958,7 @@ pub const LinuxServer = struct {
         excluded: ?client_model.ClientId,
         visible_client_tags: ?[]const u8,
         out: *std.ArrayList(client_model.ClientId),
+        chatter: ChannelChatter,
     ) std.mem.Allocator.Error!void {
         var members = self.world.memberIterator(channel) orelse return;
         while (members.next()) |member| {
@@ -13790,6 +13968,7 @@ pub const LinuxServer = struct {
             }
             const id = clientIdFromWorld(member.*);
             if (excluded) |skip| if (id.eql(skip)) continue;
+            if (self.memberSkipsChatter(id, chatter)) continue;
             if (!self.deliveryVisibleForClientTags(id, visible_client_tags)) continue;
             try self.appendUniqueDeliveryId(out, id);
         }
@@ -13818,6 +13997,48 @@ pub const LinuxServer = struct {
     /// Deliver `bytes` with an IRCv3 message-tag segment assembled for THIS
     /// recipient: `@time=…;account=… ` including only the tags whose caps the
     /// recipient negotiated. Used by the PRIVMSG/NOTICE/TAGMSG paths.
+    /// Eight rendered prefixes cover a channel whose members share a handful of
+    /// negotiated cap sets. The key is only the caps that change this event's
+    /// prefix, so identical recipients reuse one rendering.
+    const TagPrefixCache = struct {
+        const slot_count = 8;
+        used: [slot_count]bool = @splat(false),
+        keys: [slot_count]u32 = @splat(0),
+        lens: [slot_count]u16 = @splat(0),
+        storage: [slot_count][max_delivery_prefix_bytes]u8 = undefined,
+        next: usize = 0,
+
+        fn prefix(self: *TagPrefixCache, session: *const dispatch.ClientSession, tags: MsgTags) []const u8 {
+            const key = LinuxServer.tagPrefixKey(session, tags);
+            for (self.used, 0..) |occupied, index| {
+                if (occupied and self.keys[index] == key) return self.storage[index][0..self.lens[index]];
+            }
+            const slot = self.next % slot_count;
+            self.next += 1;
+            const rendered = buildTagPrefix(session, tags, &self.storage[slot]);
+            self.used[slot] = true;
+            self.keys[slot] = key;
+            self.lens[slot] = @intCast(rendered.len);
+            return self.storage[slot][0..rendered.len];
+        }
+    };
+
+    fn tagPrefixKey(session: *const dispatch.ClientSession, tags: MsgTags) u32 {
+        var bits: u32 = 0;
+        if (tags.time_value.len != 0 and session.hasCap(.server_time)) bits |= 1;
+        if (tags.account != null and session.hasCap(.account_tag)) bits |= 2;
+        if (session.hasCap(.message_tags) and (tags.msgid != null or tags.is_bot or tags.client_tags != null)) bits |= 4;
+        if (tags.client_tags != null) {
+            if (session.hasCap(.onyx_topics)) bits |= 8;
+            if (session.hasCap(.onyx_e2ee)) bits |= 16;
+            if (session.hasCap(.typing)) bits |= 32;
+            if (session.hasCap(.react)) bits |= 64;
+            if (session.hasCap(.reply)) bits |= 128;
+            if (session.hasCap(.message_editing)) bits |= 256;
+        }
+        return bits;
+    }
+
     const TaggedDeliveryMode = enum {
         ordinary,
         prepared_batch,
@@ -13834,6 +14055,20 @@ pub const LinuxServer = struct {
         bytes: []const u8,
         mode: TaggedDeliveryMode,
     ) !void {
+        return self.deliverTaggedFanout(id, tags, bytes, mode, null, false);
+    }
+
+    /// `defer_spool_drain` skips the per-recipient wake and drain. The caller
+    /// is inside a wake batch and drains the local shard once after the fan-out.
+    fn deliverTaggedFanout(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        tags: MsgTags,
+        bytes: []const u8,
+        mode: TaggedDeliveryMode,
+        prefix_cache: ?*TagPrefixCache,
+        defer_spool_drain: bool,
+    ) !void {
         const conn = self.connFor(id) orelse return error.ClientNotFound;
         if (conn.closing) return;
         if (tags.msgid != null and self.attachmentHasReusableSession(id)) {
@@ -13843,8 +14078,12 @@ pub const LinuxServer = struct {
                     // with MESSAGE_V2 authority. Ordinary fanout is now only the
                     // transport trigger: reserving again after another attachment
                     // drained the shared batch would recreate the retired event.
-                    self.wakeShard(id.shard);
-                    if (id.shard == self.rx().shard_id) self.drainAttachmentSpoolForCurrentReactor();
+                    if (defer_spool_drain) {
+                        self.noteFanoutWake(id.shard);
+                    } else {
+                        self.wakeShard(id.shard);
+                        if (id.shard == self.rx().shard_id) self.drainAttachmentSpoolForCurrentReactor();
+                    }
                     return;
                 },
                 .ordinary => {
@@ -13865,8 +14104,11 @@ pub const LinuxServer = struct {
         // Sized for the full @-segment: server-time + account + msgid + relayed
         // client-only tags. Built from a serialized read of the owning reactor's
         // negotiated caps; the bytes then route to that reactor via enqueueDelivery.
-        var tagbuf: [256]u8 = undefined;
-        const prefix = buildTagPrefix(&conn.session, tags, &tagbuf);
+        var tagbuf: [max_delivery_prefix_bytes]u8 = undefined;
+        const prefix = if (prefix_cache) |cache|
+            cache.prefix(&conn.session, tags)
+        else
+            buildTagPrefix(&conn.session, tags, &tagbuf);
         try self.deliverPrefixed(id, prefix, bytes);
     }
 
@@ -13951,17 +14193,70 @@ pub const LinuxServer = struct {
         except: ?client_model.ClientId,
         mode: TaggedDeliveryMode,
     ) !void {
+        try self.broadcastTagged(channel, tags, bytes, except, mode, 0);
+    }
+
+    fn broadcastTagged(
+        self: *LinuxServer,
+        channel: []const u8,
+        tags: MsgTags,
+        bytes: []const u8,
+        except: ?client_model.ClientId,
+        mode: TaggedDeliveryMode,
+        min_rank: u8,
+    ) !void {
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
+        const chatter = channelChatterOf(bytes);
         // Coalesce per-recipient cross-shard wakes into one wake per touched shard.
         self.beginWakeBatch();
         defer self.endWakeBatch();
-        while (members.next()) |member| {
-            const mid = clientIdFromWorld(member.*);
-            if (except) |skip| {
-                if (mid.eql(skip)) continue;
-            }
-            self.deliverTaggedMode(mid, tags, bytes, mode) catch continue;
+        var prefix_cache = TagPrefixCache{};
+        const batch_ordinary = mode == .ordinary and tags.msgid != null;
+        var owned: std.ArrayList(attachment_delivery_spool.OwnedBatchRecord) = .empty;
+        defer {
+            for (owned.items) |rec| if (rec.bytes.len != 0) self.allocator.free(rec.bytes);
+            owned.deinit(self.allocator);
         }
+        var event_id: attachment_delivery_spool.EventId = @splat(0);
+        if (batch_ordinary) event_id = attachmentEventId(tags.msgid.?);
+        while (members.next()) |member| {
+            if (min_rank != 0) {
+                const modes = self.world.memberModes(channel, member.*) orelse continue;
+                if (modes.rank() < min_rank) continue;
+            }
+            const id = clientIdFromWorld(member.*);
+            if (except) |skip| {
+                if (id.eql(skip)) continue;
+            }
+            if (self.memberSkipsChatter(id, chatter)) continue;
+            if (batch_ordinary and self.attachmentHasReusableSession(id)) {
+                const conn = self.connFor(id) orelse continue;
+                if (conn.closing) continue;
+                var rendered_buf: [max_prefixed_delivery_bytes]u8 = undefined;
+                const rendered = self.renderTaggedRecordCached(id, tags, bytes, &rendered_buf, &prefix_cache) catch {
+                    self.deliverTaggedFanout(id, tags, bytes, mode, &prefix_cache, false) catch {};
+                    continue;
+                };
+                const copy = self.allocator.dupe(u8, rendered) catch {
+                    self.deliverTaggedFanout(id, tags, bytes, mode, &prefix_cache, false) catch {};
+                    continue;
+                };
+                owned.append(self.allocator, .{
+                    .client = monitorIdFromClient(id),
+                    .event_id = event_id,
+                    .bytes = copy,
+                }) catch {
+                    self.allocator.free(copy);
+                    self.deliverTaggedFanout(id, tags, bytes, mode, &prefix_cache, false) catch {};
+                    continue;
+                };
+                continue;
+            }
+            self.deliverTaggedFanout(id, tags, bytes, mode, &prefix_cache, mode == .prepared_batch) catch {};
+        }
+        var retained = false;
+        if (owned.items.len != 0) retained = self.publishOwnedAttachmentBatch(owned.items);
+        if (mode == .prepared_batch or retained) self.drainAttachmentSpoolForCurrentReactorDeep();
     }
 
     fn broadcastChannel(
@@ -13972,6 +14267,7 @@ pub const LinuxServer = struct {
     ) !void {
         var tag_buf: [48]u8 = undefined;
         const tag = serverTimeTag(&tag_buf);
+        const chatter = channelChatterOf(bytes);
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
         self.beginWakeBatch();
         defer self.endWakeBatch();
@@ -13980,6 +14276,7 @@ pub const LinuxServer = struct {
             if (except) |skip| {
                 if (id.eql(skip)) continue;
             }
+            if (self.memberSkipsChatter(id, chatter)) continue;
             self.deliverTimed(id, tag, bytes) catch continue;
         }
     }
@@ -14015,6 +14312,7 @@ pub const LinuxServer = struct {
         cap: dispatch.CapId,
         except: ?client_model.ClientId,
     ) !void {
+        var prefix_cache = TagPrefixCache{};
         var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
         self.beginWakeBatch();
         defer self.endWakeBatch();
@@ -14025,7 +14323,7 @@ pub const LinuxServer = struct {
             }
             const mconn = self.connFor(id) orelse continue;
             if (!mconn.session.hasCap(cap)) continue;
-            self.deliverTagged(id, tags, bytes) catch continue;
+            self.deliverTaggedFanout(id, tags, bytes, .ordinary, &prefix_cache, false) catch continue;
         }
     }
 
@@ -14040,18 +14338,7 @@ pub const LinuxServer = struct {
         min_rank: u8,
         mode: TaggedDeliveryMode,
     ) !void {
-        var members = self.world.memberIterator(channel) orelse return error.NoSuchChannel;
-        self.beginWakeBatch();
-        defer self.endWakeBatch();
-        while (members.next()) |member| {
-            const mm = self.world.memberModes(channel, member.*) orelse continue;
-            if (mm.rank() < min_rank) continue;
-            const id = clientIdFromWorld(member.*);
-            if (except) |skip| {
-                if (id.eql(skip)) continue;
-            }
-            self.deliverTaggedMode(id, tags, bytes, mode) catch continue;
-        }
+        try self.broadcastTagged(channel, tags, bytes, except, mode, min_rank);
     }
 
     /// Forward a cross-node user message to every established S2S peer except
@@ -14171,17 +14458,43 @@ pub const LinuxServer = struct {
         if (self.connFor(recipient_id)) |rconn| {
             if (sender_account.len == 0 and rconn.session.umodes.contains(.regonly_pm)) return true;
             if (msg.verb == .privmsg and rconn.session.umodes.contains(.no_ctcp) and isBlockableCtcp(msg.text)) return true;
+            const self_msg = std.ascii.eqlIgnoreCase(msg.source_nick, msg.target);
+            const accepted = self.accepts.contains(msg.target, msg.source_nick) catch false;
+            const same_account = if (sender_account.len != 0)
+                if (rconn.session.account()) |ra| std.ascii.eqlIgnoreCase(sender_account, ra) else false
+            else
+                false;
+            // A relay frame has no authenticated TLS bit. +Z stays closed
+            // unless the sender is this nick or the same account.
+            if (rconn.session.umodes.contains(.tls_only_pm) and !self_msg and !same_account) return true;
+            if (rconn.session.umodes.contains(.common_chan)) {
+                const shares = self.clientSharesChannelWithNick(worldIdFromClient(recipient_id), msg.source_nick);
+                if (!self_msg and !accepted and !same_account and !shares) return true;
+            }
             if (rconn.session.umodes.contains(.callerid)) {
-                const self_msg = std.ascii.eqlIgnoreCase(msg.source_nick, msg.target);
-                const accepted = self.accepts.contains(msg.target, msg.source_nick) catch false;
-                const same_account = if (sender_account.len != 0)
-                    if (rconn.session.account()) |ra| std.ascii.eqlIgnoreCase(sender_account, ra) else false
-                else
-                    false;
                 if (!self_msg and !accepted and !same_account) return true;
             }
         }
         if (self.silence.isSilenced(msg.target, msg.source_prefix)) return true;
+        return false;
+    }
+
+    fn clientsShareChannel(self: *LinuxServer, left: world_model.ClientId, right: world_model.ClientId) bool {
+        var channels = self.world.channelIterator();
+        while (channels.next()) |view| {
+            if (self.world.isMember(view.name, left) and self.world.isMember(view.name, right)) return true;
+        }
+        return false;
+    }
+
+    /// Local membership plus a converged remote roster. An unproven share fails closed.
+    fn clientSharesChannelWithNick(self: *LinuxServer, client: world_model.ClientId, nick: []const u8) bool {
+        var channels = self.world.channelIterator();
+        while (channels.next()) |view| {
+            if (!self.world.isMember(view.name, client)) continue;
+            if (self.world.isMemberByNick(view.name, nick)) return true;
+            if (self.remoteMemberStatusInChannel(view.name, nick) != null) return true;
+        }
         return false;
     }
 
@@ -15870,7 +16183,11 @@ pub const LinuxServer = struct {
                 const signed_route = msg.recipient_route_id orelse return .permanent;
                 const sender_member = replica_proof != null or signed_member_modes != null or
                     self.remoteMemberOfChannelAtNode(msg.target, source_nick, msg.origin_node);
-                if (sender_member and !self.world.channelHasExtFlag(msg.target, .nowhisper)) {
+                // Signed mode bits are not a visibility proof. +x uses the local
+                // member table or the converged roster, and skips local delivery
+                // when this sender cannot see the recipient.
+                const whisper_hidden = self.auditoriumHidesWhisper(msg.target, source_nick, msg.recipient);
+                if (sender_member and !self.world.channelHasExtFlag(msg.target, .nowhisper) and !whisper_hidden) {
                     const target_resolution = self.collectRelayV2ExactTarget(
                         msg.recipient,
                         signed_route,
@@ -15935,6 +16252,7 @@ pub const LinuxServer = struct {
             .client_tags = safe_tags,
             .msgid = stable_msgid,
         };
+        const relay_chatter = channelChatterOf(line);
 
         var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
         defer delivery_ids.deinit(self.allocator);
@@ -15949,6 +16267,7 @@ pub const LinuxServer = struct {
                             if (modes.rank() < min_rank) continue;
                         }
                         const id = clientIdFromWorld(member.*);
+                        if (self.memberSkipsChatter(id, relay_chatter)) continue;
                         if (msg.verb == .tagmsg) {
                             const target_conn = self.connFor(id) orelse continue;
                             var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
@@ -16013,6 +16332,8 @@ pub const LinuxServer = struct {
             self.chanstatsMessage(row.target, row.sender, row.command, row.text);
         }
 
+        self.beginWakeBatch();
+        defer self.endWakeBatch();
         switch (msg.scope_kind) {
             .channel => if (speech != .deny) {
                 if (self.world.memberIterator(msg.target)) |*iter| {
@@ -16024,12 +16345,13 @@ pub const LinuxServer = struct {
                             if (modes.rank() < min_rank) continue;
                         }
                         const id = clientIdFromWorld(member.*);
+                        if (self.memberSkipsChatter(id, relay_chatter)) continue;
                         if (msg.verb == .tagmsg) {
                             const conn = self.connFor(id) orelse continue;
                             var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                             if (clientTagsForSession(&conn.session, safe_tags, &visible).len == 0) continue;
                         }
-                        self.deliverPreparedTagged(id, tags, line) catch {};
+                        self.deliverTaggedFanout(id, tags, line, .prepared_batch, null, true) catch {};
                     }
                 }
             },
@@ -16040,7 +16362,7 @@ pub const LinuxServer = struct {
                         var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                         if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
                     }
-                    self.deliverPreparedTagged(id, tags, line) catch {};
+                    self.deliverTaggedFanout(id, tags, line, .prepared_batch, null, true) catch {};
                 }
             },
         }
@@ -16065,8 +16387,9 @@ pub const LinuxServer = struct {
                 var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
                 if (clientTagsForSession(&target_conn.session, safe_tags, &visible).len == 0) continue;
             }
-            self.deliverPreparedTagged(sender_id, tags, line) catch {};
+            self.deliverTaggedFanout(sender_id, tags, line, .prepared_batch, null, true) catch {};
         }
+        self.drainAttachmentSpoolForCurrentReactorDeep();
         self.forwardAcceptedRelayV2(wire);
         return .{ .accepted = relay_id };
     }
@@ -16292,32 +16615,26 @@ pub const LinuxServer = struct {
                 std.fmt.bufPrint(&channel_line_buf, ":{s} {s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, render_target, clean_msg.data_tag, eff_text }) catch return
             else
                 std.fmt.bufPrint(&channel_line_buf, ":{s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, render_target, eff_text }) catch return;
-            if (self.world.memberIterator(clean_msg.target)) |*it| {
-                var members = it.*;
-                if (speech == .opmoderate or clean_msg.min_rank > 0) {
-                    const min_rank = if (speech == .opmoderate) 2 else clean_msg.min_rank;
+            const relay_rank: u8 = if (speech == .opmoderate) 2 else clean_msg.min_rank;
+            if (clean_msg.verb == .tagmsg) {
+                const relay_chatter = channelChatterOf(channel_line);
+                if (self.world.memberIterator(clean_msg.target)) |*it| {
+                    var members = it.*;
                     while (members.next()) |member| {
-                        const mm = self.world.memberModes(clean_msg.target, member.*) orelse continue;
-                        if (mm.rank() < min_rank) continue;
-                        const mid = clientIdFromWorld(member.*);
-                        if (clean_msg.verb == .tagmsg) {
-                            const mconn = self.connFor(mid) orelse continue;
-                            var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
-                            if (clientTagsForSession(&mconn.session, clean_msg.tags, &visible_tags_buf).len == 0) continue;
+                        if (relay_rank != 0) {
+                            const mm = self.world.memberModes(clean_msg.target, member.*) orelse continue;
+                            if (mm.rank() < relay_rank) continue;
                         }
-                        self.deliverTagged(mid, relay_tags, channel_line) catch {};
-                    }
-                } else {
-                    while (members.next()) |member| {
                         const mid = clientIdFromWorld(member.*);
-                        if (clean_msg.verb == .tagmsg) {
-                            const mconn = self.connFor(mid) orelse continue;
-                            var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
-                            if (clientTagsForSession(&mconn.session, clean_msg.tags, &visible_tags_buf).len == 0) continue;
-                        }
+                        if (self.memberSkipsChatter(mid, relay_chatter)) continue;
+                        const mconn = self.connFor(mid) orelse continue;
+                        var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                        if (clientTagsForSession(&mconn.session, clean_msg.tags, &visible_tags_buf).len == 0) continue;
                         self.deliverTagged(mid, relay_tags, channel_line) catch {};
                     }
                 }
+            } else {
+                self.broadcastTagged(clean_msg.target, relay_tags, channel_line, null, .ordinary, relay_rank) catch {};
             }
             // Record the incoming relayed channel message into the CHATHISTORY
             // ring so cross-node CHATHISTORY works: a member reading back on THIS
@@ -16511,6 +16828,9 @@ pub const LinuxServer = struct {
         if (self.world.channelExists(msg.target) and self.world.channelHasExtFlag(msg.target, .nowhisper)) {
             return;
         }
+        // Same +x rule as the local command: do not deliver a whisper to a
+        // member the sender is not allowed to see. Unknown rank is regular.
+        if (self.auditoriumHidesWhisper(msg.target, msg.source_nick, msg.recipient)) return;
         if (self.world.findNick(msg.recipient)) |rwid| {
             // WHISPER invariant: the recipient must be on the shared channel.
             if (self.world.isMember(msg.target, rwid)) {
@@ -16749,6 +17069,7 @@ pub const LinuxServer = struct {
     /// printable + comma-free per the SCRAM grammar) and the STS policy (so the
     /// `sts` cap is advertised on CAP LS when an operator enabled it).
     fn injectSessionState(self: *LinuxServer, conn: *ConnState) void {
+        conn.session.password_sasl_allowed = conn.is_tls or self.config.allow_plaintext_password_sasl;
         conn.session.configureMultiline(self.config.multiline_max_bytes, self.config.multiline_max_lines) catch {};
         if (!self.config.sasl_enabled) {
             if (self.config.sts_value) |v| conn.session.enableSts(v) catch {};
@@ -16788,6 +17109,9 @@ pub const LinuxServer = struct {
         conn.session.sasl_allow_anonymous = self.config.sasl_allow_anonymous;
         conn.session.sasl_oauth_auto_provision = self.config.sasl_oauth_auto_provision;
         conn.session.sasl_decode_max_bytes = @min(@as(usize, self.config.sasl_decode_max_bytes), sasl_mechrouter.MAX_RAW_MESSAGE);
+        if (self.account_services != null) {
+            conn.session.login_audit = .{ .ptr = self, .record = recordSaslLogin };
+        }
     }
 
     fn retainCloseReason(conn: *ConnState, reason: []const u8) void {
@@ -17140,8 +17464,10 @@ pub const LinuxServer = struct {
         // Presence first lets a current peer issue the identity-wide QUIT while
         // every channel route is still visible. Per-channel negatives follow to
         // converge authority and are client-display-deduped at the receiver.
-        if (announce and !conn.session_mesh_announce_pending)
+        if (announce and !conn.session_mesh_announce_pending) {
+            self.retireOrdinaryGuest(conn);
             self.announceMembership(presence_channel, nick, 0, false, quit_identity, mesh_quit_setter);
+        }
         var it = self.world.channels.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.members.contains(worldIdFromClient(id))) {
@@ -18248,6 +18574,9 @@ pub const LinuxServer = struct {
         // Stamp the mesh-claim HLC for this session so a same-account cross-mesh
         // collision can tell the live session from a stale ghost (newest wins).
         conn.mesh_nick_hlc = self.nextMeshHlc();
+        // Ordinary guests publish one original v2 presence record. Account and
+        // portable-token sessions stay on their existing routes.
+        self.publishOrdinaryGuest(conn, true);
     }
 
     /// Whether `nick` is currently held in the world by a LOCAL connection that
@@ -18738,6 +19067,12 @@ pub const LinuxServer = struct {
                 } else if (conn.s2s) |link| {
                     link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch return false;
                 }
+            }
+        }
+        if (conn.s2s_secured) |link| {
+            if (link.supportsGuestPresence()) {
+                self.refreshOrdinaryGuests();
+                if (link.remoteNodeId()) |hop| if (hop != 0) self.driveGuestPresence(hop);
             }
         }
         // A pending live attachment was intentionally omitted until its signed
@@ -20552,6 +20887,8 @@ pub const LinuxServer = struct {
         }
 
         const sender_op = modes.isOperator();
+        const formatting_ok = sender_op or self.remoteHasOverridePrefix(account);
+        if (!formatting_ok and self.world.channelHasExtFlag(channel, .nocolor) and containsIrcFormatting(text)) return .deny;
         if (!sender_op and self.world.channelHasFlag(channel, .no_ctcp) and isBlockableCtcp(text)) return .deny;
         if (is_notice and !sender_op and self.world.channelHasFlag(channel, .no_notice)) return .deny;
         if (min_rank > 0 and modes.rank() < 1) return .deny;
@@ -22405,6 +22742,13 @@ pub const LinuxServer = struct {
             return true;
         }
 
+        // +B NOBOT: a client in user mode +B cannot join. An invite does not
+        // bypass it. A server operator can.
+        if (self.world.channelHasExtFlag(channel, .nobot) and conn.session.umodes.contains(.bot) and !conn.session.isOper()) {
+            if (!quiet) try queueNumeric(conn, .ERR_BANNEDFROMCHAN, &.{channel}, "Cannot join channel (+B) - bots are not allowed");
+            return true;
+        }
+
         // +O oper-only / +A admin-only: server operator gates, checked with the
         // other hard join denials and bypassed by no channel status.
         if (self.world.channelHasFlag(channel, .oper_only) and !conn.session.isOper()) {
@@ -22588,7 +22932,58 @@ pub const LinuxServer = struct {
     }
 
     fn joinOne(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, key: ?[]const u8, depth: u8) !void {
-        return self.joinOneWith(id, conn, channel, key, depth, false, null);
+        // Resolve an OID before joinOneWith mutates World. A miss keeps the
+        // caller's token so the 403 parameter cannot be the real channel name.
+        var oid_name: [256]u8 = undefined;
+        const channel_name = self.resolveJoinChannelOid(id, conn, channel, &oid_name) orelse channel;
+        return self.joinOneWith(id, conn, channel_name, key, depth, false, null);
+    }
+
+    /// `0` plus exactly eight hex digits. `000000000` parses as 0 and is not a channel.
+    fn ircxOidToken(token: []const u8) ?u32 {
+        if (token.len != 9 or token[0] != '0') return null;
+        var value: u32 = 0;
+        for (token[1..9]) |byte| {
+            const digit: u32 = switch (byte) {
+                '0'...'9' => byte - '0',
+                'a'...'f' => byte - 'a' + 10,
+                'A'...'F' => byte - 'A' + 10,
+                else => return null,
+            };
+            value = (value << 4) | digit;
+        }
+        return value;
+    }
+
+    /// Secret, private, and hidden channels are not visible to a non-member.
+    fn channelConcealedFromJoinOid(self: *LinuxServer, name: []const u8) bool {
+        return self.world.channelHasFlag(name, .secret) or
+            self.world.isPrivate(name) or
+            self.world.isHidden(name);
+    }
+
+    /// Canonical name for a JOIN OID, copied into `out`. Null leaves the
+    /// original token on the ordinary name path: unknown, id 0, a duplicate
+    /// id, and an invisible channel the caller may not see all produce the
+    /// same 403. A network operator is `conn.session.isOper()`, not a channel op.
+    fn resolveJoinChannelOid(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        token: []const u8,
+        out: *[256]u8,
+    ) ?[]const u8 {
+        const oid = ircxOidToken(token) orelse return null;
+        if (oid == 0) return null;
+        const name = self.world.channelNameForOid(oid, out) orelse return null;
+        if (self.channelConcealedFromJoinOid(name) and
+            !self.world.isMember(name, worldIdFromClient(id)) and
+            !conn.session.isOper())
+        {
+            @memset(out[0..name.len], 0);
+            return null;
+        }
+        return name;
     }
 
     /// Join implementation with one internal-only exception for IRCX CREATE's
@@ -22955,19 +23350,33 @@ pub const LinuxServer = struct {
             self.replayRewindOnJoin(conn, join_target) catch {};
         }
 
-        // IRCX ONJOIN: deliver the channel's on-join message PROP to the joiner.
+        // IRCX ONJOIN: one PRIVMSG per line, sender is the channel, joiner only.
         if (logical_joined) self.deliverChannelPropMessage(conn, join_target, "ONJOIN");
     }
 
-    /// Deliver a channel's IRCX on-join/on-part message PROP (ONJOIN/ONPART) to a
-    /// single user as a server NOTICE, tagged with the channel. No-op when unset.
-    /// Reuses the live IRCX PROP store (durable + mesh-synced + access-controlled).
+    /// Deliver a channel's IRCX ONJOIN or ONPART text to this client only.
+    /// ONJOIN is a PRIVMSG and ONPART is a NOTICE. The channel name is the
+    /// sender. The stored bytes `\` + `n` start another line. A real control
+    /// byte drops the whole value so a stored CR/LF cannot open a second command.
     fn deliverChannelPropMessage(self: *LinuxServer, conn: *ConnState, channel: []const u8, key: []const u8) void {
+        const command: []const u8 = if (std.mem.eql(u8, key, "ONJOIN"))
+            "PRIVMSG"
+        else if (std.mem.eql(u8, key, "ONPART"))
+            "NOTICE"
+        else
+            return;
         const ev = self.props.getProp(.{ .kind = .channel, .id = channel }, key) catch return;
         if (ev.value.len == 0) return;
-        var buf: [default_reply_bytes]u8 = undefined;
-        const out = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :[{s}] {s}\r\n", .{ self.serverName(), conn.session.displayName(), channel, ev.value }) catch return;
-        emitReplyLine(conn, out) catch {};
+        const nick = conn.session.displayName();
+        if (nick.len == 0 or dispatch.hasControlByte(ev.value) or dispatch.hasControlByte(nick) or dispatch.hasControlByte(channel)) return;
+        var rest = ev.value;
+        while (rest.len > 0) {
+            const cut = nextJoinPartLine(rest);
+            rest = cut.rest;
+            var buf: [default_reply_bytes]u8 = undefined;
+            const out = formatMessage(&buf, channel, command, &.{nick}, cut.line) catch return;
+            emitReplyLine(conn, out) catch {};
+        }
     }
 
     pub fn handlePart(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -23029,7 +23438,7 @@ pub const LinuxServer = struct {
             _ = self.retireMediaPhysicalChannel(logical_id, logical_conn, channel, logical_conn.session.displayName()) catch {};
         }
 
-        // IRCX ONPART: deliver the channel's on-part message PROP to the leaver.
+        // IRCX ONPART: one NOTICE per line, sender is the channel, leaver only.
         self.deliverChannelPropMessage(conn, channel, "ONPART");
 
         // +x AUDITORIUM: a regular member's PART is only relayed to ops/voiced (and
@@ -23232,7 +23641,9 @@ pub const LinuxServer = struct {
             try self.handleUserMode(id, conn, parsed, channel);
             return;
         }
-        if (!self.world.channelExists(channel)) {
+        // A secret, private, or hidden channel the caller is not in is the same
+        // 403 as a missing name. A member still reads and changes modes.
+        if (!self.world.channelExists(channel) or self.channelHiddenFromWhois(channel, worldIdFromClient(id))) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
@@ -23750,7 +24161,7 @@ pub const LinuxServer = struct {
         }
         // Query form: MODE <ownnick>.
         if (parsed.param_count == 1) {
-            var ms_buf: [16]u8 = undefined;
+            var ms_buf: [40]u8 = undefined;
             try queueNumeric(conn, .RPL_UMODEIS, &.{}, conn.session.umodeString(&ms_buf));
             return;
         }
@@ -23823,7 +24234,7 @@ pub const LinuxServer = struct {
         var logical_ids: std.ArrayList(client_model.ClientId) = .empty;
         defer logical_ids.deinit(self.allocator);
         try self.collectAttachedExactTokenClients(tid, tconn, &logical_ids);
-        var applied_buf: [16]u8 = undefined;
+        var applied_buf: [40]u8 = undefined;
         var applied = Buf{ .storage = &applied_buf };
         var adding = true;
         var emitted_sign: u8 = 0;
@@ -23932,6 +24343,12 @@ pub const LinuxServer = struct {
             return;
         } else if (active_override and kicker.rank() < target_mm.rank()) {
             override_kick_bypass = true;
+        }
+        // +K FOUNDERKICK: an ordinary channel op cannot kick. The founder and
+        // a server operator can. Rank already stops an op from kicking the founder.
+        if (self.world.channelHasExtFlag(args.channel, .founderkick) and !kicker.contains(.founder) and !conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "Cannot kick (+K: founder only)");
+            return;
         }
 
         const kicker_prefix = kick.Prefix{ .nick = conn.session.displayName(), .user = conn.session.username(), .host = hostOf(conn) };
@@ -24383,20 +24800,23 @@ pub const LinuxServer = struct {
         } else |_| {}
     }
 
-    /// LISTX [<filter>] — IRCX extended channel list (811/812/816/817). Every
-    /// draft filter term is honored against real channel data: member-count,
-    /// name/topic/subject/language masks, creation-age (`C`) and topic-age (`T`)
-    /// thresholds, and the registered (`R=`) flag. Creation/topic ages are
-    /// computed in wall-clock ms from the channel's `created_unix`/`topic_time`
-    /// (unix seconds); SUBJECT/LANGUAGE come from the IRCX PROP store. The reply
-    /// is capped at `listx_max_results`, emitting 816 when truncated. Enumerates
-    /// the mesh-wide union of channels (local world PLUS remote-only channels),
-    /// so browse-all is identical from any mesh node.
+    /// LISTX [<filter> [<query limit>]] — IRCX extended channel list
+    /// (811/812/816/817). Every draft filter term is honored against real
+    /// channel data: member-count, name/topic/subject/language masks,
+    /// creation-age (`C`) and topic-age (`T`) thresholds, and the registered
+    /// (`R=`) flag. Creation/topic ages are computed in wall-clock ms from the
+    /// channel's `created_unix`/`topic_time` (unix seconds); SUBJECT/LANGUAGE
+    /// come from the IRCX PROP store. A trailing query limit caps the 812
+    /// entries; `0` and a missing limit use `listx_max_results`. Either cap
+    /// emits 816 when another match remains. Enumerates the mesh-wide union of
+    /// channels (local world PLUS remote-only channels), so browse-all is
+    /// identical from any mesh node.
     pub fn handleListx(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const request = listx.parse(parsed.paramSlice()) catch {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"LISTX"}, "Invalid LISTX filter");
             return;
         };
+        const listx_cap = listx.resultCap(request.query_limit, listx_max_results);
         const ctx = listx.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
         // Channels present only on remote peers (no local world record).
         const remote_only = self.remoteOnlyChannelNames() catch &.{};
@@ -24425,7 +24845,7 @@ pub const LinuxServer = struct {
                 .registered = v.registered,
             };
             if (!request.matches(info, now_ms)) continue;
-            if (emitted >= listx_max_results) {
+            if (emitted >= listx_cap) {
                 truncated = true;
                 break;
             }
@@ -24458,7 +24878,7 @@ pub const LinuxServer = struct {
                     .registered = false,
                 };
                 if (!request.matches(info, now_ms)) continue;
-                if (emitted >= listx_max_results) {
+                if (emitted >= listx_cap) {
                     truncated = true;
                     break;
                 }
@@ -24492,6 +24912,10 @@ pub const LinuxServer = struct {
             // Not a local client: try the mesh projection before giving up. A
             // remote member announced by an established S2S peer gets a minimal
             // WHOIS (311/312/313/318) built from converged mesh state.
+            if (self.remoteWhoisFromGuest(target_nick)) |remote| {
+                self.sendRemoteWhois(conn, &sink, remote) catch return;
+                return;
+            }
             if (self.findRemoteWhois(target_nick)) |remote| {
                 self.sendRemoteWhois(conn, &sink, remote) catch return;
                 return;
@@ -24604,6 +25028,10 @@ pub const LinuxServer = struct {
             // enforced on the PRIVMSG/NOTICE path; here we only reflect the mode.
             .regonly_msgs = tconn.session.umodes.contains(.regonly_pm),
             .callerid = tconn.session.umodes.contains(.callerid),
+            .common_chan = tconn.session.umodes.contains(.common_chan),
+            .tls_only_pm = tconn.session.umodes.contains(.tls_only_pm),
+            .no_invite = tconn.session.umodes.contains(.no_invite),
+            .show_idle = !(tconn.session.umodes.contains(.hide_idle) and !conn.session.isOper() and conn != tconn),
             // RPL_WHOISSERVER (312) trailing: this node's configured description
             // (`[network] description`), mirroring the per-server description a
             // remote node gossips for its own users.
@@ -24640,6 +25068,16 @@ pub const LinuxServer = struct {
         };
         whois.writeWhois(&sink, self.serverName(), conn.session.displayName(), subject) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
+        if (tconn.session.umodes.contains(.whois_notify) and conn != tconn and !conn.session.isOper()) {
+            var notice_buf: [256]u8 = undefined;
+            const notice = std.fmt.bufPrint(&notice_buf, ":{s} NOTICE {s} :{s} is doing a /whois on you\r\n", .{
+                self.serverName(),
+                tconn.session.displayName(),
+                conn.session.displayName(),
+            }) catch return;
+            self.deliver(clientIdFromWorld(target_wid.?), notice) catch {};
+            self.armSendIfNeeded(tconn) catch {};
+        }
     }
 
     /// A remote (mesh) WHOIS subject resolved from S2S peer rosters: the nick
@@ -24881,6 +25319,18 @@ pub const LinuxServer = struct {
             .deny_user_on_channel => return queueNumeric(conn, .ERR_USERONCHANNEL, &.{ args.nick, args.channel }, "is already on channel"),
             .deny_chan_op_privs_needed => return queueNumeric(conn, .ERR_CHANOPRIVSNEEDED, &.{args.channel}, "You're not channel operator"),
         }
+        if (self.connFor(clientIdFromWorld(target_wid))) |tconn| {
+            if (tconn.session.umodes.contains(.no_invite) and !conn.session.isOper()) {
+                const same_account = if (conn.session.account()) |sa|
+                    if (tconn.session.account()) |ta| std.ascii.eqlIgnoreCase(sa, ta) else false
+                else
+                    false;
+                if (!same_account) {
+                    try queueNumeric(conn, .ERR_CANTSENDTOUSER, &.{args.nick}, "is in +V mode (not accepting invites)");
+                    return;
+                }
+            }
+        }
         // Record a persistent invite only when a channel gate consumes it: +i,
         // +l, or +j. INVITE delivery itself still succeeds for ordinary channels.
         if (self.world.channelHasFlag(args.channel, .invite_only) or
@@ -25111,10 +25561,12 @@ pub const LinuxServer = struct {
         whowas_reply.emitWhowas(&scratch, self.serverName(), conn.session.displayName(), target, entries[0..n], &sink) catch return;
     }
 
-    /// KNOCK <channel> [:reason] — ask for an invite to a +i channel. Channel
+    /// KNOCK <channel> [:reason] — ask for an invite to a +i or +u channel.
+    /// A missing name and a secret, private, or hidden channel the caller
+    /// cannot see share one 403. Operators are not exempt. The notify path
+    /// is limited to three knocks per connection per 30 seconds (712). Channel
     /// ops get RPL_KNOCK (710); the knocker gets RPL_KNOCKDLVR (711) only after
-    /// a local operator is notified. Refused if the channel is open (713) or
-    /// the knocker is already a member (714).
+    /// a local operator is notified. An open channel is 713. A member is 714.
     pub fn handleKnock(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KNOCK"}, "Not enough parameters");
@@ -25122,11 +25574,13 @@ pub const LinuxServer = struct {
         }
         const channel = parsed.paramSlice()[0];
         const reason = if (parsed.param_count >= 2) parsed.paramSlice()[1] else "wants to join";
-        if (!self.world.channelExists(channel)) {
+        const wid = worldIdFromClient(id);
+        // Same reply for a name that does not exist and a name this caller
+        // must not learn exists. Do not notify, publish, or spend the budget.
+        if (!self.world.channelExists(channel) or self.channelHiddenFromWhois(channel, wid)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
-        const wid = worldIdFromClient(id);
         if (self.world.isMember(channel, wid)) {
             try queueNumeric(conn, .ERR_KNOCKONCHAN, &.{channel}, "You are already on that channel");
             return;
@@ -25138,6 +25592,10 @@ pub const LinuxServer = struct {
         const knock_ext = self.world.channelHasExtFlag(channel, .knock);
         if (!knock_invite and !knock_ext) {
             try queueNumeric(conn, .ERR_CHANOPEN, &.{channel}, "Channel is open");
+            return;
+        }
+        if (!admitKnock(conn, @intCast(self.meshWallMs()))) {
+            try queueNumeric(conn, .ERR_TOOMANYKNOCK, &.{channel}, "Too many KNOCKs for this channel");
             return;
         }
 
@@ -25163,6 +25621,22 @@ pub const LinuxServer = struct {
         // MEMBER KNOCK event: a non-member asked to enter a gated channel. Lets
         // MEMBER subscribers (and legacy oper-action opers) see knocks network-wide.
         try self.publishMemberEvent("KNOCK", channel, conn.session.displayName(), reason);
+    }
+
+    /// Three delivered knocks per connection inside a 30-second window.
+    /// Called only on the path that would notify operators.
+    fn admitKnock(conn: *ConnState, now_ms: i64) bool {
+        const window_ms: i64 = 30_000;
+        const budget: u8 = 3;
+        const elapsed = now_ms - conn.knock_window_start_ms;
+        if (conn.knock_count == 0 or elapsed < 0 or elapsed >= window_ms) {
+            conn.knock_window_start_ms = now_ms;
+            conn.knock_count = 1;
+            return true;
+        }
+        if (conn.knock_count >= budget) return false;
+        conn.knock_count += 1;
+        return true;
     }
 
     /// RENAME <#old> <#new> [:reason] — IRCv3 draft/channel-rename. A channel
@@ -26898,6 +27372,24 @@ pub const LinuxServer = struct {
         return secs * 1000;
     }
 
+    /// Draft IRCX LAG, in milliseconds. Only a stored `1` or `2` delays anyone.
+    /// `0`, a missing property, and any other spelling add no delay.
+    fn channelLagGapMs(self: *LinuxServer, channel: []const u8) u64 {
+        if (channel.len == 0 or (channel[0] != '#' and channel[0] != '&')) return 0;
+        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = channel };
+        const ev = self.props.getProp(entity, "LAG") catch return 0;
+        const secs: u64 = ircx_prop_store.lagSeconds(ev.value) orelse 0;
+        return secs * 1000;
+    }
+
+    /// Text for a send refused by SLOWMODE, or by draft LAG when SLOWMODE does
+    /// not apply to this sender.
+    fn channelSendGapText(self: *LinuxServer, channel: []const u8, slowmode_exempt: bool) []const u8 {
+        const slow = if (slowmode_exempt) 0 else self.channelSlowmodeGapMs(channel);
+        if (slow == 0 and self.channelLagGapMs(channel) != 0) return "Cannot send to channel (lag)";
+        return "Cannot send to channel (slowmode)";
+    }
+
     /// Voice and channel operators skip the gap unless SLOWVOICE is "0".
     /// Absent and "1" keep the exemption. Network operators are always exempt.
     fn channelSlowmodeVoiceExempt(self: *LinuxServer, channel: []const u8) bool {
@@ -26941,11 +27433,15 @@ pub const LinuxServer = struct {
         return true;
     }
 
-    /// True when this send must be refused. An allowed, non-exempt send records
-    /// the timer. A refusal leaves the previous timestamp where it was.
+    /// True when this send must be refused. An allowed send records the timer.
+    /// A refusal leaves the previous timestamp where it was.
+    ///
+    /// `exempt` skips SLOWMODE (network operators, and voice when SLOWVOICE
+    /// allows it). Draft LAG still spaces every member, including those
+    /// exemptions. When both are set, the longer gap wins for a non-exempt sender.
     fn slowmodeDenies(self: *LinuxServer, channel: []const u8, nick: []const u8, exempt: bool) bool {
-        if (exempt) return false;
-        const gap_ms = self.channelSlowmodeGapMs(channel);
+        const slow = if (exempt) 0 else self.channelSlowmodeGapMs(channel);
+        const gap_ms = @max(slow, self.channelLagGapMs(channel));
         if (gap_ms == 0) return false;
         if (self.slowmodeTooSoon(channel, nick, gap_ms)) return true;
         return !self.noteSlowmodeSend(channel, nick);
@@ -28375,6 +28871,7 @@ pub const LinuxServer = struct {
                 error.StorePoisoned => return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery"),
                 else => return err,
             };
+            self.recordAccountLogin(conn, account, .recovery, conn.session.tls_certfp orelse "");
             try channelNotice(conn, "RECOVERYCODES: login ok — that code is now spent", .{});
             return;
         }
@@ -36026,6 +36523,7 @@ pub const LinuxServer = struct {
         conn.tls_kernel_prefix_remaining = ts.kernel_tx_prefix_remaining;
         conn.tls = t;
         conn.is_tls = true;
+        conn.session.password_sasl_allowed = true;
         conn.tls_tx_offloaded = ts.tx_offloaded;
         conn.tls_rx_offloaded = ts.rx_offloaded;
         if (ts.certfp.len != 0) {
@@ -36932,7 +37430,7 @@ pub const LinuxServer = struct {
         if (req.changes.len == 0) {
             // Query: collect active mode letters (base + IRCX-extended) as names.
             const ctx = ircx_modex.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
-            var names: [32][]const u8 = undefined;
+            var names: [48][]const u8 = undefined;
             var nn: usize = 0;
             var flags_buf: [16]u8 = undefined;
             const base = self.world.channelModeString(channel, &flags_buf);
@@ -40221,6 +40719,14 @@ pub const LinuxServer = struct {
             if (secs > slowmode_max_secs) return .bad_value;
             return .not_handled;
         }
+        if (std.ascii.eqlIgnoreCase(key, "LAG")) {
+            // Draft LAG: 0, 1, or 2 seconds between one member's channel messages.
+            // Delete clears. The value stays in the generic prop store. Unlike
+            // SLOWMODE, the delay applies to voice and channel operators too.
+            if (deleting) return .not_handled;
+            if (ircx_prop_store.lagSeconds(value) == null) return .bad_value;
+            return .not_handled;
+        }
         if (std.ascii.eqlIgnoreCase(key, "SLOWVOICE")) {
             // "0" makes voice and channel operators wait out the gap. "1" or
             // delete keeps them exempt. Network operators are always exempt.
@@ -40826,10 +41332,11 @@ pub const LinuxServer = struct {
 
     fn ircxAuthPackageList(conn: *ConnState, out: []u8) []const u8 {
         var len: usize = 0;
-        if (conn.session.sasl_plain != null) appendSaslInfoMech(out, &len, "PLAIN") catch return out[0..len];
-        if (conn.session.sasl_scram256 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(out, &len, "SCRAM-SHA-256") catch return out[0..len];
-        if (conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(out, &len, "SCRAM-SHA-512") catch return out[0..len];
-        if (conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0 and conn.session.tls_exporter != null) appendSaslInfoMech(out, &len, "SCRAM-SHA-512-PLUS") catch return out[0..len];
+        const password_ok = conn.session.password_sasl_allowed;
+        if (password_ok and conn.session.sasl_plain != null) appendSaslInfoMech(out, &len, "PLAIN") catch return out[0..len];
+        if (password_ok and conn.session.sasl_scram256 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(out, &len, "SCRAM-SHA-256") catch return out[0..len];
+        if (password_ok and conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(out, &len, "SCRAM-SHA-512") catch return out[0..len];
+        if (password_ok and conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0 and conn.session.tls_exporter != null) appendSaslInfoMech(out, &len, "SCRAM-SHA-512-PLUS") catch return out[0..len];
         if (conn.session.sasl_external != null) appendSaslInfoMech(out, &len, "EXTERNAL") catch return out[0..len];
         if (conn.session.sasl_session_token != null) appendSaslInfoMech(out, &len, "SESSION-TOKEN") catch return out[0..len];
         if (conn.session.sasl_oauthbearer != null) appendSaslInfoMech(out, &len, "OAUTHBEARER") catch return out[0..len];
@@ -40999,6 +41506,8 @@ pub const LinuxServer = struct {
                 if (!std.ascii.eqlIgnoreCase(old, account)) _ = self.removeTrackedSession(old, monitorIdFromClient(id));
             }
             loginSession(conn, account);
+            if (loginMechanismFromIrcx(package)) |mech|
+                self.recordAccountLogin(conn, account, mech, conn.session.tls_certfp orelse "");
             conn.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
             self.restoreAccountMetadata(conn, account);
             self.restoreAccountSilence(conn, account);
@@ -41050,6 +41559,7 @@ pub const LinuxServer = struct {
     /// enables IRCX mode for the session; `ISIRCX` only queries. Both reply with
     /// RPL_IRCX (800): `<state> <version> <package-list> <maxmsg> <option-list>`.
     /// Onyx Server advertises live SASL-backed IRCX AUTH packages for this session.
+    /// The option list is `OID=visible` because JOIN accepts a visibility-safe object id.
     pub fn handleIrcx(self: *LinuxServer, conn: *ConnState, enable: bool) !void {
         _ = self;
         if (enable) conn.ircx = true;
@@ -41057,7 +41567,7 @@ pub const LinuxServer = struct {
         var packages_buf: [128]u8 = undefined;
         const packages = ircxAuthPackageList(conn, &packages_buf);
         // version 0; package-list = advertised SASL-backed AUTH packages; maxmsg 512.
-        try queueNumeric(conn, .RPL_IRCX, &.{ state, "0", packages, "512" }, "*");
+        try queueNumeric(conn, .RPL_IRCX, &.{ state, "0", packages, "512" }, "OID=visible");
     }
 
     pub fn handleIrcxAuth(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -41080,6 +41590,12 @@ pub const LinuxServer = struct {
             try self.ircxAuthUnknownPackage(conn, req.package_raw);
             return;
         };
+        if (ircxAuthIsKnowledgeFactor(req.package) and !conn.session.password_sasl_allowed) {
+            conn.session.sasl_router = null;
+            conn.session.sasl_pending = null;
+            try self.ircxAuthFailed(conn, req.package.token());
+            return;
+        }
         if (req.sequence == .abort) {
             conn.session.sasl_router = null;
             conn.session.sasl_pending = null;
@@ -41168,11 +41684,56 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// A client DATA prefix is always `nick!user@host`. The bare server name
+    /// has no `!` and is reserved for a line this process authors.
+    fn clientShapedDataPrefix(prefix: []const u8) bool {
+        return std.mem.indexOfScalar(u8, prefix, '!') != null;
+    }
+
+    /// Bare server name safe to place in an IRC prefix. A separator would let
+    /// the origin be parsed as a client, or split the line.
+    fn serverDataOrigin(self: *const LinuxServer) ?[]const u8 {
+        const name = self.serverName();
+        if (name.len == 0) return null;
+        for (name) |byte| {
+            if (byte <= 0x20 or byte == 0x7f or byte == '!' or byte == '@' or byte == ':') return null;
+        }
+        return name;
+    }
+
+    /// Deliver a DATA line this server authored. The prefix is the bare server
+    /// name. Client DATA, REQUEST, and REPLY keep `nick!user@host` in
+    /// `handleData`. This path does not relay: a mesh DATA prefix must stay
+    /// `nick!user@host`, and copying the server name into that shape would
+    /// forge a client.
+    fn deliverServerOriginData(
+        self: *LinuxServer,
+        target: []const u8,
+        tag: []const u8,
+        message: []const u8,
+    ) void {
+        const origin = self.serverDataOrigin() orelse return;
+        if (!validDataTag(tag) or message.len == 0) return;
+        if (dispatch.hasControlByte(message)) return;
+        for (target) |byte| {
+            if (byte <= 0x20 or byte == 0x7f or byte == ':') return;
+        }
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const line = formatMessage(&msg_buf, origin, "DATA", &.{ target, tag }, message) catch return;
+        if (world_model.isChannelName(target)) {
+            if (!self.world.channelExists(target)) return;
+            self.broadcastChannel(target, line, null) catch {};
+            return;
+        }
+        const rwid = self.world.findNick(target) orelse return;
+        self.deliver(clientIdFromWorld(rwid), line) catch {};
+    }
+
     /// DATA / REQUEST / REPLY <target> <tag> :<message> — IRCX typed directed
     /// messaging. Tag rules: [A-z][A-z0-9.]{0,14}; reserved prefixes SYS/ADM need
-    /// operator, OWN/HST need channel owner/host on a channel target. Relays
-    /// `:sender <CMD> <target> <tag> :<message>` to the target (a nick, or all
-    /// members of a channel).
+    /// operator, OWN/HST need channel owner/host on a channel target. The
+    /// rendered prefix is the client's `nick!user@host`. A server-authored DATA
+    /// line uses the bare server name instead, from `deliverServerOriginData`.
     pub fn handleData(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (self.senderSilenced(conn)) return;
         if (parsed.param_count < 3) {
@@ -41217,7 +41778,10 @@ pub const LinuxServer = struct {
         }
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
-        const line = formatMessage(&msg_buf, try clientPrefix(conn, &prefix_buf), parsed.command, &.{ target, tag }, message) catch return;
+        const speaker = clientPrefix(conn, &prefix_buf) catch return;
+        // A client cannot occupy the server origin. That prefix has no `!`.
+        if (!clientShapedDataPrefix(speaker)) return;
+        const line = formatMessage(&msg_buf, speaker, parsed.command, &.{ target, tag }, message) catch return;
         if (is_chan) {
             if (!self.world.channelExists(chan)) {
                 try queueNumeric(conn, .ERR_NOTONCHANNEL, &.{target}, "You're not on that channel");
@@ -41252,13 +41816,13 @@ pub const LinuxServer = struct {
             const event_hlc = self.nextMeshHlc();
             var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
             defer delivery_ids.deinit(self.allocator);
-            self.collectChannelDeliveryIds(chan, min_rank, null, null, &delivery_ids) catch {
-                try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
-                return;
-            };
             var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
             defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
             if (self.authoredRelayV2Configured()) {
+                self.collectChannelDeliveryIds(chan, min_rank, null, null, &delivery_ids, .none) catch {
+                    try self.failReply(conn, parsed.command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                    return;
+                };
                 accepted_v2 = self.admitAuthoredRelayV2(
                     dataVerbV2(parsed.command) orelse return,
                     chan,
@@ -41615,9 +42179,9 @@ pub const LinuxServer = struct {
     }
 
     /// WHISPER <channel> <nick[,nick...]> :<text> — IRCX channel-scoped private
-    /// message. The sender must be on the channel; each recipient is delivered a
-    /// `:sender WHISPER <channel> <nick> :<text>` line only if also on the channel
-    /// (ERR_NOSUCHNICK 401 / ERR_NOTONCHANNEL 442 per failing recipient).
+    /// message. The sender must be on the channel. A local recipient who is not
+    /// a member, or whom +x hides from this sender, gets 441. A remote nick the
+    /// sender cannot see gets the same 401 as a nick the roster does not list.
     pub fn handleWhisper(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         var recipient_storage: [whisper.DEFAULT_MAX_RECIPIENTS][]const u8 = undefined;
         const args = whisper.parseWhisperArgs(parsed.paramSlice(), &recipient_storage) catch {
@@ -41646,14 +42210,19 @@ pub const LinuxServer = struct {
             const rwid = self.world.findNick(nick) orelse {
                 // Not a local nick: try the mesh. The recipient must be a member
                 // of THIS shared channel on a remote node (WHISPER's invariant).
-                // We scope the relay to the owning peer (never flood the mesh);
-                // a genuinely-unknown nick falls back to ERR_NOSUCHNICK.
-                if (!self.relayWhisperRemote(id, conn, args.channel, nick, args.text)) {
+                // A +x member this sender cannot see gets the same 401 as a nick
+                // the roster does not list, and the relay is not attempted.
+                // 441 here would admit that the nick is in the channel.
+                if (self.auditoriumHidesWhisper(args.channel, sender.nick, nick) or
+                    !self.relayWhisperRemote(id, conn, args.channel, nick, args.text))
+                {
                     try queueNumeric(conn, .ERR_NOSUCHNICK, &.{nick}, "No such nick");
                 }
                 continue;
             };
-            if (!self.world.isMember(args.channel, rwid)) {
+            if (!self.world.isMember(args.channel, rwid) or
+                self.auditoriumHidesWhisper(args.channel, sender.nick, nick))
+            {
                 try queueNumeric(conn, .ERR_USERNOTINCHANNEL, &.{ nick, args.channel }, "They aren't on that channel");
                 continue;
             }
@@ -42037,6 +42606,9 @@ pub const LinuxServer = struct {
         } else {
             try self.joinOneWith(id, conn, req.channel, null, 0, false, null);
         }
+        // Creator only, and only after CREATE's join path returns. A null OID
+        // skips the line. Ordinary JOIN never reaches this call.
+        self.emitCreateOidReply(conn, req.channel);
         if (req.clone_from != null) {
             // joinOne suppresses the founder-MODE broadcast on a pre-existing
             // (cloned) channel; announce the inherited channel modes explicitly so
@@ -42057,6 +42629,18 @@ pub const LinuxServer = struct {
             synth.param_count = 2;
             self.handleMode(id, conn, &synth) catch {};
         }
+    }
+
+    /// `:{server} CREATE <channel> <oid>` to the creating connection only.
+    /// OID spelling matches PROP OID (`0` + 8 lowercase hex). Null or unset skips.
+    fn emitCreateOidReply(self: *LinuxServer, conn: *ConnState, channel: []const u8) void {
+        const oid = self.world.channelOid(channel) orelse return;
+        if (oid == 0) return;
+        var oid_buf: [9]u8 = undefined;
+        const oid_text = std.fmt.bufPrint(&oid_buf, "0{x:0>8}", .{oid}) catch return;
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const msg = formatMessage(&line_buf, self.serverName(), "CREATE", &.{ channel, oid_text }, null) catch return;
+        emitReplyLine(conn, msg) catch {};
     }
 
     /// Whether `conn` may mutate metadata on `target`: own nick (case-insensitive)
@@ -42968,7 +43552,8 @@ pub const LinuxServer = struct {
         }
         const newnick = parsed.paramSlice()[0];
         if (!isValidNick(newnick)) {
-            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{newnick}, "Erroneous nickname");
+            const shown = if (ident_utf8.containsIdentifierSpoof(newnick)) "*" else newnick;
+            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{shown}, "Erroneous nickname");
             return;
         }
         if (self.registeredNickRequiresAuthentication(conn, newnick)) {
@@ -44430,6 +45015,136 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, .ERR_PASSWDMISMATCH, &.{}, msg);
     }
 
+    /// One successful sign-in. Password checks (recovery-code generate/clear,
+    /// SASL PLAIN verify) stay on `identifyAccount` and write nothing.
+    /// `at_ms == 0` is stamped by the services clock. A new certificate prefix
+    /// or passkey tells the account's other live sessions. Notice failure
+    /// does not fail the login, and the full certificate is never stored.
+    fn recordAccountLogin(
+        self: *LinuxServer,
+        conn: *ConnState,
+        account: []const u8,
+        mechanism: services_mod.LoginMechanism,
+        prefix_src: []const u8,
+    ) void {
+        const tls_on = conn.is_tls or conn.session.tls_cipher != null or conn.session.tls_exporter != null or conn.session.tls_certfp != null;
+        self.auditLogin(&conn.session, account, loginEntry(tls_on, mechanism, prefix_src));
+    }
+
+    fn recordSaslLogin(
+        ptr: *anyopaque,
+        session: *dispatch.ClientSession,
+        account: []const u8,
+        mechanism: sasl.Mechanism,
+        tls_on: bool,
+        fingerprint: []const u8,
+    ) void {
+        const mapped: services_mod.LoginMechanism = switch (mechanism) {
+            .plain => .password,
+            .scram_sha_256, .scram_sha_512, .scram_sha_512_plus => .scram,
+            .external => .external,
+            .oauthbearer => .oauth,
+            .session_token => .token,
+            .anonymous => return,
+        };
+        const self: *LinuxServer = @ptrCast(@alignCast(ptr));
+        self.auditLogin(session, account, loginEntry(tls_on, mapped, fingerprint));
+    }
+
+    fn loginMechanismFromIrcx(package: ircx_auth.Package) ?services_mod.LoginMechanism {
+        return switch (package) {
+            .plain, .gatekeeper, .gatekeeper_passport => .password,
+            .scram_sha_256, .scram_sha_512, .scram_sha_512_plus => .scram,
+            .external => .external,
+            .oauthbearer => .oauth,
+            .session_token => .token,
+            .anon, .anonymous => null,
+        };
+    }
+
+    fn loginEntry(tls_on: bool, mechanism: services_mod.LoginMechanism, prefix_src: []const u8) services_mod.LoginAuditEntry {
+        var entry = services_mod.LoginAuditEntry{
+            .mechanism = mechanism,
+            .tls = if (tls_on) .tls else .clear,
+        };
+        const n = @min(prefix_src.len, entry.certfp_prefix.len);
+        if (n > 0) {
+            @memcpy(entry.certfp_prefix[0..n], prefix_src[0..n]);
+            entry.certfp_len = @intCast(n);
+        }
+        return entry;
+    }
+
+    fn auditLogin(
+        self: *LinuxServer,
+        except_session: *const dispatch.ClientSession,
+        account: []const u8,
+        entry: services_mod.LoginAuditEntry,
+    ) void {
+        const svc = self.account_services orelse return;
+        var prior_buf: [services_mod.login_audit_cap]services_mod.LoginAuditEntry = undefined;
+        const prior = svc.copyLoginAudit(account, &prior_buf) catch null;
+        const fresh = if (prior) |rows| loginPrefixIsNew(rows, entry) else false;
+        svc.appendLoginAudit(account, entry) catch {};
+        if (fresh) self.notifyNewSignIn(account, entry.mechanism, except_session);
+    }
+
+    /// A passkey is new when no earlier passkey row carries this prefix.
+    /// Any other sign-in is new when no row carries this certificate prefix.
+    /// An empty prefix is not a device identity, so it never notifies.
+    fn loginPrefixIsNew(rows: []const services_mod.LoginAuditEntry, entry: services_mod.LoginAuditEntry) bool {
+        if (entry.certfp_len == 0) return false;
+        const n: usize = entry.certfp_len;
+        const prefix = entry.certfp_prefix[0..n];
+        if (entry.mechanism == .passkey) {
+            for (rows) |row| {
+                if (row.mechanism != .passkey or row.certfp_len != entry.certfp_len) continue;
+                if (std.mem.eql(u8, row.certfp_prefix[0..n], prefix)) return false;
+            }
+            return true;
+        }
+        for (rows) |row| {
+            if (row.certfp_len != entry.certfp_len) continue;
+            if (std.mem.eql(u8, row.certfp_prefix[0..n], prefix)) return false;
+        }
+        return true;
+    }
+
+    fn notifyNewSignIn(
+        self: *LinuxServer,
+        account: []const u8,
+        mechanism: services_mod.LoginMechanism,
+        except_session: *const dispatch.ClientSession,
+    ) void {
+        const label = mechanism.label();
+        var body: [96]u8 = undefined;
+        const text = std.fmt.bufPrint(&body, "New sign-in on your account ({s}).", .{label}) catch return;
+        for (self.reactors) |*reactor| {
+            var slot_index: usize = 0;
+            while (slot_index < reactor.clients.slots.items.len) : (slot_index += 1) {
+                const slot = &reactor.clients.slots.items[slot_index];
+                if (!slot.occupied) continue;
+                if (&slot.value.session == except_session) continue;
+                const live = slot.value.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(live, account)) continue;
+                const nick_src = slot.value.session.displayName();
+                if (nick_src.len == 0 or std.mem.indexOfAny(u8, nick_src, "\r\n\x00") != null) continue;
+                const id = slotClientId(reactor, slot_index, slot.gen);
+                self.deliverNoticeTo(id, &slot.value, text) catch {};
+            }
+        }
+    }
+
+    fn loginPrefixText(entry: services_mod.LoginAuditEntry, out: *[8]u8) []const u8 {
+        if (entry.certfp_len == 0) return "-";
+        const n: usize = @min(@as(usize, entry.certfp_len), out.len);
+        for (0..n) |i| {
+            const b = entry.certfp_prefix[i];
+            out[i] = if (b >= 0x20 and b < 0x7f) b else '-';
+        }
+        return out[0..n];
+    }
+
     /// `IDENTIFY <account> <password>` — authenticate to an existing account.
     pub fn handleIdentify(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!self.authenticationAvailable())
@@ -44462,6 +45177,7 @@ pub const LinuxServer = struct {
         }
         if (!self.authenticationAvailable())
             return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
+        self.recordAccountLogin(conn, account, .password, conn.session.tls_certfp orelse "");
         self.loginRecordSuccess(conn, account);
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
         _ = self.clearOperAuthorityTransition(
@@ -44869,8 +45585,14 @@ pub const LinuxServer = struct {
     }
 
     /// `ACCOUNTINFO [account]` — report account name + flags (self if omitted).
+    /// `ACCOUNTINFO LOGINS [account]` lists the capped sign-in ring. The word
+    /// LOGINS is this subcommand, so an account with that name is
+    /// `ACCOUNTINFO LOGINS logins`. Another account's rows require an operator.
     pub fn handleAccountInfo(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         const svc = self.account_services orelse return self.failReply(conn, "ACCOUNTINFO", "TEMPORARILY_UNAVAILABLE", "Accounts are unavailable");
+        if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "LOGINS")) {
+            return self.handleAccountLogins(conn, svc, parsed);
+        }
         const target = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
             parsed.paramSlice()[0]
         else
@@ -44886,7 +45608,7 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(
             &buf,
-            ":{s} NOTICE {s} :account={s} flags={d} suspended={} forbidden={} noexpire={}\r\n",
+            ":{s} NOTICE {s} :account={s} flags={d} suspended={} forbidden={} noexpire={} passkey_only={}\r\n",
             .{
                 self.serverName(),
                 conn.session.displayName(),
@@ -44895,9 +45617,47 @@ pub const LinuxServer = struct {
                 (info.flags & services_mod.account_flag_suspended) != 0,
                 (info.flags & services_mod.account_flag_forbidden) != 0,
                 (info.flags & services_mod.account_flag_noexpire) != 0,
+                (info.flags & services_mod.account_flag_passkey_only) != 0,
             },
         ) catch return;
         try appendToConn(conn, line);
+    }
+
+    fn handleAccountLogins(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services, parsed: *const irc_line.LineView) !void {
+        const requested = if (parsed.param_count >= 2 and parsed.paramSlice()[1].len != 0)
+            parsed.paramSlice()[1]
+        else
+            null;
+        const self_account = conn.session.account();
+        const target = requested orelse (self_account orelse {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCOUNTINFO"}, "Not logged in; specify an account");
+            return;
+        });
+        const own = if (self_account) |mine| std.ascii.eqlIgnoreCase(mine, target) else false;
+        if (!own and !conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied");
+            return;
+        }
+        var rows: [services_mod.login_audit_cap]services_mod.LoginAuditEntry = undefined;
+        const listed = svc.copyLoginAudit(target, &rows) catch |err| switch (err) {
+            error.InvalidName => return self.failReply(conn, "ACCOUNTINFO", "BAD_ACCOUNT", "Invalid account name"),
+            else => return self.failReply(conn, "ACCOUNTINFO", "TEMPORARILY_UNAVAILABLE", "Could not read logins"),
+        };
+        if (listed.len == 0) {
+            try self.noticeTo(conn, "LOGINS: none");
+            return;
+        }
+        for (listed) |row| {
+            var prefix_buf: [8]u8 = undefined;
+            const prefix = loginPrefixText(row, &prefix_buf);
+            var body: [160]u8 = undefined;
+            const text = std.fmt.bufPrint(
+                &body,
+                "LOGINS: time={d} mechanism={s} tls={s} prefix={s}",
+                .{ row.at_ms, row.mechanism.label(), row.tls.label(), prefix },
+            ) catch continue;
+            try self.noticeTo(conn, text);
+        }
     }
 
     /// `ACCOUNT <SUSPEND|UNSUSPEND|FORBID|UNFORBID|NOEXPIRE|INFO> <account>`
@@ -44999,11 +45759,12 @@ pub const LinuxServer = struct {
     pub fn handleSaslInfo(self: *LinuxServer, conn: *ConnState) !void {
         var mech_buf: [128]u8 = undefined;
         var mech_len: usize = 0;
-        if (conn.session.sasl_plain != null) appendSaslInfoMech(&mech_buf, &mech_len, "PLAIN") catch return;
+        const password_ok = conn.session.password_sasl_allowed;
+        if (password_ok and conn.session.sasl_plain != null) appendSaslInfoMech(&mech_buf, &mech_len, "PLAIN") catch return;
         if (conn.session.sasl_external != null) appendSaslInfoMech(&mech_buf, &mech_len, "EXTERNAL") catch return;
-        if (conn.session.sasl_scram256 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-256") catch return;
-        if (conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-512") catch return;
-        if (conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0 and conn.session.tls_exporter != null) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-512-PLUS") catch return;
+        if (password_ok and conn.session.sasl_scram256 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-256") catch return;
+        if (password_ok and conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-512") catch return;
+        if (password_ok and conn.session.sasl_scram512 != null and conn.session.sasl_server_nonce.len != 0 and conn.session.tls_exporter != null) appendSaslInfoMech(&mech_buf, &mech_len, "SCRAM-SHA-512-PLUS") catch return;
         if (conn.session.sasl_session_token != null) appendSaslInfoMech(&mech_buf, &mech_len, "SESSION-TOKEN") catch return;
         if (conn.session.sasl_oauthbearer != null) appendSaslInfoMech(&mech_buf, &mech_len, "OAUTHBEARER") catch return;
         if (conn.session.sasl_allow_anonymous) appendSaslInfoMech(&mech_buf, &mech_len, "ANONYMOUS") catch return;
@@ -46739,7 +47500,7 @@ pub const LinuxServer = struct {
             return self.failReply(conn, "WEBAUTHN", "NOT_CONFIGURED", "Passkey login is not configured on this network");
         const p = parsed.paramSlice();
         if (p.len == 0)
-            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|RENAME|STATUS>");
+            return self.failReply(conn, "WEBAUTHN", "NEED_MORE_PARAMS", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|RENAME|STATUS|LOCK>");
         const sub = p[0];
 
         if (std.ascii.eqlIgnoreCase(sub, "STATUS")) return self.webauthnStatus(conn, svc);
@@ -46750,7 +47511,21 @@ pub const LinuxServer = struct {
         if (std.ascii.eqlIgnoreCase(sub, "LIST")) return self.webauthnListCmd(conn, svc);
         if (std.ascii.eqlIgnoreCase(sub, "REMOVE")) return self.webauthnRemove(conn, svc, p);
         if (std.ascii.eqlIgnoreCase(sub, "RENAME")) return self.webauthnRename(conn, svc, p);
-        return self.failReply(conn, "WEBAUTHN", "INVALID_SUBCOMMAND", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|RENAME|STATUS>");
+        if (std.ascii.eqlIgnoreCase(sub, "LOCK")) return self.webauthnLock(conn, svc);
+        return self.failReply(conn, "WEBAUTHN", "INVALID_SUBCOMMAND", "Usage: WEBAUTHN <REGISTER|REGISTER-FINISH|AUTH|AUTH-FINISH|LIST|REMOVE|RENAME|STATUS|LOCK>");
+    }
+
+    /// `WEBAUTHN LOCK` — refuse password, PLAIN, and SCRAM until a recovery
+    /// code replaces the password. Requires a passkey that is already stored.
+    fn webauthnLock(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services) !void {
+        const account = conn.session.account() orelse
+            return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in before locking out password login");
+        var scratch: [1024]u8 = undefined;
+        svc.enablePasskeyOnly(account, &scratch) catch |err| switch (err) {
+            error.Forbidden => return self.failReply(conn, "WEBAUTHN", "PASSKEY_REQUIRED", "Bind a passkey before locking out password login"),
+            else => return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Could not lock password login"),
+        };
+        try self.webauthnReply(conn, "LOCKED :password login disabled");
     }
 
     /// Fill `out` with a fresh CSPRNG challenge. Returns false (fail-closed) when
@@ -47060,6 +47835,7 @@ pub const LinuxServer = struct {
             error.StorePoisoned => return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery"),
             else => return err,
         };
+        self.recordAccountLogin(conn, cred.account(), .passkey, cred_id_b64);
         var b: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&b, ":{s} NOTICE {s} :You are now identified as {s}\r\n", .{ self.serverName(), conn.session.displayName(), conn.session.account() orelse target_account }) catch return;
         try emitReplyLine(conn, line);
@@ -53801,6 +54577,52 @@ pub const LinuxServer = struct {
         return (self.media_physical_attachments.items[idx].kind_bits & mediaKindBit(kind)) != 0;
     }
 
+    const MediaRoutingChannelDeparture = enum { none, kept, cleared };
+
+    /// Retire this connection's routing membership for one channel. PART, KICK,
+    /// and disconnect already drop the nick-wide room; the physical member row
+    /// has to leave in that same cut, or shutdown sees a member with no room.
+    fn publishMediaRoutingChannelDeparture(self: *LinuxServer, id: client_model.ClientId, channel: []const u8) !MediaRoutingChannelDeparture {
+        const opaque_owner = self.media_routing_owner orelse return .none;
+        const domain = mediaRoutingBacking(opaque_owner).domain;
+        const departure = (try domain.prepareChannelDeparture(channel, id)) orelse return .none;
+        defer departure.deinit();
+        if (departure.isTerminal()) return error.BadState;
+        const native = try self.native_media.prepareDeparture(domain, departure);
+        defer native.deinit();
+        const webrtc = try self.media_plane.prepareDeparture(domain, departure);
+        defer webrtc.deinit();
+        const rooms = try self.media_rooms.prepareDeparture(departure, channel);
+        defer rooms.deinit();
+        const transition = rooms.transition();
+        const cleared = transition.had_member and !transition.display_remains;
+        const Cut = struct {
+            domain: *media_routing.Domain,
+            departure: *media_routing.PreparedDeparture,
+            native: *native_media_mod.PreparedNativeDeparture,
+            webrtc: *media_plane_mod.PreparedWebrtcDeparture,
+            rooms: *media_room.PreparedRoomDeparture,
+            fn run(scope: *media_routing.Locked, ctx: @This()) !void {
+                try ctx.departure.validateLocked(ctx.domain, scope);
+                try ctx.native.validateLocked(ctx.domain, scope, ctx.departure);
+                try ctx.webrtc.validateLocked(ctx.domain, scope, ctx.departure);
+                try ctx.rooms.validateLocked(ctx.domain, scope, ctx.departure);
+                ctx.native.commitLocked(ctx.domain, scope);
+                ctx.webrtc.commitLocked(ctx.domain, scope);
+                ctx.rooms.commitLocked(ctx.domain, scope);
+                ctx.departure.commitLocked(ctx.domain, scope);
+            }
+        };
+        try domain.withLocked(Cut{
+            .domain = domain,
+            .departure = departure,
+            .native = native,
+            .webrtc = webrtc,
+            .rooms = rooms,
+        }, Cut.run);
+        return if (cleared) .cleared else .kept;
+    }
+
     /// Retire one physical connection's media authority for a channel while the
     /// old World membership and nick are still available for Event Spine routing.
     /// A surviving same-nick publisher gets attachment-granular crypto teardown;
@@ -53812,6 +54634,10 @@ pub const LinuxServer = struct {
         channel: []const u8,
         nick: []const u8,
     ) !MediaPhysicalRemoval {
+        const routing = self.publishMediaRoutingChannelDeparture(id, channel) catch |err| blk: {
+            srvLog("onyx-server: media channel departure failed ({s})\n", .{@errorName(err)});
+            break :blk MediaRoutingChannelDeparture.none;
+        };
         const detached_attachment: ?[media_e2ee_attachment_bytes]u8 = if (conn.media_e2ee_attachment_bound)
             conn.media_e2ee_attachment
         else
@@ -53824,7 +54650,8 @@ pub const LinuxServer = struct {
                 self.native_media.unregister(channel, nick);
                 self.bridgeUnregister(channel, nick);
                 self.media_rooms.clearParticipantProfile(channel, nick);
-                if (self.media_rooms.leaveAll(channel, nick)) {
+                const left = self.media_rooms.leaveAll(channel, nick);
+                if (left or routing == .cleared) {
                     try self.broadcastMediaEvent(channel, "LEAVE", nick, "");
                     if (self.media_rooms.room(channel) == null) _ = self.transcript.clearChannel(channel);
                 }
@@ -54168,6 +54995,10 @@ pub const LinuxServer = struct {
         while (it.next()) |entry| {
             if (!entry.value_ptr.members.contains(worldIdFromClient(id))) continue;
             const removal = self.removeMediaPhysicalAttachment(id, entry.key_ptr.*, nick);
+            const routing = self.publishMediaRoutingChannelDeparture(id, entry.key_ptr.*) catch |err| blk: {
+                srvLog("onyx-server: media channel departure failed ({s})\n", .{@errorName(err)});
+                break :blk MediaRoutingChannelDeparture.none;
+            };
             if (removal == .remaining) {
                 if (detached_attachment) |attachment|
                     self.publishMediaE2eeDetach(entry.key_ptr.*, nick, attachment) catch {};
@@ -54178,7 +55009,8 @@ pub const LinuxServer = struct {
             self.native_media.unregister(entry.key_ptr.*, nick);
             self.bridgeUnregister(entry.key_ptr.*, nick);
             self.media_rooms.clearParticipantProfile(entry.key_ptr.*, nick);
-            if (self.media_rooms.leaveAll(entry.key_ptr.*, nick)) {
+            const left = self.media_rooms.leaveAll(entry.key_ptr.*, nick);
+            if (left or routing == .cleared) {
                 self.broadcastMediaEvent(entry.key_ptr.*, "LEAVE", nick, "") catch {};
                 if (self.media_rooms.room(entry.key_ptr.*) == null) _ = self.transcript.clearChannel(entry.key_ptr.*);
             }
@@ -56234,6 +57066,355 @@ pub const LinuxServer = struct {
         }
     }
 
+    const guest_presence_lease_ms: i64 = 120_000;
+    const guest_presence_renew_margin_ms: i64 = 30_000;
+
+    fn guestNowMs(self: *const LinuxServer) i64 {
+        const wall = self.meshWallMs();
+        const limit: u64 = @intCast(std.math.maxInt(i64));
+        if (wall > limit) return std.math.maxInt(i64);
+        return @intCast(wall);
+    }
+
+    fn ensureGuestAuthority(self: *LinuxServer) !*guest_presence_route.Authority {
+        if (self.guest_presence) |auth| return auth;
+        const auth = try guest_presence_route.Authority.create(self.allocator);
+        self.guest_presence = auth;
+        return auth;
+    }
+
+    fn presenceApprovalRoots(self: *LinuxServer, extra: ?[32]u8) ![][32]u8 {
+        const trusted = self.mesh_trusted_node_keys;
+        const local: ?[32]u8 = if (self.config.node_identity) |ident| ident.sign_kp.public_key else null;
+        var add_local = local != null;
+        var add_extra = extra != null;
+        if (local) |key| for (trusted) |item| if (std.mem.eql(u8, &item, &key)) {
+            add_local = false;
+        };
+        if (extra) |key| {
+            for (trusted) |item| {
+                if (std.mem.eql(u8, &item, &key)) add_extra = false;
+            }
+            if (add_extra) {
+                if (local) |own| {
+                    if (std.mem.eql(u8, &own, &key)) add_extra = false;
+                }
+            }
+        }
+        const total = trusted.len + @as(usize, @intFromBool(add_local)) + @as(usize, @intFromBool(add_extra));
+        const out = try self.allocator.alloc([32]u8, total);
+        @memcpy(out[0..trusted.len], trusted);
+        var cursor = trusted.len;
+        if (add_local) {
+            out[cursor] = local.?;
+            cursor += 1;
+        }
+        if (add_extra) out[cursor] = extra.?;
+        return out;
+    }
+
+    fn ordinaryGuestEligible(self: *const LinuxServer, conn: *const ConnState) bool {
+        if (conn.s2s != null or conn.s2s_secured != null) return false;
+        if (conn.session.account() != null) return false;
+        if (self.config.node_identity == null) return false;
+        const nick = conn.session.displayName();
+        return nick.len != 0 and !std.mem.eql(u8, nick, "*");
+    }
+
+    fn publishOrdinaryGuest(self: *LinuxServer, conn: *ConnState, drive: bool) void {
+        if (!self.ordinaryGuestEligible(conn)) return;
+        const ident = self.config.node_identity orelse return;
+        const auth = self.ensureGuestAuthority() catch return;
+        if (std.mem.allEqual(u8, &conn.guest_id, 0)) {
+            const counter = std.math.add(u64, self.guest_serial, 1) catch return;
+            conn.guest_id = mesh_presence_v2.guestId(.{ .epoch = 1, .counter = counter }) catch return;
+            self.guest_serial = counter;
+        }
+        const prior = auth.retainedByGuest(ident.sign_kp.public_key, conn.guest_id);
+        if (prior) |kept| if (kept.operation == .quit) return;
+        const nick = conn.session.displayName();
+        const now = self.guestNowMs();
+        var revision: u64 = 1;
+        var claim_hlc: u64 = 0;
+        var claim_revision: u64 = 1;
+        var renew = prior == null;
+        if (prior) |kept| {
+            revision = kept.revision;
+            claim_hlc = kept.claim_hlc;
+            claim_revision = kept.claim_revision;
+            const nick_changed = !std.ascii.eqlIgnoreCase(kept.nick, nick);
+            const remaining = if (kept.expires_ms > now) kept.expires_ms - now else 0;
+            if (nick_changed or remaining < guest_presence_renew_margin_ms) {
+                revision = mesh_presence_v2.nextRevision(kept.revision) catch return;
+                renew = true;
+                if (nick_changed) {
+                    claim_hlc = self.nextMeshHlc();
+                    claim_revision = revision;
+                }
+            }
+        }
+        if (renew) {
+            if (claim_hlc == 0) claim_hlc = self.nextMeshHlc();
+            const identity = membershipIdentityOf(conn);
+            const expires = std.math.add(i64, now, guest_presence_lease_ms) catch return;
+            const record: mesh_presence_v2.Record = .{
+                .operation = .present,
+                .origin = ident.sign_kp.public_key,
+                .guest = conn.guest_id,
+                .revision = revision,
+                .routing_class = .true_guest,
+                .class_revision = 1,
+                .claim_hlc = claim_hlc,
+                .claim_revision = claim_revision,
+                .issued_ms = now,
+                .expires_ms = expires,
+                .nick = nick,
+                .username = identity.username,
+                .host = identity.host,
+                .realname = identity.realname,
+                .server = self.serverName(),
+                .description = self.config.server_description,
+            };
+            var buffer: [mesh_presence_v2.max_wire_len]u8 = undefined;
+            const encoded = mesh_presence_v2.encode(record, &ident.sign_kp, &buffer) catch return;
+            const roots = self.presenceApprovalRoots(null) catch return;
+            defer self.allocator.free(roots);
+            _ = auth.admit(encoded, roots, now, 0, true) catch return;
+            conn.guest_revision = revision;
+            conn.guest_claim_revision = claim_revision;
+            conn.guest_claim_hlc = claim_hlc;
+        }
+        if (drive) self.driveGuestPresence(null);
+    }
+
+    fn refreshOrdinaryGuests(self: *LinuxServer) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                self.publishOrdinaryGuest(&slot.value, false);
+            }
+        }
+    }
+
+    fn retireOrdinaryGuest(self: *LinuxServer, conn: *const ConnState) void {
+        if (std.mem.allEqual(u8, &conn.guest_id, 0)) return;
+        const ident = self.config.node_identity orelse return;
+        const auth = self.guest_presence orelse return;
+        const prior = auth.retainedByGuest(ident.sign_kp.public_key, conn.guest_id) orelse return;
+        if (prior.operation == .quit) return;
+        const revision = mesh_presence_v2.nextRevision(prior.revision) catch return;
+        const now = self.guestNowMs();
+        const issued = if (now >= prior.issued_ms) now else prior.issued_ms;
+        const expires = std.math.add(i64, issued, guest_presence_lease_ms) catch return;
+        const record: mesh_presence_v2.Record = .{
+            .operation = .quit,
+            .origin = ident.sign_kp.public_key,
+            .guest = conn.guest_id,
+            .revision = revision,
+            .routing_class = prior.routing_class,
+            .class_revision = prior.class_revision,
+            .claim_hlc = prior.claim_hlc,
+            .claim_revision = prior.claim_revision,
+            .issued_ms = issued,
+            .expires_ms = expires,
+            .nick = prior.nick,
+            .username = prior.username,
+            .host = prior.host,
+            .realname = prior.realname,
+            .server = prior.server,
+            .description = prior.description,
+        };
+        var buffer: [mesh_presence_v2.max_wire_len]u8 = undefined;
+        const encoded = mesh_presence_v2.encode(record, &ident.sign_kp, &buffer) catch return;
+        const roots = self.presenceApprovalRoots(null) catch return;
+        defer self.allocator.free(roots);
+        _ = auth.admit(encoded, roots, now, 0, true) catch return;
+        self.driveGuestPresence(null);
+    }
+
+    const GuestLink = struct {
+        id: client_model.ClientId,
+        link: *secured_s2s_link.SecuredLink,
+    };
+
+    fn guestLink(self: *LinuxServer, hop: u64) ?GuestLink {
+        if (hop == 0) return null;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsGuestPresence()) continue;
+                const remote = link.remoteNodeId() orelse continue;
+                if (remote != hop) continue;
+                return .{ .id = slotClientId(reactor, slot_index, slot.gen), .link = link };
+            }
+        }
+        return null;
+    }
+
+    fn driveGuestPresence(self: *LinuxServer, only_hop: ?u64) void {
+        const auth = self.guest_presence orelse return;
+        const now = self.guestNowMs();
+        var index: usize = 0;
+        while (index < auth.retainedCount()) : (index += 1) {
+            const item = auth.forwardAt(index, now) orelse continue;
+            for (self.reactors) |*reactor| {
+                for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                    if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                    const link = slot.value.s2s_secured orelse continue;
+                    if (!link.established() or !link.supportsGuestPresence()) continue;
+                    const hop = link.remoteNodeId() orelse continue;
+                    if (hop == 0) continue;
+                    if (only_hop) |wanted| if (hop != wanted) continue;
+                    if (!item.local and item.next_hop == hop) continue;
+                    if (!auth.wantsSend(index, hop)) continue;
+                    const emitted = link.forwardGuestPresence(item.wire) catch continue;
+                    if (!emitted) continue;
+                    if (!auth.markSent(index, hop)) continue;
+                    const peer_id = slotClientId(reactor, slot_index, slot.gen);
+                    _ = self.flushSecuredS2sOutboundTo(peer_id, link);
+                }
+            }
+        }
+    }
+
+    fn liveOrdinaryGuest(self: *LinuxServer, nick: []const u8) ?guest_presence_route.SubjectView {
+        const auth = self.guest_presence orelse return null;
+        return auth.liveByNick(nick, self.guestNowMs());
+    }
+
+    fn remoteWhoisFromGuest(self: *LinuxServer, nick: []const u8) ?RemoteWhois {
+        const live = self.liveOrdinaryGuest(nick) orelse return null;
+        return .{
+            .nick = live.nick,
+            .username = live.username,
+            .realname = live.realname,
+            .host = live.host,
+            .server = live.server,
+            .server_info = if (live.description.len != 0) live.description else null,
+            .account = "",
+            .real_host = "",
+            .certfp = "",
+        };
+    }
+
+    fn authorOrdinaryGuestDirect(
+        self: *LinuxServer,
+        conn: *const ConnState,
+        route: guest_presence_route.SubjectView,
+        text: []const u8,
+        hlc: u64,
+    ) bool {
+        if (hlc == 0 or std.mem.allEqual(u8, &conn.guest_id, 0)) return false;
+        if (route.local or route.next_hop == 0) return false;
+        const dest = self.guestLink(route.next_hop) orelse return false;
+        const ident = self.config.node_identity orelse return false;
+        const record: guest_direct.Record = .{
+            .origin = ident.sign_kp.public_key,
+            .sender_guest = conn.guest_id,
+            .recipient_origin = route.origin,
+            .recipient_guest = route.guest,
+            .hlc = hlc,
+            .issued_ms = self.guestNowMs(),
+            .sender_nick = conn.session.displayName(),
+            .target_nick = route.nick,
+            .text = text,
+        };
+        var buffer: [guest_direct.max_wire_len]u8 = undefined;
+        const encoded = guest_direct.encode(record, &ident.sign_kp, &buffer) catch return false;
+        const emitted = dest.link.forwardGuestDirect(encoded) catch return false;
+        if (!emitted) return false;
+        return self.flushSecuredS2sOutboundTo(dest.id, dest.link);
+    }
+
+    /// Guest counters restart on every node, so the id is only unique together
+    /// with the publishing origin. An intermediate node must not deliver a
+    /// foreign subject whose counter happens to match a local guest.
+    fn localGuestClient(self: *LinuxServer, origin: [32]u8, guest: [16]u8) ?client_model.ClientId {
+        if (std.mem.allEqual(u8, &guest, 0)) return null;
+        const ident = self.config.node_identity orelse return null;
+        if (!std.mem.eql(u8, &origin, &ident.sign_kp.public_key)) return null;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
+                if (!slot.occupied or slot.value.closing) continue;
+                if (slot.value.s2s != null or slot.value.s2s_secured != null) continue;
+                if (!std.mem.eql(u8, &slot.value.guest_id, &guest)) continue;
+                return slotClientId(reactor, slot_index, slot.gen);
+            }
+        }
+        return null;
+    }
+
+    fn deliverGuestDirect(self: *LinuxServer, recipient: client_model.ClientId, record: guest_direct.Record) void {
+        var prefix_buf: [512]u8 = undefined;
+        const prefix = if (self.guest_presence) |auth| blk: {
+            if (auth.liveByGuest(record.origin, record.sender_guest, self.guestNowMs())) |sender| {
+                break :blk std.fmt.bufPrint(&prefix_buf, "{s}!{s}@{s}", .{ sender.nick, sender.username, sender.host }) catch record.sender_nick;
+            }
+            break :blk record.sender_nick;
+        } else record.sender_nick;
+        var msg_buf: [default_reply_bytes]u8 = undefined;
+        const msg = formatMessage(&msg_buf, prefix, "PRIVMSG", &.{record.target_nick}, record.text) catch return;
+        var time_buf: [40]u8 = undefined;
+        const issued: u64 = if (record.issued_ms > 0) @intCast(record.issued_ms) else 0;
+        const tags = MsgTags{ .time_value = serverTimeValueAt(&time_buf, issued), .account = null, .client_tags = null, .msgid = null, .is_bot = false };
+        self.deliverTaggedMode(recipient, tags, msg, .ordinary) catch {};
+    }
+
+    fn drainGuestFrames(self: *LinuxServer, conn: *const ConnState, link: *secured_s2s_link.SecuredLink) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
+        const hop = link.remoteNodeId() orelse 0;
+        self.drainGuestPresenceFrom(link, hop);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainGuestDirectFrom(link, hop);
+        if (!conn.ownsActiveMeshLink(link) or hop == 0) return;
+        self.driveGuestPresence(null);
+    }
+
+    fn drainGuestPresenceFrom(self: *LinuxServer, link: *secured_s2s_link.SecuredLink, hop: u64) void {
+        const inbound = link.takeGuestPresence() catch return;
+        defer {
+            for (inbound) |*item| item.deinit(self.allocator);
+            self.allocator.free(inbound);
+        }
+        if (hop == 0 or inbound.len == 0) return;
+        const roots = self.presenceApprovalRoots(link.peerNodeKey()) catch return;
+        defer self.allocator.free(roots);
+        const auth = self.ensureGuestAuthority() catch return;
+        const now = self.guestNowMs();
+        for (inbound) |item| {
+            _ = auth.admit(item.wire, roots, now, hop, false) catch continue;
+        }
+    }
+
+    fn drainGuestDirectFrom(self: *LinuxServer, link: *secured_s2s_link.SecuredLink, hop: u64) void {
+        const inbound = link.takeGuestDirects() catch return;
+        defer {
+            for (inbound) |*item| item.deinit(self.allocator);
+            self.allocator.free(inbound);
+        }
+        const auth = self.guest_presence orelse return;
+        const now = self.guestNowMs();
+        const policy: guest_direct.ClockPolicy = .{};
+        for (inbound) |item| {
+            const decoded = guest_direct.decode(item.wire) catch continue;
+            decoded.verify() catch continue;
+            policy.validate(decoded.record.issued_ms, now) catch continue;
+            auth.observeDirect(decoded.record.origin, decoded.record.hlc, decoded.record.issued_ms, now) catch continue;
+            if (self.localGuestClient(decoded.record.recipient_origin, decoded.record.recipient_guest)) |recipient| {
+                self.deliverGuestDirect(recipient, decoded.record);
+                continue;
+            }
+            if (hop == 0) continue;
+            const route = auth.liveByGuest(decoded.record.recipient_origin, decoded.record.recipient_guest, now) orelse continue;
+            if (route.local or route.next_hop == 0 or route.next_hop == hop) continue;
+            const dest = self.guestLink(route.next_hop) orelse continue;
+            const emitted = dest.link.forwardGuestDirect(item.wire) catch continue;
+            if (!emitted) continue;
+            _ = self.flushSecuredS2sOutboundTo(dest.id, dest.link);
+        }
+    }
+
     /// Admit signed Event Spine v2 objects through the daemon-global authority,
     /// then deliver locally and re-flood the exact immutable byte image. The
     /// transport already verified both immediate-hop and origin signatures, but
@@ -58138,6 +59319,7 @@ pub const LinuxServer = struct {
                 }
 
                 const channel_op = member_modes.isOperator();
+                if (!channel_op and self.world.channelHasExtFlag(chan, .nocolor) and containsIrcFormatting(text)) break :blk "+c no color";
                 if (!channel_op and self.world.channelHasFlag(chan, .no_ctcp) and isBlockableCtcp(text)) break :blk "+C no-CTCP";
                 if (is_notice and !channel_op and self.world.channelHasFlag(chan, .no_notice)) break :blk "+T no-NOTICE";
                 if (min_rank > 0 and member_modes.rank() < 1) break :blk "statusmsg rank";
@@ -58195,6 +59377,10 @@ pub const LinuxServer = struct {
         }
 
         const sender_op = member_modes.isOperator() or conn.session.isOper();
+        if (!sender_op and self.world.channelHasExtFlag(chan, .nocolor) and containsIrcFormatting(text)) {
+            if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+c: no color or formatting)");
+            return .deny;
+        }
         if (!sender_op and self.world.channelHasFlag(chan, .no_ctcp) and isBlockableCtcp(text)) {
             if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (+C: no CTCP)");
             return .deny;
@@ -58210,7 +59396,7 @@ pub const LinuxServer = struct {
         const slow_exempt = conn.session.isOper() or
             (self.channelSlowmodeVoiceExempt(chan) and member_modes.canSpeakModerated());
         if (self.slowmodeDenies(chan, conn.session.displayName(), slow_exempt)) {
-            if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, "Cannot send to channel (slowmode)");
+            if (!is_notice) try queueNumeric(conn, .ERR_CANNOTSENDTOCHAN, &.{target}, self.channelSendGapText(chan, slow_exempt));
             return .deny;
         }
 
@@ -58275,19 +59461,20 @@ pub const LinuxServer = struct {
             } else null;
             var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
             defer delivery_ids.deinit(self.allocator);
-            self.collectChannelDeliveryIds(
-                target,
-                0,
-                if (echo) null else id,
-                tags,
-                &delivery_ids,
-            ) catch {
-                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
-                return;
-            };
             var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
             defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
             if (self.authoredRelayV2Configured()) {
+                self.collectChannelDeliveryIds(
+                    target,
+                    0,
+                    if (echo) null else id,
+                    tags,
+                    &delivery_ids,
+                    .speech,
+                ) catch {
+                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                    return;
+                };
                 accepted_v2 = self.admitAuthoredRelayV2(
                     .tagmsg,
                     target,
@@ -58318,9 +59505,11 @@ pub const LinuxServer = struct {
                 }
             }
             var members = self.world.memberIterator(target) orelse return;
+            const tagmsg_chatter = channelChatterOf(msg);
             while (members.next()) |member| {
                 const mid = clientIdFromWorld(member.*);
                 if (mid.eql(id) and !echo) continue;
+                if (self.memberSkipsChatter(mid, tagmsg_chatter)) continue;
                 const mconn = self.connFor(mid) orelse continue;
                 var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
                 if (clientTagsForSession(&mconn.session, tags, &visible_tags_buf).len == 0) continue;
@@ -59035,12 +60224,27 @@ pub const LinuxServer = struct {
             e2ee_policy.isCanonicalRoomEnvelope(text))
             return self.messageOneLong(id, conn, command, target, text, client_tags);
 
+        // +f strips before the 512-byte wire budget. Stripping only inside
+        // messageOneLong keeps colour codes in the budgeted prefix and drops
+        // the visible tail of an oversized formatted line.
+        var stripped_buf: [default_reply_bytes]u8 = undefined;
+        var body = text;
+        if (world_model.isChannelName(room_target) and
+            self.channelEncryptionPolicy(room_target) != .required and
+            self.world.channelHasExtFlag(room_target, .noformat) and
+            color_strip.hasFormatting(text))
+        {
+            if (color_strip.stripFormattingWith(.{ .max_output_bytes = stripped_buf.len }, text, &stripped_buf)) |clean| {
+                if (clean.len != 0) body = clean;
+            } else |_| {}
+        }
+
         const budget = (try ordinaryMessageTextBudget(conn, command, target)) orelse {
             if (!std.ascii.eqlIgnoreCase(command, "NOTICE"))
                 try self.failReply(conn, command, "INPUT_TOO_LONG", "Message target leaves no room for text");
             return;
         };
-        const bounded_text = utf8PrefixWithin(text, budget);
+        const bounded_text = utf8PrefixWithin(body, budget);
         if (bounded_text.len == 0) {
             if (!std.ascii.eqlIgnoreCase(command, "NOTICE"))
                 try self.failReply(conn, command, "INPUT_TOO_LONG", "Message text does not fit in an IRC line");
@@ -59187,26 +60391,27 @@ pub const LinuxServer = struct {
                 self.publishModerationHeld(chan, conn, eff_text);
                 return;
             }
-            // delivery_ids feeds durable MESSAGE_V2 ADS1. When authoring is
-            // active, admit MUST succeed before broadcast — fail closed so mesh
-            // and local views stay consistent. mIRC formatting is legal body
-            // content (message_relay.validTextField); ADS1 spool soft-fails
-            // inside admitAuthoredRelayV2 without aborting mesh publish.
+            // The member walk exists only to build the durable MESSAGE_V2
+            // recipient set. Ordinary local delivery walks the channel once.
+            // When authoring is active, admit MUST succeed before broadcast.
+            // ADS1 spool soft-fails inside admitAuthoredRelayV2 without
+            // aborting mesh publish.
             var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
             defer delivery_ids.deinit(self.allocator);
-            self.collectChannelDeliveryIds(
-                chan,
-                min_rank,
-                if (echo) null else id,
-                null,
-                &delivery_ids,
-            ) catch {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
-                return;
-            };
             var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
             defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
             if (self.authoredRelayV2Configured()) {
+                self.collectChannelDeliveryIds(
+                    chan,
+                    min_rank,
+                    if (echo) null else id,
+                    null,
+                    &delivery_ids,
+                    if (is_notice) .notice else .speech,
+                ) catch {
+                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                    return;
+                };
                 var authored_prefix_buf: [320]u8 = undefined;
                 const authored_prefix = clientPrefix(conn, &authored_prefix_buf) catch return;
                 const history_plan: ?RelayV2History = if (min_rank == 0) .{
@@ -59337,6 +60542,20 @@ pub const LinuxServer = struct {
         }
 
         const recipient = self.world.findNick(target) orelse {
+            // A live ordinary guest is a signed subject with its own direct
+            // scope. Do not also emit a legacy nick relay for that subject.
+            if (!is_notice) {
+                if (self.liveOrdinaryGuest(target)) |route| {
+                    if (!self.authorOrdinaryGuestDirect(conn, route, text, event_hlc)) {
+                        try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+                        return;
+                    }
+                    var guest_time_buf: [40]u8 = undefined;
+                    const guest_tags = MsgTags{ .time_value = serverTimeValueAt(&guest_time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
+                    if (echo) self.deliverTaggedMode(id, guest_tags, msg, .ordinary) catch {};
+                    return;
+                }
+            }
             // Not local: relay to mesh peers so the node that owns this nick can
             // deliver (loop-guarded; a truly-nonexistent nick is dropped far-side).
             if (self.hasEstablishedPeer() or self.detachedReplicaTokenForNick(target) != null) {
@@ -59486,6 +60705,34 @@ pub const LinuxServer = struct {
             if (recipient_conn) |rconn| {
                 if (rconn.session.umodes.contains(.no_ctcp)) {
                     try self.failReply(conn, command, "CTCP_BLOCKED", "Cannot message this user (+C: no CTCP)");
+                    return;
+                }
+            }
+        }
+        if (recipient_conn) |rconn| {
+            const self_msg = recipient_id.eql(id);
+            const sender_account = conn.session.account();
+            const same_account = if (sender_account) |sa|
+                if (rconn.session.account()) |ra| std.mem.eql(u8, sa, ra) else false
+            else
+                false;
+            const sender_nick = conn.session.displayName();
+            // +Z is stricter than ACCEPT: a cleartext sender stays blocked.
+            if (rconn.session.umodes.contains(.tls_only_pm)) {
+                const bypass = self_msg or conn.is_tls or conn.session.isOper() or same_account;
+                if (!bypass) {
+                    if (!is_notice) try queueNumeric(conn, .ERR_CANTSENDTOUSER, &.{target}, "is in +Z mode (TLS required)");
+                    return;
+                }
+            }
+            // +G accepts a shared channel, ACCEPT, the same account, an oper, or self.
+            // NOTICE is dropped with no numeric and no notice to the recipient.
+            if (rconn.session.umodes.contains(.common_chan)) {
+                const accepted = self.accepts.contains(target, sender_nick) catch false;
+                const shares = self.clientsShareChannel(worldIdFromClient(id), worldIdFromClient(recipient_id));
+                const bypass = self_msg or accepted or conn.session.isOper() or same_account or shares;
+                if (!bypass) {
+                    if (!is_notice) try queueNumeric(conn, .ERR_CANTSENDTOUSER, &.{target}, "is in +G mode (share a channel or ACCEPT)");
                     return;
                 }
             }
@@ -59821,7 +61068,9 @@ pub const LinuxServer = struct {
         }
 
         const channel = parsed.paramSlice()[0];
-        if (!self.world.channelExists(channel)) {
+        // A secret, private, or hidden channel the caller is not in is the same
+        // 403 as a missing name. Members still read and set the topic.
+        if (!self.world.channelExists(channel) or self.channelHiddenFromWhois(channel, worldIdFromClient(id))) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
@@ -59982,6 +61231,52 @@ pub const LinuxServer = struct {
         if (mm.isOperator()) return .op;
         if (mm.contains(.voice)) return .voice;
         return .regular;
+    }
+
+    /// The less visible of two ranks. A disagreed roster must not promote a
+    /// regular into someone a hidden member can be whispered by.
+    fn lessVisibleRank(a: auditorium.Rank, b: auditorium.Rank) auditorium.Rank {
+        if (a == .regular or b == .regular) return .regular;
+        if (a == .voice or b == .voice) return .voice;
+        return .op;
+    }
+
+    /// Rank of `nick` on `channel`. Local membership wins. Otherwise every
+    /// converged remote row for that nick is folded to the less visible rank.
+    /// Null means this node has no membership row at all.
+    fn channelRankForNick(self: *LinuxServer, channel: []const u8, nick: []const u8) ?auditorium.Rank {
+        if (self.world.memberModesByNick(channel, nick)) |modes| return auditoriumRank(modes);
+        var found: ?auditorium.Rank = null;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                const members = if (slot.value.s2s_secured) |link| blk: {
+                    if (!link.established()) continue;
+                    break :blk link.channelMembers(channel);
+                } else if (slot.value.s2s) |link| blk: {
+                    if (!link.established()) continue;
+                    break :blk link.channelMembers(channel);
+                } else continue;
+                for (members) |member| {
+                    if (!std.ascii.eqlIgnoreCase(member.nick, nick)) continue;
+                    const rank = auditoriumRank(.{ .bits = @as(u8, member.status) });
+                    found = if (found) |prior| lessVisibleRank(prior, rank) else rank;
+                }
+            }
+        }
+        return found;
+    }
+
+    /// True when +x hides `recipient_nick` from `sender_nick`. The sender's own
+    /// nick is visible to the sender. An unknown rank counts as regular, so a
+    /// missing roster row cannot reveal a hidden member. A channel that is not
+    /// an auditorium returns false.
+    fn auditoriumHidesWhisper(self: *LinuxServer, channel: []const u8, sender_nick: []const u8, recipient_nick: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(sender_nick, recipient_nick)) return false;
+        if (!self.world.channelHasExtFlag(channel, .auditorium)) return false;
+        const viewer = self.channelRankForNick(channel, sender_nick) orelse .regular;
+        const member = self.channelRankForNick(channel, recipient_nick) orelse .regular;
+        return !auditorium.visibleTo(viewer, member);
     }
 
     /// Display projection of a live signed mesh grant. Privilege bits of 0 are
@@ -63591,7 +64886,7 @@ const PortableServer = struct {
 
     fn onAccept(self: *PortableServer, ev: io_backend.Reaped) ServerError!void {
         if (ev.token.slot != 0 or ev.token.gen != 1) return;
-        if (!self.backend.levelTriggered()) self.armAccept() catch |err| {
+        if (!self.backend.levelTriggered() and !ev.more) self.armAccept() catch |err| {
             if (ev.result >= 0) io_backend.closeSocket(@intCast(ev.result));
             return err;
         };
@@ -63947,8 +65242,10 @@ const PortableServer = struct {
             if (parsed.param_count == 0 or parsed.paramSlice()[0].len == 0)
                 return self.portableNumeric(conn, "431", "", "No nickname given");
             const requested = parsed.paramSlice()[0];
-            if (!isValidNick(requested))
-                return self.portableNumeric(conn, "432", requested, "Erroneous nickname");
+            if (!isValidNick(requested)) {
+                const shown = if (ident_utf8.containsIdentifierSpoof(requested)) "*" else requested;
+                return self.portableNumeric(conn, "432", shown, "Erroneous nickname");
+            }
             for (self.conns.items) |other| {
                 if (!other.live or other == conn or !other.state.session.registration.nick_seen) continue;
                 if (std.ascii.eqlIgnoreCase(other.state.session.displayName(), requested))
@@ -64706,15 +66003,47 @@ fn expectPidfdIsSelf(fd: linux.fd_t) !void {
     try std.testing.expect(std.mem.indexOf(u8, text_buf[0..n], needle) != null);
 }
 
+fn nextSmapsLine(text: []const u8, i: *usize) []const u8 {
+    const start = i.*;
+    var end = start;
+    while (end < text.len and text[end] != '\n') : (end += 1) {}
+    i.* = if (end < text.len) end + 1 else end;
+    return text[start..end];
+}
+
+fn parseSmapsRange(line: []const u8) ?struct { start: usize, end: usize } {
+    const dash = std.mem.indexOfScalar(u8, line, '-') orelse return null;
+    if (dash == 0 or dash > 16) return null;
+    for (line[0..dash]) |c| if (!std.ascii.isHex(c)) return null;
+    const start = std.fmt.parseInt(usize, line[0..dash], 16) catch return null;
+    const rest = line[dash + 1 ..];
+    const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+    if (sp == 0 or sp > 16) return null;
+    for (rest[0..sp]) |c| if (!std.ascii.isHex(c)) return null;
+    const end = std.fmt.parseInt(usize, rest[0..sp], 16) catch return null;
+    if (end <= start) return null;
+    return .{ .start = start, .end = end };
+}
+
 fn expectSecretPageAdvised(page: [*]u8) !void {
     const raw = linux.openat(linux.AT.FDCWD, "/proc/self/smaps", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (posix.errno(raw) != .SUCCESS) return error.Unexpected;
     const rfd: linux.fd_t = @intCast(raw);
     defer _ = linux.close(rfd);
-    const buf = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
-    defer std.testing.allocator.free(buf);
+    // A full-suite process has far more than 4 MiB of smaps, and a secret page
+    // can sit inside a merged VMA whose start address is not the page itself.
+    const allocator = std.testing.allocator;
+    var buf = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(buf);
     var filled: usize = 0;
-    while (filled < buf.len) {
+    while (true) {
+        if (filled == buf.len) {
+            if (buf.len >= 32 * 1024 * 1024) return error.Unexpected;
+            const grown = try allocator.alloc(u8, buf.len * 2);
+            @memcpy(grown[0..filled], buf[0..filled]);
+            allocator.free(buf);
+            buf = grown;
+        }
         const n = linux.read(rfd, buf[filled..].ptr, buf.len - filled);
         switch (posix.errno(n)) {
             .SUCCESS => {
@@ -64725,17 +66054,29 @@ fn expectSecretPageAdvised(page: [*]u8) !void {
             else => return error.Unexpected,
         }
     }
-    var addr_buf: [32]u8 = undefined;
-    const marker = std.fmt.bufPrint(&addr_buf, "{x}-", .{@intFromPtr(page)}) catch return error.Unexpected;
     const text = buf[0..filled];
-    const at = std.mem.indexOf(u8, text, marker) orelse return error.TestUnexpectedResult;
-    const window = text[at..@min(text.len, at + 2000)];
-    const flags_at = std.mem.indexOf(u8, window, "VmFlags:") orelse return error.TestUnexpectedResult;
-    const rest = window[flags_at..];
-    const line_len = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-    const line = rest[0..line_len];
-    try std.testing.expect(std.mem.indexOf(u8, line, " dd") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, " wf") != null);
+    const addr = @intFromPtr(page);
+    var i: usize = 0;
+    while (i < text.len) {
+        const line = nextSmapsLine(text, &i);
+        const range = parseSmapsRange(line) orelse continue;
+        if (addr < range.start or addr >= range.end) continue;
+        while (i < text.len) {
+            const saved = i;
+            const flags_line = nextSmapsLine(text, &i);
+            if (parseSmapsRange(flags_line) != null) {
+                i = saved;
+                break;
+            }
+            if (std.mem.startsWith(u8, flags_line, "VmFlags:")) {
+                try std.testing.expect(std.mem.indexOf(u8, flags_line, " dd") != null);
+                try std.testing.expect(std.mem.indexOf(u8, flags_line, " wf") != null);
+                return;
+            }
+        }
+        return error.TestUnexpectedResult;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "GAP-X3 secret page is DONTDUMP and WIPEONFORK" {
@@ -64901,7 +66242,10 @@ const CompletionHandler = struct {
             // poll: the cross-reactor wake eventfd became readable — drain it so
             // the loop ran (and, once sharded, drain this reactor's mailbox).
             .poll => |event| {
-                if (event.token.slot == wake_token.slot) self.server.onWakePoll();
+                if (event.token.slot == wake_token.slot) {
+                    if (!event.more) self.server.rx().wake_armed = false;
+                    self.server.onWakePoll();
+                }
             },
             .other => {},
         }
@@ -65647,7 +66991,8 @@ const PreparedPublicMediaOutput = struct {
         server: *LinuxServer,
         id: client_model.ClientId,
         conn: *ConnState,
-        channel: []const u8,
+        channel_buf: [128]u8,
+        channel_len: usize,
         bytes: []u8,
         framed: ?ws_output.Prepared,
         queue: sendq.PreparedAppend(*ConnState),
@@ -65670,7 +67015,16 @@ const PreparedPublicMediaOutput = struct {
     fn prepare(server: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, bytes: []const u8) !PreparedPublicMediaOutput {
         if (conn.tls != null) return .{ .protected = try PreparedMediaOutput.prepare(server, id, conn, channel, bytes) };
         try server.requireMediaCaller(id, conn, channel);
-        if (conn.fd < 0 or conn.tls_tx_offloaded or conn.tls_rx_offloaded or conn.tls_control_charge != 0 or conn.tls_deferred_charge != 0 or conn.tls_deferred_plain.items.len != 0) return error.BadState;
+        // Own the name. Callers pass a slice into a by-value negotiation that
+        // is copied on return; keeping that slice would dangle at validate.
+        if (channel.len == 0 or channel.len > 128) return error.BadState;
+        // A unit sink keeps fd < 0 and retains the SendQ. A live descriptor,
+        // including a capture row that the test writes itself, stays eligible.
+        if (conn.fd < 0) {
+            const capture_sink = if (comptime builtin.is_test) conn.test_sendq_capture else false;
+            if (!capture_sink) return error.BadState;
+        }
+        if (conn.tls_tx_offloaded or conn.tls_rx_offloaded or conn.tls_control_charge != 0 or conn.tls_deferred_charge != 0 or conn.tls_deferred_plain.items.len != 0) return error.BadState;
         const owned = try server.allocator.dupe(u8, bytes);
         errdefer server.allocator.free(owned);
         var framed: ?ws_output.Prepared = null;
@@ -65685,14 +67039,16 @@ const PreparedPublicMediaOutput = struct {
         const wire = if (framed) |*frames| frames.bytes() else owned;
         var queue = try sendq.prepareAppend(conn, wire.len);
         errdefer queue.abort();
-        return .{ .plain = .{ .server = server, .id = id, .conn = conn, .channel = channel, .bytes = owned, .framed = framed, .queue = queue, .fd = conn.fd, .token = conn.token, .send_len = conn.send_len, .send_offset = conn.send_offset, .overflow_len = conn.send_overflow.items.len, .overflow_ptr = @intFromPtr(conn.send_overflow.items.ptr), .overflow_capacity = conn.send_overflow.capacity, .cap = conn.sendq_cap, .ws = conn.ws, .overflow_allocator = conn.overflow_allocator, .send_armed = conn.send_armed, .submitted_len = conn.send_submitted_len, .submitted_offset = conn.send_submitted_offset } };
+        var plain: Plain = .{ .server = server, .id = id, .conn = conn, .channel_buf = undefined, .channel_len = channel.len, .bytes = owned, .framed = framed, .queue = queue, .fd = conn.fd, .token = conn.token, .send_len = conn.send_len, .send_offset = conn.send_offset, .overflow_len = conn.send_overflow.items.len, .overflow_ptr = @intFromPtr(conn.send_overflow.items.ptr), .overflow_capacity = conn.send_overflow.capacity, .cap = conn.sendq_cap, .ws = conn.ws, .overflow_allocator = conn.overflow_allocator, .send_armed = conn.send_armed, .submitted_len = conn.send_submitted_len, .submitted_offset = conn.send_submitted_offset };
+        @memcpy(plain.channel_buf[0..channel.len], channel);
+        return .{ .plain = plain };
     }
 
     fn validate(self: *const PreparedPublicMediaOutput) !void {
         if (self.protected) |*output| return output.validate();
         const plain = if (self.plain) |*owned| owned else return error.BadState;
         const conn = plain.conn;
-        try plain.server.requireMediaCaller(plain.id, conn, plain.channel);
+        try plain.server.requireMediaCaller(plain.id, conn, plain.channel_buf[0..plain.channel_len]);
         if (plain.done or conn.fd != plain.fd or !std.meta.eql(conn.token, plain.token) or conn.tls != null or conn.tls_tx_offloaded or conn.tls_rx_offloaded or conn.tls_control_charge != 0 or conn.tls_deferred_charge != 0 or conn.tls_deferred_plain.items.len != 0 or conn.send_len != plain.send_len or conn.send_offset != plain.send_offset or conn.send_overflow.items.len != plain.overflow_len or @intFromPtr(conn.send_overflow.items.ptr) != plain.overflow_ptr or conn.send_overflow.capacity != plain.overflow_capacity or conn.sendq_cap != plain.cap or conn.ws != plain.ws or conn.overflow_allocator.ptr != plain.overflow_allocator.ptr or conn.overflow_allocator.vtable != plain.overflow_allocator.vtable or conn.send_armed != plain.send_armed or conn.send_submitted_len != plain.submitted_len or conn.send_submitted_offset != plain.submitted_offset) return error.BadState;
         if (plain.framed) |*frames| {
             const ws = conn.ws orelse return error.BadState;
@@ -67048,6 +68404,12 @@ test "GAP-O5 REHASH DRY prints diffs and applies none" {
     std.debug.print("GAP-O5 branch=REHASH DRY named ward class limit and listener diffs, applied none, then a real REHASH applied the limit without moving the listener\n", .{});
 }
 
+fn joinTestMedia(server: *Server, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
+    conn.session.registration.registered = true;
+    const parsed = try irc_line.parseLine(line);
+    try server.dispatchRegistered(id, conn, &parsed, line);
+}
+
 test "GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -67058,6 +68420,7 @@ test "GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint" {
     };
     defer server.deinit();
     current_reactor = &server.reactors[0];
+    server.start();
 
     const low_id = try addTestLocalClient(&server, "low", null);
     const high_id = try addTestLocalClient(&server, "high", null);
@@ -67068,10 +68431,8 @@ test "GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint" {
     low.send_armed = true;
     high.send_armed = true;
 
-    const join_low = try irc_line.parseLine("MEDIA JOIN #v voice");
-    const join_high = try irc_line.parseLine("MEDIA JOIN #v voice");
-    try server.handleMedia(low_id, low, &join_low);
-    try server.handleMedia(high_id, high, &join_high);
+    try joinTestMedia(&server, low_id, low, "MEDIA JOIN #v voice");
+    try joinTestMedia(&server, high_id, high, "MEDIA JOIN #v voice");
     try server.native_media.register("#v", "low", .voice, 11, .{});
     try server.native_media.register("#v", "high", .voice, 12, .{});
     try std.testing.expect(server.media_plane.allocate("#v", "low") != null);
@@ -67096,6 +68457,13 @@ test "GAP-V3 MEDIA ABR stores independent spatial ceilings from the hint" {
     try std.testing.expect(std.mem.indexOf(u8, low_reply, "action=decrease") != null);
     try std.testing.expect(std.mem.indexOf(u8, high_reply, "action=increase") != null);
 
+    // These rows are the test's direct transport maps, outside the routing
+    // owner. Terminal release refuses a leg that still holds them.
+    server.native_media.unregister("#v", "low");
+    server.native_media.unregister("#v", "high");
+    server.media_plane.remove("#v", "low");
+    server.media_plane.remove("#v", "high");
+
     std.debug.print("GAP-V3 branch=MEDIA ABR applies each receiver's abrHint to its own spatial ceiling\n", .{});
 }
 
@@ -67109,6 +68477,7 @@ test "GAP-V4 recording waits for every member and stops when one joins" {
     };
     defer server.deinit();
     current_reactor = &server.reactors[0];
+    server.start();
 
     const alice_id = try addTestLocalClient(&server, "alice", null);
     const bob_id = try addTestLocalClient(&server, "bob", null);
@@ -67122,11 +68491,14 @@ test "GAP-V4 recording waits for every member and stops when one joins" {
     alice.send_armed = true;
     bob.send_armed = true;
     carol.send_armed = true;
+    // Recording stop publishes issuer bytes through the plaintext output plan.
+    // These clients have no socket; the SendQ is the sink.
+    alice.test_sendq_capture = true;
+    bob.test_sendq_capture = true;
+    carol.test_sendq_capture = true;
 
-    const join_a = try irc_line.parseLine("MEDIA JOIN #rec voice");
-    const join_b = try irc_line.parseLine("MEDIA JOIN #rec voice");
-    try server.handleMedia(alice_id, alice, &join_a);
-    try server.handleMedia(bob_id, bob, &join_b);
+    try joinTestMedia(&server, alice_id, alice, "MEDIA JOIN #rec voice");
+    try joinTestMedia(&server, bob_id, bob, "MEDIA JOIN #rec voice");
 
     alice.send_len = 0;
     const too_soon = try irc_line.parseLine("MEDIA RECORD #rec");
@@ -67153,8 +68525,7 @@ test "GAP-V4 recording waits for every member and stops when one joins" {
     try std.testing.expect(std.mem.indexOf(u8, roster_text, "alice voice main 0 0 - consent=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, roster_text, "bob voice main 0 0 - consent=1") != null);
 
-    const join_c = try irc_line.parseLine("MEDIA JOIN #rec voice");
-    try server.handleMedia(carol_id, carol, &join_c);
+    try joinTestMedia(&server, carol_id, carol, "MEDIA JOIN #rec voice");
     const stopped = server.media_rooms.recordingOf("#rec") orelse return error.TestUnexpectedResult;
     try std.testing.expect(!stopped.active);
     try std.testing.expect(std.mem.indexOf(u8, carol.send_buf[0..carol.send_len], "stopped") != null);
@@ -67172,6 +68543,7 @@ test "GAP-V5 a participant or oper reads loss rtt and layer without key material
     };
     defer server.deinit();
     current_reactor = &server.reactors[0];
+    server.start();
 
     const alice_id = try addTestLocalClient(&server, "alice", null);
     const bob_id = try addTestLocalClient(&server, "bob", null);
@@ -67193,12 +68565,9 @@ test "GAP-V5 a participant or oper reads loss rtt and layer without key material
     eve.send_armed = true;
     oper.session.is_oper = true;
 
-    const join_a = try irc_line.parseLine("MEDIA JOIN #q voice");
-    const join_b = try irc_line.parseLine("MEDIA JOIN #q voice");
-    const join_c = try irc_line.parseLine("MEDIA JOIN #q voice");
-    try server.handleMedia(alice_id, alice, &join_a);
-    try server.handleMedia(bob_id, bob, &join_b);
-    try server.handleMedia(carol_id, carol, &join_c);
+    try joinTestMedia(&server, alice_id, alice, "MEDIA JOIN #q voice");
+    try joinTestMedia(&server, bob_id, bob, "MEDIA JOIN #q voice");
+    try joinTestMedia(&server, carol_id, carol, "MEDIA JOIN #q voice");
     try server.native_media.register("#q", "alice", .voice, 11, .{});
     try server.native_media.register("#q", "bob", .voice, 12, .{});
     try std.testing.expect(server.media_plane.allocate("#q", "alice") != null);
@@ -67271,6 +68640,13 @@ test "GAP-V5 a participant or oper reads loss rtt and layer without key material
     try std.testing.expect(std.mem.indexOf(u8, refused, "442") != null);
     try std.testing.expect(std.mem.indexOf(u8, refused, "loss=") == null);
 
+    // These rows are the test's direct transport maps, outside the routing
+    // owner. Terminal release refuses a leg that still holds them.
+    server.native_media.unregister("#q", "alice");
+    server.native_media.unregister("#q", "bob");
+    server.media_plane.remove("#q", "alice");
+    server.media_plane.remove("#q", "bob");
+
     std.debug.print("GAP-V5 branch=participant and oper read loss rtt spatial bitrate; key material is absent\n", .{});
 }
 
@@ -67284,6 +68660,7 @@ test "GAP-V6 the room reads the speaking queue and the server forwards positions
     };
     defer server.deinit();
     current_reactor = &server.reactors[0];
+    server.start();
 
     const alice_id = try addTestLocalClient(&server, "alice", null);
     const bob_id = try addTestLocalClient(&server, "bob", null);
@@ -67298,12 +68675,9 @@ test "GAP-V6 the room reads the speaking queue and the server forwards positions
     bob.send_armed = true;
     carol.send_armed = true;
 
-    const join_a = try irc_line.parseLine("MEDIA JOIN #q voice");
-    const join_b = try irc_line.parseLine("MEDIA JOIN #q voice");
-    const join_c = try irc_line.parseLine("MEDIA JOIN #q voice");
-    try server.handleMedia(alice_id, alice, &join_a);
-    try server.handleMedia(bob_id, bob, &join_b);
-    try server.handleMedia(carol_id, carol, &join_c);
+    try joinTestMedia(&server, alice_id, alice, "MEDIA JOIN #q voice");
+    try joinTestMedia(&server, bob_id, bob, "MEDIA JOIN #q voice");
+    try joinTestMedia(&server, carol_id, carol, "MEDIA JOIN #q voice");
 
     const hand_a = try irc_line.parseLine("MEDIA HAND #q up");
     const hand_b = try irc_line.parseLine("MEDIA HAND #q up");
@@ -71523,6 +72897,7 @@ test "UTF-8 IRC line budget ends before a split codepoint" {
 /// not a channel-name lead char; first char not a digit or '-'.
 fn isValidNick(nick: []const u8) bool {
     if (nick.len == 0 or nick.len > 64) return false;
+    if (ident_utf8.containsIdentifierSpoof(nick)) return false;
     if (nick[0] == '-' or (nick[0] >= '0' and nick[0] <= '9')) return false;
     for (nick) |ch| {
         switch (ch) {
@@ -71771,6 +73146,44 @@ test "tls13Config carries raw-public-key negotiation gate" {
     const mtls_cfg = server.tls13Config(true);
     try std.testing.expect(mtls_cfg.enable_raw_public_key);
     try std.testing.expect(mtls_cfg.request_client_cert);
+}
+
+const ChannelLineKind = enum { privmsg, notice, tagmsg, other };
+
+fn channelLineKind(bytes: []const u8) ChannelLineKind {
+    var index: usize = 0;
+    if (index < bytes.len and bytes[index] == '@') {
+        while (index < bytes.len and bytes[index] != ' ') index += 1;
+        if (index < bytes.len and bytes[index] == ' ') index += 1;
+    }
+    if (index < bytes.len and bytes[index] == ':') {
+        while (index < bytes.len and bytes[index] != ' ') index += 1;
+        if (index < bytes.len and bytes[index] == ' ') index += 1;
+    }
+    const rest = bytes[index..];
+    if (commandTokenIs(rest, "PRIVMSG")) return .privmsg;
+    if (commandTokenIs(rest, "NOTICE")) return .notice;
+    if (commandTokenIs(rest, "TAGMSG")) return .tagmsg;
+    return .other;
+}
+
+fn commandTokenIs(rest: []const u8, word: []const u8) bool {
+    if (rest.len < word.len) return false;
+    if (!std.ascii.eqlIgnoreCase(rest[0..word.len], word)) return false;
+    if (rest.len == word.len) return true;
+    const next = rest[word.len];
+    return next == ' ' or next == '\r' or next == '\n';
+}
+
+/// Channel +c rejects these IRC formatting bytes, including hex colour.
+fn containsIrcFormatting(text: []const u8) bool {
+    for (text) |byte| {
+        switch (byte) {
+            0x02, 0x03, 0x04, 0x0f, 0x11, 0x16, 0x1d, 0x1e, 0x1f => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Whether `text` contains a CTCP request that `+C` should block. CTCP ACTION
@@ -72720,6 +74133,7 @@ fn operTestConfig(port: u16) Config {
         .host = "127.0.0.1",
         .port = port,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
     };
 }
@@ -72730,6 +74144,7 @@ fn multiOperTestConfig(port: u16) Config {
         .port = port,
         .num_shards = 1,
         .sasl_checker = test_multi_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_multi_oper_bindings) catch unreachable,
     };
 }
@@ -72755,6 +74170,7 @@ fn bouncerRewindConfig(port: u16) Config {
         .port = port,
         .num_shards = 1,
         .sasl_checker = test_rewind_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_rewind_bindings) catch unreachable,
     };
 }
@@ -72881,6 +74297,7 @@ fn runtimeGrantTestConfig(port: u16) Config {
         .port = port,
         .num_shards = 1,
         .sasl_checker = test_runtime_grant_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
     };
 }
@@ -90680,10 +92097,13 @@ test "required E2EE room alone exempts its tagged envelope from the ordinary IRC
     const tags = "+onyx/e2ee=mls";
 
     // A syntactically valid encrypted envelope does not extend a nick's line.
+    // The onyx/e2ee client tag is outside that 512-byte message.
+    const e2ee_tag = "@+onyx/e2ee=mls ";
     resetTestSendQ(bob);
     try server.messageOne(alice_id, alice, "PRIVMSG", "bob", envelope, tags);
-    try std.testing.expectEqual(@as(usize, 512), bob.send_len);
-    try std.testing.expect(std.mem.startsWith(u8, bob.send_buf[0..bob.send_len], ":alice!"));
+    try std.testing.expectEqual(@as(usize, 512 + e2ee_tag.len), bob.send_len);
+    try std.testing.expect(std.mem.startsWith(u8, bob.send_buf[0..bob.send_len], e2ee_tag));
+    try std.testing.expect(std.mem.startsWith(u8, bob.send_buf[e2ee_tag.len..bob.send_len], ":alice!"));
     try std.testing.expect(std.mem.endsWith(u8, bob.send_buf[0..bob.send_len], "\r\n"));
 
     _ = try server.world.join("#optional", worldIdFromClient(alice_id));
@@ -90692,7 +92112,7 @@ test "required E2EE room alone exempts its tagged envelope from the ordinary IRC
     _ = try server.props.setProp(optional, e2ee_policy.policy_prop, "optional", .{ .id = "op", .access = .owner });
     resetTestSendQ(bob);
     try server.messageOne(alice_id, alice, "PRIVMSG", "#optional", envelope, tags);
-    try std.testing.expectEqual(@as(usize, 512), bob.send_len);
+    try std.testing.expectEqual(@as(usize, 512 + e2ee_tag.len), bob.send_len);
     var prefix_buf: [320]u8 = undefined;
     const prefix = try clientPrefix(alice, &prefix_buf);
     const ordinary_text_len = 512 - (1 + prefix.len + 1 + "PRIVMSG".len + 1 + "#optional".len + 2 + 2);
@@ -95056,6 +96476,480 @@ test "GAP-P0c remote LISTX carries the peer topic" {
     std.debug.print("GAP-P0c branch=listx remote topic\n", .{});
 }
 
+fn countNeedle(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var rest = haystack;
+    while (std.mem.indexOf(u8, rest, needle)) |index| {
+        count += 1;
+        rest = rest[index + needle.len ..];
+    }
+    return count;
+}
+
+fn ircxLagSay(server: *Server, id: client_model.ClientId, conn: *ConnState, text: []const u8) !void {
+    var buf: [128]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "PRIVMSG #lag :{s}", .{text});
+    var parsed = try irc_line.parseLine(line);
+    try server.handleMessage(id, conn, &parsed, "PRIVMSG");
+}
+
+test "IRCX LISTX query limit truncates at the caller's cap" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const asker_id = try addTestLocalClient(server, "Asker", null);
+    const asker = server.connFor(asker_id).?;
+    _ = try server.world.join("#lx1", worldIdFromClient(asker_id));
+    _ = try server.world.join("#lx2", worldIdFromClient(asker_id));
+    _ = try server.world.join("#lx3", worldIdFromClient(asker_id));
+
+    var bad = try irc_line.parseLine("LISTX >0 nope");
+    try server.handleListx(asker, &bad);
+    try expectContains(asker.send_buf[0..asker.send_len], "Invalid LISTX filter");
+    resetTestSendQ(asker);
+
+    var one = try irc_line.parseLine("LISTX >0 1");
+    try server.handleListx(asker, &one);
+    const capped = asker.send_buf[0..asker.send_len];
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(capped, " 812 Asker "));
+    try expectContains(capped, " 816 Asker 1 ");
+    try expectContains(capped, " 817 Asker ");
+    resetTestSendQ(asker);
+
+    var all = try irc_line.parseLine("LISTX >0 0");
+    try server.handleListx(asker, &all);
+    const open = asker.send_buf[0..asker.send_len];
+    try std.testing.expectEqual(@as(usize, 3), countNeedle(open, " 812 Asker "));
+    try std.testing.expect(std.mem.indexOf(u8, open, " 816 ") == null);
+    try expectContains(open, " 817 Asker ");
+}
+
+test "IRCX PROP LAG delays every member and yields to a longer SLOWMODE" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var sim = reactor_mod.SimReactor.init(1_000_000);
+    server.reactor = sim.reactor();
+
+    const founder_id = try addTestLocalClient(server, "Founder", "founder");
+    const member_id = try addTestLocalClient(server, "Member", "member");
+    const voiced_id = try addTestLocalClient(server, "Voiced", "voiced");
+    const oper_id = try addTestLocalClient(server, "Oper", "oper");
+    const ear_id = try addTestLocalClient(server, "Ear", "ear");
+    const founder = server.connFor(founder_id).?;
+    const member = server.connFor(member_id).?;
+    const voiced = server.connFor(voiced_id).?;
+    const oper = server.connFor(oper_id).?;
+    const ear = server.connFor(ear_id).?;
+    founder.ircx = true;
+    oper.session.is_oper = true;
+
+    _ = try server.world.join("#lag", worldIdFromClient(founder_id));
+    _ = try server.world.join("#lag", worldIdFromClient(member_id));
+    _ = try server.world.join("#lag", worldIdFromClient(voiced_id));
+    _ = try server.world.join("#lag", worldIdFromClient(oper_id));
+    _ = try server.world.join("#lag", worldIdFromClient(ear_id));
+    _ = try server.world.setMemberMode("#lag", worldIdFromClient(voiced_id), .voice, true);
+
+    const channel = ircx_prop_store.Entity{ .kind = .channel, .id = "#lag" };
+    var bad = try irc_line.parseLine("PROP #lag LAG :3");
+    try server.handleProp(founder_id, founder, &bad);
+    try expectContains(founder.send_buf[0..founder.send_len], "Invalid property value");
+    resetTestSendQ(founder);
+    try std.testing.expectError(error.PropMissing, server.props.getProp(channel, "LAG"));
+
+    var set_lag = try irc_line.parseLine("PROP #lag LAG :2");
+    try server.handleProp(founder_id, founder, &set_lag);
+    try std.testing.expectEqualStrings("2", (try server.props.getProp(channel, "LAG")).value);
+
+    resetTestSendQ(member);
+    var steal = try irc_line.parseLine("PROP #lag LAG :1");
+    try server.handleProp(member_id, member, &steal);
+    try expectContains(member.send_buf[0..member.send_len], "Insufficient access");
+    try std.testing.expectEqualStrings("2", (try server.props.getProp(channel, "LAG")).value);
+    resetTestSendQ(member);
+
+    resetTestSendQ(ear);
+    try ircxLagSay(server, member_id, member, "m1");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #lag :m1");
+    resetTestSendQ(member);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, member_id, member, "m2");
+    try expectContains(member.send_buf[0..member.send_len], "(lag)");
+    try std.testing.expect(std.mem.indexOf(u8, ear.send_buf[0..ear.send_len], "PRIVMSG #lag :m2") == null);
+
+    resetTestSendQ(voiced);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, voiced_id, voiced, "v1");
+    try ircxLagSay(server, voiced_id, voiced, "v2");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #lag :v1");
+    try expectContains(voiced.send_buf[0..voiced.send_len], "(lag)");
+    try std.testing.expect(std.mem.indexOf(u8, ear.send_buf[0..ear.send_len], "PRIVMSG #lag :v2") == null);
+
+    resetTestSendQ(oper);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, oper_id, oper, "o1");
+    try ircxLagSay(server, oper_id, oper, "o2");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #lag :o1");
+    try expectContains(oper.send_buf[0..oper.send_len], "(lag)");
+    try std.testing.expect(std.mem.indexOf(u8, ear.send_buf[0..ear.send_len], "PRIVMSG #lag :o2") == null);
+
+    sim.advance(2_000);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, member_id, member, "m3");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #lag :m3");
+
+    resetTestSendQ(founder);
+    var set_slow = try irc_line.parseLine("PROP #lag SLOWMODE :5");
+    try server.handleProp(founder_id, founder, &set_slow);
+    sim.advance(5_000);
+
+    resetTestSendQ(member);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, member_id, member, "s1");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #lag :s1");
+    sim.advance(2_000);
+    resetTestSendQ(member);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, member_id, member, "s2");
+    try expectContains(member.send_buf[0..member.send_len], "slowmode");
+    try std.testing.expect(std.mem.indexOf(u8, ear.send_buf[0..ear.send_len], "PRIVMSG #lag :s2") == null);
+    sim.advance(3_000);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, member_id, member, "s3");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #lag :s3");
+
+    // Voice skips SLOWMODE and still waits out LAG.
+    sim.advance(5_000);
+    resetTestSendQ(voiced);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, voiced_id, voiced, "v3");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #lag :v3");
+    resetTestSendQ(voiced);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, voiced_id, voiced, "v4");
+    try expectContains(voiced.send_buf[0..voiced.send_len], "(lag)");
+    sim.advance(2_000);
+    resetTestSendQ(ear);
+    try ircxLagSay(server, voiced_id, voiced, "v5");
+    try expectContains(ear.send_buf[0..ear.send_len], "PRIVMSG #lag :v5");
+}
+
+const JoinPartCut = struct {
+    line: []const u8,
+    rest: []const u8,
+};
+
+/// Split one IRCX ONJOIN/ONPART value on the two stored bytes `\` + `n`.
+/// A trailing break does not invent an empty line. Real newlines are not cuts.
+fn nextJoinPartLine(value: []const u8) JoinPartCut {
+    var i: usize = 0;
+    while (i + 1 < value.len) : (i += 1) {
+        if (value[i] == '\\' and value[i + 1] == 'n') {
+            return .{ .line = value[0..i], .rest = value[i + 2 ..] };
+        }
+    }
+    return .{ .line = value, .rest = value[value.len..] };
+}
+
+test "IRCX ONJOIN is a channel PRIVMSG and ONPART is a channel NOTICE" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const only = nextJoinPartLine("hello\\nthere");
+    try std.testing.expectEqualStrings("hello", only.line);
+    try std.testing.expectEqualStrings("there", only.rest);
+    const tail = nextJoinPartLine("hello\\n");
+    try std.testing.expectEqualStrings("hello", tail.line);
+    try std.testing.expectEqual(@as(usize, 0), tail.rest.len);
+    const plain = nextJoinPartLine("hello\\there");
+    try std.testing.expectEqualStrings("hello\\there", plain.line);
+
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const founder_id = try addTestLocalClient(server, "Founder", "founder");
+    const member_id = try addTestLocalClient(server, "Member", "member");
+    const founder = server.connFor(founder_id).?;
+    const member = server.connFor(member_id).?;
+    founder.ircx = true;
+
+    var founder_join = try irc_line.parseLine("JOIN #oj");
+    try server.handleJoin(founder_id, founder, &founder_join);
+    const channel = ircx_prop_store.Entity{ .kind = .channel, .id = "#oj" };
+    var set_join = try irc_line.parseLine("PROP #oj ONJOIN :hello\\nthere");
+    try server.handleProp(founder_id, founder, &set_join);
+    try std.testing.expectEqualStrings("hello\\nthere", (try server.props.getProp(channel, "ONJOIN")).value);
+    var set_part = try irc_line.parseLine("PROP #oj ONPART :bye\\nnow");
+    try server.handleProp(founder_id, founder, &set_part);
+    resetTestSendQ(founder);
+
+    var member_join = try irc_line.parseLine("JOIN #oj");
+    try server.handleJoin(member_id, member, &member_join);
+    const joined = member.send_buf[0..member.send_len];
+    try expectContains(joined, ":#oj PRIVMSG Member :hello\r\n");
+    try expectContains(joined, ":#oj PRIVMSG Member :there\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, joined, ":[#oj]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, founder.send_buf[0..founder.send_len], "PRIVMSG Member :") == null);
+
+    resetTestSendQ(member);
+    try server.handleJoin(member_id, member, &member_join);
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], "PRIVMSG Member :") == null);
+
+    resetTestSendQ(founder);
+    resetTestSendQ(member);
+    var member_part = try irc_line.parseLine("PART #oj");
+    try server.handlePart(member_id, member, &member_part);
+    const parted = member.send_buf[0..member.send_len];
+    try expectContains(parted, ":#oj NOTICE Member :bye\r\n");
+    try expectContains(parted, ":#oj NOTICE Member :now\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, parted, ":[#oj]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, founder.send_buf[0..founder.send_len], "NOTICE Member :") == null);
+    try std.testing.expect(std.mem.indexOf(u8, founder.send_buf[0..founder.send_len], "PRIVMSG Member :") == null);
+}
+
+test "IRCX CREATE reply carries the new channel oid" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const founder_id = try addTestLocalClient(server, "Founder", "founder");
+    const member_id = try addTestLocalClient(server, "Member", "member");
+    const other_id = try addTestLocalClient(server, "Other", "other");
+    const founder = server.connFor(founder_id).?;
+    const member = server.connFor(member_id).?;
+    const other = server.connFor(other_id).?;
+
+    var create_line = try irc_line.parseLine("CREATE #oidroom");
+    try server.handleCreate(founder_id, founder, &create_line);
+    const created = founder.send_buf[0..founder.send_len];
+    const oid = server.world.channelOid("#oidroom") orelse return error.TestUnexpectedResult;
+    var oid_buf: [9]u8 = undefined;
+    const oid_text = try std.fmt.bufPrint(&oid_buf, "0{x:0>8}", .{oid});
+    try expectContains(created, " CREATE #oidroom ");
+    try expectContains(created, oid_text);
+    var wire_buf: [128]u8 = undefined;
+    const wire = try std.fmt.bufPrint(&wire_buf, ":{s} CREATE #oidroom {s}\r\n", .{ server.serverName(), oid_text });
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(created, wire));
+
+    resetTestSendQ(member);
+    var member_join = try irc_line.parseLine("JOIN #oidroom");
+    try server.handleJoin(member_id, member, &member_join);
+    try expectContains(member.send_buf[0..member.send_len], " JOIN #oidroom\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], "CREATE") == null);
+
+    const create_lines_before = countOccurrences(founder.send_buf[0..founder.send_len], " CREATE #oidroom ");
+    try std.testing.expectEqual(@as(usize, 1), create_lines_before);
+    resetTestSendQ(founder);
+    try server.handleCreate(founder_id, founder, &create_line);
+    try expectContains(founder.send_buf[0..founder.send_len], " 926 ");
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(founder.send_buf[0..founder.send_len], " CREATE #oidroom "));
+    try std.testing.expect(std.mem.indexOf(u8, founder.send_buf[0..founder.send_len], "CREATE") == null);
+
+    resetTestSendQ(other);
+    var plain_join = try irc_line.parseLine("JOIN #plainnew");
+    try server.handleJoin(other_id, other, &plain_join);
+    try std.testing.expect(server.world.channelExists("#plainnew"));
+    try expectContains(other.send_buf[0..other.send_len], " JOIN #plainnew\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, other.send_buf[0..other.send_len], " CREATE #plainnew ") == null);
+}
+
+test "IRCX visible channel oid joins and a hidden channel oid does not" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const founder_id = try addTestLocalClient(server, "Founder", "founder");
+    const member_id = try addTestLocalClient(server, "Member", "member");
+    const outsider_id = try addTestLocalClient(server, "Outsider", "outsider");
+    const oper_id = try addTestLocalClient(server, "Oper", "oper");
+    const owner_id = try addTestLocalClient(server, "Owner", "owner");
+    const founder = server.connFor(founder_id).?;
+    const member = server.connFor(member_id).?;
+    const outsider = server.connFor(outsider_id).?;
+    const oper = server.connFor(oper_id).?;
+    const owner = server.connFor(owner_id).?;
+    // Network operator, not a channel operator. isOper is the visibility bypass.
+    oper.session.is_oper = true;
+
+    var create_public = try irc_line.parseLine("CREATE #public");
+    try server.handleCreate(founder_id, founder, &create_public);
+    const public_oid = server.world.channelOid("#public") orelse return error.TestUnexpectedResult;
+    var public_oid_buf: [9]u8 = undefined;
+    const public_oid_text = try std.fmt.bufPrint(&public_oid_buf, "0{x:0>8}", .{public_oid});
+
+    resetTestSendQ(member);
+    var cmd_public: [32]u8 = undefined;
+    const member_join_line = try std.fmt.bufPrint(&cmd_public, "JOIN {s}", .{public_oid_text});
+    var member_join = try irc_line.parseLine(member_join_line);
+    try server.handleJoin(member_id, member, &member_join);
+    const member_joined = member.send_buf[0..member.send_len];
+    try expectContains(member_joined, " JOIN #public\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, member_joined, " CREATE ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, member_joined, public_oid_text) == null);
+    try std.testing.expect(server.world.isMember("#public", worldIdFromClient(member_id)));
+    try std.testing.expect(!server.world.channelExists(public_oid_text));
+
+    var create_secret = try irc_line.parseLine("CREATE #secroom");
+    try server.handleCreate(owner_id, owner, &create_secret);
+    _ = try server.world.setChannelFlag("#secroom", .secret, true);
+    try std.testing.expect(server.world.channelHasFlag("#secroom", .secret));
+    const secret_oid = server.world.channelOid("#secroom") orelse return error.TestUnexpectedResult;
+    var secret_oid_buf: [9]u8 = undefined;
+    const secret_oid_text = try std.fmt.bufPrint(&secret_oid_buf, "0{x:0>8}", .{secret_oid});
+
+    // Founder is a channel operator on #public, not a network operator, and not a member here.
+    resetTestSendQ(founder);
+    var cmd_secret_miss: [32]u8 = undefined;
+    const founder_secret_line = try std.fmt.bufPrint(&cmd_secret_miss, "JOIN {s}", .{secret_oid_text});
+    var founder_secret = try irc_line.parseLine(founder_secret_line);
+    try server.handleJoin(founder_id, founder, &founder_secret);
+    const founder_secret_reply = founder.send_buf[0..founder.send_len];
+    var miss_buf: [96]u8 = undefined;
+    const founder_miss = try std.fmt.bufPrint(&miss_buf, " 403 Founder {s} :No such channel\r\n", .{secret_oid_text});
+    try expectContains(founder_secret_reply, founder_miss);
+    try std.testing.expect(std.mem.indexOf(u8, founder_secret_reply, "#secroom") == null);
+    try std.testing.expect(!server.world.isMember("#secroom", worldIdFromClient(founder_id)));
+
+    var member_secret_name = try irc_line.parseLine("JOIN #secroom");
+    try server.handleJoin(member_id, member, &member_secret_name);
+    try std.testing.expect(server.world.isMember("#secroom", worldIdFromClient(member_id)));
+    resetTestSendQ(member);
+    var cmd_secret_member: [32]u8 = undefined;
+    const member_secret_line = try std.fmt.bufPrint(&cmd_secret_member, "JOIN {s}", .{secret_oid_text});
+    var member_secret = try irc_line.parseLine(member_secret_line);
+    try server.handleJoin(member_id, member, &member_secret);
+    // Already a member: re-JOIN stays on the canonical channel and must not 403.
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], " 403 ") == null);
+    try std.testing.expect(server.world.isMember("#secroom", worldIdFromClient(member_id)));
+    try std.testing.expect(!server.world.channelExists(secret_oid_text));
+
+    resetTestSendQ(oper);
+    var cmd_secret_oper: [32]u8 = undefined;
+    const oper_secret_line = try std.fmt.bufPrint(&cmd_secret_oper, "JOIN {s}", .{secret_oid_text});
+    var oper_secret = try irc_line.parseLine(oper_secret_line);
+    try server.handleJoin(oper_id, oper, &oper_secret);
+    try expectContains(oper.send_buf[0..oper.send_len], " JOIN #secroom\r\n");
+    try std.testing.expect(server.world.isMember("#secroom", worldIdFromClient(oper_id)));
+
+    var create_hidden = try irc_line.parseLine("CREATE #hidroom");
+    try server.handleCreate(owner_id, owner, &create_hidden);
+    _ = try server.world.setHidden("#hidroom", true);
+    try std.testing.expect(server.world.isHidden("#hidroom"));
+    const hidden_oid = server.world.channelOid("#hidroom") orelse return error.TestUnexpectedResult;
+    var hidden_oid_buf: [9]u8 = undefined;
+    const hidden_oid_text = try std.fmt.bufPrint(&hidden_oid_buf, "0{x:0>8}", .{hidden_oid});
+    resetTestSendQ(outsider);
+    var cmd_hidden: [32]u8 = undefined;
+    const outsider_hidden_line = try std.fmt.bufPrint(&cmd_hidden, "JOIN {s}", .{hidden_oid_text});
+    var outsider_hidden = try irc_line.parseLine(outsider_hidden_line);
+    try server.handleJoin(outsider_id, outsider, &outsider_hidden);
+    const hidden_reply = outsider.send_buf[0..outsider.send_len];
+    const hidden_miss = try std.fmt.bufPrint(&miss_buf, " 403 Outsider {s} :No such channel\r\n", .{hidden_oid_text});
+    try expectContains(hidden_reply, hidden_miss);
+    try std.testing.expect(std.mem.indexOf(u8, hidden_reply, "#hidroom") == null);
+    try std.testing.expect(!server.world.isMember("#hidroom", worldIdFromClient(outsider_id)));
+
+    resetTestSendQ(outsider);
+    var join_zero_oid = try irc_line.parseLine("JOIN 000000000");
+    try server.handleJoin(outsider_id, outsider, &join_zero_oid);
+    try expectContains(outsider.send_buf[0..outsider.send_len], " 403 Outsider 000000000 :No such channel\r\n");
+
+    resetTestSendQ(outsider);
+    var join_missing = try irc_line.parseLine("JOIN 0deadbeef");
+    try server.handleJoin(outsider_id, outsider, &join_missing);
+    try expectContains(outsider.send_buf[0..outsider.send_len], " 403 Outsider 0deadbeef :No such channel\r\n");
+    try std.testing.expect(!server.world.channelExists("0deadbeef"));
+    try std.testing.expect(!server.world.channelExists("000000000"));
+
+    resetTestSendQ(outsider);
+    var join_plain = try irc_line.parseLine("JOIN #plain");
+    try server.handleJoin(outsider_id, outsider, &join_plain);
+    try std.testing.expect(server.world.channelExists("#plain"));
+    const plain_reply = outsider.send_buf[0..outsider.send_len];
+    try expectContains(plain_reply, " JOIN #plain\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, plain_reply, " CREATE ") == null);
+
+    resetTestSendQ(outsider);
+    var join_short = try irc_line.parseLine("JOIN 0abc");
+    try server.handleJoin(outsider_id, outsider, &join_short);
+    try expectContains(outsider.send_buf[0..outsider.send_len], " 403 Outsider 0abc :No such channel\r\n");
+    try std.testing.expect(!server.world.channelExists("0abc"));
+
+    var join_part_all = try irc_line.parseLine("JOIN 0");
+    try server.handleJoin(member_id, member, &join_part_all);
+    try std.testing.expectEqual(@as(usize, 0), server.world.channelCountOf(worldIdFromClient(member_id)));
+    try std.testing.expect(!server.world.isMember("#public", worldIdFromClient(member_id)));
+    try std.testing.expect(!server.world.isMember("#secroom", worldIdFromClient(member_id)));
+
+    resetTestSendQ(founder);
+    try server.handleIrcx(founder, false);
+    const ircx_reply = founder.send_buf[0..founder.send_len];
+    try expectContains(ircx_reply, " 800 Founder 0 0 ");
+    try expectContains(ircx_reply, " 512 :OID=visible\r\n");
+}
+
 /// Blocking read with a bounded poll budget (so a misbehaving server fails the
 /// test instead of hanging). Accumulates into `client` and returns when `needle`
 /// is present, or errors after ~3s.
@@ -95665,6 +97559,7 @@ test "threaded server: session-sync fresh login defers autojoin until SESSION TO
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var cfg = operTestConfig(0);
     cfg.sasl_checker = test_dm_relay_checker;
+    cfg.allow_plaintext_password_sasl = true;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -95713,6 +97608,7 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
         .crypto_io = std.testing.io,
@@ -97378,6 +99274,7 @@ test "threaded server: EXTERNAL auto-resume latch excludes certificates and PLAI
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .sasl_external = test_external_lookup,
         .crypto_io = std.testing.io,
     }) catch |err| switch (err) {
@@ -99335,6 +101232,7 @@ test "threaded server: CHANNEL ACCESS grants, denies non-founder, and queries" {
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
     }) catch |err| switch (err) {
@@ -99415,6 +101313,7 @@ test "threaded server: CHANNEL AKICK add mirrors to live join gate and kicks cur
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
     }) catch |err| switch (err) {
@@ -99521,6 +101420,7 @@ test "threaded server: CHANNEL SET TOPICLOCK DESC URL PRIVATE persist and take e
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
     }) catch |err| switch (err) {
@@ -99606,6 +101506,7 @@ test "threaded server: STATS m reports per-command usage to an oper" {
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
     }) catch |err| switch (err) {
@@ -99809,6 +101710,7 @@ test "threaded server: SASL oper elevation persists inactive OCG1 compatibility 
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
         .oper_grants_path = grants_path,
@@ -99878,6 +101780,7 @@ test "threaded server: a joining network operator announces the derived +Y prefi
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
     }) catch |err| switch (err) {
@@ -100060,6 +101963,7 @@ test "threaded server: ACCOUNT oper lifecycle command controls account auth" {
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
     }) catch |err| switch (err) {
@@ -100153,6 +102057,7 @@ test "threaded server: SACCESS GRANT overrides DENY at registration" {
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
     }) catch |err| switch (err) {
@@ -100226,6 +102131,7 @@ test "threaded server: SACCESS HOLDNICK reserves a nick glob; opers bypass" {
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
     }) catch |err| switch (err) {
@@ -100376,6 +102282,7 @@ test "threaded server: registered nick requires owner authentication before use"
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .account_services = &services,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -102729,6 +104636,7 @@ test "threaded server: reusable session keeps all local clients live, synchroniz
     // deliberately kick-immune, which would test +Y protection instead of
     // logical-session KICK fan-out.
     cfg.sasl_checker = test_dm_relay_checker;
+    cfg.allow_plaintext_password_sasl = true;
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -103001,8 +104909,16 @@ test "threaded server: overlong multiline concat rejects before delivery and his
     try writeAllFd(fd_b, "PING :multiline-barrier\r\n");
     try recvUntil(&b, "PONG onyx.local :multiline-barrier", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "PRIVMSG #m") == null);
-    var history_buf: [1]lotus.Message = undefined;
-    try std.testing.expectEqual(@as(usize, 0), (try server.history.latest("#m", history_buf.len, &history_buf)).len);
+    // JOIN itself is recorded for event playback. The rejected concat must not
+    // add a PRIVMSG or NOTICE row, or any of the chunk bytes.
+    var history_buf: [8]lotus.Message = undefined;
+    const recorded = try server.history.latest("#m", history_buf.len, &history_buf);
+    for (recorded) |row| {
+        try std.testing.expect(!std.mem.eql(u8, row.command, "PRIVMSG"));
+        try std.testing.expect(!std.mem.eql(u8, row.command, "NOTICE"));
+        try std.testing.expect(std.mem.indexOfScalar(u8, row.text, 'a') == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, row.text, 'b') == null);
+    }
 }
 
 test "threaded server: draft/multiline CAP value follows runtime config" {
@@ -105278,6 +107194,8 @@ test "TLS3: Server armed SEND and real partial CQEs drain old ciphertext before 
 // ring and lets actual CQEs retire it. The peer proves the control did not
 // overtake any previously accepted plaintext, including an overflow suffix.
 fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bool, sq_pressure: bool, clean_close: bool, quiesce_pressure: bool) !void {
+    // This host's TCP ULP list has no `tls`. Attaching kTLS is KtlsUlpUnsupported.
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     defer current_reactor = null;
     const a = std.testing.allocator;
     var fixture = try Tls3ServerFixture.createTransport(suite, true);
@@ -105611,6 +107529,7 @@ fn tls3ServerPeerFatal(suite: u16, kernel_tx: bool) !void {
 
 test "TLS3: authenticated peer fatal after armed prefix retires exact physical generation without reply or suffix" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |tx| try tls3ServerPeerFatal(suite, tx);
 }
 
@@ -105724,7 +107643,7 @@ test "TLS3: paired capture and physical adoption every allocation fault retains 
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
         try tls3ServerCaptureAdoptFaults(suite, false);
-        if (comptime builtin.os.tag == .linux) try tls3ServerCaptureAdoptFaults(suite, true);
+        if (builtin.os.tag == .linux and ktls.probeUlpSupport()) try tls3ServerCaptureAdoptFaults(suite, true);
     }
 }
 
@@ -106036,6 +107955,7 @@ test "TLS3: clean software drain-close retains accepted phase3 plaintext through
 
 test "TLS3: kernel RX with software TX retains clean-close plaintext through every phase3 preparation OOM" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]Tls3DrainFault{ .metadata, .tls, .sendq }) |point|
         try tls3ServerSoftwareCloseRetry(suite, point, true);
 }
@@ -106339,6 +108259,7 @@ fn tls3ServerPartialReplyAdopt(suite: u16, kernel_rx: bool, first: usize) !void 
 
 test "TLS3: real typed TX reply offsets zero through four and plaintext suffix survive two physical adoptions" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |rx| for (0..5) |first| try tls3ServerPartialReplyAdopt(suite, rx, first);
 }
 
@@ -106480,11 +108401,13 @@ fn tls3ServerKernelReplyPressure(suite: u16, kernel_rx: bool) !void {
 
 test "TLS3: actual typed reply WouldBlock retains epoch credit and accepted suffix until peer drains" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |rx| try tls3ServerKernelReplyPressure(suite, rx);
 }
 
 test "TLS3: staged physical adoption rejects wrong actual kernel secret and sequence before FD publication" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     defer current_reactor = null;
     const a = std.testing.allocator;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
@@ -106534,6 +108457,7 @@ test "TLS3: staged physical adoption rejects wrong actual kernel secret and sequ
 
 test "TLS3: actual kernel getter failure before and after accepted reply prefix disposes terminal suffix" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     defer current_reactor = null;
     const a = std.testing.allocator;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |partial| {
@@ -106602,6 +108526,7 @@ fn tls3ServerCloseAfterAcceptedReply(ctx: *anyopaque, fd: i32) void {
 
 test "TLS3: real TX install failure after full accepted KU refuses replay and disposes plaintext suffix" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     defer current_reactor = null;
     const a = std.testing.allocator;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| for ([_]bool{ false, true }) |partial| {
@@ -106892,6 +108817,7 @@ fn tls3ServerKernelAdopt(suite: u16, kernel_tx: bool) !void {
 
 test "TLS3: real kernel phase2 and partial KU preserve physical FD through two strict adoptions" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
         for ([_]bool{ false, true }) |tx| try tls3ServerKernelAdopt(suite, tx);
     }
@@ -110271,6 +112197,201 @@ test "threaded server: +x auditorium hides regular members in NAMES" {
     try std.testing.expect(std.mem.indexOf(u8, c.written(), "B") == null);
 }
 
+test "threaded server: whisper auditorium returns 441" {
+    const server = createTestServer(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_c = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_c);
+    const fd_d = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_d);
+    const alloc = std.testing.allocator;
+    const a = try alloc.create(LiveClient);
+    defer alloc.destroy(a);
+    const b = try alloc.create(LiveClient);
+    defer alloc.destroy(b);
+    const c = try alloc.create(LiveClient);
+    defer alloc.destroy(c);
+    const d = try alloc.create(LiveClient);
+    defer alloc.destroy(d);
+    a.* = .{ .fd = fd_a };
+    b.* = .{ .fd = fd_b };
+    c.* = .{ .fd = fd_c };
+    d.* = .{ .fd = fd_d };
+    try writeAllFd(fd_a, "NICK A\r\nUSER alice 0 * :Alice\r\n");
+    try writeAllFd(fd_b, "NICK B\r\nUSER bob 0 * :Bob\r\n");
+    try writeAllFd(fd_c, "NICK C\r\nUSER carol 0 * :Carol\r\n");
+    try writeAllFd(fd_d, "NICK D\r\nUSER dana 0 * :Dana\r\n");
+    try recvUntil(a, " 001 A ", 200);
+    try recvUntil(b, " 001 B ", 200);
+    try recvUntil(c, " 001 C ", 200);
+    try recvUntil(d, " 001 D ", 200);
+    // WHISPER is gated until the session opts into IRCX.
+    try writeAllFd(fd_a, "IRCX\r\n");
+    try writeAllFd(fd_c, "IRCX\r\n");
+    try recvUntil(a, " 800 A 1 0 ", 200);
+    try recvUntil(c, " 800 C 1 0 ", 200);
+    try writeAllFd(fd_a, "JOIN #aud\r\n");
+    try recvUntil(a, " 366 A #aud ", 200);
+    try writeAllFd(fd_b, "JOIN #aud\r\n");
+    try recvUntil(b, " 366 B #aud ", 200);
+    try writeAllFd(fd_c, "JOIN #aud\r\n");
+    try recvUntil(c, " 366 C #aud ", 200);
+    try writeAllFd(fd_a, "MODE #aud +x\r\n");
+    try recvUntil(a, "MODE #aud +x", 200);
+
+    // D never joined. That 441 is the reply a hidden member must match.
+    c.reset();
+    try writeAllFd(fd_c, "WHISPER #aud D :off-channel\r\n");
+    try recvUntil(c, " 441 C D #aud :They aren't on that channel", 200);
+
+    // B is a regular member. C gets the same 441 and B does not receive the text.
+    b.reset();
+    c.reset();
+    try writeAllFd(fd_c, "WHISPER #aud B :hidden-regular\r\n");
+    try recvUntil(c, " 441 C B #aud :They aren't on that channel", 200);
+    b.readAvailable() catch {};
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "hidden-regular") == null);
+
+    // An operator is visible to a regular, so C can whisper A.
+    a.reset();
+    try writeAllFd(fd_c, "WHISPER #aud A :to-op\r\n");
+    try recvUntil(a, ":C!carol@localhost WHISPER #aud A :to-op", 200);
+
+    // An operator can whisper a regular.
+    b.reset();
+    try writeAllFd(fd_a, "WHISPER #aud B :from-op\r\n");
+    try recvUntil(b, ":A!alice@localhost WHISPER #aud B :from-op", 200);
+
+    // Voice can whisper a regular.
+    try writeAllFd(fd_a, "MODE #aud +v C\r\n");
+    try recvUntil(a, "MODE #aud +v C", 200);
+    b.reset();
+    try writeAllFd(fd_c, "WHISPER #aud B :from-voice\r\n");
+    try recvUntil(b, ":C!carol@localhost WHISPER #aud B :from-voice", 200);
+
+    // +w still denies everyone, including the operator.
+    try writeAllFd(fd_a, "MODE #aud +w\r\n");
+    try recvUntil(a, "MODE #aud +w", 200);
+    a.reset();
+    b.reset();
+    try writeAllFd(fd_a, "WHISPER #aud B :nowhisper\r\n");
+    try recvUntil(a, " 923 ", 200);
+    b.readAvailable() catch {};
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "nowhisper") == null);
+}
+
+test "threaded server: plaintext password SASL is refused" {
+    // TLS accept advertises and completes PLAIN. This client is not polled:
+    // is_tls with no tls object still queues plaintext into send_buf.
+    const tls_host = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    {
+        defer {
+            tls_host.deinit();
+            std.testing.allocator.destroy(tls_host);
+        }
+        const host_id = try tls_host.rx().clients.alloc(ConnState.init(-1));
+        const host_conn = tls_host.connFor(host_id).?;
+        host_conn.token = try tokenFromId(host_id);
+        host_conn.overflow_allocator = tls_host.allocator;
+        host_conn.is_tls = true;
+        tls_host.injectSessionState(host_conn);
+        try tls_host.processLiveLine(host_id, host_conn, "CAP LS 302");
+        try std.testing.expect(std.mem.indexOf(u8, host_conn.send_buf[0..host_conn.send_len], "PLAIN") != null);
+        host_conn.send_len = 0;
+        try tls_host.processLiveLine(host_id, host_conn, "CAP REQ :sasl");
+        try tls_host.processLiveLine(host_id, host_conn, "AUTHENTICATE PLAIN");
+        var plain_raw: [32]u8 = undefined;
+        const plain_b64 = std.base64.standard.Encoder.encode(&plain_raw, "\x00admin\x00onyx");
+        var auth_line_buf: [64]u8 = undefined;
+        const auth_line = try std.fmt.bufPrint(&auth_line_buf, "AUTHENTICATE {s}", .{plain_b64});
+        try tls_host.processLiveLine(host_id, host_conn, auth_line);
+        try std.testing.expectEqualStrings("admin", host_conn.session.account() orelse return error.TestUnexpectedResult);
+    }
+
+    // Plaintext listener: the default latch is false, so password mechanisms
+    // are omitted and both AUTH and AUTHENTICATE fail closed. AUTHENTICATE is
+    // pre-registration; IRCX AUTH is a registered command.
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    const alloc = std.testing.allocator;
+    const client = try alloc.create(LiveClient);
+    defer alloc.destroy(client);
+    client.* = .{ .fd = fd };
+
+    // " LS :" is the final CAP LS chunk. Continuation lines are " LS * :".
+    try writeAllFd(fd, "CAP LS 302\r\n");
+    try recvUntil(client, " LS :", 200);
+    client.readAvailable() catch {};
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), "PLAIN") == null);
+
+    client.reset();
+    try writeAllFd(fd, "IRCX\r\n");
+    try recvUntil(client, " 800 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), "PLAIN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), "OID=visible") != null);
+
+    client.reset();
+    try writeAllFd(fd, "CAP REQ :sasl\r\nAUTHENTICATE PLAIN\r\n");
+    try recvUntil(client, " 904 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), " 903 ") == null);
+
+    client.reset();
+    try writeAllFd(fd, "CAP END\r\nNICK A\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(client, " 376 A ", 200);
+    client.readAvailable() catch {};
+    client.reset();
+    // IRCX AUTH is `AUTH <package> <I|C|*>`. A bare package is 461, before the
+    // password-mechanism refusal. `I` is the initial exchange.
+    try writeAllFd(fd, "AUTH PLAIN I\r\n");
+    try recvUntil(client, " 910 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, client.written(), "Authentication failed") != null);
+}
+
 test "threaded server: MODEX NOFORMAT does not collide with channel forward +f" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -110457,6 +112578,9 @@ test "threaded server: media user modes block transmit and hide automatic presen
     };
     defer server.deinit();
     const port = try server.boundPort();
+    // Logical MEDIA JOIN needs the membership owner. Production main calls
+    // start() before runThreaded; UDP stays off in this config.
+    server.start();
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
     defer {
@@ -110529,6 +112653,9 @@ test "threaded server: re-handshake detaches superseded attachment and same-nick
     defer server.deinit();
     const identity = try enrollTestMediaIdentity(&server, "admin", "detach-explicit", 0x73);
     const port = try server.boundPort();
+    // Logical MEDIA JOIN needs the membership owner. Production main calls
+    // start() before runThreaded; UDP stays off in this config.
+    server.start();
 
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
@@ -110682,6 +112809,9 @@ test "threaded server: same-nick disconnect detaches crypto attachment before fi
     defer server.deinit();
     const identity = try enrollTestMediaIdentity(&server, "admin", "detach-disconnect", 0x74);
     const port = try server.boundPort();
+    // Logical MEDIA JOIN needs the membership owner. Production main calls
+    // start() before runThreaded; UDP stays off in this config.
+    server.start();
 
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
@@ -110780,6 +112910,9 @@ test "threaded server: PART and KICK retire physical media before channel member
     }
     const identity = try enrollTestMediaIdentity(server, "admin", "membership-retire", 0x75);
     const port = try server.boundPort();
+    // Logical MEDIA JOIN needs the membership owner. Production main calls
+    // start() before runThreaded; UDP stays off in this config.
+    server.start();
 
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
@@ -110898,6 +113031,9 @@ test "threaded server: mid-call NICK retires old media authority before identity
     defer server.deinit();
     const identity = try enrollTestMediaIdentity(&server, "admin", "nick-retire", 0x76);
     const port = try server.boundPort();
+    // Logical MEDIA JOIN needs the membership owner. Production main calls
+    // start() before runThreaded; UDP stays off in this config.
+    server.start();
 
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
@@ -111012,6 +113148,9 @@ test "threaded server: account logout and replacement retire old physical media 
     const admin_identity = try enrollTestMediaIdentity(server, "admin", "account-old", 0x77);
     const bob_identity = try enrollTestMediaIdentity(server, "bob", "account-new", 0x78);
     const port = try server.boundPort();
+    // Logical MEDIA JOIN needs the membership owner. Production main calls
+    // start() before runThreaded; UDP stays off in this config.
+    server.start();
 
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
@@ -111163,6 +113302,9 @@ test "threaded server: authenticated call participants relay bounded opaque E2EE
     const identity_entity = ircx_prop_store.Entity{ .kind = .user, .id = "admin" };
     _ = try server.props.setProp(identity_entity, "identity.key.media", identity_value, .{ .id = "admin", .access = .member });
     const port = try server.boundPort();
+    // Logical MEDIA JOIN needs the membership owner. Production main calls
+    // start() before runThreaded; UDP stays off in this config.
+    server.start();
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
     defer {
@@ -111957,10 +114099,11 @@ test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs
     try recvUntil(&a, "FAIL MEDIA BAD_FINGERPRINT", 200);
 }
 
-test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails closed on a fingerprint request" {
+test "threaded server: MEDIA OFFER with DTLS off refuses plaintext credentials and fails closed on a fingerprint request" {
     var cfg = multiOperTestConfig(0);
     cfg.media_enabled = true;
     cfg.media_dtls_srtp = false; // DTLS-SRTP disabled (default)
+    cfg.crypto_io = std.testing.io;
     const server = try std.testing.allocator.create(Server);
     defer std.testing.allocator.destroy(server);
     server.initInPlace(std.testing.allocator, cfg) catch |err| switch (err) {
@@ -111968,6 +114111,8 @@ test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails close
         else => return err,
     };
     defer server.deinit();
+    server.start();
+    if (server.media_plane.port == 0) return error.SkipZigTest;
     const port = try server.boundPort();
     var run = std.atomic.Value(bool).init(true);
     var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
@@ -111986,13 +114131,13 @@ test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails close
     try writeAllFd(fd_a, "JOIN #media\r\n");
     try recvUntil(&a, " 366 A #media ", 200);
 
-    // With the feature off, a plain OFFER still ships the legacy srtp= group key.
+    // Plaintext IRC cannot carry the SRTP group key. DTLS being off does not
+    // put that secret on the socket.
     a.reset();
     try writeAllFd(fd_a, "MEDIA OFFER #media cadencevox transport=webrtc\r\n");
-    try recvUntil(&a, "EVENT A MEDIA TRANSPORT #media", 200);
-    try recvUntil(&a, "srtp=", 200);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, a.written(), "fingerprint=") == null);
+    try recvUntil(&a, "FAIL MEDIA SECURE_SIGNALING_REQUIRED", 200);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "ufrag=") == null);
 
     // A DTLS keying request when the server has it off fails closed (no media,
     // no leaked group key).
@@ -114566,15 +116711,20 @@ test "threaded server: SUCCESSOR hands a dropped founder's channel to its succes
     _ = try services.registerAccount("alice", "correcthorse", &scratch);
     _ = try services.registerAccount("bob", "correcthorse", &scratch);
     _ = try services.registerAccount("carol", "correcthorse", &scratch);
+    // The hold starts at this clock. SHOW and DROP run after it elapses.
+    services.clock_override_ms.store(1_000, .seq_cst);
 
-    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
+    const server = createTestServer(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .account_services = &services }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
     };
-    defer server.deinit();
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
     const port = try server.boundPort();
     var run = std.atomic.Value(bool).init(true);
-    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
     defer {
         run.store(false, .release);
         if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
@@ -114596,6 +116746,7 @@ test "threaded server: SUCCESSOR hands a dropped founder's channel to its succes
     try recvUntil(&a, "Channel #ch registered to alice", 300);
     try writeAllFd(fd_a, "SUCCESSOR #ch SET bob\r\n");
     try recvUntil(&a, "#ch successor set to bob", 300);
+    services.clock_override_ms.store(1_000 + services_mod.successor_hold_ms, .seq_cst);
     a.reset();
     try writeAllFd(fd_a, "SUCCESSOR #ch SHOW\r\n");
     try recvUntil(&a, "#ch successor is bob", 300);
@@ -114612,6 +116763,206 @@ test "threaded server: SUCCESSOR hands a dropped founder's channel to its succes
     try recvUntil(&b, "You are now identified as bob", 300);
     try writeAllFd(fd_b, "SUCCESSOR #ch SET carol\r\n");
     try recvUntil(&b, "#ch successor set to carol", 300);
+}
+
+test "login prefix is new only for an unseen certificate or passkey" {
+    var seen = services_mod.LoginAuditEntry{
+        .mechanism = .external,
+        .tls = .tls,
+        .certfp_len = 4,
+    };
+    @memcpy(seen.certfp_prefix[0..4], "abcd");
+    const rows = [_]services_mod.LoginAuditEntry{seen};
+    try std.testing.expect(!LinuxServer.loginPrefixIsNew(&rows, seen));
+
+    var other = seen;
+    other.certfp_prefix[0] = 'z';
+    try std.testing.expect(LinuxServer.loginPrefixIsNew(&rows, other));
+
+    var pass = seen;
+    pass.mechanism = .passkey;
+    try std.testing.expect(LinuxServer.loginPrefixIsNew(&rows, pass));
+    const pass_rows = [_]services_mod.LoginAuditEntry{pass};
+    try std.testing.expect(!LinuxServer.loginPrefixIsNew(&pass_rows, pass));
+
+    var bare = seen;
+    bare.certfp_len = 0;
+    try std.testing.expect(!LinuxServer.loginPrefixIsNew(&rows, bare));
+}
+
+test "new sign-in notice reaches the other session with a certificate prefix" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-new-signin.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "correcthorse", &scratch);
+
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    // 64-hex fingerprints. LOGINS may show only the first 8 characters.
+    const fp_ann = "abcdef01deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    const fp_bob = "bbbbbbb2cafebabecafebabecafebabecafebabecafebabecafebabecafebabe";
+    const fp_ned = "ccccccc3ffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    try std.testing.expectEqual(@as(usize, 64), fp_ann.len);
+    try std.testing.expectEqual(@as(usize, 64), fp_bob.len);
+    try std.testing.expectEqual(@as(usize, 64), fp_ned.len);
+
+    const id_ann = try addTestLocalClient(server, "Ann", null);
+    const id_bob = try addTestLocalClient(server, "Bob", null);
+    const ann = server.connFor(id_ann).?;
+    const bob = server.connFor(id_bob).?;
+    ann.test_sendq_capture = true;
+    bob.test_sendq_capture = true;
+    ann.is_tls = true;
+    bob.is_tls = true;
+    ann.session.tls_certfp = fp_ann;
+    bob.session.tls_certfp = fp_bob;
+
+    var identify = irc_line.LineView{ .raw = "", .command = "IDENTIFY" };
+    identify.params[0] = "alice";
+    identify.params[1] = "correcthorse";
+    identify.param_count = 2;
+    try server.handleIdentify(ann, &identify);
+    try std.testing.expectEqualStrings("alice", ann.session.account() orelse return error.TestUnexpectedResult);
+
+    resetTestSendQ(ann);
+    resetTestSendQ(bob);
+    try server.handleIdentify(bob, &identify);
+    try std.testing.expectEqualStrings("alice", bob.session.account() orelse return error.TestUnexpectedResult);
+    try std.testing.expect(std.mem.indexOf(u8, ann.send_buf[0..ann.send_len], "New sign-in on your account (password).") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bob.send_buf[0..bob.send_len], "New sign-in on your account (password).") == null);
+
+    resetTestSendQ(ann);
+    var logins = irc_line.LineView{ .raw = "", .command = "ACCOUNTINFO" };
+    logins.params[0] = "LOGINS";
+    logins.param_count = 1;
+    try server.handleAccountInfo(ann, &logins);
+    const login_lines = ann.send_buf[0..ann.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, login_lines, "tls=tls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, login_lines, "prefix=abcdef01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, login_lines, "prefix=bbbbbbb2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, login_lines, "deadbeef") == null);
+    try std.testing.expect(std.mem.indexOf(u8, login_lines, "cafebabe") == null);
+
+    const id_sam = try addTestLocalClient(server, "Sam", null);
+    const sam = server.connFor(id_sam).?;
+    sam.test_sendq_capture = true;
+    sam.is_tls = true;
+    sam.session.tls_certfp = fp_ann;
+    resetTestSendQ(ann);
+    try server.handleIdentify(sam, &identify);
+    try std.testing.expectEqualStrings("alice", sam.session.account() orelse return error.TestUnexpectedResult);
+    try std.testing.expect(std.mem.indexOf(u8, ann.send_buf[0..ann.send_len], "New sign-in") == null);
+
+    ann.sendq_cap = 0;
+    resetTestSendQ(ann);
+    const id_ned = try addTestLocalClient(server, "Ned", null);
+    const ned = server.connFor(id_ned).?;
+    ned.test_sendq_capture = true;
+    ned.is_tls = true;
+    ned.session.tls_certfp = fp_ned;
+    try server.handleIdentify(ned, &identify);
+    try std.testing.expectEqualStrings("alice", ned.session.account() orelse return error.TestUnexpectedResult);
+    try std.testing.expect(std.mem.indexOf(u8, ann.send_buf[0..ann.send_len], "New sign-in") == null);
+}
+
+test "threaded server: ACCOUNTINFO LOGINS and WEBAUTHN LOCK" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-logins.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "correcthorse", &scratch);
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+    const origins = [_][]const u8{"https://chat.example"};
+
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .webauthn_rp_id = "chat.example",
+        .webauthn_origins = &origins,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var a = LiveClient{ .fd = fd_a };
+    var b = LiveClient{ .fd = fd_b };
+
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :A\r\n");
+    try recvUntil(&a, " 001 A ", 200);
+    try writeAllFd(fd_a, "IDENTIFY alice correcthorse\r\n");
+    try recvUntil(&a, "You are now identified as alice", 300);
+    a.reset();
+    try writeAllFd(fd_a, "ACCOUNTINFO LOGINS\r\n");
+    try recvUntil(&a, "mechanism=password", 300);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "tls=clear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "prefix=-") != null);
+
+    a.reset();
+    try writeAllFd(fd_a, "ACCOUNTINFO\r\n");
+    try recvUntil(&a, "passkey_only=false", 300);
+    a.reset();
+    try writeAllFd(fd_a, "WEBAUTHN LOCK\r\n");
+    try recvUntil(&a, "PASSKEY_REQUIRED", 300);
+
+    try services.webauthnBind("alice", "abc", "k", 0, "", 1);
+    a.reset();
+    try writeAllFd(fd_a, "WEBAUTHN LOCK\r\n");
+    try recvUntil(&a, "WEBAUTHN LOCKED", 300);
+    a.reset();
+    try writeAllFd(fd_a, "ACCOUNTINFO\r\n");
+    try recvUntil(&a, "passkey_only=true", 300);
+
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(&b, " 001 B ", 200);
+    try writeAllFd(fd_b, "IDENTIFY alice correcthorse\r\n");
+    try recvUntil(&b, "Invalid account or password", 300);
+    b.reset();
+    try writeAllFd(fd_b, "IDENTIFY bob correcthorse\r\n");
+    try recvUntil(&b, "You are now identified as bob", 300);
+    b.reset();
+    try writeAllFd(fd_b, "ACCOUNTINFO LOGINS alice\r\n");
+    try recvUntil(&b, " 481 ", 300);
+
+    a.reset();
+    try writeAllFd(fd_a, "ACCOUNTINFO LOGINS\r\n");
+    try recvUntil(&a, "mechanism=password", 300);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "mechanism=password") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), "Invalid account or password") == null);
 }
 
 test "threaded server: SESSIONS lists connections and filters (oper)" {
@@ -114831,6 +117182,7 @@ test "account-switch ratchet standard SASL then post-auth replacement never unio
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_account_switch_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_account_switch_bindings) catch unreachable,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -115197,6 +117549,7 @@ test "threaded server: PROP user ACCOUNT provider returns the target's login" {
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
     }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
@@ -122124,34 +124477,44 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
     } else return error.SkipZigTest;
 }
 
-fn reserveTwoLoopbackPorts() ServerError!struct { u16, u16 } {
-    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
-        const fd1 = try createListener("127.0.0.1", 0, 8);
-        defer closeFd(fd1);
-        const fd2 = try createListener("127.0.0.1", 0, 8);
-        defer closeFd(fd2);
-        return .{ try socketPort(fd1), try socketPort(fd2) };
-    } else return error.Unsupported;
+fn duplicateListenerFd(fd: linux.fd_t) ServerError!linux.fd_t {
+    const rc = linux.dup(fd);
+    if (linux.errno(@as(u64, @intCast(rc))) != .SUCCESS) return error.SocketUnavailable;
+    return @as(linux.fd_t, @intCast(rc));
 }
 
-fn reserveThreeLoopbackPorts() ServerError!struct { u16, u16, u16 } {
-    if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
-        const fd1 = try createListener("127.0.0.1", 0, 8);
-        defer closeFd(fd1);
-        const fd2 = try createListener("127.0.0.1", 0, 8);
-        defer closeFd(fd2);
-        const fd3 = try createListener("127.0.0.1", 0, 8);
-        defer closeFd(fd3);
-        return .{ try socketPort(fd1), try socketPort(fd2), try socketPort(fd3) };
-    } else return error.Unsupported;
+const HeldLoopbackListener = struct {
+    fd: linux.fd_t,
+    port: u16,
+
+    fn close(self: HeldLoopbackListener) void {
+        closeFd(self.fd);
+    }
+};
+
+fn holdLoopbackListener() ServerError!HeldLoopbackListener {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.Unsupported;
+    const fd = try createListener("127.0.0.1", 0, 8);
+    errdefer closeFd(fd);
+    return .{ .fd = fd, .port = try socketPort(fd) };
 }
 
-/// Heavyweight mesh acceptance tests temporarily release their probed S2S
-/// ports before the real listeners bind them. Multiple copies of the tests
-/// running in separate Zig test processes can otherwise reserve the same ports,
-/// authenticate each other's identical fixtures, and produce a false topology
-/// timeout or silently Skip on AddressInUse. One advisory kernel lock serializes
-/// these cross-process fixtures; a crashed test releases it automatically.
+fn holdTwoLoopbackListeners() ServerError!struct { HeldLoopbackListener, HeldLoopbackListener } {
+    const first = try holdLoopbackListener();
+    errdefer first.close();
+    return .{ first, try holdLoopbackListener() };
+}
+
+fn holdThreeLoopbackListeners() ServerError!struct { HeldLoopbackListener, HeldLoopbackListener, HeldLoopbackListener } {
+    const first = try holdLoopbackListener();
+    errdefer first.close();
+    const second = try holdLoopbackListener();
+    errdefer second.close();
+    return .{ first, second, try holdLoopbackListener() };
+}
+
+/// One advisory kernel lock serializes heavyweight mesh acceptance fixtures
+/// across Zig test processes. A crashed test releases it automatically.
 fn acquireHeavyMeshAcceptanceTestLock() !linux.fd_t {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const open_rc = linux.open(
@@ -122280,9 +124643,11 @@ fn dumpMeshDialProofForTest(server: *Server) void {
 fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
-        const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
-        const s2s_port1 = s2s_ports[0];
-        const s2s_port2 = s2s_ports[1];
+        const held = holdTwoLoopbackListeners() catch return error.SkipZigTest;
+        defer held[0].close();
+        defer held[1].close();
+        const s2s_port1 = held[0].port;
+        const s2s_port2 = held[1].port;
 
         var spec1_buf: [32]u8 = undefined;
         var spec2_buf: [32]u8 = undefined;
@@ -122295,6 +124660,7 @@ fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
             .host = "127.0.0.1",
             .port = 0,
             .s2s_port = s2s_port1,
+            .inherited_s2s_fd = held[0].fd,
             .node_id = 1,
             .server_name = "node1.test",
             .mesh_connect = &node1_peers,
@@ -122310,6 +124676,7 @@ fn runReciprocalMeshDurabilityTest(shards1: u16, shards2: u16) !void {
             .host = "127.0.0.1",
             .port = 0,
             .s2s_port = s2s_port2,
+            .inherited_s2s_fd = held[1].fd,
             .node_id = 2,
             .server_name = "node2.test",
             .mesh_connect = &node2_peers,
@@ -122414,18 +124781,21 @@ fn parseLusersUserCount(buf: []const u8) ?u64 {
 fn runLusersCrossShardConsistencyTest(shards1: u16, shards2: u16) !void {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
-        const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+        const held = holdTwoLoopbackListeners() catch return error.SkipZigTest;
+        defer held[0].close();
+        defer held[1].close();
         var spec1_buf: [32]u8 = undefined;
         var spec2_buf: [32]u8 = undefined;
-        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
-        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{held[0].port});
+        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{held[1].port});
         const node1_peers = [_][]const u8{node2_spec};
         const node2_peers = [_][]const u8{node1_spec};
 
         var node1 = Server.init(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
-            .s2s_port = s2s_ports[0],
+            .s2s_port = held[0].port,
+            .inherited_s2s_fd = held[0].fd,
             .node_id = 1,
             .server_name = "node1.test",
             .mesh_connect = &node1_peers,
@@ -122439,7 +124809,8 @@ fn runLusersCrossShardConsistencyTest(shards1: u16, shards2: u16) !void {
         var node2 = Server.init(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
-            .s2s_port = s2s_ports[1],
+            .s2s_port = held[1].port,
+            .inherited_s2s_fd = held[1].fd,
             .node_id = 2,
             .server_name = "node2.test",
             .mesh_connect = &node2_peers,
@@ -122568,11 +124939,13 @@ const test_line_mesh_checker = sasl.PlainChecker{ .ptr = &test_line_mesh_anchor,
 test "threaded server: an UNPROVEN cross-node same-account claim grants no coexistence relay (F1 fail-closed)" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+    const held = holdTwoLoopbackListeners() catch return error.SkipZigTest;
+    defer held[0].close();
+    defer held[1].close();
     var spec1_buf: [32]u8 = undefined;
     var spec2_buf: [32]u8 = undefined;
-    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
-    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{held[0].port});
+    const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{held[1].port});
     const node1_peers = [_][]const u8{node2_spec};
     const node2_peers = [_][]const u8{node1_spec};
 
@@ -122584,13 +124957,15 @@ test "threaded server: an UNPROVEN cross-node same-account claim grants no coexi
     var node1_cfg = Config{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[0],
+        .s2s_port = held[0].port,
+        .inherited_s2s_fd = held[0].fd,
         .node_id = 1,
         .server_name = "node1.test",
         .mesh_connect = &node1_peers,
         .num_shards = 1,
         .sweep_interval_ms = 100,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
     };
     node1_cfg.s2s_config.require_signed_frames = false;
     var node1 = Server.init(alloc, node1_cfg) catch |err| switch (err) {
@@ -122601,13 +124976,15 @@ test "threaded server: an UNPROVEN cross-node same-account claim grants no coexi
     var node2_cfg = Config{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[1],
+        .s2s_port = held[1].port,
+        .inherited_s2s_fd = held[1].fd,
         .node_id = 2,
         .server_name = "node2.test",
         .mesh_connect = &node2_peers,
         .num_shards = 1,
         .sweep_interval_ms = 100,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
     };
     node2_cfg.s2s_config.require_signed_frames = false;
     var node2 = Server.init(alloc, node2_cfg) catch |err| switch (err) {
@@ -122710,7 +125087,9 @@ test "threaded server: an UNPROVEN cross-node same-account claim grants no coexi
 test "threaded server: one reusable session stays live and participatory across a secured mesh" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+    const held = holdTwoLoopbackListeners() catch return error.SkipZigTest;
+    defer held[0].close();
+    defer held[1].close();
 
     var tmp1 = std.testing.tmpDir(.{});
     defer tmp1.cleanup();
@@ -122738,7 +125117,8 @@ test "threaded server: one reusable session stays live and participatory across 
     node2.initInPlace(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[1],
+        .s2s_port = held[1].port,
+        .inherited_s2s_fd = held[1].fd,
         .node_id = ident2.shortId(),
         .server_name = "session-node2.test",
         .node_identity = &ident2,
@@ -122751,6 +125131,7 @@ test "threaded server: one reusable session stays live and participatory across 
         .relay_v2_activation_epoch = 1,
         .relay_v2_roster = &relay_v2_roster,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
         .account_services = &services2,
         .num_shards = 1,
         .sweep_interval_ms = 100,
@@ -122776,13 +125157,14 @@ test "threaded server: one reusable session stays live and participatory across 
     };
 
     var peer_buf: [32]u8 = undefined;
-    const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{held[1].port});
     const peers = [_][]const u8{peer};
     const node1 = try alloc.create(Server);
     node1.initInPlace(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[0],
+        .s2s_port = held[0].port,
+        .inherited_s2s_fd = held[0].fd,
         .node_id = ident1.shortId(),
         .server_name = "session-node1.test",
         .node_identity = &ident1,
@@ -122796,6 +125178,7 @@ test "threaded server: one reusable session stays live and participatory across 
         .relay_v2_roster = &relay_v2_roster,
         .mesh_connect = &peers,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
         .account_services = &services1,
         .webhook_enabled = true,
         .webhook_port = 0,
@@ -123767,15 +126150,18 @@ fn sendFarPresenceLegacyDiagnostic(server: *Server, peer_key: [32]u8) !u64 {
 }
 
 /// Actual TCP/Mooring A-B-C, with independent ordinary clients and no A-C leg.
-/// The two intended-behavior assertions below are deliberately RED until the
-/// separate signed presence and exact guest-DM contracts are integrated.
+/// Far WHOIS and the guest DM use the original signed presence record and the
+/// exact guest-direct frame. The legacy v1 MESSAGE leaf stays terminal.
 fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const allocator = std.testing.allocator;
     const acceptance_lock = if (builtin.os.tag == .linux) try acquireHeavyMeshAcceptanceTestLock() else -1;
     defer if (acceptance_lock >= 0) closeFd(acceptance_lock);
-    const ports = try reserveThreeLoopbackPorts();
+    const held = try holdThreeLoopbackListeners();
+    defer held[0].close();
+    defer held[1].close();
+    defer held[2].close();
     var tmp_a = std.testing.tmpDir(.{});
     defer tmp_a.cleanup();
     var tmp_b = std.testing.tmpDir(.{});
@@ -123805,11 +126191,12 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
     const roots_b = [_][]const u8{ &root_a, &root_c };
     const roots_c = [_][]const u8{ &root_a, &root_b };
     var peer_buf: [32]u8 = undefined;
-    const dial_b = [_][]const u8{try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{ports[1]})};
+    const dial_b = [_][]const u8{try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{held[1].port})};
     const config_b = Config{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = ports[1],
+        .s2s_port = held[1].port,
+        .inherited_s2s_fd = held[1].fd,
         .node_id = identity_b.shortId(),
         .node_identity = &identity_b,
         .crypto_io = std.testing.io,
@@ -123826,7 +126213,8 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
         .sweep_interval_ms = 100,
     };
     var config_a = config_b;
-    config_a.s2s_port = ports[0];
+    config_a.s2s_port = held[0].port;
+    config_a.inherited_s2s_fd = held[0].fd;
     config_a.node_id = identity_a.shortId();
     config_a.node_identity = &identity_a;
     config_a.server_name = "far-presence-a.test";
@@ -123834,7 +126222,8 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
     config_a.mesh_trust_roots = &roots_a;
     config_a.account_services = &services_a;
     var config_c = config_a;
-    config_c.s2s_port = ports[2];
+    config_c.s2s_port = held[2].port;
+    config_c.inherited_s2s_fd = held[2].fd;
     config_c.node_id = identity_c.shortId();
     config_c.node_identity = &identity_c;
     config_c.server_name = "far-presence-c.test";
@@ -123977,7 +126366,10 @@ test "threaded server: same-IP mesh dial partition heals after inbound binding a
     const alloc = std.testing.allocator;
     const cross_process_lock = if (builtin.os.tag == .linux) try acquireHeavyMeshAcceptanceTestLock() else -1;
     defer if (cross_process_lock >= 0) closeFd(cross_process_lock);
-    const ports = try reserveThreeLoopbackPorts();
+    const held = try holdThreeLoopbackListeners();
+    defer held[0].close();
+    defer held[1].close();
+    defer held[2].close();
     var tmp_a = std.testing.tmpDir(.{});
     defer tmp_a.cleanup();
     var tmp_b = std.testing.tmpDir(.{});
@@ -124008,12 +126400,13 @@ test "threaded server: same-IP mesh dial partition heals after inbound binding a
     const roots_c = [_][]const u8{ &root_a, &root_b };
     var a_spec_buf: [32]u8 = undefined;
     var b_spec_buf: [32]u8 = undefined;
-    const dial_a = [_][]const u8{try std.fmt.bufPrint(&a_spec_buf, "127.0.0.1:{d}", .{ports[0]})};
-    const dial_b = [_][]const u8{try std.fmt.bufPrint(&b_spec_buf, "127.0.0.1:{d}", .{ports[1]})};
+    const dial_a = [_][]const u8{try std.fmt.bufPrint(&a_spec_buf, "127.0.0.1:{d}", .{held[0].port})};
+    const dial_b = [_][]const u8{try std.fmt.bufPrint(&b_spec_buf, "127.0.0.1:{d}", .{held[1].port})};
     const config_a = Config{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = ports[0],
+        .s2s_port = held[0].port,
+        .inherited_s2s_fd = held[0].fd,
         .node_id = id_a.shortId(),
         .node_identity = &id_a,
         .crypto_io = std.testing.io,
@@ -124027,11 +126420,13 @@ test "threaded server: same-IP mesh dial partition heals after inbound binding a
         .relay_v2_roster = &roots,
         .account_services = &services_a,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
         .num_shards = 1,
         .sweep_interval_ms = 100,
     };
     var config_b = config_a;
-    config_b.s2s_port = ports[1];
+    config_b.s2s_port = held[1].port;
+    config_b.inherited_s2s_fd = held[1].fd;
     config_b.node_id = id_b.shortId();
     config_b.node_identity = &id_b;
     config_b.server_name = "aa-redial-b.test";
@@ -124039,7 +126434,8 @@ test "threaded server: same-IP mesh dial partition heals after inbound binding a
     config_b.mesh_trust_roots = &roots_b;
     config_b.account_services = &services_b;
     var config_c = config_a;
-    config_c.s2s_port = ports[2];
+    config_c.s2s_port = held[2].port;
+    config_c.inherited_s2s_fd = held[2].fd;
     config_c.node_id = id_c.shortId();
     config_c.node_identity = &id_c;
     config_c.server_name = "cc-redial-c.test";
@@ -124076,7 +126472,7 @@ test "threaded server: same-IP mesh dial partition heals after inbound binding a
         testSleepMs(20);
         before_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
     }
-    try std.testing.expectEqual(std.mem.nativeToBig(u16, ports[1]), before_b.target.?.port);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, held[1].port), before_b.target.?.port);
     var c = try LiveUpgradeTestNode.init(alloc, config_c);
     defer c.deinit();
     try c.start();
@@ -124151,7 +126547,7 @@ test "threaded server: same-IP mesh dial partition heals after inbound binding a
     SameIPPeerProof.pauseDial(a.server, false);
     const healed_b = try SameIPPeerProof.wait(a.server, id_b.sign_kp.public_key);
     try std.testing.expect(healed_b.initiator and healed_b.bound);
-    try std.testing.expectEqual(std.mem.nativeToBig(u16, ports[1]), healed_b.target.?.port);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, held[1].port), healed_b.target.?.port);
     try std.testing.expectEqual(before_c.fd, (try SameIPPeerProof.wait(a.server, id_c.sign_kp.public_key)).fd);
     try expectMeshPeersVisible(&live[0], &.{ config_b.server_name, config_c.server_name }, 80);
     try SameIPPeerProof.expectMembers(clients[0], &.{ "DialA", "DialB", "DialC" });
@@ -124184,7 +126580,9 @@ test "threaded server: four-client reusable session and MARKREAD survive sequent
     const alloc = std.testing.allocator;
     const cross_process_lock = try acquireHeavyMeshAcceptanceTestLock();
     defer closeFd(cross_process_lock);
-    const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+    const held = holdTwoLoopbackListeners() catch return error.SkipZigTest;
+    defer held[0].close();
+    defer held[1].close();
 
     var tmp1 = std.testing.tmpDir(.{});
     defer tmp1.cleanup();
@@ -124209,7 +126607,8 @@ test "threaded server: four-client reusable session and MARKREAD survive sequent
     var node2_config = Config{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[1],
+        .s2s_port = held[1].port,
+        .inherited_s2s_fd = held[1].fd,
         .node_id = ident2.shortId(),
         .server_name = "helix-session-node2.test",
         .node_identity = &ident2,
@@ -124222,6 +126621,7 @@ test "threaded server: four-client reusable session and MARKREAD survive sequent
         .relay_v2_activation_epoch = 1,
         .relay_v2_roster = &relay_v2_helix_roster,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
         .account_services = &services2,
         .num_shards = 1,
         .sweep_interval_ms = 100,
@@ -124233,12 +126633,13 @@ test "threaded server: four-client reusable session and MARKREAD survive sequent
     const port2 = try node2.server.boundPort();
 
     var peer_buf: [32]u8 = undefined;
-    const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{held[1].port});
     const peers = [_][]const u8{peer};
     var node1_config = Config{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[0],
+        .s2s_port = held[0].port,
+        .inherited_s2s_fd = held[0].fd,
         .node_id = ident1.shortId(),
         .server_name = "helix-session-node1.test",
         .node_identity = &ident1,
@@ -124252,6 +126653,7 @@ test "threaded server: four-client reusable session and MARKREAD survive sequent
         .relay_v2_roster = &relay_v2_helix_roster,
         .mesh_connect = &peers,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
         .account_services = &services1,
         .num_shards = 2,
         .sweep_interval_ms = 100,
@@ -124443,7 +126845,10 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
     const alloc = std.testing.allocator;
     const cross_process_lock = try acquireHeavyMeshAcceptanceTestLock();
     defer closeFd(cross_process_lock);
-    const s2s_ports = reserveThreeLoopbackPorts() catch return error.SkipZigTest;
+    const held = holdThreeLoopbackListeners() catch return error.SkipZigTest;
+    defer held[0].close();
+    defer held[1].close();
+    defer held[2].close();
 
     var tmp1 = std.testing.tmpDir(.{});
     defer tmp1.cleanup();
@@ -124476,7 +126881,7 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
     const relay_v2_line_roster = [_][]const u8{ &root1, &root2, &root3 };
 
     var node2_spec_buf: [32]u8 = undefined;
-    const node2_spec = try std.fmt.bufPrint(&node2_spec_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const node2_spec = try std.fmt.bufPrint(&node2_spec_buf, "127.0.0.1:{d}", .{held[1].port});
     const node1_to_node2 = [_][]const u8{node2_spec};
 
     // A strict line: node 1 dials node 2, node 2 dials node 3, and there is no
@@ -124485,7 +126890,8 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
     const node3 = createTestServer(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[2],
+        .s2s_port = held[2].port,
+        .inherited_s2s_fd = held[2].fd,
         .node_id = ident3.shortId(),
         .server_name = "session-line-node3.test",
         .node_identity = &ident3,
@@ -124498,6 +126904,7 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
         .relay_v2_activation_epoch = 1,
         .relay_v2_roster = &relay_v2_line_roster,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
         .account_services = &services3,
         .num_shards = 1,
         .sweep_interval_ms = 100,
@@ -124515,7 +126922,8 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
     const node2 = createTestServer(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[1],
+        .s2s_port = held[1].port,
+        .inherited_s2s_fd = held[1].fd,
         .node_id = ident2.shortId(),
         .server_name = "session-line-node2.test",
         .node_identity = &ident2,
@@ -124530,6 +126938,7 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
         // This edge is opened explicitly by an oper below, so the acceptance
         // test can hold it down deterministically between SQUIT and CONNECT.
         .sasl_checker = test_line_mesh_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services2,
         .num_shards = 1,
@@ -124548,7 +126957,8 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
     const node1 = createTestServer(alloc, .{
         .host = "127.0.0.1",
         .port = 0,
-        .s2s_port = s2s_ports[0],
+        .s2s_port = held[0].port,
+        .inherited_s2s_fd = held[0].fd,
         .node_id = ident1.shortId(),
         .server_name = "session-line-node1.test",
         .node_identity = &ident1,
@@ -124562,6 +126972,7 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
         .relay_v2_roster = &relay_v2_line_roster,
         .mesh_connect = &node1_to_node2,
         .sasl_checker = test_dm_relay_checker,
+        .allow_plaintext_password_sasl = true,
         .account_services = &services1,
         .num_shards = 1,
         .sweep_interval_ms = 100,
@@ -124617,7 +127028,7 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
     const connect_node3 = try std.fmt.bufPrint(
         &connect_node3_buf,
         "CONNECT 127.0.0.1 {d}\r\n",
-        .{s2s_ports[2]},
+        .{held[2].port},
     );
     admin.reset();
     try writeAllFd(admin_fd, connect_node3);
@@ -125300,18 +127711,21 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
 test "threaded server: inbound relay re-enforces local +n / +t against a remote actor" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
-        const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+        const held = holdTwoLoopbackListeners() catch return error.SkipZigTest;
+        defer held[0].close();
+        defer held[1].close();
         var spec1_buf: [32]u8 = undefined;
         var spec2_buf: [32]u8 = undefined;
-        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
-        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{held[0].port});
+        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{held[1].port});
         const node1_peers = [_][]const u8{node2_spec};
         const node2_peers = [_][]const u8{node1_spec};
 
         var node1 = Server.init(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
-            .s2s_port = s2s_ports[0],
+            .s2s_port = held[0].port,
+            .inherited_s2s_fd = held[0].fd,
             .node_id = 1,
             .server_name = "node1.test",
             .mesh_connect = &node1_peers,
@@ -125326,7 +127740,8 @@ test "threaded server: inbound relay re-enforces local +n / +t against a remote 
         var node2 = Server.init(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
-            .s2s_port = s2s_ports[1],
+            .s2s_port = held[1].port,
+            .inherited_s2s_fd = held[1].fd,
             .node_id = 2,
             .server_name = "node2.test",
             .mesh_connect = &node2_peers,
@@ -125448,18 +127863,21 @@ test "threaded server: inbound relay re-enforces local +n / +t against a remote 
 test "threaded server: WHISPER and DATA relay to a remote-shard channel co-member" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
-        const s2s_ports = reserveTwoLoopbackPorts() catch return error.SkipZigTest;
+        const held = holdTwoLoopbackListeners() catch return error.SkipZigTest;
+        defer held[0].close();
+        defer held[1].close();
         var spec1_buf: [32]u8 = undefined;
         var spec2_buf: [32]u8 = undefined;
-        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{s2s_ports[0]});
-        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+        const node1_spec = try std.fmt.bufPrint(&spec1_buf, "127.0.0.1:{d}", .{held[0].port});
+        const node2_spec = try std.fmt.bufPrint(&spec2_buf, "127.0.0.1:{d}", .{held[1].port});
         const node1_peers = [_][]const u8{node2_spec};
         const node2_peers = [_][]const u8{node1_spec};
 
         var node1 = Server.init(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
-            .s2s_port = s2s_ports[0],
+            .s2s_port = held[0].port,
+            .inherited_s2s_fd = held[0].fd,
             .node_id = 1,
             .server_name = "node1.test",
             .mesh_connect = &node1_peers,
@@ -125474,7 +127892,8 @@ test "threaded server: WHISPER and DATA relay to a remote-shard channel co-membe
         var node2 = Server.init(alloc, .{
             .host = "127.0.0.1",
             .port = 0,
-            .s2s_port = s2s_ports[1],
+            .s2s_port = held[1].port,
+            .inherited_s2s_fd = held[1].fd,
             .node_id = 2,
             .server_name = "node2.test",
             .mesh_connect = &node2_peers,
@@ -135713,4 +138132,621 @@ test "webpush consumer: malformed and truncated apparent HTTP receipts retain ex
         try std.testing.expectEqual(@as(u64, 1), server.outbound_webhook_delivered);
         try std.testing.expectEqual(@as(usize, 1), WebpushConsumerFixture.historyCount(server));
     }
+}
+
+test "privacy modes gate direct messages joins kicks whois and invites" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const Gate = struct {
+        server: *Server,
+
+        fn say(self: @This(), id: client_model.ClientId, conn: *ConnState, command: []const u8, line: []const u8) !void {
+            var parsed = try irc_line.parseLine(line);
+            if (std.ascii.eqlIgnoreCase(command, "PRIVMSG") or std.ascii.eqlIgnoreCase(command, "NOTICE")) {
+                try self.server.handleMessage(id, conn, &parsed, command);
+            } else if (std.ascii.eqlIgnoreCase(command, "JOIN")) {
+                try self.server.handleJoin(id, conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "KICK")) {
+                try self.server.handleKick(id, conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "WHOIS")) {
+                try self.server.handleWhois(conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "INVITE")) {
+                try self.server.handleInvite(id, conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "ACCEPT")) {
+                try self.server.handleAcceptCmd(conn, &parsed);
+            } else unreachable;
+        }
+
+        fn has(conn: *ConnState, needle: []const u8) !void {
+            try expectContains(conn.send_buf[0..conn.send_len], needle);
+        }
+
+        fn missing(conn: *ConnState, needle: []const u8) !void {
+            try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], needle) == null);
+        }
+
+        fn clear(conns: []const *ConnState) void {
+            for (conns) |conn| resetTestSendQ(conn);
+        }
+    };
+
+    const ann_id = try addTestLocalClient(server, "Ann", null);
+    const bob_id = try addTestLocalClient(server, "Bob", null);
+    const sam_id = try addTestLocalClient(server, "Sam", null);
+    const ann = server.connFor(ann_id) orelse return error.TestUnexpectedResult;
+    const bob = server.connFor(bob_id) orelse return error.TestUnexpectedResult;
+    const sam = server.connFor(sam_id) orelse return error.TestUnexpectedResult;
+    ann.test_sendq_capture = true;
+    bob.test_sendq_capture = true;
+    sam.test_sendq_capture = true;
+    ann.overflow_allocator = alloc;
+    bob.overflow_allocator = alloc;
+    sam.overflow_allocator = alloc;
+    ann.session.registration.registered = true;
+    bob.session.registration.registered = true;
+    sam.session.registration.registered = true;
+    const gate = Gate{ .server = server };
+    const all = [_]*ConnState{ ann, bob, sam };
+    const ann_wid = worldIdFromClient(ann_id);
+    const bob_wid = worldIdFromClient(bob_id);
+    const sam_wid = worldIdFromClient(sam_id);
+
+    // +Z: cleartext PRIVMSG is 716, NOTICE is silent, TLS delivers.
+    bob.session.umodes.add(.tls_only_pm);
+    ann.is_tls = false;
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG Bob :hello-z");
+    try Gate.has(ann, "is in +Z mode (TLS required)");
+    try Gate.has(ann, " 716 ");
+    try Gate.missing(bob, "hello-z");
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "NOTICE", "NOTICE Bob :quiet-z");
+    try Gate.missing(ann, " 716 ");
+    try Gate.missing(bob, "quiet-z");
+    Gate.clear(&all);
+    ann.is_tls = true;
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG Bob :hello-tls");
+    try Gate.has(bob, "hello-tls");
+    try Gate.missing(ann, " 716 ");
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "WHOIS", "WHOIS Bob");
+    try Gate.has(ann, "is only accepting private messages over TLS");
+    bob.session.umodes.remove(.tls_only_pm);
+    ann.is_tls = false;
+
+    // +G: no shared channel is 716. A shared channel delivers. After parting,
+    // ACCEPT delivers, and ACCEPT still does not bypass +Z.
+    bob.session.umodes.add(.common_chan);
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG Bob :hello-g");
+    try Gate.has(ann, "is in +G mode (share a channel or ACCEPT)");
+    try Gate.missing(bob, "hello-g");
+    _ = try server.world.join("#share", ann_wid);
+    _ = try server.world.join("#share", bob_wid);
+    try std.testing.expect(server.clientsShareChannel(ann_wid, bob_wid));
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG Bob :hello-share");
+    try Gate.has(bob, "hello-share");
+    try server.world.part("#share", ann_wid);
+    try server.world.part("#share", bob_wid);
+    try std.testing.expect(!server.clientsShareChannel(ann_wid, bob_wid));
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "ACCEPT", "ACCEPT +Ann");
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG Bob :hello-accept");
+    try Gate.has(bob, "hello-accept");
+    bob.session.umodes.add(.tls_only_pm);
+    ann.is_tls = false;
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG Bob :hello-z-accept");
+    try Gate.has(ann, "is in +Z mode (TLS required)");
+    try Gate.missing(ann, "is in +G mode");
+    try Gate.missing(bob, "hello-z-accept");
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "WHOIS", "WHOIS Bob");
+    try Gate.has(ann, "is only accepting private messages from users who share a channel");
+    bob.session.umodes.remove(.tls_only_pm);
+    bob.session.umodes.remove(.common_chan);
+
+    // +c: a non-op is rejected, including hex colour. NOTICE stays silent.
+    // A channel op bypasses the check.
+    _ = try server.world.join("#color", ann_wid);
+    _ = try server.world.join("#color", bob_wid);
+    _ = try server.world.setChannelExtFlag("#color", .nocolor, true);
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "PRIVMSG", "PRIVMSG #color :\x02bold-c");
+    try Gate.has(bob, "Cannot send to channel (+c: no color or formatting)");
+    try Gate.missing(ann, "bold-c");
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "NOTICE", "NOTICE #color :\x02notice-color");
+    try Gate.missing(bob, "no color or formatting");
+    try Gate.missing(bob, " 404 ");
+    try Gate.missing(ann, "notice-color");
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "PRIVMSG", "PRIVMSG #color :hex\x04mark");
+    try Gate.has(bob, "Cannot send to channel (+c: no color or formatting)");
+    try Gate.missing(ann, "hex\x04mark");
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG #color :\x02op-bold");
+    try Gate.has(bob, "op-bold");
+
+    // +B: a new channel is not blocked. An existing +B channel refuses a bot,
+    // including one who holds an invite. A server operator can join.
+    bob.session.umodes.add(.bot);
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "JOIN", "JOIN #botnew");
+    try std.testing.expect(server.world.isMember("#botnew", bob_wid));
+    _ = try server.world.join("#bots", ann_wid);
+    _ = try server.world.setChannelExtFlag("#bots", .nobot, true);
+    try server.world.addInvite("#bots", bob_wid);
+    try std.testing.expect(server.world.hasInvite("#bots", bob_wid));
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "JOIN", "JOIN #bots");
+    try Gate.has(bob, "Cannot join channel (+B) - bots are not allowed");
+    try std.testing.expect(!server.world.isMember("#bots", bob_wid));
+    bob.session.is_oper = true;
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "JOIN", "JOIN #bots");
+    try Gate.missing(bob, "bots are not allowed");
+    try std.testing.expect(server.world.isMember("#bots", bob_wid));
+    bob.session.is_oper = false;
+    bob.session.umodes.remove(.bot);
+
+    // +K: an op cannot kick a regular member. The founder can.
+    _ = try server.world.join("#kick", ann_wid);
+    _ = try server.world.join("#kick", bob_wid);
+    _ = try server.world.join("#kick", sam_wid);
+    _ = try server.world.setMemberMode("#kick", bob_wid, .op, true);
+    _ = try server.world.setChannelExtFlag("#kick", .founderkick, true);
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "KICK", "KICK #kick Sam :not-founder");
+    try Gate.has(bob, "Cannot kick (+K: founder only)");
+    try std.testing.expect(server.world.isMember("#kick", sam_wid));
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "KICK", "KICK #kick Sam :founder-kick");
+    try Gate.missing(ann, "Cannot kick (+K: founder only)");
+    try std.testing.expect(!server.world.isMember("#kick", sam_wid));
+
+    // +D hides channel PRIVMSG and still shows JOIN. -D delivers the next PRIVMSG.
+    // +T hides channel NOTICE and still shows a PRIVMSG whose text mentions NOTICE.
+    _ = try server.world.join("#deaf", ann_wid);
+    _ = try server.world.join("#deaf", bob_wid);
+    bob.session.umodes.add(.deaf);
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG #deaf :deaf-secret");
+    try Gate.missing(bob, "deaf-secret");
+    try Gate.missing(bob, "PRIVMSG");
+    Gate.clear(&all);
+    try gate.say(sam_id, sam, "JOIN", "JOIN #deaf");
+    try Gate.has(bob, "JOIN #deaf");
+    bob.session.umodes.remove(.deaf);
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG #deaf :hearing-again");
+    try Gate.has(bob, "hearing-again");
+    bob.session.umodes.add(.no_chan_notice);
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "NOTICE", "NOTICE #deaf :hidden-notice");
+    try Gate.missing(bob, "hidden-notice");
+    try Gate.missing(ann, " 404 ");
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "PRIVMSG", "PRIVMSG #deaf :see NOTICE inside");
+    try Gate.has(bob, "see NOTICE inside");
+    bob.session.umodes.remove(.no_chan_notice);
+
+    // +I hides idle from other users. Self and a server operator still see 317.
+    bob.session.umodes.add(.hide_idle);
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "WHOIS", "WHOIS Bob");
+    try Gate.has(ann, " 311 ");
+    try Gate.missing(ann, " 317 ");
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "WHOIS", "WHOIS Bob");
+    try Gate.has(bob, " 317 ");
+    ann.session.is_oper = true;
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "WHOIS", "WHOIS Bob");
+    try Gate.has(ann, " 317 ");
+    ann.session.is_oper = false;
+
+    // +W notifies the target of a non-self, non-oper WHOIS only.
+    bob.session.umodes.add(.whois_notify);
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "WHOIS", "WHOIS Bob");
+    try Gate.has(bob, "is doing a /whois on you");
+    ann.session.is_oper = true;
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "WHOIS", "WHOIS Bob");
+    try Gate.missing(bob, "is doing a /whois on you");
+    ann.session.is_oper = false;
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "WHOIS", "WHOIS Bob");
+    try Gate.missing(bob, "is doing a /whois on you");
+
+    // +V refuses an invite. A server operator and the same account can invite.
+    bob.session.umodes.add(.no_invite);
+    _ = try server.world.join("#hall", ann_wid);
+    try std.testing.expect(!server.world.isMember("#hall", bob_wid));
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "WHOIS", "WHOIS Bob");
+    try Gate.has(ann, "is not accepting invites");
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "INVITE", "INVITE Bob #hall");
+    try Gate.has(ann, "is in +V mode (not accepting invites)");
+    try Gate.missing(bob, "INVITE");
+    try std.testing.expect(!server.world.isMember("#hall", bob_wid));
+    ann.session.is_oper = true;
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "INVITE", "INVITE Bob #hall");
+    try Gate.missing(ann, "is in +V mode");
+    try Gate.has(bob, "INVITE Bob :#hall");
+    ann.session.is_oper = false;
+    ann.session.loginAs("shared");
+    bob.session.loginAs("shared");
+    try std.testing.expect(bob.session.umodes.contains(.no_invite));
+    try std.testing.expect(!ann.session.isOper());
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "INVITE", "INVITE Bob #hall");
+    try Gate.missing(ann, "is in +V mode");
+    try Gate.has(bob, "INVITE Bob :#hall");
+}
+
+test "knock on a hidden channel matches a missing channel" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const Gate = struct {
+        server: *Server,
+
+        fn say(self: @This(), id: client_model.ClientId, conn: *ConnState, command: []const u8, line: []const u8) !void {
+            var parsed = try irc_line.parseLine(line);
+            if (std.ascii.eqlIgnoreCase(command, "KNOCK")) {
+                try self.server.handleKnock(id, conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "TOPIC")) {
+                try self.server.handleTopic(id, conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "MODE")) {
+                try self.server.handleMode(id, conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "NICK")) {
+                try self.server.handleNickChange(id, conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "JOIN")) {
+                try self.server.handleJoin(id, conn, &parsed);
+            } else unreachable;
+        }
+
+        fn has(conn: *ConnState, needle: []const u8) !void {
+            try expectContains(conn.send_buf[0..conn.send_len], needle);
+        }
+
+        fn missing(conn: *ConnState, needle: []const u8) !void {
+            try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], needle) == null);
+        }
+
+        fn clear(conns: []const *ConnState) void {
+            for (conns) |conn| resetTestSendQ(conn);
+        }
+
+        fn historyHits(server_ptr: *Server, needle: []const u8) usize {
+            var records: [128]event_history_mod.StoredEvent = undefined;
+            const n = server_ptr.event_history.collect(null, 0, &records);
+            var hits: usize = 0;
+            for (records[0..n]) |*ev| {
+                if (std.mem.indexOf(u8, ev.message(), needle) != null) hits += 1;
+            }
+            return hits;
+        }
+    };
+
+    const ann_id = try addTestLocalClient(server, "Ann", null);
+    const bob_id = try addTestLocalClient(server, "Bob", null);
+    const ann = server.connFor(ann_id) orelse return error.TestUnexpectedResult;
+    const bob = server.connFor(bob_id) orelse return error.TestUnexpectedResult;
+    ann.test_sendq_capture = true;
+    bob.test_sendq_capture = true;
+    ann.overflow_allocator = alloc;
+    bob.overflow_allocator = alloc;
+    ann.session.registration.registered = true;
+    bob.session.registration.registered = true;
+    const gate = Gate{ .server = server };
+    const all = [_]*ConnState{ ann, bob };
+    const ann_wid = worldIdFromClient(ann_id);
+    const bob_wid = worldIdFromClient(bob_id);
+
+    _ = try server.world.join("#sec", ann_wid);
+    _ = try server.world.setChannelFlag("#sec", .invite_only, true);
+    _ = try server.world.setChannelFlag("#sec", .secret, true);
+    try server.world.setTopic("#sec", "secret-topic-text", "Ann", 10);
+    _ = try server.world.join("#priv", ann_wid);
+    _ = try server.world.setPrivate("#priv", true);
+    _ = try server.world.join("#hid", ann_wid);
+    _ = try server.world.setHidden("#hid", true);
+    _ = try server.world.setChannelExtFlag("#hid", .knock, true);
+    _ = try server.world.join("#door", ann_wid);
+    _ = try server.world.join("#open", ann_wid);
+    _ = try server.world.setChannelFlag("#open", .invite_only, true);
+    try std.testing.expect(!server.world.isMember("#sec", bob_wid));
+
+    // Missing, secret, private, and hidden share one 403. Probing them does
+    // not notify the founder and does not spend the knock budget.
+    const hidden = [_][]const u8{ "#missing", "#sec", "#priv", "#hid" };
+    for (hidden) |name| {
+        var line_buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "KNOCK {s} :outside", .{name});
+        Gate.clear(&all);
+        try gate.say(bob_id, bob, "KNOCK", line);
+        try Gate.has(bob, " 403 ");
+        try Gate.has(bob, "No such channel");
+        try Gate.has(bob, name);
+        try Gate.missing(bob, "Channel is open");
+        try Gate.missing(bob, " 710 ");
+        try Gate.missing(bob, " 711 ");
+        try Gate.missing(bob, " 713 ");
+        try Gate.missing(ann, " 710 ");
+        var needle_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "KNOCK {s}", .{name});
+        try std.testing.expectEqual(@as(usize, 0), Gate.historyHits(server, needle));
+    }
+    try std.testing.expectEqual(@as(u8, 0), bob.knock_count);
+
+    bob.session.is_oper = true;
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "KNOCK", "KNOCK #sec :oper");
+    try Gate.has(bob, " 403 ");
+    try Gate.has(bob, "No such channel");
+    try Gate.missing(ann, " 710 ");
+    bob.session.is_oper = false;
+    try std.testing.expectEqual(@as(u8, 0), bob.knock_count);
+
+    // A visible open channel is 713. A visible +i channel delivers 710 and 711.
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "KNOCK", "KNOCK #door :open");
+    try Gate.has(bob, " 713 ");
+    try Gate.has(bob, "Channel is open");
+    try Gate.missing(bob, "No such channel");
+    try Gate.missing(ann, " 710 ");
+    try std.testing.expectEqual(@as(u8, 0), bob.knock_count);
+
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "KNOCK", "KNOCK #open :member");
+    try Gate.has(ann, " 714 ");
+    try Gate.missing(ann, " 710 ");
+    try std.testing.expectEqual(@as(u8, 0), ann.knock_count);
+
+    var open_hits: usize = 0;
+    for (0..3) |_| {
+        Gate.clear(&all);
+        try gate.say(bob_id, bob, "KNOCK", "KNOCK #open :please");
+        try Gate.has(ann, " 710 ");
+        try Gate.has(ann, "#open");
+        try Gate.has(bob, " 711 ");
+        try Gate.missing(bob, " 712 ");
+        open_hits = Gate.historyHits(server, "KNOCK #open");
+    }
+    try std.testing.expect(open_hits >= 1);
+    try std.testing.expectEqual(@as(u8, 3), bob.knock_count);
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "KNOCK", "KNOCK #open :again");
+    try Gate.has(bob, " 712 ");
+    try Gate.has(bob, "Too many KNOCKs for this channel");
+    try Gate.missing(bob, " 711 ");
+    try Gate.missing(ann, " 710 ");
+    try std.testing.expectEqual(open_hits, Gate.historyHits(server, "KNOCK #open"));
+    try std.testing.expectEqual(@as(u8, 3), bob.knock_count);
+
+    // TOPIC and MODE on a hidden channel use the same 403. A public channel
+    // still answers.
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "TOPIC", "TOPIC #sec");
+    try Gate.has(bob, " 403 ");
+    try Gate.has(bob, "No such channel");
+    try Gate.missing(bob, "secret-topic-text");
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "TOPIC", "TOPIC #sec :hijack");
+    try Gate.has(bob, " 403 ");
+    try Gate.missing(bob, "hijack");
+    try std.testing.expectEqualStrings("secret-topic-text", server.world.topicInfo("#sec").?.text);
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "TOPIC", "TOPIC #open");
+    try Gate.has(bob, " 331 ");
+    try Gate.has(bob, "No topic is set");
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "MODE", "MODE #sec");
+    try Gate.has(bob, " 403 ");
+    try Gate.has(bob, "No such channel");
+    try Gate.missing(bob, " 324 ");
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "MODE", "MODE #open");
+    try Gate.has(bob, " 324 ");
+    try Gate.missing(bob, "No such channel");
+
+    // Bidi and mixed-script names are rejected. The nick does not change.
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "NICK", "NICK A\u{0430}lice");
+    try Gate.has(ann, " 432 ");
+    try Gate.has(ann, "Erroneous nickname");
+    try std.testing.expectEqualStrings("Ann", ann.session.displayName());
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "NICK", "NICK Ann\u{202E}");
+    try Gate.has(ann, " 432 ");
+    try std.testing.expectEqualStrings("Ann", ann.session.displayName());
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "JOIN", "JOIN #\u{202E}hid");
+    try Gate.has(bob, "No such channel");
+    try std.testing.expect(!server.world.channelExists("#\u{202E}hid"));
+    try std.testing.expect(world_model.isChannelName("%#room"));
+    try std.testing.expect(!world_model.isChannelName("#A\u{0430}"));
+}
+
+test "server DATA origin is the server name and client DATA keeps its nick" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const Gate = struct {
+        server: *Server,
+
+        fn say(self: @This(), id: client_model.ClientId, conn: *ConnState, command: []const u8, line: []const u8) !void {
+            var parsed = try irc_line.parseLine(line);
+            if (std.ascii.eqlIgnoreCase(command, "DATA") or
+                std.ascii.eqlIgnoreCase(command, "REQUEST") or
+                std.ascii.eqlIgnoreCase(command, "REPLY"))
+            {
+                try self.server.handleData(id, conn, &parsed);
+            } else if (std.ascii.eqlIgnoreCase(command, "NICK")) {
+                try self.server.handleNickChange(id, conn, &parsed);
+            } else unreachable;
+        }
+
+        fn has(conn: *ConnState, needle: []const u8) !void {
+            try expectContains(conn.send_buf[0..conn.send_len], needle);
+        }
+
+        fn missing(conn: *ConnState, needle: []const u8) !void {
+            try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], needle) == null);
+        }
+
+        fn clear(conns: []const *ConnState) void {
+            for (conns) |conn| resetTestSendQ(conn);
+        }
+    };
+
+    const ann_id = try addTestLocalClient(server, "Ann", null);
+    const bob_id = try addTestLocalClient(server, "Bob", null);
+    const ann = server.connFor(ann_id) orelse return error.TestUnexpectedResult;
+    const bob = server.connFor(bob_id) orelse return error.TestUnexpectedResult;
+    ann.test_sendq_capture = true;
+    bob.test_sendq_capture = true;
+    ann.overflow_allocator = alloc;
+    bob.overflow_allocator = alloc;
+    ann.session.registration.registered = true;
+    bob.session.registration.registered = true;
+    ann.ircx = true;
+    bob.ircx = true;
+    const gate = Gate{ .server = server };
+    const all = [_]*ConnState{ ann, bob };
+    const ann_wid = worldIdFromClient(ann_id);
+    const bob_wid = worldIdFromClient(bob_id);
+    _ = try server.world.join("#room", ann_wid);
+    _ = try server.world.join("#room", bob_wid);
+    const origin = server.serverName();
+    try std.testing.expect(std.mem.indexOfScalar(u8, origin, '!') == null);
+
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "DATA", "DATA #room app.status :hello");
+    try Gate.has(bob, ":Ann!user@localhost DATA #room app.status :hello\r\n");
+    try Gate.has(ann, ":Ann!user@localhost DATA #room app.status :hello\r\n");
+    try Gate.missing(bob, ":onyx.local DATA");
+    try Gate.missing(ann, ":onyx.local DATA");
+
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "REQUEST", "REQUEST #room app.ping :ping");
+    try Gate.has(bob, ":Ann!user@localhost REQUEST #room app.ping :ping\r\n");
+    try Gate.missing(bob, ":onyx.local ");
+
+    // A client-supplied prefix is not the origin. The rendered line stays the nick.
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "DATA", ":onyx.local DATA #room app.status :forged");
+    try Gate.has(ann, ":Bob!user@localhost DATA #room app.status :forged\r\n");
+    try Gate.missing(ann, ":onyx.local DATA");
+    try Gate.missing(bob, ":onyx.local DATA");
+
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "DATA", "DATA #room SYS.notice :no");
+    try Gate.has(ann, " 913 ");
+    try Gate.has(ann, "Reserved DATA tag (operator only)");
+    try Gate.missing(bob, "SYS.notice");
+    try Gate.missing(ann, ":onyx.local DATA");
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "DATA", "DATA #room ADM.alert :no");
+    try Gate.has(ann, " 913 ");
+    try Gate.has(ann, "Reserved DATA tag (operator only)");
+    try Gate.missing(bob, "ADM.alert");
+
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "DATA", "DATA #room OWN.state :no");
+    try Gate.has(bob, " 913 ");
+    try Gate.has(bob, "Reserved DATA tag (channel owner/host only)");
+    try Gate.missing(ann, "OWN.state");
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "DATA", "DATA #room HST.state :no");
+    try Gate.has(bob, " 913 ");
+    try Gate.has(bob, "Reserved DATA tag (channel owner/host only)");
+    try Gate.missing(ann, "HST.state");
+
+    // A channel operator may still send OWN. The prefix stays the nick.
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "DATA", "DATA #room OWN.state :owner-line");
+    try Gate.has(bob, ":Ann!user@localhost DATA #room OWN.state :owner-line\r\n");
+    try Gate.missing(bob, ":onyx.local DATA");
+
+    bob.session.is_oper = true;
+    Gate.clear(&all);
+    try gate.say(bob_id, bob, "DATA", "DATA #room SYS.notice :oper-line");
+    try Gate.has(ann, ":Bob!user@localhost DATA #room SYS.notice :oper-line\r\n");
+    try Gate.missing(ann, ":onyx.local DATA");
+    bob.session.is_oper = false;
+
+    Gate.clear(&all);
+    server.deliverServerOriginData("#room", "SYS.notice", "from-server");
+    try Gate.has(ann, ":onyx.local DATA #room SYS.notice :from-server\r\n");
+    try Gate.has(bob, ":onyx.local DATA #room SYS.notice :from-server\r\n");
+    try Gate.missing(ann, "!");
+    try Gate.missing(bob, "!");
+
+    Gate.clear(&all);
+    server.deliverServerOriginData("Bob", "SYS.notice", "direct");
+    try Gate.has(bob, ":onyx.local DATA Bob SYS.notice :direct\r\n");
+    try Gate.missing(ann, "direct");
+    try Gate.missing(bob, "!");
+
+    const bob_len = bob.send_len;
+    const ann_len = ann.send_len;
+    server.deliverServerOriginData("#missing", "SYS.notice", "nope");
+    server.deliverServerOriginData("#room", "9bad", "nope");
+    server.deliverServerOriginData("#room", "SYS.notice", "");
+    try std.testing.expectEqual(bob_len, bob.send_len);
+    try std.testing.expectEqual(ann_len, ann.send_len);
+
+    Gate.clear(&all);
+    try gate.say(ann_id, ann, "NICK", "NICK onyx.local");
+    try Gate.has(ann, " 432 ");
+    try std.testing.expectEqualStrings("Ann", ann.session.displayName());
+    try std.testing.expect(!std.mem.eql(u8, ann.session.displayName(), origin));
 }

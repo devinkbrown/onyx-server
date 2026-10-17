@@ -94,6 +94,16 @@ pub const BatchRecord = struct {
     bytes: []const u8,
 };
 
+/// Caller-owned rendered body. `prepareOwnedBatch` / `reserveOwnedBatch` either
+/// leave every body with the caller (on error) or take ownership of the bodies
+/// they insert. Exact duplicates stay with the caller. Adopted slices are
+/// replaced with an empty slice so the caller can free whatever remains.
+pub const OwnedBatchRecord = struct {
+    client: ClientId,
+    event_id: EventId,
+    bytes: []u8,
+};
+
 pub const ReserveResult = struct {
     inserted: usize,
     exact_duplicates: usize,
@@ -437,6 +447,109 @@ pub const Spool = struct {
         var prepared = try self.prepareBatch(batch);
         defer prepared.deinit();
         return prepared.commit();
+    }
+
+    /// Same all-or-nothing admission as `prepareBatch`, without copying bodies.
+    /// Inserted buffers become spool property. A failure adopts nothing.
+    pub fn prepareOwnedBatch(self: *Spool, batch: []OwnedBatchRecord) ReserveError!PreparedBatch {
+        if (batch.len > self.config.max_records) return error.CapacityExceeded;
+
+        const kind = try self.allocator.alloc(u8, batch.len);
+        defer self.allocator.free(kind);
+
+        var new_count: usize = 0;
+        var new_bytes: usize = 0;
+        var new_attachments: usize = 0;
+        var duplicate_count: usize = 0;
+        for (batch, 0..) |record, index| {
+            switch (try self.ownedDisposition(batch, index)) {
+                .duplicate => {
+                    kind[index] = 0;
+                    duplicate_count += 1;
+                },
+                .insert => {
+                    kind[index] = 1;
+                    new_count += 1;
+                    new_bytes = std.math.add(usize, new_bytes, record.bytes.len) catch
+                        return error.CapacityExceeded;
+                    if (!self.hasClient(record.client)) {
+                        var prior_new_client = false;
+                        for (batch[0..index]) |prior| {
+                            if (prior.client == record.client) {
+                                prior_new_client = true;
+                                break;
+                            }
+                        }
+                        if (!prior_new_client) new_attachments += 1;
+                    }
+                },
+            }
+        }
+
+        if (new_count > self.config.max_records - self.entries.items.len)
+            return error.CapacityExceeded;
+        if (new_attachments > self.config.max_attachments - self.attachment_count)
+            return error.CapacityExceeded;
+        if (new_bytes > self.config.max_total_bytes - self.total_bytes)
+            return error.CapacityExceeded;
+        if (new_count > std.math.maxInt(u64) - self.next_sequence)
+            return error.CapacityExceeded;
+
+        const staged = try self.allocator.alloc(Entry, new_count);
+        errdefer self.allocator.free(staged);
+        try self.entries.ensureUnusedCapacity(self.allocator, staged.len);
+
+        var staged_len: usize = 0;
+        for (batch, kind) |*record, flag| {
+            if (flag == 0) continue;
+            staged[staged_len] = .{
+                .client = record.client,
+                .sequence = self.next_sequence + @as(u64, @intCast(staged_len)),
+                .event_id = record.event_id,
+                .bytes = record.bytes,
+            };
+            record.bytes = &.{};
+            staged_len += 1;
+        }
+        std.debug.assert(staged_len == new_count);
+
+        return .{
+            .spool = self,
+            .staged = staged,
+            .new_bytes = new_bytes,
+            .new_attachments = new_attachments,
+            .exact_duplicates = duplicate_count,
+            .expected_len = self.entries.items.len,
+            .expected_total_bytes = self.total_bytes,
+            .expected_attachment_count = self.attachment_count,
+            .expected_next_sequence = self.next_sequence,
+        };
+    }
+
+    /// Adopt `batch` in one transaction. See `prepareOwnedBatch` for ownership.
+    pub fn reserveOwnedBatch(self: *Spool, batch: []OwnedBatchRecord) ReserveError!ReserveResult {
+        var prepared = try self.prepareOwnedBatch(batch);
+        defer prepared.deinit();
+        return prepared.commit();
+    }
+
+    const OwnedDisposition = enum { insert, duplicate };
+
+    fn ownedDisposition(self: *const Spool, batch: []const OwnedBatchRecord, index: usize) ReserveError!OwnedDisposition {
+        const record = batch[index];
+        if (!validRenderedRecord(record.bytes) or record.bytes.len > self.config.max_record_bytes)
+            return error.InvalidRecord;
+        if (self.indexOf(record.client, record.event_id)) |existing| {
+            if (!std.mem.eql(u8, self.entries.items[existing].bytes, record.bytes))
+                return error.Equivocation;
+            return .duplicate;
+        }
+        for (batch[0..index]) |prior| {
+            if (prior.client != record.client or !std.mem.eql(u8, &prior.event_id, &record.event_id)) continue;
+            if (!std.mem.eql(u8, prior.bytes, record.bytes)) return error.Equivocation;
+            return .duplicate;
+        }
+        return .insert;
     }
 
     /// Return at most one oldest record per physical client, starting after the
@@ -1953,4 +2066,72 @@ test "attachment delivery spool large canonical checkpoint validation is linear"
         noncanonical[noncanonical.len - checksum_len ..][0..checksum_len],
     );
     try testing.expectError(error.NonCanonicalOrder, validateCheckpoint(noncanonical));
+}
+
+test "owned attachment batch adopts inserted bodies and adopts nothing on failure" {
+    var spool = try Spool.init(testing.allocator, .{});
+    defer spool.deinit();
+
+    const first = try testing.allocator.dupe(u8, "one\r\n");
+    const first_ptr = first.ptr;
+    var adopted = [_]OwnedBatchRecord{
+        .{ .client = 7, .event_id = eventId(3), .bytes = first },
+    };
+    const inserted = try spool.reserveOwnedBatch(&adopted);
+    try testing.expectEqual(@as(usize, 1), inserted.inserted);
+    try testing.expectEqual(@as(usize, 0), adopted[0].bytes.len);
+    try testing.expectEqual(first_ptr, spool.entries.items[0].bytes.ptr);
+
+    const duplicate = try testing.allocator.dupe(u8, "one\r\n");
+    var again = [_]OwnedBatchRecord{
+        .{ .client = 7, .event_id = eventId(3), .bytes = duplicate },
+    };
+    const dup = try spool.reserveOwnedBatch(&again);
+    try testing.expectEqual(@as(usize, 0), dup.inserted);
+    try testing.expectEqual(@as(usize, 1), dup.exact_duplicates);
+    try testing.expectEqual(duplicate.ptr, again[0].bytes.ptr);
+    testing.allocator.free(again[0].bytes);
+    try testing.expectEqual(@as(usize, 1), spool.len());
+
+    const conflict = try testing.allocator.dupe(u8, "two\r\n");
+    var bad = [_]OwnedBatchRecord{
+        .{ .client = 7, .event_id = eventId(3), .bytes = conflict },
+    };
+    try testing.expectError(error.Equivocation, spool.reserveOwnedBatch(&bad));
+    try testing.expectEqual(conflict.ptr, bad[0].bytes.ptr);
+    testing.allocator.free(bad[0].bytes);
+    try testing.expectEqualStrings("one\r\n", spool.entries.items[0].bytes);
+
+    var limited = try Spool.init(testing.allocator, .{
+        .max_attachments = 1,
+        .max_records = 1,
+        .max_total_bytes = 64,
+        .max_record_bytes = 32,
+    });
+    defer limited.deinit();
+    const keep = try testing.allocator.dupe(u8, "keep\r\n");
+    const drop = try testing.allocator.dupe(u8, "drop\r\n");
+    var overflow = [_]OwnedBatchRecord{
+        .{ .client = 1, .event_id = eventId(1), .bytes = keep },
+        .{ .client = 2, .event_id = eventId(1), .bytes = drop },
+    };
+    try testing.expectError(error.CapacityExceeded, limited.reserveOwnedBatch(&overflow));
+    try testing.expectEqual(keep.ptr, overflow[0].bytes.ptr);
+    try testing.expectEqual(drop.ptr, overflow[1].bytes.ptr);
+    testing.allocator.free(overflow[0].bytes);
+    testing.allocator.free(overflow[1].bytes);
+    try testing.expectEqual(@as(usize, 0), limited.len());
+
+    const left = try testing.allocator.dupe(u8, "left\r\n");
+    const right = try testing.allocator.dupe(u8, "right\r\n");
+    var pending = [_]OwnedBatchRecord{
+        .{ .client = 4, .event_id = eventId(8), .bytes = left },
+        .{ .client = 5, .event_id = eventId(8), .bytes = right },
+    };
+    var prepared = try spool.prepareOwnedBatch(&pending);
+    try testing.expectEqual(@as(usize, 0), pending[0].bytes.len);
+    try testing.expectEqual(@as(usize, 0), pending[1].bytes.len);
+    try testing.expectEqual(left.ptr, prepared.staged[0].bytes.ptr);
+    prepared.deinit();
+    try testing.expectEqual(@as(usize, 1), spool.len());
 }

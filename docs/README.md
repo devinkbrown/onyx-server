@@ -7,24 +7,27 @@ clone of any prior daemon. It speaks IRCv3 + IRCX, runs a custom Undertow CRDT m
 forward-secret Mooring server links, and ships its own pure-Zig TLS (Armor), media codecs
 (CadenceVox/CadenceVis), and in-place upgrade (Helix).
 
-**Current source/live distinction (verified 2026-09-06):** the source manifest is
-`0.7.0` at source-code baseline commit `ae78d490`; both production nodes run the separately
-recorded `0.7.0+ae78d490` artifact under `onyx-server.service`. See the
-[canonical production paths and evidence](ops/onyx-server-paths.md) before doing
-day-2 operations. The public GitHub release channel still publishes `v0.5.6`;
-source version, deployed image, and public tag are intentionally reported separately.
+**Current source/live distinction:** the source manifest is **0.8.0**
+(`build.zig.zon`). That bump is not a deploy. On 2026-09-06 the source baseline
+was `ae78d490` and both production nodes ran the separately recorded
+`0.7.0+ae78d490` artifact under `onyx-server.service`. That fleet record stands.
+See the [canonical production paths and evidence](ops/onyx-server-paths.md) before
+day-2 operations. The public GitHub release channel still publishes `v0.5.6`.
+Source version, deployed image, and public tag stay separate claims. The full
+test suite has not been re-run green on 0.8.0.
 
 The current daemon surface includes `[class.*]` connection classes for registration-time
 resource/admission/flood policy, bounded growable SendQ and RecvQ, optional nick-delay
 holds against camping, and live operator introspection through `STATS Y`, `STATS l`, and
 richer `INFO`.
 
-**Documentation baseline (2026-09-06):** source-code baseline is `ae78d490` (`0.7.0`);
-the deployed two-node fleet is separately recorded as `0.7.0+ae78d490` under
-`onyx-server.service`. Current paths, executable hash, and mesh gauges are kept
-in [the production evidence table](ops/onyx-server-paths.md). Release notes,
-audits, and checkpoint files retain immutable historical snapshots and are marked
-as such rather than rewritten to current values.
+**Documentation baseline:** source manifest **0.8.0**. The 2026-09-06 fleet
+record remains `0.7.0+ae78d490` under `onyx-server.service`. Current paths,
+executable hash, and mesh gauges are kept in
+[the production evidence table](ops/onyx-server-paths.md). Release notes,
+audits, and checkpoint files keep their historical snapshots. Living
+architecture and reference pages describe the 0.8.0 source contract, including
+where that contract is not yet suite-green.
 
 **New here?** Start with the [Quickstart](guide/00-quickstart.md), then the
 [architecture overview](architecture/00-overview.md). The

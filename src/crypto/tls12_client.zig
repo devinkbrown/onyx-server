@@ -1421,7 +1421,9 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
     }
     // Every presented CA's dNSName constraints bind each certificate below it,
     // including an intermediate's own names. Shared with the TLS 1.3 client.
-    try x509_verify.enforcePresentedNameConstraints(chain);
+    // server_name is the name hostname matching accepted, which may be one
+    // expansion of a wildcard SAN rather than a SAN string.
+    try x509_verify.enforcePresentedNameConstraintsFor(chain, server_name);
 
     // RFC 5280 §4.2.1.10 / §6.1.4(m): pathLenConstraint enforcement, shared
     // with the TLS 1.3 client. Reduce the chain to per-cert facts (path limit
@@ -1449,7 +1451,7 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
         if (anchor.eku_present and !anchor.eku_server_auth) continue;
         // The anchor's own name constraints and pathLenConstraint bind the
         // path even when that certificate is not resent in the chain.
-        try x509_verify.enforceExternalAnchor(chain, anchor_der);
+        try x509_verify.enforceExternalAnchorFor(chain, anchor_der, server_name);
         return;
     }
     return error.UnknownCa;
@@ -2006,6 +2008,57 @@ test "TLS 1.2 client rejects a name-constrained CA's cross-domain leaf (F1)" {
         error.BadCertificate,
         verifyChainToTrustAnchors(&chain, &anchors, "login.victim-bank.com", null),
     );
+}
+
+test "TLS 1.2 client rejects a wildcard SAN that expands into an excluded dNSName" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const nb: i64 = 1_704_067_200;
+    const na: i64 = 1_924_991_999;
+    const ca_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x81)));
+    const open_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x82)));
+    const leaf_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x83)));
+    const ca_pub = ca_kp.public_key.toBytes();
+    const open_pub = open_kp.public_key.toBytes();
+    const leaf_pub = leaf_kp.public_key.toBytes();
+
+    var ca_buf: [1024]u8 = undefined;
+    var open_buf: [1024]u8 = undefined;
+    var leaf_buf: [1024]u8 = undefined;
+    var good_buf: [1024]u8 = undefined;
+
+    const ca = try x509_verify.mintEd25519CertExt(&ca_buf, "Wild NC", "Wild NC", ca_pub, ca_kp, nb, na, .{
+        .is_ca = true,
+        .permitted_dns = &.{"example.com"},
+        .excluded_dns = &.{"bad.example.com"},
+    });
+    const excluded_leaf = try x509_verify.mintEd25519CertExt(&leaf_buf, "Wild NC", "wild.example.com", leaf_pub, ca_kp, nb, na, .{
+        .dns_names = &.{"*.example.com"},
+    });
+    const excluded_chain = [_][]const u8{ excluded_leaf, ca };
+    const ca_anchors = [_][]const u8{ca};
+    // *.example.com is inside example.com and is not the name bad.example.com,
+    // but hostname matching expands it to that excluded name.
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&excluded_chain, &ca_anchors, "bad.example.com", null));
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&excluded_chain, &ca_anchors, "host.example.com", null));
+    const omitted = [_][]const u8{excluded_leaf};
+    try std.testing.expectError(error.BadCertificate, verifyChainToTrustAnchors(&omitted, &ca_anchors, "bad.example.com", null));
+
+    const good_leaf = try x509_verify.mintEd25519CertExt(&good_buf, "Wild NC", "good.example.com", leaf_pub, ca_kp, nb, na, .{
+        .dns_names = &.{"*.good.example.com"},
+    });
+    const good_chain = [_][]const u8{ good_leaf, ca };
+    try verifyChainToTrustAnchors(&good_chain, &ca_anchors, "x.good.example.com", null);
+
+    const open = try x509_verify.mintEd25519CertExt(&open_buf, "Wild Open", "Wild Open", open_pub, open_kp, nb, na, .{
+        .is_ca = true,
+        .permitted_dns = &.{"example.com"},
+    });
+    const open_leaf = try x509_verify.mintEd25519CertExt(&leaf_buf, "Wild Open", "wild.example.com", leaf_pub, open_kp, nb, na, .{
+        .dns_names = &.{"*.example.com"},
+    });
+    const open_chain = [_][]const u8{ open_leaf, open };
+    const open_anchors = [_][]const u8{open};
+    try verifyChainToTrustAnchors(&open_chain, &open_anchors, "host.example.com", null);
 }
 
 test "TLS 1.2 client rejects a pathLen:0 CA with a spliced intermediate (F1)" {

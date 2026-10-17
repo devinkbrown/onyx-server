@@ -38,6 +38,9 @@ pub const Reaped = struct {
     op: Op,
     token: ringlane.FdToken,
     result: i32,
+    /// Kernel kept the original submission armed (`IORING_CQE_F_MORE`).
+    /// One-shot backends leave this false so the caller re-arms.
+    more: bool = false,
 };
 
 pub const Listener = struct {
@@ -1940,10 +1943,10 @@ pub const IoBackend = struct {
             pub fn onCompletion(sink: *@This(), completion: ringlane.Completion) void {
                 if (sink.n >= sink.dest.len) return;
                 const item: ?Reaped = switch (completion) {
-                    .accept => |ev| .{ .op = .accept, .token = ev.token, .result = ev.res },
-                    .recv => |ev| .{ .op = .recv, .token = ev.token, .result = ev.res },
-                    .send => |ev| .{ .op = .send, .token = ev.token, .result = ev.res },
-                    .poll => |ev| .{ .op = .poll, .token = ev.token, .result = ev.res },
+                    .accept => |ev| .{ .op = .accept, .token = ev.token, .result = ev.res, .more = ev.more },
+                    .recv => |ev| .{ .op = .recv, .token = ev.token, .result = ev.res, .more = ev.more },
+                    .send => |ev| .{ .op = .send, .token = ev.token, .result = ev.res, .more = ev.more },
+                    .poll => |ev| .{ .op = .poll, .token = ev.token, .result = ev.res, .more = ev.more },
                     .timeout => .{ .op = .timeout, .token = .{ .slot = 0, .gen = 0 }, .result = 0 },
                     .connect => |ev| .{ .op = .connect, .token = ev.token, .result = ev.res },
                     .other => null,
@@ -3059,7 +3062,10 @@ const Iocp = struct {
     }
 
     pub fn enqueueAccept(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t) !void {
-        if (self.n >= self.cap) return error.SubmissionQueueFull;
+        // A closed port has no kernel queue. Ops that still fit are recorded,
+        // then MissingOp. A second op on a full closed queue is MissingOp and
+        // is not recorded. A live port still reports SubmissionQueueFull.
+        if (self.n >= self.cap) return if (self.port == 0) error.MissingOp else error.SubmissionQueueFull;
         const handle = try handleOf(fd);
         const serial = try self.remember(packToken(token), handle, op_accept);
         return self.pushStored(.{
@@ -3073,7 +3079,7 @@ const Iocp = struct {
     }
 
     pub fn enqueueRecv(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t, buffer: []u8) !void {
-        if (self.n >= self.cap) return error.SubmissionQueueFull;
+        if (self.n >= self.cap) return if (self.port == 0) error.MissingOp else error.SubmissionQueueFull;
         if (buffer.len == 0 or buffer.len > std.math.maxInt(u32)) return error.MissingOp;
         const handle = try handleOf(fd);
         const serial = try self.remember(packToken(token), handle, op_recv);
@@ -3090,7 +3096,7 @@ const Iocp = struct {
     }
 
     pub fn enqueueSend(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t, buffer: []const u8) !void {
-        if (self.n >= self.cap) return error.SubmissionQueueFull;
+        if (self.n >= self.cap) return if (self.port == 0) error.MissingOp else error.SubmissionQueueFull;
         if (buffer.len == 0 or buffer.len > std.math.maxInt(u32)) return error.MissingOp;
         const handle = try handleOf(fd);
         const serial = try self.remember(packToken(token), handle, op_send);
@@ -3107,7 +3113,7 @@ const Iocp = struct {
     }
 
     pub fn enqueuePoll(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t, poll_mask: u32) !void {
-        if (self.n >= self.cap) return error.SubmissionQueueFull;
+        if (self.n >= self.cap) return if (self.port == 0) error.MissingOp else error.SubmissionQueueFull;
         const supported = linux.POLL.IN | linux.POLL.OUT;
         if (poll_mask == 0 or poll_mask & ~@as(u32, supported) != 0) return error.MissingOp;
         const handle = try handleOf(fd);
@@ -3124,7 +3130,7 @@ const Iocp = struct {
     }
 
     pub fn enqueueConnect(self: *Iocp, token: ringlane.FdToken, fd: linux.fd_t, addr: *const std.posix.sockaddr, addrlen: std.posix.socklen_t) !void {
-        if (self.n >= self.cap) return error.SubmissionQueueFull;
+        if (self.n >= self.cap) return if (self.port == 0) error.MissingOp else error.SubmissionQueueFull;
         const len: usize = @intCast(addrlen);
         if (len != @sizeOf(RioSockAddr) and len != @sizeOf(RioSockAddr6)) return error.MissingOp;
         const bytes = @as([*]const u8, @ptrCast(addr))[0..len];
@@ -3148,6 +3154,10 @@ const Iocp = struct {
 
     pub fn enqueueCancel(self: *Iocp, kind: ringlane.OpKind, token: ringlane.FdToken) !void {
         if (self.submit_failed) return error.MissingOp;
+        // A closed port has nothing to cancel. Kqueue returns MissingOp for
+        // poll before any push when its fd is closed. Recording this cancel
+        // would count a seventh op after the six the closed-port contract keeps.
+        if (kind == .poll and self.port == 0) return error.MissingOp;
         const op: u8 = switch (kind) {
             .accept => op_accept,
             .recv => op_recv,
@@ -3208,7 +3218,7 @@ const Iocp = struct {
 
     fn pushStored(self: *Iocp, packet: Packet) !void {
         if (self.submit_failed) return error.MissingOp;
-        if (self.n >= self.cap) return error.SubmissionQueueFull;
+        if (self.n >= self.cap) return if (self.port == 0) error.MissingOp else error.SubmissionQueueFull;
         self.packets[self.n] = packet;
         self.n += 1;
         if (self.port == 0) return error.MissingOp;
@@ -3830,6 +3840,12 @@ const Iocp = struct {
         if (iosb.u.Status == .CANCELLED) return .{ .op = op, .token = token, .result = -@as(i32, @intFromEnum(linux.E.CANCELED)) };
         if (iosb.u.Status != .SUCCESS) return .{ .op = op, .token = token, .result = -1 };
         if (packet.op == op_accept) {
+            // Linux tests call this decoder. The Winsock adopt is not
+            // analyzed off Windows, so the static musl test does not
+            // reference ws2_32.
+            if (comptime builtin.os.tag != .windows) {
+                return .{ .op = .accept, .token = token, .result = -1 };
+            }
             const sock = acceptSequence(packet.handle, accept_out) catch {
                 return .{ .op = .accept, .token = token, .result = -1 };
             };

@@ -341,10 +341,10 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.limits.sweep_interval_ms != 0) out.sweep_interval_ms = @intCast(cfg.limits.sweep_interval_ms);
     out.ring_entries = @intCast(cfg.io.ring_entries);
     out.cqe_batch = @intCast(cfg.io.cqe_batch);
-    // Ownership-safe setup flags. `RingCore.init` (`server.zig`) is the
-    // fail-closed probe: `IoUring.init` with these flags returns
-    // `error.Unsupported` instead of silently narrowing to baseline.
-    // Default false = byte-identical. Do not raise `cqe_batch` here.
+    // `defer_taskrun` is stored and still refused together with `sqpoll`
+    // by config check. `ringlane.Ring.init` does not pass
+    // `DEFER_TASKRUN` or `SINGLE_ISSUER`. `sqpoll` is opt-in and falls
+    // back only on `error.ArgumentsInvalid`. Do not raise `cqe_batch` here.
     out.features.defer_taskrun = cfg.io.defer_taskrun;
     out.features.sqpoll = cfg.io.sqpoll;
     out.reg_timeout_penalty = cfg.reputation.registration_timeout_penalty;
@@ -603,10 +603,10 @@ pub const AcmeBootConfig = struct {
     http01_conn_read_timeout_sec: u32 = (config_format.Config.Acme{}).http01_conn_read_timeout_sec,
 };
 
-/// Neutral `[io]` flag projection for ownership-safe io_uring setup
-/// (`defer_taskrun`+`SINGLE_ISSUER`, `sqpoll`). `mapToServerConfig` also
-/// copies these onto `server.Config.features` so `RingCore.init` is the
-/// fail-closed kernel probe. Default false = byte-identical.
+/// Neutral `[io]` flag projection. `defer_taskrun` stays on the config
+/// object and is rejected together with `sqpoll` before boot. The live
+/// ring never requests `DEFER_TASKRUN` or `SINGLE_ISSUER`. `sqpoll` is
+/// copied onto `server.Config.features` and is opt-in.
 pub const IoBootConfig = struct {
     defer_taskrun: bool = false,
     sqpoll: bool = false,
@@ -620,11 +620,10 @@ pub fn mapIoBootConfig(cfg: config_format.Config) IoBootConfig {
 }
 
 /// Kernel reason `--check-config` prints when both flags are set.
-/// `RingFeatures.setupFlags` always adds `IORING_SETUP_SINGLE_ISSUER` next to
-/// `IORING_SETUP_DEFER_TASKRUN`, and Linux rejects that trio with SQPOLL
-/// (`EINVAL`). The four-reactor boot also created rings before the worker
-/// thread bound, which returned `InvalidThread`. The safe combination is
-/// SQPOLL without `defer_taskrun`.
+/// `RingFeatures.setupFlags` still describes `DEFER_TASKRUN|SINGLE_ISSUER`,
+/// and Linux rejects that trio with SQPOLL (`EINVAL`). The live
+/// `Ring.init` never passes those two bits. Config check keeps refusing
+/// the pair so a file cannot ask for a setup this tree will not arm.
 pub const sqpoll_defer_taskrun_reason: []const u8 = "io.sqpoll + io.defer_taskrun rejected: kernel returns EINVAL for IORING_SETUP_SQPOLL|IORING_SETUP_DEFER_TASKRUN|IORING_SETUP_SINGLE_ISSUER";
 
 /// `txrx` stays a documented footgun until a TLS 1.3 peer can rekey both
@@ -951,9 +950,9 @@ pub const Loaded = struct {
     acme: AcmeBootConfig = .{},
     /// Neutral IRCv3 STS boot projection; `main.zig` consumes this to enable STS.
     sts: StsBootConfig = .{},
-    /// Parsed `[io]` ownership-safe ring flags. Also copied onto
-    /// `config.features`; `RingCore.init` refuse-closes if the kernel
-    /// rejects the setup flags.
+    /// Parsed `[io]` flags. `sqpoll` is copied onto `config.features`.
+    /// `defer_taskrun` is stored here and refused with `sqpoll` before
+    /// boot. The live ring never requests `DEFER_TASKRUN`.
     io: IoBootConfig = .{},
     /// Number of worker reactor shards to spin up (`ReactorPool` size). 1 = the
     /// single-reactor model. `server.Config` carries no thread-topology field,

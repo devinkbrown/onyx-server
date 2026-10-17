@@ -304,6 +304,8 @@ const session_replica_frame = @import("../../proto/session_replica_frame.zig");
 const meshpass = @import("../../proto/meshpass.zig");
 const membership_event = @import("../../proto/membership_event.zig");
 const oper_event = @import("../../proto/oper_event.zig");
+const mesh_presence_v2 = @import("../../proto/mesh_presence_v2.zig");
+const guest_direct = @import("../../proto/guest_direct.zig");
 const observe_event = @import("../../proto/observe_event.zig");
 const kill_relay = @import("../../proto/kill_relay.zig");
 const memo_push_relay = @import("../../proto/memo_push_relay.zig");
@@ -506,6 +508,20 @@ pub const InboundOperEventV2 = struct {
         self.* = undefined;
     }
 };
+
+/// One verified original guest-presence or guest-direct body plus the
+/// authenticated immediate hop. `wire` is forwarded byte-identical.
+pub const InboundGuestFrame = struct {
+    wire: []u8,
+    via_peer: NodeId,
+
+    pub fn deinit(self: *InboundGuestFrame, allocator: Allocator) void {
+        allocator.free(self.wire);
+        self.* = undefined;
+    }
+};
+
+const max_guest_frames = 64;
 
 /// NICK/MEMBERSHIP frames and their snapshot completion marker on a negotiated
 /// v2 link are residence-dependent.
@@ -775,6 +791,14 @@ pub const S2sPeer = struct {
     /// Verified KEYTRANS_HEAD payloads. The daemon checks the head signature
     /// and refuses an older entry count. Opaque here.
     keytrans_heads: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified mesh-presence v2 originals. The daemon admits the origin and
+    /// chooses the next hop; this queue does not resign the body.
+    guest_presence: std.ArrayListUnmanaged(InboundGuestFrame) = .empty,
+    /// Verified ordinary-guest direct messages awaiting exact delivery or
+    /// one-hop forward. Capped so a peer cannot grow the queue without bound.
+    guest_directs: std.ArrayListUnmanaged(InboundGuestFrame) = .empty,
+    dropped_guest_frames: u64 = 0,
+    rejected_guest_frames: u64 = 0,
     /// Verified MEMO_PUSH payloads received from this peer, awaiting the daemon
     /// to decode and run local Web Push delivery. These are signing-required:
     /// legacy/plaintext peers are ignored so DM previews do not ride unsigned S2S.
@@ -1063,6 +1087,10 @@ pub const S2sPeer = struct {
         self.search_replies.deinit(self.allocator);
         for (self.keytrans_heads.items) |m| self.allocator.free(m);
         self.keytrans_heads.deinit(self.allocator);
+        for (self.guest_presence.items) |*frame| frame.deinit(self.allocator);
+        self.guest_presence.deinit(self.allocator);
+        for (self.guest_directs.items) |*frame| frame.deinit(self.allocator);
+        self.guest_directs.deinit(self.allocator);
         for (self.memo_pushes.items) |m| self.allocator.free(m);
         self.memo_pushes.deinit(self.allocator);
         for (self.media_ws_datagrams.items) |m| self.allocator.free(m);
@@ -1389,6 +1417,8 @@ pub const S2sPeer = struct {
             .SEARCH_QUERY => try self.recvSearchQuery(frame.payload),
             .SEARCH_REPLY => try self.recvSearchReply(frame.payload),
             .KEYTRANS_HEAD => try self.recvKeyTransHead(frame.payload),
+            .GUEST_PRESENCE => self.recvGuestPresence(frame.payload),
+            .GUEST_DIRECT => self.recvGuestDirect(frame.payload),
             .RESYNC => {
                 self.resync_requested = true;
                 // RESYNC is also the one-shot capability-refresh request for a
@@ -2024,6 +2054,92 @@ pub const S2sPeer = struct {
 
     pub fn supportsKeyTransHead(self: *const S2sPeer) bool {
         return self.established and self.peer_supports_keytrans_head;
+    }
+
+    /// Established secured links that already sign. No second capability bit
+    /// and no probe: peers that do not know the tag skip it.
+    pub fn supportsGuestPresence(self: *const S2sPeer) bool {
+        return self.established and self.signing_key != null and self.peer_supports_signing;
+    }
+
+    fn recvGuestPresence(self: *S2sPeer, outer_payload: []const u8) void {
+        self.recvGuestFrame(outer_payload, .GUEST_PRESENCE, true);
+    }
+
+    fn recvGuestDirect(self: *S2sPeer, outer_payload: []const u8) void {
+        self.recvGuestFrame(outer_payload, .GUEST_DIRECT, false);
+    }
+
+    fn recvGuestFrame(self: *S2sPeer, outer_payload: []const u8, frame_type: s2s_frame.FrameType, presence: bool) void {
+        if (!self.supportsGuestPresence()) {
+            self.rejected_guest_frames +|= 1;
+            return;
+        }
+        const payload = self.verifiedPayload(frame_type, outer_payload) orelse {
+            self.rejected_guest_frames +|= 1;
+            return;
+        };
+        if (presence) {
+            const decoded = mesh_presence_v2.decode(payload) catch {
+                self.rejected_guest_frames +|= 1;
+                return;
+            };
+            decoded.verify() catch {
+                self.rejected_guest_frames +|= 1;
+                return;
+            };
+        } else {
+            const decoded = guest_direct.decode(payload) catch {
+                self.rejected_guest_frames +|= 1;
+                return;
+            };
+            decoded.verify() catch {
+                self.rejected_guest_frames +|= 1;
+                return;
+            };
+        }
+        const queue = if (presence) &self.guest_presence else &self.guest_directs;
+        if (queue.items.len >= max_guest_frames) {
+            self.dropped_guest_frames +|= 1;
+            return;
+        }
+        const wire = self.allocator.dupe(u8, payload) catch {
+            self.dropped_guest_frames +|= 1;
+            return;
+        };
+        queue.append(self.allocator, .{ .wire = wire, .via_peer = self.remote_node_id }) catch {
+            self.dropped_guest_frames +|= 1;
+            self.allocator.free(wire);
+            return;
+        };
+    }
+
+    fn requireGuestPresence(self: *const S2sPeer) !void {
+        if (!self.supportsGuestPresence()) return error.SecuredLinkRequired;
+    }
+
+    pub fn forwardGuestPresence(self: *S2sPeer, sink: ByteSink, original: []const u8) !bool {
+        try self.requireGuestPresence();
+        const decoded = mesh_presence_v2.decode(original) catch return error.InvalidField;
+        try decoded.verify();
+        try self.emitSignable(sink, .GUEST_PRESENCE, original);
+        return true;
+    }
+
+    pub fn forwardGuestDirect(self: *S2sPeer, sink: ByteSink, original: []const u8) !bool {
+        try self.requireGuestPresence();
+        const decoded = guest_direct.decode(original) catch return error.InvalidField;
+        try decoded.verify();
+        try self.emitSignable(sink, .GUEST_DIRECT, original);
+        return true;
+    }
+
+    pub fn takeGuestPresence(self: *S2sPeer) ![]InboundGuestFrame {
+        return self.guest_presence.toOwnedSlice(self.allocator);
+    }
+
+    pub fn takeGuestDirects(self: *S2sPeer) ![]InboundGuestFrame {
+        return self.guest_directs.toOwnedSlice(self.allocator);
     }
 
     /// Queue a verified inbound MEMO_PUSH hint for daemon-side Web Push
@@ -9312,7 +9428,7 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .MEMO_PUSH,                        .SESSION_REPLICA_OFFER,
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
         .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,               .E2EE_GROUP_ACK,                   .MEMBERSHIP_SYNC,
-        .SEARCH_QUERY,        .SEARCH_REPLY,           .KEYTRANS_HEAD,
+        .SEARCH_QUERY,        .SEARCH_REPLY,           .KEYTRANS_HEAD,            .GUEST_PRESENCE,                   .GUEST_DIRECT,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

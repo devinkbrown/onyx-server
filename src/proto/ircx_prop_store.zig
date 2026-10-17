@@ -225,6 +225,18 @@ pub fn channelPropKey(raw: []const u8) ?ChannelPropKey {
     return null;
 }
 
+/// Draft channel LAG, in whole seconds. Only `0`, `1`, and `2` are legal.
+/// Any other spelling, including a longer number, is not a lag.
+pub fn lagSeconds(value: []const u8) ?u8 {
+    if (value.len != 1) return null;
+    return switch (value[0]) {
+        '0' => 0,
+        '1' => 1,
+        '2' => 2,
+        else => null,
+    };
+}
+
 pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
     const key = channelPropKey(raw) orelse return null;
     return switch (key) {
@@ -248,6 +260,7 @@ pub fn channelPropInfo(raw: []const u8) ?ChannelPropInfo {
         .topic => .{ .key = key, .max_value = 160, .min_setter = .host },
         .subject => .{ .key = key, .max_value = 31, .min_setter = .host },
         .client, .onjoin, .onpart => .{ .key = key, .max_value = 255, .min_setter = .host },
+        // Draft LAG is one digit: 0, 1, or 2 seconds. `lagSeconds` rejects the rest.
         .lag => .{ .key = key, .max_value = 1, .min_setter = .owner },
         .account => .{ .key = key, .max_value = 31, .min_setter = .sysop_manager },
         .clientguid, .servicepath => .{ .key = key, .max_value = default_max_value, .min_setter = .owner },
@@ -2105,6 +2118,7 @@ fn validateValueFor(entity: Entity, key: []const u8, value: []const u8, access: 
         if (channelPropInfo(key)) |info| {
             if (info.read_only) return error.ReadOnlyProperty;
             if (!access.allows(info.min_setter)) return error.AccessDenied;
+            if (info.key == .lag and lagSeconds(value) == null) return error.InvalidValue;
             limit = @min(limit, info.max_value);
         } else if (!access.allows(.host)) {
             return error.AccessDenied;
@@ -3029,6 +3043,17 @@ test "limits and built-in channel property metadata are enforced" {
     const chan = try Entity.fromId("#mc");
     try std.testing.expectError(error.ReadOnlyProperty, full.setProp(chan, "MEMBERCOUNT", "1", .{ .id = "server", .access = .server }));
     _ = try full.setProp(chan, "MEMBERLIMIT", "50", .{ .id = "host", .access = .host });
+
+    // Draft LAG is a 0–2 second member pause. A one-character impostor is not.
+    try std.testing.expectEqual(@as(?u8, 2), lagSeconds("2"));
+    try std.testing.expectEqual(@as(?u8, 0), lagSeconds("0"));
+    try std.testing.expect(lagSeconds("3") == null);
+    try std.testing.expect(lagSeconds("10") == null);
+    _ = try full.setProp(chan, "LAG", "2", .{ .id = "owner", .access = .owner });
+    try std.testing.expectEqualStrings("2", (try full.getProp(chan, "LAG")).value);
+    try std.testing.expectError(error.InvalidValue, full.setProp(chan, "LAG", "9", .{ .id = "owner", .access = .owner }));
+    try std.testing.expectError(error.AccessDenied, full.setProp(chan, "LAG", "1", .{ .id = "host", .access = .host }));
+    try std.testing.expectEqualStrings("2", (try full.getProp(chan, "LAG")).value);
 }
 
 test "user profile properties use the profile value limit" {

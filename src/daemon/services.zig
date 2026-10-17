@@ -311,7 +311,66 @@ pub const account_flag_noexpire: u32 = 1 << 2;
 /// format change. `secure` = recognize the account only via identify.
 pub const account_flag_enforce_off: u32 = 1 << 3;
 pub const account_flag_secure: u32 = 1 << 4;
+/// Password, SCRAM, and the other password-derived mechanisms are refused.
+/// Passkey login and a recovery-code password replacement stay available.
+/// The generic ACCOUNTSET flags field cannot set or clear this bit.
+pub const account_flag_passkey_only: u32 = 1 << 5;
 pub const account_flags_privileged: u32 = account_flag_suspended | account_flag_forbidden | account_flag_noexpire;
+
+/// How long a SUCCESSOR SET waits before it replaces the armed successor.
+/// CLEAR during the wait cancels the replacement. A drop during the wait
+/// still hands the channel to the already-armed successor.
+pub const successor_hold_ms: u64 = 10 * 60 * 1000;
+
+pub const login_audit_cap: usize = 8;
+const login_audit_prefix = "lga\x00";
+const login_audit_record_len: usize = 19;
+const login_audit_key_max: usize = login_audit_prefix.len + account_max;
+const login_audit_blob_max: usize = login_audit_cap * login_audit_record_len;
+
+pub const LoginMechanism = enum(u8) {
+    password = 1,
+    scram = 2,
+    external = 3,
+    passkey = 4,
+    recovery = 5,
+    oauth = 6,
+    token = 7,
+
+    pub fn label(self: LoginMechanism) []const u8 {
+        return switch (self) {
+            .password => "password",
+            .scram => "scram",
+            .external => "external",
+            .passkey => "passkey",
+            .recovery => "recovery",
+            .oauth => "oauth",
+            .token => "token",
+        };
+    }
+};
+
+pub const LoginTls = enum(u8) {
+    unknown = 0,
+    clear = 1,
+    tls = 2,
+
+    pub fn label(self: LoginTls) []const u8 {
+        return switch (self) {
+            .unknown => "unknown",
+            .clear => "clear",
+            .tls => "tls",
+        };
+    }
+};
+
+pub const LoginAuditEntry = struct {
+    at_ms: u64 = 0,
+    mechanism: LoginMechanism = .password,
+    tls: LoginTls = .unknown,
+    certfp_prefix: [8]u8 = @splat(0),
+    certfp_len: u8 = 0,
+};
 
 pub const AccountInfo = struct {
     name: AccountName,
@@ -524,6 +583,10 @@ pub const Services = struct {
     /// every fail-closed availability transition does advance it.
     durable_oper_availability_epoch: u64 = 0,
     lock: rwlock.RwLock = .{},
+    /// Zero uses the wall clock. A non-zero value is a millisecond clock for
+    /// the successor hold and the login audit. Atomic so a live server test
+    /// can publish it from another thread while the daemon reads it.
+    clock_override_ms: std.atomic.Value(u64) = .init(0),
 
     pub fn init(store: *OroStore, state: ?StateHook) Services {
         return .{ .store = store, .state = state };
@@ -557,6 +620,32 @@ pub const Services = struct {
         defer self.lock.unlockExclusive();
 
         self.scram = scram;
+        // The gate reads account flags and must not take the SCRAM lock.
+        // attach holds this services lock first, then publishes the pointer.
+        scram.password_gate = .{ .ptr = self, .allowed = scramPasswordGate };
+    }
+
+    fn scramPasswordGate(ptr: *anyopaque, account: []const u8) bool {
+        const self: *Services = @ptrCast(@alignCast(ptr));
+        return self.passwordMechanismsAllowed(account);
+    }
+
+    fn servicesNowMs(self: *const Services) u64 {
+        const override = self.clock_override_ms.load(.acquire);
+        if (override != 0) return override;
+        const wall = std.Io.Clock.real.now(self.store.io).toMilliseconds();
+        if (wall <= 0) return 0;
+        return @intCast(wall);
+    }
+
+    /// False when the account has refused password-derived mechanisms.
+    /// A missing account returns true so the caller keeps its ordinary
+    /// unknown-account behavior.
+    pub fn passwordMechanismsAllowed(self: *Services, account: []const u8) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const record = self.loadAccount(account) catch return true;
+        return (record.flags & account_flag_passkey_only) == 0;
     }
 
     /// Attach the account ⇄ certfp binding store (for SASL EXTERNAL / CERTADD).
@@ -2397,6 +2486,15 @@ pub const Services = struct {
         var cose_key_buf: [webauthn_creds.max_cose_key_bytes]u8 = undefined;
         const cose_key = rec.decodeCoseKey(&cose_key_buf) catch return error.InvalidRecord;
 
+        // A passkey-only account must keep one credential. Removing the last
+        // one would leave no way in except the recovery-code password reset.
+        if (ids.len <= 1) {
+            const owner = self.loadAccount(key.asSlice()) catch null;
+            if (owner) |record| {
+                if ((record.flags & account_flag_passkey_only) != 0) return error.Forbidden;
+            }
+        }
+
         // Remove from the list, then delete the record.
         var new_list_buf: [webauthn_creds.account_list_value_max]u8 = undefined;
         const new_list = (webauthn_creds.listRemove(list, target, &new_list_buf) catch return error.BufferTooSmall) orelse
@@ -2408,6 +2506,34 @@ pub const Services = struct {
         }
         self.store.family(.props).delete(cred_key) catch {};
         self.recordKeyTransparency(key.asSlice(), .webauthn, .delete, target, cose_key, 0);
+    }
+
+    /// Refuse password-derived mechanisms for `account`. Requires at least one
+    /// bound passkey, so a typo in a flags field cannot lock the account out.
+    /// Not reachable from ACCOUNTSET. A later ceremony calls this only after
+    /// the passkey has already verified.
+    pub fn enablePasskeyOnly(self: *Services, account: []const u8, scratch: []u8) ServiceError!void {
+        const key = try accountKey(account);
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        if (!self.passkeysBoundUnlocked(key.asSlice())) return error.Forbidden;
+        var record = try self.loadAccount(key.asSlice());
+        record.flags |= account_flag_passkey_only;
+        try self.saveAccount(record, scratch);
+    }
+
+    fn passkeysBoundUnlocked(self: *Services, account: []const u8) bool {
+        var list_key_buf: [webauthn_creds.account_list_key_max]u8 = undefined;
+        const list_key = webauthn_creds.accountListKey(&list_key_buf, account) orelse return false;
+        const list = self.store.family(.props).get(list_key) orelse return false;
+        var ids_buf: [webauthn_creds.max_creds_per_account][]const u8 = undefined;
+        const ids = webauthn_creds.listIds(list, &ids_buf);
+        for (ids) |id| {
+            var cred_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+            const cred_key = webauthn_creds.credKey(&cred_key_buf, id) orelse continue;
+            if (self.store.family(.props).get(cred_key) != null) return true;
+        }
+        return false;
     }
 
     /// Mirror an account's derived SCRAM tuple into the durable store, keyed by
@@ -2759,7 +2885,132 @@ pub const Services = struct {
         return .verified;
     }
 
+    fn loginAuditKey(buf: []u8, account: []const u8) ?[]const u8 {
+        if (account.len == 0 or account.len > account_max) return null;
+        if (buf.len < login_audit_prefix.len + account.len) return null;
+        @memcpy(buf[0..login_audit_prefix.len], login_audit_prefix);
+        @memcpy(buf[login_audit_prefix.len..][0..account.len], account);
+        return buf[0 .. login_audit_prefix.len + account.len];
+    }
+
+    fn loginMechanismFromByte(byte: u8) ?LoginMechanism {
+        return switch (byte) {
+            @intFromEnum(LoginMechanism.password) => .password,
+            @intFromEnum(LoginMechanism.scram) => .scram,
+            @intFromEnum(LoginMechanism.external) => .external,
+            @intFromEnum(LoginMechanism.passkey) => .passkey,
+            @intFromEnum(LoginMechanism.recovery) => .recovery,
+            @intFromEnum(LoginMechanism.oauth) => .oauth,
+            @intFromEnum(LoginMechanism.token) => .token,
+            else => null,
+        };
+    }
+
+    fn loginTlsFromByte(byte: u8) ?LoginTls {
+        return switch (byte) {
+            @intFromEnum(LoginTls.unknown) => .unknown,
+            @intFromEnum(LoginTls.clear) => .clear,
+            @intFromEnum(LoginTls.tls) => .tls,
+            else => null,
+        };
+    }
+
+    fn decodeLoginAuditRecord(raw: []const u8) ?LoginAuditEntry {
+        if (raw.len != login_audit_record_len) return null;
+        const mechanism = loginMechanismFromByte(raw[8]) orelse return null;
+        const tls = loginTlsFromByte(raw[9]) orelse return null;
+        var prefix: [8]u8 = @splat(0);
+        @memcpy(&prefix, raw[11..19]);
+        return .{
+            .at_ms = std.mem.readInt(u64, raw[0..8], .little),
+            .mechanism = mechanism,
+            .tls = tls,
+            .certfp_prefix = prefix,
+            .certfp_len = @min(raw[10], 8),
+        };
+    }
+
+    /// Append one successful login. The ring keeps `login_audit_cap` records and
+    /// drops the oldest. A failure here must not fail the login that recorded it.
+    /// `tls = unknown` is the honest value when the caller cannot see the socket.
+    pub fn appendLoginAudit(self: *Services, account: []const u8, entry: LoginAuditEntry) ServiceError!void {
+        const key_name = try accountKey(account);
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var key_buf: [login_audit_key_max]u8 = undefined;
+        const key = loginAuditKey(&key_buf, key_name.asSlice()) orelse return error.BufferTooSmall;
+        var blob: [login_audit_blob_max]u8 = undefined;
+        var n: usize = 0;
+        if (self.store.family(.props).get(key)) |existing| {
+            const whole = (existing.len / login_audit_record_len) * login_audit_record_len;
+            const records = whole / login_audit_record_len;
+            const keep = if (records >= login_audit_cap) login_audit_cap - 1 else records;
+            const drop = records - keep;
+            const src = existing[drop * login_audit_record_len .. whole];
+            @memcpy(blob[0..src.len], src);
+            n = src.len;
+        }
+        var stamped = entry;
+        if (stamped.at_ms == 0) stamped.at_ms = self.servicesNowMs();
+        var rec: [login_audit_record_len]u8 = undefined;
+        std.mem.writeInt(u64, rec[0..8], stamped.at_ms, .little);
+        rec[8] = @intFromEnum(stamped.mechanism);
+        rec[9] = @intFromEnum(stamped.tls);
+        rec[10] = @min(stamped.certfp_len, 8);
+        @memcpy(rec[11..19], &stamped.certfp_prefix);
+        @memcpy(blob[n..][0..login_audit_record_len], &rec);
+        n += login_audit_record_len;
+        try self.store.family(.props).put(key, blob[0..n]);
+    }
+
+    /// Copy the account's login ring into `out`, oldest first and newest last.
+    /// When `out` is shorter than the ring, the newest entries are kept.
+    pub fn copyLoginAudit(self: *Services, account: []const u8, out: []LoginAuditEntry) ServiceError![]const LoginAuditEntry {
+        const key_name = try accountKey(account);
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        var key_buf: [login_audit_key_max]u8 = undefined;
+        const key = loginAuditKey(&key_buf, key_name.asSlice()) orelse return error.BufferTooSmall;
+        const blob = self.store.family(.props).get(key) orelse return out[0..0];
+        var decoded: [login_audit_cap]LoginAuditEntry = undefined;
+        var count: usize = 0;
+        var off: usize = 0;
+        while (off + login_audit_record_len <= blob.len and count < login_audit_cap) : (off += login_audit_record_len) {
+            if (decodeLoginAuditRecord(blob[off..][0..login_audit_record_len])) |row| {
+                decoded[count] = row;
+                count += 1;
+            }
+        }
+        if (out.len == 0 or count == 0) return out[0..0];
+        const start = if (count > out.len) count - out.len else 0;
+        const kept = count - start;
+        for (0..kept) |i| out[i] = decoded[start + i];
+        return out[0..kept];
+    }
+
     pub fn identifyAccount(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
+        return self.identifyAccountChecked(name, password);
+    }
+
+    /// Password login that records one audit row. Password checks that are not
+    /// logins stay on `identifyAccount` and write nothing. `mechanism` is forced
+    /// to password. `at_ms == 0` is stamped from the services clock.
+    pub fn identifyAccountWithAudit(self: *Services, name: []const u8, password: []const u8, entry: LoginAuditEntry) ServiceError!CommandResult {
+        const result = try self.identifyAccountChecked(name, password);
+        switch (result) {
+            .identified => |id| {
+                var stamped = entry;
+                stamped.mechanism = .password;
+                self.appendLoginAudit(id.name.asSlice(), stamped) catch {};
+            },
+            else => {},
+        }
+        return result;
+    }
+
+    fn identifyAccountChecked(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
         self.lock.lockShared();
         defer self.lock.unlockShared();
 
@@ -2776,6 +3027,7 @@ pub const Services = struct {
         // lock the owner out of every credential path, matching issueSessionToken
         // and validateSessionToken which already reject both flags.
         if ((record.flags & (account_flag_suspended | account_flag_forbidden)) != 0) return error.AuthFailed;
+        if ((record.flags & account_flag_passkey_only) != 0) return error.AuthFailed;
         return .{ .identified = .{ .name = record.name } };
     }
 
@@ -2785,6 +3037,13 @@ pub const Services = struct {
 
         const record = try self.loadAccount(name);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
+        if ((record.flags & account_flag_passkey_only) != 0) return error.AuthFailed;
+        var audit_key_buf: [login_audit_key_max]u8 = undefined;
+        if (loginAuditKey(&audit_key_buf, record.name.asSlice())) |audit_key| {
+            if (self.store.family(.props).get(audit_key) != null) {
+                try self.store.family(.props).delete(audit_key);
+            }
+        }
         try self.store.family(.accounts).delete(record.name.asSlice());
         return .{ .dropped_account = .{ .name = record.name } };
     }
@@ -2806,6 +3065,7 @@ pub const Services = struct {
 
         var record = try self.loadAccount(name);
         try verifyPassword(record, old_password, self.cfg.pbkdf2_rounds);
+        if ((record.flags & account_flag_passkey_only) != 0) return error.AuthFailed;
         try self.validateNewPassword(new_password);
         // A change must actually change the password.
         if (std.mem.eql(u8, old_password, new_password)) return error.InvalidPassword;
@@ -2856,6 +3116,9 @@ pub const Services = struct {
         try hashPassword(&hash, new_password, &salt, self.cfg.pbkdf2_rounds);
         record.salt = salt;
         record.hash = hash;
+        // Recovery replacement is the break-glass path. The new password works,
+        // and this single-use proof clears the passkey-only refusal.
+        record.flags &= ~account_flag_passkey_only;
 
         const encoded = try encodeAccount(record, scratch);
         var account_token_key_buf: [session_token_account_key_max]u8 = undefined;
@@ -2911,6 +3174,7 @@ pub const Services = struct {
 
         const record = try self.loadAccount(name);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
+        if ((record.flags & account_flag_passkey_only) != 0) return error.AuthFailed;
         const clean_nick = try validateNick(nick);
         return .{ .ghosted = .{ .account = record.name, .nick = clean_nick } };
     }
@@ -2938,6 +3202,7 @@ pub const Services = struct {
             else => return err,
         };
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
+        if ((record.flags & account_flag_passkey_only) != 0) return error.AuthFailed;
         switch (field) {
             .email => |email| {
                 record.email = try validateEmail(email);
@@ -2946,7 +3211,8 @@ pub const Services = struct {
             .flags => |flags| {
                 const preserved = record.flags & account_flags_privileged;
                 if ((flags & account_flags_privileged) != preserved) return error.Forbidden;
-                record.flags = preserved | (flags & ~account_flags_privileged);
+                const passkey = record.flags & account_flag_passkey_only;
+                record.flags = preserved | passkey | (flags & ~(account_flags_privileged | account_flag_passkey_only));
             },
             // SECURE on/off. ENFORCE on/off is stored inverted (`enforce_off`) so
             // the default-0 record keeps today's always-on enforcement.
@@ -4369,46 +4635,145 @@ pub const Services = struct {
     }
 
     // ── Durable registered-channel founder successor (svc_successor; SUCCESSOR) ──
-    // One successor account per channel in `.props` ("suc\x00<channel>"). When the
-    // founder's account is dropped, the channel is handed to its successor.
+    // The armed name lives at "suc\x00<channel>". A replacement lives at
+    // "shp\x00<channel>" as little-endian ready_ms plus the account name, and
+    // does not replace the armed name until `successor_hold_ms` has elapsed.
+    // CLEAR during the hold deletes only the replacement. A drop during the
+    // hold still reads the armed name. The first SET has no armed name, so it
+    // cannot win a drop until the hold elapses.
     const successor_prefix = "suc\x00";
+    const successor_pending_prefix = "shp\x00";
     const successor_key_max: usize = successor_prefix.len + channel_max;
+    const successor_pending_key_max: usize = successor_pending_prefix.len + channel_max;
 
     fn successorKey(buf: []u8, channel: []const u8) ?[]const u8 {
-        if (channel.len == 0 or channel.len > channel_max) return null;
-        if (buf.len < successor_prefix.len + channel.len) return null;
-        @memcpy(buf[0..successor_prefix.len], successor_prefix);
-        for (channel, 0..) |c, i| buf[successor_prefix.len + i] = std.ascii.toLower(c);
-        return buf[0 .. successor_prefix.len + channel.len];
+        return successorPrefixedKey(buf, successor_prefix, channel);
     }
 
-    /// Set `account` (normalized) as `channel`'s configured successor.
+    fn successorPendingKey(buf: []u8, channel: []const u8) ?[]const u8 {
+        return successorPrefixedKey(buf, successor_pending_prefix, channel);
+    }
+
+    fn successorPrefixedKey(buf: []u8, prefix: []const u8, channel: []const u8) ?[]const u8 {
+        if (channel.len == 0 or channel.len > channel_max) return null;
+        if (buf.len < prefix.len + channel.len) return null;
+        @memcpy(buf[0..prefix.len], prefix);
+        for (channel, 0..) |c, i| buf[prefix.len + i] = std.ascii.toLower(c);
+        return buf[0 .. prefix.len + channel.len];
+    }
+
+    fn promoteReadySuccessorUnlocked(self: *Services, armed_key: []const u8, pending_key: []const u8) ServiceError!void {
+        const blob = self.store.family(.props).get(pending_key) orelse return;
+        if (blob.len <= 8 or blob.len > 8 + account_max) return;
+        const ready = std.mem.readInt(u64, blob[0..8], .little);
+        if (self.servicesNowMs() < ready) return;
+        var name_buf: [account_max]u8 = undefined;
+        const name_len = blob.len - 8;
+        @memcpy(name_buf[0..name_len], blob[8..]);
+        try self.store.family(.props).put(armed_key, name_buf[0..name_len]);
+        try self.store.family(.props).delete(pending_key);
+    }
+
+    fn copyBoundedProp(self: *Services, key: []const u8, dest: []u8) ?[]const u8 {
+        const blob = self.store.family(.props).get(key) orelse return null;
+        if (blob.len == 0 or blob.len > dest.len) return null;
+        @memcpy(dest[0..blob.len], blob);
+        return dest[0..blob.len];
+    }
+
+    /// Queue `account` as `channel`'s successor. Replacing an armed successor
+    /// waits `successor_hold_ms`. Setting the armed account again cancels that
+    /// wait. A clock that cannot represent the deadline arms the name immediately.
     pub fn channelSuccessorSet(self: *Services, channel: []const u8, account: []const u8) ServiceError!void {
         const acc = try accountKey(account);
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
-        var kb: [successor_key_max]u8 = undefined;
-        const k = successorKey(&kb, channel) orelse return error.InvalidChannel;
-        try self.store.family(.props).put(k, acc.asSlice());
+        var armed_key_buf: [successor_key_max]u8 = undefined;
+        const armed_key = successorKey(&armed_key_buf, channel) orelse return error.InvalidChannel;
+        var pending_key_buf: [successor_pending_key_max]u8 = undefined;
+        const pending_key = successorPendingKey(&pending_key_buf, channel) orelse return error.InvalidChannel;
+        // A matured replacement is the successor a new hold has to beat. Fold
+        // it into the armed key before comparing, or the next SET would hide
+        // it behind the previous armed name.
+        try self.promoteReadySuccessorUnlocked(armed_key, pending_key);
+
+        var armed_buf: [account_max]u8 = undefined;
+        if (self.copyBoundedProp(armed_key, &armed_buf)) |armed| {
+            if (std.mem.eql(u8, armed, acc.asSlice())) {
+                if (self.store.family(.props).get(pending_key) != null) {
+                    try self.store.family(.props).delete(pending_key);
+                }
+                return;
+            }
+        }
+
+        const ready = std.math.add(u64, self.servicesNowMs(), successor_hold_ms) catch {
+            try self.store.family(.props).put(armed_key, acc.asSlice());
+            if (self.store.family(.props).get(pending_key) != null) {
+                try self.store.family(.props).delete(pending_key);
+            }
+            return;
+        };
+        var value: [8 + account_max]u8 = undefined;
+        std.mem.writeInt(u64, value[0..8], ready, .little);
+        const name = acc.asSlice();
+        @memcpy(value[8..][0..name.len], name);
+        try self.store.family(.props).put(pending_key, value[0 .. 8 + name.len]);
     }
 
-    /// Remove `channel`'s configured successor. No-op when unset.
+    /// Cancel an unready replacement, or remove the armed successor once the
+    /// replacement is ready (or when nothing is waiting).
     pub fn channelSuccessorClear(self: *Services, channel: []const u8) ServiceError!void {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
-        var kb: [successor_key_max]u8 = undefined;
-        const k = successorKey(&kb, channel) orelse return;
-        try self.store.family(.props).delete(k);
+        var pending_key_buf: [successor_pending_key_max]u8 = undefined;
+        const pending_key = successorPendingKey(&pending_key_buf, channel) orelse return;
+        var armed_key_buf: [successor_key_max]u8 = undefined;
+        const armed_key = successorKey(&armed_key_buf, channel) orelse return;
+
+        var hold_until: ?u64 = null;
+        if (self.store.family(.props).get(pending_key)) |blob| {
+            if (blob.len > 8 and blob.len <= 8 + account_max) {
+                hold_until = std.mem.readInt(u64, blob[0..8], .little);
+            }
+        }
+        if (hold_until) |at| {
+            if (self.servicesNowMs() < at) {
+                try self.store.family(.props).delete(pending_key);
+                return;
+            }
+        }
+        if (self.store.family(.props).get(pending_key) != null) {
+            try self.store.family(.props).delete(pending_key);
+        }
+        if (self.store.family(.props).get(armed_key) != null) {
+            try self.store.family(.props).delete(armed_key);
+        }
     }
 
-    /// Copy `channel`'s configured successor account into `out`, or null if unset.
+    /// Copy the successor account into `out`. An unready replacement is hidden.
+    /// A ready replacement is the name returned. Null when neither is visible.
     pub fn channelSuccessorGet(self: *Services, channel: []const u8, out: []u8) ?[]const u8 {
         self.lock.lockShared();
         defer self.lock.unlockShared();
-        var kb: [successor_key_max]u8 = undefined;
-        const k = successorKey(&kb, channel) orelse return null;
-        const blob = self.store.family(.props).get(k) orelse return null;
-        if (blob.len == 0) return null;
+        var pending_key_buf: [successor_pending_key_max]u8 = undefined;
+        if (successorPendingKey(&pending_key_buf, channel)) |pending_key| {
+            if (self.store.family(.props).get(pending_key)) |blob| {
+                if (blob.len > 8 and blob.len <= 8 + account_max) {
+                    const ready = std.mem.readInt(u64, blob[0..8], .little);
+                    const account = blob[8..];
+                    if (self.servicesNowMs() >= ready and out.len != 0) {
+                        const n = @min(account.len, out.len);
+                        @memcpy(out[0..n], account[0..n]);
+                        return out[0..n];
+                    }
+                }
+            }
+        }
+        var armed_key_buf: [successor_key_max]u8 = undefined;
+        const armed_key = successorKey(&armed_key_buf, channel) orelse return null;
+        const blob = self.store.family(.props).get(armed_key) orelse return null;
+        if (blob.len == 0 or out.len == 0) return null;
         const n = @min(blob.len, out.len);
         @memcpy(out[0..n], blob[0..n]);
         return out[0..n];
@@ -5979,6 +6344,130 @@ test "register and identify account" {
 
     const identified = try services.identifyAccount("ALICE", "correct horse battery staple");
     try std.testing.expectEqualStrings("alice", identified.identified.name.asSlice());
+}
+
+test "services passkey-only successor hold and login audit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try openTestStore(tmp, "services-passkey-successor.wal");
+    defer store.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    var scram = ScramStore.init(std.testing.allocator);
+    defer scram.deinit();
+    services.attachScramStore(&scram);
+    var scratch: [record_max]u8 = undefined;
+    const password = "correct horse battery staple";
+    _ = try services.registerAccount("Alice", password, &scratch);
+    _ = try services.registerAccount("Bob", password, &scratch);
+    try std.testing.expect(scram.resolve("alice") != null);
+
+    services.clock_override_ms.store(1_000, .release);
+    var rows: [login_audit_cap]LoginAuditEntry = undefined;
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        services.clock_override_ms.store(1_000 + @as(u64, @intCast(i)), .release);
+        const identified = try services.identifyAccountWithAudit("alice", password, .{
+            .at_ms = services.clock_override_ms.load(.acquire),
+            .tls = .unknown,
+        });
+        try std.testing.expectEqualStrings("alice", identified.identified.name.asSlice());
+    }
+    const unchecked = try services.copyLoginAudit("alice", &rows);
+    try std.testing.expectEqual(login_audit_cap, unchecked.len);
+    try std.testing.expectEqual(@as(u64, 1_001), unchecked[0].at_ms);
+    _ = try services.identifyAccount("alice", password);
+    const still = try services.copyLoginAudit("alice", &rows);
+    try std.testing.expectEqual(@as(u64, 1_001), still[0].at_ms);
+    try std.testing.expectEqual(@as(u64, 1_008), still[still.len - 1].at_ms);
+    const got = try services.copyLoginAudit("alice", &rows);
+    try std.testing.expectEqual(login_audit_cap, got.len);
+    try std.testing.expectEqual(@as(u64, 1_001), got[0].at_ms);
+    try std.testing.expectEqual(@as(u64, 1_008), got[got.len - 1].at_ms);
+    try std.testing.expectEqual(LoginMechanism.password, got[0].mechanism);
+    try std.testing.expectEqual(LoginTls.unknown, got[0].tls);
+
+    var prefix: [8]u8 = @splat(0);
+    @memcpy(prefix[0..4], "abcd");
+    try services.appendLoginAudit("alice", .{
+        .at_ms = 9_000,
+        .mechanism = .passkey,
+        .tls = .tls,
+        .certfp_prefix = prefix,
+        .certfp_len = 4,
+    });
+    const audited = try services.copyLoginAudit("ALICE", &rows);
+    try std.testing.expectEqual(login_audit_cap, audited.len);
+    try std.testing.expectEqual(@as(u64, 1_002), audited[0].at_ms);
+    try std.testing.expectEqual(LoginMechanism.passkey, audited[audited.len - 1].mechanism);
+    try std.testing.expectEqual(LoginTls.tls, audited[audited.len - 1].tls);
+    try std.testing.expectEqual(@as(u8, 4), audited[audited.len - 1].certfp_len);
+    try std.testing.expectEqualStrings("abcd", audited[audited.len - 1].certfp_prefix[0..4]);
+
+    services.clock_override_ms.store(5_000, .release);
+    var out: [account_max]u8 = undefined;
+    try std.testing.expect(services.channelSuccessorGet("#Room", &out) == null);
+    try services.channelSuccessorSet("#Room", "Alice");
+    try std.testing.expect(services.channelSuccessorGet("#room", &out) == null);
+    services.clock_override_ms.store(5_000 + successor_hold_ms - 1, .release);
+    try std.testing.expect(services.channelSuccessorGet("#room", &out) == null);
+    services.clock_override_ms.store(5_000 + successor_hold_ms, .release);
+    try std.testing.expectEqualStrings("alice", services.channelSuccessorGet("#room", &out).?);
+
+    const replace_at: u64 = 5_000 + successor_hold_ms;
+    try services.channelSuccessorSet("#room", "Bob");
+    try std.testing.expectEqualStrings("alice", services.channelSuccessorGet("#room", &out).?);
+    try services.channelSuccessorSet("#room", "alice");
+    services.clock_override_ms.store(replace_at + successor_hold_ms, .release);
+    try std.testing.expectEqualStrings("alice", services.channelSuccessorGet("#room", &out).?);
+
+    const second = services.clock_override_ms.load(.acquire);
+    try services.channelSuccessorSet("#room", "bob");
+    services.clock_override_ms.store(second + successor_hold_ms - 1, .release);
+    try services.channelSuccessorClear("#room");
+    try std.testing.expectEqualStrings("alice", services.channelSuccessorGet("#room", &out).?);
+    services.clock_override_ms.store(second + successor_hold_ms, .release);
+    try std.testing.expectEqualStrings("alice", services.channelSuccessorGet("#room", &out).?);
+
+    const third = services.clock_override_ms.load(.acquire);
+    try services.channelSuccessorSet("#room", "Bob");
+    services.clock_override_ms.store(third + successor_hold_ms, .release);
+    try std.testing.expectEqualStrings("bob", services.channelSuccessorGet("#room", &out).?);
+    try services.channelSuccessorSet("#room", "bob");
+    try std.testing.expectEqualStrings("bob", services.channelSuccessorGet("#room", &out).?);
+    const fourth = services.clock_override_ms.load(.acquire);
+    try services.channelSuccessorSet("#room", "Alice");
+    services.clock_override_ms.store(fourth + 1, .release);
+    try std.testing.expectEqualStrings("bob", services.channelSuccessorGet("#room", &out).?);
+    try services.channelSuccessorClear("#room");
+    try std.testing.expectEqualStrings("bob", services.channelSuccessorGet("#room", &out).?);
+    try services.channelSuccessorClear("#room");
+    try std.testing.expect(services.channelSuccessorGet("#room", &out) == null);
+
+    try std.testing.expectError(error.Forbidden, services.enablePasskeyOnly("alice", &scratch));
+    try services.webauthnBind("alice", "abc", "k", 0, "", 1);
+    try services.webauthnBind("alice", "def", "k", 0, "lap", 1);
+    try services.enablePasskeyOnly("alice", &scratch);
+    try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", password));
+    try std.testing.expectError(error.AuthFailed, services.dropAccount("alice", password));
+    try std.testing.expectError(error.AuthFailed, services.changeAccountPassword("alice", password, "another correct horse battery", &scratch));
+    try std.testing.expectError(error.AuthFailed, services.ghostAccount("alice", password, "Other"));
+    try std.testing.expectError(error.AuthFailed, services.setAccount("alice", password, .{ .flags = 0 }, &scratch));
+    try std.testing.expect(scram.resolve("alice") == null);
+    try services.webauthnDelete("alice", "abc");
+    try std.testing.expectError(error.Forbidden, services.webauthnDelete("alice", "def"));
+
+    const flagged = try services.setAccount("bob", password, .{ .flags = account_flag_passkey_only | account_flag_secure }, &scratch);
+    try std.testing.expect((flagged.set_account.flags & account_flag_passkey_only) == 0);
+    try std.testing.expect((flagged.set_account.flags & account_flag_secure) != 0);
+
+    try services.setAccountPasswordForced("alice", password, &scratch);
+    const restored = try services.identifyAccount("alice", password);
+    try std.testing.expectEqualStrings("alice", restored.identified.name.asSlice());
+    try std.testing.expect(scram.resolve("alice") != null);
+    try services.webauthnDelete("alice", "def");
+    const info = try services.accountInfo("alice");
+    try std.testing.expect((info.account_info.flags & account_flag_passkey_only) == 0);
 }
 
 test "channel SET flags and DESC/URL persist and round-trip" {

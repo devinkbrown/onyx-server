@@ -18,6 +18,10 @@ realm = "example"
 mesh_pass = "env:ONYX_MESH_PASS"
 ```
 
+## Ordinary guests
+
+An account-less client publishes one mesh-presence v2 record. WHOIS and PRIVMSG for that nick follow the signed record, including across a node that is not directly linked to the guest's home. NOTICE does not. There is no second presence version and no new handshake bit. Authenticated clients and reusable sessions stay on their existing MESSAGE_V2 and session paths. The Helix world checkpoint stays version 2 and does not carry the guest id. See [mesh architecture](../architecture/mesh-s2s.md#ordinary-guest-presence). This behavior is in source. The full test suite has not been re-run green on it.
+
 ## MESSAGE_V2 bridge and activation
 
 MESSAGE_V2 uses a mesh-wide compatibility barrier so one logical event is never
