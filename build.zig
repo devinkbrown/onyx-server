@@ -1574,11 +1574,14 @@ fn manifestVersion() []const u8 {
     return manifest[start..end];
 }
 
-/// Capture the current git revision at configure time: the short commit hash,
-/// suffixed "-dirty" when the working tree has uncommitted changes. Returns
-/// "unknown" when git is unavailable or this is not a checkout, so builds from a
-/// source tarball still succeed. The `-C <build_root>` keeps it correct
-/// regardless of the build's working directory.
+/// Capture the current git revision at configure time: 12 hex digits,
+/// suffixed "-dirty" when `git status` reports tracked changes. A source
+/// tarball with no checkout still stamps "unknown".
+///
+/// The build runner often cannot spawn `git` (its PATH search returns
+/// FileNotFound before exec). An absolute `git` is tried first. If that
+/// fails, HEAD is read from `.git` the same way git would: `HEAD`, a loose
+/// ref, then `packed-refs`, including a `gitdir:` file.
 /// Whether `rel` (relative to the build root, which is the process cwd during
 /// `zig build`) exists as an accessible plain file. Guards the configure-time
 /// `dependOnFileContents` calls so a `.git`-less tarball or a linked-worktree
@@ -1591,21 +1594,84 @@ fn gitRefExists(b: *std.Build, rel: []const u8) bool {
 
 fn gitCommit(b: *std.Build) []const u8 {
     const root = b.root.root_dir.path orelse ".";
-    const hash = b.runAllowFail(
-        &.{ "git", "-C", root, "rev-parse", "--short", "HEAD" },
-        &code,
-        .ignore,
-    ) catch return "unknown";
-    const short = std.mem.trim(u8, hash, " \r\n\t");
-    if (short.len == 0) return "unknown";
+    if (runGitShortCommit(b, root)) |stamped| return stamped;
+    if (readGitShortCommit(b, root)) |hash| return hash;
+    return "unknown";
+}
 
-    const status = b.runAllowFail(
-        &.{ "git", "-C", root, "status", "--porcelain", "--untracked-files=no" },
-        &code,
-        .ignore,
-    ) catch "";
-    const dirty = std.mem.trim(u8, status, " \r\n\t").len != 0;
+fn runGitShortCommit(b: *std.Build, root: []const u8) ?[]const u8 {
+    const git_exe = b.findProgram(.{ .names = &.{ "/usr/bin/git", "git" } }) orelse return null;
+    const hash_raw = switch (b.runFallible(
+        &.{ git_exe, "-C", root, "rev-parse", "--short=12", "HEAD" },
+        .{ .stderr_behavior = .ignore },
+    )) {
+        .success => |out| out,
+        else => return null,
+    };
+    const short = std.mem.trim(u8, hash_raw, " \r\n\t");
+    if (!isGitHex(short)) return null;
+    const status_raw = switch (b.runFallible(
+        &.{ git_exe, "-C", root, "status", "--porcelain", "--untracked-files=no" },
+        .{ .stderr_behavior = .ignore },
+    )) {
+        .success => |out| out,
+        else => "",
+    };
+    const dirty = std.mem.trim(u8, status_raw, " \r\n\t").len != 0;
     return if (dirty) b.fmt("{s}-dirty", .{short}) else b.dupe(short);
 }
 
-var code: u8 = 0;
+fn readGitShortCommit(b: *std.Build, root: []const u8) ?[]const u8 {
+    const git_dir = resolveGitDir(b, root) orelse return null;
+    const head = readTrimmed(b, b.pathJoin(&.{ git_dir, "HEAD" })) orelse return null;
+    const full = if (std.mem.startsWith(u8, head, "ref: ")) blk: {
+        const ref = std.mem.trim(u8, head["ref: ".len..], " \t");
+        if (std.mem.indexOfScalar(u8, ref, '/') == null) return null;
+        if (readTrimmed(b, b.pathJoin(&.{ git_dir, ref }))) |loose| break :blk loose;
+        break :blk packedRef(b, git_dir, ref) orelse return null;
+    } else head;
+    if (!isGitHex(full) or full.len < 12) return null;
+    return b.dupe(full[0..12]);
+}
+
+fn resolveGitDir(b: *std.Build, root: []const u8) ?[]const u8 {
+    const dot = b.pathJoin(&.{ root, ".git" });
+    if (readTrimmed(b, b.pathJoin(&.{ dot, "HEAD" })) != null) return dot;
+    const text = readTrimmed(b, dot) orelse return null;
+    const prefix = "gitdir: ";
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+    const gitdir = std.mem.trim(u8, text[prefix.len..], " \t");
+    if (gitdir.len == 0) return null;
+    if (std.fs.path.isAbsolute(gitdir)) return b.dupe(gitdir);
+    return b.pathJoin(&.{ root, gitdir });
+}
+
+fn packedRef(b: *std.Build, git_dir: []const u8, ref: []const u8) ?[]const u8 {
+    const text = readTrimmed(b, b.pathJoin(&.{ git_dir, "packed-refs" })) orelse return null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const name = std.mem.trim(u8, line[sp + 1 ..], " ");
+        if (!std.mem.eql(u8, name, ref)) continue;
+        return std.mem.trim(u8, line[0..sp], " ");
+    }
+    return null;
+}
+
+fn readTrimmed(b: *std.Build, path: []const u8) ?[]const u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.graph.arena, .limited(1024 * 1024)) catch return null;
+    const trimmed = std.mem.trim(u8, bytes, " \r\n\t");
+    if (trimmed.len == 0) return null;
+    return trimmed;
+}
+
+fn isGitHex(s: []const u8) bool {
+    if (s.len < 7 or s.len > 64) return false;
+    for (s) |c| switch (c) {
+        '0'...'9', 'a'...'f', 'A'...'F' => {},
+        else => return false,
+    };
+    return true;
+}
