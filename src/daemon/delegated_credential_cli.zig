@@ -8,16 +8,19 @@
 //! command here validates ready-made RFC 9345 wire bytes with the same codec and
 //! signature primitives the TLS stack already consumes.
 
+// This leaf stays inside the onyx_server module. A second `@import("onyx_server")`
+// from the executable would put the same file in both modules, which Zig rejects.
 const std = @import("std");
-const onyx_server = @import("onyx_server");
-
-const dlog = onyx_server.daemon.dlog;
-const tls_certs = onyx_server.daemon.tls_certs;
-const delegated_credential = onyx_server.proto.delegated_credential;
-const tls_signature_scheme = onyx_server.proto.tls_signature_scheme;
-const ecdsa_p256 = onyx_server.crypto.ecdsa_p256;
-const rsa_verify = onyx_server.crypto.rsa_verify;
-const x509 = onyx_server.crypto.x509;
+const dlog = @import("dlog.zig");
+const tls_certs = @import("tls_certs.zig");
+const delegated_credential = @import("../proto/delegated_credential.zig");
+const tls_signature_scheme = @import("../proto/tls_signature_scheme.zig");
+const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
+const rsa_verify = @import("../crypto/rsa_verify.zig");
+const x509 = @import("../crypto/x509.zig");
+const platform = @import("../substrate/platform.zig");
+const x509_selfsign = @import("../proto/x509_selfsign.zig");
+const pem = @import("../proto/pem.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 
@@ -151,7 +154,7 @@ pub fn validate(
     if (!leaf.delegation_usage) return error.DelegationUsageMissing;
     if (!leaf.key_usage_digital_signature) return error.DigitalSignatureKeyUsageMissing;
 
-    const now = now_override orelse @divTrunc(onyx_server.substrate.platform.realtimeMillis(), 1000);
+    const now = now_override orelse @divTrunc(platform.realtimeMillis(), 1000);
     const expiry = leaf.not_before.epoch_seconds + @as(i64, dc.valid_time);
     if (now > expiry) return error.Expired;
     if (expiry > now + @as(i64, delegated_credential.max_valid_time_seconds)) {
@@ -253,7 +256,6 @@ fn schemeName(raw: u16) []const u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const x509_selfsign = onyx_server.proto.x509_selfsign;
 
 test "delegated credential CLI parseArgs" {
     try testing.expectError(error.UnknownArgument, parseArgs(&.{"bogus"}));
@@ -299,8 +301,8 @@ test "delegated credential CLI validates leaf signature and lifetime" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pem_buf: [2048]u8 = undefined;
-    const pem = try onyx_server.proto.pem.encode(&pem_buf, "CERTIFICATE", leaf);
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "leaf.pem", .data = pem });
+    const encoded = try pem.encode(&pem_buf, "CERTIFICATE", leaf);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "leaf.pem", .data = encoded });
     const cert_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/leaf.pem", .{tmp.sub_path});
     defer allocator.free(cert_path);
 
