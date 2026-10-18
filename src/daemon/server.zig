@@ -25485,27 +25485,35 @@ pub const LinuxServer = struct {
 
         const tconn = target_conn.?;
 
-        // GeoIP/ASN summary (RPL_WHOISSPECIAL), visible to opers or to the user
-        // themselves, when a MaxMind database is loaded and the IP resolves.
+        // Oper/self only. 320 carries the reverse name and the literal address
+        // together. The name never feeds the public cloak. A missing cache entry
+        // is queued; this reply does not wait on DNS. The stored real host is
+        // the address captured at accept; if that store is empty the socket
+        // peer is still the address this connection accepted.
+        var special_buf: [640]u8 = undefined;
+        var literal_buf: [64]u8 = undefined;
+        var rdns_buf: [whois_profile.max_rdns_len]u8 = undefined;
+        var rdns_name: []const u8 = "";
+        var rdns_confirmed = true;
+        const show_addr = conn.session.isOper() or conn == tconn;
+        const stored_host: []const u8 = if (show_addr) tconn.session.realHost() else "";
+        const ip_text: []const u8 = if (stored_host.len != 0) stored_host else if (show_addr) blk: {
+            const paddr = tconn.peer_addr orelse break :blk "";
+            break :blk addrText(paddr, &literal_buf) orelse "";
+        } else "";
+
+        // GeoIP/ASN summary, same gate as the address. Resolved from the
+        // literal this reply will print, including the socket fallback.
         var geo_buf: [256]u8 = undefined;
         var geo_text: ?[]const u8 = null;
-        if (conn.session.isOper() or conn == tconn) {
-            if (parseGeoIp(tconn.session.realHost())) |gip| {
+        if (show_addr) {
+            if (parseGeoIp(ip_text)) |gip| {
                 // City DB → city + region + country; the separate ASN DB → AS + org.
                 const place = self.lookupGeoPlace(gip);
                 const asn_info = self.lookupGeoAsn(gip);
                 geo_text = buildGeoWhois(&geo_buf, place.city, place.region, place.country, asn_info.asn, asn_info.asorg);
             }
         }
-
-        // Oper/self only. 320 carries the reverse name and the literal address
-        // together. The name never feeds the public cloak. A missing cache entry
-        // is queued; this reply does not wait on DNS.
-        var special_buf: [640]u8 = undefined;
-        var rdns_buf: [whois_profile.max_rdns_len]u8 = undefined;
-        var rdns_name: []const u8 = "";
-        var rdns_confirmed = true;
-        const show_addr = conn.session.isOper() or conn == tconn;
         if (show_addr) {
             if (self.config.rdns) |res| {
                 if (tconn.peer_addr) |paddr| {
@@ -25521,7 +25529,6 @@ pub const LinuxServer = struct {
                 }
             }
         }
-        const ip_text: []const u8 = if (show_addr and tconn.session.realHost().len > 0) tconn.session.realHost() else "";
         const special: ?[]const u8 = if (show_addr)
             formatWhoisAddressLine(&special_buf, rdns_name, rdns_confirmed, ip_text, geo_text)
         else
@@ -58274,7 +58281,12 @@ pub const LinuxServer = struct {
 
     fn remoteWhoisFromGuest(self: *LinuxServer, nick: []const u8) ?RemoteWhois {
         const live = self.liveOrdinaryGuest(nick) orelse return null;
-        return .{
+        // Presence publishes the public cloak. The literal address and cert
+        // fingerprint already ride the oper-info membership roster; this reply
+        // has to read them or an account-less user shows class and cipher with
+        // no address. origin_node stays unset so a stored WHOIS_PROFILE still
+        // matches whichever home published it.
+        var remote = RemoteWhois{
             .nick = live.nick,
             .username = live.username,
             .realname = live.realname,
@@ -58285,6 +58297,11 @@ pub const LinuxServer = struct {
             .real_host = "",
             .certfp = "",
         };
+        if (self.findRemoteWhois(nick)) |roster| {
+            remote.real_host = roster.real_host;
+            remote.certfp = roster.certfp;
+        }
+        return remote;
     }
 
     fn authorOrdinaryGuestDirect(
@@ -120157,6 +120174,209 @@ test "whois profile remote facts follow the stored origin" {
         .origin_node = 9,
     }, &gone_again_buf);
     try std.testing.expect(!server.storeWhoisProfile(gone_again));
+}
+
+test "oper WHOIS of a remote guest keeps the roster address" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x5a)), "whois-guest-addr");
+    defer ident.deinit();
+    const root_hex = std.fmt.bytesToHex(ident.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&root_hex};
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = ident.shortId(),
+        .node_identity = &ident,
+        .crypto_io = std.testing.io,
+        .server_name = "here.example",
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{
+        .allocator = allocator,
+        .local_node_id = 1,
+        .remote_node_id = ident.shortId(),
+        .local_epoch_ms = 1000,
+        .server_name = "home.example",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer peer.deinit();
+    const link = try allocator.create(s2s_link.S2sLink);
+    try link.init(.{
+        .allocator = allocator,
+        .local_node_id = ident.shortId(),
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "here.example",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+    try peer.start(50);
+    try pumpLinkPair(&peer, link, allocator);
+    try std.testing.expect(link.established());
+    try link.primeResumedMember("#root", "FarGuest", 1, 0, 100, .{
+        .username = "far",
+        .realname = "Far Guest",
+        .host = "6785ec3b46600e68.opq.onyx",
+        .real_host = "203.0.113.77",
+        .certfp = "abcdef",
+    }, 100);
+
+    const now = server.guestNowMs();
+    const guest = try mesh_presence_v2.guestId(.{ .epoch = 1, .counter = 1 });
+    var wire_buf: [mesh_presence_v2.max_wire_len]u8 = undefined;
+    const encoded = try mesh_presence_v2.encode(.{
+        .operation = .present,
+        .origin = ident.sign_kp.public_key,
+        .guest = guest,
+        .revision = 1,
+        .routing_class = .true_guest,
+        .class_revision = 1,
+        .claim_hlc = 1,
+        .claim_revision = 1,
+        .issued_ms = now,
+        .expires_ms = now + 60_000,
+        .nick = "FarGuest",
+        .username = "far",
+        .host = "6785ec3b46600e68.opq.onyx",
+        .realname = "Far Guest",
+        .server = "home.example",
+        .description = "winter",
+    }, &ident.sign_kp, &wire_buf);
+    const auth = try server.ensureGuestAuthority();
+    const approval = try server.presenceApprovalRoots(null);
+    defer allocator.free(approval);
+    try std.testing.expectEqual(guest_presence_route.Disposition.inserted, try auth.admit(encoded, approval, now, 9, false));
+    const resolved = server.remoteWhoisFromGuest("FarGuest") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("203.0.113.77", resolved.real_host);
+    try std.testing.expectEqualStrings("abcdef", resolved.certfp);
+    try std.testing.expectEqual(@as(u64, 0), resolved.origin_node);
+
+    var profile_buf: [whois_profile.max_encoded_len]u8 = undefined;
+    const profile = try whois_profile.encode(.{
+        .present = true,
+        .tls = true,
+        .signon_unix = 1_700_000_000,
+        .last_active_unix = 1_700_000_100,
+        .revision_ms = 3,
+        .origin_node = 11,
+        .nick = "FarGuest",
+        .cipher = "TLS_AES_128_GCM_SHA256",
+        .class_name = "user",
+    }, &profile_buf);
+    try std.testing.expect(server.storeWhoisProfile(profile));
+
+    const oper_id = try addTestLocalClient(server, "Oper", null);
+    const oper = server.connFor(oper_id) orelse return error.TestUnexpectedResult;
+    oper.session.registration.registered = true;
+    try reconcileTestOper(&oper.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "ircop", "Oper");
+    const plain_id = try addTestLocalClient(server, "Plain", null);
+    const plain = server.connFor(plain_id) orelse return error.TestUnexpectedResult;
+    plain.session.registration.registered = true;
+
+    var oper_line = try irc_line.parseLine("WHOIS FarGuest");
+    try server.handleWhois(oper, &oper_line);
+    const oper_reply = oper.send_buf[0..oper.send_len];
+    try expectContains(oper_reply, "6785ec3b46600e68.opq.onyx");
+    try expectContains(oper_reply, "actual address 203.0.113.77");
+    try expectContains(oper_reply, "is in connection class user");
+    try expectContains(oper_reply, "TLS_AES_128_GCM_SHA256");
+    try expectContains(oper_reply, " 338 ");
+    try expectContains(oper_reply, " 276 ");
+    try expectContains(oper_reply, "abcdef");
+
+    var plain_line = try irc_line.parseLine("WHOIS FarGuest");
+    try server.handleWhois(plain, &plain_line);
+    const plain_reply = plain.send_buf[0..plain.send_len];
+    try expectContains(plain_reply, "6785ec3b46600e68.opq.onyx");
+    try std.testing.expect(std.mem.indexOf(u8, plain_reply, "203.0.113.77") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_reply, "actual address") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_reply, "connection class") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_reply, "abcdef") == null);
+}
+
+test "oper or self WHOIS falls back to the socket address" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    const target_id = try addTestLocalClient(server, "SocketUser", null);
+    const target = server.connFor(target_id) orelse return error.TestUnexpectedResult;
+    target.session.registration.registered = true;
+    target.session.setVisibleHost("cloak.opq.onyx");
+    target.session.setRealHost("");
+    target.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 77 } };
+
+    const v6_id = try addTestLocalClient(server, "V6User", null);
+    const v6 = server.connFor(v6_id) orelse return error.TestUnexpectedResult;
+    v6.session.registration.registered = true;
+    v6.session.setVisibleHost("v6.opq.onyx");
+    v6.session.setRealHost("");
+    v6.peer_addr = .{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+
+    const oper_id = try addTestLocalClient(server, "Oper", null);
+    const oper = server.connFor(oper_id) orelse return error.TestUnexpectedResult;
+    oper.session.registration.registered = true;
+    try reconcileTestOper(&oper.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "ircop", "Oper");
+    const plain_id = try addTestLocalClient(server, "Plain", null);
+    const plain = server.connFor(plain_id) orelse return error.TestUnexpectedResult;
+    plain.session.registration.registered = true;
+
+    var self_line = try irc_line.parseLine("WHOIS SocketUser");
+    try server.handleWhois(target, &self_line);
+    const self_reply = target.send_buf[0..target.send_len];
+    try expectContains(self_reply, "cloak.opq.onyx");
+    try expectContains(self_reply, "actual address 203.0.113.77");
+
+    oper.send_len = 0;
+    var oper_line = try irc_line.parseLine("WHOIS SocketUser");
+    try server.handleWhois(oper, &oper_line);
+    try expectContains(oper.send_buf[0..oper.send_len], "actual address 203.0.113.77");
+
+    var plain_line = try irc_line.parseLine("WHOIS SocketUser");
+    try server.handleWhois(plain, &plain_line);
+    try std.testing.expect(std.mem.indexOf(u8, plain.send_buf[0..plain.send_len], "203.0.113.77") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.send_buf[0..plain.send_len], "actual address") == null);
+
+    target.session.setRealHost("198.51.100.9");
+    oper.send_len = 0;
+    var stored_line = try irc_line.parseLine("WHOIS SocketUser");
+    try server.handleWhois(oper, &stored_line);
+    const stored = oper.send_buf[0..oper.send_len];
+    try expectContains(stored, "actual address 198.51.100.9");
+    try std.testing.expect(std.mem.indexOf(u8, stored, "203.0.113.77") == null);
+
+    var v6_line = try irc_line.parseLine("WHOIS V6User");
+    try server.handleWhois(v6, &v6_line);
+    try expectContains(v6.send_buf[0..v6.send_len], "actual address 2001:db8:0:0:0:0:0:1");
+    plain.send_len = 0;
+    var plain_v6 = try irc_line.parseLine("WHOIS V6User");
+    try server.handleWhois(plain, &plain_v6);
+    try std.testing.expect(std.mem.indexOf(u8, plain.send_buf[0..plain.send_len], "2001:db8") == null);
 }
 
 test "GAP-P0c remote SYS and ADM DATA tags stay closed for an operator account" {
