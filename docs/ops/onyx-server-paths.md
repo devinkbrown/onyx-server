@@ -24,8 +24,8 @@ substitutes for this table.
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.8.0+b9cd1d6a60ca` | `0.8.0+b9cd1d6a60ca` |
-| Executable SHA-256 | `81f33908f8670f08221d6db07a09553ceee70ca7a7bb52ff952aeeff945f1fff` | same |
+| Running image | `0.8.0+8359a7e59f0d` | `0.8.0+8359a7e59f0d` |
+| Executable SHA-256 | `05aaeda7ccded81476341d6496f9a32257395293d38ceb85a0aedce786dbb43c` | same |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
@@ -33,12 +33,13 @@ substitutes for this table.
 `SIGUSR2` does not adopt a new inode. This roll was a full restart, eshmaki
 first (`rc-service`), then ircx.us (`systemctl`). The mesh socket is native
 IPv6: eshmaki `2604:f440:3:40::2` to ircx.us `2607:5300:201:3100::24ca` port
-6900. The previous image is `onyx-server.prev-0.8.0-96c4b512c3d7` in each run
+6900. The previous image is `onyx-server.prev-0.8.0-b9cd1d6a60ca` in each run
 directory, SHA-256
-`836e5b9f52f97e6b8b3280f8c9549c81f72f55d7dae689074a525aaf6b0e4806`.
+`81f33908f8670f08221d6db07a09553ceee70ca7a7bb52ff952aeeff945f1fff`.
 `--check-config` passed on both live TOML files before the restarts. Mesh
 health reported `links_active=1`, `peers_up=1`, and `partitioned=0` on both
-nodes. The full `zig build test` suite was not re-run for this image.
+nodes. ircx.us logged `mesh S2S established (secured) peer=eshmaki.me`. The
+full `zig build test` suite was not re-run for this image.
 
 ## Day-2 ops
 
