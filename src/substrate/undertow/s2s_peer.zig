@@ -179,6 +179,12 @@ const max_search_frames: usize = 1024;
 const keytrans_head_extension_probe = "onyx-xcap-keytrans-head-1?";
 const keytrans_head_extension_reply = "onyx-xcap-keytrans-head-1!";
 const max_keytrans_heads: usize = 1024;
+/// Remote WHOIS session facts. The handshake byte is full, so tag 0x2E is
+/// sent only after the peer answers this probe. An older peer echoes the
+/// probe itself and never receives the frame.
+const whois_profile_extension_probe = "onyx-xcap-whois-profile-1?";
+const whois_profile_extension_reply = "onyx-xcap-whois-profile-1!";
+const max_whois_profiles: usize = 1024;
 const read_marker_extension_probe = "onyx-xcap-read-marker-1?";
 const read_marker_extension_reply = "onyx-xcap-read-marker-1!";
 const read_marker_namespace = "read.marker/";
@@ -306,6 +312,7 @@ const membership_event = @import("../../proto/membership_event.zig");
 const oper_event = @import("../../proto/oper_event.zig");
 const mesh_presence_v2 = @import("../../proto/mesh_presence_v2.zig");
 const guest_direct = @import("../../proto/guest_direct.zig");
+const whois_profile = @import("../../proto/whois_profile.zig");
 const observe_event = @import("../../proto/observe_event.zig");
 const kill_relay = @import("../../proto/kill_relay.zig");
 const memo_push_relay = @import("../../proto/memo_push_relay.zig");
@@ -660,6 +667,12 @@ pub const S2sPeer = struct {
     /// Remote answered the key-transparency head probe. Send KEYTRANS_HEAD
     /// only after this is true so an older peer never receives tag 0x2B.
     peer_supports_keytrans_head: bool = false,
+    /// Remote answered the WHOIS profile probe. Send WHOIS_PROFILE only after
+    /// this is true so an older peer never receives tag 0x2E.
+    peer_supports_whois_profile: bool = false,
+    /// Set on the false-to-true edge so the daemon publishes the local roster
+    /// once, including when the probe reply arrives after the membership burst.
+    whois_profile_ready: bool = false,
     /// Remote advertised frame signing plus the explicit event-spine-v2 bit.
     peer_supports_event_spine_v2: bool = false,
     /// Daemon-supplied residence-proof verifier (Design C / F1). Null (default,
@@ -786,6 +799,9 @@ pub const S2sPeer = struct {
     /// Verified SEARCH_QUERY payloads. The daemon decodes and answers them.
     /// Substrate-pure: the bytes stay opaque here.
     search_queries: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Verified WHOIS_PROFILE bodies waiting for the daemon. Each slice is
+    /// owned and freed by the daemon after it stores or rejects the record.
+    whois_profiles: std.ArrayListUnmanaged([]u8) = .empty,
     /// Verified SEARCH_REPLY payloads. The daemon authorizes each hit.
     search_replies: std.ArrayListUnmanaged([]u8) = .empty,
     /// Verified KEYTRANS_HEAD payloads. The daemon checks the head signature
@@ -1083,6 +1099,8 @@ pub const S2sPeer = struct {
         self.wards.deinit(self.allocator);
         for (self.search_queries.items) |m| self.allocator.free(m);
         self.search_queries.deinit(self.allocator);
+        for (self.whois_profiles.items) |m| self.allocator.free(m);
+        self.whois_profiles.deinit(self.allocator);
         for (self.search_replies.items) |m| self.allocator.free(m);
         self.search_replies.deinit(self.allocator);
         for (self.keytrans_heads.items) |m| self.allocator.free(m);
@@ -1346,6 +1364,8 @@ pub const S2sPeer = struct {
                 {
                     try emitFrame(self.allocator, sink, .PONG, session_replica_v3_reply);
                 }
+                if (std.mem.eql(u8, frame.payload, whois_profile_extension_probe))
+                    try emitFrame(self.allocator, sink, .PONG, whois_profile_extension_reply);
             },
             .PONG => {
                 self.pong_rx_count += 1;
@@ -1375,6 +1395,10 @@ pub const S2sPeer = struct {
                     self.peer_supports_signing and self.peer_supports_session_replica_v2)
                 {
                     self.peer_supports_session_replica_v3 = true;
+                }
+                if (std.mem.eql(u8, frame.payload, whois_profile_extension_reply)) {
+                    if (!self.peer_supports_whois_profile) self.whois_profile_ready = true;
+                    self.peer_supports_whois_profile = true;
                 }
             },
             .QUIT => self.closeRemote(),
@@ -1419,6 +1443,7 @@ pub const S2sPeer = struct {
             .KEYTRANS_HEAD => try self.recvKeyTransHead(frame.payload),
             .GUEST_PRESENCE => self.recvGuestPresence(frame.payload),
             .GUEST_DIRECT => self.recvGuestDirect(frame.payload),
+            .WHOIS_PROFILE => self.recvWhoisProfile(frame.payload),
             .RESYNC => {
                 self.resync_requested = true;
                 // RESYNC is also the one-shot capability-refresh request for a
@@ -2054,6 +2079,41 @@ pub const S2sPeer = struct {
 
     pub fn supportsKeyTransHead(self: *const S2sPeer) bool {
         return self.established and self.peer_supports_keytrans_head;
+    }
+
+    fn recvWhoisProfile(self: *S2sPeer, frame_payload: []const u8) void {
+        const payload = self.verifiedPayload(.WHOIS_PROFILE, frame_payload) orelse return;
+        if (whois_profile.decode(payload) == null) return;
+        if (self.whois_profiles.items.len >= max_whois_profiles) return;
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        self.whois_profiles.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    pub fn takeWhoisProfiles(self: *S2sPeer) ![][]u8 {
+        return self.whois_profiles.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit a signed WHOIS profile. Refused until the peer has answered the
+    /// probe, so an older peer is never sent tag 0x2E.
+    pub fn sendWhoisProfile(self: *S2sPeer, sink: ByteSink, wire: []const u8) !void {
+        if (!self.established or !self.peer_supports_whois_profile) return error.WhoisProfileUnavailable;
+        if (whois_profile.decode(wire) == null) return error.InvalidWhoisProfile;
+        try self.emitSignable(sink, .WHOIS_PROFILE, wire);
+    }
+
+    pub fn supportsWhoisProfile(self: *const S2sPeer) bool {
+        return self.established and self.peer_supports_whois_profile;
+    }
+
+    pub fn supportsMemberOperInfo(self: *const S2sPeer) bool {
+        return self.peer_supports_oper_info;
+    }
+
+    /// One-shot edge: the peer just became able to receive WHOIS profiles.
+    pub fn takeWhoisProfileReady(self: *S2sPeer) bool {
+        const ready = self.whois_profile_ready;
+        self.whois_profile_ready = false;
+        return ready;
     }
 
     /// Established secured links that already sign. No second capability bit
@@ -4309,6 +4369,8 @@ pub const S2sPeer = struct {
         self.peer_supports_e2ee_group_current = false;
         self.peer_supports_search = false;
         self.peer_supports_keytrans_head = false;
+        self.peer_supports_whois_profile = false;
+        self.whois_profile_ready = false;
         self.peer_supports_event_spine_v2 = self.peer_supports_signing and (hs.caps & cap_event_spine_v2) != 0;
         if (self.signedFramesRequired() and !self.peer_supports_signing) {
             return error.SignedFramesRequired;
@@ -4335,6 +4397,7 @@ pub const S2sPeer = struct {
             try emitFrame(self.allocator, sink, .PING, keytrans_head_extension_probe);
         if (self.signing_key != null and self.peer_supports_signing)
             try emitFrame(self.allocator, sink, .PING, read_marker_extension_probe);
+        try emitFrame(self.allocator, sink, .PING, whois_profile_extension_probe);
     }
 
     fn rememberRemote(self: *S2sPeer, hs: Handshake, now_ms: u64) !void {
@@ -4397,6 +4460,7 @@ pub const S2sPeer = struct {
         {
             try emitFrame(self.allocator, sink, .PING, session_replica_v3_probe);
         }
+        try emitFrame(self.allocator, sink, .PING, whois_profile_extension_probe);
         self.handshake_sent = true;
     }
 
@@ -9429,6 +9493,7 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
         .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,               .E2EE_GROUP_ACK,                   .MEMBERSHIP_SYNC,
         .SEARCH_QUERY,        .SEARCH_REPLY,           .KEYTRANS_HEAD,            .GUEST_PRESENCE,                   .GUEST_DIRECT,
+        .WHOIS_PROFILE,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug

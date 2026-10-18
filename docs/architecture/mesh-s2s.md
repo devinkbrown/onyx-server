@@ -69,11 +69,17 @@ The daemon also keeps operational mesh state outside the substrate: peer health,
 | `MEDIA_WS_DATAGRAM` | `0x25` | media | secured-signed | - | Origin-only cascade of an already-validated browser Cadence WS binary media datagram (`src/proto/media_ws_relay.zig`, `src/proto/s2s_frame.zig`). Receivers local-fanout only; never re-mesh. |
 | `GUEST_PRESENCE` | `0x2C` | relay | secured-signed | - | Original mesh-presence v2 record. The hop envelope authenticates the immediate peer. The origin signature is unchanged. No new handshake bit. |
 | `GUEST_DIRECT` | `0x2D` | relay | secured-signed | - | Ordinary-guest PRIVMSG bound to both guest incarnations. Forward only toward the recipient's next hop. No new handshake bit. |
+| `WHOIS_PROFILE` | `0x2E` | membership | signable | PING `onyx-xcap-whois-profile-1` | Remote WHOIS session facts: signon, last active, TLS cipher, away, bot, public mode hints, mode string, connection class, and WebSocket. rDNS is included only toward a secured oper-info peer. No new handshake bit. |
 
 > Unknown frame tags are skipped when the length header is valid. They do not
 > tear the link down. `GUEST_PRESENCE` and `GUEST_DIRECT` are the current
 > ordinary-guest frames. A peer that does not know the tag skips it. The
 > sender does not wait for a new PONG and does not advertise a second version.
+> `WHOIS_PROFILE` is the exception that does wait: the sender emits tag `0x2E`
+> only after the peer answers the profile probe with `onyx-xcap-whois-profile-1!`.
+> An older peer echoes the probe and never receives the tag. A missing profile
+> leaves idle, away, and TLS off the remote WHOIS. The full `zig build test`
+> suite has not been re-run after this frame.
 
 ## Ordinary guest presence
 

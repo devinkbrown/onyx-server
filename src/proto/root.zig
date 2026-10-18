@@ -351,6 +351,7 @@ pub const whisper_cmd = @import("whisper_cmd.zig");
 pub const whisper = @import("whisper.zig");
 pub const who_props = @import("who_props.zig");
 pub const whois_extra = @import("whois_extra.zig");
+pub const whois_profile = @import("whois_profile.zig");
 pub const whowas_reply = @import("whowas_reply.zig");
 pub const whox = @import("whox.zig");
 pub const who = @import("who.zig");
@@ -714,6 +715,7 @@ test {
     _ = whisper;
     _ = who_props;
     _ = whois_extra;
+    _ = whois_profile;
     _ = whowas_reply;
     _ = whox;
     _ = who;

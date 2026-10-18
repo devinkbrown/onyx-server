@@ -110,6 +110,7 @@ const oper_cred_share = @import("../proto/oper_cred_share.zig");
 const oper_session_provenance = @import("oper_session_provenance.zig");
 const invite = @import("../proto/invite.zig");
 const whois = @import("whois.zig");
+const whois_profile = @import("../proto/whois_profile.zig");
 const whowas = @import("whowas.zig");
 const whowas_reply = @import("../proto/whowas_reply.zig");
 const monitor = @import("../proto/monitor.zig");
@@ -3130,6 +3131,13 @@ pub const ConnState = struct {
     /// silence since the last message — NOT since the last PING/PONG or query, so
     /// it is intentionally separate from `last_activity_ms`. Seeded at signon.
     last_message_ms: i64 = 0,
+    /// Monotonic ms of the last WHOIS_PROFILE publish. Zero means this
+    /// connection has not published one. Speech refreshes wait 60s; a mode,
+    /// away, account, nick, or quit change publishes immediately.
+    whois_profile_sent_ms: i64 = 0,
+    /// Last published WHOIS_PROFILE revision. The next publish is strictly
+    /// newer, including two changes inside one wall-clock millisecond.
+    whois_profile_revision: u64 = 0,
     /// Mesh HLC stamped when this session last asserted its nick claim to the mesh
     /// (registration, nick change, or USR2 re-adoption). Comparable to a remote
     /// claim's HLC so a same-account cross-mesh collision retires the OLDER (stale
@@ -4538,6 +4546,86 @@ const RetiredTlsGeneration = struct {
     }
 };
 
+const RemoteWhoisProfile = struct {
+    origin_node: u64 = 0,
+    revision_ms: u64 = 0,
+    signon_unix: u64 = 0,
+    last_active_unix: u64 = 0,
+    flags: u16 = 0,
+    cipher: []u8 = &.{},
+    away: []u8 = &.{},
+    rdns: []u8 = &.{},
+    modes: []u8 = &.{},
+    class_name: []u8 = &.{},
+
+    fn deinit(self: *RemoteWhoisProfile, allocator: std.mem.Allocator) void {
+        if (self.cipher.len != 0) allocator.free(self.cipher);
+        if (self.away.len != 0) allocator.free(self.away);
+        if (self.rdns.len != 0) allocator.free(self.rdns);
+        if (self.modes.len != 0) allocator.free(self.modes);
+        if (self.class_name.len != 0) allocator.free(self.class_name);
+        self.* = .{};
+    }
+};
+
+const max_remote_whois_profiles: usize = 8192;
+const whois_profile_refresh_ms: i64 = 60_000;
+
+fn profileTokenOk(bytes: []const u8) bool {
+    for (bytes) |ch| {
+        if (ch <= 0x20 or ch == 0x7f or ch == ':') return false;
+    }
+    return true;
+}
+
+fn profileModesOk(bytes: []const u8) bool {
+    if (bytes.len < 2 or bytes[0] != '+') return false;
+    for (bytes[1..]) |ch| {
+        if (!std.ascii.isAlphanumeric(ch)) return false;
+    }
+    return true;
+}
+
+fn profileToken(bytes: []const u8, max_len: usize) []const u8 {
+    if (bytes.len == 0 or !profileTokenOk(bytes)) return "";
+    if (bytes.len <= max_len) return bytes;
+    return bytes[0..max_len];
+}
+
+fn profileAway(bytes: []const u8) []const u8 {
+    const max = whois_profile.max_away_len;
+    const cut = if (bytes.len <= max) bytes else blk: {
+        var i: usize = max;
+        while (i > 0 and (bytes[i] & 0xC0) == 0x80) {
+            i -= 1;
+        }
+        break :blk bytes[0..i];
+    };
+    for (cut) |ch| {
+        if (ch < 0x20 or ch == 0x7f) return "";
+    }
+    return cut;
+}
+
+/// Copy a mode string for a WHOIS 320 line. `o` and `a` are operator letters
+/// and stay off the line when the subject asked to hide them.
+fn filterWhoisModeText(modes: []const u8, hide_oper_letters: bool, out: []u8) ?[]const u8 {
+    if (modes.len == 0 or out.len < 2) return null;
+    var n: usize = 0;
+    out[n] = '+';
+    n += 1;
+    for (modes) |ch| {
+        if (ch == '+') continue;
+        if (!std.ascii.isAlphanumeric(ch)) continue;
+        if (hide_oper_letters and (ch == 'o' or ch == 'a')) continue;
+        if (n >= out.len) break;
+        out[n] = ch;
+        n += 1;
+    }
+    if (n < 2) return null;
+    return out[0..n];
+}
+
 pub const LinuxServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -4786,6 +4874,8 @@ pub const LinuxServer = struct {
     /// Account-only signed position frontier. Keys are account NUL target;
     /// values retain the complete immutable ENTITY_PROP for repair and relay.
     read_marker_facts: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// One WHOIS_PROFILE per remote nick. Keys are owned lowercased nicks.
+    remote_whois_profiles: std.StringHashMapUnmanaged(RemoteWhoisProfile) = .empty,
     read_marker_clock: mesh_clock_mod.MeshClock = .{},
     read_marker_unavailable: bool = false,
     silence: silence.Store,
@@ -6144,6 +6234,10 @@ pub const LinuxServer = struct {
         // the process rather than limp into a partially resumed daemon.
         if (!self.inheritedStateConsumedBeforeServices())
             @panic("Server.start called before adoptInheritedSessions consumed the inherited Helix handoff");
+        // Helix adopt can restore a channel whose creation time was never
+        // stored. Stamp those unset rows with boot time before any worker or
+        // mesh burst can publish numeric 329. A real stored time stays put.
+        self.noteChannelClock();
         self.driveLifecycle(.init);
         self.driveLifecycle(.ready);
         // Holding area for cross-mesh live-session migration capsules awaiting the
@@ -8327,6 +8421,7 @@ pub const LinuxServer = struct {
         if (self.ocsp_staple_incoming) |incoming| self.allocator.free(incoming);
         self.read_markers.deinit();
         self.deinitReadMarkerFacts(&self.read_marker_facts);
+        self.deinitRemoteWhoisProfiles();
         self.monitor.deinit();
         self.whowas.deinit();
         self.world.deinit();
@@ -8422,7 +8517,10 @@ pub const LinuxServer = struct {
         self.drainSessionDropControls();
         self.drainFabric();
         self.drainAttachmentSpoolForCurrentReactor();
-        if (self.rx() == &self.reactors[0]) self.retryRelayV2Outbox();
+        if (self.rx() == &self.reactors[0]) {
+            self.flushPendingSecuredOutbound();
+            self.retryRelayV2Outbox();
+        }
         if (self.rx() == &self.reactors[0] and
             self.e2ee_group_retry_requested.swap(false, .acq_rel))
             self.retryE2eeGroupCustody();
@@ -12124,6 +12222,8 @@ pub const LinuxServer = struct {
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainMeshSearch(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainWhoisProfiles(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         self.drainKeyTransHeads(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainMemoPushes(conn, link);
@@ -12355,6 +12455,8 @@ pub const LinuxServer = struct {
         self.drainWards(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainMeshSearch(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainWhoisProfiles(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainKeyTransHeads(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
@@ -17223,6 +17325,7 @@ pub const LinuxServer = struct {
                 const publish_peer_snapshot = !conn.s2s_dedup;
                 const dropped_node = link.peerShortId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
+                    srvLog("onyx-server: mesh link down peer={s} reason={s}\n", .{ link.remoteName(), reason });
                     self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
                     self.publishServerLink(link.remoteName(), false);
                     _ = self.peer_health.remove(link.remoteName());
@@ -17260,6 +17363,7 @@ pub const LinuxServer = struct {
                 const publish_peer_snapshot = !conn.s2s_dedup;
                 const dropped_node = link.remoteNodeId();
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
+                    srvLog("onyx-server: mesh link down peer={s} reason={s}\n", .{ link.remoteName(), reason });
                     self.logMeshEvent(.peer_down, link.remoteName(), "link dropped");
                     self.publishServerLink(link.remoteName(), false);
                     _ = self.peer_health.remove(link.remoteName());
@@ -17436,7 +17540,7 @@ pub const LinuxServer = struct {
         return true;
     }
 
-    fn broadcastQuit(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState, reason: []const u8) !void {
+    fn broadcastQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, reason: []const u8) !void {
         if (self.world.nickOf(worldIdFromClient(id)) == null) return;
 
         var prefix_buf: [256]u8 = undefined;
@@ -17466,6 +17570,7 @@ pub const LinuxServer = struct {
         // converge authority and are client-display-deduped at the receiver.
         if (announce and !conn.session_mesh_announce_pending) {
             self.retireOrdinaryGuest(conn);
+            self.publishWhoisGone(conn, nick);
             self.announceMembership(presence_channel, nick, 0, false, quit_identity, mesh_quit_setter);
         }
         var it = self.world.channels.iterator();
@@ -18211,6 +18316,13 @@ pub const LinuxServer = struct {
         return if (names) remaining else @min(default_reply_bytes * 65, remaining);
     }
 
+    /// Stamp World with the current wall-clock second. Mesh materialization and
+    /// Helix restore both create channels outside a client command, and a zero
+    /// clock there is what numeric 329 later renders as 1 Jan 1970.
+    fn noteChannelClock(self: *LinuxServer) void {
+        self.world.noteWallClock(@divFloor(platform.realtimeMillis(), 1000));
+    }
+
     fn dispatchRegistered(
         self: *LinuxServer,
         id: client_model.ClientId,
@@ -18220,8 +18332,9 @@ pub const LinuxServer = struct {
     ) !void {
         // Refresh the world's wall-clock so a channel created by this command
         // (JOIN/CREATE) gets a correct IRCX CREATION timestamp without the pure
-        // world taking a clock dependency.
-        self.world.clock_unix = @divFloor(platform.realtimeMillis(), 1000);
+        // world taking a clock dependency. Also repairs an unset 0 left by a
+        // mesh materialization that raced the first client command.
+        self.noteChannelClock();
 
         // draft/multiline: a negotiating client's `BATCH +ref draft/multiline`
         // and its @batch-tagged PRIVMSG/NOTICE chunks are routed into the
@@ -18571,6 +18684,7 @@ pub const LinuxServer = struct {
         // `broadcastQuit`. The same-account-share path returned above, so a second
         // session sharing the nick doesn't re-announce (the primary already did).
         self.announceMembership(presence_channel, nick, 0, true, membershipIdentityOf(conn), "");
+        self.publishWhoisProfile(conn, true);
         // Stamp the mesh-claim HLC for this session so a same-account cross-mesh
         // collision can tell the live session from a stale ghost (newest wins).
         conn.mesh_nick_hlc = self.nextMeshHlc();
@@ -18882,6 +18996,19 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Page secured-link ciphertext that a foreign shard left in the link buffer.
+    /// Reactor 0 owns every mesh socket. The wake that asked it to send does not
+    /// itself carry the bytes.
+    fn flushPendingSecuredOutbound(self: *LinuxServer) void {
+        if (self.rx() != &self.reactors[0]) return;
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied or slot.value.closing) continue;
+            const link = slot.value.s2s_secured orelse continue;
+            if (!slot.value.ownsActiveMeshLink(link) or link.outbound().len == 0) continue;
+            _ = self.flushMeshBurstStage(&slot.value);
+        }
+    }
+
     /// Drain one encoded burst family without dropping authenticated records.
     /// Secured links page by whole outer-record boundaries and retain the exact
     /// suffix across SendQ backpressure; plaintext rolling-old links retain the
@@ -19067,6 +19194,7 @@ pub const LinuxServer = struct {
                 } else if (conn.s2s) |link| {
                     link.sendMembership(presence_channel, pnick, 0, hlc, true, pident, "") catch return false;
                 }
+                if (!self.sendOneWhoisProfile(conn, mc)) return false;
             }
         }
         if (conn.s2s_secured) |link| {
@@ -21365,6 +21493,9 @@ pub const LinuxServer = struct {
             ids.append(self.allocator, id) catch return;
         }
         if (ids.items.len == 0) return;
+        // Membership restore creates the channel when it is absent. Stamp the
+        // wall clock first so that shell is not born at unix 0.
+        self.noteChannelClock();
 
         const host = if (ch.host.len != 0) ch.host else if (remote_name.len != 0) remote_name else default_host;
         const user = if (ch.username.len != 0) ch.username else world_projection.remote_user_placeholder;
@@ -21524,6 +21655,7 @@ pub const LinuxServer = struct {
             self.traceLog(.info, .s2s, "remote channel mode state ignored on mlocked channel");
             return false;
         }
+        self.noteChannelClock();
         self.world.ensureRemoteListChannel(ch.channel) catch return false;
         before.* = self.channelModeStateSnapshot(ch.channel);
 
@@ -21742,6 +21874,7 @@ pub const LinuxServer = struct {
 
     fn applyRemoteChannelList(self: *LinuxServer, ch: anytype) bool {
         if (ch.present) {
+            self.noteChannelClock();
             self.world.ensureRemoteListChannel(ch.channel) catch return false;
             return switch (ch.kind) {
                 .ban => self.world.addBan(ch.channel, ch.mask, ch.setter, ch.set_at) catch false,
@@ -23689,8 +23822,9 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .RPL_CHANNELMODEIS, parts[0..n], "");
             if (self.world.channelCreatedUnix(channel)) |created| {
                 var created_buf: [32]u8 = undefined;
-                const created_text = std.fmt.bufPrint(&created_buf, "{d}", .{created}) catch "0";
-                try queueNumeric(conn, .RPL_CREATIONTIME, &.{ channel, created_text }, "");
+                if (std.fmt.bufPrint(&created_buf, "{d}", .{created})) |created_text| {
+                    try queueNumeric(conn, .RPL_CREATIONTIME, &.{ channel, created_text }, "");
+                } else |_| {}
             }
             return;
         }
@@ -24206,6 +24340,7 @@ pub const LinuxServer = struct {
             }
         }
         if (applied.written().len == 0) return;
+        self.publishWhoisProfile(conn, true);
 
         // User modes are logical-session state. Publish the complete exact-token
         // snapshot before any attachment observes the reflection; a failed Store
@@ -24260,6 +24395,7 @@ pub const LinuxServer = struct {
             }
         }
         if (applied.written().len == 0) return;
+        self.publishWhoisProfile(tconn, true);
         _ = self.commitPortableSessionMutation(tid, tconn);
 
         var line_buf: [default_reply_bytes]u8 = undefined;
@@ -24894,6 +25030,365 @@ pub const LinuxServer = struct {
         if (listx.writeListxEnd(&endbuf, ctx)) |line| try appendToConn(conn, line) else |_| {}
     }
 
+    fn deinitRemoteWhoisProfiles(self: *LinuxServer) void {
+        var it = self.remote_whois_profiles.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        var keys = self.remote_whois_profiles.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.remote_whois_profiles.deinit(self.allocator);
+    }
+
+    fn remoteWhoisProfile(self: *LinuxServer, nick: []const u8, origin_node: u64) ?*RemoteWhoisProfile {
+        var key_buf: [whois_profile.max_nick_len]u8 = undefined;
+        if (nick.len == 0 or nick.len > key_buf.len) return null;
+        const key = std.ascii.lowerString(key_buf[0..nick.len], nick);
+        const slot = self.remote_whois_profiles.getPtr(key) orelse return null;
+        if (origin_node != 0 and slot.origin_node != 0 and slot.origin_node != origin_node) return null;
+        if ((slot.flags & whois_profile.flag_present) == 0) return null;
+        return slot;
+    }
+
+    fn dupeProfileText(self: *LinuxServer, bytes: []const u8) ?[]u8 {
+        if (bytes.len == 0) return &.{};
+        return self.allocator.dupe(u8, bytes) catch null;
+    }
+
+    fn copyWhoisProfile(self: *LinuxServer, view: whois_profile.View) ?RemoteWhoisProfile {
+        var profile = RemoteWhoisProfile{
+            .origin_node = view.origin_node,
+            .revision_ms = view.revision_ms,
+            .signon_unix = view.signon_unix,
+            .last_active_unix = view.last_active_unix,
+            .flags = view.flags,
+        };
+        const cipher = self.dupeProfileText(view.cipher) orelse {
+            profile.deinit(self.allocator);
+            return null;
+        };
+        profile.cipher = cipher;
+        const away = self.dupeProfileText(view.away_text) orelse {
+            profile.deinit(self.allocator);
+            return null;
+        };
+        profile.away = away;
+        const rdns_text = self.dupeProfileText(view.rdns) orelse {
+            profile.deinit(self.allocator);
+            return null;
+        };
+        profile.rdns = rdns_text;
+        const modes = self.dupeProfileText(view.modes) orelse {
+            profile.deinit(self.allocator);
+            return null;
+        };
+        profile.modes = modes;
+        const class_name = self.dupeProfileText(view.class_name) orelse {
+            profile.deinit(self.allocator);
+            return null;
+        };
+        profile.class_name = class_name;
+        return profile;
+    }
+
+    /// Accept a verified WHOIS_PROFILE payload. Equal or older revisions are
+    /// dropped. A departure with no stored row is not forwarded. The table
+    /// fails closed at its cap instead of evicting a live profile.
+    fn storeWhoisProfile(self: *LinuxServer, payload: []const u8) bool {
+        const view = whois_profile.decode(payload) orelse return false;
+        var key_buf: [whois_profile.max_nick_len]u8 = undefined;
+        const key = std.ascii.lowerString(key_buf[0..view.nick.len], view.nick);
+        if (!view.present()) {
+            const slot = self.remote_whois_profiles.getPtr(key) orelse return false;
+            if (view.revision_ms <= slot.revision_ms) return false;
+            if (self.remote_whois_profiles.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                var dropped = removed.value;
+                dropped.deinit(self.allocator);
+            }
+            return true;
+        }
+        if (self.remote_whois_profiles.getPtr(key) == null and
+            self.remote_whois_profiles.count() >= max_remote_whois_profiles)
+        {
+            return false;
+        }
+        var copy = self.copyWhoisProfile(view) orelse return false;
+        const gop = self.remote_whois_profiles.getOrPut(self.allocator, key) catch {
+            copy.deinit(self.allocator);
+            return false;
+        };
+        if (gop.found_existing) {
+            if (view.revision_ms <= gop.value_ptr.revision_ms) {
+                copy.deinit(self.allocator);
+                return false;
+            }
+            gop.value_ptr.deinit(self.allocator);
+            gop.value_ptr.* = copy;
+            return true;
+        }
+        const owned_key = self.allocator.dupe(u8, key) catch {
+            copy.deinit(self.allocator);
+            _ = self.remote_whois_profiles.remove(key);
+            return false;
+        };
+        gop.key_ptr.* = owned_key;
+        gop.value_ptr.* = copy;
+        return true;
+    }
+
+    fn whoisUnix(self: *LinuxServer, mono_ms: i64) u64 {
+        const age_ms = @max(@as(i64, 0), self.nowMs() - mono_ms);
+        const unix_ms = platform.realtimeMillis() - age_ms;
+        if (unix_ms <= 0) return 0;
+        return @intCast(@divTrunc(unix_ms, 1000));
+    }
+
+    fn nextWhoisRevision(_: *LinuxServer, conn: *ConnState) u64 {
+        const wall = platform.realtimeMillis();
+        var revision: u64 = if (wall > 0) @intCast(wall) else 0;
+        if (revision <= conn.whois_profile_revision) {
+            revision = conn.whois_profile_revision +% 1;
+        }
+        if (revision == 0) {
+            revision = 1;
+        }
+        conn.whois_profile_revision = revision;
+        return revision;
+    }
+
+    fn encodeUserWhois(
+        self: *LinuxServer,
+        conn: *ConnState,
+        include_rdns: bool,
+        revision: u64,
+        out: []u8,
+    ) ?[]const u8 {
+        const nick = conn.session.displayName();
+        var modes_buf: [whois_profile.max_modes_len]u8 = undefined;
+        const raw_modes = conn.session.umodeString(&modes_buf);
+        const modes = if (raw_modes.len <= whois_profile.max_modes_len and profileModesOk(raw_modes)) raw_modes else "";
+        var rdns_buf: [cloak.max_cloak_len]u8 = undefined;
+        var rdns_name: []const u8 = "";
+        if (include_rdns) {
+            if (self.config.rdns) |res| {
+                if (conn.peer_addr) |paddr| {
+                    if (res.lookup(paddr, &rdns_buf)) |name| {
+                        const token = profileToken(name, whois_profile.max_rdns_len);
+                        if (token.len != 0) {
+                            rdns_name = token;
+                        }
+                    }
+                }
+            }
+        }
+        var class_name: []const u8 = "";
+        if (self.config.class_registry) |*reg| {
+            const name = reg.classFor(matchCtx(conn)).name;
+            const token = profileToken(name, whois_profile.max_class_len);
+            if (token.len != 0) {
+                class_name = token;
+            }
+        }
+        var cipher: []const u8 = "";
+        if (conn.is_tls) {
+            if (conn.session.tls_cipher) |name| {
+                cipher = profileToken(name, whois_profile.max_cipher_len);
+            }
+        }
+        var away_text: []const u8 = "";
+        var away = false;
+        if (conn.session.awayMessage()) |text| {
+            away = true;
+            away_text = profileAway(text);
+        }
+        const signon = self.whoisUnix(conn.connected_at_ms);
+        var last_active = if (conn.last_message_ms == 0) signon else self.whoisUnix(conn.last_message_ms);
+        if (last_active == 0) {
+            last_active = signon;
+        }
+        const wire = whois_profile.encode(.{
+            .present = true,
+            .tls = conn.is_tls,
+            .bot = conn.session.isBot(),
+            .regonly = conn.session.umodes.contains(.regonly_pm),
+            .callerid = conn.session.umodes.contains(.callerid),
+            .common_chan = conn.session.umodes.contains(.common_chan),
+            .tls_only = conn.session.umodes.contains(.tls_only_pm),
+            .no_invite = conn.session.umodes.contains(.no_invite),
+            .hide_idle = conn.session.umodes.contains(.hide_idle),
+            .hide_chans = conn.session.umodes.contains(.hide_chans),
+            .away = away,
+            .has_rdns = rdns_name.len != 0,
+            .hide_oper = conn.session.umodes.contains(.hide_oper),
+            .websocket = conn.ws != null,
+            .signon_unix = signon,
+            .last_active_unix = last_active,
+            .revision_ms = revision,
+            .origin_node = self.config.node_id,
+            .nick = nick,
+            .cipher = cipher,
+            .away_text = away_text,
+            .rdns = rdns_name,
+            .modes = modes,
+            .class_name = class_name,
+        }, out) catch return null;
+        return wire;
+    }
+
+    fn whoisLinkSupportsProfile(peer: *ConnState) bool {
+        if (peer.s2s_secured) |link| return link.supportsWhoisProfile();
+        if (peer.s2s) |link| return link.supportsWhoisProfile();
+        return false;
+    }
+
+    fn whoisLinkOperInfo(peer: *ConnState) bool {
+        const link = peer.s2s_secured orelse return false;
+        return link.supportsMemberOperInfo();
+    }
+
+    fn sendWhoisWire(peer: *ConnState, wire: []const u8) bool {
+        if (peer.s2s_secured) |link| {
+            link.sendWhoisProfile(wire) catch return false;
+            return true;
+        }
+        if (peer.s2s) |link| {
+            link.sendWhoisProfile(wire) catch return false;
+            return true;
+        }
+        return false;
+    }
+
+    fn emitWhoisToPeers(self: *LinuxServer, wire_rdns: []const u8, wire_plain: []const u8) void {
+        // Client commands run on the socket's own reactor. The mesh link and its
+        // send buffer live on reactor 0. Encoding into the link buffer is safe
+        // under the completion world lock; paging that ciphertext into a SendQ
+        // or submitting it on this shard's ring is not. A foreign shard wakes
+        // the owner and leaves the records in the link.
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const peer = &slot.value;
+                if (!peer.isActiveMeshPeer() or !whoisLinkSupportsProfile(peer)) continue;
+                const wire = if (whoisLinkOperInfo(peer)) wire_rdns else wire_plain;
+                if (!sendWhoisWire(peer, wire)) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                if (peer.s2s_secured) |link| {
+                    _ = self.flushSecuredS2sOutboundTo(pid, link);
+                } else if (peer.s2s) |link| {
+                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
+                    link.clearOutbound();
+                }
+            }
+        }
+    }
+
+    fn publishWhoisProfile(self: *LinuxServer, conn: *ConnState, force: bool) void {
+        if (conn.s2s != null or conn.s2s_secured != null) return;
+        if (!conn.session.registered()) return;
+        const nick = conn.session.displayName();
+        if (nick.len == 0 or std.mem.eql(u8, nick, "*")) return;
+        const now = self.nowMs();
+        if (!force and conn.whois_profile_sent_ms != 0 and now - conn.whois_profile_sent_ms < whois_profile_refresh_ms) return;
+        const revision = self.nextWhoisRevision(conn);
+        var with_rdns: [whois_profile.max_encoded_len]u8 = undefined;
+        var plain: [whois_profile.max_encoded_len]u8 = undefined;
+        const wire_rdns = self.encodeUserWhois(conn, true, revision, &with_rdns) orelse return;
+        const wire_plain = self.encodeUserWhois(conn, false, revision, &plain) orelse return;
+        conn.whois_profile_sent_ms = now;
+        self.emitWhoisToPeers(wire_rdns, wire_plain);
+    }
+
+    fn publishWhoisGone(self: *LinuxServer, conn: *ConnState, nick: []const u8) void {
+        if (nick.len == 0 or std.mem.eql(u8, nick, "*") or !whois_profile.nickOk(nick)) return;
+        const revision = self.nextWhoisRevision(conn);
+        var buf: [whois_profile.max_encoded_len]u8 = undefined;
+        const wire = whois_profile.encode(.{
+            .present = false,
+            .nick = nick,
+            .revision_ms = revision,
+            .origin_node = self.config.node_id,
+        }, &buf) catch return;
+        self.emitWhoisToPeers(wire, wire);
+    }
+
+    /// One local user's profile on an already-open membership burst. The burst
+    /// flushes the stage; this must not, or a partial family would commit early.
+    fn sendOneWhoisProfile(self: *LinuxServer, peer: *ConnState, user: *ConnState) bool {
+        if (!whoisLinkSupportsProfile(peer)) return true;
+        const revision = self.nextWhoisRevision(user);
+        var buf: [whois_profile.max_encoded_len]u8 = undefined;
+        const wire = self.encodeUserWhois(user, whoisLinkOperInfo(peer), revision, &buf) orelse return true;
+        if (!sendWhoisWire(peer, wire)) return false;
+        user.whois_profile_sent_ms = self.nowMs();
+        return true;
+    }
+
+    fn publishLocalWhoisProfilesTo(self: *LinuxServer, peer: *ConnState) void {
+        if (!peer.isActiveMeshPeer() or !whoisLinkSupportsProfile(peer)) return;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const user = &slot.value;
+                if (user.s2s != null or user.s2s_secured != null) continue;
+                if (!user.session.registered()) continue;
+                const nick = user.session.displayName();
+                if (nick.len == 0 or std.mem.eql(u8, nick, "*")) continue;
+                if (!self.sendOneWhoisProfile(peer, user)) {
+                    _ = self.flushMeshBurstStage(peer);
+                    return;
+                }
+            }
+        }
+        _ = self.flushMeshBurstStage(peer);
+    }
+
+    fn relayWhoisProfile(self: *LinuxServer, view: whois_profile.View, source: *ConnState) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const peer = &slot.value;
+                if (peer == source or !peer.isActiveMeshPeer() or !whoisLinkSupportsProfile(peer)) continue;
+                var buf: [whois_profile.max_encoded_len]u8 = undefined;
+                const wire = whois_profile.encode(view.record(whoisLinkOperInfo(peer)), &buf) catch continue;
+                if (!sendWhoisWire(peer, wire)) continue;
+                _ = self.flushMeshBurstStage(peer);
+            }
+        }
+    }
+
+    fn drainWhoisProfiles(self: *LinuxServer, conn: *ConnState, link: anytype) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
+        const payloads = link.takeWhoisProfiles() catch null;
+        if (payloads) |taken| {
+            defer {
+                for (taken) |payload| self.allocator.free(payload);
+                if (taken.len != 0) self.allocator.free(taken);
+            }
+            for (taken) |payload| {
+                const view = whois_profile.decode(payload) orelse continue;
+                if (!self.storeWhoisProfile(payload)) continue;
+                self.relayWhoisProfile(view, conn);
+            }
+        }
+        if (link.takeWhoisProfileReady()) self.publishLocalWhoisProfilesTo(conn);
+    }
+
+    fn whoisModesLine(self: *LinuxServer, conn: *const ConnState, hide_oper_letters: bool, out: []u8) ?[]const u8 {
+        _ = self;
+        var raw_buf: [whois_profile.max_modes_len]u8 = undefined;
+        var filtered_buf: [whois_profile.max_modes_len]u8 = undefined;
+        const raw = conn.session.umodeString(&raw_buf);
+        const filtered = filterWhoisModeText(raw, hide_oper_letters, &filtered_buf) orelse return null;
+        return std.fmt.bufPrint(out, "is using modes {s}", .{filtered}) catch null;
+    }
+
+    fn whoisClassLine(self: *LinuxServer, conn: *const ConnState, show: bool, out: []u8) ?[]const u8 {
+        if (!show) return null;
+        const reg = if (self.config.class_registry) |*registry| registry else return null;
+        const name = reg.classFor(matchCtx(conn)).name;
+        if (name.len == 0) return null;
+        return std.fmt.bufPrint(out, "is in connection class {s}", .{name}) catch null;
+    }
+
     /// WHOIS [server] <nick> — full WHOIS sequence for a local user.
     pub fn handleWhois(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (parsed.param_count < 1) {
@@ -25001,6 +25496,8 @@ pub const LinuxServer = struct {
             }
         }
 
+        var modes_line_buf: [96]u8 = undefined;
+        var class_line_buf: [128]u8 = undefined;
         const subject = whois.WhoisSubject{
             // Show the target's nick in the exact case they registered, not the
             // case the requester happened to type in the WHOIS command.
@@ -25031,6 +25528,9 @@ pub const LinuxServer = struct {
             .common_chan = tconn.session.umodes.contains(.common_chan),
             .tls_only_pm = tconn.session.umodes.contains(.tls_only_pm),
             .no_invite = tconn.session.umodes.contains(.no_invite),
+            .modes_line = self.whoisModesLine(tconn, operHidden(tconn, conn), &modes_line_buf),
+            .class_line = self.whoisClassLine(tconn, conn.session.isOper() or conn == tconn, &class_line_buf),
+            .via_websocket = tconn.ws != null,
             .show_idle = !(tconn.session.umodes.contains(.hide_idle) and !conn.session.isOper() and conn != tconn),
             // RPL_WHOISSERVER (312) trailing: this node's configured description
             // (`[network] description`), mirroring the per-server description a
@@ -25103,6 +25603,9 @@ pub const LinuxServer = struct {
         real_host: []const u8,
         /// TLS client-cert fingerprint ("" = none) — oper-only 276.
         certfp: []const u8,
+        /// Home node from the roster. A stored WHOIS_PROFILE is used only when
+        /// its origin matches, or when either side has not recorded an origin.
+        origin_node: u64 = 0,
     };
 
     /// Resolve `nick` as a remote mesh member via any established S2S peer
@@ -25141,6 +25644,7 @@ pub const LinuxServer = struct {
                 .account = member.account,
                 .real_host = member.real_host,
                 .certfp = member.certfp,
+                .origin_node = member.node,
             };
         }
         const direct = link.remoteName();
@@ -25154,6 +25658,7 @@ pub const LinuxServer = struct {
             .account = member.account,
             .real_host = member.real_host,
             .certfp = member.certfp,
+            .origin_node = member.node,
         };
     }
 
@@ -25166,8 +25671,9 @@ pub const LinuxServer = struct {
     /// a live mesh display grant covers the account, and 318. To an OPERATOR
     /// requester it ALSO surfaces the deanonymized identity a secured oper-info
     /// link propagated: the real host/IP (338), GeoIP/ASN (320, computed locally
-    /// from that IP), and the TLS cert fingerprint (276). Idle/away/671 are
-    /// per-connection state remote nodes don't replicate, so they are omitted.
+    /// from that IP), the TLS cert fingerprint (276), and rDNS when the profile
+    /// carried it. Idle, away, TLS, modes, and class come from WHOIS_PROFILE.
+    /// With no profile those lines stay absent.
     fn sendRemoteWhois(
         self: *LinuxServer,
         conn: *ConnState,
@@ -25179,13 +25685,17 @@ pub const LinuxServer = struct {
         var memberships: [32]whois.ChannelMembership = undefined;
         var prefix_store: [32][2]u8 = undefined;
         const requester_wid = self.world.findNick(conn.session.displayName()) orelse world_model.ClientId.invalid;
-        const nchan = self.remoteMemberChannels(remote.nick, requester_wid, memberships[0..], prefix_store[0..]);
+        var nchan = self.remoteMemberChannels(remote.nick, requester_wid, memberships[0..], prefix_store[0..]);
         // Oper-only deanonymized identity: the real IP (338) + GeoIP/ASN (320,
         // resolved locally from that IP via the same MaxMind path the local WHOIS
         // uses) + TLS cert fingerprint (276). real_host/certfp are non-empty ONLY
         // when a secured oper-info link propagated them; additionally gate display
         // on the REQUESTER being an operator so a regular user never sees them.
         const requester_is_oper = conn.session.isOper();
+        const profile = self.remoteWhoisProfile(remote.nick, remote.origin_node);
+        if (profile) |p| {
+            if ((p.flags & whois_profile.flag_hide_chans) != 0 and !requester_is_oper) nchan = 0;
+        }
         var geo_buf: [256]u8 = undefined;
         var geo_text: ?[]const u8 = null;
         if (requester_is_oper and remote.real_host.len != 0) {
@@ -25201,6 +25711,62 @@ pub const LinuxServer = struct {
                 const asn_info = self.lookupGeoAsn(gip);
                 geo_text = buildGeoWhois(&geo_buf, city, region, country, asn_info.asn, asn_info.asorg);
             }
+        }
+        var special_buf: [560]u8 = undefined;
+        var special = geo_text;
+        if (requester_is_oper) {
+            if (profile) |p| {
+                if ((p.flags & whois_profile.flag_has_rdns) != 0 and p.rdns.len != 0) {
+                    special = if (geo_text) |g|
+                        (std.fmt.bufPrint(&special_buf, "rDNS {s} · {s}", .{ p.rdns, g }) catch geo_text)
+                    else
+                        (std.fmt.bufPrint(&special_buf, "rDNS {s}", .{p.rdns}) catch null);
+                }
+            }
+        }
+        var modes_text_buf: [48]u8 = undefined;
+        var modes_line_buf: [96]u8 = undefined;
+        var class_line_buf: [128]u8 = undefined;
+        var modes_line: ?[]const u8 = null;
+        var class_line: ?[]const u8 = null;
+        var idle_secs: u64 = 0;
+        var signon_ts: u64 = 0;
+        var show_idle = false;
+        var is_secure = false;
+        var secure_cipher: ?[]const u8 = null;
+        var away: ?[]const u8 = null;
+        var is_bot = false;
+        var regonly = false;
+        var callerid = false;
+        var common_chan = false;
+        var tls_only = false;
+        var no_invite = false;
+        var via_websocket = false;
+        if (profile) |p| {
+            const hide_oper_letters = (p.flags & whois_profile.flag_hide_oper) != 0 and !requester_is_oper;
+            if (filterWhoisModeText(p.modes, hide_oper_letters, &modes_text_buf)) |modes| {
+                modes_line = std.fmt.bufPrint(&modes_line_buf, "is using modes {s}", .{modes}) catch null;
+            }
+            if (requester_is_oper and p.class_name.len != 0) {
+                class_line = std.fmt.bufPrint(&class_line_buf, "is in connection class {s}", .{p.class_name}) catch null;
+            }
+            const hide_idle = (p.flags & whois_profile.flag_hide_idle) != 0 and !requester_is_oper;
+            if (!hide_idle and p.signon_unix != 0 and p.last_active_unix != 0) {
+                const now_unix: u64 = @intCast(@max(@as(i64, 0), @divTrunc(platform.realtimeMillis(), 1000)));
+                idle_secs = if (now_unix > p.last_active_unix) now_unix - p.last_active_unix else 0;
+                signon_ts = p.signon_unix;
+                show_idle = true;
+            }
+            is_secure = (p.flags & whois_profile.flag_tls) != 0;
+            if (is_secure and p.cipher.len != 0) secure_cipher = p.cipher;
+            if ((p.flags & whois_profile.flag_away) != 0) away = if (p.away.len != 0) p.away else "Away";
+            is_bot = (p.flags & whois_profile.flag_bot) != 0;
+            regonly = (p.flags & whois_profile.flag_regonly) != 0;
+            callerid = (p.flags & whois_profile.flag_callerid) != 0;
+            common_chan = (p.flags & whois_profile.flag_common_chan) != 0;
+            tls_only = (p.flags & whois_profile.flag_tls_only) != 0;
+            no_invite = (p.flags & whois_profile.flag_no_invite) != 0;
+            via_websocket = (p.flags & whois_profile.flag_websocket) != 0;
         }
         const oper_display = self.remoteOperDisplay(remote.account);
         const subject = whois.WhoisSubject{
@@ -25222,14 +25788,26 @@ pub const LinuxServer = struct {
                 if (oper.title.len > 0) oper.title else null
             else
                 null,
-            // Idle/signon are per-connection state the origin node doesn't replicate,
-            // so suppress RPL_WHOISIDLE rather than render a bogus "idle 0, epoch".
-            .show_idle = false,
+            .show_idle = show_idle,
+            .idle_secs = idle_secs,
+            .signon_ts = signon_ts,
+            .is_bot = is_bot,
+            .away = away,
+            .is_secure = is_secure,
+            .secure_cipher = secure_cipher,
+            .regonly_msgs = regonly,
+            .callerid = callerid,
+            .common_chan = common_chan,
+            .tls_only_pm = tls_only,
+            .no_invite = no_invite,
+            .modes_line = modes_line,
+            .class_line = class_line,
+            .via_websocket = via_websocket,
             .channels = memberships[0..nchan],
             // Oper-only deanonymized identity (see the geo block above).
             .actual_host = if (requester_is_oper and remote.real_host.len != 0) remote.real_host else null,
             .certfp = if (requester_is_oper and remote.certfp.len != 0) remote.certfp else null,
-            .geo = geo_text,
+            .geo = special,
         };
         whois.writeWhois(sink, self.serverName(), conn.session.displayName(), subject) catch return;
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
@@ -41506,6 +42084,7 @@ pub const LinuxServer = struct {
                 if (!std.ascii.eqlIgnoreCase(old, account)) _ = self.removeTrackedSession(old, monitorIdFromClient(id));
             }
             loginSession(conn, account);
+            self.publishWhoisProfile(conn, true);
             if (loginMechanismFromIrcx(package)) |mech|
                 self.recordAccountLogin(conn, account, mech, conn.session.tls_certfp orelse "");
             conn.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
@@ -43508,6 +44087,9 @@ pub const LinuxServer = struct {
         }
         if (!conn.session_mesh_announce_pending)
             self.announceNickChange(old, newnick, membershipIdentityOf(conn), v2_authority_ready);
+        if (!std.ascii.eqlIgnoreCase(old, newnick) and !self.nickIsLiveLocal(old))
+            self.publishWhoisGone(conn, old);
+        self.publishWhoisProfile(conn, true);
         const nick_hlc = self.nextMeshHlc();
         for (logical_ids.items) |logical_id| {
             if (self.connFor(logical_id)) |logical_conn| logical_conn.mesh_nick_hlc = nick_hlc;
@@ -43728,6 +44310,9 @@ pub const LinuxServer = struct {
         // user and see a live NICK line (identity is nick-independent).
         if (!conn.session_mesh_announce_pending)
             self.announceNickChange(old, newnick, membershipIdentityOf(conn), v2_authority_ready);
+        if (!std.ascii.eqlIgnoreCase(old, newnick) and !self.nickIsLiveLocal(old))
+            self.publishWhoisGone(conn, old);
+        self.publishWhoisProfile(conn, true);
         // Re-stamp the mesh-claim HLC: changing nick is a fresh claim assertion, so
         // a same-account ghost on another node loses to this newer claim.
         const nick_hlc = self.nextMeshHlc();
@@ -43917,6 +44502,7 @@ pub const LinuxServer = struct {
 
         // #33: feed the ACTIVITY stream a presence transition.
         self.pushPresenceActivity(id, conn, if (reason != null) .away else .active);
+        self.publishWhoisProfile(conn, true);
     }
 
     /// SETNAME :<realname> — IRCv3 setname. Updates the GECOS and echoes the
@@ -44490,6 +45076,7 @@ pub const LinuxServer = struct {
         // privilege transition — published so USER subscribers and oper-action
         // opers see who gained operator status (and under what title/class).
         self.publishUserEvent(conn, "OPER", if (title.len != 0) title else class_name) catch {};
+        self.publishWhoisProfile(conn, true);
         var prefix_buf: [256]u8 = undefined;
         var msg_buf: [default_reply_bytes]u8 = undefined;
         const prefix = try clientPrefix(conn, &prefix_buf);
@@ -44877,6 +45464,7 @@ pub const LinuxServer = struct {
                 _ = self.removeTrackedSession(old, monitorIdFromClient(id));
         }
         loginSession(conn, account);
+        self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(id, conn, acct);
         self.maybeApplyAccountCloak(id, conn);
         self.restoreAccountMetadata(conn, account);
@@ -44927,6 +45515,7 @@ pub const LinuxServer = struct {
                 _ = self.removeTrackedSession(old, monitorIdFromClient(idFromToken(conn.token)));
         }
         loginSession(conn, account);
+        self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} REGISTER SUCCESS {s} :Account registered\r\n", .{ self.serverName(), account }) catch return;
@@ -45194,6 +45783,7 @@ pub const LinuxServer = struct {
                 _ = self.removeTrackedSession(old, monitorIdFromClient(idFromToken(conn.token)));
         }
         loginSession(conn, account);
+        self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         // Per-account cloak: switch the visible host to <account>.users.<suffix>
         // now that the login is confirmed (post-registration path; the handshake
@@ -45249,6 +45839,7 @@ pub const LinuxServer = struct {
         if (was_oper)
             _ = self.clearOperAuthorityTransition(id, conn, true, "account logout revoked operator authority");
         conn.session.logout();
+        self.publishWhoisProfile(conn, true);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
         try emitReplyLine(conn, line);
@@ -59947,7 +60538,10 @@ pub const LinuxServer = struct {
         if (!try self.messageContentGates(id, conn, command, parsed.paramSlice()[0], text, is_notice)) return;
         // Reset the WHOIS idle clock on a real PRIVMSG (NOTICE never resets idle,
         // by convention — so bots/services don't keep a user looking "active").
-        if (!is_notice) conn.last_message_ms = self.nowMs();
+        if (!is_notice) {
+            conn.last_message_ms = self.nowMs();
+            self.publishWhoisProfile(conn, false);
+        }
 
         // `PRIVMSG a,#b,c :text`: deliver to each comma-separated target, capped
         // at MAXTARGETS to bound fan-out / resist spam amplification.
@@ -118850,6 +119444,172 @@ test "GAP-P0c remote WHOIS copies roster identity and leaves idle away and secur
     try std.testing.expect(std.mem.indexOf(u8, reply, " 671 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "draft/multiline") == null);
     std.debug.print("GAP-P0c branch=remote WHOIS copies roster identity and leaves idle away and TLS-secure unreplicated\n", .{});
+}
+
+test "whois profile remote facts follow the stored origin" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    const watcher_id = try addTestLocalClient(server, "Watcher", null);
+    const watcher = server.connFor(watcher_id) orelse return error.TestUnexpectedResult;
+    watcher.session.registration.registered = true;
+
+    var modes_out: [96]u8 = undefined;
+    var class_out: [128]u8 = undefined;
+    try std.testing.expect(server.whoisModesLine(watcher, false, &modes_out) == null);
+    try std.testing.expect(server.whoisClassLine(watcher, true, &class_out) == null);
+    _ = watcher.session.setUmode(.invisible, true);
+    const local_modes = server.whoisModesLine(watcher, false, &modes_out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("is using modes +i", local_modes);
+
+    var wire_buf: [whois_profile.max_encoded_len]u8 = undefined;
+    const wire = try whois_profile.encode(.{
+        .present = true,
+        .tls = true,
+        .away = true,
+        .has_rdns = true,
+        .websocket = true,
+        .signon_unix = 1_700_000_000,
+        .last_active_unix = 1_700_000_100,
+        .revision_ms = 5,
+        .origin_node = 9,
+        .nick = "FarUser",
+        .cipher = "TLS_AES_128_GCM_SHA256",
+        .away_text = "brb",
+        .rdns = "ircx.example",
+        .modes = "+iR",
+        .class_name = "users",
+    }, &wire_buf);
+    try std.testing.expect(server.storeWhoisProfile(wire));
+    const kept = server.remoteWhoisProfile("faruser", 9) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("TLS_AES_128_GCM_SHA256", kept.cipher);
+    try std.testing.expect(server.remoteWhoisProfile("FarUser", 4) == null);
+    try std.testing.expect(server.remoteWhoisProfile("FarUser", 0) != null);
+
+    const remote = Server.RemoteWhois{
+        .nick = "FarUser",
+        .username = "far",
+        .realname = "Far Person",
+        .host = "far.example",
+        .server = "peer.example",
+        .server_info = "Peer",
+        .account = "",
+        .real_host = "198.51.100.8",
+        .certfp = "abcdef",
+        .origin_node = 9,
+    };
+    var storage: [default_reply_bytes * 2]u8 = undefined;
+    var lines_buf: [40]whois.WhoisLine = undefined;
+    var sink = whois.WhoisLineSink{ .lines = &lines_buf, .storage = &storage };
+    try server.sendRemoteWhois(watcher, &sink, remote);
+    const reply = watcher.send_buf[0..watcher.send_len];
+    try expectContains(reply, " 317 ");
+    try expectContains(reply, " 1700000000 ");
+    try expectContains(reply, " 671 ");
+    try expectContains(reply, "TLS_AES_128_GCM_SHA256");
+    try expectContains(reply, " 301 ");
+    try expectContains(reply, "brb");
+    try expectContains(reply, "is using modes +iR");
+    try expectContains(reply, "is connected via WebSocket");
+    try std.testing.expect(std.mem.indexOf(u8, reply, "rDNS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "connection class") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, " 338 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, " 276 ") == null);
+
+    watcher.send_len = 0;
+    sink.reset();
+    var mismatched = remote;
+    mismatched.origin_node = 4;
+    try server.sendRemoteWhois(watcher, &sink, mismatched);
+    const missed = watcher.send_buf[0..watcher.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, missed, " 671 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, missed, " 317 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, missed, " 301 ") == null);
+
+    try reconcileTestOper(&watcher.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "ircop", "Watcher");
+    const shown = server.whoisModesLine(watcher, false, &modes_out) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, shown, "is using modes +o"));
+    var hidden_out: [96]u8 = undefined;
+    const hidden_modes = server.whoisModesLine(watcher, true, &hidden_out) orelse return error.TestUnexpectedResult;
+    const hidden_tail = hidden_modes["is using modes ".len..];
+    try std.testing.expect(std.mem.indexOfScalar(u8, hidden_tail, 'o') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, hidden_tail, 'a') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, hidden_tail, 'i') != null);
+
+    watcher.send_len = 0;
+    sink.reset();
+    try server.sendRemoteWhois(watcher, &sink, remote);
+    const oper_reply = watcher.send_buf[0..watcher.send_len];
+    try expectContains(oper_reply, "rDNS ircx.example");
+    try expectContains(oper_reply, "is in connection class users");
+    try expectContains(oper_reply, " 338 ");
+    try expectContains(oper_reply, "198.51.100.8");
+    try expectContains(oper_reply, " 276 ");
+    try expectContains(oper_reply, "abcdef");
+
+    const guest_id = try addTestLocalClient(server, "Guest", null);
+    const guest = server.connFor(guest_id) orelse return error.TestUnexpectedResult;
+    guest.session.registration.registered = true;
+    var hide_buf: [whois_profile.max_encoded_len]u8 = undefined;
+    const hidden = try whois_profile.encode(.{
+        .present = true,
+        .hide_idle = true,
+        .tls = true,
+        .signon_unix = 1_700_000_000,
+        .last_active_unix = 1_700_000_100,
+        .revision_ms = 6,
+        .origin_node = 9,
+        .nick = "FarUser",
+        .cipher = "TLS_AES_128_GCM_SHA256",
+    }, &hide_buf);
+    try std.testing.expect(server.storeWhoisProfile(hidden));
+    sink.reset();
+    try server.sendRemoteWhois(guest, &sink, remote);
+    const guest_reply = guest.send_buf[0..guest.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, guest_reply, " 317 ") == null);
+    try expectContains(guest_reply, " 671 ");
+    try expectContains(guest_reply, "TLS_AES_128_GCM_SHA256");
+
+    var old_buf: [whois_profile.max_encoded_len]u8 = undefined;
+    const old = try whois_profile.encode(.{
+        .present = true,
+        .signon_unix = 1,
+        .last_active_unix = 1,
+        .revision_ms = 5,
+        .origin_node = 9,
+        .nick = "FarUser",
+    }, &old_buf);
+    try std.testing.expect(!server.storeWhoisProfile(old));
+
+    var gone_buf: [whois_profile.max_encoded_len]u8 = undefined;
+    const gone = try whois_profile.encode(.{
+        .present = false,
+        .nick = "FarUser",
+        .revision_ms = 7,
+        .origin_node = 9,
+    }, &gone_buf);
+    try std.testing.expect(server.storeWhoisProfile(gone));
+    try std.testing.expect(server.remoteWhoisProfile("FarUser", 9) == null);
+    var gone_again_buf: [whois_profile.max_encoded_len]u8 = undefined;
+    const gone_again = try whois_profile.encode(.{
+        .present = false,
+        .nick = "FarUser",
+        .revision_ms = 8,
+        .origin_node = 9,
+    }, &gone_again_buf);
+    try std.testing.expect(!server.storeWhoisProfile(gone_again));
 }
 
 test "GAP-P0c remote SYS and ADM DATA tags stay closed for an operator account" {

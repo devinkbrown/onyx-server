@@ -173,6 +173,10 @@ pub const FrameType = enum(u8) {
     /// One ordinary-guest direct message. Distinct from legacy MESSAGE and
     /// from MESSAGE_V2 so a known guest is never also nick-relayed.
     GUEST_DIRECT = 0x2D,
+    /// Session facts for a remote WHOIS. Negotiated by a PING extension because
+    /// the handshake capability byte is full. Absent on a peer that did not
+    /// answer, so idle, away, and TLS stay omitted instead of being invented.
+    WHOIS_PROFILE = 0x2E,
 
     pub fn tag(self: FrameType) u8 {
         return @intFromEnum(self);
@@ -225,6 +229,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.KEYTRANS_HEAD) => .KEYTRANS_HEAD,
             @intFromEnum(FrameType.GUEST_PRESENCE) => .GUEST_PRESENCE,
             @intFromEnum(FrameType.GUEST_DIRECT) => .GUEST_DIRECT,
+            @intFromEnum(FrameType.WHOIS_PROFILE) => .WHOIS_PROFILE,
             else => null,
         };
     }
@@ -431,6 +436,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .KEYTRANS_HEAD, .token = "KEYTRANS_HEAD", .family = .relay, .auth = .signed, .summary = "Signed key-transparency log head. Gated by a PING extension. A higher entry count replaces the stored head; an older head does not." },
     .{ .frame_type = .GUEST_PRESENCE, .token = "GUEST_PRESENCE", .family = .relay, .auth = .secured_signed, .summary = "Original mesh-presence v2 record. The hop envelope authenticates the immediate peer; the origin signature is unchanged." },
     .{ .frame_type = .GUEST_DIRECT, .token = "GUEST_DIRECT", .family = .relay, .auth = .secured_signed, .summary = "Exact ordinary-guest direct message bound to both guest incarnations. Forward only toward the recipient." },
+    .{ .frame_type = .WHOIS_PROFILE, .token = "WHOIS_PROFILE", .family = .membership, .auth = .signable, .summary = "Remote WHOIS session facts. Gated by a PING extension. rDNS is present only on a secured oper-info link." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {

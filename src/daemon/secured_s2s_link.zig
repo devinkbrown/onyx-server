@@ -1304,6 +1304,32 @@ pub const SecuredLink = struct {
         return link.takeKeyTransHeads();
     }
 
+    pub fn supportsWhoisProfile(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsWhoisProfile();
+    }
+
+    pub fn supportsMemberOperInfo(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsMemberOperInfo();
+    }
+
+    pub fn takeWhoisProfileReady(self: *SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.takeWhoisProfileReady();
+    }
+
+    pub fn sendWhoisProfile(self: *SecuredLink, wire: []const u8) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.sendWhoisProfile(wire);
+        try self.drainInner();
+    }
+
+    pub fn takeWhoisProfiles(self: *SecuredLink) anyerror![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeWhoisProfiles();
+    }
+
     /// Emit a signed Web Push hint for an offline memo/DM over the encrypted
     /// S2S leg. The inner peer requires frame signing, so old/non-signing peers
     /// silently get no hint.

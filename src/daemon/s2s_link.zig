@@ -952,6 +952,26 @@ pub const S2sLink = struct {
         return self.peer.takeKeyTransHeads();
     }
 
+    pub fn supportsWhoisProfile(self: *const S2sLink) bool {
+        return self.peer.supportsWhoisProfile();
+    }
+
+    pub fn supportsMemberOperInfo(self: *const S2sLink) bool {
+        return self.peer.supportsMemberOperInfo();
+    }
+
+    pub fn takeWhoisProfileReady(self: *S2sLink) bool {
+        return self.peer.takeWhoisProfileReady();
+    }
+
+    pub fn sendWhoisProfile(self: *S2sLink, wire: []const u8) !void {
+        try self.peer.sendWhoisProfile(self.sink(), wire);
+    }
+
+    pub fn takeWhoisProfiles(self: *S2sLink) ![][]u8 {
+        return self.peer.takeWhoisProfiles();
+    }
+
     /// Emit a signed, signing-required Web Push hint for an offline memo/DM.
     /// The peer driver no-ops for non-signing peers so this never rides legacy
     /// plaintext S2S.

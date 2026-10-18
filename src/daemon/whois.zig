@@ -93,10 +93,10 @@ pub const WhoisSubject = struct {
     server_info: ?[]const u8 = null,
     idle_secs: u64 = 0,
     signon_ts: u64 = 0,
-    /// Emit RPL_WHOISIDLE (317). Local users always carry real idle/signon; a
-    /// remote mesh user does NOT (idle/signon are per-connection state the origin
-    /// node doesn't replicate), so the remote WHOIS path clears this to suppress
-    /// a misleading "idle 0 secs, signed on <epoch>" line rather than render zeros.
+    /// Emit RPL_WHOISIDLE (317). Local users always carry real idle/signon. A
+    /// remote user emits it only when a WHOIS_PROFILE supplied a real signon and
+    /// last-active time. An empty profile leaves this false so WHOIS does not
+    /// invent "idle 0, signed on at the epoch".
     show_idle: bool = true,
     is_bot: bool = false,
     is_oper: bool = false,
@@ -138,6 +138,14 @@ pub const WhoisSubject = struct {
     tls_only_pm: bool = false,
     /// RPL_WHOISSPECIAL (320): +V refuses ordinary invites.
     no_invite: bool = false,
+    /// RPL_WHOISSPECIAL (320). Already filtered for this requester, for example
+    /// "is using modes +iw". Null or empty omits the line.
+    modes_line: ?[]const u8 = null,
+    /// RPL_WHOISSPECIAL (320). Oper or self only, for example
+    /// "is in connection class users". Null or empty omits the line.
+    class_line: ?[]const u8 = null,
+    /// RPL_WHOISSPECIAL (320): the connection was accepted as a WebSocket.
+    via_websocket: bool = false,
     channels: []const ChannelMembership = &.{},
 };
 
@@ -258,6 +266,15 @@ pub fn writeWhoisWith(
     if (subject.no_invite) {
         try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is not accepting invites");
     }
+    if (subject.modes_line) |text| {
+        if (text.len != 0) try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, text);
+    }
+    if (subject.class_line) |text| {
+        if (text.len != 0) try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, text);
+    }
+    if (subject.via_websocket) {
+        try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is connected via WebSocket");
+    }
     if (subject.away) |away_message| {
         try writeAwayLine(params, sink, server_name, requester_nick, subject.nick, away_message);
     }
@@ -338,6 +355,8 @@ pub fn validateSubjectWith(comptime params: Params, subject: WhoisSubject) Whois
     if (subject.secure_cipher) |cipher| try validateRenderedTrailingText(cipher, error.InvalidRealname);
     if (subject.actual_host) |host| try validateRenderedHost(host, error.InvalidHost);
     if (subject.geo) |geo_text| try validateRenderedTrailingText(geo_text, error.InvalidRealname);
+    if (subject.modes_line) |text| try validateRenderedTrailingText(text, error.InvalidRealname);
+    if (subject.class_line) |text| try validateRenderedTrailingText(text, error.InvalidRealname);
     for (subject.channels) |membership| {
         try validateChannelMembershipWith(params, membership);
     }

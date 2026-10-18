@@ -3370,11 +3370,25 @@ pub const World = struct {
         return channel.limit;
     }
 
-    /// The IRCX object id assigned to `name` at creation (null if no such channel).
-    /// Unix-seconds creation time assigned to `name` at creation (null if no such
-    /// channel; 0 if created before the server set a clock). IRCX CREATION prop.
+    /// Record a positive wall-clock second and fill only channels whose creation
+    /// time is still unset. A stored non-zero time is a real creation instant
+    /// and is left alone, including across a later clock note.
+    pub fn noteWallClock(self: *World, unix_seconds: i64) void {
+        if (unix_seconds <= 0) return;
+        self.clock_unix = unix_seconds;
+        var it = self.channels.valueIterator();
+        while (it.next()) |channel| {
+            if (channel.created_unix <= 0) {
+                channel.created_unix = unix_seconds;
+            }
+        }
+    }
+
+    /// Unix-seconds creation time assigned to `name` (null if no such channel,
+    /// or if the stored time is still unset). IRCX CREATION and numeric 329.
     pub fn channelCreatedUnix(self: *World, name: []const u8) ?i64 {
         const channel = self.channels.getPtr(name) orelse return null;
+        if (channel.created_unix <= 0) return null;
         return channel.created_unix;
     }
 
@@ -5423,6 +5437,26 @@ test "handoffExactSessionIdentity leaves nick and every membership unchanged on 
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+}
+
+test "unset channel creation is not a unix epoch and a later clock fills only unset rows" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const founder = testClient(7);
+    try std.testing.expect(try world.join("#born", founder));
+    try std.testing.expect(world.channelCreatedUnix("#born") == null);
+    try std.testing.expectEqual(@as(i64, 0), world.channels.getPtr("#born").?.created_unix);
+    world.noteWallClock(0);
+    try std.testing.expect(world.channelCreatedUnix("#born") == null);
+    world.noteWallClock(1_700_000_000);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000), world.channelCreatedUnix("#born"));
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), world.clock_unix);
+    world.channels.getPtr("#born").?.created_unix = 111;
+    world.noteWallClock(1_800_000_000);
+    try std.testing.expectEqual(@as(?i64, 111), world.channelCreatedUnix("#born"));
+    try std.testing.expectEqual(@as(i64, 1_800_000_000), world.clock_unix);
+    try std.testing.expect(try world.join("#later", founder));
+    try std.testing.expectEqual(@as(?i64, 1_800_000_000), world.channelCreatedUnix("#later"));
 }
 
 test "PreparedSessionRestore claim is inert until commit and creates absent channels exactly" {

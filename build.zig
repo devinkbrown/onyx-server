@@ -1575,13 +1575,17 @@ fn manifestVersion() []const u8 {
 }
 
 /// Capture the current git revision at configure time: 12 hex digits,
-/// suffixed "-dirty" when `git status` reports tracked changes. A source
+/// suffixed "-dirty" when tracked files differ from the index. A source
 /// tarball with no checkout still stamps "unknown".
 ///
 /// The build runner often cannot spawn `git` (its PATH search returns
-/// FileNotFound before exec). An absolute `git` is tried first. If that
-/// fails, HEAD is read from `.git` the same way git would: `HEAD`, a loose
-/// ref, then `packed-refs`, including a `gitdir:` file.
+/// FileNotFound before exec). An absolute `git` is tried first. Host `git`
+/// is spawned without `LD_LIBRARY_PATH`: the Zig wrapper injects a private
+/// library directory that breaks git's own `libz`, and a failed status used
+/// to be reported as a clean commit. If spawn still fails, HEAD is read from
+/// `.git` (`HEAD`, a loose ref, then `packed-refs`, including a `gitdir:`
+/// file) and the index is compared to the worktree with `lstat`.
+///
 /// Whether `rel` (relative to the build root, which is the process cwd during
 /// `zig build`) exists as an accessible plain file. Guards the configure-time
 /// `dependOnFileContents` calls so a `.git`-less tarball or a linked-worktree
@@ -1599,26 +1603,54 @@ fn gitCommit(b: *std.Build) []const u8 {
     return "unknown";
 }
 
+fn gitStamp(b: *std.Build, short: []const u8, dirty: bool) []const u8 {
+    return if (dirty) b.fmt("{s}-dirty", .{short}) else b.dupe(short);
+}
+
+/// Host tools such as git must not inherit the Zig wrapper's private
+/// `LD_LIBRARY_PATH`. That directory's `libz` fails to relocate and git exits
+/// 127, which previously made a dirty tree look like a clean commit.
+fn hostToolEnviron(b: *std.Build) *std.process.Environ.Map {
+    const arena = b.graph.arena;
+    const map = arena.create(std.process.Environ.Map) catch @panic("OOM");
+    map.* = std.process.Environ.Map.init(arena);
+    var it = b.graph.environ_map.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "LD_LIBRARY_PATH")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "LD_PRELOAD")) continue;
+        map.put(entry.key_ptr.*, entry.value_ptr.*) catch @panic("OOM");
+    }
+    return map;
+}
+
 fn runGitShortCommit(b: *std.Build, root: []const u8) ?[]const u8 {
     const git_exe = b.findProgram(.{ .names = &.{ "/usr/bin/git", "git" } }) orelse return null;
+    const env = hostToolEnviron(b);
     const hash_raw = switch (b.runFallible(
         &.{ git_exe, "-C", root, "rev-parse", "--short=12", "HEAD" },
-        .{ .stderr_behavior = .ignore },
+        .{ .stderr_behavior = .ignore, .environ_map = env },
     )) {
         .success => |out| out,
         else => return null,
     };
     const short = std.mem.trim(u8, hash_raw, " \r\n\t");
     if (!isGitHex(short)) return null;
-    const status_raw = switch (b.runFallible(
+    switch (b.runFallible(
         &.{ git_exe, "-C", root, "status", "--porcelain", "--untracked-files=no" },
-        .{ .stderr_behavior = .ignore },
+        .{ .stderr_behavior = .ignore, .environ_map = env },
     )) {
-        .success => |out| out,
-        else => "",
-    };
-    const dirty = std.mem.trim(u8, status_raw, " \r\n\t").len != 0;
-    return if (dirty) b.fmt("{s}-dirty", .{short}) else b.dupe(short);
+        .success => |out| {
+            const dirty = std.mem.trim(u8, out, " \r\n\t").len != 0;
+            return gitStamp(b, short, dirty);
+        },
+        else => {
+            // A failed status is not a clean tree. Prefer the index scan, and
+            // otherwise keep the dirty suffix so the banner cannot name a
+            // commit the worktree does not match.
+            const dirty = indexWorktreeDirty(b, root) orelse true;
+            return gitStamp(b, short, dirty);
+        },
+    }
 }
 
 fn readGitShortCommit(b: *std.Build, root: []const u8) ?[]const u8 {
@@ -1631,7 +1663,72 @@ fn readGitShortCommit(b: *std.Build, root: []const u8) ?[]const u8 {
         break :blk packedRef(b, git_dir, ref) orelse return null;
     } else head;
     if (!isGitHex(full) or full.len < 12) return null;
-    return b.dupe(full[0..12]);
+    const dirty = indexWorktreeDirty(b, root) orelse false;
+    return gitStamp(b, full[0..12], dirty);
+}
+
+/// True when a tracked path's `lstat` size or mtime disagrees with the git
+/// index, a tracked path is missing, or an entry is unmerged. Null when the
+/// index is absent, too new, or unreadable. Symlinks are not followed: the
+/// index records the link itself. This matches `git status --porcelain
+/// --untracked-files=no` for ordinary unstaged edits.
+fn indexWorktreeDirty(b: *std.Build, root: []const u8) ?bool {
+    const git_dir = resolveGitDir(b, root) orelse return null;
+    const index_path = b.pathJoin(&.{ git_dir, "index" });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        index_path,
+        b.graph.arena,
+        .limited(8 * 1024 * 1024),
+    ) catch return null;
+    if (bytes.len < 12 or !std.mem.eql(u8, bytes[0..4], "DIRC")) return null;
+    const version = readBe(u32, bytes[4..8]);
+    if (version != 2) return null;
+    const count = readBe(u32, bytes[8..12]);
+    var at: usize = 12;
+    var n: u32 = 0;
+    while (n < count) : (n += 1) {
+        if (at + 62 > bytes.len) return null;
+        const mtime_sec = readBe(u32, bytes[at + 8 ..][0..4]);
+        const mtime_nsec = readBe(u32, bytes[at + 12 ..][0..4]);
+        const size = readBe(u32, bytes[at + 36 ..][0..4]);
+        const flags = readBe(u16, bytes[at + 60 ..][0..2]);
+        const name_len: usize = flags & 0x0fff;
+        const stage: u16 = (flags >> 12) & 0x3;
+        const assume_valid = (flags & 0x8000) != 0;
+        const extended = (flags & 0x4000) != 0;
+        if (extended) return null;
+        const name_at = at + 62;
+        const name_end: usize = if (name_len == 0x0fff) blk: {
+            const nul = std.mem.indexOfScalarPos(u8, bytes, name_at, 0) orelse return null;
+            break :blk nul;
+        } else blk: {
+            if (name_at + name_len >= bytes.len) return null;
+            if (bytes[name_at + name_len] != 0) return null;
+            break :blk name_at + name_len;
+        };
+        const name = bytes[name_at..name_end];
+        const entry_len = (name_end + 1) - at;
+        const pad = (8 - (entry_len % 8)) % 8;
+        at = name_end + 1 + pad;
+        if (at > bytes.len) return null;
+        if (name.len == 0 or assume_valid) continue;
+        if (stage != 0) return true;
+        const path = b.pathJoin(&.{ root, name });
+        const st = std.Io.Dir.cwd().statFile(b.graph.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return null,
+        };
+        const idx_ns: i96 = @as(i96, mtime_sec) * std.time.ns_per_s + mtime_nsec;
+        if (st.size != @as(u64, size) or st.mtime.nanoseconds != idx_ns) return true;
+    }
+    return false;
+}
+
+fn readBe(comptime T: type, bytes: []const u8) T {
+    var value: T = 0;
+    for (bytes[0..@sizeOf(T)]) |byte| value = (value << 8) | @as(T, byte);
+    return value;
 }
 
 fn resolveGitDir(b: *std.Build, root: []const u8) ?[]const u8 {

@@ -24,17 +24,21 @@ substitutes for this table.
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.8.0+3da63872fc9f` | `0.8.0+3da63872fc9f` |
-| Executable SHA-256 | `e05d95a4456c45e70e4f5745b98025e6e9fb511773ad468dd905681c33d82a3f` | same |
+| Running image | `0.8.0+2c3566e7d7f3-dirty` | `0.8.0+2c3566e7d7f3-dirty` |
+| Executable SHA-256 | `b85ae4aa12e9995ba36348750fd551e8f7e391b087e726fb0de20c205342eb6d` | same |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
 
-`SIGUSR2` did not adopt this image on either node: both processes kept the
-previous inode. The roll was a full restart, eshmaki first, then ircx.us.
-The previous image is `onyx-server.prev-0.8.0-unknown` in each run directory,
-SHA-256 `d405c2697db35a8e9a2fd1e5bf10e5af1b422cf0a2baf946351a5ee63baec944`.
-The full `zig build test` suite was not re-run for this image.
+The `-dirty` suffix is the uncommitted WHOIS profile work on top of `2c3566e7d7f3`.
+`SIGUSR2` does not adopt a new inode. This roll was a full restart, eshmaki
+first (`rc-service`), then ircx.us (`systemctl`). The previous image is
+`onyx-server.prev-0.8.0-3da63872fc9f` in each run directory, SHA-256
+`e05d95a4456c45e70e4f5745b98025e6e9fb511773ad468dd905681c33d82a3f`.
+After both nodes were up, a guest on eshmaki.me ran `WHOIS trev` (homed on
+ircx.us) and received 317, 330, 313, 671 with the cipher, and 320 modes.
+Real host, certfp, and rDNS stayed off that non-operator reply. The full
+`zig build test` suite was not re-run for this image.
 
 ## Day-2 ops
 
