@@ -24,21 +24,23 @@ substitutes for this table.
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.8.0+2c3566e7d7f3-dirty` | `0.8.0+2c3566e7d7f3-dirty` |
-| Executable SHA-256 | `b85ae4aa12e9995ba36348750fd551e8f7e391b087e726fb0de20c205342eb6d` | same |
+| Running image | `0.8.0+96c4b512c3d7` | `0.8.0+96c4b512c3d7` |
+| Executable SHA-256 | `836e5b9f52f97e6b8b3280f8c9549c81f72f55d7dae689074a525aaf6b0e4806` | same |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
 
-The `-dirty` suffix is the uncommitted WHOIS profile work on top of `2c3566e7d7f3`.
 `SIGUSR2` does not adopt a new inode. This roll was a full restart, eshmaki
-first (`rc-service`), then ircx.us (`systemctl`). The previous image is
-`onyx-server.prev-0.8.0-3da63872fc9f` in each run directory, SHA-256
-`e05d95a4456c45e70e4f5745b98025e6e9fb511773ad468dd905681c33d82a3f`.
+first (`rc-service`), then ircx.us (`systemctl`). Each node has one
+established port-6900 socket. The previous image is
+`onyx-server.prev-0.8.0-2c3566e7d7f3-dirty` in each run directory, SHA-256
+`b85ae4aa12e9995ba36348750fd551e8f7e391b087e726fb0de20c205342eb6d`.
 After both nodes were up, a guest on eshmaki.me ran `WHOIS trev` (homed on
-ircx.us) and received 317, 330, 313, 671 with the cipher, and 320 modes.
-Real host, certfp, and rDNS stayed off that non-operator reply. The full
-`zig build test` suite was not re-run for this image.
+ircx.us) and received 317, 319, 330, 313, 671 with the cipher, and 320 modes.
+Real host, certfp, and rDNS stayed off that non-operator reply. `MODE #root`
+returned numeric 329 as `1792298240`, the local restart clock. The stored
+creation time had been unset, so the boot clock filled it; the reply is not
+the unix epoch. The full `zig build test` suite was not re-run for this image.
 
 ## Day-2 ops
 
