@@ -744,15 +744,17 @@ const server_version = "onyx-server-" ++ build_info.version;
 /// (operators override the whole thing via `[motd] text`). Conditional blocks
 /// begin right after the prior line so an inactive branch leaves no blank line.
 const default_motd_template =
-    "{greeting}, {nick}! Welcome to {network}.\n" ++
-    "You're on {server} ({version}) - {users} users online right now.{if:weather}\n" ++
-    "Weather - {weather}.{/if}{if:news}\n" ++
-    "Headlines - {news}.{/if}{if:account}\n" ++
-    "Signed in as {account}; your services and saved settings are active.{else}\n" ++
-    "Tip: register your account to reserve your nick and unlock services.{/if}{if:oper}\n" ++
-    "Operator privileges are active on this connection - wield them with care.{/if}{if:secure}{else}\n" ++
-    "Note: this link is not encrypted - reconnect over TLS for privacy.{/if}\n" ++
-    "Onyx Server - a clean-room, Zig-native IRCX/IRCv3 daemon: Undertow CRDT mesh, forward-secret Mooring links.";
+    "{greeting}, {nick}. Welcome to {network}.\n" ++
+    "{if:place}You are connecting from {city|an unknown city}{if:region}, {region}{/if}{if:country} ({country}){/if}.\n{/if}" ++
+    "{users} {plural:users:person:people} online{if:servers>1} across {servers} {plural:servers:server:servers}{/if}, {channels} {plural:channels:channel:channels} open.\n" ++
+    "{if:account}Signed in as {account}.{else}You are not signed in. Register to reserve {nick}.{/if}\n" ++
+    "{if:channels_here=0}You have not joined a channel yet. LIST shows what is open.\n{/if}" ++
+    "{if:away}You are marked away: {away}\n{/if}" ++
+    "{if:!secure}This link is plaintext. Reconnect with TLS.\n{/if}" ++
+    "{if:oper}Operator privileges are active on this connection.\n{/if}" ++
+    "{if:weather}Weather: {weather}\n{/if}" ++
+    "{if:news}{news}\n{/if}" ++
+    "{weekday} {date} {time} — {server} up {uptime|unknown} ({version}).";
 
 /// Reserved pseudo-channel used to gossip per-user PRESENCE across the mesh.
 ///
@@ -11245,6 +11247,9 @@ pub const LinuxServer = struct {
             conn.sendq_cap = s2sSendqCap(configured);
         }
         conn.token = try tokenFromId(id);
+        // Clients and mesh peers: Nagle holds small handshake frames, and a
+        // vanished peer should not wait for the application PING timeout.
+        applyClientKeepalive(conn.fd);
         conn.connected_at_ms = self.nowMs();
         conn.last_activity_ms = conn.connected_at_ms;
         conn.last_message_ms = conn.connected_at_ms;
@@ -11333,11 +11338,6 @@ pub const LinuxServer = struct {
             self.traceLog(.info, .s2s, "s2s peer accepted");
             return;
         }
-
-        // Every accepted client transport uses the same TCP fd. Enable
-        // kernel-level dead-peer detection before a trusted PROXY preamble can
-        // defer TLS/WS/plain IRC setup.
-        applyClientKeepalive(conn.fd);
 
         // Capture the peer host (real + auto-cloak) before client setup. A
         // trusted PROXY preamble may replace this with the original client IP
@@ -12530,10 +12530,13 @@ pub const LinuxServer = struct {
             return;
         }
         if (event.res < 0) {
-            self.noteMeshConnectFailure(event.token, "S2S connect failed");
-            try self.closeConn(event.token, "S2S connect failed");
+            try self.retireFailedMeshConnect(event.token, "S2S connect failed");
             return;
         }
+        // The first completed connect owns the dial. Its sibling is marked
+        // closing before this handler returns, so a success CQE already in
+        // the queue cannot start a second handshake.
+        self.claimMeshDialWinner(event.token);
         if (conn.s2s_secured) |_| {
             // Secured initiator: just listen — the responder sends its prekey
             // preamble first, which drives the handshake on recv.
@@ -25166,16 +25169,20 @@ pub const LinuxServer = struct {
         var modes_buf: [whois_profile.max_modes_len]u8 = undefined;
         const raw_modes = conn.session.umodeString(&modes_buf);
         const modes = if (raw_modes.len <= whois_profile.max_modes_len and profileModesOk(raw_modes)) raw_modes else "";
-        var rdns_buf: [cloak.max_cloak_len]u8 = undefined;
+        var rdns_buf: [whois_profile.max_rdns_len]u8 = undefined;
         var rdns_name: []const u8 = "";
+        var rdns_confirmed = true;
         if (include_rdns) {
             if (self.config.rdns) |res| {
                 if (conn.peer_addr) |paddr| {
-                    if (res.lookup(paddr, &rdns_buf)) |name| {
-                        const token = profileToken(name, whois_profile.max_rdns_len);
+                    if (res.lookupObserved(paddr, &rdns_buf)) |seen| {
+                        const token = profileToken(seen.name, whois_profile.max_rdns_len);
                         if (token.len != 0) {
                             rdns_name = token;
+                            rdns_confirmed = seen.confirmed;
                         }
+                    } else {
+                        res.request(paddr);
                     }
                 }
             }
@@ -25218,6 +25225,7 @@ pub const LinuxServer = struct {
             .hide_chans = conn.session.umodes.contains(.hide_chans),
             .away = away,
             .has_rdns = rdns_name.len != 0,
+            .rdns_unconfirmed = rdns_name.len != 0 and !rdns_confirmed,
             .hide_oper = conn.session.umodes.contains(.hide_oper),
             .websocket = conn.ws != null,
             .signon_unix = signon,
@@ -25372,6 +25380,27 @@ pub const LinuxServer = struct {
         if (link.takeWhoisProfileReady()) self.publishLocalWhoisProfilesTo(conn);
     }
 
+    /// Oper/self WHOIS address line. The reverse name and the literal address
+    /// are both included when both exist, so a client that only prints this
+    /// 320 trailing still shows each one. A PTR that did not forward-confirm
+    /// stays labeled as such. The public cloak is not this string.
+    fn formatWhoisAddressLine(buf: []u8, name: []const u8, confirmed: bool, ip: []const u8, geo: ?[]const u8) ?[]const u8 {
+        const named = name.len != 0 and (ip.len == 0 or !std.mem.eql(u8, name, ip));
+        const note: []const u8 = if (!named or confirmed) "" else " (not forward-confirmed)";
+        const body: []const u8 = if (named and ip.len != 0)
+            (std.fmt.bufPrint(buf, "rDNS {s}{s} ({s})", .{ name, note, ip }) catch return null)
+        else if (named)
+            (std.fmt.bufPrint(buf, "rDNS {s}{s}", .{ name, note }) catch return null)
+        else if (ip.len != 0)
+            (std.fmt.bufPrint(buf, "actual address {s}", .{ip}) catch return null)
+        else
+            return geo;
+        const extra = geo orelse return body;
+        if (extra.len == 0) return body;
+        const appended = std.fmt.bufPrint(buf[body.len..], " · {s}", .{extra}) catch return body;
+        return buf[0 .. body.len + appended.len];
+    }
+
     fn whoisModesLine(self: *LinuxServer, conn: *const ConnState, hide_oper_letters: bool, out: []u8) ?[]const u8 {
         _ = self;
         var raw_buf: [whois_profile.max_modes_len]u8 = undefined;
@@ -25463,38 +25492,40 @@ pub const LinuxServer = struct {
         if (conn.session.isOper() or conn == tconn) {
             if (parseGeoIp(tconn.session.realHost())) |gip| {
                 // City DB → city + region + country; the separate ASN DB → AS + org.
-                var city: ?[]const u8 = null;
-                var region: ?[]const u8 = null;
-                var country: ?[]const u8 = null;
-                if (self.ensureGeoip()) |db| {
-                    if (db.lookupInfo(gip) catch null) |gi| country = gi.country_iso;
-                    city = db.lookupName(gip, "city", "en") catch null;
-                    region = db.lookupString(gip, &.{ "subdivisions", "0", "names", "en" }) catch null;
-                }
+                const place = self.lookupGeoPlace(gip);
                 const asn_info = self.lookupGeoAsn(gip);
-                geo_text = buildGeoWhois(&geo_buf, city, region, country, asn_info.asn, asn_info.asorg);
+                geo_text = buildGeoWhois(&geo_buf, place.city, place.region, place.country, asn_info.asn, asn_info.asorg);
             }
         }
 
-        // "make rDNS live" — fold the forward-confirmed reverse-DNS name (from the
-        // resolver cache; opers/self only) into the free-form RPL_WHOISSPECIAL (320)
-        // line. 320 is a trailing param so the space-bearing text is safe, and the
-        // name NEVER feeds the privacy-preserving public cloak.
-        var special_buf: [560]u8 = undefined;
-        var rdns_buf: [cloak.max_cloak_len]u8 = undefined;
-        var special: ?[]const u8 = geo_text;
-        if (conn.session.isOper() or conn == tconn) {
+        // Oper/self only. 320 carries the reverse name and the literal address
+        // together. The name never feeds the public cloak. A missing cache entry
+        // is queued; this reply does not wait on DNS.
+        var special_buf: [640]u8 = undefined;
+        var rdns_buf: [whois_profile.max_rdns_len]u8 = undefined;
+        var rdns_name: []const u8 = "";
+        var rdns_confirmed = true;
+        const show_addr = conn.session.isOper() or conn == tconn;
+        if (show_addr) {
             if (self.config.rdns) |res| {
                 if (tconn.peer_addr) |paddr| {
-                    if (res.lookup(paddr, &rdns_buf)) |name| {
-                        special = if (geo_text) |g|
-                            (std.fmt.bufPrint(&special_buf, "rDNS {s} · {s}", .{ name, g }) catch geo_text)
-                        else
-                            (std.fmt.bufPrint(&special_buf, "rDNS {s}", .{name}) catch null);
+                    if (res.lookupObserved(paddr, &rdns_buf)) |seen| {
+                        const token = profileToken(seen.name, whois_profile.max_rdns_len);
+                        if (token.len != 0) {
+                            rdns_name = token;
+                            rdns_confirmed = seen.confirmed;
+                        }
+                    } else {
+                        res.request(paddr);
                     }
                 }
             }
         }
+        const ip_text: []const u8 = if (show_addr and tconn.session.realHost().len > 0) tconn.session.realHost() else "";
+        const special: ?[]const u8 = if (show_addr)
+            formatWhoisAddressLine(&special_buf, rdns_name, rdns_confirmed, ip_text, geo_text)
+        else
+            geo_text;
 
         var modes_line_buf: [96]u8 = undefined;
         var class_line_buf: [128]u8 = undefined;
@@ -25553,11 +25584,10 @@ pub const LinuxServer = struct {
             // (local connections only; remote users carry no local TLS state).
             .is_secure = tconn.is_tls,
             .secure_cipher = tconn.session.tls_cipher,
-            // RPL_WHOISACTUALLY (338): real host/IP, shown only to opers or self.
-            .actual_host = if (conn.session.isOper() or conn == tconn) blk: {
-                const rh = tconn.session.realHost();
-                break :blk if (rh.len > 0) rh else null;
-            } else null,
+            // RPL_WHOISACTUALLY (338): reverse name, then the literal address
+            // when they differ. Oper or self only.
+            .actual_host = if (!show_addr) null else if (rdns_name.len != 0) rdns_name else if (ip_text.len > 0) ip_text else null,
+            .actual_ip = if (show_addr and rdns_name.len != 0 and ip_text.len != 0 and !std.mem.eql(u8, rdns_name, ip_text)) ip_text else null,
             // +p hide-chans: suppress the channel list unless the requester is the
             // user themselves or an oper.
             .channels = blk: {
@@ -25700,30 +25730,27 @@ pub const LinuxServer = struct {
         var geo_text: ?[]const u8 = null;
         if (requester_is_oper and remote.real_host.len != 0) {
             if (parseGeoIp(remote.real_host)) |gip| {
-                var city: ?[]const u8 = null;
-                var region: ?[]const u8 = null;
-                var country: ?[]const u8 = null;
-                if (self.ensureGeoip()) |db| {
-                    if (db.lookupInfo(gip) catch null) |gi| country = gi.country_iso;
-                    city = db.lookupName(gip, "city", "en") catch null;
-                    region = db.lookupString(gip, &.{ "subdivisions", "0", "names", "en" }) catch null;
-                }
+                const place = self.lookupGeoPlace(gip);
                 const asn_info = self.lookupGeoAsn(gip);
-                geo_text = buildGeoWhois(&geo_buf, city, region, country, asn_info.asn, asn_info.asorg);
+                geo_text = buildGeoWhois(&geo_buf, place.city, place.region, place.country, asn_info.asn, asn_info.asorg);
             }
         }
-        var special_buf: [560]u8 = undefined;
-        var special = geo_text;
+        var special_buf: [640]u8 = undefined;
+        var rdns_name: []const u8 = "";
+        var rdns_confirmed = true;
         if (requester_is_oper) {
             if (profile) |p| {
                 if ((p.flags & whois_profile.flag_has_rdns) != 0 and p.rdns.len != 0) {
-                    special = if (geo_text) |g|
-                        (std.fmt.bufPrint(&special_buf, "rDNS {s} · {s}", .{ p.rdns, g }) catch geo_text)
-                    else
-                        (std.fmt.bufPrint(&special_buf, "rDNS {s}", .{p.rdns}) catch null);
+                    rdns_name = p.rdns;
+                    rdns_confirmed = (p.flags & whois_profile.flag_rdns_unconfirmed) == 0;
                 }
             }
         }
+        const ip_text: []const u8 = if (requester_is_oper and remote.real_host.len != 0) remote.real_host else "";
+        const special: ?[]const u8 = if (requester_is_oper)
+            formatWhoisAddressLine(&special_buf, rdns_name, rdns_confirmed, ip_text, geo_text)
+        else
+            null;
         var modes_text_buf: [48]u8 = undefined;
         var modes_line_buf: [96]u8 = undefined;
         var class_line_buf: [128]u8 = undefined;
@@ -25804,8 +25831,10 @@ pub const LinuxServer = struct {
             .class_line = class_line,
             .via_websocket = via_websocket,
             .channels = memberships[0..nchan],
-            // Oper-only deanonymized identity (see the geo block above).
-            .actual_host = if (requester_is_oper and remote.real_host.len != 0) remote.real_host else null,
+            // Oper-only. The reverse name is the host parameter; the address
+            // is the following parameter when it is a different string.
+            .actual_host = if (!requester_is_oper) null else if (rdns_name.len != 0) rdns_name else if (ip_text.len > 0) ip_text else null,
+            .actual_ip = if (requester_is_oper and rdns_name.len != 0 and ip_text.len != 0 and !std.mem.eql(u8, rdns_name, ip_text)) ip_text else null,
             .certfp = if (requester_is_oper and remote.certfp.len != 0) remote.certfp else null,
             .geo = special,
         };
@@ -37384,8 +37413,22 @@ pub const LinuxServer = struct {
         // table point at this authenticated survivor; rollback never sees it.
         if (conn.s2s_dial_target_known and link.peerNodeKey() != null) {
             for (self.mesh_dials) |*dial| {
-                if (dial.addr == null) dial.addr = sockaddrForHost(dial.host, dial.port, 2_000) catch continue;
-                if (sameSockaddrIn(conn.s2s_connect_addr, dial.addr.?)) dial.token = conn.token;
+                if (dial.addr == null) {
+                    const plan = dialPlanForHost(dial.host, dial.port, 2_000) catch continue;
+                    dial.addr = plan.primary;
+                    dial.alt_addr = plan.alt;
+                }
+                const on_primary = sameSockaddrIn(conn.s2s_connect_addr, dial.addr.?);
+                const on_alt = if (dial.alt_addr) |alt| sameSockaddrIn(conn.s2s_connect_addr, alt) else false;
+                if (!on_primary and !on_alt) continue;
+                // An inherited IPv4 survivor must count as the configured peer
+                // even when the fresh plan prefers IPv6. Stick to the family
+                // that is already up so boot does not open a second link.
+                dial.addr = conn.s2s_connect_addr;
+                dial.alt_addr = null;
+                dial.alt_token = null;
+                dial.alt_after_ms = -1;
+                dial.token = conn.token;
             }
         }
         const rname = link.remoteName();
@@ -37406,8 +37449,7 @@ pub const LinuxServer = struct {
     /// successor's mesh boot pass re-dials every configured peer itself.
     fn dialManaged(self: *LinuxServer, token: RingFdToken) bool {
         for (self.mesh_dials) |dial| {
-            const t = dial.token orelse continue;
-            if (t.slot == token.slot and t.gen == token.gen) return true;
+            if (meshDialTracks(dial, token)) return true;
         }
         return false;
     }
@@ -37511,6 +37553,7 @@ pub const LinuxServer = struct {
         else
             try socketTcp6();
         errdefer closeFd(fd);
+        applyClientKeepalive(fd);
         const id = try self.rx().clients.alloc(ConnState.init(fd));
         errdefer _ = self.rx().clients.free(id);
         const peer = self.rx().clients.get(id).?;
@@ -37665,8 +37708,7 @@ pub const LinuxServer = struct {
 
     fn meshDialForToken(self: *LinuxServer, token: RingFdToken) ?*MeshDial {
         for (self.mesh_dials) |*dial| {
-            const tok = dial.token orelse continue;
-            if (tok.slot == token.slot and tok.gen == token.gen) return dial;
+            if (meshDialTracks(dial.*, token)) return dial;
         }
         return null;
     }
@@ -37675,8 +37717,12 @@ pub const LinuxServer = struct {
         if (self.meshDialForToken(conn.token)) |dial| return dial;
         if (!conn.s2s_dial_target_known) return null;
         for (self.mesh_dials) |*dial| {
-            const addr = dial.addr orelse continue;
-            if (sameSockaddrIn(conn.s2s_connect_addr, addr)) return dial;
+            if (dial.addr) |addr| {
+                if (sameSockaddrIn(conn.s2s_connect_addr, addr)) return dial;
+            }
+            if (dial.alt_addr) |addr| {
+                if (sameSockaddrIn(conn.s2s_connect_addr, addr)) return dial;
+            }
         }
         return null;
     }
@@ -37684,6 +37730,131 @@ pub const LinuxServer = struct {
     fn noteMeshConnectFailure(self: *LinuxServer, token: RingFdToken, reason: []const u8) void {
         const dial = self.meshDialForToken(token) orelse return;
         self.noteMeshDialFailure(dial, reason);
+    }
+
+    fn liveDialConn(self: *LinuxServer, token: RingFdToken) ?*ConnState {
+        const peer = self.rx().clients.get(idFromToken(token)) orelse return null;
+        if (peer.token.slot != token.slot or peer.token.gen != token.gen) return null;
+        return peer;
+    }
+
+    fn clearMeshDialToken(dial: *MeshDial, token: RingFdToken) void {
+        if (dial.token) |tok| {
+            if (tok.slot == token.slot and tok.gen == token.gen) dial.token = null;
+        }
+        if (dial.alt_token) |tok| {
+            if (tok.slot == token.slot and tok.gen == token.gen) dial.alt_token = null;
+        }
+    }
+
+    fn meshDialOtherToken(dial: *const MeshDial, token: RingFdToken) ?RingFdToken {
+        if (dial.token) |tok| if (tok.slot == token.slot and tok.gen == token.gen) return dial.alt_token;
+        if (dial.alt_token) |tok| if (tok.slot == token.slot and tok.gen == token.gen) return dial.token;
+        return null;
+    }
+
+    /// Start the stored alternate without another breaker probe. The primary
+    /// attempt already consumed the probe.
+    fn submitAltDial(self: *LinuxServer, dial: *MeshDial) MeshDialAttempt {
+        const alt = dial.alt_addr orelse return .skipped;
+        if (self.initiateS2sConnectToAddr(alt)) |tok| {
+            dial.token = tok;
+            dial.alt_token = null;
+            dial.alt_after_ms = -1;
+            srvLog("onyx-server: mesh auto-connect -> {s} (alternate dial initiated)\n", .{dial.spec});
+            return .attempted;
+        } else |err| switch (err) {
+            error.SubmissionQueueFull => return .sq_full,
+            else => {
+                self.noteMeshDialFailure(dial, "S2S connect failed");
+                dial.alt_after_ms = -1;
+                srvLog("onyx-server: mesh auto-connect -> {s} alternate failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                return .attempted;
+            },
+        }
+    }
+
+    fn altRetryDue(dial: *const MeshDial) bool {
+        return dial.token == null and dial.alt_token == null and dial.alt_addr != null and dial.alt_after_ms == 0 and dial.last_attempt_ms != 0;
+    }
+
+    fn maybeStartAltDial(self: *LinuxServer, dial: *MeshDial, now: i64) void {
+        if (dial.alt_after_ms == -1 or dial.alt_token != null) return;
+        const alt = dial.alt_addr orelse return;
+        if (now < dial.alt_after_ms) return;
+        const tok = dial.token orelse return;
+        const peer = self.liveDialConn(tok) orelse return;
+        if (peer.closing or !peer.connect_armed) return;
+        if (self.initiateS2sConnectToAddr(alt)) |alt_tok| {
+            dial.alt_token = alt_tok;
+            srvLog("onyx-server: mesh auto-connect -> {s} (alternate dial initiated)\n", .{dial.spec});
+        } else |_| {}
+    }
+
+    fn claimMeshDialWinner(self: *LinuxServer, token: RingFdToken) void {
+        const dial = self.meshDialForToken(token) orelse return;
+        const conn = self.liveDialConn(token) orelse return;
+        if (meshDialOtherToken(dial, token)) |sib| {
+            clearMeshDialToken(dial, sib);
+            if (self.liveDialConn(sib)) |sib_conn| {
+                if (!sib_conn.closing) self.closeConn(sib, "S2S alternate dial lost") catch {};
+            }
+        }
+        dial.addr = conn.s2s_connect_addr;
+        dial.token = token;
+        dial.alt_addr = null;
+        dial.alt_token = null;
+        dial.alt_after_ms = -1;
+    }
+
+    /// A connect failure is not a dial failure while the other family is in
+    /// flight or can be started now. Both addresses stay cached when neither
+    /// connects, so the next redial races again.
+    fn retireFailedMeshConnect(self: *LinuxServer, token: RingFdToken, reason: []const u8) !void {
+        const dial = self.meshDialForToken(token) orelse {
+            try self.closeConn(token, reason);
+            return;
+        };
+        const other = meshDialOtherToken(dial, token);
+        var other_live = false;
+        if (other) |sib| {
+            if (self.liveDialConn(sib)) |peer| other_live = !peer.closing;
+        }
+        clearMeshDialToken(dial, token);
+        if (other_live) {
+            if (dial.token == null) {
+                dial.token = other;
+                if (other) |sib| {
+                    if (dial.alt_token) |alt_tok| {
+                        if (alt_tok.slot == sib.slot and alt_tok.gen == sib.gen) dial.alt_token = null;
+                    }
+                }
+            }
+            dial.alt_after_ms = -1;
+            try self.closeConn(token, reason);
+            return;
+        }
+        if (dial.alt_addr) |alt| {
+            if (dial.alt_after_ms != -1 and dial.alt_token == null and dial.token == null) {
+                if (self.initiateS2sConnectToAddr(alt)) |tok| {
+                    dial.token = tok;
+                    dial.alt_after_ms = -1;
+                    srvLog("onyx-server: mesh auto-connect -> {s} (alternate dial initiated)\n", .{dial.spec});
+                    try self.closeConn(token, reason);
+                    return;
+                } else |err| switch (err) {
+                    error.SubmissionQueueFull => {
+                        dial.alt_after_ms = 0;
+                        try self.closeConn(token, reason);
+                        return;
+                    },
+                    else => {},
+                }
+            }
+        }
+        self.noteMeshDialFailure(dial, reason);
+        dial.alt_after_ms = -1;
+        try self.closeConn(token, reason);
     }
 
     fn noteMeshDialSuccessByName(self: *LinuxServer, name: []const u8) void {
@@ -37745,30 +37916,49 @@ pub const LinuxServer = struct {
 
     fn tryMeshAutoDial(self: *LinuxServer, dial: *MeshDial, force: bool, now: i64) MeshDialAttempt {
         if (dial.token) |tok| {
-            if (self.rx().clients.get(idFromToken(tok))) |peer| {
+            if (self.liveDialConn(tok)) |peer| {
                 // Same slot AND same generation: our dial still owns it.
-                if (peer.token.slot == tok.slot and peer.token.gen == tok.gen and !peer.closing) return .skipped;
+                if (!peer.closing) {
+                    self.maybeStartAltDial(dial, now);
+                    return .skipped;
+                }
             }
             dial.token = null; // dial's connection is gone — eligible again
         }
+        if (dial.alt_token) |tok| {
+            if (self.liveDialConn(tok)) |peer| {
+                if (!peer.closing) {
+                    dial.token = tok;
+                    dial.alt_token = null;
+                    dial.alt_after_ms = -1;
+                    return .skipped;
+                }
+            }
+            dial.alt_token = null;
+        }
+        // A primary that could not submit its alternate retries that family
+        // before the flat redial interval and without a second breaker probe.
+        if (altRetryDue(dial)) return self.submitAltDial(dial);
         if (meshRedialWaiting(dial, now, force)) return .skipped;
         // A fresh successor's dial table has no cached resolution yet, while an
-        // inherited outbound link does retain its exact dial target. Resolve the
-        // configured target before looking for that survivor; otherwise the boot
-        // pass cannot match an IP-literal/DNS-alias config and opens a duplicate
-        // connection beside the zero-drop inherited link.
+        // inherited outbound link does retain its exact dial target. Resolve
+        // both families before looking for that survivor; otherwise a v6-first
+        // plan misses an inherited IPv4 link and opens a duplicate.
         if (dial.addr == null) {
-            dial.addr = sockaddrForHost(dial.host, dial.port, 2_000) catch |err| {
+            const plan = dialPlanForHost(dial.host, dial.port, 2_000) catch |err| {
                 dial.last_attempt_ms = now;
                 srvLog("onyx-server: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
                 return .attempted;
             };
+            dial.addr = plan.primary;
+            dial.alt_addr = plan.alt;
         }
         // Already linked to this peer via the surviving (possibly inbound)
         // link? Don't dial a duplicate — that just loops collapse→redial.
         // A live link is not by itself a successful handshake or anti-entropy
         // round, so it does not close the breaker.
         if (self.meshPeerLinkedByDial(dial)) {
+            self.stickDialToLinkedPeer(dial);
             dial.token = null;
             return .skipped;
         }
@@ -37784,6 +37974,8 @@ pub const LinuxServer = struct {
         const addr = dial.addr.?;
         if (self.initiateS2sConnectToAddr(addr)) |tok| {
             dial.token = tok;
+            dial.alt_token = null;
+            dial.alt_after_ms = if (dial.alt_addr != null) saturatingAddI64(now, happy_eyeballs_delay_ms) else -1;
             srvLog("onyx-server: mesh auto-connect -> {s} (dial initiated)\n", .{dial.spec});
             return .attempted;
         } else |err| switch (err) {
@@ -37793,8 +37985,9 @@ pub const LinuxServer = struct {
                 return .sq_full;
             },
             else => {
-                releaseMooringProbe(dial, before);
                 srvLog("onyx-server: mesh auto-connect -> {s} failed ({s}); retrying\n", .{ dial.spec, @errorName(err) });
+                if (dial.alt_addr != null) return self.submitAltDial(dial);
+                releaseMooringProbe(dial, before);
                 return .attempted;
             },
         }
@@ -40140,11 +40333,56 @@ pub const LinuxServer = struct {
 
     fn lookupGeoAsn(self: *LinuxServer, ip: geoip.Ip) GeoAsnLookup {
         const db = self.ensureGeoipAsn() orelse return .{};
-        const info = (db.lookupInfo(ip) catch null) orelse return .{};
-        return .{
-            .asn = info.asn,
-            .asorg = info.asn_org orelse info.org orelse info.isp,
-        };
+        // A full-record decode also reads city-only fields. Those are absent in
+        // an ASN database and must not discard the AS number, so a failed or
+        // empty rich decode falls back to the two ASN keys directly.
+        if (db.lookupInfo(ip) catch null) |info| {
+            if (info.asn != null or info.asn_org != null or info.org != null or info.isp != null) {
+                return .{
+                    .asn = info.asn,
+                    .asorg = info.asn_org orelse info.org orelse info.isp,
+                };
+            }
+        }
+        const asn_wide = db.lookupUnsigned(ip, &.{"autonomous_system_number"}) catch null;
+        const org = db.lookupString(ip, &.{"autonomous_system_organization"}) catch null;
+        var asn: ?u32 = null;
+        if (asn_wide) |n| {
+            if (n <= std.math.maxInt(u32)) {
+                asn = @intCast(n);
+            }
+        }
+        if (asn == null and org == null) return .{};
+        return .{ .asn = asn, .asorg = org };
+    }
+
+    const GeoPlace = struct {
+        city: ?[]const u8 = null,
+        region: ?[]const u8 = null,
+        country: ?[]const u8 = null,
+        info: ?geoip.GeoInfo = null,
+    };
+
+    /// City, region, and country for an IP. Country prefers the English name
+    /// and falls back to the ISO code. The rich `GeoInfo` is best-effort: a
+    /// decode error there does not drop names the narrow lookups already found.
+    /// Every slice borrows the loaded city database.
+    fn lookupGeoPlace(self: *LinuxServer, ip: geoip.Ip) GeoPlace {
+        const db = self.ensureGeoip() orelse return .{};
+        var place = GeoPlace{};
+        place.city = db.lookupName(ip, "city", "en") catch null;
+        place.region = db.lookupString(ip, &.{ "subdivisions", "0", "names", "en" }) catch null;
+        place.country = db.lookupName(ip, "country", "en") catch null;
+        if (place.country == null) {
+            place.country = db.lookupString(ip, &.{ "country", "iso_code" }) catch null;
+        }
+        place.info = db.lookupInfo(ip) catch null;
+        if (place.country == null) {
+            if (place.info) |gi| {
+                place.country = gi.country_iso;
+            }
+        }
+        return place;
     }
 
     /// On registration, record the client's `location` (city or country) and
@@ -40406,21 +40644,55 @@ pub const LinuxServer = struct {
     /// no database is configured or the address yields no geo data. Used to
     /// annotate oper reports (CLONES) with country/ASN context.
     fn geoTag(self: *LinuxServer, ip_text: []const u8, buf: []u8) []const u8 {
-        const db = self.ensureGeoip() orelse return "";
         const ip = parseGeoIp(ip_text) orelse return "";
-        const gi = (db.lookupInfo(ip) catch null) orelse return "";
-        const cc = gi.country_iso orelse "??";
-        if (gi.asn) |asn| {
-            const org = gi.asn_org orelse gi.org orelse "";
+        var cc: []const u8 = "";
+        var asn: ?u32 = null;
+        var org: []const u8 = "";
+        if (self.ensureGeoip()) |db| {
+            if (db.lookupString(ip, &.{ "country", "iso_code" }) catch null) |iso| {
+                cc = iso;
+            }
+            if (db.lookupInfo(ip) catch null) |gi| {
+                if (cc.len == 0) {
+                    if (gi.country_iso) |iso| {
+                        cc = iso;
+                    }
+                }
+                asn = gi.asn;
+                if (gi.asn_org orelse gi.org) |name| {
+                    org = name;
+                }
+            }
+        }
+        // DB-IP ships city and ASN as two files. The city record has no AS
+        // number; the configured ASN database does.
+        if (asn == null or org.len == 0) {
+            const extra = self.lookupGeoAsn(ip);
+            if (asn == null) {
+                asn = extra.asn;
+            }
+            if (org.len == 0) {
+                if (extra.asorg) |name| {
+                    org = name;
+                }
+            }
+        }
+        if (cc.len == 0 and asn == null) return "";
+        if (asn) |n| {
             return std.fmt.bufPrint(buf, " [{s} AS{d}{s}{s}]", .{
-                cc, asn, if (org.len > 0) " " else "", org,
+                if (cc.len != 0) cc else "??",
+                n,
+                if (org.len > 0) " " else "",
+                org,
             }) catch "";
         }
         return std.fmt.bufPrint(buf, " [{s}]", .{cc}) catch "";
     }
 
-    /// GEOIP <ip> — oper lookup of the configured MaxMind database. Reports the
-    /// rich GeoInfo for the address as NOTICE lines.
+    /// GEOIP <ip> — oper lookup of the configured city and ASN databases.
+    /// Reports place, coordinates, and AS number as NOTICE lines. The AS
+    /// number comes from the city record when that database carries it, and
+    /// otherwise from `[geoip].asn_database`.
     pub fn handleGeoip(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
         if (!self.requirePriv(conn, .oper_spy)) return;
         if (parsed.param_count < 1 or parsed.paramSlice()[0].len == 0) {
@@ -40432,63 +40704,132 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "GEOIP: invalid IP address");
             return;
         };
-        const db = self.ensureGeoip() orelse {
+        const want_city = self.config.geoip_db_path.len != 0;
+        const want_asn = self.config.geoip_asn_db_path.len != 0;
+        if (!want_city and !want_asn) {
             try self.noticeTo(conn, "GEOIP: no database configured");
             return;
-        };
-        const info = (db.lookupInfo(ip) catch {
-            try self.noticeTo(conn, "GEOIP: database read error");
-            return;
-        }) orelse {
+        }
+
+        const place = self.lookupGeoPlace(ip);
+        const asn_info = self.lookupGeoAsn(ip);
+        const gi = place.info;
+        const asn: ?u32 = if (gi) |g| (g.asn orelse asn_info.asn) else asn_info.asn;
+        const asorg: ?[]const u8 = if (gi) |g| (g.asn_org orelse g.org orelse asn_info.asorg) else asn_info.asorg;
+        const has_place = place.city != null or place.region != null or place.country != null or gi != null;
+        if (!has_place and asn == null and asorg == null) {
+            const city_failed = want_city and self.geoip_db == null;
+            const asn_failed = want_asn and self.geoip_asn_db == null;
+            if (city_failed or asn_failed) {
+                try self.noticeTo(conn, "GEOIP: database read error");
+                return;
+            }
             var nb: [128]u8 = undefined;
             const note = std.fmt.bufPrint(&nb, "GEOIP {s}: no data", .{target}) catch return;
             try self.noticeTo(conn, note);
             return;
-        };
+        }
 
         var b: [default_reply_bytes]u8 = undefined;
-        const head = std.fmt.bufPrint(&b, "GEOIP {s}: country={s} continent={s} /{d}", .{
-            target,
-            info.country_iso orelse "?",
-            info.continent_code orelse "?",
-            info.prefix_len,
-        }) catch return;
-        try self.noticeTo(conn, head);
+        if (gi) |g| {
+            const head = std.fmt.bufPrint(&b, "GEOIP {s}: country={s} continent={s} /{d}", .{
+                target,
+                g.country_iso orelse "?",
+                g.continent_code orelse "?",
+                g.prefix_len,
+            }) catch return;
+            try self.noticeTo(conn, head);
+        } else if (place.city != null or place.region != null or place.country != null) {
+            // A rich decode can fail after the narrow name lookups succeeded.
+            // Keep those names; do not tell the operator the record is missing.
+            const head = std.fmt.bufPrint(&b, "GEOIP {s}: country={s}", .{
+                target,
+                place.country orelse "?",
+            }) catch return;
+            try self.noticeTo(conn, head);
+        } else {
+            const head = std.fmt.bufPrint(&b, "GEOIP {s}: no city record", .{target}) catch return;
+            try self.noticeTo(conn, head);
+        }
 
-        if (info.latitude != null or info.time_zone != null or info.postal_code != null) {
-            const loc = std.fmt.bufPrint(&b, "  loc: {d:.4},{d:.4} +/-{d}km tz={s} postal={s}", .{
-                info.latitude orelse 0,
-                info.longitude orelse 0,
-                info.accuracy_radius orelse 0,
-                info.time_zone orelse "?",
-                info.postal_code orelse "?",
-            }) catch return;
-            try self.noticeTo(conn, loc);
+        if (place.city != null or place.region != null or place.country != null) {
+            var place_buf: [192]u8 = undefined;
+            var w: usize = 0;
+            var sep = false;
+            for ([_]?[]const u8{ place.city, place.region, place.country }) |part| {
+                const text = part orelse continue;
+                if (text.len == 0) continue;
+                if (sep and w + 2 <= place_buf.len) {
+                    place_buf[w] = ',';
+                    place_buf[w + 1] = ' ';
+                    w += 2;
+                }
+                const n = @min(text.len, place_buf.len - w);
+                @memcpy(place_buf[w..][0..n], text[0..n]);
+                w += n;
+                sep = true;
+            }
+            if (w != 0) {
+                const line = std.fmt.bufPrint(&b, "  place: {s}", .{place_buf[0..w]}) catch return;
+                try self.noticeTo(conn, line);
+            }
         }
-        if (info.asn != null or info.isp != null or info.org != null or info.connection_type != null) {
-            const net = std.fmt.bufPrint(&b, "  net: AS{d} {s} isp={s} conn={s}", .{
-                info.asn orelse 0,
-                info.asn_org orelse info.org orelse "?",
-                info.isp orelse "?",
-                info.connection_type orelse "?",
-            }) catch return;
+
+        if (gi) |g| {
+            if (g.latitude != null or g.longitude != null or g.accuracy_radius != null or g.time_zone != null or g.postal_code != null) {
+                var w: usize = 0;
+                const prefix = "  loc:";
+                @memcpy(b[0..prefix.len], prefix);
+                w = prefix.len;
+                if (g.latitude != null and g.longitude != null) {
+                    const seg = std.fmt.bufPrint(b[w..], " {d:.4},{d:.4}", .{ g.latitude.?, g.longitude.? }) catch return;
+                    w += seg.len;
+                }
+                if (g.accuracy_radius) |km| {
+                    const seg = std.fmt.bufPrint(b[w..], " +/-{d}km", .{km}) catch return;
+                    w += seg.len;
+                }
+                if (g.time_zone) |tz| {
+                    const seg = std.fmt.bufPrint(b[w..], " tz={s}", .{tz}) catch return;
+                    w += seg.len;
+                }
+                if (g.postal_code) |postal| {
+                    const seg = std.fmt.bufPrint(b[w..], " postal={s}", .{postal}) catch return;
+                    w += seg.len;
+                }
+                try self.noticeTo(conn, b[0..w]);
+            }
+            if (g.isp != null or g.connection_type != null) {
+                const net = std.fmt.bufPrint(&b, "  isp: {s} conn={s}", .{
+                    g.isp orelse "-",
+                    g.connection_type orelse "-",
+                }) catch return;
+                try self.noticeTo(conn, net);
+            }
+            const t = g.traits;
+            if (t.is_anonymous or t.is_anonymous_proxy or t.is_anonymous_vpn or t.is_hosting_provider or
+                t.is_public_proxy or t.is_residential_proxy or t.is_satellite_provider or t.is_tor_exit_node)
+            {
+                const flags = std.fmt.bufPrint(&b, "  flags:{s}{s}{s}{s}{s}{s}{s}{s}", .{
+                    if (t.is_anonymous) " anon" else "",
+                    if (t.is_anonymous_proxy) " anon-proxy" else "",
+                    if (t.is_anonymous_vpn) " vpn" else "",
+                    if (t.is_hosting_provider) " hosting" else "",
+                    if (t.is_public_proxy) " public-proxy" else "",
+                    if (t.is_residential_proxy) " residential-proxy" else "",
+                    if (t.is_satellite_provider) " satellite" else "",
+                    if (t.is_tor_exit_node) " tor" else "",
+                }) catch return;
+                try self.noticeTo(conn, flags);
+            }
+        }
+        if (asn) |n| {
+            const org = asorg orelse "";
+            const net = if (org.len != 0)
+                std.fmt.bufPrint(&b, "  net: AS{d} {s}", .{ n, org }) catch return
+            else
+                std.fmt.bufPrint(&b, "  net: AS{d}", .{n}) catch return;
             try self.noticeTo(conn, net);
-        }
-        const t = info.traits;
-        if (t.is_anonymous or t.is_anonymous_proxy or t.is_anonymous_vpn or t.is_hosting_provider or
-            t.is_public_proxy or t.is_residential_proxy or t.is_satellite_provider or t.is_tor_exit_node)
-        {
-            const flags = std.fmt.bufPrint(&b, "  flags:{s}{s}{s}{s}{s}{s}{s}{s}", .{
-                if (t.is_anonymous) " anon" else "",
-                if (t.is_anonymous_proxy) " anon-proxy" else "",
-                if (t.is_anonymous_vpn) " vpn" else "",
-                if (t.is_hosting_provider) " hosting" else "",
-                if (t.is_public_proxy) " public-proxy" else "",
-                if (t.is_residential_proxy) " residential-proxy" else "",
-                if (t.is_satellite_provider) " satellite" else "",
-                if (t.is_tor_exit_node) " tor" else "",
-            }) catch return;
-            try self.noticeTo(conn, flags);
         }
     }
 
@@ -43649,6 +43990,20 @@ pub const LinuxServer = struct {
         return total;
     }
 
+    /// Operators registered on this node, across every reactor. Mesh peers are
+    /// not included; a remote operator is counted by the node they are on.
+    fn localOperCount(self: *LinuxServer) u64 {
+        var total: u64 = 0;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                if (slot.value.s2s != null or slot.value.s2s_secured != null) continue;
+                if (slot.value.session.registered() and slot.value.session.isOper()) total += 1;
+            }
+        }
+        return total;
+    }
+
     pub fn handleLusers(self: *LinuxServer, conn: *ConnState) !void {
         // Classify connections: registered local users vs unknown (still in
         // registration) vs established S2S peers (counted as servers, never
@@ -43819,7 +44174,6 @@ pub const LinuxServer = struct {
         else
             default_motd_template;
 
-        var time_buf: [64]u8 = undefined;
         const now_ms = platform.realtimeMillis();
         const epoch_s: u64 = @intCast(@max(@as(i64, 0), @divFloor(now_ms, 1000)));
 
@@ -43836,25 +44190,69 @@ pub const LinuxServer = struct {
             news_line = self.motdNewsLine(conn, io, &news_buf);
         }
 
+        var date_buf: [16]u8 = undefined;
+        var clock_buf: [16]u8 = undefined;
+        var uptime_buf: [32]u8 = undefined;
+        var online_buf: [32]u8 = undefined;
+        const now_unix = @as(i64, @intCast(epoch_s));
+        const uptime_s: u64 = @intCast(@max(@as(i64, 0), now_unix - self.boot_unix));
+        const now_mono = self.nowMs();
+        const online_s: u64 = if (conn.connected_at_ms > 0 and now_mono >= conn.connected_at_ms)
+            @intCast(@divFloor(now_mono - conn.connected_at_ms, 1000))
+        else
+            0;
+        const channels_here: u64 = if (self.world.findNick(conn.session.displayName())) |wid|
+            @intCast(self.world.channelCountOf(wid))
+        else
+            0;
+
+        // Place is shown only to this connection. The address itself is not.
+        var city: []const u8 = "";
+        var region: []const u8 = "";
+        var country: []const u8 = "";
+        var longitude: ?f64 = null;
+        if (parseGeoIp(conn.session.realHost())) |ip| {
+            const place = self.lookupGeoPlace(ip);
+            city = place.city orelse "";
+            region = place.region orelse "";
+            country = place.country orelse "";
+            if (place.info) |info| longitude = info.longitude;
+        }
+
         const vars = motd_template.Vars{
             .nick = conn.session.displayName(),
             .account = conn.session.account(),
             .host = conn.session.host(),
+            .username = conn.session.username(),
+            .realname = conn.session.realname(),
+            .away = conn.session.awayMessage() orelse "",
             .network = protocol_inventory.currentNetworkName(),
             .server = self.serverName(),
             .version = server_version,
-            .time = formatServerTime(&time_buf),
+            .time = motd_template.formatClock(epoch_s, &clock_buf),
+            .date = motd_template.formatDate(epoch_s, &date_buf),
+            .weekday = motd_template.weekdayName(epoch_s),
+            .uptime = motd_template.formatSpan(uptime_s, &uptime_buf),
+            .online = motd_template.formatSpan(online_s, &online_buf),
             // Network-wide total so a MOTD that says "users online" / "across the
             // mesh" reflects the whole mesh, not just this node's local clients.
             .users = self.meshUserCount(),
+            .local_users = @intCast(self.world.localNickCount()),
+            .opers = self.localOperCount(),
+            .channels = @intCast(self.world.channelCount()),
+            .channels_here = channels_here,
+            .servers = 1 + self.distinctPeerCount(),
+            .city = city,
+            .region = region,
+            .country = country,
             .is_oper = conn.session.isOper(),
             .secure = conn.is_tls,
-            .hour = @intCast(@mod(@divFloor(epoch_s, 3600), 24)),
+            .hour = motd_template.solarHour(epoch_s, longitude),
             .weather = weather_line,
             .news = news_line,
         };
 
-        var expanded_buf: [4096]u8 = undefined;
+        var expanded_buf: [8192]u8 = undefined;
         // On overflow/malformed template, fall back to serving the raw text.
         const expanded = motd_template.expand(template, vars, &expanded_buf) catch template;
 
@@ -59162,8 +59560,28 @@ pub const LinuxServer = struct {
                 self.s2sPeerLivenessExpired(conn, self.nowMs())) continue;
             _ = establishedPeerName(conn) orelse continue;
             if (sameSockaddrIn(conn.s2s_connect_addr, addr)) return true;
+            if (dial.alt_addr) |alt| if (sameSockaddrIn(conn.s2s_connect_addr, alt)) return true;
         }
         return false;
+    }
+
+    fn stickDialToLinkedPeer(self: *LinuxServer, dial: *MeshDial) void {
+        const addr = dial.addr orelse return;
+        var it = self.reactors[0].clients.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value;
+            if (!conn.isActiveMeshPeer() or !conn.s2s_dial_target_known or
+                self.s2sPeerLivenessExpired(conn, self.nowMs())) continue;
+            _ = establishedPeerName(conn) orelse continue;
+            const on_primary = sameSockaddrIn(conn.s2s_connect_addr, addr);
+            const on_alt = if (dial.alt_addr) |alt| sameSockaddrIn(conn.s2s_connect_addr, alt) else false;
+            if (!on_primary and !on_alt) continue;
+            dial.addr = conn.s2s_connect_addr;
+            dial.alt_addr = null;
+            dial.alt_token = null;
+            dial.alt_after_ms = -1;
+            return;
+        }
     }
 
     fn sameS2sPeer(a: *const ConnState, b: *const ConnState) bool {
@@ -59188,8 +59606,12 @@ pub const LinuxServer = struct {
             survivor.s2s_dial_target_known = true;
         }
         for (self.mesh_dials) |*dial| {
-            const token = dial.token orelse continue;
-            if (token.slot == loser.token.slot and token.gen == loser.token.gen) dial.token = survivor.token;
+            if (dial.token) |token| {
+                if (token.slot == loser.token.slot and token.gen == loser.token.gen) dial.token = survivor.token;
+            }
+            if (dial.alt_token) |token| {
+                if (token.slot == loser.token.slot and token.gen == loser.token.gen) dial.alt_token = survivor.token;
+            }
         }
     }
 
@@ -73795,7 +74217,7 @@ fn isBlockableCtcp(text: []const u8) bool {
 }
 
 /// Compose the RPL_WHOISSPECIAL geo/ASN phrase from the resolved parts:
-/// `is connecting from <city>, <region>, <country> · AS<asn> <org>`. Omits any
+/// `is connecting from <city>, <region>, <country> | AS<asn> <org>`. Omits any
 /// missing piece; returns null when neither a location nor an ASN resolved.
 fn buildGeoWhois(
     buf: []u8,
@@ -73850,6 +74272,23 @@ fn buildGeoWhois(
         }
     }
     return buf[0..a.w];
+}
+
+test "geo whois phrase joins place and ASN and omits empty parts" {
+    var buf: [256]u8 = undefined;
+    const full = buildGeoWhois(&buf, "Dallas", "Texas", "United States", 397423, "Tier.Net Technologies LLC") orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(
+        "is connecting from Dallas, Texas, United States | AS397423 Tier.Net Technologies LLC",
+        full,
+    );
+    try std.testing.expect(buildGeoWhois(&buf, null, null, null, null, null) == null);
+    const asn_only = buildGeoWhois(&buf, null, null, null, 15169, "Google LLC") orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("is connecting from an unknown location | AS15169 Google LLC", asn_only);
+    const place_only = buildGeoWhois(&buf, "Mountain View", null, "US", null, null) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("is connecting from Mountain View, US", place_only);
 }
 
 /// The host to show for `conn`: its visible (cloaked/vhost) host, falling back
@@ -74282,6 +74721,11 @@ fn decodeMeshAdmissionToken(allocator: std.mem.Allocator, text: []const u8) ![]u
 /// wait is `backoff.exponential` of this base instead of the flat interval.
 const mesh_redial_interval_ms: i64 = if (builtin.is_test) 250 else 10_000;
 
+/// RFC 8305 connection-attempt delay. The second family is submitted from the
+/// reactor sweep once this elapses, or immediately if the first connect fails.
+/// It never blocks the reactor.
+const happy_eyeballs_delay_ms: i64 = if (builtin.is_test) 50 else 250;
+
 /// How long a TCP-up peer may sit without a finished handshake, or an
 /// established peer may sit without anti-entropy, before that counts as one
 /// breaker failure. The sweep records at most one failure per backoff window.
@@ -74302,7 +74746,19 @@ const MeshDial = struct {
     token: ?RingFdToken = null,
     /// Last resolved configured target. Match the complete proven endpoint.
     /// Dual-stack: IPv4 peers are held in IPv4-mapped form (::ffff:a.b.c.d).
+    /// After a connect wins, this sticks to that family for the process.
     addr: ?posix.sockaddr.in6 = null,
+    /// Second family for the current resolution. Null for a literal or a
+    /// single-family answer. Cleared once one family wins.
+    alt_addr: ?posix.sockaddr.in6 = null,
+    /// In-flight connect for `alt_addr`. Distinct from `token` so a loser
+    /// completion cannot trip the breaker while its sibling is still trying.
+    alt_token: ?RingFdToken = null,
+    /// `0` retries `alt_addr` immediately after the primary socket is gone.
+    /// A positive value is the earliest monotonic ms the alt may start while
+    /// the primary connect is still armed. `-1` means this attempt already
+    /// used or dismissed the alternate.
+    alt_after_ms: i64 = 0,
     /// Monotonic ms of the last dial attempt (rate cap for re-dials). 0 =
     /// never dialed (the forced boot pass always fires regardless).
     last_attempt_ms: i64 = 0,
@@ -74334,13 +74790,55 @@ fn sockaddrIn(host: []const u8, port: u16) ServerError!posix.sockaddr.in {
     };
 }
 
-/// Resolve a mesh peer "host" to a dual-stack `sockaddr.in6`. IPv4/IPv6 literals
-/// parse directly (IPv4 as IPv4-mapped ::ffff:a.b.c.d); a hostname goes through a
-/// blocking DNS lookup (bounded by `timeout_ms` per nameserver) — an A record
-/// first (dialed IPv4-mapped), falling back to AAAA so a v6-only peer such as
-/// `[mesh].connect = ["node.example:6900"]` or oper `CONNECT node.example 6900`
-/// still resolves. Linux dials both through AF_INET6; OpenBSD translates the
-/// canonical mapped address and selects a native AF_INET socket for IPv4.
+fn meshDialTracks(dial: MeshDial, token: RingFdToken) bool {
+    if (dial.token) |tok| if (tok.slot == token.slot and tok.gen == token.gen) return true;
+    if (dial.alt_token) |tok| if (tok.slot == token.slot and tok.gen == token.gen) return true;
+    return false;
+}
+
+fn saturatingAddI64(now: i64, delay: i64) i64 {
+    if (delay > 0 and now > std.math.maxInt(i64) - delay) return std.math.maxInt(i64);
+    return now + delay;
+}
+
+const DialPlan = struct {
+    primary: posix.sockaddr.in6,
+    alt: ?posix.sockaddr.in6 = null,
+};
+
+/// One AAAA and one A, with IPv6 first when both exist. Neither answer is null.
+/// A missing family leaves `alt` empty so a v4-only or v6-only peer is dialed
+/// on that family alone.
+fn dialPlanFromAnswers(v6: ?[16]u8, v4: ?[4]u8, port: u16) ?DialPlan {
+    if (v6) |bytes| {
+        const primary = sockaddrIn6FromV6(.{
+            .bytes = bytes,
+            .port = port,
+            .interface = .{ .index = 0 },
+        }, port);
+        const alt = if (v4) |octets| sockaddrIn6FromV4(octets, port) else null;
+        return .{ .primary = primary, .alt = alt };
+    }
+    if (v4) |octets| return .{ .primary = sockaddrIn6FromV4(octets, port) };
+    return null;
+}
+
+fn dialPlanForHost(host: []const u8, port: u16, timeout_ms: u31) ServerError!DialPlan {
+    if (sockaddrIn6(host, port)) |addr| {
+        return .{ .primary = addr };
+    } else |err| {
+        if (std.mem.indexOfScalar(u8, host, '%') != null) return err;
+    }
+    const families = http_fetch.resolveHostFamilies(host, timeout_ms) catch return error.InvalidAddress;
+    return dialPlanFromAnswers(families.v6, families.v4, port) orelse error.InvalidAddress;
+}
+
+/// Resolve one address for oper `CONNECT` and other single-target callers.
+/// Literals parse directly (IPv4 as IPv4-mapped ::ffff:a.b.c.d). A hostname
+/// still prefers A, then AAAA: this path has no second socket to race, so a
+/// broken AAAA must not hide a working A. Auto-dial uses `dialPlanForHost`.
+/// Linux dials both through AF_INET6; OpenBSD translates the canonical mapped
+/// address and selects a native AF_INET socket for IPv4.
 fn sockaddrForHost(host: []const u8, port: u16, timeout_ms: u31) ServerError!posix.sockaddr.in6 {
     if (sockaddrIn6(host, port)) |addr| return addr else |err| {
         // A zone marker is a literal-only form. Reject malformed scope here
@@ -74394,6 +74892,26 @@ test "mesh dial IPv6 sockaddr preserves resolved interface scope" {
     const mapped = sockaddrIn6FromV4(.{ 127, 0, 0, 1 }, 6900);
     try std.testing.expectEqual(@as(u32, 0), mapped.scope_id);
     try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, mapped.addr[12..16]);
+}
+
+test "dual-stack dial plan prefers IPv6 and keeps IPv4 mapped" {
+    const v6 = [16]u8{ 0x26, 0x04, 0xf4, 0x40, 0, 3, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 2 };
+    const plan = dialPlanFromAnswers(v6, .{ 170, 39, 213, 188 }, 6900) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(plan.alt != null);
+    try std.testing.expect(!isV4Mapped(plan.primary.addr));
+    try std.testing.expect(isV4Mapped(plan.alt.?.addr));
+    try std.testing.expectEqualSlices(u8, &v6, &plan.primary.addr);
+    try std.testing.expectEqualSlices(u8, &.{ 170, 39, 213, 188 }, plan.alt.?.addr[12..16]);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 6900), plan.primary.port);
+
+    const v4_only = dialPlanFromAnswers(null, .{ 127, 0, 0, 1 }, 6900) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(v4_only.alt == null);
+    try std.testing.expect(isV4Mapped(v4_only.primary.addr));
+
+    const v6_only = dialPlanFromAnswers(v6, null, 6900) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(v6_only.alt == null);
+    try std.testing.expect(!isV4Mapped(v6_only.primary.addr));
+    try std.testing.expect(dialPlanFromAnswers(null, null, 6900) == null);
 }
 
 const socket_system = if (builtin.os.tag == .openbsd) posix.system else linux;
@@ -119438,6 +119956,7 @@ test "GAP-P0c remote WHOIS copies roster identity and leaves idle away and secur
     try expectContains(reply, " 330 Watcher FarUser faracct ");
     try expectContains(reply, " 312 Watcher FarUser peer.example ");
     try expectContains(reply, " 338 ");
+    try expectContains(reply, "actual address 198.51.100.8");
     try expectContains(reply, " 276 ");
     try std.testing.expect(std.mem.indexOf(u8, reply, " 317 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, reply, " 301 ") == null);
@@ -119524,6 +120043,8 @@ test "whois profile remote facts follow the stored origin" {
     try expectContains(reply, "is using modes +iR");
     try expectContains(reply, "is connected via WebSocket");
     try std.testing.expect(std.mem.indexOf(u8, reply, "rDNS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "actual address") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "198.51.100.8") == null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "connection class") == null);
     try std.testing.expect(std.mem.indexOf(u8, reply, " 338 ") == null);
     try std.testing.expect(std.mem.indexOf(u8, reply, " 276 ") == null);
@@ -119552,12 +120073,36 @@ test "whois profile remote facts follow the stored origin" {
     sink.reset();
     try server.sendRemoteWhois(watcher, &sink, remote);
     const oper_reply = watcher.send_buf[0..watcher.send_len];
-    try expectContains(oper_reply, "rDNS ircx.example");
+    try expectContains(oper_reply, "rDNS ircx.example (198.51.100.8)");
+    try expectContains(oper_reply, "ircx.example 198.51.100.8 :Is actually using host");
     try expectContains(oper_reply, "is in connection class users");
     try expectContains(oper_reply, " 338 ");
     try expectContains(oper_reply, "198.51.100.8");
     try expectContains(oper_reply, " 276 ");
     try expectContains(oper_reply, "abcdef");
+
+    var raw_buf: [whois_profile.max_encoded_len]u8 = undefined;
+    const raw_ptr = try whois_profile.encode(.{
+        .present = true,
+        .has_rdns = true,
+        .rdns_unconfirmed = true,
+        .tls = true,
+        .signon_unix = 1_700_000_000,
+        .last_active_unix = 1_700_000_100,
+        .revision_ms = 6,
+        .origin_node = 9,
+        .nick = "FarUser",
+        .cipher = "TLS_AES_128_GCM_SHA256",
+        .rdns = "ptr.example.net",
+        .class_name = "users",
+    }, &raw_buf);
+    try std.testing.expect(server.storeWhoisProfile(raw_ptr));
+    watcher.send_len = 0;
+    sink.reset();
+    try server.sendRemoteWhois(watcher, &sink, remote);
+    const raw_reply = watcher.send_buf[0..watcher.send_len];
+    try expectContains(raw_reply, "rDNS ptr.example.net (not forward-confirmed) (198.51.100.8)");
+    try expectContains(raw_reply, "ptr.example.net 198.51.100.8 :Is actually using host");
 
     const guest_id = try addTestLocalClient(server, "Guest", null);
     const guest = server.connFor(guest_id) orelse return error.TestUnexpectedResult;
@@ -119569,7 +120114,7 @@ test "whois profile remote facts follow the stored origin" {
         .tls = true,
         .signon_unix = 1_700_000_000,
         .last_active_unix = 1_700_000_100,
-        .revision_ms = 6,
+        .revision_ms = 7,
         .origin_node = 9,
         .nick = "FarUser",
         .cipher = "TLS_AES_128_GCM_SHA256",
@@ -119579,6 +120124,8 @@ test "whois profile remote facts follow the stored origin" {
     try server.sendRemoteWhois(guest, &sink, remote);
     const guest_reply = guest.send_buf[0..guest.send_len];
     try std.testing.expect(std.mem.indexOf(u8, guest_reply, " 317 ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, guest_reply, "ptr.example.net") == null);
+    try std.testing.expect(std.mem.indexOf(u8, guest_reply, "198.51.100.8") == null);
     try expectContains(guest_reply, " 671 ");
     try expectContains(guest_reply, "TLS_AES_128_GCM_SHA256");
 
@@ -119597,7 +120144,7 @@ test "whois profile remote facts follow the stored origin" {
     const gone = try whois_profile.encode(.{
         .present = false,
         .nick = "FarUser",
-        .revision_ms = 7,
+        .revision_ms = 8,
         .origin_node = 9,
     }, &gone_buf);
     try std.testing.expect(server.storeWhoisProfile(gone));
@@ -119606,7 +120153,7 @@ test "whois profile remote facts follow the stored origin" {
     const gone_again = try whois_profile.encode(.{
         .present = false,
         .nick = "FarUser",
-        .revision_ms = 8,
+        .revision_ms = 9,
         .origin_node = 9,
     }, &gone_again_buf);
     try std.testing.expect(!server.storeWhoisProfile(gone_again));
@@ -123015,6 +123562,139 @@ test "configured boot dial resolves and recognizes inherited outbound survivor" 
     try std.testing.expectEqual(sq_before, server.rx().ring.inner.sq_ready());
 }
 
+test "dual-stack dial treats an inherited IPv4 survivor as already linked" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer {
+        pair.a.deinit();
+        pair.b.deinit();
+        pair.ida.sign_kp.secret_key.page = null;
+        pair.idb.sign_kp.secret_key.page = null;
+        pair.ida.deinit();
+        pair.idb.deinit();
+    }
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    const specs = [_][]const u8{"ircx.us:6900"};
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_connect = &specs,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = try server.rx().clients.alloc(ConnState.init(sockets[0]));
+    const inherited = server.rx().clients.get(id).?;
+    inherited.overflow_allocator = allocator;
+    inherited.token = try tokenFromId(id);
+    inherited.s2s_secured = &pair.a;
+    defer inherited.s2s_secured = null;
+    inherited.s2s_initiator = true;
+    inherited.s2s_connect_addr = try sockaddrForHost("127.0.0.1", 6900, 1);
+    inherited.s2s_dial_target_known = true;
+
+    server.mesh_dials[0].addr = try sockaddrForHost("2001:db8::21", 6900, 1);
+    server.mesh_dials[0].alt_addr = inherited.s2s_connect_addr;
+    const clients_before = server.rx().clients.len();
+    try std.testing.expect(server.sweepMeshAutoConnect(true, 1));
+    try std.testing.expectEqual(clients_before, server.rx().clients.len());
+    try std.testing.expect(server.mesh_dials[0].token == null);
+    try std.testing.expect(server.mesh_dials[0].alt_addr == null);
+    try std.testing.expect(sameSockaddrIn(server.mesh_dials[0].addr.?, inherited.s2s_connect_addr));
+    try std.testing.expect(server.meshPeerLinkedByDial(&server.mesh_dials[0]));
+}
+
+test "dual-stack dial waits out the attempt delay before the alternate" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const specs = [_][]const u8{"127.0.0.1:9"};
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_connect = &specs,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const now: i64 = 1_000;
+    server.mesh_dials[0].addr = try sockaddrForHost("2001:db8::21", 9, 1);
+    server.mesh_dials[0].alt_addr = try sockaddrForHost("127.0.0.1", 9, 1);
+    try std.testing.expectEqual(Server.MeshDialAttempt.attempted, server.tryMeshAutoDial(&server.mesh_dials[0], true, now));
+    const primary = server.mesh_dials[0].token orelse return error.TestUnexpectedResult;
+    try std.testing.expect(server.mesh_dials[0].alt_token == null);
+    try std.testing.expectEqual(now + happy_eyeballs_delay_ms, server.mesh_dials[0].alt_after_ms);
+    const attempt_ms = server.mesh_dials[0].last_attempt_ms;
+    try std.testing.expectEqual(Server.MeshDialAttempt.skipped, server.tryMeshAutoDial(&server.mesh_dials[0], false, now + happy_eyeballs_delay_ms - 1));
+    try std.testing.expect(server.mesh_dials[0].alt_token == null);
+    try std.testing.expectEqual(attempt_ms, server.mesh_dials[0].last_attempt_ms);
+    try std.testing.expectEqual(Server.MeshDialAttempt.skipped, server.tryMeshAutoDial(&server.mesh_dials[0], false, now + happy_eyeballs_delay_ms));
+    const alt = server.mesh_dials[0].alt_token orelse return error.TestUnexpectedResult;
+    try std.testing.expect(alt.slot != primary.slot or alt.gen != primary.gen);
+    try std.testing.expectEqual(attempt_ms, server.mesh_dials[0].last_attempt_ms);
+    try std.testing.expectEqual(@as(u32, 0), server.mesh_dials[0].backoff_failures);
+    try std.testing.expect(server.meshDialForToken(primary) != null);
+    try std.testing.expect(server.meshDialForToken(alt) != null);
+}
+
+test "dual-stack dial failure starts the alternate without a breaker hit" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const specs = [_][]const u8{"127.0.0.1:9"};
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .mesh_connect = &specs,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const alt_addr = try sockaddrForHost("127.0.0.1", 9, 1);
+    server.mesh_dials[0].addr = try sockaddrForHost("2001:db8::22", 9, 1);
+    server.mesh_dials[0].alt_addr = alt_addr;
+    server.mesh_dials[0].alt_after_ms = 50_000;
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    server.mesh_dials[0].token = conn.token;
+    try server.handleConnect(.{ .token = conn.token, .res = -1 });
+    try std.testing.expect(server.rx().clients.get(id) == null);
+    try std.testing.expectEqual(@as(u32, 0), server.mesh_dials[0].backoff_failures);
+    try std.testing.expectEqual(@as(i64, -1), server.mesh_dials[0].alt_after_ms);
+    try std.testing.expect(server.mesh_dials[0].alt_token == null);
+    try std.testing.expect(server.mesh_dials[0].alt_addr != null);
+    const tok = server.mesh_dials[0].token orelse return error.TestUnexpectedResult;
+    const alt = server.liveDialConn(tok) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(sameSockaddrIn(alt.s2s_connect_addr, alt_addr));
+    try std.testing.expect(alt.connect_armed);
+}
+
 fn sameIPTestSocketPair() ![2]linux.fd_t {
     var sockets: [2]linux.fd_t = undefined;
     if (comptime builtin.os.tag == .openbsd) {
@@ -125378,9 +126058,7 @@ fn dumpMeshDialProofForTest(server: *Server) void {
             if (conn.s2s == null and conn.s2s_secured == null) continue;
             var bound = false;
             for (server.mesh_dials) |dial| {
-                if (dial.token) |token| {
-                    if (token.slot == conn.token.slot and token.gen == conn.token.gen) bound = true;
-                }
+                if (meshDialTracks(dial, conn.token)) bound = true;
             }
             std.debug.print("mesh proof node={s} shard={d} fd={d} token={d}/{d} peer={s} initiator={} known={} target_port={d} bound={} dedup={} closing={} connect={} recv={} send={} backlog={d}\n", .{
                 server.serverName(),                               reactor.shard_id,   conn.fd,                    conn.token.slot,                                                                                       conn.token.gen,
@@ -126786,8 +127464,7 @@ const SameIPPeerProof = struct {
             if (result != null) return null; // more than one live route is a failure
             var bound = false;
             for (server.mesh_dials) |dial| {
-                const token = dial.token orelse continue;
-                if (token.slot == conn.token.slot and token.gen == conn.token.gen) bound = true;
+                if (meshDialTracks(dial, conn.token)) bound = true;
             }
             result = .{
                 .fd = conn.fd,

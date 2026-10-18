@@ -43,6 +43,10 @@ pub const flag_away: u16 = 1 << 10;
 pub const flag_has_rdns: u16 = 1 << 11;
 pub const flag_hide_oper: u16 = 1 << 12;
 pub const flag_websocket: u16 = 1 << 13;
+/// The rDNS label is a PTR that did not forward-confirm. `flag_has_rdns` is
+/// still set so the name is on the wire; operators must not treat it as the
+/// confirmed hostname.
+pub const flag_rdns_unconfirmed: u16 = 1 << 14;
 
 pub const EncodeError = error{ Invalid, Overflow };
 
@@ -59,6 +63,8 @@ pub const Record = struct {
     hide_chans: bool = false,
     away: bool = false,
     has_rdns: bool = false,
+    /// Meaningful only when `has_rdns` is set. The name is a raw PTR.
+    rdns_unconfirmed: bool = false,
     hide_oper: bool = false,
     websocket: bool = false,
     signon_unix: u64 = 0,
@@ -105,6 +111,7 @@ pub const View = struct {
             .hide_chans = (self.flags & flag_hide_chans) != 0,
             .away = (self.flags & flag_away) != 0,
             .has_rdns = rdns.len != 0,
+            .rdns_unconfirmed = rdns.len != 0 and (self.flags & flag_rdns_unconfirmed) != 0,
             .hide_oper = (self.flags & flag_hide_oper) != 0,
             .websocket = (self.flags & flag_websocket) != 0,
             .signon_unix = self.signon_unix,
@@ -129,6 +136,7 @@ pub fn encode(rec: Record, out: []u8) EncodeError![]const u8 {
     if (!modesOk(rec.modes) or rec.modes.len > max_modes_len) return error.Invalid;
     if (!tokenOk(rec.class_name) or rec.class_name.len > max_class_len) return error.Invalid;
     if (rec.has_rdns and rec.rdns.len == 0) return error.Invalid;
+    if (rec.rdns_unconfirmed and !rec.has_rdns) return error.Invalid;
     if (!rec.present and (rec.cipher.len != 0 or rec.away_text.len != 0 or rec.rdns.len != 0 or rec.modes.len != 0 or rec.class_name.len != 0)) return error.Invalid;
 
     var flags: u16 = 0;
@@ -144,6 +152,7 @@ pub fn encode(rec: Record, out: []u8) EncodeError![]const u8 {
     if (rec.hide_chans) flags |= flag_hide_chans;
     if (rec.away) flags |= flag_away;
     if (rec.has_rdns) flags |= flag_has_rdns;
+    if (rec.rdns_unconfirmed) flags |= flag_rdns_unconfirmed;
     if (rec.hide_oper) flags |= flag_hide_oper;
     if (rec.websocket) flags |= flag_websocket;
 
@@ -185,6 +194,7 @@ pub fn decode(bytes: []const u8) ?View {
     if (!nickOk(nick) or !tokenOk(cipher) or !awayOk(away_text) or !tokenOk(rdns) or !modesOk(modes) or !tokenOk(class_name)) return null;
     if ((flags & flag_has_rdns) != 0 and rdns.len == 0) return null;
     if ((flags & flag_has_rdns) == 0 and rdns.len != 0) return null;
+    if ((flags & flag_rdns_unconfirmed) != 0 and (flags & flag_has_rdns) == 0) return null;
     if ((flags & flag_present) == 0 and (cipher.len != 0 or away_text.len != 0 or rdns.len != 0 or modes.len != 0 or class_name.len != 0)) return null;
     return .{
         .flags = flags,
@@ -333,4 +343,39 @@ test "whois profile rejects a truncated body and a gone record with session text
         .nick = "klys",
         .cipher = "TLS_AES_128_GCM_SHA256",
     }, &buf));
+}
+
+test "whois profile keeps an unconfirmed rDNS mark and rejects it alone" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const wire = try encode(.{
+        .present = true,
+        .has_rdns = true,
+        .rdns_unconfirmed = true,
+        .nick = "klys",
+        .rdns = "ptr.example.net",
+        .revision_ms = 3,
+        .origin_node = 1,
+    }, &buf);
+    const view = decode(wire) orelse return error.TestUnexpectedResult;
+    try std.testing.expect((view.flags & flag_has_rdns) != 0);
+    try std.testing.expect((view.flags & flag_rdns_unconfirmed) != 0);
+    try std.testing.expectEqualStrings("ptr.example.net", view.rdns);
+    const kept = view.record(true);
+    try std.testing.expect(kept.has_rdns);
+    try std.testing.expect(kept.rdns_unconfirmed);
+    const stripped = view.record(false);
+    try std.testing.expect(!stripped.has_rdns);
+    try std.testing.expect(!stripped.rdns_unconfirmed);
+    try std.testing.expectEqualStrings("", stripped.rdns);
+    try std.testing.expectError(error.Invalid, encode(.{
+        .present = true,
+        .rdns_unconfirmed = true,
+        .nick = "klys",
+    }, &buf));
+    var dropped = try std.testing.allocator.dupe(u8, wire);
+    defer std.testing.allocator.free(dropped);
+    var flags = std.mem.readInt(u16, dropped[1..3], .little);
+    flags &= ~flag_has_rdns;
+    std.mem.writeInt(u16, dropped[1..3], flags, .little);
+    try std.testing.expect(decode(dropped) == null);
 }

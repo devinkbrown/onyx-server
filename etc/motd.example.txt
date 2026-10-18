@@ -6,16 +6,22 @@
      | |_| | | | (_) | (__| | | | |
       \___/|_|  \___/ \___|_| |_|_|    大蛇
 
-  Connected to {server} (running {version}) — {users} users online.{if:weather}
+  {if:place}Connecting from {city|somewhere}{if:region}, {region}{/if}{if:country} ({country}){/if}.
+  {/if}{users} {plural:users:person:people} online{if:servers>1} across {servers} servers{/if}, {channels} {plural:channels:channel:channels} open.
+  This node: {local_users} local, {opers} {plural:opers:operator:operators}. You have been here {online|0s}.
+  Server {server} has been up {uptime|unknown} ({version}).
+
+{if:account}  Signed in as {account} ({realname|no realname}). Your services and saved settings are active.{else}  You are browsing as {nick|a guest} — register your account to reserve your nick
+  and unlock services (see REGISTER).{/if}{if:channels_here=0}
+  You have not joined a channel yet. LIST shows what is open; #root is home base.{else}
+  You are in {channels_here} {plural:channels_here:channel:channels}.{/if}{if:away}
+  You are marked away: {away}{/if}{if:oper}
+  [*] Operator privileges are active on this connection — wield them with care.{/if}{if:!secure}
+  [!] This connection is not encrypted. Reconnect over TLS for privacy.{/if}{if:weather}
   Weather — {weather}.{/if}{if:news}
   Headlines — {news}.{/if}
 
-{if:account}  Signed in as {account}. Your services and saved settings are active.{else}  You are browsing as a guest — register your account to reserve your nick
-  and unlock services (see REGISTER).{/if}{if:oper}
-  [*] Operator privileges are active on this connection — wield them with care.{/if}{if:secure}{else}
-  [!] This connection is not encrypted. Reconnect over TLS for privacy.{/if}
-
-  #root is home base — type LIST to explore the network.
+  {weekday} {date} {time}
   Be excellent to each other.
 
   -- The {network} staff

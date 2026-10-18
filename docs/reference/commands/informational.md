@@ -72,7 +72,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 ## MOTD
 
 - Syntax: `MOTD`
-- Description: Returns the Message of the Day from the configured `[motd] text` template or the built-in default. The MOTD is expanded per connection: time-of-day greeting, nick/account/host, live network figures, oper/login/TLS conditionals, and, when enabled, localized `{weather}` and `{news}` placeholders.
+- Description: Returns the Message of the Day from the configured `[motd] text` template or the built-in default. The MOTD is expanded per connection: solar-time greeting, nick, account, realname, away text, GeoIP place, channel count, mesh figures, uptime, oper/login/TLS conditionals, and, when enabled, localized `{weather}` and `{news}` placeholders. The place is the city, region, and country; the IP is not included.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_MOTDSTART 375`, `RPL_MOTD 372`, `RPL_ENDOFMOTD 376`.

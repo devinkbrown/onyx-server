@@ -7,10 +7,11 @@
 //! confirmation can take seconds), so client IPs are *enqueued* here and
 //! resolved on a dedicated worker thread via `proto/dns.zig` (FCrDNS). The
 //! reactor reads the confirmed hostname back — at registration time — to present
-//! a cloaked HOSTNAME instead of a cloaked IP. Best-effort: any miss, timeout,
-//! or unconfirmed PTR leaves the entry resolved-but-nameless and the caller
-//! falls back to the IP cloak. Mutex-guarded fixed cache + job ring, mirroring
-//! the established `geo_services` background-fetcher pattern.
+//! a cloaked HOSTNAME instead of a cloaked IP. `lookup` and the cloak use only
+//! a forward-confirmed name. A PTR that did not confirm stays readable through
+//! `lookupObserved` for oper WHOIS and is not part of the checkpoint.
+//! Mutex-guarded fixed cache + job ring, mirroring the established
+//! `geo_services` background-fetcher pattern.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,8 +34,13 @@ const Entry = struct {
     has_key: bool = false,
     state: State = .empty,
     host_buf: [max_host_len]u8 = undefined,
-    /// 0 when ready-but-unconfirmed (no usable hostname → caller uses the IP).
+    /// Confirmed hostname length. 0 when there is no forward-confirmed name.
+    /// `lookup` reads only this, so a raw PTR never becomes a cloak or a
+    /// trusted hostname.
     host_len: usize = 0,
+    /// PTR text length, including a name that failed forward confirmation.
+    /// Not part of the checkpoint; a restored entry reports only `host_len`.
+    observed_len: usize = 0,
     resolved_ms: i64 = 0,
 };
 
@@ -213,7 +219,14 @@ pub const Resolver = struct {
     fn publishSnapshot(self: *Resolver, snapshot: *const Snapshot) !void {
         if (self.entries.len != cache_slots) return error.InvalidState;
         for (snapshot.entries, self.entries) |entry, *out| {
-            out.* = .{ .key = entry.key, .has_key = entry.has_key, .state = entry.state, .host_len = entry.host_len, .resolved_ms = entry.resolved_ms };
+            out.* = .{
+                .key = entry.key,
+                .has_key = entry.has_key,
+                .state = entry.state,
+                .host_len = entry.host_len,
+                .observed_len = entry.host_len,
+                .resolved_ms = entry.resolved_ms,
+            };
             @memcpy(out.host_buf[0..entry.host_len], entry.host[0..entry.host_len]);
         }
         for (snapshot.jobs[0..snapshot.job_count], 0..) |ip, i| self.jobs[i] = .{ .ip = ip };
@@ -267,13 +280,29 @@ pub const Resolver = struct {
     /// Confirmed hostname for `ip`, copied into `out`, or null when not yet
     /// resolved or there is no forward-confirmed PTR. Never blocks.
     pub fn lookup(self: *Resolver, ip: dns.Address, out: []u8) ?[]const u8 {
+        const seen = self.lookupObserved(ip, out) orelse return null;
+        if (!seen.confirmed) return null;
+        return seen.name;
+    }
+
+    pub const ObservedName = struct {
+        name: []const u8,
+        confirmed: bool,
+    };
+
+    /// PTR for `ip`, including one that did not forward-confirm. `confirmed`
+    /// is true only when the name is safe to treat as the client's hostname.
+    /// Never blocks.
+    pub fn lookupObserved(self: *Resolver, ip: dns.Address, out: []u8) ?ObservedName {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         const e = self.find(ip) orelse return null;
-        if (e.state != .ready or e.host_len == 0) return null;
-        const n = @min(e.host_len, out.len);
+        if (e.state != .ready) return null;
+        const have = if (e.observed_len != 0) e.observed_len else e.host_len;
+        if (have == 0) return null;
+        const n = @min(have, out.len);
         @memcpy(out[0..n], e.host_buf[0..n]);
-        return out[0..n];
+        return .{ .name = out[0..n], .confirmed = e.host_len != 0 };
     }
 
     // ---- internals -----------------------------------------------------------
@@ -342,17 +371,29 @@ pub const Resolver = struct {
                 continue;
             };
             // DNS I/O happens OUTSIDE the lock (it can block for seconds).
+            // Keep the PTR even when it does not forward-confirm. Operators
+            // need that name next to the address; `host_len` stays 0 so the
+            // confirmed-only lookup and the checkpoint still ignore it.
             var name_buf: [max_host_len]u8 = undefined;
-            const confirmed = dns.resolveConfirmed(&self.cfg, job.ip, &name_buf);
+            const ptr_name = dns.resolveReverse(&self.cfg, job.ip, &name_buf) catch null;
+            var forward_ok = false;
+            if (ptr_name) |name| {
+                var fwd: [dns.max_cache_addrs]dns.Address = undefined;
+                if (dns.resolveForward(&self.cfg, name, job.ip == .ipv6, &fwd)) |addrs| {
+                    forward_ok = dns.forwardConfirms(job.ip, addrs);
+                } else |_| {}
+            }
 
             lockSpin(&self.mutex);
             const e = self.reserve(job.ip);
-            if (confirmed) |name| {
+            if (ptr_name) |name| {
                 const n = @min(name.len, e.host_buf.len);
                 @memcpy(e.host_buf[0..n], name[0..n]);
-                e.host_len = n;
+                e.observed_len = n;
+                e.host_len = if (forward_ok) n else 0;
             } else {
-                e.host_len = 0; // resolved, but no forward-confirmed hostname
+                e.observed_len = 0;
+                e.host_len = 0;
             }
             e.resolved_ms = platform.monotonicMillis();
             e.state = .ready;
@@ -528,10 +569,25 @@ test "request enqueues; lookup misses until a confirmed result is stored" {
         lockSpin(&r.mutex);
         const e = r.reserve(ip);
         e.host_len = 0;
+        e.observed_len = 0;
         e.state = .ready;
         r.mutex.unlock();
     }
     try std.testing.expect(r.lookup(ip, &buf) == null); // ready, no hostname → miss
+    {
+        lockSpin(&r.mutex);
+        const e = r.reserve(ip);
+        const raw = "ptr.example.net";
+        @memcpy(e.host_buf[0..raw.len], raw);
+        e.host_len = 0;
+        e.observed_len = raw.len;
+        e.state = .ready;
+        r.mutex.unlock();
+    }
+    try std.testing.expect(r.lookup(ip, &buf) == null); // unconfirmed PTR is not a trusted name
+    const observed = r.lookupObserved(ip, &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ptr.example.net", observed.name);
+    try std.testing.expect(!observed.confirmed);
 
     // Simulate a confirmed result.
     {
@@ -540,10 +596,23 @@ test "request enqueues; lookup misses until a confirmed result is stored" {
         const name = "host.example.com";
         @memcpy(e.host_buf[0..name.len], name);
         e.host_len = name.len;
+        e.observed_len = name.len;
         e.state = .ready;
         r.mutex.unlock();
     }
     try std.testing.expectEqualStrings("host.example.com", r.lookup(ip, &buf).?);
+    // A restored checkpoint has no observed_len. The confirmed name still resolves.
+    {
+        lockSpin(&r.mutex);
+        const e = r.reserve(ip);
+        e.observed_len = 0;
+        e.host_len = "host.example.com".len;
+        e.state = .ready;
+        r.mutex.unlock();
+    }
+    try std.testing.expectEqualStrings("host.example.com", r.lookup(ip, &buf).?);
+    const restored = r.lookupObserved(ip, &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(restored.confirmed);
 }
 
 test "request de-dupes and the job ring stays bounded" {

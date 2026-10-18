@@ -116,9 +116,13 @@ pub const WhoisSubject = struct {
     /// appended to the 671 trailing as "... secure connection (<cipher>)".
     /// Only rendered when `is_secure` is set; null keeps the plain wording.
     secure_cipher: ?[]const u8 = null,
-    /// RPL_WHOISACTUALLY (338): the target's real host/IP, shown only to opers
-    /// (or the user themselves). Null suppresses the line.
+    /// RPL_WHOISACTUALLY (338): the target's reverse name, or the literal
+    /// address when no reverse name is known. Shown only to opers or self.
+    /// Null suppresses the line.
     actual_host: ?[]const u8 = null,
+    /// Second 338 parameter: the literal address when `actual_host` is a
+    /// reverse name. Null keeps the single-parameter form.
+    actual_ip: ?[]const u8 = null,
     /// Free-form GeoIP/ASN summary, surfaced as RPL_WHOISSPECIAL (320). Built by
     /// the daemon from the MaxMind database when one is loaded.
     geo: ?[]const u8 = null,
@@ -222,7 +226,9 @@ pub fn writeWhoisWith(
     // rather than emit a malformed param; the rest of the WHOIS still renders.
     if (subject.actual_host) |host| {
         if (host.len != 0 and host[0] != ':') {
-            try writeWhoisActuallyLine(params, sink, server_name, requester_nick, subject.nick, host);
+            const ip = subject.actual_ip orelse "";
+            const extra = if (ip.len != 0 and ip[0] != ':' and !std.mem.eql(u8, ip, host)) ip else null;
+            try writeWhoisActuallyLine(params, sink, server_name, requester_nick, subject.nick, host, extra);
         }
     }
     if (subject.show_idle) {
@@ -354,6 +360,7 @@ pub fn validateSubjectWith(comptime params: Params, subject: WhoisSubject) Whois
     if (subject.certfp) |fp| try validateRenderedTrailingText(fp, error.InvalidRealname);
     if (subject.secure_cipher) |cipher| try validateRenderedTrailingText(cipher, error.InvalidRealname);
     if (subject.actual_host) |host| try validateRenderedHost(host, error.InvalidHost);
+    if (subject.actual_ip) |ip| try validateRenderedHost(ip, error.InvalidHost);
     if (subject.geo) |geo_text| try validateRenderedTrailingText(geo_text, error.InvalidRealname);
     if (subject.modes_line) |text| try validateRenderedTrailingText(text, error.InvalidRealname);
     if (subject.class_line) |text| try validateRenderedTrailingText(text, error.InvalidRealname);
@@ -720,12 +727,16 @@ fn writeWhoisActuallyLine(
     requester_nick: []const u8,
     subject_nick: []const u8,
     actual_host: []const u8,
+    actual_ip: ?[]const u8,
 ) WhoisError!void {
     var b = try sink.beginLine();
     b.max_line_bytes = params.max_line_bytes;
     try b.numericPrefix(whois_actually_code, server_name, requester_nick);
     try b.spaceParam(subject_nick);
     try b.spaceParam(actual_host);
+    if (actual_ip) |ip| {
+        if (ip.len != 0) try b.spaceParam(ip);
+    }
     try b.spaceTrailing("Is actually using host");
     try b.crlf();
     try sink.commitLine(&b);
@@ -1056,6 +1067,29 @@ test "actual_host emits RPL_WHOISACTUALLY 338 after the server line" {
     }
     try std.testing.expect(idx_338 != null);
     try std.testing.expect(idx_338.? == idx_312 + 1); // immediately after the server line
+}
+
+test "actual host and address are both parameters of 338" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.actual_host = "ariadne.space";
+    subject.actual_ip = "203.0.113.7";
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    var found = false;
+    for (sink.slice()) |line| {
+        if (std.mem.indexOf(u8, line.bytes, " 338 ") != null) {
+            found = true;
+            try std.testing.expectEqualStrings(
+                ":irc.example 338 dan alice ariadne.space 203.0.113.7 :Is actually using host\r\n",
+                line.bytes,
+            );
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "IPv6 actual_host renders (does not suppress the whole WHOIS)" {

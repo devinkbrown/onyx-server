@@ -239,13 +239,21 @@ pub fn get(
     if (opts.connect_established) |connected| connected.* = false;
     if (opts.windows_chain_policy and (!tls or opts.insecure_skip_verify)) return error.BadCertificate;
     const lookup_host = endpointHost(host);
-    const addr = resolveHostA(lookup_host, port, opts.recv_timeout_ms) catch |err| blk: {
+    const addr: net.IpAddress = if (comptime builtin.os.tag == .windows) blk: {
         // The Windows system resolver can have an AAAA answer with no A
         // answer. Keep the chosen address pinned for the entire request.
-        if (comptime builtin.os.tag == .windows) {
-            if (err == error.HostNotFound) break :blk try resolveHostAAAA(lookup_host, port, opts.recv_timeout_ms);
-        }
-        return err;
+        break :blk resolveHostA(lookup_host, port, opts.recv_timeout_ms) catch |err| switch (err) {
+            error.HostNotFound => try resolveHostAAAA(lookup_host, port, opts.recv_timeout_ms),
+            else => return err,
+        };
+    } else blk: {
+        // One poll covers A and AAAA. Prefer IPv4 when it exists so an
+        // established HTTPS path stays on the address it already used; a
+        // v6-only name still connects.
+        const families = try resolveHostFamilies(lookup_host, opts.recv_timeout_ms);
+        if (families.v4) |bytes| break :blk .{ .ip4 = .{ .bytes = bytes, .port = port } };
+        if (families.v6) |bytes| break :blk .{ .ip6 = .{ .bytes = bytes, .port = port } };
+        return error.HostNotFound;
     };
     var connected = false;
     var first_opts = opts;
@@ -672,19 +680,15 @@ pub fn resolveHostA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAd
     const query = dns.encodeQuery(&query_buf, query_id, host, .a) catch return error.HostNotFound;
 
     for (servers) |srv| {
-        const ns_v4 = switch (srv) {
-            .ipv4 => |b| b,
-            .ipv6 => continue,
-        };
-        if (queryOneServer(ns_v4, query, timeout_ms)) |ipv4| {
+        if (queryOneServer(srv, query, timeout_ms)) |ipv4| {
             return .{ .ip4 = .{ .bytes = ipv4, .port = port } };
         } else |_| {}
     }
     return error.HostNotFound;
 }
 
-fn queryOneServer(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![4]u8 {
-    const msg = try queryServerPort(ns_v4, 53, query, timeout_ms);
+fn queryOneServer(ns: dns.Address, query: []const u8, timeout_ms: u31) Error![4]u8 {
+    const msg = try queryServerPort(ns, 53, query, timeout_ms);
     for (msg.answerSlice()) |rr| switch (rr.data) {
         .a => |ipv4| return ipv4,
         else => {},
@@ -692,24 +696,27 @@ fn queryOneServer(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![4]u8 
     return error.HostNotFound;
 }
 
-fn queryServerPort(ns_v4: [4]u8, port: u16, query: []const u8, timeout_ms: u31) Error!dns.Message(1, dns.max_cache_addrs) {
-    const question = dns.parseMessage(1, 0, query) catch return error.HostNotFound;
-    if (question.question_count != 1) return error.HostNotFound;
-    const fd = try udpSocket();
+fn queryServerPort(ns: dns.Address, port: u16, query: []const u8, timeout_ms: u31) Error!dns.Message(1, dns.max_cache_addrs) {
+    const fd = try udpSocketFamily(if (ns == .ipv4) posix.AF.INET else posix.AF.INET6, false);
     defer closeFd(fd);
     try setRecvTimeout(fd, timeout_ms);
-    var sa = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ns_v4) };
-    if (posix.errno(sys.connect(fd, @ptrCast(&sa), @sizeOf(sys.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
+    try connectUdp(fd, ns, port);
     try writeAll(fd, query);
     var resp: [dns.max_message_len]u8 = undefined;
     const rc = sys.read(fd, &resp, resp.len);
     if (posix.errno(rc) != .SUCCESS) return error.HostNotFound;
-    const msg = dns.parseMessage(1, dns.max_cache_addrs, resp[0..@intCast(rc)]) catch return error.HostNotFound;
+    return acceptedResponse(query, resp[0..@intCast(rc)]) orelse error.HostNotFound;
+}
+
+fn acceptedResponse(query: []const u8, raw: []const u8) ?dns.Message(1, dns.max_cache_addrs) {
+    const question = dns.parseMessage(1, 0, query) catch return null;
+    if (question.question_count != 1) return null;
+    const msg = dns.parseMessage(1, dns.max_cache_addrs, raw) catch return null;
     const q = question.questions[0];
     if (msg.header.id != question.header.id or msg.header.rcode() != 0 or
         msg.header.flags & 0x7a00 != 0 or
-        !dns.responseMatchesQuestion(1, dns.max_cache_addrs, &msg, q.name.slice(), q.qtype)) return error.HostNotFound;
-    if (!dns.responseAnswersFollowCnames(dns.max_cache_addrs, resp[0..@intCast(rc)], q.name.slice(), q.qtype)) return error.HostNotFound;
+        !dns.responseMatchesQuestion(1, dns.max_cache_addrs, &msg, q.name.slice(), q.qtype)) return null;
+    if (!dns.responseAnswersFollowCnames(dns.max_cache_addrs, raw, q.name.slice(), q.qtype)) return null;
     return msg;
 }
 
@@ -737,15 +744,252 @@ pub fn resolveHostAAAA(host: []const u8, port: u16, timeout_ms: u31) Error!net.I
     const query = dns.encodeQuery(&query_buf, query_id, host, .aaaa) catch return error.HostNotFound;
 
     for (servers) |srv| {
-        const ns_v4 = switch (srv) {
-            .ipv4 => |b| b,
-            .ipv6 => continue,
-        };
-        if (queryOneServer6(ns_v4, query, timeout_ms)) |ipv6| {
+        if (queryOneServer6(srv, query, timeout_ms)) |ipv6| {
             return .{ .ip6 = .{ .bytes = ipv6, .port = port } };
         } else |_| {}
     }
     return error.HostNotFound;
+}
+
+/// Both address families for `host`, from one wait per nameserver. IPv4 and
+/// IPv6 literals skip DNS. A nameserver of either family is queried; A and
+/// AAAA share the timeout instead of walking the resolver twice.
+pub const HostFamilies = struct {
+    v4: ?[4]u8 = null,
+    v6: ?[16]u8 = null,
+};
+
+pub fn resolveHostFamilies(host: []const u8, timeout_ms: u31) Error!HostFamilies {
+    if (host.len == 0 or std.mem.indexOfScalar(u8, host, 0) != null) return error.HostNotFound;
+    if (net.IpAddress.parse(host, 0)) |addr| {
+        return switch (addr) {
+            .ip4 => |a4| .{ .v4 = a4.bytes },
+            .ip6 => |a6| .{ .v6 = a6.bytes },
+        };
+    } else |_| {}
+    if (comptime builtin.os.tag == .windows) return resolveHostFamiliesWindows(host, timeout_ms);
+
+    var conf_buf: [4096]u8 = undefined;
+    const text = readSmallFile("/etc/resolv.conf", &conf_buf) catch return error.NoNameservers;
+    const conf = resolv_conf.parse(text);
+    const servers = conf.nameserverSlice();
+    if (servers.len == 0) return error.NoNameservers;
+
+    var found = HostFamilies{};
+    for (servers) |srv| {
+        if (found.v4 != null and found.v6 != null) break;
+        const part = queryFamilies(srv, 53, host, timeout_ms, found.v4 == null, found.v6 == null);
+        if (found.v4 == null) found.v4 = part.v4;
+        if (found.v6 == null) found.v6 = part.v6;
+    }
+    if (found.v4 == null and found.v6 == null) return error.HostNotFound;
+    return found;
+}
+
+fn queryFamilies(
+    ns: dns.Address,
+    port: u16,
+    host: []const u8,
+    timeout_ms: u31,
+    want_v4: bool,
+    want_v6: bool,
+) HostFamilies {
+    var found = HostFamilies{};
+    if (!want_v4 and !want_v6) return found;
+    var seed: [4]u8 = undefined;
+    osEntropy(&seed);
+    const id_a = std.mem.readInt(u16, seed[0..2], .big);
+    var id_aaaa = std.mem.readInt(u16, seed[2..4], .big);
+    if (id_aaaa == id_a) id_aaaa +%= 1;
+
+    var query_a_buf: [dns.max_message_len]u8 = undefined;
+    var query_aaaa_buf: [dns.max_message_len]u8 = undefined;
+    const query_a: ?[]const u8 = if (!want_v4) null else dns.encodeQuery(&query_a_buf, id_a, host, .a) catch null;
+    const query_aaaa: ?[]const u8 = if (!want_v6) null else dns.encodeQuery(&query_aaaa_buf, id_aaaa, host, .aaaa) catch null;
+    if (query_a == null and query_aaaa == null) return found;
+
+    const family: u32 = if (ns == .ipv4) posix.AF.INET else posix.AF.INET6;
+    var a_fd: ?sys.fd_t = null;
+    var aaaa_fd: ?sys.fd_t = null;
+    defer if (a_fd) |fd| closeFd(fd);
+    defer if (aaaa_fd) |fd| closeFd(fd);
+    if (query_a) |query| {
+        if (udpSocketFamily(family, true)) |fd| {
+            if (connectUdp(fd, ns, port)) {
+                if (writeAll(fd, query)) |_| a_fd = fd else |_| closeFd(fd);
+            } else |_| closeFd(fd);
+        } else |_| {}
+    }
+    if (query_aaaa) |query| {
+        if (udpSocketFamily(family, true)) |fd| {
+            if (connectUdp(fd, ns, port)) {
+                if (writeAll(fd, query)) |_| aaaa_fd = fd else |_| closeFd(fd);
+            } else |_| closeFd(fd);
+        } else |_| {}
+    }
+    if (a_fd == null and aaaa_fd == null) return found;
+
+    const started = monoMs();
+    while (monoMs() - started <= timeout_ms) {
+        var polls: [2]sys.pollfd = undefined;
+        var n: usize = 0;
+        var a_slot: ?usize = null;
+        var aaaa_slot: ?usize = null;
+        if (a_fd) |fd| {
+            polls[n] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
+            a_slot = n;
+            n += 1;
+        }
+        if (aaaa_fd) |fd| {
+            polls[n] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
+            aaaa_slot = n;
+            n += 1;
+        }
+        if (n == 0) break;
+        const elapsed = monoMs() - started;
+        const remain: i32 = if (elapsed >= timeout_ms) 0 else @intCast(timeout_ms - @as(u31, @intCast(elapsed)));
+        const ready = pollCount(polls[0..n], remain) orelse break;
+        if (ready == 0) break;
+        if (a_slot) |slot| {
+            if (polls[slot].revents != 0) {
+                if (a_fd) |fd| {
+                    if (readFamily(fd, query_a.?)) |addr| {
+                        found.v4 = addr.v4;
+                    }
+                }
+                if (a_fd) |fd| closeFd(fd);
+                a_fd = null;
+            }
+        }
+        if (aaaa_slot) |slot| {
+            if (polls[slot].revents != 0) {
+                if (aaaa_fd) |fd| {
+                    if (readFamily(fd, query_aaaa.?)) |addr| {
+                        found.v6 = addr.v6;
+                    }
+                }
+                if (aaaa_fd) |fd| closeFd(fd);
+                aaaa_fd = null;
+            }
+        }
+    }
+    return found;
+}
+
+const FamilyAnswer = struct { v4: ?[4]u8 = null, v6: ?[16]u8 = null };
+
+fn readFamily(fd: sys.fd_t, query: []const u8) ?FamilyAnswer {
+    var resp: [dns.max_message_len]u8 = undefined;
+    const rc = sys.read(fd, &resp, resp.len);
+    if (posix.errno(rc) != .SUCCESS or rc == 0) return null;
+    const msg = acceptedResponse(query, resp[0..@intCast(rc)]) orelse return null;
+    var out = FamilyAnswer{};
+    for (msg.answerSlice()) |rr| switch (rr.data) {
+        .a => |ipv4| {
+            if (out.v4 == null) out.v4 = ipv4;
+        },
+        .aaaa => |ipv6| {
+            if (out.v6 == null) out.v6 = ipv6;
+        },
+        else => {},
+    };
+    if (out.v4 == null and out.v6 == null) return null;
+    return out;
+}
+
+fn pollCount(polls: []sys.pollfd, timeout_ms: i32) ?usize {
+    while (true) {
+        const rc = sys.poll(polls.ptr, polls.len, timeout_ms);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return null,
+        }
+    }
+}
+
+fn monoMs() i64 {
+    var ts: sys.timespec = undefined;
+    if (posix.errno(sys.clock_gettime(posix.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    const sec: i64 = @intCast(ts.sec);
+    const ms: i64 = @intCast(@divTrunc(ts.nsec, 1_000_000));
+    return sec * 1000 + ms;
+}
+
+fn connectUdp(fd: sys.fd_t, ns: dns.Address, port: u16) Error!void {
+    const rc = switch (ns) {
+        .ipv4 => |bytes| blk: {
+            var sa = sys.sockaddr.in{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(bytes) };
+            break :blk sys.connect(fd, @ptrCast(&sa), @sizeOf(sys.sockaddr.in));
+        },
+        .ipv6 => |bytes| blk: {
+            var sa = sys.sockaddr.in6{
+                .port = std.mem.nativeToBig(u16, port),
+                .flowinfo = 0,
+                .addr = bytes,
+                .scope_id = 0,
+            };
+            break :blk sys.connect(fd, @ptrCast(&sa), @sizeOf(sys.sockaddr.in6));
+        },
+    };
+    if (posix.errno(rc) != .SUCCESS) return error.ConnectFailed;
+}
+
+fn resolveHostFamiliesWindows(host: []const u8, timeout_ms: u31) Error!HostFamilies {
+    if (comptime builtin.os.tag != .windows) return error.NoNameservers;
+    if (timeout_ms == 0) return error.ResolveTimeout;
+    if (host.len == 0 or host.len > 1024 or std.mem.indexOfScalar(u8, host, 0) != null) return error.HostNotFound;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, host) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HostNotFound,
+    };
+    var startup: [408]u8 align(8) = @splat(0);
+    if (win.WSAStartup(0x0202, &startup) != 0) {
+        std.heap.page_allocator.free(wide);
+        return error.SocketUnavailable;
+    }
+    const event = win.CreateEventW(null, 1, 0, null) orelse {
+        _ = win.WSACleanup();
+        std.heap.page_allocator.free(wide);
+        return error.SocketUnavailable;
+    };
+    const state = std.heap.page_allocator.create(WinResolveState) catch {
+        _ = win.CloseHandle(event);
+        _ = win.WSACleanup();
+        std.heap.page_allocator.free(wide);
+        return error.OutOfMemory;
+    };
+    state.* = .{
+        .event = event,
+        .name = wide,
+        .family = 0,
+        .port = 0,
+        .both = true,
+    };
+    state.hints.family = 0;
+    state.hints.socket_type = win.sock_stream;
+    state.hints.protocol = win.ipproto_tcp;
+    defer state.release();
+
+    var cancel_handle: ?*anyopaque = null;
+    const rc = win.GetAddrInfoExW(state.name.ptr, null, win.ns_dns, null, &state.hints, &state.result, null, &state.overlapped, winResolveCompleted, &cancel_handle);
+    if (rc != win.io_pending) winResolveCompleted(@bitCast(rc), 0, &state.overlapped);
+    const wait_ms: u32 = @min(timeout_ms, 2500);
+    const waited = win.WaitForSingleObject(state.event, wait_ms);
+    if (waited != win.wait_object_0) {
+        if (cancel_handle != null) _ = win.GetAddrInfoExCancel(&cancel_handle);
+        return if (waited == win.wait_timeout) error.ResolveTimeout else error.HostNotFound;
+    }
+    if (state.status.load(.acquire) != 0) return error.HostNotFound;
+    var found = HostFamilies{ .v4 = state.v4, .v6 = state.v6 };
+    if (found.v4 == null and found.v6 == null) {
+        if (state.answer) |addr| switch (addr) {
+            .ip4 => |a4| found.v4 = a4.bytes,
+            .ip6 => |a6| found.v6 = a6.bytes,
+        };
+    }
+    if (found.v4 == null and found.v6 == null) return error.HostNotFound;
+    return found;
 }
 
 fn resolveHostWindows(host: []const u8, port: u16, timeout_ms: u31, want_v6: bool) Error!net.IpAddress {
@@ -813,6 +1057,9 @@ const WinResolveState = struct {
     name: [:0]u16,
     family: i32,
     port: u16,
+    both: bool = false,
+    v4: ?[4]u8 = null,
+    v6: ?[16]u8 = null,
     answer: ?net.IpAddress = null,
     status: std.atomic.Value(i32) = .init(win.io_pending),
     refs: std.atomic.Value(u32) = .init(2),
@@ -829,7 +1076,13 @@ const WinResolveState = struct {
 fn winResolveCompleted(status: u32, _: u32, overlapped: *win.Overlapped) callconv(.winapi) void {
     const state: *WinResolveState = @fieldParentPtr("overlapped", overlapped);
     if (state.result) |result| {
-        if (status == 0) state.answer = firstWinSystemAddress(result, state.family, state.port);
+        if (status == 0 and state.both) {
+            const families = collectWinFamilies(result);
+            state.v4 = families.v4;
+            state.v6 = families.v6;
+        } else if (status == 0) {
+            state.answer = firstWinSystemAddress(result, state.family, state.port);
+        }
         win.FreeAddrInfoExW(result);
         state.result = null;
     }
@@ -863,8 +1116,46 @@ fn firstWinSystemAddress(head: ?*win.AddrInfoExW, family: i32, port: u16) ?net.I
     return null;
 }
 
-fn queryOneServer6(ns_v4: [4]u8, query: []const u8, timeout_ms: u31) Error![16]u8 {
-    const msg = try queryServerPort(ns_v4, 53, query, timeout_ms);
+fn collectWinFamilies(head: ?*win.AddrInfoExW) HostFamilies {
+    var out = HostFamilies{};
+    var cursor = head;
+    for (0..64) |_| {
+        const entry = cursor orelse break;
+        cursor = entry.next;
+        if (entry.addr == null or entry.addr_len > 128) continue;
+        const raw: [*]const u8 = @ptrCast(entry.addr.?);
+        if (entry.family == win.af_inet and out.v4 == null and entry.addr_len >= 16 and
+            std.mem.readInt(u16, raw[0..2], .little) == win.af_inet)
+        {
+            var bytes: [4]u8 = undefined;
+            @memcpy(&bytes, raw[4..8]);
+            out.v4 = bytes;
+            continue;
+        }
+        if (entry.family == win.af_inet6 and entry.addr_len >= 28 and
+            std.mem.readInt(u16, raw[0..2], .little) == win.af_inet6)
+        {
+            var bytes: [16]u8 = undefined;
+            @memcpy(&bytes, raw[8..24]);
+            const mapped = bytes[0] == 0 and bytes[1] == 0 and bytes[2] == 0 and bytes[3] == 0 and
+                bytes[4] == 0 and bytes[5] == 0 and bytes[6] == 0 and bytes[7] == 0 and
+                bytes[8] == 0 and bytes[9] == 0 and bytes[10] == 0xff and bytes[11] == 0xff;
+            if (mapped) {
+                if (out.v4 == null) {
+                    var v4_bytes: [4]u8 = undefined;
+                    @memcpy(&v4_bytes, bytes[12..16]);
+                    out.v4 = v4_bytes;
+                }
+            } else if (out.v6 == null) {
+                out.v6 = bytes;
+            }
+        }
+    }
+    return out;
+}
+
+fn queryOneServer6(ns: dns.Address, query: []const u8, timeout_ms: u31) Error![16]u8 {
+    const msg = try queryServerPort(ns, 53, query, timeout_ms);
     for (msg.answerSlice()) |rr| switch (rr.data) {
         .aaaa => |ipv6| return ipv6,
         else => {},
@@ -976,7 +1267,17 @@ fn socketTcpNonblock(family: u32) Error!sys.fd_t {
 }
 
 fn udpSocket() Error!sys.fd_t {
-    const rc = sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
+    return udpSocketFamily(posix.AF.INET, false);
+}
+
+/// `nonblock` is for the dual A/AAAA poll. A blocking socket keeps
+/// `SO_RCVTIMEO`, which is what a single query and the resolver tests use.
+fn udpSocketFamily(family: u32, nonblock: bool) Error!sys.fd_t {
+    // Socket type flags are comptime integers. A runtime `if` cannot produce
+    // that type, so start from the blocking pair and add NONBLOCK after.
+    var flags: u32 = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC;
+    if (nonblock) flags |= posix.SOCK.NONBLOCK;
+    const rc = sys.socket(family, flags, posix.IPPROTO.UDP);
     return switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => error.SocketUnavailable,
@@ -1700,15 +2001,77 @@ test "http_fetch native DNS UDP transport binds replies to query identity" {
         var joined = false;
         defer if (!joined) thread.join();
         if (wrong_id or mode == 3) {
-            try std.testing.expectError(error.HostNotFound, queryServerPort(.{ 127, 0, 0, 1 }, std.mem.bigToNative(u16, addr.port), query, 100));
+            try std.testing.expectError(error.HostNotFound, queryServerPort(.{ .ipv4 = .{ 127, 0, 0, 1 } }, std.mem.bigToNative(u16, addr.port), query, 100));
         } else {
-            const msg = try queryServerPort(.{ 127, 0, 0, 1 }, std.mem.bigToNative(u16, addr.port), query, 100);
+            const msg = try queryServerPort(.{ .ipv4 = .{ 127, 0, 0, 1 } }, std.mem.bigToNative(u16, addr.port), query, 100);
             try std.testing.expectEqual([4]u8{ 127, 0, 0, 7 }, msg.answers[0].data.a);
         }
         thread.join();
         joined = true;
         try std.testing.expect(worker.ok);
     }
+}
+
+test "resolveHostFamilies keeps literals off the resolver" {
+    const v4 = try resolveHostFamilies("127.0.0.1", 1);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &v4.v4.?);
+    try std.testing.expect(v4.v6 == null);
+    const v6 = try resolveHostFamilies("::1", 1);
+    try std.testing.expect(v6.v4 == null);
+    try std.testing.expectEqual(@as(u8, 1), v6.v6.?[15]);
+}
+
+test "dual dns query collects A and AAAA from one nameserver" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const Worker = struct {
+        fd: sys.fd_t,
+        replies: usize = 0,
+        fn run(self: *@This()) void {
+            setRecvTimeout(self.fd, 2000) catch return;
+            while (self.replies < 2) {
+                var packet: [dns.max_message_len]u8 = undefined;
+                var from: posix.sockaddr.storage = undefined;
+                var from_len: posix.socklen_t = @sizeOf(@TypeOf(from));
+                const got = sys.recvfrom(self.fd, &packet, packet.len, 0, @ptrCast(&from), &from_len);
+                if (posix.errno(got) != .SUCCESS or got < 12) return;
+                const msg = dns.parseMessage(1, 0, packet[0..@intCast(got)]) catch return;
+                if (msg.question_count != 1) return;
+                const q = msg.questions[0];
+                var out: [dns.max_message_len]u8 = undefined;
+                const encoded = switch (q.qtype) {
+                    .a => dns.encodeMessage(&out, .{
+                        .id = msg.header.id,
+                        .response = true,
+                        .questions = &.{.{ .name = q.name.slice(), .qtype = .a }},
+                        .answers = &.{.{ .name = q.name.slice(), .rr_type = .a, .ttl = 30, .data = .{ .a = .{ 203, 0, 113, 9 } } }},
+                    }),
+                    .aaaa => dns.encodeMessage(&out, .{
+                        .id = msg.header.id,
+                        .response = true,
+                        .questions = &.{.{ .name = q.name.slice(), .qtype = .aaaa }},
+                        .answers = &.{.{ .name = q.name.slice(), .rr_type = .aaaa, .ttl = 30, .data = .{ .aaaa = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 } } }},
+                    }),
+                    else => return,
+                } catch return;
+                const sent = sys.sendto(self.fd, encoded.ptr, encoded.len, 0, @ptrCast(&from), from_len);
+                if (posix.errno(sent) != .SUCCESS) return;
+                self.replies += 1;
+            }
+        }
+    };
+    const fd = try udpSocket();
+    defer closeFd(fd);
+    var bound = sys.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.bind(fd, @ptrCast(&bound), @sizeOf(@TypeOf(bound)))));
+    var bound_len: posix.socklen_t = @sizeOf(@TypeOf(bound));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.getsockname(fd, @ptrCast(&bound), &bound_len)));
+    var worker = Worker{ .fd = fd };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    const found = queryFamilies(.{ .ipv4 = .{ 127, 0, 0, 1 } }, std.mem.bigToNative(u16, bound.port), "peer.example", 1000, true, true);
+    thread.join();
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, found.v4.?);
+    try std.testing.expectEqual([16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 }, found.v6.?);
+    try std.testing.expectEqual(@as(usize, 2), worker.replies);
 }
 
 test "TLS client fatal transport: http_fetch socket writer preserves control custody" {

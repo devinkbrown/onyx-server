@@ -60,15 +60,26 @@ name = "Onyx"
 # client sees it expanded with their own details. Split on newlines into lines;
 # supports @file: to load from disk. When unset, a personalized default is used.
 #
-# Substitutions ({key} -> value; unknown keys left verbatim; {{ }} = literal):
-#   {nick} {account} {host} {network} {server} {version} {time} {date}
-#   {users} {opers} {channels}        live network figures
-#   {greeting}                        "Good morning/afternoon/evening" by hour
-#   {weather} {news}                  localized weather / headlines (see [weather]/[news])
-# Conditionals ({if:COND}...{else}...{/if}; COND = oper | account | secure | weather | news):
+# Substitutions ({key} -> value; unknown keys left verbatim; {{ }} = literal).
+# {key|fallback} is used when that value is missing or empty.
+# {plural:key:one:many} picks a word (1 -> one). CR/LF/NUL in a value become spaces.
+#   {nick} {account} {username} {realname} {host} {network} {server} {version}
+#   {time} {date} {weekday} {greeting} {uptime} {online}
+#   {users} {local_users} {opers} {channels} {channels_here} {servers}
+#   {city} {region} {country}     this connection's GeoIP place (not the IP)
+#   {away}                        AWAY text, empty when not away
+#   {weather} {news}              localized weather / headlines (see [weather]/[news])
+# {greeting} uses solar time from the client's longitude when GeoIP has one,
+# otherwise UTC. It is not a civil timezone and does not apply daylight saving.
+# Conditionals: {if:COND}...{else}...{/if}, also {if:!COND} and {if:not:COND}.
+# Flags: oper, account, secure, weather, news, away, place, city, region,
+# country, channels (this client is in at least one).
+# Numbers compare with > < >= <= = == !=, for example {if:users>1} or
+# {if:channels_here=0}.
 #   {if:account}Welcome back, {account}!{else}Please register.{/if}
 #   {if:oper}You have operator privileges.{/if}
-#   {if:secure}{else}This link is not encrypted.{/if}
+#   {if:!secure}This link is not encrypted.{/if}
+#   {if:place}You are in {city}, {region}.{/if}
 #
 # A ready-to-use annotated example ships in etc/motd.example.txt:
 # text = "@file:etc/motd.example.txt"

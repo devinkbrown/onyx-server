@@ -58,15 +58,23 @@ before being split into lines. When omitted or empty, the server serves a
 personalized built-in default.
 
 Substitutions use `{key}`; unknown keys are left verbatim, and `{{` / `}}` emit
-literal braces. The available keys are `{nick}`, `{account}`, `{host}`,
-`{network}`, `{server}`, `{version}`, `{time}`, `{date}`, `{users}`, `{opers}`,
-and `{channels}`, plus `{greeting}` (a time-of-day greeting) and `{weather}` /
-`{news}` (see `[weather]` / `[news]`).
+literal braces. `{key|fallback}` supplies text when the value is missing or
+empty. `{plural:key:one:many}` picks a word from a count (`1` uses `one`).
+CR, LF, and NUL inside a value become spaces.
 
-Conditionals take the form `{if:COND}…{else}…{/if}`, where `COND` is `oper`,
-`account`, `secure`, `weather`, or `news` (the last two are true when that line is
-available); conditionals nest. For example:
-`{if:account}Welcome back, {account}!{else}Please register.{/if}`
+Keys: `{nick}`, `{account}`, `{username}`, `{realname}`, `{host}`, `{away}`,
+`{network}`, `{server}`, `{version}`, `{time}`, `{date}`, `{weekday}`,
+`{uptime}`, `{online}`, `{users}`, `{local_users}`, `{opers}`, `{channels}`,
+`{channels_here}`, `{servers}`, `{city}`, `{region}`, `{country}`, `{greeting}`,
+`{weather}`, `{news}`. `{greeting}` uses solar time from the client's GeoIP
+longitude when one is known, otherwise UTC. The place fields are that
+connection's city, region, and country; the MOTD does not include the IP.
+
+Conditionals are `{if:COND}…{else}…{/if}`, `{if:!COND}`, and `{if:not:COND}`.
+Flags: `oper`, `account`, `secure`, `weather`, `news`, `away`, `place`, `city`,
+`region`, `country`, and `channels` (this client is in at least one). Numeric
+keys compare with `>`, `<`, `>=`, `<=`, `=`, `==`, and `!=`. Conditionals nest.
+For example: `{if:account}Welcome back, {account}!{else}Please register.{/if}`
 
 ## `[admin]`
 
