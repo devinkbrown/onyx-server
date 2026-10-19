@@ -143,7 +143,9 @@ extract_items() {
 }
 
 decode_entities() {
-  sed -E 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&#39;/'\''/g; s/&quot;/"/g; s/&apos;/'\''/g; s/&nbsp;/ /g'
+  # Named entities only. The 80-character deck clip below is unchanged.
+  # Numeric character references are decoded on the daemon's live RSS path.
+  sed -E 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&#39;/'\''/g; s/&quot;/"/g; s/&apos;/'\''/g; s/&nbsp;/ /g; s/&rsquo;/'\''/g; s/&lsquo;/'\''/g; s/&rdquo;/"/g; s/&ldquo;/"/g; s/&hellip;/.../g; s/&ndash;/-/g; s/&mdash;/--/g'
 }
 
 pack_lines() {

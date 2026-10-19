@@ -34,8 +34,10 @@ was already cached. Enable the bot with `[geo] enabled = true` (see
 - Replies: `Weather - Austin: 72°F, Partly cloudy, wind 12 mph` for a classic
   reading. A full report adds feels-like and wind direction on that line, then
   a second NOTICE such as `  humidity 45%, precip 0.20 in, 29.91 inHg, UV 6, vis 6 mi`
-  when those fields are present. A cache miss is
-  `Fetching weather for <place>… try again in a moment.`
+  when those fields are present. A precipitation amount that rounds to zero and
+  a UV index of 0 are left off that line. Cloud cover, today's highest rain,
+  snow, or thunder chance, and the observation time are added when wttr sends
+  them. A cache miss is `Fetching weather for <place>… try again in a moment.`
 - Sources: `src/daemon/server.zig:handleFantasyWeather`, `src/proto/weather_units.zig`, `src/proto/geo_fetch.zig`
 
 ## !forecast
@@ -45,9 +47,12 @@ was already cached. Enable the bot with `[geo] enabled = true` (see
   entry as `!weather`. Weekdays are computed from the date (1970-01-01 is Thursday).
 - Privileges: Any channel member able to speak. Does not require `+W`.
 - Replies: `Forecast - Austin:` followed by lines such as
-  `  Mon 19: 77/57°F, Rain, precip 0.06 in`. A classic cache row, or a miss,
-  replies `Fetching the forecast for <place>… try again in a moment.` A rich
-  report with no days replies `No multi-day forecast for <place>.`
+  `  Mon 19: 77/57°F, Rain, precip 0.06 in`. A day also shows the highest rain,
+  snow, or thunder chance (rain wins a tie) and sunrise and sunset when wttr
+  sends them. A precipitation total that rounds to zero is omitted. A classic
+  cache row, or a miss, replies `Fetching the forecast for <place>… try again
+  in a moment.` A rich report with no days replies `No multi-day forecast for
+  <place>.`
 - Sources: `src/daemon/server.zig:handleFantasyForecast`
 
 ## !setweather
@@ -74,8 +79,9 @@ was already cached. Enable the bot with `[geo] enabled = true` (see
   (news-wire — see [modes.md](../protocol/modes.md)), including `!news sources`.
   Silent otherwise.
 - Replies: `News - BBC World:` then `  1. [2h] Title - deck`. A headline with no
-  time or deck stays a plain title. `!news sources` lists keys and topics.
-  Unknown grammar replies with the usage line.
+  time or deck stays a plain title. Deck text has HTML tags removed, common
+  entities decoded, and repeated spaces collapsed. `!news sources` lists keys
+  and topics. Unknown grammar replies with the usage line.
 - Sources: `src/daemon/server.zig:handleFantasyNews`, `src/proto/news_sources.zig`
 
 ## !localnews

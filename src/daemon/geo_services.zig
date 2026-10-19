@@ -58,15 +58,24 @@ pub const Options = struct {
     max_headlines: u8 = 3,
 };
 
+/// Chance and sun times live in this process only. The Helix geo day slot does
+/// not carry them, so a restore shows temperatures until the next fetch.
 const DaySlot = struct {
     has_precip: bool = false,
     min_c: f64 = 0,
     max_c: f64 = 0,
     precip_mm: f64 = 0,
+    rain_pct: u8 = 0,
+    snow_pct: u8 = 0,
+    thunder_pct: u8 = 0,
     label_buf: [10]u8 = @splat(0),
     label_len: u8 = 0,
     desc_buf: [32]u8 = @splat(0),
     desc_len: u8 = 0,
+    sunrise_buf: [12]u8 = @splat(0),
+    sunrise_len: u8 = 0,
+    sunset_buf: [12]u8 = @splat(0),
+    sunset_len: u8 = 0,
 };
 
 const WeatherEntry = struct {
@@ -88,6 +97,14 @@ const WeatherEntry = struct {
     flags: u8 = 0,
     wind_dir_buf: [3]u8 = @splat(0),
     wind_dir_len: u8 = 0,
+    /// Cloud, observation time, and today's chance are not in the Helix row.
+    cloud_pct: u8 = 0,
+    has_cloud: bool = false,
+    rain_pct: u8 = 0,
+    snow_pct: u8 = 0,
+    thunder_pct: u8 = 0,
+    obs_buf: [12]u8 = @splat(0),
+    obs_len: u8 = 0,
     day_count: u8 = 0,
     days: [weather_units.max_days]DaySlot = .{ .{}, .{}, .{} },
     fetched_ms: i64 = 0,
@@ -129,8 +146,11 @@ pub const WeatherScratch = struct {
     loc: [max_loc]u8 = undefined,
     desc: [max_desc]u8 = undefined,
     wind_dir: [3]u8 = undefined,
+    obs: [12]u8 = undefined,
     day_labels: [weather_units.max_days][10]u8 = undefined,
     day_descs: [weather_units.max_days][32]u8 = undefined,
+    day_sunrise: [weather_units.max_days][12]u8 = undefined,
+    day_sunset: [weather_units.max_days][12]u8 = undefined,
 };
 
 /// A weather reading copied into caller storage (so it stays valid after the
@@ -652,7 +672,8 @@ pub const Service = struct {
             .max_response_bytes = 128 * 1024,
         }) catch return false;
         defer self.allocator.free(resp);
-        const parsed = geo_fetch.parseWeatherReport(geo_fetch.httpBody(resp)) catch return false;
+        const body = geo_fetch.httpPayload(resp) orelse return false;
+        const parsed = geo_fetch.parseWeatherReport(body) catch return false;
         self.storeWeather(k, parsed);
         return true;
     }
@@ -671,6 +692,12 @@ pub const Service = struct {
         e.uv = reading.uv_index;
         e.visibility = reading.visibility_km;
         e.flags = reading.flags;
+        e.cloud_pct = reading.cloud_pct;
+        e.has_cloud = reading.has_cloud;
+        e.rain_pct = reading.rain_pct;
+        e.snow_pct = reading.snow_pct;
+        e.thunder_pct = reading.thunder_pct;
+        e.obs_len = @intCast(copyClamp(&e.obs_buf, geo_fetch.clipUtf8(reading.obs, e.obs_buf.len)));
         const wind = geo_fetch.clipUtf8(reading.wind_dir, e.wind_dir_buf.len);
         e.wind_dir_len = @intCast(copyClamp(&e.wind_dir_buf, wind));
         if (e.wind_dir_len == 0) e.flags &= ~weather_units.flag_wind_dir;
@@ -686,10 +713,17 @@ pub const Service = struct {
             slot.min_c = day.min_c;
             slot.max_c = day.max_c;
             slot.precip_mm = if (day.has_precip) day.precip_mm else 0;
+            slot.rain_pct = day.rain_pct;
+            slot.snow_pct = day.snow_pct;
+            slot.thunder_pct = day.thunder_pct;
             const label = geo_fetch.clipUtf8(day.label, slot.label_buf.len);
             const desc = geo_fetch.clipUtf8(day.desc, slot.desc_buf.len);
+            const sunrise = geo_fetch.clipUtf8(day.sunrise, slot.sunrise_buf.len);
+            const sunset = geo_fetch.clipUtf8(day.sunset, slot.sunset_buf.len);
             slot.label_len = @intCast(copyClamp(&slot.label_buf, label));
             slot.desc_len = @intCast(copyClamp(&slot.desc_buf, desc));
+            slot.sunrise_len = @intCast(copyClamp(&slot.sunrise_buf, sunrise));
+            slot.sunset_len = @intCast(copyClamp(&slot.sunset_buf, sunset));
         }
         for (e.days[days..]) |*slot| slot.* = .{};
         e.fetched_ms = stamp(platform.monotonicMillis());
@@ -721,9 +755,10 @@ pub const Service = struct {
             .max_response_bytes = 1024 * 1024,
         }) catch return false;
         defer self.allocator.free(resp);
+        const body = geo_fetch.httpPayload(resp) orelse return false;
 
         var items: [max_headlines]geo_fetch.RssItem = undefined;
-        const got = geo_fetch.parseRssItems(geo_fetch.httpBody(resp), &items);
+        const got = geo_fetch.parseRssItems(body, &items);
         if (got.len == 0) return false;
         var packed_rows: [max_headlines][max_headline]u8 = undefined;
         var lines: [max_headlines][]const u8 = undefined;
@@ -943,6 +978,7 @@ fn copyWeather(e: *const WeatherEntry, scratch: *WeatherScratch) WeatherView {
     const loc = copyInto(&scratch.loc, e.loc_buf[0..e.loc_len]);
     const desc = copyInto(&scratch.desc, e.desc_buf[0..e.desc_len]);
     const wind = copyInto(&scratch.wind_dir, e.wind_dir_buf[0..e.wind_dir_len]);
+    const obs = copyInto(&scratch.obs, e.obs_buf[0..e.obs_len]);
     var view = WeatherView{
         .location = loc,
         .day_count = e.day_count,
@@ -958,6 +994,12 @@ fn copyWeather(e: *const WeatherEntry, scratch: *WeatherScratch) WeatherView {
             .flags = e.flags,
             .desc = desc,
             .wind_dir = wind,
+            .cloud_pct = e.cloud_pct,
+            .has_cloud = e.has_cloud,
+            .obs = obs,
+            .rain_pct = e.rain_pct,
+            .snow_pct = e.snow_pct,
+            .thunder_pct = e.thunder_pct,
         },
     };
     for (e.days[0..e.day_count], 0..) |day, i| {
@@ -968,6 +1010,11 @@ fn copyWeather(e: *const WeatherEntry, scratch: *WeatherScratch) WeatherView {
             .max_c = day.max_c,
             .precip_mm = day.precip_mm,
             .has_precip = day.has_precip,
+            .rain_pct = day.rain_pct,
+            .snow_pct = day.snow_pct,
+            .thunder_pct = day.thunder_pct,
+            .sunrise = copyInto(&scratch.day_sunrise[i], day.sunrise_buf[0..day.sunrise_len]),
+            .sunset = copyInto(&scratch.day_sunset[i], day.sunset_buf[0..day.sunset_len]),
         };
     }
     return view;

@@ -66,6 +66,16 @@ pub const Reading = struct {
     desc: []const u8 = "",
     /// 16-point compass from the source ("N", "ESE"); empty when unknown.
     wind_dir: []const u8 = "",
+    /// Percent cloud cover. Shown only when `has_cloud` is set, including 0.
+    /// Process memory: a Helix geo restore leaves it clear until the next fetch.
+    cloud_pct: u8 = 0,
+    has_cloud: bool = false,
+    /// Source observation clock, such as "12:11 PM". Empty when unknown.
+    obs: []const u8 = "",
+    /// Highest chance on the first forecast day. Zero means "not shown".
+    rain_pct: u8 = 0,
+    snow_pct: u8 = 0,
+    thunder_pct: u8 = 0,
 };
 
 /// One civil day of a forecast. Temperatures are metric. `label` is `YYYY-MM-DD`
@@ -77,6 +87,12 @@ pub const Day = struct {
     precip_mm: f64 = 0,
     desc: []const u8 = "",
     has_precip: bool = false,
+    /// Highest hourly chance. Zero is omitted. Not part of the Helix day slot.
+    rain_pct: u8 = 0,
+    snow_pct: u8 = 0,
+    thunder_pct: u8 = 0,
+    sunrise: []const u8 = "",
+    sunset: []const u8 = "",
 };
 
 fn roundI(v: f64) i64 {
@@ -270,7 +286,11 @@ pub fn renderReport(primary: []u8, detail: []u8, location: []const u8, reading: 
         var piece: [24]u8 = undefined;
         appendPiece(detail, &n, std.fmt.bufPrint(&piece, "humidity {d}%", .{reading.humidity_pct}) catch "");
     }
-    if ((reading.flags & flag_precip) != 0) {
+    if (notableChance(reading.rain_pct, reading.snow_pct, reading.thunder_pct)) |chance| {
+        var piece: [24]u8 = undefined;
+        appendPiece(detail, &n, std.fmt.bufPrint(&piece, "{d}% {s}", .{ chance.pct, chance.name }) catch "");
+    }
+    if ((reading.flags & flag_precip) != 0 and precipShown(reading.precip_mm, sys)) {
         var pb: [16]u8 = undefined;
         const precip = formatPrecip(reading.precip_mm, sys, &pb);
         var piece: [32]u8 = undefined;
@@ -280,7 +300,7 @@ pub fn renderReport(primary: []u8, detail: []u8, location: []const u8, reading: 
         var pb: [16]u8 = undefined;
         appendPiece(detail, &n, formatPressure(reading.pressure_hpa, sys, &pb));
     }
-    if ((reading.flags & flag_uv) != 0) {
+    if ((reading.flags & flag_uv) != 0 and reading.uv_index != 0) {
         var piece: [16]u8 = undefined;
         appendPiece(detail, &n, std.fmt.bufPrint(&piece, "UV {d}", .{reading.uv_index}) catch "");
     }
@@ -290,30 +310,67 @@ pub fn renderReport(primary: []u8, detail: []u8, location: []const u8, reading: 
         var piece: [24]u8 = undefined;
         appendPiece(detail, &n, std.fmt.bufPrint(&piece, "vis {s}", .{vis}) catch "");
     }
+    if (reading.has_cloud) {
+        var piece: [16]u8 = undefined;
+        appendPiece(detail, &n, std.fmt.bufPrint(&piece, "cloud {d}%", .{reading.cloud_pct}) catch "");
+    }
+    if (reading.obs.len != 0) {
+        var piece: [24]u8 = undefined;
+        appendPiece(detail, &n, std.fmt.bufPrint(&piece, "obs {s}", .{reading.obs}) catch "");
+    }
     return .{ .primary = line, .detail = detail[0..n] };
 }
 
-/// One forecast day, e.g. "Mon 19: 78/62°F, Partly cloudy, precip 0.10 in".
-/// The unit is written once after the high/low pair.
+/// One forecast day, e.g. "Mon 19: 77/57°F, Rain, precip 0.06 in".
+/// The unit is written once after the high/low pair. A chance is the highest of
+/// rain, snow, and thunder (rain wins a tie). Precipitation that rounds to zero
+/// is omitted, as are empty sunrise and sunset.
 pub fn renderDay(buf: []u8, day: Day, sys: UnitSystem) []const u8 {
     var label_buf: [16]u8 = undefined;
     const label = formatDayLabel(day.label, &label_buf);
     var pair: [24]u8 = undefined;
     const temps = formatTempPair(day.max_c, day.min_c, sys, &pair);
-    if (day.desc.len != 0 and day.has_precip) {
+    const head = if (day.desc.len != 0)
+        std.fmt.bufPrint(buf, "{s}: {s}, {s}", .{ label, temps, day.desc }) catch return buf[0..0]
+    else
+        std.fmt.bufPrint(buf, "{s}: {s}", .{ label, temps }) catch return buf[0..0];
+    var n: usize = head.len;
+    if (notableChance(day.rain_pct, day.snow_pct, day.thunder_pct)) |chance| {
+        var piece: [24]u8 = undefined;
+        appendPiece(buf, &n, std.fmt.bufPrint(&piece, "{d}% {s}", .{ chance.pct, chance.name }) catch "");
+    }
+    if (day.has_precip and precipShown(day.precip_mm, sys)) {
         var pb: [16]u8 = undefined;
         const precip = formatPrecip(day.precip_mm, sys, &pb);
-        return std.fmt.bufPrint(buf, "{s}: {s}, {s}, precip {s}", .{ label, temps, day.desc, precip }) catch buf[0..0];
+        var piece: [32]u8 = undefined;
+        appendPiece(buf, &n, std.fmt.bufPrint(&piece, "precip {s}", .{precip}) catch "");
     }
-    if (day.desc.len != 0) {
-        return std.fmt.bufPrint(buf, "{s}: {s}, {s}", .{ label, temps, day.desc }) catch buf[0..0];
+    if (day.sunrise.len != 0) {
+        var piece: [28]u8 = undefined;
+        appendPiece(buf, &n, std.fmt.bufPrint(&piece, "sunrise {s}", .{day.sunrise}) catch "");
     }
-    if (day.has_precip) {
-        var pb: [16]u8 = undefined;
-        const precip = formatPrecip(day.precip_mm, sys, &pb);
-        return std.fmt.bufPrint(buf, "{s}: {s}, precip {s}", .{ label, temps, precip }) catch buf[0..0];
+    if (day.sunset.len != 0) {
+        var piece: [28]u8 = undefined;
+        appendPiece(buf, &n, std.fmt.bufPrint(&piece, "sunset {s}", .{day.sunset}) catch "");
     }
-    return std.fmt.bufPrint(buf, "{s}: {s}", .{ label, temps }) catch buf[0..0];
+    return buf[0..n];
+}
+
+const NotableChance = struct { pct: u8, name: []const u8 };
+
+/// Snow or thunder is shown only when it is strictly the highest chance.
+/// An equal rain chance wins, then snow, then thunder.
+fn notableChance(rain: u8, snow: u8, thunder: u8) ?NotableChance {
+    if (rain > 0 and rain >= snow and rain >= thunder) return .{ .pct = rain, .name = "rain" };
+    if (snow > 0 and snow >= thunder) return .{ .pct = snow, .name = "snow" };
+    if (thunder > 0) return .{ .pct = thunder, .name = "thunder" };
+    return null;
+}
+
+fn precipShown(mm: f64, sys: UnitSystem) bool {
+    var buf: [16]u8 = undefined;
+    const text = formatPrecip(mm, sys, &buf);
+    return text.len != 0 and !std.mem.eql(u8, text, "0.00 in") and !std.mem.eql(u8, text, "0 mm");
 }
 
 fn formatTempPair(max_c: f64, min_c: f64, sys: UnitSystem, buf: []u8) []const u8 {
@@ -489,6 +546,54 @@ test "renderReport adds feels-like and a detail line without changing the classi
     const day = Day{ .label = "2026-10-19", .min_c = 14, .max_c = 25, .precip_mm = 1.5, .desc = "Rain", .has_precip = true };
     var day_buf: [96]u8 = undefined;
     try testing.expectEqualStrings("Mon 19: 77/57°F, Rain, precip 0.06 in", renderDay(&day_buf, day, .imperial));
+}
+
+test "renderReport omits a zero amount and shows chance, cloud, and sun" {
+    var primary: [160]u8 = undefined;
+    var detail: [200]u8 = undefined;
+    const rich = Reading{
+        .temp_c = 14,
+        .wind_kph = 4,
+        .feels_c = 12,
+        .humidity_pct = 46,
+        .precip_mm = 0,
+        .pressure_hpa = 1023,
+        .uv_index = 0,
+        .visibility_km = 10,
+        .flags = flag_feels | flag_humidity | flag_precip | flag_pressure | flag_uv | flag_visibility | flag_wind_dir | flag_rich,
+        .desc = "Overcast",
+        .wind_dir = "SE",
+        .cloud_pct = 100,
+        .has_cloud = true,
+        .obs = "12:11 PM",
+        .rain_pct = 11,
+    };
+    const report = renderReport(&primary, &detail, "Austin", rich, .imperial);
+    try testing.expectEqualStrings("Austin: 57°F (feels 54°F), Overcast, wind SE 2 mph", report.primary);
+    try testing.expectEqualStrings("humidity 46%, 11% rain, 30.21 inHg, vis 6 mi, cloud 100%, obs 12:11 PM", report.detail);
+    try testing.expect(std.mem.indexOf(u8, report.detail, "precip") == null);
+    try testing.expect(std.mem.indexOf(u8, report.detail, "UV") == null);
+
+    var day_buf: [160]u8 = undefined;
+    const dry = Day{
+        .label = "2026-10-19",
+        .min_c = 14,
+        .max_c = 24,
+        .precip_mm = 0,
+        .desc = "Overcast",
+        .has_precip = true,
+        .rain_pct = 11,
+        .sunrise = "07:36 AM",
+        .sunset = "06:55 PM",
+    };
+    const line = renderDay(&day_buf, dry, .imperial);
+    try testing.expectEqualStrings("Mon 19: 75/57°F, Overcast, 11% rain, sunrise 07:36 AM, sunset 06:55 PM", line);
+    try testing.expect(line.len < day_buf.len);
+
+    const snow = Day{ .label = "2026-10-20", .min_c = 16, .max_c = 28, .desc = "Snow", .snow_pct = 40, .rain_pct = 5, .thunder_pct = 5 };
+    try testing.expectEqualStrings("Tue 20: 82/61°F, Snow, 40% snow", renderDay(&day_buf, snow, .imperial));
+    const storm = Day{ .label = "2026-10-21", .min_c = 19, .max_c = 29, .precip_mm = 1.0, .desc = "Thunder", .has_precip = true, .rain_pct = 10, .thunder_pct = 30 };
+    try testing.expectEqualStrings("Wed 21: 84/66°F, Thunder, 30% thunder, precip 0.04 in", renderDay(&day_buf, storm, .imperial));
 }
 
 test "parseForecast reads key=value source and renders localized" {

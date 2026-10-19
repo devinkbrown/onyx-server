@@ -15,6 +15,7 @@
 //! I/O lives in `daemon/geo_services.zig` (a background thread), so nothing here
 //! blocks or allocates.
 const std = @import("std");
+const http1_client = @import("http1_client.zig");
 const weather_units = @import("weather_units.zig");
 
 pub const Error = error{
@@ -109,11 +110,24 @@ pub fn buildNewsRequest(buf: []u8, host: []const u8, path: []const u8) Error![]c
 }
 
 /// Return the body of an HTTP response (everything after the CRLFCRLF header
-/// terminator). Returns the whole input if no terminator is present.
+/// terminator). Returns the whole input if no terminator is present. This does
+/// not decode `Transfer-Encoding: chunked`. Callers that parse a live response
+/// use `httpPayload`.
 pub fn httpBody(response: []const u8) []const u8 {
     if (std.mem.indexOf(u8, response, "\r\n\r\n")) |i| return response[i + 4 ..];
     if (std.mem.indexOf(u8, response, "\n\n")) |i| return response[i + 2 ..];
     return response;
+}
+
+/// Decode one complete HTTP/1.0 or 1.1 response in place and return the body.
+/// Chunked framing and `Content-Length` are honored. A non-2xx status, a
+/// truncated message, or too many headers returns null. The slice aliases
+/// `response`.
+pub fn httpPayload(response: []u8) ?[]const u8 {
+    var headers: [64]http1_client.Header = undefined;
+    const parsed = http1_client.parseResponse(response, &headers) catch return null;
+    if (parsed.status < 200 or parsed.status > 299) return null;
+    return parsed.body;
 }
 
 /// Parse either a wttr.in `j1` document or the legacy one-line body.
@@ -360,6 +374,11 @@ fn parseWeatherJson(body: []const u8) Error!WeatherReport {
     if (stringField(current, "windspeedKmph", 0)) |raw| if (parseJsonNumber(raw)) |v| {
         reading.wind_kph = v;
     };
+    if (stringField(current, "cloudcover", 0)) |raw| if (parseSmallInt(raw, 100)) |v| {
+        reading.cloud_pct = @intCast(v);
+        reading.has_cloud = true;
+    };
+    reading.obs = std.mem.trim(u8, stringField(current, "observation_time", 0) orelse "", " \t\r\n");
     reading.wind_dir = std.mem.trim(u8, stringField(current, "winddir16Point", 0) orelse "", " \t\r\n");
     if (reading.wind_dir.len != 0) reading.flags |= weather_units.flag_wind_dir;
     reading.desc = std.mem.trim(u8, nestedValue(current, "weatherDesc") orelse "", " \t\r\n");
@@ -380,10 +399,19 @@ fn parseWeatherJson(body: []const u8) Error!WeatherReport {
             if (stringField(day_inner, "mintempC", 0)) |raw| day.min_c = parseJsonNumber(raw) orelse day.min_c;
             if (stringField(day_inner, "maxtempC", 0)) |raw| day.max_c = parseJsonNumber(raw) orelse day.max_c;
             if (arrayInterior(day_inner, "hourly", 0)) |hourly| fillHourly(&day, hourly);
+            if (arrayInterior(day_inner, "astronomy", 0)) |astro_arr| if (firstObjectInterior(astro_arr)) |astro| {
+                day.sunrise = std.mem.trim(u8, stringField(astro, "sunrise", 0) orelse "", " \t\r\n");
+                day.sunset = std.mem.trim(u8, stringField(astro, "sunset", 0) orelse "", " \t\r\n");
+            };
             if (day.label.len == 0 and day.desc.len == 0) continue;
             report.days[report.day_count] = day;
             report.day_count += 1;
         }
+    }
+    if (report.day_count != 0) {
+        report.reading.rain_pct = report.days[0].rain_pct;
+        report.reading.snow_pct = report.days[0].snow_pct;
+        report.reading.thunder_pct = report.days[0].thunder_pct;
     }
     return report;
 }
@@ -398,6 +426,9 @@ fn fillHourly(day: *weather_units.Day, hourly: []const u8) void {
             precip += v;
             saw = true;
         };
+        noteChance(&day.rain_pct, stringField(hour, "chanceofrain", 0));
+        noteChance(&day.snow_pct, stringField(hour, "chanceofsnow", 0));
+        noteChance(&day.thunder_pct, stringField(hour, "chanceofthunder", 0));
         const desc = std.mem.trim(u8, nestedValue(hour, "weatherDesc") orelse "", " \t\r\n");
         const clock = std.fmt.parseInt(i32, stringField(hour, "time", 0) orelse "", 10) catch {
             if (day.desc.len == 0 and desc.len != 0) day.desc = desc;
@@ -411,8 +442,15 @@ fn fillHourly(day: *weather_units.Day, hourly: []const u8) void {
     }
     if (saw) {
         day.precip_mm = precip;
-        day.has_precip = true;
+        day.has_precip = precip != 0;
     }
+}
+
+fn noteChance(dst: *u8, raw: ?[]const u8) void {
+    const text = raw orelse return;
+    const v = parseSmallInt(text, 100) orelse return;
+    const pct: u8 = @intCast(v);
+    if (pct > dst.*) dst.* = pct;
 }
 
 fn arrayInterior(s: []const u8, key: []const u8, depth: usize) ?[]const u8 {
@@ -653,26 +691,35 @@ fn cleanText(src: []const u8, buf: []u8) []const u8 {
         if (src[i] == '<') {
             if (std.mem.indexOfScalarPos(u8, src, i, '>')) |end| {
                 i = end + 1;
-                if (n < buf.len and (n == 0 or buf[n - 1] != ' ')) {
-                    buf[n] = ' ';
-                    n += 1;
-                }
+                pushSpace(buf, &n);
                 continue;
             }
         }
         if (src[i] == '&') {
             if (decodeEntity(src[i..])) |ent| {
-                if (!appendCp(buf, &n, ent.cp)) break;
+                if (ent.cp < 0x20 or ent.cp == 0x7f) {
+                    pushSpace(buf, &n);
+                } else if (!appendCp(buf, &n, ent.cp)) break;
                 i += ent.len;
                 continue;
             }
         }
         const c = src[i];
-        buf[n] = if (c < 0x20 or c == 0x7f) ' ' else c;
-        n += 1;
+        if (c <= 0x20 or c == 0x7f) {
+            pushSpace(buf, &n);
+        } else {
+            buf[n] = c;
+            n += 1;
+        }
         i += 1;
     }
     return std.mem.trim(u8, buf[0..n], " ");
+}
+
+fn pushSpace(buf: []u8, n: *usize) void {
+    if (n.* == 0 or n.* >= buf.len or buf[n.* - 1] == ' ') return;
+    buf[n.*] = ' ';
+    n.* += 1;
 }
 
 const Entity = struct { cp: u21, len: usize };
@@ -685,10 +732,48 @@ fn decodeEntity(s: []const u8) ?Entity {
         .{ .name = "&quot;", .cp = '"' },
         .{ .name = "&apos;", .cp = '\'' },
         .{ .name = "&nbsp;", .cp = 0xA0 },
+        .{ .name = "&rsquo;", .cp = 0x2019 },
+        .{ .name = "&lsquo;", .cp = 0x2018 },
+        .{ .name = "&rdquo;", .cp = 0x201D },
+        .{ .name = "&ldquo;", .cp = 0x201C },
+        .{ .name = "&hellip;", .cp = 0x2026 },
+        .{ .name = "&ndash;", .cp = 0x2013 },
+        .{ .name = "&mdash;", .cp = 0x2014 },
         .{ .name = "&#39;", .cp = '\'' },
     };
     for (names) |ent| if (std.ascii.startsWithIgnoreCase(s, ent.name)) return .{ .cp = ent.cp, .len = ent.name.len };
-    return null;
+    return decodeNumericEntity(s);
+}
+
+fn decodeNumericEntity(s: []const u8) ?Entity {
+    if (s.len < 4 or s[0] != '&' or s[1] != '#') return null;
+    var i: usize = 2;
+    const hex = i < s.len and (s[i] == 'x' or s[i] == 'X');
+    if (hex) i += 1;
+    const start = i;
+    var cp: u32 = 0;
+    var digits: usize = 0;
+    while (i < s.len and digits < 6) {
+        const c = s[i];
+        if (c == ';') break;
+        const digit: u32 = if (hex) switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => return null,
+        } else switch (c) {
+            '0'...'9' => c - '0',
+            else => return null,
+        };
+        const base: u32 = if (hex) 16 else 10;
+        if (cp > (0x10FFFF - digit) / base) return null;
+        cp = cp * base + digit;
+        digits += 1;
+        i += 1;
+    }
+    if (digits == 0 or i >= s.len or s[i] != ';' or i == start) return null;
+    if (cp == 0 or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return null;
+    return .{ .cp = @intCast(cp), .len = i + 1 };
 }
 
 fn appendCp(buf: []u8, n: *usize, cp: u21) bool {
@@ -832,7 +917,7 @@ test "parseRssTitles skips the feed title and returns headlines" {
 
 test "parseWeatherReport reads wttr j1 current conditions and the midday forecast" {
     const body =
-        \\{"current_condition":[{"temp_C":"22","FeelsLikeC":"21","humidity":"50","precipMM":"1.5","pressure":"1013","uvIndex":"3","visibility":"10","windspeedKmph":"20","winddir16Point":"N","weatherDesc":[{"value":"Partly cloudy "}]}],"nearest_area":[{"areaName":[{"value":"Austin"}],"region":[{"value":"Texas"}]}],"weather":[{"date":"2026-10-19","maxtempC":"25","mintempC":"14","hourly":[{"time":"0","precipMM":"0.5","weatherDesc":[{"value":"Cloud"}]},{"time":"1200","precipMM":"1.0","weatherDesc":[{"value":"Rain"}]}]}]}
+        \\{"current_condition":[{"temp_C":"22","FeelsLikeC":"21","humidity":"50","precipMM":"1.5","pressure":"1013","uvIndex":"3","visibility":"10","cloudcover":"75","observation_time":"12:11 PM","windspeedKmph":"20","winddir16Point":"N","weatherDesc":[{"value":"Partly cloudy "}]}],"nearest_area":[{"areaName":[{"value":"Austin"}],"region":[{"value":"Texas"}]}],"weather":[{"date":"2026-10-19","maxtempC":"25","mintempC":"14","astronomy":[{"sunrise":"07:36 AM","sunset":"06:55 PM"}],"hourly":[{"time":"0","precipMM":"0.5","chanceofsnow":"10","weatherDesc":[{"value":"Cloud"}]},{"time":"1200","precipMM":"1.0","chanceofrain":"40","chanceofthunder":"5","weatherDesc":[{"value":"Rain"}]}]}]}
     ;
     const report = try parseWeatherReport(body);
     try std.testing.expectEqual(@as(f64, 22), report.reading.temp_c);
@@ -855,6 +940,78 @@ test "parseWeatherReport reads wttr j1 current conditions and the midday forecas
     try std.testing.expectEqual(@as(f64, 1.5), report.days[0].precip_mm);
     try std.testing.expectEqualStrings("Rain", report.days[0].desc);
     try std.testing.expect(report.days[0].has_precip);
+    try std.testing.expect(report.reading.has_cloud);
+    try std.testing.expectEqual(@as(u8, 75), report.reading.cloud_pct);
+    try std.testing.expectEqualStrings("12:11 PM", report.reading.obs);
+    try std.testing.expectEqual(@as(u8, 40), report.days[0].rain_pct);
+    try std.testing.expectEqual(@as(u8, 10), report.days[0].snow_pct);
+    try std.testing.expectEqual(@as(u8, 5), report.days[0].thunder_pct);
+    try std.testing.expectEqual(@as(u8, 40), report.reading.rain_pct);
+    try std.testing.expectEqualStrings("07:36 AM", report.days[0].sunrise);
+    try std.testing.expectEqualStrings("06:55 PM", report.days[0].sunset);
+}
+
+test "parseWeatherReport reads a pretty-printed three-day j1 document" {
+    const body =
+        \\{
+        \\  "current_condition": [
+        \\    {
+        \\      "temp_C": "14",
+        \\      "FeelsLikeC": "12",
+        \\      "humidity": "46",
+        \\      "precipMM": "0.0",
+        \\      "pressure": "1023",
+        \\      "uvIndex": "0",
+        \\      "visibility": "10",
+        \\      "cloudcover": "100",
+        \\      "windspeedKmph": "4",
+        \\      "winddir16Point": "SE",
+        \\      "weatherDesc": [ { "value": "Overcast " } ]
+        \\    }
+        \\  ],
+        \\  "nearest_area": [ { "areaName": [ { "value": "Austin" } ], "region": [ { "value": "Texas" } ] } ],
+        \\  "weather": [
+        \\    {
+        \\      "date": "2026-10-19",
+        \\      "maxtempC": "24",
+        \\      "mintempC": "14",
+        \\      "astronomy": [ { "sunrise": "07:36 AM", "sunset": "06:55 PM" } ],
+        \\      "hourly": [
+        \\        { "time": "0", "precipMM": "0.0", "chanceofrain": "2", "weatherDesc": [ { "value": "Cloudy" } ] },
+        \\        { "time": "1200", "precipMM": "0.0", "chanceofrain": "11", "chanceofthunder": "1", "weatherDesc": [ { "value": "Overcast" } ] }
+        \\      ]
+        \\    },
+        \\    {
+        \\      "date": "2026-10-20",
+        \\      "maxtempC": "28",
+        \\      "mintempC": "16",
+        \\      "hourly": [ { "time": "1200", "precipMM": "0.0", "chanceofrain": "0", "chanceofsnow": "40", "chanceofthunder": "5", "weatherDesc": [ { "value": "Snow" } ] } ]
+        \\    },
+        \\    {
+        \\      "date": "2026-10-21",
+        \\      "maxtempC": "29",
+        \\      "mintempC": "19",
+        \\      "hourly": [ { "time": "900", "precipMM": "1.0", "chanceofrain": "10", "chanceofthunder": "30", "weatherDesc": [ { "value": "Thunder" } ] } ]
+        \\    }
+        \\  ]
+        \\}
+    ;
+    const report = try parseWeatherReport(body);
+    try std.testing.expectEqualStrings("Austin", report.location);
+    try std.testing.expectEqual(@as(f64, 14), report.reading.temp_c);
+    try std.testing.expect((report.reading.flags & weather_units.flag_uv) != 0);
+    try std.testing.expectEqual(@as(u8, 0), report.reading.uv_index);
+    try std.testing.expect((report.reading.flags & weather_units.flag_precip) != 0);
+    try std.testing.expectEqual(@as(f64, 0), report.reading.precip_mm);
+    try std.testing.expectEqual(@as(u8, 11), report.reading.rain_pct);
+    try std.testing.expectEqual(@as(usize, 3), report.day_count);
+    try std.testing.expect(!report.days[0].has_precip);
+    try std.testing.expectEqualStrings("Overcast", report.days[0].desc);
+    try std.testing.expectEqual(@as(u8, 11), report.days[0].rain_pct);
+    try std.testing.expectEqual(@as(u8, 40), report.days[1].snow_pct);
+    try std.testing.expectEqual(@as(u8, 30), report.days[2].thunder_pct);
+    try std.testing.expect(report.days[2].has_precip);
+    try std.testing.expectEqual(@as(f64, 1.0), report.days[2].precip_mm);
 }
 
 test "parseWeatherReport accepts the legacy one-line body" {
@@ -894,4 +1051,37 @@ test "parseRssItems keeps the publication time and description" {
 test "httpBody splits on the header terminator" {
     const resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n+10°C|↑5km/h|Clear|Paris";
     try std.testing.expectEqualStrings("+10°C|↑5km/h|Clear|Paris", httpBody(resp));
+}
+
+test "httpPayload decodes a chunked body and rejects a non-2xx status" {
+    const json = "{\"current_condition\":[{\"temp_C\":\"14\",\"weatherDesc\":[{\"value\":\"Overcast\"}]}],\"nearest_area\":[{\"areaName\":[{\"value\":\"Austin\"}]}],\"weather\":[{\"date\":\"2026-10-19\",\"maxtempC\":\"24\",\"mintempC\":\"14\",\"hourly\":[{\"time\":\"1200\",\"precipMM\":\"0.0\",\"chanceofrain\":\"11\",\"weatherDesc\":[{\"value\":\"Overcast\"}]}]}]}";
+    const split = 40;
+    var raw: [1400]u8 = undefined;
+    const msg = std.fmt.bufPrint(&raw, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n{x}\r\n{s}\r\n0\r\n\r\n", .{
+        split,
+        json[0..split],
+        json.len - split,
+        json[split..],
+    }) catch unreachable;
+    try std.testing.expect(httpBody(msg)[0] != '{');
+    const body = httpPayload(msg) orelse return error.ParseFailed;
+    const report = try parseWeatherReport(body);
+    try std.testing.expectEqualStrings("Austin", report.location);
+    try std.testing.expectEqual(@as(f64, 14), report.reading.temp_c);
+    try std.testing.expectEqual(@as(usize, 1), report.day_count);
+    try std.testing.expectEqual(@as(u8, 11), report.days[0].rain_pct);
+    try std.testing.expect((report.reading.flags & weather_units.flag_rich) != 0);
+
+    var missing = ("HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}").*;
+    try std.testing.expect(httpPayload(&missing) == null);
+    var framed = ("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntrueJUNK").*;
+    try std.testing.expectEqualStrings("true", httpPayload(&framed).?);
+}
+
+test "packHeadline decodes markup, entities, and collapsed space" {
+    var packed_line: [180]u8 = undefined;
+    const line = packHeadline(&packed_line, 1792422245, "Tom&#8217;s win", "<p>Jane&rsquo;s note&hellip;</p>  <b>today</b>");
+    const view = unpackHeadline(line);
+    try std.testing.expectEqualStrings("Tom’s win", view.title);
+    try std.testing.expectEqualStrings("Jane’s note… today", view.deck);
 }
