@@ -39,8 +39,8 @@ in `macTag`).
 ```text
 IPv4  a.b.c.d      -> <f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.onyx
 IPv6  2001:db8::1  -> <f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.onyx
-opaque             -> <f>.opq.onyx
-opaque + epoch     -> <f(epoch)>.opq.onyx   (anon auth-split; see below)
+opaque             -> <32 hex>.opq.onyx          (v3; 128 bits)
+opaque + epoch     -> <32 hex epoch>.opq.onyx    (anon auth-split; see below)
 account            -> kain.users.onyx
 ```
 
@@ -70,12 +70,15 @@ The server fills `Geo` from its MaxMind databases in `cloakGeo`
 | `mode` | Form (`cloak` fn) | Subnet-bannable? | What leaks |
 | --- | --- | --- | --- |
 | `hierarchical` (default) | `cloakIPv4` / `cloakIPv6` | Yes — shared prefix tokens + `a<asn>.<cc>` labels | Which users share a subnet; country + ASN |
-| `opaque` | `cloakOpaque` → `<f>.opq.<suffix>` | No | Nothing — one token, no subnet hierarchy, no geo |
+| `opaque` | `cloakOpaqueV3` → `<32 hex>.opq.<suffix>` | No | Nothing — one 128-bit token, no subnet hierarchy, no geo |
 
-Opaque emits a single 64-bit token over the whole address (`opaque_marker =
-"opq"`), so nothing about the address leaks — not even country/ASN or which
-users share a subnet — at the cost that opaque cloaks cannot be subnet-banned.
-Two addresses in the same /24 share nothing under opaque.
+Opaque emits a single token over the whole address (`opaque_marker = "opq"`),
+so nothing about the address leaks — not even country/ASN or which users share
+a subnet — at the cost that opaque cloaks cannot be subnet-banned. The daemon
+uses the v3 128-bit token (`cloakOpaqueV3`, domain tags `ip4/v3/opq|` /
+`ip6/v3/opq|`). The v2 64-bit `cloakOpaque` function stays in the engine so a
+ban written against an older public token can still be recognized; other users
+do not see that token. Two addresses in the same /24 share nothing under opaque.
 
 ## Per-account cloak
 
@@ -95,13 +98,13 @@ the conventional `localhost`.
 
 When `[cloak] anon_epoch_secs` is non-zero (default `86400` = 24 h), the cloak
 engine **splits on authentication state**. An **unauthenticated** client
-(`session.account() == null`) is cloaked with `cloakOpaqueEpoch`
-([src/proto/cloak.zig:187](../../src/proto/cloak.zig)): a single 64-bit token
-over the full address **plus the current epoch counter**, then the `opq` marker
-and suffix (`<f(epoch)>.opq.<suffix>`). The epoch is folded into the HMAC
-(`token64Epoch` / `macTagEpoch` → `HMAC-SHA256(key, domain || data || epoch_be64)`,
-domain tags `ip4/v2/opqe|` / `ip6/v2/opqe|`, so an epoch cloak never equals the
-plain `cloakOpaque` token). Two consequences:
+(`session.account() == null`) is cloaked with `cloakOpaqueEpochV3`: a single
+**128-bit** token over the full address **plus the current epoch counter**,
+then the `opq` marker and suffix (`<f(epoch)>.opq.<suffix>`, 32 hex digits).
+The epoch is folded into the HMAC (`token128Epoch` →
+`HMAC-SHA256(key, domain || data || epoch_be64)`, domain tags `ip4/v3/opqe|` /
+`ip6/v3/opqe|`). A v2 64-bit epoch token of the same address never equals the
+v3 token. Two consequences:
 
 - the same address is **unlinkable across epochs** (each rollover yields a fresh,
   unrelatable token), retiring the forever-linkability of a static-IP anonymous
@@ -109,15 +112,25 @@ plain `cloakOpaque` token). Two consequences:
 - the opaque single-token form leaks **no subnet co-membership** and no geo.
 
 The epoch is `floor(wall_clock_seconds / anon_epoch_secs)`, computed by
-`anonCloakEpoch` ([src/daemon/server.zig:5981](../../src/daemon/server.zig)). It
-is **wall-clock** based, not per-node monotonic, so every mesh node computes the
-same epoch for a given instant — the same cross-node clock-domain rule as oper
-grants and HLC LWW; a monotonic clock would desync the anon cloak across the
-mesh.
+`anonCloakEpoch` from `meshWallMs` (the reactor wall clock, not a per-node
+monotonic clock). Every mesh node computes the same epoch for a given instant.
+A connection that stays up across the boundary is recomputed on the maintenance
+tick: local channels get CHGHOST, and peers get a fresh membership plus guest
+presence so the new host is the one the rest of the mesh shows. A persona or an
+account cloak is not rotated.
+
+If cloaking fails while a key is configured, the visible host is
+`hidden.opq.<suffix>`. It is never the raw address and never a reverse name.
+
+Operators and the user themselves also see a 320 `ban cloak <hierarchical>`
+line. That host is the stable v2 hierarchical cloak (subnet tokens and
+`a<asn>.<cc>`). WARD matches it, the current and previous v3 public tokens, and
+the v2 64-bit opaque tokens, so a subnet hostmask and a ban written against the
+previous public cloak still hit. None of those alternate hosts is the host
+other users see.
 
 **Logged-in clients are unaffected.** The auth-split branch in `applyVisibleHost`
-([src/daemon/server.zig:5825](../../src/daemon/server.zig)) fires only when
-`account() == null`; an authenticated client falls through to its stable,
+fires only when `account() == null`; an authenticated client falls through to its stable,
 moderatable account/hierarchical cloak and keeps subnet-bannability. The
 trade-off is deliberate: moderation of anonymous abuse shifts to **account bans +
 registration friction**, which these opaque, unlinkable cloaks are designed to
@@ -208,7 +221,7 @@ Numerics are defined in [src/proto/numeric.zig](../../src/proto/numeric.zig).
 | Numeric | Meaning | Local user WHOIS | Remote (mesh) user WHOIS |
 | --- | --- | --- | --- |
 | `338` `RPL_WHOISACTUALLY` | real host / IP | Oper or self | Oper requester + field propagated (secured leg) |
-| `320` `RPL_WHOISSPECIAL` | GeoIP/ASN summary + rDNS name; separate +R/+g message-restriction hints | Geo/rDNS: oper or self. +R/+g hints: any requester | Geo: oper requester + real IP propagated (geo resolved locally). +R/+g hints are local-user only |
+| `320` `RPL_WHOISSPECIAL` | Literal address and rDNS, GeoIP/ASN, oper/self `ban cloak`, and +R/+g message-restriction hints | Address, rDNS, and `ban cloak`: oper or self. +R/+g hints: any requester | Address, rDNS, geo, and `ban cloak`: oper requester when the real IP propagated (geo and the ban cloak are computed locally). +R/+g hints are local-user only |
 | `276` `RPL_WHOISCERTFP` | TLS client-cert fingerprint | Any requester (it is the value SASL EXTERNAL matches) | Oper requester + certfp propagated |
 
 Note the asymmetry: locally, `276` is not oper-gated (a client's certfp is not
@@ -229,9 +242,9 @@ wired in [src/main.zig](../../src/main.zig).
 | `secret` | string | random per-boot | Passphrase stretched to the 32-byte cloak key by **argon2id** (64 MiB / t=2 / p=1, fixed salt). Absent → random key (privacy still on; cloaks are not stable across restarts). |
 | `previous_secret` | string | none | Prior secret (same argon2id path) kept live so WARD host/mask bans written under it keep matching during a rotation grace window. Drop once old bans age out. |
 | `suffix` | string | `onyx` | Network-identifying tail: IP cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname/account cloaks embed it. |
-| `mode` | string | `hierarchical` | `hierarchical` = subnet-bannable tokens + `a<asn>.<cc>` labels; `opaque` = one token, no subnet/geo leak, not subnet-bannable. |
+| `mode` | string | `hierarchical` | `hierarchical` = subnet-bannable tokens + `a<asn>.<cc>` labels; `opaque` = one 128-bit token, no subnet/geo leak, not subnet-bannable. |
 | `account_cloak` | bool | `false` | Logged-in clients show the key-free `<account>.users.<suffix>`. Explicit VHOST personas still override. |
-| `anon_epoch_secs` | integer (seconds) | `86400` | Anonymous auth-split cadence. Non-zero → unauthenticated clients get the epoch-rotating opaque cloak (above). `0` disables the split (anonymous clients keep the stable hierarchical cloak). |
+| `anon_epoch_secs` | integer (seconds) | `86400` | Anonymous auth-split cadence. Non-zero → unauthenticated clients get the 128-bit epoch cloak, including clients that stay connected across the boundary. `0` keeps the stable hierarchical cloak. |
 
 **Mesh requirement.** Every mesh node MUST share one `[cloak] secret`. On a
 meshed node with no shared secret, each node derives its own random per-boot key,

@@ -19,8 +19,9 @@ pub const Params = struct {
 
 /// The SASL mechanism that produced a verified account.
 ///
-/// Elevation depends only on the account name; the mechanism is retained for
-/// audit events and structured replies at higher layers.
+/// This registry keys the grant on the account name. The daemon applies a
+/// separate step-up gate before projection: a passkey-locked account does not
+/// become an operator on a password, recovery, or session-token session.
 pub const SaslMechanism = enum {
     external,
     scram_sha_256,
@@ -29,6 +30,9 @@ pub const SaslMechanism = enum {
 };
 
 /// Account identity after SASL has already succeeded.
+/// The registry itself still keys only on the account name. The daemon
+/// refuses to project that grant for a passkey-locked account unless the
+/// live session authenticated with a passkey or EXTERNAL.
 pub const VerifiedAccount = struct {
     name: []const u8,
     mechanism: SaslMechanism = .other,

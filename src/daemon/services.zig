@@ -315,7 +315,14 @@ pub const account_flag_secure: u32 = 1 << 4;
 /// Passkey login and a recovery-code password replacement stay available.
 /// The generic ACCOUNTSET flags field cannot set or clear this bit.
 pub const account_flag_passkey_only: u32 = 1 << 5;
+/// Operator elevation stays closed to password, SCRAM, recovery, and session
+/// tokens until a later passkey authentication. LOCK sets this with
+/// `passkey_only`. Recovery clears `passkey_only` and leaves this set, so the
+/// restored password is not an operator credential. A passkey sign-in clears
+/// it only after `passkey_only` is already clear. ACCOUNTSET cannot touch it.
+pub const account_flag_oper_stepup: u32 = 1 << 6;
 pub const account_flags_privileged: u32 = account_flag_suspended | account_flag_forbidden | account_flag_noexpire;
+const account_flags_sticky: u32 = account_flag_passkey_only | account_flag_oper_stepup;
 
 /// How long a SUCCESSOR SET waits before it replaces the armed successor.
 /// CLEAR during the wait cancels the replacement. A drop during the wait
@@ -2511,14 +2518,50 @@ pub const Services = struct {
     /// Refuse password-derived mechanisms for `account`. Requires at least one
     /// bound passkey, so a typo in a flags field cannot lock the account out.
     /// Not reachable from ACCOUNTSET. A later ceremony calls this only after
-    /// the passkey has already verified.
+    /// the passkey has already verified. Also arms the operator step-up latch
+    /// and revokes SASL session tokens in the same durable cut: a token minted
+    /// before the lock is a password-equivalent re-entry credential.
     pub fn enablePasskeyOnly(self: *Services, account: []const u8, scratch: []u8) ServiceError!void {
         const key = try accountKey(account);
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
+        if (self.store.preparedWritesPoisoned()) return error.StorePoisoned;
         if (!self.passkeysBoundUnlocked(key.asSlice())) return error.Forbidden;
         var record = try self.loadAccount(key.asSlice());
-        record.flags |= account_flag_passkey_only;
+        record.flags |= account_flag_passkey_only | account_flag_oper_stepup;
+        const encoded = try encodeAccount(record, scratch);
+        var account_token_key_buf: [session_token_account_key_max]u8 = undefined;
+        const account_token_key = sessionTokenAccountKey(&account_token_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        var prepared = try self.store.prepareBatch(&.{
+            .{ .family = .accounts, .kind = .put, .key = record.name.asSlice(), .value = encoded },
+            .{ .family = .props, .kind = .delete, .key = account_token_key },
+        });
+        defer prepared.abort();
+        try prepared.commit();
+    }
+
+    /// True when this account must not become a network operator on a password,
+    /// SCRAM, recovery-code, or session-token session. A missing account is not
+    /// latched, so an unknown name keeps the caller's ordinary not-found path.
+    pub fn operStepUpRequired(self: *Services, account: []const u8) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const record = self.loadAccount(account) catch return false;
+        return (record.flags & account_flags_sticky) != 0;
+    }
+
+    /// A verified passkey login retires the operator latch once password login
+    /// is already allowed again. While the account is still passkey-only the
+    /// latch stays, so the later recovery replacement re-arms it from that bit.
+    /// A no-op when the latch is already clear.
+    pub fn notePasskeyAuthentication(self: *Services, account: []const u8, scratch: []u8) ServiceError!void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        if (self.store.preparedWritesPoisoned()) return error.StorePoisoned;
+        var record = try self.loadAccount(account);
+        if ((record.flags & account_flag_oper_stepup) == 0) return;
+        if ((record.flags & account_flag_passkey_only) != 0) return;
+        record.flags &= ~account_flag_oper_stepup;
         try self.saveAccount(record, scratch);
     }
 
@@ -2608,6 +2651,7 @@ pub const Services = struct {
         const value = self.store.family(.accounts).get(key.asSlice()) orelse return error.NotFound;
         const record = try decodeAccount(value);
         if ((record.flags & account_flag_suspended) != 0 or (record.flags & account_flag_forbidden) != 0) return error.AuthFailed;
+        if ((record.flags & account_flag_passkey_only) != 0) return error.AuthFailed;
 
         var token: [session_token_len]u8 = undefined;
         defer secureZero(&token);
@@ -2708,6 +2752,7 @@ pub const Services = struct {
         const acct_value = self.store.family(.accounts).get(key.asSlice()) orelse return null;
         const acct_record = decodeAccount(acct_value) catch return null;
         if ((acct_record.flags & account_flag_suspended) != 0 or (acct_record.flags & account_flag_forbidden) != 0) return null;
+        if ((acct_record.flags & account_flag_passkey_only) != 0) return null;
         if (acct_record.name.asSlice().len > account_out.len) return null;
         @memcpy(account_out[0..acct_record.name.asSlice().len], acct_record.name.asSlice());
         return account_out[0..acct_record.name.asSlice().len];
@@ -3116,9 +3161,13 @@ pub const Services = struct {
         try hashPassword(&hash, new_password, &salt, self.cfg.pbkdf2_rounds);
         record.salt = salt;
         record.hash = hash;
-        // Recovery replacement is the break-glass path. The new password works,
-        // and this single-use proof clears the passkey-only refusal.
+        // Recovery replacement is the break-glass path back to a password.
+        // It clears the passkey-only refusal. An account that was locked, or
+        // that was already waiting on a passkey before operator elevation,
+        // keeps the operator latch so this password is not an operator credential.
+        const step_up = (record.flags & account_flags_sticky) != 0;
         record.flags &= ~account_flag_passkey_only;
+        if (step_up) record.flags |= account_flag_oper_stepup;
 
         const encoded = try encodeAccount(record, scratch);
         var account_token_key_buf: [session_token_account_key_max]u8 = undefined;
@@ -3211,8 +3260,8 @@ pub const Services = struct {
             .flags => |flags| {
                 const preserved = record.flags & account_flags_privileged;
                 if ((flags & account_flags_privileged) != preserved) return error.Forbidden;
-                const passkey = record.flags & account_flag_passkey_only;
-                record.flags = preserved | passkey | (flags & ~(account_flags_privileged | account_flag_passkey_only));
+                const sticky = record.flags & account_flags_sticky;
+                record.flags = preserved | sticky | (flags & ~(account_flags_privileged | account_flags_sticky));
             },
             // SECURE on/off. ENFORCE on/off is stored inverted (`enforce_off`) so
             // the default-0 record keeps today's always-on enforcement.
@@ -6447,7 +6496,13 @@ test "services passkey-only successor hold and login audit" {
     try std.testing.expectError(error.Forbidden, services.enablePasskeyOnly("alice", &scratch));
     try services.webauthnBind("alice", "abc", "k", 0, "", 1);
     try services.webauthnBind("alice", "def", "k", 0, "lap", 1);
+    const issued = try services.issueSessionToken("alice", 1_000);
+    var token_account: [account_max]u8 = undefined;
+    try std.testing.expect(services.validateSessionToken("alice", issued.tokenSlice(), 1_001, &token_account) != null);
     try services.enablePasskeyOnly("alice", &scratch);
+    try std.testing.expect(services.operStepUpRequired("alice"));
+    try std.testing.expect(services.validateSessionToken("alice", issued.tokenSlice(), 1_001, &token_account) == null);
+    try std.testing.expectError(error.AuthFailed, services.issueSessionToken("alice", 1_002));
     try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", password));
     try std.testing.expectError(error.AuthFailed, services.dropAccount("alice", password));
     try std.testing.expectError(error.AuthFailed, services.changeAccountPassword("alice", password, "another correct horse battery", &scratch));
@@ -6457,8 +6512,9 @@ test "services passkey-only successor hold and login audit" {
     try services.webauthnDelete("alice", "abc");
     try std.testing.expectError(error.Forbidden, services.webauthnDelete("alice", "def"));
 
-    const flagged = try services.setAccount("bob", password, .{ .flags = account_flag_passkey_only | account_flag_secure }, &scratch);
+    const flagged = try services.setAccount("bob", password, .{ .flags = account_flag_passkey_only | account_flag_oper_stepup | account_flag_secure }, &scratch);
     try std.testing.expect((flagged.set_account.flags & account_flag_passkey_only) == 0);
+    try std.testing.expect((flagged.set_account.flags & account_flag_oper_stepup) == 0);
     try std.testing.expect((flagged.set_account.flags & account_flag_secure) != 0);
 
     try services.setAccountPasswordForced("alice", password, &scratch);
@@ -6468,6 +6524,16 @@ test "services passkey-only successor hold and login audit" {
     try services.webauthnDelete("alice", "def");
     const info = try services.accountInfo("alice");
     try std.testing.expect((info.account_info.flags & account_flag_passkey_only) == 0);
+    try std.testing.expect((info.account_info.flags & account_flag_oper_stepup) != 0);
+    const kept = try services.setAccount("alice", password, .{ .flags = 0 }, &scratch);
+    try std.testing.expect((kept.set_account.flags & account_flag_oper_stepup) != 0);
+    try services.notePasskeyAuthentication("alice", &scratch);
+    const cleared = try services.accountInfo("alice");
+    try std.testing.expect((cleared.account_info.flags & account_flag_oper_stepup) == 0);
+    try services.setAccountPasswordForced("bob", password, &scratch);
+    const bob_info = try services.accountInfo("bob");
+    try std.testing.expect((bob_info.account_info.flags & account_flag_oper_stepup) == 0);
+    try std.testing.expect(!services.operStepUpRequired("bob"));
 }
 
 test "channel SET flags and DESC/URL persist and round-trip" {

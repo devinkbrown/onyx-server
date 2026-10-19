@@ -3,13 +3,14 @@
 
 //! `armor verify` — certificate-chain verification against a CA bundle.
 //!
-//! All trust decisions are substrate calls: chain signature + validity +
-//! CA/pathlen/name-constraint enforcement via src/crypto/x509_verify.zig
-//! (`verifySimpleChainAt`), anchors loaded with the daemon's own bundle
-//! loader (src/daemon/acme_cli.zig `loadTrustAnchors`). The optional `-name`
-//! check mirrors the single-label wildcard semantics of the (file-private)
-//! matcher in src/crypto/tls_client.zig `dnsPatternMatches` — exporting that
-//! is a noted substrate gap; the mirror here is string comparison only.
+//! Chain signatures and validity use `x509_verify.verifySimpleChainAt`.
+//! Name constraints and path length use the same helpers as the TLS
+//! handshake: `enforcePresentedNameConstraintsFor`, `enforcePathLen`, and
+//! `enforceExternalAnchorFor`, including the DNS name from `-name`. Anchors
+//! load through the daemon's bundle loader (`acme_cli.loadTrustAnchors`).
+//! The optional `-name` hostname match is still the single-label comparison
+//! mirrored from `tls_client.zig`; the accepted name is then held to the
+//! handshake's name-constraint helper.
 
 const std = @import("std");
 const onyx_server = @import("onyx_server");
@@ -125,10 +126,25 @@ pub const VerifyError = error{
     NameMismatch,
 };
 
-/// Verify `chain` (leaf first) against `anchors` at `now`. Success requires
-/// one anchor that completes a substrate-verified chain (signatures, validity
-/// window, CA bits, path length, name constraints — x509_verify does all of
-/// it). Fail-closed: no anchor works => error.
+/// Apply the handshake's presented-chain and trust-anchor name constraints,
+/// plus path length, after the signature check has accepted `anchor`.
+fn acceptHandshakeNameConstraints(
+    presented: []const []const u8,
+    anchor: []const u8,
+    expected_name: ?[]const u8,
+) !void {
+    try x509_verify.enforcePresentedNameConstraintsFor(presented, expected_name);
+    var facts_buf: [16]x509_verify.CaPathFact = undefined;
+    const n = x509_verify.buildPathFacts(presented, &facts_buf);
+    try x509_verify.enforcePathLen(facts_buf[0..n]);
+    try x509_verify.enforceExternalAnchorFor(presented, anchor, expected_name);
+}
+
+/// Verify `chain` (leaf first) against `anchors` at `now`. Signatures and the
+/// validity window come from `verifySimpleChainAt` on the chain plus the
+/// anchor. Name constraints and path length then use the same helpers the
+/// TLS handshake uses, including `expected_name` when the caller supplied
+/// one. An anchor that fails any of those checks is skipped.
 pub fn verifyChain(
     gpa: Allocator,
     chain: []const []const u8,
@@ -149,6 +165,10 @@ pub fn verifyChain(
     for (anchors) |anchor| {
         full[chain.len] = anchor;
         if (x509_verify.verifySimpleChainAt(full, now)) |_| {
+            acceptHandshakeNameConstraints(chain, anchor, expected_name) catch |err| {
+                last_err = err;
+                continue;
+            };
             return;
         } else |err| {
             last_err = err;
@@ -156,7 +176,13 @@ pub fn verifyChain(
         // The chain may already end in a self-signed root present in the
         // bundle: accept `chain` alone when its last cert IS the anchor.
         if (std.mem.eql(u8, chain[chain.len - 1], anchor)) {
-            if (x509_verify.verifySimpleChainAt(chain, now)) |_| return else |err| {
+            if (x509_verify.verifySimpleChainAt(chain, now)) |_| {
+                acceptHandshakeNameConstraints(chain, anchor, expected_name) catch |err| {
+                    last_err = err;
+                    continue;
+                };
+                return;
+            } else |err| {
                 last_err = err;
             }
         }
@@ -292,6 +318,78 @@ test "GAP-K15 armorcli verify matches an IP literal against iPAddress only" {
     }, ca_kp);
     try verifyChain(gpa, &.{ip_leaf}, &.{ca_der}, now, "1.2.3.4");
     try testing.expectError(error.NameMismatch, verifyChain(gpa, &.{ip_leaf}, &.{ca_der}, now, "www.example.com"));
+}
+
+test "armorcli verify rejects a name and a path outside the handshake constraints" {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const gpa = testing.allocator;
+    const now: i64 = 1_800_000_000;
+    const ca_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xc1)));
+    const bad_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xc2)));
+    const good_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xc3)));
+    const mid_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xc4)));
+    const deep_kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xc5)));
+
+    var ca_buf: [1024]u8 = undefined;
+    const ca_der = try x509_verify.mintEd25519CertExt(
+        &ca_buf,
+        "Onyx Name-Constrained CA",
+        "Onyx Name-Constrained CA",
+        ca_kp.public_key.toBytes(),
+        ca_kp,
+        now - 1000,
+        now + 100_000,
+        .{ .is_ca = true, .path_len = 0, .permitted_dns = &.{".corp.example"} },
+    );
+    var bad_buf: [1024]u8 = undefined;
+    const bad_leaf = try x509_verify.mintEd25519CertExt(
+        &bad_buf,
+        "Onyx Name-Constrained CA",
+        "login.victim-bank.com",
+        bad_kp.public_key.toBytes(),
+        ca_kp,
+        now - 1000,
+        now + 100_000,
+        .{ .dns_names = &.{"login.victim-bank.com"} },
+    );
+    try testing.expectError(error.BadCertificate, verifyChain(gpa, &.{bad_leaf}, &.{ca_der}, now, "login.victim-bank.com"));
+
+    var good_buf: [1024]u8 = undefined;
+    const good_leaf = try x509_verify.mintEd25519CertExt(
+        &good_buf,
+        "Onyx Name-Constrained CA",
+        "login.corp.example",
+        good_kp.public_key.toBytes(),
+        ca_kp,
+        now - 1000,
+        now + 100_000,
+        .{ .dns_names = &.{"login.corp.example"} },
+    );
+    try verifyChain(gpa, &.{good_leaf}, &.{ca_der}, now, "login.corp.example");
+
+    var mid_buf: [1024]u8 = undefined;
+    const mid_der = try x509_verify.mintEd25519CertExt(
+        &mid_buf,
+        "Onyx Name-Constrained CA",
+        "Onyx Intermediate",
+        mid_kp.public_key.toBytes(),
+        ca_kp,
+        now - 1000,
+        now + 100_000,
+        .{ .is_ca = true },
+    );
+    var deep_buf: [1024]u8 = undefined;
+    const deep_leaf = try x509_verify.mintEd25519CertExt(
+        &deep_buf,
+        "Onyx Intermediate",
+        "login.corp.example",
+        deep_kp.public_key.toBytes(),
+        mid_kp,
+        now - 1000,
+        now + 100_000,
+        .{ .dns_names = &.{"login.corp.example"} },
+    );
+    try testing.expectError(error.BadCertificate, verifyChain(gpa, &.{ deep_leaf, mid_der }, &.{ca_der}, now, "login.corp.example"));
 }
 
 test "armorcli verify dnsPatternMatches is single-label only" {

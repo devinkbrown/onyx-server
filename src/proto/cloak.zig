@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Deterministic host/IP cloaking (charybdis-grade hierarchical scheme, v2).
+//! Deterministic host/IP cloaking. Hierarchical cloaks are v2. The public
+//! opaque cloak (plain and epoch) is v3: one 128-bit token, no subnet or geo.
 //!
 //! Every cloak segment is a keyed HMAC-SHA256 token over a *cumulative prefix*
-//! of the real address. The FULL-address token is 64 bits (16 hex) so two
+//! of the real address. The hierarchical full-address token is 64 bits (16 hex) so two
 //! distinct addresses never collide to the same cloak in practice; the coarser
 //! subnet-prefix tokens are 32 bits (8 hex). Because each segment depends only
 //! on the prefix up to that point:
@@ -25,7 +26,8 @@
 //!
 //!   IPv4  `a.b.c.d`      -> `<f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.ircxnet`
 //!   IPv6  `2001:db8::1`  -> `<f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.ircxnet`
-//!   opaque (max privacy) -> `<f>.opq.ircxnet`  (one token, no subnet/geo leak)
+//!   opaque (max privacy) -> `<32 hex>.opq.<suffix>` (v3, 128 bits, no subnet/geo)
+//!   anon epoch           -> `<32 hex>.opq.<suffix>` (`cloakOpaqueEpochV3`)
 //!   rDNS  `dsl-1.isp.com`-> `ircxnet-<token>.isp.com`
 //!   acct  `Kain`@`IRCXNet`-> `kain.users.ircxnet` (no key needed)
 //!
@@ -49,6 +51,9 @@ pub const token_hex_len = 8;
 /// pushes that past 4 billion, so two real addresses effectively never share a
 /// cloak.
 pub const full_token_hex_len = 16;
+/// Hex digits for the v3 public opaque token (128 bits, one DNS label).
+/// The v2 64-bit token stays for ban grace. v3 is what anonymous users show.
+pub const wide_token_hex_len = 32;
 
 /// Default network-identifying suffix carried by every cloaked host so users
 /// and opers can tell at a glance that a host is cloaked. Configurable via
@@ -196,6 +201,45 @@ pub fn cloakOpaqueEpoch(
         switch (parsed) {
             .ip4 => |ip4| token64Epoch(&full, key, "ip4/v2/opqe|", ip4.bytes[0..4], epoch),
             .ip6 => |ip6| token64Epoch(&full, key, "ip6/v2/opqe|", ip6.bytes[0..16], epoch),
+        }
+    } else |_| return error.InvalidHostname;
+    return std.fmt.bufPrint(out, "{s}.{s}.{s}", .{ &full, opaque_marker, options.suffix }) catch error.OutputTooSmall;
+}
+
+/// v3 public opaque cloak: 128 bits over the full address, still one token and
+/// still no subnet or geo labels. A distinct domain tag keeps it unlinkable to
+/// the v2 64-bit token of the same address.
+pub fn cloakOpaqueV3(
+    out: []u8,
+    key: *const SecretKey,
+    address: []const u8,
+    options: Options,
+) CloakError![]const u8 {
+    var full: [wide_token_hex_len]u8 = undefined;
+    if (Net.IpAddress.parse(address, 0)) |parsed| {
+        switch (parsed) {
+            .ip4 => |ip4| token128(&full, key, "ip4/v3/opq|", ip4.bytes[0..4]),
+            .ip6 => |ip6| token128(&full, key, "ip6/v3/opq|", ip6.bytes[0..16]),
+        }
+    } else |_| return error.InvalidHostname;
+    return std.fmt.bufPrint(out, "{s}.{s}.{s}", .{ &full, opaque_marker, options.suffix }) catch error.OutputTooSmall;
+}
+
+/// v3 epoch opaque cloak. Same privacy shape as `cloakOpaqueEpoch` (no shared
+/// subnet label, no geo) with a 128-bit token and a v3 domain tag, so a v2
+/// epoch cloak of the same address and epoch never matches it.
+pub fn cloakOpaqueEpochV3(
+    out: []u8,
+    key: *const SecretKey,
+    address: []const u8,
+    epoch: u64,
+    options: Options,
+) CloakError![]const u8 {
+    var full: [wide_token_hex_len]u8 = undefined;
+    if (Net.IpAddress.parse(address, 0)) |parsed| {
+        switch (parsed) {
+            .ip4 => |ip4| token128Epoch(&full, key, "ip4/v3/opqe|", ip4.bytes[0..4], epoch),
+            .ip6 => |ip6| token128Epoch(&full, key, "ip6/v3/opqe|", ip6.bytes[0..16], epoch),
         }
     } else |_| return error.InvalidHostname;
     return std.fmt.bufPrint(out, "{s}.{s}.{s}", .{ &full, opaque_marker, options.suffix }) catch error.OutputTooSmall;
@@ -387,6 +431,18 @@ fn token64Epoch(out: *[full_token_hex_len]u8, key: *const SecretKey, domain: []c
     var tag = macTagEpoch(key, domain, data, epoch);
     defer secureZero(&tag);
     hexEncode(out, tag[0 .. full_token_hex_len / 2]);
+}
+
+fn token128(out: *[wide_token_hex_len]u8, key: *const SecretKey, domain: []const u8, data: []const u8) void {
+    var tag = macTag(key, domain, data);
+    defer secureZero(&tag);
+    hexEncode(out, tag[0 .. wide_token_hex_len / 2]);
+}
+
+fn token128Epoch(out: *[wide_token_hex_len]u8, key: *const SecretKey, domain: []const u8, data: []const u8, epoch: u64) void {
+    var tag = macTagEpoch(key, domain, data, epoch);
+    defer secureZero(&tag);
+    hexEncode(out, tag[0 .. wide_token_hex_len / 2]);
 }
 
 /// HMAC-SHA256(key, domain || data). Key bytes are wiped after use.
@@ -906,6 +962,59 @@ test "opaque epoch cloak: a different key yields an unlinkable rotation" {
 test "opaque epoch cloak: small output buffer fails cleanly" {
     var out: [8]u8 = undefined;
     try testing.expectError(error.OutputTooSmall, cloakOpaqueEpoch(&out, &test_key, "203.0.113.5", 1, .{}));
+}
+
+test "v3 opaque cloak is 128 bits and shares nothing with a neighbor or with v2" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    var c: [max_cloak_len]u8 = undefined;
+    const ca = try cloakOpaqueV3(&a, &test_key, "203.0.113.5", .{});
+    const cb = try cloakOpaqueV3(&b, &test_key, "203.0.113.77", .{});
+    const v2 = try cloakOpaque(&c, &test_key, "203.0.113.5", .{});
+
+    var lbuf: [16][]const u8 = undefined;
+    const labels = splitLabels(&lbuf, ca);
+    try testing.expectEqual(@as(usize, 3), labels.len);
+    try testing.expect(isHexToken(labels[0], wide_token_hex_len));
+    try testing.expectEqualStrings(opaque_marker, labels[1]);
+    try testing.expectEqualStrings(default_suffix, labels[2]);
+    try testing.expect(!std.mem.eql(u8, ca, cb));
+    try testing.expect(!std.mem.eql(u8, ca, v2));
+}
+
+test "v3 epoch cloak rotates, hides a shared subnet, and is not the v2 token" {
+    var a: [max_cloak_len]u8 = undefined;
+    var a2: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    var c: [max_cloak_len]u8 = undefined;
+    var d: [max_cloak_len]u8 = undefined;
+    const e1 = try cloakOpaqueEpochV3(&a, &test_key, "203.0.113.5", 9, .{});
+    const e1b = try cloakOpaqueEpochV3(&a2, &test_key, "203.0.113.5", 9, .{});
+    const e2 = try cloakOpaqueEpochV3(&b, &test_key, "203.0.113.5", 10, .{});
+    const neighbor = try cloakOpaqueEpochV3(&c, &test_key, "203.0.113.77", 9, .{});
+    const v2 = try cloakOpaqueEpoch(&d, &test_key, "203.0.113.5", 9, .{});
+    try testing.expectEqualSlices(u8, e1, e1b);
+    try testing.expect(!std.mem.eql(u8, e1, e2));
+    try testing.expect(!std.mem.eql(u8, e1, neighbor));
+    try testing.expect(!std.mem.eql(u8, e1, v2));
+    try testing.expect(std.mem.endsWith(u8, e1, ".opq." ++ default_suffix));
+
+    var v6a: [max_cloak_len]u8 = undefined;
+    var v6b: [max_cloak_len]u8 = undefined;
+    const v6e1 = try cloakOpaqueEpochV3(&v6a, &test_key, "2001:db8::1", 3, .{});
+    const v6e2 = try cloakOpaqueEpochV3(&v6b, &test_key, "2001:db8::1", 4, .{});
+    try testing.expect(!std.mem.eql(u8, v6e1, v6e2));
+    var lbuf: [16][]const u8 = undefined;
+    const labels = splitLabels(&lbuf, v6e1);
+    try testing.expect(isHexToken(labels[0], wide_token_hex_len));
+}
+
+test "v3 epoch cloak rejects a non-address and a short buffer" {
+    var out: [max_cloak_len]u8 = undefined;
+    try testing.expectError(error.InvalidHostname, cloakOpaqueEpochV3(&out, &test_key, "host.example", 1, .{}));
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, cloakOpaqueV3(&tiny, &test_key, "203.0.113.5", .{}));
+    try testing.expectError(error.OutputTooSmall, cloakOpaqueEpochV3(&tiny, &test_key, "2001:db8::1", 1, .{}));
 }
 
 test "classify recognizes address kinds" {

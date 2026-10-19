@@ -2688,7 +2688,7 @@ pub const Config = struct {
     /// `<suffix>-<token>` leading label. Borrowed; outlives the server.
     cloak_suffix: []const u8 = cloak.default_suffix,
     /// Opaque IP cloak mode (`[cloak] mode = "opaque"`). When true, IP cloaks use
-    /// the single-token `cloakOpaque` form (no subnet hierarchy, no geo labels)
+    /// the single-token v3 form (128 bits, no subnet hierarchy, no geo labels)
     /// instead of the hierarchical, subnet-bannable form. Max privacy, at the
     /// cost of subnet-bannability.
     cloak_opaque: bool = false,
@@ -2698,15 +2698,15 @@ pub const Config = struct {
     cloak_account: bool = false,
     /// Anonymous-client cloak rotation cadence in seconds (`[cloak]
     /// anon_epoch_secs`). When non-zero, an UNAUTHENTICATED client's IP is
-    /// cloaked with the epoch-salted opaque form (`cloakOpaqueEpoch`) so it
-    /// rotates each `anon_epoch_secs` and never leaks subnet co-membership.
+    /// cloaked with the 128-bit epoch-salted opaque form (`cloakOpaqueEpochV3`)
+    /// so it rotates each `anon_epoch_secs` and never leaks subnet co-membership.
     /// Logged-in clients are unaffected (they keep the account/hierarchical
     /// cloak). 0 = disabled (anonymous clients keep the stable cloak).
     cloak_anon_epoch_secs: u64 = 0,
     /// Background forward-confirmed reverse-DNS resolver (owned by main). When
-    /// set, each non-loopback client IP is resolved off the hot path and its
-    /// confirmed hostname becomes the cloak base (so hosts show a cloaked
-    /// hostname rather than a cloaked IP). Null = reverse DNS disabled.
+    /// set, each non-loopback client IP is resolved off the hot path. The
+    /// confirmed name is oper/self WHOIS only and never becomes the public
+    /// cloak. Null = reverse DNS disabled.
     rdns: ?*rdns.Resolver = null,
     /// Background connect-time DNS blocklist resolver (owned by main). When set,
     /// each non-loopback client IP is checked against the configured zones off
@@ -4926,6 +4926,11 @@ pub const LinuxServer = struct {
     /// the TTL watches every still-logged-in oper's grant lapse (remote
     /// `Registry.lookup` → null, the `*` prefix silently decays).
     last_oper_grant_refresh_ms: i64 = 0,
+    /// Last anonymous-cloak epoch applied to live sessions. Runtime only: not
+    /// config and not a Helix field. The maintenance tick recomputes visible
+    /// hosts only when this differs from the current wall-clock epoch. 0 means
+    /// the sweep has not run yet.
+    last_anon_cloak_epoch: u64 = 0,
     /// Monotonic-clock guard for the coarse signed session-replica lease refresh.
     last_session_replica_refresh_ms: i64 = 0,
     /// Independent guard for short positive attachment-lease renewal.
@@ -8927,6 +8932,10 @@ pub const LinuxServer = struct {
         // as reactor 0) keeps the send cadence honest.
         if (self.isMaintenanceReactor()) {
             const now = self.nowMs();
+            // Anonymous cloaks rotate on the wall-clock epoch even when the
+            // connection stays up. One comparison per tick; the walk runs only
+            // when the epoch actually changes.
+            self.rotateDueAnonCloaks();
             // Cross-mesh oper-grant refresh: minted grants expire after
             // `oper_grant_ttl_ms`, so on a link that stays up longer than the
             // TTL a still-logged-in oper's grant lapses on every peer (remote
@@ -11420,9 +11429,8 @@ pub const LinuxServer = struct {
             return;
         }
         conn.session.setRealHost(ip);
-        // Kick off forward-confirmed reverse DNS off the hot path; the result (if
-        // any) upgrades the cloak base from the IP to the hostname at
-        // registration time. The initial visible host below is always IP-based.
+        // Reverse DNS stays off the public cloak. The name is oper/self WHOIS
+        // only. The visible host below is always the IP cloak.
         if (self.config.rdns) |res| {
             res.request(addr);
         }
@@ -11475,27 +11483,21 @@ pub const LinuxServer = struct {
             // account/hierarchical cloak, keeping subnet-bannability. Moderation of
             // anonymous abuse shifts to account bans + registration friction.
             if (self.config.cloak_anon_epoch_secs != 0 and conn.session.account() == null) {
-                const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
-                conn.session.setVisibleHost(cloak.cloakOpaqueEpoch(&cbuf, &key, ip_text, self.anonCloakEpoch(), opts) catch {
-                    conn.session.setVisibleHost(ip_text);
-                    return;
-                });
+                conn.session.setVisibleHost(self.anonVisibleCloak(ip_text, self.anonCloakEpoch(), &cbuf));
                 return;
             }
             // Cloak the IP ITSELF — never the reverse-DNS name, which would leak
             // the ISP's registrable domain (`....comcast.net`). rDNS still resolves
             // (for the oper-only real-host WHOIS line); it just never feeds the
-            // public cloak. Opaque mode emits one token over the whole address;
-            // hierarchical mode mixes in GeoIP country + ASN as ban-able labels.
+            // public cloak. Opaque mode emits one 128-bit token over the whole
+            // address; hierarchical mode mixes in GeoIP country + ASN as ban-able
+            // labels. A cloak failure stays a generic hidden host, never the IP.
             const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
             const cloaked = if (self.config.cloak_opaque)
-                cloak.cloakOpaque(&cbuf, &key, ip_text, opts)
+                cloak.cloakOpaqueV3(&cbuf, &key, ip_text, opts)
             else
                 cloak.cloak(&cbuf, &key, ip_text, self.cloakGeo(ip_text), opts);
-            conn.session.setVisibleHost(cloaked catch {
-                conn.session.setVisibleHost(ip_text);
-                return;
-            });
+            conn.session.setVisibleHost(cloaked catch self.hiddenCloakHost(&cbuf));
         } else {
             // No cloak key configured: show the reverse-DNS name when the operator
             // enabled rDNS, else the raw IP (their explicit non-cloaking choice).
@@ -11543,8 +11545,11 @@ pub const LinuxServer = struct {
         const ip_text = addrText(addr, &ipbuf) orelse return null;
         if (std.mem.startsWith(u8, ip_text, "127.") or std.mem.eql(u8, ip_text, "0:0:0:0:0:0:0:1")) return null;
         const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
+        if (self.config.cloak_anon_epoch_secs != 0 and conn.session.account() == null) {
+            return cloak.cloakOpaqueEpochV3(buf, &key, ip_text, self.anonCloakEpoch(), opts) catch null;
+        }
         const cloaked = if (self.config.cloak_opaque)
-            cloak.cloakOpaque(buf, &key, ip_text, opts)
+            cloak.cloakOpaqueV3(buf, &key, ip_text, opts)
         else
             cloak.cloak(buf, &key, ip_text, self.cloakGeo(ip_text), opts);
         return cloaked catch null;
@@ -11633,8 +11638,113 @@ pub const LinuxServer = struct {
     fn anonCloakEpoch(self: *const LinuxServer) u64 {
         const secs = self.config.cloak_anon_epoch_secs;
         if (secs == 0) return 0;
-        const now_ms: u64 = @intCast(@max(@as(i64, 0), platform.realtimeMillis()));
-        return (now_ms / 1000) / secs;
+        return (self.meshWallMs() / 1000) / secs;
+    }
+
+    /// Public anonymous cloak for `epoch`. On any cloak failure this is a
+    /// generic hidden host, never the raw address.
+    fn anonVisibleCloak(self: *LinuxServer, ip_text: []const u8, epoch: u64, buf: []u8) []const u8 {
+        const key = self.config.cloak_key orelse return self.hiddenCloakHost(buf);
+        const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
+        return cloak.cloakOpaqueEpochV3(buf, &key, ip_text, epoch, opts) catch self.hiddenCloakHost(buf);
+    }
+
+    fn hiddenCloakHost(self: *const LinuxServer, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "hidden.{s}.{s}", .{ cloak.opaque_marker, self.config.cloak_suffix }) catch "hidden.opq.onyx";
+    }
+
+    /// Stable hierarchical cloak of an IP, for oper WHOIS and WARD only.
+    /// A hostname is refused so a reverse name can never become this host.
+    fn banCloakHost(self: *LinuxServer, ip_text: []const u8, buf: []u8) ?[]const u8 {
+        if (ip_text.len == 0 or cloak.classify(ip_text) == .hostname) return null;
+        if (std.mem.startsWith(u8, ip_text, "127.") or std.mem.eql(u8, ip_text, "0:0:0:0:0:0:0:1")) return null;
+        const key = self.config.cloak_key orelse return null;
+        return cloak.cloak(buf, &key, ip_text, self.cloakGeo(ip_text), .{ .suffix = self.config.cloak_suffix }) catch null;
+    }
+
+    fn whoisBanCloakLine(self: *LinuxServer, ip_text: []const u8, host_buf: []u8, line_buf: []u8) ?[]const u8 {
+        const host = self.banCloakHost(ip_text, host_buf) orelse return null;
+        return std.fmt.bufPrint(line_buf, "ban cloak {s}", .{host}) catch null;
+    }
+
+    /// True when `host` is a cloak this server generated, or is still the raw
+    /// address from a build that failed open. A persona such as `staff.example`
+    /// does not match and is left alone.
+    fn generatedCloakHost(self: *const LinuxServer, host: []const u8, real_host: []const u8) bool {
+        if (real_host.len != 0 and std.mem.eql(u8, host, real_host)) return true;
+        var tail_buf: [80]u8 = undefined;
+        const tail = std.fmt.bufPrint(&tail_buf, ".{s}.{s}", .{ cloak.opaque_marker, self.config.cloak_suffix }) catch return false;
+        if (std.mem.endsWith(u8, host, tail)) return true;
+        var ip_tail: [80]u8 = undefined;
+        const ip_end = std.fmt.bufPrint(&ip_tail, ".ip.{s}", .{self.config.cloak_suffix}) catch return false;
+        if (std.mem.endsWith(u8, host, ip_end)) return true;
+        var ip6_tail: [80]u8 = undefined;
+        const ip6_end = std.fmt.bufPrint(&ip6_tail, ".ip6.{s}", .{self.config.cloak_suffix}) catch return false;
+        return std.mem.endsWith(u8, host, ip6_end);
+    }
+
+    /// When the anonymous epoch rolls, recompute generated cloaks for clients
+    /// that are still connected and tell their channels. Personas and account
+    /// cloaks are not touched. Runs on the maintenance reactor under the world
+    /// write lock, same as the other timer sweeps.
+    fn rotateDueAnonCloaks(self: *LinuxServer) void {
+        if (self.config.cloak_key == null or self.config.cloak_anon_epoch_secs == 0) return;
+        const epoch = self.anonCloakEpoch();
+        if (epoch == self.last_anon_cloak_epoch) return;
+        var changed = false;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (conn.s2s != null or conn.s2s_secured != null) continue;
+                if (conn.closing or conn.session.account() != null) continue;
+                const addr = conn.peer_addr orelse continue;
+                var ipbuf: [64]u8 = undefined;
+                const ip_text = addrText(addr, &ipbuf) orelse continue;
+                if (std.mem.startsWith(u8, ip_text, "127.") or std.mem.eql(u8, ip_text, "0:0:0:0:0:0:0:1")) continue;
+                if (!self.generatedCloakHost(conn.session.host(), conn.session.realHost())) continue;
+                var cbuf: [cloak.max_cloak_len]u8 = undefined;
+                const computed = self.anonVisibleCloak(ip_text, epoch, &cbuf);
+                var host_buf: [cloak.max_cloak_len]u8 = undefined;
+                if (computed.len > host_buf.len) continue;
+                @memcpy(host_buf[0..computed.len], computed);
+                const next = host_buf[0..computed.len];
+                if (std.mem.eql(u8, conn.session.host(), next)) continue;
+                const nick = conn.session.displayName();
+                if (conn.session.registered() and nick.len != 0 and !std.mem.eql(u8, nick, "*")) {
+                    const id = slotClientId(reactor, i, slot.gen);
+                    self.applyVhostLine(id, conn, next) catch {};
+                    if (!std.mem.eql(u8, conn.session.host(), next)) conn.session.setVisibleHost(next);
+                    self.reannounceVisibleHost(conn);
+                    self.publishOrdinaryGuest(conn, false);
+                    changed = true;
+                } else {
+                    conn.session.setVisibleHost(next);
+                }
+            }
+        }
+        self.last_anon_cloak_epoch = epoch;
+        if (changed) self.driveGuestPresence(null);
+    }
+
+    /// Push the current visible host to mesh peers: the presence roster and
+    /// every channel this nick is actually in.
+    fn reannounceVisibleHost(self: *LinuxServer, conn: *const ConnState) void {
+        const nick = conn.session.displayName();
+        if (nick.len == 0 or std.mem.eql(u8, nick, "*")) return;
+        const ident = membershipIdentityOf(conn);
+        const wid = self.world.findNick(nick) orelse {
+            self.announceMembership(presence_channel, nick, 0, true, ident, "");
+            return;
+        };
+        self.announceMembership(presence_channel, nick, 0, true, ident, "");
+        var cit = self.world.channelIterator();
+        while (cit.next()) |cv| {
+            if (isPresenceChannel(cv.name)) continue;
+            if (!self.world.isMember(cv.name, wid)) continue;
+            const status: u4 = @truncate((self.world.memberModes(cv.name, wid) orelse world_model.MemberModes.empty()).bits);
+            self.announceMembership(cv.name, nick, status, true, ident, "");
+        }
     }
 
     /// Whether IP reputation is active (a non-zero refuse threshold configured).
@@ -25536,6 +25646,8 @@ pub const LinuxServer = struct {
 
         var modes_line_buf: [96]u8 = undefined;
         var class_line_buf: [128]u8 = undefined;
+        var ban_host_buf: [cloak.max_cloak_len]u8 = undefined;
+        var ban_line_buf: [cloak.max_cloak_len + 16]u8 = undefined;
         const subject = whois.WhoisSubject{
             // Show the target's nick in the exact case they registered, not the
             // case the requester happened to type in the WHOIS command.
@@ -25568,6 +25680,7 @@ pub const LinuxServer = struct {
             .no_invite = tconn.session.umodes.contains(.no_invite),
             .modes_line = self.whoisModesLine(tconn, operHidden(tconn, conn), &modes_line_buf),
             .class_line = self.whoisClassLine(tconn, conn.session.isOper() or conn == tconn, &class_line_buf),
+            .ban_cloak = if (show_addr) self.whoisBanCloakLine(ip_text, &ban_host_buf, &ban_line_buf) else null,
             .via_websocket = tconn.ws != null,
             .show_idle = !(tconn.session.umodes.contains(.hide_idle) and !conn.session.isOper() and conn != tconn),
             // RPL_WHOISSERVER (312) trailing: this node's configured description
@@ -25761,6 +25874,8 @@ pub const LinuxServer = struct {
         var modes_text_buf: [48]u8 = undefined;
         var modes_line_buf: [96]u8 = undefined;
         var class_line_buf: [128]u8 = undefined;
+        var ban_host_buf: [cloak.max_cloak_len]u8 = undefined;
+        var ban_line_buf: [cloak.max_cloak_len + 16]u8 = undefined;
         var modes_line: ?[]const u8 = null;
         var class_line: ?[]const u8 = null;
         var idle_secs: u64 = 0;
@@ -25836,6 +25951,7 @@ pub const LinuxServer = struct {
             .no_invite = no_invite,
             .modes_line = modes_line,
             .class_line = class_line,
+            .ban_cloak = if (requester_is_oper) self.whoisBanCloakLine(ip_text, &ban_host_buf, &ban_line_buf) else null,
             .via_websocket = via_websocket,
             .channels = memberships[0..nchan],
             // Oper-only. The reverse name is the host parameter; the address
@@ -29481,7 +29597,7 @@ pub const LinuxServer = struct {
                 error.AuthFailed, error.NotFound => return self.failReply(conn, "RECOVERYCODES", "AUTH_FAILED", "Invalid or already-used recovery code"),
                 else => return self.failReply(conn, "RECOVERYCODES", "INTERNAL_ERROR", "Could not consume recovery code"),
             };
-            self.finishLogin(conn, account) catch |err| switch (err) {
+            self.finishLoginWithFactor(conn, account, .recovery) catch |err| switch (err) {
                 error.StorePoisoned => return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery"),
                 else => return err,
             };
@@ -36912,11 +37028,11 @@ pub const LinuxServer = struct {
         // explicitly disabled at the frozen Step 5 boundary. A forged/nonconfigured
         // carried `is_oper` therefore stays inert, while an exact configured-local
         // account retains its current privilege projection across Helix.
+        // The authentication factor is not in the capsule. A step-up account
+        // therefore fails closed here until this process sees a passkey or
+        // EXTERNAL login again.
         const configured_binding = if (conn.session.account()) |account|
-            if (self.oper_registry) |*registry|
-                oper_session_provenance.configuredLocalBinding(registry, account)
-            else
-                null
+            self.operBindingIfFactorAllows(account, conn.session.auth_factor)
         else
             null;
         _ = conn.session.reconcileOperAuthority(configured_binding, .disabled, self.grantNowU64());
@@ -39344,7 +39460,7 @@ pub const LinuxServer = struct {
             // for a grace window. Only the key-derived facets differ; address /
             // account / country / asn / certfp / realname are key-independent.
             var prev_host_buf: [cloak.max_cloak_len]u8 = undefined;
-            const prev_host = self.prevKeyCloakHost(conn, &prev_host_buf) orelse return null;
+            const prev_host = self.prevKeyCloakHost(conn, &prev_host_buf) orelse return self.cloakBanWard(conn, facets, now_wall);
             var prev_mask_buf: [256]u8 = undefined;
             const prev_mask = std.fmt.bufPrint(&prev_mask_buf, "{s}!{s}@{s}", .{
                 conn.session.displayName(),
@@ -39354,8 +39470,63 @@ pub const LinuxServer = struct {
             var alt = facets;
             alt.host = prev_host;
             alt.mask = prev_mask;
-            break :blk self.warden.check(alt, now_wall) orelse return null;
+            break :blk self.warden.check(alt, now_wall) orelse self.cloakBanWard(conn, facets, now_wall);
         };
+    }
+
+    /// WARD host/mask also matches the stable hierarchical cloak and the
+    /// previous public opaque tokens. The channel still sees only the current
+    /// opaque or account host. A hostname is never turned into a ban cloak.
+    fn cloakBanWard(self: *LinuxServer, conn: *ConnState, facets: warden.Facets, now_wall: i64) ?*const warden.Ward {
+        const key = self.config.cloak_key orelse return null;
+        const addr = conn.peer_addr orelse return null;
+        var ipbuf: [64]u8 = undefined;
+        const ip_text = addrText(addr, &ipbuf) orelse return null;
+        if (std.mem.startsWith(u8, ip_text, "127.") or std.mem.eql(u8, ip_text, "0:0:0:0:0:0:0:1")) return null;
+        var host_buf: [cloak.max_cloak_len]u8 = undefined;
+        var mask_buf: [320]u8 = undefined;
+        const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
+        if (self.banCloakHost(ip_text, &host_buf)) |host| {
+            if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+        }
+        if (self.config.cloak_anon_epoch_secs != 0 and conn.session.account() == null) {
+            const epoch = self.anonCloakEpoch();
+            if (cloak.cloakOpaqueEpoch(&host_buf, &key, ip_text, epoch, opts)) |host| {
+                if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+            } else |_| {}
+            if (cloak.cloakOpaqueEpochV3(&host_buf, &key, ip_text, epoch, opts)) |host| {
+                if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+            } else |_| {}
+            if (epoch > 0) {
+                if (cloak.cloakOpaqueEpoch(&host_buf, &key, ip_text, epoch - 1, opts)) |host| {
+                    if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+                } else |_| {}
+                if (cloak.cloakOpaqueEpochV3(&host_buf, &key, ip_text, epoch - 1, opts)) |host| {
+                    if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+                } else |_| {}
+            }
+        }
+        return null;
+    }
+
+    fn wardOnAltHost(
+        self: *LinuxServer,
+        conn: *const ConnState,
+        facets: warden.Facets,
+        now_wall: i64,
+        host: []const u8,
+        mask_buf: []u8,
+    ) ?*const warden.Ward {
+        if (host.len == 0 or std.mem.eql(u8, host, facets.host)) return null;
+        const mask = std.fmt.bufPrint(mask_buf, "{s}!{s}@{s}", .{
+            conn.session.displayName(),
+            conn.session.username(),
+            host,
+        }) catch "";
+        var alt = facets;
+        alt.host = host;
+        alt.mask = mask;
+        return self.warden.check(alt, now_wall);
     }
 
     fn subjectHitsMeshFilter(self: *const LinuxServer, conn: *const ConnState) bool {
@@ -42275,6 +42446,17 @@ pub const LinuxServer = struct {
         return ircx_auth.saslMechanism(package);
     }
 
+    fn ircxSessionAuthFactor(package: ircx_auth.Package) dispatch.SessionAuthFactor {
+        return switch (package) {
+            .plain => .password,
+            .scram_sha_256, .scram_sha_512, .scram_sha_512_plus => .scram,
+            .external => .external,
+            .session_token => .token,
+            .oauthbearer => .oauth,
+            .anonymous, .anon, .gatekeeper, .gatekeeper_passport => .none,
+        };
+    }
+
     fn ircxAuthAllowsOperElevation(package: ircx_auth.Package) bool {
         return switch (package) {
             .plain,
@@ -42436,6 +42618,7 @@ pub const LinuxServer = struct {
             if (loginMechanismFromIrcx(package)) |mech|
                 self.recordAccountLogin(conn, account, mech, conn.session.tls_certfp orelse "");
             conn.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
+            conn.session.auth_factor = ircxSessionAuthFactor(package);
             self.restoreAccountMetadata(conn, account);
             self.restoreAccountSilence(conn, account);
         }
@@ -45417,6 +45600,28 @@ pub const LinuxServer = struct {
         try self.elevateOperFromAccountWithPrefix(conn, true);
     }
 
+    /// Configured operator binding for `account`, or null when this session's
+    /// factor must not become a network operator. A passkey-only account, and
+    /// an account whose recovery restored a password, require a passkey or
+    /// EXTERNAL factor on this process. Missing factor fails closed. Accounts
+    /// that were never locked keep the previous password-elevation behavior.
+    fn operBindingIfFactorAllows(
+        self: *LinuxServer,
+        account: []const u8,
+        factor: dispatch.SessionAuthFactor,
+    ) ?oper_session_provenance.ConfiguredLocalBinding {
+        if (self.account_services) |svc| {
+            if (svc.operStepUpRequired(account)) {
+                switch (factor) {
+                    .passkey, .external => {},
+                    else => return null,
+                }
+            }
+        }
+        const registry = if (self.oper_registry) |*found| found else return null;
+        return oper_session_provenance.configuredLocalBinding(registry, account);
+    }
+
     fn elevateOperFromAccountWithPrefix(
         self: *LinuxServer,
         conn: *ConnState,
@@ -45442,10 +45647,7 @@ pub const LinuxServer = struct {
         const account = conn.session.account() orelse return;
 
         const application_now = self.grantNowU64();
-        const configured_binding = if (self.oper_registry) |*registry|
-            oper_session_provenance.configuredLocalBinding(registry, account)
-        else
-            null;
+        const configured_binding = self.operBindingIfFactorAllows(account, conn.session.auth_factor);
         const presubscribe_bits = if (configured_binding) |*binding| binding.presubscribeBits() else 0;
 
         // Step 5 deliberately consumes only the sealed live-config capability.
@@ -45846,6 +46048,12 @@ pub const LinuxServer = struct {
         conn.clearMediaE2eeAttachment();
     }
 
+    /// Shared post-authentication login sequence. The factor is `.none`, which
+    /// still elevates an account that was never passkey-locked.
+    fn finishLogin(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
+        try self.finishLoginWithFactor(conn, account, .none);
+    }
+
     /// Shared post-authentication login sequence, factored so a password-less
     /// login (WEBAUTHN AUTH-FINISH) fires the same side effects as the IDENTIFY
     /// success path (`handleIdentify`): bind the session to `account`, emit the
@@ -45855,8 +46063,15 @@ pub const LinuxServer = struct {
     /// already verified the credential and cleared the login throttle. This
     /// mirrors — and is intentionally kept in lockstep with — the tail of
     /// `handleIdentify`; it does NOT emit the "You are now identified" notice so
-    /// each caller can print its own success line.
-    fn finishLogin(self: *LinuxServer, conn: *ConnState, account: []const u8) !void {
+    /// each caller can print its own success line. `factor` is recorded after
+    /// `loginAs` clears the previous one, and it is what the operator step-up
+    /// gate reads.
+    fn finishLoginWithFactor(
+        self: *LinuxServer,
+        conn: *ConnState,
+        account: []const u8,
+        factor: dispatch.SessionAuthFactor,
+    ) !void {
         if (!self.authenticationAvailable()) return error.StorePoisoned;
         const id = idFromToken(conn.token);
         self.retireMediaBeforeAccountMutation(id, conn, account);
@@ -45869,6 +46084,7 @@ pub const LinuxServer = struct {
                 _ = self.removeTrackedSession(old, monitorIdFromClient(id));
         }
         loginSession(conn, account);
+        conn.session.auth_factor = factor;
         self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(id, conn, acct);
         self.maybeApplyAccountCloak(id, conn);
@@ -45920,6 +46136,7 @@ pub const LinuxServer = struct {
                 _ = self.removeTrackedSession(old, monitorIdFromClient(idFromToken(conn.token)));
         }
         loginSession(conn, account);
+        conn.session.auth_factor = .password;
         self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         var buf: [default_reply_bytes]u8 = undefined;
@@ -45949,7 +46166,7 @@ pub const LinuxServer = struct {
                 try channelNotice(conn, "Email {s} recorded (unverified — this server cannot verify email ownership yet)", .{email});
             }
         }
-        if (conn.session.sasl_oper_elevation_allowed) try self.elevateOperFromAccount(conn);
+        try self.elevateOperFromAccount(conn);
         self.trackSession(idFromToken(conn.token), conn);
         self.armBoundedExactResumeHoldIfNeeded(idFromToken(conn.token), conn);
         if (!try self.enforceE2eeSessionEligibility(idFromToken(conn.token), conn)) return;
@@ -46188,6 +46405,7 @@ pub const LinuxServer = struct {
                 _ = self.removeTrackedSession(old, monitorIdFromClient(idFromToken(conn.token)));
         }
         loginSession(conn, account);
+        conn.session.auth_factor = .password;
         self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         // Per-account cloak: switch the visible host to <account>.users.<suffix>
@@ -46589,6 +46807,9 @@ pub const LinuxServer = struct {
         if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "LOGINS")) {
             return self.handleAccountLogins(conn, svc, parsed);
         }
+        if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "SESSIONS")) {
+            return self.handleAccountSessions(conn, parsed);
+        }
         const target = if (parsed.param_count >= 1 and parsed.paramSlice()[0].len != 0)
             parsed.paramSlice()[0]
         else
@@ -46604,7 +46825,7 @@ pub const LinuxServer = struct {
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(
             &buf,
-            ":{s} NOTICE {s} :account={s} flags={d} suspended={} forbidden={} noexpire={} passkey_only={}\r\n",
+            ":{s} NOTICE {s} :account={s} flags={d} suspended={} forbidden={} noexpire={} passkey_only={} oper_stepup={}\r\n",
             .{
                 self.serverName(),
                 conn.session.displayName(),
@@ -46614,6 +46835,7 @@ pub const LinuxServer = struct {
                 (info.flags & services_mod.account_flag_forbidden) != 0,
                 (info.flags & services_mod.account_flag_noexpire) != 0,
                 (info.flags & services_mod.account_flag_passkey_only) != 0,
+                (info.flags & services_mod.account_flag_oper_stepup) != 0,
             },
         ) catch return;
         try appendToConn(conn, line);
@@ -46654,6 +46876,81 @@ pub const LinuxServer = struct {
             ) catch continue;
             try self.noticeTo(conn, text);
         }
+    }
+
+    /// Live attachments listed by one `ACCOUNTINFO SESSIONS` reply. Matches the
+    /// reusable-session cap so a full account is not silently shortened.
+    const account_session_list_cap = sessions_mod.snapshot_capacity;
+
+    const AccountSessionRow = struct {
+        const nick_max: usize = 64;
+        nick: [nick_max]u8 = undefined,
+        nick_len: u8 = 0,
+        tls: bool = false,
+        node_id: u64 = 0,
+    };
+
+    /// `ACCOUNTINFO SESSIONS [account]` lists live attachments for the caller's
+    /// account. `SESSIONS` is the subcommand, so an account of that name is
+    /// `ACCOUNTINFO SESSIONS sessions`. A non-operator who names another account
+    /// is refused before any session is read. Each row is the nick, TLS or
+    /// clear, and the node id. The address, certificate, and session token are
+    /// not copied into the row.
+    fn handleAccountSessions(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const requested = if (parsed.param_count >= 2 and parsed.paramSlice()[1].len != 0)
+            parsed.paramSlice()[1]
+        else
+            null;
+        const self_account = conn.session.account();
+        const target = requested orelse (self_account orelse {
+            try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"ACCOUNTINFO"}, "Not logged in; specify an account");
+            return;
+        });
+        const own = if (self_account) |mine| std.ascii.eqlIgnoreCase(mine, target) else false;
+        if (!own and !conn.session.isOper()) {
+            try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{}, "Permission denied");
+            return;
+        }
+
+        var rows: [account_session_list_cap]AccountSessionRow = undefined;
+        var listed: usize = 0;
+        var truncated = false;
+        walk: for (self.reactors) |*reactor| {
+            var slot_index: usize = 0;
+            while (slot_index < reactor.clients.slots.items.len) : (slot_index += 1) {
+                const slot = &reactor.clients.slots.items[slot_index];
+                if (!slot.occupied or slot.value.closing) continue;
+                if (slot.value.s2s != null or slot.value.s2s_secured != null) continue;
+                const live = slot.value.session.account() orelse continue;
+                if (!std.ascii.eqlIgnoreCase(live, target)) continue;
+                const nick = slot.value.session.displayName();
+                if (nick.len == 0 or nick.len > AccountSessionRow.nick_max or std.mem.eql(u8, nick, "*")) continue;
+                if (std.mem.indexOfAny(u8, nick, "\r\n\x00") != null) continue;
+                if (listed == rows.len) {
+                    truncated = true;
+                    break :walk;
+                }
+                @memcpy(rows[listed].nick[0..nick.len], nick);
+                rows[listed].nick_len = @intCast(nick.len);
+                rows[listed].tls = slot.value.is_tls;
+                rows[listed].node_id = self.config.node_id;
+                listed += 1;
+            }
+        }
+        if (listed == 0) {
+            try self.noticeTo(conn, "SESSIONS: none");
+            return;
+        }
+        for (rows[0..listed]) |row| {
+            var body: [160]u8 = undefined;
+            const text = std.fmt.bufPrint(
+                &body,
+                "SESSIONS: nick={s} tls={s} node={d}",
+                .{ row.nick[0..row.nick_len], if (row.tls) "tls" else "clear", row.node_id },
+            ) catch continue;
+            try self.noticeTo(conn, text);
+        }
+        if (truncated) try self.noticeTo(conn, "SESSIONS: truncated");
     }
 
     /// `ACCOUNT <SUSPEND|UNSUSPEND|FORBID|UNFORBID|NOEXPIRE|INFO> <account>`
@@ -48513,6 +48810,7 @@ pub const LinuxServer = struct {
 
     /// `WEBAUTHN LOCK` — refuse password, PLAIN, and SCRAM until a recovery
     /// code replaces the password. Requires a passkey that is already stored.
+    /// The same cut arms the operator step-up latch and revokes session tokens.
     fn webauthnLock(self: *LinuxServer, conn: *ConnState, svc: *services_mod.Services) !void {
         const account = conn.session.account() orelse
             return self.failReply(conn, "WEBAUTHN", "NOT_LOGGED_IN", "Log in before locking out password login");
@@ -48826,8 +49124,13 @@ pub const LinuxServer = struct {
         // at bind time), not the client-echoed AUTH argument case-variant — the
         // eqlIgnoreCase gate above already proved they name the same account, and
         // downstream account keying (metadata/silence restore) is case-sensitive.
+        // A verified passkey retires the post-recovery operator latch before
+        // elevation. A store failure does not log the session in.
         self.loginRecordSuccess(conn, target_account);
-        self.finishLogin(conn, cred.account()) catch |err| switch (err) {
+        var step_scratch: [1024]u8 = undefined;
+        svc.notePasskeyAuthentication(cred.account(), &step_scratch) catch
+            return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
+        self.finishLoginWithFactor(conn, cred.account(), .passkey) catch |err| switch (err) {
             error.StorePoisoned => return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery"),
             else => return err,
         };
@@ -54293,10 +54596,7 @@ pub const LinuxServer = struct {
         const nonce_len = @min(conn.session.sasl_server_nonce.len, nonce_buf.len);
         @memcpy(nonce_buf[0..nonce_len], conn.session.sasl_server_nonce[0..nonce_len]);
         var desired_session = conn.session;
-        const configured_binding = if (self.oper_registry) |*registry|
-            oper_session_provenance.configuredLocalBinding(registry, account)
-        else
-            null;
+        const configured_binding = self.operBindingIfFactorAllows(account, conn.session.auth_factor);
         const profile = prepareMigratedSessionProfile(
             &desired_session,
             account,
@@ -54675,6 +54975,7 @@ pub const LinuxServer = struct {
 
         const live_had_override = session.hasUmode(.override);
         const live_media_tx_denied = session.hasUmode(.media_tx_deny);
+        const carried_factor = session.auth_factor;
 
         // The HMAC-authenticated caller account is canonical even for rolling-old
         // snapshots that omitted their account field. The current socket's real
@@ -54694,6 +54995,7 @@ pub const LinuxServer = struct {
             // verified live grant may retain +o or derive +a/+j.
             .is_oper = false,
         });
+        session.auth_factor = carried_factor;
 
         // A carried oper bit and the predecessor's in-memory projection are
         // profile history, never authority. Recompute from the live sealed
@@ -58130,6 +58432,7 @@ pub const LinuxServer = struct {
         if (prior) |kept| if (kept.operation == .quit) return;
         const nick = conn.session.displayName();
         const now = self.guestNowMs();
+        const identity = membershipIdentityOf(conn);
         var revision: u64 = 1;
         var claim_hlc: u64 = 0;
         var claim_revision: u64 = 1;
@@ -58139,8 +58442,9 @@ pub const LinuxServer = struct {
             claim_hlc = kept.claim_hlc;
             claim_revision = kept.claim_revision;
             const nick_changed = !std.ascii.eqlIgnoreCase(kept.nick, nick);
+            const host_changed = !std.mem.eql(u8, kept.host, identity.host);
             const remaining = if (kept.expires_ms > now) kept.expires_ms - now else 0;
-            if (nick_changed or remaining < guest_presence_renew_margin_ms) {
+            if (nick_changed or host_changed or remaining < guest_presence_renew_margin_ms) {
                 revision = mesh_presence_v2.nextRevision(kept.revision) catch return;
                 renew = true;
                 if (nick_changed) {
@@ -58151,7 +58455,6 @@ pub const LinuxServer = struct {
         }
         if (renew) {
             if (claim_hlc == 0) claim_hlc = self.nextMeshHlc();
-            const identity = membershipIdentityOf(conn);
             const expires = std.math.add(i64, now, guest_presence_lease_ms) catch return;
             const record: mesh_presence_v2.Record = .{
                 .operation = .present,
@@ -60197,7 +60500,46 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleMesh(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "PROP")) {
+            return self.meshPropWitness(conn, parsed);
+        }
         return oper_cmd.handleMesh(self, conn, parsed);
+    }
+
+    /// Oper `MESH PROP` witness. The line is the stored origin node and HLC
+    /// of one channel property. The signing key, the signature, the owner,
+    /// and the value stay in the clock and are not copied into the notice.
+    fn meshPropWitness(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        if (parsed.param_count < 3 or parsed.paramSlice()[1].len == 0 or parsed.paramSlice()[2].len == 0) {
+            try self.noticeTo(conn, "Usage: MESH PROP <#channel> <key>");
+            return;
+        }
+        const requested_channel = parsed.paramSlice()[1];
+        const requested_key = parsed.paramSlice()[2];
+        if (dispatch.hasControlByte(requested_channel) or dispatch.hasControlByte(requested_key)) {
+            try self.noticeTo(conn, "PROP witness none");
+            return;
+        }
+        const clock = self.channelPropClock(requested_channel, requested_key) orelse {
+            try self.noticeTo(conn, "PROP witness none");
+            return;
+        };
+        if (dispatch.hasControlByte(clock.channel) or dispatch.hasControlByte(clock.key)) {
+            try self.noticeTo(conn, "PROP witness none");
+            return;
+        }
+        var body: [384]u8 = undefined;
+        const text = std.fmt.bufPrint(&body, "PROP witness channel={s} key={s} origin={d} hlc={d} present={}", .{
+            clock.channel,
+            clock.key,
+            clock.origin_node,
+            clock.hlc,
+            clock.present,
+        }) catch {
+            try self.noticeTo(conn, "PROP witness none");
+            return;
+        };
+        try self.noticeTo(conn, text);
     }
 
     pub fn noticeBody(self: *LinuxServer, conn: *ConnState, text: []const u8) !void {
@@ -94461,6 +94803,124 @@ test "cloak auth-split: anon_epoch_secs=0 keeps the stable hierarchical cloak (b
     try std.testing.expect(std.mem.endsWith(u8, conn.session.host(), ".ip.ircxnet"));
 }
 
+test "cloak v3: anonymous host is 128-bit opaque and the ban host still wards" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    server.config.cloak_key = cloak.SecretKey.init(@as([cloak.key_len]u8, @splat(0x3c)));
+    server.config.cloak_suffix = "onyx";
+    server.config.cloak_anon_epoch_secs = 86400;
+
+    const id = try addTestLocalClient(server, "Anon", null);
+    const conn = server.connFor(id) orelse return error.TestUnexpectedResult;
+    conn.session.registration.registered = true;
+    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 9 } };
+    server.applyVisibleHost(conn);
+    const visible = conn.session.host();
+    try std.testing.expect(std.mem.endsWith(u8, visible, ".opq.onyx"));
+    try std.testing.expect(std.mem.indexOf(u8, visible, ".ip.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "203") == null);
+    const dot = std.mem.indexOfScalar(u8, visible, '.') orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, cloak.wide_token_hex_len), dot);
+
+    const other_id = try addTestLocalClient(server, "Neighbor", null);
+    const other = server.connFor(other_id) orelse return error.TestUnexpectedResult;
+    other.session.registration.registered = true;
+    other.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 10 } };
+    server.applyVisibleHost(other);
+    try std.testing.expect(!std.mem.eql(u8, visible, other.session.host()));
+
+    var ban_buf: [cloak.max_cloak_len]u8 = undefined;
+    const ban = server.banCloakHost("203.0.113.9", &ban_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.endsWith(u8, ban, ".ip.onyx"));
+    try server.warden.add(.{
+        .match = .host,
+        .pattern = ban,
+        .action = .expel,
+        .reason = "net",
+        .set_by = "oper",
+    });
+    try std.testing.expect(server.wardMatch(conn) != null);
+    try std.testing.expect(server.wardMatch(other) == null);
+
+    const oper_id = try addTestLocalClient(server, "Oper", null);
+    const oper = server.connFor(oper_id) orelse return error.TestUnexpectedResult;
+    oper.session.registration.registered = true;
+    try reconcileTestOper(&oper.session, oper_mod.OperPrivileges.initMany(&.{.oper_override}), "ircop", "Oper");
+    const plain_id = try addTestLocalClient(server, "Plain", null);
+    const plain = server.connFor(plain_id) orelse return error.TestUnexpectedResult;
+    plain.session.registration.registered = true;
+
+    var oper_line = try irc_line.parseLine("WHOIS Anon");
+    try server.handleWhois(oper, &oper_line);
+    const oper_reply = oper.send_buf[0..oper.send_len];
+    try expectContains(oper_reply, "ban cloak ");
+    try expectContains(oper_reply, ".ip.onyx");
+    try expectContains(oper_reply, "actual address 203.0.113.9");
+    try expectContains(oper_reply, visible);
+
+    var plain_line = try irc_line.parseLine("WHOIS Anon");
+    try server.handleWhois(plain, &plain_line);
+    const plain_reply = plain.send_buf[0..plain.send_len];
+    try expectContains(plain_reply, visible);
+    try std.testing.expect(std.mem.indexOf(u8, plain_reply, "ban cloak") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_reply, "203.0.113.9") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_reply, ".ip.onyx") == null);
+}
+
+test "cloak v3: epoch rotation replaces a generated cloak and leaves a persona" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    server.config.cloak_key = cloak.SecretKey.init(@as([cloak.key_len]u8, @splat(0x41)));
+    server.config.cloak_suffix = "onyx";
+    server.config.cloak_anon_epoch_secs = 86400;
+
+    const id = try addTestLocalClient(server, "Stale", null);
+    const conn = server.connFor(id) orelse return error.TestUnexpectedResult;
+    conn.session.registration.registered = true;
+    conn.peer_addr = .{ .ipv4 = .{ 198, 51, 100, 7 } };
+    conn.session.setRealHost("198.51.100.7");
+    conn.session.setVisibleHost("stale.opq.onyx");
+    server.last_anon_cloak_epoch = 0;
+    server.rotateDueAnonCloaks();
+    try std.testing.expect(std.mem.endsWith(u8, conn.session.host(), ".opq.onyx"));
+    try std.testing.expect(!std.mem.eql(u8, conn.session.host(), "stale.opq.onyx"));
+    try std.testing.expect(std.mem.indexOf(u8, conn.session.host(), "198.51.100.7") == null);
+    const rotated = conn.session.host();
+    server.rotateDueAnonCloaks();
+    try std.testing.expectEqualStrings(rotated, conn.session.host());
+
+    conn.session.setVisibleHost("persona.example");
+    server.last_anon_cloak_epoch = 0;
+    server.rotateDueAnonCloaks();
+    try std.testing.expectEqualStrings("persona.example", conn.session.host());
+}
+
 // Build a relay PRIVMSG signed by `kp`, stamping the carried pubkey/sig into the
 // caller-owned `pk_buf`/`sig_buf` (which must outlive any deliverRelay call). The
 // `origin_node` is the self-certified short id of `kp`, so a receiver's
@@ -118009,6 +118469,307 @@ test "new sign-in notice reaches the other session with a certificate prefix" {
     try server.handleIdentify(ned, &identify);
     try std.testing.expectEqualStrings("alice", ned.session.account() orelse return error.TestUnexpectedResult);
     try std.testing.expect(std.mem.indexOf(u8, ann.send_buf[0..ann.send_len], "New sign-in") == null);
+}
+
+test "MESH PROP shows origin and hlc without signing material" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    const planted_owner = "owner-material-alice";
+    const planted_pub = "pubkey-material-7f3a";
+    const planted_sig = "signature-material-91c0";
+    try std.testing.expect(server.recordChannelPropClock("#zig", "TOPIC", planted_owner, 9001, true, 42, planted_pub, planted_sig));
+
+    const id = try addTestLocalClient(server, "Witness", null);
+    const conn = server.connFor(id).?;
+    conn.test_sendq_capture = true;
+
+    var line = irc_line.LineView{ .raw = "", .command = "MESH" };
+    line.params[0] = "PROP";
+    line.params[1] = "#zig";
+    line.params[2] = "TOPIC";
+    line.param_count = 3;
+    try server.handleMesh(conn, &line);
+    const body = conn.send_buf[0..conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, body, "PROP witness channel=#zig key=TOPIC origin=42 hlc=9001 present=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, planted_owner) == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, planted_pub) == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, planted_sig) == null);
+
+    resetTestSendQ(conn);
+    line.params[2] = "MISSING";
+    try server.handleMesh(conn, &line);
+    const missing = conn.send_buf[0..conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, missing, "PROP witness none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, planted_owner) == null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, planted_pub) == null);
+    try std.testing.expect(std.mem.indexOf(u8, missing, planted_sig) == null);
+}
+
+test "REGISTER elevates a configured operator account and leaves an unbound account ordinary" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-register-oper.wal");
+    defer store.deinit();
+    var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+
+    const bindings = [_]oper_mod.OperBinding{
+        .{ .account_name = "regop", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
+    };
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .oper_registry = oper_mod.OperRegistry.init(&bindings) catch unreachable,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    const id_op = try addTestLocalClient(server, "RegOp", null);
+    const id_plain = try addTestLocalClient(server, "RegPlain", null);
+    const op = server.connFor(id_op).?;
+    const plain = server.connFor(id_plain).?;
+    op.test_sendq_capture = true;
+    plain.test_sendq_capture = true;
+
+    var reg = irc_line.LineView{ .raw = "", .command = "REGISTER" };
+    reg.params[0] = "regop";
+    reg.params[1] = "*";
+    reg.params[2] = "correct horse battery staple";
+    reg.param_count = 3;
+    try server.handleRegister(op, &reg);
+    try std.testing.expectEqualStrings("regop", op.session.account() orelse return error.TestUnexpectedResult);
+    try std.testing.expect(op.session.auth_factor == .password);
+    try std.testing.expect(op.session.isOper());
+    try std.testing.expectEqualStrings("netadmin", op.session.operClass());
+    try std.testing.expect(!services.operStepUpRequired("regop"));
+    try std.testing.expect(std.mem.indexOf(u8, op.send_buf[0..op.send_len], "REGISTER SUCCESS regop") != null);
+
+    reg.params[0] = "regplain";
+    try server.handleRegister(plain, &reg);
+    try std.testing.expectEqualStrings("regplain", plain.session.account() orelse return error.TestUnexpectedResult);
+    try std.testing.expect(plain.session.auth_factor == .password);
+    try std.testing.expect(!plain.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, plain.send_buf[0..plain.send_len], "REGISTER SUCCESS regplain") != null);
+
+    // An existing name fails before login, so the ordinary session stays ordinary.
+    resetTestSendQ(plain);
+    reg.params[0] = "regop";
+    try server.handleRegister(plain, &reg);
+    try std.testing.expectEqualStrings("regplain", plain.session.account() orelse return error.TestUnexpectedResult);
+    try std.testing.expect(!plain.session.isOper());
+    try std.testing.expect(std.mem.indexOf(u8, plain.send_buf[0..plain.send_len], "ACCOUNT_EXISTS") != null);
+    try std.testing.expect(op.session.isOper());
+}
+
+test "passkey recovery does not grant operator until a passkey signs in" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-oper-stepup.wal");
+    defer store.deinit();
+    var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("step", "correcthorse", &scratch);
+    _ = try services.registerAccount("plain", "correcthorse", &scratch);
+
+    const bindings = [_]oper_mod.OperBinding{
+        .{ .account_name = "step", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
+        .{ .account_name = "plain", .class_name = "ircop", .privileges = oper_mod.OperPrivileges.initMany(&.{.client_moderate}) },
+    };
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .oper_registry = oper_mod.OperRegistry.init(&bindings) catch unreachable,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    const id = try addTestLocalClient(server, "Step", null);
+    const conn = server.connFor(id).?;
+    conn.test_sendq_capture = true;
+
+    var identify = irc_line.LineView{ .raw = "", .command = "IDENTIFY" };
+    identify.params[0] = "step";
+    identify.params[1] = "correcthorse";
+    identify.param_count = 2;
+    try server.handleIdentify(conn, &identify);
+    try std.testing.expect(conn.session.isOper());
+
+    try services.webauthnBind("step", "abc", "k", 0, "", 1);
+    try services.enablePasskeyOnly("step", &scratch);
+    try std.testing.expect(services.operStepUpRequired("step"));
+    conn.session.logout();
+    try std.testing.expect(!conn.session.isOper());
+
+    try services.setAccountPasswordForced("step", "correcthorse", &scratch);
+    const info = try services.accountInfo("step");
+    try std.testing.expect((info.account_info.flags & services_mod.account_flag_passkey_only) == 0);
+    try std.testing.expect((info.account_info.flags & services_mod.account_flag_oper_stepup) != 0);
+
+    try server.handleIdentify(conn, &identify);
+    try std.testing.expectEqualStrings("step", conn.session.account().?);
+    try std.testing.expect(!conn.session.isOper());
+
+    try server.finishLoginWithFactor(conn, "step", .recovery);
+    try std.testing.expect(!conn.session.isOper());
+
+    conn.session.auth_factor = .external;
+    try server.elevateOperFromAccount(conn);
+    try std.testing.expect(conn.session.isOper());
+    const still = try services.accountInfo("step");
+    try std.testing.expect((still.account_info.flags & services_mod.account_flag_oper_stepup) != 0);
+
+    try server.finishLoginWithFactor(conn, "step", .password);
+    try std.testing.expect(!conn.session.isOper());
+
+    try services.notePasskeyAuthentication("step", &scratch);
+    try server.finishLoginWithFactor(conn, "step", .passkey);
+    try std.testing.expect(conn.session.isOper());
+    const cleared = try services.accountInfo("step");
+    try std.testing.expect((cleared.account_info.flags & services_mod.account_flag_oper_stepup) == 0);
+
+    try server.finishLoginWithFactor(conn, "step", .password);
+    try std.testing.expect(conn.session.isOper());
+    try services.setAccountPasswordForced("plain", "correcthorse", &scratch);
+    try std.testing.expect(!services.operStepUpRequired("plain"));
+    try server.finishLoginWithFactor(conn, "plain", .password);
+    try std.testing.expect(conn.session.isOper());
+    try std.testing.expectEqualStrings("ircop", conn.session.operClass());
+}
+
+test "ACCOUNTINFO SESSIONS lists live attachments without secrets" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-account-sessions.wal");
+    defer store.deinit();
+    var services = services_mod.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "correcthorse", &scratch);
+    _ = try services.registerAccount("bob", "correcthorse", &scratch);
+
+    const bindings = [_]oper_mod.OperBinding{
+        .{ .account_name = "alice", .class_name = "netadmin", .privileges = oper_mod.OperPrivileges.full },
+    };
+    const server = createTestServer(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = 42,
+        .account_services = &services,
+        .oper_registry = oper_mod.OperRegistry.init(&bindings) catch unreachable,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        std.testing.allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    const planted_host = "203.0.113.50";
+    const planted_cert = "aabbccddeeff00112233445566778899";
+    const id_ann = try addTestLocalClient(server, "Ann", null);
+    const id_bea = try addTestLocalClient(server, "Bea", null);
+    const id_bob = try addTestLocalClient(server, "Bob", null);
+    const id_cay = try addTestLocalClient(server, "Cay", null);
+    const ann = server.connFor(id_ann).?;
+    const bea = server.connFor(id_bea).?;
+    const bob = server.connFor(id_bob).?;
+    const cay = server.connFor(id_cay).?;
+    ann.test_sendq_capture = true;
+    bea.test_sendq_capture = true;
+    bob.test_sendq_capture = true;
+    cay.test_sendq_capture = true;
+    bea.is_tls = true;
+    ann.session.setRealHost(planted_host);
+    ann.session.tls_certfp = planted_cert;
+
+    var identify = irc_line.LineView{ .raw = "", .command = "IDENTIFY" };
+    identify.params[0] = "alice";
+    identify.params[1] = "correcthorse";
+    identify.param_count = 2;
+    try server.handleIdentify(ann, &identify);
+    try server.handleIdentify(bea, &identify);
+    try std.testing.expect(ann.session.isOper());
+    identify.params[0] = "bob";
+    try server.handleIdentify(bob, &identify);
+    try std.testing.expect(!bob.session.isOper());
+
+    resetTestSendQ(ann);
+    var sessions = irc_line.LineView{ .raw = "", .command = "ACCOUNTINFO" };
+    sessions.params[0] = "SESSIONS";
+    sessions.param_count = 1;
+    try server.handleAccountInfo(ann, &sessions);
+    const own = ann.send_buf[0..ann.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, own, "SESSIONS: nick=Ann tls=clear node=42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, own, "SESSIONS: nick=Bea tls=tls node=42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, own, planted_host) == null);
+    try std.testing.expect(std.mem.indexOf(u8, own, planted_cert) == null);
+    try std.testing.expect(std.mem.indexOf(u8, own, "nick=Bob") == null);
+
+    bea.closing = true;
+    resetTestSendQ(ann);
+    try server.handleAccountInfo(ann, &sessions);
+    const after_close = ann.send_buf[0..ann.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, after_close, "nick=Ann") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_close, "nick=Bea") == null);
+
+    resetTestSendQ(bob);
+    sessions.params[1] = "alice";
+    sessions.param_count = 2;
+    try server.handleAccountInfo(bob, &sessions);
+    const denied = bob.send_buf[0..bob.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, denied, " 481 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "nick=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "SESSIONS:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, denied, planted_host) == null);
+    try std.testing.expect(std.mem.indexOf(u8, denied, planted_cert) == null);
+
+    resetTestSendQ(cay);
+    sessions.param_count = 1;
+    try server.handleAccountInfo(cay, &sessions);
+    try std.testing.expect(std.mem.indexOf(u8, cay.send_buf[0..cay.send_len], " 461 ") != null);
+
+    resetTestSendQ(ann);
+    sessions.params[1] = "bob";
+    sessions.param_count = 2;
+    try server.handleAccountInfo(ann, &sessions);
+    const oper_view = ann.send_buf[0..ann.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, oper_view, "SESSIONS: nick=Bob tls=clear node=42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oper_view, "nick=Ann") == null);
+    try std.testing.expect(std.mem.indexOf(u8, oper_view, planted_host) == null);
+    try std.testing.expect(std.mem.indexOf(u8, oper_view, planted_cert) == null);
 }
 
 test "threaded server: ACCOUNTINFO LOGINS and WEBAUTHN LOCK" {

@@ -754,15 +754,12 @@ minting_enabled = false
 # stable across IPs/devices. Explicit VHOST personas still override it.
 # account_cloak = false
 # Anonymous-client cloak rotation cadence, in SECONDS (default 86400 = 24 h).
-# When non-zero, an UNAUTHENTICATED client's IP is cloaked with an OPAQUE, epoch-
-# rotated token: the same anonymous IP maps to a fresh opaque cloak each epoch and
-# leaks no subnet co-membership — retiring the forever-linkability of a static-IP
-# anonymous user. Wall-clock based so every mesh node agrees on the epoch. Logged-
-# in clients are unaffected (they keep the stable account/hierarchical cloak, which
-# stays subnet-bannable). Set 0 to disable rotation (anonymous clients keep the
-# stable hierarchical cloak — the pre-2026-07 behavior). Moderation of anonymous
-# abuse shifts to account bans + registration friction, which opaque anon cloaks
-# are designed to require.
+# When non-zero, an UNAUTHENTICATED client shows a 128-bit OPAQUE token salted by
+# the wall-clock epoch. Nothing about the subnet or country is in that host, and
+# a connection that stays up is re-cloaked when the epoch changes. Oper WHOIS
+# still shows a stable hierarchical "ban cloak" host, and WARD matches it, so
+# subnet hostmasks keep working. Logged-in clients keep the account or
+# hierarchical cloak. Set 0 to disable rotation.
 # anon_epoch_secs = 86400
 
 

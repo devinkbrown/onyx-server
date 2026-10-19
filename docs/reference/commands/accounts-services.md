@@ -84,13 +84,13 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 
 ## ACCOUNTINFO
 
-- Syntax: `ACCOUNTINFO [account]` and `ACCOUNTINFO LOGINS [account]`
-- Description: Reports account name and flags, including `passkey_only`. Without an argument, uses the caller's logged-in account. `LOGINS` lists up to eight recent sign-ins (time in milliseconds, mechanism, TLS, and an 8-byte prefix). The word `LOGINS` is the subcommand. A caller reads their own rows. An operator may name another account. The full certificate is not shown.
-- Privileges: Registered client. Another account's login rows require an operator.
-- Parameters: Optional account. For `LOGINS`, an optional account after the subcommand.
-- Replies: Server `NOTICE` `account=<name> flags=<n> suspended=<bool> forbidden=<bool> noexpire=<bool> passkey_only=<bool>`. Login rows are `LOGINS: time=<ms> mechanism=<name> tls=<clear|tls|unknown> prefix=<text|->`, or `LOGINS: none`.
-- Errors: `ERR_NEEDMOREPARAMS 461` when neither argument nor login exists; `ERR_NOPRIVILEGES 481` when a non-operator names another account's logins; `FAIL ACCOUNTINFO ACCOUNT_UNKNOWN`; `FAIL ACCOUNTINFO BAD_ACCOUNT`; `FAIL ACCOUNTINFO TEMPORARILY_UNAVAILABLE`.
-- Example: `ACCOUNTINFO alice` and `ACCOUNTINFO LOGINS`
+- Syntax: `ACCOUNTINFO [account]`, `ACCOUNTINFO LOGINS [account]`, and `ACCOUNTINFO SESSIONS [account]`
+- Description: Reports account name and flags, including `passkey_only` and `oper_stepup`. Without an argument, uses the caller's logged-in account. `LOGINS` lists up to eight recent sign-ins (time in milliseconds, mechanism, TLS, and an 8-byte prefix). `SESSIONS` lists live attachments on this process: nick, TLS or clear, and node id. The words `LOGINS` and `SESSIONS` are subcommands. A caller reads their own rows. An operator may name another account. The address, the certificate, and the session token are not shown.
+- Privileges: Registered client. Another account's login or session rows require an operator.
+- Parameters: Optional account. For `LOGINS` and `SESSIONS`, an optional account after the subcommand.
+- Replies: Server `NOTICE` `account=<name> flags=<n> suspended=<bool> forbidden=<bool> noexpire=<bool> passkey_only=<bool> oper_stepup=<bool>`. Login rows are `LOGINS: time=<ms> mechanism=<name> tls=<clear|tls|unknown> prefix=<text|->`, or `LOGINS: none`. Session rows are `SESSIONS: nick=<nick> tls=<tls|clear> node=<id>`, `SESSIONS: none`, or `SESSIONS: truncated` after a full cap.
+- Errors: `ERR_NEEDMOREPARAMS 461` when neither argument nor login exists; `ERR_NOPRIVILEGES 481` when a non-operator names another account's logins or sessions; `FAIL ACCOUNTINFO ACCOUNT_UNKNOWN`; `FAIL ACCOUNTINFO BAD_ACCOUNT`; `FAIL ACCOUNTINFO TEMPORARILY_UNAVAILABLE`.
+- Example: `ACCOUNTINFO alice`, `ACCOUNTINFO LOGINS`, and `ACCOUNTINFO SESSIONS`
 - Sources: `src/daemon/modules/accounts.zig:134`, `src/daemon/server.zig:23457`, `src/daemon/services.zig:1284`
 
 ## SASLINFO
@@ -160,7 +160,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## CHANNEL
 
 - Syntax: `CHANNEL <REGISTER|DROP|INFO|ACCESS|AKICK|SET|TRANSFER> <#channel> ...`
-- Description: Real server command for channel services. The implemented switch handles `REGISTER`, `DROP`, `INFO`, `ACCESS`, `AKICK`, and `SET MLOCK`; `TRANSFER` and non-MLOCK `SET` fields are parsed but still reply as unavailable.
+- Description: Real server command for channel services. The switch handles `REGISTER`, `DROP`, `INFO`, `ACCESS`, `AKICK`, `TRANSFER`, and `SET` for `MLOCK`, `KEEPTOPIC`, `TOPICLOCK`, `GUARD`, `PRIVATE`, `DESC`, and `URL`. `TRANSFER` moves the founder to an existing account. Any other parsed `SET` field replies that it is not available yet.
 - Privileges: Registered client logged in to an account.
 - Parameters: Subcommand and channel-specific arguments.
 - Replies: Server notices; `REGISTER`/`DROP` also reflect live registered-channel state.
@@ -310,7 +310,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## WEBAUTHN
 
 - Syntax: `WEBAUTHN STATUS | REGISTER [label] | REGISTER-FINISH <cred-id> <client-data-json> <authdata> [attestation] | AUTH <account> | AUTH-FINISH <cred-id> <client-data-json> <authdata> <signature> | LIST | REMOVE <cred-id> | RENAME <cred-id> :<label> | LOCK`
-- Description: Passkey (WebAuthn) registration and passwordless login. `REGISTER`/`REGISTER-FINISH` bind a credential to the logged-in account; `AUTH`/`AUTH-FINISH` issue and verify a single-use challenge; `LIST`, `REMOVE`, `RENAME`, and `STATUS` manage that account's credentials. `LOCK` refuses password, PLAIN, and SCRAM until a recovery code replaces the password. It requires a passkey that is already stored. Attestation and user-verification requirements follow `[webauthn]` configuration.
+- Description: Passkey (WebAuthn) registration and passwordless login. `REGISTER`/`REGISTER-FINISH` bind a credential to the logged-in account; `AUTH`/`AUTH-FINISH` issue and verify a single-use challenge; `LIST`, `REMOVE`, `RENAME`, and `STATUS` manage that account's credentials. `LOCK` refuses password, PLAIN, and SCRAM until a recovery code replaces the password, revokes SASL session tokens, and arms `oper_stepup`. It requires a passkey that is already stored. While that latch is set, a password, SCRAM, recovery-code, or session-token session does not become a network operator. A passkey or EXTERNAL session may. Recovery that replaces the password clears `passkey_only` and leaves the latch set until a later passkey sign-in. `ACCOUNTSET` cannot set or clear either bit. Attestation and user-verification requirements follow `[webauthn]` configuration.
 - Privileges: Registration, management, and `LOCK` require a logged-in account; authentication challenge may name an account while logged out. All ceremonies require a configured WebAuthn relying party and fail closed on malformed base64, origin, RP-ID, credential, or signature data.
 - Replies: `WEBAUTHN` challenge/allow-credential lines, status/list notices, `WEBAUTHN LOCKED :password login disabled`, and a normal account login notice after a successful assertion.
 - Errors: `FAIL WEBAUTHN NOT_CONFIGURED`, `NOT_LOGGED_IN`, `NO_PENDING`, `BAD_CREDENTIAL_ID`, `BAD_CLIENT_DATA`, `BAD_AUTHDATA`, `BAD_SIGNATURE`, `BAD_ORIGIN`, `RP_MISMATCH`, `ASSERTION_FAILED`, `UNKNOWN_CREDENTIAL`, `CREDENTIAL_ACCOUNT_MISMATCH`, `PASSKEY_REQUIRED`, `INVALID_SUBCOMMAND`, and policy/temporary errors.

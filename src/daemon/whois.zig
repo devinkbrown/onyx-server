@@ -148,6 +148,10 @@ pub const WhoisSubject = struct {
     /// RPL_WHOISSPECIAL (320). Oper or self only, for example
     /// "is in connection class users". Null or empty omits the line.
     class_line: ?[]const u8 = null,
+    /// RPL_WHOISSPECIAL (320). Oper or self only. The stable hierarchical cloak
+    /// (`ban cloak <host>`) used for subnet and country hostmasks. This is not
+    /// the public host and is never sent to a channel.
+    ban_cloak: ?[]const u8 = null,
     /// RPL_WHOISSPECIAL (320): the connection was accepted as a WebSocket.
     via_websocket: bool = false,
     channels: []const ChannelMembership = &.{},
@@ -278,6 +282,9 @@ pub fn writeWhoisWith(
     if (subject.class_line) |text| {
         if (text.len != 0) try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, text);
     }
+    if (subject.ban_cloak) |text| {
+        if (text.len != 0) try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, text);
+    }
     if (subject.via_websocket) {
         try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, "is connected via WebSocket");
     }
@@ -364,6 +371,7 @@ pub fn validateSubjectWith(comptime params: Params, subject: WhoisSubject) Whois
     if (subject.geo) |geo_text| try validateRenderedTrailingText(geo_text, error.InvalidRealname);
     if (subject.modes_line) |text| try validateRenderedTrailingText(text, error.InvalidRealname);
     if (subject.class_line) |text| try validateRenderedTrailingText(text, error.InvalidRealname);
+    if (subject.ban_cloak) |text| try validateRenderedTrailingText(text, error.InvalidRealname);
     for (subject.channels) |membership| {
         try validateChannelMembershipWith(params, membership);
     }

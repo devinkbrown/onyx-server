@@ -18,7 +18,7 @@ done by editing their tests away.
 
 | Slice | What the tree does | Evidence limit |
 | --- | --- | --- |
-| Armor name constraints | A single-label wildcard SAN is the set of one-label expansions. An excluded subtree matches if any expansion is inside. A permitted subtree matches only if every expansion is inside. The accepted name is also checked against every presented CA and the matching trust anchor. | Armor suite 121 passed, 3 skipped, on the musl qemu run. `src/cli/verify_cmd.zig` does not call that checker yet (X-4). |
+| Armor name constraints | A single-label wildcard SAN is the set of one-label expansions. An excluded subtree matches if any expansion is inside. A permitted subtree matches only if every expansion is inside. The accepted name is also checked against every presented CA and the matching trust anchor. `armor verify` applies those same helpers after the signature check. | Armor suite 121 passed, 3 skipped, on the earlier musl qemu run. CLI verify landed in source on 2026-10-18 and is not deployed. Focused `test-cli-verbose` passed, including a cross-domain name and a pathLen 0 intermediate. The full suite was not rerun. |
 | IRCX LAG | `PROP LAG` is 0, 1, or 2 seconds for every member. Voice and operators are not exempt. `SLOWMODE` exemptions stay on `SLOWMODE`. | Landed with the October IRCX slice. |
 | LISTX limit | The second parameter is accepted and clamped. Numeric 816. Layout stays `<channel> <members> <created_ms> <topic_ms> :<topic>`. | Do not "fix" that layout back to the 1998 mode/limit row. |
 | ONJOIN / ONPART | ONJOIN is `PRIVMSG` to the joiner only. ONPART is `NOTICE` to the parter only. The channel name is the sender. The two characters `\` `n` start another line. A real CR, LF, or NUL is rejected. | Max 255. |
@@ -234,6 +234,16 @@ operator may name another account and gets the same fields. A
 non-operator naming another account is 481 before lookup, same as
 LOGINS. `SESSIONS` is a subcommand, not an account name.
 
+Landed in source on 2026-10-18. Not deployed. Rows are the live
+attachments on this process: `nick`, `tls` or `clear`, and this node's
+id. A non-operator who names another account receives 481 before any
+session is read. Closing and server-link sockets are omitted. The
+address, certificate, and session token are not copied into the row.
+Retained session replicas are not listed: they outlive the socket and
+do not carry TLS. Focused Debug `test-mod-verbose` passed 75 tests,
+including the sessions case. Full `zig build test` and ReleaseSafe
+were not run.
+
 ### W3-B. Oper step-up
 
 A passkey-only account cannot become a network operator on a session
@@ -242,11 +252,33 @@ requires a passkey or EXTERNAL on that session. Recovery stays the
 break-glass path back to a password, and that password session is not
 an oper session until the account holder signs in with a passkey again.
 
+Landed in source on 2026-10-18. Not deployed. The durable latch is
+account flag bit 6 (`oper_stepup`). Recovery clears `passkey_only` and
+leaves the latch set. A passkey sign-in clears it only after
+`passkey_only` is already clear. EXTERNAL may elevate the current
+session and does not clear the latch. Helix drops operator on a
+step-up account because the factor is not in the capsule. Focused
+Debug `test-mod-verbose` passed 88 tests, including the recovery
+step-up case. Full `zig build test` and ReleaseSafe were not run.
+
 ### W3-C. Reply audit
 
 Compare `handleRegister`, `handleIdentify`, `handleChannel`, and
 `handleMemo` to the command pages. Patch only a line that contradicts
 the page. Do not change the RESETPASS existence rule.
+
+Landed in source on 2026-10-18. Not deployed. `REGISTER` records the
+password factor and elevates through the same step-up gate as
+`IDENTIFY`. A new account that is already in the oper registry becomes
+an operator; an unbound account does not. An existing name still fails
+with `ACCOUNT_EXISTS` before login. `IDENTIFY` and `MEMO` already
+matched their pages. `MEMO` has no expiry field, so none was added.
+`CHANNEL TRANSFER` and `SET` of `MLOCK`, `KEEPTOPIC`, `TOPICLOCK`,
+`GUARD`, `PRIVATE`, `DESC`, and `URL` were already implemented; the
+command page now says so. Focused Debug `test-mod-verbose` passed 76
+tests, including the register-elevation case, the register rebind case,
+and the sessions case. Full `zig build test` and ReleaseSafe were not
+run.
 
 ### W3-D. Memo and grant expiry the holder can see
 
@@ -280,6 +312,16 @@ line may show the origin node and the HLC of one property. Do not hand
 the signing key, the raw signature, or a forgeable "trusted" bit to
 ordinary clients.
 
+Landed in source on 2026-10-18. Not deployed. `MESH PROP <#channel>
+<key>` (and the `NETSTAT` alias) notices the stored origin node, the
+hybrid logical clock, and whether the fact is present. The signing
+key, the signature, the owner, and the value are not copied into the
+notice. A missing clock is `PROP witness none`. The command stays
+registered as oper-only, the same gate as the other `MESH`
+subcommands. Focused Debug `test-mod-verbose` passed 75 tests,
+including the witness case. Full `zig build test` and ReleaseSafe
+were not run.
+
 ### W4-C. Partition rejoin honors the denial
 
 A kick, a ban, or an `ACCESS DENY` that landed during a partition
@@ -300,6 +342,12 @@ not enable the feature.
 `src/cli/verify_cmd.zig` must apply the same name-constraint helper
 the handshake applies, or the comment must stop claiming that it does.
 No new TLS feature.
+
+Landed in source on 2026-10-18. Not deployed. `verifyChain` calls
+`enforcePresentedNameConstraintsFor`, `enforcePathLen`, and
+`enforceExternalAnchorFor` after `verifySimpleChainAt` accepts the
+anchor. Focused `test-cli-verbose` passed 8 tests. Full `zig build
+test` and ReleaseSafe were not run.
 
 ### W5-B. Ship evidence
 

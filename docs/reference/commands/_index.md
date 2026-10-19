@@ -104,7 +104,7 @@ Last reconciled **2026-09-06** against the enabled module manifest and command r
 | `FORCEJOIN` | Force a user to join. | [oper-moderation.md](oper-moderation.md#forcejoin) |
 | `FORCEPART` | Force a user to part. | [oper-moderation.md](oper-moderation.md#forcepart) |
 | `FORCETOPIC` | Force channel topic. | [oper-moderation.md](oper-moderation.md#forcetopic) |
-| `MESH` | Mesh peer report, log, grants, quorum summary. | [mesh-ops.md](mesh-ops.md#mesh) |
+| `MESH` | Mesh peer report, log, grants, quorum summary, and one property witness. | [mesh-ops.md](mesh-ops.md#mesh) |
 | `NETSTAT` | Alias of `MESH`. | [mesh-ops.md](mesh-ops.md#netstat) |
 | `ROUTE` | Mesh route report. | [mesh-ops.md](mesh-ops.md#route) |
 | `NETHEALTH` | Mesh liveness report. | [mesh-ops.md](mesh-ops.md#nethealth) |

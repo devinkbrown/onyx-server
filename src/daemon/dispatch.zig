@@ -916,6 +916,11 @@ pub const ClientSession = struct {
     /// True only when the most recent SASL account login came from a local
     /// verifier that may map to configured oper bindings.
     sasl_oper_elevation_allowed: bool = false,
+    /// How this process authenticated the current account. Runtime only: not
+    /// part of the Helix snapshot. A successor that did not observe the factor
+    /// keeps `.none`, and a step-up account then fails closed for operator
+    /// elevation. `loginAs` clears it; the caller sets the new factor after.
+    auth_factor: SessionAuthFactor = .none,
     /// Set after a non-token SASL success so the server services command surface
     /// can issue and deliver a fresh session token once the live connection layer
     /// regains control.
@@ -1317,6 +1322,7 @@ pub const ClientSession = struct {
         self.logged_in = true;
         self.sasl_guest = false;
         self.sasl_oper_elevation_allowed = false;
+        self.auth_factor = .none;
         // Server-managed +r: a logged-in identity is "registered". Set here so SASL,
         // IDENTIFY, REGISTER, EXTERNAL, and session restore all surface it uniformly.
         self.umodes.add(.registered);
@@ -1332,6 +1338,7 @@ pub const ClientSession = struct {
         self.logged_in = false;
         self.sasl_guest = true;
         self.sasl_oper_elevation_allowed = false;
+        self.auth_factor = .none;
         self.umodes.remove(.registered);
     }
 
@@ -1340,6 +1347,7 @@ pub const ClientSession = struct {
         self.logged_in = false;
         self.sasl_guest = false;
         self.sasl_oper_elevation_allowed = false;
+        self.auth_factor = .none;
         self.sasl_issue_session_token = false;
         self.account_store.len = 0;
         self.umodes.remove(.registered);
@@ -1582,6 +1590,29 @@ fn writeSaslMechanismList(session: *const ClientSession, out: []u8) ?[]const u8 
     appendSaslMechanismSep(out, &len, session.sasl_oauthbearer != null, "OAUTHBEARER", ' ') catch return null;
     appendSaslMechanismSep(out, &len, session.sasl_allow_anonymous, "ANONYMOUS", ' ') catch return null;
     return if (len == 0) null else out[0..len];
+}
+
+/// Factor that produced the current account binding. Not serialized.
+pub const SessionAuthFactor = enum(u8) {
+    none,
+    password,
+    scram,
+    external,
+    passkey,
+    recovery,
+    token,
+    oauth,
+};
+
+fn sessionAuthFactorFromSasl(mechanism: ?sasl.Mechanism) SessionAuthFactor {
+    return switch (mechanism orelse return .none) {
+        .plain => .password,
+        .scram_sha_256, .scram_sha_512, .scram_sha_512_plus => .scram,
+        .external => .external,
+        .session_token => .token,
+        .oauthbearer => .oauth,
+        .anonymous => .none,
+    };
 }
 
 fn saslMechanismAllowsOperElevation(mechanism: ?sasl.Mechanism) bool {
@@ -1998,6 +2029,7 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
                 ctx.session.account_store.len = 0;
                 ctx.session.sasl_guest = false;
                 ctx.session.sasl_oper_elevation_allowed = false;
+                ctx.session.auth_factor = .none;
                 ctx.session.sasl_issue_session_token = false;
                 ctx.session.sasl_pending = sasl.Mechanism.parse(payload);
                 ctx.session.sasl_router = router;
@@ -2102,6 +2134,7 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
                 }
                 ctx.session.loginAs(account);
                 ctx.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
+                ctx.session.auth_factor = sessionAuthFactorFromSasl(mechanism);
                 ctx.session.sasl_issue_session_token = result.issue_session_token;
                 if (ctx.session.login_audit) |hook| if (mechanism) |mech| {
                     if (mech != .anonymous) {
@@ -2148,6 +2181,7 @@ fn saslFail(ctx: DispatchCtx, message: []const u8) DispatchError!void {
     ctx.session.logged_in = false;
     ctx.session.sasl_guest = false;
     ctx.session.sasl_oper_elevation_allowed = false;
+    ctx.session.auth_factor = .none;
     ctx.session.sasl_issue_session_token = false;
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
@@ -2160,6 +2194,7 @@ fn saslTooLong(ctx: DispatchCtx) DispatchError!void {
     ctx.session.logged_in = false;
     ctx.session.sasl_guest = false;
     ctx.session.sasl_oper_elevation_allowed = false;
+    ctx.session.auth_factor = .none;
     ctx.session.sasl_issue_session_token = false;
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;
@@ -2184,6 +2219,7 @@ fn saslAbort(ctx: DispatchCtx) DispatchError!void {
     ctx.session.logged_in = false;
     ctx.session.sasl_guest = false;
     ctx.session.sasl_oper_elevation_allowed = false;
+    ctx.session.auth_factor = .none;
     ctx.session.sasl_issue_session_token = false;
     ctx.session.account_store.len = 0;
     ctx.session.client.registration.sasl = .failed;

@@ -247,9 +247,9 @@ pub const help_topics = [_]HelpTopic{
     .{
         .topic = "ACCOUNTINFO",
         .lines = &[_][]const u8{
-            "ACCOUNTINFO [account] | ACCOUNTINFO LOGINS [account]",
+            "ACCOUNTINFO [account] | ACCOUNTINFO LOGINS [account] | ACCOUNTINFO SESSIONS [account]",
             "Reports account name and flags. With no account, uses the logged-in account.",
-            "LOGINS lists recent sign-ins: time, mechanism, TLS, and a short prefix. Operators may name another account. The word LOGINS is the subcommand.",
+            "LOGINS lists recent sign-ins: time, mechanism, TLS, and a short prefix. SESSIONS lists live attachments: nick, TLS or clear, and node id. Operators may name another account. LOGINS and SESSIONS are subcommands.",
         },
     },
     .{
@@ -327,7 +327,7 @@ pub const help_topics = [_]HelpTopic{
         .topic = "WEBAUTHN",
         .lines = &[_][]const u8{
             "WEBAUTHN STATUS | REGISTER [label] | REGISTER-FINISH <cred-id> <client-data-json> <authdata> [attestation] | AUTH <account> | AUTH-FINISH <cred-id> <client-data-json> <authdata> <signature> | LIST | REMOVE <cred-id> | RENAME <cred-id> :<label> | LOCK",
-            "Registers a passkey, logs in with one, or locks out password login after a passkey is stored.",
+            "Registers a passkey, logs in with one, or locks out password login after a passkey is stored. After LOCK, a password or recovery session is not a network operator until a later passkey sign-in.",
         },
     },
     .{

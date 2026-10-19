@@ -6,18 +6,18 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 
 ## MESH
 
-- Syntax: `MESH [LOG|GRANTS|ADMISSION]`
-- Description: Without a subcommand, renders live mesh peer/link health and then a partition/quorum summary (`mesh intact`, `PARTITIONED (quorum held)`, or `PARTITIONED (NO QUORUM ...)`). `MESH LOG` prints recent mesh audit events. `MESH GRANTS` lists recognized cross-mesh operator grants. `MESH ADMISSION` reports MeshPass admission posture (`open`, shared-secret fallback, or signed roots) without exposing shared secret or token bytes, plus the local MESSAGE_V2 implementation marker (`relay_v2_bridge_implemented`), authoring mode/eligibility, activation epoch, roster count, and roster digest (`relay_v2_roster_digest`). The implementation marker is not peer or full-mesh readiness proof.
+- Syntax: `MESH [LOG|GRANTS|ADMISSION|PROP <#channel> <key>]`
+- Description: Without a subcommand, renders live mesh peer/link health and then a partition/quorum summary (`mesh intact`, `PARTITIONED (quorum held)`, or `PARTITIONED (NO QUORUM ...)`). `MESH LOG` prints recent mesh audit events. `MESH GRANTS` lists recognized cross-mesh operator grants. `MESH ADMISSION` reports MeshPass admission posture (`open`, shared-secret fallback, or signed roots) without exposing shared secret or token bytes, plus the local MESSAGE_V2 implementation marker (`relay_v2_bridge_implemented`), authoring mode/eligibility, activation epoch, roster count, and roster digest (`relay_v2_roster_digest`). The implementation marker is not peer or full-mesh readiness proof. `MESH PROP` reports the stored origin node and hybrid logical clock of one channel property. It does not include the signing key, the signature, the owner, the value, or a trusted bit.
 - Privileges: Oper (`.access = .oper`).
-- Parameters: Optional `LOG`, `GRANTS`, or `ADMISSION`.
-- Replies: Server notices containing report lines.
+- Parameters: Optional `LOG`, `GRANTS`, `ADMISSION`, or `PROP` plus a channel and a property key.
+- Replies: Server notices containing report lines. A property witness is `PROP witness channel=<channel> key=<key> origin=<node> hlc=<clock> present=<true|false>`, or `PROP witness none`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `MESH ADMISSION`
 - Sources: `src/daemon/modules/oper_security.zig:132`, `src/daemon/server.zig:10308`, `src/daemon/server.zig:10412`
 
 ## NETSTAT
 
-- Syntax: `NETSTAT [LOG|GRANTS|ADMISSION]`
+- Syntax: `NETSTAT [LOG|GRANTS|ADMISSION|PROP <#channel> <key>]`
 - Description: Alias of `MESH`; dispatches to the same handler and supports the same subcommands.
 - Privileges: Oper (`.access = .oper`).
 - Parameters: Same as `MESH`.
