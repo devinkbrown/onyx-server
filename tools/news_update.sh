@@ -10,15 +10,19 @@
 # via `[geo] news_cache_dir`. File names match the daemon's cache keys with
 # ':' -> '_': general sources -> src_<key>.txt, country feeds -> cc_<cc>.txt.
 #
-# Usage:  news_update.sh <output_dir> [max_headlines]
-# Cron:   */5 * * * * /path/to/news_update.sh /var/lib/onyx-server/news 10
+# Each headline is either a plain title or `epoch<TAB>title<TAB>deck`. The daemon
+# turns that into "  1. [2h] Title - deck". There is no byte-length prefix:
+# `${#var}` counts characters on busybox and GNU bash alike.
 #
-# No API keys. Requires: bash, curl. Optional: a feed is simply skipped if it
-# is unreachable, leaving any previously written file intact.
+# Usage:  news_update.sh <output_dir> [max_headlines]
+# Cron:   */5 * * * * /path/to/news_update.sh /var/lib/onyx-server/news 5
+#
+# No API keys. Requires: bash, curl, awk, date. Optional: a feed is simply
+# skipped if it is unreachable, leaving any previously written file intact.
 set -uo pipefail
 
 OUT_DIR="${1:?usage: news_update.sh <output_dir> [max_headlines]}"
-MAX="${2:-10}"
+MAX="${2:-5}"
 UA="OnyxServer-news/1 (+https://onyx.local)"
 mkdir -p "$OUT_DIR"
 
@@ -42,6 +46,11 @@ SOURCES=(
   "cnbc|https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
   "espn|https://www.espn.com/espn/rss/news"
   "cbssports|https://www.cbssports.com/rss/headlines/"
+  "cbs|https://www.cbsnews.com/latest/rss/world"
+  "sky|https://feeds.skynews.com/feeds/rss/world.xml"
+  "wapo|https://feeds.washingtonpost.com/rss/world"
+  "dw|https://rss.dw.com/rdf/rss-en-all"
+  "cnn|https://rss.cnn.com/rss/edition.rss"
 )
 
 # Country feeds: cc|url  (mirrors news_sources.country_feeds)
@@ -60,39 +69,121 @@ COUNTRY_FEEDS=(
   "ZA|https://feeds.24.com/articles/news24/TopStories/rss"
   "KR|https://www.koreaherald.com/rss/01.xml"
   "SG|https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"
+  "PH|https://www.philstar.com/rss/headlines"
+  "PK|https://www.dawn.com/feeds/home"
+  "NG|https://www.vanguardngr.com/feed/"
+  "EG|https://egyptindependent.com/feed/"
+  "AR|https://buenosairesherald.com/feed"
+  "SE|https://www.thelocal.se/feeds/rss.php"
+  "NO|https://www.thelocal.no/feeds/rss.php"
+  "DK|https://www.thelocal.dk/feeds/rss.php"
+  "FI|https://feeds.yle.fi/uutiset/v1/majorHeadlines/YLE_UUTISET.rss"
+  "NL|https://www.dutchnews.nl/feed/"
+  "CH|https://www.swissinfo.ch/eng/rss/headline_news"
+  "AT|https://www.thelocal.at/feeds/rss.php"
+  "RU|https://www.themoscowtimes.com/rss/news"
+  "IL|https://www.jpost.com/rss/rssfeedsheadlines.aspx"
+  "SA|https://www.arabnews.com/rss.xml"
+  "AE|https://www.thenationalnews.com/rss"
+  "GR|https://www.ekathimerini.com/rss"
   "IT|https://www.thelocal.it/feeds/rss.php"
   "ES|https://www.thelocal.es/feeds/rss.php"
-  "NL|https://www.dutchnews.nl/feed/"
-  "SE|https://www.thelocal.se/feeds/rss.php"
-  "MX|https://feeds.bbci.co.uk/mundo/rss.xml"
+  "PT|https://www.theportugalnews.com/rss"
+  "MY|https://www.malaymail.com/feed"
+  "ID|https://www.thejakartapost.com/rss/dailyheadline.xml"
+  "TH|https://www.bangkokpost.com/rss/data/topstories.xml"
+  "VN|https://vietnamnews.vn/rss/20.rss"
+  "HK|https://www.scmp.com/rss/91/feed"
+  "TW|https://www.taiwannews.com.tw/ch/rss.php"
+  "KE|https://nation.africa/kenya/rss.xml"
+  "MA|https://www.moroccoworldnews.com/feed/"
+  "CL|https://santiagotimes.cl/feed/"
+  "BE|https://www.brusselstimes.com/feed"
+  "CN|https://www.chinadaily.com.cn/rss/cndy_rss.xml"
 )
 
-# Extract the first $MAX *item* titles from an RSS/Atom feed on stdin. Splitting
-# the stream on <item>/<entry> boundaries means the channel and <image> titles
-# are never mistaken for headlines (RSS is often a single line, so awk's regex
-# record separator is used rather than line tools). CDATA + a few entities are
-# decoded. Requires an awk with regex RS (gawk/busybox awk; mawk works too).
-extract_titles() {
+# Extract up to $MAX items as title<RS>when<RS>deck. RS is ASCII 0x1e and never
+# reaches the cache file. Channel and <image> titles are not items.
+extract_items() {
   awk -v max="$MAX" '
     BEGIN { RS = "<item[ >]|<entry[ >]"; IGNORECASE = 1; n = 0 }
+    function trim(s) {
+      gsub(/\r/, "", s)
+      gsub(/^[ \t\n]+/, "", s)
+      gsub(/[ \t\n]+$/, "", s)
+      gsub(/[ \t\n]+/, " ", s)
+      return s
+    }
+    function unwrap(raw) {
+      gsub(/<!\[CDATA\[/, "", raw)
+      gsub(/\]\]>/, "", raw)
+      return trim(raw)
+    }
+    function grab(s, name,   rest, raw) {
+      if (!match(s, "<" name "[^>]*>")) return ""
+      rest = substr(s, RSTART + RLENGTH)
+      if (!match(rest, "</" name "[^>]*>")) return ""
+      raw = substr(rest, 1, RSTART - 1)
+      return unwrap(raw)
+    }
     NR > 1 && n < max {
-      s = $0
-      if (match(s, /<title[^>]*>/)) {
-        s = substr(s, RSTART + RLENGTH)
-        sub(/<\/title>.*/, "", s)
-        gsub(/<!\[CDATA\[/, "", s); gsub(/\]\]>/, "", s)
-        gsub(/\r/, "", s); sub(/^[ \t\n]+/, "", s); sub(/[ \t\n]+$/, "", s)
-        if (s != "") { print s; n++ }
-      }
-    }' \
-    | sed -E 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&#39;/'\''/g; s/&quot;/"/g; s/&apos;/'\''/g'
+      title = grab($0, "title")
+      if (title == "") next
+      when = grab($0, "pubDate")
+      if (when == "") when = grab($0, "updated")
+      if (when == "") when = grab($0, "published")
+      if (when == "") when = grab($0, "dc:date")
+      deck = grab($0, "description")
+      if (deck == "") deck = grab($0, "summary")
+      gsub(/<[^>]*>/, " ", deck)
+      deck = trim(deck)
+      printf "%s\036%s\036%s\n", title, when, deck
+      n++
+    }'
+}
+
+decode_entities() {
+  sed -E 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&#39;/'\''/g; s/&quot;/"/g; s/&apos;/'\''/g; s/&nbsp;/ /g'
+}
+
+pack_lines() {
+  local title when deck rest epoch
+  while IFS= read -r rec; do
+    title="${rec%%$'\036'*}"
+    rest="${rec#*$'\036'}"
+    when="${rest%%$'\036'*}"
+    deck="${rest#*$'\036'}"
+    title="$(printf '%s' "$title" | decode_entities)"
+    deck="$(printf '%s' "$deck" | decode_entities)"
+    title="${title//$'\t'/ }"
+    deck="${deck//$'\t'/ }"
+    title="${title:0:110}"
+    deck="${deck:0:80}"
+    title="${title#"${title%%[![:space:]]*}"}"
+    title="${title%"${title##*[![:space:]]}"}"
+    deck="${deck#"${deck%%[![:space:]]*}"}"
+    deck="${deck%"${deck##*[![:space:]]}"}"
+    [[ -n "$title" ]] || continue
+    epoch=0
+    if [[ -n "$when" ]]; then
+      epoch="$(date -u -d "$when" +%s 2>/dev/null || true)"
+      [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+    fi
+    if [[ "$epoch" == 0 && -z "$deck" ]]; then
+      printf '%s\n' "$title"
+    elif [[ -n "$deck" ]]; then
+      printf '%s\t%s\t%s\n' "$epoch" "$title" "$deck"
+    else
+      printf '%s\t%s\n' "$epoch" "$title"
+    fi
+  done
 }
 
 fetch_one() {
   local stem="$1" url="$2"
   local tmp body
   tmp="$(mktemp)"
-  body="$(curl -fsSL --max-time 15 -A "$UA" "$url" 2>/dev/null | extract_titles)"
+  body="$(curl -fsSL --max-time 15 -A "$UA" "$url" 2>/dev/null | extract_items | pack_lines)"
   if [[ -n "$body" ]]; then
     printf '# %s — updated %s\n%s\n' "$stem" "$(date -u +%FT%TZ)" "$body" > "$tmp"
     mv -f "$tmp" "$OUT_DIR/$stem.txt"

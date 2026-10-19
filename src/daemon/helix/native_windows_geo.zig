@@ -6,12 +6,18 @@
 //! serialized, and source capture requires its real pause and producer fence.
 const std = @import("std");
 const geo = @import("../geo_services.zig");
+const weather_units = @import("../../proto/weather_units.zig");
 const runtime_pause = @import("../runtime_pause.zig");
 
 const magic = "HXGE";
-const version: u16 = 1;
+const version_v1: u16 = 1;
+const version_v2: u16 = 2;
 const header_len: usize = 64;
-const weather_len: usize = 28 + geo.max_key + geo.max_loc + geo.max_desc;
+/// Frozen v1 weather row. v2 appends `weather_tail_len` and is what this image writes.
+const weather_len_v1: usize = 28 + geo.max_key + geo.max_loc + geo.max_desc;
+const day_len: usize = 70;
+const weather_tail_len: usize = 32 + weather_units.max_days * day_len;
+const weather_len: usize = weather_len_v1 + weather_tail_len;
 const news_len: usize = 22 + geo.max_key + geo.max_headline * geo.max_headlines;
 const job_len: usize = 2 + geo.max_key;
 pub const max_capture_bytes: usize = @sizeOf(geo.Snapshot) +
@@ -35,10 +41,19 @@ pub fn isCheckpoint(bytes: []const u8) bool {
     return bytes.len >= magic.len and std.mem.eql(u8, bytes[0..magic.len], magic);
 }
 
+fn weatherLenOf(bytes: []const u8) error{InvalidSnapshot}!usize {
+    if (bytes.len < 6 or !isCheckpoint(bytes)) return error.InvalidSnapshot;
+    return switch (std.mem.readInt(u16, bytes[4..6], .big)) {
+        version_v1 => weather_len_v1,
+        version_v2 => weather_len,
+        else => error.InvalidSnapshot,
+    };
+}
+
 fn countJobs(bytes: []const u8) error{InvalidSnapshot}!usize {
-    if (bytes.len < header_len + geo.weather_slots * weather_len + geo.news_slots * news_len or
-        bytes.len > max_checkpoint_bytes or !isCheckpoint(bytes) or
-        std.mem.readInt(u16, bytes[4..6], .big) != version or
+    const row_len = try weatherLenOf(bytes);
+    if (bytes.len < header_len + geo.weather_slots * row_len + geo.news_slots * news_len or
+        bytes.len > max_checkpoint_bytes or
         !std.mem.allEqual(u8, bytes[6..8], 0) or
         std.mem.readInt(u16, bytes[8..10], .big) != geo.weather_slots or
         std.mem.readInt(u16, bytes[10..12], .big) != geo.news_slots or
@@ -47,7 +62,7 @@ fn countJobs(bytes: []const u8) error{InvalidSnapshot}!usize {
         return error.InvalidSnapshot;
     const count: usize = std.mem.readInt(u16, bytes[12..14], .big);
     if (count > geo.job_capacity or
-        bytes.len != header_len + geo.weather_slots * weather_len + geo.news_slots * news_len + count * job_len or
+        bytes.len != header_len + geo.weather_slots * row_len + geo.news_slots * news_len + count * job_len or
         std.enums.fromInt(geo.Execution, bytes[14]) == null)
         return error.InvalidSnapshot;
     return count;
@@ -57,6 +72,7 @@ fn countJobs(bytes: []const u8) error{InvalidSnapshot}!usize {
 /// allocator. Config equality is checked separately against the candidate.
 pub fn validateCheckpoint(bytes: []const u8) error{InvalidSnapshot}!void {
     const job_count = try countJobs(bytes);
+    const row_len = try weatherLenOf(bytes);
     var seen_weather: [geo.weather_slots][]const u8 = undefined;
     var weather_count: usize = 0;
     var seen_news: [geo.news_slots][]const u8 = undefined;
@@ -64,7 +80,7 @@ pub fn validateCheckpoint(bytes: []const u8) error{InvalidSnapshot}!void {
     var seen_jobs: [geo.job_capacity]struct { kind: geo.JobKind, key: []const u8 } = undefined;
     var pos: usize = header_len;
     for (0..geo.weather_slots) |_| {
-        const row = bytes[pos..][0..weather_len];
+        const row = bytes[pos..][0..row_len];
         const state = std.enums.fromInt(geo.State, row[0]) orelse return error.InvalidSnapshot;
         const key_len: usize = row[1];
         const loc_len: usize = row[2];
@@ -83,8 +99,9 @@ pub fn validateCheckpoint(bytes: []const u8) error{InvalidSnapshot}!void {
             for (seen_weather[0..weather_count]) |prior| if (std.mem.eql(u8, prior, key[0..key_len])) return error.InvalidSnapshot;
             seen_weather[weather_count] = key[0..key_len];
             weather_count += 1;
+            if (row_len == weather_len) try validateWeatherTail(row[weather_len_v1..]);
         }
-        pos += weather_len;
+        pos += row_len;
     }
     for (0..geo.news_slots) |_| {
         const row = bytes[pos..][0..news_len];
@@ -141,7 +158,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const geo.Snapsho
     errdefer allocator.free(bytes);
     @memset(bytes, 0);
     @memcpy(bytes[0..4], magic);
-    std.mem.writeInt(u16, bytes[4..6], version, .big);
+    std.mem.writeInt(u16, bytes[4..6], version_v2, .big);
     std.mem.writeInt(u16, bytes[8..10], geo.weather_slots, .big);
     std.mem.writeInt(u16, bytes[10..12], geo.news_slots, .big);
     std.mem.writeInt(u16, bytes[12..14], @intCast(snapshot.jobs.len), .big);
@@ -162,6 +179,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const geo.Snapsho
         @memcpy(row[28..][0..entry.key_len], entry.key[0..entry.key_len]);
         @memcpy(row[28 + geo.max_key ..][0..entry.loc_len], entry.location[0..entry.loc_len]);
         @memcpy(row[28 + geo.max_key + geo.max_loc ..][0..entry.desc_len], entry.description[0..entry.desc_len]);
+        writeWeatherTail(row[weather_len_v1..], entry);
         pos += weather_len;
     }
     for (snapshot.news) |entry| {
@@ -198,6 +216,7 @@ pub fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8, opts: geo
     const digest = geo.optionsDigest(opts) catch return error.ConfigMismatch;
     if (!std.crypto.timing_safe.eql([32]u8, digest, bytes[24..56].*)) return error.ConfigMismatch;
     const job_count: usize = std.mem.readInt(u16, bytes[12..14], .big);
+    const row_len = try weatherLenOf(bytes);
     const weather = try allocator.alloc(geo.WeatherCarry, geo.weather_slots);
     errdefer allocator.free(weather);
     const news = try allocator.alloc(geo.NewsCarry, geo.news_slots);
@@ -206,12 +225,13 @@ pub fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8, opts: geo
     errdefer allocator.free(jobs);
     var pos: usize = header_len;
     for (weather) |*entry| {
-        const row = bytes[pos..][0..weather_len];
+        const row = bytes[pos..][0..row_len];
         entry.* = .{ .state = std.enums.fromInt(geo.State, row[0]).?, .key_len = row[1], .loc_len = row[2], .desc_len = row[3], .temp_c_bits = std.mem.readInt(u64, row[4..12], .big), .wind_kph_bits = std.mem.readInt(u64, row[12..20], .big), .fetched_ms = @bitCast(std.mem.readInt(u64, row[20..28], .big)) };
         @memcpy(&entry.key, row[28..][0..geo.max_key]);
         @memcpy(&entry.location, row[28 + geo.max_key ..][0..geo.max_loc]);
         @memcpy(&entry.description, row[28 + geo.max_key + geo.max_loc ..][0..geo.max_desc]);
-        pos += weather_len;
+        if (row_len == weather_len) readWeatherTail(row[weather_len_v1..], entry);
+        pos += row_len;
     }
     for (news) |*entry| {
         const row = bytes[pos..][0..news_len];
@@ -251,6 +271,88 @@ pub fn restoreEncodedParked(allocator: std.mem.Allocator, owner: *geo.Service, b
     try owner.restoreSnapshotParked(&snapshot, max_capture_bytes);
 }
 
+fn writeWeatherTail(tail: []u8, entry: geo.WeatherCarry) void {
+    tail[0] = entry.flags;
+    tail[1] = entry.humidity;
+    tail[2] = entry.uv;
+    tail[3] = entry.wind_dir_len;
+    @memcpy(tail[4..7], &entry.wind_dir);
+    std.mem.writeInt(u16, tail[8..10], entry.visibility, .big);
+    std.mem.writeInt(u16, tail[10..12], entry.pressure, .big);
+    std.mem.writeInt(u64, tail[12..20], entry.feels_bits, .big);
+    std.mem.writeInt(u64, tail[20..28], entry.precip_bits, .big);
+    tail[28] = entry.day_count;
+    for (entry.days, 0..) |day, i| {
+        const slot = tail[32 + i * day_len ..][0..day_len];
+        slot[0] = day.flags;
+        slot[1] = day.desc_len;
+        slot[2] = day.label_len;
+        std.mem.writeInt(u64, slot[4..12], day.min_bits, .big);
+        std.mem.writeInt(u64, slot[12..20], day.max_bits, .big);
+        std.mem.writeInt(u64, slot[20..28], day.precip_bits, .big);
+        @memcpy(slot[28..38], &day.label);
+        @memcpy(slot[38..70], &day.desc);
+    }
+}
+
+fn readWeatherTail(tail: []const u8, entry: *geo.WeatherCarry) void {
+    entry.flags = tail[0];
+    entry.humidity = tail[1];
+    entry.uv = tail[2];
+    entry.wind_dir_len = tail[3];
+    @memcpy(&entry.wind_dir, tail[4..7]);
+    entry.visibility = std.mem.readInt(u16, tail[8..10], .big);
+    entry.pressure = std.mem.readInt(u16, tail[10..12], .big);
+    entry.feels_bits = std.mem.readInt(u64, tail[12..20], .big);
+    entry.precip_bits = std.mem.readInt(u64, tail[20..28], .big);
+    entry.day_count = tail[28];
+    for (&entry.days, 0..) |*day, i| {
+        const slot = tail[32 + i * day_len ..][0..day_len];
+        day.flags = slot[0];
+        day.desc_len = slot[1];
+        day.label_len = slot[2];
+        day.min_bits = std.mem.readInt(u64, slot[4..12], .big);
+        day.max_bits = std.mem.readInt(u64, slot[12..20], .big);
+        day.precip_bits = std.mem.readInt(u64, slot[20..28], .big);
+        @memcpy(&day.label, slot[28..38]);
+        @memcpy(&day.desc, slot[38..70]);
+    }
+}
+
+fn validateWeatherTail(tail: []const u8) error{InvalidSnapshot}!void {
+    if (tail.len != weather_tail_len or tail[7] != 0 or !std.mem.allEqual(u8, tail[29..32], 0)) return error.InvalidSnapshot;
+    const flags = tail[0];
+    const wind_len: usize = tail[3];
+    if (wind_len > 3 or !std.mem.allEqual(u8, tail[4 + wind_len .. 7], 0)) return error.InvalidSnapshot;
+    if ((flags & weather_units.flag_humidity) == 0 and tail[1] != 0) return error.InvalidSnapshot;
+    if ((flags & weather_units.flag_uv) == 0 and tail[2] != 0) return error.InvalidSnapshot;
+    if ((flags & weather_units.flag_wind_dir) == 0 and wind_len != 0) return error.InvalidSnapshot;
+    const visibility = std.mem.readInt(u16, tail[8..10], .big);
+    const pressure = std.mem.readInt(u16, tail[10..12], .big);
+    const feels = std.mem.readInt(u64, tail[12..20], .big);
+    const precip = std.mem.readInt(u64, tail[20..28], .big);
+    if ((flags & weather_units.flag_visibility) == 0 and visibility != 0) return error.InvalidSnapshot;
+    if ((flags & weather_units.flag_pressure) == 0 and pressure != 0) return error.InvalidSnapshot;
+    if ((flags & weather_units.flag_feels) == 0 and feels != 0) return error.InvalidSnapshot;
+    if ((flags & weather_units.flag_precip) == 0 and precip != 0) return error.InvalidSnapshot;
+    const day_count: usize = tail[28];
+    if (day_count > weather_units.max_days) return error.InvalidSnapshot;
+    for (0..weather_units.max_days) |i| {
+        const slot = tail[32 + i * day_len ..][0..day_len];
+        if (i >= day_count) {
+            if (!std.mem.allEqual(u8, slot, 0)) return error.InvalidSnapshot;
+            continue;
+        }
+        if ((slot[0] & ~@as(u8, 1)) != 0 or slot[3] != 0) return error.InvalidSnapshot;
+        const desc_len: usize = slot[1];
+        const label_len: usize = slot[2];
+        if (desc_len > 32 or label_len > 10) return error.InvalidSnapshot;
+        if (!std.mem.allEqual(u8, slot[28 + label_len .. 38], 0) or !std.mem.allEqual(u8, slot[38 + desc_len .. 70], 0)) return error.InvalidSnapshot;
+        const day_precip = std.mem.readInt(u64, slot[20..28], .big);
+        if ((slot[0] & 1) == 0 and day_precip != 0) return error.InvalidSnapshot;
+    }
+}
+
 fn fixture(allocator: std.mem.Allocator, opts: geo.Options) !geo.Snapshot {
     const weather = try allocator.alloc(geo.WeatherCarry, geo.weather_slots);
     errdefer allocator.free(weather);
@@ -270,6 +372,18 @@ fn fixture(allocator: std.mem.Allocator, opts: geo.Options) !geo.Snapshot {
     weather[7].temp_c_bits = @bitCast(@as(f64, 5.5));
     weather[7].wind_kph_bits = @bitCast(@as(f64, 12.0));
     weather[7].fetched_ms = 123;
+    weather[7].flags = weather_units.flag_feels | weather_units.flag_wind_dir | weather_units.flag_rich;
+    weather[7].feels_bits = @bitCast(@as(f64, 4.0));
+    weather[7].wind_dir_len = 1;
+    weather[7].wind_dir[0] = 'N';
+    weather[7].day_count = 1;
+    weather[7].days[0].flags = 1;
+    weather[7].days[0].label_len = 10;
+    @memcpy(weather[7].days[0].label[0..10], "2026-10-19");
+    weather[7].days[0].desc_len = 4;
+    @memcpy(weather[7].days[0].desc[0..4], "Rain");
+    weather[7].days[0].min_bits = @bitCast(@as(f64, 1.0));
+    weather[7].days[0].max_bits = @bitCast(@as(f64, 6.0));
     news[3].state = .ready;
     news[3].key_len = 7;
     @memcpy(news[3].key[0..7], "src:bbc");
@@ -307,6 +421,15 @@ test "Windows GEO checkpoint preserves physical cache slots and FIFO with malfor
     try std.testing.expectEqual(geo.JobKind.news, decoded.jobs[0].kind);
     try std.testing.expectEqual(geo.JobKind.weather, decoded.jobs[1].kind);
     try std.testing.expectEqual(@as(i64, 789), decoded.captured_monotonic_ms);
+    try std.testing.expectEqual(weather_units.flag_feels | weather_units.flag_wind_dir | weather_units.flag_rich, decoded.weather[7].flags);
+    try std.testing.expectEqual(@as(u8, 1), decoded.weather[7].day_count);
+    try std.testing.expectEqualStrings("2026-10-19", decoded.weather[7].days[0].label[0..10]);
+    try std.testing.expectEqualStrings("Rain", decoded.weather[7].days[0].desc[0..4]);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, 4.0))), decoded.weather[7].feels_bits);
+    const cleared = try allocator.dupe(u8, bytes);
+    defer allocator.free(cleared);
+    cleared[header_len + 7 * weather_len + weather_len_v1] = weather_units.flag_rich;
+    try std.testing.expectError(error.InvalidSnapshot, validateCheckpoint(cleared));
     var changed: geo.Options = .{};
     changed.weather_ttl_ms += 1;
     try std.testing.expectError(error.ConfigMismatch, decodeSnapshot(allocator, bytes, changed));
@@ -320,6 +443,38 @@ test "Windows GEO checkpoint preserves physical cache slots and FIFO with malfor
     const duplicate = header_len + 8 * weather_len;
     @memcpy(bad[duplicate..][0..weather_len], bad[active..][0..weather_len]);
     try std.testing.expectError(error.InvalidSnapshot, validateCheckpoint(bad));
+}
+
+test "v1 geo checkpoint decodes with detail flags clear" {
+    const allocator = std.testing.allocator;
+    const total = header_len + geo.weather_slots * weather_len_v1 + geo.news_slots * news_len;
+    const bytes = try allocator.alloc(u8, total);
+    defer allocator.free(bytes);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..4], magic);
+    std.mem.writeInt(u16, bytes[4..6], version_v1, .big);
+    std.mem.writeInt(u16, bytes[8..10], geo.weather_slots, .big);
+    std.mem.writeInt(u16, bytes[10..12], geo.news_slots, .big);
+    bytes[14] = @intFromEnum(geo.Execution.unstarted);
+    const digest = try geo.optionsDigest(.{});
+    @memcpy(bytes[24..56], &digest);
+    std.mem.writeInt(u32, bytes[56..60], @intCast(total), .big);
+    const row = bytes[header_len + 7 * weather_len_v1 ..][0..weather_len_v1];
+    row[0] = @intFromEnum(geo.State.ready);
+    row[1] = 4;
+    row[2] = 4;
+    std.mem.writeInt(u64, row[4..12], @bitCast(@as(f64, 5.5)), .big);
+    std.mem.writeInt(u64, row[20..28], @bitCast(@as(i64, 123)), .big);
+    @memcpy(row[28..][0..4], "oslo");
+    @memcpy(row[28 + geo.max_key ..][0..4], "Oslo");
+    try validateCheckpoint(bytes);
+    var decoded = try decodeSnapshot(allocator, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(geo.State.ready, decoded.weather[7].state);
+    try std.testing.expectEqual(@as(u8, 0), decoded.weather[7].flags);
+    try std.testing.expectEqual(@as(u8, 0), decoded.weather[7].day_count);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, 5.5))), decoded.weather[7].temp_c_bits);
+    try std.testing.expectEqualStrings("oslo", decoded.weather[7].key[0..4]);
 }
 
 test "Windows GEO checkpoint source fence and candidate parked Gate restore" {

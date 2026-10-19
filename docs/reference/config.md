@@ -112,20 +112,21 @@ Headlines for the MOTD `{news}` placeholder.
 
 ## `[geo]`
 
-The live in-channel `!weather`/`!news` bot (see
+The live in-channel `!weather`/`!forecast`/`!news` bot (see
 [commands/fantasy-bot.md](commands/fantasy-bot.md)). When enabled, the daemon
-fetches `wttr.in` (weather) and the bundled RSS feeds (news) on a background
-thread and serves them to channel fantasy commands. All sources are key-free.
+fetches wttr.in `format=j1` (weather and forecast) and the bundled RSS feeds
+(news) on a background thread and serves them to channel fantasy commands.
+All sources are key-free.
 
 Source: struct at `src/daemon/config_format.zig` (`Geo`), mapping at `src/daemon/config_boot.zig`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `enabled` | bool | `false` | — | Enable the `!weather`/`!news` bot. |
+| `enabled` | bool | `false` | — | Enable the `!weather`/`!forecast`/`!news` bot. |
 | `news_insecure_tls` | bool | `true` | — | Skip TLS verification for the public read-only news feeds, so the best-effort clean-room TLS reaches more hosts. Weather is plain HTTP and unaffected. |
 | `cmd_cooldown_ms` | integer | `3000` | `0..600000` | Minimum interval between bot replies in a single channel (anti-flood). 0 disables. |
-| `default_location` | string or null | unset | any string | Fallback `!weather` location when a user has no GeoIP / `location` metadata. |
-| `news_cache_dir` | string or null | unset | path | Directory of headline files written by `tools/news_update.sh` (one headline per line, `src_<key>.txt` / `cc_<cc>.txt`). When set, `!news` reads these files instead of fetching live — robust full coverage of every feed regardless of the in-daemon TLS reach. |
+| `default_location` | string or null | unset | any string | Fallback place for `!weather` and `!forecast` after the argument, nick `location`, and channel `!setweather`. Also used by the MOTD `{weather}` line after nick `location` and `[weather] location`. |
+| `news_cache_dir` | string or null | unset | path | Directory of headline files written by `tools/news_update.sh` (`src_<key>.txt` / `cc_<cc>.txt`). A line is a title, or `epoch<TAB>title<TAB>deck`. When set, `!news` reads these files instead of fetching live. The daemon keeps up to five headlines per feed. |
 
 ## `[listen]`
 

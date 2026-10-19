@@ -183,4 +183,4 @@ Last reconciled **2026-09-06** against the enabled module manifest and command r
 
 ## In-channel fantasy commands
 
-These are not registry commands. A channel `PRIVMSG` beginning with `!` can invoke the server's weather and news bot (`!weather`/`!w`/`!wx`, `!news`/`!n`, `!localnews`), which answers as a server `NOTICE`. See [fantasy-bot.md](fantasy-bot.md). The `!news` and `!localnews` commands require the channel mode `+W` (news-wire).
+These are not registry commands. A channel `PRIVMSG` beginning with `!` can invoke the server's weather and news bot (`!weather`/`!w`/`!wx`, `!forecast`/`!fc`/`!fcast`, `!news`/`!n`, `!localnews`), which answers as a server `NOTICE`. See [fantasy-bot.md](fantasy-bot.md). The `!news` and `!localnews` commands require the channel mode `+W` (news-wire).

@@ -89,6 +89,7 @@ const lusers = @import("../proto/lusers.zig");
 const motd = @import("../proto/motd.zig");
 const motd_template = @import("../proto/motd_template.zig");
 const weather_units = @import("../proto/weather_units.zig");
+const geo_fetch = @import("../proto/geo_fetch.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
@@ -40656,14 +40657,17 @@ pub const LinuxServer = struct {
             return;
         }
         const is_weather = eqi(cmd, "!weather") or eqi(cmd, "!w") or eqi(cmd, "!wx");
+        const is_forecast = eqi(cmd, "!forecast") or eqi(cmd, "!fc") or eqi(cmd, "!fcast");
         const is_news = eqi(cmd, "!news") or eqi(cmd, "!n");
         const is_local = eqi(cmd, "!localnews");
-        if (!(is_weather or is_news or is_local)) return;
+        if (!(is_weather or is_forecast or is_news or is_local)) return;
         // Anti-flood: rate-limit bot replies per channel so a user can't spam
         // `!weather` to flood the channel or hammer the fetcher.
         if (!self.fantasyCooldownOk(chan)) return;
         if (is_weather) {
             self.handleFantasyWeather(conn, chan, rest);
+        } else if (is_forecast) {
+            self.handleFantasyForecast(conn, chan, rest);
         } else if (is_news) {
             self.handleFantasyNews(conn, chan, rest, false);
         } else {
@@ -40722,89 +40726,235 @@ pub const LinuxServer = struct {
         self.fantasyReply(chan, std.fmt.bufPrint(&b, "Channel weather location set to {s}.", .{loc}) catch "Channel weather location set.");
     }
 
+    /// Place for `!weather` and `!forecast`: argument, nick location, channel
+    /// default, then `[geo] default_location`.
+    fn fantasyWeatherPlace(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8) []const u8 {
+        if (arg.len > 0) return arg[0..@min(arg.len, 80)];
+        const nick = conn.session.displayName();
+        const user_loc = self.metaValue(nick, "location");
+        if (user_loc.len != 0) return user_loc;
+        const chan_loc = self.metaValue(chan, "weather_location");
+        if (chan_loc.len != 0) return chan_loc;
+        if (self.config.geo_default_location.len != 0) return self.config.geo_default_location;
+        return "";
+    }
+
     /// `!weather [location]` — serve cached weather for the argument, the sender's
-    /// `location` metadata, or the channel's `!setweather` default; localized to
-    /// the sender's `country`.
+    /// `location` metadata, the channel's `!setweather` default, or
+    /// `[geo] default_location`; localized to the sender's `country`.
     fn handleFantasyWeather(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8) void {
         if (!self.config.geo_enabled) return;
         self.geo.start(); // lazy-start the fetcher thread on first use
-        const nick = conn.session.displayName();
-
-        var location = if (arg.len > 0) arg[0..@min(arg.len, 80)] else self.metaValue(nick, "location");
-        if (location.len == 0) location = self.metaValue(chan, "weather_location"); // channel default
-        if (location.len == 0) {
+        const place = self.fantasyWeatherPlace(conn, chan, arg);
+        if (place.len == 0) {
             self.fantasyReply(chan, "Set your location first: METADATA SET location <place>  (or use !weather <place>, or a chanop can !setweather <place>)");
             return;
         }
 
-        const country = self.metaValue(nick, "country");
+        const country = self.metaValue(conn.session.displayName(), "country");
         const sys = weather_units.resolveSystem(self.config.weather_units, country);
-
-        var loc_out: [64]u8 = undefined;
-        var desc_out: [48]u8 = undefined;
-        if (self.geo.getWeather(location, &loc_out, &desc_out)) |view| {
-            var line_buf: [160]u8 = undefined;
-            const line = weather_units.renderLine(&line_buf, view.location, view.reading, sys);
-            var out: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&out, "Weather - {s}", .{line}) catch return;
+        var scratch = geo_services.WeatherScratch{};
+        if (self.geo.getWeather(place, &scratch)) |view| {
+            var primary: [256]u8 = undefined;
+            var detail: [256]u8 = undefined;
+            const report = weather_units.renderReport(&primary, &detail, view.location, view.reading, sys);
+            var out: [320]u8 = undefined;
+            const msg = std.fmt.bufPrint(&out, "Weather - {s}", .{report.primary}) catch return;
             self.fantasyReply(chan, msg);
+            if (report.detail.len != 0) {
+                var extra: [320]u8 = undefined;
+                const line = std.fmt.bufPrint(&extra, "  {s}", .{report.detail}) catch return;
+                self.fantasyReply(chan, line);
+            }
         } else {
             var out: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&out, "Fetching weather for {s}… try again in a moment.", .{location[0..@min(location.len, 80)]}) catch return;
+            const msg = std.fmt.bufPrint(&out, "Fetching weather for {s}… try again in a moment.", .{place}) catch return;
             self.fantasyReply(chan, msg);
         }
     }
 
-    /// `!news [source]` / `!localnews [CC]` — only in +W (news-wire) channels.
-    /// `local` resolves a country feed (arg CC, else the sender's `country`
-    /// metadata); otherwise a named source (arg key, else the default source).
+    /// `!forecast [location]` — the same place and cache entry as `!weather`,
+    /// rendered as up to three civil days.
+    fn handleFantasyForecast(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8) void {
+        if (!self.config.geo_enabled) return;
+        self.geo.start();
+        const place = self.fantasyWeatherPlace(conn, chan, arg);
+        if (place.len == 0) {
+            self.fantasyReply(chan, "Set your location first: METADATA SET location <place>  (or use !forecast <place>, or a chanop can !setweather <place>)");
+            return;
+        }
+        const country = self.metaValue(conn.session.displayName(), "country");
+        const sys = weather_units.resolveSystem(self.config.weather_units, country);
+        var scratch = geo_services.WeatherScratch{};
+        const view = self.geo.getWeather(place, &scratch) orelse {
+            var out: [160]u8 = undefined;
+            const msg = std.fmt.bufPrint(&out, "Fetching the forecast for {s}… try again in a moment.", .{place}) catch return;
+            self.fantasyReply(chan, msg);
+            return;
+        };
+        const shown = if (view.location.len != 0) view.location else place;
+        if ((view.reading.flags & weather_units.flag_rich) == 0) {
+            var out: [160]u8 = undefined;
+            const msg = std.fmt.bufPrint(&out, "Fetching the forecast for {s}… try again in a moment.", .{shown}) catch return;
+            self.fantasyReply(chan, msg);
+            return;
+        }
+        if (view.day_count == 0) {
+            var out: [160]u8 = undefined;
+            const msg = std.fmt.bufPrint(&out, "No multi-day forecast for {s}.", .{shown}) catch return;
+            self.fantasyReply(chan, msg);
+            return;
+        }
+        var header: [160]u8 = undefined;
+        self.fantasyReply(chan, std.fmt.bufPrint(&header, "Forecast - {s}:", .{shown}) catch return);
+        const days = @min(view.day_count, weather_units.max_days);
+        for (view.days[0..days]) |day| {
+            var body: [160]u8 = undefined;
+            var line: [180]u8 = undefined;
+            const text = weather_units.renderDay(&body, day, sys);
+            self.fantasyReply(chan, std.fmt.bufPrint(&line, "  {s}", .{text}) catch continue);
+        }
+    }
+
+    /// `!news` / `!localnews` — only in +W (news-wire) channels. `local` is a
+    /// country feed. `!news` selects a source, a topic, a count, or the catalogue.
     fn handleFantasyNews(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8, local: bool) void {
         if (!self.config.geo_enabled) return;
         // Gated by the +W channel mode: silent in channels that haven't enabled it.
         if (!self.world.channelHasFlag(chan, .news_wire)) return;
         self.geo.start();
-
-        var keybuf: [80]u8 = undefined;
-        var name: []const u8 = "";
-        var key: []const u8 = "";
         if (local) {
-            const cc = if (arg.len >= 2) arg[0..2] else self.metaValue(conn.session.displayName(), "country");
-            if (cc.len == 0) {
-                self.fantasyReply(chan, "Unknown country - try: !localnews <CC>  (e.g. !localnews JP)");
-                return;
-            }
-            const feed = news_sources.countryFeed(cc) orelse {
-                self.fantasyReply(chan, "No country feed for that code. Try !news for general headlines.");
-                return;
-            };
-            name = feed.name;
-            key = std.fmt.bufPrint(&keybuf, "cc:{s}", .{cc}) catch return;
-        } else {
-            const src = if (arg.len > 0)
-                (news_sources.sourceByKey(arg) orelse {
-                    self.fantasyReply(chan, "Unknown source. Try !news (default) or a key like bbc/npr/guardian.");
-                    return;
-                })
-            else
-                news_sources.defaultSource();
-            name = src.name;
-            key = std.fmt.bufPrint(&keybuf, "src:{s}", .{src.key}) catch return;
+            self.replyLocalNews(conn, chan, arg);
+            return;
         }
+        switch (news_sources.parseNewsCommand(arg)) {
+            .usage => self.fantasyReply(chan, "Usage: !news [source|topic|1-5]  |  !news topic <name> [1-5]  |  !news sources"),
+            .sources => self.replyNewsCatalogue(chan),
+            .default_source => |query| {
+                const src = news_sources.defaultSource();
+                var keybuf: [80]u8 = undefined;
+                const key = std.fmt.bufPrint(&keybuf, "src:{s}", .{src.key}) catch return;
+                self.replyNewsSource(chan, src.name, key, query.count);
+            },
+            .source => |query| {
+                const src = news_sources.sourceByKey(query.key) orelse return;
+                var keybuf: [80]u8 = undefined;
+                const key = std.fmt.bufPrint(&keybuf, "src:{s}", .{src.key}) catch return;
+                self.replyNewsSource(chan, src.name, key, query.count);
+            },
+            .topic => |query| self.replyNewsTopic(chan, query.name, query.count),
+        }
+    }
 
-        var out: [512]u8 = undefined;
-        var lines: [5][]const u8 = undefined;
-        if (self.geo.getNews(key, &out, &lines)) |got| {
-            var hb: [128]u8 = undefined;
-            self.fantasyReply(chan, std.fmt.bufPrint(&hb, "News - {s}:", .{name}) catch name);
-            for (got, 1..) |headline, n| {
-                var lb: [320]u8 = undefined;
-                const line = std.fmt.bufPrint(&lb, "  {d}. {s}", .{ n, headline }) catch continue;
-                self.fantasyReply(chan, line);
-            }
-        } else {
-            var fb: [128]u8 = undefined;
-            self.fantasyReply(chan, std.fmt.bufPrint(&fb, "Fetching {s} headlines… try again in a moment.", .{name}) catch return);
+    fn replyLocalNews(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8) void {
+        if (arg.len == 1) {
+            self.fantasyReply(chan, "Unknown country - try: !localnews <CC>  (e.g. !localnews JP)");
+            return;
         }
+        const cc = if (arg.len >= 2) arg[0..2] else self.metaValue(conn.session.displayName(), "country");
+        if (cc.len < 2) {
+            self.fantasyReply(chan, "Unknown country - try: !localnews <CC>  (e.g. !localnews JP)");
+            return;
+        }
+        const feed = news_sources.countryFeed(cc) orelse {
+            self.fantasyReply(chan, "No country feed for that code. Try !news for general headlines.");
+            return;
+        };
+        var keybuf: [80]u8 = undefined;
+        const key = std.fmt.bufPrint(&keybuf, "cc:{s}", .{cc}) catch return;
+        self.replyNewsSource(chan, feed.name, key, 0);
+    }
+
+    fn replyNewsSource(self: *LinuxServer, chan: []const u8, name: []const u8, key: []const u8, count: u8) void {
+        const want: usize = if (count == 0) self.geo.opts.max_headlines else count;
+        var storage: [geo_services.max_headline * geo_services.max_headlines]u8 = undefined;
+        var lines: [geo_services.max_headlines][]const u8 = undefined;
+        const got = self.geo.getNews(key, &storage, &lines) orelse {
+            var fb: [160]u8 = undefined;
+            self.fantasyReply(chan, std.fmt.bufPrint(&fb, "Fetching {s} headlines… try again in a moment.", .{name}) catch return);
+            return;
+        };
+        var hb: [160]u8 = undefined;
+        self.fantasyReply(chan, std.fmt.bufPrint(&hb, "News - {s}:", .{name}) catch name);
+        const show = @min(got.len, want);
+        const now = @divFloor(platform.realtimeMillis(), 1000);
+        for (got[0..show], 1..) |headline, n| {
+            var lb: [320]u8 = undefined;
+            self.fantasyReply(chan, geo_fetch.formatHeadline(&lb, n, headline, now));
+        }
+    }
+
+    fn replyNewsTopic(self: *LinuxServer, chan: []const u8, topic: []const u8, count: u8) void {
+        var indexes: [news_sources.sources.len]usize = undefined;
+        const matched = news_sources.sourcesForTopic(topic, &indexes);
+        if (matched == 0) {
+            self.fantasyReply(chan, "No sources for that topic. Try !news sources.");
+            return;
+        }
+        const show = @min(matched, 4);
+        const warm = @min(matched, 16);
+        const per: usize = if (count == 0) 1 else count;
+        var header: [96]u8 = undefined;
+        self.fantasyReply(chan, std.fmt.bufPrint(&header, "News - {s}:", .{topic}) catch "News:");
+        const now = @divFloor(platform.realtimeMillis(), 1000);
+        for (0..warm) |i| {
+            const src = news_sources.sources[indexes[i]];
+            var keybuf: [80]u8 = undefined;
+            const key = std.fmt.bufPrint(&keybuf, "src:{s}", .{src.key}) catch continue;
+            var storage: [geo_services.max_headline * geo_services.max_headlines]u8 = undefined;
+            var lines: [geo_services.max_headlines][]const u8 = undefined;
+            const got = self.geo.getNews(key, &storage, &lines);
+            if (i >= show) continue;
+            if (got == null) {
+                var fb: [160]u8 = undefined;
+                self.fantasyReply(chan, std.fmt.bufPrint(&fb, "Fetching {s}…", .{src.name}) catch continue);
+                continue;
+            }
+            var name_buf: [128]u8 = undefined;
+            self.fantasyReply(chan, std.fmt.bufPrint(&name_buf, "  {s}:", .{src.name}) catch continue);
+            const take = @min(got.?.len, per);
+            for (got.?[0..take], 1..) |headline, n| {
+                var lb: [320]u8 = undefined;
+                self.fantasyReply(chan, geo_fetch.formatHeadline(&lb, n, headline, now));
+            }
+        }
+        if (matched <= show) return;
+        var more: [360]u8 = undefined;
+        const head = std.fmt.bufPrint(&more, "More {s} sources: ", .{topic}) catch return;
+        var n = head.len;
+        var listed: usize = 0;
+        var i = show;
+        while (i < matched and listed < 8) : (i += 1) {
+            const key = news_sources.sources[indexes[i]].key;
+            const sep: usize = if (listed == 0) 0 else 2;
+            if (n + sep + key.len > more.len) break;
+            if (sep != 0) {
+                more[n] = ',';
+                more[n + 1] = ' ';
+            }
+            @memcpy(more[n + sep ..][0..key.len], key);
+            n += sep + key.len;
+            listed += 1;
+        }
+        if (i < matched and n + 3 <= more.len) {
+            @memcpy(more[n..][0..3], "...");
+            n += 3;
+        }
+        self.fantasyReply(chan, more[0..n]);
+    }
+
+    fn replyNewsCatalogue(self: *LinuxServer, chan: []const u8) void {
+        self.fantasyReply(chan, "News sources:");
+        var index: usize = 0;
+        while (index < news_sources.sources.len) {
+            var buf: [360]u8 = undefined;
+            const line = news_sources.writeCatalogueLine(&buf, index);
+            if (line.next == index) break;
+            self.fantasyReply(chan, line.text);
+            index = line.next;
+        }
+        var topics_buf: [240]u8 = undefined;
+        self.fantasyReply(chan, news_sources.formatTopics(&topics_buf));
     }
 
     /// Parse an IPv4 or IPv6 literal into a geoip.Ip, or null if malformed.
@@ -44255,9 +44405,10 @@ pub const LinuxServer = struct {
     /// Build the MOTD `{weather}` line for the connecting client. A configured
     /// `[weather] source` file (refreshed by an external updater) takes
     /// precedence; otherwise the line is served from the live geo cache,
-    /// personalized to the user's `location` metadata, the configured default
-    /// location, or — last resort — their GeoIP country, and localized to their
-    /// `country`. Empty when nothing resolves (the `{if:weather}` block hides it).
+    /// personalized to the user's `location` metadata, `[weather] location`,
+    /// `[geo] default_location`, or — last resort — their GeoIP country, and
+    /// localized to their `country`. Empty when nothing resolves (the
+    /// `{if:weather}` block hides it).
     fn motdWeatherLine(self: *LinuxServer, conn: *ConnState, io: std.Io, out: []u8) []const u8 {
         // 1) File-based source (external updater) wins when configured.
         if (self.config.weather_enabled and self.config.weather_source.len != 0) {
@@ -44267,7 +44418,7 @@ pub const LinuxServer = struct {
             const country = if (self.config.weather_country.len != 0) self.config.weather_country else f.country;
             const loc = if (self.config.weather_location.len != 0) self.config.weather_location else f.location;
             const sys = weather_units.resolveSystem(self.config.weather_units, country);
-            return weather_units.renderLine(out, loc, f.reading, sys);
+            return motdWeatherText(out, loc, f.reading, sys);
         }
         // 2) Live geo cache, personalized to the connecting user.
         if (!self.config.geo_enabled) return "";
@@ -44275,13 +44426,13 @@ pub const LinuxServer = struct {
         const country = self.metaValue(nick, "country");
         var location = self.metaValue(nick, "location");
         if (location.len == 0) location = self.config.weather_location;
+        if (location.len == 0) location = self.config.geo_default_location;
         if (location.len == 0) location = country; // GeoIP country geolocates on the source
         if (location.len == 0) return "";
         const sys = weather_units.resolveSystem(self.config.weather_units, country);
-        var loc_out: [64]u8 = undefined;
-        var desc_out: [48]u8 = undefined;
-        if (self.geo.getWeather(location, &loc_out, &desc_out)) |view| {
-            return weather_units.renderLine(out, view.location, view.reading, sys);
+        var scratch = geo_services.WeatherScratch{};
+        if (self.geo.getWeather(location, &scratch)) |view| {
+            return motdWeatherText(out, view.location, view.reading, sys);
         }
         return "";
     }
@@ -44303,12 +44454,14 @@ pub const LinuxServer = struct {
                 if (n >= self.config.news_count) break;
                 const line = std.mem.trim(u8, raw, " \t\r");
                 if (line.len == 0 or line[0] == '#') continue;
+                const title = geo_fetch.unpackHeadline(line).title;
+                if (title.len == 0) continue;
                 const sep: []const u8 = if (n == 0) "" else " | ";
-                if (w + sep.len + line.len > out.len) break;
+                if (w + sep.len + title.len > out.len) break;
                 @memcpy(out[w..][0..sep.len], sep);
                 w += sep.len;
-                @memcpy(out[w..][0..line.len], line);
-                w += line.len;
+                @memcpy(out[w..][0..title.len], title);
+                w += title.len;
                 n += 1;
             }
             return out[0..w];
@@ -44342,16 +44495,32 @@ pub const LinuxServer = struct {
     /// placeholder. Returns the written slice (borrows `out`).
     fn motdJoinHeadlines(got: [][]const u8, out: []u8) []const u8 {
         var w: usize = 0;
-        const take = @min(got.len, 2);
-        for (got[0..take], 0..) |headline, idx| {
-            const sep: []const u8 = if (idx == 0) "" else " | ";
-            if (w + sep.len + headline.len > out.len) break;
+        var n: usize = 0;
+        for (got) |headline| {
+            if (n >= 2) break;
+            const title = geo_fetch.unpackHeadline(headline).title;
+            if (title.len == 0) continue;
+            const sep: []const u8 = if (n == 0) "" else " | ";
+            if (w + sep.len + title.len > out.len) break;
             @memcpy(out[w..][0..sep.len], sep);
             w += sep.len;
-            @memcpy(out[w..][0..headline.len], headline);
-            w += headline.len;
+            @memcpy(out[w..][0..title.len], title);
+            w += title.len;
+            n += 1;
         }
         return out[0..w];
+    }
+
+    /// One MOTD weather line. A classic reading stays the `renderLine` text.
+    /// A rich reading appends the detail when it fits.
+    fn motdWeatherText(out: []u8, location: []const u8, reading: weather_units.Reading, sys: weather_units.UnitSystem) []const u8 {
+        var detail: [160]u8 = undefined;
+        const report = weather_units.renderReport(out, &detail, location, reading, sys);
+        if (report.detail.len == 0 or report.primary.len + 3 + report.detail.len > out.len) return report.primary;
+        const n = report.primary.len;
+        @memcpy(out[n..][0..3], " | ");
+        @memcpy(out[n + 3 ..][0..report.detail.len], report.detail);
+        return out[0 .. n + 3 + report.detail.len];
     }
 
     pub fn handleMotd(self: *LinuxServer, conn: *ConnState) !void {

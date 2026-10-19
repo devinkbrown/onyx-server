@@ -148,6 +148,143 @@ pub fn usesImperial(cc: []const u8) bool {
     return false;
 }
 
+/// Headlines one `!news` reply may show. Matches `geo_services.max_headlines`.
+pub const max_shown: u8 = 5;
+
+/// Topic names a `!news` query can select. A source key of the same spelling
+/// wins over the topic.
+pub const topics = [_][]const u8{
+    "world",       "us",      "uk",      "politics",
+    "environment", "tech",    "science", "entertainment",
+    "business",    "finance", "sports",  "health",
+    "europe",
+};
+
+pub const NewsRequest = union(enum) {
+    default_source: struct { count: u8 },
+    source: struct { key: []const u8, count: u8 },
+    topic: struct { name: []const u8, count: u8 },
+    sources,
+    usage,
+};
+
+/// Parse the argument of `!news`. `count` 0 means the caller picks its default
+/// (a single source uses the configured headline count; a topic uses one).
+pub fn parseNewsCommand(arg: []const u8) NewsRequest {
+    var tokens: [4][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, arg, " \t");
+    while (it.next()) |token| {
+        if (n >= 3) return .usage;
+        tokens[n] = token;
+        n += 1;
+    }
+    if (n == 0) return .{ .default_source = .{ .count = 0 } };
+    if (std.ascii.eqlIgnoreCase(tokens[0], "sources")) {
+        if (n != 1) return .usage;
+        return .sources;
+    }
+    if (std.ascii.eqlIgnoreCase(tokens[0], "topic")) {
+        if (n < 2 or n > 3) return .usage;
+        const name = canonicalTopic(tokens[1]) orelse return .usage;
+        const count: u8 = if (n == 3) parseShownCount(tokens[2]) orelse return .usage else 0;
+        return .{ .topic = .{ .name = name, .count = count } };
+    }
+    if (n > 2) return .usage;
+    if (n == 2) {
+        const count = parseShownCount(tokens[1]) orelse return .usage;
+        if (sourceByKey(tokens[0])) |src| return .{ .source = .{ .key = src.key, .count = count } };
+        if (canonicalTopic(tokens[0])) |name| return .{ .topic = .{ .name = name, .count = count } };
+        return .usage;
+    }
+    if (allDigits(tokens[0])) {
+        const count = parseShownCount(tokens[0]) orelse return .usage;
+        return .{ .default_source = .{ .count = count } };
+    }
+    if (sourceByKey(tokens[0])) |src| return .{ .source = .{ .key = src.key, .count = 0 } };
+    if (canonicalTopic(tokens[0])) |name| return .{ .topic = .{ .name = name, .count = 0 } };
+    return .usage;
+}
+
+pub fn canonicalTopic(name: []const u8) ?[]const u8 {
+    for (topics) |topic| if (std.ascii.eqlIgnoreCase(topic, name)) return topic;
+    return null;
+}
+
+/// Fill `out` with indexes into `sources` that carry `topic`.
+pub fn sourcesForTopic(topic: []const u8, out: []usize) usize {
+    const name = canonicalTopic(topic) orelse return 0;
+    var n: usize = 0;
+    for (sources, 0..) |src, index| {
+        if (n >= out.len) break;
+        for (src.topics) |tag| if (std.ascii.eqlIgnoreCase(tag, name)) {
+            out[n] = index;
+            n += 1;
+            break;
+        };
+    }
+    return n;
+}
+
+pub const CatalogueLine = struct { text: []const u8, next: usize };
+
+/// One catalogue line of `key (Name)` pairs, starting at `sources[start]`.
+pub fn writeCatalogueLine(buf: []u8, start: usize) CatalogueLine {
+    var n: usize = 0;
+    var i = start;
+    if (i >= sources.len or buf.len == 0) return .{ .text = buf[0..0], .next = i };
+    while (i < sources.len) {
+        var piece: [96]u8 = undefined;
+        const one = std.fmt.bufPrint(&piece, "{s} ({s})", .{ sources[i].key, sources[i].name }) catch break;
+        const sep: usize = if (n == 0) 0 else 2;
+        if (n != 0 and n + sep + one.len > buf.len) break;
+        if (n == 0 and one.len > buf.len) {
+            const keep = @min(one.len, buf.len);
+            @memcpy(buf[0..keep], one[0..keep]);
+            return .{ .text = buf[0..keep], .next = i + 1 };
+        }
+        if (sep != 0) {
+            buf[n] = ',';
+            buf[n + 1] = ' ';
+        }
+        @memcpy(buf[n + sep ..][0..one.len], one);
+        n += sep + one.len;
+        i += 1;
+    }
+    return .{ .text = buf[0..n], .next = i };
+}
+
+pub fn formatTopics(buf: []u8) []const u8 {
+    const head = "Topics: ";
+    if (head.len > buf.len) return buf[0..0];
+    @memcpy(buf[0..head.len], head);
+    var n = head.len;
+    for (topics, 0..) |topic, index| {
+        const sep: usize = if (index == 0) 0 else 2;
+        if (n + sep + topic.len > buf.len) break;
+        if (sep != 0) {
+            buf[n] = ',';
+            buf[n + 1] = ' ';
+        }
+        @memcpy(buf[n + sep ..][0..topic.len], topic);
+        n += sep + topic.len;
+    }
+    return buf[0..n];
+}
+
+fn parseShownCount(token: []const u8) ?u8 {
+    if (!allDigits(token)) return null;
+    const value = std.fmt.parseInt(u16, token, 10) catch return null;
+    if (value < 1 or value > max_shown) return null;
+    return @intCast(value);
+}
+
+fn allDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
 // ---- tests ------------------------------------------------------------------
 
 test "sourceByKey resolves a known source case-insensitively" {
@@ -178,4 +315,47 @@ test "usesImperial matches the imperial set" {
 test "every source and country feed has an https url" {
     for (sources) |s| try std.testing.expect(std.mem.startsWith(u8, s.url, "https://"));
     for (country_feeds) |f| try std.testing.expect(std.mem.startsWith(u8, f.url, "https://"));
+}
+
+test "parseNewsCommand distinguishes sources, topics, counts, and usage" {
+    const bare = parseNewsCommand("");
+    try std.testing.expect(bare == .default_source);
+    try std.testing.expectEqual(@as(u8, 0), bare.default_source.count);
+
+    const counted = parseNewsCommand("4");
+    try std.testing.expectEqual(@as(u8, 4), counted.default_source.count);
+    try std.testing.expect(parseNewsCommand("0") == .usage);
+    try std.testing.expect(parseNewsCommand("6") == .usage);
+    try std.testing.expect(parseNewsCommand("99") == .usage);
+
+    const bbc = parseNewsCommand("BBC");
+    try std.testing.expectEqualStrings("bbc", bbc.source.key);
+    try std.testing.expectEqual(@as(u8, 0), bbc.source.count);
+    const bbc_n = parseNewsCommand("bbc 2");
+    try std.testing.expectEqualStrings("bbc", bbc_n.source.key);
+    try std.testing.expectEqual(@as(u8, 2), bbc_n.source.count);
+
+    const sports = parseNewsCommand("Sports");
+    try std.testing.expectEqualStrings("sports", sports.topic.name);
+    try std.testing.expectEqual(@as(u8, 0), sports.topic.count);
+    const topic = parseNewsCommand("topic europe 3");
+    try std.testing.expectEqualStrings("europe", topic.topic.name);
+    try std.testing.expectEqual(@as(u8, 3), topic.topic.count);
+
+    try std.testing.expect(parseNewsCommand("sources") == .sources);
+    try std.testing.expect(parseNewsCommand("sources 2") == .usage);
+    try std.testing.expect(parseNewsCommand("topic") == .usage);
+    try std.testing.expect(parseNewsCommand("bbc 2 extra") == .usage);
+    try std.testing.expect(parseNewsCommand("nope") == .usage);
+
+    var indexes: [sources.len]usize = undefined;
+    const found = sourcesForTopic("tech", &indexes);
+    try std.testing.expect(found >= 2);
+    try std.testing.expectEqual(sources[indexes[0]].key, "ars");
+    var line: [180]u8 = undefined;
+    const first = writeCatalogueLine(&line, 0);
+    try std.testing.expect(std.mem.startsWith(u8, first.text, "abc (ABC News)"));
+    try std.testing.expect(first.next > 0);
+    var topics_buf: [180]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, formatTopics(&topics_buf), "Topics: world, us, uk"));
 }

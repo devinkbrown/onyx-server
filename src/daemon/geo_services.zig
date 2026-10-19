@@ -21,6 +21,10 @@ const geo_fetch = @import("../proto/geo_fetch.zig");
 const weather_units = @import("../proto/weather_units.zig");
 const news_sources = @import("../proto/news_sources.zig");
 const platform = @import("../substrate/platform.zig");
+
+comptime {
+    if (news_sources.max_shown != max_headlines) @compileError("news show count must match the geo headline slots");
+}
 pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 
@@ -29,6 +33,8 @@ pub const max_loc = 64;
 pub const max_desc = 48;
 pub const max_headline = 180;
 pub const max_headlines = 5;
+/// A failed fetch stays pending and may be queued again after this interval.
+const fetch_retry_ms: i64 = 30_000;
 pub const weather_slots = 64;
 pub const news_slots = 64;
 pub const job_capacity = 128;
@@ -52,6 +58,17 @@ pub const Options = struct {
     max_headlines: u8 = 3,
 };
 
+const DaySlot = struct {
+    has_precip: bool = false,
+    min_c: f64 = 0,
+    max_c: f64 = 0,
+    precip_mm: f64 = 0,
+    label_buf: [10]u8 = @splat(0),
+    label_len: u8 = 0,
+    desc_buf: [32]u8 = @splat(0),
+    desc_len: u8 = 0,
+};
+
 const WeatherEntry = struct {
     state: State = .empty,
     key_buf: [max_key]u8 = undefined,
@@ -62,6 +79,17 @@ const WeatherEntry = struct {
     desc_len: usize = 0,
     temp_c: f64 = 0,
     wind_kph: f64 = 0,
+    feels_c: f64 = 0,
+    precip_mm: f64 = 0,
+    humidity: u8 = 0,
+    pressure: u16 = 0,
+    uv: u8 = 0,
+    visibility: u16 = 0,
+    flags: u8 = 0,
+    wind_dir_buf: [3]u8 = @splat(0),
+    wind_dir_len: u8 = 0,
+    day_count: u8 = 0,
+    days: [weather_units.max_days]DaySlot = .{ .{}, .{}, .{} },
     fetched_ms: i64 = 0,
 
     fn key(self: *const WeatherEntry) []const u8 {
@@ -96,11 +124,22 @@ const Job = struct {
     }
 };
 
+/// Caller storage for a weather view. Slices in `WeatherView` borrow it.
+pub const WeatherScratch = struct {
+    loc: [max_loc]u8 = undefined,
+    desc: [max_desc]u8 = undefined,
+    wind_dir: [3]u8 = undefined,
+    day_labels: [weather_units.max_days][10]u8 = undefined,
+    day_descs: [weather_units.max_days][32]u8 = undefined,
+};
+
 /// A weather reading copied into caller storage (so it stays valid after the
 /// cache lock is released).
 pub const WeatherView = struct {
     reading: weather_units.Reading,
     location: []const u8,
+    days: [weather_units.max_days]weather_units.Day = .{ .{}, .{}, .{} },
+    day_count: usize = 0,
 };
 
 pub const Service = struct {
@@ -243,11 +282,41 @@ pub const Service = struct {
         const jobs = try allocator.alloc(JobCarry, self.job_count);
         errdefer allocator.free(jobs);
         for (&self.weather, weather) |entry, *out| {
-            if (entry.key_len > max_key or entry.loc_len > max_loc or entry.desc_len > max_desc) return error.InvalidState;
-            out.* = .{ .state = entry.state, .key_len = @intCast(entry.key_len), .loc_len = @intCast(entry.loc_len), .desc_len = @intCast(entry.desc_len), .temp_c_bits = @bitCast(entry.temp_c), .wind_kph_bits = @bitCast(entry.wind_kph), .fetched_ms = entry.fetched_ms };
+            if (entry.key_len > max_key or entry.loc_len > max_loc or entry.desc_len > max_desc or entry.wind_dir_len > 3 or entry.day_count > weather_units.max_days) return error.InvalidState;
+            out.* = .{};
+            out.state = entry.state;
+            out.key_len = @intCast(entry.key_len);
+            out.loc_len = @intCast(entry.loc_len);
+            out.desc_len = @intCast(entry.desc_len);
+            out.temp_c_bits = @bitCast(entry.temp_c);
+            out.wind_kph_bits = @bitCast(entry.wind_kph);
+            out.fetched_ms = entry.fetched_ms;
+            out.flags = entry.flags;
+            out.humidity = entry.humidity;
+            out.uv = entry.uv;
+            out.wind_dir_len = entry.wind_dir_len;
+            out.visibility = entry.visibility;
+            out.pressure = entry.pressure;
+            out.feels_bits = @bitCast(entry.feels_c);
+            out.precip_bits = @bitCast(entry.precip_mm);
+            out.day_count = entry.day_count;
             @memcpy(out.key[0..entry.key_len], entry.key_buf[0..entry.key_len]);
             @memcpy(out.location[0..entry.loc_len], entry.loc_buf[0..entry.loc_len]);
             @memcpy(out.description[0..entry.desc_len], entry.desc_buf[0..entry.desc_len]);
+            @memcpy(out.wind_dir[0..entry.wind_dir_len], entry.wind_dir_buf[0..entry.wind_dir_len]);
+            for (entry.days[0..entry.day_count], 0..) |day, i| {
+                if (@as(usize, day.label_len) > out.days[i].label.len or @as(usize, day.desc_len) > out.days[i].desc.len) return error.InvalidState;
+                out.days[i] = .{
+                    .flags = if (day.has_precip) 1 else 0,
+                    .desc_len = day.desc_len,
+                    .label_len = day.label_len,
+                    .min_bits = @bitCast(day.min_c),
+                    .max_bits = @bitCast(day.max_c),
+                    .precip_bits = if (day.has_precip) @bitCast(day.precip_mm) else 0,
+                };
+                @memcpy(out.days[i].label[0..day.label_len], day.label_buf[0..day.label_len]);
+                @memcpy(out.days[i].desc[0..day.desc_len], day.desc_buf[0..day.desc_len]);
+            }
         }
         for (&self.news, news) |entry, *out| {
             if (entry.key_len > max_key or entry.count > max_headlines) return error.InvalidState;
@@ -291,10 +360,39 @@ pub const Service = struct {
         defer self.mutex.unlock();
         if (parked) try self.runtime.requireParked();
         for (snapshot.weather, &self.weather) |entry, *out| {
-            out.* = .{ .state = entry.state, .key_len = entry.key_len, .loc_len = entry.loc_len, .desc_len = entry.desc_len, .temp_c = @bitCast(entry.temp_c_bits), .wind_kph = @bitCast(entry.wind_kph_bits), .fetched_ms = entry.fetched_ms };
+            out.* = .{};
+            out.state = entry.state;
+            out.key_len = entry.key_len;
+            out.loc_len = entry.loc_len;
+            out.desc_len = entry.desc_len;
+            out.temp_c = @bitCast(entry.temp_c_bits);
+            out.wind_kph = @bitCast(entry.wind_kph_bits);
+            out.fetched_ms = entry.fetched_ms;
+            out.flags = entry.flags;
+            out.humidity = entry.humidity;
+            out.uv = entry.uv;
+            out.wind_dir_len = entry.wind_dir_len;
+            out.visibility = entry.visibility;
+            out.pressure = entry.pressure;
+            out.feels_c = @bitCast(entry.feels_bits);
+            out.precip_mm = @bitCast(entry.precip_bits);
+            out.day_count = entry.day_count;
             @memcpy(out.key_buf[0..entry.key_len], entry.key[0..entry.key_len]);
             @memcpy(out.loc_buf[0..entry.loc_len], entry.location[0..entry.loc_len]);
             @memcpy(out.desc_buf[0..entry.desc_len], entry.description[0..entry.desc_len]);
+            @memcpy(out.wind_dir_buf[0..entry.wind_dir_len], entry.wind_dir[0..entry.wind_dir_len]);
+            for (entry.days[0..entry.day_count], 0..) |day, i| {
+                out.days[i] = .{
+                    .has_precip = (day.flags & 1) != 0,
+                    .min_c = @bitCast(day.min_bits),
+                    .max_c = @bitCast(day.max_bits),
+                    .precip_mm = @bitCast(day.precip_bits),
+                    .label_len = day.label_len,
+                    .desc_len = day.desc_len,
+                };
+                @memcpy(out.days[i].label_buf[0..day.label_len], day.label[0..day.label_len]);
+                @memcpy(out.days[i].desc_buf[0..day.desc_len], day.desc[0..day.desc_len]);
+            }
         }
         for (snapshot.news, &self.news) |entry, *out| {
             out.* = .{ .state = entry.state, .key_len = entry.key_len, .count = entry.count, .lens = entry.lens, .fetched_ms = entry.fetched_ms };
@@ -361,7 +459,7 @@ pub const Service = struct {
     /// location into the caller buffers and returns a view; on miss/stale it
     /// enqueues a refresh and returns null (stale data is still returned while a
     /// refresh runs, so users see *something*).
-    pub fn getWeather(self: *Service, location: []const u8, loc_out: []u8, desc_out: []u8) ?WeatherView {
+    pub fn getWeather(self: *Service, location: []const u8, scratch: *WeatherScratch) ?WeatherView {
         if (!self.opts.weather_enabled) return null;
         var keybuf: [max_key]u8 = undefined;
         const k = normalizeKey(location, &keybuf);
@@ -372,14 +470,15 @@ pub const Service = struct {
 
         const now = platform.monotonicMillis();
         if (self.findWeather(k)) |e| {
-            const fresh = (now - e.fetched_ms) < self.opts.weather_ttl_ms;
             if (e.state == .ready) {
+                const fresh = (now - e.fetched_ms) < self.opts.weather_ttl_ms;
                 if (!fresh) self.enqueue(.weather, k); // refresh in background, serve stale now
-                const loc = copyInto(loc_out, e.loc_buf[0..e.loc_len]);
-                const desc = copyInto(desc_out, e.desc_buf[0..e.desc_len]);
-                return .{ .reading = .{ .temp_c = e.temp_c, .wind_kph = e.wind_kph, .precip_mm = 0, .desc = desc }, .location = loc };
+                // A classic row (no rich parse) is served as-is and upgraded once.
+                if ((e.flags & weather_units.flag_rich) == 0 and now - e.fetched_ms >= fetch_retry_ms) self.enqueue(.weather, k);
+                return copyWeather(e, scratch);
             }
-            return null; // pending
+            if (e.fetched_ms != 0 and now - e.fetched_ms >= fetch_retry_ms) self.enqueue(.weather, k);
+            return null; // pending, or in flight while fetched_ms == 0
         }
         self.enqueue(.weather, k);
         return null;
@@ -399,11 +498,12 @@ pub const Service = struct {
 
         const now = platform.monotonicMillis();
         if (self.findNews(k)) |e| {
-            const fresh = (now - e.fetched_ms) < self.opts.news_ttl_ms;
             if (e.state == .ready and e.count > 0) {
+                const fresh = (now - e.fetched_ms) < self.opts.news_ttl_ms;
                 if (!fresh) self.enqueue(.news, k);
                 return copyHeadlines(e, out, lines);
             }
+            if (e.fetched_ms != 0 and now - e.fetched_ms >= fetch_retry_ms) self.enqueue(.news, k);
             return null;
         }
         self.enqueue(.news, k);
@@ -463,29 +563,53 @@ pub const Service = struct {
         return oldest;
     }
 
-    /// Enqueue a fetch job for `k` unless one is already queued or the matching
-    /// entry is already pending. Caller holds the mutex.
+    /// Enqueue a fetch job for `k` unless one is already queued. Caller holds
+    /// the mutex. A pending slot with `fetched_ms == 0` is in flight; a failed
+    /// fetch stamps `fetched_ms` and stays pending so it can be retried.
     fn enqueue(self: *Service, kind: JobKind, k: []const u8) void {
         if (self.producers.frozen or self.stop_flag.load(.acquire)) return;
-        // Mark the target entry pending so repeated requests don't pile up.
         switch (kind) {
             .weather => _ = self.reserveWeather(k),
             .news => _ = self.reserveNews(k),
         }
-        if (self.job_count >= job_capacity) return;
-        // De-dupe against queued jobs.
-        var i: usize = 0;
-        var idx = self.job_head;
-        while (i < self.job_count) : (i += 1) {
-            const j = &self.jobs[idx];
-            if (j.kind == kind and std.mem.eql(u8, j.key(), k)) return;
-            idx = (idx + 1) % job_capacity;
-        }
+        const queued = self.queueJob(kind, k);
+        self.markFetch(kind, k, queued);
+    }
+
+    fn queueJob(self: *Service, kind: JobKind, k: []const u8) bool {
+        if (self.jobAlready(kind, k)) return true;
+        if (self.job_count >= job_capacity) return false;
         var job = Job{ .kind = kind };
         job.key_len = copyKey(&job.key_buf, k);
         self.jobs[self.job_tail] = job;
         self.job_tail = (self.job_tail + 1) % job_capacity;
         self.job_count += 1;
+        return true;
+    }
+
+    fn jobAlready(self: *const Service, kind: JobKind, k: []const u8) bool {
+        var i: usize = 0;
+        var idx = self.job_head;
+        while (i < self.job_count) : (i += 1) {
+            const j = &self.jobs[idx];
+            if (j.kind == kind and std.mem.eql(u8, j.key(), k)) return true;
+            idx = (idx + 1) % job_capacity;
+        }
+        return false;
+    }
+
+    fn markFetch(self: *Service, kind: JobKind, k: []const u8, queued: bool) void {
+        const failed_at = stamp(platform.monotonicMillis());
+        switch (kind) {
+            .weather => if (self.findWeather(k)) |e| {
+                if (e.state != .pending) return;
+                e.fetched_ms = if (queued) 0 else failed_at;
+            },
+            .news => if (self.findNews(k)) |e| {
+                if (e.state != .pending) return;
+                e.fetched_ms = if (queued) 0 else failed_at;
+            },
+        }
     }
 
     fn worker(self: *Service) void {
@@ -518,22 +642,57 @@ pub const Service = struct {
     }
 
     fn fetchWeather(self: *Service, k: []const u8) void {
-        var req_buf: [512]u8 = undefined;
-        const req = geo_fetch.buildWeatherRequest(&req_buf, geo_fetch.weather_host, k) catch return;
-        const resp = http_fetch.get(self.allocator, geo_fetch.weather_host, 80, false, req, .{
-            .max_response_bytes = 64 * 1024,
-        }) catch return;
-        defer self.allocator.free(resp);
-        const parsed = geo_fetch.parseWeather(geo_fetch.httpBody(resp)) catch return;
+        if (!self.tryFetchWeather(k)) self.noteFetchFailure(.weather, k);
+    }
 
+    fn tryFetchWeather(self: *Service, k: []const u8) bool {
+        var req_buf: [512]u8 = undefined;
+        const req = geo_fetch.buildWeatherRequest(&req_buf, geo_fetch.weather_host, k) catch return false;
+        const resp = http_fetch.get(self.allocator, geo_fetch.weather_host, 80, false, req, .{
+            .max_response_bytes = 128 * 1024,
+        }) catch return false;
+        defer self.allocator.free(resp);
+        const parsed = geo_fetch.parseWeatherReport(geo_fetch.httpBody(resp)) catch return false;
+        self.storeWeather(k, parsed);
+        return true;
+    }
+
+    fn storeWeather(self: *Service, k: []const u8, report: geo_fetch.WeatherReport) void {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         const e = self.reserveWeather(k);
-        e.temp_c = parsed.reading.temp_c;
-        e.wind_kph = parsed.reading.wind_kph;
-        e.loc_len = copyClamp(&e.loc_buf, if (parsed.location.len != 0) parsed.location else k);
-        e.desc_len = copyClamp(&e.desc_buf, parsed.reading.desc);
-        e.fetched_ms = platform.monotonicMillis();
+        const reading = report.reading;
+        e.temp_c = reading.temp_c;
+        e.wind_kph = reading.wind_kph;
+        e.feels_c = reading.feels_c;
+        e.precip_mm = reading.precip_mm;
+        e.humidity = reading.humidity_pct;
+        e.pressure = reading.pressure_hpa;
+        e.uv = reading.uv_index;
+        e.visibility = reading.visibility_km;
+        e.flags = reading.flags;
+        const wind = geo_fetch.clipUtf8(reading.wind_dir, e.wind_dir_buf.len);
+        e.wind_dir_len = @intCast(copyClamp(&e.wind_dir_buf, wind));
+        if (e.wind_dir_len == 0) e.flags &= ~weather_units.flag_wind_dir;
+        const place = if (report.location.len != 0) report.location else k;
+        e.loc_len = copyClamp(&e.loc_buf, geo_fetch.clipUtf8(place, e.loc_buf.len));
+        e.desc_len = copyClamp(&e.desc_buf, geo_fetch.clipUtf8(reading.desc, e.desc_buf.len));
+        const days = @min(report.day_count, e.days.len);
+        e.day_count = @intCast(days);
+        for (e.days[0..days], 0..) |*slot, i| {
+            const day = report.days[i];
+            slot.* = .{};
+            slot.has_precip = day.has_precip;
+            slot.min_c = day.min_c;
+            slot.max_c = day.max_c;
+            slot.precip_mm = if (day.has_precip) day.precip_mm else 0;
+            const label = geo_fetch.clipUtf8(day.label, slot.label_buf.len);
+            const desc = geo_fetch.clipUtf8(day.desc, slot.desc_buf.len);
+            slot.label_len = @intCast(copyClamp(&slot.label_buf, label));
+            slot.desc_len = @intCast(copyClamp(&slot.desc_buf, desc));
+        }
+        for (e.days[days..]) |*slot| slot.* = .{};
+        e.fetched_ms = stamp(platform.monotonicMillis());
         e.state = .ready;
     }
 
@@ -541,7 +700,7 @@ pub const Service = struct {
         // File-cache path (preferred when configured): read headlines an external
         // key-free updater has written. Robust full coverage, no in-daemon TLS.
         if (self.opts.news_cache_dir.len != 0) {
-            self.fetchNewsFromFile(k);
+            if (!self.fetchNewsFromFile(k)) self.noteFetchFailure(.news, k);
             return;
         }
         // Live path: in-daemon RSS-over-TLS fetch. crypto/tls_client verifies
@@ -549,35 +708,45 @@ pub const Service = struct {
         // failed rsa_pss hosts like NPR/Guardian is fixed). It is TLS-1.3 only,
         // so a TLS-1.2-only host would still fail — `news_cache_dir` +
         // tools/news_update.sh remain available for guaranteed full coverage.
-        const url = newsUrlForKey(k) orelse return;
-        const u = http_fetch.parseUrl(url) catch return;
+        if (!self.tryFetchNews(k)) self.noteFetchFailure(.news, k);
+    }
+
+    fn tryFetchNews(self: *Service, k: []const u8) bool {
+        const url = newsUrlForKey(k) orelse return false;
+        const u = http_fetch.parseUrl(url) catch return false;
         var req_buf: [1024]u8 = undefined;
-        const req = geo_fetch.buildNewsRequest(&req_buf, u.host, u.path) catch return;
+        const req = geo_fetch.buildNewsRequest(&req_buf, u.host, u.path) catch return false;
         const resp = http_fetch.get(self.allocator, u.host, u.port, u.tls, req, .{
             .insecure_skip_verify = self.opts.news_insecure_tls,
             .max_response_bytes = 1024 * 1024,
-        }) catch return;
+        }) catch return false;
         defer self.allocator.free(resp);
 
-        var titles: [max_headlines][]const u8 = undefined;
-        const got = geo_fetch.parseRssTitles(geo_fetch.httpBody(resp), &titles);
-        self.storeNews(k, got);
+        var items: [max_headlines]geo_fetch.RssItem = undefined;
+        const got = geo_fetch.parseRssItems(geo_fetch.httpBody(resp), &items);
+        if (got.len == 0) return false;
+        var packed_rows: [max_headlines][max_headline]u8 = undefined;
+        var lines: [max_headlines][]const u8 = undefined;
+        for (got, 0..) |item, i| {
+            lines[i] = geo_fetch.packHeadline(&packed_rows[i], item.published_unix, item.title, item.deck);
+        }
+        return self.storeNews(k, lines[0..got.len]);
     }
 
     /// Read `<news_cache_dir>/<key with ':'->'_'>.txt` (one headline per line,
     /// `#` comments skipped) and cache its headlines. Thread-safe blocking file
     /// read (raw syscalls; never touches the reactor io).
-    fn fetchNewsFromFile(self: *Service, k: []const u8) void {
+    fn fetchNewsFromFile(self: *Service, k: []const u8) bool {
         // getNews accepts a client-supplied key. Only catalogue entries may
         // become filenames below the configured cache directory.
-        if (newsUrlForKey(k) == null) return;
+        if (newsUrlForKey(k) == null) return false;
         var name_buf: [max_key]u8 = undefined;
         const fname = fileKey(k, &name_buf);
         var path_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}.txt", .{ self.opts.news_cache_dir, fname }, 0) catch return;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}.txt", .{ self.opts.news_cache_dir, fname }, 0) catch return false;
 
         var file_buf: [16 * 1024]u8 = undefined;
-        const contents = readFileZ(path, &file_buf) orelse return;
+        const contents = readFileZ(path, &file_buf) orelse return false;
 
         var titles: [max_headlines][]const u8 = undefined;
         var n: usize = 0;
@@ -589,29 +758,56 @@ pub const Service = struct {
             titles[n] = line;
             n += 1;
         }
-        self.storeNews(k, titles[0..n]);
+        if (n == 0) return false;
+        return self.storeNews(k, titles[0..n]);
     }
 
-    /// Copy `headlines` into the news cache entry for `k` (mutex-guarded). No-op
-    /// when empty, so a failed fetch leaves any prior data intact.
-    fn storeNews(self: *Service, k: []const u8, headlines: []const []const u8) void {
-        if (headlines.len == 0) return;
+    /// Copy `headlines` into the news cache entry for `k` (mutex-guarded).
+    /// Keeps up to `max_headlines` rows. An empty result leaves any prior data
+    /// intact and returns false. The serve path, not this store, applies
+    /// `opts.max_headlines`.
+    fn storeNews(self: *Service, k: []const u8, headlines: []const []const u8) bool {
+        if (headlines.len == 0) return false;
+        var packed_text: [max_headline * max_headlines]u8 = @splat(0);
+        var packed_lens: [max_headlines]u16 = @splat(0);
+        var count: usize = 0;
+        var off: usize = 0;
+        const want = @min(headlines.len, max_headlines);
+        for (headlines[0..want]) |t| {
+            const clipped = geo_fetch.clipUtf8(t, max_headline);
+            if (clipped.len == 0) continue;
+            if (off + clipped.len > packed_text.len) break;
+            @memcpy(packed_text[off..][0..clipped.len], clipped);
+            packed_lens[count] = @intCast(clipped.len);
+            off += clipped.len;
+            count += 1;
+        }
+        if (count == 0) return false;
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         const e = self.reserveNews(k);
-        e.count = 0;
-        var off: usize = 0;
-        const want = @min(headlines.len, @as(usize, self.opts.max_headlines));
-        for (headlines[0..want]) |t| {
-            const clipped = t[0..@min(t.len, max_headline)];
-            if (off + clipped.len > e.text.len) break;
-            @memcpy(e.text[off .. off + clipped.len], clipped);
-            e.lens[e.count] = @intCast(clipped.len);
-            off += clipped.len;
-            e.count += 1;
-        }
-        e.fetched_ms = platform.monotonicMillis();
+        @memset(&e.text, 0);
+        e.lens = @splat(0);
+        @memcpy(e.text[0..off], packed_text[0..off]);
+        e.lens = packed_lens;
+        e.count = count;
+        e.fetched_ms = stamp(platform.monotonicMillis());
         e.state = .ready;
+        return true;
+    }
+
+    fn noteFetchFailure(self: *Service, kind: JobKind, k: []const u8) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const now = stamp(platform.monotonicMillis());
+        switch (kind) {
+            .weather => if (self.findWeather(k)) |e| {
+                if (e.state != .empty) e.fetched_ms = now;
+            },
+            .news => if (self.findNews(k)) |e| {
+                if (e.state != .empty) e.fetched_ms = now;
+            },
+        }
     }
 };
 
@@ -743,6 +939,44 @@ fn copyHeadlines(e: *const NewsEntry, out: []u8, lines: [][]const u8) ?[][]const
     return lines[0..n];
 }
 
+fn copyWeather(e: *const WeatherEntry, scratch: *WeatherScratch) WeatherView {
+    const loc = copyInto(&scratch.loc, e.loc_buf[0..e.loc_len]);
+    const desc = copyInto(&scratch.desc, e.desc_buf[0..e.desc_len]);
+    const wind = copyInto(&scratch.wind_dir, e.wind_dir_buf[0..e.wind_dir_len]);
+    var view = WeatherView{
+        .location = loc,
+        .day_count = e.day_count,
+        .reading = .{
+            .temp_c = e.temp_c,
+            .wind_kph = e.wind_kph,
+            .precip_mm = e.precip_mm,
+            .feels_c = e.feels_c,
+            .humidity_pct = e.humidity,
+            .pressure_hpa = e.pressure,
+            .uv_index = e.uv,
+            .visibility_km = e.visibility,
+            .flags = e.flags,
+            .desc = desc,
+            .wind_dir = wind,
+        },
+    };
+    for (e.days[0..e.day_count], 0..) |day, i| {
+        view.days[i] = .{
+            .label = copyInto(&scratch.day_labels[i], day.label_buf[0..day.label_len]),
+            .desc = copyInto(&scratch.day_descs[i], day.desc_buf[0..day.desc_len]),
+            .min_c = day.min_c,
+            .max_c = day.max_c,
+            .precip_mm = day.precip_mm,
+            .has_precip = day.has_precip,
+        };
+    }
+    return view;
+}
+
+fn stamp(now: i64) i64 {
+    return if (now == 0) 1 else now;
+}
+
 fn copyInto(dst: []u8, src: []const u8) []const u8 {
     const n = @min(dst.len, src.len);
     @memcpy(dst[0..n], src[0..n]);
@@ -782,11 +1016,10 @@ test "newsUrlForKey resolves source and country keys" {
 test "cache miss enqueues and reports not-ready" {
     var svc = Service.init(std.testing.allocator, .{});
     // No worker thread started: requests just enqueue and return null.
-    var loc: [max_loc]u8 = undefined;
-    var desc: [max_desc]u8 = undefined;
-    try std.testing.expect(svc.getWeather("Austin", &loc, &desc) == null);
+    var scratch = WeatherScratch{};
+    try std.testing.expect(svc.getWeather("Austin", &scratch) == null);
     // Same key again must not double-enqueue (entry now pending).
-    try std.testing.expect(svc.getWeather("austin", &loc, &desc) == null);
+    try std.testing.expect(svc.getWeather("austin", &scratch) == null);
     try std.testing.expectEqual(@as(usize, 1), svc.job_count);
 }
 
@@ -817,12 +1050,85 @@ test "ready weather entry is served and localized by caller" {
         e.fetched_ms = platform.monotonicMillis();
         e.state = .ready;
     }
-    var loc: [max_loc]u8 = undefined;
-    var desc: [max_desc]u8 = undefined;
-    const v = svc.getWeather("Austin", &loc, &desc).?;
+    var scratch = WeatherScratch{};
+    const v = svc.getWeather("Austin", &scratch).?;
     var line: [128]u8 = undefined;
     const out = weather_units.renderLine(&line, v.location, v.reading, weather_units.forCountry("US"));
     try std.testing.expectEqualStrings("Austin: 72°F, Partly cloudy, wind 12 mph", out);
+    try std.testing.expectEqual(@as(usize, 0), svc.job_count);
+}
+
+test "failed weather fetch retries after the backoff and keeps a ready row" {
+    var svc = Service.init(std.testing.allocator, .{});
+    var scratch = WeatherScratch{};
+    try std.testing.expect(svc.getWeather("Austin", &scratch) == null);
+    try std.testing.expectEqual(@as(usize, 1), svc.job_count);
+    const job = svc.takeJob().?;
+    try std.testing.expectEqual(@as(usize, 0), svc.job_count);
+    svc.noteFetchFailure(.weather, job.key());
+    try std.testing.expect(svc.getWeather("Austin", &scratch) == null);
+    try std.testing.expectEqual(@as(usize, 0), svc.job_count);
+    {
+        lockSpin(&svc.mutex);
+        defer svc.mutex.unlock();
+        svc.findWeather("austin").?.fetched_ms = platform.monotonicMillis() - fetch_retry_ms;
+    }
+    try std.testing.expect(svc.getWeather("Austin", &scratch) == null);
+    try std.testing.expectEqual(@as(usize, 1), svc.job_count);
+
+    {
+        lockSpin(&svc.mutex);
+        defer svc.mutex.unlock();
+        const e = svc.findWeather("austin").?;
+        e.state = .ready;
+        e.temp_c = 22;
+        e.flags = weather_units.flag_rich;
+        e.fetched_ms = 0;
+    }
+    svc.noteFetchFailure(.weather, "austin");
+    {
+        lockSpin(&svc.mutex);
+        defer svc.mutex.unlock();
+        const e = svc.findWeather("austin").?;
+        try std.testing.expectEqual(State.ready, e.state);
+        try std.testing.expectEqual(@as(f64, 22), e.temp_c);
+        try std.testing.expect(e.fetched_ms != 0);
+    }
+    const served = svc.getWeather("Austin", &scratch).?;
+    try std.testing.expectEqual(@as(f64, 22), served.reading.temp_c);
+}
+
+test "classic weather row is served and queued for one rich refresh" {
+    var svc = Service.init(std.testing.allocator, .{});
+    {
+        lockSpin(&svc.mutex);
+        defer svc.mutex.unlock();
+        const e = svc.reserveWeather("oslo");
+        e.temp_c = 10;
+        e.loc_len = copyClamp(&e.loc_buf, "Oslo");
+        e.fetched_ms = platform.monotonicMillis() - fetch_retry_ms;
+        e.state = .ready;
+    }
+    var scratch = WeatherScratch{};
+    const first = svc.getWeather("Oslo", &scratch).?;
+    try std.testing.expectEqual(@as(f64, 10), first.reading.temp_c);
+    try std.testing.expectEqual(@as(usize, 1), svc.job_count);
+    const second = svc.getWeather("oslo", &scratch).?;
+    try std.testing.expectEqual(@as(f64, 10), second.reading.temp_c);
+    try std.testing.expectEqual(@as(usize, 1), svc.job_count);
+}
+
+test "news store keeps five headlines and ignores an empty result" {
+    var svc = Service.init(std.testing.allocator, .{ .max_headlines = 3 });
+    try std.testing.expect(svc.storeNews("src:bbc", &.{ "a", "b", "c", "d", "e", "f" }));
+    try std.testing.expectEqual(@as(usize, 5), svc.findNews("src:bbc").?.count);
+    try std.testing.expect(!svc.storeNews("src:bbc", &.{}));
+    try std.testing.expectEqual(@as(usize, 5), svc.findNews("src:bbc").?.count);
+    var buf: [max_headline * max_headlines]u8 = undefined;
+    var lines: [max_headlines][]const u8 = undefined;
+    const got = svc.getNews("src:bbc", &buf, &lines).?;
+    try std.testing.expectEqual(@as(usize, 5), got.len);
+    try std.testing.expectEqualStrings("e", got[4]);
 }
 
 test "ready news entry returns its headlines" {
@@ -851,6 +1157,16 @@ test "ready news entry returns its headlines" {
 }
 
 pub const Execution = enum(u8) { unstarted, paused };
+pub const DayCarry = struct {
+    flags: u8 = 0,
+    desc_len: u8 = 0,
+    label_len: u8 = 0,
+    min_bits: u64 = 0,
+    max_bits: u64 = 0,
+    precip_bits: u64 = 0,
+    label: [10]u8 = @splat(0),
+    desc: [32]u8 = @splat(0),
+};
 pub const WeatherCarry = struct {
     state: State = .empty,
     key: [max_key]u8 = @splat(0),
@@ -862,6 +1178,17 @@ pub const WeatherCarry = struct {
     temp_c_bits: u64 = 0,
     wind_kph_bits: u64 = 0,
     fetched_ms: i64 = 0,
+    flags: u8 = 0,
+    humidity: u8 = 0,
+    uv: u8 = 0,
+    wind_dir_len: u8 = 0,
+    wind_dir: [3]u8 = @splat(0),
+    visibility: u16 = 0,
+    pressure: u16 = 0,
+    feels_bits: u64 = 0,
+    precip_bits: u64 = 0,
+    day_count: u8 = 0,
+    days: [weather_units.max_days]DayCarry = .{ .{}, .{}, .{} },
 };
 pub const NewsCarry = struct {
     state: State = .empty,
@@ -901,6 +1228,7 @@ pub const Snapshot = struct {
             if (entry.loc_len > max_loc or entry.desc_len > max_desc) return error.InvalidState;
             if (!std.mem.allEqual(u8, entry.location[entry.loc_len..], 0) or !std.mem.allEqual(u8, entry.description[entry.desc_len..], 0)) return error.InvalidState;
             if (entry.state == .empty and (entry.loc_len != 0 or entry.desc_len != 0 or entry.temp_c_bits != 0 or entry.wind_kph_bits != 0 or entry.fetched_ms != 0)) return error.InvalidState;
+            try validateWeatherDetail(entry);
             if (entry.state != .empty) for (self.weather[0..i]) |prior| {
                 if (prior.state != .empty and std.mem.eql(u8, entry.key[0..entry.key_len], prior.key[0..prior.key_len])) return error.InvalidState;
             };
@@ -925,6 +1253,24 @@ pub const Snapshot = struct {
         }
     }
 };
+fn validateWeatherDetail(entry: WeatherCarry) !void {
+    if (entry.wind_dir_len > 3 or entry.day_count > weather_units.max_days) return error.InvalidState;
+    if (!std.mem.allEqual(u8, entry.wind_dir[entry.wind_dir_len..], 0)) return error.InvalidState;
+    if ((entry.flags & weather_units.flag_humidity) == 0 and entry.humidity != 0) return error.InvalidState;
+    if ((entry.flags & weather_units.flag_uv) == 0 and entry.uv != 0) return error.InvalidState;
+    if ((entry.flags & weather_units.flag_visibility) == 0 and entry.visibility != 0) return error.InvalidState;
+    if ((entry.flags & weather_units.flag_pressure) == 0 and entry.pressure != 0) return error.InvalidState;
+    if ((entry.flags & weather_units.flag_feels) == 0 and entry.feels_bits != 0) return error.InvalidState;
+    if ((entry.flags & weather_units.flag_precip) == 0 and entry.precip_bits != 0) return error.InvalidState;
+    if ((entry.flags & weather_units.flag_wind_dir) == 0 and entry.wind_dir_len != 0) return error.InvalidState;
+    if (entry.state == .empty and (entry.flags != 0 or entry.humidity != 0 or entry.uv != 0 or entry.wind_dir_len != 0 or entry.visibility != 0 or entry.pressure != 0 or entry.feels_bits != 0 or entry.precip_bits != 0 or entry.day_count != 0)) return error.InvalidState;
+    for (entry.days, 0..) |day, i| {
+        if ((day.flags & ~@as(u8, 1)) != 0 or @as(usize, day.label_len) > day.label.len or @as(usize, day.desc_len) > day.desc.len) return error.InvalidState;
+        if (!std.mem.allEqual(u8, day.label[day.label_len..], 0) or !std.mem.allEqual(u8, day.desc[day.desc_len..], 0)) return error.InvalidState;
+        if ((day.flags & 1) == 0 and day.precip_bits != 0) return error.InvalidState;
+        if (i >= @as(usize, entry.day_count) and (day.flags != 0 or day.label_len != 0 or day.desc_len != 0 or day.min_bits != 0 or day.max_bits != 0 or day.precip_bits != 0)) return error.InvalidState;
+    }
+}
 fn validateKey(key: *const [max_key]u8, len: usize, empty: bool) !void {
     if (len > max_key or (empty and len != 0) or (!empty and len == 0)) return error.InvalidState;
     if (!std.mem.allEqual(u8, key[len..], 0)) return error.InvalidState;
@@ -952,9 +1298,8 @@ test "companion runtime GEO unstarted lazy membership is fenced without invented
     var service = Service.init(std.testing.allocator, .{});
     try service.prepareColdResources(std.testing.io);
     defer service.stop();
-    var loc: [max_loc]u8 = undefined;
-    var desc: [max_desc]u8 = undefined;
-    try std.testing.expect(service.getWeather("New York", &loc, &desc) == null);
+    var scratch = WeatherScratch{};
+    try std.testing.expect(service.getWeather("New York", &scratch) == null);
     const token = try service.requestPause(1);
     try std.testing.expectEqual(Execution.unstarted, try service.pauseExecution(token));
     service.start(); // actual lazy entry is blocked under the same lifecycle gate
@@ -985,7 +1330,7 @@ test "companion runtime GEO real gated pause carries all caches news FIFO and OO
         gate.control.destroyJoined();
     }
     service.enqueue(.weather, "oslo");
-    service.storeNews("src:bbc", &.{ "first title", "second title" });
+    try std.testing.expect(service.storeNews("src:bbc", &.{ "first title", "second title" }));
     service.enqueue(.news, "src:bbc");
     const token = try service.requestPause(1);
     try service.prepareDormantWorker(gate.control, gate.view, try gate.view.slot(.geo, 0, &service));
@@ -1142,11 +1487,10 @@ test "companion runtime producer fence GEO carries accepted lazy FIFO and preven
     var service = Service.init(std.testing.allocator, .{});
     try service.prepareColdResources(std.testing.io);
     defer service.stop();
-    var loc: [max_loc]u8 = undefined;
-    var desc: [max_desc]u8 = undefined;
-    try std.testing.expect(service.getWeather("New York", &loc, &desc) == null);
+    var scratch = WeatherScratch{};
+    try std.testing.expect(service.getWeather("New York", &scratch) == null);
     const fence = try service.fenceProducers();
-    try std.testing.expect(service.getWeather("London", &loc, &desc) == null);
+    try std.testing.expect(service.getWeather("London", &scratch) == null);
     service.start();
     try std.testing.expect(service.thread == null);
     try std.testing.expect(service.findWeather("london") == null);
@@ -1157,7 +1501,7 @@ test "companion runtime producer fence GEO carries accepted lazy FIFO and preven
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(usize, 1), snapshot.jobs.len);
     try service.resumeProducers(fence);
-    try std.testing.expect(service.getWeather("London", &loc, &desc) == null);
+    try std.testing.expect(service.getWeather("London", &scratch) == null);
     const next = try service.fenceProducers();
     try std.testing.expectError(error.InvalidProducerFence, service.inspectFrozen(fence, null));
     try std.testing.expectEqual(@as(usize, 2), (try service.inspectFrozen(next, null)).queued);
