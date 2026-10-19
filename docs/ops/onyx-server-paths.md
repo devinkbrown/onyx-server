@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-10-18**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-10-19**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -19,13 +19,13 @@ substitutes for this table.
 | **TLS IRC** | `:6697` | `:6697` |
 | **WSS** | `:8080` | `:8080` |
 
-## Verified fleet baseline (2026-10-18)
+## Verified fleet baseline (2026-10-19)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.8.0+b785e99cf0c7` | `0.8.0+b785e99cf0c7` |
-| Executable SHA-256 | `3667c44a37e46346d6401abb5e271eb3d7d82102f28eff95147cfdad53743234` | same |
+| Running image | `0.8.0+31a1e8eba636` | `0.8.0+31a1e8eba636` |
+| Executable SHA-256 | `82d1415702986229a641c2c95c12c31896e577adaaeeb48b78eb2e29c686f975` | same |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
@@ -33,9 +33,9 @@ substitutes for this table.
 `SIGUSR2` does not adopt a new inode. This roll was a full restart, eshmaki
 first (`rc-service`), then ircx.us (`systemctl`). The mesh socket is native
 IPv6: eshmaki `2604:f440:3:40::2` to ircx.us `2607:5300:201:3100::24ca` port
-6900. The previous image is `onyx-server.prev-0.8.0-8359a7e59f0d` in each run
+6900. The previous image is `onyx-server.prev-0.8.0-b785e99cf0c7` in each run
 directory, SHA-256
-`05aaeda7ccded81476341d6496f9a32257395293d38ceb85a0aedce786dbb43c`.
+`3667c44a37e46346d6401abb5e271eb3d7d82102f28eff95147cfdad53743234`.
 `--check-config` passed on both live TOML files before the restarts. Mesh
 health reported `links_active=1`, `peers_up=1`, and `partitioned=0` on both
 nodes. ircx.us logged `mesh S2S established (secured) peer=eshmaki.me`. The
