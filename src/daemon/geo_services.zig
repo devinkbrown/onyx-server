@@ -6,8 +6,9 @@
 //! A single dedicated OS thread owns all outbound HTTP (via `http_fetch`, which
 //! never touches the reactor io_uring); reactor threads only ever read/write the
 //! mutex-guarded cache. A request that misses or finds a stale entry enqueues a
-//! refresh job and returns "not ready" so the caller can say *"fetching… try
-//! again"* — the classic fantasy-bot behaviour, but in-process.
+//! refresh job and returns "not ready". The caller keeps the channel and place,
+//! and `fetch_done` wakes the reactor when that job finishes so the same
+//! command can be answered once. The reactor never blocks on the fetch.
 //!
 //!   * Weather: wttr.in (plain HTTP, no key); cached metric reading re-localized
 //!     per the requesting user's country at serve time.
@@ -179,6 +180,11 @@ pub const Service = struct {
     job_head: usize = 0,
     job_tail: usize = 0,
     job_count: usize = 0,
+    /// Reactor poke. The worker calls it after a job settles, outside the cache
+    /// mutex. Null in unit tests that never start the thread. The function may
+    /// only wake a reactor; it must not touch the cache or the world.
+    fetch_done: ?*const fn (*anyopaque) void = null,
+    fetch_done_ctx: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) Service {
         return .{ .allocator = allocator, .opts = opts };
@@ -530,6 +536,45 @@ pub const Service = struct {
         return null;
     }
 
+    /// Cache state for a place, without enqueueing. `inflight` is a queued job
+    /// that has not settled; `failed` is a pending row stamped for retry.
+    pub fn weatherPhase(self: *Service, location: []const u8) CachePhase {
+        if (!self.opts.weather_enabled) return .absent;
+        var keybuf: [max_key]u8 = undefined;
+        const k = normalizeKey(location, &keybuf);
+        if (k.len == 0) return .absent;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const e = self.findWeather(k) orelse return .absent;
+        return phaseOf(e.state, e.fetched_ms);
+    }
+
+    pub fn newsPhase(self: *Service, cache_key: []const u8) CachePhase {
+        if (!self.opts.news_enabled) return .absent;
+        var keybuf: [max_key]u8 = undefined;
+        const k = normalizeKey(cache_key, &keybuf);
+        if (k.len == 0) return .absent;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const e = self.findNews(k) orelse return .absent;
+        return phaseOf(e.state, e.fetched_ms);
+    }
+
+    /// True while a weather job for `location` is queued or the row is the
+    /// in-flight pending state. A ready classic row stays ready during a rich
+    /// upgrade, so the forecast waiter uses this instead of `weatherPhase`.
+    pub fn weatherBusy(self: *Service, location: []const u8) bool {
+        if (!self.opts.weather_enabled) return false;
+        var keybuf: [max_key]u8 = undefined;
+        const k = normalizeKey(location, &keybuf);
+        if (k.len == 0) return false;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.jobAlready(.weather, k)) return true;
+        if (self.findWeather(k)) |e| return e.state == .pending and e.fetched_ms == 0;
+        return false;
+    }
+
     // ---- internals ----------------------------------------------------------
 
     fn findWeather(self: *Service, k: []const u8) ?*WeatherEntry {
@@ -647,7 +692,14 @@ pub const Service = struct {
                 .weather => self.fetchWeather(job.key()),
                 .news => self.fetchNews(job.key()),
             }
+            self.noteFetchDone();
         }
+    }
+
+    fn noteFetchDone(self: *Service) void {
+        const hook = self.fetch_done orelse return;
+        const ctx = self.fetch_done_ctx orelse return;
+        hook(ctx);
     }
 
     /// Pop the next queued job (mutex-guarded), or null if the queue is empty.
@@ -844,7 +896,50 @@ pub const Service = struct {
             },
         }
     }
+
+    /// Install a classic ready row. The production daemon does not call this.
+    pub fn testingReadyWeather(self: *Service, location: []const u8, temp_c: f64, wind_kph: f64, desc: []const u8, shown: []const u8) void {
+        if (comptime !@import("builtin").is_test) unreachable;
+        var keybuf: [max_key]u8 = undefined;
+        const k = normalizeKey(location, &keybuf);
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const e = self.reserveWeather(k);
+        e.temp_c = temp_c;
+        e.wind_kph = wind_kph;
+        e.feels_c = 0;
+        e.precip_mm = 0;
+        e.humidity = 0;
+        e.pressure = 0;
+        e.uv = 0;
+        e.visibility = 0;
+        e.flags = 0;
+        e.wind_dir_len = 0;
+        e.day_count = 0;
+        e.loc_len = copyClamp(&e.loc_buf, geo_fetch.clipUtf8(shown, e.loc_buf.len));
+        e.desc_len = copyClamp(&e.desc_buf, geo_fetch.clipUtf8(desc, e.desc_buf.len));
+        e.fetched_ms = stamp(platform.monotonicMillis());
+        e.state = .ready;
+    }
+
+    /// Stamp a pending row the way a failed HTTP fetch does.
+    pub fn testingFailFetch(self: *Service, kind: JobKind, location: []const u8) void {
+        if (comptime !@import("builtin").is_test) unreachable;
+        var keybuf: [max_key]u8 = undefined;
+        const k = normalizeKey(location, &keybuf);
+        self.noteFetchFailure(kind, k);
+    }
 };
+
+pub const CachePhase = enum { absent, inflight, failed, ready };
+
+fn phaseOf(state: State, fetched_ms: i64) CachePhase {
+    return switch (state) {
+        .empty => .absent,
+        .ready => .ready,
+        .pending => if (fetched_ms == 0) .inflight else .failed,
+    };
+}
 
 /// Map a cache key ("src:bbc"/"cc:us") to its file stem ("src_bbc"/"cc_us").
 fn fileKey(k: []const u8, buf: []u8) []const u8 {
@@ -1143,6 +1238,34 @@ test "failed weather fetch retries after the backoff and keeps a ready row" {
     }
     const served = svc.getWeather("Austin", &scratch).?;
     try std.testing.expectEqual(@as(f64, 22), served.reading.temp_c);
+}
+
+test "weather phase is in flight, then failed, then ready" {
+    var svc = Service.init(std.testing.allocator, .{});
+    try std.testing.expectEqual(CachePhase.absent, svc.weatherPhase("seattle"));
+    var scratch = WeatherScratch{};
+    try std.testing.expect(svc.getWeather("Seattle", &scratch) == null);
+    try std.testing.expectEqual(CachePhase.inflight, svc.weatherPhase("seattle"));
+    try std.testing.expect(svc.weatherBusy("Seattle"));
+    const job = svc.takeJob().?;
+    // The row stays in flight until the fetch stores a reading or stamps failure.
+    try std.testing.expect(svc.weatherBusy("seattle"));
+    svc.noteFetchFailure(.weather, job.key());
+    try std.testing.expect(!svc.weatherBusy("Seattle"));
+    try std.testing.expectEqual(CachePhase.failed, svc.weatherPhase("Seattle"));
+    svc.testingReadyWeather("Seattle", 22, 20, "Partly cloudy", "Seattle");
+    try std.testing.expectEqual(CachePhase.ready, svc.weatherPhase("seattle"));
+    var notes: usize = 0;
+    svc.fetch_done_ctx = &notes;
+    svc.fetch_done = struct {
+        fn bump(ctx: *anyopaque) void {
+            const n: *usize = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+        }
+    }.bump;
+    svc.noteFetchDone();
+    svc.noteFetchDone();
+    try std.testing.expectEqual(@as(usize, 2), notes);
 }
 
 test "classic weather row is served and queued for one rich refresh" {

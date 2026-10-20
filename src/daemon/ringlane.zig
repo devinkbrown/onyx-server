@@ -3,14 +3,19 @@
 
 //! Ringlane submission and completion.
 //!
-//! Linux io_uring only. The production ring lives here; `substrate/io/ring.zig`
-//! stays the unfinished prototype and is not this backend.
+//! Linux io_uring only. The production ring lives here. `substrate/io/ring.zig`
+//! is the same shape of prototype and is not this backend.
 //!
 //! The live ring probes multishot accept and multishot wake-poll, sizes the
 //! completion queue for a full reactor batch, and arms cooperative task-work.
 //! `IORING_SETUP_DEFER_TASKRUN` and `IORING_SETUP_SINGLE_ISSUER` are never
-//! requested. Recv and send stay one-shot: the connection buffer is released
-//! on the first CQE, which is the Helix snapshot point.
+//! requested. When a provided-buffer group is installed, multishot recv selects
+//! from that group. The daemon copies those bytes into the connection buffer
+//! before parse or a Helix snapshot, then replenishes the slice. Zero-copy send
+//! keeps the send buffer until `IORING_CQE_F_NOTIF`. Copy recv and copy send
+//! stay available for kTLS and for a ring with no group. Fixed files are
+//! implemented here and are not used on the connection path: registration idles
+//! the ring, and Helix inherits raw fds. `buf_ring.registerAll` stays pure.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,6 +23,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 const IoUring = linux.IoUring;
+const buf_ring = @import("../substrate/io/buf_ring.zig");
 
 pub const default_cqe_batch: usize = 256;
 pub const max_cqe_batch: usize = 4096;
@@ -111,6 +117,9 @@ pub const RecvEvent = struct {
     token: FdToken,
     res: i32,
     more: bool,
+    /// Set only when the kernel selected a provided buffer. A copy recv leaves
+    /// this null so the caller buffer is the payload.
+    buffer_id: ?u16 = null,
 };
 
 pub const SendEvent = struct {
@@ -118,6 +127,11 @@ pub const SendEvent = struct {
     res: i32,
     more: bool,
     notif: bool,
+
+    /// True only on the zero-copy notification that releases the send buffer.
+    pub fn bufferReleased(self: SendEvent) bool {
+        return self.notif;
+    }
 };
 
 pub const ConnectEvent = struct {
@@ -141,13 +155,25 @@ pub const Completion = union(OpKind) {
     poll: PollEvent,
 };
 
+/// Upper 16 bits of the CQE flags are a provided-buffer id only when
+/// `IORING_CQE_F_BUFFER` is set. A copy completion must stay null.
+fn providedBufferId(cqe: linux.io_uring_cqe) ?u16 {
+    if ((cqe.flags & linux.IORING_CQE_F_BUFFER) == 0) return null;
+    return @intCast(cqe.flags >> linux.IORING_CQE_BUFFER_SHIFT);
+}
+
 fn decodeCompletion(cqe: linux.io_uring_cqe) error{UnknownOpKind}!Completion {
     const ud = try decodeUserData(cqe.user_data);
     const more = (cqe.flags & linux.IORING_CQE_F_MORE) != 0;
     return switch (ud.kind) {
         .other => .{ .other = {} },
         .accept => .{ .accept = .{ .token = ud.token, .res = cqe.res, .more = more } },
-        .recv => .{ .recv = .{ .token = ud.token, .res = cqe.res, .more = more } },
+        .recv => .{ .recv = .{
+            .token = ud.token,
+            .res = cqe.res,
+            .more = more,
+            .buffer_id = providedBufferId(cqe),
+        } },
         .send => .{ .send = .{
             .token = ud.token,
             .res = cqe.res,
@@ -352,11 +378,36 @@ fn openInner(entries: u16, features: RingFeatures) !IoUring {
     return error.ArgumentsInvalid;
 }
 
+/// Provided-buffer group size for `clients` connections. Multishot recv can
+/// take a second buffer before userspace replenishes, so the group is at least
+/// twice the connection cap, rounded up to a power of two, and never above the
+/// kernel's provided-buffer ceiling.
+pub fn bufferGroupCount(clients: u32) u16 {
+    const doubled: u32 = if (clients > (std.math.maxInt(u32) / 2)) std.math.maxInt(u32) else clients * 2;
+    const want: u32 = if (doubled < 2) 2 else doubled;
+    var rounded: u32 = 1;
+    while (rounded < want) {
+        if (rounded >= buf_ring.max_buffer_count) return buf_ring.max_buffer_count;
+        rounded <<= 1;
+    }
+    if (rounded > buf_ring.max_buffer_count) return buf_ring.max_buffer_count;
+    return @intCast(rounded);
+}
+
 pub const Ring = struct {
     inner: IoUring,
     features: RingFeatures,
-    accept_multishot: bool,
-    poll_multishot: bool,
+    accept_multishot: bool = false,
+    poll_multishot: bool = false,
+    provided: ?buf_ring.LiveBufRing = null,
+    provided_len: u32 = 0,
+    provided_group: u16 = 0,
+    fixed_count: u32 = 0,
+    /// Caller-owned slice table, or the table owned by `pool_allocator`.
+    external_slices: ?[][]u8 = null,
+    pool_mem: ?[]u8 = null,
+    pool_slices: ?[][]u8 = null,
+    pool_allocator: ?std.mem.Allocator = null,
 
     pub fn init(entries: u16, features: RingFeatures) !Ring {
         const probed = ensureProbes();
@@ -369,7 +420,42 @@ pub const Ring = struct {
     }
 
     pub fn deinit(self: *Ring) void {
+        if (comptime builtin.os.tag == .linux) {
+            if (self.provided) |*live| live.deinit();
+        }
+        self.provided = null;
+        self.provided_len = 0;
+        self.provided_group = 0;
+        if (self.fixed_count != 0) {
+            self.inner.unregister_files() catch {};
+            self.fixed_count = 0;
+        }
         self.inner.deinit();
+        const allocator = self.pool_allocator;
+        if (self.pool_slices) |slices| {
+            if (allocator) |alloc| alloc.free(slices);
+            self.pool_slices = null;
+        }
+        if (self.pool_mem) |mem| {
+            if (allocator) |alloc| alloc.free(mem);
+            self.pool_mem = null;
+        }
+        self.pool_allocator = null;
+        self.external_slices = null;
+    }
+
+    pub fn hasProvidedGroup(self: *const Ring) bool {
+        return self.provided != null;
+    }
+
+    pub fn providedGroup(self: *const Ring) u16 {
+        return self.provided_group;
+    }
+
+    pub fn providedSlice(self: *const Ring, buffer_id: u16) ?[]u8 {
+        const slices = self.external_slices orelse return null;
+        if (buffer_id >= slices.len) return null;
+        return slices[buffer_id];
     }
 
     fn flushOverflow(self: *Ring) !void {
@@ -420,8 +506,9 @@ pub const Ring = struct {
         }
     }
 
-    /// One-shot into the caller buffer. A multishot or provided-buffer recv
-    /// would still own that memory after the CQE Helix snapshots.
+    /// One-shot copy into the caller buffer. The kernel writes `buffer`, and
+    /// the matching CQE releases it. Multishot and provided-buffer recv use
+    /// `submitRecvMultishot` so a Helix snapshot never aliases pool memory.
     pub fn submitRecv(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []u8) !void {
         _ = try self.inner.recv(try encodeUserData(.recv, token), fd, .{ .buffer = buffer }, 0);
     }
@@ -430,10 +517,159 @@ pub const Ring = struct {
         _ = try self.inner.connect(try encodeUserData(.connect, token), fd, addr, addrlen);
     }
 
-    /// Copy send. A zero-copy send posts a later `IORING_CQE_F_NOTIF`, and
-    /// the daemon releases the send buffer on the first completion.
+    /// Copy send. The one completion releases `buffer`. A zero-copy send is
+    /// `submitSendZc` and stays owned until the notification CQE.
     pub fn submitSend(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []const u8) !void {
         _ = try self.inner.send(try encodeUserData(.send, token), fd, buffer, 0);
+    }
+
+    fn bufferCap(buffers: []const []u8) error{ EmptyBuffer, BufferTooLarge }!u32 {
+        var cap: u32 = std.math.maxInt(u32);
+        for (buffers) |buffer| {
+            if (buffer.len == 0) return error.EmptyBuffer;
+            if (buffer.len > std.math.maxInt(u32)) return error.BufferTooLarge;
+            const n: u32 = @intCast(buffer.len);
+            if (n < cap) cap = n;
+        }
+        return cap;
+    }
+
+    /// Register one provided-buffer group and publish every caller slice.
+    /// One group per ring. `buffers` must stay live until each selected buffer
+    /// is replenished or the ring is torn down. `buffers.len` is a non-zero
+    /// power of two no larger than `buf_ring.max_buffer_count`.
+    pub fn registerProvidedBuffers(self: *Ring, group_id: u16, buffers: [][]u8) !void {
+        if (comptime builtin.os.tag != .linux) return error.FeatureNotEnabled;
+        if (!self.features.buf_ring) return error.FeatureNotEnabled;
+        if (self.provided != null) return error.AlreadyRegistered;
+        if (buffers.len == 0 or buffers.len > buf_ring.max_buffer_count) return error.EntriesNotInRange;
+        if (!std.math.isPowerOfTwo(buffers.len)) return error.EntriesNotPowerOfTwo;
+        const cap = try bufferCap(buffers);
+        const entries: u16 = @intCast(buffers.len);
+        if (comptime builtin.os.tag == .linux) {
+            var live = try buf_ring.LiveBufRing.init(&self.inner, entries, group_id);
+            errdefer live.deinit();
+            for (buffers, 0..) |buffer, id| {
+                try live.publish(buffer, @intCast(id));
+            }
+            self.provided = live;
+            self.provided_len = cap;
+            self.provided_group = group_id;
+            self.external_slices = buffers;
+        }
+    }
+
+    /// Allocate `count` buffers of `stride` bytes, register them as one group,
+    /// and free them from `Ring.deinit`. A failed install leaves the ring on
+    /// the copy path.
+    pub fn installOwnedBuffers(
+        self: *Ring,
+        allocator: std.mem.Allocator,
+        count: u16,
+        stride: usize,
+        group_id: u16,
+    ) !void {
+        if (comptime builtin.os.tag != .linux) return error.FeatureNotEnabled;
+        if (!self.features.buf_ring) return error.FeatureNotEnabled;
+        if (self.provided != null or self.pool_allocator != null) return error.AlreadyRegistered;
+        if (count == 0 or count > buf_ring.max_buffer_count) return error.EntriesNotInRange;
+        if (!std.math.isPowerOfTwo(count)) return error.EntriesNotPowerOfTwo;
+        if (stride == 0 or stride > std.math.maxInt(u32)) return error.BufferTooLarge;
+        const bytes_len = std.math.mul(usize, count, stride) catch return error.BufferTooLarge;
+        const bytes = try allocator.alloc(u8, bytes_len);
+        errdefer allocator.free(bytes);
+        const slices = try allocator.alloc([]u8, count);
+        errdefer allocator.free(slices);
+        for (slices, 0..) |*slot, index| {
+            const start = index * stride;
+            slot.* = bytes[start..][0..stride];
+        }
+        try self.registerProvidedBuffers(group_id, slices);
+        self.pool_mem = bytes;
+        self.pool_slices = slices;
+        self.pool_allocator = allocator;
+    }
+
+    /// Publish one used buffer back into the registered group. `buffer` must
+    /// be the slice the kernel selected for `buffer_id`.
+    pub fn replenishProvidedBuffer(self: *Ring, buffer: []u8, buffer_id: u16) !void {
+        if (comptime builtin.os.tag != .linux) return error.FeatureNotEnabled;
+        if (!self.features.buf_ring) return error.FeatureNotEnabled;
+        if (comptime builtin.os.tag == .linux) {
+            if (self.provided) |*live| {
+                try live.publish(buffer, buffer_id);
+                return;
+            }
+        }
+        return error.NotRegistered;
+    }
+
+    fn groupMatches(self: *const Ring, group_id: u16) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        if (comptime builtin.os.tag == .linux) {
+            const live = self.provided orelse return false;
+            return live.group_id == group_id;
+        }
+        return false;
+    }
+
+    /// Arm a one-shot recv that selects from the registered group.
+    pub fn submitRecvBufRing(self: *Ring, token: FdToken, fd: linux.fd_t, group_id: u16) !void {
+        if (!self.features.buf_ring) return error.FeatureNotEnabled;
+        if (self.provided == null or !self.groupMatches(group_id)) return error.NotRegistered;
+        _ = try self.inner.recv(try encodeUserData(.recv, token), fd, .{ .buffer_selection = .{
+            .group_id = group_id,
+            .len = self.provided_len,
+        } }, 0);
+    }
+
+    /// Arm a multishot recv that keeps selecting from the registered group.
+    /// Each data completion keeps `more` set until cancel, close, or an empty
+    /// group. Does not submit.
+    pub fn submitRecvMultishot(self: *Ring, token: FdToken, fd: linux.fd_t, group_id: u16) !void {
+        if (!self.features.multishot_recv or !self.features.buf_ring) return error.FeatureNotEnabled;
+        if (self.provided == null or !self.groupMatches(group_id)) return error.NotRegistered;
+        const sqe = try self.inner.recv(try encodeUserData(.recv, token), fd, .{ .buffer_selection = .{
+            .group_id = group_id,
+            .len = self.provided_len,
+        } }, 0);
+        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+    }
+
+    /// Install one fixed file table. Later submits address a slot by index.
+    /// Not used for accepted connections: the call waits for the ring to idle,
+    /// and a Helix successor receives the raw fd.
+    pub fn registerFixedFiles(self: *Ring, fds: []const linux.fd_t) !void {
+        if (!self.features.fixed_files) return error.FeatureNotEnabled;
+        if (self.fixed_count != 0) return error.AlreadyRegistered;
+        if (fds.len == 0 or fds.len > std.math.maxInt(u32)) return error.EntriesNotInRange;
+        try self.inner.register_files(fds);
+        self.fixed_count = @intCast(fds.len);
+    }
+
+    fn fixedFd(self: *Ring, index: u32) error{ FeatureNotEnabled, NotRegistered, FileIndexOutOfRange }!linux.fd_t {
+        if (!self.features.fixed_files) return error.FeatureNotEnabled;
+        if (self.fixed_count == 0) return error.NotRegistered;
+        if (index >= self.fixed_count) return error.FileIndexOutOfRange;
+        return @intCast(index);
+    }
+
+    pub fn submitSendFixed(self: *Ring, token: FdToken, index: u32, buffer: []const u8) !void {
+        const fd = try self.fixedFd(index);
+        const sqe = try self.inner.send(try encodeUserData(.send, token), fd, buffer, 0);
+        sqe.flags |= linux.IOSQE_FIXED_FILE;
+    }
+
+    pub fn submitRecvFixed(self: *Ring, token: FdToken, index: u32, buffer: []u8) !void {
+        const fd = try self.fixedFd(index);
+        const sqe = try self.inner.recv(try encodeUserData(.recv, token), fd, .{ .buffer = buffer }, 0);
+        sqe.flags |= linux.IOSQE_FIXED_FILE;
+    }
+
+    /// Queue a zero-copy send. `buffer` stays owned until the notification CQE.
+    pub fn submitSendZc(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []const u8) !void {
+        if (!self.features.send_zc) return error.FeatureNotEnabled;
+        _ = try self.inner.send_zc(try encodeUserData(.send, token), fd, buffer, 0, 0);
     }
 
     /// Cancel one exact-generation socket operation by the same `user_data`
@@ -558,6 +794,7 @@ test "GAP-X2 ringlane submission identity round-trips and completions keep their
         .send => |ev| {
             try std.testing.expect(ev.more);
             try std.testing.expect(ev.notif);
+            try std.testing.expect(ev.bufferReleased());
             try std.testing.expectEqual(@as(i32, -11), ev.res);
             try std.testing.expectEqual(token.slot, ev.token.slot);
             try std.testing.expectEqual(token.gen, ev.token.gen);
@@ -571,6 +808,7 @@ test "GAP-X2 ringlane submission identity round-trips and completions keep their
         .recv => |ev| {
             try std.testing.expect(ev.more);
             try std.testing.expectEqual(@as(i32, 4), ev.res);
+            try std.testing.expectEqual(@as(?u16, null), ev.buffer_id);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -726,4 +964,255 @@ test "ringlane: multishot accept keeps CLOEXEC and cancels without a further con
         return error.TestUnexpectedResult;
     }
     std.debug.print("ringlane: multishot accept kept CLOEXEC across two connections and cancel stopped the arm; cq={d}\n", .{ring.inner.cq.cqes.len});
+}
+
+test "ringlane buffer group count is two connections rounded up and capped" {
+    try std.testing.expectEqual(@as(u16, 2), bufferGroupCount(0));
+    try std.testing.expectEqual(@as(u16, 2), bufferGroupCount(1));
+    try std.testing.expectEqual(@as(u16, 2048), bufferGroupCount(1024));
+    try std.testing.expectEqual(buf_ring.max_buffer_count, bufferGroupCount(20_000));
+    try std.testing.expectEqual(buf_ring.max_buffer_count, bufferGroupCount(std.math.maxInt(u32)));
+}
+
+test "ringlane provided buffers, zero-copy send, and fixed files" {
+    if (comptime builtin.os.tag != .linux) return;
+    const recv_token = FdToken{ .slot = 4, .gen = 2 };
+    var disabled: Ring = .{ .inner = undefined, .features = .{} };
+    var none: [0][]u8 = .{};
+    try std.testing.expectError(error.FeatureNotEnabled, disabled.registerProvidedBuffers(1, &none));
+    try std.testing.expectError(error.FeatureNotEnabled, disabled.submitRecvBufRing(recv_token, 0, 1));
+    try std.testing.expectError(error.FeatureNotEnabled, disabled.submitRecvMultishot(recv_token, 0, 1));
+    try std.testing.expectError(error.FeatureNotEnabled, disabled.submitSendZc(recv_token, 0, "x"));
+    var no_files: [0]linux.fd_t = .{};
+    try std.testing.expectError(error.FeatureNotEnabled, disabled.registerFixedFiles(&no_files));
+    var unregistered: Ring = .{ .inner = undefined, .features = .{ .buf_ring = true, .multishot_recv = true, .fixed_files = true } };
+    try std.testing.expectError(error.NotRegistered, unregistered.submitRecvMultishot(recv_token, 0, 1));
+    try std.testing.expectError(error.NotRegistered, unregistered.submitSendFixed(recv_token, 0, "x"));
+
+    var ring = Ring.init(32, .{ .buf_ring = true, .multishot_recv = true, .send_zc = true, .fixed_files = true }) catch |err| {
+        if (isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    defer ring.deinit();
+    try std.testing.expect((ring.inner.flags & linux.IORING_SETUP_DEFER_TASKRUN) == 0);
+    try std.testing.expect((ring.inner.flags & linux.IORING_SETUP_SINGLE_ISSUER) == 0);
+    try std.testing.expectError(error.EntriesNotInRange, ring.registerProvidedBuffers(1, &none));
+    var odd_a: [4]u8 = @splat(1);
+    var odd_b: [4]u8 = @splat(2);
+    var odd_c: [4]u8 = @splat(3);
+    var odd = [_][]u8{ &odd_a, &odd_b, &odd_c };
+    try std.testing.expectError(error.EntriesNotPowerOfTwo, ring.registerProvidedBuffers(1, &odd));
+
+    var storage: [32]u8 = @splat(0xA5);
+    var slices = [_][]u8{&storage};
+    ring.registerProvidedBuffers(1, &slices) catch |err| {
+        if (isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    try std.testing.expect(ring.hasProvidedGroup());
+    try std.testing.expectEqual(@as(u16, 1), ring.providedGroup());
+    const pair = linuxSocketPair() orelse return error.SkipZigTest;
+    defer closeFdPair(pair);
+    try std.testing.expectError(error.NotRegistered, ring.submitRecvMultishot(recv_token, pair[1], 9));
+    try ring.submitRecvMultishot(recv_token, pair[1], 1);
+    try writeFdAll(pair[0], "one!");
+    const first = try reapOneRecv(&ring, recv_token);
+    try std.testing.expectEqual(@as(i32, 4), first.res);
+    try std.testing.expect(first.more);
+    const id = first.buffer_id orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 0), id);
+    try std.testing.expectEqualSlices(u8, "one!", storage[0..4]);
+    const view = ring.providedSlice(id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, "one!", view[0..4]);
+    @memset(storage[0..], 0xA5);
+    try ring.replenishProvidedBuffer(view, id);
+    try writeFdAll(pair[0], "two!");
+    const second = try reapOneRecv(&ring, recv_token);
+    try std.testing.expectEqual(@as(i32, 4), second.res);
+    try std.testing.expect(second.more);
+    try std.testing.expectEqual(@as(?u16, id), second.buffer_id);
+    try std.testing.expectEqualSlices(u8, "two!", storage[0..4]);
+    try ring.submitExactCancel(.recv, recv_token);
+    const canceled = try reapOneRecv(&ring, recv_token);
+    try std.testing.expect(isErrno(canceled.res, .CANCELED));
+    try std.testing.expect(!canceled.more);
+
+    const listener = listenLoopback() orelse return error.SkipZigTest;
+    defer _ = linux.close(listener.fd);
+    const client = connectLoopback(listener.port) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(client);
+    const accepted_rc = linux.accept4(listener.fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+    if (posix.errno(accepted_rc) != .SUCCESS) return error.TestUnexpectedResult;
+    const accepted: linux.fd_t = @intCast(accepted_rc);
+    defer _ = linux.close(accepted);
+    const enable: u32 = 1;
+    _ = linux.setsockopt(client, posix.SOL.SOCKET, linux.SO.ZEROCOPY, std.mem.asBytes(&enable), @sizeOf(u32));
+    const payload = "zc-send";
+    const send_token = FdToken{ .slot = 6, .gen = 2 };
+    try ring.submitSendZc(send_token, client, payload);
+    const sent = try reapSendPair(&ring, send_token);
+    try std.testing.expectEqual(@as(i32, payload.len), sent.bytes.res);
+    try std.testing.expect(!sent.bytes.bufferReleased());
+    try std.testing.expect(sent.bytes.more);
+    try std.testing.expect(sent.released.bufferReleased());
+    try std.testing.expectEqual(@as(i32, 0), sent.released.res);
+    var got: [16]u8 = @splat(0);
+    var n: usize = 0;
+    var reads: u8 = 0;
+    while (reads < 8) : (reads += 1) {
+        const rc = linux.read(accepted, got[0..].ptr, payload.len);
+        if (posix.errno(rc) == .SUCCESS) {
+            n = rc;
+            break;
+        }
+        if (posix.errno(rc) != .AGAIN) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(payload.len, n);
+    try std.testing.expectEqualSlices(u8, payload, got[0..payload.len]);
+
+    try std.testing.expectError(error.EntriesNotInRange, ring.registerFixedFiles(&no_files));
+    ring.registerFixedFiles(&pair) catch |err| {
+        if (isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    try std.testing.expectError(error.AlreadyRegistered, ring.registerFixedFiles(&pair));
+    try std.testing.expectError(error.FileIndexOutOfRange, ring.submitSendFixed(send_token, 2, "x"));
+    const fixed_send = FdToken{ .slot = 8, .gen = 2 };
+    const fixed_recv = FdToken{ .slot = 9, .gen = 2 };
+    var fixed_buf: [16]u8 = @splat(0xA5);
+    try ring.submitSendFixed(fixed_send, 0, "fixed");
+    try ring.submitRecvFixed(fixed_recv, 1, &fixed_buf);
+    const fixed = try reapFixedExchange(&ring, fixed_send, fixed_recv);
+    try std.testing.expectEqual(@as(i32, 5), fixed.send.res);
+    try std.testing.expectEqual(@as(i32, 5), fixed.recv.res);
+    try std.testing.expect(!fixed.recv.more);
+    try std.testing.expectEqualSlices(u8, "fixed", fixed_buf[0..5]);
+
+    var owned = Ring.init(8, .{ .buf_ring = true }) catch |err| {
+        if (isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    defer owned.deinit();
+    try owned.installOwnedBuffers(std.testing.allocator, bufferGroupCount(2), 32, 7);
+    try std.testing.expect(owned.hasProvidedGroup());
+    try std.testing.expectEqual(@as(u16, 4), bufferGroupCount(2));
+    try std.testing.expect(owned.providedSlice(0) != null);
+    try std.testing.expect(owned.providedSlice(3) != null);
+    try std.testing.expect(owned.providedSlice(4) == null);
+}
+
+const SendPair = struct { bytes: SendEvent, released: SendEvent };
+const FixedExchange = struct { send: SendEvent, recv: RecvEvent };
+
+fn linuxSocketPair() ?[2]linux.fd_t {
+    if (comptime builtin.os.tag != .linux) return null;
+    var pair: [2]linux.fd_t = undefined;
+    const opened = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &pair);
+    if (posix.errno(opened) != .SUCCESS) return null;
+    return pair;
+}
+
+fn closeFdPair(pair: [2]linux.fd_t) void {
+    if (comptime builtin.os.tag != .linux) return;
+    _ = linux.close(pair[0]);
+    _ = linux.close(pair[1]);
+}
+
+fn writeFdAll(fd: linux.fd_t, payload: []const u8) !void {
+    if (comptime builtin.os.tag != .linux) return;
+    const wrote = linux.write(fd, payload.ptr, payload.len);
+    if (posix.errno(wrote) != .SUCCESS or wrote != payload.len) return error.TestUnexpectedResult;
+}
+
+fn reapOneRecv(ring: *Ring, token: FdToken) !RecvEvent {
+    const Sink = struct {
+        token: FdToken,
+        event: ?RecvEvent = null,
+        fn onCompletion(self: *@This(), completion: Completion) void {
+            switch (completion) {
+                .recv => |ev| {
+                    if (self.event == null and ev.token.slot == self.token.slot and ev.token.gen == self.token.gen) {
+                        self.event = ev;
+                    }
+                },
+                else => {},
+            }
+        }
+    };
+    var sink = Sink{ .token = token };
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var spins: u8 = 0;
+    while (sink.event == null and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        try ring.reapCompletions(&cqes, 0, &sink);
+    }
+    return sink.event orelse error.TestUnexpectedResult;
+}
+
+fn reapSendPair(ring: *Ring, token: FdToken) !SendPair {
+    const Sink = struct {
+        token: FdToken,
+        sent: ?SendEvent = null,
+        released: ?SendEvent = null,
+        fn onCompletion(self: *@This(), completion: Completion) void {
+            switch (completion) {
+                .send => |ev| {
+                    if (ev.token.slot != self.token.slot or ev.token.gen != self.token.gen) return;
+                    if (ev.bufferReleased()) {
+                        self.released = ev;
+                    } else if (self.sent == null) {
+                        self.sent = ev;
+                    }
+                },
+                else => {},
+            }
+        }
+    };
+    var sink = Sink{ .token = token };
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var spins: u8 = 0;
+    while ((sink.sent == null or sink.released == null) and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        try ring.reapCompletions(&cqes, 0, &sink);
+    }
+    return .{
+        .bytes = sink.sent orelse return error.TestUnexpectedResult,
+        .released = sink.released orelse return error.TestUnexpectedResult,
+    };
+}
+
+fn reapFixedExchange(ring: *Ring, send_token: FdToken, recv_token: FdToken) !FixedExchange {
+    const Sink = struct {
+        send_token: FdToken,
+        recv_token: FdToken,
+        sent: ?SendEvent = null,
+        got: ?RecvEvent = null,
+        fn onCompletion(self: *@This(), completion: Completion) void {
+            switch (completion) {
+                .send => |ev| {
+                    if (self.sent == null and ev.token.slot == self.send_token.slot and ev.token.gen == self.send_token.gen) {
+                        self.sent = ev;
+                    }
+                },
+                .recv => |ev| {
+                    if (self.got == null and ev.token.slot == self.recv_token.slot and ev.token.gen == self.recv_token.gen) {
+                        self.got = ev;
+                    }
+                },
+                else => {},
+            }
+        }
+    };
+    var sink = Sink{ .send_token = send_token, .recv_token = recv_token };
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var spins: u8 = 0;
+    while ((sink.sent == null or sink.got == null) and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        try ring.reapCompletions(&cqes, 0, &sink);
+    }
+    return .{
+        .send = sink.sent orelse return error.TestUnexpectedResult,
+        .recv = sink.got orelse return error.TestUnexpectedResult,
+    };
 }

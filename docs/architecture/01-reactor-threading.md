@@ -2,7 +2,7 @@
 
 _The live Ringlane io_uring reactor, per-reactor connection state, worker shards, cross-shard delivery, world locking, and the live multithreading status._
 
-The production Linux ring is `src/daemon/ringlane.zig`. The daemon imports it at `src/daemon/server.zig:981`, and `src/daemon/reactor_backend.zig` selects `ringlane.Ring` on Linux. `src/substrate/io/ring.zig` is an unfinished prototype. It does not connect, poll, or cancel, and it is not the daemon backend. `src/substrate/reactor.zig` is the separate clock seam. Its header still treats submit, poll, accept, recv, and send as future work for that seam.
+The production Linux ring is `src/daemon/ringlane.zig`. The daemon imports it at `src/daemon/server.zig:981`, and `src/daemon/reactor_backend.zig` selects `ringlane.Ring` on Linux. `src/substrate/io/ring.zig` is the same shape of prototype and is not the daemon backend. The production ring sizes the completion queue to at least 256 and requests cooperative task-work. Accept passes `SOCK_CLOEXEC`. It never requests `DEFER_TASKRUN` or `SINGLE_ISSUER`. On Linux each reactor installs one provided-buffer group and arms multishot recv. The completion is copied into the connection buffer before parse or a Helix snapshot, and the pool slice is replenished. Sends are zero-copy except kTLS TX, and the send buffer stays owned until the notification completion. Fixed files are implemented and are not registered for accepted sockets. `registerAll` stays pure bookkeeping. `src/substrate/reactor.zig` is the separate clock seam. Its header still treats submit, poll, accept, recv, and send as future work for that seam.
 
 The socket path is unchanged: accept TCP, receive IRC bytes through the ring, feed complete LF-terminated lines into the command core, and send queued replies back through the ring.
 
@@ -19,14 +19,14 @@ This section is the 2026-10-17 source contract. It is not a green full-suite res
 | SQPOLL | Opt-in through `[io].sqpoll`. The flag stays on every ladder attempt until the kernel returns `ArgumentsInvalid`. | `src/daemon/ringlane.zig:321` |
 | Accept | Multishot accept with `SOCK_CLOEXEC` when the probe succeeded. The arm stays up while `IORING_CQE_F_MORE` is set and clears on the terminal completion. | `src/daemon/ringlane.zig:404` |
 | Wake poll | Multishot poll on the reactor eventfd when the probe succeeded. `wake_armed` clears only when MORE is clear. Each completion drains the eventfd. | `src/daemon/ringlane.zig:465`, `src/daemon/server.zig:8375`, `src/daemon/server.zig:8415` |
-| Recv and send | One-shot copy operations. The first completion releases the connection buffer and is the Helix snapshot point. Multishot recv, zero-copy send, provided-buffer rings, and fixed files are not on this path. | `src/daemon/ringlane.zig:12` |
+| Recv and send | Linux with a provided-buffer group uses multishot recv. The bytes are copied into `recv_buf` and the pool slice is replenished before the latch drops. `recv_armed` stays set while `IORING_CQE_F_MORE` is set. `ENOBUFS` rearms instead of closing. Zero-copy send keeps `send_armed` until `IORING_CQE_F_NOTIF`. kTLS stays on one-shot copy recv and send. Fixed files are not on this path. | `src/daemon/ringlane.zig:12`, `src/daemon/server.zig:17125` |
 | Overflow | Submit flushes `IORING_SQ_CQ_OVERFLOW` and retries once when the completion queue is overcommitted. | `src/daemon/ringlane.zig:380` |
 | Listener adoption | Shard 0, when `s2s_port` is not 0, dups an inherited S2S listener and adopts that fd. The caller keeps the original. Port 0 still means no S2S listener. | `src/daemon/server.zig:2316`, `src/daemon/server.zig:5548`, `src/daemon/server.zig:124254` |
 | World lock | Completions are handled under the shared world write lock. Reactors parallelize I/O and serialize command processing. | `src/daemon/server.zig:9907` |
 
 `[io].defer_taskrun` remains a parsed key. `--check-config` still rejects it together with `sqpoll`. That rejection does not mean the live ring arms deferred task-run.
 
-`src/substrate/io/buf_ring.zig` is provided-buffer bookkeeping for the prototype. The daemon does not register a buffer ring.
+`src/substrate/io/buf_ring.zig` keeps pure provided-buffer bookkeeping. `registerAll` does not call the kernel. The production ring registers one group through `LiveBufRing` when Linux boot sets `buf_ring`. A kernel that rejects the group leaves that reactor on copy recv. The group is at least twice `max_clients`, rounded up to a power of two, and capped at 32768 entries of `default_recv_bytes`.
 
 Line numbers in the sections below were taken against an older `server.zig`. Read the named symbol before trusting a citation there. The threading model those sections describe is still the model: one reactor owns its ring, clients, and listener fds; another reactor does not touch those fds.
 

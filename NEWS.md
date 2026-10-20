@@ -40,13 +40,20 @@ note as acceptance.
 - **Ringlane.** The production ring is `src/daemon/ringlane.zig`. It probes
   multishot accept and multishot wake-poll, sizes the completion queue to at
   least 256 entries, and requests cooperative task-work. It never requests
-  `IORING_SETUP_DEFER_TASKRUN` or `IORING_SETUP_SINGLE_ISSUER`. Recv and send
-  stay one-shot. `[io].defer_taskrun` is parsed and ignored by the ring.
-  `[io].sqpoll` stays opt-in. `src/substrate/io/ring.zig` remains an
-  unfinished prototype.
+  `IORING_SETUP_DEFER_TASKRUN` or `IORING_SETUP_SINGLE_ISSUER`. On Linux the
+  daemon installs one provided-buffer group per reactor and arms multishot
+  recv against it. Each completion is copied into the connection buffer
+  before parse or a Helix snapshot, and the pool slice is replenished.
+  Sends are zero-copy except kTLS TX, and the send buffer stays owned until
+  the notification completion. Copy recv and copy send remain for kTLS and
+  for a kernel that rejects the buffer group. Fixed files are implemented
+  and stay off the connection path. `[io].defer_taskrun` is parsed and
+  ignored by the ring. `[io].sqpoll` stays opt-in.
+  `src/substrate/io/ring.zig` is still not the production backend.
+  `buf_ring.registerAll` stays pure bookkeeping.
 - **Helix capsules unchanged.** Guest identity is runtime-only. The world
   checkpoint stays version 2. No capsule version moves with this manifest bump.
-- **`/INFO`.** The body names Ringlane and the one-shot recv/send rule.
+- **`/INFO`.** The body names Ringlane, multishot recv, and zero-copy send.
 
 ## 0.7.0 (2026-09-04)
 

@@ -9,6 +9,7 @@
 //! conservative — a field is overridden only when the config supplies a
 //! meaningful value, otherwise the caller's defaults stand.
 const std = @import("std");
+const builtin = @import("builtin");
 const dlog = @import("dlog.zig");
 
 const config_format = @import("config_format.zig");
@@ -345,8 +346,17 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     // by config check. `ringlane.Ring.init` does not pass
     // `DEFER_TASKRUN` or `SINGLE_ISSUER`. `sqpoll` is opt-in and falls
     // back only on `error.ArgumentsInvalid`. Do not raise `cqe_batch` here.
+    // Linux arms provided-buffer multishot recv and zero-copy send. Fixed
+    // files stay off: registration idles the ring and Helix inherits raw fds.
+    // Other kernels keep the flags clear so PortableRing.init does not refuse
+    // the daemon.
     out.features.defer_taskrun = cfg.io.defer_taskrun;
     out.features.sqpoll = cfg.io.sqpoll;
+    if (comptime builtin.os.tag == .linux) {
+        out.features.buf_ring = true;
+        out.features.multishot_recv = true;
+        out.features.send_zc = true;
+    }
     out.reg_timeout_penalty = cfg.reputation.registration_timeout_penalty;
     out.clone_refuse_penalty = cfg.reputation.clone_refuse_penalty;
     out.session_max_accounts = cfg.sessions.max_accounts;
@@ -1207,6 +1217,16 @@ test "config text overlays the server config" {
     try testing.expect(!loaded.io.sqpoll);
     try testing.expect(!loaded.config.features.defer_taskrun);
     try testing.expect(!loaded.config.features.sqpoll);
+    try testing.expect(!loaded.config.features.fixed_files);
+    if (comptime builtin.os.tag == .linux) {
+        try testing.expect(loaded.config.features.buf_ring);
+        try testing.expect(loaded.config.features.multishot_recv);
+        try testing.expect(loaded.config.features.send_zc);
+    } else {
+        try testing.expect(!loaded.config.features.buf_ring);
+        try testing.expect(!loaded.config.features.multishot_recv);
+        try testing.expect(!loaded.config.features.send_zc);
+    }
     try testing.expectEqual(@as(usize, 512), loaded.config.memo_config.max_text_bytes);
     try testing.expectEqual(@as(usize, 48), loaded.config.memo_config.max_from_bytes);
     try testing.expectEqual(@as(usize, 16), loaded.config.memo_config.max_per_account);
@@ -1251,6 +1271,12 @@ test "io defer_taskrun and sqpoll project onto Loaded.io and Config.features wit
     try testing.expect(loaded.io.sqpoll);
     try testing.expect(loaded.config.features.defer_taskrun);
     try testing.expect(loaded.config.features.sqpoll);
+    try testing.expect(!loaded.config.features.fixed_files);
+    if (comptime builtin.os.tag == .linux) {
+        try testing.expect(loaded.config.features.buf_ring);
+        try testing.expect(loaded.config.features.multishot_recv);
+        try testing.expect(loaded.config.features.send_zc);
+    }
     try testing.expectEqual(@as(u16, 256), loaded.config.cqe_batch);
     const why = configCheckError(loaded.io, loaded.tls.ktls) orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, why, "defer_taskrun") != null);

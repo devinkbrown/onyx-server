@@ -473,10 +473,12 @@ reputation_half_life = "1m"    # decay half-life of the reputation penalty
 [io]
 ring_entries = 32      # io_uring SQ entries per reactor (8..4096)
 cqe_batch = 256        # max CQEs reaped per event-loop drain (16..4096)
-# Kernel flags. Default off. defer_taskrun is parsed and then ignored by
-# the live ring: Ring.init never requests DEFER_TASKRUN or SINGLE_ISSUER.
-# Setting it together with sqpoll fails --check-config. sqpoll is opt-in
-# and falls back if the kernel rejects the setup.
+# Kernel flags. defer_taskrun is parsed and then ignored: Ring.init never
+# requests DEFER_TASKRUN or SINGLE_ISSUER. Setting it together with sqpoll
+# fails --check-config. sqpoll is opt-in and falls back if the kernel
+# rejects the setup. On Linux the daemon also arms provided-buffer
+# multishot recv and zero-copy send. Those are not keys. Fixed files stay
+# off, and kTLS stays on the copy path.
 # defer_taskrun = false
 # sqpoll = false         # IORING_SETUP_SQPOLL
 

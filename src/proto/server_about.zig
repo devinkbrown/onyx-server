@@ -65,7 +65,7 @@ pub fn renderInfo(info: AboutInfo, writer: anytype) !void {
     try writer.writeAll("Crypto:   Armor - a from-scratch pure-Zig TLS and primitive library\n");
     try writer.writeAll("Media:    Causeway SFU | CadenceVox/CadenceVis codecs | QUIC/WebTransport transport\n");
     try writer.writeAll("History:  Lotus event-DAG with verified-streaming backfill\n");
-    try writer.writeAll("I/O:      Ringlane on Linux | probed multishot accept and wake | one-shot recv and send\n");
+    try writer.writeAll("I/O:      Ringlane on Linux | multishot accept, wake, and recv | zero-copy send\n");
     try writer.writeAll("\n");
 
     if (info.network.len != 0) {

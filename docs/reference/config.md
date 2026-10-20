@@ -338,6 +338,8 @@ Source: struct at `src/daemon/config_format.zig:153`, parsing at `src/daemon/con
 | `defer_taskrun` | bool | `false` | — | Parsed and stored. The live `Ring.init` never requests `IORING_SETUP_DEFER_TASKRUN` or `IORING_SETUP_SINGLE_ISSUER`. `--check-config` still rejects this key together with `sqpoll`. Default off. |
 | `sqpoll` | bool | `false` | — | `IORING_SETUP_SQPOLL` when true. The live ring keeps the flag through its setup ladder and falls back only on `error.ArgumentsInvalid`. Default off. |
 
+On Linux, boot also arms provided-buffer multishot receive and zero-copy send. There is no key for either one. The daemon copies each selected receive into the connection buffer and replenishes the pool slice. A zero-copy send holds the send buffer until the kernel notification. kTLS, and a ring that cannot install the buffer group, stay on the copy path. Fixed files are not registered. A kernel that refuses zero-copy drops that ring back to copy send.
+
 ## `[reputation]`
 
 Source: struct at `src/daemon/config_format.zig:158`, parsing at `src/daemon/config_format.zig:380`, mapping at `src/daemon/config_boot.zig:56`.

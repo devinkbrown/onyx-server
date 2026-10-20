@@ -1,18 +1,32 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Unfinished Ringlane io_uring prototype — not the production backend.
+//! Ringlane io_uring prototype — not the production backend.
 //!
-//! The live daemon ring lives inline in `src/daemon/server.zig`. Do not adopt
-//! this module as a drop-in: `OpKind` has no `.connect` / `.poll` / cancel
-//! (Helix quiesce is unimplementable on it), `narrow()` is not a kernel probe,
-//! `buf_ring.registerAll` never registers with the kernel, and accept flags
-//! are `0` (the daemon passes `SOCK.CLOEXEC` to avoid split-brain after
-//! execve). Multishot receive and provided-buffer rings stay out of 0.7.
+//! The live daemon ring is `src/daemon/ringlane.zig`. The daemon does not
+//! import this file. Connect, poll, and exact-generation cancel of accept,
+//! recv, send, and connect are submittable here, and accept passes
+//! `SOCK_CLOEXEC`. `kernelProbe` asks the kernel whether multishot accept and
+//! multishot poll work. `narrow` stays pure: it only folds a capability set
+//! the caller already measured.
 //!
-//! Kept as a design sketch and a home for the pure user_data / FdToken /
-//! RingFeatures tests. The `Reactor` seam (`src/substrate/reactor.zig`) does
-//! not dispatch here.
+//! `Ring.init` sizes the completion queue to at least 256 entries and requests
+//! cooperative task-work, walking a shorter setup ladder only when the kernel
+//! returns `ArgumentsInvalid`. It never passes `IORING_SETUP_DEFER_TASKRUN`
+//! or `IORING_SETUP_SINGLE_ISSUER`. Submit flushes a completion-queue overflow
+//! and retries once. The ordinary recv and send paths stay copies.
+//!
+//! `registerProvidedBuffers` registers one provided-buffer group.
+//! `submitRecvBufRing` is the one-shot select. `submitRecvMultishot` stays
+//! armed only when `multishot_recv` is set and that group is registered.
+//! `replenishProvidedBuffer` publishes a used buffer again.
+//! `submitSendZc` is the zero-copy send. `registerFixedFiles` installs one
+//! fixed file table, and the fixed submit helpers address it by index.
+//! `buf_ring.registerAll` stays pure bookkeeping and does not register buffers
+//! with the kernel. The production ring in `src/daemon/ringlane.zig` arms its
+//! own multishot recv and zero-copy send. This file is not that backend.
+//!
+//! The `Reactor` seam (`src/substrate/reactor.zig`) does not dispatch here.
 //!
 //! Design rules followed here:
 //!   - Feature gating is a comptime `RingFeatures` profile. Unsupported branches
@@ -29,10 +43,16 @@
 //! error (EPERM/ENOSYS/etc.). The pure logic is always exercised.
 const std = @import("std");
 const builtin = @import("builtin");
+const posix = std.posix;
 const linux = std.os.linux;
 // io_uring is a Linux-only fast path; `void` off-Linux so the pure helpers in
 // this file (user_data codec, FdToken, RingFeatures, CQE decode) stay portable.
 const IoUring = if (builtin.os.tag == .linux) linux.IoUring else void;
+const buf_ring = @import("buf_ring.zig");
+
+/// Smallest completion queue this ring will open. A reactor batch is 256,
+/// and the kernel default of twice the submission queue is too small for it.
+pub const min_cq_entries: u32 = 256;
 
 // ---------------------------------------------------------------------------
 // Feature gating (comptime Kernel persona)
@@ -62,8 +82,8 @@ pub const RingFeatures = struct {
     /// range of kernels and inside restricted sandboxes. The default.
     pub const baseline: RingFeatures = .{};
 
-    /// linux_6_1_safe persona: multishot accept/recv + buf_ring + fixed files +
-    /// defer_taskrun. The production default tier from planning/05.
+    /// Sketch only. `Ring.init` keeps the field and never passes
+    /// `DEFER_TASKRUN` or `SINGLE_ISSUER` to the kernel.
     pub const linux_6_1_safe: RingFeatures = .{
         .multishot_accept = true,
         .multishot_recv = true,
@@ -96,9 +116,8 @@ pub const RingFeatures = struct {
     }
 
     /// Return a copy with any features unsupported by `caps` disabled (fail
-    /// closed). Pure: callers feed it the result of a runtime probe. Keeping it
-    /// separate from the probe itself makes the narrowing logic testable without
-    /// a kernel.
+    /// closed). Pure: pass a `RingFeatures` built from `kernelProbe`, or any
+    /// other measured set. This function does not call the kernel.
     pub fn narrow(self: RingFeatures, caps: RingFeatures) RingFeatures {
         var result: RingFeatures = .{
             .multishot_accept = self.multishot_accept and caps.multishot_accept,
@@ -127,6 +146,11 @@ pub const OpKind = enum(u8) {
     recv = 2,
     send = 3,
     timeout = 4,
+    connect = 5,
+    // poll: readiness watch on a bare fd (a reactor wake eventfd). The same
+    // numeric value as the production ring, so a user_data word means the
+    // same kind in both codecs.
+    poll = 6,
 };
 
 /// Generational handle for a connection slot. The slot indexes a fixed table;
@@ -251,6 +275,19 @@ pub const TimeoutEvent = struct {
     res: i32,
 };
 
+/// A connect completion. `res` is 0, or a negative errno. Connect is one-shot.
+pub const ConnectEvent = struct {
+    token: FdToken,
+    res: i32,
+};
+
+/// A poll completion. `more` is set while a multishot poll arm stays live.
+pub const PollEvent = struct {
+    token: FdToken,
+    res: i32,
+    more: bool,
+};
+
 /// Catch-all for ops without a dedicated typed event.
 pub const OtherEvent = struct {
     token: FdToken,
@@ -265,6 +302,8 @@ pub const Completion = union(OpKind) {
     recv: RecvEvent,
     send: SendEvent,
     timeout: TimeoutEvent,
+    connect: ConnectEvent,
+    poll: PollEvent,
 };
 
 /// Decode a raw CQE into a typed `Completion`. Pure (operates on a plain CQE
@@ -289,7 +328,22 @@ pub fn decodeCompletion(cqe: linux.io_uring_cqe) error{UnknownOpKind}!Completion
             .notif = (cqe.flags & linux.IORING_CQE_F_NOTIF) != 0,
         } },
         .timeout => .{ .timeout = .{ .token = ud.token, .res = cqe.res } },
+        .connect => .{ .connect = .{ .token = ud.token, .res = cqe.res } },
+        .poll => .{ .poll = .{ .token = ud.token, .res = cqe.res, .more = more } },
         .other => .{ .other = .{ .token = ud.token, .res = cqe.res, .flags = cqe.flags } },
+    };
+}
+
+/// Cancel one exact-generation socket operation by the same `user_data`
+/// identity it was submitted with. Cancelling by fd is not safe: a slot can
+/// carry recv and send at once, and the descriptor may be reused. Poll and
+/// timeout are not socket-quiesce targets.
+pub fn exactCancelUserData(kind: OpKind, token: FdToken) error{ InvalidCancelKind, TokenOutOfRange }!struct { completion: u64, target: u64 } {
+    if (kind != .accept and kind != .recv and kind != .send and kind != .connect)
+        return error.InvalidCancelKind;
+    return .{
+        .completion = try encodeUserData(.other, token),
+        .target = try encodeUserData(kind, token),
     };
 }
 
@@ -323,48 +377,388 @@ pub fn isUnsupportedInitError(err: anyerror) bool {
     };
 }
 
+/// Kernel answers for the two multishot arms this prototype is allowed to use.
+/// `false` means the probe failed closed, including when it could not decide.
+pub const ProbeAnswers = struct {
+    accept: bool = false,
+    poll: bool = false,
+};
+
+/// Read the cached multishot probe. The first call opens a scratch ring.
+/// A later call reuses a definitive yes or no. An inconclusive attempt is not
+/// cached. Off Linux both answers are false.
+pub fn kernelProbe() ProbeAnswers {
+    return KernelProbe.ensure();
+}
+
+const KernelProbe = if (builtin.os.tag != .linux) struct {
+    pub fn ensure() ProbeAnswers {
+        return .{};
+    }
+} else struct {
+    var mu: std.atomic.Mutex = .unlocked;
+    var accept_answer: ?bool = null;
+    var poll_answer: ?bool = null;
+
+    pub fn ensure() ProbeAnswers {
+        while (!mu.tryLock()) std.Thread.yield() catch {};
+        defer mu.unlock();
+        if (accept_answer == null) {
+            if (probeAcceptMultishot()) |known| accept_answer = known;
+        }
+        if (poll_answer == null) {
+            if (probePollMultishot()) |known| poll_answer = known;
+        }
+        return .{
+            .accept = accept_answer orelse false,
+            .poll = poll_answer orelse false,
+        };
+    }
+
+    fn isErrno(res: i32, err: linux.E) bool {
+        return res == -@as(i32, @intFromEnum(err));
+    }
+
+    fn openLoopbackListener() ?linux.fd_t {
+        const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+        if (posix.errno(rc) != .SUCCESS) return null;
+        const fd: linux.fd_t = @intCast(rc);
+        var addr = linux.sockaddr.in{
+            .port = 0,
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        };
+        if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+            _ = linux.close(fd);
+            return null;
+        }
+        if (posix.errno(linux.listen(fd, 16)) != .SUCCESS) {
+            _ = linux.close(fd);
+            return null;
+        }
+        return fd;
+    }
+
+    /// `true` when a cancelled multishot accept completes with MORE clear.
+    /// `false` when the kernel rejects the opcode. `null` is inconclusive.
+    fn probeAcceptMultishot() ?bool {
+        var ring = IoUring.init(8, 0) catch return null;
+        defer ring.deinit();
+        const listener = openLoopbackListener() orelse return null;
+        defer _ = linux.close(listener);
+        const accept_ud = encodeUserData(.accept, .{ .slot = 1, .gen = 1 }) catch return null;
+        _ = ring.accept_multishot(accept_ud, listener, null, null, posix.SOCK.CLOEXEC) catch return null;
+        var ts = linux.kernel_timespec{ .sec = 0, .nsec = 1_000_000 };
+        const timeout_ud = encodeUserData(.timeout, .{ .slot = 2, .gen = 1 }) catch return null;
+        _ = ring.timeout(timeout_ud, &ts, 0, 0) catch return null;
+        _ = ring.submit_and_wait(1) catch return null;
+        var cqes: [8]linux.io_uring_cqe = undefined;
+        const ready = ring.copy_cqes(&cqes, 0) catch return null;
+        for (cqes[0..ready]) |cqe| {
+            const decoded = decodeUserData(cqe.user_data) catch continue;
+            if (decoded.kind != .accept) continue;
+            if (isErrno(cqe.res, .INVAL) or isErrno(cqe.res, .OPNOTSUPP)) return false;
+            return null;
+        }
+        const cancel_ud = encodeUserData(.other, .{ .slot = 3, .gen = 1 }) catch return null;
+        _ = ring.cancel(cancel_ud, accept_ud, 0) catch return null;
+        var spins: u8 = 0;
+        while (spins < 8) : (spins += 1) {
+            _ = ring.submit_and_wait(1) catch return null;
+            const n = ring.copy_cqes(&cqes, 0) catch return null;
+            for (cqes[0..n]) |cqe| {
+                if (cqe.user_data != accept_ud) continue;
+                if ((cqe.flags & linux.IORING_CQE_F_MORE) != 0) return false;
+                if (isErrno(cqe.res, .INVAL) or isErrno(cqe.res, .OPNOTSUPP)) return false;
+                if (isErrno(cqe.res, .CANCELED)) return true;
+                return null;
+            }
+        }
+        return null;
+    }
+
+    fn probePollMultishot() ?bool {
+        var ring = IoUring.init(8, 0) catch return null;
+        defer ring.deinit();
+        const efd_rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        if (posix.errno(efd_rc) != .SUCCESS) return null;
+        const efd: linux.fd_t = @intCast(efd_rc);
+        defer _ = linux.close(efd);
+        const poll_ud = encodeUserData(.poll, .{ .slot = 4, .gen = 1 }) catch return null;
+        const sqe = ring.poll_add(poll_ud, efd, linux.POLL.IN) catch return null;
+        sqe.len = linux.IORING_POLL_ADD_MULTI;
+        var ts = linux.kernel_timespec{ .sec = 0, .nsec = 1_000_000 };
+        const timeout_ud = encodeUserData(.timeout, .{ .slot = 5, .gen = 1 }) catch return null;
+        _ = ring.timeout(timeout_ud, &ts, 0, 0) catch return null;
+        _ = ring.submit_and_wait(1) catch return null;
+        var cqes: [8]linux.io_uring_cqe = undefined;
+        const ready = ring.copy_cqes(&cqes, 0) catch return null;
+        for (cqes[0..ready]) |cqe| {
+            const decoded = decodeUserData(cqe.user_data) catch continue;
+            if (decoded.kind != .poll) continue;
+            if (isErrno(cqe.res, .INVAL) or isErrno(cqe.res, .OPNOTSUPP)) return false;
+            return null;
+        }
+        const cancel_ud = encodeUserData(.other, .{ .slot = 6, .gen = 1 }) catch return null;
+        _ = ring.cancel(cancel_ud, poll_ud, 0) catch return null;
+        var spins: u8 = 0;
+        while (spins < 8) : (spins += 1) {
+            _ = ring.submit_and_wait(1) catch return null;
+            const n = ring.copy_cqes(&cqes, 0) catch return null;
+            for (cqes[0..n]) |cqe| {
+                if (cqe.user_data != poll_ud) continue;
+                if ((cqe.flags & linux.IORING_CQE_F_MORE) != 0) return false;
+                if (isErrno(cqe.res, .INVAL) or isErrno(cqe.res, .OPNOTSUPP)) return false;
+                if (isErrno(cqe.res, .CANCELED)) return true;
+                return null;
+            }
+        }
+        return null;
+    }
+};
+
 /// io_uring-backed reactor core. Thin wrapper over `std.os.linux.IoUring` that
 /// adds typed submission helpers and typed completion decoding. One `Ring` per
-/// shard is the intended deployment shape (planning/01 SQ policy).
+/// shard is the intended deployment shape (planning/01 SQ policy). This is not
+/// the daemon backend.
 pub const Ring = if (builtin.os.tag == .linux) struct {
     inner: IoUring,
     features: RingFeatures,
+    accept_multishot: bool = false,
+    poll_multishot: bool = false,
+    /// One kernel-registered provided-buffer group, or null when none is live.
+    provided: ?buf_ring.LiveBufRing = null,
+    /// Shortest registered buffer. A buffer-select recv uses this as its cap.
+    provided_len: u32 = 0,
+    /// Number of entries in the registered fixed file table. Zero means none.
+    fixed_count: u32 = 0,
 
-    /// Set up a ring with `entries` SQ slots (power of two, 1..32768) using the
-    /// setup flags derived from `features`. Returns the same errors as
-    /// `IoUring.init`; in restricted environments those satisfy
-    /// `isUnsupportedInitError` and should be treated as a skip.
+    /// Set up a ring with `entries` SQ slots (power of two, 1..32768). The
+    /// completion queue is at least `min_cq_entries`. Cooperative task-work is
+    /// requested first. `defer_taskrun` is not a setup flag. In restricted
+    /// environments the errors satisfy `isUnsupportedInitError`.
     pub fn init(entries: u16, features: RingFeatures) !Ring {
-        const inner = try IoUring.init(entries, features.setupFlags());
-        return .{ .inner = inner, .features = features };
+        const probed = kernelProbe();
+        return .{
+            .inner = try openInner(entries, features),
+            .features = features,
+            .accept_multishot = probed.accept,
+            .poll_multishot = probed.poll,
+        };
+    }
+
+    fn completionQueueEntries(sq: u16) u32 {
+        const sq_entries: u32 = sq;
+        var want: u32 = sq_entries * 4;
+        if (want < min_cq_entries) want = min_cq_entries;
+        if (want > 32768) want = 32768;
+        if (want < sq_entries) want = sq_entries;
+        var rounded: u32 = 1;
+        while (rounded < want) rounded <<= 1;
+        return rounded;
+    }
+
+    fn openParams(entries: u16, flags: u32, cq_entries: u32) !IoUring {
+        var params = std.mem.zeroInit(linux.io_uring_params, .{
+            .flags = flags,
+            .cq_entries = cq_entries,
+            .sq_thread_idle = 1000,
+        });
+        return IoUring.init_params(entries, &params);
+    }
+
+    fn runtimeFlags(sqpoll: bool, fast: bool) u32 {
+        var flags: u32 = 0;
+        if (sqpoll) flags |= linux.IORING_SETUP_SQPOLL;
+        if (fast) {
+            flags |= linux.IORING_SETUP_COOP_TASKRUN;
+            flags |= linux.IORING_SETUP_TASKRUN_FLAG;
+            flags |= linux.IORING_SETUP_CQSIZE;
+        }
+        return flags;
+    }
+
+    fn openInner(entries: u16, features: RingFeatures) !IoUring {
+        const cq = completionQueueEntries(entries);
+        const attempts = [_]u32{
+            runtimeFlags(features.sqpoll, true),
+            runtimeFlags(features.sqpoll, false) | linux.IORING_SETUP_CQSIZE,
+            runtimeFlags(features.sqpoll, false) | linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_TASKRUN_FLAG,
+            runtimeFlags(features.sqpoll, false),
+        };
+        for (attempts, 0..) |flags, index| {
+            const opened = if ((flags & linux.IORING_SETUP_CQSIZE) != 0)
+                openParams(entries, flags, cq)
+            else
+                IoUring.init(entries, flags);
+            if (opened) |ring| return ring else |err| switch (err) {
+                error.ArgumentsInvalid => {
+                    if (index + 1 == attempts.len) return err;
+                },
+                else => |other| return other,
+            }
+        }
+        return error.ArgumentsInvalid;
     }
 
     pub fn deinit(self: *Ring) void {
+        // Unregister while the io_uring fd is still open. `free_buf_ring`
+        // munmaps even when the unregister syscall fails. The kernel also
+        // drops a fixed file table when the ring closes.
+        if (self.provided) |*live| live.deinit();
+        self.provided = null;
+        self.provided_len = 0;
+        if (self.fixed_count != 0) {
+            self.inner.unregister_files() catch {};
+            self.fixed_count = 0;
+        }
         self.inner.deinit();
+    }
+
+    fn bufferCap(buffers: []const []u8) error{ EmptyBuffer, BufferTooLarge }!u32 {
+        var cap: u32 = std.math.maxInt(u32);
+        for (buffers) |buffer| {
+            if (buffer.len == 0) return error.EmptyBuffer;
+            if (buffer.len > std.math.maxInt(u32)) return error.BufferTooLarge;
+            const n: u32 = @intCast(buffer.len);
+            if (n < cap) cap = n;
+        }
+        return cap;
+    }
+
+    /// Register one provided-buffer group and publish every caller slice.
+    /// One group per ring. `buffers.len` must be a non-zero power of two no
+    /// larger than `buf_ring.max_buffer_count`. Each slice must be non-empty,
+    /// fit in a `u32`, and stay live until the matching recv completion.
+    /// The daemon does not call this.
+    pub fn registerProvidedBuffers(self: *Ring, group_id: u16, buffers: [][]u8) !void {
+        if (!self.features.buf_ring) return error.FeatureNotEnabled;
+        if (self.provided != null) return error.AlreadyRegistered;
+        if (buffers.len == 0 or buffers.len > buf_ring.max_buffer_count) return error.EntriesNotInRange;
+        if (!std.math.isPowerOfTwo(buffers.len)) return error.EntriesNotPowerOfTwo;
+        const cap = try bufferCap(buffers);
+        const entries: u16 = @intCast(buffers.len);
+        var live = try buf_ring.LiveBufRing.init(&self.inner, entries, group_id);
+        errdefer live.deinit();
+        for (buffers, 0..) |buffer, id| {
+            try live.publish(buffer, @intCast(id));
+        }
+        self.provided = live;
+        self.provided_len = cap;
+    }
+
+    /// Publish one used buffer back into the registered group. `buffer` must
+    /// be the same slice the kernel selected for `buffer_id`.
+    pub fn replenishProvidedBuffer(self: *Ring, buffer: []u8, buffer_id: u16) !void {
+        if (!self.features.buf_ring) return error.FeatureNotEnabled;
+        if (self.provided) |*live| {
+            try live.publish(buffer, buffer_id);
+            return;
+        }
+        return error.NotRegistered;
+    }
+
+    /// Install one fixed file table. A later submit addresses a slot by index
+    /// with `IOSQE_FIXED_FILE`. One table per ring. The daemon does not call this.
+    pub fn registerFixedFiles(self: *Ring, fds: []const linux.fd_t) !void {
+        if (!self.features.fixed_files) return error.FeatureNotEnabled;
+        if (self.fixed_count != 0) return error.AlreadyRegistered;
+        if (fds.len == 0 or fds.len > std.math.maxInt(u32)) return error.EntriesNotInRange;
+        try self.inner.register_files(fds);
+        self.fixed_count = @intCast(fds.len);
+    }
+
+    fn fixedFd(self: *Ring, index: u32) error{ FeatureNotEnabled, NotRegistered, FileIndexOutOfRange }!linux.fd_t {
+        if (!self.features.fixed_files) return error.FeatureNotEnabled;
+        if (self.fixed_count == 0) return error.NotRegistered;
+        if (index >= self.fixed_count) return error.FileIndexOutOfRange;
+        return @intCast(index);
+    }
+
+    fn flushOverflow(self: *Ring) !void {
+        if (!self.inner.cq_ring_needs_flush()) return;
+        _ = try self.inner.enter(0, 0, linux.IORING_ENTER_GETEVENTS);
+    }
+
+    fn enterSubmit(self: *Ring, wait_nr: u32) !u32 {
+        try self.flushOverflow();
+        return self.submitWaiting(wait_nr) catch |err| switch (err) {
+            error.CompletionQueueOvercommitted => {
+                try self.flushOverflow();
+                return self.submitWaiting(wait_nr);
+            },
+            else => |other| return other,
+        };
+    }
+
+    fn submitWaiting(self: *Ring, wait_nr: u32) !u32 {
+        if (wait_nr == 0) return self.inner.submit();
+        return self.inner.submit_and_wait(wait_nr);
     }
 
     /// Flush queued SQEs to the kernel. Returns the number submitted.
     pub fn submit(self: *Ring) !u32 {
-        return self.inner.submit();
+        return self.enterSubmit(0);
     }
 
     /// Submit queued SQEs and block until at least `wait_nr` completions exist.
     pub fn submitAndWait(self: *Ring, wait_nr: u32) !u32 {
-        return self.inner.submit_and_wait(wait_nr);
+        return self.enterSubmit(wait_nr);
+    }
+
+    /// Post one completion onto `target` with `IORING_OP_MSG_RING` and drain
+    /// both rings. The posted word is a poll identity; the source completion
+    /// is `.other`.
+    pub fn bootMsgRing(source: *Ring, target: *Ring) !void {
+        const token = FdToken{ .slot = 1, .gen = 1 };
+        const posted = try encodeUserData(.poll, token);
+        const sqe = try source.inner.get_sqe();
+        sqe.prep_rw(.MSG_RING, target.inner.fd, 0, 1, posted);
+        sqe.user_data = try encodeUserData(.other, token);
+        sqe.rw_flags = 0;
+        _ = try source.enterSubmit(1);
+        var source_cqe: [1]linux.io_uring_cqe = undefined;
+        const source_n = try source.inner.copy_cqes(&source_cqe, 0);
+        if (source_n != 1 or source_cqe[0].res != 0) return error.Unexpected;
+        if (source_cqe[0].user_data != try encodeUserData(.other, token)) return error.Unexpected;
+        _ = try target.enterSubmit(1);
+        var target_cqe: [1]linux.io_uring_cqe = undefined;
+        const target_n = try target.inner.copy_cqes(&target_cqe, 0);
+        if (target_n != 1 or target_cqe[0].res != 1) return error.Unexpected;
+        if (target_cqe[0].user_data != posted) return error.Unexpected;
     }
 
     // --- typed submission helpers -----------------------------------------
 
     /// Arm an accept on `listener_fd` for `token`. Uses multishot accept when
-    /// the compiled feature profile allows it, else a one-shot accept. Does not
-    /// submit; call `submit` afterwards.
+    /// the kernel probe succeeded, otherwise one shot. Does not submit.
     pub fn submitAccept(self: *Ring, token: FdToken, listener_fd: linux.fd_t) !void {
+        // SOCK_CLOEXEC so an accepted socket cannot leak across execve. Helix
+        // clears that bit only after the successor has sealed the fds it keeps.
         const ud = try encodeUserData(.accept, token);
-        if (self.features.multishot_accept) {
-            _ = try self.inner.accept_multishot(ud, listener_fd, null, null, 0);
+        if (self.accept_multishot) {
+            _ = try self.inner.accept_multishot(ud, listener_fd, null, null, posix.SOCK.CLOEXEC);
         } else {
-            _ = try self.inner.accept(ud, listener_fd, null, null, 0);
+            _ = try self.inner.accept(ud, listener_fd, null, null, posix.SOCK.CLOEXEC);
         }
+    }
+
+    /// Arm a one-shot connect. `addr` must stay live until the connect CQE.
+    pub fn submitConnect(self: *Ring, token: FdToken, fd: linux.fd_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t) !void {
+        _ = try self.inner.connect(try encodeUserData(.connect, token), fd, addr, addrlen);
+    }
+
+    /// Watch `fd` for readiness. A probed multishot poll stays armed while
+    /// `IORING_CQE_F_MORE` is set; otherwise the caller re-arms one shot.
+    pub fn submitPollAdd(self: *Ring, token: FdToken, fd: linux.fd_t, poll_mask: u32) !void {
+        const user_data = try encodeUserData(.poll, token);
+        const sqe = try self.inner.poll_add(user_data, fd, poll_mask);
+        if (self.poll_multishot) sqe.len = linux.IORING_POLL_ADD_MULTI;
+    }
+
+    /// Queue an exact-generation cancel. The original CQE is still delivered.
+    pub fn submitExactCancel(self: *Ring, kind: OpKind, token: FdToken) !void {
+        const ud = try exactCancelUserData(kind, token);
+        _ = try self.inner.cancel(ud.completion, ud.target, 0);
     }
 
     /// Arm a recv on `fd` for `token` into a caller-provided buffer. Provided
@@ -375,13 +769,34 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         _ = try self.inner.recv(ud, fd, .{ .buffer = buffer }, 0);
     }
 
-    /// Arm a recv on `fd` for `token` selecting a buffer from provided-buffer
-    /// ring group `group_id`. Requires the `buf_ring` feature to be compiled in.
-    /// Does not submit.
+    /// Arm a one-shot recv on `fd` for `token` that selects a buffer from the
+    /// registered group. The read is capped at the shortest registered buffer.
+    /// Fails closed when the feature is off, no group is registered, or
+    /// `group_id` is not that group. Does not submit. Does not arm multishot.
     pub fn submitRecvBufRing(self: *Ring, token: FdToken, fd: linux.fd_t, group_id: u16) !void {
         if (!self.features.buf_ring) return error.FeatureNotEnabled;
+        const live = self.provided orelse return error.NotRegistered;
+        if (live.group_id != group_id) return error.NotRegistered;
         const ud = try encodeUserData(.recv, token);
-        _ = try self.inner.recv(ud, fd, .{ .buffer_selection = .{ .group_id = group_id, .len = 0 } }, 0);
+        _ = try self.inner.recv(ud, fd, .{ .buffer_selection = .{
+            .group_id = group_id,
+            .len = self.provided_len,
+        } }, 0);
+    }
+
+    /// Arm a multishot recv that keeps selecting from the registered group.
+    /// Each data completion keeps `more` set until cancel, close, or an empty
+    /// group. Fails closed without a registered group. Does not submit.
+    pub fn submitRecvMultishot(self: *Ring, token: FdToken, fd: linux.fd_t, group_id: u16) !void {
+        if (!self.features.multishot_recv or !self.features.buf_ring) return error.FeatureNotEnabled;
+        const live = self.provided orelse return error.NotRegistered;
+        if (live.group_id != group_id) return error.NotRegistered;
+        const ud = try encodeUserData(.recv, token);
+        const sqe = try self.inner.recv(ud, fd, .{ .buffer_selection = .{
+            .group_id = group_id,
+            .len = self.provided_len,
+        } }, 0);
+        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
     }
 
     /// Queue a copy send of `buffer` on `fd` for `token`. `IORING_OP_SEND` does
@@ -394,6 +809,20 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
     pub fn submitSend(self: *Ring, token: FdToken, fd: linux.fd_t, buffer: []const u8) !void {
         const ud = try encodeUserData(.send, token);
         _ = try self.inner.send(ud, fd, buffer, 0);
+    }
+
+    /// Queue a copy send through fixed file `index`. Requires a registered table.
+    pub fn submitSendFixed(self: *Ring, token: FdToken, index: u32, buffer: []const u8) !void {
+        const fd = try self.fixedFd(index);
+        const sqe = try self.inner.send(try encodeUserData(.send, token), fd, buffer, 0);
+        sqe.flags |= linux.IOSQE_FIXED_FILE;
+    }
+
+    /// Arm a one-shot copy recv through fixed file `index`. Requires a registered table.
+    pub fn submitRecvFixed(self: *Ring, token: FdToken, index: u32, buffer: []u8) !void {
+        const fd = try self.fixedFd(index);
+        const sqe = try self.inner.recv(try encodeUserData(.recv, token), fd, .{ .buffer = buffer }, 0);
+        sqe.flags |= linux.IOSQE_FIXED_FILE;
     }
 
     /// Queue a zero-copy send of `buffer` on `fd` for `token`. Requires
@@ -738,6 +1167,533 @@ test "submitTimeout fires and decodes as a timeout completion" {
         try testing.expect(collector.tok != null);
         try testing.expect(tok.eql(collector.tok.?));
     }
+}
+
+test "exact cancel identity covers connect and a probe caps set drops deferred taskrun" {
+    const token = FdToken{ .slot = 3, .gen = 9 };
+    inline for (.{ OpKind.accept, .recv, .send, .connect }) |kind| {
+        const ud = try exactCancelUserData(kind, token);
+        try testing.expectEqual(try encodeUserData(kind, token), ud.target);
+        try testing.expectEqual(try encodeUserData(.other, token), ud.completion);
+    }
+    try testing.expectError(error.InvalidCancelKind, exactCancelUserData(.timeout, token));
+    try testing.expectError(error.InvalidCancelKind, exactCancelUserData(.poll, token));
+
+    const connect_cqe: linux.io_uring_cqe = .{
+        .user_data = try encodeUserData(.connect, token),
+        .res = 0,
+        .flags = 0,
+    };
+    const connected = try decodeCompletion(connect_cqe);
+    try testing.expect(connected == .connect);
+    try testing.expectEqual(@as(i32, 0), connected.connect.res);
+    try testing.expect(token.eql(connected.connect.token));
+
+    const poll_cqe: linux.io_uring_cqe = .{
+        .user_data = try encodeUserData(.poll, token),
+        .res = 1,
+        .flags = linux.IORING_CQE_F_MORE,
+    };
+    const polled = try decodeCompletion(poll_cqe);
+    try testing.expect(polled == .poll);
+    try testing.expect(polled.poll.more);
+    try testing.expectEqual(@as(i32, 1), polled.poll.res);
+
+    const narrowed = RingFeatures.linux_6_8_fast.narrow(.{ .multishot_accept = true });
+    try testing.expect(narrowed.multishot_accept);
+    try testing.expect(!narrowed.defer_taskrun);
+    try testing.expect(!narrowed.multishot_recv);
+    try testing.expect(!narrowed.buf_ring);
+    try testing.expect(!narrowed.send_zc);
+    try testing.expect(!narrowed.fixed_files);
+    try testing.expect(!narrowed.sqpoll);
+}
+
+test "prototype ring accepts with CLOEXEC, connects, polls, and cancels" {
+    if (builtin.os.tag != .linux) return;
+    var ring = try initOrSkip(.{ .defer_taskrun = true });
+    defer ring.deinit();
+    try testing.expect(ring.features.defer_taskrun);
+    try testing.expect((ring.inner.flags & linux.IORING_SETUP_DEFER_TASKRUN) == 0);
+    try testing.expect((ring.inner.flags & linux.IORING_SETUP_SINGLE_ISSUER) == 0);
+    try testing.expect((ring.inner.flags & linux.IORING_SETUP_COOP_TASKRUN) != 0);
+    try testing.expect(ring.inner.cq.cqes.len >= min_cq_entries);
+    const probed = kernelProbe();
+    try testing.expect(probed.accept);
+    try testing.expect(probed.poll);
+    try testing.expect(ring.accept_multishot);
+    try testing.expect(ring.poll_multishot);
+
+    const listener = listenLoopback() orelse return error.SkipZigTest;
+    defer _ = linux.close(listener.fd);
+    const accept_token: FdToken = .{ .slot = 11, .gen = 2 };
+    try ring.submitAccept(accept_token, listener.fd);
+    _ = try ring.submit();
+    const client = connectLoopback(listener.port) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(client);
+
+    const AcceptSink = struct {
+        event: ?AcceptEvent = null,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            switch (c) {
+                .accept => |ev| self.event = ev,
+                else => {},
+            }
+        }
+    };
+    var accept_sink = AcceptSink{};
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var spins: u8 = 0;
+    while (accept_sink.event == null and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        _ = try ring.reapCompletions(&cqes, 0, &accept_sink);
+    }
+    const accepted = accept_sink.event orelse return error.TestUnexpectedResult;
+    defer {
+        if (accepted.res >= 0) _ = linux.close(accepted.res);
+    }
+    try testing.expect(accept_token.eql(accepted.token));
+    try testing.expect(accepted.res >= 0);
+    try testing.expect(accepted.more);
+    try testing.expect(hasCloexec(accepted.res));
+    try ring.submitExactCancel(.accept, accept_token);
+    const CancelSink = struct {
+        canceled: bool = false,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            switch (c) {
+                .accept => |ev| {
+                    if (ev.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+                        if (!ev.more) self.canceled = true;
+                    } else if (ev.res >= 0) {
+                        _ = linux.close(ev.res);
+                    }
+                },
+                else => {},
+            }
+        }
+    };
+    var cancel_sink = CancelSink{};
+    spins = 0;
+    while (!cancel_sink.canceled and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        _ = try ring.reapCompletions(&cqes, 0, &cancel_sink);
+    }
+    try testing.expect(cancel_sink.canceled);
+
+    const connect_fd = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    if (posix.errno(connect_fd) != .SUCCESS) return error.TestUnexpectedResult;
+    const dial: linux.fd_t = @intCast(connect_fd);
+    defer _ = linux.close(dial);
+    var dial_addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, listener.port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const connect_token: FdToken = .{ .slot = 12, .gen = 2 };
+    try ring.submitConnect(connect_token, dial, @ptrCast(&dial_addr), @sizeOf(linux.sockaddr.in));
+    const ConnectSink = struct {
+        event: ?ConnectEvent = null,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            switch (c) {
+                .connect => |ev| self.event = ev,
+                else => {},
+            }
+        }
+    };
+    var connect_sink = ConnectSink{};
+    spins = 0;
+    while (connect_sink.event == null and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        _ = try ring.reapCompletions(&cqes, 0, &connect_sink);
+    }
+    const connected = connect_sink.event orelse return error.TestUnexpectedResult;
+    try testing.expect(connect_token.eql(connected.token));
+    try testing.expectEqual(@as(i32, 0), connected.res);
+    const drained = linux.accept4(listener.fd, null, null, posix.SOCK.CLOEXEC);
+    if (posix.errno(drained) != .SUCCESS) return error.TestUnexpectedResult;
+    _ = linux.close(@intCast(drained));
+
+    const efd_rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    if (posix.errno(efd_rc) != .SUCCESS) return error.TestUnexpectedResult;
+    const efd: linux.fd_t = @intCast(efd_rc);
+    defer _ = linux.close(efd);
+    const poll_token: FdToken = .{ .slot = 14, .gen = 2 };
+    try ring.submitPollAdd(poll_token, efd, linux.POLL.IN);
+    var one: u64 = 1;
+    _ = linux.write(efd, @ptrCast(&one), @sizeOf(u64));
+    const PollSink = struct {
+        event: ?PollEvent = null,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            switch (c) {
+                .poll => |ev| self.event = ev,
+                else => {},
+            }
+        }
+    };
+    var poll_sink = PollSink{};
+    spins = 0;
+    while (poll_sink.event == null and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        _ = try ring.reapCompletions(&cqes, 0, &poll_sink);
+    }
+    const woke = poll_sink.event orelse return error.TestUnexpectedResult;
+    try testing.expect(poll_token.eql(woke.token));
+    try testing.expect(woke.res > 0);
+    try testing.expect(woke.more);
+}
+
+test "prototype ring registers one provided buffer and one-shot recvs" {
+    if (builtin.os.tag != .linux) return;
+    const token: FdToken = .{ .slot = 4, .gen = 2 };
+    var disabled: Ring = .{ .inner = undefined, .features = RingFeatures.baseline };
+    var none: [0][]u8 = .{};
+    try testing.expectError(error.FeatureNotEnabled, disabled.registerProvidedBuffers(3, &none));
+    try testing.expectError(error.FeatureNotEnabled, disabled.submitRecvBufRing(token, 0, 3));
+    var unregistered: Ring = .{ .inner = undefined, .features = .{ .buf_ring = true } };
+    try testing.expectError(error.NotRegistered, unregistered.submitRecvBufRing(token, 0, 3));
+
+    var ring = try initOrSkip(.{ .buf_ring = true });
+    defer ring.deinit();
+    try testing.expect((ring.inner.flags & linux.IORING_SETUP_DEFER_TASKRUN) == 0);
+    try testing.expectError(error.EntriesNotInRange, ring.registerProvidedBuffers(3, &none));
+    var odd_a: [4]u8 = @splat(1);
+    var odd_b: [4]u8 = @splat(2);
+    var odd_c: [4]u8 = @splat(3);
+    var odd = [_][]u8{ &odd_a, &odd_b, &odd_c };
+    try testing.expectError(error.EntriesNotPowerOfTwo, ring.registerProvidedBuffers(3, &odd));
+    var empty_buf: [0]u8 = .{};
+    var solid: [8]u8 = @splat(4);
+    var empties = [_][]u8{ &empty_buf, &solid };
+    try testing.expectError(error.EmptyBuffer, ring.registerProvidedBuffers(3, &empties));
+
+    var buf0: [32]u8 = @splat(0xA5);
+    var buf1: [32]u8 = @splat(0xA5);
+    var slices = [_][]u8{ &buf0, &buf1 };
+    ring.registerProvidedBuffers(3, &slices) catch |err| {
+        if (isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    try testing.expectError(error.AlreadyRegistered, ring.registerProvidedBuffers(3, &slices));
+
+    var pair: [2]linux.fd_t = undefined;
+    const opened = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &pair);
+    if (posix.errno(opened) != .SUCCESS) return error.TestUnexpectedResult;
+    defer {
+        _ = linux.close(pair[0]);
+        _ = linux.close(pair[1]);
+    }
+    try testing.expectError(error.NotRegistered, ring.submitRecvBufRing(token, pair[1], 9));
+    const payload = "ring-buf";
+    const wrote = linux.write(pair[0], payload, payload.len);
+    if (posix.errno(wrote) != .SUCCESS or wrote != payload.len) return error.TestUnexpectedResult;
+    try ring.submitRecvBufRing(token, pair[1], 3);
+    _ = try ring.submitAndWait(1);
+
+    const Sink = struct {
+        event: ?RecvEvent = null,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            switch (c) {
+                .recv => |ev| self.event = ev,
+                else => {},
+            }
+        }
+    };
+    var sink = Sink{};
+    var cqes: [4]linux.io_uring_cqe = undefined;
+    const stats = try ring.reapCompletions(&cqes, 0, &sink);
+    try testing.expectEqual(@as(u32, 1), stats.processed);
+    try testing.expectEqual(@as(u32, 0), stats.skipped);
+    const got = sink.event orelse return error.TestUnexpectedResult;
+    try testing.expect(token.eql(got.token));
+    try testing.expectEqual(@as(i32, payload.len), got.res);
+    try testing.expect(!got.more);
+    const id = got.buffer_id orelse return error.TestUnexpectedResult;
+    try testing.expect(id < 2);
+    const chosen = if (id == 0) buf0[0..payload.len] else buf1[0..payload.len];
+    try testing.expectEqualSlices(u8, payload, chosen);
+}
+
+test "prototype ring multishot recv replenishes a provided buffer" {
+    if (builtin.os.tag != .linux) return;
+    const token: FdToken = .{ .slot = 5, .gen = 2 };
+    var no_multi: Ring = .{ .inner = undefined, .features = .{ .buf_ring = true } };
+    var no_buf: Ring = .{ .inner = undefined, .features = .{ .multishot_recv = true } };
+    var bare: Ring = .{ .inner = undefined, .features = .{ .multishot_recv = true, .buf_ring = true } };
+    var scratch: [4]u8 = @splat(1);
+    var disabled: Ring = .{ .inner = undefined, .features = .{} };
+    try testing.expectError(error.FeatureNotEnabled, disabled.replenishProvidedBuffer(&scratch, 0));
+    try testing.expectError(error.FeatureNotEnabled, no_multi.submitRecvMultishot(token, 0, 1));
+    try testing.expectError(error.FeatureNotEnabled, no_buf.submitRecvMultishot(token, 0, 1));
+    try testing.expectError(error.NotRegistered, bare.submitRecvMultishot(token, 0, 1));
+    try testing.expectError(error.NotRegistered, bare.replenishProvidedBuffer(&scratch, 0));
+
+    var ring = try initOrSkip(.{ .buf_ring = true, .multishot_recv = true });
+    defer ring.deinit();
+    try testing.expect((ring.inner.flags & linux.IORING_SETUP_DEFER_TASKRUN) == 0);
+    var storage: [32]u8 = @splat(0xA5);
+    var slices = [_][]u8{&storage};
+    ring.registerProvidedBuffers(1, &slices) catch |err| {
+        if (isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    const pair = try openStreamPair();
+    defer closePair(pair);
+    try testing.expectError(error.NotRegistered, ring.submitRecvMultishot(token, pair[1], 9));
+    try ring.submitRecvMultishot(token, pair[1], 1);
+    try writeAll(pair[0], "one!");
+    const first = try reapRecv(&ring, token);
+    try testing.expect(token.eql(first.token));
+    try testing.expectEqual(@as(i32, 4), first.res);
+    try testing.expect(first.more);
+    const id = first.buffer_id orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 0), id);
+    try testing.expectEqualSlices(u8, "one!", storage[0..4]);
+    @memset(storage[0..], 0xA5);
+    try ring.replenishProvidedBuffer(&storage, id);
+    try writeAll(pair[0], "two!");
+    const second = try reapRecv(&ring, token);
+    try testing.expectEqual(@as(i32, 4), second.res);
+    try testing.expect(second.more);
+    try testing.expectEqual(@as(?u16, id), second.buffer_id);
+    try testing.expectEqualSlices(u8, "two!", storage[0..4]);
+    try ring.submitExactCancel(.recv, token);
+    const canceled = try reapRecv(&ring, token);
+    try testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), canceled.res);
+    try testing.expect(!canceled.more);
+}
+
+test "prototype ring zero-copy send releases the buffer" {
+    if (builtin.os.tag != .linux) return;
+    const token: FdToken = .{ .slot = 6, .gen = 2 };
+    var ring = try initOrSkip(.{ .send_zc = true });
+    defer ring.deinit();
+    try testing.expect((ring.inner.flags & linux.IORING_SETUP_DEFER_TASKRUN) == 0);
+    const listener = listenLoopback() orelse return error.SkipZigTest;
+    defer _ = linux.close(listener.fd);
+    const client = connectLoopback(listener.port) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(client);
+    const accepted_rc = linux.accept4(listener.fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+    if (posix.errno(accepted_rc) != .SUCCESS) return error.TestUnexpectedResult;
+    const accepted: linux.fd_t = @intCast(accepted_rc);
+    defer _ = linux.close(accepted);
+    const enable: u32 = 1;
+    _ = linux.setsockopt(client, posix.SOL.SOCKET, linux.SO.ZEROCOPY, std.mem.asBytes(&enable), @sizeOf(u32));
+    const payload = "zc-send";
+    try ring.submitSendZc(token, client, payload);
+
+    const Sink = struct {
+        sent: ?SendEvent = null,
+        released: ?SendEvent = null,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            switch (c) {
+                .send => |ev| {
+                    if (ev.bufferReleased()) {
+                        self.released = ev;
+                    } else if (self.sent == null) {
+                        self.sent = ev;
+                    }
+                },
+                else => {},
+            }
+        }
+    };
+    var sink = Sink{};
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var spins: u8 = 0;
+    while ((sink.sent == null or sink.released == null) and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        _ = try ring.reapCompletions(&cqes, 0, &sink);
+    }
+    const sent = sink.sent orelse return error.TestUnexpectedResult;
+    const released = sink.released orelse return error.TestUnexpectedResult;
+    try testing.expect(token.eql(sent.token));
+    try testing.expectEqual(@as(i32, payload.len), sent.res);
+    try testing.expect(!sent.bufferReleased());
+    try testing.expect(released.bufferReleased());
+    try testing.expectEqual(@as(i32, 0), released.res);
+
+    var got: [16]u8 = @splat(0);
+    var n: usize = 0;
+    var reads: u8 = 0;
+    while (reads < 8) : (reads += 1) {
+        const rc = linux.read(accepted, @ptrCast(&got), payload.len);
+        if (posix.errno(rc) == .SUCCESS) {
+            n = rc;
+            break;
+        }
+        if (posix.errno(rc) != .AGAIN) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    try testing.expectEqual(payload.len, n);
+    try testing.expectEqualSlices(u8, payload, got[0..payload.len]);
+}
+
+test "prototype ring sends through a fixed file index" {
+    if (builtin.os.tag != .linux) return;
+    const send_token: FdToken = .{ .slot = 8, .gen = 2 };
+    const recv_token: FdToken = .{ .slot = 9, .gen = 2 };
+    var disabled: Ring = .{ .inner = undefined, .features = RingFeatures.baseline };
+    var none: [0]linux.fd_t = .{};
+    var scratch: [1]u8 = .{0};
+    try testing.expectError(error.FeatureNotEnabled, disabled.registerFixedFiles(&none));
+    try testing.expectError(error.FeatureNotEnabled, disabled.submitSendFixed(send_token, 0, "x"));
+    try testing.expectError(error.FeatureNotEnabled, disabled.submitRecvFixed(recv_token, 0, &scratch));
+    var unregistered: Ring = .{ .inner = undefined, .features = .{ .fixed_files = true } };
+    try testing.expectError(error.NotRegistered, unregistered.submitSendFixed(send_token, 0, "x"));
+
+    var ring = try initOrSkip(.{ .fixed_files = true });
+    defer ring.deinit();
+    try testing.expect((ring.inner.flags & linux.IORING_SETUP_DEFER_TASKRUN) == 0);
+    try testing.expectError(error.EntriesNotInRange, ring.registerFixedFiles(&none));
+    const pair = try openStreamPair();
+    defer closePair(pair);
+    ring.registerFixedFiles(&pair) catch |err| {
+        if (isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    try testing.expectError(error.AlreadyRegistered, ring.registerFixedFiles(&pair));
+    try testing.expectError(error.FileIndexOutOfRange, ring.submitSendFixed(send_token, 2, "x"));
+
+    const payload = "fixed";
+    var buf: [16]u8 = @splat(0xA5);
+    try ring.submitSendFixed(send_token, 0, payload);
+    try ring.submitRecvFixed(recv_token, 1, &buf);
+    const Sink = struct {
+        sent: ?SendEvent = null,
+        got: ?RecvEvent = null,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            switch (c) {
+                .send => |ev| {
+                    if (self.sent == null) self.sent = ev;
+                },
+                .recv => |ev| {
+                    if (self.got == null) self.got = ev;
+                },
+                else => {},
+            }
+        }
+    };
+    var sink = Sink{};
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var spins: u8 = 0;
+    while ((sink.sent == null or sink.got == null) and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        _ = try ring.reapCompletions(&cqes, 0, &sink);
+    }
+    const sent = sink.sent orelse return error.TestUnexpectedResult;
+    const got = sink.got orelse return error.TestUnexpectedResult;
+    try testing.expect(send_token.eql(sent.token));
+    try testing.expect(recv_token.eql(got.token));
+    try testing.expectEqual(@as(i32, payload.len), sent.res);
+    try testing.expectEqual(@as(i32, payload.len), got.res);
+    try testing.expect(!got.more);
+    try testing.expectEqualSlices(u8, payload, buf[0..payload.len]);
+}
+
+test "prototype rings boot a message onto a full completion queue" {
+    if (builtin.os.tag != .linux) return;
+    var source = try initOrSkip(.{});
+    defer source.deinit();
+    var target = try initOrSkip(.{});
+    defer target.deinit();
+    try testing.expect(source.inner.cq.cqes.len >= min_cq_entries);
+    try testing.expect(target.inner.cq.cqes.len >= min_cq_entries);
+    try testing.expect((source.inner.flags & linux.IORING_SETUP_DEFER_TASKRUN) == 0);
+    try testing.expect((source.inner.flags & linux.IORING_SETUP_COOP_TASKRUN) != 0);
+    try Ring.bootMsgRing(&source, &target);
+}
+
+fn openStreamPair() ![2]linux.fd_t {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var pair: [2]linux.fd_t = undefined;
+    const opened = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &pair);
+    if (posix.errno(opened) != .SUCCESS) return error.TestUnexpectedResult;
+    return pair;
+}
+
+fn closePair(pair: [2]linux.fd_t) void {
+    if (comptime builtin.os.tag != .linux) return;
+    _ = linux.close(pair[0]);
+    _ = linux.close(pair[1]);
+}
+
+fn writeAll(fd: linux.fd_t, payload: []const u8) !void {
+    if (comptime builtin.os.tag != .linux) return;
+    const wrote = linux.write(fd, payload.ptr, payload.len);
+    if (posix.errno(wrote) != .SUCCESS or wrote != payload.len) return error.TestUnexpectedResult;
+}
+
+fn reapRecv(ring: *Ring, token: FdToken) !RecvEvent {
+    if (comptime builtin.os.tag != .linux) return error.TestUnexpectedResult;
+    const Sink = struct {
+        token: FdToken,
+        event: ?RecvEvent = null,
+        fn onCompletion(self: *@This(), c: Completion) void {
+            switch (c) {
+                .recv => |ev| {
+                    if (self.event == null and self.token.eql(ev.token)) self.event = ev;
+                },
+                else => {},
+            }
+        }
+    };
+    var sink = Sink{ .token = token };
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var spins: u8 = 0;
+    while (sink.event == null and spins < 8) : (spins += 1) {
+        _ = try ring.submitAndWait(1);
+        _ = try ring.reapCompletions(&cqes, 0, &sink);
+    }
+    if (sink.event) |event| return event;
+    return error.TestUnexpectedResult;
+}
+
+fn listenLoopback() ?struct { fd: linux.fd_t, port: u16 } {
+    if (comptime builtin.os.tag != .linux) return null;
+    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    var addr = linux.sockaddr.in{
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    if (posix.errno(linux.listen(fd, 16)) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    var storage: linux.sockaddr.storage = undefined;
+    var slen: posix.socklen_t = @sizeOf(@TypeOf(storage));
+    if (posix.errno(linux.getsockname(fd, @ptrCast(&storage), &slen)) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    const bound: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+}
+
+fn connectLoopback(port: u16) ?linux.fd_t {
+    if (comptime builtin.os.tag != .linux) return null;
+    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    var addr = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    if (posix.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+fn hasCloexec(fd: linux.fd_t) bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    const flags = linux.fcntl(fd, posix.F.GETFD, 0);
+    return posix.errno(flags) == .SUCCESS and (flags & posix.FD_CLOEXEC) != 0;
 }
 
 test {

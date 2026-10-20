@@ -1704,6 +1704,44 @@ const default_host = "localhost";
 const fantasy_cooldown_slots = 64;
 /// One tracked channel's last fantasy-bot reply time.
 const FantasyCooldown = struct { key: [64]u8 = undefined, len: usize = 0, ts_ms: i64 = 0 };
+/// Outstanding one-shot fantasy answers. A cache miss registers a slot; reactor
+/// 0 sends the channel PRIVMSG when the background fetch settles.
+const fantasy_wait_slots = 16;
+/// Connect plus receive budget, plus a little queue delay, then one failure.
+const fantasy_wait_ms: i64 = 25_000;
+/// `[limits] channellen` tops out at 200.
+const fantasy_chan_max = 200;
+
+const FantasyWaitKind = enum(u8) { empty, weather, forecast, news };
+
+const FantasyWait = struct {
+    kind: FantasyWaitKind = .empty,
+    chan: [fantasy_chan_max]u8 = undefined,
+    chan_len: u8 = 0,
+    key: [geo_services.max_key]u8 = undefined,
+    key_len: u8 = 0,
+    label: [geo_services.max_key]u8 = undefined,
+    label_len: u8 = 0,
+    units: weather_units.UnitSystem = .metric,
+    count: u8 = 0,
+    topic_child: bool = false,
+    armed_ms: i64 = 0,
+
+    fn channel(self: *const FantasyWait) []const u8 {
+        return self.chan[0..self.chan_len];
+    }
+    fn keySlice(self: *const FantasyWait) []const u8 {
+        return self.key[0..self.key_len];
+    }
+    fn labelSlice(self: *const FantasyWait) []const u8 {
+        return self.label[0..self.label_len];
+    }
+};
+
+comptime {
+    if (geo_services.max_key > 255 or fantasy_chan_max > 255)
+        @compileError("fantasy wait lengths must fit in u8");
+}
 
 const Numeric = enum(u16) {
     RPL_ISUPPORT = 5,
@@ -2971,9 +3009,10 @@ pub const ConnState = struct {
     send_buf: [default_reply_bytes]u8 = undefined,
     send_len: usize = 0,
     send_offset: usize = 0,
-    /// True exactly while io_uring owns `recv_buf` for this connection token.
-    /// A slot must not be freed or reused until the matching exact-generation
-    /// RECV completion clears this latch.
+    /// True exactly while a recv SQE is armed for this token. A copy recv owns
+    /// `recv_buf` until that CQE. A multishot provided-buffer recv owns a pool
+    /// slice instead; `recv_buf` is the stable copy used for parse and Helix.
+    /// A slot must not be freed until the terminal completion clears this latch.
     recv_armed: bool = false,
     send_armed: bool = false,
     /// Exact successful submission length, released only by its matching CQE.
@@ -5024,6 +5063,10 @@ pub const LinuxServer = struct {
     /// Per-channel fantasy-bot cooldown (anti-flood): the last reply time in each
     /// of a small set of recently-active channels. Bounded; oldest slot evicted.
     fantasy_cooldown: [fantasy_cooldown_slots]FantasyCooldown = @splat(.{}),
+    /// One-shot `!weather` / `!forecast` / `!news` replies waiting on the fetcher.
+    fantasy_waits: [fantasy_wait_slots]FantasyWait = @splat(.{}),
+    /// Lock-free count so reactor 0 can skip the drain when nothing is waiting.
+    fantasy_wait_live: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     props: ircx_prop_store.DefaultStore,
     /// Mesh LWW clocks for IRCX channel PROP facts. Current values live in
     /// `props`; this table retains delete tombstones for relink convergence.
@@ -5714,6 +5757,16 @@ pub const LinuxServer = struct {
             return err;
         };
         errdefer ring.deinit();
+        if (comptime builtin.os.tag == .linux) {
+            // A kernel that rejects the group leaves the ring on copy recv.
+            // Fixed files stay unregistered: Helix inherits the raw fd.
+            if (config.features.buf_ring) {
+                const count = ringlane.bufferGroupCount(config.max_clients);
+                ring.installOwnedBuffers(allocator, count, default_recv_bytes, 1) catch |err| {
+                    srvLog("ringlane: provided buffers stayed off ({s})\n", .{@errorName(err)});
+                };
+            }
+        }
 
         // Reserve the full connection table up front so ConnState buffers never
         // move under in-flight io_uring I/O (a realloc would corrupt them). Each
@@ -6027,6 +6080,9 @@ pub const LinuxServer = struct {
             .news_cache_dir = config.geo_news_cache_dir,
             .max_headlines = @intCast(@min(config.news_count, 5)),
         });
+        // `self` keeps this address; the worker only calls the hook after init.
+        geo_ptr.fetch_done = geoFetchDone;
+        geo_ptr.fetch_done_ctx = self;
 
         var latency_stats = try server_stats.LatencyStats.init(allocator, reactors.len);
         errdefer latency_stats.deinit();
@@ -7034,6 +7090,14 @@ pub const LinuxServer = struct {
             self.webhook_server = null;
         }
         try self.webhook_server.?.prepareColdResources(io);
+    }
+
+    /// Fetch thread → reactor 0. Safe from any thread: it only writes the wake
+    /// eventfd. The fantasy slots are drained later on reactor 0.
+    fn geoFetchDone(ctx: *anyopaque) void {
+        const server: *LinuxServer = @ptrCast(@alignCast(ctx));
+        if (server.reactors.len == 0) return;
+        if (server.reactors[0].wake) |*w| w.wake();
     }
 
     /// `PostSink` callback: enqueue a validated post for reactor 0 and nudge it.
@@ -10071,6 +10135,13 @@ pub const LinuxServer = struct {
         // Drain any off-thread webhook posts addressed to reactor 0 and fan each
         // into its channel on-thread. Cheap when empty (one lock-free pop).
         self.drainWebhookPosts();
+        // A finished weather/news fetch wakes reactor 0. Answer the channel here,
+        // on the reactor, so the fetcher thread never touches World.
+        if (self.fantasy_wait_live.load(.acquire) != 0 and self.rx() == &self.reactors[0]) {
+            self.world.lockWrite();
+            self.drainFantasyWaitsLocked();
+            self.world.unlockWrite();
+        }
 
         _ = try self.rx().ring.submit();
         // UPGRADE is deliberately deferred past the complete copied CQE batch,
@@ -13030,12 +13101,38 @@ pub const LinuxServer = struct {
         conn.activation_recv_required = false;
     }
 
+    /// Copy a provided-buffer payload into `recv_buf` and publish the slice
+    /// back. A copy recv has no buffer id. The slice is replenished even when
+    /// the bytes are discarded.
+    fn stageRecvPayload(self: *LinuxServer, conn: *ConnState, event: ringlane.RecvEvent) void {
+        if (comptime builtin.os.tag != .linux) return;
+        const id = event.buffer_id orelse return;
+        const src = self.rx().ring.providedSlice(id) orelse {
+            conn.closing = true;
+            return;
+        };
+        if (event.res > 0) {
+            const n: usize = @intCast(event.res);
+            if (n > src.len or n > conn.recv_buf.len) {
+                conn.closing = true;
+            } else {
+                @memcpy(conn.recv_buf[0..n], src[0..n]);
+            }
+        }
+        self.rx().ring.replenishProvidedBuffer(src, id) catch {
+            conn.closing = true;
+        };
+    }
+
     pub fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
         const was_cancel_pending = conn.recv_cancel_pending;
-        conn.recv_armed = false;
+        // Multishot recv stays armed while the kernel sets MORE. Clearing the
+        // latch here would submit a second recv beside the live SQE.
+        if (!event.more) conn.recv_armed = false;
         conn.recv_cancel_pending = false;
+        self.stageRecvPayload(conn, event);
         if (comptime builtin.os.tag == .windows) {
             if (conn.windows_force_close_cancel) {
                 try self.closeConn(event.token, conn.close_reason);
@@ -13081,6 +13178,18 @@ pub const LinuxServer = struct {
         // after another shard declared an outbound byte gap.
         if (self.abortDeliveryGapFor(id, conn)) return;
 
+        // An empty provided-buffer group disarms multishot recv with ENOBUFS.
+        // That is not EOF. Replenish already happened for any selected slice;
+        // arm again instead of closing.
+        if (comptime builtin.os.tag == .linux) {
+            if (!conn.tls_rx_offloaded and self.rx().ring.hasProvidedGroup() and
+                event.res == -@as(i32, @intFromEnum(linux.E.NOBUFS)))
+            {
+                if (!conn.closing) try self.armRecv(conn);
+                return;
+            }
+        }
+
         // kTLS RX offload: a kernel-decrypted TLS control record surfaces here as a
         // recv error (res < 0, typically -EIO) because a plain recv cannot carry the
         // record type. Demux it via recvmsg + cmsg instead of dropping the conn — a
@@ -13110,6 +13219,19 @@ pub const LinuxServer = struct {
 
         if (event.res <= 0) conn.closing = true;
         if (event.res > 0) {
+            // A selected recv that did not name its buffer must not parse a
+            // stale `recv_buf`. kTLS copy recv is the exception: the kernel
+            // wrote that buffer and the completion carries no buffer id.
+            if (comptime builtin.os.tag == .linux) {
+                if (event.buffer_id == null and !conn.tls_rx_offloaded and self.rx().ring.hasProvidedGroup()) {
+                    conn.closing = true;
+                }
+            }
+            if (conn.closing) {
+                try self.armSendIfNeeded(conn);
+                if (!hasUnsentOutput(conn)) try self.closeConn(event.token, conn.close_reason);
+                return;
+            }
             if (conn.tls_rx_offloaded) {
                 const t = conn.tls orelse return error.ClientNotFound;
                 if (!t.kernelApplicationAllowed()) {
@@ -13147,9 +13269,39 @@ pub const LinuxServer = struct {
         const was_cancel_pending = conn.send_cancel_pending;
         const submitted = conn.send_submitted_len;
         const submitted_offset = conn.send_submitted_offset;
-        conn.send_submitted_len = 0;
-        conn.send_submitted_offset = 0;
-        conn.send_armed = false;
+        // A zero-copy notification carries no new bytes. The data CQE already
+        // advanced `send_offset`. This CQE is the release of `send_buf`.
+        if (event.notif) {
+            conn.send_submitted_len = 0;
+            conn.send_submitted_offset = 0;
+            conn.send_armed = false;
+            conn.send_cancel_pending = false;
+            if (comptime builtin.os.tag == .windows) {
+                if (conn.windows_force_close_cancel) {
+                    try self.closeConn(event.token, conn.close_reason);
+                    return;
+                }
+            }
+            if (conn.send_offset >= conn.send_len) {
+                conn.send_offset = 0;
+                conn.send_len = 0;
+            }
+            if (!self.rx().socket_io_quiescing) try self.armSendIfNeeded(conn);
+            self.maybeAttachKtlsTx(conn);
+            if (conn.closing and !hasUnsentOutput(conn))
+                try self.closeConn(event.token, conn.close_reason);
+            return;
+        }
+        // `more` on a zero-copy data CQE means the notification is still
+        // coming and the kernel still reads the submitted range. Keep the
+        // latch so the buffer is not refilled or re-armed. A copy send has
+        // `more` clear and releases on this CQE.
+        const hold = event.more;
+        if (!hold) {
+            conn.send_submitted_len = 0;
+            conn.send_submitted_offset = 0;
+            conn.send_armed = false;
+        }
         conn.send_cancel_pending = false;
         if (comptime builtin.os.tag == .windows) {
             if (conn.windows_force_close_cancel) {
@@ -13175,6 +13327,19 @@ pub const LinuxServer = struct {
         // now; sending any later queued bytes would cross the known stream gap.
         if (self.abortDeliveryGapFor(id, conn)) return;
         if (event.res < 0) {
+            // A kernel that has no zero-copy send posts this once and may
+            // still owe a notification. Drop the feature for this ring and
+            // resend the same bytes by copy. A notification, when MORE was
+            // set, rearms after it releases the buffer.
+            if (comptime builtin.os.tag == .linux) {
+                if (!event.notif and !conn.tls_tx_offloaded and self.rx().ring.features.send_zc and
+                    event.res == -@as(i32, @intFromEnum(linux.E.OPNOTSUPP)))
+                {
+                    self.rx().ring.features.send_zc = false;
+                    if (!hold and !self.rx().socket_io_quiescing) try self.armSendIfNeeded(conn);
+                    return;
+                }
+            }
             // An actual stream error cannot complete the collision handshake.
             // Preserve the ordinary immediate failure path instead of retrying
             // a tail across a known byte gap.
@@ -13203,13 +13368,16 @@ pub const LinuxServer = struct {
         }
         self.stats.onBytesOut(accepted);
         conn.send_offset += @as(usize, @intCast(event.res));
-        if (conn.send_offset >= conn.send_len) {
+        // The notification still owns the submitted range. Zeroing or refilling
+        // here would overwrite bytes the kernel has not released.
+        if (!hold and conn.send_offset >= conn.send_len) {
             conn.send_offset = 0;
             conn.send_len = 0;
             // Inline buffer drained: pull the next chunk of the SendQ overflow into
             // it (nothing is armed here, so refilling the inline buffer is safe).
             refillFromOverflow(conn);
         }
+        if (hold) return;
 
         try self.armSendIfNeeded(conn);
         // Once the send stream is fully drained (armSendIfNeeded above re-armed if
@@ -17064,6 +17232,23 @@ pub const LinuxServer = struct {
     /// latch to consult.
     fn armRecv(self: *LinuxServer, conn: *ConnState) !void {
         if (self.rx().socket_io_quiescing or conn.recv_armed or conn.closing or tlsControlWaiting(conn)) return;
+        if (comptime builtin.os.tag == .linux) {
+            // kTLS RX demuxes control records with recvmsg on the connection
+            // buffer. Provided-buffer multishot cannot carry that cmsg.
+            if (!conn.tls_rx_offloaded and self.rx().ring.hasProvidedGroup()) {
+                self.rx().ring.submitRecvMultishot(conn.token, conn.fd, self.rx().ring.providedGroup()) catch |err| {
+                    if (err == error.SubmissionQueueFull) {
+                        conn.io_activation_pending = true;
+                        conn.activation_recv_required = true;
+                        self.wakeReactor();
+                        return;
+                    }
+                    return err;
+                };
+                conn.recv_armed = true;
+                return;
+            }
+        }
         io_backend.submitRecv(&self.rx().ring, conn.token, conn.fd, &conn.recv_buf) catch |err| {
             if (err == error.SubmissionQueueFull) {
                 conn.io_activation_pending = true;
@@ -17131,7 +17316,28 @@ pub const LinuxServer = struct {
                 submitted_len = @intCast(@min(submitted_len, conn.tls_kernel_prefix_remaining));
         }
         if (submitted_len == 0) return;
-        io_backend.submitSend(&self.rx().ring, conn.token, conn.fd, conn.send_buf[conn.send_offset..][0..submitted_len]) catch |err| {
+        const outbound = conn.send_buf[conn.send_offset..][0..submitted_len];
+        if (comptime builtin.os.tag == .linux) {
+            // kTLS TX is a kernel record send. Zero-copy would keep the buffer
+            // until a notification the kTLS path does not own. SO_ZEROCOPY is
+            // per socket and idempotent; a refusal stays on the copy send.
+            if (self.rx().ring.features.send_zc and !conn.tls_tx_offloaded and enableSendZerocopy(conn.fd)) {
+                self.rx().ring.submitSendZc(conn.token, conn.fd, outbound) catch |err| {
+                    if (err == error.SubmissionQueueFull) {
+                        conn.io_activation_pending = true;
+                        conn.activation_recv_required = !tlsControlWaiting(conn) and (conn.activation_recv_required or (!conn.recv_armed and !conn.closing));
+                        self.wakeReactor();
+                        return;
+                    }
+                    return err;
+                };
+                conn.send_submitted_len = submitted_len;
+                conn.send_submitted_offset = conn.send_offset;
+                conn.send_armed = true;
+                return;
+            }
+        }
+        io_backend.submitSend(&self.rx().ring, conn.token, conn.fd, outbound) catch |err| {
             if (err == error.SubmissionQueueFull) {
                 conn.io_activation_pending = true;
                 conn.activation_recv_required = !tlsControlWaiting(conn) and (conn.activation_recv_required or (!conn.recv_armed and !conn.closing));
@@ -40601,7 +40807,7 @@ pub const LinuxServer = struct {
         return if (self.config.server_name.len != 0) self.config.server_name else server_name;
     }
 
-    /// Post a server NOTICE answer to `chan` from THIS server (the replier). The
+    /// Post a server PRIVMSG answer to `chan` from THIS server (the replier). The
     /// fantasy bot only ever runs on the requesting user's own server, so the
     /// answer is generated exactly once: it is delivered to local members AND
     /// relayed to peers (so members on other nodes see the one reply, sourced
@@ -40618,7 +40824,7 @@ pub const LinuxServer = struct {
         if (dispatch.hasControlByte(text)) return;
         const origin = self.serverName();
         var buf: [default_reply_bytes]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :{s}\r\n", .{ origin, chan, text }) catch return;
+        const line = std.fmt.bufPrint(&buf, ":{s} PRIVMSG {s} :{s}\r\n", .{ origin, chan, text }) catch return;
         self.broadcastChannel(chan, line, null) catch {};
 
         // Relay across the mesh so remote members of the channel see the reply,
@@ -40627,7 +40833,7 @@ pub const LinuxServer = struct {
             const hlc = self.nextMeshHlc();
             _ = self.relay_seen.observe(self.config.node_id, hlc);
             var relay_msg = s2s_link.RelayMessage{
-                .verb = .notice,
+                .verb = .privmsg,
                 .target = chan,
                 .source_nick = origin,
                 .source_prefix = origin,
@@ -40741,7 +40947,8 @@ pub const LinuxServer = struct {
 
     /// `!weather [location]` — serve cached weather for the argument, the sender's
     /// `location` metadata, the channel's `!setweather` default, or
-    /// `[geo] default_location`; localized to the sender's `country`.
+    /// `[geo] default_location`; localized to the sender's `country`. A miss
+    /// waits for the fetcher and answers this same command.
     fn handleFantasyWeather(self: *LinuxServer, conn: *ConnState, chan: []const u8, arg: []const u8) void {
         if (!self.config.geo_enabled) return;
         self.geo.start(); // lazy-start the fetcher thread on first use
@@ -40753,24 +40960,7 @@ pub const LinuxServer = struct {
 
         const country = self.metaValue(conn.session.displayName(), "country");
         const sys = weather_units.resolveSystem(self.config.weather_units, country);
-        var scratch = geo_services.WeatherScratch{};
-        if (self.geo.getWeather(place, &scratch)) |view| {
-            var primary: [256]u8 = undefined;
-            var detail: [256]u8 = undefined;
-            const report = weather_units.renderReport(&primary, &detail, view.location, view.reading, sys);
-            var out: [320]u8 = undefined;
-            const msg = std.fmt.bufPrint(&out, "Weather - {s}", .{report.primary}) catch return;
-            self.fantasyReply(chan, msg);
-            if (report.detail.len != 0) {
-                var extra: [320]u8 = undefined;
-                const line = std.fmt.bufPrint(&extra, "  {s}", .{report.detail}) catch return;
-                self.fantasyReply(chan, line);
-            }
-        } else {
-            var out: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&out, "Fetching weather for {s}… try again in a moment.", .{place}) catch return;
-            self.fantasyReply(chan, msg);
-        }
+        self.dispatchWeather(chan, place, sys);
     }
 
     /// `!forecast [location]` — the same place and cache entry as `!weather`,
@@ -40785,35 +40975,7 @@ pub const LinuxServer = struct {
         }
         const country = self.metaValue(conn.session.displayName(), "country");
         const sys = weather_units.resolveSystem(self.config.weather_units, country);
-        var scratch = geo_services.WeatherScratch{};
-        const view = self.geo.getWeather(place, &scratch) orelse {
-            var out: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&out, "Fetching the forecast for {s}… try again in a moment.", .{place}) catch return;
-            self.fantasyReply(chan, msg);
-            return;
-        };
-        const shown = if (view.location.len != 0) view.location else place;
-        if ((view.reading.flags & weather_units.flag_rich) == 0) {
-            var out: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&out, "Fetching the forecast for {s}… try again in a moment.", .{shown}) catch return;
-            self.fantasyReply(chan, msg);
-            return;
-        }
-        if (view.day_count == 0) {
-            var out: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&out, "No multi-day forecast for {s}.", .{shown}) catch return;
-            self.fantasyReply(chan, msg);
-            return;
-        }
-        var header: [160]u8 = undefined;
-        self.fantasyReply(chan, std.fmt.bufPrint(&header, "Forecast - {s}:", .{shown}) catch return);
-        const days = @min(view.day_count, weather_units.max_days);
-        for (view.days[0..days]) |day| {
-            var body: [160]u8 = undefined;
-            var line: [180]u8 = undefined;
-            const text = weather_units.renderDay(&body, day, sys);
-            self.fantasyReply(chan, std.fmt.bufPrint(&line, "  {s}", .{text}) catch continue);
-        }
+        self.dispatchForecast(chan, place, sys);
     }
 
     /// `!news` / `!localnews` — only in +W (news-wire) channels. `local` is a
@@ -40866,22 +41028,7 @@ pub const LinuxServer = struct {
     }
 
     fn replyNewsSource(self: *LinuxServer, chan: []const u8, name: []const u8, key: []const u8, count: u8) void {
-        const want: usize = if (count == 0) self.geo.opts.max_headlines else count;
-        var storage: [geo_services.max_headline * geo_services.max_headlines]u8 = undefined;
-        var lines: [geo_services.max_headlines][]const u8 = undefined;
-        const got = self.geo.getNews(key, &storage, &lines) orelse {
-            var fb: [160]u8 = undefined;
-            self.fantasyReply(chan, std.fmt.bufPrint(&fb, "Fetching {s} headlines… try again in a moment.", .{name}) catch return);
-            return;
-        };
-        var hb: [160]u8 = undefined;
-        self.fantasyReply(chan, std.fmt.bufPrint(&hb, "News - {s}:", .{name}) catch name);
-        const show = @min(got.len, want);
-        const now = @divFloor(platform.realtimeMillis(), 1000);
-        for (got[0..show], 1..) |headline, n| {
-            var lb: [320]u8 = undefined;
-            self.fantasyReply(chan, geo_fetch.formatHeadline(&lb, n, headline, now));
-        }
+        self.dispatchNews(chan, name, key, count, false);
     }
 
     fn replyNewsTopic(self: *LinuxServer, chan: []const u8, topic: []const u8, count: u8) void {
@@ -40896,27 +41043,17 @@ pub const LinuxServer = struct {
         const per: usize = if (count == 0) 1 else count;
         var header: [96]u8 = undefined;
         self.fantasyReply(chan, std.fmt.bufPrint(&header, "News - {s}:", .{topic}) catch "News:");
-        const now = @divFloor(platform.realtimeMillis(), 1000);
         for (0..warm) |i| {
             const src = news_sources.sources[indexes[i]];
             var keybuf: [80]u8 = undefined;
             const key = std.fmt.bufPrint(&keybuf, "src:{s}", .{src.key}) catch continue;
-            var storage: [geo_services.max_headline * geo_services.max_headlines]u8 = undefined;
-            var lines: [geo_services.max_headlines][]const u8 = undefined;
-            const got = self.geo.getNews(key, &storage, &lines);
-            if (i >= show) continue;
-            if (got == null) {
-                var fb: [160]u8 = undefined;
-                self.fantasyReply(chan, std.fmt.bufPrint(&fb, "Fetching {s}…", .{src.name}) catch continue);
+            if (i >= show) {
+                var storage: [geo_services.max_headline * geo_services.max_headlines]u8 = undefined;
+                var lines: [geo_services.max_headlines][]const u8 = undefined;
+                _ = self.geo.getNews(key, &storage, &lines);
                 continue;
             }
-            var name_buf: [128]u8 = undefined;
-            self.fantasyReply(chan, std.fmt.bufPrint(&name_buf, "  {s}:", .{src.name}) catch continue);
-            const take = @min(got.?.len, per);
-            for (got.?[0..take], 1..) |headline, n| {
-                var lb: [320]u8 = undefined;
-                self.fantasyReply(chan, geo_fetch.formatHeadline(&lb, n, headline, now));
-            }
+            self.dispatchNews(chan, src.name, key, @intCast(per), true);
         }
         if (matched <= show) return;
         var more: [360]u8 = undefined;
@@ -40955,6 +41092,267 @@ pub const LinuxServer = struct {
         }
         var topics_buf: [240]u8 = undefined;
         self.fantasyReply(chan, news_sources.formatTopics(&topics_buf));
+    }
+
+    fn dispatchWeather(self: *LinuxServer, chan: []const u8, place: []const u8, sys: weather_units.UnitSystem) void {
+        var scratch = geo_services.WeatherScratch{};
+        if (self.geo.getWeather(place, &scratch)) |view| {
+            self.replyWeather(chan, view, sys);
+            return;
+        }
+        self.rememberFantasyWait(.weather, chan, place, place, sys, 0, false);
+        var again = geo_services.WeatherScratch{};
+        if (self.geo.getWeather(place, &again)) |view| {
+            self.cancelFantasyWait(.weather, chan, place);
+            self.replyWeather(chan, view, sys);
+        }
+    }
+
+    fn dispatchForecast(self: *LinuxServer, chan: []const u8, place: []const u8, sys: weather_units.UnitSystem) void {
+        var scratch = geo_services.WeatherScratch{};
+        if (self.geo.getWeather(place, &scratch)) |view| {
+            if ((view.reading.flags & weather_units.flag_rich) != 0 or !self.geo.weatherBusy(place)) {
+                self.replyForecast(chan, view, sys, place);
+                return;
+            }
+        }
+        self.rememberFantasyWait(.forecast, chan, place, place, sys, 0, false);
+        var again = geo_services.WeatherScratch{};
+        if (self.geo.getWeather(place, &again)) |view| {
+            if ((view.reading.flags & weather_units.flag_rich) != 0 or !self.geo.weatherBusy(place)) {
+                self.cancelFantasyWait(.forecast, chan, place);
+                self.replyForecast(chan, view, sys, place);
+            }
+        }
+    }
+
+    fn dispatchNews(self: *LinuxServer, chan: []const u8, name: []const u8, key: []const u8, count: u8, topic_child: bool) void {
+        const want: usize = if (count == 0) self.geo.opts.max_headlines else count;
+        var storage: [geo_services.max_headline * geo_services.max_headlines]u8 = undefined;
+        var lines: [geo_services.max_headlines][]const u8 = undefined;
+        if (self.geo.getNews(key, &storage, &lines)) |got| {
+            self.replyNewsBlock(chan, name, got, want, topic_child);
+            return;
+        }
+        self.rememberFantasyWait(.news, chan, key, name, .metric, count, topic_child);
+        var storage2: [geo_services.max_headline * geo_services.max_headlines]u8 = undefined;
+        var lines2: [geo_services.max_headlines][]const u8 = undefined;
+        if (self.geo.getNews(key, &storage2, &lines2)) |got| {
+            self.cancelFantasyWait(.news, chan, key);
+            self.replyNewsBlock(chan, name, got, want, topic_child);
+        }
+    }
+
+    fn replyWeather(self: *LinuxServer, chan: []const u8, view: geo_services.WeatherView, sys: weather_units.UnitSystem) void {
+        var primary: [256]u8 = undefined;
+        var detail: [256]u8 = undefined;
+        const report = weather_units.renderReport(&primary, &detail, view.location, view.reading, sys);
+        var out: [320]u8 = undefined;
+        const msg = std.fmt.bufPrint(&out, "Weather - {s}", .{report.primary}) catch return;
+        self.fantasyReply(chan, msg);
+        if (report.detail.len != 0) {
+            var extra: [320]u8 = undefined;
+            const line = std.fmt.bufPrint(&extra, "  {s}", .{report.detail}) catch return;
+            self.fantasyReply(chan, line);
+        }
+    }
+
+    fn replyForecast(self: *LinuxServer, chan: []const u8, view: geo_services.WeatherView, sys: weather_units.UnitSystem, place: []const u8) void {
+        const shown = if (view.location.len != 0) view.location else place;
+        if ((view.reading.flags & weather_units.flag_rich) == 0 or view.day_count == 0) {
+            var out: [160]u8 = undefined;
+            self.fantasyReply(chan, std.fmt.bufPrint(&out, "No multi-day forecast for {s}.", .{shown}) catch return);
+            return;
+        }
+        var header: [160]u8 = undefined;
+        self.fantasyReply(chan, std.fmt.bufPrint(&header, "Forecast - {s}:", .{shown}) catch return);
+        const days = @min(view.day_count, weather_units.max_days);
+        for (view.days[0..days]) |day| {
+            var body: [160]u8 = undefined;
+            var line: [180]u8 = undefined;
+            const text = weather_units.renderDay(&body, day, sys);
+            self.fantasyReply(chan, std.fmt.bufPrint(&line, "  {s}", .{text}) catch continue);
+        }
+    }
+
+    fn replyNewsBlock(self: *LinuxServer, chan: []const u8, name: []const u8, headlines: []const []const u8, want: usize, topic_child: bool) void {
+        if (topic_child) {
+            var name_buf: [128]u8 = undefined;
+            self.fantasyReply(chan, std.fmt.bufPrint(&name_buf, "  {s}:", .{name}) catch return);
+        } else {
+            var hb: [160]u8 = undefined;
+            self.fantasyReply(chan, std.fmt.bufPrint(&hb, "News - {s}:", .{name}) catch name);
+        }
+        const show = @min(headlines.len, want);
+        const now = @divFloor(platform.realtimeMillis(), 1000);
+        for (headlines[0..show], 1..) |headline, n| {
+            var lb: [320]u8 = undefined;
+            self.fantasyReply(chan, geo_fetch.formatHeadline(&lb, n, headline, now));
+        }
+    }
+
+    fn replyFantasyUnavailable(self: *LinuxServer, chan: []const u8, kind: FantasyWaitKind, label: []const u8) void {
+        var out: [160]u8 = undefined;
+        const msg = switch (kind) {
+            .weather => std.fmt.bufPrint(&out, "Weather for {s} is unavailable right now.", .{label}) catch return,
+            .forecast => std.fmt.bufPrint(&out, "Forecast for {s} is unavailable right now.", .{label}) catch return,
+            .news => std.fmt.bufPrint(&out, "Headlines from {s} are unavailable right now.", .{label}) catch return,
+            .empty => return,
+        };
+        self.fantasyReply(chan, msg);
+    }
+
+    fn rememberFantasyWait(
+        self: *LinuxServer,
+        kind: FantasyWaitKind,
+        chan: []const u8,
+        key: []const u8,
+        label: []const u8,
+        units: weather_units.UnitSystem,
+        count: u8,
+        topic_child: bool,
+    ) void {
+        if (kind == .empty or chan.len == 0 or key.len == 0) return;
+        if (chan.len > fantasy_chan_max or key.len > geo_services.max_key) {
+            self.replyFantasyUnavailable(chan, kind, label);
+            return;
+        }
+        var found = false;
+        var empty: ?*FantasyWait = null;
+        var oldest: *FantasyWait = &self.fantasy_waits[0];
+        var slot: *FantasyWait = &self.fantasy_waits[0];
+        for (&self.fantasy_waits) |*w| {
+            if (w.kind == .empty) {
+                if (empty == null) empty = w;
+                continue;
+            }
+            if (w.armed_ms < oldest.armed_ms) oldest = w;
+            if (w.kind == kind and std.ascii.eqlIgnoreCase(w.channel(), chan) and std.ascii.eqlIgnoreCase(w.keySlice(), key)) {
+                slot = w;
+                found = true;
+                break;
+            }
+        }
+        const use_empty = !found and empty != null;
+        if (!found) slot = empty orelse oldest;
+        slot.kind = kind;
+        slot.chan_len = @intCast(chan.len);
+        @memcpy(slot.chan[0..chan.len], chan);
+        slot.key_len = @intCast(key.len);
+        @memcpy(slot.key[0..key.len], key);
+        const lab_n = @min(label.len, slot.label.len);
+        slot.label_len = @intCast(lab_n);
+        @memcpy(slot.label[0..lab_n], label[0..lab_n]);
+        slot.units = units;
+        slot.count = count;
+        slot.topic_child = topic_child;
+        slot.armed_ms = self.nowMs();
+        if (use_empty) _ = self.fantasy_wait_live.fetchAdd(1, .release);
+    }
+
+    fn cancelFantasyWait(self: *LinuxServer, kind: FantasyWaitKind, chan: []const u8, key: []const u8) void {
+        for (&self.fantasy_waits) |*w| {
+            if (w.kind == kind and std.ascii.eqlIgnoreCase(w.channel(), chan) and std.ascii.eqlIgnoreCase(w.keySlice(), key)) {
+                w.kind = .empty;
+                self.noteFantasyWaitCleared();
+                return;
+            }
+        }
+    }
+
+    fn noteFantasyWaitCleared(self: *LinuxServer) void {
+        var cur = self.fantasy_wait_live.load(.acquire);
+        while (cur != 0) {
+            if (self.fantasy_wait_live.cmpxchgWeak(cur, cur - 1, .release, .acquire) == null) return;
+            cur = self.fantasy_wait_live.load(.acquire);
+        }
+    }
+
+    fn clearFantasyWait(self: *LinuxServer, w: *FantasyWait) FantasyWait {
+        const kept = w.*;
+        w.kind = .empty;
+        self.noteFantasyWaitCleared();
+        return kept;
+    }
+
+    /// Reactor 0, world lock held. Sends a ready report or, once the fetch has
+    /// failed or the wait has expired, one unavailable PRIVMSG.
+    fn drainFantasyWaitsLocked(self: *LinuxServer) void {
+        const now = self.nowMs();
+        for (&self.fantasy_waits) |*w| {
+            if (w.kind == .empty) continue;
+            const expired = now - w.armed_ms >= fantasy_wait_ms;
+            switch (w.kind) {
+                .empty => {},
+                .weather => self.drainWeatherWait(w, expired),
+                .forecast => self.drainForecastWait(w, expired),
+                .news => self.drainNewsWait(w, expired),
+            }
+        }
+    }
+
+    fn drainWeatherWait(self: *LinuxServer, w: *FantasyWait, expired: bool) void {
+        const key = w.keySlice();
+        switch (self.geo.weatherPhase(key)) {
+            .ready => {
+                var scratch = geo_services.WeatherScratch{};
+                if (self.geo.getWeather(key, &scratch)) |view| {
+                    const kept = self.clearFantasyWait(w);
+                    self.replyWeather(kept.channel(), view, kept.units);
+                    return;
+                }
+            },
+            .inflight => if (!expired) return,
+            .absent, .failed => {},
+        }
+        const kept = self.clearFantasyWait(w);
+        self.replyFantasyUnavailable(kept.channel(), .weather, kept.labelSlice());
+    }
+
+    fn drainForecastWait(self: *LinuxServer, w: *FantasyWait, expired: bool) void {
+        const key = w.keySlice();
+        switch (self.geo.weatherPhase(key)) {
+            .ready => {
+                var scratch = geo_services.WeatherScratch{};
+                if (self.geo.getWeather(key, &scratch)) |view| {
+                    const rich = (view.reading.flags & weather_units.flag_rich) != 0;
+                    if (rich or expired or !self.geo.weatherBusy(key)) {
+                        const kept = self.clearFantasyWait(w);
+                        if (rich) self.replyForecast(kept.channel(), view, kept.units, kept.labelSlice()) else {
+                            var out: [160]u8 = undefined;
+                            const shown = if (view.location.len != 0) view.location else kept.labelSlice();
+                            self.fantasyReply(kept.channel(), std.fmt.bufPrint(&out, "No multi-day forecast for {s}.", .{shown}) catch return);
+                        }
+                        return;
+                    }
+                    return;
+                }
+            },
+            .inflight => if (!expired) return,
+            .absent, .failed => {},
+        }
+        const kept = self.clearFantasyWait(w);
+        self.replyFantasyUnavailable(kept.channel(), .forecast, kept.labelSlice());
+    }
+
+    fn drainNewsWait(self: *LinuxServer, w: *FantasyWait, expired: bool) void {
+        const key = w.keySlice();
+        switch (self.geo.newsPhase(key)) {
+            .ready => {
+                var storage: [geo_services.max_headline * geo_services.max_headlines]u8 = undefined;
+                var lines: [geo_services.max_headlines][]const u8 = undefined;
+                if (self.geo.getNews(key, &storage, &lines)) |got| {
+                    const kept = self.clearFantasyWait(w);
+                    const want: usize = if (kept.count == 0) self.geo.opts.max_headlines else kept.count;
+                    self.replyNewsBlock(kept.channel(), kept.labelSlice(), got, want, kept.topic_child);
+                    return;
+                }
+            },
+            .inflight => if (!expired) return,
+            .absent, .failed => {},
+        }
+        const kept = self.clearFantasyWait(w);
+        self.replyFantasyUnavailable(kept.channel(), .news, kept.labelSlice());
     }
 
     /// Parse an IPv4 or IPv6 literal into a geoip.Ip, or null if malformed.
@@ -61893,7 +62291,7 @@ pub const LinuxServer = struct {
             const opmod_route = speech == .opmoderate;
             // Fantasy bot: a speaker's PRIVMSG beginning with '!' may invoke the
             // weather/news bot. The message is still delivered to the channel
-            // normally below; this only posts the server's answer as a NOTICE.
+            // normally below; this only posts the server's answer as a PRIVMSG.
             // Required rooms never treat ciphertext as a bot command.
             if (!is_notice and self.channelEncryptionPolicy(chan) != .required and
                 text.len > 1 and text[0] == '!')
@@ -75617,6 +76015,15 @@ fn applyClientKeepalive(fd: linux.fd_t) void {
         };
     }
     io_backend.setTcpNoDelay(fd);
+}
+
+/// Opt this socket into zero-copy send. io_uring still posts the buffer
+/// notification itself. A kernel that rejects the option leaves the caller
+/// on the copy path.
+fn enableSendZerocopy(fd: linux.fd_t) bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    const enable: u32 = 1;
+    return posix.errno(linux.setsockopt(fd, posix.SOL.SOCKET, linux.SO.ZEROCOPY, std.mem.asBytes(&enable), @sizeOf(u32))) == .SUCCESS;
 }
 
 fn socketPort(fd: linux.fd_t) ServerError!u16 {
@@ -108014,6 +108421,129 @@ test "ring: poll op fires a completion when a watched eventfd becomes readable" 
     } else return error.SkipZigTest;
 }
 
+test "ringlane multishot recv copies into the connection and zero-copy send waits for notif" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_clients = 2,
+        .features = .{
+            .buf_ring = true,
+            .multishot_recv = true,
+            .send_zc = true,
+        },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+    if (!server.rx().ring.hasProvidedGroup()) return error.SkipZigTest;
+    try std.testing.expect(server.rx().ring.features.send_zc);
+    try std.testing.expect(!server.rx().ring.features.fixed_files);
+    try std.testing.expectEqual(@as(u32, 0), server.rx().ring.fixed_count);
+    try std.testing.expect((server.rx().ring.inner.flags & linux.IORING_SETUP_DEFER_TASKRUN) == 0);
+    try std.testing.expect((server.rx().ring.inner.flags & linux.IORING_SETUP_SINGLE_ISSUER) == 0);
+
+    const listener = createListener("127.0.0.1", 0, 8) catch return error.SkipZigTest;
+    defer closeFd(listener);
+    const port = socketPort(listener) catch return error.SkipZigTest;
+    const client = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(client);
+    const client_flags = linux.fcntl(client, posix.F.GETFL, 0);
+    if (posix.errno(client_flags) == .SUCCESS) {
+        _ = linux.fcntl(client, posix.F.SETFL, client_flags | posix.SOCK.NONBLOCK);
+    }
+    const accepted_rc = linux.accept4(listener, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+    if (posix.errno(accepted_rc) != .SUCCESS) return error.SkipZigTest;
+    const accepted: linux.fd_t = @intCast(accepted_rc);
+    const enable: u32 = 1;
+    _ = linux.setsockopt(accepted, posix.SOL.SOCKET, linux.SO.ZEROCOPY, std.mem.asBytes(&enable), @sizeOf(u32));
+
+    const id = try server.reactors[0].clients.alloc(ConnState.init(accepted));
+    const conn = server.reactors[0].clients.get(id) orelse return error.TestUnexpectedResult;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    try server.armRecv(conn);
+    try std.testing.expect(conn.recv_armed);
+
+    const inbound = "hi";
+    const wrote = linux.write(client, inbound.ptr, inbound.len);
+    if (posix.errno(wrote) != .SUCCESS or wrote != inbound.len) return error.TestUnexpectedResult;
+
+    const Handler = struct {
+        server: *Server,
+        conn: *ConnState,
+        expect: usize,
+        held_after_bytes: bool = false,
+        released: bool = false,
+        pub fn onCompletion(self: *@This(), completion: ringlane.Completion) void {
+            switch (completion) {
+                .recv => |event| self.server.handleRecv(event) catch {},
+                .send => |event| {
+                    self.server.handleSend(event) catch {};
+                    if (event.notif) {
+                        self.released = !self.conn.send_armed and self.conn.send_len == 0 and self.conn.send_offset == 0;
+                    } else if (self.conn.send_offset == self.expect) {
+                        self.held_after_bytes = self.conn.send_armed;
+                    }
+                },
+                else => {},
+            }
+        }
+    };
+    var handler = Handler{ .server = server, .conn = conn, .expect = 0 };
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var recv_spins: u8 = 0;
+    while (conn.line_len < inbound.len and recv_spins < 8) : (recv_spins += 1) {
+        _ = try server.rx().ring.submitAndWait(1);
+        try server.rx().ring.reapCompletions(&cqes, 0, &handler);
+    }
+    try std.testing.expect(conn.recv_armed);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expectEqual(@as(usize, inbound.len), conn.line_len);
+    try std.testing.expectEqualSlices(u8, inbound, conn.line_buf[0..conn.line_len]);
+
+    const outbound = "pong";
+    @memcpy(conn.send_buf[0..outbound.len], outbound);
+    conn.send_len = outbound.len;
+    conn.send_offset = 0;
+    handler.expect = outbound.len;
+    try server.armSendIfNeeded(conn);
+    try std.testing.expect(conn.send_armed);
+    try std.testing.expectEqual(@as(usize, outbound.len), conn.send_submitted_len);
+
+    var spins: u8 = 0;
+    while ((!handler.held_after_bytes or !handler.released) and spins < 8) : (spins += 1) {
+        _ = try server.rx().ring.submitAndWait(1);
+        try server.rx().ring.reapCompletions(&cqes, 0, &handler);
+    }
+    try std.testing.expect(handler.held_after_bytes);
+    try std.testing.expect(handler.released);
+    try std.testing.expect(!conn.send_armed);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_offset);
+
+    var got: [8]u8 = @splat(0);
+    var n: usize = 0;
+    var reads: u8 = 0;
+    while (reads < 8) : (reads += 1) {
+        const rc = linux.read(client, got[0..].ptr, outbound.len);
+        if (posix.errno(rc) == .SUCCESS) {
+            n = rc;
+            break;
+        }
+        if (posix.errno(rc) != .AGAIN) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(outbound.len, n);
+    try std.testing.expectEqualSlices(u8, outbound, got[0..outbound.len]);
+}
+
 test "threaded server: implicit-TLS client handshakes + registers over the wire" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const Ed25519 = std.crypto.sign.Ed25519;
@@ -112233,8 +112763,63 @@ test "exploit: fantasyReply drops CRLF-smuggled external-feed content (broadcast
     conn.send_len = 0;
     server.fantasyReply("#room", "sunny 25C, light breeze");
     const out = conn.send_buf[0..conn.send_len];
-    try expectContains(out, " NOTICE #room :sunny 25C, light breeze\r\n");
+    try expectContains(out, " PRIVMSG #room :sunny 25C, light breeze\r\n");
     try assertNoInjectedWireLine(out);
+}
+
+test "fantasy weather arrives as one channel PRIVMSG" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.config.geo_enabled = true;
+    server.config.weather_units = "imperial";
+    server.geo.opts.weather_enabled = true;
+    // Keep the test off the network. start() returns while a pause epoch is set.
+    server.geo.lazy_pause_epoch = 1;
+
+    const id = try addTestLocalClient(server, "victim", null);
+    const conn = server.connFor(id).?;
+    _ = try server.world.join("#room", worldIdFromClient(id));
+
+    server.geo.testingReadyWeather("Austin", 22, 20, "Partly cloudy", "Austin");
+    server.handleFantasyWeather(conn, "#room", "Austin");
+    const cached = conn.send_buf[0..conn.send_len];
+    try expectContains(cached, " PRIVMSG #room :Weather - Austin: 72°F, Partly cloudy, wind 12 mph\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, cached, " NOTICE ") == null);
+    try std.testing.expectEqual(@as(u32, 0), server.fantasy_wait_live.load(.acquire));
+
+    conn.send_len = 0;
+    server.handleFantasyWeather(conn, "#room", "paris");
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expect(server.geo.thread == null);
+    try std.testing.expectEqual(@as(u32, 1), server.fantasy_wait_live.load(.acquire));
+    server.drainFantasyWaitsLocked();
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+
+    server.geo.testingReadyWeather("paris", 22, 20, "Partly cloudy", "Paris");
+    server.drainFantasyWaitsLocked();
+    const fetched = conn.send_buf[0..conn.send_len];
+    try expectContains(fetched, " PRIVMSG #room :Weather - Paris: 72°F, Partly cloudy, wind 12 mph\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "Fetching") == null);
+    try std.testing.expectEqual(@as(u32, 0), server.fantasy_wait_live.load(.acquire));
+
+    conn.send_len = 0;
+    server.handleFantasyWeather(conn, "#room", "rome");
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    server.geo.testingFailFetch(.weather, "rome");
+    server.drainFantasyWaitsLocked();
+    const failed = conn.send_buf[0..conn.send_len];
+    try expectContains(failed, " PRIVMSG #room :Weather for rome is unavailable right now.\r\n");
+    try std.testing.expect(std.mem.indexOf(u8, failed, " NOTICE ") == null);
+    const failed_len = conn.send_len;
+    server.drainFantasyWaitsLocked();
+    try std.testing.expectEqual(failed_len, conn.send_len);
+    try std.testing.expectEqual(@as(u32, 0), server.fantasy_wait_live.load(.acquire));
 }
 
 // --- Exploit corpus (Part B / P2, §1A, CWE-20,190,770): the client wire parser

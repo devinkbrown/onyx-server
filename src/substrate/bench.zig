@@ -18,8 +18,8 @@
 //!
 //! It does **not** boot the daemon and does **not** open a fixed port. Every socket
 //! it creates is loopback on an ephemeral port (`port = 0`). Nothing here touches
-//! `src/substrate/io/ring.zig` — wiring the modern io_uring feature set is P0-2,
-//! owned by onyx-server-reactor. This is baseline-only, by design.
+//! `src/substrate/io/ring.zig`. The daemon ring now arms multishot recv and
+//! zero-copy send; this harness still does not measure that path.
 //!
 //! WHAT IT MEASURES
 //! ----------------
