@@ -10,11 +10,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
+const client_socket_policy = @import("client_socket_policy.zig");
 
 /// Pending TFO handshakes the listener will accept. Set before listen.
 pub const fastopen_queue: u32 = 256;
-/// Unacked data abort, in milliseconds. Idle clients are not affected.
-pub const user_timeout_ms: u32 = 30_000;
+/// Bound unacknowledged data and keepalive failure without shortening the
+/// configured three-probe keepalive window. Accepted sockets inherit this.
+pub const user_timeout_ms: u32 = client_socket_policy.user_timeout_ms;
 
 /// CPU index for SO_INCOMING_CPU. Shards spread across the machine's CPUs;
 /// a one-CPU host stays on CPU 0.
@@ -203,7 +205,7 @@ pub fn restrictFilesystem(dirs: []const SandboxDir) error{Unexpected}!void {
     // landlock_restrict_self returns EPERM unless no_new_privs is set or the
     // caller holds CAP_SYS_ADMIN. The bit is irreversible and stays in this
     // process, which is the forked proof or the long-running main path.
-    const no_new = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+    const no_new = linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     if (posix.errno(no_new) != .SUCCESS) return error.Unexpected;
     const abi = landlockAbi() catch return error.Unexpected;
     if (abi < 1) return error.Unexpected;
@@ -265,12 +267,12 @@ pub fn installSyscallDenylist() error{Unexpected}!void {
         else => 0,
     };
     const denied = [_]u32{
-        @intCast(@intFromEnum(linux.SYS.ptrace)),
-        @intCast(@intFromEnum(linux.SYS.reboot)),
-        @intCast(@intFromEnum(linux.SYS.kexec_load)),
-        @intCast(@intFromEnum(linux.SYS.init_module)),
-        @intCast(@intFromEnum(linux.SYS.delete_module)),
-        @intCast(@intFromEnum(linux.SYS.swapon)),
+        @intCast(@backingInt(linux.SYS.ptrace)),
+        @intCast(@backingInt(linux.SYS.reboot)),
+        @intCast(@backingInt(linux.SYS.kexec_load)),
+        @intCast(@backingInt(linux.SYS.init_module)),
+        @intCast(@backingInt(linux.SYS.delete_module)),
+        @intCast(@backingInt(linux.SYS.swapon)),
     };
     var filters: [3 + 1 + denied.len * 2 + 1]SockFilter = undefined;
     var n: usize = 0;
@@ -293,7 +295,7 @@ pub fn installSyscallDenylist() error{Unexpected}!void {
     filters[n] = bpfStmt(bpf_ret_k, seccomp_ret_allow);
     n += 1;
 
-    const no_new = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+    const no_new = linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     if (posix.errno(no_new) != .SUCCESS) return error.Unexpected;
     var prog = SockFprog{ .len = @intCast(n), .filter = &filters };
     const rc = linux.syscall3(.seccomp, linux.SECCOMP.SET_MODE_FILTER, 0, @intFromPtr(&prog));
