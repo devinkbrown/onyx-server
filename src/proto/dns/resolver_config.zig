@@ -11,10 +11,11 @@ const wire = @import("wire.zig");
 
 pub const max_nameservers: usize = 4;
 
-/// Resolver settings: the nameserver list (UDP) plus timeout/retry policy.
+/// Resolver settings: UDP/TCP nameservers plus timeout/retry policy.
+/// Field layout is also consumed by the daemon resolver configuration digest.
 pub const ResolverConfig = struct {
     nameservers: [max_nameservers]wire.Address = undefined,
-    /// IPv6 link-local DNS servers require the adapter's scope ID on Windows.
+    /// IPv6 scoped nameservers use a native interface index on every platform.
     nameserver_scope_ids: [max_nameservers]u32 = @splat(0),
     nameserver_count: usize = 0,
     port: u16 = 53,
@@ -55,25 +56,66 @@ pub fn parseIpLiteral(text: []const u8) ?wire.Address {
     return null;
 }
 
-/// Parse `nameserver` directives out of resolv.conf text into `cfg`. IPv4 and
-/// IPv6 literals are recognized; comments and other directives are ignored.
-/// Returns the total nameserver count now held by `cfg`.
+/// Parse resolv.conf nameservers and bounded timeout/attempt options. Interface
+/// scopes may be numeric or native POSIX interface names. Invalid scopes are
+/// rejected rather than silently sending link-local queries on interface zero.
+/// Search lists and suffix expansion are intentionally outside this stub API.
 pub fn parseResolvConf(text: []const u8, cfg: *ResolverConfig) usize {
-    var it = std.mem.tokenizeAny(u8, text, "\r\n");
-    while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t");
-        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
-        const keyword = "nameserver";
-        if (!std.mem.startsWith(u8, line, keyword)) continue;
-        if (line.len == keyword.len or (line[keyword.len] != ' ' and line[keyword.len] != '\t')) continue;
-        const rest = std.mem.trim(u8, line[keyword.len..], " \t");
-        if (rest.len == 0) continue;
-        // Strip an optional %zone / trailing comment token.
-        var field = rest;
-        if (std.mem.indexOfAny(u8, field, " \t#;%")) |cut| field = field[0..cut];
-        if (parseIpLiteral(field)) |addr| cfg.addNameserver(addr);
+    var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+    while (lines.next()) |raw| {
+        const comment = std.mem.indexOfAny(u8, raw, "#;") orelse raw.len;
+        var fields = std.mem.tokenizeAny(u8, raw[0..comment], " \t");
+        const keyword = fields.next() orelse continue;
+        if (std.mem.eql(u8, keyword, "options")) {
+            while (fields.next()) |option| {
+                if (std.mem.startsWith(u8, option, "timeout:")) {
+                    const seconds = std.fmt.parseInt(u32, option[8..], 10) catch continue;
+                    cfg.timeout_ms = @as(u32, @min(@max(seconds, 1), 5)) * 1000;
+                } else if (std.mem.startsWith(u8, option, "attempts:")) {
+                    const attempts = std.fmt.parseInt(u32, option[9..], 10) catch continue;
+                    cfg.attempts = @intCast(@min(@max(attempts, 1), 3));
+                }
+            }
+            continue;
+        }
+        if (!std.mem.eql(u8, keyword, "nameserver")) continue;
+        const field = fields.next() orelse continue;
+        const split = std.mem.indexOfScalar(u8, field, '%');
+        const address = parseIpLiteral(field[0..(split orelse field.len)]) orelse continue;
+        var scope: u32 = 0;
+        if (split) |index| {
+            if (address != .ipv6) continue;
+            scope = scopeIndex(field[index + 1 ..]) orelse continue;
+        }
+        if (address == .ipv6 and address.ipv6[0] == 0xfe and address.ipv6[1] & 0xc0 == 0x80 and scope == 0) continue;
+        cfg.addSystemNameserver(address, scope);
     }
     return cfg.nameserver_count;
+}
+
+fn scopeIndex(zone: []const u8) ?u32 {
+    if (zone.len == 0) return null;
+    if (std.fmt.parseInt(u32, zone, 10)) |index| return if (index == 0) null else index else |_| {}
+    if (zone.len >= 16) return null;
+    // Interface names cannot contain a DNS delimiter or path component.
+    for (zone) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return null;
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const raw = linux.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
+        if (posix.errno(raw) != .SUCCESS) return null;
+        const fd: posix.fd_t = @intCast(raw);
+        defer _ = linux.close(fd);
+        var request: linux.ifreq = std.mem.zeroes(linux.ifreq);
+        @memcpy(request.ifrn.name[0..zone.len], zone);
+        if (posix.errno(linux.ioctl(fd, linux.SIOCGIFINDEX, @intFromPtr(&request))) != .SUCCESS or request.ifru.ivalue <= 0) return null;
+        return @intCast(request.ifru.ivalue);
+    } else if (comptime builtin.os.tag == .openbsd) {
+        var name: [16:0]u8 = @splat(0);
+        @memcpy(name[0..zone.len], zone);
+        const index = std.c.if_nametoindex(&name);
+        return if (index > 0) @intCast(index) else null;
+    }
+    return null;
 }
 
 /// Build a resolver config from the host's configured DNS servers. Windows
@@ -87,7 +129,9 @@ pub fn systemResolverConfig() ResolverConfig {
     }
     var buf: [8192]u8 = undefined;
     if (readFileZ("/etc/resolv.conf", &buf)) |contents| {
-        _ = parseResolvConf(contents, &cfg);
+        // A full buffer may end inside a directive. Parse complete lines only.
+        const end = if (contents.len == buf.len) std.mem.lastIndexOfScalar(u8, contents, '\n') orelse 0 else contents.len;
+        _ = parseResolvConf(contents[0..end], &cfg);
     }
     if (cfg.nameserver_count == 0) {
         cfg.addNameserver(.{ .ipv4 = .{ 1, 1, 1, 1 } });
@@ -468,4 +512,34 @@ test "parseResolvConf requires whitespace after nameserver keyword" {
     try std.testing.expectEqual(@as(usize, 2), parseResolvConf(text, &cfg));
     try std.testing.expectEqual(wire.Address{ .ipv4 = .{ 192, 0, 2, 53 } }, cfg.nameservers[0]);
     try std.testing.expectEqual(parseIpLiteral("2001:db8::53").?, cfg.nameservers[1]);
+}
+
+test "DNS resolv.conf preserves numeric IPv6 scopes deduplicates and bounds retry options" {
+    var cfg = ResolverConfig{};
+    const text =
+        \\nameserver fe80::53%7
+        \\nameserver fe80::53%7
+        \\nameserver fe80::53%8 # distinct interface
+        \\nameserver fe80::53
+        \\nameserver fe80::53%0
+        \\nameserver fe80::53%4294967296
+        \\nameserver 192.0.2.1%2
+        \\nameserver 192.0.2.53
+        \\options timeout:999 attempts:999
+    ;
+    try std.testing.expectEqual(@as(usize, 3), parseResolvConf(text, &cfg));
+    try std.testing.expectEqualSlices(u32, &.{ 7, 8, 0 }, cfg.nameserver_scope_ids[0..3]);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.timeout_ms);
+    try std.testing.expectEqual(@as(u8, 3), cfg.attempts);
+    _ = parseResolvConf("options timeout:0 attempts:0\noptions timeout:bad attempts:bad", &cfg);
+    try std.testing.expectEqual(@as(u32, 1000), cfg.timeout_ms);
+    try std.testing.expectEqual(@as(u8, 1), cfg.attempts);
+}
+
+test "DNS resolv.conf resolves native loopback interface scopes" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var cfg = ResolverConfig{};
+    const line = if (builtin.os.tag == .linux) "nameserver fe80::53%lo" else "nameserver fe80::53%lo0";
+    try std.testing.expectEqual(@as(usize, 1), parseResolvConf(line, &cfg));
+    try std.testing.expect(cfg.nameserver_scope_ids[0] != 0);
 }
