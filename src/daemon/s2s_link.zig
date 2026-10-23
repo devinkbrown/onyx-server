@@ -556,6 +556,10 @@ pub const S2sLink = struct {
         return self.peer.supportsSecureRelayV2();
     }
 
+    pub fn supportsSecureRelayV2Guest(self: *const S2sLink) bool {
+        return self.peer.supportsSecureRelayV2Guest();
+    }
+
     pub fn supportsRelayV2AckConfirm(self: *const S2sLink) bool {
         return self.peer.supportsRelayV2AckConfirm();
     }
@@ -638,6 +642,10 @@ pub const S2sLink = struct {
 
     pub fn probeRelayV2Current(self: *S2sLink) !void {
         try self.peer.probeRelayV2Current(self.sink());
+    }
+
+    pub fn probeSecureRelayV2Guest(self: *S2sLink) !void {
+        try self.peer.probeSecureRelayV2Guest(self.sink());
     }
 
     pub fn takeInboundV2Acks(self: *S2sLink) ![]message_relay_v2.RelayId {
