@@ -51,16 +51,34 @@ on this host reports unresolved CPU compatibility and was not used.
 - Independent read-only reviews approved the corrected leaf state, daemon
   capture/adopt seam, and both directions of the pre-exec compatibility boundary.
 
-The full Debug suite is running against the frozen source at report creation.
-Logs are in `/tmp/onyx-recovery-*.log`; deployment must wait for its final
-result and independent release acceptance. Committing the unchanged source
-allows reproducible packaging to run while that test finishes.
+Full Debug and ReleaseSafe both completed: 10,104 module tests passed, 322
+skipped, plus 11 main and 54 armor CLI tests passed. Each full run therefore
+passed 10,169 tests with zero failures, leaks, or log errors. Debug plus check
+completed 11/11 build steps in 2,612.2 seconds; ReleaseSafe completed 9/9 steps
+in 1,904.1 seconds. The deterministic remainder passed WASM builds, 82 fuzz
+checks, and 17 BoGo shim checks (14/14 build steps). Logs are in
+`/tmp/onyx-recovery-*.log`.
+
+Commit `48891b3389215c46dedf87e572e677845ff59165` contains the frozen tested
+source. All 1,004 recorded Zig/ZON source hashes were unchanged across commit;
+the tested source diff from `907db907` hashes to
+`aaf78bd9c2cf27c74dfdbbb67be75cb9e52b8573659d81cfc07b84e47ba6e7f0`.
+Independent review accepted the completed source, test, and artifact evidence.
+
+Formatting limitation: the stable 0.17 formatter reports 205 files that are
+byte-identical to the recovery baseline (209 findings before this fix). All
+touched files pass formatting; no new formatting debt was introduced. The
+full-tree formatter check is not claimed green.
 
 The static ReleaseSafe candidate built successfully (6/6 build steps) at
 `zig-out/mesh-recovery/bin/onyx-server`. Its private upgrade probe emits the
 current token only, and `--check-config` passed against the local live TOML.
-This preliminary candidate identifies as `0.8.1+907db907757c-dirty`; it is not
-a committed release artifact and has not been installed.
+That preliminary candidate identifies as `0.8.1+907db907757c-dirty` and was
+not installed. Official `packaging/release.sh` subsequently built the clean
+commit as `0.8.1+48891b338921`; `packaging/verify-release.sh` rebuilt it from
+a fresh cache and verified byte identity, the shipped binary, and manifest
+integrity. Release SHA-256:
+`258dadd825a05b5039fffa35306b781f463d7f1c69dcbf632a249fd5bb08737f`.
 
 ## Production state
 
@@ -76,5 +94,26 @@ The remote image SHA-256 was
 `4aad53f36ad5f816e6cf2512597509df636dec2e4c1200791b832d30dd483af0`.
 
 The user explicitly authorized deployment to both nodes and publication to
-GitHub. Neither has occurred at report creation. Publish only after deployment
-acceptance; retain the existing active relay epoch and roster configuration.
+GitHub. The release is now installed and running on both nodes; `/proc/PID/exe`
+hashes match the reproducible artifact. Local PID 4523 is managed by OpenRC
+(`started`); remote PID 2144191 is managed by systemd (`active`). Both live
+configs are byte-identical to their rollback copies. Relay authoring remains
+active and eligible at epoch 1, roster count 2, roster digest
+`879ef8edfa22a2125e32f757c65e81f76264144dd328b934eb4454a8bf5dbb4d`.
+
+Post-roll acceptance passed both nodes' established-link/peer/partition gauges,
+TLS client registration and cross-node PRIVMSG in both directions, persisted
+account login after the remote restart, and fresh exact-token reconnect with
+channel restoration on both nodes. Temporary test accounts were removed.
+
+Cold-boundary limitation: the initial smoke expected an old exact MTOKEN to
+resume remotely. It received the protocol's home-node redirect; following that
+redirect after a cold restart correctly returned `NO_ATTACHMENT`, because the
+physical attachment lived in RAM. This smoke failed and is **not** counted as
+token recovery. Independent review confirmed these unchanged paths and accepted
+reauthentication plus fresh-session checks for the explicitly authorized cold
+roll. Old exact tokens require a fresh login; this production roll does not
+claim Helix continuity. The new split-frame Helix behavior is covered by the
+Debug/ReleaseSafe regression and multi-client suite.
+
+GitHub publication follows this successful dual-node acceptance.

@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-10-19**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-10-23**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -19,29 +19,42 @@ substitutes for this table.
 | **TLS IRC** | `:6697` | `:6697` |
 | **WSS** | `:8080` | `:8080` |
 
-## Verified fleet baseline (2026-10-19)
+## Verified fleet baseline (2026-10-23)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.8.0+d5ac2a5866c8` | `0.8.0+d5ac2a5866c8` |
-| Executable SHA-256 | `4aad53f36ad5f816e6cf2512597509df636dec2e4c1200791b832d30dd483af0` | same |
+| Running image | `0.8.1+48891b338921` | `0.8.1+48891b338921` |
+| Executable SHA-256 | `258dadd825a05b5039fffa35306b781f463d7f1c69dcbf632a249fd5bb08737f` | same |
+| Process ID at acceptance | `4523` | `2144191` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
 
-`SIGUSR2` does not adopt a new inode. This roll was a full restart, eshmaki
-first (`rc-service`, pid 6265, started Mon Oct 19 16:05:00 2026), then ircx.us
-(`systemctl`, MainPID 1912210, ActiveEnterTimestamp Mon 2026-10-19 09:05:11 PDT).
-The mesh socket is native IPv6: eshmaki `2604:f440:3:40::2` to ircx.us
-`2607:5300:201:3100::24ca` port 6900. The previous image is
-`onyx-server.prev-0.8.0-31a1e8eba636` in each run directory, SHA-256
-`82d1415702986229a641c2c95c12c31896e577adaaeeb48b78eb2e29c686f975`.
-`--check-config` passed on both live TOML files before the restarts. Mesh
-health reported `links_active=1`, `peers_up=1`, and `partitioned=0` on both
-nodes. ircx.us logged `mesh S2S established (secured) peer=eshmaki.me`. The
-full `zig build test` suite was not re-run for this image. The filtered module
-run before the release build was 126 passed, 2 skipped, 0 failed.
+This roll used authorized cold restarts, local first, because S2S checkpoint
+schema v5 adds mandatory authenticated partial-frame carry. The image probe
+refuses pre-v5 hot handoffs before exec. Local OpenRC state was reconciled with
+the existing process before starting the replacement; it now reports `started`.
+ircx.us reports `active` and started at 2026-10-23 08:08:24 UTC.
+
+Rollback binaries remain in each runtime directory:
+
+- eshmaki: `onyx-server.prev-20261023-569a8c28`, SHA-256
+  `569a8c286907c098505550ec9e739fb4e5b5ec80d782aae834a966cba38167a9`.
+- ircx: `onyx-server.prev-20261023-4aad53f3`, SHA-256
+  `4aad53f36ad5f816e6cf2512597509df636dec2e4c1200791b832d30dd483af0`.
+
+Both staged binaries passed `--check-config`. Configs remain byte-identical to
+their `onyx-server.local.toml.prev-48891b33` backups; relay authoring stays
+active at epoch 1 with the same two-node roster digest. Both nodes report
+`links_active=1`, `peers_up=1`, and `partitioned=0`. Cross-node TLS chat passed
+in both directions. Persisted-account login and fresh exact-token reconnect
+passed. Old exact-attachment tokens did **not** survive the cold boundary;
+users need to log in again. This is not evidence of live Helix continuity.
+
+Full Debug and ReleaseSafe each passed 10,169 tests with 322 skips and zero
+failures/leaks. The release rebuilt byte-identically from a clean cache.
+Details: [mesh record recovery audit](../audit/mesh-record-carry-2026-10-23.md).
 
 ## Day-2 ops
 
