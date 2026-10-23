@@ -31094,8 +31094,9 @@ pub const LinuxServer = struct {
     /// implicitly privileged (it came from the service manager / root).
     /// Seal an established secured mesh link for a zero-drop Helix upgrade. Queues
     /// an `.s2s_link` capsule carrying the link's crypto (Mooring record keys +
-    /// counters), inner framing header, partial-record carry, and all not-yet-sent
-    /// outbound bytes. The caller preserves the socket fd (CLOEXEC cleared) so the
+    /// counters), inner framing header and authenticated partial-frame carry,
+    /// partial-record carry, and all not-yet-sent outbound bytes. The caller
+    /// preserves the socket fd (CLOEXEC cleared) so the
     /// peer never sees a drop. Returns true on success; false on ANY failure.
     /// Failure for an established link is fatal to the complete upgrade; only an
     /// unestablished dial may fall back to the re-dial path.
@@ -31203,6 +31204,7 @@ pub const LinuxServer = struct {
             .remote_name = remote_name,
             .connect_addr = if (conn.s2s_dial_target_known) std.mem.asBytes(&conn.s2s_connect_addr) else &.{},
             .rec_inbuf = outer.rec_inbuf,
+            .inner_inbuf = outer.inner_inbuf,
             .pending_out = pending,
             .roster = roster.items,
             .roster_count = roster_count,
@@ -37719,6 +37721,7 @@ pub const LinuxServer = struct {
             },
             .remote_name = snap.remote_name,
             .rec_inbuf = snap.rec_inbuf,
+            .inner_inbuf = snap.inner_inbuf,
             .now_ms = now_u,
             .rng_seed = snap.remote_node_id ^ now_u ^ @as(u64, @intCast(@max(@as(i32, 0), snap.fd))),
         }) catch {
@@ -74142,6 +74145,7 @@ test "v2 Store hot-adoption is SQ-inert until authority-first link activation" {
         .caps = caps,
         .remote_name = pair.a.snapshotInnerRemoteName(),
         .rec_inbuf = outer.rec_inbuf,
+        .inner_inbuf = outer.inner_inbuf,
     };
     outer.established.serialize(&snap.established);
 
@@ -74407,6 +74411,7 @@ test "hot-adopt secured link tears down cleanly when RESYNC exceeds the carried 
         .caps = caps,
         .remote_name = pair.a.snapshotInnerRemoteName(),
         .rec_inbuf = outer.rec_inbuf,
+        .inner_inbuf = outer.inner_inbuf,
         .pending_out = carried,
     };
     outer.established.serialize(&snap.established);
@@ -74517,6 +74522,7 @@ test "portability-enabled hot-adopt rejects a rolling-old peer before roster rel
         .caps = caps,
         .remote_name = pair.a.snapshotInnerRemoteName(),
         .rec_inbuf = outer.rec_inbuf,
+        .inner_inbuf = outer.inner_inbuf,
     };
     outer.established.serialize(&snap.established);
 
@@ -74643,6 +74649,7 @@ test "UPGRADE restored property checkpoint bursts after preserved-link activatio
         .caps = caps,
         .remote_name = pair.a.snapshotInnerRemoteName(),
         .rec_inbuf = outer.rec_inbuf,
+        .inner_inbuf = outer.inner_inbuf,
     };
     outer.established.serialize(&snap.established);
     const s2s_blob = try s2s_snapshot.encode(allocator, snap);
@@ -83780,6 +83787,162 @@ test "UPGRADE completed secured mesh recv seals and resumes one continuous recor
     try std.testing.expectEqual(@as(usize, 1), changes.len);
     try std.testing.expectEqualStrings("#after-upgrade", changes[0].channel);
     try std.testing.expectEqualStrings("AfterUpgrade", changes[0].nick);
+}
+
+test "UPGRADE preserves a split signed mesh frame and partial encrypted record through live recv" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    const config = Config{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "split-upgrade-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "session-replay-secret",
+    };
+    const predecessor = createTestServer(allocator, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        predecessor.deinit();
+        allocator.destroy(predecessor);
+    }
+    current_reactor = &predecessor.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = try predecessor.rx().clients.alloc(ConnState.init(sockets[0]));
+    const conn = predecessor.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.s2s_secured = &pair.a;
+    defer conn.s2s_secured = null; // The pair owns this borrowed link on every exit.
+
+    // Use the actual signed peer encoder, then seal two valid Mooring records
+    // around its midpoint. Large production batches create the same boundary;
+    // this small fixture pins the exact in-flight cut without megabytes of filler.
+    const member_identity = s2s_peer_mod.MemberIdentity{
+        .username = "split",
+        .realname = "Split Upgrade",
+        .host = "mesh.test",
+    };
+    const channel = "#split-upgrade";
+    const nick = "SplitUpgrade";
+    try pair.b.inner.?.sendMembership(channel, nick, 0, 700, true, member_identity, "");
+    const plaintext = try allocator.dupe(u8, pair.b.inner.?.outbound());
+    defer allocator.free(plaintext);
+    try std.testing.expect(plaintext.len > 2 * s2s_frame.header_len);
+    const split_at = plaintext.len / 2;
+    const sender = pair.b.exportOuter();
+    const initial_counter = pair.a.recv_counter;
+    try std.testing.expectEqual(initial_counter, sender.send_counter);
+    const wire = try allocator.alloc(u8, plaintext.len + 2 * (4 + 16));
+    defer allocator.free(wire);
+    var offset: usize = 0;
+    for ([_][]const u8{ plaintext[0..split_at], plaintext[split_at..] }, 0..) |chunk, index| {
+        const body_len = chunk.len + 16;
+        std.mem.writeInt(u32, wire[offset..][0..4], @intCast(body_len), .little);
+        var aad: [8]u8 = undefined;
+        const counter = sender.send_counter + @as(u64, @intCast(index));
+        std.mem.writeInt(u64, &aad, counter, .little);
+        sender.established.sealRecord(counter, &aad, chunk, wire[offset + 4 ..][0..body_len]);
+        offset += 4 + body_len;
+    }
+    pair.b.inner.?.clearOutbound();
+    pair.b.send_counter += 2;
+    const first_record_len = 4 + split_at + 16;
+    const cut = first_record_len + 9; // Complete first record + next header and ciphertext.
+
+    try predecessor.armRecv(conn);
+    _ = try predecessor.rx().ring.submit();
+    try writeAllFd(sockets[1], wire[0..cut]);
+    _ = try predecessor.rx().ring.submitAndWait(1);
+    try predecessor.quiesceOwnedSocketIo();
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(!conn.recv_armed and !conn.send_armed);
+    try std.testing.expectEqual(initial_counter + 1, pair.a.recv_counter);
+    try std.testing.expect(pair.a.findRemoteMember(nick) == null);
+
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(allocator);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| allocator.free(blob);
+        blobs.deinit(allocator);
+    }
+    try std.testing.expect(predecessor.sealSecuredLink(conn, &pair.a, &pieces, &blobs));
+    try std.testing.expectEqual(@as(usize, 1), pieces.items.len);
+    const snap = try s2s_snapshot.decode(pieces.items[0].bytes, s2s_snapshot.schema_version);
+    try std.testing.expectEqualSlices(u8, plaintext[0..split_at], snap.inner_inbuf);
+    try std.testing.expectEqualSlices(u8, wire[first_record_len..cut], snap.rec_inbuf);
+    try std.testing.expectEqual(initial_counter + 1, snap.recv_counter);
+
+    const successor = try createTestServer(allocator, config);
+    defer {
+        successor.deinit();
+        allocator.destroy(successor);
+    }
+    current_reactor = &successor.reactors[0];
+    const watcher_id = try addTestLocalClient(successor, "Watcher", null);
+    const watcher = successor.connFor(watcher_id).?;
+    watcher.test_sendq_capture = true;
+    _ = try successor.world.join(channel, worldIdFromClient(watcher_id));
+
+    // Transfer the preserved descriptor only when the successor is ready to
+    // stage it. A failed adoption owns and closes it; the predecessor cannot.
+    conn.s2s_secured = null;
+    conn.fd = -1;
+    const adopted_id = successor.adoptInheritedS2sLink(snap, true) orelse return error.TestUnexpectedResult;
+    const adopted = successor.connFor(adopted_id).?;
+    const resumed = adopted.s2s_secured.?;
+    try std.testing.expectEqualSlices(u8, snap.inner_inbuf, resumed.exportOuter().inner_inbuf);
+    try std.testing.expectEqualSlices(u8, snap.rec_inbuf, resumed.exportOuter().rec_inbuf);
+    try std.testing.expect(!adopted.recv_armed and !adopted.send_armed);
+
+    // The remaining ciphertext crosses the real socket completion and daemon
+    // admission path. Both buffers must empty, and one authenticated JOIN must
+    // reach the local client without a reconnect or a missing prefix.
+    try successor.armRecv(adopted);
+    _ = try successor.rx().ring.submit();
+    try writeAllFd(sockets[1], wire[cut..]);
+    _ = try successor.rx().ring.submitAndWait(1);
+    try successor.quiesceOwnedSocketIo();
+    try std.testing.expect(!adopted.closing);
+    try std.testing.expectEqual(initial_counter + 2, resumed.recv_counter);
+    try std.testing.expectEqual(@as(usize, 0), resumed.exportOuter().inner_inbuf.len);
+    try std.testing.expectEqual(@as(usize, 0), resumed.exportOuter().rec_inbuf.len);
+    try std.testing.expect(resumed.findRemoteMember(nick) != null);
+    try std.testing.expectEqual(@as(usize, 1), resumed.channelMembers(channel).len);
+    const expected_join = ":SplitUpgrade!split@mesh.test JOIN :#split-upgrade\r\n";
+    const first_output = try copyTestSendQ(allocator, watcher);
+    defer allocator.free(first_output);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(first_output, expected_join));
+
+    // A current-peer repair repeating the same signed membership remains
+    // idempotent after the split-frame resume and consumes the next counter.
+    try pair.b.sendMembership(channel, nick, 0, 700, true, member_identity, "");
+    successor.rx().socket_io_quiescing = false;
+    try successor.armRecv(adopted);
+    _ = try successor.rx().ring.submit();
+    try writeAllFd(sockets[1], pair.b.outbound());
+    _ = try successor.rx().ring.submitAndWait(1);
+    try successor.quiesceOwnedSocketIo();
+    try std.testing.expect(!adopted.closing);
+    try std.testing.expectEqual(initial_counter + 3, resumed.recv_counter);
+    try std.testing.expectEqual(@as(usize, 1), resumed.channelMembers(channel).len);
+    const final_output = try copyTestSendQ(allocator, watcher);
+    defer allocator.free(final_output);
+    try std.testing.expectEqualSlices(u8, first_output, final_output);
 }
 
 /// Shared skeleton for the two RESYNC-re-burst tests below: converge a

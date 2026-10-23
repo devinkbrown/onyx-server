@@ -179,57 +179,57 @@ pub const FrameType = enum(u8) {
     WHOIS_PROFILE = 0x2E,
 
     pub fn tag(self: FrameType) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn fromTag(tag_value: u8) ?FrameType {
         return switch (tag_value) {
-            @intFromEnum(FrameType.HANDSHAKE) => .HANDSHAKE,
-            @intFromEnum(FrameType.BURST) => .BURST,
-            @intFromEnum(FrameType.DELTA) => .DELTA,
-            @intFromEnum(FrameType.GOSSIP) => .GOSSIP,
-            @intFromEnum(FrameType.PING) => .PING,
-            @intFromEnum(FrameType.PONG) => .PONG,
-            @intFromEnum(FrameType.QUIT) => .QUIT,
-            @intFromEnum(FrameType.MEMBERSHIP) => .MEMBERSHIP,
-            @intFromEnum(FrameType.MESSAGE) => .MESSAGE,
-            @intFromEnum(FrameType.OPER_GRANT) => .OPER_GRANT,
-            @intFromEnum(FrameType.CHANNEL_MODE_FLAGS) => .CHANNEL_MODE_FLAGS,
-            @intFromEnum(FrameType.CHANNEL_LIST) => .CHANNEL_LIST,
-            @intFromEnum(FrameType.CHANNEL_PROP) => .CHANNEL_PROP,
-            @intFromEnum(FrameType.TOPIC) => .TOPIC,
-            @intFromEnum(FrameType.NICKCHANGE) => .NICKCHANGE,
-            @intFromEnum(FrameType.CHANNEL_MODE_STATE) => .CHANNEL_MODE_STATE,
-            @intFromEnum(FrameType.SESSION_MIGRATE) => .SESSION_MIGRATE,
-            @intFromEnum(FrameType.ENTITY_PROP) => .ENTITY_PROP,
-            @intFromEnum(FrameType.CLONE_COUNT) => .CLONE_COUNT,
-            @intFromEnum(FrameType.OPER_EVENT) => .OPER_EVENT,
-            @intFromEnum(FrameType.OBSERVE_EVENT) => .OBSERVE_EVENT,
-            @intFromEnum(FrameType.KILL) => .KILL,
-            @intFromEnum(FrameType.WARD) => .WARD,
-            @intFromEnum(FrameType.RESYNC) => .RESYNC,
-            @intFromEnum(FrameType.REPAIR_SUMMARY) => .REPAIR_SUMMARY,
-            @intFromEnum(FrameType.REPAIR_REQUEST) => .REPAIR_REQUEST,
-            @intFromEnum(FrameType.REPAIR_RESPONSE) => .REPAIR_RESPONSE,
-            @intFromEnum(FrameType.MEMO_PUSH) => .MEMO_PUSH,
-            @intFromEnum(FrameType.SESSION_MIGRATE_CONSUMED) => .SESSION_MIGRATE_CONSUMED,
-            @intFromEnum(FrameType.SESSION_REPLICA_OFFER) => .SESSION_REPLICA_OFFER,
-            @intFromEnum(FrameType.SESSION_REPLICA_ACK) => .SESSION_REPLICA_ACK,
-            @intFromEnum(FrameType.SESSION_REPLICA_REVOKE) => .SESSION_REPLICA_REVOKE,
-            @intFromEnum(FrameType.MESSAGE_V2) => .MESSAGE_V2,
-            @intFromEnum(FrameType.SESSION_REPLICA_ATTACHMENT_LEASE) => .SESSION_REPLICA_ATTACHMENT_LEASE,
-            @intFromEnum(FrameType.OPER_EVENT_V2) => .OPER_EVENT_V2,
-            @intFromEnum(FrameType.MESSAGE_V2_ACK) => .MESSAGE_V2_ACK,
-            @intFromEnum(FrameType.MEDIA_WS_DATAGRAM) => .MEDIA_WS_DATAGRAM,
-            @intFromEnum(FrameType.E2EE_GROUP) => .E2EE_GROUP,
-            @intFromEnum(FrameType.E2EE_GROUP_ACK) => .E2EE_GROUP_ACK,
-            @intFromEnum(FrameType.MEMBERSHIP_SYNC) => .MEMBERSHIP_SYNC,
-            @intFromEnum(FrameType.SEARCH_QUERY) => .SEARCH_QUERY,
-            @intFromEnum(FrameType.SEARCH_REPLY) => .SEARCH_REPLY,
-            @intFromEnum(FrameType.KEYTRANS_HEAD) => .KEYTRANS_HEAD,
-            @intFromEnum(FrameType.GUEST_PRESENCE) => .GUEST_PRESENCE,
-            @intFromEnum(FrameType.GUEST_DIRECT) => .GUEST_DIRECT,
-            @intFromEnum(FrameType.WHOIS_PROFILE) => .WHOIS_PROFILE,
+            @backingInt(FrameType.HANDSHAKE) => .HANDSHAKE,
+            @backingInt(FrameType.BURST) => .BURST,
+            @backingInt(FrameType.DELTA) => .DELTA,
+            @backingInt(FrameType.GOSSIP) => .GOSSIP,
+            @backingInt(FrameType.PING) => .PING,
+            @backingInt(FrameType.PONG) => .PONG,
+            @backingInt(FrameType.QUIT) => .QUIT,
+            @backingInt(FrameType.MEMBERSHIP) => .MEMBERSHIP,
+            @backingInt(FrameType.MESSAGE) => .MESSAGE,
+            @backingInt(FrameType.OPER_GRANT) => .OPER_GRANT,
+            @backingInt(FrameType.CHANNEL_MODE_FLAGS) => .CHANNEL_MODE_FLAGS,
+            @backingInt(FrameType.CHANNEL_LIST) => .CHANNEL_LIST,
+            @backingInt(FrameType.CHANNEL_PROP) => .CHANNEL_PROP,
+            @backingInt(FrameType.TOPIC) => .TOPIC,
+            @backingInt(FrameType.NICKCHANGE) => .NICKCHANGE,
+            @backingInt(FrameType.CHANNEL_MODE_STATE) => .CHANNEL_MODE_STATE,
+            @backingInt(FrameType.SESSION_MIGRATE) => .SESSION_MIGRATE,
+            @backingInt(FrameType.ENTITY_PROP) => .ENTITY_PROP,
+            @backingInt(FrameType.CLONE_COUNT) => .CLONE_COUNT,
+            @backingInt(FrameType.OPER_EVENT) => .OPER_EVENT,
+            @backingInt(FrameType.OBSERVE_EVENT) => .OBSERVE_EVENT,
+            @backingInt(FrameType.KILL) => .KILL,
+            @backingInt(FrameType.WARD) => .WARD,
+            @backingInt(FrameType.RESYNC) => .RESYNC,
+            @backingInt(FrameType.REPAIR_SUMMARY) => .REPAIR_SUMMARY,
+            @backingInt(FrameType.REPAIR_REQUEST) => .REPAIR_REQUEST,
+            @backingInt(FrameType.REPAIR_RESPONSE) => .REPAIR_RESPONSE,
+            @backingInt(FrameType.MEMO_PUSH) => .MEMO_PUSH,
+            @backingInt(FrameType.SESSION_MIGRATE_CONSUMED) => .SESSION_MIGRATE_CONSUMED,
+            @backingInt(FrameType.SESSION_REPLICA_OFFER) => .SESSION_REPLICA_OFFER,
+            @backingInt(FrameType.SESSION_REPLICA_ACK) => .SESSION_REPLICA_ACK,
+            @backingInt(FrameType.SESSION_REPLICA_REVOKE) => .SESSION_REPLICA_REVOKE,
+            @backingInt(FrameType.MESSAGE_V2) => .MESSAGE_V2,
+            @backingInt(FrameType.SESSION_REPLICA_ATTACHMENT_LEASE) => .SESSION_REPLICA_ATTACHMENT_LEASE,
+            @backingInt(FrameType.OPER_EVENT_V2) => .OPER_EVENT_V2,
+            @backingInt(FrameType.MESSAGE_V2_ACK) => .MESSAGE_V2_ACK,
+            @backingInt(FrameType.MEDIA_WS_DATAGRAM) => .MEDIA_WS_DATAGRAM,
+            @backingInt(FrameType.E2EE_GROUP) => .E2EE_GROUP,
+            @backingInt(FrameType.E2EE_GROUP_ACK) => .E2EE_GROUP_ACK,
+            @backingInt(FrameType.MEMBERSHIP_SYNC) => .MEMBERSHIP_SYNC,
+            @backingInt(FrameType.SEARCH_QUERY) => .SEARCH_QUERY,
+            @backingInt(FrameType.SEARCH_REPLY) => .SEARCH_REPLY,
+            @backingInt(FrameType.KEYTRANS_HEAD) => .KEYTRANS_HEAD,
+            @backingInt(FrameType.GUEST_PRESENCE) => .GUEST_PRESENCE,
+            @backingInt(FrameType.GUEST_DIRECT) => .GUEST_DIRECT,
+            @backingInt(FrameType.WHOIS_PROFILE) => .WHOIS_PROFILE,
             else => null,
         };
     }
@@ -248,7 +248,7 @@ pub const Capability = enum(u3) {
     event_spine_v2 = 7,
 
     pub fn bit(self: Capability) u3 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn mask(self: Capability) u8 {
@@ -484,6 +484,18 @@ pub const Decoder = struct {
     accumulator: std.ArrayList(u8) = .empty,
     payload_buf: std.ArrayList(u8) = .empty,
 
+    /// A drained decoder may retain only an incomplete frame. Validate a
+    /// checkpoint without dispatching any frame or allocating memory.
+    pub fn validatePartial(bytes: []const u8, max_frame_size: usize) error{ InvalidPartialFrame, OversizeFrame }!void {
+        if (bytes.len == 0) return;
+        if (bytes.len >= max_frame_size) return error.OversizeFrame;
+        if (bytes.len < header_len) return;
+        const payload_len = std.mem.readInt(u32, bytes[1..][0..length_len], endian);
+        const total = std.math.add(usize, header_len, payload_len) catch return error.OversizeFrame;
+        if (total > max_frame_size) return error.OversizeFrame;
+        if (bytes.len >= total) return error.InvalidPartialFrame;
+    }
+
     pub fn init(allocator: std.mem.Allocator, max_frame_size: usize) Decoder {
         return .{
             .allocator = allocator,
@@ -676,13 +688,13 @@ test "truncated handled" {
     var decoder = Decoder.init(allocator, default_max_frame_size);
     defer decoder.deinit();
 
-    try decoder.feed(&.{@intFromEnum(FrameType.HANDSHAKE)});
+    try decoder.feed(&.{@backingInt(FrameType.HANDSHAKE)});
     try testing.expectEqual(@as(?Frame, null), try decoder.next());
     try testing.expectError(error.Truncated, decoder.finish());
 
     decoder.reset();
     var header: [header_len]u8 = undefined;
-    header[0] = @intFromEnum(FrameType.QUIT);
+    header[0] = @backingInt(FrameType.QUIT);
     std.mem.writeInt(u32, header[1..][0..length_len], 3, endian);
     try decoder.feed(&header);
     try testing.expectEqual(@as(?Frame, null), try decoder.next());

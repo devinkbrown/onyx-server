@@ -184,7 +184,8 @@ pub const registry = [_]Descriptor{
     // surviving remote member to local clients as a spurious JOIN on every
     // upgrade. `min_supported = 1` keeps accepting capsules sealed by pre-bump
     // binaries; `s2s_snapshot.decode` is version-aware.
-    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 4, .min_supported = 1, .max_supported = 4 },
+    // v5 carries the authenticated partial inner frame across record boundaries.
+    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 5, .min_supported = 1, .max_supported = 5 },
     // v2 (2026-07) appended the WS adapter's partial framing state so a
     // mid-frame wss client is carried instead of dropped. v3 appends the
     // selected WebSocket application protocol, which controls
@@ -342,7 +343,7 @@ pub fn encode(allocator: Allocator, capsule: Capsule) Error![]u8 {
 
     try out.appendSlice(allocator, &magic);
     try appendU32(allocator, &out, capsule.header.schema_id);
-    try out.append(allocator, @intFromEnum(capsule.header.kind));
+    try out.append(allocator, @backingInt(capsule.header.kind));
     try appendU16(allocator, &out, capsule.header.version);
     try appendU16(allocator, &out, capsule.header.min_supported);
     try appendU16(allocator, &out, capsule.header.max_supported);
@@ -626,7 +627,7 @@ test "exact clients world history webhook and handoff descriptors fail closed" {
         try std.testing.expectEqual(@as(u16, 1), exact.current_version);
         try std.testing.expectEqual(@as(u16, 1), exact.min_supported);
         try std.testing.expectEqual(@as(u16, 1), exact.max_supported);
-        try std.testing.expectEqual(kind, try CapsuleKind.fromByte(@intFromEnum(kind)));
+        try std.testing.expectEqual(kind, try CapsuleKind.fromByte(@backingInt(kind)));
     }
     inline for (.{ CapsuleKind.handoff_manifest, CapsuleKind.native_service }) |kind| {
         const exact = descriptor(kind);

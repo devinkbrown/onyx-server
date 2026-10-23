@@ -54,10 +54,12 @@
 //!                           member roster: `roster_count` self-delimiting
 //!                           records (see `RosterMember`), `roster_len` bytes
 //!                           total; decode validates the walk fail-closed
+//!   [u32 len][inner_inbuf] (v5+) authenticated incomplete inner frame
 const std = @import("std");
 
 const hs = @import("../../crypto/mooring_handshake.zig");
 const s2s_frame = @import("../../proto/s2s_frame.zig");
+const media_ws_relay = @import("../../proto/media_ws_relay.zig");
 
 pub const Error = error{
     Truncated,
@@ -69,6 +71,8 @@ pub const Error = error{
     TrailingBytes,
     InvalidRosterMember,
     RosterCountMismatch,
+    InvalidPartialFrame,
+    OversizeFrame,
 };
 
 pub const est_len = hs.Established.serialized_len;
@@ -76,7 +80,7 @@ pub const est_len = hs.Established.serialized_len;
 /// Current `.s2s_link` capsule schema version whose blob layout `encode` writes.
 /// The blob carries no inline version — it rides the capsule header — so this
 /// MIRRORS the descriptor in `capsule.zig`; bump both together.
-pub const schema_version: u16 = 4;
+pub const schema_version: u16 = 5;
 
 /// Length of the embedded `Established` blob in schema v1 capsules. v2 appended a
 /// trailing `admitted_frame_families` (u32) to `Established.serialize`, so a v1
@@ -133,6 +137,9 @@ pub const Snapshot = struct {
 
     rec_inbuf: []const u8 = &.{},
     pending_out: []const u8 = &.{},
+    /// (v5+) Authenticated partial inner frame, after all complete frames were
+    /// dispatched. Mandatory on current wire images, including when empty.
+    inner_inbuf: []const u8 = &.{},
 
     /// (v4+) The link's converged remote-member roster: `roster_count`
     /// self-delimiting `RosterMember` records, sealed verbatim from the route
@@ -268,6 +275,7 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     if (snap.roster.len > std.math.maxInt(u32)) return error.TooLong;
     // Never SEAL a roster the successor would refuse: the same walk decode runs.
     try validateRoster(snap.roster, snap.roster_count);
+    try s2s_frame.Decoder.validatePartial(snap.inner_inbuf, media_ws_relay.required_max_frame_size);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -304,6 +312,8 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     try appendInt(&out, allocator, u32, snap.roster_count);
     try appendInt(&out, allocator, u32, @intCast(snap.roster.len));
     try out.appendSlice(allocator, snap.roster);
+    try appendInt(&out, allocator, u32, @intCast(snap.inner_inbuf.len));
+    try out.appendSlice(allocator, snap.inner_inbuf);
 
     return out.toOwnedSlice(allocator);
 }
@@ -317,7 +327,9 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
 /// still lands at its correct offset. v3 appends the `caps_ext` byte; v4 appends
 /// the trailing roster block (pre-v4 blobs decode with an EMPTY roster — the
 /// successor then reconverges via RESYNC alone, exactly the pre-bump behavior).
-/// Any version outside 1..4 is rejected fail-closed (a too-new blob may have
+/// v5 appends the mandatory partial-inner-frame carry. Legacy cold migration
+/// decodes older images with empty carry; current adoption requires v5.
+/// Any version outside 1..5 is rejected fail-closed (a too-new blob may have
 /// grown an embedded region again and cannot be parsed here).
 pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
     // Every supported predecessor layout is still an authority-bearing Helix
@@ -347,7 +359,7 @@ fn decodeInternal(bytes: []const u8, version: u16, strict_current: bool) Error!S
             @memcpy(snap.established[0..est_len_v1], try r.take(est_len_v1));
             @memset(snap.established[est_len_v1..], 0); // admitted_frame_families = 0
         },
-        2, 3, schema_version => @memcpy(&snap.established, try r.take(est_len)),
+        2, 3, 4, schema_version => @memcpy(&snap.established, try r.take(est_len)),
         // Fail-closed: only v1 and the current schema are parseable here. MAINTENANCE
         // TRAP — each future schema bump that keeps `min_supported = 1` in the capsule
         // descriptor MUST add an explicit legacy arm above for EVERY still-accepted
@@ -394,6 +406,10 @@ fn decodeInternal(bytes: []const u8, version: u16, strict_current: bool) Error!S
         // Fail-closed BEFORE the roster can reach adoption: the whole region
         // must walk as exactly `roster_count` well-formed records.
         try validateRoster(snap.roster, snap.roster_count);
+    }
+    if (version >= 5) {
+        snap.inner_inbuf = try r.take(try r.int(u32));
+        try s2s_frame.Decoder.validatePartial(snap.inner_inbuf, media_ws_relay.required_max_frame_size);
     }
     if (strict_current and r.pos != bytes.len) return error.TrailingBytes;
     return snap;
@@ -504,6 +520,37 @@ test "s2s link snapshot decode rejects truncation" {
     try testing.expectError(error.Truncated, decode(&[_]u8{ 1, 0, 0 }, schema_version));
 }
 
+test "s2s link snapshot requires and validates partial inner frame carry" {
+    var frame_buf: [32]u8 = undefined;
+    const frame = try s2s_frame.encode(.PING, "carry across records", &frame_buf);
+    const prefix = frame[0 .. frame.len - 1];
+    const bytes = try encode(testing.allocator, .{ .inner_inbuf = prefix });
+    defer testing.allocator.free(bytes);
+    const got = try decodeCurrent(bytes);
+    try testing.expectEqualSlices(u8, prefix, got.inner_inbuf);
+    for (0..prefix.len + 4) |cut| {
+        try testing.expectError(error.Truncated, decodeCurrent(bytes[0 .. bytes.len - cut - 1]));
+    }
+    try testing.expectError(error.InvalidPartialFrame, encode(testing.allocator, .{ .inner_inbuf = frame }));
+
+    const malformed = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(malformed);
+    const prefix_start = malformed.len - prefix.len;
+    std.mem.writeInt(u32, malformed[prefix_start + 1 ..][0..4], 0, .little);
+    try testing.expectError(error.InvalidPartialFrame, decodeCurrent(malformed));
+    std.mem.writeInt(u32, malformed[prefix_start + 1 ..][0..4], std.math.maxInt(u32), .little);
+    try testing.expectError(error.OversizeFrame, decodeCurrent(malformed));
+
+    // Empty carry still has a mandatory length. A v4 image is available only
+    // through explicit legacy decode, never the current adoption path.
+    const empty = try encode(testing.allocator, .{});
+    defer testing.allocator.free(empty);
+    const v4 = empty[0 .. empty.len - 4];
+    try testing.expectError(error.Truncated, decodeCurrent(v4));
+    const legacy = try decode(v4, 4);
+    try testing.expectEqual(@as(usize, 0), legacy.inner_inbuf.len);
+}
+
 test "current s2s decode rejects noncanonical flags capabilities legacy and trailing bytes" {
     const allocator = testing.allocator;
     const bytes = try encode(allocator, .{ .fd = 41, .remote_node_id = 9 });
@@ -537,13 +584,13 @@ const caps_ext_field_off_v2: usize = est_field_off + est_len +
     8 + 8 + 1;
 
 /// Synthesize the pre-roster (≤v3) wire image from a current-encode blob by
-/// stripping the trailing v4 roster block. Valid only when the encoded roster
-/// was EMPTY (the block is then exactly 8 zero bytes: count=0, len=0) — the
+/// stripping the empty v5 carry and v4 roster blocks. Valid only when both
+/// were EMPTY (12 zero bytes: count=0, len=0, inner_len=0) — the
 /// legacy fixtures below all model rosterless predecessors.
 fn stripEmptyRosterBlock(bytes: []const u8) []const u8 {
-    std.debug.assert(bytes.len >= 8);
-    for (bytes[bytes.len - 8 ..]) |b| std.debug.assert(b == 0);
-    return bytes[0 .. bytes.len - 8];
+    std.debug.assert(bytes.len >= 12);
+    for (bytes[bytes.len - 12 ..]) |b| std.debug.assert(b == 0);
+    return bytes[0 .. bytes.len - 12];
 }
 
 test "current s2s decode rejects inconsistent relay-v2 capability combinations" {
@@ -867,8 +914,8 @@ test "s2s link snapshot capsule roster decode fails closed on malformed records"
     _ = try decodeCurrent(bytes);
 
     // Layout of the trailing block: [u32 count][u32 len][roster rlen bytes].
-    const count_off = bytes.len - rlen - 8;
-    const region_off = bytes.len - rlen;
+    const count_off = bytes.len - rlen - 12;
+    const region_off = bytes.len - rlen - 4;
 
     // (a) A count that does not match the walked records fails closed.
     const bad_count = try allocator.dupe(u8, bytes);
@@ -889,7 +936,7 @@ test "s2s link snapshot capsule roster decode fails closed on malformed records"
     // (d) A non-boolean session-token flag (the record's last byte) fails closed.
     const bad_flag = try allocator.dupe(u8, bytes);
     defer allocator.free(bad_flag);
-    bad_flag[bytes.len - 1] = 2;
+    bad_flag[bytes.len - 5] = 2;
     try testing.expectError(error.InvalidRosterMember, decodeCurrent(bad_flag));
 }
 

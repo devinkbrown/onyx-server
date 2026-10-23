@@ -888,15 +888,10 @@ fn canonicalPayload(item: capsule.Capsule, kind: capsule.CapsuleKind) ?[]const u
     return item.fields[0].bytes;
 }
 
-/// S2S is the one ownership-bearing family intentionally rolling-compatible.
-/// Require that the predecessor's own current payload version is the negotiated
-/// overlap, then let the per-version canonical decoder validate the exact body.
+/// Current S2S handoffs must carry the authenticated partial inner frame.
+/// Older schemas are available only through explicit cold-migration decoding.
 fn canonicalS2sPayload(item: capsule.Capsule) ?[]const u8 {
-    if (item.header.kind != .s2s_link or item.fields.len != 1 or
-        item.fields[0].ordinal != 1) return null;
-    const negotiated = capsule.negotiate(capsule.descriptor(.s2s_link), item.header) catch return null;
-    if (negotiated != item.header.version) return null;
-    return item.fields[0].bytes;
+    return canonicalPayload(item, .s2s_link);
 }
 
 /// The rolling-compatible sidecar analogue of `canonicalS2sPayload` for the
@@ -1333,13 +1328,12 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
     try std.testing.expectEqual(@as(usize, 1), summary.e2ee_group_mesh_authority);
     try std.testing.expectEqual(@as(usize, 1), summary.mesh_clock);
 
-    // A v2 predecessor owns the same fd graph but predates the caps-extension
-    // byte AND the v4 roster block. Its advertised current version must
-    // negotiate and validate without weakening the exact ownership relation.
+    // A legacy predecessor cannot prove preservation of partial inner frames.
+    // Reject its image at current whole-handoff validation.
     const caps_ext_off = @sizeOf(i32) + 1 + 1 + s2s_snapshot.est_len +
         8 + 8 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 1;
-    // Strip the trailing v4 roster block first (empty roster ⇒ 8 zero bytes).
-    const s2s_v3 = s2s[0 .. s2s.len - 8];
+    // Strip the empty v5 carry and v4 roster blocks (12 zero bytes).
+    const s2s_v3 = s2s[0 .. s2s.len - 12];
     const s2s_v2 = try allocator.alloc(u8, s2s_v3.len - 1);
     defer allocator.free(s2s_v2);
     @memcpy(s2s_v2[0..caps_ext_off], s2s_v3[0..caps_ext_off]);
@@ -1347,8 +1341,7 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
     fields[8][0].bytes = s2s_v2;
     caps[8].header.version = 2;
     caps[8].header.max_supported = 2;
-    const rolling = try validateCurrent(current, &.{ 10, 11, 20 });
-    try std.testing.expectEqual(@as(usize, 1), rolling.s2s_links);
+    try std.testing.expectError(error.InvalidS2s, validateCurrent(current, &.{ 10, 11, 20 }));
 }
 
 test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard)" {

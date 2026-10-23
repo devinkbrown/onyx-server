@@ -237,6 +237,7 @@ pub const SecuredLink = struct {
         inner: s2s_link.S2sLink.ResumeHeader,
         remote_name: []const u8,
         rec_inbuf: []const u8,
+        inner_inbuf: []const u8 = &.{},
         now_ms: u64,
         rng_seed: u64,
     };
@@ -283,6 +284,7 @@ pub const SecuredLink = struct {
         // free the partial-record carry.
         errdefer self.resumed_established.?.deinit();
         errdefer self.rec_inbuf.deinit(self.allocator);
+        try s2s_frame.Decoder.validatePartial(rs.inner_inbuf, opts.inner_config.max_frame_size);
         try self.rec_inbuf.appendSlice(self.allocator, rs.rec_inbuf);
 
         const link = try self.allocator.create(s2s_link.S2sLink);
@@ -311,6 +313,10 @@ pub const SecuredLink = struct {
         };
         // The peer stored this page. Drop the stack handle without unmapping.
         owned_key.secret_key.page = null;
+        errdefer link.deinit();
+        // Restore authenticated plaintext without dispatch or counter changes.
+        // The next decrypted record completes this same inner frame.
+        try link.peer.decoder.feed(rs.inner_inbuf);
         self.inner = link;
         return self;
     }
@@ -395,6 +401,8 @@ pub const SecuredLink = struct {
         established: hs.Established,
         /// Partial inbound record awaiting more bytes (reassembly carry).
         rec_inbuf: []const u8,
+        /// Authenticated prefix of an inner frame spanning encrypted records.
+        inner_inbuf: []const u8,
         /// Sealed records not yet drained to the transport (self.out). The
         /// kernel-buffered tail rides the preserved fd; the ConnState app-send
         /// buffer is captured separately by the daemon and ordered BEFORE this.
@@ -412,6 +420,7 @@ pub const SecuredLink = struct {
             .feed_seq = self.feed_seq,
             .established = self.establishedKeys().*,
             .rec_inbuf = self.rec_inbuf.items,
+            .inner_inbuf = self.inner.?.peer.decoder.accumulator.items,
             .pending_out = self.out.items,
         };
     }
@@ -2267,6 +2276,82 @@ test "secured link distinguishes an oversized record from a handshake message" {
     var header: [record_len_prefix]u8 = undefined;
     std.mem.writeInt(u32, &header, max_record_len + 1, .little);
     try testing.expectError(error.RecordTooLarge, p.b.feed(&header, 99));
+}
+
+test "secured link resumes partial inner frame atomically across every allocation failure" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    // This fixture returns its identities by value; resume clones the identity
+    // key, so bind that borrow to its final address before exercising adoption.
+    p.b.identity = &p.idb;
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+    const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "r", .host = "h" };
+    try p.a.inner.?.sendMembership("#carry", "carried", 0, 100, true, ident, "");
+    const plaintext_len = p.a.inner.?.outbound().len;
+    try p.a.drainInnerWithChunkLimit(plaintext_len / 2);
+    const wire = p.a.outbound();
+    const first_len = record_len_prefix + @as(usize, std.mem.readInt(u32, wire[0..4], .little));
+    const received = first_len + 3; // also carry a partial next record header
+    try p.b.feed(wire[0..received], 100);
+    const outer = p.b.exportOuter();
+    try testing.expect(outer.inner_inbuf.len > 0);
+    try testing.expectEqual(@as(usize, 3), outer.rec_inbuf.len);
+    try testing.expect(p.b.findRemoteMember("carried") == null);
+    const expected_inner = try testing.allocator.dupe(u8, outer.inner_inbuf);
+    defer testing.allocator.free(expected_inner);
+    const expected_record = try testing.allocator.dupe(u8, outer.rec_inbuf);
+    defer testing.allocator.free(expected_record);
+
+    const Sweep = struct {
+        fn make(allocator: std.mem.Allocator, predecessor: *SecuredLink) !SecuredLink {
+            const old = predecessor.exportOuter();
+            var secret: [hs.Established.serialized_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, &secret);
+            old.established.serialize(&secret);
+            return SecuredLink.resumeOuter(.{
+                .allocator = allocator,
+                .role = predecessor.role,
+                .identity = predecessor.identity,
+                .local_prekey = predecessor.local_prekey,
+                .cfg = predecessor.cfg,
+                .rng = predecessor.rng,
+                .server_name = predecessor.server_name,
+                .inner_config = predecessor.inner_config,
+            }, .{
+                .established = hs.Established.deserialize(&secret),
+                .send_counter = old.send_counter,
+                .recv_counter = old.recv_counter,
+                .feed_seq = old.feed_seq,
+                .inner = predecessor.snapshotInner().?,
+                .remote_name = predecessor.snapshotInnerRemoteName(),
+                .rec_inbuf = old.rec_inbuf,
+                .inner_inbuf = old.inner_inbuf,
+                .now_ms = 100,
+                .rng_seed = 17,
+            });
+        }
+        fn run(allocator: std.mem.Allocator, predecessor: *SecuredLink) !void {
+            const old = predecessor.exportOuter();
+            var resumed = try make(allocator, predecessor);
+            defer resumed.deinit();
+            try testing.expectEqual(old.recv_counter, resumed.recv_counter);
+            try testing.expectEqualSlices(u8, old.inner_inbuf, resumed.exportOuter().inner_inbuf);
+            try testing.expectEqualSlices(u8, old.rec_inbuf, resumed.rec_inbuf.items);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{&p.b});
+    try testing.expectEqual(outer.recv_counter, p.b.recv_counter);
+    try testing.expectEqualSlices(u8, expected_inner, p.b.exportOuter().inner_inbuf);
+    try testing.expectEqualSlices(u8, expected_record, p.b.rec_inbuf.items);
+    var resumed = try Sweep.make(testing.allocator, &p.b);
+    defer resumed.deinit();
+    try resumed.feed(wire[received..], 100);
+    resumed.processDeferredResidenceFrames(100);
+    try testing.expect(resumed.findRemoteMember("carried") != null);
+    try testing.expectEqual(@as(usize, 1), drainMembershipKindFor(&resumed, .joined, "carried"));
+    try testing.expectEqual(@as(usize, 0), resumed.exportOuter().inner_inbuf.len);
+    try testing.expectEqual(p.a.send_counter, resumed.recv_counter);
 }
 
 test "a single flipped bit in a transit record fails decryption" {

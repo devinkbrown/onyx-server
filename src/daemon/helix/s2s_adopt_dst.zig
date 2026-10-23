@@ -72,13 +72,13 @@ fn sampleSnap(fd: i32) s2s_snapshot.Snapshot {
 }
 
 /// Synthesize the pre-roster (v3-layout) wire image from a current-encode blob
-/// by stripping the trailing v4 roster block. Valid only when the encoded
-/// roster was EMPTY (the block is then exactly 8 zero bytes: count=0, len=0) —
+/// by stripping the empty v5 carry and v4 roster blocks. Valid only when both
+/// were EMPTY (12 zero bytes: count=0, len=0, inner_len=0) —
 /// every pre-v4 fixture here models a rosterless predecessor.
 fn stripEmptyRosterBlock(allocator: Allocator, current_blob: []const u8) ![]u8 {
-    std.debug.assert(current_blob.len >= 8);
-    for (current_blob[current_blob.len - 8 ..]) |b| std.debug.assert(b == 0);
-    return allocator.dupe(u8, current_blob[0 .. current_blob.len - 8]);
+    std.debug.assert(current_blob.len >= 12);
+    for (current_blob[current_blob.len - 12 ..]) |b| std.debug.assert(b == 0);
+    return allocator.dupe(u8, current_blob[0 .. current_blob.len - 12]);
 }
 
 /// Encode an actual schema-v3 `.s2s_link` capsule — the immediately-prior
@@ -443,7 +443,7 @@ test "s2s_link v4 capsule with a corrupt roster is refused fail-closed and fd re
     defer allocator.free(blob);
     // Corrupt the roster block's declared count so the decode-time walk
     // mismatches — the link must drop cleanly, never adopt a partial roster.
-    const count_off = blob.len - roster.items.len - 8;
+    const count_off = blob.len - roster.items.len - 12;
     std.mem.writeInt(u32, blob[count_off..][0..4], 9, .little);
     var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = blob }};
     const bad = try capsule.encode(allocator, capsule.make(.s2s_link, fields[0..]));

@@ -326,7 +326,7 @@ const WindowsCandidateBarrier = struct {
 };
 
 fn recordWindowsTlsMaterial(proof: *windows_config_proof.EffectiveBuilder, loaded: *const onyx_server.daemon.tls_certs.Loaded) !void {
-    try proof.record(.tls, "key-kind", &.{@intFromEnum(loaded.key_kind)});
+    try proof.record(.tls, "key-kind", &.{@backingInt(loaded.key_kind)});
     try proof.recordCount(.tls, "certificate-count", loaded.cert_chain.len);
     for (loaded.cert_chain) |der| try proof.record(.tls, "certificate-der", der);
     switch (loaded.key_kind) {
@@ -1042,10 +1042,9 @@ pub fn main(init: std.process.Init) !void {
                 config_path_arg = path;
             } else return error.InvalidWindowsCandidate;
         } else if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.upgrade_capability_arg)) {
-            // Advertise the current contract plus the exact predecessor token.
-            // The latter lets a deployed HSSN v3 writer upgrade into this v4
-            // reader; current predecessors still require the current token and
-            // therefore reject rollback to a v3-only image.
+            // Advertise only the current exact contract. A pre-S2S-v5 writer
+            // cannot preserve authenticated partial frames, so its probe must
+            // refuse this target while the predecessor still serves clients.
             std.debug.print("{s}\n", .{
                 onyx_server.daemon.helix.live.upgrade_capability_advertisement,
             });
