@@ -38,6 +38,19 @@ pub const Mode = enum {
     tcp_slow,
 };
 
+pub const Reply = union(enum) {
+    silent,
+    ptr: []const u8,
+    address: wire.Address,
+};
+
+pub const Step = struct {
+    name: []const u8,
+    qtype: wire.RecordType,
+    delay_ms: u32 = 0,
+    reply: Reply,
+};
+
 pub const Server = struct {
     udp: Socket,
     listener: Socket,
@@ -49,6 +62,10 @@ pub const Server = struct {
     tcp_queries: usize = 0,
     failure: ?anyerror = null,
     expected_queries: usize = 1,
+    /// Optional deterministic requests/replies for daemon-worker integration.
+    /// The caller retains these immutable steps through join/deinit.
+    script: []const Step = &.{},
+    fixture_timeout_ms: u32 = 2500,
 
     pub fn init(ipv6: bool, mode: Mode) !Server {
         if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd and builtin.os.tag != .windows) return error.SkipZigTest;
@@ -104,8 +121,8 @@ pub const Server = struct {
     }
 
     fn serve(self: *Server) !void {
-        const deadline = Deadline.after(2500);
-        const count: usize = if (self.mode == .alias_followup or self.mode == .alias_cycle or self.mode == .alias_cross_cycle or self.mode == .alias_slow) 2 else self.expected_queries;
+        const deadline = Deadline.after(self.fixture_timeout_ms);
+        const count: usize = if (self.script.len != 0) self.script.len else if (self.mode == .alias_followup or self.mode == .alias_cycle or self.mode == .alias_cross_cycle or self.mode == .alias_slow) 2 else self.expected_queries;
         for (0..count) |index| {
             var datagram = transport.Connection{ .socket = self.udp, .protocol = .udp };
             try datagram.wait(.read, deadline);
@@ -128,6 +145,19 @@ pub const Server = struct {
             const question = parsed.questions[0];
             const id = parsed.header.id;
             self.udp_queries += 1;
+            if (self.script.len != 0) {
+                const step = self.script[index];
+                if (question.qtype != step.qtype or !std.mem.eql(u8, question.name.slice(), step.name)) return error.InvalidQuestion;
+                if (step.delay_ms != 0) pause(@min(step.delay_ms, try deadline.remaining()));
+                var reply = try Packet.init(id, question.name.slice(), question.qtype);
+                switch (step.reply) {
+                    .silent => continue,
+                    .ptr => |name| try reply.nameRecord(question.name.slice(), 12, 30, name),
+                    .address => |address| try reply.address(question.name.slice(), 30, address),
+                }
+                try sendDatagram(self.udp, reply.slice(), &peer, peer_len);
+                continue;
+            }
             if (self.mode == .silent) continue;
             var packet = try Packet.init(id, question.name.slice(), question.qtype);
             if (self.mode == .wrong_id or self.mode == .wrong_question or self.mode == .foreign_source or self.mode == .wrong_tc_id or self.mode == .wrong_tc_question) {
