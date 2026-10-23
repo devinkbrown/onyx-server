@@ -1564,6 +1564,9 @@ const ConnectionDiagnosticEvent = enum {
 const ConnectionDiagnosticReason = enum {
     none,
     generic_client_quit,
+    connection_timeout,
+    connection_reset,
+    read_error,
     ping_timeout,
     registration_timeout,
     tls_peer_alert,
@@ -1580,6 +1583,9 @@ const ConnectionDiagnosticReason = enum {
 fn connectionDiagnosticReason(reason: []const u8) ConnectionDiagnosticReason {
     const known = .{
         .{ "Client quit", ConnectionDiagnosticReason.generic_client_quit },
+        .{ "Connection timed out", ConnectionDiagnosticReason.connection_timeout },
+        .{ "Connection reset by peer", ConnectionDiagnosticReason.connection_reset },
+        .{ "Read error", ConnectionDiagnosticReason.read_error },
         .{ "Ping timeout", ConnectionDiagnosticReason.ping_timeout },
         .{ "Registration timeout", ConnectionDiagnosticReason.registration_timeout },
         .{ "TLS peer alert", ConnectionDiagnosticReason.tls_peer_alert },
@@ -1596,6 +1602,21 @@ fn connectionDiagnosticReason(reason: []const u8) ConnectionDiagnosticReason {
         if (std.mem.eql(u8, reason, entry[0])) return entry[1];
     }
     return if (reason.len == 0) .none else .other_redacted;
+}
+
+/// Ordinary receive completions carry the backend's negative errno. Windows
+/// IOCP currently collapses non-cancellation failures to -1, so it cannot claim
+/// a more specific cause. kTLS control notifications are handled before this
+/// classifier; their negative result alone is not a transport failure.
+fn receiveErrorCloseReason(result: i32) []const u8 {
+    std.debug.assert(result < 0);
+    if (comptime builtin.os.tag == .windows) return "Read error";
+    const E = if (builtin.os.tag == .openbsd) std.c.E else linux.E;
+    return switch (result) {
+        -@as(i32, @backingInt(E.TIMEDOUT)) => "Connection timed out",
+        -@as(i32, @backingInt(E.CONNRESET)) => "Connection reset by peer",
+        else => "Read error",
+    };
 }
 
 /// Process-local diagnostics never enter a session/checkpoint. Bound logging
@@ -12645,7 +12666,12 @@ pub const LinuxServer = struct {
         }
 
         if (event.res <= 0) {
-            logConnectionDiagnostic(conn, if (event.res == 0) .recv_eof else .recv_error, event.res, null, .none);
+            // Preserve a previously chosen policy/command reason and the EOF
+            // default. Static error text outlives any deferred SEND or session
+            // handoff; only the existing finalizer may publish QUIT/free the row.
+            if (event.res < 0 and std.mem.eql(u8, conn.close_reason, "Client quit"))
+                conn.close_reason = receiveErrorCloseReason(event.res);
+            logConnectionDiagnostic(conn, if (event.res == 0) .recv_eof else .recv_error, event.res, null, if (event.res < 0) connectionDiagnosticReason(conn.close_reason) else .none);
             conn.closing = true;
         }
         if (event.res > 0) {
@@ -125266,6 +125292,133 @@ test "tiny ring fairly activates more than 64 quiet inherited sockets with pendi
         try std.testing.expect(entry.value.send_armed);
         try std.testing.expect(!entry.value.io_activation_pending);
     }
+}
+
+test "receive error diagnostics: handleRecv retains reasons through SEND ownership and broadcasts QUIT" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 4 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const observer_id = try addTestLocalClient(server, "RecvObserver", null);
+    const observer = server.connFor(observer_id).?;
+    _ = try server.world.join("#recv-reason", worldIdFromClient(observer_id));
+    const E = if (builtin.os.tag == .openbsd) std.c.E else linux.E;
+    const Case = struct {
+        result: i32,
+        prior: []const u8 = "Client quit",
+        already_closing: bool = false,
+        expected: []const u8,
+        diagnostic: []const u8,
+    };
+    for ([_]Case{
+        .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .expected = "Connection timed out", .diagnostic = "connection_timeout" },
+        .{ .result = -@as(i32, @backingInt(E.CONNRESET)), .expected = "Connection reset by peer", .diagnostic = "connection_reset" },
+        .{ .result = -@as(i32, @backingInt(E.IO)), .expected = "Read error", .diagnostic = "read_error" },
+        .{ .result = -1, .expected = "Read error", .diagnostic = "read_error" },
+        .{ .result = std.math.minInt(i32), .expected = "Read error", .diagnostic = "read_error" },
+        .{ .result = 0, .expected = "Client quit", .diagnostic = "generic_client_quit" },
+        .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .prior = "Server draining", .expected = "Server draining", .diagnostic = "server_draining" },
+        .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .prior = "private prior reason", .expected = "private prior reason", .diagnostic = "other_redacted" },
+        .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .already_closing = true, .expected = "Client quit", .diagnostic = "generic_client_quit" },
+    }) |case| {
+        var sockets: [2]i32 = undefined;
+        if (posix.errno(socket_system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+            return error.SkipZigTest;
+        defer closeFd(sockets[1]);
+        const victim_id = addTestLocalClient(server, "RecvVictim", null) catch |err| {
+            closeFd(sockets[0]);
+            return err;
+        };
+        const victim = server.connFor(victim_id).?;
+        victim.fd = sockets[0]; // the Server owns and must close this physical endpoint
+        const token = victim.token;
+        _ = try server.world.join("#recv-reason", worldIdFromClient(victim_id));
+        observer.send_len = 0;
+        observer.send_offset = 0;
+
+        // Inject exact completions into the real handler. An outstanding SEND
+        // owns accepted bytes, so a receive failure must retain both the row
+        // and the original tail until that matching completion releases it.
+        const pending = "accepted output\r\n";
+        try rawAppendToConn(victim, pending);
+        victim.send_armed = true;
+        victim.send_submitted_len = pending.len;
+        victim.recv_armed = true;
+        victim.close_reason = case.prior;
+        victim.closing = case.already_closing;
+        try server.handleRecv(.{ .token = token, .res = case.result, .more = false });
+        const held = server.connFor(victim_id) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(held.closing);
+        try std.testing.expect(!held.recv_armed);
+        try std.testing.expect(held.send_armed);
+        try std.testing.expectEqualStrings(case.expected, held.close_reason);
+        try std.testing.expectEqualStrings(pending, held.send_buf[held.send_offset..held.send_len]);
+        try std.testing.expectEqual(@as(usize, 0), observer.send_len);
+        var diagnostic: [768]u8 = undefined;
+        const line = try formatConnectionDiagnostic(&diagnostic, 0, held, .closed, 0, null, connectionDiagnosticReason(held.close_reason), 0);
+        var category: [96]u8 = undefined;
+        try expectContains(line, try std.fmt.bufPrint(&category, "reason={s} ", .{case.diagnostic}));
+        try std.testing.expect(std.mem.indexOf(u8, line, "private prior reason") == null);
+
+        try server.handleSend(.{ .token = token, .res = @intCast(pending.len), .more = false, .notif = false });
+        try std.testing.expect(server.connFor(victim_id) == null);
+        try std.testing.expect(server.world.nickOf(worldIdFromClient(victim_id)) == null);
+        var expected_quit: [128]u8 = undefined;
+        const quit = try std.fmt.bufPrint(&expected_quit, " QUIT :{s}\r\n", .{case.expected});
+        try expectContains(observer.send_buf[0..observer.send_len], quit);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observer.send_buf[0..observer.send_len], " QUIT :"));
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try readFd(sockets[1], &byte));
+    }
+}
+
+test "receive error diagnostics: parsed explicit QUIT survives a later timeout completion" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 4 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const observer_id = try addTestLocalClient(server, "QuitObserver", null);
+    const observer = server.connFor(observer_id).?;
+    const victim_id = try addTestLocalClient(server, "QuitVictim", null);
+    const victim = server.connFor(victim_id).?;
+    _ = try server.world.join("#explicit-quit", worldIdFromClient(observer_id));
+    _ = try server.world.join("#explicit-quit", worldIdFromClient(victim_id));
+    const pending = "accepted output\r\n";
+    try rawAppendToConn(victim, pending);
+    victim.send_armed = true;
+    victim.send_submitted_len = pending.len;
+    victim.recv_armed = true;
+    const token = victim.token;
+    var parsed = try irc_line.parseLine("QUIT :my explicit reason");
+    try server.handleQuit(victim_id, victim, &parsed);
+    try std.testing.expect(victim.closing);
+    const prior = victim.close_reason;
+    try expectContains(observer.send_buf[0..observer.send_len], " QUIT :my explicit reason\r\n");
+    const before = observer.send_len;
+    const E = if (builtin.os.tag == .openbsd) std.c.E else linux.E;
+    try server.handleRecv(.{ .token = token, .res = -@as(i32, @backingInt(E.TIMEDOUT)), .more = false });
+    try std.testing.expectEqualStrings(prior, server.connFor(victim_id).?.close_reason);
+    try std.testing.expectEqual(before, observer.send_len);
+    try server.handleSend(.{ .token = token, .res = @intCast(pending.len), .more = false, .notif = false });
+    try std.testing.expect(server.connFor(victim_id) == null);
+    try std.testing.expectEqual(before, observer.send_len);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observer.send_buf[0..observer.send_len], " QUIT :"));
 }
 
 test "send error waits for quiet recv CQE and stale generation cannot free reuse" {
