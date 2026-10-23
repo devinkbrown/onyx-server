@@ -166,6 +166,10 @@ const relay_v2_extension_probe = "onyx-xcap-relay-v2-1?";
 const relay_v2_extension_reply = "onyx-xcap-relay-v2-1!";
 const relay_v2_ack_confirm_probe = "onyx-xcap-relay-v2-ack-confirm?";
 const relay_v2_ack_confirm_reply = "onyx-xcap-relay-v2-ack-confirm!";
+/// A negotiated MESSAGE_V2 scope for exact ordinary-guest recipients. The
+/// handshake byte is full; older peers echo this PING and never receive schema 3.
+const message_v2_guest_probe = "onyx-xcap-message-v2-guest?";
+const message_v2_guest_reply = "onyx-xcap-message-v2-guest!";
 /// v2 negotiates safe-retirement ACK/ACK_CONFIRM (flag byte on E2EE_GROUP_ACK).
 /// v1 peers never answer this probe and never receive tag 0x26/0x27.
 const e2ee_group_extension_probe = "onyx-xcap-e2ee-group-2?";
@@ -654,6 +658,9 @@ pub const S2sPeer = struct {
     /// remain durable until the original sender explicitly confirms ACK receipt,
     /// instead of relying on a finite replay-window guess.
     peer_supports_relay_v2_ack_confirm: bool = false,
+    /// Remote answered the distinct MESSAGE_V2 guest-recipient probe. This is
+    /// deliberately absent from ResumeHeader and must be re-probed after Helix.
+    peer_supports_message_v2_guest: bool = false,
     /// Remote answered the append-only E2EEGROUP v2 schema probe (ACK/ACK_CONFIRM
     /// retirement). Separate from the handshake byte; valid only atop secure
     /// relay v2 base.
@@ -1345,6 +1352,9 @@ pub const S2sPeer = struct {
                     try emitFrame(self.allocator, sink, .PONG, relay_v2_extension_reply);
                 if (std.mem.eql(u8, frame.payload, relay_v2_ack_confirm_probe))
                     try emitFrame(self.allocator, sink, .PONG, relay_v2_ack_confirm_reply);
+                if (std.mem.eql(u8, frame.payload, message_v2_guest_probe) and
+                    self.supportsSecureRelayV2Base())
+                    try emitFrame(self.allocator, sink, .PONG, message_v2_guest_reply);
                 if (std.mem.eql(u8, frame.payload, e2ee_group_extension_probe) and
                     self.supportsSecureRelayV2Base())
                     try emitFrame(self.allocator, sink, .PONG, e2ee_group_extension_reply);
@@ -1376,6 +1386,9 @@ pub const S2sPeer = struct {
                 if (std.mem.eql(u8, frame.payload, relay_v2_ack_confirm_reply) and
                     self.peer_supports_secure_relay_v2)
                     self.peer_supports_relay_v2_ack_confirm = true;
+                if (std.mem.eql(u8, frame.payload, message_v2_guest_reply) and
+                    self.supportsSecureRelayV2())
+                    self.peer_supports_message_v2_guest = true;
                 if (std.mem.eql(u8, frame.payload, e2ee_group_extension_reply) and
                     self.supportsSecureRelayV2Base())
                     self.peer_supports_e2ee_group_current = true;
@@ -2354,6 +2367,12 @@ pub const S2sPeer = struct {
             self.peer_supports_relay_v2_ack_confirm;
     }
 
+    /// Guest-recipient schema is a separate rolling capability layered on top
+    /// of the secured, ACK-confirmed MESSAGE_V2 transport.
+    pub fn supportsSecureRelayV2Guest(self: *const S2sPeer) bool {
+        return self.supportsSecureRelayV2() and self.peer_supports_message_v2_guest;
+    }
+
     pub fn supportsRelayV2AckConfirm(self: *const S2sPeer) bool {
         return self.supportsSecureRelayV2() and self.peer_supports_relay_v2_ack_confirm;
     }
@@ -2374,6 +2393,11 @@ pub const S2sPeer = struct {
             self.rejected_relay_v2_frames +|= 1;
             return;
         };
+        if (owned.msg.scope_kind == .direct_guest and !self.supportsSecureRelayV2Guest()) {
+            self.rejected_relay_v2_frames +|= 1;
+            owned.deinit(self.allocator);
+            return;
+        }
         const outcome = message_relay_v2.verifyAndRelayId(self.allocator, owned.msg) catch {
             self.rejected_relay_v2_frames +|= 1;
             owned.deinit(self.allocator);
@@ -2449,6 +2473,8 @@ pub const S2sPeer = struct {
         if (!self.peer_supports_secure_relay_v2) return error.CapabilityNotNegotiated;
         if (!self.peer_supports_relay_v2_current or !self.peer_supports_relay_v2_ack_confirm)
             return error.CapabilityNotNegotiated;
+        if (msg.scope_kind == .direct_guest and !self.supportsSecureRelayV2Guest())
+            return error.CapabilityNotNegotiated;
 
         const outcome = try message_relay_v2.verifyAndRelayId(self.allocator, msg);
         const id = switch (outcome) {
@@ -2476,6 +2502,8 @@ pub const S2sPeer = struct {
             return error.CapabilityNotNegotiated;
         var owned = message_relay_v2.decode(self.allocator, wire) catch return error.InvalidRelayMessage;
         defer owned.deinit(self.allocator);
+        if (owned.msg.scope_kind == .direct_guest and !self.supportsSecureRelayV2Guest())
+            return error.CapabilityNotNegotiated;
         const id = switch (try message_relay_v2.verifyAndRelayId(self.allocator, owned.msg)) {
             .verified => |verified| verified,
             .origin_mismatch => return error.OriginMismatch,
@@ -2501,6 +2529,8 @@ pub const S2sPeer = struct {
             return error.CapabilityNotNegotiated;
         var owned = message_relay_v2.decode(self.allocator, wire) catch return error.InvalidRelayMessage;
         defer owned.deinit(self.allocator);
+        if (owned.msg.scope_kind == .direct_guest and !self.supportsSecureRelayV2Guest())
+            return error.CapabilityNotNegotiated;
         const id = switch (try message_relay_v2.verifyAndRelayId(self.allocator, owned.msg)) {
             .verified => |verified| verified,
             .origin_mismatch => return error.OriginMismatch,
@@ -2791,6 +2821,16 @@ pub const S2sPeer = struct {
         if (!self.supportsSecureRelayV2Base()) return;
         try emitFrame(self.allocator, sink, .PING, relay_v2_extension_probe);
         try emitFrame(self.allocator, sink, .PING, relay_v2_ack_confirm_probe);
+        try self.probeSecureRelayV2Guest(sink);
+    }
+
+    /// Re-negotiate the guest-recipient MESSAGE_V2 schema after Helix resume.
+    /// Legacy peers only echo this bounded PING; no new frame is sent until the
+    /// distinct reply has been observed on a fully negotiated secure relay link.
+    pub fn probeSecureRelayV2Guest(self: *S2sPeer, sink: ByteSink) !void {
+        if (!self.established) return error.NotEstablished;
+        if (!self.supportsSecureRelayV2Base()) return;
+        try emitFrame(self.allocator, sink, .PING, message_v2_guest_probe);
     }
 
     /// Negotiate SRTF3 on an already-established preserved stream. An older
@@ -4367,6 +4407,7 @@ pub const S2sPeer = struct {
         // The fixed handshake byte only establishes the secured relay base.
         // Re-authorize the current E2EEGROUP schema on every handshake.
         self.peer_supports_e2ee_group_current = false;
+        self.peer_supports_message_v2_guest = false;
         self.peer_supports_search = false;
         self.peer_supports_keytrans_head = false;
         self.peer_supports_whois_profile = false;
@@ -4389,8 +4430,10 @@ pub const S2sPeer = struct {
         // a fresh bounded proof once the secured relay base is established. This
         // covers reciprocal RESYNC handshakes where `handshake_sent` is already
         // true, while a same-socket Helix downgrade remains fail-closed.
-        if (self.supportsSecureRelayV2Base())
+        if (self.supportsSecureRelayV2Base()) {
             try emitFrame(self.allocator, sink, .PING, e2ee_group_extension_probe);
+            try emitFrame(self.allocator, sink, .PING, message_v2_guest_probe);
+        }
         if (self.signing_key != null)
             try emitFrame(self.allocator, sink, .PING, mesh_search_extension_probe);
         if (self.signing_key != null)
@@ -4454,6 +4497,7 @@ pub const S2sPeer = struct {
         if (self.secure_relay_transport_enabled and self.signing_key != null) {
             try emitFrame(self.allocator, sink, .PING, relay_v2_extension_probe);
             try emitFrame(self.allocator, sink, .PING, relay_v2_ack_confirm_probe);
+            try emitFrame(self.allocator, sink, .PING, message_v2_guest_probe);
         }
         if (self.session_replica_transport_enabled and
             self.session_replica_attachment_transport_enabled and self.signing_key != null)
@@ -6283,6 +6327,8 @@ test "secure relay v2 negotiates only on secured peers and round-trips once" {
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6100);
     try std.testing.expect(a.supportsSecureRelayV2());
     try std.testing.expect(b.supportsSecureRelayV2());
+    try std.testing.expect(a.supportsSecureRelayV2Guest());
+    try std.testing.expect(b.supportsSecureRelayV2Guest());
 
     var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
     var signature: [message_relay_v2.sig_len]u8 = undefined;
@@ -6310,6 +6356,207 @@ test "secure relay v2 negotiates only on secured peers and round-trips once" {
     try std.testing.expectEqual(@as(usize, 1), inbound.len);
     try std.testing.expect(!(try b.forwardMessageV2(b_to_a.sink(), inbound[0].wire)));
     try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+}
+
+test "MESSAGE_V2 guest xcap requires its exact PONG over secure relay" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x73);
+    const kp_b = try signingKeyFor(0x74);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6110);
+    try std.testing.expect(a.supportsSecureRelayV2Guest());
+
+    // An old peer echoes the unknown PING payload. The echo is not the
+    // capability reply and cannot enable schema 3.
+    a.peer_supports_message_v2_guest = false;
+    try emitFrame(allocator, b_to_a.sink(), .PONG, message_v2_guest_probe);
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6111);
+    b_to_a.clear();
+    try std.testing.expect(!a.supportsSecureRelayV2Guest());
+
+    // Similar-looking, malformed, and correct replies without the secured
+    // relay base are all ignored.
+    try emitFrame(allocator, b_to_a.sink(), .PONG, "onyx-xcap-message-v2-guest-2!");
+    try emitFrame(allocator, b_to_a.sink(), .PONG, message_v2_guest_reply[0 .. message_v2_guest_reply.len - 1]);
+    a.peer_supports_secure_relay_v2 = false;
+    try emitFrame(allocator, b_to_a.sink(), .PONG, message_v2_guest_reply);
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6112);
+    b_to_a.clear();
+    try std.testing.expect(!a.supportsSecureRelayV2Guest());
+
+    // A fresh exact reply is accepted only after secure-relay support is
+    // restored and the normal current-schema/ACK-confirm gates are present.
+    a.peer_supports_secure_relay_v2 = true;
+    try emitFrame(allocator, b_to_a.sink(), .PONG, message_v2_guest_reply);
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6113);
+    b_to_a.clear();
+    try std.testing.expect(a.supportsSecureRelayV2Guest());
+}
+
+test "MESSAGE_V2 direct guest scope is withheld until the peer answers its xcap" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x77);
+    const kp_b = try signingKeyFor(0x78);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6130);
+    try std.testing.expect(a.supportsSecureRelayV2Guest());
+    try std.testing.expect(b.supportsSecureRelayV2Guest());
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var msg = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "guestnick",
+        .source_prefix = "alice!u@example.invalid",
+        .account = "alice",
+        .tags = "",
+        .text = "hello guest",
+        .scope_kind = .direct_guest,
+        .wire_schema = 3,
+        .sender_route_id = try message_relay_v2.routeId(@splat(0x31)),
+        .recipient_guest_origin = @splat(0x32),
+        .recipient_guest_id = @splat(0x33),
+        .origin_node = a_short,
+        .hlc = 101,
+    };
+    try message_relay_v2.stampOrigin(allocator, &msg, &a.signing_key.?, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(allocator, msg);
+    defer allocator.free(wire);
+
+    // Losing the negotiated reply after adoption blocks new sends, forwarding,
+    // retained replay, and inbound schema-3 delivery.
+    a.peer_supports_message_v2_guest = false;
+    try std.testing.expectError(error.CapabilityNotNegotiated, a.sendMessageV2(a_to_b.sink(), msg));
+    try std.testing.expectError(error.CapabilityNotNegotiated, a.forwardMessageV2(a_to_b.sink(), wire));
+    try std.testing.expectError(error.CapabilityNotNegotiated, a.replayRetainedMessageV2Wire(a_to_b.sink(), wire));
+    try std.testing.expectEqual(@as(usize, 0), a_to_b.bytes.items.len);
+
+    try b.sendMessageV2(b_to_a.sink(), msg);
+    // Model B having not yet heard A's post-adoption probe; A independently
+    // rejects because its reply from B was cleared above.
+    b.peer_supports_message_v2_guest = false;
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6131);
+    b_to_a.clear();
+    var inbound = try a.takeInboundV2();
+    try std.testing.expectEqual(@as(usize, 0), inbound.len);
+    allocator.free(inbound);
+
+    // Probe again after adoption. The peer's exact reply enables schema 3.
+    try a.probeSecureRelayV2Guest(a_to_b.sink());
+    try b.feed(a_to_b.bytes.items, b_to_a.sink(), tc.now_ms, 0x6133);
+    a_to_b.clear();
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6134);
+    b_to_a.clear();
+    try std.testing.expect(a.supportsSecureRelayV2Guest());
+    try b.probeSecureRelayV2Guest(b_to_a.sink());
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6134);
+    b_to_a.clear();
+    try b.feed(a_to_b.bytes.items, b_to_a.sink(), tc.now_ms, 0x6134);
+    a_to_b.clear();
+    try std.testing.expect(b.supportsSecureRelayV2Guest());
+    try a.sendMessageV2(a_to_b.sink(), msg);
+    try b.feed(a_to_b.bytes.items, b_to_a.sink(), tc.now_ms, 0x6135);
+    a_to_b.clear();
+    inbound = try b.takeInboundV2();
+    defer {
+        for (inbound) |*item| item.deinit(allocator);
+        allocator.free(inbound);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    try std.testing.expectEqual(message_relay_v2.ScopeKind.direct_guest, inbound[0].owned.msg.scope_kind);
+}
+
+test "MESSAGE_V2 guest xcap is reset and re-probed after established-link resume" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x75);
+    const kp_b = try signingKeyFor(0x76);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6120);
+    try std.testing.expect(a.supportsSecureRelayV2Guest());
+    a_to_b.clear();
+    b_to_a.clear();
+
+    const hdr = a.snapshotResume();
+    var resumed_state = ChannelCrdt.init(allocator, a_short);
+    defer resumed_state.deinit();
+    const resumed_key = try signingKeyFor(0x75);
+    var resumed = try S2sPeer.resumeEstablished(.{
+        .allocator = allocator,
+        .state = &resumed_state,
+        .clock = tc.clock(),
+        .local_node_id = a_short,
+        .remote_node_id = b_short,
+        .local_epoch_ms = 3000,
+        .server_name = "a.test",
+        .description = "test",
+        .config = a.config,
+        .signing_key = resumed_key,
+        .secure_relay_transport_enabled = true,
+    }, hdr, a.remoteName(), tc.now_ms + 1, 0x6121);
+    defer resumed.deinit();
+
+    try std.testing.expect(resumed.supportsSecureRelayV2());
+    try std.testing.expect(!resumed.supportsSecureRelayV2Guest());
+    try resumed.probeSecureRelayV2Guest(a_to_b.sink());
+    try b.feed(a_to_b.bytes.items, b_to_a.sink(), tc.now_ms + 1, 0x6122);
+    a_to_b.clear();
+    try resumed.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms + 1, 0x6123);
+    b_to_a.clear();
+    try std.testing.expect(resumed.supportsSecureRelayV2Guest());
 }
 
 test "secure relay v2 ACK is authenticated deduplicated bounded and capability gated" {
