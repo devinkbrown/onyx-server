@@ -8,6 +8,7 @@ are separate systems described in [World, dispatch and modules](02-world-dispatc
 | Entry | Implementation boundaries | Ownership rule |
 | --- | --- | --- |
 | `src/daemon/server.zig` | Configuration values in `server_config.zig`; native upgrade value contracts in `native_upgrade_contracts.zig`; Linux keepalive values in `client_socket_policy.zig` | Runtime ownership and transaction bodies remain in the server. This is a partial extraction, with canonical aliases preserving callers. |
+| `src/daemon/config_format.zig` | Canonical model/defaults, resolver/error contracts, ordered TOML projection, typed value/authority/mesh/listener helpers, and topical tests | Keep one Config type and preserve allocation, validation, and error order in the projection transaction. Sibling helpers are not facade exports. |
 | `src/proto/dns.zig` | Wire/name validation, response interpretation, query deadlines and transport, configuration, result cache, confirmation | Results own their names and addresses; every socket and retry remains inside its absolute deadline. See [DNS](dns.md). |
 | `src/proto/lotus.zig` | Retained-message store, canonical types, checkpoint codec, and history/exact-once tests | Keep wire definitions canonical and preserve protocol identities. |
 | `src/proto/ircx_prop_store.zig` | Property contracts, storage operations, and codecs | Retain property authorization and canonical encoding at their existing boundaries. |
