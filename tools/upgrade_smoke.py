@@ -369,28 +369,28 @@ def _run_smoke():
     # and conn B's SASL login would then RECLAIM that ghost — replacing B's
     # freshly-elevated oper session with the ghost's non-oper state, so the
     # UPGRADE would 481 (pre-existing reclaim-clobbers-elevation behavior).
-    a = connect()
+    a = tls_connect(tls_port)
     a.sendall(b"NICK regger\r\nUSER reg 0 * :reg\r\n")
     if " 001 " not in recv_until(a, b" 001 "):
         fail("conn A did not register (no 001)", proc)
     a.sendall(f"REGISTER {ACCT} * {PASSWORD}\r\n".encode())
     reg = recv_until(a, b"REGISTER", timeout=20)  # argon2 hash is slow in Debug
-    if "REGISTER SUCCESS" not in reg and "FAIL" not in reg:
-        fail(f"unexpected REGISTER reply: {reg!r}", proc)
+    if "REGISTER SUCCESS" not in reg:
+        fail("operator account REGISTER did not succeed", proc)
 
     # Register a second, non-oper account for the bouncer-session check.
-    a2 = connect()
+    a2 = tls_connect(tls_port)
     a2.sendall(b"NICK survivor\r\nUSER reg2 0 * :reg2\r\n")
     if " 001 " not in recv_until(a2, b" 001 "):
         fail("conn A2 did not register (no 001)", proc)
     a2.sendall(f"REGISTER {BOUNCE_ACCT} * {BOUNCE_PASSWORD}\r\n".encode())
     reg2 = recv_until(a2, b"REGISTER", timeout=20)  # argon2 hash is slow in Debug
-    if "REGISTER SUCCESS" not in reg2 and "FAIL" not in reg2:
-        fail(f"unexpected REGISTER reply for bounce: {reg2!r}", proc)
+    if "REGISTER SUCCESS" not in reg2:
+        fail("bouncer account REGISTER did not succeed", proc)
     a2.close()
 
     # Conn B: SASL login -> auto-elevate to oper -> UPGRADE.
-    b = connect()
+    b = tls_connect(tls_port)
     b.sendall(b"CAP LS 302\r\n")
     recv_until(b, b"CAP")
     b.sendall(b"CAP REQ :sasl\r\nAUTHENTICATE PLAIN\r\n")
@@ -407,11 +407,11 @@ def _run_smoke():
         fail(f"operator not elevated (no 381): {welcome!r}", proc)
     print("PASS: operator elevated via SASL (381)")
 
-    # Conn D: a plain registered client we keep OPEN across the UPGRADE to prove
+    # Conn D: a TLS registered client we keep OPEN across the UPGRADE to prove
     # its TCP connection (fd) is re-attached, not dropped. It logs in via SASL
     # (bouncer session), joins a channel, sets +i, and arms MONITOR + SILENCE
     # so the successor must restore ALL of that per-client state.
-    d = connect()
+    d = tls_connect(tls_port)
     d.sendall(b"CAP LS 302\r\n")
     recv_until(d, b"CAP")
     d.sendall(b"CAP REQ :sasl\r\nAUTHENTICATE PLAIN\r\n")

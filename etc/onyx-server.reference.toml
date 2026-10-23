@@ -54,6 +54,15 @@ name = "Onyx"
 # discoverable = false
 
 
+# --- [logging] — optional persistent daemon diagnostics --------------------
+[logging]
+# Linux: append stderr to this file; unset keeps inherited stderr/journal.
+# Requires a daemon-owned 0600 regular file with one link; final symlinks are
+# rejected. Run --check-config as the daemon user (it may create the file).
+# Opened at startup and Helix adoption; failures retain inherited stderr.
+# Configure external rotation; the daemon does not rotate this file itself.
+# stderr_file = "/var/log/onyx-server/onyx-server.log"
+
 # --- [motd] — message of the day (personalized template) ---------------------
 [motd]
 # MOTD text served by the MOTD command. It is a PER-CONNECTION TEMPLATE: each
