@@ -792,6 +792,11 @@ pub const SecuredLink = struct {
         return link.supportsSecureRelayV2();
     }
 
+    pub fn supportsSecureRelayV2Guest(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsSecureRelayV2Guest();
+    }
+
     pub fn supportsRelayV2AckConfirm(self: *const SecuredLink) bool {
         const link = self.inner orelse return false;
         return link.supportsRelayV2AckConfirm();
@@ -924,6 +929,12 @@ pub const SecuredLink = struct {
     pub fn probeRelayV2Current(self: *SecuredLink) anyerror!void {
         const link = self.inner orelse return error.NotEstablished;
         try link.probeRelayV2Current();
+        try self.drainInner();
+    }
+
+    pub fn probeSecureRelayV2Guest(self: *SecuredLink) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.probeSecureRelayV2Guest();
         try self.drainInner();
     }
 
@@ -1996,8 +2007,15 @@ test "secure relay v2 is negotiated encrypted and drained through SecuredLink" {
     defer p.deinit();
     try testing.expect(p.a.supportsSecureRelayV2());
     try testing.expect(p.b.supportsSecureRelayV2());
+    try testing.expect(p.a.supportsSecureRelayV2Guest());
+    try testing.expect(p.b.supportsSecureRelayV2Guest());
     p.a.clearOutbound();
     p.b.clearOutbound();
+
+    // Exercise the public secured wrapper seam for a bounded re-probe.
+    try p.a.probeSecureRelayV2Guest();
+    try pump(&p.a, &p.b, false);
+    try testing.expect(p.a.supportsSecureRelayV2Guest());
 
     var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
     var signature: [message_relay_v2.sig_len]u8 = undefined;
