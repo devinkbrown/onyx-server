@@ -337,7 +337,6 @@ pub const Resolver = struct {
     /// Caller holds the mutex.
     fn enqueueLocked(self: *Resolver, ip: dns.Address) void {
         if (self.producers.frozen or self.stop_flag.load(.acquire)) return;
-        _ = self.reserve(ip); // mark pending so repeat requests don't pile up
         if (self.job_count >= job_capacity) return;
         var i: usize = 0;
         var idx = self.job_head;
@@ -345,6 +344,10 @@ pub const Resolver = struct {
             if (addrEql(self.jobs[idx].ip, ip)) return; // already queued
             idx = (idx + 1) % job_capacity;
         }
+        // Publish pending only after queue admission is certain. A refused
+        // request must remain retryable and must not evict a cache entry.
+        const entry = self.reserve(ip);
+        entry.* = .{ .key = ip, .has_key = true, .state = .pending };
         self.jobs[self.job_tail] = .{ .ip = ip };
         self.job_tail = (self.job_tail + 1) % job_capacity;
         self.job_count += 1;
@@ -751,4 +754,47 @@ test "companion runtime producer fence RDNS preserves accepted queue and rejects
     try std.testing.expectError(error.InvalidProducerFence, resolver.captureFrozen(failing.allocator(), fence, null, 1024 * 1024));
     try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
     try std.testing.expectEqual(@as(usize, 2), (try resolver.inspectFrozen(next, null)).queued);
+}
+
+test "DNS worker full queue does not strand an unaccepted address" {
+    var resolver = try Resolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    for (0..job_capacity) |i| {
+        resolver.request(.{ .ipv4 = .{ 192, 0, @intCast(i / 256), @intCast(i % 256) } });
+    }
+    const overflow: dns.Address = .{ .ipv4 = .{ 198, 51, 100, 7 } };
+    resolver.request(overflow);
+    try std.testing.expectEqual(job_capacity, resolver.job_count);
+    try std.testing.expect(resolver.find(overflow) == null);
+    _ = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    resolver.request(overflow);
+    try std.testing.expectEqual(job_capacity, resolver.job_count);
+    try std.testing.expectEqual(State.pending, resolver.find(overflow).?.state);
+    var occurrences: usize = 0;
+    while (resolver.takeJob()) |job| {
+        if (addrEql(job.ip, overflow)) occurrences += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), occurrences);
+}
+
+test "DNS worker refresh stays pending after dequeue and preserves checkpoint validity" {
+    var resolver = try Resolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    const ip: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    const entry = resolver.reserve(ip);
+    entry.state = .ready;
+    entry.resolved_ms = 0;
+    const host = "old.example.test";
+    @memcpy(entry.host_buf[0..host.len], host);
+    entry.host_len = host.len;
+    entry.observed_len = host.len;
+    // Exercise admission directly so the test does not depend on host uptime.
+    resolver.enqueueLocked(ip);
+    try std.testing.expectEqual(State.pending, entry.state);
+    var snapshot = try resolver.captureUnstarted(std.testing.allocator, 1024 * 1024);
+    defer snapshot.deinit();
+    try snapshot.validate(resolver.cfg);
+    _ = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    resolver.request(ip);
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
 }
