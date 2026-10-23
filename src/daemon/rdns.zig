@@ -16,6 +16,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dns = @import("../proto/dns.zig");
+const dns_engine = @import("../proto/dns/query_engine.zig");
+const dns_confirmation = @import("../proto/dns/confirmation.zig");
+const DnsDeadline = @import("../proto/dns/deadline.zig").Deadline;
 const platform = @import("../substrate/platform.zig");
 pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
@@ -471,17 +474,9 @@ pub const Resolver = struct {
             // Keep the PTR even when it does not forward-confirm. Operators
             // need that name next to the address; `host_len` stays 0 so the
             // confirmed-only lookup and the checkpoint still ignore it.
-            var name_buf: [max_host_len]u8 = undefined;
-            const ptr_name = dns.resolveReverse(&self.cfg, job.ip, &name_buf) catch null;
-            var forward_ok = false;
-            if (ptr_name) |name| {
-                var fwd: [dns.max_cache_addrs]dns.Address = undefined;
-                if (dns.resolveForward(&self.cfg, name, job.ip == .ipv6, &fwd)) |addrs| {
-                    forward_ok = dns.forwardConfirms(job.ip, addrs);
-                } else |_| {}
-            }
-
-            self.completeJob(job, ptr_name, forward_ok);
+            const deadline = DnsDeadline.after(dns_engine.defaultBudget(&self.cfg));
+            const observed = dns_confirmation.resolveUntil(&self.cfg, job.ip, deadline);
+            self.completeJob(job, if (observed.name.len == 0) null else observed.name.slice(), observed.confirmed);
         }
     }
 };
@@ -1099,4 +1094,82 @@ test "DNS worker completes an orphan to unblock a rowless legacy FIFO head witho
     var after = try resolver.captureUnstarted(std.testing.allocator, 1024 * 1024);
     defer after.deinit();
     try std.testing.expectEqualDeep(before.jobs[1..before.job_count], after.jobs[0..after.job_count]);
+}
+
+test "DNS worker budget shares five seconds across delayed PTR and silent forward while retaining observation" {
+    const fixture = @import("../proto/dns/test_server.zig");
+    var server = try fixture.Server.init(false, .valid);
+    defer server.deinit();
+    const ip: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    const steps = [_]fixture.Step{
+        .{ .name = "7.113.0.203.in-addr.arpa", .qtype = .ptr, .delay_ms = 2500, .reply = .{ .ptr = "observed.budget.test" } },
+        .{ .name = "observed.budget.test", .qtype = .a, .reply = .silent },
+    };
+    server.script = &steps;
+    server.fixture_timeout_ms = 5000;
+    try server.start();
+    var cfg = server.resolverConfig();
+    cfg.timeout_ms = std.math.maxInt(u32);
+    cfg.attempts = 255;
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, cfg);
+    defer resolver.deinit();
+    resolver.request(ip);
+    const started = platform.monotonicMillis();
+    resolver.start();
+    try std.testing.expect(resolver.thread != null);
+    var name: [max_host_len]u8 = undefined;
+    while (platform.monotonicMillis() - started < 6500 and resolver.lookupObserved(ip, &name) == null) sleepMs(5);
+    const elapsed = platform.monotonicMillis() - started;
+    const observed = resolver.lookupObserved(ip, &name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("observed.budget.test", observed.name);
+    try std.testing.expect(!observed.confirmed);
+    try std.testing.expect(resolver.lookup(ip, &name) == null);
+    // The former independently renewed forward deadline took about 7.5s.
+    // Allow scheduler overhead while distinguishing it from one 5s budget.
+    try std.testing.expect(elapsed >= 4500 and elapsed < 6500);
+    resolver.stop();
+    try server.join();
+    try std.testing.expectEqual(@as(usize, 2), server.udp_queries);
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
+    try std.testing.expect(resolver.active_job == null);
+    const entry = resolver.find(ip) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!entry.work_reserved);
+    try std.testing.expect(entry.resolved_ms >= started and entry.resolved_ms <= started + elapsed);
+}
+
+test "DNS worker budget confirms matching IPv4 and IPv6 and retains mismatching PTR observations" {
+    const fixture = @import("../proto/dns/test_server.zig");
+    const v4: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    const v6: dns.Address = .{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7 } };
+    const cases = [_]struct { address: dns.Address, answer: dns.Address, confirmed: bool }{
+        .{ .address = v4, .answer = v4, .confirmed = true },
+        .{ .address = v6, .answer = v6, .confirmed = true },
+        .{ .address = v4, .answer = .{ .ipv4 = .{ 203, 0, 113, 8 } }, .confirmed = false },
+    };
+    for (cases) |case| {
+        var server = try fixture.Server.init(false, .valid);
+        defer server.deinit();
+        var reverse_buf: [dns.max_domain_text_len]u8 = undefined;
+        const steps = [_]fixture.Step{
+            .{ .name = try dns.reverseName(&reverse_buf, case.address), .qtype = .ptr, .reply = .{ .ptr = "matching.budget.test" } },
+            .{ .name = "matching.budget.test", .qtype = if (case.address == .ipv6) .aaaa else .a, .reply = .{ .address = case.answer } },
+        };
+        server.script = &steps;
+        try server.start();
+        var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, server.resolverConfig());
+        defer resolver.deinit();
+        resolver.request(case.address);
+        resolver.start();
+        try std.testing.expect(resolver.thread != null);
+        var name: [max_host_len]u8 = undefined;
+        const stop_at = platform.monotonicMillis() + 1500;
+        while (platform.monotonicMillis() < stop_at and resolver.lookupObserved(case.address, &name) == null) sleepMs(5);
+        const observed = resolver.lookupObserved(case.address, &name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("matching.budget.test", observed.name);
+        try std.testing.expectEqual(case.confirmed, observed.confirmed);
+        try std.testing.expectEqual(case.confirmed, resolver.lookup(case.address, &name) != null);
+        resolver.stop();
+        try server.join();
+        try std.testing.expectEqual(@as(usize, 2), server.udp_queries);
+    }
 }

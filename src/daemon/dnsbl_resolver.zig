@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const dns = @import("../proto/dns.zig");
+const dns_engine = @import("../proto/dns/query_engine.zig");
+const DnsDeadline = @import("../proto/dns/deadline.zig").Deadline;
 const dnsbl = @import("dnsbl.zig");
 const platform = @import("../substrate/platform.zig");
 pub const runtime_pause = @import("runtime_pause.zig");
@@ -502,30 +504,36 @@ pub const Resolver = struct {
 
     /// Probe every configured zone for `ip`, stopping at the first listing. Run
     /// outside the mutex. Any per-zone error (NXDOMAIN, no data, timeout) means
-    /// "not listed by that zone" and the scan continues.
+    /// "not listed by that zone" and the scan continues. All zones share one
+    /// deadline of at most five seconds. Each receives an equal share of the
+    /// remaining time, so earlier silence cannot consume every later zone's
+    /// opportunity; quick replies leave their unused time to the remaining zones.
     fn probe(self: *const Resolver, ip: dns.Address) Verdict {
+        const deadline = DnsDeadline.after(dns_engine.defaultBudget(&self.cfg));
         var query_cfg = self.cfg;
         if (comptime @import("builtin").os.tag == .windows) {
-            // A stop cannot interrupt a blocking Winsock receive. Bound one
-            // zone to at most one second per nameserver, then observe stop
-            // before starting the next of up to eight zones.
+            // Preserve the existing per-attempt limit and stop boundary for
+            // a single-zone Windows probe as well as the whole-scan deadline.
             query_cfg.timeout_ms = @min(query_cfg.timeout_ms, 1000);
             query_cfg.attempts = @min(query_cfg.attempts, 1);
         }
-        for (self.zones[0..self.zone_count]) |zone| {
+        for (self.zones[0..self.zone_count], 0..) |zone, index| {
             if (self.stop_flag.load(.acquire)) break;
+            const remaining = deadline.remaining() catch break;
+            const zones_left: u32 = @intCast(self.zone_count - index);
+            const zone_deadline = deadline.slice(@max(1, remaining / zones_left)) catch break;
             var name_buf: [dns.max_domain_text_len]u8 = undefined;
             const name = switch (ip) {
                 .ipv4 => |b| dnsbl.reverseNameV4(b, zone, &name_buf),
                 .ipv6 => |b| dnsbl.reverseNameV6(b, zone, &name_buf),
             } catch continue;
 
-            var addr_buf: [8]dns.Address = undefined;
-            const answers = dns.resolveForward(&query_cfg, name, false, &addr_buf) catch continue;
+            const result = dns_engine.resolveUntil(&query_cfg, name, .a, zone_deadline) catch continue;
+            if (result.outcome != .positive) continue;
 
             var a_records: [8][4]u8 = undefined;
             var n: usize = 0;
-            for (answers) |ans| switch (ans) {
+            for (result.addressSlice()[0..@min(8, result.address_count)]) |ans| switch (ans) {
                 .ipv4 => |b| {
                     a_records[n] = b;
                     n += 1;
@@ -1219,4 +1227,74 @@ test "DNS worker completes an orphan to unblock a rowless legacy FIFO head witho
     var after = try resolver.captureUnstarted(std.testing.allocator, 1024 * 1024);
     defer after.deinit();
     try std.testing.expectEqualDeep(before.jobs[1..before.job_count], after.jobs[0..after.job_count]);
+}
+
+test "DNS worker budget bounds all eight silent DNSBL zones to five seconds" {
+    const fixture = @import("../proto/dns/test_server.zig");
+    var server = try fixture.Server.init(false, .valid);
+    defer server.deinit();
+    const zones = [_][]const u8{ "zero.test", "one.test", "two.test", "three.test", "four.test", "five.test", "six.test", "seven.test" };
+    var names: [max_zones][dns.max_domain_text_len]u8 = undefined;
+    var steps: [max_zones]fixture.Step = undefined;
+    const ip: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    for (zones, 0..) |zone, index| steps[index] = .{
+        .name = try dnsbl.reverseNameV4(ip.ipv4, zone, &names[index]),
+        .qtype = .a,
+        .reply = .silent,
+    };
+    server.script = &steps;
+    server.fixture_timeout_ms = 5000;
+    try server.start();
+    var cfg = server.resolverConfig();
+    cfg.timeout_ms = std.math.maxInt(u32);
+    cfg.attempts = 255;
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, cfg, &zones);
+    defer resolver.deinit();
+    resolver.request(ip);
+    const started = platform.monotonicMillis();
+    try resolver.startChecked();
+    while (platform.monotonicMillis() - started < 6500 and resolver.lookup(ip) == null) sleepMs(5);
+    const elapsed = platform.monotonicMillis() - started;
+    const verdict = resolver.lookup(ip) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Verdict{ .listed = false }, verdict);
+    try std.testing.expect(elapsed >= 4500 and elapsed < 6500);
+    resolver.stop();
+    try server.join();
+    try std.testing.expectEqual(max_zones, server.udp_queries);
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
+    try std.testing.expect(resolver.active_job == null);
+    const entry = resolver.find(ip) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!entry.work_reserved);
+    try std.testing.expect(entry.resolved_ms >= started and entry.resolved_ms <= started + elapsed);
+}
+
+test "DNS worker budget gives the final DNSBL zone a listing opportunity after earlier silence" {
+    const fixture = @import("../proto/dns/test_server.zig");
+    var server = try fixture.Server.init(false, .valid);
+    defer server.deinit();
+    const zones = [_][]const u8{ "zero.test", "one.test", "two.test", "three.test", "four.test", "five.test", "six.test", "seven.test" };
+    var names: [max_zones][dns.max_domain_text_len]u8 = undefined;
+    var steps: [max_zones]fixture.Step = undefined;
+    const ip: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    for (zones, 0..) |zone, index| steps[index] = .{
+        .name = try dnsbl.reverseNameV4(ip.ipv4, zone, &names[index]),
+        .qtype = .a,
+        .reply = if (index == max_zones - 1) .{ .address = .{ .ipv4 = .{ 127, 0, 0, 7 } } } else .silent,
+    };
+    server.script = &steps;
+    try server.start();
+    var cfg = server.resolverConfig();
+    cfg.timeout_ms = 800;
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, cfg, &zones);
+    defer resolver.deinit();
+    resolver.request(ip);
+    const started = platform.monotonicMillis();
+    try resolver.startChecked();
+    while (platform.monotonicMillis() - started < 1800 and resolver.lookup(ip) == null) sleepMs(5);
+    const elapsed = platform.monotonicMillis() - started;
+    try std.testing.expectEqual(Verdict{ .listed = true, .code = 7 }, resolver.lookup(ip) orelse return error.TestUnexpectedResult);
+    try std.testing.expect(elapsed >= 500 and elapsed < 1800);
+    resolver.stop();
+    try server.join();
+    try std.testing.expectEqual(max_zones, server.udp_queries);
 }
