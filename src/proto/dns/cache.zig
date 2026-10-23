@@ -184,7 +184,7 @@ fn addressKey(self: wire.Address) AddressKey {
 }
 
 fn expiresAt(now_ms: i64, ttl_seconds: u32) i64 {
-    return now_ms + @as(i64, @intCast(ttl_seconds)) * 1000;
+    return now_ms +| @as(i64, ttl_seconds) * 1000;
 }
 
 fn isExpired(now_ms: i64, expires_ms: i64) bool {
@@ -206,4 +206,17 @@ test "cache returns hits and expires forward and reverse entries" {
     try cache.putPtr(4000, addrs[0], "localhost", 1);
     try std.testing.expectEqualStrings("localhost", cache.getPtr(4999, addrs[0]).?);
     try std.testing.expect(cache.getPtr(5000, addrs[0]) == null);
+}
+
+test "DNS legacy cache expiry saturates instead of overflowing caller timestamps" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const address = wire.Address{ .ipv4 = .{ 192, 0, 2, 1 } };
+    const near_limit = std.math.maxInt(i64) - 1;
+    try cache.putHost(near_limit, "host.test", &.{address}, std.math.maxInt(u32));
+    try cache.putPtr(near_limit, address, "host.test", std.math.maxInt(u32));
+    try std.testing.expect(cache.getHost(near_limit, "host.test") != null);
+    try std.testing.expect(cache.getPtr(near_limit, address) != null);
+    try std.testing.expect(cache.getHost(std.math.maxInt(i64), "host.test") == null);
+    try std.testing.expect(cache.getPtr(std.math.maxInt(i64), address) == null);
 }

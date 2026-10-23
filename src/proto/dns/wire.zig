@@ -4,213 +4,32 @@
 //! Transport-free DNS messages, bounded name decoding, and answer ownership validation.
 
 const std = @import("std");
+const names = @import("name_codec.zig");
 
-pub const max_message_len: usize = 512;
-pub const max_domain_text_len: usize = 253;
-pub const max_cache_addrs: usize = 8;
-pub const class_in: u16 = 1;
+const types = @import("message_types.zig");
 
-pub const EncodeError = error{
-    OutputTooSmall,
-    NameTooLong,
-    InvalidName,
-    TooManyQuestions,
-    TooManyAnswers,
-    UnsupportedType,
-    TxtStringTooLong,
-};
-
-pub const DecodeError = error{
-    TruncatedMessage,
-    OversizeMessage,
-    InvalidName,
-    NameTooLong,
-    CompressionLoop,
-    TooManyQuestions,
-    TooManyAnswers,
-    UnsupportedType,
-    UnsupportedClass,
-    UnsupportedSection,
-    MalformedRData,
-    TrailingBytes,
-};
-
-pub const RecordType = enum(u16) {
-    a = 1,
-    ptr = 12,
-    txt = 16,
-    aaaa = 28,
-
-    pub fn fromInt(value: u16) DecodeError!RecordType {
-        return switch (value) {
-            1 => .a,
-            12 => .ptr,
-            16 => .txt,
-            28 => .aaaa,
-            else => error.UnsupportedType,
-        };
-    }
-};
-
-pub const Header = struct {
-    id: u16,
-    flags: u16,
-    qdcount: u16,
-    ancount: u16,
-    nscount: u16,
-    arcount: u16,
-
-    pub fn isResponse(self: Header) bool {
-        return (self.flags & 0x8000) != 0;
-    }
-
-    pub fn rcode(self: Header) u4 {
-        return @intCast(self.flags & 0x000f);
-    }
-};
-
-pub const Name = struct {
-    bytes: [max_domain_text_len]u8 = @splat(0),
-    len: usize = 0,
-
-    pub fn fromSlice(text: []const u8) EncodeError!Name {
-        if (text.len > max_domain_text_len) return error.NameTooLong;
-        var name = Name{};
-        @memcpy(name.bytes[0..text.len], text);
-        name.len = text.len;
-        return name;
-    }
-
-    pub fn slice(self: *const Name) []const u8 {
-        return self.bytes[0..self.len];
-    }
-};
-
-pub const Address = union(enum) {
-    ipv4: [4]u8,
-    ipv6: [16]u8,
-};
-
-pub const Question = struct {
-    name: Name,
-    qtype: RecordType,
-    qclass: u16 = class_in,
-};
-
-pub const RData = union(enum) {
-    a: [4]u8,
-    aaaa: [16]u8,
-    ptr: Name,
-};
-
-pub const ResourceRecord = struct {
-    name: Name,
-    rr_type: RecordType,
-    class: u16,
-    ttl: u32,
-    data: RData,
-    txt: Txt = .{},
-
-    pub fn txtData(self: *const ResourceRecord) ?*const Txt {
-        if (self.rr_type != .txt) return null;
-        return &self.txt;
-    }
-};
-
-pub const Query = struct {
-    name: []const u8,
-    qtype: RecordType,
-    qclass: u16 = class_in,
-};
-
-pub const AnswerData = union(enum) {
-    a: [4]u8,
-    aaaa: [16]u8,
-    ptr: []const u8,
-    txt: []const []const u8,
-};
-
-pub const Answer = struct {
-    name: []const u8,
-    rr_type: RecordType,
-    class: u16 = class_in,
-    ttl: u32,
-    data: AnswerData,
-};
-
-pub const BuildMessage = struct {
-    id: u16,
-    response: bool = false,
-    recursion_desired: bool = true,
-    recursion_available: bool = false,
-    rcode: u4 = 0,
-    questions: []const Query = &[_]Query{},
-    answers: []const Answer = &[_]Answer{},
-};
-
-pub const max_txt_rdata_len: usize = max_message_len;
-pub const max_txt_character_string_len: usize = 255;
-
-pub const Txt = struct {
-    bytes: [max_txt_rdata_len]u8 = @splat(0),
-    len: usize = 0,
-    string_count: usize = 0,
-
-    pub fn rdata(self: *const Txt) []const u8 {
-        return self.bytes[0..self.len];
-    }
-
-    pub fn iterator(self: *const Txt) TxtIterator {
-        return .{ .rdata = self.rdata() };
-    }
-
-    pub fn stringCount(self: *const Txt) usize {
-        return self.string_count;
-    }
-
-    pub fn stringAt(self: *const Txt, index: usize) ?[]const u8 {
-        var it = self.iterator();
-        var i: usize = 0;
-        while (it.next()) |part| {
-            if (i == index) return part;
-            i += 1;
-        }
-        return null;
-    }
-};
-
-pub const TxtIterator = struct {
-    rdata: []const u8,
-    pos: usize = 0,
-
-    pub fn next(self: *TxtIterator) ?[]const u8 {
-        if (self.pos >= self.rdata.len) return null;
-        const len: usize = self.rdata[self.pos];
-        const start = self.pos + 1;
-        const end = start + len;
-        if (end > self.rdata.len) return null;
-        self.pos = end;
-        return self.rdata[start..end];
-    }
-};
-
-pub fn Message(comptime max_questions: usize, comptime max_answers: usize) type {
-    return struct {
-        header: Header,
-        questions: [max_questions]Question = undefined,
-        question_count: usize = 0,
-        answers: [max_answers]ResourceRecord = undefined,
-        answer_count: usize = 0,
-
-        pub fn questionSlice(self: *const @This()) []const Question {
-            return self.questions[0..self.question_count];
-        }
-
-        pub fn answerSlice(self: *const @This()) []const ResourceRecord {
-            return self.answers[0..self.answer_count];
-        }
-    };
-}
+pub const max_message_len = types.max_message_len;
+pub const max_domain_text_len = types.max_domain_text_len;
+pub const max_cache_addrs = types.max_cache_addrs;
+pub const class_in = types.class_in;
+pub const EncodeError = types.EncodeError;
+pub const DecodeError = types.DecodeError;
+pub const RecordType = types.RecordType;
+pub const Header = types.Header;
+pub const Name = types.Name;
+pub const Address = types.Address;
+pub const Question = types.Question;
+pub const RData = types.RData;
+pub const ResourceRecord = types.ResourceRecord;
+pub const Query = types.Query;
+pub const AnswerData = types.AnswerData;
+pub const Answer = types.Answer;
+pub const BuildMessage = types.BuildMessage;
+pub const max_txt_rdata_len = types.max_txt_rdata_len;
+pub const max_txt_character_string_len = types.max_txt_character_string_len;
+pub const Txt = types.Txt;
+pub const TxtIterator = types.TxtIterator;
+pub const Message = types.Message;
 
 /// Encode any supported query/response message without name compression.
 pub fn encodeMessage(out: []u8, msg: BuildMessage) EncodeError![]const u8 {
@@ -449,105 +268,11 @@ const Writer = struct {
 };
 
 fn encodeName(w: *Writer, raw_name: []const u8) EncodeError!void {
-    var name = raw_name;
-    if (name.len == 0) return error.InvalidName;
-    if (name.len == 1 and name[0] == '.') {
-        try w.putByte(0);
-        return;
-    }
-    if (name[name.len - 1] == '.') name = name[0 .. name.len - 1];
-    if (name.len == 0 or name.len > max_domain_text_len) return error.NameTooLong;
-
-    var wire_len: usize = 1;
-    var cursor: usize = 0;
-    while (cursor <= name.len) {
-        const next = findByte(name, cursor, '.') orelse name.len;
-        if (next == cursor) return error.InvalidName;
-        const label = name[cursor..next];
-        if (label.len > 63) return error.NameTooLong;
-        for (label) |ch| {
-            if (!isLabelByte(ch)) return error.InvalidName;
-        }
-        wire_len += 1 + label.len;
-        if (wire_len > 255) return error.NameTooLong;
-        try w.putByte(@intCast(label.len));
-        try w.putBytes(label);
-        if (next == name.len) break;
-        cursor = next + 1;
-    }
-    try w.putByte(0);
+    w.pos += try names.encode(w.buf[w.pos..], raw_name);
 }
 
 fn decodeName(packet: []const u8, start: usize, out: *Name) DecodeError!usize {
-    if (start >= packet.len) return error.TruncatedMessage;
-
-    var seen = @as([max_message_len]bool, @splat(false));
-    var cursor = start;
-    var next_offset: ?usize = null;
-    var wire_len: usize = 0;
-    var text_len: usize = 0;
-
-    while (true) {
-        if (cursor >= packet.len) return error.TruncatedMessage;
-        if (seen[cursor]) return error.CompressionLoop;
-        seen[cursor] = true;
-
-        const len = packet[cursor];
-        if ((len & 0xc0) == 0xc0) {
-            if (cursor + 1 >= packet.len) return error.TruncatedMessage;
-            const ptr = (@as(usize, len & 0x3f) << 8) | packet[cursor + 1];
-            if (ptr >= packet.len) return error.InvalidName;
-            if (next_offset == null) next_offset = cursor + 2;
-            wire_len += 2;
-            if (wire_len > 255) return error.NameTooLong;
-            cursor = ptr;
-            continue;
-        }
-        if ((len & 0xc0) != 0) return error.InvalidName;
-
-        cursor += 1;
-        wire_len += 1 + len;
-        if (wire_len > 255) return error.NameTooLong;
-        if (len == 0) {
-            if (text_len == 0) {
-                out.bytes[0] = '.';
-                out.len = 1;
-            } else {
-                out.len = text_len;
-            }
-            return next_offset orelse cursor;
-        }
-        if (len > 63) return error.NameTooLong;
-        if (cursor + len > packet.len) return error.TruncatedMessage;
-        for (packet[cursor..][0..len]) |ch| {
-            if (!isLabelByte(ch)) return error.InvalidName;
-        }
-
-        if (text_len != 0) {
-            if (text_len >= out.bytes.len) return error.NameTooLong;
-            out.bytes[text_len] = '.';
-            text_len += 1;
-        }
-        if (text_len + len > out.bytes.len) return error.NameTooLong;
-        @memcpy(out.bytes[text_len..][0..len], packet[cursor..][0..len]);
-        text_len += len;
-        cursor += len;
-    }
-}
-
-fn isLabelByte(ch: u8) bool {
-    return switch (ch) {
-        'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => true,
-        else => false,
-    };
-}
-
-fn findByte(bytes: []const u8, start: usize, needle: u8) ?usize {
-    var cursor = start;
-    while (cursor < bytes.len) : (cursor += 1) {
-        if (bytes[cursor] == needle) return cursor;
-    }
-    return null;
+    return names.decode(max_message_len, packet, start, &out.bytes, &out.len);
 }
 
 fn encodeTxtRData(w: *Writer, strings: []const []const u8) EncodeError!void {
@@ -598,19 +323,8 @@ pub fn addressEql(a: Address, b: Address) bool {
     };
 }
 
-fn trimRootDot(name: []const u8) []const u8 {
-    if (name.len > 1 and name[name.len - 1] == '.') return name[0 .. name.len - 1];
-    return name;
-}
-
 pub fn namesEqual(a: []const u8, b: []const u8) bool {
-    const left = trimRootDot(a);
-    const right = trimRootDot(b);
-    if (left.len != right.len) return false;
-    for (left, right) |x, y| {
-        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
-    }
-    return true;
+    return names.equal(a, b);
 }
 
 pub fn responseMatchesQuestion(
@@ -891,4 +605,8 @@ test "DNS CNAME answer ownership follows canonical target and rejects unrelated 
     try encodeName(&cycle, q.name);
     std.mem.writeInt(u16, bytes[rdlen_at..][0..2], @intCast(cycle.pos), .big);
     try std.testing.expect(!responseAnswersFollowCnames(4, bytes[0 .. start + cycle.pos], q.name, .a));
+}
+
+test {
+    _ = names;
 }

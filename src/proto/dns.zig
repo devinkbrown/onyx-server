@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! DNS wire codec, TTL caches, and native blocking resolution.
+//! DNS wire codec, TTL caches, and bounded native UDP/TCP resolution.
 //!
 //! Stable public entry point. `dns/wire.zig` owns transport-free validation;
 //! `dns/resolver_config.zig` discovers host policy; `dns/resolver.zig` performs
-//! UDP lookups on dedicated resolver workers.
+//! bounded lookups on dedicated resolver workers.
 
 const wire = @import("dns/wire.zig");
 const cache = @import("dns/cache.zig");
@@ -58,10 +58,24 @@ pub const forwardConfirms = resolver.forwardConfirms;
 pub const resolveForward = resolver.resolveForward;
 pub const resolveReverse = resolver.resolveReverse;
 pub const resolveConfirmed = resolver.resolveConfirmed;
+/// Detailed owned results, including canonical name and validated TTL metadata.
+/// The existing ResolverConfig layout is unchanged.
+pub const ResolveOptions = @import("dns/query_engine.zig").Options;
+pub const ResolveResult = @import("dns/response.zig").Result;
+pub const ResolveOutcome = @import("dns/response.zig").Outcome;
+pub const LookupError = @import("dns/query_engine.zig").Error;
+pub const resolve = @import("dns/query_engine.zig").resolve;
+pub const ResultCache = @import("dns/result_cache.zig").Cache;
+pub const CachedResolver = @import("dns/cached_resolver.zig").Resolver;
 
 test {
     _ = wire;
     _ = cache;
     _ = config;
     _ = resolver;
+    _ = @import("dns/response_tests.zig");
+    _ = @import("dns/query_engine.zig");
+    _ = @import("dns/query_engine_tests.zig");
+    _ = @import("dns/result_cache.zig");
+    _ = @import("dns/cached_resolver.zig");
 }

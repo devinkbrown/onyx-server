@@ -82,3 +82,32 @@ pub extern "ws2_32" fn send(socket: usize, bytes: [*]const u8, length: i32, flag
 pub extern "ws2_32" fn recv(socket: usize, bytes: [*]u8, length: i32, flags: i32) callconv(.winapi) i32;
 pub extern "ws2_32" fn recvfrom(socket: usize, bytes: [*]u8, length: i32, flags: i32, from: *SockAddr4, from_length: *i32) callconv(.winapi) i32;
 pub extern "ws2_32" fn sendto(socket: usize, bytes: [*]const u8, length: i32, flags: i32, to: *const SockAddr4, to_length: i32) callconv(.winapi) i32;
+
+// Nonblocking DNS TCP fallback and deadline-controlled UDP readiness.
+pub const sock_stream: i32 = 1;
+// WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT (Windows 7 SP1+).
+pub const socket_flags: u32 = 0x81;
+pub const ipproto_tcp: i32 = 6;
+pub const so_error: i32 = 0x1007;
+pub const fionbio: u32 = 0x8004667e;
+pub const interrupted: i32 = 10004;
+pub const would_block: i32 = 10035;
+pub const in_progress: i32 = 10036;
+pub const already: i32 = 10037;
+
+pub const FdSet = extern struct {
+    count: u32,
+    sockets: [64]usize,
+};
+pub const Timeval = extern struct {
+    seconds: i32,
+    microseconds: i32,
+};
+
+pub extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+pub extern "ws2_32" fn ioctlsocket(socket: usize, command: u32, value: *u32) callconv(.winapi) i32;
+pub extern "ws2_32" fn select(ignored_nfds: i32, readfds: ?*FdSet, writefds: ?*FdSet, exceptfds: ?*FdSet, timeout: *Timeval) callconv(.winapi) i32;
+pub extern "ws2_32" fn getsockopt(socket: usize, level: i32, option: i32, value: *anyopaque, length: *i32) callconv(.winapi) i32;
+
+pub extern "ws2_32" fn listen(socket: usize, backlog: i32) callconv(.winapi) i32;
+pub extern "ws2_32" fn accept(socket: usize, address: ?*anyopaque, length: ?*i32) callconv(.winapi) usize;
