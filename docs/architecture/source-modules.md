@@ -8,12 +8,13 @@ are separate systems described in [World, dispatch and modules](02-world-dispatc
 | Entry | Implementation boundaries | Ownership rule |
 | --- | --- | --- |
 | `src/proto/dns.zig` | Wire/name validation, response interpretation, query deadlines and transport, configuration, result cache, confirmation | Results own their names and addresses; every socket and retry remains inside its absolute deadline. See [DNS](dns.md). |
-| `src/proto/lotus.zig` | Protocol types, codecs, and state-machine implementation | Keep wire definitions canonical and preserve protocol identities. |
+| `src/proto/lotus.zig` | Retained-message store, canonical types, checkpoint codec, and history/exact-once tests | Keep wire definitions canonical and preserve protocol identities. |
 | `src/proto/ircx_prop_store.zig` | Property contracts, storage operations, and codecs | Retain property authorization and canonical encoding at their existing boundaries. |
 | `src/daemon/store.zig` | Storage owner, records, WAL/snapshot codecs, platform file custody, and focused tests | Prepare fallible state before durable writes; publish prepared mutations without allocation. |
 | `src/daemon/services.zig` | One owner plus typed account, credential, channel, session, device, and operator domains | Domain contexts borrow original field addresses. They do not copy mutable fields before acquiring the original lock. |
 | `src/daemon/relay_v2_event_log.zig` | Event-log owner, rows, checkpoint codec, and tests | Keep canonical event bytes and accepted custody together; decoding must not partially publish. |
 | `src/daemon/attachment_delivery_spool.zig` | Spool owner, record model, policy, strict checkpoint codec, and tests | Prepared batches and attachment transfers remain with the owning spool and its no-fail commit boundary. |
+| `src/daemon/mail_sender.zig` | One mail worker, message assembly, relay resolution, socket/TLS exchange, snapshots, and retained failure-journal checks | Accepted jobs and ambiguous failure receipts stay with the worker; private journal identity and publication order remain unchanged. |
 | `src/daemon/http_fetch.zig` | Request policy, URL parsing, TLS exchange, DNS resolution, native sockets, and Windows resolver ABI | Preserve resolved-address pinning, TLS identity, native callback lifetime, and owned socket cleanup. |
 
 ## Choosing a home for a change
