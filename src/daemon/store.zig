@@ -738,8 +738,8 @@ pub const OroStore = struct {
         self.active_prepared.?.record = record;
         writeU32(record[0..4], @intCast(payload_len));
         const payload = record[record_header_len..];
-        payload[0] = @intFromEnum(MutationKind.put);
-        payload[1] = @intFromEnum(store_family);
+        payload[0] = @backingInt(MutationKind.put);
+        payload[1] = @backingInt(store_family);
         writeU32(payload[2..][0..4], @intCast(key.len));
         writeU32(payload[6..][0..4], @intCast(value.len));
         @memcpy(payload[payload_header_len..][0..key.len], key);
@@ -1667,8 +1667,8 @@ pub const OroStore = struct {
         if (payload.len < payload_header_len) return StoreError.BadRecord;
 
         const kind: MutationKind = switch (payload[0]) {
-            @intFromEnum(MutationKind.put) => .put,
-            @intFromEnum(MutationKind.delete) => .delete,
+            @backingInt(MutationKind.put) => .put,
+            @backingInt(MutationKind.delete) => .delete,
             else => return StoreError.UnknownRecordKind,
         };
         const store_family = decodeFamily(payload[1]) orelse return StoreError.UnknownFamily;
@@ -2851,7 +2851,7 @@ fn coldCutDigest(owned: *const ColdBacking) ![32]u8 {
         var it = map.iterator();
         while (it.next()) |entry| {
             var item = std.crypto.hash.Blake3.init(.{});
-            coldHashInt(&item, @intFromEnum(family));
+            coldHashInt(&item, @backingInt(family));
             coldHashBytes(&item, entry.key_ptr.*);
             coldHashBytes(&item, entry.value_ptr.*);
             var digest: [32]u8 = undefined;
@@ -2876,16 +2876,16 @@ fn coldPreparedDigest(owned: *const ColdBacking) ![32]u8 {
     coldHashInt(&hash, batch.next_seq_after);
     coldHashBytes(&hash, batch.record orelse return StoreError.SnapshotCoverageMismatch);
     for (batch.entries[0..batch.count]) |entry| {
-        coldHashInt(&hash, @intFromEnum(entry.family));
-        coldHashInt(&hash, @intFromEnum(entry.kind));
+        coldHashInt(&hash, @backingInt(entry.family));
+        coldHashInt(&hash, @backingInt(entry.kind));
         coldHashBytes(&hash, entry.key orelse return StoreError.SnapshotCoverageMismatch);
         coldHashInt(&hash, @intFromBool(entry.value != null));
         if (entry.value) |value| coldHashBytes(&hash, value);
         coldHashInt(&hash, @intFromBool(entry.change != null));
         if (entry.change) |change| {
             coldHashInt(&hash, change.seq);
-            coldHashInt(&hash, @intFromEnum(change.family));
-            coldHashInt(&hash, @intFromEnum(change.kind));
+            coldHashInt(&hash, @backingInt(change.family));
+            coldHashInt(&hash, @backingInt(change.kind));
             coldHashBytes(&hash, change.key);
             coldHashInt(&hash, @intFromBool(change.value != null));
             if (change.value) |value| coldHashBytes(&hash, value);
@@ -5063,7 +5063,7 @@ pub fn ManagedBridge(comptime R: type) type {
                 defer sb.gate.unlockExclusive();
                 var h = std.crypto.hash.Blake3.init(.{});
                 for (sb.store.maps) |m| for (m.map.slots) |slot| {
-                    KvTable.hashNumber(&h, @intFromEnum(slot.state));
+                    KvTable.hashNumber(&h, @backingInt(slot.state));
                     if (slot.state == .used) {
                         KvTable.hashSlotPointers(&h, slot);
                         h.update(slot.key);
@@ -5076,8 +5076,8 @@ pub fn ManagedBridge(comptime R: type) type {
                     KvTable.hashNumber(&h, @intFromBool(entry != null));
                     if (entry) |m| {
                         KvTable.hashNumber(&h, m.seq);
-                        KvTable.hashNumber(&h, @intFromEnum(m.family));
-                        KvTable.hashNumber(&h, @intFromEnum(m.kind));
+                        KvTable.hashNumber(&h, @backingInt(m.family));
+                        KvTable.hashNumber(&h, @backingInt(m.kind));
                         h.update(m.key);
                         if (m.value) |v| h.update(v);
                     }
@@ -5444,7 +5444,7 @@ const family_count = @typeInfo(Family).@"enum".field_names.len;
 const families = std.enums.values(Family);
 
 fn familyIndex(store_family: Family) usize {
-    return @intFromEnum(store_family);
+    return @backingInt(store_family);
 }
 
 fn decodeFamily(value: u8) ?Family {
@@ -5825,7 +5825,7 @@ const KvTable = struct {
     }
     fn slotDigest(slot: Slot, work: *Work) ![32]u8 {
         var h = std.crypto.hash.Blake3.init(.{});
-        hashNumber(&h, @intFromEnum(slot.state));
+        hashNumber(&h, @backingInt(slot.state));
         hashNumber(&h, slot.hash);
         try work.charge(&work.bytes, if (slot.state == .used) @as(usize, 32) else 16);
         if (slot.state == .used) {
@@ -6147,8 +6147,8 @@ fn writeRecordAt(
 
     writeU32(record[0..4], @intCast(payload_len));
     const payload = record[record_header_len..];
-    payload[0] = @intFromEnum(kind);
-    payload[1] = @intFromEnum(store_family);
+    payload[0] = @backingInt(kind);
+    payload[1] = @backingInt(store_family);
     writeU32(payload[2..][0..4], @intCast(key.len));
     writeU32(payload[6..][0..4], if (kind == .delete) tombstone_len else @as(u32, @intCast(value.len)));
     @memcpy(payload[payload_header_len..][0..key.len], key);
@@ -6229,8 +6229,8 @@ fn encodeBatchGuard(record: *[batch_guard_len]u8) void {
 }
 
 fn encodeMutation(payload: []u8, mutation: BatchMutation) void {
-    payload[0] = @intFromEnum(mutation.kind);
-    payload[1] = @intFromEnum(mutation.family);
+    payload[0] = @backingInt(mutation.kind);
+    payload[1] = @backingInt(mutation.family);
     writeU32(payload[2..6], @intCast(mutation.key.len));
     writeU32(payload[6..10], if (mutation.value) |value| @intCast(value.len) else tombstone_len);
     @memcpy(payload[payload_header_len..][0..mutation.key.len], mutation.key);
@@ -6356,8 +6356,8 @@ fn writeSnapshotCoverageRecordAt(
 
 fn isMutationPayload(payload: []const u8) bool {
     if (payload.len == 0) return false;
-    return payload[0] == @intFromEnum(MutationKind.put) or
-        payload[0] == @intFromEnum(MutationKind.delete);
+    return payload[0] == @backingInt(MutationKind.put) or
+        payload[0] == @backingInt(MutationKind.delete);
 }
 
 fn checksum(payload: []const u8) u32 {
@@ -8947,7 +8947,7 @@ fn coldFifoScenario(kind: enum { wal, snapshot, temporary, revalidation, lock, p
             break;
         }
         if (result < 0) {
-            if ((if (comptime @import("builtin").os.tag == .linux) std.os.linux.errno(@bitCast(result)) else std.posix.errno(result)) == .INTR) continue;
+            if ((if (comptime @import("builtin").os.tag == .linux) std.os.linux.errno(@as(usize, @bitCast(result))) else std.posix.errno(result)) == .INTR) continue;
             return error.TestUnexpectedResult;
         }
         try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
@@ -9139,7 +9139,7 @@ fn coldFifoKillReap(pid: std.posix.pid_t) void {
     while (true) {
         const result = if (comptime os == .linux) @as(isize, @bitCast(std.os.linux.wait4(pid, &status, 0, null))) else std.posix.system.waitpid(pid, &status, 0);
         if (result == pid) return;
-        if (result < 0 and (if (comptime @import("builtin").os.tag == .linux) std.os.linux.errno(@bitCast(result)) else std.posix.errno(result)) == .INTR) continue;
+        if (result < 0 and (if (comptime @import("builtin").os.tag == .linux) std.os.linux.errno(@as(usize, @bitCast(result))) else std.posix.errno(result)) == .INTR) continue;
         return;
     }
 }
@@ -10295,15 +10295,15 @@ test "STORE source owner complete census heterogeneous original contexts and dis
         while (try cursor.next()) |d| {
             try std.testing.expectEqualDeep(state.source, d.source);
             try std.testing.expect(d.requested_bytes > 0);
-            kinds[@intFromEnum(d.kind)] += 1;
+            kinds[@backingInt(d.kind)] += 1;
             if (std.meta.eql(d.original_allocator, AllocatorObservation.from(meta.allocator()))) try meta.mark(d) else try payload.mark(d);
         }
         try meta.checkAll(true);
         try payload.checkAll(true);
-        for ([_]@FieldType(OwnedCapacityDescriptor, "kind"){ .owner_box, .wal_path, .snapshot_path, .table_backing, .live_key, .live_value, .feed_ring, .feed_key, .retired_bytes, .retired_table }) |kind| try std.testing.expect(kinds[@intFromEnum(kind)] != 0);
+        for ([_]@FieldType(OwnedCapacityDescriptor, "kind"){ .owner_box, .wal_path, .snapshot_path, .table_backing, .live_key, .live_value, .feed_ring, .feed_key, .retired_bytes, .retired_table }) |kind| try std.testing.expect(kinds[@backingInt(kind)] != 0);
         if (feed_capacity == 2) {
-            try std.testing.expect(kinds[@intFromEnum(@as(@FieldType(OwnedCapacityDescriptor, "kind"), .retired_key))] != 0);
-            try std.testing.expect(kinds[@intFromEnum(@as(@FieldType(OwnedCapacityDescriptor, "kind"), .retired_value))] != 0);
+            try std.testing.expect(kinds[@backingInt(@as(@FieldType(OwnedCapacityDescriptor, "kind"), .retired_key))] != 0);
+            try std.testing.expect(kinds[@backingInt(@as(@FieldType(OwnedCapacityDescriptor, "kind"), .retired_value))] != 0);
         }
         try cursor.finish();
         try std.testing.expectError(error.InvalidLease, cursor.next());

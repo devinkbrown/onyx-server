@@ -101,15 +101,15 @@ pub const CipherSuite = struct {
 
     pub fn encode(self: CipherSuite, buf: []u8) EncodeError!void {
         if (buf.len < encoded_len) return error.BufferTooSmall;
-        mem.writeInt(u16, buf[0..2], @intFromEnum(self.kdf_id), .big);
-        mem.writeInt(u16, buf[2..4], @intFromEnum(self.aead_id), .big);
+        mem.writeInt(u16, buf[0..2], @backingInt(self.kdf_id), .big);
+        mem.writeInt(u16, buf[2..4], @backingInt(self.aead_id), .big);
     }
 
     pub fn decode(buf: []const u8) DecodeError!CipherSuite {
         if (buf.len < encoded_len) return error.BufferTooShort;
         return .{
-            .kdf_id = @enumFromInt(mem.readInt(u16, buf[0..2], .big)),
-            .aead_id = @enumFromInt(mem.readInt(u16, buf[2..4], .big)),
+            .kdf_id = @fromBackingInt(@intCast(mem.readInt(u16, buf[0..2], .big))),
+            .aead_id = @fromBackingInt(@intCast(mem.readInt(u16, buf[2..4], .big))),
         };
     }
 
@@ -195,7 +195,7 @@ pub const ECHConfig = struct {
         off += 2;
         buf[off] = self.config_id;
         off += 1;
-        mem.writeInt(u16, buf[off..][0..2], @intFromEnum(self.kem_id), .big);
+        mem.writeInt(u16, buf[off..][0..2], @backingInt(self.kem_id), .big);
         off += 2;
         mem.writeInt(u16, buf[off..][0..2], @intCast(self.public_key.len), .big);
         off += 2;
@@ -241,7 +241,7 @@ pub const ECHConfig = struct {
         const config_id = inner[off];
         off += 1;
         if (inner.len < off + 2) return error.BufferTooShort;
-        const kem_id: KemId = @enumFromInt(mem.readInt(u16, inner[off..][0..2], .big));
+        const kem_id: KemId = @fromBackingInt(@intCast(mem.readInt(u16, inner[off..][0..2], .big)));
         off += 2;
 
         if (inner.len < off + 2) return error.BufferTooShort;
@@ -283,7 +283,7 @@ pub const ECHConfig = struct {
         const ext_total_bytes = mem.readInt(u16, inner[off..][0..2], .big);
         off += 2;
         if (inner.len < off + ext_total_bytes) return error.BufferTooShort;
-        var ext_list = ArrayList(Extension){ .items = &.{}, .capacity = 0 };
+        var ext_list = ArrayList(Extension).empty;
         errdefer {
             for (ext_list.items) |e| allocator.free(e.data);
             ext_list.deinit(allocator);
@@ -355,7 +355,7 @@ pub const ECHConfigList = struct {
         if (buf.len > 2 + list_len) return error.TrailingBytes;
         const list_buf = buf[2 .. 2 + list_len];
         var off: usize = 0;
-        var list = ArrayList(ECHConfig){ .items = &.{}, .capacity = 0 };
+        var list = ArrayList(ECHConfig).empty;
         errdefer {
             for (list.items) |*c| c.deinit(allocator);
             list.deinit(allocator);

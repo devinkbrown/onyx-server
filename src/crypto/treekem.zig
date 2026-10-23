@@ -11,6 +11,7 @@
 //! cannot decrypt the new epoch.
 const std = @import("std");
 const random = @import("random.zig");
+const zig_compat = @import("zig_compat.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -420,7 +421,7 @@ fn envelopeMask(
 ) Secret {
     var ctx: [8 + 1 + 8 + public_key_len]u8 = undefined;
     std.mem.writeInt(u64, ctx[0..8], epoch, .big);
-    ctx[8] = @intFromEnum(operation);
+    ctx[8] = @backingInt(operation);
     std.mem.writeInt(u64, ctx[9..17], member_id, .big);
     @memcpy(ctx[17..], &ephemeral_public);
     return hkdfExpand(&dh, "envelope", &ctx);
@@ -438,7 +439,7 @@ fn envelopeKeyPair() Error!KeyPair {
     var seed: MemberSeed = undefined;
     random.fillOsEntropy(&seed) catch return error.InvalidPublicKey;
     defer secureZero(&seed);
-    const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.InvalidPublicKey;
+    const kp = zig_compat.x25519GenerateDeterministic(seed) catch return error.InvalidPublicKey;
     return .{ .public_key = kp.public_key, .secret_key = kp.secret_key };
 }
 
@@ -447,7 +448,7 @@ fn keyPairFromMaterial(label: []const u8, material: []const u8) Error!KeyPair {
     while (true) : (counter +%= 1) {
         var seed_ctx: [1]u8 = .{counter};
         const seed_bytes = hkdfExpand(material, label, &seed_ctx);
-        const kp = X25519.KeyPair.generateDeterministic(seed_bytes) catch {
+        const kp = zig_compat.x25519GenerateDeterministic(seed_bytes) catch {
             if (counter == std.math.maxInt(u8)) return error.InvalidPublicKey;
             continue;
         };
@@ -464,7 +465,7 @@ fn rosterHash(roster: []const MemberPublic, epoch: u64, operation: Operation) Se
     var out: Secret = undefined;
     var ctx: [9]u8 = undefined;
     std.mem.writeInt(u64, ctx[0..8], epoch, .big);
-    ctx[8] = @intFromEnum(operation);
+    ctx[8] = @backingInt(operation);
     HkdfSha256.expand(&out, &ctx, prk);
     for (roster) |member| {
         var ikm: [secret_len + 8 + public_key_len]u8 = undefined;

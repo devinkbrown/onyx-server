@@ -7,6 +7,7 @@
 //! library and implements the local header parser, base64 helpers, X25519 file
 //! key wrap, header MAC, and STREAM ChaCha20-Poly1305 payload encryption.
 const std = @import("std");
+const zig_compat = @import("zig_compat.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -55,7 +56,7 @@ pub const KeyPair = struct {
     }
 
     pub fn generateDeterministic(seed: [X25519.seed_length]u8) Error!KeyPair {
-        const kp = X25519.KeyPair.generateDeterministic(seed) catch return error.InvalidPublicKey;
+        const kp = zig_compat.x25519GenerateDeterministic(seed) catch return error.InvalidPublicKey;
         return .{ .public_key = kp.public_key, .secret_key = kp.secret_key };
     }
 
@@ -102,7 +103,7 @@ pub fn encryptWithOptions(
     var payload_nonce: PayloadNonce = options.payload_nonce orelse randomPayloadNonce(io);
 
     const eph_secret = if (options.ephemeral_scalar) |s| s else randomScalar(io);
-    const eph_pub = X25519.recoverPublicKey(eph_secret) catch return error.InvalidPublicKey;
+    const eph_pub = zig_compat.x25519RecoverPublicKey(eph_secret) catch return error.InvalidPublicKey;
 
     var shared = X25519.scalarmult(eph_secret, recipient_pubkey) catch return error.InvalidPublicKey;
     defer secureZero(&shared);
@@ -141,7 +142,7 @@ pub fn decrypt(
 ) Error![]u8 {
     const parsed = try parseHeader(ciphertext);
 
-    var recipient_pub = X25519.recoverPublicKey(identity_scalar) catch return error.InvalidPublicKey;
+    var recipient_pub = zig_compat.x25519RecoverPublicKey(identity_scalar) catch return error.InvalidPublicKey;
     defer secureZero(&recipient_pub);
 
     var shared = X25519.scalarmult(identity_scalar, parsed.ephemeral_pubkey) catch return error.InvalidPublicKey;

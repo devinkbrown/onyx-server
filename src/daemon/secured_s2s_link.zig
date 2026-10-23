@@ -64,6 +64,11 @@ pub const max_expected_remotes: usize = 16;
 const RecordChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const record_len_prefix: usize = 4;
 const record_tag_len: usize = RecordChaCha.tag_length;
+/// Keep one complete emitted record within even the 1 MiB pre-registration
+/// SendQ. Once matched, server links have a larger floor, but this bound also
+/// makes progress safe before that class assignment and under custom classes.
+const max_outbound_record_wire_len: usize = 1 * 1024 * 1024;
+const max_outbound_record_plaintext: usize = max_outbound_record_wire_len - record_len_prefix - record_tag_len;
 
 /// Upper bound on a single inbound record's `len` field. A drained inner chunk
 /// is at most one CRDT frame batch; cap generously but finitely so a desync or
@@ -81,7 +86,7 @@ fn recordAad(counter: u64) [8]u8 {
 
 /// Named errors this adapter raises (it also surfaces handshake, allocation, and
 /// inner-link errors; the methods use `anyerror` to carry the union).
-pub const HandshakeError = error{ HandshakeTooLarge, PrekeyRejected, UnexpectedRemote };
+pub const HandshakeError = error{ HandshakeTooLarge, RecordTooLarge, PrekeyRejected, UnexpectedRemote };
 
 pub const Options = struct {
     allocator: std.mem.Allocator,
@@ -1527,7 +1532,7 @@ pub const SecuredLink = struct {
             const buf = self.rec_inbuf.items[consumed..];
             if (buf.len < record_len_prefix) break;
             const body_len = std.mem.readInt(u32, buf[0..4], .little);
-            if (body_len > max_record_len) return error.HandshakeTooLarge;
+            if (body_len > max_record_len) return error.RecordTooLarge;
             if (body_len < record_tag_len) return error.AuthFailed; // malformed: no room for a tag, can never authenticate
             const total = record_len_prefix + body_len;
             if (buf.len < total) break; // wait for the rest of this record
@@ -1554,23 +1559,44 @@ pub const SecuredLink = struct {
         }
     }
 
-    /// Outbound: take the inner link's pending plaintext and emit it as ONE
-    /// length-prefixed AEAD record (sealed with `send_key` + the next record
-    /// counter), appended to `self.out`. Each drained chunk becomes its own
-    /// record; the counter advances so nonces never repeat.
+    /// Outbound: split the inner link's pending plaintext into length-prefixed
+    /// AEAD records no larger than the SendQ-safe outbound bound, append them to `self.out`,
+    /// then clear the inner queue. The counter advances once per record so nonces
+    /// never repeat. Record boundaries may split an inner frame; the peer's stream
+    /// parser reassembles those bytes after authenticating each record.
     fn drainInner(self: *SecuredLink) anyerror!void {
+        return self.drainInnerWithChunkLimit(max_outbound_record_plaintext);
+    }
+
+    /// Reserve every encoded record before sealing any of them. That keeps an
+    /// allocation failure from leaving a partial batch in `out` with advanced
+    /// counters while the full plaintext remains queued for a later retry.
+    fn drainInnerWithChunkLimit(self: *SecuredLink, chunk_limit: usize) anyerror!void {
+        std.debug.assert(chunk_limit > 0 and chunk_limit <= max_outbound_record_plaintext);
         const link = self.inner.?;
         const o = link.outbound();
         if (o.len == 0) return;
-        try self.sealRecordTo(o);
+
+        const record_count = 1 + (o.len - 1) / chunk_limit;
+        const overhead = std.math.mul(usize, record_count, record_len_prefix + record_tag_len) catch return error.OutOfMemory;
+        const additional = std.math.add(usize, o.len, overhead) catch return error.OutOfMemory;
+        _ = std.math.add(usize, self.out.items.len, additional) catch return error.OutOfMemory;
+        try self.out.ensureUnusedCapacity(self.allocator, additional);
+
+        var offset: usize = 0;
+        while (offset < o.len) {
+            const chunk_len = @min(chunk_limit, o.len - offset);
+            try self.sealRecordTo(o[offset .. offset + chunk_len]);
+            offset += chunk_len;
+        }
         link.clearOutbound();
     }
 
     /// Seal `pt` into one record (`[u32 len][ct][tag]`) and append to `self.out`.
     fn sealRecordTo(self: *SecuredLink, pt: []const u8) anyerror!void {
+        if (pt.len > max_outbound_record_plaintext) return error.RecordTooLarge;
         const keys = self.establishedKeys();
         const body_len = pt.len + record_tag_len;
-        std.debug.assert(body_len <= max_record_len);
 
         const start = self.out.items.len;
         try self.out.resize(self.allocator, start + record_len_prefix + body_len);
@@ -2147,6 +2173,102 @@ test "post-handshake bytes on the wire are ciphertext, not inner plaintext" {
     try testing.expect(std.mem.indexOf(u8, wire, plaintext) == null);
 }
 
+test "secured link splits large outbound batches into bounded records" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    const plaintext = try testing.allocator.alloc(u8, 8 * 1024 * 1024 + max_outbound_record_plaintext + 73);
+    defer testing.allocator.free(plaintext);
+    for (plaintext, 0..) |*byte, i| byte.* = @truncate(i);
+    try p.a.inner.?.out.appendSlice(testing.allocator, plaintext);
+
+    const initial_wire = try testing.allocator.dupe(u8, p.a.outbound());
+    defer testing.allocator.free(initial_wire);
+    const initial_counter = p.a.send_counter;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const original_allocator = p.a.allocator;
+    p.a.allocator = failing.allocator();
+    defer p.a.allocator = original_allocator;
+    try testing.expectError(error.OutOfMemory, p.a.drainInner());
+    try testing.expectEqual(initial_counter, p.a.send_counter);
+    try testing.expectEqualSlices(u8, initial_wire, p.a.outbound());
+    try testing.expectEqualSlices(u8, plaintext, p.a.inner.?.outbound());
+
+    failing.fail_index = std.math.maxInt(usize);
+    try p.a.drainInner();
+    const wire = p.a.outbound();
+    const recovered = try testing.allocator.alloc(u8, plaintext.len);
+    defer testing.allocator.free(recovered);
+    var wire_offset: usize = 0;
+    var plain_offset: usize = 0;
+    var counter = initial_counter;
+    while (wire_offset < wire.len) {
+        try testing.expect(wire.len - wire_offset >= record_len_prefix + record_tag_len);
+        const body_len = std.mem.readInt(u32, wire[wire_offset..][0..4], .little);
+        try testing.expect(body_len <= max_record_len);
+        try testing.expect(body_len >= record_tag_len);
+        try testing.expect(record_len_prefix + @as(usize, body_len) <= max_outbound_record_wire_len);
+        const body_start = wire_offset + record_len_prefix;
+        const body_end = body_start + @as(usize, body_len);
+        try testing.expect(body_end <= wire.len);
+        const ct_len: usize = @as(usize, body_len) - record_tag_len;
+        const tag = wire[body_start + ct_len .. body_end][0..record_tag_len].*;
+        const aad = recordAad(counter);
+        try p.b.establishedKeys().openRecord(
+            counter,
+            &aad,
+            wire[body_start .. body_start + ct_len],
+            tag,
+            recovered[plain_offset..][0..ct_len],
+        );
+        wire_offset = body_end;
+        plain_offset += ct_len;
+        counter += 1;
+    }
+
+    const expected_records: u64 = @intCast(1 + (plaintext.len - 1) / max_outbound_record_plaintext);
+    try testing.expectEqual(initial_counter + expected_records, counter);
+    try testing.expectEqual(plaintext.len, plain_offset);
+    try testing.expectEqualSlices(u8, plaintext, recovered);
+    try testing.expectEqual(@as(usize, 0), p.a.inner.?.outbound().len);
+    try testing.expectEqual(initial_counter + expected_records, p.a.send_counter);
+}
+
+test "secured link reassembles an inner frame split across records" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+
+    const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "real name", .host = "h.example" };
+    try p.a.inner.?.sendMembership("#undertow", "split-member", 0, 100, true, ident, "");
+    const plaintext_len = p.a.inner.?.outbound().len;
+    try testing.expect(plaintext_len > 2 * s2s_frame.header_len);
+    const initial_send_counter = p.a.send_counter;
+    const initial_recv_counter = p.b.recv_counter;
+    const chunk_limit = plaintext_len / 2;
+    const expected_records: u64 = @intCast(1 + (plaintext_len - 1) / chunk_limit);
+
+    try p.a.drainInnerWithChunkLimit(chunk_limit);
+    try testing.expectEqual(initial_send_counter + expected_records, p.a.send_counter);
+    try p.b.feed(p.a.outbound(), 100);
+    p.b.processDeferredResidenceFrames(100);
+
+    try testing.expectEqual(initial_recv_counter + expected_records, p.b.recv_counter);
+    try testing.expect(p.b.findRemoteMember("split-member") != null);
+}
+
+test "secured link distinguishes an oversized record from a handshake message" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+
+    var header: [record_len_prefix]u8 = undefined;
+    std.mem.writeInt(u32, &header, max_record_len + 1, .little);
+    try testing.expectError(error.RecordTooLarge, p.b.feed(&header, 99));
+}
+
 test "a single flipped bit in a transit record fails decryption" {
     var p = try EstablishedPair.init();
     defer p.deinit();
@@ -2498,7 +2620,7 @@ test "resumeOuter primed with the carried s2s roster suppresses the spurious RES
     const outer = a.exportOuter();
     var snap = s2s_snapshot.Snapshot{
         .fd = 5,
-        .role = @intFromEnum(outer.role),
+        .role = @backingInt(outer.role),
         .send_counter = outer.send_counter,
         .recv_counter = outer.recv_counter,
         .feed_seq = outer.feed_seq,

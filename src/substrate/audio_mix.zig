@@ -91,7 +91,7 @@ pub const Mixer = struct {
             .frame_size = frame_size,
             .energy_threshold = energy_threshold,
             .default_gain = default_gain,
-            .participants = .{ .items = &.{}, .capacity = 0 },
+            .participants = .empty,
         };
     }
 
@@ -102,7 +102,7 @@ pub const Mixer = struct {
             .frame_size = config.frame_size_samples,
             .energy_threshold = config.energy_threshold,
             .default_gain = config.default_gain,
-            .participants = .{ .items = &.{}, .capacity = 0 },
+            .participants = .empty,
         };
     }
 

@@ -1674,7 +1674,7 @@ const MediaPhysicalRemoval = enum {
 };
 
 fn mediaKindBit(kind: media_room.MediaKind) u8 {
-    return @as(u8, 1) << @intCast(@intFromEnum(kind));
+    return @as(u8, 1) << @intCast(@backingInt(kind));
 }
 /// Pre-registration SendQ ceiling, used until a connection is matched to a class
 /// (which sets its real `sendq_cap`). Generous so a handshake/MOTD burst never
@@ -1890,7 +1890,7 @@ const Numeric = enum(u16) {
 
 fn formatNumericCode(code: Numeric, buf: []u8) []const u8 {
     if (buf.len < 3) return buf[0..0];
-    const value: u16 = @intFromEnum(code);
+    const value: u16 = @backingInt(code);
     buf[0] = @as(u8, '0') + @as(u8, @intCast((value / 100) % 10));
     buf[1] = @as(u8, '0') + @as(u8, @intCast((value / 10) % 10));
     buf[2] = @as(u8, '0') + @as(u8, @intCast(value % 10));
@@ -3014,7 +3014,18 @@ pub const ConnState = struct {
     /// slice instead; `recv_buf` is the stable copy used for parse and Helix.
     /// A slot must not be freed until the terminal completion clears this latch.
     recv_armed: bool = false,
+    /// The currently armed RECV uses a provided-buffer multishot SQE. This
+    /// records submission ownership independently of the ring-wide capability,
+    /// which may be disabled while this request is still in flight.
+    recv_multishot_armed: bool = false,
+    /// An unsupported multishot CQE with MORE set means the current request is
+    /// still kernel-owned. Stop selecting this optional mode ring-wide, drain
+    /// this exact request to its terminal CQE, then re-arm with copy recv.
+    recv_multishot_fallback_drain: bool = false,
     send_armed: bool = false,
+    /// A live SEND_ZC submission may outlast the ring-wide capability decision.
+    /// Keep its ownership through the notification CQE when MORE was set.
+    send_zc_armed: bool = false,
     /// Exact successful submission length, released only by its matching CQE.
     send_submitted_len: usize = 0,
     send_submitted_offset: usize = 0,
@@ -3888,7 +3899,6 @@ const Reactor = struct {
     /// Published only after this actual owner completes a successful backend
     /// loop turn. A Gate arrival/release is not an activation acknowledgment.
     runtime_activated: std.atomic.Value(bool) = .init(false),
-
     /// Fair, generation-safe cursor for bounded post-Helix socket activation.
     /// Only the slot index is retained across turns; every scan revalidates the
     /// occupied slot and reads its current generation before arming anything.
@@ -3956,14 +3966,14 @@ const Reactor = struct {
         }
         self.clients.deinit();
         if (self.wake) |*w| w.deinit();
-        closeFd(self.listener_fd);
-        if (self.s2s_listener_fd >= 0) closeFd(self.s2s_listener_fd);
-        if (self.tls_listener_fd >= 0) closeFd(self.tls_listener_fd);
-        if (self.ws_listener_fd >= 0) closeFd(self.ws_listener_fd);
-        if (self.listener_companion_fd >= 0) closeFd(self.listener_companion_fd);
-        if (self.s2s_listener_companion_fd >= 0) closeFd(self.s2s_listener_companion_fd);
-        if (self.tls_listener_companion_fd >= 0) closeFd(self.tls_listener_companion_fd);
-        if (self.ws_listener_companion_fd >= 0) closeFd(self.ws_listener_companion_fd);
+        closeListenerFd(self.listener_fd);
+        if (self.s2s_listener_fd >= 0) closeListenerFd(self.s2s_listener_fd);
+        if (self.tls_listener_fd >= 0) closeListenerFd(self.tls_listener_fd);
+        if (self.ws_listener_fd >= 0) closeListenerFd(self.ws_listener_fd);
+        if (self.listener_companion_fd >= 0) closeListenerFd(self.listener_companion_fd);
+        if (self.s2s_listener_companion_fd >= 0) closeListenerFd(self.s2s_listener_companion_fd);
+        if (self.tls_listener_companion_fd >= 0) closeListenerFd(self.tls_listener_companion_fd);
+        if (self.ws_listener_companion_fd >= 0) closeListenerFd(self.ws_listener_companion_fd);
     }
 };
 
@@ -4561,8 +4571,8 @@ const WebpushOverflowDelivery = struct {
     }
     fn event(self: *const @This()) oper_event.SignedOperEventV2 {
         return .{
-            .category = @intFromEnum(event_spine.EventCategory.service),
-            .severity = @intFromEnum(event_spine.EventSeverity.warn),
+            .category = @backingInt(event_spine.EventCategory.service),
+            .severity = @backingInt(event_spine.EventSeverity.warn),
             .origin_node = self.origin_node,
             .hlc = self.hlc,
             .origin_server = self.origin,
@@ -5666,7 +5676,7 @@ pub const LinuxServer = struct {
             }
             break :blk fd;
         } else try reuseport.createReusePortListener(primaryListenerHost(config.host), config.port, config.backlog);
-        errdefer closeFd(listener_fd);
+        errdefer closeListenerFd(listener_fd);
         const inherited_companion: ?linux.fd_t = if (nativeManifestListener(config, shard_id, .plain, true)) |fd|
             fd
         else if (shard_id < config.inherited_listener_companion_fds.len)
@@ -5674,7 +5684,7 @@ pub const LinuxServer = struct {
         else
             null;
         const listener_companion_fd = try stageListenerCompanion(config.host, config.port, listener_fd, config.backlog, true, inherited, inherited_companion);
-        errdefer if (listener_companion_fd >= 0) closeFd(listener_companion_fd);
+        errdefer if (listener_companion_fd >= 0) closeListenerFd(listener_companion_fd);
 
         // S2S peers must be accepted on reactor 0: the mesh dial table,
         // collision resolver, and link-establish side effects are reactor-0
@@ -5682,7 +5692,7 @@ pub const LinuxServer = struct {
         const manifest_s2s = nativeManifestListener(config, shard_id, .s2s, false);
         const bind_s2s = config.s2s_port != 0 and (!reuse_port or shard_id == 0);
         var s2s_listener_fd: linux.fd_t = -1;
-        errdefer if (s2s_listener_fd >= 0) closeFd(s2s_listener_fd);
+        errdefer if (s2s_listener_fd >= 0) closeListenerFd(s2s_listener_fd);
         if (bind_s2s) {
             if (manifest_s2s) |fd| {
                 s2s_listener_fd = try adoptNativeListener(config, fd);
@@ -5702,7 +5712,7 @@ pub const LinuxServer = struct {
             try stageListenerCompanion(config.host, config.s2s_port, s2s_listener_fd, config.backlog, false, inherited_s2s, nativeManifestListener(config, shard_id, .s2s, true))
         else
             -1;
-        errdefer if (s2s_listener_companion_fd >= 0) closeFd(s2s_listener_companion_fd);
+        errdefer if (s2s_listener_companion_fd >= 0) closeListenerFd(s2s_listener_companion_fd);
 
         // Cert presence is the "TLS configured" signal (main.zig only supplies a
         // chain when [tls] is enabled). Port 0 then means an ephemeral bind, the
@@ -5717,12 +5727,12 @@ pub const LinuxServer = struct {
                 try createListener(primaryListenerHost(config.host), config.tls_port, config.backlog))
         else
             -1;
-        errdefer if (tls_listener_fd >= 0) closeFd(tls_listener_fd);
+        errdefer if (tls_listener_fd >= 0) closeListenerFd(tls_listener_fd);
         const tls_listener_companion_fd = if (tls_listener_fd >= 0)
             try stageListenerCompanion(config.host, config.tls_port, tls_listener_fd, config.backlog, reuse_port, inherited_tls, nativeManifestListener(config, shard_id, .tls, true))
         else
             -1;
-        errdefer if (tls_listener_companion_fd >= 0) closeFd(tls_listener_companion_fd);
+        errdefer if (tls_listener_companion_fd >= 0) closeListenerFd(tls_listener_companion_fd);
 
         // Secure-WebSocket (wss) browser listener: gated on `ws_enabled` AND the
         // same cert-presence signal as the TLS listener (browsers require wss).
@@ -5737,12 +5747,12 @@ pub const LinuxServer = struct {
                 try createListener(primaryListenerHost(config.host), config.ws_port, config.backlog))
         else
             -1;
-        errdefer if (ws_listener_fd >= 0) closeFd(ws_listener_fd);
+        errdefer if (ws_listener_fd >= 0) closeListenerFd(ws_listener_fd);
         const ws_listener_companion_fd = if (ws_listener_fd >= 0)
             try stageListenerCompanion(config.host, config.ws_port, ws_listener_fd, config.backlog, reuse_port, inherited_ws, nativeManifestListener(config, shard_id, .ws, true))
         else
             -1;
-        errdefer if (ws_listener_companion_fd >= 0) closeFd(ws_listener_companion_fd);
+        errdefer if (ws_listener_companion_fd >= 0) closeListenerFd(ws_listener_companion_fd);
 
         if (comptime builtin.os.tag == .linux) {
             const incoming_cpu = kernel_linux.shardIncomingCpu(shard_id);
@@ -8652,8 +8662,8 @@ pub const LinuxServer = struct {
                 // reactor's clients subscribed to the carried category (safe — we
                 // only touch our own shard's client table, on our own thread).
                 if (msg.broadcast_category) |cat_raw| {
-                    const category: event_spine.EventCategory = @enumFromInt(cat_raw);
-                    const severity: event_spine.EventSeverity = @enumFromInt(@min(msg.broadcast_severity, @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1)));
+                    const category: event_spine.EventCategory = @fromBackingInt(@intCast(cat_raw));
+                    const severity: event_spine.EventSeverity = @fromBackingInt(@intCast(@min(msg.broadcast_severity, @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1))));
                     // The publishing reactor carried the event subject inline so this
                     // reactor applies each local subscriber's per-category subject
                     // glob exactly as the origin did. An empty carried subject means
@@ -9302,7 +9312,7 @@ pub const LinuxServer = struct {
             const n = self.event_collapse.flush(platform.realtimeMillis(), &summaries);
             for (summaries[0..n]) |*s| {
                 const cat: event_spine.EventCategory = if (s.category < @typeInfo(event_spine.EventCategory).@"enum".field_names.len)
-                    @enumFromInt(s.category)
+                    @fromBackingInt(@intCast(s.category))
                 else
                     .flood;
                 var mb: [320]u8 = undefined;
@@ -10816,6 +10826,14 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Queue at most one exact cancel while a SEND still owns its buffer.
+    fn submitSendCancelIfNeeded(self: *LinuxServer, conn: *ConnState) !bool {
+        if (!conn.send_armed or conn.send_cancel_pending) return false;
+        try io_backend.submitCancel(&self.rx().ring, .send, conn.token);
+        conn.send_cancel_pending = true;
+        return true;
+    }
+
     /// Owner-thread socket safe point. Queue exact user_data cancels for every
     /// armed RECV/SEND, submit them, and keep reaping through the ordinary
     /// CompletionHandler until the matching original CQEs release every buffer.
@@ -10858,19 +10876,16 @@ pub const LinuxServer = struct {
                     };
                     conn.recv_cancel_pending = true;
                 }
-                if (conn.send_armed and !conn.send_cancel_pending) {
-                    io_backend.submitCancel(&r.ring, .send, conn.token) catch |err| switch (err) {
-                        error.SubmissionQueueFull => {
-                            sq_full = true;
-                            break;
-                        },
-                        else => {
-                            if (first_err == null) first_err = err;
-                            break;
-                        },
-                    };
-                    conn.send_cancel_pending = true;
-                }
+                _ = self.submitSendCancelIfNeeded(conn) catch |err| switch (err) {
+                    error.SubmissionQueueFull => {
+                        sq_full = true;
+                        break;
+                    },
+                    else => {
+                        if (first_err == null) first_err = err;
+                        break;
+                    },
+                };
                 if (conn.connect_armed and !conn.connect_cancel_pending) {
                     io_backend.submitCancel(&r.ring, .connect, conn.token) catch |err| switch (err) {
                         error.SubmissionQueueFull => {
@@ -11267,7 +11282,7 @@ pub const LinuxServer = struct {
             armed.* = false;
             cancel_pending.* = false;
         }
-        if (was_cancel_pending and event.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+        if (was_cancel_pending and event.res == -@as(i32, @backingInt(linux.E.CANCELED))) {
             if (!self.rx().socket_io_quiescing) self.armAccept() catch self.wakeReactor();
             return;
         }
@@ -12695,7 +12710,7 @@ pub const LinuxServer = struct {
                 return;
             }
         }
-        if (was_cancel_pending and event.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+        if (was_cancel_pending and event.res == -@as(i32, @backingInt(linux.E.CANCELED))) {
             conn.connect_rearm_pending = true;
             if (!self.rx().socket_io_quiescing) {
                 self.armConnect(conn) catch {
@@ -13124,14 +13139,30 @@ pub const LinuxServer = struct {
         };
     }
 
+    fn isOptionalIoUringUnsupportedResult(res: i32) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+        if (res >= 0) return false;
+        const errno = -res;
+        return errno == @as(i32, @backingInt(linux.E.OPNOTSUPP)) or
+            errno == @as(i32, @backingInt(linux.E.INVAL)) or
+            errno == @as(i32, @backingInt(linux.E.NOSYS)) or
+            errno == @as(i32, @backingInt(linux.E.PERM)) or
+            errno == @as(i32, @backingInt(linux.E.ACCES));
+    }
+
     pub fn handleRecv(self: *LinuxServer, event: ringlane.RecvEvent) !void {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
         const was_cancel_pending = conn.recv_cancel_pending;
+        const was_fallback_drain = conn.recv_multishot_fallback_drain;
+        const was_multishot_armed = conn.recv_multishot_armed;
         // Multishot recv stays armed while the kernel sets MORE. Clearing the
         // latch here would submit a second recv beside the live SQE.
-        if (!event.more) conn.recv_armed = false;
-        conn.recv_cancel_pending = false;
+        if (!event.more) {
+            conn.recv_armed = false;
+            conn.recv_multishot_armed = false;
+            conn.recv_cancel_pending = false;
+        }
         self.stageRecvPayload(conn, event);
         if (comptime builtin.os.tag == .windows) {
             if (conn.windows_force_close_cancel) {
@@ -13140,13 +13171,14 @@ pub const LinuxServer = struct {
             }
         }
 
-        // Helix's exact cancel releases the kernel's recv_buf reference without
-        // meaning EOF. Preserve the live stream and, while the owner is at its
-        // safe point, deliberately do not arm a replacement RECV. A close that
-        // was already latched still gets its ordinary all-refs-clear finalizer.
-        if (was_cancel_pending and
-            event.res == -@as(i32, @intFromEnum(linux.E.CANCELED)))
+        // Helix cancellation and fallback-drain cancellation release the recv
+        // buffer without meaning EOF. Preserve the live stream and, while the
+        // owner is at its safe point, deliberately do not arm a replacement
+        // RECV. A latched close still gets its all-refs-clear finalizer.
+        if ((was_cancel_pending or (was_fallback_drain and !event.more)) and
+            event.res == -@as(i32, @backingInt(linux.E.CANCELED)))
         {
+            conn.recv_multishot_fallback_drain = false;
             if (!self.rx().socket_io_quiescing) {
                 // Failure-resume may have released the shared barrier before a
                 // cancel's original CQE arrived. Retain accepted close output
@@ -13178,12 +13210,34 @@ pub const LinuxServer = struct {
         // after another shard declared an outbound byte gap.
         if (self.abortDeliveryGapFor(id, conn)) return;
 
+        // Some kernels or sandbox policies reject optional multishot recv only
+        // when the first CQE arrives. Disable it for this ring and keep this
+        // connection alive. MORE means the kernel still owns the multishot
+        // request; let that exact request reach its terminal CQE before arming
+        // copy recv, so the two paths can never consume overlapping bytes.
+        if (comptime builtin.os.tag == .linux) {
+            if (was_multishot_armed and !conn.tls_rx_offloaded and event.buffer_id == null and
+                isOptionalIoUringUnsupportedResult(event.res))
+            {
+                self.rx().ring.features.multishot_recv = false;
+                if (event.more) {
+                    conn.recv_multishot_fallback_drain = true;
+                    return;
+                }
+                conn.recv_multishot_fallback_drain = false;
+                if (!self.rx().socket_io_quiescing) try self.armRecv(conn);
+                return;
+            }
+        }
+        if (conn.recv_multishot_fallback_drain and !event.more)
+            conn.recv_multishot_fallback_drain = false;
+
         // An empty provided-buffer group disarms multishot recv with ENOBUFS.
         // That is not EOF. Replenish already happened for any selected slice;
         // arm again instead of closing.
         if (comptime builtin.os.tag == .linux) {
-            if (!conn.tls_rx_offloaded and self.rx().ring.hasProvidedGroup() and
-                event.res == -@as(i32, @intFromEnum(linux.E.NOBUFS)))
+            if (was_multishot_armed and !conn.tls_rx_offloaded and
+                event.res == -@as(i32, @backingInt(linux.E.NOBUFS)))
             {
                 if (!conn.closing) try self.armRecv(conn);
                 return;
@@ -13223,7 +13277,9 @@ pub const LinuxServer = struct {
             // stale `recv_buf`. kTLS copy recv is the exception: the kernel
             // wrote that buffer and the completion carries no buffer id.
             if (comptime builtin.os.tag == .linux) {
-                if (event.buffer_id == null and !conn.tls_rx_offloaded and self.rx().ring.hasProvidedGroup()) {
+                if (event.buffer_id == null and !conn.tls_rx_offloaded and
+                    was_multishot_armed)
+                {
                     conn.closing = true;
                 }
             }
@@ -13267,6 +13323,7 @@ pub const LinuxServer = struct {
         const id = idFromToken(event.token);
         const conn = try self.connForToken(event.token);
         const was_cancel_pending = conn.send_cancel_pending;
+        const was_send_zc_armed = conn.send_zc_armed;
         const submitted = conn.send_submitted_len;
         const submitted_offset = conn.send_submitted_offset;
         // A zero-copy notification carries no new bytes. The data CQE already
@@ -13275,6 +13332,7 @@ pub const LinuxServer = struct {
             conn.send_submitted_len = 0;
             conn.send_submitted_offset = 0;
             conn.send_armed = false;
+            conn.send_zc_armed = false;
             conn.send_cancel_pending = false;
             if (comptime builtin.os.tag == .windows) {
                 if (conn.windows_force_close_cancel) {
@@ -13301,8 +13359,9 @@ pub const LinuxServer = struct {
             conn.send_submitted_len = 0;
             conn.send_submitted_offset = 0;
             conn.send_armed = false;
+            conn.send_zc_armed = false;
+            conn.send_cancel_pending = false;
         }
-        conn.send_cancel_pending = false;
         if (comptime builtin.os.tag == .windows) {
             if (conn.windows_force_close_cancel) {
                 try self.closeConn(event.token, conn.close_reason);
@@ -13312,7 +13371,7 @@ pub const LinuxServer = struct {
         // Cancellation is not a stream error. No bytes were accepted, so retain
         // the exact unsent [send_offset, send_len) tail for the Helix snapshot.
         if (was_cancel_pending and
-            event.res == -@as(i32, @intFromEnum(linux.E.CANCELED)))
+            event.res == -@as(i32, @backingInt(linux.E.CANCELED)))
         {
             if (!self.rx().socket_io_quiescing) {
                 try self.armSendIfNeeded(conn);
@@ -13332,8 +13391,8 @@ pub const LinuxServer = struct {
             // resend the same bytes by copy. A notification, when MORE was
             // set, rearms after it releases the buffer.
             if (comptime builtin.os.tag == .linux) {
-                if (!event.notif and !conn.tls_tx_offloaded and self.rx().ring.features.send_zc and
-                    event.res == -@as(i32, @intFromEnum(linux.E.OPNOTSUPP)))
+                if (!event.notif and was_send_zc_armed and !conn.tls_tx_offloaded and
+                    isOptionalIoUringUnsupportedResult(event.res))
                 {
                     self.rx().ring.features.send_zc = false;
                     if (!hold and !self.rx().socket_io_quiescing) try self.armSendIfNeeded(conn);
@@ -17235,7 +17294,9 @@ pub const LinuxServer = struct {
         if (comptime builtin.os.tag == .linux) {
             // kTLS RX demuxes control records with recvmsg on the connection
             // buffer. Provided-buffer multishot cannot carry that cmsg.
-            if (!conn.tls_rx_offloaded and self.rx().ring.hasProvidedGroup()) {
+            if (!conn.tls_rx_offloaded and self.rx().ring.features.multishot_recv and
+                self.rx().ring.hasProvidedGroup())
+            {
                 self.rx().ring.submitRecvMultishot(conn.token, conn.fd, self.rx().ring.providedGroup()) catch |err| {
                     if (err == error.SubmissionQueueFull) {
                         conn.io_activation_pending = true;
@@ -17246,6 +17307,7 @@ pub const LinuxServer = struct {
                     return err;
                 };
                 conn.recv_armed = true;
+                conn.recv_multishot_armed = true;
                 return;
             }
         }
@@ -17259,6 +17321,7 @@ pub const LinuxServer = struct {
             return err;
         };
         conn.recv_armed = true;
+        conn.recv_multishot_armed = false;
     }
 
     /// Acquire the connection's single CONNECT ownership reference. The address
@@ -17334,6 +17397,7 @@ pub const LinuxServer = struct {
                 conn.send_submitted_len = submitted_len;
                 conn.send_submitted_offset = conn.send_offset;
                 conn.send_armed = true;
+                conn.send_zc_armed = true;
                 return;
             }
         }
@@ -17349,6 +17413,7 @@ pub const LinuxServer = struct {
         conn.send_submitted_len = submitted_len;
         conn.send_submitted_offset = conn.send_offset;
         conn.send_armed = true;
+        conn.send_zc_armed = false;
     }
 
     /// A healthy drain-close retains every accepted output domain, including
@@ -31119,7 +31184,7 @@ pub const LinuxServer = struct {
 
         var snap = s2s_snapshot.Snapshot{
             .fd = conn.fd,
-            .role = @intFromEnum(outer.role),
+            .role = @backingInt(outer.role),
             .s2s_initiator = conn.s2s_initiator,
             .send_counter = outer.send_counter,
             .recv_counter = outer.recv_counter,
@@ -38895,7 +38960,7 @@ pub const LinuxServer = struct {
         // A leading non-numeric arg is a category (or ALL); then an optional count.
         if (params.len > argi and params[argi].len != 0 and !isAsciiDigits(params[argi])) {
             if (!std.ascii.eqlIgnoreCase(params[argi], "ALL")) {
-                filter_cat = @intFromEnum(event_spine.EventCategory.parse(params[argi]) orelse {
+                filter_cat = @backingInt(event_spine.EventCategory.parse(params[argi]) orelse {
                     try queueNumeric(conn, .ERR_NOSUCHEVENT, &.{params[argi]}, "No such event category");
                     return;
                 });
@@ -38908,7 +38973,7 @@ pub const LinuxServer = struct {
         count = std.math.clamp(count, 1, 200);
 
         var buf: [200]event_history_mod.StoredEvent = undefined;
-        const got = self.event_history.collect(filter_cat, @intFromEnum(conn.session.eventMinSeverity()), buf[0..count]);
+        const got = self.event_history.collect(filter_cat, @backingInt(conn.session.eventMinSeverity()), buf[0..count]);
 
         if (json) {
             var hb: [160]u8 = undefined;
@@ -38973,7 +39038,7 @@ pub const LinuxServer = struct {
             const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field_name);
             if (!first) try w.writeAll(",");
             first = false;
-            try w.print("\"{s}\":{d}", .{ cat.token(), self.event_stats.categoryCount(@intFromEnum(cat)) });
+            try w.print("\"{s}\":{d}", .{ cat.token(), self.event_stats.categoryCount(@backingInt(cat)) });
         }
         try w.writeAll("},\"severities\":{");
         first = true;
@@ -38981,7 +39046,7 @@ pub const LinuxServer = struct {
             const sev: event_spine.EventSeverity = @field(event_spine.EventSeverity, field_name);
             if (!first) try w.writeAll(",");
             first = false;
-            try w.print("\"{s}\":{d}", .{ sev.token(), self.event_stats.severityCount(@intFromEnum(sev)) });
+            try w.print("\"{s}\":{d}", .{ sev.token(), self.event_stats.severityCount(@backingInt(sev)) });
         }
         try w.writeAll(
             "},\"operator_surfaces\":{" ++
@@ -39024,7 +39089,7 @@ pub const LinuxServer = struct {
             var any = false;
             inline for (@typeInfo(event_spine.EventCategory).@"enum".field_names) |field_name| {
                 const cat: event_spine.EventCategory = @field(event_spine.EventCategory, field_name);
-                const n = self.event_stats.categoryCount(@intFromEnum(cat));
+                const n = self.event_stats.categoryCount(@backingInt(cat));
                 if (n != 0) {
                     var nb: [40]u8 = undefined;
                     w.writeAll(std.fmt.bufPrint(&nb, " {s}={d}", .{ cat.code(), n }) catch "") catch {};
@@ -39041,7 +39106,7 @@ pub const LinuxServer = struct {
             w.writeAll("  by severity:") catch {};
             inline for (@typeInfo(event_spine.EventSeverity).@"enum".field_names) |field_name| {
                 const sev: event_spine.EventSeverity = @field(event_spine.EventSeverity, field_name);
-                const n = self.event_stats.severityCount(@intFromEnum(sev));
+                const n = self.event_stats.severityCount(@backingInt(sev));
                 if (n != 0) {
                     var nb: [40]u8 = undefined;
                     w.writeAll(std.fmt.bufPrint(&nb, " {s}={d}", .{ sev.token(), n }) catch "") catch {};
@@ -39399,7 +39464,7 @@ pub const LinuxServer = struct {
         const ev = observe_event.decode(bytes) catch return null;
         var action_opt: ?observe_mod.Action = null;
         inline for (@typeInfo(observe_mod.Action).@"enum".field_values) |f_value| {
-            if (f_value == ev.action) action_opt = @enumFromInt(ev.action);
+            if (f_value == ev.action) action_opt = @fromBackingInt(@intCast(ev.action));
         }
         const action = action_opt orelse return null;
         return .{ .origin = ev.origin_server, .action = action, .subject = .{
@@ -39455,7 +39520,7 @@ pub const LinuxServer = struct {
         if (self.fabric) |*fabric| {
             var enc: [observe_event.max_encoded_len]u8 = undefined;
             const wire = observe_event.encode(.{
-                .action = @intFromEnum(action),
+                .action = @backingInt(action),
                 .origin_server = truncObserve(origin_server, observe_event.max_origin_len),
                 .nick = truncObserve(subject.nick, observe_event.max_nick_len),
                 .user = truncObserve(subject.user, observe_event.max_user_len),
@@ -39496,7 +39561,7 @@ pub const LinuxServer = struct {
     /// quit, nick, oper-up) are session-lifecycle, the same low volume the
     /// `.connect`/`.disconnect` Event-Spine categories already broadcast.
     fn meshBroadcastObserveEvent(self: *LinuxServer, action: observe_mod.Action, subject: observe_mod.Subject) void {
-        const act: u8 = @intFromEnum(action);
+        const act: u8 = @backingInt(action);
         const origin = self.serverName();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
@@ -46100,7 +46165,7 @@ pub const LinuxServer = struct {
     /// hint and never installs a ward. An add/remove updates the registry.
     /// Returns true when a successful add should sweep live clients.
     fn ingestMeshWardPayload(self: *LinuxServer, payload: []const u8) bool {
-        if (payload.len != 0 and payload[0] == @intFromEnum(warden.WireOp.filter)) {
+        if (payload.len != 0 and payload[0] == @backingInt(warden.WireOp.filter)) {
             const decoded = warden.decodeMeshBanFilter(self.allocator, payload) catch {
                 self.traceLog(.warn, .s2s, "dropped malformed mesh-ban filter from peer");
                 return false;
@@ -56026,8 +56091,8 @@ pub const LinuxServer = struct {
         } else {
             // Legacy source append is allocation-free, with the same accepted
             // local history semantics as the existing direct-leaf publisher.
-            self.event_history.record(@intFromEnum(event_spine.EventCategory.service), @intFromEnum(event_spine.EventSeverity.warn), platform.realtimeMillis(), candidate.origin, message);
-            self.event_stats.record(@intFromEnum(event_spine.EventCategory.service), @intFromEnum(event_spine.EventSeverity.warn));
+            self.event_history.record(@backingInt(event_spine.EventCategory.service), @backingInt(event_spine.EventSeverity.warn), platform.realtimeMillis(), candidate.origin, message);
+            self.event_stats.record(@backingInt(event_spine.EventCategory.service), @backingInt(event_spine.EventSeverity.warn));
         }
         // Every fallible candidate precedes source acceptance. Publish owned
         // downstream work and consume exactly one Worker notice without failure.
@@ -58545,13 +58610,13 @@ pub const LinuxServer = struct {
         // threshold within the window is suppressed here (dropped from delivery,
         // mesh, history, and stats); the stats-tick flush later emits one
         // "collapsed N×" summary. Severity >= warn is never collapsed.
-        if (!self.event_collapse.admit(@intFromEnum(category), @intFromEnum(severity), message, platform.realtimeMillis())) return;
+        if (!self.event_collapse.admit(@backingInt(category), @backingInt(severity), message, platform.realtimeMillis())) return;
         if (self.config.node_identity) |identity| {
             var origin_pubkey: [oper_event.pubkey_len]u8 = undefined;
             var origin_sig: [oper_event.sig_len]u8 = undefined;
             var event = oper_event.SignedOperEventV2{
-                .category = @intFromEnum(category),
-                .severity = @intFromEnum(severity),
+                .category = @backingInt(category),
+                .severity = @backingInt(severity),
                 .origin_node = self.config.node_id,
                 .hlc = self.nextMeshHlc(),
                 .origin_server = self.serverName(),
@@ -58568,8 +58633,8 @@ pub const LinuxServer = struct {
 
         // A node without a sovereign signing identity cannot author OEVT v2.
         // Retain deployed direct-leaf v1 behavior; peers never re-flood it.
-        self.event_history.record(@intFromEnum(category), @intFromEnum(severity), platform.realtimeMillis(), self.serverName(), message);
-        self.event_stats.record(@intFromEnum(category), @intFromEnum(severity));
+        self.event_history.record(@backingInt(category), @backingInt(severity), platform.realtimeMillis(), self.serverName(), message);
+        self.event_stats.record(@backingInt(category), @backingInt(severity));
         self.deliverOperEventLocal(self.serverName(), category, severity, subject, message);
         self.meshBroadcastOperEvent(category, severity, message);
         self.deliverOutboundWebhooks(category, severity, message);
@@ -58712,8 +58777,8 @@ pub const LinuxServer = struct {
                 var fan = reactor_fabric.DeliverMsg{
                     .to = client_model.ClientId.invalid,
                     .buf = buf,
-                    .broadcast_category = @intFromEnum(category),
-                    .broadcast_severity = @intFromEnum(severity),
+                    .broadcast_category = @backingInt(category),
+                    .broadcast_severity = @backingInt(severity),
                 };
                 const sn = @min(subject.len, deliver_handle.broadcast_subject_max);
                 @memcpy(fan.broadcast_subject[0..sn], subject[0..sn]);
@@ -58877,8 +58942,8 @@ pub const LinuxServer = struct {
     /// signed OPER_EVENT, carrying our server name as the origin. Best-effort; a
     /// send failure to one peer never blocks the others or the local delivery.
     fn meshBroadcastOperEvent(self: *LinuxServer, category: event_spine.EventCategory, severity: event_spine.EventSeverity, message: []const u8) void {
-        const cat: u6 = @intFromEnum(category);
-        const sev: u8 = @intFromEnum(severity);
+        const cat: u6 = @backingInt(category);
+        const sev: u8 = @backingInt(severity);
         const origin = self.serverName();
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
@@ -58915,13 +58980,13 @@ pub const LinuxServer = struct {
             // (a hostile peer could send any in-range u6) — never @enumFromInt blind.
             var category_opt: ?event_spine.EventCategory = null;
             inline for (@typeInfo(event_spine.EventCategory).@"enum".field_values) |f_value| {
-                if (f_value == ev.category) category_opt = @enumFromInt(ev.category);
+                if (f_value == ev.category) category_opt = @fromBackingInt(@intCast(ev.category));
             }
             const category = category_opt orelse continue;
             // Severity rides the wire (u8); clamp an out-of-range value from a
             // hostile/newer peer to the top defined level rather than @enumFromInt blind.
             const sev_max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1);
-            const severity: event_spine.EventSeverity = @enumFromInt(@min(ev.severity, sev_max));
+            const severity: event_spine.EventSeverity = @fromBackingInt(@intCast(@min(ev.severity, sev_max)));
             // Subject == message (callers that publish locally use the same).
             // Origin is the authenticated peer, not the spoofable wire field.
             const origin = trustedOrigin(link, ev.origin_server);
@@ -59309,11 +59374,11 @@ pub const LinuxServer = struct {
 
             var category_opt: ?event_spine.EventCategory = null;
             inline for (@typeInfo(event_spine.EventCategory).@"enum".field_values) |value| {
-                if (value == event.category) category_opt = @enumFromInt(event.category);
+                if (value == event.category) category_opt = @fromBackingInt(@intCast(event.category));
             }
             const category = category_opt orelse continue;
             const sev_max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1);
-            const severity: event_spine.EventSeverity = @enumFromInt(@min(event.severity, sev_max));
+            const severity: event_spine.EventSeverity = @fromBackingInt(@intCast(@min(event.severity, sev_max)));
             self.deliverOperEventV2Local(event, event_id, category, severity, event.subject);
             self.meshForwardOperEventV2(item.wire);
         }
@@ -64943,7 +65008,7 @@ fn hashManagedPolicyValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) !v
             hash.update(&bytes);
         },
         .float => |info| try hashManagedPolicyValue(hash, @as(@Int(.unsigned, info.bits), @bitCast(value))),
-        .@"enum" => try hashManagedPolicyValue(hash, @intFromEnum(value)),
+        .@"enum" => try hashManagedPolicyValue(hash, @backingInt(value)),
         .optional => {
             hash.update(&.{@intFromBool(value != null)});
             if (value) |inner| try hashManagedPolicyValue(hash, inner);
@@ -65233,7 +65298,7 @@ pub const ManagedCoreFixture = if (builtin.is_test) struct {
 } else struct {};
 
 fn managedSpecBefore(_: void, a: reactor_pool_mod.runtime_start_gate.ParticipantSpec, b: reactor_pool_mod.runtime_start_gate.ParticipantSpec) bool {
-    return @intFromEnum(a.kind) < @intFromEnum(b.kind) or (a.kind == b.kind and a.instance < b.instance);
+    return @backingInt(a.kind) < @backingInt(b.kind) or (a.kind == b.kind and a.instance < b.instance);
 }
 fn managedAppendSpec(out: []reactor_pool_mod.runtime_start_gate.ParticipantSpec, count: *usize, kind: reactor_pool_mod.runtime_start_gate.Kind, instance: u16, owner: *const anyopaque, options: std.Thread.SpawnConfig) !void {
     if (count.* == out.len) return error.ParticipantCapacity;
@@ -65337,7 +65402,7 @@ test "managed leased core: actual read and transaction custody retain exact plac
     try b.install_seal.?.requireOriginal(b);
     var public_key: crypto_sign.PublicKey = undefined;
     var signature: crypto_sign.Signature = undefined;
-    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "source custody", .message = "retained source transaction" };
+    var event: oper_event.SignedOperEventV2 = .{ .category = @backingInt(event_spine.EventCategory.service), .severity = @backingInt(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "source custody", .message = "retained source transaction" };
     try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
     const plan = try ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000);
     var plan_aborted = false;
@@ -65429,7 +65494,7 @@ test "managed leased core: every actual recovery factory allocation failure rele
     defer if (!closed) original.discardLeasedCold() catch @panic("leased allocation seed cleanup");
     var public_key: crypto_sign.PublicKey = undefined;
     var signature: crypto_sign.Signature = undefined;
-    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "source allocation", .message = "original accepted durable output" };
+    var event: oper_event.SignedOperEventV2 = .{ .category = @backingInt(event_spine.EventCategory.service), .severity = @backingInt(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "source allocation", .message = "original accepted durable output" };
     try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
     const plan = try ManagedCoreFixture.prepareLeasedEvent(original, event, &.{.{ .url = "https://delivery.example.test/leased", .secret = "exact original source secret" }}, 1000);
     var committed = false;
@@ -65534,7 +65599,7 @@ test "managed leased core: real failed preparations refund active World custody 
     defer std.testing.allocator.free(before);
     var public_key: crypto_sign.PublicKey = undefined;
     var signature: crypto_sign.Signature = undefined;
-    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "scope budget", .message = "uncommitted scope attempts" };
+    var event: oper_event.SignedOperEventV2 = .{ .category = @backingInt(event_spine.EventCategory.service), .severity = @backingInt(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "scope budget", .message = "uncommitted scope attempts" };
     try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
     var invalid = event;
     invalid.origin_server = "foreign.core.test";
@@ -65584,7 +65649,7 @@ test "managed leased core: bound prepare allocation failures retain original WAL
     defer std.testing.allocator.free(before);
     var public_key: crypto_sign.PublicKey = undefined;
     var signature: crypto_sign.Signature = undefined;
-    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "scope allocation", .message = "all fallible source preparation" };
+    var event: oper_event.SignedOperEventV2 = .{ .category = @backingInt(event_spine.EventCategory.service), .severity = @backingInt(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "scope allocation", .message = "all fallible source preparation" };
     try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
     var induced: usize = 0;
     var succeeded = false;
@@ -65637,7 +65702,7 @@ test "managed leased core: real other caller holding fresh World refuses before 
     defer std.testing.allocator.free(before);
     var public_key: crypto_sign.PublicKey = undefined;
     var signature: crypto_sign.Signature = undefined;
-    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "World caller", .message = "original candidate stays retained" };
+    var event: oper_event.SignedOperEventV2 = .{ .category = @backingInt(event_spine.EventCategory.service), .severity = @backingInt(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "World caller", .message = "original candidate stays retained" };
     try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
     const plan = try ManagedCoreFixture.prepareLeasedEvent(core, event, &.{}, 1000);
     var interrupted = false;
@@ -65742,7 +65807,7 @@ test "managed leased core: actual final valid World acquisition permits cold-onl
     try ManagedCoreFixture.seedFinalLeasedWorldAcquisition(core);
     var public_key: crypto_sign.PublicKey = undefined;
     var signature: crypto_sign.Signature = undefined;
-    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "final source scope", .message = "retained candidate at final acquisition" };
+    var event: oper_event.SignedOperEventV2 = .{ .category = @backingInt(event_spine.EventCategory.service), .severity = @backingInt(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "final source scope", .message = "retained candidate at final acquisition" };
     try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
     const plan = try ManagedCoreFixture.prepareLeasedEvent(core, event, &.{.{ .url = "https://delivery.example.test/final", .secret = "uncommitted final output" }}, 1000);
     var interrupted = false;
@@ -65884,7 +65949,7 @@ fn managedLeasedRegisteredChannelColdTest(exhaustion: bool) !void {
     if (exhaustion) try ManagedCoreFixture.seedFinalLeasedWorldAcquisition(core);
     var public_key: crypto_sign.PublicKey = undefined;
     var signature: crypto_sign.Signature = undefined;
-    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "channel source custody", .message = "uncommitted source scope" };
+    var event: oper_event.SignedOperEventV2 = .{ .category = @backingInt(event_spine.EventCategory.service), .severity = @backingInt(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "channel source custody", .message = "uncommitted source scope" };
     try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
     if (!exhaustion) try managedLeasedRegisteredChannelSameLaneTest(core, event, storage, &before);
     // An actual leaf candidate retains the genuine issued Scope and original
@@ -66036,7 +66101,7 @@ fn managedLeasedRegisteredChannelFirstTest() !void {
     defer before.deinit();
     var public_key: crypto_sign.PublicKey = undefined;
     var signature: crypto_sign.Signature = undefined;
-    var event: oper_event.SignedOperEventV2 = .{ .category = @intFromEnum(event_spine.EventCategory.service), .severity = @intFromEnum(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "stage-first admission", .message = "no funded event candidate" };
+    var event: oper_event.SignedOperEventV2 = .{ .category = @backingInt(event_spine.EventCategory.service), .severity = @backingInt(event_spine.EventSeverity.warn), .origin_node = identity.shortId(), .hlc = 1000 << 16, .origin_server = "leased.core.test", .subject = "stage-first admission", .message = "no funded event candidate" };
     try oper_event.stampOrigin(&event, &identity.sign_kp, &public_key, &signature);
     var invalid = event;
     invalid.origin_server = "foreign.core.test";
@@ -66320,7 +66385,7 @@ test "managed core: inconsistent actual full key refuses before occupied listene
         errdefer closeFd(fd);
         break :blk BoundTcp{ .fd = fd, .port = try socketPort(fd) };
     } else try bindLoopback(true);
-    defer closeFd(listener.fd);
+    defer closeListenerFd(listener.fd);
     var resolver = try rdns.Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
     defer resolver.deinit();
     var identity = try node_identity.fromSeed(@splat(0x41), "core-key-proof");
@@ -70923,6 +70988,42 @@ fn copyTestSendQ(allocator: std.mem.Allocator, conn: *const ConnState) ![]u8 {
     return out;
 }
 
+/// A live secured peer may already have paged whole records into its socket
+/// SendQ while later ciphertext remains owned by SecuredLink. Reconstruct the
+/// stream in transport order: queued prefix first, then the link's unsent tail.
+fn copySecuredConnOutputInWireOrder(
+    allocator: std.mem.Allocator,
+    conn: *const ConnState,
+    link: *const secured_s2s_link.SecuredLink,
+) ![]u8 {
+    const queued = try copyTestSendQ(allocator, conn);
+    defer allocator.free(queued);
+    const pending = link.outbound();
+    const total = try std.math.add(usize, queued.len, pending.len);
+    const out = try allocator.alloc(u8, total);
+    @memcpy(out[0..queued.len], queued);
+    @memcpy(out[queued.len..], pending);
+    return out;
+}
+
+/// Count the complete AEAD records in a captured secured-link stream. This
+/// catches partial SendQ tails as well as missing bytes between the queued and
+/// still-link-owned portions of the stream.
+fn countCompleteSecuredRecords(wire: []const u8) !u64 {
+    var offset: usize = 0;
+    var count: u64 = 0;
+    while (offset < wire.len) {
+        try std.testing.expect(wire.len - offset >= 4);
+        const body_len = std.mem.readInt(u32, wire[offset..][0..4], .little);
+        try std.testing.expect(body_len >= 16);
+        const record_len = try std.math.add(usize, 4, @as(usize, @intCast(body_len)));
+        try std.testing.expect(record_len <= wire.len - offset);
+        offset += record_len;
+        count += 1;
+    }
+    return count;
+}
+
 fn resetTestSendQ(conn: *ConnState) void {
     conn.send_len = 0;
     conn.send_offset = 0;
@@ -74025,7 +74126,7 @@ test "v2 Store hot-adoption is SQ-inert until authority-first link activation" {
     if (inner.peer_supports_session_attachment_lease_v2) caps |= s2s_snapshot.cap_session_attachment_lease_v2;
     var snap = s2s_snapshot.Snapshot{
         .fd = sockets[0],
-        .role = @intFromEnum(outer.role),
+        .role = @backingInt(outer.role),
         .send_counter = outer.send_counter,
         .recv_counter = outer.recv_counter,
         .feed_seq = outer.feed_seq,
@@ -74112,10 +74213,22 @@ test "secured roster repair follows inbound membership generations across asymme
     _ = try server.world.join("#roster-gc-barrier", worldIdFromClient(pending_id));
 
     // Seed B's existing view through the actual daemon burst path.
+    const initial_recv_counter = pair.b.recv_counter;
     try std.testing.expect(server.sendMembershipBurstTo(peer));
-    const initial_daemon_burst = try allocator.dupe(u8, pair.a.outbound());
+    const initial_queued_len = peer.send_len - peer.send_offset + peer.send_overflow.items.len;
+    const initial_link_outbound_len = pair.a.outbound().len;
+    // This fixture exercises split ownership: the flush path has already
+    // paged a prefix into ConnState while later records remain in SecuredLink.
+    // Feeding only link.outbound() skips earlier AEAD counters.
+    try std.testing.expect(initial_queued_len != 0);
+    try std.testing.expect(initial_link_outbound_len != 0);
+    const initial_daemon_burst = try copySecuredConnOutputInWireOrder(allocator, peer, &pair.a);
     defer allocator.free(initial_daemon_burst);
+    const initial_record_count = try countCompleteSecuredRecords(initial_daemon_burst);
+    try std.testing.expectEqual(pair.a.send_counter - initial_recv_counter, initial_record_count);
+    try std.testing.expectEqual(initial_queued_len + initial_link_outbound_len, initial_daemon_burst.len);
     pair.a.clearOutbound();
+    resetTestSendQ(peer);
     try pair.b.feed(initial_daemon_burst, 80);
     pair.b.processDeferredResidenceFrames(80);
     server.discardIdentityTransitions(&pair.b);
@@ -74132,10 +74245,17 @@ test "secured roster repair follows inbound membership generations across asymme
     // Once authority is ready, the complete daemon burst reaffirms the row before
     // its marker, producing neither a repair PART nor a replacement JOIN.
     pending.session_mesh_announce_pending = false;
+    const complete_recv_counter = pair.b.recv_counter;
     try std.testing.expect(server.sendMembershipBurstTo(peer));
-    const daemon_burst = try allocator.dupe(u8, pair.a.outbound());
+    const complete_queued_len = peer.send_len - peer.send_offset + peer.send_overflow.items.len;
+    const complete_link_outbound_len = pair.a.outbound().len;
+    const daemon_burst = try copySecuredConnOutputInWireOrder(allocator, peer, &pair.a);
     defer allocator.free(daemon_burst);
+    const complete_record_count = try countCompleteSecuredRecords(daemon_burst);
+    try std.testing.expectEqual(pair.a.send_counter - complete_recv_counter, complete_record_count);
+    try std.testing.expectEqual(complete_queued_len + complete_link_outbound_len, daemon_burst.len);
     pair.a.clearOutbound();
+    resetTestSendQ(peer);
     try pair.b.feed(daemon_burst, 90);
     pair.b.processDeferredResidenceFrames(90);
     try std.testing.expectEqual(@as(?i64, 90), pair.b.inner.?.peer.last_membership_sync_ms);
@@ -74271,7 +74391,7 @@ test "hot-adopt secured link tears down cleanly when RESYNC exceeds the carried 
     if (inner.peer_supports_session_attachment_lease_v2) caps |= s2s_snapshot.cap_session_attachment_lease_v2;
     var snap = s2s_snapshot.Snapshot{
         .fd = sockets[0],
-        .role = @intFromEnum(outer.role),
+        .role = @backingInt(outer.role),
         .send_counter = outer.send_counter,
         .recv_counter = outer.recv_counter,
         .feed_seq = outer.feed_seq,
@@ -74381,7 +74501,7 @@ test "portability-enabled hot-adopt rejects a rolling-old peer before roster rel
     // reusable negative authority, so no proxy replay is permitted.
     var snap = s2s_snapshot.Snapshot{
         .fd = sockets[0],
-        .role = @intFromEnum(outer.role),
+        .role = @backingInt(outer.role),
         .send_counter = outer.send_counter,
         .recv_counter = outer.recv_counter,
         .feed_seq = outer.feed_seq,
@@ -74507,7 +74627,7 @@ test "UPGRADE restored property checkpoint bursts after preserved-link activatio
     if (inner.peer_supports_session_attachment_lease_v2) caps |= s2s_snapshot.cap_session_attachment_lease_v2;
     var snap = s2s_snapshot.Snapshot{
         .fd = sockets[0],
-        .role = @intFromEnum(outer.role),
+        .role = @backingInt(outer.role),
         .send_counter = outer.send_counter,
         .recv_counter = outer.recv_counter,
         .feed_seq = outer.feed_seq,
@@ -76587,6 +76707,13 @@ fn readFd(fd: linux.fd_t, buf: []u8) ServerError!usize {
     return n;
 }
 
+/// Close this listener descriptor without shutting down the shared socket.
+/// Inherited listeners may have another live descriptor owner during an
+/// in-process Helix handoff, and shutdown() would disable every duplicate.
+fn closeListenerFd(fd: linux.fd_t) void {
+    os_runtime.close(fd);
+}
+
 fn closeFd(fd: linux.fd_t) void {
     if (comptime builtin.os.tag == .windows) {
         io_backend.closeSocket(fd);
@@ -76746,7 +76873,7 @@ fn encodeUpgradeStreamWithWidenedHeaderForTest(
         try accumulator.add(.{
             .header = .{
                 .schema_id = cap.header.schema_id,
-                .kind = @intFromEnum(cap.header.kind),
+                .kind = @backingInt(cap.header.kind),
                 .version = cap.header.version,
                 .min_supported = cap.header.min_supported,
                 .max_supported = cap.header.max_supported,
@@ -76789,7 +76916,7 @@ fn encodeUpgradeStreamWithLegacyV3SessionsForTest(
         try accumulator.add(.{
             .header = .{
                 .schema_id = cap.header.schema_id,
-                .kind = @intFromEnum(cap.header.kind),
+                .kind = @backingInt(cap.header.kind),
                 .version = cap.header.version,
                 .min_supported = cap.header.min_supported,
                 .max_supported = cap.header.max_supported,
@@ -78707,8 +78834,8 @@ test "UPGRADE mandatory state round trip is exact and deterministic" {
     var event_pubkey: [oper_event.pubkey_len]u8 = undefined;
     var event_signature: [oper_event.sig_len]u8 = undefined;
     var stable_event = oper_event.SignedOperEventV2{
-        .category = @intFromEnum(event_spine.EventCategory.oper_action),
-        .severity = @intFromEnum(event_spine.EventSeverity.notice),
+        .category = @backingInt(event_spine.EventCategory.oper_action),
+        .severity = @backingInt(event_spine.EventSeverity.notice),
         .origin_node = event_identity.shortId(),
         .hlc = predecessor.nextMeshHlc(),
         .origin_server = "event-upgrade.test",
@@ -80658,8 +80785,8 @@ test "Event Spine v2 history conflict rolls back staged replay authority byte-ex
     var pubkey: [oper_event.pubkey_len]u8 = undefined;
     var signature: [oper_event.sig_len]u8 = undefined;
     var event = oper_event.SignedOperEventV2{
-        .category = @intFromEnum(event_spine.EventCategory.oper_action),
-        .severity = @intFromEnum(event_spine.EventSeverity.notice),
+        .category = @backingInt(event_spine.EventCategory.oper_action),
+        .severity = @backingInt(event_spine.EventSeverity.notice),
         .origin_node = identity.shortId(),
         .hlc = server.nextMeshHlc(),
         .origin_server = "event-transaction.test",
@@ -80733,7 +80860,7 @@ test "Event Spine v2 undefined severity fails closed without authority mutation"
     var pubkey: [oper_event.pubkey_len]u8 = undefined;
     var signature: [oper_event.sig_len]u8 = undefined;
     var event = oper_event.SignedOperEventV2{
-        .category = @intFromEnum(event_spine.EventCategory.oper_action),
+        .category = @backingInt(event_spine.EventCategory.oper_action),
         .severity = std.math.maxInt(u8),
         .origin_node = identity.shortId(),
         .hlc = server.nextMeshHlc(),
@@ -80791,8 +80918,8 @@ test "Event Spine v2 binds local and remote origins before authority mutation" {
     var wrong_name_pk: [oper_event.pubkey_len]u8 = undefined;
     var wrong_name_sig: [oper_event.sig_len]u8 = undefined;
     var wrong_name = oper_event.SignedOperEventV2{
-        .category = @intFromEnum(event_spine.EventCategory.security),
-        .severity = @intFromEnum(event_spine.EventSeverity.warn),
+        .category = @backingInt(event_spine.EventCategory.security),
+        .severity = @backingInt(event_spine.EventSeverity.warn),
         .origin_node = local_identity.shortId(),
         .hlc = hlc,
         .origin_server = "local-alias.invalid",
@@ -80804,8 +80931,8 @@ test "Event Spine v2 binds local and remote origins before authority mutation" {
     var remote_pk: [oper_event.pubkey_len]u8 = undefined;
     var remote_sig: [oper_event.sig_len]u8 = undefined;
     var unknown_remote = oper_event.SignedOperEventV2{
-        .category = @intFromEnum(event_spine.EventCategory.security),
-        .severity = @intFromEnum(event_spine.EventSeverity.warn),
+        .category = @backingInt(event_spine.EventCategory.security),
+        .severity = @backingInt(event_spine.EventSeverity.warn),
         .origin_node = remote_identity.shortId(),
         .hlc = server.nextMeshHlc(),
         .origin_server = "unknown-remote.test",
@@ -80872,8 +80999,8 @@ test "Event Spine v2 guard allocation failures leave replay and history byte-exa
         var pubkey: [oper_event.pubkey_len]u8 = undefined;
         var signature: [oper_event.sig_len]u8 = undefined;
         var event = oper_event.SignedOperEventV2{
-            .category = @intFromEnum(event_spine.EventCategory.oper_action),
-            .severity = @intFromEnum(event_spine.EventSeverity.notice),
+            .category = @backingInt(event_spine.EventCategory.oper_action),
+            .severity = @backingInt(event_spine.EventSeverity.notice),
             .origin_node = identity.shortId(),
             .hlc = server.nextMeshHlc(),
             .origin_server = "event-oom.test",
@@ -81433,8 +81560,8 @@ test "DST GAP-A4 event history reloads across USR2 and a signed id is not duplic
     var pubkey: [oper_event.pubkey_len]u8 = undefined;
     var signature: [oper_event.sig_len]u8 = undefined;
     var event = oper_event.SignedOperEventV2{
-        .category = @intFromEnum(event_spine.EventCategory.security),
-        .severity = @intFromEnum(event_spine.EventSeverity.warn),
+        .category = @backingInt(event_spine.EventCategory.security),
+        .severity = @backingInt(event_spine.EventSeverity.warn),
         .origin_node = remote_id,
         .hlc = predecessor.nextMeshHlc(),
         .origin_server = "relay-origin.test",
@@ -82130,8 +82257,8 @@ fn gapO6Join(server: *Server, id: client_model.ClientId, conn: *ConnState, chann
 fn gapO6FloodVerdicts(server: *Server, needle: []const u8) usize {
     var buf: [8]event_history_mod.StoredEvent = undefined;
     const n = server.event_history.collect(
-        @intFromEnum(event_spine.EventCategory.flood),
-        @intFromEnum(event_spine.EventSeverity.warn),
+        @backingInt(event_spine.EventCategory.flood),
+        @backingInt(event_spine.EventSeverity.warn),
         &buf,
     );
     var count: usize = 0;
@@ -84074,7 +84201,7 @@ test "UPGRADE timer deferral still dispatches later recv CQE in copied batch" {
     handler.onCompletion(.{ .timeout = {} });
     handler.onCompletion(.{ .recv = .{
         .token = conn.token,
-        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .res = -@as(i32, @backingInt(linux.E.CANCELED)),
         .more = false,
     } });
 
@@ -84153,7 +84280,7 @@ test "UPGRADE send completion and exact cancel retain the unsent suffix" {
     conn.send_submitted_offset = 2;
     try server.handleSend(.{
         .token = conn.token,
-        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .res = -@as(i32, @backingInt(linux.E.CANCELED)),
         .more = false,
         .notif = false,
     });
@@ -84162,6 +84289,53 @@ test "UPGRADE send completion and exact cancel retain the unsent suffix" {
     try std.testing.expect(!conn.send_armed);
     try std.testing.expect(!conn.send_cancel_pending);
     server.reactors[0].socket_io_quiescing = false;
+}
+
+test "UPGRADE SEND_ZC MORE retains cancel ownership through notification" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = try server.reactors[0].clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.reactors[0].clients.get(id).?;
+    conn.overflow_allocator = std.testing.allocator;
+    conn.token = try tokenFromId(id);
+    server.noteClientAccepted(conn);
+    server.reactors[0].socket_io_quiescing = true;
+    conn.closing = true;
+    conn.close_reason = "test quiesce close";
+    @memcpy(conn.send_buf[0..4], "wire");
+    conn.send_len = 4;
+    conn.send_offset = 0;
+    conn.send_submitted_len = 4;
+    conn.send_submitted_offset = 0;
+    conn.send_armed = true;
+    conn.send_zc_armed = true;
+    conn.send_cancel_pending = true;
+
+    try server.handleSend(.{ .token = conn.token, .res = 4, .more = true, .notif = false });
+    try std.testing.expect(conn.send_armed);
+    try std.testing.expect(conn.send_zc_armed);
+    try std.testing.expect(conn.send_cancel_pending);
+    try std.testing.expectEqual(@as(usize, 4), conn.send_offset);
+    try std.testing.expect(!(try server.submitSendCancelIfNeeded(conn)));
+
+    // MORE leaves the slot and buffer owned. The notification releases both,
+    // clears the pending cancel once, and completes the already-latched close.
+    try server.handleSend(.{ .token = conn.token, .res = 0, .more = false, .notif = true });
+    try std.testing.expect(server.reactors[0].clients.get(id) == null);
+    try std.testing.expectEqual(@as(i64, 0), server.stats.connections_active.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), server.stats.connections_total.load(.acquire));
 }
 
 test "UPGRADE quiet recv exact cancel rearms on failure resume" {
@@ -88238,7 +88412,7 @@ fn runRemotePropFailureSweep(tmp: *std.testing.TmpDir, variant: RemotePropFailur
     var fail_index: usize = 0;
     while (fail_index < 96) : (fail_index += 1) {
         var name_buf: [72]u8 = undefined;
-        const wal_name = try std.fmt.bufPrint(&name_buf, "server-kt-atomic-{d}-{d}.wal", .{ @intFromEnum(variant), fail_index });
+        const wal_name = try std.fmt.bufPrint(&name_buf, "server-kt-atomic-{d}-{d}.wal", .{ @backingInt(variant), fail_index });
         var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, wal_name);
         defer store.deinit();
         var kt = key_transparency.KeyTransparencyLog.init(std.testing.allocator);
@@ -107212,7 +107386,7 @@ test "shared full server: OpenBSD wildcard pairs deliver across families and qui
         var kinds: [4]usize = @splat(0);
         var families: [2]usize = @splat(0);
         for (rows) |row| {
-            kinds[@intFromEnum(row.kind)] += 1;
+            kinds[@backingInt(row.kind)] += 1;
             families[if (row.family == .ipv4) @as(usize, 0) else 1] += 1;
             if (row.kind == .s2s) try std.testing.expectEqual(@as(u12, 0), row.shard);
             const flags = posix.system.fcntl(row.fd, posix.F.GETFD, @as(i32, 0));
@@ -107427,7 +107601,7 @@ test "shared full server: native bot staging is allocation-failure atomic" {
 test "Windows native Helix listener manifest verifies exact bound socket roles" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const listener = try reuseport.createWindowsListener("127.0.0.1", 0, 8);
-    defer closeFd(listener);
+    defer closeListenerFd(listener);
     const port = try socketPort(listener);
     const row = ListenerDescriptor{ .shard = 0, .kind = .plain, .family = .ipv6, .fd = listener };
     var cfg = Config{ .host = "127.0.0.1", .port = port, .num_shards = 3, .native_listener_manifest = &.{row} };
@@ -108421,6 +108595,16 @@ test "ring: poll op fires a completion when a watched eventfd becomes readable" 
     } else return error.SkipZigTest;
 }
 
+test "ringlane optional-feature fallback classifies unsupported-operation errnos only" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    inline for (.{ linux.E.OPNOTSUPP, linux.E.INVAL, linux.E.NOSYS, linux.E.PERM, linux.E.ACCES }) |errno| {
+        try std.testing.expect(LinuxServer.isOptionalIoUringUnsupportedResult(-@as(i32, @backingInt(errno))));
+    }
+    try std.testing.expect(!LinuxServer.isOptionalIoUringUnsupportedResult(0));
+    try std.testing.expect(!LinuxServer.isOptionalIoUringUnsupportedResult(-@as(i32, @backingInt(linux.E.IO))));
+    try std.testing.expect(!LinuxServer.isOptionalIoUringUnsupportedResult(-@as(i32, @backingInt(linux.E.PIPE))));
+}
+
 test "ringlane multishot recv copies into the connection and zero-copy send waits for notif" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -108450,7 +108634,7 @@ test "ringlane multishot recv copies into the connection and zero-copy send wait
     try std.testing.expect((server.rx().ring.inner.flags & linux.IORING_SETUP_SINGLE_ISSUER) == 0);
 
     const listener = createListener("127.0.0.1", 0, 8) catch return error.SkipZigTest;
-    defer closeFd(listener);
+    defer closeListenerFd(listener);
     const port = socketPort(listener) catch return error.SkipZigTest;
     const client = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(client);
@@ -108542,6 +108726,307 @@ test "ringlane multishot recv copies into the connection and zero-copy send wait
     }
     try std.testing.expectEqual(outbound.len, n);
     try std.testing.expectEqualSlices(u8, outbound, got[0..outbound.len]);
+}
+
+test "ringlane unsupported optional recv and SEND_ZC fall back without changing bytes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_clients = 2,
+        .features = .{ .buf_ring = true, .multishot_recv = true, .send_zc = true },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+
+    const listener = createListener("127.0.0.1", 0, 8) catch return error.SkipZigTest;
+    defer closeListenerFd(listener);
+    const client = connectLoopback(socketPort(listener) catch return error.SkipZigTest) catch return error.SkipZigTest;
+    defer closeFd(client);
+    const client_two = connectLoopback(socketPort(listener) catch return error.SkipZigTest) catch return error.SkipZigTest;
+    defer closeFd(client_two);
+    const client_flags = linux.fcntl(client, posix.F.GETFL, 0);
+    if (posix.errno(client_flags) == .SUCCESS)
+        _ = linux.fcntl(client, posix.F.SETFL, client_flags | posix.SOCK.NONBLOCK);
+    const client_two_flags = linux.fcntl(client_two, posix.F.GETFL, 0);
+    if (posix.errno(client_two_flags) == .SUCCESS)
+        _ = linux.fcntl(client_two, posix.F.SETFL, client_two_flags | posix.SOCK.NONBLOCK);
+    const accepted_rc = linux.accept4(listener, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+    if (posix.errno(accepted_rc) != .SUCCESS) return error.SkipZigTest;
+    const accepted: linux.fd_t = @intCast(accepted_rc);
+    const accepted_two_rc = linux.accept4(listener, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+    if (posix.errno(accepted_two_rc) != .SUCCESS) return error.SkipZigTest;
+    const accepted_two: linux.fd_t = @intCast(accepted_two_rc);
+
+    const id = try server.reactors[0].clients.alloc(ConnState.init(accepted));
+    const conn = server.reactors[0].clients.get(id) orelse return error.TestUnexpectedResult;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    const id_two = try server.reactors[0].clients.alloc(ConnState.init(accepted_two));
+    const conn_two = server.reactors[0].clients.get(id_two) orelse return error.TestUnexpectedResult;
+    conn_two.overflow_allocator = allocator;
+    conn_two.token = try tokenFromId(id_two);
+
+    // Both requests were submitted before the first unsupported result disables
+    // the feature for this ring. Their per-connection ownership must still let
+    // each CQE enter fallback independently.
+    server.rx().ring.features.multishot_recv = true;
+    conn.recv_armed = true;
+    conn.recv_multishot_armed = true;
+    conn_two.recv_armed = true;
+    conn_two.recv_multishot_armed = true;
+    try server.handleRecv(.{
+        .token = conn.token,
+        .res = -@as(i32, @backingInt(linux.E.INVAL)),
+        .more = false,
+    });
+    try std.testing.expect(!server.rx().ring.features.multishot_recv);
+    try std.testing.expect(conn.recv_armed);
+    try std.testing.expect(!conn.recv_multishot_armed);
+    try std.testing.expect(!conn.closing);
+    try server.handleRecv(.{
+        .token = conn_two.token,
+        .res = -@as(i32, @backingInt(linux.E.INVAL)),
+        .more = false,
+    });
+    try std.testing.expect(conn_two.recv_armed);
+    try std.testing.expect(!conn_two.recv_multishot_armed);
+    try std.testing.expect(!conn_two.closing);
+
+    const inbound = "PING :recv-a\r\n";
+    const inbound_two = "PING :recv-b\r\n";
+    const wrote_in = linux.write(client, inbound.ptr, inbound.len);
+    if (posix.errno(wrote_in) != .SUCCESS or wrote_in != inbound.len) return error.TestUnexpectedResult;
+    const wrote_in_two = linux.write(client_two, inbound_two.ptr, inbound_two.len);
+    if (posix.errno(wrote_in_two) != .SUCCESS or wrote_in_two != inbound_two.len) return error.TestUnexpectedResult;
+
+    const Handler = struct {
+        server: *Server,
+        err: ?anyerror = null,
+        pub fn onCompletion(self: *@This(), completion: ringlane.Completion) void {
+            switch (completion) {
+                .recv => |event| self.server.handleRecv(event) catch |err| {
+                    self.err = err;
+                },
+                .send => |event| self.server.handleSend(event) catch |err| {
+                    self.err = err;
+                },
+                else => {},
+            }
+        }
+    };
+    var handler = Handler{ .server = server };
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    server.rx().ring.features.send_zc = false;
+    const pong = ":onyx.local PONG onyx.local :recv-a\r\n";
+    const pong_two = ":onyx.local PONG onyx.local :recv-b\r\n";
+    var response: [128]u8 = undefined;
+    var response_two: [128]u8 = undefined;
+    var response_len: usize = 0;
+    var response_two_len: usize = 0;
+    var spins: u8 = 0;
+    while ((response_len < pong.len or response_two_len < pong_two.len) and spins < 32) : (spins += 1) {
+        _ = try server.rx().ring.submitAndWait(1);
+        try server.rx().ring.reapCompletions(&cqes, 0, &handler);
+        if (handler.err) |err| return err;
+        if (response_len < pong.len) {
+            const read_rc = linux.read(client, response[response_len..].ptr, response.len - response_len);
+            if (posix.errno(read_rc) == .SUCCESS) {
+                if (read_rc == 0) return error.TestUnexpectedResult;
+                response_len += read_rc;
+            } else if (posix.errno(read_rc) != .AGAIN) return error.TestUnexpectedResult;
+        }
+        if (response_two_len < pong_two.len) {
+            const read_rc = linux.read(client_two, response_two[response_two_len..].ptr, response_two.len - response_two_len);
+            if (posix.errno(read_rc) == .SUCCESS) {
+                if (read_rc == 0) return error.TestUnexpectedResult;
+                response_two_len += read_rc;
+            } else if (posix.errno(read_rc) != .AGAIN) return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqual(pong.len, response_len);
+    try std.testing.expectEqualSlices(u8, pong, response[0..response_len]);
+    try std.testing.expectEqual(pong_two.len, response_two_len);
+    try std.testing.expectEqualSlices(u8, pong_two, response_two[0..response_two_len]);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(!conn_two.closing);
+    try std.testing.expect(conn.recv_armed);
+    try std.testing.expect(conn_two.recv_armed);
+    try std.testing.expect(!conn.send_armed);
+    try std.testing.expect(!conn_two.send_armed);
+
+    // A retains its submitted range across the unsupported data CQE's MORE
+    // notification; B proves its already-submitted SEND_ZC is still recognized
+    // after A disabled the ring-wide feature.
+    const outbound = "zero-copy-tail-a";
+    const outbound_two = "zero-copy-tail-b";
+    @memcpy(conn.send_buf[0..outbound.len], outbound);
+    conn.send_len = outbound.len;
+    conn.send_offset = 0;
+    conn.send_submitted_len = outbound.len;
+    conn.send_submitted_offset = 0;
+    conn.send_armed = true;
+    conn.send_zc_armed = true;
+    server.rx().ring.features.send_zc = true;
+    try server.handleSend(.{
+        .token = conn.token,
+        .res = -@as(i32, @backingInt(linux.E.ACCES)),
+        .more = true,
+        .notif = false,
+    });
+    try std.testing.expect(!server.rx().ring.features.send_zc);
+    try std.testing.expect(conn.send_armed);
+    try std.testing.expect(conn.send_zc_armed);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_offset);
+    try std.testing.expectEqual(outbound.len, conn.send_submitted_len);
+    try std.testing.expectEqualSlices(u8, outbound, conn.send_buf[0..conn.send_len]);
+
+    @memcpy(conn_two.send_buf[0..outbound_two.len], outbound_two);
+    conn_two.send_len = outbound_two.len;
+    conn_two.send_offset = 0;
+    conn_two.send_submitted_len = outbound_two.len;
+    conn_two.send_submitted_offset = 0;
+    conn_two.send_armed = true;
+    conn_two.send_zc_armed = true;
+    try server.handleSend(.{
+        .token = conn_two.token,
+        .res = -@as(i32, @backingInt(linux.E.INVAL)),
+        .more = false,
+        .notif = false,
+    });
+    try std.testing.expect(conn_two.send_armed);
+    try std.testing.expect(!conn_two.send_zc_armed);
+    try std.testing.expectEqual(@as(usize, 0), conn_two.send_offset);
+    try std.testing.expectEqual(outbound_two.len, conn_two.send_submitted_len);
+
+    // The SEND_ZC notification releases A's original buffer and triggers an
+    // exact copy retry of the still-unaccepted tail.
+    try server.handleSend(.{
+        .token = conn.token,
+        .res = 0,
+        .more = false,
+        .notif = true,
+    });
+    try std.testing.expect(!conn.send_zc_armed);
+    try std.testing.expect(conn.send_armed);
+
+    spins = 0;
+    while ((conn.send_armed or conn_two.send_armed) and spins < 16) : (spins += 1) {
+        _ = try server.rx().ring.submitAndWait(1);
+        try server.rx().ring.reapCompletions(&cqes, 0, &handler);
+        if (handler.err) |err| return err;
+    }
+    try std.testing.expect(!conn.send_armed);
+    try std.testing.expect(!conn_two.send_armed);
+    var received: [64]u8 = undefined;
+    var received_two: [64]u8 = undefined;
+    var received_len: usize = 0;
+    var received_two_len: usize = 0;
+    var reads: u8 = 0;
+    while ((received_len < outbound.len or received_two_len < outbound_two.len) and reads < 16) : (reads += 1) {
+        if (received_len < outbound.len) {
+            const read_rc = linux.read(client, received[received_len..].ptr, received.len - received_len);
+            if (posix.errno(read_rc) == .SUCCESS) {
+                if (read_rc == 0) return error.TestUnexpectedResult;
+                received_len += read_rc;
+            } else if (posix.errno(read_rc) == .AGAIN) {
+                std.Thread.yield() catch {};
+            } else return error.TestUnexpectedResult;
+        }
+        if (received_two_len < outbound_two.len) {
+            const read_two_rc = linux.read(client_two, received_two[received_two_len..].ptr, received_two.len - received_two_len);
+            if (posix.errno(read_two_rc) == .SUCCESS) {
+                if (read_two_rc == 0) return error.TestUnexpectedResult;
+                received_two_len += read_two_rc;
+            } else if (posix.errno(read_two_rc) == .AGAIN) {
+                std.Thread.yield() catch {};
+            } else return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqual(outbound.len, received_len);
+    try std.testing.expectEqualSlices(u8, outbound, received[0..received_len]);
+    try std.testing.expectEqual(outbound_two.len, received_two_len);
+    try std.testing.expectEqualSlices(u8, outbound_two, received_two[0..received_two_len]);
+
+    // The synthetic unsupported CQE must have produced only one copy-send
+    // submission. Give a duplicate completion a bounded chance to surface.
+    var quiet_reads: u8 = 0;
+    while (quiet_reads < 8) : (quiet_reads += 1) {
+        const extra = linux.read(client, received[0..].ptr, received.len);
+        if (posix.errno(extra) == .SUCCESS) return error.TestUnexpectedResult;
+        if (posix.errno(extra) != .AGAIN) return error.TestUnexpectedResult;
+        const extra_two = linux.read(client_two, received_two[0..].ptr, received_two.len);
+        if (posix.errno(extra_two) == .SUCCESS) return error.TestUnexpectedResult;
+        if (posix.errno(extra_two) != .AGAIN) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+}
+
+test "ringlane fallback-drain terminal cancel finalizes a closing client once" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_clients = 1,
+        .features = .{ .buf_ring = true, .multishot_recv = true, .send_zc = false },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+
+    const listener = createListener("127.0.0.1", 0, 2) catch return error.SkipZigTest;
+    defer closeListenerFd(listener);
+    const client = connectLoopback(socketPort(listener) catch return error.SkipZigTest) catch return error.SkipZigTest;
+    defer closeFd(client);
+    const accepted_rc = linux.accept4(listener, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+    if (posix.errno(accepted_rc) != .SUCCESS) return error.SkipZigTest;
+    const accepted: linux.fd_t = @intCast(accepted_rc);
+    const id = try server.reactors[0].clients.alloc(ConnState.init(accepted));
+    const conn = server.reactors[0].clients.get(id) orelse return error.TestUnexpectedResult;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    server.noteClientAccepted(conn);
+    try std.testing.expectEqual(@as(i64, 1), server.stats.connections_active.load(.acquire));
+
+    // The optional-op CQE reports MORE, so its original request remains owned.
+    conn.recv_armed = true;
+    conn.recv_multishot_armed = true;
+    server.rx().ring.features.multishot_recv = true;
+    try server.handleRecv(.{
+        .token = conn.token,
+        .res = -@as(i32, @backingInt(linux.E.INVAL)),
+        .more = true,
+    });
+    try std.testing.expect(conn.recv_armed);
+    try std.testing.expect(conn.recv_multishot_fallback_drain);
+    try std.testing.expect(!server.rx().ring.features.multishot_recv);
+
+    // Closing cannot recycle inline state while that multishot request remains
+    // kernel-owned. Its terminal cancellation must release and finalize once.
+    try server.closeConn(conn.token, "test close during fallback drain");
+    try std.testing.expect(conn.closing);
+    try std.testing.expect(server.reactors[0].clients.get(id) != null);
+    try server.handleRecv(.{
+        .token = conn.token,
+        .res = -@as(i32, @backingInt(linux.E.CANCELED)),
+        .more = false,
+    });
+    try std.testing.expect(server.reactors[0].clients.get(id) == null);
+    try std.testing.expectEqual(@as(i64, 0), server.stats.connections_active.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), server.stats.connections_total.load(.acquire));
 }
 
 test "threaded server: implicit-TLS client handshakes + registers over the wire" {
@@ -125091,7 +125576,7 @@ test "send error waits for quiet recv CQE and stale generation cannot free reuse
 
     try server.handleSend(.{
         .token = old_token,
-        .res = -@as(i32, @intFromEnum(linux.E.PIPE)),
+        .res = -@as(i32, @backingInt(linux.E.PIPE)),
         .more = false,
         .notif = false,
     });
@@ -125107,7 +125592,7 @@ test "send error waits for quiet recv CQE and stale generation cannot free reuse
     // Only the exact old RECV CQE releases recv_buf and permits final teardown.
     try server.handleRecv(.{
         .token = old_token,
-        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .res = -@as(i32, @backingInt(linux.E.CANCELED)),
         .more = false,
     });
     try std.testing.expect(server.rx().clients.get(old_id) == null);
@@ -125135,7 +125620,7 @@ test "send error waits for quiet recv CQE and stale generation cannot free reuse
     try std.testing.expect(server.rx().clients.get(gap_id) != null);
     try server.handleRecv(.{
         .token = gap.token,
-        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .res = -@as(i32, @backingInt(linux.E.CANCELED)),
         .more = false,
     });
     try std.testing.expect(server.rx().clients.get(gap_id) == null);
@@ -125673,7 +126158,7 @@ test "same-IP mesh dial blocked duplicate drain expires and Helix refuses its pa
     try std.testing.expect(server.rx().clients.get(id) == null);
 }
 
-test "same-IP mesh dial receive caller observes zero-output loser retirement by exact generation" {
+test "same-IP mesh dial receive caller drains extension probes before exact-generation retirement" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     defer current_reactor = null;
     const alloc = std.testing.allocator;
@@ -125707,7 +126192,8 @@ test "same-IP mesh dial receive caller observes zero-output loser retirement by 
         links[1].clearOutbound();
         links[0].clearOutbound();
         // This initiator's own handshake and burst already crossed its send
-        // boundary. Receiving the remote HELLO now produces no output.
+        // boundary. Receiving the remote HELLO emits bounded capability PING
+        // probes from S2sPeer.recvHandshake; the collision loser must drain them.
         try links[2].start(20);
         links[2].clearOutbound();
         links[2].peer.burst_sent = true;
@@ -125719,9 +126205,9 @@ test "same-IP mesh dial receive caller observes zero-output loser retirement by 
         defer server.deinit();
         // A repeated low-severity LINK announcement may already be collapsed.
         // That ordinary runtime case leaves this final drive with no audit tail
-        // to accidentally keep its slot alive after the zero-output handshake.
+        // to accidentally keep its slot alive after the probe-producing handshake.
         for (0..event_collapse_mod.default_threshold) |_| {
-            try std.testing.expect(server.event_collapse.admit(@intFromEnum(event_spine.EventCategory.server_link), @intFromEnum(event_spine.EventSeverity.notice), "SERVER LINK aaa-peer.test", platform.realtimeMillis()));
+            try std.testing.expect(server.event_collapse.admit(@backingInt(event_spine.EventCategory.server_link), @backingInt(event_spine.EventSeverity.notice), "SERVER LINK aaa-peer.test", platform.realtimeMillis()));
         }
         current_reactor = &server.reactors[0];
         const old_id = try server.rx().clients.alloc(ConnState.init(-1));
@@ -125746,19 +126232,29 @@ test "same-IP mesh dial receive caller observes zero-output loser retirement by 
             var handler = CompletionHandler{ .server = server };
             var completions: [8]reactor_backend.CompletionBuffer = undefined;
             const deadline = platform.monotonicMillis() + 3_000;
-            while (server.rx().clients.get(id) != null and platform.monotonicMillis() < deadline) {
+            while (server.rx().clients.get(id) != null and !conn.s2s_dedup and platform.monotonicMillis() < deadline) {
+                _ = try server.rx().ring.submit();
                 try server.rx().ring.reapCompletions(&completions, 0, &handler);
                 sleepOneMillis();
             }
             if (handler.err) |err| return err;
+            try std.testing.expect(server.rx().clients.get(id) != null);
+            try std.testing.expect(conn.s2s_dedup and conn.closing);
         } else {
-            // A false result tells the completion caller not to touch its
-            // original pointer after synchronous collision finalization.
-            try std.testing.expect(!try server.driveClientBytes(id, conn, hello));
+            // driveClientBytes reports whether this exact generation remains
+            // live. The loser stays allocated while its probe SEND drains.
+            try std.testing.expect(try server.driveClientBytes(id, conn, hello));
         }
-        if (server.rx().clients.get(id)) |remaining| {
-            std.debug.print("zero-output collision fixture completion={} closing={} dedup={} recv={} send={} backlog={d} retained={d} deadline={d}\n", .{ through_completion, remaining.closing, remaining.s2s_dedup, remaining.recv_armed, remaining.send_armed, connSendBacklog(remaining), if (remaining.s2s) |l| l.outbound().len else @as(usize, 0), remaining.s2s_dedup_drain_deadline_ms });
-        }
+        const remaining = server.rx().clients.get(id) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(remaining.closing and remaining.s2s_dedup);
+        const expected_drain = try copyTestSendQ(alloc, remaining);
+        defer alloc.free(expected_drain);
+        try std.testing.expect(expected_drain.len != 0);
+        try std.testing.expect(remaining.send_armed and remaining.s2s_dedup_drain_deadline_ms != 0);
+        // PING extension probes are legitimate handshake output. Submit the
+        // retained SEND, compare its exact wire bytes, and wait for EOF from the
+        // normal drain finalizer before reusing this slot.
+        try readSameIPDrainWire(server, sockets[1], expected_drain, true);
         try std.testing.expect(server.rx().clients.get(id) == null);
         const replacement = try server.rx().clients.alloc(ConnState.init(-1));
         try std.testing.expectEqual(id.slot, replacement.slot);
@@ -128818,9 +129314,9 @@ const LiveUpgradeTestNode = struct {
         // successor rebinds that configured port. Model that same boundary only
         // after capture and join; every carried client/peer fd remains held.
         for (self.server.reactors) |*reactor| {
-            closeFd(reactor.s2s_listener_fd);
+            closeListenerFd(reactor.s2s_listener_fd);
             reactor.s2s_listener_fd = -1;
-            closeFd(reactor.s2s_listener_companion_fd);
+            closeListenerFd(reactor.s2s_listener_companion_fd);
             reactor.s2s_listener_companion_fd = -1;
         }
         const successor = try createTestServer(self.allocator, successor_config);
@@ -132444,7 +132940,7 @@ test "UPGRADE authoritative manifest accepts only open connected stream sockets"
     defer for (pipe_fds) |fd| closeFd(fd);
 
     const rogue_listener = createListener("127.0.0.1", 0, 1) catch return error.SkipZigTest;
-    defer closeFd(rogue_listener);
+    defer closeListenerFd(rogue_listener);
 
     // Allocate and close this last so its numeric slot cannot be reused by a
     // later setup syscall before the rejection is exercised.
@@ -134287,7 +134783,7 @@ test "same-nick exact sibling close keeps restored mesh membership live" {
     try std.testing.expect(retained_claimant.send_armed);
     try server.handleSend(.{
         .token = claimant_token,
-        .res = -@as(i32, @intFromEnum(linux.E.CANCELED)),
+        .res = -@as(i32, @backingInt(linux.E.CANCELED)),
         .more = false,
         .notif = false,
     });
@@ -136565,7 +137061,7 @@ fn wakeAndJoinProbe(probe: *OutboundHookProbe, port: u16, proceed: *std.Io.Event
 
 fn exerciseDrainedProbeReadiness(force_blocking: bool, cleanup: *ProbeCleanupObservation) !void {
     const listener = try bindLoopback(true);
-    defer closeFd(listener.fd);
+    defer closeListenerFd(listener.fd);
     if (force_blocking) {
         const old = socket_system.fcntl(listener.fd, posix.F.GETFL, @as(c_int, 0));
         if (posix.errno(old) != .SUCCESS) return error.Unexpected;
@@ -137095,7 +137591,7 @@ test "HTTPS outbound webhook reaches pinned address with injected trust anchor" 
         }
     };
     const listener = try bindLoopback(true);
-    defer closeFd(listener.fd);
+    defer closeListenerFd(listener.fd);
     var probe = Probe{ .listener = listener.fd, .chain = &chain, .key_pair = kp };
     const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
     var joined = false;

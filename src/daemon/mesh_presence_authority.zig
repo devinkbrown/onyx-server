@@ -2362,7 +2362,7 @@ fn namespaceFingerprintForTest(dir: std.Io.Dir) ![32]u8 {
     while (try iterator.next(std.testing.io)) |entry| {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(entry.name);
-        hash.update(&.{@intFromEnum(entry.kind)});
+        hash.update(&.{@backingInt(entry.kind)});
         var part: [32]u8 = undefined;
         hash.final(&part);
         for (&result, part) |*byte, value| byte.* ^= value;
@@ -3073,7 +3073,7 @@ fn waitLiveCompactionKill(pid: std.posix.pid_t) !void {
         while (true) {
             const result = if (comptime os == .linux) @as(isize, @bitCast(std.os.linux.wait4(pid, &discarded, 0, null))) else std.posix.system.waitpid(pid, &discarded, 0);
             if (result == pid) break;
-            if (result < 0 and (if (comptime os == .linux) std.os.linux.errno(@bitCast(result)) else std.posix.errno(result)) == .INTR) continue;
+            if (result < 0 and (if (comptime os == .linux) std.os.linux.errno(@as(usize, @bitCast(result))) else std.posix.errno(result)) == .INTR) continue;
             break;
         }
     };
@@ -3086,7 +3086,7 @@ fn waitLiveCompactionKill(pid: std.posix.pid_t) !void {
             return;
         }
         if (result < 0) {
-            if ((if (comptime os == .linux) std.os.linux.errno(@bitCast(result)) else std.posix.errno(result)) == .INTR) continue;
+            if ((if (comptime os == .linux) std.os.linux.errno(@as(usize, @bitCast(result))) else std.posix.errno(result)) == .INTR) continue;
             return error.TestUnexpectedResult;
         }
         try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);

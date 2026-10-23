@@ -3,6 +3,7 @@
 
 //! Self-contained symmetric + X25519 double ratchet for Onyx Server channels.
 const std = @import("std");
+const zig_compat = @import("zig_compat.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -350,7 +351,7 @@ fn rootForTests() RootKey {
 }
 
 fn kp(byte: u8) !X25519.KeyPair {
-    return try X25519.KeyPair.generateDeterministic(seed(byte));
+    return try zig_compat.x25519GenerateDeterministic(seed(byte));
 }
 
 fn pairForTests(max_skip: u32) !struct { alice: Ratchet, bob: Ratchet } {

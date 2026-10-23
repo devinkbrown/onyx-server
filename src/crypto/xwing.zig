@@ -14,6 +14,7 @@
 //! ciphertext and public key in the final combiner.
 const std = @import("std");
 const Secret = @import("secret.zig").Secret;
+const zig_compat = @import("zig_compat.zig");
 
 const Sha3_256 = std.crypto.hash.sha3.Sha3_256;
 const Shake256 = std.crypto.hash.sha3.Shake256;
@@ -99,7 +100,7 @@ pub fn encapsulateDeterministic(pk: PublicKey, seed: [encaps_seed_len]u8) Error!
     defer secureZero(&pq.shared_secret);
 
     const ek_x = seed[MlKem768.encaps_seed_length..encaps_seed_len].*;
-    const ct_x = X25519.recoverPublicKey(ek_x) catch return error.LowOrderPoint;
+    const ct_x = zig_compat.x25519RecoverPublicKey(ek_x) catch return error.LowOrderPoint;
     const ss_x = X25519.scalarmult(ek_x, pk_x) catch return error.LowOrderPoint;
     try rejectAllZero(ss_x);
 
@@ -172,7 +173,7 @@ fn expandDecapsulationKey(seed: [secret_key_len]u8) Error!ExpandedSecret {
     const kp_m = try MlKem768.KeyPair.generateDeterministic(mlkem_seed);
 
     const sk_x = expanded_bytes[MlKem768.seed_length..expanded_secret_len].*;
-    const pk_x = X25519.recoverPublicKey(sk_x) catch return error.LowOrderPoint;
+    const pk_x = zig_compat.x25519RecoverPublicKey(sk_x) catch return error.LowOrderPoint;
 
     return .{
         .sk_m = kp_m.secret_key,

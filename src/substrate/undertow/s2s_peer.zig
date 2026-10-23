@@ -3132,7 +3132,7 @@ pub const S2sPeer = struct {
     }
 
     fn meshpassFrameFamilyBit(family: meshpass.FrameFamily) u32 {
-        return @as(u32, 1) << @as(u5, @intCast(@intFromEnum(family)));
+        return @as(u32, 1) << @as(u5, @intCast(@backingInt(family)));
     }
 
     /// Install (or clear) the daemon's residence-proof verifier. Borrowed; the
@@ -3288,7 +3288,7 @@ pub const S2sPeer = struct {
         const kp = &self.signing_key.?;
         const buf = try self.allocator.alloc(u8, signed_frame.header_len + payload.len);
         defer self.allocator.free(buf);
-        const env = try signed_frame.wrap(buf, kp, @intFromEnum(frame_type), payload);
+        const env = try signed_frame.wrap(buf, kp, @backingInt(frame_type), payload);
         try emitFrame(self.allocator, sink, frame_type, env);
     }
 
@@ -3318,7 +3318,7 @@ pub const S2sPeer = struct {
             self.rejected_signature_frames +|= 1;
             return null;
         };
-        if (!signed_frame.verify(u, @intFromEnum(frame_type))) {
+        if (!signed_frame.verify(u, @backingInt(frame_type))) {
             self.rejected_signature_frames +|= 1;
             return null;
         }
@@ -4632,7 +4632,7 @@ fn encodeGossip(allocator: Allocator, payload: *const gossip_round.GossipPayload
     try writeVarint(&out, allocator, payload.member_deltas.items.len);
     for (payload.member_deltas.items) |delta| {
         try writeU64(&out, allocator, delta.id);
-        try out.append(allocator, @intFromEnum(delta.state));
+        try out.append(allocator, @backingInt(delta.state));
         try writeU64(&out, allocator, delta.incarnation);
     }
     try writeVarint(&out, allocator, payload.suspicions.items.len);
@@ -4738,7 +4738,7 @@ fn encodeRepairResponse(allocator: Allocator, response: *const anti_entropy_repa
     try writeVersionVector(&out, allocator, response.vv);
     try writeVarint(&out, allocator, response.records.len);
     for (response.records) |record| {
-        try out.append(allocator, @intFromEnum(record.kind));
+        try out.append(allocator, @backingInt(record.kind));
         try writeBytes(&out, allocator, record.key);
         try writeBytes(&out, allocator, record.payload);
     }
@@ -6178,7 +6178,7 @@ test "E2EEGROUP ACK is domain separated authenticated deduplicated bounded and c
     const retry_env = try signed_frame.wrap(
         &retry_env_buf,
         &b.signing_key.?,
-        @intFromEnum(s2s_frame.FrameType.E2EE_GROUP_ACK),
+        @backingInt(s2s_frame.FrameType.E2EE_GROUP_ACK),
         &retry_id,
     );
     {
@@ -6218,7 +6218,7 @@ test "E2EEGROUP ACK is domain separated authenticated deduplicated bounded and c
     const wrong_domain = try signed_frame.wrap(
         &wrong_domain_buf,
         &b.signing_key.?,
-        @intFromEnum(s2s_frame.FrameType.MESSAGE_V2_ACK),
+        @backingInt(s2s_frame.FrameType.MESSAGE_V2_ACK),
         &first,
     );
     try emitFrame(allocator, b_to_a.sink(), .E2EE_GROUP_ACK, wrong_domain);
@@ -8218,7 +8218,11 @@ test "exact-token collision rename is atomic across both identities and deltas o
 
 test "session token revoke allocation failure retains membership for retry" {
     const Sweep = struct {
-        fn run(allocator: std.mem.Allocator) !void {
+        fn run(
+            allocator: std.mem.Allocator,
+            failing: *std.testing.FailingAllocator,
+            fail_after_setup: ?usize,
+        ) !usize {
             var tc = TestClock{ .now_ms = 10 };
             var state = ChannelCrdt.init(allocator, 1);
             defer state.deinit();
@@ -8233,6 +8237,8 @@ test "session token revoke allocation failure retains membership for retry" {
                 .account = "a",
                 .session_token = token,
             }, 10);
+            const revoke_alloc_start = failing.alloc_index;
+            if (fail_after_setup) |offset| failing.fail_index = revoke_alloc_start + offset;
             const revoked = peer.reconcileSessionToken(token, null, &.{}) catch |err| {
                 // Every MembershipDelta string/list allocation precedes route
                 // deletion. Any OOM therefore leaves the exact row available
@@ -8242,6 +8248,7 @@ test "session token revoke allocation failure retains membership for retry" {
                 try std.testing.expectEqual(@as(usize, 0), peer.membership_changes.items.len);
                 return err;
             };
+            const revoke_allocation_count = failing.alloc_index - revoke_alloc_start;
             try std.testing.expectEqual(@as(usize, 1), revoked.removed);
             try std.testing.expectEqual(@as(usize, 0), peer.channelMembers("#room").len);
             const changes = try peer.takeMembershipChanges();
@@ -8249,9 +8256,31 @@ test "session token revoke allocation failure retains membership for retry" {
             try std.testing.expectEqual(@as(usize, 1), changes.len);
             try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.parted, changes[0].kind);
             for (changes) |*change| change.deinit(allocator);
+            return revoke_allocation_count;
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+
+    // RouteTable's derived best-nick claim index is explicitly best-effort: an
+    // allocation failure there marks the cache dirty and leaves the roster as
+    // authority, so revoke can still complete successfully. Exercise every
+    // allocation cut while accepting that cache-only OOM, and keep the semantic
+    // assertions in Sweep.run as the gate for any successful revoke.
+    var baseline = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocation_count = try Sweep.run(baseline.allocator(), &baseline, null);
+    try std.testing.expectEqual(baseline.allocated_bytes, baseline.freed_bytes);
+
+    for (0..allocation_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const result = Sweep.run(failing.allocator(), &failing, fail_index);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (result) |_| {
+            // Sweep.run verified the revoked roster and exact single PART.
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        }
+    }
 }
 
 test "rejected downgraded MEMBERSHIP creates no UID route delta or roster entry" {
@@ -9021,7 +9050,7 @@ test "a forged frame (wrong signature) is rejected and counted" {
     };
     const inner = try channel_prop_event.encode(ev, &ev_buf);
     var env_buf: [512]u8 = undefined;
-    const env = try signed_frame.wrap(&env_buf, &kp_a, @intFromEnum(s2s_frame.FrameType.CHANNEL_PROP), inner);
+    const env = try signed_frame.wrap(&env_buf, &kp_a, @backingInt(s2s_frame.FrameType.CHANNEL_PROP), inner);
     env[signed_frame.pubkey_len] ^= 0x80; // corrupt the signature
 
     var fbuf: [1024]u8 = undefined;
@@ -9078,7 +9107,7 @@ test "a forged frame (attacker key, origin mismatch) is rejected and counted" {
     };
     const inner = try channel_prop_event.encode(ev, &ev_buf);
     var env_buf: [512]u8 = undefined;
-    const env = try signed_frame.wrap(&env_buf, &kp_x, @intFromEnum(s2s_frame.FrameType.CHANNEL_PROP), inner);
+    const env = try signed_frame.wrap(&env_buf, &kp_x, @backingInt(s2s_frame.FrameType.CHANNEL_PROP), inner);
 
     var fbuf: [1024]u8 = undefined;
     const wire = try s2s_frame.encode(.CHANNEL_PROP, env, &fbuf);

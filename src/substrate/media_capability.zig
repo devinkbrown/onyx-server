@@ -49,7 +49,6 @@ pub fn validateFeedbackPayload(bytes: []const u8, seq_out: []u32) feedback.Error
         .nack => |nack| 7 + nack.seqs.len * 4,
         .keyframe_request => 5,
         .receiver_report => 18,
-        else => return error.BadKind,
     };
     if (bytes.len != expected) return error.Truncated;
     return message;

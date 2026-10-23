@@ -11,6 +11,7 @@
 const std = @import("std");
 const hash = @import("hash.zig");
 const Secret = @import("secret.zig").Secret;
+const zig_compat = @import("zig_compat.zig");
 
 const StdX25519 = std.crypto.dh.X25519;
 const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
@@ -57,7 +58,7 @@ pub const X25519Kx = struct {
     }
 
     pub fn generateDeterministic(seed: [seed_len]u8) !KeyPair {
-        const kp = try StdX25519.KeyPair.generateDeterministic(seed);
+        const kp = try zig_compat.x25519GenerateDeterministic(seed);
         return .{
             .public_key = kp.public_key,
             .secret_key = SecretKey.init(kp.secret_key),

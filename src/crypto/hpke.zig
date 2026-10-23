@@ -8,6 +8,7 @@
 //! library. It implements the RFC 9180 base-mode path: DHKEM encapsulation,
 //! key schedule, sequence-number nonces, and single-shot seal/open helpers.
 const std = @import("std");
+const zig_compat = @import("zig_compat.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -58,7 +59,7 @@ pub const KeyPair = struct {
     }
 
     pub fn generateDeterministic(key_seed: [X25519.seed_length]u8) Error!KeyPair {
-        const kp = X25519.KeyPair.generateDeterministic(key_seed) catch return error.InvalidPublicKey;
+        const kp = zig_compat.x25519GenerateDeterministic(key_seed) catch return error.InvalidPublicKey;
         return .{ .public_key = kp.public_key, .secret_key = kp.secret_key };
     }
 
@@ -112,7 +113,7 @@ pub fn encapDeterministic(pk_r: PublicKey, eph_seed: [X25519.seed_length]u8) Err
 }
 
 pub fn decap(enc: Enc, sk_r: SecretKey) Error!SharedSecret {
-    const pk_r = X25519.recoverPublicKey(sk_r) catch return error.InvalidPublicKey;
+    const pk_r = zig_compat.x25519RecoverPublicKey(sk_r) catch return error.InvalidPublicKey;
     var zz = X25519.scalarmult(sk_r, enc) catch return error.InvalidEncapsulatedKey;
     defer secureZero(&zz);
     return extractAndExpand(zz, enc, pk_r);

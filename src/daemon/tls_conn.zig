@@ -1234,7 +1234,9 @@ pub const TlsConn = struct {
         prepared.commit();
         const owned = prepared.takeBytes();
         self.write_buf.deinit(self.allocator);
-        self.write_buf = .{ .items = owned, .capacity = owned.len };
+        self.write_buf = .empty;
+        self.write_buf.items = owned;
+        self.write_buf.capacity = owned.len;
         return self.write_buf.items;
     }
 
@@ -1302,7 +1304,7 @@ pub const TlsConn = struct {
         while (true) {
             const wire = try completeRecordLen(buf[pos..]) orelse return .need_more;
             const rec = buf[pos .. pos + wire];
-            if (rec[0] != @intFromEnum(tls_record.ContentType.handshake)) return error.BadRecord;
+            if (rec[0] != @backingInt(tls_record.ContentType.handshake)) return error.BadRecord;
             const frag = rec[tls_record.record_header_len..];
             if (hs_len + frag.len > hs.len) return error.BadHandshake;
             @memcpy(hs[hs_len..][0..frag.len], frag);
@@ -1454,9 +1456,9 @@ const tls_handshake_key_update: u8 = 24;
 /// violation ⇒ `.fault` (close), never a silent continue.
 fn classifyKtlsRecord(record_type: u8, plaintext: []u8) KtlsRxRecord {
     return switch (record_type) {
-        @intFromEnum(ktls.RecordType.application_data) => .{ .app_data = plaintext },
-        @intFromEnum(ktls.RecordType.handshake) => parseKeyUpdate(plaintext),
-        @intFromEnum(ktls.RecordType.alert) => .close_notify,
+        @backingInt(ktls.RecordType.application_data) => .{ .app_data = plaintext },
+        @backingInt(ktls.RecordType.handshake) => parseKeyUpdate(plaintext),
+        @backingInt(ktls.RecordType.alert) => .close_notify,
         // change_cipher_spec (a legal no-op mid-handshake) has no business after
         // the handshake on a kTLS conn, and any other type is unknown — fail-safe.
         else => .fault,
@@ -1910,8 +1912,8 @@ test "kTLS RX offload: the kernel decrypts client records into recv() plaintext"
     const rr2 = try ktls.recvmsgRecordType(server_fd, &demux_buf, 0);
     // Observed on this kernel (7.0.3): record_type=22 (handshake), n=5 (the
     // KeyUpdate handshake message: 4-byte header + 1-byte update_request).
-    try std.testing.expectEqual(@intFromEnum(ktls.RecordType.handshake), rr2.record_type);
-    try std.testing.expect(rr2.record_type != @intFromEnum(ktls.RecordType.application_data));
+    try std.testing.expectEqual(@backingInt(ktls.RecordType.handshake), rr2.record_type);
+    try std.testing.expect(rr2.record_type != @backingInt(ktls.RecordType.application_data));
     // The daemon-level classifier maps that to `.key_update` (consume + continue),
     // never `.app_data` and never a hard fault ⇒ no spurious drop.
     try std.testing.expect(classifyKtlsRecord(rr2.record_type, rr2.plaintext) == .key_update);
@@ -1942,7 +1944,7 @@ test "kTLS RX offload: the kernel decrypts client records into recv() plaintext"
     if (ktls.recvmsgRecordType(server_fd, &after_buf, linux.MSG.DONTWAIT)) |ok| {
         // Whatever came back, it must NOT be the new-key plaintext delivered as a
         // clean application_data record.
-        try std.testing.expect(!(ok.record_type == @intFromEnum(ktls.RecordType.application_data) and
+        try std.testing.expect(!(ok.record_type == @backingInt(ktls.RecordType.application_data) and
             std.mem.eql(u8, ok.plaintext, "post-rekey app data")));
     } else |err| {
         // The stale RX key cannot open the rotated record: a rekey signal or a
@@ -2155,40 +2157,40 @@ test "kTLS RX rekey continuity: a client KeyUpdate survives with zero dropped by
 test "classifyKtlsRecord maps TLS content types to recv-loop actions" {
     var pt = [_]u8{ 1, 2, 3 };
     // application_data ⇒ feed the plaintext buffer.
-    switch (classifyKtlsRecord(@intFromEnum(ktls.RecordType.application_data), &pt)) {
+    switch (classifyKtlsRecord(@backingInt(ktls.RecordType.application_data), &pt)) {
         .app_data => |d| try std.testing.expectEqualSlices(u8, &pt, d),
         else => return error.TestUnexpectedResult,
     }
     // handshake ⇒ a KeyUpdate, with the update_requested flag read from the wire.
     // update_not_requested(0): continue (advance RX key, no reply owed).
     var ku_not = [_]u8{ 24, 0, 0, 1, 0 };
-    switch (classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &ku_not)) {
+    switch (classifyKtlsRecord(@backingInt(ktls.RecordType.handshake), &ku_not)) {
         .key_update => |k| try std.testing.expect(!k.request_peer),
         else => return error.TestUnexpectedResult,
     }
     // update_requested(1): the flag is surfaced so the daemon can honor the reply
     // obligation (RFC 8446 §4.6.3) — spec-safe close in the offloaded-TX case.
     var ku_req = [_]u8{ 24, 0, 0, 1, 1 };
-    switch (classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &ku_req)) {
+    switch (classifyKtlsRecord(@backingInt(ktls.RecordType.handshake), &ku_req)) {
         .key_update => |k| try std.testing.expect(k.request_peer),
         else => return error.TestUnexpectedResult,
     }
     // Fail-closed: a handshake record that is not exactly one well-formed KeyUpdate
     // ⇒ .fault (close), never a silent continue. Wrong length, wrong type, wrong
     // uint24 length prefix, and an out-of-range request value are each rejected.
-    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &pt) == .fault);
+    try std.testing.expect(classifyKtlsRecord(@backingInt(ktls.RecordType.handshake), &pt) == .fault);
     var bad_type = [_]u8{ 20, 0, 0, 1, 0 }; // finished(20), not key_update
-    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &bad_type) == .fault);
+    try std.testing.expect(classifyKtlsRecord(@backingInt(ktls.RecordType.handshake), &bad_type) == .fault);
     var bad_len = [_]u8{ 24, 0, 0, 2, 0 }; // uint24 length 2, not 1
-    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &bad_len) == .fault);
+    try std.testing.expect(classifyKtlsRecord(@backingInt(ktls.RecordType.handshake), &bad_len) == .fault);
     var bad_req = [_]u8{ 24, 0, 0, 1, 2 }; // request value 2 ∉ {0,1}
-    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &bad_req) == .fault);
+    try std.testing.expect(classifyKtlsRecord(@backingInt(ktls.RecordType.handshake), &bad_req) == .fault);
     var coalesced = [_]u8{ 24, 0, 0, 1, 0, 24, 0, 0, 1, 0 }; // two KeyUpdates
-    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.handshake), &coalesced) == .fault);
+    try std.testing.expect(classifyKtlsRecord(@backingInt(ktls.RecordType.handshake), &coalesced) == .fault);
     // alert (close_notify) ⇒ graceful close.
-    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.alert), &pt) == .close_notify);
+    try std.testing.expect(classifyKtlsRecord(@backingInt(ktls.RecordType.alert), &pt) == .close_notify);
     // change_cipher_spec / any unknown type post-handshake ⇒ fail-safe close.
-    try std.testing.expect(classifyKtlsRecord(@intFromEnum(ktls.RecordType.change_cipher_spec), &pt) == .fault);
+    try std.testing.expect(classifyKtlsRecord(@backingInt(ktls.RecordType.change_cipher_spec), &pt) == .fault);
     try std.testing.expect(classifyKtlsRecord(99, &pt) == .fault);
 }
 
@@ -3331,7 +3333,7 @@ test "TLS record limit: adapter with TX offload never returns raw software fatal
     switch (pair.client) {
         .tls13 => |*client| {
             try std.testing.expectError(error.TlsAlert, client.decryptApp(wire));
-            try std.testing.expectEqual(@as(u8, 22), @intFromEnum(client.last_alert.?.description));
+            try std.testing.expectEqual(@as(u8, 22), @backingInt(client.last_alert.?.description));
         },
         else => unreachable,
     }
@@ -3387,7 +3389,7 @@ fn recordLimitMalformed12Proof(oversized: bool) !void {
                 const wire = try a.alloc(u8, tls_record.record_header_len + length);
                 defer a.free(wire);
                 @memset(wire, 0);
-                wire[0] = @intFromEnum(tls_record.ContentType.application_data);
+                wire[0] = @backingInt(tls_record.ContentType.application_data);
                 wire[1] = 3;
                 wire[2] = 3;
                 std.mem.writeInt(u16, wire[3..5], @intCast(wire.len - tls_record.record_header_len), .big);
@@ -3566,7 +3568,7 @@ test "TLS record limit: adapter pending KU transfer OOM retains exact engine cus
         const pair = try PreparedOutputTestPair.create(.tls13);
         defer pair.destroy();
         const engine = &pair.conn.engine.tls13;
-        try std.testing.expectEqual(@as(u16, 0x1301), @intFromEnum(engine.selected_suite.?));
+        try std.testing.expectEqual(@as(u16, 0x1301), @backingInt(engine.selected_suite.?));
         // Use the actual authenticated pair's RX key and next record sequence.
         // A requested KU leaves the old-key response owned by the engine.
         const inner = [_]u8{ 24, 0, 0, 1, 1, 22 };
@@ -3818,8 +3820,8 @@ fn tls3SuitePair(suite: u16) !*PreparedOutputTestPair {
     _ = try pair.conn.onInbound(finished);
     try std.testing.expect(pair.conn.handshakeDone());
     try std.testing.expect(pair.client.tls13.handshakeDone());
-    try std.testing.expectEqual(suite, @intFromEnum(pair.conn.engine.tls13.selected_suite.?));
-    try std.testing.expectEqual(suite, @intFromEnum(pair.client.tls13.selected_suite.?));
+    try std.testing.expectEqual(suite, @backingInt(pair.conn.engine.tls13.selected_suite.?));
+    try std.testing.expectEqual(suite, @backingInt(pair.client.tls13.selected_suite.?));
     return pair;
 }
 

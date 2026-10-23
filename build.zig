@@ -3,6 +3,16 @@
 
 const std = @import("std");
 
+fn optimizeMode(comptime old_name: []const u8, comptime new_name: []const u8) std.builtin.OptimizeMode {
+    const enum_info = @typeInfo(std.builtin.OptimizeMode).@"enum";
+    inline for (enum_info.field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, old_name) or std.mem.eql(u8, field_name, new_name)) {
+            return @field(std.builtin.OptimizeMode, field_name);
+        }
+    }
+    @compileError("unsupported Zig optimization mode spelling");
+}
+
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
 // executed by an external runner. The functions in `std.Build` implement a DSL
@@ -19,6 +29,10 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const optimize_debug = optimizeMode("Debug", "debug");
+    const optimize_release_fast = optimizeMode("ReleaseFast", "fast");
+    const optimize_release_safe = optimizeMode("ReleaseSafe", "safe");
+    const optimize_release_small = optimizeMode("ReleaseSmall", "small");
 
     // Onyx Server targets 64-bit only (native x86_64/aarch64; the wasm32 browser
     // codec below is the lone, deliberate exception). Reject a 32-bit daemon
@@ -34,7 +48,7 @@ pub fn build(b: *std.Build) void {
     // Strip debug info from optimized builds (smaller, faster-to-load binaries).
     // Debug builds keep symbols for backtraces; test binaries (below) always keep
     // them so failing-test traces stay readable.
-    const strip_release = optimize != .Debug;
+    const strip_release = optimize != optimize_debug;
 
     // Focused testing: `zig build test -Dtest-filter=<substr>` runs only matching
     // tests — a big win on the full suite's compile+run time during iteration.
@@ -739,14 +753,14 @@ pub fn build(b: *std.Build) void {
     const wasm_mod = b.createModule(.{
         .root_source_file = b.path("src/wasm/cadence_wasm.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = optimize_release_small,
         .strip = true,
     });
     // The codecs depend only on std, so expose them as standalone wasm-targeted
     // modules (the full onyx root pulls in io_uring/sockets and won't build
     // freestanding).
-    const wasm_cadencevox = b.createModule(.{ .root_source_file = b.path("src/substrate/cadencevox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
-    const wasm_cadencevis = b.createModule(.{ .root_source_file = b.path("src/substrate/cadencevis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
+    const wasm_cadencevox = b.createModule(.{ .root_source_file = b.path("src/substrate/cadencevox_adpcm.zig"), .target = wasm_target, .optimize = optimize_release_small, .strip = true });
+    const wasm_cadencevis = b.createModule(.{ .root_source_file = b.path("src/substrate/cadencevis_delta.zig"), .target = wasm_target, .optimize = optimize_release_small, .strip = true });
     wasm_mod.addImport("cadencevox_adpcm", wasm_cadencevox);
     wasm_mod.addImport("cadencevis_delta", wasm_cadencevis);
     const wasm = b.addExecutable(.{ .name = "cadence", .root_module = wasm_mod });
@@ -761,7 +775,7 @@ pub fn build(b: *std.Build) void {
     const wasm_transport_mod = b.createModule(.{
         .root_source_file = b.path("src/wasm_transport_root.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = optimize_release_small,
         .strip = true,
     });
     const wasm_transport = b.addExecutable(.{ .name = "onyx_transport", .root_module = wasm_transport_mod });
@@ -962,7 +976,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/windows_pe_stack.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = optimize_release_safe,
         }),
     }) else null;
     // Several full-server fixtures still construct Server by value before
@@ -1113,7 +1127,7 @@ pub fn build(b: *std.Build) void {
     const ct_onyx_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize_release_fast,
         .link_libc = needs_libc,
     });
     ct_onyx_mod.addImport("build_info", build_info_mod);
@@ -1122,7 +1136,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/constant_time_check.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize_release_fast,
             .link_libc = needs_libc,
             .imports = &.{.{ .name = "onyx_server", .module = ct_onyx_mod }},
         }),
@@ -1151,7 +1165,7 @@ pub fn build(b: *std.Build) void {
     // reasoning that gives `ct-check` and `release` their own modules. `-Doptimize`
     // is honored when passed explicitly so a Debug-vs-ReleaseFast comparison is
     // still possible on purpose; the run prints the mode it measured.
-    const bench_optimize = if (b.user_input_options.contains("optimize")) optimize else .ReleaseFast;
+    const bench_optimize = if (b.user_input_options.contains("optimize")) optimize else optimize_release_fast;
     const bench_onyx_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -1423,7 +1437,7 @@ pub fn build(b: *std.Build) void {
     const release_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize_release_fast,
         .link_libc = needs_libc,
         .strip = true,
     });
@@ -1434,7 +1448,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize_release_fast,
             .link_libc = needs_libc,
             .strip = true,
             .imports = &.{.{ .name = "onyx_server", .module = release_mod }},
@@ -1470,7 +1484,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/native_service_helper_main.zig"),
                 .target = target,
-                .optimize = .ReleaseSafe,
+                .optimize = optimize_release_safe,
                 .link_libc = true,
                 .strip = true,
             }),
@@ -1481,7 +1495,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/native_service_policy_main.zig"),
                 .target = target,
-                .optimize = .ReleaseSafe,
+                .optimize = optimize_release_safe,
                 .link_libc = true,
                 .strip = true,
             }),
@@ -1492,7 +1506,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tools/stage_openbsd_service.zig"),
                 .target = b.graph.host,
-                .optimize = .ReleaseSafe,
+                .optimize = optimize_release_safe,
                 .link_libc = b.graph.host.result.os.tag != .linux and b.graph.host.result.os.tag != .windows,
             }),
         });

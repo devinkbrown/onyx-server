@@ -16,6 +16,7 @@
 //! module is transport-agnostic and deterministic, so it slots into the DST
 //! harness now.
 const std = @import("std");
+const zig_compat = @import("zig_compat.zig");
 const random = @import("random.zig");
 
 const ratchet = @import("ratchet.zig");
@@ -59,7 +60,7 @@ fn deriveNextPair(shared: [32]u8, label: []const u8) !X25519.KeyPair {
     h.update(&shared);
     h.update(label);
     h.final(&seed);
-    return X25519.KeyPair.generateDeterministic(seed);
+    return zig_compat.x25519GenerateDeterministic(seed);
 }
 
 /// A 1:1 forward-secret channel over the double ratchet, bootstrapped from an
@@ -155,7 +156,7 @@ pub const SecureGroup = struct {
 const testing = std.testing;
 
 fn pairFromSeed(b: u8) !X25519.KeyPair {
-    return X25519.KeyPair.generateDeterministic(@as([X25519.seed_length]u8, @splat(b)));
+    return zig_compat.x25519GenerateDeterministic(@as([X25519.seed_length]u8, @splat(b)));
 }
 
 test "1:1 channel: HPKE bootstrap + ratchet round-trip both directions" {

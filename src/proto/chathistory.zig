@@ -477,7 +477,8 @@ pub fn HistoryStore(
         }
 
         fn debugAssertContentRefs(self: *const Self) void {
-            if (builtin.mode != .Debug) return;
+            const debug_mode: std.builtin.OptimizeMode = if (comptime builtin.zig_version.pre != null) .Debug else .debug;
+            if (builtin.mode != debug_mode) return;
 
             var content_it = self.contents.iterator();
             while (content_it.next()) |content_entry| {

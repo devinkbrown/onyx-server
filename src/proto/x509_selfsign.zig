@@ -48,6 +48,13 @@ pub const Params = struct {
     ocsp_url: []const u8 = &.{},
     /// Emit the id-pe-tlsfeature extension listing status_request(5) — must-staple.
     must_staple: bool = false,
+    /// Emit the id-ce-delegationUsage extension (RFC 9345 §4.2) — authorizes this
+    /// certificate to sign delegated credentials. Off by default.
+    delegation_usage: bool = false,
+    /// Emit a critical KeyUsage extension asserting digitalSignature (RFC 5280
+    /// §4.2.1.3), required alongside delegationUsage for a delegated-credential leaf.
+    /// Off by default.
+    key_usage_digital_signature: bool = false,
 };
 
 pub const EcdsaP256Params = struct {
