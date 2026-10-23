@@ -45,6 +45,33 @@ Source: struct at `src/daemon/config_format.zig:56`, parsing at `src/daemon/conf
 | `icon_url` | string or null | unset | URL string | IRCv3 network icon: when set, advertised as the `NETWORKICON=<url>` ISUPPORT token (clients may render the logo); omitted when unset. NETWORKICON support (`src/daemon/server.zig` `buildIsupportTokens`, `src/daemon/config_boot.zig`). |
 | `discoverable` | boolean | `false` | `true`/`false` | Opt-in bit for public discovery directories. `status.json` exports `"discoverable":true` only when enabled, so private meshes are not indexed by accident (`src/daemon/server.zig` `buildStatusJson`). |
 
+## `[logging]`
+
+Source: `src/daemon/config_format.zig` (`Logging`), `src/daemon/dlog.zig`, and
+the startup/config-check paths in `src/main.zig`.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---|---|---|
+| `stderr_file` | string | unset | NUL-free path, 1..4095 bytes; Linux only | Append operational stderr to this file. Unset preserves inherited stderr, including a systemd journal sink. Relative paths use the process working directory. |
+
+The destination must be a regular file owned by the daemon user, with mode
+`0600` and one hard link. Final-component symlinks and nonregular destinations
+are rejected. `--check-config` validates the destination and may create it;
+run the check as the daemon user. Existing contents are retained.
+
+The sink is opened on cold startup and each Helix successor. If replacement
+fails at runtime, the daemon reports the error to inherited stderr and continues
+adoption of live connections. Arrange external log rotation; the daemon appends
+without truncating the file.
+
+Connection diagnostics record UTC milliseconds, physical connection identity,
+peer address, escaped nickname, transport, lifecycle events, and socket/TLS error
+categories. They exclude authentication payloads, passwords, session tokens,
+message contents, and arbitrary QUIT text. The process-wide budget is 128
+diagnostic events per fixed one-second window; the next admitted record reports
+suppressed events. This budget applies to connection diagnostics, not every
+operational log line.
+
 ## `[motd]`
 
 Source: struct at `src/daemon/config_format.zig:62`, parsing at `src/daemon/config_format.zig:329`, mapping at `src/daemon/config_boot.zig:21`.
