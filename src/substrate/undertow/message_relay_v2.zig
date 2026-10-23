@@ -24,6 +24,8 @@ pub const relay_id_len: usize = 16;
 pub const RouteId = [route_id_len]u8;
 pub const RelayId = [relay_id_len]u8;
 pub const SessionToken = [16]u8;
+pub const GuestId = [16]u8;
+pub const GuestOrigin = sign.PublicKey;
 pub const Verb = relay_v1.Verb;
 
 pub const sign_domain = "onyx-s2s-relay-msg-v2";
@@ -43,11 +45,17 @@ pub const ScopeKind = enum(u8) {
     /// logical session. Receivers later require that route to be locally
     /// attached to the recipient and joined to the signed channel.
     channel_whisper = 3,
+    /// Direct delivery to one exact ordinary-guest incarnation. Unlike
+    /// `direct`, the destination is not a portable account session and must be
+    /// resolved by (recipient_guest_origin, recipient_guest_id) at each hop.
+    /// This scope is wire schema 3 and requires the negotiated guest-scope cap.
+    direct_guest = 4,
 };
 
 pub const RelayMessage = struct {
-    /// Transcript schema selected by decode. Not encoded as a map field: field
-    /// presence itself distinguishes legacy 16-field v2 from current v2.1.
+    /// Transcript schema selected by decode. Not encoded as a map field:
+    /// presence distinguishes legacy 16-field v2, current 17-field v2.1, and
+    /// the negotiated 19-field guest-recipient v2.2 schema.
     wire_schema: u8 = 2,
     verb: Verb,
     target: []const u8,
@@ -69,6 +77,10 @@ pub const RelayMessage = struct {
     /// One-way identifier for the direct recipient's exact logical session.
     /// Present for `direct` and `channel_whisper`; absent for `channel`.
     recipient_route_id: ?RouteId = null,
+    /// Exact ordinary guest destination. These fields are present only for
+    /// `direct_guest`; they are signed directly and never inferred from nick.
+    recipient_guest_origin: ?GuestOrigin = null,
+    recipient_guest_id: ?GuestId = null,
     origin_node: u64,
     hlc: u64,
     origin_pubkey: []const u8 = "",
@@ -125,11 +137,19 @@ fn routeIdIsNull(id: RouteId) bool {
     return std.mem.allEqual(u8, &id, 0);
 }
 
+fn guestIdIsNull(id: GuestId) bool {
+    return std.mem.allEqual(u8, &id, 0);
+}
+
+fn guestOriginIsNull(origin: GuestOrigin) bool {
+    return std.mem.allEqual(u8, &origin, 0);
+}
+
 /// Enforce the v2 scope contract and reuse v1's hardened IRC grammar for all
 /// rendered fields. Signature presence is checked separately so an origin can
 /// validate the body before stamping it.
 fn validateBody(msg: RelayMessage) SemanticError!void {
-    if (msg.wire_schema != 1 and msg.wire_schema != 2) return error.InvalidSemantic;
+    if (msg.wire_schema != 1 and msg.wire_schema != 2 and msg.wire_schema != 3) return error.InvalidSemantic;
     const nick = msg.sourceNick() orelse return error.InvalidSemantic;
     relay_v1.validateSemantic(.{
         .verb = msg.verb,
@@ -171,7 +191,19 @@ fn validateBody(msg: RelayMessage) SemanticError!void {
                 msg.recipient.len == 0 or msg.recipient_route_id == null)
                 return error.InvalidSemantic;
         },
+        .direct_guest => {
+            if (msg.wire_schema != 3 or isChannelTarget(msg.target) or msg.recipient.len != 0 or
+                msg.recipient_route_id != null or msg.sender_route_id == null or
+                msg.sender_member_modes != null)
+                return error.InvalidSemantic;
+            const guest_origin = msg.recipient_guest_origin orelse return error.InvalidSemantic;
+            const guest_id = msg.recipient_guest_id orelse return error.InvalidSemantic;
+            if (guestOriginIsNull(guest_origin) or guestIdIsNull(guest_id)) return error.InvalidSemantic;
+        },
     }
+    if (msg.scope_kind != .direct_guest and
+        (msg.wire_schema == 3 or msg.recipient_guest_origin != null or msg.recipient_guest_id != null))
+        return error.InvalidSemantic;
 }
 
 /// A v2 message is always origin-signed; there is deliberately no unsigned
@@ -203,6 +235,34 @@ pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     try validateSemantic(msg);
     const sender_route: []const u8 = if (msg.sender_route_id) |*id| id else "";
     const recipient_route: []const u8 = if (msg.recipient_route_id) |*id| id else "";
+    if (msg.scope_kind == .direct_guest) {
+        const guest_id: []const u8 = if (msg.recipient_guest_id) |*id| id else "";
+        const guest_origin: []const u8 = if (msg.recipient_guest_origin) |*origin| origin else "";
+        // Keep all v1/v2 maps byte-identical. The two additional fields are
+        // emitted only for the explicitly negotiated guest-recipient scope.
+        var guest_entries = [_]cpv.MapEntry{
+            .{ .key = "account", .value = .{ .string = msg.account } },
+            .{ .key = "data_tag", .value = .{ .string = msg.data_tag } },
+            .{ .key = "hlc", .value = .{ .unsigned = msg.hlc } },
+            .{ .key = "min_rank", .value = .{ .unsigned = msg.min_rank } },
+            .{ .key = "origin_node", .value = .{ .unsigned = msg.origin_node } },
+            .{ .key = "origin_pubkey", .value = .{ .bytes = msg.origin_pubkey } },
+            .{ .key = "origin_sig", .value = .{ .bytes = msg.origin_sig } },
+            .{ .key = "recipient", .value = .{ .string = msg.recipient } },
+            .{ .key = "recipient_guest_id", .value = .{ .bytes = guest_id } },
+            .{ .key = "recipient_guest_origin", .value = .{ .bytes = guest_origin } },
+            .{ .key = "recipient_route_id", .value = .{ .bytes = recipient_route } },
+            .{ .key = "scope_kind", .value = .{ .unsigned = @backingInt(msg.scope_kind) } },
+            .{ .key = "sender_member_modes", .value = .{ .unsigned = if (msg.sender_member_modes) |m| m else 256 } },
+            .{ .key = "sender_route_id", .value = .{ .bytes = sender_route } },
+            .{ .key = "source_prefix", .value = .{ .string = msg.source_prefix } },
+            .{ .key = "tags", .value = .{ .string = msg.tags } },
+            .{ .key = "target", .value = .{ .string = msg.target } },
+            .{ .key = "text", .value = .{ .string = msg.text } },
+            .{ .key = "verb", .value = .{ .unsigned = @backingInt(msg.verb) } },
+        };
+        return cpv.Encoder.encode(allocator, .{ .map = &guest_entries });
+    }
     var entries = [_]cpv.MapEntry{
         .{ .key = "account", .value = .{ .string = msg.account } },
         .{ .key = "data_tag", .value = .{ .string = msg.data_tag } },
@@ -213,14 +273,14 @@ pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
         .{ .key = "origin_sig", .value = .{ .bytes = msg.origin_sig } },
         .{ .key = "recipient", .value = .{ .string = msg.recipient } },
         .{ .key = "recipient_route_id", .value = .{ .bytes = recipient_route } },
-        .{ .key = "scope_kind", .value = .{ .unsigned = @intFromEnum(msg.scope_kind) } },
+        .{ .key = "scope_kind", .value = .{ .unsigned = @backingInt(msg.scope_kind) } },
         .{ .key = "sender_member_modes", .value = .{ .unsigned = if (msg.sender_member_modes) |m| m else 256 } },
         .{ .key = "sender_route_id", .value = .{ .bytes = sender_route } },
         .{ .key = "source_prefix", .value = .{ .string = msg.source_prefix } },
         .{ .key = "tags", .value = .{ .string = msg.tags } },
         .{ .key = "target", .value = .{ .string = msg.target } },
         .{ .key = "text", .value = .{ .string = msg.text } },
-        .{ .key = "verb", .value = .{ .unsigned = @intFromEnum(msg.verb) } },
+        .{ .key = "verb", .value = .{ .unsigned = @backingInt(msg.verb) } },
     };
     return cpv.Encoder.encode(allocator, .{ .map = entries[0..] });
 }
@@ -243,10 +303,14 @@ const Field = enum(u5) {
     target,
     text,
     verb,
+    // Append schema-3-only fields so the numeric bit positions for the legacy
+    // 16/17-field masks above remain unchanged.
+    recipient_guest_id,
+    recipient_guest_origin,
 };
 
 fn claimField(seen: *u32, field: Field) DecodeError!void {
-    const mask = @as(u32, 1) << @as(u5, @intCast(@intFromEnum(field)));
+    const mask = @as(u32, 1) << @as(u5, @intCast(@backingInt(field)));
     if ((seen.* & mask) != 0) return error.InvalidDocument;
     seen.* |= mask;
 }
@@ -258,7 +322,13 @@ fn allFieldsMask() u32 {
 }
 
 fn legacyFieldsMask() u32 {
-    return allFieldsMask() & ~(@as(u32, 1) << @intFromEnum(Field.sender_member_modes));
+    return allFieldsMask() & ~(@as(u32, 1) << @backingInt(Field.sender_member_modes));
+}
+
+fn guestFieldsMask() u32 {
+    return allFieldsMask() |
+        (@as(u32, 1) << @backingInt(Field.recipient_guest_id)) |
+        (@as(u32, 1) << @backingInt(Field.recipient_guest_origin));
 }
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
@@ -308,6 +378,12 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
         } else if (std.mem.eql(u8, entry.key, "recipient_route_id")) {
             try claimField(&seen, .recipient_route_id);
             msg.recipient_route_id = try readRouteId(entry.value);
+        } else if (std.mem.eql(u8, entry.key, "recipient_guest_id")) {
+            try claimField(&seen, .recipient_guest_id);
+            msg.recipient_guest_id = try readGuestId(entry.value);
+        } else if (std.mem.eql(u8, entry.key, "recipient_guest_origin")) {
+            try claimField(&seen, .recipient_guest_origin);
+            msg.recipient_guest_origin = try readGuestOrigin(entry.value);
         } else if (std.mem.eql(u8, entry.key, "scope_kind")) {
             try claimField(&seen, .scope_kind);
             msg.scope_kind = try readScope(entry.value);
@@ -340,8 +416,9 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
     // authority-free membership assertion; emission of the 17-field current
     // schema is separately capability-probed so a strict old decoder never sees
     // an unknown key during a rolling upgrade.
-    if (seen != allFieldsMask() and seen != legacyFieldsMask()) return error.MissingField;
-    msg.wire_schema = if (seen == legacyFieldsMask()) 1 else 2;
+    if (seen != allFieldsMask() and seen != legacyFieldsMask() and seen != guestFieldsMask())
+        return error.MissingField;
+    msg.wire_schema = if (seen == legacyFieldsMask()) 1 else if (seen == guestFieldsMask()) 3 else 2;
     if (msg.origin_pubkey.len != pubkey_len or msg.origin_sig.len != sig_len)
         return error.InvalidFieldType;
     try validateSemantic(msg);
@@ -399,8 +476,8 @@ pub fn originTranscript(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     try out.appendSlice(allocator, &u64_le);
     std.mem.writeInt(u64, &u64_le, msg.hlc, .little);
     try out.appendSlice(allocator, &u64_le);
-    try out.append(allocator, @intFromEnum(msg.verb));
-    try out.append(allocator, @intFromEnum(msg.scope_kind));
+    try out.append(allocator, @backingInt(msg.verb));
+    try out.append(allocator, @backingInt(msg.scope_kind));
     try out.append(allocator, msg.min_rank);
     if (msg.wire_schema >= 2) {
         try out.append(allocator, @intFromBool(msg.sender_member_modes != null));
@@ -408,6 +485,12 @@ pub fn originTranscript(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     }
     try appendRoute(&out, allocator, msg.sender_route_id);
     try appendRoute(&out, allocator, msg.recipient_route_id);
+    if (msg.wire_schema >= 3) {
+        const guest_origin = msg.recipient_guest_origin orelse return error.InvalidSemantic;
+        const guest_id = msg.recipient_guest_id orelse return error.InvalidSemantic;
+        try out.appendSlice(allocator, &guest_origin);
+        try out.appendSlice(allocator, &guest_id);
+    }
     try appendLenPrefixed(&out, allocator, msg.source_prefix);
     try appendLenPrefixed(&out, allocator, msg.account);
     try appendLenPrefixed(&out, allocator, msg.tags);
@@ -600,6 +683,7 @@ fn readScope(value: cpv.Value) DecodeError!ScopeKind {
         1 => .channel,
         2 => .direct,
         3 => .channel_whisper,
+        4 => .direct_guest,
         else => error.InvalidScope,
     };
 }
@@ -611,6 +695,24 @@ fn readRouteId(value: cpv.Value) DecodeError!?RouteId {
     const id: RouteId = bytes[0..route_id_len].*;
     if (routeIdIsNull(id)) return error.InvalidFieldType;
     return id;
+}
+
+fn readGuestId(value: cpv.Value) DecodeError!?GuestId {
+    const bytes = try readBytes(value);
+    if (bytes.len == 0) return null;
+    if (bytes.len != @sizeOf(GuestId)) return error.InvalidFieldType;
+    const id: GuestId = bytes[0..@sizeOf(GuestId)].*;
+    if (guestIdIsNull(id)) return error.InvalidFieldType;
+    return id;
+}
+
+fn readGuestOrigin(value: cpv.Value) DecodeError!?GuestOrigin {
+    const bytes = try readBytes(value);
+    if (bytes.len == 0) return null;
+    if (bytes.len != pubkey_len) return error.InvalidFieldType;
+    const origin: GuestOrigin = bytes[0..pubkey_len].*;
+    if (guestOriginIsNull(origin)) return error.InvalidFieldType;
+    return origin;
 }
 
 fn testKeyPair(seed_byte: u8) !sign.KeyPair {
@@ -666,6 +768,219 @@ test "secure relay v2 signed channel and direct scopes round-trip" {
     defer direct.deinit(allocator);
     try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(allocator, direct.msg));
     try std.testing.expectEqualSlices(u8, &channel.recipient_route_id.?, &direct.msg.recipient_route_id.?);
+    try std.testing.expectEqual(@as(u8, 2), direct.msg.wire_schema);
+    const direct_wire_again = try encode(allocator, direct.msg);
+    defer allocator.free(direct_wire_again);
+    try std.testing.expectEqualSlices(u8, direct_wire, direct_wire_again);
+}
+
+test "secure relay v2 signed guest-recipient scope round-trips exact identity" {
+    const allocator = std.testing.allocator;
+    var sender_kp = try testKeyPair(0x59);
+    defer sender_kp.deinit();
+    var guest_origin_kp = try testKeyPair(0x5a);
+    defer guest_origin_kp.deinit();
+    var other_guest_origin_kp = try testKeyPair(0x5b);
+    defer other_guest_origin_kp.deinit();
+    var pubkey: [pubkey_len]u8 = undefined;
+    var signature: [sig_len]u8 = undefined;
+    var msg = RelayMessage{
+        .wire_schema = 3,
+        .verb = .privmsg,
+        .target = "GuestC",
+        .source_prefix = "alice!u@example.invalid",
+        .account = "alice",
+        .text = "exact guest delivery",
+        .scope_kind = .direct_guest,
+        .sender_route_id = try routeId(@splat(0x69)),
+        .recipient_guest_origin = guest_origin_kp.public_key,
+        .recipient_guest_id = @splat(0xc3),
+        .origin_node = signed_frame.originShortId(sender_kp.public_key),
+        .hlc = 101,
+    };
+    try stampOrigin(allocator, &msg, &sender_kp, &pubkey, &signature);
+
+    const wire = try encode(allocator, msg);
+    defer allocator.free(wire);
+    var decoded = try decode(allocator, wire);
+    defer decoded.deinit(allocator);
+    var document = try cpv.Decoder.decode(allocator, wire);
+    defer document.deinit(allocator);
+    const field_count = switch (document) {
+        .map => |entries| entries.len,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 19), field_count);
+    try std.testing.expectEqual(@as(u8, 3), decoded.msg.wire_schema);
+    try std.testing.expectEqual(ScopeKind.direct_guest, decoded.msg.scope_kind);
+    try std.testing.expectEqual(guest_origin_kp.public_key, decoded.msg.recipient_guest_origin.?);
+    try std.testing.expectEqual(@as(GuestId, @splat(0xc3)), decoded.msg.recipient_guest_id.?);
+    try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(allocator, decoded.msg));
+
+    const authored_id = try relayId(allocator, msg);
+    const decoded_id = try relayId(allocator, decoded.msg);
+    try std.testing.expectEqual(authored_id, decoded_id);
+    const encoded_again = try encode(allocator, decoded.msg);
+    defer allocator.free(encoded_again);
+    try std.testing.expectEqualSlices(u8, wire, encoded_again);
+
+    var changed = msg;
+    changed.target = "GuestD";
+    try std.testing.expectEqual(VerifyOutcome.bad_signature, try verifyOrigin(allocator, changed));
+    changed = msg;
+    changed.recipient_guest_id = @splat(0xc4);
+    try std.testing.expectEqual(VerifyOutcome.bad_signature, try verifyOrigin(allocator, changed));
+    changed = msg;
+    changed.recipient_guest_origin = other_guest_origin_kp.public_key;
+    try std.testing.expectEqual(VerifyOutcome.bad_signature, try verifyOrigin(allocator, changed));
+}
+
+test "secure relay v2 guest-recipient scope rejects missing zero and mixed identity fields" {
+    const allocator = std.testing.allocator;
+    var sender_kp = try testKeyPair(0x5c);
+    defer sender_kp.deinit();
+    var guest_origin_kp = try testKeyPair(0x5d);
+    defer guest_origin_kp.deinit();
+    var pubkey: [pubkey_len]u8 = undefined;
+    var signature: [sig_len]u8 = undefined;
+    var msg = RelayMessage{
+        .wire_schema = 3,
+        .verb = .privmsg,
+        .target = "GuestC",
+        .source_prefix = "alice!u@example.invalid",
+        .account = "alice",
+        .text = "strict guest target",
+        .scope_kind = .direct_guest,
+        .sender_route_id = try routeId(@splat(0x71)),
+        .recipient_guest_origin = guest_origin_kp.public_key,
+        .recipient_guest_id = @splat(0xd3),
+        .origin_node = signed_frame.originShortId(sender_kp.public_key),
+        .hlc = 102,
+    };
+    try stampOrigin(allocator, &msg, &sender_kp, &pubkey, &signature);
+
+    var changed = msg;
+    changed.recipient_guest_origin = null;
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.recipient_guest_origin = @splat(0);
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.recipient_guest_id = null;
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.recipient_guest_id = @splat(0);
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.scope_kind = .direct;
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.wire_schema = 2;
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.sender_route_id = null;
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.sender_member_modes = 0;
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.recipient = "GuestC";
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+    changed = msg;
+    changed.recipient_route_id = try routeId(@splat(0x72));
+    try std.testing.expectError(error.InvalidSemantic, validateSemantic(changed));
+
+    const wire = try encode(allocator, msg);
+    defer allocator.free(wire);
+    var document = try cpv.Decoder.decode(allocator, wire);
+    defer document.deinit(allocator);
+    const entries = switch (document) {
+        .map => |map| map,
+        else => return error.TestUnexpectedResult,
+    };
+    var wrong_width: [19]cpv.MapEntry = undefined;
+    @memcpy(&wrong_width, entries);
+    const short_guest_id: [15]u8 = @splat(0xd3);
+    for (&wrong_width) |*entry| {
+        if (std.mem.eql(u8, entry.key, "recipient_guest_id")) {
+            entry.value = .{ .bytes = &short_guest_id };
+            break;
+        }
+    }
+    const wrong_width_wire = try cpv.Encoder.encode(allocator, .{ .map = &wrong_width });
+    defer allocator.free(wrong_width_wire);
+    try std.testing.expectError(error.InvalidFieldType, decode(allocator, wrong_width_wire));
+
+    var zero_guest_id: [19]cpv.MapEntry = undefined;
+    @memcpy(&zero_guest_id, entries);
+    const zero_id: GuestId = @splat(0);
+    for (&zero_guest_id) |*entry| {
+        if (std.mem.eql(u8, entry.key, "recipient_guest_id")) {
+            entry.value = .{ .bytes = &zero_id };
+            break;
+        }
+    }
+    const zero_guest_id_wire = try cpv.Encoder.encode(allocator, .{ .map = &zero_guest_id });
+    defer allocator.free(zero_guest_id_wire);
+    try std.testing.expectError(error.InvalidFieldType, decode(allocator, zero_guest_id_wire));
+
+    var zero_guest_origin: [19]cpv.MapEntry = undefined;
+    @memcpy(&zero_guest_origin, entries);
+    const zero_origin: GuestOrigin = @splat(0);
+    for (&zero_guest_origin) |*entry| {
+        if (std.mem.eql(u8, entry.key, "recipient_guest_origin")) {
+            entry.value = .{ .bytes = &zero_origin };
+            break;
+        }
+    }
+    const zero_guest_origin_wire = try cpv.Encoder.encode(allocator, .{ .map = &zero_guest_origin });
+    defer allocator.free(zero_guest_origin_wire);
+    try std.testing.expectError(error.InvalidFieldType, decode(allocator, zero_guest_origin_wire));
+
+    var wrong_scope: [19]cpv.MapEntry = undefined;
+    @memcpy(&wrong_scope, entries);
+    for (&wrong_scope) |*entry| {
+        if (std.mem.eql(u8, entry.key, "scope_kind")) {
+            entry.value = .{ .unsigned = @backingInt(ScopeKind.direct) };
+            break;
+        }
+    }
+    const wrong_scope_wire = try cpv.Encoder.encode(allocator, .{ .map = &wrong_scope });
+    defer allocator.free(wrong_scope_wire);
+    try std.testing.expectError(error.InvalidSemantic, decode(allocator, wrong_scope_wire));
+}
+
+test "secure relay v2 decoder preserves legacy 16-field scope transcript" {
+    const allocator = std.testing.allocator;
+    var kp = try testKeyPair(0x5e);
+    defer kp.deinit();
+    var pubkey: [pubkey_len]u8 = undefined;
+    var signature: [sig_len]u8 = undefined;
+    var msg = try signedSample(&kp, &pubkey, &signature);
+    msg.wire_schema = 1;
+    try stampOrigin(allocator, &msg, &kp, &pubkey, &signature);
+
+    const current_wire = try encode(allocator, msg);
+    defer allocator.free(current_wire);
+    var document = try cpv.Decoder.decode(allocator, current_wire);
+    defer document.deinit(allocator);
+    const entries = switch (document) {
+        .map => |map| map,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 17), entries.len);
+    var legacy_entries: [16]cpv.MapEntry = undefined;
+    @memcpy(legacy_entries[0..10], entries[0..10]);
+    @memcpy(legacy_entries[10..], entries[11..]);
+    const legacy_wire = try cpv.Encoder.encode(allocator, .{ .map = &legacy_entries });
+    defer allocator.free(legacy_wire);
+    var decoded = try decode(allocator, legacy_wire);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), decoded.msg.wire_schema);
+    try std.testing.expectEqual(ScopeKind.channel, decoded.msg.scope_kind);
+    try std.testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(allocator, decoded.msg));
+    try std.testing.expect(decoded.msg.recipient_guest_origin == null);
+    try std.testing.expect(decoded.msg.recipient_guest_id == null);
 }
 
 test "secure relay v2 signs immutable scope route policy and rendering fields" {
@@ -725,7 +1040,7 @@ test "secure relay v2 channel whisper signs display channel and exact recipient 
         .hlc = 100,
     };
     try stampOrigin(allocator, &msg, &kp, &pubkey, &signature);
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(msg.scope_kind));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(msg.scope_kind));
     const wire = try encode(allocator, msg);
     defer allocator.free(wire);
     var owned = try decode(allocator, wire);
