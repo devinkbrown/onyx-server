@@ -46,7 +46,7 @@ pub const StoreError = error{
     TableWorkExceeded,
 };
 
-/// Narrow fault-injection seam for the prepared-write lane. This is kept on
+/// Narrow fault-injection seam shared by ordinary and prepared writes. Kept on
 /// OroStore rather than faking `std.Io`, so tests exercise the exact write and
 /// sync boundary used in production. A `.short` write writes a strict prefix
 /// and then reports `IoAmbiguous`; `.failed` reports before writing any bytes.
@@ -335,6 +335,7 @@ const CoverageSlot = struct {
 const ActivePrepared = struct {
     generation: u64,
     store_family: Family,
+    kind: MutationKind,
     key: ?[]u8,
     value: ?[]u8,
     record: ?[]u8,
@@ -342,7 +343,7 @@ const ActivePrepared = struct {
     final_wal_offset: u64,
     next_seq_after: u64,
     sequence: u64,
-    existing: bool,
+    old_key: ?[]u8 = null,
     old_value: ?[]u8 = null,
     table_plan: ?KvTable.Plan = null,
 };
@@ -675,14 +676,14 @@ pub const OroStore = struct {
         return .{ .store = self };
     }
 
-    /// Install or clear the narrow prepared-write I/O seam. Production code
+    /// Install or clear the shared mutation I/O seam. Production code
     /// leaves this at `.{};` tests use it to prove ambiguous short-write,
     /// failed-write, and sync boundaries poison the store.
     pub fn setPreparedIoFault(self: *OroStore, fault: PreparedIoFault) void {
         self.prepared_io_fault = fault;
     }
 
-    /// True after a prepared write crossed an ambiguous write/sync boundary.
+    /// True after any mutation crossed an ambiguous write/sync boundary.
     /// The store must be reopened before any further mutation is admitted.
     /// Reads retain the prior published rows, which may differ from durable
     /// bytes. Authentication callers must refuse authority while this is true.
@@ -701,15 +702,31 @@ pub const OroStore = struct {
         key: []const u8,
         value: []const u8,
     ) !PreparedPut {
+        return self.prepareMutation(store_family, .put, key, value);
+    }
+
+    /// Ordinary deletes share the single-record reservation and publication
+    /// boundary with puts; they never introduce the batch WAL format.
+    fn prepareMutation(
+        self: *OroStore,
+        store_family: Family,
+        kind: MutationKind,
+        key: []const u8,
+        value: ?[]const u8,
+    ) !PreparedPut {
+        std.debug.assert((kind == .put) == (value != null));
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
         if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
         if (self.next_prepared_generation == std.math.maxInt(u64)) return StoreError.SequenceExhausted;
         const sequence = try self.reserveSequence();
 
-        const payload_len = try checkedPayloadLen(.put, key, value, self.cfg.max_record_bytes);
+        const payload_len = try checkedPayloadLen(kind, key, value orelse "", self.cfg.max_record_bytes);
         const record_len = std.math.add(usize, record_header_len, payload_len) catch return StoreError.RecordTooLarge;
-        try self.maps[familyIndex(store_family)].map.checkRevision();
+        const map = &self.maps[familyIndex(store_family)];
+        // An absent delete still appends a mutation and advances the feed, but
+        // leaves the table (including an exhausted revision) unchanged.
+        if (kind == .put or map.map.getEntry(key) != null) try map.map.checkRevision();
         const final_wal_offset = try self.preflightWalForRecord(record_len);
         self.reclaimRetirements();
 
@@ -718,6 +735,7 @@ pub const OroStore = struct {
         self.active_prepared = .{
             .generation = generation,
             .store_family = store_family,
+            .kind = kind,
             .key = null,
             .value = null,
             .record = null,
@@ -725,43 +743,37 @@ pub const OroStore = struct {
             .final_wal_offset = final_wal_offset,
             .next_seq_after = try checkedNextSequence(sequence),
             .sequence = sequence,
-            .existing = false,
         };
         errdefer self.discardActivePrepared();
 
-        const map = &self.maps[familyIndex(store_family)];
-        const existing = map.map.getEntry(key) != null;
-        self.active_prepared.?.existing = existing;
-        self.active_prepared.?.old_value = map.map.get(key);
+        if (map.map.getEntry(key)) |old| {
+            self.active_prepared.?.old_key = @constCast(old.key_ptr.*);
+            self.active_prepared.?.old_value = old.value_ptr.*;
+        }
 
         const record = try self.allocator.alloc(u8, record_len);
         self.active_prepared.?.record = record;
         writeU32(record[0..4], @intCast(payload_len));
         const payload = record[record_header_len..];
-        payload[0] = @backingInt(MutationKind.put);
-        payload[1] = @backingInt(store_family);
-        writeU32(payload[2..][0..4], @intCast(key.len));
-        writeU32(payload[6..][0..4], @intCast(value.len));
-        @memcpy(payload[payload_header_len..][0..key.len], key);
-        @memcpy(payload[payload_header_len + key.len ..][0..value.len], value);
+        encodeMutation(payload, .{ .family = store_family, .kind = kind, .key = key, .value = value });
         writeU32(record[4..][0..4], checksum(payload));
 
         const owned_key = try self.allocator.dupe(u8, key);
         self.active_prepared.?.key = owned_key;
-        const owned_value = try self.allocator.dupe(u8, value);
-        self.active_prepared.?.value = owned_value;
+        if (value) |bytes| self.active_prepared.?.value = try self.allocator.dupe(u8, bytes);
 
         if (self.changefeed.entries.len != 0) {
             const change = try OwnedMutation.from(self.allocator, .{
                 .seq = sequence,
                 .family = store_family,
-                .kind = .put,
+                .kind = kind,
                 .key = key,
                 .value = value,
             });
             self.active_prepared.?.change = change;
         }
-        self.active_prepared.?.table_plan = try map.map.prepare(&.{.{ .key = owned_key, .value = owned_value }}, std.math.maxInt(u64));
+        if (kind == .put or self.active_prepared.?.old_key != null)
+            self.active_prepared.?.table_plan = try map.map.prepare(&.{.{ .key = owned_key, .value = self.active_prepared.?.value }}, std.math.maxInt(u64));
         return .{ .store = self, .generation = generation };
     }
 
@@ -957,16 +969,9 @@ pub const OroStore = struct {
     }
 
     pub fn put(self: *OroStore, store_family: Family, key: []const u8, value: []const u8) !void {
-        if (self.staged_read_only) return StoreError.ReadOnlyStore;
-        if (self.prepared_poisoned) return StoreError.StorePoisoned;
-        if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
-        const sequence = try self.reserveSequence();
-        const record_len = try recordSize(.put, key, value, self.cfg.max_record_bytes);
-        try self.maps[familyIndex(store_family)].map.checkOrdinaryPut(key);
-        _ = try self.preflightWalForRecord(record_len);
-        try self.appendRecord(.put, store_family, key, value);
-        try self.applyPut(store_family, key, value);
-        try self.recordMutation(sequence, store_family, .put, key, value);
+        var prepared = try self.preparePut(store_family, key, value);
+        defer prepared.deinit();
+        try prepared.commit();
     }
 
     pub fn get(self: *const OroStore, store_family: Family, key: []const u8) ?[]const u8 {
@@ -974,16 +979,9 @@ pub const OroStore = struct {
     }
 
     pub fn delete(self: *OroStore, store_family: Family, key: []const u8) !void {
-        if (self.staged_read_only) return StoreError.ReadOnlyStore;
-        if (self.prepared_poisoned) return StoreError.StorePoisoned;
-        if (self.active_prepared != null or self.active_batch != null) return StoreError.PreparedMutationActive;
-        const sequence = try self.reserveSequence();
-        const record_len = try recordSize(.delete, key, "", self.cfg.max_record_bytes);
-        if (self.maps[familyIndex(store_family)].map.getEntry(key) != null) try self.maps[familyIndex(store_family)].map.checkRevision();
-        _ = try self.preflightWalForRecord(record_len);
-        try self.appendRecord(.delete, store_family, key, "");
-        try self.applyDelete(store_family, key);
-        try self.recordMutation(sequence, store_family, .delete, key, null);
+        var prepared = try self.prepareMutation(store_family, .delete, key, null);
+        defer prepared.deinit();
+        try prepared.commit();
     }
 
     /// Writes current state to a snapshot and truncates the WAL.
@@ -1418,21 +1416,26 @@ pub const OroStore = struct {
         if (active.generation != generation) return StoreError.PreparedAlreadyConsumed;
         if (self.prepared_poisoned) return StoreError.StorePoisoned;
 
-        const table_plan = if (self.active_prepared.?.table_plan) |*plan| plan else return StoreError.InvalidTablePlan;
         const table = &self.maps[familyIndex(active.store_family)].map;
-        if (table_plan.owner != table or active.key == null or active.value == null or !table_plan.matchesEdit(active.key.?, active.value)) return StoreError.InvalidTablePlan;
-        try table_plan.validate();
+        if (active.key == null or (active.kind == .put) != (active.value != null)) return StoreError.InvalidTablePlan;
+        if (self.active_prepared.?.table_plan) |*plan| {
+            if (plan.owner != table or !plan.matchesEdit(active.key.?, active.value)) return StoreError.InvalidTablePlan;
+            try plan.validate();
+        } else if (active.kind != .delete or active.old_key != null) return StoreError.InvalidTablePlan;
         if (table.getEntry(active.key.?)) |old| {
-            if (!active.existing or active.old_value == null or active.old_value.?.ptr != old.value_ptr.*.ptr or active.old_value.?.len != old.value_ptr.*.len) return StoreError.InvalidTablePlan;
-        } else if (active.existing or active.old_value != null) return StoreError.InvalidTablePlan;
+            if (active.old_key == null or active.old_value == null or active.old_key.?.ptr != old.key_ptr.*.ptr or active.old_key.?.len != old.key_ptr.*.len or active.old_value.?.ptr != old.value_ptr.*.ptr or active.old_value.?.len != old.value_ptr.*.len) return StoreError.InvalidTablePlan;
+        } else if (active.old_key != null or active.old_value != null) return StoreError.InvalidTablePlan;
         try self.writePreparedBytes(active.record.?, active.final_wal_offset);
 
         // Durable publication is deliberately scalar/pointer-only. All
         // retirement slots were made available before admission, and no
         // allocator or fallible call is permitted below this line.
         var prepared = active;
-        if (self.active_prepared.?.table_plan.?.publish()) |slots| self.retireTable(slots);
-        if (prepared.existing) self.retireBytes(prepared.key.?);
+        if (self.active_prepared.?.table_plan) |*plan| if (plan.publish()) |slots| self.retireTable(slots);
+        if (prepared.kind == .delete) {
+            if (prepared.old_key) |key| self.retireBytes(key);
+            self.retireBytes(prepared.key.?);
+        } else if (prepared.old_key != null) self.retireBytes(prepared.key.?);
         if (prepared.old_value) |value| self.retireBytes(value);
         prepared.key = null;
         prepared.value = null;
@@ -1641,20 +1644,6 @@ pub const OroStore = struct {
         return offset;
     }
 
-    fn appendRecord(
-        self: *OroStore,
-        kind: MutationKind,
-        store_family: Family,
-        key: []const u8,
-        value: []const u8,
-    ) !void {
-        try self.ensureWal();
-        const file = self.wal_file.?;
-        const next_offset = try writeRecordAt(self.io, file, self.wal_offset, self.allocator, kind, store_family, key, value, self.cfg.max_record_bytes);
-        try file.sync(self.io);
-        self.wal_offset = next_offset;
-    }
-
     fn applyPayload(self: *OroStore, payload: []const u8) !void {
         if (payload.len == 0) return StoreError.BadRecord;
 
@@ -1696,25 +1685,6 @@ pub const OroStore = struct {
 
     fn applyDelete(self: *OroStore, store_family: Family, key: []const u8) !void {
         self.maps[familyIndex(store_family)].delete(key);
-    }
-
-    fn recordMutation(
-        self: *OroStore,
-        sequence: u64,
-        store_family: Family,
-        kind: MutationKind,
-        key: []const u8,
-        value: ?[]const u8,
-    ) !void {
-        if (sequence != self.next_seq) return StoreError.SequenceExhausted;
-        try self.changefeed.push(.{
-            .seq = sequence,
-            .family = store_family,
-            .kind = kind,
-            .key = key,
-            .value = value,
-        });
-        self.next_seq = try checkedNextSequence(sequence);
     }
 
     fn reserveSequence(self: *const OroStore) !u64 {
@@ -5758,10 +5728,6 @@ const KvTable = struct {
         self.tombstones = 0;
         self.revision += 1;
     }
-    fn checkOrdinaryPut(self: *const Self, key: []const u8) !void {
-        try self.checkRevision();
-        if (self.getEntry(key) == null and self.revision > std.math.maxInt(u64) - 3) return StoreError.SequenceExhausted;
-    }
     fn getOrPut(self: *Self, key: []const u8) !GetOrPut {
         try self.checkRevision();
         if (self.getEntry(key)) |entry| {
@@ -6044,24 +6010,6 @@ const ChangeFeed = struct {
             if (entry.*) |*mutation| mutation.deinit(self.allocator);
         }
         self.allocator.free(self.entries);
-    }
-
-    fn push(self: *ChangeFeed, mutation: Mutation) !void {
-        if (self.entries.len == 0) return;
-
-        const owned = try OwnedMutation.from(self.allocator, mutation);
-
-        if (self.count < self.entries.len) {
-            const index = (self.start + self.count) % self.entries.len;
-            self.entries[index] = owned;
-            self.count += 1;
-        } else {
-            const index = self.start;
-            if (self.entries[index]) |*old| old.deinit(self.allocator);
-            self.entries[index] = null;
-            self.entries[index] = owned;
-            self.start = (self.start + 1) % self.entries.len;
-        }
     }
 
     /// Publish an already-owned entry. `PreparedPut.prepare` allocates the
@@ -6827,6 +6775,293 @@ test "openWithConfig honours a smaller record limit" {
         StoreError.RecordTooLarge,
         store.family(.accounts).put("alice", "this value is definitely longer than sixteen bytes"),
     );
+}
+
+const OrdinaryMutationTest = struct {
+    const Mode = enum { insert, grow, replace, delete, absent_delete };
+    const seed_keys = [_][]const u8{ "alice", "b", "c", "d", "e", "f" };
+
+    fn key(mode: Mode) []const u8 {
+        return switch (mode) {
+            .replace, .delete => "alice",
+            else => "candidate",
+        };
+    }
+
+    fn kind(mode: Mode) MutationKind {
+        return switch (mode) {
+            .delete, .absent_delete => .delete,
+            else => .put,
+        };
+    }
+
+    fn seed(store: *OroStore, mode: Mode) !void {
+        for (seed_keys[0..if (mode == .grow) seed_keys.len else 1]) |seed_key|
+            try store.put(.accounts, seed_key, "old");
+    }
+
+    fn apply(store: *OroStore, mode: Mode) !void {
+        switch (kind(mode)) {
+            .put => try store.put(.accounts, key(mode), "new"),
+            .delete => try store.delete(.accounts, key(mode)),
+        }
+    }
+
+    fn expectRows(store: *const OroStore, mode: Mode, committed: bool) !void {
+        if (mode == .delete and committed) {
+            try std.testing.expect(store.get(.accounts, "alice") == null);
+        } else {
+            try std.testing.expectEqualStrings(if (mode == .replace and committed) "new" else "old", store.get(.accounts, "alice").?);
+        }
+        if ((mode == .insert or mode == .grow) and committed) {
+            try std.testing.expectEqualStrings("new", store.get(.accounts, "candidate").?);
+        } else try std.testing.expect(store.get(.accounts, "candidate") == null);
+        if (mode == .grow) for (seed_keys[1..]) |seed_key| {
+            try std.testing.expectEqualStrings("old", store.get(.accounts, seed_key).?);
+        };
+        const initial_count: u32 = if (mode == .grow) 6 else 1;
+        const final_count = if (!committed) initial_count else switch (mode) {
+            .insert, .grow => initial_count + 1,
+            .delete => initial_count - 1,
+            else => initial_count,
+        };
+        try std.testing.expectEqual(final_count, store.maps[familyIndex(.accounts)].map.count());
+    }
+
+    fn feedDigest(store: *const OroStore) [32]u8 {
+        var h = std.crypto.hash.Blake3.init(.{});
+        for (0..store.changeCount()) |i| {
+            const change = store.changeAt(i).?;
+            KvTable.hashNumber(&h, change.seq);
+            KvTable.hashNumber(&h, @backingInt(change.family));
+            KvTable.hashNumber(&h, @backingInt(change.kind));
+            KvTable.hashNumber(&h, change.key.len);
+            h.update(change.key);
+            if (change.value) |value| {
+                KvTable.hashNumber(&h, value.len);
+                h.update(value);
+            }
+        }
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        return out;
+    }
+
+    fn sweep(mode: Mode, feed_capacity: usize) !void {
+        var failure_index: usize = 0;
+        while (failure_index < 64) : (failure_index += 1) {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const cfg: Config = .{ .changefeed_capacity = feed_capacity };
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+            var next_sequence: u64 = undefined;
+            var failed = false;
+            {
+                var store = try OroStore.openWithConfig(failing.allocator(), std.testing.io, tmp.dir, "ordinary-oom.wal", cfg);
+                defer store.deinit();
+                try seed(&store, mode);
+                const before_wal = try readWalForTest(tmp, "ordinary-oom.wal");
+                defer std.testing.allocator.free(before_wal);
+                const before_offset = store.wal_offset;
+                const before_seq = store.next_seq;
+                const before_feed = feedDigest(&store);
+                const before_count = store.changeCount();
+                const table = &store.maps[familyIndex(.accounts)].map;
+                const before_revision = table.revision;
+                const before_slots = table.slots;
+                failing.fail_index = failing.alloc_index + failure_index;
+                apply(&store, mode) catch |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    try std.testing.expect(failing.has_induced_failure);
+                    failing.fail_index = std.math.maxInt(usize);
+                    failed = true;
+                    try expectRows(&store, mode, false);
+                    try std.testing.expect(!store.preparedWritesPoisoned());
+                    try std.testing.expect(store.active_prepared == null);
+                    try std.testing.expectEqual(before_offset, store.wal_offset);
+                    try std.testing.expectEqual(before_seq, store.next_seq);
+                    try std.testing.expectEqual(before_count, store.changeCount());
+                    try std.testing.expectEqualSlices(u8, &before_feed, &feedDigest(&store));
+                    try std.testing.expectEqual(before_revision, table.revision);
+                    try std.testing.expectEqual(before_slots.ptr, table.slots.ptr);
+                    try std.testing.expectEqual(before_slots.len, table.slots.len);
+                    const after_wal = try readWalForTest(tmp, "ordinary-oom.wal");
+                    defer std.testing.allocator.free(after_wal);
+                    try std.testing.expectEqualSlices(u8, before_wal, after_wal);
+                    var reopened = try OroStore.openReadOnlyWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "ordinary-oom.wal", cfg);
+                    defer reopened.deinit();
+                    try expectRows(&reopened, mode, false);
+                    try std.testing.expectEqual(before_seq, reopened.next_seq);
+                    // Retry in the same live store after every rejected index.
+                    try apply(&store, mode);
+                };
+                failing.fail_index = std.math.maxInt(usize);
+                try expectRows(&store, mode, true);
+                next_sequence = before_seq + 1;
+                try std.testing.expectEqual(next_sequence, store.next_seq);
+                try std.testing.expectEqual(before_revision + @intFromBool(mode != .absent_delete), table.revision);
+                try std.testing.expect(!store.batch_format_required);
+                if (feed_capacity == 0) {
+                    try std.testing.expectEqual(@as(usize, 0), store.changeCount());
+                } else {
+                    const change = store.changeAt(store.changeCount() - 1).?;
+                    try std.testing.expectEqual(before_seq, change.seq);
+                    try std.testing.expectEqual(kind(mode), change.kind);
+                    try std.testing.expectEqualStrings(key(mode), change.key);
+                    if (kind(mode) == .put) try std.testing.expectEqualStrings("new", change.value.?) else try std.testing.expect(change.value == null);
+                }
+            }
+            // The writer is closed; replay must agree with the successful retry.
+            var reopened = try OroStore.openWithConfig(std.testing.allocator, std.testing.io, tmp.dir, "ordinary-oom.wal", cfg);
+            defer reopened.deinit();
+            try expectRows(&reopened, mode, true);
+            try std.testing.expectEqual(next_sequence, reopened.next_seq);
+            if (!failed) {
+                try std.testing.expect(failure_index >= 2);
+                return;
+            }
+        }
+        return error.TestUnexpectedResult; // The sweep must reach normal success.
+    }
+};
+
+test "STORE ordinary writes reserve every allocation before durable publication" {
+    for (std.enums.values(OrdinaryMutationTest.Mode)) |mode| {
+        for ([_]usize{ 0, 1, 4 }) |capacity| try OrdinaryMutationTest.sweep(mode, capacity);
+    }
+}
+
+test "STORE ordinary write and sync ambiguity poison until close and reopen" {
+    const cases = [_]struct { fault: PreparedIoFault, complete: bool }{
+        .{ .fault = .{ .write = .failed }, .complete = false },
+        .{ .fault = .{ .write = .short }, .complete = false },
+        .{ .fault = .{ .sync = true }, .complete = true },
+    };
+    for (std.enums.values(OrdinaryMutationTest.Mode)) |mode| {
+        for (cases) |case| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var expected_sequence: u64 = undefined;
+            {
+                var store = try openTestStore(tmp, "ordinary-ambiguous.wal");
+                defer store.deinit();
+                try OrdinaryMutationTest.seed(&store, mode);
+                const before_seq = store.next_seq;
+                const before_offset = store.wal_offset;
+                const before_feed = OrdinaryMutationTest.feedDigest(&store);
+                const before_revision = store.maps[familyIndex(.accounts)].map.revision;
+                store.setPreparedIoFault(case.fault);
+                try std.testing.expectError(StoreError.IoAmbiguous, OrdinaryMutationTest.apply(&store, mode));
+                try std.testing.expect(store.preparedWritesPoisoned());
+                try std.testing.expect(store.active_prepared == null);
+                try OrdinaryMutationTest.expectRows(&store, mode, false);
+                try std.testing.expectEqual(before_seq, store.next_seq);
+                try std.testing.expectEqual(before_offset, store.wal_offset);
+                try std.testing.expectEqual(before_revision, store.maps[familyIndex(.accounts)].map.revision);
+                try std.testing.expectEqualSlices(u8, &before_feed, &OrdinaryMutationTest.feedDigest(&store));
+                store.setPreparedIoFault(.{});
+                try std.testing.expectError(StoreError.StorePoisoned, store.put(.accounts, "later", "blocked"));
+                try std.testing.expectError(StoreError.StorePoisoned, store.delete(.accounts, "alice"));
+                try std.testing.expectError(StoreError.StorePoisoned, store.preparePut(.accounts, "later", "blocked"));
+                try std.testing.expectError(StoreError.StorePoisoned, store.prepareBatch(&.{.{ .family = .accounts, .kind = .delete, .key = "alice" }}));
+                try std.testing.expectError(StoreError.StorePoisoned, store.snapshotAndTruncate());
+                expected_sequence = before_seq + @intFromBool(case.complete);
+            }
+            var reopened = try openTestStore(tmp, "ordinary-ambiguous.wal");
+            defer reopened.deinit();
+            try std.testing.expect(!reopened.preparedWritesPoisoned());
+            try OrdinaryMutationTest.expectRows(&reopened, mode, case.complete);
+            try std.testing.expectEqual(expected_sequence, reopened.next_seq);
+            try reopened.put(.props, "after-reopen", "accepted");
+            try std.testing.expectEqual(expected_sequence + 1, reopened.next_seq);
+        }
+    }
+}
+
+test "STORE ordinary writes retain canonical single-record WAL bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "ordinary-canonical.wal");
+    defer store.deinit();
+    const initial_offset = store.wal_offset;
+    const canonical = try tmp.dir.createFile(std.testing.io, "canonical.wal", .{ .read = true });
+    defer canonical.close(std.testing.io);
+    var offset: u64 = 0;
+    for ([_]MutationKind{ .put, .put, .delete, .delete }) |kind| {
+        switch (kind) {
+            .put => try store.put(.accounts, "alice", "value"),
+            .delete => try store.delete(.accounts, "alice"),
+        }
+        offset = try writeRecordAt(std.testing.io, canonical, offset, std.testing.allocator, kind, .accounts, "alice", "value", default_max_record_len);
+    }
+    const actual = try readWalForTest(tmp, "ordinary-canonical.wal");
+    defer std.testing.allocator.free(actual);
+    const expected = try readWalForTest(tmp, "canonical.wal");
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, actual[@intCast(initial_offset)..]);
+    try std.testing.expect(!store.batch_format_required);
+    try std.testing.expectEqual(@as(u64, 5), store.next_seq);
+    try store.snapshotAndTruncate();
+    var reopened = try openTestStore(tmp, "ordinary-canonical.wal");
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 5), reopened.next_seq);
+    try std.testing.expect(reopened.get(.accounts, "alice") == null);
+    try std.testing.expect(!reopened.batch_format_required);
+}
+
+test "STORE ordinary delete publication performs no allocator work" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try OroStore.openWithConfig(failing.allocator(), std.testing.io, tmp.dir, "ordinary-delete-noalloc.wal", .{ .changefeed_capacity = 1 });
+    defer store.deinit();
+    try store.put(.accounts, "alice", "old");
+    for ([_][]const u8{ "alice", "absent" }) |key| {
+        var prepared = try store.prepareMutation(.accounts, .delete, key, null);
+        defer prepared.deinit();
+        const allocations = failing.alloc_index;
+        const frees = failing.deallocations;
+        failing.fail_index = allocations;
+        try prepared.commit();
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqual(allocations, failing.alloc_index);
+        try std.testing.expectEqual(frees, failing.deallocations);
+        try std.testing.expect(store.get(.accounts, key) == null);
+    }
+}
+
+test "STORE ordinary revision and token generation guards precede WAL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "ordinary-guards.wal");
+    defer store.deinit();
+    try store.put(.accounts, "alice", "old");
+    const table = &store.maps[familyIndex(.accounts)].map;
+    // A planned insertion reserves exactly one revision (no growth/rollback
+    // stamps), so it can use the last revision without wrapping.
+    table.revision = std.math.maxInt(u64) - 1;
+    try store.put(.accounts, "last", "value");
+    try std.testing.expectEqual(std.math.maxInt(u64), table.revision);
+    try std.testing.expectError(StoreError.SequenceExhausted, store.put(.accounts, "blocked", "value"));
+    try std.testing.expectError(StoreError.SequenceExhausted, store.delete(.accounts, "alice"));
+    const before_seq = store.next_seq;
+    try store.delete(.accounts, "absent");
+    try std.testing.expectEqual(before_seq + 1, store.next_seq);
+    try std.testing.expectEqual(std.math.maxInt(u64), table.revision);
+
+    const before = try readWalForTest(tmp, "ordinary-guards.wal");
+    defer std.testing.allocator.free(before);
+    table.revision = 1;
+    store.next_prepared_generation = std.math.maxInt(u64);
+    try std.testing.expectError(StoreError.SequenceExhausted, store.put(.accounts, "blocked", "value"));
+    try std.testing.expectError(StoreError.SequenceExhausted, store.delete(.accounts, "alice"));
+    store.next_prepared_generation = 1;
+    store.next_seq = std.math.maxInt(u64);
+    try std.testing.expectError(StoreError.SequenceExhausted, store.put(.accounts, "blocked", "value"));
+    try std.testing.expectError(StoreError.SequenceExhausted, store.delete(.accounts, "alice"));
+    const after = try readWalForTest(tmp, "ordinary-guards.wal");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
 }
 
 test "STORE prepared put reserves then commits insert and replacement" {
