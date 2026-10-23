@@ -63,9 +63,11 @@ pub fn parseResolvConf(text: []const u8, cfg: *ResolverConfig) usize {
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t");
         if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
-        if (!std.mem.startsWith(u8, line, "nameserver")) continue;
-        const rest = std.mem.trim(u8, line["nameserver".len..], " \t");
-        if (rest.len == 0 or rest.len == line.len) continue; // need whitespace after keyword
+        const keyword = "nameserver";
+        if (!std.mem.startsWith(u8, line, keyword)) continue;
+        if (line.len == keyword.len or (line[keyword.len] != ' ' and line[keyword.len] != '\t')) continue;
+        const rest = std.mem.trim(u8, line[keyword.len..], " \t");
+        if (rest.len == 0) continue;
         // Strip an optional %zone / trailing comment token.
         var field = rest;
         if (std.mem.indexOfAny(u8, field, " \t#;%")) |cut| field = field[0..cut];
@@ -451,4 +453,19 @@ test "ResolverConfig caps nameservers at max_nameservers" {
     while (i < max_nameservers + 3) : (i += 1) cfg.addNameserver(.{ .ipv4 = .{ 10, 0, 0, @intCast(i) } });
     try std.testing.expectEqual(max_nameservers, cfg.nameserver_count);
     try std.testing.expectEqual(max_nameservers, cfg.nsSlice().len);
+}
+
+test "parseResolvConf requires whitespace after nameserver keyword" {
+    var cfg = ResolverConfig{};
+    const text =
+        "nameserver192.0.2.1\n" ++
+        "nameserver2001:db8::1\n" ++
+        "nameserver=192.0.2.2\n" ++
+        "nameserver\n" ++
+        "nameserver \t\n" ++
+        "nameserver\t192.0.2.53\n" ++
+        " nameserver  2001:db8::53 # valid IPv6\n";
+    try std.testing.expectEqual(@as(usize, 2), parseResolvConf(text, &cfg));
+    try std.testing.expectEqual(wire.Address{ .ipv4 = .{ 192, 0, 2, 53 } }, cfg.nameservers[0]);
+    try std.testing.expectEqual(parseIpLiteral("2001:db8::53").?, cfg.nameservers[1]);
 }

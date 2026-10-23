@@ -64,8 +64,7 @@ fn queryServer(ns: wire.Address, scope_id: u32, port: u16, query: []const u8, re
             const fd: linux.fd_t = @intCast(rc);
             defer _ = linux.close(fd);
 
-            const tv = linux.timeval{ .sec = @intCast(timeout_ms / 1000), .usec = @intCast((timeout_ms % 1000) * 1000) };
-            _ = linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+            try configureLinuxTimeouts(fd, timeout_ms);
 
             switch (ns) {
                 .ipv4 => |b| {
@@ -116,6 +115,16 @@ fn queryServer(ns: wire.Address, scope_id: u32, port: u16, query: []const u8, re
         },
         else => return error.SocketUnavailable,
     }
+}
+
+fn configureLinuxTimeouts(fd: linux.fd_t, timeout_ms: u32) ResolveError!void {
+    // A zero timeval disables the kernel deadline. Match the POSIX resolver's
+    // minimum and fail closed if either blocking operation cannot be bounded.
+    const finite_ms = @max(timeout_ms, 1);
+    const tv = linux.timeval{ .sec = @intCast(finite_ms / 1000), .usec = @intCast((finite_ms % 1000) * 1000) };
+    if (posix.errno(linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval))) != .SUCCESS or
+        posix.errno(linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval))) != .SUCCESS)
+        return error.SocketUnavailable;
 }
 
 fn queryServerWindows(ns: wire.Address, scope_id: u32, port: u16, query: []const u8, recv_buf: []u8, timeout_ms: u32) ResolveError![]const u8 {
@@ -416,4 +425,65 @@ test "DNS native resolver forward reverse and confirmation use IPv4 and IPv6 UDP
         joined = true;
         try std.testing.expectEqual(@as(usize, 4), worker.count);
     }
+}
+
+test "DNS Linux timeout installation fails closed on invalid socket" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try std.testing.expectError(error.SocketUnavailable, configureLinuxTimeouts(-1, 0));
+}
+
+test "DNS Linux zero timeout expires before a delayed UDP reply" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const platform = @import("../../substrate/platform.zig");
+    const fd_raw = linux.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(fd_raw));
+    const fd: linux.fd_t = @intCast(fd_raw);
+    defer _ = linux.close(fd);
+    try configureLinuxTimeouts(fd, 1000);
+    var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))));
+    var addr_len: posix.socklen_t = @sizeOf(@TypeOf(addr));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.getsockname(fd, @ptrCast(&addr), &addr_len)));
+
+    const Responder = struct {
+        fd: linux.fd_t,
+        received: bool = false,
+
+        fn run(self: *@This()) void {
+            var packet: [wire.max_message_len]u8 = undefined;
+            var peer: linux.sockaddr.in = undefined;
+            var peer_len: posix.socklen_t = @sizeOf(@TypeOf(peer));
+            const got = linux.recvfrom(self.fd, &packet, packet.len, 0, @ptrCast(&peer), &peer_len);
+            if (posix.errno(got) != .SUCCESS) return;
+            self.received = true;
+            // The late reply releases a regressed zero-timeout receive, so the
+            // regression fails an assertion instead of hanging the test gate.
+            var remaining = linux.timespec{ .sec = 0, .nsec = 250 * std.time.ns_per_ms };
+            while (true) {
+                var next: linux.timespec = undefined;
+                switch (posix.errno(linux.nanosleep(&remaining, &next))) {
+                    .SUCCESS => break,
+                    .INTR => remaining = next,
+                    else => return,
+                }
+            }
+            _ = linux.sendto(self.fd, &packet, got, 0, @ptrCast(&peer), peer_len);
+        }
+    };
+    var responder = Responder{ .fd = fd };
+    const thread = try std.Thread.spawn(.{}, Responder.run, .{&responder});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var query_buf: [wire.max_message_len]u8 = undefined;
+    const query = try wire.encodeQuery(&query_buf, 7, "zero-timeout.test", .a);
+    var response: [wire.max_message_len]u8 = undefined;
+    const started_ms = platform.monotonicMillis();
+    const result = queryServer(.{ .ipv4 = .{ 127, 0, 0, 1 } }, 0, std.mem.bigToNative(u16, addr.port), query, &response, 0);
+    const elapsed_ms = platform.monotonicMillis() - started_ms;
+    thread.join();
+    joined = true;
+    try std.testing.expect(responder.received);
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(elapsed_ms >= 0 and elapsed_ms < 2000);
 }
