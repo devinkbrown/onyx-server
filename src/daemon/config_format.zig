@@ -68,6 +68,8 @@ pub const Config = struct {
     /// `[trace] file` — operator-named flight-recorder dump. Unset keeps the
     /// ring in memory for oper DEBUG.
     trace: Trace = .{},
+    /// Optional process stderr sink, opened again by each Helix successor.
+    logging: Logging = .{},
     oper_ocg2: OperOcg2 = .{},
     wasm: Wasm = .{},
     listen: Listen = .{},
@@ -263,6 +265,12 @@ pub const Config = struct {
         /// DIE, RESTART, and mesh-scope bans wait for a second distinct oper.
         /// Default off: a single-oper network is unchanged.
         two_person_rule: bool = false,
+    };
+
+    pub const Logging = struct {
+        /// Append-only regular file owned by the daemon, mode 0600. Unset keeps
+        /// inherited stderr (for example journald); never logs protocol payloads.
+        stderr_file: ?[]const u8 = null,
     };
 
     /// `[trace]` flight-recorder file. A fault overwrites this path with the
@@ -992,6 +1000,7 @@ pub const Config = struct {
         if (self.oper.grants_path) |v| allocator.free(v);
         if (self.oper.event_history_path) |v| allocator.free(v);
         if (self.trace.file) |v| allocator.free(v);
+        if (self.logging.stderr_file) |v| allocator.free(v);
         if (self.wasm.plugin_dir) |v| allocator.free(v);
         freeWasmRegistry(allocator, self.wasm.registry);
         allocator.free(self.wasm.revoked_blake3);
@@ -1213,6 +1222,16 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try setOpt(allocator, resolver, doc.getString("oper.grants_path"), &cfg.oper.grants_path);
     try setOpt(allocator, resolver, doc.getString("oper.event_history_path"), &cfg.oper.event_history_path);
     try setOpt(allocator, resolver, doc.getString("trace.file"), &cfg.trace.file);
+    if (doc.get("logging")) |value| {
+        if (value.* != .table) return error.ParseError;
+    }
+    if (doc.get("logging.stderr_file")) |value| {
+        if (value.* != .string) return error.ParseError;
+        try setOpt(allocator, resolver, value.string, &cfg.logging.stderr_file);
+        const log_path = cfg.logging.stderr_file.?;
+        if (log_path.len == 0 or log_path.len >= 4096 or std.mem.indexOfScalar(u8, log_path, 0) != null)
+            return error.ParseError;
+    }
     if (doc.getBool("oper.auto_override")) |b| cfg.oper.auto_override = b;
     if (doc.getBool("oper.two_person_rule")) |b| cfg.oper.two_person_rule = b;
     try setOpt(allocator, resolver, doc.getString("wasm.plugin_dir"), &cfg.wasm.plugin_dir);
@@ -4410,4 +4429,27 @@ test "meshCloakSecretMissing: cloak federation guard flags meshed node with no s
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "persistent logging configuration owns its path and rejects malformed settings" {
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n";
+    var cfg = try parseToml(testing.allocator, base ++ "[logging]\nstderr_file=\"/var/log/onyx-server.log\"\n", .{});
+    defer cfg.deinit(testing.allocator);
+    try testing.expectEqualStrings("/var/log/onyx-server.log", cfg.logging.stderr_file.?);
+    var absent = try parseToml(testing.allocator, base, .{});
+    defer absent.deinit(testing.allocator);
+    try testing.expect(absent.logging.stderr_file == null);
+    try testing.expectError(error.ParseError, parseToml(testing.allocator, base ++ "[logging]\nstderr_file=42\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(testing.allocator, base ++ "[logging]\nstderr_file=\"\"\n", .{}));
+}
+
+test "persistent logging configuration releases ownership at every allocation failure" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var cfg = try parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[logging]\nstderr_file=\"/var/log/onyx-server.log\"\n", .{});
+            defer cfg.deinit(allocator);
+            try testing.expectEqualStrings("/var/log/onyx-server.log", cfg.logging.stderr_file.?);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{});
 }

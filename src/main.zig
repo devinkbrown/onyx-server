@@ -1182,6 +1182,12 @@ pub fn main(init: std.process.Init) !void {
                         std.debug.print("config ERROR in {s}: {s}\n", .{ path, why });
                         std.process.exit(1);
                     }
+                    if (l.parsed.logging.stderr_file) |log_path| {
+                        onyx_server.daemon.dlog.preflightPersistent(init.io, log_path) catch |err| {
+                            std.debug.print("config ERROR in {s}: logging destination: {s}\n", .{ path, @errorName(err) });
+                            std.process.exit(1);
+                        };
+                    }
                     if (comptime builtin.os.tag == .windows) {
                         if (l.config.sasl_enabled) if (l.parsed.sasl.account_db) |db| {
                             onyx_server.daemon.os_runtime.requirePrivateDirectoryWindows(init.io, std.Io.Dir.cwd(), db) catch |err| {
@@ -1541,6 +1547,13 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.num_shards = loaded.num_shards;
                 srv_cfg.config_path = path;
                 srv_cfg.config_resolver = resolver;
+                if (loaded.parsed.logging.stderr_file) |log_path| {
+                    // Keep the inherited sink if opening a replacement fails.
+                    // A logging-path race must never abort live Helix adoption.
+                    onyx_server.daemon.dlog.configurePersistent(init.io, log_path) catch |err| {
+                        std.debug.print("onyx-server: logging destination unavailable ({s}); retaining inherited stderr\n", .{@errorName(err)});
+                    };
+                }
                 // Windows pins every live companion to the effective config
                 // proof and carries its process-owned state. A configured
                 // native-media port has no socket when media is disabled.

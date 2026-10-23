@@ -1628,6 +1628,196 @@ fn ignoreSigpipe() void {
 fn srvLog(comptime fmt: []const u8, args: anytype) void {
     dlog.log(fmt, args);
 }
+
+const ConnectionDiagnosticEvent = enum {
+    accepted,
+    adopted,
+    registered,
+    closed,
+    refused,
+    recv_eof,
+    recv_error,
+    send_error,
+    recv_buffer_missing,
+    recv_buffer_bounds,
+    recv_buffer_replenish,
+    ktls_rx_close,
+    tls_established,
+    tls_kernel_handshake_conflict,
+    tls_output_error,
+    tls_error,
+    command_quit,
+    parser_error,
+    recvq_limit,
+    nick_auth_required,
+    nick_denial_output,
+    websocket_peer_close,
+    websocket_close,
+};
+
+/// Only server-defined categories enter logs. QUIT reasons and other arbitrary
+/// wire text can contain secrets, so unknown reasons are deliberately omitted.
+const ConnectionDiagnosticReason = enum {
+    none,
+    generic_client_quit,
+    ping_timeout,
+    registration_timeout,
+    tls_peer_alert,
+    tls_record_failure,
+    registered_nick,
+    flood,
+    line_too_long,
+    server_draining,
+    send_no_progress,
+    send_completion,
+    other_redacted,
+};
+
+fn connectionDiagnosticReason(reason: []const u8) ConnectionDiagnosticReason {
+    const known = .{
+        .{ "Client quit", ConnectionDiagnosticReason.generic_client_quit },
+        .{ "Ping timeout", ConnectionDiagnosticReason.ping_timeout },
+        .{ "Registration timeout", ConnectionDiagnosticReason.registration_timeout },
+        .{ "TLS peer alert", ConnectionDiagnosticReason.tls_peer_alert },
+        .{ "TLS record failure", ConnectionDiagnosticReason.tls_record_failure },
+        .{ "Registered nickname requires authentication", ConnectionDiagnosticReason.registered_nick },
+        .{ "Excess Flood", ConnectionDiagnosticReason.flood },
+        .{ "Line too long", ConnectionDiagnosticReason.line_too_long },
+        .{ "Server draining", ConnectionDiagnosticReason.server_draining },
+        .{ "SEND made no progress", ConnectionDiagnosticReason.send_no_progress },
+        .{ "Invalid SEND completion", ConnectionDiagnosticReason.send_completion },
+        .{ "Invalid TLS prefix completion", ConnectionDiagnosticReason.send_completion },
+    };
+    inline for (known) |entry| {
+        if (std.mem.eql(u8, reason, entry[0])) return entry[1];
+    }
+    return if (reason.len == 0) .none else .other_redacted;
+}
+
+/// Process-local diagnostics never enter a session/checkpoint. Bound logging
+/// during connection churn or repeated preregistration failures, and report
+/// dropped lines on the next admitted event. No allocation or blocking lock.
+const ConnectionDiagnosticBudget = struct {
+    window: std.atomic.Value(u64) = .init(0),
+    suppressed: std.atomic.Value(u64) = .init(0),
+    const per_second = 128;
+
+    fn take(self: *ConnectionDiagnosticBudget, now_ms: u64) ?u64 {
+        const second = (now_ms / 1000) & 0x0000ffffffffffff;
+        var old = self.window.load(.monotonic);
+        var attempts: usize = 0;
+        while (attempts < 8) : (attempts += 1) {
+            // A delayed thread must never reopen a spent earlier window and
+            // then let another caller reset the current window's budget again.
+            const effective_second = @max(second, old >> 16);
+            const count = if (old >> 16 == effective_second) old & 0xffff else 0;
+            if (count >= per_second) break;
+            const next = (effective_second << 16) | (count + 1);
+            if (self.window.cmpxchgWeak(old, next, .monotonic, .monotonic)) |observed| {
+                old = observed;
+            } else return self.suppressed.swap(0, .monotonic);
+        }
+        _ = self.suppressed.fetchAdd(1, .monotonic);
+        return null;
+    }
+};
+var connection_diagnostic_budget: ConnectionDiagnosticBudget = .{};
+
+fn diagnosticNick(nick: []const u8, out: *[256]u8) []const u8 {
+    const hex = "0123456789abcdef";
+    var len: usize = 0;
+    for (nick[0..@min(nick.len, 64)]) |byte| {
+        if (byte >= 0x21 and byte <= 0x7e and byte != '"' and byte != '\\') {
+            out[len] = byte;
+            len += 1;
+        } else {
+            out[len..][0..4].* = .{ '\\', 'x', hex[byte >> 4], hex[byte & 15] };
+            len += 4;
+        }
+    }
+    return out[0..len];
+}
+
+fn formatConnectionDiagnostic(
+    out: []u8,
+    now_ms: u64,
+    conn: *const ConnState,
+    event: ConnectionDiagnosticEvent,
+    result: i32,
+    failure: ?anyerror,
+    reason: ConnectionDiagnosticReason,
+    suppressed: u64,
+) ![]const u8 {
+    var peer_buf: [64]u8 = undefined;
+    const peer = if (conn.peer_addr) |addr| LinuxServer.addrText(addr, &peer_buf) orelse "unknown" else "unknown";
+    var nick_buf: [256]u8 = undefined;
+    const nick = diagnosticNick(conn.session.displayName(), &nick_buf);
+    const transport = if (conn.ws != null) (if (conn.is_tls) "wss" else "ws") else if (conn.is_tls) "tls" else "tcp";
+    return std.fmt.bufPrint(out, "onyx-server: connection ts_ms={d} event={s} slot={d} generation={d} fd={d} peer={s} transport={s} nick=\"{s}\" registered={} ktls_rx={} ktls_tx={} queued={d} result={d} errno={d} error={s} reason={s} suppressed={d}\n", .{
+        now_ms,                    @tagName(event),       conn.token.slot,       conn.token.gen,        conn.fd, peer,                                     transport,                                      nick,
+        conn.session.registered(), conn.tls_rx_offloaded, conn.tls_tx_offloaded, connSendBacklog(conn), result,  if (result < 0) -@as(i64, result) else 0, if (failure) |err| @errorName(err) else "none", @tagName(reason),
+        suppressed,
+    });
+}
+
+fn logConnectionDiagnostic(conn: *const ConnState, event: ConnectionDiagnosticEvent, result: i32, failure: ?anyerror, reason: ConnectionDiagnosticReason) void {
+    if (builtin.is_test) return;
+    const now_ms: u64 = @intCast(@max(0, platform.realtimeMillis()));
+    const budget_ms: u64 = @intCast(@max(0, platform.monotonicMillis()));
+    const suppressed = connection_diagnostic_budget.take(budget_ms) orelse return;
+    var line: [768]u8 = undefined;
+    const rendered = formatConnectionDiagnostic(&line, now_ms, conn, event, result, failure, reason, suppressed) catch return;
+    srvLog("{s}", .{rendered});
+}
+
+test "connection diagnostics escape identifiers and exclude credentials and wire text" {
+    var conn = ConnState.init(17);
+    conn.token = .{ .slot = 7, .gen = 3 };
+    conn.peer_addr = .{ .ipv4 = .{ 192, 0, 2, 8 } };
+    conn.is_tls = true;
+    try conn.session.setNick("Ari\"\\adne");
+    conn.close_reason = "QUIT :secret-password-and-token";
+    const wire = "AUTHENTICATE secret-sasl-payload";
+    @memcpy(conn.send_buf[0..wire.len], wire);
+    conn.send_len = wire.len;
+    conn.session.sasl_server_nonce = "secret-server-nonce";
+    var out: [768]u8 = undefined;
+    const line = try formatConnectionDiagnostic(&out, 1792769786000, &conn, .recv_error, -104, error.ConnectionReset, connectionDiagnosticReason(conn.close_reason), 9);
+    try std.testing.expect(std.mem.indexOf(u8, line, "slot=7 generation=3 fd=17 peer=192.0.2.8 transport=tls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "nick=\"Ari\\x22\\x5cadne\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "result=-104 errno=104 error=ConnectionReset reason=other_redacted suppressed=9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "secret") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, line, "\r"));
+    try std.testing.expectEqual(ConnectionDiagnosticReason.ping_timeout, connectionDiagnosticReason("Ping timeout"));
+    var escaped: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("\\x0d\\x0a\\x00", diagnosticNick("\r\n\x00", &escaped));
+
+    // The maximum nickname expansion and minimum signed I/O result remain
+    // bounded. No truncation may produce a forged second log record.
+    try conn.session.setNick(&(@as([64]u8, @splat('"'))));
+    const longest = try formatConnectionDiagnostic(&out, std.math.maxInt(u64), &conn, .recv_buffer_replenish, std.math.minInt(i32), error.OutOfMemory, .registration_timeout, std.math.maxInt(u64));
+    try std.testing.expect(longest.len < out.len);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, longest, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, longest, "errno=2147483648") != null);
+}
+
+test "connection diagnostics rate budget reports suppressed churn in the next window" {
+    var budget: ConnectionDiagnosticBudget = .{};
+    for (0..ConnectionDiagnosticBudget.per_second) |_| {
+        try std.testing.expectEqual(@as(?u64, 0), budget.take(1000));
+    }
+    for (0..10) |_| try std.testing.expect(budget.take(1999) == null);
+    try std.testing.expectEqual(@as(?u64, 10), budget.take(2000));
+    try std.testing.expectEqual(@as(?u64, 0), budget.take(2001));
+    for (2..ConnectionDiagnosticBudget.per_second) |_| {
+        try std.testing.expectEqual(@as(?u64, 0), budget.take(2000));
+    }
+    // A delayed caller from the previous second cannot reopen either window.
+    try std.testing.expect(budget.take(1999) == null);
+    try std.testing.expect(budget.take(2000) == null);
+    try std.testing.expectEqual(@as(?u64, 2), budget.take(3000));
+}
 // Timeout-sweep period and IP-reputation penalty weights are operator-tunable
 // via `[limits].sweep_interval` and `[reputation]` (see Config fields).
 const default_reply_bytes: usize = 8192;
@@ -12104,11 +12294,13 @@ pub const LinuxServer = struct {
     }
 
     fn startAcceptedClient(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, kind: AcceptKind, arm_recv: bool) !bool {
-        return switch (kind) {
+        const started = switch (kind) {
             .plain => try self.startAcceptedPlain(conn, arm_recv),
             .tls => try self.startAcceptedTls(id, conn, arm_recv),
             .ws => try self.startAcceptedWs(id, conn, arm_recv),
         };
+        if (started) logConnectionDiagnostic(conn, .accepted, 0, null, .none);
+        return started;
     }
 
     /// Add `points` of penalty to a peer's reputation (no-op when disabled or the
@@ -12251,6 +12443,7 @@ pub const LinuxServer = struct {
     /// Record refusal of a completely initialized physical slot. The total was
     /// acquired when the slot became live; only its active ownership is released.
     fn noteClientRefusedBeforeLive(self: *LinuxServer, conn: *ConnState) void {
+        logConnectionDiagnostic(conn, .refused, 0, null, connectionDiagnosticReason(conn.close_reason));
         self.dropClientStats(conn);
     }
 
@@ -13086,6 +13279,7 @@ pub const LinuxServer = struct {
 
     fn failTls(self: *LinuxServer, conn: *ConnState, failure: anyerror) void {
         const t = conn.tls orelse return;
+        if (!conn.tls_terminal_failure) logConnectionDiagnostic(conn, .tls_error, 0, failure, .none);
         conn.tls_terminal_failure = true;
         conn.closing = true;
         conn.close_reason = if (failure == error.TlsAlert) "TLS peer alert" else "TLS record failure";
@@ -13123,18 +13317,21 @@ pub const LinuxServer = struct {
         if (comptime builtin.os.tag != .linux) return;
         const id = event.buffer_id orelse return;
         const src = self.rx().ring.providedSlice(id) orelse {
+            logConnectionDiagnostic(conn, .recv_buffer_missing, event.res, null, .none);
             conn.closing = true;
             return;
         };
         if (event.res > 0) {
             const n: usize = @intCast(event.res);
             if (n > src.len or n > conn.recv_buf.len) {
+                logConnectionDiagnostic(conn, .recv_buffer_bounds, event.res, null, .none);
                 conn.closing = true;
             } else {
                 @memcpy(conn.recv_buf[0..n], src[0..n]);
             }
         }
-        self.rx().ring.replenishProvidedBuffer(src, id) catch {
+        self.rx().ring.replenishProvidedBuffer(src, id) catch |err| {
+            logConnectionDiagnostic(conn, .recv_buffer_replenish, event.res, err, .none);
             conn.closing = true;
         };
     }
@@ -13261,6 +13458,7 @@ pub const LinuxServer = struct {
                     return;
                 },
                 .close => {
+                    logConnectionDiagnostic(conn, .ktls_rx_close, event.res, null, .none);
                     conn.closing = true;
                     try self.armSendIfNeeded(conn);
                     if (!hasUnsentOutput(conn)) {
@@ -13271,7 +13469,10 @@ pub const LinuxServer = struct {
             }
         }
 
-        if (event.res <= 0) conn.closing = true;
+        if (event.res <= 0) {
+            logConnectionDiagnostic(conn, if (event.res == 0) .recv_eof else .recv_error, event.res, null, .none);
+            conn.closing = true;
+        }
         if (event.res > 0) {
             // A selected recv that did not name its buffer must not parse a
             // stale `recv_buf`. kTLS copy recv is the exception: the kernel
@@ -13280,6 +13481,7 @@ pub const LinuxServer = struct {
                 if (event.buffer_id == null and !conn.tls_rx_offloaded and
                     was_multishot_armed)
                 {
+                    logConnectionDiagnostic(conn, .recv_buffer_missing, event.res, null, .none);
                     conn.closing = true;
                 }
             }
@@ -13402,6 +13604,7 @@ pub const LinuxServer = struct {
             // An actual stream error cannot complete the collision handshake.
             // Preserve the ordinary immediate failure path instead of retrying
             // a tail across a known byte gap.
+            logConnectionDiagnostic(conn, .send_error, event.res, null, .none);
             conn.s2s_dedup_drain_deadline_ms = 0;
             try self.closeConn(event.token, conn.close_reason);
             return;
@@ -17699,6 +17902,7 @@ pub const LinuxServer = struct {
                 }
                 conn.session_handoff_retry = false;
             }
+            logConnectionDiagnostic(conn, .closed, 0, null, connectionDiagnosticReason(reason));
             // Release any SendQ / RecvQ overflow heap before the slot is freed/reused
             // (covers every close path below, including S2S links that carry mesh bursts).
             if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
@@ -18030,6 +18234,7 @@ pub const LinuxServer = struct {
         }
         if (handshake_pending and conn.tls.?.handshakeDone()) {
             self.recordElapsedLatency(.tls_handshake, started_at_ms);
+            logConnectionDiagnostic(conn, .tls_established, 0, null, .none);
         }
         // Once the mTLS handshake completes, bind the presented client cert's
         // fingerprint to the session so SASL EXTERNAL can match it to an account.
@@ -18066,6 +18271,7 @@ pub const LinuxServer = struct {
         // server-initiated post-handshake sends, so drop it (the client
         // reconnects) rather than corrupt the stream.
         if (conn.tls_tx_offloaded and outcome.handshake_bytes.len != 0) {
+            logConnectionDiagnostic(conn, .tls_kernel_handshake_conflict, 0, null, .none);
             conn.closing = true;
             return;
         }
@@ -18079,7 +18285,8 @@ pub const LinuxServer = struct {
             // re-encrypt the flight as application_data (clients abort with
             // "unexpected message"). TLS 1.3 sends its Finished pre-established so
             // it never tripped this.
-            rawAppendToConn(conn, outcome.handshake_bytes) catch {
+            rawAppendToConn(conn, outcome.handshake_bytes) catch |err| {
+                logConnectionDiagnostic(conn, .tls_output_error, 0, err, .none);
                 conn.closing = true;
                 return;
             };
@@ -18242,6 +18449,7 @@ pub const LinuxServer = struct {
                 .pong => {},
                 .close => |payload| {
                     // Echo the close (status code included) and drain-close.
+                    logConnectionDiagnostic(conn, .websocket_peer_close, 0, null, .none);
                     wsQueueControl(conn, .close, payload);
                     conn.closing = true;
                     return;
@@ -18448,6 +18656,7 @@ pub const LinuxServer = struct {
         self.deliverWelcome(conn);
         self.emitClientRegistered(id, conn);
         self.evaluateNickProtection(conn);
+        logConnectionDiagnostic(conn, .registered, 0, null, .none);
     }
 
     fn feedBytes(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, bytes: []const u8) !void {
@@ -18455,6 +18664,7 @@ pub const LinuxServer = struct {
         for (bytes) |byte| {
             const line = (recvqPush(conn, byte) catch |err| switch (err) {
                 error.LineTooLong => {
+                    logConnectionDiagnostic(conn, .recvq_limit, 0, err, .none);
                     conn.closing = true;
                     self.stats.onError();
                     return error.LineTooLong;
@@ -18480,6 +18690,7 @@ pub const LinuxServer = struct {
         const parsed = irc_line.parseLine(line) catch |err| switch (err) {
             error.EmptyLine => return,
             else => {
+                logConnectionDiagnostic(conn, .parser_error, 0, err, .none);
                 conn.closing = true;
                 return;
             },
@@ -18621,6 +18832,7 @@ pub const LinuxServer = struct {
             }
             if (conn.session.registered()) try self.completeLiveRegistration(id, conn);
             if (std.ascii.eqlIgnoreCase(parsed.command, "QUIT")) {
+                logConnectionDiagnostic(conn, .command_quit, 0, null, .none);
                 conn.closing = true;
             }
             return;
@@ -19011,6 +19223,7 @@ pub const LinuxServer = struct {
         conn.session.registration.registered = false;
         conn.session.registration.nick_seen = false;
         conn.session.client.registration.prereg = .user_seen;
+        logConnectionDiagnostic(conn, .nick_auth_required, 0, null, .registered_nick);
         queueNumeric(
             conn,
             .ERR_ERRONEUSNICKNAME,
@@ -19022,7 +19235,10 @@ pub const LinuxServer = struct {
             error.NoSpaceLeft,
             error.OversizeLine,
             error.LineTooLong,
-            => conn.closing = true,
+            => {
+                logConnectionDiagnostic(conn, .nick_denial_output, 0, err, .registered_nick);
+                conn.closing = true;
+            },
             else => return err,
         };
         return true;
@@ -36855,6 +37071,7 @@ pub const LinuxServer = struct {
                 if (!slot.occupied) continue;
                 if (slot.value.s2s != null or slot.value.s2s_secured != null) continue;
                 self.noteClientAccepted(&slot.value);
+                logConnectionDiagnostic(&slot.value, .adopted, 0, null, .none);
             }
         }
 
@@ -63169,6 +63386,7 @@ pub const LinuxServer = struct {
     }
 
     pub fn handleQuit(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        logConnectionDiagnostic(conn, .command_quit, 0, null, .none);
         const reason = if (parsed.param_count >= 1) parsed.paramSlice()[0] else "Client quit";
         // QUIT closes this transport, not the shared logical identity. If another
         // attachment is live, hand ownership/state to it and let the ordinary
@@ -70054,6 +70272,7 @@ fn wsMessageTooBig(conn: *ConnState) void {
 }
 
 fn wsCloseStatus(conn: *ConnState, status: u16) void {
+    logConnectionDiagnostic(conn, .websocket_close, status, null, .none);
     var payload: [2]u8 = undefined;
     std.mem.writeInt(u16, &payload, status, .big);
     wsQueueControl(conn, .close, &payload);
