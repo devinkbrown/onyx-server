@@ -32,12 +32,24 @@ has no public-resolver fallback. Literal addresses bypass that I/O. Windows keep
 its native resolver path. Web Push continues to screen and pin the returned
 address before connecting.
 
-HTTP fetch retains its own DNS transports at this revision. They use the shared
-wire codec and existing validation helpers, but do not automatically gain the
-new query engine's TCP fallback or whole-lookup deadline policy.
+POSIX HTTP lookups use that same adapter for A, AAAA, and dual-family resolution.
+The caller's budget is clamped to 1–5,000 ms and shared across ordered endpoints,
+aliases, and TCP fallback. A dual-family lookup performs A on the caller and AAAA
+on one helper thread under the exact same deadline. The helper is always joined
+before results are read or borrowed configuration/name storage can expire. Either
+family can succeed independently. If the helper cannot start, the lookup performs
+A only; it does not run a second sequential lookup. Windows retains its native
+resolver policy. Missing or unusable HTTP nameserver configuration does not
+silently select a public resolver.
 
-All lookup entry points wait for native socket readiness and must run on resolver
-workers. They do not make synchronous DNS safe to call on a server reactor. A
+HTTP and ACME read configuration before starting their socket deadline. Native
+file reads, thread scheduling, and join scheduling are outside that I/O bound.
+These calls still block their caller; this consolidation does not move existing
+HTTP or mesh hostname callers off their reactors.
+
+Lookup entry points wait for native socket readiness. New integrations should run
+them on resolver workers; the deadline does not make synchronous DNS safe to call
+on a server reactor. A
 forward-confirmed lookup made through `resolveConfirmed` shares one budget across
 PTR and forward confirmation. The daemon rDNS worker also shares one absolute
 deadline across both operations and retains the owned PTR observation if forward
@@ -176,7 +188,13 @@ cache expiry/pressure/allocation failure, and shared deadlines across real retri
 The ordinary `dns` module filter also discovers rDNS, DNSBL, and relevant existing
 codec/consumer tests. Real worker regressions also cover delayed PTR plus silent
 confirmation, eight silent DNSBL zones, and a last-zone listing after earlier
-silence. Run Debug and safe-mode focused gates with the repository's
+silence. HTTP tests require both real A and AAAA questions before emitting either
+answer, reject a deliberately serialized implementation, and check partial-family
+results, helper-start failure, backup order, and the shared deadline. ACME tests
+exercise its real resolver callback against incorrect IDs/questions and silent
+endpoints. The UDP/TCP fixture retries at most eight exact port-collision failures,
+closing both owned sockets between attempts; other setup errors remain failures.
+Run Debug and safe-mode focused gates with the repository's
 Zig compiler, plus supported-platform compile checks.
 
 A failed legacy lookup commonly surfaces as `Timeout`; use the detailed API's

@@ -36,6 +36,7 @@ where that contract is not yet suite-green.
 
 ## Operations
 
+- [Client disconnect diagnosis](ops/client-disconnects.md) — receive reasons, Linux keepalive policy, and upgrade limits
 - [Runbook](RUNBOOK.md) — staging, systemd install, config validation, hot-upgrade, rollback, health checks
 - [Contributing](../CONTRIBUTING.md) — source-of-truth workflow, build/test lanes, PR checklist
 - [Security policy](../SECURITY.md) — private vulnerability reporting
