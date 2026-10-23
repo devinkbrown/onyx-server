@@ -11,10 +11,10 @@ does not resolve TXT records.
 ## Runtime use
 
 `resolveForward`, `resolveReverse`, and `resolveConfirmed` use the new query engine.
-The rDNS worker in `src/daemon/rdns.zig` calls the forward and reverse wrappers;
-the DNSBL worker in `src/daemon/dnsbl_resolver.zig` calls the forward wrapper.
-These workers therefore use the engine's validation, alias traversal, scoped
-IPv6 transport, TCP fallback, and bounded lookup budget.
+The rDNS worker in `src/daemon/rdns.zig` uses a typed PTR-observation and
+confirmation operation; the DNSBL worker in `src/daemon/dnsbl_resolver.zig` queries
+the same engine directly. Both use its validation, alias traversal, scoped IPv6
+transport, TCP fallback, and a whole-job budget capped at five seconds.
 
 The detailed `resolve` API additionally returns the canonical name, addresses or
 PTR name, outcome, alias count, and validated TTL. `CachedResolver` owns a bounded
@@ -30,8 +30,17 @@ the new query engine's TCP fallback or deadline policy.
 All lookup entry points wait for native socket readiness and must run on resolver
 workers. They do not make synchronous DNS safe to call on a server reactor. A
 forward-confirmed lookup made through `resolveConfirmed` shares one budget across
-PTR and forward confirmation. Two independent wrapper calls, as currently used by
-the rDNS worker, each have their own budget.
+PTR and forward confirmation. The daemon rDNS worker also shares one absolute
+deadline across both operations and retains the owned PTR observation if forward
+confirmation fails or times out. Only a matching forward result becomes a
+confirmed hostname.
+
+A complete DNSBL scan shares one deadline across all configured zones, preserving
+zone order and the first listing. Each zone receives an equal share of the
+remaining time; quick replies leave their unused time for later zones. The
+existing fail-open result policy remains: this deadline change does not make
+transient failures authoritative negative DNS answers. Scheduler delays are
+outside the socket I/O deadline.
 
 ## Ownership and modules
 
@@ -44,6 +53,7 @@ the rDNS worker, each have their own budget.
 | `deadline.zig`, `transport.zig` | Absolute monotonic budget and owned native sockets |
 | `resolver_config.zig`, `windows_abi.zig` | Host policy discovery and native Windows ABI |
 | `resolver.zig` | Existing resolver API and error compatibility |
+| `confirmation.zig` | Owned PTR observation and forward confirmation under one deadline |
 | `result_cache.zig`, `cached_resolver.zig` | Bounded owned results and a worker-owned cache integration API |
 | `cache.zig` | Original forward/PTR cache API retained for existing users |
 
@@ -155,7 +165,9 @@ They exercise IPv4/IPv6, peer/ID/question rejection, partial TC envelopes, TCP
 fragmentation and size limits, alias cycles and aging TTLs, negative responses,
 cache expiry/pressure/allocation failure, and shared deadlines across real retries.
 The ordinary `dns` module filter also discovers rDNS, DNSBL, and relevant existing
-codec/consumer tests. Run Debug and safe-mode focused gates with the repository's
+codec/consumer tests. Real worker regressions also cover delayed PTR plus silent
+confirmation, eight silent DNSBL zones, and a last-zone listing after earlier
+silence. Run Debug and safe-mode focused gates with the repository's
 Zig compiler, plus supported-platform compile checks.
 
 A failed legacy lookup commonly surfaces as `Timeout`; use the detailed API's
@@ -165,3 +177,19 @@ have zero cache lifetime. Repeated misses with zero lifetime are expected for
 zero-TTL records and negative replies lacking an applicable SOA. For TCP failures,
 check that the configured resolver permits TCP on the same port as UDP. The TCP
 framing policy follows [RFC 7766 section 8](https://www.rfc-editor.org/rfc/rfc7766#section-8).
+
+## Accepted worker-job ownership
+
+The rDNS and DNSBL workers reserve a cache row only after queue admission succeeds.
+Queued and active jobs pin their rows against eviction, including a DNSBL row
+whose synchronous remembered verdict becomes visible before its accepted probe
+finishes. Completion releases that reservation under the resolver mutex.
+
+Historical checkpoints can contain pending rows with no matching FIFO job.
+Demand can re-admit such work, and a bounded worker scan repairs at most one row
+per boundary. If a historical FIFO head has no row and every row is pending,
+one unreserved orphan may run first to create a reclaimable row; the existing
+FIFO bytes and relative order remain unchanged. Capture refuses an active job,
+and restore reconstructs runtime reservations from the validated FIFO. These
+repairs preserve the existing checkpoint layout and do not infer work ownership
+from timestamps or change the legacy cache's thirty-minute lifetime policy.
