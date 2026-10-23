@@ -899,7 +899,7 @@ fn readFamily(fd: sys.fd_t, query: []const u8) ?FamilyAnswer {
 
 fn pollCount(polls: []sys.pollfd, timeout_ms: i32) ?usize {
     while (true) {
-        const rc = sys.poll(polls.ptr, polls.len, timeout_ms);
+        const rc = sys.poll(polls.ptr, @intCast(polls.len), timeout_ms);
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
