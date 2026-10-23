@@ -56,9 +56,9 @@ pub const Options = struct {
     require_sct: u8 = 0,
 };
 
-/// Both address families for `host`, from one wait per nameserver. IPv4 and
-/// IPv6 literals skip DNS. A nameserver of either family is queried; A and
-/// AAAA share the timeout instead of walking the resolver twice.
+/// Both address families for `host`. IP literals skip DNS; Windows retains its
+/// native resolver policy. POSIX A and AAAA run concurrently under one clamped
+/// 1..5000 ms deadline across all configured nameservers and follow-ups.
 pub const HostFamilies = struct {
     v4: ?[4]u8 = null,
     v6: ?[16]u8 = null,
