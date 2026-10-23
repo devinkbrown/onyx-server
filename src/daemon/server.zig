@@ -17360,7 +17360,7 @@ pub const LinuxServer = struct {
         // every channel route is still visible. Per-channel negatives follow to
         // converge authority and are client-display-deduped at the receiver.
         if (announce and !conn.session_mesh_announce_pending) {
-            self.retireOrdinaryGuest(conn);
+            _ = self.retireOrdinaryGuest(conn);
             self.publishWhoisGone(conn, nick);
             self.announceMembership(presence_channel, nick, 0, false, quit_identity, mesh_quit_setter);
         }
@@ -22092,6 +22092,11 @@ pub const LinuxServer = struct {
         // origin. Never let an older origin keep mutating the obsolete nick even
         // when both snapshots contain the same channel.
         if (!std.ascii.eqlIgnoreCase(nick, best.nick)) return .reject;
+        // The internal presence channel is a signed nick-routing claim, not a
+        // user channel in the portable snapshot. Bind its add/remove to the same
+        // exact live OFFER after the account/nick checks above; ordinary channels
+        // still require exact snapshot membership below.
+        if (isPresenceChannel(channel)) return .{ .bind = exact.token };
         const desired_present = sessionSnapshotChannelMode(&snapshot, channel) != null;
         if (present != desired_present) return .reject;
         return .{ .bind = exact.token };
@@ -29308,6 +29313,7 @@ pub const LinuxServer = struct {
             };
             self.finishLoginWithFactor(conn, account, .recovery) catch |err| switch (err) {
                 error.StorePoisoned => return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery"),
+                error.GuestPresenceUnavailable => return self.failReply(conn, "RECOVERYCODES", "TEMPORARILY_UNAVAILABLE", "Could not retire the previous guest route"),
                 else => return err,
             };
             self.recordAccountLogin(conn, account, .recovery, conn.session.tls_certfp orelse "");
@@ -42650,6 +42656,9 @@ pub const LinuxServer = struct {
         const oper_elevation_allowed = ircxAuthAllowsOperElevation(package);
         conn.session.sasl_router = null;
         conn.session.sasl_pending = null;
+        const was_account_bound = conn.session.account() != null;
+        if ((!result.guest or was_account_bound) and !self.retireOrdinaryGuestForAccountBind(conn))
+            return self.failReply(conn, "AUTH", "TEMPORARILY_UNAVAILABLE", "Could not retire the previous guest route");
         self.retireMediaBeforeAccountMutation(id, conn, if (result.guest) null else account);
         _ = self.clearOperAuthorityTransition(
             id,
@@ -42663,6 +42672,7 @@ pub const LinuxServer = struct {
             if (conn.session.account()) |old| _ = self.removeTrackedSession(old, monitorIdFromClient(id));
             conn.session_list_cache.reset();
             conn.session.loginGuest(account);
+            if (was_account_bound) self.publishOrdinaryGuest(conn, true);
         } else {
             if (conn.session.account()) |old| {
                 if (!std.ascii.eqlIgnoreCase(old, account)) _ = self.removeTrackedSession(old, monitorIdFromClient(id));
@@ -42676,6 +42686,7 @@ pub const LinuxServer = struct {
             self.restoreAccountMetadata(conn, account);
             self.restoreAccountSilence(conn, account);
         }
+        if (!result.guest or was_account_bound) self.reannounceVisibleHost(conn);
         conn.session.client.registration.sasl = .succeeded;
         if (conn.session.account()) |acct| self.emitAccountChange(id, conn, acct);
         if (final_copy) |final| try ircxAuthChallenge(conn, package, final);
@@ -46147,6 +46158,7 @@ pub const LinuxServer = struct {
     ) !void {
         if (!self.authenticationAvailable()) return error.StorePoisoned;
         const id = idFromToken(conn.token);
+        if (!self.retireOrdinaryGuestForAccountBind(conn)) return error.GuestPresenceUnavailable;
         self.retireMediaBeforeAccountMutation(id, conn, account);
         _ = self.clearOperAuthorityTransition(id, conn, true, "account authentication replaced operator authority");
         // Re-login to a different account: drop the previous account's session
@@ -46158,6 +46170,7 @@ pub const LinuxServer = struct {
         }
         loginSession(conn, account);
         conn.session.auth_factor = factor;
+        self.reannounceVisibleHost(conn);
         self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(id, conn, acct);
         self.maybeApplyAccountCloak(id, conn);
@@ -46190,13 +46203,19 @@ pub const LinuxServer = struct {
         const email = parsed.paramSlice()[1];
         const has_email = email.len != 0 and !std.mem.eql(u8, email, "*");
         const password = parsed.paramSlice()[2];
+        const had_guest_incarnation = !std.mem.allEqual(u8, &conn.guest_id, 0);
+        if (!self.retireOrdinaryGuestForAccountBind(conn))
+            return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Could not retire the previous guest route");
         var scratch: [1024]u8 = undefined;
         _ = svc.registerAccountWithEmail(account, password, if (has_email) email else null, false, &scratch) catch |err| {
+            if (had_guest_incarnation) self.publishOrdinaryGuest(conn, true);
             try self.failReply(conn, "REGISTER", registerFailCode(err), "Registration failed");
             return;
         };
-        if (!self.authenticationAvailable())
+        if (!self.authenticationAvailable()) {
+            if (had_guest_incarnation) self.publishOrdinaryGuest(conn, true);
             return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
+        }
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
         _ = self.clearOperAuthorityTransition(
             idFromToken(conn.token),
@@ -46210,6 +46229,7 @@ pub const LinuxServer = struct {
         }
         loginSession(conn, account);
         conn.session.auth_factor = .password;
+        self.reannounceVisibleHost(conn);
         self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         var buf: [default_reply_bytes]u8 = undefined;
@@ -46461,6 +46481,8 @@ pub const LinuxServer = struct {
         }
         if (!self.authenticationAvailable())
             return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
+        if (!self.retireOrdinaryGuestForAccountBind(conn))
+            return self.failReply(conn, "IDENTIFY", "TEMPORARILY_UNAVAILABLE", "Could not retire the previous guest route");
         self.recordAccountLogin(conn, account, .password, conn.session.tls_certfp orelse "");
         self.loginRecordSuccess(conn, account);
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
@@ -46479,6 +46501,7 @@ pub const LinuxServer = struct {
         }
         loginSession(conn, account);
         conn.session.auth_factor = .password;
+        self.reannounceVisibleHost(conn);
         self.publishWhoisProfile(conn, true);
         if (conn.session.account()) |acct| self.emitAccountChange(idFromToken(conn.token), conn, acct);
         // Per-account cloak: switch the visible host to <account>.users.<suffix>
@@ -46535,6 +46558,10 @@ pub const LinuxServer = struct {
         if (was_oper)
             _ = self.clearOperAuthorityTransition(id, conn, true, "account logout revoked operator authority");
         conn.session.logout();
+        if (was_logged_in) {
+            self.publishOrdinaryGuest(conn, true);
+            self.reannounceVisibleHost(conn);
+        }
         self.publishWhoisProfile(conn, true);
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, ":{s} NOTICE {s} :You are now logged out\r\n", .{ self.serverName(), conn.session.displayName() }) catch return;
@@ -49205,6 +49232,7 @@ pub const LinuxServer = struct {
             return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         self.finishLoginWithFactor(conn, cred.account(), .passkey) catch |err| switch (err) {
             error.StorePoisoned => return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery"),
+            error.GuestPresenceUnavailable => return self.failReply(conn, "WEBAUTHN", "TEMPORARILY_UNAVAILABLE", "Could not retire the previous guest route"),
             else => return err,
         };
         self.recordAccountLogin(conn, cred.account(), .passkey, cred_id_b64);
@@ -51222,7 +51250,16 @@ pub const LinuxServer = struct {
                         // MTOKEN on another node while the issuer remains connected;
                         // waiting until detach would force a redirect/ownership race
                         // and violate mesh-wide multi-attachment semantics.
-                        _ = self.shipSessionMigration(id, conn, account, handle.token);
+                        if (!self.shipSessionMigration(id, conn, account, handle.token)) {
+                            try self.failReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "Could not publish exact mesh session authority");
+                            return;
+                        }
+                        // Receiver-side exact-token MEMBERSHIP resolution discards
+                        // token-less route rows once an OFFER arrives. Reannounce
+                        // this connection only after its signed OFFER and current
+                        // attachment lease are durable, so the internal presence
+                        // nick claim can bind to the exact portable session.
+                        self.reannounceVisibleHost(conn);
                         var lb: [1152]u8 = undefined;
                         const expires_unix = (self.meshWallMs() + mesh_reclaim_ttl_ms) / 1000;
                         const mline = if (exact_issuance) blk: {
@@ -52073,6 +52110,48 @@ pub const LinuxServer = struct {
             }
         }
         return found;
+    }
+
+    const LiveRecipientReplica = union(enum) {
+        none,
+        exact: session_migrate.Token,
+        unresolved,
+    };
+
+    fn hasActiveSecuredSessionReplicaPeer(self: *LinuxServer, peer: u64) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (link.established() and link.remoteNodeId() == peer) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Resolve a live portable target only from the winning nick home plus its
+    /// unique signed OFFER, a current nonconflicted remote attachment lease, and
+    /// Store provenance through an active authenticated secured peer. A bare
+    /// nickname claim or a stale compatibility row never supplies MESSAGE_V2's
+    /// recipient route.
+    fn liveAttachedReplicaForNick(self: *LinuxServer, nick: []const u8) LiveRecipientReplica {
+        const home = self.meshNickHomeNode(nick) orelse return .none;
+        const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+        const identity = (self.session_replica_store.uniqueLiveOriginNick(home, nick, now_wall) catch
+            return .unresolved) orelse return .none;
+        if (!self.session_replica_store.hasAttachedOriginOtherThan(identity.token, self.config.node_id, now_wall))
+            return .none;
+
+        var routes: [64]session_replica_v2.Store.Route = undefined;
+        const route_count = self.session_replica_store.routesInto(identity.token, &routes);
+        if (route_count != self.session_replica_store.routeCountForToken(identity.token)) return .unresolved;
+        for (routes[0..route_count]) |route| {
+            if (route.destination != home or route.next_hop == 0) continue;
+            if (!self.session_replica_store.hasReplicaParent(identity.token, home, route.next_hop)) continue;
+            if (!self.hasActiveSecuredSessionReplicaPeer(route.next_hop)) continue;
+            return .{ .exact = identity.token };
+        }
+        return .unresolved;
     }
 
     /// Sign and wrap one portable snapshot. Detach-time fanout and peer-rejoin
@@ -52963,8 +53042,11 @@ pub const LinuxServer = struct {
     }
 
     /// Remove only roster rows receiver-tagged with this exact token and absent
-    /// from the deterministic best signed snapshot. Malformed signed snapshots
-    /// fail closed to an empty desired set; allocation pressure is retryable.
+    /// from the deterministic best signed snapshot. The internal presence
+    /// channel is a signed nick-routing claim rather than a user channel, so a
+    /// portable snapshot must preserve an already-bound presence row. Malformed
+    /// signed snapshots fail closed to an empty desired set; allocation pressure
+    /// is retryable.
     fn reconcileSessionReplicaRoutes(
         self: *LinuxServer,
         token: session_migrate.Token,
@@ -52976,18 +53058,27 @@ pub const LinuxServer = struct {
             return self.reconcileSessionReplicaRouteProjection(token, null, &.{}, mode);
         };
         defer snapshot.deinit(self.allocator);
-        const desired = if (std.ascii.eqlIgnoreCase(snapshot.account, entry.account) and
-            std.ascii.eqlIgnoreCase(snapshot.nick, entry.nick))
-            snapshot.channels
-        else
-            &.{};
-        const desired_nick: ?[]const u8 = if (desired.len != 0 or
-            (std.ascii.eqlIgnoreCase(snapshot.account, entry.account) and
-                std.ascii.eqlIgnoreCase(snapshot.nick, entry.nick)))
-            entry.nick
-        else
-            null;
-        return self.reconcileSessionReplicaRouteProjection(token, desired_nick, desired, mode);
+        const identity_matches = std.ascii.eqlIgnoreCase(snapshot.account, entry.account) and
+            std.ascii.eqlIgnoreCase(snapshot.nick, entry.nick);
+        var desired: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer desired.deinit(self.allocator);
+        if (identity_matches) {
+            desired.appendSlice(self.allocator, snapshot.channels) catch return false;
+            var has_presence = false;
+            for (snapshot.channels) |channel| {
+                if (isPresenceChannel(channel)) {
+                    has_presence = true;
+                    break;
+                }
+            }
+            if (!has_presence) desired.append(self.allocator, presence_channel) catch return false;
+        }
+        return self.reconcileSessionReplicaRouteProjection(
+            token,
+            if (identity_matches) entry.nick else null,
+            desired.items,
+            mode,
+        );
     }
 
     fn reconcileSessionReplicaRouteProjection(
@@ -58486,6 +58577,7 @@ pub const LinuxServer = struct {
 
     fn ordinaryGuestEligible(self: *const LinuxServer, conn: *const ConnState) bool {
         if (conn.s2s != null or conn.s2s_secured != null) return false;
+        if (!conn.session.registered()) return false;
         if (conn.session.account() != null) return false;
         if (self.config.node_identity == null) return false;
         const nick = conn.session.displayName();
@@ -58568,16 +58660,16 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn retireOrdinaryGuest(self: *LinuxServer, conn: *const ConnState) void {
-        if (std.mem.allEqual(u8, &conn.guest_id, 0)) return;
-        const ident = self.config.node_identity orelse return;
-        const auth = self.guest_presence orelse return;
-        const prior = auth.retainedByGuest(ident.sign_kp.public_key, conn.guest_id) orelse return;
-        if (prior.operation == .quit) return;
-        const revision = mesh_presence_v2.nextRevision(prior.revision) catch return;
+    fn retireOrdinaryGuest(self: *LinuxServer, conn: *const ConnState) bool {
+        if (std.mem.allEqual(u8, &conn.guest_id, 0)) return true;
+        const ident = self.config.node_identity orelse return false;
+        const auth = self.guest_presence orelse return false;
+        const prior = auth.retainedByGuest(ident.sign_kp.public_key, conn.guest_id) orelse return false;
+        if (prior.operation == .quit) return true;
+        const revision = mesh_presence_v2.nextRevision(prior.revision) catch return false;
         const now = self.guestNowMs();
         const issued = if (now >= prior.issued_ms) now else prior.issued_ms;
-        const expires = std.math.add(i64, issued, guest_presence_lease_ms) catch return;
+        const expires = std.math.add(i64, issued, guest_presence_lease_ms) catch return false;
         const record: mesh_presence_v2.Record = .{
             .operation = .quit,
             .origin = ident.sign_kp.public_key,
@@ -58597,11 +58689,23 @@ pub const LinuxServer = struct {
             .description = prior.description,
         };
         var buffer: [mesh_presence_v2.max_wire_len]u8 = undefined;
-        const encoded = mesh_presence_v2.encode(record, &ident.sign_kp, &buffer) catch return;
-        const roots = self.presenceApprovalRoots(null) catch return;
+        const encoded = mesh_presence_v2.encode(record, &ident.sign_kp, &buffer) catch return false;
+        const roots = self.presenceApprovalRoots(null) catch return false;
         defer self.allocator.free(roots);
-        _ = auth.admit(encoded, roots, now, 0, true) catch return;
+        const disposition = auth.admit(encoded, roots, now, 0, true) catch return false;
+        if (disposition != .updated and disposition != .inserted) return false;
         self.driveGuestPresence(null);
+        return true;
+    }
+
+    /// Account binding retires the guest route before the authenticated session
+    /// becomes visible. Keep the old incarnation on any failed tombstone admit so
+    /// callers can retry without leaving an unrevokable route behind.
+    fn retireOrdinaryGuestForAccountBind(self: *LinuxServer, conn: *ConnState) bool {
+        if (std.mem.allEqual(u8, &conn.guest_id, 0)) return true;
+        if (!self.retireOrdinaryGuest(conn)) return false;
+        conn.guest_id = @splat(0);
+        return true;
     }
 
     const GuestLink = struct {
@@ -58720,6 +58824,7 @@ pub const LinuxServer = struct {
             for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
                 if (!slot.occupied or slot.value.closing) continue;
                 if (slot.value.s2s != null or slot.value.s2s_secured != null) continue;
+                if (slot.value.session.account() != null) continue;
                 if (!std.mem.eql(u8, &slot.value.guest_id, &guest)) continue;
                 return slotClientId(reactor, slot_index, slot.gen);
             }
@@ -58784,6 +58889,24 @@ pub const LinuxServer = struct {
             policy.validate(decoded.record.issued_ms, now) catch continue;
             auth.observeDirect(decoded.record.origin, decoded.record.hlc, decoded.record.issued_ms, now) catch continue;
             if (self.localGuestClient(decoded.record.recipient_origin, decoded.record.recipient_guest)) |recipient| {
+                const sender = auth.liveByGuest(decoded.record.origin, decoded.record.sender_guest, now) orelse continue;
+                if (!std.ascii.eqlIgnoreCase(sender.nick, decoded.record.sender_nick)) continue;
+                var sender_prefix_buf: [320]u8 = undefined;
+                const sender_prefix = std.fmt.bufPrint(
+                    &sender_prefix_buf,
+                    "{s}!{s}@{s}",
+                    .{ sender.nick, sender.username, sender.host },
+                ) catch continue;
+                const policy_message = s2s_link.RelayMessage{
+                    .verb = .privmsg,
+                    .target = decoded.record.target_nick,
+                    .source_nick = sender.nick,
+                    .source_prefix = sender_prefix,
+                    .text = decoded.record.text,
+                    .origin_node = message_relay.originShortId(decoded.record.origin),
+                    .hlc = decoded.record.hlc,
+                };
+                if (self.relayDirectMessagePolicyBlocks(policy_message, "", recipient)) continue;
                 self.deliverGuestDirect(recipient, decoded.record);
                 continue;
             }
@@ -61010,7 +61133,28 @@ pub const LinuxServer = struct {
             return;
         }
         const recipient = self.world.findNick(target) orelse {
-            const recipient_token = self.detachedReplicaTokenForNick(target) orelse return;
+            const live_replica = if (self.authoredRelayV2Configured())
+                self.liveAttachedReplicaForNick(target)
+            else
+                LiveRecipientReplica.none;
+            const live_token: ?session_migrate.Token = switch (live_replica) {
+                .none => null,
+                .exact => |token| token,
+                .unresolved => {
+                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Live recipient session authority is ambiguous or unreachable; event not sent");
+                    return;
+                },
+            };
+            const recipient_token = live_token orelse self.detachedReplicaTokenForNick(target) orelse {
+                const target_home = self.meshNickHomeNode(target);
+                const trusted_target_account = if (target_home) |home|
+                    self.trustedRemoteAccountAtNode(target, home)
+                else
+                    null;
+                if (self.authoredRelayV2Configured() and trusted_target_account != null)
+                    try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Live recipient has no unambiguous portable session route; event not sent");
+                return;
+            };
             if (self.config.node_identity == null) return;
             const sender_token = self.portableSessionTokenForClient(id, conn);
             var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
@@ -61990,29 +62134,55 @@ pub const LinuxServer = struct {
         }
 
         const recipient = self.world.findNick(target) orelse {
+            const live_replica = if (self.authoredRelayV2Configured())
+                self.liveAttachedReplicaForNick(target)
+            else
+                LiveRecipientReplica.none;
+            const active_recipient_token: ?session_migrate.Token = switch (live_replica) {
+                .none => null,
+                .exact => |token| token,
+                .unresolved => {
+                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Live recipient session authority is ambiguous or unreachable; message not sent");
+                    return;
+                },
+            };
             // A live ordinary guest is a signed subject with its own direct
-            // scope. Do not also emit a legacy nick relay for that subject.
-            if (!is_notice) {
+            // scope. Do not also emit a legacy nick relay for that subject. A
+            // registered target's signed session authority takes precedence over
+            // stale guest-presence copies still converging across the mesh.
+            if (!is_notice and active_recipient_token == null) {
                 if (self.liveOrdinaryGuest(target)) |route| {
-                    if (!self.authorOrdinaryGuestDirect(conn, route, text, event_hlc)) {
-                        try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+                    const guest_home = message_relay.originShortId(route.origin);
+                    if (self.trustedRemoteAccountAtNode(target, guest_home) == null) {
+                        if (!self.authorOrdinaryGuestDirect(conn, route, text, event_hlc)) {
+                            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+                            return;
+                        }
+                        var guest_time_buf: [40]u8 = undefined;
+                        const guest_tags = MsgTags{ .time_value = serverTimeValueAt(&guest_time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
+                        if (echo) self.deliverTaggedMode(id, guest_tags, msg, .ordinary) catch {};
                         return;
                     }
-                    var guest_time_buf: [40]u8 = undefined;
-                    const guest_tags = MsgTags{ .time_value = serverTimeValueAt(&guest_time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
-                    if (echo) self.deliverTaggedMode(id, guest_tags, msg, .ordinary) catch {};
-                    return;
                 }
             }
             // Not local: relay to mesh peers so the node that owns this nick can
             // deliver (loop-guarded; a truly-nonexistent nick is dropped far-side).
-            if (self.hasEstablishedPeer() or self.detachedReplicaTokenForNick(target) != null) {
+            if (self.hasEstablishedPeer() or active_recipient_token != null or self.detachedReplicaTokenForNick(target) != null) {
                 var pbuf2: [320]u8 = undefined;
                 if (clientPrefix(conn, &pbuf2)) |prefix| {
-                    const recipient_token = self.detachedReplicaTokenForNick(target);
-                    const target_route_known = self.meshNickHomeNode(target) != null or recipient_token != null;
+                    const recipient_token = active_recipient_token orelse self.detachedReplicaTokenForNick(target);
+                    const target_home = self.meshNickHomeNode(target);
+                    const trusted_target_account = if (target_home) |home|
+                        self.trustedRemoteAccountAtNode(target, home)
+                    else
+                        null;
+                    const target_route_known = target_home != null or recipient_token != null or trusted_target_account != null;
                     if (!target_route_known) {
                         if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+                        return;
+                    }
+                    if (self.authoredRelayV2Configured() and recipient_token == null and trusted_target_account != null) {
+                        if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Live recipient has no unambiguous portable session route; message not sent");
                         return;
                     }
                     var local_sender_ids: std.ArrayList(client_model.ClientId) = .empty;
@@ -92268,6 +92438,7 @@ test "session replica lifecycle IRCX AUTH guest rebind revokes the abandoned por
 
     const id = try addTestLocalClient(server, "GuestSwitch", "old-guest-acct");
     const conn = server.connFor(id).?;
+    conn.session.registration.registered = true;
     const old = server.sessions.resumeHandleForClient("old-guest-acct", monitorIdFromClient(id)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(server.sessions.markPortableResumeIssued("old-guest-acct", monitorIdFromClient(id)));
     try publishTestSessionReplicaAuthority(server, old.token, "old-guest-acct", "GuestSwitch");
@@ -92276,6 +92447,19 @@ test "session replica lifecycle IRCX AUTH guest rebind revokes the abandoned por
     try std.testing.expect(conn.session.account() == null);
     try std.testing.expect(server.sessions.resumeHandleForClient("old-guest-acct", monitorIdFromClient(id)) == null);
     try expectTestSessionReplicaRevoked(server, old.token);
+    const guest_incarnation = conn.guest_id;
+    try std.testing.expect(!std.mem.allEqual(u8, &guest_incarnation, 0));
+    const live_guest = server.guest_presence.?.retainedByGuest(ident.sign_kp.public_key, guest_incarnation) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(mesh_presence_v2.Operation.present, live_guest.operation);
+
+    // An already-anonymous AUTH result is a no-op for presence identity. It
+    // must not terminally quit the usable incarnation or mint another one.
+    try server.completeIrcxAuth(id, conn, .anonymous, .{ .account = "guest-trace", .guest = true });
+    try std.testing.expectEqual(guest_incarnation, conn.guest_id);
+    const unchanged_guest = server.guest_presence.?.retainedByGuest(ident.sign_kp.public_key, guest_incarnation) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(mesh_presence_v2.Operation.present, unchanged_guest.operation);
 }
 
 test "session replica lifecycle REGISTER rebind revokes the abandoned portable token" {
@@ -129730,6 +129914,72 @@ fn sendFarPresenceLegacyDiagnostic(server: *Server, peer_key: [32]u8) !u64 {
     return error.TestUnexpectedResult;
 }
 
+fn farGuestTombstoned(server: *Server, origin: [32]u8, guest: [16]u8, nick: []const u8) bool {
+    server.world.lockWrite();
+    defer server.world.unlockWrite();
+    const tombstone = if (server.guest_presence) |auth|
+        auth.retainedByGuest(origin, guest)
+    else
+        null;
+    return tombstone != null and tombstone.?.operation == .quit and server.liveOrdinaryGuest(nick) == null;
+}
+
+fn relayV2CheckpointSnapshot(server: *Server, allocator: std.mem.Allocator) ![]u8 {
+    lockSpin(&server.relay_v2_replay_mu);
+    defer server.relay_v2_replay_mu.unlock();
+    return server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+}
+
+const FarReplicaFacts = struct {
+    home: ?u64 = null,
+    claims: usize = 0,
+    members: usize = 0,
+    peers: usize = 0,
+    offer: bool = false,
+    attached: bool = false,
+    route_count: usize = 0,
+    active_path: bool = false,
+};
+
+fn farReplicaFacts(server: *Server, nick: []const u8, origin: u64) FarReplicaFacts {
+    server.world.lockWrite();
+    defer server.world.unlockWrite();
+    var facts: FarReplicaFacts = .{ .home = server.meshNickHomeNode(nick) };
+    for (server.reactors) |*reactor| {
+        for (reactor.clients.slots.items) |*slot| {
+            if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+            const link = slot.value.s2s_secured orelse continue;
+            if (!link.established()) continue;
+            facts.peers += 1;
+            if (link.bestNickClaim(nick) != null) facts.claims += 1;
+            if (link.findRemoteMember(nick) != null) facts.members += 1;
+        }
+    }
+    const now_wall: i64 = @intCast(@min(server.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+    const identity = (server.session_replica_store.uniqueLiveOriginNick(origin, nick, now_wall) catch return facts) orelse return facts;
+    facts.offer = true;
+    facts.attached = server.session_replica_store.hasAttachedOriginOtherThan(identity.token, server.config.node_id, now_wall);
+    var routes: [64]session_replica_v2.Store.Route = undefined;
+    facts.route_count = server.session_replica_store.routesInto(identity.token, &routes);
+    for (routes[0..facts.route_count]) |route| {
+        if (route.destination != origin or route.next_hop == 0) continue;
+        if (!server.session_replica_store.hasReplicaParent(identity.token, origin, route.next_hop)) continue;
+        if (server.hasActiveSecuredSessionReplicaPeer(route.next_hop)) facts.active_path = true;
+    }
+    return facts;
+}
+
+fn testMessageTagValue(bytes: []const u8, body: []const u8, key: []const u8) ?[]const u8 {
+    const body_at = std.mem.indexOf(u8, bytes, body) orelse return null;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, bytes[0..body_at], '\n')) |newline|
+        newline + 1
+    else
+        0;
+    if (line_start >= body_at or bytes[line_start] != '@') return null;
+    const tags_end = line_start + (std.mem.indexOfScalar(u8, bytes[line_start..body_at], ' ') orelse return null);
+    return findTagValue(bytes[line_start + 1 .. tags_end], key);
+}
+
 /// Actual TCP/Mooring A-B-C, with independent ordinary clients and no A-C leg.
 /// Far WHOIS and the guest DM use the original signed presence record and the
 /// exact guest-direct frame. The legacy v1 MESSAGE leaf stays terminal.
@@ -129829,7 +130079,7 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
         client.* = .{ .fd = try connectLoopback(try server.boundPort()) };
         initialized += 1;
         var registration_buf: [200]u8 = undefined;
-        const registration = try std.fmt.bufPrint(&registration_buf, "CAP REQ :echo-message message-tags server-time\r\nNICK {s}\r\nUSER ordinary 0 * :Independent {s}\r\nCAP END\r\n", .{ nick, nick });
+        const registration = try std.fmt.bufPrint(&registration_buf, "CAP REQ :echo-message message-tags server-time draft/react draft/reply\r\nNICK {s}\r\nUSER ordinary 0 * :Independent {s}\r\nCAP END\r\n", .{ nick, nick });
         try writeAllFd(client.fd, registration);
         var welcome_buf: [40]u8 = undefined;
         try recvUntil(client, try std.fmt.bufPrint(&welcome_buf, " 001 {s} ", .{nick}), 200);
@@ -129914,7 +130164,6 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
                 testSleepMs(10);
             }
             try std.testing.expectEqual(@as(usize, 0), countOccurrences(live[0].written(), "legacy-terminal-control"));
-            std.debug.print("far ordinary nickname legacy control: signed C->B ingested; terminal transit, no GuestA delivery\n", .{});
             live[0].reset();
             try writeAllFd(live[0].fd, "PRIVMSG GuestC :ordinary-far-direct\r\nPING :far-dm-fence\r\n");
             try recvUntil(&live[0], "PONG onyx.local :far-dm-fence", 200);
@@ -129924,11 +130173,260 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
                 if (std.mem.indexOf(u8, live[2].written(), "PRIVMSG GuestC :ordinary-far-direct") != null) break;
                 testSleepMs(10);
             }
-            std.debug.print("far ordinary nickname DM author={s}\nrecipient={s}\n", .{ live[0].written(), live[2].written() });
             try expectContains(live[2].written(), "PRIVMSG GuestC :ordinary-far-direct");
             try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[2].written(), "PRIVMSG GuestC :ordinary-far-direct"));
             try expectContains(live[0].written(), "PRIVMSG GuestC :ordinary-far-direct");
             try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), "PRIVMSG GuestC :ordinary-far-direct"));
+
+            b.server.world.lockWrite();
+            const guest_b_world_id = b.server.world.findNick("GuestB") orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const guest_b_conn = b.server.connFor(clientIdFromWorld(guest_b_world_id)) orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const old_guest_b = guest_b_conn.guest_id;
+            b.server.world.unlockWrite();
+            try std.testing.expect(!std.mem.allEqual(u8, &old_guest_b, 0));
+            a.server.world.lockWrite();
+            const home_before_register = a.server.meshNickHomeNode("GuestB");
+            a.server.world.unlockWrite();
+            try std.testing.expectEqual(@as(?u64, identity_b.shortId()), home_before_register);
+
+            // Reproduce registration after the unauthenticated IRC handshake:
+            // the old signed guest route must receive a higher-revision QUIT
+            // before the connection becomes an authenticated account session.
+            live[1].reset();
+            try writeAllFd(live[1].fd, "REGISTER farb * correcthorse\r\n");
+            try recvUntil(&live[1], "REGISTER SUCCESS farb", 200);
+            const retirement_deadline = platform.monotonicMillis() + 5_000;
+            while (true) {
+                if (farGuestTombstoned(b.server, identity_b.sign_kp.public_key, old_guest_b, "GuestB") and
+                    farGuestTombstoned(a.server, identity_b.sign_kp.public_key, old_guest_b, "GuestB") and
+                    farGuestTombstoned(c.server, identity_b.sign_kp.public_key, old_guest_b, "GuestB")) break;
+                if (platform.monotonicMillis() >= retirement_deadline) return error.TestTimeout;
+                testSleepMs(10);
+            }
+            b.server.world.lockWrite();
+            const registered_b_id = b.server.world.findNick("GuestB") orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const registered_b = b.server.connFor(clientIdFromWorld(registered_b_id)) orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const account_bound = registered_b.session.account() != null;
+            const guest_id_cleared = std.mem.allEqual(u8, &registered_b.guest_id, 0);
+            b.server.world.unlockWrite();
+            try std.testing.expect(account_bound and guest_id_cleared);
+            a.server.world.lockWrite();
+            const home_after_register = a.server.meshNickHomeNode("GuestB");
+            a.server.world.unlockWrite();
+            try std.testing.expectEqual(@as(?u64, identity_b.shortId()), home_after_register);
+
+            live[0].reset();
+            try writeAllFd(live[0].fd, "REGISTER fara * correcthorse\r\n");
+            try recvUntil(&live[0], "REGISTER SUCCESS fara", 200);
+            for ([_]usize{ 0, 1 }) |index| {
+                live[index].reset();
+                try writeAllFd(live[index].fd, "SESSION TOKEN\r\n");
+                try recvUntil(&live[index], "SESSION MTOKEN ", 200);
+            }
+
+            b.server.world.lockWrite();
+            const portable_b_id = b.server.world.findNick("GuestB") orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const portable_b = b.server.connFor(clientIdFromWorld(portable_b_id)) orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const portable_b_account = portable_b.session.account() orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const portable_b_handle = b.server.sessions.resumeHandleForClient(
+                portable_b_account,
+                monitorIdFromClient(clientIdFromWorld(portable_b_id)),
+            ) orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const local_offer = b.server.session_replica_store.getOrigin(portable_b_handle.token, identity_b.shortId()) != null;
+            const local_attachment = b.server.session_replica_store.getAttachmentLease(portable_b_handle.token, identity_b.shortId()) != null;
+            const replica_dirty = b.server.sessions.tokenReplicaDirty(portable_b_handle.token);
+            b.server.world.unlockWrite();
+            try std.testing.expect(portable_b_handle.portable and local_offer and local_attachment and !replica_dirty);
+
+            const replica_deadline = platform.monotonicMillis() + 10_000;
+            while (true) {
+                a.server.world.lockWrite();
+                const a_target = a.server.liveAttachedReplicaForNick("GuestB");
+                a.server.world.unlockWrite();
+                const a_ready = switch (a_target) {
+                    .exact => true,
+                    else => false,
+                };
+                if (a_ready) break;
+                if (platform.monotonicMillis() >= replica_deadline) {
+                    const a_facts = farReplicaFacts(a.server, "GuestB", identity_b.shortId());
+                    std.debug.print(
+                        "live recipient route facts A(home={any}, claims={}, members={}, peers={}, offer={}, attached={}, routes={}, active_path={})\n",
+                        .{ a_facts.home, a_facts.claims, a_facts.members, a_facts.peers, a_facts.offer, a_facts.attached, a_facts.route_count, a_facts.active_path },
+                    );
+                    return error.TestTimeout;
+                }
+                testSleepMs(10);
+            }
+
+            live[1].reset();
+            try writeAllFd(live[1].fd, "MODE GuestB +R\r\n");
+            try recvUntil(&live[1], " MODE GuestB +R\r\n", 200);
+            a.server.world.lockWrite();
+            const after_mode_target = a.server.liveAttachedReplicaForNick("GuestB");
+            a.server.world.unlockWrite();
+            try std.testing.expect(switch (after_mode_target) {
+                .exact => true,
+                else => false,
+            });
+            live[2].reset();
+            live[1].reset();
+            try writeAllFd(live[2].fd, "PRIVMSG GuestB :regonly-remote-control\r\nPING :regonly-remote-fence\r\n");
+            try recvUntil(&live[2], "PONG onyx.local :regonly-remote-fence", 200);
+            const policy_deadline = platform.monotonicMillis() + 300;
+            while (platform.monotonicMillis() < policy_deadline) {
+                try live[1].readAvailable();
+                testSleepMs(10);
+            }
+            try std.testing.expect(std.mem.indexOf(u8, live[1].written(), "regonly-remote-control") == null);
+            a.server.world.lockWrite();
+            const after_policy_target = a.server.liveAttachedReplicaForNick("GuestB");
+            a.server.world.unlockWrite();
+            const after_policy_ready = switch (after_policy_target) {
+                .exact => true,
+                else => false,
+            };
+            if (!after_policy_ready) {
+                const facts = farReplicaFacts(a.server, "GuestB", identity_b.shortId());
+                std.debug.print("route after anonymous +R probe: home={any} claims={} members={} peers={} offer={} attached={} routes={} active_path={}\n", .{
+                    facts.home,
+                    facts.claims,
+                    facts.members,
+                    facts.peers,
+                    facts.offer,
+                    facts.attached,
+                    facts.route_count,
+                    facts.active_path,
+                });
+                return error.TestUnexpectedResult;
+            }
+
+            const replay_before = try relayV2CheckpointSnapshot(a.server, allocator);
+            defer allocator.free(replay_before);
+            live[0].reset();
+            live[1].reset();
+            try writeAllFd(live[0].fd, "PRIVMSG GuestB :live-active-v2-direct\r\nPING :live-v2-direct-fence\r\n");
+            try recvUntil(&live[0], "PONG onyx.local :live-v2-direct-fence", 200);
+            const direct_deadline = platform.monotonicMillis() + 2_000;
+            while (std.mem.indexOf(u8, live[1].written(), "PRIVMSG GuestB :live-active-v2-direct") == null and
+                platform.monotonicMillis() < direct_deadline)
+            {
+                try live[1].readAvailable();
+                testSleepMs(10);
+            }
+            if (std.mem.indexOf(u8, live[1].written(), "PRIVMSG GuestB :live-active-v2-direct") == null) {
+                const sender_no_such_nick = std.mem.indexOf(u8, live[0].written(), " 401 GuestA GuestB ") != null;
+                const sender_unavailable = std.mem.indexOf(u8, live[0].written(), "TEMPORARILY_UNAVAILABLE") != null;
+                const sender_echo = std.mem.indexOf(u8, live[0].written(), "PRIVMSG GuestB :live-active-v2-direct") != null;
+                std.debug.print("live exact direct delivery failed: sender_401={} sender_unavailable={} sender_echo={} recipient_line={}\n", .{
+                    sender_no_such_nick,
+                    sender_unavailable,
+                    sender_echo,
+                    std.mem.indexOf(u8, live[1].written(), "PRIVMSG GuestB :live-active-v2-direct") != null,
+                });
+                return error.TestTimeout;
+            }
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), "PRIVMSG GuestB :live-active-v2-direct"));
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[1].written(), "PRIVMSG GuestB :live-active-v2-direct"));
+            const author_msgid = testMessageTagValue(live[0].written(), "PRIVMSG GuestB :live-active-v2-direct", "msgid") orelse
+                return error.TestUnexpectedResult;
+            const recipient_msgid = testMessageTagValue(live[1].written(), "PRIVMSG GuestB :live-active-v2-direct", "msgid") orelse
+                return error.TestUnexpectedResult;
+            const author_time = testMessageTagValue(live[0].written(), "PRIVMSG GuestB :live-active-v2-direct", "time") orelse
+                return error.TestUnexpectedResult;
+            const recipient_time = testMessageTagValue(live[1].written(), "PRIVMSG GuestB :live-active-v2-direct", "time") orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(author_msgid, recipient_msgid);
+            try std.testing.expectEqualStrings(author_time, recipient_time);
+            const replay_after = try relayV2CheckpointSnapshot(a.server, allocator);
+            defer allocator.free(replay_after);
+            try std.testing.expect(!std.mem.eql(u8, replay_before, replay_after));
+
+            // The direct TAGMSG path resolves the same exact live recipient
+            // route and must retain its stable event identity at both ends.
+            const replay_before_tagmsg = try relayV2CheckpointSnapshot(a.server, allocator);
+            defer allocator.free(replay_before_tagmsg);
+            live[0].reset();
+            live[1].reset();
+            try writeAllFd(live[0].fd, "@+draft/reply=live-v2-target;+draft/react=ok TAGMSG GuestB\r\nPING :live-v2-tagmsg-fence\r\n");
+            try recvUntil(&live[0], "PONG onyx.local :live-v2-tagmsg-fence", 200);
+            const tagmsg_deadline = platform.monotonicMillis() + 2_000;
+            while (std.mem.indexOf(u8, live[1].written(), "TAGMSG GuestB") == null and
+                platform.monotonicMillis() < tagmsg_deadline)
+            {
+                try live[1].readAvailable();
+                testSleepMs(10);
+            }
+            try expectContains(live[1].written(), "TAGMSG GuestB");
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), "TAGMSG GuestB"));
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[1].written(), "TAGMSG GuestB"));
+            const author_tagmsg_id = testMessageTagValue(live[0].written(), "TAGMSG GuestB", "msgid") orelse
+                return error.TestUnexpectedResult;
+            const recipient_tagmsg_id = testMessageTagValue(live[1].written(), "TAGMSG GuestB", "msgid") orelse
+                return error.TestUnexpectedResult;
+            const author_tagmsg_time = testMessageTagValue(live[0].written(), "TAGMSG GuestB", "time") orelse
+                return error.TestUnexpectedResult;
+            const recipient_tagmsg_time = testMessageTagValue(live[1].written(), "TAGMSG GuestB", "time") orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(author_tagmsg_id, recipient_tagmsg_id);
+            try std.testing.expectEqualStrings(author_tagmsg_time, recipient_tagmsg_time);
+            const replay_after_tagmsg = try relayV2CheckpointSnapshot(a.server, allocator);
+            defer allocator.free(replay_after_tagmsg);
+            try std.testing.expect(!std.mem.eql(u8, replay_before_tagmsg, replay_after_tagmsg));
+
+            // Account logout starts a fresh guest incarnation. A no-op LOGOUT on
+            // the still-anonymous GuestC preserves its existing guest route.
+            live[1].reset();
+            try writeAllFd(live[1].fd, "LOGOUT\r\n");
+            try recvUntil(&live[1], "You are now logged out", 200);
+            b.server.world.lockWrite();
+            const after_logout_b_id = b.server.world.findNick("GuestB") orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const new_guest_b = b.server.connFor(clientIdFromWorld(after_logout_b_id)).?.guest_id;
+            b.server.world.unlockWrite();
+            try std.testing.expect(!std.mem.allEqual(u8, &new_guest_b, 0));
+            try std.testing.expect(!std.mem.eql(u8, &old_guest_b, &new_guest_b));
+            c.server.world.lockWrite();
+            const guest_c_world_id = c.server.world.findNick("GuestC") orelse {
+                c.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const guest_c_id = clientIdFromWorld(guest_c_world_id);
+            const old_guest_c = c.server.connFor(guest_c_id).?.guest_id;
+            c.server.world.unlockWrite();
+            live[2].reset();
+            try writeAllFd(live[2].fd, "LOGOUT\r\n");
+            try recvUntil(&live[2], "You are now logged out", 200);
+            c.server.world.lockWrite();
+            const unchanged_guest_c = c.server.connFor(guest_c_id).?.guest_id;
+            c.server.world.unlockWrite();
+            try std.testing.expectEqual(old_guest_c, unchanged_guest_c);
         },
     }
 }
@@ -129937,7 +130435,7 @@ test "threaded server: far ordinary nickname WHOIS crosses secured A-B-C without
     try runFarOrdinaryNickRegression(.whois);
 }
 
-test "threaded server: far ordinary nickname direct DM crosses secured A-B-C without portable tokens" {
+test "threaded server: far ordinary guest DM and live attached direct MESSAGE_V2" {
     try runFarOrdinaryNickRegression(.direct_message);
 }
 
