@@ -27,8 +27,7 @@ const acme = @import("acme_client.zig");
 const http01 = @import("acme_http01_server.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 const pem = @import("../proto/pem.zig");
-const dns = @import("../proto/dns.zig");
-const resolv_conf = @import("../proto/resolv_conf.zig");
+const dns_address_lookup = @import("dns_address_lookup.zig");
 const toml = @import("../proto/toml.zig");
 const http_fetch = @import("http_fetch.zig");
 const os_runtime = @import("os_runtime.zig");
@@ -472,22 +471,19 @@ pub fn issue(
 }
 
 // ---------------------------------------------------------------------------
-// Built-in blocking DNS resolver (reuses our own dns.zig + resolv_conf)
+// Built-in bounded DNS resolver
 // ---------------------------------------------------------------------------
 
-/// Default `Resolver`: on Unix, parses /etc/resolv.conf and performs a blocking
-/// A-record lookup over UDP using the clean-room `dns.zig` codec. On Windows,
-/// delegates to the DNS Client through GetAddrInfoExW. Out-of-band only.
-///
-/// Handles IP literals and direct A records. The Unix codec does not decode
-/// CNAME chains or EDNS additional records, so CDN-fronted endpoints may need
-/// a custom `Resolver` (or a static host→IP) there.
+/// Default `Resolver`: on Unix, reads /etc/resolv.conf and resolves one A
+/// address through validated UDP, TCP fallback, and CNAME traversal under one
+/// three-second budget. On Windows, delegates to the DNS Client through
+/// GetAddrInfoExW. Handles IP literals without I/O. Out-of-band only.
 pub const SystemResolver = struct {
     allocator: Allocator,
     io: std.Io,
     /// Max bytes read from /etc/resolv.conf.
     resolv_conf_max_bytes: usize = default_resolv_conf_max_bytes,
-    /// UDP port used for DNS A-record lookups.
+    /// UDP/TCP port used for DNS A-record lookups.
     dns_port: u16 = default_dns_port,
 
     pub fn resolver(self: *SystemResolver) Resolver {
@@ -532,100 +528,7 @@ fn systemResolveA(
     const text = std.Io.Dir.cwd().readFileAlloc(io, "/etc/resolv.conf", allocator, .limited(resolv_conf_max_bytes)) catch
         return error.NoNameservers;
     defer allocator.free(text);
-    const conf = resolv_conf.parse(text);
-    const servers = conf.nameserverSlice();
-    if (servers.len == 0) return error.NoNameservers;
-
-    var id_seed: [2]u8 = undefined;
-    osEntropy(&id_seed);
-    const query_id = std.mem.readInt(u16, &id_seed, .big);
-
-    var query_buf: [dns.max_message_len]u8 = undefined;
-    const query = try dns.encodeQuery(&query_buf, query_id, host, .a);
-
-    // Try every configured nameserver in order, over whichever transport its
-    // address family requires (UDP/IPv4 or UDP/IPv6). In an IPv6-only resolver
-    // environment (e.g. nameserver ::1) only the v6 path is reachable, so it
-    // must be wired — not skipped — or resolution fails with NoNameservers.
-    for (servers) |srv| {
-        const answer = switch (srv) {
-            .ipv4 => |b| queryOneServer(b, query, dns_port) catch continue,
-            .ipv6 => |b| queryOneServer6(b, query, dns_port) catch continue,
-        };
-        if (answer) |ipv4| return .{ .ip4 = .{ .bytes = ipv4, .port = port } };
-    }
-    return error.HostNotFound;
-}
-
-/// Send `query` to a v4 nameserver:<dns_port> and return the first A record, or null.
-fn queryOneServer(ns_v4: [4]u8, query: []const u8, dns_port: u16) !?[4]u8 {
-    if (comptime builtin.os.tag == .openbsd) return queryNativeServer(.{ .ip4 = .{ .bytes = ns_v4, .port = dns_port } }, query);
-    const fd = try udpSocket(posix.AF.INET);
-    defer closeFd(fd);
-    var sa = linux.sockaddr.in{ .port = std.mem.nativeToBig(u16, dns_port), .addr = @bitCast(ns_v4) };
-    if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
-        return error.ConnectFailed;
-    return exchangeQuery(fd, query);
-}
-
-/// Send `query` to a v6 nameserver:<dns_port> over UDP/IPv6 and return the first
-/// A record, or null. Mirrors `queryOneServer` exactly, differing only in the
-/// socket family and `sockaddr_in6` (flowinfo/scope_id left zero — link-local
-/// scopes are not expressible in resolv.conf's textual form we parse).
-fn queryOneServer6(ns_v6: [16]u8, query: []const u8, dns_port: u16) !?[4]u8 {
-    if (comptime builtin.os.tag == .openbsd) return queryNativeServer(.{ .ip6 = .{ .bytes = ns_v6, .port = dns_port } }, query);
-    const fd = try udpSocket(posix.AF.INET6);
-    defer closeFd(fd);
-    var sa = linux.sockaddr.in6{
-        .port = std.mem.nativeToBig(u16, dns_port),
-        .flowinfo = 0,
-        .addr = ns_v6,
-        .scope_id = 0,
-    };
-    if (posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
-        return error.ConnectFailed;
-    return exchangeQuery(fd, query);
-}
-
-/// Write `query` to the (already-connected) UDP socket `fd`, read the reply, and
-/// return the first A record found, or null. Shared by the v4 and v6 paths so
-/// the send/recv/parse semantics stay identical across address families.
-fn exchangeQuery(fd: linux.fd_t, query: []const u8) !?[4]u8 {
-    if (posix.errno(linux.write(fd, query.ptr, query.len)) != .SUCCESS) return error.ConnectFailed;
-
-    var resp_buf: [dns.max_message_len]u8 = undefined;
-    const rc = linux.read(fd, &resp_buf, resp_buf.len);
-    if (posix.errno(rc) != .SUCCESS) return error.ConnectFailed;
-    const n: usize = @intCast(rc);
-
-    const msg = dns.parseMessage(1, dns.max_cache_addrs, resp_buf[0..n]) catch return null;
-    for (msg.answerSlice()) |rr| switch (rr.data) {
-        .a => |ipv4| return ipv4,
-        else => {},
-    };
-    return null;
-}
-
-fn queryNativeServer(address: net.IpAddress, query: []const u8) !?[4]u8 {
-    const native = @import("native_network.zig");
-    const fd = try native.socket(if (address == .ip4) posix.AF.INET else posix.AF.INET6, true, false);
-    defer @import("os_runtime.zig").close(fd);
-    try native.setTimeout(fd, 3000);
-    try native.connectSocket(fd, address);
-    try native.writeAll(fd, query);
-    var response: [dns.max_message_len]u8 = undefined;
-    const count = try native.readSome(fd, &response);
-    const question = dns.parseMessage(1, 0, query) catch return null;
-    if (question.question_count != 1) return null;
-    const name = question.questionSlice()[0].name.slice();
-    const message = dns.parseMessage(1, dns.max_cache_addrs, response[0..count]) catch return null;
-    if (message.header.id != question.header.id or message.header.rcode() != 0 or (message.header.flags & 0x7a00) != 0 or !dns.responseMatchesQuestion(1, dns.max_cache_addrs, &message, name, .a) or
-        !dns.responseAnswersFollowCnames(dns.max_cache_addrs, response[0..count], name, .a)) return null;
-    for (message.answerSlice()) |rr| switch (rr.data) {
-        .a => |bytes| return bytes,
-        else => {},
-    };
-    return null;
+    return dns_address_lookup.resolve(text, host, port, dns_port, .a, 3000);
 }
 
 // ---------------------------------------------------------------------------
@@ -664,16 +567,6 @@ fn socketTcp() Error!linux.fd_t {
     } else return error.SocketUnavailable;
 }
 
-fn udpSocket(family: u32) Error!linux.fd_t {
-    if (comptime builtin.os.tag == .linux) {
-        const rc = linux.socket(family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, linux.IPPROTO.UDP);
-        return switch (posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            else => error.SocketUnavailable,
-        };
-    } else return error.SocketUnavailable;
-}
-
 fn closeFd(fd: linux.fd_t) void {
     if (comptime builtin.os.tag == .openbsd) return @import("os_runtime.zig").close(fd);
     _ = linux.close(fd);
@@ -701,23 +594,6 @@ fn readSome(fd: linux.fd_t, buf: []u8) Error!usize {
             return n;
         },
         else => return error.ConnectionClosed,
-    }
-}
-
-fn osEntropy(buf: []u8) void {
-    if (comptime builtin.os.tag != .linux) {
-        @import("../substrate/platform.zig").fillOsEntropy(buf) catch @panic("ACME DNS entropy unavailable");
-        return;
-    }
-    var filled: usize = 0;
-    while (filled < buf.len) {
-        const rc = linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-        if (posix.errno(rc) != .SUCCESS) {
-            // Fallback: monotonic-ish fill; query IDs are not security-critical.
-            for (buf[filled..]) |*b| b.* = 0x55;
-            return;
-        }
-        filled += @intCast(rc);
     }
 }
 
@@ -1604,175 +1480,8 @@ test "applyToml leaves runner defaults when acme table absent" {
     try std.testing.expectEqual(default_dns_port, cfg.dns_port);
 }
 
-test "v6 nameserver sockaddr is built with INET6 family, big-endian port, and raw bytes" {
-    // Mirrors the construction inside queryOneServer6: this proves the v6 path's
-    // sockaddr is shaped correctly (family/port/addr/scope) and is reachable —
-    // it is no longer skipped with `continue` as the old loop did.
-    const ns_v6: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }; // ::1
-    const sa = posix.sockaddr.in6{
-        .port = std.mem.nativeToBig(u16, 53),
-        .flowinfo = 0,
-        .addr = ns_v6,
-        .scope_id = 0,
-    };
-    try std.testing.expectEqual(@as(@TypeOf(sa.family), posix.AF.INET6), sa.family);
-    try std.testing.expectEqual(std.mem.nativeToBig(u16, 53), sa.port);
-    try std.testing.expectEqual(@as(u32, 0), sa.flowinfo);
-    try std.testing.expectEqual(@as(u32, 0), sa.scope_id);
-    try std.testing.expectEqualSlices(u8, &ns_v6, &sa.addr);
-}
-
-test "udpSocket opens an AF_INET6 datagram socket" {
-    // The v6 transport must actually open an IPv6 UDP socket (the gap was that
-    // this path didn't exist). Skip only if the kernel/sandbox lacks IPv6.
-    const fd = if (comptime builtin.os.tag == .openbsd)
-        try @import("native_network.zig").socket(posix.AF.INET6, true, false)
-    else
-        udpSocket(posix.AF.INET6) catch return error.SkipZigTest;
-    closeFd(fd);
-}
-
-fn nativeDnsFixture() !void {
-    if (comptime builtin.os.tag != .openbsd) return error.SkipZigTest;
-    const sys = posix.system;
-    const Responder = struct {
-        fd: i32,
-        served: usize = 0,
-        fn run(self: *@This()) void {
-            for (0..3) |index| {
-                var bytes: [dns.max_message_len]u8 = undefined;
-                var peer: posix.sockaddr.in6 = undefined;
-                var len: posix.socklen_t = @sizeOf(@TypeOf(peer));
-                const got = sys.recvfrom(self.fd, &bytes, bytes.len, 0, @ptrCast(&peer), &len);
-                if (posix.errno(got) != .SUCCESS) return;
-                const question = dns.parseMessage(1, 0, bytes[0..@intCast(got)]) catch return;
-                if (question.question_count != 1) return;
-                const q = question.questions[0];
-                var wire: [dns.max_message_len]u8 = undefined;
-                const reply = dns.encodeMessage(&wire, .{
-                    .id = question.header.id,
-                    .response = true,
-                    .questions = &.{.{ .name = q.name.slice(), .qtype = q.qtype }},
-                    .answers = &.{.{ .name = q.name.slice(), .rr_type = .a, .ttl = 30, .data = .{ .a = .{ 203, 0, 113, 7 } } }},
-                }) catch return;
-                // Valid framing/ID/question cannot make a truncated or error
-                // response authoritative, even when it contains an address.
-                if (index == 1) wire[2] |= 0x02;
-                if (index == 2) wire[3] |= 0x03;
-                const sent = sys.sendto(self.fd, reply.ptr, reply.len, 0, @ptrCast(&peer), len);
-                if (posix.errno(sent) != .SUCCESS or sent != reply.len) return;
-                self.served += 1;
-            }
-        }
-    };
-    const fd = try @import("native_network.zig").socket(posix.AF.INET6, true, false);
-    defer closeFd(fd);
-    try @import("native_network.zig").setTimeout(fd, 1000);
-    var loopback: [16]u8 = @splat(0);
-    loopback[15] = 1;
-    var address = posix.sockaddr.in6{ .addr = loopback, .port = 0, .scope_id = 0, .flowinfo = 0 };
-    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.bind(fd, @ptrCast(&address), @sizeOf(@TypeOf(address)))));
-    var len: posix.socklen_t = @sizeOf(@TypeOf(address));
-    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.getsockname(fd, @ptrCast(&address), &len)));
-    var responder = Responder{ .fd = fd };
-    const thread = try std.Thread.spawn(.{}, Responder.run, .{&responder});
-    var joined = false;
-    defer if (!joined) thread.join();
-    var query_buf: [dns.max_message_len]u8 = undefined;
-    const query = try dns.encodeQuery(&query_buf, 0x4242, "host.test", .a);
-    const port = std.mem.bigToNative(u16, address.port);
-    try std.testing.expectEqual(@as(?[4]u8, .{ 203, 0, 113, 7 }), try queryOneServer6(loopback, query, port));
-    try std.testing.expectEqual(@as(?[4]u8, null), try queryOneServer6(loopback, query, port));
-    try std.testing.expectEqual(@as(?[4]u8, null), try queryOneServer6(loopback, query, port));
-    thread.join();
-    joined = true;
-    try std.testing.expectEqual(@as(usize, 3), responder.served);
-}
-
-test "queryOneServer6 round-trips an A record against a ::1 DNS responder" {
-    if (comptime builtin.os.tag == .openbsd) {
-        try nativeDnsFixture();
-    } else if (comptime builtin.os.tag == .linux) {
-        // End-to-end proof the v6 path opens a socket, connects, sends the query,
-        // and parses the reply — exercising exactly queryOneServer6 -> exchangeQuery.
-        // A real UDP/IPv6 loopback responder answers with one A record. If the
-        // sandbox has no usable IPv6 loopback, skip rather than fail.
-        const srv = udpSocket(posix.AF.INET6) catch return error.SkipZigTest;
-        defer closeFd(srv);
-
-        var bind_sa = linux.sockaddr.in6{
-            .port = 0, // ephemeral
-            .flowinfo = 0,
-            .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, // ::1
-            .scope_id = 0,
-        };
-        if (posix.errno(linux.bind(srv, @ptrCast(&bind_sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
-            return error.SkipZigTest; // no IPv6 loopback in this environment
-
-        // Recover the kernel-assigned ephemeral port.
-        var name_sa: linux.sockaddr.in6 = undefined;
-        var name_len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
-        if (posix.errno(linux.getsockname(srv, @ptrCast(&name_sa), &name_len)) != .SUCCESS)
-            return error.SkipZigTest;
-        const bound_port = std.mem.bigToNative(u16, name_sa.port);
-
-        // Build the client query the same way systemResolveA does.
-        var query_buf: [dns.max_message_len]u8 = undefined;
-        const query = try dns.encodeQuery(&query_buf, 0x4242, "host.test", .a);
-
-        // Pre-stage the canned A-record response so we can reply the moment the
-        // query lands (single-threaded: receive, then send, then parse).
-        var resp_buf: [dns.max_message_len]u8 = undefined;
-        const answers = [_]dns.Answer{.{
-            .name = "host.test",
-            .rr_type = .a,
-            .ttl = 60,
-            .data = .{ .a = .{ 203, 0, 113, 7 } },
-        }};
-        const questions = [_]dns.Query{.{ .name = "host.test", .qtype = .a }};
-        const response = try dns.encodeMessage(&resp_buf, .{
-            .id = 0x4242,
-            .response = true,
-            .recursion_available = true,
-            .questions = &questions,
-            .answers = &answers,
-        });
-
-        // Client side: connected UDP/IPv6 socket to our responder, send query.
-        const cli = try udpSocket(posix.AF.INET6);
-        defer closeFd(cli);
-        var dst_sa = linux.sockaddr.in6{
-            .port = std.mem.nativeToBig(u16, bound_port),
-            .flowinfo = 0,
-            .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
-            .scope_id = 0,
-        };
-        if (posix.errno(linux.connect(cli, @ptrCast(&dst_sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS)
-            return error.SkipZigTest;
-        if (posix.errno(linux.write(cli, query.ptr, query.len)) != .SUCCESS) return error.SkipZigTest;
-
-        // Server side: receive the query, reply to the sender with the A record.
-        var in_buf: [dns.max_message_len]u8 = undefined;
-        var from_sa: linux.sockaddr.in6 = undefined;
-        var from_len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
-        const rc = linux.recvfrom(srv, &in_buf, in_buf.len, 0, @ptrCast(&from_sa), &from_len);
-        if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
-        if (posix.errno(linux.sendto(srv, response.ptr, response.len, 0, @ptrCast(&from_sa), from_len)) != .SUCCESS)
-            return error.SkipZigTest;
-
-        // Client reads + parses the reply exactly like exchangeQuery does.
-        var reply_buf: [dns.max_message_len]u8 = undefined;
-        const n_rc = linux.read(cli, &reply_buf, reply_buf.len);
-        try std.testing.expectEqual(linux.E.SUCCESS, posix.errno(n_rc));
-        const n: usize = @intCast(n_rc);
-        const msg = try dns.parseMessage(1, dns.max_cache_addrs, reply_buf[0..n]);
-        var found: ?[4]u8 = null;
-        for (msg.answerSlice()) |rr| switch (rr.data) {
-            .a => |ipv4| found = ipv4,
-            else => {},
-        };
-        try std.testing.expectEqual(@as(?[4]u8, .{ 203, 0, 113, 7 }), found);
-    } else return error.SkipZigTest;
+test {
+    _ = @import("acme_dns_tests.zig");
 }
 
 test {
