@@ -18355,6 +18355,7 @@ pub const LinuxServer = struct {
         var storage: [default_reply_bytes]u8 = undefined;
         var replies = dispatch.ReplyCtx.init(&storage);
         try dispatch.releaseChallengeHold(&conn.session, &replies);
+        if (try self.rejectUnauthenticatedRegistrationNick(conn)) return;
         if (replies.written().len != 0) try appendToConn(conn, replies.written());
     }
 
@@ -18605,17 +18606,7 @@ pub const LinuxServer = struct {
                 },
                 else => return err,
             };
-            if (conn.session.registered() and self.registeredNickRequiresAuthentication(conn, conn.session.displayName())) {
-                try queueNumeric(
-                    conn,
-                    .ERR_ERRONEUSNICKNAME,
-                    &.{conn.session.displayName()},
-                    "Nickname is registered; authenticate as this account before using it",
-                );
-                conn.close_reason = "Registered nickname requires authentication";
-                conn.closing = true;
-                return;
-            }
+            if (try self.rejectUnauthenticatedRegistrationNick(conn)) return;
             if (sink.written().len != 0) try appendToConn(conn, sink.written());
             if (std.ascii.eqlIgnoreCase(parsed.command, "AUTHENTICATE"))
                 conn.sasl_external_authenticated = external_exchange and
@@ -19006,6 +18997,34 @@ pub const LinuxServer = struct {
             if (std.ascii.eqlIgnoreCase(account, nick)) return false;
         }
         _ = svc.accountInfo(nick) catch return false;
+        return true;
+    }
+
+    /// Dispatch stages the welcome before live account-store admission. Reject
+    /// an unowned account name without publishing that welcome or closing the
+    /// transport: IRC clients recover from 432 by sending another NICK. Retain
+    /// USER, CAP, SASL, and challenge state, but require a fresh accepted NICK
+    /// before any command can complete registration or publish live identity.
+    fn rejectUnauthenticatedRegistrationNick(self: *LinuxServer, conn: *ConnState) !bool {
+        if (!conn.session.registered() or
+            !self.registeredNickRequiresAuthentication(conn, conn.session.displayName())) return false;
+        conn.session.registration.registered = false;
+        conn.session.registration.nick_seen = false;
+        conn.session.client.registration.prereg = .user_seen;
+        queueNumeric(
+            conn,
+            .ERR_ERRONEUSNICKNAME,
+            &.{conn.session.displayName()},
+            "Nickname is registered; authenticate as this account before using it",
+        ) catch |err| switch (err) {
+            error.OutputTooSmall,
+            error.TextTooLong,
+            error.NoSpaceLeft,
+            error.OversizeLine,
+            error.LineTooLong,
+            => conn.closing = true,
+            else => return err,
+        };
         return true;
     }
 
@@ -104808,11 +104827,26 @@ test "threaded server: registered nick requires owner authentication before use"
     try recvUntil(&guest, " 432 Admin Admin :Nickname is registered; authenticate as this account before using it", 200);
     try std.testing.expect(std.mem.indexOf(u8, guest.written(), " 001 Admin ") == null);
 
+    // A rejected identity is recoverable on the same transport. In particular,
+    // clients such as WeeChat immediately retry NICK without repeating USER.
+    guest.reset();
+    try writeAllFd(fd_guest, "NICK GuestFallback\r\nPING :nick-fallback-alive\r\n");
+    try recvUntil(&guest, " :nick-fallback-alive\r\n", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(guest.written(), " 001 GuestFallback "));
+    try std.testing.expect(std.mem.indexOf(u8, guest.written(), " 001 Admin ") == null);
+    guest.reset();
+    try writeAllFd(fd_guest, "REGISTER * * fallback-password\r\n");
+    try recvUntil(&guest, "REGISTER SUCCESS GuestFallback", 200);
+    _ = try services.accountInfo("GuestFallback");
+
     const fd_owner = connectLoopback(port) catch return error.SkipZigTest;
     defer closeFd(fd_owner);
     var owner = LiveClient{ .fd = fd_owner };
-    try saslPlainPrelude(fd_owner, "admin", "onyx");
     try writeAllFd(fd_owner, "NICK Admin\r\nUSER admin 0 * :Admin\r\n");
+    try recvUntil(&owner, " 432 Admin Admin :Nickname is registered; authenticate as this account before using it", 200);
+    owner.reset();
+    try saslPlainPrelude(fd_owner, "admin", "onyx");
+    try writeAllFd(fd_owner, "NICK Admin\r\n");
     try recvUntil(&owner, " 001 Admin ", 200);
 
     const fd_other = connectLoopback(port) catch return error.SkipZigTest;
@@ -104823,6 +104857,133 @@ test "threaded server: registered nick requires owner authentication before use"
     other.reset();
     try writeAllFd(fd_other, "NICK Admin\r\n");
     try recvUntil(&other, " 432 Guest42 Admin :Nickname is registered; authenticate as this account before using it", 200);
+}
+
+test "threaded server: registered nick rejection preserves CAP USER and blocks publication until fallback" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "registered-nick-fallback.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("admin", "correcthorse", &scratch);
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.connFor(id).?;
+    conn.token = try tokenFromId(id);
+    conn.overflow_allocator = server.allocator;
+    server.injectSessionState(conn);
+    try server.feedBytes(
+        id,
+        conn,
+        "CAP LS 302\r\n" ++
+            "NICK Admin\r\nUSER retained 0 * :Retained Realname\r\n" ++
+            "CAP REQ :server-time message-tags echo-message multi-prefix userhost-in-names away-notify setname extended-join invite-notify account-tag chghost batch account-notify cap-notify draft/multiline\r\n" ++
+            "CAP END\r\n",
+    );
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(!conn.session.registered());
+    try std.testing.expect(!conn.session.registration.nick_seen);
+    try std.testing.expect(conn.session.registration.user_seen);
+    try std.testing.expectEqual(.user_seen, conn.session.client.registration.prereg);
+    try std.testing.expectEqual(.complete, conn.session.cap.state);
+    try std.testing.expect(conn.session.hasCap(.multiline));
+    try std.testing.expectEqualStrings("retained", conn.session.username());
+    try std.testing.expectEqualStrings("Retained Realname", conn.session.realname());
+    try std.testing.expect(server.world.findNick("Admin") == null);
+    try std.testing.expect(!server.sessions.containsClient("admin", monitorIdFromClient(id)));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(conn.send_buf[0..conn.send_len], " 001 "));
+
+    // Unrelated commands and repeated protected names cannot bypass admission.
+    try server.feedBytes(id, conn, "JOIN #protected\r\nCAP END\r\nNICK aDmIn\r\n");
+    try std.testing.expect(!conn.session.registered());
+    try std.testing.expect(!conn.closing);
+    try std.testing.expectEqual(@as(usize, 0), server.world.channelCount());
+    try std.testing.expect(server.world.findNick("admin") == null);
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(conn.send_buf[0..conn.send_len], " 001 "));
+
+    // Coalesced input after the rejected name must still be processed. The
+    // accepted name gets one welcome and the already supplied USER/CAP state.
+    try server.feedBytes(id, conn, "NICK Admin\r\nNICK GuestFallback\r\nPING :still-open\r\n");
+    try std.testing.expect(conn.session.registered());
+    try std.testing.expect(!conn.closing);
+    try std.testing.expectEqual(@as(?world_model.ClientId, worldIdFromClient(id)), server.world.findNick("GuestFallback"));
+    try std.testing.expect(server.world.findNick("Admin") == null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(conn.send_buf[0..conn.send_len], " 001 GuestFallback "));
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " :still-open\r\n") != null);
+    try std.testing.expectEqualStrings("retained", conn.session.username());
+    try std.testing.expect(conn.session.hasCap(.multiline));
+
+    // A full SendQ must not leave dispatch's speculative registered flag live
+    // when the denial itself cannot be queued.
+    const blocked_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const blocked = server.connFor(blocked_id).?;
+    blocked.token = try tokenFromId(blocked_id);
+    server.injectSessionState(blocked);
+    try server.processLiveLine(blocked_id, blocked, "NICK Admin");
+    blocked.sendq_cap = 0;
+    try server.processLiveLine(blocked_id, blocked, "USER blocked 0 * :Blocked");
+    try std.testing.expect(blocked.closing);
+    try std.testing.expect(!blocked.session.registered());
+    try std.testing.expect(!blocked.session.registration.nick_seen);
+    try std.testing.expect(blocked.session.registration.user_seen);
+    try std.testing.expectEqual(.user_seen, blocked.session.client.registration.prereg);
+    try std.testing.expectEqual(@as(usize, 0), blocked.send_len);
+    try std.testing.expect(server.world.findNick("Admin") == null);
+    try std.testing.expect(!server.sessions.containsClient("admin", monitorIdFromClient(blocked_id)));
+}
+
+test "threaded server: registered nick challenge release rejects welcome and permits fallback" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "registered-nick-challenge.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("admin", "correcthorse", &scratch);
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .account_services = &services,
+        .challenge_enabled = true,
+        .reputation_refuse_threshold = 1,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try gapP8Open(&server);
+    const conn = server.connFor(id).?;
+    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 9 } };
+    _ = try server.reputation.penalize(conn.peer_addr.?, 5, server.nowU64());
+    try server.feedBytes(id, conn, "NICK Admin\r\nUSER retained 0 * :Retained\r\n");
+    try std.testing.expect(conn.session.challenge_hold);
+    try std.testing.expect(!conn.session.registered());
+    var nonce_buf: [8]u8 = undefined;
+    const nonce = gapP8Pow(conn.challenge_seed[0..conn.challenge_seed_len], &nonce_buf) orelse return error.TestUnexpectedResult;
+    var line_buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "CHALLENGE {s}\r\n", .{nonce});
+    try server.feedBytes(id, conn, line);
+    try std.testing.expect(conn.challenge_passed);
+    try std.testing.expect(!conn.session.registered());
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(server.world.findNick("Admin") == null);
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(conn.send_buf[0..conn.send_len], " 001 "));
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], " 432 Admin Admin ") != null);
+    try server.feedBytes(id, conn, "NICK ChallengeFallback\r\n");
+    try std.testing.expect(conn.session.registered());
+    try std.testing.expect(!conn.closing);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(conn.send_buf[0..conn.send_len], " 001 ChallengeFallback "));
 }
 
 test "threaded server: VERIFY accepts account argument and legacy code form" {
