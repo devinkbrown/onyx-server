@@ -314,10 +314,11 @@ pub const Resolver = struct {
         return null;
     }
 
-    /// Find or claim a slot for `ip`, marking it pending. Caller holds the mutex.
-    fn reserve(self: *Resolver, ip: dns.Address) *Entry {
+    /// Find or claim a slot for `ip`. Pending work is never evicted; a full
+    /// cache of pending entries refuses admission. Caller holds the mutex.
+    fn reserve(self: *Resolver, ip: dns.Address) ?*Entry {
         if (self.find(ip)) |e| return e;
-        const e = self.victim();
+        const e = self.victim() orelse return null;
         e.* = .{};
         e.key = ip;
         e.has_key = true;
@@ -325,11 +326,12 @@ pub const Resolver = struct {
         return e;
     }
 
-    fn victim(self: *Resolver) *Entry {
-        var oldest: *Entry = &self.entries[0];
+    fn victim(self: *Resolver) ?*Entry {
+        var oldest: ?*Entry = null;
         for (self.entries) |*e| {
             if (!e.has_key or e.state == .empty) return e;
-            if (e.resolved_ms < oldest.resolved_ms) oldest = e;
+            if (e.state == .pending) continue;
+            if (oldest == null or e.resolved_ms < oldest.?.resolved_ms) oldest = e;
         }
         return oldest;
     }
@@ -346,7 +348,7 @@ pub const Resolver = struct {
         }
         // Publish pending only after queue admission is certain. A refused
         // request must remain retryable and must not evict a cache entry.
-        const entry = self.reserve(ip);
+        const entry = self.reserve(ip) orelse return;
         entry.* = .{ .key = ip, .has_key = true, .state = .pending };
         self.jobs[self.job_tail] = .{ .ip = ip };
         self.job_tail = (self.job_tail + 1) % job_capacity;
@@ -388,7 +390,10 @@ pub const Resolver = struct {
             }
 
             lockSpin(&self.mutex);
-            const e = self.reserve(job.ip);
+            const e = self.reserve(job.ip) orelse {
+                self.mutex.unlock();
+                continue;
+            };
             if (ptr_name) |name| {
                 const n = @min(name.len, e.host_buf.len);
                 @memcpy(e.host_buf[0..n], name[0..n]);
@@ -570,7 +575,7 @@ test "request enqueues; lookup misses until a confirmed result is stored" {
     // Simulate the worker storing a resolved-but-unconfirmed result.
     {
         lockSpin(&r.mutex);
-        const e = r.reserve(ip);
+        const e = r.reserve(ip) orelse return error.TestUnexpectedResult;
         e.host_len = 0;
         e.observed_len = 0;
         e.state = .ready;
@@ -579,7 +584,7 @@ test "request enqueues; lookup misses until a confirmed result is stored" {
     try std.testing.expect(r.lookup(ip, &buf) == null); // ready, no hostname → miss
     {
         lockSpin(&r.mutex);
-        const e = r.reserve(ip);
+        const e = r.reserve(ip) orelse return error.TestUnexpectedResult;
         const raw = "ptr.example.net";
         @memcpy(e.host_buf[0..raw.len], raw);
         e.host_len = 0;
@@ -595,7 +600,7 @@ test "request enqueues; lookup misses until a confirmed result is stored" {
     // Simulate a confirmed result.
     {
         lockSpin(&r.mutex);
-        const e = r.reserve(ip);
+        const e = r.reserve(ip) orelse return error.TestUnexpectedResult;
         const name = "host.example.com";
         @memcpy(e.host_buf[0..name.len], name);
         e.host_len = name.len;
@@ -607,7 +612,7 @@ test "request enqueues; lookup misses until a confirmed result is stored" {
     // A restored checkpoint has no observed_len. The confirmed name still resolves.
     {
         lockSpin(&r.mutex);
-        const e = r.reserve(ip);
+        const e = r.reserve(ip) orelse return error.TestUnexpectedResult;
         e.observed_len = 0;
         e.host_len = "host.example.com".len;
         e.state = .ready;
@@ -781,7 +786,7 @@ test "DNS worker refresh stays pending after dequeue and preserves checkpoint va
     var resolver = try Resolver.init(std.testing.allocator);
     defer resolver.deinit();
     const ip: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
-    const entry = resolver.reserve(ip);
+    const entry = resolver.reserve(ip) orelse return error.TestUnexpectedResult;
     entry.state = .ready;
     entry.resolved_ms = 0;
     const host = "old.example.test";
@@ -797,4 +802,44 @@ test "DNS worker refresh stays pending after dequeue and preserves checkpoint va
     _ = resolver.takeJob() orelse return error.TestUnexpectedResult;
     resolver.request(ip);
     try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
+}
+
+test "DNS worker cache pressure preserves an in-flight pending address" {
+    var resolver = try Resolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    for (resolver.entries, 0..) |*entry, i| {
+        entry.* = .{ .key = .{ .ipv4 = .{ 192, 168, @intCast(i / 256), @intCast(i % 256) } }, .has_key = true, .state = .ready, .resolved_ms = @intCast(i + 1) };
+    }
+    const first: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 1 } };
+    const second: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 2 } };
+    resolver.request(first);
+    _ = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    resolver.request(second);
+    const retained = resolver.find(first) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(State.pending, retained.state);
+    resolver.request(first);
+    try std.testing.expectEqual(@as(usize, 1), resolver.job_count);
+    try std.testing.expect(addrEql(second, (resolver.takeJob() orelse return error.TestUnexpectedResult).ip));
+}
+
+test "DNS worker refuses admission when every cache entry is pending" {
+    var resolver = try Resolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    for (resolver.entries, 0..) |*entry, i| {
+        entry.* = .{ .key = .{ .ipv4 = .{ 192, 168, @intCast(i / 256), @intCast(i % 256) } }, .has_key = true, .state = .pending };
+    }
+    const incoming: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    resolver.request(incoming);
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
+    try std.testing.expect(resolver.find(incoming) == null);
+    for (resolver.entries, 0..) |entry, i| {
+        const expected: dns.Address = .{ .ipv4 = .{ 192, 168, @intCast(i / 256), @intCast(i % 256) } };
+        try std.testing.expect(addrEql(expected, entry.key));
+        try std.testing.expectEqual(State.pending, entry.state);
+    }
+    // Once a completed entry is available, the same request is retryable.
+    resolver.entries[0].state = .ready;
+    resolver.request(incoming);
+    try std.testing.expectEqual(@as(usize, 1), resolver.job_count);
+    try std.testing.expectEqual(State.pending, resolver.find(incoming).?.state);
 }
