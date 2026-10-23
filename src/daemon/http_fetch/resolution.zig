@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Unix dual-stack DNS query transport and reply validation.
+//! Single-family DNS policy over the shared engine, plus parallel dual-stack lookup.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const sys = if (builtin.os.tag == .windows) std.os.linux else std.posix.system;
 const posix = std.posix;
 const dns = @import("../../proto/dns.zig");
+const address_lookup = @import("../dns_address_lookup.zig");
 const resolv_conf = @import("../../proto/resolv_conf.zig");
 const tls_client = @import("../../crypto/tls_client.zig");
 const net = std.Io.net;
@@ -16,62 +17,24 @@ const HostFamilies = @import("contracts.zig").HostFamilies;
 const resolveHostFamiliesWindows = @import("windows_resolver.zig").resolveHostFamiliesWindows;
 const resolveHostWindows = @import("windows_resolver.zig").resolveHostWindows;
 const udpSocketFamily = @import("native_io.zig").udpSocketFamily;
-const setRecvTimeout = @import("native_io.zig").setRecvTimeout;
 const closeFd = @import("native_io.zig").closeFd;
 const writeAll = @import("native_io.zig").writeAll;
 const readSmallFile = @import("native_io.zig").readSmallFile;
 const osEntropy = @import("native_io.zig").osEntropy;
 
-// ---- DNS (A-record over UDP, blocking) --------------------------------------
+// ---- Single-family resolution (blocking, bounded) -------------------------
 
 /// Resolve `host` to an address: IP literals parse directly; otherwise query
 /// the system resolver with a bounded wait (Windows) or each configured DNS
-/// server (Unix). Public so mesh auto-connect can dial hostname peers.
+/// server (Unix). The POSIX lookup shares timeout_ms across every server, alias,
+/// and TCP fallback, clamped to 1..5000 ms. Public for mesh hostname dialing.
 pub fn resolveHostA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAddress {
     if (net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
     if (comptime builtin.os.tag == .windows) {
         return resolveHostWindows(host, port, timeout_ms, false);
     }
 
-    var conf_buf: [4096]u8 = undefined;
-    const text = readSmallFile("/etc/resolv.conf", &conf_buf) catch return error.NoNameservers;
-    const conf = resolv_conf.parse(text);
-    const servers = conf.nameserverSlice();
-    if (servers.len == 0) return error.NoNameservers;
-
-    var id_seed: [2]u8 = undefined;
-    osEntropy(&id_seed);
-    const query_id = std.mem.readInt(u16, &id_seed, .big);
-    var query_buf: [dns.max_message_len]u8 = undefined;
-    const query = dns.encodeQuery(&query_buf, query_id, host, .a) catch return error.HostNotFound;
-
-    for (servers) |srv| {
-        if (queryOneServer(srv, query, timeout_ms)) |ipv4| {
-            return .{ .ip4 = .{ .bytes = ipv4, .port = port } };
-        } else |_| {}
-    }
-    return error.HostNotFound;
-}
-
-fn queryOneServer(ns: dns.Address, query: []const u8, timeout_ms: u31) Error![4]u8 {
-    const msg = try queryServerPort(ns, 53, query, timeout_ms);
-    for (msg.answerSlice()) |rr| switch (rr.data) {
-        .a => |ipv4| return ipv4,
-        else => {},
-    };
-    return error.HostNotFound;
-}
-
-pub fn queryServerPort(ns: dns.Address, port: u16, query: []const u8, timeout_ms: u31) Error!dns.Message(1, dns.max_cache_addrs) {
-    const fd = try udpSocketFamily(if (ns == .ipv4) posix.AF.INET else posix.AF.INET6, false);
-    defer closeFd(fd);
-    try setRecvTimeout(fd, timeout_ms);
-    try connectUdp(fd, ns, port);
-    try writeAll(fd, query);
-    var resp: [dns.max_message_len]u8 = undefined;
-    const rc = sys.read(fd, &resp, resp.len);
-    if (posix.errno(rc) != .SUCCESS) return error.HostNotFound;
-    return acceptedResponse(query, resp[0..@intCast(rc)]) orelse error.HostNotFound;
+    return resolveSingleFamily(host, port, timeout_ms, .a);
 }
 
 fn acceptedResponse(query: []const u8, raw: []const u8) ?dns.Message(1, dns.max_cache_addrs) {
@@ -86,8 +49,8 @@ fn acceptedResponse(query: []const u8, raw: []const u8) ?dns.Message(1, dns.max_
     return msg;
 }
 
-/// Like `resolveHostA` but requests IPv6 addresses. The Unix path queries AAAA
-/// records over configured IPv4 nameservers; Windows uses its system resolver.
+/// Like `resolveHostA` but requests IPv6 addresses over configured nameservers
+/// of either family. Windows keeps its native system-resolver policy.
 pub fn resolveHostAAAA(host: []const u8, port: u16, timeout_ms: u31) Error!net.IpAddress {
     if (net.IpAddress.parse(host, port)) |addr| switch (addr) {
         .ip6 => return addr,
@@ -97,25 +60,37 @@ pub fn resolveHostAAAA(host: []const u8, port: u16, timeout_ms: u31) Error!net.I
         return resolveHostWindows(host, port, timeout_ms, true);
     }
 
+    return resolveSingleFamily(host, port, timeout_ms, .aaaa);
+}
+
+/// Only single-family lookups use this policy. Config-file ownership and the
+/// legacy HTTP error surface stay here; packet validation and socket deadlines
+/// belong to the shared address lookup. No public resolver fallback is allowed.
+fn resolveSingleFamily(host: []const u8, port: u16, timeout_ms: u31, family: address_lookup.Family) Error!net.IpAddress {
+    if (comptime builtin.is_test) {
+        if (Testing.config) |config| {
+            const text = config.text orelse return error.NoNameservers;
+            return resolveConfiguredFamily(text, host, port, config.dns_port, family, timeout_ms);
+        }
+    }
     var conf_buf: [4096]u8 = undefined;
     const text = readSmallFile("/etc/resolv.conf", &conf_buf) catch return error.NoNameservers;
-    const conf = resolv_conf.parse(text);
-    const servers = conf.nameserverSlice();
-    if (servers.len == 0) return error.NoNameservers;
-
-    var id_seed: [2]u8 = undefined;
-    osEntropy(&id_seed);
-    const query_id = std.mem.readInt(u16, &id_seed, .big);
-    var query_buf: [dns.max_message_len]u8 = undefined;
-    const query = dns.encodeQuery(&query_buf, query_id, host, .aaaa) catch return error.HostNotFound;
-
-    for (servers) |srv| {
-        if (queryOneServer6(srv, query, timeout_ms)) |ipv6| {
-            return .{ .ip6 = .{ .bytes = ipv6, .port = port } };
-        } else |_| {}
-    }
-    return error.HostNotFound;
+    return resolveConfiguredFamily(text, host, port, 53, family, timeout_ms);
 }
+
+fn resolveConfiguredFamily(text: []const u8, host: []const u8, port: u16, dns_port: u16, family: address_lookup.Family, timeout_ms: u31) Error!net.IpAddress {
+    return address_lookup.resolve(text, host, port, dns_port, family, timeout_ms) catch |err| switch (err) {
+        error.NoNameservers => error.NoNameservers,
+        else => error.HostNotFound,
+    };
+}
+
+/// Per-test-thread config-file substitute. Tests call the actual public resolver
+/// entry points; no override or mutable test state exists in production builds.
+pub const Testing = if (builtin.is_test) struct {
+    pub const Config = struct { text: ?[]const u8, dns_port: u16 = 53 };
+    pub threadlocal var config: ?Config = null;
+} else struct {};
 
 pub fn resolveHostFamilies(host: []const u8, timeout_ms: u31) Error!HostFamilies {
     if (host.len == 0 or std.mem.indexOfScalar(u8, host, 0) != null) return error.HostNotFound;
@@ -291,13 +266,4 @@ fn connectUdp(fd: sys.fd_t, ns: dns.Address, port: u16) Error!void {
         },
     };
     if (posix.errno(rc) != .SUCCESS) return error.ConnectFailed;
-}
-
-fn queryOneServer6(ns: dns.Address, query: []const u8, timeout_ms: u31) Error![16]u8 {
-    const msg = try queryServerPort(ns, 53, query, timeout_ms);
-    for (msg.answerSlice()) |rr| switch (rr.data) {
-        .aaaa => |ipv6| return ipv6,
-        else => {},
-    };
-    return error.HostNotFound;
 }
