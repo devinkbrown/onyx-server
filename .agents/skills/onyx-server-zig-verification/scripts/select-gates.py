@@ -29,9 +29,30 @@ def contains(path: str, *needles: str) -> bool:
 
 
 def select(paths: Iterable[str]) -> tuple[list[str], set[str]]:
-    gates: set[str] = set()
-    critical: set[str] = set()
+    all_gates: set[str] = set()
+    all_critical: set[str] = set()
     for path in paths:
+        gates: set[str] = set()
+        critical: set[str] = set()
+        # Extracted suites include helpers and test names outside the historical
+        # named filters (for example DNS resolver_config).
+        if path.startswith(("src/proto/dns/", "src/proto/ircx_prop_store/",
+                            "src/proto/lotus/", "src/daemon/relay_v2_event_log/")):
+            gates.add("test-mod")
+            critical.add("test-mod")
+        # Preserve caller gates when a stable facade is split into a directory.
+        for facade in ("src/daemon/store", "src/daemon/sessions", "src/daemon/world",
+                       "src/daemon/physical_lifecycle", "src/proto/lotus"):
+            if path.startswith(facade + "/"):
+                path = facade + ".zig"
+                break
+        if path == "src/main.zig":
+            gates.add("test")
+            critical.add("test")
+        if (path in {"src/daemon/registry.zig", "src/daemon/diagnostics.zig", "src/daemon/dlog.zig"}
+                or path.startswith("src/daemon/module_") or path.startswith("src/daemon/modules/")):
+            gates.update(("test-mod", "test-server"))
+            critical.update(("test-mod", "test-server"))
         # Neither foundation's tests are selected by the services name filters.
         # Their complete module artifact covers storage and resource consumers.
         if path in {"src/daemon/store.zig", "src/daemon/physical_lifecycle.zig"}:
@@ -90,7 +111,14 @@ def select(paths: Iterable[str]) -> tuple[list[str], set[str]]:
         if path in {"build.zig", "build.zig.zon"} or path.startswith("packaging/"):
             gates.add("test")
             critical.add("test")
-    return sorted(gates), critical
+        # A new or moved source file must never silently select only `check`.
+        # Evaluate per path: another file's matched gates cannot hide this one.
+        if not gates and path.startswith("src/") and path.endswith(".zig"):
+            gates.add("test-mod")
+            critical.add("test-mod")
+        all_gates.update(gates)
+        all_critical.update(critical)
+    return sorted(all_gates), all_critical
 
 
 def main() -> int:

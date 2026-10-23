@@ -58,6 +58,33 @@ class GateSelectionTests(unittest.TestCase):
     def test_build_change_selects_full_release_safe_test(self) -> None:
         self.assert_selection("build.zig", {"test"}, {"test"})
 
+    def test_new_source_cannot_escape_testing_beside_a_known_path(self) -> None:
+        for paths in (("src/daemon/new_controller.zig", "src/cli/main.zig"),
+                      ("src/cli/main.zig", "src/daemon/new_controller.zig")):
+            gates, critical = selector.select(paths)
+            self.assertEqual({"test-mod", "test-cli"}, set(gates))
+            self.assertEqual({"test-mod"}, critical)
+
+    def test_module_runtime_and_diagnostics_keep_live_and_safe_gates(self) -> None:
+        for path in ("src/daemon/registry.zig", "src/daemon/module_runtime.zig",
+                     "src/daemon/modules/introspect.zig", "src/daemon/diagnostics.zig"):
+            self.assert_selection(path, {"test-mod", "test-server"}, {"test-mod", "test-server"})
+
+    def test_extracted_facades_keep_consumer_gates(self) -> None:
+        for facade in ("src/daemon/store", "src/daemon/sessions", "src/daemon/world",
+                       "src/daemon/physical_lifecycle", "src/proto/lotus"):
+            before, critical_before = selector.select([facade + ".zig"])
+            after, critical_after = selector.select([facade + "/checkpoint.zig"])
+            self.assertLessEqual(set(before), set(after))
+            self.assertLessEqual(critical_before, critical_after)
+
+    def test_nested_dns_config_does_not_only_select_config_filter(self) -> None:
+        self.assert_selection("src/proto/dns/resolver_config.zig",
+                              {"test-mod", "test-config"}, {"test-mod"})
+
+    def test_entrypoint_selects_full_suite(self) -> None:
+        self.assert_selection("src/main.zig", {"test"}, {"test"})
+
     def test_store_includes_module_tests_and_auth_consumers(self) -> None:
         self.assert_selection(
             "src/daemon/store.zig",
