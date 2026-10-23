@@ -23,9 +23,18 @@ configuration. These additive interfaces are exercised by local transport tests.
 The daemon's rDNS and DNSBL caches have **not** yet been migrated to them, and this
 change does not replace those services' cache, expiry, or retry policies.
 
-HTTP fetch and the ACME runner have their own DNS transports. They still use the
-shared wire codec and existing validation helpers, but do not automatically gain
-the new query engine's TCP fallback or deadline policy.
+The POSIX ACME `SystemResolver` now uses `daemon/dns_address_lookup.zig` and
+the same validated engine. Its complete A lookup shares a three-second deadline
+across four ordered nameservers, CNAME traversal, and TCP fallback. Each endpoint
+receives a share of the remaining time; negative answers and errors still permit
+a later configured endpoint. It reads the caller-bounded configuration file and
+has no public-resolver fallback. Literal addresses bypass that I/O. Windows keeps
+its native resolver path. Web Push continues to screen and pin the returned
+address before connecting.
+
+HTTP fetch retains its own DNS transports at this revision. They use the shared
+wire codec and existing validation helpers, but do not automatically gain the
+new query engine's TCP fallback or whole-lookup deadline policy.
 
 All lookup entry points wait for native socket readiness and must run on resolver
 workers. They do not make synchronous DNS safe to call on a server reactor. A
