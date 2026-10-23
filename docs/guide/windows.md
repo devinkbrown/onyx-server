@@ -696,7 +696,7 @@ zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summ
 zig build -j1 test -Dtarget=x86_64-windows --summary all
 zig build -j1 test -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
 zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=proto.' --summary all
-zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=daemon.store.test.' --summary all
+zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=daemon.store' --summary all
 zig build -j1 test-cli -Dtarget=x86_64-windows --summary all
 python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --tls --wss --metrics --webhook
 python -B .\tools\windows_full_daemon_smoke.py .\zig-out\bin\onyx-server.exe --ws-plain
