@@ -342,16 +342,59 @@ pub fn probeUpgradeExecutableFd(
         .clock = .awake,
         .raw = .fromSeconds(2),
     } }).toDeadline(io);
-    const result = try std.process.run(allocator, io, .{
+    // std.process.run uses stdin=.ignore, which opens /dev/null O_RDWR.
+    // The daemon's inherited Landlock policy deliberately permits only reads
+    // there. An immediately closed pipe supplies EOF without widening policy.
+    var child = try std.process.spawn(io, .{
         .argv = &.{ proc_path, upgrade_capability_arg },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-        .timeout = deadline,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
     });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    return result.term.success() and
-        (hasUpgradeCapabilityLine(result.stdout) or hasUpgradeCapabilityLine(result.stderr));
+    defer {
+        // Zig's Child.kill sends SIGTERM then waits. A candidate can ignore or
+        // block TERM, so force the still-owned, unreaped child to exit first.
+        // Its PID cannot be reused until Child.kill performs the final reap.
+        if (child.id) |pid| {
+            while (linux.errno(linux.kill(pid, .KILL)) == .INTR) {}
+        }
+        child.kill(io);
+    }
+    child.stdin.?.close(io);
+    child.stdin = null;
+
+    var storage: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var output: std.Io.File.MultiReader = undefined;
+    output.init(allocator, io, storage.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer output.deinit();
+    while (output.fill(64, deadline)) |_| {
+        if (output.reader(0).buffered().len > 4096 or output.reader(1).buffered().len > 4096)
+            return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    try output.checkAnyError();
+    if (output.reader(0).buffered().len > 4096 or output.reader(1).buffered().len > 4096)
+        return error.StreamTooLong;
+
+    // EOF does not prove process exit: a hostile image can close both output
+    // pipes and then hang. Observe exit without consuming it, under the same
+    // absolute deadline, before Child.wait performs its normal reap/cleanup.
+    while (true) {
+        const remaining = deadline.deadline.durationFromNow(io).raw.nanoseconds;
+        if (remaining <= 0) return error.Timeout;
+        var status: linux.siginfo_t = std.mem.zeroes(linux.siginfo_t);
+        switch (linux.errno(linux.waitid(.PID, child.id.?, &status, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, null))) {
+            .SUCCESS => if (status.fields.common.first.piduid.pid != 0) break,
+            .INTR => continue,
+            else => return error.ProbeWaitFailed,
+        }
+        try std.Io.sleep(io, .{ .nanoseconds = @min(remaining, 10 * std.time.ns_per_ms) }, .awake);
+    }
+    const term = try child.wait(io);
+    return term.success() and
+        (hasUpgradeCapabilityLine(output.reader(0).buffered()) or hasUpgradeCapabilityLine(output.reader(1).buffered()));
 }
 
 pub const ExecPlan = struct {
@@ -1438,4 +1481,174 @@ test "MARKREAD private reader refuses hot downgrade without an unsafe forward br
     try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_v4_upgrade_capability_token ++ "\n"));
     try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement));
     try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement, predecessor_v4_upgrade_capability_token));
+}
+
+const ProbeFixture = enum { stdout, stderr, wrong, oversize, closed_hang, drip };
+
+/// Tiny static x86_64 fixtures avoid shell startup, PATH, libc, and /dev/null.
+/// Every image first reads stdin and requires EOF before doing anything else.
+fn openProbeFixture(mode: ProbeFixture) !handoff.Fd {
+    if (comptime builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var image: [8192]u8 = @splat(0);
+    @memcpy(image[0..16], &[_]u8{ 0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    std.mem.writeInt(u16, image[16..18], 2, .little); // ET_EXEC
+    std.mem.writeInt(u16, image[18..20], 62, .little); // EM_X86_64
+    std.mem.writeInt(u32, image[20..24], 1, .little);
+    std.mem.writeInt(u64, image[24..32], 0x400078, .little);
+    std.mem.writeInt(u64, image[32..40], 64, .little);
+    std.mem.writeInt(u16, image[52..54], 64, .little);
+    std.mem.writeInt(u16, image[54..56], 56, .little);
+    std.mem.writeInt(u16, image[56..58], 1, .little);
+    std.mem.writeInt(u32, image[64..68], 1, .little); // PT_LOAD
+    std.mem.writeInt(u32, image[68..72], 5, .little); // PF_R | PF_X
+    std.mem.writeInt(u64, image[80..88], 0x400000, .little);
+    std.mem.writeInt(u64, image[88..96], 0x400000, .little);
+    std.mem.writeInt(u64, image[112..120], 4096, .little);
+
+    const Assembler = struct {
+        bytes: []u8,
+        used: usize = 0,
+        fn put(self: *@This(), bytes: []const u8) void {
+            @memcpy(self.bytes[self.used..][0..bytes.len], bytes);
+            self.used += bytes.len;
+        }
+        fn u32le(self: *@This(), value: u32) void {
+            std.mem.writeInt(u32, self.bytes[self.used..][0..4], value, .little);
+            self.used += 4;
+        }
+        fn u64le(self: *@This(), value: u64) void {
+            std.mem.writeInt(u64, self.bytes[self.used..][0..8], value, .little);
+            self.used += 8;
+        }
+    };
+    var code: Assembler = .{ .bytes = image[120..512] };
+    // read(0,rsp,1); require EOF, otherwise exit(7).
+    code.put(&.{ 0x31, 0xc0, 0x31, 0xff, 0x48, 0x89, 0xe6, 0xba, 1, 0, 0, 0, 0x0f, 0x05, 0x85, 0xc0, 0x74, 12 });
+    code.put(&.{ 0xb8, 60, 0, 0, 0, 0xbf, 7, 0, 0, 0, 0x0f, 0x05 });
+    var payload_len: usize = 0;
+    if (mode == .closed_hang) {
+        // Block SIGTERM, proving timeout cleanup needs SIGKILL. A six-second
+        // alarm is only a fixture safety net if that cleanup regresses.
+        payload_len = 8;
+        std.mem.writeInt(u64, image[512..520], 1 << 14, .little);
+        code.put(&.{ 0xb8, 14, 0, 0, 0, 0x31, 0xff, 0x48, 0xbe });
+        code.u64le(0x400200);
+        code.put(&.{ 0x31, 0xd2, 0x41, 0xba, 8, 0, 0, 0, 0x0f, 0x05 });
+        code.put(&.{ 0xb8, 37, 0, 0, 0, 0xbf, 6, 0, 0, 0, 0x0f, 0x05 });
+        code.put(&.{ 0xb8, 3, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0x0f, 0x05 });
+        code.put(&.{ 0xb8, 3, 0, 0, 0, 0xbf, 2, 0, 0, 0, 0x0f, 0x05 });
+        code.put(&.{ 0xb8, 34, 0, 0, 0, 0x0f, 0x05, 0xeb, 0xf7 }); // pause forever
+    } else {
+        const payload = if (mode == .wrong) "wrong\n" else upgrade_capability_token ++ "\n";
+        @memcpy(image[512..][0..payload.len], payload);
+        payload_len = if (mode == .oversize) 4097 else payload.len;
+        if (mode == .drip) {
+            image[512] = '.';
+            payload_len = 24;
+            std.mem.writeInt(u64, image[520..528], 0, .little);
+            std.mem.writeInt(u64, image[528..536], 100_000_000, .little);
+        }
+        const loop = code.used;
+        code.put(&.{ 0xb8, 1, 0, 0, 0, 0xbf }); // write(fd,payload,len)
+        code.u32le(if (mode == .stderr) 2 else 1);
+        code.put(&.{ 0x48, 0xbe });
+        code.u64le(0x400200);
+        code.put(&.{0xba});
+        code.u32le(@intCast(if (mode == .drip) 1 else payload_len));
+        code.put(&.{ 0x0f, 0x05 });
+        if (mode == .drip) {
+            code.put(&.{ 0xb8, 35, 0, 0, 0, 0x48, 0xbf }); // nanosleep(100ms,NULL)
+            code.u64le(0x400208);
+            code.put(&.{ 0x31, 0xf6, 0x0f, 0x05, 0xe9 });
+            const jump: i32 = @as(i32, @intCast(loop)) - @as(i32, @intCast(code.used + 4));
+            code.u32le(@bitCast(jump));
+        } else code.put(&.{ 0xb8, 60, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05 });
+    }
+    const image_len = 512 + payload_len;
+    std.mem.writeInt(u64, image[96..104], image_len, .little);
+    std.mem.writeInt(u64, image[104..112], image_len, .little);
+    const opened = linux.memfd_create("onyx-probe-fixture", 1); // MFD_CLOEXEC
+    if (linux.errno(opened) != .SUCCESS) return error.TestUnexpectedResult;
+    const fd: handoff.Fd = @intCast(opened);
+    errdefer _ = linux.close(fd);
+    var written: usize = 0;
+    while (written < image_len) {
+        const count = linux.write(fd, image[written..].ptr, image_len - written);
+        switch (linux.errno(count)) {
+            .SUCCESS => if (count != 0) {
+                written += count;
+            } else return error.TestUnexpectedResult,
+            .INTR => continue,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    return fd;
+}
+
+fn sandboxedProbeStatus(fd: handoff.Fd, mode: ProbeFixture) u8 {
+    // Never reuse std.testing.io's inherited pool/mutex state after fork.
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .async_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    @import("../kernel_linux.zig").installDaemonSandbox(null) catch return 70;
+    const denied = linux.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(denied) != .ACCES) {
+        if (linux.errno(denied) == .SUCCESS) _ = linux.close(@intCast(denied));
+        return 71;
+    }
+    const started = std.Io.Clock.awake.now(io);
+    const outcome: anyerror!bool = probeUpgradeExecutableFd(std.heap.page_allocator, io, fd);
+    const elapsed = started.durationTo(std.Io.Clock.awake.now(io)).nanoseconds;
+    if (mode == .closed_hang or mode == .drip) {
+        if (outcome) |_| return 72 else |err| if (err != error.Timeout) return 73;
+        if (elapsed < std.time.ns_per_s or elapsed > 5 * std.time.ns_per_s) return 74;
+    } else if (mode == .oversize) {
+        if (outcome) |_| return 75 else |err| if (err != error.StreamTooLong) return 76;
+    } else {
+        const accepted = outcome catch return 77;
+        if (accepted != (mode != .wrong)) return 78;
+    }
+    // Every success/error path must reap its one child, not leave it running
+    // or zombie. This forked fixture has no other child processes.
+    var status: i32 = 0;
+    if (linux.errno(linux.waitpid(-1, &status, linux.W.NOHANG)) != .CHILD) return 79;
+    return 0;
+}
+
+fn expectSandboxedProbe(mode: ProbeFixture) !void {
+    if (comptime builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const fd = try openProbeFixture(mode);
+    defer _ = linux.close(fd);
+    const child = linux.fork();
+    if (linux.errno(child) != .SUCCESS) return error.Unexpected;
+    if (child == 0) {
+        // A broken deadline must fail the fixture rather than hang the suite.
+        _ = linux.syscall1(.alarm, 8);
+        linux.exit_group(sandboxedProbeStatus(fd, mode));
+    }
+    var status: i32 = 0;
+    while (true) {
+        switch (linux.errno(linux.waitpid(@intCast(child), &status, 0))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+    try std.testing.expectEqual(@as(i32, 0), status & 0x7f);
+    try std.testing.expectEqual(@as(i32, 0), (status >> 8) & 0xff);
+}
+
+test "Helix capability probe works inside real daemon sandbox with stdin EOF" {
+    try expectSandboxedProbe(.stdout);
+    try expectSandboxedProbe(.stderr);
+    try expectSandboxedProbe(.wrong);
+}
+
+test "Helix capability probe rejects oversized output and reaps its sandboxed child" {
+    try expectSandboxedProbe(.oversize);
+}
+
+test "Helix capability probe deadline bounds dripped output and closed-output hangs" {
+    try expectSandboxedProbe(.drip);
+    try expectSandboxedProbe(.closed_hang);
 }
