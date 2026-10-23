@@ -996,6 +996,7 @@ const media_cmd = @import("media_cmd.zig");
 const oper_cmd = @import("oper_cmd.zig");
 const mesh_search = @import("mesh_search.zig");
 const kernel_linux = @import("kernel_linux.zig");
+const client_socket_policy = @import("client_socket_policy.zig");
 const kernel_other = @import("kernel_other.zig");
 
 const RingFdToken = ringlane.FdToken;
@@ -67418,6 +67419,51 @@ test "GAP-X3 live listener sets TCP_FASTOPEN, TCP_USER_TIMEOUT, and SO_INCOMING_
     std.debug.print("GAP-X3 branch=linux listener sets TCP_FASTOPEN TCP_USER_TIMEOUT and SO_INCOMING_CPU and stores a pidfd\n", .{});
 }
 
+test "client socket policy: actual accept inherits the full timeout and applies shared keepalive options" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const peer = try connectLoopback(try server.boundPort());
+    defer closeFd(peer);
+    const accepted_rc = linux.accept4(server.rx().listener_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+    if (posix.errno(accepted_rc) != .SUCCESS) return error.TestUnexpectedResult;
+    const accepted: linux.fd_t = @intCast(accepted_rc);
+    var test_owns_accepted = true;
+    defer if (test_owns_accepted) closeFd(accepted);
+
+    // Read the real accepted descriptor before the daemon touches it: the
+    // listener's TCP_USER_TIMEOUT must already have been inherited by Linux.
+    const inherited = try kernel_linux.readU32Option(accepted, linux.IPPROTO.TCP, linux.TCP.USER_TIMEOUT);
+    try std.testing.expectEqual(@as(u32, 60_000), inherited);
+    try std.testing.expectEqual(client_socket_policy.user_timeout_ms, inherited);
+    try std.testing.expectEqual(inherited, try kernel_linux.readU32Option(server.rx().listener_fd, linux.IPPROTO.TCP, linux.TCP.USER_TIMEOUT));
+
+    // The actual accept handler takes ownership even on its refusal/error
+    // paths. It must install keepalive on this same descriptor before RECV.
+    test_owns_accepted = false;
+    try server.handleAccept(.{ .token = listener_token, .res = accepted, .more = false });
+    try std.testing.expectEqual(@as(usize, 1), server.rx().clients.len());
+    var clients = server.rx().clients.iterator();
+    const conn = (clients.next() orelse return error.TestUnexpectedResult).value;
+    try std.testing.expectEqual(accepted, conn.fd);
+    try std.testing.expect(conn.recv_armed);
+    try std.testing.expectEqual(@as(u32, 1), try kernel_linux.readU32Option(conn.fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE));
+    try std.testing.expectEqual(client_socket_policy.keepalive_idle_seconds, try kernel_linux.readU32Option(conn.fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE));
+    try std.testing.expectEqual(client_socket_policy.keepalive_interval_seconds, try kernel_linux.readU32Option(conn.fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL));
+    try std.testing.expectEqual(client_socket_policy.keepalive_probes, try kernel_linux.readU32Option(conn.fd, linux.IPPROTO.TCP, linux.TCP.KEEPCNT));
+    try std.testing.expectEqual(inherited, try kernel_linux.readU32Option(conn.fd, linux.IPPROTO.TCP, linux.TCP.USER_TIMEOUT));
+    try std.testing.expectEqual(@as(u32, 1), try kernel_linux.readU32Option(conn.fd, linux.IPPROTO.TCP, linux.TCP.NODELAY));
+}
+
 /// Landlock allowlist plus the seccomp denylist for the long-running daemon.
 pub fn installDaemonKernelSandbox(config_path: ?[]const u8) !void {
     switch (comptime builtin.os.tag) {
@@ -75553,22 +75599,18 @@ fn setsockopt(fd: linux.fd_t, level: i32, optname: u32, opt: []const u8) ServerE
     }
 }
 
-/// Enable TCP keepalive (+ NODELAY) on an accepted client socket so a peer that
-/// vanished without a clean close — laptop sleep, network change, crash, killed
-/// tab with no FIN — is reaped by the kernel in ~60s instead of lingering as a
-/// channel "ghost" until the much slower app-level PING timeout (interval +
-/// timeout). Linux uses 30s idle + 3 probes 10s apart; Windows uses 30s idle
-/// + 3s intervals with the OS probe count (normally ten). Idle-but-alive
-/// clients are unaffected: the kernel answers keepalive
-/// probes itself, regardless of whether the client app is doing anything, so a
-/// quiet-but-connected session is never dropped. NODELAY also flushes small IRC
-/// lines immediately. Best-effort — setsockopt failures are non-fatal (the PING
-/// timeout remains the backstop).
+/// Enable TCP keepalive and NODELAY on accepted clients and outbound mesh
+/// sockets. Linux shares its idle/probe timings with the listener-inherited
+/// TCP_USER_TIMEOUT budget so that budget covers the configured probe window.
+/// Windows keeps its 30s idle, 3s interval and OS-controlled probe count.
+/// Responsive kernels answer probes without application traffic; a stalled
+/// path can still expire. Socket-option failures remain non-fatal, with the
+/// application PING timeout as a separate backstop.
 fn applyClientKeepalive(fd: linux.fd_t) void {
     const on: u32 = 1;
-    const idle: u32 = 30; // seconds idle before the first probe
-    const intvl: u32 = 10; // seconds between probes
-    const cnt: u32 = 3; // failed probes before the socket is declared dead
+    const idle = client_socket_policy.keepalive_idle_seconds;
+    const intvl = client_socket_policy.keepalive_interval_seconds;
+    const cnt = client_socket_policy.keepalive_probes;
     setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&on)) catch {};
     if (builtin.os.tag == .linux) {
         setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
