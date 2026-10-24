@@ -387,6 +387,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.node.public_key) |v| out.node_public_key = v;
     out.s2s_config = cfg.mesh.s2s;
     if (cfg.mesh.realm.len != 0) out.mesh_realm = cfg.mesh.realm;
+    if (cfg.mesh.presence_store_path) |path| out.mesh_presence_store_path = path;
     if (cfg.mesh.mesh_pass) |v| out.mesh_pass = v;
     if (cfg.mesh.admission_token) |v| out.mesh_admission_token = v;
     if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
@@ -1093,6 +1094,7 @@ test "config text overlays the server config" {
         \\keylen = 24
         \\[mesh]
         \\realm = "ircxnet"
+        \\presence_store_path = "/var/lib/onyx/mesh-presence.wal"
         \\mesh_pass = "shared-secret"
         \\trust_roots = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
         \\admission_token = "aabbcc"
@@ -1178,6 +1180,7 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u31, 2048), loaded.config.max_clients);
     try testing.expectEqual(@as(u32, 24), loaded.config.keylen);
     try testing.expectEqualStrings("ircxnet", loaded.config.mesh_realm);
+    try testing.expectEqualStrings("/var/lib/onyx/mesh-presence.wal", loaded.config.mesh_presence_store_path);
     try testing.expectEqualStrings("shared-secret", loaded.config.mesh_pass);
     try testing.expectEqual(@as(usize, 1), loaded.config.mesh_trust_roots.len);
     try testing.expectEqualStrings("aabbcc", loaded.config.mesh_admission_token);

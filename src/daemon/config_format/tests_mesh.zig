@@ -51,6 +51,17 @@ test "parseToml: [mesh].require_secured projects onto Config and defaults false"
     }
 }
 
+test "parseToml: [mesh].presence_store_path is owned and optional" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6667\n[mesh]\npresence_store_path = \"state/mesh-presence.wal\"\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqualStrings("state/mesh-presence.wal", cfg.mesh.presence_store_path.?);
+
+    var defaults = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6667\n", .{});
+    defer defaults.deinit(allocator);
+    try testing.expect(defaults.mesh.presence_store_path == null);
+}
+
 test "parseToml: MESSAGE_V2 activation plan is explicit complete and type-strict" {
     const allocator = testing.allocator;
     const local_seed: [32]u8 = @splat(0x11);

@@ -25,6 +25,8 @@ const crypto_sign = @import("../crypto/sign.zig");
 const mesh_presence_v2 = @import("../proto/mesh_presence_v2.zig");
 const guest_direct = @import("../proto/guest_direct.zig");
 const guest_presence_route = @import("guest_presence_route.zig");
+const mesh_presence_authority = @import("mesh_presence_authority.zig");
+const mesh_presence_retained = @import("mesh_presence_retained.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const message_relay = @import("../substrate/undertow/message_relay.zig");
 const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
@@ -2157,6 +2159,68 @@ pub const DurableDeviceBoot = server_config.DurableDeviceBoot;
 
 pub const Config = server_config.Config;
 
+/// Open the strict durable guest issuer and retained-presence image. First
+/// provisioning deliberately burns the historical epoch 1 before returning:
+/// epoch-1 runtime guest IDs were used by older binaries and must never be
+/// reused after upgrade. Existing partial or corrupt stores are never repaired
+/// by this path; initialize() rejects any pre-existing namespace.
+fn openDurableGuestPresence(
+    allocator: std.mem.Allocator,
+    config: Config,
+    identity: *const node_identity.NodeIdentity,
+) !mesh_presence_authority.Authority {
+    const io = config.crypto_io orelse return error.MissingCryptoIo;
+    const path = config.mesh_presence_store_path;
+    const now_ms = @max(@as(i64, 0), platform.realtimeMillis());
+    const context: mesh_presence_retained.LocalContext = .{
+        .origin = identity.sign_kp.public_key,
+        .realm = identity.realm,
+    };
+    const dir = std.Io.Dir.cwd();
+    return mesh_presence_authority.Authority.openCold(
+        allocator,
+        io,
+        dir,
+        path,
+        context,
+        &identity.sign_kp,
+        now_ms,
+        .{},
+    ) catch |err| switch (err) {
+        error.FileNotFound, error.MissingState => blk: {
+            var store_id: [16]u8 = undefined;
+            secure_fns.randomBytes(&store_id);
+            if (std.mem.allEqual(u8, &store_id, 0)) store_id[0] = 1;
+            var first = try mesh_presence_authority.Authority.initialize(
+                allocator,
+                io,
+                dir,
+                path,
+                context,
+                store_id,
+                &identity.sign_kp,
+                now_ms,
+                .{},
+            );
+            first.deinit();
+            // initialize() emits epoch 1 for schema-compatible first provision;
+            // the cold reopen commits its epoch-2 retirement before any guest
+            // subject can escape to a physical client or peer.
+            break :blk try mesh_presence_authority.Authority.openCold(
+                allocator,
+                io,
+                dir,
+                path,
+                context,
+                &identity.sign_kp,
+                now_ms,
+                .{},
+            );
+        },
+        else => return err,
+    };
+}
+
 fn validateMeshAdmissionSecurity(config: Config) !void {
     if (config.mesh_admission_roots.len == 0) return;
     if (config.node_identity == null or config.crypto_io == null) {
@@ -2413,6 +2477,9 @@ pub const ConnState = struct {
     /// A live SEND_ZC submission may outlast the ring-wide capability decision.
     /// Keep its ownership through the notification CQE when MORE was set.
     send_zc_armed: bool = false,
+    /// A terminal stream send error forbids retrying queued output. SEND_ZC can
+    /// still own its submitted buffer until the exact notification CQE arrives.
+    send_terminal_failure: bool = false,
     /// Exact successful submission length, released only by its matching CQE.
     send_submitted_len: usize = 0,
     send_submitted_offset: usize = 0,
@@ -4223,6 +4290,10 @@ pub const LinuxServer = struct {
     /// Live mesh-presence v2 subjects and their separate next hops. Null until
     /// the first ordinary guest is published. Not part of the Helix capsule.
     guest_presence: ?*guest_presence_route.Authority = null,
+    /// Durable issuer + retained signed-presence authority. When configured,
+    /// this owner is the persistence source for guest identities and lifecycle
+    /// transitions; it holds the WAL lease for the server lifetime.
+    durable_guest_presence: ?mesh_presence_authority.Authority = null,
     /// Next runtime guest counter. The on-wire epoch stays 1 for this process.
     guest_serial: u64 = 0,
     /// Immutable sorted event-time membership used by RVL2: this node plus the
@@ -5243,6 +5314,22 @@ pub const LinuxServer = struct {
         const runtime_features = try normalizeServerPolicy(allocator, raw_config, accounts_available);
         errdefer if (runtime_features.owned_disabled_features) |owned| allocator.free(owned);
         const config = runtime_features.config;
+        const active_identity_mesh = config.node_identity != null and
+            (config.s2s_port != 0 or
+                (if (config.inherited_s2s_fd) |fd| fd >= 0 else false) or
+                config.mesh_connect.len != 0 or config.mesh_trust_roots.len != 0);
+        if (comptime !builtin.is_test) {
+            if (active_identity_mesh and config.mesh_presence_store_path.len == 0)
+                return error.MissingMeshPresenceStorePath;
+        }
+        var durable_guest_presence: ?mesh_presence_authority.Authority = null;
+        if (config.mesh_presence_store_path.len != 0) {
+            const identity = config.node_identity orelse return error.MeshPresenceIdentityRequired;
+            if (config.resume_arena_fd != null or config.native_arena_bytes != null or config.inherited_state_fd_manifest_present)
+                return error.MeshPresenceHotCheckpointRequired;
+            durable_guest_presence = try openDurableGuestPresence(allocator, config, identity);
+        }
+        errdefer if (durable_guest_presence) |*authority| authority.deinit();
         const durable_plan = try validateDurableDeviceBoot(config);
         try validateMeshAdmissionSecurity(config);
         const boot_unix = @divTrunc(platform.realtimeMillis(), 1000);
@@ -5538,6 +5625,7 @@ pub const LinuxServer = struct {
             .msg_ring_booted = msg_ring_booted,
             .mesh_dials = mesh_dials,
             .mesh_trusted_node_keys = mesh_trusted_node_keys,
+            .durable_guest_presence = durable_guest_presence,
             .relay_v2_required_nodes = relay_v2_required_nodes,
             .relay_v2_activation_state = relay_v2_activation_state,
             .meshpass_roots = meshpass_roots,
@@ -5657,6 +5745,9 @@ pub const LinuxServer = struct {
             .start_ms = if (config.reactor) |r| r.nowMillis() else platform.monotonicMillis(),
             .boot_unix = boot_unix,
         };
+        // Authority ownership moved into the final server image. Any later
+        // destructor now closes its retained Store, WAL, and exclusive lease.
+        durable_guest_presence = null;
         if (durable_property_candidate) |candidate| {
             self.channel_prop_clocks = candidate.channel_clocks;
             self.entity_prop_clocks = candidate.entity_clocks;
@@ -7914,6 +8005,7 @@ pub const LinuxServer = struct {
         if (self.mesh_dials.len != 0) self.allocator.free(self.mesh_dials);
         self.inherited_mesh_redials.deinit(self.allocator);
         if (self.guest_presence) |auth| auth.destroy();
+        if (self.durable_guest_presence) |*authority| authority.deinit();
         if (self.mesh_trusted_node_keys.len != 0) self.allocator.free(self.mesh_trusted_node_keys);
         if (self.relay_v2_required_nodes.len != 0) self.allocator.free(self.relay_v2_required_nodes);
         if (self.meshpass_roots.len != 0) self.allocator.free(self.meshpass_roots);
@@ -12573,7 +12665,11 @@ pub const LinuxServer = struct {
             event.res == -@as(i32, @backingInt(linux.E.CANCELED)))
         {
             conn.recv_multishot_fallback_drain = false;
-            if (!self.rx().socket_io_quiescing) {
+            if (conn.send_terminal_failure) {
+                if (!conn.send_armed) discardPoisonedSendTail(conn);
+                if (conn.closing and !hasUnsentOutput(conn))
+                    try self.closeConn(event.token, conn.close_reason);
+            } else if (!self.rx().socket_io_quiescing) {
                 // Failure-resume may have released the shared barrier before a
                 // cancel's original CQE arrived. Retain accepted close output
                 // just as on SEND cancellation; ECANCELED is not a stream gap.
@@ -12593,7 +12689,11 @@ pub const LinuxServer = struct {
         // its payload and let the all-refs-clear finalizer decide whether the slot
         // can now be recycled.
         if (conn.closing) {
-            try self.armSendIfNeeded(conn);
+            if (conn.send_terminal_failure) {
+                if (!conn.send_armed) discardPoisonedSendTail(conn);
+            } else {
+                try self.armSendIfNeeded(conn);
+            }
             if (!hasUnsentOutput(conn))
                 try self.closeConn(event.token, conn.close_reason);
             return;
@@ -12738,6 +12838,12 @@ pub const LinuxServer = struct {
             conn.send_armed = false;
             conn.send_zc_armed = false;
             conn.send_cancel_pending = false;
+            if (conn.send_terminal_failure) {
+                discardPoisonedSendTail(conn);
+                if (conn.closing and !hasUnsentOutput(conn))
+                    try self.closeConn(event.token, conn.close_reason);
+                return;
+            }
             if (comptime builtin.os.tag == .windows) {
                 if (conn.windows_force_close_cancel) {
                     try self.closeConn(event.token, conn.close_reason);
@@ -12807,12 +12913,16 @@ pub const LinuxServer = struct {
             // Preserve the ordinary immediate failure path instead of retrying
             // a tail across a known byte gap.
             logConnectionDiagnostic(conn, .send_error, event.res, null, .none);
+            conn.send_terminal_failure = true;
+            if (!conn.send_armed) discardPoisonedSendTail(conn);
             conn.s2s_dedup_drain_deadline_ms = 0;
             try self.closeConn(event.token, conn.close_reason);
             return;
         }
 
         if (event.res == 0) {
+            conn.send_terminal_failure = true;
+            if (!conn.send_armed) discardPoisonedSendTail(conn);
             try self.closeConn(event.token, "SEND made no progress");
             return;
         }
@@ -12820,11 +12930,15 @@ pub const LinuxServer = struct {
         if (accepted > submitted or submitted_offset != conn.send_offset or
             conn.send_offset > conn.send_len or accepted > conn.send_len - conn.send_offset)
         {
+            conn.send_terminal_failure = true;
+            if (!conn.send_armed) discardPoisonedSendTail(conn);
             try self.closeConn(event.token, "Invalid SEND completion");
             return;
         }
         if (conn.tls_kernel_prefix_remaining != 0) {
             if (accepted > conn.tls_kernel_prefix_remaining) {
+                conn.send_terminal_failure = true;
+                if (!conn.send_armed) discardPoisonedSendTail(conn);
                 try self.closeConn(event.token, "Invalid TLS prefix completion");
                 return;
             }
@@ -14208,6 +14322,14 @@ pub const LinuxServer = struct {
             token: session_migrate.Token,
             also_token: ?session_migrate.Token = null,
         },
+        /// First hop selected by a live signed ordinary-guest route. This is
+        /// used only when direct-origin nick MEMBERSHIP is not transitive; the
+        /// receiver re-resolves the nick at each hop. A sender token may also
+        /// select its other exact attachment peers.
+        guest_next_hop: struct {
+            node: u64,
+            sender_token: ?session_migrate.Token = null,
+        },
     };
 
     /// Forward a relayed message to the peers selected by `scope`. Returns the
@@ -14274,6 +14396,7 @@ pub const LinuxServer = struct {
             .channel => |ch| link.channelMembers(ch).len > 0,
             .nick => |nk| link.bestNickClaim(nk) != null,
             .session_nick => |target| link.bestNickClaim(target.nick) != null,
+            .guest_next_hop => |target| link.remoteNodeId() == target.node and link.supportsGuestPresence(),
         };
     }
 
@@ -14285,16 +14408,16 @@ pub const LinuxServer = struct {
     /// Keeping this separate from `relayWanted` ensures plaintext peers can never
     /// qualify through a portable-session route.
     fn relayWantedBySessionReplica(self: *LinuxServer, link: *secured_s2s_link.SecuredLink, scope: RelayScope) bool {
-        const target = switch (scope) {
-            .session_nick => |value| value,
-            else => return false,
-        };
         const peer = link.peerShortId() orelse return false;
-        if (self.session_replica_routes.contains(.{ .token = target.token, .peer = peer })) return true;
-        if (target.also_token) |token| {
-            return self.session_replica_routes.contains(.{ .token = token, .peer = peer });
-        }
-        return false;
+        return switch (scope) {
+            .session_nick => |value| self.session_replica_routes.contains(.{ .token = value.token, .peer = peer }) or
+                (if (value.also_token) |token| self.session_replica_routes.contains(.{ .token = token, .peer = peer }) else false),
+            .guest_next_hop => |value| if (value.sender_token) |token|
+                self.session_replica_routes.contains(.{ .token = token, .peer = peer })
+            else
+                false,
+            else => false,
+        };
     }
 
     fn relayDirectMessagePolicyBlocks(
@@ -14622,6 +14745,32 @@ pub const LinuxServer = struct {
         );
     }
 
+    /// Resolve the authenticated account for a portable MESSAGE_V2 sender even
+    /// when this node has no physical attachment for that far origin. The signed
+    /// OFFER binds origin, nick, account, and exact token; the sender_route_id
+    /// must identify that same token, and a current attachment lease must cover
+    /// the OFFER. The message's account string alone never grants policy bypass.
+    const RelayV2GuestSenderProof = struct {
+        token: session_migrate.Token,
+        account: []const u8,
+    };
+
+    fn relayV2GuestSenderAuthority(
+        self: *LinuxServer,
+        msg: message_relay_v2.RelayMessage,
+        nick: []const u8,
+    ) ?RelayV2GuestSenderProof {
+        const sender_route = msg.sender_route_id orelse return null;
+        if (nick.len == 0 or msg.account.len == 0) return null;
+        const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+        const live = (self.session_replica_store.uniqueLiveOriginNick(msg.origin_node, nick, now_wall) catch return null) orelse return null;
+        const exact_route = message_relay_v2.routeId(live.token) catch return null;
+        if (!std.crypto.timing_safe.eql(message_relay_v2.RouteId, exact_route, sender_route) or
+            !self.session_replica_store.hasAttachedOriginOtherThan(live.token, self.config.node_id, now_wall) or
+            !std.ascii.eqlIgnoreCase(live.entry.account, msg.account)) return null;
+        return .{ .token = live.token, .account = live.entry.account };
+    }
+
     const RelayV2RoutePredicateContext = struct {
         route: message_relay_v2.RouteId,
     };
@@ -14669,6 +14818,11 @@ pub const LinuxServer = struct {
     const RelayV2ExactTargetResolution = union(enum) {
         transit,
         pending,
+        invalid,
+        /// The exact local guest incarnation is authoritatively retired. The
+        /// accepted event still enters RVG2/RVL2 with an empty delivery batch,
+        /// so its origin can receive a durable terminal receipt.
+        terminal,
         ready: RelayV2ExactTarget,
     };
 
@@ -14683,31 +14837,79 @@ pub const LinuxServer = struct {
         account_out: []u8,
         out: *std.ArrayList(client_model.ClientId),
     ) std.mem.Allocator.Error!RelayV2ExactTargetResolution {
-        const match = self.localPortableSessionByRoute(signed_route, account_out) orelse
-            return .transit;
-        try self.collectAttachedTokenAuthorityClients(match.account, match.token, out);
-        var index: usize = 0;
-        while (index < out.items.len) {
-            const conn = self.connFor(out.items[index]) orelse {
-                _ = out.orderedRemove(index);
-                continue;
-            };
-            const wrong_nick = !std.ascii.eqlIgnoreCase(conn.session.displayName(), nick);
-            const wrong_channel = if (required_channel) |channel|
-                !self.world.isMember(channel, worldIdFromClient(out.items[index]))
-            else
-                false;
-            if (wrong_nick or wrong_channel) {
-                _ = out.orderedRemove(index);
-            } else {
-                index += 1;
+        if (self.localPortableSessionByRoute(signed_route, account_out)) |match| {
+            try self.collectAttachedTokenAuthorityClients(match.account, match.token, out);
+            var index: usize = 0;
+            while (index < out.items.len) {
+                const conn = self.connFor(out.items[index]) orelse {
+                    _ = out.orderedRemove(index);
+                    continue;
+                };
+                const wrong_nick = !std.ascii.eqlIgnoreCase(conn.session.displayName(), nick);
+                const wrong_channel = if (required_channel) |channel|
+                    !self.world.isMember(channel, worldIdFromClient(out.items[index]))
+                else
+                    false;
+                if (wrong_nick or wrong_channel) {
+                    _ = out.orderedRemove(index);
+                } else {
+                    index += 1;
+                }
             }
+            if (out.items.len == 0) return .pending;
+            return .{ .ready = .{
+                .primary = out.items[0],
+                .account = match.account,
+                .token = match.token,
+            } };
         }
-        if (out.items.len == 0) return .pending;
+
+        return .transit;
+    }
+
+    /// Resolve the explicit MESSAGE_V2 guest scope through exact signed
+    /// `(origin key, incarnation)` authority. A nick is only the display name
+    /// captured when authored; a NICK after admission does not change which
+    /// physical guest connection the signed incarnation names.
+    fn collectRelayV2ExactGuestTarget(
+        self: *LinuxServer,
+        origin: [32]u8,
+        guest_id: [16]u8,
+        out: *std.ArrayList(client_model.ClientId),
+        route_out: *?guest_presence_route.SubjectView,
+    ) std.mem.Allocator.Error!RelayV2ExactTargetResolution {
+        const auth = self.guest_presence orelse return .pending;
+        const guest = auth.liveByGuest(origin, guest_id, self.guestNowMs()) orelse {
+            if (auth.retainedByGuest(origin, guest_id)) |retired| {
+                if (retired.local and retired.operation == .quit) return .terminal;
+            }
+            // A complete authenticated frontier may have compacted the QUIT
+            // witness while retaining the fact that this exact incarnation is
+            // retired. That proof is terminal delivery authority; an unknown
+            // future counter remains pending below.
+            const subject = mesh_presence_v2.subject(guest_id) catch return .invalid;
+            for (auth.store.frontiers.items) |frontier_row| {
+                if (std.crypto.timing_safe.eql([32]u8, frontier_row.decoded.origin, origin) and
+                    frontier_row.conflict == null and
+                    frontier_row.decoded.retires(origin, subject.epoch, subject.counter))
+                    return .terminal;
+            }
+            // Absence is not transit authority. The signed presence may be
+            // reordered behind this direct frame, so defer before RVG2 until
+            // this hop has an exact destination route or terminal proof.
+            return .pending;
+        };
+        route_out.* = guest;
+        if (!guest.local) return .transit;
+        const recipient = self.localGuestClient(origin, guest_id) orelse return .pending;
+        const conn = self.connFor(recipient) orelse return .pending;
+        if (conn.session.account() != null) return .pending;
+        if (!std.crypto.timing_safe.eql([16]u8, conn.guest_id, guest_id)) return .invalid;
+        try out.append(self.allocator, recipient);
         return .{ .ready = .{
-            .primary = out.items[0],
-            .account = match.account,
-            .token = match.token,
+            .primary = recipient,
+            .account = "",
+            .token = @splat(0),
         } };
     }
 
@@ -14930,6 +15132,9 @@ pub const LinuxServer = struct {
 
     const RelayV2OutboxReservation = struct {
         peers: []const u64,
+        /// Exact event-time custody set. Null preserves the configured full
+        /// direct-neighbor set for scopes whose contract is network-wide.
+        required_nodes: ?[]const u64 = null,
         receipt_peer: ?u64 = null,
         wire: []const u8,
         unbound_excluded_peer: u64 = relay_v2_outbox.local_origin_exclusion,
@@ -14981,13 +15186,14 @@ pub const LinuxServer = struct {
         var event_log_plan: ?relay_v2_event_log.PreparedAccepted = null;
         defer if (event_log_plan) |*plan| plan.deinit();
         if (outbox) |reservation| {
-            if (self.relay_v2_required_nodes.len < 2) return .rejected;
+            const required_nodes = reservation.required_nodes orelse self.relay_v2_required_nodes;
+            if (required_nodes.len < 2) return .rejected;
             const prepared = self.relay_v2_event_log.prepareAccepted(
                 relay_id,
                 reservation.wire,
                 self.config.node_id,
                 reservation.receipt_peer,
-                self.relay_v2_required_nodes,
+                required_nodes,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return .rejected,
@@ -15103,8 +15309,7 @@ pub const LinuxServer = struct {
         wire: []const u8,
         via_peer: u64,
     ) std.mem.Allocator.Error!bool {
-        if (!self.relayV2DirectNeighbor(via_peer) or self.relay_v2_required_nodes.len < 2)
-            return false;
+        if (!self.relayV2DirectNeighbor(via_peer)) return false;
         const peers = try self.collectRelayV2OutboxPeers(via_peer, false);
         defer self.allocator.free(peers);
 
@@ -15112,12 +15317,14 @@ pub const LinuxServer = struct {
         defer self.relay_v2_replay_mu.unlock();
         if (!self.relay_v2_event_log.contains(relay_id))
             return self.relay_v2_outbox.containsReceipt(via_peer, relay_id);
+        const retained = self.relay_v2_event_log.viewFor(relay_id) orelse return false;
+        if (retained.required_nodes.len < 2) return false;
         const prepared = self.relay_v2_event_log.prepareAccepted(
             relay_id,
             wire,
             self.config.node_id,
             via_peer,
-            self.relay_v2_required_nodes,
+            retained.required_nodes,
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => false,
@@ -15131,7 +15338,6 @@ pub const LinuxServer = struct {
         // An exact ingress replay cannot undo a durable neighbor ACK or widen
         // the event's original coverage set. Keep its receipt, but reserve
         // retries only for still-unconfirmed peers in the retained authority.
-        const retained = self.relay_v2_event_log.viewFor(relay_id) orelse return false;
         var pending_len: usize = 0;
         for (peers) |peer| {
             if (std.mem.indexOfScalar(u64, retained.required_nodes, peer) == null or
@@ -15214,6 +15420,103 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    fn appendRelayV2RequiredNode(self: *LinuxServer, nodes: *std.ArrayList(u64), node: u64) !void {
+        if (node == 0 or node == self.config.node_id) return;
+        if (!self.relayV2DirectNeighbor(node)) return error.UnroutableCustodyPeer;
+        for (nodes.items) |present| if (present == node) return;
+        try nodes.append(self.allocator, node);
+    }
+
+    fn relayV2AttachmentLeaseIsCurrent(
+        self: *const LinuxServer,
+        token: session_migrate.Token,
+        origin: u64,
+        lease: *const session_replica_v2.Store.AttachmentLeaseEntry,
+        now_ms: i64,
+    ) bool {
+        if (lease.conflicted or now_ms > lease.expires_at_ms) return false;
+        const offer = self.session_replica_store.getOrigin(token, origin) orelse return false;
+        if (offer.quarantine_until_ms != null or now_ms > offer.expires_at_ms or
+            lease.revision.compare(offer.revision) != .gt) return false;
+        const signed_offer = session_replica_v2.decodeOffer(offer.wire) catch return false;
+        return std.crypto.timing_safe.eql([32]u8, signed_offer.signer, lease.signer);
+    }
+
+    /// Build the signed direct_guest event's immediate custody path. Only the
+    /// exact target's authenticated presence hop and current attachment routes
+    /// for the sender's exact token become obligations; an unrelated neighbor
+    /// cannot pin this origin's ordered RVL2 stream when it lacks the guest xcap.
+    fn collectDirectGuestRequiredNodes(
+        self: *LinuxServer,
+        target: ?guest_presence_route.SubjectView,
+        sender_token: ?session_migrate.Token,
+        receipt_peer: ?u64,
+    ) (std.mem.Allocator.Error || error{ UnroutableCustodyPeer, UnroutableGuestCustody, UnroutableSessionCustody })![]u64 {
+        var nodes: std.ArrayList(u64) = .empty;
+        errdefer nodes.deinit(self.allocator);
+        try nodes.append(self.allocator, self.config.node_id);
+        if (receipt_peer) |peer| try self.appendRelayV2RequiredNode(&nodes, peer);
+        if (target) |guest| {
+            if (!guest.local) {
+                if (guest.next_hop == 0) return error.UnroutableGuestCustody;
+                try self.appendRelayV2RequiredNode(&nodes, guest.next_hop);
+            }
+        }
+        if (sender_token) |token| {
+            if (self.session_replica_store.isQuarantined(token)) return error.UnroutableSessionCustody;
+            const route_count = self.session_replica_store.routeCountForToken(token);
+            const routes = try self.allocator.alloc(session_replica_v2.Store.Route, route_count);
+            defer self.allocator.free(routes);
+            const copied_routes = self.session_replica_store.routesInto(token, routes);
+            if (copied_routes != route_count) return error.UnroutableSessionCustody;
+            const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+            var active_remote_origins: usize = 0;
+            var leases = self.session_replica_store.attachment_leases.iterator();
+            while (leases.next()) |slot| {
+                const key = slot.key_ptr;
+                if (!std.crypto.timing_safe.eql(session_migrate.Token, key.token, token) or
+                    key.origin_node == self.config.node_id or
+                    !self.relayV2AttachmentLeaseIsCurrent(token, key.origin_node, slot.value_ptr, now_wall)) continue;
+                active_remote_origins += 1;
+                var route_found = false;
+                for (routes[0..copied_routes]) |route| {
+                    if (route.destination != key.origin_node or route.next_hop == 0) continue;
+                    try self.appendRelayV2RequiredNode(&nodes, route.next_hop);
+                    route_found = true;
+                }
+                if (!route_found) return error.UnroutableSessionCustody;
+            }
+            if (active_remote_origins == 0 and
+                self.session_replica_store.hasAttachedOriginOtherThan(token, self.config.node_id, now_wall))
+                return error.UnroutableSessionCustody;
+        }
+        std.mem.sort(u64, nodes.items, {}, std.sort.asc(u64));
+        var unique_len: usize = 0;
+        for (nodes.items) |node| {
+            if (unique_len != 0 and nodes.items[unique_len - 1] == node) continue;
+            nodes.items[unique_len] = node;
+            unique_len += 1;
+        }
+        nodes.items.len = unique_len;
+        if (nodes.items.len > relay_v2_event_log.default_max_confirmed_nodes_per_row)
+            return error.UnroutableGuestCustody;
+        return nodes.toOwnedSlice(self.allocator);
+    }
+
+    fn collectRelayV2OutboxPeersForRequired(
+        self: *LinuxServer,
+        required_nodes: []const u64,
+        exclude_peer: ?u64,
+    ) std.mem.Allocator.Error![]u64 {
+        var peers: std.ArrayList(u64) = .empty;
+        errdefer peers.deinit(self.allocator);
+        for (required_nodes) |node| {
+            if (node == self.config.node_id or (exclude_peer != null and node == exclude_peer.?)) continue;
+            try peers.append(self.allocator, node);
+        }
+        return peers.toOwnedSlice(self.allocator);
+    }
+
     /// Build and sign one immutable local MESSAGE_V2, finish every allocation
     /// (including canonical encode) before authority publication, then enter it
     /// through the same RVG2/Lotus transaction as inbound traffic.
@@ -15236,18 +15539,68 @@ pub const LinuxServer = struct {
         history: ?RelayV2History,
         delivery: ?AuthoredRelayV2Delivery,
     ) !?AcceptedAuthoredRelayV2 {
+        return self.admitAuthoredRelayV2WithGuestRecipient(
+            verb,
+            target,
+            min_rank,
+            source_prefix,
+            account,
+            tags,
+            data_tag,
+            text,
+            scope_kind,
+            recipient,
+            sender_token,
+            sender_member_modes,
+            recipient_token,
+            null,
+            hlc,
+            history,
+            delivery,
+        );
+    }
+
+    /// Build a signed direct message for an already-resolved guest incarnation
+    /// or portable logical session. Guest recipients use the explicit negotiated
+    /// schema-3 scope, carrying the exact presence origin and incarnation rather
+    /// than overloading a portable-session route ID.
+    fn admitAuthoredRelayV2WithGuestRecipient(
+        self: *LinuxServer,
+        verb: message_relay_v2.Verb,
+        target: []const u8,
+        min_rank: u8,
+        source_prefix: []const u8,
+        account: []const u8,
+        tags: []const u8,
+        data_tag: []const u8,
+        text: []const u8,
+        scope_kind: message_relay_v2.ScopeKind,
+        recipient: []const u8,
+        sender_token: ?sessions_mod.Token,
+        sender_member_modes: ?u8,
+        recipient_token: ?sessions_mod.Token,
+        guest_recipient: ?guest_presence_route.SubjectView,
+        hlc: u64,
+        history: ?RelayV2History,
+        delivery: ?AuthoredRelayV2Delivery,
+    ) !?AcceptedAuthoredRelayV2 {
         const identity = self.config.node_identity orelse return null;
         const sender_route = if (sender_token) |token|
             message_relay_v2.routeId(token) catch return null
         else
             null;
+        if (guest_recipient != null and sender_route == null) return null;
         const recipient_route = if (recipient_token) |token|
-            message_relay_v2.routeId(token) catch return null
+            (message_relay_v2.routeId(token) catch return null)
         else
             null;
+        const event_scope = if (guest_recipient != null) .direct_guest else scope_kind;
+        const guest_origin = if (guest_recipient) |guest| guest.origin else null;
+        const guest_id = if (guest_recipient) |guest| guest.guest else null;
         var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
         var signature: [message_relay_v2.sig_len]u8 = undefined;
         var msg = message_relay_v2.RelayMessage{
+            .wire_schema = if (guest_recipient != null) 3 else 2,
             .verb = verb,
             .target = target,
             .min_rank = min_rank,
@@ -15257,10 +15610,12 @@ pub const LinuxServer = struct {
             .data_tag = data_tag,
             .text = text,
             .recipient = recipient,
-            .scope_kind = scope_kind,
+            .scope_kind = event_scope,
             .sender_route_id = sender_route,
             .sender_member_modes = sender_member_modes,
             .recipient_route_id = recipient_route,
+            .recipient_guest_origin = guest_origin,
+            .recipient_guest_id = guest_id,
             .origin_node = self.config.node_id,
             .hlc = hlc,
         };
@@ -15302,18 +15657,34 @@ pub const LinuxServer = struct {
                 else => return err,
             };
         }
-        const peers = try self.collectRelayV2OutboxPeers(null, true);
-        defer self.allocator.free(peers);
+        var required_guest_nodes: []u64 = &.{};
+        defer if (required_guest_nodes.len != 0) self.allocator.free(required_guest_nodes);
+        var peers: []u64 = &.{};
+        defer if (peers.len != 0) self.allocator.free(peers);
+        const outbox_reservation: ?RelayV2OutboxReservation = if (guest_recipient) |guest| blk: {
+            required_guest_nodes = try self.collectDirectGuestRequiredNodes(guest, sender_token, null);
+            if (required_guest_nodes.len < 2) break :blk null;
+            peers = try self.collectRelayV2OutboxPeersForRequired(required_guest_nodes, null);
+            break :blk .{
+                .peers = peers,
+                .required_nodes = required_guest_nodes,
+                .wire = wire,
+                .unbound_excluded_peer = self.config.node_id,
+            };
+        } else blk: {
+            peers = try self.collectRelayV2OutboxPeers(null, true);
+            break :blk .{
+                .peers = peers,
+                .wire = wire,
+                .unbound_excluded_peer = self.config.node_id,
+            };
+        };
         // Only a staged ADS1 batch counts. An empty prepare (no reusable
         // recipients) returns a non-null shell with prepared=null — that must
         // NOT force prepared_batch delivery (wake-only drain of an empty spool
         // would drop every recipient that later becomes reusable mid-fanout).
         const has_attachment_batch = if (prepared_delivery) |pd| pd.prepared != null else false;
-        const relay_id = switch (try self.admitRelayV2Detailed(msg, history, .{
-            .peers = peers,
-            .wire = wire,
-            .unbound_excluded_peer = self.config.node_id,
-        }, if (prepared_delivery) |*prepared| prepared else null)) {
+        const relay_id = switch (try self.admitRelayV2Detailed(msg, history, outbox_reservation, if (prepared_delivery) |*prepared| prepared else null)) {
             .accepted => |id| id,
             .duplicate, .rejected => {
                 self.allocator.free(wire);
@@ -15598,11 +15969,18 @@ pub const LinuxServer = struct {
     }
 
     fn replayRelayV2WireToPeer(self: *LinuxServer, peer: u64, wire: []const u8) bool {
+        var decoded = message_relay_v2.decode(self.allocator, wire) catch return false;
+        defer decoded.deinit(self.allocator);
+        const requires_guest_scope = decoded.msg.scope_kind == .direct_guest;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, slot_index| {
                 if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsSecureRelayV2()) continue;
+                // Preserve the exact event-log/outbox obligation until this
+                // authenticated next hop answers the guest-scope xcap probe.
+                // Never serialize a schema-3 guest event to an older peer.
+                if (requires_guest_scope and !link.supportsSecureRelayV2Guest()) continue;
                 if ((link.remoteNodeId() orelse continue) != peer) continue;
                 const peer_id = slotClientId(reactor, slot_index, slot.gen);
                 if (!self.flushSecuredS2sOutboundTo(peer_id, link)) return false;
@@ -15725,6 +16103,13 @@ pub const LinuxServer = struct {
         const inbound = link.takeInboundV2() catch return;
         defer self.allocator.free(inbound);
         for (inbound, 0..) |*item, inbound_index| {
+            if (item.owned.msg.scope_kind == .direct_guest and !link.supportsSecureRelayV2Guest()) {
+                // A peer that has not completed the explicit feature probe is
+                // not authorized to send this schema. Do not admit/ACK it; the
+                // sender keeps its retained exact wire for negotiation/retry.
+                item.deinit(self.allocator);
+                continue;
+            }
             switch (self.deliverRelayV2(item.owned.msg, item.wire, item.via_peer)) {
                 .accepted => |id| {
                     _ = self.sendRelayV2AckToPeer(item.via_peer, id);
@@ -15806,6 +16191,16 @@ pub const LinuxServer = struct {
         };
 
         const replica_proof = self.replicatedSessionProofV2(msg);
+        const guest_sender_proof: ?RelayV2GuestSenderProof = if (msg.scope_kind == .direct_guest and replica_proof == null)
+            self.relayV2GuestSenderAuthority(msg, source_nick)
+        else
+            null;
+        const guest_sender_account = if (guest_sender_proof) |proof| proof.account else null;
+        // A direct-guest sender's +R/+g/SILENCE decisions use the account in a
+        // current authenticated OFFER+attachment lease, never the signed string
+        // by itself. Missing authority is deferred before the global replay guard.
+        if (msg.scope_kind == .direct_guest and replica_proof == null and guest_sender_account == null)
+            return .{ .retry = .transient };
         // SESSION_REPLICA and MESSAGE_V2 may arrive in adjacent records. A
         // locally resident sender without its exact signed route proof is
         // unresolved authority, not a policy denial: retaining the immutable
@@ -15828,7 +16223,8 @@ pub const LinuxServer = struct {
         // from one locally attached reusable session. It can bridge only an
         // absent roster claim; a known conflicting home remains a permanent
         // rejection below. Old peers continue to decode the exact same schema.
-        const signed_direct_residence = msg.scope_kind == .direct and msg.sender_route_id != null;
+        const signed_direct_residence = (msg.scope_kind == .direct or msg.scope_kind == .direct_guest) and
+            msg.sender_route_id != null;
         const sender_home = self.relaySenderHome(source_nick, msg.origin_node);
         // replica_proof is a portable session — it may override residence.
         // signed_member_modes is only the origin's assertion of mode bits: it
@@ -15852,6 +16248,8 @@ pub const LinuxServer = struct {
             null;
         const policy_account = if (replica_proof) |proof|
             proof.trusted_account
+        else if (guest_sender_account) |account|
+            account
         else if (residence_account) |account|
             account
         else
@@ -15865,6 +16263,8 @@ pub const LinuxServer = struct {
         var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
         defer sender_ids.deinit(self.allocator);
         var exact_target: ?RelayV2ExactTarget = null;
+        var terminal_guest_target = false;
+        var guest_target_route: ?guest_presence_route.SubjectView = null;
         var speech: ChannelSpeechResult = .deny;
         var effective_text = msg.text;
         // Bound the strip buffer to the largest deliverable line body so an
@@ -15967,24 +16367,37 @@ pub const LinuxServer = struct {
                     };
                 }
             },
-            .direct => if (local_sender_allowed) {
+            .direct, .direct_guest => if (local_sender_allowed) {
                 if (is_data_family and !self.remoteDataTagAuthorized(
                     msg.data_tag,
                     false,
                     null,
                     policy_account,
                 )) return .permanent;
-                const signed_route = msg.recipient_route_id orelse return .permanent;
-                const target_resolution = self.collectRelayV2ExactTarget(
-                    msg.target,
-                    signed_route,
-                    null,
-                    &recipient_account_buf,
-                    &recipient_ids,
-                ) catch return .{ .retry = .transient };
+                const target_resolution = if (msg.scope_kind == .direct_guest) blk: {
+                    const guest_origin = msg.recipient_guest_origin orelse return .permanent;
+                    const guest_id = msg.recipient_guest_id orelse return .permanent;
+                    break :blk self.collectRelayV2ExactGuestTarget(
+                        guest_origin,
+                        guest_id,
+                        &recipient_ids,
+                        &guest_target_route,
+                    ) catch return .{ .retry = .transient };
+                } else blk: {
+                    const signed_route = msg.recipient_route_id orelse return .permanent;
+                    break :blk self.collectRelayV2ExactTarget(
+                        msg.target,
+                        signed_route,
+                        null,
+                        &recipient_account_buf,
+                        &recipient_ids,
+                    ) catch return .{ .retry = .transient };
+                };
                 switch (target_resolution) {
                     .ready => |target| exact_target = target,
                     .pending => return .{ .retry = .transient },
+                    .invalid => return .permanent,
+                    .terminal => terminal_guest_target = true,
                     .transit => {},
                 }
                 if (exact_target) |target| {
@@ -16026,6 +16439,7 @@ pub const LinuxServer = struct {
                         }
                     }
                 }
+                if (terminal_guest_target) recipient_ids.clearRetainingCapacity();
             },
             .channel_whisper => if (local_sender_allowed) {
                 const signed_route = msg.recipient_route_id orelse return .permanent;
@@ -16046,6 +16460,8 @@ pub const LinuxServer = struct {
                     switch (target_resolution) {
                         .ready => |target| exact_target = target,
                         .pending => return .{ .retry = .transient },
+                        .invalid => return .permanent,
+                        .terminal => return .permanent,
                         .transit => {},
                     }
                 }
@@ -16125,7 +16541,7 @@ pub const LinuxServer = struct {
                     }
                 }
             },
-            .direct, .channel_whisper => {
+            .direct, .direct_guest, .channel_whisper => {
                 for (recipient_ids.items) |id| {
                     if (msg.verb == .tagmsg) {
                         const target_conn = self.connFor(id) orelse continue;
@@ -16157,13 +16573,40 @@ pub const LinuxServer = struct {
         ) catch return .{ .retry = .transient };
         defer prepared_delivery.deinit();
 
-        const outbox_peers = self.collectRelayV2OutboxPeers(via_peer, true) catch return .{ .retry = .transient };
-        defer self.allocator.free(outbox_peers);
-        const outbox_reservation = RelayV2OutboxReservation{
-            .peers = outbox_peers,
-            .receipt_peer = via_peer,
-            .wire = wire,
-            .unbound_excluded_peer = via_peer,
+        var guest_required_nodes: []u64 = &.{};
+        defer if (guest_required_nodes.len != 0) self.allocator.free(guest_required_nodes);
+        var outbox_peers: []u64 = &.{};
+        defer if (outbox_peers.len != 0) self.allocator.free(outbox_peers);
+        const outbox_reservation: ?RelayV2OutboxReservation = if (msg.scope_kind == .direct_guest) blk: {
+            const sender_token = if (replica_proof) |proof|
+                proof.token
+            else if (guest_sender_proof) |proof|
+                proof.token
+            else
+                return .{ .retry = .transient };
+            guest_required_nodes = self.collectDirectGuestRequiredNodes(
+                guest_target_route,
+                sender_token,
+                via_peer,
+            ) catch return .{ .retry = .transient };
+            if (guest_required_nodes.len < 2) break :blk null;
+            outbox_peers = self.collectRelayV2OutboxPeersForRequired(guest_required_nodes, via_peer) catch
+                return .{ .retry = .transient };
+            break :blk .{
+                .peers = outbox_peers,
+                .required_nodes = guest_required_nodes,
+                .receipt_peer = via_peer,
+                .wire = wire,
+                .unbound_excluded_peer = via_peer,
+            };
+        } else blk: {
+            outbox_peers = self.collectRelayV2OutboxPeers(via_peer, true) catch return .{ .retry = .transient };
+            break :blk .{
+                .peers = outbox_peers,
+                .receipt_peer = via_peer,
+                .wire = wire,
+                .unbound_excluded_peer = via_peer,
+            };
         };
         const relay_id = switch (self.admitRelayV2Detailed(msg, history_row, outbox_reservation, &prepared_delivery) catch return .{ .retry = .transient }) {
             .accepted => |id| id,
@@ -16203,7 +16646,7 @@ pub const LinuxServer = struct {
                     }
                 }
             },
-            .direct, .channel_whisper => {
+            .direct, .direct_guest, .channel_whisper => {
                 for (recipient_ids.items) |id| {
                     if (msg.verb == .tagmsg) {
                         const target_conn = self.connFor(id) orelse continue;
@@ -16758,6 +17201,7 @@ pub const LinuxServer = struct {
     }
 
     pub fn armSendIfNeeded(self: *LinuxServer, conn: *ConnState) !void {
+        if (conn.send_terminal_failure) return;
         try self.progressTlsControl(conn);
         if (!tlsAllowsQueuedWire(conn)) return;
         if (comptime builtin.is_test) {
@@ -31542,6 +31986,10 @@ pub const LinuxServer = struct {
             }
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
+            snap.guest_incarnation = e.value.guest_id;
+            snap.guest_revision = e.value.guest_revision;
+            snap.guest_claim_revision = e.value.guest_claim_revision;
+            snap.guest_claim_hlc = e.value.guest_claim_hlc;
             // AcceptEx does not reliably expose the peer sockaddr on an
             // imported socket. Preserve the already-authenticated kernel or
             // trusted PROXY address and its exact clone-limit accounting.
@@ -36676,6 +37124,18 @@ pub const LinuxServer = struct {
     }
 
     fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot, close_fd_on_failure: bool) bool {
+        const guest_id_present = !std.mem.allEqual(u8, &snap.guest_incarnation, 0);
+        const guest_metadata_present = snap.guest_revision != 0 and
+            snap.guest_claim_revision != 0 and snap.guest_claim_hlc != 0;
+        const guest_metadata_empty = snap.guest_revision == 0 and
+            snap.guest_claim_revision == 0 and snap.guest_claim_hlc == 0;
+        if ((guest_id_present and (!guest_metadata_present or snap.account.len != 0 or
+            snap.nick.len == 0 or std.mem.eql(u8, snap.nick, "*"))) or
+            (!guest_id_present and !guest_metadata_empty))
+        {
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return false;
+        }
         // Per-SHARD cap (rx() is the fd-derived target shard): matches the
         // accept path, whose cap is also per-shard — each reactor's table is
         // reserved to max_clients, so the bound protects buffer address
@@ -36691,6 +37151,10 @@ pub const LinuxServer = struct {
         };
         const conn = self.rx().clients.get(id).?;
         conn.overflow_allocator = self.allocator; // backs the SendQ overflow heap
+        conn.guest_id = snap.guest_incarnation;
+        conn.guest_revision = snap.guest_revision;
+        conn.guest_claim_revision = snap.guest_claim_revision;
+        conn.guest_claim_hlc = snap.guest_claim_hlc;
         conn.gagged = snap.gagged;
         conn.ircx = snap.ircx;
         conn.unfurl_opt_in = snap.unfurl_opt_in;
@@ -37209,6 +37673,11 @@ pub const LinuxServer = struct {
         // capability without disconnecting.
         if (!link.supportsSecureRelayV2()) {
             link.probeRelayV2Current() catch {
+                self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
+                return null;
+            };
+        } else if (!link.supportsSecureRelayV2Guest()) {
+            link.probeSecureRelayV2Guest() catch {
                 self.rollbackInheritedS2sBeforeIo(id, snap.fd, close_fd_on_failure);
                 return null;
             };
@@ -46203,19 +46672,19 @@ pub const LinuxServer = struct {
         const email = parsed.paramSlice()[1];
         const has_email = email.len != 0 and !std.mem.eql(u8, email, "*");
         const password = parsed.paramSlice()[2];
-        const had_guest_incarnation = !std.mem.allEqual(u8, &conn.guest_id, 0);
-        if (!self.retireOrdinaryGuestForAccountBind(conn))
-            return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Could not retire the previous guest route");
         var scratch: [1024]u8 = undefined;
         _ = svc.registerAccountWithEmail(account, password, if (has_email) email else null, false, &scratch) catch |err| {
-            if (had_guest_incarnation) self.publishOrdinaryGuest(conn, true);
             try self.failReply(conn, "REGISTER", registerFailCode(err), "Registration failed");
             return;
         };
         if (!self.authenticationAvailable()) {
-            if (had_guest_incarnation) self.publishOrdinaryGuest(conn, true);
             return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Account storage requires recovery");
         }
+        // Failed registration never needs to consume or recreate the guest
+        // incarnation. Retire it only after account storage accepted the new
+        // account and before this connection binds to that authenticated name.
+        if (!self.retireOrdinaryGuestForAccountBind(conn))
+            return self.failReply(conn, "REGISTER", "TEMPORARILY_UNAVAILABLE", "Could not retire the previous guest route");
         self.retireMediaBeforeAccountMutation(idFromToken(conn.token), conn, account);
         _ = self.clearOperAuthorityTransition(
             idFromToken(conn.token),
@@ -52129,29 +52598,145 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    fn hasSecureRelayV2GuestPeer(self: *LinuxServer, peer: u64) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (link.established() and link.remoteNodeId() == peer and link.supportsSecureRelayV2Guest())
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    const ReadMarkerMeshStateForTest = struct {
+        found: bool = false,
+        established: bool = false,
+        supports: bool = false,
+        supports_relay_v2: bool = false,
+        marker_seen: bool = false,
+        burst_done: bool = false,
+        replay_pending: bool = false,
+        replay_burst_pending: bool = false,
+        burst_stage: u8 = 0,
+        fact_count: usize = 0,
+        secured_slots: usize = 0,
+    };
+
+    fn readMarkerMeshStateForTest(self: *LinuxServer, peer: u64) ReadMarkerMeshStateForTest {
+        self.world.lockWrite();
+        defer self.world.unlockWrite();
+        var state = ReadMarkerMeshStateForTest{ .fact_count = self.read_marker_facts.count() };
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied or slot.value.closing) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                state.secured_slots += 1;
+                if (link.remoteNodeId() != peer) continue;
+                state.found = true;
+                state.established = link.established();
+                state.supports = link.supportsReadMarkers();
+                state.supports_relay_v2 = link.supportsSecureRelayV2();
+                state.marker_seen = slot.value.read_marker_capability_seen;
+                state.burst_done = slot.value.s2s_burst_done;
+                state.replay_pending = slot.value.session_replica_replay_pending;
+                state.replay_burst_pending = slot.value.session_replica_resync_burst_pending;
+                state.burst_stage = @backingInt(slot.value.mesh_burst_stage);
+                return state;
+            }
+        }
+        return state;
+    }
+
+    fn setSecureRelayV2GuestPeerForTest(self: *LinuxServer, peer: u64, enabled: bool) bool {
+        if (comptime !builtin.is_test) return false;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or link.remoteNodeId() != peer) continue;
+                const inner = link.inner orelse continue;
+                inner.peer.peer_supports_message_v2_guest = enabled;
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Resolve a live portable target only from the winning nick home plus its
     /// unique signed OFFER, a current nonconflicted remote attachment lease, and
     /// Store provenance through an active authenticated secured peer. A bare
     /// nickname claim or a stale compatibility row never supplies MESSAGE_V2's
     /// recipient route.
     fn liveAttachedReplicaForNick(self: *LinuxServer, nick: []const u8) LiveRecipientReplica {
-        const home = self.meshNickHomeNode(nick) orelse return .none;
         const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
-        const identity = (self.session_replica_store.uniqueLiveOriginNick(home, nick, now_wall) catch
+        const home = self.meshNickHomeNode(nick);
+        const Candidate = struct { token: session_migrate.Token, origin: u64 };
+        const identity = if (home) |origin| blk: {
+            const exact = (self.session_replica_store.uniqueLiveOriginNick(origin, nick, now_wall) catch
+                return .unresolved) orelse return .none;
+            break :blk Candidate{ .token = exact.token, .origin = origin };
+        } else blk: {
+            // Nick MEMBERSHIP is intentionally direct-origin scoped. A signed
+            // portable OFFER can still be the only authenticated authority for
+            // a far attached recipient, so select a unique current best token
+            // identity by signed nick while refusing concurrent token claims.
+            var candidate: ?Candidate = null;
+            var entries = self.session_replica_store.entries.iterator();
+            while (entries.next()) |slot| {
+                const key = slot.key_ptr.*;
+                const entry = slot.value_ptr;
+                if (now_wall > entry.expires_at_ms or entry.quarantine_until_ms != null or
+                    !std.ascii.eqlIgnoreCase(entry.nick, nick)) continue;
+                const best = self.session_replica_store.bestLiveIdentity(key.token, now_wall) orelse continue;
+                if (best != entry) continue;
+                if (candidate) |prior| {
+                    if (!std.crypto.timing_safe.eql(sessions_mod.Token, prior.token, key.token))
+                        return .unresolved;
+                    continue;
+                }
+                candidate = .{ .token = key.token, .origin = key.origin_node };
+            }
+            break :blk candidate orelse return .none;
+        };
+        const origin = identity.origin;
+        const exact = (self.session_replica_store.uniqueLiveOriginNick(origin, nick, now_wall) catch
             return .unresolved) orelse return .none;
+        if (!std.crypto.timing_safe.eql(sessions_mod.Token, exact.token, identity.token)) return .unresolved;
         if (!self.session_replica_store.hasAttachedOriginOtherThan(identity.token, self.config.node_id, now_wall))
             return .none;
 
         var routes: [64]session_replica_v2.Store.Route = undefined;
         const route_count = self.session_replica_store.routesInto(identity.token, &routes);
         if (route_count != self.session_replica_store.routeCountForToken(identity.token)) return .unresolved;
+        var active_route = false;
         for (routes[0..route_count]) |route| {
-            if (route.destination != home or route.next_hop == 0) continue;
-            if (!self.session_replica_store.hasReplicaParent(identity.token, home, route.next_hop)) continue;
+            if (route.destination == self.config.node_id or route.next_hop == 0) continue;
+            if (home) |home_node| if (route.destination != home_node) continue;
+            if (!self.sessionReplicaOriginHasCurrentAttachmentLease(identity.token, route.destination, now_wall)) continue;
+            if (!self.session_replica_store.hasReplicaParent(identity.token, route.destination, route.next_hop)) continue;
             if (!self.hasActiveSecuredSessionReplicaPeer(route.next_hop)) continue;
-            return .{ .exact = identity.token };
+            active_route = true;
+            break;
         }
-        return .unresolved;
+        return if (active_route) .{ .exact = identity.token } else .unresolved;
+    }
+
+    fn sessionReplicaOriginHasCurrentAttachmentLease(
+        self: *LinuxServer,
+        token: session_migrate.Token,
+        origin: u64,
+        now_wall: i64,
+    ) bool {
+        var leases = self.session_replica_store.attachment_leases.iterator();
+        while (leases.next()) |slot| {
+            const key = slot.key_ptr;
+            if (key.origin_node != origin or
+                !std.crypto.timing_safe.eql(session_migrate.Token, key.token, token)) continue;
+            if (self.relayV2AttachmentLeaseIsCurrent(token, origin, slot.value_ptr, now_wall)) return true;
+        }
+        return false;
     }
 
     /// Sign and wrap one portable snapshot. Detach-time fanout and peer-rejoin
@@ -58584,6 +59169,18 @@ pub const LinuxServer = struct {
         return nick.len != 0 and !std.mem.eql(u8, nick, "*");
     }
 
+    fn localGuestRouteForClient(self: *LinuxServer, conn: *const ConnState) ?guest_presence_route.SubjectView {
+        if (conn.session.account() != null or std.mem.allEqual(u8, &conn.guest_id, 0)) return null;
+        const identity = self.config.node_identity orelse return null;
+        const route = (self.guest_presence orelse return null).liveByGuest(
+            identity.sign_kp.public_key,
+            conn.guest_id,
+            self.guestNowMs(),
+        ) orelse return null;
+        if (!route.local) return null;
+        return route;
+    }
+
     fn publishOrdinaryGuest(self: *LinuxServer, conn: *ConnState, drive: bool) void {
         if (!self.ordinaryGuestEligible(conn)) return;
         const ident = self.config.node_identity orelse return;
@@ -58853,9 +59450,14 @@ pub const LinuxServer = struct {
         const hop = link.remoteNodeId() orelse 0;
         self.drainGuestPresenceFrom(link, hop);
         if (!conn.ownsActiveMeshLink(link)) return;
+        // Publish newly admitted sender/recipient authority before forwarding
+        // any direct that arrived in the same read batch. Mesh output is
+        // ordered on each secured peer, so downstream nodes can resolve the
+        // signed guest identities before admitting the body.
+        self.driveGuestPresence(null);
+        if (!conn.ownsActiveMeshLink(link)) return;
         self.drainGuestDirectFrom(link, hop);
         if (!conn.ownsActiveMeshLink(link) or hop == 0) return;
-        self.driveGuestPresence(null);
     }
 
     fn drainGuestPresenceFrom(self: *LinuxServer, link: *secured_s2s_link.SecuredLink, hop: u64) void {
@@ -58887,10 +59489,13 @@ pub const LinuxServer = struct {
             const decoded = guest_direct.decode(item.wire) catch continue;
             decoded.verify() catch continue;
             policy.validate(decoded.record.issued_ms, now) catch continue;
-            auth.observeDirect(decoded.record.origin, decoded.record.hlc, decoded.record.issued_ms, now) catch continue;
+            const sender = auth.liveByGuest(decoded.record.origin, decoded.record.sender_guest, now) orelse continue;
+            if (!std.ascii.eqlIgnoreCase(sender.nick, decoded.record.sender_nick)) continue;
+            const target = auth.liveByGuest(decoded.record.recipient_origin, decoded.record.recipient_guest, now) orelse continue;
+            if (!std.ascii.eqlIgnoreCase(target.nick, decoded.record.target_nick)) continue;
             if (self.localGuestClient(decoded.record.recipient_origin, decoded.record.recipient_guest)) |recipient| {
-                const sender = auth.liveByGuest(decoded.record.origin, decoded.record.sender_guest, now) orelse continue;
-                if (!std.ascii.eqlIgnoreCase(sender.nick, decoded.record.sender_nick)) continue;
+                const recipient_conn = self.connFor(recipient) orelse continue;
+                if (!std.ascii.eqlIgnoreCase(recipient_conn.session.displayName(), decoded.record.target_nick)) continue;
                 var sender_prefix_buf: [320]u8 = undefined;
                 const sender_prefix = std.fmt.bufPrint(
                     &sender_prefix_buf,
@@ -58907,13 +59512,14 @@ pub const LinuxServer = struct {
                     .hlc = decoded.record.hlc,
                 };
                 if (self.relayDirectMessagePolicyBlocks(policy_message, "", recipient)) continue;
+                auth.observeDirect(decoded.record.origin, decoded.record.hlc, decoded.record.issued_ms, now) catch continue;
                 self.deliverGuestDirect(recipient, decoded.record);
                 continue;
             }
             if (hop == 0) continue;
-            const route = auth.liveByGuest(decoded.record.recipient_origin, decoded.record.recipient_guest, now) orelse continue;
-            if (route.local or route.next_hop == 0 or route.next_hop == hop) continue;
-            const dest = self.guestLink(route.next_hop) orelse continue;
+            if (target.local or target.next_hop == 0 or target.next_hop == hop) continue;
+            const dest = self.guestLink(target.next_hop) orelse continue;
+            auth.observeDirect(decoded.record.origin, decoded.record.hlc, decoded.record.issued_ms, now) catch continue;
             const emitted = dest.link.forwardGuestDirect(item.wire) catch continue;
             if (!emitted) continue;
             _ = self.flushSecuredS2sOutboundTo(dest.id, dest.link);
@@ -61153,6 +61759,118 @@ pub const LinuxServer = struct {
                     null;
                 if (self.authoredRelayV2Configured() and trusted_target_account != null)
                     try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Live recipient has no unambiguous portable session route; event not sent");
+                if (self.liveOrdinaryGuest(target)) |guest_route| {
+                    const guest_home = message_relay.originShortId(guest_route.origin);
+                    const matching_home = target_home == null or target_home.? == guest_home;
+                    if (matching_home and trusted_target_account == null and !guest_route.local and guest_route.next_hop != 0) {
+                        const account_guest_v2 = self.authoredRelayV2Configured() and conn.session.account() != null;
+                        if (!account_guest_v2 and target_home == null and guest_route.next_hop != guest_home) {
+                            try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Far ordinary guests require a portable recipient route for TAGMSG");
+                            return;
+                        }
+                        if (self.config.node_identity == null) return;
+                        const sender_token = self.portableSessionTokenForClient(id, conn);
+                        const exact_sender_token: ?sessions_mod.Token = if (conn.session.account()) |account| blk: {
+                            const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse break :blk null;
+                            break :blk if (tokenIsNull(handle.token)) null else handle.token;
+                        } else null;
+                        var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
+                        defer sender_ids.deinit(self.allocator);
+                        self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch return;
+                        if (account_guest_v2) {
+                            if (exact_sender_token == null) {
+                                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Authenticated guest delivery lacks an exact sender route; event not sent");
+                                return;
+                            }
+                            var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
+                            defer delivery_ids.deinit(self.allocator);
+                            self.collectDirectDeliveryIds(
+                                &.{},
+                                sender_ids.items,
+                                id,
+                                echo,
+                                tags,
+                                &delivery_ids,
+                            ) catch return;
+                            var accepted = (self.admitAuthoredRelayV2WithGuestRecipient(
+                                .tagmsg,
+                                target,
+                                0,
+                                prefix,
+                                conn.session.account() orelse "",
+                                tags,
+                                "",
+                                "",
+                                .direct_guest,
+                                "",
+                                exact_sender_token,
+                                null,
+                                null,
+                                guest_route,
+                                event_hlc,
+                                null,
+                                .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+                            ) catch {
+                                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; event not sent — check mesh peers and retry");
+                                return;
+                            }) orelse {
+                                try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the event; not delivered — retry or contact opers");
+                                return;
+                            };
+                            defer accepted.deinit(self.allocator);
+                            message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
+                            self.forwardAcceptedRelayV2(accepted.wire);
+                            var guest_tags_time: [40]u8 = undefined;
+                            const guest_tags = MsgTags{
+                                .time_value = serverTimeValueAt(&guest_tags_time, event_time_ms),
+                                .account = conn.session.account(),
+                                .client_tags = tags,
+                                .msgid = message_id,
+                                .is_bot = conn.session.isBot(),
+                            };
+                            for (sender_ids.items) |sender_attachment| {
+                                if (sender_attachment.eql(id) and !echo) continue;
+                                const attachment = self.connFor(sender_attachment) orelse continue;
+                                var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                                if (clientTagsForSession(&attachment.session, tags, &visible_tags_buf).len == 0) continue;
+                                self.deliverTaggedMode(sender_attachment, guest_tags, msg, accepted.deliveryMode()) catch {};
+                            }
+                            return;
+                        }
+                        var relay_msg = s2s_link.RelayMessage{
+                            .verb = .tagmsg,
+                            .target = target,
+                            .source_nick = conn.session.displayName(),
+                            .source_prefix = prefix,
+                            .account = conn.session.account() orelse "",
+                            .tags = tags,
+                            .text = "",
+                            .origin_node = self.config.node_id,
+                            .hlc = event_hlc,
+                        };
+                        var pubkey_buf: [message_relay.pubkey_len]u8 = undefined;
+                        var signature_buf: [message_relay.sig_len]u8 = undefined;
+                        self.signRelayOrigin(&relay_msg, &pubkey_buf, &signature_buf);
+                        const scope: RelayScope = if (target_home == null)
+                            .{ .guest_next_hop = .{ .node = guest_route.next_hop, .sender_token = sender_token } }
+                        else if (sender_token) |token|
+                            .{ .session_nick = .{ .nick = target, .token = token } }
+                        else
+                            .{ .nick = target };
+                        if (self.relayLegacyToPeers(relay_msg, scope, false) == 0) {
+                            try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Signed guest route is not reachable; event not sent");
+                            return;
+                        }
+                        for (sender_ids.items) |sender_attachment| {
+                            if (sender_attachment.eql(id) and !echo) continue;
+                            const attachment = self.connFor(sender_attachment) orelse continue;
+                            var visible_tags_buf: [irc_line.max_client_tags_raw_len]u8 = undefined;
+                            if (clientTagsForSession(&attachment.session, tags, &visible_tags_buf).len == 0) continue;
+                            self.deliverTaggedMode(sender_attachment, ctags, msg, .ordinary) catch {};
+                        }
+                        return;
+                    }
+                }
                 return;
             };
             if (self.config.node_identity == null) return;
@@ -61254,6 +61972,15 @@ pub const LinuxServer = struct {
         );
         const sender_token = self.portableSessionTokenForClient(id, conn);
         const recipient_token = self.portableSessionTokenForClient(recipient_id, rconn);
+        const recipient_guest_route = self.localGuestRouteForClient(rconn);
+        const guest_v2 = self.authoredRelayV2Configured() and
+            sender_token != null and recipient_guest_route != null;
+        if (self.authoredRelayV2Configured() and sender_token != null and
+            !std.mem.allEqual(u8, &rconn.guest_id, 0) and recipient_guest_route == null)
+        {
+            try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Local guest incarnation authority is unavailable; event not sent");
+            return;
+        }
         var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
         defer delivery_ids.deinit(self.allocator);
         self.collectDirectDeliveryIds(
@@ -61269,8 +61996,26 @@ pub const LinuxServer = struct {
         };
         var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
         defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
-        if (recipient_token != null and self.authoredRelayV2Configured()) {
-            accepted_v2 = self.admitAuthoredRelayV2(
+        if ((recipient_token != null or guest_v2) and self.authoredRelayV2Configured()) {
+            accepted_v2 = (if (guest_v2) self.admitAuthoredRelayV2WithGuestRecipient(
+                .tagmsg,
+                target,
+                0,
+                prefix,
+                conn.session.account() orelse "",
+                tags,
+                "",
+                "",
+                .direct_guest,
+                "",
+                sender_token,
+                null,
+                null,
+                recipient_guest_route,
+                event_hlc,
+                null,
+                .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+            ) else self.admitAuthoredRelayV2(
                 .tagmsg,
                 target,
                 0,
@@ -61294,7 +62039,7 @@ pub const LinuxServer = struct {
                     .timestamp_ms = event_time_ms,
                 } else null else null,
                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
-            ) catch {
+            )) catch {
                 try self.failReply(conn, "TAGMSG", "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; event not sent — check mesh peers and retry");
                 return;
             };
@@ -61350,11 +62095,13 @@ pub const LinuxServer = struct {
             var pk_buf: [message_relay.pubkey_len]u8 = undefined;
             var sig_buf: [message_relay.sig_len]u8 = undefined;
             self.signRelayOrigin(&relay_msg, &pk_buf, &sig_buf);
-            _ = self.relayLegacyToPeers(relay_msg, .{ .session_nick = .{
-                .nick = target,
-                .token = recipient_token.?,
-                .also_token = sender_token,
-            } }, true);
+            if (recipient_token) |token| {
+                _ = self.relayLegacyToPeers(relay_msg, .{ .session_nick = .{
+                    .nick = target,
+                    .token = token,
+                    .also_token = sender_token,
+                } }, true);
+            }
         }
         if (accepted_v2 == null) {
             if (store_target) |key| self.recordHistoryTagmsgAt(key, conn, message_id, tags, event_time_ms);
@@ -62133,11 +62880,21 @@ pub const LinuxServer = struct {
             return;
         }
 
+        var ordinary_guest_route: ?guest_presence_route.SubjectView = null;
         const recipient = self.world.findNick(target) orelse {
             const live_replica = if (self.authoredRelayV2Configured())
                 self.liveAttachedReplicaForNick(target)
             else
                 LiveRecipientReplica.none;
+            if (comptime builtin.is_test) {
+                if (std.mem.eql(u8, text, "direct-after-origin-detach")) {
+                    std.debug.print("guest-dm-route target_home={?d} live_replica={s} replica_rows={d}\n", .{
+                        self.meshNickHomeNode(target),
+                        @tagName(live_replica),
+                        self.session_replica_store.entries.count(),
+                    });
+                }
+            }
             const active_recipient_token: ?session_migrate.Token = switch (live_replica) {
                 .none => null,
                 .exact => |token| token,
@@ -62150,19 +62907,39 @@ pub const LinuxServer = struct {
             // scope. Do not also emit a legacy nick relay for that subject. A
             // registered target's signed session authority takes precedence over
             // stale guest-presence copies still converging across the mesh.
-            if (!is_notice and active_recipient_token == null) {
+            if (active_recipient_token == null) {
                 if (self.liveOrdinaryGuest(target)) |route| {
                     const guest_home = message_relay.originShortId(route.origin);
-                    if (self.trustedRemoteAccountAtNode(target, guest_home) == null) {
-                        if (!self.authorOrdinaryGuestDirect(conn, route, text, event_hlc)) {
-                            try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+                    const target_home = self.meshNickHomeNode(target);
+                    const matching_home = target_home == null or target_home.? == guest_home;
+                    if (matching_home and self.trustedRemoteAccountAtNode(target, guest_home) == null) {
+                        ordinary_guest_route = route;
+                        // The exact-incarnation OGDM frame is for a true guest
+                        // sender. Authenticated connections retire that identity
+                        // at login and use the signed nick/next-hop relay below.
+                        if (!is_notice and conn.session.account() == null and
+                            !std.mem.allEqual(u8, &conn.guest_id, 0))
+                        {
+                            if (!self.authorOrdinaryGuestDirect(conn, route, text, event_hlc)) {
+                                try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
+                                return;
+                            }
+                            var guest_time_buf: [40]u8 = undefined;
+                            const guest_tags = MsgTags{ .time_value = serverTimeValueAt(&guest_time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
+                            if (echo) self.deliverTaggedMode(id, guest_tags, msg, .ordinary) catch {};
                             return;
                         }
-                        var guest_time_buf: [40]u8 = undefined;
-                        const guest_tags = MsgTags{ .time_value = serverTimeValueAt(&guest_time_buf, event_time_ms), .account = conn.session.account(), .client_tags = clean_client_tags, .msgid = message_id, .is_bot = conn.session.isBot() };
-                        if (echo) self.deliverTaggedMode(id, guest_tags, msg, .ordinary) catch {};
-                        return;
                     }
+                }
+            }
+            if (ordinary_guest_route) |route| {
+                const guest_home = message_relay.originShortId(route.origin);
+                const account_guest_v2 = self.authoredRelayV2Configured() and
+                    conn.session.account() != null and active_recipient_token == null;
+                if (!account_guest_v2 and self.meshNickHomeNode(target) == null and route.next_hop != guest_home) {
+                    if (!is_notice)
+                        try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Far ordinary guests require a portable recipient route for direct messages");
+                    return;
                 }
             }
             // Not local: relay to mesh peers so the node that owns this nick can
@@ -62176,7 +62953,7 @@ pub const LinuxServer = struct {
                         self.trustedRemoteAccountAtNode(target, home)
                     else
                         null;
-                    const target_route_known = target_home != null or recipient_token != null or trusted_target_account != null;
+                    const target_route_known = target_home != null or recipient_token != null or trusted_target_account != null or ordinary_guest_route != null;
                     if (!target_route_known) {
                         if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHNICK, &.{target}, "No such nick");
                         return;
@@ -62208,28 +62985,60 @@ pub const LinuxServer = struct {
                         const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse break :blk null;
                         break :blk if (tokenIsNull(handle.token)) null else handle.token;
                     } else null;
+                    const account_guest_v2 = self.authoredRelayV2Configured() and
+                        conn.session.account() != null and recipient_token == null and ordinary_guest_route != null;
+                    const guest_recipient: ?guest_presence_route.SubjectView = if (account_guest_v2)
+                        ordinary_guest_route
+                    else
+                        null;
                     var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
                     defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
                     // Fail closed: durable admit required when authoring active.
-                    if (recipient_token != null and self.authoredRelayV2Configured()) {
-                        accepted_v2 = self.admitAuthoredRelayV2(
-                            if (is_notice) .notice else .privmsg,
-                            target,
-                            0,
-                            prefix,
-                            conn.session.account() orelse "",
-                            clean_client_tags orelse "",
-                            "",
-                            text,
-                            .direct,
-                            "",
-                            exact_sender_token,
-                            null,
-                            recipient_token,
-                            event_hlc,
-                            null,
-                            .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
-                        ) catch {
+                    if ((recipient_token != null or account_guest_v2) and self.authoredRelayV2Configured()) {
+                        if (account_guest_v2 and (exact_sender_token == null or guest_recipient == null)) {
+                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Authenticated guest delivery lacks an exact signed route; message not sent");
+                            return;
+                        }
+                        const admitted = if (guest_recipient) |guest|
+                            self.admitAuthoredRelayV2WithGuestRecipient(
+                                if (is_notice) .notice else .privmsg,
+                                target,
+                                0,
+                                prefix,
+                                conn.session.account() orelse "",
+                                clean_client_tags orelse "",
+                                "",
+                                text,
+                                .direct_guest,
+                                "",
+                                exact_sender_token,
+                                null,
+                                null,
+                                guest,
+                                event_hlc,
+                                null,
+                                .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+                            )
+                        else
+                            self.admitAuthoredRelayV2(
+                                if (is_notice) .notice else .privmsg,
+                                target,
+                                0,
+                                prefix,
+                                conn.session.account() orelse "",
+                                clean_client_tags orelse "",
+                                "",
+                                text,
+                                .direct,
+                                "",
+                                exact_sender_token,
+                                null,
+                                recipient_token,
+                                event_hlc,
+                                null,
+                                .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+                            );
+                        accepted_v2 = admitted catch {
                             if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; message not sent — check mesh peers and retry");
                             return;
                         };
@@ -62264,13 +63073,21 @@ pub const LinuxServer = struct {
                     // only replica route can never hide an unreachable target.
                     const sender_token = self.portableSessionTokenForClient(id, conn);
                     const relay_scope: RelayScope = if (recipient_token orelse sender_token) |token|
-                        .{ .session_nick = .{
+                        if (target_home == null and recipient_token == null) blk: {
+                            if (ordinary_guest_route) |route| break :blk .{ .guest_next_hop = .{
+                                .node = route.next_hop,
+                                .sender_token = sender_token,
+                            } };
+                            break :blk .{ .session_nick = .{ .nick = target, .token = token } };
+                        } else .{ .session_nick = .{
                             .nick = target,
                             .token = token,
                             .also_token = if (recipient_token != null) sender_token else null,
                         } }
+                    else if (target_home == null) if (ordinary_guest_route) |route|
+                        .{ .guest_next_hop = .{ .node = route.next_hop } }
                     else
-                        .{ .nick = target };
+                        .{ .nick = target } else .{ .nick = target };
                     if (accepted_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
                     const legacy_relays = self.relayLegacyToPeers(
                         relay_msg,
@@ -62427,6 +63244,7 @@ pub const LinuxServer = struct {
             const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(recipient_id)) orelse break :blk null;
             break :blk if (tokenIsNull(handle.token)) null else handle.token;
         } else null else null;
+        const recipient_guest_route = if (recipient_conn) |rconn| self.localGuestRouteForClient(rconn) else null;
         var sender_ids: std.ArrayList(client_model.ClientId) = .empty;
         defer sender_ids.deinit(self.allocator);
         if (!same_logical_session) {
@@ -62453,7 +63271,16 @@ pub const LinuxServer = struct {
         defer if (accepted_direct_v2) |*accepted| accepted.deinit(self.allocator);
         var direct_history_key_buf: [320]u8 = undefined;
         var direct_history_key: ?[]const u8 = null;
-        if (recipient_exact_token != null and self.authoredRelayV2Configured()) {
+        const guest_v2 = recipient_guest_route != null and sender_exact_token != null and
+            conn.session.account() != null and self.authoredRelayV2Configured();
+        if (self.authoredRelayV2Configured() and sender_exact_token != null and
+            recipient_conn != null and !std.mem.allEqual(u8, &recipient_conn.?.guest_id, 0) and
+            recipient_guest_route == null and recipient_exact_token == null)
+        {
+            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Local guest incarnation authority is unavailable; message not sent");
+            return;
+        }
+        if ((recipient_exact_token != null or guest_v2) and self.authoredRelayV2Configured()) {
             const authored_prefix = try clientPrefix(conn, &prefix_buf);
             const history_plan: ?RelayV2History = if (!is_notice)
                 if (dmHistoryKey(
@@ -62476,7 +63303,25 @@ pub const LinuxServer = struct {
             else
                 null;
             // Fail closed on durable DM admit — same contract as channel.
-            accepted_direct_v2 = self.admitAuthoredRelayV2(
+            accepted_direct_v2 = (if (guest_v2) self.admitAuthoredRelayV2WithGuestRecipient(
+                if (is_notice) .notice else .privmsg,
+                target,
+                0,
+                authored_prefix,
+                conn.session.account() orelse "",
+                clean_client_tags orelse "",
+                "",
+                text,
+                .direct_guest,
+                "",
+                sender_exact_token,
+                null,
+                null,
+                recipient_guest_route,
+                event_hlc,
+                history_plan,
+                .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
+            ) else self.admitAuthoredRelayV2(
                 if (is_notice) .notice else .privmsg,
                 target,
                 0,
@@ -62493,7 +63338,7 @@ pub const LinuxServer = struct {
                 event_hlc,
                 history_plan,
                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
-            ) catch {
+            )) catch {
                 if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; message not sent — check mesh peers and retry");
                 return;
             };
@@ -62510,7 +63355,7 @@ pub const LinuxServer = struct {
         }
         const direct_delivery_mode: TaggedDeliveryMode = if (accepted_direct_v2) |accepted|
             accepted.deliveryMode()
-        else if (self.authoredRelayV2Configured() and recipient_exact_token != null)
+        else if (self.authoredRelayV2Configured() and (recipient_exact_token != null or guest_v2))
             .mesh_busy_local
         else
             .ordinary;
@@ -62587,6 +63432,7 @@ pub const LinuxServer = struct {
         // single-homed nick matches zero links (per-link route tables only hold
         // the direct peer's members) and this is a cheap no-op in the common
         // single-device case. Best-effort, like the channel relay above.
+        if (accepted_direct_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
         if (self.hasEstablishedPeer()) {
             var rp_buf: [320]u8 = undefined;
             if (clientPrefix(conn, &rp_buf)) |prefix| {
@@ -62625,7 +63471,6 @@ pub const LinuxServer = struct {
                     } }
                 else
                     .{ .nick = route_nick };
-                if (accepted_direct_v2) |accepted| self.forwardAcceptedRelayV2(accepted.wire);
                 _ = self.relayLegacyToPeers(
                     relay_msg,
                     relay_scope,
@@ -73874,6 +74719,16 @@ test "secured roster repair follows inbound membership generations across asymme
     // Seed B's existing view through the actual daemon burst path.
     const initial_recv_counter = pair.b.recv_counter;
     try std.testing.expect(server.sendMembershipBurstTo(peer));
+    const original_sendq_cap = peer.sendq_cap;
+    const link_before_flush = pair.a.outbound();
+    try std.testing.expect(link_before_flush.len >= 4);
+    const first_record_len = @as(usize, @intCast(std.mem.readInt(u32, link_before_flush[0..4], .little))) + 4;
+    try std.testing.expect(first_record_len < link_before_flush.len);
+    peer.sendq_cap = first_record_len;
+    // Force the production whole-record pager to leave a queued prefix and an
+    // encrypted suffix in their separate owners. The queue cap is restored
+    // after capture so later fixture phases use their normal budget.
+    try std.testing.expect(!server.flushSecuredS2sOutboundTo(peer_id, &pair.a));
     const initial_queued_len = peer.send_len - peer.send_offset + peer.send_overflow.items.len;
     const initial_link_outbound_len = pair.a.outbound().len;
     // This fixture exercises split ownership: the flush path has already
@@ -73888,6 +74743,7 @@ test "secured roster repair follows inbound membership generations across asymme
     try std.testing.expectEqual(initial_queued_len + initial_link_outbound_len, initial_daemon_burst.len);
     pair.a.clearOutbound();
     resetTestSendQ(peer);
+    peer.sendq_cap = original_sendq_cap;
     try pair.b.feed(initial_daemon_burst, 80);
     pair.b.processDeferredResidenceFrames(80);
     server.discardIdentityTransitions(&pair.b);
@@ -99848,11 +100704,14 @@ test "threaded server: mesh-token local resume restores detached snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    var identity = try node_identity.fromSeed(@splat(0x5e), "mesh-token-resume-test");
+    defer identity.deinit();
+
     var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-mesh-session-resume.wal");
     defer store.deinit();
     var services = services_mod.Services.init(&store, null);
 
-    const cfg = Config{ .host = "127.0.0.1", .port = 0, .account_services = &services, .mesh_pass = "mesh-reclaim-secret", .crypto_io = std.testing.io };
+    const cfg = Config{ .host = "127.0.0.1", .port = 0, .node_id = identity.shortId(), .node_identity = &identity, .account_services = &services, .mesh_pass = "mesh-reclaim-secret", .crypto_io = std.testing.io };
     var server = Server.init(std.testing.allocator, cfg) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -125723,6 +126582,79 @@ test "send error waits for quiet recv CQE and stale generation cannot free reuse
     try std.testing.expect(server.rx().clients.get(gap_id) == null);
 }
 
+test "SEND_ZC terminal EPIPE drops queued tail after notification without retry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var sockets: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+
+    const id = try server.rx().clients.alloc(ConnState.init(sockets[0]));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = std.testing.allocator;
+    conn.token = try tokenFromId(id);
+    server.noteClientAccepted(conn);
+    conn.recv_armed = true;
+
+    const queued = "failed-frame-tail";
+    @memcpy(conn.send_buf[0..queued.len], queued);
+    conn.send_len = queued.len;
+    try conn.send_overflow.appendSlice(conn.overflow_allocator, "overflow-tail");
+    conn.send_armed = true;
+    conn.send_zc_armed = true;
+    conn.send_submitted_len = 5;
+    conn.send_submitted_offset = 0;
+
+    // EPIPE is terminal, but MORE means the kernel still owns the submitted
+    // bytes until the separate zero-copy notification arrives.
+    try server.handleSend(.{
+        .token = conn.token,
+        .res = -@as(i32, @backingInt(linux.E.PIPE)),
+        .more = true,
+        .notif = false,
+    });
+    try std.testing.expect(conn.closing);
+    try std.testing.expect(conn.send_terminal_failure);
+    try std.testing.expect(conn.send_armed and conn.send_zc_armed);
+    try std.testing.expectEqual(queued.len, conn.send_len);
+    try std.testing.expectEqualStrings(queued, conn.send_buf[0..conn.send_len]);
+    try std.testing.expectEqualStrings("overflow-tail", conn.send_overflow.items);
+
+    // Releasing the exact SEND_ZC buffer discards both tails and must not arm a
+    // second send. The slot remains alive solely for its outstanding RECV.
+    try server.handleSend(.{
+        .token = conn.token,
+        .res = 0,
+        .more = false,
+        .notif = true,
+    });
+    try std.testing.expect(!conn.send_armed and !conn.send_zc_armed);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_submitted_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_offset);
+    try std.testing.expectEqual(@as(usize, 0), conn.send_overflow.items.len);
+    try std.testing.expect(conn.recv_armed);
+    try std.testing.expect(server.rx().clients.get(id) != null);
+
+    // Only the matching RECV CQE releases the remaining connection reference.
+    try server.handleRecv(.{
+        .token = conn.token,
+        .res = -@as(i32, @backingInt(linux.E.CANCELED)),
+        .more = false,
+    });
+    try std.testing.expect(server.rx().clients.get(id) == null);
+    try std.testing.expectEqual(@as(i64, 0), server.stats.connections_active.load(.acquire));
+}
+
 test "secured accept using final SQ slot retains partial I/O ownership" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     defer current_reactor = null;
@@ -128376,6 +129308,19 @@ fn countMeshLogDetail(server: *const LinuxServer, detail: []const u8) usize {
     return n;
 }
 
+fn printPeerLifecycleEventsForTest(server: *const LinuxServer, label: []const u8) void {
+    var it = server.mesh_log.iterator();
+    while (it.next()) |event| {
+        if (event.kind != .peer_up and event.kind != .peer_down and event.kind != .link_handshake) continue;
+        std.debug.print("{s} mesh event {s} subject={s} detail={s}\n", .{
+            label,
+            mesh_event_log.kindWord(event.kind),
+            event.subject,
+            event.detail,
+        });
+    }
+}
+
 fn dumpMeshDialProofForTest(server: *Server) void {
     server.world.lockWrite();
     defer server.world.unlockWrite();
@@ -129328,7 +130273,18 @@ test "threaded server: one reusable session stays live and participatory across 
     c.reset();
     sender.reset();
     try writeAllFd(fd_sender, "PRIVMSG Nova :direct-after-origin-detach\r\n");
-    try recvUntil(b, "PRIVMSG Nova :direct-after-origin-detach", 400);
+    recvUntil(b, "PRIVMSG Nova :direct-after-origin-detach", 400) catch |err| {
+        sender.readAvailable() catch {};
+        c.readAvailable() catch {};
+        std.debug.print("guest-dm-delivery b={d} c={d} sender_no_such_nick={d} sender_temp_unavailable={d} sender_fail={d}\n", .{
+            @intFromBool(std.mem.indexOf(u8, b.written(), "PRIVMSG Nova :direct-after-origin-detach") != null),
+            @intFromBool(std.mem.indexOf(u8, c.written(), "PRIVMSG Nova :direct-after-origin-detach") != null),
+            @intFromBool(std.mem.indexOf(u8, sender.written(), "No such nick") != null),
+            @intFromBool(std.mem.indexOf(u8, sender.written(), "TEMPORARILY_UNAVAILABLE") != null),
+            @intFromBool(std.mem.indexOf(u8, sender.written(), "FAIL") != null),
+        });
+        return err;
+    };
     try recvUntil(c, "PRIVMSG Nova :direct-after-origin-detach", 400);
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "PRIVMSG Nova :direct-after-origin-detach"));
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(c.written(), "PRIVMSG Nova :direct-after-origin-detach"));
@@ -129914,6 +130870,58 @@ fn sendFarPresenceLegacyDiagnostic(server: *Server, peer_key: [32]u8) !u64 {
     return error.TestUnexpectedResult;
 }
 
+fn sendFarGuestDirectDiagnostic(
+    server: *Server,
+    peer_key: [32]u8,
+    record: guest_direct.Record,
+) !void {
+    server.world.lockWrite();
+    defer server.world.unlockWrite();
+    current_reactor = &server.reactors[0];
+    defer current_reactor = null;
+    const ident = server.config.node_identity orelse return error.TestUnexpectedResult;
+    if (!std.mem.eql(u8, &ident.sign_kp.public_key, &record.origin)) return error.TestUnexpectedResult;
+    var wire_buf: [guest_direct.max_wire_len]u8 = undefined;
+    const wire = try guest_direct.encode(record, &ident.sign_kp, &wire_buf);
+    var peers = server.reactors[0].clients.iterator();
+    while (peers.next()) |entry| {
+        const link = entry.value.s2s_secured orelse continue;
+        if (!entry.value.ownsActiveMeshLink(link)) continue;
+        const key = link.peerNodeKey() orelse continue;
+        if (!std.mem.eql(u8, &key, &peer_key)) continue;
+        try std.testing.expect(try link.forwardGuestDirect(wire));
+        try std.testing.expect(server.flushSecuredS2sOutboundTo(entry.id, link));
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn sendFarGuestPresenceDiagnostic(
+    server: *Server,
+    peer_key: [32]u8,
+    record: mesh_presence_v2.Record,
+) !void {
+    server.world.lockWrite();
+    defer server.world.unlockWrite();
+    current_reactor = &server.reactors[0];
+    defer current_reactor = null;
+    const ident = server.config.node_identity orelse return error.TestUnexpectedResult;
+    if (!std.mem.eql(u8, &ident.sign_kp.public_key, &record.origin)) return error.TestUnexpectedResult;
+    var wire_buf: [mesh_presence_v2.max_wire_len]u8 = undefined;
+    const wire = try mesh_presence_v2.encode(record, &ident.sign_kp, &wire_buf);
+    var peers = server.reactors[0].clients.iterator();
+    while (peers.next()) |entry| {
+        const link = entry.value.s2s_secured orelse continue;
+        if (!entry.value.ownsActiveMeshLink(link)) continue;
+        const key = link.peerNodeKey() orelse continue;
+        if (!std.mem.eql(u8, &key, &peer_key)) continue;
+        try std.testing.expect(try link.forwardGuestPresence(wire));
+        try std.testing.expect(server.flushSecuredS2sOutboundTo(entry.id, link));
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn farGuestTombstoned(server: *Server, origin: [32]u8, guest: [16]u8, nick: []const u8) bool {
     server.world.lockWrite();
     defer server.world.unlockWrite();
@@ -130093,6 +131101,23 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
     try std.testing.expect(SameIPPeerProof.read(a.server, identity_c.sign_kp.public_key) == null);
     try std.testing.expect(SameIPPeerProof.read(c.server, identity_a.sign_kp.public_key) == null);
 
+    const guest_scope_deadline = platform.monotonicMillis() + 10_000;
+    while (true) {
+        a.server.world.lockWrite();
+        const a_guest_cap = a.server.hasSecureRelayV2GuestPeer(identity_b.shortId());
+        a.server.world.unlockWrite();
+        b.server.world.lockWrite();
+        const b_guest_caps = b.server.hasSecureRelayV2GuestPeer(identity_a.shortId()) and
+            b.server.hasSecureRelayV2GuestPeer(identity_c.shortId());
+        b.server.world.unlockWrite();
+        c.server.world.lockWrite();
+        const c_guest_cap = c.server.hasSecureRelayV2GuestPeer(identity_b.shortId());
+        c.server.world.unlockWrite();
+        if (a_guest_cap and b_guest_caps and c_guest_cap) break;
+        if (platform.monotonicMillis() >= guest_scope_deadline) return error.TestTimeout;
+        testSleepMs(10);
+    }
+
     // Wait for actual origin-owned PRESENCE on every direct leg. No route-table
     // seed, token, common channel, or foreign MEMBERSHIP exception supplies it.
     const roster_deadline = platform.monotonicMillis() + 20_000;
@@ -130188,8 +131213,157 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
                 return error.TestUnexpectedResult;
             };
             const old_guest_b = guest_b_conn.guest_id;
+            const b_guest_auth = b.server.guest_presence orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const b_guest_count = b_guest_auth.retainedCount();
             b.server.world.unlockWrite();
             try std.testing.expect(!std.mem.allEqual(u8, &old_guest_b, 0));
+            try std.testing.expect(b_guest_count != 0);
+
+            c.server.world.lockWrite();
+            const guest_c_world = c.server.world.findNick("GuestC") orelse {
+                c.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const guest_c_conn = c.server.connFor(clientIdFromWorld(guest_c_world)) orelse {
+                c.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const guest_c_incarnation = guest_c_conn.guest_id;
+            c.server.world.unlockWrite();
+            try std.testing.expect(!std.mem.allEqual(u8, &guest_c_incarnation, 0));
+
+            // A valid origin signature does not let the sender choose the
+            // recipient nick independently of the signed guest incarnation.
+            const mismatched_target = guest_direct.Record{
+                .origin = identity_c.sign_kp.public_key,
+                .sender_guest = guest_c_incarnation,
+                .recipient_origin = identity_b.sign_kp.public_key,
+                .recipient_guest = old_guest_b,
+                .hlc = c.server.nextMeshHlc(),
+                .issued_ms = c.server.guestNowMs(),
+                .sender_nick = "GuestC",
+                .target_nick = "GuestC",
+                .text = "guest-target-nick-mismatch",
+            };
+            live[1].reset();
+            try sendFarGuestDirectDiagnostic(c.server, identity_b.sign_kp.public_key, mismatched_target);
+            const mismatch_deadline = platform.monotonicMillis() + 300;
+            while (platform.monotonicMillis() < mismatch_deadline) {
+                try live[1].readAvailable();
+                testSleepMs(10);
+            }
+            try std.testing.expect(std.mem.indexOf(u8, live[1].written(), "guest-target-nick-mismatch") == null);
+
+            // Force a real signed-frame reorder on C->B->A: the valid direct
+            // arrives at B before its sender's presence. B must not consume the
+            // (origin,HLC) replay identity until authority exists; after the
+            // exact same frame is retried, presence crosses B before the body.
+            const reordered_guest = try mesh_presence_v2.guestId(.{ .epoch = 77, .counter = 99 });
+            a.server.world.lockWrite();
+            const guest_a_world = a.server.world.findNick("GuestA") orelse {
+                a.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const guest_a_conn = a.server.connFor(clientIdFromWorld(guest_a_world)) orelse {
+                a.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const guest_a_incarnation = guest_a_conn.guest_id;
+            a.server.world.unlockWrite();
+            const reordered_hlc = c.server.nextMeshHlc();
+            const reordered_issued = c.server.guestNowMs();
+            const reordered_direct = guest_direct.Record{
+                .origin = identity_c.sign_kp.public_key,
+                .sender_guest = reordered_guest,
+                .recipient_origin = identity_a.sign_kp.public_key,
+                .recipient_guest = guest_a_incarnation,
+                .hlc = reordered_hlc,
+                .issued_ms = reordered_issued,
+                .sender_nick = "ReorderC",
+                .target_nick = "GuestA",
+                .text = "reordered-guest-direct",
+            };
+            live[0].reset();
+            try sendFarGuestDirectDiagnostic(c.server, identity_b.sign_kp.public_key, reordered_direct);
+            const reordered_drop_deadline = platform.monotonicMillis() + 300;
+            while (platform.monotonicMillis() < reordered_drop_deadline) {
+                try live[0].readAvailable();
+                testSleepMs(10);
+            }
+            try std.testing.expect(std.mem.indexOf(u8, live[0].written(), "reordered-guest-direct") == null);
+            const presence_record: mesh_presence_v2.Record = .{
+                .operation = .present,
+                .origin = identity_c.sign_kp.public_key,
+                .guest = reordered_guest,
+                .revision = 1,
+                .routing_class = .true_guest,
+                .class_revision = 1,
+                .claim_hlc = c.server.nextMeshHlc(),
+                .claim_revision = 1,
+                .issued_ms = reordered_issued,
+                .expires_ms = reordered_issued + 120_000,
+                .nick = "ReorderC",
+                .username = "reorder",
+                .host = "localhost",
+                .realname = "Reordered guest sender",
+                .server = c.server.config.server_name,
+                .description = "Onyx Server test node",
+            };
+            try sendFarGuestPresenceDiagnostic(c.server, identity_b.sign_kp.public_key, presence_record);
+            const reordered_presence_deadline = platform.monotonicMillis() + 5_000;
+            while (true) {
+                a.server.world.lockWrite();
+                const sender_visible = if (a.server.guest_presence) |auth|
+                    auth.liveByGuest(identity_c.sign_kp.public_key, reordered_guest, a.server.guestNowMs()) != null
+                else
+                    false;
+                a.server.world.unlockWrite();
+                if (sender_visible) break;
+                if (platform.monotonicMillis() >= reordered_presence_deadline) return error.TestTimeout;
+                testSleepMs(10);
+            }
+            try sendFarGuestDirectDiagnostic(c.server, identity_b.sign_kp.public_key, reordered_direct);
+            const reordered_delivery_deadline = platform.monotonicMillis() + 2_000;
+            while (std.mem.indexOf(u8, live[0].written(), "PRIVMSG GuestA :reordered-guest-direct") == null and
+                platform.monotonicMillis() < reordered_delivery_deadline)
+            {
+                try live[0].readAvailable();
+                testSleepMs(10);
+            }
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), "PRIVMSG GuestA :reordered-guest-direct"));
+
+            // Simulate a full retained-presence table. Failed REGISTER attempts
+            // must not tombstone this connection's guest and then be unable to
+            // publish the replacement incarnation into the full table.
+            b.server.world.lockWrite();
+            b_guest_auth.store.config.max_entries = b_guest_count;
+            b.server.world.unlockWrite();
+            for (0..2) |_| {
+                live[1].reset();
+                try writeAllFd(live[1].fd, "REGISTER farb * x\r\n");
+                try recvUntil(&live[1], "Registration failed", 200);
+            }
+            b.server.world.lockWrite();
+            const after_failed_register_id = b.server.world.findNick("GuestB") orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const after_failed_register = b.server.connFor(clientIdFromWorld(after_failed_register_id)) orelse {
+                b.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const failed_register_kept_guest = std.mem.eql(u8, &after_failed_register.guest_id, &old_guest_b);
+            const failed_register_kept_presence = b_guest_auth.liveByGuest(
+                identity_b.sign_kp.public_key,
+                old_guest_b,
+                b.server.guestNowMs(),
+            ) != null;
+            b_guest_auth.store.config.max_entries = 4096;
+            b.server.world.unlockWrite();
+            try std.testing.expect(failed_register_kept_guest and failed_register_kept_presence);
             a.server.world.lockWrite();
             const home_before_register = a.server.meshNickHomeNode("GuestB");
             a.server.world.unlockWrite();
@@ -130222,18 +131396,246 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
             const guest_id_cleared = std.mem.allEqual(u8, &registered_b.guest_id, 0);
             b.server.world.unlockWrite();
             try std.testing.expect(account_bound and guest_id_cleared);
+            live[1].reset();
+            try writeAllFd(live[1].fd, "SESSION TOKEN\r\n");
+            try recvUntil(&live[1], "SESSION MTOKEN ", 200);
             a.server.world.lockWrite();
             const home_after_register = a.server.meshNickHomeNode("GuestB");
             a.server.world.unlockWrite();
             try std.testing.expectEqual(@as(?u64, identity_b.shortId()), home_after_register);
 
+            // Once B has authenticated, it no longer has a guest incarnation.
+            // Its PRIVMSG/NOTICE/TAGMSG to A's still-live ordinary guest must
+            // take the exact signed guest-incarnation MESSAGE_V2 route, not OGDM.
+            for ([_][]const u8{
+                "PRIVMSG GuestA :authenticated-to-guest-privmsg",
+                "NOTICE GuestA :authenticated-to-guest-notice",
+                "@+draft/reply=auth-guest-target;+draft/react=ok TAGMSG GuestA",
+            }, 0..) |command, index| {
+                live[0].reset();
+                live[1].reset();
+                var command_buf: [200]u8 = undefined;
+                const wire_command = try std.fmt.bufPrint(&command_buf, "{s}\r\n", .{command});
+                try writeAllFd(live[1].fd, wire_command);
+                const marker = switch (index) {
+                    0 => "authenticated-to-guest-privmsg",
+                    1 => "authenticated-to-guest-notice",
+                    else => "TAGMSG GuestA",
+                };
+                const auth_guest_deadline = platform.monotonicMillis() + 2_000;
+                while ((std.mem.indexOf(u8, live[1].written(), marker) == null or
+                    std.mem.indexOf(u8, live[0].written(), marker) == null) and
+                    platform.monotonicMillis() < auth_guest_deadline)
+                {
+                    try live[1].readAvailable();
+                    try live[0].readAvailable();
+                    testSleepMs(10);
+                }
+                if (std.mem.indexOf(u8, live[1].written(), marker) == null or
+                    std.mem.indexOf(u8, live[0].written(), marker) == null)
+                {
+                    std.debug.print("authenticated direct guest outcome sender={} recipient={} unavailable={} no_such={} index={}\n", .{
+                        std.mem.indexOf(u8, live[1].written(), marker) != null,
+                        std.mem.indexOf(u8, live[0].written(), marker) != null,
+                        std.mem.indexOf(u8, live[1].written(), "TEMPORARILY_UNAVAILABLE") != null,
+                        std.mem.indexOf(u8, live[1].written(), " 401 GuestB GuestA ") != null,
+                        index,
+                    });
+                    return error.TestTimeout;
+                }
+                try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[1].written(), marker));
+                try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), marker));
+            }
+
             live[0].reset();
             try writeAllFd(live[0].fd, "REGISTER fara * correcthorse\r\n");
             try recvUntil(&live[0], "REGISTER SUCCESS fara", 200);
-            for ([_]usize{ 0, 1 }) |index| {
-                live[index].reset();
-                try writeAllFd(live[index].fd, "SESSION TOKEN\r\n");
-                try recvUntil(&live[index], "SESSION MTOKEN ", 200);
+            live[0].reset();
+            try writeAllFd(live[0].fd, "SESSION TOKEN\r\n");
+            try recvUntil(&live[0], "SESSION MTOKEN ", 200);
+
+            // Authenticated A is more than one hop from ordinary GuestC. The
+            // signed guest-incarnation route must use MESSAGE_V2's durable
+            // admission, stable identity, and exact-once forwarding just like
+            // a portable registered recipient.
+            a.server.world.lockWrite();
+            const sender_a_id = a.server.world.findNick("GuestA") orelse {
+                a.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const sender_a_conn = a.server.connFor(clientIdFromWorld(sender_a_id)) orelse {
+                a.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            const sender_a_portable = a.server.portableSessionTokenForClient(clientIdFromWorld(sender_a_id), sender_a_conn) != null;
+            const far_guest_route = a.server.liveOrdinaryGuest("GuestC");
+            a.server.world.unlockWrite();
+            try std.testing.expect(sender_a_portable);
+            try std.testing.expect(far_guest_route != null and !far_guest_route.?.local and far_guest_route.?.next_hop == identity_b.shortId());
+
+            // Simulate a rolling old neighbor that has not answered the guest
+            // scope xcap. The origin must retain the exact V2 obligation and
+            // must not send a V1 twin; after negotiation completes, that same
+            // event wire reaches the far guest once.
+            const retained_guest_scope_marker = "guest-scope-pending-xcap";
+            a.server.world.lockWrite();
+            const disabled_guest_cap = a.server.setSecureRelayV2GuestPeerForTest(identity_b.shortId(), false);
+            a.server.world.unlockWrite();
+            try std.testing.expect(disabled_guest_cap);
+            live[0].reset();
+            live[1].reset();
+            live[2].reset();
+            try writeAllFd(live[0].fd, "PRIVMSG GuestC :guest-scope-pending-xcap\r\n");
+            try recvUntil(&live[0], retained_guest_scope_marker, 200);
+            const pending_guest_deadline = platform.monotonicMillis() + 300;
+            while (platform.monotonicMillis() < pending_guest_deadline) {
+                try live[1].readAvailable();
+                try live[2].readAvailable();
+                testSleepMs(10);
+            }
+            try std.testing.expect(std.mem.indexOf(u8, live[1].written(), retained_guest_scope_marker) == null);
+            try std.testing.expect(std.mem.indexOf(u8, live[2].written(), retained_guest_scope_marker) == null);
+            var retained_guest_scope = false;
+            var retained_guest_hlc: u64 = 0;
+            a.server.world.lockWrite();
+            lockSpin(&a.server.relay_v2_replay_mu);
+            for (a.server.relay_v2_outbox.items()) |item| {
+                if (item.peer != identity_b.shortId()) continue;
+                var decoded = message_relay_v2.decode(allocator, item.wire) catch continue;
+                defer decoded.deinit(allocator);
+                if (decoded.msg.scope_kind != .direct_guest or
+                    !std.mem.eql(u8, decoded.msg.text, retained_guest_scope_marker)) continue;
+                retained_guest_scope = true;
+                retained_guest_hlc = decoded.msg.hlc;
+                break;
+            }
+            a.server.relay_v2_replay_mu.unlock();
+            a.server.world.unlockWrite();
+            try std.testing.expect(retained_guest_scope);
+            b.server.world.lockWrite();
+            const no_legacy_twin = !b.server.relay_seen.seen.contains(.{
+                .origin_node = identity_a.shortId(),
+                .hlc = retained_guest_hlc,
+                .authenticated = true,
+            });
+            b.server.world.unlockWrite();
+            try std.testing.expect(no_legacy_twin);
+            a.server.world.lockWrite();
+            const enabled_guest_cap = a.server.setSecureRelayV2GuestPeerForTest(identity_b.shortId(), true);
+            a.server.world.unlockWrite();
+            try std.testing.expect(enabled_guest_cap);
+            const pending_delivery_deadline = platform.monotonicMillis() + 5_000;
+            while (std.mem.indexOf(u8, live[2].written(), retained_guest_scope_marker) == null and
+                platform.monotonicMillis() < pending_delivery_deadline)
+            {
+                try live[2].readAvailable();
+                testSleepMs(10);
+            }
+            try expectContains(live[2].written(), retained_guest_scope_marker);
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), retained_guest_scope_marker));
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[2].written(), retained_guest_scope_marker));
+            const pending_sender_msgid = testMessageTagValue(live[0].written(), retained_guest_scope_marker, "msgid") orelse
+                return error.TestUnexpectedResult;
+            const pending_guest_msgid = testMessageTagValue(live[2].written(), retained_guest_scope_marker, "msgid") orelse
+                return error.TestUnexpectedResult;
+            const pending_sender_time = testMessageTagValue(live[0].written(), retained_guest_scope_marker, "time") orelse
+                return error.TestUnexpectedResult;
+            const pending_guest_time = testMessageTagValue(live[2].written(), retained_guest_scope_marker, "time") orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(pending_sender_msgid, pending_guest_msgid);
+            try std.testing.expectEqualStrings(pending_sender_time, pending_guest_time);
+
+            // Force the exact guest presence authority to trail its MESSAGE_V2
+            // body at C. C must retain the immutable body without admitting
+            // replay or ACKing it; restoring authority retries that same wire
+            // and delivers once with the original stable identity.
+            const reordered_guest_marker = "guest-scope-before-presence";
+            var prior_guest_clock: mesh_presence_v2.ClockPolicy = undefined;
+            c.server.world.lockWrite();
+            const c_guest_auth = c.server.guest_presence orelse {
+                c.server.world.unlockWrite();
+                return error.TestUnexpectedResult;
+            };
+            prior_guest_clock = c_guest_auth.store.config.clock;
+            c_guest_auth.store.config.clock.max_lifetime_ms = 1;
+            c.server.world.unlockWrite();
+            live[0].reset();
+            live[1].reset();
+            live[2].reset();
+            try writeAllFd(live[0].fd, "PRIVMSG GuestC :guest-scope-before-presence\r\n");
+            try recvUntil(&live[0], reordered_guest_marker, 200);
+            var deferred_guest = false;
+            var reordered_relay_id: ?message_relay_v2.RelayId = null;
+            const deferred_guest_deadline = platform.monotonicMillis() + 3_000;
+            while (!deferred_guest and platform.monotonicMillis() < deferred_guest_deadline) {
+                c.server.world.lockWrite();
+                for (c.server.relay_v2_deferred[0..c.server.relay_v2_deferred_len]) |*pending| {
+                    if (pending.inbound.owned.msg.scope_kind != .direct_guest or
+                        !std.mem.eql(u8, pending.inbound.owned.msg.text, reordered_guest_marker)) continue;
+                    deferred_guest = true;
+                    reordered_relay_id = try message_relay_v2.relayId(allocator, pending.inbound.owned.msg);
+                    break;
+                }
+                c.server.world.unlockWrite();
+                if (!deferred_guest) testSleepMs(10);
+            }
+            try std.testing.expect(deferred_guest);
+            const target_stayed_pending = std.mem.indexOf(u8, live[2].written(), reordered_guest_marker) == null;
+            try std.testing.expect(target_stayed_pending);
+            const retained_at_b = blk: {
+                b.server.world.lockWrite();
+                defer b.server.world.unlockWrite();
+                break :blk b.server.relay_v2_outbox.contains(identity_c.shortId(), reordered_relay_id.?);
+            };
+            try std.testing.expect(retained_at_b);
+            c.server.world.lockWrite();
+            c_guest_auth.store.config.clock = prior_guest_clock;
+            c.server.world.unlockWrite();
+            const deferred_guest_delivery_deadline = platform.monotonicMillis() + 3_000;
+            while (std.mem.indexOf(u8, live[2].written(), reordered_guest_marker) == null and
+                platform.monotonicMillis() < deferred_guest_delivery_deadline)
+            {
+                try live[2].readAvailable();
+                testSleepMs(10);
+            }
+            try expectContains(live[2].written(), reordered_guest_marker);
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), reordered_guest_marker));
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[2].written(), reordered_guest_marker));
+            const reordered_sender_msgid = testMessageTagValue(live[0].written(), reordered_guest_marker, "msgid") orelse
+                return error.TestUnexpectedResult;
+            const reordered_guest_msgid = testMessageTagValue(live[2].written(), reordered_guest_marker, "msgid") orelse
+                return error.TestUnexpectedResult;
+            const reordered_sender_time = testMessageTagValue(live[0].written(), reordered_guest_marker, "time") orelse
+                return error.TestUnexpectedResult;
+            const reordered_guest_time = testMessageTagValue(live[2].written(), reordered_guest_marker, "time") orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(reordered_sender_msgid, reordered_guest_msgid);
+            try std.testing.expectEqualStrings(reordered_sender_time, reordered_guest_time);
+
+            const guest_v2_cases = [_][2][]const u8{
+                .{ "PRIVMSG GuestC :auth-far-guest-privmsg", "auth-far-guest-privmsg" },
+                .{ "NOTICE GuestC :auth-far-guest-notice", "auth-far-guest-notice" },
+                .{ "@+draft/reply=auth-far-target;+draft/react=ok TAGMSG GuestC", "TAGMSG GuestC" },
+            };
+            for (guest_v2_cases) |case_row| {
+                live[0].reset();
+                live[2].reset();
+                var command_buf: [240]u8 = undefined;
+                try writeAllFd(live[0].fd, try std.fmt.bufPrint(&command_buf, "{s}\r\n", .{case_row[0]}));
+                try recvUntil(&live[0], case_row[1], 200);
+                try recvUntil(&live[2], case_row[1], 200);
+                try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), case_row[1]));
+                try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[2].written(), case_row[1]));
+                const sender_msgid = testMessageTagValue(live[0].written(), case_row[1], "msgid") orelse
+                    return error.TestUnexpectedResult;
+                const recipient_msgid = testMessageTagValue(live[2].written(), case_row[1], "msgid") orelse
+                    return error.TestUnexpectedResult;
+                const sender_time = testMessageTagValue(live[0].written(), case_row[1], "time") orelse
+                    return error.TestUnexpectedResult;
+                const recipient_time = testMessageTagValue(live[2].written(), case_row[1], "time") orelse
+                    return error.TestUnexpectedResult;
+                try std.testing.expectEqualStrings(sender_msgid, recipient_msgid);
+                try std.testing.expectEqualStrings(sender_time, recipient_time);
             }
 
             b.server.world.lockWrite();
@@ -130427,6 +131829,69 @@ fn runFarOrdinaryNickRegression(case: FarOrdinaryNickCase) !void {
             const unchanged_guest_c = c.server.connFor(guest_c_id).?.guest_id;
             c.server.world.unlockWrite();
             try std.testing.expectEqual(old_guest_c, unchanged_guest_c);
+
+            // A far attached account may have a complete signed OFFER/lease
+            // route at A without a direct-origin MEMBERSHIP row. The exact
+            // recipient route must still authorize V2 delivery through B.
+            live[2].reset();
+            try writeAllFd(live[2].fd, "REGISTER farc * correcthorse\r\n");
+            try recvUntil(&live[2], "REGISTER SUCCESS farc", 200);
+            live[2].reset();
+            try writeAllFd(live[2].fd, "SESSION TOKEN\r\n");
+            try recvUntil(&live[2], "SESSION MTOKEN ", 200);
+            a.server.world.lockWrite();
+            const far_home = a.server.meshNickHomeNode("GuestC");
+            a.server.world.unlockWrite();
+            try std.testing.expectEqual(@as(?u64, null), far_home);
+            const far_replica_deadline = platform.monotonicMillis() + 10_000;
+            while (true) {
+                a.server.world.lockWrite();
+                const far_target = a.server.liveAttachedReplicaForNick("GuestC");
+                a.server.world.unlockWrite();
+                if (switch (far_target) {
+                    .exact => true,
+                    else => false,
+                }) break;
+                if (platform.monotonicMillis() >= far_replica_deadline) {
+                    const facts = farReplicaFacts(a.server, "GuestC", identity_c.shortId());
+                    std.debug.print("far recipient route facts A(home={any}, claims={}, members={}, peers={}, offer={}, attached={}, routes={}, active_path={})\n", .{
+                        facts.home,
+                        facts.claims,
+                        facts.members,
+                        facts.peers,
+                        facts.offer,
+                        facts.attached,
+                        facts.route_count,
+                        facts.active_path,
+                    });
+                    return error.TestTimeout;
+                }
+                testSleepMs(10);
+            }
+            live[0].reset();
+            live[2].reset();
+            try writeAllFd(live[0].fd, "PRIVMSG GuestC :far-live-active-v2-direct\r\n");
+            const far_direct_deadline = platform.monotonicMillis() + 2_000;
+            while (std.mem.indexOf(u8, live[2].written(), "PRIVMSG GuestC :far-live-active-v2-direct") == null and
+                platform.monotonicMillis() < far_direct_deadline)
+            {
+                try live[2].readAvailable();
+                testSleepMs(10);
+            }
+            try expectContains(live[2].written(), "PRIVMSG GuestC :far-live-active-v2-direct");
+            try recvUntil(&live[0], "PRIVMSG GuestC :far-live-active-v2-direct", 200);
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[0].written(), "PRIVMSG GuestC :far-live-active-v2-direct"));
+            try std.testing.expectEqual(@as(usize, 1), countOccurrences(live[2].written(), "PRIVMSG GuestC :far-live-active-v2-direct"));
+            const far_author_msgid = testMessageTagValue(live[0].written(), "PRIVMSG GuestC :far-live-active-v2-direct", "msgid") orelse
+                return error.TestUnexpectedResult;
+            const far_recipient_msgid = testMessageTagValue(live[2].written(), "PRIVMSG GuestC :far-live-active-v2-direct", "msgid") orelse
+                return error.TestUnexpectedResult;
+            const far_author_time = testMessageTagValue(live[0].written(), "PRIVMSG GuestC :far-live-active-v2-direct", "time") orelse
+                return error.TestUnexpectedResult;
+            const far_recipient_time = testMessageTagValue(live[2].written(), "PRIVMSG GuestC :far-live-active-v2-direct", "time") orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(far_author_msgid, far_recipient_msgid);
+            try std.testing.expectEqualStrings(far_author_time, far_recipient_time);
         },
     }
 }
@@ -131557,6 +133022,7 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
     try recvUntil(&admin, "SQUIT complete", 200);
     try Helpers.expectPeerAbsent(&admin, "session-line-node3.test");
     try Helpers.expectPeerAbsent(&probe3, "session-line-node2.test");
+    const node3_link_drops_before_reconnect = countMeshLogDetail(node3, "secured link dropped");
 
     const marker3 = "MARKREAD #mesh-line timestamp=2026-06-04T12:00:02.000Z";
     inline for (.{ a, b, &d, sender }) |client| client.reset();
@@ -131624,8 +133090,74 @@ test "threaded server: reusable session and MARKREAD stay exact-once across a th
         &.{ "session-line-node1.test", "session-line-node3.test" },
         160,
     );
-    try recvUntil(&d, marker3, 600);
+    var secured_bc = false;
+    for (0..200) |_| {
+        const n2 = node2.readMarkerMeshStateForTest(ident3.shortId());
+        const n3 = node3.readMarkerMeshStateForTest(ident2.shortId());
+        if (n2.found and n2.established and n2.supports and n2.supports_relay_v2 and
+            n3.found and n3.established and n3.supports and n3.supports_relay_v2)
+        {
+            secured_bc = true;
+            break;
+        }
+        testSleepMs(10);
+    }
+    if (!secured_bc) {
+        const n2 = node2.readMarkerMeshStateForTest(ident3.shortId());
+        const n3 = node3.readMarkerMeshStateForTest(ident2.shortId());
+        std.debug.print(
+            "MARKREAD reconnect did not negotiate B-C: n2 peer(found={}, established={}, read_marker={}, relay_v2={}, secured_slots={d}) n3 peer(found={}, established={}, read_marker={}, relay_v2={}, secured_slots={d})\n",
+            .{ n2.found, n2.established, n2.supports, n2.supports_relay_v2, n2.secured_slots, n3.found, n3.established, n3.supports, n3.supports_relay_v2, n3.secured_slots },
+        );
+        printPeerLifecycleEventsForTest(node2, "n2");
+        printPeerLifecycleEventsForTest(node3, "n3");
+        return error.TestTimeout;
+    }
+    recvUntil(&d, marker3, 600) catch |err| {
+        const n1 = node1.readMarkerMeshStateForTest(ident2.shortId());
+        const n2 = node2.readMarkerMeshStateForTest(ident3.shortId());
+        const n3 = node3.readMarkerMeshStateForTest(ident2.shortId());
+        std.debug.print(
+            "MARKREAD reconnect timeout state: n1 facts={d}; n2 facts={d} peer(found={}, established={}, supports={}, relay_v2={}, seen={}, burst_done={}, replay_pending={}, replay_burst_pending={}, stage={d}, secured_slots={d}); n3 facts={d} peer(found={}, established={}, supports={}, relay_v2={}, seen={}, burst_done={}, replay_pending={}, replay_burst_pending={}, stage={d}, secured_slots={d})\n",
+            .{
+                n1.fact_count,
+                n2.fact_count,
+                n2.found,
+                n2.established,
+                n2.supports,
+                n2.supports_relay_v2,
+                n2.marker_seen,
+                n2.burst_done,
+                n2.replay_pending,
+                n2.replay_burst_pending,
+                n2.burst_stage,
+                n2.secured_slots,
+                n3.fact_count,
+                n3.found,
+                n3.established,
+                n3.supports,
+                n3.supports_relay_v2,
+                n3.marker_seen,
+                n3.burst_done,
+                n3.replay_pending,
+                n3.replay_burst_pending,
+                n3.burst_stage,
+                n3.secured_slots,
+            },
+        );
+        printPeerLifecycleEventsForTest(node2, "n2");
+        printPeerLifecycleEventsForTest(node3, "n3");
+        return err;
+    };
     try Helpers.expectOnce(&d, marker3);
+    try std.testing.expectEqual(
+        node3_link_drops_before_reconnect,
+        countMeshLogDetail(node3, "secured link dropped"),
+    );
+    const n2_after_marker = node2.readMarkerMeshStateForTest(ident3.shortId());
+    const n3_after_marker = node3.readMarkerMeshStateForTest(ident2.shortId());
+    try std.testing.expect(n2_after_marker.found and n2_after_marker.established and n2_after_marker.supports);
+    try std.testing.expect(n3_after_marker.found and n3_after_marker.established and n3_after_marker.supports);
     try recvUntil(&d, "JOIN :#mesh-retained", 600);
     try Helpers.expectOnce(&d, "JOIN :#mesh-retained");
     const retained_session_token = switch (try session_resume_credential.decode(local_token)) {
