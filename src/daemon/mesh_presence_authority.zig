@@ -261,6 +261,20 @@ pub const Authority = struct {
             if (self.ram != .local_lifecycles or index >= self.ram.local_lifecycles.subject_count) return null;
             return self.ram.local_lifecycles.subjects[index].original;
         }
+
+        /// Exact signed frontier bytes paired with this prepared WAL cut.
+        /// Borrowed until abort/deinit; presence-only cuts have no frontier
+        /// projection to hand to a path manager.
+        pub fn frontierOriginal(self: *const Prepared) ?[]const u8 {
+            if (self.done) return null;
+            return switch (self.ram) {
+                .presence => null,
+                .frontier => |plan| if (plan.candidate) |candidate| if (candidate.conflict == null) candidate.original else null else null,
+                .local_lifecycle => |plan| if (plan.frontier_candidate) |candidate| candidate.original else null,
+                .local_lifecycles => |plan| if (plan.frontier_candidate) |candidate| candidate.original else null,
+            };
+        }
+
         pub fn deinit(self: *Prepared) void {
             self.abort();
         }
@@ -1229,6 +1243,50 @@ fn publishLifecycle(owner: *Authority, value: wire.Record, through: u64, active:
     try std.testing.expectEqual(head_generation + 1, owner.head.commit_generation);
     try std.testing.expectEqual(image_generation + 1, owner.head.image_generation);
     try expectAuthorityDiskProjection(owner);
+}
+
+test "mesh presence authority prepared local lifecycle exposes its signed frontier until abort" {
+    var tmp = try testTmpDir();
+    defer tmp.cleanup();
+    var key = try sign.KeyPair.fromSeed(@splat(246));
+    defer key.deinit();
+    var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "frontier-output.wal", contextFor(&key), @splat(73), &key, 1000, .{});
+    defer owner.deinit();
+
+    const subject = try owner.reserveSubject(&key);
+    const original_record = try recordFor(key.public_key, subject);
+    var original_buffer: [wire.max_wire_len]u8 = undefined;
+    const original = try wire.encode(original_record, &key, &original_buffer);
+    const predecessor_frontier = owner.durable.get(.props, issuer.frontier_key).?;
+    const predecessor_generation = owner.retained_store.generation;
+    const predecessor_head = owner.head;
+
+    var presence_only = try owner.preparePresence(original, &.{key.public_key}, 1000, &key);
+    defer presence_only.deinit();
+    try std.testing.expect(presence_only.frontierOriginal() == null);
+    presence_only.abort();
+
+    var prepared = try owner.prepareLocalLifecycle(original, subject.counter, &.{subject.counter}, 1000, &key);
+    defer prepared.deinit();
+    const generated = prepared.frontierOriginal() orelse return error.TestUnexpectedResult;
+    const decoded = try frontier.decode(generated);
+    try decoded.verify();
+    try std.testing.expectEqual(key.public_key, decoded.origin);
+    try std.testing.expectEqual(subject.epoch, decoded.epoch);
+    try std.testing.expectEqual(@as(u64, 2), decoded.revision);
+    try std.testing.expectEqual(subject.counter, decoded.through);
+    try std.testing.expect(decoded.contains(subject.counter));
+    try std.testing.expectEqual(predecessor_generation, owner.retained_store.generation);
+    try std.testing.expectEqualDeep(predecessor_head, owner.head);
+    try std.testing.expectEqual(@as(usize, 0), owner.retained_store.entries.items.len);
+
+    prepared.abort();
+    try std.testing.expect(prepared.frontierOriginal() == null);
+    prepared.deinit();
+    try std.testing.expectEqual(predecessor_generation, owner.retained_store.generation);
+    try std.testing.expectEqualDeep(predecessor_head, owner.head);
+    try std.testing.expectEqual(@as(usize, 0), owner.retained_store.entries.items.len);
+    try std.testing.expectEqualSlices(u8, predecessor_frontier, owner.durable.get(.props, issuer.frontier_key).?);
 }
 
 test "mesh presence authority compound lifecycle replaces at capacity renews renames and certifies quit" {
