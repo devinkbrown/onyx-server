@@ -31,6 +31,7 @@ test "required Windows chain policy refuses raw keys and resumption" {
 const hkdf_tls13 = @import("hkdf_tls13.zig");
 const tls_resumption = @import("tls_resumption.zig");
 const tls_record = @import("tls_record.zig");
+const tls_handshake_reassembly = @import("tls_handshake_reassembly.zig");
 const x509 = @import("x509.zig");
 const x509_verify = @import("x509_verify.zig");
 const ocsp = @import("ocsp.zig");
@@ -73,6 +74,8 @@ const Sha256 = hkdf_tls13.Sha256;
 const Sha384 = hkdf_tls13.Sha384;
 /// Largest TLS 1.3 transcript-hash / traffic-secret length we handle (SHA-384).
 const max_hash_len = Sha384.hash_len;
+/// Total retained handshake transcript bound, including the certificate flight.
+const max_transcript_len: usize = 2 * 1024 * 1024;
 
 /// Fail-closed cap on how many handshake messages one post-handshake record may
 /// coalesce. RFC 8446 §5.1 permits several messages per record, and a real
@@ -643,6 +646,7 @@ pub const Client = struct {
 
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
+    server_hello_reassembly: tls_handshake_reassembly.Reassembly = .{},
     hs_plain: std.ArrayList(u8) = .empty,
     /// Count of unencrypted change_cipher_spec records the peer has sent, over
     /// the whole connection. Unbounded, this is a channel a hostile (or
@@ -770,6 +774,7 @@ pub const Client = struct {
         self.server_app_keys.wipe();
         self.transcript.deinit(self.allocator);
         self.recv_buf.deinit(self.allocator);
+        self.server_hello_reassembly.deinit(self.allocator);
         self.hs_plain.deinit(self.allocator);
         self.post_handshake_send.deinit(self.allocator);
         self.post_handshake_recv.deinit(self.allocator);
@@ -1958,6 +1963,32 @@ pub const Client = struct {
 
     fn tryConsumeServerHello(self: *Client) Error!ServerHelloStep {
         while (true) {
+            if (self.server_hello_reassembly.completeLen()) |message_len| {
+                if (self.server_hello_reassembly.bytes.items.len != message_len) return error.BadHandshake;
+                const bytes = self.server_hello_reassembly.bytes.items;
+                var off: usize = 0;
+                const msg = try parseHandshake(bytes, &off);
+                if (off != bytes.len or msg.typ != .server_hello) return error.BadHandshake;
+
+                if (isHelloRetryRequest(msg.body)) {
+                    if (self.hrr_seen) return error.BadHandshake;
+                    if (self.ech_active) return error.HelloRetryRequestUnsupported;
+                    const ch2 = try self.handleHelloRetryRequest(msg.body, msg.raw);
+                    self.server_hello_reassembly.consume(message_len);
+                    self.retry_hello = ch2;
+                    return .retry;
+                }
+
+                var selected = try self.parseServerHello(msg.body);
+                if (self.ech_active) try self.checkEchAcceptance(msg.raw);
+                try self.appendTranscript(msg.raw);
+                try self.deriveHandshakeKeys(selected.buf[0..selected.len]);
+                secureZero(&selected.buf);
+                self.server_hello_reassembly.consume(message_len);
+                self.state = .wait_encrypted_extensions;
+                return .proceed;
+            }
+
             const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
             if (rec.content_type == .change_cipher_spec) {
                 try self.acceptCompatCcs(rec.fragment);
@@ -1969,39 +2000,8 @@ pub const Client = struct {
                 return error.TlsAlert;
             }
             if (rec.content_type != .handshake) return error.BadRecord;
-
-            var off: usize = 0;
-            const msg = try parseHandshake(rec.fragment, &off);
-            if (off != rec.fragment.len or msg.typ != .server_hello) return error.BadHandshake;
-
-            if (isHelloRetryRequest(msg.body)) {
-                // A second HelloRetryRequest in one connection is fatal.
-                if (self.hrr_seen) return error.BadHandshake;
-                // ECH + HRR (re-seal the ClientHelloInner under the same HPKE
-                // context with an empty `enc`, plus the "hrr ech accept
-                // confirmation" transcript) is not yet implemented (deferred, gated
-                // on an external ECH oracle). Rather than emit a subtly non-compliant
-                // CH2 that silently downgrades ECH, refuse — FAIL CLOSED. The server
-                // enforces the symmetric guard (`EchHrrUnsupported`) when it accepted
-                // an inner and would itself need to HelloRetryRequest.
-                if (self.ech_active) return error.HelloRetryRequestUnsupported;
-                const ch2 = try self.handleHelloRetryRequest(msg.body, msg.raw);
-                consumePrefix(&self.recv_buf, rec.wire_len);
-                self.retry_hello = ch2;
-                return .retry;
-            }
-
-            var selected = try self.parseServerHello(msg.body);
-            // ECH acceptance: inspect the confirmation in ServerHello.random and,
-            // if the server accepted, switch the transcript to the ClientHelloInner
-            // BEFORE ServerHello is folded in and the handshake keys are derived.
-            if (self.ech_active) try self.checkEchAcceptance(msg.raw);
-            try self.appendTranscript(msg.raw);
-            try self.deriveHandshakeKeys(selected.buf[0..selected.len]);
-            secureZero(&selected.buf);
+            try self.server_hello_reassembly.append(self.allocator, rec.fragment);
             consumePrefix(&self.recv_buf, rec.wire_len);
-            self.state = .wait_encrypted_extensions;
-            return .proceed;
         }
     }
 
@@ -2145,6 +2145,7 @@ pub const Client = struct {
                 // the server Certificate; the request itself stays in the
                 // transcript. Only the test-only mTLS path acts on it later.
                 if (msg.typ == .certificate_request) {
+                    if (self.cert_requested) return error.BadHandshake;
                     self.client_cert_type = try validateCertificateRequest(msg.body, self.offer_client_raw_public_key);
                     self.cert_requested = true;
                     try self.appendTranscript(msg.raw);
@@ -2925,7 +2926,8 @@ pub const Client = struct {
     }
 
     fn appendTranscript(self: *Client, bytes: []const u8) Error!void {
-        if (self.transcript.items.len > std.math.maxInt(usize) - bytes.len) return error.TranscriptOverflow;
+        const total = std.math.add(usize, self.transcript.items.len, bytes.len) catch return error.TranscriptOverflow;
+        if (total > max_transcript_len) return error.TranscriptOverflow;
         try self.transcript.appendSlice(self.allocator, bytes);
     }
 };
@@ -4565,6 +4567,26 @@ fn buildTestServerHelloBody(
     try appendU16(allocator, &body, @intCast(exts.items.len));
     try body.appendSlice(allocator, exts.items);
     return body.toOwnedSlice(allocator);
+}
+
+test "client rejects duplicate CertificateRequest and caps cumulative transcript" {
+    const alloc = std.testing.allocator;
+    var client = try Client.init(alloc, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer client.deinit();
+
+    client.state = .wait_certificate;
+    const request = [_]u8{ 13, 0, 0, 11, 0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3 };
+    try client.hs_plain.appendSlice(alloc, &request);
+    try std.testing.expect(try client.tryProcessPlainHandshake());
+    try std.testing.expect(client.cert_requested);
+    try client.hs_plain.appendSlice(alloc, &request);
+    try std.testing.expectError(error.BadHandshake, client.tryProcessPlainHandshake());
+
+    const transcript_len_before_oversized_append = client.transcript.items.len;
+    const oversized = try alloc.alloc(u8, max_transcript_len + 1);
+    defer alloc.free(oversized);
+    try std.testing.expectError(error.TranscriptOverflow, client.appendTranscript(oversized));
+    try std.testing.expectEqual(transcript_len_before_oversized_append, client.transcript.items.len);
 }
 
 test "TLS 1.3 ServerHello after HRR must keep the HRR cipher suite (RFC 8446 §4.1.4)" {
