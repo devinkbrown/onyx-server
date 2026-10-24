@@ -177,6 +177,9 @@ pub const FrameType = enum(u8) {
     /// the handshake capability byte is full. Absent on a peer that did not
     /// answer, so idle, away, and TLS stay omitted instead of being invented.
     WHOIS_PROFILE = 0x2E,
+    /// Original signed complete guest-retirement frontier. Sent only after a
+    /// distinct PING/PONG extension confirms the peer understands this frame.
+    GUEST_FRONTIER = 0x2F,
 
     pub fn tag(self: FrameType) u8 {
         return @backingInt(self);
@@ -230,6 +233,7 @@ pub const FrameType = enum(u8) {
             @backingInt(FrameType.GUEST_PRESENCE) => .GUEST_PRESENCE,
             @backingInt(FrameType.GUEST_DIRECT) => .GUEST_DIRECT,
             @backingInt(FrameType.WHOIS_PROFILE) => .WHOIS_PROFILE,
+            @backingInt(FrameType.GUEST_FRONTIER) => .GUEST_FRONTIER,
             else => null,
         };
     }
@@ -437,6 +441,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .GUEST_PRESENCE, .token = "GUEST_PRESENCE", .family = .relay, .auth = .secured_signed, .summary = "Original mesh-presence v2 record. The hop envelope authenticates the immediate peer; the origin signature is unchanged." },
     .{ .frame_type = .GUEST_DIRECT, .token = "GUEST_DIRECT", .family = .relay, .auth = .secured_signed, .summary = "Exact ordinary-guest direct message bound to both guest incarnations. Forward only toward the recipient." },
     .{ .frame_type = .WHOIS_PROFILE, .token = "WHOIS_PROFILE", .family = .membership, .auth = .signable, .summary = "Remote WHOIS session facts. Gated by a PING extension. rDNS is present only on a secured oper-info link." },
+    .{ .frame_type = .GUEST_FRONTIER, .token = "GUEST_FRONTIER", .family = .relay, .auth = .secured_signed, .summary = "Original signed complete guest-retirement frontier; gated by its own PING/PONG extension." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {
@@ -872,4 +877,14 @@ test "E2EE group frames are secured and base-transport gated without a new capab
     try testing.expectEqual(FrameType.E2EE_GROUP_ACK, frameSpecByTag(0x27).?.frame_type);
     try testing.expectEqual(FrameType.E2EE_GROUP_ACK, frameSpecByToken("E2EE_GROUP_ACK").?.frame_type);
     try testing.expectEqual(@as(usize, 8), capability_catalog.len);
+}
+
+test "guest frontier is a distinct secured-signed extension frame" {
+    const spec = frameSpec(.GUEST_FRONTIER);
+    try testing.expectEqual(FrameFamily.relay, spec.family);
+    try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
+    try testing.expectEqual(@as(u8, 0), spec.capability_mask);
+    try testing.expectEqual(FrameType.GUEST_FRONTIER, frameSpecByTag(0x2F).?.frame_type);
+    try testing.expectEqual(FrameType.GUEST_FRONTIER, frameSpecByToken("GUEST_FRONTIER").?.frame_type);
+    try testing.expectEqual(FrameType.GUEST_FRONTIER, FrameType.fromTag(0x2F).?);
 }
