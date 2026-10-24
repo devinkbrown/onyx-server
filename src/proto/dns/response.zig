@@ -79,7 +79,7 @@ pub fn envelope(packet: []const u8, expected_id: u16, question: types.Query) Err
 }
 
 const Alias = struct { owner: types.Name, target: types.Name, ttl: u32 };
-const Terminal = struct { owner: types.Name, data: types.RData, ttl: u32 };
+const Terminal = struct { owner: types.Name, ttl: u32 };
 const NegativeAuthority = struct { owner: types.Name, ttl: u32 };
 
 pub fn inspect(packet: []const u8, expected_id: u16, question: types.Query) Error!Result {
@@ -102,7 +102,10 @@ pub fn inspectWithPath(packet: []const u8, expected_id: u16, question: types.Que
     if (record_count > max_records) return error.TooManyRecords;
     var aliases: [max_aliases]Alias = undefined;
     var alias_count: usize = 0;
-    var terminals: [types.max_cache_addrs]Terminal = undefined;
+    // Keep ownership and TTL metadata for every bounded answer record, but
+    // only retain a cache-sized prefix of the address/name data itself.
+    var terminals: [max_records]Terminal = undefined;
+    var terminal_data: [types.max_cache_addrs]types.RData = undefined;
     var terminal_count: usize = 0;
     var authorities: [max_aliases]NegativeAuthority = undefined;
     var authority_count: usize = 0;
@@ -136,7 +139,6 @@ pub fn inspectWithPath(packet: []const u8, expected_id: u16, question: types.Que
             alias_count += 1;
         } else if (in_answer and kind == @backingInt(question.qtype)) {
             if (class != types.class_in) return error.UnsupportedClass;
-            if (terminal_count == terminals.len) return error.TooManyAnswers;
             const data: types.RData = switch (question.qtype) {
                 .a => blk: {
                     if (len != 4) return error.MalformedRData;
@@ -153,7 +155,8 @@ pub fn inspectWithPath(packet: []const u8, expected_id: u16, question: types.Que
                 },
                 .txt => unreachable,
             };
-            terminals[terminal_count] = .{ .owner = owner, .data = data, .ttl = ttl };
+            if (terminal_count < terminal_data.len) terminal_data[terminal_count] = data;
+            terminals[terminal_count] = .{ .owner = owner, .ttl = ttl };
             terminal_count += 1;
         } else if (in_answer and (kind == 1 or kind == 28 or kind == 12 or kind == 16)) {
             return error.InvalidOwner;
@@ -197,7 +200,8 @@ pub fn inspectWithPath(packet: []const u8, expected_id: u16, question: types.Que
     for (terminals[0..terminal_count], 0..) |terminal, index| {
         if (!names.equal(terminal.owner.slice(), canonical.slice())) return error.InvalidOwner;
         lifetime = @min(lifetime, terminal.ttl);
-        switch (terminal.data) {
+        if (index >= terminal_data.len) continue;
+        switch (terminal_data[index]) {
             .a => |address| {
                 result.addresses[result.address_count] = .{ .ipv4 = address };
                 result.address_count += 1;

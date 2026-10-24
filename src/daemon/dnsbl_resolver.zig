@@ -1210,3 +1210,36 @@ test "DNS worker budget gives the final DNSBL zone a listing opportunity after e
     try server.join();
     try std.testing.expectEqual(max_zones, server.udp_queries);
 }
+
+test "DNS worker reaches a listing secondary nameserver inside a short zone budget" {
+    const fixture = @import("../proto/dns/test_server.zig");
+    var server = try fixture.Server.init(false, .silent);
+    defer server.deinit();
+    const zones = [_][]const u8{ "zero.test", "one.test", "two.test", "three.test", "four.test", "five.test", "six.test", "seven.test" };
+    const ip: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    var name_buf: [dns.max_domain_text_len]u8 = undefined;
+    const query_name = try dnsbl.reverseNameV4(ip.ipv4, zones[0], &name_buf);
+    const steps = [_]fixture.Step{
+        .{ .name = query_name, .qtype = .a, .reply = .silent },
+        .{ .name = query_name, .qtype = .a, .reply = .{ .address = .{ .ipv4 = .{ 127, 0, 0, 7 } } } },
+    };
+    server.script = &steps;
+    server.fixture_timeout_ms = 1500;
+    try server.start();
+    var cfg = server.resolverConfig();
+    cfg.timeout_ms = 2000;
+    cfg.attempts = 1;
+    cfg.addNameserver(server.address);
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, cfg, &zones);
+    defer resolver.deinit();
+    resolver.request(ip);
+    const started = platform.monotonicMillis();
+    try resolver.startChecked();
+    while (platform.monotonicMillis() - started < 1500 and resolver.lookup(ip) == null) sleepMs(5);
+    const elapsed = platform.monotonicMillis() - started;
+    try std.testing.expectEqual(Verdict{ .listed = true, .code = 7 }, resolver.lookup(ip) orelse return error.TestUnexpectedResult);
+    try std.testing.expect(elapsed < 1500);
+    resolver.stop();
+    try server.join();
+    try std.testing.expectEqual(@as(usize, 2), server.udp_queries);
+}

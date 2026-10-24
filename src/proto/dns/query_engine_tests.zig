@@ -5,6 +5,7 @@ const std = @import("std");
 const engine = @import("query_engine.zig");
 const fixture = @import("test_server.zig");
 const response = @import("response.zig");
+const wire = @import("wire.zig");
 const platform = @import("../../substrate/platform.zig");
 
 test "DNS connected UDP rejects foreign source mismatched ID and question then accepts valid reply" {
@@ -126,6 +127,50 @@ test "DNS retries and nameservers share one total deadline" {
     try std.testing.expect(elapsed >= 100 and elapsed < 750);
     try server.join();
     try std.testing.expectEqual(@as(usize, 3), server.udp_queries);
+}
+
+test "DNS shares a short lookup deadline across silent primary and answering secondary" {
+    var server = try fixture.Server.init(false, .silent);
+    defer server.deinit();
+    const steps = [_]fixture.Step{
+        .{ .name = "lookup.test", .qtype = .a, .reply = .silent },
+        .{ .name = "lookup.test", .qtype = .a, .reply = .{ .address = .{ .ipv4 = .{ 192, 0, 2, 9 } } } },
+    };
+    server.script = &steps;
+    server.fixture_timeout_ms = 500;
+    try server.start();
+
+    var cfg = server.resolverConfig();
+    cfg.timeout_ms = 1000;
+    cfg.attempts = 1;
+    cfg.addNameserver(server.address);
+    const start = platform.monotonicMillis();
+    const result = try engine.resolve(&cfg, "lookup.test", .a, .{ .total_timeout_ms = 240 });
+    const elapsed = platform.monotonicMillis() - start;
+    try server.join();
+
+    try std.testing.expectEqual(response.Outcome.positive, result.outcome);
+    try std.testing.expectEqual(@as(usize, 1), result.address_count);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 9 }, &result.addresses[0].ipv4);
+    try std.testing.expectEqual(@as(usize, 2), server.udp_queries);
+    try std.testing.expect(elapsed < 400);
+}
+
+test "DNS retains a bounded address prefix from UDP and TCP answers" {
+    for ([_]fixture.Mode{ .many_addresses, .tcp_many_addresses }) |mode| {
+        var server = try fixture.Server.init(false, mode);
+        defer server.deinit();
+        try server.start();
+        const result = try engine.resolve(&server.resolverConfig(), "lookup.test", .a, .{});
+        try server.join();
+
+        try std.testing.expectEqual(response.Outcome.positive, result.outcome);
+        try std.testing.expectEqual(@as(usize, wire.max_cache_addrs), result.address_count);
+        try std.testing.expectEqual(@as(u8, 1), result.addresses[0].ipv4[3]);
+        try std.testing.expectEqual(@as(u8, wire.max_cache_addrs), result.addresses[wire.max_cache_addrs - 1].ipv4[3]);
+        try std.testing.expectEqual(@as(usize, 1), server.udp_queries);
+        try std.testing.expectEqual(@as(usize, if (mode == .tcp_many_addresses) 1 else 0), server.tcp_queries);
+    }
 }
 
 test "DNS configured attempts are capped even when overall budget remains" {

@@ -88,9 +88,16 @@ fn query(cfg: *const config.ResolverConfig, name: []const u8, qtype: wire.Record
     var last_error: Error = error.Timeout;
     for (0..@min(@max(cfg.attempts, 1), max_attempts)) |_| {
         for (cfg.nsSlice(), 0..) |address, index| {
-            _ = try deadline.remaining();
+            const remaining = try deadline.remaining();
+            const servers_left: u32 = @intCast(cfg.nameserver_count - index);
+            // Give each remaining nameserver an opportunity within the
+            // caller's absolute lookup budget. Otherwise a silent primary
+            // can consume a short DNSBL zone slice before a healthy secondary
+            // is reached.
+            const endpoint_share = @max(1, remaining / servers_left);
+            const endpoint_budget = @max(1, @min(cfg.timeout_ms, endpoint_share));
             const endpoint = transport.Endpoint{ .address = address, .scope_id = cfg.nameserver_scope_ids[index], .port = cfg.port };
-            const attempt_deadline = try deadline.slice(cfg.timeout_ms);
+            const attempt_deadline = try deadline.slice(endpoint_budget);
             return queryEndpoint(endpoint, name, qtype, attempt_deadline) catch |err| {
                 last_error = err;
                 continue;

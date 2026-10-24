@@ -44,6 +44,8 @@ pub const Mode = enum {
     servfail,
     silent,
     malformed,
+    many_addresses,
+    tcp_many_addresses,
     tcp_fragmented,
     tcp_oversize,
     tcp_partial,
@@ -221,7 +223,12 @@ pub const Server = struct {
                     for (0..@import("query_engine.zig").max_rejected_datagrams) |_| try sendDatagram(self.udp, packet.slice(), &peer, peer_len);
                     return;
                 },
-                .tcp_fragmented, .tcp_oversize, .tcp_partial, .tcp_slow => {
+                .many_addresses => {
+                    for (0..wire.max_cache_addrs + 1) |address_index| {
+                        try packet.address(question.name.slice(), 30, .{ .ipv4 = .{ 192, 0, 2, @intCast(address_index + 1) } });
+                    }
+                },
+                .tcp_fragmented, .tcp_many_addresses, .tcp_oversize, .tcp_partial, .tcp_slow => {
                     packet.flags(0x8380);
                     // A complete question followed by a genuinely partial RR.
                     std.mem.writeInt(u16, packet.bytes[6..8], 1, .big);
@@ -269,7 +276,11 @@ pub const Server = struct {
         var packet = try Packet.init(parsed.header.id, question.name.slice(), question.qtype);
         const padding: [600]u8 = @splat(0);
         try packet.record(.answer, question.name.slice(), 46, 30, &padding);
-        try positive(&packet, question, 7);
+        if (self.mode == .tcp_many_addresses) {
+            for (0..wire.max_cache_addrs + 1) |address_index| {
+                try packet.address(question.name.slice(), 30, .{ .ipv4 = .{ 192, 0, 2, @intCast(address_index + 1) } });
+            }
+        } else try positive(&packet, question, 7);
         std.mem.writeInt(u16, &prefix, @intCast(if (self.mode == .tcp_oversize) response.max_packet_len + 1 else packet.len), .big);
         if (self.mode == .tcp_oversize) {
             try connection.send(&prefix, deadline);
