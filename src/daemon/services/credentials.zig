@@ -43,16 +43,46 @@ pub const Context = struct {
         defer self.lock.unlockExclusive();
 
         const binds = self.certfp_binds.* orelse return error.InvalidFingerprint;
-        try binds.bind(account, fingerprint);
-        // Mirror the binding into the durable store, keyed by fingerprint, so it
-        // survives a restart. In-memory is authoritative for this session; the
-        // store is a best-effort durable mirror (a WAL hiccup must not fail the
-        // already-applied in-memory bind).
-        var kb: [certfp_key_max]u8 = undefined;
-        if (certfpKey(&kb, fingerprint)) |k| {
-            self.store.*.family(.props).put(k, account) catch {};
+        const key = accountKey(account) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidFingerprint,
+        };
+        var list_key_buf: [certfp_account_key_max]u8 = undefined;
+        const list_key = certfpAccountKey(&list_key_buf, key.asSlice()) orelse return error.InvalidFingerprint;
+        const existing = self.store.*.family(.props).get(list_key) orelse "";
+        var list_buf: [certfp_list_value_max]u8 = undefined;
+        if (existing.len + fingerprint.len + @intFromBool(existing.len != 0) > list_buf.len) return error.InvalidFingerprint;
+        @memcpy(list_buf[0..existing.len], existing);
+        var list_len = existing.len;
+        if (list_len != 0) {
+            list_buf[list_len] = '\n';
+            list_len += 1;
         }
-        self.addCertfpListEntry(account, fingerprint) catch {};
+        @memcpy(list_buf[list_len..][0..fingerprint.len], fingerprint);
+        list_len += fingerprint.len;
+        var kb: [certfp_key_max]u8 = undefined;
+        const fp_key = certfpKey(&kb, fingerprint) orelse return error.InvalidFingerprint;
+        var previous_owner_buf: [certfp_bind_mod.max_account_len]u8 = undefined;
+        const previous_owner = if (binds.accountForFingerprint(fingerprint)) |owner| blk: {
+            if (owner.len > previous_owner_buf.len) return error.InvalidFingerprint;
+            @memcpy(previous_owner_buf[0..owner.len], owner);
+            break :blk previous_owner_buf[0..owner.len];
+        } else null;
+        binds.bind(key.asSlice(), fingerprint) catch |err| return err;
+        errdefer if (previous_owner) |owner| {
+            binds.bind(owner, fingerprint) catch {};
+        } else {
+            _ = binds.unbind(fingerprint);
+        };
+        var prepared = self.store.*.prepareBatch(&.{
+            .{ .family = .props, .kind = .put, .key = fp_key, .value = key.asSlice() },
+            .{ .family = .props, .kind = .put, .key = list_key, .value = list_buf[0..list_len] },
+        }) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidFingerprint,
+        };
+        defer prepared.abort();
+        prepared.commit() catch return error.InvalidFingerprint;
         self.recordKeyTransparency(account, .certfp, .bind, fingerprint, fingerprint, 0);
     }
 
@@ -87,10 +117,35 @@ pub const Context = struct {
         const owner = try self.certfpOwnerUnlocked(fingerprint);
         if (!std.ascii.eqlIgnoreCase(owner, key.asSlice())) return error.Forbidden;
 
-        if (self.certfp_binds.*) |binds| _ = binds.unbind(fingerprint);
+        var list_key_buf: [certfp_account_key_max]u8 = undefined;
+        const list_key = certfpAccountKey(&list_key_buf, key.asSlice()) orelse return error.BufferTooSmall;
+        const existing = self.store.*.family(.props).get(list_key) orelse "";
+        var list_buf: [certfp_list_value_max]u8 = undefined;
+        var list_len: usize = 0;
+        var it = std.mem.splitScalar(u8, existing, '\n');
+        while (it.next()) |fp| {
+            if (fp.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(fp, fingerprint)) {
+                continue;
+            }
+            if (list_len != 0) {
+                if (list_len >= list_buf.len) return error.BufferTooSmall;
+                list_buf[list_len] = '\n';
+                list_len += 1;
+            }
+            if (list_len + fp.len > list_buf.len) return error.BufferTooSmall;
+            @memcpy(list_buf[list_len..][0..fp.len], fp);
+            list_len += fp.len;
+        }
         var fp_key_buf: [certfp_key_max]u8 = undefined;
-        if (certfpKey(&fp_key_buf, fingerprint)) |fp_key| self.store.*.family(.props).delete(fp_key) catch {};
-        try self.removeCertfpListEntry(key.asSlice(), fingerprint);
+        const fp_key = certfpKey(&fp_key_buf, fingerprint) orelse return error.BufferTooSmall;
+        var prepared = try self.store.*.prepareBatch(&.{
+            .{ .family = .props, .kind = .delete, .key = fp_key },
+            .{ .family = .props, .kind = if (list_len == 0) .delete else .put, .key = list_key, .value = if (list_len == 0) null else list_buf[0..list_len] },
+        });
+        defer prepared.abort();
+        try prepared.commit();
+        if (self.certfp_binds.*) |binds| _ = binds.unbind(fingerprint);
         self.recordKeyTransparency(key.asSlice(), .certfp, .delete, fingerprint, fingerprint, 0);
     }
 
@@ -330,16 +385,16 @@ pub const Context = struct {
             }
         }
 
-        // Remove from the list, then delete the record.
+        // Stage the index and credential-row changes as one durable transaction.
         var new_list_buf: [webauthn_creds.account_list_value_max]u8 = undefined;
         const new_list = (webauthn_creds.listRemove(list, target, &new_list_buf) catch return error.BufferTooSmall) orelse
             return error.NotFound;
-        if (new_list.len == 0) {
-            self.store.*.family(.props).delete(list_key) catch {};
-        } else {
-            try self.store.*.family(.props).put(list_key, new_list);
-        }
-        self.store.*.family(.props).delete(cred_key) catch {};
+        var prepared = try self.store.*.prepareBatch(&.{
+            .{ .family = .props, .kind = if (new_list.len == 0) .delete else .put, .key = list_key, .value = if (new_list.len == 0) null else new_list },
+            .{ .family = .props, .kind = .delete, .key = cred_key },
+        });
+        defer prepared.abort();
+        try prepared.commit();
         self.recordKeyTransparency(key.asSlice(), .webauthn, .delete, target, cose_key, 0);
     }
 

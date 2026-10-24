@@ -343,6 +343,7 @@ pub const Context = struct {
         try self.validateNewPassword(new_password);
         // A change must actually change the password.
         if (std.mem.eql(u8, old_password, new_password)) return error.InvalidPassword;
+        if (self.store.*.preparedWritesPoisoned()) return error.StorePoisoned;
 
         var salt: [salt_len]u8 = undefined;
         self.store.*.io.randomSecure(&salt) catch self.store.*.io.random(&salt);
@@ -352,14 +353,49 @@ pub const Context = struct {
         record.hash = hash;
 
         const encoded = try encodeAccount(record, scratch);
-        try self.store.*.family(.accounts).put(record.name.asSlice(), encoded);
-
-        // Re-derive the SCRAM credential so a SCRAM-SHA-256 login uses the new
-        // password; a mirror failure must not roll back the persisted change.
+        var token_key_buf: [session_token_account_key_max]u8 = undefined;
+        const token_key = sessionTokenAccountKey(&token_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        var scram_key_buf: [scram_key_max]u8 = undefined;
+        const scram_key = scramKey(&scram_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        var scram_value_buf: [ScramStore.serialized_max]u8 = undefined;
+        defer secureZero(&scram_value_buf);
+        var scram_value: ?[]const u8 = null;
+        var prepared_import: ?ScramStore.PreparedImport = null;
+        defer if (prepared_import) |*prepared| prepared.abort();
         if (self.scram.*) |scram| {
-            scram.deriveAndStore(record.name.asSlice(), new_password) catch return error.InvalidRecord;
-            self.persistScram(scram, record.name.asSlice());
+            var keys256 = sasl.deriveScramKeys(new_password, &salt, scram_store_mod.default_iterations) catch return error.InvalidRecord;
+            defer keys256.wipe();
+            var keys512 = sasl_scram512.deriveScramKeys(new_password, &salt, scram_store_mod.default_iterations) catch return error.InvalidRecord;
+            defer keys512.wipe();
+            var full = ScramStore.FullRecord{
+                .salt = &salt,
+                .iterations = scram_store_mod.default_iterations,
+                .stored_key = keys256.stored_key,
+                .server_key = keys256.server_key,
+                .has_512 = true,
+                .stored_key_512 = keys512.stored_key,
+                .server_key_512 = keys512.server_key,
+            };
+            defer {
+                secureZero(&full.stored_key);
+                secureZero(&full.server_key);
+                secureZero(&full.stored_key_512);
+                secureZero(&full.server_key_512);
+            }
+            scram_value = ScramStore.serializeFullRecord(full, &scram_value_buf) orelse return error.InvalidRecord;
+            prepared_import = scram.prepareImportFullRecord(record.name.asSlice(), full) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidRecord,
+            };
         }
+        var prepared = try self.store.*.prepareBatch(&.{
+            .{ .family = .accounts, .kind = .put, .key = record.name.asSlice(), .value = encoded },
+            .{ .family = .props, .kind = if (scram_value == null) .delete else .put, .key = scram_key, .value = scram_value },
+            .{ .family = .props, .kind = .delete, .key = token_key },
+        });
+        defer prepared.abort();
+        try prepared.commit();
+        if (prepared_import) |*candidate| candidate.commit();
     }
 
     /// Set an account's password WITHOUT verifying the current one — for an
