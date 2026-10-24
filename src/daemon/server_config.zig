@@ -641,6 +641,9 @@ pub const Config = struct {
     s2s_config: s2s_link.PeerConfig = .{},
     mesh_realm: []const u8 = "local",
     mesh_pass: []const u8 = "",
+    /// `[mesh].presence_store_path`: private durable issuer/presence WAL. Empty
+    /// disables ordinary-guest mesh authority; active meshes fail startup.
+    mesh_presence_store_path: []const u8 = "",
     /// Encoded `[mesh].admission_token` text (hex or base64). Decoded once at
     /// server init into `LinuxServer.mesh_admission_token`.
     mesh_admission_token: []const u8 = "",
