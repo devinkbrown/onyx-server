@@ -189,6 +189,57 @@ pub const ScramRecord = struct {
     server_key: [Sha256.digest_len]u8,
 };
 
+/// Internal identity for the exact SCRAM verifier used by one in-flight
+/// exchange. This is never sent on the wire; the live account service compares
+/// it with the durable verifier immediately before binding the SASL session.
+pub const ScramCredentialAlgorithm = enum(u8) {
+    sha256 = 1,
+    sha512 = 2,
+};
+
+pub const ScramCredentialFingerprint = struct {
+    algorithm: ScramCredentialAlgorithm,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
+/// Short alias for services APIs that validate an in-flight SCRAM proof.
+pub const CredentialFingerprint = ScramCredentialFingerprint;
+
+/// Domain-separated, unambiguous fingerprint of a SCRAM verifier tuple.
+/// Lengths and integer fields use little-endian encoding so the result is
+/// stable across platforms and can be recomputed from the durable account row.
+pub fn fingerprintScramCredential(
+    algorithm: ScramCredentialAlgorithm,
+    salt: []const u8,
+    iterations: u32,
+    stored_key: []const u8,
+    server_key: []const u8,
+) ?ScramCredentialFingerprint {
+    if (salt.len > std.math.maxInt(u16) or stored_key.len > std.math.maxInt(u16) or server_key.len > std.math.maxInt(u16)) return null;
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("onyx/sasl-scram-credential/v1");
+    hasher.update(&.{@backingInt(algorithm)});
+    updateFingerprintLength(&hasher, salt.len);
+    hasher.update(salt);
+    var encoded_iterations: [4]u8 = undefined;
+    for (&encoded_iterations, 0..) |*byte, index| byte.* = @truncate(iterations >> @as(u5, @intCast(index * 8)));
+    hasher.update(&encoded_iterations);
+    updateFingerprintLength(&hasher, stored_key.len);
+    hasher.update(stored_key);
+    updateFingerprintLength(&hasher, server_key.len);
+    hasher.update(server_key);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .algorithm = algorithm, .digest = digest };
+}
+
+fn updateFingerprintLength(hasher: *std.crypto.hash.sha2.Sha256, len: usize) void {
+    const value: u16 = @intCast(len);
+    hasher.update(&.{ @truncate(value), @truncate(value >> 8) });
+}
+
 pub const ScramLookup = struct {
     ptr: *anyopaque,
     lookupFn: *const fn (ptr: *anyopaque, username: []const u8) ?ScramRecord,
@@ -792,6 +843,31 @@ test "SCRAM-SHA-256 full handshake accepts correct proof and rejects wrong proof
     );
     const rejected = try d.receive(bad_final, &decode_buf, &out);
     try std.testing.expectEqual(Numeric.ERR_SASLFAIL, rejected.failure);
+}
+
+test "SCRAM credential fingerprint binds the full verifier tuple and algorithm" {
+    const stored256: [32]u8 = @splat(0x11);
+    const server256: [32]u8 = @splat(0x22);
+    const stored512: [64]u8 = @splat(0x33);
+    const server512: [64]u8 = @splat(0x44);
+    const base = fingerprintScramCredential(.sha256, "salt", 4096, &stored256, &server256) orelse return error.TestUnexpectedResult;
+    const duplicate = fingerprintScramCredential(.sha256, "salt", 4096, &stored256, &server256) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(base.algorithm, duplicate.algorithm);
+    try std.testing.expect(std.crypto.timing_safe.eql([32]u8, base.digest, duplicate.digest));
+
+    const changed_salt = fingerprintScramCredential(.sha256, "salt2", 4096, &stored256, &server256).?;
+    const changed_iterations = fingerprintScramCredential(.sha256, "salt", 4097, &stored256, &server256).?;
+    const changed_stored_key = fingerprintScramCredential(.sha256, "salt", 4096, stored512[0..32], &server256).?;
+    const changed_server_key = fingerprintScramCredential(.sha256, "salt", 4096, &stored256, server512[0..32]).?;
+    const changed_algorithm = fingerprintScramCredential(.sha512, "salt", 4096, &stored512, &server512).?;
+    const changed_fingerprints = [_]ScramCredentialFingerprint{ changed_salt, changed_iterations, changed_stored_key, changed_server_key, changed_algorithm };
+    for (changed_fingerprints) |changed| {
+        try std.testing.expect(!std.crypto.timing_safe.eql([32]u8, base.digest, changed.digest));
+    }
+    const oversized_salt = try std.testing.allocator.alloc(u8, @as(usize, std.math.maxInt(u16)) + 1);
+    defer std.testing.allocator.free(oversized_salt);
+    @memset(oversized_salt, 0);
+    try std.testing.expect(fingerprintScramCredential(.sha256, oversized_salt, 1, &stored256, &server256) == null);
 }
 
 fn makeClientFinal(
