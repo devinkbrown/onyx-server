@@ -1510,7 +1510,7 @@ pub const Services = struct {
     }
 
     fn accountsView(self: *const Services) accounts_domain.Context {
-        return .{ .store = &self.store, .lock = @constCast(&self.lock), .cfg = &self.cfg, .scram = &self.scram, .clock_override_ms = &self.clock_override_ms };
+        return .{ .store = &self.store, .lock = @constCast(&self.lock), .cfg = &self.cfg, .scram = &self.scram, .certfp_binds = &self.certfp_binds, .clock_override_ms = &self.clock_override_ms };
     }
 
     fn channel_propsView(self: *const Services) channel_props_domain.Context {
