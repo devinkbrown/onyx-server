@@ -65,6 +65,11 @@ const decodeVerify = @import("records.zig").decodeVerify;
 const tokenMatches = @import("records.zig").tokenMatches;
 const clock_domain = @import("clock.zig");
 const persistence_domain = @import("persistence.zig");
+const certfp_bind_mod = @import("../certfp_bind.zig");
+const webauthn_creds = @import("../webauthn_creds.zig");
+const contracts = @import("contracts.zig");
+const store_mod = @import("../store.zig");
+const max_batch_mutations = @import("../store/contracts.zig").max_batch_mutations;
 
 /// Borrowed addresses into one Services owner; this view owns no state.
 /// Operations retain their original lock and durable publication boundaries.
@@ -73,6 +78,7 @@ pub const Context = struct {
     lock: *rwlock.RwLock,
     cfg: *const Config,
     scram: *const ?*ScramStore,
+    certfp_binds: *const ?*certfp_bind_mod.CertfpBindStore,
     clock_override_ms: *const std.atomic.Value(u64),
 
     /// False when the account has refused password-derived mechanisms.
@@ -312,13 +318,73 @@ pub const Context = struct {
         const record = try self.loadAccount(name);
         try verifyPassword(record, password, self.cfg.pbkdf2_rounds);
         if ((record.flags & account_flag_passkey_only) != 0) return error.AuthFailed;
+        if (self.store.*.preparedWritesPoisoned()) return error.StorePoisoned;
+        if (self.certfp_binds.*) |binds| {
+            const bind_count = binds.accountBindingCount(record.name.asSlice(), 4096) orelse return error.TableWorkExceeded;
+            if (bind_count > 16) return error.TableWorkExceeded;
+        }
+
+        var mutations: [max_batch_mutations]store_mod.BatchMutation = undefined;
+        var mutation_count: usize = 0;
+        try appendDropDelete(&mutations, &mutation_count, .accounts, record.name.asSlice());
+
         var audit_key_buf: [login_audit_key_max]u8 = undefined;
         if (loginAuditKey(&audit_key_buf, record.name.asSlice())) |audit_key| {
-            if (self.store.*.family(.props).get(audit_key) != null) {
-                try self.store.*.family(.props).delete(audit_key);
+            if (self.store.*.family(.props).get(audit_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, audit_key);
+        }
+        var verify_key_buf: [verify_key_max]u8 = undefined;
+        if (verifyKey(&verify_key_buf, record.name.asSlice())) |verify_key| {
+            if (self.store.*.family(.props).get(verify_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, verify_key);
+        }
+        var scram_key_buf: [scram_key_max]u8 = undefined;
+        const scram_key = scramKey(&scram_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        if (self.store.*.family(.props).get(scram_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, scram_key);
+        var totp_key_buf: [contracts.totp_key_max]u8 = undefined;
+        const totp_key = @import("mfa.zig").Context.totpKey(&totp_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        if (self.store.*.family(.props).get(totp_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, totp_key);
+        var recovery_key_buf: [contracts.rcd_key_max]u8 = undefined;
+        const recovery_key = std.fmt.bufPrint(&recovery_key_buf, "{s}{s}", .{ contracts.rcd_prefix, record.name.asSlice() }) catch return error.BufferTooSmall;
+        if (self.store.*.family(.props).get(recovery_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, recovery_key);
+
+        var token_index_buf: [session_token_account_key_max]u8 = undefined;
+        const token_index = sessionTokenAccountKey(&token_index_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        if (self.store.*.family(.props).get(token_index) != null) try appendDropDelete(&mutations, &mutation_count, .props, token_index);
+
+        var certfp_list_key_buf: [@import("records.zig").certfp_account_key_max]u8 = undefined;
+        const certfp_list_key = @import("records.zig").certfpAccountKey(&certfp_list_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        if (self.store.*.family(.props).get(certfp_list_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, certfp_list_key);
+
+        var webauthn_list_key_buf: [webauthn_creds.account_list_key_max]u8 = undefined;
+        const webauthn_list_key = webauthn_creds.accountListKey(&webauthn_list_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
+        if (self.store.*.family(.props).get(webauthn_list_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, webauthn_list_key);
+
+        // Account-scoped indexes can be missing after older best-effort writes.
+        // Scan the bounded in-memory props map for credential rows whose own
+        // value names this account, so re-registration cannot inherit them.
+        const props = &self.store.*.maps[@backingInt(store_mod.Family.props)].map;
+        var props_it = props.iterator();
+        var scanned: usize = 0;
+        while (props_it.next()) |entry| {
+            scanned += 1;
+            if (scanned > 4096) return error.TableWorkExceeded;
+            const row_key = entry.key_ptr.*;
+            const row_value = entry.value_ptr.*;
+            if (std.mem.startsWith(u8, row_key, "certfp:")) {
+                if (std.ascii.eqlIgnoreCase(row_value, record.name.asSlice())) try appendDropDelete(&mutations, &mutation_count, .props, row_key);
+            } else if (std.mem.startsWith(u8, row_key, "webauthn:")) {
+                const credential = webauthn_creds.decodeRecord(row_value) catch continue;
+                if (std.ascii.eqlIgnoreCase(credential.account, record.name.asSlice())) try appendDropDelete(&mutations, &mutation_count, .props, row_key);
+            } else if (std.mem.startsWith(u8, row_key, "sessiontok:")) {
+                const token = @import("records.zig").decodeSessionTokenRecord(row_value) catch continue;
+                if (std.ascii.eqlIgnoreCase(token.account.asSlice(), record.name.asSlice())) try appendDropDelete(&mutations, &mutation_count, .props, row_key);
             }
         }
-        try self.store.*.family(.accounts).delete(record.name.asSlice());
+
+        var prepared = try self.store.*.prepareBatch(mutations[0..mutation_count]);
+        defer prepared.abort();
+        try prepared.commit();
+        if (self.certfp_binds.*) |binds| _ = binds.unbindAccount(record.name.asSlice());
+        if (self.scram.*) |scram| _ = scram.remove(record.name.asSlice());
         return .{ .dropped_account = .{ .name = record.name } };
     }
 
@@ -687,3 +753,14 @@ pub const Context = struct {
         return (clock_domain.Context{ .store = self.store, .clock_override_ms = self.clock_override_ms }).servicesNowMs();
     }
 };
+
+fn appendDropDelete(
+    mutations: *[max_batch_mutations]store_mod.BatchMutation,
+    count: *usize,
+    family: store_mod.Family,
+    key: []const u8,
+) ServiceError!void {
+    if (count.* >= mutations.len) return error.TableWorkExceeded;
+    mutations[count.*] = .{ .family = family, .kind = .delete, .key = key };
+    count.* += 1;
+}

@@ -373,6 +373,94 @@ test "ordinary password change keeps PLAIN SCRAM and tokens atomic across alloca
     } else return error.FailureSweepDidNotComplete;
 }
 
+test "DROP atomically revokes credentials before same-name re-registration" {
+    const fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const cose = [_]u8{ 0xa5, 0x01, 0x02, 0x03 };
+    var failed: usize = 0;
+    var failure_index: usize = 0;
+    while (failure_index < 128) : (failure_index += 1) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        var store = try OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "drop-credentials.wal");
+        defer store.deinit();
+        var scram = ScramStore.init(std.testing.allocator);
+        defer scram.deinit();
+        var binds = @import("../certfp_bind.zig").CertfpBindStore.init(std.testing.allocator);
+        defer binds.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        services.attachScramStore(&scram);
+        services.attachCertfpBinds(&binds);
+        var scratch: [record_max]u8 = undefined;
+        _ = try services.registerAccount("alice", auth_atomic_old_password, &scratch);
+        try scram.storeWithSalt("alice", auth_atomic_old_password, "old-scram-salt16", 1);
+        Internal.persistScram(&services, &scram, "alice");
+        try services.bindCertfp("alice", fingerprint);
+        try services.webauthnBind("alice", "credDROP", &cose, 1, "old", 1);
+        // Model rows left by older best-effort index writes: the direct
+        // credentials still name alice, while both account indexes are absent.
+        var certfp_list_key_buf: [@import("records.zig").certfp_account_key_max]u8 = undefined;
+        try store.family(.props).delete(@import("records.zig").certfpAccountKey(&certfp_list_key_buf, "alice").?);
+        var webauthn_list_key_buf: [@import("../webauthn_creds.zig").account_list_key_max]u8 = undefined;
+        try store.family(.props).delete(@import("../webauthn_creds.zig").accountListKey(&webauthn_list_key_buf, "alice").?);
+        const old_token = try services.issueSessionToken("alice", 1000);
+        failing.fail_index = failing.alloc_index + failure_index;
+
+        const dropped = services.dropAccount("alice", auth_atomic_old_password) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            failing.fail_index = std.math.maxInt(usize);
+            _ = try services.identifyAccount("alice", auth_atomic_old_password);
+            try std.testing.expectEqualStrings("alice", services.accountForCertfp(fingerprint).?);
+            var credential: Services.WebauthnCredential = .{};
+            try services.webauthnLookup("credDROP", &credential);
+            try std.testing.expect(scram.resolve("alice") != null);
+            var token_account: [account_max]u8 = undefined;
+            try std.testing.expect(services.validateSessionToken("alice", old_token.tokenSlice(), 1002, &token_account) != null);
+
+            _ = try services.dropAccount("alice", auth_atomic_old_password);
+            try std.testing.expect(services.accountForCertfp(fingerprint) == null);
+            try std.testing.expect(scram.resolve("alice") == null);
+            try std.testing.expectError(error.NotFound, services.webauthnLookup("credDROP", &credential));
+            try std.testing.expect(services.validateSessionToken("alice", old_token.tokenSlice(), 1002, &token_account) == null);
+            _ = try services.registerAccount("alice", auth_atomic_new_password, &scratch);
+            try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", auth_atomic_old_password));
+            _ = try services.identifyAccount("alice", auth_atomic_new_password);
+            {
+                var reopened = try openTestStore(tmp, "drop-credentials.wal");
+                defer reopened.deinit();
+                var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+                var cold_scram = ScramStore.init(std.testing.allocator);
+                defer cold_scram.deinit();
+                cold_scram.setLoader(cold.scramLoader());
+                cold.attachScramStore(&cold_scram);
+                var token_out: [account_max]u8 = undefined;
+                try std.testing.expect(cold.validateSessionToken("alice", old_token.tokenSlice(), 1002, &token_out) == null);
+                try std.testing.expect(cold_scram.resolve("alice") == null);
+                try std.testing.expectError(error.NotFound, cold.webauthnLookup("credDROP", &credential));
+                _ = try cold.identifyAccount("alice", auth_atomic_new_password);
+            }
+            failed += 1;
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqualStrings("alice", dropped.dropped_account.name.asSlice());
+        try std.testing.expect(services.accountForCertfp(fingerprint) == null);
+        try std.testing.expect(scram.resolve("alice") == null);
+        var credential: Services.WebauthnCredential = .{};
+        try std.testing.expectError(error.NotFound, services.webauthnLookup("credDROP", &credential));
+        var token_account: [account_max]u8 = undefined;
+        try std.testing.expect(services.validateSessionToken("alice", old_token.tokenSlice(), 1002, &token_account) == null);
+        _ = try services.registerAccount("alice", auth_atomic_new_password, &scratch);
+        try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", auth_atomic_old_password));
+        _ = try services.identifyAccount("alice", auth_atomic_new_password);
+        try std.testing.expect(failed > 0);
+        std.debug.print("DROP credential atomicity: {d} induced allocation failures, retries, and cold re-registration\n", .{failed});
+        break;
+    } else return error.FailureSweepDidNotComplete;
+}
+
 test "TOTP Services forced reset ambiguity preserves live SCRAM and replays one complete credential policy" {
     const cases = [_]struct { fault: store_mod.PreparedIoFault, committed: bool }{
         .{ .fault = .{ .write = .failed }, .committed = false },

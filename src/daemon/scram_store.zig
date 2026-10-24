@@ -629,6 +629,24 @@ pub const ScramStore = struct {
         };
     }
 
+    /// Remove an account's cached SCRAM material after its durable credential
+    /// transaction commits. The account must be canonicalized by the caller.
+    pub fn remove(self: *ScramStore, account: []const u8) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const entry = self.entries.fetchRemove(account) orelse return false;
+        var value = entry.value;
+        self.allocator.free(entry.key);
+        secureZero(value.salt);
+        self.allocator.free(value.salt);
+        secureZero(&value.stored_key);
+        secureZero(&value.server_key);
+        secureZero(&value.stored_key_512);
+        secureZero(&value.server_key_512);
+        return true;
+    }
+
     /// Adapter exposing this store as the mechrouter's SCRAM-SHA-256 credential
     /// source. The returned fat pointer borrows `self`, so the `ScramStore` must
     /// outlive every connection that copies it (own it alongside the `Server`).

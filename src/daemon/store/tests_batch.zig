@@ -20,6 +20,7 @@ const readWalForTest = @import("tests_support.zig").readWalForTest;
 const refreshRecordChecksum = @import("tests_support.zig").refreshRecordChecksum;
 const rewriteTestFile = @import("tests_support.zig").rewriteTestFile;
 const readU32 = @import("wal.zig").readU32;
+const max_batch_mutations = @import("contracts.zig").max_batch_mutations;
 
 pub const test_policy_batch = [_]BatchMutation{
     .{ .family = .props, .kind = .put, .key = "tot\x00alice", .value = "NEWSECRET" },
@@ -97,6 +98,91 @@ test "STORE batch reserves OOM atomically and retries every allocation" {
     }
     try std.testing.expect(failures > 0);
     try std.testing.expectEqual(@as(usize, 1), successes);
+}
+
+test "STORE maximum credential revocation batch survives commit and cold replay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var mutations: [max_batch_mutations]BatchMutation = undefined;
+    var key_bufs: [max_batch_mutations][32]u8 = undefined;
+    for (&mutations, 0..) |*mutation, i| {
+        const key = try std.fmt.bufPrint(&key_bufs[i], "credential-row-{d}", .{i});
+        mutation.* = .{
+            .family = .props,
+            .kind = .put,
+            .key = key,
+            .value = "present",
+        };
+    }
+    {
+        var store = try openTestStore(tmp, "batch-max.wal");
+        defer store.deinit();
+        var prepared = try store.prepareBatch(&mutations);
+        defer prepared.abort();
+        try prepared.commit();
+        for (mutations) |mutation| try std.testing.expectEqualStrings("present", store.get(.props, mutation.key).?);
+    }
+    var reopened = try openTestStore(tmp, "batch-max.wal");
+    defer reopened.deinit();
+    for (mutations) |mutation| try std.testing.expectEqualStrings("present", reopened.get(.props, mutation.key).?);
+    var too_many: [max_batch_mutations + 1]BatchMutation = undefined;
+    @memcpy(too_many[0..max_batch_mutations], &mutations);
+    too_many[max_batch_mutations] = .{ .family = .props, .kind = .put, .key = "overflow", .value = "x" };
+    try std.testing.expectError(error.BadRecord, reopened.prepareBatch(&too_many));
+}
+
+fn maxBatchFailureAt(fail_offset: usize) !bool {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var store = try OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "batch-max-oom.wal");
+    defer store.deinit();
+    var mutations: [max_batch_mutations]BatchMutation = undefined;
+    var key_bufs: [max_batch_mutations][32]u8 = undefined;
+    for (&mutations, 0..) |*mutation, i| {
+        const key = try std.fmt.bufPrint(&key_bufs[i], "credential-row-{d}", .{i});
+        mutation.* = .{ .family = .props, .kind = .put, .key = key, .value = "present" };
+    }
+    const before = try readWalForTest(tmp, "batch-max-oom.wal");
+    defer std.testing.allocator.free(before);
+    const seq_before = store.next_seq;
+    const offset_before = store.wal_offset;
+    failing.fail_index = failing.alloc_index + fail_offset;
+    var prepared = store.prepareBatch(&mutations) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expect(failing.has_induced_failure);
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqual(seq_before, store.next_seq);
+        try std.testing.expectEqual(offset_before, store.wal_offset);
+        const after = try readWalForTest(tmp, "batch-max-oom.wal");
+        defer std.testing.allocator.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+        for (mutations) |mutation| try std.testing.expect(store.get(.props, mutation.key) == null);
+        var retry = try store.prepareBatch(&mutations);
+        defer retry.abort();
+        try retry.commit();
+        return false;
+    };
+    failing.fail_index = std.math.maxInt(usize);
+    defer prepared.abort();
+    try std.testing.expect(!failing.has_induced_failure);
+    try prepared.commit();
+    for (mutations) |mutation| try std.testing.expectEqualStrings("present", store.get(.props, mutation.key).?);
+    var reopened = try openTestStore(tmp, "batch-max-oom.wal");
+    defer reopened.deinit();
+    for (mutations) |mutation| try std.testing.expectEqualStrings("present", reopened.get(.props, mutation.key).?);
+    return true;
+}
+
+test "STORE maximum credential revocation batch allocation failures retry atomically" {
+    var failures: usize = 0;
+    for (0..512) |fail_offset| {
+        if (try maxBatchFailureAt(fail_offset)) {
+            try std.testing.expect(failures > 0);
+            break;
+        }
+        failures += 1;
+    } else return error.FailureSweepDidNotComplete;
 }
 
 test "STORE batch write ambiguity publishes nothing and reopen resolves the whole group" {
