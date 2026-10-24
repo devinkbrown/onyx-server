@@ -10,6 +10,7 @@ const WebauthnCredential = @import("contracts.zig").WebauthnCredential;
 const certfp_bind_mod = @import("../certfp_bind.zig");
 const webauthn_creds = @import("../webauthn_creds.zig");
 const WebauthnListEntry = @import("contracts.zig").WebauthnListEntry;
+const records = @import("records.zig");
 
 test "certfp binding persists across store reopen" {
     var tmp = std.testing.tmpDir(.{});
@@ -69,6 +70,74 @@ test "certfp list and delete enforce account ownership" {
     try std.testing.expect(services.accountForCertfp(fp_alice) == null);
 }
 
+test "CERTDEL allocation failure preserves durable and RAM authority, then retries" {
+    const fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var failed: usize = 0;
+    var failure_index: usize = 0;
+    while (failure_index < 64) : (failure_index += 1) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        var store = try @import("records.zig").OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "certdel-oom.wal");
+        defer store.deinit();
+        var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+        defer binds.deinit();
+        var services = Services.init(&store, null);
+        services.attachCertfpBinds(&binds);
+        try services.bindCertfp("alice", fp);
+        failing.fail_index = failing.alloc_index + failure_index;
+
+        services.deleteCertfp("alice", fp) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
+            var listed_buf: [2][]const u8 = undefined;
+            const listed = try services.listCertfps("alice", &listed_buf);
+            try std.testing.expectEqual(@as(usize, 1), listed.len);
+            try services.deleteCertfp("alice", fp);
+            try std.testing.expect(services.accountForCertfp(fp) == null);
+            {
+                var reopened = try openTestStore(tmp, "certdel-oom.wal");
+                defer reopened.deinit();
+                var cold = Services.init(&reopened, null);
+                try std.testing.expect(cold.accountForCertfp(fp) == null);
+                var cold_list: [2][]const u8 = undefined;
+                try std.testing.expectEqual(@as(usize, 0), (try cold.listCertfps("alice", &cold_list)).len);
+            }
+            failed += 1;
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expect(services.accountForCertfp(fp) == null);
+        try std.testing.expect(failed > 0);
+        std.debug.print("CERTDEL atomic: {d} induced allocation failures, retries, and cold reopen\n", .{failed});
+        break;
+    } else return error.FailureSweepDidNotComplete;
+}
+
+test "CERTDEL revokes an authoritative fingerprint even when its list row is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var store = try openTestStore(tmp, "certdel-missing-list.wal");
+    defer store.deinit();
+    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    var services = Services.init(&store, null);
+    services.attachCertfpBinds(&binds);
+    var fp_key_buf: [records.certfp_key_max]u8 = undefined;
+    try store.family(.props).put(records.certfpKey(&fp_key_buf, fp).?, "alice");
+    try binds.bind("alice", fp);
+    try services.deleteCertfp("alice", fp);
+    try std.testing.expect(services.accountForCertfp(fp) == null);
+    var reopened = try openTestStore(tmp, "certdel-missing-list.wal");
+    defer reopened.deinit();
+    var cold = Services.init(&reopened, null);
+    try std.testing.expect(cold.accountForCertfp(fp) == null);
+}
+
 test "webauthn bind/lookup/list/delete round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -113,6 +182,51 @@ test "webauthn bind/lookup/list/delete round-trip" {
     try std.testing.expectError(error.NotFound, services.webauthnLookup("credAAA", &cred));
     const empty = try services.webauthnList("alice", entries[0..]);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "WebAuthn delete allocation failure preserves list and credential row, then retries" {
+    var failed: usize = 0;
+    var failure_index: usize = 0;
+    while (failure_index < 64) : (failure_index += 1) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        var store = try @import("records.zig").OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "webauthn-delete-oom.wal");
+        defer store.deinit();
+        var services = Services.init(&store, null);
+        const cose = [_]u8{ 0xa5, 0x01, 0x02, 0x03 };
+        try services.webauthnBind("alice", "credOOM", &cose, 1, "key", 1);
+        failing.fail_index = failing.alloc_index + failure_index;
+
+        services.webauthnDelete("alice", "credOOM") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            failing.fail_index = std.math.maxInt(usize);
+            var cred: Services.WebauthnCredential = .{};
+            try services.webauthnLookup("credOOM", &cred);
+            var listed: [2]Services.WebauthnListEntry = undefined;
+            try std.testing.expectEqual(@as(usize, 1), (try services.webauthnList("alice", &listed)).len);
+            try services.webauthnDelete("alice", "credOOM");
+            try std.testing.expectError(error.NotFound, services.webauthnLookup("credOOM", &cred));
+            {
+                var reopened = try openTestStore(tmp, "webauthn-delete-oom.wal");
+                defer reopened.deinit();
+                var cold = Services.init(&reopened, null);
+                try std.testing.expectError(error.NotFound, cold.webauthnLookup("credOOM", &cred));
+                var cold_list: [2]Services.WebauthnListEntry = undefined;
+                try std.testing.expectEqual(@as(usize, 0), (try cold.webauthnList("alice", &cold_list)).len);
+            }
+            failed += 1;
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expect(!failing.has_induced_failure);
+        var cred: Services.WebauthnCredential = .{};
+        try std.testing.expectError(error.NotFound, services.webauthnLookup("credOOM", &cred));
+        try std.testing.expect(failed > 0);
+        std.debug.print("WebAuthn delete atomic: {d} induced allocation failures, retries, and cold reopen\n", .{failed});
+        break;
+    } else return error.FailureSweepDidNotComplete;
 }
 
 test "webauthn rename relabels, preserves fields, and enforces ownership" {

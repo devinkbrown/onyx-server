@@ -311,6 +311,68 @@ test "TOTP Services forced reset reserves SCRAM cache before durable mutation an
     }
 }
 
+test "ordinary password change keeps PLAIN SCRAM and tokens atomic across allocation failure" {
+    var failed: usize = 0;
+    var failure_index: usize = 0;
+    while (failure_index < 128) : (failure_index += 1) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        var store = try OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "password-change-oom.wal");
+        defer store.deinit();
+        var scram = ScramStore.init(std.testing.allocator);
+        defer scram.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        services.attachScramStore(&scram);
+        var scratch: [record_max]u8 = undefined;
+        _ = try services.registerAccount("alice", auth_atomic_old_password, &scratch);
+        try scram.storeWithSalt("alice", auth_atomic_old_password, "old-scram-salt16", 1);
+        Internal.persistScram(&services, &scram, "alice");
+        const old_token = try services.issueSessionToken("alice", 1000);
+        const old_scram = scram.lookup("alice").?;
+        const before = try tmp.dir.readFileAlloc(std.testing.io, "password-change-oom.wal", std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(before);
+        failing.fail_index = failing.alloc_index + failure_index;
+
+        services.changeAccountPassword("alice", auth_atomic_old_password, auth_atomic_new_password, &scratch) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            failing.fail_index = std.math.maxInt(usize);
+            _ = try services.identifyAccount("alice", auth_atomic_old_password);
+            try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", auth_atomic_new_password));
+            try std.testing.expectEqualSlices(u8, &old_scram.stored_key, &scram.lookup("alice").?.stored_key);
+            var token_account: [account_max]u8 = undefined;
+            try std.testing.expect(services.validateSessionToken("alice", old_token.tokenSlice(), 1002, &token_account) != null);
+            const after = try tmp.dir.readFileAlloc(std.testing.io, "password-change-oom.wal", std.testing.allocator, .unlimited);
+            defer std.testing.allocator.free(after);
+            try std.testing.expectEqualSlices(u8, before, after);
+            try services.changeAccountPassword("alice", auth_atomic_old_password, auth_atomic_new_password, &scratch);
+            _ = try services.identifyAccount("alice", auth_atomic_new_password);
+            try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", auth_atomic_old_password));
+            try std.testing.expect(services.validateSessionToken("alice", old_token.tokenSlice(), 1002, &token_account) == null);
+            {
+                var reopened = try openTestStore(tmp, "password-change-oom.wal");
+                defer reopened.deinit();
+                var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+                var cold_scram = ScramStore.init(std.testing.allocator);
+                defer cold_scram.deinit();
+                cold_scram.setLoader(cold.scramLoader());
+                cold.attachScramStore(&cold_scram);
+                _ = try cold.identifyAccount("alice", auth_atomic_new_password);
+                try std.testing.expectError(error.AuthFailed, cold.identifyAccount("alice", auth_atomic_old_password));
+                try std.testing.expect(cold.validateSessionToken("alice", old_token.tokenSlice(), 1002, &token_account) == null);
+            }
+            failed += 1;
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expect(failed > 0);
+        std.debug.print("ordinary password change atomic: {d} induced allocation failures, retries, and cold reopen\n", .{failed});
+        break;
+    } else return error.FailureSweepDidNotComplete;
+}
+
 test "TOTP Services forced reset ambiguity preserves live SCRAM and replays one complete credential policy" {
     const cases = [_]struct { fault: store_mod.PreparedIoFault, committed: bool }{
         .{ .fault = .{ .write = .failed }, .committed = false },
