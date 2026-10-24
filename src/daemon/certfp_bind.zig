@@ -65,24 +65,64 @@ pub const CertfpBindStore = struct {
     /// Bind `fingerprint` to `account`. Re-binding the same fingerprint replaces
     /// the owner (the most recent CERTADD wins). One account may own many certs.
     pub fn bind(self: *CertfpBindStore, account: []const u8, fingerprint: []const u8) CertfpBindError!void {
+        var prepared = try self.prepareBind(account, fingerprint);
+        defer prepared.abort();
+        prepared.commit();
+    }
+
+    /// Reserve all owner/key memory and map capacity while holding the binding
+    /// lock. The returned value must be committed after durable publication or
+    /// aborted on every failure path; both operations are allocation-free.
+    pub fn prepareBind(self: *CertfpBindStore, account: []const u8, fingerprint: []const u8) CertfpBindError!PreparedBind {
         self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        errdefer self.lock.unlockExclusive();
 
         certfp.validateFingerprint(fingerprint) catch return error.InvalidFingerprint;
         if (account.len == 0 or account.len > max_account_len) return error.AccountTooLong;
 
-        if (self.entries.getPtr(fingerprint)) |slot| {
-            const new_acct = try self.allocator.dupe(u8, account);
-            self.allocator.free(slot.*);
-            slot.* = new_acct;
-            return;
-        }
-        const key = try self.allocator.dupe(u8, fingerprint);
-        errdefer self.allocator.free(key);
-        const val = try self.allocator.dupe(u8, account);
-        errdefer self.allocator.free(val);
-        try self.entries.put(self.allocator, key, val);
+        const existing = self.entries.contains(fingerprint);
+        const key = if (existing) null else try self.allocator.dupe(u8, fingerprint);
+        errdefer if (key) |owned| self.allocator.free(owned);
+        const owned_account = try self.allocator.dupe(u8, account);
+        errdefer self.allocator.free(owned_account);
+        if (!existing) try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        return .{ .store = self, .fingerprint = fingerprint, .key = key, .account = owned_account };
     }
+
+    pub const PreparedBind = struct {
+        store: *CertfpBindStore,
+        fingerprint: []const u8,
+        key: ?[]u8,
+        account: ?[]u8,
+        active: bool = true,
+
+        pub fn commit(self: *PreparedBind) void {
+            if (!self.active) return;
+            if (self.store.entries.getPtr(self.fingerprint)) |slot| {
+                self.store.allocator.free(slot.*);
+                slot.* = self.account.?;
+                self.account = null;
+                if (self.key) |key| self.store.allocator.free(key);
+                self.key = null;
+            } else {
+                self.store.entries.putAssumeCapacityNoClobber(self.key.?, self.account.?);
+                self.key = null;
+                self.account = null;
+            }
+            self.active = false;
+            self.store.lock.unlockExclusive();
+        }
+
+        pub fn abort(self: *PreparedBind) void {
+            if (!self.active) return;
+            if (self.key) |key| self.store.allocator.free(key);
+            if (self.account) |account| self.store.allocator.free(account);
+            self.key = null;
+            self.account = null;
+            self.active = false;
+            self.store.lock.unlockExclusive();
+        }
+    };
 
     /// The account owning `fingerprint`, or null. The returned slice borrows
     /// this thread's `lookup_scratch` — valid until this thread's next call

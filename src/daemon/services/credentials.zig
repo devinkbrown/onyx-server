@@ -51,29 +51,38 @@ pub const Context = struct {
         const list_key = certfpAccountKey(&list_key_buf, key.asSlice()) orelse return error.InvalidFingerprint;
         const existing = self.store.*.family(.props).get(list_key) orelse "";
         var list_buf: [certfp_list_value_max]u8 = undefined;
-        if (existing.len + fingerprint.len + @intFromBool(existing.len != 0) > list_buf.len) return error.InvalidFingerprint;
-        @memcpy(list_buf[0..existing.len], existing);
-        var list_len = existing.len;
-        if (list_len != 0) {
-            list_buf[list_len] = '\n';
-            list_len += 1;
+        var list_len: usize = 0;
+        var already_listed = false;
+        var list_it = std.mem.splitScalar(u8, existing, '\n');
+        while (list_it.next()) |fp| {
+            if (fp.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(fp, fingerprint)) {
+                if (already_listed) continue;
+                already_listed = true;
+            }
+            if (list_len != 0) {
+                if (list_len >= list_buf.len) return error.InvalidFingerprint;
+                list_buf[list_len] = '\n';
+                list_len += 1;
+            }
+            if (list_len + fp.len > list_buf.len) return error.InvalidFingerprint;
+            @memcpy(list_buf[list_len..][0..fp.len], fp);
+            list_len += fp.len;
         }
-        @memcpy(list_buf[list_len..][0..fingerprint.len], fingerprint);
-        list_len += fingerprint.len;
+        if (!already_listed) {
+            if (list_len != 0) {
+                if (list_len >= list_buf.len) return error.InvalidFingerprint;
+                list_buf[list_len] = '\n';
+                list_len += 1;
+            }
+            if (list_len + fingerprint.len > list_buf.len) return error.InvalidFingerprint;
+            @memcpy(list_buf[list_len..][0..fingerprint.len], fingerprint);
+            list_len += fingerprint.len;
+        }
         var kb: [certfp_key_max]u8 = undefined;
         const fp_key = certfpKey(&kb, fingerprint) orelse return error.InvalidFingerprint;
-        var previous_owner_buf: [certfp_bind_mod.max_account_len]u8 = undefined;
-        const previous_owner = if (binds.accountForFingerprint(fingerprint)) |owner| blk: {
-            if (owner.len > previous_owner_buf.len) return error.InvalidFingerprint;
-            @memcpy(previous_owner_buf[0..owner.len], owner);
-            break :blk previous_owner_buf[0..owner.len];
-        } else null;
-        binds.bind(key.asSlice(), fingerprint) catch |err| return err;
-        errdefer if (previous_owner) |owner| {
-            binds.bind(owner, fingerprint) catch {};
-        } else {
-            _ = binds.unbind(fingerprint);
-        };
+        var prepared_bind = binds.prepareBind(key.asSlice(), fingerprint) catch |err| return err;
+        defer prepared_bind.abort();
         var prepared = self.store.*.prepareBatch(&.{
             .{ .family = .props, .kind = .put, .key = fp_key, .value = key.asSlice() },
             .{ .family = .props, .kind = .put, .key = list_key, .value = list_buf[0..list_len] },
@@ -83,6 +92,7 @@ pub const Context = struct {
         };
         defer prepared.abort();
         prepared.commit() catch return error.InvalidFingerprint;
+        prepared_bind.commit();
         self.recordKeyTransparency(account, .certfp, .bind, fingerprint, fingerprint, 0);
     }
 
@@ -114,7 +124,7 @@ pub const Context = struct {
         defer self.lock.unlockExclusive();
 
         const key = try accountKey(account);
-        const owner = try self.certfpOwnerUnlocked(fingerprint);
+        const owner = try self.certfpAnyOwnerUnlocked(fingerprint);
         if (!std.ascii.eqlIgnoreCase(owner, key.asSlice())) return error.Forbidden;
 
         var list_key_buf: [certfp_account_key_max]u8 = undefined;
@@ -197,12 +207,12 @@ pub const Context = struct {
             else => return error.BufferTooSmall,
         }) orelse return error.AlreadyExists; // already present under this account
 
-        // Record first, then list; roll the record back if the list write fails.
-        try self.store.*.family(.props).put(cred_key, record);
-        self.store.*.family(.props).put(list_key, new_list) catch |e| {
-            self.store.*.family(.props).delete(cred_key) catch {};
-            return e;
-        };
+        var prepared = try self.store.*.prepareBatch(&.{
+            .{ .family = .props, .kind = .put, .key = cred_key, .value = record },
+            .{ .family = .props, .kind = .put, .key = list_key, .value = new_list },
+        });
+        defer prepared.abort();
+        try prepared.commit();
         self.recordKeyTransparency(key.asSlice(), .webauthn, .bind, cred_id_b64, cose_key, now_unix * 1000);
     }
 
@@ -220,6 +230,20 @@ pub const Context = struct {
         const cred_key = webauthn_creds.credKey(&cred_key_buf, cred_id_b64) orelse return error.NotFound;
         const value = self.store.*.family(.props).get(cred_key) orelse return error.NotFound;
         const rec = webauthn_creds.decodeRecord(value) catch return error.InvalidRecord;
+
+        // The per-account list is the authority for whether a passkey is
+        // enrolled. A leftover direct row from an older partial bind cannot
+        // authenticate after that index is removed.
+        var list_key_buf: [webauthn_creds.account_list_key_max]u8 = undefined;
+        const list_key = webauthn_creds.accountListKey(&list_key_buf, rec.account) orelse return error.NotFound;
+        const credential_list = self.store.*.family(.props).get(list_key) orelse return error.NotFound;
+        var listed = false;
+        var ids_it = std.mem.splitScalar(u8, credential_list, '\n');
+        while (ids_it.next()) |id| if (std.mem.eql(u8, id, cred_id_b64)) {
+            listed = true;
+            break;
+        };
+        if (!listed) return error.NotFound;
 
         if (rec.account.len > out.account_buf.len) return error.InvalidRecord;
         @memcpy(out.account_buf[0..rec.account.len], rec.account);
@@ -485,11 +509,33 @@ pub const Context = struct {
 
     pub fn certfpOwnerUnlocked(self: Context, fingerprint: []const u8) ServiceError![]const u8 {
         if (self.certfp_binds.*) |binds| {
+            if (binds.accountForFingerprint(fingerprint)) |acct| {
+                if (self.certfpListedUnlocked(acct, fingerprint)) return acct;
+            }
+        }
+        const owner = try self.certfpAnyOwnerUnlocked(fingerprint);
+        if (!self.certfpListedUnlocked(owner, fingerprint)) return error.NotFound;
+        return owner;
+    }
+
+    fn certfpAnyOwnerUnlocked(self: Context, fingerprint: []const u8) ServiceError![]const u8 {
+        if (self.certfp_binds.*) |binds| {
             if (binds.accountForFingerprint(fingerprint)) |acct| return acct;
         }
         var kb: [certfp_key_max]u8 = undefined;
         const k = certfpKey(&kb, fingerprint) orelse return error.NotFound;
         return self.store.*.family(.props).get(k) orelse error.NotFound;
+    }
+
+    fn certfpListedUnlocked(self: Context, account: []const u8, fingerprint: []const u8) bool {
+        var key_buf: [certfp_account_key_max]u8 = undefined;
+        const list_key = certfpAccountKey(&key_buf, account) orelse return false;
+        const list = self.store.*.family(.props).get(list_key) orelse return false;
+        var it = std.mem.splitScalar(u8, list, '\n');
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry, fingerprint)) return true;
+        }
+        return false;
     }
 
     pub fn addCertfpListEntry(self: Context, account: []const u8, fingerprint: []const u8) ServiceError!void {

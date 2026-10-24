@@ -81,6 +81,53 @@ pub const Context = struct {
     certfp_binds: *const ?*certfp_bind_mod.CertfpBindStore,
     clock_override_ms: *const std.atomic.Value(u64),
 
+    pub const ScramCredentialGuard = struct {
+        lock: *rwlock.RwLock,
+        held: bool = true,
+
+        /// Release the Services shared lock held across SCRAM proof acceptance
+        /// and the caller's authenticated-session publication.
+        pub fn release(self: *ScramCredentialGuard) void {
+            if (!self.held) return;
+            self.held = false;
+            self.lock.unlockShared();
+        }
+
+        pub fn deinit(self: *ScramCredentialGuard) void {
+            self.release();
+        }
+    };
+
+    /// Hold account credential authority stable while a verified SCRAM proof
+    /// is turned into a live authenticated session. The expected fingerprint
+    /// is captured when the server-first tuple is issued; this guard recomputes
+    /// from the strict durable SCRAM row, bypassing the cache/backfill path.
+    pub fn acquireScramCredentialGuard(
+        self: Context,
+        account: []const u8,
+        expected: sasl.CredentialFingerprint,
+    ) ServiceError!ScramCredentialGuard {
+        self.lock.lockShared();
+        errdefer self.lock.unlockShared();
+
+        if (self.store.*.preparedWritesPoisoned()) return error.StorePoisoned;
+        const canonical = try accountKey(account);
+        if (self.store.*.family(.accounts).get(canonical.asSlice()) == null) return error.NotFound;
+        var key_buf: [scram_key_max]u8 = undefined;
+        const key = scramKey(&key_buf, canonical.asSlice()) orelse return error.BufferTooSmall;
+        const value = self.store.*.family(.props).get(key) orelse return error.NotFound;
+        const record = ScramStore.deserializeFullRecord(value) orelse return error.InvalidRecord;
+        const actual = switch (expected.algorithm) {
+            .sha256 => sasl.fingerprintScramCredential(.sha256, record.salt, record.iterations, &record.stored_key, &record.server_key),
+            .sha512 => if (record.has_512)
+                sasl.fingerprintScramCredential(.sha512, record.salt, record.iterations, &record.stored_key_512, &record.server_key_512)
+            else
+                null,
+        } orelse return error.AuthFailed;
+        if (!std.crypto.timing_safe.eql([32]u8, actual.digest, expected.digest)) return error.AuthFailed;
+        return .{ .lock = self.lock };
+    }
+
     /// False when the account has refused password-derived mechanisms.
     /// A missing account returns true so the caller keeps its ordinary
     /// unknown-account behavior.
@@ -348,36 +395,70 @@ pub const Context = struct {
 
         var token_index_buf: [session_token_account_key_max]u8 = undefined;
         const token_index = sessionTokenAccountKey(&token_index_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
-        if (self.store.*.family(.props).get(token_index) != null) try appendDropDelete(&mutations, &mutation_count, .props, token_index);
+        if (self.store.*.family(.props).get(token_index)) |token_hash| {
+            if (token_hash.len != @import("records.zig").hash_hex_len) return error.InvalidRecord;
+            var token_key_buf: [@import("records.zig").session_token_key_max]u8 = undefined;
+            const token_key = @import("records.zig").sessionTokenKey(&token_key_buf, token_hash) orelse return error.InvalidRecord;
+            if (self.store.*.family(.props).get(token_key)) |token_row| {
+                const token = try @import("records.zig").decodeSessionTokenRecord(token_row);
+                if (!std.ascii.eqlIgnoreCase(token.account.asSlice(), record.name.asSlice())) return error.InvalidRecord;
+                try appendDropDelete(&mutations, &mutation_count, .props, token_key);
+            }
+            try appendDropDelete(&mutations, &mutation_count, .props, token_index);
+        }
 
         var certfp_list_key_buf: [@import("records.zig").certfp_account_key_max]u8 = undefined;
         const certfp_list_key = @import("records.zig").certfpAccountKey(&certfp_list_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
-        if (self.store.*.family(.props).get(certfp_list_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, certfp_list_key);
+        if (self.store.*.family(.props).get(certfp_list_key)) |certfp_list| {
+            var certfp_count: usize = 0;
+            var seen_fingerprints: [16][]const u8 = undefined;
+            var list_it = std.mem.splitScalar(u8, certfp_list, '\n');
+            while (list_it.next()) |fp| {
+                if (fp.len == 0) continue;
+                if (fp.len != @import("../../proto/certfp.zig").fingerprint_len) return error.InvalidRecord;
+                @import("../../proto/certfp.zig").validateFingerprint(fp) catch return error.InvalidRecord;
+                var duplicate = false;
+                for (seen_fingerprints[0..certfp_count]) |seen| {
+                    if (std.mem.eql(u8, seen, fp)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+                if (certfp_count == seen_fingerprints.len) return error.InvalidRecord;
+                seen_fingerprints[certfp_count] = fp;
+                certfp_count += 1;
+                var fp_key_buf: [@import("records.zig").certfp_key_max]u8 = undefined;
+                const fp_key = @import("records.zig").certfpKey(&fp_key_buf, fp) orelse return error.InvalidRecord;
+                if (self.store.*.family(.props).get(fp_key)) |owner| {
+                    if (std.ascii.eqlIgnoreCase(owner, record.name.asSlice())) try appendDropDelete(&mutations, &mutation_count, .props, fp_key);
+                }
+            }
+            try appendDropDelete(&mutations, &mutation_count, .props, certfp_list_key);
+        }
 
         var webauthn_list_key_buf: [webauthn_creds.account_list_key_max]u8 = undefined;
         const webauthn_list_key = webauthn_creds.accountListKey(&webauthn_list_key_buf, record.name.asSlice()) orelse return error.BufferTooSmall;
-        if (self.store.*.family(.props).get(webauthn_list_key) != null) try appendDropDelete(&mutations, &mutation_count, .props, webauthn_list_key);
-
-        // Account-scoped indexes can be missing after older best-effort writes.
-        // Scan the bounded in-memory props map for credential rows whose own
-        // value names this account, so re-registration cannot inherit them.
-        const props = &self.store.*.maps[@backingInt(store_mod.Family.props)].map;
-        var props_it = props.iterator();
-        var scanned: usize = 0;
-        while (props_it.next()) |entry| {
-            scanned += 1;
-            if (scanned > 4096) return error.TableWorkExceeded;
-            const row_key = entry.key_ptr.*;
-            const row_value = entry.value_ptr.*;
-            if (std.mem.startsWith(u8, row_key, "certfp:")) {
-                if (std.ascii.eqlIgnoreCase(row_value, record.name.asSlice())) try appendDropDelete(&mutations, &mutation_count, .props, row_key);
-            } else if (std.mem.startsWith(u8, row_key, "webauthn:")) {
-                const credential = webauthn_creds.decodeRecord(row_value) catch continue;
-                if (std.ascii.eqlIgnoreCase(credential.account, record.name.asSlice())) try appendDropDelete(&mutations, &mutation_count, .props, row_key);
-            } else if (std.mem.startsWith(u8, row_key, "sessiontok:")) {
-                const token = @import("records.zig").decodeSessionTokenRecord(row_value) catch continue;
-                if (std.ascii.eqlIgnoreCase(token.account.asSlice(), record.name.asSlice())) try appendDropDelete(&mutations, &mutation_count, .props, row_key);
+        if (self.store.*.family(.props).get(webauthn_list_key)) |credential_list| {
+            var ids_buf: [webauthn_creds.max_creds_per_account][]const u8 = undefined;
+            const ids = webauthn_creds.listIds(credential_list, &ids_buf);
+            var id_count: usize = 0;
+            var list_it = std.mem.splitScalar(u8, credential_list, '\n');
+            while (list_it.next()) |id| if (id.len != 0) {
+                id_count += 1;
+            };
+            if (id_count != ids.len) return error.InvalidRecord;
+            for (ids) |id| {
+                if (!webauthn_creds.validCredIdB64(id)) return error.InvalidRecord;
+                var credential_key_buf: [webauthn_creds.cred_key_max]u8 = undefined;
+                const credential_key = webauthn_creds.credKey(&credential_key_buf, id) orelse return error.InvalidRecord;
+                if (self.store.*.family(.props).get(credential_key)) |credential_row| {
+                    const credential = webauthn_creds.decodeRecord(credential_row) catch return error.InvalidRecord;
+                    if (!std.ascii.eqlIgnoreCase(credential.account, record.name.asSlice())) return error.InvalidRecord;
+                    try appendDropDelete(&mutations, &mutation_count, .props, credential_key);
+                }
             }
+            try appendDropDelete(&mutations, &mutation_count, .props, webauthn_list_key);
         }
 
         var prepared = try self.store.*.prepareBatch(mutations[0..mutation_count]);
@@ -429,13 +510,14 @@ pub const Context = struct {
         var prepared_import: ?ScramStore.PreparedImport = null;
         defer if (prepared_import) |*prepared| prepared.abort();
         if (self.scram.*) |scram| {
-            var keys256 = sasl.deriveScramKeys(new_password, &salt, scram_store_mod.default_iterations) catch return error.InvalidRecord;
+            const iterations = scram.derivationIterations();
+            var keys256 = sasl.deriveScramKeys(new_password, &salt, iterations) catch return error.InvalidRecord;
             defer keys256.wipe();
-            var keys512 = sasl_scram512.deriveScramKeys(new_password, &salt, scram_store_mod.default_iterations) catch return error.InvalidRecord;
+            var keys512 = sasl_scram512.deriveScramKeys(new_password, &salt, iterations) catch return error.InvalidRecord;
             defer keys512.wipe();
             var full = ScramStore.FullRecord{
                 .salt = &salt,
-                .iterations = scram_store_mod.default_iterations,
+                .iterations = iterations,
                 .stored_key = keys256.stored_key,
                 .server_key = keys256.server_key,
                 .has_512 = true,
@@ -511,13 +593,14 @@ pub const Context = struct {
         var prepared_import: ?ScramStore.PreparedImport = null;
         defer if (prepared_import) |*prepared| prepared.abort();
         if (self.scram.*) |scram| {
-            var keys256 = sasl.deriveScramKeys(new_password, &salt, scram_store_mod.default_iterations) catch return error.InvalidRecord;
+            const iterations = scram.derivationIterations();
+            var keys256 = sasl.deriveScramKeys(new_password, &salt, iterations) catch return error.InvalidRecord;
             defer keys256.wipe();
-            var keys512 = sasl_scram512.deriveScramKeys(new_password, &salt, scram_store_mod.default_iterations) catch return error.InvalidRecord;
+            var keys512 = sasl_scram512.deriveScramKeys(new_password, &salt, iterations) catch return error.InvalidRecord;
             defer keys512.wipe();
             var full = ScramStore.FullRecord{
                 .salt = &salt,
-                .iterations = scram_store_mod.default_iterations,
+                .iterations = iterations,
                 .stored_key = keys256.stored_key,
                 .server_key = keys256.server_key,
                 .has_512 = true,

@@ -70,6 +70,69 @@ test "certfp list and delete enforce account ownership" {
     try std.testing.expect(services.accountForCertfp(fp_alice) == null);
 }
 
+test "CERTADD stages owner replacement before durable commit and restores old owner on OOM" {
+    const fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var failures: usize = 0;
+    for (0..128) |failure_index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        var store = try @import("records.zig").OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "certadd-replace-oom.wal");
+        defer store.deinit();
+        var binds = certfp_bind_mod.CertfpBindStore.init(failing.allocator());
+        defer binds.deinit();
+        var services = Services.init(&store, null);
+        services.attachCertfpBinds(&binds);
+        try services.bindCertfp("alice", fp);
+        failing.fail_index = failing.alloc_index + failure_index;
+
+        services.bindCertfp("bob", fp) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expectEqualStrings("alice", binds.accountForFingerprint(fp).?);
+            var fp_key_buf: [records.certfp_key_max]u8 = undefined;
+            try std.testing.expectEqualStrings("alice", store.family(.props).get(records.certfpKey(&fp_key_buf, fp).?).?);
+            try services.bindCertfp("bob", fp);
+            try std.testing.expectEqualStrings("bob", binds.accountForFingerprint(fp).?);
+            {
+                var reopened = try openTestStore(tmp, "certadd-replace-oom.wal");
+                defer reopened.deinit();
+                var cold = Services.init(&reopened, null);
+                try std.testing.expectEqualStrings("bob", cold.accountForCertfp(fp).?);
+            }
+            failures += 1;
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqualStrings("bob", binds.accountForFingerprint(fp).?);
+        try std.testing.expect(failures > 0);
+        std.debug.print("CERTADD staged replace: {d} induced allocation failures, retry, and cold reopen\n", .{failures});
+        break;
+    } else return error.FailureSweepDidNotComplete;
+}
+
+test "CERTADD repeated fingerprint is deduplicated and leaves room for another cert" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "services-certfp-dedup.wal");
+    defer store.deinit();
+    var binds = certfp_bind_mod.CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    var services = Services.init(&store, null);
+    services.attachCertfpBinds(&binds);
+    const a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for (0..16) |_| try services.bindCertfp("alice", a);
+    try services.bindCertfp("alice", b);
+    var listed_buf: [20][]const u8 = undefined;
+    const listed = try services.listCertfps("alice", &listed_buf);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+    try std.testing.expectEqualStrings(a, listed[0]);
+    try std.testing.expectEqualStrings(b, listed[1]);
+}
+
 test "CERTDEL allocation failure preserves durable and RAM authority, then retries" {
     const fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     var failed: usize = 0;
@@ -130,12 +193,33 @@ test "CERTDEL revokes an authoritative fingerprint even when its list row is abs
     var fp_key_buf: [records.certfp_key_max]u8 = undefined;
     try store.family(.props).put(records.certfpKey(&fp_key_buf, fp).?, "alice");
     try binds.bind("alice", fp);
+    try std.testing.expect(services.accountForCertfp(fp) == null); // Missing index fails closed for authentication.
     try services.deleteCertfp("alice", fp);
     try std.testing.expect(services.accountForCertfp(fp) == null);
     var reopened = try openTestStore(tmp, "certdel-missing-list.wal");
     defer reopened.deinit();
     var cold = Services.init(&reopened, null);
     try std.testing.expect(cold.accountForCertfp(fp) == null);
+}
+
+test "orphan WebAuthn row without account index cannot authenticate after restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "webauthn-orphan-index.wal");
+    defer store.deinit();
+    var services = Services.init(&store, null);
+    const cose = [_]u8{ 0xa5, 0x01, 0x02, 0x03 };
+    try services.webauthnBind("alice", "credORPHAN", &cose, 1, "old", 1);
+    var list_key_buf: [webauthn_creds.account_list_key_max]u8 = undefined;
+    try store.family(.props).delete(webauthn_creds.accountListKey(&list_key_buf, "alice").?);
+    var credential: Services.WebauthnCredential = .{};
+    try std.testing.expectError(error.NotFound, services.webauthnLookup("credORPHAN", &credential));
+    {
+        var reopened = try openTestStore(tmp, "webauthn-orphan-index.wal");
+        defer reopened.deinit();
+        var cold = Services.init(&reopened, null);
+        try std.testing.expectError(error.NotFound, cold.webauthnLookup("credORPHAN", &credential));
+    }
 }
 
 test "webauthn bind/lookup/list/delete round-trip" {

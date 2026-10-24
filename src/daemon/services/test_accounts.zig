@@ -53,7 +53,7 @@ test "services passkey-only successor hold and login audit" {
     var store = try openTestStore(tmp, "services-passkey-successor.wal");
     defer store.deinit();
     var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
-    var scram = ScramStore.init(std.testing.allocator);
+    var scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
     defer scram.deinit();
     services.attachScramStore(&scram);
     var scratch: [record_max]u8 = undefined;
@@ -400,7 +400,7 @@ test "scram credentials persist across store reopen via loader" {
     {
         var store = try openTestStore(tmp, "services-scram.wal");
         defer store.deinit();
-        var scram = ScramStore.init(std.testing.allocator);
+        var scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
         defer scram.deinit();
         var services = Services.init(&store, null);
         services.attachScramStore(&scram);
@@ -412,7 +412,7 @@ test "scram credentials persist across store reopen via loader" {
         // Reopen with a COLD in-memory SCRAM store + the durable loader.
         var store = try openTestStore(tmp, "services-scram.wal");
         defer store.deinit();
-        var scram = ScramStore.init(std.testing.allocator);
+        var scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
         defer scram.deinit();
         var services = Services.init(&store, null);
         services.attachScramStore(&scram);
@@ -495,7 +495,7 @@ test "registerAccount mirrors SCRAM credentials when a store is attached" {
     var store = try openTestStore(tmp, "services-scram-mirror.wal");
     defer store.deinit();
 
-    var scram = ScramStore.init(std.testing.allocator);
+    var scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
     defer scram.deinit();
 
     var services = Services.init(&store, null);
@@ -664,10 +664,13 @@ test "forbidden account is locked out of every login path" {
     // Bind a certfp to alice through the durable props mirror; certfpOwnerUnlocked
     // falls back to it when the in-memory cache is cold, so this exercises the
     // SASL EXTERNAL lookup without a live CertfpBindStore.
-    const fp = "aa:bb:cc:dd";
+    const fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     var kb: [certfp_key_max]u8 = undefined;
     const k = certfpKey(&kb, fp).?;
     try store.family(.props).put(k, "alice");
+    var list_key_buf: [@import("records.zig").certfp_account_key_max]u8 = undefined;
+    const list_key = @import("records.zig").certfpAccountKey(&list_key_buf, "alice").?;
+    try store.family(.props).put(list_key, fp);
     try std.testing.expectEqualStrings("alice", services.accountForCertfp(fp).?);
 
     // An admin FORBID on a registered account must lock it out of EVERY login
