@@ -1217,9 +1217,26 @@ pub const SecuredLink = struct {
         return link.supportsGuestPresence();
     }
 
+    pub fn supportsGuestFrontier(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsGuestFrontier();
+    }
+
+    pub fn takeGuestFrontierReady(self: *SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.takeGuestFrontierReady();
+    }
+
     pub fn forwardGuestPresence(self: *SecuredLink, original: []const u8) anyerror!bool {
         const link = self.inner orelse return error.NotEstablished;
         const emitted = try link.forwardGuestPresence(original);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn forwardGuestFrontier(self: *SecuredLink, original: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.forwardGuestFrontier(original);
         if (emitted) try self.drainInner();
         return emitted;
     }
@@ -1239,6 +1256,11 @@ pub const SecuredLink = struct {
     pub fn takeGuestDirects(self: *SecuredLink) anyerror![]s2s_link.InboundGuestFrame {
         const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundGuestFrame, 0);
         return link.takeGuestDirects();
+    }
+
+    pub fn takeGuestFrontiers(self: *SecuredLink) anyerror![]s2s_link.InboundGuestFrontier {
+        const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundGuestFrontier, 0);
+        return link.takeGuestFrontiers();
     }
 
     /// Emit a signed OBSERVE_EVENT over the encrypted leg, then flush ciphertext.
