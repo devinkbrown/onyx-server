@@ -57749,7 +57749,11 @@ pub const LinuxServer = struct {
     }
 
     fn snapshotClass(self: *LinuxServer) !PolicyUndo {
-        const registry = if (self.config.class_registry) |*reg| try reg.clone() else null;
+        return self.snapshotClassWithAllocator(self.allocator);
+    }
+
+    fn snapshotClassWithAllocator(self: *LinuxServer, allocator: std.mem.Allocator) !PolicyUndo {
+        const registry = if (self.config.class_registry) |*reg| try reg.cloneWithAllocator(allocator) else null;
         return .{ .class = .{
             .generation = self.policy_gen_class,
             .registry = registry,
@@ -57848,19 +57852,18 @@ pub const LinuxServer = struct {
         self.policy_undo = null;
     }
 
-    /// Install a finished connection-class table and number that generation.
-    /// The server takes ownership of `new_reg`. REHASH uses this path.
-    fn installClassRegistry(self: *LinuxServer, new_reg: conn_class.Registry) void {
-        var policy_snap: ?PolicyUndo = self.snapshotClass() catch null;
-        defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
+    /// Publish a fully prepared connection-class table and its rollback image.
+    /// All registry and snapshot allocation must finish before entering here.
+    fn installPreparedClassRegistry(
+        self: *LinuxServer,
+        new_reg: conn_class.Registry,
+        policy_snap: PolicyUndo,
+    ) void {
         if (self.reload_class_registry) |*old| old.deinit();
         self.reload_class_registry = new_reg;
         self.config.class_registry = new_reg;
-        if (policy_snap) |snap| {
-            self.commitPolicy(snap);
-            policy_snap = null;
-            _ = self.recordOperAudit(self.serverName(), .other, "class", "class replace");
-        }
+        self.commitPolicy(policy_snap);
+        _ = self.recordOperAudit(self.serverName(), .other, "class", "class replace");
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
                 if (!slot.occupied) continue;
@@ -57869,6 +57872,16 @@ pub const LinuxServer = struct {
                 self.assignConnClass(conn);
             }
         }
+    }
+
+    /// Test/bootstrap helper. A snapshot failure leaves the current table live
+    /// and releases the replacement passed by the caller.
+    fn installClassRegistry(self: *LinuxServer, new_reg: conn_class.Registry) !void {
+        var replacement = new_reg;
+        errdefer replacement.deinit();
+        const policy_snap = try self.snapshotClass();
+        self.installPreparedClassRegistry(replacement, policy_snap);
+        replacement = undefined;
     }
 
     /// `POLICY` lists ward, filter, class, and ban generations.
@@ -59722,7 +59735,12 @@ pub const LinuxServer = struct {
     /// Build the class registry a real REHASH would install. The caller frees it.
     /// A failure leaves the live registry alone.
     fn proposedClassRegistry(self: *LinuxServer, parsed: *const config_format.Config) ?conn_class.Registry {
-        var cb = conn_class.Builder.init(self.allocator);
+        return buildClassRegistry(self.allocator, parsed) catch null;
+    }
+
+    fn buildClassRegistry(allocator: std.mem.Allocator, parsed: *const config_format.Config) !conn_class.Registry {
+        var cb = conn_class.Builder.init(allocator);
+        errdefer cb.deinit();
         for (parsed.classes) |c| {
             cb.add(.{
                 .name = c.name,
@@ -59733,15 +59751,9 @@ pub const LinuxServer = struct {
                 .oper_only = c.match_oper,
                 .ident_glob = c.ident_glob,
                 .host_glob = c.host_glob,
-            }) catch {
-                cb.deinit();
-                return null;
-            };
+            }) catch |err| return err;
         }
-        return cb.finish() catch {
-            cb.deinit();
-            return null;
-        };
+        return cb.finish();
     }
 
     pub fn emitRehashDry(self: *LinuxServer, conn: *ConnState, path: []const u8, parsed: *const config_format.Config) !void {
@@ -59777,6 +59789,17 @@ pub const LinuxServer = struct {
         return oper_cmd.handleRehashParsed(self, conn, parsed_line);
     }
 
+    /// Deterministic allocator seam for REHASH preparation tests. Production
+    /// dispatch always uses the server allocator.
+    fn handleRehashParsedWithClassAllocator(
+        self: *LinuxServer,
+        conn: *ConnState,
+        parsed_line: *const irc_line.LineView,
+        class_allocator: std.mem.Allocator,
+    ) !void {
+        return oper_cmd.handleRehashParsedWithClassAllocator(self, conn, parsed_line, class_allocator);
+    }
+
     /// Rotate the RFC 5077 / TLS 1.3 session-ticket key: the current key becomes
     /// the previous key (tickets sealed under it still open for one more window,
     /// via tls_resumption.openTicketWithRotation) and a fresh current key is
@@ -59786,11 +59809,44 @@ pub const LinuxServer = struct {
         secure_fns.randomBytes(&self.tls_ticket_key);
     }
 
-    /// Apply the anti-abuse runtime knobs from a freshly parsed config on REHASH:
-    /// the connection-class registry (per-class clone/flood/admission policy), the
-    /// global clone caps, the connection-rate throttle, and the nick-delay window.
-    /// Best-effort: a failed class-registry rebuild keeps the current registry.
-    pub fn applyReloadedLimits(self: *LinuxServer, parsed: *const config_format.Config) void {
+    const PreparedReloadLimits = struct {
+        classes: conn_class.Registry,
+        policy_undo: PolicyUndo,
+        throttle: ?clone_detect_mod.CloneDetector,
+    };
+
+    fn destroyPreparedReloadLimits(self: *LinuxServer, prepared: *PreparedReloadLimits) void {
+        prepared.classes.deinit();
+        self.destroyPolicyUndo(&prepared.policy_undo);
+        if (prepared.throttle) |*throttle| throttle.deinit();
+        prepared.* = undefined;
+    }
+
+    fn prepareReloadedLimits(
+        self: *LinuxServer,
+        parsed: *const config_format.Config,
+        class_allocator: std.mem.Allocator,
+    ) !PreparedReloadLimits {
+        var classes = try buildClassRegistry(class_allocator, parsed);
+        errdefer classes.deinit();
+        var policy_undo = try self.snapshotClassWithAllocator(class_allocator);
+        errdefer self.destroyPolicyUndo(&policy_undo);
+        const throttle: ?clone_detect_mod.CloneDetector = if (parsed.limits.throttle_connects != 0)
+            try clone_detect_mod.CloneDetector.initChecked(self.allocator, .{
+                .max_concurrent_per_ip = 0,
+                .max_connects_per_window = parsed.limits.throttle_connects,
+                .window_ms = @max(@as(u64, 1), parsed.limits.throttle_window_ms),
+            })
+        else
+            null;
+        return .{ .classes = classes, .policy_undo = policy_undo, .throttle = throttle };
+    }
+
+    fn commitReloadedLimits(
+        self: *LinuxServer,
+        parsed: *const config_format.Config,
+        prepared: *PreparedReloadLimits,
+    ) void {
         const lim = parsed.limits;
 
         // Scalar caps — pure value updates (no ownership concerns).
@@ -59809,42 +59865,13 @@ pub const LinuxServer = struct {
         // explicit +j, which always overrides this default).
         self.config.raid_joins = lim.raid_joins;
         self.config.raid_secs = @intCast(@max(@as(u64, 1), lim.raid_window_ms / 1000));
-        if (self.conn_throttle) |*t| t.deinit();
-        self.conn_throttle = if (lim.throttle_connects != 0) clone_detect_mod.CloneDetector.init(self.allocator, .{
-            .max_concurrent_per_ip = 0,
-            .max_connects_per_window = lim.throttle_connects,
-            .window_ms = @max(@as(u64, 1), lim.throttle_window_ms),
-        }) else null;
+        if (self.conn_throttle) |*throttle| throttle.deinit();
+        self.conn_throttle = prepared.throttle;
+        prepared.throttle = null;
 
-        // Connection classes: build a fresh self-owning registry (the Builder dupes
-        // everything), then free the prior server-owned generation and repoint the
-        // live registry. The initial registry stays owned by `Loaded`.
-        var cb = conn_class.Builder.init(self.allocator);
-        var ok = true;
-        for (parsed.classes) |c| {
-            cb.add(.{
-                .name = c.name,
-                .policy = c.policy,
-                .cidr_texts = c.match_texts,
-                .tls_only = c.match_tls,
-                .account_only = c.match_account,
-                .oper_only = c.match_oper,
-                .ident_glob = c.ident_glob,
-                .host_glob = c.host_glob,
-            }) catch {
-                ok = false;
-                break;
-            };
-        }
-        if (ok) {
-            if (cb.finish()) |new_reg| {
-                self.installClassRegistry(new_reg);
-            } else |_| {
-                cb.deinit();
-            }
-        } else {
-            cb.deinit();
-        }
+        self.installPreparedClassRegistry(prepared.classes, prepared.policy_undo);
+        prepared.classes = undefined;
+        prepared.policy_undo = undefined;
 
         // Reload OroWasm plugins from the (possibly changed) [wasm] plugin_dir.
         // Rebuild the bridge so removed plugins disappear; the dir string lives in
@@ -59870,6 +59897,25 @@ pub const LinuxServer = struct {
             .disabled_plugins = self.config.wasm_disabled_plugins,
         });
         self.loadWasmPlugins();
+    }
+
+    /// REHASH stages every allocation needed for limits and connection-class
+    /// policy before changing any live admission scalar or registry. The final
+    /// swaps cannot fail, so an OOM leaves the previous generation intact.
+    pub fn applyReloadedLimitsWithClassAllocator(
+        self: *LinuxServer,
+        parsed: *const config_format.Config,
+        class_allocator: std.mem.Allocator,
+    ) !void {
+        var prepared = try self.prepareReloadedLimits(parsed, class_allocator);
+        var committed = false;
+        defer if (!committed) self.destroyPreparedReloadLimits(&prepared);
+        self.commitReloadedLimits(parsed, &prepared);
+        committed = true;
+    }
+
+    pub fn applyReloadedLimits(self: *LinuxServer, parsed: *const config_format.Config) !void {
+        return self.applyReloadedLimitsWithClassAllocator(parsed, self.allocator);
     }
 
     /// Load OroWasm control-plane plugins from `[wasm] plugin_dir` (best-effort).
@@ -136399,7 +136445,7 @@ test "REHASH applyReloadedLimits: swaps class registry + throttle without double
             \\
         ;
         var p1 = try config_format.parseToml(allocator, toml1, .{});
-        server.applyReloadedLimits(&p1);
+        try server.applyReloadedLimits(&p1);
         p1.deinit(allocator); // the registry duped everything; freeing parsed is safe
         try std.testing.expect(server.conn_throttle != null);
         try std.testing.expectEqual(@as(u32, 5), server.config.throttle_connects);
@@ -136420,11 +136466,186 @@ test "REHASH applyReloadedLimits: swaps class registry + throttle without double
             \\
         ;
         var p2 = try config_format.parseToml(allocator, toml2, .{});
-        server.applyReloadedLimits(&p2);
+        try server.applyReloadedLimits(&p2);
         p2.deinit(allocator);
         try std.testing.expect(server.conn_throttle == null); // throttle disabled
         try std.testing.expectEqual(@as(u32, 7), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
     } else return error.SkipZigTest;
+}
+
+test "REHASH class registry OOM aborts staged config and retries cleanly" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const old_text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\host = "127.0.0.1"
+        \\irc = 6680
+        \\[limits]
+        \\throttle_connects = 4
+        \\throttle_window = "10s"
+        \\[class.user]
+        \\require_sasl = false
+        \\[class.trusted]
+        \\match = ["10.0.0.0/8"]
+        \\match_ident = "trusted*"
+        \\match_host = "*.example.test"
+        \\[[oper_groups]]
+        \\name = "netadmin"
+        \\privileges = ["server_rehash"]
+        \\[[opers]]
+        \\account = "old-admin"
+        \\class = "netadmin"
+    ;
+    const new_text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\host = "127.0.0.1"
+        \\irc = 6680
+        \\[limits]
+        \\max_clones_per_ip = 9
+        \\nick_delay = "3s"
+        \\throttle_connects = 8
+        \\throttle_window = "20s"
+        \\[class.user]
+        \\require_sasl = true
+        \\[class.trusted]
+        \\match = ["10.0.0.0/8"]
+        \\match_ident = "trusted*"
+        \\match_host = "*.example.test"
+        \\[[oper_groups]]
+        \\name = "netadmin"
+        \\privileges = ["server_rehash"]
+        \\[[opers]]
+        \\account = "new-admin"
+        \\class = "netadmin"
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash-atomic.toml", .data = old_text });
+    const path = try rehashTmpPath(allocator, tmp, "rehash-atomic.toml");
+    defer allocator.free(path);
+    server.config.config_path = path;
+    server.config.crypto_io = std.testing.io;
+
+    var old_parsed = try config_format.parseToml(allocator, old_text, .{});
+    try server.applyReloadedLimits(&old_parsed);
+    const old_bindings = try server.operBindingsFromConfig(old_parsed);
+    server.reload_bindings = old_bindings;
+    server.oper_registry = try oper_mod.OperRegistry.init(old_bindings);
+    server.reload_parsed = old_parsed;
+    old_parsed = undefined;
+
+    const old_registry = server.oper_registry.?;
+    const old_class_generation = server.policy_gen_class;
+    const old_oper_bindings_ptr = server.reload_bindings.ptr;
+    const old_parsed_opers_ptr = server.reload_parsed.?.opers.ptr;
+    const old_class_registry_ptr = server.config.class_registry.?.classes.ptr;
+    const old_modules_ptr = &module_manifest.Live.modules;
+    const old_command_table_ptr = &module_manifest.Live.commands;
+    const old_command_table_len = module_manifest.Live.commands.len;
+    const old_rehash_handler = module_manifest.Live.lookupCommand("REHASH").?.spec.handler;
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rehash-atomic.toml", .data = new_text });
+    const invocation = try irc_line.parseLine("REHASH");
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.overflow_allocator = allocator;
+    conn.token = try tokenFromId(id);
+    conn.send_armed = true;
+    conn.test_sendq_capture = true;
+    defer {
+        if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(allocator);
+        if (server.rx().clients.get(id)) |live| {
+            live.send_armed = false;
+            _ = server.rx().clients.free(id);
+        }
+    }
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_rehash});
+    try conn.session.setNick("RehashOp");
+
+    var injected_failures: usize = 0;
+    var allocation_offset: usize = 0;
+    while (allocation_offset < 128) : (allocation_offset += 1) {
+        failing.fail_index = failing.alloc_index + allocation_offset;
+        failing.resize_fail_index = std.math.maxInt(usize);
+        failing.has_induced_failure = false;
+        conn.send_len = 0;
+        try server.handleRehashParsedWithClassAllocator(conn, &invocation, failing.allocator());
+
+        if (!failing.has_induced_failure) {
+            const success_reply = conn.send_buf[0..conn.send_len];
+            try std.testing.expect(std.mem.indexOf(u8, success_reply, "Configuration reloaded") != null);
+            try std.testing.expectEqual(@as(u32, 9), server.config.max_clones_per_ip);
+            try std.testing.expectEqual(@as(u64, 3000), server.config.nick_delay_ms);
+            try std.testing.expectEqual(@as(u32, 8), server.config.throttle_connects);
+            try std.testing.expectEqual(@as(u64, 20_000), server.config.throttle_window_ms);
+            try std.testing.expectEqual(@as(usize, 8), server.conn_throttle.?.params.max_connects_per_window);
+            try std.testing.expectEqual(@as(u64, 20_000), server.conn_throttle.?.params.window_ms);
+            try std.testing.expect(server.config.class_registry.?.byName("user").?.policy.require_sasl);
+            try std.testing.expectEqualStrings("new-admin", server.oper_registry.?.bindings[0].account_name);
+            try std.testing.expect(server.reload_bindings.ptr != old_oper_bindings_ptr);
+            try std.testing.expect(server.reload_parsed.?.opers.ptr != old_parsed_opers_ptr);
+            try std.testing.expectEqual(old_modules_ptr, &module_manifest.Live.modules);
+            try std.testing.expectEqual(old_command_table_ptr, &module_manifest.Live.commands);
+            try std.testing.expectEqual(old_command_table_len, module_manifest.Live.commands.len);
+            try std.testing.expectEqual(@intFromPtr(old_rehash_handler), @intFromPtr(module_manifest.Live.lookupCommand("REHASH").?.spec.handler));
+
+            var admission_probe = ConnState.init(-1);
+            admission_probe.overflow_allocator = allocator;
+            admission_probe.test_sendq_capture = true;
+            defer if (admission_probe.send_overflow.capacity > 0) admission_probe.send_overflow.deinit(allocator);
+            server.assignConnClass(&admission_probe);
+            try std.testing.expect(server.enforceClassAdmission(&admission_probe));
+            break;
+        }
+
+        injected_failures += 1;
+        const failure_reply = conn.send_buf[0..conn.send_len];
+        try std.testing.expect(std.mem.indexOf(u8, failure_reply, "REHASH: out of memory; keeping current config") != null);
+        try std.testing.expect(std.mem.indexOf(u8, failure_reply, "Configuration reloaded") == null);
+        try std.testing.expectEqual(@as(u32, 0), server.config.max_clones_per_ip);
+        try std.testing.expectEqual(@as(u64, 0), server.config.nick_delay_ms);
+        try std.testing.expectEqual(@as(u32, 4), server.config.throttle_connects);
+        try std.testing.expectEqual(@as(u64, 10_000), server.config.throttle_window_ms);
+        try std.testing.expectEqual(@as(usize, 4), server.conn_throttle.?.params.max_connects_per_window);
+        try std.testing.expectEqual(@as(u64, 10_000), server.conn_throttle.?.params.window_ms);
+        try std.testing.expectEqual(old_class_generation, server.policy_gen_class);
+        try std.testing.expectEqual(old_class_registry_ptr, server.config.class_registry.?.classes.ptr);
+        try std.testing.expect(!server.config.class_registry.?.byName("user").?.policy.require_sasl);
+        try std.testing.expect(server.conn_throttle != null);
+        try std.testing.expect(server.reload_parsed.?.opers.ptr == old_parsed_opers_ptr);
+        try std.testing.expectEqual(old_oper_bindings_ptr, server.reload_bindings.ptr);
+        try std.testing.expectEqualStrings("old-admin", server.oper_registry.?.bindings[0].account_name);
+        try std.testing.expectEqual(old_registry.bindings.ptr, server.oper_registry.?.bindings.ptr);
+        try std.testing.expectEqual(old_modules_ptr, &module_manifest.Live.modules);
+        try std.testing.expectEqual(old_command_table_ptr, &module_manifest.Live.commands);
+        try std.testing.expectEqual(old_command_table_len, module_manifest.Live.commands.len);
+        try std.testing.expectEqual(@intFromPtr(old_rehash_handler), @intFromPtr(module_manifest.Live.lookupCommand("REHASH").?.spec.handler));
+
+        var admission_probe = ConnState.init(-1);
+        admission_probe.overflow_allocator = allocator;
+        admission_probe.test_sendq_capture = true;
+        defer if (admission_probe.send_overflow.capacity > 0) admission_probe.send_overflow.deinit(allocator);
+        server.assignConnClass(&admission_probe);
+        try std.testing.expect(!server.enforceClassAdmission(&admission_probe));
+    }
+    try std.testing.expect(injected_failures > 0);
+    try std.testing.expect(allocation_offset < 128);
+    std.debug.print("REHASH class-policy allocation failpoints exercised: {d}\n", .{injected_failures});
 }
 
 test "same-nick atomic restore sends only safe deferred mesh departures" {
@@ -138640,7 +138861,7 @@ test "GAP-O10 policy rollback restores the last ward, filter, class, and ban gen
     var builder = conn_class.Builder.init(allocator);
     defer builder.deinit();
     try builder.add(.{ .name = "vip", .policy = .{ .max_per_account = 9 } });
-    server.installClassRegistry(try builder.finish());
+    try server.installClassRegistry(try builder.finish());
     try std.testing.expectEqual(@as(u32, 9), server.config.class_registry.?.byName("vip").?.policy.max_per_account);
     try std.testing.expectEqual(@as(u32, 2), server.policy_gen_class);
     try expectProof(&server.oper_audit, .other, "class replace", 2);
