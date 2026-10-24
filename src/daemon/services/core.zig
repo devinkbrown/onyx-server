@@ -75,6 +75,7 @@ const sessions_domain = @import("sessions.zig");
 const webpush_domain = @import("webpush.zig");
 
 pub const Services = struct {
+    pub const ScramCredentialGuard = accounts_domain.Context.ScramCredentialGuard;
     store: *OroStore,
     /// Set only by the closed StateContext factory. That factory retains this
     /// entire Services object privately; no bound Services/Store pointer leaves
@@ -810,6 +811,14 @@ pub const Services = struct {
 
     pub fn identifyAccount(self: *Services, name: []const u8, password: []const u8) ServiceError!CommandResult {
         return self.accountsView().identifyAccount(name, password);
+    }
+
+    pub fn acquireScramCredentialGuard(
+        self: *Services,
+        account: []const u8,
+        expected: @import("../../proto/sasl.zig").CredentialFingerprint,
+    ) ServiceError!ScramCredentialGuard {
+        return self.accountsView().acquireScramCredentialGuard(account, expected);
     }
 
     pub fn identifyAccountWithAudit(self: *Services, name: []const u8, password: []const u8, entry: LoginAuditEntry) ServiceError!CommandResult {

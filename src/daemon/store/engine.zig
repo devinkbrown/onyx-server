@@ -731,7 +731,7 @@ pub const OroStore = struct {
         // set, not merely a subset whose individual rows happen to match.
         if (active.count == 0 or active.count > max_batch_mutations) return StoreError.InvalidTablePlan;
         var edit_count: usize = 0;
-        var seen: [family_count]u8 = @splat(0);
+        var seen = std.mem.zeroes([family_count][max_batch_mutations]bool);
         for (&active.table_plans, 0..) |*plan, i| if (plan.*) |*value| {
             if (value.owner != &self.maps[i].map or value.edit_count == 0 or value.edit_count > max_batch_mutations) return StoreError.InvalidTablePlan;
             try value.validate();
@@ -743,16 +743,16 @@ pub const OroStore = struct {
             const plan = &(active.table_plans[index] orelse return StoreError.InvalidTablePlan);
             if (entry.key == null or (entry.kind == .put) != (entry.value != null)) return StoreError.InvalidTablePlan;
             const matched = plan.editIndex(entry.key.?, entry.value) orelse return StoreError.InvalidTablePlan;
-            const bit = @as(u8, 1) << @as(u3, @intCast(matched));
-            if (seen[index] & bit != 0) return StoreError.InvalidTablePlan;
-            seen[index] |= bit;
+            if (matched >= max_batch_mutations or seen[index][matched]) return StoreError.InvalidTablePlan;
+            seen[index][matched] = true;
             if (self.maps[index].map.getEntry(entry.key.?)) |old| {
                 if (entry.old_key == null or entry.old_value == null or entry.old_key.?.ptr != old.key_ptr.*.ptr or entry.old_key.?.len != old.key_ptr.*.len or entry.old_value.?.ptr != old.value_ptr.*.ptr or entry.old_value.?.len != old.value_ptr.*.len) return StoreError.InvalidTablePlan;
             } else if (entry.old_key != null or entry.old_value != null) return StoreError.InvalidTablePlan;
         }
         for (active.table_plans, 0..) |plan, i| if (plan) |value| {
-            const complete = (@as(u16, 1) << @as(u4, @intCast(value.edit_count))) - 1;
-            if (seen[i] != complete) return StoreError.InvalidTablePlan;
+            if (value.edit_count > max_batch_mutations) return StoreError.InvalidTablePlan;
+            for (0..value.edit_count) |edit_index| if (!seen[i][edit_index]) return StoreError.InvalidTablePlan;
+            for (value.edit_count..max_batch_mutations) |edit_index| if (seen[i][edit_index]) return StoreError.InvalidTablePlan;
         };
     }
 

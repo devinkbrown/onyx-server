@@ -19,6 +19,8 @@ const ServiceError = @import("records.zig").ServiceError;
 const SessionTokenIssue = @import("records.zig").SessionTokenIssue;
 const certfp_key_max = @import("records.zig").certfp_key_max;
 const certfpKey = @import("records.zig").certfpKey;
+const scram_key_max = @import("records.zig").scram_key_max;
+const scramKey = @import("records.zig").scramKey;
 const WebauthnCredential = @import("contracts.zig").WebauthnCredential;
 const AuthAtomicTestOperation = @import("test_support.zig").AuthAtomicTestOperation;
 const auth_atomic_old_secret = @import("test_support.zig").auth_atomic_old_secret;
@@ -135,7 +137,7 @@ test "TOTP Services atomic policy write and sync ambiguity deny every auth until
                 }, &scram_record_buf).?;
                 try store.family(.props).put("scram:alice", scram_record);
                 const loader = services.scramLoader();
-                var backfill_destination = ScramStore.init(std.testing.allocator);
+                var backfill_destination = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
                 defer backfill_destination.deinit();
                 try std.testing.expect(loader.loadFn(loader.ptr, "alice", &backfill_destination));
                 const seq_before = store.next_seq;
@@ -242,7 +244,7 @@ test "TOTP Services forced reset reserves SCRAM cache before durable mutation an
         var store = try openTestStore(tmp, "auth-reset-scram.wal");
         defer store.deinit();
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        var scram = ScramStore.init(failing.allocator());
+        var scram = ScramStore.initWithIterationsForTesting(failing.allocator(), 1);
         defer scram.deinit();
         var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
         var scratch: [record_max]u8 = undefined;
@@ -295,7 +297,7 @@ test "TOTP Services forced reset reserves SCRAM cache before durable mutation an
         var reopened = try openTestStore(tmp, "auth-reset-scram.wal");
         defer reopened.deinit();
         var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
-        var cold_scram = ScramStore.init(std.testing.allocator);
+        var cold_scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
         defer cold_scram.deinit();
         cold_scram.setLoader(cold.scramLoader());
         const restored = cold_scram.resolve("alice").?;
@@ -320,7 +322,7 @@ test "ordinary password change keeps PLAIN SCRAM and tokens atomic across alloca
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
         var store = try OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "password-change-oom.wal");
         defer store.deinit();
-        var scram = ScramStore.init(std.testing.allocator);
+        var scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
         defer scram.deinit();
         var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
         services.attachScramStore(&scram);
@@ -354,7 +356,7 @@ test "ordinary password change keeps PLAIN SCRAM and tokens atomic across alloca
                 var reopened = try openTestStore(tmp, "password-change-oom.wal");
                 defer reopened.deinit();
                 var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
-                var cold_scram = ScramStore.init(std.testing.allocator);
+                var cold_scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
                 defer cold_scram.deinit();
                 cold_scram.setLoader(cold.scramLoader());
                 cold.attachScramStore(&cold_scram);
@@ -384,7 +386,7 @@ test "DROP atomically revokes credentials before same-name re-registration" {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
         var store = try OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "drop-credentials.wal");
         defer store.deinit();
-        var scram = ScramStore.init(std.testing.allocator);
+        var scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
         defer scram.deinit();
         var binds = @import("../certfp_bind.zig").CertfpBindStore.init(std.testing.allocator);
         defer binds.deinit();
@@ -397,13 +399,8 @@ test "DROP atomically revokes credentials before same-name re-registration" {
         Internal.persistScram(&services, &scram, "alice");
         try services.bindCertfp("alice", fingerprint);
         try services.webauthnBind("alice", "credDROP", &cose, 1, "old", 1);
-        // Model rows left by older best-effort index writes: the direct
-        // credentials still name alice, while both account indexes are absent.
-        var certfp_list_key_buf: [@import("records.zig").certfp_account_key_max]u8 = undefined;
-        try store.family(.props).delete(@import("records.zig").certfpAccountKey(&certfp_list_key_buf, "alice").?);
-        var webauthn_list_key_buf: [@import("../webauthn_creds.zig").account_list_key_max]u8 = undefined;
-        try store.family(.props).delete(@import("../webauthn_creds.zig").accountListKey(&webauthn_list_key_buf, "alice").?);
         const old_token = try services.issueSessionToken("alice", 1000);
+        const old_scram_key = scram.lookup("alice").?.stored_key;
         failing.fail_index = failing.alloc_index + failure_index;
 
         const dropped = services.dropAccount("alice", auth_atomic_old_password) catch |err| {
@@ -430,13 +427,17 @@ test "DROP atomically revokes credentials before same-name re-registration" {
                 var reopened = try openTestStore(tmp, "drop-credentials.wal");
                 defer reopened.deinit();
                 var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
-                var cold_scram = ScramStore.init(std.testing.allocator);
+                var cold_scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
                 defer cold_scram.deinit();
                 cold_scram.setLoader(cold.scramLoader());
                 cold.attachScramStore(&cold_scram);
                 var token_out: [account_max]u8 = undefined;
                 try std.testing.expect(cold.validateSessionToken("alice", old_token.tokenSlice(), 1002, &token_out) == null);
-                try std.testing.expect(cold_scram.resolve("alice") == null);
+                const restored_scram = cold_scram.resolve("alice").?;
+                try std.testing.expect(!std.mem.eql(u8, &old_scram_key, &restored_scram.stored_key));
+                var restored_keys = try sasl.deriveScramKeys(auth_atomic_new_password, restored_scram.salt, restored_scram.iterations);
+                defer restored_keys.wipe();
+                try std.testing.expectEqualSlices(u8, &restored_keys.stored_key, &restored_scram.stored_key);
                 try std.testing.expectError(error.NotFound, cold.webauthnLookup("credDROP", &credential));
                 _ = try cold.identifyAccount("alice", auth_atomic_new_password);
             }
@@ -461,6 +462,123 @@ test "DROP atomically revokes credentials before same-name re-registration" {
     } else return error.FailureSweepDidNotComplete;
 }
 
+test "DROP work stays bounded with 50 revoked session-token generations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "drop-token-generations.wal");
+    defer store.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccount("alice", auth_atomic_old_password, &scratch);
+    var first_token: SessionTokenIssue = undefined;
+    for (0..50) |generation| {
+        const issued = try services.issueSessionToken("alice", 1000 + @as(i64, @intCast(generation * 100)));
+        if (generation == 0) first_token = issued;
+        try services.revokeSessionTokens("alice");
+    }
+    _ = try services.dropAccount("alice", auth_atomic_old_password);
+    _ = try services.registerAccount("alice", auth_atomic_new_password, &scratch);
+    var token_account: [account_max]u8 = undefined;
+    try std.testing.expect(services.validateSessionToken("alice", first_token.tokenSlice(), 10_000, &token_account) == null);
+    var reopened = try openTestStore(tmp, "drop-token-generations.wal");
+    defer reopened.deinit();
+    var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+    try std.testing.expect(cold.validateSessionToken("alice", first_token.tokenSlice(), 10_000, &token_account) == null);
+}
+
+test "DROP ignores unrelated props above the former global scan limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "drop-many-props.wal");
+    defer store.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccount("alice", auth_atomic_old_password, &scratch);
+    var key_buf: [32]u8 = undefined;
+    const props = &store.maps[@backingInt(store_mod.Family.props)];
+    for (0..4100) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "unrelated-{d}", .{i});
+        try props.put(key, "not an account credential");
+    }
+    _ = try services.dropAccount("alice", auth_atomic_old_password);
+    try std.testing.expectError(error.AuthFailed, services.identifyAccount("alice", auth_atomic_old_password));
+    try std.testing.expectEqual(@as(u32, 4100), props.map.count());
+}
+
+test "DROP deduplicates legacy repeated CERTFP list entries before batch prepare" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "drop-duplicate-certfp.wal");
+    defer store.deinit();
+    var binds = @import("../certfp_bind.zig").CertfpBindStore.init(std.testing.allocator);
+    defer binds.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    services.attachCertfpBinds(&binds);
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccount("alice", auth_atomic_old_password, &scratch);
+    const fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try services.bindCertfp("alice", fingerprint);
+    var list_key_buf: [@import("records.zig").certfp_account_key_max]u8 = undefined;
+    const list_key = @import("records.zig").certfpAccountKey(&list_key_buf, "alice").?;
+    var repeated: [@import("records.zig").certfp_list_value_max]u8 = undefined;
+    var repeated_len: usize = 0;
+    for (0..16) |i| {
+        if (i != 0) {
+            repeated[repeated_len] = '\n';
+            repeated_len += 1;
+        }
+        @memcpy(repeated[repeated_len..][0..fingerprint.len], fingerprint);
+        repeated_len += fingerprint.len;
+    }
+    try store.family(.props).put(list_key, repeated[0..repeated_len]);
+    _ = try services.dropAccount("alice", auth_atomic_old_password);
+    try std.testing.expect(services.accountForCertfp(fingerprint) == null);
+    _ = try services.registerAccount("alice", auth_atomic_new_password, &scratch);
+    try std.testing.expect(services.accountForCertfp(fingerprint) == null);
+}
+
+test "SCRAM credential guard validates durable tuple and releases on every error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "scram-credential-guard.wal");
+    defer store.deinit();
+    var scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
+    defer scram.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    services.attachScramStore(&scram);
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccount("alice", auth_atomic_old_password, &scratch);
+    try services.setAccountPasswordForced("alice", auth_atomic_new_password, &scratch);
+
+    var scram_key_buf: [scram_key_max]u8 = undefined;
+    const scram_key = scramKey(&scram_key_buf, "alice").?;
+    const full = ScramStore.deserializeFullRecord(store.family(.props).get(scram_key).?).?;
+    const fingerprint256 = sasl.fingerprintScramCredential(.sha256, full.salt, full.iterations, &full.stored_key, &full.server_key).?;
+    const fingerprint512 = sasl.fingerprintScramCredential(.sha512, full.salt, full.iterations, &full.stored_key_512, &full.server_key_512).?;
+    {
+        var guard = try services.acquireScramCredentialGuard("alice", fingerprint256);
+        guard.release();
+    }
+    {
+        var guard = try services.acquireScramCredentialGuard("alice", fingerprint512);
+        guard.deinit();
+    }
+
+    var stale = fingerprint256;
+    stale.digest[0] ^= 1;
+    try std.testing.expectError(error.AuthFailed, services.acquireScramCredentialGuard("alice", stale));
+    _ = try services.identifyAccount("alice", auth_atomic_new_password); // mismatch path released the shared lock
+
+    try services.changeAccountPassword("alice", auth_atomic_new_password, "replacement password with enough entropy", &scratch);
+    try std.testing.expectError(error.AuthFailed, services.acquireScramCredentialGuard("alice", fingerprint256));
+    const updated = ScramStore.deserializeFullRecord(store.family(.props).get(scram_key).?).?;
+    const current = sasl.fingerprintScramCredential(.sha256, updated.salt, updated.iterations, &updated.stored_key, &updated.server_key).?;
+    var guard = try services.acquireScramCredentialGuard("alice", current);
+    guard.release();
+    _ = try services.dropAccount("alice", "replacement password with enough entropy");
+    try std.testing.expectError(error.NotFound, services.acquireScramCredentialGuard("alice", current));
+}
+
 test "TOTP Services forced reset ambiguity preserves live SCRAM and replays one complete credential policy" {
     const cases = [_]struct { fault: store_mod.PreparedIoFault, committed: bool }{
         .{ .fault = .{ .write = .failed }, .committed = false },
@@ -475,7 +593,7 @@ test "TOTP Services forced reset ambiguity preserves live SCRAM and replays one 
         {
             var store = try openTestStore(tmp, "auth-reset-scram-io.wal");
             defer store.deinit();
-            var scram = ScramStore.init(std.testing.allocator);
+            var scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
             defer scram.deinit();
             var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
             var scratch: [record_max]u8 = undefined;
@@ -495,7 +613,7 @@ test "TOTP Services forced reset ambiguity preserves live SCRAM and replays one 
         var reopened = try openTestStore(tmp, "auth-reset-scram-io.wal");
         defer reopened.deinit();
         var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
-        var cold_scram = ScramStore.init(std.testing.allocator);
+        var cold_scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
         defer cold_scram.deinit();
         cold_scram.setLoader(cold.scramLoader());
         const restored = cold_scram.resolve("alice").?;
@@ -570,13 +688,13 @@ test "TOTP Services SCRAM backfill holds durable borrow through cache publicatio
     var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
     var scratch: [record_max]u8 = undefined;
     _ = try services.registerAccount("alice", auth_atomic_old_password, &scratch);
-    var fixture_scram = ScramStore.init(std.testing.allocator);
+    var fixture_scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
     defer fixture_scram.deinit();
     try fixture_scram.storeWithSalt("alice", auth_atomic_old_password, "old-scram-salt16", 1);
     Internal.persistScram(&services, &fixture_scram, "alice");
     const old_token = try services.issueSessionToken("alice", 1000);
     var pausing: PausingAllocator = .{};
-    var destination = ScramStore.init(pausing.allocator());
+    var destination = ScramStore.initWithIterationsForTesting(pausing.allocator(), 1);
     defer destination.deinit();
     destination.setLoader(services.scramLoader());
     services.attachScramStore(&destination);
@@ -620,7 +738,7 @@ test "TOTP Services SCRAM backfill holds durable borrow through cache publicatio
     var reopened = try openTestStore(tmp, "auth-backfill-reset.wal");
     defer reopened.deinit();
     var cold = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
-    var cold_scram = ScramStore.init(std.testing.allocator);
+    var cold_scram = ScramStore.initWithIterationsForTesting(std.testing.allocator, 1);
     defer cold_scram.deinit();
     cold_scram.setLoader(cold.scramLoader());
     const restored = cold_scram.resolve("alice").?;

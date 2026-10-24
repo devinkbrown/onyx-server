@@ -131,6 +131,56 @@ test "STORE maximum credential revocation batch survives commit and cold replay"
     try std.testing.expectError(error.BadRecord, reopened.prepareBatch(&too_many));
 }
 
+test "STORE batch selector validation covers same-family edits at 8 9 16 and 42" {
+    const counts = [_]usize{ 8, 9, 16, 42 };
+    for (counts) |count| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var key_bufs: [max_batch_mutations][32]u8 = undefined;
+        var mutations: [max_batch_mutations]BatchMutation = undefined;
+        var store = try openTestStore(tmp, "batch-selector-width.wal");
+        defer store.deinit();
+        for (0..count) |i| {
+            const key = try std.fmt.bufPrint(&key_bufs[i], "selector-{d}", .{i});
+            try store.put(.props, key, "live");
+            mutations[i] = .{ .family = .props, .kind = .delete, .key = key };
+        }
+        var prepared = try store.prepareBatch(mutations[0..count]);
+        defer prepared.abort();
+        try prepared.commit();
+        for (mutations[0..count]) |mutation| try std.testing.expect(store.get(.props, mutation.key) == null);
+        var reopened = try openTestStore(tmp, "batch-selector-width.wal");
+        defer reopened.deinit();
+        for (mutations[0..count]) |mutation| try std.testing.expect(reopened.get(.props, mutation.key) == null);
+    }
+}
+
+test "STORE batch selector validation completes mixed-family deletes and cold replay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "batch-mixed-delete.wal");
+    defer store.deinit();
+    const seeds = [_]struct { family: @import("contracts.zig").Family, key: []const u8 }{
+        .{ .family = .props, .key = "credential-a" },
+        .{ .family = .props, .key = "credential-b" },
+        .{ .family = .accounts, .key = "alice" },
+        .{ .family = .memos, .key = "memo-1" },
+    };
+    for (seeds) |seed| try store.put(seed.family, seed.key, "live");
+    const mutations = [_]BatchMutation{
+        .{ .family = .props, .kind = .delete, .key = "credential-a" },
+        .{ .family = .props, .kind = .delete, .key = "credential-b" },
+        .{ .family = .accounts, .kind = .delete, .key = "alice" },
+        .{ .family = .memos, .kind = .delete, .key = "memo-1" },
+    };
+    var prepared = try store.prepareBatch(&mutations);
+    defer prepared.abort();
+    try prepared.commit();
+    var reopened = try openTestStore(tmp, "batch-mixed-delete.wal");
+    defer reopened.deinit();
+    for (seeds) |seed| try std.testing.expect(reopened.get(seed.family, seed.key) == null);
+}
+
 fn maxBatchFailureAt(fail_offset: usize) !bool {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
