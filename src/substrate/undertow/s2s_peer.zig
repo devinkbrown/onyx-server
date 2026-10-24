@@ -4404,6 +4404,11 @@ pub const S2sPeer = struct {
         if (self.established and !had_attachment_lease_v2 and self.peer_supports_session_attachment_lease_v2)
             self.resync_requested = true;
         self.peer_supports_secure_relay_v2 = self.peer_supports_signing and (hs.caps & cap_secure_relay_v2) != 0;
+        // A refreshed base handshake does not refresh the append-only schema
+        // proofs. Revoke both independently negotiated MESSAGE_V2 extensions
+        // until this handshake's explicit PONG proofs arrive.
+        self.peer_supports_relay_v2_current = false;
+        self.peer_supports_relay_v2_ack_confirm = false;
         // The fixed handshake byte only establishes the secured relay base.
         // Re-authorize the current E2EEGROUP schema on every handshake.
         self.peer_supports_e2ee_group_current = false;
@@ -4431,6 +4436,8 @@ pub const S2sPeer = struct {
         // covers reciprocal RESYNC handshakes where `handshake_sent` is already
         // true, while a same-socket Helix downgrade remains fail-closed.
         if (self.supportsSecureRelayV2Base()) {
+            try emitFrame(self.allocator, sink, .PING, relay_v2_extension_probe);
+            try emitFrame(self.allocator, sink, .PING, relay_v2_ack_confirm_probe);
             try emitFrame(self.allocator, sink, .PING, e2ee_group_extension_probe);
             try emitFrame(self.allocator, sink, .PING, message_v2_guest_probe);
         }
@@ -6356,6 +6363,72 @@ test "secure relay v2 negotiates only on secured peers and round-trips once" {
     try std.testing.expectEqual(@as(usize, 1), inbound.len);
     try std.testing.expect(!(try b.forwardMessageV2(b_to_a.sink(), inbound[0].wire)));
     try std.testing.expectEqual(@as(usize, 0), b_to_a.bytes.items.len);
+}
+
+test "refreshed base handshake revokes and independently reprobes MESSAGE_V2 xcaps" {
+    const allocator = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 10 };
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    const kp_a = try signingKeyFor(0x79);
+    const kp_b = try signingKeyFor(0x7a);
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    var a = try newSigningPeer(allocator, &a_state, &tc, kp_a, b_short, 1000, "a.test");
+    defer a.deinit();
+    var b = try newSigningPeer(allocator, &b_state, &tc, kp_b, a_short, 2000, "b.test");
+    defer b.deinit();
+    a.secure_relay_transport_enabled = true;
+    b.secure_relay_transport_enabled = true;
+    var a_to_b = BufferSink{};
+    defer a_to_b.deinit(allocator);
+    var b_to_a = BufferSink{};
+    defer b_to_a.deinit(allocator);
+
+    try a.startHandshake(a_to_b.sink());
+    try b.startHandshake(b_to_a.sink());
+    try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6140);
+    try std.testing.expect(a.supportsSecureRelayV2());
+    try std.testing.expect(a.peer_supports_relay_v2_current);
+    try std.testing.expect(a.peer_supports_relay_v2_ack_confirm);
+
+    // A same-identity HANDSHAKE on a preserved link invalidates both xcaps.
+    // The receiver must ask again, even though handshake_sent is already set.
+    a_to_b.clear();
+    b_to_a.clear();
+    try b.emitHandshake(b_to_a.sink());
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6141);
+    b_to_a.clear();
+    try std.testing.expect(!a.peer_supports_relay_v2_current);
+    try std.testing.expect(!a.peer_supports_relay_v2_ack_confirm);
+    try std.testing.expect(!a.supportsSecureRelayV2());
+
+    // A legacy peer echoes probe tokens as PONG payloads. Those echoes are not
+    // either distinct extension reply and cannot restore either capability.
+    try emitFrame(allocator, b_to_a.sink(), .PONG, relay_v2_extension_probe);
+    try emitFrame(allocator, b_to_a.sink(), .PONG, relay_v2_ack_confirm_probe);
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6142);
+    b_to_a.clear();
+    try std.testing.expect(!a.peer_supports_relay_v2_current);
+    try std.testing.expect(!a.peer_supports_relay_v2_ack_confirm);
+
+    // The separate current-schema proof restores only its own bit.
+    try emitFrame(allocator, b_to_a.sink(), .PONG, relay_v2_extension_reply);
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6143);
+    b_to_a.clear();
+    try std.testing.expect(a.peer_supports_relay_v2_current);
+    try std.testing.expect(!a.peer_supports_relay_v2_ack_confirm);
+    try std.testing.expect(!a.supportsSecureRelayV2());
+
+    // ACK_CONFIRM remains disabled until its own fresh distinct reply arrives.
+    try emitFrame(allocator, b_to_a.sink(), .PONG, relay_v2_ack_confirm_reply);
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6144);
+    b_to_a.clear();
+    try std.testing.expect(a.peer_supports_relay_v2_current);
+    try std.testing.expect(a.peer_supports_relay_v2_ack_confirm);
+    try std.testing.expect(a.supportsSecureRelayV2());
 }
 
 test "MESSAGE_V2 guest xcap requires its exact PONG over secure relay" {
