@@ -126573,8 +126573,15 @@ test "send error waits for quiet recv CQE and stale generation cannot free reuse
     old.overflow_allocator = std.testing.allocator;
     old.token = try tokenFromId(old_id);
     const old_token = old.token;
+    const copy_tail = "pending-copy-tail";
+    @memcpy(old.send_buf[0..copy_tail.len], copy_tail);
+    old.send_len = copy_tail.len;
+    old.send_submitted_len = copy_tail.len;
+    old.send_submitted_offset = 0;
+    try old.send_overflow.appendSlice(old.overflow_allocator, "pending-copy-overflow");
     old.recv_armed = true;
     old.send_armed = true;
+    const queued_before = server.rx().ring.inner.sq_ready();
 
     try server.handleSend(.{
         .token = old_token,
@@ -126583,8 +126590,13 @@ test "send error waits for quiet recv CQE and stale generation cannot free reuse
         .notif = false,
     });
     try std.testing.expect(old.closing);
+    try std.testing.expect(old.send_terminal_failure);
     try std.testing.expect(old.recv_armed);
     try std.testing.expect(!old.send_armed);
+    try std.testing.expectEqual(@as(usize, 0), old.send_len);
+    try std.testing.expectEqual(@as(usize, 0), old.send_submitted_len);
+    try std.testing.expectEqual(@as(usize, 0), old.send_overflow.items.len);
+    try std.testing.expectEqual(queued_before, server.rx().ring.inner.sq_ready());
     try std.testing.expect(server.rx().clients.get(old_id) != null);
 
     // The retained recv-owned slot cannot be selected for a new connection.
@@ -126598,6 +126610,7 @@ test "send error waits for quiet recv CQE and stale generation cannot free reuse
         .more = false,
     });
     try std.testing.expect(server.rx().clients.get(old_id) == null);
+    try std.testing.expectEqual(queued_before, server.rx().ring.inner.sq_ready());
 
     const reused_id = try server.rx().clients.alloc(ConnState.init(-1));
     try std.testing.expectEqual(old_id.slot, reused_id.slot);
@@ -126649,6 +126662,8 @@ test "SEND_ZC terminal EPIPE drops queued tail after notification without retry"
     conn.overflow_allocator = std.testing.allocator;
     conn.token = try tokenFromId(id);
     server.noteClientAccepted(conn);
+    try conn.session.setNick("EpipePoison");
+    conn.session.registration.registered = true;
     conn.recv_armed = true;
 
     const queued = "failed-frame-tail";
@@ -126674,6 +126689,24 @@ test "SEND_ZC terminal EPIPE drops queued tail after notification without retry"
     try std.testing.expectEqual(queued.len, conn.send_len);
     try std.testing.expectEqualStrings(queued, conn.send_buf[0..conn.send_len]);
     try std.testing.expectEqualStrings("overflow-tail", conn.send_overflow.items);
+
+    // Helix may not carry the terminal marker, so this closing registered
+    // connection must make the whole client seal incomplete while SEND_ZC
+    // still owns the inline buffer. It cannot be adopted and retry the tail.
+    var seal_pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer seal_pieces.deinit(std.testing.allocator);
+    var seal_blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seal_blobs.items) |blob| std.testing.allocator.free(blob);
+        seal_blobs.deinit(std.testing.allocator);
+    }
+    var seal_fds: [1]linux.fd_t = undefined;
+    var seal_fd_count: usize = 0;
+    var seal_counts = Server.SealCounts{};
+    server.sealShardClients(&server.reactors[0], &seal_pieces, &seal_blobs, &seal_fds, &seal_fd_count, &seal_counts);
+    try std.testing.expectEqual(@as(usize, 1), seal_counts.clients_expected);
+    try std.testing.expectEqual(@as(usize, 0), seal_counts.clients);
+    try std.testing.expectEqual(@as(usize, 0), seal_fd_count);
 
     // Releasing the exact SEND_ZC buffer discards both tails and must not arm a
     // second send. The slot remains alive solely for its outstanding RECV.
