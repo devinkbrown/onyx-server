@@ -188,6 +188,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [mesh]
     try setStr(allocator, resolver, doc.getString("mesh.realm"), &cfg.mesh.realm);
+    try setOpt(allocator, resolver, doc.getString("mesh.presence_store_path"), &cfg.mesh.presence_store_path);
     try setOpt(allocator, resolver, doc.getString("mesh.mesh_pass"), &cfg.mesh.mesh_pass);
     try setOpt(allocator, resolver, doc.getString("mesh.admission_token"), &cfg.mesh.admission_token);
     if (doc.getArray("mesh.trust_roots")) |arr| {

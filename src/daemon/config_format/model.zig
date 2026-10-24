@@ -330,6 +330,10 @@ pub const Config = struct {
     pub const Mesh = struct {
         realm: []const u8 = "",
         trust_roots: []const []const u8 = &.{},
+        /// Private leased WAL for signed ordinary-guest presence, incarnation
+        /// issuance, and replay-safe retirement. Required for mesh deployments
+        /// with a node identity; it is never shared with account/session stores.
+        presence_store_path: ?[]const u8 = null,
         mesh_pass: ?[]const u8 = null,
         /// Encoded MeshPass signed-capability token this node presents in the
         /// encrypted Mooring M1. Accepts hex or standard base64 text.
@@ -1004,6 +1008,7 @@ pub const Config = struct {
         }
         allocator.free(self.classes);
         allocator.free(self.mesh.realm);
+        if (self.mesh.presence_store_path) |value| allocator.free(value);
         freeStringList(allocator, self.mesh.trust_roots);
         freeStringList(allocator, self.mesh.admission_roots);
         freeStringList(allocator, self.mesh.relay_v2_roster);
