@@ -9,91 +9,14 @@ const std = @import("std");
 const rwlock = @import("../substrate/rwlock.zig");
 const ebr = @import("../substrate/ebr.zig");
 const world_rcu = @import("world_rcu.zig");
+const world_rcu_state = @import("world_rcu_state.zig");
 const ident_utf8 = @import("../substrate/utf8.zig");
 
-/// Lazily-created RCU mirror of the nick registry (the lock-free read path).
-/// Heap-allocated so the EBR domain has a stable address: registered writer and
-/// per-thread reader participants plus the registry's borrowed `&domain` must
-/// stay valid after the owning `World` is moved (World.init returns by value).
-/// Activated lazily and, once live, drives EVERY nick read (`findNick`) and collision check — the read
-/// hot path is lock-free at the registry level and case-insensitive (RFC1459-ish
-/// ASCII casemapping; "Alice" and "alice" are the same nick). `client_nicks`
-/// remains the authoritative id->nick reverse index; the RCU registry is
-/// authoritative for nick->id.
-const RcuNickState = struct {
-    domain: ebr.Domain,
-    generation: usize,
-    /// Writer-side participant used for CoW publish/retire. Readers must never
-    /// share it; they use a per-thread participant from `rcuReaderParticipant`.
-    writer_participant: *ebr.Participant,
-    nicks: world_rcu.NickRegistry,
-};
-
-/// Marker value stored in the RCU channel-existence mirror. The mirror only
-/// answers "does this channel name exist?" (lock-free, case-insensitive); the
-/// authoritative `Channel` records live in `World.channels`. We store the
-/// channel OID as a witness so the value type is a plain integer (no dangling
-/// pointer into the rehash-prone `channels` map).
-const RcuChannelState = struct {
-    domain: ebr.Domain,
-    generation: usize,
-    /// Writer-side participant used for CoW publish/retire. Readers must never
-    /// share it; they use a per-thread participant from `rcuReaderParticipant`.
-    writer_participant: *ebr.Participant,
-    /// channel name -> OID witness (existence set).
-    names: world_rcu.ChannelRegistry(u32),
-    /// One membership set per live channel, keyed by case-folded channel name.
-    /// The MembershipSet values are heap-allocated for stable addresses (the
-    /// AutoHashMap may rehash). All share the same EBR `domain`; writers use
-    /// `writer_participant`, and readers use per-thread participants.
-    members: std.StringHashMapUnmanaged(*world_rcu.MembershipSet) = .empty,
-};
-
-const rcu_tls_slot_count: usize = ebr.max_participants;
-
-const RcuTlsEntry = struct {
-    domain: ?*ebr.Domain = null,
-    generation: usize = 0,
-    participant: ?*ebr.Participant = null,
-};
-
-threadlocal var rcu_tls_entries: [rcu_tls_slot_count]RcuTlsEntry = @splat(.{});
-var rcu_generation = std.atomic.Value(usize).init(1);
-
-fn nextRcuGeneration() usize {
-    return rcu_generation.fetchAdd(1, .monotonic);
-}
-
-fn rcuReaderParticipant(domain: *ebr.Domain, generation: usize) ebr.RegisterError!*ebr.Participant {
-    var free_slot: ?usize = null;
-    for (&rcu_tls_entries, 0..) |*entry, i| {
-        if (entry.participant) |p| {
-            if (entry.domain == domain and entry.generation == generation) return p;
-        } else if (free_slot == null) {
-            free_slot = i;
-        }
-    }
-
-    const idx = free_slot orelse return error.TooManyParticipants;
-    const p = try domain.register();
-    rcu_tls_entries[idx] = .{
-        .domain = domain,
-        .generation = generation,
-        .participant = p,
-    };
-    return p;
-}
-
-fn rcuForgetThreadParticipants(domain: *ebr.Domain, generation: usize) void {
-    for (&rcu_tls_entries) |*entry| {
-        if (entry.participant) |p| {
-            if (entry.domain == domain and entry.generation == generation) {
-                p.unregister();
-                entry.* = .{};
-            }
-        }
-    }
-}
+const RcuNickState = world_rcu_state.RcuNickState;
+const RcuChannelState = world_rcu_state.RcuChannelState;
+const nextRcuGeneration = world_rcu_state.nextRcuGeneration;
+const rcuReaderParticipant = world_rcu_state.rcuReaderParticipant;
+const rcuForgetThreadParticipants = world_rcu_state.rcuForgetThreadParticipants;
 
 /// Opaque client handle value used by the local server world.
 pub const ClientId = packed struct {
