@@ -2553,15 +2553,26 @@ pub const S2sPeer = struct {
     }
 
     fn recvMessageV2Ack(self: *S2sPeer, outer_payload: []const u8) !void {
-        if (!self.supportsSecureRelayV2()) return error.SecuredLinkRequired;
+        // An ACK can cross the explicit rolling-upgrade probe reply on a newly
+        // established link: the sender may have completed its probe first.
+        // Require the secured base and authenticate before interpreting it, but
+        // soft-drop a valid advisory receipt until this side has exact schema
+        // proofs. The sender retains custody and retries the MESSAGE_V2 event,
+        // which causes another ACK/ACK_CONFIRM round.
+        if (!self.supportsSecureRelayV2Base()) return error.SecuredLinkRequired;
         const payload = self.verifiedPayload(.MESSAGE_V2_ACK, outer_payload) orelse
             return error.BadFrameSignature;
         const is_confirm = payload.len == message_relay_v2.relay_id_len + 1;
         if (payload.len != message_relay_v2.relay_id_len and !is_confirm)
             return error.InvalidRelayMessage;
-        if (is_confirm and
-            (!self.supportsRelayV2AckConfirm() or payload[message_relay_v2.relay_id_len] != 1))
-            return error.CapabilityNotNegotiated;
+        if (is_confirm and payload[message_relay_v2.relay_id_len] != 1)
+            return error.InvalidRelayMessage;
+        if (!self.supportsSecureRelayV2() or
+            (is_confirm and !self.supportsRelayV2AckConfirm()))
+        {
+            self.rejected_relay_v2_frames +|= 1;
+            return;
+        }
         const id: message_relay_v2.RelayId = payload[0..message_relay_v2.relay_id_len].*;
         const queue = if (is_confirm) &self.inbound_v2_ack_confirms else &self.inbound_v2_acks;
         for (queue.items) |queued| {
@@ -6956,6 +6967,46 @@ test "secure relay v2 ACK is authenticated deduplicated bounded and capability g
     try a.startHandshake(a_to_b.sink());
     try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6150);
+
+    // Exact xcap proofs can finish in opposite orders on the two secured
+    // streams. A fully signed ACK and ACK_CONFIRM arriving before this side's
+    // proof are advisory and must not tear down the link or create receipts.
+    // Both are retried after the exact proof completes.
+    const early_id: message_relay_v2.RelayId = @splat(0x54);
+    a.peer_supports_relay_v2_current = false;
+    a.peer_supports_relay_v2_ack_confirm = false;
+    try b.sendMessageV2Ack(b_to_a.sink(), early_id);
+    try b.sendMessageV2AckConfirm(b_to_a.sink(), early_id);
+    const early_ack_batch = try allocator.dupe(u8, b_to_a.bytes.items);
+    defer allocator.free(early_ack_batch);
+    b_to_a.clear();
+    try a.feed(early_ack_batch, a_to_b.sink(), tc.now_ms, 0x6157);
+    try std.testing.expect(a.established);
+    var early_acks = try a.takeInboundV2Acks();
+    try std.testing.expectEqual(@as(usize, 0), early_acks.len);
+    allocator.free(early_acks);
+    var early_confirms = try a.takeInboundV2AckConfirms();
+    try std.testing.expectEqual(@as(usize, 0), early_confirms.len);
+    allocator.free(early_confirms);
+    try std.testing.expectEqual(@as(u64, 2), a.takeRejectedRelayV2Frames());
+
+    try emitFrame(allocator, b_to_a.sink(), .PONG, relay_v2_extension_reply);
+    try emitFrame(allocator, b_to_a.sink(), .PONG, relay_v2_ack_confirm_reply);
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6158);
+    b_to_a.clear();
+    try std.testing.expect(a.supportsSecureRelayV2());
+    try b.sendMessageV2Ack(b_to_a.sink(), early_id);
+    try b.sendMessageV2AckConfirm(b_to_a.sink(), early_id);
+    try a.feed(b_to_a.bytes.items, a_to_b.sink(), tc.now_ms, 0x6159);
+    b_to_a.clear();
+    early_acks = try a.takeInboundV2Acks();
+    try std.testing.expectEqual(@as(usize, 1), early_acks.len);
+    try std.testing.expectEqualSlices(u8, &early_id, &early_acks[0]);
+    allocator.free(early_acks);
+    early_confirms = try a.takeInboundV2AckConfirms();
+    try std.testing.expectEqual(@as(usize, 1), early_confirms.len);
+    try std.testing.expectEqualSlices(u8, &early_id, &early_confirms[0]);
+    allocator.free(early_confirms);
 
     const first: message_relay_v2.RelayId = @splat(0x55);
     try b.sendMessageV2Ack(b_to_a.sink(), first);
