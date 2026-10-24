@@ -375,15 +375,16 @@ pub const Server = struct {
         try self.recv_buf.appendSlice(self.allocator, received);
         while (true) {
             const rec = (try tls12.completeRecord(self.recv_buf.items)) orelse return .need_more;
+            const encrypted = switch (self.state) {
+                .wait_client_finished, .wait_resumed_client_finished => true,
+                else => false,
+            };
+            if (!encrypted and rec.fragment.len > tls_record.max_plaintext_len) return error.RecordOverflow;
             if (rec.content_type == .alert) {
-                const encrypted = switch (self.state) {
-                    .wait_client_finished, .wait_resumed_client_finished => true,
-                    else => false,
-                };
                 if (encrypted) {
                     const opened = try tls12.openRecordAlloc(self.allocator, self.selected_suite orelse return error.BadState, &self.keys.client_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
                     defer self.allocator.free(opened.plaintext);
-                    if (self.client_offered_record_size_limit and opened.plaintext.len > self.receive_record_size_limit) return error.RecordOverflow;
+                    if (opened.plaintext.len > tls_record.max_plaintext_len or (self.client_offered_record_size_limit and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
                     _ = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
                 } else _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
                 return error.TlsAlert;
@@ -2249,6 +2250,22 @@ test "tls12 ClientHello reassembly rejects oversized, interleaved, and trailing 
         defer allocator.free(trailing);
         try std.testing.expectError(error.BadHandshake, server.feed(trailing));
     }
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const payload_len = tls_record.max_plaintext_len + 1;
+        const payload = try allocator.alloc(u8, payload_len);
+        defer allocator.free(payload);
+        try std.testing.expectError(error.PlaintextTooLong, tls12.writePlainRecord(allocator, .handshake, payload));
+
+        const wire = try allocator.alloc(u8, tls_record.record_header_len + payload_len);
+        defer allocator.free(wire);
+        wire[0] = @backingInt(tls12.ContentType.handshake);
+        std.mem.writeInt(u16, wire[1..3], tls12.tls_version, .big);
+        std.mem.writeInt(u16, wire[3..5], @intCast(payload_len), .big);
+        @memset(wire[tls_record.record_header_len..], 0);
+        try std.testing.expectError(error.RecordOverflow, server.feed(wire));
+    }
 }
 
 test "TLS 1.2 loopback: record_size_limit negotiated + fragments outbound records (RFC 8449)" {
@@ -3681,5 +3698,5 @@ test "TLS record limit: output custody TLS12 server Finished OOM preserves pre-C
 }
 
 test "TLS record limit: TLS12 authenticated mTLS negotiates64 in both directions" {
-    try runMtlsLoopback(.ecdsa, 64);
+    try runMtlsLoopback(.ecdsa, 64, .records);
 }

@@ -754,8 +754,13 @@ pub const TlsConn = struct {
         // authentication/admission. No transfer/flatten allocation follows the
         // RX/TX epoch cut. The caller reserves exact physical queue custody too.
         var control_reply = false;
-        // Process complete records front-to-back, consuming each from recv_buf.
-        while (try completeRecordLen(self.recv_buf.items)) |wire_len| {
+        // Walk records with a cursor and compact once. Shifting the remaining
+        // stream after every record turns an attacker-controlled flight of tiny
+        // records into quadratic copying.
+        var consumed_len: usize = 0;
+        defer if (consumed_len != 0) consumePrefix(&self.recv_buf, consumed_len);
+        while (try completeRecordLen(self.recv_buf.items[consumed_len..])) |wire_len| {
+            const record = self.recv_buf.items[consumed_len .. consumed_len + wire_len];
             const connected = self.handshakeDone();
             // A flight accumulated earlier in this call must reach the caller
             // before a requested reply can advance the TX epoch. Retain the
@@ -764,7 +769,7 @@ pub const TlsConn = struct {
             const reserve_software_reply = connected and admit_requested and !self.ktls_tx_offloaded and self.engine == .tls13;
             if (reserve_software_reply) try self.send_buf.ensureTotalCapacity(self.allocator, 27);
             if (connected) {
-                if (!try self.decryptRecord(self.recv_buf.items[0..wire_len], admit_requested)) {
+                if (!try self.decryptRecord(record, admit_requested)) {
                     self.control_phase = .userspace_requested_ku_held;
                     self.held_record_len = @intCast(wire_len);
                     break;
@@ -774,9 +779,9 @@ pub const TlsConn = struct {
                     self.held_record_len = 0;
                 }
             } else {
-                try self.feedRecord(self.recv_buf.items[0..wire_len]);
+                try self.feedRecord(record);
             }
-            consumePrefix(&self.recv_buf, wire_len);
+            consumed_len += wire_len;
             if (reserve_software_reply and self.engine.tls13.post_handshake_send.items.len != 0) {
                 const pending = self.engine.tls13.post_handshake_send.items;
                 std.debug.assert(pending.len == 27 and self.unpublished.items.len == 0);
@@ -1310,6 +1315,7 @@ pub const TlsConn = struct {
             const rec = buf[pos .. pos + wire];
             if (rec[0] != @backingInt(tls_record.ContentType.handshake)) return error.BadRecord;
             const frag = rec[tls_record.record_header_len..];
+            if (frag.len > tls_record.max_plaintext_len) return error.RecordOverflow;
             try self.version_detection.append(self.allocator, frag);
             pos += wire;
             self.version_detection_scanned = pos;
@@ -3135,17 +3141,24 @@ test "version-dispatch: dual TlsConn accepts a padded 20KiB fragmented TLS 1.2 C
     client.transcript.clearRetainingCapacity();
     try client.transcript.appendSlice(alloc, padded_hello);
 
-    const split_at = 15_000;
-    const first = try tls12.writePlainRecord(alloc, .handshake, padded_hello[0..split_at]);
-    defer alloc.free(first);
-    const second = try tls12.writePlainRecord(alloc, .handshake, padded_hello[split_at..]);
-    defer alloc.free(second);
-    const wire = try alloc.alloc(u8, first.len + second.len);
-    defer alloc.free(wire);
-    @memcpy(wire[0..first.len], first);
-    @memcpy(wire[first.len..], second);
+    // Split every handshake byte into a separate legal record. This exercises
+    // the adapter's bounded cursor path with enough records to catch repeated
+    // front-compaction while retaining the end-to-end handshake/app-data proof.
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(alloc);
+    try wire.ensureTotalCapacity(alloc, padded_hello.len * (tls_record.record_header_len + 1));
+    for (padded_hello) |byte| {
+        wire.appendSliceAssumeCapacity(&.{
+            @backingInt(tls_record.ContentType.handshake),
+            0x03,
+            0x03,
+            0x00,
+            0x01,
+            byte,
+        });
+    }
 
-    const server_flight = try conn.onInbound(wire);
+    const server_flight = try conn.onInbound(wire.items);
     try std.testing.expectEqual(Version.tls12, conn.negotiatedVersion().?);
     const client_flight = switch (try client.feed(server_flight.handshake_bytes)) {
         .bytes_to_send => |bytes| bytes,
@@ -3176,6 +3189,74 @@ test "version-dispatch: dual TlsConn applies the shared total handshake bound" {
     const record = try tls12.writePlainRecord(alloc, .handshake, &oversized);
     defer alloc.free(record);
     try std.testing.expectError(error.BadHandshake, conn.onInbound(record));
+}
+
+test "version-dispatch: dual TlsConn rejects oversized plaintext record payload" {
+    const alloc = std.testing.allocator;
+    var conn = TlsConn.initDual(alloc, .{ .cert_chain = &.{} }, .{ .cert_chain = &.{}, .ecdsa_p256_signing_key = null });
+    defer conn.deinit();
+
+    const payload_len = tls_record.max_plaintext_len + 1;
+    const payload = try alloc.alloc(u8, payload_len);
+    defer alloc.free(payload);
+    try std.testing.expectError(error.PlaintextTooLong, tls12.writePlainRecord(alloc, .handshake, payload));
+
+    const wire = try alloc.alloc(u8, tls_record.record_header_len + payload_len);
+    defer alloc.free(wire);
+    wire[0] = @backingInt(tls_record.ContentType.handshake);
+    std.mem.writeInt(u16, wire[1..3], 0x0303, .big);
+    std.mem.writeInt(u16, wire[3..5], @intCast(payload_len), .big);
+    @memset(wire[tls_record.record_header_len..], 0);
+    try std.testing.expectError(error.RecordOverflow, conn.onInbound(wire));
+}
+
+test "version-dispatch: dual TlsConn rejects malformed ClientHello at shared handshake cap" {
+    const alloc = std.testing.allocator;
+    const ec_key = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var cert_buf: [2048]u8 = undefined;
+    const cert = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_893_456_000,
+        .serial = &.{1},
+        .key_pair = ec_key,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var conn = TlsConn.initDual(alloc, .{ .cert_chain = &.{} }, .{ .cert_chain = &.{cert}, .ecdsa_p256_signing_key = ec_key });
+    defer conn.deinit();
+
+    const total_len = tls_handshake_reassembly.max_message_len;
+    const handshake = try alloc.alloc(u8, total_len);
+    defer alloc.free(handshake);
+    handshake[0] = 1;
+    std.mem.writeInt(u24, handshake[1..4], @intCast(total_len - 4), .big);
+    // Invalid client_version makes this exact-cap message fail closed after
+    // the adapter has reassembled and dispatched it to the TLS 1.2 parser.
+    @memset(handshake[4..], 0);
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(alloc);
+    const fragment_cap = 16;
+    const record_count = (handshake.len + fragment_cap - 1) / fragment_cap;
+    const wire_len = handshake.len + record_count * tls_record.record_header_len;
+    try wire.ensureTotalCapacity(alloc, wire_len);
+    var offset: usize = 0;
+    while (offset < handshake.len) {
+        const fragment_len = @min(fragment_cap, handshake.len - offset);
+        const fragment_wire_len: u16 = @intCast(fragment_len);
+        wire.appendSliceAssumeCapacity(&.{
+            @backingInt(tls_record.ContentType.handshake),
+            0x03,
+            0x03,
+            @intCast(fragment_wire_len >> 8),
+            @truncate(fragment_wire_len),
+        });
+        wire.appendSliceAssumeCapacity(handshake[offset .. offset + fragment_len]);
+        offset += fragment_len;
+    }
+    try std.testing.expectEqual(record_count, wire.items.len / (tls_record.record_header_len + fragment_cap));
+    try std.testing.expectError(error.ProtocolVersion, conn.onInbound(wire.items));
 }
 
 fn padTls12ClientHello(allocator: Allocator, handshake: []const u8, padding_len: usize) Error![]u8 {
