@@ -25,6 +25,7 @@ const Allocator = std.mem.Allocator;
 const tls_server = @import("../crypto/tls_server.zig");
 const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_record = @import("../crypto/tls_record.zig");
+const tls_handshake_reassembly = @import("../crypto/tls_handshake_reassembly.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const ktls = @import("ktls.zig");
 const kernel_other = @import("kernel_other.zig");
@@ -154,6 +155,10 @@ pub const TlsConn = struct {
 
     /// Inbound socket bytes not yet split into a complete record.
     recv_buf: std.ArrayList(u8) = .empty,
+    /// Bounded first ClientHello accumulation used only for dual-version
+    /// dispatch. The selected engine still consumes the original wire records.
+    version_detection: tls_handshake_reassembly.Reassembly = .{},
+    version_detection_scanned: usize = 0,
     /// Already exposed ciphertext scratch, rebuilt per successful owner turn.
     send_buf: std.ArrayList(u8) = .empty,
     /// Owned engine flights whose bytes have not appeared in an Outcome. Slot
@@ -259,6 +264,7 @@ pub const TlsConn = struct {
             .tls12 => |*s| s.deinit(),
         }
         self.recv_buf.deinit(self.allocator);
+        self.version_detection.deinit(self.allocator);
         self.send_buf.deinit(self.allocator);
         self.discardUnpublished();
         self.unpublished.deinit(self.allocator);
@@ -1296,27 +1302,26 @@ pub const TlsConn = struct {
     /// Inspect the buffered first ClientHello and decide the protocol version: a
     /// supported_versions extension listing 0x0304 selects TLS 1.3, otherwise
     /// TLS 1.2. Reassembles the ClientHello across handshake records if needed.
-    fn detectVersion(self: *const TlsConn) Error!Detected {
-        var hs: [tls_record.max_plaintext_len]u8 = undefined;
-        var hs_len: usize = 0;
-        var pos: usize = 0;
+    fn detectVersion(self: *TlsConn) Error!Detected {
+        var pos = self.version_detection_scanned;
         const buf = self.recv_buf.items;
         while (true) {
             const wire = try completeRecordLen(buf[pos..]) orelse return .need_more;
             const rec = buf[pos .. pos + wire];
             if (rec[0] != @backingInt(tls_record.ContentType.handshake)) return error.BadRecord;
             const frag = rec[tls_record.record_header_len..];
-            if (hs_len + frag.len > hs.len) return error.BadHandshake;
-            @memcpy(hs[hs_len..][0..frag.len], frag);
-            hs_len += frag.len;
+            try self.version_detection.append(self.allocator, frag);
             pos += wire;
-            if (hs_len >= 4) {
-                const msg_len = (@as(usize, hs[1]) << 16) | (@as(usize, hs[2]) << 8) | hs[3];
-                if (hs_len >= 4 + msg_len) {
-                    if (hs[0] != 1) return error.BadHandshake; // must be client_hello
-                    return classifyClientHello(hs[4 .. 4 + msg_len]);
-                }
-            }
+            self.version_detection_scanned = pos;
+            const message_len = self.version_detection.completeLen() orelse continue;
+            if (message_len != self.version_detection.bytes.items.len) return error.BadHandshake;
+            const message = self.version_detection.bytes.items;
+            if (message[0] != 1) return error.BadHandshake; // must be client_hello
+            const detected = classifyClientHello(message[4..message_len]);
+            self.version_detection.deinit(self.allocator);
+            self.version_detection = .{};
+            self.version_detection_scanned = 0;
+            return detected;
         }
     }
 };
@@ -2897,6 +2902,7 @@ test "prepared application output TLS1.2 negotiated fragmentation and empty batc
 }
 
 const tls12_client = @import("../crypto/tls12_client.zig");
+const tls12 = @import("../crypto/tls12.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
 
 test "owned OCSP staples survive source publication and share only aliased generations" {
@@ -3023,7 +3029,7 @@ test "version-dispatch: a TLS 1.3 client completes through a dual TlsConn" {
     try std.testing.expectEqualStrings("reply 1.3", got);
 }
 
-test "version-dispatch: a TLS 1.2 client completes through a dual TlsConn" {
+test "version-dispatch: a fragmented TLS 1.2 ClientHello completes through a dual TlsConn" {
     const alloc = std.testing.allocator;
     const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x55)));
     var cert_buf: [1024]u8 = undefined;
@@ -3057,7 +3063,16 @@ test "version-dispatch: a TLS 1.2 client completes through a dual TlsConn" {
 
     const ch = try client.start();
     defer alloc.free(ch);
-    const sf = try conn.onInbound(ch);
+    const ch_record = (try tls12.completeRecord(ch)) orelse return error.TestUnexpectedResult;
+    const ch_first = try tls12.writePlainRecord(alloc, .handshake, ch_record.fragment[0..2]);
+    defer alloc.free(ch_first);
+    const ch_second = try tls12.writePlainRecord(alloc, .handshake, ch_record.fragment[2..]);
+    defer alloc.free(ch_second);
+    const fragmented_ch = try alloc.alloc(u8, ch_first.len + ch_second.len);
+    defer alloc.free(fragmented_ch);
+    @memcpy(fragmented_ch[0..ch_first.len], ch_first);
+    @memcpy(fragmented_ch[ch_first.len..], ch_second);
+    const sf = try conn.onInbound(fragmented_ch);
     try std.testing.expectEqual(Version.tls12, conn.negotiatedVersion().?);
     const cf = switch (try client.feed(sf.handshake_bytes)) {
         .bytes_to_send => |b| b,
@@ -3077,6 +3092,125 @@ test "version-dispatch: a TLS 1.2 client completes through a dual TlsConn" {
     const got = try client.decrypt(cipher);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("reply 1.2", got);
+}
+
+test "version-dispatch: dual TlsConn accepts a padded 20KiB fragmented TLS 1.2 ClientHello" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x57)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+
+    const ec_key = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var ec_buf: [2048]u8 = undefined;
+    const ec_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ec_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_893_456_000,
+        .serial = &.{ 1, 2, 3, 5 },
+        .key_pair = ec_key,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+
+    var conn = TlsConn.initDual(
+        alloc,
+        .{ .cert_chain = &.{der}, .signing_key = kp },
+        .{ .cert_chain = &.{ec_der}, .ecdsa_p256_signing_key = ec_key },
+    );
+    defer conn.deinit();
+
+    var client = try tls12_client.Client.init(alloc, .{
+        .server_name = "irc.test",
+        .trust_anchors = &.{ec_der},
+        .now_unix_seconds = 1_735_689_600,
+    });
+    defer client.deinit();
+
+    const original = try client.start();
+    defer alloc.free(original);
+    const original_record = (try tls12.completeRecord(original)) orelse return error.TestUnexpectedResult;
+    const padded_hello = try padTls12ClientHello(alloc, original_record.fragment, 20 * 1024);
+    defer alloc.free(padded_hello);
+    // Keep the peer's transcript aligned with the exact wire ClientHello.
+    client.transcript.clearRetainingCapacity();
+    try client.transcript.appendSlice(alloc, padded_hello);
+
+    const split_at = 15_000;
+    const first = try tls12.writePlainRecord(alloc, .handshake, padded_hello[0..split_at]);
+    defer alloc.free(first);
+    const second = try tls12.writePlainRecord(alloc, .handshake, padded_hello[split_at..]);
+    defer alloc.free(second);
+    const wire = try alloc.alloc(u8, first.len + second.len);
+    defer alloc.free(wire);
+    @memcpy(wire[0..first.len], first);
+    @memcpy(wire[first.len..], second);
+
+    const server_flight = try conn.onInbound(wire);
+    try std.testing.expectEqual(Version.tls12, conn.negotiatedVersion().?);
+    const client_flight = switch (try client.feed(server_flight.handshake_bytes)) {
+        .bytes_to_send => |bytes| bytes,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(client_flight);
+    const final_flight = try conn.onInbound(client_flight);
+    _ = try client.feed(final_flight.handshake_bytes);
+    try std.testing.expect(conn.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
+
+    const app = try client.encrypt("padded client hello app data");
+    defer alloc.free(app);
+    const plaintext = try conn.onInbound(app);
+    try std.testing.expectEqualStrings("padded client hello app data", plaintext.plaintext);
+    const reply = try conn.write("padded reply");
+    const opened = try client.decrypt(reply);
+    defer alloc.free(opened);
+    try std.testing.expectEqualStrings("padded reply", opened);
+}
+
+test "version-dispatch: dual TlsConn applies the shared total handshake bound" {
+    const alloc = std.testing.allocator;
+    var conn = TlsConn.initDual(alloc, .{ .cert_chain = &.{} }, .{ .cert_chain = &.{}, .ecdsa_p256_signing_key = null });
+    defer conn.deinit();
+    // Header declares one byte beyond the shared 1 MiB complete-message cap.
+    const oversized = [_]u8{ 1, 0x0f, 0xff, 0xfd };
+    const record = try tls12.writePlainRecord(alloc, .handshake, &oversized);
+    defer alloc.free(record);
+    try std.testing.expectError(error.BadHandshake, conn.onInbound(record));
+}
+
+fn padTls12ClientHello(allocator: Allocator, handshake: []const u8, padding_len: usize) Error![]u8 {
+    if (handshake.len < 4 or handshake[0] != 1 or padding_len > std.math.maxInt(u16)) return error.BadHandshake;
+    const body_len = (@as(usize, handshake[1]) << 16) | (@as(usize, handshake[2]) << 8) | handshake[3];
+    if (body_len + 4 != handshake.len) return error.BadHandshake;
+    const body = handshake[4..];
+    var offset: usize = 34;
+    if (offset >= body.len) return error.BadHandshake;
+    offset += 1 + body[offset];
+    if (offset + 2 > body.len) return error.BadHandshake;
+    const suites_len = (@as(usize, body[offset]) << 8) | body[offset + 1];
+    offset += 2 + suites_len;
+    if (offset >= body.len) return error.BadHandshake;
+    offset += 1 + body[offset];
+    if (offset + 2 > body.len) return error.BadHandshake;
+    const extensions_len = (@as(usize, body[offset]) << 8) | body[offset + 1];
+    if (offset + 2 + extensions_len != body.len) return error.BadHandshake;
+    const new_extensions_len = std.math.add(usize, extensions_len, 4 + padding_len) catch return error.BadHandshake;
+    if (new_extensions_len > std.math.maxInt(u16)) return error.BadHandshake;
+    const output = try allocator.alloc(u8, handshake.len + 4 + padding_len);
+    errdefer allocator.free(output);
+    const extension_bytes_start = 4 + offset + 2;
+    @memcpy(output[0 .. extension_bytes_start + extensions_len], handshake[0 .. extension_bytes_start + extensions_len]);
+    std.mem.writeInt(u16, output[4 + offset ..][0..2], @intCast(new_extensions_len), .big);
+    const padding_header = extension_bytes_start + extensions_len;
+    output[padding_header] = 0;
+    output[padding_header + 1] = 21;
+    std.mem.writeInt(u16, output[padding_header + 2 ..][0..2], @intCast(padding_len), .big);
+    @memset(output[padding_header + 4 ..], 0);
+    const new_body_len = body_len + 4 + padding_len;
+    output[1] = @intCast((new_body_len >> 16) & 0xff);
+    output[2] = @intCast((new_body_len >> 8) & 0xff);
+    output[3] = @intCast(new_body_len & 0xff);
+    return output;
 }
 
 test "version-dispatch: failed TLS 1.2 init leaves engine undecided" {
@@ -3375,7 +3509,6 @@ fn recordLimitConnectedPair12(chacha: bool) !*PreparedOutputTestPair {
 }
 
 fn recordLimitMalformed12Proof(oversized: bool) !void {
-    const tls12 = @import("../crypto/tls12.zig");
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |chacha| {
         for ([_]bool{ false, true }) |at_server| {
@@ -3424,7 +3557,6 @@ test "TLS record limit: TLS12 actual pair protocol overflow emits fatal22" {
 }
 
 test "TLS record limit: adapter retains TLS12 committed Finished before coalesced error alert" {
-    const tls12 = @import("../crypto/tls12.zig");
     const a = std.testing.allocator;
     const pair = try PreparedOutputTestPair.createUnfinished(.tls12, false);
     defer pair.destroy();
@@ -3555,7 +3687,6 @@ test "TLS record limit: adapter terminal flatten OOM retains exact epoch prefix 
     try std.testing.expectEqualSlices(u8, expected, retry);
     try std.testing.expectEqual(@as(u64, 2), pair.sequence());
     try std.testing.expect(pair.conn.takeAlert(error.RecordOverflow) == null);
-    const tls12 = @import("../crypto/tls12.zig");
     const opened = try tls12.openRecordAlloc(a, pair.client.tls12.selected_suite.?, &pair.client.tls12.keys.server_write, 1, original_alert);
     defer a.free(opened.plaintext);
     // A changed caller argument cannot replace the original MAC failure.

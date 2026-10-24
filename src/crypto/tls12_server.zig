@@ -16,6 +16,7 @@ const tls12 = @import("tls12.zig");
 const tls12_client = @import("tls12_client.zig");
 const tls_server = @import("tls_server.zig");
 const tls_record = @import("tls_record.zig");
+const tls_handshake_reassembly = @import("tls_handshake_reassembly.zig");
 const tls_alert = @import("../proto/tls_alert.zig");
 const tls_resumption = @import("tls_resumption.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
@@ -187,6 +188,14 @@ pub const Server = struct {
     state: State = .wait_client_hello,
 
     recv_buf: std.ArrayList(u8) = .empty,
+    /// TLS handshake messages may span multiple TLSPlaintext records. The
+    /// ClientHello is reassembled separately because version dispatch already
+    /// validated it across records before selecting this TLS 1.2 engine.
+    client_hello_reassembly: tls_handshake_reassembly.Reassembly = .{},
+    /// Later plaintext client handshake messages (mTLS Certificate, CKE, and
+    /// CertificateVerify) may be fragmented across records or coalesced into
+    /// one record. Keep one bounded stream until each complete message is ready.
+    client_handshake_reassembly: tls_handshake_reassembly.Reassembly = .{},
     transcript: std.ArrayList(u8) = .empty,
 
     key_pair: ecdh_p256.KeyPair,
@@ -277,6 +286,8 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         std.debug.assert(self.app_write_active == null);
         self.recv_buf.deinit(self.allocator);
+        self.client_hello_reassembly.deinit(self.allocator);
+        self.client_handshake_reassembly.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
         if (self.selected_alpn) |p| self.allocator.free(p);
         if (self.presented_ticket) |t| self.allocator.free(t);
@@ -314,7 +325,7 @@ pub const Server = struct {
         const desc = tls_server.alertDescriptionForError(err) orelse return null;
         self.alert_taken = true;
         self.read_failed = true;
-        const body = [_]u8{ @intFromEnum(tls_server.AlertLevel.fatal), @intFromEnum(desc) };
+        const body = [_]u8{ @backingInt(tls_server.AlertLevel.fatal), @backingInt(desc) };
         switch (self.state) {
             .wait_resumed_client_ccs, .wait_resumed_client_finished => {
                 const suite = self.selected_suite orelse return null;
@@ -380,9 +391,13 @@ pub const Server = struct {
             switch (self.state) {
                 .wait_client_hello => {
                     if (rec.content_type != .handshake) return error.BadHandshake;
+                    try self.client_hello_reassembly.append(self.allocator, rec.fragment);
+                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    const message_len = self.client_hello_reassembly.completeLen() orelse continue;
+                    if (message_len != self.client_hello_reassembly.bytes.items.len) return error.BadHandshake;
                     var off: usize = 0;
-                    const msg = try parseHandshake(rec.fragment, &off);
-                    if (off != rec.fragment.len or msg.typ != .client_hello) return error.BadHandshake;
+                    const msg = try parseHandshake(self.client_hello_reassembly.bytes.items, &off);
+                    if (off != self.client_hello_reassembly.bytes.items.len or msg.typ != .client_hello) return error.BadHandshake;
                     try self.parseClientHello(msg.body);
                     try self.transcript.appendSlice(self.allocator, msg.raw);
                     // A presented ticket that opens, validates, and is not
@@ -391,52 +406,23 @@ pub const Server = struct {
                     self.resuming = self.tryResume();
                     if (self.resuming) {
                         const reply = try self.buildResumedServerFlight();
-                        consumePrefix(&self.recv_buf, rec.wire_len);
+                        self.client_hello_reassembly.consume(message_len);
+                        self.offered_suites = &.{};
                         self.state = .wait_resumed_client_ccs;
                         return .{ .bytes_to_send = reply };
                     }
                     const reply = try self.buildServerFlight();
-                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    self.client_hello_reassembly.consume(message_len);
+                    self.offered_suites = &.{};
                     self.state = if (self.config.request_client_cert) .wait_client_certificate else .wait_client_key_exchange;
                     return .{ .bytes_to_send = reply };
                 },
-                .wait_client_certificate => {
-                    // mTLS: the client's Certificate precedes its ClientKeyExchange.
+                .wait_client_certificate, .wait_client_key_exchange, .wait_client_certificate_verify => {
                     if (rec.content_type != .handshake) return error.BadHandshake;
-                    var off: usize = 0;
-                    const msg = try parseHandshake(rec.fragment, &off);
-                    if (off != rec.fragment.len or msg.typ != .certificate) return error.BadHandshake;
-                    try self.parseClientCertificate(msg.body);
-                    try self.transcript.appendSlice(self.allocator, msg.raw);
-                    consumePrefix(&self.recv_buf, rec.wire_len);
-                    self.state = .wait_client_key_exchange;
-                },
-                .wait_client_key_exchange => {
-                    if (rec.content_type != .handshake) return error.BadHandshake;
-                    var off: usize = 0;
-                    const msg = try parseHandshake(rec.fragment, &off);
-                    if (off != rec.fragment.len or msg.typ != .client_key_exchange) return error.BadHandshake;
-                    // RFC 7627: the session hash covers ClientHello THROUGH
-                    // ClientKeyExchange inclusive, so the CKE must be in the
-                    // transcript BEFORE the master secret is derived.
-                    try self.transcript.appendSlice(self.allocator, msg.raw);
-                    try self.parseClientKeyExchange(msg.body);
-                    consumePrefix(&self.recv_buf, rec.wire_len);
-                    // A presented client cert must prove key possession via
-                    // CertificateVerify before CCS; a declined cert skips it.
-                    self.state = if (self.client_leaf_key != null) .wait_client_certificate_verify else .wait_client_ccs;
-                },
-                .wait_client_certificate_verify => {
-                    if (rec.content_type != .handshake) return error.BadHandshake;
-                    var off: usize = 0;
-                    const msg = try parseHandshake(rec.fragment, &off);
-                    if (off != rec.fragment.len or msg.typ != .certificate_verify) return error.BadHandshake;
-                    try self.verifyClientCertificateVerify(msg.body);
-                    try self.transcript.appendSlice(self.allocator, msg.raw);
-                    consumePrefix(&self.recv_buf, rec.wire_len);
-                    self.state = .wait_client_ccs;
+                    try self.feedClientHandshakeRecord(rec);
                 },
                 .wait_client_ccs => {
+                    if (self.client_handshake_reassembly.bytes.items.len != 0) return error.BadHandshake;
                     if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     self.state = .wait_client_finished;
@@ -499,6 +485,46 @@ pub const Server = struct {
                 },
                 .connected => return error.BadState,
             }
+        }
+    }
+
+    /// Accumulate a plaintext client handshake record, then process every
+    /// complete message now available. This preserves transcript order when
+    /// clients split a message across records or coalesce Certificate,
+    /// ClientKeyExchange, and CertificateVerify in one record.
+    fn feedClientHandshakeRecord(self: *Server, rec: tls12.Record) Error!void {
+        try self.client_handshake_reassembly.append(self.allocator, rec.fragment);
+        consumePrefix(&self.recv_buf, rec.wire_len);
+
+        while (self.client_handshake_reassembly.completeLen()) |message_len| {
+            var off: usize = 0;
+            const msg = try parseHandshake(self.client_handshake_reassembly.bytes.items, &off);
+            if (off != message_len) return error.BadHandshake;
+
+            switch (self.state) {
+                .wait_client_certificate => {
+                    if (msg.typ != .certificate) return error.BadHandshake;
+                    try self.parseClientCertificate(msg.body);
+                    try self.transcript.appendSlice(self.allocator, msg.raw);
+                    self.state = .wait_client_key_exchange;
+                },
+                .wait_client_key_exchange => {
+                    if (msg.typ != .client_key_exchange) return error.BadHandshake;
+                    // RFC 7627: EMS includes ClientKeyExchange in the session
+                    // hash before the master secret is derived.
+                    try self.transcript.appendSlice(self.allocator, msg.raw);
+                    try self.parseClientKeyExchange(msg.body);
+                    self.state = if (self.client_leaf_key != null) .wait_client_certificate_verify else .wait_client_ccs;
+                },
+                .wait_client_certificate_verify => {
+                    if (msg.typ != .certificate_verify) return error.BadHandshake;
+                    try self.verifyClientCertificateVerify(msg.body);
+                    try self.transcript.appendSlice(self.allocator, msg.raw);
+                    self.state = .wait_client_ccs;
+                },
+                else => return error.BadHandshake,
+            }
+            self.client_handshake_reassembly.consume(message_len);
         }
     }
 
@@ -672,7 +698,7 @@ pub const Server = struct {
         if (self.read_failed or self.app_write_active != null or self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
         const st: ResumeState = .{
-            .suite = @intFromEnum(suite),
+            .suite = @backingInt(suite),
             .keys = self.keys,
             .app_read_seq = self.app_read_seq,
             .app_write_seq = self.app_write_seq,
@@ -858,7 +884,7 @@ pub const Server = struct {
         try sh_body.appendSlice(self.allocator, &self.server_random);
         try sh_body.append(self.allocator, @intCast(self.session_id_len));
         try sh_body.appendSlice(self.allocator, self.session_id[0..self.session_id_len]);
-        try appendU16(self.allocator, &sh_body, @intFromEnum(self.selected_suite orelse return error.BadState));
+        try appendU16(self.allocator, &sh_body, @backingInt(self.selected_suite orelse return error.BadState));
         try sh_body.append(self.allocator, 0);
         var exts: std.ArrayList(u8) = .empty;
         defer exts.deinit(self.allocator);
@@ -1139,7 +1165,7 @@ pub const Server = struct {
             self.allocator,
             key,
             aead_nonce,
-            @intFromEnum(suite),
+            @backingInt(suite),
             &self.master_secret,
             &ticket_nonce,
             self.config.now_unix_seconds * 1000,
@@ -1257,7 +1283,7 @@ pub const Server = struct {
         try sh_body.appendSlice(self.allocator, &self.server_random);
         try sh_body.append(self.allocator, @intCast(self.session_id_len));
         try sh_body.appendSlice(self.allocator, self.session_id[0..self.session_id_len]);
-        try appendU16(self.allocator, &sh_body, @intFromEnum(suite));
+        try appendU16(self.allocator, &sh_body, @backingInt(suite));
         try sh_body.append(self.allocator, 0);
         var exts: std.ArrayList(u8) = .empty;
         defer exts.deinit(self.allocator);
@@ -1361,7 +1387,7 @@ fn writeExtension(allocator: Allocator, out: *std.ArrayList(u8), typ: u16, body:
 }
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: tls12.HandshakeType, body: []const u8) Error!void {
-    try out.append(allocator, @intFromEnum(typ));
+    try out.append(allocator, @backingInt(typ));
     try appendU24(allocator, out, @intCast(body.len));
     try out.appendSlice(allocator, body);
 }
@@ -1401,7 +1427,7 @@ fn parseHandshake(bytes: []const u8, off: *usize) Error!HandshakeMsg {
     if (bytes.len - start < 4 + len) return error.BadHandshake;
     off.* = start + 4 + len;
     return .{
-        .typ = @enumFromInt(bytes[start]),
+        .typ = @fromBackingInt(@intCast(bytes[start])),
         .body = bytes[start + 4 .. start + 4 + len],
         .raw = bytes[start .. start + 4 + len],
     };
@@ -1466,7 +1492,7 @@ fn appendU32(allocator: Allocator, out: *std.ArrayList(u8), v: u32) Allocator.Er
 /// True when the raw offered cipher-suite octets (u16 big-endian, back to back)
 /// include `suite`.
 fn clientOfferedSuite(offered: []const u8, suite: tls12.CipherSuite) bool {
-    const want = @intFromEnum(suite);
+    const want = @backingInt(suite);
     var i: usize = 0;
     while (i + 2 <= offered.len) : (i += 2) {
         const v = (@as(u16, offered[i]) << 8) | offered[i + 1];
@@ -1782,7 +1808,7 @@ test "TLS 1.2 ServerHello.random carries the RFC 8446 downgrade sentinel" {
     // the final 8 bytes of that random.
     const rec = (try tls12.completeRecord(flight)) orelse return error.TestUnexpectedResult;
     if (rec.content_type != .handshake) return error.TestUnexpectedResult;
-    if (rec.fragment.len < 38 or rec.fragment[0] != @intFromEnum(tls12.HandshakeType.server_hello)) {
+    if (rec.fragment.len < 38 or rec.fragment[0] != @backingInt(tls12.HandshakeType.server_hello)) {
         return error.TestUnexpectedResult;
     }
     const sh_random = rec.fragment[6..38];
@@ -1834,10 +1860,12 @@ test "TLS 1.2 clientKeyFromCert parses RSA and ECDSA P-256 leaves" {
     try std.testing.expect(ek == .ecdsa_p256);
 }
 
+const MtlsClientFlightLayout = enum { records, fragmented, coalesced, trailing_partial };
+
 /// Drive a full TLS 1.2 mTLS handshake between the in-repo server and client
 /// (no external tools) and assert the server captured the presented leaf + its
 /// certfp, then exchanges application data on the mutually-authed channel.
-fn runMtlsLoopback(client_cert: enum { ecdsa, rsa }, receive_limit: u16) !void {
+fn runMtlsLoopback(client_cert: enum { ecdsa, rsa }, receive_limit: u16, layout: MtlsClientFlightLayout) !void {
     const certfp = @import("../proto/certfp.zig");
     const allocator = std.testing.allocator;
     const fixture = try makeFixture(allocator);
@@ -1896,7 +1924,14 @@ fn runMtlsLoopback(client_cert: enum { ecdsa, rsa }, receive_limit: u16) !void {
         .need_more => return error.BadHandshake,
     };
     defer allocator.free(cf);
-    const sfin = switch (try server.feed(cf)) {
+    const arranged_cf = try arrangeMtlsClientFlight(allocator, cf, layout);
+    defer allocator.free(arranged_cf);
+    if (layout == .trailing_partial) {
+        try std.testing.expectError(error.BadHandshake, server.feed(arranged_cf));
+        try std.testing.expect(!server.handshakeDone());
+        return;
+    }
+    const sfin = switch (try server.feed(arranged_cf)) {
         .bytes_to_send => |b| b,
         .need_more => return error.BadHandshake,
     };
@@ -1907,6 +1942,7 @@ fn runMtlsLoopback(client_cert: enum { ecdsa, rsa }, receive_limit: u16) !void {
     try std.testing.expectEqual(@as(usize, receive_limit), server.peer_record_size_limit);
     try std.testing.expect(client.handshakeDone());
     try std.testing.expect(server.handshakeDone());
+    try std.testing.expectEqualSlices(u8, client.transcript.items, server.transcript.items);
 
     const presented = server.clientCertDer() orelse return error.BadHandshake;
     try std.testing.expectEqualSlices(u8, client_der, presented);
@@ -1921,14 +1957,80 @@ fn runMtlsLoopback(client_cert: enum { ecdsa, rsa }, receive_limit: u16) !void {
     const s_plain = try server.decrypt(c_app);
     defer allocator.free(s_plain);
     try std.testing.expectEqualStrings("AUTHENTICATE EXTERNAL\r\n", s_plain);
+    const s_app = try server.encrypt("mTLS application reply");
+    defer allocator.free(s_app);
+    const c_plain = try client.decrypt(s_app);
+    defer allocator.free(c_plain);
+    try std.testing.expectEqualStrings("mTLS application reply", c_plain);
+}
+
+/// Reframe the three initial plaintext mTLS handshake messages while keeping
+/// CCS and encrypted Finished byte-exact. This drives both multi-record
+/// fragmentation and multi-message record coalescing through the production
+/// server state machine.
+fn arrangeMtlsClientFlight(allocator: Allocator, flight: []const u8, layout: MtlsClientFlightLayout) Error![]u8 {
+    if (layout == .records) return try allocator.dupe(u8, flight);
+    var handshake: std.ArrayList(u8) = .empty;
+    defer handshake.deinit(allocator);
+    var tail_offset: usize = 0;
+    while (tail_offset < flight.len) {
+        const rec = (try tls12.completeRecord(flight[tail_offset..])) orelse return error.BadHandshake;
+        if (rec.content_type != .handshake) break;
+        try handshake.appendSlice(allocator, rec.fragment);
+        tail_offset += rec.wire_len;
+    }
+    if (handshake.items.len == 0 or tail_offset == flight.len) return error.BadHandshake;
+
+    var arranged: std.ArrayList(u8) = .empty;
+    errdefer arranged.deinit(allocator);
+    switch (layout) {
+        .records => unreachable,
+        .coalesced, .trailing_partial => {
+            if (layout == .trailing_partial) try handshake.appendSlice(allocator, &.{ 1, 0 });
+            const record = try tls12.writePlainRecord(allocator, .handshake, handshake.items);
+            defer allocator.free(record);
+            try arranged.appendSlice(allocator, record);
+        },
+        .fragmented => {
+            const cuts = [_]usize{ 1, 2, 7, handshake.items.len };
+            var start: usize = 0;
+            for (cuts) |cut| {
+                const end = @min(cut, handshake.items.len);
+                if (end <= start) continue;
+                const record = try tls12.writePlainRecord(allocator, .handshake, handshake.items[start..end]);
+                defer allocator.free(record);
+                try arranged.appendSlice(allocator, record);
+                start = end;
+            }
+            if (start < handshake.items.len) {
+                const record = try tls12.writePlainRecord(allocator, .handshake, handshake.items[start..]);
+                defer allocator.free(record);
+                try arranged.appendSlice(allocator, record);
+            }
+        },
+    }
+    try arranged.appendSlice(allocator, flight[tail_offset..]);
+    return try arranged.toOwnedSlice(allocator);
 }
 
 test "TLS 1.2 mTLS: ECDSA P-256 client cert completes and exposes leaf + CertFP" {
-    try runMtlsLoopback(.ecdsa, 16384);
+    try runMtlsLoopback(.ecdsa, 16384, .records);
 }
 
 test "TLS 1.2 mTLS: RSA client cert completes and exposes leaf + CertFP" {
-    try runMtlsLoopback(.rsa, 16384);
+    try runMtlsLoopback(.rsa, 16384, .records);
+}
+
+test "TLS 1.2 mTLS client-auth handshake messages reassemble across records" {
+    try runMtlsLoopback(.ecdsa, 16384, .fragmented);
+}
+
+test "TLS 1.2 mTLS client-auth handshake messages coalesce in one record" {
+    try runMtlsLoopback(.ecdsa, 16384, .coalesced);
+}
+
+test "TLS 1.2 mTLS rejects an incomplete extra handshake message before CCS" {
+    try runMtlsLoopback(.ecdsa, 16384, .trailing_partial);
 }
 
 test "TLS 1.2 mTLS: client may decline (empty Certificate) and still connect" {
@@ -2044,6 +2146,109 @@ test "TLS 1.2 loopback ECDHE ECDSA AES-256-GCM-SHA384" {
     // Real clients (OpenSSL, browsers) list AES-256-GCM-SHA384 first, so this is
     // the suite the server actually negotiates in the wild — exercise it.
     try runLoopback(.aes256);
+}
+
+test "tls12 ClientHello reassembles across handshake records and feed calls" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    const split_points = [_]usize{ 2, 32 };
+    for (split_points, 0..) |split_at, case_index| {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{
+            .server_name = "localhost",
+            .trust_anchors = &anchors,
+            .now_unix_seconds = 1_735_689_600,
+        });
+        defer client.deinit();
+
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const record = (try tls12.completeRecord(ch)) orelse return error.BadHandshake;
+        const first = try tls12.writePlainRecord(allocator, .handshake, record.fragment[0..split_at]);
+        defer allocator.free(first);
+        const second = try tls12.writePlainRecord(allocator, .handshake, record.fragment[split_at..]);
+        defer allocator.free(second);
+
+        const server_flight = if (case_index == 0) blk: {
+            try std.testing.expectEqual(FeedResult.need_more, try server.feed(first));
+            break :blk switch (try server.feed(second)) {
+                .bytes_to_send => |bytes| bytes,
+                .need_more => return error.BadHandshake,
+            };
+        } else blk: {
+            const both = try allocator.alloc(u8, first.len + second.len);
+            defer allocator.free(both);
+            @memcpy(both[0..first.len], first);
+            @memcpy(both[first.len..], second);
+            break :blk switch (try server.feed(both)) {
+                .bytes_to_send => |bytes| bytes,
+                .need_more => return error.BadHandshake,
+            };
+        };
+        defer allocator.free(server_flight);
+        const client_flight = switch (try client.feed(server_flight)) {
+            .bytes_to_send => |bytes| bytes,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(client_flight);
+        const server_finished = switch (try server.feed(client_flight)) {
+            .bytes_to_send => |bytes| bytes,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(server_finished);
+        _ = try client.feed(server_finished);
+        try std.testing.expect(server.handshakeDone());
+        try std.testing.expect(client.handshakeDone());
+
+        const client_app = try client.encrypt("fragmented client hello");
+        defer allocator.free(client_app);
+        const server_plain = try server.decrypt(client_app);
+        defer allocator.free(server_plain);
+        try std.testing.expectEqualStrings("fragmented client hello", server_plain);
+        const server_app = try server.encrypt("fragmented reply");
+        defer allocator.free(server_app);
+        const client_plain = try client.decrypt(server_app);
+        defer allocator.free(client_plain);
+        try std.testing.expectEqualStrings("fragmented reply", client_plain);
+    }
+}
+
+test "tls12 ClientHello reassembly rejects oversized, interleaved, and trailing data" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const too_large = [_]u8{ 1, 0x10, 0, 0 };
+        const record = try tls12.writePlainRecord(allocator, .handshake, &too_large);
+        defer allocator.free(record);
+        try std.testing.expectError(error.BadHandshake, server.feed(record));
+    }
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const partial = try tls12.writePlainRecord(allocator, .handshake, &.{ 1, 0 });
+        defer allocator.free(partial);
+        try std.testing.expectEqual(FeedResult.need_more, try server.feed(partial));
+        const interleaved = try tls12.writePlainRecord(allocator, .change_cipher_spec, &.{1});
+        defer allocator.free(interleaved);
+        try std.testing.expectError(error.BadHandshake, server.feed(interleaved));
+    }
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const trailing = try tls12.writePlainRecord(allocator, .handshake, &.{ 1, 0, 0, 0, 1, 0, 0, 0 });
+        defer allocator.free(trailing);
+        try std.testing.expectError(error.BadHandshake, server.feed(trailing));
+    }
 }
 
 test "TLS 1.2 loopback: record_size_limit negotiated + fragments outbound records (RFC 8449)" {
@@ -2498,10 +2703,10 @@ test "TLS 1.2 takeAlert emits a PLAINTEXT fatal alert before the server ChangeCi
         defer allocator.free(rec);
         // [content_type=21][03 03][len=0x0002][level=fatal(2)][desc=protocol_version(70)]
         try std.testing.expectEqual(@as(usize, 7), rec.len);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls12.ContentType.alert)), rec[0]);
         try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, rec[3..5], .big));
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertDescription.protocol_version)), rec[6]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertLevel.fatal)), rec[5]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertDescription.protocol_version)), rec[6]);
 
         // OutOfMemory maps to no description ⇒ no alert.
         try std.testing.expect(server.takeAlert(error.OutOfMemory) == null);
@@ -2531,9 +2736,9 @@ test "TLS 1.2 takeAlert emits a PLAINTEXT fatal alert before the server ChangeCi
 
         const rec = server.takeAlert(error.BadHandshake) orelse return error.BadHandshake;
         defer allocator.free(rec);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertDescription.decode_error)), rec[6]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls12.ContentType.alert)), rec[0]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertLevel.fatal)), rec[5]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertDescription.decode_error)), rec[6]);
         // No write seq consumed on the plaintext path.
         try std.testing.expectEqual(@as(u64, 0), server.hs_write_seq);
     }
@@ -2588,15 +2793,15 @@ test "TLS 1.2 takeAlert seals an ENCRYPTED fatal alert after the resumed server 
     // The nonce/seq is consumed so it can never be reused.
     try std.testing.expectEqual(@as(u64, 2), server.hs_write_seq);
     // TLS 1.2 does not hide the content type: the OUTER record is alert (21).
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls12.ContentType.alert)), rec[0]);
     // It decrypts under the server write keys at the seq used (1), to
     // [fatal(2)][decrypt_error(51)].
     const opened = try tls12.openRecordAlloc(allocator, suite, &server.keys.server_write, 1, rec);
     defer allocator.free(opened.plaintext);
     try std.testing.expectEqual(tls12.ContentType.alert, opened.content_type);
     try std.testing.expectEqualSlices(u8, &.{
-        @intFromEnum(tls_server.AlertLevel.fatal),
-        @intFromEnum(tls_server.AlertDescription.decrypt_error),
+        @backingInt(tls_server.AlertLevel.fatal),
+        @backingInt(tls_server.AlertDescription.decrypt_error),
     }, opened.plaintext);
 }
 
@@ -3028,8 +3233,8 @@ test "tls12 EMS required: a legacy ClientHello without the extension is rejected
     // The refusal maps to a fatal handshake_failure(40) plaintext alert.
     const rec = server.takeAlert(error.EmsRequired) orelse return error.BadHandshake;
     defer allocator.free(rec);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls12.ContentType.alert)), rec[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertLevel.fatal)), rec[5]);
     try std.testing.expectEqual(@as(u8, 40), rec[6]);
 }
 
@@ -3181,12 +3386,18 @@ test "tls12 malformed handshake bytes yield typed errors, never a crash" {
         const bad_ct = [_]u8{ 99, 0x03, 0x03, 0x00, 0x01, 0x00 };
         try std.testing.expectError(error.BadRecord, server.feed(&bad_ct));
     }
-    // A handshake header whose declared length overruns the record is refused.
+    // A complete record may carry only a prefix of a handshake message; retain
+    // it until the remaining body arrives instead of rejecting a valid split.
     {
         var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
         defer server.deinit();
         const overrun = [_]u8{ 22, 0x03, 0x03, 0x00, 0x05, 1, 0x00, 0x00, 0xff, 0x00 };
-        try std.testing.expectError(error.BadHandshake, server.feed(&overrun));
+        try std.testing.expectEqual(FeedResult.need_more, try server.feed(&overrun));
+        try std.testing.expect(!server.read_failed);
+        const rest: [254]u8 = @splat(0);
+        const rest_record = try tls12.writePlainRecord(allocator, .handshake, &rest);
+        defer allocator.free(rest_record);
+        try std.testing.expectError(error.ProtocolVersion, server.feed(rest_record));
     }
     // A wrong first message type (Finished where ClientHello belongs) is refused.
     {
@@ -3320,13 +3531,13 @@ test "tls12 EMS ticket binding: non-EMS sessions get no ticket and a non-EMS res
 /// message (type 11). Used to distinguish full (Certificate present) from
 /// abbreviated (no Certificate) handshakes by inspecting the wire.
 fn serverHelloFlightHasCertificate(flight: []const u8) bool {
-    return handshakeFlightContainsType(flight, @intFromEnum(tls12.HandshakeType.certificate));
+    return handshakeFlightContainsType(flight, @backingInt(tls12.HandshakeType.certificate));
 }
 
 /// True when the server's final plaintext flight contains a NewSessionTicket
 /// handshake message (type 4) before the CCS.
 fn finalFlightHasNewSessionTicket(flight: []const u8) bool {
-    return handshakeFlightContainsType(flight, @intFromEnum(tls12.HandshakeType.new_session_ticket));
+    return handshakeFlightContainsType(flight, @backingInt(tls12.HandshakeType.new_session_ticket));
 }
 
 /// Walk the TLS records in a plaintext flight and report whether any PLAINTEXT
@@ -3340,8 +3551,8 @@ fn handshakeFlightContainsType(flight: []const u8, want_type: u8) bool {
         const len = (@as(usize, flight[i + 3]) << 8) | flight[i + 4];
         const body_start = i + 5;
         if (body_start + len > flight.len) return false;
-        if (ct == @intFromEnum(tls12.ContentType.change_cipher_spec)) return false;
-        if (ct == @intFromEnum(tls12.ContentType.handshake)) {
+        if (ct == @backingInt(tls12.ContentType.change_cipher_spec)) return false;
+        if (ct == @backingInt(tls12.ContentType.handshake)) {
             var off = body_start;
             while (off + 4 <= body_start + len) {
                 const mt = flight[off];
