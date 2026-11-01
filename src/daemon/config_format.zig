@@ -1159,10 +1159,10 @@ pub fn containsOcg2Intent(source: []const u8) bool {
 /// Parse standard TOML and project it onto a defaulted `Config`.
 pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Resolver) TomlError!Config {
     if (source.len > max_config_bytes) return error.ParseError;
-    var doc = toml.parse(allocator, source) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.ParseError,
-    } || std.mem.Allocator.Error;
+    // Preserve the underlying toml.ParseError variant instead of collapsing it
+    // to a generic `error.ParseError` — the specific reason is surfaced to the
+    // operator (see TomlError above).
+    var doc = try toml.parse(allocator, source);
     defer doc.deinit(allocator);
 
     var cfg = try Config.initDefaults(allocator);
