@@ -5015,7 +5015,7 @@ test "cloak configuration validates shape parserValue types and mode" {
         .{ .text = "[cloak]\nanon_epoch_secs=\"0\"\n", .expected = error.@"cloak.anon_epoch_secs" },
         .{ .text = "[cloak]\nanon_epoch_secs=-1\n", .expected = error.ParseError },
         .{ .text = "[cloak]\nanon_epoch_secs=31536001\n", .expected = error.ParseError },
-        .{ .text = "[cloak]\nsecret=null\n", .expected = error.ParseError },
+        .{ .text = "[cloak]\nsecret=null\n", .expected = error.InvalidNumber },
     };
     try std.testing.expectError(error.cloak, parseToml(a, "cloak=7\n" ++ base, .{}));
     for (cases) |case| {

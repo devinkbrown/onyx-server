@@ -2497,5 +2497,5 @@ test "setup quiet loader preserves typed boot projection and rejected input" {
     try testing.expectEqualStrings(normal.parsed.network.name, quiet.parsed.network.name);
     try testing.expectEqual(normal.oper_bindings.len, quiet.oper_bindings.len);
     try testing.expectEqual(@as(usize, 0), quiet.oper_bindings.len);
-    try testing.expectError(error.ParseError, loadFromTextQuiet(allocator, "[listen\n", .{ .port = 6680 }, .{}));
+    try testing.expectError(error.InvalidSyntax, loadFromTextQuiet(allocator, "[listen\n", .{ .port = 6680 }, .{}));
 }
