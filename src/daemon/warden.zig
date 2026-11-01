@@ -445,6 +445,10 @@ pub fn decodeWire(bytes: []const u8) WireError!WireWard {
     const created_ms = try takeI64(bytes, &off);
     const expires_ms = try takeI64(bytes, &off);
     if (pattern.len == 0) return error.BadField;
+    // A malformed address CIDR would replicate a dead ward network-wide (it lists
+    // but never fires — `matchValue` fails it closed). Reject it at decode so a
+    // bad address-ward cannot ride in over gossip.
+    if (!addressPatternValid(match, pattern)) return error.BadField;
     // This is the hostile-peer surface: unlike the local WARD command (whose
     // line parser already strips CRLF), these fields arrive raw off the mesh.
     try validateWireField(pattern, false);
@@ -555,6 +559,21 @@ pub fn decideMeshBan(filter: ?*const MeshBanFilter, registry: *const Registry, m
     }
     if (on_list) return .confirmed;
     return .absent;
+}
+
+/// Whether an `.address` Ward pattern is well-formed at CREATE time. A pattern
+/// containing `/` is a CIDR network and MUST parse — otherwise it is stored,
+/// lists, and looks live, yet `matchValue` fails an unparseable CIDR closed at
+/// match time, so it never fires (a ban that silently protects nothing). A bare
+/// pattern (no `/`) globs and is always accepted; non-address matches glob and
+/// are always accepted. Callers validate at every create seam — the WARD command
+/// and the mesh decode path — so a dead address-ward can neither be stored
+/// locally nor replicated network-wide.
+pub fn addressPatternValid(match: Match, pattern: []const u8) bool {
+    if (match != .address) return true;
+    if (std.mem.indexOfScalar(u8, pattern, '/') == null) return true;
+    _ = cidr.Cidr.parse(pattern) catch return false;
+    return true;
 }
 
 /// Match a facet value against a Ward pattern. An `.address` pattern that
@@ -744,6 +763,27 @@ test "limits and validation" {
     try std.testing.expectError(error.ReasonTooLong, reg.add(longr));
     try reg.add(mkWard(.host, "a.b", .expel));
     try std.testing.expectError(error.TooManyWards, reg.add(mkWard(.host, "c.d", .expel)));
+}
+
+test "address ward CIDR is validated at create and decode" {
+    // The pure create-time guard: a bad CIDR is rejected; a valid CIDR, a bare
+    // globbing address, and any non-address facet are accepted.
+    try std.testing.expect(!addressPatternValid(.address, "192.0.2.0/99"));
+    try std.testing.expect(!addressPatternValid(.address, "2001:db8::/129"));
+    try std.testing.expect(!addressPatternValid(.address, "not-an-ip/24"));
+    try std.testing.expect(addressPatternValid(.address, "192.0.2.0/24"));
+    try std.testing.expect(addressPatternValid(.address, "2001:db8::/32"));
+    try std.testing.expect(addressPatternValid(.address, "192.0.2.*")); // bare glob, no '/'
+    try std.testing.expect(addressPatternValid(.address, "203.0.113.7")); // DNSBL-style bare IP
+    try std.testing.expect(addressPatternValid(.host, "*.evil/x")); // non-address globs
+
+    // The mesh decode path rejects a malformed-CIDR address ward so it cannot
+    // replicate a dead ward network-wide; a valid CIDR still round-trips.
+    var buf: [max_wire_len]u8 = undefined;
+    const bad = WireWard{ .op = .add, .match = .address, .pattern = "192.0.2.0/99", .action = .refuse, .reason = "range ban", .set_by = "oper", .created_ms = 0, .expires_ms = 0 };
+    try std.testing.expectError(error.BadField, decodeWire(try encodeWire(bad, &buf)));
+    const good = WireWard{ .op = .add, .match = .address, .pattern = "192.0.2.0/24", .action = .refuse, .reason = "", .set_by = "", .created_ms = 0, .expires_ms = 0 };
+    try std.testing.expectEqualStrings("192.0.2.0/24", (try decodeWire(try encodeWire(good, &buf))).pattern);
 }
 
 test "mesh ward wire round-trips add and remove" {
