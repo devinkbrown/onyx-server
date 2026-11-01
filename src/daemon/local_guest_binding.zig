@@ -71,6 +71,12 @@ const Backing = struct {
     rows: []Binding,
     tickets: []Ticket,
 };
+/// Bytes of `Backing` charged to `Limits.retained_bytes`. The embedded
+/// issuer's inline WAL buffers are issuer/WAL resources, which the retained
+/// budget explicitly excludes (see `Limits`); counting them would couple the
+/// binding budget to OroStore batch-capacity growth.
+const backing_retained_bytes: usize = @sizeOf(Backing) - @sizeOf(issuer_mod.Issuer);
+
 fn backing(owner: *Bindings) *Backing {
     return @ptrCast(@alignCast(owner));
 }
@@ -128,7 +134,7 @@ pub const Bindings = opaque {
         if (limits.bindings == 0 or limits.tickets == 0 or path.len == 0) return error.InvalidLimits;
         const rows_bytes = std.math.mul(usize, limits.bindings, @sizeOf(Binding)) catch return error.BudgetExceeded;
         const tickets_bytes = std.math.mul(usize, limits.tickets, @sizeOf(Ticket)) catch return error.BudgetExceeded;
-        var fixed = std.math.add(usize, @sizeOf(Backing), rows_bytes) catch return error.BudgetExceeded;
+        var fixed = std.math.add(usize, backing_retained_bytes, rows_bytes) catch return error.BudgetExceeded;
         fixed = std.math.add(usize, fixed, tickets_bytes) catch return error.BudgetExceeded;
         fixed = std.math.add(usize, fixed, path.len) catch return error.BudgetExceeded;
         if (fixed > limits.retained_bytes) return error.BudgetExceeded;
@@ -297,7 +303,7 @@ pub const Bindings = opaque {
         if (image.image.rows.len > limits.bindings or image.image.tickets.len != limits.tickets) return error.BudgetExceeded;
         const rows_bytes = std.math.mul(usize, limits.bindings, @sizeOf(Binding)) catch return error.BudgetExceeded;
         const tickets_bytes = std.math.mul(usize, limits.tickets, @sizeOf(Ticket)) catch return error.BudgetExceeded;
-        const size = std.math.add(usize, @sizeOf(Backing), rows_bytes) catch return error.BudgetExceeded;
+        const size = std.math.add(usize, backing_retained_bytes, rows_bytes) catch return error.BudgetExceeded;
         const size2 = std.math.add(usize, size, tickets_bytes) catch return error.BudgetExceeded;
         if ((std.math.add(usize, size2, path.len) catch return error.BudgetExceeded) > limits.retained_bytes) return error.BudgetExceeded;
         const origin = blk: {
