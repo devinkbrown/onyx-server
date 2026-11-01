@@ -28822,6 +28822,22 @@ pub const LinuxServer = struct {
         try appendToConn(conn, end);
     }
 
+    /// Whether a local-world channel must be omitted from a LIST/LISTX reply
+    /// for `conn`. Secret (+s)/hidden (+h) channels keep their existing
+    /// LIST/LISTX treatment (never enumerated). A private (+p) channel is
+    /// visible only to its members and opers — the same gate bare NAMES
+    /// uses — so neither its name nor its topic leaks to a non-member.
+    /// Fail-closed on an unknown viewer. Remote-only channels cannot be
+    /// +p here: private state materializes a local world record (see
+    /// `remoteChannelSecret`), so they are gated in the local phase.
+    fn listEntryHidden(self: *LinuxServer, conn: *ConnState, name: []const u8, secret: bool, hidden: bool) bool {
+        if (secret or hidden) return true;
+        if (!self.world.isPrivate(name)) return false;
+        if (conn.session.isOper()) return false;
+        const viewer_wid = self.world.findNick(conn.session.displayName()) orelse return true;
+        return !self.world.isMember(name, viewer_wid);
+    }
+
     /// LIST [<filters>] — RPL_LISTSTART/RPL_LIST/RPL_LISTEND. Secret (+s)
     /// channels are hidden. Malformed filters return a numeric instead of
     /// falling back to listing every channel. C/T filters use wall-clock seconds
@@ -28846,6 +28862,7 @@ pub const LinuxServer = struct {
         defer self.allocator.free(remote_only);
         const Adapter = struct {
             server: *LinuxServer,
+            conn: *ConnState,
             it: world_model.World.ChannelViewIterator,
             remote: []const []const u8,
             remote_idx: usize = 0,
@@ -28858,7 +28875,7 @@ pub const LinuxServer = struct {
             pub fn next(s: *@This()) ?list.ChannelInfo {
                 // Phase 1: local world channels.
                 while (s.it.next()) |v| {
-                    if (v.secret or v.hidden) continue;
+                    if (s.server.listEntryHidden(s.conn, v.name, v.secret, v.hidden)) continue;
                     // Count members mesh-wide (local + remote peer roster), so the
                     // displayed count — and the >N/<N ELIST filter — match NAMES.
                     const users = s.server.globalMemberCount(v.name, v.members);
@@ -28903,7 +28920,7 @@ pub const LinuxServer = struct {
             }
         };
         const now_seconds = @divFloor(platform.realtimeMillis(), 1000);
-        var adapter = Adapter{ .server = self, .it = self.world.channelIterator(), .remote = remote_only, .filters = &filters, .now_seconds = now_seconds };
+        var adapter = Adapter{ .server = self, .conn = conn, .it = self.world.channelIterator(), .remote = remote_only, .filters = &filters, .now_seconds = now_seconds };
         var scratch: [default_reply_bytes]u8 = undefined;
         var sink = ConnLineSinkCRLF{ .conn = conn };
         list.emitList(Adapter, &adapter, request, .{ .server_name = self.serverName(), .requester = conn.session.displayName(), .now_seconds = now_seconds }, &scratch, &sink) catch return;
@@ -28957,7 +28974,7 @@ pub const LinuxServer = struct {
         // Phase 1: local world channels.
         var it = self.world.channelIterator();
         while (it.next()) |v| {
-            if (v.secret or v.hidden) continue;
+            if (self.listEntryHidden(conn, v.name, v.secret, v.hidden)) continue;
             const entity = ircx_prop_store.Entity{ .kind = .channel, .id = v.name };
             const subject = if (self.props.getProp(entity, "SUBJECT")) |ev| ev.value else |_| "";
             const language = if (self.props.getProp(entity, "LANGUAGE")) |ev| ev.value else |_| "";
@@ -31067,7 +31084,22 @@ pub const LinuxServer = struct {
         // Notify every local operator-or-higher member.
         var mask_buf: ClientPrefixBuffer = undefined;
         const mask = clientPrefix(conn, &mask_buf);
-        var members = self.world.memberIterator(channel) orelse return;
+        const notified_ops = self.notifyLocalChanOpsKnock(channel, mask, reason);
+        if (notified_ops > 0) {
+            try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
+        }
+
+        // MEMBER KNOCK event: a non-member asked to enter a gated channel. Lets
+        // MEMBER subscribers (and legacy oper-action opers) see knocks network-wide.
+        try self.publishMemberEvent("KNOCK", channel, conn.session.displayName(), reason);
+    }
+
+    /// Send RPL_KNOCK (710) to every LOCAL operator-or-higher member of
+    /// `channel`. Returns the number of operators actually delivered to.
+    /// Shared by the local KNOCK handler and by remote MEMBER KNOCK event
+    /// synthesis, so both paths render an identical numeric.
+    fn notifyLocalChanOpsKnock(self: *LinuxServer, channel: []const u8, mask: []const u8, reason: []const u8) usize {
+        var members = self.world.memberIterator(channel) orelse return 0;
         var notified_ops: usize = 0;
         while (members.next()) |member| {
             const mm = self.world.memberModes(channel, member.*) orelse continue;
@@ -31076,16 +31108,50 @@ pub const LinuxServer = struct {
             const op_conn = self.connFor(op_id) orelse continue;
             if (op_conn.closing) continue;
             var line_buf: [default_reply_bytes]u8 = undefined;
-            const line = try formatNumericLine(&line_buf, op_conn.session.displayName(), .RPL_KNOCK, &.{ channel, mask }, reason);
+            const line = formatNumericLine(&line_buf, op_conn.session.displayName(), .RPL_KNOCK, &.{ channel, mask }, reason) catch continue;
             if (self.enqueueDeliveryMaybeClose(op_id, line, false, "Client quit") == .delivered) notified_ops += 1;
         }
-        if (notified_ops > 0) {
-            try queueNumeric(conn, .RPL_KNOCKDLVR, &.{channel}, "Your KNOCK has been delivered");
-        }
+        return notified_ops;
+    }
 
-        // MEMBER KNOCK event: a non-member asked to enter a gated channel. Lets
-        // MEMBER subscribers (and legacy oper-action opers) see knocks network-wide.
-        try self.publishMemberEvent("KNOCK", channel, conn.session.displayName(), reason);
+    /// A `MEMBER KNOCK <channel> <nick> [:<reason>]` Event Spine message
+    /// accepted from a mesh peer: give this node's local channel operators
+    /// the same 710 the origin node gave its own (the origin notifies only
+    /// its local ops directly, so without this a remote op never sees the
+    /// knock). Called only after spine admission succeeds, so the spine
+    /// exact-once guard bounds this to one synthesis per accepted event.
+    /// The mask uses the knocker's mesh-published visible identity
+    /// (`findRemoteWhois` applies the cloak projection; never a real host),
+    /// falling back to the bare nick when no roster row is known.
+    fn synthesizeRemoteKnock(self: *LinuxServer, message: []const u8) void {
+        const prefix = "MEMBER KNOCK ";
+        if (!std.mem.startsWith(u8, message, prefix)) return;
+        var rest = message[prefix.len..];
+        const chan_end = std.mem.indexOfScalar(u8, rest, ' ') orelse return;
+        const channel = rest[0..chan_end];
+        rest = rest[chan_end + 1 ..];
+        if (channel.len == 0 or rest.len == 0) return;
+        var nick: []const u8 = rest;
+        var reason: []const u8 = "wants to join";
+        if (std.mem.indexOf(u8, rest, " :")) |sep| {
+            nick = rest[0..sep];
+            reason = rest[sep + 2 ..];
+            if (reason.len == 0) reason = "wants to join";
+        } else if (std.mem.indexOfScalar(u8, rest, ' ') != null) {
+            return; // a bare extra token is not a KNOCK shape we authored
+        }
+        if (nick.len == 0 or !self.world.channelExists(channel)) return;
+        var mask_buf: ClientPrefixBuffer = undefined;
+        var mask: []const u8 = nick;
+        if (self.findRemoteWhois(nick)) |rw| {
+            if (rw.username.len != 0 and rw.host.len != 0 and
+                std.mem.indexOfAny(u8, rw.username, " !@") == null and
+                std.mem.indexOfAny(u8, rw.host, " !@") == null)
+            {
+                mask = clientPrefixParts(nick, rw.username, rw.host, &mask_buf);
+            }
+        }
+        _ = self.notifyLocalChanOpsKnock(channel, mask, reason);
     }
 
     /// Three delivered knocks per connection inside a 30-second window.
@@ -66394,6 +66460,9 @@ pub const LinuxServer = struct {
             self.event_history.record(ev.category, ev.severity, platform.realtimeMillis(), origin, ev.message);
             self.event_stats.record(ev.category, ev.severity);
             self.deliverOperEventLocal(origin, category, severity, ev.message, ev.message);
+            // Mirror an accepted MEMBER KNOCK to local ops as a native 710
+            // (v1 events are direct-leaf only, never re-flooded).
+            if (category == .oper_action) self.synthesizeRemoteKnock(ev.message);
         }
     }
 
@@ -66994,6 +67063,9 @@ pub const LinuxServer = struct {
             const sev_max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1);
             const severity: event_spine.EventSeverity = @fromBackingInt(@intCast(@min(event.severity, sev_max)));
             self.deliverOperEventV2Local(event, event_id, category, severity, event.subject);
+            // Remote chanops are not EVENT subscribers: mirror an accepted
+            // MEMBER KNOCK to this node's local ops as a native 710.
+            if (category == .oper_action) self.synthesizeRemoteKnock(event.message);
             self.meshForwardOperEventV2(item.wire);
         }
     }
@@ -109028,6 +109100,61 @@ test "IRCX LISTX query limit truncates at the caller's cap" {
     try expectContains(open, " 817 Asker ");
 }
 
+test "LIST and LISTX hide a private (+p) channel from a non-member" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const owner_id = try addTestLocalClient(server, "Owner", null);
+    const owner = server.connFor(owner_id).?;
+    _ = try server.world.join("#privchan", worldIdFromClient(owner_id));
+    _ = try server.world.join("#openchan", worldIdFromClient(owner_id));
+    try server.world.setTopic("#privchan", "private topic text", "Owner", 1_700_000_000);
+    _ = try server.world.setPrivate("#privchan", true);
+    try std.testing.expect(server.world.isPrivate("#privchan"));
+
+    const stranger_id = try addTestLocalClient(server, "Stranger", null);
+    const stranger = server.connFor(stranger_id).?;
+
+    // Non-member: neither the +p name nor its topic may appear in LISTX.
+    var listx_query = try irc_line.parseLine("LISTX");
+    try server.handleListx(stranger, &listx_query);
+    {
+        const out = stranger.send_buf[0..stranger.send_len];
+        try expectContains(out, "#openchan");
+        try std.testing.expect(std.mem.indexOf(u8, out, "#privchan") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "private topic text") == null);
+    }
+    resetTestSendQ(stranger);
+
+    // Non-member: plain LIST gets the same gate.
+    var list_query = try irc_line.parseLine("LIST");
+    try server.handleList(stranger, &list_query);
+    {
+        const out = stranger.send_buf[0..stranger.send_len];
+        try expectContains(out, "#openchan");
+        try std.testing.expect(std.mem.indexOf(u8, out, "#privchan") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "private topic text") == null);
+    }
+
+    // Member: still sees its own +p channel in LISTX.
+    var member_query = try irc_line.parseLine("LISTX");
+    try server.handleListx(owner, &member_query);
+    try expectContains(owner.send_buf[0..owner.send_len], "#privchan");
+}
+
 test "IRCX PROP LAG delays every member and yields to a longer SLOWMODE" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -146400,6 +146527,37 @@ test "GAP-P0c KNOCK sends 711 only after local operator notification" {
     try server.handleKnock(caller_id, caller_conn, &without_op);
     try std.testing.expect(std.mem.indexOf(u8, caller_conn.send_buf[0..caller_conn.send_len], " 711 ") == null);
     std.debug.print("GAP-P0c branch=knock 711 only after a local op is notified\n", .{});
+}
+
+test "remote MEMBER KNOCK event synthesizes 710 for local channel operators" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const op_id = try addTestLocalClient(&server, "RemoteOp", null);
+    const op_conn = server.connFor(op_id).?;
+    const member_id = try addTestLocalClient(&server, "PlainMember", null);
+    const member_conn = server.connFor(member_id).?;
+    _ = try server.world.join("#gated", worldIdFromClient(op_id));
+    _ = try server.world.setMemberMode("#gated", worldIdFromClient(op_id), .op, true);
+    _ = try server.world.join("#gated", worldIdFromClient(member_id));
+    _ = try server.world.setChannelFlag("#gated", .invite_only, true);
+
+    // Non-KNOCK member events and malformed shapes synthesize nothing.
+    server.synthesizeRemoteKnock("MEMBER JOIN #gated FarKnocker");
+    server.synthesizeRemoteKnock("MEMBER KNOCK");
+    server.synthesizeRemoteKnock("MEMBER KNOCK #gated");
+    server.synthesizeRemoteKnock("MEMBER KNOCK #missing FarKnocker :please");
+    try std.testing.expect(std.mem.indexOf(u8, op_conn.send_buf[0..op_conn.send_len], " 710 ") == null);
+
+    // A peer-authored knock reaches the local op (bare-nick mask: no mesh
+    // peer roster row in this harness), never a plain member.
+    server.synthesizeRemoteKnock("MEMBER KNOCK #gated FarKnocker :please invite me");
+    try expectContains(op_conn.send_buf[0..op_conn.send_len], " 710 RemoteOp #gated FarKnocker :please invite me");
+    try std.testing.expect(std.mem.indexOf(u8, member_conn.send_buf[0..member_conn.send_len], " 710 ") == null);
 }
 
 test "WHOWAS privacy: departing account retains visible host and account only" {

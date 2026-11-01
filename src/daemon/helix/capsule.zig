@@ -88,6 +88,15 @@ pub const CapsuleKind = enum(u8) {
     /// kind is a compile error until this decision is made for it.
     pub fn carriesSecrets(kind: CapsuleKind) bool {
         return switch (kind) {
+            // `.clients` blobs are `session_snapshot.encode` output carrying the
+            // trailing raw 16-byte session reclaim token, and `.sessions` pieces
+            // are `session_capsule` bytes carrying `SessionEntry.token` — both
+            // are replay authority and must be wiped like key material. Adopt
+            // paths copy those tokens by value (`@memcpy` into
+            // `sessions_mod.Token`) before capsule deinit, so wipe-on-deinit
+            // cannot corrupt live state.
+            .clients,
+            .sessions,
             .tls_session,
             .mooring_ratchet,
             .s2s_link,
@@ -96,9 +105,7 @@ pub const CapsuleKind = enum(u8) {
             .host_presentation,
             .local_guest_issuer,
             => true,
-            .clients,
             .channels,
-            .sessions,
             .send_queue,
             .ws_session,
             .pending_migration,
@@ -745,7 +752,11 @@ test "wipeSecretPayloads zeroes secret-bearing payloads and leaves plain ones" {
     try std.testing.expect(CapsuleKind.mooring_ratchet.carriesSecrets());
     try std.testing.expect(CapsuleKind.tls_ticket_keys.carriesSecrets());
     try std.testing.expect(CapsuleKind.mesh_checkpoint.carriesSecrets());
-    try std.testing.expect(!CapsuleKind.clients.carriesSecrets());
+    // Raw 16-byte session reclaim tokens (replay authority) ride in both:
+    // `.clients` via the `session_snapshot` trailing token block and
+    // `.sessions` via `SessionEntry.token`.
+    try std.testing.expect(CapsuleKind.clients.carriesSecrets());
+    try std.testing.expect(CapsuleKind.sessions.carriesSecrets());
     try std.testing.expect(!CapsuleKind.channels.carriesSecrets());
     try std.testing.expect(!CapsuleKind.ws_session.carriesSecrets());
 
@@ -755,16 +766,24 @@ test "wipeSecretPayloads zeroes secret-bearing payloads and leaves plain ones" {
     var secret_buf = "traffic-secret-material".*;
     var plain_buf = "world-checkpoint-state".*;
     var mesh_buf = "history-private-key".*;
+    var sessions_buf = "reclaim-token-bytes!".*;
+    var clients_buf = "snapshot-token-tail!".*;
     var secret_field = [_]Field{.{ .ordinal = 1, .bytes = &secret_buf }};
     var plain_field = [_]Field{.{ .ordinal = 1, .bytes = &plain_buf }};
     var mesh_field = [_]Field{.{ .ordinal = 1, .bytes = &mesh_buf }};
+    var sessions_field = [_]Field{.{ .ordinal = 1, .bytes = &sessions_buf }};
+    var clients_field = [_]Field{.{ .ordinal = 1, .bytes = &clients_buf }};
 
     wipeSecretPayloads(.tls_session, &secret_field); // secret-bearing → wiped
     wipeSecretPayloads(.mesh_checkpoint, &mesh_field);
-    wipeSecretPayloads(.clients, &plain_field); // plain → untouched
+    wipeSecretPayloads(.sessions, &sessions_field); // reclaim token → wiped
+    wipeSecretPayloads(.clients, &clients_field); // reclaim token → wiped
+    wipeSecretPayloads(.channels, &plain_field); // plain → untouched
 
     for (secret_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
     for (mesh_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (sessions_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (clients_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
     try std.testing.expectEqualStrings("world-checkpoint-state", &plain_buf);
 }
 

@@ -12,11 +12,12 @@
 //! unwired `src/proto/ech.zig` config-framing library — see `ech_config.zig`'s
 //! header for why the live path uses `ech_config` + this module instead.)
 //!
-//! HPKE suite: the reused `hpke.zig` implements exactly DHKEM(X25519,
-//! HKDF-SHA256) / HKDF-SHA256 / ChaCha20-Poly1305, so ECH here supports a config
-//! advertising KEM `0x0020`, KDF `0x0001`, AEAD `0x0003`. A config requiring any
-//! other suite is rejected up front (the caller then omits ECH — a byte-identical
-//! ClientHello). Broader HPKE suites are a follow-up.
+//! HPKE suite: the reused `hpke.zig` implements DHKEM(X25519, HKDF-SHA256) /
+//! HKDF-SHA256 with either ChaCha20-Poly1305 or AES-128-GCM, so ECH here
+//! supports a config advertising KEM `0x0020`, KDF `0x0001`, and AEAD `0x0003`
+//! or `0x0001` (the suite BoringSSL-style ECH configs advertise). A config
+//! requiring any other suite is rejected up front (the caller then omits ECH —
+//! a byte-identical ClientHello).
 //!
 //! References: draft-ietf-tls-esni §5.2 (encryption + `info`), §6.1.3 (padding),
 //! §7.2 (acceptance confirmation).
@@ -28,10 +29,22 @@ const ech_config = @import("../proto/ech_config.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// The three HPKE ids this module (via `hpke.zig`) can seal under.
+/// The HPKE ids this module (via `hpke.zig`) can seal under.
 pub const kem_id: u16 = hpke.kem_id; // DHKEM(X25519, HKDF-SHA256) = 0x0020
 pub const kdf_id: u16 = hpke.kdf_id; // HKDF-SHA256 = 0x0001
+/// Default/preferred AEAD id, kept for existing callers.
 pub const aead_id: u16 = hpke.aead_id; // ChaCha20-Poly1305 = 0x0003
+pub const aead_id_aes128_gcm: u16 = hpke.aead_id_aes128_gcm; // AES-128-GCM = 0x0001
+
+/// The AEAD id `beginSeal` will use for `cfg`, or null when the config
+/// advertises no `{kdf_id, aead}` suite this module can seal under.
+/// ChaCha20-Poly1305 is preferred when both are advertised, preserving the
+/// exact wire behavior configs usable before AES-128-GCM support produced.
+pub fn selectAeadId(cfg: ech_config.Config) ?u16 {
+    if (cfg.supportsSuite(kdf_id, aead_id)) return aead_id;
+    if (cfg.supportsSuite(kdf_id, aead_id_aes128_gcm)) return aead_id_aes128_gcm;
+    return null;
+}
 
 /// Expected HPKE recipient public-key length for our KEM (X25519 = 32). A
 /// KEM-`0x0020` config whose `public_key` is any other length is not sealable;
@@ -41,8 +54,8 @@ pub const hpke_public_key_len: usize = hpke.public_key_len;
 /// The `encrypted_client_hello` extension type (draft-ietf-tls-esni).
 pub const extension_type: u16 = 0xfe0d;
 
-/// AEAD tag length of the ECH HPKE suite (ChaCha20-Poly1305). The sealed ECH
-/// payload is `len(EncodedClientHelloInner) + tag_len`.
+/// AEAD tag length of the ECH HPKE suites (16 for both ChaCha20-Poly1305 and
+/// AES-128-GCM). The sealed ECH payload is `len(EncodedClientHelloInner) + tag_len`.
 pub const tag_len: usize = hpke.tag_len;
 
 /// HPKE `info` label prefix: the 7-byte ASCII string "tls ech" then a 0x00.
@@ -76,6 +89,9 @@ pub const Error = error{
 pub const SealResult = struct {
     enc: [hpke.enc_len]u8,
     payload: []u8,
+    /// The AEAD id actually sealed under (0x0003 or 0x0001); serialize it with
+    /// `writeOuterExtBodyForSuite` so the outer extension names the true suite.
+    aead_id: u16 = aead_id,
 
     pub fn deinit(self: SealResult, allocator: Allocator) void {
         allocator.free(self.payload);
@@ -117,20 +133,32 @@ pub fn paddingLen(encoded_len: usize, server_name_len: usize, maximum_name_lengt
 /// builds the AAD with a zeroed payload placeholder, then calls `seal`.
 pub const Sealer = struct {
     enc: [hpke.enc_len]u8,
-    ctx: hpke.Context,
+    /// The AEAD id this sealer seals under (0x0003 or 0x0001), selected from
+    /// the config by `beginSeal`. Serialize it via `writeOuterExtBodyForSuite`.
+    aead_id: u16 = aead_id,
+    ctx: union(enum) {
+        chacha20_poly1305: hpke.ChaCha20Poly1305.Context,
+        aes128_gcm: hpke.Aes128Gcm.Context,
+    },
 
     /// Seal `pt` (the padded EncodedClientHelloInner) under `aad` (the
     /// ClientHelloOuterAAD). Single-use: the context is wiped afterward. Returns
     /// the owned ciphertext payload.
     pub fn seal(self: *Sealer, allocator: Allocator, aad: []const u8, pt: []const u8) Error![]u8 {
-        const ct = try self.ctx.seal(allocator, aad, pt);
-        self.ctx.wipe();
+        const ct = switch (self.ctx) {
+            .chacha20_poly1305 => |*c| try c.seal(allocator, aad, pt),
+            .aes128_gcm => |*c| try c.seal(allocator, aad, pt),
+        };
+        self.wipe();
         return ct.bytes;
     }
 
     /// Wipe the sender context without sealing (error-path cleanup).
     pub fn wipe(self: *Sealer) void {
-        self.ctx.wipe();
+        switch (self.ctx) {
+            .chacha20_poly1305 => |*c| c.wipe(),
+            .aes128_gcm => |*c| c.wipe(),
+        }
     }
 };
 
@@ -144,7 +172,7 @@ pub fn beginSeal(
     eph_seed: [hpke.secret_key_len]u8,
 ) Error!Sealer {
     if (cfg.kem_id != kem_id) return error.UnsupportedEchSuite;
-    if (!cfg.supportsSuite(kdf_id, aead_id)) return error.UnsupportedEchSuite;
+    const selected_aead_id = selectAeadId(cfg) orelse return error.UnsupportedEchSuite;
     if (cfg.public_key.len != hpke.public_key_len) return error.UnsupportedEchSuite;
 
     var pk_r: hpke.PublicKey = undefined;
@@ -153,10 +181,22 @@ pub fn beginSeal(
     const info = try buildInfo(allocator, cfg);
     defer allocator.free(info);
 
-    var kem = try hpke.encapDeterministic(pk_r, eph_seed);
+    // A config whose public key is not a usable X25519 point (e.g. all-zero /
+    // small-order) is not a config this module can seal under.
+    var kem = hpke.encapDeterministic(pk_r, eph_seed) catch return error.UnsupportedEchSuite;
     defer kem.wipe();
-    const ctx = hpke.Context.setupBaseS(kem.shared_secret, info);
-    return .{ .enc = kem.enc, .ctx = ctx };
+    if (selected_aead_id == aead_id_aes128_gcm) {
+        return .{
+            .enc = kem.enc,
+            .aead_id = selected_aead_id,
+            .ctx = .{ .aes128_gcm = hpke.Aes128Gcm.Context.setupBaseS(kem.shared_secret, info) },
+        };
+    }
+    return .{
+        .enc = kem.enc,
+        .aead_id = selected_aead_id,
+        .ctx = .{ .chacha20_poly1305 = hpke.ChaCha20Poly1305.Context.setupBaseS(kem.shared_secret, info) },
+    };
 }
 
 /// One-shot convenience: `beginSeal` then `seal`. The ECH client path uses the
@@ -171,7 +211,7 @@ pub fn seal(
     var sealer = try beginSeal(allocator, cfg, eph_seed);
     errdefer sealer.wipe();
     const payload = try sealer.seal(allocator, aad, encoded_inner);
-    return .{ .enc = sealer.enc, .payload = payload };
+    return .{ .enc = sealer.enc, .payload = payload, .aead_id = sealer.aead_id };
 }
 
 /// Exact serialized length of the outer `encrypted_client_hello` extension *body*
@@ -196,6 +236,20 @@ pub fn writeOuterExtBody(
     enc: []const u8,
     payload: []const u8,
 ) Error![]const u8 {
+    return writeOuterExtBodyForSuite(out, config_id, enc, payload, aead_id);
+}
+
+/// As `writeOuterExtBody`, but stamps `suite_aead_id` (the AEAD actually
+/// sealed under, e.g. `Sealer.aead_id`) into the cipher_suite field. Rejects
+/// an AEAD id this module cannot seal under.
+pub fn writeOuterExtBodyForSuite(
+    out: []u8,
+    config_id: u8,
+    enc: []const u8,
+    payload: []const u8,
+    suite_aead_id: u16,
+) Error![]const u8 {
+    if (suite_aead_id != aead_id and suite_aead_id != aead_id_aes128_gcm) return error.UnsupportedEchSuite;
     if (enc.len > std.math.maxInt(u16) or payload.len > std.math.maxInt(u16)) return error.BadLength;
     if (payload.len == 0) return error.BadLength; // payload<1..2^16-1>
     const need = outerExtBodyLen(enc.len, payload.len);
@@ -206,7 +260,7 @@ pub fn writeOuterExtBody(
     n += 1;
     std.mem.writeInt(u16, out[n..][0..2], kdf_id, .big);
     n += 2;
-    std.mem.writeInt(u16, out[n..][0..2], aead_id, .big);
+    std.mem.writeInt(u16, out[n..][0..2], suite_aead_id, .big);
     n += 2;
     out[n] = config_id;
     n += 1;
@@ -266,6 +320,10 @@ const Sha384 = hkdf_tls13.Sha384;
 /// Assemble a one-entry ECHConfigList around `pk` and parse it back into a
 /// `Config`. The returned `Config` borrows `list_buf`, so keep it alive.
 fn testConfig(list_buf: []u8, config_id: u8, pk: []const u8, public_name: []const u8) !ech_config.Config {
+    return testConfigForAead(list_buf, config_id, pk, public_name, aead_id);
+}
+
+fn testConfigForAead(list_buf: []u8, config_id: u8, pk: []const u8, public_name: []const u8, suite_aead_id: u16) !ech_config.Config {
     var contents: [512]u8 = undefined;
     var n: usize = 0;
     contents[n] = config_id;
@@ -280,7 +338,7 @@ fn testConfig(list_buf: []u8, config_id: u8, pk: []const u8, public_name: []cons
     n += 2;
     std.mem.writeInt(u16, contents[n..][0..2], kdf_id, .big);
     n += 2;
-    std.mem.writeInt(u16, contents[n..][0..2], aead_id, .big);
+    std.mem.writeInt(u16, contents[n..][0..2], suite_aead_id, .big);
     n += 2;
     contents[n] = 64;
     n += 1; // maximum_name_length
@@ -302,7 +360,7 @@ fn testConfig(list_buf: []u8, config_id: u8, pk: []const u8, public_name: []cons
 
     std.mem.writeInt(u16, list_buf[0..2], @intCast(m), .big);
     @memcpy(list_buf[2..][0..m], entry[0..m]);
-    return (try ech_config.selectSupported(list_buf[0 .. 2 + m], kem_id, kdf_id, aead_id)).?;
+    return (try ech_config.selectSupported(list_buf[0 .. 2 + m], kem_id, kdf_id, suite_aead_id)).?;
 }
 
 test "seal round-trips: a test 'server' opens the ECH payload" {
@@ -363,6 +421,57 @@ test "seal rejects an unsupported HPKE suite config" {
     cfg.kem_id = kem_id;
     cfg.cipher_suites = &[_]u8{ 0x00, 0x01, 0x00, 0x02 };
     try testing.expectError(error.UnsupportedEchSuite, seal(allocator, cfg, "inner", "aad", @splat(0)));
+}
+
+test "tls Encrypted Client Hello seal accepts an AES-128-GCM config and rejects a bogus aead_id" {
+    const allocator = testing.allocator;
+    const kp = try hpke.KeyPair.generateDeterministic(@splat(0x2E));
+
+    var list_buf: [600]u8 = undefined;
+    const cfg = try testConfigForAead(&list_buf, 9, &kp.public_key, "cover.example", aead_id_aes128_gcm);
+    try testing.expectEqual(@as(?u16, aead_id_aes128_gcm), selectAeadId(cfg));
+
+    const encoded_inner = "EncodedClientHelloInner bytes for the AES-GCM ECH config";
+    const aad = "ClientHelloOuterAAD with payload zeroed";
+    var sealed = try seal(allocator, cfg, encoded_inner, aad, @splat(0x3D));
+    defer sealed.deinit(allocator);
+    try testing.expectEqual(aead_id_aes128_gcm, sealed.aead_id);
+
+    // A server holding the config key opens it under the AES-128-GCM suite...
+    const info = try buildInfo(allocator, cfg);
+    defer allocator.free(info);
+    const opened = try hpke.Aes128Gcm.openBase(allocator, sealed.enc, kp.secret_key, info, aad, sealed.payload);
+    defer opened.deinit(allocator);
+    try testing.expectEqualSlices(u8, encoded_inner, opened.bytes);
+    // ...and not under the ChaCha20-Poly1305 suite.
+    try testing.expectError(
+        error.AuthenticationFailed,
+        hpke.openBase(allocator, sealed.enc, kp.secret_key, info, aad, sealed.payload),
+    );
+
+    // The outer extension stamps the suite actually sealed under.
+    var body_buf: [256]u8 = undefined;
+    const body = try writeOuterExtBodyForSuite(
+        body_buf[0..outerExtBodyLen(sealed.enc.len, sealed.payload.len)],
+        cfg.config_id,
+        &sealed.enc,
+        sealed.payload,
+        sealed.aead_id,
+    );
+    try testing.expectEqual(kdf_id, std.mem.readInt(u16, body[1..3], .big));
+    try testing.expectEqual(aead_id_aes128_gcm, std.mem.readInt(u16, body[3..5], .big));
+    try testing.expectError(
+        error.UnsupportedEchSuite,
+        writeOuterExtBodyForSuite(body_buf[0..outerExtBodyLen(sealed.enc.len, sealed.payload.len)], cfg.config_id, &sealed.enc, sealed.payload, 0x0002),
+    );
+
+    // A bogus aead_id (and an unsupported KDF pairing) is rejected up front.
+    var bogus = cfg;
+    bogus.cipher_suites = &[_]u8{ 0x00, 0x01, 0x99, 0x99 };
+    try testing.expectEqual(@as(?u16, null), selectAeadId(bogus));
+    try testing.expectError(error.UnsupportedEchSuite, seal(allocator, bogus, "inner", "aad", @splat(0x3D)));
+    bogus.cipher_suites = &[_]u8{ 0x00, 0x03, 0x00, 0x01 }; // AES-GCM but HKDF-SHA512
+    try testing.expectError(error.UnsupportedEchSuite, seal(allocator, bogus, "inner", "aad", @splat(0x3D)));
 }
 
 test "outer extension body round-trips through the parser" {
