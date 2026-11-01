@@ -1,0 +1,17 @@
+# Root-owned OpenRC settings; installed as /etc/conf.d/onyx-server.
+# Keep secrets in the daemon's private TOML, not in command arguments.
+
+# command=/usr/bin/onyx-server
+# config=/etc/onyx-server/onyx-server.toml
+# command_user=onyx-server:onyx-server
+# directory=/var/lib/onyx-server
+
+# Service-specific defaults override OpenRC's global defaults; edit here to change them.
+# Permit at most three respawns in a 60-second period, with five seconds between.
+respawn_delay=5
+respawn_max=3
+respawn_period=60
+
+# Supervised stdout/stderr go to the configured syslog service by default.
+# output_logger="logger -t onyx-server -p daemon.info"
+# error_logger="logger -t onyx-server -p daemon.err"

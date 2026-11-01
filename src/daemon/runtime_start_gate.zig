@@ -132,7 +132,7 @@ fn backing(self: *const View) *const Backing {
 }
 
 fn before(a: ParticipantSpec, b: ParticipantSpec) bool {
-    return @intFromEnum(a.kind) < @intFromEnum(b.kind) or
+    return @backingInt(a.kind) < @backingInt(b.kind) or
         (a.kind == b.kind and a.instance < b.instance);
 }
 fn optionsEqual(a: std.Thread.SpawnConfig, b: std.Thread.SpawnConfig) bool {
@@ -556,8 +556,8 @@ test "selective join retires producer while original consumer remains live" {
 
 test "GEO appends after every existing kind and exact canonical owner is required" {
     const original = [_]Kind{ .reactor, .rdns, .dnsbl, .mail, .acme, .ocsp, .webpush, .metrics, .webhook, .history, .native_media, .media_plane, .webtransport, .native_service };
-    for (original, 0..) |kind, value| try testing.expectEqual(@as(u8, @intCast(value)), @intFromEnum(kind));
-    try testing.expectEqual(@as(u8, 14), @intFromEnum(Kind.geo));
+    for (original, 0..) |kind, value| try testing.expectEqual(@as(u8, @intCast(value)), @backingInt(kind));
+    try testing.expectEqual(@as(u8, 14), @backingInt(Kind.geo));
     var owner: Actor = .{};
     var foreign: Actor = .{};
     const specs = [_]ParticipantSpec{

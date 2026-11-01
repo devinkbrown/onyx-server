@@ -175,7 +175,7 @@ pub const Throttle = struct {
 
     /// Number of keys currently tracked in `scope`.
     pub fn count(self: *const Throttle, scope: Scope) usize {
-        return self.tables[@intFromEnum(scope)].count();
+        return self.tables[@backingInt(scope)].count();
     }
 
     /// Total keys tracked across both scopes.
@@ -188,8 +188,8 @@ pub const Throttle = struct {
     /// omitting them would change future capacity and decay decisions.
     pub fn exportUpgradeCheckpoint(self: *const Throttle, allocator: std.mem.Allocator) CheckpointError![]u8 {
         if (!validCheckpointParams(self.params)) return error.InvalidField;
-        const account_count = self.tables[@intFromEnum(Scope.account)].count();
-        const ip_count = self.tables[@intFromEnum(Scope.ip)].count();
+        const account_count = self.tables[@backingInt(Scope.account)].count();
+        const ip_count = self.tables[@backingInt(Scope.ip)].count();
         if (account_count > max_checkpoint_entries_per_scope or ip_count > max_checkpoint_entries_per_scope or
             (self.params.max_tracked_per_scope != 0 and
                 (account_count > self.params.max_tracked_per_scope or ip_count > self.params.max_tracked_per_scope)))
@@ -307,7 +307,7 @@ pub const Throttle = struct {
     }
 
     fn lockedFor(self: *Throttle, scope: Scope, norm: []const u8, now_ms: i64) ?i64 {
-        const t = &self.tables[@intFromEnum(scope)];
+        const t = &self.tables[@backingInt(scope)];
         const entry = t.get(norm) orelse return null;
         if (now_ms < entry.locked_until_ms) {
             // Saturating subtract; both operands are i64 and lhs > rhs here.
@@ -321,7 +321,7 @@ pub const Throttle = struct {
     pub fn score(self: *Throttle, scope: Scope, key: []const u8, now_ms: i64) f64 {
         var buf: [256]u8 = undefined;
         const norm = normalizeInto(&buf, key) orelse return self.scoreHeap(scope, key, now_ms);
-        const t = &self.tables[@intFromEnum(scope)];
+        const t = &self.tables[@backingInt(scope)];
         const entry = t.getPtr(norm) orelse return 0;
         return self.decayedScore(entry, now_ms);
     }
@@ -330,7 +330,7 @@ pub const Throttle = struct {
         const norm = self.allocator.dupe(u8, key) catch return 0;
         defer self.allocator.free(norm);
         toLower(norm);
-        const t = &self.tables[@intFromEnum(scope)];
+        const t = &self.tables[@backingInt(scope)];
         const entry = t.getPtr(norm) orelse return 0;
         return self.decayedScore(entry, now_ms);
     }
@@ -380,7 +380,7 @@ pub const Throttle = struct {
     }
 
     fn removeNorm(self: *Throttle, scope: Scope, norm: []const u8) void {
-        const t = &self.tables[@intFromEnum(scope)];
+        const t = &self.tables[@backingInt(scope)];
         if (t.fetchRemove(norm)) |removed| self.allocator.free(removed.key);
     }
 
@@ -432,7 +432,7 @@ pub const Throttle = struct {
     }
 
     fn getOrCreateNorm(self: *Throttle, scope: Scope, norm: []const u8, now_ms: i64) ?*Entry {
-        const t = &self.tables[@intFromEnum(scope)];
+        const t = &self.tables[@backingInt(scope)];
         if (t.getPtr(norm)) |entry| return entry;
 
         const cap = self.params.max_tracked_per_scope;

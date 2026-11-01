@@ -302,7 +302,7 @@ pub fn parseList(bytes: []const u8) Error!SctList {
 pub fn parseSct(bytes: []const u8) Error!Sct {
     var r = Reader.init(bytes);
 
-    const version: Version = @enumFromInt(try r.readU8());
+    const version: Version = @fromBackingInt(@intCast(try r.readU8()));
 
     const id_bytes = try r.take(log_id_len);
     var log_id: [log_id_len]u8 = undefined;
@@ -397,15 +397,15 @@ pub fn buildSignedData(out: []u8, input: SignedDataInput) Error![]const u8 {
 
     var off: usize = 0;
 
-    out[off] = @intFromEnum(input.version);
+    out[off] = @backingInt(input.version);
     off += 1;
-    out[off] = @intFromEnum(SignatureType.certificate_timestamp);
+    out[off] = @backingInt(SignatureType.certificate_timestamp);
     off += 1;
 
     std.mem.writeInt(u64, out[off..][0..timestamp_len], input.timestamp, .big);
     off += timestamp_len;
 
-    writeU16(out[off..], @intFromEnum(input.entry_type));
+    writeU16(out[off..], @backingInt(input.entry_type));
     off += sig_alg_len;
 
     switch (input.entry_type) {
@@ -820,7 +820,7 @@ fn buildOneSctBody(
     signature: []const u8,
 ) []const u8 {
     var off: usize = 0;
-    out[off] = @intFromEnum(Version.v1);
+    out[off] = @backingInt(Version.v1);
     off += 1;
     @memcpy(out[off..][0..log_id_len], &log_id);
     off += log_id_len;
@@ -1006,7 +1006,7 @@ test "parseSct rejects a signature length that overruns the body" {
     // Arrange: hand-build an SCT whose signature length prefix lies.
     var body: [1 + log_id_len + 8 + 2 + 2 + 2]u8 = undefined;
     var off: usize = 0;
-    body[off] = @intFromEnum(Version.v1);
+    body[off] = @backingInt(Version.v1);
     off += 1;
     @memset(body[off..][0..log_id_len], 0x00);
     off += log_id_len;
@@ -1044,7 +1044,7 @@ test "parseList surfaces version even for an unknown version byte" {
     // named member, so an unknown byte is not equal to v1.
     try testing.expectEqual(@as(usize, 1), parsed.len);
     try testing.expect(parsed.slice()[0].version != .v1);
-    try testing.expectEqual(@as(u8, 9), @intFromEnum(parsed.slice()[0].version));
+    try testing.expectEqual(@as(u8, 9), @backingInt(parsed.slice()[0].version));
 }
 
 test "parseList rejects more than max_scts entries" {

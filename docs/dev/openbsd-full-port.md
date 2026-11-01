@@ -3,6 +3,9 @@
 
 # Full OpenBSD runtime port
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Requested 2026-09-30. The target is the shipping Linux daemon's product
 behavior on OpenBSD, including secured mesh sessions and connection-preserving
 Helix. The native plaintext evidence in the continuation audit is an accepted

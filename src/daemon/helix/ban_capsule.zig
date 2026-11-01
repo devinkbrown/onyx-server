@@ -93,7 +93,7 @@ pub fn encode(self: BanCapsule, out: []u8) Error![]const u8 {
     if (self.entries.len > 0xFFFF) return error.TooMany;
     try writeU16(out, &pos, @intCast(self.entries.len));
     for (self.entries) |e| {
-        try writeByte(out, &pos, @intFromEnum(e.kind));
+        try writeByte(out, &pos, @backingInt(e.kind));
         try writeStr(out, &pos, e.mask);
         try writeStr(out, &pos, e.setter);
         try writeI64(out, &pos, e.set_ts);

@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SELECTOR = Path(__file__).with_name("select-gates.py")
@@ -18,6 +21,19 @@ SPEC.loader.exec_module(selector)
 
 
 class GateSelectionTests(unittest.TestCase):
+    def test_cli_uses_pinned_safe_spelling_without_losing_critical_gates(self) -> None:
+        output = io.StringIO()
+        with patch.object(sys, "argv", [str(SELECTOR), "src/daemon/sessions.zig"]):
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(0, selector.main())
+        commands = output.getvalue().splitlines()
+        gates, critical = selector.select(["src/daemon/sessions.zig"])
+        for gate in gates:
+            self.assertIn(f"zig build {gate}", commands)
+        for gate in critical:
+            self.assertIn(f"zig build {gate} -Doptimize=safe", commands)
+        self.assertNotIn("ReleaseSafe", output.getvalue())
+
     def assert_selection(
         self, path: str, expected_gates: set[str], expected_critical: set[str]
     ) -> None:

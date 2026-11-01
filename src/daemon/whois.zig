@@ -116,6 +116,12 @@ pub const WhoisSubject = struct {
     /// appended to the 671 trailing as "... secure connection (<cipher>)".
     /// Only rendered when `is_secure` is set; null keeps the plain wording.
     secure_cipher: ?[]const u8 = null,
+    /// Actual kernel TLS offload state for this physical connection, appended
+    /// to the 671 trailing as `[kTLS: TX]`, `[kTLS: RX]`, or `[kTLS: TX+RX]`.
+    /// These must describe the currently attached directions, not merely the
+    /// configured `[tls] ktls` intent. Only rendered when `is_secure` is set.
+    ktls_tx: bool = false,
+    ktls_rx: bool = false,
     /// RPL_WHOISACTUALLY (338): the target's reverse name, or the literal
     /// address when no reverse name is known. Shown only to opers or self.
     /// Null suppresses the line.
@@ -252,7 +258,7 @@ pub fn writeWhoisWith(
         try writeWhoisCertfpLine(params, sink, server_name, requester_nick, subject.nick, fp);
     }
     if (subject.is_secure) {
-        try writeWhoisSecureLine(params, sink, server_name, requester_nick, subject.nick, subject.secure_cipher);
+        try writeWhoisSecureLine(params, sink, server_name, requester_nick, subject.nick, subject.secure_cipher, subject.ktls_tx, subject.ktls_rx);
     }
     if (subject.geo) |geo_text| {
         try writeWhoisSpecialLine(params, sink, server_name, requester_nick, subject.nick, geo_text);
@@ -711,6 +717,8 @@ fn writeWhoisSecureLine(
     requester_nick: []const u8,
     subject_nick: []const u8,
     cipher: ?[]const u8,
+    ktls_tx: bool,
+    ktls_rx: bool,
 ) WhoisError!void {
     var b = try sink.beginLine();
     b.max_line_bytes = params.max_line_bytes;
@@ -723,6 +731,13 @@ fn writeWhoisSecureLine(
             try b.appendBytes(c);
             try b.appendBytes(")");
         }
+    }
+    if (ktls_tx and ktls_rx) {
+        try b.appendBytes(" [kTLS: TX+RX]");
+    } else if (ktls_tx) {
+        try b.appendBytes(" [kTLS: TX]");
+    } else if (ktls_rx) {
+        try b.appendBytes(" [kTLS: RX]");
     }
     try b.crlf();
     try sink.commitLine(&b);
@@ -789,7 +804,7 @@ fn whoisChannelsHeaderLen(server_name: []const u8, requester_nick: []const u8, s
 
 fn validNickByte(ch: u8) bool {
     return switch (ch) {
-        'A'...'Z', 'a'...'z', '0'...'9', '[', ']', '\\', '`', '_', '^', '{', '|', '}', '-' => true,
+        'A'...'Z', 'a'...'z', '0'...'9', '[', ']', '\\', '`', '_', '^', '{', '|', '}', '-', 0x80...0xff => true,
         else => false,
     };
 }
@@ -804,7 +819,7 @@ fn validUserByte(ch: u8) bool {
 
 fn validHostByte(ch: u8) bool {
     return switch (ch) {
-        'A'...'Z', 'a'...'z', '0'...'9', '.', '-', '_', ':', '[', ']', '/' => true,
+        'A'...'Z', 'a'...'z', '0'...'9', '.', '-', '_', ':', '[', ']', '/', 0x80...0xff => true,
         else => false,
     };
 }
@@ -1032,6 +1047,45 @@ test "secure connection with negotiated cipher renders it in the 671 trailing" {
             found_671 = true;
             try std.testing.expectEqualStrings(
                 ":irc.example 671 dan alice :is using a secure connection (TLS_AES_128_GCM_SHA256)\r\n",
+                line.bytes,
+            );
+        }
+    }
+    try std.testing.expect(found_671);
+}
+
+test "secure connection renders actual kTLS offload state in the 671 trailing" {
+    var storage: [1024]u8 = undefined;
+    var lines_storage: [12]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+
+    var subject = sampleSubject();
+    subject.is_secure = true;
+    subject.secure_cipher = "TLS_CHACHA20_POLY1305_SHA256";
+    subject.ktls_tx = true;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+
+    var found_671 = false;
+    for (sink.slice()) |line| {
+        if (std.mem.indexOf(u8, line.bytes, " 671 ") != null) {
+            found_671 = true;
+            try std.testing.expectEqualStrings(
+                ":irc.example 671 dan alice :is using a secure connection (TLS_CHACHA20_POLY1305_SHA256) [kTLS: TX]\r\n",
+                line.bytes,
+            );
+        }
+    }
+    try std.testing.expect(found_671);
+
+    sink.reset();
+    subject.ktls_rx = true;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+    found_671 = false;
+    for (sink.slice()) |line| {
+        if (std.mem.indexOf(u8, line.bytes, " 671 ") != null) {
+            found_671 = true;
+            try std.testing.expectEqualStrings(
+                ":irc.example 671 dan alice :is using a secure connection (TLS_CHACHA20_POLY1305_SHA256) [kTLS: TX+RX]\r\n",
                 line.bytes,
             );
         }
@@ -1376,4 +1430,47 @@ test "single channel token too large for line limit is rejected" {
         error.ChannelTokenTooLong,
         writeWhoisChannelLines(.{ .max_line_bytes = 26 }, &sink, "s", "me", "alice", &channels),
     );
+}
+
+test "WHOIS preserves non-ASCII public identity bytes in 311" {
+    var storage: [2048]u8 = undefined;
+    var lines_storage: [8]WhoisLine = undefined;
+    var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+    var subject = sampleSubject();
+    subject.nick = "álîce";
+    subject.user = "üser";
+    subject.host = "höst.example";
+    subject.actual_host = null;
+    try writeWhois(&sink, "irc.example", "dan", subject);
+    try std.testing.expectEqualStrings(":irc.example 311 dan álîce üser höst.example * :Alice Example\r\n", sink.slice()[0].bytes);
+    for (sink.slice()) |line| try std.testing.expect(std.mem.indexOf(u8, line.bytes, " 338 ") == null);
+    try validateHost("2001:db8::1");
+}
+
+test "WHOIS non-ASCII identity respects byte limits and rejects unsafe ASCII before output" {
+    const nick: [DEFAULT_MAX_NICK_BYTES + 1]u8 = @splat(0x80);
+    const host: [DEFAULT_MAX_HOST_BYTES + 1]u8 = @splat(0x80);
+    try validateNick(nick[0..DEFAULT_MAX_NICK_BYTES]);
+    try validateHost(host[0..DEFAULT_MAX_HOST_BYTES]);
+    try std.testing.expectError(error.NickTooLong, validateNick(&nick));
+    try std.testing.expectError(error.HostTooLong, validateHost(&host));
+    const invalid = [_]u8{ 0, '\r', '\n', ' ', 0x7f, '!', '@' };
+    for (invalid) |bad| {
+        const mixed = [_]u8{ 0xc3, 0xa9, bad, 'x' };
+        var storage: [1024]u8 = @splat(0xa5);
+        var lines_storage: [8]WhoisLine = undefined;
+        var sink = WhoisLineSink{ .lines = &lines_storage, .storage = &storage };
+        var subject = sampleSubject();
+        subject.nick = &mixed;
+        try std.testing.expectError(error.InvalidNick, writeWhois(&sink, "irc.example", "dan", subject));
+        subject = sampleSubject();
+        subject.host = &mixed;
+        try std.testing.expectError(error.InvalidHost, writeWhois(&sink, "irc.example", "dan", subject));
+        subject = sampleSubject();
+        subject.user = &mixed;
+        try std.testing.expectError(error.InvalidUser, writeWhois(&sink, "irc.example", "dan", subject));
+        try std.testing.expectEqual(@as(usize, 0), sink.slice().len);
+        try std.testing.expect(std.mem.allEqual(u8, &storage, 0xa5));
+    }
+    try std.testing.expectError(error.InvalidNick, validateNick("é:bad"));
 }

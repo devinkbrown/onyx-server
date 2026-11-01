@@ -116,7 +116,7 @@ pub fn encode(
     }
     for (totp_keys) |key| {
         const item = totp.entries.get(key).?;
-        try checkTotp(key, item.secret_b32, @intFromEnum(item.phase) == 1, item.last_step);
+        try checkTotp(key, item.secret_b32, @backingInt(item.phase) == 1, item.last_step);
         if (item.secret.len == 0) return error.InvalidField;
         try wire.addLen(&size, 14 + key.len + item.secret_b32.len);
     }
@@ -154,7 +154,7 @@ pub fn encode(
         const item = totp.entries.get(key).?;
         writer.writeU16(@intCast(key.len));
         writer.writeU16(@intCast(item.secret_b32.len));
-        writer.writeByte(@intFromEnum(item.phase));
+        writer.writeByte(@backingInt(item.phase));
         writer.writeByte(@intFromBool(item.last_step != null));
         writer.writeI64(item.last_step orelse 0);
         writer.writeBytes(key);
@@ -286,7 +286,7 @@ fn parseHeader(bytes: []const u8) Error!Header {
         .totp_params = .{
             .window = bytes[54],
             .digits = bytes[55],
-            .algo = @enumFromInt(bytes[60]),
+            .algo = @fromBackingInt(@intCast(bytes[60])),
         },
     };
     if (!std.mem.eql(u8, bytes[56..60], &.{ 0, 0, 0, 0 })) return error.InvalidField;
@@ -324,7 +324,7 @@ fn writeHeader(writer: *wire.Writer, h: Header, body_len: usize) void {
     writer.writeByte(h.totp_params.window);
     writer.writeByte(h.totp_params.digits);
     writer.writeBytes(&.{ 0, 0, 0, 0 });
-    writer.writeByte(@intFromEnum(h.totp_params.algo));
+    writer.writeByte(@backingInt(h.totp_params.algo));
     writer.writeBytes(&.{ 0, 0, 0 });
     std.debug.assert(writer.pos == header_len);
 }

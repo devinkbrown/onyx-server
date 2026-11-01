@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+description="Onyx Server secured IRC/IRCX mesh daemon"
+supervisor="supervise-daemon"
+
+: "${command:=/usr/bin/onyx-server}"
+: "${config:=/etc/onyx-server/onyx-server.toml}"
+: "${command_user:=onyx-server:onyx-server}"
+: "${directory:=/var/lib/onyx-server}"
+: "${respawn_delay:=5}"
+: "${respawn_max:=3}"
+: "${respawn_period:=60}"
+: "${output_logger:=logger -t onyx-server -p daemon.info}"
+: "${error_logger:=logger -t onyx-server -p daemon.err}"
+umask="0077"
+command_args="\"${config}\""
+required_files="${config}"
+
+depend() {
+	need net
+	use dns logger
+}
+
+start_pre() {
+	checkpath --directory --mode 0700 --owner "${command_user}" "${directory}" || return 1
+	ebegin "Validating Onyx Server configuration"
+	"${command}" --check-config "${config}"
+	eend $?
+}

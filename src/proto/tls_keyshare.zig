@@ -51,12 +51,12 @@ pub const NamedGroup = enum(u16) {
     /// Map a raw wire value onto the enum; unknown values land in the `_` tag
     /// while preserving the exact integer (recoverable via `@intFromEnum`).
     pub fn fromInt(value: u16) NamedGroup {
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// The raw wire value for this group.
     pub fn toInt(self: NamedGroup) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

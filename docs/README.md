@@ -7,26 +7,28 @@ clone of any prior daemon. It speaks IRCv3 + IRCX, runs a custom Undertow CRDT m
 forward-secret Mooring server links, and ships its own pure-Zig TLS (Armor), media codecs
 (CadenceVox/CadenceVis), and in-place upgrade (Helix).
 
-**Current source/live distinction:** the source manifest is **0.8.0**
-(`build.zig.zon`). That bump is not a deploy. On 2026-09-06 the source baseline
-was `ae78d490` and both production nodes ran the separately recorded
-`0.7.0+ae78d490` artifact under `onyx-server.service`. That fleet record stands.
+**Current source/live distinction:** the source manifest is **0.9.0**
+(`build.zig.zon`), and as of 2026-11-01 both production nodes run the deployed
+`0.9.0+066d9b8356be-dirty` artifact (eshmaki.me under OpenRC, ircx.us under
+systemd) with `[tls] ktls = "txrx"` active. Older version records below and in
+release notes are historical.
 See the [canonical production paths and evidence](ops/onyx-server-paths.md) before
-day-2 operations. The public GitHub release channel still publishes `v0.5.6`.
+day-2 operations; this page does not establish the current fleet image or tag.
 Source version, deployed image, and public tag stay separate claims. The full
-test suite has not been re-run green on 0.8.0.
+test-suite status for the current candidate is recorded in the dated
+[release preparation report](ops/release-preparation-cloaking-2026-10-26.md).
 
 The current daemon surface includes `[class.*]` connection classes for registration-time
 resource/admission/flood policy, bounded growable SendQ and RecvQ, optional nick-delay
 holds against camping, and live operator introspection through `STATS Y`, `STATS l`, and
 richer `INFO`.
 
-**Documentation baseline:** source manifest **0.8.0**. The 2026-09-06 fleet
-record remains `0.7.0+ae78d490` under `onyx-server.service`. Current paths,
+**Documentation baseline:** source manifest **0.9.0**, deployed fleet
+`0.9.0+066d9b8356be-dirty` (2026-11-01). Current paths,
 executable hash, and mesh gauges are kept in
 [the production evidence table](ops/onyx-server-paths.md). Release notes,
 audits, and checkpoint files keep their historical snapshots. Living
-architecture and reference pages describe the 0.8.0 source contract, including
+architecture and reference pages describe the source contract, including
 where that contract is not yet suite-green.
 
 **New here?** Start with the [Quickstart](guide/00-quickstart.md), then the
@@ -37,6 +39,7 @@ where that contract is not yet suite-green.
 ## Operations
 
 - [Runbook](RUNBOOK.md) — staging, systemd install, config validation, hot-upgrade, rollback, health checks
+- [Cloaking release preparation (2026-10-26)](ops/release-preparation-cloaking-2026-10-26.md) — candidate changes, verification, and migration/release limits
 - [Contributing](../CONTRIBUTING.md) — source-of-truth workflow, build/test lanes, PR checklist
 - [Security policy](../SECURITY.md) — private vulnerability reporting
 
@@ -44,6 +47,9 @@ where that contract is not yet suite-green.
 
 - [Quickstart](guide/00-quickstart.md) — build, configure, and run in minutes
 - [Building](guide/build.md) — build targets and cross-compilation
+- [Alpine Linux](guide/alpine.md) — musl builds, staged OpenRC supervision, and readiness
+- [Installation preview](guide/setup.md) — validated setup plans in text or JSON, without applying changes
+- [Redacted preflight diagnostics](guide/diagnostics.md) — shared text/JSON checks, metric semantics, and readiness limits
 - [Testing](guide/testing.md) — focused test lanes, smoke gates, and deterministic assurance
 - [TLS](guide/tls.md) — the Armor stack, certificates, and mTLS
 - [Operators](guide/operators.md) — SASL-only operator setup and tooling
@@ -71,6 +77,12 @@ analysis*, not necessarily shipped behavior — where they disagree with the
 architecture and reference docs above (verified against code), those are
 authoritative.
 
+- [Integrated delivery roadmap (2026-10-26)](ROADMAP-2026-10-26.md) — cloaking, setup wizard, usability, session tokens, media, mesh, Alpine, and measured efficiency (plan)
+- [Roadmap delivery waves](ops/roadmap-wave-execution-2026-10-26.md) — implementation cuts, ownership boundaries, and reusable gate evidence
+- [Onyx client integration outline](design/onyx-client-integration-2026-10-26.md) — client journeys, server contracts, rollout order, and acceptance (plan; client source not audited)
+- [Session-control candidate contract](reference/protocol/onyx-session-control.v1.json) — typed mesh inventory/revocation fields, credential separation, and open scale/retirement limits
+- [Credential domains](reference/credential-domains.md) — source-scoped issuers, lifetimes, replay boundaries, and explicit inventory gaps (candidate audit)
+- [Native chat SQPOLL measurements](ops/live-chat-sqpoll-benchmark-2026-10-26.md) — optimized Alpine corpus, exact deliveries, CPU/latency tradeoffs, and open regression budget
 - [TLS hardening roadmap](dev/tls-roadmap.md) — gap analysis vs. BoringSSL/WolfSSL, with DONE/TODO status (EMS-required, HRR pinning, 0-RTT freshness window, ECH `retry_configs`)
 - [BoGo interop](dev/tls-design/bogo.md) — the BoringSSL test-suite shim and coverage
 - [Certificate compression](dev/tls-design/cert-compression.md) — RFC 8879 `compress_certificate`

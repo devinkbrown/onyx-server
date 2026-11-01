@@ -202,7 +202,7 @@ pub fn writeOuterExtBody(
     if (out.len != need) return error.BadLength;
 
     var n: usize = 0;
-    out[n] = @intFromEnum(ClientHelloType.outer);
+    out[n] = @backingInt(ClientHelloType.outer);
     n += 1;
     std.mem.writeInt(u16, out[n..][0..2], kdf_id, .big);
     n += 2;

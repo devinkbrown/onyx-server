@@ -290,6 +290,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.backup.dir.len != 0) out.backup_dir = cfg.backup.dir;
     if (cfg.backup.interval_ms != 0) out.backup_interval_ms = cfg.backup.interval_ms;
     if (cfg.sasl.account_db) |db| out.account_store_path = db;
+    out.guest_issuer_path = cfg.guest_presence.issuer_path orelse "";
     // [metrics] — live Prometheus /metrics endpoint. Off unless a port is set;
     // the bind defaults to loopback and is only widened by an explicit address.
     if (cfg.metrics.listen != 0) {
@@ -352,6 +353,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     // the daemon.
     out.features.defer_taskrun = cfg.io.defer_taskrun;
     out.features.sqpoll = cfg.io.sqpoll;
+    out.features.sqpoll_idle_ms = cfg.io.sqpoll_idle_ms;
     if (comptime builtin.os.tag == .linux) {
         out.features.buf_ring = true;
         out.features.multishot_recv = true;
@@ -392,6 +394,9 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.mesh.trust_roots.len != 0) out.mesh_trust_roots = cfg.mesh.trust_roots;
     if (cfg.mesh.admission_roots.len != 0) out.mesh_admission_roots = cfg.mesh.admission_roots;
     out.mesh_admission_min_revocation_epoch = cfg.mesh.admission_min_revocation_epoch;
+    // Empty policy removes inherited grants too; historical denial verification
+    // decides whether that candidate can be adopted transactionally.
+    out.retired_session_group_fences = cfg.mesh.retired_session_group_fences;
     // The activation tuple is one authority. An empty projection cannot remove
     // a staged plan or hot-downgrade an active base (both are forbidden state
     // transitions); a meaningful plan replaces all three fields together.
@@ -445,6 +450,33 @@ test "parseIp4Host parses loopback and rejects junk" {
     try std.testing.expectEqual(@as(?u32, null), parseIp4Host("127.0.0"));
     try std.testing.expectEqual(@as(?u32, null), parseIp4Host("not-an-ip"));
     try std.testing.expectEqual(@as(?u32, null), parseIp4Host("256.0.0.1"));
+}
+
+test "retired session fence boot projection borrows policy and clears inherited grants" {
+    const policy = @import("session_group_retired_policy.zig");
+    const grants = [_]policy.Grant{.{ .group_key = @splat(1), .issuer_key = @splat(2), .fact_digest = @splat(3) }};
+    var parsed: config_format.Config = .{};
+    parsed.mesh.retired_session_group_fences = &grants;
+    const mapped = mapToServerConfig(parsed, .{ .port = 6680 });
+    try std.testing.expectEqual(@as(usize, 1), mapped.retired_session_group_fences.len);
+    try std.testing.expect(mapped.retired_session_group_fences.ptr == grants[0..].ptr);
+    parsed.mesh.retired_session_group_fences = &.{};
+    const cleared = mapToServerConfig(parsed, mapped);
+    try std.testing.expectEqual(@as(usize, 0), cleared.retired_session_group_fences.len);
+}
+
+test "sqpoll idle boot projection reaches the real reactor and neutral preflight" {
+    var parsed: config_format.Config = .{};
+    parsed.io.sqpoll = true;
+    parsed.io.sqpoll_idle_ms = 37;
+    const mapped = mapToServerConfig(parsed, .{ .port = 6680 });
+    try std.testing.expect(mapped.features.sqpoll);
+    try std.testing.expectEqual(@as(u32, 37), mapped.features.sqpoll_idle_ms);
+    const neutral = mapIoBootConfig(parsed);
+    try std.testing.expectEqual(@as(u32, 37), neutral.sqpoll_idle_ms);
+    try std.testing.expect(configCheckError(neutral, .off) == null);
+    try std.testing.expect(configCheckError(.{ .sqpoll_idle_ms = 0 }, .off) != null);
+    try std.testing.expect(configCheckError(.{ .sqpoll_idle_ms = 60_001 }, .off) != null);
 }
 
 test "MESSAGE_V2 activation fields map without reparsing deployment identities" {
@@ -620,12 +652,14 @@ pub const AcmeBootConfig = struct {
 pub const IoBootConfig = struct {
     defer_taskrun: bool = false,
     sqpoll: bool = false,
+    sqpoll_idle_ms: u32 = config_format.default_sqpoll_idle_ms,
 };
 
 pub fn mapIoBootConfig(cfg: config_format.Config) IoBootConfig {
     return .{
         .defer_taskrun = cfg.io.defer_taskrun,
         .sqpoll = cfg.io.sqpoll,
+        .sqpoll_idle_ms = cfg.io.sqpoll_idle_ms,
     };
 }
 
@@ -636,30 +670,28 @@ pub fn mapIoBootConfig(cfg: config_format.Config) IoBootConfig {
 /// the pair so a file cannot ask for a setup this tree will not arm.
 pub const sqpoll_defer_taskrun_reason: []const u8 = "io.sqpoll + io.defer_taskrun rejected: kernel returns EINVAL for IORING_SETUP_SQPOLL|IORING_SETUP_DEFER_TASKRUN|IORING_SETUP_SINGLE_ISSUER";
 
-/// `txrx` stays a documented footgun until a TLS 1.3 peer can rekey both
-/// directions with kTLS RX on and no reconnect. `--check-config` and boot
-/// refuse the mode; the previous safe behavior is `tx` (RX stays off).
-pub const ktls_txrx_footgun: []const u8 = "[tls] ktls=txrx is a documented footgun: TLS 1.3 KeyUpdate with request_peer has no TLS_TX reinstall, so the binary refuses txrx and kTLS stays tx";
-
-/// What the daemon actually arms. `rx` stays false until the both-direction
-/// rekey above is proven against the kernel.
+/// What the daemon actually arms from the configured kTLS intent and the
+/// boot-time kernel capability probe. `txrx` arms both directions only when
+/// the kernel advertises the TLS ULP; without that capability both directions
+/// fail closed to userspace TLS. TLS 1.3 peer KeyUpdate is handled by the
+/// kernel-control path: RX installs the rotated receive epoch, and a requested
+/// reply is sent under the old TX epoch before installing the rotated TX epoch.
 pub const KtlsOffload = struct {
     tx: bool = false,
     rx: bool = false,
-    footgun: ?[]const u8 = null,
 };
 
 pub fn resolveKtlsOffload(mode: config_format.Config.KtlsMode, ktls_capable: bool) KtlsOffload {
-    if (mode == .txrx) return .{ .tx = ktls_capable, .rx = false, .footgun = ktls_txrx_footgun };
-    if (mode == .off or !ktls_capable) return .{ .tx = false, .rx = false };
-    return .{ .tx = true, .rx = false };
+    if (mode == .off or !ktls_capable) return .{};
+    return .{ .tx = true, .rx = mode == .txrx };
 }
 
 /// Refusal shared by `--check-config` and normal boot. Null means the loaded
 /// file is allowed to start. Io is reported before kTLS when both are unsafe.
 pub fn configCheckError(io: IoBootConfig, ktls: config_format.Config.KtlsMode) ?[]const u8 {
     if (io.sqpoll and io.defer_taskrun) return sqpoll_defer_taskrun_reason;
-    if (ktls == .txrx) return ktls_txrx_footgun;
+    if (io.sqpoll_idle_ms == 0 or io.sqpoll_idle_ms > 60_000) return "io.sqpoll_idle_ms must be an integer from 1 through 60000";
+    _ = ktls; // Every parsed kTLS mode is admissible; capability is resolved at boot.
     return null;
 }
 
@@ -983,6 +1015,28 @@ pub fn loadFromText(
     base: server.Config,
     resolver: config_format.Resolver,
 ) !Loaded {
+    return loadFromTextImpl(allocator, text, base, resolver, false);
+}
+
+/// Preview shares exactly the boot loader but omits configuration-derived log
+/// messages. Diagnostics must not reveal secrets or inject terminal escapes.
+/// The choice is per call and never mutates the daemon's global logger.
+pub fn loadFromTextQuiet(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    base: server.Config,
+    resolver: config_format.Resolver,
+) !Loaded {
+    return loadFromTextImpl(allocator, text, base, resolver, true);
+}
+
+fn loadFromTextImpl(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    base: server.Config,
+    resolver: config_format.Resolver,
+    quiet: bool,
+) !Loaded {
     var parsed = try config_format.parseToml(allocator, text, resolver);
     errdefer parsed.deinit(allocator);
 
@@ -1011,12 +1065,12 @@ pub fn loadFromText(
     errdefer bindings.deinit(allocator);
     for (parsed.opers) |o| {
         if (o.class.len == 0 or groups.get(o.class) == null) {
-            dlog.log("onyx-server: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
+            if (!quiet) dlog.log("onyx-server: skipping oper binding for account '{s}': unknown or empty class\n", .{o.account});
             continue;
         }
         const privileges = groups.effectivePrivileges(o.class);
         if (privileges.count() == 0) {
-            dlog.log("onyx-server: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
+            if (!quiet) dlog.log("onyx-server: skipping oper binding for account '{s}': class '{s}' has no privileges\n", .{ o.account, o.class });
             continue;
         }
         try bindings.append(allocator, .{
@@ -1028,6 +1082,8 @@ pub fn loadFromText(
         });
     }
     const oper_bindings = try bindings.toOwnedSlice(allocator);
+    // toOwnedSlice resets bindings; retain custody until Loaded is returned.
+    errdefer allocator.free(oper_bindings);
 
     var config = mapToServerConfig(parsed, base);
     if (oper_bindings.len != 0) {
@@ -1051,7 +1107,7 @@ pub fn loadFromText(
                 .oper_only = c.match_oper,
                 .ident_glob = c.ident_glob,
                 .host_glob = c.host_glob,
-            }) catch |e| dlog.log("onyx-server: skipping connection class '{s}': {s}\n", .{ c.name, @errorName(e) });
+            }) catch |e| if (!quiet) dlog.log("onyx-server: skipping connection class '{s}': {s}\n", .{ c.name, @errorName(e) });
         }
         config.class_registry = try cb.finish();
     }
@@ -1303,7 +1359,7 @@ test "config check rejects sqpoll plus defer_taskrun with the kernel EINVAL reas
     std.debug.print("GAP-A5 branch=refuse {s}\n", .{why});
 }
 
-test "config check rejects ktls txrx footgun and resolveKtlsOffload keeps RX off" {
+test "config check admits ktls txrx and resolveKtlsOffload arms both directions" {
     const allocator = testing.allocator;
     const text =
         \\[node]
@@ -1317,25 +1373,24 @@ test "config check rejects ktls txrx footgun and resolveKtlsOffload keeps RX off
     var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
     defer loaded.deinit(allocator);
     try testing.expectEqual(config_format.Config.KtlsMode.txrx, loaded.tls.ktls);
-    const why = configCheckError(loaded.io, loaded.tls.ktls) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(ktls_txrx_footgun, why);
-    try testing.expect(std.mem.indexOf(u8, why, "txrx") != null);
-    try testing.expect(std.mem.indexOf(u8, why, "footgun") != null);
+    try testing.expect(configCheckError(loaded.io, loaded.tls.ktls) == null);
 
     const armed = resolveKtlsOffload(.txrx, true);
     try testing.expect(armed.tx);
-    try testing.expect(!armed.rx);
-    try testing.expect(armed.footgun != null);
+    try testing.expect(armed.rx);
+
+    const incapable = resolveKtlsOffload(.txrx, false);
+    try testing.expect(!incapable.tx);
+    try testing.expect(!incapable.rx);
 
     const tx_only = resolveKtlsOffload(.tx, true);
     try testing.expect(tx_only.tx);
     try testing.expect(!tx_only.rx);
-    try testing.expect(tx_only.footgun == null);
 
     const off = resolveKtlsOffload(.off, true);
     try testing.expect(!off.tx);
     try testing.expect(!off.rx);
-    std.debug.print("GAP-A6 branch=footgun rx=off ktls-stays-tx\n", .{});
+    std.debug.print("GAP-A6 branch=txrx-admitted rx=on-when-kernel-capable\n", .{});
 }
 
 test "config check GAP-A2 refuses a mesh peer without require_secured and keeps compat" {
@@ -2112,6 +2167,19 @@ test "tls sni entries surface on the boot tls projection" {
     try testing.expectEqualStrings("example.key", loaded.tls.sni[0].key_path);
 }
 
+test "guest presence issuer path requires explicit nonempty configuration" {
+    const allocator = testing.allocator;
+    var disabled = try loadFromText(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{ .port = 6680 }, .{});
+    defer disabled.deinit(allocator);
+    try testing.expectEqualStrings("", disabled.config.guest_issuer_path);
+    var enabled = try loadFromText(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[guest_presence]\nissuer_path = '/private/guest.wal'\n", .{ .port = 6680 }, .{});
+    defer enabled.deinit(allocator);
+    try testing.expectEqualStrings("/private/guest.wal", enabled.config.guest_issuer_path);
+    try testing.expectError(error.ParseError, loadFromText(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[guest_presence]\nissuer_path = ''\n", .{ .port = 6680 }, .{}));
+    try testing.expectError(error.ParseError, loadFromText(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[guest_presence]\nissuer_path = 42\n", .{ .port = 6680 }, .{}));
+    try testing.expectError(error.ParseError, loadFromText(allocator, "guest_presence = false\n[node]\nid = 1\n[listen]\nirc = 6680\n", .{ .port = 6680 }, .{}));
+}
+
 test "tls omitted keeps sni empty on the boot projection" {
     const allocator = testing.allocator;
     var loaded = try loadFromText(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{ .port = 6680 }, .{});
@@ -2351,4 +2419,29 @@ test "[class.*] parses into the connection-class registry with v4/v6 + TLS match
     try testing.expectEqualStrings("user", reg.classFor(.{ .ip_text = "10.1.2.3", .is_tls = false }).name);
     try testing.expectEqualStrings("trusted", reg.classFor(.{ .ip_text = "::1", .is_tls = true }).name);
     try testing.expectEqualStrings("server", reg.classFor(.{ .is_server_link = true }).name);
+}
+
+test "setup quiet loader preserves typed boot projection and rejected input" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 42
+        \\[listen]
+        \\irc = 6700
+        \\[network]
+        \\name = "Setup preview"
+        \\[[opers]]
+        \\account = "ignored-private-account"
+        \\class = "missing"
+    ;
+    var normal = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer normal.deinit(allocator);
+    var quiet = try loadFromTextQuiet(allocator, text, .{ .port = 6680 }, .{});
+    defer quiet.deinit(allocator);
+    try testing.expectEqual(normal.config.port, quiet.config.port);
+    try testing.expectEqual(normal.parsed.node.id, quiet.parsed.node.id);
+    try testing.expectEqualStrings(normal.parsed.network.name, quiet.parsed.network.name);
+    try testing.expectEqual(normal.oper_bindings.len, quiet.oper_bindings.len);
+    try testing.expectEqual(@as(usize, 0), quiet.oper_bindings.len);
+    try testing.expectError(error.ParseError, loadFromTextQuiet(allocator, "[listen\n", .{ .port = 6680 }, .{}));
 }

@@ -21,6 +21,35 @@ const http = @import("http_fetch.zig");
 const lock_mod = @import("../substrate/rwlock.zig");
 const services_mod = @import("services.zig");
 const server_mod = @import("server.zig");
+const session_fences = @import("session_group_revoke_durable.zig");
+const session_replica = @import("helix/session_replica.zig");
+const retired_fences = @import("session_group_retired_policy.zig");
+
+pub const max_session_fence_roots: usize = 4096;
+/// Output-only configuration view issued by the original sealed Core stage.
+/// roots borrows the actor's synchronous stack; grants borrows Core policy.
+pub const SessionFencePolicyView = struct {
+    local: ?sign.PublicKey,
+    roots: []const sign.PublicKey,
+    retired_grants: []const retired_fences.Grant,
+};
+const SessionFenceTrust = struct {
+    policy: SessionFencePolicyView,
+    fn active(raw: *const anyopaque, key: sign.PublicKey, origin: u64) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (oper.originShortId(key) != origin) return false;
+        if (self.policy.local) |local| if (std.crypto.timing_safe.eql(sign.PublicKey, local, key)) return true;
+        for (self.policy.roots) |root| if (std.crypto.timing_safe.eql(sign.PublicKey, root, key)) return true;
+        return false;
+    }
+    fn retired(raw: *const anyopaque, key: sign.PublicKey, origin: u64, group: retired_fences.Digest, fact: retired_fences.Digest) bool {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        return oper.originShortId(key) == origin and retired_fences.allows(self.policy.retired_grants, key, group, fact);
+    }
+    fn trust(self: *const @This()) session_fences.Trust {
+        return .{ .ctx = self, .allows = active, .allows_retired = retired, .required_grants = self.policy.retired_grants };
+    }
+};
 
 const History = history_mod.EventHistory(512);
 pub const max_deliveries = 8;
@@ -69,6 +98,27 @@ pub const Authority = opaque {
     pub fn openCold(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8, context: Context, key: *const sign.KeyPair, config: Config) !*Authority {
         return create(allocator, io, dir, name, context, key, config, true);
     }
+    /// Entry-only Helix disposal protection. A live original Services loan
+    /// pins this authority; the gate fixes its generation and the Services
+    /// lock protects mutable WAL handles. No descriptor or backing escapes.
+    pub fn ownsDescriptorForCore(self: *Authority, loan: *ServicesLoan, descriptor: std.os.linux.fd_t) !bool {
+        if (comptime builtin.os.tag != .linux) return error.Unsupported;
+        const b = backing(self);
+        if (!b.gate.tryLockExclusive()) return error.SourceBorrowed;
+        defer b.gate.unlockExclusive();
+        const original = servicesToken(loan);
+        if (original.context != b.state or b.state.services_loan != original) return error.SourceIdentityMismatch;
+        try original.validate();
+        if (original.calls != 0 or b.state.authority_entries != 0 or b.active != null) return error.SourceBorrowed;
+        if (!original.lock.tryLockExclusive()) return error.SourceBorrowed;
+        defer original.lock.unlockExclusive();
+        if (b.head.generation == 0) return error.InvalidState;
+        if (descriptor == b.state.lease.handle or descriptor == b.state.dir.handle or descriptor == b.state.store.dir.handle) return true;
+        if (b.state.store.wal_file) |file| if (descriptor == file.handle) return true;
+        if (b.state.store.staged_write_file) |file| if (descriptor == file.handle) return true;
+        return false;
+    }
+
     pub fn observe(self: *Authority) !Observation {
         const b = backing(self);
         b.gate.lockExclusive();
@@ -290,6 +340,28 @@ pub const StateContext = opaque {
         }
     }
 
+    /// Cold/staged original-Core operation. No caller trust callback or source
+    /// Store alias is accepted. Only the caller-owned replica target escapes.
+    pub fn restoreSessionGroupFencesForCore(stage: *server_mod.ManagedLeasedCoreStage, owner: *Authority, loan: *ServicesLoan, target: *session_replica.Store, now_ms: i64) !usize {
+        var roots: [max_session_fence_roots]sign.PublicKey = undefined;
+        const policy = try stage.originalSessionGroupFencePolicy(owner, loan, &roots);
+        const call = try beginSessionFenceRead(stage, owner, loan);
+        defer finishSessionFenceRead(call);
+        const trust = SessionFenceTrust{ .policy = policy };
+        return try session_fences.restoreInto(&call.context.store, target, now_ms, trust.trust());
+    }
+
+    /// Strict retained-fact verification for an already detached replica cut.
+    /// The original Store remains borrowed only inside this synchronous call.
+    pub fn verifySessionGroupFencesForCore(stage: *server_mod.ManagedLeasedCoreStage, owner: *Authority, loan: *ServicesLoan, target: *const session_replica.Store) !usize {
+        var roots: [max_session_fence_roots]sign.PublicKey = undefined;
+        const policy = try stage.originalSessionGroupFencePolicy(owner, loan, &roots);
+        const call = try beginSessionFenceRead(stage, owner, loan);
+        defer finishSessionFenceRead(call);
+        const trust = SessionFenceTrust{ .policy = policy };
+        return try session_fences.verifyRetained(&call.context.store, target, trust.trust());
+    }
+
     pub fn attachServices(self: *StateContext, config: services_mod.Config) !*ServicesLoan {
         const context = stateBacking(self);
         const b = context.owner;
@@ -361,6 +433,26 @@ pub const ServicesLoan = opaque {
         defer loan.finish();
         return try services.webpushPruneDeadUntil(allocator, endpoints, deadline);
     }
+    /// World is held by the original caller from replica preparation through
+    /// this synchronous WAL commit and its subsequent no-fail replica commit.
+    /// No retained World scope, callback, plan or Store pointer is returned.
+    pub fn persistSessionGroupFence(self: *ServicesLoan, wire: []const u8) !void {
+        const loan = servicesToken(self);
+        const services = try loan.begin();
+        defer loan.finish();
+        const b = loan.context.owner;
+        const stage = loan.context.core_stage orelse return error.SessionFenceSourceUnavailable;
+        var roots: [max_session_fence_roots]sign.PublicKey = undefined;
+        const policy = try stage.originalSessionGroupFencePolicy(@ptrCast(b), self, &roots);
+        services.lock.lockExclusive();
+        defer services.lock.unlockExclusive();
+        if (loan.context.store.preparedWritesPoisoned()) return error.StorePoisoned;
+        try b.validateSource();
+        const trust = SessionFenceTrust{ .policy = policy };
+        _ = try session_fences.authorizeFence(wire, trust.trust());
+        try session_fences.persist(&loan.context.store, wire);
+    }
+
     pub fn close(self: *ServicesLoan) !void {
         const loan = servicesToken(self);
         const b = loan.context.owner;
@@ -752,6 +844,32 @@ const ServicesLoanToken = struct {
         self.calls -= 1;
     }
 };
+// Cold reads cannot use ServicesLoan.begin: no published World exists yet.
+// The exact original stage supplies that distinct scope; the original mutex
+// and source call counters retain all storage through the synchronous return.
+fn beginSessionFenceRead(stage: *server_mod.ManagedLeasedCoreStage, owner: *Authority, loan: *ServicesLoan) !*ServicesLoanToken {
+    try stage.requireOriginalSessionGroupFenceRead(owner, loan);
+    const b = backing(owner);
+    b.gate.lockExclusive();
+    defer b.gate.unlockExclusive();
+    const token = servicesToken(loan);
+    try token.validate();
+    if (token.context != b.state or b.state.core_stage != stage or b.state.services_loan != token) return error.SourceIdentityMismatch;
+    if (current_services_loan != null) return error.ServicesCallReentered;
+    if (token.calls != 0 or b.state.authority_entries != 0 or b.active != null or b.read_count != 0) return error.SourceBorrowed;
+    if (!token.lock.tryLockExclusive()) return error.SourceBorrowed;
+    errdefer token.lock.unlockExclusive();
+    if (b.state.store.preparedWritesPoisoned()) return error.StorePoisoned;
+    try b.validateSource();
+    token.calls = 1;
+    current_services_loan = token;
+    return token;
+}
+fn finishSessionFenceRead(token: *ServicesLoanToken) void {
+    token.lock.unlockExclusive();
+    token.finish();
+}
+
 // Conservative source-entered named-call scope, not a lock/readiness receipt.
 // Actual locking is performed by the original private Services method itself.
 threadlocal var current_services_loan: ?*ServicesLoanToken = null;
@@ -1005,8 +1123,8 @@ fn renderBody(a: std.mem.Allocator, event: oper.SignedOperEventV2) ![]u8 {
 }
 fn renderBodyAllocating(a: std.mem.Allocator, event: oper.SignedOperEventV2) ![]u8 {
     if (event.category >= history_mod.category_count or event.severity >= history_mod.severity_count) return error.InvalidEvent;
-    const category: spine.EventCategory = @enumFromInt(event.category);
-    const severity: spine.EventSeverity = @enumFromInt(event.severity);
+    const category: spine.EventCategory = @fromBackingInt(@intCast(event.category));
+    const severity: spine.EventSeverity = @fromBackingInt(@intCast(event.severity));
     var writer = std.Io.Writer.Allocating.init(a);
     errdefer writer.deinit();
     try writer.writer.writeAll("{\"category\":");
@@ -1537,7 +1655,7 @@ const TestEvent = struct {
         return result;
     }
     fn event(self: *const TestEvent) oper.SignedOperEventV2 {
-        return .{ .category = @intFromEnum(spine.EventCategory.service), .severity = @intFromEnum(spine.EventSeverity.warn), .origin_node = oper.originShortId(self.public_key), .hlc = self.hlc, .origin_server = "node.example.test", .subject = "retained source output", .message = "exact original \"message\"", .origin_pubkey = &self.public_key, .origin_sig = &self.signature };
+        return .{ .category = @backingInt(spine.EventCategory.service), .severity = @backingInt(spine.EventSeverity.warn), .origin_node = oper.originShortId(self.public_key), .hlc = self.hlc, .origin_server = "node.example.test", .subject = "retained source output", .message = "exact original \"message\"", .origin_pubkey = &self.public_key, .origin_sig = &self.signature };
     }
 };
 fn testDirectory(dir: std.Io.Dir) !void {
@@ -2808,4 +2926,229 @@ test "delivery authority: original Core World acquisition loss and real reacquis
     retried = true;
     const expected_id = try oper.eventId(event.event());
     try std.testing.expectEqualSlices(u8, &expected_id, &id);
+}
+
+fn managedFenceWire(key: *const sign.KeyPair, token: u8) ![]u8 {
+    return session_replica.encodeOffer(std.testing.allocator, .{
+        .operation = .group_revoke,
+        .token = @splat(token),
+        .revision = .{ .epoch = 1000, .sequence = 1000 << 16, .origin_node = oper.originShortId(key.public_key) },
+        .issued_at_ms = 1000,
+        .expires_at_ms = 2000,
+        .account = "alice",
+    }, key);
+}
+const ManagedFenceTestSource = struct {
+    owner: *Authority,
+    loan: *ServicesLoan,
+    stage: *server_mod.ManagedLeasedCoreStage,
+    fn fromCore(core: *server_mod.ManagedCore) !@This() {
+        const read = try server_mod.ManagedCoreFixture.borrowLeasedAuthority(core);
+        defer read.release() catch @panic("managed fence source read release");
+        const b = readToken(read).owner;
+        return .{ .owner = @ptrCast(b), .loan = @ptrCast(b.state.services_loan.?), .stage = b.state.core_stage.? };
+    }
+};
+
+test "delivery authority: managed session fences preserve closed source custody through persist restore verify and cold recovery" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testDirectory(tmp.dir);
+    var identity = try @import("node_identity.zig").fromSeed(@splat(111), "managed-fence");
+    defer identity.deinit();
+    var resolver = try @import("rdns.zig").Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const wire = try managedFenceWire(&identity.sign_kp, 111);
+    defer std.testing.allocator.free(wire);
+    {
+        const core = try leasedLeafCore(tmp.dir, "fence-core.wal", .provision, &identity, &resolver);
+        defer core.discardLeasedCold() catch @panic("managed fence core close");
+        const source = try ManagedFenceTestSource.fromCore(core);
+        const state = backing(source.owner).state;
+        try std.testing.expectError(error.ExclusiveLockNotHeldByCaller, source.loan.persistSessionGroupFence(wire));
+        try server_mod.ManagedCoreFixture.persistLeasedSessionGroupFence(core, wire);
+        const sequence = state.store.next_seq;
+        try server_mod.ManagedCoreFixture.persistLeasedSessionGroupFence(core, wire);
+        try std.testing.expectEqual(sequence, state.store.next_seq);
+        var target = session_replica.Store.init(std.testing.allocator);
+        defer target.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, source.loan, &target, 5000));
+        try std.testing.expect(target.isGroupRevoked("alice", @splat(111)));
+        try std.testing.expectEqual(@as(usize, 1), try StateContext.verifySessionGroupFencesForCore(source.stage, source.owner, source.loan, &target));
+        try std.testing.expectEqual(@as(usize, 0), state.services_loan.?.calls);
+        try std.testing.expect(current_services_loan == null);
+        try std.testing.expectError(error.BoundStateRequiresTransaction, state.services_loan.?.services.legacyStore());
+        try std.testing.expectError(error.SourceBorrowed, source.loan.close());
+    }
+    const recovered = try leasedLeafCore(tmp.dir, "fence-core.wal", .recover, &identity, &resolver);
+    defer recovered.discardLeasedCold() catch @panic("managed fence recovered core close");
+    const source = try ManagedFenceTestSource.fromCore(recovered);
+    var target = session_replica.Store.init(std.testing.allocator);
+    defer target.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, source.loan, &target, 10_000));
+    try std.testing.expect(target.isGroupRevoked("alice", @splat(111)));
+}
+
+test "delivery authority: managed session fences reject foreign source reentry head mismatch and preserve scope on OOM" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testDirectory(tmp.dir);
+    var identity = try @import("node_identity.zig").fromSeed(@splat(112), "managed-fence");
+    defer identity.deinit();
+    var resolver = try @import("rdns.zig").Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const core = try leasedLeafCore(tmp.dir, "fence-guards.wal", .provision, &identity, &resolver);
+    defer core.discardLeasedCold() catch @panic("managed fence guarded core close");
+    const other = try leasedLeafCore(tmp.dir, "fence-foreign.wal", .provision, &identity, &resolver);
+    defer other.discardLeasedCold() catch @panic("managed fence foreign core close");
+    const source = try ManagedFenceTestSource.fromCore(core);
+    const foreign = try ManagedFenceTestSource.fromCore(other);
+    const wire = try managedFenceWire(&identity.sign_kp, 112);
+    defer std.testing.allocator.free(wire);
+    try server_mod.ManagedCoreFixture.persistLeasedSessionGroupFence(core, wire);
+    var before = try TestCut.capture(source.owner);
+    defer before.deinit();
+    var target = session_replica.Store.init(std.testing.allocator);
+    defer target.deinit();
+    try std.testing.expectError(error.ConfiguredOwnerMismatch, StateContext.restoreSessionGroupFencesForCore(foreign.stage, source.owner, source.loan, &target, 5000));
+    try std.testing.expectError(error.ConfiguredOwnerMismatch, StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, foreign.loan, &target, 5000));
+    {
+        const call = try beginSessionFenceRead(source.stage, source.owner, source.loan);
+        defer finishSessionFenceRead(call);
+        try std.testing.expectError(error.ServicesCallReentered, StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, source.loan, &target, 5000));
+        try std.testing.expectError(error.SourceBorrowed, source.loan.close());
+        try std.testing.expectError(error.SourceBorrowed, source.owner.close());
+    }
+    const b = backing(source.owner);
+    b.head_digest[0] ^= 1;
+    {
+        defer b.head_digest[0] ^= 1;
+        try std.testing.expectError(error.PredecessorMismatch, StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, source.loan, &target, 5000));
+    }
+    try before.expectUnchanged(source.owner, true);
+    var failures: usize = 0;
+    for (0..64) |index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        var staged = session_replica.Store.init(failing.allocator());
+        defer staged.deinit();
+        const empty = try staged.encodeUpgradeCheckpoint(std.testing.allocator, 5000);
+        defer std.testing.allocator.free(empty);
+        const result = StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, source.loan, &staged, 5000);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |count| {
+            try std.testing.expectEqual(@as(usize, 1), count);
+            try std.testing.expect(failures != 0);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            const failed = try staged.encodeUpgradeCheckpoint(std.testing.allocator, 5000);
+            defer std.testing.allocator.free(failed);
+            try std.testing.expectEqualSlices(u8, empty, failed);
+            try before.expectUnchanged(source.owner, true);
+            try std.testing.expect(current_services_loan == null);
+            try std.testing.expectEqual(@as(usize, 0), b.state.services_loan.?.calls);
+            try std.testing.expectEqual(@as(usize, 1), try StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, source.loan, &staged, 5000));
+        }
+        if (index == 63) return error.MissingSuccessfulAllocationCut;
+    }
+    try before.expectUnchanged(source.owner, true);
+    // Fault only the original Store's prepared-write allocator. The wrapper
+    // delegates every allocation/free to the same genuine underlying owner.
+    const additional = try managedFenceWire(&identity.sign_kp, 114);
+    defer std.testing.allocator.free(additional);
+    const original_allocator = b.state.store.allocator;
+    var persist_failures: usize = 0;
+    for (0..64) |index| {
+        var failing = std.testing.FailingAllocator.init(original_allocator, .{ .fail_index = index });
+        b.state.store.allocator = failing.allocator();
+        const result = server_mod.ManagedCoreFixture.persistLeasedSessionGroupFence(core, additional);
+        b.state.store.allocator = original_allocator;
+        if (result) |_| {
+            try std.testing.expect(persist_failures != 0);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            persist_failures += 1;
+            try before.expectUnchanged(source.owner, true);
+            try std.testing.expect(current_services_loan == null);
+            try std.testing.expectEqual(@as(usize, 0), b.state.services_loan.?.calls);
+            try std.testing.expect(!b.state.store.preparedWritesPoisoned());
+        }
+        if (index == 63) return error.MissingSuccessfulAllocationCut;
+    }
+}
+
+test "delivery authority: managed session fence sync uncertainty poisons source until actual cold recovery" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testDirectory(tmp.dir);
+    var identity = try @import("node_identity.zig").fromSeed(@splat(113), "managed-fence");
+    defer identity.deinit();
+    var resolver = try @import("rdns.zig").Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const wire = try managedFenceWire(&identity.sign_kp, 113);
+    defer std.testing.allocator.free(wire);
+    {
+        const core = try leasedLeafCore(tmp.dir, "fence-poison.wal", .provision, &identity, &resolver);
+        defer core.discardLeasedCold() catch @panic("managed fence poisoned core close");
+        const source = try ManagedFenceTestSource.fromCore(core);
+        const state = backing(source.owner).state;
+        state.store.setPreparedIoFault(.{ .sync = true });
+        try std.testing.expectError(error.IoAmbiguous, server_mod.ManagedCoreFixture.persistLeasedSessionGroupFence(core, wire));
+        try std.testing.expect(state.store.preparedWritesPoisoned());
+        try std.testing.expectEqual(@as(usize, 0), state.services_loan.?.calls);
+        try std.testing.expect(current_services_loan == null);
+        try std.testing.expectError(error.StorePoisoned, server_mod.ManagedCoreFixture.persistLeasedSessionGroupFence(core, wire));
+        var target = session_replica.Store.init(std.testing.allocator);
+        defer target.deinit();
+        try std.testing.expectError(error.StorePoisoned, StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, source.loan, &target, 5000));
+        try std.testing.expectError(error.StorePoisoned, StateContext.verifySessionGroupFencesForCore(source.stage, source.owner, source.loan, &target));
+        try std.testing.expectEqual(@as(usize, 0), target.group_revocations.count());
+    }
+    const recovered = try leasedLeafCore(tmp.dir, "fence-poison.wal", .recover, &identity, &resolver);
+    defer recovered.discardLeasedCold() catch @panic("managed fence sync recovered core close");
+    const source = try ManagedFenceTestSource.fromCore(recovered);
+    var target = session_replica.Store.init(std.testing.allocator);
+    defer target.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try StateContext.restoreSessionGroupFencesForCore(source.stage, source.owner, source.loan, &target, 5000));
+    try std.testing.expect(target.isGroupRevoked("alice", @splat(113)));
+}
+
+test "delivery authority Core descriptor ownership: live original loan protects private lease WAL and directory" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testDirectory(tmp.dir);
+    var key = try sign.KeyPair.fromSeed(@splat(81));
+    defer key.deinit();
+    const owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "descriptor.wal", testContext(&key), &key, .{});
+    defer owner.close() catch @panic("descriptor source close");
+    const loan = try owner.stateContext().attachServices(.{ .pbkdf2_rounds = 1 });
+    var loan_live = true;
+    defer if (loan_live) loan.close() catch @panic("descriptor loan close");
+    const state = backing(owner).state;
+    const before = try owner.observe();
+    try std.testing.expect(try owner.ownsDescriptorForCore(loan, state.lease.handle));
+    try std.testing.expect(try owner.ownsDescriptorForCore(loan, state.store.wal_file.?.handle));
+    try std.testing.expect(try owner.ownsDescriptorForCore(loan, state.dir.handle));
+    const unrelated = try tmp.dir.createFile(std.testing.io, "unrelated", .{ .read = true });
+    defer unrelated.close(std.testing.io);
+    try std.testing.expect(!try owner.ownsDescriptorForCore(loan, unrelated.handle));
+    try std.testing.expectEqual(before.generation, (try owner.observe()).generation);
+    servicesToken(loan).lock.lockExclusive();
+    const borrowed = owner.ownsDescriptorForCore(loan, state.lease.handle);
+    servicesToken(loan).lock.unlockExclusive();
+    try std.testing.expectError(error.SourceBorrowed, borrowed);
+    const other = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "other-descriptor.wal", testContext(&key), &key, .{});
+    defer other.close() catch @panic("other descriptor source close");
+    const foreign = try other.stateContext().attachServices(.{ .pbkdf2_rounds = 1 });
+    defer foreign.close() catch @panic("foreign descriptor loan close");
+    try std.testing.expectError(error.SourceIdentityMismatch, owner.ownsDescriptorForCore(foreign, state.lease.handle));
+    try loan.close();
+    loan_live = false;
+    try std.testing.expectError(error.SourceIdentityMismatch, owner.ownsDescriptorForCore(loan, state.lease.handle));
 }

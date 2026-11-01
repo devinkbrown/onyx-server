@@ -62,6 +62,18 @@ Focused: `test-mesh`, `test-helix`, `test-server`, `test-smoke`, `test-tls`, `te
 - **NOTICE** never emits error replies.
 - **Mooring handshake** bounds are not TLS record limits — mislabeling wastes hours.
 
+## Resume guard
+Before the first write after a follow-up, read `.zig-cache/CURRENT.json` when
+present and confirm the active assignment, source manifest, owner and phase.
+The latest assignment supersedes stale unfinished work. Do not finish an older
+assignment first when its contract is already accepted. Frozen evidence contexts
+remain read-only; create a new context only for the current assigned change.
+Report an ownership or checkpoint conflict to the coordinator before editing.
+When available, run `python3 -B tools/roadmap_checkpoint_audit.py` to detect
+stale job statuses, ledger-count drift and narrow full-suite attribution conflicts.
+Resolve contradictions in the checkpoint; inspect unknown evidence without
+restarting its job. This read-only audit never grants gate or release acceptance.
+
 ## Review contract
 Severity: CRITICAL / HIGH / MEDIUM / LOW / nit.  
 Verdict: Approve | Approve-with-nits | Block.  

@@ -109,10 +109,10 @@ const Reader = struct {
     fn read(self: *Reader) ParseError!Tlv {
         const tag_octet = try self.takeByte();
         const tag: Tag = switch (tag_octet) {
-            @intFromEnum(Tag.integer) => .integer,
-            @intFromEnum(Tag.oid) => .oid,
-            @intFromEnum(Tag.octet_string) => .octet_string,
-            @intFromEnum(Tag.sequence) => .sequence,
+            @backingInt(Tag.integer) => .integer,
+            @backingInt(Tag.oid) => .oid,
+            @backingInt(Tag.octet_string) => .octet_string,
+            @backingInt(Tag.sequence) => .sequence,
             else => return error.InvalidDer,
         };
 
@@ -166,7 +166,7 @@ const Writer = struct {
     }
 
     fn tlv(self: *Writer, tag: Tag, len: usize) EncodeError!void {
-        try self.byte(@intFromEnum(tag));
+        try self.byte(@backingInt(tag));
         try self.length(len);
     }
 

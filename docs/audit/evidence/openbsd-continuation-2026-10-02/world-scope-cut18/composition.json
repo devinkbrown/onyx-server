@@ -1,0 +1,10 @@
+{
+  "base": ".zig-cache/openbsd-lifecycle-20261002-17",
+  "scope": "Repair exhausted-acquisition cold cleanup; original admission and abort failclosed; complete World-loss selection; production publication remains refused",
+  "overlays": {
+    "src/daemon/server.zig": "b844ebbd4ecaac1bf7a9184a2a49f07f49ebba4a197efae0f80e4fab219ebf64",
+    "src/daemon/delivery_authority.zig": "d07854a62763e1d3730bf2b407c45b6b2a9eec6aa6b5011c31634b7e28a47fb5",
+    "src/daemon/services.zig": "9921b8bf643c6650e5582e60b02e59fa0b0f55d522ecfa703fd1ff315edc8ffc",
+    "src/substrate/rwlock.zig": "0dccc9e11dab0b211b4cd3be39d6afe3ca62276ab2e8ababd91920173aa1bf8b"
+  }
+}

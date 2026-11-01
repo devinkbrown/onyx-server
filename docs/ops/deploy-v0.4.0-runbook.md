@@ -1,5 +1,8 @@
 # Onyx Server v0.4.0 — Production Deploy Runbook (both mesh nodes)
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 > **Naming note (2026-07):** This runbook records the **v0.4.0** deploy as executed.
 > The product is now **Onyx Server** (repo `/home/kain/onyx-server`, binary `onyx-server`).
 > Banner text `Onyx Server 0.4.0+…` and `journalctl -u onyx` below are **historical literals**

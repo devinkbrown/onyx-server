@@ -67,7 +67,7 @@ pub fn absentFrame(kind: Kind) Frame {
     var body: Frame = @splat(0);
     @memcpy(body[0..4], magic);
     std.mem.writeInt(u16, body[4..6], version, .big);
-    body[6] = @intFromEnum(kind);
+    body[6] = @backingInt(kind);
     return body;
 }
 
@@ -143,7 +143,7 @@ const Parsed = struct {
 
 fn parseFrame(bytes: []const u8, kind: Kind, target_pid: u32, forbidden: []const usize) Error!?Parsed {
     if (bytes.len != frame_len or !std.mem.eql(u8, bytes[0..4], magic) or
-        std.mem.readInt(u16, bytes[4..6], .big) != version or bytes[6] != @intFromEnum(kind))
+        std.mem.readInt(u16, bytes[4..6], .big) != version or bytes[6] != @backingInt(kind))
         return error.InvalidFrame;
     if (bytes[7] == 0) {
         const canonical = absentFrame(kind);
@@ -333,7 +333,7 @@ const Fixture = struct {
     }
 
     fn source(self: *const Fixture) graph_codec.Source {
-        return .{ .graph = &self.graph, .rooms = &self.rooms, .bridges = &.{}, .clients = &.{}, .attachments = &.{}, .bindings = &.{} };
+        return .{ .graph = &self.graph, .rooms = &self.rooms, .bridges = &.{}, .clients = &.{}, .attachments = &.{}, .bindings = &.{}, .crypto_bindings = &.{} };
     }
 };
 
@@ -458,7 +458,7 @@ test "Windows media custody rejects a physical kind passed to graph decoder" {
     defer prepared.deinit();
     var wrong_kind = prepared.body;
     defer std.crypto.secureZero(u8, &wrong_kind);
-    wrong_kind[6] = @intFromEnum(Kind.native_physical);
+    wrong_kind[6] = @backingInt(Kind.native_physical);
     var receiver = try Receiver.init(&wrong_kind, .native_physical, &.{});
     defer receiver.deinit();
     try std.testing.expectError(error.WrongKind, receiver.takeGraph(std.testing.allocator, upgrade_id));

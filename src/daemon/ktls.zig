@@ -1,27 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Linux kTLS (kernel TLS offload) — Phase 0 foundation.
+//! Linux kTLS (kernel TLS offload) primitives and control-record demux.
 //!
-//! Pure encoders + constants for the kernel TLS ULP, with NO syscalls and NO
-//! live wiring. This is the byte-layout half of `docs/dev/tls-design/ktls.md`
-//! Phase 0: the `SOL_TLS`/`TLS_TX` sockopt constants, the per-cipher
-//! `tls12_crypto_info_*` struct geometry (Linux UAPI `include/uapi/linux/tls.h`),
-//! a serializer that produces the exact bytes `setsockopt(SOL_TLS, TLS_TX, …)`
-//! expects, and the TLS 1.3 static-IV → salt/iv split.
+//! This module owns the kernel TLS ULP constants, per-cipher
+//! `tls12_crypto_info_*` geometry (Linux UAPI `include/uapi/linux/tls.h`),
+//! boot-time ULP probing, `TCP_ULP`/`TLS_TX`/`TLS_RX` attach and reinstall,
+//! kernel tuple reads, typed control-record sends, and `recvmsg` demux of
+//! kernel-decrypted control records. The daemon's TLS adapter supplies live
+//! TLS 1.3 traffic material; TLS 1.2 kTLS remains unsupported.
 //!
-//! Scope discipline:
-//!   * **Authoritative + unit-tested here:** the sockopt constants, the cipher
-//!     geometry, the `crypto_info` byte layout (field order iv‖key‖salt‖rec_seq
-//!     after the 4-byte `tls_crypto_info` header), the big-endian `rec_seq`
-//!     encoding, and the TLS 1.3 nonce split (salt = static_iv[0..4],
-//!     iv = static_iv[4..12] for AES-GCM; salt-less, iv = the full 12-byte IV for
-//!     ChaCha20-Poly1305 — RFC 8446 §5.3, matching how the kernel XORs the record
-//!     sequence into the `iv` field).
-//!   * **Deferred to Phase 1** (needs a real kernel round-trip to validate):
-//!     the TLS 1.2 explicit-nonce derivation, the `TCP_ULP` attach + `setsockopt`
-//!     calls, the boot-time per-suite capability probe, and the getsockopt-seq
-//!     liveness self-test. Those are intentionally NOT in this module.
+//! The serialized layout is iv, key, salt, then the big-endian record
+//! sequence after the 4-byte `tls_crypto_info` header. The TLS 1.3 nonce
+//! split uses salt = static_iv[0..4] and iv = static_iv[4..12] for AES-GCM;
+//! ChaCha20-Poly1305 has no salt and uses the full 12-byte IV.
 //!
 //! The daemon is 64-bit little-endian only (x86_64 / aarch64); the `u16`
 //! `version`/`cipher_type` fields are encoded in native (little) endianness,
@@ -58,7 +50,7 @@ pub const CipherType = enum(u16) {
     chacha20_poly1305 = 54,
 
     pub fn toInt(self: CipherType) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -308,8 +300,8 @@ pub fn attachRx(fd: linux.fd_t, crypto_info: []const u8) AttachError!void {
 
 /// `SOL_TLS` cmsg types (Linux UAPI `include/uapi/linux/tls.h`). `TLS_GET_RECORD_TYPE`
 /// is the ancillary message the kernel attaches to a `recvmsg` carrying a record's
-/// 1-byte TLS content type; `TLS_SET_RECORD_TYPE` is its TX twin (unused — the
-/// daemon never emits control records over kTLS).
+/// 1-byte TLS content type; `TLS_SET_RECORD_TYPE` is its TX twin, used by
+/// `sendControl` for typed handshake and alert records under kernel TX.
 pub const TLS_SET_RECORD_TYPE: u32 = 1;
 pub const TLS_GET_RECORD_TYPE: u32 = 2;
 
@@ -424,7 +416,7 @@ pub fn recvmsgRecordType(fd: linux.fd_t, buf: []u8, flags: u32) RecvError!Record
                     const n: usize = @intCast(rc);
                     const metadata = try parseRecordTypeCmsg(&msg);
                     if (n == 0 and metadata == null) return error.Eof;
-                    return .{ .record_type = metadata orelse @intFromEnum(RecordType.application_data), .plaintext = buf[0..n], .metadata_present = metadata != null, .end_of_record = msg.flags & linux.MSG.EOR != 0 };
+                    return .{ .record_type = metadata orelse @backingInt(RecordType.application_data), .plaintext = buf[0..n], .metadata_present = metadata != null, .end_of_record = msg.flags & linux.MSG.EOR != 0 };
                 },
                 .INTR => continue,
                 .AGAIN => return error.WouldBlock,
@@ -479,7 +471,7 @@ pub fn sendControl(fd: linux.fd_t, record_type: RecordType, bytes: []const u8) C
     var cbuf: [cmsg_space_record_type]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
     const hdr: *linux.cmsghdr = @ptrCast(&cbuf);
     hdr.* = .{ .len = cmsgAlign(cmsg_hdr_len) + 1, .level = @intCast(SOL_TLS), .type = @intCast(TLS_SET_RECORD_TYPE) };
-    cbuf[cmsgAlign(cmsg_hdr_len)] = @intFromEnum(record_type);
+    cbuf[cmsgAlign(cmsg_hdr_len)] = @backingInt(record_type);
     var iov = [_]posix.iovec_const{.{ .base = bytes.ptr, .len = bytes.len }};
     const msg: linux.msghdr_const = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len, .flags = 0 };
     while (true) {
@@ -629,7 +621,7 @@ test "parseRecordTypeCmsg reads the TLS_GET_RECORD_TYPE content byte" {
     hdr.len = cmsg_len;
     hdr.level = @intCast(SOL_TLS);
     hdr.type = @intCast(TLS_GET_RECORD_TYPE);
-    cbuf[cmsgAlign(cmsg_hdr_len)] = @intFromEnum(RecordType.handshake);
+    cbuf[cmsgAlign(cmsg_hdr_len)] = @backingInt(RecordType.handshake);
 
     var iov = [_]posix.iovec{.{ .base = undefined, .len = 0 }};
     var msg = linux.msghdr{
@@ -642,7 +634,7 @@ test "parseRecordTypeCmsg reads the TLS_GET_RECORD_TYPE content byte" {
         .flags = 0,
     };
     // The handshake(22) content type is parsed out of the ancillary data.
-    try testing.expectEqual(@as(?u8, @intFromEnum(RecordType.handshake)), try parseRecordTypeCmsg(&msg));
+    try testing.expectEqual(@as(?u8, @backingInt(RecordType.handshake)), try parseRecordTypeCmsg(&msg));
 
     // No control data ⇒ null (the caller then treats the read as application_data,
     // matching a plain recv of app plaintext).
@@ -681,7 +673,7 @@ test "parseRecordTypeCmsg rejects a data-less matching cmsg instead of reading t
     // returned by misreading this adjacent header as ancillary content.
     const next_off = cmsgAlign(cmsg_hdr_len);
     const hdr1: *linux.cmsghdr = @ptrCast(@alignCast(base + next_off));
-    hdr1.len = @intFromEnum(RecordType.handshake); // low byte == 22
+    hdr1.len = @backingInt(RecordType.handshake); // low byte == 22
     hdr1.level = 0;
     hdr1.type = 0;
 
@@ -707,9 +699,9 @@ test "cmsg geometry matches the LP64 CMSG_* macros" {
     try testing.expectEqual(@as(usize, 8), cmsgAlign(1));
     try testing.expectEqual(@as(u32, 2), TLS_GET_RECORD_TYPE);
     // The content-type registry values the kernel reports in the cmsg.
-    try testing.expectEqual(@as(u8, 21), @intFromEnum(RecordType.alert));
-    try testing.expectEqual(@as(u8, 22), @intFromEnum(RecordType.handshake));
-    try testing.expectEqual(@as(u8, 23), @intFromEnum(RecordType.application_data));
+    try testing.expectEqual(@as(u8, 21), @backingInt(RecordType.alert));
+    try testing.expectEqual(@as(u8, 22), @backingInt(RecordType.handshake));
+    try testing.expectEqual(@as(u8, 23), @backingInt(RecordType.application_data));
 }
 
 /// Establish an ESTABLISHED loopback TCP pair, attach the TLS ULP to the server

@@ -163,7 +163,7 @@ pub fn encode(allocator: std.mem.Allocator, snapshot: SnapshotView) Error![]u8 {
     writer.writeU32(snapshot.generations.class);
     writer.writeU32(snapshot.generations.ban);
     writer.writeU32(snapshot.generations.proof);
-    writer.writeByte(if (kind) |k| @intFromEnum(k) else 0);
+    writer.writeByte(if (kind) |k| @backingInt(k) else 0);
     writer.writeBytes(&.{ 0, 0, 0 });
     writer.writeU32(snapshot.previous_generation);
     writer.writeU32(@intCast(count));
@@ -297,9 +297,9 @@ fn wardSize(size: *usize, row: warden.Ward, params: warden.Params) Error!void {
 }
 
 fn writeWard(writer: *wire.Writer, row: warden.Ward) void {
-    writer.writeByte(@intFromEnum(row.match));
-    writer.writeByte(@intFromEnum(row.scope));
-    writer.writeByte(@intFromEnum(row.action));
+    writer.writeByte(@backingInt(row.match));
+    writer.writeByte(@backingInt(row.scope));
+    writer.writeByte(@backingInt(row.action));
     writer.writeU16(@intCast(row.pattern.len));
     writer.writeU16(@intCast(row.reason.len));
     writer.writeU16(@intCast(row.set_by.len));
@@ -344,7 +344,7 @@ fn validateWardRows(reader: *wire.Reader, count: usize) Error!void {
     for (0..count) |index| {
         const row = try readWard(reader, params);
         var hash: u64 = 0xcbf29ce484222325;
-        hash = (hash ^ @as(u64, @intFromEnum(row.match))) *% 0x100000001b3;
+        hash = (hash ^ @as(u64, @backingInt(row.match))) *% 0x100000001b3;
         for (row.pattern) |byte| hash = (hash ^ byte) *% 0x100000001b3;
         var slot: usize = @intCast(hash & (table.len - 1));
         while (table[slot] != 0) : (slot = (slot + 1) & (table.len - 1)) {

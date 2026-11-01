@@ -65,16 +65,16 @@ After toolkit changes:
 
 | Node | Runtime | Binary | Config | Unit |
 |------|---------|--------|--------|------|
-| eshmaki.me | `/home/kain/onyx-server-run` | `…/onyx-server` | `…/onyx-server.local.toml` | `onyx-server.service` |
+| eshmaki.me | `/home/kain/onyx-server-run` | `…/onyx-server` | `…/onyx-server.local.toml` | OpenRC `/etc/init.d/onyx-server` |
 | ircx.us (`trev@ircx.us`) | `/home/trev/onyx-server-run` | `…/onyx-server` | `…/onyx-server.local.toml` | `onyx-server.service` |
 
 Metrics: `:9130/metrics` — `links_active` = established Mooring; `tcp_active` = TCP only.  
 Health: `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`  
-As verified on 2026-09-06, both nodes run `0.7.0+ae78d490` with artifact SHA-256
-`0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` and report
+As verified on 2026-11-01, both nodes run `0.9.0+066d9b8356be-dirty` with artifact SHA-256
+`61d218f6682857eed5f3d4bb4007c2d99869fc723810f0df637961a417e5fe02` and report
 `links_active=1`, `peers_up=1`, and `partitioned=0`. The source manifest is
-now `0.8.0` and has not replaced that image. The full suite has not been
-re-run green on 0.8.0. Details and refresh commands:
+`0.9.0` (`build.zig.zon`) and this image is deployed with `[tls] ktls="txrx"`
+on both nodes. Details and refresh commands:
 `docs/ops/onyx-server-paths.md`, `docs/ops/mesh-metrics-deploy-checklist.md`, and
 skill `onyx-server-mesh-ops`.
 

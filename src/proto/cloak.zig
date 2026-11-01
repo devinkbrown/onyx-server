@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Deterministic host/IP cloaking. Hierarchical cloaks are v2. The public
-//! opaque cloak (plain and epoch) is v3: one 128-bit token, no subnet or geo.
+//! opaque cloak v4 binds rotation provenance to one 128-bit address token.
 //!
 //! Every cloak segment is a keyed HMAC-SHA256 token over a *cumulative prefix*
 //! of the real address. The hierarchical full-address token is 64 bits (16 hex) so two
@@ -29,7 +29,7 @@
 //!   opaque (max privacy) -> `<32 hex>.opq.<suffix>` (v3, 128 bits, no subnet/geo)
 //!   anon epoch           -> `<32 hex>.opq.<suffix>` (`cloakOpaqueEpochV3`)
 //!   rDNS  `dsl-1.isp.com`-> `ircxnet-<token>.isp.com`
-//!   acct  `Kain`@`IRCXNet`-> `kain.users.ircxnet` (no key needed)
+//!   acct  `Kain` -> `kain.users.onyx`; lossy labels add an identity digest.
 //!
 //! The most specific token comes FIRST (leftmost), matching DNS semantics
 //! where the rightmost labels are the broadest: masking the leading labels
@@ -245,6 +245,71 @@ pub fn cloakOpaqueEpochV3(
     return std.fmt.bufPrint(out, "{s}.{s}.{s}", .{ &full, opaque_marker, options.suffix }) catch error.OutputTooSmall;
 }
 
+/// Provenance-bearing opaque cloak. Public epoch/cadence labels let policy
+/// recover a historical cloak in constant work without retaining address history.
+/// HMAC binds every field, including normalized suffix; no subnet bits are public.
+pub fn cloakOpaqueEpochV4(
+    out: []u8,
+    key: *const SecretKey,
+    address: []const u8,
+    epoch: u64,
+    cadence: u64,
+    options: Options,
+) CloakError![]const u8 {
+    var nonzero: u8 = 0;
+    for (key.bytes) |b| nonzero |= b;
+    if (nonzero == 0) return error.InvalidKey;
+    if (cadence > 31_536_000 or (cadence == 0 and epoch != 0)) return error.InvalidHostname;
+    var suffix_buf: [max_hostname_len]u8 = undefined;
+    const suffix = try normalizeSuffix(&suffix_buf, options.suffix);
+    const parsed = Net.IpAddress.parse(address, 0) catch return error.InvalidHostname;
+    var mac = HmacSha256.init(&key.bytes);
+    defer secureZero(std.mem.asBytes(&mac));
+    mac.update("onyx/cloak/opaque/v4\x00");
+    switch (parsed) {
+        .ip4 => |ip| {
+            mac.update("\x04");
+            mac.update(&ip.bytes);
+        },
+        .ip6 => |ip| {
+            // IPv4-mapped IPv6 and native IPv4 identify the same endpoint.
+            if (std.mem.eql(u8, ip.bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255 })) {
+                mac.update("\x04");
+                mac.update(ip.bytes[12..16]);
+            } else {
+                mac.update("\x06");
+                mac.update(&ip.bytes);
+            }
+        },
+    }
+    var metadata: [16]u8 = undefined;
+    std.mem.writeInt(u64, metadata[0..8], epoch, .big);
+    std.mem.writeInt(u64, metadata[8..16], cadence, .big);
+    mac.update(&metadata);
+    mac.update(suffix);
+    var tag: [tag_len]u8 = undefined;
+    defer secureZero(&tag);
+    mac.final(&tag);
+    var token: [wide_token_hex_len]u8 = undefined;
+    hexEncode(&token, tag[0..16]);
+    const host = std.fmt.bufPrint(out, "{s}.e{x}.c{x}.opq4.{s}", .{ &token, epoch, cadence, suffix }) catch return error.OutputTooSmall;
+    if (host.len > max_hostname_len) return error.InvalidHostname;
+    return host;
+}
+
+/// Strict DNS suffix validation shared by generation and configuration.
+pub fn normalizeSuffix(out: []u8, suffix: []const u8) CloakError![]const u8 {
+    // Reserve the longest v4 prefix (32 hex + e/c u64 labels + marker).
+    if (suffix.len == 0 or suffix.len > max_hostname_len - 74 or out.len < suffix.len) return error.InvalidHostname;
+    var labels = std.mem.splitScalar(u8, suffix, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return error.InvalidHostname;
+        for (label) |c| if (!isHostnameByte(c)) return error.InvalidHostname;
+    }
+    for (suffix, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out[0..suffix.len];
+}
+
 /// Cloak raw IPv4 bytes hierarchically: a 64-bit token over the full address,
 /// then 32-bit tokens per cumulative prefix (/24, /16, /8), most specific
 /// first, then the mixed-in `a<asn>.<cc>` geo labels, the `ip` marker, and the
@@ -357,8 +422,8 @@ pub fn cloakHostname(
     return out[0..n];
 }
 
-/// Friendly cloak for a logged-in account: `<account>.users.<network>`,
-/// lowercased and sanitized to hostname-safe characters. Stable across
+/// Friendly account cloak. Canonical DNS labels retain their existing spelling;
+/// lossy identities use `<label>.<digest>.users.<network>` to prevent collisions. Stable across
 /// restarts and key rotation (no secret involved); the server decides when to
 /// present this instead of the IP/host cloak.
 pub fn cloakAccount(
@@ -366,17 +431,49 @@ pub fn cloakAccount(
     account: []const u8,
     network: []const u8,
 ) CloakError![]const u8 {
-    var n: usize = 0;
-    try appendSanitizedLabel(out, &n, account, error.InvalidAccount);
-    try appendByte(out, &n, '.');
-    try append(out, &n, account_subdomain);
-    try appendByte(out, &n, '.');
-    if (network.len == 0) {
-        try append(out, &n, default_suffix);
-    } else {
-        try appendSanitizedLabel(out, &n, network, error.InvalidHostname);
+    if (account.len == 0 or account.len > 256) return error.InvalidAccount;
+    var network_buf: [max_hostname_len]u8 = undefined;
+    const suffix = try normalizeSuffix(&network_buf, if (network.len == 0) default_suffix else network);
+    var canonical = account.len <= 63 and account[0] != '-' and account[account.len - 1] != '-';
+    for (account) |c| if (!isHostnameByte(c)) {
+        canonical = false;
+    };
+    var label_buf: [63]u8 = undefined;
+    if (canonical) {
+        for (account, 0..) |c, i| label_buf[i] = std.ascii.toLower(c);
+        return std.fmt.bufPrint(out, "{s}.{s}.{s}", .{ label_buf[0..account.len], account_subdomain, suffix }) catch error.OutputTooSmall;
     }
-    return out[0..n];
+    var label_len: usize = 0;
+    for (account) |c| {
+        const mapped: u8 = if (isHostnameByte(c)) std.ascii.toLower(c) else '-';
+        if (label_len == 0 and mapped == '-') continue;
+        if (label_len == 30) break;
+        label_buf[label_len] = mapped;
+        label_len += 1;
+    }
+    while (label_len > 0 and label_buf[label_len - 1] == '-') label_len -= 1;
+    if (label_len == 0) {
+        // Services accepts punctuation-only names. Give only those permitted
+        // names a fixed friendly label; the existing digest still distinguishes
+        // every account and keeps this family separate from canonical labels.
+        if (account.len > 32) return error.InvalidAccount;
+        for (account) |c| if (c != '_' and c != '.' and c != '-') return error.InvalidAccount;
+        @memcpy(label_buf[0..7], "account");
+        label_len = 7;
+    }
+    // Lossy identities use TWO labels. Canonical identities always use ONE,
+    // so an account resembling the digest can never claim the same hostname.
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("onyx/cloak/account/v2\x00");
+    for (account) |c| {
+        const folded = [_]u8{std.ascii.toLower(c)};
+        hash.update(&folded);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    var token: [32]u8 = undefined;
+    hexEncode(&token, digest[0..16]);
+    return std.fmt.bufPrint(out, "{s}.{s}.{s}.{s}", .{ label_buf[0..label_len], &token, account_subdomain, suffix }) catch error.OutputTooSmall;
 }
 
 /// Append the mixed-in geo labels `a<asn>.<cc>.` (with a trailing dot). Both
@@ -885,8 +982,10 @@ test "account cloak is friendly, sanitized, and key-free" {
     var out: [max_cloak_len]u8 = undefined;
     const c = try cloakAccount(&out, "Kain", "IRCXNet");
     try testing.expectEqualStrings("kain.users.ircxnet", c);
+    try testing.expect(std.mem.endsWith(u8, c, ".users.ircxnet"));
     const c2 = try cloakAccount(&out, "Some_User!", "IRCXNet");
-    try testing.expectEqualStrings("some-user.users.ircxnet", c2);
+    try testing.expect(std.mem.startsWith(u8, c2, "some-user."));
+    try testing.expect(std.mem.endsWith(u8, c2, ".users.ircxnet"));
 }
 
 test "account cloak rejects unusable account names" {
@@ -1025,4 +1124,98 @@ test "classify recognizes address kinds" {
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "v4 cloak canonicalizes addresses and binds public metadata and suffix" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    var c: [max_cloak_len]u8 = undefined;
+    const first = try cloakOpaqueEpochV4(&a, &test_key, "203.0.113.9", 9, 1209600, .{ .suffix = "Onyx" });
+    const mapped = try cloakOpaqueEpochV4(&b, &test_key, "::ffff:203.0.113.9", 9, 1209600, .{});
+    try testing.expectEqualStrings(first, mapped);
+    try testing.expect(!std.mem.eql(u8, first[0..32], (try cloakOpaqueEpochV4(&c, &test_key, "203.0.113.9", 9, 86400, .{}))[0..32]));
+    try testing.expect(!std.mem.eql(u8, first[0..32], (try cloakOpaqueEpochV4(&c, &test_key, "203.0.113.9", 10, 1209600, .{}))[0..32]));
+    try testing.expect(!std.mem.eql(u8, first[0..32], (try cloakOpaqueEpochV4(&c, &test_key, "203.0.113.9", 9, 1209600, .{ .suffix = "other" }))[0..32]));
+    const short = try cloakOpaqueEpochV4(&a, &test_key, "2001:db8::1", 0, 0, .{});
+    const long = try cloakOpaqueEpochV4(&b, &test_key, "2001:0db8:0000:0000:0000:0000:0000:0001", 0, 0, .{});
+    try testing.expectEqualStrings(short, long);
+}
+
+test "v4 cloak rejects invalid keys suffixes cadence and hostname input" {
+    var buf: [max_cloak_len]u8 = undefined;
+    const zero = SecretKey.init(@splat(0));
+    try testing.expectError(error.InvalidKey, cloakOpaqueEpochV4(&buf, &zero, "203.0.113.9", 1, 86400, .{}));
+    try testing.expectError(error.InvalidHostname, cloakOpaqueEpochV4(&buf, &test_key, "host.test", 1, 86400, .{}));
+    try testing.expectError(error.InvalidHostname, cloakOpaqueEpochV4(&buf, &test_key, "203.0.113.9", 1, 0, .{}));
+    try testing.expectError(error.InvalidHostname, cloakOpaqueEpochV4(&buf, &test_key, "203.0.113.9", 1, 31_536_001, .{}));
+    inline for (.{ "", "bad suffix", "-bad", "bad-", "bad..suffix", "bad.", "*.suffix" }) |suffix| {
+        try testing.expectError(error.InvalidHostname, cloakOpaqueEpochV4(&buf, &test_key, "203.0.113.9", 1, 86400, .{ .suffix = suffix }));
+    }
+    var tiny: [1]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, cloakOpaqueEpochV4(&tiny, &test_key, "203.0.113.9", 1, 86400, .{}));
+}
+
+test "account cloak digest prevents lossy friendly label privilege collisions" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const first = try cloakAccount(&a, "alice_foo", "onyx");
+    inline for (.{ "alice.foo", "alice-foo", "-alice_foo", "alice_foo-" }) |account| {
+        try testing.expect(!std.mem.eql(u8, first, try cloakAccount(&b, account, "onyx")));
+    }
+    try testing.expectEqualStrings(first, try cloakAccount(&b, "ALICE_FOO", "ONYX"));
+}
+
+test "v4 cloak HMAC framing known answer" {
+    const key = SecretKey.init(@splat(7));
+    var out: [253]u8 = undefined;
+    try testing.expectEqualStrings("84f0ccacbb6ef9a05cd4fb61abd2448f.e9.c127500.opq4.onyx", try cloakOpaqueEpochV4(&out, &key, "203.0.113.9", 9, 1209600, .{}));
+}
+
+test "account cloak canonical and hashed families cannot impersonate each other" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const hashed = try cloakAccount(&a, "alice_foo", "onyx");
+    const ending = std.mem.indexOf(u8, hashed, ".users.").?;
+    var crafted: [63]u8 = undefined;
+    @memcpy(crafted[0..ending], hashed[0..ending]);
+    for (crafted[0..ending]) |*c| if (c.* == '.') {
+        c.* = '-';
+    };
+    try testing.expect(!std.mem.eql(u8, hashed, try cloakAccount(&b, crafted[0..ending], "onyx")));
+    try testing.expect(!std.mem.eql(u8, hashed, try cloakAccount(&b, hashed[0..ending], "onyx")));
+    try testing.expectEqualStrings("alice-foo.users.onyx", try cloakAccount(&b, "Alice-Foo", "onyx"));
+}
+
+test "account cloak retains distinct punctuation-only identities" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const names = [_][]const u8{ "_", ".", "-", "_.-", "--__..", "________________________________" };
+    for (names, 0..) |name, index| {
+        const host = try cloakAccount(&a, name, "onyx");
+        try testing.expect(std.mem.startsWith(u8, host, "account."));
+        try testing.expect(std.mem.endsWith(u8, host, ".users.onyx"));
+        try testing.expect(host.len <= max_cloak_len);
+        for (names[0..index]) |other| {
+            try testing.expect(!std.mem.eql(u8, host, try cloakAccount(&b, other, "onyx")));
+        }
+        try testing.expect(!std.mem.eql(u8, host, try cloakAccount(&b, "account", "onyx")));
+        const prefix_end = std.mem.indexOf(u8, host, ".users.").?;
+        try testing.expect(!std.mem.eql(u8, host, try cloakAccount(&b, host[0..prefix_end], "onyx")));
+        var tiny: [1]u8 = undefined;
+        try testing.expectError(error.OutputTooSmall, cloakAccount(&tiny, name, "onyx"));
+    }
+    try testing.expectError(error.InvalidAccount, cloakAccount(&a, "!!!", "onyx"));
+    try testing.expectError(error.InvalidAccount, cloakAccount(&a, "_________________________________", "onyx"));
+}
+
+test "account cloak retains complete long identity and ASCII casefold" {
+    var a: [max_cloak_len]u8 = undefined;
+    var b: [max_cloak_len]u8 = undefined;
+    const first = try cloakAccount(&a, "abcdefghijklmnopqrstuvwxyzabcd_1", "onyx");
+    const second = try cloakAccount(&b, "abcdefghijklmnopqrstuvwxyzabcd_2", "onyx");
+    try testing.expect(std.mem.startsWith(u8, first, "abcdefghijklmnopqrstuvwxyzabcd."));
+    try testing.expect(!std.mem.eql(u8, first, second));
+    try testing.expectEqualStrings(first, try cloakAccount(&b, "ABCDEFGHIJKLMNOPQRSTUVWXYZABCD_1", "ONYX"));
+    // Neither input nor the digest includes a client address or a cloak key.
+    try testing.expectEqualStrings(first, try cloakAccount(&b, "abcdefghijklmnopqrstuvwxyzabcd_1", "onyx"));
 }

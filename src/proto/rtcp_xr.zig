@@ -50,7 +50,7 @@ pub const BlockIterator = struct {
 
         self.pos = body_end;
         return .{
-            .typ = @enumFromInt(header[0]),
+            .typ = @fromBackingInt(@intCast(header[0])),
             .type_specific = header[1],
             .body = self.bytes[body_start..body_end],
         };
@@ -167,7 +167,7 @@ fn writeBlockHeader(typ: BlockType, type_specific: u8, body_len: usize, out: []u
     std.debug.assert(body_len % 4 == 0);
     std.debug.assert(body_len / 4 <= std.math.maxInt(u16));
 
-    out[0] = @intFromEnum(typ);
+    out[0] = @backingInt(typ);
     out[1] = type_specific;
     std.mem.writeInt(u16, out[2..4], @intCast(body_len / 4), endian);
 }

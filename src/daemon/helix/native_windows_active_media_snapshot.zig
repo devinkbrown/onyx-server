@@ -24,6 +24,7 @@ const max_rows: usize = routing.max_graph_rows * 2;
 const magic = [4]u8{ 'H', 'X', 'N', 'A' };
 const webrtc_magic = [4]u8{ 'H', 'X', 'W', 'A' };
 const version: u16 = 1;
+const webrtc_version: u16 = 2;
 const header_len: usize = 12;
 const digest_len: usize = 32;
 const digest_domain = "onyx-windows-native-active-media-v1";
@@ -82,6 +83,7 @@ comptime {
         @typeInfo(media_transport.MediaTransport.Snapshot).@"struct".field_names.len != 6 or
         @typeInfo(media_transport.MediaTransport.SnapshotEndpoint).@"struct".field_names.len != 9 or
         @typeInfo(rtp_nack.RetransmitBuffer.Snapshot).@"struct".field_names.len != 4 or
+        @typeInfo(rtp_nack.RetransmitBuffer.Snapshot.Packet).@"struct".field_names.len != 4 or
         @typeInfo(rtp_nack.PerSsrcRetransmitBuffer.Snapshot).@"struct".field_names.len != 5 or
         @typeInfo(sfu_srtp.SfuSrtp.Snapshot).@"struct".field_names.len != 6 or
         @typeInfo(sfu_srtp.SfuSrtp.Snapshot.Peer).@"struct".field_names.len != 8 or
@@ -183,7 +185,7 @@ fn writeValue(w: *Writer, comptime T: type, value: T) void {
             const I = @Int(.unsigned, @sizeOf(T) * 8);
             w.int(I, @bitCast(value));
         },
-        .@"enum" => |e| w.int(e.tag_type, @intFromEnum(value)),
+        .@"enum" => |e| w.int(e.tag_type, @backingInt(value)),
         .optional => |o| {
             w.int(u8, @intFromBool(value != null));
             if (value) |v| writeValue(w, o.child, v);
@@ -400,7 +402,7 @@ pub fn encodeWebrtc(allocator: std.mem.Allocator, snapshot: *const webrtc.Physic
     errdefer freeEncoded(allocator, bytes);
     var w = Writer{ .bytes = bytes };
     w.put(&webrtc_magic);
-    w.int(u16, version);
+    w.int(u16, webrtc_version);
     w.int(u16, 0);
     w.int(u32, @intCast(body_len));
     writeValue(&w, webrtc.PhysicalSnapshot, snapshot.*);
@@ -445,7 +447,7 @@ pub fn decodeWebrtc(allocator: std.mem.Allocator, bytes: []const u8, limits: web
     if (limits.max_bytes == 0 or limits.max_bytes > max_alloc_bytes) return error.Capacity;
     if (bytes.len < header_len + digest_len or bytes.len > max_wire_bytes or !std.mem.eql(u8, bytes[0..4], &webrtc_magic)) return error.InvalidSnapshot;
     var header = Reader{ .bytes = bytes[4..header_len], .alloc_limit = limits.max_bytes };
-    if (try header.int(u16) != version or try header.int(u16) != 0) return error.InvalidSnapshot;
+    if (try header.int(u16) != webrtc_version or try header.int(u16) != 0) return error.InvalidSnapshot;
     const body_len: usize = try header.int(u32);
     if (body_len != bytes.len - header_len - digest_len) return error.InvalidSnapshot;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -637,10 +639,10 @@ fn webrtcHistoryFixture(allocator: std.mem.Allocator) !webrtc.PhysicalSnapshot {
     const packet = [13]u8{ 0x80, 111, 0, 9, 0, 0, 0, 1, 0, 0, 1, 145, 'x' };
     var history = rtp_nack.RetransmitBuffer.init(allocator, media_transport.rtx_capacity);
     defer history.deinit();
-    try history.onSent(9, &packet);
+    try history.onSentAt(9, &packet, 100);
     var cache = rtp_nack.PerSsrcRetransmitBuffer.init(allocator, media_transport.rtx_capacity, sfu_srtp.max_owners);
     defer cache.deinit();
-    const prepared = try cache.prepareSent(401, 9, &packet);
+    const prepared = try cache.prepareSentAt(401, 9, &packet, 100);
     defer prepared.deinit();
     try prepared.validate();
     prepared.commitRetainingMetadata();
@@ -652,7 +654,7 @@ fn webrtcHistoryFixture(allocator: std.mem.Allocator) !webrtc.PhysicalSnapshot {
     defer transport_owner.deinit();
     var rng = std.Random.DefaultCsprng.init(@splat(0x17));
     const transport_endpoint = try transport_owner.allocate("#one", "alice", rng.random());
-    try transport_endpoint.rtx.onSent(9, &packet);
+    try transport_endpoint.rtx.onSentAt(9, &packet, 100);
     var transport = try transport_owner.capture(allocator, webrtcLimits().transport);
     errdefer transport.deinit();
     const rows = try allocator.alloc(webrtc.PhysicalSnapshot.Row, 1);
@@ -741,6 +743,8 @@ test "Windows active WebRTC physical checkpoint roundtrips canonical owned state
     defer decoded.deinit();
     try testing.expect(decoded.rows.ptr != source.rows.ptr);
     try testing.expect(decoded.rows[0].rtx.packets[0].bytes.ptr != source.rows[0].rtx.packets[0].bytes.ptr);
+    try testing.expectEqual(@as(i64, 100), decoded.rows[0].rtx.packets[0].sent_ms);
+    try testing.expectEqual(@as(i64, 100), decoded.rows[0].cache.streams[0].cache.packets[0].sent_ms);
     try testing.expectEqualSlices(u8, source.rows[0].cache.streams[0].cache.packets[0].bytes, decoded.rows[0].cache.streams[0].cache.packets[0].bytes);
     try testing.expect(decoded.transport.endpoints.ptr != source.transport.endpoints.ptr);
     try testing.expectEqualDeep(source.queue, decoded.queue);
@@ -757,6 +761,10 @@ test "Windows active WebRTC checkpoint rejects malformed and re-digested input" 
     const bytes = try encodeWebrtc(testing.allocator, &source, limits);
     defer freeEncoded(testing.allocator, bytes);
     try testing.expectError(error.InvalidSnapshot, decodeWebrtc(testing.allocator, bytes[0 .. bytes.len - 1], limits));
+    const current_version = bytes[4..6].*;
+    std.mem.writeInt(u16, bytes[4..6], 1, .little);
+    try testing.expectError(error.InvalidSnapshot, decodeWebrtc(testing.allocator, bytes, limits));
+    bytes[4..6].* = current_version;
     bytes[header_len] ^= 1;
     try testing.expectError(error.InvalidSnapshot, decodeWebrtc(testing.allocator, bytes, limits));
     bytes[header_len] ^= 1;

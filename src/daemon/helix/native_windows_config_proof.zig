@@ -8,7 +8,7 @@ const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const domain = "onyx/helix/windows-config-source/v1\x00";
 pub const Digest = [Sha256.digest_length]u8;
-pub const max_source_bytes: usize = 1 << 20;
+pub const max_source_bytes = @import("../config_limits.zig").max_source_bytes;
 pub const max_path_bytes: usize = 32 << 10;
 pub const max_resolution_name_bytes: usize = 4 << 10;
 pub const max_resolution_value_bytes: usize = 1 << 20;
@@ -70,7 +70,7 @@ pub const Builder = struct {
 
     fn record(self: *Builder, kind: Kind, ordinal: u32, name: []const u8, value: []const u8) void {
         var header: [21]u8 = undefined;
-        header[0] = @intFromEnum(kind);
+        header[0] = @backingInt(kind);
         std.mem.writeInt(u32, header[1..5], ordinal, .big);
         std.mem.writeInt(u64, header[5..13], @intCast(name.len), .big);
         std.mem.writeInt(u64, header[13..21], @intCast(value.len), .big);
@@ -125,7 +125,7 @@ pub const EffectiveBuilder = struct {
         const added = std.math.add(usize, name.len, value.len) catch return error.MaterialTooLarge;
         if (added > max_effective_material_bytes - self.bytes) return error.MaterialTooLarge;
         var header: [21]u8 = undefined;
-        header[0] = @intFromEnum(kind);
+        header[0] = @backingInt(kind);
         std.mem.writeInt(u32, header[1..5], self.records + 1, .big);
         std.mem.writeInt(u64, header[5..13], @intCast(name.len), .big);
         std.mem.writeInt(u64, header[13..21], @intCast(value.len), .big);

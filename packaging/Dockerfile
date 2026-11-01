@@ -7,30 +7,34 @@
 #
 #   1. Build the verified artifact:   packaging/release.sh
 #   2. Build the image:               docker build -f packaging/Dockerfile -t onyx-server:latest .
-#   3. Run it:                        docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
+#   3. Run it:                        docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 #
 # The node's sovereign identity key + account store live in /data — mount a
 # volume to persist them across restarts. Point the Onyx web client at
 # ws://<host>:8080 (build Onyx with VITE_IRC_WS, or use a hosted client).
 #
-# (An alternative fully-from-source multi-stage build is possible once Zig 0.17
-# ships a stable release; today's toolchain is a dev build, so we ship the
-# reproducible binary the release script already produces + verifies.)
+# Only /data needs to be writable. Configuration lives beside the generated
+# node key there; a read-only /etc config would prevent first-boot identity
+# persistence. Named volumes inherit these initial contents. Bind mounts must
+# be provisioned with private configuration/state owned by uid/gid 10001.
 FROM alpine:3.20
 
 RUN adduser -D -u 10001 onyx-server \
     && mkdir -p /data \
-    && chown onyx-server:onyx-server /data
+    && chown onyx-server:onyx-server /data \
+    && chmod 0700 /data
 
 # The reproducible artifact produced by packaging/release.sh.
 COPY dist/onyx-server-*-x86_64-linux-musl /usr/local/bin/onyx-server
-COPY packaging/onyx-server.quickstart.toml /etc/onyx-server/onyx-server.toml
+COPY --chown=10001:10001 packaging/onyx-server.quickstart.toml /data/onyx-server.toml
+RUN chmod 0600 /data/onyx-server.toml
 
-USER onyx-server
+USER 10001:10001
 WORKDIR /data
 
 # 6667 = plaintext IRC · 8080 = browser WebSocket (Onyx). Add TLS (6697/wss) via
 # a production config with real certs.
 EXPOSE 6667 8080
 
-ENTRYPOINT ["/usr/local/bin/onyx-server", "/etc/onyx-server/onyx-server.toml"]
+ENTRYPOINT ["/usr/local/bin/onyx-server"]
+CMD ["/data/onyx-server.toml"]

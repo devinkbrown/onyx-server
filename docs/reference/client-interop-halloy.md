@@ -23,7 +23,7 @@ Companion references:
 
 | Side | Authority | Pin |
 |---|---|---|
-| Onyx Server CAPs | `cap_specs` in `src/daemon/dispatch.zig:316-445` (`CapId` at `:243`) | this repository HEAD |
+| Onyx Server CAPs | `cap_specs` in `src/proto/live_cap_metadata.zig` (imported by `src/daemon/dispatch.zig`) | this repository HEAD |
 | Onyx Server SASL mechs | `writeSaslCapValue` at `src/daemon/dispatch.zig:1435-1445` | this repository HEAD |
 | Onyx first-party REQ filter | `_wantedCaps` in `/home/kain/onyx/src/lib/irc/client.ts:1344-1357` | Onyx tree HEAD |
 | Halloy REQ set | `Capability` + `Capabilities::create_requested` in [data/src/capabilities.rs](https://github.com/squidowl/halloy/blob/d97e05afcc49e036521cd013235d699c04569d17/data/src/capabilities.rs) | commit `d97e05afcc49e036521cd013235d699c04569d17` (2026-07-20) |
@@ -121,7 +121,7 @@ Columns:
 
 ### CAP count summary (Onyx Server `cap_specs`)
 
-Advertised names (including the `no-implicit-names` dual spelling): **45** name strings over **44** `CapId` values (`sts` policy-gated). Halloy explicitly REQs **22** of those names (counting one of the no-implicit-names spellings). The remainder are passive, server-only, vendor, or config-gated as above.
+Advertised names (including the `no-implicit-names` dual spelling): **47** name strings over **46** `CapId` values (`sts` policy-gated), including the vendor caps `onyx/2fa` and `onyx/privacy` defined in `src/proto/live_cap_metadata.zig`. Halloy explicitly REQs **22** of those names (counting one of the no-implicit-names spellings). The remainder are passive, server-only, vendor, or config-gated as above.
 
 ---
 

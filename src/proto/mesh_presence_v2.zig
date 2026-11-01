@@ -125,7 +125,7 @@ pub fn encode(record: Record, key: *const sign.KeyPair, out: []u8) ![]const u8 {
     if (out.len < length) return error.Truncated;
     @memcpy(out[0..4], magic);
     out[4] = version;
-    out[5] = @intFromEnum(record.operation);
+    out[5] = @backingInt(record.operation);
     @memcpy(out[6..38], &record.origin);
     @memcpy(out[38..54], &record.guest);
     std.mem.writeInt(u64, out[54..62], record.revision, .big);
@@ -133,7 +133,7 @@ pub fn encode(record: Record, key: *const sign.KeyPair, out: []u8) ![]const u8 {
     std.mem.writeInt(u64, out[70..78], record.claim_revision, .big);
     std.mem.writeInt(i64, out[78..86], record.issued_ms, .big);
     std.mem.writeInt(i64, out[86..94], record.expires_ms, .big);
-    out[94] = @intFromEnum(record.routing_class);
+    out[94] = @backingInt(record.routing_class);
     std.mem.writeInt(u64, out[95..103], record.class_revision, .big);
     var cursor: usize = fixed_prefix_len;
     for (fields(record)) |field| {
@@ -295,7 +295,7 @@ test "presence v2 all required classes sign roundtrip exact offsets and physical
         try std.testing.expect(sameRecord(record, decoded.record));
         try std.testing.expectEqual(original.ptr, decoded.wire.ptr);
         try std.testing.expectEqual(@as(u8, 2), original[4]);
-        try std.testing.expectEqual(@intFromEnum(class), original[94]);
+        try std.testing.expectEqual(@backingInt(class), original[94]);
         try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, original[95..103], .big));
         try std.testing.expectEqual(Subject{ .epoch = 3, .counter = 17 }, try subject(decoded.record.guest));
         var legacy: [v1.max_wire_len]u8 = undefined;
@@ -321,7 +321,7 @@ test "presence v2 rejects unknown versions classes invalid provenance and revisi
         bytes[94] = unknown;
         try std.testing.expectError(error.InvalidField, decode(original));
     }
-    bytes[94] = @intFromEnum(RoutingClass.true_guest);
+    bytes[94] = @backingInt(RoutingClass.true_guest);
     for ([_]u64{ 0, 2 }) |invalid| {
         std.mem.writeInt(u64, bytes[95..103], invalid, .big);
         try std.testing.expectError(error.InvalidField, decode(original));
@@ -588,7 +588,7 @@ test "presence v2 same revision class equivocation and full subject mismatch nev
 }
 
 fn historyIndex(older_revision: usize, newer_revision: usize, older_class: RoutingClass, older_class_revision: usize, newer_class: RoutingClass, newer_class_revision: usize) usize {
-    return (((((older_revision * 6 + newer_revision) * 3 + @intFromEnum(older_class) - 1) * 6 + older_class_revision) * 3 + @intFromEnum(newer_class) - 1) * 6 + newer_class_revision);
+    return (((((older_revision * 6 + newer_revision) * 3 + @backingInt(older_class) - 1) * 6 + older_class_revision) * 3 + @backingInt(newer_class) - 1) * 6 + newer_class_revision);
 }
 
 test "presence v2 exhaustive finite class histories accept exactly possible subsequence chronology" {

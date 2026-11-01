@@ -14,6 +14,60 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const seq_modulus: i64 = 1 << 16;
+/// A cached retransmission is useful strictly before this age.
+pub const retransmit_max_age_ms: i64 = 1000;
+pub fn retransmitFresh(sent_ms: i64, now_ms: i64) bool {
+    return sent_ms > 0 and now_ms >= sent_ms and now_ms - sent_ms < retransmit_max_age_ms;
+}
+pub const FreshPacket = struct { bytes: []const u8, sent_ms: i64 };
+
+/// Joint NACK/FEC-style recovery choice for one missing packet.
+pub const RecoveryDecision = enum { retransmit, recover_locally, drop_late };
+
+/// Deadline in packet-age milliseconds derived from a caller-supplied
+/// playout budget minus a jitter guard. The result is bounded to
+/// `[0, retransmit_max_age_ms]` so no budget can extend retransmit
+/// usefulness past the existing freshness bound.
+pub fn retransmitDeadlineMs(playout_budget_ms: i64, jitter_ms: i64) i64 {
+    const budget = std.math.clamp(playout_budget_ms, 0, retransmit_max_age_ms);
+    const jitter = std.math.clamp(jitter_ms, 0, retransmit_max_age_ms);
+    return @max(0, budget - jitter);
+}
+
+/// Pure joint recovery decision over bounded inputs. A retransmit is
+/// useful strictly before `deadline_ms` (exactly at the deadline is
+/// late, matching `retransmitFresh`); lateness overrides local
+/// recovery. Exactly one missing packet prefers FEC-style local
+/// recovery only when `prefer_local_single_missing` is set. Negative
+/// age, a non-positive deadline, or zero missing packets fail closed
+/// as `drop_late`.
+pub fn decideRecovery(packet_age_ms: i64, deadline_ms: i64, missing_count: usize, prefer_local_single_missing: bool) RecoveryDecision {
+    const deadline = std.math.clamp(deadline_ms, 0, retransmit_max_age_ms);
+    if (packet_age_ms < 0 or deadline <= 0 or packet_age_ms >= deadline) return .drop_late;
+    if (missing_count == 0) return .drop_late;
+    if (missing_count == 1 and prefer_local_single_missing) return .recover_locally;
+    return .retransmit;
+}
+
+/// Caller-owned joint recovery policy. `decide` keeps the pure
+/// `decideRecovery` rule and counts every late drop it returns;
+/// `dropped_late` saturates instead of wrapping.
+pub const RecoveryPolicy = struct {
+    playout_budget_ms: i64,
+    jitter_ms: i64 = 0,
+    prefer_local_single_missing: bool = false,
+    dropped_late: u64 = 0,
+
+    pub fn deadlineMs(self: RecoveryPolicy) i64 {
+        return retransmitDeadlineMs(self.playout_budget_ms, self.jitter_ms);
+    }
+
+    pub fn decide(self: *RecoveryPolicy, packet_age_ms: i64, missing_count: usize) RecoveryDecision {
+        const decision = decideRecovery(packet_age_ms, self.deadlineMs(), missing_count, self.prefer_local_single_missing);
+        if (decision == .drop_late) self.dropped_late +|= 1;
+        return decision;
+    }
+};
 
 pub const NackError = error{
     InvalidFciLength,
@@ -122,6 +176,7 @@ pub const RetransmitBuffer = struct {
         pub const Packet = struct {
             seq: u16,
             ext_seq: i64,
+            sent_ms: i64 = 0,
             bytes: []u8,
         };
 
@@ -140,6 +195,7 @@ pub const RetransmitBuffer = struct {
             var bytes: usize = 0;
             var previous: ?i64 = null;
             for (self.packets) |packet| {
+                if (packet.sent_ms < 0) return error.InvalidSnapshot;
                 if (previous) |p| if (packet.ext_seq <= p) return error.InvalidSnapshot;
                 const seq: u16 = @truncate(@as(u64, @bitCast(packet.ext_seq)));
                 if (packet.seq != seq or packet.ext_seq > self.newest_ext_seq.?) return error.InvalidSnapshot;
@@ -156,6 +212,7 @@ pub const RetransmitBuffer = struct {
         var bytes: usize = 0;
         var previous: ?i64 = null;
         for (self.packets.items) |packet| {
+            if (packet.sent_ms < 0) return error.InvalidSnapshot;
             if (previous) |p| if (packet.ext_seq <= p) return error.InvalidSnapshot;
             if (self.newest_ext_seq == null or packet.ext_seq > self.newest_ext_seq.? or
                 packet.seq != @as(u16, @truncate(@as(u64, @bitCast(packet.ext_seq))))) return error.InvalidSnapshot;
@@ -173,7 +230,7 @@ pub const RetransmitBuffer = struct {
             allocator.free(packets);
         }
         for (self.packets.items, 0..) |packet, i| {
-            packets[i] = .{ .seq = packet.seq, .ext_seq = packet.ext_seq, .bytes = try allocator.dupe(u8, packet.bytes) };
+            packets[i] = .{ .seq = packet.seq, .ext_seq = packet.ext_seq, .sent_ms = packet.sent_ms, .bytes = try allocator.dupe(u8, packet.bytes) };
             initialized += 1;
         }
         return .{ .allocator = allocator, .capacity = self.capacity, .packets = packets, .newest_ext_seq = self.newest_ext_seq };
@@ -189,7 +246,7 @@ pub const RetransmitBuffer = struct {
         try candidate.packets.ensureTotalCapacity(allocator, snapshot.packets.len);
         for (snapshot.packets) |packet| {
             const bytes = try allocator.dupe(u8, packet.bytes);
-            candidate.packets.appendAssumeCapacity(.{ .seq = packet.seq, .ext_seq = packet.ext_seq, .bytes = bytes });
+            candidate.packets.appendAssumeCapacity(.{ .seq = packet.seq, .ext_seq = packet.ext_seq, .sent_ms = packet.sent_ms, .bytes = bytes });
         }
         candidate.newest_ext_seq = snapshot.newest_ext_seq;
         return candidate;
@@ -212,17 +269,19 @@ pub const RetransmitBuffer = struct {
     }
 
     pub fn onSent(self: *RetransmitBuffer, seq: u16, bytes: []const u8) Allocator.Error!void {
+        return self.onSentAt(seq, bytes, 0);
+    }
+    pub fn onSentAt(self: *RetransmitBuffer, seq: u16, bytes: []const u8, sent_ms: i64) Allocator.Error!void {
         if (self.capacity == 0) return;
 
         const ext_seq = if (self.newest_ext_seq) |newest| extendSeq(seq, newest) else @as(i64, seq);
-        self.newest_ext_seq = maxOptionalI64(self.newest_ext_seq, ext_seq);
-
         const copied = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(copied);
 
         if (self.findExt(ext_seq)) |index| {
             self.allocator.free(self.packets.items[index].bytes);
             self.packets.items[index].bytes = copied;
+            self.newest_ext_seq = maxOptionalI64(self.newest_ext_seq, ext_seq);
             return;
         }
 
@@ -231,8 +290,10 @@ pub const RetransmitBuffer = struct {
         try self.packets.insert(self.allocator, index, .{
             .seq = seq,
             .ext_seq = ext_seq,
+            .sent_ms = @max(0, sent_ms),
             .bytes = copied,
         });
+        self.newest_ext_seq = maxOptionalI64(self.newest_ext_seq, ext_seq);
 
         while (self.packets.items.len > self.capacity) {
             const old = self.packets.orderedRemove(0);
@@ -244,6 +305,9 @@ pub const RetransmitBuffer = struct {
     /// backend calls happen here or in deinit after the cut; commit is pure.
     /// Existing ordinary onSent semantics remain separately available.
     pub fn prepareSent(self: *RetransmitBuffer, seq: u16, bytes: []const u8) Allocator.Error!*PreparedSent {
+        return self.prepareSentAt(seq, bytes, 0);
+    }
+    pub fn prepareSentAt(self: *RetransmitBuffer, seq: u16, bytes: []const u8, sent_ms: i64) Allocator.Error!*PreparedSent {
         const p = try self.allocator.create(SentPlan);
         p.* = .{ .owner = self, .allocator = self.allocator, .old_ptr = @intFromPtr(self.packets.items.ptr), .old_len = self.packets.items.len, .old_capacity = self.packets.capacity, .old_newest = self.newest_ext_seq, .limit = self.capacity, .old_digest = sentDigest(self), .next_newest = self.newest_ext_seq };
         errdefer self.allocator.destroy(p);
@@ -254,13 +318,16 @@ pub const RetransmitBuffer = struct {
         if (self.capacity == 0) return @ptrCast(p);
         const extended = if (self.newest_ext_seq) |old| extendSeq(seq, old) else @as(i64, seq);
         p.next_newest = maxOptionalI64(self.newest_ext_seq, extended);
+        // Replacing the same extended identity never renews its lifetime,
+        // including when the original clock reading was unknown.
+        const original_sent_ms = if (self.findExt(extended)) |index| self.packets.items[index].sent_ms else @max(0, sent_ms);
         const copied = try self.allocator.dupe(u8, bytes);
         p.copied = copied;
         try p.rows.ensureTotalCapacity(self.allocator, self.packets.items.len + 1);
         var inserted = false;
         for (self.packets.items) |row| {
             if (!inserted and row.ext_seq >= extended) {
-                p.rows.appendAssumeCapacity(.{ .seq = seq, .ext_seq = extended, .bytes = copied });
+                p.rows.appendAssumeCapacity(.{ .seq = seq, .ext_seq = extended, .sent_ms = original_sent_ms, .bytes = copied });
                 inserted = true;
             }
             if (row.ext_seq == extended) {
@@ -269,7 +336,7 @@ pub const RetransmitBuffer = struct {
             }
             p.rows.appendAssumeCapacity(row);
         }
-        if (!inserted) p.rows.appendAssumeCapacity(.{ .seq = seq, .ext_seq = extended, .bytes = copied });
+        if (!inserted) p.rows.appendAssumeCapacity(.{ .seq = seq, .ext_seq = extended, .sent_ms = original_sent_ms, .bytes = copied });
         if (p.rows.items.len > self.capacity) {
             std.debug.assert(p.retired == null);
             p.retired = p.rows.orderedRemove(0).bytes;
@@ -287,6 +354,22 @@ pub const RetransmitBuffer = struct {
         return null;
     }
 
+    /// Clock-domain discontinuity or unknown send time is a miss, never a fresh packet.
+    pub fn lookupFreshPacket(self: RetransmitBuffer, seq: u16, now_ms: i64) ?FreshPacket {
+        var index = self.packets.items.len;
+        while (index > 0) {
+            index -= 1;
+            const packet = self.packets.items[index];
+            if (packet.seq != seq) continue;
+            if (!retransmitFresh(packet.sent_ms, now_ms)) return null;
+            return .{ .bytes = packet.bytes, .sent_ms = packet.sent_ms };
+        }
+        return null;
+    }
+    pub fn lookupFresh(self: RetransmitBuffer, seq: u16, now_ms: i64) ?[]const u8 {
+        return if (self.lookupFreshPacket(seq, now_ms)) |packet| packet.bytes else null;
+    }
+
     pub fn len(self: RetransmitBuffer) usize {
         return self.packets.items.len;
     }
@@ -302,6 +385,7 @@ pub const RetransmitBuffer = struct {
 const StoredPacket = struct {
     seq: u16,
     ext_seq: i64,
+    sent_ms: i64 = 0,
     bytes: []u8,
 };
 
@@ -326,6 +410,7 @@ fn sentDigest(owner: *const RetransmitBuffer) [32]u8 {
     for (owner.packets.items) |row| {
         std.hash.autoHash(&hash, row.seq);
         std.hash.autoHash(&hash, row.ext_seq);
+        std.hash.autoHash(&hash, row.sent_ms);
         std.hash.autoHash(&hash, @intFromPtr(row.bytes.ptr));
         std.hash.autoHash(&hash, row.bytes.len);
         hash.update(row.bytes);
@@ -592,6 +677,53 @@ test "retransmit buffer replaces duplicate extended sequence packet" {
     try buffer.onSent(42, "new");
     try std.testing.expectEqual(@as(usize, 1), buffer.len());
     try std.testing.expectEqualSlices(u8, "new", buffer.lookup(42).?);
+}
+
+test "joint recovery retransmit on-time retransmit allowed" {
+    // Deadline is the playout budget minus the jitter guard: 200 - 30 = 170.
+    try std.testing.expectEqual(@as(i64, 170), retransmitDeadlineMs(200, 30));
+    try std.testing.expectEqual(RecoveryDecision.retransmit, decideRecovery(50, 170, 3, true));
+    try std.testing.expectEqual(RecoveryDecision.retransmit, decideRecovery(169, 170, 3, false));
+}
+
+test "joint recovery retransmit late retransmit dropped and counted" {
+    var policy = RecoveryPolicy{ .playout_budget_ms = 200, .jitter_ms = 30 };
+    try std.testing.expectEqual(RecoveryDecision.drop_late, policy.decide(171, 3));
+    try std.testing.expectEqual(RecoveryDecision.drop_late, policy.decide(1_000, 3));
+    try std.testing.expectEqual(@as(u64, 2), policy.dropped_late);
+    // On-time decisions do not inflate the late counter.
+    try std.testing.expectEqual(RecoveryDecision.retransmit, policy.decide(10, 3));
+    try std.testing.expectEqual(@as(u64, 2), policy.dropped_late);
+}
+
+test "joint recovery retransmit single-missing prefers local recovery when policy says so" {
+    try std.testing.expectEqual(RecoveryDecision.recover_locally, decideRecovery(50, 170, 1, true));
+    // Same inputs without the preference fall back to a retransmit.
+    try std.testing.expectEqual(RecoveryDecision.retransmit, decideRecovery(50, 170, 1, false));
+    // Local preference never resurrects a late packet.
+    try std.testing.expectEqual(RecoveryDecision.drop_late, decideRecovery(500, 170, 1, true));
+    // Multi-missing loss is not single-missing local recovery.
+    try std.testing.expectEqual(RecoveryDecision.retransmit, decideRecovery(50, 170, 2, true));
+}
+
+test "joint recovery retransmit exactly at deadline is dropped" {
+    // Useful strictly before the deadline, matching retransmitFresh.
+    try std.testing.expectEqual(RecoveryDecision.drop_late, decideRecovery(170, 170, 3, false));
+    try std.testing.expectEqual(RecoveryDecision.retransmit, decideRecovery(169, 170, 3, false));
+    var policy = RecoveryPolicy{ .playout_budget_ms = 200, .jitter_ms = 30 };
+    try std.testing.expectEqual(RecoveryDecision.drop_late, policy.decide(170, 1));
+    try std.testing.expectEqual(@as(u64, 1), policy.dropped_late);
+}
+
+test "joint recovery retransmit bounded and invalid inputs drop late" {
+    try std.testing.expectEqual(RecoveryDecision.drop_late, decideRecovery(-1, 170, 3, false));
+    try std.testing.expectEqual(RecoveryDecision.drop_late, decideRecovery(10, 170, 0, true));
+    try std.testing.expectEqual(RecoveryDecision.drop_late, decideRecovery(10, 0, 3, false));
+    // Budget is capped by the existing retransmit freshness bound and the
+    // jitter guard cannot make the deadline negative.
+    try std.testing.expectEqual(retransmit_max_age_ms, retransmitDeadlineMs(60_000, 0));
+    try std.testing.expectEqual(@as(i64, 0), retransmitDeadlineMs(20, 30));
+    try std.testing.expectEqual(@as(i64, 0), retransmitDeadlineMs(-5, 0));
 }
 
 test "sequence wrap gaps and retransmit lookup are deterministic" {
@@ -915,6 +1047,15 @@ pub const PerSsrcRetransmitBuffer = struct {
         if (!matchesPacket(bytes, ssrc, seq)) return null;
         return bytes;
     }
+    pub fn lookupFreshPacket(self: *const @This(), ssrc: u32, seq: u16, now_ms: i64) ?FreshPacket {
+        const cell = self.streams.get(ssrc) orelse return null;
+        const packet = cell.cache.lookupFreshPacket(seq, now_ms) orelse return null;
+        if (!matchesPacket(packet.bytes, ssrc, seq)) return null;
+        return packet;
+    }
+    pub fn lookupFresh(self: *const @This(), ssrc: u32, seq: u16, now_ms: i64) ?[]const u8 {
+        return if (self.lookupFreshPacket(ssrc, seq, now_ms)) |packet| packet.bytes else null;
+    }
     pub fn len(self: *const @This(), ssrc: u32) usize {
         const cell = self.streams.get(ssrc) orelse return 0;
         return cell.cache.len();
@@ -923,6 +1064,9 @@ pub const PerSsrcRetransmitBuffer = struct {
         return bytes.len >= 12 and bytes[0] >> 6 == 2 and std.mem.readInt(u16, bytes[2..4], .big) == seq and std.mem.readInt(u32, bytes[8..12], .big) == ssrc;
     }
     pub fn prepareSent(self: *@This(), ssrc: u32, seq: u16, bytes: []const u8) !*PreparedPerSsrcSent {
+        return self.prepareSentAt(ssrc, seq, bytes, 0);
+    }
+    pub fn prepareSentAt(self: *@This(), ssrc: u32, seq: u16, bytes: []const u8, sent_ms: i64) !*PreparedPerSsrcSent {
         if (!matchesPacket(bytes, ssrc, seq)) return error.InvalidPacket;
         if (self.revision == 0 or self.revision == std.math.maxInt(u64)) return error.SequenceExhausted;
         const old = self.streams.get(ssrc);
@@ -949,7 +1093,7 @@ pub const PerSsrcRetransmitBuffer = struct {
             }
             break :create new;
         };
-        plan.inner = try cell.cache.prepareSent(seq, bytes);
+        plan.inner = try cell.cache.prepareSentAt(seq, bytes, sent_ms);
         return @ptrCast(plan);
     }
     /// Allocation-free identity observation; it is never an ownership grant.
@@ -1224,4 +1368,161 @@ test "physical media per-SSRC cache every new existing growth allocation refusal
     try perSsrcRetryBoundaryTest(false, false);
     try perSsrcRetryBoundaryTest(true, false);
     try perSsrcRetryBoundaryTest(false, true);
+}
+
+test "retransmit age boundary wrap and snapshot preserve original deadline" {
+    const a = std.testing.allocator;
+    var source = RetransmitBuffer.init(a, 2);
+    defer source.deinit();
+    try source.onSentAt(65535, "before-wrap", 100);
+    try source.onSentAt(0, "after-wrap", 101);
+    try std.testing.expectEqualStrings("before-wrap", source.lookupFresh(65535, 1099).?);
+    try std.testing.expect(source.lookupFresh(65535, 1100) == null);
+    try std.testing.expect(source.lookupFresh(0, 100) == null);
+    try std.testing.expectEqualStrings("after-wrap", source.lookupFresh(0, 1100).?);
+    try std.testing.expect(source.lookupFresh(0, 1101) == null);
+    var snap = try source.capture(a, 4096);
+    defer snap.deinit();
+    var restored = try RetransmitBuffer.prepareRestore(a, &snap, 2, 4096);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(i64, 100), snap.packets[0].sent_ms);
+    try std.testing.expectEqualStrings("before-wrap", restored.lookupFresh(65535, 1099).?);
+    try std.testing.expect(restored.lookupFresh(65535, 1100) == null);
+    try std.testing.expect(restored.lookupFresh(0, std.math.maxInt(i64)) == null);
+    try source.onSentAt(1, "unknown-time", 0);
+    try std.testing.expect(source.lookupFresh(1, 1) == null);
+}
+
+fn ageAllocationCuts(a: Allocator) !void {
+    var source = RetransmitBuffer.init(a, 2);
+    defer source.deinit();
+    try source.onSentAt(10, "old", 100);
+    const old = source.newest_ext_seq;
+    const plan = source.prepareSentAt(11, "new", 101) catch |err| {
+        std.debug.assert(source.newest_ext_seq == old);
+        std.debug.assert(source.lookupFresh(10, 101) != null);
+        return err;
+    };
+    defer plan.deinit();
+    try plan.validate();
+    plan.commitRetainingMetadata();
+    var snapshot = try source.capture(a, 4096);
+    defer snapshot.deinit();
+    var restored = try RetransmitBuffer.prepareRestore(a, &snapshot, 2, 4096);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("new", restored.lookupFresh(11, 1100).?);
+    try std.testing.expect(restored.lookupFresh(11, 1101) == null);
+}
+test "retransmit age prepare and snapshot allocation cuts remain atomic" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ageAllocationCuts, .{});
+}
+
+test "retransmit stale pressure remains a bounded miss without changing retained fresh packets" {
+    const a = std.testing.allocator;
+    var source = RetransmitBuffer.init(a, 2);
+    defer source.deinit();
+    try source.onSentAt(10, "old", 100);
+    try source.onSentAt(11, "fresh", 1099);
+    for (0..512) |_| try std.testing.expect(source.lookupFresh(10, 1100) == null);
+    try std.testing.expectEqual(@as(usize, 2), source.len());
+    try std.testing.expectEqualStrings("fresh", source.lookupFresh(11, 1100).?);
+    try std.testing.expect(source.lookupFresh(11, 99) == null);
+}
+
+test "retransmit duplicate keeps original lifetime in ordinary and prepared caches" {
+    const a = std.testing.allocator;
+    var ordinary = RetransmitBuffer.init(a, 4);
+    defer ordinary.deinit();
+    try ordinary.onSentAt(65535, "old", 100);
+    try ordinary.onSentAt(65535, "replacement", 1099);
+    try std.testing.expectEqualStrings("replacement", ordinary.lookupFresh(65535, 1099).?);
+    try std.testing.expect(ordinary.lookupFresh(65535, 1100) == null);
+    try ordinary.onSentAt(0, "new-cycle", 1100);
+    try std.testing.expectEqualStrings("new-cycle", ordinary.lookupFresh(0, 1100).?);
+    var snap = try ordinary.capture(a, 4096);
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(i64, 100), snap.packets[0].sent_ms);
+    try std.testing.expectEqual(@as(i64, 1100), snap.packets[1].sent_ms);
+    var restored = try RetransmitBuffer.prepareRestore(a, &snap, 4, 4096);
+    defer restored.deinit();
+    try std.testing.expect(restored.lookupFresh(65535, 1100) == null);
+    try std.testing.expectEqualStrings("new-cycle", restored.lookupFresh(0, 1100).?);
+    try ordinary.onSentAt(1, "unknown", 0);
+    try ordinary.onSentAt(1, "unknown-replaced", 1200);
+    try std.testing.expect(ordinary.lookupFresh(1, 1200) == null);
+    var prepared = RetransmitBuffer.init(a, 2);
+    defer prepared.deinit();
+    try prepared.onSentAt(9, "old", 100);
+    const plan = try prepared.prepareSentAt(9, "replacement", 1099);
+    defer plan.deinit();
+    try plan.validate();
+    plan.commitRetainingMetadata();
+    try std.testing.expectEqualStrings("replacement", prepared.lookupFresh(9, 1099).?);
+    try std.testing.expect(prepared.lookupFresh(9, 1100) == null);
+    var copy = try prepared.capture(a, 4096);
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(i64, 100), copy.packets[0].sent_ms);
+    var unknown = RetransmitBuffer.init(a, 1);
+    defer unknown.deinit();
+    try unknown.onSentAt(3, "unknown", 0);
+    const unknown_plan = try unknown.prepareSentAt(3, "replacement", 1200);
+    defer unknown_plan.deinit();
+    try unknown_plan.validate();
+    unknown_plan.commitRetainingMetadata();
+    try std.testing.expect(unknown.lookupFresh(3, 1200) == null);
+}
+
+fn duplicateOrdinaryAllocationSweep(a: Allocator) !void {
+    var cache = RetransmitBuffer.init(a, 2);
+    defer cache.deinit();
+    try cache.onSentAt(9, "old", 100);
+    const original = cache.lookup(9).?;
+    const ptr = original.ptr;
+    cache.onSentAt(9, "replacement", 1099) catch |err| {
+        std.debug.assert(cache.lookup(9).?.ptr == ptr);
+        std.debug.assert(std.mem.eql(u8, cache.lookupFresh(9, 1099).?, "old"));
+        std.debug.assert(cache.lookupFresh(9, 1100) == null);
+        return err;
+    };
+    try std.testing.expectEqualStrings("replacement", cache.lookupFresh(9, 1099).?);
+    try std.testing.expect(cache.lookupFresh(9, 1100) == null);
+}
+test "retransmit ordinary duplicate allocation rollback preserves original lifetime" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, duplicateOrdinaryAllocationSweep, .{});
+}
+
+fn duplicatePerSsrcAllocationSweep(a: Allocator) !void {
+    var cache = PerSsrcRetransmitBuffer.init(a, 2, 2);
+    defer cache.deinit();
+    var packet: [13]u8 = @splat(0);
+    packet[0] = 0x80;
+    std.mem.writeInt(u16, packet[2..4], 9, .big);
+    std.mem.writeInt(u32, packet[8..12], 7, .big);
+    packet[12] = 'a';
+    const first = try cache.prepareSentAt(7, 9, &packet, 100);
+    defer first.deinit();
+    try first.validate();
+    first.commitRetainingMetadata();
+    const before = cache.observationDigest();
+    packet[12] = 'b';
+    const duplicate = cache.prepareSentAt(7, 9, &packet, 1099) catch |err| {
+        std.debug.assert(std.mem.eql(u8, &before, &cache.observationDigest()));
+        std.debug.assert(cache.lookupFresh(7, 9, 1099).?[12] == 'a');
+        return err;
+    };
+    defer duplicate.deinit();
+    try duplicate.validate();
+    duplicate.commitRetainingMetadata();
+    try std.testing.expectEqual(@as(u8, 'b'), cache.lookupFresh(7, 9, 1099).?[12]);
+    try std.testing.expect(cache.lookupFresh(7, 9, 1100) == null);
+    var snapshot = try cache.capture(a, 4096);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(i64, 100), snapshot.streams[0].cache.packets[0].sent_ms);
+    var restored = try PerSsrcRetransmitBuffer.prepareRestore(a, &snapshot, 2, 2, 4096);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u8, 'b'), restored.lookupFresh(7, 9, 1099).?[12]);
+    try std.testing.expect(restored.lookupFresh(7, 9, 1100) == null);
+}
+test "retransmit per-SSRC duplicate lifetime and all allocation cuts" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, duplicatePerSsrcAllocationSweep, .{});
 }

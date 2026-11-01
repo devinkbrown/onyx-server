@@ -494,7 +494,7 @@ pub const resources = struct {
         const b = coordinatorBacking(loan.owner);
         const p = &b.participants[loan.participant_slot];
         if (p.managed.plan_transaction != loan.transaction) return error.StaleTicket;
-        const role = p.managed.roles[@intFromEnum(purpose)] orelse return error.CapacityExceeded;
+        const role = p.managed.roles[@backingInt(purpose)] orelse return error.CapacityExceeded;
         const role_slot = try loan.owner.roleIndex(role);
         const origin = p.first_component + candidateHome(purpose);
         if (b.roles[role_slot].origin != origin) return error.StaleTicket;
@@ -546,7 +546,7 @@ pub const resources = struct {
         const found = home.probe(record.ptr.?) orelse return error.InvalidPlan;
         if (found.record != index % b.slots_per_home) return error.InvalidPlan;
         const logical = b.components[record.logical_owner];
-        const accounts = [_]usize{ 0, 1 + @as(usize, @intFromEnum(logical.category)), 3 + logical.row };
+        const accounts = [_]usize{ 0, 1 + @as(usize, @backingInt(logical.category)), 3 + logical.row };
         for (accounts) |account_index| {
             const totals = d.owner.account(account_index).totals;
             if ((if (record.state == .retiring) totals.retiring else totals.resident) < record.charge) return error.InvalidPlan;
@@ -650,7 +650,7 @@ pub const resources = struct {
             charge = try sum(charge, try capacityCharge(usize, bucket_count));
             charge = try sum(charge, try capacityCharge(OriginalSpan, allocation_count));
             const bootstrap: Totals = .{ .resident = charge };
-            if (!bootstrap.permits(profile.fleet) or !bootstrap.permits(profile.categories[@intFromEnum(Category.graph)]) or !bootstrap.permits(profile.infrastructure)) return error.CapacityExceeded;
+            if (!bootstrap.permits(profile.fleet) or !bootstrap.permits(profile.categories[@backingInt(Category.graph)]) or !bootstrap.permits(profile.infrastructure)) return error.CapacityExceeded;
             // All metadata has been priced before the first backend allocation.
             const self = try backend.create(CoordinatorBacking);
             errdefer backend.destroy(self);
@@ -885,7 +885,7 @@ pub const resources = struct {
                     if (@intFromPtr(old.ptr.?) + old.len > start) return error.InvalidPlan;
                 }
             }
-            const accounts = [_]usize{ 0, 1 + @as(usize, @intFromEnum(Category.graph)), 3 + spec.row.slot };
+            const accounts = [_]usize{ 0, 1 + @as(usize, @backingInt(Category.graph)), 3 + spec.row.slot };
             var final: [3]Totals = undefined;
             for (accounts, 0..) |account_index, i| {
                 const account_ = self.account(account_index);
@@ -960,7 +960,7 @@ pub const resources = struct {
             for (allowances.uses, 0..) |cap, i| {
                 if (cap.charge == 0 and cap.slots == 0) continue;
                 if (cap.charge == 0 or cap.slots == 0) return error.InvalidPlan;
-                const purpose: store.CandidateUse = @enumFromInt(i);
+                const purpose: store.CandidateUse = @fromBackingInt(@intCast(i));
                 const origin = self.componentId(p.first_component + candidateHome(purpose));
                 p.managed.roles[i] = try builder.addNewRole(.{ .origin = origin, .expected_origin_revision = b.components[origin.slot].revision, .label = @intCast(i), .kind = switch (purpose) {
                     .packet, .scratch_key => .{ .discard = .finish },
@@ -1115,7 +1115,7 @@ pub const resources = struct {
                     if (participant.managed.plan_transaction != coordinatorBacking(self).serial) return error.InvalidPlan;
                     for (participant.managed.roles, 0..) |maybe_role, use_index| if (maybe_role) |id| {
                         const role = coordinatorBacking(self).roles[try self.roleIndex(id)];
-                        const purpose: store.CandidateUse = @enumFromInt(use_index);
+                        const purpose: store.CandidateUse = @fromBackingInt(@intCast(use_index));
                         if (role.origin != participant.first_component + candidateHome(purpose)) return error.InvalidPlan;
                         const receiver = switch (purpose) {
                             .packet, .scratch_key => vacant,
@@ -1159,7 +1159,7 @@ pub const resources = struct {
                 std.debug.assert(coordinatorBacking(self).homes[index].live_new == 0 and coordinatorBacking(self).homes[index].active_transaction == 0);
                 const hold: Holds = .{ .preparation = entry.plan.new_capacity_peak, .wire = entry.plan.final_wire_addition_max };
                 try self.accumulate(0, hold);
-                try self.accumulate(1 + @as(usize, @intFromEnum(component.category)), hold);
+                try self.accumulate(1 + @as(usize, @backingInt(component.category)), hold);
                 try self.accumulate(3 + component.row, hold);
             }
             try self.accumulateRolePlacements();
@@ -1173,14 +1173,14 @@ pub const resources = struct {
                     .retire => {
                         const hold: Holds = .{ .old_retire = record.charge };
                         try self.accumulate(0, hold);
-                        try self.accumulate(1 + @as(usize, @intFromEnum(source.category)), hold);
+                        try self.accumulate(1 + @as(usize, @backingInt(source.category)), hold);
                         try self.accumulate(3 + source.row, hold);
                     },
                     .move => {
                         const receiver = coordinatorBacking(self).components[entry.receiver];
                         if (source.category != receiver.category) {
-                            try self.accumulate(1 + @as(usize, @intFromEnum(source.category)), .{ .outgoing = record.charge });
-                            try self.accumulate(1 + @as(usize, @intFromEnum(receiver.category)), .{ .incoming = record.charge });
+                            try self.accumulate(1 + @as(usize, @backingInt(source.category)), .{ .outgoing = record.charge });
+                            try self.accumulate(1 + @as(usize, @backingInt(receiver.category)), .{ .incoming = record.charge });
                         }
                         if (source.row != receiver.row) {
                             try self.accumulate(3 + source.row, .{ .outgoing = record.charge });
@@ -1241,7 +1241,7 @@ pub const resources = struct {
             for (coordinatorBacking(self).roles[0..coordinatorBacking(self).role_count]) |role| {
                 try self.validateRole(role);
                 const target = coordinatorBacking(self).components[if (role.receiver == vacant) role.origin else role.receiver];
-                const accounts = [_]usize{ 0, 1 + @as(usize, @intFromEnum(target.category)), 3 + target.row };
+                const accounts = [_]usize{ 0, 1 + @as(usize, @backingInt(target.category)), 3 + target.row };
                 for (accounts) |a| {
                     coordinatorBacking(self).role_contributions[count] = .{ .origin = role.origin, .account = a, .retain = if (role.receiver != vacant) role.plan.max_charge else 0, .discard = if (role.receiver == vacant) role.plan.max_charge else 0 };
                     count += 1;
@@ -1264,7 +1264,7 @@ pub const resources = struct {
                     retain = cappedAdd(retain, contributions[i].retain, plan.final_new_capacity_max);
                     discard = cappedAdd(discard, contributions[i].discard, plan.new_capacity_peak);
                 }
-                const inside = first.account == 0 or first.account == 1 + @as(usize, @intFromEnum(source.category)) or first.account == 3 + source.row;
+                const inside = first.account == 0 or first.account == 1 + @as(usize, @backingInt(source.category)) or first.account == 3 + source.row;
                 std.debug.assert(inside or discard == 0);
                 const publication = if (inside) cappedAdd(discard, retain, plan.new_capacity_peak) else retain;
                 try self.accumulate(first.account, .{ .resident = retain, .publication_new = publication });
@@ -1493,7 +1493,7 @@ pub const resources = struct {
         fn less(owner: *Coordinator, a: Entry, b: Entry) bool {
             const ca = coordinatorBacking(owner).components[a.index];
             const cb = coordinatorBacking(owner).components[b.index];
-            if (ca.category != cb.category) return @intFromEnum(ca.category) < @intFromEnum(cb.category);
+            if (ca.category != cb.category) return @backingInt(ca.category) < @backingInt(cb.category);
             if (coordinatorBacking(owner).rows[ca.row].id != coordinatorBacking(owner).rows[cb.row].id) return coordinatorBacking(owner).rows[ca.row].id < coordinatorBacking(owner).rows[cb.row].id;
             return ca.serial < cb.serial;
         }
@@ -2316,7 +2316,7 @@ fn fixtureResident(owner: *resources.Coordinator, origin: resources.ComponentId,
     std.debug.assert(fixtureCoordinator(owner).phase == .idle and len != 0 and home.free_count != 0);
     const charge = try resources.sum(len, alignment.toByteUnits() - 1);
     const component = fixtureCoordinator(owner).components[logical_index];
-    const accounts = [_]usize{ 0, 1 + @as(usize, @intFromEnum(component.category)), 3 + component.row };
+    const accounts = [_]usize{ 0, 1 + @as(usize, @backingInt(component.category)), 3 + component.row };
     for (accounts) |index| {
         var totals = owner.account(index).totals;
         totals.resident = try resources.sum(totals.resident, charge);
@@ -2355,7 +2355,7 @@ fn clearFixtureResidents(owner: *resources.Coordinator) void {
             home.live_total -= 1;
             home.free_count += 1;
             fixtureCoordinator(owner).fleet.totals.resident -= record.charge;
-            fixtureCoordinator(owner).categories[@intFromEnum(logical.category)].totals.resident -= record.charge;
+            fixtureCoordinator(owner).categories[@backingInt(logical.category)].totals.resident -= record.charge;
             fixtureCoordinator(owner).rows[logical.row].account.totals.resident -= record.charge;
         }
     }
@@ -3622,7 +3622,7 @@ test "physical Store S2 finite shared work and sparse absent table role retry" {
     try std.testing.expectEqualDeep(before, fixtureCoordinator(owner).fleet.totals);
     var sparse = storeTestAllowances();
     sparse.homes[5] = .{ .peak = 0, .final = 0, .slots = 0 };
-    sparse.uses[@intFromEnum(store.CandidateUse.table_backing)] = .{ .charge = 0, .slots = 0 };
+    sparse.uses[@backingInt(store.CandidateUse.table_backing)] = .{ .charge = 0, .slots = 0 };
     const tx = try storeTestFunding(owner, id, sparse);
     const loan = try tx.participantLoan(id);
     try std.testing.expectError(error.CapacityExceeded, resources.storeAllocationBinding(loan, .table_backing));
@@ -3868,9 +3868,9 @@ test "physical Store S2 owned inputs seven canonical uses and failed binding cus
         var uses: [7]bool = @splat(false);
         var index: usize = 0;
         while (try m.owner.?.inspectCandidateAllocation(c, index)) |a| : (index += 1) {
-            uses[@intFromEnum(a.use)] = true;
+            uses[@backingInt(a.use)] = true;
             const role = b.roles[a.role.slot];
-            try std.testing.expectEqual(m.roles[@intFromEnum(a.use)].?.serial, a.role.serial);
+            try std.testing.expectEqual(m.roles[@backingInt(a.use)].?.serial, a.role.serial);
             switch (a.use) {
                 .packet, .scratch_key => try std.testing.expectEqual(resources.FreePoint.finish, role.plan.kind.discard),
                 else => try std.testing.expectEqual(b.participants[id.slot].first_component, role.plan.kind.retain.slot),
@@ -3881,7 +3881,7 @@ test "physical Store S2 owned inputs seven canonical uses and failed binding cus
     }
     try std.testing.expectEqualDeep(totals, b.fleet.totals);
     var allowance = storeTestAllowances();
-    allowance.uses[@intFromEnum(store.CandidateUse.value)].charge = 1;
+    allowance.uses[@backingInt(store.CandidateUse.value)].charge = 1;
     {
         const tx = try storeTestFunding(owner, id, allowance);
         defer tx.abort() catch unreachable;

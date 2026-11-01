@@ -49,9 +49,9 @@ pub const Kind = enum(u8) {
 
 fn kindFromRaw(raw: u8) ?Kind {
     return switch (raw) {
-        @intFromEnum(Kind.speak) => .speak,
-        @intFromEnum(Kind.webhook) => .webhook,
-        @intFromEnum(Kind.history) => .history,
+        @backingInt(Kind.speak) => .speak,
+        @backingInt(Kind.webhook) => .webhook,
+        @backingInt(Kind.history) => .history,
         else => null,
     };
 }
@@ -310,7 +310,7 @@ pub fn encodeFrom(allocator: std.mem.Allocator, table: *const Table, now_ms: u64
         if (grant_count == max_grants) return error.TooMany;
         if (!table.isBot(slot.accountSlice())) return error.InvalidGrant;
         try appendShortSlice(&out, allocator, slot.accountSlice(), max_account);
-        try out.append(allocator, @intFromEnum(slot.kind));
+        try out.append(allocator, @backingInt(slot.kind));
         try appendShortSlice(&out, allocator, slot.scopeSlice(), max_scope);
         try appendInt(&out, allocator, u64, slot.expiry_ms);
         grant_count += 1;

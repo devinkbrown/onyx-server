@@ -308,3 +308,96 @@ test "rendered lines never contain carriage returns from input" {
     try std.testing.expect(std.mem.indexOf(u8, out, "badname") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hostname") != null);
 }
+
+/// Immutable borrowed view of a reactor-0 publication. Its owner must retain
+/// names until rendering completes; no pointers into a reactor's clients.
+/// Unknown means no trustworthy observation, not zero or healthy.
+pub const Status = struct {
+    pub const max_peers = 256;
+    pub const max_name_bytes = 255;
+    pub const Freshness = enum { unknown, current, stale };
+    pub const Security = enum { unknown, plaintext, secured };
+    pub const Capability = enum { unknown, unavailable, available };
+    pub const Readiness = enum { unknown, degraded, ready };
+    pub const Peer = struct {
+        name: []const u8,
+        state: PeerState,
+        security: Security = .unknown,
+        session_group_v4: Capability = .unknown,
+        session_replica_v2: Capability = .unknown,
+        session_attachment_lease_v2: Capability = .unknown,
+    };
+    freshness: Freshness = .unknown,
+    tcp_active: ?u64 = null,
+    established: ?u64 = null,
+    secured: ?u64 = null,
+    plaintext: ?u64 = null,
+    peers_up: ?u64 = null,
+    peers_total: ?u64 = null,
+    partitioned: ?bool = null,
+    quorum: ?bool = null,
+    components: ?u64 = null,
+    service_readiness: Readiness = .unknown,
+    peers: []const Peer = &.{},
+};
+
+fn writeCount(w: anytype, name: []const u8, value: ?u64) !void {
+    try w.print(" {s}=", .{name});
+    if (value) |v| try w.print("{d}", .{v}) else try w.writeAll("unknown");
+}
+fn writeFlag(w: anytype, name: []const u8, value: ?bool) !void {
+    try w.print(" {s}=", .{name});
+    if (value) |v| try w.writeAll(if (v) "yes" else "no") else try w.writeAll("unknown");
+}
+
+/// A bounded, operator-only presentation. A caller must mark incomplete or
+/// aged publications stale/unknown and never infer security from links_active.
+pub fn renderStatus(status: Status, w: anytype) !void {
+    if (status.peers.len > Status.max_peers) return error.TooManyPeers;
+    for (status.peers) |peer| if (peer.name.len > Status.max_name_bytes) return error.NameTooLong;
+    try w.print("mesh status freshness={s}", .{@tagName(status.freshness)});
+    try writeCount(w, "tcp", status.tcp_active);
+    try writeCount(w, "established", status.established);
+    try writeCount(w, "secured", status.secured);
+    try writeCount(w, "plaintext", status.plaintext);
+    try w.writeByte('\n');
+    try w.writeAll("mesh health");
+    try writeCount(w, "peers_up", status.peers_up);
+    try writeCount(w, "peers_total", status.peers_total);
+    try writeFlag(w, "partitioned", status.partitioned);
+    try writeFlag(w, "quorum", status.quorum);
+    try writeCount(w, "components", status.components);
+    try w.print(" service_readiness={s}\n", .{@tagName(status.service_readiness)});
+    for (status.peers) |peer| {
+        try w.writeAll("mesh peer name=");
+        for (peer.name) |c| try w.writeByte(if (c >= 33 and c <= 126 and c != '=') c else '?');
+        try w.print(" state={s} security={s} session_group_v4={s} session_replica_v2={s} session_attachment_lease_v2={s}\n", .{ peerStateWord(peer.state), @tagName(peer.security), @tagName(peer.session_group_v4), @tagName(peer.session_replica_v2), @tagName(peer.session_attachment_lease_v2) });
+    }
+}
+
+test "bounded mesh status separates transport security and unknown observations" {
+    const peers = [_]Status.Peer{
+        .{ .name = "tcp", .state = .handshaking },
+        .{ .name = "plain", .state = .established, .security = .plaintext, .session_replica_v2 = .unavailable },
+        .{ .name = "secure", .state = .established, .security = .secured, .session_replica_v2 = .available },
+    };
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderStatus(.{ .freshness = .stale, .tcp_active = 3, .established = 2, .plaintext = 1, .secured = 1, .partitioned = true, .quorum = false, .service_readiness = .degraded, .peers = &peers }, &w);
+    const out = w.buffered();
+    for ([_][]const u8{ "freshness=stale", "tcp=3 established=2 secured=1 plaintext=1", "peers_up=unknown", "partitioned=yes quorum=no components=unknown", "service_readiness=degraded", "state=handshaking security=unknown session_group_v4=unknown session_replica_v2=unknown", "security=plaintext session_group_v4=unknown session_replica_v2=unavailable", "security=secured session_group_v4=unknown session_replica_v2=available" }) |expected| try std.testing.expect(std.mem.indexOf(u8, out, expected) != null);
+    var empty: [512]u8 = undefined;
+    var ew = std.Io.Writer.fixed(&empty);
+    try renderStatus(.{}, &ew);
+    try std.testing.expect(std.mem.indexOf(u8, ew.buffered(), "tcp=unknown established=unknown secured=unknown plaintext=unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ew.buffered(), "quorum=unknown") != null);
+}
+
+test "mesh status rejects overlong inputs before writing" {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    const name: [Status.max_name_bytes + 1]u8 = @splat('a');
+    const peer = [_]Status.Peer{.{ .name = &name, .state = .down }};
+    try std.testing.expectError(error.NameTooLong, renderStatus(.{ .peers = &peer }, &w));
+    try std.testing.expectEqual(@as(usize, 0), w.buffered().len);
+}

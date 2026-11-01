@@ -244,7 +244,7 @@ pub fn encode(
         writer.writeU16(@intCast(r.account.len));
         writer.writeU16(@intCast(r.vhost.len));
         writer.writeU16(@intCast(r.reason.len));
-        writer.writeByte(@intFromEnum(r.status));
+        writer.writeByte(@backingInt(r.status));
         writer.writeI64(r.requested_ms);
         writer.writeI64(r.decided_ms);
         writer.writeBytes(r.account);

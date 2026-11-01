@@ -99,7 +99,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
                     var found = false;
                     for (self.plane.session.participants[0..self.plane.session.len]) |row| {
                         if (row.id.eql(&entry.id)) {
-                            if (row.joined.bits != @as(u8, 1) << @intCast(@intFromEnum(entry.kind))) return error.InvalidSnapshot;
+                            if (row.joined.bits != @as(u8, 1) << @intCast(@backingInt(entry.kind))) return error.InvalidSnapshot;
                             found = true;
                             break;
                         }

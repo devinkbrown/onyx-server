@@ -314,7 +314,7 @@ pub const Server = struct {
         const desc = tls_server.alertDescriptionForError(err) orelse return null;
         self.alert_taken = true;
         self.read_failed = true;
-        const body = [_]u8{ @intFromEnum(tls_server.AlertLevel.fatal), @intFromEnum(desc) };
+        const body = [_]u8{ @backingInt(tls_server.AlertLevel.fatal), @backingInt(desc) };
         switch (self.state) {
             .wait_resumed_client_ccs, .wait_resumed_client_finished => {
                 const suite = self.selected_suite orelse return null;
@@ -672,7 +672,7 @@ pub const Server = struct {
         if (self.read_failed or self.app_write_active != null or self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
         const st: ResumeState = .{
-            .suite = @intFromEnum(suite),
+            .suite = @backingInt(suite),
             .keys = self.keys,
             .app_read_seq = self.app_read_seq,
             .app_write_seq = self.app_write_seq,
@@ -858,7 +858,7 @@ pub const Server = struct {
         try sh_body.appendSlice(self.allocator, &self.server_random);
         try sh_body.append(self.allocator, @intCast(self.session_id_len));
         try sh_body.appendSlice(self.allocator, self.session_id[0..self.session_id_len]);
-        try appendU16(self.allocator, &sh_body, @intFromEnum(self.selected_suite orelse return error.BadState));
+        try appendU16(self.allocator, &sh_body, @backingInt(self.selected_suite orelse return error.BadState));
         try sh_body.append(self.allocator, 0);
         var exts: std.ArrayList(u8) = .empty;
         defer exts.deinit(self.allocator);
@@ -1139,7 +1139,7 @@ pub const Server = struct {
             self.allocator,
             key,
             aead_nonce,
-            @intFromEnum(suite),
+            @backingInt(suite),
             &self.master_secret,
             &ticket_nonce,
             self.config.now_unix_seconds * 1000,
@@ -1257,7 +1257,7 @@ pub const Server = struct {
         try sh_body.appendSlice(self.allocator, &self.server_random);
         try sh_body.append(self.allocator, @intCast(self.session_id_len));
         try sh_body.appendSlice(self.allocator, self.session_id[0..self.session_id_len]);
-        try appendU16(self.allocator, &sh_body, @intFromEnum(suite));
+        try appendU16(self.allocator, &sh_body, @backingInt(suite));
         try sh_body.append(self.allocator, 0);
         var exts: std.ArrayList(u8) = .empty;
         defer exts.deinit(self.allocator);
@@ -1361,7 +1361,7 @@ fn writeExtension(allocator: Allocator, out: *std.ArrayList(u8), typ: u16, body:
 }
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: tls12.HandshakeType, body: []const u8) Error!void {
-    try out.append(allocator, @intFromEnum(typ));
+    try out.append(allocator, @backingInt(typ));
     try appendU24(allocator, out, @intCast(body.len));
     try out.appendSlice(allocator, body);
 }
@@ -1401,7 +1401,7 @@ fn parseHandshake(bytes: []const u8, off: *usize) Error!HandshakeMsg {
     if (bytes.len - start < 4 + len) return error.BadHandshake;
     off.* = start + 4 + len;
     return .{
-        .typ = @enumFromInt(bytes[start]),
+        .typ = @fromBackingInt(@intCast(bytes[start])),
         .body = bytes[start + 4 .. start + 4 + len],
         .raw = bytes[start .. start + 4 + len],
     };
@@ -1466,7 +1466,7 @@ fn appendU32(allocator: Allocator, out: *std.ArrayList(u8), v: u32) Allocator.Er
 /// True when the raw offered cipher-suite octets (u16 big-endian, back to back)
 /// include `suite`.
 fn clientOfferedSuite(offered: []const u8, suite: tls12.CipherSuite) bool {
-    const want = @intFromEnum(suite);
+    const want = @backingInt(suite);
     var i: usize = 0;
     while (i + 2 <= offered.len) : (i += 2) {
         const v = (@as(u16, offered[i]) << 8) | offered[i + 1];
@@ -1782,7 +1782,7 @@ test "TLS 1.2 ServerHello.random carries the RFC 8446 downgrade sentinel" {
     // the final 8 bytes of that random.
     const rec = (try tls12.completeRecord(flight)) orelse return error.TestUnexpectedResult;
     if (rec.content_type != .handshake) return error.TestUnexpectedResult;
-    if (rec.fragment.len < 38 or rec.fragment[0] != @intFromEnum(tls12.HandshakeType.server_hello)) {
+    if (rec.fragment.len < 38 or rec.fragment[0] != @backingInt(tls12.HandshakeType.server_hello)) {
         return error.TestUnexpectedResult;
     }
     const sh_random = rec.fragment[6..38];
@@ -2498,10 +2498,10 @@ test "TLS 1.2 takeAlert emits a PLAINTEXT fatal alert before the server ChangeCi
         defer allocator.free(rec);
         // [content_type=21][03 03][len=0x0002][level=fatal(2)][desc=protocol_version(70)]
         try std.testing.expectEqual(@as(usize, 7), rec.len);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls12.ContentType.alert)), rec[0]);
         try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, rec[3..5], .big));
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertDescription.protocol_version)), rec[6]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertLevel.fatal)), rec[5]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertDescription.protocol_version)), rec[6]);
 
         // OutOfMemory maps to no description ⇒ no alert.
         try std.testing.expect(server.takeAlert(error.OutOfMemory) == null);
@@ -2531,9 +2531,9 @@ test "TLS 1.2 takeAlert emits a PLAINTEXT fatal alert before the server ChangeCi
 
         const rec = server.takeAlert(error.BadHandshake) orelse return error.BadHandshake;
         defer allocator.free(rec);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertDescription.decode_error)), rec[6]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls12.ContentType.alert)), rec[0]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertLevel.fatal)), rec[5]);
+        try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertDescription.decode_error)), rec[6]);
         // No write seq consumed on the plaintext path.
         try std.testing.expectEqual(@as(u64, 0), server.hs_write_seq);
     }
@@ -2588,15 +2588,15 @@ test "TLS 1.2 takeAlert seals an ENCRYPTED fatal alert after the resumed server 
     // The nonce/seq is consumed so it can never be reused.
     try std.testing.expectEqual(@as(u64, 2), server.hs_write_seq);
     // TLS 1.2 does not hide the content type: the OUTER record is alert (21).
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls12.ContentType.alert)), rec[0]);
     // It decrypts under the server write keys at the seq used (1), to
     // [fatal(2)][decrypt_error(51)].
     const opened = try tls12.openRecordAlloc(allocator, suite, &server.keys.server_write, 1, rec);
     defer allocator.free(opened.plaintext);
     try std.testing.expectEqual(tls12.ContentType.alert, opened.content_type);
     try std.testing.expectEqualSlices(u8, &.{
-        @intFromEnum(tls_server.AlertLevel.fatal),
-        @intFromEnum(tls_server.AlertDescription.decrypt_error),
+        @backingInt(tls_server.AlertLevel.fatal),
+        @backingInt(tls_server.AlertDescription.decrypt_error),
     }, opened.plaintext);
 }
 
@@ -3028,8 +3028,8 @@ test "tls12 EMS required: a legacy ClientHello without the extension is rejected
     // The refusal maps to a fatal handshake_failure(40) plaintext alert.
     const rec = server.takeAlert(error.EmsRequired) orelse return error.BadHandshake;
     defer allocator.free(rec);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls12.ContentType.alert)), rec[0]);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls_server.AlertLevel.fatal)), rec[5]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls12.ContentType.alert)), rec[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls_server.AlertLevel.fatal)), rec[5]);
     try std.testing.expectEqual(@as(u8, 40), rec[6]);
 }
 
@@ -3320,13 +3320,13 @@ test "tls12 EMS ticket binding: non-EMS sessions get no ticket and a non-EMS res
 /// message (type 11). Used to distinguish full (Certificate present) from
 /// abbreviated (no Certificate) handshakes by inspecting the wire.
 fn serverHelloFlightHasCertificate(flight: []const u8) bool {
-    return handshakeFlightContainsType(flight, @intFromEnum(tls12.HandshakeType.certificate));
+    return handshakeFlightContainsType(flight, @backingInt(tls12.HandshakeType.certificate));
 }
 
 /// True when the server's final plaintext flight contains a NewSessionTicket
 /// handshake message (type 4) before the CCS.
 fn finalFlightHasNewSessionTicket(flight: []const u8) bool {
-    return handshakeFlightContainsType(flight, @intFromEnum(tls12.HandshakeType.new_session_ticket));
+    return handshakeFlightContainsType(flight, @backingInt(tls12.HandshakeType.new_session_ticket));
 }
 
 /// Walk the TLS records in a plaintext flight and report whether any PLAINTEXT
@@ -3340,8 +3340,8 @@ fn handshakeFlightContainsType(flight: []const u8, want_type: u8) bool {
         const len = (@as(usize, flight[i + 3]) << 8) | flight[i + 4];
         const body_start = i + 5;
         if (body_start + len > flight.len) return false;
-        if (ct == @intFromEnum(tls12.ContentType.change_cipher_spec)) return false;
-        if (ct == @intFromEnum(tls12.ContentType.handshake)) {
+        if (ct == @backingInt(tls12.ContentType.change_cipher_spec)) return false;
+        if (ct == @backingInt(tls12.ContentType.handshake)) {
             var off = body_start;
             while (off + 4 <= body_start + len) {
                 const mt = flight[off];

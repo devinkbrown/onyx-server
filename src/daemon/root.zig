@@ -99,6 +99,9 @@ pub const module_bus = @import("module_bus.zig");
 pub const module_core = @import("module_core.zig");
 pub const module_harness = @import("module_harness.zig");
 pub const module_lifecycle = @import("module_lifecycle.zig");
+pub const module_runtime = @import("module_runtime.zig");
+pub const diagnostics = @import("diagnostics.zig");
+pub const linux_webtransport_helix = @import("linux_webtransport_helix.zig");
 pub const native_media_link = @import("native_media_link.zig");
 pub const native_media_transport = @import("native_media_transport.zig");
 pub const netsplit_batch = @import("netsplit_batch.zig");
@@ -148,6 +151,9 @@ pub const server_stats = @import("server_stats.zig");
 pub const server = @import("server.zig");
 pub const services = @import("services.zig");
 pub const session_drop_tx = @import("session_drop_tx.zig");
+pub const session_group_revoke_durable = @import("session_group_revoke_durable.zig");
+pub const session_group_retired_policy = @import("session_group_retired_policy.zig");
+pub const session_retirement_baseline = @import("session_retirement_baseline.zig");
 pub const session_sid = @import("session_sid.zig");
 pub const sessions = @import("sessions.zig");
 pub const sfu_srtp = @import("sfu_srtp.zig");
@@ -216,6 +222,7 @@ pub const configured_runtime = @import("configured_runtime.zig");
 /// Leased local signed-event journal prerequisite; production binding remains open.
 pub const delivery_authority = @import("delivery_authority.zig");
 pub const doctor = @import("doctor.zig");
+pub const service_environment = @import("service_environment.zig");
 pub const backup_set = @import("backup_set.zig");
 pub const gap_holds = @import("gap_holds.zig");
 
@@ -466,6 +473,7 @@ test {
     _ = dnsbl_resolver;
     _ = dnsbl;
     _ = doctor;
+    _ = service_environment;
     _ = dualstack_udp;
     _ = durable_credential_props_boot;
     _ = durable_credential_props;
@@ -526,6 +534,9 @@ test {
     _ = module_core;
     _ = module_harness;
     _ = module_lifecycle;
+    _ = module_runtime;
+    _ = diagnostics;
+    _ = linux_webtransport_helix;
     _ = native_media_link;
     _ = native_media_transport;
     _ = native_network;
@@ -584,6 +595,9 @@ test {
     _ = server;
     _ = services;
     _ = session_drop_tx;
+    _ = session_group_revoke_durable;
+    _ = session_group_retired_policy;
+    _ = session_retirement_baseline;
     _ = session_sid;
     _ = sessions;
     _ = sfu_srtp;
@@ -801,4 +815,22 @@ test "S6C6 external import cannot reach runtime privilege surface" {
 
 test {
     _ = delivery_authority;
+}
+
+// Private unadvertised guest owner discovery.
+pub const guest_presence_owner = @import("guest_presence_owner.zig");
+test {
+    _ = guest_presence_owner;
+}
+
+// Private independent guest owner fault campaign.
+pub const guest_presence_owner_fault_test = @import("guest_presence_owner_fault_test.zig");
+test {
+    _ = guest_presence_owner_fault_test;
+}
+
+// Private execution-wave local binding discovery.
+pub const local_guest_binding = @import("local_guest_binding.zig");
+test {
+    _ = local_guest_binding;
 }

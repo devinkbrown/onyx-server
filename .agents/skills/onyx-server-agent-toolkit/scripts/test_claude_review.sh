@@ -5,7 +5,8 @@ set -euo pipefail
 project_root="$(git rev-parse --show-toplevel)"
 launcher="$project_root/tools/claude-review.sh"
 stub="$project_root/.agents/skills/onyx-server-agent-toolkit/scripts/claude_review_stub.py"
-test_root="$(mktemp -d /tmp/onyx-claude-review-test.XXXXXX)"
+review_tmp_base="$(cd -- "${TMPDIR:-/tmp}" && pwd -P)"
+test_root="$(mktemp -d "$review_tmp_base/onyx-claude-review-test.XXXXXX")"
 cleanup() {
   rm -rf -- "$test_root"
 }
@@ -85,7 +86,13 @@ if grep -F 'OUTSIDE_AGENT_SENTINEL_BYTES' "$test_root/observed" >/dev/null; then
   echo "reviewer observed transient agent-definition symlink target" >&2
   exit 1
 fi
-grep -E '^cwd=/tmp/onyx-claude-snapshot\.' "$test_root/observed" >/dev/null
+grep -F "cwd=$review_tmp_base/onyx-claude-snapshot." "$test_root/observed" >/dev/null
+[ "$(grep -c '^cwd=' "$test_root/observed")" -eq 1 ]
+review_snapshot="$(sed -n 's/^cwd=//p' "$test_root/observed")"
+if [ -e "$review_snapshot" ] || [ -L "$review_snapshot" ]; then
+  echo "review snapshot survived launcher cleanup" >&2
+  exit 1
+fi
 
 set +e
 (

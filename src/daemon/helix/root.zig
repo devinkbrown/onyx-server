@@ -12,6 +12,10 @@ pub const handoff = @import("handoff.zig");
 pub const live = @import("live.zig");
 pub const handoff_manifest = @import("handoff_manifest.zig");
 pub const handoff_relations = @import("handoff_relations.zig");
+pub const physical_connection_relation = @import("physical_connection_relation.zig");
+pub const socket_owner_identity = @import("socket_owner_identity.zig");
+pub const remote_presentation_snapshot = @import("remote_presentation_snapshot.zig");
+pub const linux_webtransport_checkpoint = @import("linux_webtransport_checkpoint.zig");
 pub const supervisor = @import("supervisor.zig");
 pub const conduit = @import("conduit.zig");
 pub const native_arena_envelope = @import("native_arena_envelope.zig");
@@ -121,6 +125,9 @@ pub const session_adopt_dst = @import("session_adopt_dst.zig");
 pub const multishard_upgrade_dst = @import("multishard_upgrade_dst.zig");
 
 test {
+    _ = physical_connection_relation;
+    _ = socket_owner_identity;
+    _ = remote_presentation_snapshot;
     _ = native_arena_envelope;
     _ = native_arena_file;
     _ = native_control;
@@ -185,16 +192,22 @@ test "section 10 drops unused memo away and ratelimit codecs" {
     try std.testing.expect(@hasDecl(@This(), "ban_capsule"));
     try std.testing.expect(@hasDecl(@This(), "silence_capsule"));
 
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(capsule.CapsuleKind.clients));
-    try std.testing.expectEqual(@as(u8, 17), @intFromEnum(capsule.CapsuleKind.handoff_manifest));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(capsule.CapsuleKind.clients));
+    try std.testing.expectEqual(@as(u8, 17), @backingInt(capsule.CapsuleKind.handoff_manifest));
     try std.testing.expectEqual(capsule.CapsuleKind.handoff_manifest, try capsule.CapsuleKind.fromByte(17));
-    try std.testing.expectEqual(@as(u8, 18), @intFromEnum(capsule.CapsuleKind.native_service));
+    try std.testing.expectEqual(@as(u8, 18), @backingInt(capsule.CapsuleKind.native_service));
     try std.testing.expectEqual(capsule.CapsuleKind.native_service, try capsule.CapsuleKind.fromByte(18));
-    try std.testing.expectError(error.UnknownKind, capsule.CapsuleKind.fromByte(19));
-    try std.testing.expectEqual(@as(usize, 18), @typeInfo(capsule.CapsuleKind).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(u8, 19), @backingInt(capsule.CapsuleKind.physical_connection_relation));
+    try std.testing.expectEqual(capsule.CapsuleKind.physical_connection_relation, try capsule.CapsuleKind.fromByte(19));
+    try std.testing.expectEqual(@as(u8, 20), @backingInt(capsule.CapsuleKind.local_guest_issuer));
+    try std.testing.expectEqual(capsule.CapsuleKind.local_guest_issuer, try capsule.CapsuleKind.fromByte(20));
+    try std.testing.expectError(error.UnknownKind, capsule.CapsuleKind.fromByte(22));
+    try std.testing.expectEqual(@as(u8, 21), @backingInt(capsule.CapsuleKind.host_presentation));
+    try std.testing.expectEqual(capsule.CapsuleKind.host_presentation, try capsule.CapsuleKind.fromByte(21));
+    try std.testing.expectEqual(@as(usize, 21), @typeInfo(capsule.CapsuleKind).@"enum".field_names.len);
 
     std.debug.print(
-        "section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind 1 through 18 includes strict native service; ban_capsule stays\n",
+        "section 10 branch=stop maintaining memo_capsule away_capsule and ratelimit_capsule; CapsuleKind 1 through 21 includes strict physical ownership, issuer custody and host intent; ban_capsule stays\n",
         .{},
     );
 }

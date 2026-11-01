@@ -3,6 +3,19 @@
 
 //! Onyx Server entry point (M1: Ringlane TCP server).
 const std = @import("std");
+const setup = @import("setup.zig");
+const setup_bundle = @import("setup_bundle.zig");
+const setup_material_review = @import("setup_material_review.zig");
+const setup_secret = @import("setup_secret.zig");
+const session_retirement_cli = @import("session_retirement_cli.zig");
+const cloak_audit_cli = onyx_server.cloak_audit_cli;
+
+test {
+    _ = setup;
+    _ = setup_secret;
+    _ = session_retirement_cli;
+}
+
 const builtin = @import("builtin");
 const onyx_server = @import("onyx_server");
 const delegated_credential_cli = onyx_server.daemon.delegated_credential_cli;
@@ -17,6 +30,63 @@ const windows_tls_material = onyx_server.daemon.helix.native_windows_tls_materia
 const windows_history_material = onyx_server.daemon.helix.native_windows_history.material;
 const native_service = onyx_server.daemon.native_service;
 const service_helper = onyx_server.daemon.native_service_helper;
+
+const ConfiguredCloakKeys = struct {
+    current: ?onyx_server.proto.cloak.SecretKey = null,
+    previous: ?onyx_server.proto.cloak.SecretKey = null,
+};
+
+/// Publish configured keys together: failure must never select a random key or
+/// silently discard requested previous-key continuity.
+fn deriveConfiguredCloakKeys(
+    allocator: std.mem.Allocator,
+    secret: ?[]const u8,
+    previous_secret: ?[]const u8,
+    comptime derive: anytype,
+) !ConfiguredCloakKeys {
+    var keys: ConfiguredCloakKeys = .{};
+    errdefer if (keys.current) |*key| key.wipe();
+    var bytes: [onyx_server.proto.cloak.key_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &bytes);
+    if (secret) |value| {
+        try derive(allocator, &bytes, value, onyx_server.crypto.argon2_kdf.cloak_key_salt, onyx_server.crypto.argon2_kdf.default_params);
+        keys.current = onyx_server.proto.cloak.SecretKey.init(bytes);
+    }
+    if (previous_secret) |value| {
+        try derive(allocator, &bytes, value, onyx_server.crypto.argon2_kdf.cloak_key_salt, onyx_server.crypto.argon2_kdf.default_params);
+        keys.previous = onyx_server.proto.cloak.SecretKey.init(bytes);
+    }
+    return keys;
+}
+
+test "cloak boot: configured primary KDF allocation failure aborts" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, deriveConfiguredCloakKeys(failing.allocator(), "configured-secret", null, onyx_server.crypto.argon2_kdf.deriveKey));
+}
+
+test "cloak boot: previous KDF failure cannot publish partially derived keys" {
+    const Derivation = struct {
+        fn run(_: std.mem.Allocator, out: []u8, secret: []const u8, _: []const u8, _: onyx_server.crypto.argon2_kdf.Params) error{OutOfMemory}!void {
+            if (std.mem.eql(u8, secret, "fail-previous")) return error.OutOfMemory;
+            @memset(out, 0x57);
+        }
+    };
+    try std.testing.expectError(error.OutOfMemory, deriveConfiguredCloakKeys(std.testing.allocator, "current", "fail-previous", Derivation.run));
+    var keys = try deriveConfiguredCloakKeys(std.testing.allocator, "current", "previous", Derivation.run);
+    defer keys.current.?.wipe();
+    defer keys.previous.?.wipe();
+    try std.testing.expect(keys.current != null and keys.previous != null);
+}
+
+test "cloak boot: absent secrets retain the no-secret random-key path" {
+    const ForbiddenDerivation = struct {
+        fn run(_: std.mem.Allocator, _: []u8, _: []const u8, _: []const u8, _: onyx_server.crypto.argon2_kdf.Params) error{UnexpectedDerivation}!void {
+            return error.UnexpectedDerivation;
+        }
+    };
+    const keys = try deriveConfiguredCloakKeys(std.testing.allocator, null, null, ForbiddenDerivation.run);
+    try std.testing.expect(keys.current == null and keys.previous == null);
+}
 
 /// Own the original PEM decode container as well as every DER allocation.
 /// Companion workers borrow items until their stop/join completes; main keeps
@@ -429,6 +499,8 @@ const ResolverCtx = struct {
     record_paths: bool = true,
     managed_commitment: ?*ManagedConfigCommitment = null,
     windows_helix_proof: ?*windows_config_proof.Builder = null,
+    env_collector: ?*onyx_server.daemon.helix.live.ConfigEnvCollector = null,
+    env_collector_failed: bool = false,
 
     fn deinit(self: *ResolverCtx) void {
         for (self.file_paths.items) |path| self.path_allocator.free(path);
@@ -444,7 +516,38 @@ fn envLookup(ctx: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) a
     const value = rc.environ_map.get(name) orelse return error.EnvironmentVariableNotFound;
     if (rc.managed_commitment) |commitment| commitment.record(2, name, value);
     if (rc.windows_helix_proof) |proof| try proof.recordEnvironment(name, value);
+    if (rc.env_collector) |collector| collector.record(name, value) catch |err| {
+        rc.env_collector_failed = true;
+        return err;
+    };
     return allocator.dupe(u8, value);
+}
+
+test "ordinary Linux boot captures only resolved environment for Helix" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var map = std.process.Environ.Map.init(a);
+    defer map.deinit();
+    try map.put("NETWORK_NAME", "private-network");
+    try map.put("UNUSED_VALUE", "not-carried");
+    var collector = onyx_server.daemon.helix.live.ConfigEnvCollector.init(a);
+    defer collector.deinit();
+    var ctx = ResolverCtx{ .environ_map = &map, .io = std.testing.io, .path_allocator = a, .env_collector = &collector };
+    defer ctx.deinit();
+    const resolver = onyx_server.daemon.config_format.Resolver{ .ctx = &ctx, .env = envLookup, .file = fileLookup };
+    var loaded = try onyx_server.daemon.config_boot.loadFromTextQuiet(a, "[node]\nid=1\n[network]\nname=\"env:NETWORK_NAME\"\n[admin]\nemail=\"env:NETWORK_NAME\"\n[listen]\nirc=6680\ns2s=0\n", .{ .port = 6680 }, resolver);
+    defer loaded.deinit(a);
+    ctx.env_collector = null;
+    try std.testing.expect(!ctx.env_collector_failed);
+    try std.testing.expectEqual(@as(usize, 1), collector.view().len);
+    try std.testing.expectEqualStrings("NETWORK_NAME", collector.view()[0].name);
+    try std.testing.expectEqualStrings("private-network", collector.view()[0].value);
+    try map.put("NETWORK_NAME", "changed-after-parse");
+    const policy = onyx_server.daemon.helix.live.BootPolicy{ .config_env = collector.view() };
+    var plan = try onyx_server.daemon.helix.live.buildListenerExecPlanWithBootPolicy(a, "/onyx-server", 12, "/config", policy);
+    defer plan.deinit(a);
+    try std.testing.expectEqualStrings("NETWORK_NAME=private-network", plan.envp[1]);
+    try std.testing.expectEqual(@as(usize, 2), plan.envp.len);
 }
 
 /// `@file:path` resolver for the config parser — loads the file's contents
@@ -668,7 +771,7 @@ test "managed boot: parsed preflight refuses mesh policy without creating state"
     try std.testing.expectError(mesh_error, validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml"));
     loaded.parsed.listen.s2s = 0;
     loaded.tls.ktls = .txrx;
-    try std.testing.expectError(error.InvalidManagedIoPolicy, validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml"));
+    try validateManagedBootPlan(std.testing.allocator, std.testing.io, &loaded, "/not-created/onyx-server.toml");
 }
 
 test "managed boot: configured invalid node key refuses before cold mutation" {
@@ -840,6 +943,700 @@ fn initPrivateDirectoryWindows(io: std.Io, path: []const u8) !void {
     private.close(io);
 }
 
+const DoctorOptions = struct {
+    config: []const u8,
+    metrics_url: ?[]const u8 = null,
+    peer_config: ?[]const u8 = null,
+    json: bool = false,
+};
+
+fn parseDoctorArgs(args: []const []const u8) error{InvalidArguments}!DoctorOptions {
+    if (args.len == 0 or args[0].len == 0 or args[0][0] == '-') return error.InvalidArguments;
+    var opts = DoctorOptions{ .config = args[0] };
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--json") and !opts.json) {
+            opts.json = true;
+        } else if (std.mem.eql(u8, arg, "--peer-config") and opts.peer_config == null) {
+            i += 1;
+            if (i == args.len or args[i].len == 0 or args[i][0] == '-') return error.InvalidArguments;
+            opts.peer_config = args[i];
+        } else if (arg.len > 0 and arg[0] != '-' and opts.metrics_url == null) {
+            opts.metrics_url = arg;
+        } else return error.InvalidArguments;
+    }
+    // This offline comparison does not fetch or assert peer runtime metrics.
+    if (opts.peer_config != null and opts.metrics_url != null) return error.InvalidArguments;
+    return opts;
+}
+
+test "doctor CLI accepts JSON and one metrics URL and rejects ambiguity" {
+    const opts = try parseDoctorArgs(&.{ "config.toml", "--json", "http://127.0.0.1:9130/metrics" });
+    try std.testing.expect(opts.json);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9130/metrics", opts.metrics_url.?);
+    const peer = try parseDoctorArgs(&.{ "config.toml", "--peer-config", "peer.toml", "--json" });
+    try std.testing.expectEqualStrings("peer.toml", peer.peer_config.?);
+    try std.testing.expect(peer.json and peer.metrics_url == null);
+    for ([_][]const []const u8{ &.{ "config", "--peer-config" }, &.{ "config", "--peer-config", "--json" }, &.{ "config", "--peer-config", "a", "--peer-config", "b" }, &.{ "config", "--peer-config", "a", "url" } }) |args| try std.testing.expectError(error.InvalidArguments, parseDoctorArgs(args));
+    for ([_][]const []const u8{ &.{}, &.{"--json"}, &.{ "config", "--json", "--json" }, &.{ "config", "--unknown" }, &.{ "config", "url", "url2" } }) |args| {
+        try std.testing.expectError(error.InvalidArguments, parseDoctorArgs(args));
+    }
+}
+
+fn writeDoctorResult(allocator: std.mem.Allocator, io: std.Io, result: onyx_server.daemon.doctor.Result, json: bool) !void {
+    var observed = result;
+    observed.service_environment = onyx_server.daemon.service_environment.detect(io);
+    if (json) {
+        const text = try observed.toJson(allocator);
+        defer allocator.free(text);
+        try std.Io.File.stdout().writeStreamingAll(io, text);
+        try std.Io.File.stdout().writeStreamingAll(io, "\n");
+    } else {
+        const env = observed.service_environment;
+        std.debug.print("{s}doctor service_environment manager={s} openrc_marker={s} systemd_marker={s} container_marker={s}; markers do not establish readiness\n", .{ result.lines, @tagName(env.manager_hint), @tagName(env.openrc_marker), @tagName(env.systemd_marker), @tagName(env.container_marker) });
+    }
+}
+
+/// Private comparison allocator: neither resize nor remap can hand storage
+/// back without invoking free, which wipes the full original allocation.
+const DoctorWipeAllocator = struct {
+    parent: std.mem.Allocator,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.parent.rawAlloc(len, alignment, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        std.crypto.secureZero(u8, memory);
+        self.parent.rawFree(memory, alignment, ra);
+    }
+};
+
+fn doctorCloakCompare(parent: std.mem.Allocator, io: std.Io, opts: DoctorOptions, base: onyx_server.daemon.server.Config, resolver: onyx_server.daemon.config_format.Resolver) !bool {
+    var wipe = DoctorWipeAllocator{ .parent = parent };
+    const allocator = wipe.allocator();
+    const paths = [_][]const u8{ opts.config, opts.peer_config.? };
+    var loaded: [2]?onyx_server.daemon.config_boot.Loaded = .{ null, null };
+    defer for (&loaded) |*slot| if (slot.*) |*value| value.deinit(allocator);
+    for (paths, 0..) |path, index| {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(onyx_server.daemon.config_format.max_config_bytes)) catch break;
+        defer allocator.free(text);
+        loaded[index] = onyx_server.daemon.config_boot.loadFromTextQuiet(allocator, text, base, resolver) catch break;
+    }
+    const result = if (loaded[0] != null and loaded[1] != null)
+        try onyx_server.daemon.doctor.cloakComparison(allocator, &loaded[0].?, &loaded[1].?)
+    else
+        try onyx_server.daemon.doctor.cloakComparisonUnavailable(allocator);
+    defer result.deinit(allocator);
+    try writeDoctorResult(allocator, io, result, opts.json);
+    return !result.failed;
+}
+
+const setup_review = @import("setup_review.zig");
+
+test {
+    _ = @import("setup_review.zig");
+}
+
+fn setupTerminalWidth(file: std.Io.File, columns: ?[]const u8) !usize {
+    if (comptime builtin.os.tag == .linux) {
+        var size: std.posix.winsize = undefined;
+        const rc = std.os.linux.ioctl(file.handle, std.os.linux.T.IOCGWINSZ, @intFromPtr(&size));
+        if (std.os.linux.errno(rc) == .SUCCESS and size.col != 0) {
+            if (size.col < 20) return error.TerminalTooNarrow;
+            return setup_review.normalizedWidth(size.col);
+        }
+    }
+    if (columns) |raw| {
+        const value = std.fmt.parseInt(usize, raw, 10) catch 0;
+        if (value > 0 and value < 20) return error.TerminalTooNarrow;
+    }
+    return setup_review.fallbackWidth(columns);
+}
+fn setupMessage(init: std.process.Init, width: usize, message: []const u8) !void {
+    const text = try setup_review.renderMessage(init.gpa, message, width);
+    defer init.gpa.free(text);
+    try std.Io.File.stdout().writeStreamingAll(init.io, text);
+}
+
+fn setupDiagnostic(init: std.process.Init, interactive: bool, comptime format: []const u8, args: anytype) !void {
+    const message = try std.fmt.allocPrint(init.gpa, format, args);
+    defer init.gpa.free(message);
+    if (interactive) {
+        const width = setupTerminalWidth(std.Io.File.stdout(), init.environ_map.get("COLUMNS")) catch 38;
+        const text = try setup_review.renderMessage(init.gpa, message, width);
+        defer init.gpa.free(text);
+        try std.Io.File.stderr().writeStreamingAll(init.io, text);
+    } else try std.Io.File.stderr().writeStreamingAll(init.io, message);
+}
+
+const SetupInteraction = enum { done, save, cancel };
+
+fn setupInteract(init: std.process.Init, profile: *setup.workflow.Profile, previous: *setup.workflow.Profile, settings: *setup.workflow.Settings, config: *[]const u8, existing_allowed: bool, base: onyx_server.daemon.server.Config, resolver: onyx_server.daemon.config_format.Resolver, input_allocator: std.mem.Allocator, color: bool, has_draft: bool, artifact: ?[]const u8, bundle_requested: bool, service: setup.Service) !SetupInteraction {
+    const stdout = std.Io.File.stdout();
+    const stdin = std.Io.File.stdin();
+    if (!(try stdin.isTty(init.io)) or !(try stdout.isTty(init.io))) return error.InteractiveTerminalRequired;
+    const initial_width = try setupTerminalWidth(stdout, init.environ_map.get("COLUMNS"));
+    try stdout.writeStreamingAll(init.io, if (color) "\x1b[1;36mOnyx Server setup\x1b[0m\n" else "Onyx Server setup\n");
+    try setupMessage(init, initial_width, "Choose a new installation profile or review an existing network configuration. No service changes.\nCommands: 1/private, 2/community, 3/media, existing, review, back, help, cancel.");
+    var wizard = setup.workflow.Wizard{ .profile = profile.*, .previous = profile.*, .settings = settings.* };
+    var input_bytes: usize = 0;
+    var new_choices_edited = false;
+    var existing_network: ?setup.network_assessment.Assessment = null;
+    var existing_media: ?setup.media_assessment.Assessment = null;
+    var buffer: [512]u8 = undefined;
+    var reader = stdin.readerStreaming(init.io, &buffer);
+    while (true) {
+        const width = try setupTerminalWidth(stdout, init.environ_map.get("COLUMNS"));
+        const requested: setup_review.Action = if (bundle_requested) .bundle else if (has_draft) .draft else if (artifact != null) .export_config else .preview;
+        const network = if (wizard.profile == .existing) existing_network else setup.network_assessment.assess(.{ .hostname = wizard.settings.hostname, .listen_host = wizard.settings.listen_host, .irc_port = wizard.settings.irc_port, .tls_enabled = wizard.settings.tls_enabled, .tls_port = wizard.settings.tls_port, .validated = false });
+        const media = if (wizard.profile == .existing) existing_media else setup.media_assessment.assessConfigured(.{ .enabled = wizard.profile == .media, .media_port = wizard.settings.media_port, .native_media_port = 0, .advertised_host = "127.0.0.1", .stun_host = "", .stun_port = 0, .websocket_port = 0, .websocket_media_relay = false });
+        const review = try setup_review.renderAssessed(init.gpa, wizard.profile, wizard.previous, wizard.reviewing, wizard.settings, service, requested, if (wizard.profile == .existing) (if (config.*.len == 0) null else config.*) else artifact, color, width, network, media);
+        defer init.gpa.free(review);
+        try stdout.writeStreamingAll(init.io, review);
+        try stdout.writeStreamingAll(init.io, if (wizard.reviewing) "\nReview\nreview> " else "\nChoices\nchoice> ");
+        const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => {
+                try stdout.writeStreamingAll(init.io, "\n");
+                return .cancel;
+            },
+            else => return err,
+        };
+        // The terminal may have ECHO disabled, so the submitted input does not
+        // itself end the prompt line on the output stream.
+        try stdout.writeStreamingAll(init.io, "\n");
+        input_bytes = try std.math.add(usize, input_bytes, line.len);
+        if (input_bytes > 64 * 1024) return error.InteractionTooLong;
+        const stable_line = try input_allocator.dupe(u8, line);
+        const command = std.mem.trim(u8, stable_line, " \t\r\n");
+        if (std.mem.eql(u8, command, "existing") and !wizard.reviewing) {
+            if (!existing_allowed or new_choices_edited) {
+                try setupMessage(init, width, "Existing-network review cannot discard requested new-install options or edits; cancel and restart without them.\n");
+            } else {
+                wizard.previous = wizard.profile;
+                wizard.profile = .existing;
+            }
+            continue;
+        }
+        if (wizard.profile == .existing and !wizard.reviewing and std.mem.startsWith(u8, command, "set config ")) {
+            const path = std.mem.trim(u8, command["set config ".len..], " \t");
+            if (path.len == 0 or path.len > 4096) {
+                try setupMessage(init, width, "Enter a nonempty configuration path.\n");
+            } else {
+                config.* = path;
+                existing_network = null;
+                existing_media = null;
+            }
+            continue;
+        }
+        if (wizard.profile == .existing and !wizard.reviewing and std.mem.eql(u8, command, "back")) {
+            wizard.profile = .private;
+            wizard.previous = .private;
+            continue;
+        }
+        if (wizard.profile == .existing and !wizard.reviewing and std.mem.eql(u8, command, "review")) {
+            if (config.*.len == 0) {
+                try setupMessage(init, width, "Set an existing configuration path before review.\n");
+                continue;
+            }
+            const bytes = std.Io.Dir.cwd().readFileAlloc(init.io, config.*, init.gpa, .limited(onyx_server.daemon.config_format.max_config_bytes)) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try setupMessage(init, width, "Cannot read configuration; check the path and try again.\n");
+                continue;
+            };
+            defer {
+                std.crypto.secureZero(u8, bytes);
+                init.gpa.free(bytes);
+            }
+            var loaded = onyx_server.daemon.config_boot.loadFromTextQuiet(init.gpa, bytes, base, resolver) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try setupMessage(init, width, "Configuration validation failed; correct the file or choose another path.\n");
+                continue;
+            };
+            defer loaded.deinit(init.gpa);
+            if (setupValidationError(&loaded) != null) {
+                try setupMessage(init, width, "Configuration validation failed; correct the file or choose another path.\n");
+                continue;
+            }
+            var network_input = setupNetworkInput(&loaded);
+            network_input.hostname = try input_allocator.dupe(u8, network_input.hostname);
+            network_input.listen_host = try input_allocator.dupe(u8, network_input.listen_host);
+            var media_input = setupMediaInput(&loaded);
+            media_input.existing = true;
+            media_input.advertised_host = try input_allocator.dupe(u8, media_input.advertised_host);
+            media_input.stun_host = try input_allocator.dupe(u8, media_input.stun_host);
+            existing_network = setup.network_assessment.assess(network_input);
+            existing_media = setup.media_assessment.assessConfigured(media_input);
+            const summary = try std.json.Stringify.valueAlloc(init.gpa, setupExistingSummary(&loaded), .{});
+            defer init.gpa.free(summary);
+            try setupMessage(init, width, "Existing configuration validated for review; no enrollment or network contact performed.\nExisting configuration summary: ");
+            try setupMessage(init, width, summary);
+            try setupMessage(init, width, "\n");
+        }
+        if (wizard.profile == .existing and !wizard.reviewing and std.mem.startsWith(u8, command, "set ")) {
+            try setupMessage(init, width, "Existing-network review accepts only set config <path>; no configuration edits are made.\n");
+            continue;
+        }
+        const was_existing = wizard.profile == .existing;
+        if (was_existing and wizard.reviewing and (std.mem.eql(u8, command, "back") or std.mem.eql(u8, command, "profiles"))) {
+            existing_network = null;
+            existing_media = null;
+        }
+        const action = wizard.command(stable_line);
+        if (was_existing and wizard.profile != .existing and action == .changed) {
+            config.* = "";
+            try setupMessage(init, width, "New profile selected; the existing configuration is unchanged and will not be used.\n");
+        }
+        if (wizard.profile != .existing and action == .changed and (std.mem.startsWith(u8, command, "set ") or std.mem.eql(u8, command, "1") or std.mem.eql(u8, command, "2") or std.mem.eql(u8, command, "3") or std.mem.eql(u8, command, "private") or std.mem.eql(u8, command, "community") or std.mem.eql(u8, command, "media"))) new_choices_edited = true;
+        switch (action) {
+            .changed => {},
+            .help => try setupMessage(init, width, "Choose private, community or media for a new installation. Choose existing to review an existing network configuration.\nFor existing review use set config <path>, then review. Existing configuration is not changed; enrollment and network contact are not performed.\nUse set <hostname|listen|irc-port|node-id|tls-port|max-clients|media-port|account|privileges> <value>, or set tls on/off.\nUse search <keyword>, review, back, done, help or cancel. Passwords use --password-file or --password-fd, never this prompt.\nAt review, save requires --draft <path>.\n"),
+            .search => {
+                const query = setup.workflow.searchQuery(line).?;
+                try setupMessage(init, width, "Matching profiles and settings:\n");
+                for ([_]setup.workflow.Profile{ .private, .community, .media }) |candidate_profile| {
+                    if (setup.workflow.matches(candidate_profile, query)) {
+                        try setupMessage(init, width, setup.workflow.description(candidate_profile));
+                    }
+                }
+                for (setup.workflow.search_fields) |entry| {
+                    if (setup.workflow.matchesText(entry, query)) try setupMessage(init, width, entry);
+                }
+            },
+            .invalid => try setupMessage(init, width, "Unknown command for this step; type help.\n"),
+            .cancel => return .cancel,
+            .finish => {
+                profile.* = wizard.profile;
+                previous.* = wizard.previous;
+                settings.* = wizard.settings;
+                return .done;
+            },
+            .save => {
+                if (!has_draft) {
+                    try setupMessage(init, width, "Saving requires --draft <new-private-file> at invocation.\n");
+                    continue;
+                }
+                profile.* = wizard.profile;
+                previous.* = wizard.previous;
+                settings.* = wizard.settings;
+                return .save;
+            },
+        }
+    }
+}
+
+/// Public metadata from the actual staged bundle; private contents never leave it.
+fn setupPreparedDetails(init: std.process.Init, bundle: *const setup_bundle.Prepared, review_id: ?[]const u8, pretty: bool) ![]u8 {
+    // The staged setup bundle and its custody verification are Linux-only.
+    // Windows file attributes are not proof of private ACLs or Unix modes.
+    if (comptime builtin.os.tag == .windows) return error.SetupPermissionReviewUnavailable;
+    const allocator = init.gpa;
+    const file_names = bundle.materialNames();
+    var paths: [setup_bundle.names.len]?[]u8 = @splat(null);
+    defer for (paths) |path| if (path) |value| allocator.free(value);
+    var mode_buffers: [setup_bundle.names.len][8]u8 = undefined;
+    var files: [setup_bundle.names.len]struct { path: []const u8, mode_octal: []const u8 } = undefined;
+    for (file_names, 0..) |name, i| {
+        paths[i] = try std.fs.path.join(allocator, &.{ bundle.final_path, name });
+        const stat = try bundle.dir.statFile(init.io, name, .{ .follow_symlinks = false });
+        files[i] = .{ .path = paths[i].?, .mode_octal = try std.fmt.bufPrint(&mode_buffers[i], "0{o}", .{stat.permissions.toMode() & 0o7777}) };
+    }
+    var directory_mode_buffer: [8]u8 = undefined;
+    const directory_mode = try std.fmt.bufPrint(&directory_mode_buffer, "0{o}", .{(try bundle.dir.stat(init.io)).permissions.toMode() & 0o7777});
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .mode = "prepared_unpublished_bundle",
+        .review_id = review_id,
+        .directory = bundle.final_path,
+        .directory_mode_octal = directory_mode,
+        .node_public_key = @as([]const u8, &bundle.public_key),
+        .certificate_subject = bundle.certificate_subject[0..bundle.certificate_subject_len],
+        .certificate_expires_unix = bundle.certificate_expires_unix,
+        .tls_provenance = "canonical self-signed bootstrap; client trust or pinning required; no public CA trust claimed",
+        .bootstrap_account = bundle.accountName(),
+        .operator_privileges = bundle.account_privileges,
+        .authentication_mechanisms = if (bundle.account_len != 0) setup.workflow.account.mechanisms else @as([]const []const u8, &.{}),
+        .files = files[0..file_names.len],
+    }, .{ .whitespace = if (pretty) .indent_2 else .minified });
+}
+
+/// The caller retains the unpublished bundle on cancellation, EOF, or error.
+fn setupReviewPrepared(init: std.process.Init, bundle: *const setup_bundle.Prepared) !bool {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const stdout = std.Io.File.stdout();
+    const width = try setupTerminalWidth(stdout, init.environ_map.get("COLUMNS"));
+    const details = try setupPreparedDetails(init, bundle, null, true);
+    defer init.gpa.free(details);
+    try setupMessage(init, width, "Actual prepared bundle review");
+    try setupMessage(init, width, details);
+    try setupMessage(init, width, "The displayed identity and expiry belong to the generated private material. Nothing has been published.");
+    var buffer: [128]u8 = undefined;
+    var reader = std.Io.File.stdin().readerStreaming(init.io, &buffer);
+    while (true) {
+        try setupMessage(init, width, "Material action (publish/cancel)");
+        try stdout.writeStreamingAll(init.io, "> ");
+        const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => {
+                try stdout.writeStreamingAll(init.io, "\n");
+                return false;
+            },
+            else => return err,
+        };
+        try stdout.writeStreamingAll(init.io, "\n");
+        const command = std.mem.trim(u8, line, " \t\r\n");
+        if (std.mem.eql(u8, command, "publish")) return true;
+        if (std.mem.eql(u8, command, "cancel") or std.mem.eql(u8, command, "q")) return false;
+        try setupMessage(init, width, "Enter publish to expose this exact bundle, or cancel to remove its private stage.");
+    }
+}
+
+fn setupExistingSummary(loaded: *const onyx_server.daemon.config_boot.Loaded) setup.ExistingSummary {
+    return .{ .network = loaded.parsed.network.name, .server = loaded.config.server_name, .listen_host = loaded.config.host, .irc_port = loaded.config.port, .max_clients = loaded.config.max_clients, .media_enabled = loaded.parsed.media.enabled };
+}
+
+fn setupNetworkInput(loaded: *const onyx_server.daemon.config_boot.Loaded) setup.network_assessment.Input {
+    return .{ .hostname = loaded.config.server_name, .listen_host = loaded.config.host, .irc_port = loaded.config.port, .tls_enabled = loaded.tls.enabled, .tls_port = loaded.tls.port, .validated = true };
+}
+fn setupMediaInput(loaded: *const onyx_server.daemon.config_boot.Loaded) setup.media_assessment.Configured {
+    return .{ .enabled = loaded.config.media_enabled, .media_port = loaded.config.media_port, .native_media_port = loaded.config.native_media_port, .advertised_host = loaded.config.media_host, .stun_host = loaded.config.media_stun_host, .stun_port = loaded.config.media_stun_port, .websocket_port = if (loaded.config.ws_enabled) loaded.config.ws_port else 0, .websocket_media_relay = loaded.config.ws_media_relay };
+}
+
+fn setupValidationError(loaded: *const onyx_server.daemon.config_boot.Loaded) ?[]const u8 {
+    const boot = onyx_server.daemon.config_boot;
+    return boot.configCheckError(loaded.io, loaded.tls.ktls) orelse
+        boot.portableTransportError(builtin.os.tag, loaded.parsed) orelse
+        boot.unsecuredMeshPeerError(loaded.parsed.mesh.connect.len, loaded.parsed.mesh.require_secured) orelse
+        (if (loaded.parsed.meshCloakSecretMissing()) @as(?[]const u8, "meshed nodes require the same configured cloak secret") else null);
+}
+
+fn setupPrepareBundle(init: std.process.Init, opts: setup.Options, base: onyx_server.daemon.server.Config) !setup_bundle.Prepared {
+    if (!opts.settings.bootstrap.enabled()) {
+        if (opts.password_file != null or opts.password_fd != null) return error.BootstrapAccountRequired;
+        return setup_bundle.prepare(init.gpa, init.io, opts.bundle_path.?, opts.profile, opts.settings, base, setupValidationError);
+    }
+    const source: setup_secret.Source = if (opts.password_file) |path| .{ .private_file = path } else if (opts.password_fd) |fd| .{ .fd = fd } else return error.BootstrapPasswordSourceRequired;
+    var password: setup_secret.Secret = .{};
+    // The borrowed plaintext is gone before the prepared metadata review opens.
+    defer password.deinit();
+    try setup_secret.read(init.io, source, &password);
+    return setup_bundle.prepareAuthenticated(init.gpa, init.io, opts.bundle_path.?, opts.profile, opts.settings, base, password.slice(), null, setupValidationError);
+}
+
+fn runSetup(init: std.process.Init, base: onyx_server.daemon.server.Config, resolver: onyx_server.daemon.config_format.Resolver, args: []const []const u8) !void {
+    const allocator = init.gpa;
+    if (args.len == 1 and (std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h"))) {
+        try std.Io.File.stdout().writeStreamingAll(init.io, setup.usage);
+        return;
+    }
+    var opts = setup.parse(args) catch {
+        std.debug.print("{s}", .{setup.usage});
+        std.process.exit(2);
+    };
+    if (opts.maintenance) {
+        @import("setup_maintenance.zig").run(init, .{
+            .pid = opts.maintenance_pid.?,
+            .config = opts.config,
+            .target = opts.maintenance_target.?,
+            .backup_dir = opts.maintenance_backup.?,
+            .restore_into = opts.maintenance_restore.?,
+        }, opts.linear) catch |err| {
+            std.debug.print("setup maintenance stopped: {s}; inspect the selected runtime before any further action\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+    var input_arena = std.heap.ArenaAllocator.init(allocator);
+    defer input_arena.deinit();
+    var resumed: ?std.json.Parsed(setup.workflow.Draft) = null;
+    defer if (resumed) |*draft| draft.deinit();
+    if (opts.resume_path) |path| {
+        resumed = setup.workflow.readDraft(init.io, std.Io.Dir.cwd(), path, allocator) catch |err| {
+            std.debug.print("setup: cannot resume private draft: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        opts.profile = resumed.?.value.profile;
+        opts.service = resumed.?.value.service;
+        opts.settings = resumed.?.value.settings orelse .{};
+    }
+    if (opts.bundle_path != null) opts.settings.tls_enabled = true;
+    if (opts.settings.bootstrap.enabled() and opts.export_path != null) {
+        std.debug.print("setup: account intent requires a bundle; use preview or draft until provisioning\n", .{});
+        std.process.exit(2);
+    }
+    if (builtin.os.tag != .linux and (opts.service == .openrc or opts.service == .systemd)) {
+        std.debug.print("setup: OpenRC/systemd plans require a Linux target; use --service foreground\n", .{});
+        std.process.exit(2);
+    }
+    const stdout = std.Io.File.stdout();
+    const color = !opts.linear and setup.useColor(stdout.isTty(init.io) catch false, init.environ_map.get("NO_COLOR") != null, init.environ_map.get("TERM"));
+    var comparison_baseline: setup.workflow.Profile = if (opts.new_install) .private else .existing;
+    if (opts.interactive) {
+        const action = setupInteract(init, &opts.profile, &comparison_baseline, &opts.settings, &opts.config, opts.existing_allowed, base, resolver, input_arena.allocator(), color, opts.draft != null, opts.bundle_path orelse opts.export_path orelse opts.draft, opts.bundle_path != null, opts.service) catch |err| {
+            if (err == error.InteractiveTerminalRequired) {
+                std.debug.print("setup: interactive setup requires a terminal; for redirected output use setup --new --json or setup <config> --json.\n", .{});
+            } else if (err == error.TerminalTooNarrow) {
+                std.debug.print("setup: terminal width is below 20 columns; widen it or use a headless --json preview.\n", .{});
+            } else std.debug.print("setup: terminal interaction failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        if (action == .cancel) {
+            try setupMessage(init, try setupTerminalWidth(stdout, init.environ_map.get("COLUMNS")), "Setup cancelled; no candidate or draft published.");
+            return;
+        }
+        if (opts.profile == .existing) {
+            opts.new_install = false;
+            comparison_baseline = .existing;
+        }
+    }
+    var prepared: ?setup_bundle.Prepared = null;
+    defer if (prepared) |*bundle| bundle.deinit(init.io);
+    if (opts.bundle_path) |path| {
+        _ = path;
+        prepared = setupPrepareBundle(init, opts, base) catch |err| {
+            try setupDiagnostic(init, opts.interactive, "setup: private bundle preparation failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
+    const text = if (prepared) |*bundle|
+        bundle.config.?
+    else if (opts.new_install)
+        try setup.workflow.configuredCandidate(allocator, opts.profile, opts.settings, null)
+    else
+        std.Io.Dir.cwd().readFileAlloc(init.io, opts.config, allocator, .limited(onyx_server.daemon.config_format.max_config_bytes)) catch |err| {
+            try setupDiagnostic(init, opts.interactive, "setup: cannot read candidate: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    defer if (prepared == null) {
+        std.crypto.secureZero(u8, text);
+        allocator.free(text);
+    };
+    var existing_summary: ?setup.ExistingSummary = null;
+    var network_input: ?setup.network_assessment.Input = null;
+    var media_input: ?setup.media_assessment.Configured = null;
+    if (prepared == null) {
+        var loaded = onyx_server.daemon.config_boot.loadFromTextQuiet(allocator, text, base, resolver) catch |err| {
+            try setupDiagnostic(init, opts.interactive, "setup: invalid candidate: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer loaded.deinit(allocator);
+        if (setupValidationError(&loaded)) |why| {
+            try setupDiagnostic(init, opts.interactive, "setup: invalid candidate: {s}\n", .{why});
+            std.process.exit(1);
+        }
+        var network = setupNetworkInput(&loaded);
+        network.hostname = try input_arena.allocator().dupe(u8, network.hostname);
+        network.listen_host = try input_arena.allocator().dupe(u8, network.listen_host);
+        network_input = network;
+        var media = setupMediaInput(&loaded);
+        media.existing = !opts.new_install;
+        media.advertised_host = try input_arena.allocator().dupe(u8, media.advertised_host);
+        media.stun_host = try input_arena.allocator().dupe(u8, media.stun_host);
+        media_input = media;
+        if (!opts.new_install) {
+            var summary = setupExistingSummary(&loaded);
+            summary.network = try input_arena.allocator().dupe(u8, summary.network);
+            summary.server = try input_arena.allocator().dupe(u8, summary.server);
+            summary.listen_host = try input_arena.allocator().dupe(u8, summary.listen_host);
+            existing_summary = summary;
+        }
+    }
+    if (prepared != null) {
+        network_input = .{ .hostname = opts.settings.hostname, .listen_host = opts.settings.listen_host, .irc_port = opts.settings.irc_port, .tls_enabled = opts.settings.tls_enabled, .tls_port = opts.settings.tls_port, .validated = true };
+        media_input = .{ .enabled = opts.profile == .media, .media_port = opts.settings.media_port, .native_media_port = 0, .advertised_host = "127.0.0.1", .stun_host = "", .stun_port = 0, .websocket_port = 0, .websocket_media_relay = false };
+    }
+    const environment = onyx_server.daemon.service_environment.detect(init.io);
+    var plan = setup.Plan.init(if (opts.new_install) "<generated candidate>" else opts.config, opts.service, environment.manager_hint == .openrc, environment.manager_hint == .systemd);
+    plan.service_environment = environment;
+    if (opts.service == .auto) plan.service_basis = "observed filesystem markers only; unknown or ambiguous selects foreground; verify supervisor";
+    plan.profile = opts.profile;
+    plan.existing_summary = existing_summary;
+    if (network_input) |input| plan.network_assessment = setup.network_assessment.assess(input);
+    if (media_input) |input| plan.media_assessment = setup.media_assessment.assessConfigured(input);
+    if (opts.new_install) {
+        plan.purpose = "new_installation";
+        plan.settings = opts.settings;
+    }
+    plan.profile_values = setup.workflow.description(opts.profile);
+    plan.profile_diff_baseline = comparison_baseline;
+    if (opts.new_install) plan.profile_diff_basis = "Current settings and overrides apply to both profiles.";
+    var profile_diff_buf: [128]u8 = undefined;
+    plan.profile_diff = try setup.workflow.diff(&profile_diff_buf, comparison_baseline, opts.profile, opts.settings);
+    var draft_bytes: ?[]u8 = null;
+    defer if (draft_bytes) |bytes| allocator.free(bytes);
+    if (prepared) |*bundle| {
+        plan.mode = "bundle_provisioned";
+        plan.artifact = bundle.final_path;
+        plan.changes_applied = true;
+        plan.provisioning = "canonical persisted node identity, private random cloak secret, validated self-signed TLS certificate/key";
+        plan.node_public_key = &bundle.public_key;
+        plan.certificate_expires_unix = bundle.certificate_expires_unix;
+        plan.bootstrap_account = bundle.accountName();
+        plan.operator_privileges = bundle.account_privileges;
+        if (bundle.account_len != 0) plan.authentication_mechanisms = setup.workflow.account.mechanisms;
+        plan.tls_provenance = "canonical self-signed bootstrap; client trust/pinning is required; no public CA or external reachability claim";
+    } else if (opts.draft) |path| {
+        draft_bytes = try std.json.Stringify.valueAlloc(allocator, setup.workflow.Draft{ .version = 3, .profile = opts.profile, .service = opts.service, .settings = opts.settings }, .{});
+        plan.mode = "draft_saved";
+        plan.artifact = path;
+        plan.changes_applied = true;
+    } else if (opts.export_path) |path| {
+        plan.mode = "candidate_exported";
+        plan.artifact = path;
+        plan.changes_applied = true;
+    }
+    if (plan.changes_applied) plan.recovery = "Only the requested new private artifact was created; existing configuration and services were preserved. Remove that artifact to discard this setup checkpoint/candidate. Follow the release runbook before any live installation.";
+    // Finish every allocation and validation before publishing an artifact.
+    const output = try setup.render(allocator, plan, opts.json, color and !opts.interactive);
+    defer allocator.free(output);
+    const terminal_output = if (opts.interactive) try setup_review.renderMessage(allocator, output, try setupTerminalWidth(stdout, init.environ_map.get("COLUMNS"))) else null;
+    defer if (terminal_output) |value| allocator.free(value);
+    if (prepared) |*bundle| {
+        var custody = try setup_bundle.captureCustody(bundle, init.io);
+        defer custody.wipe();
+        if (opts.interactive) {
+            if (!try setupReviewPrepared(init, bundle)) {
+                try setupMessage(init, try setupTerminalWidth(stdout, init.environ_map.get("COLUMNS")), "Setup cancelled after material review; unpublished private stage removed.");
+                return;
+            }
+        } else {
+            var random_id: [16]u8 = undefined;
+            try onyx_server.crypto.random.fillOsEntropy(&random_id);
+            const review_id = std.fmt.bytesToHex(random_id, .lower);
+            const details = try setupPreparedDetails(init, bundle, &review_id, false);
+            defer allocator.free(details);
+            if (!try setup_material_review.review(allocator, details, &review_id)) return;
+        }
+        try setup_bundle.verifyCustody(bundle, init.io, &custody);
+        bundle.commit(init.io) catch |err| {
+            // process.exit skips defers: destroy the failed unpublished stage
+            // explicitly before returning the diagnostic.
+            bundle.deinit(init.io);
+            prepared = null;
+            try setupDiagnostic(init, opts.interactive, "setup: private bundle publication failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    } else if (plan.artifact) |path| {
+        setup.workflow.publish(init.io, std.Io.Dir.cwd(), path, draft_bytes orelse text) catch |err| {
+            try setupDiagnostic(init, opts.interactive, "setup: cannot publish new private artifact: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
+    if (opts.review_stdin) {
+        setup_material_review.writeFinal(output) catch {
+            // Publication already succeeded. Do not imply rollback, and avoid
+            // unbounded stderr or the process-exit path skipping stage cleanup.
+            if (prepared) |*bundle| bundle.deinit(init.io);
+            prepared = null;
+            setup_material_review.reportPublishedOutputFailure() catch {};
+            std.process.exit(1);
+        };
+    } else if (terminal_output) |value| {
+        try stdout.writeStreamingAll(init.io, value);
+    } else {
+        try stdout.writeStreamingAll(init.io, output);
+        if (opts.json) try stdout.writeStreamingAll(init.io, "\n");
+    }
+}
+
+test "setup profiles pass authoritative typed boot loading and static checks" {
+    for ([_]setup.workflow.Profile{ .private, .community, .media }) |profile| {
+        const text = try setup.workflow.candidate(std.testing.allocator, profile);
+        defer std.testing.allocator.free(text);
+        var loaded = try onyx_server.daemon.config_boot.loadFromTextQuiet(std.testing.allocator, text, .{ .port = 6680 }, .{});
+        defer loaded.deinit(std.testing.allocator);
+        try std.testing.expect(setupValidationError(&loaded) == null);
+        try std.testing.expectEqualStrings("127.0.0.1", loaded.parsed.listen.host);
+        try std.testing.expectEqual(profile == .media, loaded.parsed.media.enabled);
+        try std.testing.expect(!loaded.parsed.network.discoverable);
+        try std.testing.expectEqual(if (profile == .community) @as(u31, 1024) else @as(u31, 128), loaded.parsed.limits.max_clients);
+    }
+}
+
+/// Open and retain the actual private issuer parent for every relative write.
+/// The operator must control the directory and its ancestors; no path is printed.
+fn openGuestIssuerPrivateParent(io: std.Io, parent_path: []const u8) !std.Io.Dir {
+    if (comptime builtin.os.tag == .windows)
+        return onyx_server.daemon.os_runtime.openPrivateDirectoryWindows(io, std.Io.Dir.cwd(), parent_path);
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.Unsupported;
+    const dir = try std.Io.Dir.cwd().openDir(io, parent_path, .{ .follow_symlinks = false });
+    errdefer dir.close(io);
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var info: linux.Statx = std.mem.zeroes(linux.Statx);
+        while (true) switch (linux.errno(linux.statx(dir.handle, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true, .UID = true }, &info))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.PrivateDirectoryUnavailable,
+        };
+        if (!info.mask.TYPE or !info.mask.MODE or !info.mask.UID or
+            (info.mode & std.posix.S.IFMT) != std.posix.S.IFDIR or
+            info.mode & 0o7777 != 0o700 or info.uid != linux.geteuid()) return error.UnprotectedDirectory;
+    } else if (comptime builtin.os.tag == .openbsd) {
+        var info: std.posix.Stat = undefined;
+        while (true) switch (std.posix.errno(std.posix.system.fstat(dir.handle, &info))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.PrivateDirectoryUnavailable,
+        };
+        if ((info.mode & std.posix.S.IFMT) != std.posix.S.IFDIR or
+            info.mode & 0o7777 != 0o700 or info.uid != std.posix.system.geteuid()) return error.UnprotectedDirectory;
+    }
+    return dir;
+}
+
+/// Offline, explicitly provisioned issuer. Existing WAL or snapshot is never
+/// opened for writing. The held private parent and exclusive WAL creation avoid
+/// accidental replacement; the caller is responsible for trusted ancestors.
+fn initializeGuestIssuerOffline(init: std.process.Init, config_path: []const u8, base: onyx_server.daemon.server.Config, resolver: onyx_server.daemon.config_format.Resolver) !void {
+    const a = init.gpa;
+    const text = try std.Io.Dir.cwd().readFileAlloc(init.io, config_path, a, .limited(onyx_server.daemon.config_format.max_config_bytes));
+    defer a.free(text);
+    var loaded = try onyx_server.daemon.config_boot.loadFromTextQuiet(a, text, base, resolver);
+    defer loaded.deinit(a);
+    const path = loaded.config.guest_issuer_path;
+    if (path.len == 0) return error.GuestIssuerDisabled;
+    const name = std.fs.path.basename(path);
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidIssuerPath;
+    const parent_path = std.fs.path.dirname(path) orelse ".";
+    const parent = try openGuestIssuerPrivateParent(init.io, parent_path);
+    defer parent.close(init.io);
+    var identity = if (loaded.parsed.node.secret_key) |secret|
+        try onyx_server.daemon.node_identity.fromConfig(secret, loaded.parsed.mesh.realm)
+    else blk: {
+        const key_path = try onyx_server.daemon.node_keyfile.derivePath(a, config_path);
+        defer a.free(key_path);
+        var seed = try onyx_server.daemon.node_keyfile.loadExisting(a, init.io, std.Io.Dir.cwd(), key_path);
+        defer std.crypto.secureZero(u8, &seed);
+        break :blk try onyx_server.daemon.node_identity.fromSeed(seed, loaded.parsed.mesh.realm);
+    };
+    defer identity.deinit();
+    if (loaded.parsed.node.public_key) |configured| {
+        var expected: [32]u8 = undefined;
+        if (configured.len == expected.len * 2) {
+            _ = std.fmt.hexToBytes(&expected, configured) catch return error.BadPublicKey;
+        } else {
+            const n = std.base64.standard.Decoder.calcSizeForSlice(configured) catch return error.BadPublicKey;
+            if (n != expected.len) return error.BadPublicKey;
+            std.base64.standard.Decoder.decode(&expected, configured) catch return error.BadPublicKey;
+        }
+        if (!std.crypto.timing_safe.eql([32]u8, expected, identity.sign_kp.public_key)) return error.PublicKeyMismatch;
+    }
+    const snapshot_name = try std.mem.concat(a, u8, &.{ name, ".snap" });
+    defer a.free(snapshot_name);
+    if (parent.statFile(init.io, snapshot_name, .{ .follow_symlinks = false })) |_| {
+        return error.IssuerStateAlreadyExists;
+    } else |err| if (err != error.FileNotFound) return err;
+    const file = try parent.createFile(init.io, name, .{ .read = true, .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
+    file.close(init.io);
+    // On failure retain the newly created file: an ambiguous durable write must
+    // never be erased or treated as fresh by a future attempt.
+    var issuer = try onyx_server.daemon.mesh_presence_issuer.Issuer.initialize(a, init.io, parent, name, &identity.sign_kp, onyx_server.substrate.platform.realtimeMillis());
+    defer issuer.deinit();
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     var windows_service_worker: ?windows_scm.WorkerHandles = null;
@@ -857,6 +1654,8 @@ pub fn main(init: std.process.Init) !void {
     // (used by REHASH) never dangles.
     var resolver_ctx = ResolverCtx{ .environ_map = init.environ_map, .io = init.io, .path_allocator = allocator };
     defer resolver_ctx.deinit();
+    var ordinary_env = onyx_server.daemon.helix.live.ConfigEnvCollector.init(allocator);
+    defer ordinary_env.deinit();
 
     // Default config (6680; 6667/6697 belong to the local eshmaki server). A
     // config file path may be passed as argv[1]: present values override the
@@ -907,8 +1706,13 @@ pub fn main(init: std.process.Init) !void {
     var native_driver = onyx_server.daemon.helix.native_bootstrap.Driver{ .allocator = allocator, .config_path = null, .environ = init.minimal.environ };
     var native_executable: ?[:0]u8 = null;
     defer if (native_executable) |path| allocator.free(path);
+    var strict_owner: ?*onyx_server.service_identity_preflight.PreparedBoot = null;
+    defer if (strict_owner) |owner| owner.deinit();
     var held: ?onyx_server.daemon.config_boot.Loaded = null;
-    defer if (held) |*h| h.deinit(allocator);
+    defer if (held) |*h| {
+        if (strict_owner == null) h.deinit(allocator);
+    };
+    var strict_existing_identity = false;
     // Backing storage for the inherited per-shard listener fds (multi-shard
     // Helix handoff). Lives on main's frame so the slice stored on the config
     // stays valid for the whole boot.
@@ -943,7 +1747,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var config_path_arg: ?[]const u8 = null;
     const first_arg = args.next();
-    if (first_arg == null or !std.mem.eql(u8, first_arg.?, "doctor")) {
+    if (first_arg == null or (!std.mem.eql(u8, first_arg.?, "doctor") and !std.mem.eql(u8, first_arg.?, "setup") and !std.mem.eql(u8, first_arg.?, "session-fences") and !std.mem.eql(u8, first_arg.?, "cloak-audit") and !std.mem.eql(u8, first_arg.?, "--initialize-guest-issuer") and !std.mem.eql(u8, first_arg.?, "--check-service-identity"))) {
         std.debug.print(
             \\
             \\  Onyx Server {s}
@@ -1045,10 +1849,25 @@ pub fn main(init: std.process.Init) !void {
             // Advertise only the current exact contract. A pre-S2S-v5 writer
             // cannot preserve authenticated partial frames, so its probe must
             // refuse this target while the predecessor still serves clients.
-            std.debug.print("{s}\n", .{
-                onyx_server.daemon.helix.live.upgrade_capability_advertisement,
-            });
+            std.debug.print("{s}\n", .{onyx_server.daemon.helix.live.upgrade_capability_advertisement});
+            if (comptime builtin.os.tag == .linux)
+                std.debug.print("{s}\n", .{onyx_server.daemon.helix.live.boot_policy_capability_token});
             return;
+        } else if (std.mem.eql(u8, first, "--check-service-identity")) {
+            if (comptime builtin.os.tag != .linux) std.process.exit(1);
+            const raw_path = args.next();
+            const extra = args.next();
+            const path = onyx_server.service_identity_preflight.strictPath(raw_path, extra) catch std.process.exit(1);
+            const resolver = onyx_server.daemon.config_format.Resolver{ .ctx = @ptrCast(&resolver_ctx), .env = envLookup, .file = fileLookup };
+            const owner = onyx_server.service_identity_preflight.loadPreparedBoot(allocator, init.io, std.Io.Dir.cwd(), path, srv_cfg, resolver) catch std.process.exit(1);
+            owner.deinit();
+            return;
+        } else if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.strict_existing_identity_arg)) {
+            if (comptime builtin.os.tag != .linux) return error.UnsupportedServiceIdentity;
+            const raw_path = args.next();
+            const extra = args.next();
+            config_path_arg = try onyx_server.service_identity_preflight.strictPath(raw_path, extra);
+            strict_existing_identity = true;
         } else
         // `onyx-server --supervisor` is the Helix in-process-upgrade successor mode:
         // a fresh image execve'd by an UPGRADE handoff. If the handoff env fds are
@@ -1094,37 +1913,106 @@ pub fn main(init: std.process.Init) !void {
             // The successor carries its config path as the arg after --supervisor,
             // so it boots with the SAME config (ports/certs/opers/cloak) as the
             // predecessor — not the built-in defaults.
-            config_path_arg = args.next();
+            const path = args.next();
+            const flag = args.next();
+            const extra = if (flag != null) args.next() else null;
+            const selection = try onyx_server.service_identity_preflight.supervisorPath(path, flag, extra);
+            if (comptime builtin.os.tag != .linux) if (selection.strict) return error.UnsupportedServiceIdentity;
+            config_path_arg = selection.path;
+            strict_existing_identity = selection.strict;
+        } else
+        // Setup always exits before daemon/key/service activation.
+        if (std.mem.eql(u8, first, "setup")) {
+            var rest: std.ArrayList([]const u8) = .empty;
+            defer rest.deinit(allocator);
+            while (args.next()) |arg| try rest.append(allocator, arg);
+            return runSetup(init, srv_cfg, .{
+                .ctx = @ptrCast(&resolver_ctx),
+                .env = envLookup,
+                .file = fileLookup,
+            }, rest.items);
+        } else
+        // Offline audit exits before config, key derivation or daemon startup.
+        if (std.mem.eql(u8, first, "cloak-audit")) {
+            var rest: std.ArrayList([]const u8) = .empty;
+            defer rest.deinit(allocator);
+            while (args.next()) |arg| {
+                if (rest.items.len == 8) {
+                    std.debug.print("{s}", .{cloak_audit_cli.usage});
+                    std.process.exit(2);
+                }
+                try rest.append(allocator, arg);
+            }
+            const opts = cloak_audit_cli.parse(rest.items) catch {
+                std.debug.print("{s}", .{cloak_audit_cli.usage});
+                std.process.exit(2);
+            };
+            cloak_audit_cli.run(allocator, init.io, opts, std.Io.File.stdout()) catch {
+                std.debug.print("cloak-audit: audit refused\n", .{});
+                std.process.exit(1);
+            };
+            return;
+        } else
+        // Offline export owns only its private baseline and new output artifact.
+        if (std.mem.eql(u8, first, "session-fences")) {
+            var rest: std.ArrayList([]const u8) = .empty;
+            defer rest.deinit(allocator);
+            while (args.next()) |arg| {
+                if (rest.items.len == 10) {
+                    std.debug.print("{s}", .{session_retirement_cli.usage});
+                    std.process.exit(2);
+                }
+                try rest.append(allocator, arg);
+            }
+            const opts = session_retirement_cli.parse(rest.items) catch {
+                std.debug.print("{s}", .{session_retirement_cli.usage});
+                std.process.exit(2);
+            };
+            const result = session_retirement_cli.run(allocator, init.io, opts, .{
+                .ctx = @ptrCast(&resolver_ctx),
+                .env = envLookup,
+                .file = fileLookup,
+            }) catch |err| {
+                std.debug.print("session-fences: export refused ({s}); no policy content is printed\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            var output: [256]u8 = undefined;
+            const digest = std.fmt.bytesToHex(result.sha256, .lower);
+            const summary = try std.fmt.bufPrint(&output, "{{\"mode\":\"retirement_policy_exported\",\"grants\":{d},\"sha256\":\"{s}\",\"source\":\"private_offline_baseline\"}}\n", .{ result.grants, digest });
+            try std.Io.File.stdout().writeStreamingAll(init.io, summary);
+            return;
         } else
         // GAP-O4 read-only doctor exits before daemon setup or any listener bind.
         if (std.mem.eql(u8, first, "doctor")) {
-            const path = args.next() orelse {
-                std.debug.print("usage: onyx-server doctor <config> [metrics-url]\n", .{});
+            var rest: std.ArrayList([]const u8) = .empty;
+            defer rest.deinit(allocator);
+            while (args.next()) |arg| try rest.append(allocator, arg);
+            const opts = parseDoctorArgs(rest.items) catch {
+                std.debug.print("usage: onyx-server doctor <config> [metrics-url | --peer-config <path>] [--json]\n", .{});
                 std.process.exit(2);
             };
-            const metrics_url = args.next();
-            if (args.next() != null) {
-                std.debug.print("usage: onyx-server doctor <config> [metrics-url]\n", .{});
-                std.process.exit(2);
-            }
             const resolver = onyx_server.daemon.config_format.Resolver{
                 .ctx = @ptrCast(&resolver_ctx),
                 .env = envLookup,
                 .file = fileLookup,
             };
-            const config_text = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20)) catch |err| {
-                std.debug.print("doctor: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+            if (opts.peer_config != null) {
+                if (!try doctorCloakCompare(allocator, init.io, opts, srv_cfg, resolver)) std.process.exit(1);
+                return;
+            }
+            const config_text = std.Io.Dir.cwd().readFileAlloc(init.io, opts.config, allocator, .limited(onyx_server.daemon.config_format.max_config_bytes)) catch |err| {
+                std.debug.print("doctor: cannot read candidate: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
             defer allocator.free(config_text);
-            var loaded = onyx_server.daemon.config_boot.loadFromText(allocator, config_text, srv_cfg, resolver) catch |err| {
-                std.debug.print("doctor: cannot load {s}: {s}\n", .{ path, @errorName(err) });
+            var loaded = onyx_server.daemon.config_boot.loadFromTextQuiet(allocator, config_text, srv_cfg, resolver) catch |err| {
+                std.debug.print("doctor: cannot load candidate: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
             defer loaded.deinit(allocator);
-            const result = try onyx_server.daemon.doctor.report(allocator, init.io, &loaded, metrics_url, null, onyx_server.daemon.doctor.fetchMetrics);
+            const result = try onyx_server.daemon.doctor.report(allocator, init.io, &loaded, opts.metrics_url, null, onyx_server.daemon.doctor.fetchMetrics);
             defer result.deinit(allocator);
-            std.debug.print("{s}", .{result.lines});
+            try writeDoctorResult(allocator, init.io, result, opts.json);
             if (result.failed) std.process.exit(1);
             return;
         } else
@@ -1145,6 +2033,25 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             std.debug.print("private directory ready: {s}\n", .{path});
+            return;
+        } else if (std.mem.eql(u8, first, "--initialize-guest-issuer")) {
+            const path = args.next() orelse {
+                std.debug.print("usage: onyx-server --initialize-guest-issuer <config.toml>\n", .{});
+                std.process.exit(2);
+            };
+            if (args.next() != null) {
+                std.debug.print("usage: onyx-server --initialize-guest-issuer <config.toml>\n", .{});
+                std.process.exit(2);
+            }
+            initializeGuestIssuerOffline(init, path, srv_cfg, .{
+                .ctx = @ptrCast(&resolver_ctx),
+                .env = envLookup,
+                .file = fileLookup,
+            }) catch |err| {
+                std.debug.print("guest issuer initialization refused ({s})\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            std.debug.print("guest issuer initialized\n", .{});
             return;
         } else
         // `onyx-server --check-config <path> [--against <running.toml>]` parses a
@@ -1173,7 +2080,7 @@ pub fn main(init: std.process.Init) !void {
                 .env = envLookup,
                 .file = fileLookup,
             };
-            if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20))) |text| {
+            if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(onyx_server.daemon.config_format.max_config_bytes))) |text| {
                 defer allocator.free(text);
                 if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
                     var l = loaded;
@@ -1302,7 +2209,7 @@ pub fn main(init: std.process.Init) !void {
                         std.debug.print("config OCG2: {s}\n", .{@tagName(role)});
                     }
                     if (against_path) |base_path| {
-                        const base_text = std.Io.Dir.cwd().readFileAlloc(init.io, base_path, allocator, .limited(1 << 20)) catch |err| {
+                        const base_text = std.Io.Dir.cwd().readFileAlloc(init.io, base_path, allocator, .limited(onyx_server.daemon.config_format.max_config_bytes)) catch |err| {
                             std.debug.print("config ERROR: cannot read {s}: {s}\n", .{ base_path, @errorName(err) });
                             std.process.exit(1);
                         };
@@ -1318,6 +2225,36 @@ pub fn main(init: std.process.Init) !void {
                         )) |why| {
                             std.debug.print("config ERROR in {s}: {s}\n", .{ path, why });
                             std.process.exit(1);
+                        }
+                        // Q07 preview: classify every proven-field change
+                        // without printing values. Unclassified fields are
+                        // not guessed; the listener check above already
+                        // refuses the one change class proven fatal.
+                        preview: {
+                            var base_doc = onyx_server.proto.toml.parse(allocator, base_text) catch {
+                                std.debug.print("config preview: unavailable (base re-parse failed); classified changes not shown\n", .{});
+                                break :preview;
+                            };
+                            defer base_doc.deinit(allocator);
+                            var proposed_doc = onyx_server.proto.toml.parse(allocator, text) catch {
+                                std.debug.print("config preview: unavailable (candidate re-parse failed); classified changes not shown\n", .{});
+                                break :preview;
+                            };
+                            defer proposed_doc.deinit(allocator);
+                            var reloadable: usize = 0;
+                            var restart: usize = 0;
+                            var startup: usize = 0;
+                            for (onyx_server.daemon.config_format.classified_config_fields) |field| {
+                                if (!onyx_server.daemon.config_format.configFieldChanged(&base_doc, &proposed_doc, field)) continue;
+                                const class = onyx_server.daemon.config_format.configFieldClass(field);
+                                std.debug.print("config change: {s} ({s})\n", .{ field, @tagName(class) });
+                                switch (class) {
+                                    .reloadable => reloadable += 1,
+                                    .restart_required => restart += 1,
+                                    .startup_only => startup += 1,
+                                }
+                            }
+                            std.debug.print("config preview: {d} reloadable, {d} restart-required, {d} startup-only classified changed field(s); unclassified fields are not counted\n", .{ reloadable, restart, startup });
                         }
                     }
                     std.debug.print("config OK: {s}\n", .{path});
@@ -1412,10 +2349,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h")) {
             std.debug.print(
                 \\usage: onyx-server [CONFIG_PATH]
+                \\       onyx-server --initialize-guest-issuer <config.toml>
                 \\       onyx-server --check-config <path>
+                \\       onyx-server --check-service-identity <path>
+                \\       onyx-server --strict-existing-identity <path>
                 \\       onyx-server --init-private-dir <path>  (Windows)
                 \\       {s}
-                \\       onyx-server doctor <config> [metrics-url]
+                \\       onyx-server setup <config> [--service auto|openrc|systemd|foreground] [--json]
+                \\       onyx-server setup --new [--profile private|community|media] [--interactive] [--export <new.toml> | --draft <new.json>]
+                \\       onyx-server setup --resume <private-draft.json> [--interactive] [--export <new.toml>]
+                \\       onyx-server doctor <config> [metrics-url | --peer-config <path>] [--json]
+                \\       onyx-server session-fences export <config> --baseline <offline-dir> --issuer <key> --output <new-policy>
+                \\       onyx-server cloak-audit --kind <access|saccess|akick|ward|world|akick-record|ward-record|saccess-record> --input <private-checkpoint> --witness <private-json> [--checkpoint-output <new-file>]
                 \\       onyx-server --version
                 \\       onyx-server acme-issue ...
                 \\       onyx-server delegated-credential inspect|validate ...
@@ -1436,138 +2381,192 @@ pub fn main(init: std.process.Init) !void {
     // Load the config file — normal boot uses argv[1]; the UPGRADE successor uses
     // the path carried after --supervisor. One path for both so a hot-upgraded
     // process comes up on the real ports/certs/opers, not the defaults.
-    if (config_path_arg) |path| {
-        const resolver = onyx_server.daemon.config_format.Resolver{
-            .ctx = @ptrCast(&resolver_ctx),
-            .env = envLookup,
-            .file = fileLookup,
+    if (strict_existing_identity) {
+        const path = config_path_arg orelse return error.InvalidServiceArguments;
+        const resolver = onyx_server.daemon.config_format.Resolver{ .ctx = @ptrCast(&resolver_ctx), .env = envLookup, .file = fileLookup };
+        const owner = onyx_server.service_identity_preflight.loadPreparedBoot(allocator, init.io, std.Io.Dir.cwd(), path, srv_cfg, resolver) catch {
+            std.debug.print("onyx-server: strict service identity preflight refused\n", .{});
+            return error.StrictIdentityUnavailable;
         };
-        // Read through the same normalized source path that enters the Windows
-        // Helix proof. The resolver records the values actually used by parse.
-        const windows_source_path: ?[:0]u8 = if (comptime builtin.os.tag == .windows)
-            try std.Io.Dir.cwd().realPathFileAlloc(init.io, path, allocator)
-        else
-            null;
-        defer if (windows_source_path) |canonical| allocator.free(canonical);
-        const source_path = if (windows_source_path) |canonical| canonical else path;
-        if (std.Io.Dir.cwd().readFileAlloc(init.io, source_path, allocator, .limited(1 << 20))) |text| {
-            defer allocator.free(text); // string fields are duped by the parser
-            var windows_source_proof: ?windows_config_proof.Builder = null;
-            defer if (windows_source_proof) |*proof| proof.deinit();
-            defer resolver_ctx.windows_helix_proof = null;
-            if (comptime builtin.os.tag == .windows) {
-                windows_source_proof = try windows_config_proof.Builder.initCanonical(windows_source_path.?, text);
-                resolver_ctx.windows_helix_proof = &windows_source_proof.?;
-            }
-            if (managed_prelude != null) {
-                managed_commitment.record(1, path, text);
-                resolver_ctx.managed_commitment = &managed_commitment;
-            }
-            if (onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver)) |loaded| {
-                const windows_source_digest: ?windows_config_proof.Digest = if (comptime builtin.os.tag == .windows) blk: {
-                    const proof = if (windows_source_proof) |*p| p else unreachable;
-                    break :blk try proof.finish();
-                } else null;
-                resolver_ctx.windows_helix_proof = null;
-                if (windows_transfer) |*transfer| {
-                    // The static source proof is compared after read-only
-                    // config material loads. HXTM carries the exact serving
-                    // TLS generation separately; a provisional candidate
-                    // bootstrap leaf cannot serve before its COMMIT swap.
-                    if (loaded.parsed.node.secret_key == null or loaded.parsed.cloak.secret == null)
-                        windows_driver.candidateAbortNow();
-                    if (loaded.config.sasl_enabled and loaded.parsed.sasl.account_db != null) {
-                        if (transfer.wal == null) windows_driver.candidateAbortNow();
-                    } else if (transfer.wal != null) windows_driver.candidateAbortNow();
+        strict_owner = owner;
+        const loaded = owner.loaded;
+        if (onyx_server.daemon.config_boot.portableTransportError(builtin.os.tag, loaded.parsed) != null or
+            onyx_server.daemon.config_boot.configCheckError(loaded.io, loaded.tls.ktls) != null or
+            onyx_server.daemon.config_boot.unsecuredMeshPeerError(loaded.parsed.mesh.connect.len, loaded.parsed.mesh.require_secured) != null)
+            return error.InvalidServiceConfig;
+        held = loaded;
+        const carried_exe = srv_cfg.exe_path;
+        const carried_resume = srv_cfg.resume_arena_fd;
+        const carried_listen = srv_cfg.inherited_listener_fd;
+        const carried_list = srv_cfg.inherited_listener_fds;
+        const carried_state = srv_cfg.inherited_state_fds;
+        const carried_present = srv_cfg.inherited_state_fd_manifest_present;
+        const carried_valid = srv_cfg.inherited_state_fd_manifest_valid;
+        srv_cfg = loaded.config;
+        srv_cfg.exe_path = carried_exe;
+        srv_cfg.resume_arena_fd = carried_resume;
+        srv_cfg.inherited_listener_fd = carried_listen;
+        srv_cfg.inherited_listener_fds = carried_list;
+        srv_cfg.inherited_state_fds = carried_state;
+        srv_cfg.inherited_state_fd_manifest_present = carried_present;
+        srv_cfg.inherited_state_fd_manifest_valid = carried_valid;
+        srv_cfg.num_shards = loaded.num_shards;
+        srv_cfg.config_path = path;
+        srv_cfg.config_resolver = resolver;
+        srv_cfg.helix_boot_policy = .{ .strict_existing_identity = true, .config_env = owner.env_bindings.view() };
+        try srv_cfg.helix_boot_policy.validate();
+        if (loaded.parsed.logging.stderr_file) |log_path| {
+            onyx_server.daemon.dlog.configurePersistent(init.io, log_path) catch |err| {
+                std.debug.print("onyx-server: logging destination unavailable ({s}); retaining inherited stderr\n", .{@errorName(err)});
+            };
+        }
+    } else {
+        if (config_path_arg) |path| {
+            const resolver = onyx_server.daemon.config_format.Resolver{
+                .ctx = @ptrCast(&resolver_ctx),
+                .env = envLookup,
+                .file = fileLookup,
+            };
+            // Read through the same normalized source path that enters the Windows
+            // Helix proof. The resolver records the values actually used by parse.
+            const windows_source_path: ?[:0]u8 = if (comptime builtin.os.tag == .windows)
+                try std.Io.Dir.cwd().realPathFileAlloc(init.io, path, allocator)
+            else
+                null;
+            defer if (windows_source_path) |canonical| allocator.free(canonical);
+            const source_path = if (windows_source_path) |canonical| canonical else path;
+            if (std.Io.Dir.cwd().readFileAlloc(init.io, source_path, allocator, .limited(onyx_server.daemon.config_format.max_config_bytes))) |text| {
+                defer allocator.free(text); // string fields are duped by the parser
+                var windows_source_proof: ?windows_config_proof.Builder = null;
+                defer if (windows_source_proof) |*proof| proof.deinit();
+                defer resolver_ctx.windows_helix_proof = null;
+                if (comptime builtin.os.tag == .windows) {
+                    windows_source_proof = try windows_config_proof.Builder.initCanonical(windows_source_path.?, text);
+                    resolver_ctx.windows_helix_proof = &windows_source_proof.?;
                 }
                 if (managed_prelude != null) {
-                    managed_config_digest = managed_commitment.finish();
-                    resolver_ctx.managed_commitment = null;
+                    managed_commitment.record(1, path, text);
+                    resolver_ctx.managed_commitment = &managed_commitment;
                 }
-                if (onyx_server.daemon.config_boot.portableTransportError(builtin.os.tag, loaded.parsed)) |why| {
-                    std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
-                    std.process.exit(1);
+                if (comptime builtin.os.tag == .linux) resolver_ctx.env_collector = &ordinary_env;
+                const boot_result = onyx_server.daemon.config_boot.loadFromText(allocator, text, srv_cfg, resolver);
+                resolver_ctx.env_collector = null;
+                if (resolver_ctx.env_collector_failed) {
+                    if (boot_result) |result| {
+                        var discarded = result;
+                        discarded.deinit(allocator);
+                    } else |_| {}
+                    return error.InvalidBootPolicy;
                 }
-                if (comptime builtin.os.tag == .windows) {
-                    if (loaded.config.sasl_enabled) if (loaded.parsed.sasl.account_db) |db| {
-                        onyx_server.daemon.os_runtime.requirePrivateDirectoryWindows(init.io, std.Io.Dir.cwd(), db) catch |err| {
-                            std.debug.print("onyx-server: fatal account store directory for {s}: {s}\n", .{ db, @errorName(err) });
-                            std.process.exit(1);
-                        };
-                    };
-                    if (loaded.parsed.backup.dir.len != 0) {
-                        const backup_dir = onyx_server.daemon.os_runtime.openPrivateDirectoryWindows(init.io, std.Io.Dir.cwd(), loaded.parsed.backup.dir) catch |err| {
-                            std.debug.print("onyx-server: fatal backup directory for {s}: {s}\n", .{ loaded.parsed.backup.dir, @errorName(err) });
-                            std.process.exit(1);
-                        };
-                        backup_dir.close(init.io);
+                if (boot_result) |loaded| {
+                    const windows_source_digest: ?windows_config_proof.Digest = if (comptime builtin.os.tag == .windows) blk: {
+                        const proof = if (windows_source_proof) |*p| p else unreachable;
+                        break :blk try proof.finish();
+                    } else null;
+                    resolver_ctx.windows_helix_proof = null;
+                    if (windows_transfer) |*transfer| {
+                        // The static source proof is compared after read-only
+                        // config material loads. HXTM carries the exact serving
+                        // TLS generation separately; a provisional candidate
+                        // bootstrap leaf cannot serve before its COMMIT swap.
+                        if (loaded.parsed.node.secret_key == null or loaded.parsed.cloak.secret == null)
+                            windows_driver.candidateAbortNow();
+                        if (loaded.config.sasl_enabled and loaded.parsed.sasl.account_db != null) {
+                            if (transfer.wal == null) windows_driver.candidateAbortNow();
+                        } else if (transfer.wal != null) windows_driver.candidateAbortNow();
                     }
-                    if (loaded.parsed.webpush.enabled) {
-                        onyx_server.daemon.os_runtime.requirePrivateDirectoryWindows(init.io, std.Io.Dir.cwd(), loaded.parsed.webpush.vapid_key_path) catch |err| {
-                            std.debug.print("onyx-server: fatal VAPID key directory for {s}: {s}\n", .{ loaded.parsed.webpush.vapid_key_path, @errorName(err) });
-                            std.process.exit(1);
-                        };
+                    if (managed_prelude != null) {
+                        managed_config_digest = managed_commitment.finish();
+                        resolver_ctx.managed_commitment = null;
                     }
-                    validateWindowsCompanionInputs(allocator, init.io, loaded.parsed, &windows_geo) catch |err| {
-                        std.debug.print("onyx-server: fatal Windows companion preflight: {s}\n", .{@errorName(err)});
+                    if (onyx_server.daemon.config_boot.portableTransportError(builtin.os.tag, loaded.parsed)) |why| {
+                        std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
                         std.process.exit(1);
-                    };
+                    }
+                    if (comptime builtin.os.tag == .windows) {
+                        if (loaded.config.sasl_enabled) if (loaded.parsed.sasl.account_db) |db| {
+                            onyx_server.daemon.os_runtime.requirePrivateDirectoryWindows(init.io, std.Io.Dir.cwd(), db) catch |err| {
+                                std.debug.print("onyx-server: fatal account store directory for {s}: {s}\n", .{ db, @errorName(err) });
+                                std.process.exit(1);
+                            };
+                        };
+                        if (loaded.parsed.backup.dir.len != 0) {
+                            const backup_dir = onyx_server.daemon.os_runtime.openPrivateDirectoryWindows(init.io, std.Io.Dir.cwd(), loaded.parsed.backup.dir) catch |err| {
+                                std.debug.print("onyx-server: fatal backup directory for {s}: {s}\n", .{ loaded.parsed.backup.dir, @errorName(err) });
+                                std.process.exit(1);
+                            };
+                            backup_dir.close(init.io);
+                        }
+                        if (loaded.parsed.webpush.enabled) {
+                            onyx_server.daemon.os_runtime.requirePrivateDirectoryWindows(init.io, std.Io.Dir.cwd(), loaded.parsed.webpush.vapid_key_path) catch |err| {
+                                std.debug.print("onyx-server: fatal VAPID key directory for {s}: {s}\n", .{ loaded.parsed.webpush.vapid_key_path, @errorName(err) });
+                                std.process.exit(1);
+                            };
+                        }
+                        validateWindowsCompanionInputs(allocator, init.io, loaded.parsed, &windows_geo) catch |err| {
+                            std.debug.print("onyx-server: fatal Windows companion preflight: {s}\n", .{@errorName(err)});
+                            std.process.exit(1);
+                        };
+                    }
+                    if (onyx_server.daemon.config_boot.configCheckError(loaded.io, loaded.tls.ktls)) |why| {
+                        std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
+                        std.process.exit(1);
+                    }
+                    if (onyx_server.daemon.config_boot.unsecuredMeshPeerError(
+                        loaded.parsed.mesh.connect.len,
+                        loaded.parsed.mesh.require_secured,
+                    )) |why| {
+                        std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
+                        std.process.exit(1);
+                    }
+                    held = loaded;
+                    // Preserve the Helix handoff fields set above: `srv_cfg = loaded.config`
+                    // replaces the whole struct, and these are not config-file keys.
+                    const carried_exe = srv_cfg.exe_path;
+                    const carried_resume = srv_cfg.resume_arena_fd;
+                    const carried_listen = srv_cfg.inherited_listener_fd;
+                    const carried_listen_list = srv_cfg.inherited_listener_fds;
+                    const carried_state_fds = srv_cfg.inherited_state_fds;
+                    const carried_state_manifest_present = srv_cfg.inherited_state_fd_manifest_present;
+                    const carried_state_manifest_valid = srv_cfg.inherited_state_fd_manifest_valid;
+                    srv_cfg = loaded.config;
+                    windows_source_digest_boot = windows_source_digest;
+                    srv_cfg.windows_helix_raw_source_digest = windows_source_digest;
+                    srv_cfg.exe_path = carried_exe;
+                    srv_cfg.resume_arena_fd = carried_resume;
+                    srv_cfg.inherited_listener_fd = carried_listen;
+                    srv_cfg.inherited_listener_fds = carried_listen_list;
+                    srv_cfg.inherited_state_fds = carried_state_fds;
+                    srv_cfg.inherited_state_fd_manifest_present = carried_state_manifest_present;
+                    srv_cfg.inherited_state_fd_manifest_valid = carried_state_manifest_valid;
+                    srv_cfg.num_shards = loaded.num_shards;
+                    srv_cfg.config_path = path;
+                    srv_cfg.config_resolver = resolver;
+                    if (comptime builtin.os.tag == .linux) {
+                        srv_cfg.helix_boot_policy = .{ .config_env = ordinary_env.view() };
+                        try srv_cfg.helix_boot_policy.validate();
+                    }
+                    if (loaded.parsed.logging.stderr_file) |log_path| {
+                        // Keep the inherited sink if opening a replacement fails.
+                        // A logging-path race must never abort live Helix adoption.
+                        onyx_server.daemon.dlog.configurePersistent(init.io, log_path) catch |err| {
+                            std.debug.print("onyx-server: logging destination unavailable ({s}); retaining inherited stderr\n", .{@errorName(err)});
+                        };
+                    }
+                    // Windows pins every live companion to the effective config
+                    // proof and carries its process-owned state. A configured
+                    // native-media port has no socket when media is disabled.
+                    std.debug.print("onyx-server: loaded config from {s}\n", .{path});
+                } else |err| {
+                    std.debug.print("onyx-server: fatal config error in {s} ({s})\n", .{ path, @errorName(err) });
+                    return err;
                 }
-                if (onyx_server.daemon.config_boot.configCheckError(loaded.io, loaded.tls.ktls)) |why| {
-                    std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
-                    std.process.exit(1);
-                }
-                if (onyx_server.daemon.config_boot.unsecuredMeshPeerError(
-                    loaded.parsed.mesh.connect.len,
-                    loaded.parsed.mesh.require_secured,
-                )) |why| {
-                    std.debug.print("onyx-server: fatal config error in {s}: {s}\n", .{ path, why });
-                    std.process.exit(1);
-                }
-                held = loaded;
-                // Preserve the Helix handoff fields set above: `srv_cfg = loaded.config`
-                // replaces the whole struct, and these are not config-file keys.
-                const carried_exe = srv_cfg.exe_path;
-                const carried_resume = srv_cfg.resume_arena_fd;
-                const carried_listen = srv_cfg.inherited_listener_fd;
-                const carried_listen_list = srv_cfg.inherited_listener_fds;
-                const carried_state_fds = srv_cfg.inherited_state_fds;
-                const carried_state_manifest_present = srv_cfg.inherited_state_fd_manifest_present;
-                const carried_state_manifest_valid = srv_cfg.inherited_state_fd_manifest_valid;
-                srv_cfg = loaded.config;
-                windows_source_digest_boot = windows_source_digest;
-                srv_cfg.windows_helix_raw_source_digest = windows_source_digest;
-                srv_cfg.exe_path = carried_exe;
-                srv_cfg.resume_arena_fd = carried_resume;
-                srv_cfg.inherited_listener_fd = carried_listen;
-                srv_cfg.inherited_listener_fds = carried_listen_list;
-                srv_cfg.inherited_state_fds = carried_state_fds;
-                srv_cfg.inherited_state_fd_manifest_present = carried_state_manifest_present;
-                srv_cfg.inherited_state_fd_manifest_valid = carried_state_manifest_valid;
-                srv_cfg.num_shards = loaded.num_shards;
-                srv_cfg.config_path = path;
-                srv_cfg.config_resolver = resolver;
-                if (loaded.parsed.logging.stderr_file) |log_path| {
-                    // Keep the inherited sink if opening a replacement fails.
-                    // A logging-path race must never abort live Helix adoption.
-                    onyx_server.daemon.dlog.configurePersistent(init.io, log_path) catch |err| {
-                        std.debug.print("onyx-server: logging destination unavailable ({s}); retaining inherited stderr\n", .{@errorName(err)});
-                    };
-                }
-                // Windows pins every live companion to the effective config
-                // proof and carries its process-owned state. A configured
-                // native-media port has no socket when media is disabled.
-                std.debug.print("onyx-server: loaded config from {s}\n", .{path});
             } else |err| {
-                std.debug.print("onyx-server: fatal config error in {s} ({s})\n", .{ path, @errorName(err) });
+                std.debug.print("onyx-server: fatal — cannot read explicit config {s} ({s})\n", .{ path, @errorName(err) });
                 return err;
             }
-        } else |err| {
-            std.debug.print("onyx-server: fatal — cannot read explicit config {s} ({s})\n", .{ path, @errorName(err) });
-            return err;
         }
     }
-
     if (comptime builtin.os.tag == .openbsd) {
         native_driver.config_path = srv_cfg.config_path;
         srv_cfg.native_upgrade_hooks = native_driver.hooks();
@@ -1706,11 +2705,13 @@ pub fn main(init: std.process.Init) !void {
                 const ktls_offload = onyx_server.daemon.config_boot.resolveKtlsOffload(h.tls.ktls, ktls_capable);
                 srv_cfg.tls_ktls_tx = ktls_offload.tx;
                 srv_cfg.tls_ktls_rx = ktls_offload.rx;
-                if (ktls_offload.footgun) |msg| {
-                    std.debug.print("onyx-server: {s}\n", .{msg});
-                } else if (h.tls.ktls != .off) {
+                if (h.tls.ktls != .off) {
                     if (ktls_capable) {
-                        std.debug.print("onyx-server: kTLS TX offload ACTIVE (tx) — TLS 1.3 record crypto runs in the kernel\n", .{});
+                        if (h.tls.ktls == .txrx) {
+                            std.debug.print("onyx-server: kTLS TX+RX offload ACTIVE (txrx) — TLS 1.3 record crypto runs in the kernel\n", .{});
+                        } else {
+                            std.debug.print("onyx-server: kTLS TX offload ACTIVE (tx) — TLS 1.3 record crypto runs in the kernel\n", .{});
+                        }
                     } else {
                         std.debug.print("onyx-server: kTLS {s} requested but this kernel has no TLS ULP — TLS stays in userspace\n", .{@tagName(h.tls.ktls)});
                     }
@@ -1858,7 +2859,14 @@ pub fn main(init: std.process.Init) !void {
         false;
     const ocg2_requested = if (held) |h| h.ocg2.enabled else false;
     const configured_key: ?[]const u8 = if (held) |h| h.parsed.node.secret_key else null;
-    if (configured_key) |sk| {
+    if (strict_owner) |owner| {
+        const prepared = owner.takeIdentity() orelse return error.StrictIdentityUnavailable;
+        node_id_holder = prepared.node;
+        std.debug.print("onyx-server: strict service identity source: {s}\n", .{switch (prepared.source) {
+            .configured => "configured",
+            .existing_keyfile => "existing_keyfile",
+        }});
+    } else if (configured_key) |sk| {
         if (onyx_server.daemon.node_identity.fromConfig(sk, mesh_realm)) |ident| {
             node_id_holder = ident;
             std.debug.print("onyx-server: PQ-secured S2S enabled (node identity configured)\n", .{});
@@ -2221,40 +3229,21 @@ pub fn main(init: std.process.Init) !void {
     // key the daemon can no longer reproduce, so `previous_secret` grace applies
     // only to FUTURE rotations under this new Argon2id KDF, not to the SHA256→
     // Argon2id transition itself. That one-time invalidation is the accepted cost
-    // of retiring the weak KDF. (Separately, `[cloak] anon_epoch_secs` defaults to
-    // 24 h, so anonymous clients also switch from the hierarchical `.ip` cloak to
+    // of retiring the weak KDF. (Separately, non-zero `[cloak] anon_epoch_secs`
+    // means anonymous clients also switch from the hierarchical `.ip` cloak to
     // the opaque `.opq` epoch cloak on upgrade unless the operator sets it to 0.)
     var cloak_key_bytes: [onyx_server.proto.cloak.key_len]u8 = undefined;
-    const cloak_kdf_params = onyx_server.crypto.argon2_kdf.default_params;
-    const cloak_kdf_salt = onyx_server.crypto.argon2_kdf.cloak_key_salt;
     if (held) |h| {
-        if (h.parsed.cloak.secret) |secret| {
-            if (onyx_server.crypto.argon2_kdf.deriveKey(allocator, &cloak_key_bytes, secret, cloak_kdf_salt, cloak_kdf_params)) {
-                srv_cfg.cloak_key = onyx_server.proto.cloak.SecretKey.init(cloak_key_bytes);
-                if (comptime builtin.os.tag == .windows) srv_cfg.windows_helix_explicit_cloak_secret = true;
-            } else |err| {
-                if (windows_transfer != null) windows_driver.candidateAbortNow();
-                // Only reachable under catastrophic conditions (OOM for the
-                // 64 MiB scratch / thread-spawn failure). Leave cloak_key null so
-                // the random per-boot fallback below still keeps privacy on, and
-                // warn loudly (the mesh-federation caveat is printed there too).
-                std.debug.print("onyx-server: cloak key derivation failed ({s}); falling back to a per-boot random key\n", .{@errorName(err)});
-            }
-        }
-        // Previous cloak key (`[cloak] previous_secret`): kept live across a key
-        // rotation so WARD host/mask bans written under the old key keep matching.
-        // Derived through the same Argon2id path so old and new keys agree on KDF.
-        if (h.parsed.cloak.previous_secret) |prev| {
-            var prev_bytes: [onyx_server.proto.cloak.key_len]u8 = undefined;
-            if (onyx_server.crypto.argon2_kdf.deriveKey(allocator, &prev_bytes, prev, cloak_kdf_salt, cloak_kdf_params)) {
-                srv_cfg.cloak_prev_key = onyx_server.proto.cloak.SecretKey.init(prev_bytes);
-            } else |err| {
-                if (comptime builtin.os.tag == .windows) srv_cfg.windows_helix_explicit_cloak_secret = false;
-                if (windows_transfer != null) windows_driver.candidateAbortNow();
-                std.debug.print("onyx-server: previous cloak key derivation failed ({s}); rotation grace disabled this boot\n", .{@errorName(err)});
-            }
-            std.crypto.secureZero(u8, &prev_bytes);
-        }
+        var keys = deriveConfiguredCloakKeys(allocator, h.parsed.cloak.secret, h.parsed.cloak.previous_secret, onyx_server.crypto.argon2_kdf.deriveKey) catch |err| {
+            std.debug.print("onyx-server: configured cloak key derivation failed ({s}); refusing startup to preserve cloak policy\n", .{@errorName(err)});
+            if (windows_transfer != null) windows_driver.candidateAbortNow();
+            return err;
+        };
+        defer if (keys.current) |*key| key.wipe();
+        defer if (keys.previous) |*key| key.wipe();
+        srv_cfg.cloak_key = keys.current;
+        srv_cfg.cloak_prev_key = keys.previous;
+        if (comptime builtin.os.tag == .windows) srv_cfg.windows_helix_explicit_cloak_secret = keys.current != null;
         // Network-identifying cloak suffix (`[cloak] suffix`); borrowed from
         // the held config, which outlives the server.
         if (h.parsed.cloak.suffix) |suffix| srv_cfg.cloak_suffix = suffix;
@@ -2283,9 +3272,8 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("onyx-server: WARNING — meshed node has NO shared [cloak] secret; per-boot cloak keys break host/subnet ban federation and persistence. Set the SAME [cloak] secret on every mesh node.\n", .{});
         }
     }
-    // `srv_cfg.cloak_key` owns its own copy of the key; the local scratch buffer
-    // has served both the Argon2id-derive and random-fallback consumers, so wipe
-    // it — no live key material should linger on main's stack.
+    // `srv_cfg.cloak_key` owns its copy of the random key; erase the scratch
+    // buffer just as the configured-key path erases its derivation scratch.
     std.crypto.secureZero(u8, &cloak_key_bytes);
 
     if (comptime builtin.os.tag == .windows) {
@@ -2574,11 +3562,14 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer srv.deinit();
-    // This owner borrows TLS material retained by main and, on Windows, is
-    // published to Server for the source's exact paused Helix capture. Gate
+    // This owner borrows TLS material retained by main and is published to
+    // Server for the source's exact paused Helix capture. Gate
     // workers must join before this defer closes the inherited UDP socket.
     var wt_listener: ?onyx_server.daemon.webtransport_listener.WebTransportListener = null;
+    if (comptime builtin.os.tag == .linux) try srv.setLinuxWebTransportSlot(&wt_listener);
+    defer if (comptime builtin.os.tag == .linux) srv.setLinuxWebTransportSlot(null) catch unreachable;
     defer if (wt_listener) |*owner| {
+        if (comptime builtin.os.tag == .linux) srv.stopLinuxWebTransportWorker();
         if (comptime builtin.os.tag == .windows) srv.setWindowsWebTransportOwner(null) catch @panic("Windows WebTransport owner could not detach");
         owner.deinit();
     };
@@ -3303,7 +4294,10 @@ pub fn main(init: std.process.Init) !void {
             if (native_incoming != null) std.posix.system._exit(125);
             return err;
         };
-    } else if (comptime builtin.os.tag == .linux) try srv.adoptInheritedSessions();
+    } else if (comptime builtin.os.tag == .linux) {
+        try srv.adoptInheritedSessions();
+        try srv.prepareConfiguredGuestIssuer(srv.config.crypto_io orelse init.io);
+    }
     if (comptime builtin.os.tag == .windows) {
         if (windows_transfer != null) {
             srv.adoptInheritedSessions() catch |err| {
@@ -3451,7 +4445,7 @@ pub fn main(init: std.process.Init) !void {
         // Bind on all interfaces, dual-stack: the listener's socket is AF_INET6
         // with IPV6_V6ONLY=0, so `any_be` binds [::] and serves both IPv6 and
         // IPv4 (mapped) QUIC clients on one socket.
-        const wt_start = if (comptime builtin.os.tag == .windows) blk: {
+        const wt_start = if (comptime builtin.os.tag == .windows or builtin.os.tag == .linux) blk: {
             wt_listener.?.prepareColdResources(init.io, .any, srv_cfg.webtransport_port) catch |err| {
                 std.debug.print("onyx-server: WebTransport bind failed on UDP :{d} ({s})\n", .{ srv_cfg.webtransport_port, @errorName(err) });
                 return err;
@@ -3460,6 +4454,7 @@ pub fn main(init: std.process.Init) !void {
         } else wt_listener.?.start(onyx_server.daemon.webtransport_listener.any_be, srv_cfg.webtransport_port);
         wt_start catch |err| {
             std.debug.print("onyx-server: WebTransport bind failed on UDP :{d} ({s}); disabled\n", .{ srv_cfg.webtransport_port, @errorName(err) });
+            wt_listener.?.deinit();
             wt_listener = null;
             if (comptime builtin.os.tag == .windows) return err;
             break :wt;
@@ -3546,4 +4541,372 @@ test "managed boot: RSA leaf binds exact unsigned modulus and exponent" {
     wrong = private;
     wrong.e = &.{ 1, 0, 3 };
     try std.testing.expectError(error.TlsKeyMismatch, validateTlsIdentity(&.{leaf}, null, null, wrong));
+}
+
+test "setup customized candidate and private bundle validate before publication" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    const destination = try std.fs.path.join(allocator, &.{ path, "new-node" });
+    defer allocator.free(destination);
+    const settings = setup.workflow.Settings{ .hostname = "irc.example.test", .listen_host = "::1", .irc_port = 7000, .node_id = 17, .tls_enabled = true, .tls_port = 7001, .max_clients = 256, .media_port = 7100 };
+    var bundle = try setup_bundle.prepare(allocator, std.testing.io, destination, .media, settings, .{ .port = 6680 }, setupValidationError);
+    defer bundle.deinit(std.testing.io);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "new-node", .{}));
+    try std.testing.expect(std.mem.indexOf(u8, bundle.config.?, bundle.stage_name) == null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle.config.?, "secret_key") == null);
+    try std.testing.expect(bundle.certificate_expires_unix > std.Io.Clock.real.now(std.testing.io).toSeconds());
+    try bundle.commit(std.testing.io);
+    const dir = try tmp.dir.openDir(std.testing.io, "new-node", .{});
+    defer dir.close(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 0o700), @as(u32, (try dir.stat(std.testing.io)).permissions.toMode() & 0o777));
+    var seed = try onyx_server.daemon.node_keyfile.loadExisting(allocator, std.testing.io, dir, "onyx-server-node.key");
+    defer std.crypto.secureZero(u8, &seed);
+    var identity = try onyx_server.daemon.node_identity.fromSeed(seed, "");
+    defer identity.deinit();
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(identity.sign_kp.public_key, .lower), &bundle.public_key);
+    var collision = try setup_bundle.prepare(allocator, std.testing.io, destination, .private, settings, .{ .port = 6680 }, setupValidationError);
+    defer collision.deinit(std.testing.io);
+    try std.testing.expectError(error.PathAlreadyExists, collision.commit(std.testing.io));
+    var still_seed = try onyx_server.daemon.node_keyfile.loadExisting(allocator, std.testing.io, dir, "onyx-server-node.key");
+    defer std.crypto.secureZero(u8, &still_seed);
+    try std.testing.expectEqualSlices(u8, &seed, &still_seed);
+}
+
+fn setupBundleAllocationProbe(allocator: std.mem.Allocator, destination: []const u8) !void {
+    // config_format intentionally normalizes @file resolver failures to
+    // ParseError. The sweep first proves this exact template succeeds without
+    // injected failure; normalize that documented OOM boundary for its harness.
+    var bundle = setup_bundle.prepare(allocator, std.testing.io, destination, .private, .{ .tls_enabled = true }, .{ .port = 6680 }, setupValidationError) catch |err| switch (err) {
+        error.ParseError => return error.OutOfMemory,
+        else => return err,
+    };
+    defer bundle.deinit(std.testing.io);
+}
+
+// Test-only deterministic backing for the standard failure-injection sweep.
+// A failed remap exercises Allocator's alloc/copy fallback; a relocated remap
+// exercises the successful path independently of SafeAllocator bucket state.
+const SetupBundleSweepBacking = if (builtin.is_test) struct {
+    const Policy = enum { reject, relocate };
+    parent: std.mem.Allocator,
+    policy: Policy,
+    unexpected_oom: bool = false,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const result = self.parent.rawAlloc(len, alignment, ra);
+        if (result == null) self.unexpected_oom = true;
+        return result;
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(ctx: *anyopaque, old: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.policy == .reject) return null;
+        const result = self.parent.rawAlloc(new_len, alignment, ra) orelse {
+            self.unexpected_oom = true;
+            return null;
+        };
+        @memcpy(result[0..@min(old.len, new_len)], old[0..@min(old.len, new_len)]);
+        self.parent.rawFree(old, alignment, ra);
+        return result;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, alignment, ra);
+    }
+    const Context = struct { backing: *SetupBundleSweepBacking, dir: std.Io.Dir };
+    fn probe(allocator_: std.mem.Allocator, destination: []const u8, context: *Context) !void {
+        // The standard sweep creates this FailingAllocator around our backing.
+        const failing: *std.testing.FailingAllocator = @ptrCast(@alignCast(allocator_.ptr));
+        const result = setupBundleAllocationProbe(allocator_, destination);
+        const dir = try context.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var iterator = dir.iterate();
+        try std.testing.expect((try iterator.next(std.testing.io)) == null);
+        try std.testing.expect(!context.backing.unexpected_oom);
+        if (result) |_| {} else |err| {
+            if (err == error.OutOfMemory and !failing.has_induced_failure) return error.UnexpectedUninducedOutOfMemory;
+            return err;
+        }
+    }
+} else struct {};
+
+test "setup bundle sweep remap policies preserve data and ownership" {
+    const a = std.testing.allocator;
+    for ([_]SetupBundleSweepBacking.Policy{ .reject, .relocate }) |policy| {
+        var backing = SetupBundleSweepBacking{ .parent = a, .policy = policy };
+        const controlled = backing.allocator();
+        var bytes = try controlled.dupe(u8, "bundle-probe-data");
+        defer controlled.free(bytes);
+        const before = bytes.ptr;
+        if (controlled.remap(bytes, 8)) |moved| {
+            bytes = moved;
+            try std.testing.expectEqual(SetupBundleSweepBacking.Policy.relocate, policy);
+            try std.testing.expect(before != bytes.ptr);
+            try std.testing.expectEqualStrings("bundle-p", bytes);
+        } else {
+            try std.testing.expectEqual(SetupBundleSweepBacking.Policy.reject, policy);
+            try std.testing.expectEqualStrings("bundle-probe-data", bytes);
+        }
+        try std.testing.expect(!backing.unexpected_oom);
+    }
+}
+
+test "setup private bundle allocation failure sweep and validation refusal clean all staged state" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    const destination = try std.fs.path.join(allocator, &.{ path, "never-published" });
+    defer allocator.free(destination);
+    for ([_]SetupBundleSweepBacking.Policy{ .reject, .relocate }) |policy| {
+        var backing = SetupBundleSweepBacking{ .parent = allocator, .policy = policy };
+        var context = SetupBundleSweepBacking.Context{ .backing = &backing, .dir = tmp.dir };
+        try std.testing.checkAllAllocationFailures(backing.allocator(), SetupBundleSweepBacking.probe, .{ destination, &context });
+    }
+    const Refusal = struct {
+        fn reject(_: *const onyx_server.daemon.config_boot.Loaded) ?[]const u8 {
+            return "injected validation refusal";
+        }
+    };
+    try std.testing.expectError(error.InvalidBundleConfiguration, setup_bundle.prepare(allocator, std.testing.io, destination, .private, .{ .tls_enabled = true }, .{ .port = 6680 }, Refusal.reject));
+    const dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    try std.testing.expect((try iterator.next(std.testing.io)) == null);
+}
+
+test "setup account bundle cold verifies canonical SASL and exact reviewed privileges" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    const destination = try std.fs.path.join(allocator, &.{ path, "account-node" });
+    defer allocator.free(destination);
+    const settings = setup.workflow.Settings{ .tls_enabled = true, .bootstrap = .{ .account = "Alice", .privileges = "server_rehash,audit_read" } };
+    var bundle = try setup_bundle.prepareAuthenticated(allocator, std.testing.io, destination, .private, settings, .{ .port = 6680 }, "correct horse bootstrap secret", null, setupValidationError);
+    defer bundle.deinit(std.testing.io);
+    try std.testing.expectEqualStrings("alice", bundle.accountName().?);
+    try std.testing.expectEqualStrings("server_rehash,audit_read", bundle.account_privileges);
+    try std.testing.expect(std.mem.indexOf(u8, bundle.config.?, "correct horse bootstrap secret") == null);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, (try bundle.dir.statFile(std.testing.io, "accounts.wal", .{})).permissions.toMode() & 0o777));
+    try bundle.commit(std.testing.io);
+    const dir = try tmp.dir.openDir(std.testing.io, "account-node", .{});
+    defer dir.close(std.testing.io);
+    var store = try onyx_server.daemon.services.OroStore.openReadOnlyWithConfig(allocator, std.testing.io, dir, "accounts.wal", .{});
+    defer store.deinit();
+    var service = onyx_server.daemon.services.Services.init(&store, null);
+    try std.testing.expectEqual(@as(u32, 100_000), service.cfg.pbkdf2_rounds);
+    _ = try service.identifyAccount("alice", "correct horse bootstrap secret");
+    try std.testing.expectError(error.AuthFailed, service.identifyAccount("alice", "wrong password value"));
+    // Inspect only numeric work-factor metadata from real persisted SCRAM
+    // records. Never render verifier keys, salts, passwords or account rows.
+    var scram = onyx_server.daemon.services.ScramStore.init(allocator);
+    defer scram.deinit();
+    service.attachScramStore(&scram);
+    scram.setLoader(service.scramLoader());
+    const sha256_record = scram.resolve("alice") orelse return error.TestUnexpectedResult;
+    const sha512_record = scram.resolve512("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 100_000), sha256_record.iterations);
+    try std.testing.expectEqual(@as(u32, 100_000), sha512_record.iterations);
+}
+
+test "setup account allocation-sweep entry cold verifies real low-work-factor records" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    const destination = try std.fs.path.join(allocator, &.{ path, "unpublished-account-node" });
+    defer allocator.free(destination);
+    const settings = setup.workflow.Settings{ .tls_enabled = true, .bootstrap = .{ .account = "Alice" } };
+    var bundle = try setup_bundle.AllocationFailureSweep.prepareAuthenticated(allocator, std.testing.io, destination, .private, settings, .{ .port = 6680 }, "correct horse bootstrap secret", null, setupValidationError);
+    defer bundle.deinit(std.testing.io);
+    var store = try onyx_server.daemon.services.OroStore.openReadOnlyWithConfig(allocator, std.testing.io, bundle.dir, "accounts.wal", .{});
+    defer store.deinit();
+    var service = onyx_server.daemon.services.Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    try std.testing.expectEqual(@as(u32, 1), service.cfg.pbkdf2_rounds);
+    const verified = try service.identifyAccount("alice", "correct horse bootstrap secret");
+    try std.testing.expect(verified == .identified);
+    try std.testing.expectError(error.AuthFailed, service.identifyAccount("alice", "wrong password value"));
+    var scram = onyx_server.daemon.services.ScramStore.init(allocator);
+    defer scram.deinit();
+    service.attachScramStore(&scram);
+    scram.setLoader(service.scramLoader());
+    const sha256_record = scram.resolve("alice") orelse return error.TestUnexpectedResult;
+    const sha512_record = scram.resolve512("alice") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), sha256_record.iterations);
+    try std.testing.expectEqual(@as(u32, 1), sha512_record.iterations);
+    // Independently derive real keys from the cold records' metadata. Boolean
+    // assertions avoid dumping verifier bytes on failure; intermediates wipe.
+    var expected256 = try onyx_server.proto.sasl.deriveScramKeys("correct horse bootstrap secret", sha256_record.salt, sha256_record.iterations);
+    defer expected256.wipe();
+    var expected512 = try onyx_server.proto.sasl_scram512_server.deriveScramKeys("correct horse bootstrap secret", sha512_record.salt, sha512_record.iterations);
+    defer expected512.wipe();
+    try std.testing.expect(std.crypto.timing_safe.eql([32]u8, expected256.stored_key, sha256_record.stored_key));
+    try std.testing.expect(std.crypto.timing_safe.eql([32]u8, expected256.server_key, sha256_record.server_key));
+    try std.testing.expect(std.crypto.timing_safe.eql([64]u8, expected512.stored_key, sha512_record.stored_key));
+    try std.testing.expect(std.crypto.timing_safe.eql([64]u8, expected512.server_key, sha512_record.server_key));
+    // The reduced record is an unpublished test artifact; do not commit it.
+}
+
+test "setup account short write sync faults reject unpublished stage and allow retry" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    const destination = try std.fs.path.join(allocator, &.{ path, "account-node" });
+    defer allocator.free(destination);
+    const settings = setup.workflow.Settings{ .tls_enabled = true, .bootstrap = .{ .account = "Alice" } };
+    for ([_]onyx_server.daemon.store.PreparedIoFault{ .{ .write = .short }, .{ .write = .failed }, .{ .sync = true } }) |fault| {
+        try std.testing.expectError(error.IoAmbiguous, setup_bundle.prepareAuthenticated(allocator, std.testing.io, destination, .private, settings, .{ .port = 6680 }, "correct horse bootstrap secret", fault, setupValidationError));
+        const dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var iterator = dir.iterate();
+        try std.testing.expect((try iterator.next(std.testing.io)) == null);
+    }
+    var retry = try setup_bundle.prepareAuthenticated(allocator, std.testing.io, destination, .private, settings, .{ .port = 6680 }, "correct horse bootstrap secret", null, setupValidationError);
+    defer retry.deinit(std.testing.io);
+}
+
+test "setup account exhaustive allocation failures leave no stage or published account" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path);
+    const destination = try std.fs.path.join(allocator, &.{ path, "account-node" });
+    defer allocator.free(destination);
+    const settings = setup.workflow.Settings{ .tls_enabled = true, .bootstrap = .{ .account = "Alice", .privileges = "audit_read" } };
+    var reached_success = false;
+    for (0..10000) |index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = index });
+        // Only this exhaustive sweep selects reduced PLAIN and SCRAM work.
+        // Real registration, crypto, persistence and cold verification share
+        // the canonical bodies; the full-cost roundtrip stays independent.
+        if (setup_bundle.AllocationFailureSweep.prepareAuthenticated(failing.allocator(), std.testing.io, destination, .private, settings, .{ .port = 6680 }, "correct horse bootstrap secret", null, setupValidationError)) |value| {
+            var prepared = value;
+            prepared.deinit(std.testing.io);
+            reached_success = !failing.has_induced_failure;
+        } else |err| {
+            // Canonical registration/lookup intentionally maps or swallows some
+            // mirror OOMs. Accept a refusal only after an actual induced OOM.
+            if (!failing.has_induced_failure) return err;
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        const dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var iterator = dir.iterate();
+        try std.testing.expect((try iterator.next(std.testing.io)) == null);
+        if (reached_success) {
+            std.debug.print("setup account allocation sweep: injected every index before clean success at {d}\n", .{index});
+            break;
+        }
+    }
+    try std.testing.expect(reached_success);
+}
+
+const DoctorWipeProbe = if (builtin.is_test) struct {
+    parent: std.mem.Allocator,
+    frees: usize = 0,
+    nonzero_frees: usize = 0,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.parent.rawAlloc(n, alignment, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        for (memory) |byte| if (byte != 0) {
+            self.nonzero_frees += 1;
+            break;
+        };
+        self.parent.rawFree(memory, alignment, ra);
+    }
+    fn env(_: ?*anyopaque, a: std.mem.Allocator, _: []const u8) ![]const u8 {
+        return a.dupe(u8, "private-env-value");
+    }
+    fn file(_: ?*anyopaque, a: std.mem.Allocator, _: []const u8) ![]const u8 {
+        return a.dupe(u8, "private-file-value");
+    }
+    fn loadAndCompare(a: std.mem.Allocator) !void {
+        const text = "[node]\nid=1\n[listen]\nirc=6680\n[cloak]\nsecret = \"env:PRIVATE\"\nprevious_secret = \"@file:private\"\n";
+        const resolver = onyx_server.daemon.config_format.Resolver{ .env = env, .file = file };
+        var left = try onyx_server.daemon.config_boot.loadFromTextQuiet(a, text, .{ .port = 6680 }, resolver);
+        defer left.deinit(a);
+        var right = try onyx_server.daemon.config_boot.loadFromTextQuiet(a, text, .{ .port = 6680 }, resolver);
+        defer right.deinit(a);
+        const compared = try onyx_server.daemon.doctor.cloakComparison(a, &left, &right);
+        defer compared.deinit(a);
+        try std.testing.expect(!compared.failed);
+    }
+    fn compareOnly(a: std.mem.Allocator, left: *const onyx_server.daemon.config_boot.Loaded, right: *const onyx_server.daemon.config_boot.Loaded) !void {
+        const result = try onyx_server.daemon.doctor.cloakComparison(a, left, right);
+        defer result.deinit(a);
+        try std.testing.expect(!result.failed);
+        const json = try result.toJson(a);
+        defer a.free(json);
+    }
+} else struct {};
+
+test "doctor cloak scoped allocator wipes load and comparison at every allocation failure" {
+    const a = std.testing.allocator;
+    var successes: usize = 0;
+    for (0..4096) |index| {
+        var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        var observer = DoctorWipeProbe{ .parent = fail.allocator() };
+        var wipe = DoctorWipeAllocator{ .parent = observer.allocator() };
+        if (DoctorWipeProbe.loadAndCompare(wipe.allocator())) |_| {
+            successes += 1;
+            try std.testing.expect(!fail.has_induced_failure);
+            try std.testing.expect(observer.frees > 0);
+        } else |_| {
+            try std.testing.expect(fail.has_induced_failure);
+        }
+        try std.testing.expectEqual(@as(usize, 0), observer.nonzero_frees);
+        try std.testing.expectEqual(fail.allocated_bytes, fail.freed_bytes);
+        if (successes != 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), successes);
+    const text = "[node]\nid=1\n[listen]\nirc=6680\n[cloak]\nsecret = \"same-private\"\n";
+    var left = try onyx_server.daemon.config_boot.loadFromTextQuiet(a, text, .{ .port = 6680 }, .{});
+    defer left.deinit(a);
+    var right = try onyx_server.daemon.config_boot.loadFromTextQuiet(a, text, .{ .port = 6680 }, .{});
+    defer right.deinit(a);
+    successes = 0;
+    for (0..4096) |index| {
+        var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        var observer = DoctorWipeProbe{ .parent = fail.allocator() };
+        var wipe = DoctorWipeAllocator{ .parent = observer.allocator() };
+        if (DoctorWipeProbe.compareOnly(wipe.allocator(), &left, &right)) |_| {
+            successes += 1;
+            try std.testing.expect(!fail.has_induced_failure);
+            try std.testing.expect(observer.frees > 0);
+        } else |_| {
+            try std.testing.expect(fail.has_induced_failure);
+        }
+        try std.testing.expectEqual(@as(usize, 0), observer.nonzero_frees);
+        try std.testing.expectEqual(fail.allocated_bytes, fail.freed_bytes);
+        if (successes != 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), successes);
 }

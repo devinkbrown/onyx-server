@@ -129,7 +129,7 @@ pub fn Receiver(comptime max_payload: usize, comptime window: u32) type {
 fn toFecPacket(f: MediaFrame) red_fec.MediaPacket {
     return .{
         .seq = @truncate(f.sequence),
-        .pt = @intCast(@intFromEnum(f.codec) & 0x7f),
+        .pt = @intCast(@backingInt(f.codec) & 0x7f),
         .marker = f.keyframe,
         .timestamp = @truncate(f.timestamp),
         .payload = f.payload,

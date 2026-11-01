@@ -16,7 +16,7 @@ pub const Control = enum(u8) {
 
     /// Return the control byte for this formatting code.
     pub fn byte(self: Control) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Map one input byte to a known formatting control, if any.

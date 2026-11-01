@@ -220,7 +220,7 @@ pub const ReactorWake = struct {
             }
             const byte = [_]u8{1};
             while (std.c.send(self.write_handle, &byte, 1, std.c.MSG.NOSIGNAL) < 0) {
-                if (std.c._errno().* != @as(c_int, @intFromEnum(std.posix.E.INTR))) break;
+                if (std.c._errno().* != @as(c_int, @backingInt(std.posix.E.INTR))) break;
             }
             return;
         }
@@ -255,7 +255,7 @@ pub const ReactorWake = struct {
             for (0..64) |_| {
                 const rc = std.c.recv(self.handle, &bytes, bytes.len, 0);
                 if (rc > 0) continue;
-                if (rc < 0 and std.c._errno().* == @as(c_int, @intFromEnum(std.posix.E.INTR))) continue;
+                if (rc < 0 and std.c._errno().* == @as(c_int, @backingInt(std.posix.E.INTR))) continue;
                 break;
             }
             return;
@@ -479,7 +479,7 @@ test "BSD reactor wake: thread wake readiness coalesces without blocking or fd l
     try testing.expectEqual(@as(isize, 1), std.c.recv(wake.fd(), &byte, 1, 0));
     wake.drain();
     try testing.expectEqual(@as(isize, -1), std.c.recv(wake.fd(), &byte, 1, 0));
-    try testing.expectEqual(@as(c_int, @intFromEnum(std.posix.E.AGAIN)), std.c._errno().*);
+    try testing.expectEqual(@as(c_int, @backingInt(std.posix.E.AGAIN)), std.c._errno().*);
     wake.wake();
     try testing.expectEqual(@as(isize, 1), std.c.recv(wake.fd(), &byte, 1, 0));
 }

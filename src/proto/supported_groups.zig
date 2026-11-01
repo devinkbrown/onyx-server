@@ -49,12 +49,12 @@ pub const NamedGroup = enum(u16) {
 
     /// Wrap a raw wire `u16` as a `NamedGroup` (total over the enum).
     pub fn fromInt(value: u16) NamedGroup {
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// The raw wire `u16` for this group.
     pub fn toInt(self: NamedGroup) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

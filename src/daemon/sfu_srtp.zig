@@ -676,7 +676,7 @@ pub const SfuSrtp = struct {
 
     fn installIngress(self: *SfuSrtp, identity: u64, p: *PeerCtx, owner: *OwnerEntry, ssrc: u32, plain: []const u8, state: IngressState, ticks: u64) PreparedIngress {
         std.debug.assert(self.pending_ingress == null and identity != 0 and self.next_ingress != 0 and self.next_ingress != std.math.maxInt(u64));
-        const receipt: IngressReceipt = @enumFromInt((@as(u128, identity) << 64) | self.next_ingress);
+        const receipt: IngressReceipt = @fromBackingInt(@intCast((@as(u128, identity) << 64) | self.next_ingress));
         self.ingress_source = identity;
         self.next_ingress += 1;
         self.pending_ingress = .{ .issuer = self, .receipt = receipt, .peers_ptr = @intFromPtr(self.peers.ptr), .peers_len = self.peers.len, .peer = (@intFromPtr(p) - @intFromPtr(self.peers.ptr)) / @sizeOf(PeerCtx), .address = p.addr, .material = p.material, .inbound = p.inbound, .old_peer_use = p.last_use, .owner = (@intFromPtr(owner) - @intFromPtr(&self.owners[0])) / @sizeOf(OwnerEntry), .old_owner = owner.*, .next_owner = .{ .ssrc = ssrc, .addr = p.addr, .active = true, .last_use = self.clock +% 1 }, .clock = self.clock, .next_clock = self.clock +% ticks, .state = state, .plain = plain, .digest = ingressPlainDigest(plain) };

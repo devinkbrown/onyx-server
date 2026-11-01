@@ -292,3 +292,9 @@ test {
     _ = xor_filter;
     // gen:tests:end
 }
+
+// Private unadvertised guest-membership foundation discovery.
+pub const guest_membership_assembly = @import("guest_membership_assembly.zig");
+test {
+    _ = guest_membership_assembly;
+}

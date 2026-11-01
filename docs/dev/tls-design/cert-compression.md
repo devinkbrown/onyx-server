@@ -1,5 +1,8 @@
 # RFC 8879 certificate compression for Onyx Server's TLS 1.3 server
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../../README.md) and [production paths](../../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Design spike for RFC 8879 Certificate Compression in Onyx Server's Zig-native TLS stack. The server would negotiate the `compress_certificate` extension (27): the client lists compression algorithms it can decompress in ClientHello, and when it offers `zlib(1)` and the feature is config-enabled, the server compresses the Certificate message body and sends it as a new `CompressedCertificate(25)` handshake message in place of `Certificate(11)`. The whole thing reuses the in-tree `std.compress.flate` compressor in its `.zlib` (RFC 1950) container mode — I proved end-to-end (compress → RFC1950 stream → decompress round-trip + bomb-cap) against the deployed Zig 0.16 std, so no new compression dependency is needed. Only zlib is viable because std's zstd is decompress-only and there is no brotli in std. Wire compatibility is preserved by gating behind a default-off config flag; the deployed binary's bytes are unchanged until opted in, and even then it only triggers for clients that explicitly advertised support. Why: smaller Certificate flights (especially RSA chains with intermediates + embedded SCTs) cut handshake bytes and round-trip latency, and it is a modern, widely-implemented TLS extension consistent with Onyx Server's posture.
 
 ## RFC 8879 Certificate Compression — design (read-only spike, no code)

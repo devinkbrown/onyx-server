@@ -150,7 +150,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, carry: *const dnsbl.Snapshot
     std.mem.writeInt(u16, bytes[8..10], @intCast(dnsbl.cache_slots), .big);
     std.mem.writeInt(u16, bytes[10..12], @intCast(carry.job_count), .big);
     bytes[12] = @intCast(carry.zones.len);
-    bytes[13] = @intFromEnum(carry.execution);
+    bytes[13] = @backingInt(carry.execution);
     std.mem.writeInt(u64, bytes[16..24], @bitCast(carry.captured_monotonic_ms), .big);
     @memcpy(bytes[24..56], &carry.config_digest);
     std.mem.writeInt(u32, bytes[56..60], @intCast(total - header_len), .big);
@@ -165,7 +165,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, carry: *const dnsbl.Snapshot
     }
     for (carry.entries) |entry| {
         bytes[pos] = @intFromBool(entry.has_key);
-        bytes[pos + 1] = @intFromEnum(entry.state);
+        bytes[pos + 1] = @backingInt(entry.state);
         writeAddress(&bytes[pos + 2], bytes[pos + 4 ..][0..16], entry.key);
         bytes[pos + 3] = 0;
         bytes[pos + 20] = @intFromBool(entry.verdict.listed);

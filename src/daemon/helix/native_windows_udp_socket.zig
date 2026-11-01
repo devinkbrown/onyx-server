@@ -99,7 +99,7 @@ pub fn encodeFrame(transfer: *const Transfer, kind: Kind) Error!Frame {
     var body: Frame = @splat(0);
     @memcpy(body[0..4], frame_magic);
     std.mem.writeInt(u16, body[4..6], frame_version, .big);
-    body[6] = @intFromEnum(kind);
+    body[6] = @backingInt(kind);
     std.mem.writeInt(u32, body[8..12], transfer.target_pid, .big);
     std.mem.writeInt(u64, body[12..20], @intCast(transfer.source_socket), .big);
     @memcpy(body[20..], std.mem.asBytes(&transfer.info));
@@ -109,7 +109,7 @@ pub fn encodeFrame(transfer: *const Transfer, kind: Kind) Error!Frame {
 pub fn decodeFrame(bytes: []const u8, kind: Kind, target_pid: u32, source_socket: usize) Error!Transfer {
     if (bytes.len != frame_len or !std.mem.eql(u8, bytes[0..4], frame_magic) or
         std.mem.readInt(u16, bytes[4..6], .big) != frame_version or
-        bytes[6] != @intFromEnum(kind) or bytes[7] != 0 or target_pid == 0 or
+        bytes[6] != @backingInt(kind) or bytes[7] != 0 or target_pid == 0 or
         std.mem.readInt(u32, bytes[8..12], .big) != target_pid or
         std.mem.readInt(u64, bytes[12..20], .big) != source_socket or
         source_socket == invalid_socket)

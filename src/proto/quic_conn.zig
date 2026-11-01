@@ -940,7 +940,7 @@ fn captureServerHandshake(allocator: Allocator, source: *const quic_handshake.Se
     errdefer allocator.free(out_handshake);
     var pair = source.x25519_pair;
     defer pair.wipe();
-    const group: u8 = @intFromEnum(source.selected_group);
+    const group: u8 = @backingInt(source.selected_group);
     const hybrid = if (group == 1) source.hybrid_keyshare else @as(@FieldType(quic_handshake.Server, "hybrid_keyshare"), @splat(0));
     const part: ServerHandshakeSnapshot = .{
         .config_digest = try snapshotConfigDigest(allocator, source.config),
@@ -1479,7 +1479,7 @@ pub const Conn = struct {
             quic_transport_params.decode(hs.peer_params_storage.items) catch return error.InvalidSnapshot
         else
             null;
-        hs.selected_group = @enumFromInt(snapshot.handshake.selected_group);
+        hs.selected_group = @fromBackingInt(@intCast(snapshot.handshake.selected_group));
         hs.hybrid_keyshare = snapshot.handshake.hybrid_keyshare;
         try hs.transcript.appendSlice(allocator, snapshot.handshake.transcript);
         try hs.recv.appendSlice(allocator, snapshot.handshake.recv);

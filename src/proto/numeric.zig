@@ -270,14 +270,14 @@ fn buildNumericTable() [@typeInfo(Numeric).@"enum".field_names.len]Numeric {
     const field_values = @typeInfo(Numeric).@"enum".field_values;
     var table: [field_values.len]Numeric = undefined;
     for (field_values, 0..) |field_value, index| {
-        table[index] = @as(Numeric, @enumFromInt(field_value));
+        table[index] = @as(Numeric, @fromBackingInt(@intCast(field_value)));
     }
     return table;
 }
 
 /// Return the integer code for `n`.
 pub fn code(n: Numeric) u16 {
-    return @intFromEnum(n);
+    return @backingInt(n);
 }
 
 /// Return the symbolic IRC name for `n`.

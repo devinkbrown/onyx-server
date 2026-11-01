@@ -347,7 +347,7 @@ pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
         .{ .key = "tags", .value = .{ .string = msg.tags } },
         .{ .key = "target", .value = .{ .string = msg.target } },
         .{ .key = "text", .value = .{ .string = msg.text } },
-        .{ .key = "verb", .value = .{ .unsigned = @intFromEnum(msg.verb) } },
+        .{ .key = "verb", .value = .{ .unsigned = @backingInt(msg.verb) } },
     };
     return cpv.Encoder.encode(allocator, .{ .map = entries[0..] });
 }
@@ -541,7 +541,7 @@ pub fn originTranscript(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     try out.appendSlice(allocator, &u64_le);
     std.mem.writeInt(u64, &u64_le, msg.hlc, .little);
     try out.appendSlice(allocator, &u64_le);
-    try out.append(allocator, @intFromEnum(msg.verb));
+    try out.append(allocator, @backingInt(msg.verb));
     try appendLenPrefixed(&out, allocator, msg.source_prefix);
     try appendLenPrefixed(&out, allocator, msg.target);
     try appendLenPrefixed(&out, allocator, msg.text);

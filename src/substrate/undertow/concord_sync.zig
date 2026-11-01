@@ -241,7 +241,7 @@ pub const ConcordSync = struct {
 
     fn applySignedChannelDelta(self: *ConcordSync, signed: SignedDelta) Error!void {
         const view = DeltaView.decode(signed.env.op_bytes) catch return error.InvalidChannelDelta;
-        if (signed.env.family != @intFromEnum(view.family)) return error.InvalidChannelDelta;
+        if (signed.env.family != @backingInt(view.family)) return error.InvalidChannelDelta;
         if (signed.env.hlc != view.hlc.toU64()) return error.InvalidChannelDelta;
 
         switch (view.family) {
@@ -699,7 +699,7 @@ fn signChannelDelta(kp: *const signed_delta.KeyPair, op_bytes: []const u8, hlc: 
     return signed_delta.sign(.{
         .origin_node = signed_delta.nodeIdFromPublicKey(kp.public_key.toBytes()),
         .hlc = hlc,
-        .family = @intFromEnum(delta_codec.EntityFamily.memberships),
+        .family = @backingInt(delta_codec.EntityFamily.memberships),
         .scope = "#concord",
         .op_bytes = op_bytes,
     }, kp);

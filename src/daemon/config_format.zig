@@ -33,6 +33,9 @@ const s2s_peer_mod = @import("../substrate/undertow/s2s_peer.zig");
 const search_index_mod = @import("search_index.zig");
 const relay_v2_activation = @import("relay_v2_activation.zig");
 const relay_v2_event_log = @import("relay_v2_event_log.zig");
+const retired_fences = @import("session_group_retired_policy.zig");
+pub const max_config_bytes = @import("config_limits.zig").max_source_bytes;
+pub const default_sqpoll_idle_ms = @import("ringlane.zig").default_sqpoll_idle_ms;
 const node_identity = @import("node_identity.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 const wasm_abi = @import("../wasm/host/abi.zig");
@@ -98,6 +101,7 @@ pub const Config = struct {
     geoip: Geoip = .{},
     sasl: Sasl = .{},
     cloak: Cloak = .{},
+    guest_presence: GuestPresence = .{},
     tls: Tls = .{},
     acme: Acme = .{},
     ocsp: Ocsp = .{},
@@ -106,6 +110,12 @@ pub const Config = struct {
     dnsbl: Dnsbl = .{},
     mail: Mail = .{},
     webauthn: Webauthn = .{},
+
+    /// Durable local guest identity issuance. Provision explicitly before use;
+    /// an absent path leaves this pipeline disabled.
+    pub const GuestPresence = struct {
+        issuer_path: ?[]const u8 = null,
+    };
 
     /// `[dnsbl]` connect-time DNS blocklist. When enabled with one or more zones,
     /// each non-loopback client IP is checked against the zones off the hot path;
@@ -376,6 +386,8 @@ pub const Config = struct {
         /// Full secured-mesh Ed25519 node-key roster for the staged generation.
         /// This is deliberately distinct from direct-neighbor `trust_roots`.
         relay_v2_roster: []const []const u8 = &.{},
+        /// Exact historical denial facts; never active peer or receipt roots.
+        retired_session_group_fences: []const retired_fences.Grant = &.{},
         /// Runtime Undertow peer-driver limits/timers/capacities projected from
         /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.ripple]`.
         ///
@@ -486,6 +498,8 @@ pub const Config = struct {
         /// the flag through its setup ladder and falls back only on
         /// `error.ArgumentsInvalid`.
         sqpoll: bool = false,
+        /// Idle spin window for an enabled SQPOLL worker. Zero is refused.
+        sqpoll_idle_ms: u32 = default_sqpoll_idle_ms,
     };
 
     /// Decaying IP-reputation penalty weights.
@@ -733,20 +747,19 @@ pub const Config = struct {
         /// their stable, moderatable account/hierarchical cloak. Wall-clock based
         /// so every mesh node agrees on the epoch. `0` disables rotation
         /// (anonymous clients keep the stable cloak — pre-2026-07 behavior).
-        /// Default 86400 (24 h). Moderation of anonymous abuse shifts to account
-        /// bans + registration friction, which these opaque cloaks are designed
-        /// to require.
-        anon_epoch_secs: u64 = 86400,
+        /// Default 1209600 (14 days). Provenance-bearing opaque cloaks keep
+        /// host policy effective across rotations without retaining IP history.
+        anon_epoch_secs: u64 = 1_209_600,
     };
 
     /// TLS listener settings. The live listener is wired elsewhere; this section
     /// only describes intent. When `enabled` and no `cert_path`/`key_path` are
     /// given, the daemon bootstraps a self-signed Ed25519 leaf (see
     /// `tls_certs.loadOrBootstrap`) using `dns_name` as the CN/SAN.
-    /// kTLS (kernel TLS offload) mode (roadmap 3.1). `off` keeps TLS wholly in
-    /// userspace (the default and current behavior). `tx`/`txrx` opt into kernel
-    /// offload; the offload path is wired in Phase 1, so today these only widen
-    /// the boot-time capability report — no traffic is offloaded yet.
+    /// kTLS (kernel TLS offload) mode (roadmap 3.1). `off` keeps TLS wholly
+    /// in userspace. `tx` offloads server-to-client TLS 1.3 record encryption;
+    /// `txrx` also offloads client-to-server decryption. Both require the
+    /// running kernel to advertise the TLS ULP, otherwise TLS stays userspace.
     pub const KtlsMode = enum { off, tx, txrx };
 
     pub const Tls = struct {
@@ -783,10 +796,9 @@ pub const Config = struct {
         /// offers `client_certificate_type = RawPublicKey` may present a raw
         /// SPKI for SASL EXTERNAL CertFP. Default false keeps the classic path.
         raw_public_key: bool = false,
-        /// kTLS (kernel TLS offload) mode — see `Config.KtlsMode`. Default `off`.
-        /// `tx` is the safe opt-in. `txrx` parses, but boot refuses it: a
-        /// request_peer KeyUpdate has no kernel TLS_TX reinstall (documented
-        /// footgun in `config_boot.ktls_txrx_footgun`).
+        /// kTLS (kernel TLS offload) mode — see `Config.KtlsMode`. Default
+        /// `off`. `txrx` arms both directions on a kTLS-capable kernel; the
+        /// kernel-control KeyUpdate path reinstalls rotated RX and TX epochs.
         ktls: KtlsMode = .off,
         /// Additional SNI-selectable certificates (`[[tls.sni]]`, owned). When a
         /// ClientHello's server_name matches an entry's `server_names`, the TLS
@@ -1033,6 +1045,7 @@ pub const Config = struct {
         freeStringList(allocator, self.mesh.trust_roots);
         freeStringList(allocator, self.mesh.admission_roots);
         freeStringList(allocator, self.mesh.relay_v2_roster);
+        allocator.free(self.mesh.retired_session_group_fences);
         freeStringList(allocator, self.mesh.connect);
         freeStringList(allocator, self.dnsbl.zones);
         if (self.mail.relay_host) |value| allocator.free(value);
@@ -1067,6 +1080,7 @@ pub const Config = struct {
         if (self.cloak.previous_secret) |value| allocator.free(value);
         if (self.cloak.suffix) |value| allocator.free(value);
         if (self.cloak.mode) |value| allocator.free(value);
+        if (self.guest_presence.issuer_path) |value| allocator.free(value);
         allocator.free(self.tls.dns_name);
         if (self.tls.cert_path) |value| allocator.free(value);
         if (self.tls.key_path) |value| allocator.free(value);
@@ -1093,6 +1107,14 @@ pub const Config = struct {
 
 pub const TomlError = error{
     ParseError,
+    @"listen.trusted_proxies",
+    cloak,
+    @"cloak.secret",
+    @"cloak.previous_secret",
+    @"cloak.suffix",
+    @"cloak.mode",
+    @"cloak.account_cloak",
+    @"cloak.anon_epoch_secs",
     HiddenRecorderRefused,
     UnknownOcg2Field,
     MissingOcg2AuthorityNodeId,
@@ -1126,6 +1148,7 @@ pub fn containsOcg2Intent(source: []const u8) bool {
 
 /// Parse standard TOML and project it onto a defaulted `Config`.
 pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Resolver) TomlError!Config {
+    if (source.len > max_config_bytes) return error.ParseError;
     var doc = toml.parse(allocator, source) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ParseError,
@@ -1260,9 +1283,21 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("listen.ws_plain")) |b| cfg.listen.ws_plain = b;
     cfg.listen.webtransport = try portField(doc, "listen.webtransport", cfg.listen.webtransport);
     if (doc.getBool("listen.proxy_protocol")) |b| cfg.listen.proxy_protocol = b;
-    if (doc.getArray("listen.trusted_proxies")) |arr| {
+    if (doc.get("listen.trusted_proxies") != null) {
+        const arr = doc.getArray("listen.trusted_proxies") orelse return error.@"listen.trusted_proxies";
+        const resolved = ownStringArray(allocator, resolver, arr) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.@"listen.trusted_proxies",
+        };
         freeStringList(allocator, cfg.listen.trusted_proxies);
-        cfg.listen.trusted_proxies = try ownStringArray(allocator, resolver, arr);
+        cfg.listen.trusted_proxies = resolved;
+        // Match the runtime's exact IPv4/IPv6 literal parsers. CIDR and
+        // hostnames are not supported by trustedProxyMatches.
+        for (resolved) |value| {
+            if (std.Io.net.IpAddress.parseIp4(value, 0)) |_| continue else |_| {}
+            if (std.Io.net.IpAddress.parseIp6(value, 0)) |_| continue else |_| {}
+            return error.@"listen.trusted_proxies";
+        }
     }
     cfg.listen.s2s = try portField(doc, "listen.s2s", cfg.listen.s2s);
     cfg.listen.media = try portField(doc, "listen.media", cfg.listen.media);
@@ -1308,6 +1343,15 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         freeStringList(allocator, cfg.mesh.relay_v2_roster);
         cfg.mesh.relay_v2_roster = try ownStringArray(allocator, resolver, items);
     }
+    if (doc.get("mesh.retired_session_group_fences")) |value| {
+        const items = switch (value.*) {
+            .array => |items| items,
+            else => return error.ParseError,
+        };
+        const grants = try parseRetiredFenceGrants(allocator, items);
+        allocator.free(cfg.mesh.retired_session_group_fences);
+        cfg.mesh.retired_session_group_fences = grants;
+    }
     const relay_v2_plan_empty = cfg.mesh.relay_v2_activation_epoch == 0 and
         cfg.mesh.relay_v2_roster.len == 0;
     const relay_v2_plan_complete = cfg.mesh.relay_v2_activation_epoch != 0 and
@@ -1324,6 +1368,14 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     try validateRelayV2ActivationConfig(allocator, cfg);
     try parseMeshS2sConfig(doc, &cfg.mesh.s2s);
     cfg.mesh.s2s.require_signed_frames = cfg.mesh.require_signed_frames;
+
+    // [guest_presence]
+    if (doc.get("guest_presence")) |value| if (value.* != .table) return error.ParseError;
+    if (doc.get("guest_presence.issuer_path")) |value| if (value.* != .string) return error.ParseError;
+    try setOpt(allocator, resolver, doc.getString("guest_presence.issuer_path"), &cfg.guest_presence.issuer_path);
+    if (cfg.guest_presence.issuer_path) |path| {
+        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.ParseError;
+    }
 
     // [dnsbl]
     if (doc.getBool("dnsbl.enabled")) |b| cfg.dnsbl.enabled = b;
@@ -1390,6 +1442,11 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.io.cqe_batch = @intCast(try uintField(doc, "io.cqe_batch", cfg.io.cqe_batch, 16, 4096));
     if (doc.getBool("io.defer_taskrun")) |b| cfg.io.defer_taskrun = b;
     if (doc.getBool("io.sqpoll")) |b| cfg.io.sqpoll = b;
+    if (doc.get("io.sqpoll_idle_ms") != null) {
+        const idle = doc.getInt("io.sqpoll_idle_ms") orelse return error.ParseError;
+        if (idle < 1 or idle > 60_000) return error.ParseError;
+        cfg.io.sqpoll_idle_ms = @intCast(idle);
+    }
 
     // [reputation]
     cfg.reputation.registration_timeout_penalty = try floatField(doc, "reputation.registration_timeout_penalty", cfg.reputation.registration_timeout_penalty, 0, 1000);
@@ -1545,10 +1602,27 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     }
 
     // [cloak]
-    try setOpt(allocator, resolver, doc.getString("cloak.secret"), &cfg.cloak.secret);
-    try setOpt(allocator, resolver, doc.getString("cloak.previous_secret"), &cfg.cloak.previous_secret);
-    try setOpt(allocator, resolver, doc.getString("cloak.suffix"), &cfg.cloak.suffix);
-    try setOpt(allocator, resolver, doc.getString("cloak.mode"), &cfg.cloak.mode);
+    if (doc.get("cloak")) |value| if (value.* != .table) return error.cloak;
+    if (doc.get("cloak.secret")) |value| if (value.* != .string) return error.@"cloak.secret";
+    if (doc.get("cloak.previous_secret")) |value| if (value.* != .string) return error.@"cloak.previous_secret";
+    if (doc.get("cloak.suffix")) |value| if (value.* != .string) return error.@"cloak.suffix";
+    if (doc.get("cloak.mode")) |value| if (value.* != .string) return error.@"cloak.mode";
+    if (doc.get("cloak.account_cloak")) |value| if (value.* != .boolean) return error.@"cloak.account_cloak";
+    if (doc.get("cloak.anon_epoch_secs")) |value| if (value.* != .integer) return error.@"cloak.anon_epoch_secs";
+    try setCloakOpt(allocator, resolver, doc.getString("cloak.secret"), &cfg.cloak.secret, error.@"cloak.secret");
+    try setCloakOpt(allocator, resolver, doc.getString("cloak.previous_secret"), &cfg.cloak.previous_secret, error.@"cloak.previous_secret");
+    try setCloakOpt(allocator, resolver, doc.getString("cloak.suffix"), &cfg.cloak.suffix, error.@"cloak.suffix");
+    try setCloakOpt(allocator, resolver, doc.getString("cloak.mode"), &cfg.cloak.mode, error.@"cloak.mode");
+    if (cfg.cloak.mode) |mode| {
+        if (!std.mem.eql(u8, mode, "opaque") and !std.mem.eql(u8, mode, "hierarchical")) return error.@"cloak.mode";
+    }
+    for ([_]?[]const u8{ cfg.cloak.secret, cfg.cloak.previous_secret }) |secret| {
+        if (secret) |value| if (std.mem.trim(u8, value, " \t\r\n").len == 0) return error.ParseError;
+    }
+    if (cfg.cloak.suffix) |suffix| {
+        var suffix_buf: [253]u8 = undefined;
+        _ = @import("../proto/cloak.zig").normalizeSuffix(&suffix_buf, suffix) catch return error.ParseError;
+    }
     if (doc.getBool("cloak.account_cloak")) |b| cfg.cloak.account_cloak = b;
     // 0 disables anon rotation; cap at ~1 year so a fat-fingered value can't
     // wedge the epoch far in the future.
@@ -1894,6 +1968,30 @@ fn resolveStr(allocator: std.mem.Allocator, resolver: Resolver, raw: []const u8)
     return allocator.dupe(u8, raw);
 }
 
+// Scoped resolver keeps allocation failure distinct and never includes values in errors.
+fn setCloakOpt(allocator: std.mem.Allocator, resolver: Resolver, raw: ?[]const u8, slot: *?[]const u8, comptime invalid: TomlError) TomlError!void {
+    const value = raw orelse return;
+    const owned = if (std.mem.startsWith(u8, value, "env:")) blk: {
+        const name = value[4..];
+        if (name.len == 0) return invalid;
+        const lookup = resolver.env orelse return invalid;
+        break :blk lookup(resolver.ctx, allocator, name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return invalid,
+        };
+    } else if (std.mem.startsWith(u8, value, "@file:")) blk: {
+        const path = value[6..];
+        if (path.len == 0) return invalid;
+        const lookup = resolver.file orelse return invalid;
+        break :blk lookup(resolver.ctx, allocator, path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return invalid,
+        };
+    } else try allocator.dupe(u8, value);
+    if (slot.*) |old| allocator.free(old);
+    slot.* = owned;
+}
+
 /// Overlay an optional string field when the TOML supplies one.
 fn setOpt(allocator: std.mem.Allocator, resolver: Resolver, raw: ?[]const u8, slot: *?[]const u8) TomlError!void {
     const value = raw orelse return;
@@ -2105,6 +2203,118 @@ fn validateRelayV2ActivationConfig(allocator: std.mem.Allocator, cfg: Config) To
     }
 }
 
+fn retiredFenceDigest(raw: []const u8) TomlError!retired_fences.Digest {
+    if (raw.len != 64) return error.ParseError;
+    for (raw) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.ParseError;
+    var result: retired_fences.Digest = undefined;
+    _ = std.fmt.hexToBytes(&result, raw) catch return error.ParseError;
+    return result;
+}
+
+fn parseRetiredFenceGrants(allocator: std.mem.Allocator, items: []const toml.Value) TomlError![]retired_fences.Grant {
+    if (items.len > retired_fences.max_grants) return error.ParseError;
+    const raw = try allocator.alloc(retired_fences.Grant, items.len);
+    defer allocator.free(raw);
+    for (items, raw) |*item, *grant| {
+        if (item.* != .table or item.table.count() != 3) return error.ParseError;
+        grant.* = .{
+            .group_key = try retiredFenceDigest(item.getString("group_key") orelse return error.ParseError),
+            .issuer_key = try retiredFenceDigest(item.getString("issuer_key") orelse return error.ParseError),
+            .fact_digest = try retiredFenceDigest(item.getString("fact_digest") orelse return error.ParseError),
+        };
+    }
+    return retired_fences.canonicalize(allocator, raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ParseError,
+    };
+}
+
+const retired_fence_config_fixture =
+    "[node]\nid=1\n[listen]\nirc=6680\n" ++
+    "[[mesh.retired_session_group_fences]]\ngroup_key=\"" ++ "2222222222222222222222222222222222222222222222222222222222222222" ++ "\"\nissuer_key=\"" ++ "3333333333333333333333333333333333333333333333333333333333333333" ++ "\"\nfact_digest=\"" ++ "4444444444444444444444444444444444444444444444444444444444444444" ++ "\"\n" ++
+    "[[mesh.retired_session_group_fences]]\ngroup_key=\"" ++ "1111111111111111111111111111111111111111111111111111111111111111" ++ "\"\nissuer_key=\"" ++ "3333333333333333333333333333333333333333333333333333333333333333" ++ "\"\nfact_digest=\"" ++ "5555555555555555555555555555555555555555555555555555555555555555" ++ "\"\n";
+
+test "retired session fence config owns canonical grants and rejects ambiguous authority" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseToml(allocator, retired_fence_config_fixture, .{});
+    defer parsed.deinit(allocator);
+    const grants = parsed.mesh.retired_session_group_fences;
+    try std.testing.expectEqual(@as(usize, 2), grants.len);
+    try std.testing.expectEqual(@as(u8, 0x11), grants[0].group_key[0]);
+    try std.testing.expectEqual(@as(u8, 0x22), grants[1].group_key[0]);
+    try retired_fences.validateCanonical(grants);
+    for ([_][]const u8{
+        "[node]\nid=1\n[listen]\nirc=6680\n[mesh]\nretired_session_group_fences=\"ignored\"\n",
+        "[node]\nid=1\n[listen]\nirc=6680\n[mesh]\nretired_session_group_fences=[1]\n",
+        "[node]\nid=1\n[listen]\nirc=6680\n[[mesh.retired_session_group_fences]]\ngroup_key=\"bad\"\n",
+        retired_fence_config_fixture ++ "unknown_authority=true\n",
+        "[node]\nid=1\n[listen]\nirc=6680\n[[mesh.retired_session_group_fences]]\ngroup_key=\"" ++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ++ "\"\nissuer_key=\"" ++ "3333333333333333333333333333333333333333333333333333333333333333" ++ "\"\nfact_digest=\"" ++ "4444444444444444444444444444444444444444444444444444444444444444" ++ "\"\n",
+        "[node]\nid=1\n[listen]\nirc=6680\n[[mesh.retired_session_group_fences]]\ngroup_key=\"" ++ "0000000000000000000000000000000000000000000000000000000000000000" ++ "\"\nissuer_key=\"" ++ "3333333333333333333333333333333333333333333333333333333333333333" ++ "\"\nfact_digest=\"" ++ "4444444444444444444444444444444444444444444444444444444444444444" ++ "\"\n",
+    }) |invalid| try std.testing.expectError(error.ParseError, parseToml(allocator, invalid, .{}));
+    const duplicate: [retired_fences.max_grants + 1]toml.Value = @splat(.{ .integer = 0 });
+    try std.testing.expectError(error.ParseError, parseRetiredFenceGrants(allocator, &duplicate));
+    const same = "[[mesh.retired_session_group_fences]]\ngroup_key=\"" ++ "1111111111111111111111111111111111111111111111111111111111111111" ++ "\"\nissuer_key=\"" ++ "3333333333333333333333333333333333333333333333333333333333333333" ++ "\"\nfact_digest=\"" ++ "5555555555555555555555555555555555555555555555555555555555555555" ++ "\"\n";
+    try std.testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\n" ++ same ++ same, .{}));
+}
+
+test "retired session fence config allocation failures release policy and retry" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var parsed = try parseToml(allocator, retired_fence_config_fixture, .{});
+            defer parsed.deinit(allocator);
+            try retired_fences.validateCanonical(parsed.mesh.retired_session_group_fences);
+            try std.testing.expectEqual(@as(usize, 2), parsed.mesh.retired_session_group_fences.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+}
+
+test "retired session fence maximum export fits shared config source budget" {
+    const allocator = std.testing.allocator;
+    var text = std.Io.Writer.Allocating.init(allocator);
+    defer text.deinit();
+    try text.writer.writeAll("[node]\nid=1\n[listen]\nirc=6680\n");
+    for (0..retired_fences.max_grants) |index| {
+        var group: [32]u8 = @splat(1);
+        std.mem.writeInt(u32, group[0..4], @intCast(index + 1), .big);
+        const encoded = std.fmt.bytesToHex(group, .lower);
+        try text.writer.print("[[mesh.retired_session_group_fences]]\ngroup_key = \"{s}\"\nissuer_key = \"3333333333333333333333333333333333333333333333333333333333333333\"\nfact_digest = \"4444444444444444444444444444444444444444444444444444444444444444\"\n\n", .{encoded});
+    }
+    // Leave room for all 4096 active-roster key strings and field delimiters.
+    try std.testing.expect(text.written().len > 1 << 20);
+    try std.testing.expect(text.written().len + 4096 * 67 + 256 < max_config_bytes);
+    var parsed = try parseToml(allocator, text.written(), .{});
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(retired_fences.max_grants, parsed.mesh.retired_session_group_fences.len);
+    const oversized = try allocator.alloc(u8, max_config_bytes + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, ' ');
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.ParseError, parseToml(failing.allocator(), oversized, .{}));
+}
+
+test "sqpoll idle configuration is strict bounded and defaults to the measured burst profile" {
+    const allocator = std.testing.allocator;
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n[io]\n";
+    var defaults = try parseToml(allocator, base, .{});
+    defer defaults.deinit(allocator);
+    try std.testing.expect(!defaults.io.sqpoll);
+    try std.testing.expectEqual(@as(u32, 10), defaults.io.sqpoll_idle_ms);
+    for ([_]u32{ 1, 10, 1000, 60_000 }) |idle| {
+        const text = try std.fmt.allocPrint(allocator, "{s}sqpoll=true\nsqpoll_idle_ms={d}\n", .{ base, idle });
+        defer allocator.free(text);
+        var parsed = try parseToml(allocator, text, .{});
+        defer parsed.deinit(allocator);
+        try std.testing.expect(parsed.io.sqpoll);
+        try std.testing.expectEqual(idle, parsed.io.sqpoll_idle_ms);
+    }
+    for ([_][]const u8{ "0", "-1", "60001", "true", "\"10\"", "1.5" }) |invalid| {
+        const text = try std.fmt.allocPrint(allocator, "{s}sqpoll_idle_ms={s}\n", .{ base, invalid });
+        defer allocator.free(text);
+        try std.testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
+}
+
 fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!void {
     cfg.routes.max_nicks = @intCast(try uintField(doc, "mesh.routing.max_nicks", cfg.routes.max_nicks, 64, 10_000_000));
     cfg.routes.max_channels = @intCast(try uintField(doc, "mesh.routing.max_channels", cfg.routes.max_channels, 16, 1_000_000));
@@ -2229,6 +2439,272 @@ pub fn listenerSetFromConfig(cfg: Config) ListenerSet {
 pub fn listenerChangeError(live: ListenerSet, proposed: ListenerSet) ?[]const u8 {
     if (live.eql(proposed)) return null;
     return cold_restart_required_reason;
+}
+
+/// How a change to one named config field can take effect (Q07).
+/// `reloadable` is claimed only where a REHASH path applies the value live;
+/// `restart_required` covers the `ListenerSet` ports (see
+/// `listenerChangeError`) plus node identity / mesh realm, which REHASH
+/// refuses as cold maintenance; `startup_only` covers values consumed only
+/// while constructing the process at startup. Anything unlisted is
+/// `startup_only`: fail-closed, never guessed reloadable.
+pub const ConfigFieldClass = enum {
+    reloadable,
+    restart_required,
+    startup_only,
+};
+
+const reloadable_config_fields = [_][]const u8{
+    // `applyReloadedLimits` on REHASH: clone caps, nick delay, throttle, raid.
+    "limits.max_clones_per_ip",
+    "limits.max_clones_per_net",
+    "limits.max_clones_per_ip_net",
+    "limits.nick_delay",
+    "limits.throttle_connects",
+    "limits.throttle_window",
+    "limits.raid_joins",
+    "limits.raid_window",
+    // Connection-class registry and oper bindings are rebuilt on REHASH.
+    "class",
+    "opers",
+    // Wasm policy is repointed and plugins rescanned on REHASH.
+    "wasm.plugin_dir",
+    "wasm.max_plugin_bytes",
+    "wasm.max_memory_bytes",
+    "wasm.default_fuel",
+    "wasm.allowed_caps",
+    "wasm.allowed_intents",
+    "wasm.registry",
+    "wasm.revoked_blake3",
+    "wasm.disabled_plugins",
+    // Cert material is re-read and swapped for new handshakes on REHASH.
+    "tls.cert_path",
+    "tls.key_path",
+    "tls.dns_name",
+};
+
+const restart_required_config_fields = [_][]const u8{
+    // Every `ListenerSet` member: `listenerChangeError` above.
+    "listen.host",
+    "listen.irc",
+    "listen.ws",
+    "listen.webtransport",
+    "listen.s2s",
+    "listen.media",
+    "listen.native_media",
+    "tls.enabled",
+    "tls.port",
+    // REHASH refuses these as cold maintenance, keeping the current config.
+    "node.id",
+    "mesh.realm",
+};
+
+const startup_only_config_fields = [_][]const u8{
+    // Opened by `main` at startup (and by each Helix successor).
+    "logging.stderr_file",
+    // The metrics listener is started once from the boot projection.
+    "metrics.listen",
+    "metrics.bind",
+    // Cloak keys and cadence are derived/copied only at boot in `main`.
+    "cloak.secret",
+    "cloak.previous_secret",
+    "cloak.suffix",
+    "cloak.mode",
+    "cloak.account_cloak",
+    "cloak.anon_epoch_secs",
+    // Reactor topology is fixed when the pool is spun up at startup.
+    "limits.num_shards",
+    // OCG2 owns process-lifetime state; REHASH reports it restart-only.
+    "oper_ocg2.enabled",
+    "oper_ocg2.projection_enabled",
+    "oper_ocg2.minting_enabled",
+};
+
+/// Every field with a proven classification, for change previews.
+/// Fields absent from both documents are unchanged by definition.
+pub const classified_config_fields: []const []const u8 = &reloadable_config_fields ++ &restart_required_config_fields ++ &startup_only_config_fields;
+
+fn tomlValuesEqual(a: *const toml.Value, b: *const toml.Value, depth: usize) bool {
+    if (depth > 4) return false;
+    if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+    return switch (a.*) {
+        .string => |s| std.mem.eql(u8, s, b.string),
+        .integer => |n| n == b.integer,
+        .float => |f| f == b.float,
+        .boolean => |v| v == b.boolean,
+        .array => |items| blk: {
+            if (items.len != b.array.len) break :blk false;
+            for (items, b.array) |x, y| {
+                if (!tomlValuesEqual(&x, &y, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
+        .table => |*map| blk: {
+            if (map.count() != b.table.count()) break :blk false;
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                const other = b.table.get(entry.key_ptr.*) orelse break :blk false;
+                if (!tomlValuesEqual(entry.value_ptr, &other, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+/// True when `field` differs between two parsed TOML documents (present in
+/// one only, or with a different value). Values are never exposed.
+pub fn configFieldChanged(base: *const toml.Document, proposed: *const toml.Document, field: []const u8) bool {
+    const a = base.get(field);
+    const b = proposed.get(field);
+    if (a == null and b == null) return false;
+    if (a == null or b == null) return true;
+    return !tomlValuesEqual(a.?, b.?, 0);
+}
+
+/// Pure classification of a dotted TOML field name (exact, case-sensitive).
+/// Unknown or unproven fields classify `startup_only`.
+pub fn configFieldClass(field: []const u8) ConfigFieldClass {
+    for (reloadable_config_fields) |name| {
+        if (std.mem.eql(u8, field, name)) return .reloadable;
+    }
+    for (restart_required_config_fields) |name| {
+        if (std.mem.eql(u8, field, name)) return .restart_required;
+    }
+    for (startup_only_config_fields) |name| {
+        if (std.mem.eql(u8, field, name)) return .startup_only;
+    }
+    return .startup_only;
+}
+
+test "configFieldClass: provably reloadable fields classify reloadable" {
+    // Applied live by the REHASH path: anti-abuse limits, connection
+    // classes, oper bindings, Wasm policy, and TLS cert material.
+    for ([_][]const u8{
+        "limits.max_clones_per_ip",
+        "limits.max_clones_per_net",
+        "limits.max_clones_per_ip_net",
+        "limits.nick_delay",
+        "limits.throttle_connects",
+        "limits.throttle_window",
+        "limits.raid_joins",
+        "limits.raid_window",
+        "class",
+        "opers",
+        "wasm.plugin_dir",
+        "wasm.max_plugin_bytes",
+        "wasm.max_memory_bytes",
+        "wasm.default_fuel",
+        "wasm.allowed_caps",
+        "wasm.allowed_intents",
+        "wasm.registry",
+        "wasm.revoked_blake3",
+        "wasm.disabled_plugins",
+        "tls.cert_path",
+        "tls.key_path",
+        "tls.dns_name",
+    }) |field| {
+        try testing.expectEqual(ConfigFieldClass.reloadable, configFieldClass(field));
+    }
+}
+
+test "configFieldClass: listener fields classify restart_required and agree with listenerChangeError" {
+    for ([_][]const u8{
+        "listen.host",
+        "listen.irc",
+        "listen.ws",
+        "listen.webtransport",
+        "listen.s2s",
+        "listen.media",
+        "listen.native_media",
+        "tls.enabled",
+        "tls.port",
+        "node.id",
+        "mesh.realm",
+    }) |field| {
+        try testing.expectEqual(ConfigFieldClass.restart_required, configFieldClass(field));
+    }
+
+    // Agreement: an unchanged set has no cold-restart reason, and every
+    // ListenerSet member moved to a new port produces exactly that reason.
+    const live_cfg = Config{ .listen = .{ .irc = 6667, .ws = 8080, .webtransport = 8443, .s2s = 6900, .media = 5000, .native_media = 5001 }, .tls = .{ .enabled = true, .port = 6697 } };
+    const live = listenerSetFromConfig(live_cfg);
+    try testing.expect(listenerChangeError(live, live) == null);
+    var proposed_cfg = live_cfg;
+    proposed_cfg.listen.irc = 6668;
+    try testing.expectEqualStrings(cold_restart_required_reason, listenerChangeError(live, listenerSetFromConfig(proposed_cfg)).?);
+    proposed_cfg = live_cfg;
+    proposed_cfg.listen.ws = 8081;
+    try testing.expect(listenerChangeError(live, listenerSetFromConfig(proposed_cfg)) != null);
+    proposed_cfg = live_cfg;
+    proposed_cfg.listen.webtransport = 8444;
+    try testing.expect(listenerChangeError(live, listenerSetFromConfig(proposed_cfg)) != null);
+    proposed_cfg = live_cfg;
+    proposed_cfg.listen.s2s = 6901;
+    try testing.expect(listenerChangeError(live, listenerSetFromConfig(proposed_cfg)) != null);
+    proposed_cfg = live_cfg;
+    proposed_cfg.listen.media = 5002;
+    try testing.expect(listenerChangeError(live, listenerSetFromConfig(proposed_cfg)) != null);
+    proposed_cfg = live_cfg;
+    proposed_cfg.listen.native_media = 5003;
+    try testing.expect(listenerChangeError(live, listenerSetFromConfig(proposed_cfg)) != null);
+    proposed_cfg = live_cfg;
+    proposed_cfg.tls.port = 6698;
+    try testing.expect(listenerChangeError(live, listenerSetFromConfig(proposed_cfg)) != null);
+    proposed_cfg = live_cfg;
+    proposed_cfg.tls.enabled = false;
+    try testing.expect(listenerChangeError(live, listenerSetFromConfig(proposed_cfg)) != null);
+}
+
+test "configFieldClass: startup-consumed fields classify startup_only" {
+    for ([_][]const u8{
+        "logging.stderr_file",
+        "metrics.listen",
+        "metrics.bind",
+        "cloak.secret",
+        "cloak.previous_secret",
+        "cloak.suffix",
+        "cloak.mode",
+        "cloak.account_cloak",
+        "cloak.anon_epoch_secs",
+        "limits.num_shards",
+        "oper_ocg2.enabled",
+        "oper_ocg2.projection_enabled",
+        "oper_ocg2.minting_enabled",
+    }) |field| {
+        try testing.expectEqual(ConfigFieldClass.startup_only, configFieldClass(field));
+    }
+}
+
+test "configFieldClass: unknown and unproven fields fail closed to startup_only" {
+    for ([_][]const u8{
+        "",
+        "nope",
+        "limits.max_clients",
+        "network.name",
+        "tls.enable_resumption",
+        "listen.ws_plain",
+        "limits.max_clones_per_ip.extra",
+        "TLS.CERT_PATH",
+    }) |field| {
+        try testing.expectEqual(ConfigFieldClass.startup_only, configFieldClass(field));
+    }
+}
+
+test "configFieldChanged: detects value, presence, and table changes only" {
+    const allocator = testing.allocator;
+    var base = try toml.parse(allocator, "[limits]\nnick_delay = 5\n[cloak]\nsecret = \"a\"\n");
+    defer base.deinit(allocator);
+    var same = try toml.parse(allocator, "[limits]\nnick_delay = 5\n[cloak]\nsecret = \"a\"\n");
+    defer same.deinit(allocator);
+    var changed = try toml.parse(allocator, "[limits]\nnick_delay = 9\n[cloak]\nsecret = \"a\"\n[tls]\ncert_path = \"/tmp/c.pem\"\n");
+    defer changed.deinit(allocator);
+    try testing.expect(!configFieldChanged(&base, &same, "limits.nick_delay"));
+    try testing.expect(!configFieldChanged(&base, &same, "cloak.secret"));
+    try testing.expect(configFieldChanged(&base, &changed, "limits.nick_delay"));
+    try testing.expect(!configFieldChanged(&base, &changed, "cloak.secret"));
+    try testing.expect(configFieldChanged(&base, &changed, "tls.cert_path"));
+    try testing.expect(!configFieldChanged(&base, &changed, "listen.irc"));
+    try testing.expect(classified_config_fields.len >= reloadable_config_fields.len);
 }
 
 // ---------------------------------------------------------------------------
@@ -3738,8 +4214,8 @@ test "parseToml: [cloak] mode and account_cloak parse" {
     try testing.expectEqualStrings("opaque", cfg.cloak.mode.?);
     try testing.expect(cfg.cloak.account_cloak == true);
     try testing.expectEqualStrings("old-s3kr3t", cfg.cloak.previous_secret.?);
-    // anon_epoch_secs defaults to 24 h when absent.
-    try testing.expectEqual(@as(u64, 86400), cfg.cloak.anon_epoch_secs);
+    // anon_epoch_secs defaults to 14 days when absent.
+    try testing.expectEqual(@as(u64, 1_209_600), cfg.cloak.anon_epoch_secs);
 }
 
 test "parseToml: [cloak] anon_epoch_secs parses and 0 disables rotation" {
@@ -4452,4 +4928,163 @@ test "persistent logging configuration releases ownership at every allocation fa
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{});
+}
+
+test "parseToml: cloak rejects empty secrets and malformed public suffixes" {
+    inline for (.{
+        "[cloak]\nsecret=''\n",
+        "[cloak]\nprevious_secret='  '\n",
+        "[cloak]\nsuffix='bad suffix'\n",
+        "[cloak]\nsuffix='-bad.onyx'\n",
+    }) |section| {
+        try testing.expectError(error.ParseError, parseToml(testing.allocator, "[node]\nid=1\n[listen]\nirc=6680\n" ++ section, .{}));
+    }
+}
+
+test "trusted proxy configuration accepts only literal IP addresses" {
+    const a = std.testing.allocator;
+    const valid = "[node]\nid=1\n[listen]\nirc=6680\nproxy_protocol = true\ntrusted_proxies = [\"127.0.0.1\", \"::1\", \"2001:db8::1234\", \"::ffff:192.0.2.1\"]\n";
+    var parsed = try parseToml(a, valid, .{});
+    defer parsed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), parsed.listen.trusted_proxies.len);
+    var empty = try parseToml(a, "[node]\nid=1\n[listen]\nirc=6680\nproxy_protocol = true\ntrusted_proxies = []\n", .{});
+    defer empty.deinit(a);
+    try std.testing.expect(empty.listen.proxy_protocol and empty.listen.trusted_proxies.len == 0);
+    const invalid = [_][]const u8{
+        "[node]\nid=1\n[listen]\nirc=6680\ntrusted_proxies = [\"127.0.0.1/32\"]\n",
+        "[node]\nid=1\n[listen]\nirc=6680\ntrusted_proxies = [\"proxy.example\"]\n",
+        "[node]\nid=1\n[listen]\nirc=6680\ntrusted_proxies = [\"\"]\n",
+        "[node]\nid=1\n[listen]\nirc=6680\ntrusted_proxies = [\"127.0.0.1\", \"999.1.2.3\"]\n",
+        "[node]\nid=1\n[listen]\nirc=6680\ntrusted_proxies = [\"2001:db8:::1\"]\n",
+        "[node]\nid=1\n[listen]\nirc=6680\ntrusted_proxies = \"127.0.0.1\"\n",
+        "[node]\nid=1\n[listen]\nirc=6680\ntrusted_proxies = [1]\n",
+    };
+    for (invalid) |text| {
+        try std.testing.expectError(error.@"listen.trusted_proxies", parseToml(a, text, .{}));
+        try std.testing.expectError(error.@"listen.trusted_proxies", @import("config_boot.zig").loadFromTextQuiet(a, text, .{ .port = 6680 }, .{}));
+    }
+    var loaded = try @import("config_boot.zig").loadFromTextQuiet(a, valid, .{ .port = 6680 }, .{});
+    defer loaded.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), loaded.config.trusted_proxies.len);
+}
+
+fn trustedProxyInvalidAllocationProbe(allocator: std.mem.Allocator) !void {
+    const text = "[node]\nid=1\n[listen]\nirc=6680\ntrusted_proxies = [\"127.0.0.1\", \"::1\", \"bad.invalid\"]\n";
+    var parsed = parseToml(allocator, text, .{}) catch |err| switch (err) {
+        error.@"listen.trusted_proxies" => return,
+        else => return err,
+    };
+    parsed.deinit(allocator);
+    return error.TestUnexpectedResult;
+}
+
+test "trusted proxy invalid list frees every owned allocation under OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, trustedProxyInvalidAllocationProbe, .{});
+}
+
+fn cloakTestLookup(_: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
+    const value = if (std.mem.eql(u8, name, "MODE")) "opaque" else if (std.mem.eql(u8, name, "mode-file")) "hierarchical" else return error.NotFound;
+    return allocator.dupe(u8, value);
+}
+
+test "cloak configuration validates shape parserValue types and mode" {
+    const a = std.testing.allocator;
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n";
+    const Case = struct { text: []const u8, expected: TomlError };
+    const cases = [_]Case{
+        .{ .text = "[cloak]\nsecret=42\n", .expected = error.@"cloak.secret" },
+        .{ .text = "[cloak]\nsecret=[]\n", .expected = error.@"cloak.secret" },
+        .{ .text = "[cloak]\nprevious_secret={}\n", .expected = error.@"cloak.previous_secret" },
+        .{ .text = "[cloak]\nsuffix=false\n", .expected = error.@"cloak.suffix" },
+        .{ .text = "[cloak]\nmode=1\n", .expected = error.@"cloak.mode" },
+        .{ .text = "[cloak]\nmode=\"OPAQUE\"\n", .expected = error.@"cloak.mode" },
+        .{ .text = "[cloak]\nmode=\"opaque-typo\"\n", .expected = error.@"cloak.mode" },
+        .{ .text = "[cloak]\naccount_cloak=\"true\"\n", .expected = error.@"cloak.account_cloak" },
+        .{ .text = "[cloak]\nanon_epoch_secs=\"0\"\n", .expected = error.@"cloak.anon_epoch_secs" },
+        .{ .text = "[cloak]\nanon_epoch_secs=-1\n", .expected = error.ParseError },
+        .{ .text = "[cloak]\nanon_epoch_secs=31536001\n", .expected = error.ParseError },
+        .{ .text = "[cloak]\nsecret=null\n", .expected = error.ParseError },
+    };
+    try std.testing.expectError(error.cloak, parseToml(a, "cloak=7\n" ++ base, .{}));
+    for (cases) |case| {
+        const text = try std.mem.concat(a, u8, &.{ base, case.text });
+        defer a.free(text);
+        try std.testing.expectError(case.expected, parseToml(a, text, .{}));
+    }
+    var defaults = try parseToml(a, base, .{});
+    defer defaults.deinit(a);
+    try std.testing.expect(defaults.cloak.secret == null and defaults.cloak.previous_secret == null and defaults.cloak.mode == null);
+    try std.testing.expect(!defaults.cloak.account_cloak);
+    try std.testing.expectEqual(@as(u64, 1_209_600), defaults.cloak.anon_epoch_secs);
+    const resolver = Resolver{ .env = cloakTestLookup, .file = cloakTestLookup };
+    for ([_][]const u8{ "opaque", "hierarchical", "env:MODE", "@file:mode-file" }) |input| {
+        const text = try std.fmt.allocPrint(a, "{s}[cloak]\nsecret=\"new\"\nprevious_secret=\"old\"\nmode=\"{s}\"\naccount_cloak=true\nanon_epoch_secs=0\n", .{ base, input });
+        defer a.free(text);
+        var cfg = try parseToml(a, text, resolver);
+        defer cfg.deinit(a);
+        try std.testing.expectEqualStrings("new", cfg.cloak.secret.?);
+        try std.testing.expectEqualStrings("old", cfg.cloak.previous_secret.?);
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, input, "env:MODE")) "opaque" else if (std.mem.eql(u8, input, "@file:mode-file")) "hierarchical" else input, cfg.cloak.mode.?);
+        try std.testing.expect(cfg.cloak.account_cloak);
+        try std.testing.expectEqual(@as(u64, 0), cfg.cloak.anon_epoch_secs);
+    }
+}
+
+test "cloak configuration allocation failures release projected values" {
+    const Probe = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cfg = try parseToml(a, "[node]\nid=1\n[listen]\nirc=6680\n[cloak]\nsecret=\"new\"\nprevious_secret=\"old\"\nmode=\"env:MODE\"\n", .{ .env = cloakTestLookup });
+            defer cfg.deinit(a);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "cloak parserValue descendant tables rejected by field" {
+    const a = std.testing.allocator;
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n";
+    const Case = struct { name: []const u8, expected: TomlError };
+    for ([_]Case{
+        .{ .name = "secret", .expected = error.@"cloak.secret" },
+        .{ .name = "previous_secret", .expected = error.@"cloak.previous_secret" },
+        .{ .name = "suffix", .expected = error.@"cloak.suffix" },
+        .{ .name = "mode", .expected = error.@"cloak.mode" },
+        .{ .name = "account_cloak", .expected = error.@"cloak.account_cloak" },
+        .{ .name = "anon_epoch_secs", .expected = error.@"cloak.anon_epoch_secs" },
+    }) |case| {
+        for ([_]bool{ false, true }) |array_table| {
+            const text = try std.fmt.allocPrint(a, "{s}{s}cloak.{s}{s}\nx=1\n", .{ base, if (array_table) "[[" else "[", case.name, if (array_table) "]]" else "]" });
+            defer a.free(text);
+            try std.testing.expectError(case.expected, parseToml(a, text, .{}));
+        }
+    }
+}
+
+test "cloak parserValue bare date secret retains text" {
+    const a = std.testing.allocator;
+    var cfg = try parseToml(a, "[node]\nid=1\n[listen]\nirc=6680\n[cloak]\nsecret=1979-05-27\n", .{});
+    defer cfg.deinit(a);
+    try std.testing.expectEqualStrings("1979-05-27", cfg.cloak.secret.?);
+}
+
+fn cloakOomLookup(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]const u8 {
+    return error.OutOfMemory;
+}
+
+test "cloak parserValue resolver failures retain field or allocation error" {
+    const a = std.testing.allocator;
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n[cloak]\n";
+    const Case = struct { field: []const u8, expected: TomlError };
+    for ([_]Case{
+        .{ .field = "secret", .expected = error.@"cloak.secret" },
+        .{ .field = "previous_secret", .expected = error.@"cloak.previous_secret" },
+        .{ .field = "mode", .expected = error.@"cloak.mode" },
+    }) |case| {
+        for ([_][]const u8{ "env:MISSING", "@file:missing" }) |reference| {
+            const text = try std.fmt.allocPrint(a, "{s}{s}=\"{s}\"\n", .{ base, case.field, reference });
+            defer a.free(text);
+            try std.testing.expectError(case.expected, parseToml(a, text, .{ .env = cloakTestLookup, .file = cloakTestLookup }));
+            try std.testing.expectError(error.OutOfMemory, parseToml(a, text, .{ .env = cloakOomLookup, .file = cloakOomLookup }));
+        }
+    }
 }

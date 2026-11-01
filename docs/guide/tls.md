@@ -116,6 +116,18 @@ session restored` (or `mesh session restored` when the authoritative session was
 reopened from the peer). Do not copy the issued session token into client config;
 the EXTERNAL path deliberately proves possession again on each transport.
 
+## Kernel TLS offload (kTLS)
+
+`[tls] ktls` controls Linux kernel TLS offload for TLS 1.3 client
+connections: `off` (default), `tx` (server-to-client encryption in the
+kernel), or `txrx` (also client-to-server decryption). Both fleet nodes run
+`txrx`. Offload only attaches when the running kernel advertises the TLS ULP;
+otherwise TLS stays in userspace. Peer KeyUpdate rotates both epochs through
+the kernel control path without a reconnect, and WHOIS `671` shows the
+actually attached directions as `[kTLS: TX]`, `[kTLS: RX]`, or
+`[kTLS: TX+RX]`. TLS 1.2 is never offloaded. See
+`docs/reference/config.md` (`[tls] ktls`) and `src/daemon/ktls.zig`.
+
 ## Protocol capabilities
 
 Onyx Server ships a clean-room, pure-Zig TLS 1.3 stack, Armor (`src/crypto/tls_client.zig`, `src/crypto/tls_server.zig`). The live IRC-over-TLS listener uses TLS 1.3; TLS 1.1/1.0, STARTTLS, renegotiation, and record compression all fail closed.

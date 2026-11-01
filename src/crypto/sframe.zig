@@ -224,8 +224,8 @@ fn deriveKeySaltWith(comptime Aead: type, suite: CipherSuite, kid: u64, base_key
 
     var key_label: [key_label_prefix.len + 8 + 2]u8 = undefined;
     var salt_label: [salt_label_prefix.len + 8 + 2]u8 = undefined;
-    buildLabel(key_label[0..], key_label_prefix, kid, @intFromEnum(suite));
-    buildLabel(salt_label[0..], salt_label_prefix, kid, @intFromEnum(suite));
+    buildLabel(key_label[0..], key_label_prefix, kid, @backingInt(suite));
+    buildLabel(salt_label[0..], salt_label_prefix, kid, @backingInt(suite));
 
     HkdfSha256.expand(out.key[0..Aead.key_length], key_label[0..], secret);
     HkdfSha256.expand(out.salt[0..], salt_label[0..], secret);

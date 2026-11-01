@@ -89,7 +89,7 @@ pub fn absentFrame(kind: Kind) Frame {
     var frame: Frame = @splat(0);
     @memcpy(frame[0..4], magic);
     std.mem.writeInt(u16, frame[4..6], version, .big);
-    frame[6] = @intFromEnum(kind);
+    frame[6] = @backingInt(kind);
     return frame;
 }
 
@@ -124,7 +124,7 @@ fn encodePlain(kind: Kind, socket: media_socket.Snapshot, policy: ?native.Policy
     var plain: [plain_len]u8 = @splat(0);
     @memcpy(plain[0..4], plain_magic);
     std.mem.writeInt(u16, plain[4..6], version, .big);
-    plain[6] = @intFromEnum(kind);
+    plain[6] = @backingInt(kind);
     @memcpy(plain[8..40], &digest);
     encodeSocket(plain[40..68], socket);
     if (policy) |p| {
@@ -141,7 +141,7 @@ fn encodePlain(kind: Kind, socket: media_socket.Snapshot, policy: ?native.Policy
 
 fn decodePlain(bytes: []const u8, kind: Kind, digest: [32]u8, source_socket: usize) Error!?native.PhysicalTransportSnapshot {
     if (bytes.len != plain_len or !std.mem.eql(u8, bytes[0..4], plain_magic) or
-        std.mem.readInt(u16, bytes[4..6], .big) != version or bytes[6] != @intFromEnum(kind) or bytes[7] != 0 or
+        std.mem.readInt(u16, bytes[4..6], .big) != version or bytes[6] != @backingInt(kind) or bytes[7] != 0 or
         !std.crypto.timing_safe.eql([32]u8, bytes[8..40].*, digest) or
         !std.mem.allEqual(u8, bytes[112..128], 0)) return error.InvalidSnapshot;
     const socket = try decodeSocket(bytes[40..68]);
@@ -222,7 +222,7 @@ const Parsed = struct {
 
 fn parseFrame(bytes: []const u8, kind: Kind, target_pid: u32, forbidden: []const usize) Error!?Parsed {
     if (bytes.len != frame_len or !std.mem.eql(u8, bytes[0..4], magic) or
-        std.mem.readInt(u16, bytes[4..6], .big) != version or bytes[6] != @intFromEnum(kind)) return error.InvalidFrame;
+        std.mem.readInt(u16, bytes[4..6], .big) != version or bytes[6] != @backingInt(kind)) return error.InvalidFrame;
     if (bytes[7] == 0) {
         const absent = absentFrame(kind);
         if (!std.mem.eql(u8, bytes, &absent)) return error.InvalidFrame;

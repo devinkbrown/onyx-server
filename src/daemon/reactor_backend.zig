@@ -153,17 +153,17 @@ fn canonicalResult(result: i32) i32 {
     // requests as -1. The latter is not a POSIX errno: interpreting it as
     // EPERM would turn socket failures into false authorization decisions.
     if (builtin.os.tag == .windows) {
-        if (result == -@as(i32, @intFromEnum(linux.E.CANCELED))) return result;
-        return -@as(i32, @intFromEnum(linux.E.IO));
+        if (result == -@as(i32, @backingInt(linux.E.CANCELED))) return result;
+        return -@as(i32, @backingInt(linux.E.IO));
     }
     const magnitude = -@as(i64, result);
     inline for (@typeInfo(linux.E).@"enum".field_names, @typeInfo(linux.E).@"enum".field_values) |name, value| {
         if (@hasField(std.posix.E, name)) {
-            const native_value = @intFromEnum(@field(std.posix.E, name));
+            const native_value = @backingInt(@field(std.posix.E, name));
             if (magnitude == native_value) return -@as(i32, @intCast(value));
         }
     }
-    return -@as(i32, @intFromEnum(linux.E.IO));
+    return -@as(i32, @backingInt(linux.E.IO));
 }
 
 fn toCompletion(done: io_backend.Reaped) ringlane.Completion {
@@ -182,15 +182,15 @@ fn toCompletion(done: io_backend.Reaped) ringlane.Completion {
 test "reactor facade preserves original cancellation identity and canonical errors" {
     const token = ringlane.FdToken{ .slot = 13, .gen = 7 };
     const canceled_result: i32 = if (builtin.os.tag == .windows)
-        -@as(i32, @intFromEnum(linux.E.CANCELED))
+        -@as(i32, @backingInt(linux.E.CANCELED))
     else
-        -@as(i32, @intFromEnum(std.posix.E.CANCELED));
+        -@as(i32, @backingInt(std.posix.E.CANCELED));
     const recv = toCompletion(.{ .op = .recv, .token = token, .result = canceled_result }).recv;
     try std.testing.expectEqual(token, recv.token);
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), recv.res);
+    try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.CANCELED)), recv.res);
     try std.testing.expect(!recv.more);
     if (builtin.os.tag != .windows)
-        try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.AGAIN)), canonicalResult(-@as(i32, @intFromEnum(std.posix.E.AGAIN))));
+        try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.AGAIN)), canonicalResult(-@as(i32, @backingInt(std.posix.E.AGAIN))));
     if (comptime builtin.os.tag == .linux) try std.testing.expect(Ring == ringlane.Ring);
 }
 
@@ -232,11 +232,11 @@ test "reactor facade maps generic Windows IOCP failures without inventing permis
     const failed = io_backend.Reaped{ .op = .connect, .token = token, .result = -1 };
     const completion = toCompletion(failed).connect;
     try std.testing.expectEqual(token, completion.token);
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.IO)), completion.res);
+    try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.IO)), completion.res);
     try std.testing.expectEqual(@as(i32, 0), toCompletion(.{ .op = .connect, .token = token, .result = 0 }).connect.res);
     try std.testing.expectEqual(
-        -@as(i32, @intFromEnum(linux.E.CANCELED)),
-        toCompletion(.{ .op = .recv, .token = token, .result = -@as(i32, @intFromEnum(linux.E.CANCELED)) }).recv.res,
+        -@as(i32, @backingInt(linux.E.CANCELED)),
+        toCompletion(.{ .op = .recv, .token = token, .result = -@as(i32, @backingInt(linux.E.CANCELED)) }).recv.res,
     );
 }
 

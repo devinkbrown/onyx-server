@@ -125,7 +125,7 @@ pub fn encode(allocator: std.mem.Allocator, record: RelayRecord) ![]u8 {
         .{ .key = "channel", .value = .{ .string = record.channel } },
         .{ .key = "from_device", .value = .{ .string = record.from_device } },
         .{ .key = "hlc", .value = .{ .unsigned = record.hlc } },
-        .{ .key = "kind", .value = .{ .unsigned = @intFromEnum(record.kind) } },
+        .{ .key = "kind", .value = .{ .unsigned = @backingInt(record.kind) } },
         .{ .key = "origin_node", .value = .{ .unsigned = record.origin_node } },
         .{ .key = "origin_pubkey", .value = .{ .bytes = record.origin_pubkey } },
         .{ .key = "origin_sig", .value = .{ .bytes = record.origin_sig } },
@@ -155,7 +155,7 @@ const Field = enum(u4) {
 };
 
 fn claimField(seen: *u16, field: Field) DecodeError!void {
-    const mask = @as(u16, 1) << @as(u4, @intCast(@intFromEnum(field)));
+    const mask = @as(u16, 1) << @as(u4, @intCast(@backingInt(field)));
     if ((seen.* & mask) != 0) return error.InvalidDocument;
     seen.* |= mask;
 }
@@ -316,7 +316,7 @@ pub fn originTranscript(allocator: std.mem.Allocator, record: RelayRecord) ![]u8
     try out.appendSlice(allocator, &number);
     std.mem.writeInt(u64, &number, record.hlc, .little);
     try out.appendSlice(allocator, &number);
-    try out.append(allocator, @intFromEnum(record.kind));
+    try out.append(allocator, @backingInt(record.kind));
     try appendLenPrefixed(&out, allocator, record.channel);
     try appendLenPrefixed(&out, allocator, record.source_prefix);
     try appendLenPrefixed(&out, allocator, record.account);

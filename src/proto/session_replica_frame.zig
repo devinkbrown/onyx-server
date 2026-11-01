@@ -11,7 +11,7 @@
 //!
 //! Wire format (the payload schema is selected explicitly by the version):
 //!   magic[4] = "SRTF"
-//!   version u8 = 2 | 3
+//!   version u8 = 2 | 3 | 4
 //!   kind u8 = OFFER(1) | ACK(2) | REVOKE(3) | ATTACHMENT_LEASE(4)
 //!   signed_payload_len u32 (big endian)
 //!   signed_payload bytes
@@ -22,6 +22,8 @@
 //! one API after capability negotiation; decode never guesses from inner magic
 //! and never falls back across versions. Redundant kind binding prevents a
 //! valid object being reclassified merely by changing the outer S2S frame tag.
+//! Version 4 explicitly carries current inventory offers and terminal group
+//! revocation; it cannot be decoded through either frozen compatibility API.
 //! Cryptographic verification remains the daemon callback's responsibility.
 
 const std = @import("std");
@@ -31,6 +33,7 @@ const session_portability = @import("session_portability.zig");
 pub const magic = [_]u8{ 'S', 'R', 'T', 'F' };
 pub const token_version: u8 = 2;
 pub const attachment_version: u8 = 3;
+pub const current_version: u8 = 4;
 /// Compatibility name retained for the live v2 call sites.
 pub const version: u8 = token_version;
 pub const header_len: usize = magic.len + 1 + 1 + 4;
@@ -38,6 +41,7 @@ pub const header_len: usize = magic.len + 1 + 1 + 4;
 pub const WireVersion = enum(u8) {
     token_v2 = token_version,
     attachment_v3 = attachment_version,
+    current_v4 = current_version,
 };
 
 /// `[Ed25519 public key:32][signature:64]` added by `signed_frame` on the S2S
@@ -125,7 +129,7 @@ pub const DecodeError = error{
 
 /// Inspect only the authenticated transport discriminator so a negotiated link
 /// can route to one exact decoder. This never validates or returns the payload;
-/// callers must immediately invoke `decode` or `decodeAttachment` and must not
+/// callers must immediately invoke `decode`, `decodeAttachment`, or `decodeCurrent` and must not
 /// try the other decoder after a failure.
 pub fn inspectVersion(bytes: []const u8) DecodeError!WireVersion {
     if (bytes.len < header_len) return error.Truncated;
@@ -133,6 +137,7 @@ pub fn inspectVersion(bytes: []const u8) DecodeError!WireVersion {
     return switch (bytes[magic.len]) {
         token_version => .token_v2,
         attachment_version => .attachment_v3,
+        current_version => .current_v4,
         else => error.UnsupportedVersion,
     };
 }
@@ -153,6 +158,16 @@ pub fn encodeAttachment(kind: Kind, signed_payload: []const u8, out: []u8) Encod
     return encodeVersioned(attachment_version, validateAttachmentPayload, kind, signed_payload, out);
 }
 
+/// Explicit negotiated current schema. Frozen v2 never accepts inventory,
+/// terminal group fences, or current-capability acknowledgement statuses.
+pub fn encodeCurrent(kind: Kind, signed_payload: []const u8, out: []u8) EncodeError![]const u8 {
+    return encodeVersioned(current_version, validateCurrentPayload, kind, signed_payload, out);
+}
+
+pub fn decodeCurrent(expected_kind: Kind, bytes: []const u8) DecodeError!Frame {
+    return decodeVersioned(current_version, validateCurrentPayload, expected_kind, bytes);
+}
+
 fn encodeVersioned(
     comptime wire_version: u8,
     comptime validate: fn (Kind, []const u8) EncodeError!void,
@@ -166,7 +181,7 @@ fn encodeVersioned(
 
     @memcpy(out[0..magic.len], &magic);
     out[magic.len] = wire_version;
-    out[magic.len + 1] = @intFromEnum(kind);
+    out[magic.len + 1] = @backingInt(kind);
     std.mem.writeInt(u32, out[magic.len + 2 ..][0..4], @intCast(signed_payload.len), .big);
     @memcpy(out[header_len..total], signed_payload);
     return out[0..total];
@@ -288,6 +303,34 @@ fn allZero(bytes: []const u8) bool {
     return combined == 0;
 }
 
+fn validateCurrentPayload(kind: Kind, payload: []const u8) EncodeError!void {
+    if (payload.len > max_signed_payload_len) return error.PayloadTooLarge;
+    switch (kind) {
+        .offer => try validateCurrentOffer(payload, 1, 3),
+        .revoke => try validateCurrentOffer(payload, 2, 4),
+        .ack => {
+            if (payload.len < ack_magic.len + 1 or !std.mem.eql(u8, payload[0..ack_magic.len], &ack_magic)) return error.InvalidPayload;
+            const status = payload[ack_magic.len];
+            if (status < 1 or status > 9) return error.InvalidPayload;
+            const current = status == 8 or status == 9;
+            if (payload.len != ack_signed_len + (if (current) @as(usize, 40) else 0)) return error.InvalidPayload;
+            if (current and (std.mem.readInt(u64, payload[ack_transcript_len..][0..8], .big) == 0 or
+                allZero(payload[ack_transcript_len + 8 ..][0..32]))) return error.InvalidPayload;
+        },
+        .attachment_lease => try validatePayload(.attachment_lease, payload),
+    }
+}
+
+// Negotiated current links still carry ordinary legacy-shaped authority facts
+// while local physical inventory is unavailable or not being published. Their
+// signed operation remains explicit; a v4 header never upgrades their meaning.
+fn validateCurrentOffer(payload: []const u8, legacy_operation: u8, current_operation: u8) EncodeError!void {
+    if (payload.len < offer_magic.len + 1) return error.InvalidPayload;
+    const operation = payload[offer_magic.len];
+    if (operation != legacy_operation and operation != current_operation) return error.InvalidPayload;
+    try validateOffer(payload, operation);
+}
+
 fn validatePayload(kind: Kind, payload: []const u8) EncodeError!void {
     if (payload.len > max_signed_payload_len) return error.PayloadTooLarge;
     switch (kind) {
@@ -295,7 +338,7 @@ fn validatePayload(kind: Kind, payload: []const u8) EncodeError!void {
         .revoke => try validateOffer(payload, 2),
         .ack => {
             if (payload.len != ack_signed_len) return error.InvalidPayload;
-            if (!std.mem.eql(u8, payload[0..ack_magic.len], &ack_magic)) return error.InvalidPayload;
+            if (!std.mem.eql(u8, payload[0..ack_magic.len], &ack_magic) or payload[ack_magic.len] < 1 or payload[ack_magic.len] > 7) return error.InvalidPayload;
         },
         .attachment_lease => {
             if (payload.len != attachment_lease_signed_len) return error.InvalidPayload;
@@ -315,11 +358,32 @@ fn validateOffer(payload: []const u8, expected_operation: u8) EncodeError!void {
     const snapshot_len: usize = @intCast(std.mem.readInt(u32, payload[account_len_offset + 4 ..][0..4], .big));
     if (account_len > max_account_len or nick_len > max_nick_len or snapshot_len > max_snapshot_len) return error.InvalidPayload;
 
+    const inventory_count: usize = if (expected_operation == 3) blk: {
+        if (payload.len < offer_fixed_len + 3 + inner_signature_len) return error.InvalidPayload;
+        break :blk std.mem.readInt(u16, payload[offer_fixed_len + 1 ..][0..2], .big);
+    } else 0;
+    if (inventory_count > 256) return error.InvalidPayload;
     const variable_len = account_len + nick_len + snapshot_len;
-    if (payload.len != offer_fixed_len + variable_len + inner_signature_len) return error.InvalidPayload;
-    if (expected_operation == 1) {
+    const inventory_len = inventory_count * 25;
+    const count_len: usize = if (expected_operation == 3) 3 else 0;
+    if (payload.len != offer_fixed_len + count_len + variable_len + inventory_len + inner_signature_len) return error.InvalidPayload;
+    if (expected_operation == 3 and payload[offer_fixed_len] > 1) return error.InvalidPayload;
+    if (expected_operation == 1 or (expected_operation == 3 and payload[offer_fixed_len] == 1)) {
         if (account_len == 0 or nick_len == 0 or snapshot_len == 0) return error.InvalidPayload;
+    } else if (expected_operation == 3) {
+        if (account_len == 0 or nick_len != 0 or snapshot_len != 0) return error.InvalidPayload;
+    } else if (expected_operation == 4) {
+        if (account_len == 0 or nick_len != 0 or snapshot_len != 0 or std.mem.allEqual(u8, payload[5..21], 0)) return error.InvalidPayload;
     } else if (variable_len != 0) return error.InvalidPayload;
+    const inventory_start = offer_fixed_len + count_len + variable_len;
+    for (0..inventory_count) |i| {
+        const row = payload[inventory_start + i * 25 ..][0..25];
+        if (std.mem.allEqual(u8, row[0..16], 0) or std.mem.readInt(u64, row[16..24], .big) > std.math.maxInt(i64) or row[24] > 1) return error.InvalidPayload;
+        if (i > 0) {
+            const previous = payload[inventory_start + (i - 1) * 25 ..][0..16];
+            if (std.mem.order(u8, previous, row[0..16]) != .lt) return error.InvalidPayload;
+        }
+    }
 }
 
 const testing = std.testing;
@@ -599,7 +663,7 @@ test "session replica transport enforces frame-size bound before allocation or p
     var header: [header_len]u8 = @splat(0);
     @memcpy(header[0..magic.len], &magic);
     header[magic.len] = version;
-    header[magic.len + 1] = @intFromEnum(Kind.offer);
+    header[magic.len + 1] = @backingInt(Kind.offer);
     std.mem.writeInt(u32, header[magic.len + 2 ..][0..4], @intCast(max_signed_payload_len + 1), .big);
     try testing.expectError(error.PayloadTooLarge, decode(.offer, &header));
 }
@@ -625,4 +689,53 @@ test "session replica transport OFFER declared fields are strict and bounded" {
         .big,
     );
     try testing.expectError(error.InvalidPayload, encode(.offer, changed, &out));
+}
+
+test "current transport retains byte exact ordinary upsert and origin removal authority" {
+    for ([_]Kind{ .offer, .revoke }) |kind| {
+        const signed = try fakeOffer(testing.allocator, kind);
+        defer testing.allocator.free(signed);
+        var current_storage: [512]u8 = undefined;
+        const current = try encodeCurrent(kind, signed, &current_storage);
+        try testing.expectEqual(WireVersion.current_v4, try inspectVersion(current));
+        try testing.expectEqualSlices(u8, signed, (try decodeCurrent(kind, current)).signed_payload);
+        try testing.expectError(error.UnsupportedVersion, decode(kind, current));
+        var frozen_storage: [512]u8 = undefined;
+        const frozen = try encode(kind, signed, &frozen_storage);
+        try testing.expectEqual(WireVersion.token_v2, try inspectVersion(frozen));
+        try testing.expectEqualSlices(u8, signed, (try decode(kind, frozen)).signed_payload);
+        try testing.expectError(error.UnsupportedVersion, decodeCurrent(kind, frozen));
+    }
+}
+
+test "session replica current inventory eligibility is mandatory canonical and private when false" {
+    const legacy = try fakeOffer(testing.allocator, .offer);
+    defer testing.allocator.free(legacy);
+    const current = try testing.allocator.alloc(u8, legacy.len + 3);
+    defer testing.allocator.free(current);
+    @memcpy(current[0..offer_fixed_len], legacy[0..offer_fixed_len]);
+    current[offer_magic.len] = 3;
+    current[offer_fixed_len] = 1;
+    @memset(current[offer_fixed_len + 1 .. offer_fixed_len + 3], 0);
+    @memcpy(current[offer_fixed_len + 3 ..], legacy[offer_fixed_len..]);
+    var out: [1024]u8 = undefined;
+    _ = try encodeCurrent(.offer, current, &out);
+    try testing.expectError(error.InvalidPayload, encode(.offer, current, &out));
+    current[offer_fixed_len] = 2;
+    try testing.expectError(error.InvalidPayload, encodeCurrent(.offer, current, &out));
+    current[offer_fixed_len] = 0;
+    try testing.expectError(error.InvalidPayload, encodeCurrent(.offer, current, &out));
+    const private = try testing.allocator.alloc(u8, offer_fixed_len + 3 + 1 + inner_signature_len);
+    defer testing.allocator.free(private);
+    @memcpy(private[0 .. offer_fixed_len + 3], current[0 .. offer_fixed_len + 3]);
+    std.mem.writeInt(u16, private[account_len_offset + 2 ..][0..2], 0, .big);
+    std.mem.writeInt(u32, private[account_len_offset + 4 ..][0..4], 0, .big);
+    @memset(private[offer_fixed_len + 3 ..], 0);
+    private[offer_fixed_len + 3] = 'a';
+    const encoded = try encodeCurrent(.offer, private, &out);
+    try testing.expectEqualSlices(u8, private, (try decodeCurrent(.offer, encoded)).signed_payload);
+    // An old op3 without the mandatory bit is not an accepted current record.
+    try testing.expectError(error.InvalidPayload, encodeCurrent(.offer, private[0 .. private.len - 1], &out));
+    _ = try encode(.offer, legacy, &out);
+    _ = try encodeCurrent(.offer, legacy, &out);
 }

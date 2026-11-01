@@ -103,7 +103,7 @@ pub const Reader = struct {
     /// Reads one CBOR item header and any immediate borrowed payload.
     pub fn readValue(self: *Reader) DecodeError!Value {
         const first = try self.readByte();
-        const major: MajorType = @enumFromInt(@as(u3, @intCast(first >> 5)));
+        const major: MajorType = @fromBackingInt(@intCast(@as(u3, @intCast(first >> 5))));
         const addl: u5 = @intCast(first & 0x1f);
 
         return switch (major) {
@@ -416,7 +416,7 @@ pub fn validate(input: []const u8, params: Params) DecodeError!void {
 }
 
 fn majorByte(major: MajorType, addl: u5) u8 {
-    return (@as(u8, @intFromEnum(major)) << 5) | @as(u8, addl);
+    return (@as(u8, @backingInt(major)) << 5) | @as(u8, addl);
 }
 
 fn majorArgLen(value: u64) usize {

@@ -2,24 +2,28 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Live-daemon measurement harness for the 0.7 P0-1 axes the offline
-`zig build bench` harness cannot see: TLS mode (off / userspace / kTLS
-intent), `num_shards`, and `ring_entries` × `cqe_batch`, plus JOIN/PRIVMSG
-round-trip and RSS after N registered clients.
+"""Private loopback daemon measurements; never touches onyx-server.service.
 
-Boots a throwaway `onyx-server` on 127.0.0.1 with kernel-assigned ports. Never
-binds 6667/6680/6697 and never touches `orochi.service`. `--check-config` runs
-before every boot so a bad cell cannot fall through to the daemon defaults.
+The retained --sqpoll-phases profile uses a captured artifact, pinned TLS 1.3,
+four persistent clients on one shard, exact ordered fanout receipts, and separate
+idle/burst/continuous CPU windows including verified SQPOLL workers. It requires
+an explicit artifact SHA-256 and JSON destination. --phase-pilot is a reduced
+correctness profile, never a throughput baseline.
+
+Legacy 0.7 P0-1 / GAP-X4 modes retain historical latency/RSS measurements rather
+than exact delivery acceptance. Every profile boots a private daemon, preflights
+its configuration, and avoids ports 6667/6680/6697/8080 and installed services.
 
 Usage:
+  python3 tools/bench_live.py --bin CAPTURED_IMAGE --sqpoll-phases --phase-pilot \
+    --repetitions 1 --sqpoll-modes 10 --expected-sha256 SHA256 --phase-json pilot.json
   python3 tools/bench_live.py --bin zig-out/bin/onyx-server --quick
-  python3 tools/bench_live.py --bin zig-out/bin/onyx-server -o docs/audit/bench-live-0.7.0-rc.1.md
-  zig build bench-live -- --gap-x4 -o docs/audit/bench-gap-x4.md
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import socket
 import ssl
@@ -518,6 +522,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="GAP-X4 matrix: SQPOLL on/off × TLS off/userspace × shards 1 and 4",
     )
+    p.add_argument("--sqpoll-phases", action="store_true", help="retained pinned-TLS one-shard delivery/CPU profile")
+    p.add_argument("--phase-json")
+    p.add_argument("--expected-sha256")
+    p.add_argument("--phase-pilot", action="store_true", help="small correctness pilot; never a performance baseline")
+    p.add_argument("--repetitions", type=int, default=3)
+    p.add_argument("--sqpoll-modes", type=int, nargs="+", default=[0, 10, 1000])
     return p.parse_args()
 
 
@@ -527,6 +537,13 @@ def main() -> int:
     if not bin_path.is_file():
         print(f"bench_live: binary not found: {bin_path} (run zig build first)", file=sys.stderr)
         return 2
+
+    if args.sqpoll_phases:
+        if args.quick or args.gap_x4:
+            raise PhaseFailure("retained phases and legacy benchmark matrices are separate profiles")
+        return run_phase_matrix(args, bin_path)
+    if args.phase_pilot or args.phase_json or args.expected_sha256:
+        raise PhaseFailure("phase options require --sqpoll-phases")
 
     if args.quick and args.gap_x4:
         print("bench_live: --quick and --gap-x4 are different matrices", file=sys.stderr)
@@ -601,6 +618,490 @@ def main() -> int:
     if any(r.error for r in required):
         return 1
     return 0
+
+
+
+# Retained SQPOLL daemon profile. No service, installed configuration or build is changed.
+class PhaseFailure(RuntimeError):
+    pass
+
+
+class LineFramer:
+    def __init__(self):
+        self.pending = b""
+
+    def feed(self, chunk):
+        self.pending += chunk
+        if len(self.pending) > 65536:
+            raise PhaseFailure("receive buffer exceeded bound")
+        lines = self.pending.split(b"\r\n")
+        self.pending = lines.pop()
+        if any(len(line) > 16384 for line in lines) or len(self.pending) > 16384:
+            raise PhaseFailure("IRC line exceeded bound")
+        return lines
+
+
+def pinned_context(cert_der):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.maximum_version = ssl.TLSVersion.TLSv1_3
+    context.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert_der))
+    if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
+        raise PhaseFailure("TLS verification is not mandatory")
+    return context
+
+
+def phase_tls_observation(index, writer):
+    """Record negotiated public parameters, never certificate or key material."""
+    tls = writer.get_extra_info("ssl_object")
+    cipher = tls.cipher() if tls is not None else None
+    return dict(client=index, version=tls.version() if tls is not None else None,
+                cipher=cipher[0] if cipher else None)
+
+
+def phase_tls_summary(observations, expected_clients=4):
+    def summarize(key):
+        values = [item[key] for item in observations]
+        known = sorted({value for value in values if value is not None})
+        unknown = expected_clients - len(observations) + values.count(None)
+        status = "unknown" if not known else "mixed" if len(known) > 1 else "partial" if unknown else "uniform"
+        return dict(status=status, values=known, unknown_clients=unknown)
+    return dict(clients=observations, version=summarize("version"), cipher=summarize("cipher"))
+
+
+def phase_latency_percentiles(latencies):
+    from bench_sqpoll import percentile
+    return dict(latency_p50_ns=percentile(latencies, .5),
+                latency_p95_ns=percentile(latencies, .95),
+                latency_p99_ns=percentile(latencies, .99))
+
+
+def phase_payload(run_id, phase, sender, sequence):
+    return f"onyxbench:{run_id}:{phase}:{sender}:{sequence}:".encode().ljust(128, b"x")
+
+
+class DeliveryLedger:
+    def __init__(self, run_id, clients=4):
+        self.run_id, self.clients = run_id, clients
+        self.counts, self.next, self.sent, self.received = {}, {}, {}, {}
+        self.latencies = {}
+        self.changed = asyncio.Event()
+
+    def add_phase(self, phase, count):
+        if phase in self.counts:
+            raise PhaseFailure("phase registered twice")
+        self.counts[phase], self.received[phase], self.latencies[phase] = count, 0, []
+        for sender in range(self.clients):
+            for recipient in range(self.clients):
+                if sender != recipient:
+                    self.next[phase, sender, recipient] = 0
+
+    def authored(self, phase, sender, sequence):
+        key = phase, sender, sequence
+        if key in self.sent:
+            raise PhaseFailure("sender sequence reused")
+        self.sent[key] = time.monotonic_ns()
+
+    def receive(self, recipient, line):
+        # Parse complete lines, never substring receipts. Tags are legal but do
+        # not change the prefix, target, or exact payload identity.
+        if line.startswith(b"@"):
+            _, _, line = line.partition(b" ")
+        parts = line.split(b" ", 3)
+        command = parts[1] if line.startswith(b":") and len(parts) > 1 else parts[0]
+        if command.upper() != b"PRIVMSG":
+            return False
+        if not line.startswith(b":") or len(parts) != 4 or parts[2] != CHANNEL.encode() or not parts[3].startswith(b":"):
+            raise PhaseFailure("unexpected PRIVMSG target/framing")
+        payload = parts[3][1:]
+        try:
+            magic, run_id, phase_raw, sender_raw, sequence_raw, _ = payload.split(b":", 5)
+            phase, sender, sequence = phase_raw.decode("ascii"), int(sender_raw), int(sequence_raw)
+        except (ValueError, UnicodeError) as exc:
+            raise PhaseFailure("malformed message identity") from exc
+        if magic != b"onyxbench" or run_id != self.run_id.encode() or phase not in self.counts:
+            raise PhaseFailure("unknown run or phase")
+        if not 0 <= sender < self.clients or sender == recipient or not 0 <= sequence < self.counts[phase]:
+            raise PhaseFailure("unexpected sender/recipient/sequence")
+        if parts[0].split(b"!", 1)[0] != f":lb{sender}".encode():
+            raise PhaseFailure("prefix does not match sender identity")
+        if payload != phase_payload(self.run_id, phase, sender, sequence):
+            raise PhaseFailure("payload changed")
+        key = phase, sender, recipient
+        if sequence != self.next[key]:
+            raise PhaseFailure("duplicate or reordered delivery")
+        stamp = self.sent.get((phase, sender, sequence))
+        if stamp is None:
+            raise PhaseFailure("delivery was not authored")
+        self.next[key] += 1
+        self.received[phase] += 1
+        self.latencies[phase].append(time.monotonic_ns() - stamp)
+        self.changed.set()
+        return True
+
+    def complete(self, phase):
+        return self.received[phase] == self.counts[phase] * self.clients * (self.clients - 1)
+
+    def credit(self, phase, sender, sequence, window):
+        return all(self.next[phase, sender, recipient] > sequence - window
+                   for recipient in range(self.clients) if recipient != sender)
+
+
+class PhaseClient:
+    def __init__(self, index, reader, writer, ledger, failure):
+        self.index, self.reader, self.writer = index, reader, writer
+        self.ledger, self.failure = ledger, failure
+        self.welcome, self.joined = asyncio.Event(), asyncio.Event()
+        self.pending_pongs, self.lines_sent = {}, 0
+        self.framer = LineFramer()
+        self.task = asyncio.create_task(self.read())
+
+    async def send(self, line):
+        if b"\r" in line or b"\n" in line or len(line) > 510:
+            raise PhaseFailure("invalid outgoing IRC line")
+        self.writer.write(line + b"\r\n")
+        self.lines_sent += 1
+        await self.writer.drain()
+
+    async def read(self):
+        try:
+            while True:
+                chunk = await self.reader.read(32768)
+                if not chunk:
+                    raise PhaseFailure("persistent client disconnected")
+                for line in self.framer.feed(chunk):
+                    if line.split(b" ", 1)[0].upper() == b"PING":
+                        if b" " not in line:
+                            raise PhaseFailure("malformed PING")
+                        await self.send(b"PONG " + line.split(b" ", 1)[1])
+                        continue
+                    fields = line.split(b" ")
+                    command = (fields[1] if line.startswith(b":") and len(fields) > 1 else fields[0]).upper()
+                    if command == b"ERROR" or (command.isdigit() and int(command) >= 400 and command != b"422"):
+                        raise PhaseFailure("daemon returned protocol error")
+                    if command == b"001":
+                        self.welcome.set()
+                    elif command == b"366" and CHANNEL.encode() in fields:
+                        self.joined.set()
+                    elif command == b"PONG":
+                        marker = line.rsplit(b" :", 1)[-1]
+                        future = self.pending_pongs.pop(marker, None)
+                        if future is None or future.done():
+                            raise PhaseFailure("unexpected or duplicated PONG barrier")
+                        future.set_result(None)
+                    else:
+                        self.ledger.receive(self.index, line)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not self.failure.done():
+                self.failure.set_result(exc)
+
+    async def barrier(self, marker):
+        if marker in self.pending_pongs:
+            raise PhaseFailure("barrier reused")
+        future = asyncio.get_running_loop().create_future()
+        self.pending_pongs[marker] = future
+        await self.send(b"PING :" + marker)
+        await future
+
+
+async def phase_checked(awaitable, failure, timeout=30):
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _ = await asyncio.wait([task, failure], timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        if failure in done:
+            raise failure.result()
+        if task not in done:
+            raise PhaseFailure("phase deadline expired")
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def phase_wait(ledger, condition):
+    while not condition():
+        ledger.changed.clear()
+        if condition():
+            return
+        await ledger.changed.wait()
+
+
+def phase_metrics(port, target):
+    import urllib.request
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=2) as response:
+            lines = response.read(1 << 20).decode().splitlines()
+        values = {parts[0]: int(parts[1]) for line in lines if not line.startswith("#")
+                  and len(parts := line.split()) == 2 and parts[0] in
+                  {"onyx_messages_in_total", "onyx_bytes_in_total", "onyx_bytes_out_total", "onyx_connections_active", "onyx_errors_total"}}
+        if values.get("onyx_messages_in_total", -1) >= target and values.get("onyx_connections_active") == 4:
+            return values
+        time.sleep(.05)
+    raise PhaseFailure("metrics did not reach a fresh four-client snapshot")
+
+
+def phase_cpu_snapshot(pid, mode, known=None):
+    from bench_sqpoll import snapshot
+    values = snapshot(pid, mode, 1, known=known)
+    workers = [v for v in values.values() if v["name"].startswith("iou-sqp-")]
+    expected = 1 if mode else 0
+    if len(workers) != expected or any(v["name"] != f"iou-sqp-{pid}" for v in workers):
+        raise PhaseFailure("SQPOLL mode does not match observed worker custody")
+    return values
+
+
+def phase_verify_cpu_discovery(pid, mode, timed):
+    # A cached end snapshot deliberately avoids a global /proc scan in the CPU
+    # window. Rediscover afterward: an external SQ worker created mid-phase
+    # would otherwise be absent from both cached task dictionaries.
+    fresh = phase_cpu_snapshot(pid, mode)
+    if fresh.keys() != timed.keys() or any(
+            (fresh[t]["starttime"], fresh[t]["name"]) != (timed[t]["starttime"], timed[t]["name"])
+            for t in timed):
+        raise PhaseFailure("fresh discovery changed CPU task custody")
+
+
+async def measure_daemon_phases(proc, port, metrics_port, context, hostname, mode, pilot, run_id, tls_observations=None, failure_diagnostic=None):
+    failure = asyncio.get_running_loop().create_future()
+    ledger = DeliveryLedger(run_id)
+    clients = []
+    progress = dict(phase="registration", checkpoint="connect", client=0, completed=[])
+    try:
+        for index in range(4):
+            progress.update(checkpoint="connect", client=index)
+            # Verification failure propagates; there is no insecure/plain retry.
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(
+                HOST, port, ssl=context, server_hostname=hostname, ssl_handshake_timeout=5), 6)
+            client = PhaseClient(index, reader, writer, ledger, failure)
+            clients.append(client)
+            if tls_observations is not None:
+                tls_observations.append(phase_tls_observation(index, writer))
+            await client.send(f"NICK lb{index}".encode())
+            await client.send(f"USER lb{index} 0 * :retained benchmark".encode())
+            progress["checkpoint"] = "welcome"
+            await phase_checked(client.welcome.wait(), failure, 8)
+            await client.send(f"JOIN {CHANNEL}".encode())
+            progress["checkpoint"] = "join"
+            await phase_checked(client.joined.wait(), failure, 8)
+        async def barriers(phase):
+            progress["checkpoint"] = "barriers"
+            await phase_checked(asyncio.gather(*(c.barrier(f"{run_id}-{phase}-{c.index}".encode()) for c in clients)), failure, 10)
+        async def send_messages(phase, sender, count):
+            for sequence in range(count):
+                await phase_wait(ledger, lambda: ledger.credit(phase, sender, sequence, 64))
+                ledger.authored(phase, sender, sequence)
+                await clients[sender].send(b"PRIVMSG " + CHANNEL.encode() + b" :" + phase_payload(run_id, phase, sender, sequence))
+        async def finish(phase):
+            progress["checkpoint"] = "delivery_drain"
+            await phase_wait(ledger, lambda: ledger.complete(phase))
+            await barriers(phase)
+        progress.update(phase="warmup", checkpoint="send")
+        ledger.add_phase("warmup", 8)
+        await phase_checked(asyncio.gather(*(send_messages("warmup", i, 8) for i in range(4))), failure)
+        await phase_checked(finish("warmup"), failure)
+        progress["checkpoint"] = "metrics"
+        metrics_before = await asyncio.to_thread(phase_metrics, metrics_port, sum(c.lines_sent for c in clients))
+        results = []
+        for phase in ("idle", "burst", "continuous"):
+            progress.update(phase=phase, checkpoint="cpu_start")
+            count = 0 if phase == "idle" else (2 if pilot else 320) if phase == "burst" else (16 if pilot else 16384)
+            ledger.add_phase(phase, count)
+            before = phase_cpu_snapshot(proc.pid, mode)
+            driver_begin, begin = time.process_time_ns(), time.monotonic_ns()
+            async def work():
+                if phase == "idle":
+                    await asyncio.sleep(1 if pilot else 10)
+                elif phase == "burst":
+                    ticks, width = (2, 1) if pilot else (40, 8)
+                    start = asyncio.get_running_loop().time()
+                    for tick in range(ticks):
+                        await asyncio.sleep(max(0, start + tick * .25 - asyncio.get_running_loop().time()))
+                        for sender in range(4):
+                            for offset in range(width):
+                                sequence = tick * width + offset
+                                ledger.authored(phase, sender, sequence)
+                                await clients[sender].send(b"PRIVMSG " + CHANNEL.encode() + b" :" + phase_payload(run_id, phase, sender, sequence))
+                    await asyncio.sleep(max(0, start + ticks * .25 - asyncio.get_running_loop().time()))
+                else:
+                    await asyncio.gather(*(send_messages(phase, i, count) for i in range(4)))
+                await finish(phase)
+            progress["checkpoint"] = "phase_work"
+            await phase_checked(work(), failure, 120)
+            progress["checkpoint"] = "cpu_end"
+            after = phase_cpu_snapshot(proc.pid, mode, known=before)
+            elapsed, driver_cpu = time.monotonic_ns() - begin, time.process_time_ns() - driver_begin
+            if before.keys() != after.keys() or any(before[t]["starttime"] != after[t]["starttime"] or before[t]["name"] != after[t]["name"] or after[t]["ticks"] < before[t]["ticks"] for t in before):
+                raise PhaseFailure("daemon CPU task coverage changed")
+            # This discovery is outside both daemon and driver CPU windows.
+            phase_verify_cpu_discovery(proc.pid, mode, after)
+            tasks = [dict(tid=t, name=after[t]["name"], ticks=after[t]["ticks"] - before[t]["ticks"]) for t in before]
+            hz = os.sysconf("SC_CLK_TCK")
+            cpu = sum(t["ticks"] for t in tasks) / hz
+            sq_cpu = sum(t["ticks"] for t in tasks if t["name"] == f"iou-sqp-{proc.pid}") / hz
+            current = await asyncio.to_thread(phase_metrics, metrics_port, sum(c.lines_sent for c in clients))
+            delivered = ledger.received[phase]
+            results.append(dict(phase=phase, authored=4 * count, delivered=delivered, expected_delivered=12 * count,
+                                elapsed_ns=elapsed, daemon_cpu_s=cpu, sq_cpu_s=sq_cpu, driver_cpu_ns=driver_cpu,
+                                core_equivalents=cpu / (elapsed / 1e9), delivered_per_s=delivered / (elapsed / 1e9),
+                                cpu_ns_per_delivery=cpu * 1e9 / delivered if delivered else None,
+                                **phase_latency_percentiles(ledger.latencies[phase]),
+                                cpu_clock_tick_s=1 / hz, cpu_tasks=tasks, cpu_discovery_verified=True,
+                                protocol_lines_delta=current["onyx_messages_in_total"] - metrics_before["onyx_messages_in_total"],
+                                queued_bytes_delta=current["onyx_bytes_out_total"] - metrics_before["onyx_bytes_out_total"]))
+            metrics_before = current
+            progress["completed"].append(phase)
+        progress.update(phase="final", checkpoint="barriers")
+        await barriers("final")
+        await phase_checked(asyncio.sleep(.25), failure)
+        if failure.done() or proc.poll() is not None:
+            raise PhaseFailure("late delivery/connection failure")
+        if any(c.framer.pending or c.pending_pongs for c in clients):
+            raise PhaseFailure("incomplete line or unresolved barrier at final drain")
+        return results
+    except Exception:
+        if failure_diagnostic is not None:
+            active = progress["phase"]
+            total = ledger.counts.get(active)
+            positions = [position for (name, _, _), position in ledger.next.items() if name == active]
+            failure_diagnostic.update(
+                phase=active, checkpoint=progress["checkpoint"], client_index=progress["client"],
+                completed=list(progress["completed"]), clients_created=len(clients),
+                welcomed=sum(c.welcome.is_set() for c in clients), joined=sum(c.joined.is_set() for c in clients),
+                authored=sum(1 for (name, _, _) in ledger.sent if name == active),
+                expected_authored=None if total is None else total * ledger.clients,
+                received=ledger.received.get(active),
+                expected_received=None if total is None else total * ledger.clients * (ledger.clients - 1),
+                streams=len(positions), stream_min=min(positions) if positions else None,
+                stream_max=max(positions) if positions else None,
+                pending_barriers=sum(len(c.pending_pongs) for c in clients),
+                reader_tasks_done=sum(c.task.done() for c in clients),
+                read_failure_signaled=failure.done())
+        raise
+    finally:
+        for client in clients:
+            client.task.cancel()
+        await asyncio.gather(*(c.task for c in clients), return_exceptions=True)
+        for client in clients:
+            client.writer.close()
+        await asyncio.gather(*(c.writer.wait_closed() for c in clients), return_exceptions=True)
+
+
+def phase_config(base, mode, metrics_port):
+    # Only generated fixture templates are changed. Refuse ambiguous sections.
+    if base.count("[limits]\n") != 1 or any(section in base for section in ("[io]", "[metrics]", "[stats]", "[class.")):
+        raise PhaseFailure("generated bundle shape changed")
+    if base.count("[tls]\n") != 1 or "ktls =" in base:
+        raise PhaseFailure("generated TLS template shape changed")
+    base = base.replace("[tls]\n", '[tls]\nktls = "off"\n', 1)
+    return base.replace("[limits]\n", '[limits]\nnum_shards = 1\nsweep_interval = "2s"\n', 1) + (
+        f"\n[io]\nring_entries = 512\ncqe_batch = 256\nsqpoll = {'true' if mode else 'false'}\nsqpoll_idle_ms = {mode or 10}\n"
+        f'[metrics]\nlisten = {metrics_port}\nbind = "127.0.0.1"\n[stats]\ninterval = "1s"\n'
+        '[class.benchmark]\nmatch = ["127.0.0.1/32"]\nsendq = "1M"\nrecvq = "16K"\nflood_exempt = true\n')
+
+
+def run_phase_matrix(args, binary):
+    import hashlib, json, platform
+    from alpine_runtime_smoke import stop
+    import setup_review_client
+    artifact = hashlib.sha256(binary.read_bytes()).hexdigest()
+    if not args.expected_sha256 or artifact != args.expected_sha256:
+        raise PhaseFailure("explicit captured artifact SHA-256 mismatch")
+    if not args.phase_json or args.repetitions < 1 or not args.sqpoll_modes or len(set(args.sqpoll_modes)) != len(args.sqpoll_modes) or any(m not in (0, 10, 1000) for m in args.sqpoll_modes):
+        raise PhaseFailure("phase JSON, positive repetitions and valid modes required")
+    scratch = repo_root() / ".zig-cache/wave-6/live-benchmark"
+    scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
+    report = dict(profile="one-shard-pinned-TLS", pilot=args.phase_pilot, artifact_sha256=artifact,
+                  kernel=platform.release(), driver_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                  review_helper_sha256=hashlib.sha256(Path(setup_review_client.__file__).read_bytes()).hexdigest(),
+                  fixed=dict(clients=4, shards=1, ring=512, cqe=256, payload_bytes=128, window=64,
+                             sweep_ms=2000, stats_ms=1000, tls="TLS1.3", ktls="off"), records=[])
+    output = Path(args.phase_json)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="phases-", dir=scratch) as temporary:
+        work = Path(temporary)
+        ports = [free_port() for _ in range(3)]
+        if len(set(ports)) != 3:
+            raise PhaseFailure("fixture ports collided")
+        irc, tls, metrics = ports
+        hostname, bundle = "benchmark.example.test", work / "bundle"
+        def verify_review(stage, review):
+            # The controller sees the real stage before its ID-bound publish
+            # acknowledgement. Check the public certificate itself, not only
+            # the asserted metadata; never render its private companion.
+            if review["certificate_subject"] != hostname or review["bootstrap_account"] is not None:
+                raise PhaseFailure("unexpected staged identity")
+            cert_pem = ssl.DER_cert_to_PEM_cert((stage / "tls-cert.der").read_bytes())
+            with tempfile.NamedTemporaryFile(mode="w", dir=work, encoding="ascii") as cert_file:
+                cert_file.write(cert_pem)
+                cert_file.flush()
+                cert = ssl._ssl._test_decode_cert(cert_file.name)
+            if ("DNS", hostname) not in cert.get("subjectAltName", ()):
+                raise PhaseFailure("staged certificate hostname mismatch")
+            if int(ssl.cert_time_to_seconds(cert["notAfter"])) != review["certificate_expires_unix"]:
+                raise PhaseFailure("staged certificate expiry mismatch")
+
+        try:
+            made, review, _ = setup_review_client.run_review(
+                [str(binary), "setup", "--new", "--hostname", hostname, "--listen", HOST,
+                 "--irc-port", str(irc), "--tls-port", str(tls), "--bundle", str(bundle), "--json"],
+                cwd=work, mutate=verify_review)
+        except Exception:
+            raise PhaseFailure("private bundle review failed") from None
+        if made.returncode != 0 or review is None:
+            raise PhaseFailure("private bundle provisioning failed")
+        base = (bundle / "onyx-server.toml").read_text()
+        credentials = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in bundle.iterdir() if p.is_file()}
+        context = pinned_context((bundle / "tls-cert.der").read_bytes())
+        for repetition in range(args.repetitions):
+            modes = args.sqpoll_modes if repetition % 2 == 0 else list(reversed(args.sqpoll_modes))
+            for mode in modes:
+                cell = work / f"r{repetition}-m{mode}"
+                cell.mkdir(mode=0o700)
+                conf = bundle / f"cell-r{repetition}-m{mode}.toml"
+                conf.write_text(phase_config(base, mode, metrics))
+                conf.chmod(0o600)
+                checked = subprocess.run([str(binary), "--check-config", str(conf)], cwd=cell, capture_output=True, timeout=15)
+                if checked.returncode != 0:
+                    raise PhaseFailure("private phase configuration rejected")
+                process = None
+                tls_observations = []
+                failure_diagnostic = {}
+                record = dict(mode=mode, repetition=repetition, load_before=os.getloadavg())
+                try:
+                    with (cell / "daemon.log").open("wb") as log:
+                        process = subprocess.Popen([str(binary), str(conf)], cwd=cell, stdout=log,
+                                                   stderr=subprocess.STDOUT, preexec_fn=raise_stack_limit,
+                                                   start_new_session=True)
+                        if not wait_tcp(irc, BOOT_S, process):
+                            raise PhaseFailure("private listener failed startup")
+                        record["phases"] = asyncio.run(measure_daemon_phases(process, tls, metrics, context, hostname,
+                                                                            mode, args.phase_pilot, f"{repetition:04d}", tls_observations, failure_diagnostic))
+                        record["status"] = "ok"
+                except Exception as exc:
+                    record.update(status="failed", reason=str(exc))
+                    if failure_diagnostic:
+                        record["diagnostic"] = failure_diagnostic
+                finally:
+                    if process is not None:
+                        stop(process)
+                record["tls_observations"] = phase_tls_summary(tls_observations)
+                record["load_after"] = os.getloadavg()
+                report["records"].append(record)
+                output.write_text(json.dumps(report, indent=2) + "\n")
+                print(json.dumps(record), flush=True)
+                if record["status"] != "ok":
+                    break
+            if any(r["status"] != "ok" for r in report["records"]):
+                break
+        if artifact != hashlib.sha256(binary.read_bytes()).hexdigest() or any(hashlib.sha256(p.read_bytes()).hexdigest() != expected for p, expected in credentials.items()):
+            raise PhaseFailure("captured artifact or private credentials changed")
+    report["status"] = "ok" if len(report["records"]) == args.repetitions * len(args.sqpoll_modes) and all(r["status"] == "ok" for r in report["records"]) else "failed"
+    output.write_text(json.dumps(report, indent=2) + "\n")
+    return 0 if report["status"] == "ok" else 1
 
 
 if __name__ == "__main__":

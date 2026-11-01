@@ -59,7 +59,7 @@ pub fn encode(out: []u8, req: KeyUpdateRequest) Error![]const u8 {
     out[1] = 0;
     out[2] = 0;
     out[3] = @intCast(body_len);
-    out[4] = @intFromEnum(req);
+    out[4] = @backingInt(req);
     return out[0..encoded_len];
 }
 

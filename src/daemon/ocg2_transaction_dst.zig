@@ -1167,14 +1167,14 @@ const covering_dim_levels = [_]u8{ 4, 4, 2, 3, 4, 2, 3, 2, 2 };
 
 fn coveringDim(in: Input, dim: u8) u8 {
     return switch (dim) {
-        0 => @intFromEnum(in.before_reserve),
-        1 => @intFromEnum(in.before_commit),
-        2 => @intFromEnum(in.reactors),
-        3 => @intFromEnum(in.interleave),
-        4 => @intFromEnum(in.prior_cut),
+        0 => @backingInt(in.before_reserve),
+        1 => @backingInt(in.before_commit),
+        2 => @backingInt(in.reactors),
+        3 => @backingInt(in.interleave),
+        4 => @backingInt(in.prior_cut),
         5 => if (in.explicit_recovery) 1 else 0,
-        6 => @intFromEnum(in.revision),
-        7 => @intFromEnum(in.wire),
+        6 => @backingInt(in.revision),
+        7 => @backingInt(in.wire),
         8 => if (in.intent == .grant) 0 else 1,
         else => unreachable,
     };

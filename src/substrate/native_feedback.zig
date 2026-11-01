@@ -64,7 +64,7 @@ pub fn encodeNack(stream_id: u32, seqs: []const u32, out: []u8) Error![]const u8
     const needed = nack_header_len + seqs.len * 4;
     if (out.len < needed) return Error.BufferTooSmall;
 
-    out[0] = @intFromEnum(Kind.nack);
+    out[0] = @backingInt(Kind.nack);
     std.mem.writeInt(u32, out[1..][0..4], stream_id, .big);
     std.mem.writeInt(u16, out[5..][0..2], @intCast(seqs.len), .big);
 
@@ -80,7 +80,7 @@ pub fn encodeNack(stream_id: u32, seqs: []const u32, out: []u8) Error![]const u8
 pub fn encodeKeyframeRequest(stream_id: u32, out: []u8) Error![]const u8 {
     if (out.len < keyframe_request_len) return Error.BufferTooSmall;
 
-    out[0] = @intFromEnum(Kind.keyframe_request);
+    out[0] = @backingInt(Kind.keyframe_request);
     std.mem.writeInt(u32, out[1..][0..4], stream_id, .big);
 
     return out[0..keyframe_request_len];
@@ -89,7 +89,7 @@ pub fn encodeKeyframeRequest(stream_id: u32, out: []u8) Error![]const u8 {
 pub fn encodeReceiverReport(rr: ReceiverReport, out: []u8) Error![]const u8 {
     if (out.len < receiver_report_len) return Error.BufferTooSmall;
 
-    out[0] = @intFromEnum(Kind.receiver_report);
+    out[0] = @backingInt(Kind.receiver_report);
     std.mem.writeInt(u32, out[1..][0..4], rr.stream_id, .big);
     out[5] = rr.fraction_lost;
     std.mem.writeInt(u32, out[6..][0..4], rr.cumulative_lost, .big);
@@ -103,9 +103,9 @@ pub fn parse(bytes: []const u8, seq_out: []u32) Error!Message {
     if (bytes.len < 1) return Error.Truncated;
 
     const kind: Kind = switch (bytes[0]) {
-        @intFromEnum(Kind.nack) => .nack,
-        @intFromEnum(Kind.keyframe_request) => .keyframe_request,
-        @intFromEnum(Kind.receiver_report) => .receiver_report,
+        @backingInt(Kind.nack) => .nack,
+        @backingInt(Kind.keyframe_request) => .keyframe_request,
+        @backingInt(Kind.receiver_report) => .receiver_report,
         else => return Error.BadKind,
     };
 
@@ -240,7 +240,7 @@ test "nack with 3 seqs round-trips" {
     const encoded = try encodeNack(0x0102_0304, &seqs, &out);
 
     try testing.expectEqual(@as(usize, 19), encoded.len);
-    try testing.expectEqual(@intFromEnum(Kind.nack), encoded[0]);
+    try testing.expectEqual(@backingInt(Kind.nack), encoded[0]);
 
     var parsed_seqs: [3]u32 = undefined;
     const msg = try parse(encoded, &parsed_seqs);

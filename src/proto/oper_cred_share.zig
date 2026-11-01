@@ -380,7 +380,7 @@ fn encodeOcg2Signed(out: []u8, fields: Ocg2Fields) Ocg2Error!usize {
         }
     };
     try Put.raw(out, &pos, ocg2_domain);
-    try Put.byte(out, &pos, @intFromEnum(fields.kind));
+    try Put.byte(out, &pos, @backingInt(fields.kind));
     try Put.u64be(out, &pos, fields.authority_node_id);
     try Put.u64be(out, &pos, fields.revision);
     try Put.u64be(out, &pos, fields.issued_ms);

@@ -85,13 +85,13 @@ fn addInterestingBytes(buf: []u8, iteration: usize) void {
 
 fn randomFrameType(random: std.Random, iteration: usize) frame.FrameType {
     const types = [_]u8{
-        @intFromEnum(frame.FrameType.ping),
-        @intFromEnum(frame.FrameType.privmsg),
-        @intFromEnum(frame.FrameType.irc_line),
-        @intFromEnum(frame.FrameType.concord_delta),
-        @intFromEnum(frame.FrameType.cap_grant),
-        @intFromEnum(frame.FrameType.mooring_ratchet),
-        @intFromEnum(frame.FrameType.voice_data),
+        @backingInt(frame.FrameType.ping),
+        @backingInt(frame.FrameType.privmsg),
+        @backingInt(frame.FrameType.irc_line),
+        @backingInt(frame.FrameType.concord_delta),
+        @backingInt(frame.FrameType.cap_grant),
+        @backingInt(frame.FrameType.mooring_ratchet),
+        @backingInt(frame.FrameType.voice_data),
         0x1f,
         0x8c,
         0xd1,
@@ -102,7 +102,7 @@ fn randomFrameType(random: std.Random, iteration: usize) frame.FrameType {
 fn randomCtrl(random: std.Random) frame.Ctrl {
     return frame.Ctrl.init(
         random.int(u4),
-        @enumFromInt(random.int(u3)),
+        @fromBackingInt(@intCast(random.int(u3))),
         random.boolean(),
     );
 }

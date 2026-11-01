@@ -1,5 +1,8 @@
 # IRCX
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../../README.md) and [production paths](../../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 _Opt-in extended IRC commands, channel modes, properties, access lists, events, and media policy integration._
 
 > Historical reference only: this page describes a legacy C IRCX implementation

@@ -157,7 +157,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, store: *const metadata_store
         std.mem.writeInt(u16, bytes[pos..][0..2], @intCast(pairs.len), .big);
         pos += 2;
         for (pairs) |pair| {
-            bytes[pos] = @intCast(@intFromEnum(pair.visibility));
+            bytes[pos] = @intCast(@backingInt(pair.visibility));
             pos += 1;
             std.mem.writeInt(u16, bytes[pos..][0..2], @intCast(pair.key.len), .big);
             pos += 2;

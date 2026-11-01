@@ -304,7 +304,7 @@ fn presenceTransition(old: PresenceReceipt, next: PresenceReceipt, realm: Digest
 }
 fn checkManifestRoots(roots: []const ManifestRoot, first_kind: usize) Error!void {
     for (roots, first_kind..) |r, k| {
-        if (@intFromEnum(r.kind) != k or ((r.chunks == 0) != (r.bytes == 0))) return error.InvalidField;
+        if (@backingInt(r.kind) != k or ((r.chunks == 0) != (r.bytes == 0))) return error.InvalidField;
         if (r.chunks == 0 and !std.mem.eql(u8, &r.root, &emptyManifestRoot(r.kind).root)) return error.InvalidField;
         try nonzero(&r.root);
     }
@@ -481,7 +481,7 @@ fn write(w: *Writer, comptime T: type, value: T) anyerror!void {
     switch (@typeInfo(T)) {
         .int => try w.int(T, value),
         .bool => try w.int(u8, @intFromBool(value)),
-        .@"enum" => try w.int(@typeInfo(T).@"enum".tag_type, @intFromEnum(value)),
+        .@"enum" => try w.int(@typeInfo(T).@"enum".tag_type, @backingInt(value)),
         .array => |a| {
             if (a.child == u8) try w.put(&value) else for (value) |v| try write(w, a.child, v);
         },
@@ -900,7 +900,7 @@ fn verifyDeclarationEvidence(allocator: std.mem.Allocator, declaration: Declarat
     if (!found) return error.InvalidProof;
 }
 pub fn emptyManifestRoot(kind: ManifestKind) ManifestRoot {
-    return .{ .kind = kind, .chunks = 0, .bytes = 0, .root = hash("onyx-account-manifest-empty-v1", &.{&.{@intFromEnum(kind)}}) };
+    return .{ .kind = kind, .chunks = 0, .bytes = 0, .root = hash("onyx-account-manifest-empty-v1", &.{&.{@backingInt(kind)}}) };
 }
 /// Root of complete, strictly indexed chunk wires. The resulting root still
 /// needs activation by a signed head; inert chunks never create revocation.
@@ -930,7 +930,7 @@ pub fn manifestRoot(allocator: std.mem.Allocator, wires: []const []const u8, kin
     var payload_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &count_bytes, wires.len, .big);
     std.mem.writeInt(u64, &payload_bytes, bytes, .big);
-    return .{ .kind = kind, .chunks = wires.len, .bytes = bytes, .root = hash("onyx-account-manifest-root-v1", &.{ &.{@intFromEnum(kind)}, &count_bytes, &payload_bytes, &nodes[1] }) };
+    return .{ .kind = kind, .chunks = wires.len, .bytes = bytes, .root = hash("onyx-account-manifest-root-v1", &.{ &.{@backingInt(kind)}, &count_bytes, &payload_bytes, &nodes[1] }) };
 }
 pub fn verifyManifest(allocator: std.mem.Allocator, wires: []const []const u8, expected_root: ManifestRoot, id: RevocationId, context: Context, limits: Limits) !void {
     if (!std.meta.eql(expected_root, try manifestRoot(allocator, wires, expected_root.kind, id, context, limits))) return error.InvalidProof;
@@ -1000,7 +1000,7 @@ fn fixturePresence(context: Context) PresenceReceipt {
 }
 fn fixtureManifests() [5]ManifestRoot {
     var roots: [5]ManifestRoot = undefined;
-    for (&roots, 1..) |*r, k| r.* = emptyManifestRoot(@enumFromInt(k));
+    for (&roots, 1..) |*r, k| r.* = emptyManifestRoot(@fromBackingInt(@intCast(k)));
     return roots;
 }
 fn fixtureSubmanifests() [4]ManifestRoot {
@@ -1622,7 +1622,7 @@ const AcyclicFixture = struct {
         var submade: usize = 0;
         errdefer for (fixture.subchunks[0..submade]) |*wire| wire.deinit();
         for (&fixture.subchunks, 0..) |*wire, i| {
-            const kind: ManifestKind = @enumFromInt(i + 2);
+            const kind: ManifestKind = @fromBackingInt(@intCast(i + 2));
             wire.* = try encode(Chunk, allocator, .{ .resource = context.resource, .revocation = fixture.fields.revocation, .kind = kind, .index = 0, .total = 1, .payload = "exact independently owned submanifest facts" }, context, null, test_limits);
             submade += 1;
             fixture.fields.submanifests[i] = try manifestRoot(allocator, &.{wire.asSlice()}, kind, fixture.fields.revocation, context, test_limits);

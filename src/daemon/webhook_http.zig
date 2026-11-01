@@ -1540,8 +1540,8 @@ test "WebhookServer pause and whole request deadline stop an active dribble befo
 }
 
 fn acceptFailure(err: posix.E) if (builtin.os.tag == .linux) usize else c_int {
-    if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @intFromEnum(err))) else {
-        sys._errno().* = @intFromEnum(err);
+    if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @backingInt(err))) else {
+        sys._errno().* = @backingInt(err);
         return -1;
     }
 }

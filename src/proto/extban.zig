@@ -7,6 +7,7 @@
 //! the parsed pattern slices and the caller's client context, so the hot path is
 //! allocation-free and bounded by the supplied pattern and channel list.
 const std = @import("std");
+const cloak_match = @import("cloak_match.zig");
 
 /// Maximum bytes accepted for one ban mask.
 pub const MAX_MASK_BYTES: usize = 512;
@@ -51,6 +52,7 @@ pub const MAX_CERTFP_PATTERN_BYTES: usize = 128;
 /// All slices are caller-owned. `host` is the normalized hostmask/host string
 /// used for plain ban mask fallthrough.
 pub const ClientContext = struct {
+    cloak_context: ?cloak_match.Context = null,
     account: ?[]const u8 = null,
     realname: []const u8 = "",
     host: []const u8 = "",
@@ -235,13 +237,13 @@ pub fn Matcher(comptime max_nodes: usize) type {
             if (index >= self.node_count) return false;
 
             return switch (self.nodes[index]) {
-                .hostmask => |pattern| patternMatch(pattern, ctx.host),
+                .hostmask => |pattern| cloak_match.match(pattern, ctx.host, ctx.cloak_context),
                 .account => |pattern| if (ctx.account) |account| patternMatch(pattern, account) else false,
                 .realname => |pattern| patternMatch(pattern, ctx.realname),
                 .country => |pattern| if (ctx.country) |country| patternMatch(pattern, country) else false,
                 .channel => |pattern| matchAnyChannel(pattern, ctx.channels),
                 .secure => |pattern| matchSecure(pattern, ctx),
-                .mute => |pattern| patternMatch(pattern, ctx.host),
+                .mute => |pattern| cloak_match.match(pattern, ctx.host, ctx.cloak_context),
                 .oper => |pattern| matchOper(pattern, ctx),
                 .negation => |child| !self.matchNode(child, ctx),
             };
@@ -599,4 +601,20 @@ test "caller can lower nesting capacity at comptime" {
     const matcher = try SmallMatcher.parse("$~a:alice");
     try std.testing.expect(matcher.matches(.{ .account = "bob" }));
     try std.testing.expectError(error.TooDeep, SmallMatcher.parse("$~$~a:alice"));
+}
+
+test "cloak extban nested host match survives epoch rotation" {
+    const c = @import("cloak.zig");
+    const key = c.SecretKey.init(@splat(7));
+    var old: [253]u8 = undefined;
+    const before = try c.cloakOpaqueEpochV4(&old, &key, "203.0.113.9", 1, 86400, .{});
+    const matcher = try parse(before);
+    const ctx: ClientContext = .{ .host = "current.onyx", .cloak_context = .{ .key = key, .suffix = "onyx", .address = "203.0.113.9" } };
+    try std.testing.expect(matcher.matches(ctx));
+    var mute_buf: [512]u8 = undefined;
+    const muted = try parse(try std.fmt.bufPrint(&mute_buf, "$m:{s}", .{before}));
+    try std.testing.expect(muted.matches(ctx));
+    var negated_buf: [512]u8 = undefined;
+    const negated = try parse(try std.fmt.bufPrint(&negated_buf, "$~:{s}", .{before}));
+    try std.testing.expect(!negated.matches(ctx));
 }

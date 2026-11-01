@@ -3,6 +3,9 @@
 
 # Onyx Server — gap roadmap (2026-09-29)
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](README.md) and [production paths](ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 **Continuation note (2026-09-30):** the baseline audit below predates the
 implementation commits through `15e09029`. Its defect descriptions and
 unmarked headings must be checked against current source; they are not a
@@ -422,6 +425,17 @@ unwritten (`tls_conn.zig`).
 without a reconnect, proven against the kernel. Until then `[tls] ktls` stays
 `tx` on the fleet, and `txrx` remains a documented footgun. TLS 1.2 kTLS stays
 cut under the modern-only posture unless a kernel round-trip proves it.
+
+**CLOSED 2026-11-01.** The kernel-control KeyUpdate path now reinstalls the
+rotated RX epoch and, for `request_peer`, sends the server KeyUpdate under the
+old TX epoch before installing the rotated TX epoch
+(`TlsConn.readKernelControl` / `progressKernelReply`); `ktls = "txrx"` is
+admitted by `configCheckError`/`resolveKtlsOffload` and is deployed on both
+nodes (`kTLS TX+RX offload ACTIVE (txrx)`, WHOIS `671 ... [kTLS: TX+RX]`).
+Kernel proof covers `update_not_requested`, consecutive epochs, a KeyUpdate
+queued during a partial reply, server-initiated KeyUpdate, and post-rekey
+Helix capture/adopt. TLS 1.2 kTLS remains cut. See
+[production paths](ops/onyx-server-paths.md).
 
 ### GAP-A7 — New listeners have no Helix checkpoint
 

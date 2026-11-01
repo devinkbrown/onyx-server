@@ -80,7 +80,7 @@ pub const Model = struct {
 
     pub fn tick(self: *Model, site: Site) void {
         if (!self.isMaintenanceReactor()) return;
-        const i = @intFromEnum(site);
+        const i = @backingInt(site);
         self.work[i] += 1;
         self.counter[i] += 1;
         if (site == .publish_peer_count or site == .publish_peer_count_internal) {
@@ -93,7 +93,7 @@ pub const Model = struct {
 
     /// Buggy sibling path: advance the shared counter / wipe peers without work.
     pub fn stolenTick(self: *Model, site: Site) void {
-        const i = @intFromEnum(site);
+        const i = @backingInt(site);
         self.counter[i] += 1;
         if (site == .publish_peer_count or site == .publish_peer_count_internal) {
             self.peer_names = 0;
@@ -106,7 +106,7 @@ pub const Model = struct {
 
 fn allSites() [site_count]Site {
     var out: [site_count]Site = undefined;
-    for (&out, 0..) |*slot, i| slot.* = @enumFromInt(i);
+    for (&out, 0..) |*slot, i| slot.* = @fromBackingInt(@intCast(i));
     return out;
 }
 
@@ -140,7 +140,7 @@ test "DST: timer-guard ≥2 shards refuses sibling counter theft" {
         if (model.work[i] != 1 or model.counter[i] != 1) {
             std.debug.print("DST timer-guard mismatch seed={d} site={s} work={d} counter={d}\n", .{
                 seed,
-                @tagName(@as(Site, @enumFromInt(i))),
+                @tagName(@as(Site, @fromBackingInt(@intCast(i)))),
                 model.work[i],
                 model.counter[i],
             });
@@ -157,7 +157,7 @@ test "DST: timer-guard publishPeerCount sibling cannot wipe peer table" {
     model.tick(.publish_peer_count);
     model.tick(.publish_peer_count_internal);
     try std.testing.expectEqual(before, model.peer_names);
-    try std.testing.expectEqual(@as(u32, 0), model.work[@intFromEnum(Site.publish_peer_count)]);
+    try std.testing.expectEqual(@as(u32, 0), model.work[@backingInt(Site.publish_peer_count)]);
 }
 
 test "DST: timer-guard maybeProbeMeshPeerRtt does not steal probe cadence" {
@@ -208,7 +208,7 @@ test "DST: timer-guard stolen sibling path is the detectable counterexample" {
     model.stolenTick(.maybe_probe_mesh_peer_rtt);
     try std.testing.expectEqual(@as(u32, 0), model.peer_names);
     try std.testing.expectEqual(@as(u32, 1), model.last_peer_rtt_probe);
-    try std.testing.expectEqual(@as(u32, 0), model.work[@intFromEnum(Site.publish_peer_count)]);
+    try std.testing.expectEqual(@as(u32, 0), model.work[@backingInt(Site.publish_peer_count)]);
 }
 
 fn sum(values: []const u32) u32 {

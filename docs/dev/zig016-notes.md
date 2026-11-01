@@ -1,4 +1,7 @@
 # Zig 0.16 notes and worker integration rules
+
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
 *Historical design note: records Zig 0.16 API facts and worker integration rules for internal Onyx Server development.*
 
 Onyx Server targets **Zig 0.16.0**. The standard library differs significantly from older Zig releases; code written from memory of 0.11–0.14 will not compile reliably. Verify every change by compiling.

@@ -204,7 +204,7 @@ fn writeChunk(out: []u8, pos: *usize, chunk: u16) Error!void {
 
 fn runLengthChunk(status: Status, run_length: u16) u16 {
     // top bit 0 => run length; bits 14..13 = symbol; bits 12..0 = length
-    return (@as(u16, @intFromEnum(status)) << 13) | (run_length & max_run_length);
+    return (@as(u16, @backingInt(status)) << 13) | (run_length & max_run_length);
 }
 
 fn twoBitVectorChunk(statuses: []const Status) u16 {
@@ -212,7 +212,7 @@ fn twoBitVectorChunk(statuses: []const Status) u16 {
     var chunk: u16 = 0xc000;
     for (statuses, 0..) |s, i| {
         const shift: u4 = @intCast(12 - i * 2);
-        chunk |= @as(u16, @intFromEnum(s)) << shift;
+        chunk |= @as(u16, @backingInt(s)) << shift;
     }
     return chunk;
 }

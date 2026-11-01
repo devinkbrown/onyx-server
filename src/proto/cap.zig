@@ -98,7 +98,7 @@ pub const CapSet = struct {
     }
 
     fn bit(id: CapId) u64 {
-        return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(id)));
+        return @as(u64, 1) << @as(u6, @intCast(@backingInt(id)));
     }
 };
 

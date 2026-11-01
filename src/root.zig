@@ -27,6 +27,10 @@ pub const substrate = @import("substrate/root.zig");
 pub const wasm_transport_root = @import("wasm_transport_root.zig");
 // gen:mods:end
 
+/// Offline audit CLI shares library-owned cloak and checkpoint dependencies.
+pub const cloak_audit_cli = @import("cli/cloak_audit_cmd.zig");
+pub const service_identity_preflight = @import("daemon/service_identity_preflight.zig");
+
 /// OroWasm — pure-Zig sandboxed control-plane plugin host (subdir, not scanned
 /// by genroots). See docs/planning/17-module-system.md §8.
 pub const wasm_host = @import("wasm/host/root.zig");

@@ -1,5 +1,8 @@
 # Current foundational gap frontier
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Baseline: `6b9759d9`. This is a sampled source/evidence audit, not an exhaustive
 completion ledger for every historical roadmap heading. No deployment or push.
 

@@ -11,9 +11,9 @@
 #      provenance) still matches SHA256SUMS, catching post-publish tampering.
 #   3. SIGNATURE — if a cosign signature is present, verify it.
 #
-# Requires git, zig, sha256sum. cosign is optional (skipped if absent).
+# Requires git, zig, sha256sum, and Python 3. cosign is optional (skipped if absent).
 #
-# Usage:  packaging/verify-release.sh [path/to/SHA256SUMS]
+# Usage: packaging/verify-release.sh [path/to/SHA256SUMS] [target]
 #         (default: dist/SHA256SUMS)
 set -euo pipefail
 
@@ -21,13 +21,23 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 SUMS="${1:-dist/SHA256SUMS}"
-TARGET="x86_64-linux-musl"
+TARGET="${2:-x86_64-linux-musl}"
+case "$TARGET" in
+  x86_64-linux-musl) ARCH=x86_64 ;;
+  aarch64-linux-musl) ARCH=aarch64 ;;
+  *) echo "verify: unsupported target" >&2; exit 2 ;;
+esac
+CPU=baseline
 
 if [ ! -f "$SUMS" ]; then
   echo "verify: no manifest at $SUMS — run packaging/release.sh first (or pass its path)" >&2
   exit 2
 fi
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+if ! GIT_STATUS="$(git status --porcelain 2>/dev/null)"; then
+  echo "verify: cannot inspect working tree" >&2
+  exit 2
+fi
+if [ -n "$GIT_STATUS" ]; then
   echo "verify: working tree is dirty — a reproducible check must run on a clean checkout" >&2
   exit 2
 fi
@@ -35,16 +45,51 @@ fi
 SUMS_DIR="$(cd "$(dirname "$SUMS")" && pwd)"
 SUMS_FILE="$(basename "$SUMS")"
 
-# The binary is always the FIRST line of the manifest.
-EXPECTED="$(awk '{print $1}' "$SUMS" | head -1)"
-ARTIFACT="$(awk '{print $2}' "$SUMS" | head -1)"
+# Bind exactly one target-specific artifact and metadata entry. No first-line guess.
+FULLSHA="$(git rev-parse HEAD)"
+VERSION="$(grep -oE '\.version = "[^"]+"' build.zig.zon | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+[[ "$FULLSHA" =~ ^[0-9a-f]{40,64}$ && "$VERSION" =~ ^[0-9A-Za-z.+_-]+$ ]] || { echo "verify: invalid source metadata" >&2; exit 2; }
+ARTIFACT="onyx-server-${VERSION}-${TARGET}"
+ZIG_BIN="$(command -v zig)"
+ZIGVER="$("$ZIG_BIN" version)"
+ZIG_SHA256="$(sha256sum "$ZIG_BIN" | cut -d' ' -f1)"
+export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+EXPECTED="$(python3 - "$SUMS" "$SUMS_DIR/onyx-server.build.json" "$TARGET" "$ARCH" "$CPU" "$VERSION" "$FULLSHA" "$ZIGVER" "$ZIG_SHA256" "$ARTIFACT" "$SOURCE_DATE_EPOCH" <<'PYMETA'
+import hashlib, json, re, sys
+sums, path, target, arch, cpu, version, commit, zigver, zigsha, artifact, epoch = sys.argv[1:]
+try:
+    entries = {}
+    with open(sums, encoding='utf-8') as f:
+        for line in f:
+            match = re.fullmatch(r'([0-9a-f]{64}) [ *]([^/\\\n]+)\n?', line)
+            if not match or match.group(2) in entries:
+                raise ValueError('manifest')
+            entries[match.group(2)] = match.group(1)
+    with open(path, 'rb') as f:
+        raw = f.read(65537)
+    if len(raw) > 65536 or hashlib.sha256(raw).hexdigest() != entries.get('onyx-server.build.json'):
+        raise ValueError('metadata digest')
+    data = json.loads(raw)
+    expected_digest = entries[artifact]
+    expected = {'format': 1, 'target': target, 'architecture': arch, 'cpu': cpu,
+                'version': version, 'commit': commit, 'zig_version': zigver,
+                'zig_sha256': zigsha, 'artifact': artifact, 'sha256': expected_digest,
+                'source_date_epoch': epoch,
+                'flags': ['build', '-Dtarget=' + target, '-Dcpu=' + cpu, '--release=fast']}
+    if data != expected:
+        raise ValueError('metadata mismatch')
+    print(expected_digest)
+except (OSError, ValueError, KeyError, TypeError, UnicodeError):
+    print('verify: invalid manifest or build metadata', file=sys.stderr)
+    sys.exit(1)
+PYMETA
+)"
 echo "verify: expected $EXPECTED  ($ARTIFACT)"
 echo "verify: rebuilding from source @ $(git rev-parse --short HEAD) with a clean cache…"
 
 CACHE="$(mktemp -d)"
 trap 'rm -rf "$CACHE"' EXIT
-export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-zig build -Dtarget="$TARGET" -Doptimize=ReleaseFast --cache-dir "$CACHE" --prefix "$CACHE/out" >/dev/null
+"$ZIG_BIN" build -Dtarget="$TARGET" -Dcpu="$CPU" --release=fast --cache-dir "$CACHE" --prefix "$CACHE/out" >/dev/null
 
 ACTUAL="$(sha256sum "$CACHE/out/bin/onyx-server" | cut -d' ' -f1)"
 echo "verify: rebuilt  $ACTUAL"

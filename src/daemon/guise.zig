@@ -19,8 +19,8 @@
 //! This module owns the persona + offer storage and the matching logic. The live
 //! server applies the active persona to a session (CHGHOST) and gates who may
 //! publish offers. Its one outward dependency is the stateless `cloak`
-//! label-sanitizer: `claim` binds a self-claimed host's leading label to the
-//! caller's account the same way `cloakAccount` derives `<account>.users.<...>`,
+//! account-cloak encoder: `claim` binds a self-claimed host's identity labels to
+//! the caller's collision-resistant `cloakAccount` identity,
 //! so a user can only self-claim a host that spells their own account.
 
 const std = @import("std");
@@ -115,6 +115,13 @@ pub const Registry = struct {
         if (name.len == 0 or host.len == 0) return error.EmptyValue;
         if (name.len > self.params.max_name) return error.NameTooLong;
         if (host.len > self.params.max_host) return error.HostTooLong;
+        // Durable and Helix restore enter through grant, too. Validate before
+        // account allocation or replacement so rejected historical claims leave
+        // the existing registry byte-for-byte intact.
+        if (source == .claimed) {
+            if (!claimedHostBelongsToAccount(account, host)) return error.NotYours;
+            if (self.hostOwnedByOther(account, host)) return error.HostClaimedByOther;
+        }
 
         const list = try self.accountList(account);
         // Replace a same-named persona in place.
@@ -139,28 +146,16 @@ pub const Registry = struct {
     /// Self-claim `host` if it matches an operator OFFER template. Stored as a
     /// `.claimed` persona named after the host's first label. Returns the offer.
     ///
-    /// The claim is bound to `account`: the host's leading label — sanitized the
-    /// way `cloakAccount` sanitizes an account — must equal the sanitized
-    /// account, and no *other* account may already wear the same host. Without
+    /// The claim is bound to `account`: the host's identity labels must equal
+    /// the collision-resistant account cloak, and no *other* account may
+    /// already wear the same host. Without
     /// this a logged-in user could self-claim `<someone-else>.users.<suffix>` off
     /// a wildcard community offer and wear another account's apparent identity.
     pub fn claim(self: *Registry, account: []const u8, host: []const u8, now_ms: i64) GuiseError!Offer {
         const offer = self.matchOffer(host) orelse return error.NotOffered;
-        if (!leadingLabelMatchesAccount(account, host)) return error.NotYours;
-        if (self.hostOwnedByOther(account, host)) return error.HostClaimedByOther;
         const name = firstLabel(host);
         try self.grant(account, name, host, .claimed, now_ms);
         return offer;
-    }
-
-    /// True when `host`'s leading label, sanitized as a hostname label, equals
-    /// the sanitized `account` — i.e. the host spells the caller's own account.
-    fn leadingLabelMatchesAccount(account: []const u8, host: []const u8) bool {
-        var abuf: [cloak.max_cloak_len]u8 = undefined;
-        var hbuf: [cloak.max_cloak_len]u8 = undefined;
-        const acct_label = cloak.sanitizeLabel(&abuf, account) orelse return false;
-        const lead_label = cloak.sanitizeLabel(&hbuf, firstLabel(host)) orelse return false;
-        return std.mem.eql(u8, acct_label, lead_label);
     }
 
     /// True when some account OTHER than `account` already wears `host` as a
@@ -307,15 +302,42 @@ pub fn globMatch(pattern: []const u8, text: []const u8) bool {
     return p == pattern.len;
 }
 
+/// Use the cloak encoder as the single account-identity authority. Unsafe
+/// account spellings require both their friendly and digest labels.
+pub fn claimedHostBelongsToAccount(account: []const u8, host: []const u8) bool {
+    var abuf: [cloak.max_cloak_len]u8 = undefined;
+    const encoded = cloak.cloakAccount(&abuf, account, "claim") catch return false;
+    const identity = encoded[0 .. encoded.len - ".users.claim".len];
+    if (host.len <= identity.len or host[identity.len] != '.') return false;
+    if (!std.ascii.eqlIgnoreCase(identity, host[0..identity.len])) return false;
+
+    // A one-label canonical account must not borrow an unsafe account's
+    // digest as its offered suffix and impersonate that account's auto host.
+    // Other suffixes remain under the operator's OFFER policy.
+    if (std.mem.indexOfScalar(u8, identity, '.') == null) {
+        const suffix = host[identity.len + 1 ..];
+        const digest_len = cloak.wide_token_hex_len;
+        if (suffix.len > digest_len + ".users.".len and
+            std.ascii.eqlIgnoreCase(suffix[digest_len..][0..".users.".len], ".users."))
+        {
+            for (suffix[0..digest_len]) |c| {
+                if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'))) return true;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 test "grant stores multiple named personas; find + remove" {
     var reg = Registry.init(std.testing.allocator, .{});
     defer reg.deinit();
     try reg.grant("alice", "work", "alice.staff.example", .granted, 1);
-    try reg.grant("alice", "play", "ally.cool.example", .claimed, 2);
+    try reg.grant("alice", "play", "alice.cool.example", .claimed, 2);
     try std.testing.expectEqual(@as(usize, 2), reg.personas("alice").len);
-    try std.testing.expectEqualStrings("ally.cool.example", reg.find("alice", "PLAY").?.host);
+    try std.testing.expectEqualStrings("alice.cool.example", reg.find("alice", "PLAY").?.host);
     try std.testing.expect(reg.removePersona("alice", "work"));
     try std.testing.expectEqual(@as(usize, 1), reg.personas("alice").len);
 }
@@ -395,16 +417,56 @@ test "vhost claim rejects a host already worn by another account" {
     try std.testing.expectEqual(@as(usize, 0), reg.personas("shared").len);
 }
 
-test "vhost claim sanitizes account and label apples-to-apples" {
+test "vhost claim preserves collision-resistant account identity" {
     var reg = Registry.init(std.testing.allocator, .{});
     defer reg.deinit();
     try reg.addOffer("*.users.eshmaki.me", "community vhosts");
 
-    // Account "some_user" sanitizes to label "some-user"; the canonical host
-    // spelling is accepted, an unrelated label is not.
-    _ = try reg.claim("some_user", "some-user.users.eshmaki.me", 1);
-    try std.testing.expectEqualStrings("some-user.users.eshmaki.me", reg.find("some_user", "some-user").?.host);
+    // The lossy spelling belongs to another valid account, not this account.
+    try std.testing.expectError(error.NotYours, reg.claim("some_user", "some-user.users.eshmaki.me", 1));
+    var buf: [cloak.max_cloak_len]u8 = undefined;
+    const own = try cloak.cloakAccount(&buf, "some_user", "eshmaki.me");
+    _ = try reg.claim("some_user", own, 1);
+    try std.testing.expectEqualStrings(own, reg.find("some_user", "some-user").?.host);
     try std.testing.expectError(error.NotYours, reg.claim("some_user", "eve.users.eshmaki.me", 2));
+}
+
+test "vhost claim rejects punctuation collisions and encoded victim lookalikes" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.addOffer("*.users.onyx", "account hosts");
+    const aliases = [_][]const u8{ "alice_foo", "alice.foo", "-alice-foo", "alice-foo-" };
+    for (aliases, 0..) |account, i| {
+        try std.testing.expectError(error.NotYours, reg.claim(account, "alice-foo.users.onyx", 1));
+        var buf: [cloak.max_cloak_len]u8 = undefined;
+        const own = try cloak.cloakAccount(&buf, account, "onyx");
+        // The canonical account cannot claim this encoded victim's host,
+        // even before the victim has a registered persona.
+        try std.testing.expectError(error.NotYours, reg.claim("alice-foo", own, 1));
+        for (aliases[0..i]) |other| {
+            try std.testing.expectError(error.NotYours, reg.claim(other, own, 1));
+        }
+        _ = try reg.claim(account, own, 2);
+    }
+    try std.testing.expectEqual(@as(usize, 0), reg.personas("alice-foo").len);
+}
+
+test "vhost claim keeps offered suffixes and rejects altered identity labels" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.addOffer("*.community.example", "custom suffix");
+    _ = try reg.claim("ALICE", "alice.community.example", 1);
+    try std.testing.expectError(error.NotYours, reg.claim("alice", "-alice.community.example", 1));
+    try std.testing.expectError(error.NotYours, reg.claim("alice", "alice-.community.example", 1));
+    var buf: [cloak.max_cloak_len]u8 = undefined;
+    const encoded = try cloak.cloakAccount(&buf, "some_user", "claim");
+    const identity = encoded[0 .. encoded.len - ".users.claim".len];
+    var host_buf: [cloak.max_cloak_len]u8 = undefined;
+    const own = try std.fmt.bufPrint(&host_buf, "{s}.community.example", .{identity});
+    _ = try reg.claim("SOME_USER", own, 1);
+    try std.testing.expectError(error.NotYours, reg.claim("some_user", "some-user.community.example", 1));
+    host_buf[identity.len - 1] = if (host_buf[identity.len - 1] == '0') '1' else '0';
+    try std.testing.expectError(error.NotYours, reg.claim("some_user", own, 1));
 }
 
 test "no leak under churn" {
@@ -418,4 +480,24 @@ test "no leak under churn" {
         try reg.grant("churn", name, host, .granted, @intCast(i));
     }
     try std.testing.expect(reg.personas("churn").len <= 8);
+}
+
+test "claimed grant rejects historical identity collisions before registry mutation" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.grant("alice_foo", "prior", "oper-approved.example", .granted, 1);
+    const accounts_before = reg.accounts.count();
+    try std.testing.expectError(error.NotYours, reg.grant("alice_foo", "prior", "alice-foo.users.onyx", .claimed, 2));
+    try std.testing.expectError(error.NotYours, reg.grant("other_foo", "new", "other-foo.users.onyx", .claimed, 2));
+    try std.testing.expectEqual(accounts_before, reg.accounts.count());
+    const unchanged = reg.find("alice_foo", "prior").?;
+    try std.testing.expectEqualStrings("oper-approved.example", unchanged.host);
+    try std.testing.expectEqual(Source.granted, unchanged.source);
+    try std.testing.expectEqual(@as(i64, 1), unchanged.granted_ms);
+    // Explicit operator authority can still assign arbitrary hostnames.
+    try reg.grant("alice_foo", "operator", "alice-foo.users.onyx", .granted, 3);
+    var host_buf: [cloak.max_cloak_len]u8 = undefined;
+    const own_host = try cloak.cloakAccount(&host_buf, "other_foo", "onyx");
+    try reg.grant("other_foo", "own", own_host, .claimed, 4);
+    try std.testing.expectEqual(Source.claimed, reg.find("other_foo", "own").?.source);
 }

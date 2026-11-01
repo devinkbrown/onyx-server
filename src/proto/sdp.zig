@@ -34,8 +34,8 @@ pub const MediaKind = enum(u8) {
 
     fn fromInt(value: u64) Error!MediaKind {
         return switch (value) {
-            @intFromEnum(MediaKind.audio) => .audio,
-            @intFromEnum(MediaKind.video) => .video,
+            @backingInt(MediaKind.audio) => .audio,
+            @backingInt(MediaKind.video) => .video,
             else => error.UnknownKind,
         };
     }
@@ -45,13 +45,57 @@ pub const CodecTag = enum(u8) {
     cadencevox = 1,
     cadencevis = 2,
     raw = 3,
+    opus = 4,
+    vp8 = 5,
 
     fn fromInt(value: u64) Error!CodecTag {
         return switch (value) {
-            @intFromEnum(CodecTag.cadencevox) => .cadencevox,
-            @intFromEnum(CodecTag.cadencevis) => .cadencevis,
-            @intFromEnum(CodecTag.raw) => .raw,
+            @backingInt(CodecTag.cadencevox) => .cadencevox,
+            @backingInt(CodecTag.cadencevis) => .cadencevis,
+            @backingInt(CodecTag.raw) => .raw,
+            @backingInt(CodecTag.opus) => .opus,
+            @backingInt(CodecTag.vp8) => .vp8,
             else => error.UnknownCodec,
+        };
+    }
+
+    pub fn name(self: CodecTag) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn fromName(value: []const u8) Error!CodecTag {
+        if (std.ascii.eqlIgnoreCase(value, "cadencevox")) return .cadencevox;
+        if (std.ascii.eqlIgnoreCase(value, "cadencevis")) return .cadencevis;
+        if (std.ascii.eqlIgnoreCase(value, "raw")) return .raw;
+        if (std.ascii.eqlIgnoreCase(value, "opus")) return .opus;
+        if (std.ascii.eqlIgnoreCase(value, "vp8")) return .vp8;
+        return error.UnknownCodec;
+    }
+
+    /// Standard RTP payload type for gateway codecs, when one is assigned.
+    /// Opus uses 111 and VP8 uses 96 (dynamic range, WebRTC convention);
+    /// native cadence/raw codecs have no RTP payload type.
+    pub fn payloadType(self: CodecTag) ?u7 {
+        return switch (self) {
+            .opus => 111,
+            .vp8 => 96,
+            .cadencevox, .cadencevis, .raw => null,
+        };
+    }
+
+    pub fn fromPayloadType(pt: u7) ?CodecTag {
+        return switch (pt) {
+            111 => .opus,
+            96 => .vp8,
+            else => null,
+        };
+    }
+
+    pub fn mediaKind(self: CodecTag) ?MediaKind {
+        return switch (self) {
+            .cadencevox, .opus => .audio,
+            .cadencevis, .vp8 => .video,
+            .raw => null,
         };
     }
 };
@@ -63,9 +107,9 @@ pub const FecScheme = enum(u8) {
 
     fn fromInt(value: u64) Error!FecScheme {
         return switch (value) {
-            @intFromEnum(FecScheme.none) => .none,
-            @intFromEnum(FecScheme.rateless_lt) => .rateless_lt,
-            @intFromEnum(FecScheme.rs_block) => .rs_block,
+            @backingInt(FecScheme.none) => .none,
+            @backingInt(FecScheme.rateless_lt) => .rateless_lt,
+            @backingInt(FecScheme.rs_block) => .rs_block,
             else => error.UnknownFecScheme,
         };
     }
@@ -79,10 +123,10 @@ pub const Direction = enum(u8) {
 
     fn fromInt(value: u64) Error!Direction {
         return switch (value) {
-            @intFromEnum(Direction.sendrecv) => .sendrecv,
-            @intFromEnum(Direction.sendonly) => .sendonly,
-            @intFromEnum(Direction.recvonly) => .recvonly,
-            @intFromEnum(Direction.inactive) => .inactive,
+            @backingInt(Direction.sendrecv) => .sendrecv,
+            @backingInt(Direction.sendonly) => .sendonly,
+            @backingInt(Direction.recvonly) => .recvonly,
+            @backingInt(Direction.inactive) => .inactive,
             else => error.UnknownDirection,
         };
     }
@@ -120,10 +164,10 @@ pub fn encode(allocator: std.mem.Allocator, desc: MediaDescription) ![]u8 {
 
     try out.appendSlice(allocator, magic);
     try appendVarintField(allocator, &out, desc.band_id);
-    try appendVarintField(allocator, &out, @intFromEnum(desc.kind));
+    try appendVarintField(allocator, &out, @backingInt(desc.kind));
     try appendCodecsField(allocator, &out, desc.codecs);
     try appendFecField(allocator, &out, desc.fec);
-    try appendVarintField(allocator, &out, @intFromEnum(desc.direction));
+    try appendVarintField(allocator, &out, @backingInt(desc.direction));
 
     return try out.toOwnedSlice(allocator);
 }
@@ -157,7 +201,6 @@ pub fn offerAnswer(
     try validate(local_offer);
     try validate(remote_offer);
     if (local_offer.band_id != remote_offer.band_id) return error.BandMismatch;
-    if (local_offer.kind != remote_offer.kind) return error.KindMismatch;
 
     var selected: std.ArrayList(Codec) = .empty;
     errdefer selected.deinit(allocator);
@@ -168,6 +211,7 @@ pub fn offerAnswer(
         try selected.append(allocator, codec);
     }
     if (selected.items.len == 0) return error.NoCommonCodec;
+    if (local_offer.kind != remote_offer.kind) return error.KindMismatch;
 
     return .{
         .band_id = local_offer.band_id,
@@ -231,7 +275,7 @@ fn appendCodecsField(
 
     try appendVarint(allocator, &payload, codecs.len);
     for (codecs) |codec| {
-        try appendVarintField(allocator, &payload, @intFromEnum(codec.tag));
+        try appendVarintField(allocator, &payload, @backingInt(codec.tag));
         try appendVarintField(allocator, &payload, codec.clock_rate);
         try appendVarintField(allocator, &payload, codec.params);
     }
@@ -243,7 +287,7 @@ fn appendFecField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), fec: Fe
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
 
-    try appendVarintField(allocator, &payload, @intFromEnum(fec.scheme));
+    try appendVarintField(allocator, &payload, @backingInt(fec.scheme));
     try appendVarintField(allocator, &payload, fec.redundancy);
     try appendField(allocator, out, payload.items);
 }
@@ -544,4 +588,87 @@ test "truncated descriptor returns truncation error" {
     defer allocator.free(bytes);
 
     try testing.expectError(error.Truncated, decode(allocator, bytes[0 .. bytes.len - 1]));
+}
+
+test "offer opus-only vs vp8-only has no common codec" {
+    const allocator = testing.allocator;
+    const offer_codecs = [_]Codec{.{ .tag = .opus, .clock_rate = 48_000, .params = 2 }};
+    const answer_codecs = [_]Codec{.{ .tag = .vp8, .clock_rate = 90_000, .params = 0 }};
+    const offer = MediaDescription{
+        .band_id = 91,
+        .kind = .audio,
+        .codecs = &offer_codecs,
+        .fec = .{ .scheme = .none, .redundancy = 0 },
+        .direction = .sendrecv,
+    };
+    const answer = MediaDescription{
+        .band_id = 91,
+        .kind = .video,
+        .codecs = &answer_codecs,
+        .fec = .{ .scheme = .none, .redundancy = 0 },
+        .direction = .sendrecv,
+    };
+    try testing.expectError(error.NoCommonCodec, offerAnswer(allocator, offer, answer));
+}
+
+test "offer opus intersection succeeds with standard payload type" {
+    const allocator = testing.allocator;
+    const offer_codecs = [_]Codec{
+        .{ .tag = .opus, .clock_rate = 48_000, .params = 2 },
+        .{ .tag = .cadencevox, .clock_rate = 48_000, .params = 2 },
+    };
+    const answer_codecs = [_]Codec{
+        .{ .tag = .cadencevox, .clock_rate = 48_000, .params = 2 },
+        .{ .tag = .opus, .clock_rate = 48_000, .params = 1 },
+    };
+    const offer = MediaDescription{
+        .band_id = 92,
+        .kind = .audio,
+        .codecs = &offer_codecs,
+        .fec = .{ .scheme = .none, .redundancy = 0 },
+        .direction = .sendrecv,
+    };
+    const answer = MediaDescription{
+        .band_id = 92,
+        .kind = .audio,
+        .codecs = &answer_codecs,
+        .fec = .{ .scheme = .none, .redundancy = 0 },
+        .direction = .sendrecv,
+    };
+    var negotiated = try offerAnswer(allocator, offer, answer);
+    defer negotiated.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), negotiated.codecs.len);
+    try testing.expectEqual(CodecTag.opus, negotiated.codecs[0].tag);
+    try testing.expectEqual(@as(?u7, 111), negotiated.codecs[0].tag.payloadType());
+    try testing.expectEqual(@as(?CodecTag, .opus), CodecTag.fromPayloadType(111));
+    try testing.expectEqual(@as(?CodecTag, .vp8), CodecTag.fromPayloadType(96));
+    try testing.expectEqual(@as(?u7, 96), CodecTag.vp8.payloadType());
+    // Wire round-trip preserves the new tags.
+    const bytes = try encode(allocator, negotiated);
+    defer allocator.free(bytes);
+    var decoded = try decode(allocator, bytes);
+    defer decoded.deinit(allocator);
+    try testing.expectEqualSlices(Codec, negotiated.codecs, decoded.codecs);
+}
+
+test "offer vp8 intersection succeeds" {
+    const allocator = testing.allocator;
+    const offer_codecs = [_]Codec{.{ .tag = .vp8, .clock_rate = 90_000, .params = 0 }};
+    const answer_codecs = [_]Codec{.{ .tag = .vp8, .clock_rate = 90_000, .params = 0 }};
+    const offer = MediaDescription{ .band_id = 93, .kind = .video, .codecs = &offer_codecs, .fec = .{ .scheme = .none, .redundancy = 0 }, .direction = .sendrecv };
+    const answer = MediaDescription{ .band_id = 93, .kind = .video, .codecs = &answer_codecs, .fec = .{ .scheme = .none, .redundancy = 0 }, .direction = .sendrecv };
+    var negotiated = try offerAnswer(allocator, offer, answer);
+    defer negotiated.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), negotiated.codecs.len);
+    try testing.expectEqual(CodecTag.vp8, negotiated.codecs[0].tag);
+}
+
+test "unknown codec string rejected" {
+    try testing.expectError(error.UnknownCodec, CodecTag.fromName("h264"));
+    try testing.expectError(error.UnknownCodec, CodecTag.fromName(""));
+    try testing.expectEqual(CodecTag.opus, try CodecTag.fromName("opus"));
+    try testing.expectEqual(CodecTag.vp8, try CodecTag.fromName("VP8"));
+    try testing.expectEqual(CodecTag.cadencevox, try CodecTag.fromName("cadencevox"));
+    try testing.expectEqualStrings("opus", CodecTag.opus.name());
+    try testing.expectEqualStrings("vp8", CodecTag.vp8.name());
 }

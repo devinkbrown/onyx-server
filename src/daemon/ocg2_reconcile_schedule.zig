@@ -540,7 +540,7 @@ fn encodeUnchecked(out: []u8, fields: oper_cred_share.Ocg2Fields) !usize {
         }
     };
     try Put.raw(out, &pos, oper_cred_share.ocg2_domain);
-    try Put.byte(out, &pos, @intFromEnum(fields.kind));
+    try Put.byte(out, &pos, @backingInt(fields.kind));
     try Put.u64be(out, &pos, fields.authority_node_id);
     try Put.u64be(out, &pos, fields.revision);
     try Put.u64be(out, &pos, fields.issued_ms);

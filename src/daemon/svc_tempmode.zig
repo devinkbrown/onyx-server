@@ -543,7 +543,7 @@ pub fn numericForError(err: anyerror) Numeric {
 }
 
 pub fn formatNumericCode(numeric: Numeric, out: *[3]u8) []const u8 {
-    const value: u16 = @intFromEnum(numeric);
+    const value: u16 = @backingInt(numeric);
     out[0] = @as(u8, '0') + @as(u8, @intCast((value / 100) % 10));
     out[1] = @as(u8, '0') + @as(u8, @intCast((value / 10) % 10));
     out[2] = @as(u8, '0') + @as(u8, @intCast(value % 10));

@@ -130,7 +130,7 @@ const Reader = struct {
 
 fn enumByte(comptime E: type, value: u8) error{InvalidSnapshot}!E {
     inline for (@typeInfo(E).@"enum".field_values) |field_value| {
-        if (value == field_value) return @enumFromInt(value);
+        if (value == field_value) return @fromBackingInt(@intCast(value));
     }
     return error.InvalidSnapshot;
 }
@@ -338,7 +338,7 @@ pub fn encodeWebtransport(allocator: std.mem.Allocator, snapshot: *const webtran
     w.boolean(snapshot.send_proxy_header);
     w.boolean(snapshot.echo_wt_datagrams);
     w.size(snapshot.max_connections);
-    w.int(u8, @intFromEnum(snapshot.retry_policy));
+    w.int(u8, @backingInt(snapshot.retry_policy));
     w.size(snapshot.retry_load_threshold);
     writeRetrySecret(&w, &snapshot.retry_secret);
     writeReplay(&w, &snapshot.token_replay);
@@ -347,7 +347,7 @@ pub fn encodeWebtransport(allocator: std.mem.Allocator, snapshot: *const webtran
     w.int(u64, snapshot.reset_last_refill_ns);
     w.float(snapshot.reset_rate_per_s);
     w.int(u32, snapshot.reset_burst);
-    w.int(u8, @intFromEnum(snapshot.execution));
+    w.int(u8, @backingInt(snapshot.execution));
     std.debug.assert(w.pos == wt_payload_len);
     wire.finish(bytes, wt_domain);
     return bytes;
@@ -399,7 +399,7 @@ pub fn encodeWebrtc(allocator: std.mem.Allocator, snapshot: *const webrtc.Snapsh
     writeDtls(&w, &snapshot.dtls13);
     w.int(u64, snapshot.srtp_clock);
     w.boolean(snapshot.cross_configured);
-    w.int(u8, @intFromEnum(snapshot.execution));
+    w.int(u8, @backingInt(snapshot.execution));
     std.debug.assert(w.pos == webrtc_payload_len);
     wire.finish(bytes, webrtc_domain);
     return bytes;
@@ -444,7 +444,7 @@ pub fn encodeNative(allocator: std.mem.Allocator, snapshot: *const native.Snapsh
     w.put(&snapshot.mac_stream_key);
     w.boolean(snapshot.mac_key_configured);
     w.boolean(snapshot.cross_configured);
-    w.int(u8, @intFromEnum(snapshot.execution));
+    w.int(u8, @backingInt(snapshot.execution));
     std.debug.assert(w.pos == native_payload_len);
     wire.finish(bytes, native_domain);
     return bytes;

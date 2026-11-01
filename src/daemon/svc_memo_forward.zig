@@ -26,7 +26,7 @@ pub const NumericHint = enum(u16) {
     RPL_MEMORECEIPT = 989,
 
     pub fn value(self: NumericHint) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

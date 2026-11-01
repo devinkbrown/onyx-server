@@ -37,7 +37,7 @@ pub const PacketNumberLength = enum(u2) {
     four = 3,
 
     pub fn byteLen(self: PacketNumberLength) usize {
-        return @as(usize, @intFromEnum(self)) + 1;
+        return @as(usize, @backingInt(self)) + 1;
     }
 
     pub fn fromByteLen(len: usize) QuicPacketError!PacketNumberLength {
@@ -106,8 +106,8 @@ pub fn encodeLongHeader(out: []u8, header: LongHeader) QuicPacketError!usize {
 
     var pos: usize = 0;
     out[pos] = 0x80 | 0x40 |
-        (@as(u8, @intFromEnum(header.packet_type)) << 4) |
-        @as(u8, @intFromEnum(header.packet_number_len));
+        (@as(u8, @backingInt(header.packet_type)) << 4) |
+        @as(u8, @backingInt(header.packet_number_len));
     pos += 1;
 
     std.mem.writeInt(u32, out[pos..][0..4], header.version, .big);
@@ -175,7 +175,7 @@ pub fn encodeShortHeader(out: []u8, header: ShortHeader) QuicPacketError!usize {
     out[pos] = 0x40 |
         (if (header.spin) @as(u8, 0x20) else 0) |
         (if (header.key_phase) @as(u8, 0x04) else 0) |
-        @as(u8, @intFromEnum(header.packet_number_len));
+        @as(u8, @backingInt(header.packet_number_len));
     pos += 1;
 
     @memcpy(out[pos .. pos + dcid.len], dcid);

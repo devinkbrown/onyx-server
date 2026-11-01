@@ -85,7 +85,7 @@ pub const Numeric = enum(u16) {
     RPL_ENDOFCHANBADWORDS = 951,
 
     pub fn code(self: Numeric) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn format(self: Numeric, out: *[3]u8) []const u8 {

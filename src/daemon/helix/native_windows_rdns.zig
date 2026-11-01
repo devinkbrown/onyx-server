@@ -139,7 +139,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, carry: *const rdns.Snapshot,
     @memset(bytes[6..16], 0);
     std.mem.writeInt(u16, bytes[8..10], @intCast(rdns.cache_slots), .big);
     std.mem.writeInt(u16, bytes[10..12], @intCast(carry.job_count), .big);
-    bytes[12] = @intFromEnum(carry.execution);
+    bytes[12] = @backingInt(carry.execution);
     std.mem.writeInt(u64, bytes[16..24], @bitCast(carry.captured_monotonic_ms), .big);
     @memcpy(bytes[24..56], &carry.config_digest);
     std.mem.writeInt(u32, bytes[56..60], @intCast(total - header_len), .big);
@@ -148,7 +148,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, carry: *const rdns.Snapshot,
     var pos: usize = header_len;
     for (carry.entries) |entry| {
         bytes[pos] = @intFromBool(entry.has_key);
-        bytes[pos + 1] = @intFromEnum(entry.state);
+        bytes[pos + 1] = @backingInt(entry.state);
         writeAddress(&bytes[pos + 2], bytes[pos + 4 ..][0..16], entry.key);
         bytes[pos + 3] = 0;
         std.mem.writeInt(u16, bytes[pos + 20 ..][0..2], entry.host_len, .big);
@@ -305,7 +305,7 @@ test "Windows Helix rDNS checkpoint rejects malformed, mismatched, and noncanoni
     damaged[header_len + 8] = 0;
     damaged[header_len + 1] = 99; // invalid state tag
     try std.testing.expectError(error.InvalidSnapshot, decodeSnapshot(allocator, damaged, owner.cfg));
-    damaged[header_len + 1] = @intFromEnum(rdns.State.pending);
+    damaged[header_len + 1] = @backingInt(rdns.State.pending);
     damaged[24] ^= 1;
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.ConfigMismatch, decodeSnapshot(failing.allocator(), damaged, owner.cfg));

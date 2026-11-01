@@ -72,19 +72,19 @@ fn sampleSnap(fd: i32) s2s_snapshot.Snapshot {
 }
 
 /// Synthesize the pre-roster (v3-layout) wire image from a current-encode blob
-/// by stripping the empty v5 carry and v4 roster blocks. Valid only when both
-/// were EMPTY (12 zero bytes: count=0, len=0, inner_len=0) —
-/// every pre-v4 fixture here models a rosterless predecessor.
+/// by stripping the empty v6 group flags, v5 carry and v4 roster blocks.
+/// All must be empty: 14 zero bytes (three u32 fields and two bool fields).
+/// Every pre-v4 fixture here models a rosterless predecessor.
+const empty_post_v3_suffix_bytes = 14;
 fn stripEmptyRosterBlock(allocator: Allocator, current_blob: []const u8) ![]u8 {
-    std.debug.assert(current_blob.len >= 12);
-    for (current_blob[current_blob.len - 12 ..]) |b| std.debug.assert(b == 0);
-    return allocator.dupe(u8, current_blob[0 .. current_blob.len - 12]);
+    std.debug.assert(current_blob.len >= empty_post_v3_suffix_bytes);
+    for (current_blob[current_blob.len - empty_post_v3_suffix_bytes ..]) |b| std.debug.assert(b == 0);
+    return allocator.dupe(u8, current_blob[0 .. current_blob.len - empty_post_v3_suffix_bytes]);
 }
 
-/// Encode an actual schema-v3 `.s2s_link` capsule — the immediately-prior
-/// PRODUCTION schema (what the currently-deployed binary seals). The current
-/// encoder writes v4, so strip the trailing roster block and advertise the
-/// exact v3 range. Caller owns the returned bytes.
+/// Encode a historical schema-v3 `.s2s_link` capsule by removing the current
+/// encoder's post-v3 fields and advertising the exact v3 range.
+/// Caller owns the returned bytes.
 fn v3Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
     const current_blob = try s2s_snapshot.encode(allocator, snap);
     defer allocator.free(current_blob);
@@ -103,8 +103,8 @@ fn v3Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
     return capsule.encode(allocator, .{ .header = v3_header, .fields = fields[0..] });
 }
 
-/// Encode an actual schema-v2 `.s2s_link` capsule. The current encoder writes v4,
-/// so strip the v4-only roster block, remove the v3-only `caps_ext` byte, and
+/// Encode a historical schema-v2 `.s2s_link` capsule. Strip all post-v3
+/// fields, remove the v3-only `caps_ext` byte, and
 /// advertise the exact v2 range. Caller owns the returned bytes.
 fn v2Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
     const current_blob = try s2s_snapshot.encode(allocator, snap);
@@ -132,7 +132,7 @@ fn v2Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
 /// Encode a v1 `.s2s_link` capsule as a PRE-BUMP binary would have sealed it: the
 /// embedded `Established` blob is 4 bytes shorter (no `admitted_frame_families`)
 /// and the capsule header advertises `version=1, min=1, max=1`. Built by encoding
-/// the current blob and removing every later addition — v4's roster block, v3's
+/// the current blob and removing every later addition — post-v3 fields, v3's
 /// `caps_ext` byte, and v2's trailing Established u32 — then wrapping in a
 /// hand-crafted v1 header the current binary still accepts (`min_supported = 1`).
 fn v1Capsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
@@ -377,7 +377,7 @@ test "s2s_link v1 and v2 capsules co-adopt in one upgrade stream, fd ledger bala
     try testing.expectEqual(@as(usize, 0), res.fds_leaked);
 }
 
-/// Encode a CURRENT (v4) `.s2s_link` capsule carrying `snap` verbatim —
+/// Encode a current `.s2s_link` capsule carrying `snap` verbatim —
 /// including any roster block. Caller owns the returned bytes.
 fn currentCapsule(allocator: Allocator, snap: s2s_snapshot.Snapshot) ![]u8 {
     const blob = try s2s_snapshot.encode(allocator, snap);
@@ -443,7 +443,8 @@ test "s2s_link v4 capsule with a corrupt roster is refused fail-closed and fd re
     defer allocator.free(blob);
     // Corrupt the roster block's declared count so the decode-time walk
     // mismatches — the link must drop cleanly, never adopt a partial roster.
-    const count_off = blob.len - roster.items.len - 12;
+    const count_off = blob.len - roster.items.len - empty_post_v3_suffix_bytes;
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, blob[count_off..][0..4], .little));
     std.mem.writeInt(u32, blob[count_off..][0..4], 9, .little);
     var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = blob }};
     const bad = try capsule.encode(allocator, capsule.make(.s2s_link, fields[0..]));

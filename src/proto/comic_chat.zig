@@ -144,7 +144,7 @@ pub fn gestureFromToken(token: []const u8) ParseError!Gesture {
 
 /// Return the stable numeric id for a gesture.
 pub fn idOf(gesture: Gesture) u8 {
-    return @intFromEnum(gesture);
+    return @backingInt(gesture);
 }
 
 /// Parse a gesture from its stable numeric id.

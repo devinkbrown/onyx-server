@@ -217,7 +217,7 @@ pub const Endpoint = struct {
         defer std.crypto.secureZero(u8, &wire);
         @memcpy(wire[0..4], "HXWC");
         std.mem.writeInt(u16, wire[4..6], 1, .big);
-        std.mem.writeInt(u16, wire[6..8], @intFromEnum(kind), .big);
+        std.mem.writeInt(u16, wire[6..8], @backingInt(kind), .big);
         std.mem.writeInt(u64, wire[8..16], self.identity.generation, .big);
         @memcpy(wire[16..32], &self.identity.upgrade_id);
         std.mem.writeInt(u64, wire[32..40], self.send_seq, .big);

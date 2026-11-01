@@ -200,12 +200,12 @@ The `[cloak] secret` passphrase is stretched through **Argon2id** (memory-hard) 
 
 ```toml
 [cloak]
-anon_epoch_secs = 86400   # default 24 h; 0 disables rotation
+anon_epoch_secs = 1209600   # default 14 days; 0 disables rotation
 ```
 
-When non-zero, an **unauthenticated** (not-logged-in) client is given an OPAQUE cloak salted by the current wall-clock epoch, `floor(now/anon_epoch_secs)` (`src/daemon/config_format.zig:646`, `src/proto/cloak.zig:187`). A static-IP anonymous user is therefore neither linkable across epochs nor able to leak subnet co-membership. It is wall-clock based so every mesh node agrees on the epoch. Valid range is `0`–`31536000` s.
+When non-zero, an **unauthenticated** client receives a v4 opaque cloak whose HMAC binds the canonical address, epoch, cadence, and network suffix. Public epoch/cadence labels support historical policy matching without disclosing subnet or country. The epoch is `floor(now/anon_epoch_secs)`, aligned mesh-wide to the Unix epoch. Valid range is `0`–`31536000` seconds. Existing explicit daily settings are not changed by the new default.
 
-**Operator impact:** because anonymous cloaks rotate and are opaque, host/subnet `WARD` bans on anonymous abusers are short-lived and not subnet-bannable — moderation of anonymous abuse shifts to **account bans plus registration friction** (which the opaque cloaks are designed to require). **Logged-in clients are unaffected**: they keep a stable, moderatable account/hierarchical cloak. Set `anon_epoch_secs = 0` to restore the pre-2026-07 stable-cloak behavior for anonymous clients (at the cost of forever-linkability and subnet co-membership exposure).
+**Operator impact:** new v4 masks retain their original epoch/cadence for matching against a trusted same-address subject across rotations. Channel lists, ACCESS, SACCESS, AKICK, and WARD use that bounded context. Keys, suffix, account/persona scope, nick/ident restrictions, and remote secured-roster availability still matter. Arbitrary old unlabeled opaque masks require a migration audit; they cannot supply historical provenance. Account bans follow authenticated accounts across different IPs; address rules follow addresses. See [host-cloaking details and limits](../reference/host-cloaking.md). Set `anon_epoch_secs = 0` to disable anonymous rotation.
 
 ## Server links and peer inspection
 
@@ -323,3 +323,13 @@ Group inheritance is bounded to 32 parent links (`src/daemon/operator_groups.zig
 ## Reload behavior
 
 When booted with a config file, `REHASH` re-reads the same path (`src/main.zig:112`, `src/daemon/server.zig:10031`). `REHASH` rebuilds account-to-operator bindings but assigns full privileges rather than recomputing `[[oper_groups]]` (`src/daemon/server.zig:10052`, `src/daemon/server.zig:10062`). Existing sessions keep their current operator state (`src/daemon/server.zig:10028`).
+
+### Media assessment in setup previews
+
+`onyx-server setup --new --profile media --json` includes an advisory
+`media_assessment`; the text preview and interactive review use the same facts.
+It distinguishes the configured media UDP port from the separate native UDP
+port, explains ephemeral ports and the default local-only advertised address,
+and identifies unverified NAT/firewall and relay/browser fallback conditions.
+Existing configurations are reported as unknown rather than guessed. Preview
+does not start listeners or establish voice/video readiness.

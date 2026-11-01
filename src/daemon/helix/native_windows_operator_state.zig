@@ -66,7 +66,7 @@ pub fn encode(allocator: std.mem.Allocator, view: View) Error![]u8 {
     errdefer allocator.free(bytes);
     const body = bytes[frame.header_len .. bytes.len - frame.checksum_len];
     @memset(body, 0);
-    body[0] = @intFromEnum(view.method);
+    body[0] = @backingInt(view.method);
     std.mem.writeInt(u16, body[1..3], @intCast(view.question.len), .little);
     std.mem.writeInt(u16, body[3..5], @intCast(view.answer.len), .little);
     std.mem.writeInt(u64, body[5..13], view.issued, .little);
@@ -74,7 +74,7 @@ pub fn encode(allocator: std.mem.Allocator, view: View) Error![]u8 {
     @memcpy(body[187 .. 187 + view.answer.len], view.answer);
     if (view.pending) |pending| {
         body[13] = 1;
-        body[14] = @intFromEnum(pending.kind);
+        body[14] = @backingInt(pending.kind);
         std.mem.writeInt(u16, body[15..17], @intCast(pending.target.len), .little);
         std.mem.writeInt(u16, body[17..19], @intCast(pending.identity.len), .little);
         std.mem.writeInt(i64, body[19..27], pending.at_ms, .little);

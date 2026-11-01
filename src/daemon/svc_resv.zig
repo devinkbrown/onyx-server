@@ -296,7 +296,7 @@ pub fn buildUnavailableResourceNumeric(
     return std.fmt.bufPrint(
         out,
         ":{s} {d} {s} {s} :Channel is reserved: {s}",
-        .{ server_name, @intFromEnum(Numeric.ERR_UNAVAILRESOURCE), nick, channel, reason },
+        .{ server_name, @backingInt(Numeric.ERR_UNAVAILRESOURCE), nick, channel, reason },
     ) catch error.OutputTooSmall;
 }
 

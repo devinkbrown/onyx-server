@@ -129,7 +129,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Description: IRCX named-mode front-end. With no changes, lists active named modes. With changes, translates names to mode letters and delegates to the normal `MODE` engine.
 - Privileges: Registered client; actual mutations inherit `MODE` gates.
 - Parameters: Channel and optional named mode changes.
-- Replies: `RPL_MODEXLIST 806`, `RPL_MODEXEND 807`, or normal `MODE` replies/broadcasts.
+- Replies: `RPL_MODEXLIST 826`, `RPL_MODEXEND 827`, or normal `MODE` replies/broadcasts.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, plus delegated `MODE` errors.
 - Example: `MODEX #zig +AUTHONLY`
 - Sources: `src/daemon/modules/ircx.zig:57`, `src/daemon/server.zig:6470`

@@ -46,7 +46,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const ocsp.Snapsh
     std.mem.writeInt(i64, payload[79..87], snapshot.next_check_ms, .little);
     std.mem.writeInt(u64, payload[87..95], snapshot.completed_checks, .little);
     std.mem.writeInt(i64, payload[95..103], snapshot.captured_monotonic_ms, .little);
-    payload[103] = @intFromEnum(snapshot.execution);
+    payload[103] = @backingInt(snapshot.execution);
     frame.finish(bytes, domain);
     try validateCheckpoint(bytes);
     return bytes;

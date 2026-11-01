@@ -4,6 +4,12 @@
 //! Module lifecycle driver — dependency-ordered phase execution, per-module
 //! runtime health, and REHASH with LIFO rollback.
 //!
+//! Compatibility driver for legacy callers. New daemon instances use
+//! `module_runtime.Runtime`, whose health is instance-owned and whose explicit
+//! prepare/commit/abort hooks provide transactional reload. This legacy driver's
+//! fallible `on_reload` contract cannot undo a callback's partial mutation and
+//! must not be used as evidence that a live configuration reload is atomic.
+//!
 //! `registry.Module` declares the phase hooks (`on_register`, `on_init`,
 //! `on_ready`, `on_reload`, `on_deinit`); this file is what actually drives
 //! them, in `registry.loadOrder` order, and what remembers how each module
@@ -166,7 +172,7 @@ pub fn Lifecycle(comptime mods: []const registry.Module) type {
         /// The managed module set, for callers that want the comptime metadata.
         pub const modules = mods;
 
-        var states: [count]std.atomic.Value(u8) = @splat(.init(@intFromEnum(State.unloaded)));
+        var states: [count]std.atomic.Value(u8) = @splat(.init(@backingInt(State.unloaded)));
         var reload_counts: [count]std.atomic.Value(u32) = @splat(.init(0));
         var rollback_counts: [count]std.atomic.Value(u32) = @splat(.init(0));
         var last_errors: [count]std.atomic.Value(ErrorCode) = @splat(.init(0));
@@ -386,7 +392,7 @@ pub fn Lifecycle(comptime mods: []const registry.Module) type {
         }
 
         pub fn stateOf(module_index: usize) State {
-            return @enumFromInt(states[module_index].load(.monotonic));
+            return @fromBackingInt(@intCast(states[module_index].load(.monotonic)));
         }
 
         fn errorOf(module_index: usize) ?anyerror {
@@ -398,11 +404,11 @@ pub fn Lifecycle(comptime mods: []const registry.Module) type {
         fn phaseOf(module_index: usize) ?Phase {
             const raw = failed_phases[module_index].load(.monotonic);
             if (raw == no_phase) return null;
-            return @enumFromInt(raw);
+            return @fromBackingInt(@intCast(raw));
         }
 
         fn setState(module_index: usize, state: State) void {
-            states[module_index].store(@intFromEnum(state), .monotonic);
+            states[module_index].store(@backingInt(state), .monotonic);
         }
 
         fn recordFailure(
@@ -412,7 +418,7 @@ pub fn Lifecycle(comptime mods: []const registry.Module) type {
             e: anyerror,
         ) void {
             last_errors[module_index].store(@intFromError(e), .monotonic);
-            failed_phases[module_index].store(@intFromEnum(phase), .monotonic);
+            failed_phases[module_index].store(@backingInt(phase), .monotonic);
             setState(module_index, .failed);
             if (log_sink) |sink| sink(module_id, phase, e);
         }

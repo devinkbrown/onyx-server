@@ -3,7 +3,7 @@
 Deployment completed 2026-08-29.
 
 > **Historical incident record.** The recovery below is immutable evidence from
-> the 0.5.8 rollout. The current follow-up image is `0.7.0+ae78d490` on both
+> the 0.5.8 rollout. The current follow-up image is `0.9.0+066d9b8356be-dirty` on both
 > production nodes; the pair is active with one Mooring link per node and
 > `partitioned=0`. Verify current state in
 > [`onyx-server-paths.md`](onyx-server-paths.md) before using this record

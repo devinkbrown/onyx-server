@@ -70,13 +70,13 @@ pub const StoredEvent = struct {
     pub fn categoryEnum(self: *const StoredEvent) ?event_spine.EventCategory {
         const n = @typeInfo(event_spine.EventCategory).@"enum".field_names.len;
         if (self.category >= n) return null;
-        return @enumFromInt(self.category);
+        return @fromBackingInt(@intCast(self.category));
     }
 
     /// The severity as an enum, clamped to the top defined level.
     pub fn severityEnum(self: *const StoredEvent) event_spine.EventSeverity {
         const max = @as(u8, @typeInfo(event_spine.EventSeverity).@"enum".field_names.len - 1);
-        return @enumFromInt(@min(self.severity, max));
+        return @fromBackingInt(@intCast(@min(self.severity, max)));
     }
 
     fn set(cat: u8, sev: u8, ts: i64, origin_s: []const u8, message_s: []const u8) StoredEvent {

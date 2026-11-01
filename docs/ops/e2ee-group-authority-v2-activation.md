@@ -12,7 +12,7 @@ completed cold wave. Detailed inventory and post-activation metrics:
 
 **Current-state pointer (reconciled 2026-09-06):** this is an immutable first-
 activation record, not the current fleet inventory. Both production nodes now run
-`0.7.0+ae78d490` under `onyx-server.service` with one established peer and
+`0.9.0+066d9b8356be-dirty` (eshmaki.me under OpenRC, ircx.us under systemd `onyx-server.service`; verified 2026-11-01) with one established peer and
 `partitioned=0`; see [`onyx-server-paths.md`](onyx-server-paths.md). The current
 command surface is indexed in [`../reference/commands/_index.md`](../reference/commands/_index.md).
 

@@ -179,7 +179,7 @@ pub fn protectedHeader(allocator: std.mem.Allocator, alg: Algorithm) Error![]u8 
     errdefer out.deinit(allocator);
     try Cbor.writeMap(&out, allocator, 1);
     try Cbor.writeInt(&out, allocator, 1);
-    try Cbor.writeInt(&out, allocator, @intFromEnum(alg));
+    try Cbor.writeInt(&out, allocator, @backingInt(alg));
     return out.toOwnedSlice(allocator);
 }
 

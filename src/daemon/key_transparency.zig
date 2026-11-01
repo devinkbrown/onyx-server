@@ -158,7 +158,7 @@ pub fn encodeHeadBody(head: SignedHead, out: []u8) error{BufferTooSmall}![]const
     i += 8;
     @memcpy(out[i..][0..32], &head.root);
     i += 32;
-    out[i] = @intFromEnum(head.action);
+    out[i] = @backingInt(head.action);
     i += 1;
     out[i] = head.key_id_len;
     i += 1;
@@ -239,7 +239,7 @@ pub fn encodeHeadWire(head: SignedHead, out: []u8) error{BufferTooSmall}![]const
     i += 8;
     @memcpy(out[i..][0..head.root.len], &head.root);
     i += head.root.len;
-    out[i] = @intFromEnum(head.action);
+    out[i] = @backingInt(head.action);
     i += 1;
     out[i] = head.key_id_len;
     i += 1;
@@ -466,7 +466,7 @@ pub fn observationTimestampMs(hlc: u64) i64 {
 pub fn factTombstoneHash(id: FactIdentity) Hash {
     var h = Blake3.init(.{});
     h.update(fact_tombstone_domain);
-    updateInt(u8, &h, @intFromEnum(id.kind));
+    updateInt(u8, &h, @backingInt(id.kind));
     updateBytes(&h, id.account);
     updateBytes(&h, id.key_id);
     updateInt(u64, &h, id.hlc);
@@ -488,12 +488,12 @@ pub fn factCanonicalHash(id: FactIdentity, material: []const u8) Hash {
 pub fn factIdentityHash(id: FactIdentity, canonical: Hash) Hash {
     var h = Blake3.init(.{});
     h.update(fact_identity_domain);
-    updateInt(u8, &h, @intFromEnum(id.action));
+    updateInt(u8, &h, @backingInt(id.action));
     h.update(&canonical);
     updateInt(u64, &h, id.hlc);
     updateInt(u64, &h, id.origin_node);
     updateBytes(&h, id.origin_pubkey);
-    updateInt(u8, &h, @intFromEnum(id.kind));
+    updateInt(u8, &h, @backingInt(id.kind));
     updateBytes(&h, id.account);
     updateBytes(&h, id.key_id);
     var out: Hash = undefined;
@@ -760,8 +760,8 @@ pub const KeyTransparencyLog = struct {
 pub fn eventDigest(event: Event) Hash {
     var h = Blake3.init(.{});
     h.update("ONYX-KT-EVENT-v1");
-    updateInt(u8, &h, @intFromEnum(event.kind));
-    updateInt(u8, &h, @intFromEnum(event.action));
+    updateInt(u8, &h, @backingInt(event.kind));
+    updateInt(u8, &h, @backingInt(event.action));
     updateBytes(&h, event.account);
     updateBytes(&h, event.key_id);
     h.update(&event.key_hash);
@@ -814,9 +814,9 @@ pub fn encodeOwned(owned: OwnedEvent, out: []u8) CodecError![]u8 {
     var i: usize = 0;
     out[i] = codec_version;
     i += 1;
-    out[i] = @intFromEnum(owned.kind);
+    out[i] = @backingInt(owned.kind);
     i += 1;
-    out[i] = @intFromEnum(owned.action);
+    out[i] = @backingInt(owned.action);
     i += 1;
     std.mem.writeInt(u16, out[i..][0..2], owned.account_len, .little);
     i += 2;
@@ -906,7 +906,7 @@ fn writeIndexKey(out: *[max_index_key_len]u8, account: []const u8, kind: Credent
     i += account.len;
     out[i] = 0;
     i += 1;
-    out[i] = @intFromEnum(kind);
+    out[i] = @backingInt(kind);
     i += 1;
     out[i] = 0;
     i += 1;

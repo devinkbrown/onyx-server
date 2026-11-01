@@ -84,7 +84,7 @@ fn presentFrame(carry: *const webhook_http.Snapshot, target_pid: u32, info: *con
     std.mem.writeInt(u32, body[88..92], carry.config.handler.rate.per_min, .big);
     std.mem.writeInt(u32, body[92..96], carry.config.handler.rate.burst, .big);
     std.mem.writeInt(u32, body[96..100], carry.config.handler.busy_retry_after, .big);
-    body[100] = @intFromEnum(carry.execution);
+    body[100] = @backingInt(carry.execution);
     @memcpy(body[header_len..], std.mem.asBytes(info));
     return body;
 }
@@ -103,7 +103,7 @@ pub fn parseFrame(bytes: []const u8, target_pid: u32) Error!?Received {
         return null;
     }
     if (presence != 1 or target_pid == 0 or std.mem.readInt(u32, bytes[8..12], .big) != target_pid or
-        bytes[100] != @intFromEnum(webhook_http.Execution.paused) or
+        bytes[100] != @backingInt(webhook_http.Execution.paused) or
         !std.mem.eql(u8, bytes[101..104], &[_]u8{ 0, 0, 0 }))
         return error.InvalidFrame;
     const backlog = std.math.cast(u31, std.mem.readInt(u32, bytes[68..72], .big)) orelse return error.InvalidFrame;
@@ -201,7 +201,7 @@ test "Windows webhook frame has canonical absence and exact typed fields" {
     try std.testing.expectEqualDeep(carry, received.carry);
     try std.testing.expectError(error.InvalidFrame, parseFrame(&body, pid + 1));
     var corrupt = body;
-    corrupt[100] = @intFromEnum(webhook_http.Execution.unstarted);
+    corrupt[100] = @backingInt(webhook_http.Execution.unstarted);
     try std.testing.expectError(error.InvalidFrame, parseFrame(&corrupt, pid));
     corrupt = body;
     corrupt[101] = 1;

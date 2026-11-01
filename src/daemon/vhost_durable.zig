@@ -170,3 +170,32 @@ test "UPGRADE GAP-D3 granted vhost survives a dropped store image" {
     try std.testing.expectEqualStrings("*.users.example", offers[0].template);
     try std.testing.expectEqualStrings("community", offers[0].label);
 }
+
+test "cloak durable restore rejects a legacy colliding claim transactionally" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try OroStore.open(alloc, std.testing.io, tmp.dir, "cloak-legacy-claim.wal");
+    defer store.deinit();
+    // Reproduce an old persisted self-claim without passing through today's
+    // grant validator. A valid preceding row must not partially publish either.
+    try putFields(&store, 1, 0, 'p', 4, &.{ "valid", "staff", "staff.example", "granted" });
+    try putFields(&store, 1, 1, 'p', 5, &.{ "alice_foo", "legacy", "alice-foo.users.onyx", "claimed" });
+    try writeMeta(&store, .{ .generation = 1, .count = 2 });
+    var registry = guise.Registry.init(alloc, .{});
+    defer registry.deinit();
+    try registry.grant("existing", "sentinel", "unchanged.example", .granted, 1);
+    try registry.addOffer("*.users.onyx", "sentinel offer");
+    try std.testing.expectError(error.NotYours, restoreInto(&store, &registry));
+    try std.testing.expectEqual(@as(usize, 1), registry.accounts.count());
+    try std.testing.expectEqualStrings("unchanged.example", registry.find("existing", "sentinel").?.host);
+    try std.testing.expect(registry.find("valid", "staff") == null);
+    try std.testing.expect(registry.find("alice_foo", "legacy") == null);
+    try std.testing.expectEqual(@as(usize, 1), registry.offerList().len);
+    try std.testing.expectEqualStrings("sentinel offer", registry.offerList()[0].label);
+    // The same historical hostname remains legal with explicit operator source.
+    try putFields(&store, 2, 0, 'p', 5, &.{ "alice_foo", "legacy", "alice-foo.users.onyx", "granted" });
+    try writeMeta(&store, .{ .generation = 2, .count = 1 });
+    try restoreInto(&store, &registry);
+    try std.testing.expectEqual(Source.granted, registry.find("alice_foo", "legacy").?.source);
+}

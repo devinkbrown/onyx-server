@@ -1225,7 +1225,7 @@ fn hashTlsValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) !void {
         .@"struct" => |info| inline for (info.field_names) |name| try hashTlsValue(hash, @field(value, name)),
         .@"union" => |info| {
             const tag = std.meta.activeTag(value);
-            try runtime_pause.hashConfigValue(hash, @intFromEnum(tag));
+            try runtime_pause.hashConfigValue(hash, @backingInt(tag));
             inline for (info.field_names) |name| if (tag == @field(info.tag_type.?, name)) try hashTlsValue(hash, @field(value, name));
         },
         else => try runtime_pause.hashConfigValue(hash, value),

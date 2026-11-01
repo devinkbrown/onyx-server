@@ -45,7 +45,9 @@ pub const Role = mooring_session.Role;
 
 /// Bound on a single buffered handshake message (prekey ~1.3KB, M1/M2 a few KB).
 const max_handshake_msg: u32 = 64 * 1024;
-pub const max_expected_remotes: usize = 16;
+/// Aligns with `relay_v2_activation.max_roster_entries`: a mesh roster may
+/// pin every known node, so the pin table must hold a full roster.
+pub const max_expected_remotes: usize = 4096;
 
 // --- Post-AKE AEAD record layer -------------------------------------------
 //
@@ -86,10 +88,12 @@ fn recordAad(counter: u64) [8]u8 {
 
 /// Named errors this adapter raises (it also surfaces handshake, allocation, and
 /// inner-link errors; the methods use `anyerror` to carry the union).
-pub const HandshakeError = error{ HandshakeTooLarge, RecordTooLarge, PrekeyRejected, UnexpectedRemote };
+pub const HandshakeError = error{ HandshakeTooLarge, RecordTooLarge, PrekeyRejected, UnexpectedRemote, TooManyExpectedRemotes, DuplicateExpectedRemote };
 
 pub const Options = struct {
     allocator: std.mem.Allocator,
+    /// Stable Core callback, installed before lazy/resumed inner input exists.
+    membership_identity_preparer: ?s2s_peer.MembershipIdentityPreparer = null,
     role: Role,
     /// Borrowed local identity (provides the static + KEM keys and realm).
     identity: *const node_identity.NodeIdentity,
@@ -131,7 +135,10 @@ pub const SecuredLink = struct {
     local_prekey: hs.SignedPrekey,
     cfg: hs.Config,
     rng: std.Io,
-    expected_remotes: [max_expected_remotes][20]u8 = undefined,
+    /// Allocator-owned pin table (see `collectExpectedRemotes`); freed in
+    /// `deinit`. A slice, not a `[max_expected_remotes][20]u8` array, so a
+    /// full-roster table costs no 80 KiB of struct/stack per link.
+    expected_remotes: [][20]u8,
     expected_remote_count: usize = 0,
     trusted_node_keys: []const [32]u8 = &.{},
     server_name: []const u8,
@@ -163,6 +170,7 @@ pub const SecuredLink = struct {
     /// Borrowed exact-token NICKCHANGE authorizer, retained across lazy inner
     /// link creation like the membership token resolver.
     session_token_nick_authorizer: ?SessionTokenNickAuthorizer = null,
+    membership_identity_preparer: ?s2s_peer.MembershipIdentityPreparer = null,
     inbuf: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     feed_seq: u64 = 0,
@@ -173,23 +181,42 @@ pub const SecuredLink = struct {
     /// Reassembly buffer for inbound secured records: the transport delivers a
     /// byte stream, so partial records carry across `feedInner` calls here.
     rec_inbuf: std.ArrayList(u8) = .empty,
+    record_stream_poisoned: bool = false,
+
+    /// Collect `expected_remote` + `expected_remotes` into one owned pin
+    /// table. Never truncates: exceeding `max_expected_remotes` is
+    /// `error.TooManyExpectedRemotes` and any repeated pin (including
+    /// `expected_remote` repeated in the list) is
+    /// `error.DuplicateExpectedRemote`. Caller owns the returned slice.
+    fn collectExpectedRemotes(allocator: std.mem.Allocator, expected_remote: ?[20]u8, expected_remotes: []const [20]u8) anyerror![][20]u8 {
+        const total = expected_remotes.len + @as(usize, if (expected_remote != null) 1 else 0);
+        if (total > max_expected_remotes) return error.TooManyExpectedRemotes;
+        const out = try allocator.alloc([20]u8, total);
+        errdefer allocator.free(out);
+        var count: usize = 0;
+        if (expected_remote) |pin| {
+            out[count] = pin;
+            count += 1;
+        }
+        for (expected_remotes) |pin| {
+            for (out[0..count]) |existing| {
+                if (std.mem.eql(u8, &existing, &pin)) return error.DuplicateExpectedRemote;
+            }
+            out[count] = pin;
+            count += 1;
+        }
+        return out;
+    }
 
     /// Initialize. The responder immediately queues its prekey preamble and stands
     /// up its session; the initiator waits for the responder's preamble.
     pub fn init(opts: Options) anyerror!SecuredLink {
-        var expected: [max_expected_remotes][20]u8 = undefined;
-        var expected_count: usize = 0;
-        if (opts.expected_remote) |pin| {
-            expected[expected_count] = pin;
-            expected_count += 1;
-        }
-        for (opts.expected_remotes) |pin| {
-            if (expected_count == expected.len) break;
-            expected[expected_count] = pin;
-            expected_count += 1;
-        }
+        const expected = try collectExpectedRemotes(opts.allocator, opts.expected_remote, opts.expected_remotes);
+        errdefer opts.allocator.free(expected);
+        const expected_count = expected.len;
         var self = SecuredLink{
             .allocator = opts.allocator,
+            .membership_identity_preparer = opts.membership_identity_preparer,
             .role = opts.role,
             .identity = opts.identity,
             .local_prekey = opts.local_prekey,
@@ -248,19 +275,14 @@ pub const SecuredLink = struct {
     /// CRDT link is stood up established with a FRESH empty replica; the caller
     /// restores the carried roster via `primeResumedMember` before feeding bytes.
     pub fn resumeOuter(opts: Options, rs: ResumeState) anyerror!SecuredLink {
-        var expected: [max_expected_remotes][20]u8 = undefined;
-        var expected_count: usize = 0;
-        if (opts.expected_remote) |pin| {
-            expected[expected_count] = pin;
-            expected_count += 1;
-        }
-        for (opts.expected_remotes) |pin| {
-            if (expected_count == expected.len) break;
-            expected[expected_count] = pin;
-            expected_count += 1;
-        }
+        // Collect pins before taking ownership of `rs.established`: on a
+        // pin error the capsule stays the caller's to wipe.
+        const expected = try collectExpectedRemotes(opts.allocator, opts.expected_remote, opts.expected_remotes);
+        errdefer opts.allocator.free(expected);
+        const expected_count = expected.len;
         var self = SecuredLink{
             .allocator = opts.allocator,
+            .membership_identity_preparer = opts.membership_identity_preparer,
             .role = opts.role,
             .identity = opts.identity,
             .local_prekey = opts.local_prekey,
@@ -314,6 +336,7 @@ pub const SecuredLink = struct {
         // The peer stored this page. Drop the stack handle without unmapping.
         owned_key.secret_key.page = null;
         errdefer link.deinit();
+        if (self.membership_identity_preparer) |preparer| link.setMembershipIdentityPreparer(preparer);
         // Restore authenticated plaintext without dispatch or counter changes.
         // The next decrypted record completes this same inner frame.
         try link.peer.decoder.feed(rs.inner_inbuf);
@@ -331,6 +354,7 @@ pub const SecuredLink = struct {
         self.inbuf.deinit(self.allocator);
         self.out.deinit(self.allocator);
         self.rec_inbuf.deinit(self.allocator);
+        self.allocator.free(self.expected_remotes);
         self.* = undefined;
     }
 
@@ -412,6 +436,12 @@ pub const SecuredLink = struct {
     /// Snapshot the outer record-layer state needed to resume this link across a
     /// hot upgrade without re-running the AKE. Asserts the link is established.
     pub fn exportOuter(self: *const SecuredLink) OuterResume {
+        return self.exportOuterChecked() catch @panic("poisoned or pending secured stream cannot be captured");
+    }
+
+    pub fn exportOuterChecked(self: *const SecuredLink) error{ PendingMembership, RecordStreamPoisoned }!OuterResume {
+        if (self.record_stream_poisoned) return error.RecordStreamPoisoned;
+        if (self.membershipDispatchPaused()) return error.PendingMembership;
         std.debug.assert(self.phase == .established);
         return .{
             .role = self.role,
@@ -428,6 +458,7 @@ pub const SecuredLink = struct {
     /// The inner CRDT link's bounded resume header (identity/transport), or null if
     /// the inner link isn't stood up yet.
     pub fn snapshotInner(self: *const SecuredLink) ?s2s_link.S2sLink.ResumeHeader {
+        if (self.record_stream_poisoned or self.membershipDispatchPaused()) return null;
         return if (self.inner) |l| l.snapshotResume() else null;
     }
 
@@ -502,6 +533,11 @@ pub const SecuredLink = struct {
     pub fn setSessionTokenNickAuthorizer(self: *SecuredLink, authorizer: ?SessionTokenNickAuthorizer) void {
         self.session_token_nick_authorizer = authorizer;
         if (self.inner) |l| l.setSessionTokenNickAuthorizer(authorizer);
+    }
+
+    pub fn setMembershipIdentityPreparer(self: *SecuredLink, preparer: ?s2s_peer.MembershipIdentityPreparer) void {
+        self.membership_identity_preparer = preparer;
+        if (self.inner) |l| l.setMembershipIdentityPreparer(preparer);
     }
 
     pub fn rebindSessionToken(self: *SecuredLink, origin_node: u64, nick: []const u8, token: ?SessionToken) anyerror!usize {
@@ -1066,6 +1102,10 @@ pub const SecuredLink = struct {
         return link.takeSessionMigrateConsumed();
     }
 
+    pub fn supportsSessionGroupV4(self: *const SecuredLink) bool {
+        return if (self.inner) |link| link.supportsSessionGroupV4() else false;
+    }
+
     pub fn supportsSessionReplicaV2(self: *const SecuredLink) bool {
         const link = self.inner orelse return false;
         return link.supportsSessionReplicaV2();
@@ -1391,6 +1431,7 @@ pub const SecuredLink = struct {
     /// established, bytes are deframed as AEAD records, decrypted, and fed to the
     /// inner CRDT link (see the record-layer constants for the wire format).
     pub fn feed(self: *SecuredLink, bytes: []const u8, now_ms: u64) anyerror!void {
+        if (self.record_stream_poisoned) return error.RecordStreamPoisoned;
         if (self.phase == .established) {
             try self.feedInner(bytes, now_ms);
             return;
@@ -1506,6 +1547,7 @@ pub const SecuredLink = struct {
         if (self.residence_verifier) |v| link.setResidenceVerifier(v);
         if (self.session_token_resolver) |resolver| link.setSessionTokenResolver(resolver);
         if (self.session_token_nick_authorizer) |authorizer| link.setSessionTokenNickAuthorizer(authorizer);
+        if (self.membership_identity_preparer) |preparer| link.setMembershipIdentityPreparer(preparer);
         self.inner = link;
         self.phase = .established;
         if (self.role == .initiator) {
@@ -1522,22 +1564,76 @@ pub const SecuredLink = struct {
         return &self.resumed_established.?;
     }
 
+    /// Owned append receipt only: caller may release its leased transport
+    /// buffer after success, then drive an empty feed to decrypt/dispatch.
+    pub fn stageRetainedTransport(self: *SecuredLink, bytes: []const u8) anyerror!void {
+        if (self.record_stream_poisoned) return error.RecordStreamPoisoned;
+        if (self.phase != .established) return error.NotEstablished;
+        if (self.membershipDispatchPaused()) return error.MembershipDispatchPaused;
+        try self.rec_inbuf.appendSlice(self.allocator, bytes);
+    }
+
+    pub fn membershipProvenanceConflict(self: *const SecuredLink) bool {
+        return if (self.inner) |link| link.membershipProvenanceConflict() else false;
+    }
+
+    /// Owner immediately terminal-closes after this irreversible negative cut.
+    /// Preserved peer successors never become accepted/capturable continuation.
+    pub fn rejectPendingMembershipProvenanceConflict(self: *SecuredLink) anyerror!void {
+        const link = self.inner orelse return error.NotEstablished;
+        try link.rejectPendingMembershipProvenanceConflict();
+        self.record_stream_poisoned = true;
+        std.crypto.secureZero(u8, self.rec_inbuf.items);
+        self.rec_inbuf.items.len = 0;
+    }
+
+    pub fn membershipDispatchPaused(self: *const SecuredLink) bool {
+        return if (self.inner) |link| link.membershipDispatchPaused() else false;
+    }
+
+    /// Paused membership owns its original and decoder tail. It is a successful
+    /// authenticated-record handoff, distinct from any fatal decrypt/feed error.
+    pub fn retryPendingMembership(self: *SecuredLink, now_ms: u64) anyerror!void {
+        if (self.record_stream_poisoned) return error.RecordStreamPoisoned;
+        const link = self.inner orelse return;
+        // The original authenticated record already consumed its feed sequence.
+        // Funding retries do not invent another record/counter advancement.
+        try link.retryPendingMembership(now_ms, self.feed_seq);
+        if (!self.membershipDispatchPaused()) try self.drainRecordsOrPoison(now_ms);
+        try self.drainInner();
+    }
+
     /// Inbound: append the transport bytes to the record reassembly buffer, then
     /// open every complete length-prefixed AEAD record and feed the recovered
     /// plaintext to the inner CRDT link. Leftover partial-record bytes stay
     /// buffered for the next call. A tag/length failure returns an error so the
     /// caller drops the link (no corrupt plaintext is ever delivered).
     fn feedInner(self: *SecuredLink, bytes: []const u8, now_ms: u64) anyerror!void {
+        if (self.record_stream_poisoned) return error.RecordStreamPoisoned;
+        if (self.membershipDispatchPaused()) {
+            if (bytes.len != 0) return error.MembershipDispatchPaused;
+            return;
+        }
         try self.rec_inbuf.appendSlice(self.allocator, bytes);
-        try self.drainRecords(now_ms);
+        try self.drainRecordsOrPoison(now_ms);
         try self.drainInner();
+    }
+
+    fn drainRecordsOrPoison(self: *SecuredLink, now_ms: u64) anyerror!void {
+        self.drainRecords(now_ms) catch |err| {
+            self.record_stream_poisoned = true;
+            std.crypto.secureZero(u8, self.rec_inbuf.items);
+            // Pinned clearRetainingCapacity overwrites zeroes with undefined.
+            self.rec_inbuf.items.len = 0;
+            return err;
+        };
     }
 
     fn drainRecords(self: *SecuredLink, now_ms: u64) anyerror!void {
         const link = self.inner.?;
         const keys = self.establishedKeys();
         var consumed: usize = 0;
-        while (true) {
+        while (!link.membershipDispatchPaused()) {
             const buf = self.rec_inbuf.items[consumed..];
             if (buf.len < record_len_prefix) break;
             const body_len = std.mem.readInt(u32, buf[0..4], .little);
@@ -1550,15 +1646,18 @@ pub const SecuredLink = struct {
             const tag = body[body.len - record_tag_len ..][0..record_tag_len].*;
 
             const aad = recordAad(self.recv_counter);
-            const pt = try self.allocator.alloc(u8, ct.len);
-            defer self.allocator.free(pt);
-            // AEAD-open: a tamper/desync surfaces as error.AuthFailed, which we
-            // propagate so the link is dropped before any plaintext is fed in.
-            try keys.openRecord(self.recv_counter, &aad, ct, tag, pt);
+            // Exact aliasing is supported by the pinned ChaCha xor path.
+            // Header length, tag and AAD are copied before mutating ciphertext.
+            // Authentication completes before xor; failed output is undefined,
+            // so feedInner poisons/wipes carry on every error from this routine.
+            try keys.openRecord(self.recv_counter, &aad, ct, tag, ct);
             self.recv_counter +%= 1;
 
             self.feed_seq +%= 1;
-            try link.feed(pt, now_ms, self.feed_seq);
+            try link.feed(ct, now_ms, self.feed_seq);
+            // S2sPeer.feed copied into its owned decoder before dispatch. No
+            // borrowed plaintext survives this call; retain no plaintext padding.
+            std.crypto.secureZero(u8, ct);
             consumed += total;
         }
         if (consumed != 0) {
@@ -1810,6 +1909,10 @@ const EstablishedPair = struct {
     b: SecuredLink,
 
     fn init() !EstablishedPair {
+        return initWithMembershipPreparer(null);
+    }
+
+    fn initWithMembershipPreparer(preparer: ?s2s_peer.MembershipIdentityPreparer) !EstablishedPair {
         var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
         errdefer ida.deinit();
         var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
@@ -1835,6 +1938,7 @@ const EstablishedPair = struct {
             .cfg = cfgFor(idb.realm, ""),
             .rng = rng.io(),
             .server_name = "b.onyx",
+            .membership_identity_preparer = preparer,
         });
         errdefer b.deinit();
         try pump(&a, &b, false);
@@ -2831,4 +2935,456 @@ test "a trust-pin mismatch rejects the peer prekey" {
     const preamble = try testing.allocator.dupe(u8, b.outbound());
     defer testing.allocator.free(preamble);
     try testing.expectError(error.UnexpectedRemote, a.feed(preamble, 1));
+}
+
+fn expectedRemotePin(seed: u32) [20]u8 {
+    var pin: [20]u8 = @splat(0);
+    std.mem.writeInt(u32, pin[0..4], seed, .little);
+    return pin;
+}
+
+test "expected remote pins retain more than sixteen entries" {
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
+    defer ida.deinit();
+    const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+    var rng = DeterministicIo{ .s = 1 };
+
+    var pins: [32][20]u8 = undefined;
+    for (&pins, 0..) |*pin, i| pin.* = expectedRemotePin(@intCast(i + 1));
+
+    var a = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, "mp"),
+        .rng = rng.io(),
+        .server_name = "a.onyx",
+        .expected_remotes = &pins,
+    });
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 32), a.expected_remote_count);
+    // The 21st peer (index 20) would have been silently dropped at the old cap.
+    try testing.expect(a.allowsExpectedRemote(pins[20]));
+    try testing.expect(a.allowsExpectedRemote(pins[31]));
+    try testing.expect(!a.allowsExpectedRemote(expectedRemotePin(999)));
+}
+
+test "expected remote duplicate pins are rejected" {
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
+    defer ida.deinit();
+    const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+    var rng = DeterministicIo{ .s = 1 };
+    const pin = expectedRemotePin(7);
+
+    // expected_remote duplicated inside expected_remotes.
+    try testing.expectError(error.DuplicateExpectedRemote, SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, "mp"),
+        .rng = rng.io(),
+        .server_name = "a.onyx",
+        .expected_remote = pin,
+        .expected_remotes = &.{pin},
+    }));
+    // Duplicate within expected_remotes alone.
+    try testing.expectError(error.DuplicateExpectedRemote, SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, "mp"),
+        .rng = rng.io(),
+        .server_name = "a.onyx",
+        .expected_remotes = &.{ expectedRemotePin(1), expectedRemotePin(2), expectedRemotePin(1) },
+    }));
+}
+
+test "expected remote resumeOuter rejects duplicates and overflow" {
+    var pair = try EstablishedPair.init();
+    defer pair.deinit();
+    const outer = try pair.b.exportOuterChecked();
+    var secret: [hs.Established.serialized_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &secret);
+    outer.established.serialize(&secret);
+    // resumeOuter only consumes `established` on success; both calls below
+    // fail during pin collection, so this copy stays ours to wipe.
+    var est = hs.Established.deserialize(&secret);
+    defer est.deinit();
+
+    const resume_state = SecuredLink.ResumeState{
+        .established = est,
+        .send_counter = outer.send_counter,
+        .recv_counter = outer.recv_counter,
+        .feed_seq = outer.feed_seq,
+        .inner = pair.b.snapshotInner().?,
+        .remote_name = pair.b.snapshotInnerRemoteName(),
+        .rec_inbuf = outer.rec_inbuf,
+        .inner_inbuf = outer.inner_inbuf,
+        .now_ms = 1000,
+        .rng_seed = 1,
+    };
+    const pin = expectedRemotePin(7);
+    try testing.expectError(error.DuplicateExpectedRemote, SecuredLink.resumeOuter(.{
+        .allocator = testing.allocator,
+        .role = pair.b.role,
+        .identity = &pair.idb,
+        .local_prekey = pair.b.local_prekey,
+        .cfg = pair.b.cfg,
+        .rng = testing.io,
+        .server_name = pair.b.server_name,
+        .expected_remote = pin,
+        .expected_remotes = &.{pin},
+    }, resume_state));
+
+    const too_many = try testing.allocator.alloc([20]u8, max_expected_remotes + 1);
+    defer testing.allocator.free(too_many);
+    for (too_many, 0..) |*p, i| p.* = expectedRemotePin(@intCast(i + 1));
+    try testing.expectError(error.TooManyExpectedRemotes, SecuredLink.resumeOuter(.{
+        .allocator = testing.allocator,
+        .role = pair.b.role,
+        .identity = &pair.idb,
+        .local_prekey = pair.b.local_prekey,
+        .cfg = pair.b.cfg,
+        .rng = testing.io,
+        .server_name = pair.b.server_name,
+        .expected_remotes = too_many,
+    }, resume_state));
+}
+
+test "secured membership preparer is installed before lazy inner creation and resumed partial dispatch" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn prepare(raw: *anyopaque, transition: *const s2s_peer.MembershipIdentityTransition) anyerror!s2s_peer.PreparedMembershipIdentityChange {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try testing.expectEqualStrings("retained", transition.nick);
+            try testing.expectEqualStrings(if (self.calls == 0) "old.public" else "middle.public", transition.old.host);
+            try testing.expectEqualStrings(if (self.calls == 0) "middle.public" else "new.public", transition.new.host);
+            self.calls += 1;
+            return .{};
+        }
+    };
+    var probe = Probe{};
+    const hook = s2s_peer.MembershipIdentityPreparer{ .ctx = &probe, .prepare_fn = Probe.prepare };
+    var pair = try EstablishedPair.initWithMembershipPreparer(hook);
+    defer pair.deinit();
+    pair.b.identity = &pair.idb;
+    try testing.expect(pair.b.inner.?.peer.membership_identity_preparer != null);
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    try pair.a.sendMembership("#restore-hook", "retained", 0, 100, true, .{ .username = "u", .host = "old.public" }, "");
+    try pair.b.feed(pair.a.outbound(), 100);
+    pair.b.processDeferredResidenceFrames(100);
+    pair.a.clearOutbound();
+    try pair.a.sendMembership("#restore-hook", "retained", 0, 101, true, .{ .username = "u", .host = "middle.public" }, "");
+    try pair.b.feed(pair.a.outbound(), 101);
+    pair.b.processDeferredResidenceFrames(101);
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    pair.a.clearOutbound();
+    try pair.a.inner.?.sendMembership("#restore-hook", "retained", 0, 102, true, .{ .username = "u", .host = "new.public" }, "");
+    const plaintext_len = pair.a.inner.?.outbound().len;
+    try pair.a.drainInnerWithChunkLimit(plaintext_len / 2);
+    const wire = pair.a.outbound();
+    const first_len = record_len_prefix + @as(usize, std.mem.readInt(u32, wire[0..4], .little));
+    try pair.b.feed(wire[0..first_len], 102);
+    const outer = try pair.b.exportOuterChecked();
+    try testing.expect(outer.inner_inbuf.len != 0);
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    var secret: [hs.Established.serialized_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &secret);
+    outer.established.serialize(&secret);
+    var resumed = try SecuredLink.resumeOuter(.{
+        .allocator = testing.allocator,
+        .role = pair.b.role,
+        .identity = &pair.idb,
+        .local_prekey = pair.b.local_prekey,
+        .cfg = pair.b.cfg,
+        .rng = testing.io,
+        .server_name = pair.b.server_name,
+        .inner_config = pair.b.inner_config,
+        .membership_identity_preparer = hook,
+    }, .{
+        .established = hs.Established.deserialize(&secret),
+        .send_counter = outer.send_counter,
+        .recv_counter = outer.recv_counter,
+        .feed_seq = outer.feed_seq,
+        .inner = pair.b.snapshotInner().?,
+        .remote_name = pair.b.snapshotInnerRemoteName(),
+        .rec_inbuf = outer.rec_inbuf,
+        .inner_inbuf = outer.inner_inbuf,
+        .now_ms = 102,
+        .rng_seed = 1,
+    });
+    defer resumed.deinit();
+    try resumed.primeResumedMember("#restore-hook", "retained", pair.ida.shortId(), 0, 101, .{ .username = "u", .host = "middle.public" }, 101);
+    try testing.expect(resumed.inner.?.peer.membership_identity_preparer != null);
+    try resumed.feed(wire[first_len..], 102);
+    resumed.processDeferredResidenceFrames(102);
+    try testing.expectEqual(@as(usize, 2), probe.calls);
+    try testing.expectEqualStrings("new.public", resumed.findRemoteMember("retained").?.host);
+}
+
+fn recordThroughputPlaintextForTest(length: usize) ![]u8 {
+    if (length < s2s_frame.header_len or length > s2s_frame.default_max_frame_size) return error.InvalidTestLength;
+    const bytes = try testing.allocator.alloc(u8, length);
+    @memset(bytes, 0x5A);
+    // A valid length-delimited future frame: authenticated, copied by the real
+    // decoder and skipped under the existing forward-compatibility contract.
+    bytes[0] = 0xFF;
+    std.mem.writeInt(u32, bytes[1..5], @intCast(length - s2s_frame.header_len), .little);
+    return bytes;
+}
+
+test "secured record in-place cipher exact alias authenticates before plaintext delivery" {
+    const key: [RecordChaCha.key_length]u8 = @splat(0xA1);
+    const nonce: [RecordChaCha.nonce_length]u8 = @splat(0xB2);
+    const aad = recordAad(17);
+    for ([_]usize{ 0, 1, 15, 16, 63, 64, 65, 255, 256, 257, 4095, 4096, 4097 }) |length| {
+        const plain = try testing.allocator.alloc(u8, length);
+        defer testing.allocator.free(plain);
+        for (plain, 0..) |*byte, index| byte.* = @truncate(index);
+        const cipher = try testing.allocator.alloc(u8, length);
+        defer testing.allocator.free(cipher);
+        var tag: [record_tag_len]u8 = undefined;
+        RecordChaCha.encrypt(cipher, &tag, plain, &aad, nonce, key);
+        try RecordChaCha.decrypt(cipher, cipher, tag, &aad, nonce, key);
+        try testing.expectEqualSlices(u8, plain, cipher);
+    }
+}
+
+test "secured record in-place zero boundary partial and coalesced records preserve wire and counters" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+    const before_counter = p.b.recv_counter;
+    const before_seq = p.b.feed_seq;
+    try p.a.sealRecordTo(&.{});
+    inline for (.{ s2s_frame.header_len, 63, 64, 65, max_outbound_record_plaintext }) |length| {
+        const plain = try recordThroughputPlaintextForTest(length);
+        defer testing.allocator.free(plain);
+        try p.a.sealRecordTo(plain);
+    }
+    const wire = try testing.allocator.dupe(u8, p.a.outbound());
+    defer testing.allocator.free(wire);
+    const expected_wire = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(expected_wire);
+    // Split the first header, ciphertext/tag boundary and final record tail.
+    try p.b.feed(wire[0..1], 100);
+    try testing.expectEqual(before_counter, p.b.recv_counter);
+    try p.b.feed(wire[1 .. record_len_prefix + record_tag_len - 1], 101);
+    try testing.expectEqual(before_counter, p.b.recv_counter);
+    try p.b.feed(wire[record_len_prefix + record_tag_len - 1 .. wire.len - 1], 102);
+    try testing.expectEqual(before_counter + 5, p.b.recv_counter);
+    const carry = try p.b.exportOuterChecked();
+    try testing.expect(carry.rec_inbuf.len != 0);
+    // Carry remains the original incomplete ciphertext, never recovered bytes.
+    try testing.expectEqualSlices(u8, wire[wire.len - 1 - carry.rec_inbuf.len .. wire.len - 1], carry.rec_inbuf);
+    try p.b.feed(wire[wire.len - 1 ..], 103);
+    try testing.expectEqual(before_counter + 6, p.b.recv_counter);
+    try testing.expectEqual(before_seq + 6, p.b.feed_seq);
+    try testing.expectEqual(@as(usize, 0), p.b.rec_inbuf.items.len);
+    try testing.expectEqual(@as(usize, 0), p.b.inner.?.peer.decoder.accumulator.items.len);
+    try testing.expectEqualSlices(u8, expected_wire, wire);
+    _ = try p.b.exportOuterChecked();
+}
+
+test "secured record in-place tamper malformed length and counter poison without unauthenticated delivery" {
+    inline for (.{ "cipher", "tag", "short", "oversize", "counter" }) |fault| {
+        var p = try EstablishedPair.init();
+        defer p.deinit();
+        p.a.clearOutbound();
+        p.b.clearOutbound();
+        try p.a.sendMembership("#undertow", "NeverAuthenticated", 0, 200, true, .{ .username = "u", .realname = "r", .host = "public.example" }, "");
+        const wire = try testing.allocator.dupe(u8, p.a.outbound());
+        defer testing.allocator.free(wire);
+        if (comptime std.mem.eql(u8, fault, "cipher")) wire[record_len_prefix] ^= 1;
+        if (comptime std.mem.eql(u8, fault, "tag")) wire[wire.len - 1] ^= 1;
+        if (comptime std.mem.eql(u8, fault, "short")) std.mem.writeInt(u32, wire[0..4], record_tag_len - 1, .little);
+        if (comptime std.mem.eql(u8, fault, "oversize")) std.mem.writeInt(u32, wire[0..4], max_record_len + 1, .little);
+        if (comptime std.mem.eql(u8, fault, "counter")) p.b.recv_counter += 1;
+        const before_counter = p.b.recv_counter;
+        const before_seq = p.b.feed_seq;
+        const expected: anyerror = if (comptime std.mem.eql(u8, fault, "oversize")) error.RecordTooLarge else error.AuthFailed;
+        try testing.expectError(expected, p.b.feed(wire, 201));
+        try testing.expect(p.b.record_stream_poisoned);
+        try testing.expectEqual(before_counter, p.b.recv_counter);
+        try testing.expectEqual(before_seq, p.b.feed_seq);
+        try testing.expectEqual(@as(usize, 0), p.b.rec_inbuf.items.len);
+        try testing.expect(p.b.findRemoteMember("NeverAuthenticated") == null);
+        try testing.expectError(error.RecordStreamPoisoned, p.b.feed(&.{}, 202));
+        try testing.expectError(error.RecordStreamPoisoned, p.b.feed(wire, 203));
+        try testing.expectError(error.RecordStreamPoisoned, p.b.exportOuterChecked());
+        try testing.expect(p.b.snapshotInner() == null);
+    }
+}
+
+test "secured record in-place inner OOM after decrypt wipes carry and forbids retry or capture" {
+    inline for (.{ false, true }) |payload_allocation| {
+        var p = try EstablishedPair.init();
+        defer p.deinit();
+        p.a.clearOutbound();
+        p.b.clearOutbound();
+        try p.a.sendMembership("#undertow", "InnerOom", 0, 200, true, .{ .username = "u", .realname = "r", .host = "public.example" }, "");
+        const wire = p.a.outbound();
+        try p.b.rec_inbuf.ensureTotalCapacity(testing.allocator, wire.len);
+        const owned_record_memory = p.b.rec_inbuf.items.ptr;
+        const decoder = &p.b.inner.?.peer.decoder;
+        decoder.accumulator.deinit(testing.allocator);
+        decoder.accumulator = .empty;
+        decoder.payload_buf.deinit(testing.allocator);
+        decoder.payload_buf = .empty;
+        if (payload_allocation) try decoder.accumulator.ensureTotalCapacity(testing.allocator, wire.len);
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        const original = decoder.allocator;
+        decoder.allocator = failing.allocator();
+        defer decoder.allocator = original;
+        const before_counter = p.b.recv_counter;
+        const before_seq = p.b.feed_seq;
+        try testing.expectError(error.OutOfMemory, p.b.feed(wire, 201));
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(p.b.record_stream_poisoned);
+        try testing.expectEqual(before_counter + 1, p.b.recv_counter);
+        try testing.expectEqual(before_seq + 1, p.b.feed_seq);
+        try testing.expectEqual(@as(usize, 0), p.b.rec_inbuf.items.len);
+        try testing.expect(std.mem.allEqual(u8, owned_record_memory[0..wire.len], 0));
+        try testing.expect(p.b.findRemoteMember("InnerOom") == null);
+        try testing.expectError(error.RecordStreamPoisoned, p.b.feed(wire, 202));
+        try testing.expectError(error.RecordStreamPoisoned, p.b.exportOuterChecked());
+        try testing.expect(p.b.snapshotInner() == null);
+    }
+}
+
+// Reproducible, opt-in measurement. Copy this test and its two helpers unchanged
+// into a baseline-only private context for an identical workload. Run both with
+// ONYX_SECURED_RECORD_BENCH=1, the same optimize mode/machine, >=2 repeats, and
+// filter `secured record allocation CPU microbenchmark`. This measures outer
+// open+inner decoder copying/framing, not network throughput or signed dispatch.
+fn securedRecordBenchmarkEnabled() bool {
+    if (comptime @import("builtin").os.tag == .linux) {
+        // The runner supplies this environment explicitly. Procfs files may
+        // report length zero and are unsuitable for opt-in discovery here.
+        for (testing.environ.block.slice) |entry| {
+            const raw = entry orelse continue;
+            if (std.mem.eql(u8, std.mem.span(raw), "ONYX_SECURED_RECORD_BENCH=1")) return true;
+        }
+    }
+    return false;
+}
+
+fn securedRecordBenchmarkClock(cpu: bool) !u64 {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var ts: linux.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(if (cpu) .THREAD_CPUTIME_ID else .MONOTONIC, &ts)) != .SUCCESS) return error.BenchmarkClockFailed;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "secured record allocation CPU microbenchmark" {
+    if (!securedRecordBenchmarkEnabled()) return error.SkipZigTest;
+    const samples = 7;
+    inline for (.{ .{ @as(usize, 64), @as(usize, 4096) }, .{ max_outbound_record_plaintext, @as(usize, 16) } }) |workload| {
+        for (0..samples + 2) |iteration| {
+            var p = try EstablishedPair.init();
+            defer p.deinit();
+            p.a.clearOutbound();
+            p.b.clearOutbound();
+            const plain = try recordThroughputPlaintextForTest(workload[0]);
+            defer testing.allocator.free(plain);
+            const before_counter = p.b.recv_counter;
+            for (0..workload[1]) |_| try p.a.sealRecordTo(plain);
+            const wire = p.a.outbound();
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(wire, &digest, .{});
+            // Retire the original test-owned buffers with their original allocators.
+            // The measured buffers use native SMP; return them before restoring the
+            // allocators so the enclosing pair still owns only its original storage.
+            const original = p.b.allocator;
+            const decoder = &p.b.inner.?.peer.decoder;
+            const original_decoder = decoder.allocator;
+            p.b.rec_inbuf.deinit(original);
+            p.b.rec_inbuf = .empty;
+            decoder.accumulator.deinit(original_decoder);
+            decoder.accumulator = .empty;
+            decoder.payload_buf.deinit(original_decoder);
+            decoder.payload_buf = .empty;
+            var counted = testing.FailingAllocator.init(std.heap.smp_allocator, .{});
+            p.b.allocator = counted.allocator();
+            decoder.allocator = std.heap.smp_allocator;
+            defer {
+                p.b.rec_inbuf.deinit(p.b.allocator);
+                p.b.rec_inbuf = .empty;
+                decoder.accumulator.deinit(decoder.allocator);
+                decoder.accumulator = .empty;
+                decoder.payload_buf.deinit(decoder.allocator);
+                decoder.payload_buf = .empty;
+                decoder.allocator = original_decoder;
+                p.b.allocator = original;
+            }
+            // Capacity funding is outside timing and excluded from counters.
+            try p.b.rec_inbuf.ensureTotalCapacity(p.b.allocator, wire.len);
+            try decoder.accumulator.ensureTotalCapacity(decoder.allocator, plain.len);
+            const alloc_before = counted.allocations;
+            const frees_before = counted.deallocations;
+            const bytes_before = counted.allocated_bytes;
+            const cpu_start = try securedRecordBenchmarkClock(true);
+            const wall_start = try securedRecordBenchmarkClock(false);
+            try p.b.feed(wire, 200);
+            const wall_ns = (try securedRecordBenchmarkClock(false)) - wall_start;
+            const cpu_ns = (try securedRecordBenchmarkClock(true)) - cpu_start;
+            try testing.expectEqual(before_counter + workload[1], p.b.recv_counter);
+            try testing.expectEqual(@as(usize, 0), p.b.rec_inbuf.items.len);
+            try testing.expectEqual(@as(usize, 0), p.b.inner.?.peer.decoder.accumulator.items.len);
+            if (iteration >= 2) std.debug.print("SECURED_RECORD_BENCH sample={d} plaintext={d} records={d} wire={d} sha256={s} cpu_ns={d} wall_ns={d} outer_allocs={d} outer_frees={d} outer_alloc_bytes={d}\n", .{ iteration - 2, workload[0], workload[1], wire.len, std.fmt.bytesToHex(digest, .lower), cpu_ns, wall_ns, counted.allocations - alloc_before, counted.deallocations - frees_before, counted.allocated_bytes - bytes_before });
+        }
+    }
+}
+
+test "secured record in-place good then tampered coalesced records retain only authenticated first event" {
+    var p = try EstablishedPair.init();
+    defer p.deinit();
+    p.a.clearOutbound();
+    p.b.clearOutbound();
+    const initial = try p.b.takeMembershipChanges();
+    for (initial) |*change| change.deinit(testing.allocator);
+    testing.allocator.free(initial);
+    const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "r", .host = "public.example" };
+    try p.a.sendMembership("#undertow", "AcceptedFirst", 0, 200, true, ident, "");
+    const first_wire_length = p.a.outbound().len;
+    try testing.expect(first_wire_length != 0);
+    try p.a.sendMembership("#undertow", "RejectedSecond", 0, 201, true, ident, "");
+    const wire = try testing.allocator.dupe(u8, p.a.outbound());
+    defer testing.allocator.free(wire);
+    try testing.expect(wire.len > first_wire_length + record_len_prefix + record_tag_len);
+    try testing.expectEqual(first_wire_length, record_len_prefix + @as(usize, std.mem.readInt(u32, wire[0..4], .little)));
+    try testing.expectEqual(wire.len - first_wire_length, record_len_prefix + @as(usize, std.mem.readInt(u32, wire[first_wire_length..][0..4], .little)));
+    wire[wire.len - 1] ^= 1;
+    try p.b.rec_inbuf.ensureTotalCapacity(testing.allocator, wire.len);
+    const owned_record_memory = p.b.rec_inbuf.items.ptr;
+    const before_counter = p.b.recv_counter;
+    const before_seq = p.b.feed_seq;
+    try testing.expectError(error.AuthFailed, p.b.feed(wire, 202));
+    // Complete only previously authenticated deferred work. No bytes of the
+    // second record ever reached the inner decoder or membership authority.
+    p.b.processDeferredResidenceFrames(202);
+    try testing.expect(p.b.findRemoteMember("AcceptedFirst") != null);
+    try testing.expect(p.b.findRemoteMember("RejectedSecond") == null);
+    const changes = try p.b.takeMembershipChanges();
+    defer {
+        for (changes) |*change| change.deinit(testing.allocator);
+        testing.allocator.free(changes);
+    }
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expectEqualStrings("AcceptedFirst", changes[0].nick);
+    try testing.expectEqual(before_counter + 1, p.b.recv_counter);
+    try testing.expectEqual(before_seq + 1, p.b.feed_seq);
+    try testing.expect(p.b.record_stream_poisoned);
+    try testing.expectEqual(@as(usize, 0), p.b.rec_inbuf.items.len);
+    try testing.expect(std.mem.allEqual(u8, owned_record_memory[0..wire.len], 0));
+    try testing.expectError(error.RecordStreamPoisoned, p.b.feed(wire, 203));
+    try testing.expectError(error.RecordStreamPoisoned, p.b.feed(&.{}, 204));
+    try testing.expectError(error.RecordStreamPoisoned, p.b.exportOuterChecked());
+    try testing.expect(p.b.snapshotInner() == null);
 }

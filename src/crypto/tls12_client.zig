@@ -369,7 +369,7 @@ pub const Client = struct {
         try self.hs_plain.appendSlice(self.allocator, rec.fragment);
         consumePrefix(&self.recv_buf, rec.wire_len);
         if (self.hs_plain.items.len == 0) return;
-        const head_typ: tls12.HandshakeType = @enumFromInt(self.hs_plain.items[0]);
+        const head_typ: tls12.HandshakeType = @fromBackingInt(@intCast(self.hs_plain.items[0]));
         const cap: usize = if (head_typ == .certificate) max_reassembled_certificate_bytes else max_reassembled_handshake_bytes;
         if (self.hs_plain.items.len > cap) return error.HandshakeMessageTooLarge;
     }
@@ -676,13 +676,13 @@ pub const Client = struct {
         var suites: std.ArrayList(u8) = .empty;
         defer suites.deinit(self.allocator);
         if (self.force_chacha_only_for_test) {
-            try appendU16(self.allocator, &suites, @intFromEnum(tls12.CipherSuite.tls_ecdhe_ecdsa_with_chacha20_poly1305_sha256));
+            try appendU16(self.allocator, &suites, @backingInt(tls12.CipherSuite.tls_ecdhe_ecdsa_with_chacha20_poly1305_sha256));
         } else if (self.force_aes128_only_for_test) {
-            try appendU16(self.allocator, &suites, @intFromEnum(tls12.CipherSuite.tls_ecdhe_ecdsa_with_aes_128_gcm_sha256));
+            try appendU16(self.allocator, &suites, @backingInt(tls12.CipherSuite.tls_ecdhe_ecdsa_with_aes_128_gcm_sha256));
         } else if (self.force_aes256_only_for_test) {
-            try appendU16(self.allocator, &suites, @intFromEnum(tls12.CipherSuite.tls_ecdhe_ecdsa_with_aes_256_gcm_sha384));
+            try appendU16(self.allocator, &suites, @backingInt(tls12.CipherSuite.tls_ecdhe_ecdsa_with_aes_256_gcm_sha384));
         } else {
-            for (tls12.allowed_suites) |suite| try appendU16(self.allocator, &suites, @intFromEnum(suite));
+            for (tls12.allowed_suites) |suite| try appendU16(self.allocator, &suites, @backingInt(suite));
         }
         try appendU16(self.allocator, out, @intCast(suites.items.len));
         try out.appendSlice(self.allocator, suites.items);
@@ -838,7 +838,7 @@ pub const Client = struct {
         const suite = self.selected_suite orelse return error.BadState;
         const serialized = try tls_resumption.encodeStoredSession(self.allocator, .{
             .peer_record_size_limit = @intCast(self.peer_record_size_limit),
-            .suite = @intFromEnum(suite),
+            .suite = @backingInt(suite),
             .ticket_lifetime = lifetime,
             .ticket_age_add = 0,
             .ticket = ticket,
@@ -1240,7 +1240,7 @@ fn writeExtension(allocator: Allocator, out: *std.ArrayList(u8), typ: u16, body:
 }
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: tls12.HandshakeType, body: []const u8) Error!void {
-    try out.append(allocator, @intFromEnum(typ));
+    try out.append(allocator, @backingInt(typ));
     try appendU24(allocator, out, @intCast(body.len));
     try out.appendSlice(allocator, body);
 }
@@ -1252,7 +1252,7 @@ fn parseHandshake(bytes: []const u8, off: *usize) Error!HandshakeMsg {
 fn parseHandshakeMaybe(bytes: []const u8, off: *usize) ?HandshakeMsg {
     if (bytes.len - off.* < 4) return null;
     const start = off.*;
-    const typ: tls12.HandshakeType = @enumFromInt(bytes[start]);
+    const typ: tls12.HandshakeType = @fromBackingInt(@intCast(bytes[start]));
     const len = (@as(usize, bytes[start + 1]) << 16) | (@as(usize, bytes[start + 2]) << 8) | bytes[start + 3];
     if (bytes.len - start < 4 + len) return null;
     off.* = start + 4 + len;
@@ -2322,7 +2322,7 @@ fn splitOffsetInsideCertificate(fragment: []const u8) usize {
     while (off + 4 <= fragment.len) {
         const typ = fragment[off];
         const len = (@as(usize, fragment[off + 1]) << 16) | (@as(usize, fragment[off + 2]) << 8) | fragment[off + 3];
-        if (typ == @intFromEnum(tls12.HandshakeType.certificate)) return off + 4 + len / 2;
+        if (typ == @backingInt(tls12.HandshakeType.certificate)) return off + 4 + len / 2;
         off += 4 + len;
     }
     unreachable; // test-only: the fixture flight always carries a Certificate.
@@ -2467,7 +2467,7 @@ test "TLS 1.2 client rejects a handshake message whose reassembled size exceeds 
 fn feedOneHandshakeRecord(client: *Client, allocator: Allocator, fragment: []const u8) Error!FeedResult {
     var rec: std.ArrayList(u8) = .empty;
     defer rec.deinit(allocator);
-    try rec.append(allocator, @intFromEnum(tls12.ContentType.handshake));
+    try rec.append(allocator, @backingInt(tls12.ContentType.handshake));
     var ver: [2]u8 = undefined;
     std.mem.writeInt(u16, &ver, tls12.tls_version, .big);
     try rec.appendSlice(allocator, &ver);

@@ -403,7 +403,7 @@ test "GAP-K5 verify-only is the permanent 1.x posture" {
         }
     }
     inline for (drafts) |code| {
-        const scheme: SignatureScheme = @enumFromInt(code);
+        const scheme: SignatureScheme = @fromBackingInt(@intCast(code));
         try testing.expect(std.enums.tagName(SignatureScheme, scheme) == null);
     }
 }

@@ -15,7 +15,7 @@
 //!
 //! Wire layout (all integers big-endian):
 //!   magic(4) version(u8) piece_count(u32) table_len(u8)
-//!   17 * { kind(u8), count(u32) } digest(BLAKE3-256)
+//!   20 * { kind(u8), count(u32) } digest(BLAKE3-256)
 //!
 //! The digest transcript is: domain, version, then for every ordered piece
 //! `{index, schema, kind, version, min, max, ordinal, length, bytes}`, followed
@@ -24,12 +24,13 @@
 const std = @import("std");
 
 pub const magic = [_]u8{ 'H', 'H', 'M', '1' };
-pub const version: u8 = 2;
+pub const version: u8 = 5;
 pub const field_ordinal: u32 = 1;
 
-/// Exact v2 table. Kind 17 is the manifest and never hashes itself; kind 18
-/// is native service state. No live legacy table or unknown kind is accepted.
-pub const data_kinds = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18 };
+/// Exact v5 table. Kind 17 never hashes itself; 18 is native service state
+/// and 19 is the mandatory full physical connection relation. No hot legacy
+/// table or unknown kind is accepted.
+pub const data_kinds = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21 };
 pub const data_kind_count: usize = data_kinds.len;
 fn kindIndex(kind: u8) Error!usize {
     for (data_kinds, 0..) |candidate, index| if (candidate == kind) return index;
@@ -37,8 +38,8 @@ fn kindIndex(kind: u8) Error!usize {
 }
 
 const digest_len = std.crypto.hash.Blake3.digest_length;
-const checksum_domain = "onyx:helix:whole-handoff:v2\x00";
-const counts_domain = "onyx:helix:whole-handoff:counts:v2\x00";
+const checksum_domain = "onyx:helix:whole-handoff:v5\x00";
+const counts_domain = "onyx:helix:whole-handoff:counts:v5\x00";
 
 /// magic + version + piece_count + table_len + (kind + count)*N + digest.
 pub const encoded_len: usize = magic.len + 1 + 4 + 1 + data_kind_count * (1 + 4) + digest_len;
@@ -313,23 +314,28 @@ test "mixed ordered pieces commit exact headers bytes count and per-kind counts"
     try verifyPieces(wire, &pieces);
 }
 
-test "native Helix service carry: whole manifest v2 commits kind18 excludes17 and refuses old schema" {
-    const original = [_]PieceView{ samplePiece(1, 0x4843_4c54, "alice"), samplePiece(18, 0x484e_5356, "service") };
+test "native Helix service carry: whole manifest v5 commits issuer and host families excludes17 and refuses old schema" {
+    const original = [_]PieceView{ samplePiece(1, 0x4843_4c54, "alice"), samplePiece(18, 0x484e_5356, "service"), samplePiece(19, 0x4850_4331, "physical"), samplePiece(20, 0x4c47_4931, "issuer"), samplePiece(21, 0x4850_5231, "host") };
     var bytes: [encoded_len]u8 = undefined;
     const wire = try manifestFor(&original, &bytes);
     const parsed = try decode(wire);
     try std.testing.expectEqual(@as(u32, 1), parsed.kind_counts[16]);
+    try std.testing.expectEqual(@as(u32, 1), parsed.kind_counts[17]);
+    try std.testing.expectEqual(@as(u32, 1), parsed.kind_counts[18]);
+    try std.testing.expectEqual(@as(u32, 1), parsed.kind_counts[19]);
     try verifyPieces(wire, &original);
     try std.testing.expectError(error.CountMismatch, verifyPieces(wire, original[0..1]));
     var old_version = bytes;
-    old_version[magic.len] = 1;
+    old_version[magic.len] = 2;
+    try std.testing.expectError(error.BadVersion, decode(&old_version));
+    old_version[magic.len] = 4;
     try std.testing.expectError(error.BadVersion, decode(&old_version));
     var old_table = bytes;
     old_table[magic.len + 1 + 4 + 1 + 16 * 5] = 17;
     try std.testing.expectError(error.NonCanonicalKindTable, decode(&old_table));
     var accumulator = Accumulator.init();
     try std.testing.expectError(error.InvalidKind, accumulator.add(samplePiece(17, 1, "self")));
-    try std.testing.expectError(error.InvalidKind, accumulator.add(samplePiece(19, 1, "unknown")));
+    try std.testing.expectError(error.InvalidKind, accumulator.add(samplePiece(22, 1, "unknown")));
 }
 
 test "drop duplicate reorder payload bitflip and wrong header all fail closed" {

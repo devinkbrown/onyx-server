@@ -17,6 +17,7 @@ pub const IsupportError = std.mem.Allocator.Error || error{
     InvalidToken,
     InvalidKey,
     InvalidEscape,
+    LineTooLong,
 };
 
 pub const Token = struct {
@@ -98,24 +99,66 @@ pub fn buildLines(
 
     var cursor: usize = 0;
     while (cursor < tokens.len or (tokens.len == 0 and cursor == 0)) {
-        const end = @min(cursor + MAX_TOKENS_PER_LINE, tokens.len);
+        const line_start = out.items.len;
         try appendLinePrefix(allocator, &out, options);
-
-        for (tokens[cursor..end], 0..) |token, index| {
-            try validateToken(token);
-            if (index != 0) try out.append(allocator, ' ');
-            try appendToken(allocator, &out, token);
+        var count: usize = 0;
+        while (cursor < tokens.len and count < MAX_TOKENS_PER_LINE) {
+            const before = out.items.len;
+            try validateToken(tokens[cursor]);
+            if (count != 0) try out.append(allocator, ' ');
+            try appendToken(allocator, &out, tokens[cursor]);
+            if (out.items.len - line_start + 2 + TRAILING_TEXT.len + 2 > 512) {
+                out.items.len = before;
+                if (count == 0) return error.LineTooLong;
+                break;
+            }
+            count += 1;
+            cursor += 1;
         }
-
         try out.appendSlice(allocator, " :");
         try out.appendSlice(allocator, TRAILING_TEXT);
         try out.appendSlice(allocator, "\r\n");
-
+        if (out.items.len - line_start > 512) return error.LineTooLong;
         if (tokens.len == 0) break;
-        cursor = end;
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+/// Produce one owned, validated ISUPPORT token with a losslessly escaped value.
+/// Callers may publish the result in the raw inventory and free it normally.
+pub fn encodeTokenAlloc(allocator: std.mem.Allocator, token: Token) IsupportError![]u8 {
+    try validateToken(token);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendToken(allocator, &out, token);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Select the next lossless raw inventory chunk for an actual numeric reply.
+/// `server` and `target` are the exact values emitted by the caller.
+pub fn rawChunkEnd(server: []const u8, target: []const u8, tokens: []const []const u8, start: usize) IsupportError!usize {
+    if (server.len == 0 or target.len == 0 or start >= tokens.len) return error.InvalidLine;
+    for (server) |b| if (b <= ' ' or b == 127) return error.InvalidLine;
+    for (target) |b| if (b <= ' ' or b == 127) return error.InvalidLine;
+    var bytes = std.math.add(usize, server.len, target.len) catch return error.LineTooLong;
+    bytes = std.math.add(usize, bytes, 1 + 1 + 3 + 1 + 2 + TRAILING_TEXT.len + 2) catch return error.LineTooLong;
+    if (bytes > 512) return error.LineTooLong;
+    var end = start;
+    while (end < tokens.len and end - start < MAX_TOKENS_PER_LINE) {
+        const token = tokens[end];
+        if (token.len == 0 or token[0] == ':') return error.InvalidToken;
+        for (token) |b| if (b <= ' ' or b == 127) return error.InvalidToken;
+        const token_bytes = std.math.add(usize, token.len, 1) catch return error.LineTooLong;
+        const next = std.math.add(usize, bytes, token_bytes) catch return error.LineTooLong;
+        if (next > 512) {
+            if (end == start) return error.LineTooLong;
+            break;
+        }
+        bytes = next;
+        end += 1;
+    }
+    return end;
 }
 
 /// Parse one RPL_ISUPPORT (005) line. Returned keys and values are owned by
@@ -370,4 +413,48 @@ test "missing key typed getters return null" {
     try std.testing.expectEqual(@as(?[]const u8, null), map.getStr("MISSING"));
     try std.testing.expectEqual(@as(?u16, 4), try map.getInt(u16, "MODES"));
     try std.testing.expectEqual(@as(?u16, null), try map.getInt(u16, "MISSING"));
+}
+
+test "ISUPPORT line budgets reject oversized tokens after escaping" {
+    const t = std.testing;
+    const long: [500]u8 = @splat('x');
+    try t.expectError(error.LineTooLong, rawChunkEnd("irc.test", "nick", &.{&long}, 0));
+    try t.expectError(error.InvalidToken, rawChunkEnd("irc.test", "nick", &.{"bad token"}, 0));
+    const escaped: [150]u8 = @splat(' ');
+    try t.expectError(error.LineTooLong, buildLines(t.allocator, &.{.{ .key = "X", .value = &escaped }}, .{}));
+}
+
+test "ISUPPORT escaped values split by wire bytes and round trip" {
+    const t = std.testing;
+    const value: [90]u8 = @splat(' ');
+    const tokens = [_]Token{ .{ .key = "FIRST", .value = &value }, .{ .key = "SECOND", .value = &value } };
+    const bytes = try buildLines(t.allocator, &tokens, .{ .server = "irc.test", .target = "nick" });
+    defer t.allocator.free(bytes);
+    var lines = std.mem.splitSequence(u8, bytes, "\r\n");
+    const one = lines.next().?;
+    const two = lines.next().?;
+    try t.expect(one.len + 2 <= 512 and two.len + 2 <= 512);
+    try t.expectEqualStrings("", lines.next().?);
+    var first = try parseLine(t.allocator, one);
+    defer first.deinit();
+    var second = try parseLine(t.allocator, two);
+    defer second.deinit();
+    try t.expectEqualStrings(&value, first.getStr("FIRST").?);
+    try t.expectEqualStrings(&value, second.getStr("SECOND").?);
+}
+
+fn escapeTokenAllocationTest(allocator: std.mem.Allocator) !void {
+    const token = try encodeTokenAlloc(allocator, .{ .key = "NETWORK", .value = "Windows mesh=smoke\\edge" });
+    defer allocator.free(token);
+    try std.testing.expectEqualStrings("NETWORK=Windows\\x20mesh\\x3Dsmoke\\x5Cedge", token);
+    const line = try std.fmt.allocPrint(allocator, ":irc.test 005 nick {s} :are supported by this server\r\n", .{token});
+    defer allocator.free(line);
+    var map = try parseLine(allocator, line);
+    defer map.deinit();
+    try std.testing.expectEqualStrings("Windows mesh=smoke\\edge", map.getStr("NETWORK").?);
+}
+
+test "ISUPPORT raw inventory escapes configured value losslessly with OOM cleanup" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, escapeTokenAllocationTest, .{});
+    try std.testing.expectError(error.InvalidKey, encodeTokenAlloc(std.testing.allocator, .{ .key = "bad key", .value = "value" }));
 }

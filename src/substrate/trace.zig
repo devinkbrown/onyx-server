@@ -25,7 +25,7 @@ pub const Level = enum(u3) {
     }
 
     pub fn allows(minimum: Level, level: Level) bool {
-        return @intFromEnum(level) >= @intFromEnum(minimum);
+        return @backingInt(level) >= @backingInt(minimum);
     }
 };
 
@@ -75,7 +75,7 @@ pub const Category = enum(u8) {
     }
 
     pub fn slot(self: Category) usize {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

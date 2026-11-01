@@ -16,6 +16,7 @@ const scram512_server = @import("../proto/sasl_scram512_server.zig");
 const usermode = @import("../proto/usermode.zig");
 const chanmode = @import("chanmode.zig");
 const protocol_inventory = @import("../proto/protocol_inventory.zig");
+const irc_isupport = @import("../proto/irc_isupport.zig");
 const sts_policy = @import("../proto/sts_policy.zig");
 const event_spine = @import("event_spine.zig");
 const oper = @import("oper.zig");
@@ -176,7 +177,7 @@ const Numeric = enum(u16) {
 };
 
 fn formatCode(numeric: Numeric, buf: []u8) []const u8 {
-    const value: u16 = @intFromEnum(numeric);
+    const value: u16 = @backingInt(numeric);
     buf[0] = @as(u8, '0') + @as(u8, @intCast((value / 100) % 10));
     buf[1] = @as(u8, '0') + @as(u8, @intCast((value / 10) % 10));
     buf[2] = @as(u8, '0') + @as(u8, @intCast(value % 10));
@@ -239,54 +240,9 @@ const Client = struct {
     } = .{},
 };
 
-pub const CapId = enum(u6) {
-    server_time,
-    message_tags,
-    echo_message,
-    sasl,
-    multi_prefix,
-    userhost_in_names,
-    away_notify,
-    setname,
-    extended_join,
-    account_notify,
-    invite_notify,
-    account_tag,
-    onyx_session_sync,
-    onyx_bouncer,
-    onyx_topics,
-    onyx_e2ee,
-    chghost,
-    no_implicit_names,
-    chathistory,
-    message_redaction,
-    message_editing,
-    read_marker,
-    typing,
-    react,
-    reply,
-    batch,
-    bot,
-    channel_rename,
-    extended_monitor,
-    account_registration,
-    metadata_2,
-    standard_replies,
-    cap_notify,
-    labeled_response,
-    pre_away,
-    channel_context,
-    multiline,
-    sts,
-    event_playback,
-    search,
-    account_extban,
-    utf8_only,
-    netsplit,
-    netjoin,
-    onyx_2fa,
-    onyx_privacy,
-};
+const live_cap_metadata = @import("../proto/live_cap_metadata.zig");
+pub const CapId = live_cap_metadata.CapId;
+const CapSpec = live_cap_metadata.CapSpec;
 
 const CapSet = struct {
     bits: u64 = 0,
@@ -304,153 +260,7 @@ const CapSet = struct {
     }
 };
 
-const CapSpec = struct {
-    id: CapId,
-    name: []const u8,
-    value_302: ?[]const u8 = null,
-    /// When set, the cap is omitted from CAP LS unless the session supplies a
-    /// runtime policy value (see `StsPolicy`). This keeps honesty-gated caps
-    /// like `sts` absent from the default build, where no policy is configured.
-    requires_policy: bool = false,
-};
-
-const cap_specs = [_]CapSpec{
-    .{ .id = .server_time, .name = "server-time" },
-    .{ .id = .message_tags, .name = "message-tags" },
-    .{ .id = .echo_message, .name = "echo-message" },
-    // handleAuthenticate routes PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, and
-    // EXTERNAL through the mechrouter. The live server injects each checker from
-    // the account store (PLAIN via PBKDF2, SCRAM-SHA-256/512 via the mirrored
-    // credential store + a per-connection nonce, EXTERNAL via the account ⇄
-    // certfp bindings over the mutual-TLS client cert). Each fails closed when
-    // unconfigured, exactly like PLAIN always has, so advertising them never
-    // strands a client. The value actually sent is built per-connection by
-    // `writeSaslCapValue`, which lists only the mechanisms live on that session;
-    // this static value_302 is the unconfigured fallback and is kept in sync so
-    // CAP LS and the 908 mechanism list agree.
-    .{ .id = .sasl, .name = "sasl", .value_302 = "PLAIN,EXTERNAL,SCRAM-SHA-256,SCRAM-SHA-512" },
-    .{ .id = .multi_prefix, .name = "multi-prefix" },
-    .{ .id = .userhost_in_names, .name = "userhost-in-names" },
-    .{ .id = .away_notify, .name = "away-notify" },
-    .{ .id = .setname, .name = "setname" },
-    .{ .id = .extended_join, .name = "extended-join" },
-    .{ .id = .invite_notify, .name = "invite-notify" },
-    .{ .id = .account_tag, .name = "account-tag" },
-    // onyx/session-sync: opt-in sibling-device mirroring for direct
-    // PRIVMSG/NOTICE delivery and outgoing DM self-view.
-    .{ .id = .onyx_session_sync, .name = "onyx/session-sync" },
-    // onyx/bouncer: opt-in to automatic rewind (replay of missed channel
-    // history on (re)join, bounded by the client's read marker). Multi-session
-    // reclaim (SESSION RESUME) works without it; this only enables auto-replay.
-    .{ .id = .onyx_bouncer, .name = "onyx/bouncer" },
-    // onyx/topics: opt in to Onyx Server's named-conversation surface. A receiver
-    // gets the `+onyx/topic=<label>` client-only tag without needing generic
-    // message-tags, and clients can discover the topic-filtered CHATHISTORY path.
-    .{ .id = .onyx_topics, .name = "onyx/topics" },
-    // onyx/e2ee: opt in to Onyx Server's E2EE control-plane tag. Clients with this
-    // cap may send/receive `+onyx/e2ee` on messages, letting required rooms
-    // reject plaintext without the daemon decrypting client payloads.
-    .{ .id = .onyx_e2ee, .name = "onyx/e2ee" },
-    // chghost: receive a native CHGHOST line when a common user's host changes
-    // (VHOST). Clients without it see the new host on the user's next message.
-    .{ .id = .chghost, .name = "chghost" },
-    // no-implicit-names: a capable client suppresses the automatic NAMES burst
-    // sent on JOIN (it can still issue NAMES explicitly). Dual-advertised: the
-    // spec token is `draft/no-implicit-names`, so list both names (same id) — a
-    // spec client REQ-ing the draft token engages the same capability and CAP
-    // ACK echoes back whichever token the client requested.
-    .{ .id = .no_implicit_names, .name = "no-implicit-names" },
-    .{ .id = .no_implicit_names, .name = "draft/no-implicit-names" },
-    // The following expose already-live command/relay paths to clients that
-    // negotiate them. Each is backed by a verified handler or the client-only
-    // message-tag relay, so advertising them cannot strand a client:
-    //   draft/chathistory     -> CHATHISTORY command (emits a `chathistory` BATCH)
-    //   draft/message-redaction -> REDACT command
-    //   draft/message-editing -> EDIT command
-    //   draft/read-marker     -> MARKREAD command
-    //   draft/typing/react/reply -> relayed as client-only tags on TAGMSG
-    //   batch                 -> server emits BATCH (chathistory, netsplit)
-    //   bot                   -> +B bot flag surfaced in WHOIS (335)
-    .{ .id = .chathistory, .name = "draft/chathistory" },
-    // draft/search: SEARCH <target> :<query> -> full-text message search over the
-    // CHATHISTORY store; results delivered in a `chathistory` BATCH. Backed by the
-    // live `handleSearch` handler + the forward-populated inverted index.
-    .{ .id = .search, .name = "draft/search" },
-    .{ .id = .message_redaction, .name = "draft/message-redaction" },
-    .{ .id = .message_editing, .name = "draft/message-editing" },
-    .{ .id = .read_marker, .name = "draft/read-marker" },
-    .{ .id = .event_playback, .name = "draft/event-playback" },
-    .{ .id = .typing, .name = "draft/typing" },
-    .{ .id = .react, .name = "draft/react" },
-    .{ .id = .reply, .name = "draft/reply" },
-    .{ .id = .batch, .name = "batch" },
-    .{ .id = .bot, .name = "bot" },
-    // channel-rename: receive a native RENAME line when a common channel is
-    // renamed; clients without it get a PART(old)+JOIN(new) fallback.
-    .{ .id = .channel_rename, .name = "draft/channel-rename" },
-    // extended-monitor: receive AWAY/SETNAME/CHGHOST/ACCOUNT changes for
-    // MONITOR'd nicks even without a shared channel.
-    .{ .id = .extended_monitor, .name = "extended-monitor" },
-    // account-notify: receive an ACCOUNT line when a user in a common channel
-    // logs in (IDENTIFY) or out (LOGOUT). The server emits these at the live
-    // login/logout sites.
-    .{ .id = .account_notify, .name = "account-notify" },
-    // account-registration: REGISTER/VERIFY are live; advertising lets compliant
-    // clients surface nick/account registration. The `custom-account-name` value
-    // signals that REGISTER may name an account distinct from the current nick
-    // (`REGISTER <account> ...`), which this server supports. We deliberately do
-    // NOT advertise before-connect, because pre-registration REGISTER is not
-    // supported (it replies FAIL REGISTER COMPLETE_CONNECTION_REQUIRED).
-    .{ .id = .account_registration, .name = "draft/account-registration", .value_302 = "custom-account-name" },
-    // metadata-2: METADATA GET/SET/LIST/CLEAR + RPL_KEYVALUE(761)/762/766 are live.
-    .{ .id = .metadata_2, .name = "draft/metadata-2" },
-    // standard-replies: FAIL/WARN are emitted across the command surface.
-    .{ .id = .standard_replies, .name = "standard-replies" },
-    // cap-notify: the cap set is static, so CAP NEW/DEL never fire, but advertising
-    // signals support and is required before some clients enable other caps.
-    .{ .id = .cap_notify, .name = "cap-notify" },
-    // labeled-response: when a client tags a command with @label=<x>, the
-    // server echoes @label=<x> on the response (a single tagged line, a
-    // labeled-response BATCH for multi-line replies, or a bare labeled ACK for
-    // commands that emit nothing). Framing lives in proto/labeled_response.zig.
-    .{ .id = .labeled_response, .name = "labeled-response" },
-    // pre-away: a negotiating client may send AWAY during the registration
-    // handshake (before the welcome burst). The away state is applied
-    // immediately so the user is already marked away when registration
-    // completes. Handled in processLiveLine's pre-registration branch.
-    .{ .id = .pre_away, .name = "draft/pre-away" },
-    // channel-context: a client-only `+draft/channel-context=<chan>` tag on a
-    // direct message marks it as part of a channel's context. Carried by the
-    // generic client-tag relay (mergeTags), so advertising is all that's needed.
-    .{ .id = .channel_context, .name = "draft/channel-context" },
-    // multiline: the server accepts an inbound `BATCH +ref draft/multiline`
-    // (PRIVMSG/NOTICE chunks), reassembles it, and delivers the result. Limits
-    // are advertised as the cap value and enforced by the per-conn assembler.
-    .{ .id = .multiline, .name = "draft/multiline", .value_302 = "max-bytes=40000,max-lines=64" },
-    // sts (Strict Transport Security): the modern, config-gated replacement for
-    // STARTTLS (which this daemon deliberately never implements). The value is
-    // NOT static: it is the wire policy ("duration=<s>,port=<p>[,preload]")
-    // produced from operator config and supplied per-session at LS time. With
-    // `requires_policy`, the cap is OMITTED entirely until a policy is present,
-    // so a default build that has not enabled STS advertises nothing -- never
-    // stranding a client by promising TLS that no listener serves.
-    .{ .id = .sts, .name = "sts", .requires_policy = true },
-    // IRCv3 discovery caps for behavior Onyx Server already implements unconditionally,
-    // so clients can negotiate/use them: account-extban=a ($a account bans),
-    // utf8-only (the server enforces valid UTF-8 globally), and draft/netsplit +
-    // draft/netjoin (netsplit/netjoin are framed as typed BATCHes, gated on `batch`).
-    .{ .id = .account_extban, .name = "account-extban", .value_302 = "a" },
-    .{ .id = .utf8_only, .name = "utf8-only" },
-    .{ .id = .netsplit, .name = "draft/netsplit" },
-    .{ .id = .netjoin, .name = "draft/netjoin" },
-    // Accounts with 2FA complete login through IDENTIFY. Surface this before
-    // clients choose a SASL mechanism, without treating IDENTIFY as one.
-    .{ .id = .onyx_2fa, .name = "onyx/2fa", .value_302 = "IDENTIFY" },
-    // onyx/privacy: the user and channel modes enforced by this build.
-    // umode lists the receive and direct-message privacy letters. cmode lists
-    // the extended channel moderation letters. Both sets are live gates.
-    .{ .id = .onyx_privacy, .name = "onyx/privacy", .value_302 = "umode=DGIZTVW,cmode=cBK" },
-};
+const cap_specs = live_cap_metadata.cap_specs;
 
 /// Exact upper bound on the rendered, space-separated negotiated-cap-name list
 /// (every cap name + one separator each). A buffer of this size can hold the full
@@ -603,7 +413,7 @@ const CapHandleResult = enum {
 };
 
 fn capBit(id: CapId) u64 {
-    return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(id)));
+    return @as(u64, 1) << @as(u6, @intCast(@backingInt(id)));
 }
 
 /// Emit CAP LS, chunked across multiple `CAP * LS *` continuation lines when the
@@ -1209,7 +1019,7 @@ pub const ClientSession = struct {
     /// `*` (match-all) whenever the stored mask is empty, so a plain category-only
     /// subscription behaves exactly as before this feature existed.
     pub fn eventSubjectMask(self: *const ClientSession, category: event_spine.EventCategory) []const u8 {
-        const stored = self.event_subject_masks[@intFromEnum(category)].slice();
+        const stored = self.event_subject_masks[@backingInt(category)].slice();
         return if (stored.len == 0) "*" else stored;
     }
 
@@ -1217,7 +1027,7 @@ pub const ClientSession = struct {
     /// `*` mask resets to match-all. Over-length/control-byte masks are rejected
     /// (the caller surfaces the error); on rejection the prior mask is unchanged.
     pub fn setEventSubjectMask(self: *ClientSession, category: event_spine.EventCategory, mask: []const u8) DispatchError!void {
-        const slot = &self.event_subject_masks[@intFromEnum(category)];
+        const slot = &self.event_subject_masks[@backingInt(category)];
         if (mask.len == 0 or (mask.len == 1 and mask[0] == '*')) {
             slot.len = 0;
             return;
@@ -1227,7 +1037,7 @@ pub const ClientSession = struct {
 
     /// Reset `category`'s subject scope back to the wildcard `*` (match-all).
     pub fn clearEventSubjectMask(self: *ClientSession, category: event_spine.EventCategory) void {
-        self.event_subject_masks[@intFromEnum(category)].len = 0;
+        self.event_subject_masks[@backingInt(category)].len = 0;
     }
 
     /// Reset every category's subject scope to `*`. Used on CLEAR and oper logout.
@@ -1244,7 +1054,7 @@ pub const ClientSession = struct {
     }
 
     pub fn ircxEventSubjectMask(self: *const ClientSession, typ: event_spine.IrcxEventType) []const u8 {
-        const stored = self.ircx_event_subject_masks[@intFromEnum(typ)].slice();
+        const stored = self.ircx_event_subject_masks[@backingInt(typ)].slice();
         return if (stored.len == 0) "*" else stored;
     }
 
@@ -1266,7 +1076,7 @@ pub const ClientSession = struct {
     }
 
     pub fn setIrcxEventSubjectMask(self: *ClientSession, typ: event_spine.IrcxEventType, mask: []const u8) DispatchError!void {
-        const slot = &self.ircx_event_subject_masks[@intFromEnum(typ)];
+        const slot = &self.ircx_event_subject_masks[@backingInt(typ)];
         if (mask.len == 0 or (mask.len == 1 and mask[0] == '*')) {
             slot.len = 0;
             return;
@@ -1275,7 +1085,7 @@ pub const ClientSession = struct {
     }
 
     pub fn clearIrcxEventSubjectMask(self: *ClientSession, typ: event_spine.IrcxEventType) void {
-        self.ircx_event_subject_masks[@intFromEnum(typ)].len = 0;
+        self.ircx_event_subject_masks[@backingInt(typ)].len = 0;
     }
 
     /// Render active user modes as "+iB" into `out` (caller-owned, >= 32 bytes
@@ -2327,7 +2137,7 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
             tokens[count] = token;
             count += 1;
         }
-        try replies.numeric(session, .RPL_ISUPPORT, tokens[0..count], "are supported by this server");
+        try emitIsupport(session, replies, tokens[0..count]);
     } else {
         try replies.message(
             replies.server_name,
@@ -2335,9 +2145,22 @@ fn emitWelcome(session: *ClientSession, replies: *ReplyCtx) DispatchError!void {
             &.{ nick, replies.server_name, SERVER_VERSION, usermode.default_mode_letters, chanmode.default_mode_letters, chanmode.default_param_mode_letters },
             null,
         );
-        try replies.numeric(session, .RPL_ISUPPORT, protocol_inventory.currentIsupport(), "are supported by this server");
+        try emitIsupport(session, replies, protocol_inventory.currentIsupport());
     }
     try emitWelcomeNotices(session, replies, host);
+}
+
+fn emitIsupport(session: *ClientSession, replies: *ReplyCtx, tokens: []const []const u8) DispatchError!void {
+    var cursor: usize = 0;
+    while (cursor < tokens.len) {
+        cursor = irc_isupport.rawChunkEnd(replies.server_name, session.displayName(), tokens, cursor) catch return error.OutputTooSmall;
+    }
+    cursor = 0;
+    while (cursor < tokens.len) {
+        const end = irc_isupport.rawChunkEnd(replies.server_name, session.displayName(), tokens, cursor) catch return error.OutputTooSmall;
+        try replies.numeric(session, .RPL_ISUPPORT, tokens[cursor..end], irc_isupport.TRAILING_TEXT);
+        cursor = end;
+    }
 }
 
 fn portableIsupportToken(token: []const u8) bool {
@@ -2672,7 +2495,7 @@ test "restore carries client umodes; a forged +a on a non-oper snapshot is strip
     // non-oper branch; only a live configured binding or verified OCG2 visitor
     // projection may derive it.
     var forged = s.snapshot();
-    forged.umode_bits |= @as(u64, 1) << @intFromEnum(usermode.UserMode.admin);
+    forged.umode_bits |= @as(u64, 1) << @backingInt(usermode.UserMode.admin);
     forged.is_oper = false;
     var s3 = ClientSession.init();
     s3.restore(forged);
@@ -4057,4 +3880,44 @@ test "umodeString renders catalog letters for every settable mode, incl R/p/Q/H"
     const s2 = session.umodeString(&buf);
     try std.testing.expect(std.mem.indexOfScalar(u8, s2, 'C') != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, s2, 'T') == null);
+}
+
+test "registration ISUPPORT preserves inventory under maximum prefix and nickname" {
+    const t = std.testing;
+    var session = ClientSession.init();
+    var storage: [8192]u8 = undefined;
+    var replies = ReplyCtx.init(&storage);
+    const server: [253]u8 = @splat('s');
+    const nick: [MAX_NICK_BYTES]u8 = @splat('n');
+    replies.server_name = &server;
+    var nick_command: [5 + MAX_NICK_BYTES]u8 = undefined;
+    @memcpy(nick_command[0..5], "NICK ");
+    @memcpy(nick_command[5..], &nick);
+    try dispatchText(&session, &replies, &nick_command);
+    try dispatchText(&session, &replies, "USER test 0 * :test");
+    try t.expect(session.registered());
+    var lines = std.mem.splitSequence(u8, replies.written(), "\r\n");
+    const expected = protocol_inventory.currentIsupport();
+    var matched: usize = 0;
+    var chunks: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, " 005 ") == null) continue;
+        chunks += 1;
+        try t.expect(line.len + 2 <= 512);
+        var words = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = words.next();
+        try t.expectEqualStrings("005", words.next().?);
+        try t.expectEqualStrings(&nick, words.next().?);
+        var count: usize = 0;
+        while (words.next()) |word| {
+            if (word[0] == ':') break;
+            try t.expect(matched < expected.len);
+            try t.expectEqualStrings(expected[matched], word);
+            matched += 1;
+            count += 1;
+        }
+        try t.expect(count > 0 and count <= irc_isupport.MAX_TOKENS_PER_LINE);
+    }
+    try t.expect(chunks > 1);
+    try t.expectEqual(expected.len, matched);
 }

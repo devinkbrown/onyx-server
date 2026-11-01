@@ -95,7 +95,7 @@ pub const LatencyStats = struct {
 
     /// Recording is allocation-free. The caller must use its owning reactor index.
     pub fn record(self: *LatencyStats, series: Series, reactor_index: usize, value_us: u64) void {
-        const idx = @intFromEnum(series);
+        const idx = @backingInt(series);
         const slot = &self.reactors[reactor_index];
         lockSpin(&slot.mutex);
         defer slot.mutex.unlock();
@@ -185,6 +185,9 @@ pub const Stats = struct {
     const AtomicU64 = std.atomic.Value(u64);
     const AtomicI64 = std.atomic.Value(i64);
 
+    /// Unlabeled process-image totals. Helix starts a new image with zero totals;
+    /// these are diagnostics, never checkpointed authority or retry state.
+    pub const SessionPublication = enum { tracking_token_created, offer_mutation, offer_renewal, offer_retry_new, offer_retry_reused, lease_accepted, retry_attempt, retry_completed, fanout_queued, replay_queued };
     // --- counters (monotonic) ---
     connections_total: AtomicU64 = .init(0),
     s2s_accepts_total: AtomicU64 = .init(0),
@@ -193,6 +196,9 @@ pub const Stats = struct {
     bytes_out_total: AtomicU64 = .init(0),
     errors_total: AtomicU64 = .init(0),
     quits_total: AtomicU64 = .init(0),
+
+    session_publications: [@typeInfo(SessionPublication).@"enum".field_names.len]AtomicU64 =
+        @splat(.init(0)),
 
     // --- gauges (up/down) ---
     connections_active: AtomicI64 = .init(0),
@@ -204,6 +210,14 @@ pub const Stats = struct {
     /// Configured Mooring peers whose circuit breaker is open. The daemon
     /// stores the count; this gauge only publishes it.
     mooring_breakers_open: AtomicI64 = .init(0),
+
+    pub fn onSessionPublication(self: *Stats, event: SessionPublication) void {
+        _ = self.session_publications[@backingInt(event)].fetchAdd(1, .monotonic);
+    }
+
+    pub fn sessionPublicationCount(self: *const Stats, event: SessionPublication) u64 {
+        return self.session_publications[@backingInt(event)].load(.acquire);
+    }
 
     pub fn onAccept(self: *Stats) void {
         _ = self.connections_total.fetchAdd(1, .monotonic);
@@ -269,7 +283,7 @@ pub const Stats = struct {
         value: i128,
     };
 
-    fn rows(self: *const Stats) [11]Row {
+    fn rows(self: *const Stats) [21]Row {
         return .{
             .{ .prom = "onyx_connections_total", .irc = "conns", .help = "Total client connections accepted", .kind = .counter, .value = self.connections_total.load(.acquire) },
             .{ .prom = "onyx_connections_active", .irc = "conns_active", .help = "Currently open client connections", .kind = .gauge, .value = self.connections_active.load(.acquire) },
@@ -282,6 +296,16 @@ pub const Stats = struct {
             .{ .prom = "onyx_bytes_out_total", .irc = "bytes_out", .help = "Total bytes queued to clients", .kind = .counter, .value = self.bytes_out_total.load(.acquire) },
             .{ .prom = "onyx_quits_total", .irc = "quits", .help = "Total client disconnects", .kind = .counter, .value = self.quits_total.load(.acquire) },
             .{ .prom = "onyx_errors_total", .irc = "errors", .help = "Total recoverable hot-path errors", .kind = .counter, .value = self.errors_total.load(.acquire) },
+            .{ .prom = "onyx_session_tracking_token_created_total", .irc = "session_tracking_token_created", .help = "Initial session tracking bearer rows accepted; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.tracking_token_created) },
+            .{ .prom = "onyx_session_offer_mutation_total", .irc = "session_offer_mutation", .help = "Signed OFFERs accepted for local mutation; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.offer_mutation) },
+            .{ .prom = "onyx_session_offer_renewal_total", .irc = "session_offer_renewal", .help = "Signed OFFERs accepted for scheduled renewal; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.offer_renewal) },
+            .{ .prom = "onyx_session_offer_retry_new_total", .irc = "session_offer_retry_new", .help = "New signed OFFERs accepted during retry; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.offer_retry_new) },
+            .{ .prom = "onyx_session_offer_retry_reused_total", .irc = "session_offer_retry_reused", .help = "Accepted OFFERs reused to finish a lease retry; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.offer_retry_reused) },
+            .{ .prom = "onyx_session_lease_accepted_total", .irc = "session_lease_accepted", .help = "Signed attachment leases accepted; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.lease_accepted) },
+            .{ .prom = "onyx_session_retry_attempt_total", .irc = "session_retry_attempt", .help = "Dirty token publication retry attempts; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.retry_attempt) },
+            .{ .prom = "onyx_session_retry_completed_total", .irc = "session_retry_completed", .help = "Dirty token publication retries completed; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.retry_completed) },
+            .{ .prom = "onyx_session_fanout_queued_total", .irc = "session_fanout_queued", .help = "Replica records encoded into live secured fanout; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.fanout_queued) },
+            .{ .prom = "onyx_session_replay_queued_total", .irc = "session_replay_queued", .help = "Retained replica records admitted to secured replay queues; resets on exec", .kind = .counter, .value = self.sessionPublicationCount(.replay_queued) },
         };
     }
 
@@ -388,7 +412,7 @@ test "forEachLine emits one token line per metric" {
     };
     var c = Collector{};
     try s.forEachLine(&c, Collector.emit);
-    try testing.expectEqual(@as(usize, 11), c.count);
+    try testing.expectEqual(@as(usize, 21), c.count);
     try testing.expect(c.saw_conns);
 }
 
@@ -445,4 +469,24 @@ test "GAP-O1 fixed histograms preserve counts sums and peer health" {
     try empty.writePrometheus(allocator, &empty_out);
     try testing.expect(std.mem.indexOf(u8, empty_out.items, "onyx_s2s_links_active 0\n") != null);
     try testing.expect(std.mem.indexOf(u8, empty_out.items, "onyx_mooring_rtt_us_count 0\n") != null);
+}
+
+test "session publication counters expose accepted reasons separately from attempts and reset per image" {
+    var stats = Stats{};
+    stats.onSessionPublication(.retry_attempt);
+    stats.onSessionPublication(.retry_attempt);
+    stats.onSessionPublication(.lease_accepted);
+    stats.onSessionPublication(.offer_retry_reused);
+    stats.onSessionPublication(.retry_completed);
+    try testing.expectEqual(@as(u64, 2), stats.sessionPublicationCount(.retry_attempt));
+    try testing.expectEqual(@as(u64, 1), stats.sessionPublicationCount(.retry_completed));
+    try testing.expectEqual(@as(u64, 0), stats.sessionPublicationCount(.offer_mutation));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try stats.writePrometheus(testing.allocator, &out);
+    try testing.expect(std.mem.indexOf(u8, out.items, "onyx_session_retry_attempt_total 2") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "onyx_session_lease_accepted_total 1") != null);
+    // A successor constructs Stats afresh; these totals never infer authority.
+    const successor = Stats{};
+    try testing.expectEqual(@as(u64, 0), successor.sessionPublicationCount(.retry_attempt));
 }

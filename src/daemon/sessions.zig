@@ -311,6 +311,38 @@ const AttachmentLocator = struct {
     client: ClientId,
 };
 
+/// Owned folded identity plus exact store-owned display keys. The canonical key
+/// survives retirement of any individual spelling variant.
+const FoldedGroup = struct {
+    keys: std.ArrayListUnmanaged([]const u8) = .empty,
+    fn deinit(self: *FoldedGroup, allocator: std.mem.Allocator) void {
+        self.keys.deinit(allocator);
+    }
+};
+const FoldContext = struct {
+    pub fn hash(_: @This(), text: []const u8) u64 {
+        var hash_state = std.hash.Wyhash.init(0);
+        for (text) |byte| {
+            const folded = [_]u8{std.ascii.toLower(byte)};
+            hash_state.update(&folded);
+        }
+        return hash_state.final();
+    }
+    pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+const FoldedIndex = std.HashMap([]const u8, FoldedGroup, FoldContext, std.hash_map.default_max_load_percentage);
+const FoldedInsert = struct {
+    key: ?[]u8 = null,
+    group: FoldedGroup = .{},
+    fn deinit(self: *FoldedInsert, allocator: std.mem.Allocator) void {
+        if (self.key) |key| allocator.free(key);
+        self.group.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 /// One indexed reusable-token group. Row locators borrow store-owned account
 /// keys and remain valid across SessionList reallocations because client id, not
 /// an array index or pointer, is the join key. The cached state is the exact OR
@@ -335,6 +367,24 @@ const TokenIndexEntry = struct {
 pub const TokenIndexComplexity = struct {
     lookups: usize = 0,
     group_row_visits: usize = 0,
+    dirty_candidate_visits: usize = 0,
+    folded_key_visits: usize = 0,
+    folded_row_visits: usize = 0,
+};
+
+/// Bounded token publication/rotation counters, maintained like
+/// `dirty_replica_rows` (plain `usize` under the store lock, saturating at
+/// `usize` max so a hot retry loop can never wrap them). Unlike
+/// `TokenIndexComplexity` these are always on: a later diagnostics/metrics
+/// rendering pass consumes this snapshot unchanged.
+/// `rotations_required` counts only a token-changing re-attach that displaces
+/// a portable (issued) group, where a fresh credential must be issued for the
+/// new token. `duplicate_publications_suppressed` counts a public dirty-arm
+/// (`markTokenReplicaDirty`/`markTokenInventoryDirty`) absorbed by an
+/// already-dirty group instead of queueing a second publication.
+pub const TokenPublicationStats = struct {
+    rotations_required: usize = 0,
+    duplicate_publications_suppressed: usize = 0,
 };
 
 /// Current lifecycle selectors additionally pin the attached state. The legacy
@@ -524,6 +574,8 @@ pub const LifecycleComplexity = struct {
     candidate_group_lookups: usize = 0,
     candidate_key_lookup_work: usize = 0,
     candidate_group_lookup_work: usize = 0,
+    folded_group_comparisons: usize = 0,
+    folded_membership_key_visits: usize = 0,
 };
 pub const LifecyclePreview = struct {
     before: []const LifecycleRow = &.{},
@@ -633,6 +685,7 @@ pub const PreparedBootstrapTokenAttach = struct {
     list: *SessionList,
     client: ClientId,
     token: Token,
+    attachment_id: ?AttachmentId = null,
     signon_ms: i64,
     kind: TokenBindKind,
     target_portable: bool,
@@ -643,6 +696,7 @@ pub const PreparedBootstrapTokenAttach = struct {
     projection_storage: ?*LocalChannelProjectionSet = null,
     staged_target_token_entry: ?TokenIndexEntry = null,
     staged_account_key: ?[]u8 = null,
+    staged_folded_insert: FoldedInsert = .{},
     staged_account_list: ?*SessionList = null,
     evict_index: ?usize,
     detached_source_list: ?*SessionList,
@@ -688,6 +742,7 @@ pub const PreparedBootstrapTokenAttach = struct {
         const account_list = if (self.staged_account_list) |staged| blk: {
             const key = self.staged_account_key.?;
             self.store.accounts.putAssumeCapacity(key, staged.*);
+            self.store.publishFoldedInsert(key, &self.staged_folded_insert);
             self.store.allocator.destroy(staged);
             self.staged_account_list = null;
             self.staged_account_key = null;
@@ -719,6 +774,7 @@ pub const PreparedBootstrapTokenAttach = struct {
         const session = Session{
             .client = self.client,
             .token = self.token,
+            .attachment_id = self.attachment_id,
             .signon_ms = self.signon_ms,
             .portable_resume = self.resultPortable(),
             .replica_dirty = self.target_dirty,
@@ -731,6 +787,7 @@ pub const PreparedBootstrapTokenAttach = struct {
         if (session.replica_projection_dirty) self.store.dirty_projection_rows += 1;
         if (session.local_channel_projections != null) self.store.dirty_local_projection_rows += 1;
         self.store.addTokenRowLocked(self.account, session, &self.staged_target_token_entry);
+        if (self.attachment_id) |attachment| self.store.attachment_index.putAssumeCapacity(attachment.raw, .{ .account = self.account, .client = self.client });
         self.state = .committed;
         return .{ .session = session, .evicted = evicted };
     }
@@ -780,6 +837,7 @@ pub const PreparedBootstrapTokenAttach = struct {
         self.staged_account_list = null;
         if (self.staged_account_key) |key| self.store.allocator.free(key);
         self.staged_account_key = null;
+        self.staged_folded_insert.deinit(self.store.allocator);
     }
 
     fn destroyLockedRows(self: *PreparedBootstrapTokenAttach) void {
@@ -1230,6 +1288,7 @@ const LifecycleAccount = struct {
     retired_key: bool = false,
     remove_when_empty: bool = false,
 };
+const LifecycleFoldedUpdate = struct { key: ?[]u8, group: FoldedGroup = .{} };
 const LifecycleOldBinding = struct { account: []const u8, index: usize, duplicates: bool = false };
 const LifecycleGroup = struct {
     token: Token,
@@ -1315,6 +1374,7 @@ const LifecycleOwned = struct {
     accounts: std.ArrayListUnmanaged(LifecycleAccount) = .empty,
     groups: std.ArrayListUnmanaged(LifecycleGroup) = .empty,
     indexes: std.ArrayListUnmanaged(LifecycleIndex) = .empty,
+    folded_updates: std.ArrayListUnmanaged(LifecycleFoldedUpdate) = .empty,
     before: std.ArrayListUnmanaged(LifecycleRow) = .empty,
     after: std.ArrayListUnmanaged(LifecycleRow) = .empty,
     admissions: std.ArrayListUnmanaged(LifecycleAdmissionResult) = .empty,
@@ -2186,10 +2246,61 @@ const LifecycleOwned = struct {
         self.preview_value.counts = counts;
     }
 
+    /// Clone only changed folded groups; no unrelated account census occurs.
+    fn stageFoldedUpdates(self: *LifecycleOwned) LifecycleError!void {
+        const a = self.allocator();
+        for (self.accounts.items) |account| {
+            const existed = account.old != null;
+            const survives = account.final.items.items.len != 0 or (existed and !account.remove_when_empty);
+            if (existed == survives) continue;
+            var update_index: ?usize = null;
+            for (self.folded_updates.items, 0..) |update, i| {
+                self.preview_value.complexity.folded_group_comparisons += 1;
+                if (std.ascii.eqlIgnoreCase(update.key.?, account.key)) {
+                    update_index = i;
+                    break;
+                }
+            }
+            if (update_index == null) {
+                const key = try lifecycleFold(a, account.key);
+                errdefer a.free(key);
+                var folded_group: FoldedGroup = .{};
+                errdefer folded_group.deinit(a);
+                if (self.store.folded_index.getPtr(account.key)) |old| {
+                    self.preview_value.complexity.folded_membership_key_visits += old.keys.items.len;
+                    try self.charge(std.math.mul(usize, old.keys.items.len, @sizeOf([]const u8)) catch return error.CandidateLimitExceeded);
+                    try folded_group.keys.appendSlice(a, old.keys.items);
+                }
+                try self.charge(key.len);
+                try self.charge(@sizeOf(LifecycleFoldedUpdate));
+                try self.folded_updates.append(a, .{ .key = key, .group = folded_group });
+                update_index = self.folded_updates.items.len - 1;
+            }
+            const folded_group = &self.folded_updates.items[update_index.?].group;
+            if (survives) {
+                try self.charge(@sizeOf([]const u8));
+                try folded_group.keys.append(a, account.key);
+            } else {
+                var found = false;
+                for (folded_group.keys.items, 0..) |key, i| {
+                    self.preview_value.complexity.folded_membership_key_visits += 1;
+                    if (!std.mem.eql(u8, key, account.key)) continue;
+                    _ = folded_group.keys.swapRemove(i);
+                    found = true;
+                    break;
+                }
+                if (!found) return error.InvalidRequest;
+            }
+        }
+        if (self.folded_updates.items.len > std.math.maxInt(u32)) return error.CandidateLimitExceeded;
+        try self.store.folded_index.ensureUnusedCapacity(@intCast(self.folded_updates.items.len));
+    }
+
     fn reserveMaps(self: *LifecycleOwned) LifecycleError!void {
         const max_accounts = @max(self.store.accounts.count(), self.preview_value.final_accounts);
         const max_rows = @max(self.total_old_rows, self.preview_value.final_rows);
         if (max_accounts > std.math.maxInt(u32) or max_rows > std.math.maxInt(u32)) return error.CandidateLimitExceeded;
+        try self.stageFoldedUpdates();
         try self.store.accounts.ensureTotalCapacity(@intCast(max_accounts));
         try self.store.attachment_index.ensureTotalCapacity(@intCast(max_rows));
         try self.store.token_index.ensureTotalCapacity(@intCast(max_rows));
@@ -2207,8 +2318,17 @@ const LifecycleOwned = struct {
                 }
             }
             std.hash.autoHash(&h, old != null);
+            const folded = self.store.folded_index.get(a.key);
+            std.hash.autoHash(&h, folded != null);
+            if (folded) |value| std.hash.autoHashStrat(&h, value.keys.items, .DeepRecursive);
         }
         const s = self.store;
+        for (self.folded_updates.items) |update| {
+            const entry = s.folded_index.get(update.key.?);
+            std.hash.autoHashStrat(&h, update.key.?, .DeepRecursive);
+            std.hash.autoHash(&h, entry != null);
+            if (entry) |folded_group| std.hash.autoHashStrat(&h, folded_group.keys.items, .DeepRecursive);
+        }
         for (self.indexes.items) |i| {
             const entry = s.token_index.get(i.token);
             std.hash.autoHash(&h, entry != null);
@@ -2227,6 +2347,7 @@ const LifecycleOwned = struct {
             for (a.final.items.items) |s| std.hash.autoHashStrat(&h, lifecycleRow(a.display, s), .DeepRecursive);
         }
         for (self.indexes.items) |i| std.hash.autoHashStrat(&h, .{ i.token, i.entry.rows.items, i.entry.portable_rows, i.entry.dirty_rows, i.entry.projection_dirty_rows, i.entry.drop_reserved_rows, i.entry.local_projections }, .DeepRecursive);
+        for (self.folded_updates.items) |update| std.hash.autoHashStrat(&h, .{ update.key.?, update.group.keys.items }, .DeepRecursive);
         std.hash.autoHashStrat(&h, self.preview_value, .DeepRecursive);
         var digest: [32]u8 = undefined;
         h.final(&digest);
@@ -2235,6 +2356,20 @@ const LifecycleOwned = struct {
 
     fn publish(self: *LifecycleOwned) void {
         const s = self.store;
+        // Swap only complete staged folded groups before any account key can
+        // retire. Capacity and all group storage were reserved during prepare.
+        for (self.folded_updates.items) |*update| {
+            if (s.folded_index.fetchRemove(update.key.?)) |removed| {
+                var old_group = removed.value;
+                old_group.deinit(s.allocator);
+                s.allocator.free(removed.key);
+            }
+            if (update.group.keys.items.len != 0) {
+                s.folded_index.putAssumeCapacityNoClobber(update.key.?, update.group);
+                update.key = null;
+                update.group = .{};
+            }
+        }
         // Remove every old locator before any emptied account key can retire.
         for (self.indexes.items) |index| if (s.token_index.fetchRemove(index.token)) |old| {
             var entry = old.value;
@@ -2288,6 +2423,11 @@ const LifecycleOwned = struct {
             if (account.key_owned) a.free(account.key);
             a.free(account.display);
         }
+        for (self.folded_updates.items) |*update| {
+            if (update.key) |key| a.free(key);
+            update.group.deinit(a);
+        }
+        self.folded_updates.deinit(a);
         for (self.indexes.items) |*index| index.entry.deinit(a);
         self.accounts.deinit(a);
         self.groups.deinit(a);
@@ -2350,15 +2490,52 @@ fn lifecycleAdjustCounts(c: *LifecycleCounts, s: Session, add: bool) LifecycleEr
     }
 }
 
+/// Lexical, source-issued proof. It is valid only during the synchronous
+/// callback while this Store's original exclusive acquisition is retained.
+/// Never retain, copy, or use this pointer after the callback returns.
+pub const PhysicalAbsenceError = error{
+    Busy,
+    PhysicalAuthorityPresent,
+    WrongStore,
+    WrongClient,
+    WrongCaller,
+    ExpiredScope,
+    ExclusiveLockNotHeldByCaller,
+    ExclusiveAcquisitionExhausted,
+    ExclusiveAcquisitionChanged,
+};
+const PhysicalAbsenceState = struct {
+    store: *const SessionStore,
+    client: ClientId,
+    creator: std.Thread.Id,
+    acquisition: u64,
+    active: bool = true,
+};
+pub const PhysicalAbsence = opaque {
+    pub fn requireReady(self: *const PhysicalAbsence, expected_store: *const SessionStore, expected_client: ClientId) PhysicalAbsenceError!void {
+        const state: *const PhysicalAbsenceState = @ptrCast(@alignCast(self));
+        if (!state.active) return error.ExpiredScope;
+        if (state.store != expected_store) return error.WrongStore;
+        if (state.client != expected_client) return error.WrongClient;
+        const caller: std.Thread.Id = if (builtin.single_threaded) 0 else std.Thread.getCurrentId();
+        if (state.creator != caller) return error.WrongCaller;
+        try state.store.lock.requireExclusiveAcquisitionByCurrentThread(state.acquisition);
+    }
+};
+
 pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     accounts: std.StringHashMap(SessionList),
+    folded_index: FoldedIndex,
     attachment_index: std.AutoHashMap([attachment_id_mod.byte_len]u8, AttachmentLocator),
     token_index: std.AutoHashMap(Token, TokenIndexEntry),
     lock: rwlock.RwLock = .{},
     token_index_lookups: std.atomic.Value(usize) = .init(0),
     token_index_group_row_visits: std.atomic.Value(usize) = .init(0),
+    token_index_dirty_candidate_visits: std.atomic.Value(usize) = .init(0),
+    folded_key_visits: std.atomic.Value(usize) = .init(0),
+    folded_row_visits: std.atomic.Value(usize) = .init(0),
     /// Number of rows carrying `replica_dirty`, maintained under `lock`. This is
     /// deliberately a row count (not a token count), so every mutation remains
     /// O(1) once the affected row is known and collection can skip an empty
@@ -2392,10 +2569,39 @@ pub const SessionStore = struct {
     /// Generation zero is reserved for "never armed". Wrap is practically
     /// unreachable, but skipping zero keeps the invariant total even under a
     /// synthetic overflow test.
+    /// See `TokenPublicationStats`. Maintained only under `lock`.
+    token_publication_rotations_required: usize = 0,
+    token_publication_duplicate_publications_suppressed: usize = 0,
     next_local_projection_generation: u64 = 0,
     /// Ephemeral linear-owner guards; never serialized or used as credentials.
     next_lifecycle_serial: u64 = 0,
     active_lifecycle: ?*LifecycleOwned = null,
+
+    /// Allocation-free complete census of exact physical IDs. The exclusive
+    /// lock stays held through the callback; the callback must not re-enter any
+    /// SessionStore locking API or let the witness escape. O(accounts + rows).
+    /// Prepared tickets retaining this same lock make the attempt return Busy.
+    /// A future ticket that releases it before insertion requires a new pending
+    /// physical registration contract; this census alone cannot prove that case.
+    pub fn withPhysicalAbsence(self: *SessionStore, client: ClientId, context: anytype, comptime callback: anytype) anyerror!void {
+        if (!self.lock.tryLockExclusive()) return error.Busy;
+        defer self.lock.unlockExclusive();
+        const acquisition = try self.lock.captureExclusiveAcquisitionForCurrentThread();
+        var it = self.accounts.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items.items) |row| {
+                if (row.client == client) return error.PhysicalAuthorityPresent;
+            }
+        }
+        var state = PhysicalAbsenceState{
+            .store = self,
+            .client = client,
+            .creator = if (builtin.single_threaded) 0 else std.Thread.getCurrentId(),
+            .acquisition = acquisition,
+        };
+        defer state.active = false;
+        try callback(context, @as(*const PhysicalAbsence, @ptrCast(&state)));
+    }
 
     /// Synchronous World -> SessionStore transaction member. No disk I/O or
     /// external authority checks occur here. Every request is admitted from
@@ -2427,6 +2633,7 @@ pub const SessionStore = struct {
             .allocator = allocator,
             .cfg = cfg,
             .accounts = std.StringHashMap(SessionList).init(allocator),
+            .folded_index = FoldedIndex.init(allocator),
             .attachment_index = std.AutoHashMap([attachment_id_mod.byte_len]u8, AttachmentLocator).init(allocator),
             .token_index = std.AutoHashMap(Token, TokenIndexEntry).init(allocator),
         };
@@ -2464,6 +2671,9 @@ pub const SessionStore = struct {
         if (!builtin.is_test) return;
         self.token_index_lookups.store(0, .monotonic);
         self.token_index_group_row_visits.store(0, .monotonic);
+        self.token_index_dirty_candidate_visits.store(0, .monotonic);
+        self.folded_key_visits.store(0, .monotonic);
+        self.folded_row_visits.store(0, .monotonic);
     }
 
     pub fn tokenIndexComplexitySnapshot(self: *const SessionStore) TokenIndexComplexity {
@@ -2471,6 +2681,35 @@ pub const SessionStore = struct {
         return .{
             .lookups = self.token_index_lookups.load(.monotonic),
             .group_row_visits = self.token_index_group_row_visits.load(.monotonic),
+            .dirty_candidate_visits = self.token_index_dirty_candidate_visits.load(.monotonic),
+            .folded_key_visits = self.folded_key_visits.load(.monotonic),
+            .folded_row_visits = self.folded_row_visits.load(.monotonic),
+        };
+    }
+
+    /// Caller holds `lock` (exclusive). Saturating: bounded, never wraps.
+    fn noteRotationRequiredLocked(self: *SessionStore) void {
+        self.token_publication_rotations_required +|= 1;
+    }
+
+    /// Caller holds `lock` (exclusive). Saturating: bounded, never wraps.
+    fn noteDuplicatePublicationSuppressedLocked(self: *SessionStore) void {
+        self.token_publication_duplicate_publications_suppressed +|= 1;
+    }
+
+    pub fn resetTokenPublicationStats(self: *SessionStore) void {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        self.token_publication_rotations_required = 0;
+        self.token_publication_duplicate_publications_suppressed = 0;
+    }
+
+    pub fn tokenPublicationStatsSnapshot(self: *const SessionStore) TokenPublicationStats {
+        @constCast(&self.lock).lockShared();
+        defer @constCast(&self.lock).unlockShared();
+        return .{
+            .rotations_required = self.token_publication_rotations_required,
+            .duplicate_publications_suppressed = self.token_publication_duplicate_publications_suppressed,
         };
     }
 
@@ -2606,6 +2845,12 @@ pub const SessionStore = struct {
             self.lock.lockExclusive();
             defer self.lock.unlockExclusive();
 
+            var folded_groups = self.folded_index.iterator();
+            while (folded_groups.next()) |group| {
+                self.allocator.free(group.key_ptr.*);
+                group.value_ptr.deinit(self.allocator);
+            }
+            self.folded_index.deinit();
             self.attachment_index.deinit();
             var token_entries = self.token_index.valueIterator();
             while (token_entries.next()) |entry| entry.deinit(self.allocator);
@@ -2834,6 +3079,13 @@ pub const SessionStore = struct {
                     storage.* = inherited.local_projections;
                 }
             }
+            // Past every fallible step in this branch: a token-changing
+            // replacement of an issued (portable) group is the one place a
+            // fresh credential reissue becomes required. Same-token refresh
+            // and rotating a never-issued token require none.
+            if (!std.crypto.timing_safe.eql(Token, displaced.token, token) and
+                (displaced.portable_resume or self.tokenGroupStateLocked(displaced.token).portable))
+                self.noteRotationRequiredLocked();
             self.removeDirtyRowLocked(&list.items.items[idx]);
             self.removeTokenRowLocked(
                 account_key,
@@ -3138,10 +3390,19 @@ pub const SessionStore = struct {
         var claimant_list: ?*SessionList = null;
         var claimant_account: ?[]const u8 = null;
         var claimant_index: ?usize = null;
-        var claimant_it = self.accounts.iterator();
-        while (claimant_it.next()) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
-            const index = entry.value_ptr.indexOfClient(claimant_client) orelse continue;
+        const folded = self.folded_index.getPtr(account) orelse return null;
+        for (folded.keys.items) |key| {
+            if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
+            const entry = self.accounts.getEntry(key) orelse return null;
+            var found_index: ?usize = null;
+            for (entry.value_ptr.items.items, 0..) |row, row_index| {
+                if (builtin.is_test) _ = self.folded_row_visits.fetchAdd(1, .monotonic);
+                if (row.client == claimant_client) {
+                    found_index = row_index;
+                    break;
+                }
+            }
+            const index = found_index orelse continue;
             if (claimant_list != null) return null;
             claimant_list = entry.value_ptr;
             claimant_account = entry.key_ptr.*;
@@ -3194,15 +3455,14 @@ pub const SessionStore = struct {
         // planner. Allocation happens before the ticket is published; failure
         // releases the lock without consuming either bootstrap or ghost.
         var locked_row_count: usize = 0;
-        var count_it = self.accounts.iterator();
-        while (count_it.next()) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
-            locked_row_count = std.math.add(
-                usize,
-                locked_row_count,
-                entry.value_ptr.items.items.len,
-            ) catch return null;
+        var found_ghost_key = false;
+        for (folded.keys.items) |key| {
+            if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
+            const selected = self.accounts.getPtr(key) orelse return null;
+            found_ghost_key = found_ghost_key or std.mem.eql(u8, key, ghost_locator.account);
+            locked_row_count = std.math.add(usize, locked_row_count, selected.items.items.len) catch return null;
         }
+        if (!found_ghost_key or locked_row_count == 0) return null;
         const locked_account_rows = self.allocator.alloc(
             TokenBindRowSnapshot,
             locked_row_count,
@@ -3210,10 +3470,11 @@ pub const SessionStore = struct {
         var rows_transferred = false;
         defer if (!rows_transferred) self.allocator.free(locked_account_rows);
         var locked_row_index: usize = 0;
-        var rows_it = self.accounts.iterator();
-        while (rows_it.next()) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
-            for (entry.value_ptr.items.items) |row| {
+        for (folded.keys.items) |key| {
+            if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
+            const selected = self.accounts.getPtr(key) orelse return null;
+            for (selected.items.items) |row| {
+                if (builtin.is_test) _ = self.folded_row_visits.fetchAdd(1, .monotonic);
                 locked_account_rows[locked_row_index] = .{
                     .client = row.client,
                     .token = row.token,
@@ -3267,10 +3528,27 @@ pub const SessionStore = struct {
         kind: TokenBindKind,
         signon_ms: i64,
     ) ?PreparedBootstrapTokenAttach {
+        return self.prepareBootstrapTokenAttachWithAttachment(account, client, token, kind, signon_ms, null);
+    }
+
+    pub fn prepareBootstrapTokenAttachWithAttachment(
+        self: *SessionStore,
+        account: []const u8,
+        client: ClientId,
+        token: Token,
+        kind: TokenBindKind,
+        signon_ms: i64,
+        attachment_id: ?AttachmentId,
+    ) ?PreparedBootstrapTokenAttach {
         if (tokenIsSentinel(token)) return null;
         self.lock.lockExclusive();
         var keep_locked = false;
         defer if (!keep_locked) self.lock.unlockExclusive();
+
+        if (attachment_id) |attachment| {
+            if (attachment.isZero() or self.attachmentOwnerLocked(attachment) != null) return null;
+            self.attachment_index.ensureUnusedCapacity(1) catch return null;
+        }
 
         const target = self.tokenGroupStateForAccountLocked(account, token) orelse return null;
         if (kind == .join_existing and !target.found) return null;
@@ -3279,20 +3557,23 @@ pub const SessionStore = struct {
         // Reject a duplicate runtime id even when case-variant account keys
         // exist. The ticket must represent a genuinely new claimant.
         var folded_row_count: usize = 0;
-        var count_it = self.accounts.iterator();
-        while (count_it.next()) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
-            folded_row_count = std.math.add(
-                usize,
-                folded_row_count,
-                entry.value_ptr.items.items.len,
-            ) catch return null;
-            if (entry.value_ptr.indexOfClient(client) != null) return null;
+        if (self.folded_index.getPtr(account)) |folded| {
+            for (folded.keys.items) |key| {
+                if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
+                const selected = self.accounts.getPtr(key) orelse return null;
+                folded_row_count = std.math.add(usize, folded_row_count, selected.items.items.len) catch return null;
+                for (selected.items.items) |row| {
+                    if (builtin.is_test) _ = self.folded_row_visits.fetchAdd(1, .monotonic);
+                    if (row.client == client) return null;
+                }
+            }
         }
 
         const existing_entry = self.accounts.getEntry(account);
         var staged_account_key: ?[]u8 = null;
         defer if (staged_account_key) |key| self.allocator.free(key);
+        var staged_folded_insert: FoldedInsert = .{};
+        defer staged_folded_insert.deinit(self.allocator);
         var staged_account_list: ?*SessionList = null;
         defer if (staged_account_list) |list| {
             list.deinit(self.allocator);
@@ -3312,6 +3593,7 @@ pub const SessionStore = struct {
                 self.cfg.max_sessions_per_account == 0) return null;
             self.accounts.ensureUnusedCapacity(1) catch return null;
             staged_account_key = self.allocator.dupe(u8, account) catch return null;
+            staged_folded_insert = self.reserveFoldedInsert(staged_account_key.?) catch return null;
             staged_account_list = self.allocator.create(SessionList) catch return null;
             staged_account_list.?.* = .{};
             staged_account_list.?.items.ensureUnusedCapacity(self.allocator, 1) catch return null;
@@ -3336,24 +3618,30 @@ pub const SessionStore = struct {
         var rows_transferred = false;
         defer if (!rows_transferred) self.allocator.free(locked_account_rows);
         var preview_index: usize = 0;
-        var rows_it = self.accounts.iterator();
-        while (rows_it.next()) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account)) continue;
-            for (entry.value_ptr.items.items) |row| {
-                locked_account_rows[preview_index] = .{
-                    .client = row.client,
-                    .token = row.token,
-                    .attachment_id = row.attachment_id,
-                    .attached = row.attached,
-                    .portable_resume = row.portable_resume,
-                };
-                preview_index += 1;
+        // Staging a new exact-case account can reserve index capacity. Re-fetch
+        // the selected group afterwards; an absent fold is valid for adoption.
+        if (self.folded_index.getPtr(account)) |folded| {
+            for (folded.keys.items) |key| {
+                if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
+                const selected = self.accounts.getPtr(key) orelse return null;
+                for (selected.items.items) |row| {
+                    if (builtin.is_test) _ = self.folded_row_visits.fetchAdd(1, .monotonic);
+                    locked_account_rows[preview_index] = .{
+                        .client = row.client,
+                        .token = row.token,
+                        .attachment_id = row.attachment_id,
+                        .attached = row.attached,
+                        .portable_resume = row.portable_resume,
+                    };
+                    preview_index += 1;
+                }
             }
         }
+        if (preview_index != folded_row_count) return null;
         locked_account_rows[preview_index] = .{
             .client = client,
             .token = token,
-            .attachment_id = null,
+            .attachment_id = attachment_id,
             .attached = true,
             .portable_resume = switch (kind) {
                 .join_existing => target.portable,
@@ -3393,6 +3681,8 @@ pub const SessionStore = struct {
         staged_account_key = null;
         const transferred_list = staged_account_list;
         staged_account_list = null;
+        const transferred_folded_insert = staged_folded_insert;
+        staged_folded_insert = .{};
         keep_locked = true;
         return .{
             .store = self,
@@ -3400,6 +3690,7 @@ pub const SessionStore = struct {
             .list = list,
             .client = client,
             .token = token,
+            .attachment_id = attachment_id,
             .signon_ms = signon_ms,
             .kind = kind,
             .target_portable = target.portable,
@@ -3410,6 +3701,7 @@ pub const SessionStore = struct {
             .projection_storage = transferred_projection,
             .staged_target_token_entry = transferred_token_entry,
             .staged_account_key = transferred_key,
+            .staged_folded_insert = transferred_folded_insert,
             .staged_account_list = transferred_list,
             .evict_index = evict_index,
             .detached_source_list = detached_source_list,
@@ -3467,16 +3759,15 @@ pub const SessionStore = struct {
         // restore plan built from only one spelling can otherwise miss a live
         // attachment that joins or leaves immediately before this ticket.
         var locked_row_count: usize = 0;
-        var count_it = self.accounts.iterator();
-        while (count_it.next()) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account_key)) continue;
-            locked_row_count = std.math.add(
-                usize,
-                locked_row_count,
-                entry.value_ptr.items.items.len,
-            ) catch return null;
+        const folded = self.folded_index.getPtr(account_key) orelse return null;
+        var found_claimant_key = false;
+        for (folded.keys.items) |key| {
+            if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
+            const selected = self.accounts.getPtr(key) orelse return null;
+            found_claimant_key = found_claimant_key or std.mem.eql(u8, key, account_key);
+            locked_row_count = std.math.add(usize, locked_row_count, selected.items.items.len) catch return null;
         }
-        std.debug.assert(locked_row_count != 0);
+        if (!found_claimant_key or locked_row_count == 0) return null;
         const locked_account_rows = self.allocator.alloc(
             TokenBindRowSnapshot,
             locked_row_count,
@@ -3484,10 +3775,11 @@ pub const SessionStore = struct {
         var rows_transferred = false;
         defer if (!rows_transferred) self.allocator.free(locked_account_rows);
         var locked_row_index: usize = 0;
-        var rows_it = self.accounts.iterator();
-        while (rows_it.next()) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, account_key)) continue;
-            for (entry.value_ptr.items.items) |session| {
+        for (folded.keys.items) |key| {
+            if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
+            const selected = self.accounts.getPtr(key) orelse return null;
+            for (selected.items.items) |session| {
+                if (builtin.is_test) _ = self.folded_row_visits.fetchAdd(1, .monotonic);
                 locked_account_rows[locked_row_index] = .{
                     .client = session.client,
                     .token = session.token,
@@ -3589,7 +3881,30 @@ pub const SessionStore = struct {
 
         const state = self.tokenGroupStateLocked(token);
         if (!state.found or !state.portable) return false;
-        self.setTokenGroupDirtyLocked(token, true);
+        if (state.dirty) {
+            // Idempotent retry: the pending publication already covers this
+            // mutation, so the duplicate arm is suppressed, not re-queued.
+            self.noteDuplicatePublicationSuppressedLocked();
+        } else {
+            self.setTokenGroupDirtyLocked(token, true);
+        }
+        return true;
+    }
+
+    /// Queue authenticated account inventory without minting a portable resume
+    /// credential. Callers must gate publication on current inventory support;
+    /// this existing retry bit is work ownership, never credential authority.
+    pub fn markTokenInventoryDirty(self: *SessionStore, token: Token) bool {
+        if (tokenIsSentinel(token)) return false;
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        const state = self.tokenGroupStateLocked(token);
+        if (!state.found or state.drop_reserved) return false;
+        if (state.dirty) {
+            self.noteDuplicatePublicationSuppressedLocked();
+        } else {
+            self.setTokenGroupDirtyLocked(token, true);
+        }
         return true;
     }
 
@@ -3622,16 +3937,21 @@ pub const SessionStore = struct {
         return self.tokenGroupStateLocked(token).projection_dirty;
     }
 
-    /// Copy at most `out.len` unique dirty portable tokens into caller storage.
-    /// `replica_dirty` can only be minted after group portability was verified,
-    /// so it remains the durable eligibility proof if the issuing sibling is
-    /// removed before retry. No allocation occurs and the returned slice borrows
-    /// `out`; a dirty token remains visible until explicitly cleared.
-    pub fn dirtyPortableTokensInto(self: *SessionStore, out: []Token) []const Token {
+    /// Copy bounded unique dirty publication groups. The dirty bit owns pending
+    /// work for either portable replicas or authenticated inventory; it does not
+    /// grant resume authority. Credential flags and negotiated feature coverage
+    /// remain independent. No allocation; rows remain pending until cleared.
+    pub fn dirtyReplicaTokensInto(self: *SessionStore, out: []Token) []const Token {
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
         return self.dirtyTokensIntoLocked(out, .publish);
+    }
+
+    /// Historical spelling retained for existing callers. This is a retry
+    /// selector, not a portability predicate; use token-group credential state.
+    pub fn dirtyPortableTokensInto(self: *SessionStore, out: []Token) []const Token {
+        return self.dirtyReplicaTokensInto(out);
     }
 
     /// Mark one exact current attachment for SRA3 publication. Group
@@ -4262,55 +4582,48 @@ pub const SessionStore = struct {
             .publish => &self.dirty_scan_cursor,
             .projection => &self.projection_scan_cursor,
         };
-        var n: usize = 0;
+        // Keep the earliest bounded candidates in circular token order directly
+        // in caller storage. Cached dirty counts avoid visiting physical rows;
+        // one index traversal replaces one registry census per returned token.
+        // No retained hash-map position or new allocation crosses this call.
         const original_cursor = cursor_ptr.*;
-        var wrapped = original_cursor == null;
-        var lower_bound = original_cursor;
-        while (n < out.len) {
-            var candidate: ?Token = null;
-            var it = self.accounts.iterator();
-            while (it.next()) |entry| {
-                for (entry.value_ptr.items.items) |session| {
-                    if (!sessionDirty(session, kind)) continue;
-                    if (tokenInSlice(out[0..n], session.token)) continue;
-
-                    if (lower_bound) |lower| {
-                        if (std.mem.order(u8, &session.token, &lower) != .gt) continue;
-                    }
-                    if (wrapped) {
-                        if (original_cursor) |upper| {
-                            if (std.mem.order(u8, &session.token, &upper) == .gt) continue;
-                        }
-                    }
-                    if (candidate == null or std.mem.order(u8, &session.token, &candidate.?) == .lt) {
-                        candidate = session.token;
-                    }
-                }
+        var n: usize = 0;
+        var entries = self.token_index.iterator();
+        while (entries.next()) |entry| {
+            if (builtin.is_test)
+                _ = self.token_index_dirty_candidate_visits.fetchAdd(1, .monotonic);
+            const dirty = switch (kind) {
+                .publish => entry.value_ptr.dirty_rows,
+                .projection => entry.value_ptr.projection_dirty_rows,
+            };
+            if (dirty == 0) continue;
+            const token = entry.key_ptr.*;
+            var lo: usize = 0;
+            var hi = n;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (dirtyTokenOrder(token, out[mid], original_cursor) == .lt)
+                    hi = mid
+                else
+                    lo = mid + 1;
             }
-
-            if (candidate) |token| {
-                out[n] = token;
-                n += 1;
-                lower_bound = token;
-                continue;
-            }
-            if (wrapped) break;
-            // Complete the circular scan at the smallest token. The ordering is
-            // by token value, not hash-map position, so this remains fair even
-            // when the previous cursor token was removed between calls.
-            wrapped = true;
-            lower_bound = null;
+            if (lo == out.len) continue;
+            const end = @min(n, out.len - 1);
+            std.mem.copyBackwards(Token, out[lo + 1 .. end + 1], out[lo..end]);
+            out[lo] = token;
+            n = @min(n + 1, out.len);
         }
-
         if (n != 0) cursor_ptr.* = out[n - 1];
         return out[0..n];
     }
 
-    fn sessionDirty(session: Session, kind: DirtyKind) bool {
-        return switch (kind) {
-            .publish => session.replica_dirty,
-            .projection => session.replica_projection_dirty,
-        };
+    fn dirtyTokenOrder(a: Token, b: Token, cursor: ?Token) std.math.Order {
+        if (cursor) |lower| {
+            const a_after = std.mem.order(u8, &a, &lower) == .gt;
+            const b_after = std.mem.order(u8, &b, &lower) == .gt;
+            if (a_after != b_after) return if (a_after) .lt else .gt;
+        }
+        return std.mem.order(u8, &a, &b);
     }
 
     fn tokenInSlice(tokens: []const Token, needle: Token) bool {
@@ -4965,12 +5278,56 @@ pub const SessionStore = struct {
         return out;
     }
 
+    // Reserve both the canonical folded owner and its exact-key slot before
+    // publishing an account. A prepared caller owns `staged` until commit.
+    fn reserveFoldedInsert(self: *SessionStore, account: []const u8) std.mem.Allocator.Error!FoldedInsert {
+        if (self.folded_index.getPtr(account)) |group| {
+            try group.keys.ensureUnusedCapacity(self.allocator, 1);
+            return .{};
+        }
+        try self.folded_index.ensureUnusedCapacity(1);
+        var staged: FoldedInsert = .{};
+        errdefer staged.deinit(self.allocator);
+        staged.key = try lifecycleFold(self.allocator, account);
+        try staged.group.keys.ensureUnusedCapacity(self.allocator, 1);
+        return staged;
+    }
+    fn publishFoldedInsert(self: *SessionStore, exact_key: []const u8, staged: *FoldedInsert) void {
+        if (staged.key) |key| {
+            staged.group.keys.appendAssumeCapacity(exact_key);
+            self.folded_index.putAssumeCapacityNoClobber(key, staged.group);
+            staged.* = .{};
+        } else {
+            const group = self.folded_index.getPtr(exact_key) orelse unreachable;
+            group.keys.appendAssumeCapacity(exact_key);
+        }
+    }
+    fn removeFoldedKey(self: *SessionStore, exact_key: []const u8) void {
+        const entry = self.folded_index.getEntry(exact_key) orelse unreachable;
+        for (entry.value_ptr.keys.items, 0..) |key, i| {
+            if (!std.mem.eql(u8, key, exact_key)) continue;
+            _ = entry.value_ptr.keys.swapRemove(i);
+            if (entry.value_ptr.keys.items.len == 0) {
+                const canonical = entry.key_ptr.*;
+                entry.value_ptr.deinit(self.allocator);
+                self.folded_index.removeByPtr(entry.key_ptr);
+                self.allocator.free(canonical);
+            }
+            return;
+        }
+        unreachable;
+    }
+
     fn ensureAccount(self: *SessionStore, account: []const u8) Error!*SessionList {
         if (self.accounts.getPtr(account)) |list| return list;
         if (self.accounts.count() >= self.cfg.max_accounts) return error.TooManyAccounts;
         const owned = try self.allocator.dupe(u8, account);
         errdefer self.allocator.free(owned);
-        try self.accounts.putNoClobber(owned, .{});
+        try self.accounts.ensureUnusedCapacity(1);
+        var staged = try self.reserveFoldedInsert(owned);
+        defer staged.deinit(self.allocator);
+        self.accounts.putAssumeCapacityNoClobber(owned, .{});
+        self.publishFoldedInsert(owned, &staged);
         return self.accounts.getPtr(account).?;
     }
 
@@ -5259,6 +5616,7 @@ pub const SessionStore = struct {
             self.removeAttachmentIndexLocked(session);
         }
         entry.value_ptr.deinit(self.allocator);
+        self.removeFoldedKey(owned_key);
         self.accounts.removeByPtr(entry.key_ptr);
         self.allocator.free(owned_key);
     }
@@ -5637,6 +5995,7 @@ test "Session lifecycle batch every mixed allocation aborts canonical OLD and re
             try testing.expectEqual(error.OutOfMemory, err);
             try testing.expectEqual(old, try lifecycleCanonical(&s));
             try testing.expect(s.active_lifecycle == null);
+            try expectTokenIndexCoherent(&s);
             failing.fail_index = std.math.maxInt(usize);
             var retry = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
             defer retry.deinit();
@@ -6158,6 +6517,20 @@ fn expectTokenIndexCoherent(store: *SessionStore) !void {
     store.lock.lockShared();
     defer store.lock.unlockShared();
 
+    var folded_key_count: usize = 0;
+    var folded_groups = store.folded_index.iterator();
+    while (folded_groups.next()) |folded| {
+        try testing.expect(folded.value_ptr.keys.items.len != 0);
+        for (folded.key_ptr.*) |byte| try testing.expect(byte == std.ascii.toLower(byte));
+        for (folded.value_ptr.keys.items, 0..) |key, i| {
+            try testing.expect(std.ascii.eqlIgnoreCase(folded.key_ptr.*, key));
+            const account = store.accounts.getEntry(key) orelse return error.TestUnexpectedResult;
+            try testing.expect(account.key_ptr.*.ptr == key.ptr);
+            for (folded.value_ptr.keys.items[i + 1 ..]) |later| try testing.expect(!std.mem.eql(u8, key, later));
+            folded_key_count += 1;
+        }
+    }
+    try testing.expectEqual(store.accounts.count(), folded_key_count);
     var indexed_rows: usize = 0;
     var entries = store.token_index.iterator();
     while (entries.next()) |map_entry| {
@@ -6388,10 +6761,21 @@ test "exact rebind token-index work ignores unrelated registry cardinality" {
         );
     }
 
+    const old = try lifecycleCanonical(&s);
+    try testing.expect(s.prepareExactAttachmentRebind("alice", 9002, tokenNumber(0xDEAD), stable) == null);
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    var aborted = s.prepareExactAttachmentRebind("alice", 9002, resume_token, stable) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), aborted.accountRows().len);
+    aborted.abort();
+    aborted.deinit();
+    try testing.expectEqual(old, try lifecycleCanonical(&s));
+    try expectTokenIndexCoherent(&s);
     s.resetTokenIndexComplexity();
     var prepared = s.prepareExactAttachmentRebind("alice", 9002, resume_token, stable) orelse
         return error.TestUnexpectedResult;
     defer prepared.deinit();
+    try testing.expectEqual(@as(usize, 2), prepared.accountRows().len);
     try testing.expect(prepared.commit());
     prepared.finish();
     const complexity = s.tokenIndexComplexitySnapshot();
@@ -6399,6 +6783,10 @@ test "exact rebind token-index work ignores unrelated registry cardinality" {
     // guards required to freeze both token groups during exact rebind.
     try testing.expectEqual(@as(usize, 5), complexity.lookups);
     try testing.expectEqual(@as(usize, 2), complexity.group_row_visits);
+    // Three folded-key passes and the claimant/snapshot row visits stay local
+    // to the two matching spellings despite the 512 unrelated accounts.
+    try testing.expectEqual(@as(usize, 6), complexity.folded_key_visits);
+    try testing.expectEqual(@as(usize, 4), complexity.folded_row_visits);
     try expectTokenIndexCoherent(&s);
 }
 
@@ -7900,6 +8288,63 @@ test "portable resume issuance is explicit and resets on a normal re-attach" {
     try testing.expectEqual(true, s.resumeHandleForClient("alice", 1).?.portable);
 }
 
+test "token publication counters: idempotent dirty retry is a suppressed duplicate, not a rotation" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(1), 10);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    s.resetTokenPublicationStats();
+
+    // First arm queues one publication; neither counter moves.
+    try testing.expect(s.markTokenReplicaDirty(tok(1)));
+    var stats = s.tokenPublicationStatsSnapshot();
+    try testing.expectEqual(@as(usize, 0), stats.rotations_required);
+    try testing.expectEqual(@as(usize, 0), stats.duplicate_publications_suppressed);
+
+    // Idempotent retry while the group is still dirty is absorbed by the
+    // existing dirty bit: suppressed duplicate, never a required rotation.
+    try testing.expect(s.markTokenReplicaDirty(tok(1)));
+    stats = s.tokenPublicationStatsSnapshot();
+    try testing.expectEqual(@as(usize, 0), stats.rotations_required);
+    try testing.expectEqual(@as(usize, 1), stats.duplicate_publications_suppressed);
+
+    // After acceptance clears the bit, re-arming is fresh work again.
+    try testing.expect(s.clearTokenReplicaDirty(tok(1)));
+    try testing.expect(s.markTokenReplicaDirty(tok(1)));
+    stats = s.tokenPublicationStatsSnapshot();
+    try testing.expectEqual(@as(usize, 0), stats.rotations_required);
+    try testing.expectEqual(@as(usize, 1), stats.duplicate_publications_suppressed);
+}
+
+test "token publication counters: portable token rotation on re-attach requires reissue only" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+
+    _ = try s.attach("alice", 1, tok(1), 10);
+    try testing.expect(s.markPortableResumeIssued("alice", 1));
+    s.resetTokenPublicationStats();
+
+    // Real rotation: a portable group is replaced by a different token, so a
+    // fresh credential must be issued for the new token.
+    _ = try s.attach("alice", 1, tok(2), 20);
+    var stats = s.tokenPublicationStatsSnapshot();
+    try testing.expectEqual(@as(usize, 1), stats.rotations_required);
+    try testing.expectEqual(@as(usize, 0), stats.duplicate_publications_suppressed);
+
+    // Idempotent re-attach with the same token rotates nothing.
+    _ = try s.attach("alice", 1, tok(2), 30);
+    stats = s.tokenPublicationStatsSnapshot();
+    try testing.expectEqual(@as(usize, 1), stats.rotations_required);
+    try testing.expectEqual(@as(usize, 0), stats.duplicate_publications_suppressed);
+
+    // Rotating a token that was never issued as portable requires no reissue.
+    _ = try s.attach("alice", 1, tok(3), 40);
+    stats = s.tokenPublicationStatsSnapshot();
+    try testing.expectEqual(@as(usize, 1), stats.rotations_required);
+    try testing.expectEqual(@as(usize, 0), stats.duplicate_publications_suppressed);
+}
+
 test "attach reports portable authority displaced by same-client replacement" {
     var s = SessionStore.init(testing.allocator);
     defer s.deinit();
@@ -8384,12 +8829,13 @@ test "prepared bootstrap is leak-clean and non-destructive at every allocation f
             if (!s.markDetachedWithSnapshot("alice", 1, "target-state")) return error.OutOfMemory;
             if (!s.markDetachedWithSnapshot("alice", 2, "other-state")) return error.OutOfMemory;
 
-            var prepared = s.prepareBootstrapTokenAttach(
+            var prepared = s.prepareBootstrapTokenAttachWithAttachment(
                 "alice",
                 3,
                 target,
                 .join_existing,
                 30,
+                aid(0xD5),
             ) orelse {
                 var rows: [2]Session = undefined;
                 const unchanged = s.sessionsInto("alice", &rows);
@@ -8403,6 +8849,7 @@ test "prepared bootstrap is leak-clean and non-destructive at every allocation f
             prepared.finish();
             try testing.expect(s.clientHasToken("alice", 3, target));
             try testing.expect(s.findDetachedTokenSessionInAccount("alice", unrelated) != null);
+            try testing.expect(s.resumeHandleForClient("alice", 3).?.attachment_id.?.eql(aid(0xD5)));
             try expectTokenIndexCoherent(&s);
         }
     };
@@ -8795,6 +9242,101 @@ test "join and adopt OR dirty portable state across token groups" {
         try testing.expect(session.portable_resume);
         try testing.expect(session.replica_dirty);
     }
+}
+
+test "token retry collection visits groups once independent of attachments and batch size" {
+    const groups = 19;
+    const siblings = 17;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.initWithConfig(failing.allocator(), .{ .max_sessions_per_account = siblings });
+    defer s.deinit();
+    for (0..groups) |group| {
+        var account_buf: [32]u8 = undefined;
+        const account = try std.fmt.bufPrint(&account_buf, "retry-group-{d}", .{group});
+        const token = tokenNumber(group + 1);
+        for (0..siblings) |row| {
+            _ = try s.attach(account, @intCast(group * siblings + row + 1), token, @intCast(row));
+        }
+        // Deliberately leave alternating groups clean to exercise the cached
+        // dirty predicate rather than merely enumerating all indexed keys.
+        if (group % 2 == 0) {
+            try testing.expect(s.markPortableResumeIssued(account, @intCast(group * siblings + 1)));
+            try testing.expect(s.markTokenReplicaDirty(token));
+            try testing.expect(s.markTokenReplicaProjectionDirty(token));
+        }
+    }
+    failing.fail_index = failing.alloc_index;
+    var work: [32]Token = undefined;
+    // Exhaust every output capacity and cursors on dirty, clean, absent,
+    // before-first and after-last keys. The numeric oracle is independent of
+    // the collector's comparator and hash-map iteration order.
+    const dirty_groups = (groups + 1) / 2;
+    for (0..groups + 3) |cursor_value| {
+        const cursor = if (cursor_value == 0) null else tokenNumber(cursor_value);
+        const first = @min((cursor_value + 1) / 2, dirty_groups) % dirty_groups;
+        for (0..work.len + 1) |batch_size| {
+            for ([_]SessionStore.DirtyKind{ .publish, .projection }) |kind| {
+                s.dirty_scan_cursor = cursor;
+                s.projection_scan_cursor = cursor;
+                s.resetTokenIndexComplexity();
+                const result = if (kind == .publish)
+                    s.dirtyPortableTokensInto(work[0..batch_size])
+                else
+                    s.dirtyProjectionTokensInto(work[0..batch_size]);
+                try testing.expectEqual(@min(batch_size, dirty_groups), result.len);
+                for (result, 0..) |token, i| {
+                    const expected = tokenNumber(((first + i) % dirty_groups) * 2 + 1);
+                    try testing.expectEqualSlices(u8, &expected, &token);
+                }
+                const complexity = s.tokenIndexComplexitySnapshot();
+                try testing.expectEqual(@as(usize, if (batch_size == 0) 0 else groups), complexity.dirty_candidate_visits);
+                try testing.expectEqual(@as(usize, 0), complexity.group_row_visits);
+                // Collecting either lane must leave the other cursor alone.
+                const untouched = if (kind == .publish) s.projection_scan_cursor else s.dirty_scan_cursor;
+                try testing.expectEqual(cursor, untouched);
+                if (batch_size == 0) {
+                    const retained = if (kind == .publish) s.dirty_scan_cursor else s.projection_scan_cursor;
+                    try testing.expectEqual(cursor, retained);
+                }
+            }
+        }
+    }
+    try testing.expect(!failing.has_induced_failure);
+}
+
+test "account inventory retry retains nonportable siblings without widening credential authority" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var store = SessionStore.init(failing.allocator());
+    defer store.deinit();
+    _ = try store.attachWithAttachment("alice", 1, tok(0x71), aid(1), 10);
+    _ = try store.attachWithAttachment("alice", 2, tok(0x71), aid(2), 20);
+    _ = try store.attachWithAttachment("bob", 3, tok(0x72), aid(3), 30);
+    try testing.expect(!store.markTokenReplicaDirty(tok(0x71)));
+    failing.fail_index = failing.alloc_index;
+    defer failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(store.markTokenInventoryDirty(tok(0x71)));
+    try testing.expectEqual(@as(usize, 2), store.dirtyReplicaRowCount());
+    var tokens: [2]Token = undefined;
+    const selected = store.dirtyReplicaTokensInto(&tokens);
+    try testing.expectEqual(@as(usize, 1), selected.len);
+    try testing.expectEqualSlices(u8, &tok(0x71), &selected[0]);
+    var rows: [2]Session = undefined;
+    for (store.sessionsInto("alice", &rows)) |row| {
+        try testing.expect(!row.portable_resume);
+        try testing.expect(row.replica_dirty);
+    }
+    try testing.expect(store.clearTokenReplicaDirty(tok(0x71)));
+    try testing.expectEqual(@as(usize, 0), store.dirtyReplicaTokensInto(&tokens).len);
+    try testing.expect(!store.markTokenInventoryDirty(tok(0)));
+    try testing.expect(!store.markTokenInventoryDirty(tok(0x73)));
+    const selector: ExactSelector = .{ .client = 1, .token = tok(0x71), .signon_ms = 10, .attachment_id = aid(1) };
+    try testing.expectEqual(ReserveDropResult.reserved, store.reserveDrop("alice", selector, 7));
+    try testing.expect(!store.markTokenInventoryDirty(tok(0x71)));
+    try testing.expectEqual(@as(usize, 0), store.dirtyReplicaRowCount());
+    try testing.expect(store.cancelDropReservation("alice", selector, 7));
+    try testing.expect(store.markTokenInventoryDirty(tok(0x71)));
+    try testing.expect(!failing.has_induced_failure);
+    try expectTokenIndexCoherent(&store);
 }
 
 test "bounded dirty collection rotates past an uncleared failing token" {
@@ -9471,8 +10013,7 @@ test "Session lifecycle batch final removal avoids detached cap eviction and pre
 test "Session lifecycle batch limits refuse entire plan and existing empty account remains capacity" {
     var s = SessionStore.initWithConfig(testing.allocator, .{ .max_accounts = 1, .max_sessions_per_account = 2 });
     defer s.deinit();
-    const key = try testing.allocator.dupe(u8, "Alice");
-    try s.accounts.put(key, .{});
+    _ = try s.ensureAccount("Alice");
     const old = try lifecycleCanonical(&s);
     const ops = [_]LifecycleRequest{.{ .request_id = 1, .intent = .{ .admit = .{ .account = "Alice", .client = 1, .signon_ms = 10, .kind = .fresh } } }};
     try testing.expectError(error.InvalidRequest, s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &.{} }));
@@ -9815,4 +10356,337 @@ test "Session lifecycle batch contradictory chained journal intents refuse every
         try testing.expectEqual(old, try lifecycleCanonical(&s));
         try testing.expect(s.active_lifecycle == null);
     }
+}
+
+test "prepared bootstrap physical identity rejects collisions and survives abort retry" {
+    var store = SessionStore.init(testing.allocator);
+    defer store.deinit();
+    const token = tok(0xD9);
+    _ = try store.attach("alice", 1, token, 10);
+    var abandoned = store.prepareBootstrapTokenAttachWithAttachment("alice", 2, token, .join_existing, 20, aid(0xD9)) orelse return error.TestUnexpectedResult;
+    try testing.expect(abandoned.accountRows()[1].attachment_id.?.eql(aid(0xD9)));
+    abandoned.abort();
+    abandoned.deinit();
+    try testing.expect(store.resumeHandleForClient("alice", 2) == null);
+    var prepared = store.prepareBootstrapTokenAttachWithAttachment("alice", 2, token, .join_existing, 20, aid(0xD9)) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    _ = prepared.commit();
+    prepared.finish();
+    try testing.expect(store.resumeHandleForClient("alice", 2).?.attachment_id.?.eql(aid(0xD9)));
+    try testing.expect(store.prepareBootstrapTokenAttachWithAttachment("alice", 3, token, .join_existing, 30, aid(0xD9)) == null);
+    try testing.expect(store.prepareBootstrapTokenAttachWithAttachment("bob", 4, tok(0xDA), .{ .adopt_verified = true }, 30, aid(0xD9)) == null);
+    try testing.expect(store.prepareBootstrapTokenAttachWithAttachment("alice", 3, token, .join_existing, 30, .{ .raw = @splat(0) }) == null);
+    try expectTokenIndexCoherent(&store);
+}
+
+const PhysicalAbsenceProbe = struct {
+    store: *SessionStore,
+    other: *SessionStore,
+    client: ClientId,
+    called: bool = false,
+    fail: bool = false,
+    fn callback(self: *@This(), witness: *const PhysicalAbsence) !void {
+        self.called = true;
+        try witness.requireReady(self.store, self.client);
+        try testing.expectError(error.WrongStore, witness.requireReady(self.other, self.client));
+        try testing.expectError(error.WrongClient, witness.requireReady(self.store, self.client + 1));
+        if (self.fail) return error.CallbackFailure;
+    }
+};
+
+test "physical absence scans every account and all row kinds without allocation or mutation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = SessionStore.init(failing.allocator());
+    defer s.deinit();
+    var other = SessionStore.init(testing.allocator);
+    defer other.deinit();
+    const active: ClientId = 0x0000000100000007;
+    const next_generation: ClientId = 0x0000000200000007;
+    const sentinel: ClientId = 20;
+    const portable: ClientId = 30;
+    const reserved: ClientId = 40;
+    _ = try s.attach("Other", active, tok(1), 10);
+    _ = try s.attach("Sentinel", sentinel, @splat(0), 20);
+    _ = try s.attachWithAttachment("Portable", portable, tok(3), aid(3), 30);
+    try testing.expect(s.markPortableResumeIssued("Portable", portable));
+    try testing.expect(s.markDetachedWithSnapshot("Portable", portable, "private-snapshot"));
+    const row = try s.attachWithAttachment("Reserved", reserved, tok(4), aid(4), 40);
+    const selector = lifecycleSelector("Reserved", row).exact;
+    try testing.expectEqual(ReserveDropResult.reserved, s.reserveDrop("Reserved", selector, 99));
+    const before = try lifecycleCanonical(&s);
+    const allocations = failing.alloc_index;
+    failing.fail_index = failing.alloc_index;
+    var probe = PhysicalAbsenceProbe{ .store = &s, .other = &other, .client = next_generation };
+    try s.withPhysicalAbsence(next_generation, &probe, PhysicalAbsenceProbe.callback);
+    try testing.expect(probe.called);
+    for ([_]ClientId{ active, sentinel, portable, reserved }) |id| {
+        probe.called = false;
+        try testing.expectError(error.PhysicalAuthorityPresent, s.withPhysicalAbsence(id, &probe, PhysicalAbsenceProbe.callback));
+        try testing.expect(!probe.called);
+    }
+    try testing.expectEqual(allocations, failing.alloc_index);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(before, try lifecycleCanonical(&s));
+    try testing.expect(s.validateDropReservation("Reserved", selector, 99));
+    try testing.expect(s.cancelDropReservation("Reserved", selector, 99));
+}
+
+test "physical absence propagates callback error and releases exclusive lock" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    var other = SessionStore.init(testing.allocator);
+    defer other.deinit();
+    var probe = PhysicalAbsenceProbe{ .store = &s, .other = &other, .client = 7, .fail = true };
+    try testing.expectError(error.CallbackFailure, s.withPhysicalAbsence(7, &probe, PhysicalAbsenceProbe.callback));
+    probe.fail = false;
+    probe.called = false;
+    try s.withPhysicalAbsence(7, &probe, PhysicalAbsenceProbe.callback);
+    try testing.expect(probe.called);
+}
+
+test "physical absence refuses a retained SessionStore ticket and recovers" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    var other = SessionStore.init(testing.allocator);
+    defer other.deinit();
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &.{}, .observation_only = .{ .account = "not-created", .client = 8 } });
+    var probe = PhysicalAbsenceProbe{ .store = &s, .other = &other, .client = 8 };
+    try testing.expectError(error.Busy, s.withPhysicalAbsence(8, &probe, PhysicalAbsenceProbe.callback));
+    try testing.expect(!probe.called);
+    ticket.abort();
+    ticket.deinit();
+    try s.withPhysicalAbsence(8, &probe, PhysicalAbsenceProbe.callback);
+    try testing.expect(probe.called);
+}
+
+test "physical absence fails closed when exclusive acquisition generation is exhausted" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    var other = SessionStore.init(testing.allocator);
+    defer other.deinit();
+    s.lock.exclusive_generation_exhausted.store(true, .release);
+    var probe = PhysicalAbsenceProbe{ .store = &s, .other = &other, .client = 1 };
+    try testing.expectError(error.ExclusiveAcquisitionExhausted, s.withPhysicalAbsence(1, &probe, PhysicalAbsenceProbe.callback));
+    try testing.expect(!probe.called);
+    try testing.expect(s.lock.tryLockExclusive());
+    s.lock.unlockExclusive();
+}
+
+const PhysicalAbsenceThreadProbe = struct {
+    store: *SessionStore,
+    client: ClientId,
+    outcome: ?PhysicalAbsenceError = null,
+    const Work = struct {
+        probe: *PhysicalAbsenceThreadProbe,
+        witness: *const PhysicalAbsence,
+        fn run(self: *@This()) void {
+            self.witness.requireReady(self.probe.store, self.probe.client) catch |err| {
+                self.probe.outcome = err;
+                return;
+            };
+        }
+    };
+    fn callback(self: *@This(), witness: *const PhysicalAbsence) !void {
+        var work = Work{ .probe = self, .witness = witness };
+        const thread = try std.Thread.spawn(.{}, Work.run, .{&work});
+        thread.join();
+        try testing.expectEqual(@as(?PhysicalAbsenceError, error.WrongCaller), self.outcome);
+        try witness.requireReady(self.store, self.client);
+    }
+};
+
+test "physical absence witness rejects a foreign thread while the callback remains live" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    var probe = PhysicalAbsenceThreadProbe{ .store = &s, .client = 8 };
+    try s.withPhysicalAbsence(8, &probe, PhysicalAbsenceThreadProbe.callback);
+}
+
+test "folded account bind visits only selected variants and survives key retirement" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attach("Alice", 1, tok(1), 10);
+    _ = try s.attach("ALICE", 2, tok(2), 20);
+    for (0..512) |i| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "unrelated-{d}", .{i});
+        _ = try s.attach(name, @intCast(i + 100), tokenNumber(i + 100), @intCast(i));
+    }
+    s.resetTokenIndexComplexity();
+    var ticket = s.prepareTokenBind("Alice", 1, tok(1), .join_existing) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), ticket.accountRows().len);
+    try testing.expectEqual(@as(ClientId, 1), ticket.accountRows()[0].client);
+    try testing.expectEqual(@as(ClientId, 2), ticket.accountRows()[1].client);
+    ticket.abort();
+    ticket.deinit();
+    const cost = s.tokenIndexComplexitySnapshot();
+    try testing.expectEqual(@as(usize, 4), cost.folded_key_visits);
+    try testing.expectEqual(@as(usize, 2), cost.folded_row_visits);
+    try testing.expect(s.remove("Alice", 1));
+    try expectTokenIndexCoherent(&s);
+    var retained = s.prepareTokenBind("ALICE", 2, tok(2), .join_existing) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), retained.accountRows().len);
+    retained.abort();
+    retained.deinit();
+    _ = try s.attach("aLiCe", 2, tok(3), 30);
+    if (s.prepareTokenBind("ALICE", 2, tok(2), .join_existing)) |value| {
+        var unexpected = value;
+        unexpected.abort();
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    }
+    try expectTokenIndexCoherent(&s);
+}
+
+test "folded account index follows staged lifecycle replacement" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    const first = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+    _ = try s.attachWithAttachment("ALICE", 2, tok(2), aid(2), 20);
+    const ops = [_]LifecycleRequest{
+        .{ .request_id = 1, .intent = .{ .remove = .{ .source = lifecycleSelector("Alice", first), .reason = .logout } } },
+        .{ .request_id = 2, .intent = .{ .admit = .{ .account = "aLiCe", .client = 3, .signon_ms = 30, .kind = .fresh } } },
+    };
+    var ticket = try s.prepareLifecycleBatch(.{ .io = testing.io, .operations = &ops });
+    defer ticket.deinit();
+    try ticket.validateForCut();
+    ticket.commit();
+    ticket.finish();
+    try expectTokenIndexCoherent(&s);
+    try testing.expect(!s.accounts.contains("Alice"));
+    try testing.expect(s.accounts.contains("ALICE") and s.accounts.contains("aLiCe"));
+    var bind = s.prepareTokenBind("ALICE", 2, tok(2), .join_existing) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), bind.accountRows().len);
+    bind.abort();
+    bind.deinit();
+}
+
+test "folded account bootstrap insertion sweeps allocations and abort ownership" {
+    const Exercise = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const failing: *testing.FailingAllocator = @ptrCast(@alignCast(a.ptr));
+            var s = SessionStore.init(a);
+            defer s.deinit();
+            _ = try s.attachWithAttachment("Alice", 1, tok(1), aid(1), 10);
+            var aborted = s.prepareBootstrapTokenAttachWithAttachment("ALICE", 2, tok(1), .join_existing, 20, aid(2)) orelse {
+                if (failing.has_induced_failure) return error.OutOfMemory;
+                return error.TestUnexpectedResult;
+            };
+            aborted.abort();
+            aborted.deinit();
+            try expectTokenIndexCoherent(&s);
+            try testing.expect(!s.accounts.contains("ALICE"));
+            var committed = s.prepareBootstrapTokenAttachWithAttachment("ALICE", 2, tok(1), .join_existing, 20, aid(2)) orelse {
+                if (failing.has_induced_failure) return error.OutOfMemory;
+                return error.TestUnexpectedResult;
+            };
+            _ = committed.commit();
+            committed.finish();
+            committed.deinit();
+            try expectTokenIndexCoherent(&s);
+            try testing.expect(s.remove("Alice", 1));
+            try expectTokenIndexCoherent(&s);
+        }
+    };
+    var fallback = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(fallback.allocator(), Exercise.run, .{});
+}
+
+test "folded account bind allocation cuts preserve old group and retry" {
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        if (index >= 1024) return error.TestUnexpectedResult;
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var s = SessionStore.init(failing.allocator());
+        defer s.deinit();
+        _ = try s.attach("Alice", 1, tok(1), 10);
+        _ = try s.attach("ALICE", 2, tok(2), 20);
+        const old = try lifecycleCanonical(&s);
+        failing.fail_index = failing.alloc_index + index;
+        if (s.prepareTokenBind("Alice", 1, tok(2), .join_existing)) |value| {
+            var ticket = value;
+            defer ticket.deinit();
+            try testing.expect(!failing.has_induced_failure);
+            ticket.abort();
+            try testing.expectEqual(old, try lifecycleCanonical(&s));
+            try expectTokenIndexCoherent(&s);
+            break;
+        } else {
+            try testing.expect(failing.has_induced_failure);
+            try testing.expectEqual(old, try lifecycleCanonical(&s));
+            try expectTokenIndexCoherent(&s);
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = s.prepareTokenBind("Alice", 1, tok(2), .join_existing) orelse return error.TestUnexpectedResult;
+            retry.abort();
+            retry.deinit();
+            try expectTokenIndexCoherent(&s);
+        }
+    }
+}
+
+test "folded account bootstrap visits only selected variants and preserves admission" {
+    var s = SessionStore.init(testing.allocator);
+    defer s.deinit();
+    _ = try s.attach("Alice", 1, tok(1), 10);
+    _ = try s.attach("ALICE", 2, tok(2), 20);
+    for (0..512) |i| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "bootstrap-unrelated-{d}", .{i});
+        _ = try s.attach(name, @intCast(i + 100), tokenNumber(i + 100), @intCast(i));
+    }
+    s.resetTokenIndexComplexity();
+    var aborted = s.prepareBootstrapTokenAttachWithAttachment("aLiCe", 3, tok(1), .join_existing, 30, aid(3)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 3), aborted.accountRows().len);
+    try testing.expectEqual(@as(ClientId, 1), aborted.accountRows()[0].client);
+    try testing.expectEqual(@as(ClientId, 2), aborted.accountRows()[1].client);
+    try testing.expectEqual(@as(ClientId, 3), aborted.accountRows()[2].client);
+    aborted.abort();
+    aborted.deinit();
+    const cost = s.tokenIndexComplexitySnapshot();
+    try testing.expectEqual(@as(usize, 4), cost.folded_key_visits);
+    try testing.expectEqual(@as(usize, 4), cost.folded_row_visits);
+    try testing.expect(!s.accounts.contains("aLiCe"));
+    try testing.expect(s.prepareBootstrapTokenAttachWithAttachment("aLiCe", 2, tok(1), .join_existing, 30, aid(3)) == null);
+    try testing.expect(s.prepareBootstrapTokenAttachWithAttachment("other", 3, tok(1), .{ .adopt_verified = true }, 30, aid(3)) == null);
+    var committed = s.prepareBootstrapTokenAttachWithAttachment("aLiCe", 3, tok(1), .join_existing, 30, aid(3)) orelse return error.TestUnexpectedResult;
+    _ = committed.commit();
+    committed.finish();
+    committed.deinit();
+    try expectTokenIndexCoherent(&s);
+    var adopted = s.prepareBootstrapTokenAttachWithAttachment("new-fold", 4, tok(99), .{ .adopt_verified = true }, 40, aid(4)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), adopted.accountRows().len);
+    _ = adopted.commit();
+    adopted.finish();
+    adopted.deinit();
+    try expectTokenIndexCoherent(&s);
+}
+
+test "folded account bootstrap new fold allocation cuts preserve admission" {
+    const Exercise = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const failing: *testing.FailingAllocator = @ptrCast(@alignCast(a.ptr));
+            var s = SessionStore.init(a);
+            defer s.deinit();
+            _ = try s.attach("unrelated", 1, tok(1), 10);
+            var aborted = s.prepareBootstrapTokenAttachWithAttachment("new-fold", 2, tok(2), .{ .adopt_verified = true }, 20, aid(2)) orelse {
+                if (failing.has_induced_failure) return error.OutOfMemory;
+                return error.TestUnexpectedResult;
+            };
+            aborted.abort();
+            aborted.deinit();
+            try testing.expect(!s.accounts.contains("new-fold"));
+            try expectTokenIndexCoherent(&s);
+            var committed = s.prepareBootstrapTokenAttachWithAttachment("new-fold", 2, tok(2), .{ .adopt_verified = true }, 20, aid(2)) orelse {
+                if (failing.has_induced_failure) return error.OutOfMemory;
+                return error.TestUnexpectedResult;
+            };
+            _ = committed.commit();
+            committed.finish();
+            committed.deinit();
+            try expectTokenIndexCoherent(&s);
+        }
+    };
+    var fallback = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(fallback.allocator(), Exercise.run, .{});
 }

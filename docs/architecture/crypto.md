@@ -10,7 +10,7 @@ source tree. Every behavioral claim is cited to `src/`.
 Onyx Server is a clean-room, pure-Zig IRC daemon built from first principles: the daemon,
 substrate, and crypto/TLS library are all written from scratch in Zig, and
 no prior daemon is derived from as source (`README.md:3`, `README.md:133`).
-The pinned toolchain target is Zig 0.17.0-dev.1282+c0f9b51d8 (`build.zig.zon:34`).
+The pinned toolchain target is Zig 0.17.0 (`build.zig.zon`, `minimum_zig_version`).
 
 The crypto and TLS paths covered here are Zig modules built from `std.crypto`
 and local code. For example, X-Wing builds on `std.crypto.kem.ml_kem.MLKem768`

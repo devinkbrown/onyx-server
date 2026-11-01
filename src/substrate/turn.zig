@@ -44,8 +44,8 @@ pub const Method = enum(u12) {
 /// The class bits are spread across positions 4-5 and 8 of the type field
 /// per RFC 5389 §6.
 pub fn encodeMessageType(method: Method, class: Class) u16 {
-    const m: u16 = @intFromEnum(method);
-    const c: u16 = @intFromEnum(class);
+    const m: u16 = @backingInt(method);
+    const c: u16 = @backingInt(class);
     // method bits: M11..M6 in bits 13..8, M5..M4 in bits 6..5, M3..M0 in 3..0
     // class bits:  C1 in bit 7, C0 in bit 4
     const m_lo: u16 = m & 0x00F; // M3..M0  (RFC 5389 §6: M3..M0 → bits 3-0)
@@ -67,7 +67,7 @@ pub fn decodeMessageType(word: u16) error{UnknownMethod}!DecodedType {
     const c0: u16 = (word >> 4) & 0x1;
     const c: u2 = @truncate((c1 << 1) | c0);
     const method = std.enums.fromInt(Method, @as(u12, @truncate(m))) orelse return error.UnknownMethod;
-    const class: Class = @enumFromInt(c);
+    const class: Class = @fromBackingInt(@intCast(c));
     return .{ .method = method, .class = class };
 }
 
@@ -209,7 +209,7 @@ pub fn encodeXorAddr(buf: []u8, addr: XorAddr, port: u16, txn_id: *const TxnId) 
         .v4 => |raw| {
             std.debug.assert(buf.len >= 8);
             buf[0] = 0x00; // reserved
-            buf[1] = @intFromEnum(AddrFamily.v4);
+            buf[1] = @backingInt(AddrFamily.v4);
             const xport: u16 = port ^ @as(u16, @truncate(magic_cookie >> 16));
             mem.writeInt(u16, buf[2..4], xport, .big);
             const mc_bytes: [4]u8 = @bitCast(std.mem.nativeToBig(u32, magic_cookie));
@@ -218,7 +218,7 @@ pub fn encodeXorAddr(buf: []u8, addr: XorAddr, port: u16, txn_id: *const TxnId) 
         .v6 => |raw| {
             std.debug.assert(buf.len >= 20);
             buf[0] = 0x00;
-            buf[1] = @intFromEnum(AddrFamily.v6);
+            buf[1] = @backingInt(AddrFamily.v6);
             const xport: u16 = port ^ @as(u16, @truncate(magic_cookie >> 16));
             mem.writeInt(u16, buf[2..4], xport, .big);
             const mc_bytes: [4]u8 = @bitCast(std.mem.nativeToBig(u32, magic_cookie));
@@ -267,8 +267,8 @@ pub fn decodeXorAddr(buf: []const u8, txn_id: *const TxnId) XorAddrDecodeError!D
 pub const TransportProto = enum(u8) { udp = 0x11 };
 
 pub fn encodeRequestedTransport(buf: []u8, proto: TransportProto) usize {
-    var value: [4]u8 = .{ @intFromEnum(proto), 0, 0, 0 };
-    return encodeAttr(buf, @intFromEnum(AttrType.requested_transport), &value);
+    var value: [4]u8 = .{ @backingInt(proto), 0, 0, 0 };
+    return encodeAttr(buf, @backingInt(AttrType.requested_transport), &value);
 }
 
 pub fn decodeRequestedTransport(value: []const u8) error{MalformedAttribute}!TransportProto {
@@ -283,7 +283,7 @@ pub fn decodeRequestedTransport(value: []const u8) error{MalformedAttribute}!Tra
 pub fn encodeLifetime(buf: []u8, seconds: u32) usize {
     var value: [4]u8 = undefined;
     mem.writeInt(u32, &value, seconds, .big);
-    return encodeAttr(buf, @intFromEnum(AttrType.lifetime), &value);
+    return encodeAttr(buf, @backingInt(AttrType.lifetime), &value);
 }
 
 pub fn decodeLifetime(value: []const u8) error{MalformedAttribute}!u32 {
@@ -301,7 +301,7 @@ pub fn encodeChannelNumber(buf: []u8, channel: ChannelNumber) usize {
     var value: [4]u8 = undefined;
     mem.writeInt(u16, value[0..2], channel, .big);
     mem.writeInt(u16, value[2..4], 0, .big);
-    return encodeAttr(buf, @intFromEnum(AttrType.channel_number), &value);
+    return encodeAttr(buf, @backingInt(AttrType.channel_number), &value);
 }
 
 pub fn decodeChannelNumber(value: []const u8) error{MalformedAttribute}!ChannelNumber {
@@ -347,7 +347,7 @@ pub const MessageBuilder = struct {
             .v6 => .v6,
         });
         encodeXorAddr(vbuf[0..vlen], addr, port, &self.txn_id);
-        self.pos += encodeAttr(self.buf[self.pos..], @intFromEnum(AttrType.xor_peer_address), vbuf[0..vlen]);
+        self.pos += encodeAttr(self.buf[self.pos..], @backingInt(AttrType.xor_peer_address), vbuf[0..vlen]);
     }
     pub fn appendXorRelayedAddress(self: *MessageBuilder, addr: XorAddr, port: u16) void {
         var vbuf: [20]u8 = undefined;
@@ -356,10 +356,10 @@ pub const MessageBuilder = struct {
             .v6 => .v6,
         });
         encodeXorAddr(vbuf[0..vlen], addr, port, &self.txn_id);
-        self.pos += encodeAttr(self.buf[self.pos..], @intFromEnum(AttrType.xor_relayed_address), vbuf[0..vlen]);
+        self.pos += encodeAttr(self.buf[self.pos..], @backingInt(AttrType.xor_relayed_address), vbuf[0..vlen]);
     }
     pub fn appendData(self: *MessageBuilder, data: []const u8) void {
-        self.pos += encodeAttr(self.buf[self.pos..], @intFromEnum(AttrType.data), data);
+        self.pos += encodeAttr(self.buf[self.pos..], @backingInt(AttrType.data), data);
     }
     /// Finalise: write the STUN header and return the complete message slice.
     pub fn finish(self: *MessageBuilder) []const u8 {
@@ -538,7 +538,7 @@ test "LIFETIME attribute encode/decode" {
     try testing.expectEqual(@as(usize, 8), written);
     var iter = AttrIter.init(buf[0..written]);
     const attr = (try iter.next()).?;
-    try testing.expectEqual(@intFromEnum(AttrType.lifetime), attr.attr_type);
+    try testing.expectEqual(@backingInt(AttrType.lifetime), attr.attr_type);
     try testing.expectEqual(@as(u32, 600), try decodeLifetime(attr.value));
 }
 
@@ -547,7 +547,7 @@ test "REQUESTED-TRANSPORT attribute encode/decode" {
     try testing.expectEqual(@as(usize, 8), encodeRequestedTransport(&buf, .udp));
     var iter = AttrIter.init(&buf);
     const attr = (try iter.next()).?;
-    try testing.expectEqual(@intFromEnum(AttrType.requested_transport), attr.attr_type);
+    try testing.expectEqual(@backingInt(AttrType.requested_transport), attr.attr_type);
     try testing.expectEqual(TransportProto.udp, try decodeRequestedTransport(attr.value));
 }
 
@@ -556,7 +556,7 @@ test "CHANNEL-NUMBER attribute encode/decode" {
     try testing.expectEqual(@as(usize, 8), encodeChannelNumber(&buf, 0x4001));
     var iter = AttrIter.init(&buf);
     const attr = (try iter.next()).?;
-    try testing.expectEqual(@intFromEnum(AttrType.channel_number), attr.attr_type);
+    try testing.expectEqual(@backingInt(AttrType.channel_number), attr.attr_type);
     try testing.expectEqual(@as(ChannelNumber, 0x4001), try decodeChannelNumber(attr.value));
 }
 
@@ -619,10 +619,10 @@ test "Allocate request round-trip" {
     var found_lifetime: bool = false;
     var iter = AttrIter.init(parsed.attrs);
     while (try iter.next()) |attr| {
-        if (attr.attr_type == @intFromEnum(AttrType.requested_transport)) {
+        if (attr.attr_type == @backingInt(AttrType.requested_transport)) {
             try testing.expectEqual(TransportProto.udp, try decodeRequestedTransport(attr.value));
             found_transport = true;
-        } else if (attr.attr_type == @intFromEnum(AttrType.lifetime)) {
+        } else if (attr.attr_type == @backingInt(AttrType.lifetime)) {
             try testing.expectEqual(@as(u32, 3600), try decodeLifetime(attr.value));
             found_lifetime = true;
         }
@@ -643,7 +643,7 @@ test "Allocate success response with XOR-RELAYED-ADDRESS (IPv4)" {
     var iter = AttrIter.init(parsed.attrs);
     var found: bool = false;
     while (try iter.next()) |attr| {
-        if (attr.attr_type == @intFromEnum(AttrType.xor_relayed_address)) {
+        if (attr.attr_type == @backingInt(AttrType.xor_relayed_address)) {
             const dec = try decodeXorAddr(attr.value, &txn);
             try testing.expectEqual(@as(u16, 49152), dec.port);
             try testing.expectEqualSlices(u8, &relay_ip4, &dec.addr.v4);
@@ -664,7 +664,7 @@ test "Allocate success response with XOR-RELAYED-ADDRESS (IPv6)" {
     var iter = AttrIter.init(parsed.attrs);
     var found: bool = false;
     while (try iter.next()) |attr| {
-        if (attr.attr_type == @intFromEnum(AttrType.xor_relayed_address)) {
+        if (attr.attr_type == @backingInt(AttrType.xor_relayed_address)) {
             const dec = try decodeXorAddr(attr.value, &txn);
             try testing.expectEqual(@as(u16, 1234), dec.port);
             try testing.expectEqualSlices(u8, &relay_ip6, &dec.addr.v6);
@@ -690,10 +690,10 @@ test "ChannelBind request round-trip" {
     var found_ch: bool = false;
     var found_peer: bool = false;
     while (try iter.next()) |attr| {
-        if (attr.attr_type == @intFromEnum(AttrType.channel_number)) {
+        if (attr.attr_type == @backingInt(AttrType.channel_number)) {
             try testing.expectEqual(@as(ChannelNumber, 0x4002), try decodeChannelNumber(attr.value));
             found_ch = true;
-        } else if (attr.attr_type == @intFromEnum(AttrType.xor_peer_address)) {
+        } else if (attr.attr_type == @backingInt(AttrType.xor_peer_address)) {
             const dec = try decodeXorAddr(attr.value, &txn);
             try testing.expectEqual(@as(u16, 5004), dec.port);
             try testing.expectEqualSlices(u8, &peer_ip4, &dec.addr.v4);
@@ -716,7 +716,7 @@ test "Send indication with DATA attribute round-trip" {
     try testing.expectEqual(Class.indication, dt.class);
     var iter = AttrIter.init(parsed.attrs);
     const attr = (try iter.next()).?;
-    try testing.expectEqual(@intFromEnum(AttrType.data), attr.attr_type);
+    try testing.expectEqual(@backingInt(AttrType.data), attr.attr_type);
     try testing.expectEqualSlices(u8, "hello peer", attr.value);
 }
 
@@ -776,7 +776,7 @@ test "CreatePermission request round-trip" {
     try testing.expectEqual(Class.request, dt.class);
     var iter = AttrIter.init(parsed.attrs);
     const attr = (try iter.next()).?;
-    try testing.expectEqual(@intFromEnum(AttrType.xor_peer_address), attr.attr_type);
+    try testing.expectEqual(@backingInt(AttrType.xor_peer_address), attr.attr_type);
     const dec = try decodeXorAddr(attr.value, &txn);
     try testing.expectEqualSlices(u8, &peer_ip4, &dec.addr.v4);
 }

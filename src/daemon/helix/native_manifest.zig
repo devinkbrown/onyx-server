@@ -131,7 +131,7 @@ pub fn send(fd: i32, identity: exchange.Identity, rows: []const Row, deadline: i
             const offset = item * row_size;
             std.mem.writeInt(i32, payload[offset..][0..4], row.canonical, .big);
             std.mem.writeInt(u16, payload[offset + 4 ..][0..2], row.shard, .big);
-            payload[offset + 6] = @intFromEnum(row.role);
+            payload[offset + 6] = @backingInt(row.role);
             payload[offset + 7] = row.family;
             fds[item] = row.fd;
         }
@@ -262,8 +262,8 @@ test "native Helix descriptor manifest rejects duplicate authority and invalid f
 test "native Helix descriptor manifest reserves a distinct presence lease role and capacity" {
     try std.testing.expect(std.enums.fromInt(Role, 7) != null);
     try std.testing.expectEqual(@as(usize, @import("live.zig").max_inherited_state_fds + 515), max_entries);
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(Role.client));
-    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(Role.s2s_listener));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(Role.client));
+    try std.testing.expectEqual(@as(u8, 6), @backingInt(Role.s2s_listener));
 }
 
 test "native Helix service carry: complete singleton pair has strict shape and no canonical aliases" {
@@ -271,8 +271,8 @@ test "native Helix service carry: complete singleton pair has strict shape and n
     const lease: Row = .{ .canonical = 13, .fd = 33, .role = .service_lifetime_lease, .shard = 0, .family = 0 };
     try validate(&.{}); // Unmanaged handoff.
     try validate(&.{ listener, lease });
-    try std.testing.expectEqual(@as(u8, 8), @intFromEnum(Role.service_listener));
-    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(Role.service_lifetime_lease));
+    try std.testing.expectEqual(@as(u8, 8), @backingInt(Role.service_listener));
+    try std.testing.expectEqual(@as(u8, 9), @backingInt(Role.service_lifetime_lease));
     try std.testing.expectError(error.InvalidManifest, validate(&.{listener}));
     try std.testing.expectError(error.InvalidManifest, validate(&.{lease}));
     var bad = listener;

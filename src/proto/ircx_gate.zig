@@ -10,7 +10,7 @@ const std = @import("std");
 const numeric = @import("numeric.zig");
 
 pub const NEED_IRCX_TEXT: []const u8 = "IRCX command requires ISIRCX";
-pub const NEED_IRCX_CODE: u16 = @intFromEnum(numeric.Numeric.ERR_UNKNOWNCOMMAND);
+pub const NEED_IRCX_CODE: u16 = @backingInt(numeric.Numeric.ERR_UNKNOWNCOMMAND);
 
 pub const Decision = enum {
     Allowed,

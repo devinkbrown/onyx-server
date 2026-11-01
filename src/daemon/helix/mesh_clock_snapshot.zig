@@ -62,7 +62,7 @@ pub fn encode(
     out[magic.len] = version;
     std.mem.writeInt(u64, out[magic.len + 1 ..][0..8], clock.last_stamp, .little);
     std.mem.writeInt(u64, out[v1_encoded_len..][0..8], migration_offer_epoch, .little);
-    out[v2_encoded_len] = @intFromEnum(activation.mode);
+    out[v2_encoded_len] = @backingInt(activation.mode);
     std.mem.writeInt(u64, out[v2_encoded_len + 1 ..][0..8], activation.activation_epoch, .little);
     @memcpy(out[v2_encoded_len + 1 + @sizeOf(u64) ..], &activation.roster_digest);
     return out;
@@ -259,7 +259,7 @@ test "mesh clock current snapshot rejects invalid activation semantics" {
     try testing.expectError(error.InvalidActivation, decodeCurrent(&half_plan));
 
     var active_without_plan = try encode(.{ .last_stamp = 1 }, 2, .{});
-    active_without_plan[v2_encoded_len] = @intFromEnum(relay_v2_activation.Mode.active);
+    active_without_plan[v2_encoded_len] = @backingInt(relay_v2_activation.Mode.active);
     try testing.expectError(error.InvalidActivation, decodeCurrent(&active_without_plan));
 
     try testing.expectError(error.InvalidActivation, encode(.{}, 0, .{ .mode = .active }));

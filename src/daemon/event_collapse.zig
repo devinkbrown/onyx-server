@@ -16,7 +16,7 @@ const rwlock = @import("../substrate/rwlock.zig");
 const event_spine = @import("event_spine.zig");
 
 /// Severity ordinal at/above which events are never collapsed (`.warn`).
-const collapse_severity_ceiling: u8 = @intFromEnum(event_spine.EventSeverity.warn);
+const collapse_severity_ceiling: u8 = @backingInt(event_spine.EventSeverity.warn);
 
 pub const default_window_ms: i64 = 10_000;
 /// Deliver the first `default_threshold` copies in a window; suppress the rest.
@@ -159,7 +159,7 @@ pub fn CollapseTable(comptime capacity: usize) type {
 
 test "admit delivers up to the threshold then suppresses identical low-sev events" {
     var t = CollapseTable(8){ .threshold = 3, .window_ms = 1000 };
-    const notice: u8 = @intFromEnum(event_spine.EventSeverity.notice);
+    const notice: u8 = @backingInt(event_spine.EventSeverity.notice);
     // First 3 delivered, rest suppressed within the window.
     try std.testing.expect(t.admit(7, notice, "MEMBER JOIN #c a", 0));
     try std.testing.expect(t.admit(7, notice, "MEMBER JOIN #c a", 10));
@@ -170,8 +170,8 @@ test "admit delivers up to the threshold then suppresses identical low-sev event
 
 test "severity >= warn is never collapsed" {
     var t = CollapseTable(8){ .threshold = 1, .window_ms = 10_000 };
-    const warn: u8 = @intFromEnum(event_spine.EventSeverity.warn);
-    const crit: u8 = @intFromEnum(event_spine.EventSeverity.critical);
+    const warn: u8 = @backingInt(event_spine.EventSeverity.warn);
+    const crit: u8 = @backingInt(event_spine.EventSeverity.critical);
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         try std.testing.expect(t.admit(12, warn, "WARD refused x", @intCast(i)));
@@ -181,7 +181,7 @@ test "severity >= warn is never collapsed" {
 
 test "distinct messages collapse independently" {
     var t = CollapseTable(8){ .threshold = 1, .window_ms = 10_000 };
-    const notice: u8 = @intFromEnum(event_spine.EventSeverity.notice);
+    const notice: u8 = @backingInt(event_spine.EventSeverity.notice);
     try std.testing.expect(t.admit(7, notice, "MEMBER JOIN #c alice", 0));
     try std.testing.expect(!t.admit(7, notice, "MEMBER JOIN #c alice", 1)); // 2nd of same → suppress
     // A different message is a different key → delivered.
@@ -190,7 +190,7 @@ test "distinct messages collapse independently" {
 
 test "flush summarizes an elapsed window with suppressed events, then clears it" {
     var t = CollapseTable(8){ .threshold = 2, .window_ms = 100 };
-    const notice: u8 = @intFromEnum(event_spine.EventSeverity.notice);
+    const notice: u8 = @backingInt(event_spine.EventSeverity.notice);
     _ = t.admit(7, notice, "MEMBER JOIN #c a", 0);
     _ = t.admit(7, notice, "MEMBER JOIN #c a", 10);
     _ = t.admit(7, notice, "MEMBER JOIN #c a", 20); // suppressed

@@ -50,7 +50,7 @@ pub const AdmissionStamp = struct {
         try self.validate(self.approved_origin);
         var out: [encoded_len]u8 = undefined;
         out[0] = self.version;
-        out[1] = @intFromEnum(self.mode);
+        out[1] = @backingInt(self.mode);
         out[2] = self.approval_policy;
         out[3..35].* = self.approved_origin;
         std.mem.writeInt(i64, out[35..43], self.admitted_at_ms, .big);

@@ -159,7 +159,7 @@ pub fn encode(frame: MediaFrame, buf: []u8) EncodeError!usize {
     pos += 8;
     buf[pos] = if (frame.keyframe) @as(u8, 1) else @as(u8, 0);
     pos += 1;
-    buf[pos] = @intFromEnum(frame.codec);
+    buf[pos] = @backingInt(frame.codec);
     pos += 1;
     @memcpy(buf[pos .. pos + payload_len], frame.payload);
     pos += payload_len;

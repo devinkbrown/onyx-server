@@ -59,8 +59,8 @@ pub const EntityKind = enum(u8) {
 
     pub fn fromTag(tag: u8) ?EntityKind {
         return switch (tag) {
-            @intFromEnum(EntityKind.user) => .user,
-            @intFromEnum(EntityKind.member) => .member,
+            @backingInt(EntityKind.user) => .user,
+            @backingInt(EntityKind.member) => .member,
             else => null,
         };
     }
@@ -140,7 +140,7 @@ pub fn encode(ev: EntityPropEvent, out: []u8) Error![]const u8 {
     var i: usize = 0;
     out[i] = @intFromBool(ev.present);
     i += 1;
-    out[i] = @intFromEnum(ev.kind);
+    out[i] = @backingInt(ev.kind);
     i += 1;
     std.mem.writeInt(u64, out[i..][0..8], ev.origin_node, .little);
     i += 8;
@@ -298,7 +298,7 @@ pub fn originTranscript(allocator: std.mem.Allocator, ev: EntityPropEvent) ![]u8
     std.mem.writeInt(u64, &u64_le, ev.hlc, .little);
     try out.appendSlice(allocator, &u64_le);
     try out.append(allocator, @intFromBool(ev.present));
-    try out.append(allocator, @intFromEnum(ev.kind));
+    try out.append(allocator, @backingInt(ev.kind));
     try appendLenPrefixed(&out, allocator, ev.entity);
     try appendLenPrefixed(&out, allocator, ev.key);
     try appendLenPrefixed(&out, allocator, ev.value);

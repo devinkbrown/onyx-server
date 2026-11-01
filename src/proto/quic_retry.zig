@@ -189,7 +189,7 @@ pub fn encodeRetry(
     // RFC 9000 §17.2.5.1) may be any value; we set them to 0b1111 to match the
     // canonical RFC 9001 §A.4 example (0xff), so a known Retry encodes byte-for-
     // byte. The integrity tag (§5.8) covers this first byte, so it must be fixed.
-    out[pos] = 0x80 | 0x40 | (@as(u8, @intFromEnum(quic_packet.LongPacketType.retry)) << 4) | 0x0f;
+    out[pos] = 0x80 | 0x40 | (@as(u8, @backingInt(quic_packet.LongPacketType.retry)) << 4) | 0x0f;
     pos += 1;
 
     std.mem.writeInt(u32, out[pos..][0..4], quic_version_1, .big);

@@ -28,6 +28,7 @@ const buf_ring = @import("../substrate/io/buf_ring.zig");
 pub const default_cqe_batch: usize = 256;
 pub const max_cqe_batch: usize = 4096;
 pub const min_cq_entries: u32 = 256;
+pub const default_sqpoll_idle_ms: u32 = 10;
 
 pub const RingFeatures = struct {
     multishot_accept: bool = false,
@@ -37,6 +38,14 @@ pub const RingFeatures = struct {
     fixed_files: bool = false,
     defer_taskrun: bool = false,
     sqpoll: bool = false,
+    /// Positive milliseconds before an idle SQPOLL worker sleeps. Zero asks the
+    /// kernel for its default rather than disabling polling, so reject it.
+    sqpoll_idle_ms: u32 = default_sqpoll_idle_ms,
+
+    pub fn validate(self: @This()) error{InvalidSqpollIdle}!void {
+        if (self.sqpoll_idle_ms == 0 or self.sqpoll_idle_ms > 60_000)
+            return error.InvalidSqpollIdle;
+    }
 
     pub const baseline: @This() = .{};
 
@@ -81,7 +90,7 @@ const gen_max: u32 = (1 << gen_bits) - 1;
 
 pub fn encodeUserData(kind: OpKind, token: FdToken) error{TokenOutOfRange}!u64 {
     if (token.slot > slot_max or token.gen > gen_max) return error.TokenOutOfRange;
-    return (@as(u64, @intFromEnum(kind)) << kind_shift) |
+    return (@as(u64, @backingInt(kind)) << kind_shift) |
         (@as(u64, token.slot) << slot_shift) |
         @as(u64, token.gen);
 }
@@ -225,7 +234,7 @@ fn ensureProbes() ProbeAnswers {
 }
 
 fn isErrno(res: i32, err: linux.E) bool {
-    return res == -@as(i32, @intFromEnum(err));
+    return res == -@as(i32, @backingInt(err));
 }
 
 fn openLoopbackListener() ?linux.fd_t {
@@ -335,12 +344,16 @@ fn completionQueueEntries(sq: u16) u32 {
     return rounded;
 }
 
-fn openParams(entries: u16, flags: u32, cq_entries: u32) !IoUring {
-    var params = std.mem.zeroInit(linux.io_uring_params, .{
+fn setupParams(flags: u32, cq_entries: u32, sqpoll_idle_ms: u32) linux.io_uring_params {
+    return std.mem.zeroInit(linux.io_uring_params, .{
         .flags = flags,
-        .cq_entries = cq_entries,
-        .sq_thread_idle = 1000,
+        .cq_entries = if ((flags & linux.IORING_SETUP_CQSIZE) != 0) cq_entries else 0,
+        .sq_thread_idle = sqpoll_idle_ms,
     });
+}
+
+fn openParams(entries: u16, flags: u32, cq_entries: u32, sqpoll_idle_ms: u32) !IoUring {
+    var params = setupParams(flags, cq_entries, sqpoll_idle_ms);
     return IoUring.init_params(entries, &params);
 }
 
@@ -364,10 +377,7 @@ fn openInner(entries: u16, features: RingFeatures) !IoUring {
         runtimeFlags(features.sqpoll, false),
     };
     for (attempts, 0..) |flags, index| {
-        const opened = if ((flags & linux.IORING_SETUP_CQSIZE) != 0)
-            openParams(entries, flags, cq)
-        else
-            IoUring.init(entries, flags);
+        const opened = openParams(entries, flags, cq, features.sqpoll_idle_ms);
         if (opened) |ring| return ring else |err| switch (err) {
             error.ArgumentsInvalid => {
                 if (index + 1 == attempts.len) return err;
@@ -376,6 +386,65 @@ fn openInner(entries: u16, features: RingFeatures) !IoUring {
         }
     }
     return error.ArgumentsInvalid;
+}
+
+/// These are the operations used by the live accept, connection, timer,
+/// wake, cancel and mesh-dial paths. MSG_RING is separately verified only
+/// when the daemon actually starts multiple shards; accelerations remain
+/// optional and retain their existing fallbacks.
+const mandatory_opcodes = [_]linux.IORING_OP{ .ACCEPT, .RECV, .SEND, .POLL_ADD, .ASYNC_CANCEL, .TIMEOUT, .CONNECT };
+
+fn checkRequiredOperations(probe: *const linux.io_uring_probe) !void {
+    // A short/empty response is not evidence that an operation is absent.
+    if (probe.ops_len == 0) return error.KernelOpcodeProbeMalformed;
+    for (mandatory_opcodes) |op| {
+        const index: usize = @backingInt(op);
+        if (index > @backingInt(probe.last_op)) return missingOperation(op);
+        if (index >= probe.ops_len) return error.KernelOpcodeProbeIncomplete;
+        const entry = probe.ops[index];
+        if (entry.op != op) return error.KernelOpcodeProbeMalformed;
+        if (!entry.is_supported()) return missingOperation(op);
+    }
+}
+
+fn missingOperation(op: linux.IORING_OP) anyerror {
+    return switch (op) {
+        .ACCEPT => error.KernelMissingAccept,
+        .RECV => error.KernelMissingRecv,
+        .SEND => error.KernelMissingSend,
+        .POLL_ADD => error.KernelMissingPoll,
+        .ASYNC_CANCEL => error.KernelMissingCancel,
+        .TIMEOUT => error.KernelMissingTimeout,
+        .CONNECT => error.KernelMissingConnect,
+        else => unreachable,
+    };
+}
+
+const KernelOpcodeProvider = struct {
+    fn open(_: @This(), entries: u16, features: RingFeatures) !IoUring {
+        return openInner(entries, features);
+    }
+    fn probe(_: @This(), ring: *IoUring) !linux.io_uring_probe {
+        var table = std.mem.zeroInit(linux.io_uring_probe, .{});
+        const rc = linux.io_uring_register(ring.fd, .REGISTER_PROBE, &table, table.ops.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return table,
+            .PERM, .ACCES => return error.KernelOpcodeProbeDenied,
+            .NOMEM, .MFILE, .NFILE => return error.KernelOpcodeProbeResources,
+            .INVAL, .OPNOTSUPP, .NOSYS => return error.KernelOpcodeProbeUnavailable,
+            else => return error.KernelOpcodeProbeFailed,
+        }
+    }
+};
+
+/// The provider abstraction keeps error paths deterministic in tests; on every
+/// rejected probe the newly opened ring is closed before the error returns.
+fn openValidated(provider: anytype, entries: u16, features: RingFeatures) !@typeInfo(@TypeOf(provider.open(entries, features))).error_union.payload {
+    var ring = try provider.open(entries, features);
+    errdefer ring.deinit();
+    const table = try provider.probe(&ring);
+    try checkRequiredOperations(&table);
+    return ring;
 }
 
 /// Provided-buffer group size for `clients` connections. Multishot recv can
@@ -410,9 +479,12 @@ pub const Ring = struct {
     pool_allocator: ?std.mem.Allocator = null,
 
     pub fn init(entries: u16, features: RingFeatures) !Ring {
+        try features.validate();
+        var inner = try openValidated(KernelOpcodeProvider{}, entries, features);
+        errdefer inner.deinit();
         const probed = ensureProbes();
         return .{
-            .inner = try openInner(entries, features),
+            .inner = inner,
             .features = features,
             .accept_multishot = probed.accept,
             .poll_multishot = probed.poll,
@@ -1215,4 +1287,141 @@ fn reapFixedExchange(ring: *Ring, send_token: FdToken, recv_token: FdToken) !Fix
         .send = sink.sent orelse return error.TestUnexpectedResult,
         .recv = sink.got orelse return error.TestUnexpectedResult,
     };
+}
+
+test "SQPOLL idle validation and every setup-ladder parameter profile" {
+    try (RingFeatures{}).validate();
+    try std.testing.expectEqual(@as(u32, 10), (RingFeatures{}).sqpoll_idle_ms);
+    try std.testing.expectError(error.InvalidSqpollIdle, (RingFeatures{ .sqpoll_idle_ms = 0 }).validate());
+    try std.testing.expectError(error.InvalidSqpollIdle, (RingFeatures{ .sqpoll_idle_ms = 60_001 }).validate());
+    for ([_]u32{ 1, 10, 1000, 60_000 }) |idle| {
+        try (RingFeatures{ .sqpoll_idle_ms = idle }).validate();
+        for ([_]bool{ false, true }) |sqpoll| {
+            const attempts = [_]u32{
+                runtimeFlags(sqpoll, true),
+                runtimeFlags(sqpoll, false) | linux.IORING_SETUP_CQSIZE,
+                runtimeFlags(sqpoll, false) | linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_TASKRUN_FLAG,
+                runtimeFlags(sqpoll, false),
+            };
+            for (attempts) |flags| {
+                const params = setupParams(flags, 256, idle);
+                try std.testing.expectEqual(flags, params.flags);
+                try std.testing.expectEqual(idle, params.sq_thread_idle);
+                try std.testing.expectEqual(@as(u32, if ((flags & linux.IORING_SETUP_CQSIZE) != 0) 256 else 0), params.cq_entries);
+                try std.testing.expectEqual(@as(u32, 0), params.sq_entries);
+                try std.testing.expectEqual(@as(u32, 0), params.features);
+                try std.testing.expectEqual(@as(u32, 0), params.wq_fd);
+            }
+        }
+    }
+}
+
+fn syntheticRequiredProbe() linux.io_uring_probe {
+    var table = std.mem.zeroInit(linux.io_uring_probe, .{});
+    table.last_op = .RECV;
+    table.ops_len = @backingInt(linux.IORING_OP.RECV) + 1;
+    for (0..table.ops_len) |i| {
+        table.ops[i].op = @fromBackingInt(@intCast(i));
+        table.ops[i].flags = linux.IO_URING_OP_SUPPORTED;
+    }
+    return table;
+}
+
+test "ringlane required opcode probe distinguishes missing and malformed" {
+    const cases = .{
+        .{ linux.IORING_OP.ACCEPT, error.KernelMissingAccept },
+        .{ linux.IORING_OP.RECV, error.KernelMissingRecv },
+        .{ linux.IORING_OP.SEND, error.KernelMissingSend },
+        .{ linux.IORING_OP.POLL_ADD, error.KernelMissingPoll },
+        .{ linux.IORING_OP.ASYNC_CANCEL, error.KernelMissingCancel },
+        .{ linux.IORING_OP.TIMEOUT, error.KernelMissingTimeout },
+        .{ linux.IORING_OP.CONNECT, error.KernelMissingConnect },
+    };
+    var table = syntheticRequiredProbe();
+    try checkRequiredOperations(&table);
+    inline for (cases) |case| {
+        table = syntheticRequiredProbe();
+        table.ops[@backingInt(case[0])].flags = 0;
+        try std.testing.expectError(case[1], checkRequiredOperations(&table));
+    }
+    table = syntheticRequiredProbe();
+    table.ops_len = 0;
+    try std.testing.expectError(error.KernelOpcodeProbeMalformed, checkRequiredOperations(&table));
+    table = syntheticRequiredProbe();
+    table.ops_len = @backingInt(linux.IORING_OP.RECV);
+    try std.testing.expectError(error.KernelOpcodeProbeIncomplete, checkRequiredOperations(&table));
+    table = syntheticRequiredProbe();
+    table.ops[@backingInt(linux.IORING_OP.ACCEPT)].op = .NOP;
+    try std.testing.expectError(error.KernelOpcodeProbeMalformed, checkRequiredOperations(&table));
+    table = syntheticRequiredProbe();
+    table.last_op = .CONNECT;
+    try std.testing.expectError(error.KernelMissingRecv, checkRequiredOperations(&table));
+}
+
+test "ringlane required probe closes on refusal and supports retry without disabling SQPOLL" {
+    const Fixture = struct {
+        const Self = @This();
+        const Mode = enum { success, missing, denied, resources, unavailable };
+        mode: Mode = .success,
+        closes: usize = 0,
+        opens: usize = 0,
+        seen_sqpoll: bool = false,
+        seen_idle: u32 = 0,
+        const FakeRing = struct {
+            fixture: *Self,
+            fn deinit(self: *@This()) void {
+                self.fixture.closes += 1;
+            }
+        };
+        fn open(self: *@This(), _: u16, features: RingFeatures) !FakeRing {
+            self.opens += 1;
+            self.seen_sqpoll = features.sqpoll;
+            self.seen_idle = features.sqpoll_idle_ms;
+            return .{ .fixture = self };
+        }
+        fn probe(self: *@This(), _: *FakeRing) !linux.io_uring_probe {
+            switch (self.mode) {
+                .denied => return error.KernelOpcodeProbeDenied,
+                .resources => return error.KernelOpcodeProbeResources,
+                .unavailable => return error.KernelOpcodeProbeUnavailable,
+                else => {},
+            }
+            var table = syntheticRequiredProbe();
+            if (self.mode == .missing) table.ops[@backingInt(linux.IORING_OP.SEND)].flags = 0;
+            return table;
+        }
+    };
+    var fixture: Fixture = .{};
+    const features: RingFeatures = .{ .sqpoll = true, .sqpoll_idle_ms = 777 };
+    fixture.mode = .missing;
+    try std.testing.expectError(error.KernelMissingSend, openValidated(&fixture, 32, features));
+    fixture.mode = .denied;
+    try std.testing.expectError(error.KernelOpcodeProbeDenied, openValidated(&fixture, 32, features));
+    fixture.mode = .resources;
+    try std.testing.expectError(error.KernelOpcodeProbeResources, openValidated(&fixture, 32, features));
+    fixture.mode = .unavailable;
+    try std.testing.expectError(error.KernelOpcodeProbeUnavailable, openValidated(&fixture, 32, features));
+    try std.testing.expectEqual(@as(usize, 4), fixture.closes);
+    try std.testing.expect(fixture.seen_sqpoll);
+    try std.testing.expectEqual(@as(u32, 777), fixture.seen_idle);
+    fixture.mode = .success;
+    var ring = try openValidated(&fixture, 32, features);
+    try std.testing.expectEqual(@as(usize, 4), fixture.closes);
+    ring.deinit();
+    try std.testing.expectEqual(@as(usize, 5), fixture.closes);
+    try std.testing.expectEqual(@as(usize, 5), fixture.opens);
+}
+
+test "ringlane real kernel required opcode probe" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var inner = openInner(16, .{}) catch |err| {
+        if (isUnsupportedInitError(err)) return error.SkipZigTest;
+        return err;
+    };
+    defer inner.deinit();
+    const probe = (KernelOpcodeProvider{}).probe(&inner) catch |err| switch (err) {
+        error.KernelOpcodeProbeDenied, error.KernelOpcodeProbeResources, error.KernelOpcodeProbeUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    try checkRequiredOperations(&probe);
 }

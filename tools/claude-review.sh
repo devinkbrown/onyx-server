@@ -107,6 +107,7 @@ esac
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
+review_tmp_base="$(cd -- "${TMPDIR:-/tmp}" && pwd -P)"
 
 raw_file=""
 snapshot_root=""
@@ -114,7 +115,7 @@ cleanup_review() {
   local status="$?"
   if [ -n "$snapshot_root" ]; then
     case "$snapshot_root" in
-      /tmp/onyx-claude-snapshot.*)
+      "$review_tmp_base"/onyx-claude-snapshot.*)
         chmod -R u+w -- "$snapshot_root" 2>/dev/null || true
         rm -rf -- "$snapshot_root"
         ;;
@@ -219,7 +220,7 @@ declare -A starting_hashes=()
 declare -a manifest_lines=()
 declare -a read_rules=()
 declare -a permission_rules=("StructuredOutput")
-snapshot_root="$(mktemp -d /tmp/onyx-claude-snapshot.XXXXXX)"
+snapshot_root="$(mktemp -d "$review_tmp_base/onyx-claude-snapshot.XXXXXX")"
 git -C "$snapshot_root" init -q
 mkdir -p -- "$snapshot_root/.claude/agents"
 cp -- "$agent_file" "$snapshot_root/$agent_file"
@@ -319,7 +320,7 @@ full_prompt="$(printf '%s\n\nReview nonce: %s\nReviewer definition SHA-256: %s\n
   'Return only one JSON object with exactly these top-level keys: review_nonce, verdict, summary, reviewed_files, findings. Do not wrap JSON in Markdown. Verdict must be exactly pass or findings, never fail. Severity must be exactly P0, P1, P2, or P3, never high/medium/low. Each reviewed_files item has file, line, anchor. Each findings item has severity, title, file, line, evidence, counterexample, impact, fix, test.' \
   "$prompt")"
 
-raw_file="$(mktemp /tmp/onyx-claude-review.XXXXXX.json)"
+raw_file="$(mktemp "$review_tmp_base/onyx-claude-review.XXXXXX.json")"
 
 (
   cd "$snapshot_root"

@@ -104,12 +104,36 @@ ReleaseFast executable in `bin/` and the reference and quickstart configs in
 ```sh
 packaging/release.sh                                   # build the verified static binary → dist/
 docker build -f packaging/Dockerfile -t onyx-server:latest .
-docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
+docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 ```
 
-`/data` holds the node key + account store — the named volume persists them. The
-image copies the release artifact to `/usr/local/bin/onyx-server` (binary name
-fixed; version stays in the `dist/` filename only).
+The process runs as UID/GID `10001:10001`. `/data` is mode `0700` and contains
+the initial `0600` quickstart config, generated node key, and account store;
+the named volume persists them. The node key is generated **beside the config**,
+so the default config is `/data/onyx-server.toml`. An existing volume is never
+overwritten with a new config. A bind-mounted `/data` must already contain the
+reviewed config and be writable by UID/GID 10001. Before upgrading an older
+volume, provision `/data/onyx-server.toml` explicitly; older images kept that
+config under `/etc`. Preserve any existing node key and account store.
+
+The root filesystem can be requested read-only while `/data` remains writable.
+Production config and secret files can be mounted read-only inside `/data`,
+with permissions allowing UID 10001 to read them. Keep the parent directory
+writable for identity generation, or provision its existing identity privately.
+Point every enabled mutable feature (ACME, logs, databases, media caches) to
+the deliberate writable volume. Logs use inherited stdout/stderr by default;
+bound retention using your container runtime's logging settings.
+
+The image copies the static musl release artifact to
+`/usr/local/bin/onyx-server`; Alpine supplies the runtime filesystem and account
+metadata. No shell wrapper or OpenRC daemon is launched in the container.
+Arguments after the image name replace the default config argument, allowing
+preflight with `--check-config /data/onyx-server.toml`. Run that against a
+provisioned volume before starting the daemon. Container read-only-root and
+capability restrictions still require an actual container-engine acceptance
+run; the [native Alpine smoke](../docs/guide/alpine.md) establishes a separate
+host-runtime recovery boundary.
 
 ## Production TLS card
 
@@ -195,37 +219,41 @@ Any standard IRC client works too — point it at `localhost:6667` (or `6697` wi
 
 ## Reproducible releases (trust, not faith)
 
-Because the build is hermetic (pure Zig, no C interop) and static
-(`x86_64-linux-musl`), a `ReleaseFast` build **at a fixed commit is bit-for-bit
-reproducible**. You never have to trust the release machine.
+Release tooling supports `x86_64-linux-musl` (default) and
+`aarch64-linux-musl`, with explicit `baseline` CPU and ReleaseFast optimization.
+Use a separate output directory for each target:
 
 ```sh
-packaging/release.sh          # → dist/{onyx-server-<ver>-x86_64-linux-musl, SHA256SUMS, onyx-server.cdx.json, onyx-server.provenance.json}
-packaging/verify-release.sh   # rebuild from source with a clean cache; must match SHA256SUMS
+packaging/release.sh dist/x86_64 x86_64-linux-musl
+packaging/verify-release.sh dist/x86_64/SHA256SUMS x86_64-linux-musl
+packaging/release.sh dist/aarch64 aarch64-linux-musl
+packaging/verify-release.sh dist/aarch64/SHA256SUMS aarch64-linux-musl
 ```
 
-`verify-release.sh` exits non-zero if the rebuild is not byte-identical — so a
-tampered or differently-sourced binary is caught mechanically. Both scripts
-refuse to run on a dirty tree (which would embed a non-reproducible `-dirty`
-version).
+Both scripts require a clean checkout and refuse dirty or unreadable Git state.
+They require Bash, Git, Zig, Python 3, `sha256sum` and standard shell utilities.
+Each output includes checksummed `onyx-server.build.json`, binding the source
+commit, target, CPU, build flags, compiler version and compiler binary digest.
+The verifier selects the exact target artifact and compares these inputs before
+an independent clean-cache rebuild. Older manifests without this metadata are
+not supported by the current verifier; retain their matching historical verifier.
 
-**The whole release is reproducible, not just the binary** — for a given
-`(commit, Zig toolchain)`. The SBOM carries no timestamps and the provenance pins
-its build times *and* its source `ref` to the commit (not the wall clock or the
-local branch), so re-running `release.sh` on the same commit with the same `zig`
-reproduces every file — binary, SBOM, provenance, and `SHA256SUMS` — bit-for-bit.
-(Reproducible builds always require a fixed toolchain; Onyx Server's is pinned in
-`build.zig.zon`'s `minimum_zig_version`.) Only `git`, `zig`, and `sha256sum` are
-required; `cosign` and `jq` are optional and degrade to a note when absent.
+A successful rebuild demonstrates byte equality for the recorded binary and
+inputs. Cross-compilation does not establish native execution on that CPU or
+Alpine runtime acceptance. The compiler executable hash does not cover its whole
+standard-library distribution. The minimum Zig version in `build.zig.zon` is
+not a complete toolchain pin. Record and retain the complete tested toolchain.
 
-`verify-release.sh` rebuilds and proves the **binary** is byte-identical, binds
-the shipped binary to the manifest, and re-checks the SBOM/provenance integrity;
-the SBOM and provenance are reproducible *by construction* (no wall-clock inputs),
-so re-running `release.sh` on the same commit regenerates them identically.
+Metadata uses commit-derived dates and source identity. Verify repeat-build byte
+equality before claiming a particular release is reproducible; pure Zig and
+static linking alone do not prove it. The verifier also checks the integrity of
+present SBOM/provenance files. Optional signatures require separate signer
+verification; a configured signer that cannot run causes release generation to
+fail. No release or native architecture proof follows from script unit tests.
 
 ### `SHA256SUMS` — one manifest, all artifacts
 
-`SHA256SUMS` lists the binary (first line), the SBOM, and the provenance. A
+`SHA256SUMS` lists the binary, build metadata, SBOM, and provenance. A
 single cosign signature over it therefore anchors the integrity of the entire
 release. `verify-release.sh` rebuilds the binary and, if the SBOM/provenance are
 present, re-checks them against the manifest to catch post-publish tampering.

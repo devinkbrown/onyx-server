@@ -98,7 +98,7 @@ pub const Candidate = struct {
         if (!a.transport_addr.eql(b.transport_addr)) return a.transport_addr.less(b.transport_addr);
         if (a.component_id != b.component_id) return a.component_id < b.component_id;
         if (a.local_pref != b.local_pref) return a.local_pref > b.local_pref;
-        return @intFromEnum(a.type) < @intFromEnum(b.type);
+        return @backingInt(a.type) < @backingInt(b.type);
     }
 };
 

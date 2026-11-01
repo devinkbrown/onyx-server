@@ -2277,9 +2277,8 @@ pub const Server = struct {
             // §4.1.4: ClientHello2 must keep the cipher suite the HRR committed to;
             // a changed suite could switch the transcript hash out from under the
             // message_hash synthetic. `hrr_suite` was stamped when the HRR was sent.
-            if (self.hrr_suite) |committed| {
-                if (committed != full_suite) return error.BadHandshake;
-            }
+            const committed = self.hrr_suite orelse return error.BadHandshake;
+            if (committed != full_suite) return error.BadHandshake;
             switch (self.hrr_group) {
                 .x25519 => {
                     p256_share = null;
@@ -2392,6 +2391,10 @@ pub const Server = struct {
         const opened = tls_resumption.openTicketWithRotation(self.allocator, self.ticket_key, self.config.previous_ticket_key, identity.identity) catch return null;
         defer self.allocator.free(opened.plain);
         const suite = CipherSuite.fromWire(opened.opened.suite) catch return null;
+        if (self.hrr_sent) {
+            const committed = self.hrr_suite orelse return error.BadHandshake;
+            if (suite != committed) return null;
+        }
         if (!clientOfferedSuite(suites_block, suite)) return null;
         if (opened.opened.psk.len != suite.hashLen()) return null;
         if (binder.len != suite.hashLen()) return null;
@@ -2524,6 +2527,10 @@ pub const Server = struct {
     }
 
     fn writeServerHello(self: *Server, out: *std.ArrayList(u8)) Error!void {
+        if (self.hrr_sent) {
+            const committed = self.hrr_suite orelse return error.BadHandshake;
+            if (self.selected_suite != committed) return error.BadHandshake;
+        }
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
 
@@ -3600,18 +3607,28 @@ fn readOuterSessionId(outer_body: []const u8) Error![]const u8 {
     return sid;
 }
 
+// The pinned Zig public flag misses the stage2 C/Darwin software fallback.
+const compiled_aes_accelerated = std.crypto.core.aes.has_hardware_support and
+    !(builtin.cpu.arch == .aarch64 and builtin.zig_backend == .stage2_c and builtin.os.tag.isDarwin());
+
 fn pickSuite(block: []const u8) ?CipherSuite {
+    return pickSuiteWithPolicy(block, !compiled_aes_accelerated);
+}
+
+fn pickSuiteWithPolicy(block: []const u8, prefer_chacha: bool) ?CipherSuite {
     if (block.len % 2 != 0) return null;
-    // Prefer AES-128-GCM, then AES-256-GCM, then ChaCha20-Poly1305.
+    var has_aes128 = false;
     var has_aes256 = false;
     var has_chacha = false;
     var i: usize = 0;
     while (i + 1 < block.len) : (i += 2) {
         const v = std.mem.readInt(u16, block[i..][0..2], .big);
-        if (v == @backingInt(CipherSuite.tls_aes_128_gcm_sha256)) return .tls_aes_128_gcm_sha256;
+        if (v == @backingInt(CipherSuite.tls_aes_128_gcm_sha256)) has_aes128 = true;
         if (v == @backingInt(CipherSuite.tls_aes_256_gcm_sha384)) has_aes256 = true;
         if (v == @backingInt(CipherSuite.tls_chacha20_poly1305_sha256)) has_chacha = true;
     }
+    if (prefer_chacha and has_chacha) return .tls_chacha20_poly1305_sha256;
+    if (has_aes128) return .tls_aes_128_gcm_sha256;
     if (has_aes256) return .tls_aes_256_gcm_sha384;
     if (has_chacha) return .tls_chacha20_poly1305_sha256;
     return null;
@@ -4006,17 +4023,18 @@ test "loopback: tls_client completes a handshake against tls_server + app data b
     // before any encrypt() so app_write_seq is still 0.
     {
         const p = server.ktlsTxParams() orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(Server.KtlsCipher.aes_128_gcm, p.cipher);
-        try std.testing.expectEqual(@as(usize, 16), p.key.len);
-        try std.testing.expectEqualSlices(u8, server.server_app_keys.key[0..16], p.key);
+        const expected_suite: CipherSuite = if (compiled_aes_accelerated) .tls_aes_128_gcm_sha256 else .tls_chacha20_poly1305_sha256;
+        try std.testing.expectEqual(expected_suite, server.selected_suite.?);
+        try std.testing.expectEqual(if (compiled_aes_accelerated) Server.KtlsCipher.aes_128_gcm else Server.KtlsCipher.chacha20_poly1305, p.cipher);
+        try std.testing.expectEqual(expected_suite.keyLen(), p.key.len);
+        try std.testing.expectEqualSlices(u8, server.server_app_keys.key[0..expected_suite.keyLen()], p.key);
         try std.testing.expectEqualSlices(u8, &server.server_app_keys.iv, &p.iv);
         try std.testing.expectEqual(server.app_write_seq, p.seq);
     }
 
-    // The negotiated suite renders as its IANA name for WHOIS 671. The server
-    // prefers AES-128-GCM whenever the client offers it (pickSuite).
+    // The negotiated suite renders as its exact IANA name for WHOIS 671.
     const negotiated = server.cipherName() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("TLS_AES_128_GCM_SHA256", negotiated);
+    try std.testing.expectEqualStrings(if (compiled_aes_accelerated) "TLS_AES_128_GCM_SHA256" else "TLS_CHACHA20_POLY1305_SHA256", negotiated);
 
     var client_binding: [32]u8 = undefined;
     var server_binding: [32]u8 = undefined;
@@ -9876,4 +9894,152 @@ test "TLS record limit: malformed protected alert cannot suppress fatal decoding
     const opened = try openRecordAlloc(a, server.selected_suite.?, &server.server_app_keys, 0, fatal);
     defer a.free(opened.content);
     try std.testing.expectEqualSlices(u8, &.{ 2, 50 }, opened.content);
+}
+
+test "suite policy HRR ticket suite commitment fixture" {
+    const client_mod = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const a = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x72)));
+    var cert_buf: [1024]u8 = undefined;
+    const cert = try x509_selfsign.buildSelfSigned(&cert_buf, .{ .common_name = "irc.test", .not_before = 1_704_067_200, .not_after = 4_102_444_800, .serial = &.{ 0x72, 0x01 }, .key_pair = kp, .dns_names = &.{"irc.test"}, .is_ca = true });
+    const ticket_key: tls_resumption.TicketKey = @splat(0x42);
+    const psk256: [32]u8 = @splat(0x31);
+    const psk384: [48]u8 = @splat(0x32);
+    const offered = [_]u8{ 0x13, 0x01, 0x13, 0x03 };
+    const chosen = pickSuite(&offered).?;
+    const different: CipherSuite = if (chosen == .tls_aes_128_gcm_sha256) .tls_chacha20_poly1305_sha256 else .tls_aes_128_gcm_sha256;
+    // Directly exercise the final guard before ServerHello serialization.
+    {
+        var guarded = try Server.init(a, .{ .cert_chain = &.{cert}, .signing_key = kp, .ticket_key = ticket_key });
+        defer guarded.deinit();
+        guarded.hrr_sent = true;
+        guarded.selected_suite = chosen;
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(a);
+        try std.testing.expectError(error.BadHandshake, guarded.writeServerHello(&output));
+        try std.testing.expectEqual(@as(usize, 0), output.items.len);
+        guarded.hrr_suite = different;
+        try std.testing.expectError(error.BadHandshake, guarded.writeServerHello(&output));
+        try std.testing.expectEqual(@as(usize, 0), output.items.len);
+    }
+    for ([_]enum { matching, different, sha384, no_hrr, missing }{ .matching, .different, .sha384, .no_hrr, .missing }) |mode| {
+        const ticket_suite = switch (mode) {
+            .matching, .missing => chosen,
+            .different, .no_hrr => different,
+            .sha384 => .tls_aes_256_gcm_sha384,
+        };
+        const psk: []const u8 = if (mode == .sha384) &psk384 else &psk256;
+        const ticket = try tls_resumption.sealTicket(a, ticket_key, @splat(0x20), @backingInt(ticket_suite), psk, "n", 1000, 0, 0, 3600);
+        defer a.free(ticket);
+        const stored = try tls_resumption.encodeStoredSession(a, .{ .peer_record_size_limit = 16385, .suite = @backingInt(ticket_suite), .ticket_lifetime = 3600, .ticket_age_add = 0, .ticket = ticket, .psk = psk });
+        defer a.free(stored);
+        var server = try Server.init(a, .{ .cert_chain = &.{cert}, .signing_key = kp, .ticket_key = ticket_key });
+        defer server.deinit();
+        var client = try client_mod.Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &.{cert} });
+        defer client.deinit();
+        try client.setSessionTicket(stored, 0);
+        if (mode != .no_hrr) client.offerNoSharesForTest();
+        const ch1 = try client.start();
+        defer a.free(ch1);
+        const first = switch (try server.feed(ch1)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer a.free(first);
+        const flight = if (mode == .no_hrr) try a.dupe(u8, first) else blk: {
+            try std.testing.expectEqual(chosen, server.hrr_suite.?);
+            const ch2 = switch (try client.feed(first)) {
+                .bytes_to_send => |b| b,
+                .need_more => return error.TestUnexpectedResult,
+            };
+            defer a.free(ch2);
+            if (mode == .missing) {
+                server.hrr_suite = null;
+                try std.testing.expectError(error.BadHandshake, server.feed(ch2));
+                try std.testing.expect(!server.resumed);
+                try std.testing.expectEqual(@as(usize, 0), server.accepted_psk_len);
+                continue;
+            }
+            break :blk switch (try server.feed(ch2)) {
+                .bytes_to_send => |b| b,
+                .need_more => return error.TestUnexpectedResult,
+            };
+        };
+        defer a.free(flight);
+        const record = (try completePlainRecord(flight)) orelse return error.TestUnexpectedResult;
+        var offset: usize = 0;
+        const hello = try parseHandshake(record.fragment, &offset);
+        try std.testing.expectEqual(HandshakeType.server_hello, hello.typ);
+        var cursor = Cursor.init(hello.body);
+        _ = try cursor.readU16();
+        _ = try cursor.take(32);
+        _ = try cursor.take(try cursor.readU8());
+        const expected_suite = if (mode == .no_hrr) ticket_suite else chosen;
+        try std.testing.expectEqual(@backingInt(expected_suite), try cursor.readU16());
+        _ = try cursor.readU8();
+        const extensions = try cursor.take(try cursor.readU16());
+        var extensions_it = tls_extension.Iterator.init(extensions);
+        var selected_psk = false;
+        while (try extensions_it.next()) |extension| if (extension.typed() == .pre_shared_key) {
+            selected_psk = true;
+        };
+        const same = mode == .matching or mode == .no_hrr;
+        try std.testing.expectEqual(same, selected_psk);
+        try std.testing.expectEqual(same, server.resumed);
+        try std.testing.expectEqual(expected_suite, server.selected_suite.?);
+        if (!same) try std.testing.expectEqual(@as(usize, 0), server.accepted_psk_len);
+        try std.testing.expect(!server.early_data_accepted);
+        const fin = switch (try client.feed(flight)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer a.free(fin);
+        _ = try server.feed(fin);
+        try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+        const sw = server.app_write_seq;
+        const sr = server.app_read_seq;
+        const cw = client.app_write_seq;
+        const cr = client.app_read_seq;
+        const down = try server.encrypt("suite policy server message");
+        defer a.free(down);
+        try std.testing.expectEqual(sw + 1, server.app_write_seq);
+        const received_down = try client.decrypt(down);
+        defer a.free(received_down);
+        try std.testing.expectEqualStrings("suite policy server message", received_down);
+        try std.testing.expectEqual(cr + 1, client.app_read_seq);
+        const up = try client.encrypt("suite policy client message");
+        defer a.free(up);
+        try std.testing.expectEqual(cw + 1, client.app_write_seq);
+        const received_up = try server.decrypt(up);
+        defer a.free(received_up);
+        try std.testing.expectEqualStrings("suite policy client message", received_up);
+        try std.testing.expectEqual(sr + 1, server.app_read_seq);
+    }
+}
+
+test "suite policy offered subsets and malformed lists" {
+    for (0..8) |mask| {
+        var wire: [10]u8 = undefined;
+        var n: usize = 0;
+        // Deliberately reverse server preference and include an unknown suite.
+        for ([_]u16{ 0x13ff, 0x1303, 0x1302, 0x1301 }, 0..) |code, index| {
+            if (index != 0 and mask & (@as(usize, 1) << @intCast(index - 1)) == 0) continue;
+            std.mem.writeInt(u16, wire[n..][0..2], code, .big);
+            n += 2;
+        }
+        const chacha = mask & 1 != 0;
+        const aes256 = mask & 2 != 0;
+        const aes128 = mask & 4 != 0;
+        const accelerated: ?CipherSuite = if (aes128) .tls_aes_128_gcm_sha256 else if (aes256) .tls_aes_256_gcm_sha384 else if (chacha) .tls_chacha20_poly1305_sha256 else null;
+        const software: ?CipherSuite = if (chacha) .tls_chacha20_poly1305_sha256 else if (aes128) .tls_aes_128_gcm_sha256 else if (aes256) .tls_aes_256_gcm_sha384 else null;
+        try std.testing.expectEqual(accelerated, pickSuiteWithPolicy(wire[0..n], false));
+        try std.testing.expectEqual(software, pickSuiteWithPolicy(wire[0..n], true));
+        try std.testing.expectEqual(if (compiled_aes_accelerated) accelerated else software, pickSuite(wire[0..n]));
+    }
+    try std.testing.expectEqual(@as(?CipherSuite, null), pickSuiteWithPolicy(&.{0x13}, true));
+    try std.testing.expectEqual(@as(?CipherSuite, null), pickSuiteWithPolicy(&.{}, false));
+    const duplicates = [_]u8{ 0x13, 0x03, 0x13, 0x01, 0x13, 0x03, 0x13, 0x01 };
+    try std.testing.expectEqual(CipherSuite.tls_chacha20_poly1305_sha256, pickSuiteWithPolicy(&duplicates, true).?);
+    try std.testing.expectEqual(CipherSuite.tls_aes_128_gcm_sha256, pickSuiteWithPolicy(&duplicates, false).?);
 }

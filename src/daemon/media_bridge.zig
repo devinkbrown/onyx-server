@@ -34,7 +34,7 @@ pub const Codec = causeway.Codec;
 pub const TransportAddress = ice.TransportAddress;
 pub const PtMap = causeway.PtMap;
 
-pub const Error = causeway.Error || cadence_frame.DecodeError || cadence_frame.EncodeError;
+pub const Error = causeway.Error || cadence_frame.DecodeError || cadence_frame.EncodeError || error{InvalidRtpPacket};
 
 const max_id_bytes = 64;
 pub const max_member_codecs = 8;
@@ -408,7 +408,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
         /// Used by the WebRTC relay to bridge to native peers.
         pub fn fanoutWebrtcToNative(self: *Self, rtp: []const u8, keyframe_hint: bool, send_ctx: *anyopaque, send: SendFn) void {
             const dh = rtp_profile.decodeHeader(rtp) catch return;
-            const bf = causeway.fromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
+            const bf = frameFromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
             if (!self.codecAllowed(bf.codec)) return;
             var targets: [max_participants]Member = undefined;
             const n = self.crossTargetsForParticipant(.webrtc, self.ssrcs.participantForSsrc(dh.header.ssrc), &targets);
@@ -539,9 +539,33 @@ pub fn rtpToNativeDatagram(
     keyframe_hint: bool,
     out: []u8,
 ) Error!usize {
-    const bf = try causeway.fromRtp(rtp, map, keyframe_hint);
+    const bf = try frameFromRtp(rtp, map, keyframe_hint);
     const nf = causeway.toNative(bf, band_id, stream_id);
     return cadence_frame.encode(nf, out);
+}
+
+/// Browser RTP may carry CSRCs, an opaque extension block, and packet padding.
+/// None of those transport bytes are encoded codec payload. Bound each slice
+/// before rewrapping; only fixed-size fields are read and payload is borrowed.
+fn frameFromRtp(rtp: []const u8, map: *const PtMap, keyframe_hint: bool) Error!causeway.BridgeFrame {
+    var frame = try causeway.fromRtp(rtp, map, keyframe_hint);
+    var offset: usize = rtp_profile.header_len + @as(usize, rtp[0] & 0x0f) * 4;
+    if (offset > rtp.len) return error.Truncated;
+    if (rtp[0] & 0x10 != 0) {
+        if (rtp.len - offset < 4) return error.Truncated;
+        const words = std.mem.readInt(u16, rtp[offset + 2 ..][0..2], .big);
+        const extension_len = 4 + @as(usize, words) * 4;
+        if (extension_len > rtp.len - offset) return error.Truncated;
+        offset += extension_len;
+    }
+    var end = rtp.len;
+    if (rtp[0] & 0x20 != 0) {
+        const padding: usize = rtp[rtp.len - 1];
+        if (padding == 0 or padding > end - offset) return error.InvalidRtpPacket;
+        end -= padding;
+    }
+    frame.payload = rtp[offset..end];
+    return frame;
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +574,71 @@ pub fn rtpToNativeDatagram(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "RTP bridge preserves only codec payload with CSRC extensions and padding" {
+    var packet: [33]u8 = @splat(0);
+    _ = try rtp_profile.encodeHeader(.{ .payload_type = 111, .sequence = 65534, .timestamp = 0x10203040, .ssrc = 200 }, &packet);
+    packet[0] |= 0x31; // P, X, one CSRC.
+    @memcpy(packet[12..16], &[_]u8{ 0x11, 0x22, 0x33, 0x44 });
+    @memcpy(packet[16..24], &[_]u8{ 0xbe, 0xde, 0, 1, 0x10, 0x55, 0, 0 });
+    @memcpy(packet[24..29], "codec");
+    packet[32] = 4;
+    const map = defaultPtMap();
+    var out: [max_rewrap]u8 = undefined;
+    const len = try rtpToNativeDatagram(&packet, &map, cadence_frame.MEDIA_BAND_FLOOR, 88, false, &out);
+    const native = try cadence_frame.decode(out[0..len]);
+    try testing.expectEqualStrings("codec", native.payload);
+    try testing.expectEqual(@as(u32, 65534), native.sequence);
+    try testing.expectEqual(@as(u64, 0x10203040), native.timestamp);
+    try testing.expectEqual(@as(u32, 88), native.stream_id);
+
+    var bridge = ChannelBridge(4).init();
+    var sender = Member{ .leg = .webrtc, .stream_id = 200, .ssrc = 200 };
+    sender.setCodecs(&.{.cadencevox});
+    var receiver = Member{ .leg = .native, .stream_id = 100, .ssrc = 100 };
+    receiver.setCodecs(&.{.cadencevox});
+    try bridge.register("browser", sender);
+    try bridge.register("native", receiver);
+    var capture: CaptureSendCtx = .{};
+    bridge.fanoutWebrtcToNative(&packet, false, &capture, CaptureSendCtx.send);
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    const forwarded = try cadence_frame.decode(capture.written());
+    try testing.expectEqualStrings("codec", forwarded.payload);
+    try testing.expectEqual(@as(u32, 200), forwarded.stream_id);
+    try testing.expectEqual(native.sequence, forwarded.sequence);
+    try testing.expectEqual(native.timestamp, forwarded.timestamp);
+    packet[32] = 10; // Padding cannot consume extension bytes either.
+    try testing.expectError(error.InvalidRtpPacket, rtpToNativeDatagram(&packet, &map, cadence_frame.MEDIA_BAND_FLOOR, 88, false, &out));
+    bridge.fanoutWebrtcToNative(&packet, false, &capture, CaptureSendCtx.send);
+    try testing.expectEqual(@as(usize, 1), capture.count);
+}
+
+test "RTP bridge rejects malformed transport lengths before fanout" {
+    var packet: [16]u8 = @splat(0);
+    _ = try rtp_profile.encodeHeader(.{ .payload_type = 111, .sequence = 7, .timestamp = 99, .ssrc = 200 }, &packet);
+    const map = defaultPtMap();
+    var out: [max_rewrap]u8 = undefined;
+    var bridge = ChannelBridge(4).init();
+    try bridge.register("native", .{ .leg = .native });
+    var capture: CaptureSendCtx = .{};
+    for ([_]u8{ 0x82, 0x90, 0xa0 }) |flags| {
+        packet[0] = flags;
+        if (flags == 0x90) {
+            packet[14] = 0xff;
+            packet[15] = 0xff; // Largest possible extension length, absent body.
+        } else packet[15] = 0;
+        try testing.expectError(if (flags == 0xa0) error.InvalidRtpPacket else error.Truncated, rtpToNativeDatagram(&packet, &map, cadence_frame.MEDIA_BAND_FLOOR, 88, false, &out));
+        bridge.fanoutWebrtcToNative(&packet, false, &capture, CaptureSendCtx.send);
+    }
+    packet[0] = 0xa0;
+    packet[15] = 5; // Padding cannot consume fixed-header bytes.
+    try testing.expectError(error.InvalidRtpPacket, rtpToNativeDatagram(&packet, &map, cadence_frame.MEDIA_BAND_FLOOR, 88, false, &out));
+    bridge.fanoutWebrtcToNative(&packet, false, &capture, CaptureSendCtx.send);
+    packet[0] = 0x90;
+    try testing.expectError(error.Truncated, rtpToNativeDatagram(packet[0..14], &map, cadence_frame.MEDIA_BAND_FLOOR, 88, false, &out));
+    bridge.fanoutWebrtcToNative(packet[0..14], false, &capture, CaptureSendCtx.send);
+    try testing.expectEqual(@as(usize, 0), capture.count);
+}
 
 fn addr(last: u8, port: u16) TransportAddress {
     return TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, last }, port) catch unreachable;

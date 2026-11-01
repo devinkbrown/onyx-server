@@ -9,7 +9,7 @@
 //! each one contributes, plus a per-module detail view carrying dependencies,
 //! conflicts, config blocks, reload/rollback counters, and the last phase
 //! failure. Reads the comptime tables on `module_manifest.Live` and the runtime
-//! health table on `module_lifecycle.Lifecycle`.
+//! health table owned by this server instance.
 //!
 //! `MODULES` is gated at the registry gate (`access = .oper`), not only inside
 //! the handler, so the arity/access refusal is uniform with every other command.
@@ -17,7 +17,7 @@
 const std = @import("std");
 const registry = @import("../registry.zig");
 const module_core = @import("../module_core.zig");
-const module_lifecycle = @import("../module_lifecycle.zig");
+const module_runtime = @import("../module_runtime.zig");
 const module_manifest = @import("manifest.zig");
 const wasm_abi = @import("../../wasm/host/abi.zig");
 const wasm_bridge = @import("../../wasm/host/bridge.zig");
@@ -25,7 +25,18 @@ const wasm_bridge = @import("../../wasm/host/bridge.zig");
 const Core = module_core.Core;
 
 /// Runtime health view over exactly the live module set.
-const Life = module_lifecycle.Lifecycle(&module_manifest.enabled);
+const Runtime = module_runtime.Runtime(&module_manifest.enabled);
+
+fn lifeGate(core: *Core) registry.ModuleGate {
+    return core.server.module_runtime.gate();
+}
+
+fn entryAvailable(entry: registry.CommandEntry, caps: registry.DispatchCaps) bool {
+    if (caps.module_gate) |gate| {
+        if (!gate.allows(entry.module_index)) return false;
+    }
+    return registry.commandAvailable(entry.spec, caps);
+}
 
 /// Render `items` as a comma-separated list into `buf`, or "-" when empty.
 /// Truncates with a trailing "..." rather than failing: this is an operator
@@ -56,13 +67,14 @@ fn writeList(buf: []u8, items: []const []const u8) []const u8 {
 /// MODULES [<id>] — module topology and lifecycle health.
 fn modules(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
     const core = Core.from(ctx);
+    const life = &core.server.module_runtime;
 
     // Detail form: MODULES <id>.
     if (inv.params.len >= 1 and inv.params[0].len != 0) {
         const want = inv.params[0];
         inline for (module_manifest.enabled, 0..) |m, mi| {
             if (std.ascii.eqlIgnoreCase(m.id, want)) {
-                const h = Life.health(mi);
+                const h = life.health(mi);
                 var buf: [400]u8 = undefined;
                 var list_buf: [220]u8 = undefined;
 
@@ -115,9 +127,9 @@ fn modules(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
 
     // Dependency-resolved order, so the listing reads the way the daemon
     // actually brings modules up rather than in manifest order.
-    inline for (Life.load_order) |mi| {
+    inline for (Runtime.load_order) |mi| {
         const m = module_manifest.enabled[mi];
-        const h = Life.health(mi);
+        const h = life.health(mi);
         const line = std.fmt.bufPrint(&buf, "[{d}] {s} v{d}.{d}.{d} {s}/{s} state={s} {d} cmds, {d} caps, {d} hooks{s}", .{
             h.load_position,
             m.id,
@@ -135,19 +147,18 @@ fn modules(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
         try core.reply(.RPL_INFO, &.{}, line);
     }
 
-    if (!Life.engaged()) {
-        // Distinguish "nothing has been driven" from "everything is unhealthy":
-        // the daemon still runs its own inline lifecycle sweep, so an unengaged
-        // driver means unloaded states are expected, not a fault.
-        try core.reply(.RPL_INFO, &.{}, "note: lifecycle driver not engaged; states reflect no driven phase");
+    if (!life.engaged()) {
+        // Never turn an unstarted runtime into an apparent healthy module set.
+        try core.reply(.RPL_INFO, &.{}, "note: this server module runtime has not started");
     }
 
-    const summary = std.fmt.bufPrint(&buf, "{d} modules, {d} commands, {d} aliases, {d} hooks, {d} degraded", .{
+    const summary = std.fmt.bufPrint(&buf, "{d} modules, {d} commands, {d} aliases, {d} hooks, {d} degraded, generation={d}", .{
         module_manifest.enabled.len,
         module_manifest.Live.commands.len,
         module_manifest.Live.alias_count,
         module_manifest.Live.hooks.len,
-        Life.degradedCount(),
+        life.degradedCount(),
+        life.generation(),
     }) catch "summary (format error)";
     try core.reply(.RPL_ENDOFINFO, &.{}, summary);
 }
@@ -160,15 +171,16 @@ fn commands(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
     const caps = registry.DispatchCaps{
         .registered = core.conn.session.registered(),
         .oper = core.conn.session.isOper(),
+        .ircx = core.conn.ircx,
         .disabled_features = core.services.config.disabled_features,
+        .module_gate = lifeGate(core),
     };
 
     // Detail form: COMMANDS <name>.
     if (inv.params.len >= 1 and inv.params[0].len != 0) {
         const want = inv.params[0];
-        for (module_manifest.Live.commands) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.spec.name, want)) continue;
-            const avail = registry.commandAvailable(entry.spec, caps);
+        if (module_manifest.Live.lookupCommand(want)) |entry| {
+            const avail = entryAvailable(entry, caps);
             var buf: [320]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "{s} [{s}] access={s}{s}{s} params>={d} {s}{s}", .{
                 entry.spec.name,
@@ -193,7 +205,7 @@ fn commands(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
     var buf: [400]u8 = undefined;
     var used: usize = 0;
     for (module_manifest.Live.commands) |entry| {
-        if (!registry.commandAvailable(entry.spec, caps)) continue;
+        if (!entryAvailable(entry, caps)) continue;
         const name = entry.spec.name;
         if (used + name.len + 1 > buf.len) {
             try core.reply(.RPL_INFO, &.{}, buf[0..used]);
@@ -396,23 +408,24 @@ test "introspect: MODULES is oper-gated at the registry gate, not only in the ha
 }
 
 test "introspect: the lifecycle view covers exactly the live module set in load order" {
-    const table = Life.healthTable();
+    var life: Runtime = .init(0);
+    const table = life.healthTable();
     try std.testing.expectEqual(module_manifest.enabled.len, table.len);
 
     // load_order is a permutation of the manifest indices, and each health row
     // agrees with the position the driver assigned it.
     var seen: [module_manifest.enabled.len]bool = @splat(false);
-    for (Life.load_order, 0..) |mi, position| {
+    for (Runtime.load_order, 0..) |mi, position| {
         try std.testing.expect(!seen[mi]);
         seen[mi] = true;
-        try std.testing.expectEqual(position, Life.health(mi).load_position);
+        try std.testing.expectEqual(position, life.health(mi).load_position);
     }
     for (seen) |s| try std.testing.expect(s);
 
     // Nothing has driven a phase in a unit test, so the display must say so
     // rather than implying every module is broken.
-    try std.testing.expect(!Life.engaged());
-    try std.testing.expectEqual(@as(usize, 0), Life.degradedCount());
+    try std.testing.expect(!life.engaged());
+    try std.testing.expectEqual(@as(usize, 0), life.degradedCount());
 }
 
 test "introspect: writeList renders empty, single, multiple, and over-long lists" {
@@ -427,4 +440,23 @@ test "introspect: writeList renders empty, single, multiple, and over-long lists
     const out = writeList(&buf, many);
     try std.testing.expect(out.len <= buf.len);
     try std.testing.expect(std.mem.endsWith(u8, out, "..."));
+}
+
+test "introspect: command availability respects IRCX and instance module health" {
+    const data = module_manifest.Live.lookupCommand("DATA") orelse return error.MissingCommand;
+    var caps = registry.DispatchCaps{ .registered = true, .oper = false };
+    try std.testing.expect(!entryAvailable(data, caps));
+    caps.ircx = true;
+    try std.testing.expect(entryAvailable(data, caps));
+    var online = true;
+    const Gate = struct {
+        fn available(ctx: *const anyopaque, _: usize) bool {
+            const value: *const bool = @ptrCast(@alignCast(ctx));
+            return value.*;
+        }
+    };
+    caps.module_gate = .{ .ctx = &online, .available = Gate.available };
+    try std.testing.expect(entryAvailable(data, caps));
+    online = false;
+    try std.testing.expect(!entryAvailable(data, caps));
 }

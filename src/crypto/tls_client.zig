@@ -623,6 +623,8 @@ pub const Client = struct {
     /// Test-only: offer TLS_AES_256_GCM_SHA384 as the sole cipher suite, so the
     /// SHA-384 key schedule is exercised end-to-end over the loopback.
     force_aes256_only_for_test: bool = false,
+    /// Present only in test builds; no live client storage for this fixture.
+    force_aes128_only_for_test: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// Test-only: constrain the authenticated offer before transcript building.
     force_chacha_only_for_test: bool = false,
 
@@ -819,7 +821,7 @@ pub const Client = struct {
         const offer = self.resume_offer.?;
         const encrypted = try sealRecordBatchAlloc(self.allocator, offer.suite, &self.client_early_keys, self.early_write_seq, .application_data, self.early_data.?, offer.peer_record_size_limit);
         defer self.allocator.free(encrypted.bytes);
-        const eoed_hs = [_]u8{ @intFromEnum(HandshakeType.end_of_early_data), 0, 0, 0 };
+        const eoed_hs = [_]u8{ @backingInt(HandshakeType.end_of_early_data), 0, 0, 0 };
         const end = try sealRecordBatchAlloc(self.allocator, offer.suite, &self.client_early_keys, encrypted.next_seq, .handshake, &eoed_hs, offer.peer_record_size_limit);
         defer self.allocator.free(end.bytes);
         try out.ensureUnusedCapacity(self.allocator, encrypted.bytes.len + end.bytes.len);
@@ -1033,6 +1035,13 @@ pub const Client = struct {
     pub fn offerOnlyHybridForTest(self: *Client) void {
         self.force_hybrid_only_for_test = true;
     }
+
+    /// Test-only namespace; no callable AES-128 fixture in production builds.
+    pub const TestSuiteOffer = if (builtin.is_test) struct {
+        pub fn aes128(client: *Client) void {
+            client.force_aes128_only_for_test = true;
+        }
+    } else struct {};
 
     /// Test-only: offer TLS_AES_256_GCM_SHA384 as the sole cipher suite.
     pub fn offerOnlyAes256ForTest(self: *Client) void {
@@ -1257,7 +1266,7 @@ pub const Client = struct {
         var seen: usize = 0;
         while (off < self.post_handshake_recv.items.len) {
             const message_start = off;
-            const typ: HandshakeType = @enumFromInt(self.post_handshake_recv.items[message_start]);
+            const typ: HandshakeType = @fromBackingInt(@intCast(self.post_handshake_recv.items[message_start]));
             if (typ != .new_session_ticket and typ != .key_update) return error.BadHandshake;
             if (self.post_handshake_recv.items.len - message_start < 4) break;
             const declared = readU24Bytes(self.post_handshake_recv.items[message_start + 1 ..][0..3]);
@@ -1270,8 +1279,8 @@ pub const Client = struct {
                 if (off != self.post_handshake_recv.items.len or msg.body[0] > 1) return error.BadHandshake;
                 try self.updateCandidateKey(&rx_secret, &rx_keys);
                 rx_seq = 0;
-                if (msg.body[0] == @intFromEnum(KeyUpdateRequest.requested)) {
-                    const reply_hs = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 };
+                if (msg.body[0] == @backingInt(KeyUpdateRequest.requested)) {
+                    const reply_hs = [_]u8{ @backingInt(HandshakeType.key_update), 0, 0, 1, 0 };
                     const encrypted = try sealRecordBatchAlloc(self.allocator, suite, &tx_keys, tx_seq, .handshake, &reply_hs, self.peer_record_size_limit);
                     defer self.allocator.free(encrypted.bytes);
                     try replies.appendSlice(self.allocator, encrypted.bytes);
@@ -1324,7 +1333,7 @@ pub const Client = struct {
         };
         const serialized = try tls_resumption.encodeStoredSession(self.allocator, .{
             .peer_record_size_limit = @intCast(self.peer_record_size_limit),
-            .suite = @intFromEnum(suite),
+            .suite = @backingInt(suite),
             .ticket_lifetime = ticket.ticket_lifetime,
             .ticket_age_add = ticket.ticket_age_add,
             .ticket = ticket.ticket,
@@ -1349,7 +1358,7 @@ pub const Client = struct {
     fn sendKeyUpdate(self: *Client, request: KeyUpdateRequest) Error!void {
         if (self.read_failed) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
-        const hs = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, @intFromEnum(request) };
+        const hs = [_]u8{ @backingInt(HandshakeType.key_update), 0, 0, 1, @backingInt(request) };
         const encrypted = try sealRecordBatchAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .handshake, &hs, self.peer_record_size_limit);
         defer self.allocator.free(encrypted.bytes);
         var secret = self.client_app_secret;
@@ -1699,8 +1708,10 @@ pub const Client = struct {
     }
 
     fn appendOfferedCipherSuites(self: *Client, body: *std.ArrayList(u8)) Error!void {
-        if (self.force_chacha_only_for_test and self.force_aes256_only_for_test) return error.BadState;
-        const suites: []const u16 = if (self.force_chacha_only_for_test) &.{0x1303} else if (self.force_aes256_only_for_test) &.{0x1302} else &.{ 0x1302, 0x1303, 0x1301 };
+        const aes128 = if (builtin.is_test) self.force_aes128_only_for_test else false;
+        const forced = @as(u8, @intFromBool(aes128)) + @intFromBool(self.force_chacha_only_for_test) + @intFromBool(self.force_aes256_only_for_test);
+        if (forced > 1) return error.BadState;
+        const suites: []const u16 = if (aes128) &.{0x1301} else if (self.force_chacha_only_for_test) &.{0x1303} else if (self.force_aes256_only_for_test) &.{0x1302} else &.{ 0x1302, 0x1303, 0x1301 };
         try appendU16(self.allocator, body, @intCast(suites.len * 2));
         for (suites) |suite| try appendU16(self.allocator, body, suite);
     }
@@ -2107,7 +2118,7 @@ pub const Client = struct {
             self.hs_read_seq += 1;
             consumePrefix(&self.recv_buf, rec.wire_len);
 
-            dbg("decrypted flight record ct={d} len={d}", .{ @intFromEnum(opened.content_type), opened.content.len });
+            dbg("decrypted flight record ct={d} len={d}", .{ @backingInt(opened.content_type), opened.content.len });
             if (opened.content_type == .alert) {
                 self.last_alert = tls_alert.parse(opened.content) catch return error.BadRecord;
                 return error.TlsAlert;
@@ -2125,13 +2136,13 @@ pub const Client = struct {
 
     fn tryProcessPlainHandshake(self: *Client) Error!bool {
         if (self.hs_plain.items.len >= 4) {
-            const typ: HandshakeType = @enumFromInt(self.hs_plain.items[0]);
+            const typ: HandshakeType = @fromBackingInt(@intCast(self.hs_plain.items[0]));
             const cap: usize = if (typ == .certificate or typ == .compressed_certificate) 512 * 1024 else 64 * 1024;
             if (readU24Bytes(self.hs_plain.items[1..4]) > cap) return error.BadHandshake;
         }
         var off: usize = 0;
         const msg = parseHandshakeMaybe(self.hs_plain.items, &off) orelse return false;
-        dbg("plain handshake state={s} msg typ={d} len={d}", .{ @tagName(self.state), @intFromEnum(msg.typ), msg.body.len });
+        dbg("plain handshake state={s} msg typ={d} len={d}", .{ @tagName(self.state), @backingInt(msg.typ), msg.body.len });
         switch (self.state) {
             .wait_encrypted_extensions => {
                 if (msg.typ != .encrypted_extensions) return error.BadHandshake;
@@ -2705,7 +2716,7 @@ pub const Client = struct {
         switch (key_pair) {
             .ed25519 => |kp| {
                 const sig = kp.sign(input) catch return error.BadSignature;
-                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
+                try appendU16(self.allocator, &body, @backingInt(tls_signature_scheme.SignatureScheme.ed25519));
                 try appendU16(self.allocator, &body, @intCast(sig.len));
                 try body.appendSlice(self.allocator, &sig);
             },
@@ -2713,7 +2724,7 @@ pub const Client = struct {
                 const sig = ecdsa_p256.sign(input, kp) catch return error.BadSignature;
                 var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
                 const der = ecdsa_p256.signatureToDer(sig, &der_buf) catch return error.BadSignature;
-                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256));
+                try appendU16(self.allocator, &body, @backingInt(tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256));
                 try appendU16(self.allocator, &body, @intCast(der.len));
                 try body.appendSlice(self.allocator, der);
             },
@@ -2725,7 +2736,7 @@ pub const Client = struct {
                 defer secureZero(&salt);
                 var sig_buf: [rsa_verify.max_bytes]u8 = undefined;
                 const sig = rsa_sign.signPss(key, .sha256, &mhash, &salt, &sig_buf) catch return error.BadSignature;
-                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.rsa_pss_rsae_sha256));
+                try appendU16(self.allocator, &body, @backingInt(tls_signature_scheme.SignatureScheme.rsa_pss_rsae_sha256));
                 try appendU16(self.allocator, &body, @intCast(sig.len));
                 try body.appendSlice(self.allocator, sig);
             },
@@ -2972,7 +2983,7 @@ fn writePlainRecord(allocator: Allocator, typ: tls_record.ContentType, fragment:
     if (fragment.len > tls_record.max_plaintext_len) return error.BadRecord;
     var out = try allocator.alloc(u8, tls_record.record_header_len + fragment.len);
     errdefer allocator.free(out);
-    out[0] = @intFromEnum(typ);
+    out[0] = @backingInt(typ);
     std.mem.writeInt(u16, out[1..3], 0x0301, .big);
     std.mem.writeInt(u16, out[3..5], @intCast(fragment.len), .big);
     @memcpy(out[5..], fragment);
@@ -3496,7 +3507,7 @@ fn leafSerialDer(cert_der: []const u8) ?[]const u8 {
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: HandshakeType, body: []const u8) Error!void {
     if (body.len > 0x00ff_ffff) return error.BadHandshake;
-    try out.append(allocator, @intFromEnum(typ));
+    try out.append(allocator, @backingInt(typ));
     try appendU24(allocator, out, body.len);
     try out.appendSlice(allocator, body);
 }
@@ -3504,7 +3515,7 @@ fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: HandshakeT
 fn parseHandshake(input: []const u8, offset: *usize) Error!HandshakeMsg {
     if (input.len - offset.* < 4) return error.BadHandshake;
     const start = offset.*;
-    const typ: HandshakeType = @enumFromInt(input[start]);
+    const typ: HandshakeType = @fromBackingInt(@intCast(input[start]));
     const len = readU24Bytes(input[start + 1 ..][0..3]);
     const body_start = start + 4;
     const body_end = body_start + len;
@@ -3996,7 +4007,7 @@ test "ClientHello record carries SNI, TLS 1.3, suites, and key shares" {
     defer allocator.free(record);
 
     // Assert
-    try std.testing.expectEqual(@as(u8, @intFromEnum(tls_record.ContentType.handshake)), record[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(tls_record.ContentType.handshake)), record[0]);
     try std.testing.expectEqual(.found, std.meta.activeTag(sni.extract(record)));
     const fragment = record[tls_record.record_header_len..];
     var off: usize = 0;
@@ -4456,7 +4467,7 @@ fn recordLimitConnectedClient(allocator: Allocator, receive_limit: u16) !Client 
 
 test "TLS 1.3 post-handshake: unknown types, empty and invalid KU lengths are fatal (fail-closed)" {
     const allocator = std.testing.allocator;
-    const invalid = [_][]const u8{ &.{ @intFromEnum(HandshakeType.finished), 0, 0, 0 }, "", &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 2 } };
+    const invalid = [_][]const u8{ &.{ @backingInt(HandshakeType.finished), 0, 0, 0 }, "", &.{ @backingInt(HandshakeType.key_update), 0, 0, 2 } };
     for (invalid) |fragment| {
         var client = try recordLimitConnectedClient(allocator, 16385);
         defer client.deinit();
@@ -4468,7 +4479,7 @@ test "TLS 1.3 post-handshake: unknown types, empty and invalid KU lengths are fa
     // A separate healthy epoch still accepts a complete terminal KU.
     var healthy = try recordLimitConnectedClient(allocator, 16385);
     defer healthy.deinit();
-    const ku = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 };
+    const ku = [_]u8{ @backingInt(HandshakeType.key_update), 0, 0, 1, 0 };
     const record = try sealRecordAlloc(allocator, .tls_aes_128_gcm_sha256, &healthy.server_app_keys, 0, .handshake, &ku);
     defer allocator.free(record);
     try std.testing.expectEqual(AppRead.control, try healthy.decryptApp(record));
@@ -4488,7 +4499,7 @@ test "exploit: TLS 1.3 post-handshake coalesced KeyUpdate flood from the server 
             var buf: std.ArrayList(u8) = .empty;
             errdefer buf.deinit(a);
             for (0..n) |_| {
-                try writeHandshake(a, &buf, .key_update, &[_]u8{@intFromEnum(KeyUpdateRequest.requested)});
+                try writeHandshake(a, &buf, .key_update, &[_]u8{@backingInt(KeyUpdateRequest.requested)});
             }
             return buf;
         }
@@ -4545,10 +4556,10 @@ fn buildTestServerHelloBody(
 ) ![]u8 {
     var exts: std.ArrayList(u8) = .empty;
     defer exts.deinit(allocator);
-    try appendU16(allocator, &exts, @intFromEnum(tls_extension.ExtensionType.supported_versions));
+    try appendU16(allocator, &exts, @backingInt(tls_extension.ExtensionType.supported_versions));
     try appendU16(allocator, &exts, 2);
     try appendU16(allocator, &exts, tls_supported_versions.tls13);
-    try appendU16(allocator, &exts, @intFromEnum(tls_extension.ExtensionType.key_share));
+    try appendU16(allocator, &exts, @backingInt(tls_extension.ExtensionType.key_share));
     try appendU16(allocator, &exts, @intCast(4 + key_exchange.len));
     try appendU16(allocator, &exts, group);
     try appendU16(allocator, &exts, @intCast(key_exchange.len));
@@ -4580,7 +4591,7 @@ test "TLS 1.3 ServerHello after HRR must keep the HRR cipher suite (RFC 8446 §4
     const swapped = try buildTestServerHelloBody(
         allocator,
         &client.legacy_session_id,
-        @intFromEnum(CipherSuite.tls_chacha20_poly1305_sha256),
+        @backingInt(CipherSuite.tls_chacha20_poly1305_sha256),
         supported_groups.NamedGroup.x25519.toInt(),
         &client.x25519_pair.public_key,
     );
@@ -4591,7 +4602,7 @@ test "TLS 1.3 ServerHello after HRR must keep the HRR cipher suite (RFC 8446 §4
     const kept = try buildTestServerHelloBody(
         allocator,
         &client.legacy_session_id,
-        @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256),
+        @backingInt(CipherSuite.tls_aes_128_gcm_sha256),
         supported_groups.NamedGroup.x25519.toInt(),
         &client.x25519_pair.public_key,
     );
@@ -4610,7 +4621,7 @@ test "exploit: a ServerHello after HRR with no key_share never derives traffic s
 
     var exts: std.ArrayList(u8) = .empty;
     defer exts.deinit(allocator);
-    try appendU16(allocator, &exts, @intFromEnum(tls_extension.ExtensionType.supported_versions));
+    try appendU16(allocator, &exts, @backingInt(tls_extension.ExtensionType.supported_versions));
     try appendU16(allocator, &exts, 2);
     try appendU16(allocator, &exts, tls_supported_versions.tls13);
 
@@ -4620,7 +4631,7 @@ test "exploit: a ServerHello after HRR with no key_share never derives traffic s
     try body.appendSlice(allocator, &(@as([32]u8, @splat(0x42))));
     try body.append(allocator, @intCast(client.legacy_session_id.len));
     try body.appendSlice(allocator, &client.legacy_session_id);
-    try appendU16(allocator, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+    try appendU16(allocator, &body, @backingInt(CipherSuite.tls_aes_128_gcm_sha256));
     try body.append(allocator, 0);
     try appendU16(allocator, &body, @intCast(exts.items.len));
     try body.appendSlice(allocator, exts.items);
@@ -4643,7 +4654,7 @@ test "TLS 1.3 ServerHello key_share group must be one the ClientHello offered (R
         const body = try buildTestServerHelloBody(
             allocator,
             &client.legacy_session_id,
-            @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256),
+            @backingInt(CipherSuite.tls_aes_128_gcm_sha256),
             supported_groups.NamedGroup.x25519.toInt(),
             &client.x25519_pair.public_key,
         );
@@ -4660,7 +4671,7 @@ test "TLS 1.3 ServerHello key_share group must be one the ClientHello offered (R
         const body = try buildTestServerHelloBody(
             allocator,
             &client.legacy_session_id,
-            @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256),
+            @backingInt(CipherSuite.tls_aes_128_gcm_sha256),
             supported_groups.NamedGroup.x25519.toInt(),
             &client.x25519_pair.public_key,
         );
@@ -4708,11 +4719,11 @@ fn buildTestHrr(allocator: Allocator, session_id: []const u8, cookie: []const u8
     var ext: std.ArrayList(u8) = .empty;
     defer ext.deinit(allocator);
     // supported_versions (server form): selected_version = TLS 1.3.
-    try appendU16(allocator, &ext, @intFromEnum(tls_extension.ExtensionType.supported_versions));
+    try appendU16(allocator, &ext, @backingInt(tls_extension.ExtensionType.supported_versions));
     try appendU16(allocator, &ext, 2);
     try appendU16(allocator, &ext, tls_supported_versions.tls13);
     // cookie: opaque cookie<1..2^16-1> (u16 length + bytes).
-    try appendU16(allocator, &ext, @intFromEnum(tls_extension.ExtensionType.cookie));
+    try appendU16(allocator, &ext, @backingInt(tls_extension.ExtensionType.cookie));
     try appendU16(allocator, &ext, @intCast(2 + cookie.len));
     try appendU16(allocator, &ext, @intCast(cookie.len));
     try ext.appendSlice(allocator, cookie);
@@ -4723,7 +4734,7 @@ fn buildTestHrr(allocator: Allocator, session_id: []const u8, cookie: []const u8
     try body.appendSlice(allocator, &hello_retry_request_random);
     try body.append(allocator, @intCast(session_id.len));
     try body.appendSlice(allocator, session_id);
-    try appendU16(allocator, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+    try appendU16(allocator, &body, @backingInt(CipherSuite.tls_aes_128_gcm_sha256));
     try body.append(allocator, 0); // null compression
     try appendU16(allocator, &body, @intCast(ext.items.len));
     try body.appendSlice(allocator, ext.items);
@@ -7255,7 +7266,7 @@ fn clientHelloHasExt(flight: []const u8, typ: tls_extension.ExtensionType) bool 
     const rec_end = tls_record.record_header_len + @as(usize, rec_len);
     if (rec_end > flight.len) return false;
     const hs = flight[tls_record.record_header_len..rec_end];
-    if (hs[0] != @intFromEnum(HandshakeType.client_hello)) return false;
+    if (hs[0] != @backingInt(HandshakeType.client_hello)) return false;
     var pos: usize = 4 + 2 + 32;
     if (hs.len < pos + 1) return false;
     const sid_len: usize = hs[pos];
@@ -7277,7 +7288,7 @@ fn clientHelloHasExt(flight: []const u8, typ: tls_extension.ExtensionType) bool 
         const len = std.mem.readInt(u16, hs[e + 2 ..][0..2], .big);
         const data_at = e + tls_extension.header_len;
         if (data_at + @as(usize, len) > ext_end) return false;
-        if (wire == @intFromEnum(typ)) return true;
+        if (wire == @backingInt(typ)) return true;
         e = data_at + len;
     }
     return false;
@@ -7485,7 +7496,7 @@ test "exploit: a change_cipher_spec with an illegal body is rejected by the clie
 /// Offset of the PSK binders list inside a ClientHello handshake message.
 /// The binder hashes everything before that list.
 fn gapK8TruncatedLen(hs: []const u8) !usize {
-    if (hs.len < 4 or hs[0] != @intFromEnum(HandshakeType.client_hello)) return error.TestUnexpectedResult;
+    if (hs.len < 4 or hs[0] != @backingInt(HandshakeType.client_hello)) return error.TestUnexpectedResult;
     var pos: usize = 4;
     if (hs.len < pos + 2 + 32 + 1) return error.TestUnexpectedResult;
     pos += 2 + 32;
@@ -7511,7 +7522,7 @@ fn gapK8TruncatedLen(hs: []const u8) !usize {
         const len = std.mem.readInt(u16, hs[e + 2 ..][0..2], .big);
         const data_at = e + tls_extension.header_len;
         if (data_at + @as(usize, len) > ext_end) return error.TestUnexpectedResult;
-        if (typ == @intFromEnum(tls_extension.ExtensionType.pre_shared_key)) {
+        if (typ == @backingInt(tls_extension.ExtensionType.pre_shared_key)) {
             const binders_at = try tls_psk.binderListOffset(hs[data_at .. data_at + len]);
             return data_at + binders_at;
         }
@@ -7885,7 +7896,7 @@ fn recordLimitPaddedWire(allocator: Allocator, keys: *const TrafficKeys, seq: u6
     const inner = try allocator.alloc(u8, content.len + 1 + padding);
     defer allocator.free(inner);
     @memcpy(inner[0..content.len], content);
-    inner[content.len] = @intFromEnum(tls_record.ContentType.application_data);
+    inner[content.len] = @backingInt(tls_record.ContentType.application_data);
     @memset(inner[content.len + 1 ..], 0);
     const out = try allocator.alloc(u8, 5 + inner.len + Aes128Gcm.tag_length);
     errdefer allocator.free(out);
@@ -7963,7 +7974,7 @@ test "TLS record limit: client NST and KU reassemble at every split with exact k
         try std.testing.expectEqualStrings("opaque", stored.ticket);
         try std.testing.expectEqual(@as(u16, 16385), stored.peer_record_size_limit);
     }
-    const ku = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 1 };
+    const ku = [_]u8{ @backingInt(HandshakeType.key_update), 0, 0, 1, 1 };
     for (1..ku.len) |split| {
         var client = try recordLimitConnectedClient(a, 64);
         defer client.deinit();
@@ -7983,7 +7994,7 @@ test "TLS record limit: client NST and KU reassemble at every split with exact k
         defer a.free(reply);
         const decoded = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_tx, 0, reply);
         defer a.free(decoded.content);
-        try std.testing.expectEqualSlices(u8, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 }, decoded.content);
+        try std.testing.expectEqualSlices(u8, &.{ @backingInt(HandshakeType.key_update), 0, 0, 1, 0 }, decoded.content);
         const app = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .application_data, "new epoch");
         defer a.free(app);
         const got = try client.decryptApp(app);
@@ -7997,7 +8008,7 @@ test "TLS record limit: client partial controls reject interleaving and KU follo
     for ([_]tls_record.ContentType{ .application_data, .alert }) |typ| {
         var client = try recordLimitConnectedClient(a, 64);
         defer client.deinit();
-        const prefix = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, &.{ @intFromEnum(HandshakeType.key_update), 0 });
+        const prefix = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, &.{ @backingInt(HandshakeType.key_update), 0 });
         defer a.free(prefix);
         try std.testing.expectEqual(AppRead.control, try client.decryptApp(prefix));
         const interleaved = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 1, typ, &.{ 2, 22 });
@@ -8007,7 +8018,7 @@ test "TLS record limit: client partial controls reject interleaving and KU follo
     }
     var client = try recordLimitConnectedClient(a, 64);
     defer client.deinit();
-    const invalid = [_]u8{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0, @intFromEnum(HandshakeType.new_session_ticket) };
+    const invalid = [_]u8{ @backingInt(HandshakeType.key_update), 0, 0, 1, 0, @backingInt(HandshakeType.new_session_ticket) };
     const record = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, &invalid);
     defer a.free(record);
     const before = client.server_app_keys;
@@ -8025,7 +8036,7 @@ test "TLS record limit: client KU tail OOM retains prefix epochs and exact retry
         defer client.deinit();
         const old_rx = client.server_app_keys;
         const old_tx = client.client_app_keys;
-        const first = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_rx, 0, .handshake, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1 });
+        const first = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_rx, 0, .handshake, &.{ @backingInt(HandshakeType.key_update), 0, 0, 1 });
         defer a.free(first);
         const tail = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_rx, 1, .handshake, &.{1});
         defer a.free(tail);
@@ -8041,13 +8052,13 @@ test "TLS record limit: client KU tail OOM retains prefix epochs and exact retry
             try std.testing.expectEqual(@as(u64, 0), client.app_write_seq);
             try std.testing.expectEqualDeep(old_rx, client.server_app_keys);
             try std.testing.expectEqualDeep(old_tx, client.client_app_keys);
-            try std.testing.expectEqualSlices(u8, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1 }, client.post_handshake_recv.items);
+            try std.testing.expectEqualSlices(u8, &.{ @backingInt(HandshakeType.key_update), 0, 0, 1 }, client.post_handshake_recv.items);
             try std.testing.expectEqual(@as(usize, 0), client.post_handshake_send.items.len);
             client.allocator = a;
             try std.testing.expectEqual(AppRead.control, try client.decryptApp(tail));
             const reply = (try client.takePendingSend()).?;
             defer a.free(reply);
-            const expected = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_tx, 0, .handshake, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 });
+            const expected = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_tx, 0, .handshake, &.{ @backingInt(HandshakeType.key_update), 0, 0, 1, 0 });
             defer a.free(expected);
             try std.testing.expectEqualSlices(u8, expected, reply);
             continue;
@@ -8070,7 +8081,7 @@ test "TLS record limit: client owned fatal batch keeps KU before new-epoch alert
     const first_len = 5 + @as(usize, std.mem.readInt(u16, alert[3..5], .big));
     const ku = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_tx, 0, alert[0..first_len]);
     defer a.free(ku.content);
-    try std.testing.expectEqualSlices(u8, &.{ @intFromEnum(HandshakeType.key_update), 0, 0, 1, 0 }, ku.content);
+    try std.testing.expectEqualSlices(u8, &.{ @backingInt(HandshakeType.key_update), 0, 0, 1, 0 }, ku.content);
     const fatal = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.client_app_keys, 0, alert[first_len..]);
     defer a.free(fatal.content);
     try std.testing.expectEqualSlices(u8, &.{ 2, 47 }, fatal.content);
@@ -8148,11 +8159,11 @@ test "TLS record limit: stored prior64 bounds every early-data record before new
     defer plaintext.deinit(a);
     while (off < wire.len) {
         const len = 5 + @as(usize, std.mem.readInt(u16, wire[off..][3..5], .big));
-        if (wire[off] == @intFromEnum(tls_record.ContentType.application_data)) {
+        if (wire[off] == @backingInt(tls_record.ContentType.application_data)) {
             try std.testing.expect(len - 5 - 16 <= 64);
             const opened = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.client_early_keys, seq, wire[off..][0..len]);
             defer a.free(opened.content);
-            if (opened.content_type == .application_data) try plaintext.appendSlice(a, opened.content) else try std.testing.expectEqualSlices(u8, &.{ @intFromEnum(HandshakeType.end_of_early_data), 0, 0, 0 }, opened.content);
+            if (opened.content_type == .application_data) try plaintext.appendSlice(a, opened.content) else try std.testing.expectEqualSlices(u8, &.{ @backingInt(HandshakeType.end_of_early_data), 0, 0, 0 }, opened.content);
             seq += 1;
         }
         off += len;
@@ -8218,7 +8229,7 @@ test "TLS record limit: bounded NST accepts grammar maximum and refuses impossib
     try std.testing.expectEqualSlices(u8, ticket_bytes, ticket.ticket);
     var invalid = try recordLimitConnectedClient(a, 64);
     defer invalid.deinit();
-    var header: [4]u8 = .{ @intFromEnum(HandshakeType.new_session_ticket), 0, 0, 0 };
+    var header: [4]u8 = .{ @backingInt(HandshakeType.new_session_ticket), 0, 0, 0 };
     header[1] = @intCast((131339 >> 16) & 255);
     header[2] = @intCast((131339 >> 8) & 255);
     header[3] = @intCast(131339 & 255);
@@ -8372,4 +8383,63 @@ test "TLS record limit: output custody selects HS alert before client Finished i
     try std.testing.expectEqualSlices(u8, &.{ 2, 50 }, opened.content);
     try std.testing.expectEqual(@as(u64, 1), client.hs_write_seq);
     try std.testing.expectEqual(@as(u64, 0), client.app_write_seq);
+}
+
+test "TLS AES128-only fixture offers exact wire suite and exchanges authenticated data" {
+    const server_mod = @import("tls_server.zig");
+    const a = std.testing.allocator;
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x73)));
+    var cert_buf: [1024]u8 = undefined;
+    const cert = try x509_selfsign.buildSelfSigned(&cert_buf, .{ .common_name = "irc.test", .not_before = 1_704_067_200, .not_after = 4_102_444_800, .serial = &.{ 0x73, 1 }, .key_pair = kp, .dns_names = &.{"irc.test"}, .is_ca = true });
+    var server = try server_mod.Server.init(a, .{ .cert_chain = &.{cert}, .signing_key = kp });
+    defer server.deinit();
+    var client = try Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &.{cert} });
+    defer client.deinit();
+    Client.TestSuiteOffer.aes128(&client);
+    const ch = try client.start();
+    defer a.free(ch);
+    // TLS record header, handshake header, version, random, session ID vector.
+    try std.testing.expect(ch.len >= 5 + 4 + 2 + 32 + 1);
+    var pos: usize = 5 + 4 + 2 + 32;
+    const sid_len = ch[pos];
+    pos += 1 + @as(usize, sid_len);
+    try std.testing.expect(ch.len >= pos + 4);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, ch[pos..][0..2], .big));
+    try std.testing.expectEqual(@as(u16, 0x1301), std.mem.readInt(u16, ch[pos + 2 ..][0..2], .big));
+    const flight = switch (try server.feed(ch)) {
+        .bytes_to_send => |bytes| bytes,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer a.free(flight);
+    const finished = switch (try client.feed(flight)) {
+        .bytes_to_send => |bytes| bytes,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer a.free(finished);
+    _ = try server.feed(finished);
+    try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+    try std.testing.expectEqual(CipherSuite.tls_aes_128_gcm_sha256, client.selected_suite.?);
+    try std.testing.expectEqualStrings("TLS_AES_128_GCM_SHA256", server.cipherName().?);
+    const down = try server.encrypt("AES128 server");
+    defer a.free(down);
+    const got_down = try client.decrypt(down);
+    defer a.free(got_down);
+    try std.testing.expectEqualStrings("AES128 server", got_down);
+    const up = try client.encrypt("AES128 client");
+    defer a.free(up);
+    const got_up = try server.decrypt(up);
+    defer a.free(got_up);
+    try std.testing.expectEqualStrings("AES128 client", got_up);
+}
+
+test "TLS AES128-only fixture rejects conflicting suite offers" {
+    const a = std.testing.allocator;
+    for ([_]u8{ 0, 1, 2 }) |variant| {
+        var client = try Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &.{} });
+        defer client.deinit();
+        Client.TestSuiteOffer.aes128(&client);
+        client.force_aes256_only_for_test = variant != 1;
+        client.force_chacha_only_for_test = variant != 0;
+        try std.testing.expectError(error.BadState, client.start());
+    }
 }

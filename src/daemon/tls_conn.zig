@@ -603,6 +603,60 @@ pub const TlsConn = struct {
         return .{ .accepted = accepted, .completed = true };
     }
 
+    /// Server-initiated KeyUpdate on a TX-offloaded connection. The daemon
+    /// never initiates one today (only peer-requested replies rotate TX), but
+    /// the adapter supports it with the same custody as `progressKernelReply`:
+    /// the 5-byte KeyUpdate is sent under the OLD kernel epoch, the rotated
+    /// epoch is installed at sequence 0, and only then is the engine secret
+    /// committed. The caller must invoke this only with the send queue drained
+    /// (the same precondition as TX attach), so no earlier plaintext record can
+    /// overtake or follow the KeyUpdate under the wrong epoch. If the socket
+    /// would block before byte one, nothing is sent and no state changes; the
+    /// caller may retry after draining.
+    pub fn initiateKernelKeyUpdate(self: *TlsConn, fd: i32, request_peer: bool) (Error || KtlsError || ktls.ControlError)!void {
+        if (!self.ktls_tx_offloaded or self.tx_ku_reply_pending or self.terminal_error != null or
+            self.hasPreparedWrite() or self.control_turn_active) return error.BadState;
+        const engine = try self.engine13();
+        engine.app_write_seq = self.kernelSequence(fd, .tx) catch |err| {
+            self.terminal_error = err;
+            return err;
+        };
+        var prepared = try engine.prepareKernelKeyUpdate(.tx);
+        defer prepared.deinit();
+        self.control_turn_active = true;
+        defer self.control_turn_active = false;
+        const body = [_]u8{ 24, 0, 0, 1, if (request_peer) 1 else 0 };
+        var sent: usize = 0;
+        var blocked_retries: usize = 0;
+        while (sent < body.len) {
+            const accepted = ktls.sendControl(fd, .handshake, body[sent..]) catch |err| {
+                if (err == error.WouldBlock and sent == 0) return error.WouldBlock;
+                if (err == error.WouldBlock) {
+                    // A partial KeyUpdate already reached the peer, so the new
+                    // epoch must be installed or the connection is terminal.
+                    blocked_retries += 1;
+                    if (blocked_retries > 1024) {
+                        self.terminal_error = error.WouldBlock;
+                        return error.WouldBlock;
+                    }
+                    continue;
+                }
+                self.terminal_error = err;
+                return err;
+            };
+            if (accepted == 0) return error.WouldBlock;
+            sent += accepted;
+        }
+        var buf: [ktls.max_crypto_info_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
+        const encoded = try encodeKtlsCryptoInfo(prepared.params(), &buf);
+        ktls.attachTx(fd, encoded) catch |err| {
+            self.terminal_error = err;
+            return err;
+        };
+        prepared.commit();
+    }
+
     fn freebsdKtlsCipher(cipher: tls_server.Server.KtlsCipher) i32 {
         return switch (cipher) {
             .aes_128_gcm, .aes_256_gcm => kernel_other.crypto_aes_nist_gcm_16,
@@ -1684,13 +1738,28 @@ test "buildKtlsTxCryptoInfo produces a kernel-shaped TLS 1.3 crypto_info post-ha
     _ = try conn.onInbound(cfin);
     try std.testing.expect(conn.handshakeDone());
 
-    // Real handshake keys → a well-formed AES-128-GCM crypto_info (40 bytes,
-    // version 0x0304, cipher_type 51) — the same shape the kernel accepted in
-    // ktls.zig's TLS_TX loopback test, now sourced from a live TlsConn session.
+    // Check the actual negotiated suite's kernel ABI and exact TX material.
+    const engine = &conn.engine.tls13;
+    const suite = @backingInt(engine.selected_suite.?);
+    const shape: struct { len: usize, cipher: ktls.CipherType, key_len: usize, iv_len: usize, salt_len: usize } = switch (suite) {
+        0x1301 => .{ .len = 40, .cipher = .aes_gcm_128, .key_len = 16, .iv_len = 8, .salt_len = 4 },
+        0x1302 => .{ .len = 56, .cipher = .aes_gcm_256, .key_len = 32, .iv_len = 8, .salt_len = 4 },
+        0x1303 => .{ .len = 56, .cipher = .chacha20_poly1305, .key_len = 32, .iv_len = 12, .salt_len = 0 },
+        else => return error.TestUnexpectedResult,
+    };
     const encoded = try conn.buildKtlsTxCryptoInfo(&buf);
-    try std.testing.expectEqual(@as(usize, 40), encoded.len);
+    try std.testing.expectEqual(shape.len, encoded.len);
     try std.testing.expectEqual(ktls.TLS_1_3_VERSION, std.mem.readInt(u16, encoded[0..2], native));
-    try std.testing.expectEqual(ktls.CipherType.aes_gcm_128.toInt(), std.mem.readInt(u16, encoded[2..4], native));
+    try std.testing.expectEqual(shape.cipher.toInt(), std.mem.readInt(u16, encoded[2..4], native));
+    var at: usize = 4;
+    try std.testing.expectEqualSlices(u8, engine.server_app_keys.iv[shape.salt_len..], encoded[at..][0..shape.iv_len]);
+    at += shape.iv_len;
+    try std.testing.expectEqualSlices(u8, engine.server_app_keys.key[0..shape.key_len], encoded[at..][0..shape.key_len]);
+    at += shape.key_len;
+    try std.testing.expectEqualSlices(u8, engine.server_app_keys.iv[0..shape.salt_len], encoded[at..][0..shape.salt_len]);
+    at += shape.salt_len;
+    try std.testing.expectEqual(engine.app_write_seq, std.mem.readInt(u64, encoded[at..][0..8], .big));
+    try std.testing.expectEqual(encoded.len, at + 8);
 }
 
 fn testTcpSocketOrSkip() !linux.fd_t {
@@ -3568,17 +3637,13 @@ test "TLS record limit: adapter pending KU transfer OOM retains exact engine cus
         const pair = try PreparedOutputTestPair.create(.tls13);
         defer pair.destroy();
         const engine = &pair.conn.engine.tls13;
-        try std.testing.expectEqual(@as(u16, 0x1301), @backingInt(engine.selected_suite.?));
-        // Use the actual authenticated pair's RX key and next record sequence.
-        // A requested KU leaves the old-key response owned by the engine.
-        const inner = [_]u8{ 24, 0, 0, 1, 1, 22 };
-        var request: [5 + inner.len + 16]u8 = undefined;
-        const aad = tls_record.makeAdditionalData(inner.len + 16);
-        @memcpy(request[0..5], &aad);
-        var tag: [16]u8 = undefined;
-        std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(request[5..][0..inner.len], &tag, &inner, &aad, tls_record.deriveNonce(engine.client_app_keys.iv, engine.app_read_seq), engine.client_app_keys.key[0..16].*);
-        @memcpy(request[5 + inner.len ..], &tag);
-        const empty = try engine.decrypt(&request);
+        // The authenticated client seals a requested KU with its negotiated
+        // suite and advances its own write epoch as a real peer would.
+        try std.testing.expectEqual(engine.app_read_seq, pair.client.tls13.app_write_seq);
+        try pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{5});
+        const request = (try pair.client.tls13.takePendingSend()) orelse return error.TestUnexpectedResult;
+        defer a.free(request);
+        const empty = try engine.decrypt(request);
         a.free(empty);
         try std.testing.expect(engine.post_handshake_send.items.len > 0);
         try std.testing.expectError(error.BadState, engine.exportResume());
@@ -4052,6 +4117,257 @@ test "TLS3: authenticated Linux kernel all suites four modes split KU EOR and ty
             }
         }
         try tls3AuthenticatedKernelProof(suite, true, true, 1, true);
+    }
+}
+
+fn tls3KernelCipher(suite: u16) ktls.Cipher {
+    return switch (suite) {
+        0x1301 => .aes_gcm_128,
+        0x1302 => .aes_gcm_256,
+        0x1303 => .chacha20_poly1305,
+        else => unreachable,
+    };
+}
+
+fn tls3KernelExpectKeyUpdate(pair: *PreparedOutputTestPair, sockets: Tls3TcpPair, requested: bool) !void {
+    var control_buf: [64]u8 = undefined;
+    for (0..32) |_| {
+        switch (try tls3KernelNext(&pair.conn, sockets.server, &control_buf)) {
+            .progress => continue,
+            .key_update => |ku| {
+                try std.testing.expectEqual(requested, ku.requested);
+                try std.testing.expect(ku.software_reply == null);
+                return;
+            },
+            .application => return error.TestUnexpectedResult,
+        }
+    }
+    return error.TestTimeout;
+}
+
+fn tls3KernelReplyFragment(pair: *PreparedOutputTestPair, sockets: Tls3TcpPair) !bool {
+    const a = std.testing.allocator;
+    const progress = try pair.conn.progressKernelReply(sockets.server, 1);
+    try std.testing.expectEqual(@as(usize, 1), progress.accepted);
+    const wire = try Tls3TcpPair.record(sockets.peer, a);
+    defer a.free(wire);
+    const content = try pair.client.tls13.decrypt(wire);
+    defer a.free(content);
+    try std.testing.expectEqual(@as(usize, 0), content.len);
+    return progress.completed;
+}
+
+fn tls3KernelSendAndExpect(pair: *PreparedOutputTestPair, sockets: Tls3TcpPair, text: []const u8) !void {
+    const a = std.testing.allocator;
+    const wire = try pair.client.tls13.encrypt(text);
+    defer a.free(wire);
+    try Tls3TcpPair.send(sockets.peer, wire);
+    var control_buf: [128]u8 = undefined;
+    switch (try tls3KernelNext(&pair.conn, sockets.server, &control_buf)) {
+        .application => |plain| try std.testing.expectEqualStrings(text, plain),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn tls3KernelReceiveAndExpect(pair: *PreparedOutputTestPair, sockets: Tls3TcpPair, text: []const u8) !void {
+    const a = std.testing.allocator;
+    try Tls3TcpPair.send(sockets.server, text);
+    const wire = try Tls3TcpPair.record(sockets.peer, a);
+    defer a.free(wire);
+    const content = try pair.client.tls13.decrypt(wire);
+    defer a.free(content);
+    try std.testing.expectEqualStrings(text, content);
+}
+
+test "TLS3 kernel txrx unrequested and consecutive peer KeyUpdates survive" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        const pair = try tls3SuitePair(suite);
+        defer pair.destroy();
+        const sockets = try Tls3TcpPair.open();
+        defer sockets.deinit();
+        try pair.conn.enableKtlsTx(sockets.server);
+        try pair.conn.enableKtlsRx(sockets.server);
+        const cipher = tls3KernelCipher(suite);
+
+        // Epoch 1: update_not_requested rotates only the client's send key.
+        const tx_secret_before = pair.client.tls13.server_app_secret;
+        try pair.client.tls13.sendKeyUpdateFragmentsForTest(false, &.{ 2, 3 });
+        const first_request = (try pair.client.tls13.takePendingSend()).?;
+        defer a.free(first_request);
+        try Tls3TcpPair.send(sockets.peer, first_request);
+        try tls3KernelExpectKeyUpdate(pair, sockets, false);
+        try std.testing.expect(!pair.conn.tx_ku_reply_pending);
+        try std.testing.expectEqualSlices(u8, &tx_secret_before, &pair.client.tls13.server_app_secret);
+        try std.testing.expectEqualSlices(u8, &pair.client.tls13.client_app_secret, &pair.conn.engine.tls13.client_app_secret);
+        try tls3ExpectKernelTuple(suite, sockets.server, .rx, cipher, &pair.client.tls13.client_app_secret, 0);
+        try pair.conn.validateKernelTxEpoch(sockets.server);
+        try tls3KernelSendAndExpect(pair, sockets, "txrx epoch one client data");
+        try tls3KernelReceiveAndExpect(pair, sockets, "txrx epoch one server data");
+
+        // Epoch 2: update_requested starts a typed TX reply. Queue epoch 3
+        // while that reply is only partly sent; the adapter must not consume
+        // it until the old-epoch reply completes and installs epoch 2.
+        try pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 1, 4 });
+        const second_request = (try pair.client.tls13.takePendingSend()).?;
+        defer a.free(second_request);
+        try Tls3TcpPair.send(sockets.peer, second_request);
+        try tls3KernelExpectKeyUpdate(pair, sockets, true);
+        try std.testing.expect(pair.conn.tx_ku_reply_pending);
+        try std.testing.expect(!try tls3KernelReplyFragment(pair, sockets));
+        try std.testing.expect(!try tls3KernelReplyFragment(pair, sockets));
+        try std.testing.expectEqual(@as(u3, 2), pair.conn.tx_ku_reply_sent);
+        const second_app = try pair.client.tls13.encrypt("txrx epoch two client data");
+        defer a.free(second_app);
+        try Tls3TcpPair.send(sockets.peer, second_app);
+
+        try pair.client.tls13.sendKeyUpdateFragmentsForTest(false, &.{ 3, 2 });
+        const third_request = (try pair.client.tls13.takePendingSend()).?;
+        defer a.free(third_request);
+        const third_app = try pair.client.tls13.encrypt("txrx epoch three client data");
+        defer a.free(third_app);
+        try Tls3TcpPair.send(sockets.peer, third_request);
+        var control_buf: [64]u8 = undefined;
+        try std.testing.expectError(error.BadState, pair.conn.readKernelControl(sockets.server, &control_buf));
+        try std.testing.expectEqual(@as(u3, 2), pair.conn.tx_ku_reply_sent);
+
+        try std.testing.expect(!try tls3KernelReplyFragment(pair, sockets));
+        try std.testing.expect(!try tls3KernelReplyFragment(pair, sockets));
+        try std.testing.expect(try tls3KernelReplyFragment(pair, sockets));
+        try std.testing.expect(!pair.conn.tx_ku_reply_pending);
+        try tls3ExpectKernelTuple(suite, sockets.server, .tx, cipher, &pair.client.tls13.server_app_secret, 0);
+        switch (try tls3KernelNext(&pair.conn, sockets.server, &control_buf)) {
+            .application => |plain| try std.testing.expectEqualStrings("txrx epoch two client data", plain),
+            else => return error.TestUnexpectedResult,
+        }
+        try tls3KernelReceiveAndExpect(pair, sockets, "txrx epoch two server data");
+
+        // Epoch 3 was queued, not consumed, during the partial reply.
+        try tls3KernelExpectKeyUpdate(pair, sockets, false);
+        try std.testing.expect(!pair.conn.tx_ku_reply_pending);
+        try tls3ExpectKernelTuple(suite, sockets.server, .rx, cipher, &pair.client.tls13.client_app_secret, 0);
+        try Tls3TcpPair.send(sockets.peer, third_app);
+        switch (try tls3KernelNext(&pair.conn, sockets.server, &control_buf)) {
+            .application => |plain| try std.testing.expectEqualStrings("txrx epoch three client data", plain),
+            else => return error.TestUnexpectedResult,
+        }
+        try tls3KernelReceiveAndExpect(pair, sockets, "txrx epoch three server data");
+    }
+}
+
+test "TLS3 kernel server-initiated KeyUpdate rotates TX epoch" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        for ([_]bool{ false, true }) |rx| {
+            const pair = try tls3SuitePair(suite);
+            defer pair.destroy();
+            const sockets = try Tls3TcpPair.open();
+            defer sockets.deinit();
+            try pair.conn.enableKtlsTx(sockets.server);
+            if (rx) try pair.conn.enableKtlsRx(sockets.server);
+            const cipher = tls3KernelCipher(suite);
+
+            // Unrequested initiation: only the server TX epoch rotates.
+            try pair.conn.initiateKernelKeyUpdate(sockets.server, false);
+            const ku_wire = try Tls3TcpPair.record(sockets.peer, a);
+            defer a.free(ku_wire);
+            const ku_content = try pair.client.tls13.decrypt(ku_wire);
+            defer a.free(ku_content);
+            try std.testing.expectEqual(@as(usize, 0), ku_content.len);
+            try std.testing.expectEqualSlices(u8, &pair.client.tls13.server_app_secret, &pair.conn.engine.tls13.server_app_secret);
+            try tls3ExpectKernelTuple(suite, sockets.server, .tx, cipher, &pair.client.tls13.server_app_secret, 0);
+            try tls3KernelReceiveAndExpect(pair, sockets, "server initiated epoch one data");
+            if (rx) try tls3KernelSendAndExpect(pair, sockets, "server initiated epoch one client data");
+
+            // Requested initiation: the client answers with its own KeyUpdate,
+            // which rotates the RX epoch when RX is offloaded.
+            try pair.conn.initiateKernelKeyUpdate(sockets.server, true);
+            const ku2_wire = try Tls3TcpPair.record(sockets.peer, a);
+            defer a.free(ku2_wire);
+            const ku2_content = try pair.client.tls13.decrypt(ku2_wire);
+            defer a.free(ku2_content);
+            try std.testing.expectEqual(@as(usize, 0), ku2_content.len);
+            try std.testing.expectEqualSlices(u8, &pair.client.tls13.server_app_secret, &pair.conn.engine.tls13.server_app_secret);
+            try tls3ExpectKernelTuple(suite, sockets.server, .tx, cipher, &pair.client.tls13.server_app_secret, 0);
+            if (rx) {
+                const response = (try pair.client.tls13.takePendingSend()) orelse return error.TestUnexpectedResult;
+                defer a.free(response);
+                try Tls3TcpPair.send(sockets.peer, response);
+                try tls3KernelExpectKeyUpdate(pair, sockets, false);
+                try tls3ExpectKernelTuple(suite, sockets.server, .rx, cipher, &pair.client.tls13.client_app_secret, 0);
+                try tls3KernelSendAndExpect(pair, sockets, "server initiated epoch two client data");
+            }
+            try tls3KernelReceiveAndExpect(pair, sockets, "server initiated epoch two data");
+        }
+    }
+}
+
+test "TLS3 kernel txrx capture after completed rekey adopts on same fd" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const tls_snapshot = @import("helix/tls_snapshot.zig");
+    for ([_]u16{ 0x1301, 0x1303 }) |suite| {
+        const pair = try tls3SuitePair(suite);
+        defer pair.destroy();
+        const sockets = try Tls3TcpPair.open();
+        defer sockets.deinit();
+        try pair.conn.enableKtlsTx(sockets.server);
+        try pair.conn.enableKtlsRx(sockets.server);
+
+        try pair.client.tls13.sendKeyUpdateFragmentsForTest(true, &.{ 2, 3 });
+        const request = (try pair.client.tls13.takePendingSend()).?;
+        defer a.free(request);
+        try Tls3TcpPair.send(sockets.peer, request);
+        try tls3KernelExpectKeyUpdate(pair, sockets, true);
+        while (!try tls3KernelReplyFragment(pair, sockets)) {}
+        try tls3KernelSendAndExpect(pair, sockets, "completed rekey client data");
+        try tls3KernelReceiveAndExpect(pair, sockets, "completed rekey server data");
+
+        var capture = try pair.conn.prepareCapture(a, .{
+            .fd = sockets.server,
+            .tx_offloaded = true,
+            .rx_offloaded = true,
+            .wire_chunks = &.{},
+            .deferred_plain = &.{},
+            .deferred_ciphertext_charge = 0,
+            .control_charge = 0,
+            .queue_cap = 4096,
+            .kernel_tx_prefix_remaining = 0,
+        });
+        defer capture.deinit();
+        const wire = try tls_snapshot.encode(a, .{
+            .fd = sockets.server,
+            .state = capture.state,
+            .pending_out = capture.pending_out,
+            .tx_offloaded = true,
+            .rx_offloaded = true,
+            .kernel_tx_prefix_remaining = capture.kernel_tx_prefix_remaining,
+        });
+        defer a.free(wire);
+        const decoded = try tls_snapshot.decodeCurrent(wire);
+        var successor = try TlsConn.resumeFrom(a, pair.conn.cfg13, null, decoded.state);
+        defer successor.deinit();
+        try successor.restoreInheritedOffload(sockets.server, true, true);
+
+        const client_wire = try pair.client.tls13.encrypt("adopted rekey client data");
+        defer a.free(client_wire);
+        try Tls3TcpPair.send(sockets.peer, client_wire);
+        var control_buf: [128]u8 = undefined;
+        switch (try tls3KernelNext(&successor, sockets.server, &control_buf)) {
+            .application => |plain| try std.testing.expectEqualStrings("adopted rekey client data", plain),
+            else => return error.TestUnexpectedResult,
+        }
+        try Tls3TcpPair.send(sockets.server, "adopted rekey server data");
+        const server_wire = try Tls3TcpPair.record(sockets.peer, a);
+        defer a.free(server_wire);
+        const server_plain = try pair.client.tls13.decrypt(server_wire);
+        defer a.free(server_plain);
+        try std.testing.expectEqualStrings("adopted rekey server data", server_plain);
     }
 }
 

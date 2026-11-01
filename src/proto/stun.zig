@@ -239,7 +239,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Message {
         const value = bytes[cursor..][0..value_len];
         cursor += padded;
 
-        const attr: Attribute = switch (@as(AttributeType, @enumFromInt(raw_type))) {
+        const attr: Attribute = switch (@as(AttributeType, @fromBackingInt(@intCast(raw_type)))) {
             .mapped_address => .{ .mapped_address = try decodeAddressValue(value, header.transaction_id, false) },
             .xor_mapped_address => .{ .xor_mapped_address = try decodeAddressValue(value, header.transaction_id, true) },
             .username => .{ .username = value },
@@ -266,28 +266,28 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Message {
 }
 
 pub fn computeMessageIntegrity(bytes: []const u8, key: []const u8) Error![message_integrity_len]u8 {
-    const found = try findAttribute(bytes, @intFromEnum(AttributeType.message_integrity));
+    const found = try findAttribute(bytes, @backingInt(AttributeType.message_integrity));
     if (found.value_len != message_integrity_len) return error.BadMessageIntegrityLength;
     const body_len_for_mac: u16 = @intCast((found.attr_offset - header_len) + 4 + message_integrity_len);
     return computeIntegrityPrefix(bytes[0..found.attr_offset], body_len_for_mac, key);
 }
 
 pub fn verifyMessageIntegrity(bytes: []const u8, key: []const u8) Error!bool {
-    const found = try findAttribute(bytes, @intFromEnum(AttributeType.message_integrity));
+    const found = try findAttribute(bytes, @backingInt(AttributeType.message_integrity));
     const expected = try computeMessageIntegrity(bytes, key);
     const actual = bytes[found.value_offset..][0..message_integrity_len];
     return timingSafeEql(&expected, actual);
 }
 
 pub fn computeFingerprint(bytes: []const u8) Error!u32 {
-    const found = try findAttribute(bytes, @intFromEnum(AttributeType.fingerprint));
+    const found = try findAttribute(bytes, @backingInt(AttributeType.fingerprint));
     if (found.value_len != 4) return error.BadFingerprintLength;
     const body_len_for_fp: u16 = @intCast((found.attr_offset - header_len) + 8);
     return computeFingerprintPrefix(bytes[0..found.attr_offset], body_len_for_fp);
 }
 
 pub fn verifyFingerprint(bytes: []const u8) Error!bool {
-    const found = try findAttribute(bytes, @intFromEnum(AttributeType.fingerprint));
+    const found = try findAttribute(bytes, @backingInt(AttributeType.fingerprint));
     if (found.value_len != 4) return error.BadFingerprintLength;
     const header = try readHeader(bytes);
     if (found.value_offset + 4 != header_len + header.body_len) return false;
@@ -337,7 +337,7 @@ fn readHeader(bytes: []const u8) Error!Header {
     var transaction_id: TransactionId = undefined;
     @memcpy(&transaction_id, bytes[8..20]);
     return .{
-        .typ = @enumFromInt(raw_type),
+        .typ = @fromBackingInt(@intCast(raw_type)),
         .body_len = body_len,
         .transaction_id = transaction_id,
     };
@@ -345,7 +345,7 @@ fn readHeader(bytes: []const u8) Error!Header {
 
 fn writeHeader(out: []u8, typ: MessageType, body_len: u16, transaction_id: TransactionId) void {
     std.debug.assert(out.len == header_len);
-    writeU16(out[0..2], @intFromEnum(typ));
+    writeU16(out[0..2], @backingInt(typ));
     writeU16(out[2..4], body_len);
     writeU32(out[4..8], magic_cookie);
     @memcpy(out[8..20], &transaction_id);
@@ -372,7 +372,7 @@ fn findAttribute(bytes: []const u8, wanted_type: u16) Error!FoundAttribute {
         }
         cursor += padded;
     }
-    return switch (@as(AttributeType, @enumFromInt(wanted_type))) {
+    return switch (@as(AttributeType, @fromBackingInt(@intCast(wanted_type)))) {
         .message_integrity => error.MessageIntegrityMissing,
         .fingerprint => error.FingerprintMissing,
         else => error.Truncated,
@@ -442,7 +442,7 @@ fn writeRawAttr(out: []u8, cursor: *usize, raw_type: u16, value: []const u8) voi
 }
 
 fn writeAttrHeader(out: []u8, cursor: *usize, typ: AttributeType, value_len: u16) void {
-    writeU16(out[cursor.*..][0..2], @intFromEnum(typ));
+    writeU16(out[cursor.*..][0..2], @backingInt(typ));
     writeU16(out[cursor.* + 2 ..][0..2], value_len);
     cursor.* += 4;
 }
@@ -639,7 +639,7 @@ test "MESSAGE-INTEGRITY compute and verify rejects tampering" {
 
     try std.testing.expect(try verifyMessageIntegrity(bytes, "shared-secret"));
     const expected = try computeMessageIntegrity(bytes, "shared-secret");
-    const found = try findAttribute(bytes, @intFromEnum(AttributeType.message_integrity));
+    const found = try findAttribute(bytes, @backingInt(AttributeType.message_integrity));
     try std.testing.expectEqualSlices(u8, &expected, bytes[found.value_offset..][0..message_integrity_len]);
 
     const tampered = try allocator.dupe(u8, bytes);
@@ -659,7 +659,7 @@ test "FINGERPRINT compute and verify rejects tampering" {
 
     try std.testing.expect(try verifyFingerprint(bytes));
     const expected = try computeFingerprint(bytes);
-    const found = try findAttribute(bytes, @intFromEnum(AttributeType.fingerprint));
+    const found = try findAttribute(bytes, @backingInt(AttributeType.fingerprint));
     try std.testing.expectEqual(expected, readU32(bytes[found.value_offset..][0..4]));
 
     const tampered = try allocator.dupe(u8, bytes);

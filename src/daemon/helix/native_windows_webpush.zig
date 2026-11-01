@@ -106,7 +106,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const webpush.Sna
     writer.writeU32(@intCast(total));
     writer.writeU16(@intCast(snapshot.jobs.len));
     writer.writeU16(@intCast(snapshot.dead.len));
-    writer.writeByte(@intFromEnum(snapshot.execution));
+    writer.writeByte(@backingInt(snapshot.execution));
     writer.writeBytes(&.{ 0, 0, 0, 0, 0, 0, 0 });
     writer.writeU64(sent);
     writer.writeU64(failed);

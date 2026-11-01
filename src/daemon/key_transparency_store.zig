@@ -95,7 +95,7 @@ pub fn indexKey(
     i += account.len;
     out[i] = 0x1f;
     i += 1;
-    out[i] = @intFromEnum(kind);
+    out[i] = @backingInt(kind);
     i += 1;
     out[i] = 0x1f;
     i += 1;
@@ -505,7 +505,7 @@ fn validateAllKtRows(store: *const OroStore, log: *const kt.KeyTransparencyLog) 
     var seen_indexes: usize = 0;
     var seen_events: usize = 0;
     var seen_checkpoints: usize = 0;
-    var it = store.maps[@intFromEnum(store_mod.Family.props)].map.iterator();
+    var it = store.maps[@backingInt(store_mod.Family.props)].map.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (!std.mem.startsWith(u8, key, key_prefix)) continue;

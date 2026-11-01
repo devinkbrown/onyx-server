@@ -28,7 +28,7 @@ pub const NoImplicitNamesNumeric = enum(u16) {
 
     /// Return the wire numeric code.
     pub fn code(self: NoImplicitNamesNumeric) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

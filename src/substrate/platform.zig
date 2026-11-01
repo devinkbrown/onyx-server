@@ -61,6 +61,69 @@ pub fn monotonicMillis() i64 {
     }
 }
 
+/// Checked awake-domain interval clock. Its origin is shared across same-host
+/// exec, but no wall-time or elapsed-suspend guarantee is made.
+pub fn monotonicMillisChecked() ?i64 {
+    switch (os_tag) {
+        .linux => {
+            var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+            const ok = std.os.linux.errno(std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts)) == .SUCCESS;
+            const sec = std.math.cast(i64, ts.sec) orelse return null;
+            const nsec = std.math.cast(i64, ts.nsec) orelse return null;
+            return checkedMonotonicParts(ok, sec, nsec);
+        },
+        .windows => {
+            var freq: i64 = 0;
+            var count: i64 = 0;
+            // Zig's declarations return BOOL: zero is failure.
+            const freq_ok = std.os.windows.ntdll.RtlQueryPerformanceFrequency(&freq).toBool();
+            const count_ok = std.os.windows.ntdll.RtlQueryPerformanceCounter(&count).toBool();
+            return checkedPerformanceMillis(freq_ok, count_ok, freq, count);
+        },
+        else => {
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+            const ok = std.c.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts) == 0;
+            const sec = std.math.cast(i64, ts.sec) orelse return null;
+            const nsec = std.math.cast(i64, ts.nsec) orelse return null;
+            return checkedMonotonicParts(ok, sec, nsec);
+        },
+    }
+}
+fn checkedMonotonicParts(ok: bool, sec: i64, nsec: i64) ?i64 {
+    if (!ok) return null;
+    return checkedUnixMillis(sec, nsec);
+}
+fn checkedPerformanceMillis(freq_ok: bool, count_ok: bool, freq: i64, count: i64) ?i64 {
+    if (!freq_ok or !count_ok or freq <= 0 or count < 0) return null;
+    const millis = @divTrunc(@as(i128, count) * 1000, @as(i128, freq));
+    if (millis > std.math.maxInt(i64)) return null;
+    return @intCast(millis);
+}
+
+test "checked monotonic clock rejects failed and invalid raw readings" {
+    const t = std.testing;
+    try t.expect(checkedMonotonicParts(false, 1, 0) == null);
+    try t.expect(checkedMonotonicParts(true, -1, 0) == null);
+    try t.expect(checkedMonotonicParts(true, 1, -1) == null);
+    try t.expect(checkedMonotonicParts(true, 1, 1_000_000_000) == null);
+    try t.expect(checkedMonotonicParts(true, std.math.maxInt(i64), 0) == null);
+    try t.expectEqual(@as(?i64, 1234), checkedMonotonicParts(true, 1, 234_999_999));
+    try t.expect(checkedPerformanceMillis(false, true, 1, 1) == null);
+    try t.expect(checkedPerformanceMillis(true, false, 1, 1) == null);
+    try t.expect(checkedPerformanceMillis(true, true, 0, 1) == null);
+    try t.expect(checkedPerformanceMillis(true, true, -1, 1) == null);
+    try t.expect(checkedPerformanceMillis(true, true, 1, -1) == null);
+    try t.expect(checkedPerformanceMillis(true, true, 1, std.math.maxInt(i64)) == null);
+    try t.expectEqual(@as(?i64, 1500), checkedPerformanceMillis(true, true, 2, 3));
+    const nack = @import("rtp_nack.zig");
+    var cache = nack.RetransmitBuffer.init(t.allocator, 1);
+    defer cache.deinit();
+    try cache.onSentAt(1, "frame", checkedMonotonicParts(false, 1, 0) orelse 0);
+    try t.expect(cache.lookupFresh(1, 100) == null);
+    try cache.onSentAt(2, "frame", 100);
+    try t.expect(cache.lookupFresh(2, checkedPerformanceMillis(true, false, 1, 100) orelse 0) == null);
+}
+
 fn tsToMillis(sec: i64, nsec: i64) i64 {
     return sec * 1000 + @divTrunc(nsec, 1_000_000);
 }

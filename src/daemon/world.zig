@@ -9,7 +9,7 @@ const std = @import("std");
 const rwlock = @import("../substrate/rwlock.zig");
 const ebr = @import("../substrate/ebr.zig");
 const world_rcu = @import("world_rcu.zig");
-const ident_utf8 = @import("../substrate/utf8.zig");
+const channel_name = @import("../proto/channel_name.zig");
 
 /// Lazily-created RCU mirror of the nick registry (the lock-free read path).
 /// Heap-allocated so the EBR domain has a stable address: registered writer and
@@ -126,6 +126,7 @@ pub const WorldError = std.mem.Allocator.Error || error{
     InvalidOwnerSet,
     InvalidUnion,
     InvalidGraph,
+    WrongCaller,
     NoSuchChannel,
     NotOnChannel,
     NoSuchNick,
@@ -2500,6 +2501,397 @@ pub const World = struct {
         return prepared;
     }
 
+    /// Exact physical edits supplied by a separately validated authority owner.
+    /// Channel strings are borrowed until prepare returns; the ticket owns copies.
+    pub const MembershipEdit = struct { channel: []const u8, client: ClientId, desired: ?MemberModes };
+    const BatchChannel = struct {
+        name: []const u8,
+        channel: *Channel,
+        set: *world_rcu.MembershipSet,
+        start: usize,
+        end: usize,
+        remove_channel: bool,
+        additions: []world_rcu.ClientId,
+        removals: []world_rcu.ClientId,
+        new_owned_name: ?[]u8 = null,
+        new_folded_name: ?[]u8 = null,
+        rebuilt_folded_name: ?[]u8 = null,
+        insert_name: bool = false,
+        remove_name: bool = false,
+        fn less(_: void, left: BatchChannel, right: BatchChannel) bool {
+            return @intFromPtr(left.set) < @intFromPtr(right.set);
+        }
+    };
+    pub const PreparedMembershipBatch = struct {
+        world: *World,
+        acquisition: u64,
+        arena: *std.heap.ArenaAllocator,
+        channel_rcu: ?*RcuChannelState,
+        owns_rcu: bool,
+        next_oid_after: u32,
+        edits: []MembershipEdit,
+        entries: []BatchChannel,
+        stages: []world_rcu.MembershipSet.StagedEdit,
+        stage_count: usize = 0,
+        names: ?world_rcu.ChannelRegistry(u32).StagedEditBatch = null,
+        reservation: ?*ebr.Participant.RetireReservation = null,
+        active: bool = true,
+        fn release(self: *PreparedMembershipBatch) void {
+            const a = self.world.allocator;
+            self.arena.deinit();
+            a.destroy(self.arena);
+            self.active = false;
+        }
+        pub fn abort(self: *PreparedMembershipBatch) void {
+            if (!self.active) return;
+            self.world.lock.requireExclusiveAcquisitionByCurrentThread(self.acquisition) catch @panic("membership batch left its World cut");
+            if (self.names) |*stage| stage.abort();
+            while (self.stage_count != 0) {
+                self.stage_count -= 1;
+                self.stages[self.stage_count].abort();
+            }
+            if (self.reservation) |r| {
+                r.finish();
+                self.world.allocator.destroy(r);
+                self.reservation = null;
+            }
+            for (self.entries) |entry| if (entry.new_owned_name) |name| {
+                entry.channel.deinit();
+                self.world.allocator.destroy(entry.channel);
+                entry.set.deinit();
+                self.world.allocator.destroy(entry.set);
+                self.world.allocator.free(name);
+                self.world.allocator.free(entry.new_folded_name.?);
+            };
+            for (self.entries) |entry| if (entry.rebuilt_folded_name) |key| {
+                entry.set.deinit();
+                self.world.allocator.destroy(entry.set);
+                self.world.allocator.free(key);
+            };
+            if (self.owns_rcu) self.world.destroyDetachedRcuChannelState(self.channel_rcu.?);
+            self.release();
+        }
+        pub fn deinit(self: *PreparedMembershipBatch) void {
+            self.abort();
+        }
+        pub fn commit(self: *PreparedMembershipBatch) void {
+            std.debug.assert(self.active);
+            self.world.lock.requireExclusiveAcquisitionByCurrentThread(self.acquisition) catch @panic("membership batch left its World cut");
+            const w = self.world;
+            const c = self.channel_rcu orelse {
+                self.release();
+                return;
+            };
+            for (self.entries) |entry| if (entry.new_owned_name) |name| {
+                c.members.putAssumeCapacityNoClobber(entry.new_folded_name.?, entry.set);
+                w.channels.putAssumeCapacityNoClobber(name, entry.channel.*);
+                w.allocator.destroy(entry.channel);
+            };
+            for (self.entries) |entry| if (entry.rebuilt_folded_name) |key| {
+                if (entry.remove_channel) {
+                    entry.set.deinit();
+                    w.allocator.destroy(entry.set);
+                    w.allocator.free(key);
+                } else c.members.putAssumeCapacityNoClobber(key, entry.set);
+            };
+            w.next_oid = self.next_oid_after;
+            for (self.entries) |entry| {
+                if (entry.remove_channel or entry.new_owned_name != null) continue;
+                for (self.edits[entry.start..entry.end]) |edit| {
+                    if (edit.desired) |modes| entry.channel.members.putAssumeCapacity(edit.client, modes) else _ = entry.channel.members.remove(edit.client);
+                }
+            }
+            for (self.stages[0..self.stage_count]) |*stage| stage.commit();
+            if (self.names) |*stage| stage.commit();
+            if (self.owns_rcu) w.rcu_channels = c;
+            if (self.reservation) |r| {
+                r.finish();
+                w.allocator.destroy(r);
+                self.reservation = null;
+            }
+            for (self.entries) |entry| if (entry.remove_channel) {
+                w.rcuDropMembership(c, entry.name);
+                w.removeFallbackChannel(entry.name);
+            };
+            for (0..self.stage_count) |_| w.noteRcuChannelWrite(c);
+            if (self.names != null) w.noteRcuChannelWrite(c);
+            self.release();
+        }
+    };
+    /// Caller retains World exclusive access through commit/abort. Each unique
+    /// channel acquires its membership writer lock once, in stable address order.
+    pub fn prepareMembershipBatch(self: *World, input: []const MembershipEdit) WorldError!PreparedMembershipBatch {
+        const acquisition = self.lock.captureExclusiveAcquisitionForCurrentThread() catch return error.WrongCaller;
+        if (input.len == 0) {
+            const arena = try self.allocator.create(std.heap.ArenaAllocator);
+            arena.* = std.heap.ArenaAllocator.init(self.allocator);
+            return .{ .world = self, .acquisition = acquisition, .arena = arena, .channel_rcu = null, .owns_rcu = false, .next_oid_after = self.next_oid, .edits = &.{}, .entries = &.{}, .stages = &.{} };
+        }
+        const owns_rcu = self.rcu_channels == null;
+        if (owns_rcu and self.channels.count() != 0) return error.InvalidGraph;
+        const c = if (self.rcu_channels) |existing| existing else try self.createRcuChannelState();
+        errdefer if (owns_rcu) self.destroyDetachedRcuChannelState(c);
+        const arena = try self.allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer {
+            arena.deinit();
+            self.allocator.destroy(arena);
+        }
+        const a = arena.allocator();
+        const edits = try a.alloc(MembershipEdit, input.len);
+        for (input, 0..) |item, i| {
+            if (item.channel.len == 0 or item.channel.len > foldBufLen or !isChannelName(item.channel) or item.client.eql(ClientId.invalid)) return error.InvalidGraph;
+            edits[i] = .{ .channel = try a.dupe(u8, item.channel), .client = item.client, .desired = item.desired };
+        }
+        std.mem.sort(MembershipEdit, edits, {}, struct {
+            fn less(_: void, left: MembershipEdit, right: MembershipEdit) bool {
+                const order = std.ascii.orderIgnoreCase(left.channel, right.channel);
+                if (order != .eq) return order == .lt;
+                return @as(u64, @bitCast(left.client)) < @as(u64, @bitCast(right.client));
+            }
+        }.less);
+        for (edits, 0..) |edit, i| if (i != 0 and std.ascii.eqlIgnoreCase(edit.channel, edits[i - 1].channel) and edit.client.eql(edits[i - 1].client)) return error.InvalidGraph;
+        const entries = try a.alloc(BatchChannel, input.len);
+        const stages = try a.alloc(world_rcu.MembershipSet.StagedEdit, input.len);
+        try self.channels.ensureUnusedCapacity(@intCast(input.len));
+        try c.members.ensureUnusedCapacity(self.allocator, @intCast(input.len));
+        var entry_count: usize = 0;
+        var next_oid = self.next_oid;
+        var greatest_oid: u32 = 0;
+        var known_channels = self.channels.valueIterator();
+        while (known_channels.next()) |channel| greatest_oid = @max(greatest_oid, channel.oid);
+        const OidMaximum = struct {
+            fn visit(maximum: *u32, _: []const u8, oid: u32) void {
+                maximum.* = @max(maximum.*, oid);
+            }
+        };
+        c.names.iterate(c.writer_participant, &greatest_oid, OidMaximum.visit);
+        errdefer for (entries[0..entry_count]) |entry| {
+            if (entry.new_owned_name) |name| {
+                entry.channel.deinit();
+                self.allocator.destroy(entry.channel);
+                entry.set.deinit();
+                self.allocator.destroy(entry.set);
+                self.allocator.free(name);
+                self.allocator.free(entry.new_folded_name.?);
+            } else if (entry.rebuilt_folded_name) |key| {
+                entry.set.deinit();
+                self.allocator.destroy(entry.set);
+                self.allocator.free(key);
+            }
+        };
+        var cursor: usize = 0;
+        while (cursor < edits.len) {
+            const start = cursor;
+            cursor += 1;
+            while (cursor < edits.len and std.ascii.eqlIgnoreCase(edits[start].channel, edits[cursor].channel)) : (cursor += 1) {}
+            const channel_entry = self.channels.getEntry(edits[start].channel) orelse {
+                const requested = edits[start].channel;
+                if (c.names.lookup(c.writer_participant, requested) != null or rcuMembershipGet(c, requested) != null) return error.InvalidGraph;
+                var present_count: usize = 0;
+                for (edits[start..cursor]) |edit| if (edit.desired != null) {
+                    present_count += 1;
+                };
+                if (present_count == 0) continue;
+                const owned_name = try self.allocator.dupe(u8, requested);
+                errdefer self.allocator.free(owned_name);
+                var fold_buffer: [foldBufLen]u8 = undefined;
+                const folded = try self.allocator.dupe(u8, foldName(requested, &fold_buffer));
+                errdefer self.allocator.free(folded);
+                const channel = try self.allocator.create(Channel);
+                errdefer self.allocator.destroy(channel);
+                channel.* = Channel.init(self.allocator);
+                errdefer channel.deinit();
+                if (next_oid == 0) return error.InvalidGraph;
+                if (next_oid <= greatest_oid) next_oid = std.math.add(u32, greatest_oid, 1) catch return error.InvalidGraph;
+                channel.oid = next_oid;
+                channel.created_unix = self.clock_unix;
+                greatest_oid = next_oid;
+                next_oid = std.math.add(u32, next_oid, 1) catch return error.InvalidGraph;
+                const ids = try a.alloc(world_rcu.ClientId, present_count);
+                var index: usize = 0;
+                for (edits[start..cursor]) |edit| if (edit.desired) |modes| {
+                    try channel.members.put(edit.client, modes);
+                    ids[index] = @bitCast(edit.client);
+                    index += 1;
+                };
+                const set = try self.allocator.create(world_rcu.MembershipSet);
+                errdefer self.allocator.destroy(set);
+                set.* = try world_rcu.MembershipSet.initFromSlice(self.allocator, &c.domain, ids);
+                entries[entry_count] = .{ .name = owned_name, .channel = channel, .set = set, .start = start, .end = cursor, .remove_channel = false, .additions = &.{}, .removals = &.{}, .new_owned_name = owned_name, .new_folded_name = folded, .insert_name = true };
+                entry_count += 1;
+                continue;
+            };
+            const name = channel_entry.key_ptr.*;
+            const channel = channel_entry.value_ptr;
+            const name_oid = c.names.lookup(c.writer_participant, name);
+            if (channel.oid == 0) return error.InvalidGraph;
+            if (name_oid) |oid| if (oid != channel.oid) return error.InvalidGraph;
+            const set = rcuMembershipGet(c, name) orelse {
+                var final_count = channel.members.count();
+                var reserve_count: usize = 0;
+                for (edits[start..cursor]) |edit| {
+                    const present = channel.members.contains(edit.client);
+                    if (edit.desired != null and !present) {
+                        final_count += 1;
+                        reserve_count += 1;
+                    }
+                    if (edit.desired == null and present) final_count -= 1;
+                }
+                try channel.members.ensureUnusedCapacity(@intCast(reserve_count));
+                const ids = try a.alloc(world_rcu.ClientId, final_count);
+                var i: usize = 0;
+                var iter = channel.members.keyIterator();
+                while (iter.next()) |id| {
+                    var keep = true;
+                    for (edits[start..cursor]) |edit| if (edit.client.eql(id.*)) {
+                        keep = edit.desired != null;
+                        break;
+                    };
+                    if (keep) {
+                        ids[i] = @bitCast(id.*);
+                        i += 1;
+                    }
+                }
+                for (edits[start..cursor]) |edit| if (edit.desired != null and !channel.members.contains(edit.client)) {
+                    ids[i] = @bitCast(edit.client);
+                    i += 1;
+                };
+                var fold_buf: [foldBufLen]u8 = undefined;
+                const folded = try self.allocator.dupe(u8, foldName(name, &fold_buf));
+                errdefer self.allocator.free(folded);
+                const rebuilt = try self.allocator.create(world_rcu.MembershipSet);
+                errdefer self.allocator.destroy(rebuilt);
+                rebuilt.* = try world_rcu.MembershipSet.initFromSlice(self.allocator, &c.domain, ids);
+                const remove = final_count == 0 and !channel.ext_modes.has(.registered);
+                entries[entry_count] = .{ .name = name, .channel = channel, .set = rebuilt, .start = start, .end = cursor, .remove_channel = remove, .additions = &.{}, .removals = &.{}, .rebuilt_folded_name = folded, .insert_name = !remove and name_oid == null, .remove_name = remove and name_oid != null };
+                entry_count += 1;
+                continue;
+            };
+            const MissingModes = struct {
+                channel: *Channel,
+                edits: []const MembershipEdit,
+                invalid: bool = false,
+                fn check(ctx: *@This(), bits: world_rcu.ClientId) void {
+                    const id: ClientId = @bitCast(bits);
+                    if (ctx.channel.members.contains(id)) return;
+                    for (ctx.edits) |edit| if (edit.client.eql(id)) return;
+                    ctx.invalid = true;
+                }
+            };
+            var missing_modes = MissingModes{ .channel = channel, .edits = edits[start..cursor] };
+            set.iterate(c.writer_participant, &missing_modes, MissingModes.check);
+            if (missing_modes.invalid) return error.InvalidGraph;
+            const addition_capacity = std.math.add(usize, cursor - start, channel.members.count()) catch return error.InvalidGraph;
+            const additions = try a.alloc(world_rcu.ClientId, addition_capacity);
+            const removals = try a.alloc(world_rcu.ClientId, cursor - start);
+            var add_count: usize = 0;
+            var members = channel.members.keyIterator();
+            while (members.next()) |member| {
+                if (set.contains(c.writer_participant, @bitCast(member.*))) continue;
+                var edited = false;
+                for (edits[start..cursor]) |edit| if (edit.client.eql(member.*)) {
+                    edited = true;
+                    break;
+                };
+                if (!edited) {
+                    additions[add_count] = @bitCast(member.*);
+                    add_count += 1;
+                }
+            }
+            var remove_count: usize = 0;
+            var final_count = channel.members.count();
+            var reserve_count: usize = 0;
+            for (edits[start..cursor]) |edit| {
+                const fallback = channel.members.contains(edit.client);
+                const mirrored = set.contains(c.writer_participant, @bitCast(edit.client));
+                if (edit.desired != null) {
+                    if (!fallback) {
+                        final_count += 1;
+                        reserve_count += 1;
+                    }
+                    if (!mirrored) {
+                        additions[add_count] = @bitCast(edit.client);
+                        add_count += 1;
+                    }
+                } else {
+                    if (fallback) final_count -= 1;
+                    if (mirrored) {
+                        removals[remove_count] = @bitCast(edit.client);
+                        remove_count += 1;
+                    }
+                }
+            }
+            try channel.members.ensureUnusedCapacity(@intCast(reserve_count));
+            entries[entry_count] = .{ .name = name, .channel = channel, .set = set, .start = start, .end = cursor, .remove_channel = final_count == 0 and !channel.ext_modes.has(.registered), .additions = additions[0..add_count], .removals = removals[0..remove_count], .insert_name = !(final_count == 0 and !channel.ext_modes.has(.registered)) and name_oid == null, .remove_name = final_count == 0 and !channel.ext_modes.has(.registered) and name_oid != null };
+            entry_count += 1;
+        }
+        const active = entries[0..entry_count];
+        std.mem.sort(BatchChannel, active, {}, BatchChannel.less);
+        for (active, 0..) |entry, i| if (i != 0 and entry.set == active[i - 1].set) return error.InvalidGraph;
+        const prepared = PreparedMembershipBatch{ .world = self, .acquisition = acquisition, .arena = arena, .channel_rcu = c, .owns_rcu = owns_rcu, .next_oid_after = next_oid, .edits = edits, .entries = active, .stages = stages };
+        // From this point the prepared object owns the arena, so errors abort it.
+        // Disable the outer errdefer by returning errors through an inner helper.
+        return self.prepareMembershipBatchStages(prepared, c);
+    }
+    fn prepareMembershipBatchStages(self: *World, initial: PreparedMembershipBatch, c: *RcuChannelState) WorldError!PreparedMembershipBatch {
+        var prepared = initial;
+        // Caller owns arena on failure until this helper returns; only abort
+        // staged locks/reservation here, not the arena itself.
+        errdefer {
+            if (prepared.names) |*stage| stage.abort();
+            while (prepared.stage_count != 0) {
+                prepared.stage_count -= 1;
+                prepared.stages[prepared.stage_count].abort();
+            }
+            if (prepared.reservation) |r| {
+                r.finish();
+                self.allocator.destroy(r);
+            }
+        }
+        var needed: usize = 0;
+        var removed_count: usize = 0;
+        var inserted_count: usize = 0;
+        for (prepared.entries) |entry| {
+            if (entry.insert_name) inserted_count += 1;
+            if (entry.remove_name) removed_count += 1;
+            if (entry.new_owned_name == null and entry.rebuilt_folded_name == null and !entry.remove_channel and (entry.additions.len != 0 or entry.removals.len != 0)) needed += 1;
+        }
+        if (removed_count != 0 or inserted_count != 0) needed += 1;
+        if (needed == 0) return prepared;
+        const reservation = try self.allocator.create(ebr.Participant.RetireReservation);
+        reservation.* = c.writer_participant.reserveRetireCapacity(needed) catch |err| {
+            self.allocator.destroy(reservation);
+            return err;
+        };
+        prepared.reservation = reservation;
+        for (prepared.entries) |entry| {
+            if (entry.new_owned_name != null or entry.rebuilt_folded_name != null or entry.remove_channel or (entry.additions.len == 0 and entry.removals.len == 0)) continue;
+            const stage = (entry.set.stageEditReserved(reservation, entry.removals, entry.additions) catch |err| switch (err) {
+                error.InvalidEdit => return error.InvalidGraph,
+                else => return @errorCast(err),
+            }) orelse return error.InvalidGraph;
+            prepared.stages[prepared.stage_count] = stage;
+            prepared.stage_count += 1;
+        }
+        if (removed_count != 0 or inserted_count != 0) {
+            const names = try prepared.arena.allocator().alloc([]const u8, removed_count);
+            var i: usize = 0;
+            for (prepared.entries) |entry| if (entry.remove_name) {
+                names[i] = entry.name;
+                i += 1;
+            };
+            const inserts = try prepared.arena.allocator().alloc(world_rcu.ChannelRegistry(u32).Insert, inserted_count);
+            i = 0;
+            for (prepared.entries) |entry| if (entry.insert_name) {
+                inserts[i] = .{ .key = entry.name, .value = entry.channel.oid };
+                i += 1;
+            };
+            prepared.names = (try c.names.stageEditBatchReserved(reservation, names, inserts)) orelse return error.InvalidGraph;
+        }
+        return prepared;
+    }
+
     /// Failure-atomically restore one client across an exact batch of channels
     /// that already exist. Every fallback member-map capacity, immutable RCU
     /// membership snapshot, publication box, and EBR retire slot is prepared
@@ -3836,6 +4228,29 @@ pub const World = struct {
         if (channel.throttle_joins == 0) return null;
         return .{ .joins = channel.throttle_joins, .secs = channel.throttle_secs };
     }
+    const EffectiveJoinThrottle = struct { joins: u16, window_ms: i64 };
+    fn effectiveJoinThrottle(channel: *const Channel, default_joins: u16, default_secs: u32) ?EffectiveJoinThrottle {
+        const explicit = channel.throttle_joins != 0;
+        const joins: u16 = if (explicit) channel.throttle_joins else default_joins;
+        const secs: u32 = if (explicit) channel.throttle_secs else default_secs;
+        if (joins == 0 or secs == 0) return null;
+        return .{ .joins = joins, .window_ms = @as(i64, secs) * 1000 };
+    }
+    fn throttleTimestampActive(ts: i64, now_ms: i64, window_ms: i64) bool {
+        return now_ms - ts < window_ms;
+    }
+    /// Same effective rate/window as throttleAdmit, without pruning, recording,
+    /// allocating or stamping an alert. World's ordinary reader/writer lane is
+    /// still the caller's synchronization contract.
+    pub fn throttleWouldDeny(self: *World, name: []const u8, now_ms: i64, default_joins: u16, default_secs: u32) bool {
+        const channel = self.channels.getPtr(name) orelse return false;
+        const rate = effectiveJoinThrottle(channel, default_joins, default_secs) orelse return false;
+        var active: usize = 0;
+        for (channel.throttle_times.items) |ts| if (throttleTimestampActive(ts, now_ms, rate.window_ms)) {
+            active += 1;
+        };
+        return active >= rate.joins;
+    }
     /// Admit one join against the join-throttle window. The effective rate is the
     /// channel's explicit +j when set, otherwise the network default
     /// (`default_joins`/`default_secs`, 0 = no default) — so a server-wide raid
@@ -3845,15 +4260,13 @@ pub const World = struct {
     /// window and reports `.throttled_alert` so the caller can fire a raid alert.
     pub fn throttleAdmit(self: *World, name: []const u8, now_ms: i64, default_joins: u16, default_secs: u32) ThrottleResult {
         const channel = self.channels.getPtr(name) orelse return .admitted;
-        const explicit = channel.throttle_joins != 0;
-        const joins: u16 = if (explicit) channel.throttle_joins else default_joins;
-        const secs: u32 = if (explicit) channel.throttle_secs else default_secs;
-        if (joins == 0 or secs == 0) return .admitted;
-        const window_ms: i64 = @as(i64, secs) * 1000;
+        const rate = effectiveJoinThrottle(channel, default_joins, default_secs) orelse return .admitted;
+        const joins = rate.joins;
+        const window_ms = rate.window_ms;
         // Prune timestamps outside the window (compact in place).
         var kept: usize = 0;
         for (channel.throttle_times.items) |ts| {
-            if (now_ms - ts < window_ms) {
+            if (throttleTimestampActive(ts, now_ms, window_ms)) {
                 channel.throttle_times.items[kept] = ts;
                 kept += 1;
             }
@@ -4899,14 +5312,7 @@ fn foldName(name: []const u8, buf: []u8) []const u8 {
 /// a transliteration layer; tracked separately). Bidi overrides, invisible
 /// scalars, and mixed letter scripts are rejected. `%#` and `%&` stay accepted.
 pub fn isChannelName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    const prefixed = switch (name[0]) {
-        '#', '&' => true,
-        '%' => name.len >= 2 and (name[1] == '#' or name[1] == '&'),
-        else => false,
-    };
-    if (!prefixed) return false;
-    return !ident_utf8.containsIdentifierSpoof(name);
+    return channel_name.isChannelName(name);
 }
 
 fn testClient(slot: u20) ClientId {
@@ -8396,4 +8802,187 @@ test "World compound missing name candidates reject duplicate fallback OID inclu
         try std.testing.expectEqual(digest, compoundFallbackDigest(&world));
         try std.testing.expectEqual(names, c.names.published.load(.acquire));
     }
+}
+
+test "World membership batch groups siblings and creates and retires channels atomically" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    world.lockWrite();
+    defer world.unlockWrite();
+    const first = testClient(941);
+    const second = testClient(942);
+    const third = testClient(943);
+    try world.restoreMember("#room", first, MemberModes.fromModes(&.{.op}));
+    try world.restoreMember("#room", second, MemberModes.empty());
+    try world.restoreMember("#old", first, MemberModes.empty());
+    const edits = [_]World.MembershipEdit{
+        .{ .channel = "#ROOM", .client = first, .desired = null },
+        .{ .channel = "#room", .client = second, .desired = MemberModes.fromModes(&.{.voice}) },
+        .{ .channel = "#Room", .client = third, .desired = MemberModes.fromModes(&.{.op}) },
+        .{ .channel = "#old", .client = first, .desired = null },
+        .{ .channel = "#fresh", .client = first, .desired = MemberModes.empty() },
+        .{ .channel = "#FRESH", .client = third, .desired = MemberModes.fromModes(&.{.voice}) },
+    };
+    var aborting = try world.prepareMembershipBatch(&edits);
+    try std.testing.expect(world.isMember("#room", first));
+    try std.testing.expect(!world.channelExists("#fresh"));
+    aborting.abort();
+    var committed = try world.prepareMembershipBatch(&edits);
+    committed.commit();
+    try std.testing.expect(!world.isMember("#room", first));
+    try std.testing.expect(world.isMember("#room", second));
+    try std.testing.expect(world.isMember("#room", third));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#room", second).?.bits);
+    try std.testing.expect(!world.channelExists("#old"));
+    try std.testing.expect(world.isMember("#fresh", first));
+    try std.testing.expect(world.isMember("#fresh", third));
+}
+
+test "World membership batch refuses RCU-only channel without modes" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    world.lockWrite();
+    defer world.unlockWrite();
+    const client = testClient(944);
+    const c = try world.ensureRcuChannels();
+    try c.names.set(c.writer_participant, "#orphan", 91);
+    const set = try world.rcuMembershipSet(c, "#orphan");
+    try set.add(c.writer_participant, @bitCast(client));
+    const edit = [_]World.MembershipEdit{.{ .channel = "#orphan", .client = client, .desired = MemberModes.empty() }};
+    try std.testing.expectError(error.InvalidGraph, world.prepareMembershipBatch(&edit));
+    try std.testing.expect(c.names.lookup(c.writer_participant, "#orphan") != null);
+    try std.testing.expect(set.contains(c.writer_participant, @bitCast(client)));
+    try std.testing.expect(!world.channels.contains("#orphan"));
+}
+
+test "World membership batch exhausts allocation failures without publishing partial edits" {
+    var reached_success = false;
+    for (0..1024) |cut| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var world = World.init(failing.allocator());
+        defer world.deinit();
+        world.lockWrite();
+        defer world.unlockWrite();
+        const first = testClient(950);
+        const second = testClient(951);
+        const third = testClient(952);
+        try world.restoreMember("#room", first, MemberModes.fromModes(&.{.op}));
+        try world.restoreMember("#room", second, MemberModes.empty());
+        try world.restoreMember("#old", first, MemberModes.empty());
+        const edits = [_]World.MembershipEdit{
+            .{ .channel = "#room", .client = first, .desired = null },
+            .{ .channel = "#ROOM", .client = second, .desired = MemberModes.fromModes(&.{.voice}) },
+            .{ .channel = "#room", .client = third, .desired = MemberModes.empty() },
+            .{ .channel = "#old", .client = first, .desired = null },
+            .{ .channel = "#new", .client = first, .desired = MemberModes.empty() },
+        };
+        const oid_before = world.next_oid;
+        failing.fail_index = failing.alloc_index + cut;
+        if (world.prepareMembershipBatch(&edits)) |value| {
+            var prepared = value;
+            try std.testing.expect(!failing.has_induced_failure);
+            prepared.commit();
+            reached_success = true;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(oid_before, world.next_oid);
+            try std.testing.expect(world.isMember("#room", first));
+            try std.testing.expect(world.isMember("#room", second));
+            try std.testing.expect(!world.isMember("#room", third));
+            try std.testing.expectEqual(MemberModes.empty().bits, world.memberModes("#room", second).?.bits);
+            try std.testing.expect(world.isMember("#old", first));
+            try std.testing.expect(!world.channelExists("#new"));
+            failing.fail_index = std.math.maxInt(usize);
+            var retry = try world.prepareMembershipBatch(&edits);
+            retry.commit();
+        }
+        try std.testing.expect(!world.isMember("#room", first));
+        try std.testing.expect(world.isMember("#room", third));
+        try std.testing.expect(!world.channelExists("#old"));
+        try std.testing.expect(world.isMember("#new", first));
+        if (reached_success) break;
+    }
+    try std.testing.expect(reached_success);
+}
+
+test "World membership batch rebuilds missing mirror and rejects unknown RCU-only members" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    world.lockWrite();
+    defer world.unlockWrite();
+    const first = testClient(960);
+    const second = testClient(961);
+    const ghost = testClient(962);
+    try world.restoreMember("#repair", first, MemberModes.fromModes(&.{.op}));
+    const c = world.rcu_channels.?;
+    world.rcuDropMembership(c, "#repair");
+    const edits = [_]World.MembershipEdit{.{ .channel = "#repair", .client = second, .desired = MemberModes.fromModes(&.{.voice}) }};
+    var prepared = try world.prepareMembershipBatch(&edits);
+    prepared.commit();
+    try std.testing.expect(world.isMember("#repair", first));
+    try std.testing.expect(world.isMember("#repair", second));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.op}).bits, world.memberModes("#repair", first).?.bits);
+    const set = World.rcuMembershipGet(c, "#repair").?;
+    try set.add(c.writer_participant, @bitCast(ghost));
+    try std.testing.expectError(error.InvalidGraph, world.prepareMembershipBatch(&edits));
+    try std.testing.expect(set.contains(c.writer_participant, @bitCast(ghost)));
+    try std.testing.expect(world.memberModes("#repair", ghost) == null);
+}
+
+test "World membership batch creates absent channels from an empty World" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    world.lockWrite();
+    defer world.unlockWrite();
+    const first = testClient(970);
+    const second = testClient(971);
+    const edits = [_]World.MembershipEdit{
+        .{ .channel = "#new", .client = first, .desired = MemberModes.empty() },
+        .{ .channel = "#NEW", .client = second, .desired = MemberModes.fromModes(&.{.voice}) },
+    };
+    var prepared = try world.prepareMembershipBatch(&edits);
+    try std.testing.expect(world.rcu_channels == null);
+    prepared.commit();
+    try std.testing.expect(world.isMember("#new", first));
+    try std.testing.expect(world.isMember("#new", second));
+    try std.testing.expectEqual(MemberModes.fromModes(&.{.voice}).bits, world.memberModes("#new", second).?.bits);
+    const duplicated = [_]World.MembershipEdit{ edits[0], .{ .channel = "#NEW", .client = first, .desired = null } };
+    try std.testing.expectError(error.InvalidGraph, world.prepareMembershipBatch(&duplicated));
+    try std.testing.expect(world.isMember("#new", first));
+}
+
+test "World membership batch requires the actual exclusive caller" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try std.testing.expectError(error.WrongCaller, world.prepareMembershipBatch(&.{}));
+}
+
+test "World explain throttle peek leaves counters timestamps and alerts unchanged at exact boundary" {
+    var w = World.init(std.testing.allocator);
+    defer w.deinit();
+    _ = try w.join("#peek", .{ .shard = 0, .slot = 1, .gen = 1 });
+    try std.testing.expectEqual(World.ThrottleResult.admitted, w.throttleAdmit("#peek", 1000, 1, 5));
+    const channel = w.channels.getPtr("#peek").?;
+    const before_len = channel.throttle_times.items.len;
+    const before_alert = channel.throttle_alert_ms;
+    const before_timestamp = channel.throttle_times.items[0];
+    try std.testing.expect(w.throttleWouldDeny("#peek", 5999, 1, 5));
+    try std.testing.expect(!w.throttleWouldDeny("#peek", 6000, 1, 5));
+    try std.testing.expectEqual(before_len, channel.throttle_times.items.len);
+    try std.testing.expectEqual(before_alert, channel.throttle_alert_ms);
+    try std.testing.expectEqual(before_timestamp, channel.throttle_times.items[0]);
+    try std.testing.expectEqual(World.ThrottleResult.throttled_alert, w.throttleAdmit("#peek", 5999, 1, 5));
+    try std.testing.expectEqual(World.ThrottleResult.admitted, w.throttleAdmit("#peek", 6000, 1, 5));
+    // Explicit +j overrides a conflicting tighter network default.
+    try w.setThrottle("#peek", 2, 10);
+    try std.testing.expectEqual(World.ThrottleResult.admitted, w.throttleAdmit("#peek", 10_000, 1, 5));
+    try std.testing.expect(!w.throttleWouldDeny("#peek", 10_001, 1, 5));
+    try std.testing.expectEqual(World.ThrottleResult.admitted, w.throttleAdmit("#peek", 10_001, 1, 5));
+    const explicit_count = channel.throttle_times.items.len;
+    const explicit_alert = channel.throttle_alert_ms;
+    try std.testing.expect(w.throttleWouldDeny("#peek", 19_999, 1, 5));
+    try std.testing.expect(!w.throttleWouldDeny("#peek", 20_000, 1, 5));
+    try std.testing.expectEqual(explicit_count, channel.throttle_times.items.len);
+    try std.testing.expectEqual(explicit_alert, channel.throttle_alert_ms);
 }

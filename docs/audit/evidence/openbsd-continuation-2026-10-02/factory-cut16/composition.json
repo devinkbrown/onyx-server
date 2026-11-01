@@ -1,0 +1,7 @@
+{
+  "base": ".zig-cache/openbsd-lifecycle-20261002-15",
+  "scope": "Test-only defer syntax correction; frozen private leased factory still publication-refused",
+  "overlay": {
+    "src/daemon/delivery_authority.zig": "7e84164ec2eecf55afb6eb11cfffa0457393ffc0dabe0aa34e3de61dc74e4d87"
+  }
+}

@@ -181,8 +181,8 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: Snapshot) ![]u8 {
     errdefer freeEncoded(allocator, bytes);
     const payload = bytes[frame.header_len .. bytes.len - frame.checksum_len];
     payload[0] = @intFromBool(snapshot.reload_pending);
-    payload[1] = @intFromEnum(snapshot.tls12_mode);
-    payload[2] = @intFromEnum(kind);
+    payload[1] = @backingInt(snapshot.tls12_mode);
+    payload[2] = @backingInt(kind);
     payload[3] = 0;
     writeU32At(payload[4..8], @intCast(snapshot.default.cert_chain.len));
     writeU32At(payload[8..12], @intCast(if (snapshot.generated_tls12) |leg| leg.cert_chain.len else 0));

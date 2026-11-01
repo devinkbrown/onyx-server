@@ -23,6 +23,7 @@ const f_seal_grow: u32 = 0x0004;
 const f_seal_write: u32 = 0x0008;
 const scm_rights: i32 = 0x01;
 const msg_ctrunc: u32 = 0x08;
+const msg_trunc: u32 = 0x20;
 
 pub const Error = error{
     Unsupported,
@@ -34,6 +35,8 @@ pub const Error = error{
     RecvFailed,
     EmptyFdBatch,
     ControlTruncated,
+    PayloadTruncated,
+    InvalidControl,
     MissingRights,
     TooManyFds,
 } || Allocator.Error;
@@ -215,34 +218,77 @@ pub fn recvFdBatch(allocator: Allocator, socket_fd: Fd, max_payload: usize) Erro
         .flags = 0,
     };
 
-    const rc = linux.recvmsg(socket_fd, &msg, 0);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        .INTR => return recvFdBatch(allocator, socket_fd, max_payload),
-        else => return error.RecvFailed,
-    }
-    const body_len: usize = @intCast(rc);
-    if ((msg.flags & msg_ctrunc) != 0) return error.ControlTruncated;
-
-    const hdr: *linux.cmsghdr = @ptrCast(&control);
-    if (hdr.level != linux.SOL.SOCKET or hdr.type != scm_rights) return error.MissingRights;
-    if (hdr.len < controlLen(0)) return error.MissingRights;
-
-    const fd_bytes_len = hdr.len - controlLen(0);
-    if (fd_bytes_len % @sizeOf(Fd) != 0) return error.MissingRights;
-    const fd_count = fd_bytes_len / @sizeOf(Fd);
-    if (fd_count > max_fds_per_message) return error.TooManyFds;
-
-    const fds = try allocator.alloc(Fd, fd_count);
-    errdefer allocator.free(fds);
-    const data_start = alignCmsg(@sizeOf(linux.cmsghdr));
-    const source = control[data_start .. data_start + fd_bytes_len];
-    @memcpy(std.mem.sliceAsBytes(fds), source);
-
-    return .{
-        .bytes = try allocator.realloc(body, body_len),
-        .fds = fds,
+    const rc = while (true) {
+        msg.controllen = control.len;
+        msg.flags = 0;
+        const result = linux.recvmsg(socket_fd, &msg, 0);
+        switch (linux.errno(result)) {
+            .SUCCESS => break result,
+            .INTR => continue,
+            else => return error.RecvFailed,
+        }
     };
+    // Once recvmsg succeeds, every complete SCM_RIGHTS descriptor belongs to
+    // this function, even if later validation/allocation fails. Keep that
+    // ownership in a bounded stack array until the successful return.
+    var owned: [max_fds_per_message]Fd = undefined;
+    var owned_len: usize = 0;
+    errdefer for (owned[0..owned_len]) |fd| {
+        _ = linux.close(fd);
+    };
+    const control_len: usize = @min(msg.controllen, control.len);
+    var offset: usize = 0;
+    var headers: usize = 0;
+    var invalid = msg.controllen > control.len;
+    while (offset < control_len) {
+        if (control_len - offset < @sizeOf(linux.cmsghdr)) {
+            invalid = true;
+            break;
+        }
+        const hdr: *const linux.cmsghdr = @ptrCast(@alignCast(control[offset..].ptr));
+        const remaining = control_len - offset;
+        if (hdr.len < controlLen(0)) {
+            invalid = true;
+            break;
+        }
+        const available = @min(hdr.len, remaining);
+        if (hdr.level == linux.SOL.SOCKET and hdr.type == scm_rights) {
+            const data_bytes = available - controlLen(0);
+            const whole = data_bytes / @sizeOf(Fd);
+            for (0..whole) |i| {
+                var fd: Fd = undefined;
+                const at = offset + controlLen(0) + i * @sizeOf(Fd);
+                @memcpy(std.mem.asBytes(&fd), control[at..][0..@sizeOf(Fd)]);
+                if (owned_len == owned.len) {
+                    _ = linux.close(fd);
+                    invalid = true;
+                } else {
+                    owned[owned_len] = fd;
+                    owned_len += 1;
+                }
+            }
+            if (data_bytes % @sizeOf(Fd) != 0) invalid = true;
+        } else invalid = true;
+        headers += 1;
+        if (hdr.len > remaining) {
+            invalid = true;
+            break;
+        }
+        const aligned = alignCmsg(hdr.len);
+        if (aligned > remaining) {
+            if (hdr.len != remaining) invalid = true;
+            break;
+        }
+        offset += aligned;
+    }
+    if (msg.flags & msg_ctrunc != 0) return error.ControlTruncated;
+    if (msg.flags & msg_trunc != 0 or rc > body.len) return error.PayloadTruncated;
+    if (invalid or headers > 1) return error.InvalidControl;
+    if (headers != 1 or owned_len == 0) return error.MissingRights;
+    const fds = try allocator.dupe(Fd, owned[0..owned_len]);
+    errdefer allocator.free(fds);
+    const bytes = try allocator.realloc(body, @intCast(rc));
+    return .{ .bytes = bytes, .fds = fds };
 }
 
 fn alignCmsg(len: usize) usize {
@@ -299,4 +345,152 @@ test "linux socketpair can pass a memfd descriptor" {
 
     try std.testing.expect(std.mem.eql(u8, recv.bytes, "arena"));
     try std.testing.expectEqual(@as(usize, 1), recv.fds.len);
+}
+
+const HandoffNoResizeTestAllocator = struct {
+    backing: Allocator,
+    fn allocator(self: *HandoffNoResizeTestAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.backing.rawFree(memory, alignment, ra);
+    }
+};
+fn handoffTestPipe() ![2]Fd {
+    var pipe: [2]Fd = undefined;
+    if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true, .NONBLOCK = true })) != .SUCCESS) return error.TestPipeFailed;
+    return pipe;
+}
+fn handoffExpectPipeEof(read_fd: Fd) !void {
+    var byte: [1]u8 = undefined;
+    const rc = linux.read(read_fd, &byte, 1);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try std.testing.expectEqual(@as(usize, 0), rc);
+}
+
+test "handoff received rights allocation failures close kernel descriptors" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var successful = false;
+    for (0..64) |index| {
+        var sockets = try socketPair();
+        const pipe = try handoffTestPipe();
+        defer _ = linux.close(pipe[0]);
+        try sendFdBatch(sockets.supervisor, &.{pipe[1]}, "ok");
+        _ = linux.close(pipe[1]);
+        var no_resize = HandoffNoResizeTestAllocator{ .backing = std.testing.allocator };
+        var failing = std.testing.FailingAllocator.init(no_resize.allocator(), .{ .fail_index = index });
+        if (recvFdBatch(failing.allocator(), sockets.worker, 64)) |value| {
+            var result = value;
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqualStrings("ok", result.bytes);
+            try std.testing.expectEqual(@as(usize, 1), result.fds.len);
+            for (result.fds) |fd| _ = linux.close(fd);
+            result.deinit(failing.allocator());
+            successful = true;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+        }
+        sockets.close();
+        try handoffExpectPipeEof(pipe[0]);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (successful) break;
+    }
+    try std.testing.expect(successful);
+}
+
+test "handoff truncated payload closes received rights" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var sockets = try socketPair();
+    defer sockets.close();
+    const pipe = try handoffTestPipe();
+    defer _ = linux.close(pipe[0]);
+    try sendFdBatch(sockets.supervisor, &.{pipe[1]}, "oversized");
+    _ = linux.close(pipe[1]);
+    try std.testing.expectError(error.PayloadTruncated, recvFdBatch(std.testing.allocator, sockets.worker, 2));
+    sockets.close();
+    try handoffExpectPipeEof(pipe[0]);
+}
+
+test "handoff extra or truncated ancillary closes received rights" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |truncated| {
+        var sockets = try socketPair();
+        defer sockets.close();
+        const enabled: u32 = 1;
+        const set = linux.setsockopt(sockets.worker, linux.SOL.SOCKET, linux.SO.PASSCRED, std.mem.asBytes(&enabled), @sizeOf(u32));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(set));
+        const pipe = try handoffTestPipe();
+        defer _ = linux.close(pipe[0]);
+        var writes: [max_fds_per_message]Fd = undefined;
+        const count: usize = if (truncated) max_fds_per_message else 1;
+        writes[0] = pipe[1];
+        for (writes[1..count]) |*fd| {
+            const rc = linux.dup(pipe[1]);
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+            fd.* = @intCast(rc);
+        }
+        try sendFdBatch(sockets.supervisor, writes[0..count], "x");
+        for (writes[0..count]) |fd| _ = linux.close(fd);
+        if (truncated) {
+            try std.testing.expectError(error.ControlTruncated, recvFdBatch(std.testing.allocator, sockets.worker, 8));
+        } else {
+            try std.testing.expectError(error.InvalidControl, recvFdBatch(std.testing.allocator, sockets.worker, 8));
+        }
+        sockets.close();
+        try handoffExpectPipeEof(pipe[0]);
+    }
+}
+
+test "handoff receives maximum real rights with independent descriptor ownership" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var sockets = try socketPair();
+    defer sockets.close();
+    const pipe = try handoffTestPipe();
+    defer _ = linux.close(pipe[0]);
+    var writes: [max_fds_per_message]Fd = @splat(-1);
+    writes[0] = pipe[1];
+    defer for (writes) |fd| {
+        if (fd >= 0) _ = linux.close(fd);
+    };
+    for (writes[1..]) |*fd| {
+        const result = linux.dup(pipe[1]);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
+        fd.* = @intCast(result);
+    }
+    try sendFdBatch(sockets.supervisor, &writes, "maximum batch");
+    for (&writes) |*fd| {
+        _ = linux.close(fd.*);
+        fd.* = -1;
+    }
+    var received = try recvFdBatch(std.testing.allocator, sockets.worker, 64);
+    defer {
+        for (received.fds) |fd| if (fd >= 0) {
+            _ = linux.close(fd);
+        };
+        received.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqualStrings("maximum batch", received.bytes);
+    try std.testing.expectEqual(max_fds_per_message, received.fds.len);
+    const byte = [_]u8{0x5a};
+    for (received.fds, 0..) |fd, i| {
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(fd, std.posix.F.GETFD, 0)));
+        for (received.fds[0..i]) |earlier| try std.testing.expect(fd != earlier);
+        try std.testing.expectEqual(@as(usize, 1), linux.write(fd, &byte, byte.len));
+    }
+    var data: [max_fds_per_message]u8 = undefined;
+    const n = linux.read(pipe[0], &data, data.len);
+    try std.testing.expectEqual(@as(usize, max_fds_per_message), n);
+    try std.testing.expect(std.mem.allEqual(u8, &data, byte[0]));
+    for (received.fds) |*fd| {
+        _ = linux.close(fd.*);
+        fd.* = -1;
+    }
+    sockets.close();
+    try handoffExpectPipeEof(pipe[0]);
 }

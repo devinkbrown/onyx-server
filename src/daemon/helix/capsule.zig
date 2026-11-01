@@ -46,6 +46,9 @@ pub const CapsuleKind = enum(u8) {
     webhook_store = 16,
     handoff_manifest = 17,
     native_service = 18,
+    physical_connection_relation = 19,
+    local_guest_issuer = 20,
+    host_presentation = 21,
 
     pub fn fromByte(byte: u8) Error!CapsuleKind {
         return switch (byte) {
@@ -67,6 +70,9 @@ pub const CapsuleKind = enum(u8) {
             16 => .webhook_store,
             17 => .handoff_manifest,
             18 => .native_service,
+            19 => .physical_connection_relation,
+            20 => .local_guest_issuer,
+            21 => .host_presentation,
             else => error.UnknownKind,
         };
     }
@@ -87,6 +93,8 @@ pub const CapsuleKind = enum(u8) {
             .s2s_link,
             .tls_ticket_keys,
             .mesh_checkpoint,
+            .host_presentation,
+            .local_guest_issuer,
             => true,
             .clients,
             .channels,
@@ -101,6 +109,7 @@ pub const CapsuleKind = enum(u8) {
             .webhook_store,
             .handoff_manifest,
             .native_service,
+            .physical_connection_relation,
             => false,
         };
     }
@@ -185,7 +194,7 @@ pub const registry = [_]Descriptor{
     // upgrade. `min_supported = 1` keeps accepting capsules sealed by pre-bump
     // binaries; `s2s_snapshot.decode` is version-aware.
     // v5 carries the authenticated partial inner frame across record boundaries.
-    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 5, .min_supported = 1, .max_supported = 5 },
+    .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 6, .min_supported = 1, .max_supported = 6 },
     // v2 (2026-07) appended the WS adapter's partial framing state so a
     // mid-frame wss client is carried instead of dropped. v3 appends the
     // selected WebSocket application protocol, which controls
@@ -222,12 +231,15 @@ pub const registry = [_]Descriptor{
     .{ .kind = .webhook_store, .schema_id = 0x4857_484b, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // Canonical final capsule committing to every preceding capsule header,
     // field, byte, order, total count, and per-kind count in the arena.
-    // v2 commits the complete noncontiguous registry, including service kind 18.
-    // Current live adoption deliberately refuses the former v1 table.
-    .{ .kind = .handoff_manifest, .schema_id = 0x4848_4d46, .current_version = 2, .min_supported = 2, .max_supported = 2 },
+    // v5 includes the full physical relation, issuer custody and host intent.
+    // Old tables cannot prove completeness, including explicitly empty families.
+    .{ .kind = .handoff_manifest, .schema_id = 0x4848_4d46, .current_version = 5, .min_supported = 5, .max_supported = 5 },
     // NSST v2 retains the original joined launch context and pending operation.
     // Descriptor custody and actual successor readiness remain separate joins.
     .{ .kind = .native_service, .schema_id = 0x484e_5356, .current_version = 2, .min_supported = 2, .max_supported = 2 },
+    .{ .kind = .physical_connection_relation, .schema_id = 0x4850_4332, .current_version = 2, .min_supported = 2, .max_supported = 2 },
+    .{ .kind = .local_guest_issuer, .schema_id = 0x4c47_4931, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    .{ .kind = .host_presentation, .schema_id = 0x4850_5231, .current_version = 1, .min_supported = 1, .max_supported = 1 },
 };
 
 pub fn descriptor(kind: CapsuleKind) Descriptor {
@@ -629,7 +641,7 @@ test "exact clients world history webhook and handoff descriptors fail closed" {
         try std.testing.expectEqual(@as(u16, 1), exact.max_supported);
         try std.testing.expectEqual(kind, try CapsuleKind.fromByte(@backingInt(kind)));
     }
-    inline for (.{ CapsuleKind.handoff_manifest, CapsuleKind.native_service }) |kind| {
+    inline for (.{CapsuleKind.native_service}) |kind| {
         const exact = descriptor(kind);
         try std.testing.expectEqual(@as(u16, 2), exact.current_version);
         try std.testing.expectEqual(@as(u16, 2), exact.min_supported);
@@ -768,4 +780,21 @@ test "duplicate and reordered ordinals are rejected" {
         .{ .ordinal = 3, .bytes = "b" },
     };
     try std.testing.expectError(error.FieldOrdinalOutOfOrder, validate(make(.channels, @constCast(reordered[0..]))));
+}
+
+test "physical connection relation and manifest are exact current schemas" {
+    const relation = descriptor(.physical_connection_relation);
+    try std.testing.expectEqual(@as(u16, 2), relation.current_version);
+    try std.testing.expectEqual(@as(u16, 2), relation.min_supported);
+    try std.testing.expectEqual(@as(u16, 2), relation.max_supported);
+    try std.testing.expectEqual(CapsuleKind.physical_connection_relation, try CapsuleKind.fromByte(19));
+    const manifest = descriptor(.handoff_manifest);
+    try std.testing.expectEqual(@as(u16, 5), manifest.current_version);
+    try std.testing.expectEqual(@as(u16, 5), manifest.min_supported);
+    try std.testing.expectEqual(@as(u16, 5), manifest.max_supported);
+    var old = manifest;
+    old.current_version = 2;
+    old.min_supported = 2;
+    old.max_supported = 2;
+    try std.testing.expectError(error.VersionUnsupported, negotiate(old, Header.init(.handoff_manifest)));
 }

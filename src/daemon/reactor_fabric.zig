@@ -87,6 +87,18 @@ pub const ReactorFabric = struct {
     const ControlMailbox = queue.BoundedMpmc(SessionDropControl, capacity);
     const Pool = deliver_handle.DeliverPool(pool_slots);
 
+    pub const Cut = struct {
+        fabric: *const ReactorFabric,
+        target: u12,
+        position: usize,
+
+        /// True strictly before this exclusive cut within half the counter range.
+        pub fn contains(self: Cut, position: usize) bool {
+            return queue.precedesCut(position, self.position);
+        }
+    };
+    pub const PositionedMsg = struct { position: usize, msg: DeliverMsg };
+
     allocator: std.mem.Allocator,
     /// One MPMC inbox per shard; index `i` is shard `i`'s inbox. Heap slice sized
     /// to the runtime shard count.
@@ -215,6 +227,38 @@ pub const ReactorFabric = struct {
     /// handoff so a sleeping reactor notices.
     pub fn sendTo(self: *ReactorFabric, target: u12, msg: DeliverMsg) bool {
         return self.inboxes[target].push(msg);
+    }
+
+    /// Observe queued or producer-claimed positions, including unpublished slots.
+    /// This is not a quiescence barrier: callers must externally synchronize
+    /// producers and consumers and account for work already popped.
+    pub fn hasPending(self: *const ReactorFabric, target: u12) bool {
+        return self.inboxes[target].hasPending();
+    }
+
+    /// Captures the exclusive claimed-tail watermark, including unpublished
+    /// claims. A cut belongs to this fabric and target and must be consumed by
+    /// its sole owning reactor before half the counter range elapses.
+    pub fn captureCut(self: *const ReactorFabric, target: u12) Cut {
+        return .{ .fabric = self, .target = target, .position = self.inboxes[target].captureCut() };
+    }
+
+    /// True once the head has passed the cut, not when popped work completes.
+    pub fn consumedThrough(self: *const ReactorFabric, target: u12, cut: Cut) bool {
+        std.debug.assert(cut.fabric == self and cut.target == target);
+        return self.inboxes[target].consumedThrough(cut.position);
+    }
+
+    /// Transfer only pre-cut messages to the owner; a claim hole stops the drain.
+    /// Each returned buffer has the same release obligation as ordinary drain.
+    pub fn drainThrough(self: *ReactorFabric, target: u12, cut: Cut, out: []PositionedMsg) usize {
+        std.debug.assert(cut.fabric == self and cut.target == target);
+        var count: usize = 0;
+        while (count < out.len) : (count += 1) {
+            const popped = self.inboxes[target].popThrough(cut.position) orelse break;
+            out[count] = .{ .position = popped.position, .msg = popped.item };
+        }
+        return count;
     }
 
     /// Drain up to `out.len` messages from `target`'s inbox into `out`, returning
@@ -500,6 +544,69 @@ test "fabric per-shard pools scale the buffer budget with shard count" {
     try testing.expectEqual(@as(usize, 2 * ReactorFabric.pool_slots), others);
 
     for (held) |b| fabric.release(0, b);
+}
+
+test "fabric cut drains partial prefix and leaves later delivery" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fabric = ReactorFabric.init(testing.allocator, 1) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+    const id = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const first = fabric.acquire(0, "first") orelse return error.TestExpectedEqual;
+    const second = fabric.acquire(0, "second") orelse return error.TestExpectedEqual;
+    const later = fabric.acquire(0, "later") orelse return error.TestExpectedEqual;
+    try testing.expect(fabric.sendTo(0, .{ .to = id, .buf = first }));
+    try testing.expect(fabric.sendTo(0, .{ .to = id, .buf = second }));
+    const cut = fabric.captureCut(0);
+    try testing.expect(cut.contains(cut.position -% 1));
+    try testing.expect(!cut.contains(cut.position));
+    try testing.expect(!cut.contains(cut.position +% 1));
+    const wrapped = ReactorFabric.Cut{ .fabric = &fabric, .target = 0, .position = 0 };
+    try testing.expect(wrapped.contains(std.math.maxInt(usize)));
+    try testing.expect(!wrapped.contains(0));
+    try testing.expect(!wrapped.contains(1));
+    try testing.expect(fabric.sendTo(0, .{ .to = id, .buf = later }));
+    var out: [1]ReactorFabric.PositionedMsg = undefined;
+    try testing.expectEqual(@as(usize, 0), fabric.drainThrough(0, cut, out[0..0]));
+    try testing.expect(!fabric.consumedThrough(0, cut));
+    try testing.expectEqual(@as(usize, 1), fabric.drainThrough(0, cut, &out));
+    try testing.expectEqualStrings("first", fabric.bytes(out[0].msg.buf));
+    const position = out[0].position;
+    fabric.release(0, out[0].msg.buf);
+    try testing.expect(!fabric.consumedThrough(0, cut));
+    try testing.expectEqual(@as(usize, 1), fabric.drainThrough(0, cut, &out));
+    try testing.expectEqual(position +% 1, out[0].position);
+    try testing.expectEqualStrings("second", fabric.bytes(out[0].msg.buf));
+    fabric.release(0, out[0].msg.buf);
+    try testing.expect(fabric.consumedThrough(0, cut));
+    try testing.expectEqual(@as(usize, 0), fabric.drainThrough(0, cut, &out));
+    var rest: [1]DeliverMsg = undefined;
+    try testing.expectEqual(@as(usize, 1), fabric.drain(0, &rest));
+    try testing.expectEqualStrings("later", fabric.bytes(rest[0].buf));
+    fabric.release(0, rest[0].buf);
+}
+
+test "fabric pending tracks addressed delivery until drain" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fabric = ReactorFabric.init(testing.allocator, 2) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer fabric.deinit();
+
+    try testing.expect(!fabric.hasPending(0));
+    try testing.expect(!fabric.hasPending(1));
+    const buf = fabric.acquire(1, "pending") orelse return error.TestExpectedEqual;
+    try testing.expect(fabric.sendTo(1, .{ .to = .{ .shard = 1, .slot = 1, .gen = 1 }, .buf = buf }));
+    try testing.expect(!fabric.hasPending(0));
+    try testing.expect(fabric.hasPending(1));
+    var messages: [1]DeliverMsg = undefined;
+    try testing.expectEqual(@as(usize, 1), fabric.drain(1, &messages));
+    defer fabric.release(1, messages[0].buf);
+    try testing.expect(!fabric.hasPending(1));
+    try testing.expectEqualStrings("pending", fabric.bytes(messages[0].buf));
 }
 
 test "fabric drop counter accumulates and is observable" {

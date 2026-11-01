@@ -200,7 +200,7 @@ pub fn stageRestore(store: *OroStore, allocator: std.mem.Allocator) Error!Restor
     var candidate = RestoreCandidate{ .markers = Store.init(allocator), .clock = try clock(store) };
     errdefer candidate.deinit();
     try restoreInto(store, &candidate.markers);
-    var it = store.maps[@intFromEnum(store_mod.Family.props)].map.iterator();
+    var it = store.maps[@backingInt(store_mod.Family.props)].map.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (!std.mem.startsWith(u8, key, item_prefix)) continue;
@@ -409,12 +409,12 @@ test "MARKREAD repeated per-key commits keep retained durable rows bounded throu
         var candidate = try preparePutWithClock(&store, "alice", "#room", ts, "retained-fact", @intCast(stamp));
         defer candidate.deinit();
         try candidate.commit();
-        try std.testing.expectEqual(@as(u32, 2), store.maps[@intFromEnum(store_mod.Family.props)].map.count());
+        try std.testing.expectEqual(@as(u32, 2), store.maps[@backingInt(store_mod.Family.props)].map.count());
     }
     try store.snapshotAndTruncate();
     var reopened = try OroStore.open(alloc, std.testing.io, tmp.dir, "marker-bound.wal");
     defer reopened.deinit();
-    try std.testing.expectEqual(@as(u32, 2), reopened.maps[@intFromEnum(store_mod.Family.props)].map.count());
+    try std.testing.expectEqual(@as(u32, 2), reopened.maps[@backingInt(store_mod.Family.props)].map.count());
     var restored = try stageRestore(&reopened, alloc);
     defer restored.deinit();
     try std.testing.expectEqual(@as(u64, 64), restored.clock);

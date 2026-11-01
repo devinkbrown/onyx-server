@@ -1,5 +1,8 @@
 # E2EE Everywhere (Kintsugi) — Architecture Blueprint
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 *From client-only E2EE DMs to group/channel end-to-end encryption. Roadmap v1.5
 "Kintsugi" — the fortress era. Status: design. Author: stack-architect. Date: 2026-07-11.*
 

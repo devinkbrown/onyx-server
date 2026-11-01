@@ -7,7 +7,7 @@ pub const Symbol = enum(u32) {
     _,
 
     pub fn index(self: Symbol) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -39,7 +39,7 @@ pub const StringIntern = struct {
         if (next_id > std.math.maxInt(u32)) return error.TooManySymbols;
 
         const owned = try self.arena.allocator().dupe(u8, bytes);
-        const symbol: Symbol = @enumFromInt(@as(u32, @intCast(next_id)));
+        const symbol: Symbol = @fromBackingInt(@intCast(@as(u32, @intCast(next_id))));
 
         try self.by_string.put(owned, symbol);
         errdefer _ = self.by_string.remove(owned);
@@ -188,7 +188,7 @@ test "interning is deterministic" {
 
     try std.testing.expectEqual(first.count(), second.count());
     for (0..first.count()) |i| {
-        const symbol: Symbol = @enumFromInt(@as(u32, @intCast(i)));
+        const symbol: Symbol = @fromBackingInt(@intCast(@as(u32, @intCast(i))));
         try std.testing.expectEqualStrings(first.resolve(symbol), second.resolve(symbol));
     }
 }

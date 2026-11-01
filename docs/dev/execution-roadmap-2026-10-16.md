@@ -1,5 +1,8 @@
 # Onyx Server execution roadmap (2026-10-16)
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 This is the execution map. The 2026-10-15 IRCX note
 (`docs/dev/ircx-evolution-roadmap-2026-10-15.md`) stays the research
 record. Where that note's order and this file disagree, follow this

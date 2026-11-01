@@ -432,7 +432,7 @@ fn decodeAddValue(bytes: []const u8) !AddValue {
 fn encodeBoolMode(out: []u8, kind: ModeKind, reg: anytype) ![]const u8 {
     const value = reg.value orelse return error.MissingEntity;
     var w = FixedWriter{ .buf = out };
-    try w.writeU8(@intFromEnum(kind));
+    try w.writeU8(@backingInt(kind));
     try w.writeU64(reg.timestamp);
     try w.writeU64(reg.replica_id);
     try w.writeU8(if (value) 1 else 0);
@@ -442,7 +442,7 @@ fn encodeBoolMode(out: []u8, kind: ModeKind, reg: anytype) ![]const u8 {
 fn encodeKeyMode(out: []u8, reg: anytype) ![]const u8 {
     const value = reg.value orelse return error.MissingEntity;
     var w = FixedWriter{ .buf = out };
-    try w.writeU8(@intFromEnum(ModeKind.key));
+    try w.writeU8(@backingInt(ModeKind.key));
     try w.writeU64(reg.timestamp);
     try w.writeU64(reg.replica_id);
     try w.writeU8(if (value.present) 1 else 0);
@@ -454,7 +454,7 @@ fn encodeKeyMode(out: []u8, reg: anytype) ![]const u8 {
 fn encodeLimitMode(out: []u8, reg: anytype) ![]const u8 {
     const value = reg.value orelse return error.MissingEntity;
     var w = FixedWriter{ .buf = out };
-    try w.writeU8(@intFromEnum(ModeKind.limit));
+    try w.writeU8(@backingInt(ModeKind.limit));
     try w.writeU64(reg.timestamp);
     try w.writeU64(reg.replica_id);
     try w.writeU8(if (value.present) 1 else 0);

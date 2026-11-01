@@ -45,12 +45,12 @@ pub const SignatureScheme = enum(u16) {
 
     /// Wrap a raw wire `u16` as a `SignatureScheme` (total over the enum).
     pub fn fromInt(value: u16) SignatureScheme {
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// The raw wire `u16` for this scheme.
     pub fn toInt(self: SignatureScheme) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

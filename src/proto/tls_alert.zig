@@ -72,7 +72,7 @@ pub const AlertDescription = enum(u8) {
     /// Map a raw byte to a description.  Unknown codes fall through to the
     /// non-exhaustive `_` variant; the raw value is preserved.
     pub fn fromInt(code: u8) AlertDescription {
-        return @enumFromInt(code);
+        return @fromBackingInt(@intCast(code));
     }
 
     /// True when the byte does not correspond to a named description.
@@ -124,8 +124,8 @@ pub const Alert = struct {
 /// Returns `error.NoSpaceLeft` when `out` is smaller than `encoded_len`.
 pub fn encode(out: []u8, alert: Alert) error{NoSpaceLeft}![]const u8 {
     if (out.len < encoded_len) return error.NoSpaceLeft;
-    out[0] = @intFromEnum(alert.level);
-    out[1] = @intFromEnum(alert.description);
+    out[0] = @backingInt(alert.level);
+    out[1] = @backingInt(alert.description);
     return out[0..encoded_len];
 }
 
@@ -228,7 +228,7 @@ test "parse maps an unknown description code to the unknown variant without cras
 
     // Assert
     try std.testing.expect(decoded.description.isUnknown());
-    try std.testing.expectEqual(@as(u8, 255), @intFromEnum(decoded.description));
+    try std.testing.expectEqual(@as(u8, 255), @backingInt(decoded.description));
     try std.testing.expectEqual(AlertLevel.fatal, decoded.level);
 }
 

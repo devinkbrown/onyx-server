@@ -252,8 +252,8 @@ fn lessThan(_: void, a: Cluster, b: Cluster) bool {
     if (a.members.len != b.members.len) {
         return a.members.len > b.members.len;
     }
-    const a_kind = @intFromEnum(a.kind);
-    const b_kind = @intFromEnum(b.kind);
+    const a_kind = @backingInt(a.kind);
+    const b_kind = @backingInt(b.kind);
     if (a_kind != b_kind) return a_kind < b_kind;
 
     const key_cmp = std.mem.order(u8, a.key, b.key);

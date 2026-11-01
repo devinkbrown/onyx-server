@@ -325,7 +325,7 @@ pub const LinkSession = struct {
 fn withKind(allocator: Allocator, kind: MessageKind, body: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.append(allocator, @intFromEnum(kind));
+    try out.append(allocator, @backingInt(kind));
     try out.appendSlice(allocator, body);
     return out.toOwnedSlice(allocator);
 }
@@ -333,13 +333,13 @@ fn withKind(allocator: Allocator, kind: MessageKind, body: []const u8) ![]u8 {
 fn encodeGossip(allocator: Allocator, payload: *const gossip_round.GossipPayload) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.append(allocator, @intFromEnum(MessageKind.gossip));
+    try out.append(allocator, @backingInt(MessageKind.gossip));
     try writeU64(&out, allocator, payload.origin);
     try writeU64(&out, allocator, payload.origin_incarnation);
     try writeVarint(&out, allocator, payload.member_deltas.items.len);
     for (payload.member_deltas.items) |delta| {
         try writeU64(&out, allocator, delta.id);
-        try out.append(allocator, @intFromEnum(delta.state));
+        try out.append(allocator, @backingInt(delta.state));
         try writeU64(&out, allocator, delta.incarnation);
     }
     try writeVarint(&out, allocator, payload.suspicions.items.len);
@@ -386,7 +386,7 @@ fn encodeRepairSummary(allocator: Allocator, state: *const ChannelCrdt) ![]u8 {
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.append(allocator, @intFromEnum(MessageKind.repair_summary));
+    try out.append(allocator, @backingInt(MessageKind.repair_summary));
     try writeVarint(&out, allocator, summary.entries.items.len);
     for (summary.entries.items) |entry| {
         try writeBytes(&out, allocator, entry.key);
@@ -420,7 +420,7 @@ fn decodeRepairSummary(allocator: Allocator, bytes: []const u8) !anti_entropy_re
 fn encodeRepairRequest(allocator: Allocator, request: *const anti_entropy_repair.RepairRequest) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.append(allocator, @intFromEnum(MessageKind.repair_request));
+    try out.append(allocator, @backingInt(MessageKind.repair_request));
     try writeVarint(&out, allocator, request.keys.len);
     for (request.keys) |key| try writeBytes(&out, allocator, key);
     return out.toOwnedSlice(allocator);
@@ -443,12 +443,12 @@ fn decodeRepairRequest(allocator: Allocator, bytes: []const u8) !anti_entropy_re
 fn encodeRepairResponse(allocator: Allocator, response: *const anti_entropy_repair.RepairResponse) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.append(allocator, @intFromEnum(MessageKind.repair_response));
+    try out.append(allocator, @backingInt(MessageKind.repair_response));
     try writeU64(&out, allocator, response.hlc.toU64());
     try writeVersionVector(&out, allocator, response.vv);
     try writeVarint(&out, allocator, response.records.len);
     for (response.records) |record| {
-        try out.append(allocator, @intFromEnum(record.kind));
+        try out.append(allocator, @backingInt(record.kind));
         try writeBytes(&out, allocator, record.key);
         try writeBytes(&out, allocator, record.payload);
     }

@@ -1,5 +1,8 @@
 # Onyx Server upgrade roadmap (2026-10-15)
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Working tree on `portability/openbsd` at `c5d14934`, plus uncommitted Armor and IRCX edits. Nothing in this document is a deploy, a push, or a commit. Live dual-node units stay on the image recorded in `docs/ops/onyx-server-paths.md`.
 
 Swarm result, 2026-10-15:

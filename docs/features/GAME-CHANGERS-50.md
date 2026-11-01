@@ -1,5 +1,8 @@
 # Game Changers 50 — unified feature catalog (Onyx Server + Onyx)
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 **Status:** architecture proposal, uncommitted. **Docs only — no code implied by this file.**
 **Repos:** `/home/kain/onyx-server` (Zig IRC/IRCX daemon) · `/home/kain/onyx` (SolidJS web client)
 **Author:** stack-architect · **Date:** 2026-09-01

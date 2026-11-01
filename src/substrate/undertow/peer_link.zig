@@ -456,7 +456,7 @@ pub fn encodeFrame(frame: FrameView, out: []u8) Error![]const u8 {
 
     @memcpy(out[0..magic.len], &magic);
     out[magic.len] = version;
-    out[magic.len + 1] = @intFromEnum(frame.kind);
+    out[magic.len + 1] = @backingInt(frame.kind);
 
     var pos: usize = magic.len + 2;
     writeU64(out[pos..][0..8], frame.epoch_ms);
@@ -510,10 +510,10 @@ pub fn decodeFrame(in: []const u8) Error!FrameView {
 
 fn decodeKind(value: u8) Error!FrameKind {
     return switch (value) {
-        @intFromEnum(FrameKind.delta) => .delta,
-        @intFromEnum(FrameKind.ack) => .ack,
-        @intFromEnum(FrameKind.heartbeat) => .heartbeat,
-        @intFromEnum(FrameKind.close) => .close,
+        @backingInt(FrameKind.delta) => .delta,
+        @backingInt(FrameKind.ack) => .ack,
+        @backingInt(FrameKind.heartbeat) => .heartbeat,
+        @backingInt(FrameKind.close) => .close,
         else => error.UnknownFrameKind,
     };
 }

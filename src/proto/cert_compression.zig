@@ -48,7 +48,7 @@ pub const Algorithm = enum(u16) {
     _,
 
     pub fn toInt(self: Algorithm) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

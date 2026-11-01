@@ -18,7 +18,7 @@ const x509_verify = @import("x509_verify.zig");
 pub const max_plaintext_len = 16 * 1024;
 pub const max_ciphertext_len = max_plaintext_len + 256;
 pub const record_header_len = 5;
-pub const tls12_wire_version: u16 = @intFromEnum(ProtocolVersion.tls12);
+pub const tls12_wire_version: u16 = @backingInt(ProtocolVersion.tls12);
 
 pub const TlsError = error{
     BadRecordHeader,
@@ -242,7 +242,7 @@ pub const RecordHeader = struct {
 
     pub fn write(self: RecordHeader, out: []u8) TlsError!void {
         if (out.len < record_header_len) return error.OutputTooSmall;
-        out[0] = @intFromEnum(self.content_type);
+        out[0] = @backingInt(self.content_type);
         std.mem.writeInt(u16, out[1..3], self.legacy_version, .big);
         std.mem.writeInt(u16, out[3..5], self.length, .big);
     }
@@ -388,7 +388,7 @@ pub const RecordCipherState = struct {
             std.mem.writeInt(u64, out[0..8], sequence, .big);
             n = 8;
         }
-        out[n] = @intFromEnum(content_type);
+        out[n] = @backingInt(content_type);
         n += 1;
         std.mem.writeInt(u16, out[n..][0..2], wire_version, .big);
         n += 2;
@@ -746,8 +746,8 @@ fn k6HelloExtensions(record: []const u8) ![]const u8 {
     var c: usize = 0;
     while (c + 2 <= cs_len) : (c += 2) {
         const suite = std.mem.readInt(u16, body[i + c ..][0..2], .big);
-        if (suite == @intFromEnum(CipherSuite.tls_aes_128_ccm_sha256) or
-            suite == @intFromEnum(CipherSuite.tls_aes_128_ccm_8_sha256))
+        if (suite == @backingInt(CipherSuite.tls_aes_128_ccm_sha256) or
+            suite == @backingInt(CipherSuite.tls_aes_128_ccm_8_sha256))
         {
             return error.Truncated;
         }
@@ -811,8 +811,8 @@ test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane stays
     const hello = try client.start();
     defer allocator.free(hello);
     const extensions = try k6HelloExtensions(hello);
-    const groups = (try tls_extension.find(extensions, @intFromEnum(tls_extension.ExtensionType.supported_groups))) orelse return error.TestUnexpectedResult;
-    const shares = (try tls_extension.find(extensions, @intFromEnum(tls_extension.ExtensionType.key_share))) orelse return error.TestUnexpectedResult;
+    const groups = (try tls_extension.find(extensions, @backingInt(tls_extension.ExtensionType.supported_groups))) orelse return error.TestUnexpectedResult;
+    const shares = (try tls_extension.find(extensions, @backingInt(tls_extension.ExtensionType.key_share))) orelse return error.TestUnexpectedResult;
     try std.testing.expect(supported_groups.offers(groups, .x25519));
     try std.testing.expect(supported_groups.offers(groups, .secp256r1));
     try std.testing.expect(supported_groups.offers(groups, .x25519mlkem768));

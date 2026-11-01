@@ -52,7 +52,7 @@ The channel command module registers the base membership and moderation commands
 
 ### Channel mode inventory
 
-- ISUPPORT `CHANMODES`: `beIZ,k,lfj,imnstCTNMSgWOAVUFD`.
+- ISUPPORT `CHANMODES`: `beIZ,k,lfj,imntsCTNgSMWOAphuadErzxwVUFDcBK` (derived by `deriveChanmodes`; see `protocol/modes.md`).
 - ISUPPORT `PREFIX`: `(YQqov)*!.@+`. `Y`/`*` is derived from the `oper_override` privilege, not grantable channel state; grantable member modes are founder `Q`/`!`, owner `q`/`.`, operator `o`/`@`, and voice `v`/`+`.
 - List modes: `b` ban, `e` exempt, `I` invite-exception, `Z` quiet.
 - Parameter modes: `k` key on set/unset, `l` limit on set, `f` forward target on set, `j` join throttle on set.

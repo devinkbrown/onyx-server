@@ -143,12 +143,12 @@ const Reader = struct {
 fn header(w: *Writer, kind: Kind, nonce: service.Id) Error!void {
     try w.bytes("NSHP");
     try w.int(u16, policy_version);
-    try w.int(u8, @intFromEnum(kind));
+    try w.int(u8, @backingInt(kind));
     try w.int(u8, 0);
     try w.bytes(&nonce);
 }
 fn readHeader(r: *Reader, kind: Kind) Error!service.Id {
-    if (!std.mem.eql(u8, try r.take(4), "NSHP") or try r.int(u16) != policy_version or try r.int(u8) != @intFromEnum(kind) or try r.int(u8) != 0) return error.InvalidWire;
+    if (!std.mem.eql(u8, try r.take(4), "NSHP") or try r.int(u16) != policy_version or try r.int(u8) != @backingInt(kind) or try r.int(u8) != 0) return error.InvalidWire;
     const id = (try r.take(16))[0..16].*;
     if (std.mem.allEqual(u8, &id, 0)) return error.InvalidWire;
     return id;
@@ -159,7 +159,7 @@ fn encodePolicy(policy: *const Policy, kind: Kind) Error!Wire {
     var wire: Wire = .{};
     var w: Writer = .{ .wire = &wire };
     try header(&w, kind, policy.nonce);
-    try w.int(u8, @intFromEnum(policy.purpose));
+    try w.int(u8, @backingInt(policy.purpose));
     try w.int(i64, policy.deadline);
     const s = &policy.spec;
     for ([_]*const service.Path{ &s.helper, &s.executable, &s.config, &s.cwd }) |p| try w.path(p);
@@ -450,7 +450,7 @@ pub fn observeManagedContext(allocator: std.mem.Allocator, io: std.Io, s: *const
     o.cwd = identity(&st);
     for (&o.limits, 0..) |*l, i| {
         var v: sys.rlimit = undefined;
-        if (posix.errno(sys.getrlimit(@enumFromInt(i), &v)) != .SUCCESS) return error.ObservationFailed;
+        if (posix.errno(sys.getrlimit(@fromBackingInt(@intCast(i)), &v)) != .SUCCESS) return error.ObservationFailed;
         l.* = .{ .soft = @intCast(v.cur), .hard = @intCast(v.max) };
     }
     try validateManagedObservation(s, &o, phase);
@@ -596,7 +596,7 @@ fn resetChildSignals() Error!void {
     if (sys.sigemptyset(&empty) != 0) return error.IoFailed;
     const action: sys.Sigaction = .{ .handler = .{ .handler = sys.SIG.DFL }, .mask = empty, .flags = 0 };
     for (1..sys.NSIG) |number| {
-        const signal: sys.SIG = @enumFromInt(number);
+        const signal: sys.SIG = @fromBackingInt(@intCast(number));
         // OpenBSD reserves SIGTHR (32) for libc thread cancellation; public
         // sigaction may reject it. It is not a service launch signal.
         if (signal == .KILL or signal == .STOP or number == 32) continue;
@@ -1138,7 +1138,7 @@ test "native service helper policy every truncated prefix trailing bytes version
     bad[8] = 2;
     try std.testing.expectError(error.InvalidWire, decodeSpec(bad));
     @memcpy(bad, bytes);
-    bad[24] = @intFromEnum(Purpose.serve);
+    bad[24] = @backingInt(Purpose.serve);
     try std.testing.expectError(error.InvalidWire, decodeSpec(bad));
     const again = try encodeSpec(std.testing.allocator, try decodeSpec(bytes));
     defer std.testing.allocator.free(again);

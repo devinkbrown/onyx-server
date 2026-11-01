@@ -13,7 +13,7 @@ pub const OperMotdNumeric = enum(u16) {
 
     /// Return the integer IRC numeric code.
     pub fn code(self: OperMotdNumeric) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Format the numeric as a three-digit IRC code into caller-owned storage.

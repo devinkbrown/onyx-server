@@ -147,7 +147,7 @@ fn ackBody(phase: AckPhase, next_index: usize, total: usize) [ack_body_len]u8 {
     var body: [ack_body_len]u8 = undefined;
     @memcpy(body[0..4], ack_magic);
     std.mem.writeInt(u16, body[4..6], version, .big);
-    std.mem.writeInt(u16, body[6..8], @intFromEnum(phase), .big);
+    std.mem.writeInt(u16, body[6..8], @backingInt(phase), .big);
     std.mem.writeInt(u32, body[8..12], @intCast(next_index), .big);
     std.mem.writeInt(u32, body[12..16], @intCast(total), .big);
     return body;
@@ -244,7 +244,7 @@ fn validateBatchHeader(body: []const u8, start: usize, total: usize) Error!usize
 fn encodeRow(body: []u8, row: SourceRow, transfer: *const socket_mod.Transfer) void {
     std.mem.writeInt(i32, body[0..4], row.canonical, .big);
     std.mem.writeInt(u16, body[4..6], row.shard, .big);
-    body[6] = @intFromEnum(row.role);
+    body[6] = @backingInt(row.role);
     body[7] = row.family;
     body[8] = 1; // TCP stream; no HANDLE or datagram alias is accepted.
     @memset(body[9..12], 0);

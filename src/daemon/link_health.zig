@@ -49,6 +49,9 @@ pub const LinkHealth = struct {
     send_backlog_bytes: u64 = 0,
     /// Monotonic ms of the last finished anti-entropy round, or null.
     last_anti_entropy_ms: ?u64 = null,
+    /// Consecutive periodic anti-entropy rounds that found no divergence
+    /// signal; drives the adaptive backoff in resyncMeshStateToPeers.
+    anti_entropy_quiet_repairs: u32 = 0,
     /// Mesh says this peer is on the other side of a partition. Distinct from
     /// `state == .down`, which means the peer itself is gone.
     partitioned: bool = false,
@@ -295,8 +298,8 @@ pub const Registry = struct {
             try writePeerGauge(allocator, out, "onyx_peer_last_anti_entropy_ms", entry.name(), h.last_anti_entropy_ms orelse 0);
             try writePeerGauge(allocator, out, "onyx_peer_partitioned", entry.name(), @as(u8, if (h.partitioned) 1 else 0));
             try writePeerGauge(allocator, out, "onyx_peer_down", entry.name(), @as(u8, if (h.isDown()) 1 else 0));
-            try writePeerGauge(allocator, out, "onyx_peer_ripple_suspicion", entry.name(), @intFromEnum(h.ripple));
-            try writePeerGauge(allocator, out, "onyx_peer_value_sync", entry.name(), @intFromEnum(h.value_sync));
+            try writePeerGauge(allocator, out, "onyx_peer_ripple_suspicion", entry.name(), @backingInt(h.ripple));
+            try writePeerGauge(allocator, out, "onyx_peer_value_sync", entry.name(), @backingInt(h.value_sync));
         }
     }
 

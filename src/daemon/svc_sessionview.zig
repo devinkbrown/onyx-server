@@ -33,12 +33,12 @@ pub const TraceNumeric = enum(u16) {
     RPL_ENDOFTRACE = 262,
 
     pub fn code(self: TraceNumeric) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn format(self: TraceNumeric, out: []u8) Error![]const u8 {
         if (out.len < 3) return error.OutputTooSmall;
-        const value: u16 = @intFromEnum(self);
+        const value: u16 = @backingInt(self);
         out[0] = '0' + @as(u8, @intCast((value / 100) % 10));
         out[1] = '0' + @as(u8, @intCast((value / 10) % 10));
         out[2] = '0' + @as(u8, @intCast(value % 10));

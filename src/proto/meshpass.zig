@@ -315,15 +315,15 @@ fn normalizeTrustRoot(trust_root: anytype) TrustRoot {
 }
 
 fn roleBit(role: Role) u64 {
-    return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(role)));
+    return @as(u64, 1) << @as(u6, @intCast(@backingInt(role)));
 }
 
 fn frameFamilyBit(family: FrameFamily) u32 {
-    return @as(u32, 1) << @as(u5, @intCast(@intFromEnum(family)));
+    return @as(u32, 1) << @as(u5, @intCast(@backingInt(family)));
 }
 
 fn mediaRightBit(right: MediaRight) u32 {
-    return @as(u32, 1) << @as(u5, @intCast(@intFromEnum(right)));
+    return @as(u32, 1) << @as(u5, @intCast(@backingInt(right)));
 }
 
 fn sampleFields(node_pubkey: PublicKeyBytes) Fields {

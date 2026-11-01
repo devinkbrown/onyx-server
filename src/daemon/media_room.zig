@@ -46,6 +46,47 @@ pub const PhysicalProfileKey = routing.PhysicalProfileKey;
 pub const PhysicalMemberKey = struct { call: routing.CallId, client: routing.ClientId };
 pub const PhysicalMember = struct { display: media.ParticipantId, kind_bits: u8 };
 const PhysicalMemberMap = std.AutoHashMap(PhysicalMemberKey, PhysicalMember);
+const ChannelKeyContext = struct {
+    pub fn hash(_: ChannelKeyContext, key: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for (key) |byte| {
+            const folded = std.ascii.toLower(byte);
+            h.update(std.mem.asBytes(&folded));
+        }
+        return h.final();
+    }
+    pub fn eql(_: ChannelKeyContext, a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+/// Channel spelling is display storage; only ASCII A-Z is folded for lookup.
+fn ChannelMap(comptime T: type) type {
+    return std.HashMap([]const u8, T, ChannelKeyContext, std.hash_map.default_max_load_percentage);
+}
+/// Composite metadata preserves the exact participant suffix after the FIRST
+/// NUL. Its channel prefix has the same ASCII identity as every room map.
+const ParticipantKeyContext = struct {
+    pub fn hash(_: ParticipantKeyContext, key: []const u8) u64 {
+        const divider = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
+        var h = std.hash.Wyhash.init(0);
+        for (key[0..divider]) |byte| {
+            const folded = std.ascii.toLower(byte);
+            h.update(std.mem.asBytes(&folded));
+        }
+        h.update(key[divider..]);
+        return h.final();
+    }
+    pub fn eql(_: ParticipantKeyContext, a: []const u8, b: []const u8) bool {
+        const left = std.mem.indexOfScalar(u8, a, 0) orelse a.len;
+        const right = std.mem.indexOfScalar(u8, b, 0) orelse b.len;
+        return left == right and std.ascii.eqlIgnoreCase(a[0..left], b[0..right]) and
+            std.mem.eql(u8, a[left..], b[right..]);
+    }
+};
+fn ParticipantMap(comptime T: type) type {
+    return std.HashMap([]const u8, T, ParticipantKeyContext, std.hash_map.default_max_load_percentage);
+}
+const RoomMap = ChannelMap(*Room);
 fn transportChannel(value: []const u8, out: *[128]u8) PreparedError![]const u8 {
     if (value.len == 0 or value.len > out.len) return error.InvalidRequest;
     for (value, 0..) |byte, n| {
@@ -129,8 +170,8 @@ pub fn agreedKindBits(profile: CallProfile) error{InvalidProfile}!u8 {
     if (profile.codec_count == 0 or profile.codec_count > max_profile_codecs) return error.InvalidProfile;
     var bits: u8 = 0;
     for (profile.slice()) |codec| bits |= switch (codec.tag) {
-        .cadencevox => @as(u8, 1),
-        .cadencevis => @as(u8, 6),
+        .cadencevox, .opus => @as(u8, 1),
+        .cadencevis, .vp8 => @as(u8, 6),
         .raw => @as(u8, 7),
     };
     return bits;
@@ -206,7 +247,7 @@ pub const Snapshot = struct {
         for (self.rooms, 0..) |row, i| {
             if (!validChannelKey(row.key) or row.room.len == 0 or row.room.len > self.config.max_participants) return error.InvalidSnapshot;
             row.room.validate() catch return error.InvalidSnapshot;
-            for (self.rooms[0..i]) |prior| if (std.mem.eql(u8, prior.key, row.key)) return error.InvalidSnapshot;
+            for (self.rooms[0..i]) |prior| if (std.ascii.eqlIgnoreCase(prior.key, row.key)) return error.InvalidSnapshot;
         }
         try validateStringRows([]u8, self.breakouts, .composite);
         for (self.breakouts) |row| if (row.value.len > self.config.max_breakout_bytes) return error.InvalidSnapshot;
@@ -219,9 +260,9 @@ pub const Snapshot = struct {
         try validateStringRows(Quality, self.qualities, .composite);
         for (self.queues, 0..) |queue, i| {
             if (!validChannelKey(queue.key) or queue.items.len == 0 or queue.items.len > max_participants) return error.InvalidSnapshot;
-            for (self.queues[0..i]) |prior| if (std.mem.eql(u8, prior.key, queue.key)) return error.InvalidSnapshot;
+            for (self.queues[0..i]) |prior| if (std.ascii.eqlIgnoreCase(prior.key, queue.key)) return error.InvalidSnapshot;
             var room: ?Room.Snapshot = null;
-            for (self.rooms) |row| if (std.mem.eql(u8, row.key, queue.key)) {
+            for (self.rooms) |row| if (std.ascii.eqlIgnoreCase(row.key, queue.key)) {
                 room = row.room;
                 break;
             };
@@ -237,7 +278,7 @@ pub const Snapshot = struct {
                 if (!joined) return error.InvalidSnapshot;
                 var raised = false;
                 for (self.hands) |hand| if (hand.key.len == queue.key.len + 1 + item.len and
-                    std.mem.eql(u8, hand.key[0..queue.key.len], queue.key) and
+                    std.ascii.eqlIgnoreCase(hand.key[0..queue.key.len], queue.key) and
                     hand.key[queue.key.len] == 0 and
                     std.mem.eql(u8, hand.key[queue.key.len + 1 ..], item))
                 {
@@ -289,7 +330,7 @@ pub const Snapshot = struct {
             };
             const name = channel orelse return error.InvalidSnapshot;
             var display_found = false;
-            for (self.rooms) |room| if (std.mem.eql(u8, room.key, name)) {
+            for (self.rooms) |room| if (std.ascii.eqlIgnoreCase(room.key, name)) {
                 for (room.room.participants[0..room.room.len]) |participant| if (participant.id.eql(&member.member.display) and
                     participant.joined.bits & member.member.kind_bits == member.member.kind_bits)
                 {
@@ -324,19 +365,21 @@ fn validChannelKey(key: []const u8) bool {
 fn validCompositeKey(key: []const u8) bool {
     const divider = std.mem.indexOfScalar(u8, key, 0) orelse return false;
     if (!validChannelKey(key[0..divider]) or key.len > 256) return false;
-    _ = media.ParticipantId.init(key[divider + 1 ..]) catch return false;
+    const participant = key[divider + 1 ..];
+    if (std.mem.indexOfScalar(u8, participant, 0) != null) return false;
+    _ = media.ParticipantId.init(participant) catch return false;
     return true;
 }
 
 fn canonicalProfile(profile: CallProfile) SnapshotError!CallProfile {
-    if (profile.codec_count > max_profile_codecs or @intFromEnum(profile.fec.scheme) > 2) return error.InvalidSnapshot;
+    if (profile.codec_count > max_profile_codecs or @backingInt(profile.fec.scheme) > 2) return error.InvalidSnapshot;
     var copy = CallProfile{
         .codecs = @splat(.{ .tag = .cadencevox, .clock_rate = 0, .params = 0 }),
         .codec_count = profile.codec_count,
         .fec = profile.fec,
     };
     for (profile.codecs[0..profile.codec_count], 0..) |codec, i| {
-        if (@intFromEnum(codec.tag) < 1 or @intFromEnum(codec.tag) > 3) return error.InvalidSnapshot;
+        if (@backingInt(codec.tag) < 1 or @backingInt(codec.tag) > 3) return error.InvalidSnapshot;
         copy.codecs[i] = codec;
     }
     return copy;
@@ -357,7 +400,10 @@ fn canonicalRecording(recording: Recording) SnapshotError!Recording {
 fn validateStringRows(comptime T: type, rows: []const StringRow(T), kind: KeyKind) SnapshotError!void {
     for (rows, 0..) |row, i| {
         if (!(if (kind == .channel) validChannelKey(row.key) else validCompositeKey(row.key))) return error.InvalidSnapshot;
-        for (rows[0..i]) |prior| if (std.mem.eql(u8, prior.key, row.key)) return error.InvalidSnapshot;
+        for (rows[0..i]) |prior| if (if (kind == .channel)
+            std.ascii.eqlIgnoreCase(prior.key, row.key)
+        else
+            ParticipantKeyContext.eql(.{}, prior.key, row.key)) return error.InvalidSnapshot;
         if (T == CallProfile and !profileCanonical(row.value)) return error.InvalidSnapshot;
         if (T == Recording) {
             const canonical = try canonicalRecording(row.value);
@@ -400,7 +446,7 @@ fn capturePhysicalMembers(allocator: std.mem.Allocator, map: *PhysicalMemberMap)
     return rows;
 }
 
-fn captureRooms(allocator: std.mem.Allocator, map: *std.StringHashMap(*Room)) SnapshotError![]RoomRow {
+fn captureRooms(allocator: std.mem.Allocator, map: *RoomMap) SnapshotError![]RoomRow {
     const rows = try allocator.alloc(RoomRow, map.count());
     var i: usize = 0;
     errdefer {
@@ -415,7 +461,7 @@ fn captureRooms(allocator: std.mem.Allocator, map: *std.StringHashMap(*Room)) Sn
     return rows;
 }
 
-fn captureStringRows(comptime T: type, allocator: std.mem.Allocator, map: *std.StringHashMap(T)) SnapshotError![]StringRow(T) {
+fn captureStringRows(comptime T: type, allocator: std.mem.Allocator, map: anytype) SnapshotError![]StringRow(T) {
     const rows = try allocator.alloc(StringRow(T), map.count());
     var i: usize = 0;
     errdefer {
@@ -466,7 +512,7 @@ fn captureOneQueue(allocator: std.mem.Allocator, key: []const u8, items: []const
     return .{ .key = owned_key, .items = owned_items };
 }
 
-fn captureQueues(allocator: std.mem.Allocator, map: *std.StringHashMap(std.ArrayList([]u8))) SnapshotError![]QueueRow {
+fn captureQueues(allocator: std.mem.Allocator, map: *ChannelMap(std.ArrayList([]u8))) SnapshotError![]QueueRow {
     const rows = try allocator.alloc(QueueRow, map.count());
     var i: usize = 0;
     errdefer {
@@ -496,7 +542,7 @@ fn putRoomRow(result: *MediaRooms, row: RoomRow) SnapshotError!void {
     try result.rooms.put(key, room);
 }
 
-fn putStringRow(comptime T: type, allocator: std.mem.Allocator, map: *std.StringHashMap(T), row: StringRow(T)) SnapshotError!void {
+fn putStringRow(comptime T: type, allocator: std.mem.Allocator, map: anytype, row: StringRow(T)) SnapshotError!void {
     const key = try allocator.dupe(u8, row.key);
     errdefer allocator.free(key);
     const value: T = if (T == []u8) try allocator.dupe(u8, row.value) else row.value;
@@ -531,37 +577,37 @@ pub const MediaRooms = struct {
     physical_profiles: std.AutoHashMap(PhysicalProfileKey, CallProfile),
     physical_members: PhysicalMemberMap,
     transport_revision: u64 = 1,
-    rooms: std.StringHashMap(*Room),
+    rooms: RoomMap,
     /// Optional breakout (sub-room) label per participant, keyed by the composite
     /// "channel\x00participant". Absent = the default "main" breakout. Kept in a
     /// flat map so the substrate Session participant model stays untouched.
-    breakouts: std.StringHashMap([]u8),
+    breakouts: ParticipantMap([]u8),
     /// Optional spatial-audio position per participant (same composite key).
     /// Absent = origin. Value is inline (no per-entry allocation).
-    positions: std.StringHashMap(Position),
+    positions: ParticipantMap(Position),
     /// Raised-hand set (same composite key). Presence of the key = hand raised.
-    hands: std.StringHashMap(void),
+    hands: ParticipantMap(void),
     /// Negotiated codec/FEC profile per channel (the call's agreed media set),
     /// keyed by an owned channel name. Established by `MEDIA OFFER`; consulted by
     /// `MEDIA ANSWER`. Cleared when the call ends.
-    profiles: std.StringHashMap(CallProfile),
+    profiles: ChannelMap(CallProfile),
     /// Per-(channel,participant) advertised codec/FEC capability set. This is
     /// distinct from the channel profile: it records what each participant can
     /// receive so Causeway can keep the call transcode-free.
-    participant_profiles: std.StringHashMap(CallProfile),
+    participant_profiles: ParticipantMap(CallProfile),
     /// Visible consent bits, keyed by "channel\x00participant". Absent means
     /// the member has not consented. There is no hidden-recorder flag.
-    consents: std.StringHashMap(void),
+    consents: ParticipantMap(void),
     /// One oper-visible recording note per channel. The room announcement is
     /// the existence signal; this row is the stored artifact. It is not a
     /// media capture and it is cleared when the call ends.
-    recordings: std.StringHashMap(Recording),
+    recordings: ChannelMap(Recording),
     /// Last congestion sample per member. Loss, RTT, chosen spatial layer,
     /// and target bitrate only — never keying material.
-    qualities: std.StringHashMap(Quality),
+    qualities: ParticipantMap(Quality),
     /// Raised-hand order per channel. Index 0 is the head. The daemon lists
     /// this queue and does not refuse speech from a member who is not at the head.
-    queues: std.StringHashMap(std.ArrayList([]u8)),
+    queues: ChannelMap(std.ArrayList([]u8)),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
         return initConfig(allocator, .{});
@@ -573,16 +619,16 @@ pub const MediaRooms = struct {
             .config = config,
             .physical_profiles = std.AutoHashMap(PhysicalProfileKey, CallProfile).init(allocator),
             .physical_members = PhysicalMemberMap.init(allocator),
-            .rooms = std.StringHashMap(*Room).init(allocator),
-            .breakouts = std.StringHashMap([]u8).init(allocator),
-            .positions = std.StringHashMap(Position).init(allocator),
-            .hands = std.StringHashMap(void).init(allocator),
-            .profiles = std.StringHashMap(CallProfile).init(allocator),
-            .participant_profiles = std.StringHashMap(CallProfile).init(allocator),
-            .consents = std.StringHashMap(void).init(allocator),
-            .recordings = std.StringHashMap(Recording).init(allocator),
-            .qualities = std.StringHashMap(Quality).init(allocator),
-            .queues = std.StringHashMap(std.ArrayList([]u8)).init(allocator),
+            .rooms = RoomMap.init(allocator),
+            .breakouts = ParticipantMap([]u8).init(allocator),
+            .positions = ParticipantMap(Position).init(allocator),
+            .hands = ParticipantMap(void).init(allocator),
+            .profiles = ChannelMap(CallProfile).init(allocator),
+            .participant_profiles = ParticipantMap(CallProfile).init(allocator),
+            .consents = ParticipantMap(void).init(allocator),
+            .recordings = ChannelMap(Recording).init(allocator),
+            .qualities = ParticipantMap(Quality).init(allocator),
+            .queues = ChannelMap(std.ArrayList([]u8)).init(allocator),
         };
     }
 
@@ -753,6 +799,8 @@ pub const MediaRooms = struct {
 
     /// Build the "channel\x00participant" composite key into `buf`.
     fn breakoutKey(buf: []u8, channel: []const u8, pid: []const u8) ?[]const u8 {
+        if (!validChannelKey(channel) or std.mem.indexOfScalar(u8, pid, 0) != null) return null;
+        _ = media.ParticipantId.init(pid) catch return null;
         if (channel.len + 1 + pid.len > buf.len) return null;
         @memcpy(buf[0..channel.len], channel);
         buf[channel.len] = 0;
@@ -966,7 +1014,7 @@ pub const MediaRooms = struct {
             plan.new_call_key = try self.allocator.dupe(u8, channel);
             if (self.profiles.unmanaged.available == 0) {
                 const count = std.math.add(u32, self.profiles.count(), 1) catch return error.SequenceExhausted;
-                plan.call_growth = std.StringHashMap(CallProfile).init(self.allocator);
+                plan.call_growth = ChannelMap(CallProfile).init(self.allocator);
                 try plan.call_growth.?.ensureTotalCapacity(count);
             }
         }
@@ -994,7 +1042,7 @@ pub const MediaRooms = struct {
             plan.new_key = try self.allocator.dupe(u8, channel);
             if (self.profiles.unmanaged.available == 0) {
                 const required = std.math.add(u32, self.profiles.count(), 1) catch return error.SequenceExhausted;
-                plan.growth = std.StringHashMap(CallProfile).init(self.allocator);
+                plan.growth = ChannelMap(CallProfile).init(self.allocator);
                 try plan.growth.?.ensureTotalCapacity(required);
             }
         }
@@ -1070,20 +1118,25 @@ pub const MediaRooms = struct {
     }
 
     fn clearParticipantProfilesForChannel(self: *MediaRooms, channel: []const u8) void {
-        var victims: [max_participants][]const u8 = undefined;
-        var n: usize = 0;
-        var it = self.participant_profiles.keyIterator();
-        while (it.next()) |key| {
-            const k = key.*;
-            if (k.len <= channel.len or k[channel.len] != 0) continue;
-            if (!std.mem.eql(u8, k[0..channel.len], channel)) continue;
-            if (n >= victims.len) break;
-            victims[n] = k;
-            n += 1;
-        }
-        for (victims[0..n]) |key| {
-            _ = self.participant_profiles.remove(key);
-            self.allocator.free(key);
+        // Capability rows can exist before JOIN. Drain every matching row in
+        // bounded batches instead of silently retaining rows beyond room cap.
+        while (true) {
+            var victims: [max_participants][]const u8 = undefined;
+            var n: usize = 0;
+            var it = self.participant_profiles.keyIterator();
+            while (it.next()) |key| {
+                const k = key.*;
+                if (k.len <= channel.len or k[channel.len] != 0) continue;
+                if (!std.ascii.eqlIgnoreCase(k[0..channel.len], channel)) continue;
+                victims[n] = k;
+                n += 1;
+                if (n == victims.len) break;
+            }
+            if (n == 0) return;
+            for (victims[0..n]) |key| {
+                _ = self.participant_profiles.remove(key);
+                self.allocator.free(key);
+            }
         }
     }
 
@@ -1094,7 +1147,7 @@ pub const MediaRooms = struct {
         var channel_buf: [128]u8 = undefined;
         const channel = try transportChannel(channel_input, &channel_buf);
         if (membership.client.isNone() or membership.call.domain.serial == 0 or membership.call.serial == 0 or
-            membership.kind_bits & (@as(u8, 1) << @intFromEnum(kind)) == 0) return error.InvalidIdentity;
+            membership.kind_bits & (@as(u8, 1) << @backingInt(kind)) == 0) return error.InvalidIdentity;
         if (channel.len == 0 or channel.len > 128) return error.InvalidRequest;
         const id = try media.ParticipantId.init(display_nick);
         const member_key = PhysicalMemberKey{ .call = membership.call, .client = membership.client };
@@ -1130,7 +1183,7 @@ pub const MediaRooms = struct {
         if (old_room == null) {
             plan.new_key = try self.allocator.dupe(u8, channel);
             if (self.rooms.unmanaged.available == 0) {
-                plan.growth = std.StringHashMap(*Room).init(self.allocator);
+                plan.growth = RoomMap.init(self.allocator);
                 const required = std.math.add(u32, self.rooms.count(), 1) catch return error.SequenceExhausted;
                 try plan.growth.?.ensureTotalCapacity(required);
             }
@@ -1141,6 +1194,29 @@ pub const MediaRooms = struct {
     /// Exact source-owned logical/profile retirement joined to the Domain
     /// departure. All affected payloads remain owned here until after the cut.
     pub fn prepareDeparture(self: *MediaRooms, departure: *routing.PreparedDeparture, channel_input: []const u8) PreparedError!*PreparedRoomDeparture {
+        return self.prepareDepartureWithExternalOwners(departure, channel_input, EmptyExternalOwners{});
+    }
+
+    /// A descriptor borrowed from the server's original physical registry under
+    /// its uninterrupted World cut. It preserves legacy room display only and
+    /// grants no Domain membership, transport endpoint, or packet authority.
+    pub const ExternalDepartureOwner = struct {
+        channel: []const u8,
+        participant: media.ParticipantId,
+        client: routing.ClientId,
+        kind_bits: u8,
+    };
+    const EmptyExternalOwners = struct {
+        fn next(_: *@This()) PreparedError!?ExternalDepartureOwner {
+            return null;
+        }
+    };
+
+    /// Enumerate the current external-owner census BEFORE the prepared cut.
+    /// Nothing borrowed from the iterator survives this preparation. The server
+    /// retains World through all joined validations/commits, while this plan
+    /// independently validates physical-map and room revisions/snapshots.
+    pub fn prepareDepartureWithExternalOwners(self: *MediaRooms, departure: *routing.PreparedDeparture, channel_input: []const u8, external_owners: anytype) PreparedError!*PreparedRoomDeparture {
         var channel_buf: [128]u8 = undefined;
         const channel = try transportChannel(channel_input, &channel_buf);
         if (channel.len == 0 or channel.len > 128) return error.InvalidRequest;
@@ -1151,27 +1227,51 @@ pub const MediaRooms = struct {
         if (old_member != null and old_room == null) return error.InvalidSnapshot;
         const old_snapshot = if (old_room) |room_ptr| try room_ptr.capture() else Room.Snapshot{};
         var final_room = try Room.prepareRestore(&old_snapshot);
+        var external_before: u8 = 0;
+        var external_remaining: u8 = 0;
+        var external_display: ?media.ParticipantId = null;
+        var external_owned = false;
+        var owners = external_owners;
+        while (try owners.next()) |external| {
+            media.validateParticipantId(external.participant) catch return error.InvalidRequest;
+            if (external.client.isNone() or external.kind_bits == 0 or external.kind_bits & ~@as(u8, 7) != 0 or !std.ascii.eqlIgnoreCase(external.channel, channel)) return error.InvalidRequest;
+            if (old_member) |row| if (!row.display.eql(&external.participant)) return error.InvalidRequest;
+            if (external_display) |display| if (!display.eql(&external.participant)) return error.InvalidRequest;
+            external_display = external.participant;
+            // A protected physical member already contributes its exact bits
+            // to the graph census below. Never count it again as legacy.
+            if (self.physical_members.get(.{ .call = key.call, .client = external.client })) |protected| {
+                if (!protected.display.eql(&external.participant)) return error.InvalidSnapshot;
+                continue;
+            }
+            external_before |= external.kind_bits;
+            if (!external.client.eql(key.client)) external_remaining |= external.kind_bits else external_owned = true;
+        }
+        const affected_display: ?media.ParticipantId = if (old_member) |row| row.display else external_display;
+        const room_update = old_member != null or external_owned;
         var clear_display = false;
-        if (old_member) |row| {
-            var all_bits: u8 = 0;
-            var remaining: u8 = 0;
+        if (affected_display) |display| {
+            var all_bits: u8 = external_before;
+            var remaining: u8 = external_remaining;
             var it = self.physical_members.iterator();
-            while (it.next()) |entry| if (std.meta.eql(entry.key_ptr.call, key.call) and entry.value_ptr.display.eql(&row.display)) {
+            while (it.next()) |entry| if (std.meta.eql(entry.key_ptr.call, key.call) and entry.value_ptr.display.eql(&display)) {
                 all_bits |= entry.value_ptr.kind_bits;
                 if (!entry.key_ptr.client.eql(key.client)) remaining |= entry.value_ptr.kind_bits;
             };
-            const actual = final_room.participant(row.display) orelse return error.InvalidSnapshot;
+            const actual = final_room.participant(display) orelse return error.InvalidSnapshot;
             if (actual.joined.bits != all_bits) return error.InvalidSnapshot;
-            for ([_]MediaKind{ .voice, .video, .screen }) |kind| {
-                const bit = @as(u8, 1) << @intFromEnum(kind);
-                if (all_bits & bit != 0 and remaining & bit == 0) try final_room.leave(row.display, kind);
+            if (room_update) {
+                for ([_]MediaKind{ .voice, .video, .screen }) |kind| {
+                    const bit = @as(u8, 1) << @backingInt(kind);
+                    if (all_bits & bit != 0 and remaining & bit == 0) try final_room.leave(display, kind);
+                }
+                clear_display = remaining == 0;
             }
-            clear_display = remaining == 0;
         }
         const terminal = departure.isTerminal();
         if (!terminal and self.transport_revision == std.math.maxInt(u64)) return error.SequenceExhausted;
         const plan = try self.allocator.create(RoomDeparturePlan);
-        plan.* = .{ .owner = self, .key = member_key, .revision = self.transport_revision, .terminal = terminal, .batch_part = departure.isBatchPart(), .old_member = old_member, .members_state = mapState(self.physical_members), .physical_state = mapState(self.physical_profiles), .old_room = old_room, .old_room_key = if (self.rooms.getEntry(channel)) |entry| entry.key_ptr.* else null, .old_snapshot = old_snapshot, .drop_room = old_member != null and final_room.count() == 0, .clear_display = clear_display, .clear_shared = departure.removesCall() };
+        plan.* = .{ .owner = self, .key = member_key, .revision = self.transport_revision, .terminal = terminal, .batch_part = departure.isBatchPart(), .old_member = old_member, .members_state = mapState(self.physical_members), .physical_state = mapState(self.physical_profiles), .old_room = old_room, .old_room_key = if (self.rooms.getEntry(channel)) |entry| entry.key_ptr.* else null, .old_snapshot = old_snapshot, .affected_display = affected_display, .room_update = room_update, .drop_room = room_update and final_room.count() == 0, .clear_display = clear_display, .clear_shared = departure.removesCall() and final_room.count() == 0, .final_room_empty = final_room.count() == 0 };
         errdefer self.allocator.destroy(plan);
         errdefer {
             if (plan.replacement) |owned| self.allocator.destroy(owned);
@@ -1180,13 +1280,13 @@ pub const MediaRooms = struct {
         plan.channel = try self.allocator.dupe(u8, channel);
         errdefer self.allocator.free(plan.channel);
         for ([_]routing.Leg{ .native, .webrtc }, 0..) |leg, n| plan.old_profiles[n] = self.physical_profiles.get(departure.ownerKey(leg));
-        if (old_member != null and !plan.drop_room) {
+        if (room_update and !plan.drop_room) {
             plan.replacement = try self.allocator.create(Room);
             plan.replacement.?.* = final_room;
         }
         if (clear_display) {
             var buf: [256]u8 = undefined;
-            const lookup = breakoutKey(&buf, channel, old_member.?.display.slice()) orelse return error.InvalidRequest;
+            const lookup = breakoutKey(&buf, channel, affected_display.?.slice()) orelse return error.InvalidRequest;
             plan.member_lookup = try self.allocator.dupe(u8, lookup);
             plan.breakout = captureStored([]u8, self.breakouts, lookup);
             plan.position = captureStored(Position, self.positions, lookup);
@@ -1391,7 +1491,7 @@ pub const MediaRooms = struct {
         return r;
     }
 
-    fn dropRoom(self: *MediaRooms, entry: std.StringHashMap(*Room).Entry) void {
+    fn dropRoom(self: *MediaRooms, entry: RoomMap.Entry) void {
         const key = entry.key_ptr.*;
         const r = entry.value_ptr.*;
         self.clearProfile(key);
@@ -1518,6 +1618,9 @@ test "media rooms owned graph snapshot roundtrip preserves all control maps and 
         .bridge_policy = graph_policies,
     };
     try snapshot.validateAgainstGraph(&graph);
+    snapshot.rooms[0].key[1] = 'M';
+    try snapshot.validateAgainstGraph(&graph);
+    snapshot.rooms[0].key[1] = 'm';
     graph_policies[0].row.kind_bits = 2;
     try testing.expectError(error.InvalidSnapshot, graph.validate());
     graph_policies[0].row.kind_bits = 1;
@@ -1567,10 +1670,50 @@ test "media rooms owned graph snapshot roundtrip preserves all control maps and 
     snapshot.rooms[0].room.participants[0].id.len = saved;
 }
 
+test "room names use ASCII case without merging snapshot aliases or Unicode" {
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    try rooms.join("#ALPHA", "alice", .voice);
+    try rooms.join("#alpha", "bob", .video);
+    try testing.expectEqual(@as(u32, 1), rooms.rooms.count());
+    try testing.expect(rooms.isParticipant("#AlPhA", "alice"));
+    try testing.expect(rooms.isParticipant("#alpha", "bob"));
+    try testing.expect(!rooms.isParticipant("#alpha", "other"));
+    const oversized: [129]u8 = @splat('A');
+    try testing.expect(!rooms.isParticipant(&oversized, "alice"));
+    var snapshot = try rooms.capture();
+    defer snapshot.deinit();
+    try testing.expectEqualStrings("#ALPHA", snapshot.rooms[0].key);
+    var restored = try MediaRooms.prepareRestore(testing.allocator, &snapshot, &.{});
+    defer restored.deinit();
+    const entry = restored.rooms.getEntry("#alpha").?;
+    try testing.expectEqualStrings("#ALPHA", entry.key_ptr.*);
+    try testing.expect(restored.isParticipant("#aLpHa", "alice"));
+
+    try rooms.join("#é", "utf", .voice);
+    try testing.expect(!rooms.isParticipant("#É", "utf"));
+    try rooms.join("#É", "other", .voice);
+    try testing.expectEqual(@as(u32, 3), rooms.rooms.count());
+
+    var aliases = try rooms.capture();
+    defer aliases.deinit();
+    // Give two individually valid rows ASCII-equivalent keys without changing
+    // the live map. Validation must refuse them before restoration allocates.
+    const lower_alias = try testing.allocator.dupe(u8, "#alpha");
+    testing.allocator.free(aliases.rooms[1].key);
+    aliases.rooms[1].key = lower_alias;
+    // The map iteration order is unspecified: make the other key explicit.
+    const upper_alias = try testing.allocator.dupe(u8, "#ALPHA");
+    testing.allocator.free(aliases.rooms[0].key);
+    aliases.rooms[0].key = upper_alias;
+    try testing.expectError(error.InvalidSnapshot, aliases.validate());
+    try testing.expectError(error.InvalidSnapshot, MediaRooms.prepareRestore(testing.allocator, &aliases, &.{}));
+}
+
 test "media rooms prepared graph every allocation failure leaves source and permits retry" {
     var rooms = MediaRooms.init(testing.allocator);
     defer rooms.deinit();
-    try rooms.join("#oom", "alice", .voice);
+    try rooms.join("#OOM", "alice", .voice);
     try rooms.setHand("#oom", "alice", true);
     try rooms.setBreakout("#oom", "alice", "stage");
     var snapshot = try rooms.capture();
@@ -1591,6 +1734,7 @@ test "media rooms prepared graph every allocation failure leaves source and perm
             continue;
         };
         fail.fail_index = std.math.maxInt(usize);
+        try testing.expect(restored.isParticipant("#oom", "alice"));
         restored.deinit();
         try testing.expectEqual(baseline, fail.allocated_bytes - fail.freed_bytes);
         succeeded = true;
@@ -1872,7 +2016,7 @@ const ProfilePlan = struct {
     calls_state: MapState,
     physical_state: MapState,
     new_call_key: ?[]u8 = null,
-    call_growth: ?std.StringHashMap(CallProfile) = null,
+    call_growth: ?ChannelMap(CallProfile) = null,
     physical_growth: ?std.AutoHashMap(PhysicalProfileKey, CallProfile) = null,
     validated_domain: ?*routing.Domain = null,
     validated_scope: u64 = 0,
@@ -1946,7 +2090,7 @@ const SharedProfilePlan = struct {
     agreed: CallProfile,
     channel: []u8 = &.{},
     new_key: ?[]u8 = null,
-    growth: ?std.StringHashMap(CallProfile) = null,
+    growth: ?ChannelMap(CallProfile) = null,
     validated_domain: ?*routing.Domain = null,
     validated_scope: u64 = 0,
     committed: bool = false,
@@ -2009,7 +2153,7 @@ const JoinPlan = struct {
     old_snapshot: Room.Snapshot,
     replacement: ?*Room = null,
     new_key: ?[]u8 = null,
-    growth: ?std.StringHashMap(*Room) = null,
+    growth: ?RoomMap = null,
     validated_domain: ?*routing.Domain = null,
     validated_scope: u64 = 0,
     committed: bool = false,
@@ -2160,12 +2304,15 @@ test "prepared room JOIN publishes only with exact source-issued membership" {
     candidate.deinit();
     membership.deinit();
     try testing.expect(rooms.isParticipant("#j", "same"));
+    try testing.expect(rooms.isParticipant("#J", "same"));
+    try testing.expect(!rooms.isParticipant("#J", "other"));
+    try testing.expectEqual(@as(u32, 1), rooms.rooms.count());
     try domain.withLocked(RevokeRoutingTest{ .domain = domain, .call = preview.call, .client = client_id }, RevokeRoutingTest.run);
 }
 fn preparedRoomOom(allocator: std.mem.Allocator) !void {
     var rooms = MediaRooms.init(testing.allocator);
     defer rooms.deinit();
-    try rooms.join("#j", "old", .voice);
+    try rooms.join("#J", "old", .voice);
     const original_room = rooms.room("#j").?;
     const original = try original_room.capture();
     const table = mapState(rooms.rooms);
@@ -2220,11 +2367,11 @@ fn storedDigest(comptime T: type, key: []const u8, value: T) [32]u8 {
     } else if (T != void) std.hash.autoHash(&hash, value);
     return hash.finalResult();
 }
-fn captureStored(comptime T: type, map: std.StringHashMap(T), key: []const u8) ?Stored(T) {
+fn captureStored(comptime T: type, map: anytype, key: []const u8) ?Stored(T) {
     const actual = map.getEntry(key) orelse return null;
     return .{ .key = actual.key_ptr.*, .value = actual.value_ptr.*, .digest = storedDigest(T, actual.key_ptr.*, actual.value_ptr.*) };
 }
-fn validateStored(comptime T: type, map: std.StringHashMap(T), lookup: []const u8, old: ?Stored(T)) bool {
+fn validateStored(comptime T: type, map: anytype, lookup: []const u8, old: ?Stored(T)) bool {
     const actual = map.getEntry(lookup);
     if (old == null) return actual == null;
     const row = actual orelse return false;
@@ -2251,6 +2398,9 @@ const RoomDeparturePlan = struct {
     drop_room: bool,
     clear_display: bool,
     clear_shared: bool,
+    affected_display: ?media.ParticipantId,
+    room_update: bool,
+    final_room_empty: bool,
     breakout: ?Stored([]u8) = null,
     position: ?Stored(Position) = null,
     hand: ?Stored(void) = null,
@@ -2276,7 +2426,8 @@ fn roomDeparture(candidate: *PreparedRoomDeparture) *RoomDeparturePlan {
 /// the actual candidate through validateLocked before publishing its effects.
 pub const DepartureTransition = struct {
     channel: []const u8,
-    /// Empty exactly when no physical Room member belonged to this departure.
+    /// Empty when neither a protected physical member nor an explicitly
+    /// censused legacy owner changes display geometry in this departure.
     display: []const u8,
     had_member: bool,
     display_remains: bool,
@@ -2285,11 +2436,10 @@ pub const DepartureTransition = struct {
 fn departureTransition(plan: *const RoomDeparturePlan) DepartureTransition {
     return .{
         .channel = plan.channel,
-        // Borrow the actual retained optional payload, not a captured value's
-        // temporary ParticipantId array.
-        .display = if (plan.old_member) |*row| row.display.slice() else "",
-        .had_member = plan.old_member != null,
-        .display_remains = plan.old_member != null and !plan.clear_display,
+        // Borrow the plan-owned display payload, never an iterator temporary.
+        .display = if (plan.affected_display) |*display| (if (plan.room_update) display.slice() else "") else "",
+        .had_member = plan.room_update,
+        .display_remains = plan.room_update and !plan.clear_display,
         .drops_room = plan.drop_room,
     };
 }
@@ -2312,7 +2462,7 @@ pub const PreparedRoomDeparture = opaque {
         const snapshot = if (room_now) |row| try row.capture() else Room.Snapshot{};
         if (!std.meta.eql(snapshot, plan.old_snapshot)) return error.StaleCandidate;
         for ([_]routing.Leg{ .native, .webrtc }, 0..) |leg, n| if (!profileEqual(plan.old_profiles[n], owner.physical_profiles.get(.{ .call = plan.key.call, .client = plan.key.client, .leg = leg }))) return error.StaleCandidate;
-        if (plan.clear_shared != departure.removesCall()) return error.StaleCandidate;
+        if (plan.clear_shared != (departure.removesCall() and plan.final_room_empty)) return error.StaleCandidate;
         if (plan.clear_display) {
             if (!validateStored([]u8, owner.breakouts, plan.member_lookup, plan.breakout) or !validateStored(Position, owner.positions, plan.member_lookup, plan.position) or !validateStored(void, owner.hands, plan.member_lookup, plan.hand) or !validateStored(CallProfile, owner.participant_profiles, plan.member_lookup, plan.participant_profile) or !validateStored(void, owner.consents, plan.member_lookup, plan.consent) or !validateStored(Quality, owner.qualities, plan.member_lookup, plan.quality)) return error.StaleCandidate;
         }
@@ -2375,7 +2525,7 @@ const RoomDepartureTestCut = struct {
     }
 };
 fn publishRoomJoinTest(domain: *routing.Domain, rooms: *MediaRooms, id: routing.ClientId, kind: MediaKind) !routing.CallId {
-    const membership = try domain.prepareMembership("#Departure", id, @as(u8, 1) << @intFromEnum(kind));
+    const membership = try domain.prepareMembership("#Departure", id, @as(u8, 1) << @backingInt(kind));
     defer membership.deinit();
     const plan = try rooms.prepareJoin(membership.preview(), "#departure", "same", kind);
     defer plan.deinit();
@@ -2459,8 +2609,15 @@ fn roomDepartureOom(allocator: std.mem.Allocator) !void {
     defer rooms.deinit();
     const a = routing.ClientId{ .shard = 0, .slot = 0, .gen = 0 };
     call = try publishRoomJoinTest(domain, &rooms, a, .voice);
-    try rooms.setBreakout("#departure", "same", "owned");
-    try rooms.setHand("#departure", "same", true);
+    try rooms.setBreakout("#DEPARTURE", "same", "owned");
+    try rooms.setHand("#DEPARTURE", "same", true);
+    const profile = testProfile();
+    try rooms.setProfile("#DEPARTURE", profile.slice(), profile.fec);
+    try rooms.setPosition("#DEPARTURE", "same", .{ .x = 7, .y = -4 });
+    try rooms.setParticipantProfile("#DEPARTURE", "same", profile.slice(), profile.fec);
+    try testing.expect(try rooms.setConsent("#DEPARTURE", "same", true));
+    try testing.expect(try rooms.setQuality("#DEPARTURE", "same", .{ .loss_pct = 3 }));
+    try testing.expect(try rooms.startRecording("#DEPARTURE", "same"));
     const original_room = rooms.rooms.get("#departure").?;
     const original = try original_room.capture();
     const members = mapState(rooms.physical_members);
@@ -2476,6 +2633,11 @@ fn roomDepartureOom(allocator: std.mem.Allocator) !void {
         try testing.expectEqual(revision, rooms.transport_revision);
         try testing.expectEqualStrings("owned", rooms.breakoutOf("#departure", "same"));
         try testing.expect(rooms.handRaised("#departure", "same"));
+        try testing.expect(rooms.hasConsent("#departure", "same"));
+        try testing.expect(rooms.recordingOf("#departure").?.active);
+        try testing.expect(rooms.profileOf("#departure").?.eql(profile));
+        try testing.expect(rooms.participantProfileOf("#departure", "same").?.eql(profile));
+        try testing.expectEqual(@as(u8, 3), rooms.qualityOf("#departure", "same").?.loss_pct);
         return err;
     };
     candidate.deinit();
@@ -2490,7 +2652,7 @@ fn applyRoomDeparture(plan: *RoomDeparturePlan) void {
     const owner = plan.owner;
     _ = owner.physical_members.remove(plan.key);
     for ([_]routing.Leg{ .native, .webrtc }) |leg| _ = owner.physical_profiles.remove(.{ .call = plan.key.call, .client = plan.key.client, .leg = leg });
-    if (plan.old_member != null) {
+    if (plan.room_update) {
         if (plan.drop_room) _ = owner.rooms.remove(plan.channel) else {
             owner.rooms.getPtr(plan.channel).?.* = plan.replacement.?;
             plan.replacement = null;
@@ -2512,7 +2674,7 @@ fn applyRoomDeparture(plan: *RoomDeparturePlan) void {
         plan.queue_removed = plan.queue != null;
     } else if (plan.clear_display) {
         if (owner.queues.getPtr(plan.channel)) |queue| {
-            const display = plan.old_member.?.display.slice();
+            const display = plan.affected_display.?.slice();
             for (queue.items, 0..) |name, n| if (std.mem.eql(u8, name, display)) {
                 plan.retired_speaker = queue.orderedRemove(n);
                 break;
@@ -2899,4 +3061,514 @@ test "prepared Room departure observations never invent a member for offer-only 
         }
     };
     try domain.withLocked(Retire{ .domain = domain, .departure = departure, .candidate = candidate }, Retire.run);
+}
+
+const ExternalRoomOwnersTest = struct {
+    rows: []const MediaRooms.ExternalDepartureOwner,
+    index: usize = 0,
+    fn next(self: *@This()) PreparedError!?MediaRooms.ExternalDepartureOwner {
+        if (self.index == self.rows.len) return null;
+        const row = self.rows[self.index];
+        self.index += 1;
+        return row;
+    }
+};
+
+test "prepared Room external owners preserve same and disjoint legacy kinds flags and shared metadata" {
+    for ([_]MediaKind{ .voice, .video }) |legacy_kind| {
+        const domain = try routing.Domain.create(testing.allocator);
+        defer domain.destroyQuiesced() catch @panic("external Room source remained");
+        var call: ?routing.CallId = null;
+        defer cleanupRoomDomainTest(domain, call);
+        var rooms = MediaRooms.init(testing.allocator);
+        defer rooms.deinit();
+        const graph = routing.ClientId{ .shard = 0, .slot = 0, .gen = 0 };
+        const flat = routing.ClientId{ .shard = 0, .slot = 1, .gen = 0 };
+        call = try publishRoomJoinTest(domain, &rooms, graph, .voice);
+        try rooms.join("#departure", "same", legacy_kind);
+        if (legacy_kind == .voice) {
+            try testing.expect(rooms.setMuted("#departure", "same", legacy_kind, true));
+        } else try testing.expect(rooms.setSpeaking("#departure", "same", legacy_kind, true));
+        const profile = testProfile();
+        try rooms.setProfile("#departure", profile.slice(), profile.fec);
+        try rooms.setBreakout("#departure", "same", "legacy-survivor");
+        try rooms.setHand("#departure", "same", true);
+        const rows = [_]MediaRooms.ExternalDepartureOwner{
+            .{ .channel = "#departure", .participant = try media.ParticipantId.init("same"), .client = graph, .kind_bits = 1 << @backingInt(MediaKind.voice) },
+            .{ .channel = "#departure", .participant = try media.ParticipantId.init("same"), .client = flat, .kind_bits = @as(u8, 1) << @backingInt(legacy_kind) },
+        };
+        const departure = try domain.prepareDeparture(call.?, graph);
+        defer departure.deinit();
+        const plan = try rooms.prepareDepartureWithExternalOwners(departure, "#departure", ExternalRoomOwnersTest{ .rows = &rows });
+        defer plan.deinit();
+        try testing.expect(plan.transition().display_remains and !plan.transition().drops_room);
+        try domain.withLocked(RoomDepartureTestCut{ .domain = domain, .departure = departure, .room = plan }, RoomDepartureTestCut.run);
+        try testing.expectEqual(@as(u32, 0), rooms.physical_members.count());
+        const survivor = rooms.room("#departure").?.participant(try media.ParticipantId.init("same")).?;
+        try testing.expectEqual(@as(u8, 1) << @backingInt(legacy_kind), survivor.joined.bits);
+        try testing.expectEqual(legacy_kind == .voice, survivor.muted.contains(legacy_kind));
+        try testing.expectEqual(legacy_kind == .video, survivor.speaking.contains(legacy_kind));
+        try testing.expect(profile.eql(rooms.profileOf("#departure").?));
+        try testing.expectEqualStrings("legacy-survivor", rooms.breakoutOf("#departure", "same"));
+        try testing.expect(rooms.handRaised("#departure", "same"));
+        // The display survivor is NOT a replacement protected member. The
+        // old CallId no longer owns this full physical client or packet scope.
+        try testing.expect(!(try domain.hasCurrentMembership("#departure", flat)));
+    }
+}
+
+fn externalRoomDepartureOom(allocator: std.mem.Allocator) !void {
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("external Room OOM source remained");
+    var call: ?routing.CallId = null;
+    defer cleanupRoomDomainTest(domain, call);
+    var rooms = MediaRooms.init(allocator);
+    defer rooms.deinit();
+    const graph = routing.ClientId{ .shard = 0, .slot = 0, .gen = 0 };
+    const flat = routing.ClientId{ .shard = 0, .slot = 1, .gen = 0 };
+    call = try publishRoomJoinTest(domain, &rooms, graph, .voice);
+    try rooms.join("#departure", "same", .video);
+    try rooms.setHand("#departure", "same", true);
+    const original_room = rooms.room("#departure").?;
+    const snapshot = try original_room.capture();
+    const revision = rooms.transport_revision;
+    const members = mapState(rooms.physical_members);
+    const rows = [_]MediaRooms.ExternalDepartureOwner{.{ .channel = "#departure", .participant = try media.ParticipantId.init("same"), .client = flat, .kind_bits = 1 << @backingInt(MediaKind.video) }};
+    const departure = try domain.prepareDeparture(call.?, graph);
+    defer departure.deinit();
+    const attempt = rooms.prepareDepartureWithExternalOwners(departure, "#departure", ExternalRoomOwnersTest{ .rows = &rows });
+    if (attempt) |plan| {
+        plan.deinit(); // reversible candidate, never published
+    } else |err| {
+        try testing.expect(original_room == rooms.room("#departure").?);
+        try testing.expectEqualDeep(snapshot, try original_room.capture());
+        try testing.expectEqualDeep(members, mapState(rooms.physical_members));
+        try testing.expectEqual(revision, rooms.transport_revision);
+        try testing.expect(rooms.handRaised("#departure", "same"));
+        return err;
+    }
+    try testing.expect(original_room == rooms.room("#departure").?);
+    try testing.expectEqualDeep(snapshot, try original_room.capture());
+    try testing.expectEqual(revision, rooms.transport_revision);
+}
+
+test "prepared Room external-owner allocation failures leave original graph display and metadata unchanged" {
+    try testing.checkAllAllocationFailures(testing.allocator, externalRoomDepartureOom, .{});
+}
+
+test "prepared Room external-owner census rejects foreign channel display and unbacked kinds before mutation" {
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("external census source remained");
+    var call: ?routing.CallId = null;
+    defer cleanupRoomDomainTest(domain, call);
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    const graph = routing.ClientId{ .shard = 0, .slot = 0, .gen = 0 };
+    const flat = routing.ClientId{ .shard = 0, .slot = 1, .gen = 0 };
+    call = try publishRoomJoinTest(domain, &rooms, graph, .voice);
+    const original = try rooms.room("#departure").?.capture();
+    const departure = try domain.prepareDeparture(call.?, graph);
+    defer departure.deinit();
+    var rows = [_]MediaRooms.ExternalDepartureOwner{.{ .channel = "#foreign", .participant = try media.ParticipantId.init("same"), .client = flat, .kind_bits = 1 }};
+    try testing.expectError(error.InvalidRequest, rooms.prepareDepartureWithExternalOwners(departure, "#departure", ExternalRoomOwnersTest{ .rows = &rows }));
+    rows[0].channel = "#departure";
+    rows[0].participant = try media.ParticipantId.init("other");
+    try testing.expectError(error.InvalidRequest, rooms.prepareDepartureWithExternalOwners(departure, "#departure", ExternalRoomOwnersTest{ .rows = &rows }));
+    rows[0].participant = try media.ParticipantId.init("same");
+    rows[0].kind_bits = 8;
+    try testing.expectError(error.InvalidRequest, rooms.prepareDepartureWithExternalOwners(departure, "#departure", ExternalRoomOwnersTest{ .rows = &rows }));
+    rows[0].kind_bits = 2; // no such joined legacy video bit exists
+    try testing.expectError(error.InvalidSnapshot, rooms.prepareDepartureWithExternalOwners(departure, "#departure", ExternalRoomOwnersTest{ .rows = &rows }));
+    try testing.expectEqualDeep(original, try rooms.room("#departure").?.capture());
+    try testing.expect(try domain.hasCurrentMembership("#departure", graph));
+    try testing.expect(!(try domain.hasCurrentMembership("#departure", flat)));
+}
+
+fn setCaseMemberMetadata(rooms: *MediaRooms, channel: []const u8, participant: []const u8) !void {
+    const profile = testProfile();
+    try rooms.setBreakout(channel, participant, "stage");
+    try rooms.setPosition(channel, participant, .{ .x = 7, .y = -4 });
+    try rooms.setHand(channel, participant, true);
+    try rooms.setParticipantProfile(channel, participant, profile.slice(), profile.fec);
+    try testing.expect(try rooms.setConsent(channel, participant, true));
+    try testing.expect(try rooms.setQuality(channel, participant, .{ .loss_pct = 3, .rtt_ms = 41, .spatial = 1, .bitrate_kbps = 256 }));
+}
+
+fn expectCaseMemberMetadata(rooms: *const MediaRooms, channel: []const u8, participant: []const u8, present: bool) !void {
+    return expectCaseMemberMetadataWithBreakout(rooms, channel, participant, present, if (present) "stage" else default_breakout);
+}
+
+fn expectCaseMemberMetadataWithBreakout(rooms: *const MediaRooms, channel: []const u8, participant: []const u8, present: bool, expected_breakout: []const u8) !void {
+    try testing.expectEqualStrings(expected_breakout, rooms.breakoutOf(channel, participant));
+    try testing.expectEqual(if (present) Position{ .x = 7, .y = -4 } else Position{}, rooms.positionOf(channel, participant));
+    try testing.expectEqual(present, rooms.handRaised(channel, participant));
+    try testing.expectEqual(present, rooms.hasConsent(channel, participant));
+    try testing.expectEqual(present, rooms.participantProfileOf(channel, participant) != null);
+    try testing.expectEqual(present, rooms.qualityOf(channel, participant) != null);
+    if (present) {
+        try testing.expect(rooms.participantProfileOf(channel, participant).?.eql(testProfile()));
+        try testing.expectEqual(@as(u8, 3), rooms.qualityOf(channel, participant).?.loss_pct);
+    }
+}
+
+fn fillCaseMetadataFixture(rooms: *MediaRooms) !void {
+    const profile = testProfile();
+    for ([_][]const u8{ "#ALPHA", "#BETA" }) |channel| {
+        try rooms.join(channel, "Alice", .voice);
+        try rooms.setProfile(channel, profile.slice(), profile.fec);
+        try setCaseMemberMetadata(rooms, channel, "Alice");
+        try testing.expect(try rooms.startRecording(channel, "Alice"));
+    }
+}
+
+fn expectRawCaseSnapshot(rooms: *MediaRooms, snapshot: *const Snapshot) !void {
+    for (snapshot.rooms) |row| {
+        const entry = rooms.rooms.getEntry(row.key) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(row.key, entry.key_ptr.*);
+        try testing.expectEqualDeep(row.room, try entry.value_ptr.*.capture());
+    }
+    inline for (.{ "breakouts", "positions", "hands", "profiles", "participant_profiles", "consents", "recordings", "qualities" }) |field| {
+        for (@field(snapshot, field)) |row| {
+            const entry = @field(rooms, field).getEntry(row.key) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(row.key, entry.key_ptr.*);
+            if (@TypeOf(row.value) != void) try testing.expectEqualDeep(row.value, entry.value_ptr.*);
+        }
+    }
+    for (snapshot.queues) |row| {
+        const entry = rooms.queues.getEntry(row.key) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(row.key, entry.key_ptr.*);
+        try testing.expectEqual(row.items.len, entry.value_ptr.items.len);
+        for (row.items, entry.value_ptr.items) |expected, actual| try testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "media room ASCII metadata preserves exact participants and retires legacy attachments in either order" {
+    for ([_]bool{ false, true }) |reverse| {
+        var rooms = MediaRooms.init(testing.allocator);
+        defer rooms.deinit();
+        const profile = testProfile();
+        try fillCaseMetadataFixture(&rooms);
+        try rooms.join("#aLpHa", "alice", .video);
+        try setCaseMemberMetadata(&rooms, "#AlPhA", "alice");
+        try expectCaseMemberMetadata(&rooms, "#alpha", "Alice", true);
+        try expectCaseMemberMetadata(&rooms, "#ALPHA", "alice", true);
+        try expectCaseMemberMetadata(&rooms, "#alpha", "ALICE", false);
+        try testing.expect(rooms.profileOf("#alpha").?.eql(profile));
+        try testing.expect(rooms.recordingOf("#alpha").?.active);
+        var queue: [3][]const u8 = undefined;
+        try testing.expectEqual(@as(usize, 2), rooms.copySpeakQueue("#alpha", &queue));
+        try testing.expectEqualStrings("Alice", queue[0]);
+        try testing.expectEqualStrings("alice", queue[1]);
+        // Revoking consent through another spelling cannot hide from the
+        // recording authorization/read/stop paths or a later unanimous check.
+        try testing.expect(try rooms.setConsent("#aLPha", "Alice", false));
+        try testing.expect(!rooms.hasConsent("#ALPHA", "Alice"));
+        try testing.expect(!rooms.allConsented("#alpha"));
+        try testing.expect(rooms.stopRecording("#alPHA"));
+        try testing.expect(!rooms.recordingOf("#ALPHA").?.active);
+        try testing.expect(!try rooms.startRecording("#alpha", "alice"));
+        try testing.expect(try rooms.setConsent("#alpha", "Alice", true));
+        try testing.expect(try rooms.startRecording("#aLpHa", "Alice"));
+        const first = if (reverse) "alice" else "Alice";
+        const survivor = if (reverse) "Alice" else "alice";
+        try testing.expect(rooms.leaveAll("#AlPhA", first));
+        try expectCaseMemberMetadata(&rooms, "#ALPHA", first, false);
+        try expectCaseMemberMetadata(&rooms, "#alpha", survivor, true);
+        try testing.expectEqual(@as(usize, 1), rooms.copySpeakQueue("#aLPHA", &queue));
+        try testing.expectEqualStrings(survivor, queue[0]);
+        try testing.expect(rooms.recordingOf("#alpha").?.active);
+        try testing.expect(rooms.leaveAll("#aLPHA", survivor));
+        try testing.expect(rooms.room("#ALPHA") == null);
+        try testing.expect(rooms.profileOf("#alpha") == null);
+        try testing.expect(rooms.recordingOf("#alpha") == null);
+        try testing.expectEqual(@as(usize, 0), rooms.copySpeakQueue("#alpha", &queue));
+        try expectCaseMemberMetadata(&rooms, "#alpha", survivor, false);
+        try expectCaseMemberMetadata(&rooms, "#beta", "Alice", true);
+        try testing.expect(rooms.profileOf("#beta").?.eql(profile));
+        try testing.expect(rooms.recordingOf("#beta").?.active);
+    }
+}
+
+test "media room ASCII metadata mutations retain stored spelling and clear all equivalent participant profiles" {
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    try fillCaseMetadataFixture(&rooms);
+    try rooms.setBreakout("#alpha", "Alice", "changed");
+    try testing.expectEqualStrings("changed", rooms.breakoutOf("#AlPhA", "Alice"));
+    try testing.expectEqualStrings("#ALPHA\x00Alice", rooms.breakouts.getEntry("#alpha\x00Alice").?.key_ptr.*);
+    try rooms.setBreakout("#alpha", "Alice", "stage");
+    try rooms.setPosition("#aLPHA", "Alice", .{ .x = 8, .y = 9 });
+    try testing.expectEqual(Position{ .x = 8, .y = 9 }, rooms.positionOf("#ALPHA", "Alice"));
+    rooms.clearPosition("#alPHA", "Alice");
+    try testing.expectEqual(Position{}, rooms.positionOf("#ALPHA", "Alice"));
+    try rooms.setHand("#alpha", "Alice", false);
+    try testing.expect(!rooms.handRaised("#ALPHA", "Alice"));
+    var queue: [2][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), rooms.copySpeakQueue("#ALPHA", &queue));
+    const profile = testProfile();
+    try rooms.setParticipantProfile("#ALPHA", "alice", profile.slice(), profile.fec);
+    for (0..max_participants + 1) |n| {
+        var name: [32]u8 = undefined;
+        try rooms.setParticipantProfile("#aLPhA", try std.fmt.bufPrint(&name, "prejoin-{d}", .{n}), profile.slice(), profile.fec);
+    }
+    try rooms.setProfile("#aLpHa", profile.slice(), profile.fec);
+    try testing.expectEqual(@as(u32, 1), rooms.participant_profiles.count());
+    try testing.expect(rooms.participantProfileOf("#alpha", "Alice") == null);
+    try testing.expect(rooms.participantProfileOf("#alpha", "alice") == null);
+    try testing.expectEqualStrings("#ALPHA", rooms.profiles.getEntry("#alpha").?.key_ptr.*);
+    try expectCaseMemberMetadata(&rooms, "#beta", "Alice", true);
+    rooms.clearBreakout("#aLPhA", "Alice");
+    rooms.clearConsent("#aLPhA", "Alice");
+    rooms.clearQuality("#aLPhA", "Alice");
+    rooms.clearRecording("#aLPhA");
+    rooms.clearProfile("#aLPhA");
+    try expectCaseMemberMetadata(&rooms, "#alpha", "Alice", false);
+    try testing.expect(rooms.recordingOf("#alpha") == null);
+    try testing.expect(rooms.profileOf("#alpha") == null);
+}
+
+test "media room ASCII metadata strict snapshot aliases reject every map before allocation" {
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    try fillCaseMetadataFixture(&rooms);
+    inline for (.{ "rooms", "breakouts", "positions", "hands", "profiles", "participant_profiles", "consents", "recordings", "qualities", "queues" }) |field| {
+        var snapshot = try rooms.capture();
+        defer snapshot.deinit();
+        const rows = @field(snapshot, field);
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        const alias = try testing.allocator.dupe(u8, rows[0].key);
+        for (alias) |*byte| {
+            if (byte.* == 0) break;
+            byte.* = std.ascii.toLower(byte.*);
+        }
+        testing.allocator.free(rows[1].key);
+        rows[1].key = alias;
+        try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+        var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        try testing.expectError(error.InvalidSnapshot, MediaRooms.prepareRestore(fail.allocator(), &snapshot, &.{}));
+        try testing.expect(!fail.has_induced_failure);
+        try expectCaseMemberMetadata(&rooms, "#alpha", "Alice", true);
+        try expectCaseMemberMetadata(&rooms, "#beta", "Alice", true);
+    }
+}
+
+test "media room ASCII metadata snapshot preserves raw uppercase rows and cross-case queue hand references" {
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    try fillCaseMetadataFixture(&rooms);
+    var snapshot = try rooms.capture();
+    defer snapshot.deinit();
+    // Deliberately distinct spellings in structured rows remain one channel;
+    // the hand participant suffix must still be exact.
+    for (snapshot.queues) |row| for (row.key) |*byte| {
+        byte.* = std.ascii.toLower(byte.*);
+    };
+    try snapshot.validate();
+    var restored = try MediaRooms.prepareRestore(testing.allocator, &snapshot, &.{});
+    defer restored.deinit();
+    try expectRawCaseSnapshot(&restored, &snapshot);
+    try expectCaseMemberMetadata(&restored, "#alpha", "Alice", true);
+    try expectCaseMemberMetadata(&restored, "#beta", "Alice", true);
+    try testing.expect(restored.recordingOf("#alpha").?.active);
+    const recording = restored.recordingOf("#alpha").?;
+    try testing.expectEqualStrings("Alice", recording.by());
+    snapshot.hands[0].key[snapshot.hands[0].key.len - 1] = 'X';
+    try testing.expectError(error.InvalidSnapshot, snapshot.validate());
+}
+
+test "media room ASCII metadata never folds UTF8 or participant suffix and refuses malformed composite names" {
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    for ([_][]const u8{ "#é", "#É" }) |channel| {
+        try rooms.join(channel, "Alice", .voice);
+        try rooms.join(channel, "alice", .voice);
+        try setCaseMemberMetadata(&rooms, channel, "Alice");
+        try setCaseMemberMetadata(&rooms, channel, "alice");
+    }
+    try rooms.setBreakout("#é", "Alice", "lower");
+    try rooms.setBreakout("#É", "Alice", "upper");
+    try testing.expectEqualStrings("lower", rooms.breakoutOf("#é", "Alice"));
+    try testing.expectEqualStrings("upper", rooms.breakoutOf("#É", "Alice"));
+    try testing.expectEqualStrings("stage", rooms.breakoutOf("#é", "alice"));
+    try testing.expect(!ParticipantKeyContext.eql(.{}, "#x\x00Alice", "#X\x00alice"));
+    try testing.expect(!ParticipantKeyContext.eql(.{}, "#x\x00a", "#xa\x00"));
+    try testing.expect(!ParticipantKeyContext.eql(.{}, "#é\x00Alice", "#É\x00Alice"));
+    try testing.expect(!ParticipantKeyContext.eql(.{}, "#x\x00é", "#X\x00É"));
+    try testing.expect(!ChannelKeyContext.eql(.{}, "#[x]", "#{x}"));
+    var buf: [256]u8 = undefined;
+    try testing.expect(MediaRooms.breakoutKey(&buf, "#bad\x00extra", "Alice") == null);
+    try testing.expect(MediaRooms.breakoutKey(&buf, "#ok", "Al\x00ice") == null);
+    try testing.expect(!validCompositeKey("#ok\x00Al\x00ice"));
+    var snapshot = try rooms.capture();
+    defer snapshot.deinit();
+    try snapshot.validate();
+    var restored = try MediaRooms.prepareRestore(testing.allocator, &snapshot, &.{});
+    defer restored.deinit();
+    try expectRawCaseSnapshot(&restored, &snapshot);
+    try testing.expect(restored.leaveAll("#é", "Alice"));
+    try expectCaseMemberMetadataWithBreakout(&restored, "#É", "Alice", true, "upper");
+    try expectCaseMemberMetadata(&restored, "#é", "alice", true);
+}
+
+fn restoreCaseMetadataOom(allocator: std.mem.Allocator) !void {
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    try fillCaseMetadataFixture(&rooms);
+    var snapshot = try rooms.capture();
+    defer snapshot.deinit();
+    const old_rooms = mapState(rooms.rooms);
+    const old_profiles = mapState(rooms.profiles);
+    const old_breakouts = mapState(rooms.breakouts);
+    var restored = MediaRooms.prepareRestore(allocator, &snapshot, &.{}) catch |err| {
+        try testing.expectEqualDeep(old_rooms, mapState(rooms.rooms));
+        try testing.expectEqualDeep(old_profiles, mapState(rooms.profiles));
+        try testing.expectEqualDeep(old_breakouts, mapState(rooms.breakouts));
+        try expectCaseMemberMetadata(&rooms, "#alpha", "Alice", true);
+        try expectCaseMemberMetadata(&rooms, "#beta", "Alice", true);
+        try snapshot.validate();
+        return err;
+    };
+    defer restored.deinit();
+    try expectRawCaseSnapshot(&restored, &snapshot);
+    try expectCaseMemberMetadata(&restored, "#alpha", "Alice", true);
+    try expectCaseMemberMetadata(&restored, "#beta", "Alice", true);
+}
+
+test "media room ASCII metadata full fresh restore allocation failures preserve every source row" {
+    try testing.checkAllAllocationFailures(testing.allocator, restoreCaseMetadataOom, .{});
+}
+
+fn casePreparedDepartureBothOrders(reverse: bool) !void {
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("case metadata Domain rows");
+    var call: ?routing.CallId = null;
+    defer cleanupRoomDomainTest(domain, call);
+    var rooms = MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    const a = routing.ClientId{ .shard = 0, .slot = 0, .gen = 0 };
+    const b = routing.ClientId{ .shard = 0, .slot = 1, .gen = 0 };
+    // A unique legacy raw uppercase room is retained when prepared membership
+    // adopts that geometry; the map must not insert a lower-case alias.
+    try rooms.join("#DEPARTURE", "same", .voice);
+    call = try publishRoomJoinTest(domain, &rooms, a, .voice);
+    _ = try publishRoomJoinTest(domain, &rooms, b, .video);
+    try testing.expectEqualStrings("#DEPARTURE", rooms.rooms.getEntry("#departure").?.key_ptr.*);
+    const profile = testProfile();
+    try rooms.setProfile("#DEPARTURE", profile.slice(), profile.fec);
+    try setCaseMemberMetadata(&rooms, "#DEPARTURE", "same");
+    try testing.expect(try rooms.startRecording("#dEpArTuRe", "same"));
+    try rooms.join("#OTHER", "same", .voice);
+    try rooms.setProfile("#OTHER", profile.slice(), profile.fec);
+    try setCaseMemberMetadata(&rooms, "#OTHER", "same");
+    try testing.expect(try rooms.startRecording("#OTHER", "same"));
+    const ids = if (reverse) [_]routing.ClientId{ b, a } else [_]routing.ClientId{ a, b };
+    for (ids, 0..) |id, n| {
+        const departure = try domain.prepareDeparture(call.?, id);
+        defer departure.deinit();
+        const candidate = try rooms.prepareDeparture(departure, "#DePaRtUrE");
+        defer candidate.deinit();
+        try domain.withLocked(RoomDepartureTestCut{ .domain = domain, .departure = departure, .room = candidate }, RoomDepartureTestCut.run);
+        try expectCaseMemberMetadata(&rooms, "#departure", "same", n == 0);
+        try expectCaseMemberMetadata(&rooms, "#other", "same", true);
+        try testing.expect(rooms.recordingOf("#other").?.active);
+        try testing.expect(rooms.profileOf("#other").?.eql(profile));
+    }
+    try testing.expect(rooms.room("#DEPARTURE") == null);
+    try testing.expect(rooms.recordingOf("#DEPARTURE") == null);
+    try testing.expect(rooms.profileOf("#DEPARTURE") == null);
+    var queue: [2][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), rooms.copySpeakQueue("#DEPARTURE", &queue));
+    try testing.expectEqual(@as(usize, 1), rooms.copySpeakQueue("#OTHER", &queue));
+    try testing.expectEqualStrings("same", queue[0]);
+}
+
+test "media room ASCII metadata prepared departure preserves either sibling and unrelated channel" {
+    try casePreparedDepartureBothOrders(false);
+    try casePreparedDepartureBothOrders(true);
+}
+
+fn expectRawOldCaseKeys(rooms: *MediaRooms, comptime field: []const u8, count: usize) !void {
+    for (0..count) |n| {
+        var lower_buf: [32]u8 = undefined;
+        var upper_buf: [32]u8 = undefined;
+        const lower = try std.fmt.bufPrint(&lower_buf, "#old-{d}", .{n});
+        const upper = try std.fmt.bufPrint(&upper_buf, "#OLD-{d}", .{n});
+        const actual = @field(rooms, field).getEntry(lower) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(upper, actual.key_ptr.*);
+    }
+}
+
+fn casePreparedRoomGrowthOom(allocator: std.mem.Allocator) !void {
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("case room growth Domain rows");
+    var rooms = MediaRooms.init(allocator);
+    defer rooms.deinit();
+    var count: usize = 0;
+    while (count == 0 or rooms.rooms.unmanaged.available != 0) : (count += 1) {
+        var name: [32]u8 = undefined;
+        try rooms.join(try std.fmt.bufPrint(&name, "#OLD-{d}", .{count}), "Alice", .voice);
+    }
+    const table = mapState(rooms.rooms);
+    const first_key = rooms.rooms.getEntry("#old-0").?.key_ptr.*;
+    const id = routing.ClientId{ .shard = 0, .slot = 0, .gen = 0 };
+    const membership = try domain.prepareMembership("#NEW", id, 1);
+    defer membership.deinit();
+    const candidate = rooms.prepareJoin(membership.preview(), "#nEw", "Alice", .voice) catch |err| {
+        try testing.expectEqualDeep(table, mapState(rooms.rooms));
+        try testing.expect(rooms.rooms.getEntry("#OLD-0").?.key_ptr.*.ptr == first_key.ptr);
+        try expectRawOldCaseKeys(&rooms, "rooms", count);
+        return err;
+    };
+    defer candidate.deinit();
+    try testing.expect(joinPlan(candidate).growth != null);
+    try testing.expectEqualDeep(table, mapState(rooms.rooms));
+    var committed = false;
+    defer if (committed) domain.withLocked(RevokeRoutingTest{ .domain = domain, .call = membership.preview().call, .client = id }, RevokeRoutingTest.run) catch @panic("case room growth cleanup");
+    try domain.withLocked(JoinedRoomTest{ .domain = domain, .membership = membership, .room = candidate }, JoinedRoomTest.run);
+    committed = true;
+    try testing.expect(rooms.isParticipant("#NEW", "Alice"));
+    try testing.expect(rooms.rooms.getEntry("#OLD-0").?.key_ptr.*.ptr == first_key.ptr);
+    try expectRawOldCaseKeys(&rooms, "rooms", count);
+}
+
+fn casePreparedProfileGrowthOom(allocator: std.mem.Allocator) !void {
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("case profile growth Domain rows");
+    var rooms = MediaRooms.init(allocator);
+    defer rooms.deinit();
+    const profile = testProfile();
+    var count: usize = 0;
+    while (count == 0 or rooms.profiles.unmanaged.available != 0) : (count += 1) {
+        var name: [32]u8 = undefined;
+        try rooms.setProfile(try std.fmt.bufPrint(&name, "#OLD-{d}", .{count}), profile.slice(), profile.fec);
+    }
+    const table = mapState(rooms.profiles);
+    const first_key = rooms.profiles.getEntry("#old-0").?.key_ptr.*;
+    const candidate = rooms.prepareSharedProfile("#nEw", profile) catch |err| {
+        try testing.expectEqualDeep(table, mapState(rooms.profiles));
+        try testing.expect(rooms.profiles.getEntry("#OLD-0").?.key_ptr.*.ptr == first_key.ptr);
+        try expectRawOldCaseKeys(&rooms, "profiles", count);
+        return err;
+    };
+    defer candidate.deinit();
+    try testing.expect(sharedProfilePlan(candidate).growth != null);
+    try testing.expectEqualDeep(table, mapState(rooms.profiles));
+    const Cut = struct {
+        domain: *routing.Domain,
+        plan: *PreparedSharedProfile,
+        profile: CallProfile,
+        fn run(scope: *routing.Locked, ctx: @This()) PreparedError!void {
+            try ctx.plan.validateLocked(ctx.domain, scope, ctx.profile);
+            ctx.plan.commitLocked(ctx.domain, scope);
+        }
+    };
+    try domain.withLocked(Cut{ .domain = domain, .plan = candidate, .profile = profile }, Cut.run);
+    try testing.expect(rooms.transportProfileOf("#NEW").?.eql(profile));
+    try testing.expect(rooms.profiles.getEntry("#OLD-0").?.key_ptr.*.ptr == first_key.ptr);
+    try expectRawOldCaseKeys(&rooms, "profiles", count);
+}
+
+test "media room ASCII metadata prepared growth allocation failures preserve old raw keys and retry" {
+    try testing.checkAllAllocationFailures(testing.allocator, casePreparedRoomGrowthOom, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, casePreparedProfileGrowthOom, .{});
 }

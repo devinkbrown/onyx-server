@@ -2,7 +2,7 @@
 
 _System overview of the client-facing daemon, request flow, source map, and the architecture document index._
 
-Onyx Server is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.17.0-dev.1282+c0f9b51d8"` and lists an empty `.dependencies` table, so the current tree builds from checked-in Zig source. Evidence: `build.zig.zon:34`, `build.zig.zon:40`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, plus the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:20`, `src/root.zig:21`, `src/root.zig:22`, `src/root.zig:23`, `src/root.zig:29`, `src/root.zig:34`.
+Onyx Server is a Zig package and daemon executable. The package manifest sets `.minimum_zig_version = "0.17.0"` and lists an empty `.dependencies` table, so the current tree builds from checked-in Zig source. Evidence: `build.zig.zon:34`, `build.zig.zon:40`. The library root re-exports the major namespaces `crypto`, `daemon`, `proto`, and `substrate`, plus the OroWasm host and browser transport shim roots. Evidence: `src/root.zig:20`, `src/root.zig:21`, `src/root.zig:22`, `src/root.zig:23`, `src/root.zig:29`, `src/root.zig:34`.
 
 This overview covers the client-facing daemon, local world, module dispatch, Ringlane reactor model, media, Helix upgrade, OroWasm, and source-tree orientation. Undertow mesh/S2S and cryptography are summarized here only at subsystem level; see [mesh-s2s.md](mesh-s2s.md) and [crypto.md](crypto.md) for their deeper design.
 

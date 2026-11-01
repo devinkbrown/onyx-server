@@ -208,7 +208,7 @@ pub fn parseTimestamp(value: []const u8) ParseError!u64 {
 
     if (year < 1970 or month < 1 or month > 12) return error.INVALID_PARAMS;
     if (hour > 23 or minute > 59 or second > 59) return error.INVALID_PARAMS;
-    const month_enum: std.time.epoch.Month = @enumFromInt(month);
+    const month_enum: std.time.epoch.Month = @fromBackingInt(@intCast(month));
     const days_in_month = std.time.epoch.getDaysInMonth(year, month_enum);
     if (day < 1 or day > days_in_month) return error.INVALID_PARAMS;
 
@@ -220,7 +220,7 @@ pub fn parseTimestamp(value: []const u8) ParseError!u64 {
 
     var cursor_month: u8 = 1;
     while (cursor_month < month) : (cursor_month += 1) {
-        const cursor_enum: std.time.epoch.Month = @enumFromInt(cursor_month);
+        const cursor_enum: std.time.epoch.Month = @fromBackingInt(@intCast(cursor_month));
         days += std.time.epoch.getDaysInMonth(year, cursor_enum);
     }
     days += day - 1;

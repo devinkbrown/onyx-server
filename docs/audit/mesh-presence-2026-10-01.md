@@ -1,5 +1,8 @@
 # Ordinary multi-hop presence and direct delivery
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Status: source audit and causal regression in progress. No completion claim.
 Baseline: `6b9759d9134873db49df751eb451616ddacc0205`.
 This follows the accepted shared-IP lifecycle repair; it does not reopen that fix.

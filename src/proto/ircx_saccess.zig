@@ -7,6 +7,7 @@
 //! module only parses borrowed command parameters and emits replies into
 //! caller-owned buffers; storage and permission checks live above it.
 const std = @import("std");
+const cloak_match = @import("cloak_match.zig");
 const listx = @import("listx.zig");
 const numeric = @import("numeric.zig");
 const limits_config = @import("limits_config.zig");
@@ -240,9 +241,13 @@ pub const ServerAccessStore = struct {
     }
 
     pub fn matchHostmask(self: *const ServerAccessStore, entry_type: EntryType, hostmask: []const u8) ?Entry {
+        return self.matchHostmaskWithCloak(entry_type, hostmask, null);
+    }
+
+    pub fn matchHostmaskWithCloak(self: *const ServerAccessStore, entry_type: EntryType, hostmask: []const u8, ctx: ?cloak_match.Context) ?Entry {
         for (self.entries.items) |*entry| {
             if (entry.entry_type != entry_type) continue;
-            if (listx.globMatch(entry.mask, hostmask)) return entry.view();
+            if (cloak_match.match(entry.mask, hostmask, ctx)) return entry.view();
         }
         return null;
     }
@@ -810,4 +815,20 @@ test "builders validate bytes and caller-owned buffer bounds" {
 
     var limited: [128]u8 = undefined;
     try std.testing.expectError(error.LineTooLong, buildAccessEndWith(.{ .max_line_bytes = 12 }, &limited, good_ctx));
+}
+
+test "cloak SACCESS continuity keeps grant and deny independently matchable" {
+    const c = @import("cloak.zig");
+    const key = c.SecretKey.init(@splat(7));
+    var old: [253]u8 = undefined;
+    const before = try c.cloakOpaqueEpochV4(&old, &key, "203.0.113.9", 1, 86400, .{});
+    var mask_buf: [512]u8 = undefined;
+    const mask = try std.fmt.bufPrint(&mask_buf, "Nick!*@{s}", .{before});
+    var store = ServerAccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.add(.{ .entry_type = .grant, .mask = mask });
+    const ctx: cloak_match.Context = .{ .key = key, .suffix = "onyx", .address = "203.0.113.9" };
+    try std.testing.expect(store.matchHostmaskWithCloak(.grant, "Nick!u@current.onyx", ctx) != null);
+    try std.testing.expect(store.matchHostmaskWithCloak(.deny, "Nick!u@current.onyx", ctx) == null);
+    try std.testing.expect(store.matchHostmaskWithCloak(.grant, "Other!u@current.onyx", ctx) == null);
 }

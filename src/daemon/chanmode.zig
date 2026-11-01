@@ -466,6 +466,7 @@ pub const TierOp = struct { mode: MemberMode, on: bool };
 pub fn cascadeStatusOps(current: MemberModes, named: MemberMode, adding: bool, out: *[3]TierOp) usize {
     // Voice sits outside the authority chain — a plain independent toggle.
     if (named == .voice) {
+        if (current.contains(.voice) == adding) return 0;
         out[0] = .{ .mode = .voice, .on = adding };
         return 1;
     }
@@ -785,7 +786,7 @@ fn appendPrefix(out: *PrefixList, prefix: u8) void {
 }
 
 fn memberBit(mode: MemberMode) u8 {
-    return @as(u8, 1) << @as(u3, @intCast(@intFromEnum(mode)));
+    return @as(u8, 1) << @as(u3, @intCast(@backingInt(mode)));
 }
 
 /// The channel-mode letter that grants `mode` (the `(YQqov)` set, minus the
@@ -1073,4 +1074,31 @@ test "cascade: required rank is the highest tier touched" {
     var required: u8 = 0;
     for (ops[0..n]) |op| required = @max(required, rankOfMode(op.mode));
     try std.testing.expectEqual(@as(u8, 4), required);
+}
+
+test "cascade: voice additions removals and redundant toggles emit only actual changes" {
+    const chain_states = [_]MemberModes{
+        MemberModes.empty(),
+        MemberModes.fromModes(&.{.op}),
+        MemberModes.fromModes(&.{.owner}),
+        MemberModes.fromModes(&.{.founder}),
+    };
+    for (chain_states) |chain| {
+        var voiced = chain;
+        voiced.add(.voice);
+        for ([_]bool{ false, true }) |adding| {
+            for ([_]MemberModes{ chain, voiced }) |current| {
+                const sentinel: TierOp = .{ .mode = .founder, .on = false };
+                var out: [3]TierOp = @splat(sentinel);
+                const expected: usize = if (current.contains(.voice) == adding) 0 else 1;
+                try std.testing.expectEqual(expected, cascadeStatusOps(current, .voice, adding, &out));
+                if (expected == 1) {
+                    try std.testing.expectEqual(MemberMode.voice, out[0].mode);
+                    try std.testing.expectEqual(adding, out[0].on);
+                } else try std.testing.expectEqual(sentinel, out[0]);
+                try std.testing.expectEqual(sentinel, out[1]);
+                try std.testing.expectEqual(sentinel, out[2]);
+            }
+        }
+    }
 }

@@ -49,7 +49,9 @@ pub const ReserveError = std.mem.Allocator.Error || error{
     Equivocation,
 };
 
-pub const TransferError = std.mem.Allocator.Error || error{Equivocation};
+pub const TransferError = std.mem.Allocator.Error || error{ Equivocation, PendingPhysicalCustody };
+
+pub const BarrierError = std.mem.Allocator.Error || error{ CapacityExceeded, InvalidBarrier };
 
 pub const AttachmentRemap = struct {
     old_client: ClientId,
@@ -57,6 +59,7 @@ pub const AttachmentRemap = struct {
 };
 
 pub const RemapError = std.mem.Allocator.Error || error{
+    PendingPhysicalCustody,
     CapacityExceeded,
     MissingMapping,
     DuplicateSource,
@@ -118,11 +121,22 @@ pub const ReserveResult = struct {
 /// a quiescent delivery-authority boundary where no borrowed `PendingRecord` can
 /// survive exec/restore; FIFO, event id, attachment id, and rendered bytes are the
 /// persisted authority.
+pub const OutputEncoding = enum { irc_record, plaintext, preframed_secure };
+
+/// Owned output awaiting WS/TLS encoding. These entries share the ADS sequence
+/// lane but are not ADS1 records and cannot be checkpointed as that old format.
+pub const OutputRecord = struct {
+    client: ClientId,
+    bytes: []const u8,
+    encoding: OutputEncoding = .plaintext,
+};
+
 pub const PendingRecord = struct {
     client: ClientId,
     sequence: u64,
     event_id: EventId,
     bytes: []const u8,
+    encoding: OutputEncoding = .irc_record,
 };
 
 pub const TransferResult = struct {
@@ -140,6 +154,7 @@ const Entry = struct {
     sequence: u64,
     event_id: EventId,
     bytes: []u8,
+    encoding: OutputEncoding = .irc_record,
 };
 
 const AttachmentTransferPlan = struct {
@@ -266,10 +281,72 @@ pub const PreparedBatch = struct {
     }
 };
 
+/// An owner-funded ordering gate, not a fake IRC record. Existing ADS sequences
+/// precede its cutoff. Records admitted later remain owned here but cannot be
+/// collected until that exact image owner releases the oldest gate.
+const OutputBarrier = struct {
+    owner: u64,
+    cutoff: u64,
+    next: ?*OutputBarrier = null,
+    block: *OutputBarrierBlock,
+};
+const OutputBarrierLane = struct { first: *OutputBarrier, last: *OutputBarrier };
+const OutputBarrierBlock = struct {
+    nodes: []OutputBarrier,
+    remaining: usize,
+};
+
+/// Caller holds the same serialized delivery cut from prepare through commit.
+/// All node and lane capacity is paid before the image/recipient joint commit.
+pub const PreparedOutputBarriers = struct {
+    spool: *Spool,
+    clients: []ClientId,
+    block: ?*OutputBarrierBlock,
+    expected_count: usize,
+    expected_sequence: u64,
+    expected_entries: usize,
+    state: enum { prepared, committed, aborted } = .prepared,
+
+    pub fn commit(self: *@This()) void {
+        std.debug.assert(self.state == .prepared);
+        const spool = self.spool;
+        std.debug.assert(spool.output_barrier_count == self.expected_count and
+            spool.next_sequence == self.expected_sequence and spool.entries.items.len == self.expected_entries);
+        if (self.block) |block| for (self.clients, block.nodes) |client, *node| {
+            if (spool.output_barriers.getPtr(client)) |lane| {
+                lane.last.next = node;
+                lane.last = node;
+            } else spool.output_barriers.putAssumeCapacityNoClobber(client, .{ .first = node, .last = node });
+        };
+        spool.output_barrier_count += self.clients.len;
+        spool.allocator.free(self.clients);
+        self.clients = &.{};
+        self.state = .committed;
+    }
+
+    pub fn abort(self: *@This()) void {
+        if (self.state != .prepared) return;
+        if (self.block) |block| {
+            self.spool.allocator.free(block.nodes);
+            self.spool.allocator.destroy(block);
+        }
+        self.spool.allocator.free(self.clients);
+        self.clients = &.{};
+        self.block = null;
+        self.state = .aborted;
+    }
+    pub fn deinit(self: *@This()) void {
+        self.abort();
+        self.* = undefined;
+    }
+};
+
 pub const Spool = struct {
     allocator: std.mem.Allocator,
     config: Config,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    output_barriers: std.AutoHashMapUnmanaged(ClientId, OutputBarrierLane) = .empty,
+    output_barrier_count: usize = 0,
     total_bytes: usize = 0,
     /// Exact physical attachment cardinality. Mutations maintain this eagerly so
     /// admission never rescans the full record list merely to enforce the cap.
@@ -288,7 +365,94 @@ pub const Spool = struct {
     pub fn deinit(self: *Spool) void {
         for (self.entries.items) |entry| self.allocator.free(entry.bytes);
         self.entries.deinit(self.allocator);
+        var lanes = self.output_barriers.valueIterator();
+        while (lanes.next()) |lane| {
+            var node: ?*OutputBarrier = lane.first;
+            while (node) |current| {
+                node = current.next;
+                self.retireBarrierNode(current);
+            }
+        }
+        self.output_barriers.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn outputBarrierCount(self: *const Spool) usize {
+        return self.output_barrier_count;
+    }
+    pub fn hasOutputBarrier(self: *const Spool, client: ClientId) bool {
+        return self.output_barriers.contains(client);
+    }
+
+    pub fn prepareOutputBarriers(self: *Spool, owner: u64, clients: []const ClientId, max_barriers: usize) BarrierError!PreparedOutputBarriers {
+        if (owner == 0) return error.InvalidBarrier;
+        const count = std.math.add(usize, self.output_barrier_count, clients.len) catch return error.CapacityExceeded;
+        if (count > max_barriers) return error.CapacityExceeded;
+        const lane_capacity = std.math.cast(u32, clients.len) orelse return error.CapacityExceeded;
+        for (clients, 0..) |client, i| {
+            if (client == std.math.maxInt(u64)) return error.InvalidBarrier;
+            for (clients[0..i]) |prior| if (prior == client) return error.InvalidBarrier;
+            if (self.output_barriers.get(client)) |lane| {
+                var node: ?*OutputBarrier = lane.first;
+                while (node) |current| : (node = current.next) if (current.owner == owner) return error.InvalidBarrier;
+            }
+        }
+        const owned = try self.allocator.dupe(ClientId, clients);
+        errdefer self.allocator.free(owned);
+        var block: ?*OutputBarrierBlock = null;
+        if (clients.len != 0) {
+            const allocated = try self.allocator.create(OutputBarrierBlock);
+            errdefer self.allocator.destroy(allocated);
+            allocated.* = .{ .nodes = try self.allocator.alloc(OutputBarrier, clients.len), .remaining = clients.len };
+            errdefer self.allocator.free(allocated.nodes);
+            for (allocated.nodes) |*node| node.* = .{ .owner = owner, .cutoff = self.next_sequence, .block = allocated };
+            try self.output_barriers.ensureUnusedCapacity(self.allocator, lane_capacity);
+            block = allocated;
+        }
+        return .{ .spool = self, .clients = owned, .block = block, .expected_count = self.output_barrier_count, .expected_sequence = self.next_sequence, .expected_entries = self.entries.items.len };
+    }
+
+    /// An image may append to SendQ only after the older ADS prefix and every
+    /// earlier image for THIS exact physical generation has completed.
+    pub fn outputBarrierReady(self: *const Spool, client: ClientId, owner: u64) bool {
+        const lane = self.output_barriers.get(client) orelse return false;
+        if (lane.first.owner != owner) return false;
+        for (self.entries.items) |entry| if (entry.client == client and entry.sequence < lane.first.cutoff) return false;
+        return true;
+    }
+
+    pub fn releaseOutputBarrier(self: *Spool, client: ClientId, owner: u64) bool {
+        if (!self.outputBarrierReady(client, owner)) return false;
+        const lane = self.output_barriers.getPtr(client).?;
+        const node = lane.first;
+        if (node.next) |next| lane.first = next else _ = self.output_barriers.remove(client);
+        self.output_barrier_count -= 1;
+        self.retireBarrierNode(node);
+        return true;
+    }
+
+    fn retireBarrierNode(self: *Spool, node: *OutputBarrier) void {
+        const block = node.block;
+        std.debug.assert(block.remaining != 0);
+        block.remaining -= 1;
+        if (block.remaining == 0) {
+            self.allocator.free(block.nodes);
+            self.allocator.destroy(block);
+        }
+    }
+
+    /// Exact physical close only, never a reusable-token logical transfer.
+    pub fn discardOutputBarriers(self: *Spool, client: ClientId) usize {
+        const lane = self.output_barriers.fetchRemove(client) orelse return 0;
+        var count: usize = 0;
+        var node: ?*OutputBarrier = lane.value.first;
+        while (node) |current| {
+            node = current.next;
+            self.retireBarrierNode(current);
+            count += 1;
+        }
+        self.output_barrier_count -= count;
+        return count;
     }
 
     pub fn len(self: *const Spool) usize {
@@ -344,6 +508,86 @@ pub const Spool = struct {
         return self.attachment_count;
     }
 
+    pub fn hasUncheckpointedOutput(self: *const Spool) bool {
+        if (self.output_barrier_count != 0) return true;
+        for (self.entries.items) |entry| if (entry.encoding != .irc_record) return true;
+        return false;
+    }
+
+    /// Exact physical terminal retirement, never a queue reset or handoff.
+    pub fn discardUncheckpointedOutput(self: *Spool, client: ClientId) usize {
+        var retired: usize = 0;
+        var index: usize = 0;
+        while (index < self.entries.items.len) {
+            const entry = self.entries.items[index];
+            if (entry.client == client and entry.encoding != .irc_record) {
+                self.removeAt(index);
+                retired += 1;
+            } else index += 1;
+        }
+        return retired;
+    }
+
+    pub fn hasPendingOutput(self: *const Spool, client: ClientId) bool {
+        return self.hasClient(client);
+    }
+
+    /// Stage exact already-rendered output before any semantic/frontier commit.
+    /// The input is plaintext (or explicitly WS-framed plaintext), never TLS
+    /// ciphertext. Allocation/pressure refusal leaves every sequence unchanged.
+    pub fn prepareOutputBatch(self: *Spool, batch: []const OutputRecord) ReserveError!PreparedBatch {
+        var bytes: usize = 0;
+        var attachments: usize = 0;
+        for (batch, 0..) |record, index| {
+            if (record.client == std.math.maxInt(ClientId) or record.bytes.len == 0 or record.encoding == .irc_record)
+                return error.InvalidRecord;
+            bytes = std.math.add(usize, bytes, record.bytes.len) catch return error.CapacityExceeded;
+            if (!self.hasClient(record.client)) {
+                var earlier = false;
+                for (batch[0..index]) |prior| if (prior.client == record.client) {
+                    earlier = true;
+                    break;
+                };
+                if (!earlier) attachments += 1;
+            }
+        }
+        if (self.entries.items.len > self.config.max_records or batch.len > self.config.max_records - self.entries.items.len or
+            self.total_bytes > self.config.max_total_bytes or bytes > self.config.max_total_bytes - self.total_bytes or
+            self.attachment_count > self.config.max_attachments or attachments > self.config.max_attachments - self.attachment_count or
+            batch.len > std.math.maxInt(u64) - self.next_sequence) return error.CapacityExceeded;
+        const staged = try self.allocator.alloc(Entry, batch.len);
+        errdefer self.allocator.free(staged);
+        var initialized: usize = 0;
+        errdefer for (staged[0..initialized]) |entry| self.allocator.free(entry.bytes);
+        for (batch, 0..) |record, index| {
+            const sequence = self.next_sequence + @as(u64, @intCast(index));
+            var number: [16]u8 = undefined;
+            std.mem.writeInt(u64, number[0..8], record.client, .little);
+            std.mem.writeInt(u64, number[8..16], sequence, .little);
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("onyx-physical-output-chunk-v1\x00");
+            hash.update(&number);
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            const event = digest[0..16].*;
+            if (self.indexOf(record.client, event) != null) return error.Equivocation;
+            staged[index] = .{ .client = record.client, .sequence = sequence, .event_id = event, .bytes = try self.allocator.dupe(u8, record.bytes), .encoding = record.encoding };
+            initialized += 1;
+        }
+        try self.entries.ensureUnusedCapacity(self.allocator, batch.len);
+        return .{
+            .spool = self,
+            .staged = staged,
+            .new_bytes = bytes,
+            .new_attachments = attachments,
+            .exact_duplicates = 0,
+            .expected_len = self.entries.items.len,
+            .expected_total_bytes = self.total_bytes,
+            .expected_attachment_count = self.attachment_count,
+            .expected_next_sequence = self.next_sequence,
+        };
+    }
+
     /// Prepare an all-or-nothing batch without publishing it. The returned plan
     /// owns every rendered body and the live list capacity needed by `commit`.
     pub fn prepareBatch(self: *Spool, batch: []const BatchRecord) ReserveError!PreparedBatch {
@@ -358,7 +602,7 @@ pub const Spool = struct {
                 return error.InvalidRecord;
 
             if (self.indexOf(record.client, record.event_id)) |existing_index| {
-                if (!std.mem.eql(u8, self.entries.items[existing_index].bytes, record.bytes))
+                if (self.entries.items[existing_index].encoding != .irc_record or !std.mem.eql(u8, self.entries.items[existing_index].bytes, record.bytes))
                     return error.Equivocation;
                 duplicate_count += 1;
                 continue;
@@ -568,6 +812,7 @@ pub const Spool = struct {
             scanned += 1;
             if (!self.isOldestForClient(current)) continue;
             const entry = self.entries.items[current];
+            if (self.output_barriers.get(entry.client)) |lane| if (entry.sequence >= lane.first.cutoff) continue;
             var client_already_emitted = false;
             for (out[0..emitted]) |prior| if (prior.client == entry.client) {
                 client_already_emitted = true;
@@ -579,6 +824,7 @@ pub const Spool = struct {
                 .sequence = entry.sequence,
                 .event_id = entry.event_id,
                 .bytes = entry.bytes,
+                .encoding = entry.encoding,
             };
             emitted += 1;
         }
@@ -596,8 +842,18 @@ pub const Spool = struct {
         event_id: EventId,
     ) bool {
         const index = self.indexOf(client, event_id) orelse return false;
+        if (self.output_barriers.get(client)) |lane| if (self.entries.items[index].sequence >= lane.first.cutoff) return false;
         if (!self.isOldestForClient(index) or self.entries.items[index].sequence != sequence)
             return false;
+        self.removeAt(index);
+        return true;
+    }
+
+    /// Retire one caller-owned obligation at an explicit terminal boundary.
+    /// Unrelated records for this attachment retain FIFO order and custody.
+    /// The caller proves event ownership; this is not a SendQ acknowledgement.
+    pub fn discardRecord(self: *Spool, client: ClientId, event_id: EventId) bool {
+        const index = self.indexOf(client, event_id) orelse return false;
         self.removeAt(index);
         return true;
     }
@@ -607,6 +863,7 @@ pub const Spool = struct {
     /// authorities; it frees every matching body and compacts unrelated FIFO rows
     /// in place. The operation cannot fail.
     pub fn discardAttachment(self: *Spool, client: ClientId) DiscardResult {
+        _ = self.discardOutputBarriers(client);
         var write_index: usize = 0;
         var discarded_records: usize = 0;
         var discarded_bytes: usize = 0;
@@ -634,6 +891,33 @@ pub const Spool = struct {
         };
     }
 
+    /// Same intentional attachment retirement, preserving records owned by a
+    /// different typed custody domain. Caller holds the spool mutation lane.
+    pub fn discardAttachmentExcept(self: *Spool, client: ClientId, context: anytype, comptime preserve: anytype) DiscardResult {
+        var written: usize = 0;
+        var records: usize = 0;
+        var bytes: usize = 0;
+        var client_remains = false;
+        for (self.entries.items) |entry| {
+            if (entry.client == client and entry.encoding == .irc_record and !preserve(context, client, entry.event_id)) {
+                records += 1;
+                bytes += entry.bytes.len;
+                self.allocator.free(entry.bytes);
+                continue;
+            }
+            if (entry.client == client) client_remains = true;
+            self.entries.items[written] = entry;
+            written += 1;
+        }
+        if (records != 0) {
+            self.entries.items.len = written;
+            self.total_bytes -= bytes;
+            if (!client_remains) self.attachment_count -= 1;
+            self.fair_cursor = 0;
+        }
+        return .{ .discarded_records = records, .discarded_bytes = bytes };
+    }
+
     /// Prepare an exact old-to-new attachment transfer without publishing any
     /// change. Equal destination rows are preplanned as one retained earlier
     /// event; differing bytes reject the entire plan. The returned ticket owns
@@ -643,6 +927,9 @@ pub const Spool = struct {
         old_client: ClientId,
         new_client: ClientId,
     ) TransferError!PreparedAttachmentTransfer {
+        if (self.hasOutputBarrier(old_client) or self.hasOutputBarrier(new_client)) return error.PendingPhysicalCustody;
+        for (self.entries.items) |entry| if ((entry.client == old_client or entry.client == new_client) and entry.encoding != .irc_record)
+            return error.PendingPhysicalCustody;
         const plans = try self.allocator.alloc(AttachmentTransferPlan, self.entries.items.len);
         errdefer self.allocator.free(plans);
         for (self.entries.items, plans) |entry, *plan| plan.* = .{ .client = entry.client };
@@ -720,6 +1007,7 @@ pub const Spool = struct {
         self: *Spool,
         mappings: []const AttachmentRemap,
     ) RemapError!RemapResult {
+        if (self.hasUncheckpointedOutput()) return error.PendingPhysicalCustody;
         if (mappings.len > hard_max_attachments) return error.CapacityExceeded;
         if (mappings.len == 0) {
             if (self.entries.items.len != 0) return error.MissingMapping;
@@ -845,6 +1133,8 @@ pub const Spool = struct {
     }
 
     pub fn encodeCheckpoint(self: *const Spool, allocator: std.mem.Allocator) CheckpointError![]u8 {
+        if (self.output_barrier_count != 0) return error.InvalidState;
+        for (self.entries.items) |entry| if (entry.encoding != .irc_record) return error.InvalidState;
         try validateConfig(self.config);
         if (self.entries.items.len > self.config.max_records or
             self.attachment_count > self.config.max_attachments or
@@ -2134,4 +2424,237 @@ test "owned attachment batch adopts inserted bodies and adopts nothing on failur
     try testing.expectEqual(left.ptr, prepared.staged[0].bytes.ptr);
     prepared.deinit();
     try testing.expectEqual(@as(usize, 1), spool.len());
+}
+
+test "attachment delivery spool exact typed retirement preserves chat and unrelated FIFO" {
+    var spool = try Spool.init(testing.allocator, .{ .max_attachments = 4, .max_records = 8, .max_total_bytes = 128, .max_record_bytes = 32 });
+    defer spool.deinit();
+    _ = try spool.reserveBatch(&.{
+        .{ .client = 1, .event_id = eventId(1), .bytes = "host\r\n" },
+        .{ .client = 2, .event_id = eventId(2), .bytes = "other\r\n" },
+        .{ .client = 1, .event_id = eventId(3), .bytes = "chat\r\n" },
+    });
+    const Preserve = struct {
+        fn host(_: void, physical: ClientId, event: EventId) bool {
+            return physical == 1 and std.mem.eql(u8, &event, &@as(EventId, eventId(1)));
+        }
+    };
+    const result = spool.discardAttachmentExcept(1, {}, Preserve.host);
+    try testing.expectEqual(@as(usize, 1), result.discarded_records);
+    try testing.expectEqual(@as(usize, 6), result.discarded_bytes);
+    try testing.expect(spool.contains(1, eventId(1)));
+    try testing.expect(!spool.contains(1, eventId(3)));
+    try testing.expectEqual(@as(usize, 2), spool.attachmentCount());
+    var page: [2]PendingRecord = undefined;
+    const before = spool.collectPending(&page);
+    try testing.expectEqual(@as(usize, 2), before.len);
+    try testing.expectEqualSlices(u8, "host\r\n", before[0].bytes);
+    try testing.expectEqualSlices(u8, "other\r\n", before[1].bytes);
+    try testing.expect(!spool.discardRecord(2, eventId(1)));
+    try testing.expect(spool.discardRecord(1, eventId(1)));
+    try testing.expect(!spool.discardRecord(1, eventId(1)));
+    try testing.expectEqual(@as(usize, 1), spool.attachmentCount());
+    try testing.expectEqual(@as(usize, 7), spool.totalBytes());
+    const remaining = spool.collectPending(&page);
+    try testing.expectEqual(@as(usize, 1), remaining.len);
+    try testing.expectEqual(@as(ClientId, 2), remaining[0].client);
+    try testing.expectEqualSlices(u8, "other\r\n", remaining[0].bytes);
+}
+
+test "output barrier cutoff keeps old ADS ahead and every later record behind its funded owner" {
+    const a = std.testing.allocator;
+    var spool = try Spool.init(a, .{});
+    defer spool.deinit();
+    const first: EventId = @splat(1);
+    const later: EventId = @splat(2);
+    _ = try spool.reserveBatch(&.{.{ .client = 0, .event_id = first, .bytes = ":s NOTICE n :old\r\n" }});
+    var gate = try spool.prepareOutputBarriers(7, &.{ 0, 9 }, 2);
+    defer gate.deinit();
+    try std.testing.expectEqual(@as(usize, 0), spool.outputBarrierCount());
+    gate.commit();
+    _ = try spool.reserveBatch(&.{
+        .{ .client = 0, .event_id = later, .bytes = ":s NOTICE n :later\r\n" },
+        .{ .client = 10, .event_id = later, .bytes = ":s NOTICE other :independent\r\n" },
+    });
+    try std.testing.expect(!spool.outputBarrierReady(0, 7));
+    try std.testing.expect(spool.outputBarrierReady(9, 7));
+    try std.testing.expect(!spool.releaseOutputBarrier(0, 7));
+    var pending: [8]PendingRecord = undefined;
+    const before = spool.collectPending(&pending);
+    try std.testing.expectEqual(@as(usize, 2), before.len);
+    for (before) |record| {
+        if (record.client == 0) try std.testing.expectEqual(first, record.event_id);
+        try std.testing.expect(spool.commitHeadToSendq(record.client, record.sequence, record.event_id));
+    }
+    try std.testing.expectEqual(@as(usize, 0), spool.collectPending(&pending).len);
+    try std.testing.expect(spool.outputBarrierReady(0, 7));
+    try std.testing.expectError(error.InvalidState, spool.encodeCheckpoint(a));
+    try std.testing.expectError(error.PendingPhysicalCustody, spool.prepareAttachmentTransfer(0, 8));
+    try std.testing.expectError(error.PendingPhysicalCustody, spool.remapAttachments(&.{.{ .old_client = 0, .new_client = 8 }}));
+    // Owner mismatch is not a release receipt.
+    try std.testing.expect(!spool.releaseOutputBarrier(0, 8));
+    try std.testing.expect(spool.releaseOutputBarrier(0, 7));
+    const after = spool.collectPending(&pending);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqual(later, after[0].event_id);
+    try std.testing.expectEqualStrings(":s NOTICE n :later\r\n", after[0].bytes);
+    try std.testing.expect(spool.commitHeadToSendq(after[0].client, after[0].sequence, after[0].event_id));
+    try std.testing.expect(spool.releaseOutputBarrier(9, 7));
+    try std.testing.expectEqual(@as(usize, 0), spool.outputBarrierCount());
+    const wire = try spool.encodeCheckpoint(a);
+    defer a.free(wire);
+}
+
+test "output barrier image ordering includes intervening ADS and exact generation retirement" {
+    const a = std.testing.allocator;
+    var spool = try Spool.init(a, .{});
+    defer spool.deinit();
+    const old_generation: ClientId = 0x100000001;
+    const replacement_generation: ClientId = 0x200000001;
+    var first = try spool.prepareOutputBarriers(1, &.{old_generation}, 4);
+    defer first.deinit();
+    first.commit();
+    const event: EventId = @splat(3);
+    _ = try spool.reserveBatch(&.{.{ .client = old_generation, .event_id = event, .bytes = ":s NOTICE n :between images\r\n" }});
+    var second = try spool.prepareOutputBarriers(2, &.{ old_generation, replacement_generation }, 4);
+    defer second.deinit();
+    second.commit();
+    try std.testing.expect(!spool.outputBarrierReady(old_generation, 2));
+    try std.testing.expect(spool.releaseOutputBarrier(old_generation, 1));
+    try std.testing.expect(!spool.outputBarrierReady(old_generation, 2));
+    var pending: [2]PendingRecord = undefined;
+    const middle = spool.collectPending(&pending);
+    try std.testing.expectEqual(@as(usize, 1), middle.len);
+    try std.testing.expectEqualStrings(":s NOTICE n :between images\r\n", middle[0].bytes);
+    try std.testing.expect(spool.commitHeadToSendq(old_generation, middle[0].sequence, event));
+    try std.testing.expect(spool.outputBarrierReady(old_generation, 2));
+    // Closing one full ClientId cannot touch the next generation's gate.
+    _ = spool.discardAttachment(old_generation);
+    try std.testing.expect(!spool.hasOutputBarrier(old_generation));
+    try std.testing.expect(spool.hasOutputBarrier(replacement_generation));
+    try std.testing.expectEqual(@as(usize, 1), spool.outputBarrierCount());
+    try std.testing.expect(spool.releaseOutputBarrier(replacement_generation, 2));
+    try std.testing.expectEqual(@as(usize, 0), spool.outputBarrierCount());
+    try std.testing.expectError(error.InvalidBarrier, spool.prepareOutputBarriers(0, &.{7}, 2));
+    try std.testing.expectError(error.InvalidBarrier, spool.prepareOutputBarriers(1, &.{ 7, 7 }, 2));
+    try std.testing.expectError(error.InvalidBarrier, spool.prepareOutputBarriers(1, &.{std.math.maxInt(u64)}, 2));
+}
+
+test "output barrier prepare allocation cuts leave old FIFO and credits exact" {
+    const a = std.testing.allocator;
+    var failures: usize = 0;
+    var succeeded = false;
+    for (0..64) |index| {
+        var spool = try Spool.init(a, .{});
+        defer spool.deinit();
+        const event: EventId = @splat(4);
+        _ = try spool.reserveBatch(&.{.{ .client = 1, .event_id = event, .bytes = ":s NOTICE n :existing\r\n" }});
+        const before = try spool.encodeCheckpoint(a);
+        defer a.free(before);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        spool.allocator = failing.allocator();
+        const attempt = spool.prepareOutputBarriers(1, &.{ 1, 2, 3 }, 3);
+        if (attempt) |prepared| {
+            var plan = prepared;
+            try std.testing.expect(!failing.has_induced_failure);
+            plan.abort();
+            plan.abort();
+            plan.deinit();
+            succeeded = true;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+        spool.allocator = a;
+        try std.testing.expectEqual(@as(usize, 0), spool.outputBarrierCount());
+        try std.testing.expect(!spool.hasOutputBarrier(1));
+        try std.testing.expectEqual(@as(usize, 1), spool.len());
+        const after = try spool.encodeCheckpoint(a);
+        defer a.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+        if (succeeded) break;
+    }
+    try std.testing.expect(failures != 0);
+    try std.testing.expect(succeeded);
+}
+
+test "output barrier plaintext chunks preserve CRLF fragments framing type and strict checkpoint refusal" {
+    const a = std.testing.allocator;
+    var spool = try Spool.init(a, .{});
+    defer spool.deinit();
+    _ = try spool.reserveBatch(&.{.{ .client = 1, .event_id = @splat(1), .bytes = ":old NOTICE one :before\r\n" }});
+    var gates = try spool.prepareOutputBarriers(1, &.{1}, 2);
+    defer gates.deinit();
+    gates.commit();
+    var output = try spool.prepareOutputBatch(&.{
+        .{ .client = 1, .bytes = ":new NOTICE one :frag" },
+        .{ .client = 1, .bytes = "ment\r\nsecond\r\n" },
+        .{ .client = 2, .bytes = "\x81\x01X", .encoding = .preframed_secure },
+    });
+    defer output.deinit();
+    _ = output.commit();
+    var pending: [4]PendingRecord = undefined;
+    const first = spool.collectPending(&pending);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    for (first) |row| {
+        if (row.client == 1) {
+            try std.testing.expectEqual(OutputEncoding.irc_record, row.encoding);
+            try std.testing.expectEqualStrings(":old NOTICE one :before\r\n", row.bytes);
+        } else {
+            try std.testing.expectEqual(OutputEncoding.preframed_secure, row.encoding);
+            try std.testing.expectEqualSlices(u8, "\x81\x01X", row.bytes);
+        }
+        try std.testing.expect(spool.commitHeadToSendq(row.client, row.sequence, row.event_id));
+    }
+    try std.testing.expectEqual(@as(usize, 0), spool.collectPending(&pending).len);
+    try std.testing.expect(spool.releaseOutputBarrier(1, 1));
+    try std.testing.expectError(error.InvalidState, spool.encodeCheckpoint(a));
+    try std.testing.expectError(error.PendingPhysicalCustody, spool.prepareAttachmentTransfer(1, 3));
+    try std.testing.expectError(error.PendingPhysicalCustody, spool.remapAttachments(&.{.{ .old_client = 1, .new_client = 3 }}));
+    const head = spool.collectPending(&pending)[0];
+    try std.testing.expectEqual(OutputEncoding.plaintext, head.encoding);
+    try std.testing.expectEqualStrings(":new NOTICE one :frag", head.bytes);
+    try std.testing.expect(spool.commitHeadToSendq(head.client, head.sequence, head.event_id));
+    const tail = spool.collectPending(&pending)[0];
+    try std.testing.expectEqualStrings("ment\r\nsecond\r\n", tail.bytes);
+    try std.testing.expect(spool.commitHeadToSendq(tail.client, tail.sequence, tail.event_id));
+    try std.testing.expect(!spool.hasUncheckpointedOutput());
+    const empty = try spool.encodeCheckpoint(a);
+    a.free(empty);
+}
+
+test "output barrier plaintext prepare allocation cuts leave sequence bytes and physical retirement exact" {
+    const a = std.testing.allocator;
+    var saw_failure = false;
+    for (0..32) |cut| {
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = cut });
+        var spool = try Spool.init(fault.allocator(), .{});
+        defer spool.deinit();
+        const attempted = spool.prepareOutputBatch(&.{
+            .{ .client = 0, .bytes = "first fragment" },
+            .{ .client = 0x100000000, .bytes = "other generation\r\n" },
+        });
+        if (attempted) |value| {
+            var prepared = value;
+            defer prepared.deinit();
+            _ = prepared.commit();
+            try std.testing.expectEqual(@as(usize, 2), spool.len());
+            try std.testing.expectEqual(@as(usize, 1), spool.discardUncheckpointedOutput(0));
+            try std.testing.expect(!spool.hasPendingOutput(0));
+            try std.testing.expect(spool.hasPendingOutput(0x100000000));
+            try std.testing.expectEqual(@as(usize, 1), spool.discardUncheckpointedOutput(0x100000000));
+            try std.testing.expectEqual(@as(usize, 0), spool.totalBytes());
+            try std.testing.expect(saw_failure);
+            return;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            saw_failure = true;
+            try std.testing.expectEqual(@as(usize, 0), spool.len());
+            try std.testing.expectEqual(@as(usize, 0), spool.totalBytes());
+            try std.testing.expectEqual(@as(u64, 1), spool.next_sequence);
+            try std.testing.expectEqual(@as(usize, 0), spool.attachmentCount());
+        }
+    }
+    return error.TestUnexpectedResult;
 }

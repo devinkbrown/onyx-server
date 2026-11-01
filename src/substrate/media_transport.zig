@@ -16,6 +16,7 @@
 //! per participant. The inbound STUN USERNAME is `<server-ufrag>:<peer-ufrag>`,
 //! so a binding is demultiplexed back to a participant by its server ufrag.
 const std = @import("std");
+const platform = @import("platform.zig");
 const ice = @import("../proto/ice.zig");
 const stun = @import("../proto/stun.zig");
 const srtp = @import("../proto/srtp.zig");
@@ -533,7 +534,7 @@ pub const MediaTransport = struct {
             ep.ssrc = ssrc;
             self.by_ssrc.put(self.allocator, ssrc, key) catch {};
         }
-        if (seq) |sequence| ep.rtx.onSent(sequence, packet) catch {};
+        if (seq) |sequence| ep.rtx.onSentAt(sequence, packet, platform.monotonicMillisChecked() orelse 0) catch {};
         return .{ .iterator = self.endpoints.iterator(), .channel = key[0..sep], .sender = key[sep + 1 ..], .spatial = rtpSpatialLayer(packet) };
     }
 
@@ -624,14 +625,22 @@ pub const MediaTransport = struct {
     /// would let a caller re-protect it under a nonce that disagrees with its
     /// replay-window key. Reject the mismatch rather than emit a wrong packet.
     pub fn copyRetransmit(self: *MediaTransport, media_ssrc: u32, seq: u16, out: []u8) ?usize {
+        return self.copyRetransmitAt(media_ssrc, seq, out, platform.monotonicMillisChecked() orelse 0);
+    }
+    pub fn copyRetransmitAt(self: *MediaTransport, media_ssrc: u32, seq: u16, out: []u8, now_ms: i64) ?usize {
+        return if (self.copyRetransmitFreshAt(media_ssrc, seq, out, now_ms)) |packet| packet.len else null;
+    }
+    pub const FreshCopy = struct { len: usize, sent_ms: i64 };
+    pub fn copyRetransmitFreshAt(self: *MediaTransport, media_ssrc: u32, seq: u16, out: []u8, now_ms: i64) ?FreshCopy {
         const key = self.by_ssrc.get(media_ssrc) orelse return null;
         const ep = self.endpoints.getPtr(key) orelse return null;
-        const bytes = ep.rtx.lookup(seq) orelse return null;
+        const retained = ep.rtx.lookupFreshPacket(seq, now_ms) orelse return null;
+        const bytes = retained.bytes;
         if (bytes.len > out.len) return null;
         if (bytes.len < srtp.rtp_header_len) return null;
         if (std.mem.readInt(u32, bytes[8..12], .big) != media_ssrc) return null;
         @memcpy(out[0..bytes.len], bytes);
-        return bytes.len;
+        return .{ .len = bytes.len, .sent_ms = retained.sent_ms };
     }
 
     /// Per-participant transport stats snapshot (copied out so callers need not
@@ -1074,7 +1083,9 @@ fn mediaTransportDtoSweep(allocator: std.mem.Allocator) !void {
     try testing.expectEqualStrings("#call", candidate.channelForSource(source).?);
     try testing.expectEqualSlices(u8, &group, &candidate.group_keys.get("#call").?);
     var cached: [128]u8 = undefined;
-    const size = candidate.copyRetransmit(0xFA70, 65535, &cached) orelse return error.TestUnexpectedResult;
+    const captured_send = candidate.get("#call", "source").?.rtx.packets.items[0].sent_ms;
+    const size = candidate.copyRetransmitAt(0xFA70, 65535, &cached, captured_send) orelse return error.TestUnexpectedResult;
+    try testing.expect(candidate.copyRetransmitAt(0xFA70, 65535, &cached, captured_send + 1000) == null);
     try testing.expectEqualSlices(u8, &packet, cached[0..size]);
     try testing.expectEqual(@as(u64, 1), candidate.get("#call", "source").?.rx_packets);
     try testing.expectEqual(@as(u8, 1), candidate.get("#call", "receiver").?.max_spatial);

@@ -21,6 +21,7 @@
 //! uses case-insensitive globbing. Pure: owns all strings, performs no I/O.
 
 const std = @import("std");
+const cloak_match = @import("../proto/cloak_match.zig");
 const cidr = @import("../proto/cidr.zig");
 const bloom = @import("../substrate/bloom.zig");
 
@@ -50,7 +51,7 @@ pub const Match = enum {
 
     pub fn parse(raw: []const u8) ?Match {
         inline for (@typeInfo(Match).@"enum".field_values) |f_value| {
-            const m: Match = @enumFromInt(f_value);
+            const m: Match = @fromBackingInt(@intCast(f_value));
             if (std.ascii.eqlIgnoreCase(raw, m.token())) return m;
         }
         return null;
@@ -94,7 +95,7 @@ pub const Action = enum {
 
     pub fn parse(raw: []const u8) ?Action {
         inline for (@typeInfo(Action).@"enum".field_values) |f_value| {
-            const a: Action = @enumFromInt(f_value);
+            const a: Action = @fromBackingInt(@intCast(f_value));
             if (std.ascii.eqlIgnoreCase(raw, a.token())) return a;
         }
         return null;
@@ -136,6 +137,7 @@ pub const Ward = struct {
 /// The identity a subject presents at the checkpoint. Empty/null facets never
 /// match (a Ward on a facet the subject lacks simply does not apply).
 pub const Facets = struct {
+    cloak_context: ?cloak_match.Context = null,
     address: []const u8 = "",
     host: []const u8 = "",
     mask: []const u8 = "",
@@ -204,7 +206,9 @@ pub const Registry = struct {
         for (self.wards.items) |*w| {
             const value = facets.facet(w.match);
             if (value.len == 0) continue;
-            if (matchValue(w.match, w.pattern, value)) return w;
+            if (w.match == .host or w.match == .mask) {
+                if (cloak_match.match(w.pattern, value, facets.cloak_context)) return w;
+            } else if (matchValue(w.match, w.pattern, value)) return w;
         }
         return null;
     }
@@ -375,9 +379,9 @@ fn putStr(buf: []u8, off: *usize, s: []const u8) WireError!void {
 pub fn encodeWire(w: WireWard, out: []u8) WireError![]const u8 {
     var off: usize = 0;
     if (off + 3 > out.len) return error.ShortBuffer;
-    out[off] = @intFromEnum(w.op);
-    out[off + 1] = @intFromEnum(w.match);
-    out[off + 2] = @intFromEnum(w.action);
+    out[off] = @backingInt(w.op);
+    out[off + 1] = @backingInt(w.match);
+    out[off + 2] = @backingInt(w.action);
     off += 3;
     try putStr(out, &off, w.pattern);
     try putStr(out, &off, w.reason);
@@ -411,7 +415,7 @@ fn takeStr(buf: []const u8, off: *usize) WireError![]const u8 {
 
 fn enumFromByte(comptime E: type, raw: u8) WireError!E {
     inline for (@typeInfo(E).@"enum".field_values) |f_value| {
-        if (f_value == raw) return @enumFromInt(f_value);
+        if (f_value == raw) return @fromBackingInt(@intCast(f_value));
     }
     return error.BadField;
 }
@@ -515,7 +519,7 @@ pub fn encodeMeshBanFilter(filter: *const MeshBanFilter, out: []u8) WireError![]
     if (out.len < mesh_ban_filter_wire_len) return error.ShortBuffer;
     if (filter.bloom.bitCount() != mesh_ban_filter_bits or filter.bloom.hashCount() != mesh_ban_filter_hashes) return error.BadField;
     if (filter.bloom.bits.len != mesh_ban_filter_bits / 8) return error.BadField;
-    out[0] = @intFromEnum(WireOp.filter);
+    out[0] = @backingInt(WireOp.filter);
     std.mem.writeInt(u16, out[1..3], @intCast(mesh_ban_filter_bits), .little);
     std.mem.writeInt(u16, out[3..5], @intCast(mesh_ban_filter_hashes), .little);
     const items: u32 = if (filter.bloom.len() > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(filter.bloom.len());
@@ -526,7 +530,7 @@ pub fn encodeMeshBanFilter(filter: *const MeshBanFilter, out: []u8) WireError![]
 
 pub fn decodeMeshBanFilter(allocator: std.mem.Allocator, bytes: []const u8) FilterError!MeshBanFilter {
     if (bytes.len != mesh_ban_filter_wire_len) return error.Truncated;
-    if (bytes[0] != @intFromEnum(WireOp.filter)) return error.BadField;
+    if (bytes[0] != @backingInt(WireOp.filter)) return error.BadField;
     const bit_count = std.mem.readInt(u16, bytes[1..3], .little);
     const hash_count = std.mem.readInt(u16, bytes[3..5], .little);
     if (bit_count != mesh_ban_filter_bits or hash_count != mesh_ban_filter_hashes) return error.BadField;
@@ -601,7 +605,7 @@ fn mkWard(match: Match, pattern: []const u8, action: Action) Ward {
 
 test "axis tokens parse round-trip" {
     inline for (@typeInfo(Match).@"enum".field_values) |f_value| {
-        const m: Match = @enumFromInt(f_value);
+        const m: Match = @fromBackingInt(@intCast(f_value));
         try std.testing.expectEqual(m, Match.parse(m.token()).?);
     }
     try std.testing.expectEqual(Scope.mesh, Scope.parse("MESH").?);
@@ -786,13 +790,13 @@ test "mesh ward wire round-trips add and remove" {
 test "mesh ward wire rejects truncated, empty pattern, and bad enum" {
     try std.testing.expectError(error.Truncated, decodeWire(&.{ 0, 0 }));
     // op=add(0), match=mask, action=expel, then a u16 length of 0 (empty pattern).
-    var empty: [5]u8 = .{ 0, @intFromEnum(Match.mask), @intFromEnum(Action.expel), 0, 0 };
+    var empty: [5]u8 = .{ 0, @backingInt(Match.mask), @backingInt(Action.expel), 0, 0 };
     try std.testing.expectError(error.Truncated, decodeWire(&empty));
     // A bad op byte (0xff) is rejected.
     var badop: [3]u8 = .{ 0xff, 0, 0 };
     try std.testing.expectError(error.BadField, decodeWire(&badop));
     // A pattern length that runs past the buffer is truncated.
-    var short_pat: [5]u8 = .{ 0, @intFromEnum(Match.host), @intFromEnum(Action.expel), 10, 0 };
+    var short_pat: [5]u8 = .{ 0, @backingInt(Match.host), @backingInt(Action.expel), 10, 0 };
     try std.testing.expectError(error.Truncated, decodeWire(&short_pat));
 }
 
@@ -847,4 +851,17 @@ test "no leak under churn" {
     }
     reg.pruneExpired(1000);
     try std.testing.expectEqual(@as(usize, 0), reg.count());
+}
+
+test "cloak WARD host continuity stays scoped to original address" {
+    const c = @import("../proto/cloak.zig");
+    const key = c.SecretKey.init(@splat(7));
+    var old: [253]u8 = undefined;
+    const before = try c.cloakOpaqueEpochV4(&old, &key, "203.0.113.9", 1, 86400, .{});
+    var registry = Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    try registry.add(mkWard(.host, before, .expel));
+    const ctx: cloak_match.Context = .{ .key = key, .suffix = "onyx", .address = "203.0.113.9" };
+    try std.testing.expect(registry.check(.{ .host = "current.onyx", .cloak_context = ctx }, 200) != null);
+    try std.testing.expect(registry.check(.{ .host = "current.onyx" }, 200) == null);
 }

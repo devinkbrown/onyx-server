@@ -149,7 +149,7 @@ pub const DecodedEvent = union(WireVersion) {
 };
 
 const v2_magic = "OEVT";
-const v2_version: u8 = @intFromEnum(WireVersion.signed_v2);
+const v2_version: u8 = @backingInt(WireVersion.signed_v2);
 const v2_flags_none: u8 = 0;
 const v2_header_len: usize = v2_magic.len + 1 + 1 + 1 + 1 + 8 + 8 + 2 + 2 + 2 + pubkey_len + sig_len;
 pub const max_v2_encoded_len: usize = v2_header_len + max_origin_len + max_subject_len + max_message_len;

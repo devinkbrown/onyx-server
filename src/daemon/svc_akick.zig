@@ -26,6 +26,7 @@
 //! network-wide `warden` ban system. AKICK is per-channel and time-aware.
 
 const std = @import("std");
+const cloak_match = @import("../proto/cloak_match.zig");
 
 /// Distinguishes the two mask kinds so matching can short-circuit cheaply and
 /// so callers can render entries faithfully.
@@ -74,6 +75,20 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Validate and trim the mask identity shared by durable and live ADD paths.
+/// Callers retain ownership; accepted masks are compared with ASCII folding.
+pub fn validateAddMask(mask: []const u8) error{InvalidMask}![]const u8 {
+    const trimmed = std.mem.trim(u8, mask, " ");
+    if (trimmed.len == 0 or classify(trimmed).pattern.len == 0) return error.InvalidMask;
+    return trimmed;
+}
+
+/// Evaluate a candidate before durable/live publication. Uses exactly the
+/// installed entry matcher, without expiry, authority checks or allocation.
+pub fn candidateMatchesWithCloak(mask: []const u8, hostmask: []const u8, account: ?[]const u8, ctx: ?cloak_match.Context) Error!bool {
+    return classifiedMatches(classify(try validateAddMask(mask)), hostmask, account, ctx);
+}
+
 /// Result of a removal request.
 pub const RemoveResult = enum { removed, not_found };
 
@@ -105,9 +120,8 @@ pub const AkickStore = struct {
         return .{ .alloc = alloc, .max_per_channel = max_per_channel };
     }
 
-    /// Restore an empty channel row as well as nonempty lists. An ordinary ADD
-    /// may leave this row behind after a later allocation failure, and purge
-    /// keeps the channel row after removing its last entry.
+    /// Restore empty channel rows from older checkpoints as well as nonempty
+    /// lists. Purge also keeps the channel row after removing its last entry.
     pub fn checkpointEnsureChannel(self: *AkickStore, channel: []const u8) Error!void {
         _ = try self.ensureChannel(channel);
     }
@@ -121,10 +135,107 @@ pub const AkickStore = struct {
         self.channels.deinit(self.alloc);
     }
 
-    /// Add an AKICK to `channel`. `mask`, `reason`, and `setter` are copied; the
-    /// caller retains ownership of its inputs. Returns the stored entry's
-    /// matchable pattern view is available via `list`. Masks are normalized to
-    /// lowercase before storage and duplicate detection.
+    /// Owns an unpublished entry and the capacity needed to publish it. Keep
+    /// the store alive and do not mutate it while this single-use value exists.
+    /// Abort after a failed durable write; commit only after durable success.
+    pub const PreparedAdd = struct {
+        store: *AkickStore,
+        channel: []const u8,
+        entry: ?Entry,
+        new_channel: bool,
+        new_entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+        /// Publish without allocation or any remaining admission checks.
+        pub fn commit(self: *PreparedAdd) void {
+            const entry = self.entry orelse unreachable;
+            if (self.new_channel) {
+                self.new_entries.appendAssumeCapacity(entry);
+                self.store.channels.putAssumeCapacityNoClobber(self.channel, .{ .entries = self.new_entries });
+                self.new_entries = .empty;
+            } else {
+                const cl = self.store.channels.getPtr(self.channel).?;
+                cl.entries.appendAssumeCapacity(entry);
+                self.store.alloc.free(self.channel);
+            }
+            self.entry = null;
+        }
+
+        /// Idempotent for this owning value; do not copy prepared ownership.
+        pub fn abort(self: *PreparedAdd) void {
+            const entry = self.entry orelse return;
+            freeEntry(self.store.alloc, entry);
+            self.store.alloc.free(self.channel);
+            self.new_entries.deinit(self.store.alloc);
+            self.entry = null;
+        }
+    };
+
+    /// Prepare every fallible live admission step without publishing a row or
+    /// entry. On failure, existing entries and channel membership are unchanged.
+    /// Successful preparation may reserve unused backing capacity.
+    pub fn prepareAdd(
+        self: *AkickStore,
+        channel: []const u8,
+        mask: []const u8,
+        reason: []const u8,
+        setter: []const u8,
+        added_at_ms: i64,
+        expires_at_ms: ?i64,
+    ) Error!PreparedAdd {
+        var key_buf: [256]u8 = undefined;
+        const key = channelKeyTmp(&key_buf, channel) catch return Error.InvalidMask;
+        if (key.len == 0) return Error.InvalidMask;
+        const trimmed = try validateAddMask(mask);
+
+        const cl = self.channels.getPtr(key);
+        if (cl) |existing_channel| {
+            // Reject a duplicate even when the list is full: no implicit
+            // replacement of reason, setter, timestamp, expiry or ordering.
+            for (existing_channel.entries.items) |existing| {
+                if (std.ascii.eqlIgnoreCase(existing.mask, trimmed)) return Error.Duplicate;
+            }
+            if (existing_channel.entries.items.len >= self.max_per_channel) return Error.ListFull;
+        } else if (self.max_per_channel == 0) return Error.ListFull;
+
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        const mask_copy = try self.alloc.alloc(u8, trimmed.len);
+        errdefer self.alloc.free(mask_copy);
+        lowerInto(mask_copy, trimmed);
+        const kind_pattern = classify(mask_copy);
+        const reason_copy = try self.alloc.dupe(u8, reason);
+        errdefer self.alloc.free(reason_copy);
+        const setter_copy = try self.alloc.dupe(u8, setter);
+        errdefer self.alloc.free(setter_copy);
+
+        var new_entries: std.ArrayListUnmanaged(Entry) = .empty;
+        errdefer new_entries.deinit(self.alloc);
+        if (cl) |existing_channel| {
+            try existing_channel.entries.ensureUnusedCapacity(self.alloc, 1);
+        } else {
+            try new_entries.ensureUnusedCapacity(self.alloc, 1);
+            // Last fallible step: no empty channel row survives an OOM.
+            try self.channels.ensureUnusedCapacity(self.alloc, 1);
+        }
+        return .{
+            .store = self,
+            .channel = owned_key,
+            .entry = .{
+                .mask = mask_copy,
+                .pattern = kind_pattern.pattern,
+                .kind = kind_pattern.kind,
+                .reason = reason_copy,
+                .setter = setter_copy,
+                .added_at_ms = added_at_ms,
+                .expires_at_ms = expires_at_ms,
+            },
+            .new_channel = cl == null,
+            .new_entries = new_entries,
+        };
+    }
+
+    /// Copy and publish an entry immediately. Durable callers must instead use
+    /// prepareAdd, commit their durable write, then commit the prepared entry.
     pub fn add(
         self: *AkickStore,
         channel: []const u8,
@@ -134,42 +245,9 @@ pub const AkickStore = struct {
         added_at_ms: i64,
         expires_at_ms: ?i64,
     ) Error!void {
-        const trimmed = std.mem.trim(u8, mask, " ");
-        if (trimmed.len == 0) return Error.InvalidMask;
-
-        const cl = try self.ensureChannel(channel);
-
-        if (cl.entries.items.len >= self.max_per_channel) return Error.ListFull;
-
-        // Build the normalized (lowercased) mask copy first so we can compare.
-        const mask_copy = try self.alloc.alloc(u8, trimmed.len);
-        errdefer self.alloc.free(mask_copy);
-        lowerInto(mask_copy, trimmed);
-
-        for (cl.entries.items) |existing| {
-            if (std.mem.eql(u8, existing.mask, mask_copy)) return Error.Duplicate;
-        }
-
-        const kind_pattern = classify(mask_copy);
-        if (kind_pattern.pattern.len == 0) {
-            // e.g. a bare "account:" with no glob -> unusable.
-            return Error.InvalidMask;
-        }
-
-        const reason_copy = try self.alloc.dupe(u8, reason);
-        errdefer self.alloc.free(reason_copy);
-        const setter_copy = try self.alloc.dupe(u8, setter);
-        errdefer self.alloc.free(setter_copy);
-
-        try cl.entries.append(self.alloc, .{
-            .mask = mask_copy,
-            .pattern = kind_pattern.pattern,
-            .kind = kind_pattern.kind,
-            .reason = reason_copy,
-            .setter = setter_copy,
-            .added_at_ms = added_at_ms,
-            .expires_at_ms = expires_at_ms,
-        });
+        var prepared = try self.prepareAdd(channel, mask, reason, setter, added_at_ms, expires_at_ms);
+        defer prepared.abort();
+        prepared.commit();
     }
 
     /// Remove the entry whose normalized mask equals `mask`. Frees its strings.
@@ -238,13 +316,17 @@ pub const AkickStore = struct {
         account: ?[]const u8,
         now_ms: i64,
     ) ?*const Entry {
+        return self.matchOnJoinWithCloak(channel, hostmask, account, now_ms, null);
+    }
+
+    pub fn matchOnJoinWithCloak(self: *AkickStore, channel: []const u8, hostmask: []const u8, account: ?[]const u8, now_ms: i64, ctx: ?cloak_match.Context) ?*const Entry {
         var key_buf: [256]u8 = undefined;
         const key = channelKeyTmp(&key_buf, channel) catch return null;
         const cl = self.channels.getPtr(key) orelse return null;
 
         for (cl.entries.items) |*entry| {
             if (entry.isExpired(now_ms)) continue;
-            if (entryMatches(entry.*, hostmask, account)) return entry;
+            if (classifiedMatches(.{ .kind = entry.kind, .pattern = entry.pattern }, hostmask, account, ctx)) return entry;
         }
         return null;
     }
@@ -286,13 +368,13 @@ fn classify(mask: []const u8) KindPattern {
     return .{ .kind = .hostmask, .pattern = mask };
 }
 
-fn entryMatches(entry: Entry, hostmask: []const u8, account: ?[]const u8) bool {
-    return switch (entry.kind) {
-        .hostmask => globMatch(entry.pattern, hostmask),
+fn classifiedMatches(mask: KindPattern, hostmask: []const u8, account: ?[]const u8, ctx: ?cloak_match.Context) bool {
+    return switch (mask.kind) {
+        .hostmask => cloak_match.match(mask.pattern, hostmask, ctx),
         .account => blk: {
             const acct = account orelse break :blk false;
             if (acct.len == 0) break :blk false;
-            break :blk globMatch(entry.pattern, acct);
+            break :blk globMatch(mask.pattern, acct);
         },
     };
 }
@@ -571,4 +653,184 @@ test "Entry.isExpired boundary" {
     try testing.expect(!e_temp.isExpired(99));
     try testing.expect(e_temp.isExpired(100));
     try testing.expect(e_temp.isExpired(101));
+}
+
+test "cloak AKICK continuity respects original hostmask and expiry" {
+    const c = @import("../proto/cloak.zig");
+    const key = c.SecretKey.init(@splat(7));
+    var old: [253]u8 = undefined;
+    const before = try c.cloakOpaqueEpochV4(&old, &key, "203.0.113.9", 1, 86400, .{});
+    var mask_buf: [512]u8 = undefined;
+    const mask = try std.fmt.bufPrint(&mask_buf, "Nick!*@{s}", .{before});
+    var store = AkickStore.init(testing.allocator);
+    defer store.deinit();
+    try store.add("#cloak", mask, "reason", "oper", 1000, 2000);
+    const ctx: cloak_match.Context = .{ .key = key, .suffix = "onyx", .address = "203.0.113.9" };
+    try testing.expect(store.matchOnJoinWithCloak("#cloak", "Nick!u@current.onyx", null, 1001, ctx) != null);
+    try testing.expect(store.matchOnJoinWithCloak("#cloak", "Other!u@current.onyx", null, 1001, ctx) == null);
+    try testing.expect(store.matchOnJoinWithCloak("#cloak", "Nick!u@current.onyx", null, 2000, ctx) == null);
+}
+
+test "prepared add: abort preserves rows and commit owns metadata without allocation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var store = AkickStore.init(failing.allocator());
+    defer store.deinit();
+
+    var aborted = try store.prepareAdd("#New", "Bad!*@*", "reason", "issuer", 12, 99);
+    try testing.expectEqual(@as(usize, 0), store.channels.count());
+    aborted.abort();
+    aborted.abort();
+    try testing.expectEqual(@as(usize, 0), store.channels.count());
+
+    var prepared = try store.prepareAdd("#New", "Account:BaD", "reason", "issuer", 12, 99);
+    defer prepared.abort();
+    const allocations = failing.alloc_index;
+    failing.fail_index = allocations;
+    prepared.commit();
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(allocations, failing.alloc_index);
+    const entries = store.list("#NEW");
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("account:bad", entries[0].mask);
+    try testing.expectEqualStrings("bad", entries[0].pattern);
+    try testing.expectEqualStrings("reason", entries[0].reason);
+    try testing.expectEqualStrings("issuer", entries[0].setter);
+    try testing.expectEqual(@as(i64, 12), entries[0].added_at_ms);
+    try testing.expectEqual(@as(?i64, 99), entries[0].expires_at_ms);
+
+    failing.fail_index = std.math.maxInt(usize);
+    var existing = try store.prepareAdd("#new", "second!*@*", "next", "other", 14, null);
+    defer existing.abort();
+    const next_allocations = failing.alloc_index;
+    failing.fail_index = next_allocations;
+    existing.commit();
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(next_allocations, failing.alloc_index);
+    try testing.expectEqual(@as(usize, 2), store.count("#new"));
+    try testing.expectEqualStrings("account:bad", store.list("#new")[0].mask);
+    try testing.expectEqualStrings("second!*@*", store.list("#new")[1].mask);
+}
+
+test "prepared add: duplicate and capacity rejection preserve existing rule" {
+    var store = AkickStore.initCapacity(testing.allocator, 1);
+    defer store.deinit();
+    try store.add("#chan", "Bad!*@*", "original", "issuer", 17, 99);
+    try testing.expectError(Error.Duplicate, store.prepareAdd("#CHAN", " BAD!*@* ", "replacement", "other", 22, null));
+    try testing.expectError(Error.ListFull, store.prepareAdd("#chan", "another!*@*", "overflow", "other", 23, null));
+    const entry = store.list("#chan")[0];
+    try testing.expectEqual(@as(usize, 1), store.count("#chan"));
+    try testing.expectEqualStrings("original", entry.reason);
+    try testing.expectEqualStrings("issuer", entry.setter);
+    try testing.expectEqual(@as(i64, 17), entry.added_at_ms);
+    try testing.expectEqual(@as(?i64, 99), entry.expires_at_ms);
+}
+
+test "prepared add: allocation failure never publishes an empty channel" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var store = AkickStore.init(allocator);
+            defer store.deinit();
+            var prepared = store.prepareAdd("#chan", "bad!*@*", "reason", "issuer", 12, null) catch |err| {
+                try testing.expectEqual(@as(usize, 0), store.channels.count());
+                try testing.expectEqual(@as(usize, 0), store.count("#chan"));
+                store.alloc = testing.allocator;
+                try store.add("#chan", "bad!*@*", "retry", "issuer", 12, null);
+                try testing.expectEqualStrings("retry", store.list("#chan")[0].reason);
+                return err;
+            };
+            defer prepared.abort();
+            try testing.expectEqual(@as(usize, 0), store.channels.count());
+            prepared.commit();
+            try testing.expectEqual(@as(usize, 1), store.count("#chan"));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{});
+}
+
+test "prepared add: allocation failure and abort preserve existing entry order" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var store = AkickStore.init(testing.allocator);
+            defer store.deinit();
+            try store.add("#chan", "first!*@*", "original", "issuer", 17, 99);
+            // Force the existing-list reservation to grow, so this sweep
+            // includes its final fallible step as well as owned string copies.
+            const cl = store.channels.getPtr("#chan").?;
+            const tight = try testing.allocator.dupe(Entry, cl.entries.items);
+            cl.entries.deinit(testing.allocator);
+            cl.entries = std.ArrayList(Entry).fromOwnedSlice(tight);
+            const original_mask = store.list("#chan")[0].mask.ptr;
+            store.alloc = allocator;
+            var prepared = store.prepareAdd("#CHAN", "second!*@*", "next", "other", 22, null) catch |err| {
+                try testing.expectEqual(@as(usize, 1), store.channels.count());
+                try testing.expectEqual(@as(usize, 1), store.count("#chan"));
+                const original = store.list("#chan")[0];
+                try testing.expectEqual(original_mask, original.mask.ptr);
+                try testing.expectEqualStrings("original", original.reason);
+                try testing.expectEqualStrings("issuer", original.setter);
+                try testing.expectEqual(@as(i64, 17), original.added_at_ms);
+                try testing.expectEqual(@as(?i64, 99), original.expires_at_ms);
+                store.alloc = testing.allocator;
+                try store.add("#chan", "second!*@*", "retry", "other", 22, null);
+                try testing.expectEqualStrings("first!*@*", store.list("#chan")[0].mask);
+                try testing.expectEqualStrings("second!*@*", store.list("#chan")[1].mask);
+                return err;
+            };
+            prepared.abort();
+            try testing.expectEqual(@as(usize, 1), store.count("#chan"));
+            try testing.expectEqual(original_mask, store.list("#chan")[0].mask.ptr);
+            try testing.expectEqualStrings("original", store.list("#chan")[0].reason);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{});
+}
+
+test "candidate AKICK matching shares installed trim account and hostmask semantics" {
+    const Case = struct {
+        mask: []const u8,
+        hostmask: []const u8,
+        account: ?[]const u8,
+        expected: bool,
+    };
+    const cases = [_]Case{
+        .{ .mask = "  BaD!*@Example.?om ", .hostmask = "BAD!u@EXAMPLE.com", .account = null, .expected = true },
+        .{ .mask = "BaD!*@Example.?om", .hostmask = "Other!u@example.com", .account = "bad", .expected = false },
+        .{ .mask = " Account:AL?CE ", .hostmask = "other!u@elsewhere", .account = "aLiCe", .expected = true },
+        .{ .mask = "Account:*", .hostmask = "alice!u@host", .account = null, .expected = false },
+        .{ .mask = "Account:*", .hostmask = "alice!u@host", .account = "", .expected = false },
+        .{ .mask = "Account:AL?CE", .hostmask = "Alice!u@host", .account = "mallory", .expected = false },
+    };
+    for (cases) |case| {
+        const candidate = try candidateMatchesWithCloak(case.mask, case.hostmask, case.account, null);
+        try testing.expectEqual(case.expected, candidate);
+        var store = AkickStore.init(testing.allocator);
+        defer store.deinit();
+        try store.add("#chan", case.mask, "reason", "issuer", 12, null);
+        try testing.expectEqual(candidate, store.matchOnJoinWithCloak("#chan", case.hostmask, case.account, 13, null) != null);
+    }
+    try testing.expectError(error.InvalidMask, candidateMatchesWithCloak("   ", "nick!u@host", null, null));
+    try testing.expectError(error.InvalidMask, candidateMatchesWithCloak(" Account: ", "nick!u@host", "alice", null));
+}
+
+test "candidate AKICK matching preserves cloak continuity and prefix restrictions before add" {
+    const c = @import("../proto/cloak.zig");
+    const old_key = c.SecretKey.init(@splat(7));
+    const current_key = c.SecretKey.init(@splat(8));
+    var old: [253]u8 = undefined;
+    const before = try c.cloakOpaqueEpochV4(&old, &old_key, "203.0.113.9", 1, 86400, .{});
+    var mask_buf: [512]u8 = undefined;
+    const mask = try std.fmt.bufPrint(&mask_buf, " Nick!u?er@{s} ", .{before});
+    const ctx: cloak_match.Context = .{ .key = current_key, .previous_key = old_key, .suffix = "onyx", .address = "203.0.113.9" };
+    try testing.expect(try candidateMatchesWithCloak(mask, "NICK!user@current.onyx", null, ctx));
+    try testing.expect(!try candidateMatchesWithCloak(mask, "Other!user@current.onyx", null, ctx));
+    try testing.expect(!try candidateMatchesWithCloak(mask, "Nick!root@current.onyx", null, ctx));
+    try testing.expect(!try candidateMatchesWithCloak(mask, "Nick!user@current.onyx", null, null));
+    var wrong_address = ctx;
+    wrong_address.address = "203.0.113.10";
+    try testing.expect(!try candidateMatchesWithCloak(mask, "Nick!user@current.onyx", null, wrong_address));
+    var store = AkickStore.init(testing.allocator);
+    defer store.deinit();
+    try store.add("#cloak", mask, "reason", "issuer", 12, null);
+    try testing.expect(store.matchOnJoinWithCloak("#cloak", "NICK!user@current.onyx", null, 13, ctx) != null);
+    try testing.expect(store.matchOnJoinWithCloak("#cloak", "Other!user@current.onyx", null, 13, ctx) == null);
 }

@@ -8,6 +8,7 @@
 //! owners have their own joined transaction.
 
 const std = @import("std");
+const crypto_scope = @import("../media_crypto_scope.zig");
 const routing = @import("../../substrate/media_routing.zig");
 const media = @import("../media_room.zig");
 const bridge_mod = @import("../media_bridge.zig");
@@ -18,10 +19,10 @@ pub const max_wire_bytes: usize = 64 * 1024 * 1024;
 pub const max_alloc_bytes: usize = 128 * 1024 * 1024;
 pub const max_rows: usize = routing.max_graph_rows * 2;
 const magic = [4]u8{ 'H', 'X', 'M', 'G' };
-const version: u16 = 1;
+const version: u16 = 3;
 const header_len: usize = 12;
 const digest_len: usize = 32;
-const digest_domain = "onyx-windows-media-graph-checkpoint-v1";
+const digest_domain = "onyx-windows-media-graph-checkpoint-v3";
 
 pub const Error = routing.GraphError || media.SnapshotError || error{Capacity};
 
@@ -64,26 +65,20 @@ pub const Attachment = struct {
     }
 };
 
-/// Per-connection browser media binding. A bound E2EE attachment is carried
-/// only with the exact inherited socket and its newly allocated ClientId.
+/// Browser route/MAC scope only. Crypto provenance is an independent mandatory
+/// array, joined to its exact inherited socket and newly allocated ClientId.
 pub const CallBinding = struct {
     client: routing.ClientId,
     channel: [128]u8 = @splat(0),
     channel_len: u8 = 0,
     participant: [64]u8 = @splat(0),
     participant_len: u8 = 0,
-    e2ee_bound: bool = false,
-    e2ee_attachment: [16]u8 = @splat(0),
 
-    pub fn init(client: routing.ClientId, channel: []const u8, participant: []const u8, attachment: ?[16]u8) Error!CallBinding {
+    pub fn init(client: routing.ClientId, channel: []const u8, participant: []const u8) Error!CallBinding {
         if (channel.len == 0 or channel.len > 128 or participant.len == 0 or participant.len > 64) return error.InvalidSnapshot;
         var row = CallBinding{ .client = client, .channel_len = @intCast(channel.len), .participant_len = @intCast(participant.len) };
         @memcpy(row.channel[0..channel.len], channel);
         @memcpy(row.participant[0..participant.len], participant);
-        if (attachment) |value| {
-            row.e2ee_bound = true;
-            row.e2ee_attachment = value;
-        }
         try row.validate();
         return row;
     }
@@ -96,9 +91,6 @@ pub const CallBinding = struct {
     fn validate(self: *const CallBinding) Error!void {
         if (self.client.isNone() or self.channel_len == 0 or self.channel_len > self.channel.len or
             self.participant_len == 0 or self.participant_len > self.participant.len) return error.InvalidSnapshot;
-        if (!self.e2ee_bound) for (self.e2ee_attachment) |byte| {
-            if (byte != 0) return error.InvalidSnapshot;
-        };
         for (self.channelSlice()) |byte| if (byte == 0) return error.InvalidSnapshot;
         for (self.participantSlice()) |byte| if (byte == 0) return error.InvalidSnapshot;
         for (self.channel[self.channel_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
@@ -111,6 +103,17 @@ pub const BridgeRow = struct { channel: []const u8, snapshot: Bridge.Snapshot };
 /// Source fields borrow the already captured leaves. Callers hold the World
 /// cut, both paused owner tokens, the producer fence, and the bridge lock while
 /// taking those leaf snapshots. The resulting encoded bytes own their image.
+/// Dedicated signed-crypto provenance; never inferred from browser routing.
+pub const CryptoBinding = struct {
+    client: routing.ClientId,
+    scope: crypto_scope.Scope,
+    pub fn init(client: routing.ClientId, scope: crypto_scope.Scope) Error!CryptoBinding {
+        scope.validate() catch return error.InvalidSnapshot;
+        if (client.isNone() or !scope.bound) return error.InvalidSnapshot;
+        return .{ .client = client, .scope = scope };
+    }
+};
+
 pub const Source = struct {
     graph: *const routing.GraphSnapshot,
     rooms: *const media.Snapshot,
@@ -118,12 +121,13 @@ pub const Source = struct {
     clients: []const ClientSocket,
     attachments: []const Attachment,
     bindings: []const CallBinding,
+    crypto_bindings: []const CryptoBinding,
 
     pub fn validate(self: Source) Error!void {
         try self.graph.validate();
         try self.rooms.validateAgainstGraph(self.graph);
         if (self.bridges.len > media.max_snapshot_rooms or self.clients.len > max_rows or
-            self.attachments.len > max_rows or self.bindings.len > max_rows) return error.Capacity;
+            self.attachments.len > max_rows or self.bindings.len > max_rows or self.crypto_bindings.len > max_rows) return error.Capacity;
 
         for (self.clients, 0..) |row, i| {
             if (row.fd < 0 or row.source.isNone() or !graphUsesClient(self.graph, row.source)) return error.InvalidSnapshot;
@@ -170,6 +174,23 @@ pub const Source = struct {
             for (self.bindings[0..i]) |prior| if (prior.client.eql(row.client)) return error.InvalidSnapshot;
         }
 
+        for (self.crypto_bindings, 0..) |row, i| {
+            _ = try CryptoBinding.init(row.client, row.scope);
+            if (!hasClient(self.clients, row.client)) return error.IncompleteRemap;
+            var attached = false;
+            for (self.attachments) |*member| if (member.client.eql(row.client) and
+                std.ascii.eqlIgnoreCase(member.channelSlice(), row.scope.channelSlice()) and
+                std.ascii.eqlIgnoreCase(member.nickSlice(), row.scope.participantSlice()))
+            {
+                attached = true;
+                break;
+            };
+            if (!attached) return error.InvalidSnapshot;
+            for (self.crypto_bindings[0..i]) |prior| {
+                if (prior.client.eql(row.client) or prior.scope.sameTuple(&row.scope)) return error.InvalidSnapshot;
+            }
+        }
+
         for (self.bridges, 0..) |*row, i| {
             if (row.channel.len == 0 or row.channel.len > 128 or
                 graphCall(self.graph, row.channel) == null) return error.InvalidSnapshot;
@@ -197,10 +218,12 @@ pub const Snapshot = struct {
     clients: []ClientSocket,
     attachments: []Attachment,
     bindings: []CallBinding,
+    crypto_bindings: []CryptoBinding,
 
     pub fn deinit(self: *Snapshot) void {
         for (self.bridges) |row| self.allocator.free(row.channel);
         freeBindings(self.allocator, self.bindings);
+        freeCryptoBindings(self.allocator, self.crypto_bindings);
         self.allocator.free(self.attachments);
         self.allocator.free(self.clients);
         self.allocator.free(self.bridges);
@@ -209,7 +232,7 @@ pub const Snapshot = struct {
         self.* = undefined;
     }
     pub fn validate(self: *const Snapshot) Error!void {
-        try (Source{ .graph = &self.graph, .rooms = &self.rooms, .bridges = self.bridges, .clients = self.clients, .attachments = self.attachments, .bindings = self.bindings }).validate();
+        try (Source{ .graph = &self.graph, .rooms = &self.rooms, .bridges = self.bridges, .clients = self.clients, .attachments = self.attachments, .bindings = self.bindings, .crypto_bindings = self.crypto_bindings }).validate();
         try validateOrder(self);
     }
     /// Construct only private candidate storage. The returned graph remains a
@@ -250,7 +273,10 @@ pub const Snapshot = struct {
         const bindings = try allocator.dupe(CallBinding, self.bindings);
         errdefer freeBindings(allocator, bindings);
         for (bindings) |*row| row.client = remapClient(remaps, row.client) orelse unreachable;
-        return .{ .allocator = allocator, .graph = graph, .rooms = rooms, .bridges = bridges, .remaps = remaps, .attachments = attachments, .bindings = bindings };
+        const crypto_bindings = try allocator.dupe(CryptoBinding, self.crypto_bindings);
+        errdefer freeCryptoBindings(allocator, crypto_bindings);
+        for (crypto_bindings) |*row| row.client = remapClient(remaps, row.client) orelse unreachable;
+        return .{ .allocator = allocator, .graph = graph, .rooms = rooms, .bridges = bridges, .remaps = remaps, .attachments = attachments, .bindings = bindings, .crypto_bindings = crypto_bindings };
     }
 };
 
@@ -262,9 +288,11 @@ pub const Prepared = struct {
     remaps: []routing.ClientRemap,
     attachments: []Attachment,
     bindings: []CallBinding,
+    crypto_bindings: []CryptoBinding,
 
     pub fn deinit(self: *Prepared) void {
         freeBindings(self.allocator, self.bindings);
+        freeCryptoBindings(self.allocator, self.crypto_bindings);
         self.allocator.free(self.attachments);
         self.allocator.free(self.remaps);
         freeBridges(self.allocator, &self.bridges);
@@ -273,6 +301,11 @@ pub const Prepared = struct {
         self.* = undefined;
     }
 };
+
+fn freeCryptoBindings(allocator: std.mem.Allocator, bindings: []CryptoBinding) void {
+    std.crypto.secureZero(u8, std.mem.sliceAsBytes(bindings));
+    allocator.free(bindings);
+}
 
 fn freeBindings(allocator: std.mem.Allocator, bindings: []CallBinding) void {
     std.crypto.secureZero(u8, std.mem.sliceAsBytes(bindings));
@@ -303,7 +336,7 @@ fn callLess(a: routing.CallId, b: routing.CallId) bool {
 fn endpointLess(a: routing.EndpointKey, b: routing.EndpointKey) bool {
     if (!std.meta.eql(a.call, b.call)) return callLess(a.call, b.call);
     if (!a.client.eql(b.client)) return clientLess(a.client, b.client);
-    return @intFromEnum(a.leg) < @intFromEnum(b.leg);
+    return @backingInt(a.leg) < @backingInt(b.leg);
 }
 fn membershipLess(a: routing.MembershipKey, b: routing.MembershipKey) bool {
     if (!std.meta.eql(a.call, b.call)) return callLess(a.call, b.call);
@@ -394,7 +427,11 @@ fn validateOrder(snapshot: *const Snapshot) Error!void {
             fn less(a: CallBinding, b: CallBinding) bool {
                 return clientLess(a.client, b.client);
             }
-        }.less)) return error.InvalidSnapshot;
+        }.less) or !sortedRows(CryptoBinding, snapshot.crypto_bindings, struct {
+        fn less(a: CryptoBinding, b: CryptoBinding) bool {
+            return clientLess(a.client, b.client);
+        }
+    }.less)) return error.InvalidSnapshot;
     inline for (.{ snapshot.rooms.breakouts, snapshot.rooms.positions, snapshot.rooms.hands, snapshot.rooms.profiles, snapshot.rooms.participant_profiles, snapshot.rooms.consents, snapshot.rooms.recordings, snapshot.rooms.qualities, snapshot.rooms.queues }) |rows| {
         const T = @typeInfo(@TypeOf(rows)).pointer.child;
         if (!sortedRows(T, rows, stringLessFn(T))) return error.InvalidSnapshot;
@@ -510,7 +547,7 @@ fn writeValue(w: *Writer, comptime T: type, value: T) void {
             const I = @Int(.unsigned, @sizeOf(T) * 8);
             w.int(I, @bitCast(value));
         },
-        .@"enum" => |e| w.int(e.tag_type, @intFromEnum(value)),
+        .@"enum" => |e| w.int(e.tag_type, @backingInt(value)),
         .optional => |o| {
             w.int(u8, @intFromBool(value != null));
             if (value) |v| writeValue(w, o.child, v);
@@ -699,10 +736,16 @@ pub fn encode(allocator: std.mem.Allocator, source: Source) Error![]u8 {
         }
     }.less);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(bindings));
-    const canonical = Source{ .graph = &graph, .rooms = &rooms, .bridges = bridges, .clients = clients, .attachments = attachments, .bindings = bindings };
+    const crypto_bindings = try sortedCopy(CryptoBinding, a, source.crypto_bindings, struct {
+        fn less(x: CryptoBinding, y: CryptoBinding) bool {
+            return clientLess(x.client, y.client);
+        }
+    }.less);
+    defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(crypto_bindings));
+    const canonical = Source{ .graph = &graph, .rooms = &rooms, .bridges = bridges, .clients = clients, .attachments = attachments, .bindings = bindings, .crypto_bindings = crypto_bindings };
     try canonical.validate();
     var body: usize = 0;
-    inline for (.{ graph, rooms, bridges, clients, attachments, bindings }) |part| body = try addSize(body, try valueSize(@TypeOf(part), part));
+    inline for (.{ graph, rooms, bridges, clients, attachments, bindings, crypto_bindings }) |part| body = try addSize(body, try valueSize(@TypeOf(part), part));
     const total = try addSize(try addSize(header_len, body), digest_len);
     if (total > max_wire_bytes or body > std.math.maxInt(u32)) return error.Capacity;
     const bytes = try allocator.alloc(u8, total);
@@ -712,7 +755,7 @@ pub fn encode(allocator: std.mem.Allocator, source: Source) Error![]u8 {
     w.int(u16, version);
     w.int(u16, 0);
     w.int(u32, @intCast(body));
-    inline for (.{ graph, rooms, bridges, clients, attachments, bindings }) |part| writeValue(&w, @TypeOf(part), part);
+    inline for (.{ graph, rooms, bridges, clients, attachments, bindings, crypto_bindings }) |part| writeValue(&w, @TypeOf(part), part);
     std.debug.assert(w.pos == total - digest_len);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(digest_domain);
@@ -738,7 +781,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Snapshot {
     if (!std.crypto.timing_safe.eql([digest_len]u8, digest, bytes[bytes.len - digest_len ..][0..digest_len].*)) return error.InvalidSnapshot;
     const body = bytes[header_len .. bytes.len - digest_len];
     var scan = Reader{ .bytes = body };
-    inline for (.{ routing.GraphSnapshot, media.Snapshot, []BridgeRow, []ClientSocket, []Attachment, []CallBinding }) |T| try scanValue(&scan, T);
+    inline for (.{ routing.GraphSnapshot, media.Snapshot, []BridgeRow, []ClientSocket, []Attachment, []CallBinding, []CryptoBinding }) |T| try scanValue(&scan, T);
     if (scan.pos != body.len) return error.InvalidSnapshot;
     var r = Reader{ .bytes = body };
     var graph = try readValue(&r, allocator, routing.GraphSnapshot);
@@ -753,8 +796,10 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Snapshot {
     errdefer allocator.free(attachments);
     const bindings = try readValue(&r, allocator, []CallBinding);
     errdefer freeBindings(allocator, bindings);
+    const crypto_bindings = try readValue(&r, allocator, []CryptoBinding);
+    errdefer freeCryptoBindings(allocator, crypto_bindings);
     if (r.pos != body.len) return error.InvalidSnapshot;
-    const result = Snapshot{ .allocator = allocator, .graph = graph, .rooms = rooms, .bridges = bridges, .clients = clients, .attachments = attachments, .bindings = bindings };
+    const result = Snapshot{ .allocator = allocator, .graph = graph, .rooms = rooms, .bridges = bridges, .clients = clients, .attachments = attachments, .bindings = bindings, .crypto_bindings = crypto_bindings };
     try result.validate();
     return result;
 }
@@ -767,6 +812,7 @@ const TestFixture = struct {
     clients: [1]ClientSocket,
     attachments: [1]Attachment,
     bindings: [1]CallBinding,
+    crypto_bindings: [1]CryptoBinding,
 
     fn init() !TestFixture {
         const arena = try std.testing.allocator.create(std.heap.ArenaAllocator);
@@ -829,7 +875,8 @@ const TestFixture = struct {
             .bridge_rows = .{.{ .channel = "#media", .snapshot = try bridge.capture() }},
             .clients = .{.{ .source = old, .fd = 42 }},
             .attachments = .{try Attachment.init(old, "#media", "alice", 1)},
-            .bindings = .{try CallBinding.init(old, "#media", "alice", @as([16]u8, @splat(0x5a)))},
+            .bindings = .{try CallBinding.init(old, "#media", "alice")},
+            .crypto_bindings = .{try CryptoBinding.init(old, try crypto_scope.Scope.init("#media", "alice", @splat(0x5a)))},
         };
     }
     fn deinit(self: *TestFixture) void {
@@ -837,7 +884,7 @@ const TestFixture = struct {
         std.testing.allocator.destroy(self.arena);
     }
     fn source(self: *const TestFixture) Source {
-        return .{ .graph = &self.graph, .rooms = &self.rooms, .bridges = &self.bridge_rows, .clients = &self.clients, .attachments = &self.attachments, .bindings = &self.bindings };
+        return .{ .graph = &self.graph, .rooms = &self.rooms, .bridges = &self.bridge_rows, .clients = &self.clients, .attachments = &self.attachments, .bindings = &self.bindings, .crypto_bindings = &self.crypto_bindings };
     }
 };
 
@@ -851,8 +898,8 @@ test "media graph checkpoint owns exact socket roster room bridge and E2EE bindi
     try std.testing.expectEqual(@as(usize, 1), decoded.graph.memberships.len);
     try std.testing.expectEqual(@as(usize, 1), decoded.bridges.len);
     try std.testing.expectEqual(@as(i32, 42), decoded.clients[0].fd);
-    try std.testing.expect(decoded.bindings[0].e2ee_bound);
-    try std.testing.expectEqual(@as(u8, 0x5a), decoded.bindings[0].e2ee_attachment[0]);
+    try std.testing.expect(decoded.crypto_bindings[0].scope.bound);
+    try std.testing.expectEqual(@as(u8, 0x5a), decoded.crypto_bindings[0].scope.attachment[0]);
     const target: routing.ClientId = .{ .shard = 2, .slot = 3, .gen = 4 };
     var candidate = try decoded.prepare(std.testing.allocator, &.{.{ .fd = 42, .target = target }});
     defer candidate.deinit();
@@ -903,7 +950,286 @@ fn mediaGraphAllocationSweep(allocator: std.mem.Allocator) !void {
     var candidate = try decoded.prepare(allocator, &.{.{ .fd = 42, .target = .{ .shard = 2, .slot = 3, .gen = 4 } }});
     defer candidate.deinit();
     try std.testing.expect(candidate.bridges.contains("#media"));
+    try std.testing.expect(candidate.crypto_bindings[0].scope.matches("#media", "alice", @splat(0x5a)));
+    try std.testing.expect(decoded.crypto_bindings[0].client.eql(fixture.crypto_bindings[0].client));
+    try std.testing.expect(candidate.crypto_bindings[0].client.eql(.{ .shard = 2, .slot = 3, .gen = 4 }));
 }
 test "media graph checkpoint allocation failure leaves detached decode and prepare atomic" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, mediaGraphAllocationSweep, .{});
+}
+
+test "media graph checkpoint v3 independently binds crypto and rejects missing or legacy provenance" {
+    const a = std.testing.allocator;
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const wire = try encode(a, fixture.source());
+    defer freeEncoded(a, wire);
+    var decoded = try decode(a, wire);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.bindings.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded.crypto_bindings.len);
+    // Browser route may be absent for an otherwise exact native crypto member.
+    var native_only = fixture.source();
+    native_only.bindings = &.{};
+    const native_wire = try encode(a, native_only);
+    defer freeEncoded(a, native_wire);
+    var native_decoded = try decode(a, native_wire);
+    defer native_decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), native_decoded.bindings.len);
+    try std.testing.expectEqual(@as(usize, 1), native_decoded.crypto_bindings.len);
+    var wrong = fixture.crypto_bindings;
+    wrong[0].scope = try crypto_scope.Scope.init("#other", "alice", @splat(0x5a));
+    var invalid = fixture.source();
+    invalid.crypto_bindings = &wrong;
+    try std.testing.expectError(error.InvalidSnapshot, invalid.validate());
+    wrong[0].scope = try crypto_scope.Scope.init("#media", "other", @splat(0x5a));
+    try std.testing.expectError(error.InvalidSnapshot, invalid.validate());
+    wrong[0] = fixture.crypto_bindings[0];
+    wrong[0].scope.attachment = @splat(0);
+    try std.testing.expectError(error.InvalidSnapshot, invalid.validate());
+    wrong[0] = fixture.crypto_bindings[0];
+    wrong[0].scope.bound = false;
+    try std.testing.expectError(error.InvalidSnapshot, invalid.validate());
+    const legacy = try a.dupe(u8, wire);
+    defer a.free(legacy);
+    std.mem.writeInt(u16, legacy[4..6], 1, .little);
+    try std.testing.expectError(error.InvalidSnapshot, decode(a, legacy));
+    std.mem.writeInt(u16, legacy[4..6], 2, .little);
+    try std.testing.expectError(error.InvalidSnapshot, decode(a, legacy));
+    // Truncating the required body cannot be an empty-array default.
+    try std.testing.expectError(error.InvalidSnapshot, decode(a, wire[0 .. wire.len - 1]));
+    const target: routing.ClientId = .{ .shard = 1, .slot = 7, .gen = 8 };
+    var staged = try native_decoded.prepare(a, &.{.{ .fd = 42, .target = target }});
+    defer staged.deinit();
+    try std.testing.expect(staged.crypto_bindings[0].client.eql(target));
+    try std.testing.expect(staged.crypto_bindings[0].scope.matches("#media", "alice", @splat(0x5a)));
+}
+
+test "media graph checkpoint rejects uncarried legacy physical owners instead of inferring protected membership" {
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const original = try encode(std.testing.allocator, fixture.source());
+    defer freeEncoded(std.testing.allocator, original);
+    // Room-only/flat display compatibility does not relax hot physical-roster
+    // provenance. A paid legacy credit is not a Domain member or socket proof.
+    const other: routing.ClientId = .{ .shard = 0, .slot = 8, .gen = 4 };
+    const extra = [_]Attachment{ fixture.attachments[0], try Attachment.init(other, "#media", "alice", 1) };
+    var unsupported = fixture.source();
+    unsupported.attachments = &extra;
+    try std.testing.expectError(error.IncompleteRemap, unsupported.validate());
+    const same_client = [_]Attachment{ fixture.attachments[0], try Attachment.init(fixture.clients[0].source, "#legacy-only", "alice", 1) };
+    unsupported.attachments = &same_client;
+    try std.testing.expectError(error.InvalidSnapshot, encode(std.testing.allocator, unsupported));
+    const after = try encode(std.testing.allocator, fixture.source());
+    defer freeEncoded(std.testing.allocator, after);
+    try std.testing.expectEqualSlices(u8, original, after);
+}
+
+const TwinCryptoFixture = struct {
+    base: TestFixture,
+    clients: [2]ClientSocket,
+    attachments: [2]Attachment,
+    crypto: [2]CryptoBinding,
+
+    fn init() !TwinCryptoFixture {
+        var base = try TestFixture.init();
+        errdefer base.deinit();
+        const a = base.arena.allocator();
+        const second: routing.ClientId = .{ .shard = 0, .slot = 8, .gen = 4 };
+        const members = try a.alloc(routing.GraphMembership, 2);
+        members[0] = base.graph.memberships[0];
+        members[1] = members[0];
+        members[1].key.client = second;
+        base.graph.memberships = members;
+        base.graph.calls[0].row.memberships = 2;
+        const physical = try a.alloc(media.PhysicalMemberRow, 2);
+        physical[0] = base.rooms.physical_members[0];
+        physical[1] = physical[0];
+        physical[1].key.client = second;
+        base.rooms.physical_members = physical;
+        return .{
+            .base = base,
+            .clients = .{ base.clients[0], .{ .source = second, .fd = 43 } },
+            .attachments = .{ base.attachments[0], try Attachment.init(second, "#media", "alice", 1) },
+            .crypto = .{ base.crypto_bindings[0], try CryptoBinding.init(second, try crypto_scope.Scope.init("#MEDIA", "ALICE", @splat(0x6B))) },
+        };
+    }
+    fn source(self: *const TwinCryptoFixture) Source {
+        var result = self.base.source();
+        result.clients = &self.clients;
+        result.attachments = &self.attachments;
+        result.crypto_bindings = &self.crypto;
+        return result;
+    }
+    fn deinit(self: *TwinCryptoFixture) void {
+        self.base.deinit();
+    }
+};
+
+/// Mutate a real valid HXMG2 object using its actual structural codec, then
+/// recompute its integrity digest. This reaches semantic duplicate rejection;
+/// it is not a checksum/truncation failure or guessed raw-pattern replacement.
+fn duplicateTupleWireForTest(allocator: std.mem.Allocator, fixture: *const TwinCryptoFixture) ![]u8 {
+    const wire = try encode(allocator, fixture.source());
+    errdefer freeEncoded(allocator, wire);
+    var reader = Reader{ .bytes = wire[header_len .. wire.len - digest_len] };
+    inline for (.{ routing.GraphSnapshot, media.Snapshot, []BridgeRow, []ClientSocket, []Attachment, []CallBinding }) |T| try scanValue(&reader, T);
+    try std.testing.expectEqual(@as(u32, 2), try reader.int(u32));
+    try scanValue(&reader, CryptoBinding);
+    const second = fixture.crypto[1];
+    const offset = header_len + reader.pos +
+        try valueSize(@TypeOf(second.client), second.client) +
+        try valueSize(@TypeOf(second.scope.channel), second.scope.channel) +
+        try valueSize(@TypeOf(second.scope.participant), second.scope.participant);
+    @memcpy(wire[offset..][0..16], &fixture.crypto[0].scope.attachment);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(digest_domain);
+    hash.update(wire[0 .. wire.len - digest_len]);
+    var digest: [digest_len]u8 = undefined;
+    hash.final(&digest);
+    @memcpy(wire[wire.len - digest_len ..], &digest);
+    return wire;
+}
+
+test "media graph checkpoint rejects canonical duplicate crypto tuples across distinct physical clients" {
+    const a = std.testing.allocator;
+    var fixture = try TwinCryptoFixture.init();
+    defer fixture.deinit();
+    const valid_wire = try encode(a, fixture.source());
+    defer freeEncoded(a, valid_wire);
+    var decoded = try decode(a, valid_wire);
+    defer decoded.deinit();
+    try std.testing.expect(!decoded.crypto_bindings[0].client.eql(decoded.crypto_bindings[1].client));
+    const targets = [_]AdoptedClient{
+        .{ .fd = 42, .target = .{ .shard = 1, .slot = 7, .gen = 9 } },
+        .{ .fd = 43, .target = .{ .shard = 1, .slot = 8, .gen = 9 } },
+    };
+    var valid_target = try decoded.prepare(a, &targets);
+    defer valid_target.deinit();
+    try std.testing.expectEqual(@as(usize, 2), valid_target.crypto_bindings.len);
+    try std.testing.expect(valid_target.crypto_bindings[0].client.eql(targets[0].target));
+    try std.testing.expect(valid_target.crypto_bindings[1].client.eql(targets[1].target));
+    try std.testing.expect(!valid_target.crypto_bindings[0].scope.sameTuple(&valid_target.crypto_bindings[1].scope));
+    const malformed = try duplicateTupleWireForTest(a, &fixture);
+    defer freeEncoded(a, malformed);
+    try std.testing.expectError(error.InvalidSnapshot, decode(a, malformed));
+    // Capture and prepare reject the same collision, even when the tuple's
+    // channel/participant spelling differs only in case. No target allocation
+    // or partially remapped crypto authority can escape this boundary.
+    const original_aid = fixture.crypto[1].scope.attachment;
+    fixture.crypto[1].scope.attachment = fixture.crypto[0].scope.attachment;
+    try std.testing.expectError(error.InvalidSnapshot, fixture.source().validate());
+    try std.testing.expectError(error.InvalidSnapshot, encode(a, fixture.source()));
+    fixture.crypto[1].scope.attachment = original_aid;
+    decoded.crypto_bindings[1].scope.attachment = decoded.crypto_bindings[0].scope.attachment;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.InvalidSnapshot, decoded.prepare(failing.allocator(), &targets));
+    try std.testing.expect(!failing.has_induced_failure);
+    const after = try encode(a, fixture.source());
+    defer freeEncoded(a, after);
+    try std.testing.expectEqualSlices(u8, valid_wire, after);
+}
+
+fn duplicateTupleDecodeOom(allocator: std.mem.Allocator) !void {
+    var fixture = try TwinCryptoFixture.init();
+    defer fixture.deinit();
+    const wire = try duplicateTupleWireForTest(std.testing.allocator, &fixture);
+    defer freeEncoded(std.testing.allocator, wire);
+    if (decode(allocator, wire)) |accepted| {
+        var unexpected = accepted;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.InvalidSnapshot => return,
+        else => return err,
+    }
+}
+
+test "media graph checkpoint duplicate tuple rejection allocation cuts retain no detached authority" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, duplicateTupleDecodeOom, .{});
+}
+
+test "media graph v3 carries bounded feedback windows without resetting them" {
+    const client: routing.ClientId = .{ .shard = 0, .slot = 7, .gen = 3 };
+    const call: routing.CallId = .{ .domain = .{ .serial = 11 }, .serial = 1 };
+    const endpoint: routing.EndpointId = .{ .call = call, .serial = 1, .leg = .native };
+    const row: routing.EndpointEntry = .{
+        .observation = .{
+            .reference = .{ .endpoint = endpoint, .offering_client = client, .bridge_policy_revision = 1 },
+            .stamp = .{ .endpoint = endpoint, .offering_client = client, .binding_revision = 1, .security_revision = 1 },
+            .stream_id = 1,
+            .mode = .legacy_group,
+        },
+        .feedback_source = .{ .started_ms = 1234, .used = 1 },
+        .feedback_publisher = .{ .started_ms = 1234, .used = 3 },
+        .nack_source = .{ .started_ms = 1250, .used = 64 },
+        .nack_publisher = .{ .started_ms = 1250, .used = 500 },
+    };
+    var bytes: [512]u8 = undefined;
+    const size = try valueSize(routing.EndpointEntry, row);
+    try std.testing.expect(size <= bytes.len);
+    var writer: Writer = .{ .bytes = bytes[0..size] };
+    writeValue(&writer, routing.EndpointEntry, row);
+    try std.testing.expectEqual(size, writer.pos);
+    var reader: Reader = .{ .bytes = bytes[0..size] };
+    const decoded = try readValue(&reader, std.testing.allocator, routing.EndpointEntry);
+    try std.testing.expectEqualDeep(row, decoded);
+    try std.testing.expectEqual(size, reader.pos);
+    var truncated: Reader = .{ .bytes = bytes[0 .. size - 1] };
+    try std.testing.expectError(error.InvalidSnapshot, readValue(&truncated, std.testing.allocator, routing.EndpointEntry));
+}
+
+test "media graph full checkpoint remap and restore retain live feedback budgets" {
+    var fixture = try TestFixture.init();
+    defer fixture.deinit();
+    const a = fixture.arena.allocator();
+    const original = fixture.clients[0].source;
+    const call = fixture.graph.calls[0].row.id;
+    const endpoint: routing.EndpointId = .{ .call = call, .serial = 1, .leg = .native };
+    const key: routing.EndpointKey = .{ .call = call, .client = original, .leg = .native };
+    const endpoints = try a.alloc(routing.GraphEndpoint, 1);
+    endpoints[0] = .{
+        .key = key,
+        .row = .{
+            .observation = .{
+                .reference = .{ .endpoint = endpoint, .offering_client = original, .bridge_policy_revision = 1 },
+                .stamp = .{ .endpoint = endpoint, .offering_client = original, .binding_revision = 1, .security_revision = 1 },
+                .stream_id = 1,
+                .mode = .legacy_group,
+            },
+            .feedback_source = .{ .started_ms = 1000, .used = 1 },
+            .feedback_publisher = .{ .started_ms = 1000, .used = 3 },
+            .nack_source = .{ .started_ms = 1000, .used = 64 },
+            .nack_publisher = .{ .started_ms = 1000, .used = 400 },
+        },
+    };
+    fixture.graph.calls[0].row.offers = 1;
+    fixture.graph.next_endpoint = 2;
+    fixture.graph.next_stream = 2;
+    fixture.graph.endpoints = endpoints;
+    const profiles = try a.alloc(media.PhysicalProfileRow, 1);
+    var profile: media.CallProfile = .{ .codecs = @splat(.{ .tag = .cadencevox, .clock_rate = 0, .params = 0 }), .codec_count = 1 };
+    profile.codecs[0].clock_rate = 48000;
+    profiles[0] = .{ .key = key, .profile = profile };
+    fixture.rooms.physical_profiles = profiles;
+    const wire = try encode(std.testing.allocator, fixture.source());
+    defer freeEncoded(std.testing.allocator, wire);
+    var decoded = try decode(std.testing.allocator, wire);
+    defer decoded.deinit();
+    const target: routing.ClientId = .{ .shard = 1, .slot = 8, .gen = 4 };
+    var staged = try decoded.prepare(std.testing.allocator, &.{.{ .fd = 42, .target = target }});
+    defer staged.deinit();
+    var native_owner = native.NativeMediaTransport.init(std.testing.allocator);
+    defer native_owner.deinit();
+    var plane = try @import("../media_plane.zig").MediaPlane.initFallible(std.testing.allocator);
+    defer plane.deinit();
+    var prepared = try routing.prepareGraphRestore(std.testing.allocator, &staged.graph, &native_owner, &plane);
+    const restored = prepared.publish();
+    prepared.deinit();
+    defer routing.TestFeedbackClock.retire(restored, call, target) catch @panic("restored pressure fixture leaked graph");
+    const actual = try routing.TestFeedbackClock.read(restored.domain, .{ .call = call, .client = target, .leg = .native });
+    try std.testing.expectEqual(@as(u16, 1), actual.source_keyframe);
+    try std.testing.expectEqual(@as(u16, 3), actual.publisher_keyframe);
+    try std.testing.expectEqual(@as(u16, 64), actual.source_nack);
+    try std.testing.expectEqual(@as(u16, 400), actual.publisher_nack);
 }

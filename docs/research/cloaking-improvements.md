@@ -1,5 +1,8 @@
 # Onyx Server Host-Cloaking — Prioritized Improvement Brief
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Research brief · 2026-07-11 · analyst: deep-researcher · scope: `src/proto/cloak.zig`,
 key derivation in `src/main.zig`, `applyVisibleHost`/`prevKeyCloakHost` in
 `src/daemon/server.zig`, the Guise vHost system (`src/daemon/guise.zig`,

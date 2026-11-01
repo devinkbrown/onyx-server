@@ -139,7 +139,7 @@ pub fn encodeClaim(
     errdefer allocator.free(wire);
     var writer = Writer{ .bytes = wire };
     writer.writeBytes(&claim_magic);
-    writer.writeByte(@intFromEnum(claim.kind));
+    writer.writeByte(@backingInt(claim.kind));
     writer.writeByte(@intCast(claim.account.len));
     writer.writeBytes(claim.account);
     writer.writeBytes(&claim.group_token);

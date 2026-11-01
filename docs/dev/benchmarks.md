@@ -1,4 +1,7 @@
 # Benchmarks — how to run and interpret `zig build bench`
+
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
 *Developer guide for the 0.7 measurement harness (`src/substrate/bench.zig`), release plan P0-1. Reconciled 2026-09-06.*
 
 Before this harness, no performance claim about Onyx Server was falsifiable. That historical
@@ -193,3 +196,33 @@ tools/bench.sh -o docs/audit/bench-baseline-<version>.md
 Do it on an idle machine with a known governor, and check the two runs agree before
 committing the artifact. The output block carries its own provenance table, so a future reader
 can tell whether their machine is comparable.
+
+
+### Signed inventory duplicate work — 2026-10-30 private measurement
+
+A reviewed private benchmark measured the actual `Store.applySignedOffer` and
+`applySignedOfferMemoized` paths in ReleaseFast. The memo implementation matches
+integrated source manifest `2c2432ce`; benchmark-only build/source manifest is
+`ec1a5e22`. Nine cases produced36 timing rows: three samples for each working
+set, with256 warm cyclic rounds per sample. Actual production memo counters
+verified every hit or signature check, and both paths produced byte-identical
+Store checkpoints.
+
+| Working set | Median ordinary ns/call | Median memo ns/call | Median paired ordinary/memo ratio |
+| --- | ---: | ---: | ---: |
+| 1 | 109160.8 | 3764.0 | 28.921 |
+| 4 | 109926.6 | 3898.0 | 28.201 |
+| 8 | 109320.4 | 109954.1 | 0.996 |
+
+The four-slot memo eliminates repeated signature checks for the fitting sets.
+The cyclic eight-offer set thrashes it and shows essentially no benefit. This
+is direct leaf work under fixed valid logical time, with a real monotonic
+execution timer. The ordinary arm always runs first on a shared host. Ordinary
+signature counts are source expectations, not instrumented observations. These
+numbers do not establish daemon, network, contention, or mesh capacity. The
+benchmark target remains private pending the next source integration batch.
+
+Source, complete rows and verified counts are retained in
+`.zig-cache/wave-123/session-memo-bench-v2.json` and
+`.zig-cache/wave-123/session-memo-bench-verification-v2.json`. The earlier failed
+build-argument API probe is preserved separately; it produced no measurements.

@@ -1,5 +1,8 @@
 # Full record review — 2026-10-02
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 User direction: continue the full OpenBSD port, use Astra to analyze it, no
 bandaids, and review the entire record. The full roadmap objective remains open.
 No deployment, publication or push is authorized by this review.

@@ -41,6 +41,7 @@ IPv4  a.b.c.d      -> <f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.onyx
 IPv6  2001:db8::1  -> <f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.onyx
 opaque             -> <32 hex>.opq.onyx          (v3; 128 bits)
 opaque + epoch     -> <32 hex epoch>.opq.onyx    (anon auth-split; see below)
+opaque v4 + epoch  -> <32 hex>.e<epoch>.c<seconds>.opq4.onyx
 account            -> kain.users.onyx
 ```
 
@@ -94,21 +95,26 @@ recomputed by `applyVisibleHost`. An unusable account label (or a logged-out
 client) falls through to the IP cloak. Loopback (`127.x` / `::1`) always stays
 the conventional `localhost`.
 
+Canonical account names that already fit one DNS label retain that form.
+Names requiring lossy sanitization or truncation instead use
+`<friendly>.<128-bit account digest>.users.<suffix>`. The extra label prevents
+distinct permitted names such as `alice_foo`, `alice.foo`, and `alice-foo` from
+sharing a host and inheriting each other's host-based permissions. Self-claimed
+personas use the same identity encoding for ownership checks. Old ambiguous
+account masks cannot safely be guessed into grants for a new encoded identity.
+
 ## Anonymous auth-split cloak (epoch-rotating)
 
-When `[cloak] anon_epoch_secs` is non-zero (default `86400` = 24 h), the cloak
+When `[cloak] anon_epoch_secs` is non-zero (default `1209600` = 14 days), the cloak
 engine **splits on authentication state**. An **unauthenticated** client
-(`session.account() == null`) is cloaked with `cloakOpaqueEpochV3`: a single
-**128-bit** token over the full address **plus the current epoch counter**,
-then the `opq` marker and suffix (`<f(epoch)>.opq.<suffix>`, 32 hex digits).
-The epoch is folded into the HMAC (`token128Epoch` →
-`HMAC-SHA256(key, domain || data || epoch_be64)`, domain tags `ip4/v3/opqe|` /
-`ip6/v3/opqe|`). A v2 64-bit epoch token of the same address never equals the
-v3 token. Two consequences:
+(`session.account() == null`) is cloaked with `cloakOpaqueEpochV4`:
+`<32 hex>.e<epoch hex>.c<cadence hex>.opq4.<suffix>`. The **128-bit** token
+comes from HMAC-SHA256 over a distinct v4 domain, canonical binary address and
+family, epoch, cadence, and normalized suffix. IPv4-mapped IPv6 and the
+equivalent native IPv4 address produce the same identity. Two consequences:
 
-- the same address is **unlinkable across epochs** (each rollover yields a fresh,
-  unrelatable token), retiring the forever-linkability of a static-IP anonymous
-  user;
+- the same address has a fresh keyed token across epochs; public provenance
+  labels expose the period and epoch, not the address;
 - the opaque single-token form leaks **no subnet co-membership** and no geo.
 
 The epoch is `floor(wall_clock_seconds / anon_epoch_secs)`, computed by
@@ -118,6 +124,44 @@ A connection that stays up across the boundary is recomputed on the maintenance
 tick: local channels get CHGHOST, and peers get a fresh membership plus guest
 presence so the new host is the one the rest of the mesh shows. A persona or an
 account cloak is not rotated.
+
+The period is aligned to the Unix epoch, not to the date a client connects.
+Explicit existing `anon_epoch_secs = 86400` settings remain daily until changed;
+changing the default alone does not update a deployed configuration.
+
+### Automatic policy continuity
+
+New v4 masks carry their own provenance. On a normal visible-host miss, the
+policy matcher derives the candidate's cloak under the rule's original epoch
+and cadence, using the trusted address already held by the daemon. This is
+allocation-free and performs at most one derivation per configured current or
+previous key. It does not retain an unbounded address history, scan epochs, or
+rewrite policy stores every time a host changes.
+
+Channel bans, exemptions, invite exceptions, quiets, IRCX ACCESS, SACCESS,
+AKICK, and WARD use this context. Original nick and ident restrictions, rule
+precedence, expiry, issuer, and deletion semantics remain intact. A wildcard in
+the token can retain historical semantics when the epoch and cadence labels
+are literal. A wildcard over those labels remains ordinary visible-host glob
+matching; it does not authorize an unbounded epoch search.
+
+Remote speech matching uses a matching secured oper-info roster entry bound to
+the exact origin node, prefix, and account. Peers without the required private
+roster information cannot provide historical matching through this seam.
+No extra address data is sent to ordinary clients by this mechanism.
+
+Continuity requires the relevant key and suffix. Older unlabeled v2/v3 opaque
+tokens do not encode their cadence or epoch and cannot be reconstructed
+indefinitely. Existing WARD compatibility checks are a bounded grace mechanism,
+not a migration guarantee for arbitrary old masks. Audit legacy rules before a
+release that changes public format or the configured cadence.
+
+Address rules remain tied to an address; they cannot identify an anonymous
+person who moves to an unrelated IP. Authenticated account rules follow the
+account across addresses. Account/persona host matching retains its own scope.
+Historical moderation matching also means rotation does not promise anonymity
+from authorized moderation or erase correlation through a nick or an observed
+CHGHOST.
 
 If cloaking fails while a key is configured, the visible host is
 `hidden.opq.<suffix>`. It is never the raw address and never a reverse name.
@@ -132,12 +176,11 @@ other users see.
 **Logged-in clients are unaffected.** The auth-split branch in `applyVisibleHost`
 fires only when `account() == null`; an authenticated client falls through to its stable,
 moderatable account/hierarchical cloak and keeps subnet-bannability. The
-trade-off is deliberate: moderation of anonymous abuse shifts to **account bans +
-registration friction**, which these opaque, unlinkable cloaks are designed to
-require. Set `anon_epoch_secs = 0` to disable rotation and keep anonymous clients
+trade-off is deliberate: moderation across unrelated addresses still requires
+**account bans + registration friction**. Set `anon_epoch_secs = 0` to disable rotation and keep anonymous clients
 on the stable hierarchical cloak (pre-2026-07 behavior). Because
-`anon_epoch_secs` defaults to 24 h, anonymous clients switch from the
-hierarchical `.ip` cloak to the opaque `.opq` epoch cloak on upgrade unless the
+`anon_epoch_secs` defaults to 14 days, anonymous clients switch from the
+hierarchical `.ip` cloak to the opaque `.opq4` epoch cloak on upgrade unless the
 operator sets it to `0`.
 
 ## Rotatable cloak key
@@ -156,6 +199,11 @@ restarts and identical mesh-wide. With no secret, the daemon generates a random
 per-boot key so privacy is on by default. `[cloak] previous_secret` derives a
 second key (through the same argon2id path) kept live for **ban continuity across
 a rotation**.
+
+A failure deriving an explicitly configured current or previous key aborts
+startup. It must not silently replace the requested key with a random one or
+discard the requested grace key. Empty or whitespace-only configured secrets
+and invalid public suffixes are rejected during configuration parsing.
 
 **One-time reshuffle on upgrade.** This argon2id KDF replaced the prior
 `SHA256(secret)` derivation, so on the first boot after that upgrade every
@@ -221,7 +269,7 @@ Numerics are defined in [src/proto/numeric.zig](../../src/proto/numeric.zig).
 | Numeric | Meaning | Local user WHOIS | Remote (mesh) user WHOIS |
 | --- | --- | --- | --- |
 | `338` `RPL_WHOISACTUALLY` | real host / IP | Oper or self | Oper requester + field propagated (secured leg) |
-| `320` `RPL_WHOISSPECIAL` | Literal address and rDNS, GeoIP/ASN, oper/self `ban cloak`, and +R/+g message-restriction hints | Address, rDNS, and `ban cloak`: oper or self. +R/+g hints: any requester | Address, rDNS, geo, and `ban cloak`: oper requester when the real IP propagated (geo and the ban cloak are computed locally). +R/+g hints are local-user only |
+| `320` `RPL_WHOISSPECIAL` | rDNS and GeoIP/ASN (the literal address itself is on `338` only, never repeated here), oper/self `ban cloak`, and +R/+g message-restriction hints | rDNS, geo, and `ban cloak`: oper or self. +R/+g hints: any requester | rDNS, geo, and `ban cloak`: oper requester when the real IP propagated (geo and the ban cloak are computed locally). +R/+g hints are local-user only |
 | `276` `RPL_WHOISCERTFP` | TLS client-cert fingerprint | Any requester (it is the value SASL EXTERNAL matches) | Oper requester + certfp propagated |
 
 Note the asymmetry: locally, `276` is not oper-gated (a client's certfp is not
@@ -244,7 +292,16 @@ wired in [src/main.zig](../../src/main.zig).
 | `suffix` | string | `onyx` | Network-identifying tail: IP cloaks end in `.ip.<suffix>` / `.ip6.<suffix>`; hostname/account cloaks embed it. |
 | `mode` | string | `hierarchical` | `hierarchical` = subnet-bannable tokens + `a<asn>.<cc>` labels; `opaque` = one 128-bit token, no subnet/geo leak, not subnet-bannable. |
 | `account_cloak` | bool | `false` | Logged-in clients show the key-free `<account>.users.<suffix>`. Explicit VHOST personas still override. |
-| `anon_epoch_secs` | integer (seconds) | `86400` | Anonymous auth-split cadence. Non-zero → unauthenticated clients get the 128-bit epoch cloak, including clients that stay connected across the boundary. `0` keeps the stable hierarchical cloak. |
+| `anon_epoch_secs` | integer (seconds) | `1209600` | Anonymous auth-split cadence (14 days). Non-zero → unauthenticated clients get the provenance-bearing 128-bit epoch cloak, including clients that stay connected across the boundary. `0` keeps the stable cloak. Explicit daily settings must be updated separately. |
+
+Configured values must have the listed parser types. A malformed value is
+rejected rather than treated as absent; an invalid secret therefore cannot
+silently select a random per-boot key. Resolved `mode` accepts only `opaque`
+or `hierarchical`. Missing environment/file references fail with a fixed field
+name, without printing the configured value or private reference. Allocation
+failure remains a separate error. Omitted settings retain their documented
+defaults. The TOML parser represents bare date/time atoms as strings; this
+validation follows those parser types rather than enforcing lexical TOML types.
 
 **Mesh requirement.** Every mesh node MUST share one `[cloak] secret`. On a
 meshed node with no shared secret, each node derives its own random per-boot key,
@@ -255,3 +312,19 @@ WARD bans neither federate across the mesh nor survive a restart.
 when the node is meshed (`[mesh] connect` set **or** `[listen] s2s` set) and
 `[cloak] secret` is null, and `main.zig` refuses to boot
 ([src/main.zig:192](../../src/main.zig)).
+
+
+## Public history and operator comparison
+
+WHOWAS records the explicit visible host at nick change or departure, retaining
+that historical public identity through later cloak rotations. Invalid or absent
+visible storage uses a generic host and cannot fall back to the real address.
+Account numerics retain their existing public-account meaning. Existing history
+is local and is not currently transferred through process exec; older running
+images retain their own behavior until upgraded.
+
+For planned changes, operators can compare locally available configuration with
+`onyx-server doctor <config> --peer-config <peer-config> [--json]`. The
+[comparison guide](../ops/doctor-cloak-comparison-2026-10-27.md) explains the fixed
+categories and their scope. Results describe those resolved configurations;
+runtime observations remain unknown until separately measured.

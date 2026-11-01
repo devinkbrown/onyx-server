@@ -313,7 +313,7 @@ pub fn readRtpExtension(data: []const u8) Error!u16 {
 pub fn encodeRunLengthChunk(status: Status, run_length: u16) Error!u16 {
     if (status == .reserved) return Error.ReservedStatusSymbol;
     if (run_length == 0 or run_length > max_run_length) return Error.RunLengthTooLarge;
-    return (@as(u16, @intFromEnum(status)) << 13) | run_length;
+    return (@as(u16, @backingInt(status)) << 13) | run_length;
 }
 
 pub fn encodeOneBitStatusVector(statuses: []const Status) Error!u16 {
@@ -335,7 +335,7 @@ pub fn encodeTwoBitStatusVector(statuses: []const Status) Error!u16 {
     for (statuses, 0..) |status, i| {
         if (status == .reserved) return Error.ReservedStatusSymbol;
         const shift: u4 = @intCast(12 - i * 2);
-        chunk |= @as(u16, @intFromEnum(status)) << shift;
+        chunk |= @as(u16, @backingInt(status)) << shift;
     }
     return chunk;
 }

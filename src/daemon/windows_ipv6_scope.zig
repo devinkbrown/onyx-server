@@ -68,7 +68,7 @@ pub fn resolveZone(zone: []const u8) error{InvalidAddress}!u32 {
         var index: win.windows.NET.IFINDEX = undefined;
         if (win.ConvertInterfaceLuidToIndex(&luid, &index) != 0)
             return error.InvalidAddress;
-        const scope_id = @intFromEnum(index);
+        const scope_id = @backingInt(index);
         if (scope_id == 0) return error.InvalidAddress;
         return scope_id;
     } else return error.InvalidAddress;

@@ -20,6 +20,75 @@ pub const DeriveError = error{ NullSessionToken, NullAttachmentId, ZeroAttachmen
 pub const ParseError = error{InvalidDropTarget};
 pub const DropTarget = union(enum) { ordinal: usize, sid: Sid };
 
+/// LIST and DROP currently address this node's physical attachments only.
+/// Neither an unrecognized subcommand nor an extra scope/selector may silently
+/// turn into LIST or a partially applied DROP. RESUME credentials are borrowed
+/// unchanged: their canonical syntax and authority belong to the resume path.
+pub const Command = union(enum) {
+    list,
+    mesh_list: ?Sid,
+    revoke_group: Sid,
+    token,
+    resume_credential: []const u8,
+    drop: DropTarget,
+};
+
+pub const CommandError = ParseError || error{
+    UnknownSubcommand,
+    ExtraParameters,
+    MissingDropTarget,
+    MissingResumeCredential,
+    InvalidGroupTarget,
+    InvalidCursor,
+};
+
+/// Parse the complete IRC parameter slice before reading inventory, changing a
+/// selector cache, revealing TOKEN, or attempting any revocation. The only
+/// default is a parameterless SESSION; explicit LIST/TOKEN accept no arguments,
+/// and RESUME/DROP each require exactly one credential/physical selector.
+pub fn parseCommand(params: []const []const u8) CommandError!Command {
+    if (params.len == 0) return .list;
+    const sub = params[0];
+    if (std.ascii.eqlIgnoreCase(sub, "LIST")) {
+        if (params.len >= 2 and std.ascii.eqlIgnoreCase(params[1], "MESH")) {
+            if (params.len > 3) return error.ExtraParameters;
+            if (params.len == 2) return .{ .mesh_list = null };
+            const value = params[2];
+            if (!std.mem.startsWith(u8, value, "cursor=")) return error.ExtraParameters;
+            if (value.len != 7 + sid_hex_len) return error.InvalidCursor;
+            var nonce: Sid = undefined;
+            _ = std.fmt.hexToBytes(&nonce, value[7..]) catch return error.InvalidCursor;
+            if (isZeroSid(nonce)) return error.InvalidCursor;
+            return .{ .mesh_list = nonce };
+        }
+        if (params.len != 1) return error.ExtraParameters;
+        return .list;
+    }
+    if (std.ascii.eqlIgnoreCase(sub, "REVOKE")) {
+        if (params.len > 2) return error.ExtraParameters;
+        if (params.len != 2 or !std.mem.startsWith(u8, params[1], "group=") or params[1].len != 6 + sid_hex_len) return error.InvalidGroupTarget;
+        var group: Sid = undefined;
+        _ = std.fmt.hexToBytes(&group, params[1][6..]) catch return error.InvalidGroupTarget;
+        if (isZeroSid(group)) return error.InvalidGroupTarget;
+        return .{ .revoke_group = group };
+    }
+    if (std.ascii.eqlIgnoreCase(sub, "TOKEN")) {
+        if (params.len != 1) return error.ExtraParameters;
+        return .token;
+    }
+    if (std.ascii.eqlIgnoreCase(sub, "RESUME")) {
+        if (params.len > 2) return error.ExtraParameters;
+        if (params.len < 2 or params[1].len == 0) return error.MissingResumeCredential;
+        return .{ .resume_credential = params[1] };
+    }
+    if (std.ascii.eqlIgnoreCase(sub, "DROP")) {
+        if (params.len > 2) return error.ExtraParameters;
+        if (params.len < 2) return error.MissingDropTarget;
+        return .{ .drop = try parseDropTarget(params[1]) };
+    }
+    return error.UnknownSubcommand;
+}
+
 /// An exact physical row image. This intentionally retains token bytes only in
 /// the caller's ephemeral LIST cache, which is securely erased on invalidation.
 pub const ListOrdinal = struct {
@@ -195,6 +264,80 @@ fn parseOrdinal(text: []const u8) !usize {
     return if (n == 0) error.InvalidDropTarget else n;
 }
 
+test "session command grammar accepts only explicit supported local attachment operations" {
+    const irc_line = @import("../proto/irc_line.zig");
+    for ([_][]const u8{ "SESSION", "SESSION LIST", "SESSION lIsT" }) |wire| {
+        const line = try irc_line.parseLine(wire);
+        try std.testing.expect(try parseCommand(line.paramSlice()) == .list);
+    }
+    const token_line = try irc_line.parseLine("SESSION tOkEn");
+    try std.testing.expect(try parseCommand(token_line.paramSlice()) == .token);
+    for ([_][]const u8{ "SESSION DROP #7", "SESSION dRoP 7" }) |wire| {
+        const line = try irc_line.parseLine(wire);
+        const command = try parseCommand(line.paramSlice());
+        try std.testing.expectEqual(@as(usize, 7), command.drop.ordinal);
+    }
+    const sid_line = try irc_line.parseLine("SESSION DROP sid=0123456789abcdef0123456789abcdef");
+    const command = try parseCommand(sid_line.paramSlice());
+    try std.testing.expect(eql(parseSid("0123456789abcdef0123456789abcdef").?, command.drop.sid));
+}
+
+test "session command grammar rejects ignored scope and multiple revocation targets" {
+    const irc_line = @import("../proto/irc_line.zig");
+    for ([_][]const u8{
+        "SESSION DROP #1 ALL",
+        "SESSION DROP #1 #2",
+        "SESSION DROP sid=0123456789abcdef0123456789abcdef ALL",
+        "SESSION DROP ATTACHMENT #1",
+        "SESSION DROP SESSION #1",
+        "SESSION DROP #1 :",
+        "SESSION LIST ALL",
+        "SESSION LIST alice",
+        "SESSION TOKEN ALL",
+        "SESSION RESUME credential ALL",
+    }) |wire| {
+        const line = try irc_line.parseLine(wire);
+        try std.testing.expectError(error.ExtraParameters, parseCommand(line.paramSlice()));
+    }
+    for ([_][]const u8{ "SESSION NOT_A_VERB", "SESSION DEVICES", "SESSION UNKNOWN", "SESSION :" }) |wire| {
+        const line = try irc_line.parseLine(wire);
+        try std.testing.expectError(error.UnknownSubcommand, parseCommand(line.paramSlice()));
+    }
+}
+
+test "session command grammar preserves missing credential and selector failures" {
+    const irc_line = @import("../proto/irc_line.zig");
+    const drop = try irc_line.parseLine("SESSION DROP");
+    try std.testing.expectError(error.MissingDropTarget, parseCommand(drop.paramSlice()));
+    for ([_][]const u8{ "SESSION RESUME", "SESSION RESUME :" }) |wire| {
+        const line = try irc_line.parseLine(wire);
+        try std.testing.expectError(error.MissingResumeCredential, parseCommand(line.paramSlice()));
+    }
+    for ([_][]const u8{ "SESSION DROP :", "SESSION DROP ALL", "SESSION DROP #0", "SESSION DROP sid=00000000000000000000000000000000" }) |wire| {
+        const line = try irc_line.parseLine(wire);
+        try std.testing.expectError(error.InvalidDropTarget, parseCommand(line.paramSlice()));
+    }
+}
+
+test "session command grammar borrows every resume credential byte without reinterpretation" {
+    const irc_line = @import("../proto/irc_line.zig");
+    // Parsing must not rotate, normalize, decode, or reject a credential before
+    // its owning legacy/local-composite/mesh handler validates it.
+    for ([_][]const u8{
+        "0123456789ABCDEF0123456789ABCDEF",
+        "srm2l.0123456789ABCDEF0123456789ABCDEF.1123456789ABCDEF0123456789ABCDEF",
+        "srm2m.0123456789ABCDEF.1123456789ABCDEF0123456789ABCDEF",
+        "malformed-credential-for-resume-handler",
+    }) |credential| {
+        var buf: [160]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&buf, "SESSION RESUME {s}", .{credential});
+        const line = try irc_line.parseLine(wire);
+        const command = try parseCommand(line.paramSlice());
+        try std.testing.expectEqualStrings(credential, command.resume_credential);
+        try std.testing.expectEqual(line.paramSlice()[1].ptr, command.resume_credential.ptr);
+    }
+}
+
 test "sid is 128-bit physical stable attachment identity" {
     const token: sessions.Token = @splat(0x11);
     const a = try sessions.AttachmentId.fromBytes(@splat(0x22));
@@ -253,4 +396,38 @@ test "shared-token siblings are distinct by attachment and SID collisions fail c
     // fail closed instead of selecting either claimant.
     const collision = sessions.Session{ .token = token, .client = 12, .signon_ms = 3, .attachment_id = first_aid };
     try std.testing.expect(matchSid(&.{ first, collision }, first_sid) == .ambiguous);
+}
+
+/// Public selector for a logical session; never a bearer credential.
+pub fn deriveGroup(token: sessions.Token) Sid {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("onyx-session-public-group-v1\x00");
+    hash.update(&token);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest[0..sid_byte_len].*;
+}
+
+test "session group grammar is exact and selectors are separated from physical SIDs" {
+    try std.testing.expect((try parseCommand(&.{ "LIST", "MESH" })) == .mesh_list);
+    const group = deriveGroup(@splat(1));
+    const hex = formatSid(group);
+    const arg = "group=" ++ hex;
+    try std.testing.expect(eql(group, (try parseCommand(&.{ "REVOKE", arg })).revoke_group));
+    try std.testing.expectError(error.ExtraParameters, parseCommand(&.{ "REVOKE", arg, "ALL" }));
+    try std.testing.expectError(error.InvalidGroupTarget, parseCommand(&.{ "REVOKE", "ALL" }));
+    try std.testing.expectError(error.ExtraParameters, parseCommand(&.{ "LIST", "MESH", "ALL" }));
+}
+
+test "session command mesh cursors require one complete opaque nonzero nonce" {
+    const nonce: Sid = @splat(0x5A);
+    var buffer: [64]u8 = undefined;
+    const encoded = try std.fmt.bufPrint(&buffer, "cursor={s}", .{formatSid(nonce)});
+    const parsed = try parseCommand(&.{ "LIST", "MESH", encoded });
+    try std.testing.expect(eql(nonce, parsed.mesh_list.?));
+    try std.testing.expectError(error.InvalidCursor, parseCommand(&.{ "LIST", "MESH", "cursor=00000000000000000000000000000000" }));
+    try std.testing.expectError(error.InvalidCursor, parseCommand(&.{ "LIST", "MESH", "cursor=5a" }));
+    try std.testing.expectError(error.InvalidCursor, parseCommand(&.{ "LIST", "MESH", "cursor=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" }));
+    try std.testing.expectError(error.ExtraParameters, parseCommand(&.{ "LIST", "MESH", "cursor-prefix=5a" }));
+    try std.testing.expectError(error.ExtraParameters, parseCommand(&.{ "LIST", "MESH", encoded, "ALL" }));
 }

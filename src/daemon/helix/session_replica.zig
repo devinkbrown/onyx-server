@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SESSION_REPLICA v2 convergence core.
+//! SESSION_REPLICA convergence core with negotiated current inventory and terminal revocation.
 //!
 //! This module deliberately owns no sockets. It defines the signed,
 //! self-certifying OFFER/ACK/attachment-lease wire objects and the bounded
@@ -29,6 +29,7 @@
 //! across multiple hops.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const sign = @import("../../crypto/sign.zig");
 const session_portability = @import("../../proto/session_portability.zig");
@@ -68,6 +69,17 @@ pub const max_snapshot_len: usize = @min(
     session_portability.max_snapshot_len,
 );
 
+/// Complete 256-row inventory plus this snapshot, maximal account/nick,
+/// both signatures and both transport envelopes fits the existing frame cap.
+/// Larger snapshots remain valid only with fewer rows if encodeOffer proves
+/// the actual complete signed object still fits; no bytes are truncated.
+pub const max_inventory_snapshot_len: usize = @min(max_snapshot_len, session_replica_transport.max_signed_payload_len - offer_fixed_len - signature_wire_len -
+    max_account_len - max_nick_len - 3 - 256 * 25);
+comptime {
+    std.debug.assert(offer_fixed_len + signature_wire_len + max_account_len + max_nick_len +
+        3 + 256 * 25 + max_inventory_snapshot_len <= session_replica_transport.max_signed_payload_len);
+}
+
 /// A restart-safe, deterministic total-order revision. `sequence` is the full
 /// packed MeshClock stamp and `epoch` is its canonical physical projection.
 /// Carrying both on the wire makes ordering explicit while the equality
@@ -101,7 +113,62 @@ pub const Revision = struct {
 pub const OfferOperation = enum(u8) {
     upsert = 1,
     remove = 2,
+    inventory_upsert = 3,
+    group_revoke = 4,
 };
+
+pub const inventory_row_len: usize = 25;
+pub const max_inventory_attachments: usize = 256;
+pub const AttachmentMetadata = struct {
+    attachment_id: [16]u8,
+    signon_ms: i64,
+    attached: bool,
+};
+
+pub const Inventory = struct {
+    bytes: []const u8,
+
+    pub fn count(self: Inventory) usize {
+        return self.bytes.len / inventory_row_len;
+    }
+
+    pub fn at(self: Inventory, index: usize) AttachmentMetadata {
+        const row = self.bytes[index * inventory_row_len ..][0..inventory_row_len];
+        return .{
+            .attachment_id = row[0..16].*,
+            .signon_ms = @bitCast(std.mem.readInt(u64, row[16..24], .big)),
+            .attached = row[24] == 1,
+        };
+    }
+};
+
+pub fn encodeInventory(out: []u8, rows: []const AttachmentMetadata) error{ InvalidInventory, BufferTooSmall }![]const u8 {
+    if (rows.len > max_inventory_attachments) return error.InvalidInventory;
+    for (rows, 0..) |row, i| {
+        if (std.mem.allEqual(u8, &row.attachment_id, 0) or row.signon_ms < 0) return error.InvalidInventory;
+        if (i > 0 and std.mem.order(u8, &rows[i - 1].attachment_id, &row.attachment_id) != .lt) return error.InvalidInventory;
+    }
+    const len = rows.len * inventory_row_len;
+    if (out.len < len) return error.BufferTooSmall;
+    for (rows, 0..) |row, i| {
+        const target = out[i * inventory_row_len ..][0..inventory_row_len];
+        @memcpy(target[0..16], &row.attachment_id);
+        std.mem.writeInt(u64, target[16..24], @bitCast(row.signon_ms), .big);
+        target[24] = @intFromBool(row.attached);
+    }
+    return out[0..len];
+}
+
+fn validInventory(bytes: []const u8) bool {
+    if (bytes.len % inventory_row_len != 0 or bytes.len / inventory_row_len > max_inventory_attachments) return false;
+    const inventory = Inventory{ .bytes = bytes };
+    for (0..inventory.count()) |i| {
+        const row = inventory.at(i);
+        if (std.mem.allEqual(u8, &row.attachment_id, 0) or row.signon_ms < 0 or bytes[i * inventory_row_len + 24] > 1) return false;
+        if (i > 0 and std.mem.order(u8, &inventory.at(i - 1).attachment_id, &row.attachment_id) != .lt) return false;
+    }
+    return true;
+}
 
 /// Unsigned semantic OFFER. `encodeOffer` signs this value and returns the
 /// complete owned wire object. Variable fields are borrowed for the call.
@@ -114,6 +181,13 @@ pub const Offer = struct {
     account: []const u8 = "",
     nick: []const u8 = "",
     snapshot: []const u8 = "",
+    inventory: []const u8 = "",
+    /// Mandatory signed authority decision for inventory offers only.
+    resume_eligible: ?bool = null,
+
+    pub fn allowsResume(self: Offer) bool {
+        return self.operation == .upsert or (self.operation == .inventory_upsert and self.resume_eligible == true);
+    }
 };
 
 /// Decoded signed OFFER. Variable fields and `transcript` borrow the input wire.
@@ -132,6 +206,8 @@ pub const AckStatus = enum(u8) {
     superseded = 5,
     tombstoned = 6,
     capacity = 7,
+    current_ready = 8,
+    group_revoked = 9,
 };
 
 /// Unsigned semantic ACK. `offered_revision` identifies the fact being
@@ -144,6 +220,10 @@ pub const Ack = struct {
     ack_node: NodeId,
     issued_at_ms: i64,
     expires_at_ms: i64,
+    /// Mandatory signed current-cohort binding for statuses8/9 only. Frozen
+    /// statuses retain their exact old transcript and reject extra context.
+    membership_epoch: u64 = 0,
+    roster_digest: Digest = @splat(0),
 };
 
 /// Decoded signed ACK. `transcript` borrows the input wire.
@@ -201,14 +281,16 @@ pub fn encodeOffer(allocator: std.mem.Allocator, offer: Offer, kp: *const sign.K
     try validateOfferShape(offer);
     if (signed_frame.originShortId(kp.public_key) != offer.revision.origin_node) return error.OriginMismatch;
 
-    const transcript_len = offer_fixed_len + offer.account.len + offer.nick.len + offer.snapshot.len;
+    const transcript_len = offer_fixed_len + offer.account.len + offer.nick.len + offer.snapshot.len +
+        (if (offer.operation == .inventory_upsert) @as(usize, 3) + offer.inventory.len else 0);
+    if (transcript_len + signature_wire_len > session_replica_transport.max_signed_payload_len) return error.TooLong;
     const total_len = transcript_len + signature_wire_len;
     var out = try allocator.alloc(u8, total_len);
     errdefer allocator.free(out);
 
     var writer = Writer{ .bytes = out };
     writer.writeBytes(&offer_magic);
-    writer.writeByte(@intFromEnum(offer.operation));
+    writer.writeByte(@backingInt(offer.operation));
     writer.writeBytes(&offer.token);
     writer.writeRevision(offer.revision);
     writer.writeI64(offer.issued_at_ms);
@@ -216,9 +298,14 @@ pub fn encodeOffer(allocator: std.mem.Allocator, offer: Offer, kp: *const sign.K
     writer.writeU16(@intCast(offer.account.len));
     writer.writeU16(@intCast(offer.nick.len));
     writer.writeU32(@intCast(offer.snapshot.len));
+    if (offer.operation == .inventory_upsert) {
+        writer.writeByte(@intFromBool(offer.resume_eligible.?));
+        writer.writeU16(@intCast(offer.inventory.len / inventory_row_len));
+    }
     writer.writeBytes(offer.account);
     writer.writeBytes(offer.nick);
     writer.writeBytes(offer.snapshot);
+    writer.writeBytes(offer.inventory);
     std.debug.assert(writer.pos == transcript_len);
 
     const signature = try kp.signCtx(offer_sign_domain, out[0..transcript_len]);
@@ -230,6 +317,7 @@ pub fn encodeOffer(allocator: std.mem.Allocator, offer: Offer, kp: *const sign.K
 
 /// Strictly decode one canonical signed OFFER. Returned slices borrow `bytes`.
 pub fn decodeOffer(bytes: []const u8) DecodeError!SignedOffer {
+    if (bytes.len > session_replica_transport.max_signed_payload_len) return error.TooLong;
     var reader = Reader{ .bytes = bytes };
     const offer = try readOffer(&reader);
     const transcript_end = reader.pos;
@@ -250,6 +338,8 @@ fn readOffer(reader: *Reader) DecodeError!Offer {
     const operation: OfferOperation = switch (try reader.readByte()) {
         1 => .upsert,
         2 => .remove,
+        3 => .inventory_upsert,
+        4 => .group_revoke,
         else => return error.InvalidOffer,
     };
     const token = (try reader.take(@sizeOf(Token)))[0..@sizeOf(Token)].*;
@@ -260,9 +350,17 @@ fn readOffer(reader: *Reader) DecodeError!Offer {
     const nick_len = try reader.readU16();
     const snapshot_len = try reader.readU32();
     if (account_len > max_account_len or nick_len > max_nick_len or snapshot_len > max_snapshot_len) return error.TooLong;
+    const resume_eligible: ?bool = if (operation == .inventory_upsert) switch (try reader.readByte()) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidOffer,
+    } else null;
+    const inventory_count = if (operation == .inventory_upsert) try reader.readU16() else 0;
+    if (inventory_count > max_inventory_attachments) return error.TooLong;
     const account = try reader.take(account_len);
     const nick = try reader.take(nick_len);
     const snapshot = try reader.take(snapshot_len);
+    const inventory = try reader.take(@as(usize, inventory_count) * inventory_row_len);
     const offer = Offer{
         .operation = operation,
         .token = token,
@@ -272,37 +370,137 @@ fn readOffer(reader: *Reader) DecodeError!Offer {
         .account = account,
         .nick = nick,
         .snapshot = snapshot,
+        .inventory = inventory,
+        .resume_eligible = resume_eligible,
     };
     validateOfferShape(offer) catch return error.InvalidOffer;
     return offer;
 }
 
-pub fn verifyOffer(signed: SignedOffer) VerifyError!void {
+fn validateOfferProjection(signed: SignedOffer) VerifyError!void {
     var reader = Reader{ .bytes = signed.transcript };
     const projected = readOffer(&reader) catch return error.TranscriptMismatch;
     if (reader.pos != signed.transcript.len or !offerEql(projected, signed.offer)) return error.TranscriptMismatch;
     if (signed_frame.originShortId(signed.signer) != signed.offer.revision.origin_node) return error.OriginMismatch;
+}
+fn verifyOfferSignature(signed: SignedOffer) VerifyError!void {
     const valid = sign.verifyCtx(offer_sign_domain, signed.transcript, signed.signature, signed.signer) catch false;
     if (!valid) return error.BadSignature;
 }
+pub fn verifyOffer(signed: SignedOffer) VerifyError!void {
+    try validateOfferProjection(signed);
+    try verifyOfferSignature(signed);
+}
+
+/// Captures the caller's current validated cohort, not authorization itself.
+/// The caller MUST independently check the current authenticated peer, issuer
+/// membership and revocation before every call, including cache hits.
+pub const OfferMemoAuthority = struct {
+    declared: bool,
+    epoch: u64,
+    roster_digest: [32]u8,
+};
+/// Process-local performance hint. Exact bytes only; no Store/Helix authority.
+/// Caller owns this fixed memory and must serialize access and call deinit.
+pub const OfferSignatureMemo = struct {
+    pub const capacity = 4;
+    pub const max_transcript_bytes = 4096;
+    const Slot = struct {
+        valid: bool = false,
+        len: usize = 0,
+        transcript: [max_transcript_bytes]u8 = @splat(0),
+        signer: sign.PublicKey = @splat(0),
+        signature: sign.Signature = @splat(0),
+        authority: OfferMemoAuthority = .{ .declared = false, .epoch = 0, .roster_digest = @splat(0) },
+        expires_ms: i64 = 0,
+    };
+    slots: [capacity]Slot = @splat(.{}),
+    next: usize = 0,
+    last_now_ms: i64 = -1,
+    /// Saturating process-local work observations, never authority or wire data.
+    /// The legacy storage name preserves existing Server test access; this is
+    /// the SAME signature counter in every build, not an additional test copy.
+    test_signature_checks: u64 = 0,
+    cache_hits: u64 = 0,
+    fallbacks: u64 = 0,
+
+    pub const Stats = struct {
+        /// Actual signature verification attempts, including failed signatures.
+        signature_checks: u64 = 0,
+        /// Exact signature memo matches; normal Store checks still run afterward.
+        cache_hits: u64 = 0,
+        /// Valid projections outside memo eligibility that use full verification.
+        /// Eligible misses are checks, not fallbacks. Outer group-revoke bypass
+        /// and projection refusals do not call this memo verification path.
+        fallbacks: u64 = 0,
+    };
+
+    /// Read under the same owner exclusion required by verify/deinit. This value
+    /// copy owns no references and grants no authority. Not a concurrent metrics
+    /// API: callers must not race the serialized owner or checkpoint these data.
+    pub fn stats(self: *const OfferSignatureMemo) Stats {
+        return .{ .signature_checks = self.test_signature_checks, .cache_hits = self.cache_hits, .fallbacks = self.fallbacks };
+    }
+    pub fn deinit(self: *OfferSignatureMemo) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+        self.* = .{};
+    }
+    fn verify(self: *OfferSignatureMemo, signed: SignedOffer, authority: OfferMemoAuthority, now_ms: i64) VerifyError!void {
+        try validateOfferProjection(signed);
+        const forward_clock = now_ms > 0 and now_ms >= self.last_now_ms;
+        if (forward_clock) self.last_now_ms = now_ms;
+        const eligible = (signed.offer.operation == .upsert or signed.offer.operation == .inventory_upsert) and
+            signed.transcript.len <= max_transcript_bytes and
+            forward_clock and now_ms >= signed.offer.issued_at_ms and now_ms <= signed.offer.expires_at_ms;
+        if (eligible) {
+            var padded: [max_transcript_bytes]u8 = @splat(0);
+            defer std.crypto.secureZero(u8, &padded);
+            @memcpy(padded[0..signed.transcript.len], signed.transcript);
+            for (&self.slots) |*slot| {
+                if (!slot.valid or slot.len != signed.transcript.len or slot.expires_ms != signed.offer.expires_at_ms or
+                    slot.authority.declared != authority.declared or slot.authority.epoch != authority.epoch) continue;
+                if (!std.crypto.timing_safe.eql([32]u8, slot.authority.roster_digest, authority.roster_digest) or
+                    !std.crypto.timing_safe.eql(sign.PublicKey, slot.signer, signed.signer) or
+                    !std.crypto.timing_safe.eql(sign.Signature, slot.signature, signed.signature) or
+                    !std.crypto.timing_safe.eql([max_transcript_bytes]u8, slot.transcript, padded)) continue;
+                self.cache_hits +|= 1;
+                return;
+            }
+            self.test_signature_checks +|= 1;
+            try verifyOfferSignature(signed);
+            const slot = &self.slots[self.next];
+            std.crypto.secureZero(u8, std.mem.asBytes(slot));
+            slot.* = .{ .valid = true, .len = signed.transcript.len, .transcript = padded, .signer = signed.signer, .signature = signed.signature, .authority = authority, .expires_ms = signed.offer.expires_at_ms };
+            self.next = (self.next + 1) % capacity;
+            return;
+        }
+        self.fallbacks +|= 1;
+        self.test_signature_checks +|= 1;
+        try verifyOfferSignature(signed);
+    }
+};
 
 /// Encode and sign one canonical ACK. The caller owns the returned bytes.
 pub fn encodeAck(allocator: std.mem.Allocator, ack: Ack, kp: *const sign.KeyPair) EncodeError![]u8 {
     try validateAckShape(ack);
     if (signed_frame.originShortId(kp.public_key) != ack.ack_node) return error.OriginMismatch;
 
-    const transcript_len = ack_fixed_len;
+    const transcript_len = ack_fixed_len + (if (ack.status == .current_ready or ack.status == .group_revoked) @as(usize, 40) else 0);
     var out = try allocator.alloc(u8, transcript_len + signature_wire_len);
     errdefer allocator.free(out);
     var writer = Writer{ .bytes = out };
     writer.writeBytes(&ack_magic);
-    writer.writeByte(@intFromEnum(ack.status));
+    writer.writeByte(@backingInt(ack.status));
     writer.writeBytes(&ack.token);
     writer.writeRevision(ack.offered_revision);
     writer.writeRevision(ack.observed_revision);
     writer.writeU64(ack.ack_node);
     writer.writeI64(ack.issued_at_ms);
     writer.writeI64(ack.expires_at_ms);
+    if (ack.status == .current_ready or ack.status == .group_revoked) {
+        writer.writeU64(ack.membership_epoch);
+        writer.writeBytes(&ack.roster_digest);
+    }
     std.debug.assert(writer.pos == transcript_len);
 
     const signature = try kp.signCtx(ack_sign_domain, out[0..transcript_len]);
@@ -339,6 +537,8 @@ fn readAck(reader: *Reader) DecodeError!Ack {
         5 => .superseded,
         6 => .tombstoned,
         7 => .capacity,
+        8 => .current_ready,
+        9 => .group_revoked,
         else => return error.InvalidAck,
     };
     const token = (try reader.take(@sizeOf(Token)))[0..@sizeOf(Token)].*;
@@ -347,6 +547,9 @@ fn readAck(reader: *Reader) DecodeError!Ack {
     const ack_node = try reader.readU64();
     const issued_at_ms = try reader.readI64();
     const expires_at_ms = try reader.readI64();
+    const current = status == .current_ready or status == .group_revoked;
+    const membership_epoch = if (current) try reader.readU64() else 0;
+    const roster_digest: Digest = if (current) (try reader.take(@sizeOf(Digest)))[0..@sizeOf(Digest)].* else @splat(0);
     const ack = Ack{
         .status = status,
         .token = token,
@@ -355,6 +558,8 @@ fn readAck(reader: *Reader) DecodeError!Ack {
         .ack_node = ack_node,
         .issued_at_ms = issued_at_ms,
         .expires_at_ms = expires_at_ms,
+        .membership_epoch = membership_epoch,
+        .roster_digest = roster_digest,
     };
     validateAckShape(ack) catch return error.InvalidAck;
     return ack;
@@ -440,19 +645,34 @@ fn validateOfferShape(offer: Offer) error{ InvalidOffer, TooLong }!void {
     if (offer.revision.origin_node == 0 or !offer.revision.isCanonical()) return error.InvalidOffer;
     if (offer.issued_at_ms < 0 or offer.expires_at_ms < offer.issued_at_ms) return error.InvalidOffer;
     if (offer.account.len > max_account_len or offer.nick.len > max_nick_len or offer.snapshot.len > max_snapshot_len) return error.TooLong;
+    if (offer.operation != .inventory_upsert and offer.resume_eligible != null) return error.InvalidOffer;
     switch (offer.operation) {
-        .upsert => {
-            if (offer.account.len == 0 or offer.nick.len == 0 or offer.snapshot.len == 0) return error.InvalidOffer;
+        .upsert, .inventory_upsert => {
+            if (offer.account.len == 0) return error.InvalidOffer;
+            if (offer.operation == .inventory_upsert and offer.resume_eligible == null) return error.InvalidOffer;
+            if (offer.allowsResume()) {
+                if (offer.nick.len == 0 or offer.snapshot.len == 0) return error.InvalidOffer;
+            } else if (offer.nick.len != 0 or offer.snapshot.len != 0) return error.InvalidOffer;
+            if (offer.operation == .upsert and offer.inventory.len != 0) return error.InvalidOffer;
+            if (!validInventory(offer.inventory)) return error.InvalidOffer;
+        },
+        .group_revoke => {
+            if (std.mem.allEqual(u8, &offer.token, 0) or offer.account.len == 0 or offer.nick.len != 0 or offer.snapshot.len != 0 or offer.inventory.len != 0) return error.InvalidOffer;
         },
         .remove => {
-            if (offer.account.len != 0 or offer.nick.len != 0 or offer.snapshot.len != 0) return error.InvalidOffer;
+            if (offer.account.len != 0 or offer.nick.len != 0 or offer.snapshot.len != 0 or offer.inventory.len != 0) return error.InvalidOffer;
         },
     }
 }
 
 fn validateAckShape(ack: Ack) error{InvalidAck}!void {
+    const current = ack.status == .current_ready or ack.status == .group_revoked;
+    const empty_digest = std.mem.allEqual(u8, &ack.roster_digest, 0);
+    if (current) {
+        if (ack.membership_epoch == 0 or empty_digest) return error.InvalidAck;
+    } else if (ack.membership_epoch != 0 or !empty_digest) return error.InvalidAck;
     if (ack.ack_node == 0 or ack.offered_revision.origin_node == 0 or ack.observed_revision.origin_node == 0) return error.InvalidAck;
-    if (ack.offered_revision.origin_node != ack.observed_revision.origin_node) return error.InvalidAck;
+    if (ack.offered_revision.origin_node != ack.observed_revision.origin_node and ack.status != .group_revoked) return error.InvalidAck;
     if (!ack.offered_revision.isCanonical() or !ack.observed_revision.isCanonical()) return error.InvalidAck;
     if (ack.issued_at_ms < 0 or ack.expires_at_ms < ack.issued_at_ms) return error.InvalidAck;
 }
@@ -515,6 +735,8 @@ pub const ApplyError = VerifyError || error{
     QuarantineFull,
     RouteFull,
     TombstoneFull,
+    GroupRevokeFull,
+    AccountMismatch,
 } || std.mem.Allocator.Error;
 
 pub const AckApplyError = VerifyError || error{
@@ -537,15 +759,137 @@ pub const AttachmentLeaseApplyError = VerifyError || error{
     InvalidLifetime,
 } || std.mem.Allocator.Error;
 
-/// Complete restart checkpoint for the authoritative SESSION_REPLICA v2
+pub const GroupRevokeError = ApplyError;
+pub const GroupRevocation = struct {
+    wire: []const u8,
+    account: []const u8,
+    revision: Revision,
+    digest: Digest,
+};
+
+/// Caller serializes Store access from preparation through commit/abort. All
+/// fallible work precedes the durable-write boundary; commit cannot allocate.
+pub const PreparedGroupRevoke = struct {
+    store: *Store,
+    token: Token,
+    wire: ?[]const u8 = null,
+    done: bool = false,
+
+    pub fn commit(self: *PreparedGroupRevoke) ApplyDisposition {
+        std.debug.assert(!self.done);
+        self.done = true;
+        const wire = self.wire orelse return .duplicate;
+        self.wire = null;
+        const signed = decodeOffer(wire) catch unreachable;
+        self.store.account_index.getPtr(accountDigest(signed.offer.account)).?.origins.appendAssumeCapacity(.{ .token = self.token, .origin_node = 0 });
+        self.store.bumpInventoryAccount(signed.offer.account);
+        self.store.group_revocations.putAssumeCapacityNoClobber(self.token, .{
+            .wire = wire,
+            .account = signed.offer.account,
+            .revision = signed.offer.revision,
+            .digest = digestBytes(signed.transcript),
+        });
+        self.store.removeStateForToken(self.token);
+        self.store.removeLeasesForToken(self.token);
+        return .inserted;
+    }
+
+    pub fn abort(self: *PreparedGroupRevoke) void {
+        if (self.done) return;
+        self.done = true;
+        if (self.wire) |wire| {
+            const signed = decodeOffer(wire) catch unreachable;
+            const digest = accountDigest(signed.offer.account);
+            if (self.store.account_index.getPtr(digest)) |origins| {
+                if (origins.origins.items.len == 0) {
+                    origins.origins.deinit(self.store.allocator);
+                    _ = self.store.account_index.remove(digest);
+                }
+            }
+            self.store.allocator.free(wire);
+        }
+        self.wire = null;
+    }
+
+    pub fn deinit(self: *PreparedGroupRevoke) void {
+        self.abort();
+    }
+};
+
+pub const InventoryCursor = struct {
+    token: Token,
+    origin_node: NodeId,
+    attachment_id: [16]u8,
+
+    pub fn compare(a: InventoryCursor, b: InventoryCursor) std.math.Order {
+        const token_order = std.mem.order(u8, &a.token, &b.token);
+        if (token_order != .eq) return token_order;
+        const origin_order = std.math.order(a.origin_node, b.origin_node);
+        if (origin_order != .eq) return origin_order;
+        return std.mem.order(u8, &a.attachment_id, &b.attachment_id);
+    }
+};
+
+/// Internal inventory only: token bytes must never be formatted for clients.
+pub const InventoryRow = struct {
+    token: Token,
+    attachment_id: ?[16]u8,
+    origin_node: NodeId,
+    signon_ms: i64,
+    /// Signed observation; only fresh=true permits treating it as current.
+    attached: bool,
+    fresh: bool,
+    inventory_complete: bool,
+    revoked: bool = false,
+
+    pub fn cursor(self: InventoryRow) InventoryCursor {
+        return .{ .token = self.token, .origin_node = self.origin_node, .attachment_id = self.attachment_id orelse @splat(0) };
+    }
+};
+
+pub const InventoryPage = struct {
+    integrity_ok: bool = true,
+    items: []const InventoryRow,
+    next: ?InventoryCursor,
+    complete: bool,
+};
+
+/// Private volatile cursor. Never serialize or reuse across Store replacement;
+/// daemon enumeration caches must be reset on restore/adopt.
+pub const InventoryScanCursor = struct {
+    account_digest: Digest,
+    generation: u64,
+    origin_index: usize,
+    attachment_index: usize,
+};
+
+pub const max_inventory_scan_work: usize = 64;
+pub const max_inventory_scan_rows: usize = 32;
+pub const InventoryScanPage = struct {
+    items: []const InventoryRow,
+    next: ?InventoryScanCursor,
+    complete: bool,
+    integrity_ok: bool,
+    generation: u64,
+    work_used: usize,
+};
+
+const AccountInventoryIndex = struct {
+    origins: std.ArrayListUnmanaged(Store.OriginKey) = .empty,
+    generation: u64 = 0,
+};
+
+/// Complete current restart checkpoint for the authoritative SESSION_REPLICA
 /// Store. This is carried inside Helix's backwards-compatible mesh-checkpoint
 /// capsule family, so the inner magic must remain independently recognizable.
 pub const upgrade_checkpoint_magic = [_]u8{ 'S', 'R', 'S', 'T' };
-pub const upgrade_checkpoint_version: u8 = 2;
+pub const upgrade_checkpoint_version: u8 = 3;
+const upgrade_checkpoint_v2_version: u8 = 2;
 const upgrade_checkpoint_v1_version: u8 = 1;
 const upgrade_checkpoint_checksum_len = 32;
 const upgrade_checkpoint_v1_header_len = upgrade_checkpoint_magic.len + 1 + 8 + 4 + 4 + 4;
-const upgrade_checkpoint_header_len = upgrade_checkpoint_v1_header_len + 4;
+const upgrade_checkpoint_v2_header_len = upgrade_checkpoint_v1_header_len + 4;
+const upgrade_checkpoint_header_len = upgrade_checkpoint_v2_header_len + 4;
 
 pub const UpgradeCheckpointError = error{
     BadMagic,
@@ -560,6 +904,87 @@ pub const UpgradeCheckpointError = error{
     TooLarge,
 } || std.mem.Allocator.Error;
 
+/// Core retry progress and its exact Store image form one hot-handoff cut.
+/// The inner SRSTv3 authority format is unchanged and remains independently
+/// usable at explicit Store/cold boundaries. Current Core requires this wrapper.
+pub const core_checkpoint_magic = "SRHC";
+pub const core_checkpoint_version: u8 = 1;
+const core_checksum_domain = "onyx-session-replica-core-checkpoint-v1";
+const core_fixed_bytes = 4 + 1 + 1 + 4 + 32;
+pub const CoreCheckpointView = struct {
+    orphan_revoke_cursor: ?Token,
+    store_bytes: []const u8,
+};
+
+pub fn isCoreUpgradeCheckpoint(bytes: []const u8) bool {
+    return std.mem.startsWith(u8, bytes, core_checkpoint_magic);
+}
+
+fn coreCheckpointDigest(bytes: []const u8) Digest {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(core_checksum_domain);
+    hash.update(bytes);
+    var out: Digest = undefined;
+    hash.final(&out);
+    return out;
+}
+
+pub fn encodeCoreUpgradeCheckpoint(allocator: std.mem.Allocator, store: *const Store, captured_at_ms: i64, cursor: ?Token) UpgradeCheckpointError![]u8 {
+    const inner = try store.encodeUpgradeCheckpoint(allocator, captured_at_ms);
+    defer allocator.free(inner);
+    const extra: usize = if (cursor != null) @sizeOf(Token) else 0;
+    if (inner.len > std.math.maxInt(u32)) return error.TooLarge;
+    const size = std.math.add(usize, core_fixed_bytes + extra, inner.len) catch return error.TooLarge;
+    const out = try allocator.alloc(u8, size);
+    errdefer allocator.free(out);
+    @memcpy(out[0..4], core_checkpoint_magic);
+    out[4] = core_checkpoint_version;
+    out[5] = @intFromBool(cursor != null);
+    var offset: usize = 6;
+    if (cursor) |token| {
+        @memcpy(out[offset..][0..@sizeOf(Token)], &token);
+        offset += @sizeOf(Token);
+    }
+    std.mem.writeInt(u32, out[offset..][0..4], @intCast(inner.len), .big);
+    offset += 4;
+    @memcpy(out[offset..][0..inner.len], inner);
+    const checksum = coreCheckpointDigest(out[0 .. size - 32]);
+    @memcpy(out[size - 32 ..], &checksum);
+    return out;
+}
+
+/// Allocation-free framing validation; signed Store validation still occurs in
+/// restoreCurrentUpgradeCheckpoint before any candidate authority is published.
+pub fn decodeCoreUpgradeCheckpoint(bytes: []const u8) UpgradeCheckpointError!CoreCheckpointView {
+    if (!isCoreUpgradeCheckpoint(bytes)) return error.BadMagic;
+    if (bytes.len < core_fixed_bytes) return error.Truncated;
+    if (bytes[4] != core_checkpoint_version) return error.UnsupportedVersion;
+    const cursor_present = switch (bytes[5]) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidMetadata,
+    };
+    var offset: usize = 6;
+    var cursor: ?Token = null;
+    if (cursor_present) {
+        if (bytes.len < core_fixed_bytes + @sizeOf(Token)) return error.Truncated;
+        cursor = bytes[offset..][0..@sizeOf(Token)].*;
+        offset += @sizeOf(Token);
+    }
+    const length: usize = std.mem.readInt(u32, bytes[offset..][0..4], .big);
+    offset += 4;
+    const end = bytes.len - 32;
+    if (length > end - offset) return error.Truncated;
+    if (length != end - offset) return error.TrailingBytes;
+    const expected = coreCheckpointDigest(bytes[0..end]);
+    if (!std.crypto.timing_safe.eql(Digest, expected, bytes[end..][0..32].*)) return error.ChecksumMismatch;
+    const inner = bytes[offset..end];
+    if (!Store.isUpgradeCheckpoint(inner)) return error.BadMagic;
+    if (inner.len <= upgrade_checkpoint_magic.len) return error.Truncated;
+    if (inner[upgrade_checkpoint_magic.len] != upgrade_checkpoint_version) return error.UnsupportedVersion;
+    return .{ .orphan_revoke_cursor = cursor, .store_bytes = inner };
+}
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -568,6 +993,12 @@ pub const Store = struct {
     routes: std.AutoHashMapUnmanaged(RouteKey, RouteValue) = .empty,
     tombstones: std.AutoHashMapUnmanaged(OriginKey, Tombstone) = .empty,
     quarantines: std.AutoHashMapUnmanaged(Token, Quarantine) = .empty,
+    group_revocations: std.AutoHashMapUnmanaged(Token, GroupRevocation) = .empty,
+    account_index: std.AutoHashMapUnmanaged(Digest, AccountInventoryIndex) = .empty,
+    inventory_generation: u64 = 0,
+    inventory_generation_exhausted: bool = false,
+    inventory_source_visits: std.atomic.Value(usize) = .init(0),
+    inventory_row_visits: std.atomic.Value(usize) = .init(0),
 
     pub const Config = struct {
         max_entries: usize = 4096,
@@ -575,6 +1006,7 @@ pub const Store = struct {
         max_routes: usize = 16_384,
         max_tombstones: usize = 4096,
         max_quarantines: usize = 1024,
+        max_group_revocations: usize = 4096,
         max_offer_lifetime_ms: u64 = 24 * 60 * 60 * 1000,
         max_attachment_lease_lifetime_ms: u64 = 5 * 60 * 1000,
         max_future_skew_ms: u64 = default_max_future_skew_ms,
@@ -592,6 +1024,8 @@ pub const Store = struct {
         account: []const u8,
         nick: []const u8,
         snapshot: []const u8,
+        inventory: []const u8 = "",
+        resume_eligible: bool,
         revision: Revision,
         issued_at_ms: i64,
         expires_at_ms: i64,
@@ -678,6 +1112,7 @@ pub const Store = struct {
         offer,
         revoke,
         attachment_lease,
+        group_revoke,
     };
 
     fn retainedKindRank(kind: RetainedKind) u8 {
@@ -685,6 +1120,7 @@ pub const Store = struct {
             .offer => 0,
             .revoke => 1,
             .attachment_lease => 2,
+            .group_revoke => 3,
         };
     }
 
@@ -763,12 +1199,272 @@ pub const Store = struct {
         while (tombstone_it.next()) |tombstone| freeTombstone(self.allocator, tombstone.*);
         var quarantine_it = self.quarantines.valueIterator();
         while (quarantine_it.next()) |quarantine| freeQuarantine(self.allocator, quarantine.*);
+        var groups = self.group_revocations.valueIterator();
+        while (groups.next()) |group| self.allocator.free(group.wire);
+        self.group_revocations.deinit(self.allocator);
+        var accounts = self.account_index.valueIterator();
+        while (accounts.next()) |account| account.origins.deinit(self.allocator);
+        self.account_index.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.attachment_leases.deinit(self.allocator);
         self.routes.deinit(self.allocator);
         self.tombstones.deinit(self.allocator);
         self.quarantines.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn isGroupRevoked(self: *const Store, account: []const u8, token: Token) bool {
+        const group = self.group_revocations.get(token) orelse return false;
+        return std.ascii.eqlIgnoreCase(group.account, account);
+    }
+
+    pub fn groupRevokeForToken(self: *const Store, token: Token) ?*const GroupRevocation {
+        return @constCast(&self.group_revocations).getPtr(token);
+    }
+
+    pub fn prepareGroupRevoke(self: *Store, signed: SignedOffer, now_ms: i64) GroupRevokeError!PreparedGroupRevoke {
+        try verifyOffer(signed);
+        const offer = signed.offer;
+        if (offer.operation != .group_revoke) return error.InvalidOffer;
+        try self.validateOfferForStore(offer, now_ms);
+        if (self.group_revocations.get(offer.token)) |old| {
+            if (!std.ascii.eqlIgnoreCase(old.account, offer.account)) return error.AccountMismatch;
+            return .{ .store = self, .token = offer.token };
+        }
+        var entries = self.entries.iterator();
+        while (entries.next()) |entry| {
+            if (tokenEql(entry.key_ptr.token, offer.token) and !std.ascii.eqlIgnoreCase(entry.value_ptr.account, offer.account)) return error.AccountMismatch;
+        }
+        const expected = accountDigest(offer.account);
+        var tombstones = self.tombstones.iterator();
+        while (tombstones.next()) |entry| {
+            if (!tokenEql(entry.key_ptr.token, offer.token)) continue;
+            if (entry.value_ptr.identity_digest) |bound| {
+                if (!std.crypto.timing_safe.eql(Digest, expected, bound)) return error.AccountMismatch;
+            }
+        }
+        if (self.quarantines.contains(offer.token)) return error.IdentityConflict;
+        if (self.group_revocations.count() >= self.cfg.max_group_revocations) return error.GroupRevokeFull;
+        const wire = try ownSignedOffer(self.allocator, signed);
+        errdefer self.allocator.free(wire);
+        try self.group_revocations.ensureUnusedCapacity(self.allocator, 1);
+        const added = try self.reserveAccountOrigin(offer.account, .{ .token = offer.token, .origin_node = 0 });
+        std.debug.assert(added);
+        return .{ .store = self, .token = offer.token, .wire = wire };
+    }
+
+    /// Visits only the selected folded account's origin index. Revocations are
+    /// separately bounded and retained forever; their account filter never
+    /// exposes another account's token or attachment metadata.
+    pub fn accountInventoryPageInto(self: *const Store, account: []const u8, now_ms: i64, after: ?InventoryCursor, out: []InventoryRow) InventoryPage {
+        var count: usize = 0;
+        var eligible: usize = 0;
+        var integrity_ok = true;
+        const requested_account = accountDigest(account);
+        if (self.account_index.get(requested_account)) |origins| {
+            for (origins.origins.items) |key| {
+                if (builtin.is_test) _ = @constCast(&self.inventory_source_visits).fetchAdd(1, .monotonic);
+                if (key.origin_node == 0) {
+                    const group = self.group_revocations.get(key.token) orelse {
+                        integrity_ok = false;
+                        continue;
+                    };
+                    if (!std.crypto.timing_safe.eql(Digest, requested_account, accountDigest(group.account))) {
+                        integrity_ok = false;
+                        continue;
+                    }
+                    considerInventory(after, .{ .token = key.token, .attachment_id = null, .origin_node = group.revision.origin_node, .signon_ms = 0, .attached = false, .fresh = true, .inventory_complete = true, .revoked = true }, out, &count, &eligible);
+                    continue;
+                }
+                const entry = @constCast(&self.entries).getPtr(key) orelse {
+                    integrity_ok = false;
+                    continue;
+                };
+                // The index is acceleration, never account authorization. A
+                // corrupt/stale locator cannot expose another account's rows.
+                if (!std.crypto.timing_safe.eql(Digest, requested_account, accountDigest(entry.account))) {
+                    integrity_ok = false;
+                    continue;
+                }
+                if (entry.quarantine_until_ms != null or self.quarantines.contains(key.token)) continue;
+                const signed = decodeOffer(entry.wire) catch unreachable;
+                const inventory = Inventory{ .bytes = entry.inventory };
+                const complete = signed.offer.operation == .inventory_upsert;
+                const lease_live = if (self.attachment_leases.get(key)) |lease|
+                    !lease.conflicted and now_ms <= lease.expires_at_ms and lease.revision.compare(entry.revision) == .gt and
+                        std.crypto.timing_safe.eql(sign.PublicKey, lease.signer, signed.signer)
+                else
+                    false;
+                if (!complete) {
+                    considerInventory(after, .{ .token = key.token, .attachment_id = null, .origin_node = key.origin_node, .signon_ms = 0, .attached = false, .fresh = false, .inventory_complete = false }, out, &count, &eligible);
+                } else for (0..inventory.count()) |i| {
+                    const row = inventory.at(i);
+                    considerInventory(after, .{ .token = key.token, .attachment_id = row.attachment_id, .origin_node = key.origin_node, .signon_ms = row.signon_ms, .attached = row.attached, .fresh = now_ms <= entry.expires_at_ms and (!row.attached or lease_live), .inventory_complete = true }, out, &count, &eligible);
+                }
+            }
+        }
+        return .{ .items = out[0..count], .next = if (count == 0) after else out[count - 1].cursor(), .complete = integrity_ok and eligible <= count, .integrity_ok = integrity_ok };
+    }
+
+    /// Account-index traversal, bounded by both physical output and source work.
+    /// No lexical rescan, complete signed-offer decode, allocation or global
+    /// census occurs here. `complete` means end of this structural scan; lease
+    /// freshness is sampled per call and is not an atomic account snapshot.
+    pub fn accountInventoryBatchInto(self: *const Store, account: []const u8, now_ms: i64, after: ?InventoryScanCursor, out: []InventoryRow) error{ StaleCursor, InvalidCursor }!InventoryScanPage {
+        if (account.len == 0 or account.len > max_account_len) return error.InvalidCursor;
+        const digest = accountDigest(account);
+        if (after) |cursor| {
+            if (!std.crypto.timing_safe.eql(Digest, digest, cursor.account_digest) or cursor.generation == 0)
+                return error.InvalidCursor;
+        }
+        if (self.inventory_generation_exhausted) return error.StaleCursor;
+        const bucket = self.account_index.get(digest) orelse {
+            if (after != null) return error.StaleCursor;
+            return .{ .items = out[0..0], .next = null, .complete = true, .integrity_ok = true, .generation = 0, .work_used = 0 };
+        };
+        if (after) |cursor| if (cursor.generation != bucket.generation) return error.StaleCursor;
+        var cursor = after orelse InventoryScanCursor{ .account_digest = digest, .generation = bucket.generation, .origin_index = 0, .attachment_index = 0 };
+        if (cursor.origin_index > bucket.origins.items.len or
+            (cursor.origin_index == bucket.origins.items.len and cursor.attachment_index != 0)) return error.InvalidCursor;
+        var count: usize = 0;
+        var work: usize = 0;
+        var integrity_ok = true;
+        const limit = @min(out.len, max_inventory_scan_rows);
+        scan: while (cursor.origin_index < bucket.origins.items.len and count < limit and work < max_inventory_scan_work) {
+            work += 1;
+            if (builtin.is_test) _ = @constCast(&self.inventory_source_visits).fetchAdd(1, .monotonic);
+            const key = bucket.origins.items[cursor.origin_index];
+            if (key.origin_node == 0) {
+                if (cursor.attachment_index != 0) return error.InvalidCursor;
+                const group = self.group_revocations.get(key.token) orelse {
+                    integrity_ok = false;
+                    break;
+                };
+                if (group.account.len > max_account_len or !std.crypto.timing_safe.eql(Digest, digest, accountDigest(group.account))) {
+                    integrity_ok = false;
+                    break;
+                }
+                if (work == max_inventory_scan_work) break;
+                work += 1;
+                if (builtin.is_test) _ = @constCast(&self.inventory_row_visits).fetchAdd(1, .monotonic);
+                out[count] = .{ .token = key.token, .attachment_id = null, .origin_node = group.revision.origin_node, .signon_ms = 0, .attached = false, .fresh = true, .inventory_complete = true, .revoked = true };
+                count += 1;
+            } else {
+                const entry = self.entries.getPtr(key) orelse {
+                    integrity_ok = false;
+                    break;
+                };
+                // This selector index is never authorization. Even an invalid
+                // stored locator/image cannot expose foreign account metadata.
+                if (entry.account.len > max_account_len or !std.crypto.timing_safe.eql(Digest, digest, accountDigest(entry.account)) or
+                    entry.wire.len < offer_fixed_len + signature_wire_len or
+                    entry.wire.len > session_replica_transport.max_signed_payload_len or
+                    !std.mem.eql(u8, entry.wire[0..offer_magic.len], &offer_magic) or
+                    entry.inventory.len % inventory_row_len != 0 or entry.inventory.len / inventory_row_len > max_inventory_attachments)
+                {
+                    integrity_ok = false;
+                    break;
+                }
+                const operation = entry.wire[offer_magic.len];
+                const complete = operation == @backingInt(OfferOperation.inventory_upsert);
+                if ((!complete and operation != @backingInt(OfferOperation.upsert)) or (!complete and entry.inventory.len != 0)) {
+                    integrity_ok = false;
+                    break;
+                }
+                const inventory = Inventory{ .bytes = entry.inventory };
+                const row_count = if (complete) inventory.count() else 1;
+                if (cursor.attachment_index >= row_count and !(row_count == 0 and cursor.attachment_index == 0)) return error.InvalidCursor;
+                if (entry.quarantine_until_ms == null and !self.quarantines.contains(key.token)) {
+                    // The canonical image was authenticated at admission. Read
+                    // only its bounded fixed operation and signer suffix here.
+                    const signer = entry.wire[entry.wire.len - signature_wire_len ..][0..@sizeOf(sign.PublicKey)].*;
+                    const lease_live = if (self.attachment_leases.get(key)) |lease|
+                        !lease.conflicted and now_ms <= lease.expires_at_ms and lease.revision.compare(entry.revision) == .gt and
+                            std.crypto.timing_safe.eql(sign.PublicKey, lease.signer, signer)
+                    else
+                        false;
+                    while (cursor.attachment_index < row_count) {
+                        if (count == limit or work == max_inventory_scan_work) break :scan;
+                        work += 1;
+                        if (builtin.is_test) _ = @constCast(&self.inventory_row_visits).fetchAdd(1, .monotonic);
+                        if (complete) {
+                            const row = inventory.at(cursor.attachment_index);
+                            const unordered = if (cursor.attachment_index > 0)
+                                std.mem.order(u8, entry.inventory[(cursor.attachment_index - 1) * inventory_row_len ..][0..16], &row.attachment_id) != .lt
+                            else
+                                false;
+                            if (std.mem.allEqual(u8, &row.attachment_id, 0) or row.signon_ms < 0 or entry.inventory[cursor.attachment_index * inventory_row_len + 24] > 1 or unordered) {
+                                integrity_ok = false;
+                                break :scan;
+                            }
+                            out[count] = .{ .token = key.token, .attachment_id = row.attachment_id, .origin_node = key.origin_node, .signon_ms = row.signon_ms, .attached = row.attached, .fresh = now_ms <= entry.expires_at_ms and (!row.attached or lease_live), .inventory_complete = true };
+                        } else out[count] = .{ .token = key.token, .attachment_id = null, .origin_node = key.origin_node, .signon_ms = 0, .attached = false, .fresh = false, .inventory_complete = false };
+                        count += 1;
+                        cursor.attachment_index += 1;
+                    }
+                }
+            }
+            cursor.origin_index += 1;
+            cursor.attachment_index = 0;
+        }
+        const complete = integrity_ok and cursor.origin_index == bucket.origins.items.len;
+        return .{ .items = out[0..count], .next = if (complete or !integrity_ok) null else cursor, .complete = complete, .integrity_ok = integrity_ok, .generation = bucket.generation, .work_used = work };
+    }
+
+    // Derived cursor generations are published only after every fallible
+    // reservation. Exhaustion disables scans rather than reusing a generation.
+    fn bumpInventoryAccount(self: *Store, account: []const u8) void {
+        if (self.inventory_generation == std.math.maxInt(u64)) {
+            self.inventory_generation_exhausted = true;
+            return;
+        }
+        self.inventory_generation += 1;
+        if (self.account_index.getPtr(accountDigest(account))) |bucket|
+            bucket.generation = self.inventory_generation;
+    }
+
+    fn reserveAccountOrigin(self: *Store, account: []const u8, key: OriginKey) std.mem.Allocator.Error!bool {
+        const digest = accountDigest(account);
+        if (self.account_index.getPtr(digest)) |bucket| {
+            for (bucket.origins.items) |old| if (std.meta.eql(old, key)) return false;
+            try bucket.origins.ensureUnusedCapacity(self.allocator, 1);
+        } else {
+            var bucket: AccountInventoryIndex = .{};
+            errdefer bucket.origins.deinit(self.allocator);
+            try bucket.origins.ensureUnusedCapacity(self.allocator, 1);
+            try self.account_index.put(self.allocator, digest, bucket);
+        }
+        return true;
+    }
+
+    fn removeAccountOrigin(self: *Store, account: []const u8, key: OriginKey) void {
+        const digest = accountDigest(account);
+        const bucket = self.account_index.getPtr(digest) orelse unreachable;
+        for (bucket.origins.items, 0..) |old, i| {
+            if (!std.meta.eql(old, key)) continue;
+            self.bumpInventoryAccount(account);
+            _ = bucket.origins.swapRemove(i);
+            if (bucket.origins.items.len == 0) {
+                bucket.origins.deinit(self.allocator);
+                _ = self.account_index.remove(digest);
+            }
+            return;
+        }
+        unreachable;
+    }
+
+    fn removeLeasesForToken(self: *Store, token: Token) void {
+        while (true) {
+            var victim: ?OriginKey = null;
+            var entries = self.attachment_leases.keyIterator();
+            while (entries.next()) |key| if (tokenEql(key.token, token)) {
+                victim = key.*;
+                break;
+            };
+            const key = victim orelse break;
+            const removed = self.attachment_leases.fetchRemove(key).?;
+            freeAttachmentLease(self.allocator, removed.value);
+        }
     }
 
     /// Cheap discriminator for Helix mesh-checkpoint capsules. Full integrity,
@@ -790,7 +1486,8 @@ pub const Store = struct {
         if (self.entries.count() > std.math.maxInt(u32) or
             self.attachment_leases.count() > std.math.maxInt(u32) or
             self.tombstones.count() > std.math.maxInt(u32) or
-            self.quarantines.count() > std.math.maxInt(u32)) return error.TooLarge;
+            self.quarantines.count() > std.math.maxInt(u32) or
+            self.group_revocations.count() > std.math.maxInt(u32)) return error.TooLarge;
 
         var total_len: usize = upgrade_checkpoint_header_len;
         var entry_it = @constCast(&self.entries).valueIterator();
@@ -826,6 +1523,10 @@ pub const Store = struct {
                 try checkpointAddLen(&total_len, wire.len);
             }
         }
+        var groups = @constCast(&self.group_revocations).valueIterator();
+        while (groups.next()) |group| {
+            try checkpointAddLen(&total_len, 4 + group.wire.len);
+        }
         try checkpointAddLen(&total_len, upgrade_checkpoint_checksum_len);
 
         var out = try allocator.alloc(u8, total_len);
@@ -838,6 +1539,7 @@ pub const Store = struct {
         writer.writeU32(@intCast(self.tombstones.count()));
         writer.writeU32(@intCast(self.quarantines.count()));
         writer.writeU32(@intCast(self.attachment_leases.count()));
+        writer.writeU32(@intCast(self.group_revocations.count()));
 
         entry_it = @constCast(&self.entries).valueIterator();
         while (entry_it.next()) |entry| {
@@ -869,6 +1571,9 @@ pub const Store = struct {
             if (lease.conflict_wire) |wire| try checkpointWriteWire(&writer, wire);
         }
 
+        groups = @constCast(&self.group_revocations).valueIterator();
+        while (groups.next()) |group| try checkpointWriteWire(&writer, group.wire);
+
         std.debug.assert(writer.pos + upgrade_checkpoint_checksum_len == out.len);
         const checksum = digestBytes(out[0..writer.pos]);
         writer.writeBytes(&checksum);
@@ -880,11 +1585,12 @@ pub const Store = struct {
     /// caller-visible state can change. Signed facts are validated at capture
     /// time so a harmless wall-clock rollback cannot invalidate an accepted
     /// checkpoint; expiry is then swept at the restore wall time.
-    pub fn restoreUpgradeCheckpoint(
+    fn restoreVersionedUpgradeCheckpoint(
         allocator: std.mem.Allocator,
         cfg: Config,
         bytes: []const u8,
         restore_now_ms: i64,
+        allow_cold_legacy: bool,
     ) UpgradeCheckpointError!Store {
         if (bytes.len < upgrade_checkpoint_v1_header_len + upgrade_checkpoint_checksum_len) return error.Truncated;
         if (!Store.isUpgradeCheckpoint(bytes)) return error.BadMagic;
@@ -897,18 +1603,19 @@ pub const Store = struct {
         var reader = UpgradeCheckpointReader{ .bytes = bytes[0..body_end] };
         _ = try reader.take(upgrade_checkpoint_magic.len);
         const version = try reader.readByte();
-        if (version != upgrade_checkpoint_v1_version and version != upgrade_checkpoint_version)
-            return error.UnsupportedVersion;
+        if (version != upgrade_checkpoint_version and
+            !(allow_cold_legacy and (version == upgrade_checkpoint_v1_version or version == upgrade_checkpoint_v2_version))) return error.UnsupportedVersion;
         const captured_at_ms = try reader.readI64();
         if (captured_at_ms < 0) return error.InvalidMetadata;
         const entry_count: usize = try reader.readU32();
         const tombstone_count: usize = try reader.readU32();
         const quarantine_count: usize = try reader.readU32();
-        const attachment_lease_count: usize = if (version >= upgrade_checkpoint_version)
+        const attachment_lease_count: usize = if (version >= upgrade_checkpoint_v2_version)
             try reader.readU32()
         else
             0;
-        if (entry_count > cfg.max_entries or
+        const group_count: usize = if (version >= upgrade_checkpoint_version) try reader.readU32() else 0;
+        if (group_count > cfg.max_group_revocations or entry_count > cfg.max_entries or
             tombstone_count > cfg.max_tombstones or
             quarantine_count > cfg.max_quarantines or
             attachment_lease_count > cfg.max_attachment_leases)
@@ -922,6 +1629,7 @@ pub const Store = struct {
         try checkpointAddProduct(&minimum_record_bytes, tombstone_count, 4 + 1 + 8 + 1 + 1);
         try checkpointAddProduct(&minimum_record_bytes, quarantine_count, 4 + 1 + 4 + 1 + 8 + 8);
         try checkpointAddProduct(&minimum_record_bytes, attachment_lease_count, 4 + 1 + 1);
+        try checkpointAddProduct(&minimum_record_bytes, group_count, 4 + 1);
         if (minimum_record_bytes > reader.bytes.len - reader.pos) return error.Truncated;
 
         var restored = initWithConfig(allocator, cfg);
@@ -961,6 +1669,20 @@ pub const Store = struct {
             };
             try restored.restoreCheckpointAttachmentLease(wire, conflict_tag != 0, conflict_wire, captured_at_ms);
         }
+        for (0..group_count) |_| {
+            const wire = try checkpointReadWire(&reader);
+            const signed = restored.validateCheckpointSignedOffer(wire, .group_revoke, captured_at_ms) catch return error.InvalidSignedObject;
+            const token = signed.offer.token;
+            if (restored.group_revocations.contains(token) or restored.hasAnyCheckpointState(token) or restored.quarantines.contains(token)) return error.DuplicateState;
+            var leases = restored.attachment_leases.keyIterator();
+            while (leases.next()) |key| if (tokenEql(key.token, token)) return error.DuplicateState;
+            var ticket = restored.prepareGroupRevoke(signed, captured_at_ms) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidMetadata,
+            };
+            defer ticket.deinit();
+            _ = ticket.commit();
+        }
         if (reader.pos != reader.bytes.len) return error.TrailingBytes;
 
         // Cross-map invariants are checked only after all facts are present.
@@ -969,23 +1691,20 @@ pub const Store = struct {
         return restored;
     }
 
-    /// Restore only the exact current v2 checkpoint shape.
-    ///
-    /// `restoreUpgradeCheckpoint` intentionally retains the v1 rolling-upgrade
-    /// arm for explicit legacy capsules. A current outer Helix wrapper must use
-    /// this entry point so an inner v1 payload cannot omit the attachment-lease
-    /// count/state while presenting itself as current.
-    pub fn restoreCurrentUpgradeCheckpoint(
-        allocator: std.mem.Allocator,
-        cfg: Config,
-        bytes: []const u8,
-        restore_now_ms: i64,
-    ) UpgradeCheckpointError!Store {
-        if (bytes.len < upgrade_checkpoint_magic.len + 1) return error.Truncated;
-        if (!Store.isUpgradeCheckpoint(bytes)) return error.BadMagic;
-        if (bytes[upgrade_checkpoint_magic.len] != upgrade_checkpoint_version)
-            return error.UnsupportedVersion;
+    /// Current Helix and durable staging require every current state family,
+    /// including terminal group fences. Legacy omissions are never inferred.
+    pub fn restoreUpgradeCheckpoint(allocator: std.mem.Allocator, cfg: Config, bytes: []const u8, restore_now_ms: i64) UpgradeCheckpointError!Store {
+        return restoreVersionedUpgradeCheckpoint(allocator, cfg, bytes, restore_now_ms, false);
+    }
+
+    pub fn restoreCurrentUpgradeCheckpoint(allocator: std.mem.Allocator, cfg: Config, bytes: []const u8, restore_now_ms: i64) UpgradeCheckpointError!Store {
         return restoreUpgradeCheckpoint(allocator, cfg, bytes, restore_now_ms);
+    }
+
+    /// Explicit accepted cold-migration boundary; callers must restore durable
+    /// group fences before publishing this detached legacy store.
+    pub fn restoreColdMigrationCheckpoint(allocator: std.mem.Allocator, cfg: Config, bytes: []const u8, restore_now_ms: i64) UpgradeCheckpointError!Store {
+        return restoreVersionedUpgradeCheckpoint(allocator, cfg, bytes, restore_now_ms, true);
     }
 
     /// Atomically replace this Store. On corruption, capacity pressure, or OOM,
@@ -996,6 +1715,11 @@ pub const Store = struct {
         restore_now_ms: i64,
     ) UpgradeCheckpointError!void {
         var replacement = try restoreUpgradeCheckpoint(self.allocator, self.cfg, bytes, restore_now_ms);
+        errdefer replacement.deinit();
+        var groups = self.group_revocations.iterator();
+        while (groups.next()) |group| {
+            if (!replacement.isGroupRevoked(group.value_ptr.account, group.key_ptr.*)) return error.InvalidMetadata;
+        }
         const old = self.*;
         self.* = replacement;
         replacement = old;
@@ -1005,9 +1729,25 @@ pub const Store = struct {
     /// Verify and converge a signed OFFER learned through `via_peer`. Zero means
     /// locally seeded state and deliberately creates no route.
     pub fn applySignedOffer(self: *Store, signed: SignedOffer, via_peer: NodeId, now_ms: i64) ApplyError!ApplyResult {
-        try verifyOffer(signed);
+        return self.applySignedOfferInner(signed, via_peer, now_ms, null);
+    }
+    /// Signature-only memo. Caller must recheck current issuer/cohort authority
+    /// and authenticated peer before every call; no trust is cached here.
+    pub fn applySignedOfferMemoized(self: *Store, signed: SignedOffer, via_peer: NodeId, now_ms: i64, memo: *OfferSignatureMemo, authority: OfferMemoAuthority) ApplyError!ApplyResult {
+        return self.applySignedOfferInner(signed, via_peer, now_ms, .{ .memo = memo, .authority = authority });
+    }
+    const MemoInput = struct { memo: *OfferSignatureMemo, authority: OfferMemoAuthority };
+    fn applySignedOfferInner(self: *Store, signed: SignedOffer, via_peer: NodeId, now_ms: i64, memo: ?MemoInput) ApplyError!ApplyResult {
         const offer = signed.offer;
+        if (offer.operation == .group_revoke) {
+            var prepared = try self.prepareGroupRevoke(signed, now_ms);
+            defer prepared.deinit();
+            const disposition = prepared.commit();
+            return .{ .disposition = disposition, .current_revision = self.group_revocations.get(offer.token).?.revision };
+        }
+        if (memo) |m| try m.memo.verify(signed, m.authority, now_ms) else try verifyOffer(signed);
         try self.validateOfferForStore(offer, now_ms);
+        if (self.group_revocations.get(offer.token)) |group| return .{ .disposition = .tombstoned, .current_revision = group.revision };
         const digest = digestBytes(signed.transcript);
         return self.applyVerifiedOffer(signed, digest, via_peer, now_ms);
     }
@@ -1024,7 +1764,7 @@ pub const Store = struct {
         if (via_peer == 0) return .ignored;
         switch (ack.status) {
             .accepted, .duplicate, .superseded => {},
-            .conflict, .stale, .tombstoned, .capacity => return .ignored,
+            .conflict, .stale, .tombstoned, .capacity, .current_ready, .group_revoked => return .ignored,
         }
         if (ack.offered_revision.origin_node != ack.observed_revision.origin_node) return .stale;
         if (!ack.offered_revision.eql(ack.observed_revision)) return .stale;
@@ -1044,6 +1784,7 @@ pub const Store = struct {
     ) AttachmentLeaseApplyError!AttachmentLeaseDisposition {
         try verifyAttachmentLease(signed);
         const lease = signed.lease;
+        if (self.group_revocations.contains(lease.token)) return .stale;
         validateAttachmentLeaseShape(lease) catch return error.InvalidAttachmentLease;
         validateLifetime(
             lease.issued_at_ms,
@@ -1101,7 +1842,13 @@ pub const Store = struct {
     /// Return the live fact asserted by exactly one origin. Token comparison is
     /// constant-time; the public lookup deliberately does not use hash equality.
     pub fn getOrigin(self: *const Store, token: Token, origin_node: NodeId) ?*const Entry {
-        if (self.isQuarantined(token)) return null;
+        const entry = self.getOriginInventory(token, origin_node) orelse return null;
+        return if (entry.resume_eligible) entry else null;
+    }
+
+    /// Inventory-only lookup. Never use this as remote resume authority.
+    pub fn getOriginInventory(self: *const Store, token: Token, origin_node: NodeId) ?*const Entry {
+        if (self.group_revocations.contains(token) or self.isQuarantined(token)) return null;
         var it = @constCast(&self.entries).iterator();
         while (it.next()) |slot| {
             if (slot.key_ptr.origin_node == origin_node and tokenEql(slot.key_ptr.token, token)) return slot.value_ptr;
@@ -1109,11 +1856,14 @@ pub const Store = struct {
         return null;
     }
 
+    /// Retained receipt metadata, including inventory-only origins. This is
+    /// not positive presence or resume authority; use hasAttachedOriginOtherThan.
     pub fn getAttachmentLease(
         self: *const Store,
         token: Token,
         origin_node: NodeId,
     ) ?*const AttachmentLeaseEntry {
+        if (self.group_revocations.contains(token)) return null;
         var it = @constCast(&self.attachment_leases).iterator();
         while (it.next()) |slot| {
             if (slot.key_ptr.origin_node == origin_node and tokenEql(slot.key_ptr.token, token)) return slot.value_ptr;
@@ -1124,10 +1874,11 @@ pub const Store = struct {
     /// Deterministic current identity projection for callers that need one
     /// representative. Concurrent origins remain stored and addressable.
     pub fn bestIdentity(self: *const Store, token: Token) ?*const Entry {
-        if (self.isQuarantined(token)) return null;
+        if (self.group_revocations.contains(token) or self.isQuarantined(token)) return null;
         var best: ?*const Entry = null;
         var it = @constCast(&self.entries).iterator();
         while (it.next()) |slot| {
+            if (!slot.value_ptr.resume_eligible) continue;
             if (!tokenEql(slot.key_ptr.token, token)) continue;
             if (best == null or slot.value_ptr.revision.compare(best.?.revision) == .gt) best = slot.value_ptr;
         }
@@ -1137,10 +1888,11 @@ pub const Store = struct {
     /// Deterministic representative restricted to signed facts that remain
     /// live at `now_ms`; safe for hot paths between periodic sweeps.
     pub fn bestLiveIdentity(self: *const Store, token: Token, now_ms: i64) ?*const Entry {
-        if (self.isQuarantined(token)) return null;
+        if (self.group_revocations.contains(token) or self.isQuarantined(token)) return null;
         var best: ?*const Entry = null;
         var it = @constCast(&self.entries).iterator();
         while (it.next()) |slot| {
+            if (!slot.value_ptr.resume_eligible) continue;
             if (!tokenEql(slot.key_ptr.token, token) or now_ms > slot.value_ptr.expires_at_ms) continue;
             if (best == null or slot.value_ptr.revision.compare(best.?.revision) == .gt) best = slot.value_ptr;
         }
@@ -1167,6 +1919,7 @@ pub const Store = struct {
             var candidate: ?Token = null;
             var it = @constCast(&self.entries).iterator();
             while (it.next()) |slot| {
+                if (!slot.value_ptr.resume_eligible) continue;
                 if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.expires_at_ms) continue;
                 const token = slot.key_ptr.token;
                 if (lower_bound) |lower| {
@@ -1201,12 +1954,13 @@ pub const Store = struct {
             }
             var entry_it = @constCast(&self.entries).iterator();
             while (entry_it.next()) |slot| {
+                if (!slot.value_ptr.resume_eligible) continue;
                 if (now_ms > slot.value_ptr.expires_at_ms) continue;
                 considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
             }
             var lease_it = @constCast(&self.attachment_leases).iterator();
             while (lease_it.next()) |slot| {
-                if (slot.value_ptr.conflicted or now_ms > slot.value_ptr.expires_at_ms) continue;
+                if (slot.value_ptr.conflicted or now_ms > slot.value_ptr.expires_at_ms or self.getOrigin(slot.key_ptr.token, slot.key_ptr.origin_node) == null) continue;
                 considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
             }
             var tombstone_it = @constCast(&self.tombstones).iterator();
@@ -1310,6 +2064,7 @@ pub const Store = struct {
             var candidate_nick: []const u8 = &.{};
             var it = @constCast(&self.entries).iterator();
             while (it.next()) |slot| {
+                if (!slot.value_ptr.resume_eligible) continue;
                 if (!tokenEql(slot.key_ptr.token, token) or
                     slot.value_ptr.quarantine_until_ms != null or
                     now_ms > slot.value_ptr.expires_at_ms) continue;
@@ -1342,6 +2097,7 @@ pub const Store = struct {
         var match: ?LiveIdentity = null;
         var it = @constCast(&self.entries).iterator();
         while (it.next()) |slot| {
+            if (!slot.value_ptr.resume_eligible) continue;
             if (slot.key_ptr.origin_node != origin_node or now_ms > slot.value_ptr.expires_at_ms) continue;
             // Full quarantine removes token entries; the embedded marker is the
             // allocation-failure fallback and must be checked directly here.
@@ -1368,6 +2124,7 @@ pub const Store = struct {
         if (account.len == 0 or nick.len == 0) return false;
         var it = @constCast(&self.entries).iterator();
         while (it.next()) |slot| {
+            if (!slot.value_ptr.resume_eligible) continue;
             if (now_ms > slot.value_ptr.expires_at_ms) continue;
             if (!std.ascii.eqlIgnoreCase(slot.value_ptr.account, account) or
                 !std.ascii.eqlIgnoreCase(slot.value_ptr.nick, nick)) continue;
@@ -1384,7 +2141,7 @@ pub const Store = struct {
             const wires = [_][]const u8{ quarantine.first_wire, quarantine.second_wire };
             for (wires) |wire| {
                 const signed = decodeOffer(wire) catch continue;
-                if (signed.offer.operation != .upsert) continue;
+                if (!signed.offer.allowsResume()) continue;
                 if (std.ascii.eqlIgnoreCase(signed.offer.account, account) and
                     std.ascii.eqlIgnoreCase(signed.offer.nick, nick)) return true;
             }
@@ -1401,6 +2158,7 @@ pub const Store = struct {
         if (nick.len == 0) return false;
         var it = @constCast(&self.entries).valueIterator();
         while (it.next()) |entry| {
+            if (!entry.resume_eligible) continue;
             if (now_ms > entry.expires_at_ms) continue;
             if (std.ascii.eqlIgnoreCase(entry.nick, nick)) return true;
         }
@@ -1410,7 +2168,7 @@ pub const Store = struct {
             const wires = [_][]const u8{ quarantine.first_wire, quarantine.second_wire };
             for (wires) |wire| {
                 const signed = decodeOffer(wire) catch continue;
-                if (signed.offer.operation == .upsert and
+                if (signed.offer.allowsResume() and
                     std.ascii.eqlIgnoreCase(signed.offer.nick, nick)) return true;
             }
         }
@@ -1474,6 +2232,8 @@ pub const Store = struct {
         while (lease_it.next()) |lease| checkpointRaiseRevision(&maximum, lease.revision);
         var tombstone_it = @constCast(&self.tombstones).valueIterator();
         while (tombstone_it.next()) |tombstone| checkpointRaiseRevision(&maximum, tombstone.revision);
+        var groups = @constCast(&self.group_revocations).valueIterator();
+        while (groups.next()) |group| checkpointRaiseRevision(&maximum, group.revision);
         var quarantine_it = @constCast(&self.quarantines).valueIterator();
         while (quarantine_it.next()) |quarantine| {
             const wires = [_][]const u8{ quarantine.first_wire, quarantine.second_wire };
@@ -1523,7 +2283,7 @@ pub const Store = struct {
             if (lease.conflicted and lease.conflict_wire == null) continue;
             count += 1 + @as(usize, @intFromBool(lease.conflict_wire != null));
         }
-        return count;
+        return count + self.group_revocations.count();
     }
 
     /// Copy bounded borrowed views of every nonexpired current signed object.
@@ -1607,6 +2367,16 @@ pub const Store = struct {
             };
             count += 1;
         }
+        var groups = @constCast(&self.group_revocations).valueIterator();
+        while (groups.next()) |group| {
+            if (seen < skip) {
+                seen += 1;
+                continue;
+            }
+            if (count == out.len) return count;
+            out[count] = retainedObjectFromWire(group.wire);
+            count += 1;
+        }
         return count;
     }
 
@@ -1666,9 +2436,12 @@ pub const Store = struct {
                 .digest = slot.value_ptr.digest,
             }, out, &count);
         }
+        var groups = @constCast(&self.group_revocations).valueIterator();
+        while (groups.next()) |group| considerRetainedObject(after, retainedObjectFromWire(group.wire), out, &count);
         return count;
     }
 
+    /// Retained inventory count, including non-authorizing origin records.
     pub fn originCountForToken(self: *const Store, token: Token) usize {
         var count: usize = 0;
         var it = @constCast(&self.entries).keyIterator();
@@ -1685,6 +2458,7 @@ pub const Store = struct {
     pub fn hasLiveOriginOtherThan(self: *const Store, token: Token, excluded_origin: NodeId, now_ms: i64) bool {
         var it = @constCast(&self.entries).iterator();
         while (it.next()) |slot| {
+            if (!slot.value_ptr.resume_eligible) continue;
             if (!tokenEql(slot.key_ptr.token, token) or slot.key_ptr.origin_node == excluded_origin) continue;
             if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.expires_at_ms) continue;
             return true;
@@ -1857,6 +2631,7 @@ pub const Store = struct {
             }
             const key = victim orelse break;
             if (self.entries.fetchRemove(key)) |removed| {
+                self.removeAccountOrigin(removed.value.account, key);
                 freeEntry(self.allocator, removed.value);
                 result.entries += 1;
                 result.routes += self.removeRoutesForOrigin(key.token, key.origin_node);
@@ -1917,7 +2692,10 @@ pub const Store = struct {
         var entry_it = self.entries.valueIterator();
         while (entry_it.next()) |entry| {
             if (entry.quarantine_until_ms) |until_ms| {
-                if (now_ms > until_ms) entry.quarantine_until_ms = null;
+                if (now_ms > until_ms) {
+                    self.bumpInventoryAccount(entry.account);
+                    entry.quarantine_until_ms = null;
+                }
             }
         }
         var tombstone_it = self.tombstones.valueIterator();
@@ -1932,14 +2710,16 @@ pub const Store = struct {
     fn validateOfferForStore(self: *const Store, offer: Offer, now_ms: i64) ApplyError!void {
         validateOfferShape(offer) catch return error.InvalidOffer;
         if (offer.account.len > self.cfg.max_account_bytes or offer.nick.len > self.cfg.max_nick_bytes or offer.snapshot.len > self.cfg.max_snapshot_bytes) return error.InvalidOffer;
-        try validateLifetime(offer.issued_at_ms, offer.expires_at_ms, now_ms, self.cfg.max_offer_lifetime_ms, self.cfg.max_future_skew_ms);
+        validateLifetime(offer.issued_at_ms, offer.expires_at_ms, now_ms, self.cfg.max_offer_lifetime_ms, self.cfg.max_future_skew_ms) catch |err| {
+            if (err != error.Expired or offer.operation != .group_revoke) return err;
+        };
         try validateRevisionAt(offer.revision, now_ms, self.cfg.max_future_skew_ms);
     }
 
     fn applyVerifiedOffer(self: *Store, signed: SignedOffer, digest: Digest, via_peer: NodeId, now_ms: i64) ApplyError!ApplyResult {
         const offer = signed.offer;
         if (self.hasFullQuarantine(offer.token)) return .{ .disposition = .quarantined, .current_revision = offer.revision };
-        if (offer.operation == .upsert) {
+        if ((offer.operation == .upsert or offer.operation == .inventory_upsert)) {
             if (self.findIdentityConflict(offer.token, offer.account, now_ms)) |conflict| {
                 if (conflict.wire) |wire| {
                     try self.installQuarantine(signed, wire, conflict.expires_at_ms, now_ms);
@@ -1967,14 +2747,15 @@ pub const Store = struct {
                     if (!std.crypto.timing_safe.eql(Digest, current_digest, digest)) {
                         if (std.mem.order(u8, &digest, &current_digest) == .lt) {
                             switch (offer.operation) {
-                                .upsert => try self.installUpsert(signed, digest, via_peer, now_ms),
+                                .upsert, .inventory_upsert => try self.installUpsert(signed, digest, via_peer, now_ms),
                                 .remove => try self.installTombstone(signed, digest, now_ms),
+                                .group_revoke => unreachable,
                             }
                             return .{ .disposition = .conflict_replaced, .current_revision = current };
                         }
                         return .{ .disposition = .conflict, .current_revision = current };
                     }
-                    if (offer.operation == .upsert and entry != null) {
+                    if ((offer.operation == .upsert or offer.operation == .inventory_upsert) and entry != null) {
                         // The first ingress is pinned for this exact revision.
                         // A reflected duplicate from another peer must not form
                         // an alternate path back toward the first parent.
@@ -1996,8 +2777,9 @@ pub const Store = struct {
             .superseded;
 
         switch (offer.operation) {
-            .upsert => try self.installUpsert(signed, digest, via_peer, now_ms),
+            .upsert, .inventory_upsert => try self.installUpsert(signed, digest, via_peer, now_ms),
             .remove => try self.installTombstone(signed, digest, now_ms),
+            .group_revoke => unreachable,
         }
         return .{ .disposition = disposition, .current_revision = offer.revision };
     }
@@ -2010,7 +2792,7 @@ pub const Store = struct {
 
         const route_key = RouteKey{ .token = offer.token, .destination = offer.revision.origin_node, .next_hop = via_peer };
         const removable_routes = self.routeCountForOrigin(offer.token, offer.revision.origin_node);
-        const wants_route = via_peer != 0;
+        const wants_route = via_peer != 0 and offer.allowsResume();
         if (wants_route and self.routes.count() - removable_routes >= self.cfg.max_routes) return error.RouteFull;
 
         const wire = try ownSignedOffer(self.allocator, signed);
@@ -2020,13 +2802,31 @@ pub const Store = struct {
         if (!replacing_entry) try self.entries.ensureUnusedCapacity(self.allocator, 1);
         if (wants_route and removable_routes == 0) try self.routes.ensureUnusedCapacity(self.allocator, 1);
 
+        const add_account_origin = try self.reserveAccountOrigin(offer.account, key);
+        const inventory_changed = if (self.getOriginMutable(offer.token, offer.revision.origin_node)) |old|
+            old.resume_eligible != owned.offer.allowsResume() or
+                old.quarantine_until_ms != null or
+                old.wire[offer_magic.len] != wire[offer_magic.len] or
+                !std.mem.eql(u8, old.inventory, owned.offer.inventory)
+        else
+            true;
+        if (add_account_origin) self.account_index.getPtr(accountDigest(offer.account)).?.origins.appendAssumeCapacity(key);
+        if (add_account_origin or inventory_changed) self.bumpInventoryAccount(offer.account);
+
         if (self.getOriginMutable(offer.token, offer.revision.origin_node)) |old| {
+            // Expired authority may be rebound to a different account before
+            // sweep removes it. Retire its old account index only after every
+            // replacement allocation succeeds, and before freeing its key.
+            if (!std.ascii.eqlIgnoreCase(old.account, owned.offer.account))
+                self.removeAccountOrigin(old.account, key);
             freeEntry(self.allocator, old.*);
             old.* = .{
                 .wire = wire,
                 .account = owned.offer.account,
                 .nick = owned.offer.nick,
                 .snapshot = owned.offer.snapshot,
+                .inventory = owned.offer.inventory,
+                .resume_eligible = owned.offer.allowsResume(),
                 .revision = offer.revision,
                 .issued_at_ms = offer.issued_at_ms,
                 .expires_at_ms = offer.expires_at_ms,
@@ -2041,6 +2841,8 @@ pub const Store = struct {
                 .account = owned.offer.account,
                 .nick = owned.offer.nick,
                 .snapshot = owned.offer.snapshot,
+                .inventory = owned.offer.inventory,
+                .resume_eligible = owned.offer.allowsResume(),
                 .revision = offer.revision,
                 .issued_at_ms = offer.issued_at_ms,
                 .expires_at_ms = offer.expires_at_ms,
@@ -2052,7 +2854,7 @@ pub const Store = struct {
         }
         if (self.tombstones.fetchRemove(key)) |removed| freeTombstone(self.allocator, removed.value);
         _ = self.removeRoutesForOrigin(offer.token, offer.revision.origin_node);
-        if (via_peer != 0) self.putRouteAssumeCapacity(route_key, offer.revision, now_ms);
+        if (wants_route) self.putRouteAssumeCapacity(route_key, offer.revision, now_ms);
     }
 
     fn installTombstone(self: *Store, signed: SignedOffer, digest: Digest, now_ms: i64) ApplyError!void {
@@ -2069,11 +2871,14 @@ pub const Store = struct {
         const identity_digest = if (existing_tombstone) |old|
             old.identity_digest orelse self.identityDigestForToken(offer.token)
         else if (self.getOriginMutable(offer.token, offer.revision.origin_node)) |entry|
-            digestBytes(entry.account)
+            accountDigest(entry.account)
         else
             self.identityDigestForToken(offer.token);
 
-        if (self.entries.fetchRemove(key)) |removed| freeEntry(self.allocator, removed.value);
+        if (self.entries.fetchRemove(key)) |removed| {
+            self.removeAccountOrigin(removed.value.account, key);
+            freeEntry(self.allocator, removed.value);
+        }
         _ = self.removeRoutesForOrigin(offer.token, offer.revision.origin_node);
         const value = Tombstone{
             .wire = wire,
@@ -2193,7 +2998,7 @@ pub const Store = struct {
     fn identityDigestForToken(self: *const Store, token: Token) ?Digest {
         var entry_it = @constCast(&self.entries).iterator();
         while (entry_it.next()) |slot| {
-            if (tokenEql(slot.key_ptr.token, token)) return digestBytes(slot.value_ptr.account);
+            if (tokenEql(slot.key_ptr.token, token)) return accountDigest(slot.value_ptr.account);
         }
         var tombstone_it = @constCast(&self.tombstones).iterator();
         while (tombstone_it.next()) |slot| {
@@ -2208,12 +3013,12 @@ pub const Store = struct {
     };
 
     fn findIdentityConflict(self: *const Store, token: Token, account: []const u8, now_ms: i64) ?IdentityConflictEvidence {
-        const account_digest = digestBytes(account);
+        const account_digest = accountDigest(account);
         var entry_it = @constCast(&self.entries).iterator();
         while (entry_it.next()) |slot| {
             if (!tokenEql(slot.key_ptr.token, token)) continue;
             if (now_ms > slot.value_ptr.expires_at_ms) continue;
-            if (!std.mem.eql(u8, slot.value_ptr.account, account)) return .{
+            if (!std.ascii.eqlIgnoreCase(slot.value_ptr.account, account)) return .{
                 .wire = slot.value_ptr.wire,
                 .expires_at_ms = slot.value_ptr.expires_at_ms,
             };
@@ -2292,7 +3097,10 @@ pub const Store = struct {
     fn markTokenDenied(self: *Store, token: Token, until_ms: i64) void {
         var entry_it = self.entries.iterator();
         while (entry_it.next()) |slot| {
-            if (tokenEql(slot.key_ptr.token, token)) slot.value_ptr.quarantine_until_ms = until_ms;
+            if (tokenEql(slot.key_ptr.token, token)) {
+                if (slot.value_ptr.quarantine_until_ms == null) self.bumpInventoryAccount(slot.value_ptr.account);
+                slot.value_ptr.quarantine_until_ms = until_ms;
+            }
         }
         var tombstone_it = self.tombstones.iterator();
         while (tombstone_it.next()) |slot| {
@@ -2312,7 +3120,10 @@ pub const Store = struct {
                 }
             }
             const key = victim orelse break;
-            if (self.entries.fetchRemove(key)) |removed| freeEntry(self.allocator, removed.value);
+            if (self.entries.fetchRemove(key)) |removed| {
+                self.removeAccountOrigin(removed.value.account, key);
+                freeEntry(self.allocator, removed.value);
+            }
         }
         while (true) {
             var victim: ?OriginKey = null;
@@ -2365,11 +3176,17 @@ pub const Store = struct {
         const wire = try self.allocator.dupe(u8, borrowed_wire);
         errdefer self.allocator.free(wire);
         const owned = decodeOffer(wire) catch unreachable;
+        const add_account_origin = try self.reserveAccountOrigin(owned.offer.account, key);
+        if (!add_account_origin) return error.DuplicateState;
+        self.account_index.getPtr(accountDigest(owned.offer.account)).?.origins.appendAssumeCapacity(key);
+        self.bumpInventoryAccount(owned.offer.account);
         self.entries.putAssumeCapacityNoClobber(key, .{
             .wire = wire,
             .account = owned.offer.account,
             .nick = owned.offer.nick,
             .snapshot = owned.offer.snapshot,
+            .inventory = owned.offer.inventory,
+            .resume_eligible = owned.offer.allowsResume(),
             .revision = owned.offer.revision,
             .issued_at_ms = owned.offer.issued_at_ms,
             .expires_at_ms = owned.offer.expires_at_ms,
@@ -2520,7 +3337,7 @@ pub const Store = struct {
         const signed = decodeOffer(wire) catch return error.InvalidSignedObject;
         verifyOffer(signed) catch return error.InvalidSignedObject;
         const offer = signed.offer;
-        if (offer.operation != operation or
+        if ((offer.operation != operation and !(operation == .upsert and offer.operation == .inventory_upsert)) or
             offer.account.len > self.cfg.max_account_bytes or
             offer.nick.len > self.cfg.max_nick_bytes or
             offer.snapshot.len > self.cfg.max_snapshot_bytes) return error.InvalidMetadata;
@@ -2544,11 +3361,11 @@ pub const Store = struct {
         var entry_it = @constCast(&self.entries).iterator();
         while (entry_it.next()) |left| {
             if (self.hasFullQuarantine(left.key_ptr.token)) return error.DuplicateState;
-            const expected = digestBytes(left.value_ptr.account);
+            const expected = accountDigest(left.value_ptr.account);
             var other_entry_it = @constCast(&self.entries).iterator();
             while (other_entry_it.next()) |right| {
                 if (!tokenEql(left.key_ptr.token, right.key_ptr.token)) continue;
-                if (!std.mem.eql(u8, left.value_ptr.account, right.value_ptr.account)) return error.InvalidMetadata;
+                if (!std.ascii.eqlIgnoreCase(left.value_ptr.account, right.value_ptr.account)) return error.InvalidMetadata;
             }
             var tombstone_it = @constCast(&self.tombstones).iterator();
             while (tombstone_it.next()) |tombstone| {
@@ -2647,11 +3464,11 @@ fn ownSignedAttachmentLease(
 fn retainedObjectFromWire(wire: []const u8) Store.RetainedObject {
     const signed = decodeOffer(wire) catch unreachable;
     return .{
-        .kind = if (signed.offer.operation == .upsert) .offer else .revoke,
+        .kind = if (signed.offer.operation == .group_revoke) .group_revoke else if (signed.offer.operation == .upsert or signed.offer.operation == .inventory_upsert) .offer else .revoke,
         .token = signed.offer.token,
         .origin_node = signed.offer.revision.origin_node,
         .revision = signed.offer.revision,
-        .expires_at_ms = signed.offer.expires_at_ms,
+        .expires_at_ms = if (signed.offer.operation == .group_revoke) std.math.maxInt(i64) else signed.offer.expires_at_ms,
         .wire = wire,
         .digest = digestBytes(signed.transcript),
     };
@@ -2718,6 +3535,31 @@ fn tokenEql(a: Token, b: Token) bool {
     return std.crypto.timing_safe.eql(Token, a, b);
 }
 
+fn accountDigest(account: []const u8) Digest {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    for (account) |byte| {
+        const folded: [1]u8 = .{std.ascii.toLower(byte)};
+        hasher.update(&folded);
+    }
+    var result: Digest = undefined;
+    hasher.final(&result);
+    return result;
+}
+
+fn considerInventory(after: ?InventoryCursor, row: InventoryRow, out: []InventoryRow, count: *usize, eligible: *usize) void {
+    const cursor = row.cursor();
+    if (after) |lower| if (cursor.compare(lower) != .gt) return;
+    eligible.* += 1;
+    if (out.len == 0) return;
+    var index: usize = 0;
+    while (index < count.* and cursor.compare(out[index].cursor()) == .gt) : (index += 1) {}
+    if (index == out.len) return;
+    const end = @min(count.*, out.len - 1);
+    std.mem.copyBackwards(InventoryRow, out[index + 1 .. end + 1], out[index..end]);
+    out[index] = row;
+    count.* = @min(count.* + 1, out.len);
+}
+
 fn offerEql(a: Offer, b: Offer) bool {
     return a.operation == b.operation and
         tokenEql(a.token, b.token) and
@@ -2726,7 +3568,9 @@ fn offerEql(a: Offer, b: Offer) bool {
         a.expires_at_ms == b.expires_at_ms and
         std.mem.eql(u8, a.account, b.account) and
         std.mem.eql(u8, a.nick, b.nick) and
-        std.mem.eql(u8, a.snapshot, b.snapshot);
+        std.mem.eql(u8, a.snapshot, b.snapshot) and
+        std.mem.eql(u8, a.inventory, b.inventory) and
+        a.resume_eligible == b.resume_eligible;
 }
 
 fn ackEql(a: Ack, b: Ack) bool {
@@ -2736,7 +3580,9 @@ fn ackEql(a: Ack, b: Ack) bool {
         a.observed_revision.eql(b.observed_revision) and
         a.ack_node == b.ack_node and
         a.issued_at_ms == b.issued_at_ms and
-        a.expires_at_ms == b.expires_at_ms;
+        a.expires_at_ms == b.expires_at_ms and
+        a.membership_epoch == b.membership_epoch and
+        std.crypto.timing_safe.eql(Digest, a.roster_digest, b.roster_digest);
 }
 
 fn attachmentLeaseEql(a: AttachmentLease, b: AttachmentLease) bool {
@@ -3007,7 +3853,8 @@ fn testDowngradeEmptyLeaseCheckpointToV1(allocator: std.mem.Allocator, v2: []con
     std.debug.assert(v2.len >= upgrade_checkpoint_header_len + upgrade_checkpoint_checksum_len);
     const lease_count_offset = upgrade_checkpoint_v1_header_len;
     std.debug.assert(std.mem.readInt(u32, v2[lease_count_offset..][0..4], .big) == 0);
-    var v1 = try allocator.alloc(u8, v2.len - 4);
+    std.debug.assert(std.mem.readInt(u32, v2[upgrade_checkpoint_v2_header_len..][0..4], .big) == 0);
+    var v1 = try allocator.alloc(u8, v2.len - 8);
     @memcpy(v1[0..lease_count_offset], v2[0..lease_count_offset]);
     v1[upgrade_checkpoint_magic.len] = upgrade_checkpoint_v1_version;
     @memcpy(v1[lease_count_offset..], v2[upgrade_checkpoint_header_len..]);
@@ -3574,7 +4421,7 @@ test "session replica OFFER decode rejects invalid operation and oversized decla
     defer testing.allocator.free(changed);
     changed[offer_magic.len] = 0xff;
     try testing.expectError(error.InvalidOffer, decodeOffer(changed));
-    changed[offer_magic.len] = @intFromEnum(OfferOperation.upsert);
+    changed[offer_magic.len] = @backingInt(OfferOperation.upsert);
     const account_len_offset = offer_magic.len + 1 + @sizeOf(Token) + revision_wire_len + 8 + 8;
     std.mem.writeInt(u16, changed[account_len_offset..][0..2], @intCast(max_account_len + 1), .big);
     try testing.expectError(error.TooLong, decodeOffer(changed));
@@ -3607,7 +4454,7 @@ test "session replica signed ACK round-trips verifies and rejects tampering" {
 
     var tampered = try testing.allocator.dupe(u8, wire);
     defer testing.allocator.free(tampered);
-    tampered[ack_magic.len] = @intFromEnum(AckStatus.stale);
+    tampered[ack_magic.len] = @backingInt(AckStatus.stale);
     try testing.expectError(error.BadSignature, verifyAck(try decodeAck(tampered)));
     tampered[ack_magic.len] = 0xff;
     try testing.expectError(error.InvalidAck, decodeAck(tampered));
@@ -4469,6 +5316,123 @@ test "session replica remove creates a bounded tombstone blocks replay and yield
     try testing.expectEqualStrings("new-live", store.get(tok).?.snapshot);
 }
 
+test "session replica tombstone anti-entropy revoke before stale upsert cannot resurrect" {
+    var kp = try testKey(0x59);
+    defer kp.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    const tok = testToken(0x59);
+    // Anti-entropy may deliver the REVOKE before the live OFFER it removes.
+    const remove = try signedOffer(testing.allocator, removeOffer(&kp, tok, 1, 5), &kp);
+    defer testing.allocator.free(remove.wire);
+    const stale_live = try signedOffer(testing.allocator, upsertOffer(&kp, tok, 1, 1, "revoked-live"), &kp);
+    defer testing.allocator.free(stale_live.wire);
+
+    try testing.expectEqual(ApplyDisposition.tombstoned, (try store.applySignedOffer(remove.decoded, 10, 200)).disposition);
+    try testing.expect(store.get(tok) == null);
+    try testing.expect(store.getTombstone(tok) != null);
+
+    // The revocation-era record, replayed from another peer, stays revoked.
+    try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(stale_live.decoded, 11, 210)).disposition);
+    try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(stale_live.decoded, 12, 220)).disposition);
+    try testing.expectEqual(ApplyDisposition.duplicate, (try store.applySignedOffer(remove.decoded, 12, 230)).disposition);
+    try testing.expect(store.get(tok) == null);
+    try testing.expectEqual(@as(usize, 0), store.entryCount());
+    try testing.expectEqual(@as(usize, 1), store.tombstoneCount());
+    try testing.expect(store.getTombstone(tok).?.revision.eql(remove.decoded.offer.revision));
+}
+
+test "session replica tombstone bound at cap is fail closed without eviction" {
+    var kp = try testKey(0x5a);
+    defer kp.deinit();
+    var store = Store.initWithConfig(testing.allocator, .{ .max_entries = 4, .max_routes = 4, .max_tombstones = 3 });
+    defer store.deinit();
+
+    const first = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x5a), 1, 1), &kp);
+    defer testing.allocator.free(first.wire);
+    const second = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x5b), 1, 1), &kp);
+    defer testing.allocator.free(second.wire);
+    const third = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x5c), 1, 1), &kp);
+    defer testing.allocator.free(third.wire);
+    const overflow = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x5d), 1, 1), &kp);
+    defer testing.allocator.free(overflow.wire);
+    _ = try store.applySignedOffer(first.decoded, 0, 200);
+    _ = try store.applySignedOffer(second.decoded, 0, 201);
+    _ = try store.applySignedOffer(third.decoded, 0, 202);
+
+    // Existing policy is fail-closed (error.TombstoneFull), never eviction:
+    // growth stops at the cap and every retained tombstone keeps blocking.
+    try testing.expectError(error.TombstoneFull, store.applySignedOffer(overflow.decoded, 0, 203));
+    try testing.expectEqual(@as(usize, 3), store.tombstoneCount());
+    try testing.expect(store.getTombstone(testToken(0x5d)) == null);
+    const stale_first = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0x5a), 1, 0, "stale"), &kp);
+    defer testing.allocator.free(stale_first.wire);
+    try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(stale_first.decoded, 9, 204)).disposition);
+    try testing.expect(store.get(testToken(0x5a)) == null);
+
+    // Replacing an already-retained origin at the cap needs no new slot.
+    const newer_first = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x5a), 1, 2), &kp);
+    defer testing.allocator.free(newer_first.wire);
+    try testing.expectEqual(ApplyDisposition.superseded, (try store.applySignedOffer(newer_first.decoded, 0, 205)).disposition);
+    try testing.expectEqual(@as(usize, 3), store.tombstoneCount());
+    try testing.expect(store.getTombstone(testToken(0x5a)).?.revision.eql(newer_first.decoded.offer.revision));
+}
+
+test "session replica tombstone TTL expiry requires both TTL and signed expiry" {
+    var kp = try testKey(0x5b);
+    defer kp.deinit();
+
+    // Signed expiry passes first: the tombstone survives until its TTL also
+    // matures, and stale replay is still blocked in that window.
+    var expiry_first = Store.initWithConfig(testing.allocator, .{
+        .tombstone_ttl_ms = 10_000,
+        .max_offer_lifetime_ms = 20_000,
+    });
+    defer expiry_first.deinit();
+    var short_remove_offer = removeOffer(&kp, testToken(0x5e), 1, 2);
+    short_remove_offer.expires_at_ms = 400;
+    const short_remove = try signedOffer(testing.allocator, short_remove_offer, &kp);
+    defer testing.allocator.free(short_remove.wire);
+    const short_stale = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0x5e), 1, 1, "stale"), &kp);
+    defer testing.allocator.free(short_stale.wire);
+    _ = try expiry_first.applySignedOffer(short_remove.decoded, 0, 300);
+    try testing.expectEqual(@as(usize, 0), expiry_first.sweep(401).tombstones);
+    try testing.expectEqual(@as(usize, 1), expiry_first.tombstoneCount());
+    try testing.expectEqual(ApplyDisposition.stale, (try expiry_first.applySignedOffer(short_stale.decoded, 9, 401)).disposition);
+    try testing.expect(expiry_first.get(testToken(0x5e)) == null);
+
+    // TTL passes first: the tombstone survives until the signed REVOKE also
+    // expires. At maturity both conditions remove it exactly once.
+    var ttl_first = Store.initWithConfig(testing.allocator, .{
+        .tombstone_ttl_ms = 100,
+        .max_offer_lifetime_ms = 20_000,
+    });
+    defer ttl_first.deinit();
+    const tok = testToken(0x5f);
+    const remove = try signedOffer(testing.allocator, removeOffer(&kp, tok, 1, 2), &kp);
+    defer testing.allocator.free(remove.wire);
+    const stale_live = try signedOffer(testing.allocator, upsertOffer(&kp, tok, 1, 1, "revoked-live"), &kp);
+    defer testing.allocator.free(stale_live.wire);
+    _ = try ttl_first.applySignedOffer(remove.decoded, 0, 300);
+    try testing.expectEqual(@as(usize, 0), ttl_first.sweep(400).tombstones);
+    try testing.expectEqual(@as(usize, 0), ttl_first.sweep(10_000).tombstones);
+    try testing.expectEqual(@as(usize, 1), ttl_first.tombstoneCount());
+    try testing.expectEqual(ApplyDisposition.stale, (try ttl_first.applySignedOffer(stale_live.decoded, 9, 10_000)).disposition);
+    try testing.expectEqual(@as(usize, 1), ttl_first.sweep(10_001).tombstones);
+    try testing.expectEqual(@as(usize, 0), ttl_first.tombstoneCount());
+
+    // After maturity the old record is itself expired, so replay still cannot
+    // resurrect it; only a strictly newer, unexpired authority can insert.
+    try testing.expectError(error.Expired, ttl_first.applySignedOffer(stale_live.decoded, 9, 10_001));
+    try testing.expect(ttl_first.get(tok) == null);
+    var newer_offer = upsertOffer(&kp, tok, 1, 3, "after-ttl");
+    newer_offer.expires_at_ms = 20_000;
+    const newer = try signedOffer(testing.allocator, newer_offer, &kp);
+    defer testing.allocator.free(newer.wire);
+    try testing.expectEqual(ApplyDisposition.inserted, (try ttl_first.applySignedOffer(newer.decoded, 9, 10_002)).disposition);
+    try testing.expectEqualStrings("after-ttl", ttl_first.get(tok).?.snapshot);
+}
+
 test "session replica same revision remove versus upsert picks deterministic digest" {
     var kp = try testKey(0x52);
     defer kp.deinit();
@@ -5325,7 +6289,7 @@ test "session replica upgrade checkpoint v2 preserves attachment leases and acce
         error.UnsupportedVersion,
         Store.restoreCurrentUpgradeCheckpoint(testing.allocator, .{}, v1, 250),
     );
-    var legacy = try Store.restoreUpgradeCheckpoint(testing.allocator, .{}, v1, 250);
+    var legacy = try Store.restoreColdMigrationCheckpoint(testing.allocator, .{}, v1, 250);
     defer legacy.deinit();
     try testing.expectEqual(@as(usize, 1), legacy.entryCount());
     try testing.expectEqual(@as(usize, 0), legacy.attachmentLeaseCount());
@@ -5663,4 +6627,1277 @@ test "session replica max authority revision scans entries tombstones quarantine
     var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, store.cfg, checkpoint, 500);
     defer restored.deinit();
     try testing.expect(restored.maxAuthorityRevision().?.eql(quarantine_mallory.decoded.offer.revision));
+}
+
+test "current inventory canonical metadata maximum fits negotiated secured frame" {
+    var kp = try testKey(0x91);
+    defer kp.deinit();
+    var rows: [max_inventory_attachments]AttachmentMetadata = undefined;
+    for (&rows, 0..) |*row, i| {
+        var aid: [16]u8 = @splat(0);
+        std.mem.writeInt(u16, aid[14..16], @intCast(i + 1), .big);
+        row.* = .{ .attachment_id = aid, .signon_ms = @intCast(i), .attached = i % 2 == 0 };
+    }
+    var bytes: [max_inventory_attachments * inventory_row_len]u8 = undefined;
+    const inventory = try encodeInventory(&bytes, &rows);
+    const snapshot = try testing.allocator.alloc(u8, max_inventory_snapshot_len);
+    defer testing.allocator.free(snapshot);
+    @memset(snapshot, 's');
+    const account: [max_account_len]u8 = @splat('a');
+    const nick: [max_nick_len]u8 = @splat('n');
+    const signed = try signedOffer(testing.allocator, .{
+        .operation = .inventory_upsert,
+        .resume_eligible = true,
+        .token = testToken(0x91),
+        .revision = revisionFor(&kp, 200, 0),
+        .issued_at_ms = 100,
+        .expires_at_ms = 10_000,
+        .account = &account,
+        .nick = &nick,
+        .snapshot = snapshot,
+        .inventory = inventory,
+    }, &kp);
+    defer testing.allocator.free(signed.wire);
+    try verifyOffer(signed.decoded);
+    try testing.expectEqual(@as(usize, 256), (Inventory{ .bytes = signed.decoded.offer.inventory }).count());
+    try testing.expectEqual(rows[255], (Inventory{ .bytes = signed.decoded.offer.inventory }).at(255));
+    var frame: [session_replica_transport.header_len + session_replica_transport.max_signed_payload_len]u8 = undefined;
+    const encoded = try session_replica_transport.encodeCurrent(.offer, signed.wire, &frame);
+    try testing.expectEqual(session_replica_transport.WireVersion.current_v4, try session_replica_transport.inspectVersion(encoded));
+    try testing.expectEqualSlices(u8, signed.wire, (try session_replica_transport.decodeCurrent(.offer, encoded)).signed_payload);
+    try testing.expect(encoded.len + session_replica_transport.outer_signed_envelope_len + @import("../../proto/s2s_frame.zig").header_len <= @import("../../proto/s2s_frame.zig").default_max_frame_size);
+    try testing.expectError(error.InvalidPayload, session_replica_transport.encode(.offer, signed.wire, &frame));
+    try testing.expectError(error.UnsupportedVersion, session_replica_transport.decode(.offer, encoded));
+    const excess_snapshot = try testing.allocator.alloc(u8, snapshot.len + 1);
+    defer testing.allocator.free(excess_snapshot);
+    @memset(excess_snapshot, 's');
+    var too_large = signed.decoded.offer;
+    too_large.snapshot = excess_snapshot;
+    try testing.expectError(error.TooLong, encodeOffer(testing.allocator, too_large, &kp));
+
+    rows[1].attachment_id = rows[0].attachment_id;
+    try testing.expectError(error.InvalidInventory, encodeInventory(&bytes, &rows));
+    rows[1].attachment_id[15] = 2;
+    rows[0].signon_ms = -1;
+    try testing.expectError(error.InvalidInventory, encodeInventory(&bytes, &rows));
+    rows[0].signon_ms = 0;
+    const oversized_rows = try testing.allocator.alloc(AttachmentMetadata, max_inventory_attachments + 1);
+    defer testing.allocator.free(oversized_rows);
+    try testing.expectError(error.InvalidInventory, encodeInventory(&bytes, oversized_rows));
+    const mutated = try testing.allocator.dupe(u8, signed.wire);
+    defer testing.allocator.free(mutated);
+    mutated[offer_fixed_len + 3 + account.len + nick.len + snapshot.len + 24] = 2;
+    try testing.expectError(error.InvalidOffer, decodeOffer(mutated));
+    try testing.expectError(error.InvalidPayload, session_replica_transport.encodeCurrent(.offer, mutated, &frame));
+}
+
+fn testGroupOffer(kp: *const sign.KeyPair, token: Token, account: []const u8) Offer {
+    return .{ .operation = .group_revoke, .token = token, .account = account, .revision = revisionFor(kp, 300, 0), .issued_at_ms = 100, .expires_at_ms = 500 };
+}
+
+test "terminal group revoke stages atomically and fences every origin beyond expiry" {
+    var a = try testKey(0x92);
+    defer a.deinit();
+    var b = try testKey(0x93);
+    defer b.deinit();
+    const token = testToken(0x92);
+    const live_a = try signedOffer(testing.allocator, upsertOffer(&a, token, 200, 0, "a"), &a);
+    defer testing.allocator.free(live_a.wire);
+    var offer_b = upsertOffer(&b, token, 200, 0, "b");
+    offer_b.account = "ALICE";
+    const live_b = try signedOffer(testing.allocator, offer_b, &b);
+    defer testing.allocator.free(live_b.wire);
+    const fence = try signedOffer(testing.allocator, testGroupOffer(&a, token, "Alice"), &a);
+    defer testing.allocator.free(fence.wire);
+    const wrong = try signedOffer(testing.allocator, testGroupOffer(&a, token, "mallory"), &a);
+    defer testing.allocator.free(wrong.wire);
+    var store = Store.initWithConfig(testing.allocator, .{ .max_group_revocations = 1 });
+    defer store.deinit();
+    _ = try store.applySignedOffer(live_a.decoded, 11, 200);
+    _ = try store.applySignedOffer(live_b.decoded, 12, 200);
+    try testing.expectError(error.AccountMismatch, store.prepareGroupRevoke(wrong.decoded, 300));
+    var aborted = try store.prepareGroupRevoke(fence.decoded, 300);
+    aborted.abort();
+    aborted.deinit();
+    try testing.expectEqual(@as(usize, 2), store.entryCount());
+    try testing.expect(!store.isGroupRevoked("alice", token));
+    var ticket = try store.prepareGroupRevoke(fence.decoded, 300);
+    defer ticket.deinit();
+    try testing.expectEqual(ApplyDisposition.inserted, ticket.commit());
+    try testing.expect(store.isGroupRevoked("ALICE", token));
+    try testing.expect(!store.isGroupRevoked("mallory", token));
+    try testing.expectEqual(@as(usize, 0), store.entryCount());
+    try testing.expectEqual(@as(usize, 0), store.routeCount());
+    try testing.expectError(error.AccountMismatch, store.prepareGroupRevoke(wrong.decoded, 300));
+    var duplicate = try store.prepareGroupRevoke(fence.decoded, 999_999_999);
+    defer duplicate.deinit();
+    try testing.expectEqual(ApplyDisposition.duplicate, duplicate.commit());
+    try testing.expectEqualSlices(u8, fence.wire, store.groupRevokeForToken(token).?.wire);
+    var later = upsertOffer(&b, token, 600, 0, "later");
+    later.issued_at_ms = 600;
+    later.expires_at_ms = 10_000;
+    const resurrection = try signedOffer(testing.allocator, later, &b);
+    defer testing.allocator.free(resurrection.wire);
+    try testing.expectEqual(ApplyDisposition.tombstoned, (try store.applySignedOffer(resurrection.decoded, 12, 600)).disposition);
+    later.account = "mallory";
+    const attacker = try signedOffer(testing.allocator, later, &b);
+    defer testing.allocator.free(attacker.wire);
+    try testing.expectEqual(ApplyDisposition.tombstoned, (try store.applySignedOffer(attacker.decoded, 12, 600)).disposition);
+    try testing.expect(store.isGroupRevoked("alice", token));
+    const another_fence = try signedOffer(testing.allocator, testGroupOffer(&b, token, "ALICE"), &b);
+    defer testing.allocator.free(another_fence.wire);
+    const duplicate_result = try store.applySignedOffer(another_fence.decoded, 12, 600);
+    try testing.expectEqual(ApplyDisposition.duplicate, duplicate_result.disposition);
+    try testing.expect(duplicate_result.current_revision.eql(fence.decoded.offer.revision));
+    const lease = try signedAttachmentLease(testing.allocator, .{ .token = token, .revision = revisionFor(&b, 700, 0), .issued_at_ms = 700, .expires_at_ms = 1000 }, &b);
+    defer testing.allocator.free(lease.wire);
+    try testing.expectEqual(AttachmentLeaseDisposition.stale, try store.applySignedAttachmentLease(lease.decoded, 700));
+    _ = store.sweep(999_999_999);
+    try testing.expect(store.isGroupRevoked("alice", token));
+    try testing.expect(store.bestLiveIdentity(token, 999_999_999) == null);
+    var retained: [2]Store.RetainedObject = undefined;
+    try testing.expectEqual(@as(usize, 1), store.retainedObjectsAfter(999_999_999, null, &retained));
+    try testing.expectEqual(Store.RetainedKind.group_revoke, retained[0].kind);
+    try testing.expectEqualSlices(u8, fence.wire, retained[0].wire);
+    var inventory: [2]InventoryRow = undefined;
+    const page = store.accountInventoryPageInto("alice", 999_999_999, null, &inventory);
+    try testing.expectEqual(@as(usize, 1), page.items.len);
+    try testing.expect(page.complete and page.items[0].revoked and !page.items[0].attached);
+    const second = try signedOffer(testing.allocator, testGroupOffer(&a, testToken(0x93), "alice"), &a);
+    defer testing.allocator.free(second.wire);
+    try testing.expectError(error.GroupRevokeFull, store.prepareGroupRevoke(second.decoded, 300));
+    try testing.expect(!store.isGroupRevoked("alice", testToken(0x93)));
+}
+
+test "terminal group checkpoint is mandatory current state and cannot roll back" {
+    var kp = try testKey(0x94);
+    defer kp.deinit();
+    const token = testToken(0x94);
+    const fence = try signedOffer(testing.allocator, testGroupOffer(&kp, token, "alice"), &kp);
+    defer testing.allocator.free(fence.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var ticket = try store.prepareGroupRevoke(fence.decoded, 300);
+    defer ticket.deinit();
+    _ = ticket.commit();
+    const checkpoint = try store.encodeUpgradeCheckpoint(testing.allocator, 1000);
+    defer testing.allocator.free(checkpoint);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, .{}, checkpoint, 999_999_999);
+    defer restored.deinit();
+    try testing.expect(restored.isGroupRevoked("ALICE", token));
+    try testing.expectEqualSlices(u8, fence.wire, restored.groupRevokeForToken(token).?.wire);
+    var empty = Store.init(testing.allocator);
+    defer empty.deinit();
+    const rollback = try empty.encodeUpgradeCheckpoint(testing.allocator, 1000);
+    defer testing.allocator.free(rollback);
+    try testing.expectError(error.InvalidMetadata, restored.replaceFromUpgradeCheckpoint(rollback, 1000));
+    try testing.expect(restored.isGroupRevoked("alice", token));
+    var legacy_v2 = try testing.allocator.alloc(u8, rollback.len - 4);
+    defer testing.allocator.free(legacy_v2);
+    @memcpy(legacy_v2[0..upgrade_checkpoint_v2_header_len], rollback[0..upgrade_checkpoint_v2_header_len]);
+    legacy_v2[upgrade_checkpoint_magic.len] = upgrade_checkpoint_v2_version;
+    @memcpy(legacy_v2[upgrade_checkpoint_v2_header_len..], rollback[upgrade_checkpoint_header_len..]);
+    rewriteUpgradeCheckpointChecksum(legacy_v2);
+    try testing.expectError(error.UnsupportedVersion, Store.restoreUpgradeCheckpoint(testing.allocator, .{}, legacy_v2, 1000));
+    var migrated = try Store.restoreColdMigrationCheckpoint(testing.allocator, .{}, legacy_v2, 1000);
+    defer migrated.deinit();
+}
+
+test "current inventory account index excludes unrelated origins and paginates exact rows" {
+    var kp = try testKey(0x95);
+    defer kp.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    for (0..48) |i| {
+        var offer = upsertOffer(&kp, testWideToken(@intCast(i + 1)), 200, 0, "unrelated");
+        offer.account = "other";
+        const signed = try signedOffer(testing.allocator, offer, &kp);
+        defer testing.allocator.free(signed.wire);
+        _ = try store.applySignedOffer(signed.decoded, 0, 200);
+    }
+    const metadata = [_]AttachmentMetadata{
+        .{ .attachment_id = @splat(1), .signon_ms = 11, .attached = true },
+        .{ .attachment_id = @splat(2), .signon_ms = 22, .attached = false },
+    };
+    var bytes: [50]u8 = undefined;
+    var offer = upsertOffer(&kp, testToken(0xf1), 200, 0, "inventory");
+    offer.operation = .inventory_upsert;
+    offer.resume_eligible = true;
+    offer.inventory = try encodeInventory(&bytes, &metadata);
+    const signed = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(signed.wire);
+    _ = try store.applySignedOffer(signed.decoded, 0, 200);
+    const legacy = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xf2), 200, 0, "legacy"), &kp);
+    defer testing.allocator.free(legacy.wire);
+    _ = try store.applySignedOffer(legacy.decoded, 0, 200);
+    store.inventory_source_visits.store(0, .monotonic);
+    var out: [2]InventoryRow = undefined;
+    const first = store.accountInventoryPageInto("ALICE", 200, null, &out);
+    std.debug.print("Session current inventory: rows={d}, indexed_sources={d}, unrelated_origins=48\n", .{ first.items.len, store.inventory_source_visits.load(.monotonic) });
+    try testing.expectEqual(@as(usize, 2), first.items.len);
+    try testing.expectEqual(@as(usize, 2), store.inventory_source_visits.load(.monotonic));
+    try testing.expect(!first.complete and first.items[0].inventory_complete and first.items[0].attached and !first.items[1].attached);
+    try testing.expect(!first.items[0].fresh and first.items[1].fresh);
+    const lease = try signedAttachmentLease(testing.allocator, .{ .token = offer.token, .revision = revisionFor(&kp, 201, 0), .issued_at_ms = 201, .expires_at_ms = 500 }, &kp);
+    defer testing.allocator.free(lease.wire);
+    _ = try store.applySignedAttachmentLease(lease.decoded, 201);
+    try testing.expect(store.accountInventoryPageInto("alice", 201, null, &out).items[0].fresh);
+    try testing.expect(!store.accountInventoryPageInto("alice", 501, null, &out).items[0].fresh);
+    const last = store.accountInventoryPageInto("alice", 200, first.next, &out);
+    try testing.expectEqual(@as(usize, 1), last.items.len);
+    try testing.expect(last.complete and !last.items[0].inventory_complete and last.items[0].attachment_id == null and !last.items[0].fresh);
+    const absent = store.accountInventoryPageInto("absent", 200, null, &out);
+    try testing.expect(absent.complete and absent.items.len == 0);
+    const checkpoint = try store.encodeUpgradeCheckpoint(testing.allocator, 200);
+    defer testing.allocator.free(checkpoint);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, .{}, checkpoint, 200);
+    defer restored.deinit();
+    restored.inventory_source_visits.store(0, .monotonic);
+    try testing.expectEqual(@as(usize, 2), restored.accountInventoryPageInto("alice", 200, null, &out).items.len);
+    try testing.expectEqual(@as(usize, 2), restored.inventory_source_visits.load(.monotonic));
+}
+
+test "terminal group preparation and checkpoint restore survive every allocation failure" {
+    var kp = try testKey(0x96);
+    defer kp.deinit();
+    const live = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0x96), 200, 0, "live"), &kp);
+    defer testing.allocator.free(live.wire);
+    const fence = try signedOffer(testing.allocator, testGroupOffer(&kp, testToken(0x96), "alice"), &kp);
+    defer testing.allocator.free(fence.wire);
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, offered: SignedOffer, revoked: SignedOffer) !void {
+            var store = Store.init(allocator);
+            defer store.deinit();
+            _ = try store.applySignedOffer(offered, 0, 200);
+            const before = try store.encodeUpgradeCheckpoint(testing.allocator, 300);
+            defer testing.allocator.free(before);
+            var ticket = store.prepareGroupRevoke(revoked, 300) catch |err| {
+                const after = try store.encodeUpgradeCheckpoint(testing.allocator, 300);
+                defer testing.allocator.free(after);
+                try testing.expectEqualSlices(u8, before, after);
+                try testing.expect(!store.isGroupRevoked("alice", revoked.offer.token));
+                return err;
+            };
+            defer ticket.deinit();
+            _ = ticket.commit();
+            const checkpoint = try store.encodeUpgradeCheckpoint(allocator, 1000);
+            defer allocator.free(checkpoint);
+            var restored = try Store.restoreUpgradeCheckpoint(allocator, .{}, checkpoint, 1000);
+            defer restored.deinit();
+            try testing.expect(restored.isGroupRevoked("alice", revoked.offer.token));
+            restored.replaceFromUpgradeCheckpoint(checkpoint, 1000) catch |err| {
+                try testing.expect(restored.isGroupRevoked("alice", revoked.offer.token));
+                try testing.expectEqualSlices(u8, store.groupRevokeForToken(revoked.offer.token).?.wire, restored.groupRevokeForToken(revoked.offer.token).?.wire);
+                return err;
+            };
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{ live.decoded, fence.decoded });
+}
+
+test "current acknowledgement readiness and group commit cannot enter frozen transport" {
+    var kp = try testKey(0x97);
+    defer kp.deinit();
+    for ([_]AckStatus{ .current_ready, .group_revoked }) |status| {
+        const wire = try encodeAck(testing.allocator, .{ .status = status, .token = testToken(0x97), .offered_revision = revisionFor(&kp, 200, 0), .observed_revision = revisionFor(&kp, 200, 0), .ack_node = signed_frame.originShortId(kp.public_key), .issued_at_ms = 200, .expires_at_ms = 1000, .membership_epoch = 7, .roster_digest = @splat(0x71) }, &kp);
+        defer testing.allocator.free(wire);
+        try verifyAck(try decodeAck(wire));
+        var out: [512]u8 = undefined;
+        const frame = try session_replica_transport.encodeCurrent(.ack, wire, &out);
+        try testing.expectEqualSlices(u8, wire, (try session_replica_transport.decodeCurrent(.ack, frame)).signed_payload);
+        try testing.expectError(error.InvalidPayload, session_replica_transport.encode(.ack, wire, &out));
+        var store = Store.init(testing.allocator);
+        defer store.deinit();
+        try testing.expectEqual(AckDisposition.ignored, try store.applySignedAck(try decodeAck(wire), 1, 200));
+    }
+}
+
+test "current group acknowledgement alone binds concurrent different-origin fences" {
+    var a = try testKey(0x98);
+    defer a.deinit();
+    var b = try testKey(0x99);
+    defer b.deinit();
+    var ack = Ack{ .status = .group_revoked, .token = testToken(0x98), .offered_revision = revisionFor(&a, 200, 0), .observed_revision = revisionFor(&b, 201, 0), .ack_node = signed_frame.originShortId(b.public_key), .issued_at_ms = 202, .expires_at_ms = 1000, .membership_epoch = 7, .roster_digest = @splat(0x71) };
+    const wire = try encodeAck(testing.allocator, ack, &b);
+    defer testing.allocator.free(wire);
+    try verifyAck(try decodeAck(wire));
+    var out: [512]u8 = undefined;
+    const frame = try session_replica_transport.encodeCurrent(.ack, wire, &out);
+    try testing.expectEqualSlices(u8, wire, (try session_replica_transport.decodeCurrent(.ack, frame)).signed_payload);
+    try testing.expectError(error.InvalidPayload, session_replica_transport.encode(.ack, wire, &out));
+    for ([_]AckStatus{ .accepted, .duplicate, .conflict, .stale, .superseded, .tombstoned, .capacity, .current_ready }) |status| {
+        ack.status = status;
+        try testing.expectError(error.InvalidAck, encodeAck(testing.allocator, ack, &b));
+    }
+}
+
+test "expired origin account rebind cannot leak inventory or retain a dangling old index" {
+    var kp = try testKey(0x9a);
+    defer kp.deinit();
+    const token = testToken(0x9a);
+    var alice = upsertOffer(&kp, token, 100, 0, "expired Alice");
+    alice.expires_at_ms = 200;
+    const first = try signedOffer(testing.allocator, alice, &kp);
+    defer testing.allocator.free(first.wire);
+    var bytes: [inventory_row_len]u8 = undefined;
+    const inventory = try encodeInventory(&bytes, &.{.{ .attachment_id = @splat(0x9a), .signon_ms = 201, .attached = false }});
+    var bob = upsertOffer(&kp, token, 201, 0, "current Bob");
+    bob.operation = .inventory_upsert;
+    bob.resume_eligible = true;
+    bob.account = "bob";
+    bob.nick = "Bob";
+    bob.issued_at_ms = 201;
+    bob.inventory = inventory;
+    const second = try signedOffer(testing.allocator, bob, &kp);
+    defer testing.allocator.free(second.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.applySignedOffer(first.decoded, 0, 150);
+    _ = try store.applySignedOffer(second.decoded, 0, 201);
+    var out: [2]InventoryRow = undefined;
+    store.inventory_source_visits.store(0, .monotonic);
+    const private = store.accountInventoryPageInto("ALICE", 201, null, &out);
+    try testing.expect(private.complete and private.items.len == 0);
+    try testing.expectEqual(@as(usize, 0), store.inventory_source_visits.load(.monotonic));
+    const current = store.accountInventoryPageInto("BOB", 201, null, &out);
+    try testing.expect(current.complete and current.items.len == 1);
+    try testing.expectEqual(@as(i64, 201), current.items[0].signon_ms);
+    try testing.expectEqual(@as(usize, 1), store.account_index.count());
+    const checkpoint = try store.encodeUpgradeCheckpoint(testing.allocator, 201);
+    defer testing.allocator.free(checkpoint);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, .{}, checkpoint, 201);
+    defer restored.deinit();
+    try testing.expectEqual(@as(usize, 0), restored.accountInventoryPageInto("alice", 201, null, &out).items.len);
+    try testing.expectEqual(@as(usize, 1), restored.accountInventoryPageInto("bob", 201, null, &out).items.len);
+    const removed = try signedOffer(testing.allocator, removeOffer(&kp, token, 202, 0), &kp);
+    defer testing.allocator.free(removed.wire);
+    _ = try store.applySignedOffer(removed.decoded, 0, 202);
+    // Both accounts must remain safe to enumerate after the replacement is
+    // removed; an obsolete Alice locator would now dereference a missing row.
+    try testing.expectEqual(@as(usize, 0), store.accountInventoryPageInto("alice", 202, null, &out).items.len);
+    try testing.expectEqual(@as(usize, 0), store.accountInventoryPageInto("bob", 202, null, &out).items.len);
+    try testing.expectEqual(@as(usize, 0), store.account_index.count());
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, expired: SignedOffer, replacement: SignedOffer) !void {
+            var target = Store.init(allocator);
+            defer target.deinit();
+            _ = try target.applySignedOffer(expired, 0, 150);
+            const before = try target.encodeUpgradeCheckpoint(testing.allocator, 201);
+            defer testing.allocator.free(before);
+            _ = target.applySignedOffer(replacement, 0, 201) catch |err| {
+                const after = try target.encodeUpgradeCheckpoint(testing.allocator, 201);
+                defer testing.allocator.free(after);
+                try testing.expectEqualSlices(u8, before, after);
+                var rows: [2]InventoryRow = undefined;
+                const old = target.accountInventoryPageInto("alice", 201, null, &rows);
+                try testing.expect(old.integrity_ok and old.items.len == 1);
+                const absent = target.accountInventoryPageInto("bob", 201, null, &rows);
+                try testing.expect(absent.integrity_ok and absent.items.len == 0);
+                return err;
+            };
+            var rows: [2]InventoryRow = undefined;
+            const old = target.accountInventoryPageInto("alice", 201, null, &rows);
+            try testing.expect(old.integrity_ok and old.items.len == 0);
+            const current_account = target.accountInventoryPageInto("bob", 201, null, &rows);
+            try testing.expect(current_account.integrity_ok and current_account.items.len == 1);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{ first.decoded, second.decoded });
+}
+
+test "inventory selector corruption reports partial without copying foreign authority" {
+    var kp = try testKey(0x9b);
+    defer kp.deinit();
+    const token = testToken(0x9b);
+    var offered = upsertOffer(&kp, token, 200, 0, "Bob private metadata");
+    offered.account = "bob";
+    const live = try signedOffer(testing.allocator, offered, &kp);
+    defer testing.allocator.free(live.wire);
+    const key = Store.OriginKey{ .token = token, .origin_node = offered.revision.origin_node };
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.applySignedOffer(live.decoded, 0, 200);
+    var out: [2]InventoryRow = undefined;
+    try testing.expect(try store.reserveAccountOrigin("alice", key));
+    store.account_index.getPtr(accountDigest("alice")).?.origins.appendAssumeCapacity(key);
+    const foreign = store.accountInventoryPageInto("alice", 200, null, &out);
+    try testing.expect(!foreign.integrity_ok and !foreign.complete and foreign.items.len == 0);
+    store.removeAccountOrigin("alice", key);
+    const removed = store.entries.fetchRemove(key).?;
+    const missing = store.accountInventoryPageInto("bob", 200, null, &out);
+    try testing.expect(!missing.integrity_ok and !missing.complete and missing.items.len == 0);
+    store.entries.putAssumeCapacityNoClobber(key, removed.value);
+    const fence = try signedOffer(testing.allocator, testGroupOffer(&kp, token, "bob"), &kp);
+    defer testing.allocator.free(fence.wire);
+    _ = try store.applySignedOffer(fence.decoded, 0, 300);
+    const marker = Store.OriginKey{ .token = token, .origin_node = 0 };
+    try testing.expect(try store.reserveAccountOrigin("alice", marker));
+    store.account_index.getPtr(accountDigest("alice")).?.origins.appendAssumeCapacity(marker);
+    const foreign_fence = store.accountInventoryPageInto("alice", 300, null, &out);
+    try testing.expect(!foreign_fence.integrity_ok and !foreign_fence.complete and foreign_fence.items.len == 0);
+    store.removeAccountOrigin("alice", marker);
+    const removed_fence = store.group_revocations.fetchRemove(token).?;
+    const missing_fence = store.accountInventoryPageInto("bob", 300, null, &out);
+    try testing.expect(!missing_fence.integrity_ok and !missing_fence.complete and missing_fence.items.len == 0);
+    store.group_revocations.putAssumeCapacityNoClobber(token, removed_fence.value);
+    const authorized = store.accountInventoryPageInto("BOB", 300, null, &out);
+    try testing.expect(authorized.integrity_ok and authorized.complete and authorized.items.len == 1 and authorized.items[0].revoked);
+}
+
+test "current ack roster context is mandatory signed canonical and absent from frozen vectors" {
+    var kp = try testKey(0x9c);
+    defer kp.deinit();
+    const old = Ack{ .status = .accepted, .token = @splat(0x31), .offered_revision = .{ .epoch = 200, .sequence = 200 << 16, .origin_node = 1 }, .observed_revision = .{ .epoch = 201, .sequence = 201 << 16, .origin_node = 1 }, .ack_node = signed_frame.originShortId(kp.public_key), .issued_at_ms = 202, .expires_at_ms = 1000 };
+    const frozen = try encodeAck(testing.allocator, old, &kp);
+    defer testing.allocator.free(frozen);
+    const frozen_prefix_hex = "53524132013131313131313131313131313131313100000000000000c80000000000c80000000000000000000100000000000000c90000000000c900000000000000000001";
+    var prefix: [69]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&prefix, frozen_prefix_hex);
+    try testing.expectEqualSlices(u8, &prefix, frozen[0..prefix.len]);
+    try testing.expectEqual(@as(usize, 189), frozen.len);
+    const frozen_decoded = try decodeAck(frozen);
+    try verifyAck(frozen_decoded);
+    try testing.expectEqual(@as(usize, 93), frozen_decoded.transcript.len);
+    try testing.expectEqual(@as(u64, 0), frozen_decoded.ack.membership_epoch);
+    try testing.expect(std.mem.allEqual(u8, &frozen_decoded.ack.roster_digest, 0));
+    var transport: [512]u8 = undefined;
+    _ = try session_replica_transport.encode(.ack, frozen, &transport);
+    for ([_]AckStatus{ .current_ready, .group_revoked }) |status| {
+        var current = old;
+        current.status = status;
+        try testing.expectError(error.InvalidAck, encodeAck(testing.allocator, current, &kp));
+        current.membership_epoch = 42;
+        try testing.expectError(error.InvalidAck, encodeAck(testing.allocator, current, &kp));
+        current.roster_digest = @splat(0xa1);
+        const wire = try encodeAck(testing.allocator, current, &kp);
+        defer testing.allocator.free(wire);
+        try testing.expectEqual(@as(usize, 229), wire.len);
+        const decoded = try decodeAck(wire);
+        try verifyAck(decoded);
+        try testing.expectEqual(@as(u64, 42), decoded.ack.membership_epoch);
+        try testing.expectEqual(current.roster_digest, decoded.ack.roster_digest);
+        var projection = decoded;
+        projection.ack.membership_epoch += 1;
+        try testing.expectError(error.TranscriptMismatch, verifyAck(projection));
+        projection = decoded;
+        projection.ack.roster_digest[0] ^= 1;
+        try testing.expectError(error.TranscriptMismatch, verifyAck(projection));
+        var modified: [229]u8 = undefined;
+        for ([_]usize{ 100, 101 }) |offset| {
+            @memcpy(&modified, wire);
+            modified[offset] ^= 1;
+            try testing.expectError(error.BadSignature, verifyAck(try decodeAck(&modified)));
+        }
+        @memcpy(&modified, wire);
+        @memset(modified[93..101], 0);
+        try testing.expectError(error.InvalidAck, decodeAck(&modified));
+        try testing.expectError(error.InvalidPayload, session_replica_transport.encodeCurrent(.ack, &modified, &transport));
+        @memcpy(&modified, wire);
+        @memset(modified[101..133], 0);
+        try testing.expectError(error.InvalidAck, decodeAck(&modified));
+        try testing.expectError(error.InvalidPayload, session_replica_transport.encodeCurrent(.ack, &modified, &transport));
+        @memcpy(&modified, wire);
+        modified[4] = @backingInt(AckStatus.accepted);
+        try testing.expectError(error.TrailingBytes, decodeAck(&modified));
+        try testing.expectError(error.InvalidPayload, session_replica_transport.encode(.ack, &modified, &transport));
+        const trailing = try testing.allocator.alloc(u8, wire.len + 1);
+        defer testing.allocator.free(trailing);
+        @memcpy(trailing[0..wire.len], wire);
+        trailing[wire.len] = 0;
+        try testing.expectError(error.TrailingBytes, decodeAck(trailing));
+        try testing.expectError(error.InvalidPayload, session_replica_transport.encodeCurrent(.ack, trailing, &transport));
+        var missing: [189]u8 = undefined;
+        @memcpy(&missing, frozen);
+        missing[4] = @backingInt(status);
+        try testing.expectError(error.Truncated, decodeAck(&missing));
+        try testing.expectError(error.InvalidPayload, session_replica_transport.encodeCurrent(.ack, &missing, &transport));
+        try testing.expectError(error.InvalidPayload, session_replica_transport.encode(.ack, wire, &transport));
+        const frame = try session_replica_transport.encodeCurrent(.ack, wire, &transport);
+        try testing.expectEqualSlices(u8, wire, (try session_replica_transport.decodeCurrent(.ack, frame)).signed_payload);
+    }
+    var legacy_context = old;
+    legacy_context.membership_epoch = 42;
+    try testing.expectError(error.InvalidAck, encodeAck(testing.allocator, legacy_context, &kp));
+    legacy_context.membership_epoch = 0;
+    legacy_context.roster_digest = @splat(0xa1);
+    try testing.expectError(error.InvalidAck, encodeAck(testing.allocator, legacy_context, &kp));
+}
+
+test "inventory eligibility is mandatory signed and never implicit remote authority" {
+    var kp = try testKey(0xc1);
+    defer kp.deinit();
+    const token = testToken(0xc1);
+    const origin = signed_frame.originShortId(kp.public_key);
+    var offer = upsertOffer(&kp, token, 200, 0, "private-state");
+    offer.operation = .inventory_upsert;
+    try testing.expectError(error.InvalidOffer, encodeOffer(testing.allocator, offer, &kp));
+    offer.resume_eligible = false;
+    try testing.expectError(error.InvalidOffer, encodeOffer(testing.allocator, offer, &kp));
+    offer.nick = "";
+    offer.snapshot = "";
+    const metadata = [_]AttachmentMetadata{.{ .attachment_id = @splat(1), .signon_ms = 100, .attached = true }};
+    var metadata_bytes: [25]u8 = undefined;
+    offer.inventory = try encodeInventory(&metadata_bytes, &metadata);
+    const signed = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(signed.wire);
+    try verifyOffer(signed.decoded);
+    try testing.expect(!signed.decoded.offer.allowsResume());
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.applySignedOffer(signed.decoded, 42, 200);
+    const held = store.getOriginInventory(token, origin).?;
+    try testing.expect(!held.resume_eligible);
+    try testing.expectEqual(@as(usize, 0), held.nick.len);
+    try testing.expectEqual(@as(usize, 0), held.snapshot.len);
+    try testing.expect(store.getOrigin(token, origin) == null);
+    try testing.expect(store.get(token) == null);
+    try testing.expect(store.bestLiveIdentity(token, 201) == null);
+    try testing.expect(!store.hasLiveIdentity(offer.account, "nick", 201));
+    try testing.expect(!store.hasLiveOriginOtherThan(token, 0, 201));
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 0, 201));
+    try testing.expect(!store.hasReplicaParent(token, origin, null));
+    try testing.expectEqual(@as(usize, 0), store.routeCount());
+    var tokens: [4]Token = undefined;
+    try testing.expectEqual(@as(usize, 0), store.liveTokensAfter(201, null, &tokens).len);
+    try testing.expectEqual(@as(usize, 0), store.authorityTokensAfter(201, null, &tokens).len);
+    var identities: [2]Store.OriginIdentity = undefined;
+    try testing.expectEqual(@as(usize, 0), store.liveOriginIdentitiesAfter(token, 201, null, &identities).len);
+    var rows: [2]InventoryRow = undefined;
+    const page = store.accountInventoryPageInto(offer.account, 201, null, &rows);
+    try testing.expect(page.integrity_ok and page.complete);
+    try testing.expectEqual(@as(usize, 1), page.items.len);
+    try testing.expect(page.items[0].inventory_complete);
+    try testing.expectEqual(@as(usize, 1), store.retainedCount(201));
+    const lease = try signedAttachmentLease(testing.allocator, .{
+        .token = token,
+        .revision = revisionFor(&kp, 201, 0),
+        .issued_at_ms = 201,
+        .expires_at_ms = 250,
+    }, &kp);
+    defer testing.allocator.free(lease.wire);
+    _ = try store.applySignedAttachmentLease(lease.decoded, 201);
+    try testing.expect(!store.hasAttachedOriginOtherThan(token, 0, 201));
+    try testing.expect(store.get(token) == null);
+    const fresh_page = store.accountInventoryPageInto(offer.account, 201, null, &rows);
+    try testing.expect(fresh_page.items[0].fresh);
+    var ack_key = try testKey(0xc3);
+    defer ack_key.deinit();
+    const ack_wire = try encodeAck(testing.allocator, .{
+        .status = .accepted,
+        .token = token,
+        .offered_revision = offer.revision,
+        .observed_revision = offer.revision,
+        .ack_node = signed_frame.originShortId(ack_key.public_key),
+        .issued_at_ms = 200,
+        .expires_at_ms = 250,
+    }, &ack_key);
+    defer testing.allocator.free(ack_wire);
+    try testing.expectEqual(AckDisposition.stale, try store.applySignedAck(try decodeAck(ack_wire), 42, 201));
+    try testing.expect(store.get(token) == null);
+    const checkpoint = try store.encodeUpgradeCheckpoint(testing.allocator, 201);
+    defer testing.allocator.free(checkpoint);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, .{}, checkpoint, 201);
+    defer restored.deinit();
+    try testing.expect(!restored.getOriginInventory(token, origin).?.resume_eligible);
+    try testing.expectEqualSlices(u8, signed.wire, restored.getOriginInventory(token, origin).?.wire);
+    try testing.expect(restored.get(token) == null);
+
+    var frame: [session_replica_transport.header_len + session_replica_transport.max_signed_payload_len]u8 = undefined;
+    _ = try session_replica_transport.encodeCurrent(.offer, signed.wire, &frame);
+    try testing.expectError(error.InvalidPayload, session_replica_transport.encode(.offer, signed.wire, &frame));
+    const changed = try testing.allocator.dupe(u8, signed.wire);
+    defer testing.allocator.free(changed);
+    changed[offer_fixed_len] = 2;
+    try testing.expectError(error.InvalidOffer, decodeOffer(changed));
+    try testing.expectError(error.InvalidPayload, session_replica_transport.encodeCurrent(.offer, changed, &frame));
+    // Removing the mandatory byte cannot reinterpret the count/account as valid.
+    const omitted = try testing.allocator.alloc(u8, signed.wire.len - 1);
+    defer testing.allocator.free(omitted);
+    @memcpy(omitted[0..offer_fixed_len], signed.wire[0..offer_fixed_len]);
+    @memcpy(omitted[offer_fixed_len..], signed.wire[offer_fixed_len + 1 ..]);
+    if (decodeOffer(omitted)) |_| return error.TestUnexpectedResult else |_| {}
+    try testing.expectError(error.InvalidPayload, session_replica_transport.encodeCurrent(.offer, omitted, &frame));
+
+    offer.resume_eligible = true;
+    try testing.expectError(error.InvalidOffer, encodeOffer(testing.allocator, offer, &kp));
+    offer.nick = "nick";
+    offer.snapshot = "portable-state";
+    offer.revision = revisionFor(&kp, 202, 0);
+    const promoted = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(promoted.wire);
+    _ = try store.applySignedOffer(promoted.decoded, 42, 202);
+    try testing.expect(store.get(token).?.resume_eligible);
+    try testing.expect(store.bestLiveIdentity(token, 202) != null);
+    try testing.expect(store.hasLiveIdentity(offer.account, "nick", 202));
+    try testing.expect(store.hasReplicaParent(token, origin, 42));
+    // A valid-shaped semantic edit still cannot change the signed decision.
+    var forged = promoted.decoded;
+    forged.offer.resume_eligible = false;
+    try testing.expectError(error.TranscriptMismatch, verifyOffer(forged));
+
+    // A newer inventory-only revision removes previously eligible authority
+    // and its routes, while retaining inventory and the signed replay floor.
+    offer.resume_eligible = false;
+    offer.nick = "";
+    offer.snapshot = "";
+    offer.revision = revisionFor(&kp, 203, 0);
+    const demoted = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(demoted.wire);
+    _ = try store.applySignedOffer(demoted.decoded, 42, 203);
+    try testing.expect(store.get(token) == null);
+    try testing.expectEqual(@as(usize, 0), store.routeCount());
+    try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(promoted.decoded, 42, 203)).disposition);
+    try testing.expect(!store.getOriginInventory(token, origin).?.resume_eligible);
+
+    const legacy = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xc2), 202, 0, "legacy-state"), &kp);
+    defer testing.allocator.free(legacy.wire);
+    try testing.expect(legacy.decoded.offer.resume_eligible == null);
+    try testing.expect(legacy.decoded.offer.allowsResume());
+    _ = try session_replica_transport.encode(.offer, legacy.wire, &frame);
+}
+
+test "inventory batch hard budgets cover large accounts exactly once and advance through hidden sources" {
+    var kp = try testKey(0xd1);
+    defer kp.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    // These sources produce no rows; the first call must still stop at64 work.
+    for (0..80) |i| {
+        const signed = try signedOffer(testing.allocator, upsertOffer(&kp, testWideToken(@intCast(i + 1)), 200, 0, "hidden"), &kp);
+        defer testing.allocator.free(signed.wire);
+        _ = try store.applySignedOffer(signed.decoded, 0, 200);
+        store.markTokenDenied(signed.decoded.offer.token, 500);
+    }
+    var metadata: [256]AttachmentMetadata = undefined;
+    for (&metadata, 0..) |*row, i| row.* = .{ .attachment_id = testWideToken(@intCast(i + 1)), .signon_ms = @intCast(i), .attached = false };
+    var bytes: [256 * 25]u8 = undefined;
+    const inventory = try encodeInventory(&bytes, &metadata);
+    for (0..3) |i| {
+        var offer = upsertOffer(&kp, testWideToken(@intCast(1000 + i)), 200, 0, "");
+        offer.operation = .inventory_upsert;
+        offer.resume_eligible = false;
+        offer.nick = "";
+        offer.inventory = inventory;
+        const signed = try signedOffer(testing.allocator, offer, &kp);
+        defer testing.allocator.free(signed.wire);
+        _ = try store.applySignedOffer(signed.decoded, 0, 200);
+    }
+    // Unrelated accounts cannot consume even one work unit in this scan.
+    for (0..40) |i| {
+        var offer = upsertOffer(&kp, testWideToken(@intCast(2000 + i)), 200, 0, "other");
+        offer.account = "unrelated";
+        const signed = try signedOffer(testing.allocator, offer, &kp);
+        defer testing.allocator.free(signed.wire);
+        _ = try store.applySignedOffer(signed.decoded, 0, 200);
+    }
+    var out: [80]InventoryRow = undefined;
+    var cursor: ?InventoryScanCursor = null;
+    var seen: [3][256]bool = @splat(@splat(false));
+    var total: usize = 0;
+    var pages: usize = 0;
+    while (true) {
+        store.inventory_source_visits.store(0, .monotonic);
+        store.inventory_row_visits.store(0, .monotonic);
+        const page = try store.accountInventoryBatchInto("ALICE", 201, cursor, &out);
+        try testing.expect(page.integrity_ok);
+        try testing.expect(page.items.len <= 32 and page.work_used <= 64);
+        try testing.expectEqual(page.work_used, store.inventory_source_visits.load(.monotonic) + store.inventory_row_visits.load(.monotonic));
+        if (pages == 0) {
+            try testing.expectEqual(@as(usize, 0), page.items.len);
+            try testing.expectEqual(@as(usize, 64), page.work_used);
+            try testing.expect(!page.complete and page.next != null);
+            try testing.expectEqual(@as(usize, 64), page.next.?.origin_index);
+        }
+        for (page.items) |row| {
+            const group = std.mem.readInt(u16, row.token[14..16], .big) - 1000;
+            const aid = std.mem.readInt(u16, row.attachment_id.?[14..16], .big) - 1;
+            try testing.expect(group < 3 and aid < 256);
+            try testing.expect(!seen[group][aid]);
+            seen[group][aid] = true;
+            total += 1;
+        }
+        pages += 1;
+        if (page.complete) {
+            try testing.expect(page.next == null);
+            break;
+        }
+        cursor = page.next orelse return error.TestUnexpectedResult;
+        try testing.expect(pages < 40);
+    }
+    try testing.expectEqual(@as(usize, 768), total);
+    for (seen) |group| for (group) |present| try testing.expect(present);
+}
+
+test "inventory batch generations ignore renewal and invalidate structural mutations" {
+    var kp = try testKey(0xd2);
+    defer kp.deinit();
+    var metadata = [_]AttachmentMetadata{
+        .{ .attachment_id = testToken(1), .signon_ms = 1, .attached = false },
+        .{ .attachment_id = testToken(2), .signon_ms = 2, .attached = true },
+    };
+    var bytes: [50]u8 = undefined;
+    var offer = upsertOffer(&kp, testToken(0xd2), 200, 0, "initial");
+    offer.operation = .inventory_upsert;
+    offer.resume_eligible = true;
+    offer.inventory = try encodeInventory(&bytes, &metadata);
+    const original = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(original.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.applySignedOffer(original.decoded, 0, 200);
+    var out: [1]InventoryRow = undefined;
+    const first = try store.accountInventoryBatchInto("alice", 200, null, &out);
+    const cursor = first.next.?;
+    offer.revision = revisionFor(&kp, 201, 0);
+    offer.snapshot = "chat state changed";
+    offer.nick = "renamed";
+    const renewed = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(renewed.wire);
+    _ = try store.applySignedOffer(renewed.decoded, 0, 201);
+    const lease = try signedAttachmentLease(testing.allocator, .{ .token = offer.token, .revision = revisionFor(&kp, 202, 0), .issued_at_ms = 202, .expires_at_ms = 250 }, &kp);
+    defer testing.allocator.free(lease.wire);
+    _ = try store.applySignedAttachmentLease(lease.decoded, 202);
+    var other = upsertOffer(&kp, testToken(0xd3), 202, 0, "other");
+    other.account = "bob";
+    const unrelated = try signedOffer(testing.allocator, other, &kp);
+    defer testing.allocator.free(unrelated.wire);
+    _ = try store.applySignedOffer(unrelated.decoded, 0, 202);
+    const second = try store.accountInventoryBatchInto("ALICE", 202, cursor, &out);
+    try testing.expectEqual(first.generation, second.generation);
+    try testing.expect(second.complete and second.items[0].fresh);
+    try testing.expectEqual(testToken(2), second.items[0].attachment_id.?);
+    try testing.expectError(error.InvalidCursor, store.accountInventoryBatchInto("bob", 202, cursor, &out));
+    var invalid = cursor;
+    invalid.origin_index = std.math.maxInt(usize);
+    try testing.expectError(error.InvalidCursor, store.accountInventoryBatchInto("alice", 202, invalid, &out));
+    invalid = cursor;
+    invalid.attachment_index = 2;
+    try testing.expectError(error.InvalidCursor, store.accountInventoryBatchInto("alice", 202, invalid, &out));
+    metadata[1].signon_ms = 3;
+    offer.inventory = try encodeInventory(&bytes, &metadata);
+    offer.revision = revisionFor(&kp, 203, 0);
+    const changed = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(changed.wire);
+    _ = try store.applySignedOffer(changed.decoded, 0, 203);
+    try testing.expectError(error.StaleCursor, store.accountInventoryBatchInto("alice", 203, cursor, &out));
+    const current = (try store.accountInventoryBatchInto("alice", 203, null, &out)).next.?;
+    store.markTokenDenied(offer.token, 204);
+    try testing.expectError(error.StaleCursor, store.accountInventoryBatchInto("alice", 203, current, &out));
+    const hidden = try store.accountInventoryBatchInto("alice", 203, null, &out);
+    try testing.expect(hidden.complete and hidden.items.len == 0);
+    _ = store.sweep(205);
+    try testing.expect((try store.accountInventoryBatchInto("alice", 205, null, &out)).generation != hidden.generation);
+    const before_eligibility = (try store.accountInventoryBatchInto("alice", 205, null, &out)).next.?;
+    offer.resume_eligible = false;
+    offer.nick = "";
+    offer.snapshot = "";
+    offer.revision = revisionFor(&kp, 206, 0);
+    const inventory_only = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(inventory_only.wire);
+    _ = try store.applySignedOffer(inventory_only.decoded, 0, 206);
+    try testing.expectError(error.StaleCursor, store.accountInventoryBatchInto("alice", 206, before_eligibility, &out));
+    const before_removal = (try store.accountInventoryBatchInto("alice", 206, null, &out)).next.?;
+    const remove = try signedOffer(testing.allocator, removeOffer(&kp, offer.token, 207, 0), &kp);
+    defer testing.allocator.free(remove.wire);
+    _ = try store.applySignedOffer(remove.decoded, 0, 207);
+    try testing.expectError(error.StaleCursor, store.accountInventoryBatchInto("alice", 207, before_removal, &out));
+    offer.revision = revisionFor(&kp, 208, 0);
+    const readded = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(readded.wire);
+    _ = try store.applySignedOffer(readded.decoded, 0, 208);
+    try testing.expectError(error.StaleCursor, store.accountInventoryBatchInto("alice", 208, before_removal, &out));
+    const fence = try signedOffer(testing.allocator, testGroupOffer(&kp, offer.token, "alice"), &kp);
+    defer testing.allocator.free(fence.wire);
+    _ = try store.applySignedOffer(fence.decoded, 0, 300);
+    const revoked = try store.accountInventoryBatchInto("alice", 300, null, &out);
+    try testing.expect(revoked.complete and revoked.items.len == 1 and revoked.items[0].revoked);
+    try testing.expectError(error.StaleCursor, store.accountInventoryBatchInto("alice", 300, current, &out));
+}
+
+test "inventory batch index integrity never authorizes foreign or missing entries" {
+    var kp = try testKey(0xd4);
+    defer kp.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var offer = upsertOffer(&kp, testToken(0xd4), 200, 0, "private Bob");
+    offer.account = "bob";
+    const signed = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(signed.wire);
+    _ = try store.applySignedOffer(signed.decoded, 0, 200);
+    const key = Store.OriginKey{ .token = offer.token, .origin_node = offer.revision.origin_node };
+    try testing.expect(try store.reserveAccountOrigin("alice", key));
+    store.account_index.getPtr(accountDigest("alice")).?.origins.appendAssumeCapacity(key);
+    store.bumpInventoryAccount("alice");
+    var out: [32]InventoryRow = undefined;
+    const foreign = try store.accountInventoryBatchInto("alice", 201, null, &out);
+    try testing.expect(!foreign.integrity_ok and !foreign.complete and foreign.next == null and foreign.items.len == 0);
+    store.account_index.getPtr(accountDigest("alice")).?.origins.items[0].token = testToken(0xff);
+    const missing = try store.accountInventoryBatchInto("alice", 201, null, &out);
+    try testing.expect(!missing.integrity_ok and missing.items.len == 0 and missing.work_used == 1);
+    const entry = store.getOriginMutable(offer.token, offer.revision.origin_node).?;
+    const wire = entry.wire;
+    entry.wire = &.{0};
+    defer entry.wire = wire;
+    const malformed = try store.accountInventoryBatchInto("bob", 201, null, &out);
+    try testing.expect(!malformed.integrity_ok and malformed.items.len == 0);
+}
+
+test "inventory batch cursor generation and checkpoint remain atomic under index insertion OOM" {
+    var kp = try testKey(0xd5);
+    defer kp.deinit();
+    const first = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xd5), 200, 0, "first"), &kp);
+    defer testing.allocator.free(first.wire);
+    const added = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xd6), 201, 0, "added"), &kp);
+    defer testing.allocator.free(added.wire);
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, base: SignedOffer, extra: SignedOffer) !void {
+            var store = Store.init(allocator);
+            defer store.deinit();
+            _ = try store.applySignedOffer(base, 0, 200);
+            var out: [1]InventoryRow = undefined;
+            const before_page = try store.accountInventoryBatchInto("alice", 201, null, &out);
+            const before = try store.encodeUpgradeCheckpoint(testing.allocator, 201);
+            defer testing.allocator.free(before);
+            _ = store.applySignedOffer(extra, 0, 201) catch |err| {
+                const after = try store.encodeUpgradeCheckpoint(testing.allocator, 201);
+                defer testing.allocator.free(after);
+                try testing.expectEqualSlices(u8, before, after);
+                const after_page = try store.accountInventoryBatchInto("alice", 201, null, &out);
+                try testing.expectEqual(before_page.generation, after_page.generation);
+                try testing.expect(after_page.complete and after_page.items.len == 1);
+                return err;
+            };
+            const after_page = try store.accountInventoryBatchInto("alice", 201, null, &out);
+            try testing.expect(after_page.generation != before_page.generation);
+            try testing.expect(!after_page.complete and after_page.next != null);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{ first.decoded, added.decoded });
+}
+
+test "session replica Core checkpoint: absent cursor token and exact SRST authority round trip" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    // A cursor is the last visited value, not a live row reference. Successful
+    // REVOKE may remove that value before capture; preserve it without inventing
+    // a row or forcing a restart at the first persistently failing token.
+    for ([_]?Token{ null, testToken(0x85) }) |cursor| {
+        const inner = try store.encodeUpgradeCheckpoint(testing.allocator, 100);
+        defer testing.allocator.free(inner);
+        const wire = try encodeCoreUpgradeCheckpoint(testing.allocator, &store, 100, cursor);
+        defer testing.allocator.free(wire);
+        const view = try decodeCoreUpgradeCheckpoint(wire);
+        try testing.expectEqualDeep(cursor, view.orphan_revoke_cursor);
+        try testing.expectEqualSlices(u8, inner, view.store_bytes);
+        var restored = try Store.restoreCurrentUpgradeCheckpoint(testing.allocator, store.cfg, view.store_bytes, 100);
+        defer restored.deinit();
+        try testing.expectEqual(@as(usize, 0), restored.entryCount());
+        try testing.expectError(error.BadMagic, decodeCoreUpgradeCheckpoint(inner));
+    }
+}
+
+test "session replica Core checkpoint: canonical flags version checksum truncation and allocation rollback" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    const cursor = testToken(0x86);
+    const wire = try encodeCoreUpgradeCheckpoint(testing.allocator, &store, 100, cursor);
+    defer testing.allocator.free(wire);
+    for (0..wire.len) |length| {
+        if (decodeCoreUpgradeCheckpoint(wire[0..length])) |_| return error.TestUnexpectedResult else |_| {}
+    }
+    const damaged = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(damaged);
+    damaged[4] = core_checkpoint_version + 1;
+    try testing.expectError(error.UnsupportedVersion, decodeCoreUpgradeCheckpoint(damaged));
+    @memcpy(damaged, wire);
+    damaged[5] = 2;
+    try testing.expectError(error.InvalidMetadata, decodeCoreUpgradeCheckpoint(damaged));
+    @memcpy(damaged, wire);
+    damaged[6] ^= 1;
+    try testing.expectError(error.ChecksumMismatch, decodeCoreUpgradeCheckpoint(damaged));
+    var complete = false;
+    var failures: usize = 0;
+    for (0..8) |cut| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = cut });
+        const result = encodeCoreUpgradeCheckpoint(failing.allocator(), &store, 100, cursor);
+        if (result) |owned| {
+            defer failing.allocator().free(owned);
+            try testing.expectEqualSlices(u8, wire, owned);
+            try testing.expect(!failing.has_induced_failure);
+            complete = true;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expect(failing.has_induced_failure);
+            failures += 1;
+        }
+    }
+    try testing.expect(complete and failures != 0);
+    try testing.expectEqual(@as(usize, 0), store.entryCount());
+}
+
+test "session replica Core checkpoint: signed offers tombstones and terminal fences remain byte exact" {
+    var origin = try testKey(0x85);
+    defer origin.deinit();
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    const live = try signedOffer(testing.allocator, upsertOffer(&origin, testToken(1), 200, 0, "live"), &origin);
+    defer testing.allocator.free(live.wire);
+    const removed = try signedOffer(testing.allocator, removeOffer(&origin, testToken(2), 200, 1), &origin);
+    defer testing.allocator.free(removed.wire);
+    const terminal = try signedOffer(testing.allocator, testGroupOffer(&origin, testToken(3), "alice"), &origin);
+    defer testing.allocator.free(terminal.wire);
+    _ = try source.applySignedOffer(live.decoded, 0, 300);
+    _ = try source.applySignedOffer(removed.decoded, 0, 300);
+    _ = try source.applySignedOffer(terminal.decoded, 0, 300);
+    const wire = try encodeCoreUpgradeCheckpoint(testing.allocator, &source, 300, testToken(8));
+    defer testing.allocator.free(wire);
+    const view = try decodeCoreUpgradeCheckpoint(wire);
+    var restored = try Store.restoreCurrentUpgradeCheckpoint(testing.allocator, source.cfg, view.store_bytes, 300);
+    defer restored.deinit();
+    try testing.expectEqual(@as(?Token, testToken(8)), view.orphan_revoke_cursor);
+    try testing.expectEqualSlices(u8, live.wire, restored.getOrigin(testToken(1), live.decoded.offer.revision.origin_node).?.wire);
+    try testing.expectEqualSlices(u8, removed.wire, restored.getOriginTombstone(testToken(2), removed.decoded.offer.revision.origin_node).?.wire);
+    try testing.expectEqualSlices(u8, terminal.wire, restored.groupRevokeForToken(testToken(3)).?.wire);
+}
+
+test "session replica Core checkpoint: retained tombstone keys cannot restart a later retry page" {
+    var origin = try testKey(0x87);
+    defer origin.deinit();
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    for (1..18) |i| {
+        const offered = try signedOffer(testing.allocator, upsertOffer(&origin, testToken(@intCast(i)), 200, @intCast(i), "pending"), &origin);
+        defer testing.allocator.free(offered.wire);
+        _ = try source.applySignedOffer(offered.decoded, 0, 300);
+    }
+    // Token1 remains outstanding; token2..8 are tombstones and deliberately
+    // remain sorted scan keys. Resetting the cursor would select that same page.
+    for (2..9) |i| {
+        const removed = try signedOffer(testing.allocator, removeOffer(&origin, testToken(@intCast(i)), 201, @intCast(i)), &origin);
+        defer testing.allocator.free(removed.wire);
+        _ = try source.applySignedOffer(removed.decoded, 0, 300);
+    }
+    const wire = try encodeCoreUpgradeCheckpoint(testing.allocator, &source, 300, testToken(8));
+    defer testing.allocator.free(wire);
+    const view = try decodeCoreUpgradeCheckpoint(wire);
+    var restored = try Store.restoreCurrentUpgradeCheckpoint(testing.allocator, source.cfg, view.store_bytes, 300);
+    defer restored.deinit();
+    var page: [8]Token = undefined;
+    const next = restored.storedTokensAfter(view.orphan_revoke_cursor, &page);
+    try testing.expectEqual(@as(usize, 8), next.len);
+    for (next, 9..) |token, i| try testing.expectEqual(testToken(@intCast(i)), token);
+    const second = try encodeCoreUpgradeCheckpoint(testing.allocator, &restored, 300, next[7]);
+    defer testing.allocator.free(second);
+    const tail_view = try decodeCoreUpgradeCheckpoint(second);
+    var successor = try Store.restoreCurrentUpgradeCheckpoint(testing.allocator, source.cfg, tail_view.store_bytes, 300);
+    defer successor.deinit();
+    const tail = successor.storedTokensAfter(tail_view.orphan_revoke_cursor, &page);
+    try testing.expectEqual(@as(usize, 1), tail.len);
+    try testing.expectEqual(testToken(17), tail[0]);
+    try testing.expectEqualSlices(u8, source.getOrigin(testToken(1), signed_frame.originShortId(origin.public_key)).?.wire, successor.getOrigin(testToken(1), signed_frame.originShortId(origin.public_key)).?.wire);
+    try testing.expectEqual(@as(usize, 7), successor.tombstoneCount());
+}
+
+test "session replica offer memo rechecks authority, expiry and terminal revocation" {
+    var kp = try testKey(0xe1);
+    defer kp.deinit();
+    const offer = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xe1), 200, 0, "state"), &kp);
+    defer testing.allocator.free(offer.wire);
+    const fence = try signedOffer(testing.allocator, testGroupOffer(&kp, testToken(0xe1), "alice"), &kp);
+    defer testing.allocator.free(fence.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    const authority: OfferMemoAuthority = .{ .declared = true, .epoch = 1, .roster_digest = @splat(7) };
+    try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOfferMemoized(offer.decoded, 10, 200, &memo, authority)).disposition);
+    const replay = try decodeOffer(offer.wire);
+    try testing.expectEqual(ApplyDisposition.duplicate, (try store.applySignedOfferMemoized(replay, 10, 201, &memo, authority)).disposition);
+    try testing.expectEqual(@as(usize, 1), memo.test_signature_checks);
+    var changed_authority = authority;
+    changed_authority.epoch += 1;
+    _ = try store.applySignedOfferMemoized(replay, 10, 202, &memo, changed_authority);
+    try testing.expectEqual(@as(usize, 2), memo.test_signature_checks);
+    changed_authority.roster_digest[0] ^= 1;
+    _ = try store.applySignedOfferMemoized(replay, 10, 203, &memo, changed_authority);
+    try testing.expectEqual(@as(usize, 3), memo.test_signature_checks);
+    var bad = replay;
+    bad.signature[0] ^= 1;
+    try testing.expectError(error.BadSignature, store.applySignedOfferMemoized(bad, 10, 204, &memo, authority));
+    try testing.expectEqual(@as(usize, 4), memo.test_signature_checks);
+    bad = replay;
+    bad.signer[0] ^= 1;
+    try testing.expectError(error.OriginMismatch, store.applySignedOfferMemoized(bad, 10, 205, &memo, authority));
+    _ = try store.applySignedOfferMemoized(replay, 10, 200, &memo, authority);
+    try testing.expectEqual(@as(usize, 5), memo.test_signature_checks); // rollback cannot hit
+    try testing.expectError(error.Expired, store.applySignedOfferMemoized(replay, 10, 10_001, &memo, authority));
+    try testing.expectEqual(@as(usize, 6), memo.test_signature_checks);
+    _ = try store.applySignedOfferMemoized(fence.decoded, 10, 300, &memo, authority);
+    try testing.expectEqual(ApplyDisposition.tombstoned, (try store.applySignedOfferMemoized(replay, 10, 301, &memo, authority)).disposition);
+}
+
+test "session replica offer memo retains exact signed bytes and wipes bounded slots" {
+    var kp = try testKey(0xe2);
+    defer kp.deinit();
+    const authority: OfferMemoAuthority = .{ .declared = true, .epoch = 1, .roster_digest = @splat(3) };
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    const first = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(1), 200, 0, "a"), &kp);
+    defer testing.allocator.free(first.wire);
+    try memo.verify(first.decoded, authority, 200);
+    var changed = upsertOffer(&kp, testToken(1), 200, 0, "b");
+    changed.expires_at_ms = 9_999;
+    const second = try signedOffer(testing.allocator, changed, &kp);
+    defer testing.allocator.free(second.wire);
+    try memo.verify(second.decoded, authority, 201);
+    try testing.expectEqual(@as(usize, 2), memo.test_signature_checks);
+    for (2..6) |n| {
+        const other = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(@intCast(n)), 200, 0, "a"), &kp);
+        defer testing.allocator.free(other.wire);
+        try memo.verify(other.decoded, authority, 202);
+    }
+    try memo.verify(first.decoded, authority, 203);
+    try testing.expectEqual(@as(usize, 7), memo.test_signature_checks);
+    memo.deinit();
+    for (memo.slots) |slot| {
+        try testing.expect(!slot.valid);
+        try testing.expect(std.mem.allEqual(u8, &slot.transcript, 0));
+    }
+    try memo.verify(first.decoded, authority, 204);
+    try testing.expectEqual(@as(usize, 1), memo.test_signature_checks);
+}
+
+test "session replica offer memo insertion remains allocation failure atomic" {
+    var kp = try testKey(0xe3);
+    defer kp.deinit();
+    const offer = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xe3), 200, 0, "state"), &kp);
+    defer testing.allocator.free(offer.wire);
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, signed: SignedOffer) !void {
+            var store = Store.init(allocator);
+            defer store.deinit();
+            var memo: OfferSignatureMemo = .{};
+            defer memo.deinit();
+            const authority: OfferMemoAuthority = .{ .declared = true, .epoch = 1, .roster_digest = @splat(9) };
+            const result = store.applySignedOfferMemoized(signed, 10, 200, &memo, authority) catch |err| {
+                try testing.expectEqual(@as(usize, 0), store.entryCount());
+                try testing.expectEqual(@as(usize, 0), store.routeCount());
+                return err;
+            };
+            try testing.expectEqual(ApplyDisposition.inserted, result.disposition);
+            try testing.expectEqualStrings("state", store.get(signed.offer.token).?.snapshot);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Sweep.run, .{offer.decoded});
+}
+
+test "session replica offer memo warmed hit respects terminal group revocation" {
+    var kp = try testKey(0xe4);
+    defer kp.deinit();
+    const token = testToken(0xe4);
+    const offer = try signedOffer(testing.allocator, upsertOffer(&kp, token, 200, 0, "state"), &kp);
+    defer testing.allocator.free(offer.wire);
+    const fence = try signedOffer(testing.allocator, testGroupOffer(&kp, token, "alice"), &kp);
+    defer testing.allocator.free(fence.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    const authority: OfferMemoAuthority = .{ .declared = true, .epoch = 1, .roster_digest = @splat(7) };
+    try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOfferMemoized(offer.decoded, 10, 200, &memo, authority)).disposition);
+    try testing.expectEqual(@as(usize, 1), memo.test_signature_checks);
+    try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOfferMemoized(fence.decoded, 10, 201, &memo, authority)).disposition);
+    try testing.expectEqual(ApplyDisposition.tombstoned, (try store.applySignedOfferMemoized(offer.decoded, 10, 202, &memo, authority)).disposition);
+    try testing.expectEqual(@as(usize, 1), memo.test_signature_checks);
+}
+
+test "session replica offer memo warmed hit respects current quarantine" {
+    var alice = try testKey(0xe5);
+    defer alice.deinit();
+    var mallory = try testKey(0xe6);
+    defer mallory.deinit();
+    const token = testToken(0xe5);
+    const original = try signedOffer(testing.allocator, upsertOffer(&alice, token, 200, 0, "alice"), &alice);
+    defer testing.allocator.free(original.wire);
+    var conflicting_offer = upsertOffer(&mallory, token, 200, 0, "mallory");
+    conflicting_offer.account = "mallory";
+    const conflicting = try signedOffer(testing.allocator, conflicting_offer, &mallory);
+    defer testing.allocator.free(conflicting.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    const authority: OfferMemoAuthority = .{ .declared = true, .epoch = 1, .roster_digest = @splat(7) };
+    try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOfferMemoized(original.decoded, 10, 200, &memo, authority)).disposition);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try store.applySignedOffer(conflicting.decoded, 11, 201)).disposition);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try store.applySignedOfferMemoized(original.decoded, 10, 202, &memo, authority)).disposition);
+    try testing.expectEqual(@as(usize, 1), memo.test_signature_checks);
+}
+
+test "session replica offer memo inventory hit binds signed metadata and current authority" {
+    var kp = try testKey(0xe7);
+    defer kp.deinit();
+    var inventory_buf: [inventory_row_len]u8 = undefined;
+    var offer = upsertOffer(&kp, testToken(0xe7), 200, 0, "state");
+    offer.operation = .inventory_upsert;
+    offer.resume_eligible = true;
+    offer.inventory = try encodeInventory(&inventory_buf, &.{.{ .attachment_id = @splat(1), .signon_ms = 10, .attached = true }});
+    const signed = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(signed.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    const authority: OfferMemoAuthority = .{ .declared = true, .epoch = 1, .roster_digest = @splat(7) };
+    try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOfferMemoized(signed.decoded, 10, 200, &memo, authority)).disposition);
+    try testing.expectEqual(ApplyDisposition.duplicate, (try store.applySignedOfferMemoized(try decodeOffer(signed.wire), 10, 201, &memo, authority)).disposition);
+    try testing.expectEqual(@as(usize, 1), memo.test_signature_checks);
+    var altered_projection = signed.decoded;
+    altered_projection.offer.resume_eligible = false;
+    try testing.expectError(error.TranscriptMismatch, store.applySignedOfferMemoized(altered_projection, 10, 202, &memo, authority));
+    var changed_authority = authority;
+    changed_authority.roster_digest[0] ^= 1;
+    _ = try store.applySignedOfferMemoized(signed.decoded, 10, 203, &memo, changed_authority);
+    try testing.expectEqual(@as(usize, 2), memo.test_signature_checks);
+    changed_authority.epoch += 1;
+    _ = try store.applySignedOfferMemoized(signed.decoded, 10, 204, &memo, changed_authority);
+    try testing.expectEqual(@as(usize, 3), memo.test_signature_checks);
+    try testing.expectError(error.Expired, store.applySignedOfferMemoized(signed.decoded, 10, 10_001, &memo, authority));
+    try testing.expectEqual(@as(usize, 4), memo.test_signature_checks);
+}
+
+test "session replica offer memo inventory hit respects revoke and quarantine" {
+    var alice = try testKey(0xe8);
+    defer alice.deinit();
+    var mallory = try testKey(0xe9);
+    defer mallory.deinit();
+    var inventory_buf: [inventory_row_len]u8 = undefined;
+    var offer = upsertOffer(&alice, testToken(0xe8), 200, 0, "state");
+    offer.operation = .inventory_upsert;
+    offer.resume_eligible = false;
+    offer.nick = "";
+    offer.snapshot = "";
+    offer.inventory = try encodeInventory(&inventory_buf, &.{.{ .attachment_id = @splat(1), .signon_ms = 10, .attached = true }});
+    const signed = try signedOffer(testing.allocator, offer, &alice);
+    defer testing.allocator.free(signed.wire);
+    const fence = try signedOffer(testing.allocator, testGroupOffer(&alice, offer.token, "alice"), &alice);
+    defer testing.allocator.free(fence.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    const authority: OfferMemoAuthority = .{ .declared = true, .epoch = 1, .roster_digest = @splat(7) };
+    _ = try store.applySignedOfferMemoized(signed.decoded, 10, 200, &memo, authority);
+    try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOfferMemoized(fence.decoded, 10, 201, &memo, authority)).disposition);
+    try testing.expectEqual(ApplyDisposition.tombstoned, (try store.applySignedOfferMemoized(signed.decoded, 10, 202, &memo, authority)).disposition);
+    try testing.expectEqual(@as(usize, 1), memo.test_signature_checks);
+    var conflict_store = Store.init(testing.allocator);
+    defer conflict_store.deinit();
+    var conflict_memo: OfferSignatureMemo = .{};
+    defer conflict_memo.deinit();
+    var conflicting = upsertOffer(&mallory, offer.token, 200, 0, "other");
+    conflicting.account = "mallory";
+    const rival = try signedOffer(testing.allocator, conflicting, &mallory);
+    defer testing.allocator.free(rival.wire);
+    _ = try conflict_store.applySignedOfferMemoized(signed.decoded, 10, 200, &conflict_memo, authority);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try conflict_store.applySignedOffer(rival.decoded, 11, 201)).disposition);
+    try testing.expectEqual(ApplyDisposition.quarantined, (try conflict_store.applySignedOfferMemoized(signed.decoded, 10, 202, &conflict_memo, authority)).disposition);
+    try testing.expectEqual(@as(usize, 1), conflict_memo.test_signature_checks);
+}
+
+test "session replica offer memo production stats separate verification hit fallback and projection refusal" {
+    var kp = try testKey(0xea);
+    defer kp.deinit();
+    var inventory_buf: [inventory_row_len]u8 = undefined;
+    var offer = upsertOffer(&kp, testToken(0xea), 200, 0, "state");
+    offer.operation = .inventory_upsert;
+    offer.resume_eligible = true;
+    offer.inventory = try encodeInventory(&inventory_buf, &.{.{ .attachment_id = @splat(2), .signon_ms = 10, .attached = true }});
+    const signed = try signedOffer(testing.allocator, offer, &kp);
+    defer testing.allocator.free(signed.wire);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    const authority: OfferMemoAuthority = .{ .declared = true, .epoch = 1, .roster_digest = @splat(8) };
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{}, memo.stats());
+    try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOfferMemoized(signed.decoded, 10, 200, &memo, authority)).disposition);
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = 1 }, memo.stats());
+    try testing.expectEqual(ApplyDisposition.duplicate, (try store.applySignedOfferMemoized(signed.decoded, 10, 201, &memo, authority)).disposition);
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = 1, .cache_hits = 1 }, memo.stats());
+    var altered = signed.decoded;
+    altered.offer.resume_eligible = false;
+    try testing.expectError(error.TranscriptMismatch, store.applySignedOfferMemoized(altered, 10, 202, &memo, authority));
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = 1, .cache_hits = 1 }, memo.stats());
+    altered = signed.decoded;
+    altered.signature[0] ^= 1;
+    try testing.expectError(error.BadSignature, store.applySignedOfferMemoized(altered, 10, 202, &memo, authority));
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = 2, .cache_hits = 1 }, memo.stats());
+    try testing.expectError(error.Expired, store.applySignedOfferMemoized(signed.decoded, 10, 10_001, &memo, authority));
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = 3, .cache_hits = 1, .fallbacks = 1 }, memo.stats());
+    // A backward clock must perform signature verification, even for bytes
+    // still retained in a slot. Normal Store lifetime admission is unchanged.
+    try testing.expectEqual(ApplyDisposition.duplicate, (try store.applySignedOfferMemoized(signed.decoded, 10, 203, &memo, authority)).disposition);
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = 4, .cache_hits = 1, .fallbacks = 2 }, memo.stats());
+}
+
+test "session replica offer memo production stats saturate without changing signature decisions" {
+    var kp = try testKey(0xeb);
+    defer kp.deinit();
+    const signed = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xeb), 200, 0, "state"), &kp);
+    defer testing.allocator.free(signed.wire);
+    const authority: OfferMemoAuthority = .{ .declared = false, .epoch = 0, .roster_digest = @splat(0) };
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    const maximum = std.math.maxInt(u64);
+    memo.test_signature_checks = maximum - 1;
+    memo.cache_hits = maximum - 1;
+    memo.fallbacks = maximum - 1;
+    try memo.verify(signed.decoded, authority, 200);
+    try memo.verify(signed.decoded, authority, 201);
+    try memo.verify(signed.decoded, authority, 202);
+    var bad = signed.decoded;
+    bad.signature[0] ^= 1;
+    try testing.expectError(error.BadSignature, memo.verify(bad, authority, 203));
+    try memo.verify(signed.decoded, authority, 10_001);
+    try memo.verify(signed.decoded, authority, 10_002);
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = maximum, .cache_hits = maximum, .fallbacks = maximum }, memo.stats());
+}
+
+test "session replica offer memo production stats are value observations cold wiped and absent from checkpoint" {
+    var kp = try testKey(0xec);
+    defer kp.deinit();
+    const signed = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0xec), 200, 0, "state"), &kp);
+    defer testing.allocator.free(signed.wire);
+    const authority: OfferMemoAuthority = .{ .declared = false, .epoch = 0, .roster_digest = @splat(0) };
+    var memo: OfferSignatureMemo = .{};
+    defer memo.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.applySignedOfferMemoized(signed.decoded, 10, 200, &memo, authority);
+    const before = try store.encodeUpgradeCheckpoint(testing.allocator, 200);
+    defer testing.allocator.free(before);
+    var observation = memo.stats();
+    observation.signature_checks = 999;
+    try testing.expectEqual(@as(u64, 999), observation.signature_checks);
+    try testing.expectEqual(@as(u64, 1), memo.stats().signature_checks);
+    try memo.verify(signed.decoded, authority, 201);
+    try testing.expectEqual(@as(u64, 1), memo.stats().cache_hits);
+    memo.deinit();
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{}, memo.stats());
+    for (memo.slots) |slot| {
+        try testing.expect(!slot.valid);
+        try testing.expect(std.mem.allEqual(u8, &slot.transcript, 0));
+    }
+    const after = try store.encodeUpgradeCheckpoint(testing.allocator, 200);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    var restored = try Store.restoreCurrentUpgradeCheckpoint(testing.allocator, store.cfg, before, 200);
+    defer restored.deinit();
+    var cold: OfferSignatureMemo = .{};
+    defer cold.deinit();
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{}, cold.stats());
+    _ = try restored.applySignedOfferMemoized(signed.decoded, 10, 201, &cold, authority);
+    try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = 1 }, cold.stats());
 }

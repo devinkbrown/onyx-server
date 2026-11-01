@@ -40,10 +40,10 @@ pub const ListKind = enum(u8) {
 
     pub fn fromTag(tag: u8) ?ListKind {
         return switch (tag) {
-            @intFromEnum(ListKind.ban) => .ban,
-            @intFromEnum(ListKind.exempt) => .exempt,
-            @intFromEnum(ListKind.invex) => .invex,
-            @intFromEnum(ListKind.quiet) => .quiet,
+            @backingInt(ListKind.ban) => .ban,
+            @backingInt(ListKind.exempt) => .exempt,
+            @backingInt(ListKind.invex) => .invex,
+            @backingInt(ListKind.quiet) => .quiet,
             else => null,
         };
     }
@@ -74,7 +74,7 @@ pub fn encode(ev: ChannelListEvent, out: []u8) Error![]const u8 {
     var i: usize = 0;
     out[i] = @intFromBool(ev.present);
     i += 1;
-    out[i] = @intFromEnum(ev.kind);
+    out[i] = @backingInt(ev.kind);
     i += 1;
     std.mem.writeInt(u64, out[i..][0..8], ev.origin_node, .little);
     i += 8;

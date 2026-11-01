@@ -6,7 +6,7 @@ Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon, built from first princ
 
 Registry commands default to registered-client access unless the command table sets `.access = .any` or `.access = .oper` (`src/daemon/registry.zig:51`, `src/daemon/registry.zig:830`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig:14389`). Numeric names and codes are verified against `src/proto/numeric.zig` and the server-local enum (`src/daemon/server.zig:1403`).
 
-Last reconciled **2026-09-06** against the enabled module manifest and command registry. Compatibility aliases are listed individually below even when they share one handler or reference page.
+Last reconciled **2026-11-01** against the 0.9.0 enabled module manifest and command registry. Compatibility aliases are listed individually below even when they share one handler or reference page.
 
 | Command | Summary | Reference |
 |---|---|---|
@@ -147,7 +147,7 @@ Last reconciled **2026-09-06** against the enabled module manifest and command r
 | `MEDIA` | Media control plane. | [media.md](media.md#media) |
 | `ACTIVITY` | Activity/presence updates. | [media.md](media.md#activity) |
 
-### Commands added or split out in the 0.7 registry reconciliation
+### Commands added or split out in the 0.7 registry reconciliation (historical; retained for registry provenance)
 
 | Command | Summary | Reference |
 |---|---|---|

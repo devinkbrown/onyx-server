@@ -277,7 +277,7 @@ pub const Bridge = struct {
         for (self.options.registry) |pin| {
             policyDigestBytes(&hash, pin.name);
             hash.update(&pin.blake3);
-            const tier = [_]u8{@intFromEnum(pin.tier)};
+            const tier = [_]u8{@backingInt(pin.tier)};
             hash.update(&tier);
             const pub_present = [_]u8{@intFromBool(pin.publisher != null)};
             hash.update(&pub_present);

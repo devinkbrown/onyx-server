@@ -74,14 +74,14 @@ pub const Ctrl = struct {
     pub fn fromByte(byte: u8) Ctrl {
         return .{
             .flags = @intCast(byte >> 4),
-            .priority = @enumFromInt(@as(u3, @intCast((byte >> 1) & 0x07))),
+            .priority = @fromBackingInt(@intCast(@as(u3, @intCast((byte >> 1) & 0x07)))),
             .compressed = (byte & 0x01) != 0,
         };
     }
 
     pub fn toByte(self: Ctrl) u8 {
         return (@as(u8, self.flags) << 4) |
-            (@as(u8, @intFromEnum(self.priority)) << 1) |
+            (@as(u8, @backingInt(self.priority)) << 1) |
             @as(u8, if (self.compressed) 1 else 0);
     }
 
@@ -213,11 +213,11 @@ pub const FrameType = enum(u8) {
     _,
 
     pub fn fromByte(value: u8) FrameType {
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     pub fn byte(self: FrameType) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn band(self: FrameType) FrameBand {
@@ -546,7 +546,7 @@ test "hop zero is dropped" {
     try std.testing.expectError(error.HopExpired, frame.encode(&out));
 
     _ = try coilpack.encodeHeader(&out, .{
-        .type = @intFromEnum(FrameType.ping),
+        .type = @backingInt(FrameType.ping),
         .ctrl = Ctrl.init(0, .control, false).toByte(),
         .length = 0,
         .stream_id = 0,

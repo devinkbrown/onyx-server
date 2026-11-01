@@ -700,6 +700,51 @@ pub const WebTransportListener = struct {
         };
     }
 
+    /// Restore a Linux candidate using private duplicates of borrowed inherited
+    /// bridge descriptors. The authenticated carry binds device/inode and
+    /// endpoints to each descriptor before duplication. Originals are never consumed, read, shut down or modified; any
+    /// failure destroys the staged graph and closes only candidate duplicates.
+    pub fn prepareActiveConnectionsInherited(self: *WebTransportListener, carry: *const ActiveSnapshot, bridges: []const BridgeFd) !void {
+        if (comptime builtin.os.tag != .linux) return error.Unsupported;
+        lockSpin(&self.worker_mutex);
+        defer self.worker_mutex.unlock();
+        if (self.legacy_joining or self.thread != null or self.worker_id != null or self.runtime.view != null or
+            self.conns.items.len != 0 or self.by_cid.count() != 0) return error.NotQuiescent;
+        try carry.validate(self.tls);
+        var present = try self.captureIdle(.unstarted);
+        defer present.deinit();
+        present.execution = carry.base.execution;
+        if (!std.meta.eql(present, carry.base) or
+            !std.mem.eql(u8, &carry.irc_host_digest, &ircHostDigest(self.irc_host))) return error.ConfigMismatch;
+        var cursor: usize = 0;
+        for (carry.connections) |row| if (row.bridge) |expected| {
+            if (cursor >= bridges.len or bridges[cursor].slot != row.slot or bridges[cursor].fd < 0 or
+                @as(usize, @intCast(bridges[cursor].fd)) != expected.source_socket) return error.ConfigMismatch;
+            if (!std.meta.eql(try observeInheritedBridge(row.slot, bridges[cursor].fd), bridges[cursor])) return error.BridgeIdentityMismatch;
+            const observed = try observeBridge(bridges[cursor].fd);
+            if (!std.meta.eql(observed, expected)) return error.BridgeIdentityMismatch;
+            // Duplicates share status flags. Observe; never mutate the source.
+            const flags = sys.fcntl(bridges[cursor].fd, posix.F.GETFL, @as(usize, 0));
+            if (posix.errno(flags) != .SUCCESS or !@as(posix.O, @bitCast(@as(u32, @intCast(flags)))).NONBLOCK) return error.BridgeModeFailed;
+            cursor += 1;
+        };
+        if (cursor != bridges.len) return error.ConfigMismatch;
+        try self.conns.resize(self.allocator, carry.slot_count);
+        @memset(self.conns.items, null);
+        errdefer self.clearPreparedConnections();
+        for (carry.connections) |*row| {
+            const conn = try self.restoreActiveConnection(row);
+            self.conns.items[row.slot] = conn;
+            try self.indexCid(conn.initDcidSlice(), row.slot);
+            try self.indexCid(conn.scidSlice(), row.slot);
+        }
+        for (bridges) |bridge| {
+            const result = sys.fcntl(bridge.fd, posix.F.DUPFD_CLOEXEC, @as(usize, 0));
+            if (posix.errno(result) != .SUCCESS) return error.BridgeDuplicateFailed;
+            self.conns.items[bridge.slot].?.irc_fd = @intCast(result);
+        }
+    }
+
     fn restoreActiveConnection(self: *WebTransportListener, row: *const ActiveConnectionSnapshot) !*Connection {
         const conn = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(conn);
@@ -1629,7 +1674,7 @@ fn parseInitialHeader(data: []const u8) ?InitialHeader {
     // may create a connection via this path; the type bits are NOT
     // header-protected on a long header, so we can read them in the clear.
     const ptype = (data[0] >> 4) & 0x03;
-    if (ptype != @intFromEnum(quic_packet.LongPacketType.initial)) return null;
+    if (ptype != @backingInt(quic_packet.LongPacketType.initial)) return null;
 
     const version = std.mem.readInt(u32, data[1..5], .big);
 
@@ -2484,7 +2529,7 @@ test "retry — a tokenless Initial under .always policy is answered with a Retr
 
     // The reply is a Retry packet: long header, Retry type bits 0b11.
     try testing.expect((reply[0] & 0x80) != 0);
-    try testing.expectEqual(@as(u8, @intFromEnum(quic_packet.LongPacketType.retry)), (reply[0] >> 4) & 0x03);
+    try testing.expectEqual(@as(u8, @backingInt(quic_packet.LongPacketType.retry)), (reply[0] >> 4) & 0x03);
     // Retry's DCID = the client's SCID (so the client recognises the reply).
     try testing.expectEqual(@as(u8, scid.len), reply[5]);
     try testing.expectEqualSlices(u8, &scid, reply[6 .. 6 + scid.len]);
@@ -2561,7 +2606,7 @@ test "retry — a token from a different client IP is rejected" {
     var reply: [256]u8 = undefined;
     _ = fx.exchange(pkt, &reply) orelse return error.TestUnexpectedResult;
     try testing.expect(fx.lst.lookup(&dcid) == null);
-    try testing.expectEqual(@as(u8, @intFromEnum(quic_packet.LongPacketType.retry)), (reply[0] >> 4) & 0x03);
+    try testing.expectEqual(@as(u8, @backingInt(quic_packet.LongPacketType.retry)), (reply[0] >> 4) & 0x03);
 }
 
 test "retry policy .never mints a connection directly (default fast path unaffected)" {
@@ -3038,8 +3083,49 @@ fn windowsBridgeAddress(address: win.SockAddr6, len: i32) !TransportAddress {
     }
 }
 
-fn observeBridge(fd: TcpSocket) !BridgeIdentity {
-    if (comptime builtin.os.tag != .windows) return error.ActiveBridgeContinuityUnsupported;
+fn nativeBridgeAddress(address: *const posix.sockaddr.storage, len: posix.socklen_t) !TransportAddress {
+    if (address.family == posix.AF.INET and len == @sizeOf(posix.sockaddr.in)) {
+        const v4: *const posix.sockaddr.in = @ptrCast(@alignCast(address));
+        return TransportAddress.fromBytes(&@as([4]u8, @bitCast(v4.addr)), std.mem.bigToNative(u16, v4.port));
+    }
+    if (address.family == posix.AF.INET6 and len == @sizeOf(posix.sockaddr.in6)) {
+        const v6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(address));
+        // TransportAddress has no scope. Refuse identities it cannot preserve.
+        if (v6.scope_id != 0) return error.InvalidBridgeSocket;
+        const mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+        return TransportAddress.fromBytes(if (std.mem.eql(u8, v6.addr[0..12], &mapped)) v6.addr[12..16] else &v6.addr, std.mem.bigToNative(u16, v6.port));
+    }
+    return error.InvalidBridgeSocket;
+}
+
+/// Borrowed Linux descriptor manifest. The sealed checkpoint authenticates
+/// device/inode identity; active preparation creates its own CLOEXEC duplicate.
+pub const BridgeFd = struct { slot: usize, fd: i32, device: u64, inode: u64 };
+
+/// Observe the Linux open-file identity without changing its shared flags.
+pub fn observeInheritedBridge(slot: usize, fd: i32) !BridgeFd {
+    if (comptime builtin.os.tag != .linux) return error.Unsupported;
+    var stat: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
+    if (posix.errno(std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true }, &stat)) != .SUCCESS or
+        !stat.mask.TYPE or !stat.mask.INO or (stat.mode & posix.S.IFMT) != posix.S.IFSOCK or stat.ino == 0) return error.InvalidBridgeSocket;
+    _ = try observeBridge(fd);
+    return .{ .slot = slot, .fd = fd, .device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor, .inode = stat.ino };
+}
+
+pub fn observeBridge(fd: TcpSocket) !BridgeIdentity {
+    if (comptime builtin.os.tag != .windows) {
+        var kind: c_int = 0;
+        var length: posix.socklen_t = @sizeOf(c_int);
+        if (posix.errno(sys.getsockopt(fd, posix.SOL.SOCKET, posix.SO.TYPE, std.mem.asBytes(&kind), &length)) != .SUCCESS or
+            length != @sizeOf(c_int) or kind != posix.SOCK.STREAM) return error.InvalidBridgeSocket;
+        var local: posix.sockaddr.storage = undefined;
+        var peer: posix.sockaddr.storage = undefined;
+        var local_len: posix.socklen_t = @sizeOf(@TypeOf(local));
+        var peer_len: posix.socklen_t = @sizeOf(@TypeOf(peer));
+        if (posix.errno(sys.getsockname(fd, @ptrCast(&local), &local_len)) != .SUCCESS or
+            posix.errno(sys.getpeername(fd, @ptrCast(&peer), &peer_len)) != .SUCCESS) return error.InvalidBridgeSocket;
+        return .{ .source_socket = @intCast(fd), .local = try nativeBridgeAddress(&local, local_len), .peer = try nativeBridgeAddress(&peer, peer_len) };
+    }
     var local = std.mem.zeroes(win.SockAddr6);
     var peer = std.mem.zeroes(win.SockAddr6);
     var local_len: i32 = @sizeOf(win.SockAddr6);
@@ -3245,7 +3331,7 @@ fn hashTlsValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) !void {
         .@"struct" => |info| inline for (info.field_names) |name| try hashTlsValue(hash, @field(value, name)),
         .@"union" => |info| {
             const tag = std.meta.activeTag(value);
-            try runtime_pause.hashConfigValue(hash, @intFromEnum(tag));
+            try runtime_pause.hashConfigValue(hash, @backingInt(tag));
             inline for (info.field_names) |name| if (tag == @field(info.tag_type.?, name)) try hashTlsValue(hash, @field(value, name));
         },
         else => try runtime_pause.hashConfigValue(hash, value),
@@ -3402,6 +3488,174 @@ test "Windows WebTransport active snapshot restores an established QUIC and H3 t
     try testing.expectEqualDeep(active.connections[0].scid, restored.connections[0].scid);
     try testing.expectEqualDeep(active.connections[0].h3, restored.connections[0].h3);
     try testing.expectEqualDeep(active.connections[0].quic, restored.connections[0].quic);
+}
+
+test "Helix Linux WebTransport active graph preserves physical bridge and traffic across restore" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var keys: TestServerKeys = undefined;
+    try keys.init();
+    const tls: TlsConfig = .{ .cert_chain = &keys.cert_chain, .signing_key = .{ .ed25519 = keys.kp } };
+    const listen_result = sys.socket(posix.AF.INET, sys.SOCK.STREAM | sys.SOCK.CLOEXEC | sys.SOCK.NONBLOCK, sys.IPPROTO.TCP);
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(listen_result));
+    const listen_fd: posix.fd_t = @intCast(listen_result);
+    defer _ = sys.close(listen_fd);
+    var bind_address = sys.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.bind(listen_fd, @ptrCast(&bind_address), @sizeOf(@TypeOf(bind_address)))));
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.listen(listen_fd, 4)));
+    var address_len: posix.socklen_t = @sizeOf(@TypeOf(bind_address));
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.getsockname(listen_fd, @ptrCast(&bind_address), &address_len)));
+    var source = WebTransportListener.init(testing.allocator, tls, std.mem.bigToNative(u16, bind_address.port));
+    defer source.deinit();
+    try source.prepareColdResources(testing.io, .{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    try source.startPreparedLegacyWorker();
+
+    var peer_socket = try DualStackUdpSocket.bind(.{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    defer peer_socket.deinit();
+    peer_socket.setRecvTimeoutMs(100);
+    const server_address = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, source.port);
+    const client_cid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    const initial_dcid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
+    var client = try quic_conn.Conn.initClient(testing.allocator, .{
+        .alpn_protocols = &[_][]const u8{"h3"},
+        .transport_params = .{
+            .initial_source_connection_id = &client_cid,
+            .initial_max_data = 1 << 20,
+            .initial_max_stream_data_bidi_local = 256 * 1024,
+            .initial_max_stream_data_bidi_remote = 256 * 1024,
+            .initial_max_streams_bidi = 100,
+        },
+        .local_cid = &client_cid,
+        .initial_dcid = &initial_dcid,
+        .x25519_seed = @as([32]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+    });
+    defer client.deinit();
+    var round: usize = 0;
+    while (round < 40 and !client.isEstablished()) : (round += 1) {
+        try sendQuic(testing.allocator, &client, &peer_socket, server_address);
+        try recvQuicAll(&client, &peer_socket);
+    }
+    try testing.expect(client.isEstablished());
+    try sendControlAndConnect(testing.allocator, &client, "irc.example", "/wt");
+    const connect_stream = lastOpenedBidi(&client);
+    round = 0;
+    while (round < 40 and !(connectAnswered200(testing.allocator, &client, connect_stream) catch false)) : (round += 1) {
+        try sendQuic(testing.allocator, &client, &peer_socket, server_address);
+        try recvQuicAll(&client, &peer_socket);
+    }
+    try testing.expect(round < 40);
+
+    const accepted_result = sys.accept4(listen_fd, null, null, sys.SOCK.CLOEXEC | sys.SOCK.NONBLOCK);
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(accepted_result));
+    const accepted_fd: posix.fd_t = @intCast(accepted_result);
+    defer _ = sys.close(accepted_fd);
+    const session_id = try webtransport.SessionId.initClientBidirectional(connect_stream);
+    const data_stream = try client.openStream();
+    const prefix = try webtransport.encodeStreamSignal(testing.allocator, webtransport.StreamType.webtransport_bidirectional, session_id);
+    defer testing.allocator.free(prefix);
+    try client.sendStream(data_stream, prefix, false);
+    try client.sendStream(data_stream, "before\r\n", false);
+    var received: [256]u8 = undefined;
+    var received_len: usize = 0;
+    round = 0;
+    while (round < 40 and received_len < "before\r\n".len) : (round += 1) {
+        try sendQuic(testing.allocator, &client, &peer_socket, server_address);
+        try recvQuicAll(&client, &peer_socket);
+        const result = sys.read(accepted_fd, received[received_len..].ptr, received.len - received_len);
+        if (posix.errno(result) == .SUCCESS) received_len += result;
+    }
+    try testing.expectEqualStrings("before\r\n", received[0..received_len]);
+    const pause = try source.requestPause(100);
+    try source.awaitPaused(pause, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    defer source.resumePaused(pause) catch {};
+    var active = try source.capturePausedActive(pause, testing.allocator);
+    defer active.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), active.connections.len);
+    try testing.expect(active.connections[0].bridge != null);
+    try testing.expectEqual(@as(usize, 2), active.cidCount());
+    const old_slot = active.connections[0].slot;
+    active.connections[0].slot = active.slot_count;
+    try testing.expectError(error.InvalidSnapshot, active.validate(tls));
+    active.connections[0].slot = old_slot;
+    const checkpoint = @import("helix/linux_webtransport_checkpoint.zig");
+    const bridge_fd = try observeInheritedBridge(active.connections[0].slot, @intCast(active.connections[0].bridge.?.source_socket));
+    const accepted_identity = try observeBridge(accepted_fd);
+    var bridges = [_]BridgeFd{bridge_fd};
+    var accepted = [_]checkpoint.AcceptedIrcSocket{.{ .fd = @intCast(accepted_fd), .local = accepted_identity.local, .peer = accepted_identity.peer }};
+    var body: checkpoint.Body = .{ .snapshot = active, .udp_fd = source.socket.?.fd, .bridges = &bridges, .accepted = &accepted };
+    const wire = try checkpoint.encode(testing.allocator, &body, tls);
+    defer checkpoint.freeEncoded(testing.allocator, wire);
+    const view = try checkpoint.validateWire(wire);
+    try testing.expectEqual(body.udp_fd, view.udp_fd);
+    var bridge_iter = view.bridgeIterator();
+    try testing.expectEqualDeep(bridge_fd, bridge_iter.next().?);
+    try testing.expect(bridge_iter.next() == null);
+    try testing.checkAllAllocationFailures(testing.allocator, testLinuxCheckpointDecode, .{ wire, tls });
+    try testing.checkAllAllocationFailures(testing.allocator, testLinuxActiveRestore, .{ &active, tls, body.udp_fd, &bridges });
+    // Missing physical counterpart must reject even if the rest of the graph is valid.
+    body.accepted = &.{};
+    try testing.expectError(error.InvalidSnapshot, checkpoint.encode(testing.allocator, &body, tls));
+    body.accepted = &accepted;
+    const old_peer = accepted[0].peer;
+    accepted[0].peer.port ^= 1;
+    try testing.expectError(error.InvalidSnapshot, checkpoint.encode(testing.allocator, &body, tls));
+    accepted[0].peer = old_peer;
+    const duplicate = sys.fcntl(body.udp_fd, posix.F.DUPFD_CLOEXEC, @as(usize, 0));
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(duplicate));
+    var candidate = try WebTransportListener.initInherited(testing.allocator, tls, @intCast(duplicate), null, &active.base);
+    defer candidate.deinit();
+    bridges[0].inode ^= 1;
+    try testing.expectError(error.BridgeIdentityMismatch, candidate.prepareActiveConnectionsInherited(&active, &bridges));
+    try testing.expectEqual(@as(usize, 0), candidate.conns.items.len);
+    bridges[0].inode ^= 1;
+    try candidate.prepareActiveConnectionsInherited(&active, &bridges);
+    var restored = try candidate.captureUnstartedActive(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqualDeep(active.connections[0].h3, restored.connections[0].h3);
+    try testing.expectEqualDeep(active.connections[0].quic, restored.connections[0].quic);
+    try testing.expect(active.connections[0].bridge.?.source_socket != restored.connections[0].bridge.?.source_socket);
+    try testing.expectEqualDeep(active.connections[0].bridge.?.local, restored.connections[0].bridge.?.local);
+    try testing.expectEqualDeep(active.connections[0].bridge.?.peer, restored.connections[0].bridge.?.peer);
+    source.shutdown();
+    source.clearPreparedConnections();
+    try candidate.prepareInheritedResources(testing.io);
+    try candidate.startPreparedLegacyWorker();
+    try client.sendStream(data_stream, "after\r\n", false);
+    try testing.expect(writeAllFd(accepted_fd, "reply\r\n"));
+    received_len = 0;
+    var reply: [256]u8 = undefined;
+    var reply_len: usize = 0;
+    round = 0;
+    while (round < 40 and (received_len < "after\r\n".len or reply_len < "reply\r\n".len)) : (round += 1) {
+        try sendQuic(testing.allocator, &client, &peer_socket, server_address);
+        try recvQuicAll(&client, &peer_socket);
+        const result = sys.read(accepted_fd, received[received_len..].ptr, received.len - received_len);
+        if (posix.errno(result) == .SUCCESS) received_len += result;
+        reply_len += readWtBidi(&client, data_stream, reply[reply_len..], session_id);
+    }
+    try testing.expectEqualStrings("after\r\n", received[0..received_len]);
+    try testing.expectEqualStrings("reply\r\n", reply[0..reply_len]);
+}
+
+fn testLinuxCheckpointDecode(allocator: std.mem.Allocator, wire: []const u8, tls: TlsConfig) !void {
+    const checkpoint = @import("helix/linux_webtransport_checkpoint.zig");
+    var decoded = try checkpoint.decode(allocator, wire, tls);
+    defer decoded.deinit(allocator);
+    const reencoded = try checkpoint.encode(allocator, &decoded, tls);
+    defer checkpoint.freeEncoded(allocator, reencoded);
+    try testing.expectEqualSlices(u8, wire, reencoded);
+}
+
+fn testLinuxActiveRestore(allocator: std.mem.Allocator, active: *const ActiveSnapshot, tls: TlsConfig, udp_fd: i32, bridges: []const BridgeFd) !void {
+    const duplicate = sys.fcntl(udp_fd, posix.F.DUPFD_CLOEXEC, @as(usize, 0));
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(duplicate));
+    var candidate = try WebTransportListener.initInherited(allocator, tls, @intCast(duplicate), null, &active.base);
+    defer candidate.deinit();
+    try candidate.prepareActiveConnectionsInherited(active, bridges);
+    var restored = try candidate.captureUnstartedActive(allocator);
+    defer restored.deinit(allocator);
+    try testing.expectEqualDeep(active.connections[0].quic, restored.connections[0].quic);
+    try testing.expectEqualDeep(active.connections[0].h3, restored.connections[0].h3);
 }
 
 test "companion runtime webtransport real pump preserves Retry replay reset state and active guard" {

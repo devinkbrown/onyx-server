@@ -75,6 +75,12 @@ fn ingressAddressEqual(a: TransportAddress, b: TransportAddress) bool {
     return validIngressAddress(a) and validIngressAddress(b) and a.ip_len == b.ip_len and a.port == b.port and std.mem.eql(u8, a.ip[0..a.ip_len], b.ip[0..b.ip_len]);
 }
 
+const NativeEgressObserverTest = struct {
+    reached: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+    ordinal: std.atomic.Value(u64) = .init(0),
+};
+
 pub const NativeMediaTransport = struct {
     allocator: std.mem.Allocator,
     routing_domain: ?*routing.Domain = null,
@@ -103,6 +109,8 @@ pub const NativeMediaTransport = struct {
     legacy_joining: bool = false,
     worker_id: ?std.Thread.Id = null,
     runtime: runtime_pause.WorkerState = .{},
+    test_egress_observer: if (@import("builtin").is_test) ?*NativeEgressObserverTest else void = if (@import("builtin").is_test) null else {},
+    test_routed_busy: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bound local UDP port (0 until started); advertised to native clients.
     port: u16 = 0,
@@ -222,7 +230,7 @@ pub const NativeMediaTransport = struct {
         if (self.next_ingress_serial == 0 or self.next_ingress_serial == std.math.maxInt(u64)) return error.SequenceExhausted;
         const serial = self.next_ingress_serial;
         const word = @as(u256, context.domain) | (@as(u256, context.registration) << 64) | (@as(u256, context.scope) << 128) | (@as(u256, serial) << 192);
-        const handle: routing.IngressHandle = @enumFromInt(word);
+        const handle: routing.IngressHandle = @fromBackingInt(@intCast(word));
         self.next_ingress_serial += 1;
         self.active_ingress = .{ .content = .feedback, .domain = domain, .context = context, .handle = handle, .key = key, .source = row.identity.stamp, .from = from, .datagram = datagram, .digest = ingressDigest(datagram), .first_bind = row.remote == null, .validated_binding = false };
         return handle;
@@ -255,7 +263,7 @@ pub const NativeMediaTransport = struct {
         if (self.next_ingress_serial == 0 or self.next_ingress_serial == std.math.maxInt(u64)) return error.SequenceExhausted;
         const serial = self.next_ingress_serial;
         const word = @as(u256, context.domain) | (@as(u256, context.registration) << 64) | (@as(u256, context.scope) << 128) | (@as(u256, serial) << 192);
-        const handle: routing.IngressHandle = @enumFromInt(word);
+        const handle: routing.IngressHandle = @fromBackingInt(@intCast(word));
         self.next_ingress_serial = serial + 1;
         self.active_ingress = .{ .domain = domain, .context = context, .handle = handle, .key = key, .source = row.identity.stamp, .from = from, .datagram = datagram, .digest = ingressDigest(datagram), .first_bind = row.remote == null, .validated_binding = false };
         return handle;
@@ -904,8 +912,9 @@ pub const NativeMediaTransport = struct {
                         return ctx.owner.withAuthenticatedFrameLocked(ctx.domain, scope, ctx.from, ctx.bytes, ctx, accepted);
                     }
                 };
-                const result = domain.withLocked(Routed{ .owner = self, .domain = domain, .from = got.from, .bytes = got.data }, Routed.run) catch {
+                const result = domain.withLocked(Routed{ .owner = self, .domain = domain, .from = got.from, .bytes = got.data }, Routed.run) catch |err| {
                     _ = self.routed_errors.fetchAdd(1, .monotonic);
+                    if (@import("builtin").is_test and err == error.Busy) _ = self.test_routed_busy.fetchAdd(1, .release);
                     continue;
                 };
                 _ = self.routed_accepted.fetchAdd(result.accepted, .monotonic);
@@ -1339,6 +1348,15 @@ pub const NativeMediaTransport = struct {
     pub fn sendRoutedPacketPinned(self: *NativeMediaTransport, pump: *@import("media_plane.zig").MediaPlane, ordinal: u64) !media_socket.SendDisposition {
         const domain = self.routing_domain orelse return error.InvalidIdentity;
         const target = try domain.nativeEgressTarget(self, pump, ordinal);
+        if (@import("builtin").is_test) {
+            // Observe only after the actual source-issued pin was resolved.
+            // Scheduling waits outside Domain/Plane/Native/FIFO gates.
+            if (self.test_egress_observer) |observer| {
+                observer.ordinal.store(ordinal, .release);
+                observer.reached.store(true, .release);
+                while (!observer.released.load(.acquire)) std.Thread.yield() catch {};
+            }
+        }
         const canonical = try pump.borrowNativeRoutingAttempt(ordinal);
         switch (canonical.kind) {
             .frame => {
@@ -2104,7 +2122,7 @@ fn endpointKeyLess(a: routing.EndpointKey, b: routing.EndpointKey) bool {
     if (a.client.shard != b.client.shard) return a.client.shard < b.client.shard;
     if (a.client.slot != b.client.slot) return a.client.slot < b.client.slot;
     if (a.client.gen != b.client.gen) return a.client.gen < b.client.gen;
-    return @intFromEnum(a.leg) < @intFromEnum(b.leg);
+    return @backingInt(a.leg) < @backingInt(b.leg);
 }
 fn physicalSnapshotBytes(endpoints: usize, streams: usize, channels: usize, indexes: usize) !usize {
     var bytes: usize = 0;
@@ -2596,11 +2614,11 @@ fn nativeCodecs(profile: rooms.CallProfile, kind_bits: u8) !u8 {
     if (profile.codec_count == 0 or profile.codec_count > rooms.max_profile_codecs or kind_bits == 0 or kind_bits & ~@as(u8, 7) != 0) return error.InvalidProfile;
     var bits: u8 = 0;
     for (profile.slice()) |codec| switch (codec.tag) {
-        .cadencevox => {
+        .cadencevox, .opus => {
             if (kind_bits & 1 == 0) return error.InvalidProfile;
             bits |= 1;
         },
-        .cadencevis => {
+        .cadencevis, .vp8 => {
             if (kind_bits & 6 == 0) return error.InvalidProfile;
             bits |= 2;
         },
@@ -3104,7 +3122,7 @@ const NativeIngressProbe = struct {
         try std.testing.expectEqual(@as(u64, 2), view.source.binding_revision);
         if (ctx.old) |previous| try std.testing.expectError(error.InvalidIngress, ctx.domain.resolveNativeIngressLocked(scope, previous));
         try std.testing.expectError(error.Busy, ctx.owner.requireRoutingTerminal());
-        const forged: routing.IngressHandle = @enumFromInt(@intFromEnum(handle) + (@as(u256, 1) << 192));
+        const forged: routing.IngressHandle = @fromBackingInt(@intCast(@backingInt(handle) + (@as(u256, 1) << 192)));
         try std.testing.expectError(error.InvalidIngress, ctx.domain.resolveNativeIngressLocked(scope, forged));
         if (ctx.tamper) {
             const last = ctx.bytes.len - 1;
@@ -3396,6 +3414,38 @@ const PhysicalNativeWorkerFixture = struct {
         const size = try cadence_frame.encode(.{ .band_id = cadence_frame.MEDIA_BAND_FLOOR, .stream_id = peer.identity.stream_id, .sequence = sequence, .timestamp = sequence, .keyframe = false, .codec = .cadencevox_audio, .payload = "actual-native-payload" }, &clear);
         return cadence_frame.appendNativeMediaMacWithKey(&peer.keys.c2s_frame, clear[0..size], out);
     }
+    fn queueState(self: *@This()) !@import("media_plane.zig").RoutingEgressState {
+        const Cut = struct {
+            fn run(scope: *routing.Locked, fixture: *PhysicalNativeWorkerFixture) !@import("media_plane.zig").RoutingEgressState {
+                return fixture.plane.routingEgressStateLocked(fixture.domain, scope);
+            }
+        };
+        return self.domain.withLocked(self, Cut.run);
+    }
+    fn awaitSettled(self: *@This()) !void {
+        const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+        while (true) {
+            const state = try self.queueState();
+            if (state.queued == 0 and !state.inflight) return;
+            if (deadline.untilNow(testing.io).raw.nanoseconds >= 0) {
+                self.diagnose("queue-settlement-timeout");
+                return error.TestUnexpectedResult;
+            }
+            std.Thread.yield() catch {};
+        }
+    }
+    fn diagnose(self: *@This(), reason: []const u8) void {
+        std.debug.print("native-first-bind reason={s} accepted={d} refused={d} errors={d} busy={d} native_stop={any} plane_stop={any} native_entered={any} native_exited={any} plane_entered={any} plane_exited={any}\n", .{
+            reason,                                   self.native.routed_accepted.load(.acquire), self.native.routed_refused.load(.acquire),  self.native.routed_errors.load(.acquire),  self.native.test_routed_busy.load(.acquire),
+            self.native.stop_flag.load(.acquire),     self.plane.stop_flag.load(.acquire),        self.native.runtime.entered.load(.acquire), self.native.runtime.exited.load(.acquire), self.plane.runtime.entered.load(.acquire),
+            self.plane.runtime.exited.load(.acquire),
+        });
+        const state = self.queueState() catch |err| {
+            std.debug.print("native-first-bind queue_observation_error={s}\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("native-first-bind queued={d} inflight={any} fenced={any} capacity={d} next_ordinal={d}\n", .{ state.queued, state.inflight, state.fenced, state.capacity, state.next_ordinal });
+    }
     fn awaitAccepted(self: *@This(), count: u64) !void {
         const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
         while (self.native.routed_accepted.load(.acquire) < count) {
@@ -3422,14 +3472,21 @@ test "physical Native actual workers use recipient directional tags same-nick si
     defer second.deinit();
     second.setRecvTimeoutMs(1000);
     const destination = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, fixture.native.port);
+    routing.TestFeedbackClock.set(fixture.domain, 1000);
     try fixture.plane.startPreparedLegacyWorker();
     try fixture.native.startPreparedLegacyWorker();
     var sent: [256]u8 = undefined;
     second.sendTo(destination, try PhysicalNativeWorkerFixture.frame(&b, 1, &sent));
     try fixture.awaitAccepted(1); // authentic first B bind, A not bound yet
+    // Admission does not settle B->unbound-A egress. Its retained pin would
+    // legitimately reject A's first bind as Busy; settle before sending A.
+    try fixture.awaitSettled();
     first.sendTo(destination, try PhysicalNativeWorkerFixture.frame(&a, 2, &sent));
     var wire: [1024]u8 = undefined;
-    const received = second.recvFrom(&wire) orelse return error.TestUnexpectedResult;
+    const received = second.recvFrom(&wire) orelse {
+        fixture.diagnose("missing-first-A-to-B");
+        return error.TestUnexpectedResult;
+    };
     const canonical = try cadence_frame.verifyNativeMediaMacWithKey(&b.keys.s2c_frame, received.data);
     try testing.expectEqual(a.identity.stream_id, (try cadence_frame.decode(canonical)).stream_id);
     try testing.expectEqualStrings("actual-native-payload", (try cadence_frame.decode(canonical)).payload);
@@ -3449,8 +3506,18 @@ test "physical Native actual workers use recipient directional tags same-nick si
     try testing.expectEqual(a.identity.stream_id, opened.sender_stream_id);
     try testing.expectEqualSlices(u8, pli, opened.payload);
     try testing.expectError(error.BadTag, native_feedback.openEnvelope(feedback.data, &b.keys.c2s_feedback));
-    // Repeated authenticated feedback is a legitimate bounded request. It
-    // does not rotate endpoint/binding authority or reset RTP replay history.
+    // Repeated authenticated requests are refused within the source window.
+    const refused_before = fixture.native.routed_refused.load(.acquire);
+    first.sendTo(destination, envelope);
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (fixture.native.routed_refused.load(.acquire) == refused_before) {
+        if (deadline.untilNow(testing.io).raw.nanoseconds >= 0) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    second.setRecvTimeoutMs(100);
+    try testing.expect(second.recvFrom(&wire) == null);
+    second.setRecvTimeoutMs(1000);
+    routing.TestFeedbackClock.set(fixture.domain, 2000);
     first.sendTo(destination, envelope);
     const repeated = second.recvFrom(&wire) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, pli, (try native_feedback.openEnvelope(repeated.data, &b.keys.s2c_feedback)).payload);
@@ -3621,4 +3688,164 @@ test "physical media namespace collision spans distinct calls and real departure
     var current_native = try fixture.offer("#native-other-call", .{ .shard = 0, .slot = 0, .gen = 0 });
     defer current_native.wipe();
     try testing.expect(fixture.native.physical_streams.contains(current_native.identity.stream_id));
+}
+
+fn awaitNativeCounterTest(counter: *const std.atomic.Value(u64), minimum: u64) !void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (counter.load(.acquire) < minimum) {
+        if (deadline.untilNow(testing.io).raw.nanoseconds >= 0) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+}
+
+test "physical Native actual first bind collides with retained egress pin and same authenticated bytes retry" {
+    var fixture = try PhysicalNativeWorkerFixture.init();
+    defer fixture.deinit();
+    var a = try fixture.offer("#first-bind-pin", .{ .shard = 0, .slot = 0, .gen = 0 });
+    defer a.wipe();
+    var b = try fixture.offer("#first-bind-pin", .{ .shard = 0, .slot = 1, .gen = 0 });
+    defer b.wipe();
+    var first = try MediaSocket.bind(loopback_be, 0);
+    defer first.deinit();
+    var second = try MediaSocket.bind(loopback_be, 0);
+    defer second.deinit();
+    second.setRecvTimeoutMs(1000);
+    var observer: NativeEgressObserverTest = .{};
+    defer observer.released.store(true, .release);
+    fixture.native.test_egress_observer = &observer;
+    const destination = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, fixture.native.port);
+    try fixture.plane.startPreparedLegacyWorker();
+    try fixture.native.startPreparedLegacyWorker();
+    var b_storage: [256]u8 = undefined;
+    second.sendTo(destination, try PhysicalNativeWorkerFixture.frame(&b, 1, &b_storage));
+    try fixture.awaitAccepted(1);
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (!observer.reached.load(.acquire)) {
+        if (deadline.untilNow(testing.io).raw.nanoseconds >= 0) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    try testing.expectEqual(@as(u64, 1), observer.ordinal.load(.acquire));
+    const pinned = try fixture.queueState();
+    try testing.expect(pinned.inflight and pinned.queued == 1);
+    const a_key: routing.EndpointKey = .{ .call = a.identity.stamp.endpoint.call, .client = a.identity.stamp.offering_client, .leg = .native };
+    const before = blk: {
+        lockSpin(&fixture.native.mutex);
+        defer fixture.native.mutex.unlock();
+        const row = fixture.native.physical_endpoints.get(a_key).?;
+        break :blk .{ .identity = row.identity, .revision = fixture.native.physical_revision, .issuance = fixture.native.next_ingress_serial, .unbound = row.remote == null };
+    };
+    try testing.expect(before.unbound);
+    var a_storage: [256]u8 = undefined;
+    const a_datagram = try PhysicalNativeWorkerFixture.frame(&a, 2, &a_storage);
+    // Native worker authenticates these actual bytes, then first-bind preflight
+    // observes the genuine B->A active_egress pin and returns Busy.
+    first.sendTo(destination, a_datagram);
+    try awaitNativeCounterTest(&fixture.native.test_routed_busy, 1);
+    try testing.expectEqual(@as(u64, 1), fixture.native.routed_errors.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), fixture.native.routed_accepted.load(.acquire));
+    const after = blk: {
+        lockSpin(&fixture.native.mutex);
+        defer fixture.native.mutex.unlock();
+        const row = fixture.native.physical_endpoints.get(a_key).?;
+        break :blk .{ .identity = row.identity, .revision = fixture.native.physical_revision, .issuance = fixture.native.next_ingress_serial, .unbound = row.remote == null };
+    };
+    try testing.expectEqualDeep(before.identity, after.identity);
+    try testing.expect(after.unbound);
+    try testing.expectEqual(before.revision, after.revision);
+    try testing.expectEqual(before.issuance, after.issuance);
+    observer.released.store(true, .release);
+    try fixture.awaitSettled();
+    try testing.expect(!try second.testOnlyReadableNow()); // no output from dropped first bind
+    // Resend EXACTLY the same authenticated bytes: no new sequence, keys,
+    // token, source identity or minted test ingress handle can rescue it.
+    first.sendTo(destination, a_datagram);
+    var wire: [1024]u8 = undefined;
+    const received = second.recvFrom(&wire) orelse {
+        fixture.diagnose("same-bytes-retry-did-not-deliver");
+        return error.TestUnexpectedResult;
+    };
+    const canonical = try cadence_frame.verifyNativeMediaMacWithKey(&b.keys.s2c_frame, received.data);
+    const decoded = try cadence_frame.decode(canonical);
+    try testing.expectEqual(a.identity.stream_id, decoded.stream_id);
+    try testing.expectEqual(@as(u32, 2), decoded.sequence);
+    try testing.expectEqualStrings("actual-native-payload", decoded.payload);
+    try fixture.awaitAccepted(2);
+    try fixture.awaitSettled();
+    {
+        lockSpin(&fixture.native.mutex);
+        defer fixture.native.mutex.unlock();
+        try testing.expect(fixture.native.physical_endpoints.get(a_key).?.remote != null);
+        try testing.expectEqual(before.issuance + 1, fixture.native.next_ingress_serial);
+    }
+    try testing.expectEqual(@as(u64, 1), fixture.native.test_routed_busy.load(.acquire));
+    try testing.expect(!try second.testOnlyReadableNow());
+}
+
+test "physical Native authenticated worker receives normalized WebRTC compound feedback" {
+    var fixture = try PhysicalNativeWorkerFixture.init();
+    defer fixture.deinit();
+    var publisher = try fixture.offer("#compound-native", .{ .shard = 0, .slot = 0, .gen = 0 });
+    defer publisher.wipe();
+    var requester = try fixture.offerRtc("#compound-native", .{ .shard = 0, .slot = 1, .gen = 0 });
+    defer requester.wipe();
+    var native_peer = try MediaSocket.bind(loopback_be, 0);
+    defer native_peer.deinit();
+    native_peer.setRecvTimeoutMs(1000);
+    var rtc_peer = try MediaSocket.bind(loopback_be, 0);
+    defer rtc_peer.deinit();
+    rtc_peer.setRecvTimeoutMs(1000);
+    const native_destination = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, fixture.native.port);
+    const rtc_destination = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, fixture.plane.port);
+    routing.TestFeedbackClock.set(fixture.domain, 1000);
+    try fixture.plane.startPreparedLegacyWorker();
+    try fixture.native.startPreparedLegacyWorker();
+    try PhysicalNativeWorkerFixture.bindRtc(&rtc_peer, rtc_destination, &requester, 0xa3);
+    var frame: [256]u8 = undefined;
+    native_peer.sendTo(native_destination, try PhysicalNativeWorkerFixture.frame(&publisher, 1, &frame));
+    var wire: [1024]u8 = undefined;
+    const rtp = rtc_peer.recvFrom(&wire) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(publisher.identity.stream_id, (try rtp_profile.decodeHeader(rtp.data)).header.ssrc);
+    try fixture.awaitSettled();
+
+    const translate = @import("../proto/rtcp_translate.zig");
+    const rr = [_]u8{ 0x80, 201, 0, 1, 0, 0, 0, 77 };
+    var pli_storage: [20]u8 = undefined;
+    const pli = try translate.buildKeyframeRequest(77, publisher.identity.stream_id, &pli_storage);
+    var nack_storage: [24]u8 = undefined;
+    const nack = try translate.buildNack(77, publisher.identity.stream_id, &.{ 1, 1, 2 }, &nack_storage);
+    var compound: [64]u8 = undefined;
+    @memcpy(compound[0..8], &rr);
+    @memcpy(compound[8..20], pli);
+    @memcpy(compound[20..44], nack);
+    // A compound with a valid first target and unknown second target must
+    // publish nothing. The following valid compound is the ordered positive
+    // control: its first envelope must be the keyframe, never the bad NACK.
+    var bad_nack_storage: [16]u8 = undefined;
+    const bad_nack = try translate.buildNack(77, publisher.identity.stream_id, &.{8}, &bad_nack_storage);
+    var foreign_pli_storage: [12]u8 = undefined;
+    const foreign_pli = try translate.buildKeyframeRequest(77, 0xffff_fffe, &foreign_pli_storage);
+    var denied: [28]u8 = undefined;
+    @memcpy(denied[0..16], bad_nack);
+    @memcpy(denied[16..28], foreign_pli);
+    rtc_peer.sendTo(rtc_destination, &denied);
+    rtc_peer.sendTo(rtc_destination, compound[0..44]);
+    var expected_pli_buf: [32]u8 = undefined;
+    const expected_pli = try native_feedback.encodeKeyframeRequest(publisher.identity.stream_id, &expected_pli_buf);
+    const first = native_peer.recvFrom(&wire) orelse return error.TestUnexpectedResult;
+    const opened_pli = try native_feedback.openEnvelope(first.data, &publisher.keys.s2c_feedback);
+    try testing.expectEqual(requester.identity.stream_id, opened_pli.sender_stream_id);
+    try testing.expectEqualSlices(u8, expected_pli, opened_pli.payload);
+    try testing.expectError(error.BadTag, native_feedback.openEnvelope(first.data, &publisher.keys.c2s_feedback));
+    var expected_nack_buf: [64]u8 = undefined;
+    const expected_nack = try native_feedback.encodeNack(publisher.identity.stream_id, &.{ 1, 2 }, &expected_nack_buf);
+    const second = native_peer.recvFrom(&wire) orelse return error.TestUnexpectedResult;
+    const opened_nack = try native_feedback.openEnvelope(second.data, &publisher.keys.s2c_feedback);
+    try testing.expectEqual(requester.identity.stream_id, opened_nack.sender_stream_id);
+    try testing.expectEqualSlices(u8, expected_nack, opened_nack.payload);
+    try testing.expectError(error.BadTag, native_feedback.openEnvelope(second.data, &publisher.keys.c2s_feedback));
+    const source_budget = try routing.TestFeedbackClock.read(fixture.domain, .{ .call = requester.identity.stamp.endpoint.call, .client = requester.identity.stamp.offering_client, .leg = .webrtc });
+    try testing.expectEqual(@as(u16, 1), source_budget.source_keyframe);
+    try testing.expectEqual(@as(u16, 2), source_budget.source_nack);
+    native_peer.setRecvTimeoutMs(100);
+    try testing.expect(native_peer.recvFrom(&wire) == null);
 }

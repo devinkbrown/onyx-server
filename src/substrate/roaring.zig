@@ -59,7 +59,7 @@ pub const Bitmap = struct {
     }
 
     pub fn contains(self: *const Bitmap, value: u32) bool {
-        const container = self.containers.get(highBits(value)) orelse return false;
+        const container = self.containers.getPtr(highBits(value)) orelse return false;
         return container.contains(lowBits(value));
     }
 
@@ -112,16 +112,6 @@ pub const Bitmap = struct {
 
         return out;
     }
-
-    fn findNextChunk(self: *const Bitmap, minimum: u16) ?u16 {
-        var best: ?u16 = null;
-        var it = self.containers.keyIterator();
-        while (it.next()) |key| {
-            if (key.* < minimum) continue;
-            if (best == null or key.* < best.?) best = key.*;
-        }
-        return best;
-    }
 };
 
 pub const Iterator = struct {
@@ -130,30 +120,47 @@ pub const Iterator = struct {
     done: bool = false,
 
     pub fn next(self: *Iterator) ?u32 {
+        return self.nextImpl(false, null);
+    }
+
+    // The counted instantiation lets tests bound actual map probes without
+    // adding counters or allocation to production iterators.
+    fn nextImpl(self: *Iterator, comptime count_probes: bool, probes: ?*usize) ?u32 {
         if (self.done or self.next_value > std.math.maxInt(u32)) return null;
+        if (self.bitmap.containers.count() == 0) {
+            self.done = true;
+            return null;
+        }
 
         var high: u32 = @intCast(self.next_value >> 16);
         var low = lowBits(@intCast(self.next_value));
         while (high <= std.math.maxInt(u16)) {
-            const chunk = self.bitmap.findNextChunk(@intCast(high)) orelse {
-                self.done = true;
-                return null;
-            };
-            if (chunk > high) low = 0;
-
-            const container = self.bitmap.containers.get(chunk).?;
-            if (container.firstAtLeast(low)) |found_low| {
-                const value = (@as(u32, chunk) << 16) | @as(u32, found_low);
-                self.next_value = @as(u64, value) + 1;
-                return value;
+            // Probe each high key at most once while crossing gaps. Scanning the
+            // hash map for the next chunk on every value is quadratic for sparse
+            // sets, and repeats the same scan for every value in a dense chunk.
+            if (count_probes) probes.?.* += 1;
+            if (self.bitmap.containers.getPtr(@intCast(high))) |container| {
+                if (container.firstAtLeast(low)) |found_low| {
+                    const value = (high << 16) | @as(u32, found_low);
+                    self.next_value = @as(u64, value) + 1;
+                    return value;
+                }
             }
-
-            if (chunk == std.math.maxInt(u16)) {
-                self.done = true;
-                return null;
-            }
-            high = @as(u32, chunk) + 1;
+            high += 1;
             low = 0;
+            // A fixed-size fallback avoids probing large empty gaps for tiny
+            // sets. For C containers, at most C+1 searches inspect C keys
+            // apiece, plus at most C+1 exhausted/missing chunk probes. Capping C
+            // at 512 bounds this work; larger sets use the high-key domain above.
+            if (self.bitmap.containers.count() <= 512) {
+                var next_high: u32 = chunk_span;
+                var keys = self.bitmap.containers.keyIterator();
+                while (keys.next()) |key| {
+                    if (count_probes) probes.?.* += 1;
+                    if (key.* >= high and key.* < next_high) next_high = key.*;
+                }
+                high = next_high;
+            }
         }
 
         self.done = true;
@@ -203,24 +210,24 @@ const Container = union(enum) {
         }
     }
 
-    fn contains(self: Container, value: u16) bool {
-        return switch (self) {
-            .array => |array| array.contains(value),
-            .bitset => |bitset| bitset.contains(value),
+    fn contains(self: *const Container, value: u16) bool {
+        return switch (self.*) {
+            .array => |*array| array.contains(value),
+            .bitset => |*bitset| bitset.contains(value),
         };
     }
 
-    fn cardinality(self: Container) u64 {
-        return switch (self) {
-            .array => |array| array.cardinality(),
-            .bitset => |bitset| bitset.cardinality(),
+    fn cardinality(self: *const Container) u64 {
+        return switch (self.*) {
+            .array => |*array| array.cardinality(),
+            .bitset => |*bitset| bitset.cardinality(),
         };
     }
 
-    fn firstAtLeast(self: Container, value: u16) ?u16 {
-        return switch (self) {
-            .array => |array| array.firstAtLeast(value),
-            .bitset => |bitset| bitset.firstAtLeast(value),
+    fn firstAtLeast(self: *const Container, value: u16) ?u16 {
+        return switch (self.*) {
+            .array => |*array| array.firstAtLeast(value),
+            .bitset => |*bitset| bitset.firstAtLeast(value),
         };
     }
 };
@@ -321,15 +328,15 @@ const BitsetContainer = struct {
         return true;
     }
 
-    fn contains(self: BitsetContainer, value: u16) bool {
+    fn contains(self: *const BitsetContainer, value: u16) bool {
         return (self.words[wordIndex(value)] & wordBit(value)) != 0;
     }
 
-    fn cardinality(self: BitsetContainer) u64 {
+    fn cardinality(self: *const BitsetContainer) u64 {
         return self.count;
     }
 
-    fn firstAtLeast(self: BitsetContainer, value: u16) ?u16 {
+    fn firstAtLeast(self: *const BitsetContainer, value: u16) ?u16 {
         var idx = wordIndex(value);
         var word = self.words[idx] & (@as(u64, std.math.maxInt(u64)) << bitShift(value));
         while (true) : (idx += 1) {
@@ -603,4 +610,72 @@ test "set operations match random AutoHashMap oracle" {
     var actual_difference = try Bitmap.setDifference(allocator, &a, &b);
     defer actual_difference.deinit();
     try expectBitmapEqualsOracle(&actual_difference, &expected_difference);
+}
+
+test "iteration bounds map probes across dense chunks and sparse high keys" {
+    var bitmap = Bitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+
+    // A promoted dense chunk, many separate sparse chunks, and both u32 ends.
+    var value: u32 = 0;
+    while (value < 5000) : (value += 1) _ = try bitmap.add(value);
+    var high: u32 = 1;
+    while (high < 1024) : (high += 1) _ = try bitmap.add(high << 16);
+    _ = try bitmap.add(std.math.maxInt(u32));
+
+    var it = bitmap.iterator();
+    var probes: usize = 0;
+    var seen: u64 = 0;
+    var previous: ?u32 = null;
+    while (it.nextImpl(true, &probes)) |found| {
+        if (previous) |last| try std.testing.expect(found > last);
+        try std.testing.expect(bitmap.contains(found));
+        previous = found;
+        seen += 1;
+    }
+    try std.testing.expectEqual(bitmap.cardinality(), seen);
+    try std.testing.expectEqual(std.math.maxInt(u32), previous.?);
+    // Each emitted value needs one probe; crossing the entire high-key domain
+    // needs at most one additional probe per key, independent of container count.
+    try std.testing.expect(probes <= chunk_span + seen);
+    const final_probes = probes;
+    try std.testing.expectEqual(@as(?u32, null), it.nextImpl(true, &probes));
+    try std.testing.expectEqual(final_probes, probes);
+}
+
+test "tiny and empty iteration avoid scanning the high-key domain" {
+    var bitmap = Bitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+
+    var probes: usize = 0;
+    var empty_it = bitmap.iterator();
+    try std.testing.expectEqual(@as(?u32, null), empty_it.nextImpl(true, &probes));
+    try std.testing.expectEqual(@as(usize, 0), probes);
+
+    _ = try bitmap.add(1);
+    _ = try bitmap.add(std.math.maxInt(u32));
+    var it = bitmap.iterator();
+    try std.testing.expectEqual(@as(?u32, 1), it.nextImpl(true, &probes));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), it.nextImpl(true, &probes));
+    try std.testing.expectEqual(@as(?u32, null), it.nextImpl(true, &probes));
+    try std.testing.expect(probes <= 6);
+}
+
+test "medium sparse iteration skips high-key gaps with bounded key visits" {
+    var bitmap = Bitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    var high: u32 = 0;
+    while (high < 65) : (high += 1) _ = try bitmap.add((high * 1023) << 16);
+
+    var it = bitmap.iterator();
+    var probes: usize = 0;
+    high = 0;
+    while (high < 65) : (high += 1) {
+        try std.testing.expectEqual(@as(?u32, (high * 1023) << 16), it.nextImpl(true, &probes));
+    }
+    try std.testing.expectEqual(@as(?u32, null), it.nextImpl(true, &probes));
+    const count: usize = bitmap.containers.count();
+    // Count both direct probes and key visits. This distribution spans almost
+    // the full high-key domain, so a domain scan would exceed this bound.
+    try std.testing.expect(probes <= count * (count + 3));
 }

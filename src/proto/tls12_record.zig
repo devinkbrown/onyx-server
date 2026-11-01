@@ -57,7 +57,7 @@ pub const ContentType = enum(u8) {
     application_data = 23,
 
     pub fn toWire(self: ContentType) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

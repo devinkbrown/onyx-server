@@ -94,9 +94,9 @@ pub fn encode(allocator: std.mem.Allocator, registry: *const warden.Registry) Er
     writer.writeU16(@intCast(params.max_setter));
     writer.writeU16(0);
     for (registry.wards.items) |ward| {
-        writer.writeByte(@intFromEnum(ward.match));
-        writer.writeByte(@intFromEnum(ward.scope));
-        writer.writeByte(@intFromEnum(ward.action));
+        writer.writeByte(@backingInt(ward.match));
+        writer.writeByte(@backingInt(ward.scope));
+        writer.writeByte(@backingInt(ward.action));
         writer.writeU16(@intCast(ward.pattern.len));
         writer.writeU16(@intCast(ward.reason.len));
         writer.writeU16(@intCast(ward.set_by.len));
@@ -194,7 +194,7 @@ fn insertIdentity(table: *[identity_table_len]u16, seen: *[max_wards]Identity, c
 
 fn identityHash(identity: Identity) u64 {
     var hash: u64 = 0xcbf2_9ce4_8422_2325;
-    hash = (hash ^ @as(u64, @intFromEnum(identity.match))) *% 0x100_0000_01b3;
+    hash = (hash ^ @as(u64, @backingInt(identity.match))) *% 0x100_0000_01b3;
     for (identity.pattern) |byte| hash = (hash ^ byte) *% 0x100_0000_01b3;
     return hash;
 }

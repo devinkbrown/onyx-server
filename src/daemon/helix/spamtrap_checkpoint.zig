@@ -172,7 +172,7 @@ pub fn encode(allocator: std.mem.Allocator, source: *const spamtrap.DefaultSpamt
         if (trip.actor.len > std.math.maxInt(u8) or trip.target.len > std.math.maxInt(u8)) return error.InvalidField;
         writer.writeByte(@intCast(trip.actor.len));
         writer.writeByte(@intCast(trip.target.len));
-        writer.writeByte(@intFromEnum(trip.kind));
+        writer.writeByte(@backingInt(trip.kind));
         writer.writeByte(0);
         writer.writeU64(trip.count_for_actor);
         writer.writeBytes(trip.actor);

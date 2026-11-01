@@ -97,7 +97,7 @@ pub const UmodeSet = struct {
     }
 
     fn bit(mode: UserMode) u64 {
-        return @as(u64, 1) << @as(u6, @intCast(@intFromEnum(mode)));
+        return @as(u64, 1) << @as(u6, @intCast(@backingInt(mode)));
     }
 };
 
@@ -451,8 +451,8 @@ test "override user mode uses non-colliding +j catalog letter" {
 }
 
 test "privacy user modes are client-writable and keep earlier ordinals" {
-    try std.testing.expectEqual(@as(u6, 15), @intFromEnum(UserMode.override));
-    try std.testing.expectEqual(@as(u6, 16), @intFromEnum(UserMode.common_chan));
+    try std.testing.expectEqual(@as(u6, 15), @backingInt(UserMode.override));
+    try std.testing.expectEqual(@as(u6, 16), @backingInt(UserMode.common_chan));
     try std.testing.expectEqual(@as(?UserMode, .common_chan), modeFromLetter('G'));
     try std.testing.expectEqual(@as(?UserMode, .tls_only_pm), modeFromLetter('Z'));
     try std.testing.expectEqual(@as(?UserMode, .hide_idle), modeFromLetter('I'));

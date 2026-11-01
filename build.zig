@@ -185,6 +185,86 @@ pub fn build(b: *std.Build) void {
     });
     if (windows_self_hosted) exe.use_llvm = false;
 
+    // Acceptance-only helper: never installed or added to packaging.
+    const retirement_fixture = b.addExecutable(.{
+        .name = "session_retirement_fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/session_retirement_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "onyx_server", .module = mod }},
+        }),
+    });
+    const retirement_fixture_step = b.step("session-retirement-fixture", "Build private signed-fact acceptance helper (not installed)");
+    retirement_fixture_step.dependOn(&retirement_fixture.step);
+    const retirement_smoke = b.addSystemCommand(&.{ "python3", "tools/retirement_nonempty_smoke.py", "--generator" });
+    retirement_smoke.addArtifactArg(retirement_fixture);
+    retirement_smoke.addArg("--binary");
+    if (b.option([]const u8, "retirement-cli-binary", "Explicit native daemon artifact for offline retirement acceptance")) |binary| {
+        retirement_smoke.addArg(binary);
+    } else {
+        retirement_smoke.addArtifactArg(exe);
+    }
+    const retirement_smoke_step = b.step("test-session-retirement-cli", "Verify nonempty offline retirement export without starting a daemon");
+    retirement_smoke_step.dependOn(&retirement_smoke.step);
+
+    // Private acceptance-only policy matcher fixture; never installed.
+    const policy_audit_fixture = b.addExecutable(.{
+        .name = "cloak_policy_audit_fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cloak_policy_audit_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+        }),
+    });
+    policy_audit_fixture.root_module.addImport("build_info", build_info_mod);
+    _ = policy_audit_fixture.getEmittedBin();
+    const policy_fixture_step = b.step("cloak-policy-audit-fixture", "Build private policy audit acceptance helper");
+    policy_fixture_step.dependOn(&policy_audit_fixture.step);
+
+    // Private synthetic HWC2 native proof helper; not installed.
+    const cloak_world_fixture = b.addExecutable(.{
+        .name = "cloak_world_audit_fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cloak_world_audit_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+        }),
+    });
+    cloak_world_fixture.root_module.addImport("build_info", build_info_mod);
+    _ = cloak_world_fixture.getEmittedBin();
+    const cloak_world_fixture_step = b.step("cloak-world-audit-fixture", "Build private World audit acceptance helper");
+    cloak_world_fixture_step.dependOn(&cloak_world_fixture.step);
+
+    // Private offline audit acceptance helper; never installed or packaged.
+    const cloak_audit_fixture = b.addExecutable(.{
+        .name = "cloak_audit_fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cloak_audit_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+        }),
+    });
+    cloak_audit_fixture.root_module.addImport("build_info", build_info_mod);
+    const cloak_audit_fixture_step = b.step("cloak-audit-fixture", "Build private cloak audit checkpoint generator (not installed)");
+    cloak_audit_fixture_step.dependOn(&cloak_audit_fixture.step);
+    const cloak_audit_smoke = b.addSystemCommand(&.{ "python3", "tools/cloak_audit_smoke.py", "--generator" });
+    cloak_audit_smoke.addArtifactArg(cloak_audit_fixture);
+    cloak_audit_smoke.addArg("--binary");
+    if (b.option([]const u8, "cloak-audit-binary", "Explicit native daemon artifact for offline cloak audit acceptance")) |binary| {
+        cloak_audit_smoke.addArg(binary);
+    } else {
+        cloak_audit_smoke.addArtifactArg(exe);
+    }
+    if (b.option([]const u8, "cloak-audit-native-work-dir", "New private evidence directory for cloak audit acceptance")) |work_dir| {
+        cloak_audit_smoke.addArgs(&.{ "--work-dir", work_dir });
+    }
+    const cloak_audit_native_step = b.step("test-cloak-audit-native", "Verify real offline cloak audit processes with synthetic private checkpoints");
+    cloak_audit_native_step.dependOn(&cloak_audit_smoke.step);
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
@@ -271,6 +351,236 @@ pub fn build(b: *std.Build) void {
         .path = b.path("tools/verbose_test_runner.zig"),
         .mode = .simple,
     };
+
+    const entrypoint_tests = b.addTest(.{
+        .root_module = exe.root_module,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const entrypoint_leaf = b.step("test-entrypoint-leaf", "Run filtered executable-root entrypoint tests");
+    entrypoint_leaf.dependOn(&b.addRunArtifact(entrypoint_tests).step);
+
+    const maintenance_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/setup_maintenance.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+        .imports = &.{.{ .name = "onyx_server", .module = mod }},
+    });
+    const maintenance_tests = b.addTest(.{ .root_module = maintenance_tests_mod, .filters = test_filters, .test_runner = verbose_test_runner });
+    const maintenance_test_step = b.step("test-setup-maintenance", "Run existing-runtime maintenance wizard/backend tests");
+    maintenance_test_step.dependOn(&b.addRunArtifact(maintenance_tests).step);
+
+    // Custom test runners are their own @import("root"); bind this name
+    // directly to the already tested module, preserving one file owner.
+    mod.addImport("host_presentation_test_root", mod);
+    const host_exec_helper = b.addTest(.{
+        .name = "host-presentation-exec-helper",
+        .root_module = mod,
+        .filters = &.{"host presentation native helper anchor"},
+        .test_runner = .{ .path = b.path("src/host_presentation_exec_helper.zig"), .mode = .simple },
+    });
+    const install_host_exec_helper = b.addInstallArtifact(host_exec_helper, .{});
+    const host_exec_helper_step = b.step("test-host-presentation-exec-helper", "Build native host presentation production Helix helper");
+    host_exec_helper_step.dependOn(&install_host_exec_helper.step);
+
+    mod.addImport("issuer_production_test_root", mod);
+    const issuer_exec_helper = b.addTest(.{
+        .name = "issuer-production-exec-helper",
+        .root_module = mod,
+        .filters = &.{"issuer production native helper anchor"},
+        .test_runner = .{ .path = b.path("src/issuer_production_exec_helper.zig"), .mode = .simple },
+    });
+    const install_issuer_exec_helper = b.addInstallArtifact(issuer_exec_helper, .{});
+    const issuer_exec_helper_step = b.step("test-issuer-production-exec-helper", "Build native configured issuer production Helix helper");
+    issuer_exec_helper_step.dependOn(&install_issuer_exec_helper.step);
+
+    mod.addImport("session_retry_test_root", mod);
+    const retry_exec_helper = b.addTest(.{
+        .name = "session-retry-exec-helper",
+        .root_module = mod,
+        .filters = &.{"session retry native helper anchor"},
+        .test_runner = .{ .path = b.path("src/session_retry_exec_helper.zig"), .mode = .simple },
+    });
+    const install_retry_exec_helper = b.addInstallArtifact(retry_exec_helper, .{});
+    const retry_exec_helper_step = b.step("test-session-retry-exec-helper", "Build native session orphan retry production Helix helper");
+    retry_exec_helper_step.dependOn(&install_retry_exec_helper.step);
+
+    // Additive spool leaf gate; full integration and release gates remain required.
+    const spool_leaf_mod = b.createModule(.{
+        .root_source_file = b.path("src/spool_leaf_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    spool_leaf_mod.addImport("build_info", build_info_mod);
+    const spool_leaf_tests = b.addTest(.{
+        .root_module = spool_leaf_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_spool_leaf_tests = b.addRunArtifact(spool_leaf_tests);
+    const spool_leaf_step = b.step("test-spool-leaf", "Run attachment delivery spool leaf tests; accepts -Dtest-filter=<text>");
+    spool_leaf_step.dependOn(&run_spool_leaf_tests.step);
+
+    const boot_policy_mod = b.createModule(.{
+        .root_source_file = b.path("src/helix_boot_policy_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    boot_policy_mod.addImport("build_info", build_info_mod);
+    const boot_policy_tests = b.addTest(.{ .root_module = boot_policy_mod, .filters = test_filters, .test_runner = verbose_test_runner });
+    const boot_policy_step = b.step("test-helix-boot-policy", "Run explicit Helix boot policy carry tests");
+    boot_policy_step.dependOn(&b.addRunArtifact(boot_policy_tests).step);
+
+    const service_identity_mod = b.createModule(.{
+        .root_source_file = b.path("src/service_identity_preflight_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    service_identity_mod.addImport("build_info", build_info_mod);
+    const service_identity_tests = b.addTest(.{
+        .root_module = service_identity_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const service_identity_step = b.step("test-service-identity-leaf", "Run read-only service identity preflight tests");
+    service_identity_step.dependOn(&b.addRunArtifact(service_identity_tests).step);
+
+    // Additive handoff descriptor custody gate.
+    const handoff_leaf_mod = b.createModule(.{
+        .root_source_file = b.path("src/handoff_leaf_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    handoff_leaf_mod.addImport("build_info", build_info_mod);
+    const handoff_leaf_tests = b.addTest(.{
+        .root_module = handoff_leaf_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_handoff_leaf_tests = b.addRunArtifact(handoff_leaf_tests);
+    const handoff_leaf_step = b.step("test-handoff-leaf", "Run Helix descriptor custody leaf tests; accepts -Dtest-filter=<text>");
+    handoff_leaf_step.dependOn(&run_handoff_leaf_tests.step);
+
+    // Detached HWC2 relation bridge; no daemon or CLI integration.
+    const cloak_world_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("src/cloak_world_audit_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    cloak_world_bridge_mod.addImport("build_info", build_info_mod);
+    const cloak_world_bridge_tests = b.addTest(.{
+        .root_module = cloak_world_bridge_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const cloak_world_bridge_step = b.step("test-cloak-world-bridge-leaf", "Run detached HWC2 relation bridge tests");
+    cloak_world_bridge_step.dependOn(&b.addRunArtifact(cloak_world_bridge_tests).step);
+
+    // Detached raw Services records; no live Store or CLI integration.
+    const cloak_durable_mod = b.createModule(.{
+        .root_source_file = b.path("src/cloak_durable_audit_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    cloak_durable_mod.addImport("build_info", build_info_mod);
+    const cloak_durable_tests = b.addTest(.{
+        .root_module = cloak_durable_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const cloak_durable_step = b.step("test-cloak-durable-leaf", "Run detached raw Services audit tests");
+    cloak_durable_step.dependOn(&b.addRunArtifact(cloak_durable_tests).step);
+
+    // Additive focused iteration only; full session and release gates remain required.
+    const session_store_leaf_mod = b.createModule(.{
+        .root_source_file = b.path("src/session_store_leaf_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    session_store_leaf_mod.addImport("build_info", build_info_mod);
+    const session_store_leaf_tests = b.addTest(.{
+        .root_module = session_store_leaf_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_session_store_leaf_tests = b.addRunArtifact(session_store_leaf_tests);
+    const session_store_leaf_step = b.step("test-session-store-leaf", "Run session store leaf tests; accepts -Dtest-filter=<text>");
+    session_store_leaf_step.dependOn(&run_session_store_leaf_tests.step);
+
+    // Additive focused iteration only; full integration and release gates remain required.
+    const ringlane_leaf_mod = b.createModule(.{
+        .root_source_file = b.path("src/ringlane_leaf_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    ringlane_leaf_mod.addImport("build_info", build_info_mod);
+    const ringlane_leaf_tests = b.addTest(.{
+        .root_module = ringlane_leaf_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_ringlane_leaf_tests = b.addRunArtifact(ringlane_leaf_tests);
+    const ringlane_leaf_step = b.step("test-ringlane-leaf", "Run Ringlane leaf tests; accepts -Dtest-filter=<text>");
+    ringlane_leaf_step.dependOn(&run_ringlane_leaf_tests.step);
+
+    // Focused iteration only; full integration and release gates remain required.
+    const cloak_leaf_mod = b.createModule(.{
+        .root_source_file = b.path("src/cloak_leaf_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    cloak_leaf_mod.addImport("build_info", build_info_mod);
+    const cloak_leaf_tests = b.addTest(.{
+        .root_module = cloak_leaf_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_cloak_leaf_tests = b.addRunArtifact(cloak_leaf_tests);
+    const cloak_leaf_step = b.step("test-cloak-leaf", "Run cloak and historical matcher leaf tests; accepts -Dtest-filter=<text>");
+    cloak_leaf_step.dependOn(&run_cloak_leaf_tests.step);
+
+    // Offline audit and bounded CLI iteration; no live policy integration.
+    const cloak_audit_leaf_mod = b.createModule(.{
+        .root_source_file = b.path("src/cloak_migration_audit_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    cloak_audit_leaf_mod.addImport("build_info", build_info_mod);
+    const cloak_audit_leaf_tests = b.addTest(.{
+        .root_module = cloak_audit_leaf_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const run_cloak_audit_leaf_tests = b.addRunArtifact(cloak_audit_leaf_tests);
+    const cloak_audit_leaf_step = b.step("test-cloak-audit-leaf", "Run pure cloak migration audit tests; accepts -Dtest-filter=<text>");
+    cloak_audit_leaf_step.dependOn(&run_cloak_audit_leaf_tests.step);
+
+    // Detached policy-list audit only; no CLI or live integration.
+    const policy_list_audit_mod = b.createModule(.{
+        .root_source_file = b.path("src/cloak_policy_list_audit_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    policy_list_audit_mod.addImport("build_info", build_info_mod);
+    const policy_list_audit_tests = b.addTest(.{
+        .root_module = policy_list_audit_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const policy_list_audit_step = b.step("test-cloak-policy-list-leaf", "Run detached AKICK/WARD audit leaf tests");
+    policy_list_audit_step.dependOn(&b.addRunArtifact(policy_list_audit_tests).step);
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -1192,6 +1502,26 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the 0.7 measurement harness: parse, tag compose, fan-out framing, cross-shard handoff, accept rate (P0-1)");
     bench_step.dependOn(&bench_run.step);
 
+    // Separate direct-leaf OFFER signature-work measurement. No default test,
+    // default install or existing bench dependency is added.
+    const session_memo_bench = b.addExecutable(.{
+        .name = "onyx-session-memo-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/substrate/bench_session_memo.zig"),
+            .target = target,
+            .optimize = bench_optimize,
+            .link_libc = needs_libc,
+            .imports = &.{.{ .name = "onyx_server", .module = bench_onyx_mod }},
+        }),
+    });
+    if (windows_self_hosted) session_memo_bench.use_llvm = false;
+    const session_memo_install = b.addInstallArtifact(session_memo_bench, .{});
+    const session_memo_run = b.addRunArtifact(session_memo_bench);
+    session_memo_run.step.dependOn(&session_memo_install.step);
+    session_memo_run.addPassthruArgs();
+    const session_memo_step = b.step("bench-session-memo", "Measure bounded direct-leaf signed inventory duplicate work; not daemon throughput");
+    session_memo_step.dependOn(&session_memo_run.step);
+
     // `zig build bench-live` — throwaway loopback daemon for the P0-1 axes the
     // offline harness cannot see (TLS / shards / ring_entries×cqe_batch, JOIN/
     // PRIVMSG RTT, RSS). Not part of `zig build test` or `bench`. The daemon is
@@ -1469,6 +1799,8 @@ pub fn build(b: *std.Build) void {
     //   etc/onyx-server/onyx-server.reference.toml   (annotated reference config)
     //   etc/onyx-server/onyx-server.windows.quickstart.toml (Windows only)
     //   lib/systemd/system/onyx-server.service       (Linux only)
+    //   etc/init.d/onyx-server                     (Linux/OpenRC asset)
+    //   etc/conf.d/onyx-server                     (Linux/OpenRC asset)
     //   libexec/onyx-server-helper                   (OpenBSD only)
     //   libexec/onyx-server-policy                   (OpenBSD only)
     //   etc/rc.d/onyx_server                        (OpenBSD only)
@@ -1550,6 +1882,8 @@ pub fn build(b: *std.Build) void {
     package_step.dependOn(&reference_install.step);
     if (os_tag == .linux) {
         package_step.dependOn(&b.addInstallFile(b.path("etc/systemd/onyx-server.service"), "lib/systemd/system/onyx-server.service").step);
+        package_step.dependOn(&b.addInstallFile(b.path("etc/openrc/onyx-server"), "etc/init.d/onyx-server").step);
+        package_step.dependOn(&b.addInstallFile(b.path("etc/openrc/onyx-server.confd"), "etc/conf.d/onyx-server").step);
     } else if (os_tag == .windows) {
         package_step.dependOn(&b.addInstallFile(b.path("packaging/onyx-server.windows.quickstart.toml"), "etc/onyx-server/onyx-server.windows.quickstart.toml").step);
     }

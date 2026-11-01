@@ -44,7 +44,7 @@ pub const AccessLevel = enum(u16) {
     founder = 100,
 
     pub fn rank(self: AccessLevel) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn lessThan(self: AccessLevel, other: AccessLevel) bool {

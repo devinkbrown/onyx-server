@@ -162,14 +162,14 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const geo.Snapsho
     std.mem.writeInt(u16, bytes[8..10], geo.weather_slots, .big);
     std.mem.writeInt(u16, bytes[10..12], geo.news_slots, .big);
     std.mem.writeInt(u16, bytes[12..14], @intCast(snapshot.jobs.len), .big);
-    bytes[14] = @intFromEnum(snapshot.execution);
+    bytes[14] = @backingInt(snapshot.execution);
     std.mem.writeInt(u64, bytes[16..24], @bitCast(snapshot.captured_monotonic_ms), .big);
     @memcpy(bytes[24..56], &snapshot.options_digest);
     std.mem.writeInt(u32, bytes[56..60], @intCast(total), .big);
     var pos: usize = header_len;
     for (snapshot.weather) |entry| {
         const row = bytes[pos..][0..weather_len];
-        row[0] = @intFromEnum(entry.state);
+        row[0] = @backingInt(entry.state);
         row[1] = @intCast(entry.key_len);
         row[2] = @intCast(entry.loc_len);
         row[3] = @intCast(entry.desc_len);
@@ -184,7 +184,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const geo.Snapsho
     }
     for (snapshot.news) |entry| {
         const row = bytes[pos..][0..news_len];
-        row[0] = @intFromEnum(entry.state);
+        row[0] = @backingInt(entry.state);
         row[1] = @intCast(entry.key_len);
         row[2] = entry.count;
         std.mem.writeInt(u64, row[4..12], @bitCast(entry.fetched_ms), .big);
@@ -199,7 +199,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const geo.Snapsho
     }
     for (snapshot.jobs) |entry| {
         const row = bytes[pos..][0..job_len];
-        row[0] = @intFromEnum(entry.kind);
+        row[0] = @backingInt(entry.kind);
         row[1] = @intCast(entry.key_len);
         @memcpy(row[2..][0..entry.key_len], entry.key[0..entry.key_len]);
         pos += job_len;
@@ -455,12 +455,12 @@ test "v1 geo checkpoint decodes with detail flags clear" {
     std.mem.writeInt(u16, bytes[4..6], version_v1, .big);
     std.mem.writeInt(u16, bytes[8..10], geo.weather_slots, .big);
     std.mem.writeInt(u16, bytes[10..12], geo.news_slots, .big);
-    bytes[14] = @intFromEnum(geo.Execution.unstarted);
+    bytes[14] = @backingInt(geo.Execution.unstarted);
     const digest = try geo.optionsDigest(.{});
     @memcpy(bytes[24..56], &digest);
     std.mem.writeInt(u32, bytes[56..60], @intCast(total), .big);
     const row = bytes[header_len + 7 * weather_len_v1 ..][0..weather_len_v1];
-    row[0] = @intFromEnum(geo.State.ready);
+    row[0] = @backingInt(geo.State.ready);
     row[1] = 4;
     row[2] = 4;
     std.mem.writeInt(u64, row[4..12], @bitCast(@as(f64, 5.5)), .big);

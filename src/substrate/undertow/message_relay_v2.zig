@@ -213,14 +213,14 @@ pub fn encode(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
         .{ .key = "origin_sig", .value = .{ .bytes = msg.origin_sig } },
         .{ .key = "recipient", .value = .{ .string = msg.recipient } },
         .{ .key = "recipient_route_id", .value = .{ .bytes = recipient_route } },
-        .{ .key = "scope_kind", .value = .{ .unsigned = @intFromEnum(msg.scope_kind) } },
+        .{ .key = "scope_kind", .value = .{ .unsigned = @backingInt(msg.scope_kind) } },
         .{ .key = "sender_member_modes", .value = .{ .unsigned = if (msg.sender_member_modes) |m| m else 256 } },
         .{ .key = "sender_route_id", .value = .{ .bytes = sender_route } },
         .{ .key = "source_prefix", .value = .{ .string = msg.source_prefix } },
         .{ .key = "tags", .value = .{ .string = msg.tags } },
         .{ .key = "target", .value = .{ .string = msg.target } },
         .{ .key = "text", .value = .{ .string = msg.text } },
-        .{ .key = "verb", .value = .{ .unsigned = @intFromEnum(msg.verb) } },
+        .{ .key = "verb", .value = .{ .unsigned = @backingInt(msg.verb) } },
     };
     return cpv.Encoder.encode(allocator, .{ .map = entries[0..] });
 }
@@ -246,7 +246,7 @@ const Field = enum(u5) {
 };
 
 fn claimField(seen: *u32, field: Field) DecodeError!void {
-    const mask = @as(u32, 1) << @as(u5, @intCast(@intFromEnum(field)));
+    const mask = @as(u32, 1) << @as(u5, @intCast(@backingInt(field)));
     if ((seen.* & mask) != 0) return error.InvalidDocument;
     seen.* |= mask;
 }
@@ -258,7 +258,7 @@ fn allFieldsMask() u32 {
 }
 
 fn legacyFieldsMask() u32 {
-    return allFieldsMask() & ~(@as(u32, 1) << @intFromEnum(Field.sender_member_modes));
+    return allFieldsMask() & ~(@as(u32, 1) << @backingInt(Field.sender_member_modes));
 }
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
@@ -399,8 +399,8 @@ pub fn originTranscript(allocator: std.mem.Allocator, msg: RelayMessage) ![]u8 {
     try out.appendSlice(allocator, &u64_le);
     std.mem.writeInt(u64, &u64_le, msg.hlc, .little);
     try out.appendSlice(allocator, &u64_le);
-    try out.append(allocator, @intFromEnum(msg.verb));
-    try out.append(allocator, @intFromEnum(msg.scope_kind));
+    try out.append(allocator, @backingInt(msg.verb));
+    try out.append(allocator, @backingInt(msg.scope_kind));
     try out.append(allocator, msg.min_rank);
     if (msg.wire_schema >= 2) {
         try out.append(allocator, @intFromBool(msg.sender_member_modes != null));
@@ -725,7 +725,7 @@ test "secure relay v2 channel whisper signs display channel and exact recipient 
         .hlc = 100,
     };
     try stampOrigin(allocator, &msg, &kp, &pubkey, &signature);
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(msg.scope_kind));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(msg.scope_kind));
     const wire = try encode(allocator, msg);
     defer allocator.free(wire);
     var owned = try decode(allocator, wire);

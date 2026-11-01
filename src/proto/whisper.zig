@@ -100,7 +100,7 @@ pub const MemberTier = enum(u8) {
     founder = 4,
 
     pub fn isOperator(self: MemberTier) bool {
-        return @intFromEnum(self) >= @intFromEnum(MemberTier.op);
+        return @backingInt(self) >= @backingInt(MemberTier.op);
     }
 
     pub fn prefix(self: MemberTier) []const u8 {
@@ -143,12 +143,12 @@ pub const PrecheckResult = struct {
 /// WHISPER failure numerics emitted by this module.
 pub const WhisperNumeric = enum(u16) {
     ERR_NOWHISPER = ERR_NOWHISPER_CODE,
-    ERR_NOSUCHNICK = @intFromEnum(numeric.Numeric.ERR_NOSUCHNICK),
-    ERR_NOTONCHANNEL = @intFromEnum(numeric.Numeric.ERR_NOTONCHANNEL),
-    ERR_CANNOTSENDTOCHAN = @intFromEnum(numeric.Numeric.ERR_CANNOTSENDTOCHAN),
+    ERR_NOSUCHNICK = @backingInt(numeric.Numeric.ERR_NOSUCHNICK),
+    ERR_NOTONCHANNEL = @backingInt(numeric.Numeric.ERR_NOTONCHANNEL),
+    ERR_CANNOTSENDTOCHAN = @backingInt(numeric.Numeric.ERR_CANNOTSENDTOCHAN),
 
     pub fn code(self: WhisperNumeric) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

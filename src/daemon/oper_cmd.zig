@@ -10,6 +10,8 @@ const client_model = @import("client.zig");
 const cloak = @import("../proto/cloak.zig");
 const command_usage = @import("command_usage.zig");
 const config_format = @import("config_format.zig");
+const helix_live = @import("helix/live.zig");
+const retired_fences = @import("session_group_retired_policy.zig");
 const windows_config_proof = @import("helix/native_windows_config_proof.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const kill_relay = @import("../proto/kill_relay.zig");
@@ -31,6 +33,26 @@ const userip = @import("../proto/userip.zig");
 const warden = @import("warden.zig");
 const wildcard_limit = @import("../proto/wildcard_limit.zig");
 
+/// UNREJECT uses the same mapped-v4 identity as the accepted peer path. Keep
+/// existing literal parsing first; only the conventional dotted mapped spelling
+/// uses the stricter standard-library IPv6 parser as an additive fallback.
+fn unrejectAddress(text: []const u8) ?@import("../proto/dns.zig").Address {
+    const Address = @import("../proto/dns.zig").Address;
+    const parsed: Address = resolv_conf.parseIp(text) orelse blk: {
+        const fallback = std.Io.net.IpAddress.parseIp6(text, 0) catch return null;
+        const bytes = fallback.ip6.bytes;
+        if (!std.mem.eql(u8, bytes[0..10], &(@as([10]u8, @splat(0)))) or bytes[10] != 0xff or bytes[11] != 0xff) return null;
+        break :blk .{ .ipv6 = bytes };
+    };
+    return switch (parsed) {
+        .ipv4 => parsed,
+        .ipv6 => |bytes| if (std.mem.eql(u8, bytes[0..10], &(@as([10]u8, @splat(0)))) and bytes[10] == 0xff and bytes[11] == 0xff)
+            .{ .ipv4 = bytes[12..16].* }
+        else
+            parsed,
+    };
+}
+
 pub fn handleUnreject(self: anytype, conn: anytype, parsed: anytype) !void {
     const Server = @TypeOf(self.*);
     // Operator gate enforced by the registry (access=.oper).
@@ -39,7 +61,7 @@ pub fn handleUnreject(self: anytype, conn: anytype, parsed: anytype) !void {
         return;
     }
     const ip_text = parsed.paramSlice()[0];
-    const addr = resolv_conf.parseIp(ip_text) orelse {
+    const addr = unrejectAddress(ip_text) orelse {
         try self.failReply(conn, "UNREJECT", "INVALID_IP", "Not a valid IP address");
         return;
     };
@@ -105,11 +127,11 @@ pub fn handleKill(self: anytype, conn: anytype, parsed: anytype) !void {
     const raw_reason = if (parsed.param_count >= 2 and parsed.paramSlice()[1].len != 0) parsed.paramSlice()[1] else "Killed";
     const reason = Server.sanitizeKillReason(raw_reason, &reason_buf);
 
-    var prefix_buf: [256]u8 = undefined;
+    var prefix_buf: [Server.client_prefix_bytes]u8 = undefined;
     const active_override = Server.overrideActive(conn);
     const real_killer = conn.session.displayName();
     const public_killer = if (active_override) "SYSTEM" else real_killer;
-    const kill_prefix = if (active_override) "SYSTEM" else try self.clientPrefixOf(conn, &prefix_buf);
+    const kill_prefix = if (active_override) "SYSTEM" else self.clientPrefixOf(conn, &prefix_buf);
 
     // Resolve the target: a LOCAL killable client (real connection, not a peer
     // S2S link), or — failing that — a remote user owned by a mesh peer.
@@ -490,8 +512,8 @@ pub fn handleGlobal(self: anytype, id: anytype, conn: anytype, parsed: anytype) 
         const c = entry.value;
         if (!c.session.registered()) continue;
         // Build this recipient's facets for audience matching.
-        var hm_buf: [320]u8 = undefined;
-        const hm = self.clientPrefixOf(c, &hm_buf) catch continue;
+        var hm_buf: [Server.client_prefix_bytes]u8 = undefined;
+        const hm = self.clientPrefixOf(c, &hm_buf);
         var chans: [64][]const u8 = undefined;
         const nchans = self.world.channelsOf(self.worldIdOf(entry.id), &chans);
         if (!req.inAudience(hm, chans[0..nchans])) continue;
@@ -859,8 +881,25 @@ pub fn handleSquit(self: anytype, conn: anytype, parsed: anytype) !void {
     }
 }
 
-pub fn handleDebug(self: anytype, conn: anytype) !void {
+pub fn handleDebug(self: anytype, conn: anytype, parsed: anytype) !void {
     if (!self.requirePriv(conn, .audit_read)) return;
+    if (parsed.param_count != 0) {
+        if (parsed.param_count != 1 or !std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "DIAGNOSTICS")) {
+            try self.noticeTo(conn, "Usage: DEBUG [DIAGNOSTICS]");
+            return;
+        }
+        const diagnostics = @import("diagnostics.zig");
+        // Bound the IRC response independently of the 128-record retained ring.
+        var records: [32]diagnostics.Record = undefined;
+        const recent = self.diagnostics.snapshot(&records) catch {
+            try self.noticeTo(conn, "DEBUG diagnostics busy; retry");
+            return;
+        };
+        var line: [512]u8 = undefined;
+        for (recent) |record| try self.noticeTo(conn, try diagnostics.formatRecord(&line, record));
+        try self.noticeTo(conn, "End of DEBUG diagnostics");
+        return;
+    }
     var buf: [256]tracelog.RecordedEvent = undefined;
     const events = self.trace_recorder.dump(&buf);
     var line_buf: [320]u8 = undefined;
@@ -1167,6 +1206,33 @@ const WindowsRehashProof = struct {
     }
 };
 
+/// Parse-local shadow resolver. The caller retains its collector and checks
+/// failed even when a config field handles a lookup error internally. Neither
+/// this resolver nor its stack context may escape the synchronous parse.
+pub const ConfigEnvCapture = struct {
+    inner: config_format.Resolver,
+    collector: *helix_live.ConfigEnvCollector,
+    failed: bool = false,
+    pub fn resolver(self: *ConfigEnvCapture) config_format.Resolver {
+        return .{ .ctx = self, .env = if (self.inner.env != null) environment else null, .file = if (self.inner.file != null) file else null };
+    }
+    fn environment(ctx: ?*anyopaque, a: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
+        const self: *ConfigEnvCapture = @ptrCast(@alignCast(ctx.?));
+        const value = try self.inner.env.?(self.inner.ctx, a, name);
+        self.collector.record(name, value) catch |err| {
+            self.failed = true;
+            std.crypto.secureZero(u8, @constCast(value));
+            a.free(value);
+            return err;
+        };
+        return value;
+    }
+    fn file(ctx: ?*anyopaque, a: std.mem.Allocator, path: []const u8) anyerror![]const u8 {
+        const self: *ConfigEnvCapture = @ptrCast(@alignCast(ctx.?));
+        return self.inner.file.?(self.inner.ctx, a, path);
+    }
+};
+
 fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     const Server = @TypeOf(self.*);
     if (!self.requirePriv(conn, .server_rehash)) return;
@@ -1194,7 +1260,7 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
         null;
     defer if (canonical_path) |canonical| self.allocator.free(canonical);
     const source_path = if (canonical_path) |canonical| canonical else path;
-    const text = std.Io.Dir.cwd().readFileAlloc(io, source_path, self.allocator, .limited(1 << 20)) catch {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, source_path, self.allocator, .limited(config_format.max_config_bytes)) catch {
         try self.noticeTo(conn, "REHASH: cannot read config file");
         return;
     };
@@ -1211,20 +1277,49 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
         capture = .{ .inner = parse_resolver, .proof = p };
         parse_resolver = (&capture.?).resolver();
     }
-    var parsed = config_format.parseToml(self.allocator, text, parse_resolver) catch {
+    var env_collector = helix_live.ConfigEnvCollector.init(self.allocator);
+    defer env_collector.deinit();
+    var env_capture = ConfigEnvCapture{ .inner = parse_resolver, .collector = &env_collector };
+    const recorded_resolver = env_capture.resolver();
+    const resolved = if (comptime helix_live.supportsBootPolicyOn(builtin.os.tag)) recorded_resolver else parse_resolver;
+    var parsed = config_format.parseToml(self.allocator, text, resolved) catch {
         try self.noticeTo(conn, "REHASH: config parse error; keeping current config");
         return;
     };
+    if (env_capture.failed) {
+        parsed.deinit(self.allocator);
+        try self.noticeTo(conn, "REHASH: invalid config environment; keeping current config");
+        return;
+    }
     if (Server.ocg2RehashHasUnsupportedRuntimeMode(parsed.oper_ocg2)) {
         parsed.deinit(self.allocator);
         try self.noticeTo(conn, "REHASH: OCG2 project/mint mode is unsupported by this release; keeping current config");
         return;
+    }
+    if (!retired_fences.same(self.config.retired_session_group_fences, parsed.mesh.retired_session_group_fences)) {
+        self.noticeTo(conn, "REHASH: retired session fence policy changes require a validated cold maintenance transition; current policy is unchanged") catch |err| {
+            parsed.deinit(self.allocator);
+            return err;
+        };
+        if (!dry) {
+            parsed.deinit(self.allocator);
+            return;
+        }
     }
     if (dry) {
         defer parsed.deinit(self.allocator);
         try self.emitRehashDry(conn, path, &parsed);
         return;
     }
+    var next_boot_policy: ?helix_live.OwnedBootPolicy = if (comptime helix_live.supportsBootPolicyOn(builtin.os.tag)) helix_live.OwnedBootPolicy.init(self.allocator, .{
+        .strict_existing_identity = self.config.helix_boot_policy.strict_existing_identity,
+        .config_env = env_collector.view(),
+    }) catch {
+        parsed.deinit(self.allocator);
+        try self.noticeTo(conn, "REHASH: cannot retain config environment; keeping current config");
+        return;
+    } else null;
+    defer if (next_boot_policy) |*policy| policy.deinit();
     // Build the new oper bindings (strings borrow `parsed`, kept alive below).
     const bindings = self.operBindingsFromConfig(parsed) catch {
         parsed.deinit(self.allocator);
@@ -1255,6 +1350,26 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
         Server.windowsRehashEligibleParsed(self.config.windows_helix_boot_parsed.?, &parsed) and
         Server.windowsRehashIpCapSafe(self.config.max_clones_per_ip, parsed.limits.max_clones_per_ip);
 
+    // The existing command lane excludes module readers on every shard. Keep
+    // it through prepare + the nonfallible config/module publication, including
+    // detached administrative callers that did not enter via a completion.
+    const acquired_module_lane = self.lockModulePolicy();
+    defer self.unlockModulePolicy(acquired_module_lane);
+    if (comptime helix_live.supportsBootPolicyOn(builtin.os.tag)) self.validateRehashBootIdentity(&parsed, next_boot_policy.?.borrow()) catch {
+        self.allocator.free(bindings);
+        parsed.deinit(self.allocator);
+        try self.noticeTo(conn, "REHASH: node identity or realm requires cold maintenance; keeping current config");
+        return;
+    };
+    self.prepareModuleReload(&parsed) catch |err| {
+        self.allocator.free(bindings);
+        parsed.deinit(self.allocator);
+        var reason: [256]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&reason, "REHASH: module preparation failed ({s}); keeping current config", .{@errorName(err)}) catch "REHASH: module preparation failed; keeping current config");
+        return;
+    };
+    defer _ = self.module_runtime.abortReload();
+
     // Commit: replace the previous reloaded generation, then point the live
     // registry at the new bindings. `parsed`'s strings (incl. the TLS cert/key
     // paths consulted just below) now live in `self.reload_parsed`.
@@ -1267,6 +1382,13 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     self.allocator.free(self.reload_bindings);
     if (self.reload_parsed) |*p| p.deinit(self.allocator);
     self.reload_parsed = parsed;
+    if (comptime helix_live.supportsBootPolicyOn(builtin.os.tag)) {
+        var previous_boot_policy = self.reload_boot_policy;
+        self.reload_boot_policy = next_boot_policy.?;
+        next_boot_policy = null;
+        self.config.helix_boot_policy = self.reload_boot_policy.?.borrow();
+        if (previous_boot_policy) |*policy| policy.deinit();
+    }
     self.reload_bindings = bindings;
     self.oper_registry = new_registry;
 
@@ -1274,6 +1396,7 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     // flood / admission policy), the global clone caps, the connection-rate
     // throttle, and the nick-delay window — all from the freshly parsed config.
     self.applyReloadedLimits(&self.reload_parsed.?);
+    self.module_runtime.commitReload() catch unreachable;
 
     // Cert hot-reload: re-read the cert/key material from the reloaded paths
     // and atomically swap the live `config.tls_*` fields so NEW TLS handshakes
@@ -1533,4 +1656,28 @@ pub fn handleNethealth(self: anytype, conn: anytype) !void {
         "intact (quorum held)";
     const qline = std.fmt.bufPrint(&qb, "quorum: {s}; {d} mesh component(s)", .{ quorum_status, self.partition_components }) catch return;
     try self.noticeTo(conn, qline);
+}
+
+test "UNREJECT mapped IPv6 addresses clear the same IPv4 reputation key" {
+    const rep_mod = @import("ip_reputation.zig");
+    const testing = std.testing;
+    var rep = try rep_mod.IpReputation.init(testing.allocator, .{});
+    defer rep.deinit();
+    const ipv4 = unrejectAddress("198.51.100.153") orelse return error.TestUnexpectedResult;
+    const hex = unrejectAddress("::ffff:c633:6499") orelse return error.TestUnexpectedResult;
+    const dotted = unrejectAddress("::ffff:198.51.100.153") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(ipv4, hex);
+    try testing.expectEqual(ipv4, dotted);
+    _ = try rep.penalize(ipv4, 25, 0);
+    try testing.expect(rep.clear(hex));
+    _ = try rep.penalize(ipv4, 25, 0);
+    try testing.expect(rep.clear(dotted));
+    const ipv6 = unrejectAddress("2001:db8::1") orelse return error.TestUnexpectedResult;
+    try testing.expect(ipv6 == .ipv6);
+    _ = try rep.penalize(ipv6, 25, 0);
+    try testing.expect(!rep.clear(ipv4));
+    try testing.expect(rep.clear(ipv6));
+    for ([_][]const u8{ "", "::ffff:198.51.100.999", "::ffff:198.51.100.153junk", "::ffff:198.51.100.153%1", "2001::db8::1", "198.51.100.153:42" }) |bad| {
+        try testing.expect(unrejectAddress(bad) == null);
+    }
 }

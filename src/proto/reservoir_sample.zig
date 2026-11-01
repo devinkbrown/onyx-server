@@ -46,7 +46,7 @@ pub const OfferResult = enum(u2) {
 
     /// Return the compact encoded value for this offer result.
     pub fn code(self: OfferResult) u2 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

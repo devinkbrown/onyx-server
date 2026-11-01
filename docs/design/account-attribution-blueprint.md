@@ -1,3 +1,6 @@
+
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
 <!--
 SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 SPDX-License-Identifier: AGPL-3.0-or-later

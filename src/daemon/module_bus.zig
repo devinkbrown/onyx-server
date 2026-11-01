@@ -29,10 +29,10 @@
 //! `registry.loadOrder`), so a module's subscriber never runs before a
 //! subscriber belonging to a module it depends on.
 //!
-//! Concurrency: dispatch itself is stateless and re-entrant — the bus owns no
-//! mutable per-event state, and a payload is owned by the emitting reactor for
-//! the duration of the call. Only the diagnostic counters are shared, and they
-//! are relaxed atomics (statistics, never a control input).
+//! Concurrency: a payload is owned by the emitting reactor during dispatch.
+//! Managed daemons own `Bus.Instance` counters; compatibility namespace calls
+//! use a process-global instance. Counters are relaxed atomics (statistics,
+//! never a control input). An optional host-owned readiness gate controls entry.
 const std = @import("std");
 const registry = @import("registry.zig");
 
@@ -49,144 +49,147 @@ pub const HookStats = struct {
     vetoed: u64 = 0,
     /// Comptime count of modules bound to this hook.
     subscribers: usize = 0,
+    /// Unavailable subscribers skipped (information) or denied (veto).
+    unavailable: u64 = 0,
 };
 
 /// Build the event bus for a comptime module set.
 ///
-/// `Bus(mods)` is a namespace, not a value: the subscriber partition is a
-/// comptime table and the counters are process-global, exactly like the
-/// registry tables themselves. Instantiating it twice with the same `mods`
-/// yields the same type, so `server.zig` and an introspection module observe
-/// the same counters without threading a handle between them.
+/// Tables are immutable; `Bus(mods).Instance` owns mutable diagnostic counters.
+/// Static methods retain legacy process-global counters for unconverted callers.
 pub fn Bus(comptime mods: []const registry.Module) type {
     return struct {
-        var emitted: [hook_id_count]std.atomic.Value(u64) = @splat(.init(0));
-        var handler_errors: [hook_id_count]std.atomic.Value(u64) = @splat(.init(0));
-        var vetoed: [hook_id_count]std.atomic.Value(u64) = @splat(.init(0));
+        // Compatibility namespace for callers not yet attached to a runtime.
+        // Managed daemons own Instance explicitly, so their counters are isolated.
+        var legacy: Instance = .{};
 
-        /// Handlers bound to `id`, in dispatch order. Empty when nothing
-        /// subscribes, which lets an emit compile down to a counter bump.
+        pub const Instance = struct {
+            emitted: [hook_id_count]std.atomic.Value(u64) = @splat(.init(0)),
+            handler_errors: [hook_id_count]std.atomic.Value(u64) = @splat(.init(0)),
+            vetoed: [hook_id_count]std.atomic.Value(u64) = @splat(.init(0)),
+            unavailable: [hook_id_count]std.atomic.Value(u64) = @splat(.init(0)),
+
+            /// Informational delivery skips unavailable subscribers. Veto-capable
+            /// hooks must go through approve, where unavailability fails closed.
+            pub fn emit(self: *Instance, comptime id: registry.HookId, ctx: *anyopaque, payload: registry.HookPayload(id), gate: ?registry.ModuleGate) registry.HookResult {
+                comptime if (registry.hookIsVetoCapable(id)) @compileError("module_bus.emit: veto-capable hooks require approve()");
+                const slot = comptime @backingInt(id);
+                _ = self.emitted[slot].fetchAdd(1, .monotonic);
+                const erased: *anyopaque = @ptrCast(payload);
+                inline for (comptime bindingsFor(mods, id)) |entry| {
+                    if (gate == null or gate.?.allows(entry.module_index)) {
+                        const result = entry.binding.handler(ctx, erased) catch blk: {
+                            _ = self.handler_errors[slot].fetchAdd(1, .monotonic);
+                            break :blk registry.HookResult.continue_;
+                        };
+                        if (result == .stop) return .stop;
+                    } else {
+                        _ = self.unavailable[slot].fetchAdd(1, .monotonic);
+                    }
+                }
+                return .continue_;
+            }
+
+            pub fn approve(self: *Instance, comptime id: registry.HookId, ctx: *anyopaque, payload: registry.HookPayload(id), gate: ?registry.ModuleGate) bool {
+                comptime if (!registry.hookIsVetoCapable(id)) @compileError("module_bus.approve: informational hooks require emit()");
+                const slot = comptime @backingInt(id);
+                _ = self.emitted[slot].fetchAdd(1, .monotonic);
+                // A caller may already have denied the operation. No subscriber
+                // may resurrect that decision, including the first subscriber.
+                if (!payload.approved) {
+                    _ = self.vetoed[slot].fetchAdd(1, .monotonic);
+                    return false;
+                }
+                const erased: *anyopaque = @ptrCast(payload);
+                inline for (comptime bindingsFor(mods, id)) |entry| {
+                    if (gate) |availability| {
+                        if (!availability.allows(entry.module_index)) {
+                            _ = self.unavailable[slot].fetchAdd(1, .monotonic);
+                            _ = self.vetoed[slot].fetchAdd(1, .monotonic);
+                            payload.approved = false;
+                            return false;
+                        }
+                    }
+                    const result = entry.binding.handler(ctx, erased) catch {
+                        _ = self.handler_errors[slot].fetchAdd(1, .monotonic);
+                        _ = self.vetoed[slot].fetchAdd(1, .monotonic);
+                        payload.approved = false;
+                        return false;
+                    };
+                    if (!payload.approved) {
+                        _ = self.vetoed[slot].fetchAdd(1, .monotonic);
+                        return false;
+                    }
+                    if (result == .stop) break;
+                }
+                return payload.approved;
+            }
+
+            /// Fields are sampled independently; this is diagnostic state.
+            pub fn stats(self: *const Instance, comptime id: registry.HookId) HookStats {
+                const slot = comptime @backingInt(id);
+                return .{
+                    .emitted = self.emitted[slot].load(.monotonic),
+                    .handler_errors = self.handler_errors[slot].load(.monotonic),
+                    .vetoed = self.vetoed[slot].load(.monotonic),
+                    .unavailable = self.unavailable[slot].load(.monotonic),
+                    .subscribers = comptime bindingsFor(mods, id).len,
+                };
+            }
+
+            pub fn totalEmitted(self: *const Instance) u64 {
+                var total: u64 = 0;
+                for (&self.emitted) |*counter| total +%= counter.load(.monotonic);
+                return total;
+            }
+
+            pub fn totalHandlerErrors(self: *const Instance) u64 {
+                var total: u64 = 0;
+                for (&self.handler_errors) |*counter| total +%= counter.load(.monotonic);
+                return total;
+            }
+
+            /// Only use with no concurrent emitters (tests or before startup).
+            pub fn resetStats(self: *Instance) void {
+                for (&self.emitted, &self.handler_errors, &self.vetoed, &self.unavailable) |*a, *b, *c, *d| {
+                    a.store(0, .monotonic);
+                    b.store(0, .monotonic);
+                    c.store(0, .monotonic);
+                    d.store(0, .monotonic);
+                }
+            }
+        };
+
         pub fn bindings(comptime id: registry.HookId) []const registry.HookEntry {
             return comptime bindingsFor(mods, id);
         }
 
-        /// How many modules subscribe to `id`.
         pub fn subscriberCount(comptime id: registry.HookId) usize {
             return comptime bindingsFor(mods, id).len;
         }
 
-        /// Deliver an informational event to every subscriber.
-        ///
-        /// Returns `.stop` when a handler asked to end the chain, otherwise
-        /// `.continue_`. Handler errors are counted and swallowed: an
-        /// informational event has no decision to fail closed on, and a broken
-        /// subscriber must not take down the emitting path.
-        ///
-        /// Use `approve` instead for any event whose payload carries
-        /// `approved` — emitting a veto-capable event through here would
-        /// discard the veto.
-        pub fn emit(
-            comptime id: registry.HookId,
-            ctx: *anyopaque,
-            payload: registry.HookPayload(id),
-        ) registry.HookResult {
-            const slot = comptime @intFromEnum(id);
-            _ = emitted[slot].fetchAdd(1, .monotonic);
-
-            const erased: *anyopaque = @ptrCast(payload);
-            inline for (comptime bindingsFor(mods, id)) |entry| {
-                // `catch |...| .continue_` rather than `catch { continue; }`:
-                // `continue` inside an `inline for` is comptime control flow,
-                // and a handler error is a runtime condition. Treating the
-                // error as `.continue_` is the same behaviour — count it and
-                // move to the next subscriber.
-                const result = entry.binding.handler(ctx, erased) catch blk: {
-                    _ = handler_errors[slot].fetchAdd(1, .monotonic);
-                    break :blk registry.HookResult.continue_;
-                };
-                if (result == .stop) return .stop;
-            }
-            return .continue_;
+        pub fn emit(comptime id: registry.HookId, ctx: *anyopaque, payload: registry.HookPayload(id)) registry.HookResult {
+            return legacy.emit(id, ctx, payload, null);
         }
 
-        /// Put a veto-capable event to every subscriber and return whether it
-        /// is approved.
-        ///
-        /// The caller passes a payload whose `approved` still holds its `true`
-        /// default. Dispatch stops at the FIRST denial — either a handler
-        /// clearing `approved`, or a handler erroring (which fails closed) — so
-        /// a later subscriber can never resurrect a denied event. A handler
-        /// returning `.stop` ends the chain while keeping the current verdict.
-        ///
-        /// Passing an informational hook id is a COMPILE error: its payload has
-        /// no `approved` field, so the "veto" would be silently dropped.
-        pub fn approve(
-            comptime id: registry.HookId,
-            ctx: *anyopaque,
-            payload: registry.HookPayload(id),
-        ) bool {
-            comptime if (!registry.hookIsVetoCapable(id)) @compileError(
-                "module_bus.approve: hook '" ++ @tagName(id) ++
-                    "' is informational (no `approved` field) — use emit() instead",
-            );
-
-            const slot = comptime @intFromEnum(id);
-            _ = emitted[slot].fetchAdd(1, .monotonic);
-
-            const erased: *anyopaque = @ptrCast(payload);
-            inline for (comptime bindingsFor(mods, id)) |entry| {
-                const result = entry.binding.handler(ctx, erased) catch {
-                    // Fail closed: a subscriber that faulted has not approved.
-                    _ = handler_errors[slot].fetchAdd(1, .monotonic);
-                    _ = vetoed[slot].fetchAdd(1, .monotonic);
-                    payload.approved = false;
-                    return false;
-                };
-                if (!payload.approved) {
-                    _ = vetoed[slot].fetchAdd(1, .monotonic);
-                    return false;
-                }
-                if (result == .stop) break;
-            }
-            return payload.approved;
+        pub fn approve(comptime id: registry.HookId, ctx: *anyopaque, payload: registry.HookPayload(id)) bool {
+            return legacy.approve(id, ctx, payload, null);
         }
 
-        /// Diagnostic snapshot for one hook. Fields are read independently, so
-        /// a concurrent emit may be reflected in some counters and not others;
-        /// this is a statistics view, never a control input.
         pub fn stats(comptime id: registry.HookId) HookStats {
-            const slot = comptime @intFromEnum(id);
-            return .{
-                .emitted = emitted[slot].load(.monotonic),
-                .handler_errors = handler_errors[slot].load(.monotonic),
-                .vetoed = vetoed[slot].load(.monotonic),
-                .subscribers = comptime bindingsFor(mods, id).len,
-            };
+            return legacy.stats(id);
         }
 
-        /// Total events emitted across every hook.
         pub fn totalEmitted() u64 {
-            var total: u64 = 0;
-            for (&emitted) |*counter| total += counter.load(.monotonic);
-            return total;
+            return legacy.totalEmitted();
         }
 
-        /// Total handler errors across every hook — a non-zero value means some
-        /// subscriber is faulting and is worth surfacing to an operator.
         pub fn totalHandlerErrors() u64 {
-            var total: u64 = 0;
-            for (&handler_errors) |*counter| total += counter.load(.monotonic);
-            return total;
+            return legacy.totalHandlerErrors();
         }
 
-        /// Zero every counter. Tests only: the counters are process-global, so
-        /// a test that asserts on them must start from a known baseline.
         pub fn resetStats() void {
-            for (&emitted, &handler_errors, &vetoed) |*a, *b, *c| {
-                a.store(0, .monotonic);
-                b.store(0, .monotonic);
-                c.store(0, .monotonic);
-            }
+            legacy.resetStats();
         }
     };
 }
@@ -217,7 +220,7 @@ fn bindingsFor(
             const module = mods[module_index];
             for (module.hooks) |binding| {
                 if (binding.hook != id) continue;
-                rows[n] = .{ .module_id = module.id, .binding = binding };
+                rows[n] = .{ .module_id = module.id, .module_index = module_index, .binding = binding };
                 n += 1;
             }
         }
@@ -228,7 +231,7 @@ fn bindingsFor(
         while (i < total) : (i += 1) {
             var j: usize = i;
             while (j > 0 and
-                @intFromEnum(rows[j].binding.priority) < @intFromEnum(rows[j - 1].binding.priority)) : (j -= 1)
+                @backingInt(rows[j].binding.priority) < @backingInt(rows[j - 1].binding.priority)) : (j -= 1)
             {
                 const swap = rows[j];
                 rows[j] = rows[j - 1];

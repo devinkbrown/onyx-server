@@ -560,7 +560,7 @@ const ValueReader = struct {
         var type_num: u8 = ctrl >> 5;
         const size_bits: u8 = ctrl & 0x1f;
 
-        if (type_num == @intFromEnum(ValueType.pointer)) {
+        if (type_num == @backingInt(ValueType.pointer)) {
             const size_code = (ctrl >> 3) & 0x03;
             const byte_count = @as(usize, size_code) + 1;
             if (cursor + byte_count > self.limit or cursor + byte_count > self.bytes.len) {
@@ -805,7 +805,7 @@ fn appendHeader(out: *ByteList, value_type: u8, size: usize) !void {
 }
 
 fn appendString(out: *ByteList, bytes: []const u8) !void {
-    try appendHeader(out, @intFromEnum(ValueType.utf8_string), bytes.len);
+    try appendHeader(out, @backingInt(ValueType.utf8_string), bytes.len);
     try out.appendSlice(bytes);
 }
 
@@ -828,24 +828,24 @@ fn appendUint(out: *ByteList, value_type: ValueType, value: u64) !void {
         tmp[i] = @intCast((value >> shift) & 0xff);
     }
 
-    try appendHeader(out, @intFromEnum(value_type), len);
+    try appendHeader(out, @backingInt(value_type), len);
     try out.appendSlice(tmp[0..len]);
 }
 
 fn appendMapHeader(out: *ByteList, pairs: usize) !void {
-    try appendHeader(out, @intFromEnum(ValueType.map), pairs);
+    try appendHeader(out, @backingInt(ValueType.map), pairs);
 }
 
 fn appendArrayHeader(out: *ByteList, items: usize) !void {
-    try appendHeader(out, @intFromEnum(ValueType.array), items);
+    try appendHeader(out, @backingInt(ValueType.array), items);
 }
 
 fn appendBool(out: *ByteList, value: bool) !void {
-    try appendHeader(out, @intFromEnum(ValueType.boolean), if (value) 1 else 0);
+    try appendHeader(out, @backingInt(ValueType.boolean), if (value) 1 else 0);
 }
 
 fn appendDouble(out: *ByteList, value: f64) !void {
-    try appendHeader(out, @intFromEnum(ValueType.double), 8);
+    try appendHeader(out, @backingInt(ValueType.double), 8);
     var b: [8]u8 = undefined;
     std.mem.writeInt(u64, &b, @bitCast(value), .big);
     try out.appendSlice(&b);

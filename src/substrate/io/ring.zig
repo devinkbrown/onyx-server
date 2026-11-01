@@ -200,7 +200,7 @@ pub const UserData = struct {
 /// caller cannot create an ambiguous handle.
 pub fn encodeUserData(kind: OpKind, token: FdToken) error{TokenOutOfRange}!u64 {
     if (token.slot > SlotMax or token.gen > GenMax) return error.TokenOutOfRange;
-    const k: u64 = @as(u64, @intFromEnum(kind)) << OpKindShift;
+    const k: u64 = @as(u64, @backingInt(kind)) << OpKindShift;
     const s: u64 = @as(u64, token.slot) << SlotShift;
     const g: u64 = @as(u64, token.gen);
     return k | s | g;
@@ -211,7 +211,7 @@ pub fn encodeUserData(kind: OpKind, token: FdToken) error{TokenOutOfRange}!u64 {
 /// roll a comptime-checked converter. Pure.
 fn opKindFromInt(raw: u8) error{UnknownOpKind}!OpKind {
     inline for (@typeInfo(OpKind).@"enum".field_values) |f_value| {
-        if (raw == f_value) return @enumFromInt(f_value);
+        if (raw == f_value) return @fromBackingInt(@intCast(f_value));
     }
     return error.UnknownOpKind;
 }
@@ -416,7 +416,7 @@ const KernelProbe = if (builtin.os.tag != .linux) struct {
     }
 
     fn isErrno(res: i32, err: linux.E) bool {
-        return res == -@as(i32, @intFromEnum(err));
+        return res == -@as(i32, @backingInt(err));
     }
 
     fn openLoopbackListener() ?linux.fd_t {
@@ -899,7 +899,7 @@ test "encode/decode user_data round-trips for every op kind" {
         .{ .slot = SlotMax, .gen = GenMax },
     };
     inline for (@typeInfo(OpKind).@"enum".field_values) |f_value| {
-        const kind: OpKind = @enumFromInt(f_value);
+        const kind: OpKind = @fromBackingInt(@intCast(f_value));
         for (tokens) |tok| {
             const raw = try encodeUserData(kind, tok);
             const ud = try decodeUserData(raw);
@@ -1262,7 +1262,7 @@ test "prototype ring accepts with CLOEXEC, connects, polls, and cancels" {
         fn onCompletion(self: *@This(), c: Completion) void {
             switch (c) {
                 .accept => |ev| {
-                    if (ev.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+                    if (ev.res == -@as(i32, @backingInt(linux.E.CANCELED))) {
                         if (!ev.more) self.canceled = true;
                     } else if (ev.res >= 0) {
                         _ = linux.close(ev.res);
@@ -1457,7 +1457,7 @@ test "prototype ring multishot recv replenishes a provided buffer" {
     try testing.expectEqualSlices(u8, "two!", storage[0..4]);
     try ring.submitExactCancel(.recv, token);
     const canceled = try reapRecv(&ring, token);
-    try testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), canceled.res);
+    try testing.expectEqual(-@as(i32, @backingInt(linux.E.CANCELED)), canceled.res);
     try testing.expect(!canceled.more);
 }
 

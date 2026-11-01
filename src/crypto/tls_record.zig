@@ -232,7 +232,7 @@ pub fn deriveNonce(write_iv: Nonce96, seq: u64) Nonce96 {
 /// TLS 1.3 AEAD additional_data is the serialized TLSCiphertext header.
 pub fn makeAdditionalData(encrypted_record_len: u16) [record_header_len]u8 {
     var aad: [record_header_len]u8 = undefined;
-    aad[0] = @intFromEnum(outer_content_type);
+    aad[0] = @backingInt(outer_content_type);
     std.mem.writeInt(u16, aad[1..3], legacy_record_version, .big);
     std.mem.writeInt(u16, aad[3..5], encrypted_record_len, .big);
     return aad;
@@ -271,7 +271,7 @@ pub fn encodeInnerPlaintext(
     if (out.len < inner_len) return error.OutputTooSmall;
 
     @memcpy(out[0..plaintext.len], plaintext);
-    out[plaintext.len] = @intFromEnum(content_type);
+    out[plaintext.len] = @backingInt(content_type);
     @memset(out[plaintext.len + 1 .. inner_len], 0);
     return out[0..inner_len];
 }
@@ -473,7 +473,7 @@ test "padding strip returns content before type byte" {
     var inner = try allocator.alloc(u8, 9);
     defer allocator.free(inner);
     @memcpy(inner[0..4], "ping");
-    inner[4] = @intFromEnum(ContentType.handshake);
+    inner[4] = @backingInt(ContentType.handshake);
     @memset(inner[5..], 0);
 
     const opened = try decodeInnerPlaintext(inner);
@@ -510,7 +510,7 @@ test "exploit: record header declaring more than 2^14+256 is rejected" {
     // RFC 8446 §5.2 caps TLSCiphertext.length at 2^14+256. A peer declaring more
     // is trying to make us size a buffer from an unvalidated wire integer.
     var rec: [record_header_len]u8 = undefined;
-    rec[0] = @intFromEnum(outer_content_type);
+    rec[0] = @backingInt(outer_content_type);
     std.mem.writeInt(u16, rec[1..3], legacy_record_version, .big);
     std.mem.writeInt(u16, rec[3..5], max_ciphertext_len + 1, .big);
     try std.testing.expectError(error.RecordOverflow, parseCiphertext(&rec));
@@ -525,7 +525,7 @@ test "exploit: record length disagreeing with the delivered byte count is reject
     // hold (over-read attempt) and a length smaller (trailing-byte smuggling,
     // where the leftover would otherwise be silently dropped or reinterpreted).
     var over: [record_header_len + 4]u8 = undefined;
-    over[0] = @intFromEnum(outer_content_type);
+    over[0] = @backingInt(outer_content_type);
     std.mem.writeInt(u16, over[1..3], legacy_record_version, .big);
     std.mem.writeInt(u16, over[3..5], 64, .big); // claims 64, carries 4
     try std.testing.expectError(error.BadRecordHeader, parseCiphertext(&over));
@@ -560,7 +560,7 @@ test "exploit: record with a forged legacy version is rejected" {
     // peer varying it is probing for a version-dispatch path.
     for ([_]u16{ 0x0301, 0x0302, 0x0304, 0x0000, 0xFFFF }) |bad_version| {
         var rec: [record_header_len + 8]u8 = @splat(0);
-        rec[0] = @intFromEnum(outer_content_type);
+        rec[0] = @backingInt(outer_content_type);
         std.mem.writeInt(u16, rec[1..3], bad_version, .big);
         std.mem.writeInt(u16, rec[3..5], 8, .big);
         try std.testing.expectError(error.BadRecordHeader, parseCiphertext(&rec));
@@ -579,7 +579,7 @@ test "exploit: a record shorter than the AEAD tag is rejected before any open" {
     var body_len: usize = 0;
     while (body_len < A.tag_length) : (body_len += 1) {
         var rec: [record_header_len + 16]u8 = @splat(0);
-        rec[0] = @intFromEnum(outer_content_type);
+        rec[0] = @backingInt(outer_content_type);
         std.mem.writeInt(u16, rec[1..3], legacy_record_version, .big);
         std.mem.writeInt(u16, rec[3..5], @intCast(body_len), .big);
         try std.testing.expectError(
@@ -603,7 +603,7 @@ test "exploit: change_cipher_spec smuggled as an inner content type is rejected"
     // RFC 8446 §5.4: CCS is never a legal TLSInnerPlaintext type. A peer that
     // could smuggle one inside a protected record would reach the CCS-handling
     // path from within the encrypted stream.
-    var inner = [_]u8{ 'x', @intFromEnum(ContentType.change_cipher_spec) };
+    var inner = [_]u8{ 'x', @backingInt(ContentType.change_cipher_spec) };
     try std.testing.expectError(error.InvalidContentType, decodeInnerPlaintext(&inner));
 
     // ...and an inner type byte outside the enum entirely.
@@ -766,7 +766,7 @@ test "exploit: an inner plaintext whose content exceeds 2^14 is rejected after d
     const inner = try allocator.alloc(u8, max_plaintext_len + 8);
     defer allocator.free(inner);
     @memset(inner, 'B');
-    inner[inner.len - 1] = @intFromEnum(ContentType.application_data);
+    inner[inner.len - 1] = @backingInt(ContentType.application_data);
     try testing.expectError(error.RecordOverflow, decodeInnerPlaintext(inner));
 }
 
@@ -806,7 +806,7 @@ pub fn fatalAlertBytes(failure: anyerror) ?[2]u8 {
 
 test "TLS record limit: full inner global maximum includes padding and overflow-safe sizing" {
     var inner: [record_size_limit_max + 1]u8 = @splat(0);
-    inner[0] = @intFromEnum(ContentType.application_data);
+    inner[0] = @backingInt(ContentType.application_data);
     const exact = try decodeInnerPlaintext(inner[0..record_size_limit_max]);
     try std.testing.expectEqual(@as(usize, 0), exact.content.len);
     try std.testing.expectEqual(@as(usize, record_size_limit_max - 1), exact.padding_len);

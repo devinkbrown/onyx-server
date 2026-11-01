@@ -68,7 +68,7 @@ pub const RecordHeader = struct {
 
     pub fn encode(self: RecordHeader, out: []u8) EncodeError![]const u8 {
         if (out.len < record_header_len) return error.BufferTooSmall;
-        out[0] = @intFromEnum(self.content_type);
+        out[0] = @backingInt(self.content_type);
         std.mem.writeInt(u16, out[1..][0..2], self.version, .big);
         std.mem.writeInt(u16, out[3..][0..2], self.epoch, .big);
         std.mem.writeInt(u48, out[5..][0..6], self.seq, .big);
@@ -86,7 +86,7 @@ pub const RecordHeader = struct {
         if (buf.len < total) return error.BufferTooShort;
         return .{
             .hdr = .{
-                .content_type = @enumFromInt(buf[0]),
+                .content_type = @fromBackingInt(@intCast(buf[0])),
                 .version = std.mem.readInt(u16, buf[1..][0..2], .big),
                 .epoch = std.mem.readInt(u16, buf[3..][0..2], .big),
                 .seq = std.mem.readInt(u48, buf[5..][0..6], .big),
@@ -127,7 +127,7 @@ pub fn writePlaintext(
 fn gcmAad(content_type: ContentType, version: u16, seq_num: u64, plaintext_len: u16) [13]u8 {
     var aad: [13]u8 = undefined;
     std.mem.writeInt(u64, aad[0..8], seq_num, .big);
-    aad[8] = @intFromEnum(content_type);
+    aad[8] = @backingInt(content_type);
     std.mem.writeInt(u16, aad[9..][0..2], version, .big);
     std.mem.writeInt(u16, aad[11..][0..2], plaintext_len, .big);
     return aad;

@@ -71,7 +71,7 @@ pub fn encode(allocator: std.mem.Allocator, state: *const service.State) Error![
     try writer.bytes(&service.service_identity);
     try writer.bytes(&state.context.incarnation);
     try writer.int(u64, state.generation);
-    try writer.int(u8, @intFromEnum(state.phase));
+    try writer.int(u8, @backingInt(state.phase));
     try writer.bytes(&state.upgrade_id);
     const context = &state.context;
     try writer.path(&context.executable);
@@ -119,7 +119,7 @@ pub fn encode(allocator: std.mem.Allocator, state: *const service.State) Error![
     if (state.last) |last| {
         const request = try last.request.encode();
         try writer.bytes(&request);
-        try writer.int(u8, @intFromEnum(last.result));
+        try writer.int(u8, @backingInt(last.result));
     }
     return allocator.dupe(u8, buffer[0..writer.offset]);
 }

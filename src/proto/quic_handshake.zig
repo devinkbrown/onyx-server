@@ -435,10 +435,10 @@ pub const Server = struct {
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
             switch (ext.ext_type) {
-                @intFromEnum(tls_extension.ExtensionType.supported_versions) => {
+                @backingInt(tls_extension.ExtensionType.supported_versions) => {
                     if (tls_supported_versions.clientOffers(ext.data, tls_supported_versions.tls13)) offered_tls13 = true;
                 },
-                @intFromEnum(tls_extension.ExtensionType.key_share) => {
+                @backingInt(tls_extension.ExtensionType.key_share) => {
                     var shares = tls_keyshare.parseClientShares(ext.data) catch continue;
                     while (shares.next() catch null) |entry| {
                         if (entry.group == .x25519 and entry.key_exchange.len == kx.X25519Kx.public_len) {
@@ -448,7 +448,7 @@ pub const Server = struct {
                         }
                     }
                 },
-                @intFromEnum(tls_extension.ExtensionType.alpn) => self.maybeSelectAlpn(ext.data),
+                @backingInt(tls_extension.ExtensionType.alpn) => self.maybeSelectAlpn(ext.data),
                 quic_transport_parameters_ext => {
                     try self.capturePeerParams(ext.data);
                     have_params = true;
@@ -542,7 +542,7 @@ pub const Server = struct {
         try appendU16(self.allocator, &body, legacy_version);
         try body.appendSlice(self.allocator, &self.server_random);
         try body.append(self.allocator, 0); // legacy_session_id_echo: empty (QUIC)
-        try appendU16(self.allocator, &body, @intFromEnum(suite));
+        try appendU16(self.allocator, &body, @backingInt(suite));
         try body.append(self.allocator, 0); // null compression
 
         // Sized to hold the X25519MLKEM768 server key_share (1120 bytes) plus the
@@ -610,7 +610,7 @@ pub const Server = struct {
         switch (self.config.signing_key) {
             .ed25519 => |key| {
                 const sig = (key.sign(input, null) catch return error.SignatureFailed).toBytes();
-                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519));
+                try appendU16(self.allocator, &body, @backingInt(tls_signature_scheme.SignatureScheme.ed25519));
                 try appendU16(self.allocator, &body, @intCast(sig.len));
                 try body.appendSlice(self.allocator, &sig);
             },
@@ -618,7 +618,7 @@ pub const Server = struct {
                 const sig = ecdsa_p256.sign(input, key) catch return error.SignatureFailed;
                 var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
                 const der = ecdsa_p256.signatureToDer(sig, &der_buf) catch return error.SignatureFailed;
-                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256));
+                try appendU16(self.allocator, &body, @backingInt(tls_signature_scheme.SignatureScheme.ecdsa_secp256r1_sha256));
                 try appendU16(self.allocator, &body, @intCast(der.len));
                 try body.appendSlice(self.allocator, der);
             },
@@ -630,7 +630,7 @@ pub const Server = struct {
                 defer secureZero(&salt);
                 var sig_buf: [512]u8 = undefined;
                 const sig = rsa_sign.signPss(key, .sha256, &digest, &salt, &sig_buf) catch return error.SignatureFailed;
-                try appendU16(self.allocator, &body, @intFromEnum(tls_signature_scheme.SignatureScheme.rsa_pss_rsae_sha256));
+                try appendU16(self.allocator, &body, @backingInt(tls_signature_scheme.SignatureScheme.rsa_pss_rsae_sha256));
                 try appendU16(self.allocator, &body, @intCast(sig.len));
                 try body.appendSlice(self.allocator, sig);
             },
@@ -839,9 +839,9 @@ fn pickSuite(block: []const u8) ?CipherSuite {
     var i: usize = 0;
     while (i + 1 < block.len) : (i += 2) {
         const v = std.mem.readInt(u16, block[i..][0..2], .big);
-        if (v == @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256)) return .tls_aes_128_gcm_sha256;
-        if (v == @intFromEnum(CipherSuite.tls_aes_256_gcm_sha384)) has_aes256 = true;
-        if (v == @intFromEnum(CipherSuite.tls_chacha20_poly1305_sha256)) has_chacha = true;
+        if (v == @backingInt(CipherSuite.tls_aes_128_gcm_sha256)) return .tls_aes_128_gcm_sha256;
+        if (v == @backingInt(CipherSuite.tls_aes_256_gcm_sha384)) has_aes256 = true;
+        if (v == @backingInt(CipherSuite.tls_chacha20_poly1305_sha256)) has_chacha = true;
     }
     if (has_aes256) return .tls_aes_256_gcm_sha384;
     if (has_chacha) return .tls_chacha20_poly1305_sha256;
@@ -850,7 +850,7 @@ fn pickSuite(block: []const u8) ?CipherSuite {
 
 fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: HandshakeType, body: []const u8) Error!void {
     if (body.len > 0x00ff_ffff) return error.BadHandshake;
-    try out.append(allocator, @intFromEnum(typ));
+    try out.append(allocator, @backingInt(typ));
     try appendU24(allocator, out, body.len);
     try out.appendSlice(allocator, body);
 }
@@ -863,7 +863,7 @@ fn parseHandshakeMaybe(input: []const u8, offset: *usize) ?HandshakeMsg {
     const len = (@as(usize, input[1]) << 16) | (@as(usize, input[2]) << 8) | input[3];
     const body_end = 4 + len;
     if (input.len < body_end) return null;
-    const typ: HandshakeType = @enumFromInt(input[0]);
+    const typ: HandshakeType = @fromBackingInt(@intCast(input[0]));
     offset.* = body_end;
     return .{ .typ = typ, .body = input[4..body_end], .raw = input[0..body_end] };
 }
@@ -951,7 +951,7 @@ fn flightHasFinished(buf: []const u8) bool {
         const len = (@as(usize, buf[pos + 1]) << 16) | (@as(usize, buf[pos + 2]) << 8) | buf[pos + 3];
         const end = pos + 4 + len;
         if (end > buf.len) return false; // message not fully buffered yet
-        if (buf[pos] == @intFromEnum(HandshakeType.finished)) return true;
+        if (buf[pos] == @backingInt(HandshakeType.finished)) return true;
         pos = end;
     }
     return false;
@@ -1186,9 +1186,9 @@ pub const Client = struct {
 
         // cipher_suites: all three.
         try appendU16(self.allocator, &body, 6);
-        try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
-        try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_aes_256_gcm_sha384));
-        try appendU16(self.allocator, &body, @intFromEnum(CipherSuite.tls_chacha20_poly1305_sha256));
+        try appendU16(self.allocator, &body, @backingInt(CipherSuite.tls_aes_128_gcm_sha256));
+        try appendU16(self.allocator, &body, @backingInt(CipherSuite.tls_aes_256_gcm_sha384));
+        try appendU16(self.allocator, &body, @backingInt(CipherSuite.tls_chacha20_poly1305_sha256));
 
         try body.append(self.allocator, 1); // legacy_compression_methods len
         try body.append(self.allocator, 0); // null
@@ -1291,7 +1291,7 @@ pub const Client = struct {
         var it = tls_extension.Iterator.init(ext_block);
         var peer_share: ?[]const u8 = null;
         while (try it.next()) |ext| {
-            if (ext.ext_type == @intFromEnum(tls_extension.ExtensionType.key_share)) {
+            if (ext.ext_type == @backingInt(tls_extension.ExtensionType.key_share)) {
                 const entry = try tls_keyshare.parseServerShare(ext.data);
                 if (entry.group == .x25519 and entry.key_exchange.len == kx.X25519Kx.public_len) peer_share = entry.key_exchange;
             }
@@ -1307,7 +1307,7 @@ pub const Client = struct {
     fn parseEncryptedExtensions(self: *Client, body: []const u8) !void {
         var it = tls_extension.Iterator.init(try tls_extension.unwrap(body));
         while (try it.next()) |ext| {
-            if (ext.ext_type == @intFromEnum(tls_extension.ExtensionType.alpn)) {
+            if (ext.ext_type == @backingInt(tls_extension.ExtensionType.alpn)) {
                 var names = tls_alpn.Iterator.fromBlock(ext.data) catch continue;
                 if (names.next() catch null) |proto| {
                     if (proto.len <= self.selected_alpn_storage.len) {
@@ -1341,7 +1341,7 @@ pub const Client = struct {
         const sig_len = std.mem.readInt(u16, body[2..4], .big);
         if (body.len != 4 + @as(usize, sig_len)) return error.BadHandshake;
         const sig = body[4..];
-        if (scheme != @intFromEnum(tls_signature_scheme.SignatureScheme.ed25519)) return error.BadHandshake;
+        if (scheme != @backingInt(tls_signature_scheme.SignatureScheme.ed25519)) return error.BadHandshake;
         if (sig.len != Ed25519.Signature.encoded_length) return error.BadHandshake;
         var th: [max_hash_len]u8 = undefined;
         const th_len = self.transcriptHash(&th);
@@ -1687,7 +1687,7 @@ fn buildSingleSuiteHello(alloc: Allocator, client: *Client, only: CipherSuite) !
     try body.appendSlice(alloc, &client.client_random);
     try body.append(alloc, 0);
     try appendU16(alloc, &body, 2);
-    try appendU16(alloc, &body, @intFromEnum(only));
+    try appendU16(alloc, &body, @backingInt(only));
     try body.append(alloc, 1);
     try body.append(alloc, 0);
 
@@ -1781,7 +1781,7 @@ test "quic handshake rejects a ClientHello with no transport parameters" {
     try body.appendSlice(alloc, &(@as([32]u8, @splat(0x11))));
     try body.append(alloc, 0);
     try appendU16(alloc, &body, 2);
-    try appendU16(alloc, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+    try appendU16(alloc, &body, @backingInt(CipherSuite.tls_aes_128_gcm_sha256));
     try body.append(alloc, 1);
     try body.append(alloc, 0);
     var seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42));
@@ -1935,7 +1935,7 @@ test "quic handshake accepts an X25519MLKEM768 hybrid key_share and emits a hybr
     try body.appendSlice(alloc, &(@as([32]u8, @splat(0x11))));
     try body.append(alloc, 0); // empty legacy_session_id
     try appendU16(alloc, &body, 2);
-    try appendU16(alloc, &body, @intFromEnum(CipherSuite.tls_aes_128_gcm_sha256));
+    try appendU16(alloc, &body, @backingInt(CipherSuite.tls_aes_128_gcm_sha256));
     try body.append(alloc, 1);
     try body.append(alloc, 0); // null compression
 
@@ -1990,7 +1990,7 @@ test "quic handshake accepts an X25519MLKEM768 hybrid key_share and emits a hybr
     var found_hybrid = false;
     var sh_it = tls_extension.Iterator.init(sh_exts);
     while (try sh_it.next()) |ext| {
-        if (ext.ext_type == @intFromEnum(tls_extension.ExtensionType.key_share)) {
+        if (ext.ext_type == @backingInt(tls_extension.ExtensionType.key_share)) {
             const entry = try tls_keyshare.parseServerShare(ext.data);
             try testing.expectEqual(tls_keyshare.NamedGroup.x25519mlkem768, entry.group);
             try testing.expectEqual(@as(usize, hybrid_server_share_len), entry.key_exchange.len);

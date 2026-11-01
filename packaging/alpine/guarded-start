@@ -1,0 +1,6 @@
+#!/bin/sh
+# Executed by the actual supervisor under its retained service context.
+set -eu
+[ "$#" = 1 ] || exit 2
+/usr/libexec/onyx-server/runtime-preflight "$1" || exit 1
+exec /usr/bin/onyx-server --strict-existing-identity "$1"

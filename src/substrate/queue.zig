@@ -22,6 +22,11 @@ fn signedDiff(a: usize, b: usize) isize {
     return @as(isize, @bitCast(a -% b));
 }
 
+/// Whether a position precedes an exclusive cut, within half the counter range.
+pub fn precedesCut(position: usize, cut: usize) bool {
+    return signedDiff(position, cut) < 0;
+}
+
 /// Bounded multi-producer, multi-consumer queue.
 ///
 /// Capacity must be a non-zero power of two. Push returns `false` when the ring
@@ -46,6 +51,51 @@ pub fn BoundedMpmc(comptime T: type, comptime capacity: usize) type {
 
         pub fn init() Self {
             return .{};
+        }
+
+        /// Observe queued or producer-claimed positions, including unpublished
+        /// slots. This is not a quiescence barrier: callers must externally
+        /// synchronize producers and consumers and account for work already popped.
+        pub fn hasPending(self: *const Self) bool {
+            const head = self.head.load(.acquire);
+            const tail = self.tail.load(.acquire);
+            return head != tail;
+        }
+
+        pub const Positioned = struct { position: usize, item: T };
+
+        /// Exclusive producer claim watermark. A claim may not be published yet.
+        pub fn captureCut(self: *const Self) usize {
+            return self.tail.load(.acquire);
+        }
+
+        /// Counters are ordered modulo usize; keep a cut alive for less than
+        /// half the counter range. This reports dequeue, not completed custody.
+        pub fn consumedThrough(self: *const Self, cut: usize) bool {
+            return signedDiff(self.head.load(.acquire), cut) >= 0;
+        }
+
+        /// Pop only a position preceding cut. An unpublished head returns null
+        /// immediately. Concurrent consumers must obey the same cut discipline.
+        pub fn popThrough(self: *Self, cut: usize) ?Positioned {
+            var pos = self.head.load(.monotonic);
+            while (precedesCut(pos, cut)) {
+                const slot = &self.slots[pos & mask];
+                const seq = slot.seq.load(.acquire);
+                const diff = signedDiff(seq, pos +% 1);
+                if (diff == 0) {
+                    if (self.head.cmpxchgWeak(pos, pos +% 1, .monotonic, .monotonic)) |actual| {
+                        pos = actual;
+                        continue;
+                    }
+                    const item = slot.item;
+                    slot.seq.store(pos +% capacity, .release);
+                    return .{ .position = pos, .item = item };
+                }
+                if (diff < 0) return null;
+                pos = self.head.load(.monotonic);
+            }
+            return null;
         }
 
         pub fn push(self: *Self, item: T) bool {
@@ -155,6 +205,55 @@ pub fn Spsc(comptime T: type, comptime capacity: usize) type {
             return item;
         }
     };
+}
+
+test "mpmc cut stops at unpublished claim and excludes later positions across wrap" {
+    var q = BoundedMpmc(u32, 4).init();
+    const start = std.math.maxInt(usize) - 1;
+    q.head.store(start, .monotonic);
+    q.tail.store(start, .monotonic);
+    for (0..4) |i| {
+        const pos = start +% i;
+        q.slots[pos & 3].seq.store(pos, .monotonic);
+    }
+    try std.testing.expect(q.push(1));
+    const hole = q.tail.load(.monotonic);
+    try std.testing.expect(q.tail.cmpxchgStrong(hole, hole +% 1, .monotonic, .monotonic) == null);
+    const cut = q.captureCut();
+    try std.testing.expectEqual(@as(usize, 0), cut);
+    try std.testing.expect(q.push(3));
+    const first = q.popThrough(cut).?;
+    try std.testing.expectEqual(start, first.position);
+    try std.testing.expectEqual(@as(u32, 1), first.item);
+    try std.testing.expect(q.popThrough(cut) == null);
+    try std.testing.expect(!q.consumedThrough(cut));
+    q.slots[hole & 3].item = 2;
+    q.slots[hole & 3].seq.store(hole +% 1, .release);
+    const second = q.popThrough(cut).?;
+    try std.testing.expectEqual(hole, second.position);
+    try std.testing.expectEqual(@as(u32, 2), second.item);
+    try std.testing.expect(q.consumedThrough(cut));
+    try std.testing.expect(q.popThrough(cut) == null);
+    try std.testing.expectEqual(@as(?u32, 3), q.pop());
+}
+
+test "mpmc pending includes a claimed unpublished slot" {
+    var q = BoundedMpmc(u32, 4).init();
+    try std.testing.expect(!q.hasPending());
+    try std.testing.expect(q.push(7));
+    try std.testing.expect(q.hasPending());
+    try std.testing.expectEqual(@as(?u32, 7), q.pop());
+    try std.testing.expect(!q.hasPending());
+
+    // Reproduce push's successful tail claim before publishing the slot.
+    const pos = q.tail.load(.monotonic);
+    try std.testing.expect(q.tail.cmpxchgStrong(pos, pos +% 1, .monotonic, .monotonic) == null);
+    try std.testing.expect(q.hasPending());
+    try std.testing.expectEqual(@as(?u32, null), q.pop());
+    q.slots[pos & 3].item = 9;
+    q.slots[pos & 3].seq.store(pos +% 1, .release);
+    try std.testing.expectEqual(@as(?u32, 9), q.pop());
+    try std.testing.expect(!q.hasPending());
 }
 
 test "mpmc single-threaded fifo correctness" {

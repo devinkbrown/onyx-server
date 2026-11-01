@@ -2,7 +2,7 @@
 
 > **Historical release record (reconciled 2026-09-06).** This immutable
 > deployment note is retained for its exact artifact and acceptance evidence.
-> It predates the current 0.7.0 fleet; use [`onyx-server-paths.md`](onyx-server-paths.md)
+> It predates the current fleet (see `onyx-server-paths.md`); use [`onyx-server-paths.md`](onyx-server-paths.md)
 > for current paths, hash, service state, and mesh health.
 
 **Status:** dual-node production reload **completed**. Hotfix cut for guest E2EE capability negotiation.

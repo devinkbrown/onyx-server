@@ -144,17 +144,17 @@ const Writer = struct {
     }
 };
 
-const Reader = struct {
+pub const Reader = struct {
     bytes: []const u8,
     pos: usize = 0,
     alloc_bytes: usize = 0,
-    fn take(self: *Reader, len: usize) Error![]const u8 {
+    pub fn take(self: *Reader, len: usize) Error![]const u8 {
         if (len > self.bytes.len - self.pos) return error.InvalidSnapshot;
         const part = self.bytes[self.pos..][0..len];
         self.pos += len;
         return part;
     }
-    fn int(self: *Reader, comptime T: type) Error!T {
+    pub fn int(self: *Reader, comptime T: type) Error!T {
         const I = @Int(@typeInfo(T).int.signedness, @sizeOf(T) * 8);
         var buf: [@sizeOf(T)]u8 = undefined;
         @memcpy(&buf, try self.take(buf.len));
@@ -223,7 +223,7 @@ fn writeValue(w: *Writer, comptime T: type, value: T) void {
             const I = @Int(.unsigned, @sizeOf(T) * 8);
             w.int(I, @bitCast(value));
         },
-        .@"enum" => |e| w.int(e.tag_type, @intFromEnum(value)),
+        .@"enum" => |e| w.int(e.tag_type, @backingInt(value)),
         .optional => |o| {
             w.int(u8, @intFromBool(value != null));
             if (value) |v| writeValue(w, o.child, v);
@@ -242,7 +242,7 @@ fn writeValue(w: *Writer, comptime T: type, value: T) void {
         .@"union" => |u| {
             const Tag = u.tag_type orelse @compileError("HXWT rejects untagged unions");
             const tag: Tag = value;
-            w.int(@typeInfo(Tag).@"enum".tag_type, @intFromEnum(tag));
+            w.int(@typeInfo(Tag).@"enum".tag_type, @backingInt(tag));
             switch (value) {
                 inline else => |payload| writeValue(w, @TypeOf(payload), payload),
             }
@@ -251,7 +251,7 @@ fn writeValue(w: *Writer, comptime T: type, value: T) void {
     }
 }
 
-fn scanValue(r: *Reader, comptime T: type) Error!void {
+pub fn scanValue(r: *Reader, comptime T: type) Error!void {
     @setEvalBranchQuota(100_000);
     if (T == void) return;
     switch (@typeInfo(T)) {
@@ -396,22 +396,23 @@ pub fn freeEncoded(allocator: std.mem.Allocator, bytes: []u8) void {
     allocator.free(bytes);
 }
 
-pub fn encode(allocator: std.mem.Allocator, body: *const Body, tls: wt.TlsConfig, target_pid: u32) Error![]u8 {
-    try body.validate(tls, target_pid);
-    const body_len = try valueSize(Body, body.*);
+/// Shared canonical graph codec. The enclosing platform owns validation and
+/// descriptor custody; these helpers never serialize padding or pointers.
+pub fn encodeFramed(comptime T: type, allocator: std.mem.Allocator, value: T, comptime frame_magic: *const [4]u8, frame_version: u16, domain: []const u8) Error![]u8 {
+    const body_len = try valueSize(T, value);
     const total = try addSize(try addSize(header_len, body_len), digest_len);
     if (total > max_wire_bytes or body_len > std.math.maxInt(u32)) return error.Capacity;
     const bytes = try allocator.alloc(u8, total);
     errdefer freeEncoded(allocator, bytes);
     var w = Writer{ .bytes = bytes };
-    w.put(magic);
-    w.int(u16, version);
+    w.put(frame_magic);
+    w.int(u16, frame_version);
     w.int(u16, 0);
     w.int(u32, @intCast(body_len));
-    writeValue(&w, Body, body.*);
+    writeValue(&w, T, value);
     std.debug.assert(w.pos == total - digest_len);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(digest_domain);
+    hash.update(domain);
     hash.update(bytes[0..w.pos]);
     var digest: [digest_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &digest);
@@ -420,16 +421,16 @@ pub fn encode(allocator: std.mem.Allocator, body: *const Body, tls: wt.TlsConfig
     return bytes;
 }
 
-/// Complete syntax and allocation-budget scan before any candidate allocation.
-/// The caller must AEAD-authenticate `bytes` before calling this decoder.
-pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, tls: wt.TlsConfig, target_pid: u32) Error!Body {
-    if (bytes.len < header_len + digest_len or bytes.len > max_wire_bytes or !std.mem.eql(u8, bytes[0..4], magic)) return error.InvalidSnapshot;
+/// Complete syntax and allocation-budget scan without allocations. The caller
+/// must authenticate the outer Helix custody before trusting any descriptor.
+pub fn scanFramed(comptime T: type, bytes: []const u8, comptime frame_magic: *const [4]u8, frame_version: u16, domain: []const u8) Error![]const u8 {
+    if (bytes.len < header_len + digest_len or bytes.len > max_wire_bytes or !std.mem.eql(u8, bytes[0..4], frame_magic)) return error.InvalidSnapshot;
     var header = Reader{ .bytes = bytes[4..header_len] };
-    if (try header.int(u16) != version or try header.int(u16) != 0) return error.InvalidSnapshot;
+    if (try header.int(u16) != frame_version or try header.int(u16) != 0) return error.InvalidSnapshot;
     const body_len: usize = try header.int(u32);
     if (body_len != bytes.len - header_len - digest_len) return error.InvalidSnapshot;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(digest_domain);
+    hash.update(domain);
     hash.update(bytes[0 .. bytes.len - digest_len]);
     var expected: [digest_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &expected);
@@ -437,12 +438,41 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, tls: wt.TlsConfig
     const actual: [digest_len]u8 = bytes[bytes.len - digest_len ..][0..digest_len].*;
     if (!std.crypto.timing_safe.eql([digest_len]u8, expected, actual)) return error.InvalidSnapshot;
     var scan = Reader{ .bytes = bytes[header_len .. bytes.len - digest_len] };
-    try scanValue(&scan, Body);
+    try scanValue(&scan, T);
     if (scan.pos != scan.bytes.len) return error.InvalidSnapshot;
-    var read = Reader{ .bytes = scan.bytes };
-    var body = try readValue(&read, allocator, Body);
+    return scan.bytes;
+}
+
+pub fn decodeFramed(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8, comptime frame_magic: *const [4]u8, frame_version: u16, domain: []const u8) Error!T {
+    var read = Reader{ .bytes = try scanFramed(T, bytes, frame_magic, frame_version, domain) };
+    return readValue(&read, allocator, T);
+}
+
+/// Read a statically sized value without allocating. Reject slice/pointer use
+/// at compile time so descriptor relation checks remain allocation-free.
+pub fn readFixed(r: *Reader, comptime T: type) Error!T {
+    comptime assertFixed(T);
+    return readValue(r, undefined, T);
+}
+fn assertFixed(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .pointer => @compileError("readFixed rejects pointers and slices"),
+        .array => |a| assertFixed(a.child),
+        .optional => |o| assertFixed(o.child),
+        .@"struct" => |s| inline for (s.field_types) |F| assertFixed(F),
+        .@"union" => |u| inline for (u.field_types) |F| assertFixed(F),
+        else => {},
+    }
+}
+
+pub fn encode(allocator: std.mem.Allocator, body: *const Body, tls: wt.TlsConfig, target_pid: u32) Error![]u8 {
+    try body.validate(tls, target_pid);
+    return encodeFramed(Body, allocator, body.*, magic, version, digest_domain);
+}
+
+pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, tls: wt.TlsConfig, target_pid: u32) Error!Body {
+    var body = try decodeFramed(Body, allocator, bytes, magic, version, digest_domain);
     errdefer body.deinit(allocator);
-    if (read.pos != read.bytes.len) return error.InvalidSnapshot;
     try body.validate(tls, target_pid);
     return body;
 }

@@ -150,7 +150,7 @@ fn presentFrame(carry: *const history_http.Snapshot, config: *const tls_server.C
     std.mem.writeInt(u32, body[56..60], carry.listener.flow_info, .big);
     std.mem.writeInt(u64, body[60..68], carry.listener.recv_timeout_us, .big);
     @memcpy(body[68..100], &carry.tls_digest);
-    body[100] = @intFromEnum(carry.execution);
+    body[100] = @backingInt(carry.execution);
     std.mem.writeInt(u16, body[104..106], runtime.flags, .big);
     std.mem.writeInt(u16, body[106..108], runtime.receive_record_size_limit, .big);
     std.mem.writeInt(u32, body[108..112], runtime.ticket_lifetime_seconds, .big);
@@ -207,7 +207,7 @@ pub fn parseFrame(bytes: []const u8, target_pid: u32) Error!?Received {
         return null;
     }
     if (presence != 1 or target_pid == 0 or std.mem.readInt(u32, bytes[8..12], .big) != target_pid or
-        bytes[100] != @intFromEnum(history_http.Execution.paused) or
+        bytes[100] != @backingInt(history_http.Execution.paused) or
         !std.mem.eql(u8, bytes[101..104], &[_]u8{ 0, 0, 0 })) return error.InvalidFrame;
     const carry = history_http.Snapshot{
         .listener = .{
@@ -278,7 +278,7 @@ test "Windows history frame has canonical absence and strict loopback TLS fields
     try std.testing.expectEqualDeep(carry, received.carry);
     try std.testing.expectError(error.InvalidFrame, parseFrame(&body, pid + 1));
     var corrupt = body;
-    corrupt[100] = @intFromEnum(history_http.Execution.unstarted);
+    corrupt[100] = @backingInt(history_http.Execution.unstarted);
     try std.testing.expectError(error.InvalidFrame, parseFrame(&corrupt, pid));
     corrupt = body;
     corrupt[101] = 1;

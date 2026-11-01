@@ -746,11 +746,11 @@ fn paramModeKey(buf: []u8, key: state_mod.ParamModeKey) ![]const u8 {
 }
 
 fn banKey(buf: []u8, key: state_mod.BanKey) ![]const u8 {
-    return std.fmt.bufPrint(buf, "bans:{s}:{}:{s}", .{ key.channel.asSlice(), @intFromEnum(key.kind), key.mask.asSlice() });
+    return std.fmt.bufPrint(buf, "bans:{s}:{}:{s}", .{ key.channel.asSlice(), @backingInt(key.kind), key.mask.asSlice() });
 }
 
 fn banMetadataKey(buf: []u8, key: state_mod.BanKey) ![]const u8 {
-    return std.fmt.bufPrint(buf, "ban_metadata:{s}:{}:{s}", .{ key.channel.asSlice(), @intFromEnum(key.kind), key.mask.asSlice() });
+    return std.fmt.bufPrint(buf, "ban_metadata:{s}:{}:{s}", .{ key.channel.asSlice(), @backingInt(key.kind), key.mask.asSlice() });
 }
 
 fn topicKey(buf: []u8, channel: state_mod.ChannelName) ![]const u8 {
@@ -808,7 +808,7 @@ fn hashBooleanModeEntry(entry: anytype) anti_entropy.Hash {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update("onyx_server.suimyaku.state.boolean-mode.v1");
     updateBooleanModeKey(&h, entry.key);
-    updateU8(&h, @intFromEnum(entry.toggle.policy));
+    updateU8(&h, @backingInt(entry.toggle.policy));
     updateBool(&h, entry.toggle.enabled);
     updateHlc(&h, entry.toggle.hlc);
     updateU64(&h, entry.toggle.node_id);
@@ -943,7 +943,7 @@ fn updateParamModeKey(h: *std.crypto.hash.sha2.Sha256, key: state_mod.ParamModeK
 
 fn updateBanKey(h: *std.crypto.hash.sha2.Sha256, key: state_mod.BanKey) void {
     updateInline(h, key.channel);
-    updateU8(h, @intFromEnum(key.kind));
+    updateU8(h, @backingInt(key.kind));
     updateInline(h, key.mask);
 }
 

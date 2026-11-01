@@ -324,7 +324,7 @@ const WindowsSockets = struct {
                 .Completion,
             );
             if (status != .SUCCESS) {
-                std.debug.print("GAP-X1 windows iocp status=0x{x} op=associate\n", .{@intFromEnum(status)});
+                std.debug.print("GAP-X1 windows iocp status=0x{x} op=associate\n", .{@backingInt(status)});
                 return error.MissingOp;
             }
         }
@@ -1080,7 +1080,7 @@ test "IOCP cancellation identifies the original request" {
     cancelled_iosb.u.Status = .CANCELLED;
     const canceled_connect = Iocp.finishPosted(connecting, cancelled_iosb, "", null);
     try std.testing.expectEqual(Op.connect, canceled_connect.op);
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), canceled_connect.result);
+    try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.CANCELED)), canceled_connect.result);
 }
 
 test "IOCP ready queue preserves order while growing past one submit batch" {
@@ -1148,7 +1148,7 @@ test "Windows IOCP keeps slab status addresses stable across 320 pending accepts
         const count = try backend.reap(&events, 100);
         for (events[0..count]) |event| {
             try std.testing.expectEqual(Op.accept, event.op);
-            try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), event.result);
+            try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.CANCELED)), event.result);
             if (std.meta.eql(event.token, first)) seen_first = true else if (std.meta.eql(event.token, last)) seen_last = true else return error.UnexpectedToken;
         }
         if (seen_first and seen_last) break;
@@ -1196,7 +1196,7 @@ test "Windows IOCP quiesce releases never-posted token registrations" {
     try std.testing.expectEqual(@as(u32, 1), try backend.reap(&event, 1000));
     try std.testing.expectEqual(Op.accept, event[0].op);
     try std.testing.expectEqual(token, event[0].token);
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), event[0].result);
+    try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.CANCELED)), event[0].result);
 }
 
 test "IOCP AFD poll decodes output events instead of IOSB byte count" {
@@ -1230,7 +1230,7 @@ test "IOCP AFD poll decodes output events instead of IOSB byte count" {
     output.handles.handle = 0x9999;
     try std.testing.expectEqual(@as(i32, -1), Iocp.finishPosted(packet, iosb, "", &output).result);
     iosb.u.Status = .CANCELLED;
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), Iocp.finishPosted(packet, iosb, "", &output).result);
+    try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.CANCELED)), Iocp.finishPosted(packet, iosb, "", &output).result);
 }
 
 test "Windows IOCP AFD poll reports native loopback readiness masks" {
@@ -1313,7 +1313,7 @@ test "Windows IOCP ConnectEx completes loopback and cancels exact outbound token
             try std.testing.expectEqual(Op.connect, event.op);
             if (std.meta.eql(event.token, canceled_token)) {
                 try std.testing.expect(!seen_canceled);
-                try std.testing.expect(event.result == 0 or event.result == -@as(i32, @intFromEnum(linux.E.CANCELED)));
+                try std.testing.expect(event.result == 0 or event.result == -@as(i32, @backingInt(linux.E.CANCELED)));
                 seen_canceled = true;
             } else {
                 try std.testing.expectEqual(live_token, event.token);
@@ -2235,7 +2235,7 @@ const Kqueue = struct {
             self.changes[self.n - 1].canceled = .{
                 .op = opForKind(kind),
                 .token = token,
-                .result = -@as(i32, @intFromEnum(std.posix.E.CANCELED)),
+                .result = -@as(i32, @backingInt(std.posix.E.CANCELED)),
             };
             return;
         }
@@ -2512,8 +2512,8 @@ const Kqueue = struct {
             result = 0;
         } else {
             const err = positiveErrno();
-            if (err != @as(i32, @intFromEnum(std.posix.E.INPROGRESS)) and
-                err != @as(i32, @intFromEnum(std.posix.E.ALREADY))) result = -err;
+            if (err != @as(i32, @backingInt(std.posix.E.INPROGRESS)) and
+                err != @as(i32, @backingInt(std.posix.E.ALREADY))) result = -err;
         }
         if (result) |done| {
             try self.deleteFilterChecked(change.ident, evfilt_write);
@@ -2546,7 +2546,7 @@ const Kqueue = struct {
         var len: std.c.socklen_t = @sizeOf(c_int);
         if (std.c.getsockopt(@intCast(ident), std.c.SOL.SOCKET, std.c.SO.ERROR, &result, &len) < 0)
             return -positiveErrno();
-        if (len != @sizeOf(c_int)) return -@as(i32, @intFromEnum(std.posix.E.IO));
+        if (len != @sizeOf(c_int)) return -@as(i32, @backingInt(std.posix.E.IO));
         return -result;
     }
 
@@ -2563,7 +2563,7 @@ const Kqueue = struct {
         if (rc < 0) {
             // Signals wake the reactor without retiring any armed operation.
             // Return to its loop so stop/Helix state is observed promptly.
-            if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) return 0;
+            if (std.c._errno().* == @backingInt(std.c.E.INTR)) return 0;
             return error.MissingOp;
         }
         const got: usize = @intCast(rc);
@@ -2666,7 +2666,7 @@ const Kqueue = struct {
         var out: [1]std.c.Kevent = undefined;
         const timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
         if (std.c.kevent(self.fd, &batch, 1, &out, 0, &timeout) != 0) {
-            if (positiveErrno() == @as(i32, @intFromEnum(std.posix.E.NOENT))) return;
+            if (positiveErrno() == @as(i32, @backingInt(std.posix.E.NOENT))) return;
             return self.poison();
         }
     }
@@ -3706,7 +3706,7 @@ const Iocp = struct {
             iosb.u.Status = status;
             return true;
         }
-        std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @intFromEnum(status), packet.op });
+        std.debug.print("GAP-X1 windows iocp status=0x{x} op={d}\n", .{ @backingInt(status), packet.op });
         return error.MissingOp;
     }
 
@@ -3748,8 +3748,8 @@ const Iocp = struct {
         // A socket can close between dispatch and shutdown. Closing it
         // cancels outstanding I/O, and its completion still owns the IOSB
         // until the port delivers it. Continue draining that packet.
-        if (status != .SUCCESS and status != .NOT_FOUND and @intFromEnum(status) != 0xC0000008) {
-            std.debug.print("windows iocp cancel failed: status=0x{x} op={d}\n", .{ @intFromEnum(status), slot.packet.op });
+        if (status != .SUCCESS and status != .NOT_FOUND and @backingInt(status) != 0xC0000008) {
+            std.debug.print("windows iocp cancel failed: status=0x{x} op={d}\n", .{ @backingInt(status), slot.packet.op });
             return error.MissingOp;
         }
     }
@@ -3806,7 +3806,7 @@ const Iocp = struct {
                 continue;
             }
             if (status != .SUCCESS) {
-                std.debug.print("windows iocp dequeue failed: status=0x{x}\n", .{@intFromEnum(status)});
+                std.debug.print("windows iocp dequeue failed: status=0x{x}\n", .{@backingInt(status)});
                 return error.MissingOp;
             }
             const apc_addr = @intFromPtr(apc);
@@ -3837,7 +3837,7 @@ const Iocp = struct {
             op_connect => .connect,
             else => .cancel,
         };
-        if (iosb.u.Status == .CANCELLED) return .{ .op = op, .token = token, .result = -@as(i32, @intFromEnum(linux.E.CANCELED)) };
+        if (iosb.u.Status == .CANCELLED) return .{ .op = op, .token = token, .result = -@as(i32, @backingInt(linux.E.CANCELED)) };
         if (iosb.u.Status != .SUCCESS) return .{ .op = op, .token = token, .result = -1 };
         if (packet.op == op_accept) {
             // Linux tests call this decoder. The Winsock adopt is not
@@ -4254,7 +4254,7 @@ fn acceptOne(handle: usize) error{ WouldBlock, SocketFailed }!i32 {
 }
 
 fn closedConnection(status: std.os.windows.NTSTATUS) bool {
-    return switch (@intFromEnum(status)) {
+    return switch (@backingInt(status)) {
         // DISCONNECTED, RESET, LOCAL_DISCONNECT, REMOTE_DISCONNECT,
         // REFUSED, INVALID, ABORTED.
         0xC000020C, 0xC000020D, 0xC000013B, 0xC000013C, 0xC0000236, 0xC000023A, 0xC0000241 => true,
@@ -4343,7 +4343,7 @@ fn acceptSequence(listener: usize, out: []const u8) error{SocketFailed}!i32 {
             @panic("pending AFD accept wait failed");
         }
     } else if (status != .SUCCESS) {
-        std.debug.print("GAP-X1 windows afd accept status=0x{x} seq={d}\n", .{ @intFromEnum(status), sequence });
+        std.debug.print("GAP-X1 windows afd accept status=0x{x} seq={d}\n", .{ @backingInt(status), sequence });
         return error.SocketFailed;
     }
     if (iosb.u.Status != .SUCCESS) return error.SocketFailed;
@@ -5167,7 +5167,7 @@ test "BSD kqueue: interrupted wait preserves armed buffer and original completio
     defer if (!reaped) {
         _ = std.c.kill(child, .KILL);
         var status: c_int = 0;
-        while (std.c.waitpid(child, &status, 0) < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) {}
+        while (std.c.waitpid(child, &status, 0) < 0 and std.c._errno().* == @backingInt(std.c.E.INTR)) {}
     };
     closeSocket(control_pair[1]);
     control_pair[1] = -1;
@@ -5195,7 +5195,7 @@ test "BSD kqueue: interrupted wait preserves armed buffer and original completio
     try std.testing.expectEqual(@as(isize, 1), std.c.send(data_pair[0], "x", 1, std.c.MSG.NOSIGNAL));
     var status: c_int = 0;
     while (std.c.waitpid(child, &status, 0) < 0) {
-        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return error.TestUnexpectedResult;
+        if (std.c._errno().* != @backingInt(std.c.E.INTR)) return error.TestUnexpectedResult;
     }
     reaped = true;
     const bits: u32 = @bitCast(status);
@@ -5221,11 +5221,11 @@ test "BSD kqueue: broken-peer send survives default SIGPIPE disposition" {
         var byte = [_]u8{'x'};
         var reg = Kqueue.Reg{ .buf_ptr = @intFromPtr(&byte), .len = byte.len };
         const result = Kqueue.transfer(.send, @intCast(pair[0]), &reg);
-        std.c._exit(if (result == -@as(i32, @intFromEnum(std.c.E.PIPE))) 0 else 3);
+        std.c._exit(if (result == -@as(i32, @backingInt(std.c.E.PIPE))) 0 else 3);
     }
     var status: c_int = 0;
     while (std.c.waitpid(child, &status, 0) < 0) {
-        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return error.TestUnexpectedResult;
+        if (std.c._errno().* != @backingInt(std.c.E.INTR)) return error.TestUnexpectedResult;
     }
     const bits: u32 = @bitCast(status);
     try std.testing.expect(std.c.W.IFEXITED(bits));
@@ -5433,7 +5433,7 @@ test "BSD full reactor: connect accept exact cancel and refused connect preserve
     try ring.reapCompletions(&scratch, 0, &sink);
     try std.testing.expectEqual(@as(usize, 1), sink.n);
     try std.testing.expectEqual(recv_token, sink.rows[0].recv.token);
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), sink.rows[0].recv.res);
+    try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.CANCELED)), sink.rows[0].recv.res);
     sink.n = 0;
     try ring.reapCompletions(&scratch, 0, &sink);
     try std.testing.expectEqual(@as(usize, 0), sink.n);
@@ -5446,7 +5446,7 @@ test "BSD full reactor: connect accept exact cancel and refused connect preserve
     _ = try ring.submitAndWait(1);
     try ring.reapCompletions(&scratch, 0, &sink);
     try std.testing.expectEqual(next_accept, sink.rows[0].accept.token);
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CANCELED)), sink.rows[0].accept.res);
+    try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.CANCELED)), sink.rows[0].accept.res);
     sink.n = 0;
 
     // A send is one-shot: after readiness consumes bytes, no checked delete
@@ -5472,7 +5472,7 @@ test "BSD full reactor: connect accept exact cancel and refused connect preserve
             if (received >= 2) break;
         } else {
             try std.testing.expect(rc < 0);
-            try std.testing.expectEqual(@as(i32, @intFromEnum(std.posix.E.AGAIN)), Kqueue.positiveErrno());
+            try std.testing.expectEqual(@as(i32, @backingInt(std.posix.E.AGAIN)), Kqueue.positiveErrno());
         }
         const pause = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
         _ = std.c.nanosleep(&pause, null);
@@ -5480,7 +5480,7 @@ test "BSD full reactor: connect accept exact cancel and refused connect preserve
     try std.testing.expectEqual(@as(usize, 2), received);
     try std.testing.expectEqualStrings("ok", sent[0..2]);
     try std.testing.expectEqual(@as(isize, -1), std.c.recv(accepted, &sent, sent.len, 0));
-    try std.testing.expectEqual(@as(i32, @intFromEnum(std.posix.E.AGAIN)), Kqueue.positiveErrno());
+    try std.testing.expectEqual(@as(i32, @backingInt(std.posix.E.AGAIN)), Kqueue.positiveErrno());
 
     const refused_listener = try listenTcp("127.0.0.1", 0);
     closeSocket(refused_listener.fd);
@@ -5492,7 +5492,7 @@ test "BSD full reactor: connect accept exact cancel and refused connect preserve
     _ = try ring.submitAndWait(1);
     try ring.reapCompletions(&scratch, 0, &sink);
     try std.testing.expectEqual(@as(usize, 1), sink.n);
-    try std.testing.expectEqual(-@as(i32, @intFromEnum(linux.E.CONNREFUSED)), sink.rows[0].connect.res);
+    try std.testing.expectEqual(-@as(i32, @backingInt(linux.E.CONNREFUSED)), sink.rows[0].connect.res);
 }
 
 test "BSD full reactor: mixed delete receipt failure closes queue before cancellation publication" {

@@ -424,7 +424,7 @@ pub fn hashConfigValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) !void
             std.mem.writeInt(U, &bytes, @bitCast(@as(I, value)), .little);
             hash.update(&bytes);
         },
-        .@"enum" => try hashConfigValue(hash, @intFromEnum(value)),
+        .@"enum" => try hashConfigValue(hash, @backingInt(value)),
         .optional => {
             hash.update(&.{@intFromBool(value != null)});
             if (value) |inner| try hashConfigValue(hash, inner);

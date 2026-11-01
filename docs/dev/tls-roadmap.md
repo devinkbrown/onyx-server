@@ -1,5 +1,8 @@
 # TLS Hardening Roadmap
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 **2026-09-30 policy update:** GAP-K10 now refuses 0-RTT without a configured
 clock and a ticket carrying sealed issue time, age-add, and lifetime. Rejected
 freshness evidence consumes no replay slot; eligible 1-RTT resumption remains

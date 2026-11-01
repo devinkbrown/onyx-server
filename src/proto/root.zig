@@ -726,3 +726,19 @@ test {
     _ = x509;
     // gen:tests:end
 }
+
+// Private unadvertised guest-membership foundation discovery.
+pub const channel_name = @import("channel_name.zig");
+pub const guest_membership_snapshot = @import("guest_membership_snapshot.zig");
+pub const mesh_presence_v3 = @import("mesh_presence_v3.zig");
+test {
+    _ = channel_name;
+    _ = guest_membership_snapshot;
+    _ = mesh_presence_v3;
+}
+
+// Structural extension probe; no capability activation.
+pub const mesh_extension_probe = @import("mesh_extension_probe.zig");
+test {
+    _ = mesh_extension_probe;
+}

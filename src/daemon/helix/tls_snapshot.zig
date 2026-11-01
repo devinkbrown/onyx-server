@@ -192,7 +192,7 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
         try out.appendSlice(allocator, &rs.ku_prefix);
     }
     try out.appendSlice(allocator, &.{ snap.state.rx_open_control_type, snap.state.alert_prefix_len, snap.state.alert_prefix_byte, @intFromBool(snap.state.tx_ku_reply_pending), snap.state.tx_ku_reply_sent });
-    try out.append(allocator, @intFromEnum(snap.state.barrier_phase));
+    try out.append(allocator, @backingInt(snap.state.barrier_phase));
     try appendInt(&out, allocator, u32, snap.state.held_record_len);
     try appendInt(&out, allocator, u64, snap.kernel_tx_prefix_remaining);
     try appendInt(&out, allocator, u32, snap.control_charge);
@@ -657,7 +657,7 @@ test "TLS3: kernel RX partial control requires phase2 and cannot overlap reply o
         try testing.expectError(error.BadState, validate(bad));
         const wire = try a.dupe(u8, original);
         defer a.free(wire);
-        wire[wire.len - 29] = @intFromEnum(tls_conn.ControlBarrierPhase.none);
+        wire[wire.len - 29] = @backingInt(tls_conn.ControlBarrierPhase.none);
         try testing.expectError(error.BadState, decodeCurrent(wire));
         bad.tx_offloaded = true;
         bad.state.tx_ku_reply_pending = true;

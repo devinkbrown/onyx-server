@@ -151,14 +151,14 @@ pub const FsmState = enum(u8) {
     reclaimed = 0x03,
 
     pub fn tag(self: FsmState) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn fromTag(tag_value: u8) ?FsmState {
         return switch (tag_value) {
-            @intFromEnum(FsmState.offered) => .offered,
-            @intFromEnum(FsmState.accepted) => .accepted,
-            @intFromEnum(FsmState.reclaimed) => .reclaimed,
+            @backingInt(FsmState.offered) => .offered,
+            @backingInt(FsmState.accepted) => .accepted,
+            @backingInt(FsmState.reclaimed) => .reclaimed,
             else => null,
         };
     }
@@ -1109,10 +1109,9 @@ pub const MigrationOrigin = struct {
         defer self.allocator.free(snap_bytes);
 
         var capsule = blk: {
-            // The capsule borrows the token's owned fields by value-copying the
-            // struct; we keep an independent owned token to return, so re-mint a
-            // matching token copy for the capsule rather than aliasing the slice.
-            var capsule_token = try Token.mint(self.allocator, self.keypair, account, nonce, .offered, epoch, capsule_hash);
+            // Keep independently owned account storage while preserving the
+            // exact already-signed proof used by the returned token.
+            var capsule_token = try cloneToken(self.allocator, token);
             errdefer capsule_token.deinit(self.allocator);
 
             const owned_account = try self.allocator.dupe(u8, account);
@@ -1458,6 +1457,43 @@ test "origin.prepare -> target.accept round-trips a snapshot" {
     try testing.expectEqual(@as(u64, 1), target.metrics.accepted);
 }
 
+test "cloned migration proof owns account and matches independently minted complete frame" {
+    const allocator = testing.allocator;
+    const kp = try testKey(0x31);
+    const snapshot = sampleSnapshot();
+    const account = "Alice";
+    const nonce: u64 = 0x1234;
+    const epoch: u64 = 7;
+    var origin = MigrationOrigin.init(allocator, kp);
+    defer origin.deinit();
+    var prepared = try origin.prepare(account, snapshot, nonce, epoch);
+    defer prepared.deinit(allocator);
+    try testing.expect(try prepared.token.verify(allocator, origin.publicKey()));
+
+    // Reproduce the original second mint independently; never rely on the
+    // candidate's clone to construct this expected frame.
+    const hash = try capsulePayloadHash(allocator, account, snapshot);
+    var minted = try Token.mint(allocator, kp, account, nonce, .offered, epoch, hash);
+    defer minted.deinit(allocator);
+    try testing.expect(try minted.verify(allocator, origin.publicKey()));
+    try testing.expect(prepared.token.sameProof(minted));
+    const baseline = try encodeFrame(allocator, .offered, .{ .token = minted, .account = account, .snapshot = snapshot });
+    defer allocator.free(baseline);
+    try testing.expectEqualSlices(u8, baseline, prepared.frame_bytes);
+
+    var clone = try cloneToken(allocator, prepared.token);
+    defer clone.deinit(allocator);
+    try testing.expect(clone.account.ptr != prepared.token.account.ptr);
+    try testing.expectEqualStrings(prepared.token.account, clone.account);
+    try testing.expect(clone.sameProof(prepared.token));
+    try testing.expect(try clone.verify(allocator, origin.publicKey()));
+    var failed = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, cloneToken(failed.allocator(), prepared.token));
+    try testing.expectEqual(failed.allocated_bytes, failed.freed_bytes);
+    try testing.expect(try prepared.token.verify(allocator, origin.publicKey()));
+    try testing.expectEqualSlices(u8, baseline, prepared.frame_bytes);
+}
+
 test "portable migration outer account is bounded at every codec boundary" {
     const allocator = testing.allocator;
     const kp = try testKey(0x12);
@@ -1704,8 +1740,42 @@ test "target accept is retryable and logically unchanged at every allocation fai
     );
 }
 
+// Diagnostic-only backing allocator: reject resize/remap so every growth
+// fallback uses an explicit alloc/free pair seen by FailingAllocator.
+const DeterministicOomBacking = struct {
+    parent: std.mem.Allocator,
+    allocations: usize = 0,
+    frees: usize = 0,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawAlloc(len, alignment, ra) orelse return null;
+        self.allocations += 1;
+        return ptr;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, alignment, ra);
+        self.frees += 1;
+    }
+};
+
+test "diagnostic backing declines resize and remap and forwards allocation custody" {
+    var backing = DeterministicOomBacking{ .parent = testing.allocator };
+    const a = backing.allocator();
+    const bytes = try a.alloc(u8, 32);
+    try testing.expect(!a.rawResize(bytes, .fromByteUnits(1), 64, @returnAddress()));
+    try testing.expect(a.rawRemap(bytes, .fromByteUnits(1), 64, @returnAddress()) == null);
+    a.free(bytes);
+    try testing.expectEqual(@as(usize, 1), backing.allocations);
+    try testing.expectEqual(backing.allocations, backing.frees);
+}
+
 test "newer case-variant migration replacement rolls back to prior authority on every OOM" {
     const allocator = testing.allocator;
+    var backing = DeterministicOomBacking{ .parent = allocator };
     const kp = try testKey(0x3D);
     var source = MigrationOrigin.init(allocator, kp);
     defer source.deinit();
@@ -1748,7 +1818,7 @@ test "newer case-variant migration replacement rolls back to prior authority on 
         }
     };
     try testing.checkAllAllocationFailures(
-        allocator,
+        backing.allocator(),
         TargetSweep.run,
         .{
             source.publicKey(),
@@ -1781,7 +1851,9 @@ test "newer case-variant migration replacement rolls back to prior authority on 
             try testing.expectEqual(@as(u64, 2), origin.metrics.prepared);
         }
     };
-    try testing.checkAllAllocationFailures(allocator, OriginSweep.run, .{kp});
+    try testing.checkAllAllocationFailures(backing.allocator(), OriginSweep.run, .{kp});
+    try testing.expect(backing.allocations > 0);
+    try testing.expectEqual(backing.allocations, backing.frees);
 }
 
 test "reclaimToken matches only the right account" {

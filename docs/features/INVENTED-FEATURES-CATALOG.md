@@ -1,5 +1,8 @@
 # Onyx Server — invented feature catalog
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 *A speculative, source-grounded catalog of features the daemon does **not** have
 today. Written by `stack-architect` as design input, not as a commitment. The
 catalog is intentionally not a release checklist; use the current roadmap and

@@ -669,7 +669,7 @@ pub fn writeEntityClockKey(
 ) ?[]const u8 {
     const need = 1 + entity.len + 1 + key.len;
     if (out.len < need) return null;
-    out[0] = @intFromEnum(kind);
+    out[0] = @backingInt(kind);
     for (entity, 0..) |byte, index| out[1 + index] = std.ascii.toLower(byte);
     out[1 + entity.len] = 0x1f;
     for (key, 0..) |byte, index| out[1 + entity.len + 1 + index] = std.ascii.toLower(byte);
@@ -780,7 +780,7 @@ fn writeChannelRow(out: []u8, pos: *usize, clock: *const ChannelClock) void {
 }
 
 fn writeEntityRow(out: []u8, pos: *usize, clock: *const EntityClock) void {
-    out[pos.*] = @intFromEnum(clock.kind);
+    out[pos.*] = @backingInt(clock.kind);
     pos.* += 1;
     out[pos.*] = @intFromBool(clock.present);
     pos.* += 1;
@@ -1157,7 +1157,7 @@ fn testFindEntityRow(
         const lengths = readFiveLengths(bytes, &lengths_pos);
         var fields_pos = start + entity_row_prefix_len;
         const fields = readClockFields(bytes, &fields_pos, limit, lengths) catch return null;
-        if (bytes[start] == @intFromEnum(kind) and
+        if (bytes[start] == @backingInt(kind) and
             std.mem.eql(u8, fields.identity, entity) and
             std.mem.eql(u8, fields.key, key)) return start;
         pos = fields_pos;

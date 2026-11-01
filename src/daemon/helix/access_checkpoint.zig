@@ -140,7 +140,7 @@ pub fn encode(allocator: std.mem.Allocator, store: *const access.AccessStore) Er
         writer.writeByte(@intCast(entry.channel.len));
         writer.writeByte(@intCast(entry.mask.len));
         writer.writeByte(@intCast(entry.set_by.len));
-        writer.writeByte(@intFromEnum(entry.level));
+        writer.writeByte(@backingInt(entry.level));
         writer.writeByte(@intFromBool(entry.duration != null));
         writer.writeByte(@intFromBool(entry.expires_at != null));
         writer.writeBytes(entry.channel);
@@ -154,7 +154,7 @@ pub fn encode(allocator: std.mem.Allocator, store: *const access.AccessStore) Er
     for (store.tombstones.items) |marker| {
         writer.writeByte(@intCast(marker.channel.len));
         writer.writeByte(@intCast(marker.mask.len));
-        writer.writeByte(@intFromEnum(marker.level));
+        writer.writeByte(@backingInt(marker.level));
         writer.writeBytes(marker.channel);
         writer.writeBytes(marker.mask);
         writer.writeU64(marker.hlc);
@@ -314,7 +314,7 @@ fn identityHash(identity: Identity) usize {
     var hash: u64 = 0xcbf2_9ce4_8422_2325;
     for (identity.channel) |byte| hash = (hash ^ std.ascii.toLower(byte)) *% 0x100_0000_01b3;
     hash = (hash ^ 0xff) *% 0x100_0000_01b3;
-    hash = (hash ^ @as(u64, @intFromEnum(identity.level))) *% 0x100_0000_01b3;
+    hash = (hash ^ @as(u64, @backingInt(identity.level))) *% 0x100_0000_01b3;
     hash = (hash ^ 0xff) *% 0x100_0000_01b3;
     for (identity.mask) |byte| hash = (hash ^ std.ascii.toLower(byte)) *% 0x100_0000_01b3;
     return @intCast(hash);

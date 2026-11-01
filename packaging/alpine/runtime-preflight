@@ -1,0 +1,6 @@
+#!/bin/sh
+# The exact supervisor runtime UID asks the typed loader; never reads secrets here.
+set -eu
+[ "$#" = 1 ] || exit 2
+[ "$(id -u)" -gt 0 ] || exit 1
+exec /usr/bin/onyx-server --check-service-identity "$1"

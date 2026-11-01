@@ -262,7 +262,7 @@ const event_spine_facade = struct {
         }
 
         fn bit(category: Category) u64 {
-            return @as(u64, 1) << @intFromEnum(category);
+            return @as(u64, 1) << @backingInt(category);
         }
     };
 

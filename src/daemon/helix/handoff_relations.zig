@@ -12,7 +12,12 @@
 const std = @import("std");
 
 const capsule = @import("capsule.zig");
+const linux_webtransport = @import("linux_webtransport_checkpoint.zig");
 const event_spine_replay_guard = @import("../event_spine_replay_guard.zig");
+const host_presentation_snapshot = @import("host_presentation_snapshot.zig");
+const local_guest_issuer_capsule = @import("local_guest_issuer_capsule.zig");
+const physical_connection_relation = @import("physical_connection_relation.zig");
+const remote_presentation_snapshot = @import("remote_presentation_snapshot.zig");
 const attachment_delivery_spool = @import("../attachment_delivery_spool.zig");
 const e2ee_group_mesh_authority = @import("../e2ee_group_mesh_authority.zig");
 const relay_v2_event_log = @import("../relay_v2_event_log.zig");
@@ -80,6 +85,16 @@ pub const max_monitor_targets = 512;
 pub const max_silence_masks = 256;
 
 pub const Error = error{
+    InvalidLocalGuestIssuer,
+    MissingLocalGuestIssuer,
+    InvalidHostPresentation,
+    MissingHostPresentation,
+    MissingRemotePresentation,
+    DuplicateRemotePresentation,
+    InvalidRemotePresentation,
+    MissingPhysicalConnectionRelation,
+    DuplicatePhysicalConnectionRelation,
+    InvalidPhysicalConnectionRelation,
     InvalidStateFd,
     DuplicateStateFd,
     MissingStateFd,
@@ -164,12 +179,16 @@ pub const Error = error{
     InvalidDrain,
     DuplicateChanstats,
     InvalidChanstats,
+    MissingAccess,
     DuplicateAccess,
     InvalidAccess,
+    MissingSaccess,
     DuplicateSaccess,
     InvalidSaccess,
+    MissingAkick,
     DuplicateAkick,
     InvalidAkick,
+    MissingWard,
     DuplicateWard,
     InvalidWard,
     DuplicateResv,
@@ -225,9 +244,15 @@ pub const Error = error{
     DuplicateSpamtrap,
     InvalidSpamtrap,
     UnknownMeshCheckpoint,
+    InvalidWebTransport,
+    DuplicateWebTransport,
 };
 
 pub const Summary = struct {
+    local_guest_issuer: usize = 0,
+    host_presentation: usize = 0,
+    remote_presentation: usize = 0,
+    webtransport: usize = 0,
     clients: usize = 0,
     tls: usize = 0,
     websockets: usize = 0,
@@ -240,6 +265,7 @@ pub const Summary = struct {
     relay_v2_outbox: usize = 0,
     relay_v2_event_log: usize = 0,
     attachment_delivery_spool: usize = 0,
+    physical_connections: usize = 0,
     e2ee_group_mesh_authority: usize = 0,
     mesh_clock: usize = 0,
     oper_grants: usize = 0,
@@ -293,9 +319,98 @@ pub const Summary = struct {
 
 /// Validate decoded capsules after `live.verifyHandoffManifest` and before any
 /// successor state swap/adoption. `state_fds` is the authoritative environment
-/// manifest; its set must equal the client+S2S owning-fd set exactly.
+/// manifest; its set must equal the client, S2S, and WebTransport owning-fd set exactly.
+// Same already-enforced whole-handoff fd-manifest ceiling as live.zig.
+// Scratch is indexed by GLOBAL state-fd position, including native/UDP gaps.
+pub const max_state_fds: usize = 4096;
+const PhysicalFdIndex = struct { fd: i32, index: u32 };
+fn physicalFdLess(_: void, a: PhysicalFdIndex, b: PhysicalFdIndex) bool {
+    return a.fd < b.fd;
+}
+fn physicalFdIndex(rows: []const PhysicalFdIndex, fd: i32) ?u32 {
+    var lo: usize = 0;
+    var hi = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (rows[mid].fd == fd) return rows[mid].index;
+        if (rows[mid].fd < fd) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+pub const ValidatedCurrent = struct {
+    summary: Summary,
+    physical: physical_connection_relation.ValidatedView,
+    owner_count: usize,
+};
+
 pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32) Error!Summary {
+    if (state_fds.len > max_state_fds) return error.InvalidStateFd;
+    var scratch: [max_state_fds]u8 = undefined;
+    var owner_indices: [max_state_fds]physical_connection_relation.ExpectedOwner = undefined;
+    const validated = try validateCurrentWithScratch(capsules, state_fds, scratch[0..state_fds.len], owner_indices[0..state_fds.len]);
+    // Do not escape a ValidatedView borrowing this lexical scratch. Core uses
+    // the caller-funded form below through its complete adoption transaction.
+    return validated.summary;
+}
+
+pub fn validateCurrentWithScratch(capsules: []const capsule.Capsule, state_fds: []const i32, physical_scratch: []u8, owner_indices: []physical_connection_relation.ExpectedOwner) Error!ValidatedCurrent {
+    var summary = try validateCurrentBody(capsules, state_fds);
+    if (state_fds.len > max_state_fds or physical_scratch.len != state_fds.len or owner_indices.len != state_fds.len) return error.InvalidPhysicalConnectionRelation;
+    var relation: ?physical_connection_relation.View = null;
+    var fd_indices: [max_state_fds]PhysicalFdIndex = undefined;
+    for (state_fds, 0..) |fd, index| fd_indices[index] = .{ .fd = fd, .index = @intCast(index) };
+    std.mem.sort(PhysicalFdIndex, fd_indices[0..state_fds.len], {}, physicalFdLess);
+    if (state_fds.len > 1) for (fd_indices[1..state_fds.len], 0..) |row, index| if (row.fd == fd_indices[index].fd) return error.DuplicateStateFd;
+    var owner_count: usize = 0;
+    for (capsules) |item| {
+        if (item.header.kind == .physical_connection_relation) {
+            if (relation != null) return error.DuplicatePhysicalConnectionRelation;
+            const bytes = canonicalPayload(item, .physical_connection_relation) orelse return error.InvalidPhysicalConnectionRelation;
+            relation = physical_connection_relation.validateWire(bytes, max_state_fds, state_fds.len) catch return error.InvalidPhysicalConnectionRelation;
+        } else if (item.header.kind == .clients or item.header.kind == .s2s_link) {
+            const fd = (if (item.header.kind == .clients) session_snapshot.peekFd(item.fields[0].bytes) else s2s_snapshot.peekFd(item.fields[0].bytes)) orelse return error.MissingStateFd;
+            const owner_index = physicalFdIndex(fd_indices[0..state_fds.len], fd) orelse return error.MissingStateFd;
+            if (owner_count == owner_indices.len) return error.InvalidPhysicalConnectionRelation;
+            owner_indices[owner_count] = .{ .fd_index = owner_index, .role = if (item.header.kind == .s2s_link) .canonical_mesh else .client };
+            owner_count += 1;
+        }
+    }
+    const view = relation orelse return error.MissingPhysicalConnectionRelation;
+    const physical = physical_connection_relation.validateBijection(view, owner_indices[0..owner_count], state_fds.len, physical_scratch) catch return error.InvalidPhysicalConnectionRelation;
+    var host_view: ?host_presentation_snapshot.View = null;
+    for (capsules) |item| if (item.header.kind == .host_presentation) {
+        if (host_view != null) return error.InvalidHostPresentation;
+        const bytes = canonicalPayload(item, .host_presentation) orelse return error.InvalidHostPresentation;
+        host_view = host_presentation_snapshot.validateWire(bytes, .{ .rows = max_state_fds, .wire_bytes = 64 * 1024 * 1024 }) catch return error.InvalidHostPresentation;
+    };
+    const hosts = host_view orelse return error.MissingHostPresentation;
+    var host_rows = hosts.iterator();
+    var physical_rows = physical.iterator();
+    while (physical_rows.next()) |owner| {
+        if (owner.role != .client) continue;
+        const row = host_rows.next() orelse return error.InvalidHostPresentation;
+        if (row.physical != owner.old_client) return error.InvalidHostPresentation;
+        const snap = findClient(capsules, state_fds[owner.fd_index]) orelse return error.InvalidHostPresentation;
+        if (!std.mem.eql(u8, row.host, snap.host)) return error.InvalidHostPresentation;
+    }
+    if (host_rows.next() != null) return error.InvalidHostPresentation;
+    summary.host_presentation = 1;
+    summary.physical_connections = view.count;
+    return .{ .summary = summary, .physical = physical, .owner_count = owner_count };
+}
+
+fn validateCurrentBody(capsules: []const capsule.Capsule, state_fds: []const i32) Error!Summary {
     var summary: Summary = .{};
+    var guest_lease_index: ?u32 = null;
+    for (capsules) |item| if (item.header.kind == .local_guest_issuer) {
+        if (summary.local_guest_issuer != 0) return error.InvalidLocalGuestIssuer;
+        const bytes = canonicalPayload(item, .local_guest_issuer) orelse return error.InvalidLocalGuestIssuer;
+        guest_lease_index = local_guest_issuer_capsule.leaseFdIndex(bytes) catch return error.InvalidLocalGuestIssuer;
+        if (guest_lease_index) |index| if (index >= state_fds.len) return error.MissingStateFd;
+        summary.local_guest_issuer = 1;
+    };
+    if (summary.local_guest_issuer != 1) return error.MissingLocalGuestIssuer;
 
     for (state_fds, 0..) |fd, i| {
         if (fd < 0) return error.InvalidStateFd;
@@ -339,6 +454,27 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
         summary.s2s_links += 1;
     }
 
+    // The UDP listener and pump-side IRC bridges are distinct physical socket
+    // owners. Accepted bridge peers still belong to the ordinary client rows.
+    var webtransport: ?linux_webtransport.WireView = null;
+    for (capsules) |item| {
+        if (item.header.kind != .mesh_checkpoint or item.fields.len != 1 or
+            item.fields[0].ordinal != 1 or !linux_webtransport.isCurrent(item.fields[0].bytes)) continue;
+        if (webtransport != null) return error.DuplicateWebTransport;
+        const view = linux_webtransport.validateWire(item.fields[0].bytes) catch return error.InvalidWebTransport;
+        if (!containsFd(state_fds, view.udp_fd)) return error.MissingStateFd;
+        var bridges = view.bridgeIterator();
+        while (bridges.next()) |bridge| {
+            if (!containsFd(state_fds, bridge.fd)) return error.MissingStateFd;
+        }
+        var accepted = view.acceptedIterator();
+        while (accepted.next()) |row| {
+            const fd = std.math.cast(i32, row.fd) orelse return error.InvalidWebTransport;
+            if (findClient(capsules, fd) == null) return error.InvalidWebTransport;
+        }
+        webtransport = view;
+    }
+
     // Every authoritative fd must be claimed by exactly one owner.
     for (state_fds) |fd| {
         var owners: usize = 0;
@@ -353,6 +489,16 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             },
             else => {},
         };
+        if (guest_lease_index) |index| if (state_fds[index] == fd) {
+            owners += 1;
+        };
+        if (webtransport) |view| {
+            if (view.udp_fd == fd) owners += 1;
+            var bridges = view.bridgeIterator();
+            while (bridges.next()) |bridge| if (bridge.fd == fd) {
+                owners += 1;
+            };
+        }
         if (owners == 0) return error.OrphanStateFd;
         if (owners != 1) return error.DuplicateOwnerFd;
     }
@@ -447,6 +593,25 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             item.fields.len != 1 or item.fields[0].ordinal != 1)
             return error.UnknownMeshCheckpoint;
         const bytes = item.fields[0].bytes;
+        if (linux_webtransport.isCurrent(bytes)) {
+            if (item.header.min_supported != 2 or webtransport == null) return error.InvalidWebTransport;
+            summary.webtransport = 1;
+            continue;
+        }
+        if (remote_presentation_snapshot.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidRemotePresentation;
+            // The envelope itself bounds every count/string. Delegate the
+            // complete allocation-free parser to the independently reviewed leaf.
+            remote_presentation_snapshot.validateWire(bytes, .{
+                .max_projections = bytes.len,
+                .max_frontiers = bytes.len,
+                .max_string_bytes = bytes.len,
+                .max_wire_bytes = bytes.len,
+            }) catch return error.InvalidRemotePresentation;
+            if (summary.remote_presentation != 0) return error.DuplicateRemotePresentation;
+            summary.remote_presentation = 1;
+            continue;
+        }
         if (event_spine_replay_guard.isCheckpoint(bytes)) {
             if (item.header.min_supported != 2) return error.UnknownMeshCheckpoint;
             _ = event_spine_replay_guard.validateCheckpoint(bytes) catch
@@ -846,7 +1011,12 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
         }
         if (item.header.min_supported != descriptor.min_supported)
             return error.UnknownMeshCheckpoint;
-        if (session_replica.Store.isUpgradeCheckpoint(bytes)) continue;
+        if (session_replica.isCoreUpgradeCheckpoint(bytes)) {
+            _ = session_replica.decodeCoreUpgradeCheckpoint(bytes) catch return error.UnknownMeshCheckpoint;
+            continue;
+        }
+        // Recognizable bare Store state omits mandatory Core retry progress.
+        if (session_replica.Store.isUpgradeCheckpoint(bytes)) return error.UnknownMeshCheckpoint;
         if (!mesh_redial.isCurrent(bytes)) return error.UnknownMeshCheckpoint;
         const redial = mesh_redial.decodeCurrent(bytes) catch return error.InvalidRedial;
         for (capsules[0..index]) |prior| {
@@ -866,6 +1036,13 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
     if (summary.attachment_delivery_spool != 1) return error.MissingAttachmentDeliverySpool;
     if (summary.e2ee_group_mesh_authority != 1) return error.MissingE2eeGroupMeshAuthority;
     if (summary.mesh_clock != 1) return error.MissingMeshClock;
+    // Moderation authority is mandatory on every operating system. An absent
+    // store must never become an empty successor registry after exec.
+    if (summary.access != 1) return error.MissingAccess;
+    if (summary.saccess != 1) return error.MissingSaccess;
+    if (summary.akick != 1) return error.MissingAkick;
+    if (summary.ward != 1) return error.MissingWard;
+    if (summary.remote_presentation != 1) return error.MissingRemotePresentation;
     // `oper_grants` is deliberately AT-MOST-once, not required: an arena sealed
     // by a pre-checkpoint predecessor simply lacks the piece and must still
     // adopt (empty registry = the exact pre-checkpoint behavior), mirroring how
@@ -1036,6 +1213,141 @@ fn testMeshClockCap(bytes: []const u8, field: *[1]capsule.Field) capsule.Capsule
     return cap;
 }
 
+// Existing transport/replay tests still supply the mandatory policy stores;
+// their empty contents isolate those tests without relaxing production checks.
+const PolicyStoresForTest = struct {
+    bytes: [4][]u8 = undefined,
+    fields: [4][1]capsule.Field = undefined,
+    caps: [4]capsule.Capsule = undefined,
+
+    fn init(self: *PolicyStoresForTest, allocator: std.mem.Allocator) !void {
+        var access = @import("../../proto/ircx_access_store.zig").AccessStore.init(allocator);
+        defer access.deinit();
+        var saccess = @import("../../proto/ircx_saccess.zig").ServerAccessStore.init(allocator);
+        defer saccess.deinit();
+        var akick = @import("../svc_akick.zig").AkickStore.init(allocator);
+        defer akick.deinit();
+        var ward = @import("../warden.zig").Registry.init(allocator, .{});
+        defer ward.deinit();
+        const a = try access_checkpoint.encode(allocator, &access);
+        errdefer allocator.free(a);
+        const s = try saccess_checkpoint.encode(allocator, &saccess);
+        errdefer allocator.free(s);
+        const k = try akick_checkpoint.encode(allocator, &akick);
+        errdefer allocator.free(k);
+        const w = try ward_checkpoint.encode(allocator, &ward);
+        self.bytes = .{ a, s, k, w };
+        for (self.bytes, 0..) |bytes, i| {
+            self.fields[i] = .{.{ .ordinal = 1, .bytes = bytes }};
+            self.caps[i] = capsule.make(.mesh_checkpoint, &self.fields[i]);
+            self.caps[i].header.min_supported = 2;
+        }
+    }
+
+    fn deinit(self: *PolicyStoresForTest, allocator: std.mem.Allocator) void {
+        for (self.bytes) |bytes| allocator.free(bytes);
+    }
+};
+
+// Codec-only fixtures carry explicit synthetic intent; this does not prove
+// source authority. Core's real capture/adopt tests supply the positive proof.
+fn validateWithHostRowsForTest(caps: []const capsule.Capsule, fds: []const i32) !Summary {
+    const a = std.testing.allocator;
+    for (caps) |item| if (item.header.kind == .host_presentation) return validateCurrent(caps, fds);
+    var rows: std.ArrayList(host_presentation_snapshot.Row) = .empty;
+    defer rows.deinit(a);
+    for (caps) |item| {
+        if (item.header.kind != .physical_connection_relation) continue;
+        const bytes = canonicalPayload(item, .physical_connection_relation) orelse return error.InvalidPhysicalConnectionRelation;
+        const view = physical_connection_relation.validateWire(bytes, max_state_fds, fds.len) catch return error.InvalidPhysicalConnectionRelation;
+        var entries = view.iterator();
+        while (entries.next()) |entry| {
+            if (entry.role != .client) continue;
+            if (entry.fd_index >= fds.len) return validateCurrent(caps, fds);
+            var host: ?[]const u8 = null;
+            for (caps) |candidate| {
+                if (candidate.header.kind != .clients) continue;
+                const snap = session_snapshot.decodeCurrent(candidate.fields[0].bytes) catch return error.InvalidClient;
+                if (snap.fd == fds[entry.fd_index]) host = snap.host;
+            }
+            try rows.append(a, .{ .physical = entry.old_client, .source = .unknown, .host = host orelse return validateCurrent(caps, fds) });
+        }
+    }
+    const wire = try host_presentation_snapshot.encode(a, .{ .account_cloak = false, .rows = rows.items }, .{ .rows = max_state_fds, .wire_bytes = 64 * 1024 * 1024 });
+    defer a.free(wire);
+    const complete = try a.alloc(capsule.Capsule, caps.len + 1);
+    defer a.free(complete);
+    @memcpy(complete[0..caps.len], caps);
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = wire }};
+    complete[caps.len] = capsule.make(.host_presentation, &fields);
+    return validateCurrent(complete, fds);
+}
+
+fn validateWithEmptyPolicyStoresForTest(caps: []const capsule.Capsule, fds: []const i32) !Summary {
+    const allocator = std.testing.allocator;
+    var stores: PolicyStoresForTest = .{};
+    try stores.init(allocator);
+    defer stores.deinit(allocator);
+    const complete = try allocator.alloc(capsule.Capsule, caps.len + stores.caps.len + 3);
+    defer allocator.free(complete);
+    const family_count = caps.len + stores.caps.len;
+    @memcpy(complete[0..caps.len], caps);
+    @memcpy(complete[caps.len..family_count], &stores.caps);
+    const presentation = try remote_presentation_snapshot.encode(allocator, &.{}, .{
+        .max_projections = 0,
+        .max_frontiers = 0,
+        .max_string_bytes = 0,
+        .max_wire_bytes = 16,
+    });
+    defer allocator.free(presentation);
+    var presentation_fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = presentation }};
+    var used = family_count;
+    const disabled_guest = "LGI1\x01\x00";
+    var guest_fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = disabled_guest }};
+    var has_guest = false;
+    for (caps) |item| if (item.header.kind == .local_guest_issuer) {
+        has_guest = true;
+    };
+    if (!has_guest) {
+        complete[used] = capsule.make(.local_guest_issuer, &guest_fields);
+        used += 1;
+    }
+    var has_presentation = false;
+    for (caps) |item| if (item.header.kind == .mesh_checkpoint and item.fields.len == 1 and remote_presentation_snapshot.isCheckpoint(item.fields[0].bytes)) {
+        has_presentation = true;
+    };
+    if (!has_presentation) {
+        complete[used] = capsule.make(.mesh_checkpoint, &presentation_fields);
+        complete[used].header.min_supported = 2;
+        used += 1;
+    }
+    // Preserve these pre-existing family-specific negative oracles before
+    // adding the newly mandatory relation. These are codec-only wire images,
+    // not a producer proof of any real SessionStore or source connection.
+    _ = try validateCurrentBody(complete[0..used], fds);
+    for (caps) |item| if (item.header.kind == .physical_connection_relation) return validateWithHostRowsForTest(complete[0..used], fds);
+    var rows: std.ArrayList(physical_connection_relation.Entry) = .empty;
+    defer rows.deinit(allocator);
+    for (caps, 0..) |item, ordinal| {
+        const fd = switch (item.header.kind) {
+            .clients => session_snapshot.peekFd(item.fields[0].bytes) orelse return error.InvalidClient,
+            .s2s_link => s2s_snapshot.peekFd(item.fields[0].bytes) orelse return error.InvalidS2s,
+            else => continue,
+        };
+        var fd_index: ?u32 = null;
+        for (fds, 0..) |candidate, index| if (candidate == fd) {
+            fd_index = @intCast(index);
+            break;
+        };
+        try rows.append(allocator, .{ .old_client = @intCast(ordinal), .fd_index = fd_index orelse return error.MissingStateFd, .role = if (item.header.kind == .s2s_link) .canonical_mesh else .client });
+    }
+    const relation = try physical_connection_relation.encode(allocator, rows.items, max_state_fds);
+    defer allocator.free(relation);
+    var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = relation }};
+    complete[used] = capsule.make(.physical_connection_relation, &fields);
+    return validateWithHostRowsForTest(complete[0 .. used + 1], fds);
+}
+
 test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC and HXWM custody" {
     const allocator = std.testing.allocator;
     const event_replay = try testEventSpineReplayCheckpoint(allocator);
@@ -1127,7 +1439,7 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var caps: [pieces.len]capsule.Capsule = undefined;
     _ = makeTestCaps(&pieces, &fields, &caps);
     for (&caps) |*cap| cap.header.min_supported = 2;
-    const summary = try validateCurrent(&caps, &.{});
+    const summary = try validateWithEmptyPolicyStoresForTest(&caps, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.policy);
     try std.testing.expectEqual(@as(usize, 1), summary.operator_state);
     try std.testing.expectEqual(@as(usize, 1), summary.tls_material);
@@ -1136,14 +1448,14 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     try std.testing.expectEqual(@as(usize, 1), summary.acme);
     try std.testing.expectEqual(@as(usize, 1), summary.wasm);
     try std.testing.expectEqual(@as(usize, 1), summary.memo_inbox);
-    try std.testing.expectError(error.DuplicatePolicy, validateCurrent(&.{ caps[7], caps[7] }, &.{}));
-    try std.testing.expectError(error.DuplicateOperatorState, validateCurrent(&.{ caps[8], caps[8] }, &.{}));
-    try std.testing.expectError(error.DuplicateTlsMaterial, validateCurrent(&.{ caps[9], caps[9] }, &.{}));
-    try std.testing.expectError(error.DuplicateTlsReplay, validateCurrent(&.{ caps[10], caps[10] }, &.{}));
-    try std.testing.expectError(error.DuplicateHistoryMaterial, validateCurrent(&.{ caps[13], caps[13] }, &.{}));
-    try std.testing.expectError(error.DuplicateAcme, validateCurrent(&.{ caps[11], caps[11] }, &.{}));
-    try std.testing.expectError(error.DuplicateWasm, validateCurrent(&.{ caps[12], caps[12] }, &.{}));
-    try std.testing.expectError(error.DuplicateMemoInbox, validateCurrent(&.{ caps[14], caps[14] }, &.{}));
+    try std.testing.expectError(error.DuplicatePolicy, validateWithEmptyPolicyStoresForTest(&.{ caps[7], caps[7] }, &.{}));
+    try std.testing.expectError(error.DuplicateOperatorState, validateWithEmptyPolicyStoresForTest(&.{ caps[8], caps[8] }, &.{}));
+    try std.testing.expectError(error.DuplicateTlsMaterial, validateWithEmptyPolicyStoresForTest(&.{ caps[9], caps[9] }, &.{}));
+    try std.testing.expectError(error.DuplicateTlsReplay, validateWithEmptyPolicyStoresForTest(&.{ caps[10], caps[10] }, &.{}));
+    try std.testing.expectError(error.DuplicateHistoryMaterial, validateWithEmptyPolicyStoresForTest(&.{ caps[13], caps[13] }, &.{}));
+    try std.testing.expectError(error.DuplicateAcme, validateWithEmptyPolicyStoresForTest(&.{ caps[11], caps[11] }, &.{}));
+    try std.testing.expectError(error.DuplicateWasm, validateWithEmptyPolicyStoresForTest(&.{ caps[12], caps[12] }, &.{}));
+    try std.testing.expectError(error.DuplicateMemoInbox, validateWithEmptyPolicyStoresForTest(&.{ caps[14], caps[14] }, &.{}));
 
     const corrupt_memo = try allocator.dupe(u8, memo_inbox);
     defer allocator.free(corrupt_memo);
@@ -1151,10 +1463,10 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var corrupt_memo_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_memo }};
     var corrupt_memo_cap = capsule.make(.mesh_checkpoint, &corrupt_memo_field);
     corrupt_memo_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidMemoInbox, validateCurrent(&.{corrupt_memo_cap}, &.{}));
+    try std.testing.expectError(error.InvalidMemoInbox, validateWithEmptyPolicyStoresForTest(&.{corrupt_memo_cap}, &.{}));
     var downgraded_memo_cap = caps[14];
     downgraded_memo_cap.header.min_supported = 1;
-    try std.testing.expectError(error.InvalidMemoInbox, validateCurrent(&.{downgraded_memo_cap}, &.{}));
+    try std.testing.expectError(error.InvalidMemoInbox, validateWithEmptyPolicyStoresForTest(&.{downgraded_memo_cap}, &.{}));
 
     const corrupt_policy = try allocator.dupe(u8, policy);
     defer allocator.free(corrupt_policy);
@@ -1162,7 +1474,7 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var corrupt_policy_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_policy }};
     var corrupt_policy_cap = capsule.make(.mesh_checkpoint, &corrupt_policy_field);
     corrupt_policy_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidPolicy, validateCurrent(&.{corrupt_policy_cap}, &.{}));
+    try std.testing.expectError(error.InvalidPolicy, validateWithEmptyPolicyStoresForTest(&.{corrupt_policy_cap}, &.{}));
 
     const corrupt_operator = try allocator.dupe(u8, operator_state);
     defer allocator.free(corrupt_operator);
@@ -1170,7 +1482,7 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var corrupt_operator_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_operator }};
     var corrupt_operator_cap = capsule.make(.mesh_checkpoint, &corrupt_operator_field);
     corrupt_operator_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidOperatorState, validateCurrent(&.{corrupt_operator_cap}, &.{}));
+    try std.testing.expectError(error.InvalidOperatorState, validateWithEmptyPolicyStoresForTest(&.{corrupt_operator_cap}, &.{}));
 
     const corrupt_tls = try allocator.dupe(u8, tls_material);
     defer native_windows_tls_material.freeEncoded(allocator, corrupt_tls);
@@ -1178,7 +1490,7 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var corrupt_tls_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_tls }};
     var corrupt_tls_cap = capsule.make(.mesh_checkpoint, &corrupt_tls_field);
     corrupt_tls_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidTlsMaterial, validateCurrent(&.{corrupt_tls_cap}, &.{}));
+    try std.testing.expectError(error.InvalidTlsMaterial, validateWithEmptyPolicyStoresForTest(&.{corrupt_tls_cap}, &.{}));
 
     const corrupt_replay = try allocator.dupe(u8, tls_replay);
     defer allocator.free(corrupt_replay);
@@ -1186,14 +1498,14 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var corrupt_replay_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_replay }};
     var corrupt_replay_cap = capsule.make(.mesh_checkpoint, &corrupt_replay_field);
     corrupt_replay_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidTlsReplay, validateCurrent(&.{corrupt_replay_cap}, &.{}));
+    try std.testing.expectError(error.InvalidTlsReplay, validateWithEmptyPolicyStoresForTest(&.{corrupt_replay_cap}, &.{}));
     var downgraded_replay_cap = caps[10];
     downgraded_replay_cap.header.min_supported = 1;
-    try std.testing.expectError(error.InvalidTlsReplay, validateCurrent(&.{downgraded_replay_cap}, &.{}));
+    try std.testing.expectError(error.InvalidTlsReplay, validateWithEmptyPolicyStoresForTest(&.{downgraded_replay_cap}, &.{}));
     var future_replay_cap = caps[10];
     future_replay_cap.header.version += 1;
     future_replay_cap.header.max_supported += 1;
-    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{future_replay_cap}, &.{}));
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateWithEmptyPolicyStoresForTest(&.{future_replay_cap}, &.{}));
 
     const corrupt_history = try allocator.dupe(u8, history_material);
     defer native_windows_history_material.freeEncoded(allocator, corrupt_history);
@@ -1201,14 +1513,14 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var corrupt_history_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_history }};
     var corrupt_history_cap = capsule.make(.mesh_checkpoint, &corrupt_history_field);
     corrupt_history_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidHistoryMaterial, validateCurrent(&.{corrupt_history_cap}, &.{}));
+    try std.testing.expectError(error.InvalidHistoryMaterial, validateWithEmptyPolicyStoresForTest(&.{corrupt_history_cap}, &.{}));
     var downgraded_history_cap = caps[13];
     downgraded_history_cap.header.min_supported = 1;
-    try std.testing.expectError(error.InvalidHistoryMaterial, validateCurrent(&.{downgraded_history_cap}, &.{}));
+    try std.testing.expectError(error.InvalidHistoryMaterial, validateWithEmptyPolicyStoresForTest(&.{downgraded_history_cap}, &.{}));
     var future_history_cap = caps[13];
     future_history_cap.header.version += 1;
     future_history_cap.header.max_supported += 1;
-    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{future_history_cap}, &.{}));
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateWithEmptyPolicyStoresForTest(&.{future_history_cap}, &.{}));
 
     const corrupt_acme = try allocator.dupe(u8, acme);
     defer allocator.free(corrupt_acme);
@@ -1216,7 +1528,7 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var corrupt_acme_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_acme }};
     var corrupt_acme_cap = capsule.make(.mesh_checkpoint, &corrupt_acme_field);
     corrupt_acme_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidAcme, validateCurrent(&.{corrupt_acme_cap}, &.{}));
+    try std.testing.expectError(error.InvalidAcme, validateWithEmptyPolicyStoresForTest(&.{corrupt_acme_cap}, &.{}));
 
     const corrupt_wasm = try allocator.dupe(u8, wasm_state);
     defer native_windows_wasm.freeEncoded(allocator, corrupt_wasm);
@@ -1224,7 +1536,7 @@ test "current handoff relations validate unique POLY HXOP HXTM HXRG HXHL HXAC an
     var corrupt_wasm_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt_wasm }};
     var corrupt_wasm_cap = capsule.make(.mesh_checkpoint, &corrupt_wasm_field);
     corrupt_wasm_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidWasm, validateCurrent(&.{corrupt_wasm_cap}, &.{}));
+    try std.testing.expectError(error.InvalidWasm, validateWithEmptyPolicyStoresForTest(&.{corrupt_wasm_cap}, &.{}));
 }
 
 test "current handoff relations accept exact mixed client sidecars S2S and redial" {
@@ -1312,7 +1624,7 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
             hasPrefix(cap.fields[0].bytes, &mesh_clock_snapshot.magic))
             cap.header.min_supported = 2;
     }
-    const summary = try validateCurrent(current, &.{ 10, 11, 20 });
+    const summary = try validateWithEmptyPolicyStoresForTest(current, &.{ 10, 11, 20 });
     try std.testing.expectEqual(@as(usize, 2), summary.clients);
     try std.testing.expectEqual(@as(usize, 1), summary.tls);
     try std.testing.expectEqual(@as(usize, 1), summary.websockets);
@@ -1341,7 +1653,7 @@ test "current handoff relations accept exact mixed client sidecars S2S and redia
     fields[8][0].bytes = s2s_v2;
     caps[8].header.version = 2;
     caps[8].header.max_supported = 2;
-    try std.testing.expectError(error.InvalidS2s, validateCurrent(current, &.{ 10, 11, 20 }));
+    try std.testing.expectError(error.InvalidS2s, validateWithEmptyPolicyStoresForTest(current, &.{ 10, 11, 20 }));
 }
 
 test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard)" {
@@ -1400,7 +1712,7 @@ test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard
     caps[1].header.version = 1;
     caps[1].header.min_supported = 1;
     caps[1].header.max_supported = 1;
-    try std.testing.expectError(error.InvalidTls, validateCurrent(&caps, &.{10}));
+    try std.testing.expectError(error.InvalidTls, validateWithEmptyPolicyStoresForTest(&caps, &.{10}));
 }
 
 test "current handoff relations reject missing duplicate orphan and unexpected transport sidecars" {
@@ -1465,25 +1777,25 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     var base_caps: [base.len]capsule.Capsule = undefined;
     _ = makeTestCaps(&base, &base_fields, &base_caps);
     for (base_caps[base_caps.len - 7 ..]) |*cap| cap.header.min_supported = 2;
-    _ = try validateCurrent(&base_caps, &.{ 10, 11 });
+    _ = try validateWithEmptyPolicyStoresForTest(&base_caps, &.{ 10, 11 });
 
-    try std.testing.expectError(error.MissingTls, validateCurrent(&.{ base_caps[0], base_caps[1], base_caps[3] }, &.{ 10, 11 }));
-    try std.testing.expectError(error.DuplicateTls, validateCurrent(&.{ base_caps[0], base_caps[1], base_caps[2], base_caps[2], base_caps[3] }, &.{ 10, 11 }));
+    try std.testing.expectError(error.MissingTls, validateWithEmptyPolicyStoresForTest(&.{ base_caps[0], base_caps[1], base_caps[3] }, &.{ 10, 11 }));
+    try std.testing.expectError(error.DuplicateTls, validateWithEmptyPolicyStoresForTest(&.{ base_caps[0], base_caps[1], base_caps[2], base_caps[2], base_caps[3] }, &.{ 10, 11 }));
     var orphan_tls_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = tls99 }};
     const orphan_tls = capsule.make(.tls_session, &orphan_tls_field);
-    try std.testing.expectError(error.OrphanTls, validateCurrent(&.{ base_caps[0], base_caps[1], orphan_tls, base_caps[3] }, &.{ 10, 11 }));
+    try std.testing.expectError(error.OrphanTls, validateWithEmptyPolicyStoresForTest(&.{ base_caps[0], base_caps[1], orphan_tls, base_caps[3] }, &.{ 10, 11 }));
     var unexpected_tls_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = tls11 }};
     const unexpected_tls = capsule.make(.tls_session, &unexpected_tls_field);
-    try std.testing.expectError(error.UnexpectedTls, validateCurrent(&.{ base_caps[0], base_caps[1], unexpected_tls, base_caps[3] }, &.{ 10, 11 }));
+    try std.testing.expectError(error.UnexpectedTls, validateWithEmptyPolicyStoresForTest(&.{ base_caps[0], base_caps[1], unexpected_tls, base_caps[3] }, &.{ 10, 11 }));
 
-    try std.testing.expectError(error.MissingWebSocket, validateCurrent(&.{ base_caps[0], base_caps[1], base_caps[2] }, &.{ 10, 11 }));
-    try std.testing.expectError(error.DuplicateWebSocket, validateCurrent(&.{ base_caps[0], base_caps[1], base_caps[2], base_caps[3], base_caps[3] }, &.{ 10, 11 }));
+    try std.testing.expectError(error.MissingWebSocket, validateWithEmptyPolicyStoresForTest(&.{ base_caps[0], base_caps[1], base_caps[2] }, &.{ 10, 11 }));
+    try std.testing.expectError(error.DuplicateWebSocket, validateWithEmptyPolicyStoresForTest(&.{ base_caps[0], base_caps[1], base_caps[2], base_caps[3], base_caps[3] }, &.{ 10, 11 }));
     var orphan_ws_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = ws99 }};
     const orphan_ws = capsule.make(.ws_session, &orphan_ws_field);
-    try std.testing.expectError(error.OrphanWebSocket, validateCurrent(&.{ base_caps[0], base_caps[1], base_caps[2], orphan_ws }, &.{ 10, 11 }));
+    try std.testing.expectError(error.OrphanWebSocket, validateWithEmptyPolicyStoresForTest(&.{ base_caps[0], base_caps[1], base_caps[2], orphan_ws }, &.{ 10, 11 }));
     var unexpected_ws_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = ws11 }};
     const unexpected_ws = capsule.make(.ws_session, &unexpected_ws_field);
-    try std.testing.expectError(error.UnexpectedWebSocket, validateCurrent(&.{ base_caps[0], base_caps[1], base_caps[2], unexpected_ws }, &.{ 10, 11 }));
+    try std.testing.expectError(error.UnexpectedWebSocket, validateWithEmptyPolicyStoresForTest(&.{ base_caps[0], base_caps[1], base_caps[2], unexpected_ws }, &.{ 10, 11 }));
 
     const closed_ws = try ws_snapshot.encode(allocator, .{ .fd = 10, .phase_open = false });
     defer allocator.free(closed_ws);
@@ -1492,7 +1804,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &closed_ws_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const retained_internal_cr_ws = try ws_snapshot.encode(allocator, .{
@@ -1504,7 +1816,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &retained_internal_cr_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const missing_binary_accumulator_ws = try ws_snapshot.encode(allocator, .{
@@ -1518,7 +1830,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &missing_binary_accumulator_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const stray_binary_accumulator_ws = try ws_snapshot.encode(allocator, .{
@@ -1531,7 +1843,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &stray_binary_accumulator_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const oversized_binary = try allocator.alloc(u8, ws_snapshot.max_frame_payload + 1);
@@ -1550,7 +1862,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &oversized_binary_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const text_with_binary_state = try ws_snapshot.encode(allocator, .{
@@ -1563,7 +1875,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &text_with_binary_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     // A complete masked zero-payload text frame would already have been
@@ -1579,7 +1891,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &complete_frame_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const retained_lf_ws = try ws_snapshot.encode(allocator, .{
@@ -1591,7 +1903,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &retained_lf_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const oversized_tx = try allocator.alloc(u8, ws_snapshot.max_tx_bytes + 1);
@@ -1606,7 +1918,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &oversized_tx_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     // v2 has the exact partial-framing fields but no selected application
@@ -1621,7 +1933,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = legacy_ws_cap;
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const reserved_ws = try allocator.dupe(u8, ws10);
@@ -1631,7 +1943,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &reserved_ws_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 
     const trailing_ws = try allocator.alloc(u8, ws10.len + 1);
@@ -1642,7 +1954,7 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     malformed_caps[3] = capsule.make(.ws_session, &trailing_ws_field);
     try std.testing.expectError(
         error.InvalidWebSocket,
-        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+        validateWithEmptyPolicyStoresForTest(&malformed_caps, &.{ 10, 11 }),
     );
 }
 
@@ -1657,11 +1969,11 @@ test "current handoff relations reject optional sidecar owner and cardinality vi
     const monitor = try (monitor_capsule.MonitorCapsule{ .client_id = 10, .targets = &.{"bob"} }).encode(&monitor_buf);
     var monitor_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = monitor }};
     const monitor_cap = capsule.make(.monitor_list, &monitor_field);
-    try std.testing.expectError(error.DuplicateMonitor, validateCurrent(&.{ client_cap, monitor_cap, monitor_cap }, &.{10}));
+    try std.testing.expectError(error.DuplicateMonitor, validateWithEmptyPolicyStoresForTest(&.{ client_cap, monitor_cap, monitor_cap }, &.{10}));
     var orphan_monitor_buf: [64]u8 = undefined;
     const orphan_monitor_wire = try (monitor_capsule.MonitorCapsule{ .client_id = 99, .targets = &.{"bob"} }).encode(&orphan_monitor_buf);
     var orphan_monitor_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = orphan_monitor_wire }};
-    try std.testing.expectError(error.OrphanMonitor, validateCurrent(&.{ client_cap, capsule.make(.monitor_list, &orphan_monitor_field) }, &.{10}));
+    try std.testing.expectError(error.OrphanMonitor, validateWithEmptyPolicyStoresForTest(&.{ client_cap, capsule.make(.monitor_list, &orphan_monitor_field) }, &.{10}));
 
     var silence_buf: [64]u8 = undefined;
     const silence = try (silence_capsule.SilenceCapsule{ .client_id = 10, .masks = &.{"bad!*@*"} }).encode(&silence_buf);
@@ -1700,14 +2012,14 @@ test "current handoff relations reject optional sidecar owner and cardinality vi
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    _ = try validateCurrent(&.{ client_cap, monitor_cap, silence_cap, event_replay_cap, relay_replay_cap, relay_outbox_cap, relay_event_log_cap, attachment_delivery_cap, e2ee_group_cap, clock_cap }, &.{10});
-    try std.testing.expectError(error.MissingMonitor, validateCurrent(&.{ client_cap, silence_cap }, &.{10}));
-    try std.testing.expectError(error.MissingSilence, validateCurrent(&.{ client_cap, monitor_cap }, &.{10}));
-    try std.testing.expectError(error.DuplicateSilence, validateCurrent(&.{ client_cap, silence_cap, silence_cap }, &.{10}));
+    _ = try validateWithEmptyPolicyStoresForTest(&.{ client_cap, monitor_cap, silence_cap, event_replay_cap, relay_replay_cap, relay_outbox_cap, relay_event_log_cap, attachment_delivery_cap, e2ee_group_cap, clock_cap }, &.{10});
+    try std.testing.expectError(error.MissingMonitor, validateWithEmptyPolicyStoresForTest(&.{ client_cap, silence_cap }, &.{10}));
+    try std.testing.expectError(error.MissingSilence, validateWithEmptyPolicyStoresForTest(&.{ client_cap, monitor_cap }, &.{10}));
+    try std.testing.expectError(error.DuplicateSilence, validateWithEmptyPolicyStoresForTest(&.{ client_cap, silence_cap, silence_cap }, &.{10}));
     var orphan_silence_buf: [64]u8 = undefined;
     const orphan_silence_wire = try (silence_capsule.SilenceCapsule{ .client_id = 99, .masks = &.{"bad!*@*"} }).encode(&orphan_silence_buf);
     var orphan_silence_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = orphan_silence_wire }};
-    try std.testing.expectError(error.OrphanSilence, validateCurrent(&.{ client_cap, capsule.make(.silence_list, &orphan_silence_field) }, &.{10}));
+    try std.testing.expectError(error.OrphanSilence, validateWithEmptyPolicyStoresForTest(&.{ client_cap, capsule.make(.silence_list, &orphan_silence_field) }, &.{10}));
 }
 
 test "current handoff relations reject owner-fd S2S and redial violations" {
@@ -1752,26 +2064,26 @@ test "current handoff relations reject owner-fd S2S and redial violations" {
     var caps: [pieces.len]capsule.Capsule = undefined;
     _ = makeTestCaps(&pieces, &fields, &caps);
     for (caps[caps.len - 7 ..]) |*cap| cap.header.min_supported = 2;
-    _ = try validateCurrent(&caps, &.{ 10, 20 });
-    try std.testing.expectError(error.DuplicateStateFd, validateCurrent(&caps, &.{ 10, 20, 20 }));
-    try std.testing.expectError(error.MissingStateFd, validateCurrent(&caps, &.{10}));
-    try std.testing.expectError(error.OrphanStateFd, validateCurrent(&caps, &.{ 10, 20, 30 }));
-    try std.testing.expectError(error.DuplicateRedial, validateCurrent(&.{ caps[0], caps[1], caps[2], caps[2], caps[3], caps[4] }, &.{ 10, 20 }));
+    _ = try validateWithEmptyPolicyStoresForTest(&caps, &.{ 10, 20 });
+    try std.testing.expectError(error.DuplicateStateFd, validateWithEmptyPolicyStoresForTest(&caps, &.{ 10, 20, 20 }));
+    try std.testing.expectError(error.MissingStateFd, validateWithEmptyPolicyStoresForTest(&caps, &.{10}));
+    try std.testing.expectError(error.OrphanStateFd, validateWithEmptyPolicyStoresForTest(&caps, &.{ 10, 20, 30 }));
+    try std.testing.expectError(error.DuplicateRedial, validateWithEmptyPolicyStoresForTest(&.{ caps[0], caps[1], caps[2], caps[2], caps[3], caps[4] }, &.{ 10, 20 }));
 
     var trailing_redial: [mesh_redial.encoded_len + 1]u8 = undefined;
     @memcpy(trailing_redial[0..mesh_redial.encoded_len], &redial);
     trailing_redial[mesh_redial.encoded_len] = 0;
     var trailing_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = &trailing_redial }};
-    try std.testing.expectError(error.InvalidRedial, validateCurrent(&.{ caps[0], caps[1], capsule.make(.mesh_checkpoint, &trailing_field), caps[3], caps[4] }, &.{ 10, 20 }));
+    try std.testing.expectError(error.InvalidRedial, validateWithEmptyPolicyStoresForTest(&.{ caps[0], caps[1], capsule.make(.mesh_checkpoint, &trailing_field), caps[3], caps[4] }, &.{ 10, 20 }));
     var unknown_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = "unknown-mesh" }};
-    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{ caps[0], caps[1], capsule.make(.mesh_checkpoint, &unknown_field), caps[3], caps[4] }, &.{ 10, 20 }));
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateWithEmptyPolicyStoresForTest(&.{ caps[0], caps[1], capsule.make(.mesh_checkpoint, &unknown_field), caps[3], caps[4] }, &.{ 10, 20 }));
 
     const trailing_s2s = try allocator.alloc(u8, s2s.len + 1);
     defer allocator.free(trailing_s2s);
     @memcpy(trailing_s2s[0..s2s.len], s2s);
     trailing_s2s[s2s.len] = 0;
     var trailing_s2s_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = trailing_s2s }};
-    try std.testing.expectError(error.InvalidS2s, validateCurrent(&.{ caps[0], capsule.make(.s2s_link, &trailing_s2s_field), caps[2], caps[3], caps[4] }, &.{ 10, 20 }));
+    try std.testing.expectError(error.InvalidS2s, validateWithEmptyPolicyStoresForTest(&.{ caps[0], capsule.make(.s2s_link, &trailing_s2s_field), caps[2], caps[3], caps[4] }, &.{ 10, 20 }));
 }
 
 test "current handoff relations require exactly one canonical ESG2 authority" {
@@ -1811,18 +2123,18 @@ test "current handoff relations require exactly one canonical ESG2 authority" {
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
+    const summary = try validateWithEmptyPolicyStoresForTest(&.{ current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.event_spine_replay);
     try std.testing.expectError(
         error.MissingMeshClock,
-        validateCurrent(&.{ current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
     );
-    try std.testing.expectError(error.MissingEventSpineReplay, validateCurrent(&.{ relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
-    try std.testing.expectError(error.DuplicateEventSpineReplay, validateCurrent(&.{ current, current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
+    try std.testing.expectError(error.MissingEventSpineReplay, validateWithEmptyPolicyStoresForTest(&.{ relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
+    try std.testing.expectError(error.DuplicateEventSpineReplay, validateWithEmptyPolicyStoresForTest(&.{ current, current, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
 
     var legacy_compatible = current;
     legacy_compatible.header.min_supported = 1;
-    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{legacy_compatible}, &.{}));
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateWithEmptyPolicyStoresForTest(&.{legacy_compatible}, &.{}));
 
     const corrupt = try allocator.dupe(u8, event_replay);
     defer allocator.free(corrupt);
@@ -1830,7 +2142,7 @@ test "current handoff relations require exactly one canonical ESG2 authority" {
     var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidEventSpineReplay, validateCurrent(&.{corrupt_cap}, &.{}));
+    try std.testing.expectError(error.InvalidEventSpineReplay, validateWithEmptyPolicyStoresForTest(&.{corrupt_cap}, &.{}));
 
     const trailing = try allocator.alloc(u8, event_replay.len + 1);
     defer allocator.free(trailing);
@@ -1839,7 +2151,7 @@ test "current handoff relations require exactly one canonical ESG2 authority" {
     var trailing_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = trailing }};
     var trailing_cap = capsule.make(.mesh_checkpoint, &trailing_field);
     trailing_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidEventSpineReplay, validateCurrent(&.{trailing_cap}, &.{}));
+    try std.testing.expectError(error.InvalidEventSpineReplay, validateWithEmptyPolicyStoresForTest(&.{trailing_cap}, &.{}));
 }
 
 test "current handoff relations require exactly one canonical RVG2 authority" {
@@ -1880,14 +2192,14 @@ test "current handoff relations require exactly one canonical RVG2 authority" {
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, current, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
+    const summary = try validateWithEmptyPolicyStoresForTest(&.{ event_cap, current, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.relay_v2_replay);
-    try std.testing.expectError(error.MissingRelayV2Replay, validateCurrent(&.{ event_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
-    try std.testing.expectError(error.DuplicateRelayV2Replay, validateCurrent(&.{ event_cap, current, current, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
+    try std.testing.expectError(error.MissingRelayV2Replay, validateWithEmptyPolicyStoresForTest(&.{ event_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
+    try std.testing.expectError(error.DuplicateRelayV2Replay, validateWithEmptyPolicyStoresForTest(&.{ event_cap, current, current, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}));
 
     var legacy_compatible = current;
     legacy_compatible.header.min_supported = 1;
-    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{ event_cap, legacy_compatible }, &.{}));
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateWithEmptyPolicyStoresForTest(&.{ event_cap, legacy_compatible }, &.{}));
 
     const invalid_config = try allocator.dupe(u8, relay_replay);
     defer allocator.free(invalid_config);
@@ -1898,7 +2210,7 @@ test "current handoff relations require exactly one canonical RVG2 authority" {
     invalid_config_cap.header.min_supported = 2;
     try std.testing.expectError(
         error.InvalidRelayV2Replay,
-        validateCurrent(&.{ event_cap, invalid_config_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, invalid_config_cap }, &.{}),
     );
 
     const corrupt = try allocator.dupe(u8, relay_replay);
@@ -1907,7 +2219,7 @@ test "current handoff relations require exactly one canonical RVG2 authority" {
     var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidRelayV2Replay, validateCurrent(&.{ event_cap, corrupt_cap }, &.{}));
+    try std.testing.expectError(error.InvalidRelayV2Replay, validateWithEmptyPolicyStoresForTest(&.{ event_cap, corrupt_cap }, &.{}));
 
     const trailing = try allocator.alloc(u8, relay_replay.len + 1);
     defer allocator.free(trailing);
@@ -1916,7 +2228,7 @@ test "current handoff relations require exactly one canonical RVG2 authority" {
     var trailing_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = trailing }};
     var trailing_cap = capsule.make(.mesh_checkpoint, &trailing_field);
     trailing_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidRelayV2Replay, validateCurrent(&.{ event_cap, trailing_cap }, &.{}));
+    try std.testing.expectError(error.InvalidRelayV2Replay, validateWithEmptyPolicyStoresForTest(&.{ event_cap, trailing_cap }, &.{}));
 }
 
 test "current handoff relations require exactly one canonical RVO2 authority" {
@@ -1954,15 +2266,15 @@ test "current handoff relations require exactly one canonical RVO2 authority" {
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
+    const summary = try validateWithEmptyPolicyStoresForTest(&.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.relay_v2_outbox);
     try std.testing.expectError(
         error.MissingRelayV2Outbox,
-        validateCurrent(&.{ event_cap, relay_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, relay_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     try std.testing.expectError(
         error.DuplicateRelayV2Outbox,
-        validateCurrent(&.{ event_cap, relay_cap, outbox_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, relay_cap, outbox_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     const corrupt = try allocator.dupe(u8, outbox);
     defer allocator.free(corrupt);
@@ -1972,7 +2284,7 @@ test "current handoff relations require exactly one canonical RVO2 authority" {
     corrupt_cap.header.min_supported = 2;
     try std.testing.expectError(
         error.InvalidRelayV2Outbox,
-        validateCurrent(&.{ event_cap, relay_cap, corrupt_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, relay_cap, corrupt_cap }, &.{}),
     );
 }
 
@@ -2013,19 +2325,19 @@ test "current handoff relations require exactly one canonical RVL2 authority" {
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
+    const summary = try validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.relay_v2_event_log);
     try std.testing.expectError(
         error.MissingRelayV2EventLog,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, attachment_cap, e2ee_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     try std.testing.expectError(
         error.DuplicateRelayV2EventLog,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, log_cap, attachment_cap, e2ee_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, log_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     var legacy = log_cap;
     legacy.header.min_supported = 1;
-    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{legacy}, &.{}));
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateWithEmptyPolicyStoresForTest(&.{legacy}, &.{}));
 
     const corrupt = try allocator.dupe(u8, event_log);
     defer allocator.free(corrupt);
@@ -2033,7 +2345,7 @@ test "current handoff relations require exactly one canonical RVL2 authority" {
     var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidRelayV2EventLog, validateCurrent(&.{corrupt_cap}, &.{}));
+    try std.testing.expectError(error.InvalidRelayV2EventLog, validateWithEmptyPolicyStoresForTest(&.{corrupt_cap}, &.{}));
 }
 
 test "current handoff relations require exactly one canonical ADS1 authority" {
@@ -2073,19 +2385,19 @@ test "current handoff relations require exactly one canonical ADS1 authority" {
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
+    const summary = try validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.attachment_delivery_spool);
     try std.testing.expectError(
         error.MissingAttachmentDeliverySpool,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, e2ee_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, e2ee_cap }, &.{}),
     );
     try std.testing.expectError(
         error.DuplicateAttachmentDeliverySpool,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, attachment_cap, e2ee_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, attachment_cap, e2ee_cap }, &.{}),
     );
     var legacy = attachment_cap;
     legacy.header.min_supported = 1;
-    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{legacy}, &.{}));
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateWithEmptyPolicyStoresForTest(&.{legacy}, &.{}));
 
     const corrupt = try allocator.dupe(u8, attachment);
     defer allocator.free(corrupt);
@@ -2093,7 +2405,7 @@ test "current handoff relations require exactly one canonical ADS1 authority" {
     var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidAttachmentDeliverySpool, validateCurrent(&.{corrupt_cap}, &.{}));
+    try std.testing.expectError(error.InvalidAttachmentDeliverySpool, validateWithEmptyPolicyStoresForTest(&.{corrupt_cap}, &.{}));
 }
 
 test "current handoff relations require exactly one canonical EGRG authority" {
@@ -2134,19 +2446,19 @@ test "current handoff relations require exactly one canonical EGRG authority" {
     const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
     var clock_field: [1]capsule.Field = undefined;
     const clock_cap = testMeshClockCap(&clock, &clock_field);
-    const summary = try validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
+    const summary = try validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, clock_cap }, &.{});
     try std.testing.expectEqual(@as(usize, 1), summary.e2ee_group_mesh_authority);
     try std.testing.expectError(
         error.MissingE2eeGroupMeshAuthority,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, clock_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, clock_cap }, &.{}),
     );
     try std.testing.expectError(
         error.DuplicateE2eeGroupMeshAuthority,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, e2ee_cap, clock_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, e2ee_cap, e2ee_cap, clock_cap }, &.{}),
     );
     var legacy = e2ee_cap;
     legacy.header.min_supported = 1;
-    try std.testing.expectError(error.UnknownMeshCheckpoint, validateCurrent(&.{legacy}, &.{}));
+    try std.testing.expectError(error.UnknownMeshCheckpoint, validateWithEmptyPolicyStoresForTest(&.{legacy}, &.{}));
 
     const corrupt = try allocator.dupe(u8, e2ee_group);
     defer allocator.free(corrupt);
@@ -2154,7 +2466,7 @@ test "current handoff relations require exactly one canonical EGRG authority" {
     var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidE2eeGroupMeshAuthority, validateCurrent(&.{corrupt_cap}, &.{}));
+    try std.testing.expectError(error.InvalidE2eeGroupMeshAuthority, validateWithEmptyPolicyStoresForTest(&.{corrupt_cap}, &.{}));
 
     const trailing = try allocator.alloc(u8, e2ee_group.len + 1);
     defer allocator.free(trailing);
@@ -2163,7 +2475,7 @@ test "current handoff relations require exactly one canonical EGRG authority" {
     var trailing_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = trailing }};
     var trailing_cap = capsule.make(.mesh_checkpoint, &trailing_field);
     trailing_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidE2eeGroupMeshAuthority, validateCurrent(&.{trailing_cap}, &.{}));
+    try std.testing.expectError(error.InvalidE2eeGroupMeshAuthority, validateWithEmptyPolicyStoresForTest(&.{trailing_cap}, &.{}));
 
     // Zero the inner RVG2 window_size (RVG2 header bytes 5..7). EGRG body is
     // rvg2_len(4) || rvg2, so absolute offsets are egrg_header_len+4+5..6.
@@ -2200,7 +2512,7 @@ test "current handoff relations require exactly one canonical EGRG authority" {
     invalid_config_cap.header.min_supported = 2;
     try std.testing.expectError(
         error.InvalidE2eeGroupMeshAuthority,
-        validateCurrent(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, invalid_config_cap }, &.{}),
+        validateWithEmptyPolicyStoresForTest(&.{ event_cap, replay_cap, outbox_cap, log_cap, attachment_cap, invalid_config_cap }, &.{}),
     );
 }
 
@@ -2262,7 +2574,7 @@ test "current handoff relations validate the at-most-once oper-grant checkpoint"
     grants_cap.header.min_supported = 2;
 
     // Present once: accepted and counted.
-    const with = try validateCurrent(
+    const with = try validateWithEmptyPolicyStoresForTest(
         &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap, grants_cap },
         &.{},
     );
@@ -2270,14 +2582,14 @@ test "current handoff relations validate the at-most-once oper-grant checkpoint"
 
     // ABSENT is legal: a pre-checkpoint predecessor's arena still adopts
     // (empty registry = pre-checkpoint behavior). No Missing error.
-    const without = try validateCurrent(
+    const without = try validateWithEmptyPolicyStoresForTest(
         &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap },
         &.{},
     );
     try std.testing.expectEqual(@as(usize, 0), without.oper_grants);
 
     // Duplicate is ambiguous authority.
-    try std.testing.expectError(error.DuplicateOperGrants, validateCurrent(
+    try std.testing.expectError(error.DuplicateOperGrants, validateWithEmptyPolicyStoresForTest(
         &.{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap, grants_cap, grants_cap },
         &.{},
     ));
@@ -2290,10 +2602,112 @@ test "current handoff relations validate the at-most-once oper-grant checkpoint"
     var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
-    try std.testing.expectError(error.InvalidOperGrants, validateCurrent(&.{corrupt_cap}, &.{}));
+    try std.testing.expectError(error.InvalidOperGrants, validateWithEmptyPolicyStoresForTest(&.{corrupt_cap}, &.{}));
 
     // A downgraded (min=1) header on this exact state piece fails closed.
     var weak_cap = grants_cap;
     weak_cap.header.min_supported = 1;
-    try std.testing.expectError(error.InvalidOperGrants, validateCurrent(&.{weak_cap}, &.{}));
+    try std.testing.expectError(error.InvalidOperGrants, validateWithEmptyPolicyStoresForTest(&.{weak_cap}, &.{}));
+}
+
+test "current handoff relations require exact moderation authority on every platform" {
+    const allocator = std.testing.allocator;
+    const event_replay = try testEventSpineReplayCheckpoint(allocator);
+    defer allocator.free(event_replay);
+    const relay_replay = try testRelayV2ReplayCheckpoint(allocator);
+    defer allocator.free(relay_replay);
+    const outbox = try testRelayV2OutboxCheckpoint(allocator);
+    defer allocator.free(outbox);
+    const event_log = try testRelayV2EventLogCheckpoint(allocator);
+    defer allocator.free(event_log);
+    const attachment = try testAttachmentDeliveryCheckpoint(allocator);
+    defer allocator.free(attachment);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
+    const pieces = [_]TestPiece{
+        .{ .kind = .mesh_checkpoint, .bytes = event_replay },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_replay },
+        .{ .kind = .mesh_checkpoint, .bytes = outbox },
+        .{ .kind = .mesh_checkpoint, .bytes = event_log },
+        .{ .kind = .mesh_checkpoint, .bytes = attachment },
+        .{ .kind = .mesh_checkpoint, .bytes = e2ee_group },
+        .{ .kind = .mesh_checkpoint, .bytes = &clock },
+    };
+    var fields: [pieces.len][1]capsule.Field = undefined;
+    var base: [pieces.len]capsule.Capsule = undefined;
+    _ = makeTestCaps(&pieces, &fields, &base);
+    for (&base) |*cap| cap.header.min_supported = 2;
+    var stores: PolicyStoresForTest = .{};
+    try stores.init(allocator);
+    defer stores.deinit(allocator);
+    const physical_wire = try physical_connection_relation.encode(allocator, &.{}, 0);
+    defer allocator.free(physical_wire);
+    const physical_piece = [_]TestPiece{.{ .kind = .physical_connection_relation, .bytes = physical_wire }};
+    var physical_fields: [1][1]capsule.Field = undefined;
+    var physical_caps: [1]capsule.Capsule = undefined;
+    _ = makeTestCaps(&physical_piece, &physical_fields, &physical_caps);
+    const presentation = try remote_presentation_snapshot.encode(allocator, &.{}, .{
+        .max_projections = 0,
+        .max_frontiers = 0,
+        .max_string_bytes = 0,
+        .max_wire_bytes = 16,
+    });
+    defer allocator.free(presentation);
+    var presentation_fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = presentation }};
+    const disabled_guest = "LGI1\x01\x00";
+    var guest_fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = disabled_guest }};
+    var complete: [14]capsule.Capsule = undefined;
+    @memcpy(complete[0..7], &base);
+    @memcpy(complete[7..11], &stores.caps);
+    complete[11] = physical_caps[0];
+    complete[12] = capsule.make(.mesh_checkpoint, &presentation_fields);
+    complete[12].header.min_supported = 2;
+    complete[13] = capsule.make(.local_guest_issuer, &guest_fields);
+    const summary = try validateWithHostRowsForTest(&complete, &.{});
+    try std.testing.expectEqual(@as(usize, 1), summary.local_guest_issuer);
+    try std.testing.expectError(error.MissingLocalGuestIssuer, validateWithHostRowsForTest(complete[0..13], &.{}));
+    // Even an empty current image has one mandatory typed physical relation.
+    var without_physical: [13]capsule.Capsule = undefined;
+    @memcpy(without_physical[0..11], complete[0..11]);
+    without_physical[11] = complete[12];
+    without_physical[12] = complete[13];
+    try std.testing.expectError(error.MissingPhysicalConnectionRelation, validateCurrent(&without_physical, &.{}));
+    const prior_physical = complete[11];
+    const legacy_physical = try allocator.dupe(u8, physical_wire);
+    defer allocator.free(legacy_physical);
+    @memcpy(legacy_physical[0..4], "HPC1");
+    legacy_physical[4] = 1;
+    var legacy_fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = legacy_physical }};
+    complete[11] = capsule.make(.physical_connection_relation, &legacy_fields);
+    try std.testing.expectError(error.InvalidPhysicalConnectionRelation, validateCurrent(&complete, &.{}));
+    complete[11] = prior_physical;
+    try std.testing.expectEqual(@as(usize, 1), summary.access);
+    try std.testing.expectEqual(@as(usize, 1), summary.saccess);
+    try std.testing.expectEqual(@as(usize, 1), summary.akick);
+    try std.testing.expectEqual(@as(usize, 1), summary.ward);
+    const missing_errors = [_]Error{ error.MissingAccess, error.MissingSaccess, error.MissingAkick, error.MissingWard };
+    const duplicate_errors = [_]Error{ error.DuplicateAccess, error.DuplicateSaccess, error.DuplicateAkick, error.DuplicateWard };
+    const invalid_errors = [_]Error{ error.InvalidAccess, error.InvalidSaccess, error.InvalidAkick, error.InvalidWard };
+    for (0..4) |i| {
+        const index = 7 + i;
+        var missing: [13]capsule.Capsule = undefined;
+        @memcpy(missing[0..index], complete[0..index]);
+        @memcpy(missing[index..], complete[index + 1 ..]);
+        try std.testing.expectError(missing_errors[i], validateCurrent(&missing, &.{}));
+        var duplicate: [15]capsule.Capsule = undefined;
+        @memcpy(duplicate[0..14], &complete);
+        duplicate[14] = complete[index];
+        try std.testing.expectError(duplicate_errors[i], validateCurrent(&duplicate, &.{}));
+        var weak = complete;
+        weak[index].header.min_supported = 1;
+        try std.testing.expectError(invalid_errors[i], validateCurrent(&weak, &.{}));
+        const corrupt = try allocator.dupe(u8, stores.bytes[i]);
+        defer allocator.free(corrupt);
+        corrupt[corrupt.len - 1] ^= 1;
+        var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = corrupt }};
+        var corrupt_caps = complete;
+        corrupt_caps[index].fields = &corrupt_field;
+        try std.testing.expectError(invalid_errors[i], validateCurrent(&corrupt_caps, &.{}));
+    }
 }

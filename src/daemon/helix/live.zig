@@ -296,8 +296,35 @@ const predecessor_s2s_v4_upgrade_capability_caps =
     "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,sessions-v4,state-fd-manifest-v1,webhook-store-v1,world-v2";
 const predecessor_s2s_v4_upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_s2s_v4_upgrade_capability_caps;
-const upgrade_capability_caps =
+const predecessor_linux_wt_upgrade_capability_caps =
     "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,s2s-inner-carry-v5,sessions-v4,state-fd-manifest-v1,webhook-store-v1,world-v2";
+const predecessor_linux_wt_upgrade_capability_token =
+    "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_linux_wt_upgrade_capability_caps;
+const predecessor_policy_upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,s2s-inner-carry-v5,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+const predecessor_policy_upgrade_capability_token =
+    "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_policy_upgrade_capability_caps;
+// All platforms now require the four moderation stores in the inherited cut.
+// An older producer omits them on Linux; refuse that boundary before exec.
+const predecessor_physical_upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v3,physical-connection-relation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+const predecessor_physical_upgrade_capability_token =
+    "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_physical_upgrade_capability_caps;
+const predecessor_semantic_upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v3,physical-connection-relation-v1,remote-presentation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+const predecessor_semantic_upgrade_capability_token = "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_semantic_upgrade_capability_caps;
+const predecessor_host_presentation_caps =
+    "attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v3,physical-connection-relation-v2,canonical-mesh-admission-v1,remote-presentation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+pub const predecessor_host_presentation_token = "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_host_presentation_caps;
+
+const predecessor_issuer_upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v4,host-presentation-v1,physical-connection-relation-v2,canonical-mesh-admission-v1,remote-presentation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+pub const predecessor_issuer_upgrade_capability_token = "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_issuer_upgrade_capability_caps;
+const predecessor_replica_core_upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v5,host-presentation-v1,local-guest-issuer-v1,physical-connection-relation-v2,canonical-mesh-admission-v1,remote-presentation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+const predecessor_replica_core_upgrade_capability_token = "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_replica_core_upgrade_capability_caps;
+const upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v5,host-presentation-v1,local-guest-issuer-v1,physical-connection-relation-v2,canonical-mesh-admission-v1,remote-presentation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-replica-core-checkpoint-v1,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
 pub const upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
 /// Never emit a predecessor line whose mandatory state this image refuses.
@@ -331,6 +358,16 @@ pub fn probeUpgradeExecutableFd(
     io: std.Io,
     executable_fd: handoff.Fd,
 ) !bool {
+    return probeUpgradeExecutableFdWithBootPolicy(allocator, io, executable_fd, .{});
+}
+
+pub fn probeUpgradeExecutableFdWithBootPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable_fd: handoff.Fd,
+    policy: BootPolicy,
+) !bool {
+    try policy.validate();
     if (builtin.os.tag != .linux) return error.Unsupported;
     if (executable_fd < 0) return error.InvalidExecutableFd;
     var proc_path_buf: [64]u8 = undefined;
@@ -393,8 +430,187 @@ pub fn probeUpgradeExecutableFd(
         try std.Io.sleep(io, .{ .nanoseconds = @min(remaining, 10 * std.time.ns_per_ms) }, .awake);
     }
     const term = try child.wait(io);
+    const stdout = output.reader(0).buffered();
+    const stderr = output.reader(1).buffered();
     return term.success() and
-        (hasUpgradeCapabilityLine(output.reader(0).buffered()) or hasUpgradeCapabilityLine(output.reader(1).buffered()));
+        (hasUpgradeCapabilityLine(stdout) or hasUpgradeCapabilityLine(stderr)) and
+        (!policy.requiresCapability() or hasCompleteOutputLine(stdout, boot_policy_capability_token) or hasCompleteOutputLine(stderr, boot_policy_capability_token));
+}
+
+/// Borrowed from the retained prepared-config owner. Only actual resolved
+/// config references belong here; never pass the process environment. Refresh
+/// this view together with its config snapshot; it does not own those inputs.
+pub fn supportsBootPolicyOn(os: std.Target.Os.Tag) bool {
+    return os == .linux;
+}
+pub const EnvBinding = struct { name: []const u8, value: []const u8 };
+pub const BootPolicy = struct {
+    strict_existing_identity: bool = false,
+    config_env: []const EnvBinding = &.{},
+    pub fn requiresCapability(self: BootPolicy) bool {
+        return self.strict_existing_identity or self.config_env.len != 0;
+    }
+    pub fn validate(self: BootPolicy) !void {
+        if (self.config_env.len > 64) return error.InvalidBootPolicy;
+        var total: usize = 0;
+        for (self.config_env, 0..) |binding, index| {
+            if (binding.name.len == 0 or binding.name.len > 128 or binding.value.len > 4096 or
+                std.mem.indexOfScalar(u8, binding.value, 0) != null) return error.InvalidBootPolicy;
+            for (binding.name, 0..) |ch, i| {
+                if (!(std.ascii.isAlphabetic(ch) or ch == '_' or (i != 0 and std.ascii.isDigit(ch)))) return error.InvalidBootPolicy;
+            }
+            if (std.mem.startsWith(u8, binding.name, "ONYX_HELIX_") or
+                std.mem.startsWith(u8, binding.name, "ONYX_WINDOWS_") or
+                std.mem.eql(u8, binding.name, "ONYX_REQUIRE_EXISTING_IDENTITY") or
+                std.mem.eql(u8, binding.name, "ONYX_STRICT_EXISTING_IDENTITY") or
+                std.mem.startsWith(u8, binding.name, "LISTEN_") or
+                std.mem.eql(u8, binding.name, "NOTIFY_SOCKET") or
+                std.mem.eql(u8, binding.name, "WATCHDOG_PID") or
+                std.mem.eql(u8, binding.name, "WATCHDOG_USEC") or
+                std.mem.eql(u8, binding.name, "WATCHDOG_DEVICE")) return error.InvalidBootPolicy;
+            for (self.config_env[0..index]) |prior| if (std.mem.eql(u8, prior.name, binding.name)) return error.InvalidBootPolicy;
+            total = std.math.add(usize, total, binding.name.len + binding.value.len + 2) catch return error.InvalidBootPolicy;
+            if (total > 32768) return error.InvalidBootPolicy;
+        }
+    }
+};
+/// Shared recorder for the values actually returned during one config parse.
+/// It owns and wipes both names and values. Duplicate identical reads coalesce;
+/// conflicting reads fail instead of constructing a nondeterministic boot cut.
+pub const ConfigEnvCollector = struct {
+    allocator: std.mem.Allocator,
+    bindings: std.ArrayList(EnvBinding) = .empty,
+    pub fn init(a: std.mem.Allocator) ConfigEnvCollector {
+        return .{ .allocator = a };
+    }
+    pub fn view(self: *const ConfigEnvCollector) []const EnvBinding {
+        return self.bindings.items;
+    }
+    pub fn deinit(self: *ConfigEnvCollector) void {
+        for (self.bindings.items) |binding| {
+            releaseSecret(self.allocator, binding.name);
+            releaseSecret(self.allocator, binding.value);
+        }
+        self.bindings.deinit(self.allocator);
+        self.* = .{ .allocator = self.allocator };
+    }
+    pub fn record(self: *ConfigEnvCollector, name: []const u8, value: []const u8) !void {
+        for (self.bindings.items) |prior| if (std.mem.eql(u8, prior.name, name)) {
+            if (!std.mem.eql(u8, prior.value, value)) return error.ConflictingConfigEnvironment;
+            return;
+        };
+        if (self.bindings.items.len >= 64) return error.InvalidBootPolicy;
+        var checked: [64]EnvBinding = undefined;
+        @memcpy(checked[0..self.bindings.items.len], self.bindings.items);
+        checked[self.bindings.items.len] = .{ .name = name, .value = value };
+        try (BootPolicy{ .config_env = checked[0 .. self.bindings.items.len + 1] }).validate();
+        try self.bindings.ensureUnusedCapacity(self.allocator, 1);
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer releaseSecret(self.allocator, owned_name);
+        const owned_value = try self.allocator.dupe(u8, value);
+        self.bindings.appendAssumeCapacity(.{ .name = owned_name, .value = owned_value });
+    }
+};
+pub const OwnedBootPolicy = struct {
+    collector: ConfigEnvCollector,
+    strict_existing_identity: bool,
+    pub fn init(a: std.mem.Allocator, policy: BootPolicy) !OwnedBootPolicy {
+        try policy.validate();
+        var collector = ConfigEnvCollector.init(a);
+        errdefer collector.deinit();
+        for (policy.config_env) |binding| try collector.record(binding.name, binding.value);
+        return .{ .collector = collector, .strict_existing_identity = policy.strict_existing_identity };
+    }
+    pub fn borrow(self: *const OwnedBootPolicy) BootPolicy {
+        return .{ .strict_existing_identity = self.strict_existing_identity, .config_env = self.collector.view() };
+    }
+    pub fn deinit(self: *OwnedBootPolicy) void {
+        self.collector.deinit();
+    }
+};
+/// Ordering of resolver reads is immaterial; exact names and returned bytes
+/// are authoritative. Both inputs must already satisfy BootPolicy validation.
+pub fn sameConfigEnvironment(left: []const EnvBinding, right: []const EnvBinding) bool {
+    if (left.len != right.len) return false;
+    for (left) |binding| {
+        var found = false;
+        for (right) |other| if (std.mem.eql(u8, binding.name, other.name)) {
+            if (!std.mem.eql(u8, binding.value, other.value)) return false;
+            found = true;
+            break;
+        };
+        if (!found) return false;
+    }
+    return true;
+}
+
+pub const strict_existing_identity_arg = "--strict-existing-identity";
+pub const boot_policy_capability_token = "ONYX_HELIX_BOOT_POLICY=1";
+
+pub fn hasUpgradeCapabilityForBootPolicy(output: []const u8, policy: BootPolicy) bool {
+    return hasUpgradeCapabilityLine(output) and
+        (!policy.requiresCapability() or hasCompleteOutputLine(output, boot_policy_capability_token));
+}
+
+/// Allocator.free poisons the allocation before rawFree in checked builds.
+/// Release the exact original span/alignment directly so zeroing remains the
+/// last write before the allocator receives it, including an owned sentinel.
+fn releaseSecret(allocator: std.mem.Allocator, memory: anytype) void {
+    const slice_info = @typeInfo(@TypeOf(memory)).pointer;
+    const bytes: []u8 = @ptrCast(@constCast(std.mem.absorbSentinel(memory)));
+    if (bytes.len == 0) return;
+    std.crypto.secureZero(u8, bytes);
+    allocator.rawFree(bytes, .fromByteUnits(slice_info.attrs.@"align" orelse @alignOf(slice_info.child)), @returnAddress());
+}
+
+fn freeEnvironmentEntry(allocator: std.mem.Allocator, entry: [:0]const u8) void {
+    releaseSecret(allocator, entry);
+}
+
+fn validateStrictConfigPath(path: ?[]const u8) !void {
+    const value = path orelse return error.InvalidBootPolicy;
+    if (value.len == 0 or value[0] == '-' or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidBootPolicy;
+}
+
+/// Clone a validated explicit policy into an independent plan. No inherited
+/// process environment is consulted. Failure leaves the original plan intact.
+pub fn applyBootPolicy(allocator: std.mem.Allocator, base: *const ExecPlan, policy: BootPolicy) !ExecPlan {
+    try policy.validate();
+    if (policy.strict_existing_identity) {
+        if (base.argv.len != 3 or !std.mem.eql(u8, base.argv[1], "--supervisor")) return error.InvalidBootPolicy;
+        try validateStrictConfigPath(base.argv[2]);
+    }
+    // Reject collisions even for a caller-provided base plan; a policy must not
+    // replace any existing launch control or introduce duplicate environment.
+    for (policy.config_env) |binding| for (base.envp) |entry| {
+        const equal = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidBootPolicy;
+        if (std.mem.eql(u8, entry[0..equal], binding.name)) return error.InvalidBootPolicy;
+    };
+    const argv = try allocator.alloc([:0]const u8, base.argv.len + @intFromBool(policy.strict_existing_identity));
+    errdefer allocator.free(argv);
+    var argc: usize = 0;
+    errdefer for (argv[0..argc]) |arg| allocator.free(arg);
+    for (base.argv) |arg| {
+        argv[argc] = try allocator.dupeSentinel(u8, arg, 0);
+        argc += 1;
+    }
+    if (policy.strict_existing_identity) {
+        argv[argc] = try allocator.dupeSentinel(u8, strict_existing_identity_arg, 0);
+        argc += 1;
+    }
+    const envp = try allocator.alloc([:0]const u8, base.envp.len + policy.config_env.len);
+    errdefer allocator.free(envp);
+    var envc: usize = 0;
+    errdefer for (envp[0..envc]) |entry| freeEnvironmentEntry(allocator, entry);
+    for (base.envp) |entry| {
+        envp[envc] = try allocator.dupeSentinel(u8, entry, 0);
+        envc += 1;
+    }
+    for (policy.config_env) |binding| {
+        envp[envc] = try std.fmt.allocPrintSentinel(allocator, "{s}={s}", .{ binding.name, binding.value }, 0);
+        envc += 1;
+    }
+    return .{ .argv = argv, .envp = envp, .arena_fd = base.arena_fd, .control_fd = base.control_fd };
 }
 
 pub const ExecPlan = struct {
@@ -405,7 +621,7 @@ pub const ExecPlan = struct {
 
     pub fn deinit(self: *ExecPlan, allocator: std.mem.Allocator) void {
         for (self.argv) |arg| allocator.free(arg);
-        for (self.envp) |entry| allocator.free(entry);
+        for (self.envp) |entry| freeEnvironmentEntry(allocator, entry);
         allocator.free(self.argv);
         allocator.free(self.envp);
         self.* = .{ .argv = &.{}, .envp = &.{}, .arena_fd = -1, .control_fd = -1 };
@@ -628,6 +844,41 @@ pub fn buildArenaListenerExecPlan(
     }
 
     return .{ .argv = argv, .envp = envp, .arena_fd = arena_fd, .control_fd = -1 };
+}
+
+/// Policy-aware wrappers retain the legacy builders and exact empty-policy
+/// argv/env behavior. The intermediate plan is always disposed on clone error.
+pub fn buildExecPlanWithBootPolicy(a: std.mem.Allocator, path: []const u8, arena: handoff.Fd, control: handoff.Fd, policy: BootPolicy) !ExecPlan {
+    try policy.validate();
+    if (policy.strict_existing_identity) return error.InvalidBootPolicy;
+    var base = try buildExecPlan(a, path, arena, control);
+    if (!policy.requiresCapability()) return base;
+    defer base.deinit(a);
+    return applyBootPolicy(a, &base, policy);
+}
+pub fn buildExecPlanWithListenerAndBootPolicy(a: std.mem.Allocator, path: []const u8, arena: handoff.Fd, control: handoff.Fd, listener: handoff.Fd, policy: BootPolicy) !ExecPlan {
+    try policy.validate();
+    if (policy.strict_existing_identity) return error.InvalidBootPolicy;
+    var base = try buildExecPlanWithListener(a, path, arena, control, listener);
+    if (!policy.requiresCapability()) return base;
+    defer base.deinit(a);
+    return applyBootPolicy(a, &base, policy);
+}
+pub fn buildListenerExecPlanWithBootPolicy(a: std.mem.Allocator, path: []const u8, listener: handoff.Fd, config: ?[]const u8, policy: BootPolicy) !ExecPlan {
+    try policy.validate();
+    if (policy.strict_existing_identity) try validateStrictConfigPath(config);
+    var base = try buildListenerExecPlan(a, path, listener, config);
+    if (!policy.requiresCapability()) return base;
+    defer base.deinit(a);
+    return applyBootPolicy(a, &base, policy);
+}
+pub fn buildArenaListenerExecPlanWithBootPolicy(a: std.mem.Allocator, path: []const u8, arena: handoff.Fd, listeners: []const handoff.Fd, state: []const handoff.Fd, config: ?[]const u8, policy: BootPolicy) !ExecPlan {
+    try policy.validate();
+    if (policy.strict_existing_identity) try validateStrictConfigPath(config);
+    var base = try buildArenaListenerExecPlan(a, path, arena, listeners, state, config);
+    if (!policy.requiresCapability()) return base;
+    defer base.deinit(a);
+    return applyBootPolicy(a, &base, policy);
 }
 
 /// Supervisor/resume side: read inherited fds from the environment, or return
@@ -1005,7 +1256,7 @@ test "whole handoff manifest round-trips arena and rejects every completeness mu
     const manifest_not_last = [_]capsule.Capsule{ caps[0], caps[1], caps[3], caps[2] };
     try std.testing.expectError(error.ManifestNotLast, verifyHandoffManifest(&manifest_not_last));
     var wrong_manifest_header = caps[3];
-    wrong_manifest_header.header.max_supported = 3;
+    wrong_manifest_header.header.max_supported = capsule.descriptor(.handoff_manifest).max_supported + 1;
     const wrong_outer = [_]capsule.Capsule{ caps[0], caps[1], caps[2], wrong_manifest_header };
     try std.testing.expectError(error.WrongManifestHeader, verifyHandoffManifest(&wrong_outer));
     var noncanonical_manifest = caps[3];
@@ -1201,7 +1452,7 @@ test "S2S v5 upgrade capability rejects every pre-v5 reader and writer" {
         upgrade_capability_advertisement ++ "\n",
         predecessor_s2s_v4_upgrade_capability_token,
     ));
-    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "s2s-inner-carry-v5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "s2s-inner-carry-v6") != null);
     try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
     try std.testing.expect(!std.mem.eql(
         u8,
@@ -1651,4 +1902,95 @@ test "Helix capability probe rejects oversized output and reaps its sandboxed ch
 test "Helix capability probe deadline bounds dripped output and closed-output hangs" {
     try expectSandboxedProbe(.drip);
     try expectSandboxedProbe(.closed_hang);
+}
+
+test "Linux WebTransport handoff capability refuses predecessors without UDP and bridge custody" {
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_linux_wt_upgrade_capability_token ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", predecessor_linux_wt_upgrade_capability_token));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "webtransport-linux-v1") != null);
+}
+
+test "Helix policy handoff refuses predecessors that omit moderation stores" {
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_policy_upgrade_capability_token ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", predecessor_policy_upgrade_capability_token));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "mandatory-policy-v1") != null);
+}
+
+test "group fence and signed eligibility capabilities refuse preceding current producers before exec" {
+    const before_groups = "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,s2s-inner-carry-v5,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+    const before_eligibility = "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,s2s-inner-carry-v6,session-group-fence-v1,session-replica-checkpoint-v3,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+    inline for (.{ before_groups, before_eligibility }) |previous| {
+        try std.testing.expect(!hasUpgradeCapabilityLine(previous ++ "\n"));
+        try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", previous));
+    }
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "s2s-inner-carry-v6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "session-group-fence-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "session-resume-eligibility-v1") != null);
+}
+
+test "retired terminal fact policy refuses the preceding eligibility producer before exec" {
+    const before_retirement = "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,s2s-inner-carry-v6,session-group-fence-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+    try std.testing.expect(!hasUpgradeCapabilityLine(before_retirement ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", before_retirement));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "session-group-retired-facts-v1") != null);
+}
+
+test "two MiB config source capability refuses the preceding bounded reader before exec" {
+    const before_limit = "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+    try std.testing.expect(!hasUpgradeCapabilityLine(before_limit ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", before_limit));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "config-source-2m-v1") != null);
+}
+
+test "Ringlane idle feature capability refuses the preceding config reader before exec" {
+    const before_idle = "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+    try std.testing.expect(!hasUpgradeCapabilityLine(before_idle ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", before_idle));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "ring-sqpoll-idle-v1") != null);
+}
+
+test "physical connection relation mandatory schema refuses predecessor before exec" {
+    const predecessor = "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", predecessor));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_advertisement ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "physical-connection-relation-v2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_caps, "handoff-manifest-v5") != null);
+}
+
+test "remote presentation mandatory family refuses physical-only predecessor before exec" {
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_physical_upgrade_capability_token ++ "\n"));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_token, "remote-presentation-v1") != null);
+}
+
+test "canonical mesh admission capability rejects previous complete physical role line" {
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_semantic_upgrade_capability_token ++ "\n"));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_token, "physical-connection-relation-v2,canonical-mesh-admission-v1") != null);
+}
+
+test "host presentation mandatory intent rejects preceding complete capability before exec" {
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_host_presentation_token ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", predecessor_host_presentation_token));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_token, "host-presentation-v1") != null);
+}
+
+test "issuer mandatory custody rejects preceding complete capability before exec" {
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_issuer_upgrade_capability_token ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", predecessor_issuer_upgrade_capability_token));
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, upgrade_capability_token, "handoff-manifest-v5,host-presentation-v1,local-guest-issuer-v1") != null);
+}
+
+test "Helix exact capability requires replica Core retry checkpoint before exec" {
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token));
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_replica_core_upgrade_capability_token));
 }

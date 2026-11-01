@@ -37,7 +37,7 @@ pub fn run(out: *Writer) !void {
         try out.print("{s} cipher suites:\n", .{@tagName(version)});
         const info = @typeInfo(tls.CipherSuite).@"enum";
         inline for (info.field_names, info.field_values) |name, value| {
-            const suite: tls.CipherSuite = @enumFromInt(value);
+            const suite: tls.CipherSuite = @fromBackingInt(@intCast(value));
             if (tls.isAllowed(version, suite)) {
                 try out.print("  0x{x:0>4} {s}\n", .{ @as(u16, @intCast(value)), name });
             }

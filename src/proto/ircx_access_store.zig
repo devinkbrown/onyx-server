@@ -6,6 +6,8 @@
 //! This complements `ircx_saccess.zig`: SACCESS handles server-level entries,
 //! while this module owns channel-scoped ACCESS entries with setter metadata.
 const std = @import("std");
+const client_identity_limits = @import("client_identity_limits.zig");
+const cloak_match = @import("cloak_match.zig");
 const listx = @import("listx.zig");
 const limits_config = @import("limits_config.zig");
 
@@ -186,6 +188,9 @@ pub const EntryView = struct {
     mask: []const u8,
     set_by: []const u8,
     duration: ?u64 = null,
+    /// Actual absolute Unix-second expiry; null is permanent. This is not the
+    /// original requested duration and is never reconstructed from it.
+    expires_at: ?u64 = null,
     /// Hybrid logical clock of the write that produced this entry, and the node
     /// that authored it. Together they are the total order `applyRemote` resolves
     /// against; both are 0 on a store that has never stamped (a pure-local
@@ -257,6 +262,7 @@ const Entry = struct {
             .mask = self.mask,
             .set_by = self.set_by,
             .duration = self.duration,
+            .expires_at = self.expires_at,
             .hlc = self.hlc,
             .origin_node = self.origin_node,
         };
@@ -296,6 +302,56 @@ fn computeExpiry(now: u64, duration: ?u64) ?u64 {
     const d = duration orelse return null;
     if (d == 0) return null;
     return now +| d;
+}
+
+fn compareFieldIgnoreCase(a: []const u8, b: []const u8) std.math.Order {
+    const shared = @min(a.len, b.len);
+    for (a[0..shared], b[0..shared]) |lhs, rhs| {
+        const l = std.ascii.toLower(lhs);
+        const r = std.ascii.toLower(rhs);
+        if (l != r) return std.math.order(l, r);
+    }
+    if (a.len != b.len) return std.math.order(a.len, b.len);
+    return std.mem.order(u8, a, b);
+}
+
+/// Deterministic sweep order: earliest expiry first, then row identity
+/// (`channel`, `level`, `mask`), matching the store's identity triple.
+fn expiryViewLess(lhs: EntryView, rhs: EntryView) bool {
+    const lhs_at = lhs.expires_at orelse std.math.maxInt(u64);
+    const rhs_at = rhs.expires_at orelse std.math.maxInt(u64);
+    if (lhs_at != rhs_at) return lhs_at < rhs_at;
+    switch (compareFieldIgnoreCase(lhs.channel, rhs.channel)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    if (lhs.level != rhs.level) return @backingInt(lhs.level) < @backingInt(rhs.level);
+    switch (compareFieldIgnoreCase(lhs.mask, rhs.mask)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    switch (compareFieldIgnoreCase(lhs.set_by, rhs.set_by)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    if (lhs.hlc != rhs.hlc) return lhs.hlc < rhs.hlc;
+    return lhs.origin_node < rhs.origin_node;
+}
+
+/// Insert `view` into the sorted prefix `out[0..filled.*]`, keeping only the
+/// earliest `out.len` rows; the row that falls off the end is discarded.
+fn insertExpiryBounded(out: []EntryView, filled: *usize, view: EntryView) void {
+    if (out.len == 0) return;
+    var pos: usize = 0;
+    while (pos < filled.* and !expiryViewLess(view, out[pos])) pos += 1;
+    if (pos >= out.len) return;
+    var end = @min(filled.*, out.len - 1);
+    while (end > pos) : (end -= 1) out[end] = out[end - 1];
+    out[pos] = view;
+    if (filled.* < out.len) filled.* += 1;
 }
 
 pub const AccessStore = struct {
@@ -344,9 +400,12 @@ pub const AccessStore = struct {
     }
 
     /// True when `entry` carries an expiry that the store clock has passed.
-    fn isExpired(self: *const AccessStore, entry: Entry) bool {
+    fn isExpiredAt(entry: Entry, now_seconds: u64) bool {
         const at = entry.expires_at orelse return false;
-        return self.now_seconds >= at;
+        return now_seconds >= at;
+    }
+    fn isExpired(self: *const AccessStore, entry: Entry) bool {
+        return isExpiredAt(entry, self.now_seconds);
     }
 
     /// Drop every entry whose timeout has elapsed against the store clock,
@@ -388,6 +447,151 @@ pub const AccessStore = struct {
             }
         }
         return removed_count;
+    }
+
+    /// Result of `expirySweep`: bounded views into caller buffers plus the
+    /// uncapped totals, so a caller can tell truncation from emptiness.
+    pub const ExpirySweep = struct {
+        /// Entries expiring in `(now_seconds, now_seconds + window_seconds]`.
+        expiring: []const EntryView,
+        /// Entries already expired at `now_seconds` (`expires_at <= now`).
+        expired: []const EntryView,
+        expiring_total: usize,
+        expired_total: usize,
+    };
+
+    /// Pure expiry sweep for authorized reminders: classify every timed entry
+    /// against an injected `now_seconds` without mutating the store, reading
+    /// `self.now_seconds`, or pruning anything. Permanent entries are in
+    /// neither list. Both lists are ordered by `expires_at`, then by row
+    /// identity (`channel`, `level`, `mask`), and each is truncated to its
+    /// caller buffer keeping the earliest rows in that order; the totals
+    /// report the full counts. Edge rules match `isExpiredAt`: an expiry
+    /// exactly at `now_seconds` is expired, and an expiry exactly at
+    /// `now_seconds + window_seconds` (saturating) is still expiring.
+    pub fn expirySweep(
+        self: *const AccessStore,
+        now_seconds: u64,
+        window_seconds: u64,
+        expiring_out: []EntryView,
+        expired_out: []EntryView,
+    ) ExpirySweep {
+        const horizon = now_seconds +| window_seconds;
+        var expiring_filled: usize = 0;
+        var expired_filled: usize = 0;
+        var expiring_total: usize = 0;
+        var expired_total: usize = 0;
+        for (self.entries.items) |*entry| {
+            const at = entry.expires_at orelse continue;
+            if (now_seconds >= at) {
+                expired_total += 1;
+                insertExpiryBounded(expired_out, &expired_filled, entry.view());
+            } else if (at <= horizon) {
+                expiring_total += 1;
+                insertExpiryBounded(expiring_out, &expiring_filled, entry.view());
+            }
+        }
+        return .{
+            .expiring = expiring_out[0..expiring_filled],
+            .expired = expired_out[0..expired_filled],
+            .expiring_total = expiring_total,
+            .expired_total = expired_total,
+        };
+    }
+
+    /// Candidate rule for `previewMatch`: a not-yet-stored ACCESS entry.
+    pub const PreviewRule = struct {
+        channel: []const u8,
+        level: Level,
+        mask: []const u8,
+        /// Requested lifetime in seconds; null or 0 is permanent.
+        timeout: ?u64 = null,
+        /// Second the candidate is (or would be) issued at, as the base for
+        /// `computeExpiry`. Null means issued at the preview's `now_seconds`,
+        /// so a fresh candidate is never already expired.
+        issued_at: ?u64 = null,
+    };
+
+    /// One previewed subject, borrowing the caller's subject slice.
+    pub const PreviewRow = struct {
+        /// Representative subject in `nick!ident@host` form, exactly as the
+        /// existing matcher consumes it (see `matchHostmaskWithCloakAt`).
+        subject: []const u8,
+        /// Pattern outcome from `cloak_match.match`, independent of expiry:
+        /// an expired candidate still reports which subjects its mask would
+        /// have matched, with `Preview.expired` carrying the expiry verdict.
+        matches: bool,
+    };
+
+    /// Result of `previewMatch`: candidate expiry plus bounded rows.
+    pub const Preview = struct {
+        channel: []const u8,
+        level: Level,
+        mask: []const u8,
+        /// Absolute expiry from `computeExpiry`; null is permanent.
+        expires_at: ?u64,
+        /// True when `expires_at` is at or before the injected `now_seconds`
+        /// (the same `now >= expires_at` rule as `isExpiredAt`).
+        expired: bool,
+        /// Rows filled into the caller's buffer, in subject input order.
+        rows: []const PreviewRow,
+        /// Full subject count, so truncation by the caller cap is visible.
+        subjects_total: usize,
+        /// Matches across the full subject list, not just returned rows.
+        matched_total: usize,
+    };
+
+    pub fn previewMatch(
+        self: *const AccessStore,
+        rule: PreviewRule,
+        subjects: []const []const u8,
+        now_seconds: u64,
+        out: []PreviewRow,
+    ) AccessError!Preview {
+        return self.previewMatchWithCloak(rule, subjects, null, now_seconds, out);
+    }
+
+    /// Pure moderation-impact preview: report how a candidate rule would
+    /// match representative subjects without mutating the store, reading
+    /// `self.now_seconds`, stamping, or pruning. Matching reuses
+    /// `cloak_match.match`, the matcher `matchHostmaskWithCloakAt` enforces
+    /// with, and expiry reuses `computeExpiry` against `issued_at` (or
+    /// `now_seconds` when unset). Returned rows keep subject input order
+    /// and are truncated to `out.len`; totals cover the full subject list.
+    pub fn previewMatchWithCloak(
+        self: *const AccessStore,
+        rule: PreviewRule,
+        subjects: []const []const u8,
+        ctx: ?cloak_match.Context,
+        now_seconds: u64,
+        out: []PreviewRow,
+    ) AccessError!Preview {
+        _ = self;
+        try validateChannelWith(.{}, rule.channel);
+        try validateMaskWith(.{}, rule.mask);
+        for (subjects) |subject| try validateObservedHostmask(subject);
+
+        const expires_at = computeExpiry(rule.issued_at orelse now_seconds, rule.timeout);
+        var matched_total: usize = 0;
+        var filled: usize = 0;
+        for (subjects) |subject| {
+            const matches = cloak_match.match(rule.mask, subject, ctx);
+            if (matches) matched_total += 1;
+            if (filled < out.len) {
+                out[filled] = .{ .subject = subject, .matches = matches };
+                filled += 1;
+            }
+        }
+        return .{
+            .channel = rule.channel,
+            .level = rule.level,
+            .mask = rule.mask,
+            .expires_at = expires_at,
+            .expired = if (expires_at) |at| now_seconds >= at else false,
+            .rows = out[0..filled],
+            .subjects_total = subjects.len,
+            .matched_total = matched_total,
+        };
     }
 
     pub fn deinit(self: *AccessStore) void {
@@ -797,14 +1001,24 @@ pub const AccessStore = struct {
     }
 
     pub fn matchHostmask(self: *const AccessStore, channel: []const u8, hostmask: []const u8) AccessError!?EntryView {
+        return self.matchHostmaskWithCloak(channel, hostmask, null);
+    }
+
+    pub fn matchHostmaskWithCloak(self: *const AccessStore, channel: []const u8, hostmask: []const u8, ctx: ?cloak_match.Context) AccessError!?EntryView {
+        return self.matchHostmaskWithCloakAt(channel, hostmask, ctx, self.now_seconds);
+    }
+
+    /// Read-only effective lookup at the same authoritative clock snapshot as
+    /// enforcement, without refreshing the store clock or pruning any row.
+    pub fn matchHostmaskWithCloakAt(self: *const AccessStore, channel: []const u8, hostmask: []const u8, ctx: ?cloak_match.Context, now_seconds: u64) AccessError!?EntryView {
         try validateChannelWith(.{}, channel);
-        try validateHostmaskWith(.{}, hostmask);
+        try validateObservedHostmask(hostmask);
 
         var best: ?*const Entry = null;
         for (self.entries.items) |*entry| {
-            if (self.isExpired(entry.*)) continue;
+            if (isExpiredAt(entry.*, now_seconds)) continue;
             if (!std.ascii.eqlIgnoreCase(entry.channel, channel)) continue;
-            if (!listx.globMatch(entry.mask, hostmask)) continue;
+            if (!cloak_match.match(entry.mask, hostmask, ctx)) continue;
             if (best == null or entry.level.precedence() > best.?.level.precedence()) {
                 best = entry;
             }
@@ -1124,8 +1338,10 @@ fn validateMaskWith(comptime limits: Params, mask: []const u8) AccessError!void 
     if (bang_idx == 0 or at_idx <= bang_idx + 1 or at_idx == mask.len - 1) return error.InvalidMask;
 }
 
-fn validateHostmaskWith(comptime limits: Params, hostmask: []const u8) AccessError!void {
-    try validateMaskWith(limits, hostmask);
+fn validateObservedHostmask(hostmask: []const u8) AccessError!void {
+    // Observed client identity is not a stored glob. Preserve the stored rule
+    // budget while admitting the complete supported nick!username@host value.
+    try validateMaskWith(.{ .max_mask_bytes = client_identity_limits.max_prefix_bytes }, hostmask);
     if (std.mem.indexOfScalar(u8, hostmask, '*') != null) return error.InvalidMask;
     if (std.mem.indexOfScalar(u8, hostmask, '?') != null) return error.InvalidMask;
 }
@@ -1648,4 +1864,273 @@ test "ACCESS parses the LIST page cursor and COPY subcommand" {
 
     const replace = (try parse(&.{ "#dst", "COPY", "#src", "REPLACE" })).copy;
     try std.testing.expectEqual(AccessStore.CopyMode.replace, replace.mode);
+}
+
+test "cloak ACCESS continuity preserves grant identity and precedence" {
+    const c = @import("cloak.zig");
+    const key = c.SecretKey.init(@splat(7));
+    var old: [253]u8 = undefined;
+    const before = try c.cloakOpaqueEpochV4(&old, &key, "203.0.113.9", 1, 86400, .{});
+    var mask_buf: [512]u8 = undefined;
+    const mask = try std.fmt.bufPrint(&mask_buf, "Nick!*@{s}", .{before});
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.add("#cloak", .grant, mask, "oper", null);
+    const ctx: cloak_match.Context = .{ .key = key, .suffix = "onyx", .address = "203.0.113.9" };
+    try std.testing.expect((try store.matchHostmaskWithCloak("#cloak", "Nick!u@current.onyx", ctx)) != null);
+    try std.testing.expect((try store.matchHostmaskWithCloak("#cloak", "Other!u@current.onyx", ctx)) == null);
+    try std.testing.expect((try store.matchHostmask("#cloak", "Nick!u@current.onyx")) == null);
+    try store.add("#cloak", .deny, "*!*@*", "oper", null);
+    try std.testing.expectEqual(Level.deny, (try store.matchHostmaskWithCloak("#cloak", "Nick!u@current.onyx", ctx)).?.level);
+}
+
+// DRAFT ONLY — append to src/proto/ircx_access_store.zig after source release.
+test "ACCESS observed full identity is distinct from the stored pattern budget" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    const nick = "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN";
+    const user = "uuuuuuuuuuuuuuuu";
+    const short_v4_host = "0123456789abcdef0123456789abcdef.e2.c127500.opq4.onyx";
+    const observed = nick ++ "!" ++ user ++ "@" ++ short_v4_host;
+    try std.testing.expect(observed.len > DEFAULT_MAX_MASK_BYTES and observed.len <= 256);
+    try store.add("#policy", .deny, nick ++ "!" ++ user ++ "@*", "Owner", null);
+    try std.testing.expectEqual(Level.deny, (try store.matchHostmask("#policy", observed)).?.level);
+    const unrelated = ("OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO") ++ "!" ++ user ++ "@" ++ short_v4_host;
+    try std.testing.expect((try store.matchHostmask("#policy", unrelated)) == null);
+    // The accepted query must never widen persistent rule budgets.
+    const oversized_rule = ("RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR") ++ "!*@*";
+    try std.testing.expectEqual(@as(usize, 129), oversized_rule.len);
+    try std.testing.expectError(error.MaskTooLong, store.add("#policy", .voice, oversized_rule, "Owner", null));
+    try std.testing.expectError(error.InvalidMask, store.matchHostmask("#policy", nick ++ "!*@host.test"));
+    try std.testing.expectError(error.InvalidMask, store.matchHostmask("#policy", nick ++ "!u@host.test\r\n"));
+    const oversized_observed = nick ++ "!" ++ ("uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu") ++ "@" ++ ("hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh");
+    try std.testing.expectEqual(@as(usize, 386), oversized_observed.len);
+    try std.testing.expectError(error.MaskTooLong, store.matchHostmask("#policy", oversized_observed));
+}
+
+test "ACCESS explain typed absolute expiry and readonly lookup share enforcement boundary" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 100;
+    try store.add("#expiry", .deny, "*!u@private.example", "PrivateIssuer", 10);
+    const early = (try store.matchHostmaskWithCloakAt("#expiry", "n!u@private.example", null, 109)).?;
+    try std.testing.expectEqual(@as(?u64, 110), early.expires_at);
+    try std.testing.expectEqualStrings("PrivateIssuer", early.set_by);
+    try std.testing.expectEqual(@as(u64, 100), store.now_seconds);
+    try std.testing.expect((try store.matchHostmaskWithCloakAt("#expiry", "n!u@private.example", null, 110)) == null);
+    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+    store.now_seconds = 109;
+    try std.testing.expect((try store.matchHostmask("#expiry", "n!u@private.example")) != null);
+    store.now_seconds = 110;
+    try std.testing.expect((try store.matchHostmask("#expiry", "n!u@private.example")) == null);
+    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+}
+
+test "expiry sweep separates expired from expiring within window" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    store.now_seconds = 900;
+    try store.add("#a", .voice, "old1!*@h.test", "oper", 50); // expires 950
+    try store.add("#a", .voice, "old2!*@h.test", "oper", 90); // expires 990
+    store.now_seconds = 1000;
+    try store.add("#a", .host, "soon!*@h.test", "oper", 50); // expires 1050
+    try store.add("#a", .voice, "near!*@h.test", "oper", 10); // expires 1010
+    try store.add("#a", .owner, "edge!*@h.test", "oper", 100); // expires 1100
+    try store.add("#a", .deny, "far!*@h.test", "oper", 101); // expires 1101
+    try store.add("#a", .grant, "perm!*@h.test", "oper", null); // permanent
+
+    var expiring: [8]EntryView = undefined;
+    var expired: [8]EntryView = undefined;
+    const sweep = store.expirySweep(1000, 100, &expiring, &expired);
+
+    try std.testing.expectEqual(@as(usize, 3), sweep.expiring.len);
+    try std.testing.expectEqual(@as(usize, 3), sweep.expiring_total);
+    try std.testing.expectEqualStrings("near!*@h.test", sweep.expiring[0].mask);
+    try std.testing.expectEqualStrings("soon!*@h.test", sweep.expiring[1].mask);
+    try std.testing.expectEqualStrings("edge!*@h.test", sweep.expiring[2].mask);
+    try std.testing.expectEqual(@as(usize, 2), sweep.expired.len);
+    try std.testing.expectEqual(@as(usize, 2), sweep.expired_total);
+    try std.testing.expectEqualStrings("old1!*@h.test", sweep.expired[0].mask);
+    try std.testing.expectEqualStrings("old2!*@h.test", sweep.expired[1].mask);
+    // Pure: no prune, no clock refresh.
+    try std.testing.expectEqual(@as(usize, 7), store.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1000), store.now_seconds);
+}
+
+test "expiry sweep cap truncates deterministically and empty store is empty" {
+    var empty = AccessStore.init(std.testing.allocator);
+    defer empty.deinit();
+    var e1: [2]EntryView = undefined;
+    var e2: [2]EntryView = undefined;
+    const none = empty.expirySweep(1000, 60, &e1, &e2);
+    try std.testing.expectEqual(@as(usize, 0), none.expiring.len);
+    try std.testing.expectEqual(@as(usize, 0), none.expired.len);
+    try std.testing.expectEqual(@as(usize, 0), none.expiring_total);
+    try std.testing.expectEqual(@as(usize, 0), none.expired_total);
+
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 900;
+    try store.add("#b", .voice, "z-old!*@h.test", "oper", 10); // 910
+    try store.add("#a", .voice, "a-old!*@h.test", "oper", 10); // 910, identity wins tie
+    try store.add("#a", .host, "m-old!*@h.test", "oper", 20); // 920
+    store.now_seconds = 1000;
+    try store.add("#b", .voice, "z-soon!*@h.test", "oper", 10); // 1010
+    try store.add("#a", .voice, "a-soon!*@h.test", "oper", 10); // 1010, identity wins tie
+    try store.add("#a", .host, "m-soon!*@h.test", "oper", 20); // 1020
+
+    var expiring: [2]EntryView = undefined;
+    var expired: [1]EntryView = undefined;
+    const sweep = store.expirySweep(1000, 60, &expiring, &expired);
+    try std.testing.expectEqual(@as(usize, 3), sweep.expiring_total);
+    try std.testing.expectEqual(@as(usize, 3), sweep.expired_total);
+    try std.testing.expectEqual(@as(usize, 2), sweep.expiring.len);
+    try std.testing.expectEqualStrings("a-soon!*@h.test", sweep.expiring[0].mask);
+    try std.testing.expectEqualStrings("z-soon!*@h.test", sweep.expiring[1].mask);
+    try std.testing.expectEqual(@as(usize, 1), sweep.expired.len);
+    try std.testing.expectEqualStrings("a-old!*@h.test", sweep.expired[0].mask);
+    try std.testing.expectEqual(@as(usize, 6), store.entries.items.len);
+}
+
+test "expiry sweep pins window edges exactly" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 1000;
+    try store.add("#a", .voice, "at-now!*@h.test", "oper", 0); // permanent via 0, excluded below
+    // Build exact expiries by moving the add clock.
+    store.now_seconds = 990;
+    try store.add("#a", .voice, "at-now2!*@h.test", "oper", 10); // expires 1000 == now
+    store.now_seconds = 1000;
+    try store.add("#a", .host, "at-edge!*@h.test", "oper", 100); // expires 1100 == now+window
+    try store.add("#a", .owner, "past-edge!*@h.test", "oper", 101); // expires 1101
+
+    var expiring: [4]EntryView = undefined;
+    var expired: [4]EntryView = undefined;
+    const sweep = store.expirySweep(1000, 100, &expiring, &expired);
+    // Expiry == now is expired (same >= rule as isExpiredAt), not expiring.
+    try std.testing.expectEqual(@as(usize, 1), sweep.expired.len);
+    try std.testing.expectEqualStrings("at-now2!*@h.test", sweep.expired[0].mask);
+    // Expiry == now+window is inside the window; now+window+1 is outside.
+    try std.testing.expectEqual(@as(usize, 1), sweep.expiring.len);
+    try std.testing.expectEqualStrings("at-edge!*@h.test", sweep.expiring[0].mask);
+
+    // Zero window: nothing is expiring, expiry at now stays expired.
+    const zero = store.expirySweep(1000, 0, &expiring, &expired);
+    try std.testing.expectEqual(@as(usize, 0), zero.expiring.len);
+    try std.testing.expectEqual(@as(usize, 1), zero.expired.len);
+}
+
+test "preview flags matching subject and not non-matching in input order" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    var out: [4]AccessStore.PreviewRow = undefined;
+    const result = try store.previewMatch(
+        .{ .channel = "#zig", .level = .deny, .mask = "*!*@bad.test", .timeout = 60 },
+        &.{ "mallory!u@bad.test", "alice!u@good.test", "bob!u@bad.test" },
+        1000,
+        &out,
+    );
+    try std.testing.expectEqualStrings("#zig", result.channel);
+    try std.testing.expectEqual(Level.deny, result.level);
+    try std.testing.expectEqualStrings("*!*@bad.test", result.mask);
+    try std.testing.expectEqual(@as(?u64, 1060), result.expires_at);
+    try std.testing.expect(!result.expired);
+    try std.testing.expectEqual(@as(usize, 3), result.subjects_total);
+    try std.testing.expectEqual(@as(usize, 2), result.matched_total);
+    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+    try std.testing.expectEqualStrings("mallory!u@bad.test", result.rows[0].subject);
+    try std.testing.expect(result.rows[0].matches);
+    try std.testing.expectEqualStrings("alice!u@good.test", result.rows[1].subject);
+    try std.testing.expect(!result.rows[1].matches);
+    try std.testing.expectEqualStrings("bob!u@bad.test", result.rows[2].subject);
+    try std.testing.expect(result.rows[2].matches);
+}
+
+test "preview reports expired candidate rule at injected now" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    var out: [2]AccessStore.PreviewRow = undefined;
+    // Issued at 900 with a 100s timeout: expiry is exactly 1000, which the
+    // store's `now >= expires_at` rule treats as expired.
+    const result = try store.previewMatch(
+        .{ .channel = "#zig", .level = .host, .mask = "*!*@h.test", .timeout = 100, .issued_at = 900 },
+        &.{"nick!u@h.test"},
+        1000,
+        &out,
+    );
+    try std.testing.expectEqual(@as(?u64, 1000), result.expires_at);
+    try std.testing.expect(result.expired);
+    try std.testing.expect(result.rows[0].matches);
+
+    const live = try store.previewMatch(
+        .{ .channel = "#zig", .level = .host, .mask = "*!*@h.test", .timeout = 100, .issued_at = 900 },
+        &.{"nick!u@h.test"},
+        999,
+        &out,
+    );
+    try std.testing.expectEqual(@as(?u64, 1000), live.expires_at);
+    try std.testing.expect(!live.expired);
+
+    const permanent = try store.previewMatch(
+        .{ .channel = "#zig", .level = .host, .mask = "*!*@h.test" },
+        &.{"nick!u@h.test"},
+        1000,
+        &out,
+    );
+    try std.testing.expectEqual(@as(?u64, null), permanent.expires_at);
+    try std.testing.expect(!permanent.expired);
+}
+
+test "preview cap truncates in input order and store is unchanged" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 500;
+    try store.add("#zig", .voice, "keep!*@h.test", "oper", null);
+    try store.add("#ops", .host, "other!*@h.test", "oper", 25);
+
+    var before: [4]EntryView = undefined;
+    const before_rows = try store.listMatching(.{ .channel = "#zig" }, &before);
+    const before_count = store.entries.items.len;
+    const before_now = store.now_seconds;
+    const before_hlc = store.hlc;
+    const before_tombstones = store.tombstoneCount();
+
+    var out: [2]AccessStore.PreviewRow = undefined;
+    const result = try store.previewMatch(
+        .{ .channel = "#zig", .level = .deny, .mask = "*!*@h.test", .timeout = 10 },
+        &.{ "a!u@h.test", "b!u@other.test", "c!u@h.test", "d!u@h.test" },
+        1000,
+        &out,
+    );
+    // Caller cap: only the first two subjects, in input order, are returned,
+    // while totals describe the full subject list.
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("a!u@h.test", result.rows[0].subject);
+    try std.testing.expect(result.rows[0].matches);
+    try std.testing.expectEqualStrings("b!u@other.test", result.rows[1].subject);
+    try std.testing.expect(!result.rows[1].matches);
+    try std.testing.expectEqual(@as(usize, 4), result.subjects_total);
+    try std.testing.expectEqual(@as(usize, 3), result.matched_total);
+
+    // Pure preview: count, rows, clock, stamps, and tombstones are identical.
+    try std.testing.expectEqual(before_count, store.entries.items.len);
+    try std.testing.expectEqual(before_now, store.now_seconds);
+    try std.testing.expectEqual(before_hlc, store.hlc);
+    try std.testing.expectEqual(before_tombstones, store.tombstoneCount());
+    var after: [4]EntryView = undefined;
+    const after_rows = try store.listMatching(.{ .channel = "#zig" }, &after);
+    try std.testing.expectEqual(before_rows.len, after_rows.len);
+    for (before_rows, after_rows) |want, got| {
+        try std.testing.expectEqualStrings(want.channel, got.channel);
+        try std.testing.expectEqual(want.level, got.level);
+        try std.testing.expectEqualStrings(want.mask, got.mask);
+        try std.testing.expectEqualStrings(want.set_by, got.set_by);
+        try std.testing.expectEqual(want.duration, got.duration);
+        try std.testing.expectEqual(want.expires_at, got.expires_at);
+        try std.testing.expectEqual(want.hlc, got.hlc);
+        try std.testing.expectEqual(want.origin_node, got.origin_node);
+    }
 }

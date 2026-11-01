@@ -1,0 +1,91 @@
+{
+  "schema": "onyx-session-control/v1",
+  "revision": 2,
+  "implementation_status": "server candidate; not deployed",
+  "compatibility": "Supplement to the frozen client/server v2 contract; existing credential formats and local SESSION commands remain unchanged.",
+  "authentication": "Registered connection authenticated to the owning account; selectors never grant authority.",
+  "discovery": {
+    "command": "SESSION LIST MESH [cursor=<page-id>]",
+    "unsupported": "FAIL SESSION UNSUPPORTED",
+    "note": "Existing onyx/session-sync capability does not establish full-roster readiness. No new client CAP is required by this candidate."
+  },
+  "inventory": {
+    "command": "SESSION LIST MESH [cursor=<page-id>]",
+    "row_prefix": "SESSION MESH ",
+    "fields": {
+      "group": "32 lowercase hexadecimal characters; opaque logical-group selector",
+      "attachment": "32 lowercase hexadecimal characters, or 32 dashes for an unavailable physical identity",
+      "node": "unsigned 64-bit node identifier rendered in hexadecimal",
+      "state": [
+        "revoked",
+        "unknown",
+        "attached",
+        "detached"
+      ],
+      "inventory": [
+        "complete",
+        "legacy-incomplete"
+      ],
+      "coverage": [
+        "ready",
+        "partial"
+      ]
+    },
+    "end_prefix": "SESSION MESH end rows=",
+    "privacy": "Only the authenticated account is enumerated; no bearer credential, real address, signing key, or other account's inventory is emitted.",
+    "freshness": "Unknown or stale origin leases must not be displayed as a confirmed offline/revoked state. Row inventory completeness and node support coverage are separate observations.",
+    "limits": "Candidate page generation returns at most 32 rows and spends at most 64 indexed origin/row work units. It can return zero rows with continuation. A cursor advances only after the whole labeled or unlabeled output batch is accepted into transport custody. The cache expires after 120 seconds from page issue; lost-reply replay does not refresh it. Full pagination integration/fault/runtime acceptance is in progress; the legacy local inventory and logical revoke selector have separate resource acceptance.",
+    "page_fields": {
+      "rows": "Number of rows in this page, from 0 through 32.",
+      "complete": "0 when continuation is required; 1 at the end of this bounded indexed scan. This does not establish atomic global freshness, full-roster coverage or revoke completion.",
+      "cursor": "Opaque nonzero 32-hex continuation nonce, or none at completion. Never a bearer credential, group ID, attachment ID or local DROP SID.",
+      "observed_at": "Unix milliseconds for this page observation, retained unchanged when its request is replayed.",
+      "observations": "per-page; lease freshness and support coverage can differ between pages."
+    },
+    "continuation": "A plain LIST MESH begins a new enumeration. Continue using exactly cursor=<returned nonce>, on the same authenticated physical connection and nickname. A zero-row incomplete page still requires continuation. Repeating a served continuation replays its canonical page with the current command label. Account inventory structural changes, cache expiry, account/nickname changes, connection replacement or Helix invalidate continuation; STALE_LIST requires a fresh LIST MESH."
+  },
+  "selectors": {
+    "group": "First 16 bytes of BLAKE3(onyx-session-public-group-v1 followed by NUL followed by the private 16-byte group token), rendered as lowercase hex.",
+    "group_is_not": [
+      "bearer credential",
+      "nickname",
+      "local DROP SID",
+      "physical attachment ID"
+    ],
+    "mesh_attachment_is_not": "The derived SID used by local SESSION DROP; do not interchange these equally sized identifiers."
+  },
+  "revocation": {
+    "command": "SESSION REVOKE group=<32-hex>",
+    "scope": "All physical attachments of the selected logical group across the validated mesh, including the calling connection if it belongs to that group.",
+    "pending_notice_prefix": "SESSION REVOKE PENDING scope=logical-session;",
+    "complete_notice_prefix": "SESSION REVOKE OK scope=logical-session;",
+    "pending_warning": "WARN SESSION PENDING",
+    "pending_rule": "Never infer completion or rollback from PENDING. Preflight may not have committed any fence; a committed notice establishes durable local denial. Later warnings cannot undo that denial.",
+    "polling": "Repeat the same command from another authenticated attachment of this account. Preserve the selector while pending; do not use a nickname or a new logical group as an equivalent target.",
+    "complete_rule": "OK requires signed durable-denial receipts for every member of the same validated full roster and activation epoch, after local physical authority is fenced.",
+    "partition_rule": "Missing support or receipts cannot become success. Durable terminal denial is retained across replay, reconnect, cold restart, and the current strict Helix boundary.",
+    "membership_retirement_limit": "Cold restore currently verifies historical fence signers against the configured full roster. Removing a signer can reject startup; a historical-authority migration is required before retiring that signer. Never delete its denial facts to bypass this check.",
+    "other_groups": "Unrelated logical groups and account-authentication credentials remain usable."
+  },
+  "errors": {
+    "syntax": [
+      "INVALID_SUBCOMMAND",
+      "INVALID_PARAMS",
+      "INVALID_GROUP",
+      "INVALID_CURSOR"
+    ],
+    "runtime": [
+      "UNSUPPORTED",
+      "NO_SUCH_SESSION",
+      "AMBIGUOUS_GROUP",
+      "TEMPORARILY_UNAVAILABLE",
+      "STALE_LIST"
+    ],
+    "resume_after_terminal_fence": "FAIL SESSION SESSION_REVOKED"
+  },
+  "credential_separation": {
+    "SESSION TOKEN": "Origin-local logical-session credential; publishing inventory alone does not issue portable authority or make an otherwise ineligible group remotely reclaimable through EXTERNAL.",
+    "SESSION MTOKEN response": "Separately sealed mesh credential emitted in response to TOKEN when supported; not a new MTOKEN request command.",
+    "SESSIONTOKEN and SASL SESSION-TOKEN": "Account-authentication credentials; not logical-session selectors or interchangeable resume envelopes."
+  }
+}

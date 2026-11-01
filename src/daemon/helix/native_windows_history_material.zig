@@ -132,7 +132,7 @@ fn parse(bytes: []const u8) error{InvalidSnapshot}!Parts {
     // HXTM is reused only for its exact default certificate/key codec. Reject
     // its serving TLS 1.2 and reload scheduler fields in this history-only row.
     const nested_payload = nested[frame.header_len .. nested.len - frame.checksum_len];
-    if (nested_payload[0] != 0 or nested_payload[1] != @intFromEnum(tls_proof.Tls12Mode.disabled) or
+    if (nested_payload[0] != 0 or nested_payload[1] != @backingInt(tls_proof.Tls12Mode.disabled) or
         std.mem.readInt(u32, nested_payload[8..12], .little) != 0 or
         std.mem.readInt(i64, nested_payload[44..52], .little) != 0) return error.InvalidSnapshot;
     return .{

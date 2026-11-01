@@ -990,8 +990,8 @@ fn transferredListenerMatches(captured: ListenerObservation, observed: ListenerO
     return captured.device == 0 and captured.inode != @as(u64, invalid_windows_socket) and std.meta.eql(captured, canonical);
 }
 fn acceptFailure(err: posix.E) if (builtin.os.tag == .linux) usize else c_int {
-    if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @intFromEnum(err))) else {
-        sys._errno().* = @intFromEnum(err);
+    if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @backingInt(err))) else {
+        sys._errno().* = @backingInt(err);
         return -1;
     }
 }

@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const account_identity = @import("../proto/account_identity.zig");
+const media_crypto_scope = @import("media_crypto_scope.zig");
 const base64url = @import("../proto/base64url.zig");
 const client_model = @import("client.zig");
 const media_room = @import("media_room.zig");
@@ -373,15 +374,28 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
             // local binding immediately after the detach publishes: if the new
             // handshake publication then fails, the connection is fail-closed
             // instead of continuing to authorize the already-retired A.
-            if (conn.media_e2ee_attachment_bound and !conn.mediaE2eeAttachmentMatches(attachment)) {
-                const superseded = conn.media_e2ee_attachment;
-                try self.publishMediaE2eeDetach(channel, nick, superseded);
-                conn.clearMediaE2eeAttachment();
+            // Prepare every bounded byte before any accepted DETACH. Crypto
+            // provenance never changes the independent browser route/MAC scope.
+            const prepared_scope = media_crypto_scope.Scope.init(channel, nick, attachment) catch {
+                try self.failReply(conn, "MEDIA", "BAD_E2EE_HANDSHAKE", "Invalid physical crypto scope");
+                return;
+            };
+            // The signature does not include local physical ClientId. Reject a
+            // sibling's already-owned public DETACH tuple BEFORE retiring this
+            // connection's old scope or publishing any replacement signal.
+            if (!self.mediaCryptoScopeAvailable(id, prepared_scope)) {
+                try self.failReply(conn, "MEDIA", "E2EE_ATTACHMENT_IN_USE", "Crypto attachment is already owned by another physical connection");
+                return;
             }
             var detail_buf: [Server.media_e2ee_max_base64_bytes + 1]u8 = undefined;
             const detail = std.fmt.bufPrint(&detail_buf, ":{s}", .{parsed.paramSlice()[2]}) catch return error.OutputTooSmall;
+            if (conn.media_e2ee_scope.bound and !conn.mediaE2eeScopeMatches(channel, nick, attachment)) {
+                const superseded = conn.media_e2ee_scope;
+                try self.publishMediaE2eeDetach(superseded.channelSlice(), superseded.participantSlice(), superseded.attachment);
+                conn.clearMediaE2eeAttachment();
+            }
             try self.publishMediaEvent("E2EE-HANDSHAKE", channel, nick, detail);
-            conn.bindMediaE2eeAttachment(attachment);
+            conn.bindMediaCryptoScope(prepared_scope);
             return;
         }
 
@@ -399,7 +413,7 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
                 try self.failReply(conn, "MEDIA", "BAD_E2EE_SENDER", "Sender attachment must be canonical base64url");
                 return;
             };
-            if (!conn.mediaE2eeAttachmentMatches(sender_attachment)) {
+            if (!conn.mediaE2eeScopeMatches(channel, nick, sender_attachment)) {
                 try self.failReply(conn, "MEDIA", "BAD_E2EE_SENDER", "Sender attachment does not match this connection's accepted handshake");
                 return;
             }
@@ -470,7 +484,13 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
         return;
     }
     if (std.ascii.eqlIgnoreCase(sub, "LEAVE")) {
-        const removal = try self.retireMediaPhysicalChannel(id, conn, channel, nick);
+        const removal = self.retireMediaPhysicalChannel(id, conn, channel, nick) catch |err| {
+            if (err == error.MediaRetirementBackpressure) {
+                try self.failReply(conn, "MEDIA", "TEMPORARILY_UNAVAILABLE", "Media channel state is busy; retry LEAVE");
+                return;
+            }
+            return err;
+        };
         if (removal == .absent) try self.noticeTo(conn, "MEDIA: you are not in this call");
         return;
     }

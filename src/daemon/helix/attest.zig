@@ -104,8 +104,8 @@ pub fn encode(allocator: Allocator, msg: Message) Error![]u8 {
     try appendI64(allocator, &out, msg.monotonic_ms);
     try appendU32(allocator, &out, msg.capsule_count);
     try appendU32(allocator, &out, msg.fd_count);
-    try out.append(allocator, @intFromEnum(msg.verdict));
-    try out.append(allocator, @intFromEnum(msg.reason));
+    try out.append(allocator, @backingInt(msg.verdict));
+    try out.append(allocator, @backingInt(msg.reason));
     return try out.toOwnedSlice(allocator);
 }
 

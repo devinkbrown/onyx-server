@@ -37,7 +37,7 @@ fn wait(fd: i32, writing: bool, deadline: i64) Error!void {
 fn encode(header: Header, bytes: *[header_len]u8) void {
     @memcpy(bytes[0..4], "HXOB");
     std.mem.writeInt(u16, bytes[4..6], 1, .big);
-    std.mem.writeInt(u16, bytes[6..8], @intFromEnum(header.kind), .big);
+    std.mem.writeInt(u16, bytes[6..8], @backingInt(header.kind), .big);
     std.mem.writeInt(u64, bytes[8..16], header.identity.generation, .big);
     @memcpy(bytes[16..32], &header.identity.upgrade_id);
     std.mem.writeInt(u32, bytes[32..36], header.index, .big);

@@ -88,6 +88,7 @@ pub const Options = struct {
 };
 
 pub const S2sLink = struct {
+    membership_terminal_rejected: bool = false,
     allocator: std.mem.Allocator,
     /// Monotonic clock cell read by the driver's `peer_link.Clock`. Stable
     /// address required: the clock captures `&self`.
@@ -171,8 +172,34 @@ pub const S2sLink = struct {
 
     /// Drive the link with inbound bytes; outbound frames accumulate in `out`.
     pub fn feed(self: *S2sLink, bytes: []const u8, now_ms: u64, rng_seed: u64) !void {
+        if (self.membership_terminal_rejected) return error.MembershipStreamRejected;
         self.now_ms = now_ms;
         try self.peer.feed(bytes, self.sink(), now_ms, rng_seed);
+    }
+
+    pub fn stageRetainedTransport(self: *S2sLink, bytes: []const u8) !void {
+        if (self.membership_terminal_rejected) return error.MembershipStreamRejected;
+        if (self.membershipDispatchPaused()) return error.MembershipDispatchPaused;
+        try self.peer.decoder.feed(bytes);
+    }
+
+    pub fn membershipProvenanceConflict(self: *const S2sLink) bool {
+        return self.peer.membershipProvenanceConflict();
+    }
+
+    pub fn rejectPendingMembershipProvenanceConflict(self: *S2sLink) !void {
+        try self.peer.rejectPendingMembershipProvenanceConflict();
+        self.membership_terminal_rejected = true;
+    }
+
+    pub fn membershipDispatchPaused(self: *const S2sLink) bool {
+        return self.peer.membershipDispatchPaused();
+    }
+
+    pub fn retryPendingMembership(self: *S2sLink, now_ms: u64, rng_seed: u64) !void {
+        if (self.membership_terminal_rejected) return error.MembershipStreamRejected;
+        self.now_ms = now_ms;
+        try self.peer.retryPendingMembership(self.sink(), now_ms, rng_seed);
     }
 
     /// Emit a PING with `payload` (heartbeat / liveness probe).
@@ -221,6 +248,7 @@ pub const S2sLink = struct {
     /// `primeResumedMember`), and a RESYNC burst reconverges the rest (see
     /// `s2s_peer.resumeEstablished`).
     pub fn snapshotResume(self: *const S2sLink) ResumeHeader {
+        if (self.membership_terminal_rejected or self.membershipDispatchPaused()) @panic("rejected or pending authenticated membership is not checkpointed");
         return self.peer.snapshotResume();
     }
 
@@ -334,6 +362,10 @@ pub const S2sLink = struct {
 
     pub fn setSessionTokenNickAuthorizer(self: *S2sLink, authorizer: ?SessionTokenNickAuthorizer) void {
         self.peer.setSessionTokenNickAuthorizer(authorizer);
+    }
+
+    pub fn setMembershipIdentityPreparer(self: *S2sLink, preparer: ?s2s_peer.MembershipIdentityPreparer) void {
+        self.peer.setMembershipIdentityPreparer(preparer);
     }
 
     pub fn rebindSessionToken(self: *S2sLink, origin_node: NodeId, nick: []const u8, token: ?SessionToken) !usize {
@@ -766,6 +798,10 @@ pub const S2sLink = struct {
 
     /// SESSION_REPLICA v2 is active only after secured signing + explicit remote
     /// capability negotiation. Plaintext and rolling-old links return false.
+    pub fn supportsSessionGroupV4(self: *const S2sLink) bool {
+        return self.peer.supportsSessionGroupV4();
+    }
+
     pub fn supportsSessionReplicaV2(self: *const S2sLink) bool {
         return self.peer.supportsSessionReplicaV2();
     }

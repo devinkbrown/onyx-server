@@ -4,8 +4,8 @@
 //! Daemon-owned media transport plane: ties the SFU endpoint registry
 //! (MediaTransport) to a live UDP MediaSocket and a background pump thread.
 //!
-//! The pump thread blocks on the media socket (with a short recv timeout so it
-//! can observe the stop flag), demultiplexes each datagram, and answers STUN
+//! The pump waits on media and a private producer/control wake, services bounded
+//! FIFO turns, demultiplexes each datagram, and answers STUN
 //! connectivity checks under a mutex. The daemon's main thread allocates and
 //! removes endpoints (on MEDIA OFFER / LEAVE) through the same mutex, so the two
 //! threads share the registry safely. Media STUN traffic is low-rate (a call
@@ -17,6 +17,12 @@ const cadence_frame = @import("../substrate/cadence_frame.zig");
 const routing = @import("../substrate/media_routing.zig");
 const media_rooms = @import("media_room.zig");
 const runtime_pause = @import("runtime_pause.zig");
+const PumpWake = @import("media_pump_wake.zig").Wake;
+const routing_send_turn_rows: usize = 16;
+const PumpBoundaryObserverTest = struct {
+    reached: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+};
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 const ecdsa = @import("../crypto/ecdsa_p256.zig");
 const x509 = @import("../crypto/x509.zig");
@@ -36,7 +42,14 @@ const dtls13_server = @import("../proto/dtls13_server.zig");
 const dtls_fingerprint = @import("../proto/dtls_fingerprint.zig");
 const peer_verify = @import("../proto/dtls_peer_verify.zig");
 const platform = @import("../substrate/platform.zig");
+const media_pacer = @import("../substrate/media_pacer.zig");
+const PriorityPacer = media_pacer.PriorityPacer;
 const sfu_srtp = @import("sfu_srtp.zig");
+
+/// Playout budget for cached-retransmit recovery. No playout/jitter budget
+/// is configured at the retransmit serving sites, so the deadline is capped
+/// at the existing `rtp_nack.retransmit_max_age_ms` freshness bound.
+const retransmit_playout_budget_ms: i64 = rtp_nack.retransmit_max_age_ms;
 
 pub const MediaTransport = media_transport.MediaTransport;
 pub const MediaSocket = media_socket.MediaSocket;
@@ -115,6 +128,66 @@ fn profileHasCodec(profile: media_rooms.CallProfile, tag: sdp.CodecTag) bool {
     for (profile.slice()) |codec| if (codec.tag == tag) return true;
     return false;
 }
+
+comptime {
+    // Bridge codec identity is backing-int equality with sdp.CodecTag;
+    // fail compilation instead of silently mislabeling if either renumbers.
+    for ([_]sdp.CodecTag{ .cadencevox, .cadencevis, .raw, .opus, .vp8 }) |tag| {
+        const bridged: media_bridge.Codec = @fromBackingInt(@backingInt(tag));
+        if (@backingInt(bridged) != @backingInt(tag)) @compileError("bridge codec ordinal drift");
+    }
+}
+
+/// Bridge codec identity shares `sdp.CodecTag` ordinals (see causeway.Codec).
+fn bridgeCodec(tag: sdp.CodecTag) media_bridge.Codec {
+    return @fromBackingInt(@intCast(@backingInt(tag)));
+}
+
+/// Default bridge PT map extended with the SDP gateway codecs: Opus (111)
+/// and VP8 (96) are recognized alongside the native cadence codecs that
+/// already occupied those dynamic PTs. Cadence entries stay first, so a PT
+/// alone still resolves to the native codec for native-leg rewrap, while
+/// `ptForCodec` also resolves the gateway codecs to the same PTs.
+fn bridgePtMap() media_bridge.PtMap {
+    var map = media_bridge.defaultPtMap();
+    if (sdp.CodecTag.opus.payloadType()) |pt| map.add(pt, bridgeCodec(.opus));
+    if (sdp.CodecTag.vp8.payloadType()) |pt| map.add(pt, bridgeCodec(.vp8));
+    return map;
+}
+
+/// Whether an RTP payload type is admitted for `profile`: the SDP gateway
+/// codec for the PT (Opus/VP8) or its native cadence counterpart must be
+/// advertised, and the media kind must be enabled in `kind_bits`. Unknown
+/// PTs are refused.
+fn profileAcceptsPayloadType(profile: media_rooms.CallProfile, kind_bits: u8, pt: u7) bool {
+    const gateway = sdp.CodecTag.fromPayloadType(pt) orelse return false;
+    const legacy: sdp.CodecTag = switch (gateway) {
+        .opus => .cadencevox,
+        .vp8 => .cadencevis,
+        else => return false,
+    };
+    if (!profileHasCodec(profile, gateway) and !profileHasCodec(profile, legacy)) return false;
+    return switch (gateway.mediaKind() orelse return false) {
+        .audio => kind_bits & 1 != 0,
+        .video => kind_bits & 6 != 0,
+    };
+}
+/// RTP-to-native rewrap for a negotiated profile. PT 111/96 payload is only
+/// rewrapped when the profile advertises the native cadence counterpart;
+/// a gateway-only Opus/VP8 profile has no common codec with the native leg,
+/// so forwarding is refused instead of mislabelling the untouched payload.
+fn rtpToNativeForProfile(profile: media_rooms.CallProfile, rtp: []const u8, map: *media_bridge.PtMap, stream_id: u32, out: []u8) !usize {
+    const header = try rtp_profile.decodeHeader(rtp);
+    if (sdp.CodecTag.fromPayloadType(header.header.payload_type)) |gateway| {
+        const legacy: sdp.CodecTag = switch (gateway) {
+            .opus => .cadencevox,
+            .vp8 => .cadencevis,
+            else => unreachable,
+        };
+        if (!profileHasCodec(profile, legacy)) return error.ProfileDenied;
+    }
+    return media_bridge.rtpToNativeDatagram(rtp, map, cadence_frame.MEDIA_BAND_FLOOR, stream_id, false, out);
+}
 fn validRoutingRemote(addr: TransportAddress) bool {
     return (addr.ip_len == 4 or addr.ip_len == 16) and addr.port != 0;
 }
@@ -141,7 +214,57 @@ pub const RoutingProducerFence = enum(u128) { _ };
 pub const RoutingEgressState = struct { queued: usize, inflight: bool, fenced: bool, capacity: usize, payload_limit: usize, next_ordinal: u64 };
 pub const RoutingAttemptObservation = struct { source: routing.EndpointStamp, target: routing.EndpointStamp };
 const RoutingWireKind = enum { canonical, native_frame, native_feedback };
-const RoutingEgressRow = struct { wire: RoutingWireKind = .canonical, source: routing.EndpointStamp, target: routing.EndpointStamp, kind: routing.PacketKind, source_stream: u32, ordinal: u64, len: usize, digest: [32]u8 };
+
+/// Reserve bounded headroom for feedback and audio before video can fill the
+/// shared queue. This is admission control, not a playout/pacing guarantee;
+/// accepted rows retain FIFO order and all current lifecycle/ordinal rules.
+fn routingIsAudioRtp(wire: RoutingWireKind, bytes: []const u8) bool {
+    return switch (wire) {
+        .native_frame => if (cadence_frame.decode(bytes)) |frame| frame.codec == .cadencevox_audio else |_| false,
+        .canonical => blk: {
+            const map = bridgePtMap();
+            break :blk if (rtp_profile.decodeHeader(bytes)) |decoded|
+                map.codecForPt(decoded.header.payload_type) == .cadencevox
+            else |_|
+                false;
+        },
+        .native_feedback => false,
+    };
+}
+
+/// Existing kind information at the egress admission site: RTCP is
+/// control, RTP classified audio by `routingIsAudioRtp` is audio, and
+/// every other RTP packet is video.
+fn routingEgressClass(kind: routing.PacketKind, wire: RoutingWireKind, bytes: []const u8) PriorityPacer.Class {
+    if (kind == .rtcp) return .control;
+    return if (routingIsAudioRtp(wire, bytes)) .audio else .video;
+}
+
+const routing_pacer_audio_bps: u64 = 800_000;
+const routing_pacer_control_bps: u64 = 800_000;
+const routing_pacer_video_bps: u64 = 8_000_000;
+const routing_pacer_burst_bytes: u32 = 256 * 1024;
+const routing_pacer_video_debt_bytes: u32 = 256 * 1024;
+const routing_pacer_audio_quantum_bytes: u32 = 200;
+
+fn defaultRoutingPacer(now_us: i64) PriorityPacer {
+    return PriorityPacer.init(routing_pacer_audio_bps, routing_pacer_control_bps, routing_pacer_video_bps, routing_pacer_burst_bytes, routing_pacer_burst_bytes, routing_pacer_burst_bytes, routing_pacer_video_debt_bytes, routing_pacer_audio_quantum_bytes, now_us);
+}
+
+fn routingPacerNowUs() i64 {
+    const ms = platform.monotonicMillisChecked() orelse return 0;
+    return ms * 1_000;
+}
+
+fn routingAdmissionLimit(capacity: usize, kind: routing.PacketKind, wire: RoutingWireKind, bytes: []const u8) usize {
+    if (kind == .rtcp or capacity <= 1) return capacity;
+    const audio = routingIsAudioRtp(wire, bytes);
+    // Capacity two retains one data slot and one feedback slot. Larger queues
+    // additionally reserve one audio slot. Unknown data uses the video limit.
+    return capacity - @min(capacity - 1, if (audio) @as(usize, 1) else 2);
+}
+
+const RoutingEgressRow = struct { wire: RoutingWireKind = .canonical, source: routing.EndpointStamp, target: routing.EndpointStamp, kind: routing.PacketKind, source_stream: u32, ordinal: u64, len: usize, digest: [32]u8, retransmit_sent_ms: ?i64 = null };
 const RoutingEgressQueue = struct {
     rows: []RoutingEgressRow,
     payloads: []u8,
@@ -157,6 +280,18 @@ const RoutingEgressQueue = struct {
     poisoned: bool = false,
     next_fence: u64 = 1,
     fence: ?RoutingProducerFence = null,
+    pacer: PriorityPacer = defaultRoutingPacer(0),
+
+    /// Peek-then-debit pacing under `mutex`: a grant is checked with
+    /// `delayUntilUs` before publication and debited with the same
+    /// timestamp only after the wake signal succeeds, so a refused or
+    /// unpublished packet never spends tokens.
+    fn pacerGrantable(self: *const RoutingEgressQueue, class: PriorityPacer.Class, size: u32, now_us: i64) bool {
+        return self.pacer.delayUntilUs(class, size, now_us) == 0;
+    }
+    fn pacerDebit(self: *RoutingEgressQueue, class: PriorityPacer.Class, size: u32, now_us: i64) void {
+        std.debug.assert(self.pacer.tryConsume(class, size, now_us));
+    }
 };
 
 pub const MediaPlane = struct {
@@ -173,6 +308,10 @@ pub const MediaPlane = struct {
     routing_ingress_refused: u64 = 0,
     routing_ingress_completed: u64 = 0,
     routing_last_ingress_error: ?anyerror = null,
+    fir_pli_ssrc_budget: FirPliSsrcBudget = .{},
+    /// Joint recovery policy gating cached-retransmit serves; counts every
+    /// serve dropped at/past the retransmit deadline in `dropped_late`.
+    retransmit_recovery: rtp_nack.RecoveryPolicy = .{ .playout_budget_ms = retransmit_playout_budget_ms },
     routing_crypto: [sfu_srtp.max_peers]RoutingCryptoAssociation = @splat(.{}),
     physical_restored: bool = false,
     physical_socket_snapshot: ?media_socket.Snapshot = null,
@@ -182,6 +321,16 @@ pub const MediaPlane = struct {
     physical_groups: PhysicalGroupMap = .empty,
     transport: MediaTransport,
     socket: ?MediaSocket = null,
+    pump_wake: ?PumpWake = null,
+    // Process-local terminal failure: failed workers cannot restart/checkpoint.
+    pump_failed: std.atomic.Value(bool) = .init(false),
+    // Observation only: fixtures cannot alter worker scheduling or authority.
+    test_retransmit_now: if (@import("builtin").is_test) std.atomic.Value(i64) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_retransmit_next: if (@import("builtin").is_test) std.atomic.Value(i64) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_waits: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_readiness_failures: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_max_send_turn: if (@import("builtin").is_test) std.atomic.Value(usize) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_boundary_observer: if (@import("builtin").is_test) ?*PumpBoundaryObserverTest else void = if (@import("builtin").is_test) null else {},
     mutex: std.atomic.Mutex = .unlocked,
     thread: ?std.Thread = null,
     legacy_joining: bool = false,
@@ -312,6 +461,12 @@ pub const MediaPlane = struct {
         const canonical = queue.payloads[queue.head * queue.payload_limit ..][0..row.len];
         queue.inflight = row.ordinal;
         queue.mutex.unlock();
+        if (row.retransmit_sent_ms) |sent_ms| {
+            if (!self.retransmitAllowedByRecovery(sent_ms)) {
+                self.finishRoutingEgressAttempt(queue, row.ordinal, .stale);
+                return .stale;
+            }
+        }
         const Process = struct {
             owner: *MediaPlane,
             domain: *routing.Domain,
@@ -406,6 +561,7 @@ pub const MediaPlane = struct {
     }
 
     fn sendPinnedRoutingAttempt(self: *MediaPlane, socket: *MediaSocket, row: RoutingEgressRow, canonical: []const u8) RoutingDisposition {
+        if (row.retransmit_sent_ms) |sent_ms| if (!rtp_nack.retransmitFresh(sent_ms, self.retransmitNow())) return .stale;
         if (row.target.endpoint.leg == .native) {
             if (row.wire == .canonical) return .denied;
             const outcome = self.routing_domain.?.sendNativeRoutingEgress(self, row.ordinal) catch return .denied;
@@ -444,8 +600,10 @@ pub const MediaPlane = struct {
                 .rtp => self.srtp_hub.protectRtp(addr, canonical, &protected),
                 .rtcp => self.srtp_hub.protectRtcp(addr, canonical, &protected),
             } orelse return .denied;
+            if (row.retransmit_sent_ms) |sent_ms| if (!rtp_nack.retransmitFresh(sent_ms, self.retransmitNow())) return .stale;
             return routingSendDisposition(socket.trySendTo(addr, wire));
         }
+        if (row.retransmit_sent_ms) |sent_ms| if (!rtp_nack.retransmitFresh(sent_ms, self.retransmitNow())) return .stale;
         return routingSendDisposition(socket.trySendTo(addr, canonical));
     }
 
@@ -488,7 +646,7 @@ pub const MediaPlane = struct {
         const payloads = try self.allocator.alloc(u8, bytes);
         errdefer self.allocator.free(payloads);
         @memset(payloads, 0);
-        queue.* = .{ .rows = rows, .payloads = payloads, .payload_limit = payload_limit };
+        queue.* = .{ .rows = rows, .payloads = payloads, .payload_limit = payload_limit, .pacer = defaultRoutingPacer(routingPacerNowUs()) };
         const Install = struct {
             owner: *MediaPlane,
             domain: *routing.Domain,
@@ -563,19 +721,36 @@ pub const MediaPlane = struct {
         lockSpin(&queue.mutex);
         defer queue.mutex.unlock();
         if (queue.fence != null) return error.ProducerFenced;
-        if (queue.len == queue.rows.len) return error.QueueFull;
+        if (queue.len >= routingAdmissionLimit(queue.rows.len, .rtp, .native_frame, frame.bytes)) return error.QueueFull;
         if (queue.next_ordinal == 0 or queue.next_ordinal == std.math.maxInt(u64)) return error.SequenceExhausted;
         const index = (queue.head + queue.len) % queue.rows.len;
         const storage = queue.payloads[index * queue.payload_limit ..][0..queue.payload_limit];
-        var map = media_bridge.defaultPtMap();
+        var map = bridgePtMap();
         // Publisher stream is source-issued and unique, never inferred from a
         // nickname, address, recipient stream or an absent bridge mapping.
         const canonical = media_bridge.nativeDatagramToRtp(frame.bytes, &map, frame.stream_id, storage) catch |err| {
             std.crypto.secureZero(u8, storage);
             return err;
         };
+        const pacer_class = routingEgressClass(.rtp, .native_frame, frame.bytes);
+        const pacer_now_us = routingPacerNowUs();
+        const pacer_size: u32 = @intCast(canonical.len);
+        if (!queue.pacerGrantable(pacer_class, pacer_size, pacer_now_us)) {
+            std.crypto.secureZero(u8, storage);
+            return error.QueueFull;
+        }
         const ordinal = queue.next_ordinal;
         queue.rows[index] = .{ .source = frame.source, .target = target, .kind = .rtp, .source_stream = frame.stream_id, .ordinal = ordinal, .len = canonical.len, .digest = routingPayloadDigest(canonical) };
+        // Exception for process-local nonblocking wake notification only:
+        // Plane+queue gates prevent signal consumption before publication.
+        // Media crypto and network sends remain outside the Domain cut.
+        // A failed wake cannot strand an accepted ordinal.
+        if (self.pump_wake) |*wake| wake.signal() catch |err| {
+            std.crypto.secureZero(u8, storage);
+            queue.rows[index] = undefined;
+            return err;
+        };
+        queue.pacerDebit(pacer_class, pacer_size, pacer_now_us);
         queue.len += 1;
         queue.next_ordinal += 1;
         return .{ .ordinal = ordinal };
@@ -638,7 +813,7 @@ pub const MediaPlane = struct {
         if (queue.fence != null) return error.Busy;
         if (queue.next_fence == 0 or queue.next_fence == std.math.maxInt(u64)) return error.SequenceExhausted;
         const context = try domain.webrtcSourceContextLocked(scope, self.routing_binding.?, self);
-        const fence: RoutingProducerFence = @enumFromInt(@as(u128, context.registration) | (@as(u128, queue.next_fence) << 64));
+        const fence: RoutingProducerFence = @fromBackingInt(@intCast(@as(u128, context.registration) | (@as(u128, queue.next_fence) << 64)));
         queue.next_fence += 1;
         queue.fence = fence;
         return fence;
@@ -668,7 +843,7 @@ pub const MediaPlane = struct {
 
     fn requireRoutingFence(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, queue: *RoutingEgressQueue, fence: RoutingProducerFence) !void {
         const context = try domain.webrtcSourceContextLocked(scope, self.routing_binding orelse return error.NotRoutingBound, self);
-        if (queue.fence != fence or @as(u64, @truncate(@intFromEnum(fence))) != context.registration) return error.InvalidFence;
+        if (queue.fence != fence or @as(u64, @truncate(@backingInt(fence))) != context.registration) return error.InvalidFence;
     }
 
     pub fn routingEgressStateLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked) !RoutingEgressState {
@@ -883,6 +1058,7 @@ pub const MediaPlane = struct {
     pub fn upgradeContinuityReady(self: *MediaPlane) bool {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (self.pump_failed.load(.acquire)) return false;
         lockSpin(&self.fp_mutex);
         defer self.fp_mutex.unlock();
         lockSpin(&self.rtcp_out_mutex);
@@ -910,6 +1086,7 @@ pub const MediaPlane = struct {
     /// mode is captured, not guessed from failed export. Actual activation waits
     /// for the physical pump/index/crypto integration and its strict DTO joins.
     pub fn prepareOffer(self: *MediaPlane, domain: *routing.Domain, offers: *routing.PreparedOffers, channel: []const u8, profile: media_rooms.CallProfile, kind_bits: u8, expected_fp: ?[peer_verify.digest_len]u8) !*PreparedWebrtcOffer {
+        if (self.pump_failed.load(.acquire)) return error.Stopped;
         if (channel.len == 0 or channel.len > 128 or kind_bits == 0 or kind_bits & ~@as(u8, 7) != 0 or profile.codec_count == 0 or profile.codec_count > media_rooms.max_profile_codecs) return error.InvalidProfile;
         const preview = offers.preview();
         var proposed: ?routing.EndpointObservation = null;
@@ -920,7 +1097,7 @@ pub const MediaPlane = struct {
         const identity = proposed orelse return error.EndpointUnavailable;
         const key = routing.EndpointKey{ .call = identity.reference.endpoint.call, .client = identity.reference.offering_client, .leg = .webrtc };
         lockSpin(&self.mutex);
-        if (self.routing_closed or self.routing_domain != domain or self.routing_binding == null) {
+        if (self.pump_failed.load(.acquire) or self.routing_closed or self.routing_domain != domain or self.routing_binding == null) {
             self.mutex.unlock();
             return error.NotRoutingBound;
         }
@@ -1155,6 +1332,7 @@ pub const MediaPlane = struct {
     /// Bind the media socket on `bind_be`:`port` (port 0 = ephemeral) and spawn
     /// the pump thread. No-op if already started.
     pub fn start(self: *MediaPlane, bind_be: u32, port: u16) !void {
+        if (self.pump_failed.load(.acquire)) return error.Stopped;
         if (self.routing_closed) return error.Closing;
         if (self.runtime.view != null) return error.SharedGateOwned;
         if (self.socket != null) return;
@@ -1164,17 +1342,22 @@ pub const MediaPlane = struct {
             self.stopDtls();
             self.socket.?.deinit();
             self.socket = null;
+            self.pump_wake.?.deinit();
+            self.pump_wake = null;
             self.port = 0;
             return err;
         };
     }
 
     fn prepareBoundResources(self: *MediaPlane, bind_be: u32, port: u16) !void {
+        if (self.pump_failed.load(.acquire)) return error.Stopped;
         if (self.physical_pending != 0 or self.routing_binding != null) return error.Busy;
         if (self.socket != null or self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
         if (self.max_frame_bytes == 0 or self.max_frame_bytes > max_datagram or self.max_upload_bytes == 0) return error.InvalidConfig;
         var sock = try MediaSocket.bind(bind_be, port);
         errdefer sock.deinit();
+        var wake = try PumpWake.init();
+        errdefer wake.deinit();
         const actual_port = try sock.localPort();
         // STUN discovery is explicit cold preparation, never inherited restore.
         if (self.stun_server) |srv| {
@@ -1194,6 +1377,7 @@ pub const MediaPlane = struct {
             std.log.warn("onyx-server: DTLS-SRTP terminator disabled ({s})", .{@errorName(err)});
         };
         self.socket = sock;
+        self.pump_wake = wake;
         self.port = actual_port;
     }
 
@@ -1207,6 +1391,11 @@ pub const MediaPlane = struct {
         const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
         _ = try socket.capture();
         try self.runtime.pause.bindIo(io);
+        try self.preparePumpWake();
+    }
+    fn preparePumpWake(self: *MediaPlane) !void {
+        if (self.pump_failed.load(.acquire)) return error.Stopped;
+        if (self.pump_wake == null) self.pump_wake = try PumpWake.init();
     }
     pub fn validateDormantRegistration(self: *MediaPlane, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
         try self.runtime.validateRegistration(control, view, slot, .media_plane, 0, self, dormant_spawn_options);
@@ -1217,6 +1406,7 @@ pub const MediaPlane = struct {
         if (self.legacy_joining or self.thread != null) return error.AlreadyStarted;
         const socket = if (self.socket) |*sock| sock else return error.NotPrepared;
         _ = try socket.capture();
+        try self.preparePumpWake();
         self.stop_flag.store(false, .release);
         try self.runtime.prepare(control, view, slot, .media_plane, 0, MediaPlane, self, pumpLoop, dormant_spawn_options);
     }
@@ -1237,6 +1427,10 @@ pub const MediaPlane = struct {
             self.mutex.unlock();
             return error.NotPrepared;
         }
+        self.preparePumpWake() catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
         self.legacy_joining = true;
         self.stop_flag.store(false, .release);
         self.mutex.unlock();
@@ -1277,6 +1471,15 @@ pub const MediaPlane = struct {
     pub fn requestStopAndWake(self: *MediaPlane) void {
         self.stop_flag.store(true, .release);
         self.runtime.wakeForStop();
+        self.wakePump();
+    }
+    fn wakePump(self: *MediaPlane) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        // Control requests retain their original finite watchdog if an OS
+        // failure prevents signaling; accepted FIFO rows were signaled before
+        // publication and never lose custody on a wake failure.
+        if (self.pump_wake) |*wake| wake.signal() catch {};
     }
     pub fn detachAfterJoined(self: *MediaPlane) !void {
         try self.runtime.detachAfterJoined();
@@ -1289,7 +1492,14 @@ pub const MediaPlane = struct {
         try self.runtime.requireActivated();
     }
     pub fn requestPause(self: *MediaPlane, epoch: u64) !runtime_pause.Token {
-        return self.runtime.pause.request(epoch);
+        const token = blk: {
+            lockSpin(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.pump_failed.load(.acquire)) return error.Stopped;
+            break :blk try self.runtime.pause.request(epoch);
+        };
+        self.wakePump();
+        return token;
     }
     pub fn awaitPaused(self: *MediaPlane, token: runtime_pause.Token, deadline: std.Io.Clock.Timestamp) !void {
         try self.runtime.pause.awaitPaused(token, deadline);
@@ -1343,6 +1553,7 @@ pub const MediaPlane = struct {
     fn captureIdle(self: *MediaPlane, execution: Execution, pristine_domain: ?*routing.Domain) !Snapshot {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (self.pump_failed.load(.acquire)) return error.Stopped;
         if (pristine_domain == null and self.routing_binding != null) return error.RoutingContinuityUnsupported;
         lockSpin(&self.fp_mutex);
         defer self.fp_mutex.unlock();
@@ -1653,10 +1864,16 @@ pub const MediaPlane = struct {
         self.runtime.requireDetached() catch @panic("managed stop requires Runtime Control join and source detach");
         self.stop_flag.store(true, .release);
         self.runtime.wakeForStop();
+        self.wakePump();
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
+        // The worker has joined; foreign producers cannot race wake close.
+        lockSpin(&self.mutex);
+        if (self.pump_wake) |*wake| wake.deinit();
+        self.pump_wake = null;
+        self.mutex.unlock();
         // Only safe to free after the pump (sole DTLS driver) has joined.
         self.stopDtls();
         if (self.socket) |*s| {
@@ -1996,15 +2213,7 @@ pub const MediaPlane = struct {
                         ctx.owner.mutex.unlock();
                         return err;
                     };
-                    const tag: sdp.CodecTag = switch (header.header.payload_type) {
-                        111 => .cadencevox,
-                        96 => .cadencevis,
-                        else => {
-                            ctx.owner.mutex.unlock();
-                            return error.ProfileDenied;
-                        },
-                    };
-                    if (!profileHasCodec(row.profile, tag) or (tag == .cadencevox and row.kind_bits & 1 == 0) or (tag == .cadencevis and row.kind_bits & 6 == 0)) {
+                    if (!profileAcceptsPayloadType(row.profile, row.kind_bits, header.header.payload_type)) {
                         ctx.owner.mutex.unlock();
                         return error.ProfileDenied;
                     }
@@ -2063,8 +2272,7 @@ pub const MediaPlane = struct {
         }
         var header: ?rtp_profile.DecodedHeader = null;
         if (kind == .rtcp) {
-            var sequences: [64]u16 = undefined;
-            _ = try parseRoutingFeedback(canonical, &sequences);
+            _ = try parseRoutingActions(canonical);
         } else {
             _ = try validatePhysicalRtpPacket(row, canonical);
             header = try rtp_profile.decodeHeader(canonical);
@@ -2076,7 +2284,7 @@ pub const MediaPlane = struct {
             const actual_header = header.?;
             // Root's actual inbound pin retains this source row while NEW
             // per-SSRC storage is prepared outside every exclusion gate.
-            cache = try self.physical_rows.getPtr(key).?.physical_cache.prepareSent(actual_header.header.ssrc, actual_header.header.sequence, canonical);
+            cache = try self.physical_rows.getPtr(key).?.physical_cache.prepareSentAt(actual_header.header.ssrc, actual_header.header.sequence, canonical, self.retransmitNow());
         }
         lockSpin(&self.mutex);
         var locked = true;
@@ -2123,8 +2331,8 @@ pub const MediaPlane = struct {
         if (target.endpoint.leg == .native) {
             if (source.kind != .rtp) return error.FeedbackUnavailable;
             var storage: [media_socket.max_datagram]u8 = undefined;
-            var map = media_bridge.defaultPtMap();
-            const length = try media_bridge.rtpToNativeDatagram(source.bytes, &map, cadence_frame.MEDIA_BAND_FLOOR, source.stream_id, false, &storage);
+            var map = bridgePtMap();
+            const length = try rtpToNativeForProfile(source.profile, source.bytes, &map, source.stream_id, &storage);
             const bytes = storage[0..length];
             try domain.requireNativeTargetLocked(scope, target, bytes);
             lockSpin(&self.mutex);
@@ -2144,17 +2352,32 @@ pub const MediaPlane = struct {
         return self.enqueueWireBytesLocked(source, target, kind, stream_id, bytes, .canonical);
     }
     fn enqueueWireBytesLocked(self: *MediaPlane, source: routing.EndpointStamp, target: routing.EndpointStamp, kind: routing.PacketKind, stream_id: u32, bytes: []const u8, wire: RoutingWireKind) !RoutingAccepted {
+        return self.enqueueWireBytesWithDeadlineLocked(source, target, kind, stream_id, bytes, wire, null);
+    }
+    fn enqueueWireBytesWithDeadlineLocked(self: *MediaPlane, source: routing.EndpointStamp, target: routing.EndpointStamp, kind: routing.PacketKind, stream_id: u32, bytes: []const u8, wire: RoutingWireKind, sent_ms: ?i64) !RoutingAccepted {
         const queue = self.routing_egress orelse return error.QueueUnavailable;
         lockSpin(&queue.mutex);
         defer queue.mutex.unlock();
-        if (self.routing_closed or queue.fence != null) return error.ProducerFenced;
-        if (queue.len == queue.rows.len) return error.QueueFull;
+        if (self.routing_closed or self.stop_flag.load(.acquire) or queue.fence != null) return error.ProducerFenced;
+        if (queue.len >= routingAdmissionLimit(queue.rows.len, kind, wire, bytes)) return error.QueueFull;
         if (queue.next_ordinal == 0 or queue.next_ordinal == std.math.maxInt(u64)) return error.SequenceExhausted;
         if (bytes.len > queue.payload_limit) return error.PayloadTooLarge;
+        const pacer_class = routingEgressClass(kind, wire, bytes);
+        const pacer_now_us = routingPacerNowUs();
+        const pacer_size: u32 = @intCast(bytes.len);
+        if (!queue.pacerGrantable(pacer_class, pacer_size, pacer_now_us)) return error.QueueFull;
         const index = (queue.head + queue.len) % queue.rows.len;
         @memcpy(queue.payloads[index * queue.payload_limit ..][0..bytes.len], bytes);
         const ordinal = queue.next_ordinal;
-        queue.rows[index] = .{ .wire = wire, .source = source, .target = target, .kind = kind, .source_stream = stream_id, .ordinal = ordinal, .len = bytes.len, .digest = routingPayloadDigest(bytes) };
+        queue.rows[index] = .{ .wire = wire, .source = source, .target = target, .kind = kind, .source_stream = stream_id, .ordinal = ordinal, .len = bytes.len, .digest = routingPayloadDigest(bytes), .retransmit_sent_ms = sent_ms };
+        // Only this coalesced process-local nonblocking notification runs
+        // under admission gates; media crypto/network sends remain outside.
+        if (self.pump_wake) |*wake| wake.signal() catch |err| {
+            std.crypto.secureZero(u8, queue.payloads[index * queue.payload_limit ..][0..queue.payload_limit]);
+            queue.rows[index] = undefined;
+            return err;
+        };
+        queue.pacerDebit(pacer_class, pacer_size, pacer_now_us);
         queue.len += 1;
         queue.next_ordinal += 1;
         return .{ .ordinal = ordinal };
@@ -2167,18 +2390,97 @@ pub const MediaPlane = struct {
         for (self.physical_ssrcs) |entry| if (entry.live and entry.ssrc == stream) return error.PublisherCollision;
     }
 
-    /// Traverse and validate EVERY compound member before selecting feedback.
-    /// Padding can occur only on the final member; supported feedback bodies
-    /// must match their complete canonical shape, not just the common header.
-    pub fn parseRoutingFeedback(bytes: []const u8, sequences: []u16) !rtcp_translate.Feedback {
+    // These values own their sequence lists: no slice may escape the ingress
+    // pin or be supplied by an external caller as evidence of authority.
+    pub const RoutingAction = struct {
+        kind: enum { keyframe, nack },
+        ssrc: u32,
+        sender: u32,
+        fir: bool = false,
+        fir_sequence: u8 = 0,
+        seqs: [64]u16 = undefined,
+        count: usize = 0,
+    };
+    pub const RoutingActions = struct {
+        actions: [8]RoutingAction = undefined,
+        count: usize = 0,
+        // Non-action members are borrowed offsets into the held datagram.
+        plain: [16]struct { offset: usize, len: usize } = undefined,
+        plain_count: usize = 0,
+        fn keyframe(self: *@This(), ssrc: u32, sender: u32, fir: bool, sequence: u8) !void {
+            for (self.actions[0..self.count]) |action| if (action.kind == .keyframe and action.ssrc == ssrc) return;
+            if (self.count == self.actions.len) return error.InvalidIngress;
+            self.actions[self.count] = .{ .kind = .keyframe, .ssrc = ssrc, .sender = sender, .fir = fir, .fir_sequence = sequence };
+            self.count += 1;
+        }
+        fn nack(self: *@This(), ssrc: u32, sender: u32, sequences: []const u16) !void {
+            var index: usize = 0;
+            while (index < self.count) : (index += 1) if (self.actions[index].kind == .nack and self.actions[index].ssrc == ssrc) break;
+            if (index == self.count) {
+                if (self.count == self.actions.len) return error.InvalidIngress;
+                self.actions[index] = .{ .kind = .nack, .ssrc = ssrc, .sender = sender };
+                self.count += 1;
+            }
+            const action = &self.actions[index];
+            for (sequences) |seq| {
+                if (std.mem.indexOfScalar(u16, action.seqs[0..action.count], seq) != null) continue;
+                if (action.count == action.seqs.len) return error.InvalidIngress;
+                action.seqs[action.count] = seq;
+                action.count += 1;
+            }
+        }
+    };
+    /// Per-SSRC FIR/PLI bound, in the fixed-window style of the routing
+    /// feedback budgets. Endpoint budgets alone cannot cap one media SSRC
+    /// driven through many requesters, so keyframe work for a single SSRC
+    /// gets its own window before any keyframe request is enqueued.
+    pub const FirPliSsrcBudget = struct {
+        pub const window_ms: i64 = 1000;
+        pub const limit: u16 = 4;
+        pub const max_tracked: usize = 8;
+        const Slot = struct { ssrc: u32 = 0, started_ms: i64 = 0, used: u16 = 0 };
+        slots: [max_tracked]Slot = @splat(.{}),
+        dropped: u64 = 0,
+
+        pub fn allow(self: *FirPliSsrcBudget, ssrc: u32, now_ms: i64) bool {
+            if (now_ms <= 0) {
+                self.dropped +|= 1;
+                return false;
+            }
+            var free: ?*Slot = null;
+            for (&self.slots) |*slot| {
+                if (slot.used != 0 and slot.ssrc == ssrc) {
+                    if (now_ms < slot.started_ms) {
+                        self.dropped +|= 1;
+                        return false;
+                    }
+                    if (now_ms - slot.started_ms >= window_ms) slot.* = .{ .ssrc = ssrc, .started_ms = now_ms };
+                    if (slot.used >= limit) {
+                        self.dropped +|= 1;
+                        return false;
+                    }
+                    slot.used += 1;
+                    return true;
+                }
+                if (free == null and (slot.used == 0 or now_ms - slot.started_ms >= window_ms)) free = slot;
+            }
+            const slot = free orelse {
+                self.dropped +|= 1;
+                return false;
+            };
+            slot.* = .{ .ssrc = ssrc, .started_ms = now_ms, .used = 1 };
+            return true;
+        }
+    };
+    pub fn parseRoutingActions(bytes: []const u8) !RoutingActions {
         if (bytes.len < 4 or bytes.len % 4 != 0) return error.InvalidIngress;
         var compound = @import("../proto/rtcp_compound.zig").parse(bytes);
         while (try compound.next()) |_| {}
-        var selected: ?rtcp_translate.Feedback = null;
+        var result: RoutingActions = .{};
         var offset: usize = 0;
         while (offset < bytes.len) {
             const length = (@as(usize, std.mem.readInt(u16, bytes[offset + 2 ..][0..2], .big)) + 1) * 4;
-            const packet = bytes[offset..][0..length]; // full iterator checked bounds
+            const packet = bytes[offset..][0..length];
             var effective = length;
             if (packet[0] & 0x20 != 0) {
                 if (offset + length != bytes.len) return error.InvalidIngress;
@@ -2188,39 +2490,45 @@ pub const MediaPlane = struct {
             }
             const body = packet[0..effective];
             const fmt = packet[0] & 0x1f;
-            switch (packet[1]) {
-                205, 206 => {
-                    if (effective < 12 or effective % 4 != 0) return error.InvalidIngress;
-                    if (packet[1] == 206 and fmt == 1 and effective != 12) return error.InvalidIngress;
-                    if (packet[1] == 206 and fmt == 4) {
-                        if (effective < 20 or (effective - 12) % 8 != 0 or (effective - 12) / 8 > 16 or std.mem.readInt(u32, body[8..12], .big) != 0) return error.InvalidIngress;
-                        var entry: usize = 12;
-                        while (entry < effective) : (entry += 8) for (body[entry + 5 ..][0..3]) |reserved| if (reserved != 0) return error.InvalidIngress;
+            var actionable = false;
+            if (packet[1] == 205 or packet[1] == 206) {
+                if (effective < 12 or effective % 4 != 0) return error.InvalidIngress;
+                const sender = std.mem.readInt(u32, body[4..8], .big);
+                if (packet[1] == 206 and fmt == 1) {
+                    if (effective != 12) return error.InvalidIngress;
+                    try result.keyframe(std.mem.readInt(u32, body[8..12], .big), sender, false, 0);
+                    actionable = true;
+                } else if (packet[1] == 206 and fmt == 4) {
+                    if (effective < 20 or (effective - 12) % 8 != 0 or std.mem.readInt(u32, body[8..12], .big) != 0) return error.InvalidIngress;
+                    var entry: usize = 12;
+                    while (entry < effective) : (entry += 8) {
+                        for (body[entry + 5 ..][0..3]) |reserved| if (reserved != 0) return error.InvalidIngress;
+                        try result.keyframe(std.mem.readInt(u32, body[entry..][0..4], .big), sender, true, body[entry + 4]);
                     }
-                    if (packet[1] == 205 and fmt == 1 and (effective < 16 or (effective - 12) % 4 != 0)) return error.InvalidIngress;
+                    actionable = true;
+                } else if (packet[1] == 205 and fmt == 1) {
+                    if (effective < 16 or (effective - 12) % 4 != 0) return error.InvalidIngress;
                     var scratch: [64]u16 = undefined;
                     const feedback = try rtcp_translate.parse(body, &scratch);
-                    if (selected == null) switch (feedback) {
-                        .nack => |nack| {
-                            if (nack.seqs.len > sequences.len) return error.InvalidIngress;
-                            @memcpy(sequences[0..nack.seqs.len], nack.seqs);
-                            selected = .{ .nack = .{ .media_ssrc = nack.media_ssrc, .seqs = sequences[0..nack.seqs.len] } };
-                        },
-                        .keyframe_request => |request| selected = .{ .keyframe_request = request },
-                        .other => {},
-                    };
-                },
-                204 => if (effective < 12) return error.InvalidIngress,
-                207 => {
-                    if (effective < 8) return error.InvalidIngress;
-                    var blocks: @import("../proto/rtcp_xr.zig").BlockIterator = .{ .bytes = body[8..] };
-                    while (try blocks.next()) |_| {}
-                },
-                else => {}, // compound iterator validates SR/RR/SDES/BYE
+                    const nack = feedback.nack;
+                    try result.nack(nack.media_ssrc, sender, nack.seqs);
+                    actionable = true;
+                }
+            } else if (packet[1] == 204) {
+                if (effective < 12) return error.InvalidIngress;
+            } else if (packet[1] == 207) {
+                if (effective < 8) return error.InvalidIngress;
+                var blocks: @import("../proto/rtcp_xr.zig").BlockIterator = .{ .bytes = body[8..] };
+                while (try blocks.next()) |_| {}
+            }
+            if (!actionable) {
+                if (result.plain_count == result.plain.len) return error.InvalidIngress;
+                result.plain[result.plain_count] = .{ .offset = offset, .len = length };
+                result.plain_count += 1;
             }
             offset += length;
         }
-        return selected orelse .other;
+        return result;
     }
 
     pub fn routingPublisherForFeedbackLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64, ssrc: u32) !routing.EndpointStamp {
@@ -2238,69 +2546,110 @@ pub const MediaPlane = struct {
         return error.RouteDenied;
     }
 
-    pub fn enqueueWebrtcFeedbackLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64, target: routing.EndpointStamp) !RoutingAccepted {
+    fn routingActionLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64, index: usize) !RoutingAction {
         const source = try domain.resolveWebrtcCanonicalLocked(scope, self, ordinal);
         if (source.kind != .rtcp) return error.InvalidIngress;
+        const parsed = try parseRoutingActions(source.bytes);
+        if (index >= parsed.count) return error.InvalidIngress;
+        return parsed.actions[index];
+    }
+    fn encodeNativeAction(action: *const RoutingAction, stream: u32, storage: []u8) ![]const u8 {
+        return switch (action.kind) {
+            .keyframe => try native_feedback.encodeKeyframeRequest(stream, storage),
+            .nack => nack: {
+                var seqs: [64]u32 = undefined;
+                for (action.seqs[0..action.count], 0..) |seq, i| seqs[i] = seq;
+                break :nack try native_feedback.encodeNack(stream, seqs[0..action.count], storage);
+            },
+        };
+    }
+    pub fn validateRoutingActionTargetLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64, index: usize, target: routing.EndpointStamp) !void {
+        const source = try domain.resolveWebrtcCanonicalLocked(scope, self, ordinal);
+        const action = try self.routingActionLocked(domain, scope, ordinal, index);
         const destination = try domain.requireCurrentLocked(scope, target);
         if (!std.meta.eql(target.endpoint.call, source.source.endpoint.call) or target.offering_client.eql(source.source.offering_client)) return error.RouteDenied;
-        var seqs: [64]u16 = undefined;
-        const request = try parseRoutingFeedback(source.bytes, &seqs);
+        if (target.endpoint.leg == .native) {
+            if (destination.stream_id != action.ssrc) return error.RouteDenied;
+            var storage: [7 + 64 * 4]u8 = undefined;
+            try domain.requireNativeFeedbackTargetLocked(scope, target, try encodeNativeAction(&action, destination.stream_id, &storage));
+        } else {
+            const actual = try self.routingPublisherForFeedbackLocked(domain, scope, ordinal, action.ssrc);
+            if (!std.meta.eql(actual, target)) return error.RouteDenied;
+        }
+    }
+    pub fn enqueueWebrtcFeedbackLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64, index: usize, target: routing.EndpointStamp) !RoutingAccepted {
+        try self.validateRoutingActionTargetLocked(domain, scope, ordinal, index, target);
+        const source = try domain.resolveWebrtcCanonicalLocked(scope, self, ordinal);
+        const action = try self.routingActionLocked(domain, scope, ordinal, index);
+        const destination = try domain.requireCurrentLocked(scope, target);
         if (target.endpoint.leg == .native) {
             var storage: [7 + 64 * 4]u8 = undefined;
-            const feedback = switch (request) {
-                .keyframe_request => try native_feedback.encodeKeyframeRequest(destination.stream_id, &storage),
-                .nack => |nack| nack: {
-                    var seqs32: [64]u32 = undefined;
-                    for (nack.seqs, 0..) |seq, i| seqs32[i] = seq;
-                    break :nack try native_feedback.encodeNack(destination.stream_id, seqs32[0..nack.seqs.len], &storage);
-                },
-                .other => return error.FeedbackUnavailable,
-            };
-            try domain.requireNativeFeedbackTargetLocked(scope, target, feedback);
+            const feedback = try encodeNativeAction(&action, destination.stream_id, &storage);
             lockSpin(&self.mutex);
             defer self.mutex.unlock();
+            if (action.kind == .keyframe and !self.fir_pli_ssrc_budget.allow(action.ssrc, self.retransmitNow())) return error.FeedbackRateLimited;
             return self.enqueueWireBytesLocked(source.source, target, .rtcp, source.stream_id, feedback, .native_feedback);
         }
-        const publisher_ssrc: u32 = switch (request) {
-            .keyframe_request => |value| value.media_ssrc,
-            .nack => |value| value.media_ssrc,
-            .other => return error.FeedbackUnavailable,
+        var storage: [12 + 64 * 4]u8 = undefined;
+        const wire = if (action.fir) wire: {
+            @memset(storage[0..20], 0);
+            storage[0] = 0x84;
+            storage[1] = 206;
+            std.mem.writeInt(u16, storage[2..4], 4, .big);
+            std.mem.writeInt(u32, storage[4..8], action.sender, .big);
+            std.mem.writeInt(u32, storage[12..16], action.ssrc, .big);
+            storage[16] = action.fir_sequence;
+            break :wire storage[0..20];
+        } else switch (action.kind) {
+            .keyframe => try rtcp_translate.buildKeyframeRequest(action.sender, action.ssrc, &storage),
+            .nack => try rtcp_translate.buildNack(action.sender, action.ssrc, action.seqs[0..action.count], &storage),
         };
-        const actual = try self.routingPublisherForFeedbackLocked(domain, scope, ordinal, publisher_ssrc);
-        if (!std.meta.eql(actual, target)) return error.RouteDenied;
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        return self.enqueueCanonicalBytesLocked(source.source, target, .rtcp, source.stream_id, source.bytes);
+        if (action.kind == .keyframe and !self.fir_pli_ssrc_budget.allow(action.ssrc, self.retransmitNow())) return error.FeedbackRateLimited;
+        return self.enqueueCanonicalBytesLocked(source.source, target, .rtcp, source.stream_id, wire);
     }
-
-    pub fn enqueueRoutingNackLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64) !routing.FanoutResult {
+    fn retransmitNow(self: *MediaPlane) i64 {
+        if (comptime @import("builtin").is_test) {
+            const selected = self.test_retransmit_now.load(.acquire);
+            if (selected > 0) {
+                const next = self.test_retransmit_next.swap(0, .acq_rel);
+                if (next > 0) self.test_retransmit_now.store(next, .release);
+                return selected;
+            }
+        }
+        return platform.monotonicMillisChecked() orelse 0;
+    }
+    /// Serve a cached retransmit only strictly before the recovery deadline
+    /// (playout budget minus jitter); at/past it, drop and count it late.
+    fn retransmitAllowedByRecovery(self: *MediaPlane, sent_ms: i64) bool {
+        const age_ms = self.retransmitNow() -| sent_ms;
+        return self.retransmit_recovery.decide(age_ms, 1) == .retransmit;
+    }
+    pub fn enqueueRoutingNackLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64, index: usize, publisher: routing.EndpointStamp) !routing.FanoutResult {
+        try self.validateRoutingActionTargetLocked(domain, scope, ordinal, index, publisher);
         const requester = try domain.resolveWebrtcCanonicalLocked(scope, self, ordinal);
-        if (requester.kind != .rtcp) return error.InvalidIngress;
-        var seqs: [64]u16 = undefined;
-        const feedback = try parseRoutingFeedback(requester.bytes, &seqs);
-        const nack = switch (feedback) {
-            .nack => |value| value,
-            else => return error.InvalidIngress,
-        };
-        const publisher = try self.routingPublisherForFeedbackLocked(domain, scope, ordinal, nack.media_ssrc);
+        const action = try self.routingActionLocked(domain, scope, ordinal, index);
+        if (action.kind != .nack or publisher.endpoint.leg != .webrtc) return error.InvalidIngress;
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         const row = self.physical_rows.get(.{ .call = publisher.endpoint.call, .client = publisher.offering_client, .leg = .webrtc }).?;
+        const target = self.physical_rows.get(.{ .call = requester.source.endpoint.call, .client = requester.source.offering_client, .leg = .webrtc }) orelse return error.EndpointUnavailable;
+        _ = try domain.requireCurrentLocked(scope, target.identity.stamp);
+        try domain.requireBridgeNegotiationLocked(scope, target.identity.reference, target.profile, target.kind_bits);
         var result = routing.FanoutResult{ .recognized = true };
-        for (nack.seqs) |seq| {
-            const packet = row.physical_cache.lookup(nack.media_ssrc, seq) orelse {
+        const nack_now = self.retransmitNow();
+        for (action.seqs[0..action.count]) |seq| {
+            const retained = row.physical_cache.lookupFreshPacket(action.ssrc, seq, nack_now) orelse {
                 result.refused += 1;
                 continue;
             };
-            const target = self.physical_rows.get(.{ .call = requester.source.endpoint.call, .client = requester.source.offering_client, .leg = .webrtc }) orelse return error.EndpointUnavailable;
-            _ = try domain.requireCurrentLocked(scope, target.identity.stamp);
-            try domain.requireBridgeNegotiationLocked(scope, target.identity.reference, target.profile, target.kind_bits);
-            requirePhysicalRtpPacketPolicy(target, packet) catch |err| {
+            requirePhysicalRtpPacketPolicy(target, retained.bytes) catch |err| {
                 result.refused += 1;
                 result.last_refusal = err;
                 continue;
             };
-            _ = self.enqueueCanonicalBytesLocked(row.identity.stamp, requester.source, .rtp, row.identity.stream_id, packet) catch |err| {
+            _ = self.enqueueWireBytesWithDeadlineLocked(row.identity.stamp, requester.source, .rtp, row.identity.stream_id, retained.bytes, .canonical, retained.sent_ms) catch |err| {
                 result.refused += 1;
                 result.last_refusal = err;
                 continue;
@@ -2308,6 +2657,20 @@ pub const MediaPlane = struct {
             result.accepted += 1;
         }
         return result;
+    }
+    pub fn enqueueRoutingPlainLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64, index: usize, target: routing.EndpointStamp) !RoutingAccepted {
+        const source = try domain.resolveWebrtcCanonicalLocked(scope, self, ordinal);
+        const parsed = try parseRoutingActions(source.bytes);
+        if (index >= parsed.plain_count) return error.InvalidIngress;
+        const destination = try domain.requireCurrentLocked(scope, target);
+        if (target.endpoint.leg != .webrtc or !std.meta.eql(source.source.endpoint.call, target.endpoint.call) or source.source.offering_client.eql(target.offering_client)) return error.RouteDenied;
+        const piece = parsed.plain[index];
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const row = self.physical_rows.get(.{ .call = target.endpoint.call, .client = target.offering_client, .leg = .webrtc }) orelse return error.EndpointUnavailable;
+        if (!std.meta.eql(row.identity, destination)) return error.StaleCandidate;
+        try domain.requireBridgeNegotiationLocked(scope, row.identity.reference, row.profile, row.kind_bits);
+        return self.enqueueCanonicalBytesLocked(source.source, target, .rtcp, source.stream_id, source.bytes[piece.offset..][0..piece.len]);
     }
 
     fn noteRoutingIngressError(self: *MediaPlane, err: anyerror) void {
@@ -2338,13 +2701,60 @@ pub const MediaPlane = struct {
         defer self.runtime.markExited();
         var buf: [media_socket.max_datagram]u8 = undefined;
         while (!self.stop_flag.load(.acquire)) {
+            // Drain BEFORE the pause boundary: a request arriving after the
+            // boundary must retain its signal until the following wait. A
+            // request arriving before it is observed by boundary itself.
+            lockSpin(&self.mutex);
+            if (self.pump_wake) |*wake| wake.drain();
+            self.mutex.unlock();
             self.runtime.pause.boundary();
             if (self.stop_flag.load(.acquire)) break;
+            if (@import("builtin").is_test) {
+                // Test-only scheduling interleaving, outside every source gate;
+                // this observer cannot publish, consume or authorize a row.
+                lockSpin(&self.mutex);
+                const observer = self.test_boundary_observer;
+                self.mutex.unlock();
+                if (observer) |actual| {
+                    actual.reached.store(true, .release);
+                    while (!actual.released.load(.acquire) and !self.stop_flag.load(.acquire)) std.Thread.yield() catch {};
+                }
+            }
             const sock = &(self.socket orelse return);
+            var sent_rows: usize = 0;
             if (physically_routed) {
-                while (self.drainOneRoutingEgress(sock) catch break) |_| {}
+                while (sent_rows < routing_send_turn_rows and !self.stop_flag.load(.acquire)) {
+                    _ = (self.drainOneRoutingEgress(sock) catch break) orelse break;
+                    sent_rows += 1;
+                }
             } else self.drainQueuedRtcp(sock);
-            const got = sock.recvFrom(&buf) orelse {
+            if (@import("builtin").is_test) {
+                const previous = self.test_max_send_turn.load(.monotonic);
+                if (sent_rows > previous) self.test_max_send_turn.store(sent_rows, .release);
+            }
+            if (self.stop_flag.load(.acquire)) break;
+            // Full turns revisit the pause boundary even if producers continue.
+            // Check UDP readiness without sleeping while FIFO work remains.
+            lockSpin(&self.mutex);
+            var pending = false;
+            if (self.routing_egress) |queue| {
+                lockSpin(&queue.mutex);
+                pending = queue.len != 0;
+                queue.mutex.unlock();
+            }
+            self.mutex.unlock();
+            const wait_ms: u32 = if (pending) 0 else sock.recv_timeout_ms;
+            if (@import("builtin").is_test and wait_ms != 0) _ = self.test_waits.fetchAdd(1, .release);
+            const ready = self.pump_wake.?.wait(sock.fd, wait_ms) catch {
+                if (@import("builtin").is_test) _ = self.test_readiness_failures.fetchAdd(1, .release);
+                self.failPumpReadiness();
+                break;
+            };
+            if (!ready.media) continue;
+            // Local poll policy only: the inherited socket and DTO stay exact.
+            var receive_view = sock.*;
+            receive_view.recv_timeout_ms = 0;
+            const got = receive_view.recvFrom(&buf) orelse {
                 if (!physically_routed) self.drainQueuedRtcp(sock);
                 continue;
             }; // timeout/idle
@@ -2412,6 +2822,60 @@ pub const MediaPlane = struct {
                 }
             }
         }
+    }
+
+    /// Readiness failed after every preceding operation released its pins.
+    /// Fence admission atomically with the source gate, then settle accepted
+    /// unattempted rows without crypto, network I/O or new Domain authority.
+    /// The actual worker exits normally; its lifecycle owner still owns join.
+    fn failPumpReadiness(self: *MediaPlane) void {
+        if (self.routing_domain) |domain| {
+            const Cut = struct {
+                fn run(_: *routing.Locked, owner: *MediaPlane) error{}!void {
+                    owner.failPumpReadinessSource();
+                }
+            };
+            // Readiness-only boundary: this worker already released every
+            // ingress/egress pin. Join aggregate offer validate/commit exclusion.
+            domain.withLocked(self, Cut.run) catch {
+                // Closing/exhaustion is reported only after the Domain mutex
+                // barrier. Earlier cuts have finished and future ordinary
+                // publication is forbidden; failure still fences/settles when
+                // no new scope serial is available. Not a general fallback.
+                self.failPumpReadinessSource();
+            };
+        } else self.failPumpReadinessSource();
+        // Cancel racing pause only AFTER Domain and Plane exclusion release.
+        self.runtime.wakeForStop();
+    }
+    fn failPumpReadinessSource(self: *MediaPlane) void {
+        lockSpin(&self.mutex);
+        std.debug.assert(self.worker_id == std.Thread.getCurrentId() and self.routing_inbound == null);
+        self.pump_failed.store(true, .release);
+        self.stop_flag.store(true, .release);
+        if (self.routing_egress) |queue| {
+            while (true) {
+                lockSpin(&queue.mutex);
+                std.debug.assert(queue.pump_id == std.Thread.getCurrentId() and queue.inflight == null and !queue.poisoned);
+                if (queue.len == 0) {
+                    queue.mutex.unlock();
+                    break;
+                }
+                const ordinal = queue.rows[queue.head].ordinal;
+                queue.inflight = ordinal;
+                queue.mutex.unlock();
+                self.finishRoutingEgressAttempt(queue, ordinal, .source_error);
+            }
+        }
+        lockSpin(&self.rtcp_out_mutex);
+        while (self.rtcp_out_len != 0) {
+            std.crypto.secureZero(u8, &self.rtcp_out[self.rtcp_out_head].bytes);
+            self.rtcp_out[self.rtcp_out_head].len = 0;
+            self.rtcp_out_head = (self.rtcp_out_head + 1) % rtcp_egress_queue_cap;
+            self.rtcp_out_len -= 1;
+        }
+        self.rtcp_out_mutex.unlock();
+        self.mutex.unlock();
     }
 
     /// Drain off-thread RTCP egress on the pump thread. This is the only place
@@ -2786,6 +3250,9 @@ pub const MediaPlane = struct {
     /// into the DTLS terminator by resolved peer address once the peer's DTLS
     /// records arrive, so the handshake fails closed on a mismatch. Idempotent.
     pub fn bindOfferedFingerprint(self: *MediaPlane, channel: []const u8, participant: []const u8, digest: [peer_verify.digest_len]u8) !void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.pump_failed.load(.acquire)) return error.Stopped;
         var kb: [256]u8 = undefined;
         const k = fpKey(&kb, channel, participant) orelse return error.NameTooLong;
         lockSpin(&self.fp_mutex);
@@ -2982,19 +3449,19 @@ pub const MediaPlane = struct {
         if (req_state == .unavailable) return; // DTLS peer with no context ⇒ nothing to send
         for (missing) |seq| {
             lockSpin(&self.mutex);
-            const got = self.transport.copyRetransmit(media_ssrc, seq, &scratch);
+            const got = self.transport.copyRetransmitFreshAt(media_ssrc, seq, &scratch, self.retransmitNow());
             self.mutex.unlock();
-            if (got) |len| {
-                const canonical = scratch[0..len];
+            if (got) |retained| {
+                const canonical = scratch[0..retained.len];
                 switch (req_state) {
                     // Re-protect under the requester's own key. The hub derives
                     // the SRTP nonce from `canonical`'s header, and copyRetransmit
                     // guarantees that header carries `media_ssrc` — so the replay
                     // window and the nonce can never diverge on the NACK path.
                     .ready => if (self.srtp_hub.protectRtp(requester, canonical, &enc_buf)) |wire| {
-                        sock.sendTo(requester, wire);
+                        if (self.retransmitAllowedByRecovery(retained.sent_ms)) sock.sendTo(requester, wire);
                     },
-                    else => sock.sendTo(requester, canonical),
+                    else => if (self.retransmitAllowedByRecovery(retained.sent_ms)) sock.sendTo(requester, canonical),
                 }
             }
         }
@@ -3014,6 +3481,7 @@ pub const MediaPlane = struct {
     pub fn setReceiverSpatial(self: *MediaPlane, channel: []const u8, participant: []const u8, max_spatial: u8) bool {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (self.pump_failed.load(.acquire)) return false;
         return self.transport.setReceiverSpatial(channel, participant, max_spatial);
     }
 
@@ -3022,6 +3490,7 @@ pub const MediaPlane = struct {
     pub fn allocate(self: *MediaPlane, channel: []const u8, participant: []const u8) ?Creds {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (self.pump_failed.load(.acquire)) return null;
         const ep = self.transport.allocate(channel, participant, self.csprng.random()) catch return null;
         return .{ .ufrag = ep.ufrag, .pwd = ep.pwd };
     }
@@ -3036,9 +3505,10 @@ pub const MediaPlane = struct {
     }
 
     /// The per-call SRTP group key (SDES) for `channel`, generated on first use.
-    pub fn groupKey(self: *MediaPlane, channel: []const u8) [media_transport.group_key_len]u8 {
+    pub fn groupKey(self: *MediaPlane, channel: []const u8) ?[media_transport.group_key_len]u8 {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (self.pump_failed.load(.acquire)) return null;
         return self.transport.ensureGroupKey(channel, self.csprng.random());
     }
 
@@ -3064,6 +3534,7 @@ pub const MediaPlane = struct {
     /// cross-leg sink to deliver RTP-rewrapped frames to WebRTC peers. UDP
     /// sendto on a shared fd is safe to call from another thread.
     pub fn sendTo(self: *MediaPlane, dest: TransportAddress, bytes: []const u8) void {
+        if (self.pump_failed.load(.acquire)) return;
         if (self.socket) |*s| s.sendTo(dest, bytes);
     }
 
@@ -3071,14 +3542,15 @@ pub const MediaPlane = struct {
     /// DTLS-SRTP is enabled, this enqueues the packet for pump-thread egress so
     /// the pump-owned SRTCP crypto hub can protect DTLS recipients.
     pub fn sendRtcpTo(self: *MediaPlane, dest: TransportAddress, bytes: []const u8) void {
+        if (self.pump_failed.load(.acquire)) return;
         if (!self.dtls_enabled) {
-            if (self.socket) |*s| s.sendTo(dest, bytes);
+            self.sendTo(dest, bytes);
             return;
         }
         if (self.socket == null or bytes.len > rtcp_egress_max_bytes) return;
         lockSpin(&self.rtcp_out_mutex);
         defer self.rtcp_out_mutex.unlock();
-        if (self.rtcp_out_len >= rtcp_egress_queue_cap) return;
+        if (self.stop_flag.load(.acquire) or self.rtcp_out_len >= rtcp_egress_queue_cap) return;
         const idx = (self.rtcp_out_head + self.rtcp_out_len) % rtcp_egress_queue_cap;
         self.rtcp_out[idx].dest = dest;
         self.rtcp_out[idx].len = bytes.len;
@@ -3983,7 +4455,7 @@ pub const PhysicalSnapshot = struct {
         if (a.client.shard != b.client.shard) return a.client.shard < b.client.shard;
         if (a.client.slot != b.client.slot) return a.client.slot < b.client.slot;
         if (a.client.gen != b.client.gen) return a.client.gen < b.client.gen;
-        return @intFromEnum(a.leg) < @intFromEnum(b.leg);
+        return @backingInt(a.leg) < @backingInt(b.leg);
     }
     fn callLess(a: routing.CallId, b: routing.CallId) bool {
         if (a.domain.serial != b.domain.serial) return a.domain.serial < b.domain.serial;
@@ -4354,7 +4826,7 @@ pub const PhysicalSnapshot = struct {
         errdefer allocator.free(rows);
         const payloads = try allocator.alloc(u8, try std.math.mul(usize, self.queue.capacity, self.queue.payload_limit));
         @memset(payloads, 0);
-        queue.* = .{ .rows = rows, .payloads = payloads, .payload_limit = self.queue.payload_limit, .head = self.queue.head, .next_ordinal = self.queue.next_ordinal, .completed = self.queue.completed, .last_disposition = self.queue.last_disposition, .next_fence = self.queue.next_fence };
+        queue.* = .{ .rows = rows, .payloads = payloads, .payload_limit = self.queue.payload_limit, .head = self.queue.head, .next_ordinal = self.queue.next_ordinal, .completed = self.queue.completed, .last_disposition = self.queue.last_disposition, .next_fence = self.queue.next_fence, .pacer = defaultRoutingPacer(routingPacerNowUs()) };
         candidate.queue = queue;
         return candidate;
     }
@@ -4743,12 +5215,7 @@ const PhysicalRtcEndpoint = struct {
 };
 fn validatePhysicalRtpPacket(row: PhysicalRtcEndpoint, bytes: []const u8) !u8 {
     const header = try rtp_profile.decodeHeader(bytes);
-    const tag: sdp.CodecTag = switch (header.header.payload_type) {
-        111 => .cadencevox,
-        96 => .cadencevis,
-        else => return error.ProfileDenied,
-    };
-    if (!profileHasCodec(row.profile, tag) or (tag == .cadencevox and row.kind_bits & 1 == 0) or (tag == .cadencevis and row.kind_bits & 6 == 0)) return error.ProfileDenied;
+    if (!profileAcceptsPayloadType(row.profile, row.kind_bits, header.header.payload_type)) return error.ProfileDenied;
     const extension = try @import("../proto/rtp_ext.zig").find(bytes, @import("../proto/rtp_ext.zig").spatial_layer_id);
     if (extension) |layer| {
         if (layer.len != 1) return error.InvalidIngress;
@@ -4799,6 +5266,7 @@ fn rtcDigest(row: PhysicalRtcEndpoint) [32]u8 {
     for (rtx.packets.items) |packet| {
         std.hash.autoHash(&hash, packet.seq);
         std.hash.autoHash(&hash, packet.ext_seq);
+        std.hash.autoHash(&hash, packet.sent_ms);
         std.hash.autoHash(&hash, @intFromPtr(packet.bytes.ptr));
         std.hash.autoHash(&hash, packet.bytes.len);
         hash.update(packet.bytes);
@@ -5036,7 +5504,7 @@ pub const PreparedWebrtcOffer = opaque {
         try domain.requireWebrtcBindingLocked(scope, owner.routing_binding orelse return error.NotRoutingBound, owner);
         lockSpin(&owner.mutex);
         defer owner.mutex.unlock();
-        if (owner.routing_closed or owner.physical_revision != plan.revision or !std.meta.eql(rtcMapState(owner.physical_rows), plan.rows_state) or !std.meta.eql(rtcMapState(owner.physical_ufrags), plan.ufrags_state) or !std.meta.eql(rtcMapState(owner.physical_groups), plan.groups_state) or !std.meta.eql(owner.physical_groups.get(plan.key.call), plan.old_group) or owner.dtls_enabled != plan.dtls_enabled or owner.dtls13_enabled != plan.dtls13_enabled) return error.StaleCandidate;
+        if (owner.pump_failed.load(.acquire) or owner.routing_closed or owner.physical_revision != plan.revision or !std.meta.eql(rtcMapState(owner.physical_rows), plan.rows_state) or !std.meta.eql(rtcMapState(owner.physical_ufrags), plan.ufrags_state) or !std.meta.eql(rtcMapState(owner.physical_groups), plan.groups_state) or !std.meta.eql(owner.physical_groups.get(plan.key.call), plan.old_group) or owner.dtls_enabled != plan.dtls_enabled or owner.dtls13_enabled != plan.dtls13_enabled) return error.StaleCandidate;
         const current = owner.physical_rows.get(plan.key);
         if ((current == null) != (plan.old == null)) return error.StaleCandidate;
         if (current) |row| {
@@ -5469,6 +5937,132 @@ fn provisionPhysicalClientTest(domain: *routing.Domain, native: *@import("native
     try domain.withLocked(FullPhysicalJoinTest{ .domain = domain, .membership = membership, .room = joined }, FullPhysicalJoinTest.run);
     return preview.call;
 }
+const PtMatrixCase = struct { tag: sdp.CodecTag, pt: u7, kind_bits: u8, native_codec: cadence_frame.CodecTag, clock: u32 };
+const pt_matrix_cases = [_]PtMatrixCase{
+    .{ .tag = .cadencevox, .pt = 111, .kind_bits = 1, .native_codec = .cadencevox_audio, .clock = 48_000 },
+    .{ .tag = .opus, .pt = 111, .kind_bits = 1, .native_codec = .cadencevox_audio, .clock = 48_000 },
+    .{ .tag = .cadencevis, .pt = 96, .kind_bits = 6, .native_codec = .cadencevis_video, .clock = 90_000 },
+    .{ .tag = .vp8, .pt = 96, .kind_bits = 6, .native_codec = .cadencevis_video, .clock = 90_000 },
+};
+const pt_matrix_payload = "pt-matrix-payload-0123456789";
+
+test "payload type matrix advertised codec PT and leg payload bytes pass unchanged" {
+    const native_mod = @import("native_media_transport.zig");
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("pt matrix fixture retained Domain");
+    var native = native_mod.NativeMediaTransport.init(testing.allocator);
+    defer native.deinit();
+    var webrtc = try MediaPlane.initFallible(testing.allocator);
+    defer webrtc.deinit();
+    var rooms = media_rooms.MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    const native_binding = try domain.bindNative(&native);
+    const webrtc_binding = domain.bindWebrtc(&webrtc) catch |err| {
+        try domain.releaseNative(native_binding);
+        return err;
+    };
+    const a = routing.ClientId{ .shard = 0, .slot = 0, .gen = 0 };
+    defer {
+        domain.closeForTerminal() catch @panic("pt matrix fixture retained custody");
+        retirePhysicalClientTest(domain, &native, &webrtc, &rooms, a) catch @panic("pt matrix retirement");
+        domain.releaseWebrtc(webrtc_binding) catch @panic("pt matrix WebRTC binding");
+        domain.releaseNative(native_binding) catch @panic("pt matrix native binding");
+    }
+    const call = try provisionPhysicalClientTest(domain, &native, &webrtc, &rooms, "#pt-matrix", a, "owner");
+    const key = routing.EndpointKey{ .call = call, .client = a, .leg = .webrtc };
+    var map = bridgePtMap();
+    for (pt_matrix_cases) |case| {
+        var row = webrtc.physical_rows.get(key).?;
+        var profile = media_rooms.CallProfile{};
+        profile.codecs[0] = .{ .tag = case.tag, .clock_rate = case.clock, .params = 0 };
+        profile.codec_count = 1;
+        row.profile = profile;
+        row.kind_bits = case.kind_bits;
+        // WebRTC leg: advertised PT is admitted and its payload is unchanged
+        // after rewrap onto the native leg.
+        var packet_buf: [256]u8 = undefined;
+        const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = case.pt, .sequence = 7, .timestamp = 960, .ssrc = 4242 }, .payload = pt_matrix_payload }, &packet_buf);
+        _ = try validatePhysicalRtpPacket(row, packet);
+        if (case.tag == .opus or case.tag == .vp8) {
+            // Gateway-only profile: no cadence counterpart was negotiated, so
+            // the native leg must refuse instead of mislabelling the payload.
+            var denied_out: [256]u8 = undefined;
+            try testing.expectError(error.ProfileDenied, rtpToNativeForProfile(row.profile, packet, &map, 77, &denied_out));
+            // WebRTC leg: canonical forwarding keeps PT and payload identical.
+            const webrtc_header = try rtp_profile.decodeHeader(packet);
+            try testing.expectEqual(case.pt, webrtc_header.header.payload_type);
+            try testing.expectEqualStrings(pt_matrix_payload, packet[rtp_profile.header_len..]);
+            continue;
+        }
+        var native_out: [256]u8 = undefined;
+        const native_len = try rtpToNativeForProfile(row.profile, packet, &map, 77, &native_out);
+        const native_frame = try cadence_frame.decode(native_out[0..native_len]);
+        try testing.expectEqual(case.native_codec, native_frame.codec);
+        try testing.expectEqualStrings(pt_matrix_payload, native_frame.payload);
+        // Native leg: the same payload emitted as RTP carries the advertised
+        // PT and the identical payload bytes after the 12-byte RTP header.
+        var frame_buf: [256]u8 = undefined;
+        const frame_len = try cadence_frame.encode(.{ .band_id = cadence_frame.MEDIA_BAND_FLOOR, .stream_id = 77, .sequence = 7, .timestamp = 960, .codec = case.native_codec, .keyframe = true, .payload = pt_matrix_payload }, &frame_buf);
+        var rtp_buf: [256]u8 = undefined;
+        const rtp = try media_bridge.nativeDatagramToRtp(frame_buf[0..frame_len], &map, 4242, &rtp_buf);
+        const header = try rtp_profile.decodeHeader(rtp);
+        try testing.expectEqual(case.pt, header.header.payload_type);
+        try testing.expectEqualStrings(pt_matrix_payload, rtp[rtp_profile.header_len..]);
+    }
+}
+
+test "payload type matrix PT mapping round-trips and unsupported PT is refused" {
+    var map = bridgePtMap();
+    for (pt_matrix_cases) |case| {
+        const bridge_codec: media_bridge.Codec = @fromBackingInt(@intCast(@backingInt(case.tag)));
+        try testing.expectEqual(@as(?u7, case.pt), map.ptForCodec(bridge_codec));
+        try testing.expect(map.codecForPt(case.pt) != null);
+        if (case.tag.payloadType()) |pt| {
+            try testing.expectEqual(case.pt, pt);
+            try testing.expectEqual(@as(?sdp.CodecTag, case.tag), sdp.CodecTag.fromPayloadType(pt));
+        }
+    }
+    try testing.expectEqual(@as(?u7, null), map.ptForCodec(@fromBackingInt(@intCast(@backingInt(sdp.CodecTag.raw)))));
+    try testing.expect(map.codecForPt(127) == null);
+    try testing.expectEqual(@as(?sdp.CodecTag, null), sdp.CodecTag.fromPayloadType(127));
+    var packet_buf: [256]u8 = undefined;
+    const unsupported = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 127, .sequence = 1, .timestamp = 1, .ssrc = 4242 }, .payload = pt_matrix_payload }, &packet_buf);
+    var out: [256]u8 = undefined;
+    try testing.expectError(error.UnknownPayloadType, media_bridge.rtpToNativeDatagram(unsupported, &map, cadence_frame.MEDIA_BAND_FLOOR, 77, false, &out));
+    // A known PT whose codec was not advertised is refused at ingress policy,
+    // as is an entirely unknown PT, reusing the physical client fixture.
+    const native_mod = @import("native_media_transport.zig");
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("pt matrix refusal retained Domain");
+    var native = native_mod.NativeMediaTransport.init(testing.allocator);
+    defer native.deinit();
+    var webrtc = try MediaPlane.initFallible(testing.allocator);
+    defer webrtc.deinit();
+    var rooms = media_rooms.MediaRooms.init(testing.allocator);
+    defer rooms.deinit();
+    const native_binding = try domain.bindNative(&native);
+    const webrtc_binding = domain.bindWebrtc(&webrtc) catch |err| {
+        try domain.releaseNative(native_binding);
+        return err;
+    };
+    const a = routing.ClientId{ .shard = 0, .slot = 0, .gen = 0 };
+    defer {
+        domain.closeForTerminal() catch @panic("pt matrix refusal retained custody");
+        retirePhysicalClientTest(domain, &native, &webrtc, &rooms, a) catch @panic("pt matrix refusal retirement");
+        domain.releaseWebrtc(webrtc_binding) catch @panic("pt matrix refusal WebRTC binding");
+        domain.releaseNative(native_binding) catch @panic("pt matrix refusal native binding");
+    }
+    const call = try provisionPhysicalClientTest(domain, &native, &webrtc, &rooms, "#pt-matrix-refuse", a, "owner");
+    var row = webrtc.physical_rows.get(.{ .call = call, .client = a, .leg = .webrtc }).?;
+    row.profile.codecs[0] = .{ .tag = .vp8, .clock_rate = 90_000, .params = 0 };
+    row.profile.codec_count = 1;
+    row.kind_bits = 6;
+    var packet111_buf: [256]u8 = undefined;
+    const audio_packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 1, .timestamp = 1, .ssrc = 4242 }, .payload = pt_matrix_payload }, &packet111_buf);
+    try testing.expectError(error.ProfileDenied, validatePhysicalRtpPacket(row, audio_packet));
+    try testing.expectError(error.ProfileDenied, validatePhysicalRtpPacket(row, unsupported));
+}
+
 fn retirePhysicalClientTest(domain: *routing.Domain, native: *@import("native_media_transport.zig").NativeMediaTransport, webrtc: *MediaPlane, rooms: *media_rooms.MediaRooms, id: routing.ClientId) !void {
     const departure = try domain.prepareClientDeparture(id);
     defer departure.deinit();
@@ -5857,6 +6451,127 @@ test "physical prepared legacy Plane worker actual join retains exact bound sock
 }
 
 const PhysicalOfferedPeerTest = struct { key: routing.EndpointKey, creds: Creds };
+
+test "routing media admission retains audio and feedback headroom without consuming refused ordinals" {
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("admission retained Domain");
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var owner = try MediaPlane.initFallible(failing.allocator());
+    defer owner.deinit();
+    const binding = try domain.bindWebrtc(&owner);
+    defer domain.releaseWebrtc(binding) catch @panic("admission retained binding");
+    try owner.prepareRoutingEgress(domain, 4, 256);
+    defer owner.disposeRoutingEgress(domain) catch @panic("admission retained queue");
+    const stamp: routing.EndpointStamp = .{
+        .endpoint = .{ .call = .{ .domain = .{ .serial = 1 }, .serial = 1 }, .serial = 1, .leg = .webrtc },
+        .binding_revision = 1,
+        .security_revision = 1,
+        .offering_client = .{ .shard = 0, .slot = 0, .gen = 1 },
+    };
+    var video: [13]u8 = @splat(0);
+    _ = try rtp_profile.encodeHeader(.{ .payload_type = 96, .sequence = 1, .timestamp = 1, .ssrc = 1 }, &video);
+    video[12] = 'v';
+    var audio = video;
+    audio[1] = 111;
+    audio[12] = 'a';
+    const feedback = [_]u8{ 0x80, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2 };
+    // Admission itself never allocates. Queue rows remain in existing FIFO
+    // custody; this test does not claim codec, socket or playout acceptance.
+    failing.fail_index = failing.alloc_index;
+    defer failing.fail_index = std.math.maxInt(usize);
+    const first = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &video);
+    const second = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &video);
+    const queue = owner.routing_egress.?;
+    const before = routingPayloadDigest(queue.payloads);
+    const ordinal = queue.next_ordinal;
+    try testing.expectError(error.QueueFull, owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &video));
+    try testing.expectEqual(ordinal, queue.next_ordinal);
+    try testing.expectEqualDeep(before, routingPayloadDigest(queue.payloads));
+    const third = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &audio);
+    try testing.expectError(error.QueueFull, owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &audio));
+    const fourth = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtcp, 1, &feedback);
+    try testing.expectError(error.QueueFull, owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtcp, 1, &feedback));
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(@as(usize, 4), queue.len);
+    for ([_]RoutingAccepted{ first, second, third, fourth }, 0..) |accepted, index| {
+        try testing.expectEqual(@as(u64, @intCast(index + 1)), accepted.ordinal);
+        try testing.expectEqual(accepted.ordinal, queue.rows[index].ordinal);
+    }
+    queue.pump_id = std.Thread.getCurrentId();
+    defer queue.pump_id = null;
+    for ([_]RoutingAccepted{ first, second, third, fourth }) |accepted| {
+        queue.inflight = accepted.ordinal;
+        owner.finishRoutingEgressAttempt(queue, accepted.ordinal, .sent);
+    }
+    try testing.expectEqual(@as(usize, 0), queue.len);
+    try testing.expect(std.mem.allEqual(u8, queue.payloads, 0));
+    // Once the pump has released accepted custody, a previously refused video
+    // can retry without a new source identity or allocation.
+    const retry = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &video);
+    try testing.expectEqual(@as(u64, 5), retry.ordinal);
+    queue.inflight = retry.ordinal;
+    owner.finishRoutingEgressAttempt(queue, retry.ordinal, .sent);
+}
+
+test "pacer admission: video burst does not delay audio grant" {
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("pacer retained Domain");
+    var owner = try MediaPlane.initFallible(testing.allocator);
+    defer owner.deinit();
+    const binding = try domain.bindWebrtc(&owner);
+    defer domain.releaseWebrtc(binding) catch @panic("pacer retained binding");
+    try owner.prepareRoutingEgress(domain, 8, 256);
+    defer owner.disposeRoutingEgress(domain) catch @panic("pacer retained queue");
+    const stamp: routing.EndpointStamp = .{
+        .endpoint = .{ .call = .{ .domain = .{ .serial = 1 }, .serial = 1 }, .serial = 1, .leg = .webrtc },
+        .binding_revision = 1,
+        .security_revision = 1,
+        .offering_client = .{ .shard = 0, .slot = 0, .gen = 1 },
+    };
+    const queue = owner.routing_egress.?;
+    // Tight video bucket only; audio/control keep their own buckets. Video
+    // rate is zero so the burst budget can never refill mid-test: denial of
+    // the fourth packet is deterministic under any scheduler load.
+    queue.pacer = PriorityPacer.init(800_000, 800_000, 0, 1_000, 1_000, 600, 600, 200, routingPacerNowUs());
+    var video: [200]u8 = @splat(0);
+    _ = try rtp_profile.encodeHeader(.{ .payload_type = 96, .sequence = 1, .timestamp = 1, .ssrc = 1 }, video[0..13]);
+    var audio = video;
+    audio[1] = 111;
+    const feedback = [_]u8{ 0x80, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2 };
+    _ = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &video);
+    _ = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &video);
+    _ = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &video);
+    const ordinal = queue.next_ordinal;
+    // Video bucket exhausted at len 3, well below the FIFO admission limit.
+    try testing.expectError(error.QueueFull, owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &video));
+    try testing.expectEqual(ordinal, queue.next_ordinal);
+    try testing.expectEqual(@as(usize, 3), queue.len);
+    // Audio and control grants are not delayed by the video burst.
+    _ = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &audio);
+    _ = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtcp, 1, &feedback);
+    queue.pump_id = std.Thread.getCurrentId();
+    defer queue.pump_id = null;
+    while (queue.len != 0) {
+        const head = queue.rows[queue.head];
+        queue.inflight = head.ordinal;
+        owner.finishRoutingEgressAttempt(queue, head.ordinal, .sent);
+    }
+}
+
+test "routing admission classifies native audio and bounds every small queue" {
+    var storage: [64]u8 = undefined;
+    const length = try cadence_frame.encode(.{ .band_id = cadence_frame.MEDIA_BAND_FLOOR, .stream_id = 1, .sequence = 1, .timestamp = 1, .codec = .cadencevox_audio, .keyframe = false, .payload = "a" }, &storage);
+    for (0..66) |capacity| {
+        const audio = routingAdmissionLimit(capacity, .rtp, .native_frame, storage[0..length]);
+        const video = routingAdmissionLimit(capacity, .rtp, .canonical, "invalid");
+        const feedback = routingAdmissionLimit(capacity, .rtcp, .native_feedback, "");
+        try testing.expect(video <= audio and audio <= feedback and feedback == capacity);
+        if (capacity != 0) try testing.expect(video != 0);
+        if (capacity > 1) try testing.expect(audio < feedback);
+        if (capacity > 2) try testing.expect(video < audio);
+    }
+}
+
 const PhysicalIceFixture = struct {
     domain: *routing.Domain,
     owner: *MediaPlane,
@@ -5866,6 +6581,9 @@ const PhysicalIceFixture = struct {
         return initWithDtls(fail, false);
     }
     fn initWithDtls(fail: *testing.FailingAllocator, enabled: bool) !@This() {
+        return initWithCapacity(fail, enabled, 4);
+    }
+    fn initWithCapacity(fail: *testing.FailingAllocator, enabled: bool, capacity: usize) !@This() {
         const domain = try routing.Domain.create(testing.allocator);
         errdefer domain.destroyQuiesced() catch unreachable;
         const owner = try testing.allocator.create(MediaPlane);
@@ -5876,7 +6594,7 @@ const PhysicalIceFixture = struct {
         try owner.prepareColdResources(testing.io, loopback_be, 0);
         const binding = try domain.bindWebrtc(owner);
         errdefer domain.releaseWebrtc(binding) catch unreachable;
-        try owner.prepareRoutingEgress(domain, 4, 1024);
+        try owner.prepareRoutingEgress(domain, capacity, 1024);
         return .{ .domain = domain, .owner = owner, .binding = binding, .fail = fail };
     }
     fn deinit(self: *@This()) void {
@@ -6245,6 +6963,8 @@ test "physical WebRTC actual group worker relays and refuses foreign or unbound 
     var fail = testing.FailingAllocator.init(testing.allocator, .{});
     var fixture = try PhysicalIceFixture.init(&fail);
     defer fixture.deinit();
+    // Negative endpoint receive deadlines test authority, not cache age.
+    fixture.owner.test_retransmit_now.store(100, .release);
     var first = try offerPhysicalGroupBridgeTest(&fixture, "#group-worker", .{ .shard = 0, .slot = 0, .gen = 0 });
     defer std.crypto.secureZero(u8, &first.creds.pwd);
     var second = try offerPhysicalGroupBridgeTest(&fixture, "#group-worker", .{ .shard = 0, .slot = 1, .gen = 0 });
@@ -6346,10 +7066,13 @@ const FiveBlockerGroupFixture = struct {
     credentials: [3]PhysicalOfferedPeerTest,
     destination: TransportAddress,
     fn create(video_recipient: bool) !*@This() {
+        return createWithCapacity(video_recipient, 4);
+    }
+    fn createWithCapacity(video_recipient: bool, capacity: usize) !*@This() {
         const fixture = try testing.allocator.create(@This());
         errdefer testing.allocator.destroy(fixture);
         fixture.fail = testing.FailingAllocator.init(testing.allocator, .{});
-        fixture.physical = try PhysicalIceFixture.init(&fixture.fail);
+        fixture.physical = try PhysicalIceFixture.initWithCapacity(&fixture.fail, false, capacity);
         errdefer fixture.physical.deinit();
         var opened: usize = 0;
         errdefer for (fixture.peers[0..opened]) |*peer| peer.deinit();
@@ -6376,6 +7099,47 @@ const FiveBlockerGroupFixture = struct {
         testing.allocator.destroy(self);
     }
 };
+const PressureAggregateFixture = struct {
+    fail: testing.FailingAllocator,
+    physical: PhysicalIceFixture,
+    peers: [6]MediaSocket,
+    credentials: [6]PhysicalOfferedPeerTest,
+    destination: TransportAddress,
+    fn create(video_recipient: bool) !*@This() {
+        return createWithCapacity(video_recipient, 4);
+    }
+    fn createWithCapacity(video_recipient: bool, capacity: usize) !*@This() {
+        const fixture = try testing.allocator.create(@This());
+        errdefer testing.allocator.destroy(fixture);
+        fixture.fail = testing.FailingAllocator.init(testing.allocator, .{});
+        fixture.physical = try PhysicalIceFixture.initWithCapacity(&fixture.fail, false, capacity);
+        errdefer fixture.physical.deinit();
+        var opened: usize = 0;
+        errdefer for (fixture.peers[0..opened]) |*peer| peer.deinit();
+        var issued: usize = 0;
+        errdefer for (fixture.credentials[0..issued]) |*peer| std.crypto.secureZero(u8, &peer.creds.pwd);
+        for (&fixture.peers, &fixture.credentials, 0..) |*peer, *credential, n| {
+            credential.* = try fiveBlockerOfferTest(&fixture.physical, .{ .shard = 0, .slot = @intCast(n), .gen = 0 }, video_recipient);
+            issued += 1;
+            peer.* = try MediaSocket.bind(loopback_be, 0);
+            opened += 1;
+            peer.setRecvTimeoutMs(700);
+        }
+        fixture.destination = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, fixture.physical.owner.port);
+        try fixture.physical.owner.startPreparedLegacyWorker();
+        for (&fixture.peers, &fixture.credentials, 0..) |*peer, *credential, n| try bindPhysicalGroupPeerTest(peer, fixture.destination, &credential.creds, @intCast(0x81 + n));
+        return fixture;
+    }
+    fn destroy(self: *@This()) void {
+        self.physical.deinit();
+        for (&self.peers, &self.credentials) |*peer, *credential| {
+            peer.deinit();
+            std.crypto.secureZero(u8, &credential.creds.pwd);
+        }
+        testing.allocator.destroy(self);
+    }
+};
+
 test "physical media five-blocker causal distinct accepted SSRCs retain independent equal sequence cache" {
     const fixture = try FiveBlockerGroupFixture.create(true);
     defer fixture.destroy();
@@ -6438,52 +7202,94 @@ test "physical media five-blocker causal strict PLI rejects extra FCI before rou
 }
 
 test "physical media strict compound validates later feedback padding FIR and NACK count before selection" {
-    var seqs: [64]u16 = undefined;
     const pli: [12]u8 = .{ 0x81, 206, 0, 2, 0, 0, 0, 77, 0, 0, 0, 9 };
-    const positive = try MediaPlane.parseRoutingFeedback(&pli, &seqs);
-    try testing.expectEqual(@as(u32, 9), positive.keyframe_request.media_ssrc);
+    const positive = try MediaPlane.parseRoutingActions(&pli);
+    try testing.expectEqual(@as(usize, 1), positive.count);
+    try testing.expectEqual(@as(u32, 9), positive.actions[0].ssrc);
     var padded: [16]u8 = @splat(0);
     @memcpy(padded[0..12], &pli);
     padded[0] |= 0x20;
     padded[3] = 3;
     padded[15] = 4;
-    try testing.expectEqual(@as(u32, 9), (try MediaPlane.parseRoutingFeedback(&padded, &seqs)).keyframe_request.media_ssrc);
+    try testing.expectEqual(@as(u32, 9), (try MediaPlane.parseRoutingActions(&padded)).actions[0].ssrc);
     padded[15] = 0;
-    try testing.expectError(error.BadLength, MediaPlane.parseRoutingFeedback(&padded, &seqs));
+    try testing.expectError(error.BadLength, MediaPlane.parseRoutingActions(&padded));
     padded[15] = 4;
     var compound: [28]u8 = undefined;
     @memcpy(compound[0..16], &padded);
     @memcpy(compound[16..], &pli);
-    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingFeedback(&compound, &seqs));
+    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingActions(&compound));
     // A valid first feedback must not hide a malformed later member.
     @memcpy(compound[0..12], &pli);
     @memcpy(compound[12..24], &pli);
     @memset(compound[24..], 0);
     compound[15] = 3;
-    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingFeedback(&compound, &seqs));
+    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingActions(&compound));
     var fir: [20]u8 = .{ 0x84, 206, 0, 4, 0, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0, 9, 1, 0, 0, 0 };
-    try testing.expectEqual(@as(u32, 9), (try MediaPlane.parseRoutingFeedback(&fir, &seqs)).keyframe_request.media_ssrc);
+    try testing.expectEqual(@as(u32, 9), (try MediaPlane.parseRoutingActions(&fir)).actions[0].ssrc);
     fir[19] = 1;
-    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingFeedback(&fir, &seqs));
+    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingActions(&fir));
     fir[19] = 0;
     fir[11] = 9;
-    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingFeedback(&fir, &seqs));
+    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingActions(&fir));
     var nack: [16]u8 = undefined;
     const bytes = try rtcp_translate.buildNack(77, 9, &.{65535}, &nack);
-    try testing.expectEqual(@as(u16, 65535), (try MediaPlane.parseRoutingFeedback(bytes, &seqs)).nack.seqs[0]);
-    var too_small: [0]u16 = .{};
-    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingFeedback(bytes, &too_small));
+    try testing.expectEqual(@as(u16, 65535), (try MediaPlane.parseRoutingActions(bytes)).actions[0].seqs[0]);
+    try testing.expectError(error.Truncated, MediaPlane.parseRoutingActions(bytes[0..12]));
+    var oversized: [12 + 65 * 4]u8 = undefined;
+    var sequences: [65]u16 = undefined;
+    for (&sequences, 0..) |*seq, i| seq.* = @intCast(i);
+    const too_many = try rtcp_translate.buildNack(77, 9, &sequences, &oversized);
+    try testing.expectError(error.TooMany, MediaPlane.parseRoutingActions(too_many));
+    var doubled: [24]u8 = undefined;
+    @memcpy(doubled[0..12], &pli);
+    @memcpy(doubled[12..24], &pli);
+    try testing.expectEqual(@as(usize, 1), (try MediaPlane.parseRoutingActions(&doubled)).count);
+    var nack_then_pli: [28]u8 = undefined;
+    @memcpy(nack_then_pli[0..16], bytes);
+    @memcpy(nack_then_pli[16..28], &pli);
+    try testing.expectEqual(@as(usize, 2), (try MediaPlane.parseRoutingActions(&nack_then_pli)).count);
+    var multi_fir: [28]u8 = @splat(0);
+    @memcpy(multi_fir[0..20], &fir);
+    multi_fir[2] = 0;
+    multi_fir[3] = 6;
+    multi_fir[11] = 0;
+    multi_fir[23] = 10;
+    try testing.expectEqual(@as(usize, 2), (try MediaPlane.parseRoutingActions(&multi_fir)).count);
     var malformed_sr: [20]u8 = @splat(0);
     @memcpy(malformed_sr[0..12], &pli);
     malformed_sr[12] = 0x80;
     malformed_sr[13] = 200;
     malformed_sr[15] = 1;
-    try testing.expectError(error.BadLength, MediaPlane.parseRoutingFeedback(&malformed_sr, &seqs));
+    try testing.expectError(error.BadLength, MediaPlane.parseRoutingActions(&malformed_sr));
+}
+
+test "FIR PLI per-SSRC feedback budget drops burst and preserves other and periodic SSRCs" {
+    var budget: MediaPlane.FirPliSsrcBudget = .{};
+    // One SSRC may burst only up to the bound inside a single window.
+    for (0..MediaPlane.FirPliSsrcBudget.limit) |_| try testing.expect(budget.allow(4242, 1000));
+    for (0..3) |_| try testing.expect(!budget.allow(4242, 1000));
+    try testing.expectEqual(@as(u64, 3), budget.dropped);
+    // A different SSRC keeps its own independent allowance in that window.
+    try testing.expect(budget.allow(5252, 1000));
+    // A legitimate periodic PLI after the window is admitted again.
+    try testing.expect(budget.allow(4242, 1000 + MediaPlane.FirPliSsrcBudget.window_ms));
+    try testing.expect(budget.allow(4242, 1000 + 2 * MediaPlane.FirPliSsrcBudget.window_ms));
+    // Missing or regressed feedback clocks fail closed, never unbounded.
+    try testing.expect(!budget.allow(4242, 0));
+    try testing.expect(!budget.allow(4242, 999));
+    // Tracking stays bounded: once every slot is live, a new SSRC is refused.
+    var bounded: MediaPlane.FirPliSsrcBudget = .{};
+    for (0..MediaPlane.FirPliSsrcBudget.max_tracked) |i| try testing.expect(bounded.allow(@intCast(6000 + i), 1000));
+    try testing.expect(!bounded.allow(6999, 1000));
 }
 
 test "physical media NACK uses actual current recipient spatial policy and fresh recipient positive" {
     const fixture = try FiveBlockerGroupFixture.create(true);
     defer fixture.destroy();
+    // This exercises spatial policy; the two negative UDP polls must not age
+    // the unchanged cached packet while waiting for their timeouts.
+    fixture.physical.owner.test_retransmit_now.store(100, .release);
     try fixture.physical.domain.setPhysicalSelection("#five-blocker", .{ .shard = 0, .slot = 1, .gen = 0 }, .{ .max_spatial = 0, .max_temporal = 7 });
     var packet: [64]u8 = undefined;
     _ = try rtp_profile.encodeHeader(.{ .payload_type = 96, .sequence = 81, .timestamp = 900, .ssrc = 8101 }, packet[0..12]);
@@ -6506,4 +7312,924 @@ test "physical media NACK uses actual current recipient spatial policy and fresh
     fixture.peers[1].sendTo(fixture.destination, nack);
     const approved = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, bytes, approved.data);
+}
+
+// Scheduling fixtures enqueue canonical egress directly under the owner gate;
+// they exercise real socket output and production revalidation, not ingress
+// authentication. Existing physical ingress tests prove that separate boundary.
+const PumpProducerTest = struct {
+    owner: *MediaPlane,
+    source: routing.EndpointStamp,
+    target: routing.EndpointStamp,
+    stream: u32,
+    packet: []const u8,
+    stop: std.atomic.Value(bool) = .init(false),
+    accepted: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    fn enqueue(self: *@This()) !RoutingAccepted {
+        lockSpin(&self.owner.mutex);
+        defer self.owner.mutex.unlock();
+        return self.owner.enqueueCanonicalBytesLocked(self.source, self.target, .rtp, self.stream, self.packet);
+    }
+    fn run(self: *@This()) void {
+        while (!self.stop.load(.acquire)) {
+            _ = self.enqueue() catch |err| {
+                if (err != error.QueueFull) {
+                    self.failed.store(true, .release);
+                    return;
+                }
+                std.Thread.yield() catch {};
+                continue;
+            };
+            _ = self.accepted.fetchAdd(1, .release);
+        }
+    }
+    fn fromFixture(fixture: *FiveBlockerGroupFixture, packet: []const u8) @This() {
+        const owner = fixture.physical.owner;
+        lockSpin(&owner.mutex);
+        defer owner.mutex.unlock();
+        const source = owner.physical_rows.get(fixture.credentials[0].key).?.identity;
+        const target = owner.physical_rows.get(fixture.credentials[1].key).?.identity;
+        return .{ .owner = owner, .source = source.stamp, .target = target.stamp, .stream = source.stream_id, .packet = packet };
+    }
+};
+fn waitPumpCounterTest(counter: *const std.atomic.Value(u64), previous: u64) !void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (counter.load(.acquire) <= previous) {
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+}
+fn pumpQueueStateTest(owner: *MediaPlane) ?RoutingEgressState {
+    lockSpin(&owner.mutex);
+    defer owner.mutex.unlock();
+    const queue = owner.routing_egress orelse return null;
+    lockSpin(&queue.mutex);
+    defer queue.mutex.unlock();
+    return .{ .queued = queue.len, .inflight = queue.inflight != null, .fenced = queue.fence != null, .capacity = queue.rows.len, .payload_limit = queue.payload_limit, .next_ordinal = queue.next_ordinal };
+}
+fn waitPumpDrainedTest(owner: *MediaPlane) !void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (true) {
+        const state = pumpQueueStateTest(owner) orelse return error.TestUnexpectedResult;
+        if (state.queued == 0 and !state.inflight) return;
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+}
+
+test "media pump wake services idle off-thread FIFO enqueue before UDP idle deadline" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(false, 64);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    const token = try fixture.physical.paused(1);
+    owner.socket.?.recv_timeout_ms = 1500;
+    const previous = owner.test_waits.load(.acquire);
+    try owner.resumePaused(token);
+    try waitPumpCounterTest(&owner.test_waits, previous);
+    var packet_buf: [128]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 77, .timestamp = 480, .ssrc = 7001 }, .payload = "idle-producer-wake" }, &packet_buf);
+    var producer = PumpProducerTest.fromFixture(fixture, packet);
+    fixture.peers[1].setRecvTimeoutMs(200);
+    const accepted = try producer.enqueue();
+    var wire: [256]u8 = undefined;
+    const received = fixture.peers[1].recvFrom(&wire) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, packet, received.data);
+    try waitPumpDrainedTest(owner);
+    try testing.expectEqual(accepted.ordinal + 1, pumpQueueStateTest(owner).?.next_ordinal);
+    // A pause request also wakes the actual 1500ms idle wait.
+    const pause = try owner.requestPause(2);
+    defer owner.resumePaused(pause) catch unreachable;
+    try owner.awaitPaused(pause, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(200) }));
+}
+
+test "media pump wake bounds FIFO turns and services ingress under sustained production" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(false, 64);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    var packet_buf: [128]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 88, .timestamp = 960, .ssrc = 7001 }, .payload = "bounded-output-turn" }, &packet_buf);
+    var producer = PumpProducerTest.fromFixture(fixture, packet);
+    const pause = try fixture.physical.paused(1);
+    // Install a real backlog greater than one turn before releasing the worker.
+    for (0..40) |_| _ = try producer.enqueue();
+    try testing.expectEqual(@as(usize, 40), pumpQueueStateTest(owner).?.queued);
+    try owner.resumePaused(pause);
+    var wire: [256]u8 = undefined;
+    for (0..40) |_| {
+        const received = fixture.peers[1].recvFrom(&wire) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, packet, received.data);
+    }
+    try waitPumpDrainedTest(owner);
+    try testing.expectEqual(routing_send_turn_rows, owner.test_max_send_turn.load(.acquire));
+    const thread = try std.Thread.spawn(.{}, PumpProducerTest.run, .{&producer});
+    var joined = false;
+    defer if (!joined) {
+        producer.stop.store(true, .release);
+        thread.join();
+    };
+    const producer_deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (producer.accepted.load(.acquire) < 64) {
+        if (producer.failed.load(.acquire) or std.Io.Clock.awake.now(testing.io).nanoseconds >= producer_deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    const request = try PhysicalIceFixture.request(&fixture.credentials[0].creds, 0xf1);
+    defer testing.allocator.free(request);
+    fixture.peers[0].setRecvTimeoutMs(500);
+    fixture.peers[0].sendTo(fixture.destination, request);
+    const response = fixture.peers[0].recvFrom(&wire) orelse return error.TestUnexpectedResult;
+    try testing.expect(try stun.verifyMessageIntegrity(response.data, &fixture.credentials[0].creds.pwd));
+    producer.stop.store(true, .release);
+    thread.join();
+    joined = true;
+    try testing.expect(!producer.failed.load(.acquire));
+    try testing.expect(producer.accepted.load(.acquire) != 0);
+    try waitPumpDrainedTest(owner);
+    try testing.expect(owner.test_max_send_turn.load(.acquire) <= routing_send_turn_rows);
+    const settled = try fixture.physical.paused(2);
+    defer owner.resumePaused(settled) catch unreachable;
+    const queue = owner.routing_egress.?;
+    try testing.expectEqual(queue.next_ordinal - 1, queue.completed);
+    try testing.expectEqual(queue.completed % queue.rows.len, queue.head);
+    try testing.expect(std.mem.allEqual(u8, queue.payloads, 0));
+}
+
+test "media pump wake preserves pause arriving after boundary before idle wait" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(false, 64);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    const initial = try fixture.physical.paused(1);
+    var observer: PumpBoundaryObserverTest = .{};
+    defer observer.released.store(true, .release);
+    // Configuration occurs while the worker is actually paused. The observer
+    // holds only scheduling, without owning any Domain/Plane/FIFO gate.
+    owner.socket.?.recv_timeout_ms = 1500;
+    lockSpin(&owner.mutex);
+    owner.test_boundary_observer = &observer;
+    owner.mutex.unlock();
+    try owner.resumePaused(initial);
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (!observer.reached.load(.acquire)) {
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    // The pump has passed boundary but has not performed its readiness wait.
+    // The former boundary-then-drain ordering erased precisely this signal.
+    const pause = try owner.requestPause(2);
+    defer owner.resumePaused(pause) catch unreachable;
+    observer.released.store(true, .release);
+    try owner.awaitPaused(pause, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(200) }));
+    lockSpin(&owner.mutex);
+    owner.test_boundary_observer = null;
+    owner.mutex.unlock();
+}
+
+test "media pump fatal readiness fences admission and settles accepted FIFO before exit" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(false, 64);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    const pause = try fixture.physical.paused(1);
+    var packet_buf: [128]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 91, .timestamp = 960, .ssrc = 7001 }, .payload = "accepted-before-readiness-failure" }, &packet_buf);
+    var producer = PumpProducerTest.fromFixture(fixture, packet);
+    const original_fd = owner.socket.?.fd;
+    defer {
+        owner.requestStopAndWake();
+        owner.joinLegacyAfterStop() catch @panic("failed pump did not join");
+        owner.socket.?.fd = original_fd;
+        owner.dtls_enabled = false;
+    }
+    // No descriptor is closed or reused. The actual OS readiness syscall sees
+    // an invalid media handle, while the private wake/write handle stays valid.
+    owner.socket.?.fd = std.math.maxInt(media_socket.SocketHandle);
+    owner.dtls_enabled = true;
+    owner.sendRtcpTo(fixture.destination, "queued-control");
+    try testing.expectEqual(@as(usize, 1), owner.rtcp_out_len);
+    for (0..40) |_| _ = try producer.enqueue();
+    try testing.expectEqual(@as(usize, 40), pumpQueueStateTest(owner).?.queued);
+    try owner.resumePaused(pause);
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (!owner.runtime.exited.load(.acquire)) {
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(owner.stop_flag.load(.acquire));
+    try testing.expect(owner.pump_failed.load(.acquire));
+    try owner.joinLegacyAfterStop();
+    const queue = owner.routing_egress.?;
+    try testing.expectEqual(routing_send_turn_rows, owner.test_max_send_turn.load(.acquire));
+    try testing.expectEqual(@as(u64, 41), queue.next_ordinal);
+    try testing.expectEqual(@as(u64, 40), queue.completed);
+    try testing.expectEqual(@as(usize, 0), queue.len);
+    try testing.expect(queue.inflight == null and queue.pump_id == null and !queue.poisoned);
+    try testing.expectEqual(queue.completed % queue.rows.len, queue.head);
+    try testing.expectEqual(RoutingDisposition.source_error, queue.last_disposition.?);
+    try testing.expect(std.mem.allEqual(u8, queue.payloads, 0));
+    try testing.expectEqual(@as(usize, 0), owner.rtcp_out_len);
+    try testing.expect(std.mem.allEqual(u8, &owner.rtcp_out[0].bytes, 0));
+    // Signal transport is still healthy: failure fencing, rather than wake
+    // write failure, must refuse every common wire publication path.
+    lockSpin(&owner.mutex);
+    defer owner.mutex.unlock();
+    owner.pump_wake.?.drain();
+    try owner.pump_wake.?.signal();
+    for ([_]RoutingWireKind{ .canonical, .native_frame, .native_feedback }) |wire| {
+        try testing.expectError(error.ProducerFenced, owner.enqueueWireBytesLocked(producer.source, producer.target, .rtp, producer.stream, packet, wire));
+    }
+    try testing.expectEqual(@as(u64, 41), queue.next_ordinal);
+}
+
+test "media pump failed owner refuses pause checkpoint restart and legacy control admission" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(false, 64);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    const pause = try fixture.physical.paused(1);
+    const original_fd = owner.socket.?.fd;
+    const recipient = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, try fixture.peers[1].localPort());
+    owner.sendTo(recipient, "healthy-before-failure");
+    var wire: [128]u8 = undefined;
+    const healthy = fixture.peers[1].recvFrom(&wire) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("healthy-before-failure", healthy.data);
+    defer {
+        owner.requestStopAndWake();
+        owner.joinLegacyAfterStop() catch @panic("failed pump did not join");
+        owner.socket.?.fd = original_fd;
+        owner.dtls_enabled = false;
+    }
+    owner.socket.?.fd = std.math.maxInt(media_socket.SocketHandle);
+    try owner.resumePaused(pause);
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (!owner.runtime.exited.load(.acquire)) {
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    try owner.joinLegacyAfterStop();
+    owner.socket.?.fd = original_fd;
+    // The exact same retained UDP socket remains usable: lower-layer positive
+    // delivery prevents an invalid FD from making the refusal oracle vacuous.
+    try testing.expectEqual(media_socket.SendDisposition.sent, owner.socket.?.trySendTo(recipient, "retained-socket-positive"));
+    const retained = fixture.peers[1].recvFrom(&wire) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("retained-socket-positive", retained.data);
+    owner.sendTo(recipient, "forbidden-after-failure");
+    fixture.peers[1].setRecvTimeoutMs(50);
+    try testing.expect(fixture.peers[1].recvFrom(&wire) == null);
+    try testing.expect(owner.allocate("#failed", "new-client") == null);
+    try testing.expect(owner.groupKey("#failed") == null);
+    try testing.expect(!owner.setReceiverSpatial("#failed", "new-client", 0));
+    try testing.expectError(error.Stopped, owner.bindOfferedFingerprint("#failed", "new-client", @splat(0)));
+    try testing.expectError(error.Stopped, fiveBlockerOfferTest(&fixture.physical, .{ .shard = 0, .slot = 4, .gen = 0 }, false));
+    try testing.expect(!owner.upgradeContinuityReady());
+    try testing.expectError(error.Stopped, owner.requestPause(2));
+    try testing.expectError(error.Stopped, owner.captureUnstarted());
+    try testing.expectError(error.Stopped, owner.startPreparedLegacyWorker());
+    try testing.expectError(error.Stopped, owner.start(loopback_be, 0));
+    owner.dtls_enabled = true;
+    owner.sendRtcpTo(fixture.destination, "after-terminal-failure");
+    try testing.expectEqual(@as(usize, 0), owner.rtcp_out_len);
+}
+
+fn waitPumpBoolTest(flag: *const std.atomic.Value(bool)) !void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (!flag.load(.acquire)) {
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+}
+
+test "media pump failure waits for validated offer lexical publication before fencing" {
+    const fixture = try FiveBlockerGroupFixture.create(false);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    const domain = fixture.physical.domain;
+    const pause = try fixture.physical.paused(1);
+    const original_fd = owner.socket.?.fd;
+    defer {
+        owner.requestStopAndWake();
+        owner.joinLegacyAfterStop() catch @panic("failed offer-race pump did not join");
+        owner.socket.?.fd = original_fd;
+    }
+    const offers = try domain.prepareOffers("#failure-publish-race", .{ .shard = 0, .slot = 4, .gen = 0 }, &.{.{ .leg = .webrtc, .mode = .legacy_group }});
+    defer offers.deinit();
+    const candidate = try owner.prepareOffer(domain, offers, "#failure-publish-race", webrtcCandidateTestProfile(), 1, null);
+    defer candidate.deinit();
+    try testing.expect(webrtcPlan(candidate).advertisement == null);
+    const Cut = struct {
+        domain: *routing.Domain,
+        offers: *routing.PreparedOffers,
+        candidate: *PreparedWebrtcOffer,
+        validated: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        published: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+        fn body(scope: *routing.Locked, ctx: *@This()) !void {
+            try ctx.candidate.validateLocked(ctx.domain, scope, ctx.offers);
+            ctx.validated.store(true, .release);
+            // Hold the real lexical publication cut without holding Plane.
+            while (!ctx.release.load(.acquire)) std.Thread.yield() catch {};
+            ctx.candidate.commitLocked(ctx.domain, scope);
+            ctx.offers.commitLocked(ctx.domain, scope);
+            ctx.published.store(true, .release);
+        }
+        fn run(ctx: *@This()) void {
+            ctx.domain.withLocked(ctx, body) catch ctx.failed.store(true, .release);
+        }
+    };
+    var cut = Cut{ .domain = domain, .offers = offers, .candidate = candidate };
+    const thread = try std.Thread.spawn(.{}, Cut.run, .{&cut});
+    var joined = false;
+    defer if (!joined) {
+        cut.release.store(true, .release);
+        thread.join();
+    };
+    try waitPumpBoolTest(&cut.validated);
+    owner.socket.?.fd = std.math.maxInt(media_socket.SocketHandle);
+    try owner.resumePaused(pause);
+    // This observer advances only after the ACTUAL readiness syscall failed.
+    // Failure must then wait for the held Domain cut, not invalidate its commit.
+    try waitPumpCounterTest(&owner.test_readiness_failures, 0);
+    try testing.expect(!owner.pump_failed.load(.acquire));
+    try testing.expect(!cut.published.load(.acquire));
+    cut.release.store(true, .release);
+    thread.join();
+    joined = true;
+    try testing.expect(!cut.failed.load(.acquire));
+    try testing.expect(cut.published.load(.acquire));
+    try waitPumpBoolTest(&owner.runtime.exited);
+    try owner.joinLegacyAfterStop();
+    try testing.expect(owner.pump_failed.load(.acquire));
+    try testing.expectEqual(@as(usize, 4), owner.physical_rows.count());
+}
+
+test "media pump failure rejects already prepared advertisement-free offer validation" {
+    const fixture = try FiveBlockerGroupFixture.create(false);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    const domain = fixture.physical.domain;
+    const pause = try fixture.physical.paused(1);
+    const original_fd = owner.socket.?.fd;
+    defer {
+        owner.requestStopAndWake();
+        owner.joinLegacyAfterStop() catch @panic("failed prepared-offer pump did not join");
+        owner.socket.?.fd = original_fd;
+    }
+    const offers = try domain.prepareOffers("#failure-before-validate", .{ .shard = 0, .slot = 4, .gen = 0 }, &.{.{ .leg = .webrtc, .mode = .legacy_group }});
+    defer offers.deinit();
+    const candidate = try owner.prepareOffer(domain, offers, "#failure-before-validate", webrtcCandidateTestProfile(), 1, null);
+    defer candidate.deinit();
+    try testing.expect(webrtcPlan(candidate).advertisement == null);
+    owner.socket.?.fd = std.math.maxInt(media_socket.SocketHandle);
+    try owner.resumePaused(pause);
+    try waitPumpBoolTest(&owner.runtime.exited);
+    try owner.joinLegacyAfterStop();
+    const Validate = struct {
+        domain: *routing.Domain,
+        offers: *routing.PreparedOffers,
+        candidate: *PreparedWebrtcOffer,
+        fn run(scope: *routing.Locked, ctx: @This()) !void {
+            try ctx.candidate.validateLocked(ctx.domain, scope, ctx.offers);
+        }
+    };
+    try testing.expectError(error.StaleCandidate, domain.withLocked(Validate{ .domain = domain, .offers = offers, .candidate = candidate }, Validate.run));
+    try testing.expectEqual(@as(usize, 3), owner.physical_rows.count());
+}
+
+fn pressureTestCompleted(owner: *MediaPlane) u64 {
+    lockSpin(&owner.mutex);
+    defer owner.mutex.unlock();
+    return owner.routing_ingress_completed;
+}
+fn pressureTestWaitCompleted(owner: *MediaPlane, previous: u64) !void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (pressureTestCompleted(owner) <= previous) {
+        if (deadline.untilNow(testing.io).raw.nanoseconds >= 0) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+}
+fn pressureTestNack(out: *[268]u8, ssrc: u32, sequence: u16) []const u8 {
+    @memset(out, 0);
+    out[0] = 0x81;
+    out[1] = 205;
+    std.mem.writeInt(u16, out[2..4], 66, .big);
+    std.mem.writeInt(u32, out[4..8], 77, .big);
+    std.mem.writeInt(u32, out[8..12], ssrc, .big);
+    for (0..64) |i| std.mem.writeInt(u16, out[12 + i * 4 ..][0..2], sequence +% @as(u16, @intCast(i)), .big);
+    return out;
+}
+fn pressureTestPublisher(fixture: *FiveBlockerGroupFixture, ssrc: u32, sequence: u16, storage: []u8) !void {
+    var received: [1024]u8 = undefined;
+    for (0..64) |i| {
+        const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = sequence +% @as(u16, @intCast(i)), .timestamp = 480, .ssrc = ssrc }, .payload = "pressure-proof" }, storage);
+        fixture.peers[0].sendTo(fixture.destination, packet);
+        for (fixture.peers[1..]) |*peer| {
+            const got = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualSlices(u8, packet, got.data);
+        }
+    }
+}
+
+test "physical WebRTC feedback budgets bound actual keyframe and cached retransmit work" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(true, 128);
+    defer fixture.destroy();
+    // This test varies feedback quota time, not cache age.
+    fixture.physical.owner.test_retransmit_now.store(100, .release);
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    var packet: [128]u8 = undefined;
+    try pressureTestPublisher(fixture, 9001, 1, &packet);
+    var request: [64]u8 = undefined;
+    const pli = try rtcp_translate.buildKeyframeRequest(77, 9001, &request);
+    var received: [1024]u8 = undefined;
+    fixture.peers[1].sendTo(fixture.destination, pli);
+    const first = fixture.peers[0].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, pli, first.data);
+    const before = pressureTestCompleted(fixture.physical.owner);
+    fixture.peers[1].sendTo(fixture.destination, pli);
+    try pressureTestWaitCompleted(fixture.physical.owner, before);
+    try testing.expect(fixture.peers[0].recvFrom(&received) == null);
+    // A different requester retains capacity against the same publisher.
+    fixture.peers[2].sendTo(fixture.destination, pli);
+    const independent = fixture.peers[0].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, pli, independent.data);
+    // A second real publisher has independent target accounting.
+    var other_packet: [128]u8 = undefined;
+    const other = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 2, .timestamp = 960, .ssrc = 9002 }, .payload = "second-publisher" }, &other_packet);
+    fixture.peers[2].sendTo(fixture.destination, other);
+    for (fixture.peers[0..2]) |*peer| {
+        const got = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, other, got.data);
+    }
+    var other_request: [64]u8 = undefined;
+    const other_pli = try rtcp_translate.buildKeyframeRequest(77, 9002, &other_request);
+    fixture.peers[0].sendTo(fixture.destination, other_pli);
+    const other_delivery = fixture.peers[2].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, other_pli, other_delivery.data);
+    routing.TestFeedbackClock.set(fixture.physical.domain, 3000);
+    fixture.peers[1].sendTo(fixture.destination, pli);
+    const retry = fixture.peers[0].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, pli, retry.data);
+
+    var nack_buf: [268]u8 = undefined;
+    const nack = pressureTestNack(&nack_buf, 9001, 1);
+    for (0..2) |_| {
+        fixture.peers[1].sendTo(fixture.destination, nack);
+        for (0..64) |_| {
+            const packet_again = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings("pressure-proof", packet_again.data[12..]);
+        }
+    }
+    const limited_before = pressureTestCompleted(fixture.physical.owner);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    try pressureTestWaitCompleted(fixture.physical.owner, limited_before);
+    try testing.expect(fixture.peers[1].recvFrom(&received) == null);
+    fixture.peers[2].sendTo(fixture.destination, nack);
+    for (0..64) |_| {
+        const packet_again = fixture.peers[2].recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("pressure-proof", packet_again.data[12..]);
+    }
+    const first_budget = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    const publisher_budget = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[0].key);
+    try testing.expectEqual(@as(u16, 128), first_budget.source_nack);
+    try testing.expectEqual(@as(u16, 192), publisher_budget.publisher_nack);
+    routing.TestFeedbackClock.set(fixture.physical.domain, 4000);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    for (0..64) |_| {
+        const packet_again = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("pressure-proof", packet_again.data[12..]);
+    }
+    const refilled = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    try testing.expectEqual(@as(u16, 64), refilled.source_nack);
+}
+
+test "physical WebRTC NACK queue saturation charges only retained outputs" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(true, 4);
+    defer fixture.destroy();
+    // This test varies feedback quota time, not cache age.
+    fixture.physical.owner.test_retransmit_now.store(100, .release);
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    var packet: [128]u8 = undefined;
+    try pressureTestPublisher(fixture, 9101, 1, &packet);
+    var nack_buf: [268]u8 = undefined;
+    const nack = pressureTestNack(&nack_buf, 9101, 1);
+    const before = pressureTestCompleted(fixture.physical.owner);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    try pressureTestWaitCompleted(fixture.physical.owner, before);
+    var received: [1024]u8 = undefined;
+    // Audio reserves one of the four slots for feedback.
+    for (0..3) |_| {
+        const got = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("pressure-proof", got.data[12..]);
+    }
+    try testing.expect(fixture.peers[1].recvFrom(&received) == null);
+    const requester = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    const publisher = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[0].key);
+    try testing.expectEqual(@as(u16, 3), requester.source_nack);
+    try testing.expectEqual(@as(u16, 3), publisher.publisher_nack);
+}
+
+test "physical WebRTC aggregate feedback limits preserve other publishers and refill" {
+    const fixture = try PressureAggregateFixture.createWithCapacity(true, 128);
+    defer fixture.destroy();
+    // This test varies feedback quota time, not cache age.
+    fixture.physical.owner.test_retransmit_now.store(100, .release);
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    var packet: [128]u8 = undefined;
+    var received: [1024]u8 = undefined;
+    for (0..64) |i| {
+        const first = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = @intCast(i + 1), .timestamp = 480, .ssrc = 9201 }, .payload = "aggregate-first" }, &packet);
+        fixture.peers[0].sendTo(fixture.destination, first);
+        for (fixture.peers[1..]) |*peer| {
+            const got = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualSlices(u8, first, got.data);
+        }
+    }
+    var other_packet: [128]u8 = undefined;
+    for (0..64) |i| {
+        const other = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = @intCast(i + 2), .timestamp = 960, .ssrc = 9202 }, .payload = "aggregate-other" }, &other_packet);
+        fixture.peers[1].sendTo(fixture.destination, other);
+        for (&fixture.peers, 0..) |*peer, j| {
+            if (j == 1) continue;
+            const got = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualSlices(u8, other, got.data);
+        }
+    }
+    var request: [64]u8 = undefined;
+    const pli = try rtcp_translate.buildKeyframeRequest(77, 9201, &request);
+    for (fixture.peers[1..5]) |*peer| {
+        peer.sendTo(fixture.destination, pli);
+        const got = fixture.peers[0].recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, pli, got.data);
+    }
+    const before = pressureTestCompleted(fixture.physical.owner);
+    fixture.peers[5].sendTo(fixture.destination, pli);
+    try pressureTestWaitCompleted(fixture.physical.owner, before);
+    try testing.expect(fixture.peers[0].recvFrom(&received) == null);
+    const first_budget = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[0].key);
+    try testing.expectEqual(@as(u16, 4), first_budget.publisher_keyframe);
+    const denied_keyframe = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[5].key);
+    try testing.expectEqual(@as(u16, 0), denied_keyframe.source_keyframe);
+    var other_request: [64]u8 = undefined;
+    const other_pli = try rtcp_translate.buildKeyframeRequest(77, 9202, &other_request);
+    fixture.peers[5].sendTo(fixture.destination, other_pli);
+    const delivered = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, other_pli, delivered.data);
+
+    var nack_buf: [268]u8 = undefined;
+    const nack = pressureTestNack(&nack_buf, 9201, 1);
+    for (fixture.peers[1..5]) |*peer| {
+        for (0..2) |_| {
+            peer.sendTo(fixture.destination, nack);
+            for (0..64) |_| {
+                const got = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+                try testing.expectEqualStrings("aggregate-first", got.data[12..]);
+            }
+        }
+    }
+    const nack_before = pressureTestCompleted(fixture.physical.owner);
+    fixture.peers[5].sendTo(fixture.destination, nack);
+    try pressureTestWaitCompleted(fixture.physical.owner, nack_before);
+    try testing.expect(fixture.peers[5].recvFrom(&received) == null);
+    const exhausted = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[0].key);
+    try testing.expectEqual(@as(u16, 512), exhausted.publisher_nack);
+    const denied_nack = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[5].key);
+    try testing.expectEqual(@as(u16, 0), denied_nack.source_nack);
+    var other_nack_buf: [268]u8 = undefined;
+    const other_nack = pressureTestNack(&other_nack_buf, 9202, 2);
+    fixture.peers[5].sendTo(fixture.destination, other_nack);
+    for (0..64) |_| {
+        const got = fixture.peers[5].recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("aggregate-other", got.data[12..]);
+    }
+    routing.TestFeedbackClock.set(fixture.physical.domain, 2000);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    for (0..64) |_| {
+        const got = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("aggregate-first", got.data[12..]);
+    }
+    const refilled = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[0].key);
+    try testing.expectEqual(@as(u16, 64), refilled.publisher_nack);
+}
+
+test "physical WebRTC compound RR PLI and NACK route distinct authorized actions" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(true, 128);
+    defer fixture.destroy();
+    // This test varies feedback quota time, not cache age.
+    fixture.physical.owner.test_retransmit_now.store(100, .release);
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    var packet: [128]u8 = undefined;
+    try pressureTestPublisher(fixture, 9301, 1, &packet);
+    const rr = [_]u8{ 0x80, 201, 0, 1, 0, 0, 0, 77 };
+    var pli_buf: [20]u8 = undefined;
+    const pli = try rtcp_translate.buildKeyframeRequest(77, 9301, &pli_buf);
+    var nack_buf: [20]u8 = undefined;
+    const nack = try rtcp_translate.buildNack(77, 9301, &.{1}, &nack_buf);
+    var compound: [40]u8 = undefined;
+    @memcpy(compound[0..8], &rr);
+    @memcpy(compound[8..20], pli);
+    @memcpy(compound[20..36], nack);
+    fixture.peers[1].sendTo(fixture.destination, compound[0..36]);
+    var received: [1024]u8 = undefined;
+    const keyframe = fixture.peers[0].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, pli, keyframe.data);
+    const report = fixture.peers[0].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &rr, report.data);
+    const resent = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("pressure-proof", resent.data[12..]);
+    const observer = fixture.peers[2].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &rr, observer.data);
+    const publisher = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[0].key);
+    try testing.expectEqual(@as(u16, 1), publisher.publisher_keyframe);
+    try testing.expectEqual(@as(u16, 1), publisher.publisher_nack);
+}
+
+test "routing compound normalizes FIR targets and duplicate NACK sequences with bounds" {
+    const fir = [_]u8{ 0x84, 206, 0, 6, 0, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0, 0, 2, 8, 0, 0, 0 };
+    const parsed = try MediaPlane.parseRoutingActions(&fir);
+    try testing.expectEqual(@as(usize, 2), parsed.count);
+    try testing.expectEqual(@as(u32, 1), parsed.actions[0].ssrc);
+    try testing.expectEqual(@as(u32, 2), parsed.actions[1].ssrc);
+    var duplicate: [20]u8 = undefined;
+    const nack = try rtcp_translate.buildNack(77, 1, &.{ 9, 9 }, &duplicate);
+    const normalized = try MediaPlane.parseRoutingActions(nack);
+    try testing.expectEqual(@as(usize, 1), normalized.actions[0].count);
+    try testing.expectEqual(@as(u16, 9), normalized.actions[0].seqs[0]);
+    var too_many: [12 + 9 * 8]u8 = @splat(0);
+    too_many[0] = 0x84;
+    too_many[1] = 206;
+    std.mem.writeInt(u16, too_many[2..4], @intCast(too_many.len / 4 - 1), .big);
+    for (0..9) |i| std.mem.writeInt(u32, too_many[12 + i * 8 ..][0..4], @intCast(i + 1), .big);
+    try testing.expectError(error.InvalidIngress, MediaPlane.parseRoutingActions(&too_many));
+}
+
+test "physical WebRTC multi target FIR limits partial output and rejects missing target before output" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(true, 128);
+    defer fixture.destroy();
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    var packet: [128]u8 = undefined;
+    try pressureTestPublisher(fixture, 9401, 1, &packet);
+    var other_storage: [128]u8 = undefined;
+    const other = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 1, .timestamp = 480, .ssrc = 9402 }, .payload = "other-fir" }, &other_storage);
+    fixture.peers[2].sendTo(fixture.destination, other);
+    var received: [1024]u8 = undefined;
+    for (fixture.peers[0..2]) |*peer| {
+        const got = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, other, got.data);
+    }
+    var fir: [28]u8 = @splat(0);
+    fir[0] = 0x84;
+    fir[1] = 206;
+    std.mem.writeInt(u16, fir[2..4], 6, .big);
+    std.mem.writeInt(u32, fir[4..8], 77, .big);
+    std.mem.writeInt(u32, fir[12..16], 9401, .big);
+    fir[16] = 1;
+    std.mem.writeInt(u32, fir[20..24], 9999, .big);
+    fir[24] = 2;
+    // Rejected ingress increments the refusal counter, not the completion
+    // counter. Observe that exact worker result before checking both sockets.
+    lockSpin(&fixture.physical.owner.mutex);
+    const before = fixture.physical.owner.routing_ingress_refused;
+    fixture.physical.owner.mutex.unlock();
+    fixture.peers[1].sendTo(fixture.destination, &fir);
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (true) {
+        lockSpin(&fixture.physical.owner.mutex);
+        const refused = fixture.physical.owner.routing_ingress_refused;
+        const last = fixture.physical.owner.routing_last_ingress_error;
+        fixture.physical.owner.mutex.unlock();
+        if (refused > before) {
+            try testing.expectEqual(before + 1, refused);
+            try testing.expect(last != null and last.? == error.RouteDenied);
+            break;
+        }
+        if (deadline.untilNow(testing.io).raw.nanoseconds >= 0) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(fixture.peers[0].recvFrom(&received) == null);
+    try testing.expect(fixture.peers[2].recvFrom(&received) == null);
+    const pristine = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    try testing.expectEqual(@as(u16, 0), pristine.source_keyframe);
+    std.mem.writeInt(u32, fir[20..24], 9402, .big);
+    const later = pressureTestCompleted(fixture.physical.owner);
+    fixture.peers[1].sendTo(fixture.destination, &fir);
+    try pressureTestWaitCompleted(fixture.physical.owner, later);
+    const got = fixture.peers[0].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 20), got.data.len);
+    try testing.expectEqual(@as(u32, 9401), std.mem.readInt(u32, got.data[12..16], .big));
+    try testing.expectEqual(@as(u8, 1), got.data[16]);
+    try testing.expect(fixture.peers[2].recvFrom(&received) == null);
+    const charged = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    try testing.expectEqual(@as(u16, 1), charged.source_keyframe);
+}
+
+test "physical WebRTC NACK respects age boundary without charging stale pressure" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(true, 16);
+    defer fixture.destroy();
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    fixture.physical.owner.test_retransmit_now.store(100, .release);
+    var storage: [128]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 65535, .timestamp = 480, .ssrc = 9501 }, .payload = "fresh-frame" }, &storage);
+    var received: [1024]u8 = undefined;
+    fixture.peers[0].sendTo(fixture.destination, packet);
+    for (fixture.peers[1..]) |*peer| {
+        const delivered = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, packet, delivered.data);
+    }
+    var request: [64]u8 = undefined;
+    const nack = try rtcp_translate.buildNack(77, 9501, &.{65535}, &request);
+    fixture.physical.owner.test_retransmit_now.store(1099, .release);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    const fresh = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, packet, fresh.data);
+    const charged = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    try testing.expectEqual(@as(u16, 1), charged.source_nack);
+    fixture.physical.owner.test_retransmit_now.store(1100, .release);
+    const before = pressureTestCompleted(fixture.physical.owner);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    try pressureTestWaitCompleted(fixture.physical.owner, before);
+    try testing.expect(fixture.peers[1].recvFrom(&received) == null);
+    const after = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    try testing.expectEqual(charged.source_nack, after.source_nack);
+}
+
+test "physical WebRTC NACK recovery policy serves fresh and counts stale cached retransmit" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(true, 16);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    owner.test_retransmit_now.store(100, .release);
+    var storage: [128]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 65535, .timestamp = 480, .ssrc = 9801 }, .payload = "recovery-policy" }, &storage);
+    var received: [1024]u8 = undefined;
+    fixture.peers[0].sendTo(fixture.destination, packet);
+    for (fixture.peers[1..]) |*peer| {
+        const delivered = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, packet, delivered.data);
+    }
+    try waitPumpDrainedTest(owner);
+    var request: [64]u8 = undefined;
+    const nack = try rtcp_translate.buildNack(77, 9801, &.{65535}, &request);
+    // Fresh cached packet (age 999 ms) is served and not counted late.
+    owner.test_retransmit_now.store(1099, .release);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    const fresh = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, packet, fresh.data);
+    try testing.expectEqual(@as(u64, 0), owner.retransmit_recovery.dropped_late);
+    try waitPumpDrainedTest(owner);
+    const baseline = retransmitQueueSnapshotTest(owner);
+    // The retransmit is enqueued while fresh, then the serving clock reaches
+    // the deadline: it must be dropped, counted late, and not served.
+    owner.test_retransmit_next.store(1100, .release);
+    owner.test_retransmit_now.store(1099, .release);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    const dropped = try waitRetransmitCompletionTest(owner, baseline.completed);
+    try testing.expectEqual(@as(?RoutingDisposition, .stale), dropped.last);
+    try testing.expect(fixture.peers[1].recvFrom(&received) == null);
+    try testing.expectEqual(@as(u64, 1), owner.retransmit_recovery.dropped_late);
+}
+
+test "routing queued retransmission expiry completes once and preserves later queue credit" {
+    const domain = try routing.Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("deadline retained Domain");
+    var owner = try MediaPlane.initFallible(testing.allocator);
+    defer owner.deinit();
+    const binding = try domain.bindWebrtc(&owner);
+    defer domain.releaseWebrtc(binding) catch @panic("deadline retained binding");
+    try owner.prepareRoutingEgress(domain, 4, 256);
+    defer owner.disposeRoutingEgress(domain) catch @panic("deadline retained queue");
+    const stamp: routing.EndpointStamp = .{
+        .endpoint = .{ .call = .{ .domain = .{ .serial = 1 }, .serial = 1 }, .serial = 1, .leg = .webrtc },
+        .binding_revision = 1,
+        .security_revision = 1,
+        .offering_client = .{ .shard = 0, .slot = 0, .gen = 1 },
+    };
+    var packet: [13]u8 = @splat(0);
+    _ = try rtp_profile.encodeHeader(.{ .payload_type = 111, .sequence = 1, .timestamp = 1, .ssrc = 1 }, &packet);
+    packet[12] = 'p';
+    const expired = try owner.enqueueWireBytesWithDeadlineLocked(stamp, stamp, .rtp, 1, &packet, .canonical, 100);
+    const following = try owner.enqueueCanonicalBytesLocked(stamp, stamp, .rtp, 1, &packet);
+    const queue = owner.routing_egress.?;
+    queue.pump_id = std.Thread.getCurrentId();
+    defer queue.pump_id = null;
+    owner.test_retransmit_now.store(1100, .release);
+    var unused_socket: MediaSocket = undefined;
+    try testing.expectEqual(RoutingDisposition.stale, (try owner.drainOneRoutingEgress(&unused_socket)).?);
+    try testing.expectEqual(@as(usize, 1), queue.len);
+    try testing.expectEqual(@as(u64, 1), queue.completed);
+    try testing.expectEqual(following.ordinal, queue.rows[queue.head].ordinal);
+    try testing.expectEqual(@as(u64, 3), queue.next_ordinal);
+    try testing.expectEqual(expired.ordinal + 1, following.ordinal);
+    try testing.expect(std.mem.allEqual(u8, queue.payloads[0..queue.payload_limit], 0));
+    queue.inflight = following.ordinal;
+    owner.finishRoutingEgressAttempt(queue, following.ordinal, .sent);
+    try testing.expectEqual(@as(usize, 0), queue.len);
+    try testing.expectEqual(@as(u64, 2), queue.completed);
+    try testing.expect(std.mem.allEqual(u8, queue.payloads, 0));
+}
+
+const RetransmitQueueSnapshotTest = struct { queued: usize, completed: u64, next_ordinal: u64, last: ?RoutingDisposition, wiped: bool };
+fn retransmitQueueSnapshotTest(owner: *MediaPlane) RetransmitQueueSnapshotTest {
+    lockSpin(&owner.mutex);
+    defer owner.mutex.unlock();
+    const queue = owner.routing_egress.?;
+    lockSpin(&queue.mutex);
+    defer queue.mutex.unlock();
+    return .{ .queued = queue.len, .completed = queue.completed, .next_ordinal = queue.next_ordinal, .last = queue.last_disposition, .wiped = std.mem.allEqual(u8, queue.payloads, 0) };
+}
+fn waitRetransmitCompletionTest(owner: *MediaPlane, previous: u64) !RetransmitQueueSnapshotTest {
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) });
+    while (true) {
+        const state = retransmitQueueSnapshotTest(owner);
+        if (state.completed > previous and state.queued == 0) return state;
+        if (deadline.untilNow(testing.io).raw.nanoseconds >= 0) return error.TestUnexpectedResult;
+        std.Thread.yield() catch {};
+    }
+}
+test "physical WebRTC actual pump drops queued retransmission at deadline and progresses" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(true, 16);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    owner.test_retransmit_now.store(100, .release);
+    var storage: [128]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 65535, .timestamp = 480, .ssrc = 9601 }, .payload = "queued-deadline" }, &storage);
+    var received: [1024]u8 = undefined;
+    fixture.peers[0].sendTo(fixture.destination, packet);
+    for (fixture.peers[1..]) |*peer| {
+        const delivered = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, packet, delivered.data);
+    }
+    try waitPumpDrainedTest(owner);
+    const baseline = retransmitQueueSnapshotTest(owner);
+    try testing.expect(baseline.wiped);
+    const prior_budget = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    var request: [64]u8 = undefined;
+    const nack = try rtcp_translate.buildNack(77, 9601, &.{65535}, &request);
+    owner.test_retransmit_next.store(1100, .release);
+    owner.test_retransmit_now.store(1099, .release);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    const dropped = try waitRetransmitCompletionTest(owner, baseline.completed);
+    try testing.expectEqual(baseline.completed + 1, dropped.completed);
+    try testing.expectEqual(baseline.next_ordinal + 1, dropped.next_ordinal);
+    try testing.expectEqual(@as(?RoutingDisposition, .stale), dropped.last);
+    try testing.expect(dropped.wiped);
+    try testing.expect(fixture.peers[1].recvFrom(&received) == null);
+    const charged = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    try testing.expectEqual(prior_budget.source_nack + 1, charged.source_nack);
+    // A new real packet, then its real retransmission, must use the released
+    // queue capacity and the pump after the stale completion.
+    const later = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 0, .timestamp = 960, .ssrc = 9601 }, .payload = "fresh-after-drop" }, &storage);
+    fixture.peers[0].sendTo(fixture.destination, later);
+    for (fixture.peers[1..]) |*peer| {
+        const delivered = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, later, delivered.data);
+    }
+    var retry_buf: [64]u8 = undefined;
+    const retry = try rtcp_translate.buildNack(77, 9601, &.{0}, &retry_buf);
+    fixture.peers[1].sendTo(fixture.destination, retry);
+    const resent = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, later, resent.data);
+    try waitPumpDrainedTest(owner);
+    try testing.expect(retransmitQueueSnapshotTest(owner).wiped);
+}
+
+test "physical legacy group duplicate RTP cannot renew cached retransmit lifetime" {
+    const fixture = try FiveBlockerGroupFixture.createWithCapacity(true, 16);
+    defer fixture.destroy();
+    const owner = fixture.physical.owner;
+    routing.TestFeedbackClock.set(fixture.physical.domain, 1000);
+    owner.test_retransmit_now.store(100, .release);
+    var storage: [128]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 65535, .timestamp = 480, .ssrc = 9701 }, .payload = "duplicate-original" }, &storage);
+    var received: [1024]u8 = undefined;
+    fixture.peers[0].sendTo(fixture.destination, packet);
+    for (fixture.peers[1..]) |*peer| {
+        const delivered = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, packet, delivered.data);
+    }
+    owner.test_retransmit_now.store(1099, .release);
+    fixture.peers[0].sendTo(fixture.destination, packet);
+    for (fixture.peers[1..]) |*peer| {
+        const delivered = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, packet, delivered.data);
+    }
+    const prior = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    var request: [64]u8 = undefined;
+    const nack = try rtcp_translate.buildNack(77, 9701, &.{65535}, &request);
+    owner.test_retransmit_now.store(1100, .release);
+    const before = pressureTestCompleted(owner);
+    fixture.peers[1].sendTo(fixture.destination, nack);
+    try pressureTestWaitCompleted(owner, before);
+    try testing.expect(fixture.peers[1].recvFrom(&received) == null);
+    const after = try routing.TestFeedbackClock.read(fixture.physical.domain, fixture.credentials[1].key);
+    try testing.expectEqual(prior.source_nack, after.source_nack);
+    // A genuinely new extended sequence after the wrap receives a new lifetime.
+    const later = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 0, .timestamp = 960, .ssrc = 9701 }, .payload = "new-cycle" }, &storage);
+    fixture.peers[0].sendTo(fixture.destination, later);
+    for (fixture.peers[1..]) |*peer| {
+        const delivered = peer.recvFrom(&received) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, later, delivered.data);
+    }
+    var retry_buf: [64]u8 = undefined;
+    const retry = try rtcp_translate.buildNack(77, 9701, &.{0}, &retry_buf);
+    fixture.peers[1].sendTo(fixture.destination, retry);
+    const fresh = fixture.peers[1].recvFrom(&received) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, later, fresh.data);
 }

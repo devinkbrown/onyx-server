@@ -138,7 +138,7 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const mail.Snapsh
     @memcpy(bytes[0..4], magic);
     std.mem.writeInt(u16, bytes[4..6], version, .big);
     std.mem.writeInt(u16, bytes[8..10], @intCast(snapshot.jobs.len), .big);
-    bytes[10] = @intFromEnum(snapshot.execution);
+    bytes[10] = @backingInt(snapshot.execution);
     std.mem.writeInt(u64, bytes[12..20], snapshot.failure_seq, .big);
     @memcpy(bytes[20..52], &snapshot.config_digest);
     std.mem.writeInt(u32, bytes[52..56], @intCast(total), .big);

@@ -1,5 +1,8 @@
 # 0.7.0 feature activation record — 2026-09-06
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 This is the production record for the symmetric feature-gate activation on
 `eshmaki.me` and `ircx.us`. The existing verified artifact was retained; this
 was a configuration-only release followed by one cold restart per node.

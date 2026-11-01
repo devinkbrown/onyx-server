@@ -9,8 +9,13 @@ const platform = @import("../../substrate/platform.zig");
 const control = @import("native_windows_control.zig");
 const windows_scm = @import("../windows_scm.zig");
 
-pub const candidate_arg = "--helix-windows-successor-v19";
-pub const capability = "onyx-native-helix-windows-v19;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;scm-custody-v1;inert-ready;commit-ack;release-before-iocp";
+pub const candidate_arg = "--helix-windows-successor-v23";
+const predecessor_graph_capability = "onyx-native-helix-windows-v21;media-crypto-scope-v1;config-source-2m-v1;ring-sqpoll-idle-v1;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;scm-custody-v1;inert-ready;commit-ack;release-before-iocp";
+const predecessor_replica_core_capability = "onyx-native-helix-windows-v22;media-graph-v3;media-crypto-scope-v1;config-source-2m-v1;ring-sqpoll-idle-v1;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;scm-custody-v1;inert-ready;commit-ack;release-before-iocp";
+pub const capability = "onyx-native-helix-windows-v23;session-replica-core-checkpoint-v1;media-graph-v3;media-crypto-scope-v1;config-source-2m-v1;ring-sqpoll-idle-v1;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;scm-custody-v1;inert-ready;commit-ack;release-before-iocp";
+fn acceptsCapability(bytes: []const u8) bool {
+    return std.mem.eql(u8, bytes, capability);
+}
 const process_query_limited_information: u32 = 0x1000;
 const synchronize: u32 = 0x0010_0000;
 const extended_startupinfo_present: u32 = 0x0008_0000;
@@ -352,7 +357,7 @@ pub const Process = struct {
         try self.endpoint.send(.hello, capability, deadline);
         var reply = try self.endpoint.receive(deadline);
         defer reply.deinit();
-        if (reply.kind != .capabilities or !std.mem.eql(u8, reply.bytes(), capability)) return error.InvalidCandidate;
+        if (reply.kind != .capabilities or !acceptsCapability(reply.bytes())) return error.InvalidCandidate;
     }
 };
 
@@ -505,7 +510,7 @@ pub fn accept(handles: *CandidateHandles, parent_pid: u32, deadline: i64) Error!
     errdefer endpoint.deinit();
     var hello = try endpoint.receive(deadline);
     defer hello.deinit();
-    if (hello.kind != .hello or !std.mem.eql(u8, hello.bytes(), capability)) return error.InvalidCandidate;
+    if (hello.kind != .hello or !acceptsCapability(hello.bytes())) return error.InvalidCandidate;
     try endpoint.send(.capabilities, capability, deadline);
     const parent_process = handles.parent_process;
     handles.parent_process = 0;
@@ -656,11 +661,11 @@ test "Windows Helix candidate command line keeps paths and handles distinct" {
     defer allocator.free(command);
     const utf8 = try std.unicode.wtf16LeToWtf8Alloc(allocator, command);
     defer allocator.free(utf8);
-    try std.testing.expectEqualStrings("\"C:\\Program Files\\Onyx\\onyx-server.exe\" \"--helix-windows-successor-v19\" \"12\" \"24\" \"36\" \"48\" \"C:\\Onyx Data\\config\\live.toml\" \"55\" \"66\"", utf8);
+    try std.testing.expectEqualStrings("\"C:\\Program Files\\Onyx\\onyx-server.exe\" \"--helix-windows-successor-v23\" \"12\" \"24\" \"36\" \"48\" \"C:\\Onyx Data\\config\\live.toml\" \"55\" \"66\"", utf8);
     try std.testing.expectError(error.InvalidCandidate, commandLine(allocator, "C:\\Onyx\\server.exe", 1, 2, 3, 4, "bad\x00path", 0, 0));
 }
 
-test "Windows Helix v19 rejects v18 capability before candidate transfer" {
+fn expectCapabilityBeforeTransfer(previous_capability: []const u8, accepted: bool) !void {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     var pair = try control.Pair.init();
     defer pair.deinit();
@@ -670,10 +675,10 @@ test "Windows Helix v19 rejects v18 capability before candidate transfer" {
     defer parent.endpoint.deinit();
     var child = pair.takeChild(identity, key);
     defer child.deinit();
-    const previous_capability = "onyx-native-helix-windows-v18;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;inert-ready;commit-ack;release-before-iocp";
     const Runner = struct {
         endpoint: *control.Endpoint,
         failure: ?anyerror = null,
+        previous_capability: []const u8,
         fn run(self: *@This()) void {
             const deadline = platform.monotonicMillis() + 3000;
             _ = control.receivePrelude(self.endpoint.read_handle, deadline) catch |err| {
@@ -685,19 +690,85 @@ test "Windows Helix v19 rejects v18 capability before candidate transfer" {
                 return;
             };
             defer hello.deinit();
-            if (hello.kind != .hello or !std.mem.eql(u8, hello.bytes(), capability)) {
+            if (hello.kind != .hello or !acceptsCapability(hello.bytes())) {
                 self.failure = error.InvalidCandidate;
                 return;
             }
-            self.endpoint.send(.capabilities, previous_capability, deadline) catch |err| {
+            self.endpoint.send(.capabilities, self.previous_capability, deadline) catch |err| {
                 self.failure = err;
             };
         }
     };
-    var runner = Runner{ .endpoint = &child };
+    var runner = Runner{ .endpoint = &child, .previous_capability = previous_capability };
     const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
     const outcome = parent.negotiate(platform.monotonicMillis() + 3000);
     thread.join();
     if (runner.failure) |err| return err;
-    try std.testing.expectError(error.InvalidCandidate, outcome);
+    if (accepted) try outcome else try std.testing.expectError(error.InvalidCandidate, outcome);
+    try std.testing.expect(!parent.committed);
+}
+
+fn expectCapabilityRejectedBeforeTransfer(previous_capability: []const u8) !void {
+    try expectCapabilityBeforeTransfer(previous_capability, false);
+}
+
+test "Windows Helix v20 rejects v19 capability before candidate transfer" {
+    try expectCapabilityRejectedBeforeTransfer("onyx-native-helix-windows-v19;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;scm-custody-v1;inert-ready;commit-ack;release-before-iocp");
+}
+
+test "Windows Helix v20 rejects pre idle budget reader before candidate transfer" {
+    try expectCapabilityRejectedBeforeTransfer("onyx-native-helix-windows-v20;config-source-2m-v1;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;scm-custody-v1;inert-ready;commit-ack;release-before-iocp");
+}
+
+test "Windows Helix v21 rejects v20 without independent crypto provenance before transfer" {
+    try expectCapabilityRejectedBeforeTransfer("onyx-native-helix-windows-v20;config-source-2m-v1;ring-sqpoll-idle-v1;strict-capsules;hmac-control;indexed-sockets;encrypted-arena;account-wal-custody-v1;metrics-custody-v1;webhook-custody-v1;history-custody-v4;history-material-custody-v2;udp-custody-v1;media-custody-v1;active-webtransport-custody-v1;webpush-custody-v1;abuse-custody-v1;geo-custody-v1;mail-wal-custody-v2;policy-custody-v1;operator-custody-v1;account-flow-custody-v1;user-settings-custody-v1;memo-custody-v1;memo-inbox-custody-v1;ocsp-custody-v1;acme-custody-v1;tls-material-custody-v1;tls-replay-custody-v1;wasm-custody-v1;scm-custody-v1;inert-ready;commit-ack;release-before-iocp");
+}
+
+test "Windows Helix v22 graph capabilities are exact with no older or missing marker admission" {
+    try std.testing.expect(acceptsCapability(capability));
+    try std.testing.expect(!acceptsCapability(predecessor_graph_capability));
+    const marker = "media-graph-v3;";
+    const marker_at = std.mem.indexOf(u8, capability, marker).?;
+    const absent = try std.mem.concat(std.testing.allocator, u8, &.{ capability[0..marker_at], capability[marker_at + marker.len ..] });
+    defer std.testing.allocator.free(absent);
+    try std.testing.expect(!acceptsCapability(absent));
+    const malformed = try std.testing.allocator.dupe(u8, capability);
+    defer std.testing.allocator.free(malformed);
+    malformed[marker_at + "media-graph-v".len] = '2';
+    try std.testing.expect(!acceptsCapability(malformed));
+    try std.testing.expect(!acceptsCapability(capability ++ ";extra"));
+}
+
+test "Windows Helix v22 rejects complete v21 graph reader before state transfer" {
+    try expectCapabilityRejectedBeforeTransfer(predecessor_graph_capability);
+}
+
+test "Windows Helix v22 accepts current graph capability before state transfer" {
+    try expectCapabilityBeforeTransfer(capability, true);
+}
+
+test "Windows Helix v22 refuses missing graph marker before state transfer" {
+    const marker = "media-graph-v3;";
+    const marker_at = std.mem.indexOf(u8, capability, marker).?;
+    const absent = try std.mem.concat(std.testing.allocator, u8, &.{ capability[0..marker_at], capability[marker_at + marker.len ..] });
+    defer std.testing.allocator.free(absent);
+    try expectCapabilityRejectedBeforeTransfer(absent);
+}
+
+test "Windows Helix v22 refuses malformed graph marker before state transfer" {
+    const marker_at = std.mem.indexOf(u8, capability, "media-graph-v3;").?;
+    const malformed = try std.testing.allocator.dupe(u8, capability);
+    defer std.testing.allocator.free(malformed);
+    malformed[marker_at + "media-graph-v".len] = '2';
+    try expectCapabilityRejectedBeforeTransfer(malformed);
+}
+
+test "Windows Helix v23 replica Core cursor capability refuses old and missing marker before state transfer" {
+    try expectCapabilityRejectedBeforeTransfer(predecessor_replica_core_capability);
+    try expectCapabilityBeforeTransfer(capability, true);
+    const marker = "session-replica-core-checkpoint-v1;";
+    const at = std.mem.indexOf(u8, capability, marker).?;
+    const absent = try std.mem.concat(std.testing.allocator, u8, &.{ capability[0..at], capability[at + marker.len ..] });
+    defer std.testing.allocator.free(absent);
+    try expectCapabilityRejectedBeforeTransfer(absent);
 }

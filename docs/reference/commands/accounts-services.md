@@ -181,15 +181,26 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 
 ## SESSION
 
-- Syntax: `SESSION [LIST|TOKEN|RESUME <token>|DROP <#n|sid=<32-hex>>]`
+- Syntax: `SESSION [LIST [MESH]|TOKEN|RESUME <token>|DROP <#n|sid=<32-hex>>|REVOKE group=<32-hex>]`
 - Description: Lists account attachments, reveals credentials for this exact logical session, attaches the client to that session, or revokes one other physical attachment. `SESSION TOKEN` emits a 32-hex-character origin-local credential and, when mesh resume is enabled, a separately sealed portable credential. Both are reusable: every successful `RESUME` adds or restores an attachment without disconnecting siblings or consuming the credential. These are session credentials, not the `sst_...` account-authentication credential used by SASL `SESSION-TOKEN` / `SESSIONTOKEN`; authentication alone never selects another same-account session. `LIST` emits an opaque 128-bit `sid` for rows with a stable attachment ID and binds each `#n` to that connection's exact emitted snapshot. `DROP` compare-and-removes only that physical row: recycled indices, rotated token/signon/attachment identity, ambiguous SIDs, and the caller's current row fail closed. Same-token siblings retain their nick and merged channel modes without a false QUIT; dropping the final row emits the ordinary QUIT/offline transition. An attached target or surviving exact-token sibling owned by another reactor currently returns `TEMPORARILY_UNAVAILABLE` without mutating either connection, pending the reserved two-owner handoff protocol.
 - Privileges: Registered client logged in to an account.
-- Parameters: Optional subcommand; `LIST` is default.
+- Parameters: Optional subcommand; `LIST` is default. Bare `SESSION` and local `LIST` inventory this node's physical attachments for the authenticated account. `LIST MESH` requests account-scoped mesh inventory. `TOKEN` takes no arguments; `RESUME`, `DROP`, and `REVOKE` each take exactly one credential or correctly typed selector. Unknown verbs, extra selectors and implicit `ALL`/logical-session scope on `DROP` fail before changing caches, credentials or attachments.
 - Replies: `NOTICE ... :SESSION TOKEN <hex>`, optional `NOTICE ... :SESSION MTOKEN <sealed-hex> expires=<unix-seconds>`, `SESSION LIST <*|-> #n signon=<ms> <attached|detached> [sid=<32-hex>]`, `SESSION: end of session list`, `SESSION DROP #n ok` / `SESSION DROP sid=<32-hex> ok`, successful `SESSION RESUME: already attached`, `attached to live session`, `attached to live mesh session`, `attached to replicated mesh session`, or `session restored`, plus redirects. A portable token is valid for 12 hours; its live snapshot is offered immediately and re-offered on secured-peer establishment/reconnect. All attachments share identity/channel state, receive events, and may participate.
 - Retry behavior: `ORIGIN_UNREACHABLE` and `TEMPORARILY_UNAVAILABLE` retain the supplied credential. After either result or a redirect, the immediately following `SESSION TOKEN` is suppressed once with `WARN SESSION RESUME_CREDENTIAL_PRESERVED`, preventing a reconnecting client from overwriting its still-valid stored credential. Repeating `SESSION TOKEN` explicitly returns the credential for the current attachment. An already-live session is a successful attachment path, not `SESSION_ATTACHED`.
-- Errors: Terminal `FAIL SESSION INVALID_TOKEN`, `INVALID_INDEX`, `NO_SESSION`, `NO_SUCH_SESSION`, `AMBIGUOUS_SID`, `STALE_LIST`, or `CANNOT_DROP_CURRENT`; retryable `WARN SESSION ORIGIN_UNREACHABLE`, `TEMPORARILY_UNAVAILABLE`, or `RESUME_CREDENTIAL_PRESERVED`; account-required notice.
+- Errors: Terminal `FAIL SESSION INVALID_SUBCOMMAND`, `INVALID_PARAMS`, `NEED_MORE_PARAMS`, `INVALID_TOKEN`, `INVALID_INDEX`, `NO_SESSION`, `NO_SUCH_SESSION`, `AMBIGUOUS_SID`, `STALE_LIST`, or `CANNOT_DROP_CURRENT`; retryable `WARN SESSION ORIGIN_UNREACHABLE`, `TEMPORARILY_UNAVAILABLE`, or `RESUME_CREDENTIAL_PRESERVED`; account-required notice.
 - Example: `SESSION TOKEN`
 - Sources: `src/daemon/modules/accounts.zig:143`, `src/daemon/server.zig:24958`, `src/daemon/server.zig:25007`, `src/daemon/services.zig:899`
+
+Candidate mesh controls additionally support `SESSION LIST MESH` for the owning
+account and `SESSION REVOKE group=<id>` for a whole logical group. The group ID
+comes from mesh inventory; its physical attachment IDs are not local DROP SIDs.
+Completion requires signed durable-denial receipts from the same validated full
+roster and activation epoch. A pending result is not success or rollback; poll
+from another authenticated attachment if the selected group includes this
+connection. Missing durable storage/full-roster support returns `UNSUPPORTED`.
+See the [session-control wire supplement](../protocol/onyx-session-control.v1.json)
+for exact fields, errors and remaining output-budgeting limits. These controls
+do not revoke unrelated groups or SASL account-authentication credentials.
 
 ## CERTADD
 

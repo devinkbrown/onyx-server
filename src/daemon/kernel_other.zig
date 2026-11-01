@@ -358,7 +358,7 @@ pub fn assignDaemonJob() Error!void {
     var job: windows.HANDLE = undefined;
     const created = NtCreateJobObject(&job, windows.ACCESS_MASK.Specific.JobObject.ALL_ACCESS, null);
     if (created != .SUCCESS) {
-        std.debug.print("onyx-server: NtCreateJobObject status=0x{x}\n", .{@intFromEnum(created)});
+        std.debug.print("onyx-server: NtCreateJobObject status=0x{x}\n", .{@backingInt(created)});
         return error.MissingOp;
     }
     // Build 22621 rejects the basic class and the combined flags with
@@ -380,12 +380,12 @@ pub fn assignDaemonJob() Error!void {
             applied = true;
             break;
         }
-        std.debug.print("onyx-server: job limit flags=0x{x} status=0x{x}\n", .{ flags, @intFromEnum(set) });
+        std.debug.print("onyx-server: job limit flags=0x{x} status=0x{x}\n", .{ flags, @backingInt(set) });
     }
     if (!applied) std.debug.print("onyx-server: job limits left at the kernel default\n", .{});
     const assigned = NtAssignProcessToJobObject(job, current);
     if (assigned != .SUCCESS) {
-        std.debug.print("onyx-server: NtAssignProcessToJobObject status=0x{x}\n", .{@intFromEnum(assigned)});
+        std.debug.print("onyx-server: NtAssignProcessToJobObject status=0x{x}\n", .{@backingInt(assigned)});
         _ = NtClose(job);
         var raced_in_job: i32 = 0;
         if (IsProcessInJob(current, null, &raced_in_job) != 0 and raced_in_job != 0) {

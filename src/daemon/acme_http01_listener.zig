@@ -381,8 +381,8 @@ fn acceptSocket(fd: posix.fd_t) if (builtin.os.tag == .linux) usize else c_int {
 }
 
 fn acceptAgain() if (builtin.os.tag == .linux) usize else c_int {
-    if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @intFromEnum(posix.E.AGAIN)));
-    sys._errno().* = @intFromEnum(posix.E.AGAIN);
+    if (comptime builtin.os.tag == .linux) return @bitCast(-@as(isize, @backingInt(posix.E.AGAIN)));
+    sys._errno().* = @backingInt(posix.E.AGAIN);
     return -1;
 }
 

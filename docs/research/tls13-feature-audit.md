@@ -1,5 +1,8 @@
 # Armor TLS 1.3 feature audit — RFC 8446 (+ 8446bis where stable)
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Date: 2026-07-11. Scope: the TLS **1.3** core only — `src/crypto/tls_server.zig`,
 `src/crypto/tls_client.zig`, `src/crypto/tls_record.zig`, `src/crypto/hkdf_tls13.zig`,
 `src/crypto/tls_resumption.zig` and the 1.3-specific extension modules under `src/proto/`.

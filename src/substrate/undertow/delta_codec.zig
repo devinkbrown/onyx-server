@@ -363,7 +363,7 @@ pub fn DeltaView(comptime limits: Limits) type {
             var w = coilpack.Cbb.init(out);
             for (magic) |byte| _ = try w.writeU8(byte);
             _ = try w.writeU8(version);
-            _ = try w.writeU8(@intFromEnum(self.family));
+            _ = try w.writeU8(@backingInt(self.family));
             _ = try w.writeBytes(self.entity_id);
             _ = try w.writeU64Le(self.hlc.toU64());
 
@@ -493,7 +493,7 @@ pub fn OrSetCodec(comptime T: type, comptime ValueCodec: type, comptime limits: 
             var w = coilpack.Cbb.init(out);
             for (magic) |byte| _ = try w.writeU8(byte);
             _ = try w.writeU8(version);
-            _ = try w.writeU8(@intFromEnum(family));
+            _ = try w.writeU8(@backingInt(family));
             _ = try w.writeBytes(entity_id);
             _ = try w.writeU64Le(hlc.toU64());
 

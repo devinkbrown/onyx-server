@@ -112,7 +112,7 @@ pub fn encodeGreeting(allocator: Allocator, methods: []const Method) ![]u8 {
     try out.append(allocator, version);
     try out.append(allocator, @intCast(methods.len));
     for (methods) |method| {
-        try out.append(allocator, @intFromEnum(method));
+        try out.append(allocator, @backingInt(method));
     }
     return out.toOwnedSlice(allocator);
 }
@@ -130,7 +130,7 @@ pub fn decodeGreeting(allocator: Allocator, bytes: []const u8) !Greeting {
     errdefer allocator.free(methods);
 
     for (methods, 0..) |*method, i| {
-        method.* = @enumFromInt(bytes[2 + i]);
+        method.* = @fromBackingInt(@intCast(bytes[2 + i]));
     }
 
     return .{ .methods = methods };
@@ -141,7 +141,7 @@ pub fn encodeMethodSelection(allocator: Allocator, selection: MethodSelection) !
     defer out.deinit(allocator);
 
     try out.append(allocator, version);
-    try out.append(allocator, @intFromEnum(selection.method));
+    try out.append(allocator, @backingInt(selection.method));
     return out.toOwnedSlice(allocator);
 }
 
@@ -150,7 +150,7 @@ pub fn decodeMethodSelection(bytes: []const u8) Error!MethodSelection {
     if (bytes[0] != version) return Error.BadVersion;
     if (bytes.len != 2) return Error.InvalidLength;
 
-    return .{ .method = @enumFromInt(bytes[1]) };
+    return .{ .method = @fromBackingInt(@intCast(bytes[1])) };
 }
 
 pub fn encodeUserPassRequest(allocator: Allocator, credentials: Credentials) ![]u8 {
@@ -196,7 +196,7 @@ pub fn encodeUserPassResponse(allocator: Allocator, response: AuthResponse) ![]u
     defer out.deinit(allocator);
 
     try out.append(allocator, user_pass_version);
-    try out.append(allocator, @intFromEnum(response.status));
+    try out.append(allocator, @backingInt(response.status));
     return out.toOwnedSlice(allocator);
 }
 
@@ -205,7 +205,7 @@ pub fn decodeUserPassResponse(bytes: []const u8) Error!AuthResponse {
     if (bytes[0] != user_pass_version) return Error.BadVersion;
     if (bytes.len != 2) return Error.InvalidLength;
 
-    return .{ .status = @enumFromInt(bytes[1]) };
+    return .{ .status = @fromBackingInt(@intCast(bytes[1])) };
 }
 
 pub fn encodeConnectRequest(allocator: Allocator, request: ConnectRequest) ![]u8 {
@@ -213,7 +213,7 @@ pub fn encodeConnectRequest(allocator: Allocator, request: ConnectRequest) ![]u8
     defer out.deinit(allocator);
 
     try out.append(allocator, version);
-    try out.append(allocator, @intFromEnum(Command.connect));
+    try out.append(allocator, @backingInt(Command.connect));
     try out.append(allocator, 0x00);
     try appendAddress(&out, allocator, request.address);
     try appendU16(&out, allocator, request.port);
@@ -223,7 +223,7 @@ pub fn encodeConnectRequest(allocator: Allocator, request: ConnectRequest) ![]u8
 pub fn decodeConnectRequest(bytes: []const u8) Error!ConnectRequest {
     if (bytes.len < 4) return Error.Truncated;
     if (bytes[0] != version) return Error.BadVersion;
-    if (bytes[1] != @intFromEnum(Command.connect)) return Error.UnsupportedCommand;
+    if (bytes[1] != @backingInt(Command.connect)) return Error.UnsupportedCommand;
     if (bytes[2] != 0x00) return Error.BadReserved;
 
     const parsed = try parseAddress(bytes, 3);
@@ -236,7 +236,7 @@ pub fn encodeReply(allocator: Allocator, reply: Reply) ![]u8 {
     defer out.deinit(allocator);
 
     try out.append(allocator, version);
-    try out.append(allocator, @intFromEnum(reply.code));
+    try out.append(allocator, @backingInt(reply.code));
     try out.append(allocator, 0x00);
     try appendAddress(&out, allocator, reply.address);
     try appendU16(&out, allocator, reply.port);
@@ -252,7 +252,7 @@ pub fn decodeReply(bytes: []const u8) Error!Reply {
     const parsed = try parseAddress(bytes, 3);
     if (parsed.next != bytes.len) return Error.InvalidLength;
     return .{
-        .code = @enumFromInt(bytes[1]),
+        .code = @fromBackingInt(@intCast(bytes[1])),
         .address = parsed.address,
         .port = parsed.port,
     };
@@ -269,17 +269,17 @@ fn validDomain(domain: []const u8) bool {
 fn appendAddress(out: *std.ArrayList(u8), allocator: Allocator, address: Address) !void {
     switch (address) {
         .ipv4 => |octets| {
-            try out.append(allocator, @intFromEnum(AddressType.ipv4));
+            try out.append(allocator, @backingInt(AddressType.ipv4));
             try out.appendSlice(allocator, &octets);
         },
         .domain => |domain| {
             if (!validDomain(domain)) return Error.InvalidDomainLength;
-            try out.append(allocator, @intFromEnum(AddressType.domain));
+            try out.append(allocator, @backingInt(AddressType.domain));
             try out.append(allocator, @intCast(domain.len));
             try out.appendSlice(allocator, domain);
         },
         .ipv6 => |octets| {
-            try out.append(allocator, @intFromEnum(AddressType.ipv6));
+            try out.append(allocator, @backingInt(AddressType.ipv6));
             try out.appendSlice(allocator, &octets);
         },
     }
@@ -298,14 +298,14 @@ fn parseAddress(bytes: []const u8, start: usize) Error!ParsedAddress {
     offset += 1;
 
     const address: Address = switch (atyp) {
-        @intFromEnum(AddressType.ipv4) => blk: {
+        @backingInt(AddressType.ipv4) => blk: {
             if (bytes.len < offset + 4) return Error.Truncated;
             var octets: [4]u8 = undefined;
             @memcpy(&octets, bytes[offset .. offset + 4]);
             offset += 4;
             break :blk .{ .ipv4 = octets };
         },
-        @intFromEnum(AddressType.domain) => blk: {
+        @backingInt(AddressType.domain) => blk: {
             if (bytes.len < offset + 1) return Error.Truncated;
             const domain_len: usize = bytes[offset];
             offset += 1;
@@ -315,7 +315,7 @@ fn parseAddress(bytes: []const u8, start: usize) Error!ParsedAddress {
             offset += domain_len;
             break :blk .{ .domain = domain };
         },
-        @intFromEnum(AddressType.ipv6) => blk: {
+        @backingInt(AddressType.ipv6) => blk: {
             if (bytes.len < offset + 16) return Error.Truncated;
             var octets: [16]u8 = undefined;
             @memcpy(&octets, bytes[offset .. offset + 16]);
@@ -337,7 +337,7 @@ fn readU16(bytes: []const u8) u16 {
 }
 
 fn isValidReplyCode(code: u8) bool {
-    return code <= @intFromEnum(ReplyCode.address_type_not_supported);
+    return code <= @backingInt(ReplyCode.address_type_not_supported);
 }
 
 test "greeting and method selection encode decode" {

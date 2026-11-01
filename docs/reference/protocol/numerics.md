@@ -123,7 +123,7 @@ meanings emitted during registration.
 | 338 | `RPL_WHOISACTUALLY` | WHOIS target real host/IP is visible to requester. | Actual host/IP. | `src/daemon/whois.zig:33`, `src/daemon/whois.zig:209`, `src/daemon/server.zig:13233`, `src/daemon/server.zig:13400`, `src/proto/numeric.zig:108` |
 | 352 | `RPL_WHOREPLY` | Plain WHO matching row. | Channel/nick/user/host/server/flags/realname row. | `src/daemon/server.zig:12669`, `src/daemon/server.zig:12864`, `src/proto/who.zig:159`, `src/proto/numeric.zig:117` |
 | 354 | `RPL_WHOSPCRPL` | WHOX matching row. | Requested WHOX fields. | `src/daemon/server.zig:12670`, `src/daemon/server.zig:12740`, `src/daemon/server.zig:12816`, `src/proto/whox.zig:14`, `src/proto/numeric.zig:119` |
-| 671 | `RPL_WHOISSECURE` | WHOIS target is connected over TLS. | Secure-connection text, with cipher when known. | `src/daemon/whois.zig:32`, `src/daemon/whois.zig:230`, `src/daemon/server.zig:13228`, `src/proto/numeric.zig:75` |
+| 671 | `RPL_WHOISSECURE` | WHOIS target is connected over TLS. | Secure-connection text, with cipher when known and `[kTLS: TX]`, `[kTLS: RX]`, or `[kTLS: TX+RX]` when those kernel directions are actually attached. | `src/daemon/whois.zig:32`, `src/daemon/whois.zig:230`, `src/daemon/server.zig:13228`, `src/proto/numeric.zig:75` |
 
 Hidden secret/private channels now fail closed in both roster paths: a non-member
 receives a bare `RPL_ENDOFNAMES` 366 for `NAMES #chan` and no 353 rows
@@ -134,8 +134,11 @@ regression test `src/daemon/server.zig:37210`).
 
 WHOIS `RPL_WHOISSPECIAL` 320 is repeatable. Geo/rDNS 320s are oper/self-gated
 (`src/daemon/server.zig:13145`, `src/daemon/server.zig:13166`); public `+R` and
-`+g` message-restriction hints are emitted for every requester
-(`src/daemon/server.zig:13205`, `src/daemon/whois.zig:236`). Tests cover `+R`,
+`+g` message-restriction hints are emitted for every requester, as are the `+G`
+(common-channel), `+Z` (TLS-only private messages), and `+V` (no-invite)
+restriction hints when they apply (`src/daemon/whois.zig`). The same numeric
+also carries the modes line, connection-class line, oper/self `ban cloak`, and
+the via-WebSocket line. Tests cover `+R`,
 `+g`, ordering, and coexistence with GeoIP 320s at `src/daemon/whois.zig:1067`,
 `src/daemon/whois.zig:1093`, `src/daemon/whois.zig:1115`, and
 `src/daemon/whois.zig:1150`.

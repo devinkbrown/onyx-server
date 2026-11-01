@@ -109,35 +109,35 @@ pub const Encoder = struct {
         value: Value,
     ) anyerror!void {
         switch (value) {
-            .nil => try out.append(allocator, @intFromEnum(Tag.nil)),
+            .nil => try out.append(allocator, @backingInt(Tag.nil)),
             .boolean => |b| try out.append(
                 allocator,
-                if (b) @intFromEnum(Tag.true) else @intFromEnum(Tag.false),
+                if (b) @backingInt(Tag.true) else @backingInt(Tag.false),
             ),
             .unsigned => |n| {
-                try out.append(allocator, @intFromEnum(Tag.u64));
+                try out.append(allocator, @backingInt(Tag.u64));
                 try appendVarint(allocator, out, n);
             },
             .signed => |n| {
-                try out.append(allocator, @intFromEnum(Tag.i64));
+                try out.append(allocator, @backingInt(Tag.i64));
                 try appendVarint(allocator, out, zigZagEncode(n));
             },
             .bytes => |bytes| {
-                try out.append(allocator, @intFromEnum(Tag.bytes));
+                try out.append(allocator, @backingInt(Tag.bytes));
                 try appendLenAndBytes(allocator, out, bytes);
             },
             .string => |string| {
                 if (!isValidUtf8(string)) return FormatError.InvalidUtf8;
-                try out.append(allocator, @intFromEnum(Tag.string));
+                try out.append(allocator, @backingInt(Tag.string));
                 try appendLenAndBytes(allocator, out, string);
             },
             .array => |items| {
-                try out.append(allocator, @intFromEnum(Tag.array));
+                try out.append(allocator, @backingInt(Tag.array));
                 try appendVarint(allocator, out, items.len);
                 for (items) |item| try appendValue(allocator, out, item);
             },
             .map => |entries| {
-                try out.append(allocator, @intFromEnum(Tag.map));
+                try out.append(allocator, @backingInt(Tag.map));
                 try appendVarint(allocator, out, entries.len);
                 try appendSortedMap(allocator, out, entries);
             },
@@ -168,15 +168,15 @@ pub const Decoder = struct {
 
         const tag_byte = try self.readByte();
         const tag: Tag = switch (tag_byte) {
-            @intFromEnum(Tag.nil) => .nil,
-            @intFromEnum(Tag.false) => .false,
-            @intFromEnum(Tag.true) => .true,
-            @intFromEnum(Tag.u64) => .u64,
-            @intFromEnum(Tag.i64) => .i64,
-            @intFromEnum(Tag.bytes) => .bytes,
-            @intFromEnum(Tag.string) => .string,
-            @intFromEnum(Tag.array) => .array,
-            @intFromEnum(Tag.map) => .map,
+            @backingInt(Tag.nil) => .nil,
+            @backingInt(Tag.false) => .false,
+            @backingInt(Tag.true) => .true,
+            @backingInt(Tag.u64) => .u64,
+            @backingInt(Tag.i64) => .i64,
+            @backingInt(Tag.bytes) => .bytes,
+            @backingInt(Tag.string) => .string,
+            @backingInt(Tag.array) => .array,
+            @backingInt(Tag.map) => .map,
             else => return FormatError.UnknownTag,
         };
 
@@ -509,11 +509,11 @@ test "round-trip i64 values and zigzag polarity" {
 
     const neg_one = try Encoder.encode(std.testing.allocator, .{ .signed = -1 });
     defer std.testing.allocator.free(neg_one);
-    try std.testing.expectEqualSlices(u8, &.{ @intFromEnum(Tag.i64), 0x01 }, neg_one);
+    try std.testing.expectEqualSlices(u8, &.{ @backingInt(Tag.i64), 0x01 }, neg_one);
 
     const pos_one = try Encoder.encode(std.testing.allocator, .{ .signed = 1 });
     defer std.testing.allocator.free(pos_one);
-    try std.testing.expectEqualSlices(u8, &.{ @intFromEnum(Tag.i64), 0x02 }, pos_one);
+    try std.testing.expectEqualSlices(u8, &.{ @backingInt(Tag.i64), 0x02 }, pos_one);
 }
 
 test "round-trip bytes and string" {
@@ -542,15 +542,15 @@ test "round-trip map" {
 test "canonical integer minimal-length enforced" {
     try std.testing.expectError(
         FormatError.NonCanonicalVarint,
-        Decoder.decode(std.testing.allocator, &.{ @intFromEnum(Tag.u64), 0x80, 0x00 }),
+        Decoder.decode(std.testing.allocator, &.{ @backingInt(Tag.u64), 0x80, 0x00 }),
     );
     try std.testing.expectError(
         FormatError.NonCanonicalVarint,
-        Decoder.decode(std.testing.allocator, &.{ @intFromEnum(Tag.u64), 0x81, 0x00 }),
+        Decoder.decode(std.testing.allocator, &.{ @backingInt(Tag.u64), 0x81, 0x00 }),
     );
     try std.testing.expectError(
         FormatError.NonCanonicalVarint,
-        Decoder.decode(std.testing.allocator, &.{ @intFromEnum(Tag.i64), 0x80, 0x00 }),
+        Decoder.decode(std.testing.allocator, &.{ @backingInt(Tag.i64), 0x80, 0x00 }),
     );
 }
 
@@ -560,10 +560,10 @@ test "map key ordering enforced and duplicate rejection" {
         Decoder.decode(
             std.testing.allocator,
             &.{
-                @intFromEnum(Tag.map), 0x02,
-                0x01,                  'b',
-                @intFromEnum(Tag.nil), 0x01,
-                'a',                   @intFromEnum(Tag.nil),
+                @backingInt(Tag.map), 0x02,
+                0x01,                 'b',
+                @backingInt(Tag.nil), 0x01,
+                'a',                  @backingInt(Tag.nil),
             },
         ),
     );
@@ -573,10 +573,10 @@ test "map key ordering enforced and duplicate rejection" {
         Decoder.decode(
             std.testing.allocator,
             &.{
-                @intFromEnum(Tag.map), 0x02,
-                0x01,                  'a',
-                @intFromEnum(Tag.nil), 0x01,
-                'a',                   @intFromEnum(Tag.nil),
+                @backingInt(Tag.map), 0x02,
+                0x01,                 'a',
+                @backingInt(Tag.nil), 0x01,
+                'a',                  @backingInt(Tag.nil),
             },
         ),
     );
@@ -627,22 +627,22 @@ test "invalid utf8 is rejected" {
 
     try std.testing.expectError(
         FormatError.InvalidUtf8,
-        Decoder.decode(std.testing.allocator, &.{ @intFromEnum(Tag.string), 0x02, 0xc0, 0x80 }),
+        Decoder.decode(std.testing.allocator, &.{ @backingInt(Tag.string), 0x02, 0xc0, 0x80 }),
     );
 }
 
 test "truncation and trailing bytes are rejected" {
     try std.testing.expectError(
         FormatError.Truncated,
-        Decoder.decode(std.testing.allocator, &.{ @intFromEnum(Tag.bytes), 0x04, 'a', 'b' }),
+        Decoder.decode(std.testing.allocator, &.{ @backingInt(Tag.bytes), 0x04, 'a', 'b' }),
     );
     try std.testing.expectError(
         FormatError.Truncated,
-        Decoder.decode(std.testing.allocator, &.{ @intFromEnum(Tag.array), 0x01 }),
+        Decoder.decode(std.testing.allocator, &.{ @backingInt(Tag.array), 0x01 }),
     );
     try std.testing.expectError(
         FormatError.TrailingBytes,
-        Decoder.decode(std.testing.allocator, &.{ @intFromEnum(Tag.nil), @intFromEnum(Tag.nil) }),
+        Decoder.decode(std.testing.allocator, &.{ @backingInt(Tag.nil), @backingInt(Tag.nil) }),
     );
 }
 
@@ -656,7 +656,7 @@ test "decoder rejects unknown tag and overflowing varint" {
         Decoder.decode(
             std.testing.allocator,
             &.{
-                @intFromEnum(Tag.u64),
+                @backingInt(Tag.u64),
                 0xff,
                 0xff,
                 0xff,

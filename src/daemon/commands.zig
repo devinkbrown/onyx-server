@@ -32,7 +32,7 @@ pub const Numeric = enum(u16) {
 };
 
 pub fn formatCode(n: Numeric, buf: []u8) []const u8 {
-    const value: u16 = @intFromEnum(n);
+    const value: u16 = @backingInt(n);
     buf[0] = @as(u8, '0') + @as(u8, @intCast((value / 100) % 10));
     buf[1] = @as(u8, '0') + @as(u8, @intCast((value / 10) % 10));
     buf[2] = @as(u8, '0') + @as(u8, @intCast(value % 10));

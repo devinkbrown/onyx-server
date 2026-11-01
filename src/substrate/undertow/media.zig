@@ -80,7 +80,7 @@ pub const KindSet = struct {
     }
 
     fn kindBit(kind: MediaKind) u8 {
-        return @as(u8, 1) << @intCast(@intFromEnum(kind));
+        return @as(u8, 1) << @intCast(@backingInt(kind));
     }
 };
 

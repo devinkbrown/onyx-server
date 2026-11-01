@@ -53,7 +53,7 @@ pub const Numeric = enum(u16) {
 };
 
 pub fn formatCode(numeric: Numeric, out: *[3]u8) []const u8 {
-    const value: u16 = @intFromEnum(numeric);
+    const value: u16 = @backingInt(numeric);
     out[0] = '0' + @as(u8, @intCast((value / 100) % 10));
     out[1] = '0' + @as(u8, @intCast((value / 10) % 10));
     out[2] = '0' + @as(u8, @intCast(value % 10));
@@ -70,7 +70,7 @@ pub const Rank = enum(u8) {
     founder = 60,
 
     pub fn atLeast(self: Rank, keep: Rank) bool {
-        return @intFromEnum(self) >= @intFromEnum(keep);
+        return @backingInt(self) >= @backingInt(keep);
     }
 
     pub fn parse(raw: []const u8) Error!Rank {

@@ -30,6 +30,7 @@ const mmr = @import("../substrate/merkle_mountain_range.zig");
 const rwlock = @import("../substrate/rwlock.zig");
 const svc_enforce = @import("svc_enforce.zig");
 const svc_acclist = @import("svc_acclist.zig");
+const svc_akick = @import("svc_akick.zig");
 const svc_chanbadwords = @import("svc_chanbadwords.zig");
 const webpush_mod = @import("webpush.zig");
 const delivery_authority = @import("delivery_authority.zig");
@@ -203,7 +204,7 @@ const StorePutError = @typeInfo(@typeInfo(@TypeOf(OroStore.put)).@"fn".return_ty
 const StoreDeleteError = @typeInfo(@typeInfo(@TypeOf(OroStore.delete)).@"fn".return_type.?).error_union.error_set;
 const Pbkdf2Error = @typeInfo(@typeInfo(@TypeOf(std.crypto.pwhash.pbkdf2)).@"fn".return_type.?).error_union.error_set;
 
-pub const ServiceError = StorePutError || StoreDeleteError || Pbkdf2Error || error{
+pub const ServiceError = StorePutError || StoreDeleteError || Pbkdf2Error || svc_akick.Error || error{
     NotFound,
     AuthFailed,
     Forbidden,
@@ -277,7 +278,7 @@ pub const AccessLevel = enum(u8) {
     founder = 100,
 
     pub fn allows(self: AccessLevel, needed: AccessLevel) bool {
-        return @intFromEnum(self) >= @intFromEnum(needed);
+        return @backingInt(self) >= @backingInt(needed);
     }
 };
 
@@ -2809,6 +2810,21 @@ pub const Services = struct {
         email_verified: bool,
         scratch: []u8,
     ) ServiceError!CommandResult {
+        return self.registerAccountWithEmailPolicy(name, password, email, email_verified, scratch, .production);
+    }
+
+    /// Only explicitly named allocation-sweep calls select reduced SCRAM work.
+    /// Ordinary registration APIs retain production work even in test builds.
+    pub const AllocationFailureSweep = if (@import("builtin").is_test) struct {
+        pub fn registerAccount(self: *Services, name: []const u8, password: []const u8, scratch: []u8) ServiceError!CommandResult {
+            return self.registerAccountWithEmailPolicy(name, password, null, false, scratch, .allocation_failure_sweep);
+        }
+    } else struct {};
+
+    const RegistrationWorkPolicy = enum { production, allocation_failure_sweep };
+
+    fn registerAccountWithEmailPolicy(self: *Services, name: []const u8, password: []const u8, email: ?[]const u8, email_verified: bool, scratch: []u8, comptime work_policy: RegistrationWorkPolicy) ServiceError!CommandResult {
+        if (comptime !@import("builtin").is_test and work_policy != .production) @compileError("reduced registration work is test-only");
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
@@ -2850,7 +2866,11 @@ pub const Services = struct {
         // mirror failure must not roll that back, so failures map to
         // error.InvalidRecord rather than leaving a half-registered account.
         if (self.scram) |scram| {
-            scram.deriveAndStore(record.name.asSlice(), password) catch return error.InvalidRecord;
+            if (comptime work_policy == .production) {
+                scram.deriveAndStore(record.name.asSlice(), password) catch return error.InvalidRecord;
+            } else {
+                ScramStore.AllocationFailureSweep.deriveAndStore(scram, record.name.asSlice(), password) catch return error.InvalidRecord;
+            }
             // Persist the derived SCRAM tuple so a SCRAM-SHA-256 login still works
             // after a restart (the in-memory store is otherwise re-seeded only on
             // a fresh register/identify). Best-effort: a mirror failure must not
@@ -2940,22 +2960,22 @@ pub const Services = struct {
 
     fn loginMechanismFromByte(byte: u8) ?LoginMechanism {
         return switch (byte) {
-            @intFromEnum(LoginMechanism.password) => .password,
-            @intFromEnum(LoginMechanism.scram) => .scram,
-            @intFromEnum(LoginMechanism.external) => .external,
-            @intFromEnum(LoginMechanism.passkey) => .passkey,
-            @intFromEnum(LoginMechanism.recovery) => .recovery,
-            @intFromEnum(LoginMechanism.oauth) => .oauth,
-            @intFromEnum(LoginMechanism.token) => .token,
+            @backingInt(LoginMechanism.password) => .password,
+            @backingInt(LoginMechanism.scram) => .scram,
+            @backingInt(LoginMechanism.external) => .external,
+            @backingInt(LoginMechanism.passkey) => .passkey,
+            @backingInt(LoginMechanism.recovery) => .recovery,
+            @backingInt(LoginMechanism.oauth) => .oauth,
+            @backingInt(LoginMechanism.token) => .token,
             else => null,
         };
     }
 
     fn loginTlsFromByte(byte: u8) ?LoginTls {
         return switch (byte) {
-            @intFromEnum(LoginTls.unknown) => .unknown,
-            @intFromEnum(LoginTls.clear) => .clear,
-            @intFromEnum(LoginTls.tls) => .tls,
+            @backingInt(LoginTls.unknown) => .unknown,
+            @backingInt(LoginTls.clear) => .clear,
+            @backingInt(LoginTls.tls) => .tls,
             else => null,
         };
     }
@@ -3000,8 +3020,8 @@ pub const Services = struct {
         if (stamped.at_ms == 0) stamped.at_ms = self.servicesNowMs();
         var rec: [login_audit_record_len]u8 = undefined;
         std.mem.writeInt(u64, rec[0..8], stamped.at_ms, .little);
-        rec[8] = @intFromEnum(stamped.mechanism);
-        rec[9] = @intFromEnum(stamped.tls);
+        rec[8] = @backingInt(stamped.mechanism);
+        rec[9] = @backingInt(stamped.tls);
         rec[10] = @min(stamped.certfp_len, 8);
         @memcpy(rec[11..19], &stamped.certfp_prefix);
         @memcpy(blob[n..][0..login_audit_record_len], &rec);
@@ -3461,7 +3481,7 @@ pub const Services = struct {
         var prefix_buf: [key_max]u8 = undefined;
         const prefix = try prefixedKey(access_prefix, record.name.asSlice(), "", &prefix_buf);
         var count: usize = 0;
-        var it = self.store.maps[@intFromEnum(channel_access_family)].map.iterator();
+        var it = self.store.maps[@backingInt(channel_access_family)].map.iterator();
         while (it.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
             const access = try decodeAccess(entry.value_ptr.*);
@@ -3537,6 +3557,47 @@ pub const Services = struct {
         }
     }
 
+    /// Admit the complete live rule before crossing the durable commit cut.
+    /// The daemon serializes mutations of live for this entire call. Failed or
+    /// ambiguous durable commits retain OroStore's poison/cold-reopen contract;
+    /// they never publish the live candidate or attempt a compensating write.
+    pub fn channelAkickAdd(
+        self: *Services,
+        live: *svc_akick.AkickStore,
+        channel: []const u8,
+        actor: []const u8,
+        mask: []const u8,
+        reason: []const u8,
+        added_at_ms: i64,
+        scratch: []u8,
+    ) ServiceError!AkickInfo {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+        if (self.store.preparedWritesPoisoned()) return error.StorePoisoned;
+
+        const record = try self.loadChannel(channel);
+        try self.requireAccess(record, actor, .admin);
+        const actor_key = try accountKey(actor);
+        const akick = AkickRecord{
+            .channel = record.name,
+            .mask = try validateMask(mask),
+            .generation = record.generation,
+            .setter = AccountName.init(actor_key.asSlice()) catch return error.InvalidName,
+            .reason = try validateReason(reason),
+        };
+        try self.admitAkickAddUnlocked(record, akick.mask.asSlice());
+        const encoded = try encodeAkick(akick, scratch);
+        var key_buf: [key_max]u8 = undefined;
+        const key = try akickKey(record.name.asSlice(), akick.mask.asSlice(), &key_buf);
+        var live_add = try live.prepareAdd(record.name.asSlice(), akick.mask.asSlice(), akick.reason.asSlice(), actor, added_at_ms, null);
+        defer live_add.abort();
+        var durable_put = try self.store.preparePut(channel_access_family, key, encoded);
+        defer durable_put.abort();
+        try durable_put.commit();
+        live_add.commit();
+        return akick.info();
+    }
+
     pub fn channelAkickList(
         self: *Services,
         channel: []const u8,
@@ -3551,7 +3612,7 @@ pub const Services = struct {
         var prefix_buf: [key_max]u8 = undefined;
         const prefix = try prefixedKey(akick_prefix, record.name.asSlice(), "", &prefix_buf);
         var count: usize = 0;
-        var it = self.store.maps[@intFromEnum(channel_access_family)].map.iterator();
+        var it = self.store.maps[@backingInt(channel_access_family)].map.iterator();
         while (it.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
             const akick = try decodeAkick(entry.value_ptr.*);
@@ -3561,6 +3622,29 @@ pub const Services = struct {
             count += 1;
         }
         return out[0..count];
+    }
+
+    /// Both ADD entry points author the same bounded, replayable rule set.
+    /// Existing keys retain their historical spelling; identity comparison
+    /// follows the live store's trim + ASCII-fold semantics.
+    fn admitAkickAddUnlocked(self: *Services, record: ChannelRecord, mask: []const u8) ServiceError!void {
+        if (self.store.preparedWritesPoisoned()) return error.StorePoisoned;
+        const trimmed = try svc_akick.validateAddMask(mask);
+        var prefix_buf: [key_max]u8 = undefined;
+        const prefix = try prefixedKey(akick_prefix, record.name.asSlice(), "", &prefix_buf);
+        var count: usize = 0;
+        var duplicate = false;
+        var it = self.store.maps[@backingInt(channel_access_family)].map.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+            const existing = try decodeAkick(entry.value_ptr.*);
+            if (!sameBytes(generation_len, &existing.generation, &record.generation)) continue;
+            const existing_mask = svc_akick.validateAddMask(existing.mask.asSlice()) catch return error.InvalidRecord;
+            count += 1;
+            duplicate = duplicate or std.ascii.eqlIgnoreCase(existing_mask, trimmed);
+        }
+        if (duplicate) return error.Duplicate;
+        if (count >= svc_akick.default_max_per_channel) return error.ListFull;
     }
 
     fn channelAkickUnlocked(
@@ -3594,6 +3678,7 @@ pub const Services = struct {
                     .setter = AccountName.init(actor_key.asSlice()) catch return error.InvalidName,
                     .reason = try validateReason(reason),
                 };
+                try self.admitAkickAddUnlocked(record, clean_mask.asSlice());
                 const encoded = try encodeAkick(akick, scratch);
                 var key_buf: [key_max]u8 = undefined;
                 const key = try akickKey(record.name.asSlice(), clean_mask.asSlice(), &key_buf);
@@ -3745,7 +3830,7 @@ pub const Services = struct {
         var key_lens: [256]usize = undefined;
         var keys_len: usize = 0;
         {
-            var it = self.store.maps[@intFromEnum(store_mod.Family.bans)].map.iterator();
+            var it = self.store.maps[@backingInt(store_mod.Family.bans)].map.iterator();
             while (it.next()) |entry| {
                 const key = entry.key_ptr.*;
                 if (!std.mem.startsWith(u8, key, saccess_prefix)) continue;
@@ -3942,7 +4027,7 @@ pub const Services = struct {
         defer self.lock.unlockShared();
         var pb: [metadata_full_key_max]u8 = undefined;
         const prefix = metadataAccountPrefix(&pb, account) orelse return;
-        var it = self.store.maps[@intFromEnum(store_mod.Family.props)].map.iterator();
+        var it = self.store.maps[@backingInt(store_mod.Family.props)].map.iterator();
         while (it.next()) |entry| {
             const k = entry.key_ptr.*;
             if (!std.mem.startsWith(u8, k, prefix)) continue;
@@ -4161,7 +4246,7 @@ pub const Services = struct {
             rows.deinit(allocator);
         }
         var result: WebpushPruneResult = .{};
-        var iterator = self.store.maps[@intFromEnum(store_mod.Family.props)].map.iterator();
+        var iterator = self.store.maps[@backingInt(store_mod.Family.props)].map.iterator();
         while (iterator.next()) |entry| {
             try self.requireWebpushPruneDeadline(deadline);
             const key = entry.key_ptr.*;
@@ -4426,7 +4511,7 @@ pub const Services = struct {
     pub fn channelsForAccount(self: *Services, account: []const u8, ctx: anytype, comptime cb: fn (@TypeOf(ctx), []const u8, AccessLevel) void) void {
         self.lock.lockShared();
         defer self.lock.unlockShared();
-        var it = self.store.maps[@intFromEnum(channel_access_family)].map.iterator();
+        var it = self.store.maps[@backingInt(channel_access_family)].map.iterator();
         while (it.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key_ptr.*, access_prefix)) continue;
             const access = decodeAccess(entry.value_ptr.*) catch continue;
@@ -4892,7 +4977,7 @@ pub const Services = struct {
 
         var summary = LiveReplaySummary{};
         {
-            var it = self.store.maps[@intFromEnum(store_mod.Family.chanregs)].map.iterator();
+            var it = self.store.maps[@backingInt(store_mod.Family.chanregs)].map.iterator();
             while (it.next()) |entry| {
                 const record = decodeChannel(entry.value_ptr.*) catch continue;
                 try sink.channel(sink.ptr, record.name.asSlice(), record.mlock.asSlice());
@@ -4901,7 +4986,7 @@ pub const Services = struct {
             }
         }
         if (sink.akick) |on_akick| {
-            var it = self.store.maps[@intFromEnum(channel_access_family)].map.iterator();
+            var it = self.store.maps[@backingInt(channel_access_family)].map.iterator();
             while (it.next()) |entry| {
                 if (!std.mem.startsWith(u8, entry.key_ptr.*, akick_prefix)) continue;
                 const akick = decodeAkick(entry.value_ptr.*) catch continue;
@@ -4912,7 +4997,7 @@ pub const Services = struct {
             }
         }
         if (sink.ward) |on_ward| {
-            var it = self.store.maps[@intFromEnum(store_mod.Family.bans)].map.iterator();
+            var it = self.store.maps[@backingInt(store_mod.Family.bans)].map.iterator();
             while (it.next()) |entry| {
                 if (!std.mem.startsWith(u8, entry.key_ptr.*, ward_prefix)) continue;
                 const ward = decodeWard(entry.value_ptr.*) catch continue;
@@ -4921,7 +5006,7 @@ pub const Services = struct {
             }
         }
         if (sink.saccess) |on_saccess| {
-            var it = self.store.maps[@intFromEnum(store_mod.Family.bans)].map.iterator();
+            var it = self.store.maps[@backingInt(store_mod.Family.bans)].map.iterator();
             while (it.next()) |entry| {
                 if (!std.mem.startsWith(u8, entry.key_ptr.*, saccess_prefix)) continue;
                 const sa = decodeSaccess(entry.value_ptr.*) catch continue;
@@ -5232,7 +5317,7 @@ fn directoryKeyIncluded(key: []const u8, prefix: ?[]const u8) bool {
 
 fn directoryConflicts(left: *OroStore, right: *OroStore) bool {
     for (directory_families) |spec| {
-        var it = left.maps[@intFromEnum(spec.family)].map.iterator();
+        var it = left.maps[@backingInt(spec.family)].map.iterator();
         while (it.next()) |entry| {
             if (!directoryKeyIncluded(entry.key_ptr.*, spec.prefix)) continue;
             const other = right.get(spec.family, entry.key_ptr.*) orelse continue;
@@ -5245,7 +5330,7 @@ fn directoryConflicts(left: *OroStore, right: *OroStore) bool {
 fn copyMissingDirectory(dst: *OroStore, src: *OroStore) !usize {
     var copied: usize = 0;
     for (directory_families) |spec| {
-        var it = src.maps[@intFromEnum(spec.family)].map.iterator();
+        var it = src.maps[@backingInt(spec.family)].map.iterator();
         while (it.next()) |entry| {
             if (!directoryKeyIncluded(entry.key_ptr.*, spec.prefix)) continue;
             if (dst.get(spec.family, entry.key_ptr.*) != null) continue;
@@ -5548,7 +5633,7 @@ fn encodeAccess(record: AccessRecord, scratch: []u8) ServiceError![]const u8 {
     return std.fmt.bufPrint(
         scratch,
         "{s}|{s}|{s}|{s}|{}",
-        .{ access_version, record.channel.asSlice(), record.account.asSlice(), &gen_hex, @intFromEnum(record.level) },
+        .{ access_version, record.channel.asSlice(), record.account.asSlice(), &gen_hex, @backingInt(record.level) },
     ) catch error.BufferTooSmall;
 }
 
@@ -5745,10 +5830,10 @@ fn decodeSaccess(value: []const u8) ServiceError!ReplaySaccess {
 
 fn levelFromInt(value: u8) ?AccessLevel {
     return switch (value) {
-        @intFromEnum(AccessLevel.voice) => .voice,
-        @intFromEnum(AccessLevel.op) => .op,
-        @intFromEnum(AccessLevel.admin) => .admin,
-        @intFromEnum(AccessLevel.founder) => .founder,
+        @backingInt(AccessLevel.voice) => .voice,
+        @backingInt(AccessLevel.op) => .op,
+        @backingInt(AccessLevel.admin) => .admin,
+        @backingInt(AccessLevel.founder) => .founder,
         else => null,
     };
 }
@@ -11713,4 +11798,170 @@ test "services shared context strict webpush mutation refuses invalid or oversiz
     defer std.testing.allocator.free(value);
     try std.testing.expectEqualStrings("original", value);
     try std.testing.expect((try services.legacyStore()) == &store);
+}
+
+test "channel AKICK atomic add rejects duplicate and overflow without durable replacement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "akick-atomic.wal");
+        defer store.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        var live = svc_akick.AkickStore.initCapacity(std.testing.allocator, 1);
+        defer live.deinit();
+        var scratch: [record_max]u8 = undefined;
+        _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+        _ = try services.registerChannel("#Onyx", "alice", &scratch);
+        const original = try services.channelAkickAdd(&live, "#ONYX", "alice", "Bad!*@*", "original", 17, &scratch);
+        try std.testing.expectEqualStrings("original", original.reason.asSlice());
+        try std.testing.expectError(error.Duplicate, services.channelAkickAdd(&live, "#onyx", "alice", "BAD!*@*", "replacement", 22, &scratch));
+        try std.testing.expectError(error.ListFull, services.channelAkickAdd(&live, "#onyx", "alice", "other!*@*", "overflow", 23, &scratch));
+        const persisted = try services.channelAkick("#onyx", "alice", "Bad!*@*", .query, "", &scratch);
+        try std.testing.expectEqualStrings("original", persisted.akick.reason.asSlice());
+        try std.testing.expectEqualStrings("alice", persisted.akick.setter.asSlice());
+        try std.testing.expectError(error.NotFound, services.channelAkick("#onyx", "alice", "BAD!*@*", .query, "", &scratch));
+        try std.testing.expectError(error.NotFound, services.channelAkick("#onyx", "alice", "other!*@*", .query, "", &scratch));
+        try std.testing.expectEqual(@as(usize, 1), live.count("#onyx"));
+        try std.testing.expectEqualStrings("original", live.list("#onyx")[0].reason);
+        try std.testing.expectEqual(@as(i64, 17), live.list("#onyx")[0].added_at_ms);
+    }
+    {
+        var store = try openTestStore(tmp, "akick-atomic.wal");
+        defer store.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        var entries: [2]AkickInfo = undefined;
+        const reopened = try services.channelAkickList("#onyx", "alice", &entries);
+        try std.testing.expectEqual(@as(usize, 1), reopened.len);
+        try std.testing.expectEqualStrings("Bad!*@*", reopened[0].mask.asSlice());
+        try std.testing.expectEqualStrings("original", reopened[0].reason.asSlice());
+        try std.testing.expectEqualStrings("alice", reopened[0].setter.asSlice());
+    }
+}
+
+test "channel AKICK atomic add aborts live preparation on durable rejection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(tmp, "akick-atomic-rejection.wal");
+    defer store.deinit();
+    var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+    var live = svc_akick.AkickStore.init(std.testing.allocator);
+    defer live.deinit();
+    var scratch: [record_max]u8 = undefined;
+    _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+    _ = try services.registerChannel("#onyx", "alice", &scratch);
+    store.staged_read_only = true;
+    try std.testing.expectError(error.ReadOnlyStore, services.channelAkickAdd(&live, "#onyx", "alice", "bad!*@*", "reason", 17, &scratch));
+    try std.testing.expectEqual(@as(usize, 0), live.channels.count());
+    try std.testing.expectError(error.NotFound, services.channelAkick("#onyx", "alice", "bad!*@*", .query, "", &scratch));
+    store.staged_read_only = false;
+    _ = try services.channelAkickAdd(&live, "#onyx", "alice", "bad!*@*", "retry", 22, &scratch);
+    try std.testing.expectEqualStrings("retry", live.list("#onyx")[0].reason);
+}
+
+test "channel AKICK durable-only add shares live duplicate grammar and capacity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var store = try openTestStore(tmp, "akick-durable-admission.wal");
+        defer store.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        var scratch: [record_max]u8 = undefined;
+        _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+        _ = try services.registerChannel("#onyx", "alice", &scratch);
+        try std.testing.expectError(error.InvalidMask, services.channelAkick("#onyx", "alice", "   ", .add, "invalid", &scratch));
+        try std.testing.expectError(error.InvalidMask, services.channelAkick("#onyx", "alice", " Account: ", .add, "invalid", &scratch));
+        _ = try services.channelAkick("#onyx", "alice", "Bad!*@*", .add, "original", &scratch);
+        try std.testing.expectError(error.Duplicate, services.channelAkick("#onyx", "alice", " BAD!*@* ", .add, "replacement", &scratch));
+        const unchanged = try services.channelAkick("#onyx", "alice", "Bad!*@*", .query, "", &scratch);
+        try std.testing.expectEqualStrings("original", unchanged.akick.reason.asSlice());
+        try std.testing.expectEqualStrings("alice", unchanged.akick.setter.asSlice());
+
+        var mask_buf: [64]u8 = undefined;
+        for (1..svc_akick.default_max_per_channel) |idx| {
+            const mask = try std.fmt.bufPrint(&mask_buf, "rule{d}!*@*", .{idx});
+            _ = try services.channelAkick("#onyx", "alice", mask, .add, "bounded", &scratch);
+        }
+        try std.testing.expectError(error.Duplicate, services.channelAkick("#onyx", "alice", "bad!*@*", .add, "replacement", &scratch));
+        try std.testing.expectError(error.ListFull, services.channelAkick("#onyx", "alice", "overflow!*@*", .add, "overflow", &scratch));
+        var live = svc_akick.AkickStore.init(std.testing.allocator);
+        defer live.deinit();
+        try std.testing.expectError(error.ListFull, services.channelAkickAdd(&live, "#onyx", "alice", "overflow!*@*", "overflow", 17, &scratch));
+        try std.testing.expectError(error.Duplicate, services.channelAkickAdd(&live, "#onyx", "alice", "bad!*@*", "replacement", 17, &scratch));
+        try std.testing.expectEqual(@as(usize, 0), live.channels.count());
+    }
+    {
+        var store = try openTestStore(tmp, "akick-durable-admission.wal");
+        defer store.deinit();
+        var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+        var entries: [svc_akick.default_max_per_channel]AkickInfo = undefined;
+        const reopened = try services.channelAkickList("#onyx", "alice", &entries);
+        try std.testing.expectEqual(svc_akick.default_max_per_channel, reopened.len);
+        var scratch: [record_max]u8 = undefined;
+        const original = try services.channelAkick("#onyx", "alice", "Bad!*@*", .query, "", &scratch);
+        try std.testing.expectEqualStrings("original", original.akick.reason.asSlice());
+        try std.testing.expectError(error.NotFound, services.channelAkick("#onyx", "alice", "overflow!*@*", .query, "", &scratch));
+    }
+}
+
+test "channel AKICK atomic ambiguous IO retains live rules and resolves only on reopen" {
+    const cases = [_]struct {
+        name: []const u8,
+        fault: store_mod.PreparedIoFault,
+        candidate_replays: bool,
+    }{
+        .{ .name = "akick-atomic-write-failed.wal", .fault = .{ .write = .failed }, .candidate_replays = false },
+        .{ .name = "akick-atomic-write-short.wal", .fault = .{ .write = .short }, .candidate_replays = false },
+        .{ .name = "akick-atomic-sync.wal", .fault = .{ .sync = true }, .candidate_replays = true },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var store = try openTestStore(tmp, case.name);
+            defer store.deinit();
+            var services = Services.initWithConfig(&store, null, .{ .pbkdf2_rounds = 1 });
+            var live = svc_akick.AkickStore.init(std.testing.allocator);
+            defer live.deinit();
+            var scratch: [record_max]u8 = undefined;
+            _ = try services.registerAccount("alice", "correct horse battery staple", &scratch);
+            _ = try services.registerChannel("#onyx", "alice", &scratch);
+            _ = try services.channelAkickAdd(&live, "#onyx", "alice", "original!*@*", "original", 17, &scratch);
+            const next_seq = store.next_seq;
+            const change_count = store.changeCount();
+            const original_mask = live.list("#onyx")[0].mask.ptr;
+            store.setPreparedIoFault(case.fault);
+            try std.testing.expectError(error.IoAmbiguous, services.channelAkickAdd(&live, "#onyx", "alice", "candidate!*@*", "candidate", 22, &scratch));
+            try std.testing.expect(store.preparedWritesPoisoned());
+            try std.testing.expectEqual(next_seq, store.next_seq);
+            try std.testing.expectEqual(change_count, store.changeCount());
+            try std.testing.expectEqual(@as(usize, 1), live.count("#onyx"));
+            try std.testing.expectEqual(original_mask, live.list("#onyx")[0].mask.ptr);
+            try std.testing.expectEqualStrings("original", live.list("#onyx")[0].reason);
+            try std.testing.expectEqualStrings("alice", live.list("#onyx")[0].setter);
+            try std.testing.expectEqual(@as(i64, 17), live.list("#onyx")[0].added_at_ms);
+            try std.testing.expectError(error.NotFound, services.channelAkick("#onyx", "alice", "candidate!*@*", .query, "", &scratch));
+            store.setPreparedIoFault(.{});
+            try std.testing.expectError(error.StorePoisoned, services.channelAkickAdd(&live, "#onyx", "alice", "retry!*@*", "blocked", 23, &scratch));
+            try std.testing.expectError(error.StorePoisoned, services.channelAkick("#onyx", "alice", "retry!*@*", .add, "blocked", &scratch));
+        }
+        {
+            var reopened = try openTestStore(tmp, case.name);
+            defer reopened.deinit();
+            var services = Services.initWithConfig(&reopened, null, .{ .pbkdf2_rounds = 1 });
+            var scratch: [record_max]u8 = undefined;
+            const original = try services.channelAkick("#onyx", "alice", "original!*@*", .query, "", &scratch);
+            try std.testing.expectEqualStrings("original", original.akick.reason.asSlice());
+            if (case.candidate_replays) {
+                const candidate = try services.channelAkick("#onyx", "alice", "candidate!*@*", .query, "", &scratch);
+                try std.testing.expectEqualStrings("candidate", candidate.akick.reason.asSlice());
+                try std.testing.expectEqualStrings("alice", candidate.akick.setter.asSlice());
+            } else {
+                try std.testing.expectError(error.NotFound, services.channelAkick("#onyx", "alice", "candidate!*@*", .query, "", &scratch));
+            }
+            try std.testing.expectError(error.NotFound, services.channelAkick("#onyx", "alice", "retry!*@*", .query, "", &scratch));
+            var entries: [3]AkickInfo = undefined;
+            const rows = try services.channelAkickList("#onyx", "alice", &entries);
+            try std.testing.expectEqual(@as(usize, if (case.candidate_replays) 2 else 1), rows.len);
+        }
+    }
 }

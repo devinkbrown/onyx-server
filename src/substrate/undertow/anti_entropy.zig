@@ -214,6 +214,120 @@ pub fn selectStrategy(config: StrategyConfig, input: StrategyInput) RepairStrate
     return .merkle_range_diff;
 }
 
+/// Minimum anti-entropy repair interval: divergent peers repair this promptly.
+pub const min_repair_interval_ms: u64 = 1_000;
+/// Maximum anti-entropy repair interval: quiet-peer backoff never exceeds this.
+pub const max_repair_interval_ms: u64 = 60_000;
+/// Quiet-peer backoff multiplier applied per consecutive quiet repair.
+pub const repair_backoff_factor: u64 = 2;
+
+/// Per-peer inputs to the adaptive repair scheduler.
+///
+/// The caller owns this state: increment `quiet_repairs` after a repair that
+/// found no divergence, and reset it to `0` when divergence is observed.
+pub const PeerRepairState = struct {
+    peer_id: u64,
+    /// Last repair time on the caller's monotonic/wall scale, or null if never.
+    last_repair_ms: ?u64,
+    /// Pending differing-key estimate; any non-zero value forces prompt repair.
+    pending_divergence: usize,
+    quiet_repairs: u32 = 0,
+};
+
+/// Caller-supplied cap on repairs admitted in one scheduling window.
+pub const RepairBudget = struct {
+    max_per_window: usize,
+    /// Deferred peers become due again this long after `now_ms`.
+    window_ms: u64 = max_repair_interval_ms,
+};
+
+/// One deterministic scheduling decision for a peer.
+pub const RepairDecision = struct {
+    peer_id: u64,
+    interval_ms: u64,
+    /// When this peer should next be repaired, after budget deferral.
+    effective_due_ms: u64,
+    /// The peer's natural due time (before deferral) has been reached.
+    due: bool,
+    /// Due, but held past `effective_due_ms` by the repair budget.
+    deferred: bool,
+};
+
+/// Interval until the next repair for one peer.
+///
+/// Divergent peers (`pending_divergence > 0`) always get the minimum.
+/// Quiet peers back off exponentially by `quiet_repairs`, bounded by
+/// `[min_repair_interval_ms, max_repair_interval_ms]`. Pure: no clock reads.
+pub fn nextRepairIntervalMs(pending_divergence: usize, quiet_repairs: u32) u64 {
+    if (pending_divergence > 0) return min_repair_interval_ms;
+    var interval = min_repair_interval_ms;
+    var i: u32 = 0;
+    while (i < quiet_repairs) : (i += 1) {
+        if (interval >= max_repair_interval_ms) return max_repair_interval_ms;
+        interval = @min(max_repair_interval_ms, interval *| repair_backoff_factor);
+    }
+    return @min(interval, max_repair_interval_ms);
+}
+
+/// Natural due time for a peer, saturating on overflow. Never repaired is due now.
+pub fn repairDueAtMs(peer: PeerRepairState, now_ms: u64) u64 {
+    const last = peer.last_repair_ms orelse return now_ms;
+    return last +| nextRepairIntervalMs(peer.pending_divergence, peer.quiet_repairs);
+}
+
+/// Decide repairs for `peers` at `now_ms`, writing at most `out.len` decisions.
+///
+/// Decisions are emitted in ascending `peer_id` order (input order breaks id
+/// ties). At most `budget.max_per_window` due peers are admitted; further due
+/// peers are deferred to `now_ms + budget.window_ms` in that same order.
+/// Pure and deterministic: `now_ms` is a parameter and no clock is read.
+/// Clock regression is safe: all arithmetic saturates and a peer whose
+/// `last_repair_ms` lies in the future is simply not due yet.
+pub fn scheduleRepairs(peers: []const PeerRepairState, now_ms: u64, budget: RepairBudget, out: []RepairDecision) usize {
+    const count = @min(peers.len, out.len);
+    var admitted: usize = 0;
+    var written: usize = 0;
+    // Selection by ascending (peer_id, input index); no allocation.
+    var prev_id: u64 = 0;
+    var prev_idx: usize = 0;
+    var have_prev = false;
+    while (written < count) {
+        var best: ?usize = null;
+        for (peers, 0..) |peer, idx| {
+            if (have_prev and (peer.peer_id < prev_id or (peer.peer_id == prev_id and idx <= prev_idx))) continue;
+            if (best == null or peer.peer_id < peers[best.?].peer_id) best = idx;
+        }
+        const idx = best orelse break;
+        const peer = peers[idx];
+        prev_id = peer.peer_id;
+        prev_idx = idx;
+        have_prev = true;
+
+        const interval = nextRepairIntervalMs(peer.pending_divergence, peer.quiet_repairs);
+        const due_at = repairDueAtMs(peer, now_ms);
+        const due = due_at <= now_ms;
+        var deferred = false;
+        var effective_due = due_at;
+        if (due) {
+            if (admitted < budget.max_per_window) {
+                admitted += 1;
+            } else {
+                deferred = true;
+                effective_due = now_ms +| budget.window_ms;
+            }
+        }
+        out[written] = .{
+            .peer_id = peer.peer_id,
+            .interval_ms = interval,
+            .effective_due_ms = effective_due,
+            .due = due,
+            .deferred = deferred,
+        };
+        written += 1;
+    }
+    return written;
+}
+
 /// Version-vector plus HLC frontier advertised by one live peer.
 pub const PeerFrontier = struct {
     causal: clock.VersionVector,
@@ -421,6 +535,72 @@ test "causal stability watermark is the min across peer frontiers" {
     try std.testing.expect(!watermark.containsDot(.{ .replica = 1, .counter = 4 }));
     try std.testing.expectEqual(@as(u48, 700), watermark.hlc.wall_ms);
     try std.testing.expectEqual(@as(u16, 4), watermark.hlc.logical);
+}
+
+test "anti-entropy quiet peer interval grows to max and stays bounded" {
+    try std.testing.expectEqual(min_repair_interval_ms, nextRepairIntervalMs(0, 0));
+    try std.testing.expectEqual(min_repair_interval_ms * 2, nextRepairIntervalMs(0, 1));
+    try std.testing.expectEqual(min_repair_interval_ms * 4, nextRepairIntervalMs(0, 2));
+    try std.testing.expectEqual(max_repair_interval_ms, nextRepairIntervalMs(0, 10));
+    try std.testing.expectEqual(max_repair_interval_ms, nextRepairIntervalMs(0, 1_000));
+    try std.testing.expectEqual(max_repair_interval_ms, nextRepairIntervalMs(0, std.math.maxInt(u32)));
+    try std.testing.expect(min_repair_interval_ms > 0);
+    try std.testing.expect(max_repair_interval_ms >= min_repair_interval_ms);
+}
+
+test "anti-entropy divergent peer gets min interval" {
+    try std.testing.expectEqual(min_repair_interval_ms, nextRepairIntervalMs(1, 0));
+    try std.testing.expectEqual(min_repair_interval_ms, nextRepairIntervalMs(999, 10));
+    try std.testing.expectEqual(min_repair_interval_ms, nextRepairIntervalMs(std.math.maxInt(usize), std.math.maxInt(u32)));
+}
+
+test "anti-entropy budget caps simultaneous due peers deferred by peer id" {
+    const now_ms: u64 = 100_000;
+    const peers = [_]PeerRepairState{
+        .{ .peer_id = 3, .last_repair_ms = null, .pending_divergence = 5 },
+        .{ .peer_id = 1, .last_repair_ms = 0, .pending_divergence = 0, .quiet_repairs = 0 },
+        .{ .peer_id = 2, .last_repair_ms = null, .pending_divergence = 0 },
+    };
+    var out: [3]RepairDecision = undefined;
+    const n = scheduleRepairs(&peers, now_ms, .{ .max_per_window = 2, .window_ms = 5_000 }, &out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    // Deterministic peer-id order regardless of input order.
+    try std.testing.expectEqual(@as(u64, 1), out[0].peer_id);
+    try std.testing.expectEqual(@as(u64, 2), out[1].peer_id);
+    try std.testing.expectEqual(@as(u64, 3), out[2].peer_id);
+    try std.testing.expect(out[0].due and !out[0].deferred);
+    try std.testing.expect(out[1].due and !out[1].deferred);
+    try std.testing.expect(out[2].due and out[2].deferred);
+    try std.testing.expectEqual(now_ms + 5_000, out[2].effective_due_ms);
+    // Exactly budget admitted.
+    var admitted: usize = 0;
+    for (out[0..n]) |d| {
+        if (d.due and !d.deferred) admitted += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), admitted);
+}
+
+test "anti-entropy clock regression is safe" {
+    const peers = [_]PeerRepairState{
+        .{ .peer_id = 7, .last_repair_ms = 10_000, .pending_divergence = 0, .quiet_repairs = 0 },
+    };
+    var out: [1]RepairDecision = undefined;
+    const n = scheduleRepairs(&peers, 5_000, .{ .max_per_window = 4, .window_ms = 5_000 }, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(min_repair_interval_ms, out[0].interval_ms);
+    try std.testing.expectEqual(@as(u64, 10_000 + min_repair_interval_ms), out[0].effective_due_ms);
+    try std.testing.expect(!out[0].due);
+    try std.testing.expect(!out[0].deferred);
+}
+
+test "anti-entropy zero budget defers all due peers" {
+    const peers = [_]PeerRepairState{
+        .{ .peer_id = 1, .last_repair_ms = null, .pending_divergence = 1 },
+    };
+    var out: [1]RepairDecision = undefined;
+    _ = scheduleRepairs(&peers, 42, .{ .max_per_window = 0, .window_ms = 1_000 }, &out);
+    try std.testing.expect(out[0].due and out[0].deferred);
+    try std.testing.expectEqual(@as(u64, 1_042), out[0].effective_due_ms);
 }
 
 test "StrategyConfig.applyToml overlays mesh.antientropy keys" {

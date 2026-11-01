@@ -1,5 +1,8 @@
 # IRCX evolution roadmap (2026-10-15)
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Research note for Onyx Server. Execution order from 2026-10-16 is
 `docs/dev/execution-roadmap-2026-10-16.md`. IRCX here means
 `draft-pfenning-irc-extensions-04` (Dalen Abraham, Microsoft, June 1998;

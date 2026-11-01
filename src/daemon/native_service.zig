@@ -130,7 +130,7 @@ pub const Request = struct {
         var wire: [wire_len]u8 = @splat(0);
         @memcpy(wire[0..4], "NSRQ");
         std.mem.writeInt(u16, wire[4..6], version, .little);
-        wire[6] = @intFromEnum(self.verb);
+        wire[6] = @backingInt(self.verb);
         std.mem.writeInt(u32, wire[8..12], wire_len, .little);
         @memcpy(wire[12..28], &self.incarnation);
         std.mem.writeInt(u64, wire[28..36], self.generation, .little);
@@ -249,13 +249,13 @@ pub const Reply = struct {
         var wire: [wire_len]u8 = @splat(0);
         @memcpy(wire[0..4], "NSRP");
         std.mem.writeInt(u16, wire[4..6], reply_version, .little);
-        wire[6] = @intFromEnum(self.phase);
+        wire[6] = @backingInt(self.phase);
         @memcpy(wire[8..24], &self.incarnation);
         std.mem.writeInt(u64, wire[24..32], self.generation, .little);
         std.mem.writeInt(u64, wire[32..40], self.next_serial, .little);
         if (self.last) |last| {
             if (last.result == .none or last.request.verb == .query) return error.InvalidWire;
-            wire[40] = @intFromEnum(last.result);
+            wire[40] = @backingInt(last.result);
             const req = try last.request.encode();
             @memcpy(wire[48..140], &req);
         }

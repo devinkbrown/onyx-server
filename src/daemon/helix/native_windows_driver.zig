@@ -88,7 +88,7 @@ fn hashRow(hash: *Sha256, canonical: i32, shard: u16, role: bootstrap.Role, fami
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(i32, bytes[0..4], canonical, .big);
     std.mem.writeInt(u16, bytes[4..6], shard, .big);
-    bytes[6] = @intFromEnum(role);
+    bytes[6] = @backingInt(role);
     bytes[7] = family;
     hash.update(&bytes);
 }
@@ -237,7 +237,7 @@ fn body(phase: Phase, ticket: Ticket) [ready_body_len]u8 {
     var bytes: [ready_body_len]u8 = @splat(0);
     @memcpy(bytes[0..4], ready_magic);
     std.mem.writeInt(u16, bytes[4..6], ready_version, .big);
-    std.mem.writeInt(u16, bytes[6..8], @intFromEnum(phase), .big);
+    std.mem.writeInt(u16, bytes[6..8], @backingInt(phase), .big);
     std.mem.writeInt(u32, bytes[8..12], @intCast(ticket.count), .big);
     @memcpy(bytes[16..32], &ticket.nonce);
     @memcpy(bytes[32..64], &ticket.digest);
@@ -255,7 +255,7 @@ fn parseChallenge(message: *const control.Message, identity: control.Identity) E
     if (message.kind != .ready or bytes.len != ready_body_len or
         !std.mem.eql(u8, bytes[0..4], ready_magic) or
         std.mem.readInt(u16, bytes[4..6], .big) != ready_version or
-        std.mem.readInt(u16, bytes[6..8], .big) != @intFromEnum(Phase.challenge) or
+        std.mem.readInt(u16, bytes[6..8], .big) != @backingInt(Phase.challenge) or
         std.mem.readInt(u32, bytes[12..16], .big) != 0) return error.InvalidReady;
     const count: usize = std.mem.readInt(u32, bytes[8..12], .big);
     if (count > bootstrap.max_sockets) return error.InvalidReady;

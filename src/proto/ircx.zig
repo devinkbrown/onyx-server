@@ -7,6 +7,7 @@
 //! caller-owned command lines, while stores own only the bytes they must retain
 //! after validation.
 const std = @import("std");
+const cloak_match = @import("cloak_match.zig");
 const irc_line = @import("irc_line.zig");
 
 pub const MAX_PROP_NAME: usize = 64;
@@ -373,13 +374,17 @@ pub const AccessStore = struct {
     /// DENY/GRANT/QUIET are returned on direct match but do not outrank
     /// OWNER/HOST/VOICE because they are mode-list levels in IRCX.
     pub fn matchHostmask(self: *const AccessStore, channel: []const u8, hostmask: []const u8) IrcxError!?AccessEntryView {
+        return self.matchHostmaskWithCloak(channel, hostmask, null);
+    }
+
+    pub fn matchHostmaskWithCloak(self: *const AccessStore, channel: []const u8, hostmask: []const u8, ctx: ?cloak_match.Context) IrcxError!?AccessEntryView {
         try validateChannelName(channel);
         try validateAccessMask(hostmask);
 
         var best: ?*const AccessEntry = null;
         for (self.entries.items) |*entry| {
             if (!std.ascii.eqlIgnoreCase(entry.channel, channel)) continue;
-            if (!globMatch(entry.mask, hostmask)) continue;
+            if (!cloak_match.match(entry.mask, hostmask, ctx)) continue;
 
             if (best == null or entry.level.rank() > best.?.level.rank()) {
                 best = entry;

@@ -160,7 +160,7 @@ pub const FailureNumeric = enum(u16) {
     ERR_KNOCKDISABLED = ERR_KNOCKDISABLED_CODE,
 
     pub fn code(self: FailureNumeric) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

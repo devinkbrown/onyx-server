@@ -95,18 +95,18 @@ pub const ResetStore = struct {
         try self.entries.putNoClobber(owned_key, next);
     }
 
-    /// Confirms a pending token and consumes the entry on success.
-    pub fn confirm(self: *ResetStore, account: []const u8, token: []const u8, now: u64) Result {
+    /// Checks a pending token without consuming it on success. Expiry and wrong
+    /// attempts still mutate the store. The caller must serialize this check
+    /// with the subsequent operation and cancel the token after it succeeds.
+    /// This operation does not allocate.
+    pub fn check(self: *ResetStore, account: []const u8, token: []const u8, now: u64) Result {
         const entry = self.findEntry(account) orelse return .no_request;
         if (self.isExpired(entry.value_ptr.*, now)) {
             self.dropEntry(entry);
             return .expired;
         }
 
-        if (tokenMatches(entry.value_ptr.token, token)) {
-            self.dropEntry(entry);
-            return .ok;
-        }
+        if (tokenMatches(entry.value_ptr.token, token)) return .ok;
 
         // Fence-post: `max_attempts` wrong tries return `bad_token`; the
         // (max_attempts + 1)-th trips lockout and drops the record. (One extra
@@ -119,6 +119,13 @@ pub const ResetStore = struct {
         return .bad_token;
     }
 
+    /// Confirms a pending token and consumes the entry on success.
+    pub fn confirm(self: *ResetStore, account: []const u8, token: []const u8, now: u64) Result {
+        const result = self.check(account, token, now);
+        if (result == .ok) _ = self.cancel(account);
+        return result;
+    }
+
     /// Returns true when the account has a pending reset record.
     pub fn isPending(self: *const ResetStore, account: []const u8) bool {
         return self.findEntry(account) != null;
@@ -126,7 +133,7 @@ pub const ResetStore = struct {
 
     /// Returns a borrowed snapshot of the pending record for an account. Its
     /// `account`/`token` slices point into store-owned memory and are valid ONLY
-    /// until the next mutating call for this account (`confirm`/`cancel`/`issue`/
+    /// until the next mutating call for this account (`check`/`confirm`/`cancel`/`issue`/
     /// `sweepExpired`), which may free them. Copy out anything that must outlive
     /// the next store call.
     pub fn pending(self: *const ResetStore, account: []const u8) ?Pending {
@@ -342,4 +349,44 @@ test "re-issue replaces the prior token so the old token no longer confirms" {
     try testing.expectEqual(@as(u64, 6000), item.issued_ms);
     try testing.expectEqual(Result.bad_token, store.confirm("erin", &first_token, 6001));
     try testing.expectEqual(Result.ok, store.confirm("erin", &second_token, 6002));
+}
+
+test "check retains a valid token and confirm consumes it without allocation" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var store = ResetStore.init(failing.allocator(), .{ .token_bytes = 2, .ttl_ms = 10 });
+    defer store.deinit();
+    const token = [_]u8{ 0x12, 0x34 };
+    try store.issue("Alice", &token, 100);
+    const before = failing.alloc_index;
+    failing.fail_index = before;
+
+    try testing.expectEqual(Result.bad_token, store.check("alice", &[_]u8{ 0, 0 }, 101));
+    try testing.expectEqual(Result.ok, store.check("ALICE", &token, 110));
+    const pending_item = store.pending("alice").?;
+    try testing.expectEqualStrings("Alice", pending_item.account);
+    try testing.expectEqualSlices(u8, &token, pending_item.token);
+    try testing.expectEqual(@as(u64, 100), pending_item.issued_ms);
+    try testing.expectEqual(@as(u8, 1), pending_item.attempts);
+    try testing.expectEqual(Result.ok, store.confirm("alice", &token, 110));
+    try testing.expect(!store.isPending("alice"));
+    try testing.expectEqual(before, failing.alloc_index);
+    try testing.expect(!failing.has_induced_failure);
+}
+
+test "check applies expiry and wrong-attempt lockout policy" {
+    var store = ResetStore.init(testing.allocator, .{ .token_bytes = 1, .ttl_ms = 10, .max_attempts = 2 });
+    defer store.deinit();
+    const token = [_]u8{0xaa};
+    try store.issue("carol", &token, 100);
+    try testing.expectEqual(Result.bad_token, store.check("carol", &[_]u8{0}, 101));
+    try testing.expectEqual(Result.bad_token, store.check("carol", &[_]u8{1}, 102));
+    try testing.expectEqual(@as(u8, 2), store.pending("carol").?.attempts);
+    try testing.expectEqual(Result.too_many_attempts, store.check("carol", &[_]u8{2}, 103));
+    try testing.expectEqual(Result.no_request, store.check("carol", &token, 103));
+
+    try store.issue("carol", &token, 100);
+    try testing.expectEqual(Result.ok, store.check("carol", &token, 99));
+    try testing.expectEqual(Result.ok, store.check("carol", &token, 110));
+    try testing.expectEqual(Result.expired, store.check("carol", &token, 111));
+    try testing.expectEqual(Result.no_request, store.check("carol", &token, 111));
 }

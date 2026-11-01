@@ -1,0 +1,12 @@
+#!/bin/sh
+# Root structural check only. Typed credential decisions run as the runtime UID.
+set -eu
+[ "$#" = 2 ] || exit 2
+config=$1; user=$2
+case "$config" in /*) ;; *) exit 2;; esac
+uid=$(id -u "$user") || exit 1
+[ "$uid" -gt 0 ] || exit 1
+[ -f "$config" ] && [ ! -L "$config" ] || exit 1
+[ "$(stat -c %u "$config")" = "$uid" ] || exit 1
+[ "$(stat -c %h "$config")" = 1 ] || exit 1
+case "$(stat -c %a "$config")" in 400|600) ;; *) exit 1;; esac

@@ -77,7 +77,7 @@ pub const ChunkIterator = struct {
 
         self.offset = start + padded_len;
         return .{
-            .typ = @enumFromInt(self.body[start]),
+            .typ = @fromBackingInt(@intCast(self.body[start])),
             .flags = self.body[start + 1],
             .value = self.body[start + 4 .. start + chunk_len],
         };
@@ -186,7 +186,7 @@ pub fn encodeChunkHeader(typ: ChunkType, flags: u8, value_len: usize, out: []u8)
     if (out.len < 4) return error.BufferTooSmall;
     if (value_len > std.math.maxInt(u16) - 4) return error.BadLength;
 
-    out[0] = @intFromEnum(typ);
+    out[0] = @backingInt(typ);
     out[1] = flags;
     writeU16(out[2..4], @intCast(value_len + 4));
 }

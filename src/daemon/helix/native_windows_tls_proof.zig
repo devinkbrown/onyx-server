@@ -183,7 +183,7 @@ pub fn digestServing(default: Material, mode: Tls12Mode, generated: ?GeneratedTl
     defer std.crypto.secureZero(u8, std.mem.asBytes(&hash));
     hash.update(serving_domain);
     hash.update(&default_digest);
-    hash.update(&.{@intFromEnum(mode)});
+    hash.update(&.{@backingInt(mode)});
     if (generated_digest) |d| hash.update(&d);
     return hash.finalResult();
 }

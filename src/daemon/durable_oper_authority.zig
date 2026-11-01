@@ -796,7 +796,7 @@ fn encodeRecords(
         pos += 1;
         put(out, &pos, record.account);
         putU64(out, &pos, record.revision);
-        out[pos] = @intFromEnum(record.kind);
+        out[pos] = @backingInt(record.kind);
         pos += 1;
         out[pos] = @intFromBool(record.equivocation);
         pos += 1;

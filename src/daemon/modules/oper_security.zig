@@ -125,7 +125,7 @@ fn userip(c: *anyopaque, _: I) anyerror!void {
 }
 fn debug(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
-    try x.server.handleDebug(x.conn);
+    try x.server.handleDebug(x.conn, x.parsed);
 }
 fn audit(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);

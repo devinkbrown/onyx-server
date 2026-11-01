@@ -46,8 +46,8 @@ pub fn encodeOpen(o: Open, out: []u8) Error![]const u8 {
     const total_len = open_header_len + o.label.len + o.protocol.len;
     if (out.len < total_len) return error.BufferTooSmall;
 
-    out[0] = @intFromEnum(MessageType.open);
-    out[1] = @intFromEnum(o.channel_type);
+    out[0] = @backingInt(MessageType.open);
+    out[1] = @backingInt(o.channel_type);
     std.mem.writeInt(u16, out[2..4], o.priority, .big);
     std.mem.writeInt(u32, out[4..8], o.reliability, .big);
     std.mem.writeInt(u16, out[8..10], @intCast(o.label.len), .big);
@@ -72,7 +72,7 @@ pub fn parseOpen(bytes: []const u8) Error!Open {
     if (bytes.len < total_len) return error.Truncated;
 
     return .{
-        .channel_type = @enumFromInt(bytes[1]),
+        .channel_type = @fromBackingInt(@intCast(bytes[1])),
         .priority = std.mem.readInt(u16, bytes[2..4], .big),
         .reliability = std.mem.readInt(u32, bytes[4..8], .big),
         .label = bytes[label_start..protocol_start],
@@ -82,15 +82,15 @@ pub fn parseOpen(bytes: []const u8) Error!Open {
 
 pub fn encodeAck(out: []u8) Error![]const u8 {
     if (out.len < 1) return error.BufferTooSmall;
-    out[0] = @intFromEnum(MessageType.ack);
+    out[0] = @backingInt(MessageType.ack);
     return out[0..1];
 }
 
 pub fn messageType(bytes: []const u8) Error!MessageType {
     if (bytes.len < 1) return error.Truncated;
     return switch (bytes[0]) {
-        @intFromEnum(MessageType.ack) => .ack,
-        @intFromEnum(MessageType.open) => .open,
+        @backingInt(MessageType.ack) => .ack,
+        @backingInt(MessageType.open) => .open,
         else => error.BadType,
     };
 }

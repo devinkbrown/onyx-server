@@ -1,5 +1,8 @@
 # Post-Quantum Hybrid KEM Compliance — X25519MLKEM768 & X-Wing
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 Research brief · 2026-07-11 · analyst: deep-researcher · scope: Onyx Server `src/crypto`
 
 ## BLUF

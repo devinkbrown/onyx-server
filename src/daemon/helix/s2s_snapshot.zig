@@ -80,7 +80,7 @@ pub const est_len = hs.Established.serialized_len;
 /// Current `.s2s_link` capsule schema version whose blob layout `encode` writes.
 /// The blob carries no inline version — it rides the capsule header — so this
 /// MIRRORS the descriptor in `capsule.zig`; bump both together.
-pub const schema_version: u16 = 5;
+pub const schema_version: u16 = 6;
 
 /// Length of the embedded `Established` blob in schema v1 capsules. v2 appended a
 /// trailing `admitted_frame_families` (u32) to `Established.serialize`, so a v1
@@ -126,6 +126,9 @@ pub const Snapshot = struct {
     remote_epoch_ms: u64 = 0,
     caps: u8 = 0,
     caps_ext: u8 = 0,
+    /// Mandatory schema6 negotiation state; never inferred after stream adoption.
+    session_group_current: bool = false,
+    session_group_rx_current: bool = false,
     remote_name: []const u8 = &.{},
     /// Raw `posix.sockaddr.in6` bytes of a proven dial target. An authenticated
     /// reciprocal inbound survivor may inherit the completed outbound target;
@@ -268,6 +271,8 @@ pub fn validateRoster(bytes: []const u8, count: u32) Error!void {
 /// Encode `snap` into a freshly-allocated buffer the caller owns. The result
 /// contains live record keys — seal it into the arena and never persist it.
 pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Allocator.Error)![]u8 {
+    if ((snap.session_group_current or snap.session_group_rx_current) and
+        snap.caps & (cap_signing | cap_session_replica_v2) != (cap_signing | cap_session_replica_v2)) return error.UnknownCaps;
     if (snap.remote_name.len > std.math.maxInt(u16)) return error.TooLong;
     if (snap.connect_addr.len > std.math.maxInt(u16)) return error.TooLong;
     if (snap.rec_inbuf.len > std.math.maxInt(u32)) return error.TooLong;
@@ -314,6 +319,8 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
     try out.appendSlice(allocator, snap.roster);
     try appendInt(&out, allocator, u32, @intCast(snap.inner_inbuf.len));
     try out.appendSlice(allocator, snap.inner_inbuf);
+    try out.append(allocator, @intFromBool(snap.session_group_current));
+    try out.append(allocator, @intFromBool(snap.session_group_rx_current));
 
     return out.toOwnedSlice(allocator);
 }
@@ -328,8 +335,9 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
 /// the trailing roster block (pre-v4 blobs decode with an EMPTY roster — the
 /// successor then reconverges via RESYNC alone, exactly the pre-bump behavior).
 /// v5 appends the mandatory partial-inner-frame carry. Legacy cold migration
-/// decodes older images with empty carry; current adoption requires v5.
-/// Any version outside 1..5 is rejected fail-closed (a too-new blob may have
+/// decodes older images with empty carry. v6 appends independent mandatory
+/// current group TX/RX barriers; current adoption requires both fields.
+/// Any version outside 1..6 is rejected fail-closed (a too-new blob may have
 /// grown an embedded region again and cannot be parsed here).
 pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
     // Every supported predecessor layout is still an authority-bearing Helix
@@ -359,7 +367,7 @@ fn decodeInternal(bytes: []const u8, version: u16, strict_current: bool) Error!S
             @memcpy(snap.established[0..est_len_v1], try r.take(est_len_v1));
             @memset(snap.established[est_len_v1..], 0); // admitted_frame_families = 0
         },
-        2, 3, 4, schema_version => @memcpy(&snap.established, try r.take(est_len)),
+        2, 3, 4, 5, schema_version => @memcpy(&snap.established, try r.take(est_len)),
         // Fail-closed: only v1 and the current schema are parseable here. MAINTENANCE
         // TRAP — each future schema bump that keeps `min_supported = 1` in the capsule
         // descriptor MUST add an explicit legacy arm above for EVERY still-accepted
@@ -410,6 +418,16 @@ fn decodeInternal(bytes: []const u8, version: u16, strict_current: bool) Error!S
     if (version >= 5) {
         snap.inner_inbuf = try r.take(try r.int(u32));
         try s2s_frame.Decoder.validatePartial(snap.inner_inbuf, media_ws_relay.required_max_frame_size);
+    }
+    if (version >= 6) {
+        const group_current = try r.byte();
+        if (group_current > 1) return error.UnknownCaps;
+        snap.session_group_current = group_current == 1;
+        const group_rx = try r.byte();
+        if (group_rx > 1) return error.UnknownCaps;
+        snap.session_group_rx_current = group_rx == 1;
+        if ((snap.session_group_current or snap.session_group_rx_current) and snap.caps & (cap_signing | cap_session_replica_v2) != (cap_signing | cap_session_replica_v2))
+            return error.UnknownCaps;
     }
     if (strict_current and r.pos != bytes.len) return error.TrailingBytes;
     return snap;
@@ -535,7 +553,7 @@ test "s2s link snapshot requires and validates partial inner frame carry" {
 
     const malformed = try testing.allocator.dupe(u8, bytes);
     defer testing.allocator.free(malformed);
-    const prefix_start = malformed.len - prefix.len;
+    const prefix_start = malformed.len - prefix.len - 2;
     std.mem.writeInt(u32, malformed[prefix_start + 1 ..][0..4], 0, .little);
     try testing.expectError(error.InvalidPartialFrame, decodeCurrent(malformed));
     std.mem.writeInt(u32, malformed[prefix_start + 1 ..][0..4], std.math.maxInt(u32), .little);
@@ -545,7 +563,7 @@ test "s2s link snapshot requires and validates partial inner frame carry" {
     // through explicit legacy decode, never the current adoption path.
     const empty = try encode(testing.allocator, .{});
     defer testing.allocator.free(empty);
-    const v4 = empty[0 .. empty.len - 4];
+    const v4 = empty[0 .. empty.len - 6];
     try testing.expectError(error.Truncated, decodeCurrent(v4));
     const legacy = try decode(v4, 4);
     try testing.expectEqual(@as(usize, 0), legacy.inner_inbuf.len);
@@ -589,8 +607,8 @@ const caps_ext_field_off_v2: usize = est_field_off + est_len +
 /// legacy fixtures below all model rosterless predecessors.
 fn stripEmptyRosterBlock(bytes: []const u8) []const u8 {
     std.debug.assert(bytes.len >= 12);
-    for (bytes[bytes.len - 12 ..]) |b| std.debug.assert(b == 0);
-    return bytes[0 .. bytes.len - 12];
+    for (bytes[bytes.len - 14 ..]) |b| std.debug.assert(b == 0);
+    return bytes[0 .. bytes.len - 14];
 }
 
 test "current s2s decode rejects inconsistent relay-v2 capability combinations" {
@@ -914,8 +932,8 @@ test "s2s link snapshot capsule roster decode fails closed on malformed records"
     _ = try decodeCurrent(bytes);
 
     // Layout of the trailing block: [u32 count][u32 len][roster rlen bytes].
-    const count_off = bytes.len - rlen - 12;
-    const region_off = bytes.len - rlen - 4;
+    const count_off = bytes.len - rlen - 14;
+    const region_off = bytes.len - rlen - 6;
 
     // (a) A count that does not match the walked records fails closed.
     const bad_count = try allocator.dupe(u8, bytes);
@@ -936,7 +954,7 @@ test "s2s link snapshot capsule roster decode fails closed on malformed records"
     // (d) A non-boolean session-token flag (the record's last byte) fails closed.
     const bad_flag = try allocator.dupe(u8, bytes);
     defer allocator.free(bad_flag);
-    bad_flag[bytes.len - 5] = 2;
+    bad_flag[bytes.len - 7] = 2;
     try testing.expectError(error.InvalidRosterMember, decodeCurrent(bad_flag));
 }
 
@@ -979,4 +997,25 @@ test "s2s link snapshot capsule roster refuses to SEAL malformed members" {
     });
     const desynced = Snapshot{ .fd = 1, .roster = roster.items, .roster_count = 2 };
     try testing.expectError(error.RosterCountMismatch, encode(allocator, desynced));
+}
+
+test "s2s current group barriers preserve each direction and refuse absent or malformed mandatory state" {
+    try testing.expectError(error.UnknownCaps, encode(testing.allocator, .{ .session_group_current = true }));
+    try testing.expectError(error.UnknownCaps, encode(testing.allocator, .{ .session_group_rx_current = true }));
+    const caps = cap_signing | cap_session_replica_v2;
+    for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, true } }) |barriers| {
+        const wire = try encode(testing.allocator, .{ .caps = caps, .session_group_current = barriers[0], .session_group_rx_current = barriers[1] });
+        defer testing.allocator.free(wire);
+        const restored = try decodeCurrent(wire);
+        try testing.expectEqual(barriers[0], restored.session_group_current);
+        try testing.expectEqual(barriers[1], restored.session_group_rx_current);
+        try testing.expectError(error.Truncated, decodeCurrent(wire[0 .. wire.len - 1]));
+        try testing.expectError(error.Truncated, decodeCurrent(wire[0 .. wire.len - 2]));
+        const previous = try decode(wire[0 .. wire.len - 2], 5);
+        try testing.expect(!previous.session_group_current and !previous.session_group_rx_current);
+        const malformed = try testing.allocator.dupe(u8, wire);
+        defer testing.allocator.free(malformed);
+        malformed[malformed.len - 1] = 2;
+        try testing.expectError(error.UnknownCaps, decodeCurrent(malformed));
+    }
 }

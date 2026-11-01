@@ -5,15 +5,17 @@
 This runbook describes the shipped tree. For full configuration details, use
 [reference/config.md](reference/config.md) and `etc/onyx-server.reference.toml`.
 
-## Verified fleet baseline (2026-09-06)
+## Verified fleet baseline (2026-11-01)
 
-Both production nodes are `active/running` under `onyx-server.service` and run
-`0.7.0+ae78d490` from their `onyx-server-run` directories. The executable SHA-256
-on both nodes is
-`0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c`.
+Both production nodes run `0.9.0+066d9b8356be-dirty` from their
+`onyx-server-run` directories: eshmaki.me under OpenRC
+(`/etc/init.d/onyx-server`), ircx.us under systemd (`onyx-server.service`).
+The executable SHA-256 on both nodes is
+`61d218f6682857eed5f3d4bb4007c2d99869fc723810f0df637961a417e5fe02`.
 Loopback metrics show `tcp_active=1`, `links_active=1`, `peers_up=1`,
-`partitioned=0`, and one mesh component on each side. The source manifest is
-now **0.8.0** and has not replaced that image. The canonical paths/evidence table is
+`partitioned=0`, and one mesh component on each side. Both nodes run
+`[tls] ktls = "txrx"` and boot-log `kTLS TX+RX offload ACTIVE (txrx)`.
+The source manifest is **0.9.0**. The canonical paths/evidence table is
 [docs/ops/onyx-server-paths.md](ops/onyx-server-paths.md).
 
 ## Operator Model
@@ -26,7 +28,10 @@ Onyx Server runs as a long-lived network daemon with:
   `/etc/systemd/system/onyx-server.service`;
 - state under `/var/lib/onyx-server` in the packaged unit;
 - ReleaseFast production binaries from `zig build release` or `zig build package`;
-- session-preserving reload via SIGUSR2/Helix, exposed as `systemctl reload onyx-server`.
+- session-preserving reload via SIGUSR2/Helix where the listener set allows it
+  (on the current fleet the configured WebTransport listener blocks Helix, so
+  upgrades are cold restarts: `rc-service onyx-server restart` on eshmaki.me,
+  `systemctl restart onyx-server.service` on ircx.us).
 
 Cold restart is the fallback path and drops sessions. Reload is the normal upgrade path.
 Cold restart is also **not crash-durable for the MESSAGE_V2 custody plane** and can lose an
@@ -104,7 +109,16 @@ before opening the listeners.
 
 ## Hot Upgrade
 
-Use Helix reload for normal production upgrades:
+> **Current fleet (2026-11-01):** Helix reload is blocked on both production
+> nodes by the configured WebTransport listener (`[listen].webtransport = 4433`).
+> Production upgrades there are cold restarts, one node at a time:
+> `sudo rc-service onyx-server restart` (eshmaki.me, OpenRC) and
+> `sudo systemctl restart onyx-server.service` (ircx.us). The Helix procedure
+> below applies to listener sets without that blocker. Both fleet nodes run
+> `[tls] ktls = "txrx"`; expect the boot line
+> `kTLS TX+RX offload ACTIVE (txrx)` after restart.
+
+Use Helix reload for production upgrades where the listener set allows it:
 
 ```sh
 zig build package --prefix /tmp/onyx-server-stage
@@ -241,7 +255,8 @@ Cold restart is **not crash-durable for the MESSAGE_V2 custody plane**. The RVL2
 custody authorities are in-memory and survive only a connection-preserving Helix reload, whose
 checkpoints ride the upgrade capsule across re-exec. A cold restart (or power loss) discards them,
 so an intermediate node that has ACKed upstream but not yet repaired a message downstream can lose
-that message's last custody copy. Prefer `systemctl reload onyx-server`; hard-restart only from a drained
+that message's last custody copy. Prefer Helix reload (`systemctl reload onyx-server`) where the
+listener set allows it; on the current WebTransport fleet, hard-restart only from a drained
 node with no outstanding custody obligations. See the
 [cold-restart durability contract](design/message-v2-exact-once.md#cold-restart-durability-contract).
 

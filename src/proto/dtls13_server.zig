@@ -1097,7 +1097,7 @@ pub fn feedTranscript13(t: *Sha256, msg_type: dhs.HandshakeType, message_seq: u1
 pub fn feedSynthetic(t: *Sha256, ch1_hash: [hash_len]u8) void {
     var hdr_buf: [dhs.handshake_header_len]u8 = undefined;
     const hdr = dhs.Header{
-        .msg_type = @enumFromInt(254), // message_hash
+        .msg_type = @fromBackingInt(@intCast(254)), // message_hash
         .length = hash_len,
         .message_seq = 0,
         .fragment_offset = 0,

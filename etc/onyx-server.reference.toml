@@ -234,8 +234,10 @@ early_data_max_size = 0
 # clients that explicitly offer RawPublicKey receive the server leaf SPKI. When
 # request_client_cert is also on, clients may present a raw SPKI for CertFP mTLS.
 raw_public_key = false
-# Linux kTLS offload intent: "off", "tx", or "txrx". The daemon only enables it
-# when the running kernel advertises the TLS ULP; otherwise TLS stays userspace.
+# Linux kTLS offload intent: "off", "tx", or "txrx". "tx" offloads TLS 1.3
+# server-to-client encryption; "txrx" also offloads client-to-server decryption.
+# The daemon only enables it when the kernel advertises the TLS ULP; otherwise
+# TLS stays userspace.
 ktls = "off"
 # Additional SNI-selectable certificates. Each entry is loaded with the same
 # cert/key loader as the default certificate and is validated before the TLS
@@ -490,6 +492,9 @@ cqe_batch = 256        # max CQEs reaped per event-loop drain (16..4096)
 # off, and kTLS stays on the copy path.
 # defer_taskrun = false
 # sqpoll = false         # IORING_SETUP_SQPOLL
+# sqpoll_idle_ms = 10    # idle spin window when enabled (1..60000 ms)
+# Short windows reduce idle CPU between bursts; 1000 preserves the former
+# window for sustained/lowest-wakeup-latency tuning. SQPOLL stays opt-in.
 
 
 # --- [reputation] — decaying IP-reputation penalty weights -------------------
@@ -741,6 +746,15 @@ minting_enabled = false
 # inherits   = ""
 
 
+# --- [guest_presence] — durable guest identity preparation -------------------
+# Optional; disabled when absent. This prepares local identity custody and does
+# not enable a new mesh presence protocol or change advertised capabilities.
+# Use an operator-owned private parent directory (0700 on Unix). Provision once
+# with: onyx-server --initialize-guest-issuer <config.toml>
+# Missing/corrupt configured state is a startup error; never delete it to retry.
+# [guest_presence]
+# issuer_path = "/var/lib/onyx-server/private/guest-issuer.wal"
+
 # --- [cloak] — hostname cloaking ---------------------------------------------
 [cloak]
 # Secret passphrase for HMAC host cloaking. When set, every client's real IP is
@@ -764,14 +778,16 @@ minting_enabled = false
 # When true, a logged-in client's visible host becomes <account>.users.<suffix> —
 # stable across IPs/devices. Explicit VHOST personas still override it.
 # account_cloak = false
-# Anonymous-client cloak rotation cadence, in SECONDS (default 86400 = 24 h).
+# Anonymous-client cloak rotation cadence, in SECONDS (default 1209600 = 14 days).
 # When non-zero, an UNAUTHENTICATED client shows a 128-bit OPAQUE token salted by
 # the wall-clock epoch. Nothing about the subnet or country is in that host, and
 # a connection that stays up is re-cloaked when the epoch changes. Oper WHOIS
 # still shows a stable hierarchical "ban cloak" host, and WARD matches it, so
 # subnet hostmasks keep working. Logged-in clients keep the account or
-# hierarchical cloak. Set 0 to disable rotation.
-# anon_epoch_secs = 86400
+# hierarchical cloak. New provenance-bearing masks support bounded historical
+# policy matching; arbitrary older unlabeled tokens need a migration audit.
+# Existing explicit daily settings stay daily until changed. Set 0 to disable.
+# anon_epoch_secs = 1209600
 
 
 # --- [acme] — automatic TLS certificate renewal (Linux only) -----------------

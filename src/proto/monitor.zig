@@ -21,7 +21,7 @@ pub const MonitorNumeric = enum(u16) {
     ERR_MONLISTFULL = 734,
 
     pub fn code(self: MonitorNumeric) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

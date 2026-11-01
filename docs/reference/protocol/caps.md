@@ -22,6 +22,8 @@ For third-party client readiness (Halloy REQ set vs this table, SASL mechs, SESS
 | `invite-notify` | none | Invite notifications. | `src/daemon/dispatch.zig:304` |
 | `account-tag` | none | Enables account tags. | `src/daemon/dispatch.zig:305` |
 | `onyx/session-sync` | none | Onyx Server vendor cap for sibling-device direct-message mirroring. | `src/daemon/dispatch.zig:308` |
+| `onyx/2fa` | `IDENTIFY` | Onyx Server vendor cap for two-factor identity assertion. | `src/proto/live_cap_metadata.zig:195` |
+| `onyx/privacy` | `umode=DGIZTVW,cmode=cBK` | Onyx Server vendor cap advertising the enforced privacy user/channel modes. | `src/proto/live_cap_metadata.zig:199` |
 | `onyx/bouncer` | none | Onyx Server vendor cap for automatic history rewind on join/rejoin. | `src/daemon/dispatch.zig:312` |
 | `onyx/topics` | none | Onyx Server vendor cap for named conversations: clients can receive `+onyx/topic=<label>` without generic `message-tags`, and discover topic-filtered CHATHISTORY. | `src/daemon/dispatch.zig` (`onyx_topics`) |
 | `onyx/e2ee` | none | Onyx Server vendor cap for the `+onyx/e2ee` client tag used by encrypted-room policy. | `src/daemon/dispatch.zig` (`onyx_e2ee`) |
@@ -67,4 +69,4 @@ For third-party client readiness (Halloy REQ set vs this table, SASL mechs, SESS
 
 ## Vendor caps
 
-The live `src/daemon/dispatch.zig` vendor namespace is `onyx/*`: `onyx/session-sync`, `onyx/bouncer`, `onyx/topics`, and `onyx/e2ee`. No `ocean/*` capability appears in the live registry; do not document an Ocean vendor cap unless one is added to `cap_specs`.
+The live vendor namespace is `onyx/*`, defined in `src/proto/live_cap_metadata.zig` (`cap_specs`, imported by `src/daemon/dispatch.zig`): `onyx/session-sync`, `onyx/bouncer`, `onyx/topics`, `onyx/e2ee`, `onyx/2fa` (302 value `IDENTIFY`), and `onyx/privacy` (302 value `umode=DGIZTVW,cmode=cBK`). No `ocean/*` capability appears in the live registry; do not document an Ocean vendor cap unless one is added to `cap_specs`.

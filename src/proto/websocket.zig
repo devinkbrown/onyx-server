@@ -75,7 +75,7 @@ pub const Opcode = enum(u4) {
     pong = 0xa,
 
     pub fn isControl(self: Opcode) bool {
-        return @intFromEnum(self) >= 0x8;
+        return @backingInt(self) >= 0x8;
     }
 
     pub fn isData(self: Opcode) bool {
@@ -270,7 +270,7 @@ pub fn encodeFrame(
     if (out.len < header_len + payload.len) return error.OutputTooSmall;
 
     var cursor: usize = 0;
-    out[cursor] = (if (options.fin) @as(u8, 0x80) else 0) | @as(u8, @intFromEnum(options.opcode));
+    out[cursor] = (if (options.fin) @as(u8, 0x80) else 0) | @as(u8, @backingInt(options.opcode));
     cursor += 1;
 
     const mask_bit: u8 = if (masked) 0x80 else 0;

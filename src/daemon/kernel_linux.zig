@@ -203,7 +203,7 @@ pub fn restrictFilesystem(dirs: []const SandboxDir) error{Unexpected}!void {
     // landlock_restrict_self returns EPERM unless no_new_privs is set or the
     // caller holds CAP_SYS_ADMIN. The bit is irreversible and stays in this
     // process, which is the forked proof or the long-running main path.
-    const no_new = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+    const no_new = linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     if (posix.errno(no_new) != .SUCCESS) return error.Unexpected;
     const abi = landlockAbi() catch return error.Unexpected;
     if (abi < 1) return error.Unexpected;
@@ -265,12 +265,12 @@ pub fn installSyscallDenylist() error{Unexpected}!void {
         else => 0,
     };
     const denied = [_]u32{
-        @intCast(@intFromEnum(linux.SYS.ptrace)),
-        @intCast(@intFromEnum(linux.SYS.reboot)),
-        @intCast(@intFromEnum(linux.SYS.kexec_load)),
-        @intCast(@intFromEnum(linux.SYS.init_module)),
-        @intCast(@intFromEnum(linux.SYS.delete_module)),
-        @intCast(@intFromEnum(linux.SYS.swapon)),
+        @intCast(@backingInt(linux.SYS.ptrace)),
+        @intCast(@backingInt(linux.SYS.reboot)),
+        @intCast(@backingInt(linux.SYS.kexec_load)),
+        @intCast(@backingInt(linux.SYS.init_module)),
+        @intCast(@backingInt(linux.SYS.delete_module)),
+        @intCast(@backingInt(linux.SYS.swapon)),
     };
     var filters: [3 + 1 + denied.len * 2 + 1]SockFilter = undefined;
     var n: usize = 0;
@@ -293,7 +293,7 @@ pub fn installSyscallDenylist() error{Unexpected}!void {
     filters[n] = bpfStmt(bpf_ret_k, seccomp_ret_allow);
     n += 1;
 
-    const no_new = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+    const no_new = linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     if (posix.errno(no_new) != .SUCCESS) return error.Unexpected;
     var prog = SockFprog{ .len = @intCast(n), .filter = &filters };
     const rc = linux.syscall3(.seccomp, linux.SECCOMP.SET_MODE_FILTER, 0, @intFromPtr(&prog));
@@ -373,19 +373,9 @@ fn openDirPath(path: [*:0]const u8) ?linux.fd_t {
 
 /// Forked proof of the landlock ruleset and the seccomp denylist. Exit 0 is
 /// the passing child. The parent is not sandboxed.
-pub fn sandboxChildStatus() u8 {
-    var dir_buf: [80]u8 = undefined;
-    const dir = std.fmt.bufPrintSentinel(&dir_buf, "/tmp/onyx-x3-ll-{d}", .{linux.getpid()}, 0) catch return 2;
-    if (posix.errno(linux.mkdir(dir.ptr, 0o700)) != .SUCCESS) return 2;
-    var file_buf: [96]u8 = undefined;
-    const file_path = std.fmt.bufPrintSentinel(&file_buf, "{s}/inside", .{dir}, 0) catch return 2;
-    const created = linux.openat(linux.AT.FDCWD, file_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
-    if (posix.errno(created) != .SUCCESS) return 2;
-    const created_fd: linux.fd_t = @intCast(created);
-    const wrote = linux.write(created_fd, "ok".ptr, 2);
-    _ = linux.close(created_fd);
-    if (posix.errno(wrote) != .SUCCESS) return 2;
-
+pub fn sandboxChildStatus(dir: [:0]const u8, inside_path: [:0]const u8) u8 {
+    // The parent owns and creates the fixture before fork. This child only
+    // applies the existing security policy and performs syscall proofs.
     const dirfd = openDirPath(dir.ptr) orelse return 9;
     restrictFilesystem(&.{.{ .fd = dirfd, .allowed = (1 << 2) | (1 << 3) }}) catch {
         _ = linux.close(dirfd);
@@ -393,7 +383,7 @@ pub fn sandboxChildStatus() u8 {
     };
     _ = linux.close(dirfd);
 
-    const inside = openAt2(linux.AT.FDCWD, file_path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0, resolve_no_magiclinks) catch return 4;
+    const inside = openAt2(linux.AT.FDCWD, inside_path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0, resolve_no_magiclinks) catch return 4;
     _ = linux.close(inside);
     if (openAt2(linux.AT.FDCWD, "/etc/hostname", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0, resolve_no_magiclinks)) |outside| {
         _ = linux.close(outside);

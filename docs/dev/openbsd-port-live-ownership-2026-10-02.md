@@ -1,5 +1,8 @@
 # Live OpenBSD continuation coordination
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 **ASSIGNED to older root thread `01a0ef44-ee0a-7703-b2a9-c4b1a48207e6`:
 `src/daemon/mail_sender.zig` typed accepted enqueue.** This parent and its workers
 have no Mail leaf ownership or edits. Please proceed; our sole Server integrator

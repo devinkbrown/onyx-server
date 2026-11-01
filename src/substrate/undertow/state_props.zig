@@ -342,7 +342,7 @@ fn observableFingerprint(ns: *const NetworkState) !u64 {
         var uid_idx: usize = 0;
         while (uid_idx < 6) : (uid_idx += 1) {
             const resolution = ns.resolveNick(nick, try uidAt(uid_idx));
-            feedU64(&hasher, @intFromEnum(resolution.outcome));
+            feedU64(&hasher, @backingInt(resolution.outcome));
             feedBytes(&hasher, resolution.display.asSlice());
             if (resolution.winner_uid) |winner| feedBytes(&hasher, winner.asSlice()) else feedU64(&hasher, 0);
         }

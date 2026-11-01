@@ -142,7 +142,7 @@ fn compareStatusChange(a: StatusChange, b: StatusChange) std.math.Order {
     const event_order = compareEvent(a.hlc, a.replica_id, b.hlc, b.replica_id);
     if (event_order != .eq) return event_order;
 
-    const flag_order = compareInt(u2, @intFromEnum(a.flag), @intFromEnum(b.flag));
+    const flag_order = compareInt(u2, @backingInt(a.flag), @backingInt(b.flag));
     if (flag_order != .eq) return flag_order;
     return compareBool(a.grant, b.grant);
 }

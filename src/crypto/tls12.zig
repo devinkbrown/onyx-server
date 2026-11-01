@@ -389,7 +389,7 @@ pub fn writePlainRecord(
 ) Error![]u8 {
     if (plaintext.len > max_plaintext_len) return error.PlaintextTooLong;
     const out = try allocator.alloc(u8, record_header_len + plaintext.len);
-    out[0] = @intFromEnum(content_type);
+    out[0] = @backingInt(content_type);
     std.mem.writeInt(u16, out[1..3], tls_version, .big);
     std.mem.writeInt(u16, out[3..5], @intCast(plaintext.len), .big);
     @memcpy(out[record_header_len..], plaintext);
@@ -413,7 +413,7 @@ pub fn sealRecordAlloc(
     const out = try allocator.alloc(u8, record_header_len + fragment_len);
     errdefer allocator.free(out);
 
-    out[0] = @intFromEnum(content_type);
+    out[0] = @backingInt(content_type);
     std.mem.writeInt(u16, out[1..3], tls_version, .big);
     std.mem.writeInt(u16, out[3..5], @intCast(fragment_len), .big);
 
@@ -528,7 +528,7 @@ fn makeNonce(suite: CipherSuite, fixed_iv: [12]u8, seq: u64) [12]u8 {
 fn makeAad(seq: u64, content_type: ContentType, plaintext_len: u16) [13]u8 {
     var aad: [13]u8 = undefined;
     std.mem.writeInt(u64, aad[0..8], seq, .big);
-    aad[8] = @intFromEnum(content_type);
+    aad[8] = @backingInt(content_type);
     std.mem.writeInt(u16, aad[9..11], tls_version, .big);
     std.mem.writeInt(u16, aad[11..13], plaintext_len, .big);
     return aad;

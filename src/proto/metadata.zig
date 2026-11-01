@@ -111,7 +111,7 @@ pub const Access = enum(u8) {
     server = 3,
 
     pub fn atLeast(self: Access, needed: Access) bool {
-        return @intFromEnum(self) >= @intFromEnum(needed);
+        return @backingInt(self) >= @backingInt(needed);
     }
 };
 

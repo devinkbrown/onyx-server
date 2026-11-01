@@ -338,7 +338,7 @@ fn writeBoolMode(out: *std.ArrayList(u8), allocator: Allocator, kind: ModeKind, 
     const value = reg.value orelse return;
     var payload: [18]u8 = undefined;
     var w = Writer{ .buf = &payload };
-    try w.writeU8(@intFromEnum(kind));
+    try w.writeU8(@backingInt(kind));
     try w.writeU64(reg.timestamp);
     try w.writeU64(reg.replica_id);
     try w.writeU8(if (value) 1 else 0);
@@ -349,7 +349,7 @@ fn writeKeyMode(out: *std.ArrayList(u8), allocator: Allocator, reg: anytype, lim
     const value = reg.value orelse return;
     var payload: [1 + 8 + 8 + 1 + 1 + channel_crdt.KeyMode.max_len]u8 = undefined;
     var w = Writer{ .buf = &payload };
-    try w.writeU8(@intFromEnum(ModeKind.key));
+    try w.writeU8(@backingInt(ModeKind.key));
     try w.writeU64(reg.timestamp);
     try w.writeU64(reg.replica_id);
     try w.writeU8(if (value.present) 1 else 0);
@@ -362,7 +362,7 @@ fn writeLimitMode(out: *std.ArrayList(u8), allocator: Allocator, reg: anytype, l
     const value = reg.value orelse return;
     var payload: [1 + 8 + 8 + 1 + 4]u8 = undefined;
     var w = Writer{ .buf = &payload };
-    try w.writeU8(@intFromEnum(ModeKind.limit));
+    try w.writeU8(@backingInt(ModeKind.limit));
     try w.writeU64(reg.timestamp);
     try w.writeU64(reg.replica_id);
     try w.writeU8(if (value.present) 1 else 0);
@@ -399,7 +399,7 @@ fn readMode(target: *ChannelCrdt, bytes: []const u8) !void {
 }
 
 fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, kind: RecordKind, payload: []const u8, limits: Limits) !void {
-    try appendByte(out, allocator, @intFromEnum(kind), limits);
+    try appendByte(out, allocator, @backingInt(kind), limits);
     try appendVarint(out, allocator, payload.len, limits);
     try appendBytes(out, allocator, payload, limits);
 }
@@ -720,8 +720,8 @@ test "Undertow mesh burst: small members stay dense so legacy peers still parse"
     // No wire change while the dense form fits: only member_delta (kind 2)
     // records, never member_compact (kind 4). A legacy peer parses this byte for
     // byte.
-    try std.testing.expectEqual(@as(usize, 2), try countRecordKind(bytes, @intFromEnum(RecordKind.member_delta)));
-    try std.testing.expectEqual(@as(usize, 0), try countRecordKind(bytes, @intFromEnum(RecordKind.member_compact)));
+    try std.testing.expectEqual(@as(usize, 2), try countRecordKind(bytes, @backingInt(RecordKind.member_delta)));
+    try std.testing.expectEqual(@as(usize, 0), try countRecordKind(bytes, @backingInt(RecordKind.member_compact)));
 }
 
 test "Undertow mesh burst: member past dense context cap round-trips via compact fallback" {
@@ -743,7 +743,7 @@ test "Undertow mesh burst: member past dense context cap round-trips via compact
     const bytes = try serialize(allocator, &source, default_limits);
     defer allocator.free(bytes);
 
-    try std.testing.expect((try countRecordKind(bytes, @intFromEnum(RecordKind.member_compact))) >= 1);
+    try std.testing.expect((try countRecordKind(bytes, @backingInt(RecordKind.member_compact))) >= 1);
 
     var target = ChannelCrdt.init(allocator, 2);
     defer target.deinit();

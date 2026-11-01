@@ -240,7 +240,7 @@ pub fn encodeAck(allocator: std.mem.Allocator, value: Ack, kp: *const sign.KeyPa
     errdefer allocator.free(wire);
     var writer = Writer{ .bytes = wire };
     writer.writeBytes(&ack_magic);
-    writer.writeByte(@intFromEnum(value.status));
+    writer.writeByte(@backingInt(value.status));
     writer.writeIdentity(value.token, value.attachment_id);
     writer.writeRevision(value.offered_revision);
     writer.writeRevision(value.observed_revision);
@@ -1535,7 +1535,7 @@ pub const Store = struct {
         writer.writeU32(@intCast(lease_count));
         writer.writeU32(@intCast(quarantine_count));
         for (record_views) |view| {
-            writer.writeByte(@intFromEnum(view.record.kind));
+            writer.writeByte(@backingInt(view.record.kind));
             writer.writeU32(@intCast(view.record.wire.len));
             writer.writeBytes(view.record.wire);
             const witness = view.record.conflict_wire orelse &.{};
@@ -1550,7 +1550,7 @@ pub const Store = struct {
             writer.writeBytes(witness);
         }
         for (quarantine_views) |view| {
-            writer.writeByte(@intFromEnum(view.key.scope));
+            writer.writeByte(@backingInt(view.key.scope));
             writer.writeU32(@intCast(view.quarantine.first_wire.len));
             writer.writeBytes(view.quarantine.first_wire);
             writer.writeU32(@intCast(view.quarantine.second_wire.len));
@@ -1854,7 +1854,7 @@ fn quarantineKey(scope: QuarantineScope, token: Token, attachment_id: Attachment
 }
 
 fn quarantineKeyLess(a: QuarantineKey, b: QuarantineKey) bool {
-    if (a.scope != b.scope) return @intFromEnum(a.scope) < @intFromEnum(b.scope);
+    if (a.scope != b.scope) return @backingInt(a.scope) < @backingInt(b.scope);
     const token_order = std.mem.order(u8, &a.token, &b.token);
     if (token_order != .eq) return token_order == .lt;
     return std.mem.order(u8, &a.attachment_raw, &b.attachment_raw) == .lt;
@@ -1935,7 +1935,7 @@ fn antiEntropyCursorOrder(a: AntiEntropyCursor, b: AntiEntropyCursor) std.math.O
     if (attachment_order != .eq) return attachment_order;
     const revision_order = a.revision.compare(b.revision);
     if (revision_order != .eq) return revision_order;
-    if (a.kind != b.kind) return std.math.order(@intFromEnum(a.kind), @intFromEnum(b.kind));
+    if (a.kind != b.kind) return std.math.order(@backingInt(a.kind), @backingInt(b.kind));
     return std.mem.order(u8, &a.digest, &b.digest);
 }
 

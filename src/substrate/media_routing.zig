@@ -12,6 +12,7 @@ const media_rooms = @import("../daemon/media_room.zig");
 const native_owner = @import("../daemon/native_media_transport.zig");
 const webrtc_owner = @import("../daemon/media_plane.zig");
 const runtime_pause = @import("../daemon/runtime_pause.zig");
+const builtin = @import("builtin");
 
 pub const ClientId = client.ClientId;
 pub const Leg = enum { native, webrtc };
@@ -59,6 +60,8 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidRequest,
     EndpointUnavailable,
     Closing,
+    FeedbackRateLimited,
+    FeedbackClockUnavailable,
 };
 
 pub const ChannelKey = struct {
@@ -83,10 +86,29 @@ pub const EndpointObservation = struct {
     mode: SecurityMode,
 };
 const CallMap = std.AutoHashMap(ChannelKey, CallRow);
-pub const EndpointEntry = struct { observation: EndpointObservation, retiring: bool = false };
+const FeedbackWindow = struct { started_ms: i64 = 0, used: u16 = 0 };
+const feedback_window_ms: i64 = 1000;
+const feedback_source_limit: u16 = 1;
+const feedback_publisher_limit: u16 = 4;
+const nack_source_limit: u16 = 128;
+const nack_publisher_limit: u16 = 512;
+const FeedbackKind = enum { keyframe, nack };
+fn validFeedbackWindow(window: FeedbackWindow, limit: u16) bool {
+    return if (window.used == 0) window.started_ms == 0 else window.started_ms > 0 and window.used <= limit;
+}
+pub const EndpointEntry = struct {
+    observation: EndpointObservation,
+    retiring: bool = false,
+    client_retiring: bool = false,
+    retirement_slot: ?usize = null,
+    feedback_source: FeedbackWindow = .{},
+    feedback_publisher: FeedbackWindow = .{},
+    nack_source: FeedbackWindow = .{},
+    nack_publisher: FeedbackWindow = .{},
+};
 const EndpointMap = std.AutoHashMap(EndpointKey, EndpointEntry);
 pub const MembershipKey = struct { call: CallId, client: ClientId };
-pub const MembershipEntry = struct { bits: u8, retiring: bool = false };
+pub const MembershipEntry = struct { bits: u8, retiring: bool = false, client_retiring: bool = false, retirement_slot: ?usize = null };
 const MembershipMap = std.AutoHashMap(MembershipKey, MembershipEntry);
 const InboundPin = struct { binding: *WebrtcBinding, ordinal: u64, source: EndpointStamp, issued_scope: u64 };
 const EgressPin = struct { binding: *WebrtcBinding, ordinal: u64, source: EndpointStamp, target: EndpointStamp, issued_scope: u64 };
@@ -109,12 +131,390 @@ const Backing = struct {
     active_egress: ?EgressPin = null,
     active_inbound: ?InboundPin = null,
     pending_candidates: usize = 0,
+    feedback_clock_io: ?std.Io = null,
+    test_feedback_now_ms: if (builtin.is_test) ?i64 else void = if (builtin.is_test) null else {},
+    retirement_slots: []RetirementSlot = &.{},
+    free_retirement: ?usize = null,
+    pending_retirement_head: ?usize = null,
+    pending_retirement_tail: ?usize = null,
+    pending_retirements: usize = 0,
+    reserved_retirements: usize = 0,
+    publication_count: usize = 0,
+    legacy_credits: usize = 0,
+    legacy_pending: usize = 0,
+    legacy_pending_head: ?usize = null,
+    legacy_pending_tail: ?usize = null,
+    publication_head: ?usize = null,
+    publication_tail: ?usize = null,
+    publication_buckets: []PublicationBucket = &.{},
+    free_publication_bucket: ?usize = null,
+    retirement_index: RetirementIndex = .{},
+    publication_index: PublicationIndex = .{},
     registry_next: ?*Backing = null,
     calls: CallMap,
     endpoints: EndpointMap,
     memberships: MembershipMap,
     bridge_policy: BridgeMap,
 };
+// Retirement credit is funded with the ORIGINAL graph row, before admission.
+// Slots use stable indices and checked generations; growth never moves a ticket.
+pub const ChannelRetirementIntent = struct { call: CallId, client: ClientId, channel: ChannelKey };
+pub const ChannelRetirementObservation = struct { intent: ChannelRetirementIntent, offers: u32 = 0, memberships: u32 = 0 };
+pub const RetirementPublication = struct {
+    action: enum { detach, leave },
+    channel: [client.MAX_CHANNEL_NAME_BYTES]u8 = @splat(0),
+    channel_len: u16 = 0,
+    participant: [client.MAX_NICK_BYTES]u8 = @splat(0),
+    participant_len: u8 = 0,
+    attachment: [16]u8 = @splat(0),
+
+    pub fn init(action: @FieldType(RetirementPublication, "action"), channel: []const u8, participant: []const u8, attachment: [16]u8) Error!RetirementPublication {
+        _ = try ChannelKey.init(channel);
+        for (channel) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidRequest;
+        if (participant.len == 0 or participant.len > client.MAX_NICK_BYTES) return error.InvalidRequest;
+        for (participant) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidRequest;
+        if (action == .detach and std.mem.allEqual(u8, &attachment, 0)) return error.InvalidRequest;
+        var result = RetirementPublication{ .action = action, .channel_len = @intCast(channel.len), .participant_len = @intCast(participant.len), .attachment = attachment };
+        @memcpy(result.channel[0..channel.len], channel);
+        @memcpy(result.participant[0..participant.len], participant);
+        return result;
+    }
+    pub fn validate(self: *const RetirementPublication) Error!void {
+        if (self.channel_len == 0 or self.channel_len > self.channel.len or self.participant_len == 0 or self.participant_len > self.participant.len) return error.InvalidRequest;
+        _ = try ChannelKey.init(self.channelSlice());
+        for (self.channelSlice()) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidRequest;
+        for (self.participantSlice()) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidRequest;
+        if (self.action == .detach and std.mem.allEqual(u8, &self.attachment, 0)) return error.InvalidRequest;
+    }
+    pub fn channelSlice(self: *const RetirementPublication) []const u8 {
+        return self.channel[0..self.channel_len];
+    }
+    pub fn participantSlice(self: *const RetirementPublication) []const u8 {
+        return self.participant[0..self.participant_len];
+    }
+};
+/// Copied before fence/WAL acceptance. It remains immutable through account,
+/// nickname, room, or connection removal while geometry/publication retries.
+pub const RetirementOrigin = struct {
+    snapshot: RetirementPublication,
+    has_attachment: bool,
+    private_presence: bool,
+};
+const RetirementKey = struct { channel: ChannelKey, client: ClientId };
+const RetirementIndex = std.AutoHashMapUnmanaged(RetirementKey, usize);
+const PublicationIndex = std.AutoHashMapUnmanaged(ChannelKey, usize);
+const PublicationBucket = struct {
+    channel: ChannelKey = .{},
+    first: ?usize = null,
+    last: ?usize = null,
+    previous: ?usize = null,
+    next: ?usize = null,
+    next_free: ?usize = null,
+};
+pub const RetirementPublicationReceipt = struct {
+    domain: DomainId,
+    index: usize,
+    generation: u64,
+    client: ClientId,
+    publication: RetirementPublication,
+};
+const RetirementSlot = struct {
+    state: enum { free, funded, reserved, pending, publication } = .free,
+    generation: u64 = 0,
+    refs: usize = 0,
+    key: RetirementKey = undefined,
+    has_graph: bool = true,
+    legacy_credit: bool = false,
+    original_participant: [client.MAX_NICK_BYTES]u8 = @splat(0),
+    original_participant_len: u8 = 0,
+    intent: ChannelRetirementIntent = undefined,
+    publication: ?RetirementPublication = null,
+    origin: ?RetirementOrigin = null,
+    next_free: ?usize = null,
+    previous: ?usize = null,
+    next: ?usize = null,
+};
+const RetirementTicket = struct { source: *Backing, index: usize, generation: u64, committed: bool = false };
+
+pub const PreparedChannelRetirement = struct {
+    ticket: ?RetirementTicket = null,
+    observed_intent: ?ChannelRetirementIntent = null,
+    prepared_origin: ?RetirementOrigin = null,
+    pub fn intent(self: *const PreparedChannelRetirement) ?ChannelRetirementIntent {
+        const ticket = self.ticket orelse return self.observed_intent;
+        lock(&ticket.source.mutex);
+        defer ticket.source.mutex.unlock();
+        const slot = ticketSlot(ticket) orelse return null;
+        return if (slot.has_graph) slot.intent else null;
+    }
+    pub fn setOrigin(self: *PreparedChannelRetirement, origin: RetirementOrigin) Error!void {
+        try origin.snapshot.validate();
+        if (origin.has_attachment and std.mem.allEqual(u8, &origin.snapshot.attachment, 0)) return error.InvalidRequest;
+        const ticket = self.ticket orelse return;
+        lock(&ticket.source.mutex);
+        defer ticket.source.mutex.unlock();
+        const slot = ticketSlot(ticket) orelse return error.StaleCandidate;
+        if (!std.meta.eql(try ChannelKey.init(origin.snapshot.channelSlice()), slot.key.channel)) return error.InvalidIdentity;
+        if (origin.has_attachment and std.mem.allEqual(u8, &origin.snapshot.attachment, 0)) return error.InvalidRequest;
+        self.prepared_origin = origin;
+    }
+    pub fn validate(self: *const PreparedChannelRetirement) Error!void {
+        const ticket = self.ticket orelse return;
+        lock(&ticket.source.mutex);
+        defer ticket.source.mutex.unlock();
+        _ = ticketSlot(ticket) orelse return error.StaleCandidate;
+    }
+    /// Source reservation already excludes conflicting same-scope authoring.
+    /// No allocation, issuer or backend call follows policy/WAL acceptance.
+    pub fn commit(self: *PreparedChannelRetirement) void {
+        if (self.ticket) |*ticket| {
+            lock(&ticket.source.mutex);
+            defer ticket.source.mutex.unlock();
+            const slot = ticketSlot(ticket.*) orelse return;
+            if (slot.state == .reserved) {
+                if (slot.origin == null) slot.origin = self.prepared_origin;
+                publishRetirementDenial(ticket.source, ticket.index);
+            }
+            ticket.committed = true;
+        }
+    }
+    pub fn deinit(self: *PreparedChannelRetirement) void {
+        self.observed_intent = null;
+        const ticket = self.ticket orelse return;
+        self.ticket = null;
+        const source = ticket.source;
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const slot = ticketSlot(ticket) orelse return;
+        std.debug.assert(source.pending_candidates != 0 and slot.refs != 0);
+        slot.refs -= 1;
+        source.pending_candidates -= 1;
+        if (slot.state == .reserved) {
+            std.debug.assert(slot.refs == 0 and !ticket.committed);
+            if (slot.has_graph) clearScopeSlot(source, slot.intent.call, slot.intent.client);
+            source.reserved_retirements -= 1;
+            if (slot.legacy_credit) slot.state = .funded else recycleRetirementSlot(source, ticket.index);
+        }
+    }
+};
+fn ticketSlot(ticket: RetirementTicket) ?*RetirementSlot {
+    if (ticket.index >= ticket.source.retirement_slots.len) return null;
+    const slot = &ticket.source.retirement_slots[ticket.index];
+    if (slot.state == .free or slot.generation != ticket.generation or slot.refs == 0) return null;
+    return slot;
+}
+fn scopeSlot(source: *Backing, call: CallId, owner: ClientId) ?usize {
+    if (source.memberships.get(.{ .call = call, .client = owner })) |row| if (row.retirement_slot) |index| return index;
+    for ([_]Leg{ .native, .webrtc }) |leg| {
+        if (source.endpoints.get(.{ .call = call, .client = owner, .leg = leg })) |row| if (row.retirement_slot) |index| return index;
+    }
+    return null;
+}
+fn setScopeSlot(source: *Backing, call: CallId, owner: ClientId, index: usize) void {
+    if (source.memberships.getPtr(.{ .call = call, .client = owner })) |row| row.retirement_slot = index;
+    for ([_]Leg{ .native, .webrtc }) |leg| {
+        if (source.endpoints.getPtr(.{ .call = call, .client = owner, .leg = leg })) |row| row.retirement_slot = index;
+    }
+}
+fn clearScopeSlot(source: *Backing, call: CallId, owner: ClientId) void {
+    if (source.memberships.getPtr(.{ .call = call, .client = owner })) |row| row.retirement_slot = null;
+    for ([_]Leg{ .native, .webrtc }) |leg| {
+        if (source.endpoints.getPtr(.{ .call = call, .client = owner, .leg = leg })) |row| row.retirement_slot = null;
+    }
+}
+fn scopeHasTickets(source: *Backing, call: CallId, owner: ClientId) bool {
+    const index = scopeSlot(source, call, owner) orelse return false;
+    return source.retirement_slots[index].refs != 0;
+}
+fn ownerHasTickets(source: *Backing, owner: ClientId) bool {
+    for (source.retirement_slots) |slot| if (slot.state != .free and slot.refs != 0 and slot.key.client.eql(owner)) return true;
+    return false;
+}
+fn requireScopeAdmission(source: *Backing, call: CallId, owner: ClientId) Error!void {
+    const index = scopeSlot(source, call, owner) orelse return;
+    if (source.retirement_slots[index].state == .pending or source.retirement_slots[index].state == .publication) return error.Closing;
+    return error.Busy;
+}
+fn reserveRetirementSlot(source: *Backing, intent: ChannelRetirementIntent) Error!usize {
+    const index = source.free_retirement orelse return error.Busy;
+    const slot = &source.retirement_slots[index];
+    std.debug.assert(slot.state == .free and slot.refs == 0);
+    const generation = std.math.add(u64, slot.generation, 1) catch return error.SequenceExhausted;
+    source.free_retirement = slot.next_free;
+    slot.* = .{ .state = .reserved, .generation = generation, .intent = intent, .key = .{ .channel = intent.channel, .client = intent.client } };
+    source.reserved_retirements += 1;
+    source.retirement_index.putAssumeCapacity(.{ .channel = intent.channel, .client = intent.client }, index);
+    setScopeSlot(source, intent.call, intent.client, index);
+    return index;
+}
+fn appendPendingRetirement(source: *Backing, index: usize) void {
+    const slot = &source.retirement_slots[index];
+    slot.previous = source.pending_retirement_tail;
+    slot.next = null;
+    if (source.pending_retirement_tail) |tail| source.retirement_slots[tail].next = index else source.pending_retirement_head = index;
+    source.pending_retirement_tail = index;
+}
+fn unlinkPendingRetirement(source: *Backing, index: usize) void {
+    const slot = &source.retirement_slots[index];
+    if (slot.previous) |previous| source.retirement_slots[previous].next = slot.next else source.pending_retirement_head = slot.next;
+    if (slot.next) |next| source.retirement_slots[next].previous = slot.previous else source.pending_retirement_tail = slot.previous;
+    slot.previous = null;
+    slot.next = null;
+}
+fn appendLegacyPendingRetirement(source: *Backing, index: usize) void {
+    const slot = &source.retirement_slots[index];
+    slot.previous = source.legacy_pending_tail;
+    slot.next = null;
+    if (source.legacy_pending_tail) |tail| source.retirement_slots[tail].next = index else source.legacy_pending_head = index;
+    source.legacy_pending_tail = index;
+}
+fn unlinkLegacyPendingRetirement(source: *Backing, index: usize) void {
+    const slot = &source.retirement_slots[index];
+    if (slot.previous) |previous| source.retirement_slots[previous].next = slot.next else source.legacy_pending_head = slot.next;
+    if (slot.next) |next| source.retirement_slots[next].previous = slot.previous else source.legacy_pending_tail = slot.previous;
+    slot.previous = null;
+    slot.next = null;
+}
+fn publishRetirementDenial(source: *Backing, index: usize) void {
+    const slot = &source.retirement_slots[index];
+    std.debug.assert(slot.state == .reserved);
+    if (slot.has_graph) {
+        if (source.memberships.getPtr(.{ .call = slot.intent.call, .client = slot.intent.client })) |row| row.retiring = true;
+        for ([_]Leg{ .native, .webrtc }) |leg| {
+            if (source.endpoints.getPtr(.{ .call = slot.intent.call, .client = slot.intent.client, .leg = leg })) |row| row.retiring = true;
+        }
+    }
+    slot.state = .pending;
+    source.reserved_retirements -= 1;
+    if (slot.has_graph) {
+        source.pending_retirements += 1;
+        appendPendingRetirement(source, index);
+    } else {
+        source.legacy_pending += 1;
+        appendLegacyPendingRetirement(source, index);
+    }
+}
+fn recycleRetirementSlot(source: *Backing, index: usize) void {
+    const old = source.retirement_slots[index];
+    _ = source.retirement_index.remove(old.key);
+    if (old.legacy_credit) source.legacy_credits -= 1;
+    const generation = old.generation;
+    source.retirement_slots[index] = .{ .generation = generation, .next_free = source.free_retirement };
+    source.free_retirement = index;
+}
+fn releaseEmptyScope(source: *Backing, call: CallId, owner: ClientId, index: ?usize) void {
+    const actual = index orelse return;
+    if (source.memberships.contains(.{ .call = call, .client = owner })) return;
+    for ([_]Leg{ .native, .webrtc }) |leg| if (source.endpoints.contains(.{ .call = call, .client = owner, .leg = leg })) return;
+    const slot = &source.retirement_slots[actual];
+    std.debug.assert(slot.refs == 0);
+    if (slot.state == .funded) {
+        std.debug.assert(source.closing and slot.legacy_credit);
+        recycleRetirementSlot(source, actual);
+        return;
+    }
+    std.debug.assert(slot.state == .pending);
+    unlinkPendingRetirement(source, actual);
+    source.pending_retirements -= 1;
+    if (slot.publication != null) appendPublication(source, actual) else recycleRetirementSlot(source, actual);
+}
+// Channel queues retain admission-completion order. The ready-channel ring
+// rotates heads independently, so arbitrarily many blocked edges on A cannot
+// hide B behind a bounded scan. All storage is paid by original admission.
+fn appendPublication(source: *Backing, index: usize) void {
+    const slot = &source.retirement_slots[index];
+    const key = slot.key.channel;
+    const bucket_index = source.publication_index.get(key) orelse new_bucket: {
+        const next = source.free_publication_bucket.?;
+        const bucket = &source.publication_buckets[next];
+        source.free_publication_bucket = bucket.next_free;
+        bucket.* = .{ .channel = key, .previous = source.publication_tail };
+        if (source.publication_tail) |tail| source.publication_buckets[tail].next = next else source.publication_head = next;
+        source.publication_tail = next;
+        source.publication_index.putAssumeCapacity(key, next);
+        break :new_bucket next;
+    };
+    const bucket = &source.publication_buckets[bucket_index];
+    slot.previous = bucket.last;
+    slot.next = null;
+    if (bucket.last) |last| source.retirement_slots[last].next = index else bucket.first = index;
+    bucket.last = index;
+    slot.state = .publication;
+    source.publication_count += 1;
+}
+fn unlinkPublicationBucket(source: *Backing, index: usize) void {
+    const bucket = &source.publication_buckets[index];
+    if (bucket.previous) |previous| source.publication_buckets[previous].next = bucket.next else source.publication_head = bucket.next;
+    if (bucket.next) |next| source.publication_buckets[next].previous = bucket.previous else source.publication_tail = bucket.previous;
+    bucket.previous = null;
+    bucket.next = null;
+}
+fn rotatePublicationBucket(source: *Backing, index: usize) void {
+    if (source.publication_tail == index) return;
+    unlinkPublicationBucket(source, index);
+    const bucket = &source.publication_buckets[index];
+    bucket.previous = source.publication_tail;
+    if (source.publication_tail) |tail| source.publication_buckets[tail].next = index else source.publication_head = index;
+    source.publication_tail = index;
+}
+const RetirementGrowth = struct {
+    slots: []RetirementSlot,
+    buckets: []PublicationBucket,
+    index: RetirementIndex = .{},
+    publications: PublicationIndex = .{},
+    original_len: usize,
+    fn deinit(self: *RetirementGrowth, allocator: std.mem.Allocator) void {
+        allocator.free(self.slots);
+        allocator.free(self.buckets);
+        self.index.deinit(allocator);
+        self.publications.deinit(allocator);
+    }
+};
+fn prepareRetirementGrowth(allocator: std.mem.Allocator, current: usize, required: usize) Error!?RetirementGrowth {
+    if (required <= current) return null;
+    const doubled = std.math.mul(usize, current, 2) catch required;
+    const size = @max(required, @max(doubled, 8));
+    const slots = try allocator.alloc(RetirementSlot, size);
+    errdefer allocator.free(slots);
+    const buckets = try allocator.alloc(PublicationBucket, size);
+    var result = RetirementGrowth{ .slots = slots, .buckets = buckets, .original_len = current };
+    errdefer {
+        allocator.free(buckets);
+        result.index.deinit(allocator);
+        result.publications.deinit(allocator);
+    }
+    const capacity = std.math.cast(u32, size) orelse return error.SequenceExhausted;
+    try result.index.ensureTotalCapacity(allocator, capacity);
+    try result.publications.ensureTotalCapacity(allocator, capacity);
+    return result;
+}
+fn publishRetirementGrowth(source: *Backing, growth: *?RetirementGrowth) void {
+    const plan = if (growth.*) |*actual| actual else return;
+    std.debug.assert(source.retirement_slots.len == plan.original_len);
+    @memcpy(plan.slots[0..plan.original_len], source.retirement_slots);
+    @memcpy(plan.buckets[0..plan.original_len], source.publication_buckets);
+    for (plan.original_len..plan.slots.len) |index| {
+        plan.slots[index] = .{ .next_free = if (index + 1 < plan.slots.len) index + 1 else source.free_retirement };
+        plan.buckets[index] = .{ .next_free = if (index + 1 < plan.slots.len) index + 1 else source.free_publication_bucket };
+    }
+    var scopes = source.retirement_index.iterator();
+    while (scopes.next()) |entry| plan.index.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+    var channels = source.publication_index.iterator();
+    while (channels.next()) |entry| plan.publications.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+    source.free_retirement = plan.original_len;
+    source.free_publication_bucket = plan.original_len;
+    std.mem.swap([]RetirementSlot, &source.retirement_slots, &plan.slots);
+    std.mem.swap([]PublicationBucket, &source.publication_buckets, &plan.buckets);
+    std.mem.swap(RetirementIndex, &source.retirement_index, &plan.index);
+    std.mem.swap(PublicationIndex, &source.publication_index, &plan.publications);
+}
+fn deinitRetirementStorage(source: *Backing) void {
+    source.allocator.free(source.retirement_slots);
+    source.allocator.free(source.publication_buckets);
+    source.retirement_index.deinit(source.allocator);
+    source.publication_index.deinit(source.allocator);
+}
+
 var next_domain = std.atomic.Value(u64).init(1);
 var domain_registry_mutex: std.atomic.Mutex = .unlocked;
 var domain_registry: ?*Backing = null;
@@ -243,7 +643,13 @@ pub const GraphSnapshot = struct {
         for (self.endpoints, 0..) |endpoint, i| {
             const key = endpoint.key;
             const obs = endpoint.row.observation;
-            if (endpoint.row.retiring or key.client.isNone() or key.call.domain.serial != self.id.serial or
+            const source_window = endpoint.row.feedback_source;
+            const publisher_window = endpoint.row.feedback_publisher;
+            if (!validFeedbackWindow(source_window, feedback_source_limit) or
+                !validFeedbackWindow(publisher_window, feedback_publisher_limit) or
+                !validFeedbackWindow(endpoint.row.nack_source, nack_source_limit) or
+                !validFeedbackWindow(endpoint.row.nack_publisher, nack_publisher_limit)) return error.InvalidSnapshot;
+            if (endpoint.row.retiring or endpoint.row.client_retiring or endpoint.row.retirement_slot != null or key.client.isNone() or key.call.domain.serial != self.id.serial or
                 !self.hasCall(key.call) or obs.reference.offering_client.isNone() or
                 !key.client.eql(obs.reference.offering_client) or !key.client.eql(obs.stamp.offering_client) or
                 !std.meta.eql(obs.reference.endpoint, obs.stamp.endpoint) or
@@ -257,7 +663,7 @@ pub const GraphSnapshot = struct {
             }
         }
         for (self.memberships, 0..) |member, i| {
-            if (member.row.retiring or member.key.client.isNone() or member.key.call.domain.serial != self.id.serial or
+            if (member.row.retiring or member.row.client_retiring or member.row.retirement_slot != null or member.key.client.isNone() or member.key.call.domain.serial != self.id.serial or
                 !self.hasCall(member.key.call) or member.row.bits == 0 or member.row.bits & ~@as(u8, 7) != 0) return error.InvalidSnapshot;
             for (self.memberships[0..i]) |prior| if (std.meta.eql(prior.key, member.key)) return error.InvalidSnapshot;
         }
@@ -291,9 +697,9 @@ pub const GraphSnapshot = struct {
 
 fn canonicalProfile(profile: media_rooms.CallProfile) GraphError!media_rooms.CallProfile {
     if (profile.codec_count == 0 or profile.codec_count > media_rooms.max_profile_codecs or
-        @intFromEnum(profile.fec.scheme) > 2) return error.InvalidSnapshot;
+        @backingInt(profile.fec.scheme) > 2) return error.InvalidSnapshot;
     for (profile.codecs[0..profile.codec_count]) |codec| {
-        const tag = @intFromEnum(codec.tag);
+        const tag = @backingInt(codec.tag);
         if (tag < 1 or tag > 3) return error.InvalidSnapshot;
     }
     _ = media_rooms.agreedKindBits(profile) catch return error.InvalidSnapshot;
@@ -439,6 +845,7 @@ pub const PreparedGraphRestore = struct {
         source.memberships.deinit();
         source.endpoints.deinit();
         source.calls.deinit();
+        deinitRetirementStorage(source);
         source.allocator.destroy(@as(*WebrtcBindingBacking, @ptrCast(@alignCast(source.webrtc_binding.?))));
         source.allocator.destroy(@as(*NativeBindingBacking, @ptrCast(@alignCast(source.native_binding.?))));
         source.allocator.destroy(source);
@@ -478,11 +885,15 @@ pub fn prepareGraphRestore(allocator: std.mem.Allocator, graph: *const GraphSnap
         source.memberships.deinit();
         source.endpoints.deinit();
         source.calls.deinit();
+        deinitRetirementStorage(source);
     }
     try source.calls.ensureTotalCapacity(@intCast(graph.calls.len));
     try source.endpoints.ensureTotalCapacity(@intCast(graph.endpoints.len));
     try source.memberships.ensureTotalCapacity(@intCast(graph.memberships.len));
     try source.bridge_policy.ensureTotalCapacity(@intCast(graph.bridge_policy.len));
+    var retirement_growth = try prepareRetirementGrowth(allocator, 0, graph.endpoints.len + graph.memberships.len);
+    publishRetirementGrowth(source, &retirement_growth);
+    if (retirement_growth) |*growth| growth.deinit(allocator);
     for (graph.calls) |row| source.calls.putAssumeCapacity(row.channel, row.row);
     for (graph.endpoints) |row| source.endpoints.putAssumeCapacity(row.key, row.row);
     for (graph.memberships) |row| source.memberships.putAssumeCapacity(row.key, row.row);
@@ -500,6 +911,26 @@ pub fn prepareGraphRestore(allocator: std.mem.Allocator, graph: *const GraphSnap
     try reserveRestoredDomain(source);
     return .{ .source = source, .native = native, .webrtc = webrtc };
 }
+
+pub const TestFeedbackClock = if (builtin.is_test) struct {
+    pub fn set(domain: *Domain, now: i64) void {
+        const source = backing(domain);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        source.test_feedback_now_ms = now;
+    }
+    pub fn retire(restored: RestoredGraph, call: CallId, owner: ClientId) !void {
+        try retireRestoredGraph(restored, call, owner);
+    }
+    pub const View = struct { source_keyframe: u16, publisher_keyframe: u16, source_nack: u16, publisher_nack: u16 };
+    pub fn read(domain: *Domain, key: EndpointKey) Error!View {
+        const source = backing(domain);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const row = source.endpoints.get(key) orelse return error.InvalidIdentity;
+        return .{ .source_keyframe = row.feedback_source.used, .publisher_keyframe = row.feedback_publisher.used, .source_nack = row.nack_source.used, .publisher_nack = row.nack_publisher.used };
+    }
+} else void;
 
 pub const Domain = opaque {
     /// Read-only proof for no-fail physical owner installation before READY.
@@ -542,7 +973,7 @@ pub const Domain = opaque {
     pub fn destroyQuiesced(self: *Domain) Error!void {
         const source = backing(self);
         lock(&source.mutex);
-        if (source.restore_pending or source.active_inbound != null or source.active_egress != null or source.native_binding != null or source.webrtc_binding != null or source.pending_candidates != 0 or source.endpoints.count() != 0 or source.calls.count() != 0 or source.memberships.count() != 0 or source.bridge_policy.count() != 0) {
+        if (source.legacy_credits != 0 or source.legacy_pending != 0 or source.publication_count != 0 or source.pending_retirements != 0 or source.reserved_retirements != 0 or source.restore_pending or source.active_inbound != null or source.active_egress != null or source.native_binding != null or source.webrtc_binding != null or source.pending_candidates != 0 or source.endpoints.count() != 0 or source.calls.count() != 0 or source.memberships.count() != 0 or source.bridge_policy.count() != 0) {
             source.mutex.unlock();
             return error.Busy;
         }
@@ -554,6 +985,7 @@ pub const Domain = opaque {
         source.memberships.deinit();
         source.endpoints.deinit();
         source.calls.deinit();
+        deinitRetirementStorage(source);
         allocator.destroy(source);
     }
 
@@ -706,6 +1138,7 @@ pub const Domain = opaque {
         lock(&source.mutex);
         defer source.mutex.unlock();
         if (source.closing) return error.Closing;
+        if (source.legacy_pending != 0 or source.publication_count != 0 or source.pending_retirements != 0 or source.reserved_retirements != 0) return error.Busy;
         if (source.next_scope == std.math.maxInt(u64)) return error.SequenceExhausted;
         var scope = Scope{ .source = source, .serial = source.next_scope };
         source.next_scope += 1;
@@ -729,6 +1162,7 @@ pub const Domain = opaque {
         lock(&source.mutex);
         defer source.mutex.unlock();
         if (source.closing) return error.Closing;
+        if (source.legacy_pending != 0 or source.publication_count != 0 or source.pending_retirements != 0 or source.reserved_retirements != 0) return error.Busy;
         const native_binding = source.native_binding orelse return error.InvalidIdentity;
         const webrtc_binding = source.webrtc_binding orelse return error.InvalidIdentity;
         const native_record: *NativeBindingBacking = @ptrCast(@alignCast(native_binding));
@@ -907,6 +1341,350 @@ pub const Domain = opaque {
         try self.withLocked(Update{ .domain = self, .channel = channel, .client_id = client_id, .selection = selection }, Update.run);
     }
 
+    /// The legacy flat-registry adapter has no graph CallId. It nevertheless
+    /// funds the same source-owned retirement pool BEFORE original admission.
+    /// Funding grants no membership, endpoint, ingress, or packet authority.
+    pub fn fundLegacyRetirementCredit(self: *Domain, channel_name: []const u8, owner: ClientId, participant: []const u8) Error!void {
+        const channel = try ChannelKey.init(channel_name);
+        if (owner.isNone() or participant.len == 0 or participant.len > client.MAX_NICK_BYTES) return error.InvalidRequest;
+        for (participant) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidRequest;
+        const source = backing(self);
+        lock(&source.mutex);
+        if (source.closing or source.restore_pending or source.publication_index.contains(channel)) {
+            source.mutex.unlock();
+            return error.Closing;
+        }
+        const key = RetirementKey{ .channel = channel, .client = owner };
+        if (source.retirement_index.get(key)) |index| {
+            const old = source.retirement_slots[index];
+            source.mutex.unlock();
+            if (old.state != .funded) return error.Busy;
+            if (!std.ascii.eqlIgnoreCase(old.original_participant[0..old.original_participant_len], participant)) return error.InvalidIdentity;
+            return;
+        }
+        const graph_rows = std.math.add(usize, @as(usize, source.endpoints.count()), source.memberships.count()) catch {
+            source.mutex.unlock();
+            return error.SequenceExhausted;
+        };
+        const required_rows = std.math.add(usize, graph_rows, 1) catch {
+            source.mutex.unlock();
+            return error.SequenceExhausted;
+        };
+        const required = retirementRequired(source, required_rows) catch |err| {
+            source.mutex.unlock();
+            return err;
+        };
+        const original_len = source.retirement_slots.len;
+        const revision = source.revision;
+        const next_revision = checkedNext(u64, revision, 1) catch |err| {
+            source.mutex.unlock();
+            return err;
+        };
+        const candidates = std.math.add(usize, source.pending_candidates, 1) catch {
+            source.mutex.unlock();
+            return error.SequenceExhausted;
+        };
+        source.pending_candidates = candidates;
+        source.mutex.unlock();
+        defer unpinCandidate(source);
+        var growth = try prepareRetirementGrowth(source.allocator, original_len, required);
+        defer if (growth) |*plan| plan.deinit(source.allocator);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (source.closing or source.restore_pending or source.revision != revision or source.retirement_slots.len != original_len or source.retirement_index.contains(key) or source.publication_index.contains(channel)) return error.StaleCandidate;
+        // Generation exhaustion is checked before swapping any staged storage.
+        const next_index = if (growth != null) original_len else source.free_retirement orelse return error.Busy;
+        const prior_generation = if (growth != null) 0 else source.retirement_slots[next_index].generation;
+        const generation = std.math.add(u64, prior_generation, 1) catch return error.SequenceExhausted;
+        publishRetirementGrowth(source, &growth);
+        const slot = &source.retirement_slots[next_index];
+        source.free_retirement = slot.next_free;
+        slot.* = .{ .state = .funded, .generation = generation, .key = key, .has_graph = false, .legacy_credit = true, .original_participant_len = @intCast(participant.len) };
+        @memcpy(slot.original_participant[0..participant.len], participant);
+        source.retirement_index.putAssumeCapacity(key, next_index);
+        source.legacy_credits += 1;
+        source.revision = next_revision;
+    }
+    pub fn unusedTerminalLegacyCredit(self: *Domain, channel_name: []const u8, owner: ClientId) Error!bool {
+        const channel = try ChannelKey.init(channel_name);
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (!source.closing or source.restore_pending or source.pending_candidates != 0) return error.Busy;
+        const index = source.retirement_index.get(.{ .channel = channel, .client = owner }) orelse return false;
+        const slot = source.retirement_slots[index];
+        if (slot.state != .funded or !slot.legacy_credit) return false;
+        if (source.calls.get(channel)) |call| if (clientOwnsCall(source, call.id, owner)) return false;
+        return true;
+    }
+    pub fn releaseUnusedLegacyRetirementCredit(self: *Domain, channel_name: []const u8, owner: ClientId) Error!void {
+        const channel = try ChannelKey.init(channel_name);
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const index = source.retirement_index.get(.{ .channel = channel, .client = owner }) orelse return;
+        if (source.retirement_slots[index].state != .funded) return error.Busy;
+        recycleRetirementSlot(source, index);
+    }
+    pub const LegacyRetirement = struct { client: ClientId, channel: ChannelKey, participant: [client.MAX_NICK_BYTES]u8, participant_len: u8 };
+    /// Separate bounded legacy queue prevents filtered-pass phase lock with
+    /// graph cleanup. At most32 owned intents, and no fabricated CallId.
+    pub fn pendingLegacyRetirementsInto(self: *Domain, out: []LegacyRetirement) usize {
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const count = @min(@min(out.len, 32), source.legacy_pending);
+        for (out[0..count]) |*entry| {
+            const index = source.legacy_pending_head.?;
+            const slot = source.retirement_slots[index];
+            std.debug.assert(!slot.has_graph);
+            entry.* = .{ .client = slot.key.client, .channel = slot.key.channel, .participant = slot.original_participant, .participant_len = slot.original_participant_len };
+            unlinkLegacyPendingRetirement(source, index);
+            appendLegacyPendingRetirement(source, index);
+        }
+        return count;
+    }
+    /// Flat legacy geometry is already gone. Payload is staged before that cut;
+    /// completion is allocation-free and retains all metadata through Conn free.
+    pub fn finishLegacyRetirement(self: *Domain, channel_name: []const u8, owner: ClientId, publication: ?RetirementPublication) Error!void {
+        const channel = try ChannelKey.init(channel_name);
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const index = source.retirement_index.get(.{ .channel = channel, .client = owner }) orelse return error.InvalidScope;
+        const slot = &source.retirement_slots[index];
+        if (slot.state == .publication) return;
+        if (slot.state != .pending or slot.has_graph or slot.refs != 0) return error.InvalidScope;
+        if (publication) |payload| {
+            try payload.validate();
+            if (!std.meta.eql(try ChannelKey.init(payload.channelSlice()), channel)) return error.InvalidIdentity;
+        }
+        slot.publication = publication;
+        unlinkLegacyPendingRetirement(source, index);
+        source.legacy_pending -= 1;
+        if (publication != null) appendPublication(source, index) else recycleRetirementSlot(source, index);
+    }
+    /// Source-funded reversible reservation for Services pre-WAL batches.
+    /// Existing datagrams/pins remain usable until commit marks exact denial.
+    pub fn prepareChannelRetirement(self: *Domain, channel_name: []const u8, owner: ClientId) Error!PreparedChannelRetirement {
+        const channel = try ChannelKey.init(channel_name);
+        if (owner.isNone()) return error.InvalidIdentity;
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (source.closing or source.restore_pending) return error.Closing;
+        const key = RetirementKey{ .channel = channel, .client = owner };
+        if (source.retirement_index.get(key)) |index| {
+            const slot = &source.retirement_slots[index];
+            if (slot.state == .pending or slot.state == .publication) return .{ .observed_intent = if (slot.has_graph) slot.intent else null };
+            if (slot.state != .funded) return error.Busy;
+            const next_candidates = std.math.add(usize, source.pending_candidates, 1) catch return error.SequenceExhausted;
+            slot.has_graph = false;
+            if (source.calls.get(channel)) |row| if (clientOwnsCall(source, row.id, owner)) {
+                slot.has_graph = true;
+                slot.intent = .{ .call = row.id, .channel = channel, .client = owner };
+                setScopeSlot(source, row.id, owner, index);
+            };
+            slot.state = .reserved;
+            slot.refs = 1;
+            source.reserved_retirements += 1;
+            source.pending_candidates = next_candidates;
+            return .{ .ticket = .{ .source = source, .index = index, .generation = slot.generation } };
+        }
+        const row = source.calls.get(channel) orelse return .{};
+        if (!clientOwnsCall(source, row.id, owner)) return .{};
+        // Existing denial is source-owned; a repeat is a value-only no-op,
+        // never a new reference that could make an old consumed ticket valid.
+        if (scopeSlot(source, row.id, owner)) |existing| {
+            const prior = source.retirement_slots[existing];
+            if (prior.state == .pending) return .{ .observed_intent = prior.intent };
+            return error.Busy;
+        }
+        const next_candidates = std.math.add(usize, source.pending_candidates, 1) catch return error.SequenceExhausted;
+        const index = try reserveRetirementSlot(source, .{ .call = row.id, .client = owner, .channel = channel });
+        const slot = &source.retirement_slots[index];
+        if (slot.state == .reserved and slot.refs != 0) return error.Busy;
+        const next_refs = std.math.add(usize, slot.refs, 1) catch return error.SequenceExhausted;
+        slot.refs = next_refs;
+        source.pending_candidates = next_candidates;
+        return .{ .ticket = .{ .source = source, .index = index, .generation = slot.generation } };
+    }
+    /// Allocation-free immediate deny for PART/LEAVE before World mutation.
+    /// A live reversible reservation refuses Busy BEFORE any denial mutation.
+    pub fn fenceChannelRetirement(self: *Domain, channel_name: []const u8, owner: ClientId) Error!?ChannelRetirementObservation {
+        const channel = try ChannelKey.init(channel_name);
+        if (owner.isNone()) return error.InvalidIdentity;
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (source.closing or source.restore_pending) return error.Closing;
+        const call = source.calls.get(channel) orelse return null;
+        if (!clientOwnsCall(source, call.id, owner)) return null;
+        const index = if (source.retirement_index.get(.{ .channel = channel, .client = owner })) |existing| reuse: {
+            const prior = &source.retirement_slots[existing];
+            if (prior.state == .publication) return error.Closing;
+            if (prior.state == .funded) {
+                prior.has_graph = true;
+                prior.intent = .{ .call = call.id, .client = owner, .channel = channel };
+                prior.state = .reserved;
+                source.reserved_retirements += 1;
+                setScopeSlot(source, call.id, owner, existing);
+            }
+            break :reuse existing;
+        } else try reserveRetirementSlot(source, .{ .call = call.id, .client = owner, .channel = channel });
+        const slot = &source.retirement_slots[index];
+        if (slot.state == .reserved and slot.refs != 0) return error.Busy;
+        if (slot.state == .reserved) publishRetirementDenial(source, index);
+        var observation = ChannelRetirementObservation{ .intent = slot.intent };
+        for ([_]Leg{ .native, .webrtc }) |leg| if (source.endpoints.contains(.{ .call = call.id, .client = owner, .leg = leg })) {
+            observation.offers += 1;
+        };
+        observation.memberships = if (source.memberships.contains(.{ .call = call.id, .client = owner })) 1 else 0;
+        return observation;
+    }
+    pub const RetirementPhase = enum { absent, funded, reserved, graph_cleanup, legacy_cleanup, publication };
+    /// Exact credit custody; channel-wide backlog is only an admission/order
+    /// gate and cannot prove that this physical client's payload was retained.
+    pub fn retirementPhase(self: *Domain, channel_name: []const u8, owner: ClientId) Error!RetirementPhase {
+        const channel = try ChannelKey.init(channel_name);
+        if (owner.isNone()) return error.InvalidIdentity;
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const index = source.retirement_index.get(.{ .channel = channel, .client = owner }) orelse return .absent;
+        const slot = source.retirement_slots[index];
+        return switch (slot.state) {
+            .free => unreachable,
+            .funded => .funded,
+            .reserved => .reserved,
+            .pending => if (slot.has_graph) .graph_cleanup else .legacy_cleanup,
+            .publication => .publication,
+        };
+    }
+    pub fn channelRetiring(self: *Domain, channel_name: []const u8, owner: ClientId) Error!bool {
+        const channel = try ChannelKey.init(channel_name);
+        if (owner.isNone()) return error.InvalidIdentity;
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (source.retirement_index.get(.{ .channel = channel, .client = owner })) |index| {
+            const state = source.retirement_slots[index].state;
+            if (state == .pending or state == .publication) return true;
+        }
+        const call = source.calls.get(channel) orelse return false;
+        if (source.memberships.get(.{ .call = call.id, .client = owner })) |row| if (row.retiring) return true;
+        for ([_]Leg{ .native, .webrtc }) |leg| if (source.endpoints.get(.{ .call = call.id, .client = owner, .leg = leg })) |row| if (row.retiring) return true;
+        return false;
+    }
+    pub fn hasCurrentMembership(self: *Domain, channel_name: []const u8, owner: ClientId) Error!bool {
+        const channel = try ChannelKey.init(channel_name);
+        if (owner.isNone()) return error.InvalidIdentity;
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (source.closing or source.restore_pending) return false;
+        const call = source.calls.get(channel) orelse return false;
+        const member = source.memberships.get(.{ .call = call.id, .client = owner }) orelse return false;
+        return member.bits != 0 and !member.retiring;
+    }
+    /// Source-owned round-robin queue, never an unbounded graph scan. Copy at
+    /// most 32 distinct pending intents; growth/deletion cannot dangle cursors.
+    pub fn pendingChannelRetirementsInto(self: *Domain, out: []ChannelRetirementIntent) usize {
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const work = @min(@min(out.len, 32), source.pending_retirements);
+        var count: usize = 0;
+        for (0..work) |_| {
+            const index = source.pending_retirement_head.?;
+            const slot = source.retirement_slots[index];
+            if (slot.has_graph) {
+                out[count] = slot.intent;
+                count += 1;
+            }
+            unlinkPendingRetirement(source, index);
+            appendPendingRetirement(source, index);
+        }
+        return count;
+    }
+    pub fn retirementOrigin(self: *Domain, channel_name: []const u8, owner: ClientId) Error!?RetirementOrigin {
+        const channel = try ChannelKey.init(channel_name);
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const index = source.retirement_index.get(.{ .channel = channel, .client = owner }) orelse return null;
+        return source.retirement_slots[index].origin;
+    }
+    pub fn channelPublicationPending(self: *Domain, channel_name: []const u8) Error!bool {
+        const channel = try ChannelKey.init(channel_name);
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        return source.publication_index.contains(channel);
+    }
+    pub fn retirementPublicationHead(self: *Domain, channel_name: []const u8) Error!?RetirementPublicationReceipt {
+        const channel = try ChannelKey.init(channel_name);
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const bucket_index = source.publication_index.get(channel) orelse return null;
+        const index = source.publication_buckets[bucket_index].first.?;
+        const slot = source.retirement_slots[index];
+        return .{ .domain = source.id, .index = index, .generation = slot.generation, .client = slot.key.client, .publication = slot.publication.? };
+    }
+    /// Bounded fair selection: one FIFO head per independent channel. Metadata
+    /// is copied out and has no Conn, graph-row, or temporary-string lifetime.
+    pub fn pendingRetirementPublicationsInto(self: *Domain, out: []RetirementPublicationReceipt) usize {
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        const count = @min(@min(out.len, 32), source.publication_index.count());
+        for (out[0..count]) |*entry| {
+            const bucket_index = source.publication_head.?;
+            const index = source.publication_buckets[bucket_index].first.?;
+            const slot = source.retirement_slots[index];
+            entry.* = .{ .domain = source.id, .index = index, .generation = slot.generation, .client = slot.key.client, .publication = slot.publication.? };
+            rotatePublicationBucket(source, bucket_index);
+        }
+        return count;
+    }
+    /// Only an actually accepted publication can ACK its exact FIFO head.
+    /// Caller holds its serialized World authority from acceptance through ACK.
+    /// A stale/wrong-source receipt cannot free another incarnation's credit.
+    pub fn acknowledgeRetirementPublication(self: *Domain, receipt: RetirementPublicationReceipt) bool {
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        if (!std.meta.eql(source.id, receipt.domain) or receipt.index >= source.retirement_slots.len) return false;
+        const slot = &source.retirement_slots[receipt.index];
+        if (slot.state != .publication or slot.generation != receipt.generation or !slot.key.client.eql(receipt.client) or !std.meta.eql(slot.publication, @as(?RetirementPublication, receipt.publication))) return false;
+        const bucket_index = source.publication_index.get(slot.key.channel) orelse return false;
+        const bucket = &source.publication_buckets[bucket_index];
+        if (bucket.first != receipt.index) return false;
+        bucket.first = slot.next;
+        if (slot.next) |next| source.retirement_slots[next].previous = null else {
+            _ = source.publication_index.remove(bucket.channel);
+            unlinkPublicationBucket(source, bucket_index);
+            bucket.* = .{ .next_free = source.free_publication_bucket };
+            source.free_publication_bucket = bucket_index;
+        }
+        source.publication_count -= 1;
+        recycleRetirementSlot(source, receipt.index);
+        return true;
+    }
+    pub fn retirementWorkCount(self: *Domain) usize {
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        return source.legacy_pending + source.publication_count + source.pending_retirements + source.reserved_retirements;
+    }
+    pub fn hasPendingChannelRetirements(self: *Domain) bool {
+        const source = backing(self);
+        lock(&source.mutex);
+        defer source.mutex.unlock();
+        return source.legacy_pending != 0 or source.publication_count != 0 or source.pending_retirements != 0 or source.reserved_retirements != 0;
+    }
+
     /// Immediate irreversible admission denial BEFORE fallible client cleanup.
     /// It mutates only actual existing source rows; no allocation/counter/new
     /// proof issuer is required. Existing accepted send pins retain their exact
@@ -922,11 +1700,13 @@ pub const Domain = opaque {
         var endpoints = source.endpoints.iterator();
         while (endpoints.next()) |entry| if (entry.key_ptr.client.eql(client_id)) {
             entry.value_ptr.retiring = true;
+            entry.value_ptr.client_retiring = true;
             observed.offers += 1;
         };
         var memberships = source.memberships.iterator();
         while (memberships.next()) |entry| if (entry.key_ptr.client.eql(client_id)) {
             entry.value_ptr.retiring = true;
+            entry.value_ptr.client_retiring = true;
             observed.memberships += 1;
         };
         return observed;
@@ -1031,7 +1811,7 @@ pub const Domain = opaque {
         const scope = try self.requireScope(token);
         const source = backing(self);
         if (source.closing) return error.Closing;
-        const word = @intFromEnum(handle);
+        const word = @backingInt(handle);
         if (@as(u64, @truncate(word)) != source.id.serial or @as(u64, @truncate(word >> 128)) != scope.serial) return error.InvalidIngress;
         const binding = source.native_binding orelse return error.InvalidIngress;
         const record: *NativeBindingBacking = @ptrCast(@alignCast(binding));
@@ -1093,6 +1873,88 @@ pub const Domain = opaque {
         return result;
     }
 
+    const FeedbackReservation = struct { source: *EndpointEntry, target: *EndpointEntry, kind: FeedbackKind, cost: u16, source_next: FeedbackWindow, target_next: FeedbackWindow };
+
+    fn feedbackPauseIo(pause: *runtime_pause.Pause) ?std.Io {
+        lock(&pause.mutex);
+        defer pause.mutex.unlock();
+        return pause.io;
+    }
+
+    fn feedbackNow(source: *Backing) i64 {
+        if (builtin.is_test) if (source.test_feedback_now_ms) |now| return now;
+        // Both owner bindings live under this Domain cut. Pause never calls
+        // back into Domain while holding its mutex; prepare/capture take the
+        // pause and Domain cuts sequentially rather than in reverse order.
+        var selected: ?std.Io = null;
+        if (source.native_binding) |binding| {
+            const record: *NativeBindingBacking = @ptrCast(@alignCast(binding));
+            selected = feedbackPauseIo(&record.owner.runtime.pause);
+        }
+        if (source.webrtc_binding) |binding| {
+            const record: *WebrtcBindingBacking = @ptrCast(@alignCast(binding));
+            if (feedbackPauseIo(&record.owner.runtime.pause)) |io| {
+                if (selected) |prior| {
+                    if (prior.userdata != io.userdata or prior.vtable != io.vtable) return 0;
+                } else selected = io;
+            }
+        }
+        const io = selected orelse return 0;
+        if (source.feedback_clock_io) |prior| {
+            if (prior.userdata != io.userdata or prior.vtable != io.vtable) return 0;
+        } else {
+            const resolution = std.Io.Clock.awake.resolution(io) catch return 0;
+            if (resolution.nanoseconds <= 0) return 0;
+            source.feedback_clock_io = io;
+        }
+        const nanos = std.Io.Clock.awake.now(io).nanoseconds;
+        if (nanos <= 0) return 0;
+        return std.math.cast(i64, @divTrunc(nanos, 1_000_000)) orelse 0;
+    }
+
+    fn nextFeedbackWindow(window: FeedbackWindow, now: i64, limit: u16, cost: u16) Error!FeedbackWindow {
+        if (now <= 0 or (window.used != 0 and now < window.started_ms)) return error.FeedbackClockUnavailable;
+        if (cost == 0) return error.InvalidRequest;
+        var next = window;
+        if (next.used == 0 or now - next.started_ms >= feedback_window_ms) next = .{ .started_ms = now };
+        if (next.used > limit or cost > limit - next.used) return error.FeedbackRateLimited;
+        next.used += cost;
+        return next;
+    }
+
+    fn previewFeedback(self: *Domain, scope: *const Locked, from: EndpointStamp, target: EndpointStamp, kind: FeedbackKind, cost: u16) Error!FeedbackReservation {
+        _ = try self.requireCurrentLocked(scope, from);
+        _ = try self.requireCurrentLocked(scope, target);
+        const source = backing(self);
+        const from_row = source.endpoints.getPtr(.{ .call = from.endpoint.call, .client = from.offering_client, .leg = from.endpoint.leg }) orelse return error.InvalidIdentity;
+        const target_row = source.endpoints.getPtr(.{ .call = target.endpoint.call, .client = target.offering_client, .leg = target.endpoint.leg }) orelse return error.InvalidIdentity;
+        const now = feedbackNow(source);
+        const source_window, const target_window, const source_limit, const target_limit = switch (kind) {
+            .keyframe => .{ from_row.feedback_source, target_row.feedback_publisher, feedback_source_limit, feedback_publisher_limit },
+            .nack => .{ from_row.nack_source, target_row.nack_publisher, nack_source_limit, nack_publisher_limit },
+        };
+        return .{ .source = from_row, .target = target_row, .kind = kind, .cost = cost, .source_next = try nextFeedbackWindow(source_window, now, source_limit, cost), .target_next = try nextFeedbackWindow(target_window, now, target_limit, cost) };
+    }
+
+    fn commitFeedback(reservation: FeedbackReservation, accepted: u16) void {
+        std.debug.assert(accepted <= reservation.cost);
+        if (accepted == 0) return;
+        var source_next = reservation.source_next;
+        var target_next = reservation.target_next;
+        source_next.used -= reservation.cost - accepted;
+        target_next.used -= reservation.cost - accepted;
+        switch (reservation.kind) {
+            .keyframe => {
+                reservation.source.feedback_source = source_next;
+                reservation.target.feedback_publisher = target_next;
+            },
+            .nack => {
+                reservation.source.nack_source = source_next;
+                reservation.target.nack_publisher = target_next;
+            },
+        }
+    }
+
     pub fn fanoutNativeFeedbackLocked(self: *Domain, scope: *const Locked, handle: IngressHandle) !FanoutResult {
         const frame = try self.resolveNativeIngressLocked(scope, handle);
         if (frame.content != .feedback) return error.InvalidIngress;
@@ -1107,7 +1969,15 @@ pub const Domain = opaque {
             const target = entry.observation;
             if (target.stream_id != selected or entry.retiring) continue;
             if (!std.meta.eql(target.stamp.endpoint.call, frame.source.endpoint.call) or target.stamp.offering_client.eql(frame.source.offering_client)) return error.RouteDenied;
+            const kind: ?FeedbackKind = switch (frame.bytes[0]) {
+                1 => .nack,
+                2 => .keyframe,
+                else => null,
+            };
+            const cost: u16 = if (kind == .nack) std.mem.readInt(u16, frame.bytes[5..7], .big) else 1;
+            const budget = if (kind) |actual| self.previewFeedback(scope, frame.source, target.stamp, actual, cost) catch |err| return .{ .recognized = true, .refused = 1, .last_refusal = err } else null;
             _ = queue_owner.owner.enqueueNativeFeedbackLocked(self, scope, handle, target.stamp) catch |err| return .{ .recognized = true, .refused = 1, .last_refusal = err };
+            if (budget) |reservation| commitFeedback(reservation, cost);
             return .{ .recognized = true, .accepted = 1 };
         }
         return error.RouteDenied;
@@ -1275,35 +2145,62 @@ pub const Domain = opaque {
         defer source.active_scope = null;
         const frame = try self.resolveWebrtcCanonicalLocked(scope, owner, ordinal);
         if (frame.kind == .rtcp) {
-            var seqs: [64]u16 = undefined;
-            const feedback = try webrtc_owner.MediaPlane.parseRoutingFeedback(frame.bytes, &seqs);
-            const selected: ?u32 = switch (feedback) {
-                .nack => |value| value.media_ssrc,
-                .keyframe_request => |value| value.media_ssrc,
-                .other => null,
-            };
-            if (selected) |ssrc| {
-                // Native RTP bridge SSRC is the actual issued publisher stream.
-                // Resolve only a real current native row, never a missing-map
-                // all-target fallback or recipient-derived publisher identity.
+            const parsed = try webrtc_owner.MediaPlane.parseRoutingActions(frame.bytes);
+            var targets: [8]EndpointStamp = undefined;
+            // Complete all authority checks before the first output. The pin
+            // and Domain lock keep the selected full-generation rows stable.
+            for (parsed.actions[0..parsed.count], 0..) |action, index| {
+                var selected: ?EndpointStamp = null;
                 var publishers = source.endpoints.valueIterator();
                 while (publishers.next()) |entry| {
                     const target = entry.observation;
-                    if (target.stamp.endpoint.leg != .native or target.stream_id != ssrc or entry.retiring) continue;
+                    if (target.stamp.endpoint.leg != .native or target.stream_id != action.ssrc or entry.retiring) continue;
                     if (!std.meta.eql(target.stamp.endpoint.call, frame.source.endpoint.call) or target.stamp.offering_client.eql(frame.source.offering_client)) return error.RouteDenied;
-                    _ = owner.enqueueWebrtcFeedbackLocked(self, scope, ordinal, target.stamp) catch |err| return .{ .recognized = true, .refused = 1, .last_refusal = err };
-                    return .{ .recognized = true, .accepted = 1 };
+                    selected = target.stamp;
+                    break;
                 }
-                const publisher = try owner.routingPublisherForFeedbackLocked(self, scope, ordinal, ssrc);
-                switch (feedback) {
-                    .nack => return owner.enqueueRoutingNackLocked(self, scope, ordinal),
-                    .keyframe_request => {
-                        _ = owner.enqueueWebrtcFeedbackLocked(self, scope, ordinal, publisher) catch |err| return .{ .recognized = true, .refused = 1, .last_refusal = err };
-                        return .{ .recognized = true, .accepted = 1 };
-                    },
-                    .other => unreachable,
+                targets[index] = selected orelse try owner.routingPublisherForFeedbackLocked(self, scope, ordinal, action.ssrc);
+                try owner.validateRoutingActionTargetLocked(self, scope, ordinal, index, targets[index]);
+            }
+            var result = FanoutResult{ .recognized = true };
+            for (parsed.actions[0..parsed.count], 0..) |action, index| {
+                const kind: FeedbackKind = if (action.kind == .keyframe) .keyframe else .nack;
+                const cost: u16 = if (kind == .keyframe) 1 else @intCast(action.count);
+                const budget = self.previewFeedback(scope, frame.source, targets[index], kind, cost) catch |err| {
+                    result.refused += 1;
+                    result.last_refusal = err;
+                    continue;
+                };
+                if (kind == .nack and targets[index].endpoint.leg == .webrtc) {
+                    const local = try owner.enqueueRoutingNackLocked(self, scope, ordinal, index, targets[index]);
+                    commitFeedback(budget, @intCast(local.accepted));
+                    result.accepted += local.accepted;
+                    result.refused += local.refused;
+                    if (local.last_refusal) |err| result.last_refusal = err;
+                } else {
+                    _ = owner.enqueueWebrtcFeedbackLocked(self, scope, ordinal, index, targets[index]) catch |err| {
+                        result.refused += 1;
+                        result.last_refusal = err;
+                        continue;
+                    };
+                    commitFeedback(budget, cost);
+                    result.accepted += 1;
                 }
             }
+            for (0..parsed.plain_count) |index| {
+                var recipients = source.endpoints.valueIterator();
+                while (recipients.next()) |entry| {
+                    const target = entry.observation;
+                    if (entry.retiring or !std.meta.eql(target.stamp.endpoint.call, frame.source.endpoint.call) or target.stamp.offering_client.eql(frame.source.offering_client)) continue;
+                    _ = owner.enqueueRoutingPlainLocked(self, scope, ordinal, index, target.stamp) catch |err| {
+                        result.refused += 1;
+                        result.last_refusal = err;
+                        continue;
+                    };
+                    result.accepted += 1;
+                }
+            }
+            return result;
         }
         var result = FanoutResult{ .recognized = true };
         var targets = source.endpoints.valueIterator();
@@ -1468,6 +2365,7 @@ pub const Domain = opaque {
         plan.* = .{ .source = source, .facts = facts };
         errdefer source.allocator.destroy(plan);
         errdefer {
+            if (plan.retirement_growth) |*growth| growth.deinit(source.allocator);
             if (plan.calls) |*map| map.deinit();
             if (plan.endpoints) |*map| map.deinit();
         }
@@ -1481,6 +2379,7 @@ pub const Domain = opaque {
             plan.endpoints = EndpointMap.init(source.allocator);
             try plan.endpoints.?.ensureTotalCapacity(facts.endpoints_required);
         }
+        plan.retirement_growth = try prepareRetirementGrowth(source.allocator, facts.retirement_capacity, facts.retirement_required);
         return @ptrCast(plan);
     }
 
@@ -1509,6 +2408,7 @@ pub const Domain = opaque {
         plan.* = .{ .source = source, .facts = facts };
         errdefer source.allocator.destroy(plan);
         errdefer {
+            if (plan.retirement_growth) |*growth| growth.deinit(source.allocator);
             if (plan.calls) |*map| map.deinit();
             if (plan.memberships) |*map| map.deinit();
         }
@@ -1520,6 +2420,7 @@ pub const Domain = opaque {
             plan.memberships = MembershipMap.init(source.allocator);
             try plan.memberships.?.ensureTotalCapacity(facts.memberships_required);
         }
+        plan.retirement_growth = try prepareRetirementGrowth(source.allocator, facts.retirement_capacity, facts.retirement_required);
         return @ptrCast(plan);
     }
 
@@ -1528,6 +2429,8 @@ pub const Domain = opaque {
         try self.requireNoActiveIngressLocked(token);
         const source = backing(self);
         if (call.domain.serial != source.id.serial or owner.isNone()) return error.InvalidIdentity;
+        if (scopeHasTickets(source, call, owner)) return error.Busy;
+        const retirement_index = scopeSlot(source, call, owner);
         const key = MembershipKey{ .call = call, .client = owner };
         if (!source.memberships.contains(key)) return;
         const next_revision = try checkedNext(u64, source.revision, 1);
@@ -1544,6 +2447,7 @@ pub const Domain = opaque {
         row.memberships -= 1;
         if (row.offers == 0 and row.memberships == 0) _ = source.calls.remove(channel);
         source.revision = next_revision;
+        releaseEmptyScope(source, call, owner, retirement_index);
     }
 
     /// Allocate the exact physical departure before the final routing cut.
@@ -1556,12 +2460,23 @@ pub const Domain = opaque {
             source.mutex.unlock();
             return error.Busy;
         }
+        if (scopeHasTickets(source, call, owner)) {
+            source.mutex.unlock();
+            return error.Busy;
+        }
         var found: ?struct { channel: ChannelKey, row: CallRow } = null;
-        var it = source.calls.iterator();
-        while (it.next()) |entry| if (std.meta.eql(entry.value_ptr.id, call)) {
-            found = .{ .channel = entry.key_ptr.*, .row = entry.value_ptr.* };
-            break;
-        };
+        if (scopeSlot(source, call, owner)) |index| {
+            const channel = source.retirement_slots[index].intent.channel;
+            if (source.calls.get(channel)) |row| {
+                if (std.meta.eql(row.id, call)) found = .{ .channel = channel, .row = row };
+            }
+        } else {
+            var it = source.calls.iterator();
+            while (it.next()) |entry| if (std.meta.eql(entry.value_ptr.id, call)) {
+                found = .{ .channel = entry.key_ptr.*, .row = entry.value_ptr.* };
+                break;
+            };
+        }
         const actual = found orelse {
             source.mutex.unlock();
             return error.EndpointUnavailable;
@@ -1627,6 +2542,10 @@ pub const Domain = opaque {
             source.mutex.unlock();
             return error.Busy;
         }
+        if (ownerHasTickets(source, owner)) {
+            source.mutex.unlock();
+            return error.Busy;
+        }
         var count: usize = 0;
         var calls = source.calls.valueIterator();
         while (calls.next()) |row| if (clientOwnsCall(source, row.id, owner)) {
@@ -1669,6 +2588,7 @@ pub const Domain = opaque {
             parts[n] = .{ .source = source, .facts = facts, .terminal = terminal, .batch_parent = batch };
             n += 1;
         };
+        if (ownerHasTickets(source, owner)) return error.Busy;
         if (n != count) return error.StaleCandidate;
         // Canonical order is independent of table geometry and probe order.
         std.mem.sort(DepartureBacking, parts, {}, struct {
@@ -1693,6 +2613,8 @@ pub const Domain = opaque {
         try self.requireNoActiveIngressLocked(token);
         const source = backing(self);
         if (call.domain.serial != source.id.serial or owner.isNone()) return error.InvalidIdentity;
+        if (scopeHasTickets(source, call, owner)) return error.Busy;
+        const retirement_index = scopeSlot(source, call, owner);
         var removed: u32 = 0;
         for ([_]Leg{ .native, .webrtc }) |leg| {
             if (source.endpoints.contains(.{ .call = call, .client = owner, .leg = leg })) removed += 1;
@@ -1718,6 +2640,7 @@ pub const Domain = opaque {
         row.offers -= removed;
         if (row.offers == 0 and row.memberships == 0) _ = source.calls.remove(actual_key);
         source.revision = next_revision;
+        releaseEmptyScope(source, call, owner, retirement_index);
     }
 };
 
@@ -1732,9 +2655,9 @@ fn membershipBits(source: *Backing, key: MembershipKey) ?u8 {
 }
 fn clientRetiring(source: *Backing, client_id: ClientId) bool {
     var endpoints = source.endpoints.iterator();
-    while (endpoints.next()) |entry| if (entry.key_ptr.client.eql(client_id) and entry.value_ptr.retiring) return true;
+    while (endpoints.next()) |entry| if (entry.key_ptr.client.eql(client_id) and entry.value_ptr.client_retiring) return true;
     var memberships = source.memberships.iterator();
-    while (memberships.next()) |entry| if (entry.key_ptr.client.eql(client_id) and entry.value_ptr.retiring) return true;
+    while (memberships.next()) |entry| if (entry.key_ptr.client.eql(client_id) and entry.value_ptr.client_retiring) return true;
     return false;
 }
 
@@ -1758,15 +2681,19 @@ const Capture = struct {
     endpoints_required: u32,
     grow_calls: bool,
     grow_endpoints: bool,
+    retirement_capacity: usize = 0,
+    retirement_required: usize = 0,
 };
 fn capture(source: *Backing, key: ChannelKey, owner: ClientId, legs: []const OfferLeg) Error!Capture {
     if (clientRetiring(source, owner)) return error.Closing;
     _ = try checkedNext(u64, source.revision, 1);
     const call_row = source.calls.get(key);
     const call = if (call_row) |row| row.id else CallId{ .domain = source.id, .serial = source.next_call };
+    try requireScopeAdmission(source, call, owner);
     _ = try checkedNext(u64, source.next_call, if (call_row == null) 1 else 0);
     _ = try checkedNext(u64, source.next_endpoint, @intCast(legs.len));
     _ = try checkedNext(u32, source.next_stream, @intCast(legs.len));
+    if (source.publication_index.contains(key)) return error.Closing;
     var facts = Capture{ .channel = key, .owner = owner, .revision = source.revision, .next_call = source.next_call, .next_endpoint = source.next_endpoint, .next_stream = source.next_stream, .new_call = call_row == null, .preview = .{ .call = call, .endpoints = @splat(std.mem.zeroes(EndpointObservation)), .count = @intCast(legs.len) }, .calls_required = source.calls.count(), .endpoints_required = source.endpoints.count(), .grow_calls = false, .grow_endpoints = false };
     if (call_row == null) facts.calls_required = std.math.add(u32, facts.calls_required, 1) catch return error.SequenceExhausted;
     for (legs, 0..) |leg, i| {
@@ -1778,6 +2705,8 @@ fn capture(source: *Backing, key: ChannelKey, owner: ClientId, legs: []const Off
     // Counts may legitimately be zero after JOIN or the last offer retirement.
     // Identity/revision/stream issuers retain checkedNext's nonzero rule.
     if (call_row) |row| _ = std.math.add(u32, row.offers, facts.endpoints_required - source.endpoints.count()) catch return error.SequenceExhausted;
+    facts.retirement_capacity = source.retirement_slots.len;
+    facts.retirement_required = try retirementRequired(source, @as(usize, facts.endpoints_required) + source.memberships.count());
     facts.grow_calls = facts.calls_required - source.calls.count() > source.calls.unmanaged.available;
     facts.grow_endpoints = facts.endpoints_required - source.endpoints.count() > source.endpoints.unmanaged.available;
     return facts;
@@ -1793,6 +2722,7 @@ const OfferBacking = struct {
     facts: Capture,
     calls: ?CallMap = null,
     endpoints: ?EndpointMap = null,
+    retirement_growth: ?RetirementGrowth = null,
     validated_scope: u64 = 0,
     committed: bool = false,
 };
@@ -1812,6 +2742,7 @@ pub const PreparedOffers = opaque {
         const scope = try domain.requireScope(token);
         const plan = offerBacking(self);
         if (clientRetiring(source, plan.facts.owner)) return error.Closing;
+        try requireScopeAdmission(source, plan.facts.preview.call, plan.facts.owner);
         if (plan.source != source or plan.committed or source.revision != plan.facts.revision or source.next_call != plan.facts.next_call or source.next_endpoint != plan.facts.next_endpoint or source.next_stream != plan.facts.next_stream) return error.StaleCandidate;
         for (plan.facts.preview.endpoints[0..plan.facts.preview.count], 0..) |row, i| {
             const current = endpointObservation(source, .{ .call = row.reference.endpoint.call, .client = row.reference.offering_client, .leg = row.reference.endpoint.leg });
@@ -1854,6 +2785,7 @@ pub const PreparedOffers = opaque {
         const source = backing(domain);
         const scope = domain.requireScope(token) catch @panic("invalid media publication scope");
         std.debug.assert(plan.source == source and !plan.committed and plan.validated_scope == scope.serial and source.revision == plan.facts.revision);
+        publishRetirementGrowth(source, &plan.retirement_growth);
         if (plan.calls) |*replacement| {
             var it = source.calls.iterator();
             while (it.next()) |entry| replacement.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
@@ -1867,7 +2799,16 @@ pub const PreparedOffers = opaque {
         if (plan.facts.new_call) source.calls.putAssumeCapacity(plan.facts.channel, .{ .id = plan.facts.preview.call });
         const call = source.calls.getPtr(plan.facts.channel).?;
         for (plan.facts.preview.endpoints[0..plan.facts.preview.count], 0..) |row, i| {
-            source.endpoints.putAssumeCapacity(.{ .call = row.reference.endpoint.call, .client = row.reference.offering_client, .leg = row.reference.endpoint.leg }, .{ .observation = row });
+            const key: EndpointKey = .{ .call = row.reference.endpoint.call, .client = row.reference.offering_client, .leg = row.reference.endpoint.leg };
+            var entry: EndpointEntry = .{ .observation = row };
+            if (source.endpoints.get(key)) |prior| {
+                // Re-offering the same physical endpoint cannot reset quotas.
+                entry.feedback_source = prior.feedback_source;
+                entry.feedback_publisher = prior.feedback_publisher;
+                entry.nack_source = prior.nack_source;
+                entry.nack_publisher = prior.nack_publisher;
+            }
+            source.endpoints.putAssumeCapacity(key, entry);
             if (plan.facts.old[i] == null) call.offers += 1;
         }
         source.next_call += if (plan.facts.new_call) @as(u64, 1) else 0;
@@ -1882,6 +2823,7 @@ pub const PreparedOffers = opaque {
     pub fn deinit(self: *PreparedOffers) void {
         const plan = offerBacking(self);
         const source = plan.source;
+        if (plan.retirement_growth) |*growth| growth.deinit(source.allocator);
         if (plan.calls) |*map| map.deinit();
         if (plan.endpoints) |*map| map.deinit();
         source.allocator.destroy(plan);
@@ -2010,24 +2952,33 @@ const MembershipCapture = struct {
     memberships_required: u32,
     grow_calls: bool,
     grow_memberships: bool,
+    retirement_capacity: usize = 0,
+    retirement_required: usize = 0,
 };
+fn retirementRequired(source: *Backing, graph_rows: usize) Error!usize {
+    const retained = std.math.add(usize, source.publication_count, source.legacy_credits) catch return error.SequenceExhausted;
+    return std.math.add(usize, graph_rows, retained) catch error.SequenceExhausted;
+}
 fn captureMembership(source: *Backing, channel: ChannelKey, owner: ClientId, bits: u8) Error!MembershipCapture {
+    if (source.publication_index.contains(channel)) return error.Closing;
     if (clientRetiring(source, owner)) return error.Closing;
     _ = try checkedNext(u64, source.revision, 1);
     const old_call = source.calls.get(channel);
     const call = if (old_call) |row| row.id else CallId{ .domain = source.id, .serial = source.next_call };
+    try requireScopeAdmission(source, call, owner);
     _ = try checkedNext(u64, source.next_call, if (old_call == null) 1 else 0);
     const old = membershipBits(source, .{ .call = call, .client = owner });
     if (old == null and old_call != null and old_call.?.memberships == std.math.maxInt(u32)) return error.SequenceExhausted;
     const calls_required = std.math.add(u32, source.calls.count(), if (old_call == null) 1 else 0) catch return error.SequenceExhausted;
     const memberships_required = std.math.add(u32, source.memberships.count(), if (old == null) 1 else 0) catch return error.SequenceExhausted;
-    return .{ .channel = channel, .revision = source.revision, .next_call = source.next_call, .new_call = old_call == null, .old = old, .preview = .{ .call = call, .client = owner, .kind_bits = (old orelse 0) | bits }, .calls_required = calls_required, .memberships_required = memberships_required, .grow_calls = calls_required - source.calls.count() > source.calls.unmanaged.available, .grow_memberships = memberships_required - source.memberships.count() > source.memberships.unmanaged.available };
+    return .{ .channel = channel, .revision = source.revision, .next_call = source.next_call, .new_call = old_call == null, .old = old, .preview = .{ .call = call, .client = owner, .kind_bits = (old orelse 0) | bits }, .calls_required = calls_required, .memberships_required = memberships_required, .grow_calls = calls_required - source.calls.count() > source.calls.unmanaged.available, .grow_memberships = memberships_required - source.memberships.count() > source.memberships.unmanaged.available, .retirement_capacity = source.retirement_slots.len, .retirement_required = try retirementRequired(source, @as(usize, memberships_required) + source.endpoints.count()) };
 }
 const MembershipBacking = struct {
     source: *Backing,
     facts: MembershipCapture,
     calls: ?CallMap = null,
     memberships: ?MembershipMap = null,
+    retirement_growth: ?RetirementGrowth = null,
     validated_scope: u64 = 0,
     committed: bool = false,
 };
@@ -2044,6 +2995,7 @@ pub const PreparedMembership = opaque {
         const plan = membershipBacking(self);
         const source = backing(domain);
         if (clientRetiring(source, plan.facts.preview.client)) return error.Closing;
+        try requireScopeAdmission(source, plan.facts.preview.call, plan.facts.preview.client);
         if (plan.source != source or plan.committed or source.revision != plan.facts.revision or source.next_call != plan.facts.next_call) return error.StaleCandidate;
         if (!std.meta.eql(plan.facts.old, membershipBits(source, .{ .call = plan.facts.preview.call, .client = plan.facts.preview.client }))) return error.StaleCandidate;
         plan.validated_scope = scope.serial;
@@ -2057,6 +3009,7 @@ pub const PreparedMembership = opaque {
         const source = backing(domain);
         const scope = domain.requireScope(token) catch @panic("invalid membership publication scope");
         std.debug.assert(plan.source == source and !plan.committed and plan.validated_scope == scope.serial and source.revision == plan.facts.revision);
+        publishRetirementGrowth(source, &plan.retirement_growth);
         if (plan.calls) |*replacement| {
             var it = source.calls.iterator();
             while (it.next()) |entry| replacement.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
@@ -2077,6 +3030,7 @@ pub const PreparedMembership = opaque {
     pub fn deinit(self: *PreparedMembership) void {
         const plan = membershipBacking(self);
         const source = plan.source;
+        if (plan.retirement_growth) |*growth| growth.deinit(source.allocator);
         if (plan.calls) |*map| map.deinit();
         if (plan.memberships) |*map| map.deinit();
         source.allocator.destroy(plan);
@@ -2158,7 +3112,7 @@ const DepartureCapture = struct {
     offers: [2]?EndpointObservation = .{ null, null },
     removed_offers: u32 = 0,
 };
-const DepartureBacking = struct { source: *Backing, facts: DepartureCapture, terminal: bool, batch_parent: ?*ClientDepartureBacking = null, validated_scope: u64 = 0, committed: bool = false };
+const DepartureBacking = struct { source: *Backing, facts: DepartureCapture, terminal: bool, batch_parent: ?*ClientDepartureBacking = null, publication: ?RetirementPublication = null, validated_scope: u64 = 0, committed: bool = false };
 fn departureBacking(plan: *PreparedDeparture) *DepartureBacking {
     return @ptrCast(@alignCast(plan));
 }
@@ -2178,6 +3132,17 @@ pub const PreparedDeparture = opaque {
         try self.validateLocked(domain, token);
         if (!std.meta.eql(try ChannelKey.init(channel_name), departureBacking(self).facts.channel)) return error.InvalidIdentity;
     }
+    /// Payload is already owned/bounded. Caller stages it before any joined
+    /// leaf commit; a live funded fence credit must exist for this exact scope.
+    pub fn setPublicationLocked(self: *PreparedDeparture, domain: *Domain, token: *const Locked, publication: RetirementPublication) Error!void {
+        try self.validateLocked(domain, token);
+        try publication.validate();
+        const plan = departureBacking(self);
+        if (!std.meta.eql(try ChannelKey.init(publication.channelSlice()), plan.facts.channel)) return error.InvalidIdentity;
+        const index = scopeSlot(plan.source, plan.facts.call.id, plan.facts.owner) orelse return error.InvalidScope;
+        if (plan.source.retirement_slots[index].state != .pending) return error.InvalidScope;
+        plan.publication = publication;
+    }
     pub fn ownerKey(self: *PreparedDeparture, leg: Leg) EndpointKey {
         const facts = departureBacking(self).facts;
         return .{ .call = facts.call.id, .client = facts.owner, .leg = leg };
@@ -2187,7 +3152,7 @@ pub const PreparedDeparture = opaque {
         if (!std.meta.eql(self.ownerKey(key.leg), key)) return error.InvalidIdentity;
     }
     pub fn expectedOffer(self: *PreparedDeparture, leg: Leg) ?EndpointObservation {
-        return departureBacking(self).facts.offers[@intFromEnum(leg)];
+        return departureBacking(self).facts.offers[@backingInt(leg)];
     }
     pub fn removesCall(self: *PreparedDeparture) bool {
         const facts = departureBacking(self).facts;
@@ -2198,6 +3163,7 @@ pub const PreparedDeparture = opaque {
         const scope = try domain.requireScope(token);
         const plan = departureBacking(self);
         const source = backing(domain);
+        if (scopeHasTickets(source, plan.facts.call.id, plan.facts.owner)) return error.Busy;
         if (plan.source != source or plan.committed or plan.terminal != source.closing or source.revision != plan.facts.revision or !std.meta.eql(source.calls.get(plan.facts.channel), @as(?CallRow, plan.facts.call))) return error.StaleCandidate;
         if (!std.meta.eql(plan.facts.membership, membershipBits(source, .{ .call = plan.facts.call.id, .client = plan.facts.owner }))) return error.StaleCandidate;
         for ([_]Leg{ .native, .webrtc }, 0..) |leg, n| {
@@ -2557,6 +3523,12 @@ fn graphRestoreAllocationSweep(allocator: std.mem.Allocator) !void {
         try graph.validate();
         return err;
     };
+    try std.testing.expect(candidate.source.retirement_slots.len >= graph.endpoints.len + graph.memberships.len);
+    try std.testing.expectEqual(@as(usize, 0), candidate.source.pending_retirements);
+    try std.testing.expectEqual(@as(usize, 0), candidate.source.reserved_retirements);
+    for (candidate.source.retirement_slots) |slot| {
+        try std.testing.expect(slot.state == .free and slot.refs == 0 and slot.generation == 0);
+    }
     candidate.deinit();
     try std.testing.expect(native.routing_domain == null and webrtc.routing_domain == null);
     try graph.validate();
@@ -2660,6 +3632,15 @@ fn clientOwnsCall(source: *Backing, call: CallId, owner: ClientId) bool {
 }
 fn publishDeparture(source: *Backing, plan: *DepartureBacking, advance: bool) void {
     if (plan.facts.removed_offers == 0 and plan.facts.membership == null) return;
+    var retirement_index = scopeSlot(source, plan.facts.call.id, plan.facts.owner);
+    // Whole-process teardown can reclaim an UNUSED derived legacy credit;
+    // accepted lifecycle work was refused by the outer terminal preflight.
+    if (retirement_index == null and plan.terminal) {
+        if (source.retirement_index.get(.{ .channel = plan.facts.channel, .client = plan.facts.owner })) |index| {
+            if (source.retirement_slots[index].state == .funded) retirement_index = index;
+        }
+    }
+    if (plan.publication) |publication| source.retirement_slots[retirement_index.?].publication = publication;
     for ([_]Leg{ .native, .webrtc }, 0..) |leg, i| {
         const key: EndpointKey = .{ .call = plan.facts.call.id, .client = plan.facts.owner, .leg = leg };
         removeBridgePolicy(source, key, plan.facts.offers[i]);
@@ -2671,6 +3652,7 @@ fn publishDeparture(source: *Backing, plan: *DepartureBacking, advance: bool) vo
     row.memberships -= if (plan.facts.membership != null) @as(u32, 1) else 0;
     if (row.offers == 0 and row.memberships == 0) _ = source.calls.remove(plan.facts.channel) else source.calls.getPtr(plan.facts.channel).?.* = row;
     if (advance and !plan.terminal) source.revision += 1;
+    releaseEmptyScope(source, plan.facts.call.id, plan.facts.owner, retirement_index);
 }
 const ClientDepartureBacking = struct {
     source: *Backing,
@@ -2700,6 +3682,7 @@ pub const PreparedClientDeparture = opaque {
         const plan = clientDeparture(self);
         if (index >= plan.parts.len or expected != self.part(index) or departureBacking(expected).batch_parent != plan) return error.InvalidIdentity;
         const source = backing(domain);
+        if (ownerHasTickets(source, plan.owner)) return error.Busy;
         if (plan.source != source or plan.committed or plan.revision != source.revision or plan.terminal != source.closing) return error.StaleCandidate;
         try expected.validateLocked(domain, scope);
     }
@@ -3215,4 +4198,618 @@ test "media routing lexical result preserves narrow callback payload and all sou
     try std.testing.expectEqual(@as(usize, 3), calls);
     try std.testing.expectError(error.CallbackRefused, domain.withTerminalLocked(Narrow{ .calls = &calls, .refuse = true }, Narrow.run));
     try std.testing.expectEqual(@as(usize, 4), calls);
+}
+
+fn scopedMembershipTest(domain: *Domain, name: []const u8, owner: ClientId) !CallId {
+    const plan = try domain.prepareMembership(name, owner, 1);
+    defer plan.deinit();
+    try domain.withLocked(MembershipPublish{ .domain = domain, .plan = plan }, MembershipPublish.run);
+    return plan.preview().call;
+}
+fn scopedOffersTest(domain: *Domain, name: []const u8, owner: ClientId) !OfferPreview {
+    const plan = try domain.prepareOffers(name, owner, &.{ .{ .leg = .native, .mode = .legacy_group }, .{ .leg = .webrtc, .mode = .legacy_group } });
+    defer plan.deinit();
+    try domain.withLocked(PublishContext{ .domain = domain, .plan = plan }, publishForTest);
+    return plan.preview();
+}
+fn scopedCleanupTest(domain: *Domain) void {
+    domain.closeForTerminal() catch @panic("scoped test retained a live reservation");
+    const Cleanup = struct {
+        fn run(scope: *Locked, actual: *Domain) !void {
+            const source = backing(actual);
+            while (source.endpoints.count() != 0) {
+                var entries = source.endpoints.keyIterator();
+                const key = entries.next().?.*;
+                try actual.revokeOffersLocked(scope, key.call, key.client);
+            }
+            while (source.memberships.count() != 0) {
+                var entries = source.memberships.keyIterator();
+                const key = entries.next().?.*;
+                try actual.revokeMembershipLocked(scope, key.call, key.client);
+            }
+        }
+    };
+    domain.withTerminalLocked(domain, Cleanup.run) catch @panic("scoped source cleanup failed");
+}
+
+test "media routing scoped retirement batch abort restores admission and commit denies only exact call" {
+    const domain = try Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("scoped batch retained Domain");
+    defer scopedCleanupTest(domain);
+    const owner = ClientId{ .shard = 0, .slot = 0, .gen = 1 };
+    const sibling = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    _ = try scopedMembershipTest(domain, "#selected", owner);
+    const selected = try scopedOffersTest(domain, "#selected", owner);
+    _ = try scopedMembershipTest(domain, "#other", owner);
+    const other = try scopedOffersTest(domain, "#other", owner);
+    _ = try scopedMembershipTest(domain, "#selected", sibling);
+    var first = try domain.prepareChannelRetirement("#selected", owner);
+    defer first.deinit();
+    var second = try domain.prepareChannelRetirement("#other", owner);
+    defer second.deinit();
+    try std.testing.expect(!try domain.channelRetiring("#selected", owner));
+    try std.testing.expect(try domain.hasCurrentMembership("#selected", owner));
+    try std.testing.expectError(error.Busy, domain.prepareOffers("#selected", owner, &.{.{ .leg = .native, .mode = .legacy_group }}));
+    try std.testing.expectError(error.Busy, domain.prepareChannelDeparture("#selected", owner));
+    try std.testing.expectError(error.Busy, domain.prepareClientDeparture(owner));
+    first.deinit();
+    second.deinit();
+    try std.testing.expect(!domain.hasPendingChannelRetirements());
+    {
+        const retry = try domain.prepareOffers("#selected", owner, &.{.{ .leg = .native, .mode = .legacy_group }});
+        retry.deinit();
+    }
+    const stale = try domain.prepareOffers("#selected", owner, &.{.{ .leg = .native, .mode = .legacy_group }});
+    defer stale.deinit();
+    var commit = try domain.prepareChannelRetirement("#selected", owner);
+    defer commit.deinit();
+    try commit.validate();
+    commit.commit();
+    commit.deinit();
+    try std.testing.expect(try domain.channelRetiring("#selected", owner));
+    try std.testing.expect(!try domain.hasCurrentMembership("#selected", owner));
+    try std.testing.expect(try domain.hasCurrentMembership("#selected", sibling));
+    try std.testing.expect(!clientRetiring(backing(domain), owner));
+    try std.testing.expectError(error.Closing, domain.prepareMembership("#selected", owner, 1));
+    try std.testing.expectError(error.Closing, domain.withLocked(PublishContext{ .domain = domain, .plan = stale }, publishForTest));
+    const Check = struct {
+        domain: *Domain,
+        selected: EndpointStamp,
+        other: EndpointStamp,
+        fn run(scope: *Locked, ctx: @This()) !void {
+            try std.testing.expectError(error.EndpointUnavailable, ctx.domain.requireCurrentLocked(scope, ctx.selected));
+            _ = try ctx.domain.requireCurrentLocked(scope, ctx.other);
+        }
+    };
+    try domain.withLocked(Check{ .domain = domain, .selected = selected.endpoints[0].stamp, .other = other.endpoints[0].stamp }, Check.run);
+    _ = try scopedMembershipTest(domain, "#new-admission", owner);
+    var pending: [32]ChannelRetirementIntent = undefined;
+    try std.testing.expectEqual(@as(usize, 1), domain.pendingChannelRetirementsInto(&pending));
+    try std.testing.expectEqualDeep(selected.call, pending[0].call);
+    const departure = (try domain.prepareChannelDeparture("#selected", owner)).?;
+    defer departure.deinit();
+    try domain.withLocked(DepartureTestCut{ .domain = domain, .plan = departure }, DepartureTestCut.run);
+    try std.testing.expect(!domain.hasPendingChannelRetirements());
+    // A genuinely fresh source-issued membership/offer may be created only
+    // after actual cleanup invalidates OLD prepared facts by revision.
+    _ = try scopedMembershipTest(domain, "#selected", owner);
+    _ = try scopedOffersTest(domain, "#selected", owner);
+}
+
+test "media routing scoped reservation survives live credit growth and prevents leg or client recycling" {
+    const domain = try Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("scoped growth retained Domain");
+    defer scopedCleanupTest(domain);
+    const owner = ClientId{ .shard = 0, .slot = 0, .gen = 2 };
+    const call = try scopedMembershipTest(domain, "#growth", owner);
+    _ = try scopedOffersTest(domain, "#growth", owner);
+    var ticket = try domain.prepareChannelRetirement("#growth", owner);
+    defer ticket.deinit();
+    const old_index = ticket.ticket.?.index;
+    const old_generation = ticket.ticket.?.generation;
+    const old_capacity = backing(domain).retirement_slots.len;
+    for (0..20) |n| {
+        var name: [48]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&name, "#growth-{d}", .{n});
+        _ = try scopedMembershipTest(domain, channel, .{ .shard = 1, .slot = @intCast(n), .gen = 2 });
+    }
+    try std.testing.expect(backing(domain).retirement_slots.len > old_capacity);
+    try std.testing.expectEqual(old_index, ticket.ticket.?.index);
+    try std.testing.expectEqual(old_generation, ticket.ticket.?.generation);
+    try ticket.validate();
+    try std.testing.expectError(error.Busy, domain.withLocked(RevokeContext{ .domain = domain, .call = call, .owner = owner }, revokeForTest));
+    _ = try domain.fenceClientRetirement(owner); // full close can deny, never recycle a reserved credit
+    try std.testing.expectError(error.Busy, domain.prepareClientDeparture(owner));
+    ticket.commit();
+    ticket.deinit();
+    const index = scopeSlot(backing(domain), call, owner).?;
+    try domain.withLocked(RevokeContext{ .domain = domain, .call = call, .owner = owner }, revokeForTest);
+    try std.testing.expectEqual(index, scopeSlot(backing(domain), call, owner).?); // membership still owns intent
+    const departure = (try domain.prepareChannelDeparture("#growth", owner)).?;
+    defer departure.deinit();
+    try domain.withLocked(DepartureTestCut{ .domain = domain, .plan = departure }, DepartureTestCut.run);
+    try std.testing.expect(!domain.hasPendingChannelRetirements());
+    // A stale copy cannot claim the same recycled index's next generation.
+    const replacement = ClientId{ .shard = owner.shard, .slot = owner.slot, .gen = owner.gen + 1 };
+    _ = try scopedMembershipTest(domain, "#reuse", replacement);
+    var next = try domain.prepareChannelRetirement("#reuse", replacement);
+    defer next.deinit();
+    try std.testing.expectEqual(index, next.ticket.?.index);
+    try std.testing.expect(next.ticket.?.generation > old_generation);
+    var stale = PreparedChannelRetirement{ .ticket = .{ .source = backing(domain), .index = index, .generation = old_generation } };
+    try std.testing.expectError(error.StaleCandidate, stale.validate());
+    stale.commit();
+    stale.deinit();
+    try std.testing.expect(!try domain.channelRetiring("#reuse", replacement));
+}
+
+test "media routing scoped intents scale beyond 256 and enumeration has a 32 item budget" {
+    const domain = try Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("scoped scale retained Domain");
+    defer scopedCleanupTest(domain);
+    for (0..300) |n| {
+        const owner = ClientId{ .shard = 0, .slot = @intCast(n), .gen = 3 };
+        _ = try scopedMembershipTest(domain, "#broad", owner); // also funds WS-only membership credit
+    }
+    try std.testing.expect(backing(domain).retirement_slots.len >= 300);
+    for (0..300) |n| _ = try domain.fenceChannelRetirement("#broad", .{ .shard = 0, .slot = @intCast(n), .gen = 3 });
+    try std.testing.expectEqual(@as(usize, 300), backing(domain).pending_retirements);
+    var batch: [64]ChannelRetirementIntent = undefined;
+    var seen: [300]bool = @splat(false);
+    for (0..10) |_| {
+        const count = domain.pendingChannelRetirementsInto(&batch);
+        try std.testing.expectEqual(@as(usize, 32), count);
+        for (batch[0..count]) |intent| seen[intent.client.slot] = true;
+    }
+    try std.testing.expect(std.mem.allEqual(bool, &seen, true));
+    try std.testing.expect(!clientRetiring(backing(domain), .{ .shard = 0, .slot = 0, .gen = 3 }));
+    _ = try scopedMembershipTest(domain, "#fresh-call", .{ .shard = 0, .slot = 0, .gen = 3 });
+}
+
+fn scopedFundingAllocationSweep(allocator: std.mem.Allocator) !void {
+    const domain = try Domain.create(allocator);
+    defer domain.destroyQuiesced() catch @panic("scoped OOM retained Domain");
+    defer scopedCleanupTest(domain);
+    const owner = ClientId{ .shard = 0, .slot = 0, .gen = 4 };
+    const source = backing(domain);
+    const before_revision = source.revision;
+    const plan = domain.prepareMembership("#oom-credit", owner, 1) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(before_revision, source.revision);
+        try std.testing.expectEqual(@as(usize, 0), source.retirement_slots.len);
+        try std.testing.expectEqual(@as(usize, 0), source.pending_candidates);
+        try std.testing.expectEqual(@as(u32, 0), source.memberships.count());
+        return err;
+    };
+    defer plan.deinit();
+    try domain.withLocked(MembershipPublish{ .domain = domain, .plan = plan }, MembershipPublish.run);
+    try std.testing.expect(source.retirement_slots.len >= source.memberships.count());
+    var ticket = try domain.prepareChannelRetirement("#oom-credit", owner);
+    defer ticket.deinit();
+    try ticket.validate();
+    ticket.commit();
+    ticket.deinit();
+    try std.testing.expect(try domain.channelRetiring("#oom-credit", owner));
+}
+
+test "media routing scoped credit funding all allocation failures rollback before publication" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, scopedFundingAllocationSweep, .{});
+}
+
+test "media routing scoped generation exhaustion is atomic and denial needs no routing issuer" {
+    const domain = try Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("scoped exhaustion retained Domain");
+    defer scopedCleanupTest(domain);
+    const owner = ClientId{ .shard = 0, .slot = 0, .gen = 5 };
+    _ = try scopedMembershipTest(domain, "#exhausted", owner);
+    const source = backing(domain);
+    const index = source.free_retirement.?;
+    source.retirement_slots[index].generation = std.math.maxInt(u64);
+    const before_candidates = source.pending_candidates;
+    try std.testing.expectError(error.SequenceExhausted, domain.prepareChannelRetirement("#exhausted", owner));
+    try std.testing.expectError(error.SequenceExhausted, domain.fenceChannelRetirement("#exhausted", owner));
+    try std.testing.expectEqual(before_candidates, source.pending_candidates);
+    try std.testing.expectEqual(@as(usize, 0), source.reserved_retirements);
+    try std.testing.expectEqual(@as(usize, 0), source.pending_retirements);
+    try std.testing.expectEqual(index, source.free_retirement.?);
+    try std.testing.expect(try domain.hasCurrentMembership("#exhausted", owner));
+    // Restore only the test fault injection, never an exhausted production issuer.
+    source.retirement_slots[index].generation = 0;
+    const previous_scope = source.next_scope;
+    source.next_scope = std.math.maxInt(u64);
+    defer source.next_scope = previous_scope;
+    _ = try domain.fenceChannelRetirement("#exhausted", owner);
+    try std.testing.expectEqual(std.math.maxInt(u64), source.next_scope);
+    try std.testing.expect(!try domain.hasCurrentMembership("#exhausted", owner));
+}
+
+test "media routing scoped reserved and pending membership refuse strict graph and pristine capture" {
+    const testing = std.testing;
+    const domain = try Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("scoped capture retained Domain");
+    var native = native_owner.NativeMediaTransport.init(testing.allocator);
+    defer native.deinit();
+    var webrtc = try webrtc_owner.MediaPlane.initFallible(testing.allocator);
+    defer webrtc.deinit();
+    try native.prepareColdResources(testing.io, @import("media_socket.zig").loopback_be, 0);
+    try webrtc.prepareColdResources(testing.io, @import("media_socket.zig").loopback_be, 0);
+    const native_binding = try domain.bindNative(&native);
+    const webrtc_binding = try domain.bindWebrtc(&webrtc);
+    try webrtc.prepareRoutingEgress(domain, 4, 256);
+    defer {
+        native.requestStopAndWake();
+        webrtc.requestStopAndWake();
+        native.joinLegacyAfterStop() catch @panic("scoped native capture worker retained");
+        webrtc.joinLegacyAfterStop() catch @panic("scoped RTC capture worker retained");
+        scopedCleanupTest(domain);
+        webrtc.finishRoutingTerminalCleanup(domain) catch unreachable;
+        domain.releaseWebrtc(webrtc_binding) catch unreachable;
+        domain.releaseNative(native_binding) catch unreachable;
+    }
+    const owner = ClientId{ .shard = 0, .slot = 0, .gen = 6 };
+    _ = try scopedMembershipTest(domain, "#ws-only", owner);
+    try native.startPreparedLegacyWorker();
+    try webrtc.startPreparedLegacyWorker();
+    const native_token = try native.requestPause(1);
+    const webrtc_token = try webrtc.requestPause(1);
+    try native.awaitPaused(native_token, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    try webrtc.awaitPaused(webrtc_token, std.Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromSeconds(2) }));
+    var graph = try domain.captureGraph(&native, native_token, &webrtc, webrtc_token);
+    defer graph.deinit();
+    try graph.validate();
+    var ticket = try domain.prepareChannelRetirement("#ws-only", owner);
+    defer ticket.deinit();
+    try std.testing.expectError(error.Busy, domain.captureGraph(&native, native_token, &webrtc, webrtc_token));
+    try std.testing.expectError(error.Busy, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
+    // Current DTOs may never claim pending process-local state is ordinary.
+    graph.memberships[0].row.retirement_slot = ticket.ticket.?.index;
+    try std.testing.expectError(error.InvalidSnapshot, graph.validate());
+    graph.memberships[0].row.retirement_slot = null;
+    ticket.deinit();
+    var after_abort = try domain.captureGraph(&native, native_token, &webrtc, webrtc_token);
+    after_abort.deinit();
+    ticket = try domain.prepareChannelRetirement("#ws-only", owner);
+    ticket.commit();
+    ticket.deinit();
+    try std.testing.expectError(error.Busy, domain.captureGraph(&native, native_token, &webrtc, webrtc_token));
+    try std.testing.expectError(error.Busy, domain.capturePausedPristineMedia(&native, native_token, &webrtc, webrtc_token));
+    graph.memberships[0].row.retiring = true;
+    try std.testing.expectError(error.InvalidSnapshot, graph.validate());
+}
+
+fn publicationDepartureTest(domain: *Domain, channel: []const u8, owner: ClientId, action: @FieldType(RetirementPublication, "action")) !void {
+    var ticket = try domain.prepareChannelRetirement(channel, owner);
+    ticket.commit();
+    ticket.deinit();
+    const plan = (try domain.prepareChannelDeparture(channel, owner)).?;
+    defer plan.deinit();
+    const payload = try RetirementPublication.init(action, channel, "OldIdentity", @splat(0x71));
+    const Cut = struct {
+        domain: *Domain,
+        plan: *PreparedDeparture,
+        payload: RetirementPublication,
+        fn run(scope: *Locked, ctx: @This()) !void {
+            try ctx.plan.setPublicationLocked(ctx.domain, scope, ctx.payload);
+            ctx.plan.commitLocked(ctx.domain, scope);
+        }
+    };
+    try domain.withLocked(Cut{ .domain = domain, .plan = plan, .payload = payload }, Cut.run);
+}
+
+test "media routing publication credit survives deleted calls and rejects stale acknowledgements" {
+    const domain = try Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("publication test retained source custody");
+    const original = ClientId{ .shard = 0, .slot = 1, .gen = 7 };
+    const replacement = ClientId{ .shard = 0, .slot = 1, .gen = 8 };
+    _ = try scopedMembershipTest(domain, "#old", original);
+    try publicationDepartureTest(domain, "#old", original, .leave);
+    try std.testing.expectEqual(@as(u32, 0), backing(domain).calls.count());
+    try std.testing.expect(try domain.channelRetiring("#OLD", original));
+    try std.testing.expect(try domain.channelPublicationPending("#old"));
+    try std.testing.expect(domain.hasPendingChannelRetirements());
+    try std.testing.expectError(error.Closing, domain.prepareMembership("#OLD", replacement, 1));
+    var receipts: [2]RetirementPublicationReceipt = undefined;
+    try std.testing.expectEqual(@as(usize, 1), domain.pendingRetirementPublicationsInto(&receipts));
+    const first = receipts[0];
+    var wrong = first;
+    wrong.client = replacement;
+    try std.testing.expect(!domain.acknowledgeRetirementPublication(wrong));
+    wrong = first;
+    wrong.domain.serial += 1;
+    try std.testing.expect(!domain.acknowledgeRetirementPublication(wrong));
+    try std.testing.expect(domain.acknowledgeRetirementPublication(first));
+    try std.testing.expect(!domain.acknowledgeRetirementPublication(first));
+    _ = try scopedMembershipTest(domain, "#old", replacement);
+    try publicationDepartureTest(domain, "#old", replacement, .leave);
+    try std.testing.expectEqual(@as(usize, 1), domain.pendingRetirementPublicationsInto(&receipts));
+    try std.testing.expect(!domain.acknowledgeRetirementPublication(first));
+    try std.testing.expect(domain.acknowledgeRetirementPublication(receipts[0]));
+    try std.testing.expect(!domain.hasPendingChannelRetirements());
+}
+
+test "media routing publication channel heads preserve FIFO without cross-channel starvation" {
+    const domain = try Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("publication fairness test retained source custody");
+    const first = ClientId{ .shard = 0, .slot = 1, .gen = 1 };
+    const second = ClientId{ .shard = 0, .slot = 2, .gen = 1 };
+    const other = ClientId{ .shard = 0, .slot = 3, .gen = 1 };
+    // Both A rows are admitted before any pending nick-wide publication can
+    // block new incarnations. B is independent and may always make progress.
+    _ = try scopedMembershipTest(domain, "#a", first);
+    _ = try scopedMembershipTest(domain, "#a", second);
+    _ = try scopedMembershipTest(domain, "#b", other);
+    try publicationDepartureTest(domain, "#a", first, .detach);
+    try publicationDepartureTest(domain, "#a", second, .leave);
+    try publicationDepartureTest(domain, "#b", other, .leave);
+    var receipt: [1]RetirementPublicationReceipt = undefined;
+    try std.testing.expectEqual(@as(usize, 1), domain.pendingRetirementPublicationsInto(&receipt));
+    const blocked = receipt[0];
+    try std.testing.expect(blocked.client.eql(first));
+    // Repeated A failure does not advance A's FIFO. Selecting again rotates
+    // to B even when the caller can process only one channel per turn.
+    try std.testing.expectEqual(@as(usize, 1), domain.pendingRetirementPublicationsInto(&receipt));
+    try std.testing.expect(receipt[0].client.eql(other));
+    try std.testing.expect(domain.acknowledgeRetirementPublication(receipt[0]));
+    for (0..40) |_| {
+        try std.testing.expectEqual(@as(usize, 1), domain.pendingRetirementPublicationsInto(&receipt));
+        try std.testing.expect(std.meta.eql(blocked, receipt[0]));
+    }
+    try std.testing.expect(domain.acknowledgeRetirementPublication(blocked));
+    try std.testing.expectEqual(@as(usize, 1), domain.pendingRetirementPublicationsInto(&receipt));
+    try std.testing.expect(receipt[0].client.eql(second));
+    try std.testing.expectEqual(@as(@FieldType(RetirementPublication, "action"), .leave), receipt[0].publication.action);
+    try std.testing.expect(domain.acknowledgeRetirementPublication(receipt[0]));
+}
+
+test "media routing publication original legacy funding is allocation atomic and grants no graph authority" {
+    const a = std.testing.allocator;
+    const owner = ClientId{ .shard = 0, .slot = 4, .gen = 9 };
+    var completed = false;
+    var failures: usize = 0;
+    for (0..64) |index| {
+        const domain = try Domain.create(a);
+        defer domain.destroyQuiesced() catch @panic("legacy funding test retained original credit");
+        const source = backing(domain);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        source.allocator = failing.allocator();
+        const result = domain.fundLegacyRetirementCredit("#legacy", owner, "OldLegacy");
+        source.allocator = a;
+        if (result) |_| {
+            try std.testing.expectEqual(@as(u32, 0), source.calls.count());
+            try std.testing.expectEqual(@as(u32, 0), source.endpoints.count());
+            try std.testing.expectEqual(@as(u32, 0), source.memberships.count());
+            try std.testing.expect(!try domain.hasCurrentMembership("#legacy", owner));
+            try std.testing.expect(!try domain.channelRetiring("#legacy", owner));
+            const original_origin = RetirementOrigin{ .snapshot = try RetirementPublication.init(.leave, "#legacy", "OldLegacy", @splat(0x7A)), .has_attachment = true, .private_presence = true };
+            var abort = try domain.prepareChannelRetirement("#legacy", owner);
+            try abort.setOrigin(original_origin);
+            try std.testing.expect(abort.intent() == null); // no invented CallId
+            abort.deinit();
+            try std.testing.expect((try domain.retirementOrigin("#legacy", owner)) == null);
+            try std.testing.expectEqual(@as(usize, 1), source.legacy_credits);
+            try std.testing.expect(!domain.hasPendingChannelRetirements());
+            var accepted = try domain.prepareChannelRetirement("#legacy", owner);
+            try accepted.setOrigin(original_origin);
+            accepted.commit();
+            accepted.deinit();
+            var retry_origin = original_origin;
+            retry_origin.private_presence = false;
+            retry_origin.snapshot.participant[0] = 'N';
+            var repeat = try domain.prepareChannelRetirement("#legacy", owner);
+            try repeat.setOrigin(retry_origin);
+            repeat.commit();
+            repeat.deinit();
+            try std.testing.expect(std.meta.eql(original_origin, (try domain.retirementOrigin("#legacy", owner)).?));
+            try std.testing.expect(try domain.channelRetiring("#legacy", owner));
+            var graph_work: [2]ChannelRetirementIntent = undefined;
+            try std.testing.expectEqual(@as(usize, 0), domain.pendingChannelRetirementsInto(&graph_work));
+            var legacy_work: [2]Domain.LegacyRetirement = undefined;
+            try std.testing.expectEqual(@as(usize, 1), domain.pendingLegacyRetirementsInto(&legacy_work));
+            try std.testing.expectEqualStrings("OldLegacy", legacy_work[0].participant[0..legacy_work[0].participant_len]);
+            const payload = try RetirementPublication.init(.leave, "#legacy", "OldLegacy", @splat(0));
+            try domain.finishLegacyRetirement("#legacy", owner, payload);
+            const receipt = (try domain.retirementPublicationHead("#legacy")).?;
+            try std.testing.expect(domain.acknowledgeRetirementPublication(receipt));
+            try std.testing.expectEqual(@as(usize, 0), source.legacy_credits);
+            try std.testing.expectEqual(@as(u32, 0), source.retirement_index.count());
+            completed = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), source.retirement_slots.len);
+            try std.testing.expectEqual(@as(usize, 0), source.publication_buckets.len);
+            try std.testing.expectEqual(@as(usize, 0), source.legacy_credits);
+            try std.testing.expectEqual(@as(usize, 0), source.pending_candidates);
+            try std.testing.expectEqual(@as(u64, 1), source.revision);
+            try std.testing.expectEqual(@as(u32, 0), source.retirement_index.count());
+            failures += 1;
+        }
+    }
+    try std.testing.expect(completed and failures != 0);
+}
+
+test "media routing publication credits survive original-admission growth beyond 256 with bounded work" {
+    const domain = try Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("publication growth test retained source custody");
+    const owner = ClientId{ .shard = 0, .slot = 9, .gen = 11 };
+    var oldest: RetirementPublicationReceipt = undefined;
+    for (0..300) |ordinal| {
+        var name: [32]u8 = undefined;
+        const channel = try std.fmt.bufPrint(&name, "#publication-{d}", .{ordinal});
+        _ = try scopedMembershipTest(domain, channel, owner);
+        try publicationDepartureTest(domain, channel, owner, .leave);
+        if (ordinal == 0) oldest = (try domain.retirementPublicationHead(channel)).?;
+    }
+    try std.testing.expect(backing(domain).retirement_slots.len >= 300);
+    try std.testing.expectEqual(@as(usize, 300), domain.retirementWorkCount());
+    // Both slot indices and per-channel queue links were copied from LIVE
+    // storage through repeated growth; an old genuine head is still exact.
+    try std.testing.expect(domain.acknowledgeRetirementPublication(oldest));
+    var receipts: [100]RetirementPublicationReceipt = undefined;
+    var observed: usize = 1;
+    while (domain.retirementWorkCount() != 0) {
+        const count = domain.pendingRetirementPublicationsInto(&receipts);
+        try std.testing.expect(count > 0 and count <= 32);
+        for (receipts[0..count]) |receipt| {
+            try std.testing.expect(domain.acknowledgeRetirementPublication(receipt));
+            observed += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 300), observed);
+    try std.testing.expectEqual(@as(u32, 0), backing(domain).retirement_index.count());
+    try std.testing.expectEqual(@as(u32, 0), backing(domain).publication_index.count());
+}
+
+test "media routing publication exact legacy cleanup phase survives another client's channel backlog" {
+    const domain = try Domain.create(std.testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("legacy phase test retained source credits");
+    const first = ClientId{ .shard = 0, .slot = 1, .gen = 17 };
+    const last = ClientId{ .shard = 0, .slot = 2, .gen = 18 };
+    for ([_]ClientId{ first, last }) |owner| try domain.fundLegacyRetirementCredit("#same", owner, "same");
+    var a = try domain.prepareChannelRetirement("#same", first);
+    a.commit();
+    a.deinit();
+    try domain.finishLegacyRetirement("#same", first, try RetirementPublication.init(.detach, "#same", "same", @splat(0xA1)));
+    const blocked = (try domain.retirementPublicationHead("#same")).?;
+    try std.testing.expectEqual(Domain.RetirementPhase.publication, try domain.retirementPhase("#same", first));
+    var b = try domain.prepareChannelRetirement("#same", last);
+    b.commit();
+    b.deinit();
+    try std.testing.expect(try domain.channelPublicationPending("#same"));
+    try std.testing.expectEqual(Domain.RetirementPhase.legacy_cleanup, try domain.retirementPhase("#same", last));
+    try domain.finishLegacyRetirement("#same", last, try RetirementPublication.init(.leave, "#same", "same", @splat(0)));
+    try std.testing.expectEqual(Domain.RetirementPhase.publication, try domain.retirementPhase("#same", last));
+    try std.testing.expect(std.meta.eql(blocked, (try domain.retirementPublicationHead("#same")).?));
+    try std.testing.expect(domain.acknowledgeRetirementPublication(blocked));
+    const final = (try domain.retirementPublicationHead("#same")).?;
+    try std.testing.expect(final.client.eql(last));
+    try std.testing.expectEqual(@as(@FieldType(RetirementPublication, "action"), .leave), final.publication.action);
+    try std.testing.expect(domain.acknowledgeRetirementPublication(final));
+    try std.testing.expectEqual(Domain.RetirementPhase.absent, try domain.retirementPhase("#same", first));
+    try std.testing.expectEqual(Domain.RetirementPhase.absent, try domain.retirementPhase("#same", last));
+}
+
+test "keyframe pressure windows bound source and publisher without consuming failed previews" {
+    const testing = std.testing;
+    var source: FeedbackWindow = .{};
+    var publisher: FeedbackWindow = .{};
+    const source_first = try Domain.nextFeedbackWindow(source, 1000, feedback_source_limit, 1);
+    const publisher_first = try Domain.nextFeedbackWindow(publisher, 1000, feedback_publisher_limit, 1);
+    // A failed output keeps previews private; the identical retry can reserve.
+    try testing.expectEqual(source_first, try Domain.nextFeedbackWindow(source, 1000, feedback_source_limit, 1));
+    try testing.expectEqual(publisher_first, try Domain.nextFeedbackWindow(publisher, 1000, feedback_publisher_limit, 1));
+    source = source_first;
+    publisher = publisher_first;
+    try testing.expectError(error.FeedbackRateLimited, Domain.nextFeedbackWindow(source, 1001, feedback_source_limit, 1));
+    // Independent sources still have publisher capacity while one is limited.
+    for (0..3) |_| publisher = try Domain.nextFeedbackWindow(publisher, 1001, feedback_publisher_limit, 1);
+    try testing.expectError(error.FeedbackRateLimited, Domain.nextFeedbackWindow(publisher, 1001, feedback_publisher_limit, 1));
+    try testing.expectError(error.FeedbackClockUnavailable, Domain.nextFeedbackWindow(source, 999, feedback_source_limit, 1));
+    try testing.expectError(error.FeedbackClockUnavailable, Domain.nextFeedbackWindow(source, 0, feedback_source_limit, 1));
+    try testing.expectEqual(@as(u16, 1), (try Domain.nextFeedbackWindow(source, 2000, feedback_source_limit, 1)).used);
+    try testing.expectEqual(@as(u16, 1), (try Domain.nextFeedbackWindow(publisher, 2000, feedback_publisher_limit, 1)).used);
+}
+
+test "NACK packet budget charges only accepted output and preserves separate keyframe headroom" {
+    const testing = std.testing;
+    const client_id: ClientId = .{ .shard = 0, .slot = 1, .gen = 1 };
+    const call: CallId = .{ .domain = .{ .serial = 1 }, .serial = 1 };
+    const endpoint: EndpointId = .{ .call = call, .serial = 1, .leg = .native };
+    const observation: EndpointObservation = .{
+        .reference = .{ .endpoint = endpoint, .offering_client = client_id, .bridge_policy_revision = 1 },
+        .stamp = .{ .endpoint = endpoint, .offering_client = client_id, .binding_revision = 1, .security_revision = 1 },
+        .stream_id = 1,
+        .mode = .legacy_group,
+    };
+    var source: EndpointEntry = .{ .observation = observation };
+    var target: EndpointEntry = .{ .observation = observation };
+    const reservation: Domain.FeedbackReservation = .{
+        .source = &source,
+        .target = &target,
+        .kind = .nack,
+        .cost = 64,
+        .source_next = try Domain.nextFeedbackWindow(source.nack_source, 1000, nack_source_limit, 64),
+        .target_next = try Domain.nextFeedbackWindow(target.nack_publisher, 1000, nack_publisher_limit, 64),
+    };
+    Domain.commitFeedback(reservation, 0);
+    try testing.expectEqual(@as(u16, 0), source.nack_source.used);
+    try testing.expectEqual(@as(u16, 0), target.nack_publisher.used);
+    Domain.commitFeedback(reservation, 3);
+    try testing.expectEqual(@as(u16, 3), source.nack_source.used);
+    try testing.expectEqual(@as(u16, 3), target.nack_publisher.used);
+    try testing.expectEqual(@as(u16, 0), source.feedback_source.used);
+    try testing.expectEqual(@as(u16, 1), (try Domain.nextFeedbackWindow(source.feedback_source, 1000, feedback_source_limit, 1)).used);
+    try testing.expectError(error.FeedbackRateLimited, Domain.nextFeedbackWindow(source.nack_source, 1000, nack_source_limit, 126));
+    try testing.expectEqual(@as(u16, 64), (try Domain.nextFeedbackWindow(source.nack_source, 2000, nack_source_limit, 64)).used);
+    try testing.expect(!validFeedbackWindow(.{ .started_ms = 0, .used = 1 }, nack_source_limit));
+    try testing.expect(!validFeedbackWindow(.{ .started_ms = 1, .used = nack_publisher_limit + 1 }, nack_publisher_limit));
+    try testing.expect(!validFeedbackWindow(.{ .started_ms = 1, .used = 0 }, nack_source_limit));
+}
+
+test "media graph refuses malformed carried feedback windows" {
+    const testing = std.testing;
+    const owner: ClientId = .{ .shard = 0, .slot = 1, .gen = 1 };
+    const call: CallId = .{ .domain = .{ .serial = 1 }, .serial = 1 };
+    const endpoint: EndpointId = .{ .call = call, .serial = 1, .leg = .native };
+    var calls = [_]GraphCall{.{ .channel = try ChannelKey.init("#pressure"), .row = .{ .id = call, .offers = 1 } }};
+    var endpoints = [_]GraphEndpoint{.{
+        .key = .{ .call = call, .client = owner, .leg = .native },
+        .row = .{
+            .observation = .{
+                .reference = .{ .endpoint = endpoint, .offering_client = owner, .bridge_policy_revision = 1 },
+                .stamp = .{ .endpoint = endpoint, .offering_client = owner, .binding_revision = 1, .security_revision = 1 },
+                .stream_id = 1,
+                .mode = .legacy_group,
+            },
+            .feedback_source = .{ .started_ms = 1000, .used = 1 },
+            .nack_publisher = .{ .started_ms = 1000, .used = 512 },
+        },
+    }};
+    var memberships: [0]GraphMembership = .{};
+    var policies: [0]GraphBridgePolicy = .{};
+    const graph: GraphSnapshot = .{
+        .allocator = testing.allocator,
+        .id = call.domain,
+        .revision = 1,
+        .next_call = 2,
+        .next_endpoint = 2,
+        .next_stream = 2,
+        .next_scope = 1,
+        .next_binding = 3,
+        .native_binding_serial = 1,
+        .webrtc_binding_serial = 2,
+        .calls = &calls,
+        .endpoints = &endpoints,
+        .memberships = &memberships,
+        .bridge_policy = &policies,
+    };
+    try graph.validate();
+    endpoints[0].row.nack_publisher.used = 513;
+    try testing.expectError(error.InvalidSnapshot, graph.validate());
+    endpoints[0].row.nack_publisher.used = 512;
+    endpoints[0].row.feedback_source.started_ms = 0;
+    try testing.expectError(error.InvalidSnapshot, graph.validate());
+}
+
+test "same physical endpoint re-offer retains accepted feedback pressure" {
+    const testing = std.testing;
+    const domain = try Domain.create(testing.allocator);
+    defer domain.destroyQuiesced() catch @panic("feedback test leaked domain");
+    defer scopedCleanupTest(domain);
+    const owner: ClientId = .{ .shard = 0, .slot = 1, .gen = 1 };
+    const first = try domain.prepareOffers("#pressure", owner, &.{.{ .leg = .native, .mode = .legacy_group }});
+    const first_preview = first.preview();
+    try domain.withLocked(PublishContext{ .domain = domain, .plan = first }, publishForTest);
+    first.deinit();
+    const key: EndpointKey = .{ .call = first_preview.call, .client = owner, .leg = .native };
+    const original = backing(domain).endpoints.getPtr(key) orelse return error.TestUnexpectedResult;
+    original.feedback_source = .{ .started_ms = 1000, .used = 1 };
+    original.nack_publisher = .{ .started_ms = 1000, .used = 64 };
+    const second = try domain.prepareOffers("#pressure", owner, &.{.{ .leg = .native, .mode = .legacy_group }});
+    try domain.withLocked(PublishContext{ .domain = domain, .plan = second }, publishForTest);
+    second.deinit();
+    const retained = backing(domain).endpoints.get(key) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 1000), retained.feedback_source.started_ms);
+    try testing.expectEqual(@as(u16, 1), retained.feedback_source.used);
+    try testing.expectEqual(@as(u16, 64), retained.nack_publisher.used);
 }

@@ -54,7 +54,7 @@ pub const Header = struct {
             return error.BadLength;
         }
 
-        out[0] = @intFromEnum(self.msg_type);
+        out[0] = @backingInt(self.msg_type);
         std.mem.writeInt(u24, out[1..][0..3], self.length, .big);
         std.mem.writeInt(u16, out[4..][0..2], self.message_seq, .big);
         std.mem.writeInt(u24, out[6..][0..3], self.fragment_offset, .big);
@@ -66,7 +66,7 @@ pub const Header = struct {
         if (buf.len < handshake_header_len) return error.Truncated;
 
         const hdr = Header{
-            .msg_type = @enumFromInt(buf[0]),
+            .msg_type = @fromBackingInt(@intCast(buf[0])),
             .length = std.mem.readInt(u24, buf[1..][0..3], .big),
             .message_seq = std.mem.readInt(u16, buf[4..][0..2], .big),
             .fragment_offset = std.mem.readInt(u24, buf[6..][0..3], .big),

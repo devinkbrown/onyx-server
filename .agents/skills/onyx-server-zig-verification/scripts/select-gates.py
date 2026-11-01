@@ -134,7 +134,7 @@ def main() -> int:
         print(f"zig build {gate}")
     for gate in gates:
         if gate in critical:
-            print(f"zig build {gate} -Doptimize=ReleaseSafe")
+            print(f"zig build {gate} -Doptimize=safe")
     print("git diff --check")
     if args.release:
         print("zig build all-checks")

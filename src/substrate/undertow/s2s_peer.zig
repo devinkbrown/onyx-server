@@ -30,6 +30,9 @@ pub const ChannelCrdt = channel_crdt.ChannelCrdt;
 pub const NodeId = gossip_round.NodeId;
 pub const MemberInfo = route_table.Member;
 pub const MemberIdentity = route_table.MemberIdentity;
+pub const MembershipIdentityTransition = route_table.MembershipIdentityTransition;
+pub const PreparedMembershipIdentityChange = route_table.PreparedMembershipIdentityChange;
+pub const MembershipIdentityPreparer = route_table.MembershipIdentityPreparer;
 pub const SessionToken = route_table.SessionToken;
 pub const NickClaim = route_table.NickClaim;
 pub const ChannelModeFlags = route_table.ChannelModeFlags;
@@ -193,6 +196,8 @@ fn isReadMarkerKey(key: []const u8) bool {
     return key.len >= read_marker_namespace.len and std.ascii.eqlIgnoreCase(key[0..read_marker_namespace.len], read_marker_namespace);
 }
 
+const session_group_v4_probe = "onyx-xcap-session-group-inventory-v4-eligibility-v1?";
+const session_group_v4_reply = "onyx-xcap-session-group-inventory-v4-eligibility-v1!";
 const session_replica_v3_probe = "onyx-xcap-session-replica-v3?";
 const session_replica_v3_reply = "onyx-xcap-session-replica-v3!";
 
@@ -338,6 +343,7 @@ pub const ByteSink = struct {
 };
 
 pub const Config = struct {
+    session_group_inventory_enabled: bool = false,
     /// Per-peer complete-frame ceiling (header + payload). Defaults to the
     /// shared S2S 1 MiB bound; secured media-cascade links raise this to
     /// `media_ws_relay.required_max_frame_size` so a Cadence keyframe fits.
@@ -643,6 +649,8 @@ pub const S2sPeer = struct {
     /// Remote answered the append-only SRTF3 extension probe. Once true, every
     /// replica frame on this link must carry version 3; no decoder fallback is
     /// allowed after malformed or mismatched input.
+    peer_supports_session_group_v4: bool = false,
+    session_group_rx_v4: bool = false,
     peer_supports_session_replica_v3: bool = false,
     /// Remote advertised frame signing plus the explicit secure-relay-v2 bit.
     peer_supports_secure_relay_v2: bool = false,
@@ -722,6 +730,7 @@ pub const S2sPeer = struct {
     /// as live `:nick JOIN/PART #chan` lines to local members. Re-affirmations
     /// (anti-entropy re-bursts) never enqueue here, so no duplicate JOINs.
     membership_changes: std.ArrayListUnmanaged(MembershipDelta) = .empty,
+    membership_identity_preparer: ?MembershipIdentityPreparer = null,
     /// Wire/application order shared by MEMBERSHIP and NICKCHANGE deltas. The
     /// payloads remain in their long-standing typed queues for compatibility;
     /// these markers let the daemon drain an identity transition atomically in
@@ -769,6 +778,13 @@ pub const S2sPeer = struct {
     /// Bounded wire-ordered sidecars held across the feed/daemon Store boundary.
     /// Legacy/non-v2 links never enter this queue and retain immediate behavior.
     deferred_residence_frames: std.ArrayListUnmanaged(DeferredResidenceFrame) = .empty,
+    pending_membership: [membership_event.max_encoded_len]u8 = undefined,
+    pending_membership_len: usize = 0,
+    // Verified direct legacy NICK retained without borrowing decoder storage.
+    pending_nick: [16 + 12 + 2 * nick_event.max_nick_len + nick_event.max_user_len + nick_event.max_real_len + nick_event.max_host_len + nick_event.max_account_len]u8 = undefined,
+    pending_nick_len: usize = 0,
+    deferred_membership_paused: bool = false,
+    deferred_membership_conflict: bool = false,
     dropped_session_replica_frames: u64 = 0,
     rejected_session_replica_frames: u64 = 0,
     /// Inbound CLONE_COUNT payloads (raw `mesh_clones` counts-codec bytes) from
@@ -904,6 +920,8 @@ pub const S2sPeer = struct {
         peer_supports_repair: bool,
         peer_supports_session_replica_v2: bool,
         peer_supports_session_attachment_lease_v2: bool,
+        peer_supports_session_group_v4: bool = false,
+        session_group_rx_v4: bool = false,
         peer_supports_session_replica_v3: bool = false,
         /// Defaults preserve source compatibility for older snapshot producers;
         /// current Helix capture must set both fields explicitly.
@@ -924,6 +942,8 @@ pub const S2sPeer = struct {
             .peer_supports_repair = self.peer_supports_repair,
             .peer_supports_session_replica_v2 = self.peer_supports_session_replica_v2,
             .peer_supports_session_attachment_lease_v2 = self.peer_supports_session_attachment_lease_v2,
+            .peer_supports_session_group_v4 = self.peer_supports_session_group_v4,
+            .session_group_rx_v4 = self.session_group_rx_v4,
             .peer_supports_session_replica_v3 = self.peer_supports_session_replica_v3,
             .peer_supports_secure_relay_v2 = self.peer_supports_secure_relay_v2,
             .peer_supports_event_spine_v2 = self.peer_supports_event_spine_v2,
@@ -938,6 +958,9 @@ pub const S2sPeer = struct {
     /// replica. The caller must send a RESYNC to the peer to refill the converged
     /// roster/props/topics, and re-burst its own local state.
     pub fn resumeEstablished(options: Options, hdr: ResumeHeader, remote_name: []const u8, now_ms: u64, rng_seed: u64) !S2sPeer {
+        if ((hdr.peer_supports_session_group_v4 or hdr.session_group_rx_v4) and
+            (!options.config.session_group_inventory_enabled or !options.session_replica_transport_enabled or options.signing_key == null or !hdr.peer_supports_signing or !hdr.peer_supports_session_replica_v2 or
+                (hdr.peer_supports_session_replica_v3 and !options.session_replica_attachment_transport_enabled))) return error.CapabilityVersionMismatch;
         if (options.config.require_signed_frames and options.signing_key != null and !hdr.peer_supports_signing) {
             return error.SignedFramesRequired;
         }
@@ -1022,6 +1045,8 @@ pub const S2sPeer = struct {
             .peer_supports_session_attachment_lease_v2 = hdr.peer_supports_signing and
                 hdr.peer_supports_session_replica_v2 and
                 hdr.peer_supports_session_attachment_lease_v2,
+            .peer_supports_session_group_v4 = hdr.peer_supports_session_group_v4,
+            .session_group_rx_v4 = hdr.session_group_rx_v4,
             .peer_supports_session_replica_v3 = options.session_replica_attachment_transport_enabled and
                 hdr.peer_supports_signing and hdr.peer_supports_session_replica_v2 and
                 hdr.peer_supports_session_replica_v3,
@@ -1123,6 +1148,8 @@ pub const S2sPeer = struct {
         self.allocator.free(self.server_name);
         self.session.deinit();
         self.routes.deinit();
+        std.crypto.secureZero(u8, self.pending_membership[0..self.pending_membership_len]);
+        std.crypto.secureZero(u8, self.pending_nick[0..self.pending_nick_len]);
         self.registry.deinit();
         self.decoder.deinit();
         if (self.signing_key) |*kp| kp.deinit(); // wipe our copy of the secret key
@@ -1136,10 +1163,79 @@ pub const S2sPeer = struct {
     }
 
     pub fn feed(self: *S2sPeer, bytes: []const u8, sink: ByteSink, now_ms: u64, rng_seed: u64) !void {
+        if (self.membershipDispatchPaused()) {
+            if (bytes.len != 0) return error.MembershipDispatchPaused;
+            return;
+        }
         try self.decoder.feed(bytes);
+        try self.drainDecoderUntilMembershipPause(sink, now_ms, rng_seed);
+    }
+
+    fn drainDecoderUntilMembershipPause(self: *S2sPeer, sink: ByteSink, now_ms: u64, rng_seed: u64) !void {
         while (try self.decoder.next()) |frame| {
             try self.dispatch(frame, sink, now_ms, rng_seed);
+            if (self.membershipDispatchPaused()) return;
         }
+    }
+
+    pub fn membershipDispatchPaused(self: *const S2sPeer) bool {
+        return self.pending_membership_len != 0 or self.pending_nick_len != 0 or self.deferred_membership_paused or self.deferred_membership_conflict;
+    }
+
+    /// A deferred authenticated proposal conflicted with a different visible
+    /// origin. Owner must terminate/reconcile the link, never retry this as Busy.
+    pub fn membershipProvenanceConflict(self: *const S2sPeer) bool {
+        return self.deferred_membership_conflict;
+    }
+
+    /// Retire only an unaccepted terminal-conflicting proposal. The owner must
+    /// terminally close the link; successor bytes/sidecars remain untouched and
+    /// must not be processed as if the rejected transition succeeded.
+    pub fn rejectPendingMembershipProvenanceConflict(self: *S2sPeer) error{InvalidMembershipConflictState}!void {
+        if (!self.deferred_membership_conflict) return error.InvalidMembershipConflictState;
+        if (self.pending_membership_len != 0) {
+            std.crypto.secureZero(u8, self.pending_membership[0..self.pending_membership_len]);
+            self.pending_membership_len = 0;
+        } else {
+            if (self.deferred_residence_frames.items.len == 0 or self.deferred_residence_frames.items[0].kind != .membership) return error.InvalidMembershipConflictState;
+            var rejected = self.deferred_residence_frames.orderedRemove(0);
+            rejected.deinit(self.allocator);
+        }
+        self.deferred_membership_conflict = false;
+        self.deferred_membership_paused = false;
+    }
+
+    /// Caller retains owner/World custody and applies the same read-pressure and
+    /// capture barriers while paused. Pending retries never borrow decoder memory.
+    pub fn retryPendingMembership(self: *S2sPeer, sink: ByteSink, now_ms: u64, rng_seed: u64) !void {
+        if (self.deferred_membership_conflict) return error.PublicIdentityProvenanceConflict;
+        if (self.pending_membership_len != 0) {
+            const payload = self.pending_membership[0..self.pending_membership_len];
+            self.applyMembershipPayload(payload, now_ms) catch |err| switch (err) {
+                error.MembershipPreparePending => return,
+                error.PublicIdentityProvenanceConflict => {
+                    self.deferred_membership_conflict = true;
+                    return err;
+                },
+                else => return err,
+            };
+            std.crypto.secureZero(u8, self.pending_membership[0..self.pending_membership_len]);
+            self.pending_membership_len = 0;
+        }
+        if (self.pending_nick_len != 0) {
+            self.applyNickChangePayload(self.pending_nick[0..self.pending_nick_len]) catch |err| switch (err) {
+                error.OutOfMemory => return,
+                else => return err,
+            };
+            std.crypto.secureZero(u8, self.pending_nick[0..self.pending_nick_len]);
+            self.pending_nick_len = 0;
+        }
+        if (self.deferred_membership_paused) {
+            self.processDeferredResidenceFrames(now_ms);
+            if (self.deferred_membership_conflict) return error.PublicIdentityProvenanceConflict;
+            if (self.deferred_membership_paused) return;
+        }
+        try self.drainDecoderUntilMembershipPause(sink, now_ms, rng_seed);
     }
 
     pub fn finish(self: *S2sPeer) !void {
@@ -1357,6 +1453,13 @@ pub const S2sPeer = struct {
                 if (std.mem.eql(u8, frame.payload, read_marker_extension_probe) and
                     self.signing_key != null and self.peer_supports_signing)
                     try emitFrame(self.allocator, sink, .PONG, read_marker_extension_reply);
+                if (std.mem.eql(u8, frame.payload, session_group_v4_probe) and
+                    self.config.session_group_inventory_enabled and self.supportsSessionReplicaV2())
+                {
+                    // PONG precedes every later current-version transmit frame.
+                    try emitFrame(self.allocator, sink, .PONG, session_group_v4_reply);
+                    self.peer_supports_session_group_v4 = true;
+                }
                 if (std.mem.eql(u8, frame.payload, session_replica_v3_probe) and
                     self.session_replica_attachment_transport_enabled and
                     self.session_replica_transport_enabled and self.signing_key != null and
@@ -1390,6 +1493,9 @@ pub const S2sPeer = struct {
                 {
                     self.peer_supports_read_markers = true;
                 }
+                if (std.mem.eql(u8, frame.payload, session_group_v4_reply) and
+                    self.config.session_group_inventory_enabled and self.supportsSessionReplicaV2())
+                    self.session_group_rx_v4 = true;
                 if (std.mem.eql(u8, frame.payload, session_replica_v3_reply) and
                     self.session_replica_attachment_transport_enabled and
                     self.peer_supports_signing and self.peer_supports_session_replica_v2)
@@ -1539,13 +1645,23 @@ pub const S2sPeer = struct {
             self.rejected_session_replica_frames +|= 1;
             return;
         };
-        const expected_version: session_replica_frame.WireVersion =
-            if (self.peer_supports_session_replica_v3) .attachment_v3 else .token_v2;
-        if (version != expected_version) {
+        // Current token-family transport and attachment-family v3 have
+        // independent negotiation. Accept their declared schemas side by side;
+        // a failed current decoder is never retried as an attachment decoder.
+        const allowed = if (self.session_group_rx_v4) switch (version) {
+            .current_v4 => true,
+            .attachment_v3 => self.supportsSessionReplicaV3(),
+            .token_v2 => false,
+        } else version == (if (self.peer_supports_session_replica_v3)
+            session_replica_frame.WireVersion.attachment_v3
+        else
+            session_replica_frame.WireVersion.token_v2);
+        if (!allowed) {
             self.rejected_session_replica_frames +|= 1;
             return;
         }
         const decoded = switch (version) {
+            .current_v4 => session_replica_frame.decodeCurrent(kind, authenticated),
             .token_v2 => session_replica_frame.decode(kind, authenticated),
             .attachment_v3 => session_replica_frame.decodeAttachment(kind, authenticated),
         } catch {
@@ -1635,15 +1751,34 @@ pub const S2sPeer = struct {
         // Processing cannot append to this queue, so consume in place. This
         // avoids a toOwnedSlice allocation whose OOM path could strand an old
         // batch until after unrelated authority arrived.
-        for (self.deferred_residence_frames.items) |*frame| {
-            defer frame.deinit(self.allocator);
+        if (self.deferred_membership_conflict) return;
+        self.deferred_membership_paused = false;
+        while (self.deferred_residence_frames.items.len != 0) {
+            const frame = &self.deferred_residence_frames.items[0];
             switch (frame.kind) {
-                .membership => self.applyMembershipPayload(frame.payload, now_ms) catch {},
-                .nick_change => self.applyNickChangePayload(frame.payload) catch {},
+                .membership => self.applyMembershipPayload(frame.payload, now_ms) catch |err| switch (err) {
+                    error.MembershipPreparePending => {
+                        self.deferred_membership_paused = true;
+                        return;
+                    },
+                    error.PublicIdentityProvenanceConflict => {
+                        self.deferred_membership_conflict = true;
+                        return;
+                    },
+                    else => {},
+                },
+                .nick_change => self.applyNickChangePayload(frame.payload) catch |err| switch (err) {
+                    error.OutOfMemory => {
+                        self.deferred_membership_paused = true;
+                        return;
+                    },
+                    else => {},
+                },
                 .membership_sync => self.applyMembershipSyncPayload(frame.payload, now_ms),
             }
+            var completed = self.deferred_residence_frames.orderedRemove(0);
+            completed.deinit(self.allocator);
         }
-        self.deferred_residence_frames.clearRetainingCapacity();
     }
 
     /// A dropped authority/sidecar frame makes the feed incomplete. Discard all
@@ -1651,6 +1786,7 @@ pub const S2sPeer = struct {
     pub fn discardDeferredResidenceFrames(self: *S2sPeer) void {
         for (self.deferred_residence_frames.items) |*frame| frame.deinit(self.allocator);
         self.deferred_residence_frames.clearRetainingCapacity();
+        self.deferred_membership_paused = false;
     }
 
     /// True only on an established, signing-key-backed link where the remote
@@ -1663,13 +1799,17 @@ pub const S2sPeer = struct {
         return self.supportsSessionReplicaV2() and self.peer_supports_session_attachment_lease_v2;
     }
 
-    /// Once negotiated, version 3 is the only accepted replica schema for this
-    /// preserved link. The v2 base bit still proves the outer frame family and
-    /// signing support; this append-only extension selects the inner schema.
+    /// Attachment-family v3 is negotiated independently. Before current v4 it
+    /// exclusively selects the replica schema; after v4 it remains available
+    /// alongside the current token family, never as a decoder fallback.
     pub fn supportsSessionReplicaV3(self: *const S2sPeer) bool {
         return self.supportsSessionReplicaV2() and
             self.session_replica_attachment_transport_enabled and
             self.peer_supports_session_replica_v3;
+    }
+
+    pub fn supportsSessionGroupV4(self: *const S2sPeer) bool {
+        return self.supportsSessionReplicaV2() and self.config.session_group_inventory_enabled and self.peer_supports_session_group_v4;
     }
 
     /// Encode, capability-gate, outer-sign, and emit one opaque Helix object.
@@ -1678,7 +1818,8 @@ pub const S2sPeer = struct {
         if (!self.established) return error.NotEstablished;
         if (!self.session_replica_transport_enabled or self.signing_key == null or !self.peer_supports_signing) return error.SecuredLinkRequired;
         if (!self.peer_supports_session_replica_v2) return error.CapabilityNotNegotiated;
-        if (self.peer_supports_session_replica_v3) return error.CapabilityVersionMismatch;
+        if (self.peer_supports_session_group_v4 and !self.config.session_group_inventory_enabled) return error.CapabilityVersionMismatch;
+        if (self.peer_supports_session_replica_v3 and !self.supportsSessionGroupV4()) return error.CapabilityVersionMismatch;
         if (kind == .attachment_lease and !self.peer_supports_session_attachment_lease_v2)
             return error.CapabilityNotNegotiated;
 
@@ -1687,7 +1828,10 @@ pub const S2sPeer = struct {
         if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
         const transport = try self.allocator.alloc(u8, len);
         defer self.allocator.free(transport);
-        const encoded = try session_replica_frame.encode(kind, signed_payload, transport);
+        const encoded = if (self.supportsSessionGroupV4())
+            try session_replica_frame.encodeCurrent(kind, signed_payload, transport)
+        else
+            try session_replica_frame.encode(kind, signed_payload, transport);
         try self.emitSignable(sink, replicaFrameType(kind), encoded);
     }
 
@@ -2829,10 +2973,12 @@ pub const S2sPeer = struct {
         /// the LOCAL session holding `nick` (same authenticated account, strictly
         /// older mesh claim) in favour of the live remote one. `account` carries the
         /// remote claim's account for a daemon-side safety re-check before any kill.
-        pub const Kind = enum { joined, parted, status, ghost_reclaim };
+        pub const Kind = enum { joined, parted, status, ghost_reclaim, identity };
 
         channel: []u8,
         nick: []u8,
+        old_username: ?[]u8 = null,
+        old_host: ?[]u8 = null,
         username: []u8,
         realname: []u8,
         host: []u8,
@@ -2843,6 +2989,15 @@ pub const S2sPeer = struct {
         /// to re-verify a `ghost_reclaim` before retiring a local session.
         account: []u8,
         kind: Kind,
+        /// Immutable accepted-transition provenance. Null on synthesized/legacy
+        /// helper deltas: absence never proves authenticated continuity.
+        source_provenance: ?struct {
+            origin_node: NodeId,
+            hlc: u64,
+            session_token: ?SessionToken,
+            account_trusted: bool,
+            authenticated_direct: bool,
+        } = null,
         /// New status bits (for joined/status); the member's prefix modes.
         status: u4,
         /// Previous status bits (for a `status` change), to diff the MODE.
@@ -2851,11 +3006,14 @@ pub const S2sPeer = struct {
         pub fn deinit(self: *MembershipDelta, allocator: std.mem.Allocator) void {
             allocator.free(self.channel);
             allocator.free(self.nick);
+            if (self.old_username) |value| allocator.free(value);
+            if (self.old_host) |value| allocator.free(value);
             allocator.free(self.username);
             allocator.free(self.realname);
             allocator.free(self.host);
             allocator.free(self.setter);
             allocator.free(self.account);
+            if (self.source_provenance) |*source| if (source.session_token) |*token| std.crypto.secureZero(u8, token);
             self.* = undefined;
         }
     };
@@ -3031,6 +3189,8 @@ pub const S2sPeer = struct {
         username: []u8,
         realname: []u8,
         host: []u8,
+        origin_node: NodeId,
+        channels: [][]u8,
 
         pub fn deinit(self: *NickDelta, allocator: std.mem.Allocator) void {
             allocator.free(self.old_nick);
@@ -3038,6 +3198,8 @@ pub const S2sPeer = struct {
             allocator.free(self.username);
             allocator.free(self.realname);
             allocator.free(self.host);
+            for (self.channels) |channel| allocator.free(channel);
+            allocator.free(self.channels);
             self.* = undefined;
         }
     };
@@ -3152,6 +3314,57 @@ pub const S2sPeer = struct {
         self.session_token_nick_authorizer = authorizer;
     }
 
+    /// Borrowed callback context must outlive the peer and synchronize its own cut.
+    pub fn setMembershipIdentityPreparer(self: *S2sPeer, preparer: ?MembershipIdentityPreparer) void {
+        self.membership_identity_preparer = preparer;
+    }
+
+    const LegacyIdentityTicket = struct {
+        peer: *S2sPeer,
+        delta: MembershipDelta,
+        committed: bool = false,
+        fn commit(ctx: *anyopaque) void {
+            const ticket: *LegacyIdentityTicket = @ptrCast(@alignCast(ctx));
+            ticket.peer.membership_changes.appendAssumeCapacity(ticket.delta);
+            ticket.peer.identity_transition_order.appendAssumeCapacity(.membership);
+            ticket.committed = true;
+        }
+        fn release(ctx: *anyopaque) void {
+            const ticket: *LegacyIdentityTicket = @ptrCast(@alignCast(ctx));
+            const allocator = ticket.peer.allocator;
+            if (!ticket.committed) ticket.delta.deinit(allocator);
+            allocator.destroy(ticket);
+        }
+    };
+    fn prepareLegacyIdentity(ctx: *anyopaque, transition: *const MembershipIdentityTransition) anyerror!PreparedMembershipIdentityChange {
+        const self: *S2sPeer = @ptrCast(@alignCast(ctx));
+        const a = self.allocator;
+        const ticket = try a.create(LegacyIdentityTicket);
+        errdefer a.destroy(ticket);
+        const channel = try a.dupe(u8, transition.channel);
+        errdefer a.free(channel);
+        const nick = try a.dupe(u8, transition.nick);
+        errdefer a.free(nick);
+        const old_username = try a.dupe(u8, transition.old.username);
+        errdefer a.free(old_username);
+        const old_host = try a.dupe(u8, transition.old.host);
+        errdefer a.free(old_host);
+        const username = try a.dupe(u8, transition.new.username);
+        errdefer a.free(username);
+        const host = try a.dupe(u8, transition.new.host);
+        errdefer a.free(host);
+        const realname = try a.dupe(u8, transition.new.realname);
+        errdefer a.free(realname);
+        const setter = try a.dupe(u8, "");
+        errdefer a.free(setter);
+        const account = try a.dupe(u8, transition.new.account);
+        errdefer a.free(account);
+        try self.membership_changes.ensureUnusedCapacity(a, 1);
+        try self.identity_transition_order.ensureUnusedCapacity(a, 1);
+        ticket.* = .{ .peer = self, .delta = .{ .channel = channel, .nick = nick, .old_username = old_username, .old_host = old_host, .username = username, .host = host, .realname = realname, .setter = setter, .account = account, .kind = .identity, .status = 0, .prev_status = 0 } };
+        return .{ .ctx = ticket, .commit_fn = LegacyIdentityTicket.commit, .release_fn = LegacyIdentityTicket.release };
+    }
+
     /// Retroactively bind or clear exact-token metadata after signed authority
     /// arrives later than the compatibility MEMBERSHIP fact.
     pub fn rebindSessionToken(self: *S2sPeer, origin_node: NodeId, nick: []const u8, token: ?SessionToken) route_table.Error!usize {
@@ -3197,7 +3410,7 @@ pub const S2sPeer = struct {
 
     fn queueReconciledSessionRename(ctx: *anyopaque, old_nick: []const u8, new_nick: []const u8, member: *const route_table.Member) std.mem.Allocator.Error!void {
         const self: *S2sPeer = @ptrCast(@alignCast(ctx));
-        try self.queueForcedNickRename(old_nick, new_nick, .{
+        try self.queueForcedNickRename(old_nick, new_nick, member.node, member.session_token, true, .{
             .username = member.username,
             .realname = member.realname,
             .host = member.host,
@@ -3214,9 +3427,9 @@ pub const S2sPeer = struct {
         unreachable;
     }
 
-    fn queueAuthorizedWireNick(ctx: *anyopaque, old_nick: []const u8, new_nick: []const u8, _: *const route_table.Member) std.mem.Allocator.Error!void {
+    fn queueAuthorizedWireNick(ctx: *anyopaque, old_nick: []const u8, new_nick: []const u8, member: *const route_table.Member) std.mem.Allocator.Error!void {
         const wire: *WireNickRenameContext = @ptrCast(@alignCast(ctx));
-        try wire.peer.queueForcedNickRename(old_nick, new_nick, wire.ident);
+        try wire.peer.queueForcedNickRename(old_nick, new_nick, member.node, null, true, wire.ident);
     }
 
     pub fn setLocalNickResolver(self: *S2sPeer, resolver: ?LocalNickResolver) void {
@@ -3342,7 +3555,15 @@ pub const S2sPeer = struct {
     /// status-change is queued so the daemon can emit the matching live IRC line.
     fn recvMembership(self: *S2sPeer, frame_payload: []const u8, now_ms: u64) !void {
         const payload = self.verifiedPayload(.MEMBERSHIP, frame_payload) orelse return;
-        try self.applyMembershipPayload(payload, now_ms);
+        _ = membership_event.decode(payload) catch return;
+        if (payload.len > self.pending_membership.len) return;
+        self.applyMembershipPayload(payload, now_ms) catch |err| switch (err) {
+            error.MembershipPreparePending => {
+                @memcpy(self.pending_membership[0..payload.len], payload);
+                self.pending_membership_len = payload.len;
+            },
+            else => return err,
+        };
     }
 
     fn applyMembershipPayload(self: *S2sPeer, payload: []const u8, now_ms: u64) !void {
@@ -3450,18 +3671,52 @@ pub const S2sPeer = struct {
                         .certfp = ev.certfp,
                         .session_token = session_token,
                     }, local_now) catch {};
-                    self.queueMembershipDelta(&ev, .ghost_reclaim, 0, null) catch {};
+                    self.queueMembershipDelta(&ev, .ghost_reclaim, 0, null, session_token, store_account_trusted) catch {};
                     return;
                 },
             };
             // Newcomer wins over a different-node incumbent: displace the
             // incumbent to ITS uid first so two holders never coexist. Skipped for
             // a same-account reconcile, where LWW collapses the duplicate instead.
-            if (!prior_alias and surfaced_nick == null and !skip_displace and
-                !self.displaceIncumbent(&ev)) return;
+            if (!prior_alias and surfaced_nick == null and !skip_displace) {
+                if (self.routes.nickNode(ev.nick)) |incumbent_node| if (incumbent_node != ev.origin_node) {
+                    const uid = self.routes.incumbentLoserUid(ev.nick) orelse return;
+                    var prepared = (self.routes.prepareWinningJoin(ev.channel, ev.nick, ev.origin_node, ev.status, ev.hlc, .{
+                        .username = ev.username,
+                        .realname = ev.realname,
+                        .host = ev.host,
+                        .account = store_account,
+                        .account_trusted = store_account_trusted,
+                        .real_host = ev.real_host,
+                        .certfp = ev.certfp,
+                        .session_token = session_token,
+                    }, local_now, &uid) catch return error.MembershipPreparePending) orelse return;
+                    defer prepared.deinit();
+                    var join_delta = self.ownedMembershipValues(ev.channel, ev.nick, ev.username, ev.realname, ev.host, ev.setter, ev.account, .joined, ev.status, 0) catch return error.MembershipPreparePending;
+                    var join_owned = true;
+                    defer if (join_owned) join_delta.deinit(self.allocator);
+                    self.membership_changes.ensureUnusedCapacity(self.allocator, 1) catch return error.MembershipPreparePending;
+                    self.identity_transition_order.ensureUnusedCapacity(self.allocator, 2) catch return error.MembershipPreparePending;
+                    if (!(self.displaceIncumbent(&ev) catch return error.MembershipPreparePending)) return;
+                    prepared.commit();
+                    self.membership_changes.appendAssumeCapacity(join_delta);
+                    self.stampMembershipProvenance(&self.membership_changes.items[self.membership_changes.items.len - 1], &ev, session_token, store_account_trusted);
+                    self.identity_transition_order.appendAssumeCapacity(.membership);
+                    join_owned = false;
+                    return;
+                };
+            }
         }
 
-        const res = self.routes.applyMembership(ev.channel, apply_nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
+        const identity_preparer = self.membership_identity_preparer orelse MembershipIdentityPreparer{ .ctx = self, .prepare_fn = prepareLegacyIdentity, .only_changed = true };
+        var retry_existing = false;
+        if (ev.present) for (self.routes.channelMembers(ev.channel)) |member| {
+            if (member.node == ev.origin_node and std.ascii.eqlIgnoreCase(member.nick, apply_nick) and ev.hlc > member.hlc) {
+                retry_existing = true;
+                break;
+            }
+        };
+        const res = self.routes.applyMembershipWithPreparer(ev.channel, apply_nick, ev.origin_node, ev.status, ev.hlc, ev.present, .{
             .username = ev.username,
             .realname = ev.realname,
             .host = ev.host,
@@ -3470,14 +3725,18 @@ pub const S2sPeer = struct {
             .real_host = ev.real_host,
             .certfp = ev.certfp,
             .session_token = session_token,
-        }, local_now) catch return;
+        }, local_now, identity_preparer) catch |err| switch (err) {
+            error.MembershipPreparePending, error.PublicIdentityProvenanceConflict => return err,
+            error.OutOfMemory => if (retry_existing) return error.MembershipPreparePending else return,
+            else => return,
+        };
         const kind: MembershipDelta.Kind = switch (res.outcome) {
             .joined => .joined,
             .parted => .parted,
             .status_changed => .status,
             .unchanged => return,
         };
-        self.queueMembershipDelta(&ev, kind, res.prev_status, surfaced_nick) catch return; // best-effort
+        self.queueMembershipDelta(&ev, kind, res.prev_status, surfaced_nick, session_token, store_account_trusted) catch return; // best-effort
     }
 
     /// When an incoming higher-priority claim wins a contested nick over a
@@ -3485,7 +3744,7 @@ pub const S2sPeer = struct {
     /// the route table and surface a `:contested NICK <incumbentUID>` line, so
     /// local clients never see the same nick held by two mesh users at once. No-op
     /// when there is no incumbent or the incumbent is the SAME node (own update).
-    fn displaceIncumbent(self: *S2sPeer, ev: *const membership_event.MembershipEvent) bool {
+    fn displaceIncumbent(self: *S2sPeer, ev: *const membership_event.MembershipEvent) !bool {
         return self.displaceIncumbentForRename(ev.nick, ev.origin_node);
     }
 
@@ -3494,7 +3753,7 @@ pub const S2sPeer = struct {
     /// own mesh UID across the route table and surface a `:nick NICK <incumbentUID>`
     /// line, so local clients never see two mesh users holding one nick. No-op when
     /// there is no incumbent or it is the same node (an own update, not a contest).
-    fn displaceIncumbentForRename(self: *S2sPeer, nick: []const u8, winner_node: NodeId) bool {
+    fn displaceIncumbentForRename(self: *S2sPeer, nick: []const u8, winner_node: NodeId) !bool {
         const incumbent_node = self.routes.nickNode(nick) orelse return true;
         if (incumbent_node == winner_node) return true;
         const uid = self.routes.incumbentLoserUid(nick) orelse return false;
@@ -3504,12 +3763,19 @@ pub const S2sPeer = struct {
         // Pull the incumbent's stored identity so the NICK line renders its real
         // user@host (falls back to empties when the member is route-only).
         var ident = MemberIdentity{};
-        if (self.routes.findMember(nick)) |m| {
+        if (self.routes.findMemberOwnedBy(nick, incumbent_node)) |m| {
             ident = .{ .username = m.username, .realname = m.realname, .host = m.host, .account = m.account };
         }
-        const renamed = self.routes.renameNick(nick, new_nick, incumbent_node, ident) catch return false;
+        var delta = try self.ownedNickDelta(nick, new_nick, incumbent_node, null, false, ident);
+        var delta_owned = true;
+        defer if (delta_owned) delta.deinit(self.allocator);
+        try self.nick_changes.ensureUnusedCapacity(self.allocator, 1);
+        try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 1);
+        const renamed = try self.routes.renameNick(nick, new_nick, incumbent_node, ident);
         if (!renamed) return false;
-        self.queueForcedNickRename(nick, new_nick, ident) catch {}; // best-effort surface
+        self.nick_changes.appendAssumeCapacity(delta);
+        self.identity_transition_order.appendAssumeCapacity(.nick);
+        delta_owned = false;
         return true;
     }
 
@@ -3520,9 +3786,12 @@ pub const S2sPeer = struct {
         self: *S2sPeer,
         old_nick: []const u8,
         new_nick: []const u8,
+        node: NodeId,
+        token: ?SessionToken,
+        fold_nick: bool,
         ident: MemberIdentity,
     ) !void {
-        var delta = try self.ownedNickDelta(old_nick, new_nick, ident);
+        var delta = try self.ownedNickDelta(old_nick, new_nick, node, token, fold_nick, ident);
         errdefer delta.deinit(self.allocator);
         try self.nick_changes.ensureUnusedCapacity(self.allocator, 1);
         try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 1);
@@ -3537,6 +3806,9 @@ pub const S2sPeer = struct {
         self: *S2sPeer,
         old_nick: []const u8,
         new_nick: []const u8,
+        node: NodeId,
+        token: ?SessionToken,
+        fold_nick: bool,
         ident: MemberIdentity,
     ) !NickDelta {
         const on = try self.allocator.dupe(u8, old_nick);
@@ -3549,12 +3821,15 @@ pub const S2sPeer = struct {
         errdefer self.allocator.free(rn);
         const ho = try self.allocator.dupe(u8, ident.host);
         errdefer self.allocator.free(ho);
+        const channels = try self.routes.ownedNickChannels(self.allocator, old_nick, node, token, fold_nick);
         return .{
             .old_nick = on,
             .new_nick = nn,
             .username = un,
             .realname = rn,
             .host = ho,
+            .origin_node = node,
+            .channels = channels,
         };
     }
 
@@ -3567,30 +3842,26 @@ pub const S2sPeer = struct {
         node: NodeId,
         old_nick: []const u8,
         new_nick: []const u8,
-        token: SessionToken,
+        token: ?SessionToken,
         ident: MemberIdentity,
         incumbent_node: NodeId,
         incumbent_uid: []const u8,
     ) !bool {
-        const incumbent = self.routes.findMemberOwnedBy(new_nick, incumbent_node) orelse return false;
-        const incumbent_ident = MemberIdentity{
-            .username = incumbent.username,
-            .realname = incumbent.realname,
-            .host = incumbent.host,
-            .account = incumbent.account,
-            .account_trusted = incumbent.account_trusted,
-        };
+        var incumbent_ident = MemberIdentity{};
+        if (self.routes.findMemberOwnedBy(new_nick, incumbent_node)) |incumbent| {
+            incumbent_ident = .{ .username = incumbent.username, .realname = incumbent.realname, .host = incumbent.host, .account = incumbent.account, .account_trusted = incumbent.account_trusted };
+        }
 
-        var incumbent_delta = try self.ownedNickDelta(new_nick, incumbent_uid, incumbent_ident);
+        var incumbent_delta = try self.ownedNickDelta(new_nick, incumbent_uid, incumbent_node, null, token != null, incumbent_ident);
         var incumbent_delta_owned = true;
         defer if (incumbent_delta_owned) incumbent_delta.deinit(self.allocator);
-        var exact_delta = try self.ownedNickDelta(old_nick, new_nick, ident);
+        var exact_delta = try self.ownedNickDelta(old_nick, new_nick, node, null, token != null, ident);
         var exact_delta_owned = true;
         defer if (exact_delta_owned) exact_delta.deinit(self.allocator);
         try self.nick_changes.ensureUnusedCapacity(self.allocator, 2);
         try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 2);
 
-        const renamed = try self.routes.renameNickBindingSessionTokenDisplacing(
+        const renamed = try self.routes.renameNickDisplacing(
             node,
             old_nick,
             new_nick,
@@ -3622,6 +3893,8 @@ pub const S2sPeer = struct {
         kind: MembershipDelta.Kind,
         prev_status: u4,
         nick_override: ?[]const u8,
+        session_token: ?SessionToken,
+        account_trusted: bool,
     ) !void {
         try self.queueMembershipValues(
             ev.channel,
@@ -3635,6 +3908,17 @@ pub const S2sPeer = struct {
             ev.status,
             prev_status,
         );
+        self.stampMembershipProvenance(&self.membership_changes.items[self.membership_changes.items.len - 1], ev, session_token, account_trusted);
+    }
+
+    fn stampMembershipProvenance(self: *const S2sPeer, delta: *MembershipDelta, ev: *const membership_event.MembershipEvent, session_token: ?SessionToken, account_trusted: bool) void {
+        delta.source_provenance = .{
+            .origin_node = ev.origin_node,
+            .hlc = ev.hlc,
+            .session_token = session_token,
+            .account_trusted = account_trusted,
+            .authenticated_direct = self.peer_supports_signing and self.remote_node_id != 0 and ev.origin_node == self.remote_node_id,
+        };
     }
 
     fn queueMembershipValues(
@@ -3650,6 +3934,15 @@ pub const S2sPeer = struct {
         status: u4,
         prev_status: u4,
     ) !void {
+        var delta = try self.ownedMembershipValues(channel, nick, username_value, realname_value, host_value, setter_value, account_value, kind, status, prev_status);
+        errdefer delta.deinit(self.allocator);
+        try self.membership_changes.ensureUnusedCapacity(self.allocator, 1);
+        try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 1);
+        self.membership_changes.appendAssumeCapacity(delta);
+        self.identity_transition_order.appendAssumeCapacity(.membership);
+    }
+
+    fn ownedMembershipValues(self: *S2sPeer, channel: []const u8, nick: []const u8, username_value: []const u8, realname_value: []const u8, host_value: []const u8, setter_value: []const u8, account_value: []const u8, kind: MembershipDelta.Kind, status: u4, prev_status: u4) !MembershipDelta {
         const ch = try self.allocator.dupe(u8, channel);
         errdefer self.allocator.free(ch);
         const nk = try self.allocator.dupe(u8, nick);
@@ -3664,9 +3957,7 @@ pub const S2sPeer = struct {
         errdefer self.allocator.free(st);
         const ac = try self.allocator.dupe(u8, account_value);
         errdefer self.allocator.free(ac);
-        try self.membership_changes.ensureUnusedCapacity(self.allocator, 1);
-        try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 1);
-        self.membership_changes.appendAssumeCapacity(.{
+        return .{
             .channel = ch,
             .nick = nk,
             .username = un,
@@ -3677,8 +3968,7 @@ pub const S2sPeer = struct {
             .kind = kind,
             .status = status,
             .prev_status = prev_status,
-        });
-        self.identity_transition_order.appendAssumeCapacity(.membership);
+        };
     }
 
     /// Apply an inbound CHANNEL_MODE_FLAGS event to the route table (LWW by hlc).
@@ -4143,7 +4433,15 @@ pub const S2sPeer = struct {
     /// Malformed payloads and no-op renames are dropped.
     fn recvNickChange(self: *S2sPeer, frame_payload: []const u8) !void {
         const payload = self.verifiedPayload(.NICKCHANGE, frame_payload) orelse return;
-        try self.applyNickChangePayload(payload);
+        _ = nick_event.decode(payload) catch return;
+        if (payload.len > self.pending_nick.len) return;
+        self.applyNickChangePayload(payload) catch |err| switch (err) {
+            error.OutOfMemory => {
+                @memcpy(self.pending_nick[0..payload.len], payload);
+                self.pending_nick_len = payload.len;
+            },
+            else => return err,
+        };
     }
 
     fn applyNickChangePayload(self: *S2sPeer, payload: []const u8) !void {
@@ -4217,12 +4515,12 @@ pub const S2sPeer = struct {
         switch (self.routes.resolveIncomingNick(ev.new_nick, ev.origin_node, ev.hlc, ev.account, account_trusted)) {
             .keep => {
                 if (self.routes.nickNode(ev.new_nick)) |incumbent_node| {
-                    if (incumbent_node != ev.origin_node and bind_token != null) {
+                    if (incumbent_node != ev.origin_node) {
                         const uid = self.routes.incumbentLoserUid(ev.new_nick) orelse return;
                         @memcpy(incumbent_uid_buf[0..uid.len], uid[0..]);
                         incumbent_uid = incumbent_uid_buf[0..uid.len];
                         collision_incumbent = incumbent_node;
-                    } else if (!self.displaceIncumbentForRename(ev.new_nick, ev.origin_node)) return;
+                    }
                 }
             },
             .rename_to_uid => |uid| {
@@ -4241,22 +4539,14 @@ pub const S2sPeer = struct {
             .remote_same_account => {},
         }
 
+        if (collision_incumbent) |incumbent_node| {
+            const renamed = try self.applyAuthorizedSessionTokenCollisionRename(ev.origin_node, old_nick, target_nick, bind_token, ident, incumbent_node, incumbent_uid);
+            if (!renamed) return;
+            return;
+        }
         if (bind_token) |token| {
-            if (collision_incumbent) |incumbent_node| {
-                const renamed = self.applyAuthorizedSessionTokenCollisionRename(
-                    ev.origin_node,
-                    old_nick,
-                    target_nick,
-                    token,
-                    ident,
-                    incumbent_node,
-                    incumbent_uid,
-                ) catch return;
-                if (!renamed) return;
-                return;
-            }
             var wire_ctx = WireNickRenameContext{ .peer = self, .ident = ident };
-            const renamed = self.routes.renameNickBindingSessionToken(
+            const renamed = try self.routes.renameNickBindingSessionToken(
                 ev.origin_node,
                 old_nick,
                 target_nick,
@@ -4267,12 +4557,19 @@ pub const S2sPeer = struct {
                     .part_fn = rejectWireNickPart,
                     .rename_fn = queueAuthorizedWireNick,
                 },
-            ) catch return;
+            );
             if (!renamed) return;
         } else {
-            const renamed = self.routes.renameNick(old_nick, target_nick, ev.origin_node, ident) catch return;
+            var delta = try self.ownedNickDelta(old_nick, target_nick, ev.origin_node, null, false, ident);
+            var delta_owned = true;
+            defer if (delta_owned) delta.deinit(self.allocator);
+            try self.nick_changes.ensureUnusedCapacity(self.allocator, 1);
+            try self.identity_transition_order.ensureUnusedCapacity(self.allocator, 1);
+            const renamed = try self.routes.renameNick(old_nick, target_nick, ev.origin_node, ident);
             if (!renamed) return;
-            self.queueForcedNickRename(old_nick, target_nick, ident) catch return;
+            self.nick_changes.appendAssumeCapacity(delta);
+            self.identity_transition_order.appendAssumeCapacity(.nick);
+            delta_owned = false;
         }
     }
 
@@ -4340,6 +4637,17 @@ pub const S2sPeer = struct {
             return error.UnexpectedRemote;
         }
 
+        // Current transport proof is directional and belongs to this preserved
+        // byte stream. RESYNC repeats compatible HANDSHAKEs amid queued current
+        // facts; clearing RX after an earlier PONG would drop that authority.
+        const retain_group_v4 = self.established and
+            (self.peer_supports_session_group_v4 or self.session_group_rx_v4);
+        if (retain_group_v4 and
+            (!self.config.session_group_inventory_enabled or !self.session_replica_transport_enabled or
+                self.signing_key == null or hs.caps & cap_frame_signing == 0 or hs.caps & cap_session_replica_v2 == 0 or
+                (self.peer_supports_session_replica_v3 and !self.session_replica_attachment_transport_enabled)))
+            return error.CapabilityVersionMismatch;
+
         // Record the negotiated signing capability. From here on, in-scope frames
         // to/from a signing-capable peer travel inside a `signed_frame` envelope,
         // and an UNSIGNED in-scope frame from such a peer is rejected.
@@ -4352,9 +4660,13 @@ pub const S2sPeer = struct {
         self.peer_supports_session_attachment_lease_v2 = self.peer_supports_session_replica_v2 and
             (hs.caps & cap_session_attachment_lease_v2) != 0;
         // The base caps byte cannot represent another version (all eight bits
-        // are assigned). A new handshake therefore returns to v2 until the
-        // authenticated append-only PING/PONG extension is observed again.
-        self.peer_supports_session_replica_v3 = false;
+        // are assigned). Fresh streams start at v2. Current proof on an
+        // established stream remains mandatory across compatible RESYNCs.
+        if (!retain_group_v4) {
+            self.peer_supports_session_group_v4 = false;
+            self.session_group_rx_v4 = false;
+        }
+        if (!retain_group_v4) self.peer_supports_session_replica_v3 = false;
         self.peer_supports_read_markers = false;
         // A preserved established stream can transition from the old negotiated
         // capability set without receiving another RESYNC in this direction.
@@ -4460,6 +4772,8 @@ pub const S2sPeer = struct {
         {
             try emitFrame(self.allocator, sink, .PING, session_replica_v3_probe);
         }
+        if (self.session_replica_transport_enabled and self.config.session_group_inventory_enabled and self.signing_key != null)
+            try emitFrame(self.allocator, sink, .PING, session_group_v4_probe);
         try emitFrame(self.allocator, sink, .PING, whois_profile_extension_probe);
         self.handshake_sent = true;
     }
@@ -5101,7 +5415,7 @@ test "identity transition queue preserves mixed order and legacy drains discard 
     const ident = MemberIdentity{ .username = "device", .realname = "Device B", .host = "mesh.test" };
 
     try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
-    try peer.queueForcedNickRename("DeviceB", "Nova", ident);
+    try peer.queueForcedNickRename("DeviceB", "Nova", 2, null, false, ident);
     try peer.queueMembershipValues("#new", "Nova", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
 
     var first = peer.takeNextIdentityTransition() orelse return error.TestUnexpectedResult;
@@ -5137,7 +5451,7 @@ test "identity transition queue preserves mixed order and legacy drains discard 
     // only membership markers, leaving the intervening NICK as the next mixed
     // transition instead of stranding stale markers behind empty typed queues.
     try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
-    try peer.queueForcedNickRename("DeviceB", "Nova", ident);
+    try peer.queueForcedNickRename("DeviceB", "Nova", 2, null, false, ident);
     try peer.queueMembershipValues("#new", "Nova", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
     const memberships = try peer.takeMembershipChanges();
     defer allocator.free(memberships);
@@ -5151,7 +5465,7 @@ test "identity transition queue preserves mixed order and legacy drains discard 
     try std.testing.expect(peer.takeNextIdentityTransition() == null);
 
     try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
-    try peer.queueForcedNickRename("DeviceB", "Nova", ident);
+    try peer.queueForcedNickRename("DeviceB", "Nova", 2, null, false, ident);
     try peer.queueMembershipValues("#new", "Nova", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
     const nicks = try peer.takeNickChanges();
     defer allocator.free(nicks);
@@ -9624,4 +9938,850 @@ test "MARKREAD mesh extension gates private facts and rejects legacy echo and un
     defer allocator.free(unsigned);
     try std.testing.expectEqual(@as(usize, 0), unsigned.len);
     try std.testing.expect(a.rejected_signature_frames > 0);
+}
+
+const GroupV4DirectionalTest = struct {
+    tc: TestClock = .{ .now_ms = 10 },
+    a_state: ChannelCrdt,
+    b_state: ChannelCrdt,
+    a: S2sPeer,
+    b: S2sPeer,
+    a_to_b: BufferSink = .{},
+    b_to_a: BufferSink = .{},
+
+    fn create() !*@This() {
+        const allocator = std.testing.allocator;
+        const self = try allocator.create(@This());
+        errdefer allocator.destroy(self);
+        self.* = .{ .a_state = ChannelCrdt.init(allocator, 1), .b_state = ChannelCrdt.init(allocator, 2), .a = undefined, .b = undefined };
+        errdefer self.a_state.deinit();
+        errdefer self.b_state.deinit();
+        var ka = try signingKeyFor(0xb1);
+        var ka_transferred = false;
+        defer if (!ka_transferred) ka.deinit();
+        var kb = try signingKeyFor(0xb2);
+        var kb_transferred = false;
+        defer if (!kb_transferred) kb.deinit();
+        self.a = try newSigningPeer(allocator, &self.a_state, &self.tc, ka, signed_frame.originShortId(kb.public_key), 1000, "a.test");
+        ka_transferred = true;
+        errdefer self.a.deinit();
+        self.b = try newSigningPeer(allocator, &self.b_state, &self.tc, kb, signed_frame.originShortId(ka.public_key), 2000, "b.test");
+        kb_transferred = true;
+        errdefer self.b.deinit();
+        self.a.session_replica_transport_enabled = true;
+        self.b.session_replica_transport_enabled = true;
+        errdefer self.a_to_b.deinit(allocator);
+        errdefer self.b_to_a.deinit(allocator);
+        try self.a.startHandshake(self.a_to_b.sink());
+        try self.b.startHandshake(self.b_to_a.sink());
+        try pump(&self.a, &self.b, &self.a_to_b, &self.b_to_a, self.tc.now_ms, 0x5400);
+        try std.testing.expect(self.a.supportsSessionReplicaV2() and self.b.supportsSessionReplicaV2());
+        try std.testing.expect(!self.a.peer_supports_session_group_v4 and !self.a.session_group_rx_v4);
+        try std.testing.expect(!self.b.peer_supports_session_group_v4 and !self.b.session_group_rx_v4);
+        // Model activation on an already secured v2 stream so each independent
+        // negotiation direction can be scheduled without an eager pump.
+        self.a.config.session_group_inventory_enabled = true;
+        self.b.config.session_group_inventory_enabled = true;
+        return self;
+    }
+
+    fn destroy(self: *@This()) void {
+        self.a.deinit();
+        self.b.deinit();
+        self.a_state.deinit();
+        self.b_state.deinit();
+        self.a_to_b.deinit(std.testing.allocator);
+        self.b_to_a.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(self);
+    }
+
+    fn feedA(self: *@This()) !void {
+        try self.a.feed(self.b_to_a.bytes.items, self.a_to_b.sink(), self.tc.now_ms, 0x5401);
+        self.b_to_a.clear();
+    }
+
+    fn feedB(self: *@This()) !void {
+        try self.b.feed(self.a_to_b.bytes.items, self.b_to_a.sink(), self.tc.now_ms, 0x5402);
+        self.a_to_b.clear();
+    }
+
+    fn resumeDirectional(self: *@This(), source: *const S2sPeer, state: *ChannelCrdt, header: S2sPeer.ResumeHeader) !S2sPeer {
+        var options = self.resumeOptions(source, state);
+        var key = try source.signing_key.?.clone();
+        errdefer key.deinit();
+        options.signing_key = key;
+        return S2sPeer.resumeEstablished(options, header, source.remoteName(), 11, 0x5410);
+    }
+
+    fn resumeOptions(self: *@This(), source: *const S2sPeer, state: *ChannelCrdt) Options {
+        return .{ .allocator = std.testing.allocator, .state = state, .clock = self.tc.clock(), .local_node_id = source.local_node_id, .remote_node_id = source.remote_node_id, .local_epoch_ms = source.local_epoch_ms, .server_name = source.server_name, .description = "directional resume", .config = source.config, .signing_key = source.signing_key, .session_replica_transport_enabled = true, .session_replica_attachment_transport_enabled = source.session_replica_attachment_transport_enabled };
+    }
+};
+
+test "session group v4 directional negotiation preserves queued v2 before each pong barrier" {
+    const fixture = try GroupV4DirectionalTest.create();
+    defer fixture.destroy();
+    const allocator = std.testing.allocator;
+    const offer = try fakeSessionReplicaObject(allocator, .offer);
+    defer allocator.free(offer);
+    const ack = try fakeSessionReplicaObject(allocator, .ack);
+    defer allocator.free(ack);
+    const revoke = try fakeSessionReplicaObject(allocator, .revoke);
+    defer allocator.free(revoke);
+    const lease = try fakeSessionReplicaObject(allocator, .attachment_lease);
+    defer allocator.free(lease);
+    // B already queued a frozen offer when A starts probing. A can still queue
+    // old traffic behind that probe: B's RX schema is independent of its TX.
+    try fixture.b.sendSessionReplicaOffer(fixture.b_to_a.sink(), offer);
+    try fixture.a.sendPing(session_group_v4_probe, fixture.a_to_b.sink());
+    try fixture.a.sendSessionReplicaAck(fixture.a_to_b.sink(), ack);
+    try fixture.feedB();
+    try std.testing.expect(fixture.b.supportsSessionGroupV4() and !fixture.b.session_group_rx_v4);
+    try fixture.b.sendSessionReplicaRevoke(fixture.b_to_a.sink(), revoke);
+    // One socket read contains old offer, PONG barrier, then current revoke.
+    try fixture.feedA();
+    try std.testing.expect(!fixture.a.supportsSessionGroupV4() and fixture.a.session_group_rx_v4);
+    try fixture.a.sendSessionAttachmentLease(fixture.a_to_b.sink(), lease);
+    try fixture.feedB();
+    try std.testing.expect(!fixture.b.session_group_rx_v4);
+    try fixture.b.sendPing(session_group_v4_probe, fixture.b_to_a.sink());
+    try fixture.feedA();
+    try std.testing.expect(fixture.a.supportsSessionGroupV4());
+    try fixture.a.sendSessionReplicaOffer(fixture.a_to_b.sink(), offer);
+    try fixture.feedB();
+    try std.testing.expect(fixture.b.session_group_rx_v4);
+    const a_frames = try fixture.a.takeSessionReplicaFrames();
+    defer {
+        for (a_frames) |*frame| frame.deinit(allocator);
+        allocator.free(a_frames);
+    }
+    try std.testing.expectEqual(@as(usize, 2), a_frames.len);
+    try std.testing.expectEqual(session_replica_frame.WireVersion.token_v2, a_frames[0].version);
+    try std.testing.expectEqual(session_replica_frame.WireVersion.current_v4, a_frames[1].version);
+    try std.testing.expectEqualSlices(u8, offer, a_frames[0].signed_payload);
+    try std.testing.expectEqualSlices(u8, revoke, a_frames[1].signed_payload);
+    const b_frames = try fixture.b.takeSessionReplicaFrames();
+    defer {
+        for (b_frames) |*frame| frame.deinit(allocator);
+        allocator.free(b_frames);
+    }
+    try std.testing.expectEqual(@as(usize, 3), b_frames.len);
+    for (b_frames, [_]session_replica_frame.Kind{ .ack, .attachment_lease, .offer }, [_][]const u8{ ack, lease, offer }, 0..) |frame, kind, bytes, index| {
+        try std.testing.expectEqual(kind, frame.kind);
+        try std.testing.expectEqual(if (index == 2) session_replica_frame.WireVersion.current_v4 else session_replica_frame.WireVersion.token_v2, frame.version);
+        try std.testing.expectEqualSlices(u8, bytes, frame.signed_payload);
+    }
+    try std.testing.expect(fixture.a.takeNextSessionReplicaFrame() == null and fixture.b.takeNextSessionReplicaFrame() == null);
+    try std.testing.expectEqual(@as(u64, 0), fixture.a.takeRejectedOriginFrames());
+    try std.testing.expectEqual(@as(u64, 0), fixture.b.takeRejectedOriginFrames());
+    try std.testing.expectEqual(@as(u64, 0), fixture.a.takeDroppedSessionReplicaFrames());
+    try std.testing.expectEqual(@as(u64, 0), fixture.b.takeDroppedSessionReplicaFrames());
+}
+
+test "session group v4 midpoint resume preserves independent tx only and rx only states" {
+    const fixture = try GroupV4DirectionalTest.create();
+    defer fixture.destroy();
+    const allocator = std.testing.allocator;
+    try fixture.a.sendPing(session_group_v4_probe, fixture.a_to_b.sink());
+    try fixture.feedB();
+    const tx_header = fixture.b.snapshotResume();
+    try std.testing.expect(tx_header.peer_supports_session_group_v4 and !tx_header.session_group_rx_v4);
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    var b = try fixture.resumeDirectional(&fixture.b, &b_state, tx_header);
+    defer b.deinit();
+    try std.testing.expect(b.supportsSessionGroupV4() and !b.session_group_rx_v4);
+    const offer = try fakeSessionReplicaObject(allocator, .offer);
+    defer allocator.free(offer);
+    // A's old direction remains acceptable after B's TX-only upgrade. B's
+    // current frame follows its already-queued PONG on the preserved stream.
+    try fixture.a.sendSessionReplicaOffer(fixture.a_to_b.sink(), offer);
+    try b.feed(fixture.a_to_b.bytes.items, fixture.b_to_a.sink(), 11, 0x5411);
+    fixture.a_to_b.clear();
+    try b.sendSessionReplicaOffer(fixture.b_to_a.sink(), offer);
+    try fixture.feedA();
+    const rx_header = fixture.a.snapshotResume();
+    try std.testing.expect(!rx_header.peer_supports_session_group_v4 and rx_header.session_group_rx_v4);
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var a = try fixture.resumeDirectional(&fixture.a, &a_state, rx_header);
+    defer a.deinit();
+    try std.testing.expect(!a.supportsSessionGroupV4() and a.session_group_rx_v4);
+    try a.sendSessionReplicaOffer(fixture.a_to_b.sink(), offer);
+    try b.feed(fixture.a_to_b.bytes.items, fixture.b_to_a.sink(), 11, 0x5413);
+    fixture.a_to_b.clear();
+    try b.sendSessionReplicaOffer(fixture.b_to_a.sink(), offer);
+    try a.feed(fixture.b_to_a.bytes.items, fixture.a_to_b.sink(), 11, 0x5414);
+    fixture.b_to_a.clear();
+    const b_frames = try b.takeSessionReplicaFrames();
+    defer {
+        for (b_frames) |*frame| frame.deinit(allocator);
+        allocator.free(b_frames);
+    }
+    try std.testing.expectEqual(@as(usize, 2), b_frames.len);
+    for (b_frames) |frame| {
+        try std.testing.expectEqual(session_replica_frame.WireVersion.token_v2, frame.version);
+        try std.testing.expectEqualSlices(u8, offer, frame.signed_payload);
+    }
+    const a_frames = try a.takeSessionReplicaFrames();
+    defer {
+        for (a_frames) |*frame| frame.deinit(allocator);
+        allocator.free(a_frames);
+    }
+    try std.testing.expectEqual(@as(usize, 1), a_frames.len);
+    try std.testing.expectEqual(session_replica_frame.WireVersion.current_v4, a_frames[0].version);
+    // The first pre-upgrade A receive was already delivered, never duplicated
+    // into the fresh peer queue by reconstruction.
+    const prior_a_frames = try fixture.a.takeSessionReplicaFrames();
+    defer {
+        for (prior_a_frames) |*frame| frame.deinit(allocator);
+        allocator.free(prior_a_frames);
+    }
+    try std.testing.expectEqual(@as(usize, 1), prior_a_frames.len);
+    for ([_]S2sPeer.ResumeHeader{ tx_header, rx_header }) |header| {
+        var options = fixture.resumeOptions(&fixture.a, &a_state);
+        options.config.session_group_inventory_enabled = false;
+        try std.testing.expectError(error.CapabilityVersionMismatch, S2sPeer.resumeEstablished(options, header, "peer.test", 11, 1));
+        options = fixture.resumeOptions(&fixture.a, &a_state);
+        options.session_replica_transport_enabled = false;
+        try std.testing.expectError(error.CapabilityVersionMismatch, S2sPeer.resumeEstablished(options, header, "peer.test", 11, 1));
+        options = fixture.resumeOptions(&fixture.a, &a_state);
+        options.signing_key = null;
+        try std.testing.expectError(error.CapabilityVersionMismatch, S2sPeer.resumeEstablished(options, header, "peer.test", 11, 1));
+        var invalid = header;
+        invalid.peer_supports_signing = false;
+        try std.testing.expectError(error.CapabilityVersionMismatch, S2sPeer.resumeEstablished(fixture.resumeOptions(&fixture.a, &a_state), invalid, "peer.test", 11, 1));
+        invalid = header;
+        invalid.peer_supports_session_replica_v2 = false;
+        try std.testing.expectError(error.CapabilityVersionMismatch, S2sPeer.resumeEstablished(fixture.resumeOptions(&fixture.a, &a_state), invalid, "peer.test", 11, 1));
+    }
+    try std.testing.expectEqual(@as(u64, 0), a.takeRejectedOriginFrames());
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "session group v4 tx transition waits until reply sink accepts pong" {
+    const fixture = try GroupV4DirectionalTest.create();
+    defer fixture.destroy();
+    const RejectReply = struct {
+        buffer: BufferSink = .{},
+        fn write(ptr: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, bytes, session_group_v4_reply)) return error.OutOfMemory;
+            try self.buffer.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    var rejected = RejectReply{};
+    defer rejected.buffer.deinit(std.testing.allocator);
+    try fixture.a.sendPing(session_group_v4_probe, fixture.a_to_b.sink());
+    try std.testing.expectError(error.OutOfMemory, fixture.b.feed(fixture.a_to_b.bytes.items, .{ .ptr = &rejected, .write_fn = RejectReply.write }, 10, 0x5420));
+    fixture.a_to_b.clear();
+    try std.testing.expect(!fixture.b.supportsSessionGroupV4() and !fixture.b.session_group_rx_v4);
+    try fixture.a.feed(rejected.buffer.bytes.items, fixture.a_to_b.sink(), 10, 0x5421);
+    try std.testing.expect(!fixture.a.session_group_rx_v4);
+    try fixture.a.sendPing(session_group_v4_probe, fixture.a_to_b.sink());
+    try fixture.feedB();
+    try std.testing.expect(fixture.b.supportsSessionGroupV4());
+    try fixture.feedA();
+    try std.testing.expect(fixture.a.session_group_rx_v4);
+}
+
+test "session group v4 resync retains ordinary offer revoke lease across repeated handshakes" {
+    const fixture = try GroupV4DirectionalTest.create();
+    defer fixture.destroy();
+    const allocator = std.testing.allocator;
+    try fixture.a.sendPing(session_group_v4_probe, fixture.a_to_b.sink());
+    try fixture.b.sendPing(session_group_v4_probe, fixture.b_to_a.sink());
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5430);
+    try std.testing.expect(fixture.a.supportsSessionGroupV4() and fixture.a.session_group_rx_v4);
+    try std.testing.expect(fixture.b.supportsSessionGroupV4() and fixture.b.session_group_rx_v4);
+    const offer = try fakeSessionReplicaObject(allocator, .offer);
+    defer allocator.free(offer);
+    const revoke = try fakeSessionReplicaObject(allocator, .revoke);
+    defer allocator.free(revoke);
+    const lease = try fakeSessionReplicaObject(allocator, .attachment_lease);
+    defer allocator.free(lease);
+    // A preserved stream already contains current authority. RESYNC inserts
+    // reciprocal ordinary HANDSHAKEs and probes amid retained replay traffic.
+    try fixture.b.sendSessionReplicaOffer(fixture.b_to_a.sink(), offer);
+    try fixture.a.sendResync(fixture.a_to_b.sink());
+    try fixture.a.sendSessionReplicaOffer(fixture.a_to_b.sink(), offer);
+    try fixture.feedB();
+    try fixture.b.sendSessionReplicaRevoke(fixture.b_to_a.sink(), revoke);
+    try fixture.feedA();
+    try fixture.a.sendSessionReplicaRevoke(fixture.a_to_b.sink(), revoke);
+    try fixture.a.sendSessionAttachmentLease(fixture.a_to_b.sink(), lease);
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5431);
+    const a_frames = try fixture.a.takeSessionReplicaFrames();
+    defer {
+        for (a_frames) |*frame| frame.deinit(allocator);
+        allocator.free(a_frames);
+    }
+    const b_frames = try fixture.b.takeSessionReplicaFrames();
+    defer {
+        for (b_frames) |*frame| frame.deinit(allocator);
+        allocator.free(b_frames);
+    }
+    try std.testing.expectEqual(@as(usize, 2), a_frames.len);
+    try std.testing.expectEqual(@as(usize, 3), b_frames.len);
+    for (a_frames, [_][]const u8{ offer, revoke }) |frame, bytes| {
+        try std.testing.expectEqual(session_replica_frame.WireVersion.current_v4, frame.version);
+        try std.testing.expectEqualSlices(u8, bytes, frame.signed_payload);
+    }
+    for (b_frames, [_][]const u8{ offer, revoke, lease }) |frame, bytes| {
+        try std.testing.expectEqual(session_replica_frame.WireVersion.current_v4, frame.version);
+        try std.testing.expectEqualSlices(u8, bytes, frame.signed_payload);
+    }
+    try std.testing.expectEqual(@as(u64, 0), fixture.a.takeRejectedOriginFrames());
+    try std.testing.expectEqual(@as(u64, 0), fixture.b.takeRejectedOriginFrames());
+    try std.testing.expect(fixture.a.supportsSessionGroupV4() and fixture.a.session_group_rx_v4);
+    try std.testing.expect(fixture.b.supportsSessionGroupV4() and fixture.b.session_group_rx_v4);
+    for ([_]u8{ cap_frame_signing, cap_session_replica_v2 }) |missing_capability| {
+        const downgrade = try encodeHandshake(allocator, .{ .node_id = fixture.a.local_node_id, .epoch_ms = 1000, .name = "a.test", .description = "incompatible preserved stream", .caps = (cap_frame_signing | cap_session_replica_v2) & ~missing_capability });
+        defer allocator.free(downgrade);
+        try emitFrame(allocator, fixture.a_to_b.sink(), .HANDSHAKE, downgrade);
+        try std.testing.expectError(error.CapabilityVersionMismatch, fixture.b.feed(fixture.a_to_b.bytes.items, fixture.b_to_a.sink(), 10, 0x5432));
+        fixture.a_to_b.clear();
+        try std.testing.expect(fixture.b.supportsSessionGroupV4() and fixture.b.session_group_rx_v4);
+        try std.testing.expect(fixture.b.peer_supports_signing and fixture.b.peer_supports_session_replica_v2);
+    }
+    fixture.a.config.session_group_inventory_enabled = false;
+    try std.testing.expectError(error.CapabilityVersionMismatch, fixture.a.sendSessionReplicaOffer(fixture.a_to_b.sink(), offer));
+    try std.testing.expectEqual(@as(usize, 0), fixture.a_to_b.bytes.items.len);
+}
+
+test "session group v4 coexists with independently negotiated attachment v3 for every kind and resync" {
+    const fixture = try GroupV4DirectionalTest.create();
+    defer fixture.destroy();
+    const allocator = std.testing.allocator;
+    fixture.a.session_replica_attachment_transport_enabled = true;
+    fixture.b.session_replica_attachment_transport_enabled = true;
+    try fixture.a.probeSessionReplicaV3(fixture.a_to_b.sink());
+    try fixture.b.probeSessionReplicaV3(fixture.b_to_a.sink());
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5440);
+    try std.testing.expect(fixture.a.supportsSessionReplicaV3() and fixture.b.supportsSessionReplicaV3());
+    try fixture.a.sendPing(session_group_v4_probe, fixture.a_to_b.sink());
+    try fixture.b.sendPing(session_group_v4_probe, fixture.b_to_a.sink());
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5441);
+    try std.testing.expect(fixture.a.supportsSessionGroupV4() and fixture.a.session_group_rx_v4);
+    try std.testing.expect(fixture.b.supportsSessionGroupV4() and fixture.b.session_group_rx_v4);
+    const kinds = [_]session_replica_frame.Kind{ .offer, .revoke, .ack, .attachment_lease };
+    var objects3: [kinds.len][]u8 = undefined;
+    var objects4: [kinds.len][]u8 = undefined;
+    var initialized3: usize = 0;
+    var initialized4: usize = 0;
+    defer for (objects3[0..initialized3]) |bytes| allocator.free(bytes);
+    defer for (objects4[0..initialized4]) |bytes| allocator.free(bytes);
+    for (kinds, 0..) |kind, i| {
+        objects3[i] = try fakeAttachmentSessionReplicaObject(allocator, kind);
+        initialized3 += 1;
+        objects4[i] = try fakeSessionReplicaObject(allocator, kind);
+        initialized4 += 1;
+        try fixture.a.sendAttachmentSessionReplica(fixture.a_to_b.sink(), kind, objects3[i]);
+        try fixture.a.sendSessionReplica(fixture.a_to_b.sink(), kind, objects4[i]);
+    }
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5442);
+    const frames = try fixture.b.takeSessionReplicaFrames();
+    defer {
+        for (frames) |*frame| frame.deinit(allocator);
+        allocator.free(frames);
+    }
+    try std.testing.expectEqual(@as(usize, 8), frames.len);
+    for (kinds, 0..) |kind, i| {
+        try std.testing.expectEqual(session_replica_frame.WireVersion.attachment_v3, frames[i * 2].version);
+        try std.testing.expectEqual(kind, frames[i * 2].kind);
+        try std.testing.expectEqualSlices(u8, objects3[i], frames[i * 2].signed_payload);
+        try std.testing.expectEqual(session_replica_frame.WireVersion.current_v4, frames[i * 2 + 1].version);
+        try std.testing.expectEqual(kind, frames[i * 2 + 1].kind);
+        try std.testing.expectEqualSlices(u8, objects4[i], frames[i * 2 + 1].signed_payload);
+    }
+    // A repeated compatible handshake cannot silently retire either active
+    // family on this preserved current stream while replay is in flight.
+    try fixture.a.sendResync(fixture.a_to_b.sink());
+    try fixture.a.sendAttachmentSessionReplica(fixture.a_to_b.sink(), .offer, objects3[0]);
+    try fixture.a.sendSessionReplicaOffer(fixture.a_to_b.sink(), objects4[0]);
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5443);
+    try std.testing.expect(fixture.a.supportsSessionReplicaV3() and fixture.b.supportsSessionReplicaV3());
+    const replay = try fixture.b.takeSessionReplicaFrames();
+    defer {
+        for (replay) |*frame| frame.deinit(allocator);
+        allocator.free(replay);
+    }
+    try std.testing.expectEqual(@as(usize, 2), replay.len);
+    try std.testing.expectEqual(session_replica_frame.WireVersion.attachment_v3, replay[0].version);
+    try std.testing.expectEqual(session_replica_frame.WireVersion.current_v4, replay[1].version);
+    try std.testing.expectEqual(@as(u64, 0), fixture.b.takeRejectedOriginFrames());
+    // Wrong declarations are rejected even though the other family would
+    // decode successfully. No malformed-v4-to-v3 fallback is permitted.
+    var wire: [512]u8 = undefined;
+    const frozen = try session_replica_frame.encode(.offer, objects4[0], &wire);
+    try fixture.a.emitSignable(fixture.a_to_b.sink(), .SESSION_REPLICA_OFFER, frozen);
+    const declared4 = try session_replica_frame.encodeAttachment(.offer, objects3[0], &wire);
+    wire[session_replica_frame.magic.len] = session_replica_frame.current_version;
+    try fixture.a.emitSignable(fixture.a_to_b.sink(), .SESSION_REPLICA_OFFER, declared4);
+    const declared3 = try session_replica_frame.encodeCurrent(.offer, objects4[0], &wire);
+    wire[session_replica_frame.magic.len] = session_replica_frame.attachment_version;
+    try fixture.a.emitSignable(fixture.a_to_b.sink(), .SESSION_REPLICA_OFFER, declared3);
+    const unknown = try session_replica_frame.encodeCurrent(.offer, objects4[0], &wire);
+    wire[session_replica_frame.magic.len] = 0xff;
+    try fixture.a.emitSignable(fixture.a_to_b.sink(), .SESSION_REPLICA_OFFER, unknown);
+    const wrong_kind = try session_replica_frame.encodeCurrent(.offer, objects4[0], &wire);
+    try fixture.a.emitSignable(fixture.a_to_b.sink(), .SESSION_REPLICA_ACK, wrong_kind);
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5444);
+    try std.testing.expectEqual(@as(u64, 5), fixture.b.takeRejectedOriginFrames());
+    try std.testing.expect(fixture.b.takeNextSessionReplicaFrame() == null);
+    try std.testing.expectEqual(peer_link.State.established, fixture.b.linkState());
+}
+
+test "session group v4 rejects unnegotiated attachment v3 without decoder fallback" {
+    const fixture = try GroupV4DirectionalTest.create();
+    defer fixture.destroy();
+    const allocator = std.testing.allocator;
+    try fixture.a.sendPing(session_group_v4_probe, fixture.a_to_b.sink());
+    try fixture.b.sendPing(session_group_v4_probe, fixture.b_to_a.sink());
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5450);
+    try std.testing.expect(!fixture.b.supportsSessionReplicaV3() and fixture.b.session_group_rx_v4);
+    const object = try fakeAttachmentSessionReplicaObject(allocator, .offer);
+    defer allocator.free(object);
+    var wire: [512]u8 = undefined;
+    const frame = try session_replica_frame.encodeAttachment(.offer, object, &wire);
+    try fixture.a.emitSignable(fixture.a_to_b.sink(), .SESSION_REPLICA_OFFER, frame);
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5451);
+    try std.testing.expectEqual(@as(u64, 1), fixture.b.takeRejectedOriginFrames());
+    try std.testing.expect(fixture.b.takeNextSessionReplicaFrame() == null);
+}
+
+test "session group v4 attachment v3 midpoint resume retains all independent capabilities" {
+    const fixture = try GroupV4DirectionalTest.create();
+    defer fixture.destroy();
+    const allocator = std.testing.allocator;
+    fixture.a.session_replica_attachment_transport_enabled = true;
+    fixture.b.session_replica_attachment_transport_enabled = true;
+    try fixture.a.probeSessionReplicaV3(fixture.a_to_b.sink());
+    try fixture.b.probeSessionReplicaV3(fixture.b_to_a.sink());
+    try pump(&fixture.a, &fixture.b, &fixture.a_to_b, &fixture.b_to_a, 10, 0x5460);
+    try fixture.a.sendPing(session_group_v4_probe, fixture.a_to_b.sink());
+    try fixture.feedB();
+    const tx_header = fixture.b.snapshotResume();
+    try std.testing.expect(tx_header.peer_supports_session_group_v4 and !tx_header.session_group_rx_v4 and tx_header.peer_supports_session_replica_v3);
+    var b_state = ChannelCrdt.init(allocator, 2);
+    defer b_state.deinit();
+    var b = try fixture.resumeDirectional(&fixture.b, &b_state, tx_header);
+    defer b.deinit();
+    try std.testing.expect(b.supportsSessionGroupV4() and !b.session_group_rx_v4 and b.supportsSessionReplicaV3());
+    const object3 = try fakeAttachmentSessionReplicaObject(allocator, .offer);
+    defer allocator.free(object3);
+    const object4 = try fakeSessionReplicaObject(allocator, .offer);
+    defer allocator.free(object4);
+    try fixture.a.sendAttachmentSessionReplica(fixture.a_to_b.sink(), .offer, object3);
+    try b.feed(fixture.a_to_b.bytes.items, fixture.b_to_a.sink(), 11, 0x5461);
+    fixture.a_to_b.clear();
+    try b.sendAttachmentSessionReplica(fixture.b_to_a.sink(), .offer, object3);
+    try b.sendSessionReplicaOffer(fixture.b_to_a.sink(), object4);
+    try fixture.feedA();
+    const rx_header = fixture.a.snapshotResume();
+    try std.testing.expect(!rx_header.peer_supports_session_group_v4 and rx_header.session_group_rx_v4 and rx_header.peer_supports_session_replica_v3);
+    var a_state = ChannelCrdt.init(allocator, 1);
+    defer a_state.deinit();
+    var a = try fixture.resumeDirectional(&fixture.a, &a_state, rx_header);
+    defer a.deinit();
+    try std.testing.expect(!a.supportsSessionGroupV4() and a.session_group_rx_v4 and a.supportsSessionReplicaV3());
+    try a.sendAttachmentSessionReplica(fixture.a_to_b.sink(), .offer, object3);
+    try std.testing.expectError(error.CapabilityVersionMismatch, a.sendSessionReplicaOffer(fixture.a_to_b.sink(), object4));
+    try b.feed(fixture.a_to_b.bytes.items, fixture.b_to_a.sink(), 11, 0x5462);
+    fixture.a_to_b.clear();
+    try b.sendAttachmentSessionReplica(fixture.b_to_a.sink(), .offer, object3);
+    try b.sendSessionReplicaOffer(fixture.b_to_a.sink(), object4);
+    try a.feed(fixture.b_to_a.bytes.items, fixture.a_to_b.sink(), 11, 0x5463);
+    fixture.b_to_a.clear();
+    const b_frames = try b.takeSessionReplicaFrames();
+    defer {
+        for (b_frames) |*frame| frame.deinit(allocator);
+        allocator.free(b_frames);
+    }
+    try std.testing.expectEqual(@as(usize, 2), b_frames.len);
+    for (b_frames) |frame| try std.testing.expectEqual(session_replica_frame.WireVersion.attachment_v3, frame.version);
+    const a_frames = try a.takeSessionReplicaFrames();
+    defer {
+        for (a_frames) |*frame| frame.deinit(allocator);
+        allocator.free(a_frames);
+    }
+    try std.testing.expectEqual(@as(usize, 2), a_frames.len);
+    try std.testing.expectEqual(session_replica_frame.WireVersion.attachment_v3, a_frames[0].version);
+    try std.testing.expectEqual(session_replica_frame.WireVersion.current_v4, a_frames[1].version);
+    for ([_]S2sPeer.ResumeHeader{ tx_header, rx_header }) |header| {
+        var options = fixture.resumeOptions(&fixture.a, &a_state);
+        options.session_replica_attachment_transport_enabled = false;
+        try std.testing.expectError(error.CapabilityVersionMismatch, S2sPeer.resumeEstablished(options, header, "peer.test", 11, 1));
+    }
+    try std.testing.expectEqual(@as(u64, 0), a.takeRejectedOriginFrames());
+    try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
+}
+
+test "session group eligibility requires the explicit new probe and refuses experimental predecessor proof" {
+    const fixture = try GroupV4DirectionalTest.create();
+    defer fixture.destroy();
+    const allocator = std.testing.allocator;
+    try emitFrame(allocator, fixture.a_to_b.sink(), .PING, "onyx-xcap-session-group-inventory-v4?");
+    try fixture.feedB();
+    try std.testing.expect(!fixture.b.peer_supports_session_group_v4);
+    try fixture.feedA();
+    try std.testing.expect(!fixture.a.session_group_rx_v4);
+    try emitFrame(allocator, fixture.a_to_b.sink(), .PING, session_group_v4_probe);
+    try fixture.feedB();
+    try std.testing.expect(fixture.b.peer_supports_session_group_v4);
+    try fixture.feedA();
+    try std.testing.expect(fixture.a.session_group_rx_v4);
+}
+
+test "legacy identity transition allocation failure leaves roster and queue intact" {
+    var succeeded = false;
+    var saw_failure = false;
+    for (0..32) |cut| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const allocator = failing.allocator();
+        var tc = TestClock{ .now_ms = 1 };
+        var state = ChannelCrdt.init(allocator, 1);
+        defer state.deinit();
+        var peer = try newPeer(allocator, &state, &tc, 1, 2, 1000, "local.test");
+        defer peer.deinit();
+        _ = try peer.routes.applyMembership("#room", "alice", 2, 0, 10, true, .{ .username = "user", .host = "oldhost" }, 0);
+        failing.fail_index = failing.alloc_index + cut;
+        const hook = MembershipIdentityPreparer{ .ctx = &peer, .prepare_fn = S2sPeer.prepareLegacyIdentity };
+        const result = peer.routes.applyMembershipWithPreparer("#room", "alice", 2, 0, 11, true, .{ .username = "user", .host = "newhost" }, 1, hook);
+        if (result) |_| {
+            try std.testing.expectEqual(@as(usize, 1), peer.membership_changes.items.len);
+            const delta = peer.membership_changes.items[0];
+            try std.testing.expectEqual(S2sPeer.MembershipDelta.Kind.identity, delta.kind);
+            try std.testing.expectEqualStrings("oldhost", delta.old_host.?);
+            try std.testing.expectEqualStrings("newhost", delta.host);
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expect(err == error.OutOfMemory or err == error.MembershipPreparePending);
+            saw_failure = true;
+            try std.testing.expectEqual(@as(usize, 0), peer.membership_changes.items.len);
+            try std.testing.expectEqual(@as(usize, 0), peer.identity_transition_order.items.len);
+            try std.testing.expectEqualStrings("oldhost", peer.routes.channelMembers("#room")[0].host);
+            try std.testing.expectEqual(@as(u64, 10), peer.routes.channelMembers("#room")[0].hlc);
+        }
+    }
+    try std.testing.expect(saw_failure and succeeded);
+}
+
+test "membership prepare refusal retains exact payload until retry" {
+    const Probe = struct {
+        refuse: bool = true,
+        commits: usize = 0,
+        fn prepare(ctx: *anyopaque, change: *const MembershipIdentityTransition) anyerror!PreparedMembershipIdentityChange {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqualStrings("oldhost", change.old.host);
+            try std.testing.expectEqualStrings("newhost", change.new.host);
+            if (self.refuse) return error.Busy;
+            return .{ .ctx = self, .commit_fn = commit };
+        }
+        fn commit(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.commits += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 1 };
+    const local_key = try signingKeyFor(0xa6);
+    const remote_key = try signingKeyFor(0xa7);
+    const local = signed_frame.originShortId(local_key.public_key);
+    const remote = signed_frame.originShortId(remote_key.public_key);
+    var state = ChannelCrdt.init(a, local);
+    defer state.deinit();
+    var remote_state = ChannelCrdt.init(a, remote);
+    defer remote_state.deinit();
+    var peer = try newSigningPeer(a, &state, &tc, local_key, remote, 1000, "local.test");
+    defer peer.deinit();
+    var sender = try newSigningPeer(a, &remote_state, &tc, remote_key, local, 2000, "remote.test");
+    defer sender.deinit();
+    var outbound = BufferSink{};
+    defer outbound.deinit(a);
+    var inbound = BufferSink{};
+    defer inbound.deinit(a);
+    try peer.startHandshake(outbound.sink());
+    try sender.startHandshake(inbound.sink());
+    try pump(&peer, &sender, &outbound, &inbound, tc.now_ms, 0xa7);
+    try std.testing.expect(peer.peer_supports_signing and sender.peer_supports_signing);
+    _ = try peer.routes.applyMembership("#room", "alice", remote, 0, 10, true, .{ .username = "user", .host = "oldhost" }, 0);
+    var probe = Probe{};
+    peer.setMembershipIdentityPreparer(.{ .ctx = &probe, .prepare_fn = Probe.prepare });
+    var encoded: [membership_event.max_encoded_len]u8 = undefined;
+    const payload = try membership_event.encode(.{ .present = true, .status = 0, .origin_node = remote, .hlc = 11, .channel = "#room", .nick = "alice", .username = "user", .host = "newhost" }, &encoded);
+    var envelope: [signed_frame.header_len + membership_event.max_encoded_len]u8 = undefined;
+    const signed = try signed_frame.wrap(&envelope, &sender.signing_key.?, @backingInt(s2s_frame.FrameType.MEMBERSHIP), payload);
+    try peer.recvMembership(signed, 1);
+    try std.testing.expectEqual(@as(u64, 0), peer.rejected_signature_frames);
+    try std.testing.expect(peer.membershipDispatchPaused());
+    try std.testing.expectEqualStrings("oldhost", peer.routes.channelMembers("#room")[0].host);
+    @memset(encoded[0..payload.len], 0);
+    @memset(envelope[0..signed.len], 0);
+    var sink = BufferSink{};
+    defer sink.deinit(a);
+    try std.testing.expectError(error.MembershipDispatchPaused, peer.feed("x", sink.sink(), 2, 0));
+    try peer.feed("", sink.sink(), 2, 0);
+    try peer.retryPendingMembership(sink.sink(), 2, 0);
+    try std.testing.expect(peer.membershipDispatchPaused());
+    probe.refuse = false;
+    try peer.retryPendingMembership(sink.sink(), 3, 0);
+    try std.testing.expect(!peer.membershipDispatchPaused());
+    try std.testing.expectEqualStrings("newhost", peer.routes.channelMembers("#room")[0].host);
+    try std.testing.expectEqual(@as(usize, 1), probe.commits);
+}
+
+test "deferred membership prepare refusal retains ordered successors" {
+    const Probe = struct {
+        refuse: bool = true,
+        fn prepare(ctx: *anyopaque, _: *const MembershipIdentityTransition) anyerror!PreparedMembershipIdentityChange {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.refuse) return error.Busy;
+            return .{};
+        }
+    };
+    const a = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 1 };
+    var state = ChannelCrdt.init(a, 1);
+    defer state.deinit();
+    var peer = try newPeer(a, &state, &tc, 1, 2, 1000, "local.test");
+    defer peer.deinit();
+    _ = try peer.routes.applyMembership("#room", "alice", 2, 0, 10, true, .{ .username = "u", .host = "a" }, 0);
+    var probe = Probe{};
+    peer.setMembershipIdentityPreparer(.{ .ctx = &probe, .prepare_fn = Probe.prepare });
+    var encoded: [membership_event.max_encoded_len]u8 = undefined;
+    const payload = try membership_event.encode(.{ .present = true, .status = 0, .origin_node = 2, .hlc = 11, .channel = "#room", .nick = "alice", .username = "u", .host = "b" }, &encoded);
+    try peer.deferred_residence_frames.append(a, .{ .kind = .membership, .payload = try a.dupe(u8, payload) });
+    try peer.deferred_residence_frames.append(a, .{ .kind = .membership_sync, .payload = try a.dupe(u8, "") });
+    peer.processDeferredResidenceFrames(1);
+    try std.testing.expect(peer.membershipDispatchPaused());
+    try std.testing.expectEqual(@as(usize, 2), peer.deferred_residence_frames.items.len);
+    try std.testing.expectEqualStrings("a", peer.routes.channelMembers("#room")[0].host);
+    probe.refuse = false;
+    var sink = BufferSink{};
+    defer sink.deinit(a);
+    try peer.retryPendingMembership(sink.sink(), 2, 0);
+    try std.testing.expect(!peer.membershipDispatchPaused());
+    try std.testing.expectEqual(@as(usize, 0), peer.deferred_residence_frames.items.len);
+    try std.testing.expectEqualStrings("b", peer.routes.channelMembers("#room")[0].host);
+}
+
+test "terminal membership provenance rejection retires only rejected deferred head" {
+    const Probe = struct {
+        fn prepare(_: *anyopaque, _: *const MembershipIdentityTransition) anyerror!PreparedMembershipIdentityChange {
+            return error.PublicIdentityProvenanceConflict;
+        }
+    };
+    const a = std.testing.allocator;
+    var tc = TestClock{ .now_ms = 1 };
+    var state = ChannelCrdt.init(a, 1);
+    defer state.deinit();
+    var peer = try newPeer(a, &state, &tc, 1, 2, 1000, "local.test");
+    defer peer.deinit();
+    _ = try peer.routes.applyMembership("#room", "alice", 2, 0, 10, true, .{ .username = "u", .host = "old" }, 0);
+    var ctx: u8 = 0;
+    peer.setMembershipIdentityPreparer(.{ .ctx = &ctx, .prepare_fn = Probe.prepare });
+    var encoded: [membership_event.max_encoded_len]u8 = undefined;
+    const payload = try membership_event.encode(.{ .present = true, .status = 0, .origin_node = 2, .hlc = 11, .channel = "#room", .nick = "alice", .username = "u", .host = "new" }, &encoded);
+    try peer.deferred_residence_frames.append(a, .{ .kind = .membership, .payload = try a.dupe(u8, payload) });
+    try peer.deferred_residence_frames.append(a, .{ .kind = .membership_sync, .payload = try a.dupe(u8, "") });
+    peer.processDeferredResidenceFrames(1);
+    try std.testing.expect(peer.membershipProvenanceConflict());
+    try std.testing.expect(peer.membershipDispatchPaused());
+    try peer.rejectPendingMembershipProvenanceConflict();
+    try std.testing.expect(!peer.membershipDispatchPaused());
+    try std.testing.expect(!peer.membershipProvenanceConflict());
+    try std.testing.expectEqual(@as(usize, 1), peer.deferred_residence_frames.items.len);
+    try std.testing.expectEqual(DeferredResidenceFrame.Kind.membership_sync, peer.deferred_residence_frames.items[0].kind);
+    try std.testing.expectEqualStrings("old", peer.routes.channelMembers("#room")[0].host);
+    try std.testing.expectEqual(@as(u64, 10), peer.routes.channelMembers("#room")[0].hlc);
+    try std.testing.expectEqual(@as(usize, 0), peer.membership_changes.items.len);
+    try std.testing.expectError(error.InvalidMembershipConflictState, peer.rejectPendingMembershipProvenanceConflict());
+}
+
+test "nick audience survives coalesced signed join double rename and part" {
+    const a = std.testing.allocator;
+    var clock = TestClock{ .now_ms = 10 };
+    var state_a = ChannelCrdt.init(a, 1);
+    defer state_a.deinit();
+    var state_b = ChannelCrdt.init(a, 2);
+    defer state_b.deinit();
+    const key_a = try signingKeyFor(0xf1);
+    const key_b = try signingKeyFor(0xf2);
+    const origin_a = signed_frame.originShortId(key_a.public_key);
+    const origin_b = signed_frame.originShortId(key_b.public_key);
+    var sender = try newSigningPeer(a, &state_a, &clock, key_a, origin_b, 1000, "a.test");
+    defer sender.deinit();
+    var receiver = try newSigningPeer(a, &state_b, &clock, key_b, origin_a, 2000, "b.test");
+    defer receiver.deinit();
+    var outbound = BufferSink{};
+    defer outbound.deinit(a);
+    var reverse = BufferSink{};
+    defer reverse.deinit(a);
+    try sender.startHandshake(outbound.sink());
+    try receiver.startHandshake(reverse.sink());
+    try pump(&sender, &receiver, &outbound, &reverse, clock.now_ms, 9);
+    try std.testing.expect(receiver.peer_supports_signing);
+    try std.testing.expect(!receiver.supportsSessionReplicaV2());
+    const ident = MemberIdentity{ .username = "user", .host = "cloak" };
+    try sender.sendMembership(outbound.sink(), "#z", "first", 0, 100, true, ident, "");
+    try sender.sendMembership(outbound.sink(), "#a", "first", 0, 101, true, ident, "");
+    try sender.sendNickChange(outbound.sink(), "first", "second", ident, 102);
+    try sender.sendNickChange(outbound.sink(), "second", "third", ident, 103);
+    try sender.sendMembership(outbound.sink(), "#z", "third", 0, 104, false, ident, "");
+    try sender.sendMembership(outbound.sink(), "#a", "third", 0, 105, false, ident, "");
+    try pump(&sender, &receiver, &outbound, &reverse, clock.now_ms, 10);
+    try std.testing.expectEqual(@as(usize, 0), receiver.channelMembers("#a").len);
+    try std.testing.expectEqual(@as(usize, 0), receiver.channelMembers("#z").len);
+    const nicks = try receiver.takeNickChanges();
+    defer {
+        for (nicks) |*nick| nick.deinit(a);
+        a.free(nicks);
+    }
+    try std.testing.expectEqual(@as(usize, 2), nicks.len);
+    for (nicks) |nick| {
+        try std.testing.expectEqual(origin_a, nick.origin_node);
+        try std.testing.expectEqual(@as(usize, 2), nick.channels.len);
+        try std.testing.expectEqualStrings("#a", nick.channels[0]);
+        try std.testing.expectEqualStrings("#z", nick.channels[1]);
+    }
+    try std.testing.expectEqualStrings("first", nicks[0].old_nick);
+    try std.testing.expectEqualStrings("second", nicks[1].old_nick);
+}
+
+test "legacy collision nick audience and both routes are atomic under allocation failure" {
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var clock = TestClock{ .now_ms = 10 };
+            var state = ChannelCrdt.init(allocator, 1);
+            defer state.deinit();
+            var peer = try newPeer(allocator, &state, &clock, 1, 2, 1000, "test");
+            defer peer.deinit();
+            const uid = nick_collision.loserUid(3, "target");
+            for ([_][]const u8{ "#z", "#a" }) |channel| {
+                _ = try peer.routes.applyMembership(channel, "old", 2, 0, 20, true, .{ .username = "u", .host = "oldhost" }, 10);
+                _ = try peer.routes.applyMembership(channel, "target", 3, 0, 10, true, .{ .username = "v", .host = "otherhost" }, 10);
+            }
+            const renamed = peer.applyAuthorizedSessionTokenCollisionRename(2, "old", "target", null, .{ .username = "new", .host = "newhost" }, 3, &uid) catch |err| {
+                try std.testing.expect(peer.routes.findMemberOwnedBy("old", 2) != null);
+                try std.testing.expect(peer.routes.findMemberOwnedBy("target", 3) != null);
+                try std.testing.expect(peer.routes.nickNode(&uid) == null);
+                try std.testing.expectEqual(@as(usize, 0), peer.nick_changes.items.len);
+                try std.testing.expectEqual(@as(usize, 0), peer.identity_transition_order.items.len);
+                return err;
+            };
+            try std.testing.expect(renamed);
+            try std.testing.expectEqual(@as(usize, 2), peer.nick_changes.items.len);
+            for (peer.nick_changes.items) |delta| {
+                try std.testing.expectEqual(@as(usize, 2), delta.channels.len);
+                try std.testing.expectEqualStrings("#a", delta.channels[0]);
+                try std.testing.expectEqualStrings("#z", delta.channels[1]);
+            }
+            try std.testing.expectEqual(@as(NodeId, 3), peer.nick_changes.items[0].origin_node);
+            try std.testing.expectEqual(@as(NodeId, 2), peer.nick_changes.items[1].origin_node);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+}
+
+test "winning membership collision funds incumbent audience and join before either commits" {
+    var reached_success = false;
+    for (0..256) |cut| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const a = failing.allocator();
+        var clock = TestClock{ .now_ms = 10 };
+        var state = ChannelCrdt.init(a, 1);
+        defer state.deinit();
+        var peer = try newPeer(a, &state, &clock, 1, 2, 1000, "test");
+        defer peer.deinit();
+        for ([_][]const u8{ "#a", "#b" }) |channel| {
+            _ = try peer.routes.applyMembership(channel, "target", 3, 0, 10, true, .{ .username = "inc", .host = "old" }, 1);
+        }
+        const uid = nick_collision.loserUid(3, "target");
+        var payload_buf: [membership_event.max_encoded_len]u8 = undefined;
+        const payload = try membership_event.encode(.{ .present = true, .status = 0, .origin_node = 2, .hlc = 20, .channel = "#a", .nick = "target", .username = "new", .host = "newhost" }, &payload_buf);
+        failing.fail_index = failing.alloc_index + cut;
+        if (peer.applyMembershipPayload(payload, 10)) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+            reached_success = true;
+        } else |err| {
+            try std.testing.expectEqual(error.MembershipPreparePending, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(peer.routes.findMemberOwnedBy("target", 3) != null);
+            try std.testing.expect(peer.routes.findMemberOwnedBy(&uid, 3) == null);
+            try std.testing.expect(peer.routes.findMemberOwnedBy("target", 2) == null);
+            try std.testing.expectEqual(@as(usize, 0), peer.nick_changes.items.len);
+            try std.testing.expectEqual(@as(usize, 0), peer.membership_changes.items.len);
+            try std.testing.expectEqual(@as(usize, 0), peer.identity_transition_order.items.len);
+            failing.fail_index = std.math.maxInt(usize);
+            try peer.applyMembershipPayload(payload, 11);
+        }
+        try std.testing.expect(peer.routes.findMemberOwnedBy("target", 2) != null);
+        try std.testing.expect(peer.routes.findMemberOwnedBy(&uid, 3) != null);
+        try std.testing.expectEqual(@as(usize, 1), peer.nick_changes.items.len);
+        try std.testing.expectEqual(@as(usize, 2), peer.nick_changes.items[0].channels.len);
+        try std.testing.expectEqual(@as(usize, 1), peer.membership_changes.items.len);
+        if (reached_success) break;
+    }
+    try std.testing.expect(reached_success);
+}
+
+test "nick audience signed coalesced nick and part survive funding retry on legacy and v2" {
+    for ([_]bool{ false, true }) |v2| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const receiver_allocator = failing.allocator();
+        var clock = TestClock{ .now_ms = 10 };
+        var state_a = ChannelCrdt.init(std.testing.allocator, 1);
+        defer state_a.deinit();
+        var state_b = ChannelCrdt.init(receiver_allocator, 2);
+        defer state_b.deinit();
+        const key_a = try signingKeyFor(0xf3);
+        const key_b = try signingKeyFor(0xf4);
+        const origin_a = signed_frame.originShortId(key_a.public_key);
+        const origin_b = signed_frame.originShortId(key_b.public_key);
+        var sender = try newSigningPeer(std.testing.allocator, &state_a, &clock, key_a, origin_b, 1000, "a.test");
+        defer sender.deinit();
+        var receiver = try newSigningPeer(receiver_allocator, &state_b, &clock, key_b, origin_a, 2000, "b.test");
+        defer receiver.deinit();
+        sender.session_replica_transport_enabled = v2;
+        receiver.session_replica_transport_enabled = v2;
+        var outbound = BufferSink{};
+        defer outbound.deinit(std.testing.allocator);
+        var reverse = BufferSink{};
+        defer reverse.deinit(std.testing.allocator);
+        try sender.startHandshake(outbound.sink());
+        try receiver.startHandshake(reverse.sink());
+        try pump(&sender, &receiver, &outbound, &reverse, clock.now_ms, 20);
+        try std.testing.expectEqual(v2, receiver.supportsSessionReplicaV2());
+        try std.testing.expect(receiver.peer_supports_signing);
+        _ = try receiver.routes.applyMembership("#room", "before", origin_a, 0, 100, true, .{ .username = "u", .host = "h" }, 1);
+        var auth = SessionTokenNickAuthorizerStub{ .origin_node = origin_a, .token = @splat(0xf5), .best_nick = "after" };
+        if (v2) receiver.setSessionTokenNickAuthorizer(auth.authorizer());
+        try sender.sendNickChange(outbound.sink(), "before", "after", .{ .username = "u", .host = "h" }, 101);
+        try sender.sendMembership(outbound.sink(), "#room", "after", 0, 102, false, .{}, "");
+        try receiver.decoder.accumulator.ensureUnusedCapacity(receiver_allocator, outbound.bytes.items.len);
+        try receiver.decoder.payload_buf.ensureTotalCapacity(receiver_allocator, outbound.bytes.items.len);
+        if (!v2) failing.fail_index = failing.alloc_index;
+        try receiver.feed(outbound.bytes.items, reverse.sink(), 10, 21);
+        if (v2) {
+            try std.testing.expectEqual(@as(usize, 2), receiver.deferred_residence_frames.items.len);
+            failing.fail_index = failing.alloc_index;
+            receiver.processDeferredResidenceFrames(10);
+        }
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(receiver.membershipDispatchPaused());
+        try std.testing.expect(receiver.routes.findMemberOwnedBy("before", origin_a) != null);
+        try std.testing.expectEqual(@as(usize, 0), receiver.nick_changes.items.len);
+        try std.testing.expectEqual(@as(u64, 0), receiver.rejected_signature_frames);
+        failing.fail_index = std.math.maxInt(usize);
+        try receiver.retryPendingMembership(reverse.sink(), 11, 22);
+        try std.testing.expect(!receiver.membershipDispatchPaused());
+        try std.testing.expectEqual(@as(usize, 0), receiver.channelMembers("#room").len);
+        try std.testing.expectEqual(@as(usize, 1), receiver.nick_changes.items.len);
+        try std.testing.expectEqualStrings("#room", receiver.nick_changes.items[0].channels[0]);
+        try std.testing.expectEqual(origin_a, receiver.nick_changes.items[0].origin_node);
+        try receiver.retryPendingMembership(reverse.sink(), 12, 23);
+        try std.testing.expectEqual(@as(usize, 1), receiver.nick_changes.items.len);
+    }
 }

@@ -38,9 +38,9 @@ pub fn encodeSnapshot(allocator: std.mem.Allocator, snapshot: *const acme.Snapsh
     @memcpy(payload[0..32], &snapshot.config_digest);
     std.mem.writeInt(i64, payload[32..40], snapshot.next_check_ms, .little);
     std.mem.writeInt(u64, payload[40..48], snapshot.completed_checks, .little);
-    payload[48] = @intFromEnum(snapshot.last_outcome);
+    payload[48] = @backingInt(snapshot.last_outcome);
     std.mem.writeInt(i64, payload[49..57], snapshot.captured_monotonic_ms, .little);
-    payload[57] = @intFromEnum(snapshot.execution);
+    payload[57] = @backingInt(snapshot.execution);
     frame.finish(bytes, domain);
     try validateCheckpoint(bytes);
     return bytes;

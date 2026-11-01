@@ -40,7 +40,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 ## WHOIS
 
 - Syntax: `WHOIS [server] <nick>`
-- Description: Emits a WHOIS sequence covering account, away state, visible channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP/rDNS text (for opers and self). `RPL_WHOISSPECIAL 320` also carries public +R/+g private-message restriction hints for every requester. An ordinary account-less nick with a live signed guest-presence record answers 311, 312, and 318 from that record, including the signed home server across more than one hop. Any other remote WHOIS copies the one-hop roster identity and leaves idle, away, and TLS-secure on the user's home node. The multi-hop guest path is source, and the full suite has not been re-run green on it.
+- Description: Emits a WHOIS sequence covering account, away state, visible channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP/rDNS text (for opers and self). `RPL_WHOISSECURE 671` appends `[kTLS: TX]`, `[kTLS: RX]`, or `[kTLS: TX+RX]` when those kernel TLS directions are actually attached on the subject's connection (both production nodes run `ktls = "txrx"`, so attached TLS users show `TX+RX`). `RPL_WHOISSPECIAL 320` also carries public +R/+g private-message restriction hints for every requester, plus +G (common-channel), +Z (TLS-only PM), and +V (no-invite) restriction hints when they apply. An ordinary account-less nick with a live signed guest-presence record answers 311, 312, and 318 from that record, including the signed home server across more than one hop. Any other remote WHOIS copies the one-hop roster identity and leaves idle, away, and TLS-secure on the user's home node. The multi-hop guest path is source, and the full suite has not been re-run green on it.
 - Privileges: Registered client.
 - Parameters: Target nick is the last parameter.
 - Replies: `RPL_WHOISUSER 311`, `RPL_WHOISSERVER 312`, `RPL_WHOISOPERATOR 313`, `RPL_WHOISIDLE 317`, `RPL_ENDOFWHOIS 318`, `RPL_WHOISCHANNELS 319`, `RPL_WHOISSPECIAL 320`, `RPL_WHOISLOGGEDIN 330`, `RPL_WHOISBOT 335`, `RPL_WHOISCERTFP 276`, `RPL_WHOISSECURE 671`, `RPL_WHOISACTUALLY 338`, and `RPL_AWAY 301` when applicable.
@@ -84,7 +84,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 ## WHOWAS
 
 - Syntax: `WHOWAS <nick> [count]`
-- Description: Looks up recorded WHOWAS snapshots for a nick, most recent first. The optional count is parsed as a decimal value and capped to 16 records; malformed counts fall back to 16. The 314 host is the connection's real host, and a logged-in account is reported with 330.
+- Description: Looks up recorded WHOWAS snapshots for a nick, most recent first. The optional count is parsed as a decimal value and capped to 16 records; malformed counts fall back to 16. The 314 host is the explicit public host captured at nick change or departure. An absent or invalid visible host uses the generic server default; real-address fallback is prohibited. A logged-in account at capture is reported with 330.
 - Privileges: Registered client.
 - Parameters: Nick and optional count.
 - Replies: `RPL_WHOWASUSER 314` plus `RPL_WHOISSERVER 312` signoff lines when data exists, `ERR_WASNOSUCHNICK 406` when no data exists, and `RPL_ENDOFWHOWAS 369`.
@@ -116,25 +116,24 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 
 ## HELP
 
-- Syntax: `HELP [topic]`
-- Description: Returns built-in help for a topic, or general help if no topic is supplied.
+- Syntax: `HELP [topic]` or `HELP ?query`
+- Description: Returns built-in help for an exact topic, general help when no topic is supplied, or a bounded case-insensitive search of static topic names and text.
 - Privileges: Registered client.
-- Parameters: Optional topic.
-- Replies: Server `NOTICE` help lines.
-- Errors: `ERR_HELPNOTFOUND 524` when no topic exists.
-- Example: `HELP WARD`
-- Sources: `src/daemon/modules/user_query.zig:83`, `src/daemon/server.zig:7961`
+- Parameters: Optional topic, or `?` followed by a literal search of at most 64 bytes. Use `HELP :?session token` for spaces.
+- Replies: `RPL_HELPSTART 704`, `RPL_HELPTXT 705`, and `RPL_ENDOFHELP 706`. Search uses the fixed `SEARCH` topic and returns at most eight matches with a refinement hint when more exist. Empty, invalid, and unmatched searches receive bounded explanations.
+- Errors: `ERR_HELPNOTFOUND 524` when an exact topic does not exist.
+- Examples: `HELP WARD`, `HELP ?fingerprint`, `HELP ?channel`.
+- Availability: Search describes static documentation; a result does not prove a capability is negotiated or enabled.
+- Sources: `src/proto/help_db.zig`, `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`.
 
 ## HELPOP
 
-- Syntax: `HELPOP [topic]`
+- Syntax: `HELPOP [topic]` or `HELPOP ?query`
 - Description: Alias of `HELP`; registered separately but dispatched to the same handler.
 - Privileges: Registered client.
-- Parameters: Optional topic.
-- Replies: Same as `HELP`.
-- Errors: Same as `HELP`.
-- Example: `HELPOP OPER`
-- Sources: `src/daemon/modules/user_query.zig:84`, `src/daemon/server.zig:7961`
+- Parameters, replies, errors, and search bounds: Same as `HELP`.
+- Examples: `HELPOP OPER`, `HELPOP ?channel`.
+- Sources: `src/proto/help_db.zig`, `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`.
 
 ## AUTOJOIN
 

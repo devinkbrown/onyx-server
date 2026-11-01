@@ -225,7 +225,7 @@ pub const PluginStore = struct {
         for (self.hooks.items) |row| {
             digestU64(&hash, row.plugin);
             digestBytes(&hash, row.hook);
-            digestU64(&hash, @intFromEnum(row.priority));
+            digestU64(&hash, @backingInt(row.priority));
             digestBytes(&hash, row.export_name);
         }
         var out: [32]u8 = undefined;

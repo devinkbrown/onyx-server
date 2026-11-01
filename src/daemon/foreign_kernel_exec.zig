@@ -471,7 +471,7 @@ test "GAP-X3 OpenBSD pledge executes on this kernel" {
         }
         var status: c_int = 0;
         while (std.c.waitpid(child, &status, 0) < 0) {
-            if (errnoNow() != @intFromEnum(std.c.E.INTR)) return error.TestUnexpectedResult;
+            if (errnoNow() != @backingInt(std.c.E.INTR)) return error.TestUnexpectedResult;
         }
         const bits: u32 = @bitCast(status);
         try std.testing.expect(std.c.W.IFEXITED(bits));

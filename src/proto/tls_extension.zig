@@ -64,12 +64,12 @@ pub const ExtensionType = enum(u16) {
     /// Map a raw wire value onto the enum; unknown values land in the `_` tag
     /// while preserving the exact integer (recoverable via `@intFromEnum`).
     pub fn fromInt(value: u16) ExtensionType {
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// The raw wire value for this extension type.
     pub fn toInt(self: ExtensionType) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// True when `value` is a type this module names explicitly.
@@ -127,12 +127,12 @@ pub const CertificateType = enum(u8) {
 
     /// Map a raw wire byte onto the enum; unknown values land in `_`.
     pub fn fromInt(value: u8) CertificateType {
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// The raw wire byte for this certificate type.
     pub fn toInt(self: CertificateType) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

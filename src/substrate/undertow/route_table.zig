@@ -296,6 +296,35 @@ pub const MemberIdentity = struct {
     session_token: ?SessionToken = null,
 };
 
+/// Borrowed only during `prepare_fn`; these row facts are not a canonical
+/// cross-channel or cross-link identity projection.
+pub const MembershipIdentityTransition = struct {
+    channel: []const u8,
+    nick: []const u8,
+    origin_node: u64,
+    hlc: u64,
+    old: MemberIdentity,
+    new: MemberIdentity,
+};
+pub const PreparedMembershipIdentityChange = struct {
+    ctx: ?*anyopaque = null,
+    commit_fn: ?*const fn (*anyopaque) void = null,
+    release_fn: ?*const fn (*anyopaque) void = null,
+    pub fn commit(self: *PreparedMembershipIdentityChange) void {
+        if (self.commit_fn) |f| f(self.ctx.?);
+    }
+    pub fn release(self: *PreparedMembershipIdentityChange) void {
+        if (self.release_fn) |f| f(self.ctx.?);
+        self.* = .{};
+    }
+};
+pub const MembershipIdentityPreparer = struct {
+    ctx: *anyopaque,
+    prepare_fn: *const fn (*anyopaque, *const MembershipIdentityTransition) anyerror!PreparedMembershipIdentityChange,
+    /// Standalone legacy queue suppresses row-identical updates; Core observes all.
+    only_changed: bool = false,
+};
+
 /// Receiver-visible effects that must be made durable by the caller before an
 /// exact-token reconciliation mutates the authoritative compatibility roster.
 /// All slices and `member` fields are borrowed from the RouteTable for the
@@ -935,6 +964,19 @@ pub const RouteTable = struct {
         incumbent_node: NodeId,
         incumbent_uid: []const u8,
     ) Error!bool {
+        return self.renameNickDisplacing(node, old_nick, new_nick, token, ident, incumbent_node, incumbent_uid);
+    }
+
+    pub fn renameNickDisplacing(
+        self: *Self,
+        node: NodeId,
+        old_nick: []const u8,
+        new_nick: []const u8,
+        token: ?SessionToken,
+        ident: MemberIdentity,
+        incumbent_node: NodeId,
+        incumbent_uid: []const u8,
+    ) Error!bool {
         try self.validateName(new_nick);
         try self.validateName(incumbent_uid);
         try validateNode(node);
@@ -953,13 +995,13 @@ pub const RouteTable = struct {
         var lists = self.channel_members.valueIterator();
         while (lists.next()) |list| {
             for (list.entries.items) |*member| {
-                const is_exact_old = member.node == node and std.ascii.eqlIgnoreCase(member.nick, old_nick);
-                const is_incumbent = member.node == incumbent_node and std.ascii.eqlIgnoreCase(member.nick, new_nick);
+                const is_exact_old = member.node == node and (if (token != null) std.ascii.eqlIgnoreCase(member.nick, old_nick) else std.mem.eql(u8, member.nick, old_nick));
+                const is_incumbent = member.node == incumbent_node and (if (token != null) std.ascii.eqlIgnoreCase(member.nick, new_nick) else std.mem.eql(u8, member.nick, new_nick));
 
                 if (is_exact_old) {
-                    if (member.session_token) |stored| {
-                        if (!std.crypto.timing_safe.eql(SessionToken, stored, token)) return false;
-                    }
+                    if (token) |wanted| if (member.session_token) |stored| {
+                        if (!std.crypto.timing_safe.eql(SessionToken, stored, wanted)) return false;
+                    };
                     exact_count += 1;
                     continue;
                 }
@@ -975,7 +1017,7 @@ pub const RouteTable = struct {
                     std.ascii.eqlIgnoreCase(member.nick, incumbent_uid)) return false;
             }
         }
-        if (exact_count == 0 or incumbent_count == 0) return false;
+        if (exact_count == 0 and old_home == null) return false;
 
         var exact_nicks: std.ArrayListUnmanaged([]u8) = .empty;
         var exact_transferred: usize = 0;
@@ -1051,24 +1093,28 @@ pub const RouteTable = struct {
         lists = self.channel_members.valueIterator();
         while (lists.next()) |list| {
             for (list.entries.items) |*member| {
-                if (member.node == node and std.ascii.eqlIgnoreCase(member.nick, old_nick)) {
+                if (member.node == node and (if (token != null) std.ascii.eqlIgnoreCase(member.nick, old_nick) else std.mem.eql(u8, member.nick, old_nick))) {
                     self.allocator.free(member.nick);
                     member.nick = exact_nicks.items[next_exact];
                     next_exact += 1;
                     exact_transferred = next_exact;
-                    member.session_token = token;
+                    if (token) |wanted| member.session_token = wanted;
                     self.allocator.free(member.username);
                     self.allocator.free(member.realname);
                     self.allocator.free(member.host);
-                    self.allocator.free(member.account);
                     const owned_ident = exact_identities.items[next_exact - 1];
                     member.username = owned_ident.username;
                     member.realname = owned_ident.realname;
                     member.host = owned_ident.host;
-                    member.account = owned_ident.account;
-                    member.account_trusted = ident.account_trusted;
+                    if (token != null) {
+                        self.allocator.free(member.account);
+                        member.account = owned_ident.account;
+                        member.account_trusted = ident.account_trusted;
+                    } else {
+                        self.allocator.free(owned_ident.account);
+                    }
                     identities_transferred = next_exact;
-                } else if (member.node == incumbent_node and std.ascii.eqlIgnoreCase(member.nick, new_nick)) {
+                } else if (member.node == incumbent_node and (if (token != null) std.ascii.eqlIgnoreCase(member.nick, new_nick) else std.mem.eql(u8, member.nick, new_nick))) {
                     self.allocator.free(member.nick);
                     member.nick = incumbent_nicks.items[next_incumbent];
                     next_incumbent += 1;
@@ -1373,6 +1419,38 @@ pub const RouteTable = struct {
         try owned_nicks.ensureTotalCapacity(self.allocator, count);
         for (0..count) |_| owned_nicks.appendAssumeCapacity(try self.allocator.dupe(u8, new_nick));
 
+        const OwnedIdentity = struct {
+            username: []u8,
+            realname: []u8,
+            host: []u8,
+            account: []u8,
+            fn init(a: std.mem.Allocator, value: MemberIdentity) std.mem.Allocator.Error!@This() {
+                const u = try a.dupe(u8, value.username);
+                errdefer a.free(u);
+                const r = try a.dupe(u8, value.realname);
+                errdefer a.free(r);
+                const h = try a.dupe(u8, value.host);
+                errdefer a.free(h);
+                const account = try a.dupe(u8, value.account);
+                return .{ .username = u, .realname = r, .host = h, .account = account };
+            }
+            fn deinit(value: @This(), a: std.mem.Allocator) void {
+                a.free(value.username);
+                a.free(value.realname);
+                a.free(value.host);
+                a.free(value.account);
+            }
+        };
+        var identities: std.ArrayList(OwnedIdentity) = .empty;
+        var transferred_identities: usize = 0;
+        defer {
+            for (identities.items[transferred_identities..]) |value| value.deinit(self.allocator);
+            identities.deinit(self.allocator);
+        }
+        if (ident) |identity| {
+            try identities.ensureTotalCapacity(self.allocator, count);
+            for (0..count) |_| identities.appendAssumeCapacity(try OwnedIdentity.init(self.allocator, identity));
+        }
         const old_route_home = self.nick_to_node.get(stable_old_nick);
         const remove_old_route = old_route_home != null and old_route_home.? == node;
         const new_route_home = self.nick_to_node.get(new_nick);
@@ -1402,14 +1480,17 @@ pub const RouteTable = struct {
                 transferred_nicks = next_owned;
                 if (bind_untagged) row.session_token = token;
                 if (ident) |identity| {
-                    // Token installation and the spelling change are the
-                    // authoritative atomic state. Identity refresh retains the
-                    // established best-effort semantics of wire NICKCHANGE.
-                    replaceOwned(self.allocator, &row.username, identity.username) catch {};
-                    replaceOwned(self.allocator, &row.realname, identity.realname) catch {};
-                    replaceOwned(self.allocator, &row.host, identity.host) catch {};
-                    replaceOwned(self.allocator, &row.account, identity.account) catch {};
+                    const owned = identities.items[next_owned - 1];
+                    self.allocator.free(row.username);
+                    self.allocator.free(row.realname);
+                    self.allocator.free(row.host);
+                    self.allocator.free(row.account);
+                    row.username = owned.username;
+                    row.realname = owned.realname;
+                    row.host = owned.host;
+                    row.account = owned.account;
                     row.account_trusted = identity.account_trusted;
+                    transferred_identities = next_owned;
                 }
             }
         }
@@ -1569,6 +1650,65 @@ pub const RouteTable = struct {
         outcome: ApplyListOutcome,
     };
 
+    /// A fresh winning JOIN is fully funded before its incumbent is displaced.
+    /// Exclusive access must remain held until commit or deinit.
+    pub const PreparedWinningJoin = struct {
+        table: *Self,
+        channel: []const u8,
+        list: *MemberList,
+        row: Member,
+        route_key: []u8,
+        created_list: bool,
+        done: bool = false,
+        pub fn deinit(self: *PreparedWinningJoin) void {
+            if (self.done) return;
+            self.row.freeStrings(self.table.allocator);
+            self.table.allocator.free(self.route_key);
+            if (self.created_list) self.table.pruneIfEmpty(self.channel);
+            self.done = true;
+        }
+        pub fn commit(self: *PreparedWinningJoin) void {
+            std.debug.assert(!self.done);
+            const table = self.table;
+            self.list.entries.appendAssumeCapacity(self.row);
+            table.clearPartTombstone(self.channel, self.route_key, self.row.node);
+            table.nick_to_node.putNoClobber(self.route_key, self.row.node) catch unreachable;
+            table.nick_count += 1;
+            table.noteBestNickClaim(self.row.nick, .{ .node_id = self.row.node, .hlc = self.row.hlc });
+            self.done = true;
+        }
+    };
+    pub fn prepareWinningJoin(self: *Self, chan: []const u8, nick: []const u8, node: NodeId, status: u4, hlc: u64, ident: MemberIdentity, now_ms: i64, incumbent_uid: []const u8) Error!?PreparedWinningJoin {
+        try self.validateName(chan);
+        try self.validateName(nick);
+        try validateNode(node);
+        if (self.partTombstoneBlocks(chan, nick, node, hlc)) return null;
+        const had_list = self.channel_members.contains(chan);
+        const list = try self.ensureMemberList(chan);
+        errdefer if (!had_list) self.pruneIfEmpty(chan);
+        if (list.entries.items.len >= self.cfg.max_nicks) return error.RouteTableFull;
+        if (self.nick_count >= self.cfg.max_nicks and self.nick_to_node.get(incumbent_uid) == null) return error.RouteTableFull;
+        try list.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.nick_to_node.ensureUnusedCapacity(2);
+        if (!self.claim_index_dirty) try self.best_nick_claims.ensureUnusedCapacity(2);
+        const owned_nick = try self.allocator.dupe(u8, nick);
+        errdefer self.allocator.free(owned_nick);
+        const username = try self.allocator.dupe(u8, ident.username);
+        errdefer self.allocator.free(username);
+        const realname = try self.allocator.dupe(u8, ident.realname);
+        errdefer self.allocator.free(realname);
+        const host = try self.allocator.dupe(u8, ident.host);
+        errdefer self.allocator.free(host);
+        const account = try self.allocator.dupe(u8, ident.account);
+        errdefer self.allocator.free(account);
+        const real_host = try self.allocator.dupe(u8, ident.real_host);
+        errdefer self.allocator.free(real_host);
+        const certfp = try self.allocator.dupe(u8, ident.certfp);
+        errdefer self.allocator.free(certfp);
+        const route_key = try self.allocator.dupe(u8, nick);
+        return .{ .table = self, .channel = chan, .list = list, .created_list = !had_list, .route_key = route_key, .row = .{ .nick = owned_nick, .username = username, .realname = realname, .host = host, .account = account, .account_trusted = ident.account_trusted, .real_host = real_host, .certfp = certfp, .session_token = ident.session_token, .node = node, .status = status, .hlc = hlc, .last_refreshed_ms = now_ms } };
+    }
+
     /// Apply a MEMBERSHIP event for a remote member, last-writer-wins by `hlc`.
     /// `present` true = join/status upsert; false = part. Stale events (hlc <= the
     /// stored one for this nick) are ignored, so out-of-order gossip converges.
@@ -1594,6 +1734,23 @@ pub const RouteTable = struct {
         ident: MemberIdentity,
         now_ms: i64,
     ) Error!ApplyResult {
+        return self.applyMembershipWithPreparer(chan, nick, node, status, hlc, present, ident, now_ms, null) catch |err| return @errorCast(err);
+    }
+
+    /// The caller retains exclusive route access for the entire transaction.
+    /// A successful preparer must make commit and release no-fail and non-reentrant.
+    pub fn applyMembershipWithPreparer(
+        self: *Self,
+        chan: []const u8,
+        nick: []const u8,
+        node: NodeId,
+        status: u4,
+        hlc: u64,
+        present: bool,
+        ident: MemberIdentity,
+        now_ms: i64,
+        preparer: ?MembershipIdentityPreparer,
+    ) anyerror!ApplyResult {
         try self.validateName(chan);
         try self.validateName(nick);
         try validateNode(node);
@@ -1627,18 +1784,60 @@ pub const RouteTable = struct {
             // unconditionally — even for a stale-hlc re-affirmation that the LWW
             // guard below collapses to `unchanged`. This is the anti-entropy
             // re-burst keeping a still-present member alive; it must not depend on
-            // the hlc advancing. Stamped before the LWW early-return; never touched
-            // for a part (present=false), whose retraction is what we want to age.
-            if (present) cur.last_refreshed_ms = now_ms;
-            if (hlc <= cur.hlc) return .{ .outcome = .unchanged, .prev_status = prev }; // stale
+            // the hlc advancing. Stale reaffirmations refresh immediately; newer
+            // ones refresh only after replacement allocation succeeds. PART never
+            // refreshes, so its retraction can age.
+            if (hlc <= cur.hlc) {
+                if (present) cur.last_refreshed_ms = now_ms;
+                return .{ .outcome = .unchanged, .prev_status = prev };
+            }
             if (present) {
                 const changed = cur.status != status or cur.node != node;
-                try replaceOwned(self.allocator, &cur.username, ident.username);
-                try replaceOwned(self.allocator, &cur.realname, ident.realname);
-                try replaceOwned(self.allocator, &cur.host, ident.host);
-                try replaceOwned(self.allocator, &cur.account, ident.account);
-                try replaceOwned(self.allocator, &cur.real_host, ident.real_host);
-                try replaceOwned(self.allocator, &cur.certfp, ident.certfp);
+                const username = try self.allocator.dupe(u8, ident.username);
+                errdefer self.allocator.free(username);
+                const realname = try self.allocator.dupe(u8, ident.realname);
+                errdefer self.allocator.free(realname);
+                const host = try self.allocator.dupe(u8, ident.host);
+                errdefer self.allocator.free(host);
+                const account = try self.allocator.dupe(u8, ident.account);
+                errdefer self.allocator.free(account);
+                const real_host = try self.allocator.dupe(u8, ident.real_host);
+                errdefer self.allocator.free(real_host);
+                const certfp = try self.allocator.dupe(u8, ident.certfp);
+                errdefer self.allocator.free(certfp);
+                var prepared: PreparedMembershipIdentityChange = .{};
+                if (cur.node == node) {
+                    if (preparer) |observer| {
+                        if (!observer.only_changed or !std.mem.eql(u8, cur.username, username) or !std.mem.eql(u8, cur.host, host)) {
+                            const transition = MembershipIdentityTransition{
+                                .channel = chan,
+                                .nick = cur.nick,
+                                .origin_node = node,
+                                .hlc = hlc,
+                                .old = .{ .username = cur.username, .realname = cur.realname, .host = cur.host, .account = cur.account, .account_trusted = cur.account_trusted, .real_host = cur.real_host, .certfp = cur.certfp, .session_token = cur.session_token },
+                                .new = ident,
+                            };
+                            prepared = observer.prepare_fn(observer.ctx, &transition) catch |err| switch (err) {
+                                error.PublicIdentityProvenanceConflict => return err,
+                                else => return error.MembershipPreparePending,
+                            };
+                        }
+                    }
+                }
+                defer prepared.release();
+                self.allocator.free(cur.username);
+                self.allocator.free(cur.realname);
+                self.allocator.free(cur.host);
+                self.allocator.free(cur.account);
+                self.allocator.free(cur.real_host);
+                self.allocator.free(cur.certfp);
+                cur.username = username;
+                cur.realname = realname;
+                cur.host = host;
+                cur.account = account;
+                cur.real_host = real_host;
+                cur.certfp = certfp;
+                cur.last_refreshed_ms = now_ms;
                 cur.account_trusted = ident.account_trusted;
                 cur.session_token = ident.session_token;
                 cur.node = node;
@@ -1652,6 +1851,7 @@ pub const RouteTable = struct {
                 // re-affirmation so entries predating this wiring self-heal.
                 self.setNickLocation(nick, node) catch {};
                 self.noteBestNickClaim(nick, .{ .node_id = node, .hlc = hlc });
+                prepared.commit();
                 return .{ .outcome = if (changed) .status_changed else .unchanged, .prev_status = prev };
             } else {
                 const claim_key = NickKey.init(cur.nick);
@@ -2090,111 +2290,139 @@ pub const RouteTable = struct {
         };
     }
 
-    /// Rename a remote user across the nick→node map and every channel roster it
-    /// appears in, refreshing its propagated identity. Returns true if `old_nick`
-    /// existed anywhere (so the daemon should surface a live NICK line). ASCII
-    /// case-sensitive match (nicks are stored verbatim). Best-effort on OOM: a
-    /// failed roster rename leaves that roster untouched but still reports the
-    /// rename if the nick→node entry moved.
-    pub fn renameNick(
-        self: *Self,
-        old_nick: []const u8,
-        new_nick: []const u8,
-        node: NodeId,
-        ident: MemberIdentity,
-    ) Error!bool {
-        try self.validateName(new_nick);
-        // Capture copied normalized keys before any route/roster owned string can
-        // be freed, so post-mutation claim reselection never dereferences one of
-        // the strings the roster loop just replaced.
-        const old_claim_key = NickKey.init(old_nick);
-        const new_claim_key = NickKey.init(new_nick);
-
-        // Ownership guard (mesh identity == home node): a caller may only rename an
-        // entry HOMED on `node`. `renameNick` is reached from the wire
-        // (recvNickChange) with a PEER-CONTROLLED `old_nick` whose `node` is the
-        // sending peer's own id (pinned by acceptsDirectOrigin + the signed-frame
-        // origin check) — but that peer does not necessarily OWN `old_nick`. If
-        // old_nick currently routes to a DIFFERENT node, this is a cross-node
-        // hijack (a Byzantine admitted peer moving another node's nick onto
-        // itself); drop it wholesale and mutate nothing. The legitimate same-node
-        // rename and the collision-displacement path (which passes
-        // node = nickNode(nick)) both satisfy home == node and proceed. A nick with
-        // no route entry falls through — the roster loop below only ever renames
-        // entries it also owns (`m.node == node`).
-        if (self.nick_to_node.get(old_nick)) |home| {
-            if (home != node) return false;
+    /// Snapshot the precise pre-apply roster audience. Token-filtered
+    /// reconciliation excludes unrelated same-origin rows with other tokens.
+    /// Caller owns each string and the outer slice.
+    pub fn ownedNickChannels(self: *const Self, allocator: std.mem.Allocator, nick: []const u8, node: NodeId, token: ?SessionToken, fold_nick: bool) std.mem.Allocator.Error![][]u8 {
+        var channels: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (channels.items) |name| allocator.free(name);
+            channels.deinit(allocator);
         }
-
-        // Collision resolution must move/disambiguate a foreign target before
-        // rename reaches this mutation layer. Never overwrite another origin's
-        // route or roster row (including a generated UID target).
-        if (self.nick_to_node.get(new_nick)) |home| {
-            if (home != node) return false;
-        }
-        var target_it = self.channel_members.valueIterator();
-        while (target_it.next()) |list| {
-            for (list.entries.items) |member| {
-                if (member.node != node and std.ascii.eqlIgnoreCase(member.nick, new_nick)) return false;
+        var it = @constCast(&self.channel_members).iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.entries.items) |member| {
+                if (member.node != node or !(if (fold_nick) std.ascii.eqlIgnoreCase(member.nick, nick) else std.mem.eql(u8, member.nick, nick))) continue;
+                if (token) |wanted| {
+                    const present = member.session_token orelse continue;
+                    if (!std.crypto.timing_safe.eql(SessionToken, wanted, present)) continue;
+                }
+                const owned = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(owned);
+                try channels.append(allocator, owned);
+                break;
             }
         }
+        std.mem.sort([]u8, channels.items, {}, struct {
+            fn less(_: void, left: []u8, right: []u8) bool {
+                const folded = std.ascii.orderIgnoreCase(left, right);
+                return if (folded == .eq) std.mem.order(u8, left, right) == .lt else folded == .lt;
+            }
+        }.less);
+        var kept: usize = 0;
+        for (channels.items) |name| {
+            if (kept != 0 and std.ascii.eqlIgnoreCase(channels.items[kept - 1], name)) {
+                allocator.free(name);
+            } else {
+                channels.items[kept] = name;
+                kept += 1;
+            }
+        }
+        channels.items.len = kept;
+        return channels.toOwnedSlice(allocator);
+    }
 
-        var existed = false;
-
-        // nick_to_node: move old -> new (preserving the node mapping).
-        if (self.nick_to_node.fetchRemove(old_nick)) |kv| {
-            self.allocator.free(kv.key);
-            const owned = self.allocator.dupe(u8, new_nick) catch {
-                // Couldn't re-key; drop the stale mapping rather than corrupt it.
-                return error.OutOfMemory;
+    /// Prepare every roster string and route capacity before publishing a
+    /// legacy rename. OOM leaves route, roster and identity bytes unchanged.
+    pub fn renameNick(self: *Self, old_nick: []const u8, new_nick: []const u8, node: NodeId, ident: MemberIdentity) Error!bool {
+        try self.validateName(new_nick);
+        if (self.nick_to_node.get(old_nick)) |home| if (home != node) return false;
+        if (self.nick_to_node.get(new_nick)) |home| if (home != node) return false;
+        var conflicts = self.channel_members.valueIterator();
+        while (conflicts.next()) |list| for (list.entries.items) |member| {
+            if (member.node != node and std.ascii.eqlIgnoreCase(member.nick, new_nick)) return false;
+        };
+        const old_stable = try self.allocator.dupe(u8, old_nick);
+        defer self.allocator.free(old_stable);
+        const new_stable = try self.allocator.dupe(u8, new_nick);
+        defer self.allocator.free(new_stable);
+        const old_key = NickKey.init(old_stable);
+        const new_key = NickKey.init(new_stable);
+        const old_route = self.nick_to_node.get(old_stable) != null;
+        const Plan = struct {
+            member: *Member,
+            nick: []u8,
+            username: []u8,
+            realname: []u8,
+            host: []u8,
+            fn init(a: std.mem.Allocator, member: *Member, nick: []const u8, identity: MemberIdentity) std.mem.Allocator.Error!@This() {
+                const n = try a.dupe(u8, nick);
+                errdefer a.free(n);
+                const u = try a.dupe(u8, identity.username);
+                errdefer a.free(u);
+                const r = try a.dupe(u8, identity.realname);
+                errdefer a.free(r);
+                const h = try a.dupe(u8, identity.host);
+                return .{ .member = member, .nick = n, .username = u, .realname = r, .host = h };
+            }
+            fn deinit(plan: @This(), a: std.mem.Allocator) void {
+                a.free(plan.nick);
+                a.free(plan.username);
+                a.free(plan.realname);
+                a.free(plan.host);
+            }
+        };
+        var plans: std.ArrayList(Plan) = .empty;
+        var committed = false;
+        defer {
+            if (!committed) for (plans.items) |plan| plan.deinit(self.allocator);
+            plans.deinit(self.allocator);
+        }
+        var it = self.channel_members.valueIterator();
+        while (it.next()) |list| {
+            const index = list.find(old_stable) orelse continue;
+            const member = &list.entries.items[index];
+            if (member.node != node) continue;
+            const plan = try Plan.init(self.allocator, member, new_stable, ident);
+            plans.append(self.allocator, plan) catch |err| {
+                plan.deinit(self.allocator);
+                return err;
             };
-            errdefer self.allocator.free(owned);
-            // If new_nick already maps (collision), overwrite the owned key it has.
-            // That displaces a distinct pre-existing entry, so the map net-loses one
-            // slot (old removed, new displaced, new re-added); decrement `nick_count`
-            // to match or it leaks upward on every rename-into-an-existing-nick and
-            // eventually wedges `setNickLocation` against `max_nicks` with a false
-            // RouteTableFull.
-            if (self.nick_to_node.fetchRemove(new_nick)) |old_new| {
-                self.allocator.free(old_new.key);
+        }
+        if (!old_route and plans.items.len == 0) return false;
+        var route_key: ?[]u8 = null;
+        if (old_route) {
+            try self.nick_to_node.ensureUnusedCapacity(1);
+            route_key = try self.allocator.dupe(u8, new_stable);
+        }
+        defer if (route_key) |key| self.allocator.free(key);
+        if (!self.claim_index_dirty) try self.best_nick_claims.ensureUnusedCapacity(2);
+        if (old_route) {
+            const removed = self.nick_to_node.fetchRemove(old_stable).?;
+            self.allocator.free(removed.key);
+            if (self.nick_to_node.fetchRemove(new_stable)) |other| {
+                self.allocator.free(other.key);
                 self.nick_count -= 1;
             }
-            try self.nick_to_node.putNoClobber(owned, node);
-            existed = true;
+            self.nick_to_node.putNoClobber(route_key.?, node) catch unreachable;
+            route_key = null;
         }
-
-        // Every channel roster: rename the matching member + refresh identity.
-        var it = self.channel_members.iterator();
-        while (it.next()) |entry| {
-            const list = entry.value_ptr;
-            const idx = list.find(old_nick) orelse continue;
-            const m = &list.entries.items[idx];
-            // Never re-home a roster entry owned by a DIFFERENT node — defends the
-            // cross-node hijack even if the route index (nick_to_node) has diverged
-            // from a roster row (degraded index; see applyMembership).
-            if (m.node != node) continue;
-            const new_owned = self.allocator.dupe(u8, new_nick) catch continue;
-            self.allocator.free(m.nick);
-            m.nick = new_owned;
-            m.node = node;
-            // Identity refresh is best-effort: a failed realloc keeps the old copy.
-            replaceOwned(self.allocator, &m.username, ident.username) catch {};
-            replaceOwned(self.allocator, &m.realname, ident.realname) catch {};
-            replaceOwned(self.allocator, &m.host, ident.host) catch {};
-            existed = true;
+        for (plans.items) |plan| {
+            self.allocator.free(plan.member.nick);
+            self.allocator.free(plan.member.username);
+            self.allocator.free(plan.member.realname);
+            self.allocator.free(plan.member.host);
+            plan.member.nick = plan.nick;
+            plan.member.username = plan.username;
+            plan.member.realname = plan.realname;
+            plan.member.host = plan.host;
         }
-        // Roster renames are intentionally best-effort per channel, so derive both
-        // keys from the actual post-loop state rather than moving a cached winner.
-        // A case-only rename has one normalized key and needs one scan.
-        if (old_claim_key) |old_key| self.reselectBestNickKey(old_key);
-        if (!self.claim_index_dirty) {
-            if (new_claim_key) |new_key| {
-                if (old_claim_key == null or !std.meta.eql(old_claim_key.?, new_key)) {
-                    self.reselectBestNickKey(new_key);
-                }
-            }
-        }
-        return existed;
+        committed = true;
+        if (old_key) |key| self.reselectBestNickKey(key);
+        if (!self.claim_index_dirty) if (new_key) |key| {
+            if (old_key == null or !std.meta.eql(old_key.?, key)) self.reselectBestNickKey(key);
+        };
+        return true;
     }
 
     fn ensureMemberList(self: *Self, chan: []const u8) Error!*MemberList {
@@ -3611,18 +3839,21 @@ test "bestNickClaim rename reselects old and contested new normalized keys" {
     try std.testing.expect(!table.claim_index_dirty);
 }
 
-test "bestNickClaim partial rename OOM reflects both actual roster names" {
+test "bestNickClaim rename OOM preserves both actual roster names" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var table = try RouteTable.init(failing.allocator(), .{ .max_nicks = 8, .max_channels = 8, .max_nodes_per_channel = 8 });
     defer table.deinit();
     _ = try table.applyMembership("#a", "old", 1, 0, 10, true, .{}, 0);
     _ = try table.applyMembership("#b", "old", 1, 0, 10, true, .{}, 0);
+    try table.setNickLocation("old", 1);
+    const prior_claim = table.bestNickClaim("old").?;
+    const prior_claim_count = table.best_nick_claims.count();
+    const prior_dirty = table.claim_index_dirty;
 
-    // Allow the exact-route re-key and one roster nick copy, then fail every
-    // subsequent allocation. renameNick deliberately leaves the second roster
-    // untouched; claim lookup must describe that real partial state.
+    // Fail the first roster preparation after the two stable nick copies.
+    // No rename is published, and claim lookup must describe both old rows.
     failing.fail_index = failing.alloc_index + 2;
-    try std.testing.expect(try table.renameNick("old", "new", 1, .{}));
+    try std.testing.expectError(error.OutOfMemory, table.renameNick("old", "new", 1, .{}));
     try std.testing.expect(failing.has_induced_failure);
 
     var old_rows: usize = 0;
@@ -3634,10 +3865,16 @@ test "bestNickClaim partial rename OOM reflects both actual roster names" {
             if (std.mem.eql(u8, member.nick, "new")) new_rows += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 1), old_rows);
-    try std.testing.expectEqual(@as(usize, 1), new_rows);
-    try std.testing.expect(table.bestNickClaim("old") != null);
-    try std.testing.expect(table.bestNickClaim("new") != null);
+    try std.testing.expectEqual(@as(usize, 2), old_rows);
+    try std.testing.expectEqual(@as(usize, 0), new_rows);
+    const old_claim = table.bestNickClaim("old").?;
+    try std.testing.expectEqual(prior_claim.node_id, old_claim.node_id);
+    try std.testing.expectEqual(prior_claim.hlc, old_claim.hlc);
+    try std.testing.expectEqual(prior_claim_count, table.best_nick_claims.count());
+    try std.testing.expectEqual(prior_dirty, table.claim_index_dirty);
+    try std.testing.expectEqual(@as(?NodeId, 1), table.nickNode("old"));
+    try std.testing.expectEqual(@as(?NodeId, null), table.nickNode("new"));
+    try std.testing.expect(table.bestNickClaim("new") == null);
 }
 
 test "bestNickClaim prune survives claim-index rebuild OOM" {
@@ -4152,4 +4389,156 @@ test "GAP-M2 a raised channel ceiling stores the 65th node" {
     while (n <= 128) : (n += 1) try wide.updateOnMembershipChange("#m2", n, .join);
     try std.testing.expectError(error.ChannelFanoutFull, wide.updateOnMembershipChange("#m2", 129, .join));
     std.debug.print("GAP-M2 branch=raised ceilings store the 65th node and still evict only when full\n", .{});
+}
+
+test "existing membership identity allocation failure retains entire row" {
+    for (0..6) |cut| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var table = try RouteTable.init(failing.allocator(), .{});
+        defer table.deinit();
+        _ = try table.applyMembership("#room", "alice", 1, 1, 10, true, .{ .username = "olduser", .realname = "oldreal", .host = "oldhost", .account = "oldaccount", .real_host = "oldprivate", .certfp = "oldcert" }, 5);
+        failing.fail_index = failing.alloc_index + cut;
+        try std.testing.expectError(error.OutOfMemory, table.applyMembership("#room", "alice", 1, 2, 20, true, .{ .username = "newuser", .realname = "newreal", .host = "newhost", .account = "newaccount", .real_host = "newprivate", .certfp = "newcert" }, 8));
+        const row = table.channelMembers("#room")[0];
+        try std.testing.expectEqualStrings("olduser", row.username);
+        try std.testing.expectEqualStrings("oldreal", row.realname);
+        try std.testing.expectEqualStrings("oldhost", row.host);
+        try std.testing.expectEqualStrings("oldaccount", row.account);
+        try std.testing.expectEqualStrings("oldprivate", row.real_host);
+        try std.testing.expectEqualStrings("oldcert", row.certfp);
+        try std.testing.expectEqual(@as(u64, 10), row.hlc);
+        try std.testing.expectEqual(@as(u4, 1), row.status);
+        try std.testing.expectEqual(@as(i64, 5), row.last_refreshed_ms);
+        failing.fail_index = std.math.maxInt(usize);
+        _ = try table.applyMembership("#room", "alice", 1, 2, 20, true, .{ .username = "newuser", .realname = "newreal", .host = "newhost", .account = "newaccount", .real_host = "newprivate", .certfp = "newcert" }, 8);
+        try std.testing.expectEqualStrings("newhost", table.channelMembers("#room")[0].host);
+    }
+}
+
+test "membership identity preparation commits only after accepted same-owner change" {
+    const Probe = struct {
+        prepare_count: usize = 0,
+        commit_count: usize = 0,
+        release_count: usize = 0,
+        fail: bool = false,
+        fn prepare(ctx: *anyopaque, change: *const MembershipIdentityTransition) anyerror!PreparedMembershipIdentityChange {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.prepare_count += 1;
+            try std.testing.expectEqualStrings("oldhost", change.old.host);
+            try std.testing.expectEqualStrings("newhost", change.new.host);
+            if (self.fail) return error.TestRefused;
+            return .{ .ctx = self, .commit_fn = commit, .release_fn = release };
+        }
+        fn commit(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.commit_count += 1;
+        }
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.release_count += 1;
+        }
+    };
+    var table = try RouteTable.init(std.testing.allocator, .{});
+    defer table.deinit();
+    _ = try table.applyMembership("#room", "alice", 1, 0, 10, true, .{ .username = "user", .host = "oldhost" }, 0);
+    var probe = Probe{ .fail = true };
+    const hook = MembershipIdentityPreparer{ .ctx = &probe, .prepare_fn = Probe.prepare };
+    try std.testing.expectError(error.MembershipPreparePending, table.applyMembershipWithPreparer("#room", "alice", 1, 0, 11, true, .{ .username = "user", .host = "newhost" }, 1, hook));
+    try std.testing.expectEqualStrings("oldhost", table.channelMembers("#room")[0].host);
+    try std.testing.expectEqual(@as(u64, 10), table.channelMembers("#room")[0].hlc);
+    try std.testing.expectEqual(@as(usize, 0), probe.commit_count);
+    probe.fail = false;
+    _ = try table.applyMembershipWithPreparer("#room", "alice", 1, 0, 11, true, .{ .username = "user", .host = "newhost" }, 1, hook);
+    try std.testing.expectEqualStrings("newhost", table.channelMembers("#room")[0].host);
+    try std.testing.expectEqual(@as(usize, 1), probe.commit_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.release_count);
+    _ = try table.applyMembershipWithPreparer("#room", "alice", 1, 0, 11, true, .{ .username = "user", .host = "newhost" }, 2, hook);
+    try std.testing.expectEqual(@as(usize, 2), probe.prepare_count);
+}
+
+test "core observes row-identical newer proposal across channels and can refuse it" {
+    const Probe = struct {
+        calls: usize = 0,
+        commits: usize = 0,
+        fail: bool = false,
+        fn prepare(ctx: *anyopaque, change: *const MembershipIdentityTransition) anyerror!PreparedMembershipIdentityChange {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (std.mem.eql(u8, change.channel, "#b")) {
+                try std.testing.expectEqualStrings("a", change.old.host);
+                try std.testing.expectEqualStrings("a", change.new.host);
+            }
+            if (self.fail) return error.TestRefused;
+            return .{ .ctx = self, .commit_fn = commit };
+        }
+        fn commit(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.commits += 1;
+        }
+    };
+    var table = try RouteTable.init(std.testing.allocator, .{});
+    defer table.deinit();
+    _ = try table.applyMembership("#a", "alice", 1, 0, 10, true, .{ .username = "u", .host = "a" }, 1);
+    _ = try table.applyMembership("#b", "alice", 1, 0, 10, true, .{ .username = "u", .host = "a" }, 1);
+    var probe = Probe{};
+    const hook = MembershipIdentityPreparer{ .ctx = &probe, .prepare_fn = Probe.prepare };
+    _ = try table.applyMembershipWithPreparer("#a", "alice", 1, 0, 11, true, .{ .username = "u", .host = "b" }, 2, hook);
+    probe.fail = true;
+    try std.testing.expectError(error.MembershipPreparePending, table.applyMembershipWithPreparer("#b", "alice", 1, 0, 12, true, .{ .username = "u", .host = "a" }, 3, hook));
+    try std.testing.expectEqual(@as(u64, 10), table.channelMembers("#b")[0].hlc);
+    probe.fail = false;
+    _ = try table.applyMembershipWithPreparer("#b", "alice", 1, 0, 12, true, .{ .username = "u", .host = "a" }, 3, hook);
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.commits);
+    const legacy = MembershipIdentityPreparer{ .ctx = &probe, .prepare_fn = Probe.prepare, .only_changed = true };
+    _ = try table.applyMembershipWithPreparer("#b", "alice", 1, 0, 13, true, .{ .username = "u", .host = "a" }, 4, legacy);
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+}
+
+test "membership public provenance conflict is terminal and preserves old row" {
+    const Probe = struct {
+        fn prepare(_: *anyopaque, _: *const MembershipIdentityTransition) anyerror!PreparedMembershipIdentityChange {
+            return error.PublicIdentityProvenanceConflict;
+        }
+    };
+    var table = try RouteTable.init(std.testing.allocator, .{});
+    defer table.deinit();
+    _ = try table.applyMembership("#room", "alice", 1, 0, 10, true, .{ .username = "u", .host = "old" }, 4);
+    var ctx: u8 = 0;
+    const hook = MembershipIdentityPreparer{ .ctx = &ctx, .prepare_fn = Probe.prepare };
+    try std.testing.expectError(error.PublicIdentityProvenanceConflict, table.applyMembershipWithPreparer("#room", "alice", 1, 0, 11, true, .{ .username = "u", .host = "new" }, 5, hook));
+    const row = table.channelMembers("#room")[0];
+    try std.testing.expectEqualStrings("old", row.host);
+    try std.testing.expectEqual(@as(u64, 10), row.hlc);
+    try std.testing.expectEqual(@as(i64, 4), row.last_refreshed_ms);
+}
+
+test "legacy nick rename keeps route and all roster identity on allocation failure" {
+    const Sweep = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var table = try RouteTable.init(a, .{});
+            defer table.deinit();
+            for ([_][]const u8{ "#a", "#b" }) |channel| {
+                _ = try table.applyMembership(channel, "before", 9, 0, 10, true, .{ .username = "old", .host = "oldhost" }, 1);
+            }
+            const renamed = table.renameNick("before", "after", 9, .{ .username = "new", .host = "newhost" }) catch |err| {
+                try std.testing.expectEqual(@as(?NodeId, 9), table.nickNode("before"));
+                try std.testing.expect(table.nickNode("after") == null);
+                for ([_][]const u8{ "#a", "#b" }) |channel| {
+                    const member = table.channelMembers(channel)[0];
+                    try std.testing.expectEqualStrings("before", member.nick);
+                    try std.testing.expectEqualStrings("old", member.username);
+                    try std.testing.expectEqualStrings("oldhost", member.host);
+                }
+                return err;
+            };
+            try std.testing.expect(renamed);
+            for ([_][]const u8{ "#a", "#b" }) |channel| {
+                const member = table.channelMembers(channel)[0];
+                try std.testing.expectEqualStrings("after", member.nick);
+                try std.testing.expectEqualStrings("newhost", member.host);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
 }

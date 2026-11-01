@@ -54,7 +54,7 @@ pub const Privilege = enum {
 
     pub fn parse(raw: []const u8) ?Privilege {
         inline for (@typeInfo(Privilege).@"enum".field_values) |field_value| {
-            const privilege: Privilege = @enumFromInt(field_value);
+            const privilege: Privilege = @fromBackingInt(@intCast(field_value));
             if (std.ascii.eqlIgnoreCase(raw, privilege.token())) return privilege;
         }
         return null;
@@ -107,7 +107,7 @@ pub const ForceActionKind = enum {
 
     pub fn parse(raw: []const u8) ?ForceActionKind {
         inline for (@typeInfo(ForceActionKind).@"enum".field_values) |field_value| {
-            const action: ForceActionKind = @enumFromInt(field_value);
+            const action: ForceActionKind = @fromBackingInt(@intCast(field_value));
             if (std.ascii.eqlIgnoreCase(raw, action.command())) return action;
         }
         return null;
@@ -158,7 +158,7 @@ pub const Numeric = enum(u16) {
 
 pub fn formatNumericCode(numeric: Numeric, buf: []u8) []const u8 {
     if (buf.len < 3) return buf[0..0];
-    const value: u16 = @intFromEnum(numeric);
+    const value: u16 = @backingInt(numeric);
     buf[0] = @as(u8, '0') + @as(u8, @intCast((value / 100) % 10));
     buf[1] = @as(u8, '0') + @as(u8, @intCast((value / 10) % 10));
     buf[2] = @as(u8, '0') + @as(u8, @intCast(value % 10));
@@ -527,7 +527,7 @@ test "forcetopic authorizes to real TOPIC plan" {
 
 test "required privilege is stable for every force action" {
     inline for (@typeInfo(ForceActionKind).@"enum".field_values) |field_value| {
-        const action: ForceActionKind = @enumFromInt(field_value);
+        const action: ForceActionKind = @fromBackingInt(@intCast(field_value));
         try std.testing.expectEqual(Privilege.channel_moderate, requiredPrivilege(action));
     }
 }

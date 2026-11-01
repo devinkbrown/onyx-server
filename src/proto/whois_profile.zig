@@ -13,6 +13,11 @@
 const std = @import("std");
 
 pub const version: u8 = 1;
+/// Version 2 widens the flag word to 32 bits so kTLS RX can be represented.
+/// Encoding stays on version 1 unless RX is set: older receivers therefore
+/// keep accepting TX-only profiles, while they simply skip a version 2
+/// profile instead of misreading its flags.
+pub const version_extended_flags: u8 = 2;
 
 pub const max_nick_len: usize = 64;
 pub const max_cipher_len: usize = 64;
@@ -21,7 +26,7 @@ pub const max_rdns_len: usize = 255;
 pub const max_modes_len: usize = 48;
 pub const max_class_len: usize = 64;
 
-pub const max_encoded_len: usize = 1 + 2 + (8 * 4) +
+pub const max_encoded_len: usize = 1 + 4 + (8 * 4) +
     (1 + max_nick_len) +
     (1 + max_cipher_len) +
     (2 + max_away_len) +
@@ -29,24 +34,28 @@ pub const max_encoded_len: usize = 1 + 2 + (8 * 4) +
     (1 + max_modes_len) +
     (1 + max_class_len);
 
-pub const flag_present: u16 = 1 << 0;
-pub const flag_tls: u16 = 1 << 1;
-pub const flag_bot: u16 = 1 << 2;
-pub const flag_regonly: u16 = 1 << 3;
-pub const flag_callerid: u16 = 1 << 4;
-pub const flag_common_chan: u16 = 1 << 5;
-pub const flag_tls_only: u16 = 1 << 6;
-pub const flag_no_invite: u16 = 1 << 7;
-pub const flag_hide_idle: u16 = 1 << 8;
-pub const flag_hide_chans: u16 = 1 << 9;
-pub const flag_away: u16 = 1 << 10;
-pub const flag_has_rdns: u16 = 1 << 11;
-pub const flag_hide_oper: u16 = 1 << 12;
-pub const flag_websocket: u16 = 1 << 13;
+pub const flag_present: u32 = 1 << 0;
+pub const flag_tls: u32 = 1 << 1;
+pub const flag_bot: u32 = 1 << 2;
+pub const flag_regonly: u32 = 1 << 3;
+pub const flag_callerid: u32 = 1 << 4;
+pub const flag_common_chan: u32 = 1 << 5;
+pub const flag_tls_only: u32 = 1 << 6;
+pub const flag_no_invite: u32 = 1 << 7;
+pub const flag_hide_idle: u32 = 1 << 8;
+pub const flag_hide_chans: u32 = 1 << 9;
+pub const flag_away: u32 = 1 << 10;
+pub const flag_has_rdns: u32 = 1 << 11;
+pub const flag_hide_oper: u32 = 1 << 12;
+pub const flag_websocket: u32 = 1 << 13;
 /// The rDNS label is a PTR that did not forward-confirm. `flag_has_rdns` is
 /// still set so the name is on the wire; operators must not treat it as the
 /// confirmed hostname.
-pub const flag_rdns_unconfirmed: u16 = 1 << 14;
+pub const flag_rdns_unconfirmed: u32 = 1 << 14;
+/// Actual attached kernel TLS directions on the subject's home connection.
+/// TX fits the legacy version 1 flag word; RX requires version 2.
+pub const flag_ktls_tx: u32 = 1 << 15;
+pub const flag_ktls_rx: u32 = 1 << 16;
 
 pub const EncodeError = error{ Invalid, Overflow };
 
@@ -67,6 +76,8 @@ pub const Record = struct {
     rdns_unconfirmed: bool = false,
     hide_oper: bool = false,
     websocket: bool = false,
+    ktls_tx: bool = false,
+    ktls_rx: bool = false,
     signon_unix: u64 = 0,
     last_active_unix: u64 = 0,
     revision_ms: u64 = 0,
@@ -80,7 +91,7 @@ pub const Record = struct {
 };
 
 pub const View = struct {
-    flags: u16,
+    flags: u32,
     signon_unix: u64,
     last_active_unix: u64,
     revision_ms: u64,
@@ -114,6 +125,8 @@ pub const View = struct {
             .rdns_unconfirmed = rdns.len != 0 and (self.flags & flag_rdns_unconfirmed) != 0,
             .hide_oper = (self.flags & flag_hide_oper) != 0,
             .websocket = (self.flags & flag_websocket) != 0,
+            .ktls_tx = (self.flags & flag_ktls_tx) != 0,
+            .ktls_rx = (self.flags & flag_ktls_rx) != 0,
             .signon_unix = self.signon_unix,
             .last_active_unix = self.last_active_unix,
             .revision_ms = self.revision_ms,
@@ -137,9 +150,11 @@ pub fn encode(rec: Record, out: []u8) EncodeError![]const u8 {
     if (!tokenOk(rec.class_name) or rec.class_name.len > max_class_len) return error.Invalid;
     if (rec.has_rdns and rec.rdns.len == 0) return error.Invalid;
     if (rec.rdns_unconfirmed and !rec.has_rdns) return error.Invalid;
+    if ((rec.ktls_tx or rec.ktls_rx) and !rec.tls) return error.Invalid;
+    if (!rec.present and (rec.ktls_tx or rec.ktls_rx)) return error.Invalid;
     if (!rec.present and (rec.cipher.len != 0 or rec.away_text.len != 0 or rec.rdns.len != 0 or rec.modes.len != 0 or rec.class_name.len != 0)) return error.Invalid;
 
-    var flags: u16 = 0;
+    var flags: u32 = 0;
     if (rec.present) flags |= flag_present;
     if (rec.tls) flags |= flag_tls;
     if (rec.bot) flags |= flag_bot;
@@ -155,12 +170,21 @@ pub fn encode(rec: Record, out: []u8) EncodeError![]const u8 {
     if (rec.rdns_unconfirmed) flags |= flag_rdns_unconfirmed;
     if (rec.hide_oper) flags |= flag_hide_oper;
     if (rec.websocket) flags |= flag_websocket;
+    if (rec.ktls_tx) flags |= flag_ktls_tx;
+    if (rec.ktls_rx) flags |= flag_ktls_rx;
 
     var n: usize = 0;
-    try put(out, &n, &.{version});
-    var flag_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &flag_buf, flags, .little);
-    try put(out, &n, &flag_buf);
+    if (rec.ktls_rx) {
+        try put(out, &n, &.{version_extended_flags});
+        var flag_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &flag_buf, flags, .little);
+        try put(out, &n, &flag_buf);
+    } else {
+        try put(out, &n, &.{version});
+        var flag_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &flag_buf, @truncate(flags), .little);
+        try put(out, &n, &flag_buf);
+    }
     try putInt(out, &n, rec.signon_unix);
     try putInt(out, &n, rec.last_active_unix);
     try putInt(out, &n, rec.revision_ms);
@@ -176,10 +200,18 @@ pub fn encode(rec: Record, out: []u8) EncodeError![]const u8 {
 
 pub fn decode(bytes: []const u8) ?View {
     if (bytes.len < 1 + 2 + (8 * 4) + 1) return null;
-    if (bytes[0] != version) return null;
+    if (bytes[0] != version and bytes[0] != version_extended_flags) return null;
     var n: usize = 1;
-    const flags = std.mem.readInt(u16, bytes[n..][0..2], .little);
-    n += 2;
+    const flags: u32 = if (bytes[0] == version_extended_flags) blk: {
+        if (bytes.len < 1 + 4 + (8 * 4) + 1) return null;
+        const value = std.mem.readInt(u32, bytes[n..][0..4], .little);
+        n += 4;
+        break :blk value;
+    } else blk: {
+        const value = std.mem.readInt(u16, bytes[n..][0..2], .little);
+        n += 2;
+        break :blk value;
+    };
     const signon_unix = readInt(bytes, &n) orelse return null;
     const last_active_unix = readInt(bytes, &n) orelse return null;
     const revision_ms = readInt(bytes, &n) orelse return null;
@@ -195,7 +227,8 @@ pub fn decode(bytes: []const u8) ?View {
     if ((flags & flag_has_rdns) != 0 and rdns.len == 0) return null;
     if ((flags & flag_has_rdns) == 0 and rdns.len != 0) return null;
     if ((flags & flag_rdns_unconfirmed) != 0 and (flags & flag_has_rdns) == 0) return null;
-    if ((flags & flag_present) == 0 and (cipher.len != 0 or away_text.len != 0 or rdns.len != 0 or modes.len != 0 or class_name.len != 0)) return null;
+    if ((flags & (flag_ktls_tx | flag_ktls_rx)) != 0 and (flags & flag_tls) == 0) return null;
+    if ((flags & flag_present) == 0 and ((flags & (flag_ktls_tx | flag_ktls_rx)) != 0 or cipher.len != 0 or away_text.len != 0 or rdns.len != 0 or modes.len != 0 or class_name.len != 0)) return null;
     return .{
         .flags = flags,
         .signon_unix = signon_unix,
@@ -330,6 +363,85 @@ test "whois profile round-trips public facts and strips rDNS on relay" {
     try std.testing.expect((stripped_view.flags & flag_tls) != 0);
 }
 
+test "whois profile round-trips kTLS offload state" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const tx_wire = try encode(.{
+        .present = true,
+        .tls = true,
+        .ktls_tx = true,
+        .nick = "kain",
+        .cipher = "TLS_CHACHA20_POLY1305_SHA256",
+        .revision_ms = 10,
+        .origin_node = 4,
+    }, &buf);
+    try std.testing.expectEqual(@as(u8, 1), tx_wire[0]);
+    const tx_view = decode(tx_wire) orelse return error.TestUnexpectedResult;
+    try std.testing.expect((tx_view.flags & flag_ktls_tx) != 0);
+    try std.testing.expect((tx_view.flags & flag_ktls_rx) == 0);
+    const tx_record = tx_view.record(false);
+    try std.testing.expect(tx_record.ktls_tx);
+    try std.testing.expect(!tx_record.ktls_rx);
+
+    const rx_wire = try encode(.{
+        .present = true,
+        .tls = true,
+        .ktls_tx = true,
+        .ktls_rx = true,
+        .nick = "kain",
+        .cipher = "TLS_CHACHA20_POLY1305_SHA256",
+        .revision_ms = 11,
+        .origin_node = 4,
+    }, &buf);
+    try std.testing.expectEqual(@as(u8, 2), rx_wire[0]);
+    const rx_view = decode(rx_wire) orelse return error.TestUnexpectedResult;
+    try std.testing.expect((rx_view.flags & flag_ktls_tx) != 0);
+    try std.testing.expect((rx_view.flags & flag_ktls_rx) != 0);
+    const rx_record = rx_view.record(false);
+    try std.testing.expect(rx_record.ktls_tx);
+    try std.testing.expect(rx_record.ktls_rx);
+}
+
+test "whois profile v2 kTLS edges fail closed" {
+    var buf: [max_encoded_len]u8 = undefined;
+    const rx_only = try encode(.{
+        .present = true,
+        .tls = true,
+        .ktls_rx = true,
+        .nick = "kain",
+        .revision_ms = 12,
+        .origin_node = 4,
+    }, &buf);
+    try std.testing.expectEqual(@as(u8, 2), rx_only[0]);
+    const rx_view = decode(rx_only) orelse return error.TestUnexpectedResult;
+    try std.testing.expect((rx_view.flags & flag_ktls_tx) == 0);
+    try std.testing.expect((rx_view.flags & flag_ktls_rx) != 0);
+
+    var unknown = try std.testing.allocator.dupe(u8, rx_only);
+    defer std.testing.allocator.free(unknown);
+    unknown[0] = 3;
+    try std.testing.expect(decode(unknown) == null);
+    try std.testing.expect(decode(rx_only[0..3]) == null);
+
+    var no_tls = try std.testing.allocator.dupe(u8, rx_only);
+    defer std.testing.allocator.free(no_tls);
+    var flags = std.mem.readInt(u32, no_tls[1..5], .little);
+    flags &= ~flag_tls;
+    std.mem.writeInt(u32, no_tls[1..5], flags, .little);
+    try std.testing.expect(decode(no_tls) == null);
+
+    var gone = try std.testing.allocator.dupe(u8, rx_only);
+    defer std.testing.allocator.free(gone);
+    flags = std.mem.readInt(u32, gone[1..5], .little);
+    flags &= ~flag_present;
+    std.mem.writeInt(u32, gone[1..5], flags, .little);
+    try std.testing.expect(decode(gone) == null);
+    try std.testing.expectError(error.Invalid, encode(.{
+        .present = true,
+        .ktls_tx = true,
+        .nick = "kain",
+    }, &buf));
+}
+
 test "whois profile rejects a truncated body and a gone record with session text" {
     var buf: [max_encoded_len]u8 = undefined;
     const wire = try encode(.{ .nick = "klys", .revision_ms = 1 }, &buf);
@@ -375,7 +487,7 @@ test "whois profile keeps an unconfirmed rDNS mark and rejects it alone" {
     var dropped = try std.testing.allocator.dupe(u8, wire);
     defer std.testing.allocator.free(dropped);
     var flags = std.mem.readInt(u16, dropped[1..3], .little);
-    flags &= ~flag_has_rdns;
+    flags &= ~@as(u16, @truncate(flag_has_rdns));
     std.mem.writeInt(u16, dropped[1..3], flags, .little);
     try std.testing.expect(decode(dropped) == null);
 }

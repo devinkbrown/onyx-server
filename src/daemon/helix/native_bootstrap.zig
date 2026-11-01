@@ -180,7 +180,7 @@ pub const Driver = struct {
             .canonical = listener.fd,
             .fd = listener.fd,
             .shard = listener.shard,
-            .family = @intFromEnum(listener.family),
+            .family = @backingInt(listener.family),
             .role = switch (listener.kind) {
                 .plain => .plain_listener,
                 .tls => .tls_listener,
@@ -1027,10 +1027,10 @@ test "OpenBSD native dormant COMMIT after deadline survives until actual predece
     var returned: [1]u8 = undefined;
     try LateCommitFixture.readExact(report_fds[0], &returned, exchange.deadlineAfter(3000));
     try std.testing.expectEqual(@as(u8, 'R'), returned[0]);
-    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.kill(candidate_pid, @enumFromInt(0))));
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.kill(candidate_pid, @fromBackingInt(@intCast(0)))));
     try LateCommitFixture.writeExact(report_fds[0], "Q", exchange.deadlineAfter(1000));
     const gone_deadline = exchange.deadlineAfter(3000);
-    while (posix.errno(sys.kill(candidate_pid, @enumFromInt(0))) != .SRCH) {
+    while (posix.errno(sys.kill(candidate_pid, @fromBackingInt(@intCast(0)))) != .SRCH) {
         if (platform.monotonicMillis() >= gone_deadline) return error.TestTimeout;
         runtime.sleepMillis(1);
     }

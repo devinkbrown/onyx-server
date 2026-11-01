@@ -186,6 +186,20 @@ pub const ScramStore = struct {
         account: []const u8,
         password: []const u8,
     ) ScramStoreError!void {
+        return self.deriveAndStoreWithIterations(account, password, default_iterations);
+    }
+
+    /// Explicit allocation-sweep entry, absent in non-test builds. This uses
+    /// the same entropy, crypto, owned buffers and insertion path as ordinary
+    /// derivation; only the per-call PBKDF iteration count differs.
+    pub const AllocationFailureSweep = if (@import("builtin").is_test) struct {
+        pub fn deriveAndStore(self: *ScramStore, account: []const u8, password: []const u8) ScramStoreError!void {
+            return self.deriveAndStoreWithIterations(account, password, 1);
+        }
+    } else struct {};
+
+    fn deriveAndStoreWithIterations(self: *ScramStore, account: []const u8, password: []const u8, comptime iterations: u32) ScramStoreError!void {
+        if (comptime !@import("builtin").is_test and iterations != default_iterations) @compileError("reduced SCRAM derivation work is test-only");
         self.lock.lockExclusive();
         defer self.lock.unlockExclusive();
 
@@ -195,7 +209,7 @@ pub const ScramStore = struct {
         crypto_random.fillOsEntropy(&salt) catch return error.EntropyFailed;
         defer secureZero(&salt);
 
-        try self.storeWithSaltUnlocked(account, password, &salt, default_iterations);
+        try self.storeWithSaltUnlocked(account, password, &salt, iterations);
     }
 
     /// Derive and store SCRAM credentials using a caller-supplied salt and

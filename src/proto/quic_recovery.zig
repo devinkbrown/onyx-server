@@ -547,7 +547,7 @@ pub const Recovery = struct {
     }
 
     fn registry(self: *Recovery, level: EncryptionLevel) *SentRegistry {
-        return &self.sent[@intFromEnum(spaceIndex(level))];
+        return &self.sent[@backingInt(spaceIndex(level))];
     }
 
     /// The driver tells us the handshake is confirmed (1-RTT keys in use and the

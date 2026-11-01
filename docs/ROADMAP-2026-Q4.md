@@ -1,5 +1,8 @@
 # Onyx Server roadmap — Q4 2026 → 0.7
 
+> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](README.md) and [production paths](ops/onyx-server-paths.md). Do not execute it as a current procedure.
+
+
 **Audience: contributor and maintainer.** The engineering roadmap for the daemon,
 organized as a **feature spine in four waves** plus three **release tracks**
 (performance, hardening, polish) that cut across every wave. Ambitious about

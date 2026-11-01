@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-10-23 at 18:25:58 UTC**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-11-01**. (The 2026-10-23 roll is recorded separately below.) eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -21,19 +21,32 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-10-23)
+## Verified fleet baseline (2026-11-01)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.8.1+2a7bbcb71348` | `0.8.1+2a7bbcb71348` |
-| Executable SHA-256 | `98cd6ecf03b47fb358f08b6545372b213fa5c88d21b7aa27e37ff75fe10b91b5` | same |
-| Process ID at acceptance | `18189` | `2181421` |
+| Running image | `0.9.0+066d9b8356be-dirty` | `0.9.0+066d9b8356be-dirty` |
+| Executable SHA-256 | `61d218f6682857eed5f3d4bb4007c2d99869fc723810f0df637961a417e5fe02` | same |
+| Process ID at acceptance | `11106` | `2687524` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
 
-The accepted source is `2a7bbcb71348e2b61152bb8bfafb5ffbf425b8a6`. This roll
+This roll enabled `[tls] ktls = "txrx"` on both nodes (cold restarts, local
+first; Helix remains blocked by the WebTransport listener). Both nodes boot-log
+`kTLS TX+RX offload ACTIVE (txrx)` and report `ktls_tx=true, ktls_rx=true`.
+Live acceptance: mesh health smoke green both ways, cross-node chat smoke
+passed, and a fresh TLS guest WHOIS on each node renders
+`671 ... [kTLS: TX+RX]` with the literal address only on `338` (the `320`
+GeoIP/ASN line no longer repeats it). Rollback for this roll:
+`rollback-0.9.0-20261101T155843Z` in each node's runtime directory (previous
+image `0.8.1+066d9b83-dirty`, SHA-256
+`d8772178eda81c28bb5ea4c119ad8dd97da5a77367feb6a8e7401541ef795821`).
+
+### Previous roll (2026-10-23, historical)
+
+The accepted source was `2a7bbcb71348e2b61152bb8bfafb5ffbf425b8a6`. This roll
 used authorized cold restarts, local first. The predecessor's Helix capability
 probe attempted to open `/dev/null` read/write, which its inherited Landlock
 policy denied. The new image uses an immediately closed stdin pipe and a bounded

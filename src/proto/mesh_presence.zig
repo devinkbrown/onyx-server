@@ -131,7 +131,7 @@ pub fn encode(record: Record, key: *const sign.KeyPair, out: []u8) ![]const u8 {
     if (out.len < length) return error.Truncated;
     @memcpy(out[0..4], magic);
     out[4] = version;
-    out[5] = @intFromEnum(record.operation);
+    out[5] = @backingInt(record.operation);
     @memcpy(out[6..38], &record.origin);
     @memcpy(out[38..54], &record.guest);
     std.mem.writeInt(u64, out[54..62], record.revision, .big);

@@ -54,11 +54,11 @@ pub const ParamId = enum(u64) {
     _,
 
     pub fn fromInt(value: u64) ParamId {
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     pub fn toInt(self: ParamId) u64 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

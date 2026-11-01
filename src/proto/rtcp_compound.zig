@@ -162,10 +162,10 @@ pub const Iterator = struct {
         }
 
         const view = switch (packet_type) {
-            @intFromEnum(PacketType.sr) => try parseSenderReportBody(count, body),
-            @intFromEnum(PacketType.rr) => try parseReceiverReportBody(count, body),
-            @intFromEnum(PacketType.sdes) => try parseSdesBody(count, body),
-            @intFromEnum(PacketType.bye) => try parseByeBody(count, body),
+            @backingInt(PacketType.sr) => try parseSenderReportBody(count, body),
+            @backingInt(PacketType.rr) => try parseReceiverReportBody(count, body),
+            @backingInt(PacketType.sdes) => try parseSdesBody(count, body),
+            @backingInt(PacketType.bye) => try parseByeBody(count, body),
             else => View{ .other = .{
                 .pt = packet_type,
                 .body = body,
@@ -186,7 +186,7 @@ pub fn buildReceiverReport(sender_ssrc: u32, blocks: []const ReportBlock, out: [
     const total_len = header_len + 4 + blocks.len * report_block_len;
     if (out.len < total_len) return error.BadLength;
 
-    writeHeader(out[0..header_len], @intCast(blocks.len), @intFromEnum(PacketType.rr), total_len);
+    writeHeader(out[0..header_len], @intCast(blocks.len), @backingInt(PacketType.rr), total_len);
     writeU32(out[4..8], sender_ssrc);
     for (blocks, 0..) |block, index| {
         const start = 8 + index * report_block_len;
@@ -203,7 +203,7 @@ pub fn buildBye(ssrcs: []const u32, reason: []const u8, out: []u8) Error![]const
     const total_len = align4(unpadded_len);
     if (out.len < total_len) return error.BadLength;
 
-    writeHeader(out[0..header_len], @intCast(ssrcs.len), @intFromEnum(PacketType.bye), total_len);
+    writeHeader(out[0..header_len], @intCast(ssrcs.len), @backingInt(PacketType.bye), total_len);
 
     var pos: usize = header_len;
     for (ssrcs) |ssrc| {

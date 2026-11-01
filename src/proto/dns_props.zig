@@ -190,7 +190,7 @@ fn writeRepeatedLabel(out: []u8, pos: *usize, len: usize, byte: u8) void {
 }
 
 fn writeQuestionTail(out: []u8, pos: *usize, rr_type: dns.RecordType) void {
-    writeU16(out, pos, @intFromEnum(rr_type));
+    writeU16(out, pos, @backingInt(rr_type));
     writeU16(out, pos, dns.class_in);
 }
 
@@ -264,7 +264,7 @@ fn buildCompressedResponse(out: []u8) []const u8 {
     out[pos] = 0xc0;
     out[pos + 1] = 0x0c;
     pos += 2;
-    writeU16(out, &pos, @intFromEnum(dns.RecordType.a));
+    writeU16(out, &pos, @backingInt(dns.RecordType.a));
     writeU16(out, &pos, dns.class_in);
     writeU32(out, &pos, 60);
     writeU16(out, &pos, 4);

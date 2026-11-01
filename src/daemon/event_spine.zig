@@ -91,7 +91,7 @@ pub const EventSeverity = enum {
     /// by the comptime guard below (which also protects `EVENT REPLAY`'s floor
     /// and event-collapse's "never collapse ≥ warn" safety rule).
     pub fn atLeast(self: EventSeverity, floor: EventSeverity) bool {
-        return @intFromEnum(self) >= @intFromEnum(floor);
+        return @backingInt(self) >= @backingInt(floor);
     }
 };
 
@@ -107,7 +107,7 @@ comptime {
     if (ordered.len != @typeInfo(EventSeverity).@"enum".field_names.len)
         @compileError("EventSeverity: add the new level to the ordered-severity guard");
     for (ordered, 0..) |sev, i| {
-        if (@intFromEnum(sev) != i)
+        if (@backingInt(sev) != i)
             @compileError("EventSeverity ordinals must follow the low->high declaration order");
     }
 }
@@ -167,7 +167,7 @@ pub const CategoryMask = struct {
     }
 
     fn bit(category: EventCategory) u64 {
-        return @as(u64, 1) << @intFromEnum(category);
+        return @as(u64, 1) << @backingInt(category);
     }
 };
 
@@ -216,7 +216,7 @@ pub const IrcxEventType = enum(u3) {
 
     pub fn parse(raw: []const u8) ?IrcxEventType {
         inline for (@typeInfo(IrcxEventType).@"enum".field_values) |field_value| {
-            const typ: IrcxEventType = @enumFromInt(field_value);
+            const typ: IrcxEventType = @fromBackingInt(@intCast(field_value));
             if (std.ascii.eqlIgnoreCase(raw, typ.wireName())) return typ;
         }
         return null;
@@ -236,7 +236,7 @@ pub const IrcxEventType = enum(u3) {
     }
 
     pub fn bit(self: IrcxEventType) u8 {
-        return @as(u8, 1) << @intCast(@intFromEnum(self));
+        return @as(u8, 1) << @intCast(@backingInt(self));
     }
 };
 
@@ -578,11 +578,11 @@ test "EventSeverity.parse and ordering supports a min-severity filter" {
     try std.testing.expectEqual(EventSeverity.critical, EventSeverity.parse("Critical").?);
     try std.testing.expectEqual(@as(?EventSeverity, null), EventSeverity.parse("loud"));
     // Ordered low→high, so `@intFromEnum(sev) >= min` is a valid threshold test.
-    try std.testing.expect(@intFromEnum(EventSeverity.debug) < @intFromEnum(EventSeverity.info));
-    try std.testing.expect(@intFromEnum(EventSeverity.info) < @intFromEnum(EventSeverity.notice));
-    try std.testing.expect(@intFromEnum(EventSeverity.notice) < @intFromEnum(EventSeverity.warn));
-    try std.testing.expect(@intFromEnum(EventSeverity.warn) < @intFromEnum(EventSeverity.@"error"));
-    try std.testing.expect(@intFromEnum(EventSeverity.@"error") < @intFromEnum(EventSeverity.critical));
+    try std.testing.expect(@backingInt(EventSeverity.debug) < @backingInt(EventSeverity.info));
+    try std.testing.expect(@backingInt(EventSeverity.info) < @backingInt(EventSeverity.notice));
+    try std.testing.expect(@backingInt(EventSeverity.notice) < @backingInt(EventSeverity.warn));
+    try std.testing.expect(@backingInt(EventSeverity.warn) < @backingInt(EventSeverity.@"error"));
+    try std.testing.expect(@backingInt(EventSeverity.@"error") < @backingInt(EventSeverity.critical));
 }
 
 test "event spine severity threshold predicate atLeast follows the low->high order" {
