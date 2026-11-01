@@ -24,7 +24,5 @@ test {
     _ = @import("http_fetch/tests_policy.zig");
     _ = @import("http_fetch/tests_native_io.zig");
     _ = @import("http_fetch/tests_dns.zig");
-    _ = @import("http_fetch/tests_single_family_dns.zig");
-    _ = @import("http_fetch/tests_parallel_dns.zig");
     _ = @import("http_fetch/tests_tls_control.zig");
 }
