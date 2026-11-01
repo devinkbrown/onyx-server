@@ -168,7 +168,7 @@ def run(binary,scratch):
                     try:chunk=self.sock.recv(65536)
                     except socket.timeout:continue
                     assert chunk,('client closed',len(self.seen));self.seen+=chunk;assert len(self.seen)<LIMIT, 'IRC response bound reached'
-                    assert len(self.seen)<=131072,'client response bound exceeded' 
+                    assert len(self.seen)<=131072,'client response bound exceeded'
                 return self.seen
             def login(self,password,nick,ok=True):
                 self.send(b'CAP LS 302\r\n');self.until(b'CAP')
