@@ -38,6 +38,7 @@ where that contract is not yet suite-green.
 
 ## Operations
 
+- [Client disconnect diagnosis](ops/client-disconnects.md) — receive reasons, Linux keepalive policy, and upgrade limits
 - [Runbook](RUNBOOK.md) — staging, systemd install, config validation, hot-upgrade, rollback, health checks
 - [Cloaking release preparation (2026-10-26)](ops/release-preparation-cloaking-2026-10-26.md) — candidate changes, verification, and migration/release limits
 - [Contributing](../CONTRIBUTING.md) — source-of-truth workflow, build/test lanes, PR checklist
@@ -62,6 +63,8 @@ where that contract is not yet suite-green.
 - [Overview](architecture/00-overview.md) — subsystems, request flow, source map
 - [Reactor & threading](architecture/01-reactor-threading.md) — `io_uring` and sharded workers
 - [World, dispatch & modules](architecture/02-world-dispatch-modules.md) — the SerpentRegistry command system
+- [Source-module ownership](architecture/source-modules.md) — facade boundaries, canonical owners, and extraction checks
+- [DNS](architecture/dns.md) — bounded resolution, worker deadlines, validation, and cache policy
 - [Mesh & S2S](architecture/mesh-s2s.md) — Undertow CRDT, links, partition detection, oper-grant sharing
 - [Mesh security](architecture/mesh-security.md) — threat model, AEAD record layer, origin signing, media capabilities
 - [Cryptography](architecture/crypto.md) — the Mooring handshake, Armor, signing, sealed tokens

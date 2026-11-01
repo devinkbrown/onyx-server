@@ -1168,7 +1168,19 @@ pub fn handleRehash(self: anytype, conn: anytype) !void {
 
 pub fn handleRehashParsed(self: anytype, conn: anytype, parsed_line: anytype) !void {
     const dry = parsed_line.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed_line.paramSlice()[0], "DRY");
-    try rehashFromConn(self, conn, dry);
+    try rehashFromConnWithClassAllocator(self, conn, dry, self.allocator);
+}
+
+/// Exposes the class-policy staging allocator to deterministic OOM tests.
+/// Production command dispatch always passes the server allocator.
+pub fn handleRehashParsedWithClassAllocator(
+    self: anytype,
+    conn: anytype,
+    parsed_line: anytype,
+    class_allocator: std.mem.Allocator,
+) !void {
+    const dry = parsed_line.param_count >= 1 and std.ascii.eqlIgnoreCase(parsed_line.paramSlice()[0], "DRY");
+    try rehashFromConnWithClassAllocator(self, conn, dry, class_allocator);
 }
 
 /// Capture the values consumed by this parse, rather than resolving a second
@@ -1234,6 +1246,15 @@ pub const ConfigEnvCapture = struct {
 };
 
 fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
+    try rehashFromConnWithClassAllocator(self, conn, dry, self.allocator);
+}
+
+fn rehashFromConnWithClassAllocator(
+    self: anytype,
+    conn: anytype,
+    dry: bool,
+    class_allocator: std.mem.Allocator,
+) !void {
     const Server = @TypeOf(self.*);
     if (!self.requirePriv(conn, .server_rehash)) return;
     // Operator gate enforced by the registry (access=.oper).
@@ -1369,14 +1390,27 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
         return;
     };
     defer _ = self.module_runtime.abortReload();
+    // Prepare connection policy before publishing any parsed config, operator
+    // binding, limit, or Windows source-proof state. The class Builder and the
+    // policy rollback snapshot share the injected allocator boundary; OOM here
+    // leaves the active REHASH generation untouched.
+    self.applyReloadedLimitsWithClassAllocator(&parsed, class_allocator) catch |err| {
+        self.allocator.free(bindings);
+        parsed.deinit(self.allocator);
+        const note = if (err == error.OutOfMemory)
+            "REHASH: out of memory; keeping current config"
+        else
+            "REHASH: invalid connection class policy; keeping current config";
+        try self.noticeTo(conn, note);
+        return;
+    };
 
     // Commit: replace the previous reloaded generation, then point the live
     // registry at the new bindings. `parsed`'s strings (incl. the TLS cert/key
     // paths consulted just below) now live in `self.reload_parsed`.
-    // Any failure after mutation starts leaves native handoff refused. Only a
-    // narrow, monotonic per-IP clone cap increase can rebind the
-    // Windows source proof below. HXTM carries the exact serving TLS generation
-    // and HXWM carries WASM state; static/restart-only drift stays disqualified.
+    // No fallible preparation remains. Only a narrow, monotonic per-IP clone
+    // cap increase can rebind the Windows source proof below. HXTM carries the
+    // exact serving TLS generation and HXWM carries WASM state.
     if (comptime builtin.os.tag == .windows and @hasField(Server, "windows_helix_source_valid"))
         self.windows_helix_source_valid.store(false, .release);
     self.allocator.free(self.reload_bindings);
@@ -1392,10 +1426,6 @@ fn rehashFromConn(self: anytype, conn: anytype, dry: bool) !void {
     self.reload_bindings = bindings;
     self.oper_registry = new_registry;
 
-    // Reload the anti-abuse runtime: connection classes (per-class clone /
-    // flood / admission policy), the global clone caps, the connection-rate
-    // throttle, and the nick-delay window — all from the freshly parsed config.
-    self.applyReloadedLimits(&self.reload_parsed.?);
     self.module_runtime.commitReload() catch unreachable;
 
     // Cert hot-reload: re-read the cert/key material from the reloaded paths

@@ -140,7 +140,10 @@ pub const Mutation = struct {
     value: ?[]const u8,
 };
 
-pub const max_batch_mutations = 4;
+/// Large enough for an atomic account-drop cut: 16 certfp rows + their index,
+/// 16 WebAuthn rows + their index, two session-token rows, and six account,
+/// SCRAM, MFA, recovery, verification, and audit rows.
+pub const max_batch_mutations = 42;
 
 pub const meta_kind_batch: u8 = 0xFB;
 
@@ -150,7 +153,7 @@ pub const batch_format_version: u8 = 1;
 
 pub const batch_guard_len = record_header_len + 2;
 
-// Four payload/feed retirements per row, one table backing per family, packet.
+// Five payload/feed retirements per row, one table backing per family, packet.
 pub const prepared_retirement_capacity = max_batch_mutations * 5 + 1;
 
 /// A bounded atomic mutation group. Keys within one family must be distinct.

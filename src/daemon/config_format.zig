@@ -365,6 +365,9 @@ pub const Config = struct {
 
     pub const Mesh = struct {
         realm: []const u8 = "",
+        /// Durable guest-presence store path (`mesh.presence_store_path`);
+        /// unset keeps guest presence process-local.
+        presence_store_path: ?[]const u8 = null,
         trust_roots: []const []const u8 = &.{},
         mesh_pass: ?[]const u8 = null,
         /// Encoded MeshPass signed-capability token this node presents in the
@@ -1055,6 +1058,7 @@ pub const Config = struct {
         if (self.mail.trust_store_path) |value| allocator.free(value);
         if (self.webauthn.rp_id) |value| allocator.free(value);
         freeStringList(allocator, self.webauthn.origins);
+        if (self.mesh.presence_store_path) |value| allocator.free(value);
         if (self.mesh.mesh_pass) |value| allocator.free(value);
         if (self.mesh.admission_token) |value| allocator.free(value);
         if (self.sasl.realm) |value| allocator.free(value);
@@ -1306,6 +1310,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [mesh]
     try setStr(allocator, resolver, doc.getString("mesh.realm"), &cfg.mesh.realm);
+    try setOpt(allocator, resolver, doc.getString("mesh.presence_store_path"), &cfg.mesh.presence_store_path);
     try setOpt(allocator, resolver, doc.getString("mesh.mesh_pass"), &cfg.mesh.mesh_pass);
     try setOpt(allocator, resolver, doc.getString("mesh.admission_token"), &cfg.mesh.admission_token);
     if (doc.getArray("mesh.trust_roots")) |arr| {

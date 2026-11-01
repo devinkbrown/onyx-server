@@ -19,6 +19,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const zig_compat = @import("zig_compat.zig");
+const tls_handshake_reassembly = @import("tls_handshake_reassembly.zig");
 
 const kx = @import("kx.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
@@ -628,6 +629,7 @@ pub const Server = struct {
 
     transcript: std.ArrayList(u8) = .empty,
     recv_buf: std.ArrayList(u8) = .empty,
+    client_hello_reassembly: tls_handshake_reassembly.Reassembly = .{},
     /// Count of unencrypted change_cipher_spec records this peer has sent, over
     /// the whole connection. RFC 8446 lets a TLS 1.3 peer interleave these for
     /// middlebox compatibility and has us drop them, which — unbounded — is a
@@ -864,6 +866,7 @@ pub const Server = struct {
         self.server_app_keys.wipe();
         self.transcript.deinit(self.allocator);
         self.recv_buf.deinit(self.allocator);
+        self.client_hello_reassembly.deinit(self.allocator);
         self.early_data_buf.deinit(self.allocator);
         self.client_flight.deinit(self.allocator);
         self.post_handshake_send.deinit(self.allocator);
@@ -1190,21 +1193,7 @@ pub const Server = struct {
         try self.recv_buf.appendSlice(self.allocator, received);
 
         if (self.state == .wait_client_hello) {
-            while (true) {
-                const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
-                if (rec.content_type != .change_cipher_spec) break;
-                try self.acceptCompatCcs(rec.fragment);
-                consumePrefix(&self.recv_buf, rec.wire_len);
-            }
-            const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
-            if (rec.content_type == .alert) {
-                _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
-                return error.TlsAlert;
-            }
-            if (rec.content_type != .handshake) return error.BadRecord;
-            var off: usize = 0;
-            const msg = try parseHandshake(rec.fragment, &off);
-            if (off != rec.fragment.len or msg.typ != .client_hello) return error.BadHandshake;
+            const msg = (try self.nextClientHello()) orelse return .need_more;
             // ECH (roadmap 5.1): try to open a sealed ClientHelloInner. On success
             // `inner` owns the reconstructed inner ClientHello (real SNI) and
             // `self.ech_accepted` is set; on absence/failure it is null and the
@@ -1221,7 +1210,7 @@ pub const Server = struct {
             // flight committed. Retain that exact prefix for terminal custody;
             // successful returns transfer it directly to the caller.
             errdefer self.failed_flight = reply;
-            consumePrefix(&self.recv_buf, rec.wire_len);
+            self.client_hello_reassembly.consume(msg.raw.len);
             if (self.hrr_sent) {
                 // We emitted a HelloRetryRequest; await ClientHello2. 0-RTT is
                 // impossible after HRR, so no early-data handling here.
@@ -1240,26 +1229,12 @@ pub const Server = struct {
         }
 
         if (self.state == .wait_second_client_hello) {
-            while (true) {
-                const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
-                if (rec.content_type != .change_cipher_spec) break;
-                try self.acceptCompatCcs(rec.fragment);
-                consumePrefix(&self.recv_buf, rec.wire_len);
-            }
-            const rec = try completePlainRecord(self.recv_buf.items) orelse return .need_more;
-            if (rec.content_type == .alert) {
-                _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
-                return error.TlsAlert;
-            }
-            if (rec.content_type != .handshake) return error.BadRecord;
-            var off: usize = 0;
-            const msg = try parseHandshake(rec.fragment, &off);
-            if (off != rec.fragment.len or msg.typ != .client_hello) return error.BadHandshake;
+            const msg = (try self.nextClientHello()) orelse return .need_more;
             // ClientHello2 folds in after the message_hash synthetic + HRR that
             // buildHelloRetryRequest already wrote to the transcript.
             try self.appendTranscript(msg.raw);
             const reply = try self.buildServerFlight(msg.body, msg.raw);
-            consumePrefix(&self.recv_buf, rec.wire_len);
+            self.client_hello_reassembly.consume(msg.raw.len);
             self.state = if (self.request_client_cert and !self.resumed) .wait_client_cert else .wait_client_finished;
             return .{ .bytes_to_send = reply };
         }
@@ -1324,6 +1299,35 @@ pub const Server = struct {
             while (try self.processClientFlightMessage()) {}
         }
         return .need_more;
+    }
+
+    /// Collect exactly one ClientHello handshake message across plaintext TLS
+    /// records. Caller consumes the returned message after all transcript and
+    /// negotiation work has succeeded.
+    fn nextClientHello(self: *Server) Error!?HandshakeMsg {
+        while (true) {
+            if (self.client_hello_reassembly.completeLen()) |message_len| {
+                if (self.client_hello_reassembly.bytes.items.len != message_len) return error.BadHandshake;
+                var off: usize = 0;
+                const msg = try parseHandshake(self.client_hello_reassembly.bytes.items, &off);
+                if (off != message_len or msg.typ != .client_hello) return error.BadHandshake;
+                return msg;
+            }
+
+            const rec = try completePlainRecord(self.recv_buf.items) orelse return null;
+            if (rec.content_type == .change_cipher_spec) {
+                try self.acceptCompatCcs(rec.fragment);
+                consumePrefix(&self.recv_buf, rec.wire_len);
+                continue;
+            }
+            if (rec.content_type == .alert) {
+                _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
+                return error.TlsAlert;
+            }
+            if (rec.content_type != .handshake) return error.BadRecord;
+            try self.client_hello_reassembly.append(self.allocator, rec.fragment);
+            consumePrefix(&self.recv_buf, rec.wire_len);
+        }
     }
 
     /// Parse and consume one complete handshake message from the accumulated
@@ -7024,7 +7028,28 @@ fn firstHandshakeIsHelloRetryRequest(flight: []const u8) bool {
     return std.mem.eql(u8, msg.body[2..34], &hello_retry_request_random);
 }
 
-test "loopback: server HelloRetryRequest recovers a client that withheld key_shares" {
+const SplitHandshakeRecords = struct {
+    first: []u8,
+    second: []u8,
+
+    fn deinit(self: SplitHandshakeRecords, allocator: Allocator) void {
+        allocator.free(self.first);
+        allocator.free(self.second);
+    }
+};
+
+fn splitFirstHandshakeRecord(allocator: Allocator, wire: []const u8, split_at: usize) Error!SplitHandshakeRecords {
+    const rec = try completePlainRecord(wire) orelse return error.BadRecord;
+    if (rec.content_type != .handshake or split_at == 0 or split_at >= rec.fragment.len) return error.BadRecord;
+    const first = try writePlainRecord(allocator, .handshake, rec.fragment[0..split_at]);
+    errdefer allocator.free(first);
+    return .{
+        .first = first,
+        .second = try writePlainRecord(allocator, .handshake, rec.fragment[split_at..]),
+    };
+}
+
+test "loopback: fragmented ClientHello, ClientHello2, ServerHello, and HelloRetryRequest" {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
@@ -7051,7 +7076,16 @@ test "loopback: server HelloRetryRequest recovers a client that withheld key_sha
     // ClientHello1 (no shares) → server answers with a HelloRetryRequest.
     const ch1 = try client.start();
     defer alloc.free(ch1);
-    const hrr = switch (try server.feed(ch1)) {
+    const ch1_parts = try splitFirstHandshakeRecord(alloc, ch1, 2);
+    defer ch1_parts.deinit(alloc);
+    switch (try server.feed(ch1_parts.first)) {
+        .need_more => {},
+        .bytes_to_send => |bytes| {
+            alloc.free(bytes);
+            return error.TestUnexpectedResult;
+        },
+    }
+    const hrr = switch (try server.feed(ch1_parts.second)) {
         .bytes_to_send => |b| b,
         .need_more => return error.TestUnexpectedResult,
     };
@@ -7062,21 +7096,53 @@ test "loopback: server HelloRetryRequest recovers a client that withheld key_sha
     try std.testing.expectEqual(State.wait_second_client_hello, server.state);
 
     // Client consumes the HRR and emits ClientHello2 with the x25519 share.
-    const ch2 = switch (try client.feed(hrr)) {
+    const hrr_parts = try splitFirstHandshakeRecord(alloc, hrr, 3);
+    defer hrr_parts.deinit(alloc);
+    switch (try client.feed(hrr_parts.first)) {
+        .need_more => {},
+        .bytes_to_send => |bytes| {
+            alloc.free(bytes);
+            return error.TestUnexpectedResult;
+        },
+    }
+    const ch2 = switch (try client.feed(hrr_parts.second)) {
         .bytes_to_send => |b| b,
         .need_more => return error.TestUnexpectedResult,
     };
     defer alloc.free(ch2);
 
     // ClientHello2 → the real server flight; the exchange binds to x25519.
-    const sflight = switch (try server.feed(ch2)) {
+    const ch2_parts = try splitFirstHandshakeRecord(alloc, ch2, 4);
+    defer ch2_parts.deinit(alloc);
+    switch (try server.feed(ch2_parts.first)) {
+        .need_more => {},
+        .bytes_to_send => |bytes| {
+            alloc.free(bytes);
+            return error.TestUnexpectedResult;
+        },
+    }
+    const sflight = switch (try server.feed(ch2_parts.second)) {
         .bytes_to_send => |b| b,
         .need_more => return error.TestUnexpectedResult,
     };
     defer alloc.free(sflight);
     try std.testing.expectEqual(tls_keyshare.NamedGroup.x25519, server.selected_group);
 
-    const cfin = switch (try client.feed(sflight)) {
+    const sh_parts = try splitFirstHandshakeRecord(alloc, sflight, 6);
+    defer sh_parts.deinit(alloc);
+    switch (try client.feed(sh_parts.first)) {
+        .need_more => {},
+        .bytes_to_send => |bytes| {
+            alloc.free(bytes);
+            return error.TestUnexpectedResult;
+        },
+    }
+    var sh_tail: std.ArrayList(u8) = .empty;
+    defer sh_tail.deinit(alloc);
+    const sh_record = try completePlainRecord(sflight) orelse return error.TestUnexpectedResult;
+    try sh_tail.appendSlice(alloc, sh_parts.second);
+    try sh_tail.appendSlice(alloc, sflight[sh_record.wire_len..]);
+    const cfin = switch (try client.feed(sh_tail.items)) {
         .bytes_to_send => |b| b,
         .need_more => return error.TestUnexpectedResult,
     };

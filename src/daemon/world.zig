@@ -10,90 +10,14 @@ const rwlock = @import("../substrate/rwlock.zig");
 const ebr = @import("../substrate/ebr.zig");
 const world_rcu = @import("world_rcu.zig");
 const channel_name = @import("../proto/channel_name.zig");
+const world_rcu_state = @import("world_rcu_state.zig");
+const ident_utf8 = @import("../substrate/utf8.zig");
 
-/// Lazily-created RCU mirror of the nick registry (the lock-free read path).
-/// Heap-allocated so the EBR domain has a stable address: registered writer and
-/// per-thread reader participants plus the registry's borrowed `&domain` must
-/// stay valid after the owning `World` is moved (World.init returns by value).
-/// Activated lazily and, once live, drives EVERY nick read (`findNick`) and collision check — the read
-/// hot path is lock-free at the registry level and case-insensitive (RFC1459-ish
-/// ASCII casemapping; "Alice" and "alice" are the same nick). `client_nicks`
-/// remains the authoritative id->nick reverse index; the RCU registry is
-/// authoritative for nick->id.
-const RcuNickState = struct {
-    domain: ebr.Domain,
-    generation: usize,
-    /// Writer-side participant used for CoW publish/retire. Readers must never
-    /// share it; they use a per-thread participant from `rcuReaderParticipant`.
-    writer_participant: *ebr.Participant,
-    nicks: world_rcu.NickRegistry,
-};
-
-/// Marker value stored in the RCU channel-existence mirror. The mirror only
-/// answers "does this channel name exist?" (lock-free, case-insensitive); the
-/// authoritative `Channel` records live in `World.channels`. We store the
-/// channel OID as a witness so the value type is a plain integer (no dangling
-/// pointer into the rehash-prone `channels` map).
-const RcuChannelState = struct {
-    domain: ebr.Domain,
-    generation: usize,
-    /// Writer-side participant used for CoW publish/retire. Readers must never
-    /// share it; they use a per-thread participant from `rcuReaderParticipant`.
-    writer_participant: *ebr.Participant,
-    /// channel name -> OID witness (existence set).
-    names: world_rcu.ChannelRegistry(u32),
-    /// One membership set per live channel, keyed by case-folded channel name.
-    /// The MembershipSet values are heap-allocated for stable addresses (the
-    /// AutoHashMap may rehash). All share the same EBR `domain`; writers use
-    /// `writer_participant`, and readers use per-thread participants.
-    members: std.StringHashMapUnmanaged(*world_rcu.MembershipSet) = .empty,
-};
-
-const rcu_tls_slot_count: usize = ebr.max_participants;
-
-const RcuTlsEntry = struct {
-    domain: ?*ebr.Domain = null,
-    generation: usize = 0,
-    participant: ?*ebr.Participant = null,
-};
-
-threadlocal var rcu_tls_entries: [rcu_tls_slot_count]RcuTlsEntry = @splat(.{});
-var rcu_generation = std.atomic.Value(usize).init(1);
-
-fn nextRcuGeneration() usize {
-    return rcu_generation.fetchAdd(1, .monotonic);
-}
-
-fn rcuReaderParticipant(domain: *ebr.Domain, generation: usize) ebr.RegisterError!*ebr.Participant {
-    var free_slot: ?usize = null;
-    for (&rcu_tls_entries, 0..) |*entry, i| {
-        if (entry.participant) |p| {
-            if (entry.domain == domain and entry.generation == generation) return p;
-        } else if (free_slot == null) {
-            free_slot = i;
-        }
-    }
-
-    const idx = free_slot orelse return error.TooManyParticipants;
-    const p = try domain.register();
-    rcu_tls_entries[idx] = .{
-        .domain = domain,
-        .generation = generation,
-        .participant = p,
-    };
-    return p;
-}
-
-fn rcuForgetThreadParticipants(domain: *ebr.Domain, generation: usize) void {
-    for (&rcu_tls_entries) |*entry| {
-        if (entry.participant) |p| {
-            if (entry.domain == domain and entry.generation == generation) {
-                p.unregister();
-                entry.* = .{};
-            }
-        }
-    }
-}
+const RcuNickState = world_rcu_state.RcuNickState;
+const RcuChannelState = world_rcu_state.RcuChannelState;
+const nextRcuGeneration = world_rcu_state.nextRcuGeneration;
+const rcuReaderParticipant = world_rcu_state.rcuReaderParticipant;
+const rcuForgetThreadParticipants = world_rcu_state.rcuForgetThreadParticipants;
 
 /// Opaque client handle value used by the local server world.
 pub const ClientId = packed struct {
@@ -977,40 +901,6 @@ pub const World = struct {
         var key_buf: [foldBufLen]u8 = undefined;
         const folded = foldName(name, &key_buf);
         return c.members.get(folded);
-    }
-
-    /// Re-key the per-channel membership set from `old` to `new` (channel
-    /// rename). Membership is unchanged, so we move the set pointer to the new
-    /// folded key. If the folded keys coincide, nothing to do.
-    fn rcuRenameMembership(self: *World, c: *RcuChannelState, old: []const u8, new: []const u8) void {
-        var ob: [foldBufLen]u8 = undefined;
-        var nb: [foldBufLen]u8 = undefined;
-        const of = foldName(old, &ob);
-        const nf = foldName(new, &nb);
-        if (std.mem.eql(u8, of, nf)) return;
-
-        const kv = c.members.fetchRemove(of) orelse return;
-        // Free the moved-out old key; install the set under a freshly-duped new
-        // key. On dupe/put failure the set is dropped (best-effort) rather than
-        // leaked under the wrong key.
-        self.allocator.free(kv.key);
-        const new_owned = self.allocator.dupe(u8, nf) catch {
-            kv.value.deinit();
-            self.allocator.destroy(kv.value);
-            return;
-        };
-        // If a set already lives under the new key (case-fold collision), drop it
-        // first so we don't leak.
-        if (c.members.fetchRemove(nf)) |existing| {
-            existing.value.deinit();
-            self.allocator.free(existing.key);
-            self.allocator.destroy(existing.value);
-        }
-        c.members.put(self.allocator, new_owned, kv.value) catch {
-            self.allocator.free(new_owned);
-            kv.value.deinit();
-            self.allocator.destroy(kv.value);
-        };
     }
 
     /// Drop the per-channel RCU membership set for `name` (channel removed).
@@ -3970,33 +3860,79 @@ pub const World = struct {
 
         const oid = if (self.channels.getPtr(old)) |ch| ch.oid else 0;
 
+        // Capture folded names before removing the authoritative key. `old`
+        // may be borrowed from channelsOf(), so it becomes invalid when that
+        // map entry is removed below.
+        var old_fold_buf: [foldBufLen]u8 = undefined;
+        var new_fold_buf: [foldBufLen]u8 = undefined;
+        const old_folded = foldName(old, &old_fold_buf);
+        const new_folded = foldName(new, &new_fold_buf);
+        const folded_names_equal = std.mem.eql(u8, old_folded, new_folded);
+
         const new_key = try self.allocator.dupe(u8, new);
         errdefer self.allocator.free(new_key);
-        const kv = self.channels.fetchRemove(old).?; // {key, value}
-        self.channels.put(new_key, kv.value) catch |e| {
-            // Re-insert under the original key so the channel is never lost.
-            self.channels.put(kv.key, kv.value) catch {};
-            return e;
+
+        // Reserve the authoritative map's insertion before changing it. Once
+        // the source entry is removed, the destination insert cannot allocate.
+        try self.channels.ensureUnusedCapacity(1);
+
+        var moved_membership_key: ?[]u8 = null;
+        errdefer if (moved_membership_key) |key| self.allocator.free(key);
+        var channel_name_stage: ?world_rcu.ChannelRegistry(u32).StagedEditBatch = null;
+        defer if (channel_name_stage) |*stage| {
+            if (stage.active) stage.abort();
         };
+        var channel_retire_reservation: ?ebr.Participant.RetireReservation = null;
+        defer if (channel_retire_reservation) |*reservation| {
+            if (reservation.active) reservation.finish();
+        };
+
+        if (self.rcu_channels) |c| {
+            if (!folded_names_equal) {
+                // Stage one RCU existence snapshot before any authoritative
+                // mutation. The staged edit owns all allocations and holds the
+                // registry writer lock until commit or rollback.
+                channel_retire_reservation = try c.writer_participant.reserveRetireCapacity(1);
+                const removals = [_][]const u8{old_folded};
+                const inserts = [_]world_rcu.ChannelRegistry(u32).Insert{
+                    .{ .key = new_folded, .value = oid },
+                };
+                channel_name_stage = (try c.names.stageEditBatchReserved(
+                    &channel_retire_reservation.?,
+                    &removals,
+                    &inserts,
+                )) orelse return error.InvalidGraph;
+
+                if (c.members.get(old_folded) != null) {
+                    // A second folded key would mean the mirror already
+                    // disagrees with the unique authoritative channel name.
+                    if (c.members.get(new_folded) != null) return error.InvalidGraph;
+                    try c.members.ensureUnusedCapacity(self.allocator, 1);
+                    moved_membership_key = try self.allocator.dupe(u8, new_folded);
+                } else if (c.members.get(new_folded) != null) {
+                    return error.InvalidGraph;
+                }
+            }
+        }
+
+        // All potentially failing work is complete. From here to publication,
+        // the authoritative map and both RCU indexes move together.
+        const kv = self.channels.fetchRemove(old).?;
+        self.channels.putAssumeCapacity(new_key, kv.value);
         self.allocator.free(kv.key);
 
-        // Keep the RCU mirrors in step: re-key existence (same OID) and move the
-        // membership set to the new folded key. Best-effort; the authoritative
-        // store is `channels`.
         if (self.rcu_channels) |c| {
-            self.rcuRenameMembership(c, old, new);
-            // Existence: drop the old folded name only if it no longer maps to a
-            // live channel (case-fold may coincide with `new`), then publish new.
-            var ob: [foldBufLen]u8 = undefined;
-            var nb: [foldBufLen]u8 = undefined;
-            const of = foldName(old, &ob);
-            const nf = foldName(new, &nb);
-            if (!std.mem.eql(u8, of, nf)) {
-                c.names.remove(c.writer_participant, old) catch {};
+            if (!folded_names_equal) {
+                if (c.members.fetchRemove(old_folded)) |membership| {
+                    const moved_key = moved_membership_key.?;
+                    c.members.putAssumeCapacity(moved_key, membership.value);
+                    moved_membership_key = null;
+                    self.allocator.free(membership.key);
+                }
+                channel_name_stage.?.commit();
+                channel_name_stage = null;
                 self.noteRcuChannelWrite(c);
             }
-            c.names.set(c.writer_participant, new, oid) catch {};
-            self.noteRcuChannelWrite(c);
         }
         return true;
     }
@@ -7815,6 +7751,62 @@ test "renameChannel keeps RCU existence and membership mirrors in step" {
     try std.testing.expect(world.channelExists("#NEW"));
     try std.testing.expect(world.isMember("#new", a));
     try std.testing.expect(!world.isMember("#old", a));
+}
+
+test "renameChannel allocation failures preserve authoritative and RCU channel state" {
+    const client = testClient(2);
+    var failure_offset: usize = 0;
+    var saw_injected_failure = false;
+    while (failure_offset < 32) : (failure_offset += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var world = World.init(failing.allocator());
+        defer world.deinit();
+        _ = try world.join("#old", client);
+        try std.testing.expect(world.rcu_channels != null);
+
+        failing.fail_index = failing.alloc_index + failure_offset;
+        const rename_result = world.renameChannel("#old", "#new");
+        if (rename_result) |renamed| {
+            try std.testing.expect(renamed);
+            try std.testing.expect(world.channels.contains("#new"));
+            try std.testing.expect(!world.channels.contains("#old"));
+            try std.testing.expect(world.channelExists("#new"));
+            try std.testing.expect(!world.channelExists("#old"));
+            try std.testing.expect(world.isMember("#new", client));
+            try std.testing.expect(!world.isMember("#old", client));
+            try std.testing.expect(saw_injected_failure);
+            try std.testing.expect(!failing.has_induced_failure);
+            return;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(world.channels.contains("#old"));
+            try std.testing.expect(!world.channels.contains("#new"));
+            try std.testing.expect(world.channelExists("#old"));
+            try std.testing.expect(!world.channelExists("#new"));
+            try std.testing.expect(world.isMember("#old", client));
+            try std.testing.expect(!world.isMember("#new", client));
+            try std.testing.expect(failing.has_induced_failure);
+            saw_injected_failure = true;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "renameChannel accepts a borrowed channelsOf name" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const client = testClient(3);
+    _ = try world.join("#borrowed", client);
+
+    var names: [1][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), world.channelsOf(client, &names));
+    const borrowed_name = names[0];
+    try std.testing.expect(try world.renameChannel(borrowed_name, "#renamed"));
+
+    try std.testing.expect(!world.channelExists("#borrowed"));
+    try std.testing.expect(world.channelExists("#renamed"));
+    try std.testing.expect(world.isMember("#renamed", client));
+    try std.testing.expect(!world.isMember("#borrowed", client));
 }
 
 test "World compound causal handoff followed by late removal OOM must leave predecessor intact" {

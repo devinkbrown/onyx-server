@@ -154,10 +154,11 @@ pub const registry = [_]Descriptor{
     // swap (previously silently reset/dropped). v5 appends the canonical
     // `was_websocket` byte. v6 carries the effective peer address, clone-limit
     // accounting, and FloodGuard carry. v7 appends exact mesh-clone and
-    // connection-throttle ownership. This is an exact manifest contract: a successor
+    // connection-throttle ownership. v8 appends the exact ordinary-guest
+    // incarnation plus its presence and nick-claim revisions/HLC. This is an exact manifest contract: a successor
     // must understand every current transport/join field, so legacy ranges do
     // not overlap and the predecessor cold-refuses instead of degrading state.
-    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 7, .min_supported = 7, .max_supported = 7 },
+    .{ .kind = .clients, .schema_id = 0x4843_4c54, .current_version = 8, .min_supported = 8, .max_supported = 8 },
     // v2 is the first exact World image: every channel field plus nick-keyed
     // member/invite expectations. v1 silently omitted material channel state,
     // so there is intentionally no overlap and rollback is a cold restart.
@@ -616,9 +617,9 @@ test "negotiation is per capsule schema range" {
 
 test "exact clients world history webhook and handoff descriptors fail closed" {
     const clients = descriptor(.clients);
-    try std.testing.expectEqual(@as(u16, 7), clients.current_version);
-    try std.testing.expectEqual(@as(u16, 7), clients.min_supported);
-    try std.testing.expectEqual(@as(u16, 7), clients.max_supported);
+    try std.testing.expectEqual(@as(u16, 8), clients.current_version);
+    try std.testing.expectEqual(@as(u16, 8), clients.min_supported);
+    try std.testing.expectEqual(@as(u16, 8), clients.max_supported);
     var legacy_clients = clients;
     legacy_clients.current_version = 4;
     legacy_clients.min_supported = 1;

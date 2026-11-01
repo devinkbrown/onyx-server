@@ -43,6 +43,33 @@ test "DNS response CNAME chain accepts reordered records and retains minimum TTL
     try std.testing.expectEqual(@as(u32, 5), followup.ttl_seconds);
 }
 
+test "DNS response keeps a bounded address prefix and validates every answer owner" {
+    const question = wire.Query{ .name = "many.test", .qtype = .a };
+    var packet = try Packet.init(7, question.name, .a);
+    for (0..wire.max_cache_addrs + 1) |index| {
+        try packet.address(question.name, if (index == wire.max_cache_addrs) 5 else 30, .{ .ipv4 = .{ 192, 0, 2, @intCast(index + 1) } });
+    }
+    const result = try response.inspect(packet.slice(), 7, question);
+    try std.testing.expectEqual(wire.max_cache_addrs, result.address_count);
+    try std.testing.expectEqual(@as(u8, 1), result.addresses[0].ipv4[3]);
+    try std.testing.expectEqual(@as(u8, wire.max_cache_addrs), result.addresses[wire.max_cache_addrs - 1].ipv4[3]);
+    try std.testing.expectEqual(@as(u32, 5), result.ttl_seconds);
+
+    var unrelated = try Packet.init(8, question.name, .a);
+    for (0..wire.max_cache_addrs) |index| {
+        try unrelated.address(question.name, 30, .{ .ipv4 = .{ 192, 0, 2, @intCast(index + 1) } });
+    }
+    try unrelated.address("other.test", 30, .{ .ipv4 = .{ 192, 0, 2, 99 } });
+    try std.testing.expectError(error.InvalidOwner, response.inspect(unrelated.slice(), 8, question));
+
+    var malformed = try Packet.init(9, question.name, .a);
+    for (0..wire.max_cache_addrs) |index| {
+        try malformed.address(question.name, 30, .{ .ipv4 = .{ 192, 0, 2, @intCast(index + 1) } });
+    }
+    try malformed.record(.answer, question.name, 1, 30, &.{ 192, 0, 2 });
+    try std.testing.expectError(error.MalformedRData, response.inspect(malformed.slice(), 9, question));
+}
+
 test "DNS response rejects unrelated owners duplicate aliases and cycles" {
     const question = wire.Query{ .name = "alias.test", .qtype = .a };
     var unrelated = try Packet.init(7, question.name, .a);

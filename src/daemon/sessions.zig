@@ -18,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rwlock = @import("../substrate/rwlock.zig");
 const attachment_id_mod = @import("attachment_id.zig");
+const projection_mod = @import("session_projection.zig");
 
 pub const ClientId = u64;
 pub const Token = [16]u8;
@@ -34,13 +35,13 @@ pub const snapshot_capacity: usize = 64;
 /// The configuration parser caps CHANNELLEN at 200 bytes. Keeping each complete
 /// name inline makes replacement/read/clear allocation-free once a row journal
 /// exists; first-arm allocation is staged before any generation or row changes.
-pub const local_channel_name_capacity: usize = 200;
+pub const local_channel_name_capacity = projection_mod.local_channel_name_capacity;
 /// Capacity is the number of concurrently unresolved channel mutations, not a
 /// joined-channel limit. The command boundary must arm before mutating World;
 /// a ninth distinct pending channel therefore fails closed and can be retried
 /// after the projector clears a slot. Re-arming a pending case-insensitive
 /// channel replaces it even while all eight slots are occupied.
-pub const local_channel_projection_capacity: usize = 8;
+pub const local_channel_projection_capacity = projection_mod.local_channel_projection_capacity;
 
 pub const Error = std.mem.Allocator.Error || error{
     TooManyAccounts,
@@ -73,72 +74,13 @@ pub const Config = struct {
     max_sessions_per_account: usize = snapshot_capacity,
 };
 
-/// One durable desired channel image within an exact reusable-token group.
-///
-/// Every local row bearing the token carries the same bounded set. That
-/// deliberate duplication lets any sibling detach or disappear without taking
-/// the retry source with it. A newer same-channel arm receives a generation, so
-/// an older in-flight retry cannot clear the replacement.
-pub const LocalChannelProjection = struct {
-    generation: u64 = 0,
-    channel_len: u8 = 0,
-    channel_bytes: [local_channel_name_capacity]u8 = @splat(0),
-    present: bool = false,
-    member_mode_bits: u8 = 0,
-
-    pub fn channel(self: *const LocalChannelProjection) []const u8 {
-        return self.channel_bytes[0..self.channel_len];
-    }
-};
-
-/// Canonically sorted, fixed-capacity pending work for one exact token group.
-/// Rows acquire an owned copy lazily on the first pending mutation. Arm stages
-/// every missing allocation before publishing any pointer, generation, or count;
-/// read/retry/CAS-clear remain allocation-free.
-const LocalChannelProjectionSet = struct {
-    revision: u64 = 0,
-    len: u8 = 0,
-    items: [local_channel_projection_capacity]LocalChannelProjection = @splat(.{}),
-
-    fn slice(self: *const LocalChannelProjectionSet) []const LocalChannelProjection {
-        return self.items[0..self.len];
-    }
-
-    fn isEmpty(self: *const LocalChannelProjectionSet) bool {
-        return self.len == 0;
-    }
-};
-
-pub const LocalChannelProjectionWork = struct {
-    token: Token,
-    projection: LocalChannelProjection,
-};
-
-pub const AttachmentReplicaWork = struct {
-    token: Token,
-    attachment_id: AttachmentId,
-};
-
-pub const AttachmentLocalChannelProjectionWork = struct {
-    token: Token,
-    attachment_id: AttachmentId,
-    projection: LocalChannelProjection,
-};
-
-/// One accepted arm plus the exact same-channel intent it replaced. Producers
-/// that can still reject before their first live mutation use this to restore
-/// older accepted work instead of accidentally erasing it.
-pub const LocalChannelProjectionArm = struct {
-    intent: LocalChannelProjection,
-    previous: ?LocalChannelProjection,
-};
-
-pub const LocalProjectionArmError = std.mem.Allocator.Error || error{
-    InvalidChannel,
-    NoSuchToken,
-    NoSuchAttachment,
-    TooManyPendingChannels,
-};
+pub const LocalChannelProjection = projection_mod.LocalChannelProjection;
+const LocalChannelProjectionSet = projection_mod.LocalChannelProjectionSet;
+pub const LocalChannelProjectionWork = projection_mod.LocalChannelProjectionWork;
+pub const AttachmentReplicaWork = projection_mod.AttachmentReplicaWork;
+pub const AttachmentLocalChannelProjectionWork = projection_mod.AttachmentLocalChannelProjectionWork;
+pub const LocalChannelProjectionArm = projection_mod.LocalChannelProjectionArm;
+pub const LocalProjectionArmError = projection_mod.LocalProjectionArmError;
 
 /// Transient owner-protocol identity. Zero is never a valid reservation and is
 /// therefore safe as the inline "not reserved" Session value.
@@ -5623,57 +5565,26 @@ pub const SessionStore = struct {
 };
 
 fn localProjectionSetRevision(set: ?*const LocalChannelProjectionSet) u64 {
-    return if (set) |value| value.revision else 0;
+    return projection_mod.localProjectionSetRevision(set);
 }
 
 fn localChannelOrder(a: []const u8, b: []const u8) std.math.Order {
-    const shared = @min(a.len, b.len);
-    for (a[0..shared], b[0..shared]) |a_byte, b_byte| {
-        const a_folded = std.ascii.toLower(a_byte);
-        const b_folded = std.ascii.toLower(b_byte);
-        if (a_folded < b_folded) return .lt;
-        if (a_folded > b_folded) return .gt;
-    }
-    return std.math.order(a.len, b.len);
+    return projection_mod.localChannelOrder(a, b);
 }
 
 fn localProjectionIndex(set: *const LocalChannelProjectionSet, channel: []const u8) ?usize {
-    for (set.slice(), 0..) |projection, index| {
-        if (std.ascii.eqlIgnoreCase(projection.channel(), channel)) return index;
-    }
-    return null;
+    return projection_mod.localProjectionIndex(set, channel);
 }
 
 fn localProjectionUpsert(
     set: *LocalChannelProjectionSet,
     projection: LocalChannelProjection,
 ) error{TooManyPendingChannels}!void {
-    if (localProjectionIndex(set, projection.channel())) |index| {
-        set.items[index] = projection;
-        return;
-    }
-    if (set.len == local_channel_projection_capacity) return error.TooManyPendingChannels;
-
-    var insert_at: usize = 0;
-    while (insert_at < set.len and
-        localChannelOrder(set.items[insert_at].channel(), projection.channel()) == .lt)
-    {
-        insert_at += 1;
-    }
-    var cursor: usize = set.len;
-    while (cursor > insert_at) : (cursor -= 1)
-        set.items[cursor] = set.items[cursor - 1];
-    set.items[insert_at] = projection;
-    set.len += 1;
+    return projection_mod.localProjectionUpsert(set, projection);
 }
 
 fn localProjectionRemoveAt(set: *LocalChannelProjectionSet, index: usize) void {
-    std.debug.assert(index < set.len);
-    var cursor = index;
-    while (cursor + 1 < set.len) : (cursor += 1)
-        set.items[cursor] = set.items[cursor + 1];
-    set.len -= 1;
-    set.items[set.len] = .{};
+    projection_mod.localProjectionRemoveAt(set, index);
 }
 
 fn mergeLocalProjectionSets(
@@ -5681,83 +5592,40 @@ fn mergeLocalProjectionSets(
     a: *const LocalChannelProjectionSet,
     b: *const LocalChannelProjectionSet,
 ) bool {
-    out.* = .{};
-    for (a.slice()) |projection|
-        localProjectionUpsert(out, projection) catch return false;
-    for (b.slice()) |projection| {
-        if (localProjectionIndex(out, projection.channel())) |index| {
-            if (projection.generation > out.items[index].generation)
-                out.items[index] = projection;
-            continue;
-        }
-        localProjectionUpsert(out, projection) catch return false;
-    }
-    out.revision = @max(a.revision, b.revision);
-    return true;
+    return projection_mod.mergeLocalProjectionSets(out, a, b);
 }
 
 fn localWorkOrder(a: LocalChannelProjectionWork, b: LocalChannelProjectionWork) std.math.Order {
-    const token_order = std.mem.order(u8, &a.token, &b.token);
-    if (token_order != .eq) return token_order;
-    return localChannelOrder(a.projection.channel(), b.projection.channel());
+    return projection_mod.localWorkOrder(a, b);
 }
 
 fn localWorkInSlice(
     work: []const LocalChannelProjectionWork,
     needle: LocalChannelProjectionWork,
 ) bool {
-    for (work) |candidate| {
-        if (std.crypto.timing_safe.eql(Token, candidate.token, needle.token) and
-            std.ascii.eqlIgnoreCase(candidate.projection.channel(), needle.projection.channel()))
-        {
-            return true;
-        }
-    }
-    return false;
+    return projection_mod.localWorkInSlice(work, needle);
 }
 
 fn attachmentWorkOrder(a: AttachmentReplicaWork, b: AttachmentReplicaWork) std.math.Order {
-    const token_order = std.mem.order(u8, &a.token, &b.token);
-    if (token_order != .eq) return token_order;
-    return std.mem.order(u8, &a.attachment_id.raw, &b.attachment_id.raw);
+    return projection_mod.attachmentWorkOrder(a, b);
 }
 
 fn attachmentWorkInSlice(work: []const AttachmentReplicaWork, needle: AttachmentReplicaWork) bool {
-    for (work) |candidate| {
-        if (std.crypto.timing_safe.eql(Token, candidate.token, needle.token) and
-            candidate.attachment_id.eql(needle.attachment_id))
-        {
-            return true;
-        }
-    }
-    return false;
+    return projection_mod.attachmentWorkInSlice(work, needle);
 }
 
 fn attachmentLocalWorkOrder(
     a: AttachmentLocalChannelProjectionWork,
     b: AttachmentLocalChannelProjectionWork,
 ) std.math.Order {
-    const attachment_order = attachmentWorkOrder(
-        .{ .token = a.token, .attachment_id = a.attachment_id },
-        .{ .token = b.token, .attachment_id = b.attachment_id },
-    );
-    if (attachment_order != .eq) return attachment_order;
-    return localChannelOrder(a.projection.channel(), b.projection.channel());
+    return projection_mod.attachmentLocalWorkOrder(a, b);
 }
 
 fn attachmentLocalWorkInSlice(
     work: []const AttachmentLocalChannelProjectionWork,
     needle: AttachmentLocalChannelProjectionWork,
 ) bool {
-    for (work) |candidate| {
-        if (std.crypto.timing_safe.eql(Token, candidate.token, needle.token) and
-            candidate.attachment_id.eql(needle.attachment_id) and
-            std.ascii.eqlIgnoreCase(candidate.projection.channel(), needle.projection.channel()))
-        {
-            return true;
-        }
-    }
-    return false;
+    return projection_mod.attachmentLocalWorkInSlice(work, needle);
 }
 
 fn freeSnapshot(allocator: std.mem.Allocator, session: *Session) void {

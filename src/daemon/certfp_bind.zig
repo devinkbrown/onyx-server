@@ -65,24 +65,64 @@ pub const CertfpBindStore = struct {
     /// Bind `fingerprint` to `account`. Re-binding the same fingerprint replaces
     /// the owner (the most recent CERTADD wins). One account may own many certs.
     pub fn bind(self: *CertfpBindStore, account: []const u8, fingerprint: []const u8) CertfpBindError!void {
+        var prepared = try self.prepareBind(account, fingerprint);
+        defer prepared.abort();
+        prepared.commit();
+    }
+
+    /// Reserve all owner/key memory and map capacity while holding the binding
+    /// lock. The returned value must be committed after durable publication or
+    /// aborted on every failure path; both operations are allocation-free.
+    pub fn prepareBind(self: *CertfpBindStore, account: []const u8, fingerprint: []const u8) CertfpBindError!PreparedBind {
         self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        errdefer self.lock.unlockExclusive();
 
         certfp.validateFingerprint(fingerprint) catch return error.InvalidFingerprint;
         if (account.len == 0 or account.len > max_account_len) return error.AccountTooLong;
 
-        if (self.entries.getPtr(fingerprint)) |slot| {
-            const new_acct = try self.allocator.dupe(u8, account);
-            self.allocator.free(slot.*);
-            slot.* = new_acct;
-            return;
-        }
-        const key = try self.allocator.dupe(u8, fingerprint);
-        errdefer self.allocator.free(key);
-        const val = try self.allocator.dupe(u8, account);
-        errdefer self.allocator.free(val);
-        try self.entries.put(self.allocator, key, val);
+        const existing = self.entries.contains(fingerprint);
+        const key = if (existing) null else try self.allocator.dupe(u8, fingerprint);
+        errdefer if (key) |owned| self.allocator.free(owned);
+        const owned_account = try self.allocator.dupe(u8, account);
+        errdefer self.allocator.free(owned_account);
+        if (!existing) try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        return .{ .store = self, .fingerprint = fingerprint, .key = key, .account = owned_account };
     }
+
+    pub const PreparedBind = struct {
+        store: *CertfpBindStore,
+        fingerprint: []const u8,
+        key: ?[]u8,
+        account: ?[]u8,
+        active: bool = true,
+
+        pub fn commit(self: *PreparedBind) void {
+            if (!self.active) return;
+            if (self.store.entries.getPtr(self.fingerprint)) |slot| {
+                self.store.allocator.free(slot.*);
+                slot.* = self.account.?;
+                self.account = null;
+                if (self.key) |key| self.store.allocator.free(key);
+                self.key = null;
+            } else {
+                self.store.entries.putAssumeCapacityNoClobber(self.key.?, self.account.?);
+                self.key = null;
+                self.account = null;
+            }
+            self.active = false;
+            self.store.lock.unlockExclusive();
+        }
+
+        pub fn abort(self: *PreparedBind) void {
+            if (!self.active) return;
+            if (self.key) |key| self.store.allocator.free(key);
+            if (self.account) |account| self.store.allocator.free(account);
+            self.key = null;
+            self.account = null;
+            self.active = false;
+            self.store.lock.unlockExclusive();
+        }
+    };
 
     /// The account owning `fingerprint`, or null. The returned slice borrows
     /// this thread's `lookup_scratch` — valid until this thread's next call
@@ -112,6 +152,50 @@ pub const CertfpBindStore = struct {
             return true;
         }
         return false;
+    }
+
+    /// Remove every live fingerprint binding owned by an account after its
+    /// durable account-drop batch commits. No allocation is needed; each pass
+    /// removes one matching entry before restarting the map walk.
+    pub fn unbindAccount(self: *CertfpBindStore, account: []const u8) usize {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        var removed: usize = 0;
+        while (true) {
+            var target_buf: [certfp.fingerprint_len]u8 = undefined;
+            var target_len: usize = 0;
+            var it = self.entries.iterator();
+            while (it.next()) |entry| {
+                if (!std.ascii.eqlIgnoreCase(entry.value_ptr.*, account)) continue;
+                if (entry.key_ptr.*.len > target_buf.len) continue;
+                @memcpy(target_buf[0..entry.key_ptr.*.len], entry.key_ptr.*);
+                target_len = entry.key_ptr.*.len;
+                break;
+            }
+            if (target_len == 0) break;
+            if (self.entries.fetchRemove(target_buf[0..target_len])) |entry| {
+                self.allocator.free(entry.key);
+                self.allocator.free(entry.value);
+                removed += 1;
+            }
+        }
+        return removed;
+    }
+
+    /// Count live entries for an account so callers can reserve bounded
+    /// post-commit cleanup work before changing durable authority.
+    pub fn accountBindingCount(self: *const CertfpBindStore, account: []const u8, max_scan: usize) ?usize {
+        const self_mut = @constCast(self);
+        self_mut.lock.lockShared();
+        defer self_mut.lock.unlockShared();
+        if (self.entries.count() > max_scan) return null;
+        var count: usize = 0;
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.value_ptr.*, account)) count += 1;
+        }
+        return count;
     }
 };
 
@@ -271,4 +355,21 @@ test "CertfpBindStore concurrent writers and readers preserve bindings" {
             try std.testing.expect(store.accountForFingerprint(fp) != null);
         }
     }
+}
+
+test "CertfpBindStore removes every binding for a dropped account" {
+    var store = CertfpBindStore.init(std.testing.allocator);
+    defer store.deinit();
+    const a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    try store.bind("alice", a);
+    try store.bind("ALICE", b);
+    try store.bind("bob", c);
+    try std.testing.expectEqual(@as(usize, 2), store.unbindAccount("alice"));
+    try std.testing.expect(store.accountForFingerprint(a) == null);
+    try std.testing.expect(store.accountForFingerprint(b) == null);
+    try std.testing.expectEqualStrings("bob", store.accountForFingerprint(c).?);
+    try std.testing.expectEqual(@as(usize, 0), store.unbindAccount("alice"));
+    try std.testing.expectEqual(@as(usize, 1), store.accountBindingCount("bob", 16).?);
 }

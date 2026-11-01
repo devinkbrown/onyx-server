@@ -111,6 +111,9 @@ pub const PasswordGate = struct {
 /// In-memory registry of per-account SCRAM-SHA-256 credentials.
 pub const ScramStore = struct {
     allocator: std.mem.Allocator,
+    /// Iteration count used for newly derived credentials. Production callers
+    /// use `init`; the configurable constructor exists for deterministic tests.
+    derivation_iterations: u32 = default_iterations,
     /// Maps canonical account name -> SCRAM material. Keys and salt bytes owned.
     entries: std.StringHashMapUnmanaged(Entry),
     /// Bounded ring of recently-returned salt dupes (see `salt_ring_capacity`).
@@ -128,6 +131,18 @@ pub const ScramStore = struct {
     /// Create an empty store backed by `allocator`.
     pub fn init(allocator: std.mem.Allocator) ScramStore {
         return .{ .allocator = allocator, .entries = .empty };
+    }
+
+    /// Create a store with a test-specific derivation cost. Production setup
+    /// must use `init`, which always keeps the 100,000-round default.
+    pub fn initWithIterationsForTesting(allocator: std.mem.Allocator, iterations: u32) ScramStore {
+        if (!@import("builtin").is_test) @compileError("test-only SCRAM iteration override");
+        std.debug.assert(iterations > 0);
+        return .{ .allocator = allocator, .entries = .empty, .derivation_iterations = iterations };
+    }
+
+    pub fn derivationIterations(self: *const ScramStore) u32 {
+        return self.derivation_iterations;
     }
 
     /// Free every owned key and salt, then the backing table. The store must
@@ -174,7 +189,7 @@ pub const ScramStore = struct {
     }
 
     /// Derive SCRAM-SHA-256 credentials for `account` from `password` using a
-    /// freshly generated salt and `default_iterations`, then store them. An
+    /// freshly generated salt and the configured iteration count, then store them. An
     /// existing entry for the same account is overwritten (its prior salt and
     /// digests are freed/scrubbed first). The cleartext password is never
     /// retained.
@@ -209,7 +224,7 @@ pub const ScramStore = struct {
         crypto_random.fillOsEntropy(&salt) catch return error.EntropyFailed;
         defer secureZero(&salt);
 
-        try self.storeWithSaltUnlocked(account, password, &salt, iterations);
+        try self.storeWithSaltUnlocked(account, password, &salt, self.derivation_iterations);
     }
 
     /// Derive and store SCRAM credentials using a caller-supplied salt and
@@ -641,6 +656,24 @@ pub const ScramStore = struct {
             .stored_key = entry.stored_key_512,
             .server_key = entry.server_key_512,
         };
+    }
+
+    /// Remove an account's cached SCRAM material after its durable credential
+    /// transaction commits. The account must be canonicalized by the caller.
+    pub fn remove(self: *ScramStore, account: []const u8) bool {
+        self.lock.lockExclusive();
+        defer self.lock.unlockExclusive();
+
+        const entry = self.entries.fetchRemove(account) orelse return false;
+        var value = entry.value;
+        self.allocator.free(entry.key);
+        secureZero(value.salt);
+        self.allocator.free(value.salt);
+        secureZero(&value.stored_key);
+        secureZero(&value.server_key);
+        secureZero(&value.stored_key_512);
+        secureZero(&value.server_key_512);
+        return true;
     }
 
     /// Adapter exposing this store as the mechrouter's SCRAM-SHA-256 credential

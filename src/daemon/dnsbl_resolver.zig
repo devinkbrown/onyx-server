@@ -20,7 +20,7 @@ const dnsbl = @import("dnsbl.zig");
 const platform = @import("../substrate/platform.zig");
 pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
-const rdns = @import("rdns.zig");
+const checkpoint = @import("dnsbl_snapshot.zig");
 
 // The DNSBL worker test uses a real loopback UDP nameserver. Keep its socket
 // declarations local to the fixture; production DNS transport is in proto/dns.
@@ -44,23 +44,19 @@ const test_win = struct {
 };
 
 /// Maximum number of blocklist zones probed per client IP.
-pub const max_zones: usize = 8;
-
-/// A resolved blocklist verdict for one client IP.
-pub const Verdict = struct {
-    /// True when at least one configured zone listed the IP.
-    listed: bool,
-    /// Return code (last octet of the listing answer) of the first hit; 0 when
-    /// not listed.
-    code: u8 = 0,
-};
-
-pub const cache_slots: usize = 1024;
-pub const job_capacity: usize = 256;
+pub const max_zones = checkpoint.max_zones;
+pub const cache_slots = checkpoint.cache_slots;
+pub const job_capacity = checkpoint.job_capacity;
 /// Re-check an IP at most this often (blocklist state changes slowly).
 const entry_ttl_ms: i64 = 30 * 60 * 1000;
 
-pub const State = enum(u8) { empty, pending, ready };
+pub const State = checkpoint.State;
+pub const Verdict = checkpoint.Verdict;
+pub const CacheEntry = checkpoint.CacheEntry;
+pub const Execution = checkpoint.Execution;
+pub const Snapshot = checkpoint.Snapshot;
+pub const configDigest = checkpoint.configDigest;
+pub const validateZones = checkpoint.validateZones;
 
 const Entry = struct {
     key: dns.Address = .{ .ipv4 = .{ 0, 0, 0, 0 } },
@@ -547,92 +543,8 @@ pub const Resolver = struct {
     }
 };
 
-pub const CacheEntry = struct {
-    key: dns.Address = .{ .ipv4 = .{ 0, 0, 0, 0 } },
-    has_key: bool = false,
-    state: State = .empty,
-    verdict: Verdict = .{ .listed = false },
-    resolved_ms: i64 = 0,
-};
-pub const Execution = enum(u8) { unstarted, paused };
-pub const Snapshot = struct {
-    allocator: std.mem.Allocator,
-    entries: []CacheEntry,
-    jobs: []dns.Address,
-    job_count: usize,
-    zones: [][]u8,
-    config_digest: [32]u8,
-    captured_monotonic_ms: i64,
-    execution: Execution,
-    pub fn deinit(self: *Snapshot) void {
-        for (self.zones) |zone| self.allocator.free(zone);
-        self.allocator.free(self.zones);
-        self.allocator.free(self.jobs);
-        self.allocator.free(self.entries);
-        self.* = undefined;
-    }
-    pub fn validate(self: *const Snapshot, cfg: dns.ResolverConfig, zones: []const []const u8) !void {
-        if (self.entries.len != cache_slots or self.jobs.len != job_capacity or self.job_count > job_capacity or self.zones.len != zones.len) return error.InvalidState;
-        if (self.captured_monotonic_ms < 0) return error.InvalidState;
-        if (!std.mem.eql(u8, &self.config_digest, &try configDigest(cfg, zones))) return error.ConfigMismatch;
-        for (self.zones, zones) |carried, actual| if (!std.mem.eql(u8, carried, actual)) return error.ConfigMismatch;
-        for (self.entries, 0..) |entry, i| {
-            if (!entry.has_key and (entry.state != .empty or entry.verdict.listed or entry.verdict.code != 0 or
-                entry.resolved_ms != 0 or !addrEql(entry.key, .{ .ipv4 = .{ 0, 0, 0, 0 } }))) return error.InvalidState;
-            if (entry.has_key and entry.state == .empty) return error.InvalidState;
-            if (entry.state != .ready and (entry.verdict.listed or entry.verdict.code != 0 or entry.resolved_ms != 0)) return error.InvalidState;
-            if (entry.state == .ready and ((!entry.verdict.listed and entry.verdict.code != 0) or
-                entry.resolved_ms < 0 or entry.resolved_ms > self.captured_monotonic_ms)) return error.InvalidState;
-            if (entry.has_key) for (self.entries[0..i]) |prior| {
-                if (prior.has_key and addrEql(prior.key, entry.key)) return error.InvalidState;
-            };
-        }
-        for (self.jobs[0..self.job_count], 0..) |ip, i| for (self.jobs[0..i]) |prior| {
-            if (addrEql(ip, prior)) return error.InvalidState;
-        };
-    }
-};
-pub fn configDigest(cfg: dns.ResolverConfig, zones: []const []const u8) ![32]u8 {
-    try validateZones(zones);
-    const dns_digest = try rdns.resolverConfigDigest(cfg);
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("onyx/companion/dnsbl-config/v1");
-    hash.update(&dns_digest);
-    hash.update(&.{@intCast(zones.len)});
-    for (zones) |zone| {
-        const len = std.math.cast(u32, zone.len) orelse return error.Capacity;
-        var bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, len, .big);
-        hash.update(&bytes);
-        hash.update(zone);
-    }
-    return hash.finalResult();
-}
-
-/// A configured zone must produce a valid A query for both IPv4 and IPv6
-/// clients. Validate at boot rather than silently treating every lookup as a
-/// clean result when the zone can never be queried.
-pub fn validateZones(zones: []const []const u8) !void {
-    if (zones.len > max_zones) return error.TooManyZones;
-    for (zones) |zone| {
-        var name_buf: [dns.max_domain_text_len]u8 = undefined;
-        const name = try dnsbl.reverseNameV6(@splat(0), zone, &name_buf);
-        var query_buf: [dns.max_message_len]u8 = undefined;
-        _ = try dns.encodeQuery(&query_buf, 1, name, .a);
-    }
-}
-
 fn addrEql(a: dns.Address, b: dns.Address) bool {
-    return switch (a) {
-        .ipv4 => |x| switch (b) {
-            .ipv4 => |y| std.mem.eql(u8, &x, &y),
-            else => false,
-        },
-        .ipv6 => |x| switch (b) {
-            .ipv6 => |y| std.mem.eql(u8, &x, &y),
-            else => false,
-        },
-    };
+    return checkpoint.addressEql(a, b);
 }
 
 fn lockSpin(m: *std.atomic.Mutex) void {
@@ -1297,4 +1209,37 @@ test "DNS worker budget gives the final DNSBL zone a listing opportunity after e
     resolver.stop();
     try server.join();
     try std.testing.expectEqual(max_zones, server.udp_queries);
+}
+
+test "DNS worker reaches a listing secondary nameserver inside a short zone budget" {
+    const fixture = @import("../proto/dns/test_server.zig");
+    var server = try fixture.Server.init(false, .silent);
+    defer server.deinit();
+    const zones = [_][]const u8{ "zero.test", "one.test", "two.test", "three.test", "four.test", "five.test", "six.test", "seven.test" };
+    const ip: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    var name_buf: [dns.max_domain_text_len]u8 = undefined;
+    const query_name = try dnsbl.reverseNameV4(ip.ipv4, zones[0], &name_buf);
+    const steps = [_]fixture.Step{
+        .{ .name = query_name, .qtype = .a, .reply = .silent },
+        .{ .name = query_name, .qtype = .a, .reply = .{ .address = .{ .ipv4 = .{ 127, 0, 0, 7 } } } },
+    };
+    server.script = &steps;
+    server.fixture_timeout_ms = 1500;
+    try server.start();
+    var cfg = server.resolverConfig();
+    cfg.timeout_ms = 2000;
+    cfg.attempts = 1;
+    cfg.addNameserver(server.address);
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, cfg, &zones);
+    defer resolver.deinit();
+    resolver.request(ip);
+    const started = platform.monotonicMillis();
+    try resolver.startChecked();
+    while (platform.monotonicMillis() - started < 1500 and resolver.lookup(ip) == null) sleepMs(5);
+    const elapsed = platform.monotonicMillis() - started;
+    try std.testing.expectEqual(Verdict{ .listed = true, .code = 7 }, resolver.lookup(ip) orelse return error.TestUnexpectedResult);
+    try std.testing.expect(elapsed < 1500);
+    resolver.stop();
+    try server.join();
+    try std.testing.expectEqual(@as(usize, 2), server.udp_queries);
 }

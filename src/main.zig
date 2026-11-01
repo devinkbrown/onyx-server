@@ -696,6 +696,10 @@ fn validateManagedBootPlan(allocator: std.mem.Allocator, io: std.Io, loaded: *co
         return error.UnsupportedManagedTransport;
     }
     if (loaded.parsed.meshCloakSecretMissing()) return error.MissingMeshCloakSecret;
+    const mesh_active = loaded.parsed.listen.s2s != 0 or
+        loaded.parsed.mesh.connect.len != 0 or loaded.parsed.mesh.trust_roots.len != 0;
+    if (mesh_active and (loaded.parsed.mesh.presence_store_path == null or
+        loaded.parsed.mesh.presence_store_path.?.len == 0)) return error.MissingMeshPresenceStorePath;
     if (boot.configCheckError(loaded.io, loaded.tls.ktls) != null) return error.InvalidManagedIoPolicy;
     if (boot.unsecuredMeshPeerError(loaded.parsed.mesh.connect.len, loaded.parsed.mesh.require_secured) != null) return error.UnsecuredManagedMesh;
     if (loaded.parsed.node.secret_key) |secret| {
@@ -2918,6 +2922,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (node_id_holder != null) {
+        if (held) |h| {
+            const mesh_active = h.parsed.listen.s2s != 0 or
+                h.parsed.mesh.connect.len != 0 or h.parsed.mesh.trust_roots.len != 0;
+            if (mesh_active and srv_cfg.mesh_presence_store_path.len == 0) {
+                std.debug.print("onyx-server: fatal — active node-identity mesh requires [mesh].presence_store_path for durable guest authority\n", .{});
+                return error.MissingMeshPresenceStorePath;
+            }
+        }
         srv_cfg.node_identity = &node_id_holder.?;
         if (held) |h| {
             if (h.parsed.mesh.mesh_pass) |mp| srv_cfg.mesh_pass = mp;

@@ -42,6 +42,7 @@ pub const InboundE2eeGroup = s2s_peer.InboundE2eeGroup;
 pub const SignedOperEventV2 = s2s_peer.SignedOperEventV2;
 pub const InboundOperEventV2 = s2s_peer.InboundOperEventV2;
 pub const InboundGuestFrame = s2s_peer.InboundGuestFrame;
+pub const InboundGuestFrontier = s2s_peer.InboundGuestFrontier;
 const channel_crdt = @import("../substrate/undertow/channel_crdt.zig");
 const peer_link = @import("../substrate/undertow/peer_link.zig");
 
@@ -588,6 +589,10 @@ pub const S2sLink = struct {
         return self.peer.supportsSecureRelayV2();
     }
 
+    pub fn supportsSecureRelayV2Guest(self: *const S2sLink) bool {
+        return self.peer.supportsSecureRelayV2Guest();
+    }
+
     pub fn supportsRelayV2AckConfirm(self: *const S2sLink) bool {
         return self.peer.supportsRelayV2AckConfirm();
     }
@@ -670,6 +675,10 @@ pub const S2sLink = struct {
 
     pub fn probeRelayV2Current(self: *S2sLink) !void {
         try self.peer.probeRelayV2Current(self.sink());
+    }
+
+    pub fn probeSecureRelayV2Guest(self: *S2sLink) !void {
+        try self.peer.probeSecureRelayV2Guest(self.sink());
     }
 
     pub fn takeInboundV2Acks(self: *S2sLink) ![]message_relay_v2.RelayId {
@@ -902,8 +911,20 @@ pub const S2sLink = struct {
         return self.peer.supportsGuestPresence();
     }
 
+    pub fn supportsGuestFrontier(self: *const S2sLink) bool {
+        return self.peer.supportsGuestFrontier();
+    }
+
+    pub fn takeGuestFrontierReady(self: *S2sLink) bool {
+        return self.peer.takeGuestFrontierReady();
+    }
+
     pub fn forwardGuestPresence(self: *S2sLink, original: []const u8) !bool {
         return self.peer.forwardGuestPresence(self.sink(), original);
+    }
+
+    pub fn forwardGuestFrontier(self: *S2sLink, original: []const u8) !bool {
+        return self.peer.forwardGuestFrontier(self.sink(), original);
     }
 
     pub fn forwardGuestDirect(self: *S2sLink, original: []const u8) !bool {
@@ -916,6 +937,10 @@ pub const S2sLink = struct {
 
     pub fn takeGuestDirects(self: *S2sLink) ![]InboundGuestFrame {
         return self.peer.takeGuestDirects();
+    }
+
+    pub fn takeGuestFrontiers(self: *S2sLink) ![]InboundGuestFrontier {
+        return self.peer.takeGuestFrontiers();
     }
 
     /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).

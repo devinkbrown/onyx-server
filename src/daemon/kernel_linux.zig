@@ -10,11 +10,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
+const client_socket_policy = @import("client_socket_policy.zig");
 
 /// Pending TFO handshakes the listener will accept. Set before listen.
 pub const fastopen_queue: u32 = 256;
-/// Unacked data abort, in milliseconds. Idle clients are not affected.
-pub const user_timeout_ms: u32 = 30_000;
+/// Bound unacknowledged data and keepalive failure without shortening the
+/// configured three-probe keepalive window. Accepted sockets inherit this.
+pub const user_timeout_ms: u32 = client_socket_policy.user_timeout_ms;
 
 /// CPU index for SO_INCOMING_CPU. Shards spread across the machine's CPUs;
 /// a one-CPU host stays on CPU 0.
