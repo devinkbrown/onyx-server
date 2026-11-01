@@ -16,6 +16,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dns = @import("../proto/dns.zig");
+const dns_engine = @import("../proto/dns/query_engine.zig");
+const dns_confirmation = @import("../proto/dns/confirmation.zig");
+const DnsDeadline = @import("../proto/dns/deadline.zig").Deadline;
 const platform = @import("../substrate/platform.zig");
 pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
@@ -42,6 +45,9 @@ const Entry = struct {
     /// Not part of the checkpoint; a restored entry reports only `host_len`.
     observed_len: usize = 0,
     resolved_ms: i64 = 0,
+    /// Runtime custody of an accepted queued/active job, independently of a
+    /// synchronous ready result. Reconstructed from the FIFO after restore.
+    work_reserved: bool = false,
 };
 
 const Job = struct { ip: dns.Address };
@@ -59,6 +65,10 @@ pub const Resolver = struct {
     job_head: usize = 0,
     job_tail: usize = 0,
     job_count: usize = 0,
+    /// Protected by mutex; a dequeued job is still accepted work.
+    active_job: ?Job = null,
+    /// Bounded background recovery of historical pending rows without a job.
+    recovery_cursor: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) !Resolver {
         const entries = try allocator.alloc(Entry, cache_slots);
@@ -130,6 +140,7 @@ pub const Resolver = struct {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         try self.producers.requireLocked(fence);
+        if (self.active_job != null) return error.NotQuiescent;
         return .{ .execution = try self.requireCaptureCut(token), .queued = self.job_count };
     }
     pub fn requestPause(self: *Resolver, epoch: u64) !runtime_pause.Token {
@@ -170,6 +181,11 @@ pub const Resolver = struct {
     }
     fn captureCut(self: *Resolver, allocator: std.mem.Allocator, token: ?runtime_pause.Token, fence: ?runtime_pause.ProducerFence, max_bytes: usize) !Snapshot {
         const execution = try self.requireCaptureCut(token);
+        {
+            lockSpin(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.active_job != null) return error.NotQuiescent;
+        }
         const required = std.math.add(usize, @sizeOf(Snapshot), cache_slots * @sizeOf(CacheEntry) + job_capacity * @sizeOf(dns.Address)) catch return error.Capacity;
         if (required > max_bytes) return error.Capacity;
         const entries = try allocator.alloc(CacheEntry, cache_slots);
@@ -180,6 +196,7 @@ pub const Resolver = struct {
         defer self.mutex.unlock();
         if (fence) |proof| try self.producers.requireLocked(proof);
         _ = try self.requireCaptureCut(token);
+        if (self.active_job != null) return error.NotQuiescent;
         if (self.entries.len != cache_slots or self.job_count > job_capacity) return error.InvalidState;
         for (self.entries, entries) |entry, *out| {
             if (entry.host_len > max_host_len) return error.InvalidState;
@@ -217,6 +234,7 @@ pub const Resolver = struct {
     }
 
     fn publishSnapshot(self: *Resolver, snapshot: *const Snapshot) !void {
+        if (self.active_job != null) return error.NotQuiescent;
         if (self.entries.len != cache_slots) return error.InvalidState;
         for (snapshot.entries, self.entries) |entry, *out| {
             out.* = .{
@@ -229,7 +247,14 @@ pub const Resolver = struct {
             };
             @memcpy(out.host_buf[0..entry.host_len], entry.host[0..entry.host_len]);
         }
-        for (snapshot.jobs[0..snapshot.job_count], 0..) |ip, i| self.jobs[i] = .{ .ip = ip };
+        for (snapshot.jobs[0..snapshot.job_count], 0..) |ip, i| {
+            self.jobs[i] = .{ .ip = ip };
+            // This cold restore walk derives runtime custody only. Keep every
+            // cache row and FIFO record exactly as carried, including ready
+            // rows with queued work and historical orphan pending entries.
+            if (self.find(ip)) |entry| entry.work_reserved = true;
+        }
+        self.recovery_cursor = 0;
         self.job_head = 0;
         self.job_count = snapshot.job_count;
         self.job_tail = snapshot.job_count % job_capacity;
@@ -271,7 +296,7 @@ pub const Resolver = struct {
         defer self.mutex.unlock();
         const now = platform.monotonicMillis();
         if (self.find(ip)) |e| {
-            if (e.state == .pending) return;
+            if (e.state == .pending and e.work_reserved) return;
             if (e.state == .ready and (now - e.resolved_ms) < entry_ttl_ms) return;
         }
         self.enqueueLocked(ip);
@@ -314,8 +339,9 @@ pub const Resolver = struct {
         return null;
     }
 
-    /// Find or claim a slot for `ip`. Pending work is never evicted; a full
-    /// cache of pending entries refuses admission. Caller holds the mutex.
+    /// Find or claim a slot for `ip`. Pending rows and accepted work remain
+    /// pinned, including ready results supplied while a job is outstanding.
+    /// Caller holds the mutex.
     fn reserve(self: *Resolver, ip: dns.Address) ?*Entry {
         if (self.find(ip)) |e| return e;
         const e = self.victim() orelse return null;
@@ -330,7 +356,7 @@ pub const Resolver = struct {
         var oldest: ?*Entry = null;
         for (self.entries) |*e| {
             if (!e.has_key or e.state == .empty) return e;
-            if (e.state == .pending) continue;
+            if (e.state == .pending or e.work_reserved) continue;
             if (oldest == null or e.resolved_ms < oldest.?.resolved_ms) oldest = e;
         }
         return oldest;
@@ -340,6 +366,7 @@ pub const Resolver = struct {
     fn enqueueLocked(self: *Resolver, ip: dns.Address) void {
         if (self.producers.frozen or self.stop_flag.load(.acquire)) return;
         if (self.job_count >= job_capacity) return;
+        if (self.active_job) |active| if (addrEql(active.ip, ip)) return;
         var i: usize = 0;
         var idx = self.job_head;
         while (i < self.job_count) : (i += 1) {
@@ -349,20 +376,88 @@ pub const Resolver = struct {
         // Publish pending only after queue admission is certain. A refused
         // request must remain retryable and must not evict a cache entry.
         const entry = self.reserve(ip) orelse return;
-        entry.* = .{ .key = ip, .has_key = true, .state = .pending };
+        self.appendJobLocked(entry, ip);
+    }
+
+    fn appendJobLocked(self: *Resolver, entry: *Entry, ip: dns.Address) void {
+        std.debug.assert(self.job_count < job_capacity and !entry.work_reserved);
+        entry.* = .{ .key = ip, .has_key = true, .state = .pending, .work_reserved = true };
         self.jobs[self.job_tail] = .{ .ip = ip };
         self.job_tail = (self.job_tail + 1) % job_capacity;
         self.job_count += 1;
     }
 
+    /// A v1 snapshot may contain pending rows without queued work. Repair only
+    /// unowned rows, behind the accepted FIFO, without an unbounded admission
+    /// scan on the reactor. Full/frozen queues retain them for a later boundary.
+    fn recoverPendingLocked(self: *Resolver) void {
+        if (self.producers.frozen or self.stop_flag.load(.acquire) or self.job_count == job_capacity) return;
+        const entry = self.orphanCandidateLocked() orelse return;
+        self.appendJobLocked(entry, entry.key);
+    }
+
+    fn orphanCandidateLocked(self: *Resolver) ?*Entry {
+        for (0..@min(self.entries.len, 64)) |_| {
+            const entry = &self.entries[self.recovery_cursor];
+            self.recovery_cursor = (self.recovery_cursor + 1) % self.entries.len;
+            if (!entry.has_key or entry.state != .pending or entry.work_reserved) continue;
+            if (self.active_job) |active| if (addrEql(active.ip, entry.key)) continue;
+            return entry;
+        }
+        return null;
+    }
+
+    /// A historical FIFO head can lack a cache row while every row is pending.
+    /// Appending repairs behind that head would deadlock. Finish one existing
+    /// orphan obligation first, without changing any FIFO item or cursor. Its
+    /// completed row becomes reclaimable by the original head on the next turn.
+    fn claimBlockingRepairLocked(self: *Resolver) ?Job {
+        if (self.producers.frozen or self.stop_flag.load(.acquire)) return null;
+        const entry = self.orphanCandidateLocked() orelse return null;
+        const job = Job{ .ip = entry.key };
+        entry.work_reserved = true;
+        self.active_job = job;
+        return job;
+    }
+
     fn takeJob(self: *Resolver) ?Job {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
+        if (self.active_job != null or self.stop_flag.load(.acquire)) return null;
+        const was_empty = self.job_count == 0;
+        if (was_empty) self.recoverPendingLocked();
         if (self.job_count == 0) return null;
         const job = self.jobs[self.job_head];
+        // Reserve before attempting normal recovery so that a rowless blocked
+        // head cannot pin its last available orphan behind itself in the FIFO.
+        const entry = self.reserve(job.ip) orelse return self.claimBlockingRepairLocked();
+        entry.work_reserved = true;
+        if (!was_empty) self.recoverPendingLocked();
+        self.active_job = job;
         self.job_head = (self.job_head + 1) % job_capacity;
         self.job_count -= 1;
         return job;
+    }
+
+    fn completeJob(self: *Resolver, job: Job, ptr_name: ?[]const u8, forward_ok: bool) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(self.active_job != null and addrEql(self.active_job.?.ip, job.ip));
+        const entry = self.find(job.ip) orelse unreachable;
+        std.debug.assert(entry.work_reserved);
+        if (ptr_name) |name| {
+            const n = @min(name.len, entry.host_buf.len);
+            @memcpy(entry.host_buf[0..n], name[0..n]);
+            entry.observed_len = n;
+            entry.host_len = if (forward_ok) n else 0;
+        } else {
+            entry.observed_len = 0;
+            entry.host_len = 0;
+        }
+        entry.resolved_ms = platform.monotonicMillis();
+        entry.state = .ready;
+        entry.work_reserved = false;
+        self.active_job = null;
     }
 
     fn worker(self: *Resolver) void {
@@ -379,33 +474,9 @@ pub const Resolver = struct {
             // Keep the PTR even when it does not forward-confirm. Operators
             // need that name next to the address; `host_len` stays 0 so the
             // confirmed-only lookup and the checkpoint still ignore it.
-            var name_buf: [max_host_len]u8 = undefined;
-            const ptr_name = dns.resolveReverse(&self.cfg, job.ip, &name_buf) catch null;
-            var forward_ok = false;
-            if (ptr_name) |name| {
-                var fwd: [dns.max_cache_addrs]dns.Address = undefined;
-                if (dns.resolveForward(&self.cfg, name, job.ip == .ipv6, &fwd)) |addrs| {
-                    forward_ok = dns.forwardConfirms(job.ip, addrs);
-                } else |_| {}
-            }
-
-            lockSpin(&self.mutex);
-            const e = self.reserve(job.ip) orelse {
-                self.mutex.unlock();
-                continue;
-            };
-            if (ptr_name) |name| {
-                const n = @min(name.len, e.host_buf.len);
-                @memcpy(e.host_buf[0..n], name[0..n]);
-                e.observed_len = n;
-                e.host_len = if (forward_ok) n else 0;
-            } else {
-                e.observed_len = 0;
-                e.host_len = 0;
-            }
-            e.resolved_ms = platform.monotonicMillis();
-            e.state = .ready;
-            self.mutex.unlock();
+            const deadline = DnsDeadline.after(dns_engine.defaultBudget(&self.cfg));
+            const observed = dns_confirmation.resolveUntil(&self.cfg, job.ip, deadline);
+            self.completeJob(job, if (observed.name.len == 0) null else observed.name.slice(), observed.confirmed);
         }
     }
 };
@@ -771,13 +842,15 @@ test "DNS worker full queue does not strand an unaccepted address" {
     resolver.request(overflow);
     try std.testing.expectEqual(job_capacity, resolver.job_count);
     try std.testing.expect(resolver.find(overflow) == null);
-    _ = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    const first = resolver.takeJob() orelse return error.TestUnexpectedResult;
     resolver.request(overflow);
     try std.testing.expectEqual(job_capacity, resolver.job_count);
     try std.testing.expectEqual(State.pending, resolver.find(overflow).?.state);
+    resolver.completeJob(first, null, false);
     var occurrences: usize = 0;
     while (resolver.takeJob()) |job| {
         if (addrEql(job.ip, overflow)) occurrences += 1;
+        resolver.completeJob(job, null, false);
     }
     try std.testing.expectEqual(@as(usize, 1), occurrences);
 }
@@ -799,9 +872,10 @@ test "DNS worker refresh stays pending after dequeue and preserves checkpoint va
     var snapshot = try resolver.captureUnstarted(std.testing.allocator, 1024 * 1024);
     defer snapshot.deinit();
     try snapshot.validate(resolver.cfg);
-    _ = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    const active = resolver.takeJob() orelse return error.TestUnexpectedResult;
     resolver.request(ip);
     try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
+    resolver.completeJob(active, null, false);
 }
 
 test "DNS worker cache pressure preserves an in-flight pending address" {
@@ -813,13 +887,17 @@ test "DNS worker cache pressure preserves an in-flight pending address" {
     const first: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 1 } };
     const second: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 2 } };
     resolver.request(first);
-    _ = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    const active = resolver.takeJob() orelse return error.TestUnexpectedResult;
     resolver.request(second);
     const retained = resolver.find(first) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(State.pending, retained.state);
     resolver.request(first);
     try std.testing.expectEqual(@as(usize, 1), resolver.job_count);
-    try std.testing.expect(addrEql(second, (resolver.takeJob() orelse return error.TestUnexpectedResult).ip));
+    try std.testing.expect(resolver.takeJob() == null);
+    resolver.completeJob(active, null, false);
+    const next = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(addrEql(second, next.ip));
+    resolver.completeJob(next, null, false);
 }
 
 test "DNS worker refuses admission when every cache entry is pending" {
@@ -842,4 +920,256 @@ test "DNS worker refuses admission when every cache entry is pending" {
     resolver.request(incoming);
     try std.testing.expectEqual(@as(usize, 1), resolver.job_count);
     try std.testing.expectEqual(State.pending, resolver.find(incoming).?.state);
+}
+
+test "DNS worker restores and requeues historical orphan pending rows behind accepted FIFO" {
+    var source = try Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer source.deinit();
+    const orphan: dns.Address = .{ .ipv4 = .{ 192, 0, 2, 1 } };
+    const queued: dns.Address = .{ .ipv4 = .{ 192, 0, 2, 2 } };
+    _ = source.reserve(orphan) orelse return error.TestUnexpectedResult;
+    source.request(queued);
+    var snapshot = try source.captureUnstarted(std.testing.allocator, 1024 * 1024);
+    defer snapshot.deinit();
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    try resolver.restoreSnapshot(&snapshot);
+    try std.testing.expect(!resolver.find(orphan).?.work_reserved);
+    try std.testing.expect(resolver.find(queued).?.work_reserved);
+    resolver.request(orphan);
+    resolver.request(orphan);
+    try std.testing.expectEqual(@as(usize, 2), resolver.job_count);
+    const first = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(addrEql(queued, first.ip));
+    resolver.request(queued);
+    try std.testing.expectEqual(@as(usize, 1), resolver.job_count);
+    resolver.completeJob(first, null, false);
+    const second = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(addrEql(orphan, second.ip));
+    resolver.completeJob(second, null, false);
+    try std.testing.expect(resolver.active_job == null);
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
+    try std.testing.expectEqual(State.ready, resolver.find(orphan).?.state);
+}
+
+test "DNS worker background orphan scan is bounded and appends at most one repair" {
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const orphan_a: dns.Address = .{ .ipv4 = .{ 192, 0, 2, 10 } };
+    const orphan_b: dns.Address = .{ .ipv4 = .{ 192, 0, 2, 11 } };
+    resolver.entries[64] = .{ .key = orphan_a, .has_key = true, .state = .pending };
+    resolver.entries[65] = .{ .key = orphan_b, .has_key = true, .state = .pending };
+    resolver.recoverPendingLocked();
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
+    try std.testing.expectEqual(@as(usize, 64), resolver.recovery_cursor);
+    resolver.recoverPendingLocked();
+    try std.testing.expectEqual(@as(usize, 1), resolver.job_count);
+    try std.testing.expectEqual(@as(usize, 65), resolver.recovery_cursor);
+    resolver.recoverPendingLocked();
+    try std.testing.expectEqual(@as(usize, 2), resolver.job_count);
+    try std.testing.expectEqual(@as(usize, 66), resolver.recovery_cursor);
+    resolver.recovery_cursor = 64;
+    resolver.recoverPendingLocked();
+    try std.testing.expectEqual(@as(usize, 2), resolver.job_count);
+    const first = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(addrEql(orphan_a, first.ip));
+    resolver.completeJob(first, null, false);
+    const second = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(addrEql(orphan_b, second.ip));
+    resolver.completeJob(second, null, false);
+}
+
+test "DNS worker orphan recovery leaves a full or frozen FIFO unchanged and retries later" {
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    for (0..job_capacity) |index| resolver.request(.{ .ipv4 = .{ 192, 0, 0, @intCast(index) } });
+    const orphan: dns.Address = .{ .ipv4 = .{ 198, 51, 100, 1 } };
+    const entry = resolver.reserve(orphan) orelse return error.TestUnexpectedResult;
+    const before_head = resolver.job_head;
+    const before_tail = resolver.job_tail;
+    const before_cursor = resolver.recovery_cursor;
+    resolver.request(orphan);
+    resolver.recoverPendingLocked();
+    try std.testing.expectEqual(job_capacity, resolver.job_count);
+    try std.testing.expectEqual(before_head, resolver.job_head);
+    try std.testing.expectEqual(before_tail, resolver.job_tail);
+    try std.testing.expectEqual(before_cursor, resolver.recovery_cursor);
+    try std.testing.expect(!entry.work_reserved and entry.state == .pending);
+    for (0..job_capacity) |index| {
+        const expected: dns.Address = .{ .ipv4 = .{ 192, 0, 0, @intCast(index) } };
+        try std.testing.expect(addrEql(expected, resolver.jobs[(resolver.job_head + index) % job_capacity].ip));
+    }
+    const first = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    const fence = try resolver.fenceProducers();
+    resolver.request(orphan);
+    resolver.recoverPendingLocked();
+    try std.testing.expectEqual(job_capacity - 1, resolver.job_count);
+    try std.testing.expect(!entry.work_reserved);
+    try resolver.resumeProducers(fence);
+    resolver.request(orphan);
+    try std.testing.expectEqual(job_capacity, resolver.job_count);
+    try std.testing.expect(entry.work_reserved);
+    resolver.completeJob(first, null, false);
+    var count: usize = 0;
+    var repairs: usize = 0;
+    while (resolver.takeJob()) |job| {
+        if (addrEql(orphan, job.ip)) {
+            repairs += 1;
+            try std.testing.expectEqual(job_capacity - 1, count);
+        }
+        resolver.completeJob(job, null, false);
+        count += 1;
+    }
+    try std.testing.expectEqual(job_capacity, count);
+    try std.testing.expectEqual(@as(usize, 1), repairs);
+}
+
+test "DNS worker active job refuses capture and restore until completion after stop" {
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    const ip: dns.Address = .{ .ipv4 = .{ 192, 0, 2, 20 } };
+    const queued: dns.Address = .{ .ipv4 = .{ 192, 0, 2, 21 } };
+    resolver.request(ip);
+    resolver.request(queued);
+    var prior = try resolver.captureUnstarted(std.testing.allocator, 1024 * 1024);
+    defer prior.deinit();
+    const first = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.NotQuiescent, resolver.captureUnstarted(failing.allocator(), 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expectError(error.NotQuiescent, resolver.restoreSnapshot(&prior));
+    try std.testing.expectEqual(@as(usize, 1), resolver.job_count);
+    const fence = try resolver.fenceProducers();
+    try std.testing.expectError(error.NotQuiescent, resolver.inspectFrozen(fence, null));
+    try std.testing.expectError(error.NotQuiescent, resolver.captureFrozen(failing.allocator(), fence, null, 1024 * 1024));
+    resolver.requestStopAndWake();
+    try std.testing.expect(resolver.takeJob() == null);
+    resolver.completeJob(first, null, false);
+    try std.testing.expect(resolver.active_job == null);
+    try std.testing.expect(!resolver.find(ip).?.work_reserved);
+    try std.testing.expectEqual(State.ready, resolver.find(ip).?.state);
+    var completed = try resolver.captureFrozen(std.testing.allocator, fence, null, 1024 * 1024);
+    defer completed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), completed.job_count);
+    try std.testing.expect(addrEql(queued, completed.jobs[0]));
+}
+
+test "DNS worker completes an orphan to unblock a rowless legacy FIFO head without reordering" {
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, .{});
+    defer resolver.deinit();
+    for (resolver.entries, 0..) |*entry, index| {
+        entry.* = .{ .key = .{ .ipv4 = .{ 192, 168, @intCast(index / 256), @intCast(index % 256) } }, .has_key = true, .state = .pending };
+    }
+    for (&resolver.jobs, 0..) |*job, index| job.* = .{ .ip = .{ .ipv4 = .{ 198, 51, 100, @intCast(index) } } };
+    resolver.job_count = job_capacity;
+    var before = try resolver.captureUnstarted(std.testing.allocator, 1024 * 1024);
+    defer before.deinit();
+    const repair = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_head);
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_tail);
+    try std.testing.expectEqual(job_capacity, resolver.job_count);
+    for (before.jobs[0..before.job_count], 0..) |ip, index| {
+        try std.testing.expect(addrEql(ip, resolver.jobs[index].ip));
+        try std.testing.expect(!addrEql(ip, repair.ip));
+    }
+    try std.testing.expect(addrEql(repair.ip, resolver.active_job.?.ip));
+    try std.testing.expect(resolver.find(repair.ip).?.work_reserved);
+    resolver.request(repair.ip);
+    try std.testing.expect(resolver.takeJob() == null);
+    try std.testing.expectEqual(job_capacity, resolver.job_count);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.NotQuiescent, resolver.captureUnstarted(failing.allocator(), 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    resolver.completeJob(repair, null, false);
+    try std.testing.expect(resolver.active_job == null);
+    try std.testing.expectEqual(State.ready, resolver.find(repair.ip).?.state);
+    try std.testing.expect(!resolver.find(repair.ip).?.work_reserved);
+    // Production completion, without direct cache mutation, frees the original
+    // FIFO head's reservation. Existing FIFO order and remaining work survive.
+    const job = resolver.takeJob() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(addrEql(before.jobs[0], job.ip));
+    try std.testing.expectEqual(@as(usize, 1), resolver.job_head);
+    try std.testing.expectEqual(job_capacity - 1, resolver.job_count);
+    resolver.completeJob(job, null, false);
+    var after = try resolver.captureUnstarted(std.testing.allocator, 1024 * 1024);
+    defer after.deinit();
+    try std.testing.expectEqualDeep(before.jobs[1..before.job_count], after.jobs[0..after.job_count]);
+}
+
+test "DNS worker budget shares five seconds across delayed PTR and silent forward while retaining observation" {
+    const fixture = @import("../proto/dns/test_server.zig");
+    var server = try fixture.Server.init(false, .valid);
+    defer server.deinit();
+    const ip: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    const steps = [_]fixture.Step{
+        .{ .name = "7.113.0.203.in-addr.arpa", .qtype = .ptr, .delay_ms = 2500, .reply = .{ .ptr = "observed.budget.test" } },
+        .{ .name = "observed.budget.test", .qtype = .a, .reply = .silent },
+    };
+    server.script = &steps;
+    server.fixture_timeout_ms = 5000;
+    try server.start();
+    var cfg = server.resolverConfig();
+    cfg.timeout_ms = std.math.maxInt(u32);
+    cfg.attempts = 255;
+    var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, cfg);
+    defer resolver.deinit();
+    resolver.request(ip);
+    const started = platform.monotonicMillis();
+    resolver.start();
+    try std.testing.expect(resolver.thread != null);
+    var name: [max_host_len]u8 = undefined;
+    while (platform.monotonicMillis() - started < 6500 and resolver.lookupObserved(ip, &name) == null) sleepMs(5);
+    const elapsed = platform.monotonicMillis() - started;
+    const observed = resolver.lookupObserved(ip, &name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("observed.budget.test", observed.name);
+    try std.testing.expect(!observed.confirmed);
+    try std.testing.expect(resolver.lookup(ip, &name) == null);
+    // The former independently renewed forward deadline took about 7.5s.
+    // Allow scheduler overhead while distinguishing it from one 5s budget.
+    try std.testing.expect(elapsed >= 4500 and elapsed < 6500);
+    resolver.stop();
+    try server.join();
+    try std.testing.expectEqual(@as(usize, 2), server.udp_queries);
+    try std.testing.expectEqual(@as(usize, 0), resolver.job_count);
+    try std.testing.expect(resolver.active_job == null);
+    const entry = resolver.find(ip) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!entry.work_reserved);
+    try std.testing.expect(entry.resolved_ms >= started and entry.resolved_ms <= started + elapsed);
+}
+
+test "DNS worker budget confirms matching IPv4 and IPv6 and retains mismatching PTR observations" {
+    const fixture = @import("../proto/dns/test_server.zig");
+    const v4: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    const v6: dns.Address = .{ .ipv6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7 } };
+    const cases = [_]struct { address: dns.Address, answer: dns.Address, confirmed: bool }{
+        .{ .address = v4, .answer = v4, .confirmed = true },
+        .{ .address = v6, .answer = v6, .confirmed = true },
+        .{ .address = v4, .answer = .{ .ipv4 = .{ 203, 0, 113, 8 } }, .confirmed = false },
+    };
+    for (cases) |case| {
+        var server = try fixture.Server.init(false, .valid);
+        defer server.deinit();
+        var reverse_buf: [dns.max_domain_text_len]u8 = undefined;
+        const steps = [_]fixture.Step{
+            .{ .name = try dns.reverseName(&reverse_buf, case.address), .qtype = .ptr, .reply = .{ .ptr = "matching.budget.test" } },
+            .{ .name = "matching.budget.test", .qtype = if (case.address == .ipv6) .aaaa else .a, .reply = .{ .address = case.answer } },
+        };
+        server.script = &steps;
+        try server.start();
+        var resolver = try Resolver.initConfigured(std.testing.allocator, std.testing.io, server.resolverConfig());
+        defer resolver.deinit();
+        resolver.request(case.address);
+        resolver.start();
+        try std.testing.expect(resolver.thread != null);
+        var name: [max_host_len]u8 = undefined;
+        const stop_at = platform.monotonicMillis() + 1500;
+        while (platform.monotonicMillis() < stop_at and resolver.lookupObserved(case.address, &name) == null) sleepMs(5);
+        const observed = resolver.lookupObserved(case.address, &name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("matching.budget.test", observed.name);
+        try std.testing.expectEqual(case.confirmed, observed.confirmed);
+        try std.testing.expectEqual(case.confirmed, resolver.lookup(case.address, &name) != null);
+        resolver.stop();
+        try server.join();
+        try std.testing.expectEqual(@as(usize, 2), server.udp_queries);
+    }
 }
