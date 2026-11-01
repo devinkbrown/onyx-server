@@ -3362,7 +3362,10 @@ pub fn main(init: std.process.Init) !void {
             onyx_server.proto.dns.systemResolverConfig(),
         )
     else
-        onyx_server.daemon.rdns.Resolver.init(allocator) catch null;
+        onyx_server.daemon.rdns.Resolver.init(allocator) catch |err| blk: {
+            std.debug.print("onyx-server: rdns resolver init failed ({s}); reverse-DNS host resolution disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
     defer if (rdns_resolver) |*r| r.deinit();
     if (rdns_resolver) |*r| {
         if (native_incoming == null and windows_transfer == null) {
@@ -3393,6 +3396,7 @@ pub fn main(init: std.process.Init) !void {
                 )
             else
                 onyx_server.daemon.dnsbl_resolver.Resolver.init(allocator, h.parsed.dnsbl.zones) catch |err| blk: {
+                    std.debug.print("onyx-server: [dnsbl] enabled but resolver init failed ({s}); blocklist is INERT\n", .{@errorName(err)});
                     if (native_incoming != null) return err;
                     break :blk null;
                 };
@@ -3406,6 +3410,10 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.dnsbl = r;
                 srv_cfg.dnsbl_ward = h.parsed.dnsbl.ward;
             }
+        } else if (h.parsed.dnsbl.enabled) {
+            // enabled with an empty zone list: nothing to probe, so the feature
+            // silently does nothing. Make that misconfiguration visible.
+            std.debug.print("onyx-server: [dnsbl] enabled but no zones configured; blocklist is INERT\n", .{});
         }
     }
 
@@ -3456,6 +3464,7 @@ pub fn main(init: std.process.Init) !void {
                     .failure_dir = std.Io.Dir.cwd(),
                     .private_failure_windows = builtin.os.tag == .windows,
                 }) catch |err| blk: {
+                    std.debug.print("onyx-server: [mail] enabled but sender init failed ({s}); verification emails recorded unverified\n", .{@errorName(err)});
                     if (comptime builtin.os.tag == .windows) return err;
                     if (native_incoming != null) return err;
                     break :blk null;
@@ -3472,6 +3481,10 @@ pub fn main(init: std.process.Init) !void {
                     srv_cfg.mail_sender = s;
                 }
             };
+            // enabled but missing relay_host and/or from: the sender is never
+            // constructed and emails stay unverified — surface the gap.
+            if (m.relay_host == null or m.from == null)
+                std.debug.print("onyx-server: [mail] enabled but relay_host/from not set; verification emails recorded unverified\n", .{});
         }
     }
 

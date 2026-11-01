@@ -21,6 +21,7 @@ const platform = @import("../substrate/platform.zig");
 pub const runtime_pause = @import("runtime_pause.zig");
 pub const dormant_spawn_options: std.Thread.SpawnConfig = .{};
 const checkpoint = @import("dnsbl_snapshot.zig");
+const dlog = @import("dlog.zig");
 
 // The DNSBL worker test uses a real loopback UDP nameserver. Keep its socket
 // declarations local to the fixture; production DNS transport is in proto/dns.
@@ -304,8 +305,13 @@ pub const Resolver = struct {
         if (self.cfg.nameserver_count == 0) return error.NoNameservers;
         if (self.zone_count == 0) return error.NoZones;
         self.stop_flag.store(false, .release);
-        errdefer self.stop_flag.store(true, .release);
-        self.thread = try std.Thread.spawn(.{}, worker, .{self});
+        // A spawn failure here (past the nameserver/zone guards above) leaves the
+        // blocklist fully inert — every client is then treated as clean with no
+        // other signal. Surface it rather than silently degrading.
+        self.thread = std.Thread.spawn(.{}, worker, .{self}) catch |err| blk: {
+            dlog.log("onyx-server: dnsbl resolver worker thread spawn failed ({s}); blocklist is INERT\n", .{@errorName(err)});
+            break :blk null;
+        };
     }
 
     pub fn stop(self: *Resolver) void {

@@ -1303,8 +1303,12 @@ fn rehashFromConnWithClassAllocator(
     var env_capture = ConfigEnvCapture{ .inner = parse_resolver, .collector = &env_collector };
     const recorded_resolver = env_capture.resolver();
     const resolved = if (comptime helix_live.supportsBootPolicyOn(builtin.os.tag)) recorded_resolver else parse_resolver;
-    var parsed = config_format.parseToml(self.allocator, text, resolved) catch {
-        try self.noticeTo(conn, "REHASH: config parse error; keeping current config");
+    var parsed = config_format.parseToml(self.allocator, text, resolved) catch |err| {
+        // Report the specific parse failure (InvalidSyntax/DuplicateKey/...)
+        // so the operator can fix the file rather than guess.
+        var reason_buf: [96]u8 = undefined;
+        const notice = std.fmt.bufPrint(&reason_buf, "REHASH: config parse error ({s}); keeping current config", .{@errorName(err)}) catch "REHASH: config parse error; keeping current config";
+        try self.noticeTo(conn, notice);
         return;
     };
     if (env_capture.failed) {

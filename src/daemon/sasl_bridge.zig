@@ -15,6 +15,7 @@ const mechrouter = @import("../proto/sasl_mechrouter.zig");
 const services_mod = @import("services.zig");
 const scram_store_mod = @import("scram_store.zig");
 const platform = @import("../substrate/platform.zig");
+const dlog = @import("dlog.zig");
 const Services = services_mod.Services;
 const ScramStore = scram_store_mod.ScramStore;
 
@@ -42,7 +43,17 @@ pub const ServicesPlainChecker = struct {
         // Identity assumption (logging in as an account other than authcid) is
         // not supported: a non-empty authzid must equal authcid.
         if (creds.authzid.len != 0 and !std.mem.eql(u8, creds.authzid, creds.authcid)) return false;
-        const result = self.services.identifyAccount(creds.authcid, creds.password) catch return false;
+        const result = self.services.identifyAccount(creds.authcid, creds.password) catch |err| {
+            // Fail closed either way, but a wrong password (`AuthFailed`) is a
+            // routine outcome while any other error — most importantly
+            // `InvalidRecord` from a corrupt on-disk account — means the store
+            // could not even be evaluated. Surface that distinctly so storage
+            // corruption is diagnosable at the operator, not silently
+            // indistinguishable from a typo'd password.
+            if (err != error.AuthFailed)
+                dlog.log("sasl: account record decode failed for '{s}': {s}\n", .{ creds.authcid, @errorName(err) });
+            return false;
+        };
         return switch (result) {
             .identified => true,
             else => false,
@@ -156,6 +167,26 @@ test "services-backed PLAIN checker verifies registered accounts" {
     try std.testing.expect(!chk.verify(.{ .authzid = "", .authcid = "nobody", .password = "whatever" }));
     // Identity assumption (authzid != authcid) is refused.
     try std.testing.expect(!chk.verify(.{ .authzid = "bob", .authcid = "alice", .password = "correct horse battery staple" }));
+}
+
+test "PLAIN checker fails closed on a corrupt account record (InvalidRecord, not just a bad password)" {
+    const OroStore = services_mod.OroStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "sasl-bridge-corrupt.wal");
+    defer store.deinit();
+
+    var services = Services.init(&store, null);
+    // A structurally invalid on-disk record: identifyAccount returns
+    // error.InvalidRecord (not AuthFailed). The checker must still fail closed
+    // (return false) — the new logging branch surfaces the corruption distinctly
+    // without altering the fail-closed admission decision.
+    try store.family(.accounts).put("alice", "A1|alice|not-a-salt|not-a-hash|0|");
+    try std.testing.expectError(error.InvalidRecord, services.identifyAccount("alice", "whatever"));
+
+    var bridge = ServicesPlainChecker{ .services = &services };
+    const chk = bridge.checker();
+    try std.testing.expect(!chk.verify(.{ .authzid = "", .authcid = "alice", .password = "whatever" }));
 }
 
 test "services-backed EXTERNAL verifier maps a bound certfp to its account" {
