@@ -30076,7 +30076,18 @@ pub const LinuxServer = struct {
                 break :blk memberships[0..if (hide) 0 else visible_nchan];
             },
         };
-        whois.writeWhois(&sink, self.serverName(), conn.session.displayName(), subject) catch return;
+        whois.writeWhois(&sink, self.serverName(), conn.session.displayName(), subject) catch {
+            // Never leave a WHOIS unterminated. The sink is sized for the worst
+            // case today, but a builder error (an over-long field, a future
+            // numeric, a raised channel cap) would otherwise drop the whole burst
+            // INCLUDING the 318 — leaving the requester's client waiting on an end
+            // marker that never arrives. Discard the partial reply and send a bare
+            // RPL_ENDOFWHOIS so the pending WHOIS always completes.
+            sink.reset();
+            whois.writeEndOfWhois(&sink, self.serverName(), conn.session.displayName(), tconn.session.displayName()) catch return;
+            for (sink.slice()) |line| try appendToConn(conn, line.bytes);
+            return;
+        };
         for (sink.slice()) |line| try appendToConn(conn, line.bytes);
         if (tconn.session.umodes.contains(.whois_notify) and conn != tconn and !conn.session.isOper()) {
             var notice_buf: [256]u8 = undefined;
@@ -52973,7 +52984,11 @@ pub const LinuxServer = struct {
         // `[[opers]] presubscribe` config). With none configured the oper gets
         // nothing until it opts in via `EVENT ADD <category>`.
         conn.session.setEventMask(event_spine.CategoryMask{ .bits = presubscribe_bits });
-        try self.deliverNumeric(id, .RPL_YOUREOPER, &.{}, "You are now an IRC operator");
+        const youre_oper_msg = if (conn.session.isAdmin())
+            "You are now an IRC Administrator"
+        else
+            "You are now an IRC operator";
+        try self.deliverNumeric(id, .RPL_YOUREOPER, &.{}, youre_oper_msg);
         // USER OPER event: an account elevated to operator. A network-significant
         // privilege transition — published so USER subscribers and oper-action
         // opers see who gained operator status (and under what title/class).
@@ -63293,6 +63308,15 @@ pub const LinuxServer = struct {
                 self.recordHistoryEventSender(plan.channel, desired_prefix, "JOIN", plan.channel);
                 self.publishMemberEvent("JOIN", plan.channel, conn.session.displayName(), null) catch {};
                 self.notifyObservers(.join, observeSubject(conn, plan.channel));
+            }
+        }
+        // Mirror broadcastJoin for every restored channel: resume often skips a
+        // logical JOIN (claimant already in world, or a live sibling holds the
+        // membership image), but existing peers still need the derived `*` prefix.
+        if (conn.session.hasPriv(.oper_override)) {
+            const resume_nick = conn.session.displayName();
+            for (desired) |member| {
+                self.emitOperPrefixMode(member.channel, resume_nick, true);
             }
         }
         if (profile.override_activated) {
@@ -111325,6 +111349,17 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
         thr.join();
     }
 
+    // A regular member stays in #ops so resume must replay oper `*` visibility
+    // to existing channel peers, not only to the reclaiming client.
+    const fd_w = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_w);
+    var watcher = LiveClient{ .fd = fd_w };
+    try writeAllFd(fd_w, "NICK Alice\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&watcher, " 001 Alice ", 200);
+    try writeAllFd(fd_w, "JOIN #ops\r\n");
+    try recvUntil(&watcher, " 366 Alice #ops ", 200);
+    watcher.reset();
+
     // Session A: SASL-oper as admin, join a channel, then drop abruptly so a
     // detached ghost (with snapshot) is retained for the account.
     const fd_a = connectLoopback(port) catch return error.SkipZigTest;
@@ -111366,12 +111401,103 @@ test "threaded server: SASL-opered login keeps privileges across explicit detach
     try recvUntil(&b, "NICK :trev", 200);
     try recvUntil(&b, "JOIN #ops", 200);
 
+    // Existing #ops members must see the derived `*` immediately, mirroring a
+    // normal oper JOIN — not only on the reclaiming client's projected NAMES.
+    try recvUntil(&watcher, "MODE #ops +Y trev", 200);
+
     // The reclaimed session must still hold its granted privileges: a bare
     // SHUN (list) requires .client_moderate — it must succeed, never 481.
     b.reset();
     try writeAllFd(fd_b, "SHUN\r\n");
     try recvUntil(&b, "SHUN: end of list", 200);
     try std.testing.expect(std.mem.indexOf(u8, b.written(), " 481 ") == null);
+}
+
+test "threaded server: SESSION RESUME oper prefix when claimant already joined before restore" {
+    // Regression: the claimant JOINs the target channel BEFORE presenting its
+    // resume credential, so restore plans no logical JOIN for that channel (the
+    // claimant is already a world member) and `broadcastJoin` — the only other
+    // emitter of the derived `*` — never runs. Existing peers would keep
+    // rendering the reclaimed oper unprefixed until their next NAMES.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try services_mod.OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "server-resume-oper-prefix.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sasl_checker = test_oper_checker,
+        .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
+        .account_services = &services,
+        .crypto_io = std.testing.io,
+        .session_resume_composite_issuance = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_w = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_w);
+    var watcher = LiveClient{ .fd = fd_w };
+    try writeAllFd(fd_w, "NICK Alice\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&watcher, " 001 Alice ", 200);
+    try writeAllFd(fd_w, "JOIN #ops\r\n");
+    try recvUntil(&watcher, " 366 Alice #ops ", 200);
+    watcher.reset();
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    var fd_a_open = true;
+    defer if (fd_a_open) closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try saslPlainPrelude(fd_a, "admin", "onyx");
+    try writeAllFd(fd_a, "NICK trev\r\nUSER trev 0 * :Trev\r\n");
+    try recvUntil(&a, " 381 trev ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "JOIN #ops\r\n");
+    try recvUntil(&a, " 366 trev #ops ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "SESSION TOKEN\r\n");
+    try recvUntil(&a, "SESSION TOKEN ", 200);
+    const token_marker = "SESSION TOKEN ";
+    const token_start = (std.mem.indexOf(u8, a.written(), token_marker) orelse return error.TestUnexpectedResult) + token_marker.len;
+    const token_tail = a.written()[token_start..];
+    const token_len = std.mem.indexOfScalar(u8, token_tail, '\r') orelse return error.TestUnexpectedResult;
+    var token_buf: [session_resume_credential.local_text_len]u8 = undefined;
+    @memcpy(token_buf[0..token_len], token_tail[0..token_len]);
+    const resume_token = token_buf[0..token_len];
+    closeFd(fd_a);
+    fd_a_open = false;
+    testSleepMs(50);
+
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    var b = LiveClient{ .fd = fd_b };
+    try saslPlainPrelude(fd_b, "admin", "onyx");
+    try writeAllFd(fd_b, "NICK TempOper\r\nUSER webchat 0 * :Webchat\r\n");
+    try recvUntil(&b, " 381 TempOper ", 200);
+    // Join before presenting the exact resume credential — this leaves the
+    // claimant already present in world when restore plans channel replay.
+    try writeAllFd(fd_b, "JOIN #ops\r\n");
+    try recvUntil(&b, " 366 TempOper #ops ", 200);
+    b.reset();
+    var resume_line: [160]u8 = undefined;
+    try writeAllFd(fd_b, try std.fmt.bufPrint(&resume_line, "SESSION RESUME {s}\r\n", .{resume_token}));
+    try recvUntil(&b, "SESSION RESUME: exact session restored", 200);
+    try recvUntil(&watcher, "MODE #ops +Y trev", 200);
 }
 
 test "threaded server: mesh-token local resume restores detached snapshot" {
@@ -113700,8 +113826,8 @@ test "threaded server: fresh EXTERNAL publication failure preserves cap ghost by
     try std.testing.expect(!server.sessions.containsClient("kain", monitorIdFromClient(claimant_id)));
 }
 
-test "threaded server: registration EXTERNAL resumes before oper prefix and applies vhost to siblings" {
-    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+test "threaded server: registration EXTERNAL resume applies oper prefix and vhost to siblings" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x70)), "external-registration");
     defer identity.deinit();
     var server = Server.init(std.testing.allocator, .{
@@ -113759,11 +113885,17 @@ test "threaded server: registration EXTERNAL resumes before oper prefix and appl
         owner_token,
     ));
     try std.testing.expect(server.world.isMember("#root", worldIdFromClient(claimant_id)));
-    try std.testing.expectEqual(@as(usize, 0), countOccurrences(
+    // SASL-oper elevation runs during CAP negotiation, BEFORE registration
+    // completes and the resume restores #root — so the elevation-time
+    // `announceOperPrefixAllChannels` sweep finds the claimant in no channels and
+    // announces nothing. The restore path is therefore the only place the derived
+    // `*` can reach #root's local members; exactly one +Y must land there (the
+    // dedup ring collapses any repeat), for the sibling and the claimant alike.
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(
         owner.send_buf[0..owner.send_len],
         " MODE #root +Y admin",
     ));
-    try std.testing.expectEqual(@as(usize, 0), countOccurrences(
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(
         claimant.send_buf[0..claimant.send_len],
         " MODE #root +Y admin",
     ));
