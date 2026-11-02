@@ -83650,6 +83650,21 @@ test "session replica secured receipt retry does not duplicate retained cipherte
     const ciphertext = try copyTestSendQ(allocator, peer);
     defer allocator.free(ciphertext);
     try pair.b.feed(ciphertext, 475);
+    // The retained ciphertext leads with the RESYNC handshake, which revokes
+    // B's xcap view of A until probes re-complete; an ACK crossing that
+    // refresh is soft-dropped by design (no negative receipt) and the sender
+    // retries it after renegotiation.
+    const dropped = try pair.b.takeInboundV2Acks();
+    defer allocator.free(dropped);
+    try std.testing.expectEqual(@as(usize, 0), dropped.len);
+    try pair.pump(allocator);
+    try std.testing.expect(pair.b.supportsSecureRelayV2());
+    resetTestSendQ(peer);
+    peer.sendq_cap = LinuxServer.s2sSendqCap(default_sendq_cap);
+    try std.testing.expect(server.sendRelayV2AckToPeer(pair.idb.shortId(), relay_id));
+    const retry_ciphertext = try copyTestSendQ(allocator, peer);
+    defer allocator.free(retry_ciphertext);
+    try pair.b.feed(retry_ciphertext, 475);
     const acks = try pair.b.takeInboundV2Acks();
     defer allocator.free(acks);
     try std.testing.expectEqual(@as(usize, 1), acks.len);
@@ -111459,6 +111474,7 @@ test "threaded server: SESSION RESUME oper prefix when claimant already joined b
         .host = "127.0.0.1",
         .port = 0,
         .sasl_checker = test_oper_checker,
+        .allow_plaintext_password_sasl = true,
         .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable,
         .account_services = &services,
         .crypto_io = std.testing.io,
@@ -138127,6 +138143,11 @@ test "receive error diagnostics: handleRecv retains reasons through SEND ownersh
         try server.handleSend(.{ .token = token, .res = @intCast(pending.len), .more = false, .notif = false });
         try std.testing.expect(server.connFor(victim_id) == null);
         try std.testing.expect(server.world.nickOf(worldIdFromClient(victim_id)) == null);
+        // Transport-loss QUITs are retained as local-quit operations and
+        // delivered by the attachment-spool drain on a later owner turn.
+        server.world.lockWrite();
+        _ = server.drainAttachmentSpoolPassLocked();
+        server.world.unlockWrite();
         var expected_quit: [128]u8 = undefined;
         const quit = try std.fmt.bufPrint(&expected_quit, " QUIT :{s}\r\n", .{case.expected});
         try expectContains(observer.send_buf[0..observer.send_len], quit);

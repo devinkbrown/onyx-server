@@ -39,6 +39,9 @@ pub const Event = enum {
 pub const Reason = enum {
     none,
     generic_client_quit,
+    connection_timeout,
+    connection_reset,
+    read_error,
     ping_timeout,
     registration_timeout,
     tls_peer_alert,
@@ -56,6 +59,9 @@ pub const Reason = enum {
 pub fn reasonFromText(reason: []const u8) Reason {
     const known = .{
         .{ "Client quit", Reason.generic_client_quit },
+        .{ "Connection timed out", Reason.connection_timeout },
+        .{ "Connection reset by peer", Reason.connection_reset },
+        .{ "Read error", Reason.read_error },
         .{ "Ping timeout", Reason.ping_timeout },
         .{ "Registration timeout", Reason.registration_timeout },
         .{ "TLS peer alert", Reason.tls_peer_alert },

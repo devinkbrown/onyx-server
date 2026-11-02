@@ -3713,11 +3713,16 @@ test "physical Store S2 every NEW backend failure retains exact OLD and retries"
     std.debug.print("S2 actual NEW allocation failure cuts={d}, every cut retried\n", .{cuts});
 }
 
-test "physical Store S2 all twenty one retirement slots stay charged until source free" {
+test "physical Store S2 all prepared retirement slots stay charged until source free" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var backend = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const owner = try resources.Coordinator.create(std.testing.allocator, storeTestProfile(), .empty, testInstance(12));
+    // The seeded store charges every prepared retirement slot; fund enough
+    // allocation slots/refs for the full prepared capacity.
+    var profile = storeTestProfile();
+    profile.allocation_slots_per_home = 1024;
+    profile.transaction_allocation_refs = 4096;
+    const owner = try resources.Coordinator.create(std.testing.allocator, profile, .empty, testInstance(12));
     defer owner.deinit();
     const before = fixtureCoordinator(owner).fleet.totals;
     var spec = storeTestSpec(owner, tmp, backend.allocator(), backend.allocator(), backend.allocator(), false);
@@ -3727,7 +3732,8 @@ test "physical Store S2 all twenty one retirement slots stay charged until sourc
     defer if (!destroyed) owner.destroyStore(id) catch unreachable;
     const b = fixtureCoordinator(owner);
     const p = &b.participants[id.slot];
-    try std.testing.expectEqual(@as(usize, 21), (try resources.StoreBridge.TestFixture.observe(p.managed.owner.?, owner.storeId(id.slot))).retirement_count);
+    const prepared_capacity = @import("store/contracts.zig").prepared_retirement_capacity;
+    try std.testing.expectEqual(@as(usize, prepared_capacity), (try resources.StoreBridge.TestFixture.observe(p.managed.owner.?, owner.storeId(id.slot))).retirement_count);
     var retired: usize = 0;
     var next = b.components[p.first_component].owned_head;
     while (next != resources.vacant) {
@@ -3735,11 +3741,18 @@ test "physical Store S2 all twenty one retirement slots stay charged until sourc
         if (a.state == .retiring) retired += 1;
         next = a.owner_next;
     }
-    try std.testing.expectEqual(@as(usize, 28), retired); // Seven mutations own two roots.
+    // Seeded pattern: bytes and tables own one root, mutations own two.
+    var expected_retired: usize = 0;
+    for (0..prepared_capacity) |i| expected_retired += if (i % 3 == 1) 2 else 1;
+    try std.testing.expectEqual(expected_retired, retired);
     const old = b.fleet.totals;
     try owner.acquireStore(id);
     const builder = try owner.beginPlan(1);
-    try owner.addStorePlan(builder, id, storeTestAllowances());
+    var allowances = storeTestAllowances();
+    allowances.homes = @splat(.{ .peak = 1024 * 1024, .final = 1024 * 1024, .slots = 1024 });
+    allowances.homes[0].final = 0;
+    allowances.uses = @splat(.{ .charge = 1024 * 1024, .slots = 1024 });
+    try owner.addStorePlan(builder, id, allowances);
     const plan = try builder.finish();
     var retirement: ?usize = null;
     for (b.ownership[0..b.ownership_count], 0..) |entry, i| if (entry.declaration.disposition == .keep_retiring) {
