@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-11-01**. (The 2026-10-23 roll is recorded separately below.) eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-11-02**. (Earlier rolls are recorded separately below.) eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -21,28 +21,30 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-01)
+## Verified fleet baseline (2026-11-02)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.9.0+066d9b8356be-dirty` | `0.9.0+066d9b8356be-dirty` |
-| Executable SHA-256 | `61d218f6682857eed5f3d4bb4007c2d99869fc723810f0df637961a417e5fe02` | same |
-| Process ID at acceptance | `11106` | `2687524` |
+| Running image | `0.9.0+a11610c2215f` | `0.9.0+a11610c2215f` |
+| Executable SHA-256 | `e27177ef9b80c64b815c10d1ecb6aa6285adf0ea5430f9a34544dc342266761a` | same |
+| Process ID at acceptance | `39541` | `2758158` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
 
-This roll enabled `[tls] ktls = "txrx"` on both nodes (cold restarts, local
-first; Helix remains blocked by the WebTransport listener). Both nodes boot-log
-`kTLS TX+RX offload ACTIVE (txrx)` and report `ktls_tx=true, ktls_rx=true`.
-Live acceptance: mesh health smoke green both ways, cross-node chat smoke
-passed, and a fresh TLS guest WHOIS on each node renders
-`671 ... [kTLS: TX+RX]` with the literal address only on `338` (the `320`
-GeoIP/ASN line no longer repeats it). Rollback for this roll:
-`rollback-0.9.0-20261101T155843Z` in each node's runtime directory (previous
-image `0.8.1+066d9b83-dirty`, SHA-256
-`d8772178eda81c28bb5ea4c119ad8dd97da5a77367feb6a8e7401541ef795821`).
+This roll (2026-11-02, source `a11610c2`: all 90 local branches merged into
+main, full gate 11,112 pass / 312 skip / 0 fail) deployed cold restarts, local
+first; Helix remains blocked by the WebTransport listener. It also added the
+now-mandatory `[mesh] presence_store_path = "<runtime>/guest-presence.wal"`
+to both live configs (the merged guest-authority stack fails closed without
+it). Live acceptance: mesh health smoke green both ways and cross-node chat
+smoke passed both directions. Note: local OpenRC reports `starting` (state
+left by the first crashed start before the config fix) while the daemon,
+pidfile, metrics and mesh are all healthy. Rollback for this roll:
+`rollback-0.9.0-20261102T183408Z` in each node's runtime directory (previous
+image `0.9.0+066d9b8356be-dirty`, SHA-256
+`61d218f6682857eed5f3d4bb4007c2d99869fc723810f0df637961a417e5fe02`).
 
 ### Previous roll (2026-10-23, historical)
 
