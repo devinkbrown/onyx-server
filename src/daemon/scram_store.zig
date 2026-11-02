@@ -224,7 +224,7 @@ pub const ScramStore = struct {
         crypto_random.fillOsEntropy(&salt) catch return error.EntropyFailed;
         defer secureZero(&salt);
 
-        try self.storeWithSaltUnlocked(account, password, &salt, self.derivation_iterations);
+        try self.storeWithSaltUnlocked(account, password, &salt, iterations);
     }
 
     /// Derive and store SCRAM credentials using a caller-supplied salt and
