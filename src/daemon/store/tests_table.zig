@@ -731,7 +731,10 @@ test "STORE KvTable batch bounded selectors complete cross family coverage and d
             else => unreachable,
         }
         const result = ticket.commit();
-        store.active_batch.?.count = max_batch_mutations;
+        // Restore the prepared entry count (four), not the batch capacity:
+        // slots past the prepared prefix are uninitialized and must never be
+        // walked by abort cleanup.
+        store.active_batch.?.count = 4;
         store.active_batch.?.entries = entries;
         try std.testing.expectError(StoreError.InvalidTablePlan, result);
         const after = try readWalForTest(tmp, "selectors.wal");
