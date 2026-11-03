@@ -5,13 +5,13 @@
 This runbook describes the shipped tree. For full configuration details, use
 [reference/config.md](reference/config.md) and `etc/onyx-server.reference.toml`.
 
-## Verified fleet baseline (2026-11-01)
+## Verified fleet baseline (2026-11-03)
 
-Both production nodes run `0.9.0+066d9b8356be-dirty` from their
+Both production nodes run `0.9.0+c730d9f37b01` from their
 `onyx-server-run` directories: eshmaki.me under OpenRC
 (`/etc/init.d/onyx-server`), ircx.us under systemd (`onyx-server.service`).
 The executable SHA-256 on both nodes is
-`61d218f6682857eed5f3d4bb4007c2d99869fc723810f0df637961a417e5fe02`.
+`5735c08b3f537ee27b4d0c22ac7a80e96a6efc5b5122ba666f3d8e6ca3be5e61`.
 Loopback metrics show `tcp_active=1`, `links_active=1`, `peers_up=1`,
 `partitioned=0`, and one mesh component on each side. Both nodes run
 `[tls] ktls = "txrx"` and boot-log `kTLS TX+RX offload ACTIVE (txrx)`.
@@ -33,7 +33,10 @@ Onyx Server runs as a long-lived network daemon with:
   upgrades are cold restarts: `rc-service onyx-server restart` on eshmaki.me,
   `systemctl restart onyx-server.service` on ircx.us).
 
-Cold restart is the fallback path and drops sessions. Reload is the normal upgrade path.
+Cold restart is the fallback path and drops physical connections. Saved durable
+account tokens recovered on both nodes after this roll; old composite attachment
+tokens are not promised to survive a cold boundary. Reload preserves connections
+where the listener set permits it.
 Cold restart is also **not crash-durable for the MESSAGE_V2 custody plane** and can lose an
 intermediate node's last un-repaired custody copy — see [Cold Restart](#cold-restart) and the
 [cold-restart durability contract](design/message-v2-exact-once.md#cold-restart-durability-contract).
@@ -41,12 +44,15 @@ intermediate node's last un-repaired custody copy — see [Cold Restart](#cold-r
 ## Build And Stage
 
 ```sh
-zig build check
-zig build test-smoke --summary all
-zig build test-roadmap --summary all
-zig build test-smoke -Doptimize=ReleaseSafe --summary all
+zig build all-checks --summary all
+zig build test -Doptimize=safe --summary all
 zig build package --prefix /tmp/onyx-server-stage
 ```
+
+Use [focused or cached lanes](guide/testing.md) while iterating. The full native
+gates already cover the three test roots; avoid also scheduling overlapping
+roadmap suites without a changed dependency or unresolved failure. Reuse only
+source-bound, independently accepted evidence.
 
 The package step stages:
 
@@ -81,9 +87,10 @@ and exits without binding listeners or dialing mesh peers. Exit `0` on success,
 `1` on any read/parse/preflight error, `2` on usage.
 
 The packaged unit embeds this as `ExecStartPre` so a bad config **fails the start**
-instead of risking a silent fall-through to the built-in DEFAULT identity. Reload
-(`systemctl reload` / SIGUSR2) does **not** re-run `ExecStartPre`; always run
-`--check-config` yourself before a Helix reload when the config or binary changed.
+instead of risking a silent fall-through to the built-in DEFAULT identity. Both
+service kits also validate the candidate before their reload command sends USR2.
+A direct USR2 signal bypasses that check. Successful signal delivery does not
+prove Helix acceptance; verify the resulting runtime and existing clients.
 
 ## First Install
 
@@ -101,15 +108,16 @@ systemctl daemon-reload
 systemctl enable --now onyx-server
 ```
 
-If all listeners use high ports, remove `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
-`CapabilityBoundingSet=CAP_NET_BIND_SERVICE` from the unit.
+The unit ships with empty capability sets for high-port listeners. For ports below
+1024, review a drop-in granting only `CAP_NET_BIND_SERVICE`; see
+[service management](guide/service-management.md).
 
 For a public HTTPS / `wss` node, follow the [Production TLS card](guide/tls.md#production-tls-card)
 before opening the listeners.
 
 ## Hot Upgrade
 
-> **Current fleet (2026-11-01):** Helix reload is blocked on both production
+> **Current fleet (2026-11-03):** Helix reload is blocked on both production
 > nodes by the configured WebTransport listener (`[listen].webtransport = 4433`).
 > Production upgrades there are cold restarts, one node at a time:
 > `sudo rc-service onyx-server restart` (eshmaki.me, OpenRC) and
@@ -127,7 +135,7 @@ install -m 0755 /tmp/onyx-server-stage/bin/onyx-server /usr/local/bin/onyx-serve
 systemctl reload onyx-server
 ```
 
-`ExecReload=/bin/kill -USR2 $MAINPID` asks the live daemon to re-exec in place. The
+After candidate validation, `ExecReload=/bin/kill -USR2 $MAINPID` asks the live daemon to re-exec in place. The
 successor inherits every per-shard `SO_REUSEPORT` listener and attempts to reattach
 live client, TLS, WebSocket, session-registry, and secured-mesh state from the sealed
 Helix arena. The process PID remains under systemd control; systemd does not see a

@@ -122,6 +122,15 @@ zig build test -- --timings-profile=<new-profile.json>
 Ordinary later `zig build test` runs reuse local complete profiles automatically.
 Failed, interrupted, partial, or hash-mismatched evidence cannot produce a hint.
 
+On 2026-11-03, the complete Debug `all-checks` gate fell from 1,327.794 seconds
+to 944.273 seconds (22.1 to 15.7 minutes, 28.9% lower elapsed time) after the
+combined test changes. Independent review verified every previous test name plus
+two new TLS controls: 11,236 passed, 313 skipped, zero failures/leaks/log errors.
+This is a shared-host comparison, not an isolated scheduler benchmark. Cold
+ReleaseSafe LLVM compilation remains expensive; cached runtime selection and
+stable test metadata avoid repeating it for each filter or documentation commit.
+See the [release and test-speed audit](../audit/release-and-test-speed-2026-11-03.md).
+
 
 Run from the repository root: tests need `src/`, `etc/`, and `tools/bogo/` fixtures.
 Linux resource inspection found ephemeral bound listener ports and process-local

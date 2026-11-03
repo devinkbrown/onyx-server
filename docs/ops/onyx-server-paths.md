@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-11-02**. (Earlier rolls are recorded separately below.) eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-11-03**. (Earlier rolls are recorded separately below.) eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -14,24 +14,45 @@ substitutes for this table.
 | **Service** | OpenRC `/etc/init.d/onyx-server` | systemd `onyx-server.service` |
 | **Binary** | `/home/kain/onyx-server-run/onyx-server` | `/home/trev/onyx-server-run/onyx-server` |
 | **Config** | `/home/kain/onyx-server-run/onyx-server.local.toml` | `/home/trev/onyx-server-run/onyx-server.local.toml` |
-| **WorkingDirectory** | `/home/kain/onyx-server-run` | `/home/trev/onyx-server-run` |
+| **WorkingDirectory** | `/home/kain/onyx-server-run/service-state` (`0700`) | `/home/trev/onyx-server-run` |
 | **Metrics** | `http://127.0.0.1:9130/metrics` | same (loopback) |
 | **TLS IRC** | `:6697` | `:6697` |
 | **WSS** | `:8080` | `:8080` |
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-02)
+## Verified fleet baseline (2026-11-03)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.9.0+a11610c2215f` | `0.9.0+a11610c2215f` |
-| Executable SHA-256 | `e27177ef9b80c64b815c10d1ecb6aa6285adf0ea5430f9a34544dc342266761a` | same |
-| Process ID at acceptance | `39541` | `2758158` |
+| Running image | `0.9.0+c730d9f37b01` | `0.9.0+c730d9f37b01` |
+| Executable SHA-256 | `5735c08b3f537ee27b4d0c22ac7a80e96a6efc5b5122ba666f3d8e6ca3be5e61` | same |
+| Process ID at acceptance | `34450` (supervisor `34449`) | `2818026` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
+
+The artifact is built from clean source `c730d9f37b017a3e4c0a400c19cfa482a5198562`
+and reproduces byte-for-byte. Service kits include the correction in `6131c4de`.
+Local OpenRC now uses `supervise-daemon`; peer systemd uses the canonical sandbox
+with an explicit host-path/account override. Both hosts preserve `UMask=0022`
+for their public status/backup feeds; packaged defaults remain private.
+
+Both cold restarts recovered durable account tokens issued before deployment.
+Four TLS clients then passed channel/DM exact-event checks, matching message IDs
+and timestamps, local exact attachment resume, and peer redirect followed by
+origin resume. This does not establish arbitrary-node exact attachment restore
+or continuity of old composite tokens across cold restart. Helix remains blocked
+by WebTransport. See the [release and testing audit](../audit/release-and-test-speed-2026-11-03.md).
+
+The peer's first candidate start disabled TLS: systemd's separate
+`RestrictSUIDSGID` filter rejected `openat2` with `ENOSYS`. The peer was restored
+before diagnosis. An isolated A/B probe and all seven native service checks
+verified the corrected unit before retry. Its remaining sandbox is retained;
+see [service management](../guide/service-management.md).
+
+### Previous roll (2026-11-02, historical)
 
 This roll (2026-11-02, source `a11610c2`: all 90 local branches merged into
 main, full gate 11,112 pass / 312 skip / 0 fail) deployed cold restarts, local
