@@ -14,26 +14,22 @@ run is the one from source.
 | `zig build package --prefix <dir>` | staged daemon + reference config + target-specific deployment assets | Production install from a built tree |
 | `packaging/release.sh` | `dist/onyx-server-<version>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance | Reproducible attested static binary |
 
-Current source version is **0.8.0** (`build.zig.zon`). The first verified
-prebuilt on GitHub remains the public
-[`v0.5.6` Release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
-The verified fleet is still `0.7.0+ae78d490`. Build locally with
-`packaging/release.sh` for **0.8.0**. The full test suite has not been
-re-run green on this manifest.
-It includes the static musl binary, quickstart config, checksum manifest,
-CycloneDX SBOM, and provenance statement. The manifest is reproducible and was
-download-smoked through IRC and WebSocket before publication. It is **not yet
-cryptographically signed**, so verify the checksum and provenance and use the
-source rebuild path below when your threat model requires independent trust.
-There is still no published registry image; Docker remains build-from-source.
+Current source version is **0.9.0**, declared by `build.zig.zon`. Build a
+candidate from a clean checkout and verify its exact source/compiler inputs
+with the release scripts. The accepted production artifact, service-kit revision,
+full Debug/ReleaseSafe results and native multi-client acceptance are recorded
+in the [current release audit](../docs/audit/release-and-test-speed-2026-11-03.md).
+The [production paths](../docs/ops/onyx-server-paths.md) page owns current node,
+supervisor, version and executable-hash facts. A new local build is a separate
+candidate until its gates and intended-host acceptance pass.
 
-The live fleet is tracked separately from the public artifact channel: on
-2026-09-06 both production nodes were verified on `0.7.0+ae78d490` under
-`onyx-server.service` (artifact SHA-256
-`0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c`). The
-checkout can advance beyond that deployed image; consult
-[`docs/ops/onyx-server-paths.md`](../docs/ops/onyx-server-paths.md) for the
-current runtime evidence before replacing a binary.
+Public download assets have their own version, signatures and evidence. The
+[`v0.5.6` release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6)
+is a historical unsigned publication; it is not the current source or deployed
+artifact. The historical publication procedure is retained below. Check an
+asset's own manifest and verify any configured signer before using it. The
+repository's [Dockerfile](Dockerfile) builds from a locally prepared release
+artifact; it does not establish a published registry image.
 
 The daemon binary is always **`onyx-server`**. The release script only prefixes a
 version and target on the *artifact filename*
@@ -51,42 +47,37 @@ onyx-server --check-config /etc/onyx-server/onyx-server.toml
 
 `--check-config` is a real flag (`src/main.zig`): parse + preflight, print
 `config OK` / `config ERROR`, exit. No listeners, no mesh dial. The packaged
-systemd unit runs it as `ExecStartPre` so a bad config fails the start instead of
-risking a silent fall-through to the built-in DEFAULT identity.
+supervisor kits run it before startup and before a Helix reload request.
+The daemon itself also refuses an explicitly named unreadable or invalid config.
+Preflight does not prove that the service sandbox permits reactor creation,
+certificate loading or every intended listener; verify real runtime readiness.
 
 ## Quickstart (native)
 
-**Build current (0.8.0):**
+**Build current source (0.9.0):**
 
 ```sh
 packaging/release.sh
-./dist/onyx-server-0.8.0-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
-./dist/onyx-server-0.8.0-x86_64-linux-musl packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.9.0-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.9.0-x86_64-linux-musl packaging/onyx-server.quickstart.toml
 ```
 
-**Or download the latest published GitHub Release (v0.5.6):**
+For a prebuilt download, use the asset version and checksum manifest from the
+chosen GitHub Release. Do not guess a latest version from this guide or treat
+an old public artifact as the current fleet release. Independent reproduction
+requires the matching source commit, complete compiler distribution and build
+metadata described below.
 
-```sh
-release=https://github.com/devinkbrown/onyx-server/releases/download/v0.5.6
-curl -fLO "$release/onyx-server-0.5.6-x86_64-linux-musl"
-curl -fLO "$release/onyx-server.quickstart.toml"
-curl -fLO "$release/SHA256SUMS"
-grep ' onyx-server-0.5.6-x86_64-linux-musl$' SHA256SUMS | sha256sum -c -
-chmod +x onyx-server-0.5.6-x86_64-linux-musl
-./onyx-server-0.5.6-x86_64-linux-musl --check-config onyx-server.quickstart.toml
-./onyx-server-0.5.6-x86_64-linux-musl onyx-server.quickstart.toml
-```
-
-Once the process is running, the daemon itself is up quickly (typically well
-under a second to bind listeners on a warm host). That is **boot** time, not
-clone/build/DNS/ACME time.
+After startup, verify actual IRC/WebSocket registration and PONG. Build,
+service state and listener presence are separate from client readiness.
 
 - **`ws://localhost:8080`** — the browser WebSocket endpoint for the Onyx web client.
 - **`irc://localhost:6667`** — plaintext IRC for any IRC client.
 
-The node's **sovereign identity key** (`onyx-server-node.key`) and the account store
-(`accounts.db`) are generated in the working directory on first run — nothing to
-configure for local evaluation. For production, see [Production TLS card](#production-tls-card).
+The node identity key (`onyx-server-node.key`) is loaded or generated beside
+the selected config. The quickstart account store (`accounts.db`) resolves from
+the working directory. Preserve both across subsequent starts; choose private
+paths and stable node identity before joining a production mesh. For production, see [Production TLS card](#production-tls-card).
 
 ## Quickstart (Windows)
 
@@ -102,7 +93,8 @@ ReleaseFast executable in `bin/` and the reference and quickstart configs in
 ## Quickstart (Docker)
 
 ```sh
-packaging/release.sh                                   # build the verified static binary → dist/
+packaging/release.sh                                   # build a candidate → dist/
+packaging/verify-release.sh dist/SHA256SUMS              # independent reproduction
 docker build -f packaging/Dockerfile -t onyx-server:latest .
 docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
@@ -137,73 +129,29 @@ host-runtime recovery boundary.
 
 ## Production TLS card
 
-Local quickstart is plaintext on purpose. A **public** node needs DNS, TLS, and
-`wss`. Checklist (single node; mesh is a later rung — see `docs/guide/mesh.md`):
-
-| Step | What to do |
-|---|---|
-| 1. DNS | Point `A`/`AAAA` for your hostname at the host. |
-| 2. Ports | Open client TLS (`6697/tcp` by default). For ACME HTTP-01, arrange port 80 reachability (daemon `challenge_port` + reverse proxy is the usual pattern). |
-| 3. Paths | Put cert/key PEMs on durable paths (e.g. `/etc/onyx-server/tls/{cert,key}.pem`), mode `0640` / `0600` on the key. |
-| 4. Config | Enable `[tls]` with `cert_path`/`key_path`/`dns_name`. Enable `[acme]` when using the built-in client. Set `[listen] ws_plain = false`. Set a real `[network].server_name`. |
-| 5. Preflight | `onyx-server --check-config /path/to.toml` must print `config OK`. |
-| 6. Run under systemd | Prefer the unit in `etc/systemd/onyx-server.service` (`ExecStartPre=… --check-config …`). Day-2 upgrade is `systemctl reload` (Helix), not a blind restart. |
-
-Minimal production sketch (fill in host, email, and paths):
-
-```toml
-[network]
-name = "Onyx"
-server_name = "irc.example.net"
-
-[listen]
-host = "::"
-irc = 6667          # optional plaintext; many operators fire-wall this off
-ws = 8080
-ws_plain = false    # browsers need wss for a public client
-
-[tls]
-enabled = true
-port = 6697
-cert_path = "/etc/onyx-server/tls/cert.pem"
-key_path = "/etc/onyx-server/tls/key.pem"
-dns_name = "irc.example.net"
-
-[sts]
-enabled = true
-duration = 2592000
-port = 6697
-
-[acme]
-enabled = true
-directory_url = "https://acme-v02.api.letsencrypt.org/directory"
-domain = "irc.example.net"
-contact = "mailto:admin@example.net"
-# challenge_port = 14402   # loopback HTTP-01; reverse-proxy 80 → this port
-```
-
-Self-signed bootstrap (enabled `[tls]` with no cert/key paths) is fine for **local**
-eval only. Do not point a public web client origin at a self-signed leaf and call
-it production. Full field reference: `docs/guide/tls.md`, `docs/reference/config.md`,
-`etc/onyx-server.reference.toml`.
+Use the [canonical TLS/STS guide](../docs/guide/tls.md#production-tls-card)
+for public DNS, trusted certificate paths, ACME, `wss`, optional TLS 1.2 and
+kTLS behavior. The packaged quickstart binds plaintext IRC/WebSocket on `::`;
+it is an evaluation config, not a public TLS deployment. Replace it with your
+reviewed node-specific configuration and verify real hostname-checked TLS.
+Keep certificate/key access compatible with the intended service account and
+sandbox; a static config check is a separate gate from certificate loading.
 
 ## systemd (production UX)
 
-The source unit is `etc/systemd/onyx-server.service` (also staged by
-`zig build package` under `lib/systemd/system/onyx-server.service`):
+OpenRC is the equivalent supported kit for Alpine and other OpenRC hosts.
 
-```ini
-ExecStartPre=/usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
-ExecStart=/usr/local/bin/onyx-server /etc/onyx-server/onyx-server.toml
-ExecReload=/bin/kill -USR2 $MAINPID
-```
+Linux `zig build package` stages both supervisor kits. Install the kit for the
+host's init system, provision its account/private state and preserve existing
+operator overrides. Defaults and complete installation/reload/sandbox commands
+live in [service management](../docs/guide/service-management.md). In particular,
+reload validates the staged candidate before sending USR2, and request delivery
+is separate from Helix completion.
 
-- **Cold start / restart** runs `ExecStartPre` first — bad TOML or preflight failure
-  keeps the previous unit state from being replaced by a DEFAULT-identity daemon.
-- **`systemctl reload onyx-server`** is the normal upgrade path (Helix / SIGUSR2;
-  sessions kept). Reload does **not** re-run `ExecStartPre`; always
-  `--check-config` yourself before reloading after a config change.
-- Install steps and hardening notes: `docs/RUNBOOK.md`.
+The [release runbook](../docs/RUNBOOK.md) owns compatibility, custody, cold-restart
+impact, recovery and rollback order. [Production paths](../docs/ops/onyx-server-paths.md)
+owns installed host paths and current deployment constraints. Staging a package
+neither installs nor enables a service and does not accept its runtime.
 
 ## Connecting the web client
 
@@ -262,31 +210,36 @@ present, re-checks them against the manifest to catch post-publish tampering.
 
 `release.sh` cosign-signs `SHA256SUMS` when a signer is configured
 (`COSIGN_KEY=<key>` for a key file, or keyless `COSIGN_EXPERIMENTAL=1` under CI
-OIDC), producing `SHA256SUMS.sig`. `verify-release.sh` checks it when
-`COSIGN_PUBKEY` is set. If `cosign` is not installed or no signer is configured,
-signing is **skipped with a note** — the release still builds and verifies.
+OIDC), producing `SHA256SUMS.sig`. For key-based verification, set `COSIGN_PUBKEY`.
+For keyless verification, retain the emitted bundle and set both
+`COSIGN_IDENTITY` and `COSIGN_OIDC_ISSUER`. A signature that is present but
+not checked because the verifier or expected identity is absent is reported
+as unverified; a checksum/rebuild pass does not authenticate its signer. If no signer is configured, release generation explicitly skips signing.
+If a signer is configured and `cosign` is missing or signing fails, generation
+fails; it does not silently publish an unsigned substitute.
 
 ### SBOM (CycloneDX)
 
-`onyx-server.cdx.json` is a CycloneDX 1.5 SBOM — and it fits on one screen, because the
-component graph is a single binary with **zero external dependencies**. The only
-thing recorded is the Zig toolchain that produced it, as a build *tool* (not a
-runtime component). That is the whole security pitch: the software bill of
-materials is effectively one line.
+`onyx-server.cdx.json` records the daemon and its Zig compiler as CycloneDX 1.5
+metadata. The Linux static artifact has no separately packaged runtime libraries.
+This emitted inventory does not audit the compiler distribution or replace
+source, signature, reproducibility and intended-host acceptance checks.
 
 ### Provenance (SLSA v1 shape)
 
 `onyx-server.provenance.json` is an in-toto Statement carrying an SLSA-provenance-v1
 predicate. It records **what** was built (the artifact + its sha256), **from
 what** (repo, ref, full commit), **how** (the exact `zig build …` command +
-toolchain version), and **by whom** (the `release.sh` builder id). Because it is
-listed in `SHA256SUMS`, the cosign signature authenticates it — the local-builder
-equivalent of SLSA L2. Running the identical steps on a hosted runner (e.g. the
-`slsa-github-generator` GitHub Action with an isolated builder identity) is what
-elevates this to *true* SLSA L2/L3; the field shapes here are drop-in compatible
-with that upgrade.
+toolchain version), and **by whom** (the `release.sh` builder id). When a verified cosign signature covers `SHA256SUMS`, it also authenticates
+the recorded provenance file's integrity. A local provenance statement and a
+signature alone do not establish a SLSA build level or an isolated trusted
+builder. Assess the actual builder, signer identity and release process separately.
 
-## A10 — First public GitHub Release (completed 2026-07-20)
+## Historical first public GitHub Release (2026-07-20)
+
+This section preserves the executed publication record for `v0.5.6`. Its
+checks, asset names and unsigned status belong to that release; use the
+current release scripts and new acceptance evidence for a new publication.
 
 The human-authorized release is public at
 [`v0.5.6`](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
@@ -305,4 +258,5 @@ The executed gate was:
 
 All seven steps passed. The release remains deliberately labeled unsigned until
 a cosign identity is configured; checksum, SBOM, provenance, reproducibility,
-and download smoke are current evidence, not a substitute for a signature.
+and download smoke are historical evidence for that artifact, not a substitute
+for a verified signer or fresh acceptance of a different image.

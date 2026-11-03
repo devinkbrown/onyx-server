@@ -186,8 +186,8 @@ operator sets it to `0`.
 ## Rotatable cloak key
 
 The cloak key is derived at boot from `[cloak] secret` by **argon2id**, not a
-bare `SHA256(secret)` ([src/main.zig:491](../../src/main.zig),
-[deriveKey in src/crypto/argon2_kdf.zig:130](../../src/crypto/argon2_kdf.zig)).
+bare `SHA256(secret)` ([src/main.zig](../../src/main.zig),
+[deriveKey in src/crypto/argon2_kdf.zig](../../src/crypto/argon2_kdf.zig)).
 The secret is stretched with the memory-hard KDF (64 MiB / t=2 / p=1,
 `default_params`) under a fixed domain-separation salt
 `onyx/cloak-key/argon2id/v1` (`cloak_key_salt`). The whole cloak security model
@@ -211,7 +211,7 @@ client's cloak reshuffles once: the derived key changed. Pre-upgrade host/subnet
 WARD bans on the old SHA-256 cloaks do **not** carry over — they were computed
 under a key the daemon can no longer reproduce, so the `previous_secret` grace
 window applies only to *future* rotations under this argon2id KDF, not to the
-SHA-256 → argon2id transition itself ([src/main.zig:480](../../src/main.zig)).
+SHA-256 → argon2id transition itself ([src/main.zig](../../src/main.zig)).
 
 New cloaks always use the primary key. But bans written under the old key
 reference old host/mask tokens, so `enforceWard`
@@ -308,10 +308,10 @@ meshed node with no shared secret, each node derives its own random per-boot key
 so cloaked hosts differ per node and change on restart — `*!*@<cloak>` and subnet
 WARD bans neither federate across the mesh nor survive a restart.
 `--check-config` **hard-errors** on this: `meshCloakSecretMissing`
-([src/daemon/config_format.zig:829](../../src/daemon/config_format.zig)) is true
+([src/daemon/config_format.zig](../../src/daemon/config_format.zig)) is true
 when the node is meshed (`[mesh] connect` set **or** `[listen] s2s` set) and
 `[cloak] secret` is null, and `main.zig` refuses to boot
-([src/main.zig:192](../../src/main.zig)).
+([src/main.zig](../../src/main.zig)).
 
 
 ## Public history and operator comparison
@@ -321,10 +321,9 @@ that historical public identity through later cloak rotations. Invalid or absent
 visible storage uses a generic host and cannot fall back to the real address.
 Account numerics retain their existing public-account meaning. Existing history
 is local and is not currently transferred through process exec; older running
-images retain their own behavior until upgraded.
+images must be assessed separately from the current accepted fleet.
 
 For planned changes, operators can compare locally available configuration with
-`onyx-server doctor <config> --peer-config <peer-config> [--json]`. The
-[comparison guide](../ops/doctor-cloak-comparison-2026-10-27.md) explains the fixed
-categories and their scope. Results describe those resolved configurations;
+`onyx-server doctor <config> --peer-config <peer-config> [--json]`. The [diagnostics guide](../guide/diagnostics.md) explains the command and its
+configuration-only scope. Results describe those resolved configurations;
 runtime observations remain unknown until separately measured.

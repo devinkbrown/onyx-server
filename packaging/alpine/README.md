@@ -1,5 +1,11 @@
 # Alpine signed package candidate
 
+This is an isolated signed-APK development profile, not the accepted production
+installation procedure. Use [Alpine operation](../../docs/guide/alpine.md) and
+[service management](../../docs/guide/service-management.md) for the canonical
+OpenRC kit. Production acceptance is tracked in [production paths](../../docs/ops/onyx-server-paths.md);
+none of its results automatically accepts this candidate profile.
+
 Build APKv3 only inside the disposable offline Alpine guest with a newly built
 binary and an explicit ephemeral signing key. The v10 adapters require the
 binary's `ONYX_HELIX_BOOT_POLICY=1` capability. Changed binaries and helpers
@@ -58,3 +64,7 @@ checks the private capture. No generic timeout result establishes success.
 Source review, fresh signed native execution and strict startup/Helix acceptance
 remain required. This private candidate makes no full A04, crash rollback,
 repository trust-distribution, release or deployment claim.
+
+Source of truth: `make-apk.sh`, `identity-guard`, `runtime-preflight`,
+`guarded-start`, `upgrade.sh`, and the binary's typed service-identity preflight.
+Re-run the complete disposable guest profile whenever those inputs change.

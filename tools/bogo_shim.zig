@@ -3,7 +3,7 @@
 
 //! Standalone BoGo shim — the onyx-side adapter that lets BoringSSL's
 //! `ssl/test/runner` protocol-test suite ("BoGo") drive onyx's from-scratch
-//! Yoroi TLS stack. Roadmap 0.3 (design: `docs/dev/tls-design/bogo.md`).
+//! Armor TLS stack. Current workflow: `docs/guide/testing.md`.
 //!
 //! Per test, BoGo stands up a Go TLS peer on a loopback TCP port and spawns this
 //! shim with a `-flag [value]` argv describing the case. The shim always DIALS

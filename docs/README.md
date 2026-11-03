@@ -1,146 +1,63 @@
 # Onyx Server documentation
 
-*The complete guide, architecture, and reference for the Onyx Server IRC daemon — grounded in, and cited against, the live source.*
+Use the task index below to reach the current contract. The source manifest is
+**0.9.0**; the accepted November 3 deployment and its exact artifact/service
+identity live in [production status](ops/onyx-server-paths.md). Source, running
+image, public release tag and proposed work are separate facts.
 
-Onyx Server is a pure-Zig (0.17-dev) clean-room IRC daemon, built from first principles — not a
-clone of any prior daemon. It speaks IRCv3 + IRCX, runs a custom Undertow CRDT mesh with
-forward-secret Mooring server links, and ships its own pure-Zig TLS (Armor), media codecs
-(CadenceVox/CadenceVis), and in-place upgrade (Helix).
+## Start with your task
 
-**Current source/live distinction:** the source manifest is **0.9.0**
-(`build.zig.zon`), and as of 2026-11-01 both production nodes run the deployed
-`0.9.0+066d9b8356be-dirty` artifact (eshmaki.me under OpenRC, ircx.us under
-systemd) with `[tls] ktls = "txrx"` active. Older version records below and in
-release notes are historical.
-See the [canonical production paths and evidence](ops/onyx-server-paths.md) before
-day-2 operations; this page does not establish the current fleet image or tag.
-Source version, deployed image, and public tag stay separate claims. The full
-test-suite status for the current candidate is recorded in the dated
-[release preparation report](ops/release-preparation-cloaking-2026-10-26.md).
+| Task | Start here | Detailed reference |
+|---|---|---|
+| Understand what the server supports | [Feature index](reference/features.md) | [Commands](reference/commands/_index.md), [configuration](reference/config.md), [capabilities](reference/protocol/caps.md) |
+| Run a first node | [Quickstart](guide/00-quickstart.md) | [Build](guide/build.md), [setup plans](guide/setup.md), [guide index](guide/README.md) |
+| Operate a public service | [Runbook](RUNBOOK.md) | [Service kits](guide/service-management.md), [TLS](guide/tls.md), [operator guide](guide/operators.md) |
+| Link nodes or investigate disconnects | [Mesh guide](guide/mesh.md) | [Disconnect diagnosis](ops/client-disconnects.md), [diagnostics](guide/diagnostics.md), [operations index](ops/README.md) |
+| Configure accounts, history or media | [Feature index](reference/features.md) | [Account commands](reference/commands/accounts-services.md), [messaging](reference/commands/messaging.md), [media](architecture/03-media.md) |
+| Develop or review a change | [Development guide](development.md) | [Source map](architecture/source-modules.md), [testing](guide/testing.md), [contributing](../CONTRIBUTING.md) |
+| Understand architecture and invariants | [Architecture overview](architecture/00-overview.md) | [Mesh security](architecture/mesh-security.md), [credentials](reference/credential-domains.md), [Helix](architecture/04-upgrade-wasm.md) |
+| Package or verify a release | [Packaging](../packaging/README.md) | [Runbook](RUNBOOK.md), [release verification](audit/release-and-test-speed-2026-11-03.md) |
+| Maintain these documents | [Maintenance rules](MAINTENANCE.md) | `python3 -B tools/check_docs.py` |
 
-The current daemon surface includes `[class.*]` connection classes for registration-time
-resource/admission/flood policy, bounded growable SendQ and RecvQ, optional nick-delay
-holds against camping, and live operator introspection through `STATS Y`, `STATS l`, and
-richer `INFO`.
+## Public contracts
 
-**Documentation baseline:** source manifest **0.9.0**, deployed fleet
-`0.9.0+066d9b8356be-dirty` (2026-11-01). Current paths,
-executable hash, and mesh gauges are kept in
-[the production evidence table](ops/onyx-server-paths.md). Release notes,
-audits, and checkpoint files keep their historical snapshots. Living
-architecture and reference pages describe the source contract, including
-where that contract is not yet suite-green.
+The [feature index](reference/features.md) groups supported surfaces and points
+to their behavior, controls, limits and source owners. The detailed references
+are authoritative for syntax and policy:
 
-**New here?** Start with the [Quickstart](guide/00-quickstart.md), then the
-[architecture overview](architecture/00-overview.md). The
-[codename glossary](reference/glossary.md) decodes the mythos vocabulary
-(Undertow, Mooring, Ripple, Helix, Armor, …).
+- [IRC command index](reference/commands/_index.md), [IRCv3 profile](reference/ircv3.md)
+  and [IRCX reference](reference/ircx/README.md).
+- [Host command line](reference/server-cli.md) and [Armor toolkit](reference/armor-cli.md).
+- [Configuration](reference/config.md) and the
+  [annotated TOML](../etc/onyx-server.reference.toml).
+- [Modes](reference/protocol/modes.md), [numerics](reference/protocol/numerics.md),
+  [ISUPPORT](reference/protocol/isupport.md) and [capabilities](reference/protocol/caps.md).
+- [Credential domains](reference/credential-domains.md),
+  [host cloaking](reference/host-cloaking.md), [Web Push](reference/web-push.md)
+  and [native media authentication](reference/native-media-mac.md).
+- [Reusable sessions](design/session-resume-anywhere-blueprint.md),
+  [MESSAGE_V2 exact-once transaction](design/message-v2-exact-once.md), and
+  [Event Spine v2](design/event-spine-mesh-v2.md).
 
-## Operations
+The [glossary](reference/glossary.md) maps Undertow, Mooring, Armor, Helix,
+Ringlane and the other subsystem names to source.
 
-- [Client disconnect diagnosis](ops/client-disconnects.md) — receive reasons, Linux keepalive policy, and upgrade limits
-- [Runbook](RUNBOOK.md) — staging, systemd install, config validation, hot-upgrade, rollback, health checks
-- [Cloaking release preparation (2026-10-26)](ops/release-preparation-cloaking-2026-10-26.md) — candidate changes, verification, and migration/release limits
-- [Contributing](../CONTRIBUTING.md) — source-of-truth workflow, build/test lanes, PR checklist
-- [Security policy](../SECURITY.md) — private vulnerability reporting
+## Status, evidence and proposed work
 
-## Guides
+Read [NEWS](../NEWS.md) for changes and
+[production status](ops/onyx-server-paths.md) for the accepted running fleet.
+The [latest release/test-speed report](audit/release-and-test-speed-2026-11-03.md)
+records counts, timings, reproduction and acceptance limits. Native platform
+claims require their own evidence; a compiler pass is not a running-system test.
 
-- [Quickstart](guide/00-quickstart.md) — build, configure, and run in minutes
-- [Building](guide/build.md) — build targets and cross-compilation
-- [Alpine Linux](guide/alpine.md) — musl builds, staged OpenRC supervision, and readiness
-- [Installation preview](guide/setup.md) — validated setup plans in text or JSON, without applying changes
-- [Redacted preflight diagnostics](guide/diagnostics.md) — shared text/JSON checks, metric semantics, and readiness limits
-- [Testing](guide/testing.md) — focused test lanes, smoke gates, and deterministic assurance
-- [TLS](guide/tls.md) — the Armor stack, certificates, and mTLS
-- [Operators](guide/operators.md) — SASL-only operator setup and tooling
-- [Mesh / S2S linking](guide/mesh.md) — linking nodes into an Undertow mesh
-- [In-place upgrade](guide/upgrade.md) — session-preserving `USR2` hot-upgrades
-- [Persistence](guide/persistence.md) — the OroStore key/value store
+Dated [audits](audit/README.md), [developer records](dev/README.md), and old
+operational reports retain their original evidence. Obsolete overlapping plans
+have been retired from the active tree and are recoverable through the
+[archive index](MAINTENANCE.md#retired-documents). Their old versions, counts and TODOs do not
+establish current behavior.
 
-## Architecture
-
-- [Overview](architecture/00-overview.md) — subsystems, request flow, source map
-- [Reactor & threading](architecture/01-reactor-threading.md) — `io_uring` and sharded workers
-- [World, dispatch & modules](architecture/02-world-dispatch-modules.md) — the SerpentRegistry command system
-- [Source-module ownership](architecture/source-modules.md) — facade boundaries, canonical owners, and extraction checks
-- [DNS](architecture/dns.md) — bounded resolution, worker deadlines, validation, and cache policy
-- [Mesh & S2S](architecture/mesh-s2s.md) — Undertow CRDT, links, partition detection, oper-grant sharing
-- [Mesh security](architecture/mesh-security.md) — threat model, AEAD record layer, origin signing, media capabilities
-- [Cryptography](architecture/crypto.md) — the Mooring handshake, Armor, signing, sealed tokens
-- [Media](architecture/03-media.md) — SFU, transport stack, codecs, WASM shims
-- [Upgrade & WASM host](architecture/04-upgrade-wasm.md) — Helix in-place upgrade, OroWasm plugins
-- [Event Spine](architecture/event-spine.md) — typed operator/observer events: subscription, severity, replay, stats, flood-collapse
-- [Observability & stats](architecture/observability-stats.md) — channel-statistics engine and the public `status.json` mesh-health feed
-
-## Design notes & TLS development
-
-Forward-looking design and hardening docs. These describe *intent and gap
-analysis*, not necessarily shipped behavior — where they disagree with the
-architecture and reference docs above (verified against code), those are
-authoritative.
-
-- [Integrated delivery roadmap (2026-10-26)](ROADMAP-2026-10-26.md) — cloaking, setup wizard, usability, session tokens, media, mesh, Alpine, and measured efficiency (plan)
-- [Roadmap delivery waves](ops/roadmap-wave-execution-2026-10-26.md) — implementation cuts, ownership boundaries, and reusable gate evidence
-- [Onyx client integration outline](design/onyx-client-integration-2026-10-26.md) — client journeys, server contracts, rollout order, and acceptance (plan; client source not audited)
-- [Session-control candidate contract](reference/protocol/onyx-session-control.v1.json) — typed mesh inventory/revocation fields, credential separation, and open scale/retirement limits
-- [Credential domains](reference/credential-domains.md) — source-scoped issuers, lifetimes, replay boundaries, and explicit inventory gaps (candidate audit)
-- [Native chat SQPOLL measurements](ops/live-chat-sqpoll-benchmark-2026-10-26.md) — optimized Alpine corpus, exact deliveries, CPU/latency tradeoffs, and open regression budget
-- [TLS hardening roadmap](dev/tls-roadmap.md) — gap analysis vs. BoringSSL/WolfSSL, with DONE/TODO status (EMS-required, HRR pinning, 0-RTT freshness window, ECH `retry_configs`)
-- [BoGo interop](dev/tls-design/bogo.md) — the BoringSSL test-suite shim and coverage
-- [Certificate compression](dev/tls-design/cert-compression.md) — RFC 8879 `compress_certificate`
-- [kTLS](dev/tls-design/ktls.md) — kernel-offload TLS 1.3 design
-- [OCSP stapling](dev/tls-design/ocsp-stapling.md) — must-staple, freshness, delegated responders
-- [E2EE Everywhere (Kintsugi)](design/e2ee-everywhere-blueprint.md) — group/channel end-to-end encryption blueprint (design)
-- [Adversarial exploit-suite blueprint](research/exploit-suite-blueprint.md) — the direction for a `test-exploit` fail-closed attack harness (`src/security/exploit/`) (research/design)
-- [TLS/SSL library comparison](research/tls-ssl-library-comparison.md) — OpenSSL/BoringSSL/LibreSSL/mbedTLS/wolfSSL governance, licensing, CVE history (external-library background, not an Armor evaluation) (research)
-- [Zig 0.17 porting notes](dev/zig016-notes.md) — language/stdlib migration notes
-
-## Command reference
-
-- [Index](reference/commands/_index.md) — every command, one line each
-- [Connection & registration](reference/commands/connection.md)
-- [Messaging](reference/commands/messaging.md)
-- [Channels](reference/commands/channels.md)
-- [Queries](reference/commands/queries.md)
-- [Informational](reference/commands/informational.md) — `INFO`, `STATS Y`, `STATS l`
-- [Operator & moderation](reference/commands/oper-moderation.md)
-- [Mesh operations](reference/commands/mesh-ops.md)
-- [Accounts & services](reference/commands/accounts-services.md)
-- [IRCX](reference/commands/ircx.md)
-- [Media](reference/commands/media.md)
-- [Fantasy / bot commands](reference/commands/fantasy-bot.md)
-
-## Protocol reference
-
-- [Codename glossary](reference/glossary.md) — the mythos vocabulary (Undertow, Mooring, Ripple, Helix, Armor, Ringlane, Koshi, Memo, MeshPass) mapped to source
-- [Numerics](reference/protocol/numerics.md)
-- [Modes](reference/protocol/modes.md) — user and channel modes, status prefixes
-- [ISUPPORT (005)](reference/protocol/isupport.md)
-- [Capabilities (IRCv3)](reference/protocol/caps.md)
-- [Halloy capability matrix](reference/client-interop-halloy.md) — third-party interop (Halloy vs live CAP/ISUPPORT/commands)
-- [IRCv3 profile](reference/ircv3.md) — Onyx Server IRCv3 surface, exclusions, and wire limits
-- [CAP registry](reference/protocol/caps.md) — live `CAP LS` table from `cap_specs`
-- [IRCX](reference/ircx/README.md) — the IRCX protocol surface (PROP, ACCESS, EVENT, AUTH)
-- [Native media MAC](reference/native-media-mac.md) — the media authentication tag
-- [Web Push](reference/web-push.md) — browser push for offline DMs (RFC 8291/8292, VAPID discovery)
-- [Host cloaking](reference/host-cloaking.md) — keyed-HMAC cloaks, per-account cloak, rotation, and oper cross-mesh identity
-
-## Configuration
-
-- [Config reference](reference/config.md) — every section and key, including `[limits].nick_delay` and `[class.*]`, cited to `src/daemon/config_format.zig`
-- [`etc/onyx-server.reference.toml`](../etc/onyx-server.reference.toml) — runnable, annotated example
-
-## Project
-
-- [**0.7 major-release roadmap**](releases/0.7-MAJOR-ROADMAP.md) — portable I/O, per-OS kernel features, Armor TLS/CLI, expanded IRCX, client IRCX adaptation, harden/exploit pass (same `0.7.0` tag)
-- [**0.7 unified feature roadmap**](FEATURE-ROADMAP.md) — original cross-repo P0/P1/P2 table plus an index of the major tracks
-- [Q4 2026 feature roadmap](ROADMAP-2026-Q4.md) — daemon feature spine (S-01…S-30, P-xx, H-xx, L-xx) with detailed descriptions; linked from the unified roadmap
-- [0.7 release plan](releases/0.7-RELEASE-PLAN.md) — original upgrade-safety / measurement / corpus plan (now a subset of the major roadmap)
-- [Multi-reactor timer-guard audit (0.7)](audit/timer-guard-0.7.md) — historical 2026-09-01 enumeration of 46 periodic tasks and 29 reactor-0 guard sites; its P0-3 seeded model is closed, while the audit remains immutable evidence
-- [Invented features catalog](features/INVENTED-FEATURES-CATALOG.md) — F-01 … F-68 speculative features grounded against HEAD; the Top-20 game-changer shortlist is at the top
-- [Project README](../README.md)
-- [Contributing](../CONTRIBUTING.md)
-- [Runbook](RUNBOOK.md)
-- [Security policy](../SECURITY.md)
-- [License (AGPL-3.0-or-later)](../LICENSE)
+The [integrated requirements baseline](ROADMAP-2026-10-26.md),
+[acceptance ledger](ops/roadmap-acceptance-ledger-2026-10-26.md), and
+[client integration outline](design/onyx-client-integration-2026-10-26.md)
+remain scoped planning/acceptance records. Passing this release does not close
+every roadmap row or prove changes in the separate client repository.

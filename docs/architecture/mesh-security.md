@@ -9,10 +9,11 @@ This document describes how Onyx Server authenticates and protects server-to-ser
 focusing on the **security model**: what each layer guarantees, against which
 adversary, and how the wire enforces it.
 
-The headline property: a mesh peer — even a fully trusted, pinned peer that has
-been compromised — **cannot forge or alter a frame attributed to another node**.
-Onyx Server achieves this without any key-distribution subsystem, because node
-identity is self-certifying.
+Origin signatures bind signed frame families to their authors, including across
+relays. This protection depends on the family-specific signature/admission checks
+and negotiated secured transport. Legacy unsigned compatibility paths do not
+provide the same end-to-end proof; a trusted peer remains authoritative for facts
+that the receiver explicitly permits it to author.
 
 ## Threat model
 
@@ -94,9 +95,11 @@ record := [u32 len LE][ ChaCha20-Poly1305 ciphertext ][ 16-byte tag ]
   record returns an error and **drops the link** — corrupt plaintext is never
   delivered.
 
-The AKE preamble itself (prekey + the two AKE messages) stays cleartext — that
-is the handshake. Only the post-AKE CRDT stream is encrypted. Plaintext
-(non-secured) links have no L3 and are gated off by `require_secured`.
+The prekey and AKE framing/KEM prefixes are visible, while M1 and M2 carry
+AEAD-encrypted bodies. Initiator identity and MeshPass are inside sealed M1;
+they are not exposed as cleartext handshake credentials. Post-AKE records use
+the established directional traffic keys. Plaintext (non-secured) links have
+no L3 and are gated off by `require_secured`.
 
 ### L4 — Per-frame origin authentication
 
@@ -161,13 +164,15 @@ identity key. Effects:
 
 - Two signing-capable peers sign + verify direct frames; a signing peer's
   *unsigned* in-scope frame is rejected.
-- A non-signing (legacy / no-identity) peer interoperates over the unsigned
-  path; its absent signature fields decode to empty.
+- `require_signed_frames` defaults to `true`; unsigned legacy/no-identity peers
+  are rejected under that policy. An unsigned mixed rollout requires an explicit
+  `require_signed_frames=false` opt-out and has reduced authentication guarantees.
 - Multi-hop signatures are **presence-based**: a signed fact stays verifiable at
   any capable hop regardless of intermediate-peer capability; an unsigned legacy
-  fact applies as before.
+  fact is eligible only where the explicit unsigned compatibility policy allows it.
 
-This lets a mixed-version mesh roll forward without a flag day.
+Capability compatibility does not override the configured signature requirement;
+plan mixed-version rollouts with those policy boundaries explicitly.
 
 ### Reject accounting and audit
 
@@ -181,23 +186,21 @@ re-forwarded.
 
 ## Media
 
-The WebRTC media plane (`media_plane.zig`) is authenticated by STUN
-MESSAGE-INTEGRITY over the negotiated ICE credentials. The native CadenceVox/CadenceVis
-plane (`cadence` codec over UDP) uses trust-on-first-use address binding: the
-first datagram for a `stream_id` binds the publisher's source address, and later
-datagrams from a different address are dropped.
+Native media MACs are implemented. The current physical endpoint path derives
+independent client-to-server/server-to-client frame and feedback keys from fresh
+endpoint master material. It verifies bytes and current endpoint authority before
+learning an address, routing, metering or forwarding. Stream IDs are selectors,
+not credentials; 32-bit unpredictability is insufficient authentication.
 
-The pre-binding window is closed by making the `stream_id` **unguessable**. The
-id is issued by the server and stamped by the client into every cadence frame; it
-is derived as a keyed PRF — `HMAC-SHA256(native_stream_key, channel ":" nick)`
-truncated to u32 (`server.zig` `nativeStreamId`) — under a per-process random
-secret (`native_stream_key`, seeded via `secure_fns.randomBytes`). It is
-therefore a **capability token**: stable per `(channel, nick)` for the process
-lifetime (so re-JOIN is idempotent) but unpredictable to anyone without the
-secret, so an attacker who knows the public channel/nick can no longer
-precompute a victim's stream id and hijack or inject on the UDP port. No client
-change is required, because the server already delivers the id over the TLS IRC
-channel (`EVENT <nick> MEDIA NATIVE ... stream=<id>`).
+WebRTC uses its ICE/STUN and selected SRTP/DTLS endpoint contract. Browser
+WebSocket media has separate caller-only MACKEY issuance and client-held E2EE;
+server-authenticated transport does not mean the server owns the client's E2EE
+key. Native/WebRTC header rewrap cannot decrypt browser E2EE media.
+
+See [native media authentication](../reference/native-media-mac.md),
+[media architecture](03-media.md) and [credential domains](../reference/credential-domains.md).
+A MAC alone provides neither payload confidentiality nor a general feedback
+freshness guarantee.
 
 ## Host cloak federation
 
@@ -209,8 +212,8 @@ for the same input, which requires a mesh-shared cloak secret.
 - **Key derivation is Argon2id, not `SHA256`.** `[cloak] secret` is stretched
   through the memory-hard Argon2id KDF (`default_params` — t=2, m=64 MiB, p=1)
   with a fixed domain-separation salt `"onyx/cloak-key/argon2id/v1"`
-  (`src/main.zig:491`, `src/main.zig:492`, `src/main.zig:495`,
-  `src/crypto/argon2_kdf.zig:40`, `src/crypto/argon2_kdf.zig:117`). The IPv4
+  (`src/main.zig`,
+  `src/crypto/argon2_kdf.zig`). The IPv4
   input space is fully enumerable, so the whole model rests on key secrecy; a
   memory-hard KDF makes a low-entropy operator passphrase resist offline brute
   force in a way `SHA256(secret)` did not. Derivation is deterministic (fixed
@@ -220,39 +223,33 @@ for the same input, which requires a mesh-shared cloak secret.
   to a per-boot *random* key, so cloaks differ per node and change on restart —
   breaking host/subnet ban federation and persistence. The boot-time guard
   `meshCloakSecretMissing()` refuses to start and tells the operator to set the
-  SAME secret on every mesh node (`src/main.zig:192`, `src/main.zig:193`,
-  `src/daemon/config_format.zig:829`).
+  SAME secret on every mesh node (`src/main.zig`,
+  `src/daemon/config_format.zig`).
 - **Rotation grace is mesh-shared too.** `[cloak] previous_secret` is derived
   through the same Argon2id path and kept live so WARD bans written under the
   prior key keep matching during the grace window; drop it once old bans age out
-  (`src/main.zig:508`, `src/daemon/config_format.zig:616`).
-- **Auth-split cloaks.** The cloak an identity carries depends on whether it is
-  authenticated:
-  - **Accounts** (with `[cloak] account_cloak`) get a **stable** account cloak
-    `<account>.users.<suffix>`, constant across IPs and devices
-    (`src/daemon/config_format.zig:632`, `src/daemon/config_format.zig:634`).
-  - **Anonymous clients** get an **opaque, epoch-rotating** cloak: a single
-    token over the full address plus a public wall-clock epoch counter
-    `floor(now / anon_epoch_secs)` (default 86400 s = 24 h), tagged `.opq`
-    (`src/proto/cloak.zig:176`, `src/proto/cloak.zig:187`,
-    `src/daemon/config_format.zig:637`, `src/daemon/config_format.zig:646`).
-    The epoch salt makes the same static IP **unlinkable across epochs**, and
-    the single-token opaque form leaks no subnet co-membership — so an anonymous
-    user cannot be tracked long-term by cloak, while an account's cloak stays
-    stable for moderation. Anonymous moderation shifts to account bans plus
-    registration friction; setting `anon_epoch_secs = 0` restores the
-    subnet-bannable hierarchical `.ip` cloak.
+  (`src/main.zig`, `src/daemon/config_format.zig`).
+- **Auth-split cloaks.** Optional account cloaks use the configured account
+  presentation. Anonymous epoch cloaks use the provenance-bearing v4 opaque
+  format with a 128-bit token plus epoch/cadence markers. The parser default is
+  `anon_epoch_secs=1209600` (14 days); explicit daily settings remain daily.
+  Rotation changes the address-derived token and exposes no subnet hierarchy,
+  but account/nick/timing and other metadata can still correlate a person.
+  With cadence zero, the configured stable cloak policy applies.
 
-The epoch cloak is domain-separated from the plain opaque token, so an epoch
-cloak never collides with a non-epoch cloak (`src/proto/cloak.zig:186`).
+The exact formats, legacy moderation compatibility and rotation examples are
+maintained in [host cloaking](../reference/host-cloaking.md), sourced from
+`src/proto/cloak.zig`, the live `config_format.zig` and daemon host projection.
+Cloak KDF/domain separation makes token classes distinct; it is not a mathematical
+promise that finite truncated hashes can never collide.
 
-## What this does not cover (future, cross-component)
+## Coverage boundaries
 
-A per-datagram MAC on the cadence media **payload** itself would add
-defense-in-depth beyond the unguessable stream id, but the cadence frame is
-assembled in the Nexus/Ocean client JS (not this repo), so it requires a
-coordinated client + server change and is deliberately **not** stubbed
-server-only (it would be inert until the clients ship it).
+The daemon is not an E2EE client implementation. Client key storage, peer UX and
+compatible codec support need their own evidence. A configured signing root does
+not make every accepted statement true; it authorizes the exact statement family
+and its lifecycle checks. Reusable sessions and MESSAGE_V2 have explicit expiry,
+revocation, retention and cold-restart limits described in their living contracts.
 
 ## Summary of guarantees
 
@@ -264,7 +261,7 @@ server-only (it would be inert until the clients ship it).
 | Unknown/unpinned peer | `trust_roots` / `expected_remotes` pin | L2 |
 | Compromised peer forging a direct frame | Self-cert per-link signature; `originShortId(pubkey)==peer` | L4 |
 | Compromised relay forging a third node's message/prop | Self-contained origin signature verified at every hop | L4 |
-| Predicting a victim's media stream id | Keyed-PRF capability token | Media |
+| Forged native media input | Current endpoint and directional MAC verification | Media |
 | Offline brute force of a cloak passphrase | Argon2id (memory-hard) key derivation | Cloak |
-| Long-term tracking of an anonymous client by cloak | Opaque epoch-rotating cloak (unlinkable across epochs) | Cloak |
+| Long-term tracking of an anonymous client by cloak | Opaque epoch-rotating cloak; other observable identifiers can still correlate clients | Cloak |
 | Cloak/ban divergence across mesh nodes | Mesh-shared `[cloak] secret` (enforced at boot) | Cloak |

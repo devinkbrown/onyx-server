@@ -1,12 +1,11 @@
 # Event Spine full-mesh v2 wiring contract
 
-Status: shipped end-to-end. The protocol, the ESG2 replay substrate, the
+Status: live daemon implementation contract, reconciled 2026-11-03. The protocol, the ESG2 replay substrate, the
 negotiated secured S2S transport, and the live daemon publish/mesh/drain wiring
 (`deliverOperEventV2Local`, `meshBroadcastAuthoredOperEventV2`,
 `drainOperEventsV2`, `forwardOperEventV2`) are all implemented, and the ESG2
 checkpoint rides the Helix hot-upgrade capsule. Evidence:
-`src/daemon/server.zig:41782`, `src/daemon/server.zig:41980`,
-`src/daemon/server.zig:42068`, `src/daemon/server.zig:42091`.
+`src/daemon/server.zig`.
 
 The v1 `OPER_EVENT` payload is a direct-peer compatibility format. It carries no
 stable identity or end-to-end proof, so an inbound v1 event may be delivered
@@ -107,7 +106,7 @@ lands as `.duplicate` rather than being delivered twice.
      `invalid_semantic`: fail closed and audit/rate-limit as appropriate.
 
 Do not use a per-link SeenSet as the delivery boundary. It may suppress immediate
-reflections, but only the global durable guard authorizes delivery.
+reflections, but only the global checkpointed guard authorizes delivery.
 
 ## Checkpoint lifecycle
 
@@ -117,24 +116,43 @@ evicted HLCs. It rides the shared, magic-discriminated `.mesh_checkpoint` Helix
 capsule family at `min_supported = 2` — distinct in magic from the RVG2
 MESSAGE_V2 replay authority carried in the same family, so a predecessor never
 lets a v1 successor ignore it and replay retired events
-(`src/daemon/server.zig:22932`).
+(`src/daemon/server.zig`).
 
 - Restore the guard before accepting OPER_EVENT v2 traffic.
 - Replace from a checkpoint transactionally through `replaceFromCheckpoint`.
 - Hot-upgrade capture and adoption are shipped: the predecessor seals the ESG2
-  checkpoint under the replay lock at UPGRADE (`src/daemon/server.zig:22921`),
+  checkpoint under the replay lock at UPGRADE (`src/daemon/server.zig`),
   and the successor validates, decodes, and swaps it into the live guard as
-  mandatory state before serving v2 traffic (`src/daemon/server.zig:24315`,
-  `src/daemon/server.zig:24432`, `src/daemon/server.zig:25554`).
-- Persist after accepted admissions according to the daemon durability policy;
-  a restart from an older checkpoint widens the replay window and is therefore
-  not an exact-once boundary.
+  mandatory state before serving v2 traffic (`src/daemon/server.zig`).
+- The ESG2 guard is in-memory and carried by Helix. The periodic OEH1 operator
+  history file is a different store and does not persist replay authority. A cold
+  restart is not a replay-preserving exact-once boundary.
 
 ## Rolling compatibility
 
 Capability negotiation selects one wire version per link. V2-capable nodes send
 signed v2 and participate in multi-hop forwarding. A v1-only edge receives a
 legacy direct notification as a terminal leaf; it cannot safely bridge that
-event farther. The transitional `oper_event.encode`/`decode` aliases exist only
-so the current v1 daemon compiles while its link APIs migrate; new code must use
-the explicitly named versioned functions.
+event farther. The retained `oper_event.encode`/`decode` aliases name legacy V1 behavior; current
+V2 code must use the explicitly named versioned functions. Their existence does
+not imply that the live daemon is still a V1 implementation.
+
+## Operator example and delivery scope
+
+```irc
+IRCX
+EVENT ADD SECURITY SERVER_LINK
+EVENT SEVERITY warn
+EVENT REPLAY JSON ALL 30
+EVENT STATS JSON
+```
+
+Category subscription, severity floor and replay are operator surfaces. IRCX
+`CHANNEL`/`MEMBER`/`USER`/`MEDIA` subscriptions use their separate token/mask plane;
+ordinary clients can subscribe to member-scoped MEDIA events. Accepted V2 events
+enter the daemon-global guard once, and original signed bytes cross eligible
+multi-hop links. This event notification path has no retransmit-until-ACK outbox
+like MESSAGE_V2: duplicate suppression and origin authenticity do not promise
+recovery of every event lost to queue pressure, disconnection or process loss.
+See [the Event Spine architecture](../architecture/event-spine.md) for the current
+command syntax and bounded history behavior.

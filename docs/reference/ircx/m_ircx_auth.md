@@ -65,3 +65,12 @@ AUTH PLAIN I :<base64 authzid\0authcid\0passwd>
 AUTH SCRAM-SHA-256 I :<base64 client-first>
 AUTH PLAIN *
 ```
+
+## Mechanism and credential scope
+
+Discovery advertises only mechanisms wired on this connection. Use the
+[SASL matrix](../ircv3-capabilities.md#sasl-mechanisms) for current verifier and
+channel-binding conditions. Successful `SESSION-TOKEN` authentication restores
+account login; it does not select an exact reusable attachment. `AUTH` is also
+subject to the shared account status/factor checks described in
+[credential domains](../credential-domains.md).

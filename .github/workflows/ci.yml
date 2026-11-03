@@ -14,9 +14,9 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: "0.17.0-dev.1282+c0f9b51d8"
-  # Verified against Zig's official minisign key before pinning this digest.
-  ZIG_LINUX_SHA256: "6d81dec0152f6f11f8a12a84a73535b65070fe01b14a1ce75423870d65b3f270"
+  ZIG_VERSION: "0.17.0"
+  # Archive digest from Zig's official 0.17.0 download index (not the executable hash).
+  ZIG_LINUX_SHA256: "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
 
 jobs:
   check:
@@ -25,15 +25,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      # Historical dev archives are preserved by this Zig community mirror.
-      # The pinned SHA-256 below was verified against Zig's minisign key.
+      - name: Documentation links and checker controls
+        run: |
+          python3 -B tools/test_check_docs.py
+          python3 -B tools/check_docs.py
+      # Use the official release archive and verify the pinned archive digest.
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          if [[ "${ZIG_VERSION}" == *"-dev."* ]]; then
-            url="https://pkg.hexops.org/zig/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          else
-            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          fi
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           archive="${GITHUB_WORKSPACE}/.ci/zig.tar.xz"
           install_root="${GITHUB_WORKSPACE}/.ci"
           mkdir -p "${install_root}"
@@ -58,8 +57,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $url = 'https://pkg.hexops.org/zig/zig-x86_64-windows-0.17.0-dev.1282+c0f9b51d8.zip'
-          $expectedSha256 = 'DF1CA8156908BD51B417265773092DDF41A1D307F0E93B28BB3E8A0B912D0681'
+          $url = 'https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip'
+          $expectedSha256 = 'B5663F69581DCF391293FBF16C06CB80D81D806545CE618B4D0BAB7F0EB8C428'
           $archive = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows.zip'
           $installRoot = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows'
           Invoke-WebRequest -Uri $url -OutFile $archive
@@ -85,13 +84,13 @@ jobs:
       - name: Run focused Windows tests (Debug)
         run: zig build -j1 test-windows -Dtarget=x86_64-windows --summary all
       - name: Run focused Windows tests (ReleaseSafe)
-        run: zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+        run: zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=safe --summary all
       - name: Run Windows BoGo shim loopback tests
         run: zig build -j1 bogo-shim-test -Dtarget=x86_64-windows --summary all
       - name: Run focused Windows tests with native Zig codegen
         run: zig build -j1 test-windows -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
       - name: Run ReleaseSafe Windows tests with native Zig codegen
-        run: zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true --summary all
+        run: zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=safe -Dwindows-self-hosted=true --summary all
       - name: Build native-codegen Windows release package
         run: zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true --prefix .\zig-out-selfhosted --summary all
       - name: Run full Windows test suite (Debug)
@@ -99,7 +98,7 @@ jobs:
       - name: Run full Windows test suite with native Zig codegen (Debug)
         run: zig build -j1 test -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
       - name: Run full Windows test suite with native Zig codegen (ReleaseSafe)
-        run: zig build -j1 test -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true --summary all
+        run: zig build -j1 test -Dtarget=x86_64-windows -Doptimize=safe -Dwindows-self-hosted=true --summary all
       - name: Build native-codegen Windows test runners
         run: zig build -j1 test-artifacts -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
       - name: Verify Windows test-runner stack reserves
@@ -124,17 +123,17 @@ jobs:
       - name: Run portable protocol tests (Debug)
         run: zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=runtime capability policy' '-Dtest-filter=limited runtime welcome' --summary all
       - name: Run portable protocol tests (ReleaseSafe)
-        run: zig build -j1 test-mod -Dtarget=x86_64-windows -Doptimize=ReleaseSafe '-Dtest-filter=runtime capability policy' '-Dtest-filter=limited runtime welcome' --summary all
+        run: zig build -j1 test-mod -Dtarget=x86_64-windows -Doptimize=safe '-Dtest-filter=runtime capability policy' '-Dtest-filter=limited runtime welcome' --summary all
       - name: Run full protocol module tests (Debug)
         run: zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=proto.' --summary all
       - name: Run native store module tests (Debug)
         run: zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=daemon.store.test.' --summary all
       - name: Run native store module tests (ReleaseSafe)
-        run: zig build -j1 test-mod -Dtarget=x86_64-windows -Doptimize=ReleaseSafe '-Dtest-filter=daemon.store.test.' --summary all
+        run: zig build -j1 test-mod -Dtarget=x86_64-windows -Doptimize=safe '-Dtest-filter=daemon.store.test.' --summary all
       - name: Run complete native CLI tests (Debug)
         run: zig build -j1 test-cli -Dtarget=x86_64-windows --summary all
       - name: Run complete native CLI tests (ReleaseSafe)
-        run: zig build -j1 test-cli -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+        run: zig build -j1 test-cli -Dtarget=x86_64-windows -Doptimize=safe --summary all
 
   # Live fixtures build their own artifacts on a separate runner so the full
   # test suites and process smokes have independent time budgets.
@@ -148,8 +147,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $url = 'https://pkg.hexops.org/zig/zig-x86_64-windows-0.17.0-dev.1282+c0f9b51d8.zip'
-          $expectedSha256 = 'DF1CA8156908BD51B417265773092DDF41A1D307F0E93B28BB3E8A0B912D0681'
+          $url = 'https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip'
+          $expectedSha256 = 'B5663F69581DCF391293FBF16C06CB80D81D806545CE618B4D0BAB7F0EB8C428'
           $archive = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows.zip'
           $installRoot = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows'
           Invoke-WebRequest -Uri $url -OutFile $archive
@@ -349,8 +348,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $url = 'https://pkg.hexops.org/zig/zig-x86_64-windows-0.17.0-dev.1282+c0f9b51d8.zip'
-          $expectedSha256 = 'DF1CA8156908BD51B417265773092DDF41A1D307F0E93B28BB3E8A0B912D0681'
+          $url = 'https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip'
+          $expectedSha256 = 'B5663F69581DCF391293FBF16C06CB80D81D806545CE618B4D0BAB7F0EB8C428'
           $archive = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows.zip'
           $installRoot = Join-Path $env:RUNNER_TEMP 'zig-pinned-windows'
           Invoke-WebRequest -Uri $url -OutFile $archive
@@ -413,15 +412,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # Historical dev archives are preserved by this Zig community mirror.
-      # The pinned SHA-256 below was verified against Zig's minisign key.
+      # Use the official release archive and verify the pinned archive digest.
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          if [[ "${ZIG_VERSION}" == *"-dev."* ]]; then
-            url="https://pkg.hexops.org/zig/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          else
-            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          fi
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           archive="${GITHUB_WORKSPACE}/.ci/zig.tar.xz"
           install_root="${GITHUB_WORKSPACE}/.ci"
           mkdir -p "${install_root}"
@@ -442,7 +436,7 @@ jobs:
       # and optimization-only regressions without making CI depend on ReleaseFast
       # runtime assertions.
       - name: Run ReleaseSafe smoke suites
-        run: zig build test-smoke -Doptimize=ReleaseSafe --summary all
+        run: zig build test-smoke -Doptimize=safe --summary all
       # Threaded server tests need loopback sockets + io_uring; when a runner
       # lacks either the tests SkipZigTest rather than fail, so this stays green
       # on any hosted runner while exercising everything available.
@@ -461,11 +455,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${ZIG_VERSION}" == *"-dev."* ]]; then
-            url="https://pkg.hexops.org/zig/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          else
-            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          fi
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           archive="${GITHUB_WORKSPACE}/.ci/zig.tar.xz"
           install_dir="${GITHUB_WORKSPACE}/.ci/zig-${ZIG_VERSION}"
           mkdir -p "${GITHUB_WORKSPACE}/.ci"
@@ -511,15 +501,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # Historical dev archives are preserved by this Zig community mirror.
-      # The pinned SHA-256 below was verified against Zig's minisign key.
+      # Use the official release archive and verify the pinned archive digest.
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          if [[ "${ZIG_VERSION}" == *"-dev."* ]]; then
-            url="https://pkg.hexops.org/zig/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          else
-            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          fi
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           archive="${GITHUB_WORKSPACE}/.ci/zig.tar.xz"
           install_root="${GITHUB_WORKSPACE}/.ci"
           mkdir -p "${install_root}"

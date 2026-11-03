@@ -1,6 +1,6 @@
 # Redacted preflight diagnostics
 
-`onyx-server doctor <config> [metrics-url] [--json]` loads a candidate through
+`onyx-server doctor <config> [metrics-url | --peer-config <path>] [--json]` loads a candidate through
 the shared quiet configuration loader and runs fixed, read-only checks. It
 does not start the daemon or install a service. An explicit metrics URL causes
 one bounded GET; omit the URL for offline configuration/certificate checks.
@@ -95,11 +95,42 @@ cloaks are disabled. This diagnostic does not imply that login immediately
 replaces a host already displayed to other clients.
 
 
+## Offline cloak-policy comparison
+
+Compare two locally available node configurations without contacting either
+runtime or printing their secrets:
+
+```sh
+onyx-server doctor /private/node-a.toml --peer-config /private/node-b.toml --json
+```
+
+Both files pass the shared typed loader with their actual environment/file
+references. The report compares the resolved current secret, previous-secret
+presence/value, normalized suffix, opaque/legacy mode, account-cloak setting
+and anonymous cadence. It emits fixed category/status text, not values or
+secret digests. Neither previous secret configured is reported as skipped;
+a missing current secret or mismatch fails. An unreadable/invalid candidate
+produces a fixed unavailable result. The comparison allocator wipes released
+buffers. Keep both source configs and secret references private.
+
+`--peer-config` and a metrics URL are mutually exclusive. Matching files prove
+policy agreement in those inputs; they do not prove which files a running peer
+loaded, live key agreement, authorization, or current client-host convergence.
+
 ## Operator mesh snapshot
 
-A cross-reactor MESH view requires a reactor-0 publication with owned peer
-names, explicit freshness and separately observed plaintext and secured
-transport state. Missing or stale information is unknown, not zero or proof
-of health. Negotiated capability fields require actual peer observations;
-the aggregate established-link metric cannot provide them. Integration and
-nonzero-reactor acceptance are still required for such a production view.
+The current `MESH`/`NETSTAT` view uses a reactor-0 publication with owned peer
+names and separate TCP, established, secured and plaintext counts. Other
+reactors copy that publication under its owner lock. The renderer distinguishes
+unknown, current and stale snapshots; a failed publication, invalid time or age
+beyond three sweep intervals makes the view stale. Readiness is a bounded local
+runtime observation, not public client or whole-network acceptance.
+
+Missing or stale information is unknown, not zero or proof of health. Negotiated
+capability fields require actual peer observations; the aggregate established-link
+metric cannot provide them. Use the [mesh operations checklist](../ops/mesh-metrics-deploy-checklist.md)
+and real clients to verify a release.
+
+Source of truth: `src/main.zig` (`parseDoctorArgs`, `doctorCloakCompare`),
+`src/daemon/doctor.zig`, `server.zig` (`publishMeshOperationalSnapshot`,
+`readMeshOperationalSnapshotAt`) and `src/proto/mesh_report.zig`.

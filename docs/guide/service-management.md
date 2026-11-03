@@ -204,3 +204,5 @@ These checks establish kit behavior; actual account transitions, crash recovery,
 kernel sandbox compatibility and Helix client preservation require runtime
 acceptance on the intended host. See [Alpine operation](alpine.md) for native
 process/recovery tests and their coverage limits.
+
+Source of truth: [`etc/openrc/onyx-server`](../../etc/openrc/onyx-server), its `.confd` template, [`etc/systemd/onyx-server.service`](../../etc/systemd/onyx-server.service), `tools/alpine_openrc_smoke.py` and `tools/systemd_service_smoke.py`. Current installed fleet facts live in [production paths](../ops/onyx-server-paths.md); platform-specific tests retain their recorded scope.

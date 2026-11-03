@@ -2,7 +2,7 @@
 
 *IRCX discovery, typed messaging, properties, access lists, events, named modes, and extended listing.*
 
-The IRCX module registers the discovery, typed-messaging, property, access, event, mode, and list commands (`src/daemon/modules/ircx.zig:56`). `CREATE` lives in [channels.md](channels.md#create).
+The IRCX module registers the discovery, typed-messaging, property, access, event, mode, and list commands (`src/daemon/modules/ircx.zig`). `CREATE` lives in [channels.md](channels.md#create).
 
 ## IRCX
 
@@ -13,7 +13,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: `RPL_IRCX 800` with state, version, live SASL package list (`PLAIN,SCRAM-SHA-256,EXTERNAL`), max message size, and option list.
 - Errors: None specific.
 - Example: `IRCX`
-- Sources: `src/daemon/server.zig:3331`, `src/daemon/modules/ircx.zig:48`, `src/daemon/server.zig:7698`
+- Sources: `src/daemon/server.zig`, `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`
 
 ## ISIRCX
 
@@ -24,7 +24,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: `RPL_IRCX 800`.
 - Errors: None specific.
 - Example: `ISIRCX`
-- Sources: `src/daemon/server.zig:3335`, `src/daemon/modules/ircx.zig:49`, `src/daemon/server.zig:7698`
+- Sources: `src/daemon/server.zig`, `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`
 
 ## AUTH
 
@@ -34,7 +34,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: `RPL_IRCXAUTH` challenge/success/failure lines and the normal account numerics on completion.
 - Errors: Package parsing, SASL, TLS, and account lockout errors from the shared router; malformed exchanges fail closed.
 - Example: `AUTH PLAIN AGFsaWNlAGNvcnJlY3QtaG9yc2U=`
-- Sources: `src/daemon/modules/ircx.zig:68`, `src/daemon/server.zig:33452` (`handleIrcxAuth`), `src/proto/ircx.zig`, `src/proto/sasl_mechrouter.zig`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig` (`handleIrcxAuth`), `src/proto/ircx.zig`, `src/proto/sasl_mechrouter.zig`
 
 ## DATA
 
@@ -56,7 +56,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: Relayed `REQUEST` line.
 - Errors: Same as `DATA`.
 - Example: `REQUEST alice app.ping :hello`
-- Sources: `src/daemon/modules/ircx.zig:51`, `src/daemon/server.zig:7721`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`
 
 ## REPLY
 
@@ -67,7 +67,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: Relayed `REPLY` line.
 - Errors: Same as `DATA`.
 - Example: `REPLY alice app.ping :pong`
-- Sources: `src/daemon/modules/ircx.zig:52`, `src/daemon/server.zig:7721`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`
 
 ## WHISPER
 
@@ -78,7 +78,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: `WHISPER` lines to valid recipients.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_NOWHISPER 923`, `ERR_NOSUCHNICK 401`, `ERR_USERNOTINCHANNEL 441`.
 - Example: `WHISPER #zig alice,bob :private aside`
-- Sources: `src/daemon/modules/ircx.zig:53`, `src/daemon/server.zig:7772`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`
 
 ## PROP
 
@@ -89,7 +89,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: `RPL_PROPLIST 818`, `RPL_PROPEND 819`; mode broadcasts for linked built-ins.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOACCESS 913`, `ERR_BADVALUE 906`.
 - Example: `PROP #zig MEMBERCOUNT`
-- Sources: `src/daemon/modules/ircx.zig:54`, `src/daemon/server.zig:7610`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`
 
 ## ACCESS
 
@@ -100,7 +100,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: `RPL_ACCESSADD 801`, `RPL_ACCESSDELETE 802`, `RPL_ACCESSSTART 803`, `RPL_ACCESSENTRY 804`, `RPL_ACCESSEND 805`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NOPRIVILEGES 481`.
 - Example: `ACCESS #zig ADD HOST *!*@trusted.example 0 :trusted`
-- Sources: `src/daemon/modules/ircx.zig:66`, `src/proto/ircx_access_store.zig:79`, `src/proto/ircx_access_store.zig:119`, `src/proto/ircx_access_store.zig:419`, `src/daemon/server.zig:19492`
+- Sources: `src/daemon/modules/ircx.zig`, `src/proto/ircx_access_store.zig`, `src/daemon/server.zig`
 
 ## EVENT
 
@@ -121,7 +121,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: Raw `EVENT LIST` lines, raw Event Spine observe/broadcast `EVENT` lines, and server notices.
 - Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`.
 - Example: `EVENT BROADCAST :network maintenance`
-- Sources: `src/daemon/modules/ircx.zig:56`, `src/daemon/server.zig:6543`, `src/daemon/server.zig:6645`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`
 
 ## MODEX
 
@@ -132,7 +132,7 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: `RPL_MODEXLIST 826`, `RPL_MODEXEND 827`, or normal `MODE` replies/broadcasts.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, plus delegated `MODE` errors.
 - Example: `MODEX #zig +AUTHONLY`
-- Sources: `src/daemon/modules/ircx.zig:57`, `src/daemon/server.zig:6470`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`
 
 ## LISTX
 
@@ -143,4 +143,4 @@ The IRCX module registers the discovery, typed-messaging, property, access, even
 - Replies: IRCX list start/entry/PICS/truncation/end numerics `811`, `812`, `813`, `816`, `817`.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid filters.
 - Example: `LISTX >=10,C<=3600000`
-- Sources: `src/daemon/modules/ircx.zig:71`, `src/proto/listx.zig:73`, `src/proto/listx.zig:236`, `src/proto/listx.zig:242`, `src/proto/listx.zig:251`, `src/proto/listx.zig:420`, `src/daemon/server.zig:12920`
+- Sources: `src/daemon/modules/ircx.zig`, `src/proto/listx.zig`, `src/daemon/server.zig`

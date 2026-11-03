@@ -2,7 +2,7 @@
 
 *Presence, identity, and channel lookups, plus away state, realname changes, and built-in help.*
 
-Most of these commands are registered by `user.query` (`src/daemon/modules/user_query.zig:72`); `LUSERS` is registered by `query.info` (`src/daemon/modules/query_info.zig:46`, `src/daemon/modules/query_info.zig:75`) and `LISTX` by `ircx` (`src/daemon/modules/ircx.zig:51`, `src/daemon/modules/ircx.zig:71`).
+Most of these commands are registered by `user.query` (`src/daemon/modules/user_query.zig`); `LUSERS` is registered by `query.info` (`src/daemon/modules/query_info.zig`) and `LISTX` by `ircx` (`src/daemon/modules/ircx.zig`).
 
 ## ISON
 
@@ -13,7 +13,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: `RPL_ISON 303`.
 - Errors: Registry `ERR_NEEDMOREPARAMS 461` is not configured for this command; handler has no command-specific errors.
 - Example: `ISON alice bob carol`
-- Sources: `src/daemon/modules/user_query.zig:75`, `src/daemon/server.zig:12632`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`
 
 ## USERHOST
 
@@ -24,7 +24,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: `RPL_USERHOST 302`.
 - Errors: None specific in handler.
 - Example: `USERHOST alice bob`
-- Sources: `src/daemon/modules/user_query.zig:76`, `src/daemon/server.zig:12652`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`
 
 ## LUSERS
 
@@ -35,18 +35,18 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: `RPL_LUSERCLIENT 251`, `RPL_LUSEROP 252`, `RPL_LUSERUNKNOWN 253`, `RPL_LUSERCHANNELS 254`, `RPL_LUSERME 255`, `RPL_STATSCONN 250`, `RPL_LOCALUSERS 265`, `RPL_GLOBALUSERS 266`.
 - Errors: None specific in handler.
 - Example: `LUSERS`
-- Sources: `src/daemon/modules/query_info.zig:46`, `src/daemon/modules/query_info.zig:75`, `src/daemon/server.zig:21735`, `src/proto/lusers.zig:60`, `src/proto/lusers.zig:80`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`, `src/proto/lusers.zig`
 
 ## WHOIS
 
 - Syntax: `WHOIS [server] <nick>`
-- Description: Emits a WHOIS sequence covering account, away state, visible channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP/rDNS text (for opers and self). `RPL_WHOISSECURE 671` appends `[kTLS: TX]`, `[kTLS: RX]`, or `[kTLS: TX+RX]` when those kernel TLS directions are actually attached on the subject's connection (both production nodes run `ktls = "txrx"`, so attached TLS users show `TX+RX`). `RPL_WHOISSPECIAL 320` also carries public +R/+g private-message restriction hints for every requester, plus +G (common-channel), +Z (TLS-only PM), and +V (no-invite) restriction hints when they apply. An ordinary account-less nick with a live signed guest-presence record answers 311, 312, and 318 from that record, including the signed home server across more than one hop. Any other remote WHOIS copies the one-hop roster identity and leaves idle, away, and TLS-secure on the user's home node. The multi-hop guest path is source, and the full suite has not been re-run green on it.
+- Description: Emits a WHOIS sequence covering account, away state, visible channels, oper and admin visibility, bot mode, certificate fingerprint, TLS status, actual host (for opers and self), and optional GeoIP/rDNS text (for opers and self). `RPL_WHOISSECURE 671` appends `[kTLS: TX]`, `[kTLS: RX]`, or `[kTLS: TX+RX]` when those kernel TLS directions are actually attached on the subject's connection (configured `txrx` is intent; the annotation reports the directions actually attached). `RPL_WHOISSPECIAL 320` also carries public +R/+g private-message restriction hints for every requester, plus +G (common-channel), +Z (TLS-only PM), and +V (no-invite) restriction hints when they apply. An ordinary account-less nick with a live signed guest-presence record answers 311, 312, and 318 from that record, including the signed home server across more than one hop. Any other remote WHOIS copies the one-hop roster identity and leaves idle, away, and TLS-secure on the user's home node. Full release gates and bounded live acceptance are recorded in the [release audit](../../audit/release-and-test-speed-2026-11-03.md).
 - Privileges: Registered client.
 - Parameters: Target nick is the last parameter.
 - Replies: `RPL_WHOISUSER 311`, `RPL_WHOISSERVER 312`, `RPL_WHOISOPERATOR 313`, `RPL_WHOISIDLE 317`, `RPL_ENDOFWHOIS 318`, `RPL_WHOISCHANNELS 319`, `RPL_WHOISSPECIAL 320`, `RPL_WHOISLOGGEDIN 330`, `RPL_WHOISBOT 335`, `RPL_WHOISCERTFP 276`, `RPL_WHOISSECURE 671`, `RPL_WHOISACTUALLY 338`, and `RPL_AWAY 301` when applicable.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHNICK 401`.
 - Example: `WHOIS alice`
-- Sources: `src/daemon/modules/user_query.zig:77`, `src/daemon/server.zig:13086`, `src/daemon/server.zig:13149`, `src/daemon/server.zig:13209`, `src/daemon/whois.zig:203`, `src/daemon/whois.zig:236`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`, `src/daemon/whois.zig`
 
 ## LIST
 
@@ -57,7 +57,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: `RPL_LISTSTART 321`, `RPL_LIST 322`, `RPL_LISTEND 323`.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid LIST filters.
 - Example: `LIST >10`
-- Sources: `src/daemon/modules/user_query.zig:78`, `src/daemon/server.zig:12901`, `src/daemon/server.zig:12908`, `src/proto/list.zig:132`, `src/proto/elist.zig:92`, `src/proto/list.zig:163`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`, `src/proto/list.zig`, `src/proto/elist.zig`, `src/proto/list.zig`
 
 ## LISTX
 
@@ -68,7 +68,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: `RPL_LISTXSTART 811`, `RPL_LISTXENTRY 812`, optional `RPL_LISTXPICS 813`, optional `RPL_LISTXTRUNC 816`, `RPL_LISTXEND 817`.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid LISTX filters.
 - Example: `LISTX >=10,C<=3600,S=project*`
-- Sources: `src/daemon/modules/ircx.zig:51`, `src/daemon/modules/ircx.zig:71`, `src/daemon/server.zig:12998`, `src/daemon/server.zig:13007`, `src/proto/listx.zig:73`, `src/proto/listx.zig:170`, `src/proto/listx.zig:236`, `src/proto/listx.zig:369`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`, `src/proto/listx.zig`
 
 ## WHO
 
@@ -79,7 +79,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: Plain `RPL_WHOREPLY 352` and `RPL_ENDOFWHO 315`; WHOX `RPL_WHOSPCRPL 354` and `RPL_ENDOFWHO 315`.
 - Errors: `ERR_NEEDMOREPARAMS 461`.
 - Example: `WHOX #zig %tcuhsnfar`
-- Sources: `src/daemon/modules/user_query.zig:79`, `src/daemon/modules/user_query.zig:80`, `src/daemon/server.zig:12673`, `src/daemon/server.zig:12676`, `src/daemon/server.zig:12820`, `src/daemon/server.zig:12828`, `src/proto/who.zig:159`, `src/proto/who.zig:221`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`, `src/proto/who.zig`
 
 ## WHOWAS
 
@@ -90,7 +90,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: `RPL_WHOWASUSER 314` plus `RPL_WHOISSERVER 312` signoff lines when data exists, `ERR_WASNOSUCHNICK 406` when no data exists, and `RPL_ENDOFWHOWAS 369`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_WASNOSUCHNICK 406`.
 - Example: `WHOWAS alice`
-- Sources: `src/daemon/modules/user_query.zig:81`, `src/daemon/server.zig:13783`, `src/daemon/server.zig:13791`, `src/proto/whowas_reply.zig:83`, `src/proto/whowas_reply.zig:113`, `src/proto/whowas_reply.zig:164`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`, `src/proto/whowas_reply.zig`
 
 ## AWAY
 
@@ -101,7 +101,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: `RPL_NOWAWAY 306`, `RPL_UNAWAY 305`; away-notify fanout to capable peers.
 - Errors: None specific in handler.
 - Example: `AWAY :lunch`
-- Sources: `src/daemon/server.zig:3349`, `src/daemon/modules/user_query.zig:78`, `src/daemon/server.zig:8249`
+- Sources: `src/daemon/server.zig`, `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`
 
 ## SETNAME
 
@@ -112,7 +112,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: SETNAME/chghost-style notification to capable peers; no numeric success reply.
 - Errors: Handler validation errors only.
 - Example: `SETNAME :Kain`
-- Sources: `src/daemon/modules/user_query.zig:79`, `src/daemon/server.zig:8278`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`
 
 ## HELP
 
@@ -144,7 +144,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: Server `NOTICE` responses.
 - Errors: Account-required and parser failures as notices or failure replies.
 - Example: `AUTOJOIN ADD #zig`
-- Sources: `src/daemon/modules/user_query.zig:85`, `src/daemon/server.zig:5627`, `src/daemon/server.zig:8513`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`
 
 ## GROUP
 
@@ -155,7 +155,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: Server `NOTICE` or failure replies from handler.
 - Errors: Handler-specific validation failures.
 - Example: `GROUP LIST`
-- Sources: `src/daemon/modules/user_query.zig:86`, `src/daemon/server.zig:5668`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`
 
 ## WELCOME
 
@@ -166,7 +166,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: Server notices/welcome text.
 - Errors: Handler-specific validation failures.
 - Example: `WELCOME`
-- Sources: `src/daemon/modules/user_query.zig:87`, `src/daemon/server.zig:5738`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`
 
 ## SUMMON
 
@@ -179,4 +179,4 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 - Replies: `RPL_SUMMONING 342`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHNICK 401`, join validation errors.
 - Example: `SUMMON alice #ops`
-- Sources: `src/daemon/modules/feature_misc.zig:36`, `src/daemon/server.zig` `handleSummon`
+- Sources: `src/daemon/modules/feature_misc.zig`, `src/daemon/server.zig` `handleSummon`

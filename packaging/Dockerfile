@@ -5,7 +5,8 @@
 # The binary's provenance is anchored by dist/SHA256SUMS — anyone can rebuild it
 # and confirm it byte-for-byte with `packaging/verify-release.sh`.
 #
-#   1. Build the verified artifact:   packaging/release.sh
+#   1. Build a release candidate:     packaging/release.sh
+#      Verify independent rebuild:   packaging/verify-release.sh dist/SHA256SUMS
 #   2. Build the image:               docker build -f packaging/Dockerfile -t onyx-server:latest .
 #   3. Run it:                        docker run --read-only --cap-drop=ALL --security-opt=no-new-privileges -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
 #

@@ -5,7 +5,7 @@
 Mode +B and WHOIS 335 mark a bot. `announce_board` stays loaded and off the WHOIS and fantasy paths. `BOTGRANT` records the account in `bot_registry` so the grant counts as a bot, and that registry does not answer channel `!` commands. The in-channel commands are `!weather`, `!forecast`, and `!news`.
 
 Onyx Server answers a small set of in-channel `!` fantasy commands directly from the
-server, with no pseudo-clients (`src/daemon/server.zig:11150`, `handleFantasy`).
+server, with no pseudo-clients (`src/daemon/server.zig`, `handleFantasy`).
 The triggering message reaches the channel normally; the server posts the answer
 as a channel `PRIVMSG` sourced from this node's `server_name` and relays it once
 across the mesh, so members on every node see a single reply from the replying

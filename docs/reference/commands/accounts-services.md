@@ -2,7 +2,7 @@
 
 *Account, service, and persona commands exposed as real server commands — Onyx Server has no pseudo-clients.*
 
-The `accounts` module registers the account and service commands (`src/daemon/modules/accounts.zig:125`, `src/daemon/modules/accounts.zig:155`), with additional commands from feature and service modules. Onyx Server services are real server commands that reply through raw server lines and server notices; these handlers do not model pseudo-clients (`src/daemon/server.zig:22987`, `src/daemon/server.zig:23472`).
+The `accounts` module registers the account and service commands (`src/daemon/modules/accounts.zig`), with additional commands from feature and service modules. Onyx Server services are real server commands that reply through raw server lines and server notices; these handlers do not model pseudo-clients (`src/daemon/server.zig`).
 
 ## REGISTER
 
@@ -13,7 +13,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Raw `REGISTER SUCCESS <account> :Account registered`, optional email-status notice, welcome/account side effects.
 - Errors: IRCv3 `FAIL REGISTER` with `TEMPORARILY_UNAVAILABLE`, `NEED_MORE_PARAMS`, `ACCOUNT_EXISTS`, `BAD_ACCOUNT_NAME`, `INVALID_PASSWORD`, `INVALID_EMAIL`, `ACCOUNT_FORBIDDEN`.
 - Example: `REGISTER alice alice@example.net correct-horse`
-- Sources: `src/daemon/modules/accounts.zig:125`, `src/daemon/server.zig:22832`, `src/daemon/server.zig:22965`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`
 
 ## VERIFY
 
@@ -24,7 +24,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server notice `VERIFY: your account email is now verified`, `VERIFY: nothing to verify for your account`, or IRCv3 `FAIL VERIFY`.
 - Errors: `FAIL VERIFY ACCOUNT_REQUIRED`, `EXPIRED`, `INVALID_CODE`, `TOO_MANY_ATTEMPTS`; missing parameters produce a usage notice.
 - Example: `VERIFY alice abcdef012345`
-- Sources: `src/daemon/modules/accounts.zig:126`, `src/daemon/server.zig:15424`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`
 
 ## IDENTIFY
 
@@ -35,7 +35,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server `NOTICE` confirming login plus account-notify/welcome side effects.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, IRCv3 `FAIL IDENTIFY TEMPORARILY_UNAVAILABLE`, `FAIL IDENTIFY TOTP_REQUIRED` (2FA code missing/incorrect).
 - Example: `IDENTIFY alice correct-horse 492817`
-- Sources: `src/daemon/modules/accounts.zig:127`, `src/daemon/server.zig:23072`, `src/daemon/services.zig:1140`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`, `src/daemon/services.zig`
 
 ## TOTP
 
@@ -57,7 +57,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: `RPL_LOGGEDOUT 901` when an account binding was cleared, optional `MODE <nick> :-o`, then server `NOTICE` confirming logout.
 - Errors: None specific.
 - Example: `LOGOUT`
-- Sources: `src/daemon/modules/accounts.zig:129`, `src/daemon/server.zig:23128`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`
 
 ## DROP
 
@@ -68,7 +68,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server `NOTICE` confirming drop.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, IRCv3 `FAIL DROP TEMPORARILY_UNAVAILABLE`.
 - Example: `DROP alice correct-horse`
-- Sources: `src/daemon/modules/accounts.zig:130`, `src/daemon/server.zig:23169`, `src/daemon/services.zig:1158`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`, `src/daemon/services.zig`
 
 ## RESETPASS
 
@@ -91,7 +91,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server `NOTICE` `account=<name> flags=<n> suspended=<bool> forbidden=<bool> noexpire=<bool> passkey_only=<bool> oper_stepup=<bool>`. Login rows are `LOGINS: time=<ms> mechanism=<name> tls=<clear|tls|unknown> prefix=<text|->`, or `LOGINS: none`. Session rows are `SESSIONS: nick=<nick> tls=<tls|clear> node=<id>`, `SESSIONS: none`, or `SESSIONS: truncated` after a full cap.
 - Errors: `ERR_NEEDMOREPARAMS 461` when neither argument nor login exists; `ERR_NOPRIVILEGES 481` when a non-operator names another account's logins or sessions; `FAIL ACCOUNTINFO ACCOUNT_UNKNOWN`; `FAIL ACCOUNTINFO BAD_ACCOUNT`; `FAIL ACCOUNTINFO TEMPORARILY_UNAVAILABLE`.
 - Example: `ACCOUNTINFO alice`, `ACCOUNTINFO LOGINS`, and `ACCOUNTINFO SESSIONS`
-- Sources: `src/daemon/modules/accounts.zig:134`, `src/daemon/server.zig:23457`, `src/daemon/services.zig:1284`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`, `src/daemon/services.zig`
 
 ## SASLINFO
 
@@ -102,16 +102,16 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server notices.
 - Errors: None specific.
 - Example: `SASLINFO`
-- Sources: `src/daemon/modules/accounts.zig:136`, `src/daemon/server.zig:23582`, `src/daemon/dispatch.zig:1418`, `src/proto/sasl_mechrouter.zig:16`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`, `src/daemon/dispatch.zig`, `src/proto/sasl_mechrouter.zig`
 
 ## SASL AUTHENTICATE and numerics
 
 - Syntax: `AUTHENTICATE <mechanism|payload|*>`
 - Description: IRCv3 SASL runs through the `AUTHENTICATE` dispatcher. It supports configured `PLAIN`, `EXTERNAL`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `SCRAM-SHA-512-PLUS`, `SESSION-TOKEN`, `OAUTHBEARER`, and `ANONYMOUS` mechanisms on the live connection. The router can parse `SCRAM-SHA-256-PLUS`, but that name is not currently advertised by CAP, SASLINFO, or IRCX package lists. `SESSION-TOKEN` is a SASL re-entry credential, distinct from the `SESSION TOKEN` / `SESSION MTOKEN` reclaim tokens used with `SESSION RESUME`.
 - Replies: `AUTHENTICATE +` or challenge data during the exchange; `RPL_LOGGEDIN 900` plus `RPL_SASLSUCCESS 903` on success; optional final SCRAM verifier before success.
-- Errors and numerics: `ERR_SASLFAIL 904`, `ERR_SASLTOOLONG 905`, `ERR_SASLABORTED 906`, `ERR_SASLALREADY 907`, and `RPL_SASLMECHS 908` before `904` for an unsupported mechanism. `RPL_LOGGEDOUT 901` is emitted when aborting an already-authenticated SASL exchange or on `LOGOUT`. The current dispatcher defines `900`, `901`, and `903`-`908`; it does not define or emit a `902` account-auth numeric.
+- Errors and numerics: `ERR_SASLFAIL 904`, `ERR_SASLTOOLONG 905`, `ERR_SASLABORTED 906`, `ERR_SASLALREADY 907`, and `RPL_SASLMECHS 908` before `904` for an unsupported mechanism. `RPL_LOGGEDOUT 901` is emitted when aborting an already-authenticated SASL exchange or on `LOGOUT`. The current dispatcher defines `900`, `901`, and `903`; it does not define or emit a `902` account-auth numeric.
 - Account-status lockout: A SUSPENDED or FORBIDDEN account is rejected at the SASL success chokepoint for every non-guest mechanism, including SCRAM and OAUTHBEARER. The user-facing IRCv3 surface is the generic `904 :SASL authentication failed`, so account status is not enumerated.
-- Sources: `src/daemon/dispatch.zig:169`, `src/daemon/dispatch.zig:1805`, `src/daemon/dispatch.zig:1833`, `src/daemon/dispatch.zig:1919`, `src/daemon/dispatch.zig:1979`, `src/daemon/dispatch.zig:2034`, `src/daemon/server.zig:20740`, `src/daemon/services.zig:2528`
+- Sources: `src/daemon/dispatch.zig`, `src/daemon/server.zig`, `src/daemon/services.zig`
 
 ## ACCOUNTSET
 
@@ -122,7 +122,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server `NOTICE` confirming update.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, `FAIL ACCOUNTSET INVALID_VALUE`, `INVALID_FIELD`, `PRIVILEGED_FLAGS`, `TEMPORARILY_UNAVAILABLE`.
 - Example: `ACCOUNTSET alice correct-horse secure on`
-- Sources: `src/daemon/modules/accounts.zig:137`, `src/daemon/server.zig:24377`, `src/daemon/services.zig:1252`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`, `src/daemon/services.zig`
 
 ## RECOVER
 
@@ -155,7 +155,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Victim receives `ERROR :Ghosted by <nick>`; caller receives server `NOTICE`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_PASSWDMISMATCH 464`, `FAIL GHOST TEMPORARILY_UNAVAILABLE`, `ACCOUNT_REQUIRED`, `NICK_NOT_OWNED`.
 - Example: `GHOST alice_ correct-horse`
-- Sources: `src/daemon/modules/accounts.zig:138`, `src/daemon/server.zig:24427`, `src/daemon/services.zig:1242`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`, `src/daemon/services.zig`
 
 ## CHANNEL
 
@@ -166,7 +166,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Server notices; `REGISTER`/`DROP` also reflect live registered-channel state.
 - Errors: IRCv3 `FAIL CHANNEL` codes including `TEMPORARILY_UNAVAILABLE`, `NEED_MORE_PARAMS`, `ACCOUNT_REQUIRED`, `INVALID_PARAMS`, `CHANNEL_EXISTS`, `CHANNEL_UNKNOWN`, `ACCESS_DENIED`, `BAD_CHANNEL_NAME`.
 - Example: `CHANNEL REGISTER #zig`
-- Sources: `src/daemon/modules/accounts.zig:69`, `src/daemon/server.zig:8709`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`
 
 ## CS
 
@@ -177,30 +177,74 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Replies: Same as `CHANNEL`.
 - Errors: Same as `CHANNEL`.
 - Example: `CS INFO #zig`
-- Sources: `src/daemon/modules/accounts.zig:70`, `src/daemon/server.zig:8714`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`
 
 ## SESSION
 
-- Syntax: `SESSION [LIST [MESH]|TOKEN|RESUME <token>|DROP <#n|sid=<32-hex>>|REVOKE group=<32-hex>]`
-- Description: Lists account attachments, reveals credentials for this exact logical session, attaches the client to that session, or revokes one other physical attachment. `SESSION TOKEN` emits a 32-hex-character origin-local credential and, when mesh resume is enabled, a separately sealed portable credential. Both are reusable: every successful `RESUME` adds or restores an attachment without disconnecting siblings or consuming the credential. These are session credentials, not the `sst_...` account-authentication credential used by SASL `SESSION-TOKEN` / `SESSIONTOKEN`; authentication alone never selects another same-account session. `LIST` emits an opaque 128-bit `sid` for rows with a stable attachment ID and binds each `#n` to that connection's exact emitted snapshot. `DROP` compare-and-removes only that physical row: recycled indices, rotated token/signon/attachment identity, ambiguous SIDs, and the caller's current row fail closed. Same-token siblings retain their nick and merged channel modes without a false QUIT; dropping the final row emits the ordinary QUIT/offline transition. An attached target or surviving exact-token sibling owned by another reactor currently returns `TEMPORARILY_UNAVAILABLE` without mutating either connection, pending the reserved two-owner handoff protocol.
-- Privileges: Registered client logged in to an account.
-- Parameters: Optional subcommand; `LIST` is default. Bare `SESSION` and local `LIST` inventory this node's physical attachments for the authenticated account. `LIST MESH` requests account-scoped mesh inventory. `TOKEN` takes no arguments; `RESUME`, `DROP`, and `REVOKE` each take exactly one credential or correctly typed selector. Unknown verbs, extra selectors and implicit `ALL`/logical-session scope on `DROP` fail before changing caches, credentials or attachments.
-- Replies: `NOTICE ... :SESSION TOKEN <hex>`, optional `NOTICE ... :SESSION MTOKEN <sealed-hex> expires=<unix-seconds>`, `SESSION LIST <*|-> #n signon=<ms> <attached|detached> [sid=<32-hex>]`, `SESSION: end of session list`, `SESSION DROP #n ok` / `SESSION DROP sid=<32-hex> ok`, successful `SESSION RESUME: already attached`, `attached to live session`, `attached to live mesh session`, `attached to replicated mesh session`, or `session restored`, plus redirects. A portable token is valid for 12 hours; its live snapshot is offered immediately and re-offered on secured-peer establishment/reconnect. All attachments share identity/channel state, receive events, and may participate.
-- Retry behavior: `ORIGIN_UNREACHABLE` and `TEMPORARILY_UNAVAILABLE` retain the supplied credential. After either result or a redirect, the immediately following `SESSION TOKEN` is suppressed once with `WARN SESSION RESUME_CREDENTIAL_PRESERVED`, preventing a reconnecting client from overwriting its still-valid stored credential. Repeating `SESSION TOKEN` explicitly returns the credential for the current attachment. An already-live session is a successful attachment path, not `SESSION_ATTACHED`.
-- Errors: Terminal `FAIL SESSION INVALID_SUBCOMMAND`, `INVALID_PARAMS`, `NEED_MORE_PARAMS`, `INVALID_TOKEN`, `INVALID_INDEX`, `NO_SESSION`, `NO_SUCH_SESSION`, `AMBIGUOUS_SID`, `STALE_LIST`, or `CANNOT_DROP_CURRENT`; retryable `WARN SESSION ORIGIN_UNREACHABLE`, `TEMPORARILY_UNAVAILABLE`, or `RESUME_CREDENTIAL_PRESERVED`; account-required notice.
-- Example: `SESSION TOKEN`
-- Sources: `src/daemon/modules/accounts.zig:143`, `src/daemon/server.zig:24958`, `src/daemon/server.zig:25007`, `src/daemon/services.zig:899`
+Syntax:
 
-Candidate mesh controls additionally support `SESSION LIST MESH` for the owning
-account and `SESSION REVOKE group=<id>` for a whole logical group. The group ID
-comes from mesh inventory; its physical attachment IDs are not local DROP SIDs.
-Completion requires signed durable-denial receipts from the same validated full
-roster and activation epoch. A pending result is not success or rollback; poll
-from another authenticated attachment if the selected group includes this
-connection. Missing durable storage/full-roster support returns `UNSUPPORTED`.
-See the [session-control wire supplement](../protocol/onyx-session-control.v1.json)
-for exact fields, errors and remaining output-budgeting limits. These controls
-do not revoke unrelated groups or SASL account-authentication credentials.
+```irc
+SESSION LIST
+SESSION LIST MESH
+SESSION TOKEN
+SESSION MTOKEN
+SESSION RESUME <credential>
+SESSION DROP <#n|sid=<32-hex>>
+SESSION REVOKE group=<32-hex>
+```
+
+The caller must be a registered client authenticated to the owning account.
+`TOKEN` reveals the current local resume credential; composite issuance can return
+`srm2l.<group>.<attachment>` instead of the bare logical 32-hex token. `MTOKEN`
+returns a portable credential with `expires=<unix-seconds>`; composite `srm2m`
+exact-restore issuance binds destination to issuer and another node can REDIRECT.
+These are separate from the durable `sst_...` account-login credential issued by
+`SESSIONTOKEN`. Parsing a sealed envelope does not authorize arbitrary-node
+physical restore. See [credential domains](../credential-domains.md) for every
+issuer/verifier, TTL and destination rule.
+
+Legacy logical resume can add a sibling without consuming the group or disconnecting
+existing clients; composite exact restore selects retained physical attachment
+authority. All paths check account, current state, expiry/revocation and the exact
+credential kind. A failed exact restore cannot silently become a fresh attachment.
+The EXTERNAL account/nick compatibility lookup is separately possession-gated.
+
+Local LIST reports this node's physical attachment inventory with opaque SIDs and
+connection-bound `#n` selections. DROP compares the exact emitted row identity,
+rejects stale/recycled/ambiguous selectors and refuses the caller's current row.
+The live cross-reactor path uses `session_drop_tx.Journal` and owner reservations;
+backpressure or an uncompleted transaction can return a temporary result rather
+than allowing a foreign reactor to mutate a socket directly. Logical identity
+must remain online while a surviving sibling owns it.
+
+`LIST MESH` and group REVOKE use separate account-scoped mesh authority. The group
+ID is not a local DROP SID. Completion requires signed durable-denial receipts
+from the validated full roster/activation epoch; pending is neither success nor
+rollback. Unsupported durable storage/full-roster support returns `UNSUPPORTED`.
+Poll from another authenticated attachment if the selected group includes this
+connection. Unrelated groups and SASL account-token credentials are independent.
+See [the wire supplement](../protocol/onyx-session-control.v1.json).
+
+`FAIL SESSION INVALID_TOKEN` and `NO_SESSION` report credential/origin failure.
+Exact composite restore also returns `SESSION_REVOKED`, `NO_ATTACHMENT`, or
+`ATTACHMENT_IN_USE`. The last means the selected physical attachment is active:
+the credential can still be valid, no sibling is created, and no automatic
+WARN/TOKEN-preservation hook runs. Do not infer invalidity or consumption from
+`FAIL` alone. See the [complete reply table](../../design/session-resume-anywhere-blueprint.md#reply-and-retry-contract).
+
+DROP selector errors include `INVALID_INDEX`, `AMBIGUOUS_SID`, `STALE_LIST` and
+`CANNOT_DROP_CURRENT`. Retryable RESUME warnings use `ORIGIN_UNREACHABLE` or
+`TEMPORARILY_UNAVAILABLE`. After those WARN results or a redirect, the immediate
+next TOKEN request is suppressed once with `RESUME_CREDENTIAL_PRESERVED` so
+clients do not overwrite stored state. An additional explicit TOKEN request
+selects the current attachment's credential. Legacy logical-session attachment
+to a live sibling remains distinct from busy exact physical restore.
+
+Example: authenticate the same account, send `SESSION RESUME <stored>`, process
+success/retry/redirect, then deliberately request fresh state only when appropriate.
+Keep all credentials private. Cold restart account-login recovery does not restore
+the old TCP attachment. Source: `sessions.zig`, `session_drop_tx.zig`, the SESSION
+handlers in `server.zig`, and [the living session contract](../../design/session-resume-anywhere-blueprint.md).
 
 ## CERTADD
 
@@ -211,7 +255,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Server notice confirming fingerprint binding.
 - Errors: `FAIL CERTADD TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `NO_CLIENT_CERT`, `CERT_ADD_FAILED`.
 - Example: `CERTADD`
-- Sources: `src/daemon/modules/accounts.zig:145`, `src/daemon/server.zig:23640`, `src/daemon/services.zig:531`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`, `src/daemon/services.zig`
 
 ## CERTLIST
 
@@ -222,7 +266,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Server notices, one `CERTLIST <fingerprint>` per bound fingerprint, or a no-fingerprints notice.
 - Errors: `FAIL CERTLIST TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `CERT_LIST_FAILED`.
 - Example: `CERTLIST`
-- Sources: `src/daemon/modules/accounts.zig:150`, `src/daemon/server.zig:23653`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`
 
 ## CERTDEL
 
@@ -233,7 +277,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Server notice confirming removal.
 - Errors: `FAIL CERTDEL TEMPORARILY_UNAVAILABLE`, `NOT_LOGGED_IN`, `NEED_MORE_PARAMS`, `CERT_NOT_OWNED`, `CERT_NOT_FOUND`, `CERT_DEL_FAILED`.
 - Example: `CERTDEL SHA256:...`
-- Sources: `src/daemon/modules/accounts.zig:151`, `src/daemon/server.zig:23669`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`
 
 ## KEYTRANS
 
@@ -276,7 +320,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Notices with the count/codes or `RECOVERYCODES: login ok`; consumed codes are immediately spent.
 - Errors: `FAIL RECOVERYCODES ACCOUNT_REQUIRED`, `INSECURE_TRANSPORT`, `AUTH_FAILED`, `NEED_MORE_PARAMS`, `INVALID_SUBCOMMAND`, and temporary/internal store errors.
 - Example: `RECOVERYCODES GENERATE` then `RECOVERYCODES LOGIN alice ABCDE-FGHJK`
-- Sources: `src/daemon/modules/accounts.zig:137`, `src/daemon/server.zig:23370`, `src/daemon/services.zig` recovery-code store
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig`, `src/daemon/services.zig` recovery-code store
 
 ## SETPASS
 
@@ -286,7 +330,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: `NOTICE` confirming the password change/reset.
 - Errors: `FAIL SETPASS ACCOUNT_REQUIRED`, `WRONG_PASSWORD`, `INVALID_PASSWORD`, `RESET_NOT_AUTHORIZED`, or `TEMPORARILY_UNAVAILABLE`.
 - Example: `SETPASS old-correct-horse new-correct-horse`
-- Sources: `src/daemon/modules/accounts.zig:140`, `src/daemon/server.zig:36837` (`handleSetpass`)
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleSetpass`)
 
 ## SUCCESSOR
 
@@ -296,7 +340,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Notices describing the current, changed, or cleared successor.
 - Errors: `FAIL SUCCESSOR ACCOUNT_UNKNOWN`, `NOT_FOUNDER`, `INVALID_VALUE`, `INVALID_SUBCOMMAND`, `NEED_MORE_PARAMS`, or temporary account-store errors.
 - Example: `SUCCESSOR #zig SET alice`
-- Sources: `src/daemon/modules/accounts.zig:142`, `src/daemon/server.zig:36974` (`handleSuccessor`)
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleSuccessor`)
 
 ## ACCOUNT
 
@@ -306,7 +350,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: `NOTICE` containing the action, account, registration state, and resulting flags.
 - Errors: `ERR_NOPRIVILEGES 481`, `FAIL ACCOUNT ACCOUNT_UNKNOWN`, `BAD_ACCOUNT_NAME`, `INVALID_VALUE`, `NEED_MORE_PARAMS`, or temporary store errors.
 - Example: `ACCOUNT SUSPEND alice`
-- Sources: `src/daemon/modules/accounts.zig:144`, `src/daemon/server.zig:37119` (`handleAccountAdmin`)
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleAccountAdmin`)
 
 ## SESSIONTOKEN
 
@@ -316,7 +360,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: `NOTICE SESSIONTOKEN <account> <token> expires=<unix-seconds>`.
 - Errors: `FAIL SESSIONTOKEN INSECURE_TRANSPORT`, `NOT_LOGGED_IN`, `TOKEN_ISSUE_FAILED`, or temporary account-store errors.
 - Example: `SESSIONTOKEN`
-- Sources: `src/daemon/modules/accounts.zig:153`, `src/daemon/server.zig:37264` (`handleSessionToken`)
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleSessionToken`)
 
 ## WEBAUTHN
 
@@ -326,7 +370,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: `WEBAUTHN` challenge/allow-credential lines, status/list notices, `WEBAUTHN LOCKED :password login disabled`, and a normal account login notice after a successful assertion.
 - Errors: `FAIL WEBAUTHN NOT_CONFIGURED`, `NOT_LOGGED_IN`, `NO_PENDING`, `BAD_CREDENTIAL_ID`, `BAD_CLIENT_DATA`, `BAD_AUTHDATA`, `BAD_SIGNATURE`, `BAD_ORIGIN`, `RP_MISMATCH`, `ASSERTION_FAILED`, `UNKNOWN_CREDENTIAL`, `CREDENTIAL_ACCOUNT_MISMATCH`, `PASSKEY_REQUIRED`, `INVALID_SUBCOMMAND`, and policy/temporary errors.
 - Example: `WEBAUTHN REGISTER phone`
-- Sources: `src/daemon/modules/accounts.zig:155`, `src/daemon/server.zig:38838` (`handleWebauthn`), `src/crypto/webauthn.zig`, `src/daemon/webauthn_creds.zig`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleWebauthn`), `src/crypto/webauthn.zig`, `src/daemon/webauthn_creds.zig`
 
 ## E2EEGROUP
 
@@ -336,7 +380,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Exact bounded control-line delivery to eligible attachments; `WARN E2EEGROUP AUTHORING_QUIESCED` or temporary warnings when custody/delivery cannot be staged.
 - Errors: `FAIL E2EEGROUP NOT_LOGGED_IN`, `IRCX_REQUIRED`, `CAP_REQUIRED`, `BAD_CHANNEL`, `BAD_KIND`, `BAD_DEVICE`, `BAD_ACCOUNT`, `BAD_PAYLOAD`, `NOT_ON_CHANNEL`, `DEVICE_NOT_OWNED`, `TARGET_UNAVAILABLE`, or `ORIGIN_REJECTED`.
 - Example: `E2EEGROUP #team COMMIT dev-a :<base64url-record>`
-- Sources: `src/daemon/modules/accounts.zig:158`, `src/daemon/server.zig:38144` (`handleE2eeGroup`), `src/proto/e2ee_group_control.zig`, `src/proto/e2ee_group_relay.zig`
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleE2eeGroup`), `src/proto/e2ee_group_control.zig`, `src/substrate/undertow/e2ee_group_relay.zig`
 
 ## RECOGNIZE
 
@@ -346,7 +390,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Notices for list entries and add/delete outcomes.
 - Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`, invalid-mask/list-full notices, or temporary account-service errors.
 - Example: `RECOGNIZE ADD *!*@trusted.example`
-- Sources: `src/daemon/modules/accounts.zig:162`, `src/daemon/server.zig:21807` (`handleRecognize`)
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleRecognize`)
 
 ## LISTCHANS
 
@@ -356,7 +400,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: `NOTICE LISTCHANS <#channel> <level>` and `End of LISTCHANS (n)`.
 - Errors: `ERR_NOPRIVILEGES 481` when not identified or temporary account-service errors.
 - Example: `LISTCHANS`
-- Sources: `src/daemon/modules/accounts.zig:163`, `src/daemon/server.zig:22071` (`handleListchans`)
+- Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` (`handleListchans`)
 
 ## WEBHOOK
 
@@ -366,7 +410,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Notices with the one-time URL, non-secret metadata, or deletion result.
 - Errors: `ERR_NEEDMOREPARAMS 461`, channel/operator errors, disabled-feature notice, limit errors, or invalid channel/id notices.
 - Example: `WEBHOOK CREATE #alerts bridge`
-- Sources: `src/daemon/modules/webhook.zig:24`, `src/daemon/server.zig:5371` (`handleWebhook`)
+- Sources: `src/daemon/modules/webhook.zig`, `src/daemon/server.zig` (`handleWebhook`)
 
 ## WEBPUSH
 
@@ -376,7 +420,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Notices for stored/removed endpoints and list count.
 - Errors: `FAIL WEBPUSH DISABLED`, `ACCOUNT_REQUIRED`, `NEED_MORE_PARAMS`, `INVALID_ENDPOINT`, `INVALID_KEY`, `TOO_MANY_SUBSCRIPTIONS`, `NOT_SUBSCRIBED`, or `INVALID_SUBCOMMAND`.
 - Example: `WEBPUSH SUBSCRIBE https://push.example/sub <p256dh-b64url> <auth-b64url>`
-- Sources: `src/daemon/modules/feature_misc.zig:62`, `src/daemon/server.zig:45281` (`handleWebpush`), `src/proto/webpush.zig`
+- Sources: `src/daemon/modules/feature_misc.zig`, `src/daemon/server.zig` (`handleWebpush`), `src/daemon/webpush.zig`
 
 ## MEMO
 
@@ -387,7 +431,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Server notices — `MEMO from <from> :<text>`, `MEMO: End of offline memos (<n>)`, clear/forward/ignore confirmations, and `MEMO: message stored for delivery` (or `… (forwarded to <account>)`). Clear/forward mutations also publish on the Event Spine service plane.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `FAIL MEMO ACCOUNT_REQUIRED`, `ACCOUNT_UNKNOWN`, `MAILBOX_FULL`, `INVALID_MESSAGE`, `TEMPORARILY_UNAVAILABLE`, `INVALID_SUBCOMMAND`, `FORWARD_CYCLE`, `INVALID_ACCOUNT`.
 - Example: `MEMO SEND alice :ping me later`
-- Sources: `src/daemon/modules/feature_misc.zig:61`, `src/daemon/server.zig:40648`, `src/daemon/server.zig:40655`, `src/daemon/memo.zig:4`
+- Sources: `src/daemon/modules/feature_misc.zig`, `src/daemon/server.zig`, `src/daemon/memo.zig`
 
 ## VHOST
 
@@ -398,7 +442,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Server notices; native `CHGHOST` lines to capable clients when a host changes.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`, `FAIL VHOST ACCOUNT_REQUIRED`, `INVALID_HOST`, `TEMPORARILY_UNAVAILABLE`; other validation failures as notices.
 - Example: `VHOST REQUEST staff.example`
-- Sources: `src/daemon/modules/feature_misc.zig:49`, `src/daemon/server.zig:9734`, `src/daemon/server.zig:9982`
+- Sources: `src/daemon/modules/feature_misc.zig`, `src/daemon/server.zig`
 
 ## PRIVS
 
@@ -409,7 +453,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: `RPL_PRIVS 270`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `PRIVS`
-- Sources: `src/daemon/modules/feature_misc.zig:50`, `src/daemon/server.zig:9709`
+- Sources: `src/daemon/modules/feature_misc.zig`, `src/daemon/server.zig`
 
 ## FILTER
 
@@ -420,7 +464,7 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Server notices for list/end output and mutation confirmations.
 - Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`, `FAIL FILTER TEMPORARILY_UNAVAILABLE`, `INVALID_PATTERN`, `NO_SUCH_PATTERN`, `INVALID_SUBCOMMAND`.
 - Example: `FILTER ADD badword`
-- Sources: `src/daemon/modules/feature_misc.zig:51`, `src/daemon/server.zig:9647`
+- Sources: `src/daemon/modules/feature_misc.zig`, `src/daemon/server.zig`
 
 ## SEEN
 
@@ -431,4 +475,4 @@ do not revoke unrelated groups or SASL account-authentication credentials.
 - Replies: Server notices with summary and recent records, or `SEEN <account>: no record`.
 - Errors: `ERR_NEEDMOREPARAMS 461`.
 - Example: `SEEN alice`
-- Sources: `src/daemon/modules/services_ext.zig:58`, `src/daemon/server.zig:7185`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`

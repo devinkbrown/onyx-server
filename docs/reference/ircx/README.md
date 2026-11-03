@@ -2,9 +2,7 @@
 
 _Index of Onyx Server's IRCX command family, with a cross-check of the live surface against the canonical draft._
 
-Onyx Server implements IRCX natively in Zig. There is **no `modules/` directory, no
-MAPI, and no pseudo-clients** — every IRCX verb is a real server command
-registered in the SerpentRegistry module table
+Onyx Server implements IRCX as built-in Zig server commands registered in the SerpentRegistry module table
 [`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig) as a thin
 thunk over a `LinuxServer.handle*` method in
 [`src/daemon/server.zig`](../../../src/daemon/server.zig). Protocol parsing,
@@ -38,8 +36,7 @@ module.
 
 | Document | Role |
 | --- | --- |
-| [`ircx-draft-pfenning-04.md`](ircx-draft-pfenning-04.md) | Canonical IETF draft — source of truth for numerics, commands, modes, and properties. |
-| [`ircx-protocol.md`](ircx-protocol.md) | Legacy behavioral blueprint (prior C IRCX daemon). Historical only — not authoritative on identity/SID; Onyx Server is SID-free. |
+| [`ircx-draft-pfenning-04.md`](ircx-draft-pfenning-04.md) | Historical external draft excerpt defining the IRCX standard vocabulary; current daemon behavior and deliberate extensions are documented by the live references and source. |
 | [../../architecture/event-spine.md](../../architecture/event-spine.md) | Full architecture behind `EVENT`, OBSERVE, BROADCAST, categories, and severity. |
 
 ## Numeric map (live)

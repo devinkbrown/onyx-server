@@ -15,7 +15,10 @@ computed reads are `channelBuiltinGet`; validated writes are
 `OID`, `NAME`, `CREATION`, `MEMBERCOUNT`, `MEMBERLIMIT`, `LANGUAGE`,
 `FOUNDERKEY`, `OWNERKEY`, `HOSTKEY`, `VOICEKEY`, `MEMBERKEY`, `PICS`, `TOPIC`,
 `SUBJECT`, `CLIENT`, `ONJOIN`, `ONPART`, `LAG`, `ACCOUNT`, `CLIENTGUID`,
-`SERVICEPATH`, `no-ai`, `local-only`, `server-ai-ok`, `history-policy`.
+`SERVICEPATH`, `no-ai`, `local-only`, `server-ai-ok`, `history-policy`. Generic
+policy keys such as `encryption-policy`, `SLOWMODE` and
+`membership-visibility` have additional live consumer rules; they are not all
+members of the named built-in enum.
 
 `ONJOIN` is sent only to the client that just joined, as a `PRIVMSG` with the
 channel name as the sender. `ONPART` is sent only to the client that just
@@ -46,7 +49,7 @@ not see these rows at all.
 
 ## Persisted policy properties
 
-### `EPHEMERAL <secs>` — message TTL (commit `201e5f3`)
+### `EPHEMERAL <secs>` — message TTL
 
 ```text
 PROP <#channel> EPHEMERAL :<seconds>     # 60 … 2592000 (30 days)
@@ -66,7 +69,7 @@ never re-served. The history ring still bounds memory; this makes the expiry
 policy authoritative on read. Only `#`/`&` channels are ephemeral (DMs never
 expire on this path).
 
-### `PINS` — pinned messages (commit `dc2c351`)
+### `PINS` — pinned messages
 
 ```text
 PROP <#channel> PINS :<msgid>[,<msgid>…]   # up to 50 msgids
@@ -127,9 +130,9 @@ existence/secret/private/hidden checks pass. DMs do not use this channel policy.
 
 Channel properties (built-in, `EPHEMERAL`, `PINS`, `history-policy`,
 `onyx_server.topics`, and AI policy flags alike) are signed at the local origin and
-replicated as last-writer-wins CRDT facts. Commit `c2eee68` fixed cross-mesh
-PROP propagation so channel and entity properties now reach peers; the origin is
-stamped with the node's `shortId`.
+replicated as last-writer-wins CRDT facts. The origin is stamped with its node `shortId`; relays retain the original
+signature and LWW identity. Current source, not the age of the first introducing
+commit, determines which consumers and admission rules apply.
 
 ## Examples
 

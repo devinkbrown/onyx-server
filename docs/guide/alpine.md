@@ -155,25 +155,4 @@ not exercise kernel ring creation. Verify a real native startup under the
 intended service/container restrictions without disabling security checks.
 
 
-## Observed candidate environment
-
-The 2026-10-26 native environment record identifies **Alpine Linux 3.24.2**,
-x86_64, kernel `6.18.55-0-lts`, with the musl loader present. The retained
-record is `.zig-cache/wave-6/live-benchmark/native-environment.json`; it is an
-observation of this host, not certification of every Alpine deployment.
-
-On this host, the pinned-TLS four-client benchmark pilot passed its receipt
-and task-custody checks: 24 burst deliveries and 192 continuous deliveries,
-with no missing or duplicate receipts. It is explicitly a small correctness
-pilot on captured Debug artifact `80c8152491bd…92d20`, not an optimized
-performance baseline. Native offline export also passed ten empty-baseline
-controls and five nonempty signed-fact cases on that artifact. The current
-module cut passed 700 Debug tests with 34 platform/root skips, including real
-mTLS and native UDP workers; those Linux paths executed rather than being
-reported as platform skips.
-
-These are partial A07 evidence. DNS, IPv6, the full UDP/WebTransport transport
-matrix, limits and descriptor-upgrade journeys still require their separate
-Alpine acceptance. OpenRC installation/supervision and older-CPU execution
-remain separate requirements. No service was installed or changed by these
-fixtures.
+Source of truth: `build.zig`, `etc/openrc/onyx-server`, `etc/openrc/onyx-server.confd`, `tools/alpine_openrc_smoke.py`, `tools/alpine_runtime_smoke.py` and `tools/alpine_diagnostics_smoke.py`. Current installed fleet facts live in [production paths](../ops/onyx-server-paths.md); platform-specific tests retain their recorded scope.

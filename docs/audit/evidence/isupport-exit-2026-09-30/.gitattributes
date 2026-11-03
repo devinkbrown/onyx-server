@@ -1,2 +1,0 @@
-# Preserve exact command stdout/stderr.
-*.log -whitespace

@@ -2,7 +2,7 @@
 
 *Membership, moderation, topic and mode control, plus extended channel-administration services.*
 
-The channel command module registers the base membership and moderation commands (`src/daemon/modules/channel_ops.zig:56`, `src/daemon/modules/channel_ops.zig:59`). IRCX channel-administration commands are split between `channel.ops` for `CREATE` and the `ircx` module for `PROP`, `ACCESS`, and `MODEX` (`src/daemon/modules/channel_ops.zig:67`, `src/daemon/modules/ircx.zig:56`, `src/daemon/modules/ircx.zig:65`). Extended service commands such as `CLEAR` and `TEMPMODE` are registered in `services.ext` (`src/daemon/modules/services_ext.zig:44`, `src/daemon/modules/services_ext.zig:63`).
+The channel command module registers the base membership and moderation commands (`src/daemon/modules/channel_ops.zig`). IRCX channel-administration commands are split between `channel.ops` for `CREATE` and the `ircx` module for `PROP`, `ACCESS`, and `MODEX` (`src/daemon/modules/channel_ops.zig`, `src/daemon/modules/ircx.zig`). Extended service commands such as `CLEAR` and `TEMPMODE` are registered in `services.ext` (`src/daemon/modules/services_ext.zig`).
 
 ## JOIN
 
@@ -13,7 +13,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `JOIN` broadcast, `RPL_TOPIC 332` or `RPL_NOTOPIC 331`, `RPL_NAMREPLY 353`, `RPL_ENDOFNAMES 366`; may emit `ERR_LINKCHANNEL 470` for forward.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_TOOMANYCHANNELS 405`, `ERR_BANNEDFROMCHAN 474`, `ERR_SECUREONLYCHAN 489`, `ERR_NEEDREGGEDNICK 477`, `ERR_INVITEONLYCHAN 473`, `ERR_BADCHANNELKEY 475`, `ERR_THROTTLE 480`, `ERR_CHANNELISFULL 471`, `ERR_UNAVAILRESOURCE 437`.
 - Example: `JOIN #zig,#ops hunter2,`
-- Sources: `src/daemon/modules/channel_ops.zig:59`, `src/daemon/server.zig:11441`, `src/daemon/server.zig:11446`, `src/daemon/server.zig:11516`, `src/daemon/server.zig:11665`, `src/daemon/server.zig:11745`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ## PART
 
@@ -24,7 +24,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `PART` broadcast.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`.
 - Example: `PART #zig :later`
-- Sources: `src/daemon/modules/channel_ops.zig:60`, `src/daemon/server.zig:11777`, `src/daemon/server.zig:11791`, `src/daemon/server.zig:11839`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ## NAMES
 
@@ -37,7 +37,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `RPL_NAMREPLY 353`, `RPL_ENDOFNAMES 366`.
 - Errors: `ERR_NOSUCHCHANNEL 403` only for an explicit invalid channel name.
 - Example: `NAMES #zig`
-- Sources: `src/daemon/modules/channel_ops.zig:61`, `src/daemon/server.zig:11846`, `src/daemon/server.zig:11848`, `src/daemon/server.zig:11869`, `src/daemon/server.zig:11878`, `src/daemon/server.zig:11889`, `src/daemon/server.zig:12676`, `src/daemon/server.zig:12828`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ## MODE
 
@@ -48,7 +48,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `RPL_CHANNELMODEIS 324`, `RPL_CREATIONTIME 329`, `RPL_UMODEIS 221`, list numerics (`367/368`, `346/347`, `348/349`, `728/729`), `RPL_IRCX 800`, or `MODE` broadcasts.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NOSUCHNICK 401`, `ERR_USERNOTINCHANNEL 441`, `ERR_USERSDONTMATCH 502`, `ERR_BANLISTFULL 478`, `ERR_NOPRIVILEGES 481`.
 - Example: `MODE #zig +nt`
-- Sources: `src/daemon/modules/channel_ops.zig:62`, `src/daemon/server.zig:11965`, `src/daemon/server.zig:11971`, `src/daemon/server.zig:12005`, `src/daemon/server.zig:12111`, `src/daemon/server.zig:12199`, `src/daemon/server.zig:12232`, `src/daemon/server.zig:12412`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ### Channel mode inventory
 
@@ -58,7 +58,7 @@ The channel command module registers the base membership and moderation commands
 - Parameter modes: `k` key on set/unset, `l` limit on set, `f` forward target on set, `j` join throttle on set.
 - Core flag modes: `i`, `m`, `n`, `t`, `s`, `C`, `T`, `N`, `g`, `S`, `M`, `W`, `O`, `A`.
 - IRCX extension flags are defined by `chanmode_ext`: `p`, `h`, `s`, `m`, `t`, `i`, `n`, `u`, `a`, `f`, `d`, `E`, `r`, `z`, `x`, `w`, `V`, `U`, `F`, `D`. Direct `MODE` handles `p`/`h` separately, treats `f` as the core forward mode, and falls through to `chanmode_ext` for non-core extension letters; `MODEX NOFORMAT` is the named path for the extension `f`.
-- Sources: `src/proto/protocol_inventory.zig:58`, `src/proto/protocol_inventory.zig:59`, `src/daemon/dispatch.zig:55`, `src/daemon/dispatch.zig:2789`, `src/daemon/dispatch.zig:2817`, `src/daemon/chanmode.zig:399`, `src/proto/chanmode_ext.zig:51`, `src/daemon/server.zig:12232`, `src/daemon/server.zig:12412`, `src/daemon/server.zig:30968`
+- Sources: `src/proto/protocol_inventory.zig`, `src/daemon/dispatch.zig`, `src/daemon/chanmode.zig`, `src/proto/chanmode_ext.zig`, `src/daemon/server.zig`
 
 ## KICK
 
@@ -69,7 +69,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `KICK` broadcast before removal.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_USERNOTINCHANNEL 441`.
 - Example: `KICK #zig badnick :rules`
-- Sources: `src/daemon/modules/channel_ops.zig:63`, `src/daemon/server.zig:12568`, `src/daemon/server.zig:12577`, `src/daemon/server.zig:12597`, `src/daemon/server.zig:12613`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ## INVITE
 
@@ -80,7 +80,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `RPL_INVITING 341` to inviter and `INVITE` line to target.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_USERONCHANNEL 443`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NOSUCHNICK 401`.
 - Example: `INVITE alice #zig`
-- Sources: `src/daemon/modules/channel_ops.zig:64`, `src/daemon/server.zig:13471`, `src/daemon/server.zig:13484`, `src/daemon/server.zig:13488`, `src/daemon/server.zig:13500`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ## TOPIC
 
@@ -91,7 +91,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `RPL_TOPIC 332`, `RPL_NOTOPIC 331`, or `TOPIC` broadcast.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`.
 - Example: `TOPIC #zig :Onyx Server development`
-- Sources: `src/daemon/modules/channel_ops.zig:65`, `src/daemon/server.zig:29987`, `src/daemon/server.zig:29999`, `src/daemon/server.zig:30008`, `src/daemon/server.zig:30024`, `src/daemon/server.zig:30036`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ## KNOCK
 
@@ -103,7 +103,7 @@ The channel command module registers the base membership and moderation commands
 - `711` is sent only when a local operator was notified.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_KNOCKONCHAN 714`, `ERR_CHANOPEN 713`.
 - Example: `KNOCK #private :please`
-- Sources: `src/daemon/modules/channel_ops.zig:66`, `src/daemon/server.zig:13821`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ## CREATE
 
@@ -114,7 +114,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: Same join/topic/NAMES surface as `JOIN`, plus inherited or requested `MODE` broadcasts when modes are applied. The creator receives `CREATE <channel> <oid>` with oid `0` plus 8 hex digits.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid create syntax, `ERR_CHANNELEXIST 926` when the target already exists, `ERR_NOSUCHCHANNEL 403` for a missing clone source; join and mode errors from delegated paths.
 - Example: `CREATE #new`
-- Sources: `src/daemon/modules/channel_ops.zig:67`, `src/proto/ircx_create.zig:63`, `src/proto/ircx_create.zig:111`, `src/daemon/server.zig:21225`, `src/daemon/server.zig:21235`, `src/daemon/server.zig:21239`, `src/daemon/server.zig:21262`, `src/daemon/server.zig:21275`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/proto/ircx_create.zig`, `src/daemon/server.zig`
 
 ## PROP
 
@@ -126,7 +126,7 @@ The channel command module registers the base membership and moderation commands
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOACCESS 913`, `ERR_BADVALUE 906`.
 - IRCX key ladder: secret channel keys are read-gated per tier: `FOUNDERKEY` requires founder, `OWNERKEY` owner, `HOSTKEY` operator, `VOICEKEY` voice, and `MEMBERKEY` any member; server operators can read all. On keyed JOIN, the current handler reads `FOUNDERKEY`, `OWNERKEY`, and `HOSTKEY` as raw secret props and grants founder, owner, or operator status respectively when the presented key matches.
 - Example: `PROP #zig SUBJECT :Onyx Server development`
-- Sources: `src/daemon/modules/ircx.zig:65`, `src/daemon/server.zig:11665`, `src/daemon/server.zig:11678`, `src/daemon/server.zig:11683`, `src/daemon/server.zig:19694`, `src/daemon/server.zig:19738`, `src/daemon/server.zig:19759`, `src/daemon/server.zig:20437`, `src/daemon/server.zig:20449`, `src/daemon/server.zig:20464`, `src/daemon/server.zig:20499`, `src/daemon/server.zig:20509`, `src/proto/ircx_prop_store.zig:111`, `src/proto/ircx_prop_store.zig:187`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`, `src/proto/ircx_prop_store.zig`
 
 ## ACCESS
 
@@ -137,7 +137,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `RPL_ACCESSADD 801`, `RPL_ACCESSDELETE 802`, `RPL_ACCESSSTART 803`, `RPL_ACCESSENTRY 804`, `RPL_ACCESSEND 805`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NOPRIVILEGES 481`.
 - Example: `ACCESS #zig ADD VOICE *!*@trusted.example 3600 :temporary voice`
-- Sources: `src/daemon/modules/ircx.zig:66`, `src/daemon/server.zig:11691`, `src/daemon/server.zig:18363`, `src/daemon/server.zig:19582`, `src/daemon/server.zig:19600`, `src/proto/ircx_access_store.zig:12`, `src/proto/ircx_access_store.zig:79`, `src/proto/ircx_access_store.zig:380`, `src/proto/ircx_access_store.zig:465`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`, `src/proto/ircx_access_store.zig`
 
 ## MODEX
 
@@ -148,7 +148,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `RPL_MODEXLIST 826`, `RPL_MODEXEND 827`, or normal `MODE` broadcasts.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NOPRIVILEGES 481`.
 - Example: `MODEX #zig +AUTHONLY +FREETARGET`
-- Sources: `src/daemon/modules/ircx.zig:70`, `src/proto/ircx_modex.zig:103`, `src/proto/ircx_modex.zig:219`, `src/proto/ircx_modex.zig:248`, `src/proto/ircx_modex.zig:271`, `src/proto/ircx_modex.zig:300`, `src/daemon/server.zig:17444`, `src/daemon/server.zig:17459`, `src/daemon/server.zig:17489`, `src/daemon/server.zig:17531`, `src/daemon/server.zig:30968`
+- Sources: `src/daemon/modules/ircx.zig`, `src/proto/ircx_modex.zig`, `src/daemon/server.zig`
 
 ## RENAME
 
@@ -159,7 +159,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: Rename notification/broadcast from handler.
 - Errors: `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, parser errors as `ERR_NEEDMOREPARAMS 461`.
 - Example: `RENAME #old #new :new name`
-- Sources: `src/daemon/modules/channel_ops.zig:68`, `src/daemon/server.zig:13869`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig`
 
 ## CHANBADWORDS
 
@@ -169,7 +169,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: Notices for each listed pattern and add/delete outcome, followed by an end marker for `LIST`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, or temporary service errors.
 - Example: `CHANBADWORDS #zig ADD slur`
-- Sources: `src/daemon/modules/channel_ops.zig:69`, `src/daemon/server.zig:22100` (`handleChanbadwords`), `src/daemon/svc_chanbadwords.zig`
+- Sources: `src/daemon/modules/channel_ops.zig`, `src/daemon/server.zig` (`handleChanbadwords`), `src/daemon/svc_chanbadwords.zig`
 
 ## AKICK
 
@@ -191,7 +191,7 @@ The channel command module registers the base membership and moderation commands
 - Replies: `KICK` broadcasts plus final server `NOTICE` count.
 - Errors: `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`; parser errors are sent as server notices.
 - Example: `CLEAR #zig USERS KEEP op :reset`
-- Sources: `src/daemon/modules/services_ext.zig:63`, `src/daemon/server.zig:18832`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`
 
 ## TEMPMODE
 
@@ -202,4 +202,4 @@ The channel command module registers the base membership and moderation commands
 - Replies: `MODE` broadcast for adds; server `NOTICE` for cancel/sweep.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_UNKNOWNMODE 472`, `ERR_NOPRIVILEGES 481`.
 - Example: `TEMPMODE ADD #zig m 60000`
-- Sources: `src/daemon/modules/services_ext.zig:64`, `src/daemon/server.zig:18917`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`

@@ -1,6 +1,7 @@
 # Onyx client integration change outline
 
-2026-10-26 · proposed client work · companion to the
+Requirements baseline: 2026-10-26; reviewed for scope on 2026-11-03. Proposed
+client work, not a statement of deployed client behavior. Companion to the
 [integrated delivery roadmap](../ROADMAP-2026-10-26.md)
 
 This outlines the client changes needed to deliver the requested quality of
@@ -9,7 +10,7 @@ Client source has not been inspected in this repository. Items describe the
 desired behavior and integration contracts, not an assertion that an existing
 client lacks a feature. No client repository is changed by this document.
 
-The [next wizard and client wave](wizard-client-next-wave-2026-10-27.md) turns
+The [next wizard and client wave](https://github.com/devinkbrown/onyx-server/blob/3fa6e95021601c92d2a2b68869d8fa9f4047d391/docs/design/wizard-client-next-wave-2026-10-27.md) turns
 setup, recovery, accessibility, media readiness, and host-change continuity into
 concrete user flows and acceptance criteria. These remain proposed client work.
 
@@ -442,7 +443,7 @@ unconsented disclosure. Publish before/after evidence, not estimated speedups.
 The portable server candidate now prefers ChaCha when its compiled AES backend
 is software, while accelerated builds retain AES preference and AES remains a
 fallback. Use standard TLS negotiation rather than an Onyx-specific cipher
-selector. The [matched study](../ops/tls-cipher-policy-benchmark-2026-10-27.md)
+selector. The [matched study](https://github.com/devinkbrown/onyx-server/blob/3fa6e95021601c92d2a2b68869d8fa9f4047d391/docs/ops/tls-cipher-policy-benchmark-2026-10-27.md)
 records the bounded observed benefit; it is not a client or mesh benchmark.
 
 Keep TLS ticket/PSK storage, account `SESSIONTOKEN`, and logical-session resume
@@ -529,7 +530,7 @@ state, client implementation, and TLS client acceptance remain separate gates.
 
 ## Proposed physical media ownership contract
 
-The [physical media owner design](media-physical-owner-namespace-2026-10-27.md)
+The [physical media owner design](https://github.com/devinkbrown/onyx-server/blob/3fa6e95021601c92d2a2b68869d8fa9f4047d391/docs/design/media-physical-owner-namespace-2026-10-27.md)
 addresses a confirmed cross-node ambiguity when separate physical attachments
 reuse the same signed client envelope. Proposed qualified handshake, group-key,
 and retirement messages would distinguish each physical owner and generation;

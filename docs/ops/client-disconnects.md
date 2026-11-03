@@ -1,7 +1,9 @@
 # Client disconnect diagnosis
 
-This page describes the candidate source behavior. It is not a deployment
-receipt; verify the running artifact before assuming these changes are active.
+This page describes the current source policy. Use [production paths](onyx-server-paths.md) to
+identify the accepted running image and [the release audit](../audit/release-and-test-speed-2026-11-03.md)
+for deployment acceptance. A timeout diagnosis still requires the affected
+connection's own evidence.
 
 ## Receive errors
 
@@ -29,12 +31,10 @@ a 30,000-millisecond timeout could therefore abort after the first missed probe.
 The longer value also changes the allowed unacknowledged-data stall to one
 minute. Application-level deadlines remain independent and may close sooner.
 
-A controlled test using the production timers on Linux 6.18.55 observed the old
-policy fail with `ETIMEDOUT` after 40.286 seconds. The candidate survived a
-45-second interruption and then exchanged data in both directions. That test
-used a private network namespace and a drop filter on its own client socket;
-it did not change production traffic. It proves the policy difference, not the
-cause of any historical client's packet loss.
+The socket-policy regression checks real accepted-socket inheritance.
+These timers bound failed transport progress; they do not identify the cause
+of a particular client's packet loss. Correlate the actual connection's
+diagnostics and network evidence before attributing responsibility.
 
 Newly created listeners apply the new timeout, and accepted sockets inherit it.
 The real accept-path regression checks inheritance and the client keepalive
@@ -45,3 +45,6 @@ explicitly reapplies listener options. Outbound dials do not gain a new
 `TCP_USER_TIMEOUT` setting from this change. A cold start with fresh listeners
 and connections is needed for complete adoption of this listener policy; follow
 the runbook's custody requirements before restarting a live node.
+
+Source of truth: `src/daemon/client_socket_policy.zig`, `server.zig` receive/accept
+paths, and the connection diagnostics described in [Alpine operation](../guide/alpine.md).

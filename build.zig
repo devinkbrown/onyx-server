@@ -1637,7 +1637,7 @@ pub fn build(b: *std.Build) void {
     const bench_install = b.addInstallArtifact(bench_exe, .{});
     const bench_run = b.addRunArtifact(bench_exe);
     bench_run.step.dependOn(&bench_install.step);
-    const bench_step = b.step("bench", "Run the 0.7 measurement harness: parse, tag compose, fan-out framing, cross-shard handoff, accept rate (P0-1)");
+    const bench_step = b.step("bench", "Measure parse, tag compose, fan-out framing, cross-shard handoff and accept rate");
     bench_step.dependOn(&bench_run.step);
 
     // Separate direct-leaf OFFER signature-work measurement. No default test,
@@ -1682,7 +1682,7 @@ pub fn build(b: *std.Build) void {
     bench_live_run.addArg("--bin");
     bench_live_run.addArtifactArg(bench_live_exe);
     bench_live_run.addPassthruArgs();
-    const bench_live_step = b.step("bench-live", "Live-daemon P0-1 axes: TLS/shards/ring JOIN+PRIVMSG RTT + RSS (throwaway loopback; not orochi)");
+    const bench_live_step = b.step("bench-live", "Measure live TLS/shards/ring JOIN+PRIVMSG RTT and RSS (private loopback daemon)");
     bench_live_step.dependOn(&bench_live_run.step);
 
     // GAP-X5. Separate from `bench` so the default harness does not compile

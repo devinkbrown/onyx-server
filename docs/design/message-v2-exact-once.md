@@ -2,7 +2,10 @@
 
 Status: canonical signed codec, secured exact-wire transport, Lotus exact-once
 ingestion, durable RVG2 replay authority, and mandatory Helix relation are
-implemented. The daemon integration must follow the transaction below.
+implemented in the live daemon. This living source contract was reconciled on
+2026-11-03. **Durability here means in-memory custody retained through a compatible
+Helix checkpoint, not a disk WAL or power-loss recovery**; see the cold-restart
+section before choosing a maintenance strategy.
 
 ## Immutable transport object
 
@@ -34,19 +37,22 @@ Call `relay_v2_replay_guard.Guard.admitMessage(msg)`. It verifies the origin and
 returns:
 
 - `accepted: RelayId`;
-- `duplicate`, `equivocation`, `retired`, or `origin_capacity`; or
+- `duplicate: RelayId` for the exact retained accepted object;
+- `equivocation`, `retired`, or `origin_capacity`; or
 - `origin_mismatch`, `bad_signature`, or `invalid_semantic`.
 
-Only `accepted` carries an identity. That exact payload is the message identity
-for Lotus, rendered msgid/server-time state, audit correlation, and forwarding.
-Do not call `relayId` again after admission.
+Both accepted and exact duplicate outcomes retain the authenticated identity.
+Only `accepted` authorizes new history/delivery/forward publication. A duplicate
+identity is prior-acceptance evidence used for receipt/re-ACK processing; it does
+not authorize another delivery. Use the returned payload for msgid/time/audit
+correlation instead of independently calling `relayId` again.
 
 ## Transactional guard and Lotus publication
 
 Serialize this lane under one daemon-owned replay/history mutation lock
 (`relay_v2_replay_mu`). The shipped entry point is
 `admitRelayV2Detailed(msg, history, outbox, delivery)`
-(`src/daemon/server.zig:10443`); its `.accepted` is the only outcome that
+(`src/daemon/server.zig`); its `.accepted` is the only outcome that
 authorizes live delivery, SearchIndex projection, or exact-wire re-forwarding.
 Up to five authorities join one no-fail cut — the RVG2 replay guard, the Lotus
 history store, the RVL2 accepted-event log, the RVO2 per-hop outbox, and the
@@ -60,27 +66,23 @@ inbound history-only path.
    moves.
 2. Stage a complete RVG2 replay-guard candidate from the live checkpoint and
    call `candidate.admitMessage(msg)` exactly once; only `accepted => relay_id`
-   proceeds (`src/daemon/server.zig:10457`, `src/daemon/server.zig:10466`). No
+   proceeds (`src/daemon/server.zig`). No
    live object has changed yet.
 3. When an outbox reservation is present, require the configured direct-neighbor
    membership (at least this node plus one neighbor) and stage a fully-allocated
    RVL2 `prepareAccepted` plan over the live accepted-event log; it must report
-   `.inserted` (`src/daemon/server.zig:10481`, `src/daemon/server.zig:10482`,
-   `src/daemon/server.zig:10496`).
+   `.inserted` (`src/daemon/server.zig`).
 4. When a history row is present, build the Lotus candidate from the live
    history checkpoint and call `ingestExactOnce` with the exact accepted id and
-   signed fields; it must report `.inserted` (`src/daemon/server.zig:10507`,
-   `src/daemon/server.zig:10513`).
+   signed fields; it must report `.inserted` (`src/daemon/server.zig`).
 5. Reserve every immediate-hop retransmission before any authority becomes live:
    `relay_v2_outbox.putBatchExcluding` is itself failure-atomic and is the last
    fallible step, copying the exact wire once per eligible neighbor and
-   excluding the ingress hop (`src/daemon/server.zig:10534`).
+   excluding the ingress hop (`src/daemon/server.zig`).
 6. No fallible work remains. Commit the prepared ADS1 delivery batch to publish
    the exact per-attachment rendered records, then swap the Lotus and RVG2
    candidates into their live stores and commit the RVL2 plan — every step here
-   is allocation-free and cannot fail (`src/daemon/server.zig:10550`,
-   `src/daemon/server.zig:10552`, `src/daemon/server.zig:10555`,
-   `src/daemon/server.zig:10560`).
+   is allocation-free and cannot fail (`src/daemon/server.zig`).
 7. After that publication, update SearchIndex/metrics and perform local delivery
    and exact-wire mesh forwarding. Projection failure may be audited and
    repaired, but it must not roll back or duplicate the accepted authorities.
@@ -106,57 +108,56 @@ Durable custody is scoped to the node's own direct neighbors, and three distinct
 
 - `trust_roots` is the exact direct-neighbor set — the peer node identities this
   node pins for secured S2S — and is deliberately not a broad transitive trust
-  list (`src/daemon/server.zig:3362`, `src/daemon/server.zig:3367`).
+  list (`src/daemon/server.zig`).
 - `admission_roots` are the MeshPass token *signer* roots, a separate authority
-  from peer node-identity pins (`src/daemon/server.zig:2020`).
+  from peer node-identity pins (`src/daemon/server.zig`).
 - `relay_v2_roster` is the full secured-mesh node-key inventory used for
   activation; unlike `trust_roots` it is not limited to direct neighbors
-  (`src/daemon/server.zig:2033`).
+  (`src/daemon/server.zig`).
 
 The RVL2 required-node set is derived once at init as this node plus the short
 ids of every `trust_roots` neighbor, sorted and de-duplicated; a set that
 contains the local node, a duplicate, or a short-id collision disables durable
 membership rather than shipping a wrong custody graph
-(`src/daemon/server.zig:3365`, `src/daemon/server.zig:4155`). A row in the
+(`src/daemon/server.zig`). A row in the
 accepted-event log retires — dropping its retained wire — only once every
 required node has durably confirmed it
-(`src/daemon/relay_v2_event_log.zig:16`); until then the RVO2 outbox retains the
+(`src/daemon/relay_v2_event_log.zig`); until then the RVO2 outbox retains the
 exact origin-signed wire per neighbor "until that peer authenticates an ACK"
-(`src/daemon/relay_v2_outbox.zig:4`).
+(`src/daemon/relay_v2_outbox.zig`).
 
 Custody advances only on an authenticated direct neighbor's ACK.
 `relayV2DirectNeighbor` gates every custody transition on membership in the
-required-node set (`src/daemon/server.zig:10681`). An inbound ACK records that
+required-node set (`src/daemon/server.zig`). An inbound ACK records that
 neighbor in the RVL2 confirmed set and retires its RVO2 obligation
-(`commitRelayV2NeighborAck`, `src/daemon/server.zig:10870`); the receiver
+(`commitRelayV2NeighborAck`, `src/daemon/server.zig`); the receiver
 retransmits its own ACK until the origin returns an ACK_CONFIRM
-(`commitRelayV2IngressAckConfirm`, `src/daemon/server.zig:10895`), so a lost ACK
+(`commitRelayV2IngressAckConfirm`, `src/daemon/server.zig`), so a lost ACK
 cannot age a custody proof out behind unrelated traffic. A duplicate inbound
 edge in a cycle re-reserves that neighbor's receipt transactionally before
-re-ACKing (`retainRelayV2DuplicateIngress`, `src/daemon/server.zig:10592`).
+re-ACKing (`retainRelayV2DuplicateIngress`, `src/daemon/server.zig`).
 
 ## Unified egress scheduler
 
 Every MESSAGE_V2 egress — the just-accepted live case and all retransmission —
 flows through one per-origin ordered scheduler; `forwardAcceptedRelayV2` does no
 direct forwarding of its own and instead wakes reactor 0, which owns the S2S
-links (`src/daemon/server.zig:10791`). Direct forwarding would let a newer
+links (`src/daemon/server.zig`). Direct forwarding would let a newer
 same-origin event overtake a still-retained older one and let RVG2 retire the
 older event at the receiver.
 
 `collectRelayV2RetryWork` round-robins a durable per-target cursor over the
 required neighbors and asks the accepted-event log for one page per neighbor
-(`src/daemon/server.zig:11054`, `src/daemon/server.zig:11065`,
-`src/daemon/server.zig:11077`). `collectPageForNode` exposes at most the lowest
+(`src/daemon/server.zig`). `collectPageForNode` exposes at most the lowest
 missing HLC per origin for that target — "a higher event can never overtake a
 lower unconfirmed event and be retired by RVG2's greatest-W watermark" — and the
 fairness cursor rotates *between* origins but never advances *within* one
-(`src/daemon/relay_v2_event_log.zig:642`). The result is a strict per-origin
+(`src/daemon/relay_v2_event_log.zig`). The result is a strict per-origin
 FIFO: no newer-before-older same-origin frame ever reaches a neighbor, even
 across a backlog larger than the RVG2 per-origin window (a live-egress case the
-tests pin explicitly, `src/daemon/server.zig:50701`). `retryRelayV2Outbox`
+tests pin explicitly, `src/daemon/server.zig`). `retryRelayV2Outbox`
 drains that work under a bounded per-pass frame/byte budget and applies the same
-bounded, fair shape to outstanding ACK receipts (`src/daemon/server.zig:11090`).
+bounded, fair shape to outstanding ACK receipts (`src/daemon/server.zig`).
 
 ## Mesh-wide authoring barrier
 
@@ -225,38 +226,38 @@ durable. There is no disk write-ahead log behind this custody plane.
 
 The four custody authorities are in-memory only:
 
-- RVL2 accepted-event authority (`src/daemon/relay_v2_event_log.zig:4`), which
+- RVL2 accepted-event authority (`src/daemon/relay_v2_event_log.zig`), which
   retires a retained wire once every required node confirms
-  (`relay_v2_event_log.zig:16-17`);
-- RVO2 per-hop retransmission authority (`src/daemon/relay_v2_outbox.zig:4-9`),
+  (`relay_v2_event_log.zig`);
+- RVO2 per-hop retransmission authority (`src/daemon/relay_v2_outbox.zig`),
   which retains the exact wire "until that peer authenticates an ACK";
-- RVG2 replay/equivocation authority (`src/daemon/relay_v2_replay_guard.zig:4-6`);
+- RVG2 replay/equivocation authority (`src/daemon/relay_v2_replay_guard.zig`);
   and
-- ADS1 rendered-record authority (`src/daemon/attachment_delivery_spool.zig:4-11`),
+- ADS1 rendered-record authority (`src/daemon/attachment_delivery_spool.zig`),
   which is deliberately lock-free with no disk backing.
 
 Each exposes `encodeCheckpoint`/`decodeCheckpoint`
-(`relay_v2_event_log.zig:761`, `relay_v2_outbox.zig:390`,
-`relay_v2_replay_guard.zig:285`, `attachment_delivery_spool.zig:648`), but those
+(`relay_v2_event_log.zig`, `relay_v2_outbox.zig`,
+`relay_v2_replay_guard.zig`, `attachment_delivery_spool.zig`), but those
 checkpoints are sealed **only into the Helix in-memory upgrade capsule at
 re-exec** — `ONYX_HELIX_UPGRADE_CAPS` advertises `relay-v2-event-log-v1`,
 `relay-v2-outbox-v2`, `attachment-delivery-spool-v1`, and the `mesh-checkpoint-v2`
-capsule that carries RVG2 (`src/daemon/helix/live.zig:268`), and adoption
-requires exactly one of each (`src/daemon/helix/handoff_relations.zig:319-321`).
+capsule that carries RVG2 (`src/daemon/helix/live.zig`), and adoption
+requires exactly one of each (`src/daemon/helix/handoff_relations.zig`).
 The re-exec seals `relay_replay_bytes` and `event_replay_bytes` as mandatory
-capsule state passed across `execve` (`src/daemon/server.zig:23725`). No path
+capsule state passed across `execve` (`src/daemon/server.zig`). No path
 writes them to storage: the OroStore disk WAL has families only for
 `accounts, nicks, chanregs, bans, memos, vhosts, props, history`
-(`src/daemon/store.zig:55-64`) — none for relay, custody, spool, or message_v2 —
+(`src/daemon/store.zig`) — none for relay, custody, spool, or message_v2 —
 and the four custody modules contain no file I/O.
 
 **Consequence — last-copy loss on cold restart.** Consider an intermediate node
 B relaying an origin-signed message from upstream A toward downstream C. B admits
 the message, records A among the confirmed nodes, and returns a durable ACK to A.
 Once B's ACK completes A's required-node set, A may retire its own retained wire
-(`relay_v2_event_log.zig:16-17`), so B becomes the last custodian of the
+(`relay_v2_event_log.zig`), so B becomes the last custodian of the
 still-unconfirmed retransmission obligation to C (held in RVO2,
-`relay_v2_outbox.zig:4-9`). If B now suffers a power loss or a systemd **cold**
+`relay_v2_outbox.zig`). If B now suffers a power loss or a systemd **cold**
 restart (`systemctl restart`, not `reload`) before that obligation to C is
 ACKed, no checkpoint was ever captured — capture happens only at the USR2 re-exec
 boundary — and B's in-memory RVL2/RVO2/RVG2/ADS1 state is gone. The last custody
@@ -273,3 +274,33 @@ custody obligations outstanding (no un-ACKed RVO2 rows, no unretired RVL2 wire).
 Cold-restarting a node that still holds custody obligations can silently drop the
 last copy of an in-flight message. A disk-backed custody WAL that would make this
 plane crash-durable is future work and is not implemented in this build.
+
+## Authored webhook messages and policy example
+
+The active signed lane also handles incoming webhook channel text. The synthetic
+source nickname uses the reserved `=Nick` namespace, which real client admission,
+portable restore and Helix adoption must not claim. The source validates channel
+speech/encryption/ban/formatting policy before preparing publication; receivers
+validate the strict synthetic sender shape and authenticated origin. It must not
+fall back to a membership-dependent unsigned/legacy relay when roster convergence
+is incomplete. Local/remote history and rendered recipients retain the same
+accepted msgid/time. Source: the webhook MESSAGE_V2 preparation and receive paths
+in `src/daemon/server.zig`.
+
+Slowmode is a precheck until the message transaction accepts. Its key/capacity is
+prepared before publication and its timestamp is committed only at the no-fail
+accept edge. Rejected or allocation-failed messages do not consume the sender's
+next speaking slot. Receiver policy must maintain the same property.
+
+```text
+client/webhook text -> policy precheck -> signed canonical wire
+                    -> stage replay/history/custody/attachment output
+                    -> no-fail commit -> local delivery + eligible peer send
+allocation/policy failure before commit -> no accepted identity or slowmode charge
+```
+
+Use `MESH ADMISSION` on every node to inspect the active epoch/roster tuple; one
+node's implementation marker is not full-mesh readiness. The
+[release audit](../audit/release-and-test-speed-2026-11-03.md) records the accepted
+artifact and exact bounded multi-client checks. A quiet sentinel prefix during a
+cold deployment does not establish that every hidden custody obligation was drained.

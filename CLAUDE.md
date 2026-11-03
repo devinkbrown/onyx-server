@@ -18,6 +18,7 @@ Keep mechanical audits, integration audits, and security/protocol audits separat
 
 Project skills are single-sourced through `.claude/skills` → `.agents/skills`. Preload only the skills named by the selected agent; load additional skills only when the task crosses that domain. Do not replace a deterministic script or project gate with model judgment.
 
-Live dual-node units are `onyx-server.service` under `/home/kain/onyx-server-run`
-and `/home/trev/onyx-server-run`. See `docs/ops/onyx-server-paths.md`, skill
-`onyx-server-mesh-ops`, and `.agents/ROSTER.md` for the verified baseline.
+The local runtime `/home/kain/onyx-server-run` uses OpenRC
+`/etc/init.d/onyx-server`; peer `/home/trev/onyx-server-run` uses systemd
+`onyx-server.service`. See `docs/ops/onyx-server-paths.md` for dated artifact
+receipts and host overrides, and load `onyx-server-mesh-ops` for acceptance.

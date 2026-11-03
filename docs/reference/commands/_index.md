@@ -2,11 +2,11 @@
 
 *The complete client command surface of the Onyx Server daemon, sourced from the live dispatch path.*
 
-Onyx Server is a pure-Zig 0.17-dev clean-room IRC daemon, built from first principles — not a clone of any prior daemon. This reference documents only the current registered-client source surface: the `dispatchRegistered` path (`src/daemon/server.zig:14267`), the lower connection command table it falls back to (`src/daemon/dispatch.zig:1795`), and the enabled `SerpentRegistry` modules (`src/daemon/modules/manifest.zig:23`).
+Onyx Server is a pure-Zig 0.17.0 clean-room IRC daemon, built from first principles — not a clone of any prior daemon. This reference documents only the current registered-client source surface: the `dispatchRegistered` path (`src/daemon/server.zig`), the lower connection command table it falls back to (`src/daemon/dispatch.zig`), and the enabled `SerpentRegistry` modules (`src/daemon/modules/manifest.zig`).
 
-Registry commands default to registered-client access unless the command table sets `.access = .any` or `.access = .oper` (`src/daemon/registry.zig:51`, `src/daemon/registry.zig:830`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig:14389`). Numeric names and codes are verified against `src/proto/numeric.zig` and the server-local enum (`src/daemon/server.zig:1403`).
+Registry commands default to registered-client access unless the command table sets `.access = .any` or `.access = .oper` (`src/daemon/registry.zig`). Registry dispatch maps too few parameters to `ERR_NEEDMOREPARAMS 461`, denied oper commands to `ERR_NOPRIVILEGES 481`, denied registered commands to `ERR_NOTREGISTERED 451`, and disabled feature-gated commands to `ERR_UNKNOWNCOMMAND 421` (`src/daemon/server.zig`). Numeric names and codes are verified against `src/proto/numeric.zig` and the server-local enum (`src/daemon/server.zig`).
 
-Last reconciled **2026-11-01** against the 0.9.0 enabled module manifest and command registry. Compatibility aliases are listed individually below even when they share one handler or reference page.
+Last reconciled **2026-11-03** against the 0.9.0 enabled module manifest and command registry. Compatibility aliases are listed individually below even when they share one handler or reference page.
 
 | Command | Summary | Reference |
 |---|---|---|
@@ -14,7 +14,7 @@ Last reconciled **2026-11-01** against the 0.9.0 enabled module manifest and com
 | `NICK` | Set registration nick or change registered nick. | [connection.md](connection.md#nick) |
 | `USER` | Pre-registration username and realname. | [connection.md](connection.md#user) |
 | `CAP` | IRCv3 capability negotiation. | [connection.md](connection.md#cap) |
-| `AUTHENTICATE` | SASL PLAIN, EXTERNAL, or SCRAM-SHA-256 exchange. | [connection.md](connection.md#authenticate) |
+| `AUTHENTICATE` | Configured SASL mechanism exchange; see the live mechanism reference. | [connection.md](connection.md#authenticate) |
 | `PING` | Server heartbeat request; replies with `PONG`. | [connection.md](connection.md#ping) |
 | `PONG` | No-op heartbeat acknowledgement. | [connection.md](connection.md#pong) |
 | `QUIT` | Close the registered or pre-registered session. | [connection.md](connection.md#quit) |
@@ -147,7 +147,7 @@ Last reconciled **2026-11-01** against the 0.9.0 enabled module manifest and com
 | `MEDIA` | Media control plane. | [media.md](media.md#media) |
 | `ACTIVITY` | Activity/presence updates. | [media.md](media.md#activity) |
 
-### Commands added or split out in the 0.7 registry reconciliation (historical; retained for registry provenance)
+## Additional account, operator and feature commands
 
 | Command | Summary | Reference |
 |---|---|---|
@@ -180,6 +180,23 @@ Last reconciled **2026-11-01** against the 0.9.0 enabled module manifest and com
 | `WEBAUTHN` | Passkey registration, authentication, and management. | [accounts-services.md](accounts-services.md#webauthn) |
 | `WEBPUSH` | Browser push subscription lifecycle. | [accounts-services.md](accounts-services.md#webpush) |
 | `XLINE` | Warden realname-ban compatibility alias. | [oper-moderation.md](oper-moderation.md#kline--dline--xline) |
+
+
+## Automation, policy and abuse
+
+| Command | Summary | Reference |
+|---|---|---|
+| `ABUSE` | Explain current live connection abuse controls. | [automation-policy.md](automation-policy.md#abuse) |
+| `APPEAL` | File an appeal; operators list and answer. | [automation-policy.md](automation-policy.md#appeal) |
+| `BOTCMD` | Register or invoke a scoped bot command. | [automation-policy.md](automation-policy.md#botcmd) |
+| `BOTGRANT` | Manage expiring scoped bot grants. | [automation-policy.md](automation-policy.md#botgrant) |
+| `CHALLENGE` | Configure registration challenges or answer a held preregistration challenge. | [automation-policy.md](automation-policy.md#challenge) |
+| `DEFER` | Schedule a channel message or operator mode. | [automation-policy.md](automation-policy.md#defer) |
+| `HOLD` | Release or drop held first messages. | [automation-policy.md](automation-policy.md#hold) |
+| `OUTHOOK` | Manage outbound Event Spine webhook destinations. | [automation-policy.md](automation-policy.md#outhook) |
+| `POLICY` | Inspect policy generations or roll back the retained last change. | [automation-policy.md](automation-policy.md#policy) |
+| `QUARANTINE` | Move a live local client to a quarantine channel. | [automation-policy.md](automation-policy.md#quarantine) |
+| `UNFURL` | Opt into or request a bounded HTTPS preview when enabled. | [automation-policy.md](automation-policy.md#unfurl) |
 
 ## In-channel fantasy commands
 

@@ -48,9 +48,10 @@ them return `913 ERR_NOACCESS`.
 
 User and member property writes propagate over the `ENTITY_PROP` path
 (`propagateLocalEntityProp`) as signed, multi-hop last-writer-wins facts — the
-same guarantees as channel properties. Cross-mesh propagation of entity
-properties was fixed alongside channel props in commit `c2eee68` (origin stamped
-with the node's `shortId`).
+same guarantees as channel properties. The origin uses the node `shortId`; the entity-kind discriminator is signed,
+so a relay cannot convert a user fact into a member fact while retaining valid
+origin proof. Received facts still need their family-specific admission and
+account/lifecycle authorization; a stored public device key is not a bearer token.
 
 ## Examples
 

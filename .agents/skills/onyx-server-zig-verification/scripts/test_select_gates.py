@@ -34,6 +34,23 @@ class GateSelectionTests(unittest.TestCase):
             self.assertIn(f"zig build {gate} -Doptimize=safe", commands)
         self.assertNotIn("ReleaseSafe", output.getvalue())
 
+    def test_release_commands_use_pinned_fast_spelling_and_keep_order(self) -> None:
+        output = io.StringIO()
+        with patch.object(sys, "argv", [str(SELECTOR), "--release", "build.zig"]):
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(0, selector.main())
+        commands = output.getvalue().splitlines()
+        self.assertIn("zig build test -Doptimize=safe", commands)
+        self.assertEqual([
+            "zig build all-checks",
+            "zig build release -Doptimize=fast",
+            "zig build package -Doptimize=fast",
+            "packaging/release.sh dist",
+            "packaging/verify-release.sh dist/SHA256SUMS",
+        ], commands[-5:])
+        self.assertNotIn("ReleaseFast", output.getvalue())
+        self.assertNotIn("ReleaseSafe", output.getvalue())
+
     def assert_selection(
         self, path: str, expected_gates: set[str], expected_critical: set[str]
     ) -> None:

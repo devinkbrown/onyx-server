@@ -12,8 +12,9 @@ contributions are licensed under the same terms; see [LICENSE](LICENSE).
 - Zig `0.17.0-dev.1282+c0f9b51d8` or newer, matching `build.zig.zon`.
 - A 64-bit target for the daemon. The browser WASM artifacts are the only deliberate
   `wasm32` exception.
-- Linux for full runtime testing. The daemon reactor uses `io_uring`; non-Linux
-  targets are still useful for semantic/cross-build checks where supported.
+- A supported native runtime for live tests. Linux uses Ringlane/io_uring;
+  OpenBSD and Windows have separate backends and platform-specific acceptance
+  requirements. A cross-build or semantic check alone does not prove runtime support.
 - Python 3 for runtime smoke helpers in `tools/`.
 
 ## Source Of Truth
@@ -66,7 +67,7 @@ source, fix the reference/guide docs or the code, not the evidence.
 | `zig build bogo-shim` / `bogo-shim-test` | Build or self-test the BoGo TLS shim. |
 | `zig build all-checks[-verbose]` | Deterministic pre-push gate, optionally verbose. |
 | `zig build release` | Build a stripped ReleaseFast daemon. |
-| `zig build package` | Stage ReleaseFast daemon, reference config, and systemd unit. |
+| `zig build package` | Stage the optimized daemon, reference config, and target-specific service assets. |
 <!-- /AUTO-GENERATED: build-commands -->
 
 Use `-Dtest-filter="<substring>"` as a build option for focused work:
@@ -76,8 +77,18 @@ zig build test-mod -Dtest-filter="mTLS:" --summary all
 zig build test-exe -Dtest-filter="threaded server:" --summary all
 ```
 
-Do not pass `-- --test-filter`; it bypasses the build graph filters and can run far
-more than intended.
+For repeated selections without recompilation, use the reusable native test
+artifact and its runtime filter:
+
+```sh
+zig build test-cached -Doptimize=safe -- --test-filter="reusable session"
+zig build test-exe-cached -- --list-tests
+```
+
+Compile-time `-Dtest-filter` and cached runtime `--test-filter` belong to
+different targets. The first cached build compiles the full root; later runtime
+selections reuse it. Follow [the testing guide](docs/guide/testing.md) for
+platform limits, duration profiles, leaf targets and full-suite evidence.
 
 ## Runtime Smokes
 
@@ -128,11 +139,18 @@ Before opening or merging a change:
 
 ```sh
 zig build test-smoke --summary all
-zig build test-roadmap --summary all
-zig build test-smoke -Doptimize=ReleaseSafe --summary all
+# For a release-critical change, repeat the affected lane in safety-checked mode:
+zig build test-smoke -Doptimize=safe --summary all
+# Complete deterministic release gate, including all three test roots:
 zig build all-checks --summary all
 git diff --check
 ```
+
+Use narrow gates while iterating. Documentation-only changes require link,
+command and formatting checks rather than repeating unchanged full test gates.
+For release evidence, retain test inventories, pass/skip/failure counts, source
+hashes and terminal receipts; the outer Zig summary can include ancillary
+harness tests and is not the complete suite count.
 
 Also run these when relevant:
 

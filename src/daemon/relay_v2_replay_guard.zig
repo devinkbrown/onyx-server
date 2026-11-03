@@ -53,10 +53,10 @@ pub const Decision = enum {
 };
 
 /// One origin-verification and replay-admission result for a complete immutable
-/// MESSAGE_V2 object. Only `accepted` exposes an identity, and that identity is
-/// derived from the same authenticated transcript that advanced the guard.
-/// Delivery, Lotus history, msgid rendering, and re-forwarding must use this
-/// exact payload rather than calling `relayId` independently.
+/// MESSAGE_V2 object. `accepted` and exact `duplicate` expose the authenticated
+/// identity. Only accepted authorizes new delivery/history/forward publication;
+/// duplicate retains prior-acceptance identity for receipt and re-ACK handling.
+/// Consumers use this exact payload rather than deriving `relayId` independently.
 pub const Admission = union(enum) {
     accepted: RelayId,
     duplicate: RelayId,

@@ -40,22 +40,23 @@ High-interest areas include:
 
 ## Adversarial testing
 
-Beyond the deterministic-simulation suite, Onyx Server is building a dedicated
-adversarial **exploit/attack test harness** — protocol fuzzing and abuse-path
-regression tests aimed at the parser, authentication, TLS, and admission
-surfaces. The direction and coverage plan live in
-[`docs/research/exploit-suite-blueprint.md`](docs/research/exploit-suite-blueprint.md)
+The deterministic simulation suite is supplemented by `zig build test-exploit`
+(and its `test-attack` alias), plus bounded parser corpus replay through
+`zig build fuzz`. Inspect the selected tests and assertions before claiming a
+particular vulnerability class is covered. Historical coverage planning lives in
+[`docs/research/exploit-suite-blueprint.md`](https://github.com/devinkbrown/onyx-server/blob/3fa6e95021601c92d2a2b68869d8fa9f4047d391/docs/research/exploit-suite-blueprint.md)
 (a research/planning document, not a statement of current coverage).
 
 ## Supported versions
 
-Onyx Server is developed on a rolling basis; fixes land on `main`. The current
-source release line is **0.8.0** (`build.zig.zon`). That manifest bump is not a
-fleet deploy. The currently verified
-production pair (`eshmaki.me` and `ircx.us`) runs the `0.7.0+ae78d490` artifact
-under `onyx-server.service`; the public GitHub artifact channel still publishes
-`v0.5.6`. These are deliberately separate source, deployed-image, and public-tag
-claims. Operators should track `main`, verify the exact image and configuration,
-and apply security fixes through the session-preserving `USR2` hot-upgrade. See
-[`docs/ops/onyx-server-paths.md`](docs/ops/onyx-server-paths.md) for the current
-fleet evidence and rollback boundary.
+Onyx Server is developed on a rolling basis; fixes land on `main`. The source
+release line is **0.9.0** (`build.zig.zon`). A source version, a public release tag
+and a deployed artifact are separate facts. Include the exact affected revision
+when reporting an issue or assessing whether a fix is present.
+
+Operators should verify the exact artifact revision, configuration and release
+evidence before applying fixes. Prefer session-preserving Helix USR2 when the
+image capabilities and live state allow it; otherwise follow the documented
+cold-restart and durable-token recovery procedure. See the dated
+[production paths and artifact receipt](docs/ops/onyx-server-paths.md) and
+[release workflow](docs/RUNBOOK.md).

@@ -2,7 +2,7 @@
 
 *Text delivery, tag-only messages, redaction, editing, search, history playback, metadata, and caller-side filtering.*
 
-The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, `CHATHISTORY`, `SEARCH`, `MARKREAD`, `PINS`, `METADATA`, `MONITOR`, and `SILENCE` (`src/daemon/modules/messaging.zig:59`, `src/daemon/modules/messaging.zig:62`). `WHISPER` is registered by the IRCX module (`src/daemon/modules/ircx.zig:56`, `src/daemon/modules/ircx.zig:64`). `ACCEPT` is registered by the user query module (`src/daemon/modules/user_query.zig:72`, `src/daemon/modules/user_query.zig:86`).
+The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, `CHATHISTORY`, `SEARCH`, `MARKREAD`, `PINS`, `METADATA`, `MONITOR`, and `SILENCE` (`src/daemon/modules/messaging.zig`). `WHISPER` is registered by the IRCX module (`src/daemon/modules/ircx.zig`). `ACCEPT` is registered by the user query module (`src/daemon/modules/user_query.zig`).
 
 ## IRCv3 message layer
 
@@ -12,18 +12,18 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Labeled response: When a client negotiated `labeled-response` and sends `@label=<value>`, replies from a command are reframed as a labeled single line, a `labeled-response` batch, or a bare labeled ACK for commands with no output.
 - Standard replies: The server advertises `standard-replies`. Messaging errors that call `failReply` emit `FAIL <command> <code> :<reason>` for clients with the cap and fall back to a server `NOTICE` text for clients without it. The messaging handlers verified here use `FAIL`; no live messaging `WARN` or `NOTE` emitter was found in `server.zig`.
 - Multiline: Clients with `draft/multiline` may send `BATCH +<ref> draft/multiline <target>` containing `@batch=<ref>` `PRIVMSG` or `NOTICE` chunks. The assembler enforces configured byte/line/ref/target limits, supports `draft/multiline-concat`, and delivers the reassembled value through the normal message engine. An inbound batch reassembles into one value, and a long server reply stays a single IRC line.
-- Sources: `src/daemon/dispatch.zig:316`, `src/daemon/dispatch.zig:366`, `src/daemon/dispatch.zig:406`, `src/daemon/dispatch.zig:411`, `src/daemon/dispatch.zig:425`, `src/daemon/server.zig:7047`, `src/daemon/server.zig:29187`, `src/daemon/server.zig:29253`, `src/daemon/server.zig:30355`, `src/daemon/server.zig:8333`, `src/daemon/server.zig:27305`
+- Sources: `src/daemon/dispatch.zig`, `src/daemon/server.zig`
 
 ## PRIVMSG
 
 - Syntax: `PRIVMSG <target>[,<target>...] :<text>`
-- Description: Sends text to a nick, a channel, or a status-prefixed channel target. The handler applies sender silence gates, UTF-8 and content gates, channel mode gates, direct-message gates, `SILENCE`, echo-message, history recording, away and CTCP auto-replies, mesh relay, and the caller's `MAXTARGETS` fan-out cap. A connection class can tighten that cap with `max_targets`. An ordinary account-less nick with a live signed guest-presence record is delivered once, as guest-direct, only along that record's next hop, and echoed once to the sender. A nick with no such record keeps the existing unknown-nick and legacy relay behavior. This guest path is source. The full suite has not been re-run green on it.
+- Description: Sends text to a nick, a channel, or a status-prefixed channel target. The handler applies sender silence gates, UTF-8 and content gates, channel mode gates, direct-message gates, `SILENCE`, echo-message, history recording, away and CTCP auto-replies, mesh relay, and the caller's `MAXTARGETS` fan-out cap. A connection class can tighten that cap with `max_targets`. An ordinary account-less nick with a live signed guest-presence record is delivered once, as guest-direct, only along that record's next hop, and echoed once to the sender. A nick with no such record keeps the existing unknown-nick and legacy relay behavior. Full release gates and bounded live acceptance are recorded in the [release audit](../../audit/release-and-test-speed-2026-11-03.md).
 - Privileges: Registered client.
 - Parameters: One or more comma-separated targets and non-empty text.
 - Replies: Delivery line to recipients; `RPL_AWAY 301` when messaging an away user; CTCP `VERSION`, `PING`, `TIME`, `CLIENTINFO`, and `SOURCE` requests can produce a CTCP `NOTICE` reply.
 - Errors: `ERR_NORECIPIENT 411`, `ERR_NOTEXTTOSEND 412`, `ERR_NOSUCHNICK 401`, `ERR_NOSUCHCHANNEL 403`, `ERR_CANNOTSENDTOCHAN 404`, `ERR_TOOMANYTARGETS 407`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_NEEDREGGEDNICK 477`, caller-id `ERR_CANTSENDTOUSER 716` / `RPL_TARGNOTIFY 717`, IRCv3 `FAIL` for invalid UTF-8, content-filter blocks, encrypted-message policy, and CTCP blocks. With active durable mesh (`MESSAGE_V2`) authoring, channel messages and token-addressed direct messages are delivered only after durable admission succeeds. Admission error or authority rejection fails `PRIVMSG` with `TEMPORARILY_UNAVAILABLE`; `NOTICE` stays silent, and neither command falls through to local or legacy delivery. ADS1 attachment-spool pressure is distinct: after the MESSAGE_V2 authorities have admitted the event, a missing attachment batch may use ordinary SendQ delivery without weakening the admission boundary.
 - Example: `PRIVMSG #ops :status?`
-- Sources: `src/daemon/modules/messaging.zig:10`, `src/daemon/server.zig:29398`, `src/daemon/server.zig:29410`, `src/daemon/server.zig:29418`, `src/daemon/server.zig:29451`, `src/daemon/server.zig:29730`, `src/daemon/server.zig:29822`, `src/daemon/server.zig:29868`, `src/daemon/server.zig:29898`, `src/daemon/server.zig:29948`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## NOTICE
 
@@ -34,14 +34,14 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: Delivery line to recipients.
 - Errors: The handler suppresses missing-recipient/text, invalid UTF-8, content-filter, channel, and no-such-nick errors for `NOTICE`. Current source still emits `ERR_TOOMANYTARGETS 407` from the shared pre-target fan-out cap when the comma-separated target list exceeds the cap; this is the only verified `NOTICE` error path in this handler.
 - Example: `NOTICE suzu :heads up`
-- Sources: `src/daemon/modules/messaging.zig:14`, `src/daemon/server.zig:29407`, `src/daemon/server.zig:29418`, `src/daemon/server.zig:29451`, `src/daemon/server.zig:29511`, `src/daemon/server.zig:29524`, `src/daemon/server.zig:29696`, `src/daemon/server.zig:29730`, `src/daemon/server.zig:29822`, `src/daemon/server.zig:29948`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## CTCP and DCC
 
 - CTCP payloads are parsed from `PRIVMSG` and `NOTICE` bodies. Direct `PRIVMSG` CTCP requests for `VERSION`, `PING`, `TIME`, `CLIENTINFO`, and `SOURCE` receive CTCP `NOTICE` replies; `ACTION` is delivered as ordinary message content.
 - User mode `+C` and channel mode `+C` block CTCP requests except `ACTION`, returning `FAIL PRIVMSG CTCP_BLOCKED` for direct messages or `ERR_CANNOTSENDTOCHAN 404` for channels.
 - DCC is parser-only in Onyx Server: CTCP can classify DCC frames, but the server provides no DCC proxy, filehost, or relay behavior.
-- Sources: `src/proto/ctcp.zig:4`, `src/proto/ctcp.zig:45`, `src/daemon/server.zig:29960`, `src/daemon/server.zig:38541`, `src/daemon/server.zig:38576`, `src/daemon/server.zig:38663`
+- Sources: `src/proto/ctcp.zig`, `src/daemon/server.zig`
 
 ## TAGMSG
 
@@ -52,7 +52,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: Raw `TAGMSG` to recipients whose negotiated caps allow at least one relayed tag.
 - Errors: `ERR_UNKNOWNCOMMAND 421` when the client has no usable TAGMSG capability, `ERR_NOSUCHCHANNEL 403`, `ERR_CANNOTSENDTOCHAN 404`; missing target or missing relayed tags are silently dropped.
 - Example: `@+typing=active TAGMSG #chat`
-- Sources: `src/daemon/modules/messaging.zig:18`, `src/daemon/server.zig:29187`, `src/daemon/server.zig:29191`, `src/daemon/server.zig:29195`, `src/daemon/server.zig:29205`, `src/daemon/server.zig:29225`, `src/daemon/server.zig:29253`, `src/daemon/server.zig:30355`, `src/daemon/server.zig:37997`, `src/daemon/server.zig:38039`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## REDACT
 
@@ -63,7 +63,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: `REDACT <channel> <msgid> [:reason]` to the channel scope for capable recipients.
 - Errors: `FAIL REDACT NEED_REGISTRATION`, `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, `FAIL REDACT UNKNOWN_MSGID`.
 - Example: `REDACT #chat abc123 :cleanup`
-- Sources: `src/daemon/modules/messaging.zig:22`, `src/daemon/server.zig:21546`, `src/daemon/server.zig:21550`, `src/daemon/server.zig:21554`, `src/daemon/server.zig:21561`, `src/daemon/server.zig:21565`, `src/daemon/server.zig:21573`, `src/daemon/server.zig:21604`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## EDIT
 
@@ -74,7 +74,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: Edited `PRIVMSG` to recipients with `draft/message-editing`; the sender is echoed for direct-message edits.
 - Errors: `FAIL EDIT NEED_REGISTRATION`, `FAIL EDIT INVALID_PARAMS`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_NOSUCHNICK 401`, `FAIL EDIT UNKNOWN_MSGID`, `FAIL EDIT PERMISSION_DENIED`, `FAIL EDIT EDIT_FAILED`.
 - Example: `EDIT #chat abc123 :corrected text`
-- Sources: `src/daemon/modules/messaging.zig:26`, `src/daemon/server.zig:21608`, `src/daemon/server.zig:21612`, `src/daemon/server.zig:21616`, `src/daemon/server.zig:21627`, `src/daemon/server.zig:21641`, `src/daemon/server.zig:21647`, `src/daemon/server.zig:21652`, `src/daemon/server.zig:21660`, `src/daemon/server.zig:21671`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## CHATHISTORY
 
@@ -85,7 +85,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: History lines, usually in a `chathistory` `BATCH` when the client has `batch`.
 - Errors: `FAIL CHATHISTORY NEED_REGISTRATION`, `FAIL CHATHISTORY <code>` for malformed requests, `FAIL CHATHISTORY REPLAY_TOO_LARGE`, and visibility failures such as `FAIL CHATHISTORY ACCESS_DENIED`.
 - Example: `CHATHISTORY LATEST #chat * 20`
-- Sources: `src/daemon/modules/messaging.zig:30`, `src/daemon/server.zig:15016`, `src/daemon/server.zig:15026`, `src/daemon/server.zig:15038`, `src/daemon/server.zig:15042`, `src/daemon/server.zig:15140`, `src/daemon/server.zig:45294`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## SEARCH
 
@@ -96,7 +96,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: Matching history lines in a `chathistory` batch when the client has `batch`, or plain history lines otherwise.
 - Errors: `FAIL SEARCH NEED_REGISTRATION`, `FAIL SEARCH INVALID_PARAMS`, `FAIL SEARCH RATE_LIMITED`, `FAIL SEARCH INVALID_TARGET`.
 - Example: `SEARCH #chat :release checklist`
-- Sources: `src/daemon/modules/messaging.zig:34`, `src/daemon/server.zig:15176`, `src/daemon/server.zig:15190`, `src/daemon/server.zig:15209`, `src/daemon/server.zig:15214`, `src/daemon/server.zig:15221`, `src/daemon/server.zig:15235`, `src/daemon/server.zig:45042`, `src/daemon/server.zig:45125`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## MARKREAD
 
@@ -107,7 +107,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: Read-marker response line built by the read-marker subsystem.
 - Errors: `FAIL MARKREAD NEED_REGISTRATION`, `ERR_NEEDMOREPARAMS 461` for invalid parameters.
 - Example: `MARKREAD #chat timestamp=2026-06-10T12:00:00Z`
-- Sources: `src/daemon/modules/messaging.zig:38`, `src/daemon/server.zig:14285`, `src/daemon/server.zig:14288`, `src/daemon/server.zig:14294`, `src/daemon/server.zig:14316`, `src/daemon/server.zig:14423`, `src/proto/read_marker_store.zig:170`, `src/proto/read_marker_store.zig:212`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`, `src/proto/read_marker_store.zig`
 
 ## WHISPER
 
@@ -118,7 +118,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: `:sender WHISPER <channel> <nick> :<text>` to each valid recipient.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_NOWHISPER 923`, `ERR_NOSUCHNICK 401`, `ERR_USERNOTINCHANNEL 441`.
 - Example: `WHISPER #chat suzu :psst`
-- Sources: `src/daemon/modules/ircx.zig:23`, `src/daemon/server.zig:21090`, `src/daemon/server.zig:21096`, `src/daemon/server.zig:21100`, `src/daemon/server.zig:21104`, `src/daemon/server.zig:21108`, `src/daemon/server.zig:21118`, `src/daemon/server.zig:21168`, `src/proto/whisper.zig:4`
+- Sources: `src/daemon/modules/ircx.zig`, `src/daemon/server.zig`, `src/proto/whisper.zig`
 
 ## PINS
 
@@ -129,7 +129,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: `:<server> PINS <#channel> :<comma-separated-msgids>` with an empty trailing value when no pins remain.
 - Errors: `ERR_NOSUCHCHANNEL 403`, `ERR_NOTONCHANNEL 442`, `ERR_CHANOPRIVSNEEDED 482`, `ERR_BADVALUE 906`, `ERR_NEEDMOREPARAMS 461`, IRCv3 `FAIL PINS INVALID_SUBCOMMAND`.
 - Example: `PINS #chat ADD 01HMSGID`
-- Sources: `src/daemon/modules/messaging.zig:42`, `src/daemon/server.zig:14364`, `src/daemon/server.zig:14367`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## METADATA
 
@@ -140,7 +140,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: `RPL_KEYVALUE 761`, `RPL_METADATAEND 762` when listing/querying.
 - Errors: `ERR_UNKNOWNCOMMAND 421` without the cap, `ERR_KEYNOTSET 766`, `ERR_KEYINVALID 767`, `ERR_KEYNOPERMISSION 769`, `ERR_NEEDMOREPARAMS 461`.
 - Example: `METADATA * LIST`
-- Sources: `src/daemon/modules/messaging.zig:46`, `src/daemon/server.zig:21399`, `src/daemon/server.zig:21401`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## MONITOR
 
@@ -151,7 +151,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: `RPL_MONONLINE 730`, `RPL_MONOFFLINE 731`, `RPL_MONLIST 732`, `RPL_ENDOFMONLIST 733`.
 - Errors: `ERR_MONLISTFULL 734`, `ERR_NEEDMOREPARAMS 461`.
 - Example: `MONITOR + alice,bob`
-- Sources: `src/daemon/modules/messaging.zig:50`, `src/daemon/server.zig:13946`, `src/daemon/server.zig:13948`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## SILENCE
 
@@ -162,7 +162,7 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: `RPL_SILELIST 271`, `RPL_ENDOFSILELIST 272`.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid masks.
 - Example: `SILENCE +*!*@bad.example`
-- Sources: `src/daemon/modules/messaging.zig:54`, `src/daemon/server.zig:14432`, `src/daemon/server.zig:14435`, `src/daemon/server.zig:29918`
+- Sources: `src/daemon/modules/messaging.zig`, `src/daemon/server.zig`
 
 ## ACCEPT
 
@@ -173,4 +173,4 @@ The messaging module registers `PRIVMSG`, `NOTICE`, `TAGMSG`, `REDACT`, `EDIT`, 
 - Replies: `RPL_ACCEPTLIST 281`, `RPL_ENDOFACCEPT 282`.
 - Errors: `ERR_NEEDMOREPARAMS 461` for invalid input.
 - Example: `ACCEPT +alice -mallory`
-- Sources: `src/daemon/modules/user_query.zig:51`, `src/daemon/server.zig:16072`, `src/daemon/server.zig:16074`, `src/daemon/server.zig:16093`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`

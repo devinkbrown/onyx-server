@@ -62,3 +62,14 @@ ACCESS #zig LIST HOST
 ACCESS #zig DELETE OWNER nick!*@host.test
 ACCESS #zig CLEAR DENY
 ```
+
+## Signed mesh convergence
+
+Current channel ACCESS changes can be emitted as `ACCESS_EVENT_V1` with an
+immutable origin signature and LWW/tombstone authority. The secured transport uses
+the `event-spine-v2` gate; an older peer can skip the unknown tag without dropping
+the link, so an established mesh alone does not prove ACCESS convergence through
+that peer. Expiry/skew and account/channel authorization remain independent checks.
+See [the S2S catalog](../../architecture/mesh-s2s.md#s2s-frame-codec),
+`src/proto/ircx_access_event.zig` and the live ACCESS admit/apply paths in `server.zig`.
+Local store persistence and a signed forwarded fact are distinct evidence.

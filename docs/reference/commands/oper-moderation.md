@@ -2,7 +2,7 @@
 
 *Operator authority, network bans, force actions, and server-to-server link control.*
 
-The `oper.security` module registers the core oper and moderation commands (`src/daemon/modules/oper_security.zig:143`). Most are registry-gated with `.access = .oper`; `OPER` and `STATS` are the command-table exceptions, while `USERIP` is oper-gated and then refined by `oper_spy` (`src/daemon/modules/oper_security.zig:149`, `src/daemon/modules/oper_security.zig:173`, `src/daemon/modules/oper_security.zig:176`). Registry denial emits `ERR_NOPRIVILEGES 481` (`src/daemon/server.zig:8408`, `src/daemon/server.zig:8416`). Handlers check fine-grained operator privileges with `requirePriv` (`src/daemon/server.zig:26953`).
+The `oper.security` module registers the core oper and moderation commands (`src/daemon/modules/oper_security.zig`). Most are registry-gated with `.access = .oper`; `OPER` and `STATS` are the command-table exceptions, while `USERIP` is oper-gated and then refined by `oper_spy` (`src/daemon/modules/oper_security.zig`). Registry denial emits `ERR_NOPRIVILEGES 481` (`src/daemon/server.zig`). Handlers check fine-grained operator privileges with `requirePriv` (`src/daemon/server.zig`).
 
 ## OPER
 
@@ -13,7 +13,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: None on success because the command always fails.
 - Errors: `ERR_NOOPERHOST 491`.
 - Example: `OPER name password`
-- Sources: `src/daemon/modules/oper_security.zig:149`, `src/daemon/server.zig:22220`, `src/daemon/server.zig:22225`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## REHASH
 
@@ -24,7 +24,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: `RPL_REHASHING 382` and/or server notices from handler.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `REHASH`
-- Sources: `src/daemon/modules/oper_security.zig:150`, `src/daemon/server.zig:27927`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## GRANT
 
@@ -41,7 +41,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice confirming the grant.
 - Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`; notice on unknown account/privilege.
 - Example: `GRANT alice netadmin`
-- Sources: `src/daemon/modules/oper_security.zig:151`, `src/daemon/server.zig:22640`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## REVOKE
 
@@ -55,7 +55,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice confirming the revocation.
 - Errors: `ERR_NOPRIVILEGES 481`, `ERR_NEEDMOREPARAMS 461`.
 - Example: `REVOKE alice`
-- Sources: `src/daemon/modules/oper_security.zig:152`, `src/daemon/server.zig:22677`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## GRANTS
 
@@ -66,7 +66,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notices, one per active grant, then an end marker.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `GRANTS`
-- Sources: `src/daemon/modules/oper_security.zig:153`, `src/daemon/server.zig:22702`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## AUDIT
 
@@ -77,7 +77,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Event Spine lines: `:<server> EVENT <oper> AUDIT ...`.
 - Errors: `ERR_NOPRIVILEGES 481`; usage or missing proof reports are server notices.
 - Example: `AUDIT PROOF JSON 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`
-- Sources: `src/daemon/modules/oper_security.zig:178`, `src/daemon/server.zig:27536`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## SESSIONS
 
@@ -87,7 +87,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: `RPL_TRACEUSER 205` rows followed by `RPL_ENDOFTRACE 262`; invalid filters and over-large result sets are server notices.
 - Errors: `ERR_NOPRIVILEGES 481` and invalid-filter/too-many-match notices.
 - Example: `SESSIONS tls account=alice sort=connected limit=20`
-- Sources: `src/daemon/modules/oper_security.zig:179`, `src/daemon/server.zig:29116` (`handleSessions`), `src/daemon/svc_sessionview.zig`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig` (`handleSessions`), `src/daemon/svc_sessionview.zig`
 
 ## KILL
 
@@ -98,7 +98,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Local target receives a `KILL` line and close/error path; remote targets produce a relay notice to the operator; the oper action is published.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHNICK 401`, `ERR_NOPRIVILEGES 481`.
 - Example: `KILL badnick :abuse`
-- Sources: `src/daemon/modules/oper_security.zig:154`, `src/daemon/server.zig:13599`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## CLOSE
 
@@ -109,7 +109,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice reporting the number of unregistered connections closed.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `CLOSE`
-- Sources: `src/daemon/modules/oper_security.zig:155`, `src/daemon/server.zig:13572`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## DRAIN
 
@@ -120,7 +120,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server `NOTICE` status.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `DRAIN`
-- Sources: `src/daemon/modules/oper_security.zig:156`, `src/daemon/server.zig:13562`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## UNREJECT
 
@@ -131,7 +131,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`.
 - Example: `UNREJECT 203.0.113.10`
-- Sources: `src/daemon/modules/oper_security.zig:157`, `src/daemon/server.zig:13541`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## WARD
 
@@ -142,7 +142,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notices and oper events. `WARD ADD` and `WARD DEL` oper events include `proof=<id>` when the node has a signing identity. `WARD TEST` reports match/no-match by notice.
 - Errors: `ERR_NOPRIVILEGES 481`; usage and validation failures are server notices.
 - Example: `WARD ADD address 203.0.113.0/24 mesh refuse 3600 :abuse`
-- Sources: `src/daemon/modules/oper_security.zig:158`, `src/daemon/modules/oper_security.zig:160`, `src/daemon/modules/oper_security.zig:161`, `src/daemon/modules/oper_security.zig:162`, `src/daemon/server.zig:15902`, `src/daemon/warden.zig:26`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`, `src/daemon/warden.zig`
 
 ## KLINE / DLINE / XLINE
 
@@ -153,7 +153,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: WARD oper events/notices from the shared add/delete path.
 - Errors: `ERR_NOPRIVILEGES 481`; usage and validation failures are server notices.
 - Example: `KLINE ADD bad!*@* 3600 :abuse`
-- Sources: `src/daemon/modules/oper_security.zig:54`, `src/daemon/modules/oper_security.zig:58`, `src/daemon/modules/oper_security.zig:62`, `src/daemon/modules/oper_security.zig:160`, `src/daemon/server.zig:16002`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## SPAMTRAP
 
@@ -164,7 +164,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice + oper event; offenders are flagged in the registry.
 - Errors: `ERR_NOPRIVILEGES 481`; usage and add/remove failures are server notices.
 - Example: `SPAMTRAP ADD CHAN #freenudes`
-- Sources: `src/daemon/modules/oper_security.zig:159`, `src/daemon/server.zig:27681`, `src/daemon/spamtrap.zig`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`, `src/daemon/spamtrap.zig`
 
 ## SHUN
 
@@ -175,7 +175,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice/oper event with `proof=<id>` when the node has a signing identity.
 - Errors: `ERR_NOPRIVILEGES 481`; handler validation notices. Bare `SHUN` lists active shuns.
 - Example: `SHUN badnick :flood`
-- Sources: `src/daemon/modules/oper_security.zig:163`, `src/daemon/server.zig:15688`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## UNSHUN
 
@@ -186,7 +186,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice/oper event with `proof=<id>` when the node has a signing identity.
 - Errors: `ERR_NOPRIVILEGES 481`; handler validation notices.
 - Example: `UNSHUN badnick`
-- Sources: `src/daemon/modules/oper_security.zig:164`, `src/daemon/server.zig:15688`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## GLOBAL
 
@@ -197,7 +197,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Broadcast notice.
 - Errors: `ERR_NOPRIVILEGES 481`; usage/format failures are server notices.
 - Example: `GLOBAL :maintenance soon`
-- Sources: `src/daemon/modules/oper_security.zig:165`, `src/daemon/server.zig:15751`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## OPERMOTD
 
@@ -208,7 +208,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Operator MOTD numerics or server notices.
 - Errors: `ERR_NOPRIVILEGES 481`; no-oper-MOTD numeric/notice if unset.
 - Example: `OPERMOTD`
-- Sources: `src/daemon/modules/oper_security.zig:166`, `src/daemon/server.zig:15303`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## DIE
 
@@ -219,7 +219,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Oper event; no numeric success reply.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `DIE`
-- Sources: `src/daemon/modules/oper_security.zig:167`, `src/daemon/server.zig:16127`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## RESTART
 
@@ -230,7 +230,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Oper event; no numeric success reply.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `RESTART`
-- Sources: `src/daemon/modules/oper_security.zig:168`, `src/daemon/server.zig:16127`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## CONNECT
 
@@ -241,7 +241,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Oper event with `proof=<id>` when the node has a signing identity, plus server notice such as `CONNECT initiated` or `CONNECT initiated (secured)`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`, notices for illegal port, invalid host, full table, or socket failure.
 - Example: `CONNECT 203.0.113.20 6667`
-- Sources: `src/daemon/modules/oper_security.zig:169`, `src/daemon/server.zig:17164`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## SQUIT
 
@@ -252,7 +252,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Oper event with `proof=<id>` when the node has a signing identity, plus `SQUIT complete` notice.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHSERVER 402`, `ERR_NOPRIVILEGES 481`.
 - Example: `SQUIT peer.example :maintenance`
-- Sources: `src/daemon/modules/oper_security.zig:170`, `src/daemon/server.zig:17314`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## TESTLINE
 
@@ -263,7 +263,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: `RPL_TESTLINE 725` or `RPL_NOTESTLINE 726`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`.
 - Example: `TESTLINE 203.0.113.10`
-- Sources: `src/daemon/modules/oper_security.zig:174`, `src/daemon/server.zig:17388`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## TESTMASK
 
@@ -274,7 +274,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: `RPL_TESTMASK 727`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`.
 - Example: `TESTMASK *!*@*.example`
-- Sources: `src/daemon/modules/oper_security.zig:175`, `src/daemon/server.zig:17407`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## USERIP
 
@@ -285,7 +285,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Numeric `340` line from `userip.writeUseripReply`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`.
 - Example: `USERIP alice bob`
-- Sources: `src/daemon/modules/oper_security.zig:176`, `src/daemon/server.zig:16085`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## DEBUG
 
@@ -296,7 +296,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notices and final `End of DEBUG flight recorder`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `DEBUG`
-- Sources: `src/daemon/modules/oper_security.zig:177`, `src/daemon/server.zig:17374`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## GEOIP
 
@@ -307,7 +307,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notices.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`; notices for invalid IP, missing database, read error, or no data.
 - Example: `GEOIP 8.8.8.8`
-- Sources: `src/daemon/modules/feature_misc.zig:65`, `src/daemon/server.zig:19312`
+- Sources: `src/daemon/modules/feature_misc.zig`, `src/daemon/server.zig`
 
 ## CLONES
 
@@ -318,7 +318,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notices.
 - Errors: `ERR_NOPRIVILEGES 481`; `CLONES: scan failed` notice on scan failure.
 - Example: `CLONES`
-- Sources: `src/daemon/modules/services_ext.zig:65`, `src/daemon/server.zig:19408`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`
 
 ## RESV
 
@@ -329,7 +329,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notices.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`; join enforcement emits `ERR_UNAVAILRESOURCE 437`.
 - Example: `RESV #help* 3600000 :reserved`
-- Sources: `src/daemon/modules/services_ext.zig:53`, `src/daemon/server.zig:18525`, `src/daemon/svc_resv.zig:224`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`, `src/daemon/svc_resv.zig`
 
 ## UNRESV
 
@@ -340,7 +340,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`.
 - Example: `UNRESV #help*`
-- Sources: `src/daemon/modules/services_ext.zig:54`, `src/daemon/server.zig:18525`, `src/daemon/svc_resv.zig:227`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`, `src/daemon/svc_resv.zig`
 
 ## SACCESS
 
@@ -351,7 +351,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: IRCX access numerics `RPL_ACCESSADD 801`, `RPL_ACCESSDELETE 802`, `RPL_ACCESSSTART 803`, `RPL_ACCESSENTRY 804`, and `RPL_ACCESSEND 805`.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`, `ERR_TOOMANYACCESSES 916`. Enforcement can emit `ERR_ERRONEUSNICKNAME 432` for `NONICK`/`HOLDNICK` and `ERR_UNAVAILRESOURCE 437` for `NOCHANNEL`.
 - Example: `SACCESS ADD HOLDNICK Staff-* 0 :staff namespace`
-- Sources: `src/daemon/modules/ircx.zig:67`, `src/proto/ircx_saccess.zig:73`, `src/proto/ircx_saccess.zig:306`, `src/daemon/server.zig:19495`, `src/daemon/server.zig:19548`
+- Sources: `src/daemon/modules/ircx.zig`, `src/proto/ircx_saccess.zig`, `src/daemon/server.zig`
 
 ## JUPE
 
@@ -362,7 +362,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notices; `JUPE ADD` publishes an oper event with `proof=<id>` when the node has a signing identity.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`.
 - Example: `JUPE evil.example.net 0 :rogue server`
-- Sources: `src/daemon/modules/services_ext.zig:56`, `src/daemon/server.zig:18591`, `src/daemon/svc_jupe.zig:247`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`, `src/daemon/svc_jupe.zig`
 
 ## UNJUPE
 
@@ -373,7 +373,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Server notice.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOPRIVILEGES 481`.
 - Example: `UNJUPE evil.example.net`
-- Sources: `src/daemon/modules/services_ext.zig:57`, `src/daemon/server.zig:18591`, `src/daemon/svc_jupe.zig:255`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`, `src/daemon/svc_jupe.zig`
 
 ## FORCEOP
 
@@ -384,7 +384,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: `MODE` broadcast or server notice for no-op.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOSUCHNICK 401`, `ERR_USERNOTINCHANNEL 441`, `ERR_NOPRIVILEGES 481`.
 - Example: `FORCEOP #zig alice`
-- Sources: `src/daemon/modules/services_ext.zig:58`, `src/daemon/server.zig:18687`, `src/daemon/server.zig:18756`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`
 
 ## FORCEDEOP
 
@@ -395,7 +395,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: `MODE` broadcast or server notice for no-op.
 - Errors: Same as `FORCEOP`.
 - Example: `FORCEDEOP #zig alice`
-- Sources: `src/daemon/modules/services_ext.zig:59`, `src/daemon/server.zig:18687`, `src/daemon/server.zig:18756`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`
 
 ## FORCEJOIN
 
@@ -406,7 +406,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: Normal join replies to target; `Force action applied` notice to oper.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHNICK 401`, join errors, `ERR_NOPRIVILEGES 481`.
 - Example: `FORCEJOIN #zig alice`
-- Sources: `src/daemon/modules/services_ext.zig:60`, `src/daemon/server.zig:18687`, `src/daemon/server.zig:18737`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`
 
 ## FORCEPART
 
@@ -417,7 +417,7 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: `PART` broadcast; `Force action applied` notice.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOSUCHNICK 401`, `ERR_NOPRIVILEGES 481`.
 - Example: `FORCEPART #zig alice :cleanup`
-- Sources: `src/daemon/modules/services_ext.zig:61`, `src/daemon/server.zig:18687`, `src/daemon/server.zig:18744`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`
 
 ## FORCETOPIC
 
@@ -428,4 +428,4 @@ The `oper.security` module registers the core oper and moderation commands (`src
 - Replies: `TOPIC` broadcast.
 - Errors: `ERR_NEEDMOREPARAMS 461`, `ERR_NOSUCHCHANNEL 403`, `ERR_NOPRIVILEGES 481`.
 - Example: `FORCETOPIC #zig :new topic`
-- Sources: `src/daemon/modules/services_ext.zig:62`, `src/daemon/server.zig:18687`, `src/daemon/server.zig:18780`
+- Sources: `src/daemon/modules/services_ext.zig`, `src/daemon/server.zig`

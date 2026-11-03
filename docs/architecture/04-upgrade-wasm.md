@@ -1,127 +1,103 @@
 # Upgrade and OroWasm
 
-*Helix in-place upgrade and the OroWasm control-plane plugin host.*
+Helix carries live daemon state between compatible images. OroWasm runs bounded
+control-plane plugins. These are separate mechanisms: loading a plugin does not
+replace the daemon, and requesting an upgrade does not bypass state validation.
 
-Cryptographic details are out of scope; see [crypto.md](crypto.md).
+## Helix entry points and platform scope
 
-## Helix UPGRADE command and USR2 path
+`UPGRADE` is registered by [the upgrade module](../../src/daemon/modules/upgrade.zig).
+`LinuxServer.handleUpgradeCommand` checks the `server_restart` operator privilege;
+Linux SIGUSR2 reaches the same upgrade machinery from reactor 0. The production
+fleet uses Linux, with OpenRC locally and systemd on the peer. Current commands,
+rollback requirements and accepted image are recorded in the [runbook](../RUNBOOK.md)
+and [production paths](../ops/onyx-server-paths.md).
 
-The `UPGRADE` command is a SerpentRegistry module command in `ops.upgrade`. The module is a thin wrapper: it recovers `module_core.Core` and calls `LinuxServer.handleUpgrade`. Evidence: `src/daemon/modules/upgrade.zig:4`, `src/daemon/modules/upgrade.zig:16`, `src/daemon/modules/upgrade.zig:17`, `src/daemon/modules/upgrade.zig:18`, `src/daemon/modules/upgrade.zig:21`, `src/daemon/modules/upgrade.zig:25`.
+Linux prepares a sealed memfd arena, preserves authoritative listener/state fds,
+probes the already-open successor executable, and executes that pinned image with
+`--supervisor`. Windows has a separate native successor/custody driver; consult the
+[Windows guide](../guide/windows.md#guarded-windows-helix-upgrade). Linux acceptance
+does not certify Windows behavior. Source: [server.zig](../../src/daemon/server.zig)
+(`performUpgrade`, `performUpgradeAfterCompatibleTarget`, `adoptInheritedSessions`),
+[live.zig](../../src/daemon/helix/live.zig),
+[handoff.zig](../../src/daemon/helix/handoff.zig), and
+[native_windows_runtime.zig](../../src/daemon/helix/native_windows_runtime.zig).
 
-`handleUpgrade` is oper-gated with the `server_restart` privilege and delegates to `performUpgrade`; SIGUSR2 is the shell/service-manager path and polls the same `performUpgrade(null)` path from reactor 0's timer tick. Evidence: `src/daemon/server.zig:4533`, `src/daemon/server.zig:4539`, `src/daemon/server.zig:4540`, `src/daemon/server.zig:16175`, `src/daemon/server.zig:16176`, `src/daemon/server.zig:16177`, `src/main.zig:902`, `src/main.zig:906`.
+## Compatibility and complete-state validation
 
-`performUpgrade` is Linux-only. It publishes an oper event, emits process-global TLS ticket keys when resumption is enabled, serializes carried S2S links, TLS state, WebSocket markers, and registered client snapshots into Helix capsules, clears `FD_CLOEXEC` on the carried fds, seals a memfd arena, clears `FD_CLOEXEC` on the listener and arena fds, builds an exec plan for the launch path recorded at boot (falling back to `/proc/self/exe`) with `--supervisor` and the same config path, then commits via `execve`. Evidence: `src/daemon/server.zig:16277`, `src/daemon/server.zig:16286`, `src/daemon/server.zig:16301`, `src/daemon/server.zig:16310`, `src/daemon/server.zig:16329`, `src/daemon/server.zig:16343`, `src/daemon/server.zig:16406`, `src/daemon/server.zig:16426`, `src/daemon/server.zig:16483`, `src/daemon/server.zig:16501`, `src/daemon/server.zig:16505`, `src/daemon/server.zig:16513`, `src/daemon/server.zig:16535`, `src/daemon/server.zig:16541`, `src/daemon/server.zig:16542`, `src/daemon/server.zig:16551`.
+There is no universal backwards-compatible Helix ABI. Capsule kinds have explicit
+schema/version ranges in [capsule.zig](../../src/daemon/helix/capsule.zig), while
+[handoff_relations.zig](../../src/daemon/helix/handoff_relations.zig) applies the
+stricter current-image completeness and cross-family relations. Generic legacy
+codec support does not grant permission to adopt old or incomplete live state.
 
-## Capsule versioning discipline
+Current descriptors include `.clients` v8, `.s2s_link` v6, `.ws_session` v3 and
+`.handoff_manifest` v5. The textual target capability token is a distinct protocol:
+for example its `clients-v5` label is not the current `.clients` schema number.
+Read `upgrade_capability_token` in `helix/live.zig`; do not infer compatibility
+from a version banner or from one overlapping capsule range.
 
-Helix capsules are the binary state boundary across upgrades. `CapsuleKind` values are append-only enum ordinals, each kind has its own descriptor with schema id plus current/min/max supported versions, and fields are ordinaled payloads whose order is validated. There is no single global ABI integer. Evidence: `src/daemon/helix/capsule.zig:4`, `src/daemon/helix/capsule.zig:7`, `src/daemon/helix/capsule.zig:8`, `src/daemon/helix/capsule.zig:29`, `src/daemon/helix/capsule.zig:30`, `src/daemon/helix/capsule.zig:59`, `src/daemon/helix/capsule.zig:79`, `src/daemon/helix/capsule.zig:132`, `src/daemon/helix/capsule.zig:154`, `src/daemon/helix/capsule.zig:165`, `src/daemon/helix/capsule.zig:266`.
+Before publication, the successor validates the complete manifest, physical
+connection identities, mandatory authority families, fd ownership, TLS/WS joins,
+replay state and session relations. Missing, duplicate, malformed, downgraded or
+inconsistent mandatory state rejects adoption. Allocation failures must leave
+staged state unpublished; serving a partial adopted client population is forbidden.
 
-Serialized-length changes require a capsule version bump, a decoder arm for every still-supported older version, and a cross-version test. `.s2s_link` is the current worked example: it is at schema v4 with `min_supported = 1`, so one decoder still accepts v1..v4 — v2 appended `admitted_frame_families`, v3 the `caps_ext` byte, and v4 the trailing converged remote-member roster block (a pre-v4 blob decodes with an empty roster, i.e. pre-fix behavior). Transport-critical `.clients` is instead pinned to exactly v5 (`min = max = 5`) and carries no legacy arm, because a successor must understand every current join/transport field. Evidence: `src/daemon/helix/capsule.zig:106`, `src/daemon/helix/capsule.zig:137`, `src/daemon/helix/s2s_snapshot.zig:79`, `src/daemon/helix/s2s_snapshot.zig:145`, `src/daemon/helix/s2s_snapshot.zig:314`.
+| Carried authority | Source and validation boundary |
+|---|---|
+| Physical connections and client state | `helix/session_snapshot.zig`, `helix/physical_connection_relation.zig`; identity is physical, including several attachments sharing one logical token. |
+| World and reusable sessions | `helix/world_capsule.zig`, `helix/session_capsule.zig`, `sessions.zig`; includes membership, attachment and retained restore authority. |
+| TLS and WebSocket engines | `helix/tls_snapshot.zig`, `helix/ws_snapshot.zig`; secured clients require exactly matching engine state and bounded pending bytes. |
+| Established secured S2S links | `helix/s2s_snapshot.zig`; Mooring keys/counters, partial framing, inner custody and remote roster must remain consistent. |
+| Mesh, policy and identity checkpoints | `helix/handoff_relations.zig` plus the magic-discriminated `.mesh_checkpoint` families; current required pieces cannot silently default empty. |
+| MESSAGE_V2 and Event Spine replay | `relay_v2_replay_guard.zig`, `relay_v2_event_log.zig`, `relay_v2_outbox.zig`, `attachment_delivery_spool.zig`, `event_spine_replay_guard.zig`. |
 
-The arena format is a concatenated capsule stream. `decodeStream` walks until end-of-buffer, while the snapshot decoders themselves are intentionally tolerant only for append-only optional tails such as session signon/caps/oper/username/`was_secured` and TLS kTLS flags. Evidence: `src/daemon/helix/capsule.zig:243`, `src/daemon/helix/capsule.zig:246`, `src/daemon/helix/capsule.zig:253`, `src/daemon/helix/session_snapshot.zig:222`, `src/daemon/helix/session_snapshot.zig:263`, `src/daemon/helix/tls_snapshot.zig:113`, `src/daemon/helix/tls_snapshot.zig:166`.
+Paths in this table are relative to `src/daemon/`. Reusable credential scopes and
+current redirect behavior are detailed in [credential domains](../reference/credential-domains.md)
+and [the session contract](../design/session-resume-anywhere-blueprint.md).
 
-MHLC is intentionally stricter than an append-only sidecar. Current producers
-emit MHLC v3 containing the mesh clock, migration-offer epoch, and MESSAGE_V2
-activation `{mode, epoch, roster_digest}`. Generic decoding retains explicit
-v1/v2 cold-migration semantics, but current Helix adoption accepts v3 only and
-requires exactly one capsule with `min_supported = 2`. Before publication, the
-relation pass validates its whole image and the server rejects unstaged
-activation, staged rollback/rebinding, active downgrade, or active tuple change.
-The exact upgrade capability token includes `mesh-clock-v3`, preventing exec of
-a successor that cannot preserve this authority.
+## Refusal, stop and rollback boundaries
 
-## State and fd handoff
+`upgradeContinuityBlockerLocked` in `server.zig` refuses states that cannot be
+carried exactly. Examples include deferred unadmitted MESSAGE_V2 wire, retained
+remote presentation/output transactions, uncheckpointed media state, and active
+or retired recording writers awaiting journal/manifest completion. A configured
+WebTransport listener needs its exact platform owner and custody support; its
+presence alone does not prove that a particular upgrade is permitted.
 
-| Piece | Current source behavior | Evidence |
-| --- | --- | --- |
-| Session snapshot | Encodes nick, realname, account, real/visible host, away state, USER ident, logged-in/away/oper flags, fd, channel memberships, signon/last-message clocks, negotiated CAP names, full oper grant, and the v2 `was_secured` flag. | `src/daemon/helix/session_snapshot.zig:15`, `src/daemon/helix/session_snapshot.zig:25`, `src/daemon/helix/session_snapshot.zig:71`, `src/daemon/helix/session_snapshot.zig:91`, `src/daemon/helix/session_snapshot.zig:122`, `src/daemon/helix/session_snapshot.zig:196` |
-| Secured-client fail-safe | A secured session sets `was_secured` at seal time. Pre-publication relation validation requires exactly one matching valid TLS-engine capsule. A missing/malformed join or later client-adoption failure closes the affected inherited fd and rejects successor startup with `InvalidInheritedHandoff`; it is never tolerated as a partial population or plaintext client. | `src/daemon/helix/handoff_relations.zig`, `LinuxServer.adoptInheritedSessions`, `LinuxServer.adoptInheritedClient` |
-| TLS snapshot | Per-client `.tls_session` capsules carry the inherited fd, TLS 1.3 or hardened TLS 1.2 resume state, pending inbound/outbound bytes, mTLS certfp, and trailing kTLS TX/RX offload markers. | `src/daemon/helix/tls_snapshot.zig:20`, `src/daemon/helix/tls_snapshot.zig:48`, `src/daemon/helix/tls_snapshot.zig:61`, `src/daemon/helix/tls_snapshot.zig:67`, `src/daemon/helix/tls_snapshot.zig:76`, `src/daemon/helix/tls_snapshot.zig:120`, `src/daemon/server.zig:16406`, `src/daemon/server.zig:16414`, `src/daemon/server.zig:16417` |
-| WebSocket state | Current `.ws_session` v3 is keyed by fd and carries the open adapter's selected application protocol, partial deframer bytes and fragmentation flags, partial outbound IRC line, and the bounded decoded payload of an in-progress fragmented binary message. Current adoption is v3-only and semantic validation fails closed on malformed, trailing, oversize, or protocol-inconsistent state; explicit v1/v2 decoding remains only for cold-migration fixtures. | `src/daemon/helix/ws_snapshot.zig`, `src/daemon/helix/capsule.zig`, `src/daemon/helix/handoff_relations.zig`, `LinuxServer.sealSessionsForUpgrade`, `LinuxServer.adoptInheritedSessions`, `LinuxServer.adoptInheritedClient` |
-| Secured S2S snapshot | Established Mooring S2S links are preserved when snapshot export succeeds. The `.s2s_link` capsule carries the inherited fd, Mooring record keys and counters, inner framing header, peer identity/caps including repair-frame support, dial target, partial inbound record, and pending outbound records. Since schema v4 it also carries the link's converged remote-member roster — channel, nick (including loser-UID aliases), origin node, status, HLC, identity, and the receiver-derived session token — so the successor primes its fresh route table before the RESYNC and the peer's re-burst dedups to `.unchanged` instead of re-announcing every surviving remote member as a spurious JOIN. | `src/daemon/helix/s2s_snapshot.zig:20`, `src/daemon/helix/s2s_snapshot.zig:34`, `src/daemon/helix/s2s_snapshot.zig:79`, `src/daemon/helix/s2s_snapshot.zig:145`, `src/daemon/server.zig:22482`, `src/daemon/server.zig:22490`, `src/daemon/server.zig:26176`, `src/daemon/server.zig:26185` |
-| Oper-grant registry | The server-wide cross-mesh oper-grant registry — live grants, zero-privilege revocation tombstones, and the mint-incarnation high-water mark — is sealed as an `OGNT` piece in the shared magic-discriminated `.mesh_checkpoint` family (`min_supported = 2`). The successor primes its registry at the adoption commit edge, before the io loop can process any peer grant re-mint, so an unchanged operator re-learns as `had_oper_override = true` and the derived `*` (+Y) prefix is not re-broadcast to shared channels on every upgrade; the tombstones preserve the incarnation replay guard. A pre-checkpoint predecessor's arena simply lacks the piece and adopts with an empty registry (pre-fix behavior). | `src/daemon/helix/oper_grant_snapshot.zig:4`, `src/daemon/helix/oper_grant_snapshot.zig:52`, `src/daemon/server.zig:23009`, `src/daemon/server.zig:24594`, `src/daemon/server.zig:25610` |
-| Mesh fallback | Plaintext or unestablished hand-dialed links may seal a redial hint; managed `[mesh].connect` peers use the successor's normal mesh boot path. An established secured S2S link must snapshot successfully: failure refuses the entire UPGRADE rather than degrading to redial. | `LinuxServer.sealSecuredLink`, `LinuxServer.performUpgrade` |
-| Ticket keys | When TLS resumption is enabled, the predecessor emits one `.tls_ticket_keys` capsule ahead of per-client pieces; the successor adopts it in pass 0 so pre-upgrade tickets still open. | `src/daemon/helix/ticket_key_capsule.zig:4`, `src/daemon/helix/ticket_key_capsule.zig:22`, `src/daemon/server.zig:16301`, `src/daemon/server.zig:16310`, `src/daemon/server.zig:16583`, `src/daemon/server.zig:16590`, `src/daemon/server.zig:16591` |
-| Sealed arena | `helix_live.prepare` creates a memfd arena, writes encoded capsules, seals it, initializes control socket state, and advances the supervisor model. | `src/daemon/helix/live.zig:51`, `src/daemon/helix/live.zig:61`, `src/daemon/helix/live.zig:63`, `src/daemon/helix/live.zig:66`, `src/daemon/helix/live.zig:70`, `src/daemon/helix/live.zig:75`, `src/daemon/helix/live.zig:77`, `src/daemon/helix/live.zig:84` |
-| Memfd implementation | `handoff.Arena.create` uses Linux `memfd_create` with sealing enabled; `seal` applies seal, shrink, grow, and write seals. | `src/daemon/helix/handoff.zig:43`, `src/daemon/helix/handoff.zig:48`, `src/daemon/helix/handoff.zig:55`, `src/daemon/helix/handoff.zig:81`, `src/daemon/helix/handoff.zig:83`, `src/daemon/helix/handoff.zig:84` |
-| Listener and arena exec plan | Current `performUpgrade` uses `buildArenaListenerExecPlan`, carrying the sealed arena and listener fd through environment variables to `--supervisor`; client, S2S, listener, and arena fds survive because `FD_CLOEXEC` is explicitly cleared before `execve`. | `src/daemon/server.zig:16505`, `src/daemon/server.zig:16535`, `src/daemon/server.zig:16542`, `src/daemon/helix/live.zig:251`, `src/daemon/helix/live.zig:254`, `src/daemon/helix/live.zig:276`, `src/daemon/helix/live.zig:278`, `src/daemon/helix/live.zig:280` |
-| Fail-closed UPGRADE boundary | Current UPGRADE refuses incomplete state, seal/planning failure, target capability mismatch, invalid manifest/relations, or missing mandatory authority. `upgradeListenerOnly` is reserved for explicit RESTART and is not an UPGRADE fallback. | `src/daemon/server.zig` `performUpgrade`, `upgradeListenerOnly`, and `adoptInheritedSessions` |
+Linux TERM/INT are blocked before daemon workers start and observed without
+consuming their kernel-pending state. Stop checks fence deferred, frozen and exec
+upgrade boundaries, and `pending-stop-v1` prevents handing blocked stop signals to
+an incompatible successor. Offline CLI paths retain ordinary signal behavior.
+Source: [main.zig](../../src/main.zig), `server.zig` and `helix/live.zig`.
 
-## Successor adoption
+A refusal before exec keeps the predecessor serving. Once Linux exec replaces the
+image, there is no separate old process to resume: a fatal successor failure
+requires the documented recovery procedure. RESTART/listener-only execution is
+not a silent fallback for a failed UPGRADE. A cold restart drops TCP attachments
+and in-memory session/custody state. Durable account `SESSION-TOKEN` login recovery
+is separate from preserving an exact live attachment or unacknowledged message tail.
+See [MESSAGE_V2 durability](../design/message-v2-exact-once.md#cold-restart-durability-contract).
 
-The successor path is driven by `onyx-server --supervisor`. `main.zig` checks Helix handoff environment fds, adopts the inherited listener fd into server config, stores the arena fd for later session adoption, preserves those handoff-only config fields when loading the real config file, loads OroWasm plugins, then calls `srv.adoptInheritedSessions()` after the server and ring exist. Evidence: `src/main.zig:140`, `src/main.zig:146`, `src/main.zig:147`, `src/main.zig:150`, `src/main.zig:157`, `src/main.zig:257`, `src/main.zig:260`, `src/main.zig:264`, `src/main.zig:895`, `src/main.zig:900`.
+## OroWasm host and dispatch
 
-| Adoption stage | Behavior | Evidence |
-| --- | --- | --- |
-| Env parsing | `resumeFromEnv` reads `/proc/self/environ` for arena, control, and listener fd variables; if none exist, it returns null. | `src/daemon/helix/live.zig:286`, `src/daemon/helix/live.zig:297`, `src/daemon/helix/live.zig:300`, `src/daemon/helix/live.zig:314`, `src/daemon/helix/live.zig:315`, `src/daemon/helix/live.zig:316`, `src/daemon/helix/live.zig:317` |
-| Listener adoption | Reactor 0 uses `config.inherited_listener_fd` instead of binding a fresh listener. | `src/daemon/server.zig:1618`, `src/daemon/server.zig:1621`, `src/daemon/server.zig:3280`, `src/daemon/server.zig:3286`, `src/daemon/server.zig:3288`, `src/daemon/server.zig:3290` |
-| Arena read | `adoptInheritedSessions` reads capsules from `resume_arena_fd` through `helix_live.readArena`; `readArena` reads the sealed memfd and decodes the concatenated capsule stream. | `src/daemon/server.zig:16567`, `src/daemon/server.zig:16569`, `src/daemon/server.zig:16574`, `src/daemon/helix/live.zig:321`, `src/daemon/helix/live.zig:325`, `src/daemon/helix/live.zig:346` |
-| Pass 0: ticket keys | Adopt `.tls_ticket_keys` before any connection state so the successor keeps the predecessor's resumption key material. | `src/daemon/server.zig:16583`, `src/daemon/server.zig:16588`, `src/daemon/server.zig:16590`, `src/daemon/server.zig:16591`, `src/daemon/server.zig:16592` |
-| Pass 1: TLS engines | The pre-publication relation pass requires every secured client to have exactly one valid matching TLS capsule. Adoption then decodes the validated capsules into an fd-indexed set before client attachment; invalid or missing mandatory TLS state refuses the handoff rather than intentionally adopting plaintext or a partial set. | `src/daemon/helix/handoff_relations.zig`, `src/daemon/server.zig` `adoptInheritedSessions` |
-| Pass 1b: WebSocket state | Decode and validate current `.ws_session` v3 capsules by the same fd join key before client adoption. Duplicate, orphaned, closed, malformed, downgraded, or protocol-inconsistent state rejects the handoff transaction. | `src/daemon/helix/handoff_relations.zig`, `LinuxServer.adoptInheritedSessions` |
-| Pass 2: clients | Decode `.clients` snapshots, join them to already validated TLS/WS state by fd, enforce the `was_secured` relation, then call `adoptInheritedClient`. Decode, join, or adoption failure closes the affected fd and rejects the whole successor startup rather than publishing a partial client set. | `LinuxServer.adoptInheritedSessions`, `LinuxServer.adoptInheritedClient` |
-| Client reattach | `adoptInheritedClient` allocates a connection slot around the inherited fd, restores clocks/session/oper state, rebuilds TLS before socket use, restores the exact validated WebSocket protocol/deframer/fragment/tx state, re-registers nick, restores channel memberships, marks I/O activation pending for the first reactor turn, and re-arms `FD_CLOEXEC`. | `LinuxServer.adoptInheritedClient`, `LinuxServer.activatePendingSocketIo` |
-| TLS reattach | `adoptTlsState` resumes the TLS engine, restores kTLS TX/RX markers, re-binds certfp and channel binding, and requeues unflushed pending wire bytes. Any failure propagates through client adoption and rejects successor startup; it is not a best-effort single-client drop. | `LinuxServer.adoptTlsState`, `LinuxServer.adoptInheritedClient`, `LinuxServer.adoptInheritedSessions` |
-| Pass 3: mesh redials | Decode `.mesh_checkpoint` hints and stage hand-opened peer redials for the first reactor turn; config-managed mesh peers are left to the mesh boot pass. | `LinuxServer.adoptInheritedSessions`, `LinuxServer.activateInheritedMeshRedials` |
-| Pass 4: preserved S2S links | Decode `.s2s_link` capsules with the current descriptor, rebuild the established Mooring link, and stage I/O/RESYNC activation for the first reactor turn. The v4 converged roster is primed into the fresh route table (`primeInheritedS2sRoster`) before RESYNC so surviving remote members do not re-announce. Invalid decode or adoption is startup-fatal after fd recovery; no partial link population is served. | `LinuxServer.adoptInheritedSessions`, `LinuxServer.adoptSecuredLink`, `src/daemon/server.zig:26176`, `src/daemon/server.zig:26185`, `LinuxServer.activatePendingSocketIo` |
-| Commit edge: oper grants | At the same no-fail commit edge, the successor primes the carried `OGNT` oper-grant registry (fixed-capacity upserts that cannot fail) before the io loop starts, merging with any locally re-minted grants and carrying the tombstones + mint-incarnation mark forward. A missing/malformed/duplicate/downgraded checkpoint is startup-fatal; an absent piece leaves the registry empty (pre-fix behavior). | `src/daemon/server.zig:24594`, `src/daemon/server.zig:25610` |
-| Arena cleanup | After all passes, the successor closes the inherited arena fd and clears `resume_arena_fd`. | `src/daemon/server.zig:16713`, `src/daemon/server.zig:16714`, `src/daemon/server.zig:16715` |
+[The host](../../src/wasm/host/) is pure Zig. Registered commands pass through the
+SerpentRegistry runtime first; only a registry miss can reach a loaded plugin that
+owns the command. Plugins receive bounded host capabilities and fuel/memory limits,
+with reply, logging and clock callbacks. The host does not grant direct daemon
+memory ownership or arbitrary network access merely because a plugin is loaded.
 
-## Helix supervisor model
+Authoritative interfaces: `src/wasm/host/abi.zig`, `bridge.zig`, `interp.zig`, and
+`LinuxServer.dispatchRegistered`. `OROWASM STATUS|ABI|WIT|PLUGINS` reports effective
+budgets, allowed capabilities/intents, registry pins and loaded plugin grants.
+Follow the host ABI source and plugin examples under `src/wasm/host/` and the `[wasm]` section of the
+[configuration reference](../reference/config.md). Declared host features and pure
+codec helpers must be distinguished from a configured, loaded runtime plugin.
 
-`src/daemon/helix/supervisor.zig` holds the pure state machine. It exposes states from `idle` through `committed`/`rolled_back`; events such as request, freeze, drain, serialized, fd handoff, attestation, timeout, worker exit, and operator abort; plus actions such as freeze, drain, serialize, pass fds, await attestation, commit, and rollback. Evidence: `src/daemon/helix/supervisor.zig:4`, `src/daemon/helix/supervisor.zig:25`, `src/daemon/helix/supervisor.zig:36`, `src/daemon/helix/supervisor.zig:49`.
+## Verification
 
-`prepare` currently advances through request, accept frozen, drain complete, and capsules serialized. Evidence: `src/daemon/helix/live.zig:77`, `src/daemon/helix/live.zig:78`, `src/daemon/helix/live.zig:80`, `src/daemon/helix/live.zig:82`, `src/daemon/helix/live.zig:84`.
-
-`handOff` can pass fds over the control socket and advance to `awaiting_attestation`, but the live `performUpgrade` path currently uses the environment-based arena/listener exec plan rather than `handOff`. Evidence for `handOff`: `src/daemon/helix/live.zig:95`, `src/daemon/helix/live.zig:97`, `src/daemon/helix/live.zig:106`, `src/daemon/helix/live.zig:116`; evidence for live path: `src/daemon/server.zig:16542`.
-
-## OroWasm host
-
-OroWasm is a pure-Zig control-plane plugin host. The library root re-exports it as `wasm_host`, and `LinuxServer` owns a `wasm_bridge.Bridge`. Evidence: `src/root.zig:27`, `src/root.zig:29`, `src/daemon/server.zig:19`, `src/daemon/server.zig:20`, `src/daemon/server.zig:2799`, `src/daemon/server.zig:2802`, `src/daemon/server.zig:3497`.
-
-## Plugin dispatch path
-
-| Stage | Behavior | Evidence |
-| --- | --- | --- |
-| Server consult | `dispatchRegistered` resolves post-registration commands through SerpentRegistry first, then consults OroWasm only after the registry misses and only when a plugin is loaded and owns the command. | `src/daemon/server.zig:8341`, `src/daemon/server.zig:8382`, `src/daemon/server.zig:8395`, `src/daemon/server.zig:8412`, `src/daemon/server.zig:8434`, `src/daemon/server.zig:8436` |
-| Host bindings | The server supplies reply, log, and now_ms callbacks over an opaque per-command context. | `src/daemon/server.zig:8445`, `src/daemon/server.zig:8447`, `src/daemon/server.zig:8448`, `src/daemon/server.zig:8449`, `src/daemon/server.zig:30477`, `src/daemon/server.zig:30480`, `src/daemon/server.zig:30486`, `src/daemon/server.zig:30489` |
-| Bridge dispatch | `Bridge.dispatch` finds the owning plugin command, builds a hostcall callback, calls the exported function with default fuel, maps denied/trap outcomes, and returns handled. | `src/wasm/host/bridge.zig:187`, `src/wasm/host/bridge.zig:190`, `src/wasm/host/bridge.zig:191`, `src/wasm/host/bridge.zig:192`, `src/wasm/host/bridge.zig:193`, `src/wasm/host/bridge.zig:194`, `src/wasm/host/bridge.zig:197` |
-| Server error mapping | Denied hostcalls and traps become numeric errors to the client. | `src/daemon/server.zig:8451`, `src/daemon/server.zig:8453`, `src/daemon/server.zig:8458` |
-| Hook dispatch | Exports named `hook_<id>` register plugin hooks. The server invokes `message_pre_deliver` through the same host bindings; a hook returning nonzero `i32` stops delivery, while denied/trapped hooks are isolated. | `src/wasm/host/bridge.zig:200`, `src/wasm/host/bridge.zig:203`, `src/wasm/host/bridge.zig:214`, `src/wasm/host/bridge.zig:225`, `src/wasm/host/bridge.zig:643`, `src/wasm/host/bridge.zig:646`, `src/daemon/server.zig:29513`, `src/daemon/server.zig:29523`, `src/daemon/server.zig:29529` |
-
-## Plugin loading and capabilities
-
-| Source | Behavior | Evidence |
-| --- | --- | --- |
-| `Bridge.init` | Creates `PluginStore` with configured allowed capabilities, intents, and memory budget. | `src/wasm/host/bridge.zig:111`, `src/wasm/host/bridge.zig:115`, `src/wasm/host/bridge.zig:119`, `src/wasm/host/bridge.zig:120`, `src/wasm/host/bridge.zig:121`, `src/wasm/host/bridge.zig:122` |
-| Directory load | `loadFromDir` opens a plugin directory, loads `*.wasm` files up to the configured max bytes, and uses the file stem as fallback plugin name. | `src/wasm/host/bridge.zig:127`, `src/wasm/host/bridge.zig:128`, `src/wasm/host/bridge.zig:139`, `src/wasm/host/bridge.zig:140`, `src/wasm/host/bridge.zig:145`, `src/wasm/host/bridge.zig:148` |
-| Metadata parse | Bridge parses imports/exports to infer requested capabilities plus command and hook exports; `cmd_*` exports become commands, and `hook_*` exports become hooks. | `src/wasm/host/bridge.zig:161`, `src/wasm/host/bridge.zig:615`, `src/wasm/host/bridge.zig:625`, `src/wasm/host/bridge.zig:633`, `src/wasm/host/bridge.zig:643`, `src/wasm/host/bridge.zig:646` |
-| ABI schema | Host functions are independently versioned and capability-gated. | `src/wasm/host/abi.zig:4`, `src/wasm/host/abi.zig:7`, `src/wasm/host/abi.zig:11`, `src/wasm/host/abi.zig:21`, `src/wasm/host/abi.zig:29` |
-| Capability negotiation | Granted caps/intents are the intersection of requested caps/intents and host policy; manifest major version must be compatible. | `src/wasm/host/abi.zig:16`, `src/wasm/host/abi.zig:82`, `src/wasm/host/abi.zig:162`, `src/wasm/host/plugin.zig:104`, `src/wasm/host/plugin.zig:105`, `src/wasm/host/plugin.zig:106` |
-| Store lifecycle | `PluginStore` owns loaded plugins, command registrations, hook registrations, and deinitializes them on unload/deinit. | `src/wasm/host/plugin.zig:73`, `src/wasm/host/plugin.zig:77`, `src/wasm/host/plugin.zig:78`, `src/wasm/host/plugin.zig:79`, `src/wasm/host/plugin.zig:86`, `src/wasm/host/plugin.zig:115`, `src/wasm/host/plugin.zig:124` |
-| Boot/REHASH loading | `main.zig` loads plugins at boot after constructing the server, and `handleRehash` rebuilds the bridge and reloads `[wasm] plugin_dir` on REHASH. | `src/main.zig:895`, `src/main.zig:896`, `src/daemon/server.zig:28128`, `src/daemon/server.zig:28140`, `src/daemon/server.zig:28141`, `src/daemon/server.zig:28151`, `src/daemon/server.zig:28154`, `src/daemon/server.zig:28159` |
-
-## Interpreter
-
-`src/wasm/host/interp.zig` is a minimal pure-Zig wasm32 interpreter, not a general-purpose runtime. It parses a small wasm32 subset, executes integer, local, control, and memory instructions, counts fuel per instruction, and traps unsupported opcodes. Evidence: `src/wasm/host/interp.zig:4`, `src/wasm/host/interp.zig:6`, `src/wasm/host/interp.zig:7`, `src/wasm/host/interp.zig:8`, `src/wasm/host/interp.zig:9`.
-
-| Interpreter guard | Evidence |
-| --- | --- |
-| Configurable max memory, default 64 KiB | `src/wasm/host/interp.zig:31` |
-| `callWithHostcalls` takes fuel and optional hostcall callback | `src/wasm/host/interp.zig:116` |
-| Memory slices are bounds-checked | `src/wasm/host/interp.zig:122`, `src/wasm/host/interp.zig:125` |
-| Each instruction decrements fuel and `FuelExhausted` traps at zero | `src/wasm/host/interp.zig:157`, `src/wasm/host/interp.zig:158`, `src/wasm/host/interp.zig:159` |
-| Unsupported opcodes trap | `src/wasm/host/interp.zig:161`, `src/wasm/host/interp.zig:192` |
-| Imports require a host callback and type matching | `src/wasm/host/interp.zig:215`, `src/wasm/host/interp.zig:218`, `src/wasm/host/interp.zig:219`, `src/wasm/host/interp.zig:221`, `src/wasm/host/interp.zig:223` |
-
-## Browser WASM is separate
-
-`src/wasm/cadence_wasm.zig` exports browser/client codec functions for CadenceVox and CadenceVis. It is a `wasm32-freestanding` codec surface built by the `zig build wasm` target and should not be confused with the daemon's OroWasm plugin host. Evidence: `src/wasm/cadence_wasm.zig:4`, `src/wasm/cadence_wasm.zig:6`, `src/wasm/cadence_wasm.zig:15`, `src/wasm/cadence_wasm.zig:20`, `src/wasm/cadence_wasm.zig:24`, `src/wasm/cadence_wasm.zig:30`, `src/wasm/cadence_wasm.zig:38`, `src/wasm/cadence_wasm.zig:42`, `src/wasm/cadence_wasm.zig:47`, `src/wasm/cadence_wasm.zig:52`, `src/wasm/cadence_wasm.zig:57`, `build.zig:462`, `build.zig:466`, `build.zig:468`, `build.zig:480`, `build.zig:483`.
-
-## Planning notes and divergences
-
-| Topic | Current-code finding | Evidence |
-| --- | --- | --- |
-| Capsule maintenance trap | When a serialized payload changes length, bump the capsule descriptor version and keep an explicit decoder arm for every still-supported older version. `.clients` v2 and `.s2s_link` v2 are the current examples. | `src/daemon/helix/capsule.zig:80`, `src/daemon/helix/capsule.zig:91`, `src/daemon/helix/s2s_snapshot.zig:164`, `src/daemon/helix/s2s_snapshot.zig:166`, `src/daemon/helix/session_snapshot.zig:56`, `src/daemon/helix/session_snapshot.zig:581` |
-| Control-socket fd pass | The helper exists in `helix_live.handOff`, but the live `performUpgrade` path uses env-passed arena/listener fds through `buildArenaListenerExecPlan`. | helper: `src/daemon/helix/live.zig:97`; live path: `src/daemon/server.zig:16542` |
-| Plugin hooks | OroWasm hooks are active for `message_pre_deliver`; more typed daemon hook IDs can be wired as their guest payload ABI settles. | `src/wasm/host/bridge.zig:200`, `src/daemon/server.zig:29513`, `src/daemon/server.zig:29529` |
+Use the [testing guide](../guide/testing.md) for the pinned compiler and focused
+`test-helix`, `test-server`, `test-mesh` and module gates. A focused codec result
+cannot establish live connection continuity. Release acceptance requires the full
+gates and explicit multi-client evidence for the deployed upgrade strategy;
+see the [2026-11-03 release record](../audit/release-and-test-speed-2026-11-03.md).

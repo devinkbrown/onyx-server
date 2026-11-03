@@ -1,13 +1,13 @@
 # IRCX: draft-pfenning-irc-extensions-04 (canonical reference)
 
-_Normative extraction of the canonical IRCX IETF draft — the source of truth for IRCX numerics, commands, modes, and properties._
+_External protocol reference: a historical 1998 Internet-Draft excerpt, retained to explain IRCX terminology and deliberate implementation differences._
 
 > Source: IETF Internet-Draft "Extensions to the Internet Relay Chat Protocol
 > (IRCX)", Pfenning/Abraham (Microsoft), July 1998.
 > https://www.ietf.org/archive/id/draft-pfenning-irc-extensions-04.txt
-> Captured 2026-06-05 as Onyx Server's authoritative IRCX reference. Legacy C
-> implementation notes live in the sibling `ircx-protocol.md` and
-> `m_ircx_*.md` files.
+> Captured 2026-06-05. This excerpt is not a current Onyx Server implementation
+> checklist or proof of full draft conformance. Current behavior is in the
+> [IRCX command references](README.md), daemon registry/handlers and protocol codecs.
 
 ## Protocol discovery
 

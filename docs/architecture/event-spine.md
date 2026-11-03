@@ -33,12 +33,34 @@ Both wire planes share the same daemon triad: a local cross-shard fan-out (`deli
 
 ## Publish path
 
-`publishOperEvent` is the thin wrapper (subject defaults to the message text); `publishOperEventSubject` is the core path ([src/daemon/server.zig](../../src/daemon/server.zig)). In order it:
+`publishOperEvent` supplies a default subject; `publishOperEventSubject` owns
+the live branch ([server.zig](../../src/daemon/server.zig)):
 
-1. **Flood-collapse gate.** `event_collapse.admit(category, severity, message, now)` — a suppressed low-severity repeat returns early and is dropped from delivery, mesh, history, *and* stats (the later summary captures it).
-2. **History + stats.** Records into the node-wide `event_history` ring and bumps the `event_stats` counters, stamped with this server's name.
-3. **Local delivery.** `deliverOperEventLocal(serverName, …)` renders and delivers to every locally-subscribed session on this shard, then hands the body+subject+origin to every *other* shard's inbox via the reactor fabric (`DeliverMsg.broadcast_category`/`broadcast_severity`/`broadcast_subject`/`broadcast_origin`); the receiving shard re-renders for its own subscribers in `drainFabric`, so it never re-fans (loop-safe).
-4. **Admit and fan.** On a node with a signing identity (the production case), the event is authored as a signed `SignedOperEventV2`, admitted through the daemon-global **ESG2** replay guard first (`admitEventSpineV2`, which records history/stats only on `.accepted`), delivered to local subscribers by `deliverOperEventV2Local`, then fanned by `meshBroadcastAuthoredOperEventV2`: the signed `OPER_EVENT_V2` object to every `event-spine-v2`-capable secured peer (multi-hop forwarded), and a terminal legacy `OPER_EVENT` leaf to v1-only secured and plaintext peers. A node **without** a signing identity cannot author v2; unsigned V1 mesh authorship is retired, so its events are delivered locally only (history, stats, subscribers, webhooks) and never originate onto the mesh. Receiving a legacy `OPER_EVENT` from a rolling-old peer remains a terminal leaf in `drainOperEvents`. In the v2 branch the history/stats and local-delivery of steps 2–3 are performed by the admit/deliver helpers rather than inline ([src/daemon/server.zig](../../src/daemon/server.zig)).
+1. Apply flood collapse to repeated low-severity messages. Suppressed copies do
+   not reach subscribers, history, counters, mesh or outbound hooks.
+2. With a node signing identity, allocate one HLC, stamp a `SignedOperEventV2`,
+   and admit it through the daemon-global ESG2 guard. Only accepted admission
+   records history/counters and permits local delivery and peer fanout.
+3. Fan accepted signed events to capable secured peers, preserving original
+   origin identity and bytes. Legacy capable leaves receive terminal V1 output;
+   a received V1 event is not promoted to a multi-hop V2 origin.
+4. Without a signing identity, record/deliver locally and invoke configured
+   outbound hooks. This branch does not originate unsigned V1 mesh events.
+
+```mermaid
+flowchart LR
+    Publish[Typed event and subject] --> Collapse[Low-severity repeat gate]
+    Collapse --> Signed[Stamp origin and HLC]
+    Signed --> Guard[Global ESG2 admission]
+    Guard -->|accepted| Local[History, counters and local subscribers]
+    Guard -->|duplicate or rejected| Drop[No repeated publication]
+    Local --> Peers[Original signed event to eligible peers]
+    Peers --> Remote[Peer global admission and local filters]
+```
+
+The graph depicts the signing-identity branch. Subscriber queue pressure can still
+prevent an observed notification; ESG2 replay suppression is not a delivery ACK
+or retransmission queue. MESSAGE_V2 has a separate retained-custody contract.
 
 A subscriber matches when `sessionWantsEvent` is satisfied: the IRCX plane is tried first (token-routed, severity-agnostic, additive), else the category bit must be set **and** `severityWanted(severity)` passes **and** the per-category subject glob matches (default scope `*`). The category subject-glob state exists in `ClientSession` and is enforced by delivery, but the live `EVENT ADD|DEL <category...|ALL>` command currently toggles only category bits; runtime subject masks are exposed on the IRCX plane through `EVENT ADD|CHANGE <CHANNEL|MEMBER|USER|MEDIA> [mask]`. `MEDIA` events carry an extra gate — `mediaEventAllowed` requires a non-oper to be a member of the event's channel, preserving member-only media visibility.
 
@@ -58,7 +80,13 @@ At SASL oper elevation a session's category mask is seeded **only** from its `[[
 
 `EVENT REPLAY [JSON] [category|ALL] [count]` (oper-only, `handleEventReplay`) collects up to `count` (clamped 1-200, default 30) events at or above the session's severity floor, then renders them oldest->newest as NOTICEs. The default form uses a relative-age prefix (`[5m ago] KILL/warn <origin> ...`) so entries read as history, not live traffic. `EVENT REPLAY JSON ...` uses the same filters but emits machine-readable NOTICE payloads: a `type=event-replay` header, one bounded `type=event` object per retained event, and a `type=event-replay-end` trailer.
 
-The ring **is** persisted to disk: `serializeInto`/`load` use an `OEH1`-magic little-endian snapshot. `loadEventHistory` restores it at boot and `saveEventHistory` rewrites it on the stats cadence, gated to reactor 0 (the writer is `O_TRUNC`, not atomic, so a single writer avoids interleaved writes while the shared ring still captures every shard's events). This is wired to the `[oper] event_history_path` config; unset means in-memory only (per-process lifetime). REPLAY therefore survives a USR2 hot-upgrade and a cold restart.
+The optional disk history uses an `OEH1` snapshot. `loadEventHistory` loads it
+best-effort at boot; `saveEventHistory` writes through `chanstats.writeFileAtomicIo`
+(temp file plus rename) on the stats cadence. It requires `[oper] event_history_path`
+and usable I/O. Unset means process-memory history only. The persisted file can
+lag the newest accepted events, and failed writes do not establish persistence.
+Current Helix separately carries exact in-memory history; the disk history is
+not the ESG2 replay guard or a crash-exact-once authority.
 
 ## EVENT STATS and flood-collapse
 

@@ -14,44 +14,51 @@ before binding sockets.
 
 - 64-bit Windows and PowerShell.
 - Git for cloning the repository.
-- Zig `0.17.0-dev.1282+c0f9b51d8`, the version recorded in `build.zig.zon`.
+- Zig `0.17.0`, as declared by `build.zig.zon`.
 - Python 3 for the optional process and IRC smoke test.
 
-The build has no third-party package dependencies or C compiler requirement.
-The older pinned Zig snapshot is available from the Hexops archive. This
-PowerShell block installs it under your LocalAppData, verifies the downloaded
-zip against SHA-256
-`DF1CA8156908BD51B417265773092DDF41A1D307F0E93B28BB3E8A0B912D0681`,
-and adds its `zig.exe` directory to `PATH` for the current terminal session:
+The build has no third-party Zig package dependencies or C compiler requirement.
+Use a complete Windows compiler distribution matching the intended source and
+release evidence. Verify its publisher's checksum before adding its directory
+to `PATH`, then record `zig version` and the compiler executable digest. The
+old `0.17.0-dev.1282+c0f9b51d8` snapshot used by earlier Windows records is
+historical; it is no longer the manifest's compiler pin. A Linux gate or a
+cross-build does not certify current native Windows execution.
+
+The current archive URL and checksum below were checked against the
+[official Zig download index](https://ziglang.org/download/index.json) on
+2026-11-03. This pins compiler acquisition; it does not establish a fresh native
+Windows test result for the current tree.
 
 ```powershell
-$zigVersion = '0.17.0-dev.1282+c0f9b51d8'
+$zigVersion = '0.17.0'
 $archiveName = "zig-x86_64-windows-$zigVersion.zip"
 $installRoot = Join-Path $env:LOCALAPPDATA 'OnyxServer\toolchains'
 $zigDir = Join-Path $installRoot "zig-x86_64-windows-$zigVersion"
 $zigExe = Join-Path $zigDir 'zig.exe'
 $download = Join-Path $env:TEMP ('onyx-zig-' + [guid]::NewGuid().ToString('N') + '.zip')
-$expectedHash = 'DF1CA8156908BD51B417265773092DDF41A1D307F0E93B28BB3E8A0B912D0681'
+$expectedHash = 'b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428'
 
 if (-not (Test-Path -LiteralPath $zigExe)) {
     New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
     try {
-        $url = "https://pkg.hexops.org/zig/$archiveName"
+        $url = "https://ziglang.org/download/$zigVersion/$archiveName"
         Invoke-WebRequest -Uri $url -OutFile $download
         $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
-        if ($actualHash -ne $expectedHash) { throw "Unexpected Zig archive SHA-256: $actualHash" }
+        if ($actualHash -ne $expectedHash) { throw 'Unexpected Zig archive SHA-256' }
         Expand-Archive -LiteralPath $download -DestinationPath $installRoot
     } finally {
         Remove-Item -LiteralPath $download -ErrorAction SilentlyContinue
     }
 }
-if (-not (Test-Path -LiteralPath $zigExe)) { throw "zig.exe missing after extraction: $zigExe" }
+if (-not (Test-Path -LiteralPath $zigExe)) { throw 'zig.exe missing after extraction' }
 $env:Path = "$zigDir;$env:Path"
-zig version
+if ((zig version) -ne $zigVersion) { throw 'Unexpected compiler version' }
+Get-FileHash -LiteralPath $zigExe -Algorithm SHA256
 ```
 
-Then clone and build in PowerShell. Other Zig releases need their own build
-verification:
+Then clone and build in PowerShell. The native runtime claims below belong to their retained platform evidence;
+changed sources and compilers need fresh native acceptance:
 
 ```powershell
 git clone https://github.com/devinkbrown/onyx-server.git
@@ -692,9 +699,9 @@ full-daemon smoke:
 
 ```powershell
 zig build -j1 test-windows -Dtarget=x86_64-windows --summary all
-zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=safe --summary all
 zig build -j1 test -Dtarget=x86_64-windows --summary all
-zig build -j1 test -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+zig build -j1 test -Dtarget=x86_64-windows -Doptimize=safe --summary all
 zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=proto.' --summary all
 zig build -j1 test-mod -Dtarget=x86_64-windows '-Dtest-filter=daemon.store' --summary all
 zig build -j1 test-cli -Dtarget=x86_64-windows --summary all
@@ -772,11 +779,11 @@ for the daemon and Windows test artifacts. Use it with a native Windows host
 and matching target architecture:
 
 ```powershell
-zig build -j1 -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
+zig build -j1 -Dtarget=x86_64-windows -Doptimize=safe -Dwindows-self-hosted=true
 zig build -j1 test-windows -Dtarget=x86_64-windows -Dwindows-self-hosted=true
-zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true
+zig build -j1 test-windows -Dtarget=x86_64-windows -Doptimize=safe -Dwindows-self-hosted=true
 zig build -j1 test -Dtarget=x86_64-windows -Dwindows-self-hosted=true --summary all
-zig build -j1 test -Dtarget=x86_64-windows -Doptimize=ReleaseSafe -Dwindows-self-hosted=true --summary all
+zig build -j1 test -Dtarget=x86_64-windows -Doptimize=safe -Dwindows-self-hosted=true --summary all
 zig build -j1 bogo-shim-test -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 zig build -j1 package -Dtarget=x86_64-windows -Dwindows-self-hosted=true
 ```

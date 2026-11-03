@@ -1,17 +1,23 @@
 # =============================================================================
 # Onyx Server — reference configuration
 # =============================================================================
-# This file documents every configuration section and key the daemon accepts,
-# with its type, default, and accepted range. It is exhaustive: copy it, delete
-# what you don't need, and edit the rest. All keys are optional EXCEPT the two
-# marked REQUIRED ([node].id and [listen].irc).
+# Annotated configuration surface: illustrative settings plus commented optional
+# sections/keys. The detailed semantics, dependencies, ranges and restart behavior
+# live in docs/reference/config.md. Examples are not a production rollout plan:
+# choose identity, private paths, trust and feature policy for your deployment.
+# All keys are optional EXCEPT [node].id and [listen].irc; enabled features may
+# impose additional required keys. Repeated-table examples stay commented.
 #
 # Format: TOML v1.0 (parsed by src/proto/toml.zig).
 #
-# String indirection: any string value may use
+# String indirection: resolver-routed text/path/secret fields may use
 #   "env:NAME"     -> value of environment variable NAME
 #   "@file:/path"  -> contents of the file at /path
-# so secrets need not live in this file.
+# so secrets need not live in this file. Enum/duration tokens and raw registry
+# digest/signature fields stay literal; see the reference for exact exceptions.
+# Relative paths use the process WORKING DIRECTORY, not the config directory
+# (the generated node-identity key beside the config is an explicit exception).
+# Prefer absolute paths under a service manager. Input TOML limit: 2 MiB.
 #
 # Schema source of truth: src/daemon/config_format.zig (parseToml) and
 # src/daemon/config_boot.zig (mapping to the live server).
@@ -63,6 +69,12 @@ name = "Onyx"
 # Configure external rotation; the daemon does not rotate this file itself.
 # stderr_file = "/var/log/onyx-server/onyx-server.log"
 
+# --- [trace] — fault-triggered flight-recorder dump -------------------------
+[trace]
+# Optional private dump destination; fault handling replaces its contents.
+# Separate from the append-only stderr sink. Parent directory must exist.
+# file = "/var/lib/onyx-server/private/flight.log"
+
 # --- [motd] — message of the day (personalized template) ---------------------
 [motd]
 # MOTD text served by the MOTD command. It is a PER-CONNECTION TEMPLATE: each
@@ -103,7 +115,7 @@ name = "Onyx"
 [admin]
 # Shown in the ADMIN reply (RPL_ADMINLOC1 / RPL_ADMINEMAIL).
 location = "Onyx IRC network"
-email = "admin@onyx-server.local"
+email = "admin@onyx.local"
 
 
 # --- [weather] — localized weather for the MOTD {weather} placeholder --------
@@ -268,8 +280,11 @@ port = 6697
 preload = false
 
 
-# --- [mesh] — server-to-server / Suimyaku mesh -------------------------------
+# --- [mesh] — server-to-server / Undertow mesh -------------------------------
 [mesh]
+# Durable guest-presence/retirement WAL; REQUIRED for an active identity mesh
+# (listener, direct trust roots or connect peers). Keep separate from account WAL.
+# presence_store_path = "/var/lib/onyx-server/private/mesh-presence.wal"
 # Mesh realm; peers must share a realm to link. Default: "local".
 realm = "local"
 # Shared passphrase for MeshPass admission when signed admission roots are not
@@ -324,7 +339,7 @@ realm = "local"
 # window with older peers.
 require_signed_frames = true
 
-# Runtime Suimyaku routing/registry capacities used by plaintext S2S and by the
+# Runtime Undertow routing/registry capacities used by plaintext S2S and by the
 # inner CRDT stream of secured S2S.
 [mesh.routing]
 # Max tracked remote nicknames in one peer route table.
@@ -353,9 +368,9 @@ view_passive_capacity = 64
 view_shuffle_active = 2
 view_shuffle_passive = 4
 
-# Preferred table for Ripple (witnessed failure detection).
-# for one rename window (config path only — not a command). Prefer this table;
-# when both are set, mesh.ripple wins.
+# Ripple (witnessed failure detection) library settings. The active parser
+# recognizes mesh.ripple only; no mesh.sazanami alias. These knobs alone do not
+# prove the live daemon drives the complete library state machine.
 [mesh.ripple]
 # Gossip-side suspect reaping timeout and the witness quorum required before a
 # peer is declared dead.
@@ -381,6 +396,15 @@ view_passive_capacity = 8
 burst_max_bytes = 65536
 burst_max_records = 512
 
+
+# Historical retired-issuer denial policy is an optional array of EXACT facts.
+# At most 4096 unique nonzero lowercase-hex triples. Do not add retired issuers
+# to active trust roots. REHASH/warm handoff refuse changes. Use only audited
+# `session-fences` output; these placeholders MUST NOT be deployed.
+# [[mesh.retired_session_group_fences]]
+# group_key = "<64 lowercase hex characters>"
+# issuer_key = "<64 lowercase hex characters>"
+# fact_digest = "<64 lowercase hex characters>"
 
 # --- [dnsbl] — connect-time DNS blocklist ------------------------------------
 # Each non-loopback client IP is checked against the listed DNSBL zones off the
@@ -409,16 +433,16 @@ enabled = false
 [mail]
 enabled = false
 # relay_host = "localhost"
-# relay_port = 587            # 587 = STARTTLS (default); 465 = implicit TLS
-# starttls = true             # false => port 465 implicit TLS
+# relay_port = 587            # convention:587 STARTTLS,465 implicit;set mode too
+# starttls = true             # false => implicit TLS on configured relay_port
 # from = "onyx-server@example.org" # envelope sender + From: address
 # AUTH credentials for the relay (optional; omit for an open/local relay).
 # user = "env:MAIL_USER"
 # pass = "env:MAIL_PASS"
-# SECURITY: the relay's TLS certificate is NOT verified yet. Submitting AUTH
-# credentials to a NON-loopback relay is therefore REFUSED unless you explicitly
-# accept the risk here (a MITM could capture the credentials). Prefer a relay on
-# localhost / a trusted path. Set true only if you understand the exposure.
+# Trust anchors for relay certificate verification (PEM/DER; <=1 MiB).
+# Remote AUTH without nonempty anchors is refused unless verification is
+# explicitly bypassed. Prefer configured trust; leave the bypass false.
+# trust_store_path = "/etc/ssl/certs/ca-certificates.crt"
 # insecure_skip_verify = false
 
 
@@ -448,6 +472,7 @@ keylen = 64            # KEYLEN: max channel-key (+k) length (1..64)
 modes_per_line = 4     # channel modes a client combines per MODE cmd (MODES; 1..20; 1 = one mode/target per line)
 monitorlimit = 128     # max MONITOR targets per client (1..100000)
 silencelimit = 32      # max SILENCE masks per client (1..256)
+whowas_max_entries = 20 # results returned per WHOWAS query (1..100)
 # Anti-abuse:
 max_clones_per_ip = 0          # concurrent connections per exact IP; 0 = unlimited (0..65535)
 max_clones_per_net = 0         # concurrent connections per /24|/64; 0 = unlimited (0..65535)
@@ -469,7 +494,8 @@ reputation_half_life = "1m"    # decay half-life of the reputation penalty
 # Nick delay: hold a nick against reuse for this window after its owner exits, so
 # a hijacker cannot grab it the instant the owner drops (anti nick-camping). The
 # owning account may reclaim during the window; opers and connection classes
-# flagged `nick_delay_exempt` bypass it. Duration string; "0" disables (default).
+# flagged `nick_delay_exempt` bypass it. Positive duration when supplied; OMIT
+# this key for the disabled default. "0" and "0s" are rejected.
 # nick_delay = "30s"
 # Network raid guard: a default join-throttle applied to channels that have NO
 # explicit `+j` mode. At most `raid_joins` joins per `raid_window` before new
@@ -506,14 +532,16 @@ clone_refuse_penalty = 25.0           # added when a clone is refused (0..1000)
 # --- [class.<name>] — connection classes -------------------------------------
 # A connection class is a named bundle of per-connection resource, admission, and
 # flood policy, assigned to a client at registration by matching its IP, TLS,
-# account, oper status, and ident/host. The FIRST class (in file order) whose
-# match criteria are all satisfied wins; a class with no match_* criteria is a
-# catch-all. Two built-in classes always exist as fallbacks: `user` (regular
+# account, oper status, and ident/host. First match in the built registry wins;
+# TOML table hash iteration does not guarantee file-order precedence. Use disjoint
+# match criteria, and avoid overlapping custom catch-all classes. Two built-in classes always exist as fallbacks: `user` (regular
 # clients) and `server` (mesh links). Per-class limits OVERRIDE the matching
-# `[limits]` / nick-delay globals; a `0` value means "inherit the global".
+# `[limits]` / nick-delay globals where an override exists. Zero may mean
+# inherit, automatic sizing or no limit: consult the individual field.
 # Inspect the live classes and per-class member counts with `STATS Y`.
 #
-# Sizes accept K/M/G suffixes ("1M" = 1048576). Durations are strings ("30s").
+# Sizes accept K/M/G suffixes ("1M" = 1048576) or integer bytes. Class
+# durations accept strings ("30s") or nonnegative integer milliseconds.
 #
 # [class.trusted]
 # # --- match criteria (a connection must satisfy ALL that are set) ---
@@ -558,7 +586,7 @@ clone_refuse_penalty = 25.0           # added when a clone is refused (0..1000)
 # multi-device sessions per account at attach time and is carried completely
 # through session-sync snapshots and Helix upgrades.
 [sessions]
-max_accounts = 65536   # distinct accounts tracked (1..2^32); default 65536
+max_accounts = 65536   # distinct accounts tracked (1..4294967295); default 65536
 max_per_account = 64   # live sessions per account (1..65535); default 64
 # Rollout gate for attachment-bound composite SESSION TOKEN/MTOKEN issuance.
 # Keep false until every intended client accepts the composite credential shape;
@@ -613,6 +641,9 @@ changefeed_capacity = 64        # recent mutation feed entries (8..4096)
 
 # --- [sasl] — SASL authentication + account store ----------------------------
 [sasl]
+# Valid OAuth tokens may bind an unregistered account name only when enabled.
+# This does not create an account or grant oper privileges. Default false.
+oauth_auto_provision = false
 # Enable SASL (PLAIN/SCRAM-SHA-256/EXTERNAL). Explicit false disables SASL even
 # when account_db is configured; if omitted, account_db-only legacy configs still
 # enable SASL.
@@ -666,6 +697,8 @@ allow_anonymous = false
 # Default keeps the minimal control-plane surface open. Valid tokens: reply, log,
 # time, rand, store, lookup, hooks, net:outbound.
 # allowed_caps = ["reply", "log", "time"]
+# Verified-tier data-access intent; omitted/empty denies all privileged intents.
+# allowed_intents = [] # only supported token: "message-content"
 # Optional content-addressed local registry. When non-empty, only listed plugins
 # whose BLAKE3-256 digest matches are loadable. `tier` is surfaced to opers via
 # OROWASM PLUGINS and must be one of unlisted/listed/verified. `publisher` and
@@ -687,6 +720,9 @@ allow_anonymous = false
 
 # --- [oper] — operator subsystem settings ------------------------------------
 [oper]
+# DIE/RESTART/mesh-scope bans require a second distinct oper within 60 seconds.
+# Default false preserves single-operator workflows.
+two_person_rule = false
 # Auto-enable the +j override umode on elevation for any operator holding the
 # `oper_override` privilege, so admins get full channel authority (KICK / MODE /
 # TOPIC / PROP / …) without a manual `/mode +j`. Default false keeps override an
@@ -709,13 +745,13 @@ event_history_path = "/var/lib/onyx-server/event_history.bin"
 # this alone is deliberately observational: it preserves the existing live
 # operator/session behavior while the durable image is verified at runtime.
 enabled = false
-# Reserved activation flag for verified OCG2 session projection. Default false
-# and requires enabled=true. This build intentionally rejects project mode at
-# boot until the complete privilege-changing lifecycle is available.
+# Activate verified durable OCG2 authority projection onto live sessions.
+# Default false; requires enabled=true, account state and the public tuple.
+# This changes privileges: coordinate and validate before activation.
 projection_enabled = false
-# Reserved activation flag for authority-node OCG2 minting. Default false and
-# requires both enabled=true and projection_enabled=true. This build rejects
-# mint mode at boot. Never distribute private authority material here.
+# Allow authority-node minting. Requires enabled=true and projection=true.
+# Boot requires the local node identity to match the complete authority tuple.
+# Receivers must keep false. Never distribute private authority material here.
 minting_enabled = false
 # Required when enabled=true. The node id must be the exact short id derived
 # from authority_public_key. Use a quoted 16-digit hexadecimal value when the
@@ -731,6 +767,7 @@ minting_enabled = false
 # account = "alice"
 # class   = "netadmin"
 # title   = "Network Guardian"   # optional; shown in WHOIS
+# certfp = ["<64 hex SHA-256 client-certificate fingerprint>"]
 # # Event-Spine categories this oper is AUTO-subscribed to on elevation. Default
 # # is none — an oper receives nothing until it opts in with `EVENT ADD <cat>`.
 # # Tokens are EventCategory names (case-insensitive) or "ALL".
@@ -754,6 +791,17 @@ minting_enabled = false
 # Missing/corrupt configured state is a startup error; never delete it to retry.
 # [guest_presence]
 # issuer_path = "/var/lib/onyx-server/private/guest-issuer.wal"
+
+# --- [webauthn] — browser passkeys ------------------------------------------
+[webauthn]
+# Unavailable until BOTH an RP domain and a nonempty exact-origin list are set.
+# rp_id = "chat.example.net"
+# origins = ["https://chat.example.net"]
+# Require authenticator User Verification in registration AND login.
+require_uv = false
+# Require a signed attestation statement (not hardware provenance: no bundled
+# FIDO metadata trust roots). Default false retains TOFU registration.
+require_attestation = false
 
 # --- [cloak] — hostname cloaking ---------------------------------------------
 [cloak]
@@ -797,6 +845,10 @@ minting_enabled = false
 # with cert_path/key_path set. Changing those paths via live REHASH while [acme] is
 # enabled is unsupported.
 [acme]
+# HTTP-01 helper bounds: loopback listener backlog, shutdown poll, read timeout.
+http01_listen_backlog = 16       # 1..1024
+http01_accept_poll = "250ms"     # 50ms..5s
+http01_conn_read_timeout = "5s"  # 1s..60s, whole seconds
 enabled = false
 # directory_url = "https://acme-v02.api.letsencrypt.org/directory"
 # domain  = "irc.example.net"
@@ -854,6 +906,19 @@ ws_media_relay = false
 # The per-stream key is the same native_stream_key-derived (channel, participant)
 # key the native UDP leg uses.
 ws_media_require_mac = false
+# DTLS-SRTP termination on the UDP media plane. DTLS1.3 additionally requires
+# dtls_srtp=true; enabling dtls13 alone has no runtime effect.
+dtls_srtp = false
+dtls13 = false
+# Consent-gated packet-journal recording. Keep off until a private directory is
+# provisioned and participants consent through the in-call protocol.
+recording_enabled = false
+# recording_dir = "/var/lib/onyx-server/private/recordings"
+recording_retention_days = 7        # 0 disables startup-on-first-recording sweep
+recording_max_total_bytes = 536870912 # per-recording across segments;64KiB..64GiB
+recording_max_duration_secs = 14400 # 1..604800 seconds
+# Helix refuses active/retired writer state until recording finalization drains.
+# Hidden/nonconsensual recording keys are rejected, even when set to false.
 # STUN server (IPv4 literal) queried at boot for the reflexive media candidate;
 # with stun_port set, overrides listen.media_host on success. Required for remote
 # native/WebRTC peers when media_host is not publicly reachable.
@@ -877,6 +942,8 @@ max_token_bytes = 32
 
 # --- [stats] — web stats publication -----------------------------------------
 [stats]
+# Exclude these nicknames from channel-statistics aggregation (not IRC traffic).
+ignore_nicks = []
 # Directory to publish stats.json + index.html into (e.g. an nginx root).
 # Empty = disabled.
 # dir = "/var/www/onyx-server"
@@ -917,6 +984,8 @@ group_authoring_enabled = true
 # enabled, channel ops can create bindings with WEBHOOK CREATE <#channel> [name].
 # POST /api/webhooks/<id>/<token> to inject sanitized channel messages.
 [webhook]
+# Outbound target policy only; does not change the inbound listener bind.
+allow_private_targets = false
 enabled = false
 # Plain HTTP listener port. Keep loopback and put TLS/rewrite auth at nginx/Caddy.
 listen = 0
@@ -939,3 +1008,21 @@ rate_burst = 10
 # database = "/usr/share/GeoIP/GeoLite2-City.mmdb"
 # Optional separate ASN .mmdb database for WHOIS AS-number/org enrichment.
 # asn_database = "/usr/share/GeoIP/GeoLite2-ASN.mmdb"
+
+
+# --- [ocsp] — verified server certificate stapling ---------------------------
+[ocsp]
+enabled = false
+check_interval = "15m" # positive duration; fetch only when stale/missing
+# Requires a served leaf with an OCSP responder and usable issuer/trust material.
+# The worker's fresh verified staple is offered only to requesting TLS clients.
+
+# --- [webpush] — offline-DM browser notification delivery ---------------------
+[webpush]
+enabled = false
+# Contact in VAPID JWT. Change this example to your actual operator contact.
+subject = "mailto:ops@example.net"
+# Persist the ES256 key privately; changing it invalidates browser subscriptions.
+# Relative default is onyx-webpush-vapid.key under the process CWD.
+# vapid_key_path = "/var/lib/onyx-server/private/webpush-vapid.key"
+# Requires an account store and HTTPS trust anchors configured via [acme].

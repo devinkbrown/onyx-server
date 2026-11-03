@@ -2,11 +2,11 @@
 
 *Configure operator privileges, connection classes, flood control, and network-wide event subscriptions.*
 
-Onyx Server operators are SASL-only. `OPER` never accepts a password; it returns an error instructing the user to authenticate by SASL (`src/daemon/server.zig:8300`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig:8308`).
+Onyx Server operators are SASL-only. `OPER` never accepts a password; it returns an error instructing the user to authenticate by SASL (`src/daemon/server.zig`). After successful SASL, an account matching `[[opers]]` is elevated automatically (`src/daemon/server.zig`).
 
 ## Connection classes
 
-A connection class is a named bundle of per-connection resource, admission, and flood policy, assigned to a client at registration by matching the connection's source IP, TLS status, SASL authentication, operator status, and ident/host. The **first class (in file order) whose match criteria are all satisfied wins**; a class with no criteria is a catch-all fallback. Two built-in classes always exist: `user` (regular clients) and `server` (mesh links) (`src/daemon/conn_class.zig:8`).
+A connection class is a named bundle of per-connection resource, admission, and flood policy, assigned to a client at registration by matching the connection's source IP, TLS status, SASL authentication, operator status, and ident/host. The first matching class in the constructed registry wins. TOML named tables are stored in a hash map, so file order is not a precedence guarantee; use disjoint criteria and inspect `STATS Y`. A criterion-less custom class never auto-matches; unmatched clients fall back to the built-in `user` class. S2S links select the built-in `server` class directly (`src/daemon/conn_class.zig`).
 
 ### Match criteria
 
@@ -82,26 +82,26 @@ require_tls = true
 /STATS Y
 ```
 
-Numeric **218 RPL_STATSYLINE** reports one line per registered connection class with its full policy, match summary, and live member count (`src/daemon/server.zig:10356`). Output includes the class name, policy fields (sendq, recvq, max_clients, max_per_ip, max_channels, max_targets, monitor, silence, timeouts, flood settings), match facets (match criteria, TLS-only, account-only, oper-only), CIDR count, and current member count (`src/daemon/server.zig:10343`).
+Numeric **218 RPL_STATSYLINE** reports one line per registered connection class with its full policy, match summary, and live member count (`src/daemon/server.zig`). Output includes the class name, policy fields (sendq, recvq, max_clients, max_per_ip, max_channels, max_targets, monitor, silence, timeouts, flood settings), match facets (match criteria, TLS-only, account-only, oper-only), CIDR count, and current member count (`src/daemon/server.zig`).
 
 ### SendQ and RecvQ
 
 **SendQ (outbound):** each connection maintains an ~8 KiB inline send buffer plus a heap overflow, bounded by the per-class `sendq` ceiling. The buffer is io_uring zero-copy safe — the armed send buffer is never moved or freed during flight. Exceeding the ceiling drops appended data with an "output too small" error (`src/daemon/conn_class.zig`).
 
-**RecvQ (inbound):** pending unterminated lines accumulate in an inline line buffer and spill to a heap overflow once they outgrow it, bounded by the per-class `recvq` ceiling. A `recvq` of `0` inherits the daemon's physical line-buffer default. A line exceeding the ceiling drops the connection (LineTooLong error).
+**RecvQ (inbound):** pending unterminated lines accumulate in an inline line buffer and spill to a heap overflow once they outgrow it, bounded by the per-class `recvq` ceiling. A `recvq` of `0` inherits the daemon's physical line-buffer default. An ordinary line exceeding the ceiling emits numeric `417 ERR_INPUTTOOLONG` and is discarded through its next LF while the connection remains open. During a TLS control barrier, an overlong accepted plaintext line instead fails the generation because it cannot be safely resynchronized. An unfinished overflow/discard state also prevents Helix from losing partial input.
 
 ## Nick delay
 
-Nick delay is an anti-camping protection: when a registered account's nick is released (by the owner disconnecting or sending `QUIT`), the daemon holds that nick against reuse for a configured window (`src/daemon/nick_delay.zig:1`).
+Nick delay is an anti-camping protection: when a registered account's nick is released (by the owner disconnecting or sending `QUIT`), the daemon holds that nick against reuse for a configured window (`src/daemon/nick_delay.zig`).
 
 ### Configuration
 
 ```toml
 [limits]
-nick_delay = "30s"  # or "0" to disable (the default)
+nick_delay = "30s"  # omit this key for the disabled default
 ```
 
-Set `[limits].nick_delay` to a duration string (`"30s"`, `"1m"`, and so on) to enable it. `"0"` disables nick delay entirely (`src/daemon/config_format.zig:172`).
+Set `[limits].nick_delay` to a duration string (`"30s"`, `"1m"`, and so on) to enable it. Omit the key to retain the disabled default; explicit `"0"` and `"0s"` are rejected (`src/daemon/config_format.zig`).
 
 ### Behavior
 
@@ -110,12 +110,12 @@ Set `[limits].nick_delay` to a duration string (`"30s"`, `"1m"`, and so on) to e
   - The **owning account** (if the releaser was SASL-authenticated) may reclaim the nick immediately.
   - **Server operators** (any opered connection) bypass the hold entirely.
   - Connections flagged `nick_delay_exempt` in their class bypass the hold.
-  - **Everyone else** is refused with numeric **437 ERR_UNAVAILRESOURCE**: `"Nick is held (nick delay); try again shortly"` (`src/daemon/server.zig:5885`).
+  - **Everyone else** is refused with numeric **437 ERR_UNAVAILRESOURCE**: `"Nick is held (nick delay); try again shortly"` (`src/daemon/server.zig`).
 - Once the window expires, the nick is free for anyone to claim.
 
 ### Per-class exemption
 
-A connection class can exempt its members from nick-delay holds via the `nick_delay_exempt` policy flag (`src/daemon/nick_delay.zig:8`):
+A connection class can exempt its members from nick-delay holds via the `nick_delay_exempt` policy flag (`src/daemon/nick_delay.zig`):
 
 ```toml
 [class.services]
@@ -133,7 +133,7 @@ Members of this class may take a held nick without waiting, just like operators.
 /INFO
 ```
 
-Look for a line such as `"Nick delay: 30000ms hold on release - 5 nick(s) currently held"` (`src/daemon/server.zig:19219`).
+Look for a line such as `"Nick delay: 30000ms hold on release - 5 nick(s) currently held"` (`src/daemon/server.zig`).
 
 ## Per-class flood control
 
@@ -178,7 +178,7 @@ Operators can also plant **spam-trap honeypots** with `SPAMTRAP ADD NICK <nick>`
 
 ### Live-ward enforcement
 
-A `WARD` (network ban) now bites **already-connected** clients, not just the next reconnect. When a ward is added locally by the `WARD` command or arrives propagated from another mesh node, the daemon sweeps every live, registered, non-oper session and applies the first matching ward's action immediately (`src/daemon/server.zig:18713`, `src/daemon/server.zig:18730`):
+A `WARD` (network ban) now bites **already-connected** clients, not just the next reconnect. When a ward is added locally by the `WARD` command or arrives propagated from another mesh node, the daemon sweeps every live, registered, non-oper session and applies the first matching ward's action immediately (`src/daemon/server.zig`):
 
 - `refuse` / `expel` → the client is closed with `Closing Link: <name> (Banned: <reason>)`.
 - `quarantine` → the session is restricted in place (no `JOIN`, no `PRIVMSG`/`NOTICE`), no teardown.
@@ -188,13 +188,19 @@ Operator sessions and S2S links are exempt. The sweep reuses the registration ch
 
 ## Host cloaking
 
-By default every client's real IP is hidden behind an HMAC [cloak](../reference/host-cloaking.md), configured under `[cloak]`. Two changes first introduced in 0.4.0 (and retained in the current 0.7.0 source line) affect operators.
+By default every client's real IP is hidden behind an HMAC [cloak](../reference/host-cloaking.md), configured under `[cloak]`. Two changes first introduced in 0.4.0 (and retained in the current source) affect operators.
 
 ### Argon2id key derivation (migration note)
 
-The `[cloak] secret` passphrase is stretched through **Argon2id** (memory-hard) with a fixed domain-separation salt to derive the cloak key, replacing the previous bare `SHA256(secret)` (`src/main.zig:472`). Because the IPv4 input space is fully enumerable, the model rests on key secrecy, and a low-entropy operator passphrase must not be offline brute-forceable. Derivation is deterministic, so cloaked hosts stay stable across restarts and identical mesh-wide.
+The `[cloak] secret` passphrase is stretched through **Argon2id** (memory-hard) with a fixed domain-separation salt to derive the cloak key, replacing the previous bare `SHA256(secret)` (`src/main.zig`). Because the IPv4 input space is fully enumerable, the model rests on key secrecy, and a low-entropy operator passphrase must not be offline brute-forceable. Derivation is deterministic, so cloaked hosts stay stable across restarts and identical mesh-wide.
 
-**One-time migration on upgrade:** the derived key changes, so the first boot after this upgrade **reshuffles every client's cloak once**. Pre-upgrade host/subnet `WARD` bans written against the old SHA256-derived cloaks **do not carry over** — the daemon can no longer reproduce that key. The `[cloak] previous_secret` grace window covers only future rotations under the new Argon2id KDF, not the SHA256→Argon2id transition itself. Expect to re-establish any long-lived cloak/subnet bans after upgrade.
+**Historical SHA256-to-Argon2id migration:** this boundary applies only to an
+image still using the older KDF. It changes generated cloak keys and requires
+a separate policy audit for old host/subnet masks. `[cloak].previous_secret`
+rotates secrets under the current KDF; it does not recreate the historical
+SHA256-derived key. Ordinary upgrades between current compatible images do
+not repeat that old migration. Preserve explicit host/persona provenance and
+follow the [current cloaking reference](../reference/host-cloaking.md).
 
 ### Anonymous-cloak rotation (`anon_epoch_secs`)
 
@@ -215,7 +221,7 @@ When non-zero, an **unauthenticated** client receives a v4 opaque cloak whose HM
 /STATS l
 ```
 
-Numeric **211 RPL_STATSLLINE** reports one line per established S2S peer link with `sendq_cap` (the `server` class SendQ ceiling), queued bytes currently pending, and link uptime (`src/daemon/server.zig:10378`). Use this to monitor mesh health and detect SendQ backlog on remote links.
+Numeric **211 RPL_STATSLLINE** reports one line per established S2S peer link with `sendq_cap` (the `server` class SendQ ceiling), queued bytes currently pending, and link uptime (`src/daemon/server.zig`). Use this to monitor mesh health and detect SendQ backlog on remote links.
 
 ### Mesh health commands
 
@@ -223,11 +229,11 @@ Operators with `mesh_admin` privilege can inspect and manage the mesh:
 
 | Command | Purpose |
 |---|---|
-| `MESH` or `NETSTAT` | Direct S2S peer/link health, reachability, partition summary (`src/daemon/server.zig:10218`, `src/daemon/server.zig:10308`). |
-| `ROUTE` | Current routing table: this node plus established one-hop peers (`src/daemon/server.zig:10452`). |
-| `NETHEALTH` | Lists this node and each established peer as alive with RTT and idle time; this is not a witness-quorum death decision. A pair loses the link on ping timeout (`src/daemon/server.zig:10474`). |
-| `CONNECT <host> <port>` | Open outbound S2S to a peer (`src/daemon/server.zig:6304`). |
-| `SQUIT <server>` | Tear down an S2S link by server name (`src/daemon/server.zig:6371`). |
+| `MESH` or `NETSTAT` | Direct S2S peer/link health, reachability, partition summary (`src/daemon/server.zig`). |
+| `ROUTE` | Current routing table: this node plus established one-hop peers (`src/daemon/server.zig`). |
+| `NETHEALTH` | Lists this node and each established peer as alive with RTT and idle time; this is not a witness-quorum death decision. A pair loses the link on ping timeout (`src/daemon/server.zig`). |
+| `CONNECT <host> <port>` | Open outbound S2S to a peer (`src/daemon/server.zig`). |
+| `SQUIT <server>` | Tear down an S2S link by server name (`src/daemon/server.zig`). |
 
 ### Upgrade and mesh convergence
 
@@ -236,10 +242,11 @@ converged mesh view — each link's remote-member roster and the server-wide
 cross-mesh oper-grant registry — so reconverging after an upgrade no longer churns
 local clients with spurious remote `JOIN`, `+Y`, or `TOPIC` lines; earlier builds
 re-announced them on every upgrade. The resume log reports `primed N carried oper
-grant(s)` (`src/daemon/server.zig:25619`). This custody state is preserved across
+grant(s)` (`src/daemon/server.zig`). This custody state is preserved across
 a hot-upgrade **only**: it rides the in-memory Helix capsule, not a disk WAL, so a
-cold restart (`systemctl restart`) or power loss drops it — hard-restart a node
-only from a drained boundary. See [Helix upgrade](upgrade.md#custody-plane-durability)
+cold restart under either supervisor or power loss drops it. Follow the
+[runbook custody contract](../RUNBOOK.md#cold-restart); an acknowledged prefix
+and quiet counters do not prove all future producer obligations are drained. See [Helix upgrade](upgrade.md#custody-plane-durability)
 and the [mesh guide](mesh.md#message_v2-bridge-and-activation).
 
 ## Network-wide operator events
@@ -279,7 +286,7 @@ class = "netadmin"
 title = "Network Guardian"
 ```
 
-`account_db` opens an OroStore account backend and wires PLAIN, SCRAM-SHA-256, and EXTERNAL into the live server (`src/main.zig:177`, `src/main.zig:193`). `[[opers]].account` is required and must be non-empty (`src/daemon/config_format.zig:433`, `src/daemon/config_format.zig:481`). `class` names an operator group, and `title` is optional WHOIS/operator display text (`src/daemon/config_format.zig:436`, `src/daemon/config_format.zig:441`).
+`account_db` opens an OroStore account backend and wires PLAIN, SCRAM-SHA-256, and EXTERNAL into the live server (`src/main.zig`). `[[opers]].account` is required and must be non-empty (`src/daemon/config_format.zig`). `class` names an operator group, and `title` is optional WHOIS/operator display text (`src/daemon/config_format.zig`).
 
 ## Privilege classes
 
@@ -296,7 +303,7 @@ inherits = "observer"
 privileges = ["server_rehash", "server_restart", "mesh_admin", "client_kill"]
 ```
 
-Privilege strings must match the `oper.Privilege` enum names exactly (`src/daemon/oper.zig:36`):
+Privilege strings must match the `oper.Privilege` enum names exactly (`src/daemon/oper.zig`):
 
 | Privilege | Meaning in source |
 |---|---|
@@ -316,20 +323,31 @@ Privilege strings must match the `oper.Privilege` enum names exactly (`src/daemo
 | `oper_override` | Force/SA-style override authority. |
 | `limit_exempt` | Bypass all per-class connection caps (clone limits by IP/account/host). |
 
-Unknown privilege strings are ignored during config-boot conversion (`src/daemon/config_boot.zig:159`). If an operator class is missing, or its effective privileges are empty, boot skips that operator binding (`src/daemon/config_boot.zig:174`, `src/daemon/config_boot.zig:179`). Use explicit, non-empty groups.
+Unknown privilege strings are ignored during config-boot conversion (`src/daemon/config_boot.zig`). If an operator class is missing, or its effective privileges are empty, boot skips that operator binding (`src/daemon/config_boot.zig`). Use explicit, non-empty groups.
 
-Group inheritance is bounded to 32 parent links (`src/daemon/operator_groups.zig:11`). Effective privileges are the union of the group and its ancestors (`src/daemon/operator_groups.zig:88`).
+Group inheritance is bounded to 32 parent links (`src/daemon/operator_groups.zig`). Effective privileges are the union of the group and its ancestors (`src/daemon/operator_groups.zig`).
 
 ## Reload behavior
 
-When booted with a config file, `REHASH` re-reads the same path (`src/main.zig:112`, `src/daemon/server.zig:10031`). `REHASH` rebuilds account-to-operator bindings but assigns full privileges rather than recomputing `[[oper_groups]]` (`src/daemon/server.zig:10052`, `src/daemon/server.zig:10062`). Existing sessions keep their current operator state (`src/daemon/server.zig:10028`).
+`REHASH` re-reads the boot configuration path; `REHASH DRY` reports the proposed
+supported changes without committing them. The implementation in
+`src/daemon/oper_cmd.zig` validates identity and startup-only restrictions,
+stages the new registry/limits before publication, and retains the previous
+generation on preparation failure. Operator bindings recompute their class's
+inherited privileges; an unknown/empty class or empty effective privileges
+skips the binding rather than granting full authority. Changing a binding does
+not itself replace already-held session privileges.
 
-### Media assessment in setup previews
+Supported reload work includes connection classes/limits, operator bindings,
+WASM policy and certificate refresh. A failed certificate refresh retains the
+serving generation and reports its outcome. `[oper.ocg2]` activation/authority
+settings remain restart-only. REHASH does not request a new daemon image;
+validated supervisor `reload` sends USR2 for Helix, with different compatibility
+and state-preservation requirements. See [service management](service-management.md)
+and [Helix](upgrade.md).
 
-`onyx-server setup --new --profile media --json` includes an advisory
-`media_assessment`; the text preview and interactive review use the same facts.
-It distinguishes the configured media UDP port from the separate native UDP
-port, explains ephemeral ports and the default local-only advertised address,
-and identifies unverified NAT/firewall and relay/browser fallback conditions.
-Existing configurations are reported as unknown rather than guessed. Preview
-does not start listeners or establish voice/video readiness.
+Setup's media/network previews report configured intent and unknown reachability;
+use the [setup guide](setup.md#configuration-and-network-assessment) for their
+full scope before treating a preview as voice/video acceptance.
+
+Source of truth: `src/daemon/conn_class.zig`, `src/daemon/config_format.zig`, `src/daemon/server.zig`, `src/daemon/modules/oper_security.zig` and the [command reference](../reference/commands/_index.md). Current installed fleet facts live in [production paths](../ops/onyx-server-paths.md); platform-specific tests retain their recorded scope.

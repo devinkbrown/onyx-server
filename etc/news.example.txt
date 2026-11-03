@@ -1,5 +1,6 @@
-# Sample news source for [news] source. One headline per line; the daemon shows
-# the first [news].count, joined with " | ". Lines starting with # are ignored.
-Onyx Server 0.1 ships personalized MOTDs with localized weather
-Undertow mesh adds live partition + quorum detection
-New: in-place Helix upgrades keep connections alive
+# Example headlines for [news] source; replace these with your network news.
+# One headline per line. The daemon joins the first [news].count with " | ".
+# Lines beginning with # are ignored. These are examples, not release receipts.
+Welcome to Onyx: IRC and browser chat over a secured mesh
+Reusable sessions let multiple client attachments participate
+Helix preserves connections when the listener and runtime state support handoff

@@ -2,8 +2,9 @@
 #
 # Boots a working node on plaintext ws://<host>:8080 (the Onyx web client) and
 # irc://<host>:6667 (any IRC client). The node's sovereign identity key is
-# generated + persisted (0600) on first run in the working directory (/data in
-# the container image), so there is nothing to configure to get started.
+# generated + persisted (0600) beside the chosen config on first run (/data
+# for the container config). The relative account store uses the working
+# directory independently; preserve both paths across subsequent starts.
 #
 # For PRODUCTION: point clients at TLS instead — add a [tls] block with real
 # certs (or use the built-in ACME client), set `ws_plain = false`, and set a

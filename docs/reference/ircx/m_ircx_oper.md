@@ -2,11 +2,11 @@
 
 _The operator-gated corner of Onyx Server's IRCX family — server access lists (`SACCESS`), the `+z` GAG umode, and the operator `EVENT` plane._
 
-Onyx Server is not a legacy C IRC daemon: there is no `modules/m_ircx_oper.c`, no
-MAPI, and no `OPFORCE`/`SVSJOIN` pseudo-commands. The operator surface is plain
-English and rides real server commands in
-[`src/daemon/server.zig`](../../../src/daemon/server.zig), registered through
-[`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig).
+IRCX operator controls are built-in server commands in
+[`server.zig`](../../../src/daemon/server.zig), registered through
+[`modules/ircx.zig`](../../../src/daemon/modules/ircx.zig). Access/privilege checks
+apply before mutation. [The moderation reference](../commands/oper-moderation.md)
+documents the other operator command families.
 
 ## SACCESS — server-level access lists
 
@@ -16,7 +16,7 @@ ACCESS  *           …                                # same server-access path
 ```
 
 `SACCESS` is registered with `.access = .oper`, so the dispatch layer refuses it
-to non-operators before the handler runs. It is the network-wide counterpart to
+to non-operators before the handler runs. It is the server-level counterpart to
 the channel-scoped [`ACCESS`](m_ircx_access.md) command: entries match on
 `nick!user@host` facets and gate connection, nick, and channel-join at the
 server level (`handleSaccess` / `handleServerAccessRequest`). Live entries are
@@ -27,7 +27,9 @@ persisted to the durable services store and replayed on restart. The bare
 
 An operator may silence another user with `MODE <nick> +z` (cleared with `-z`),
 handled by `applyGag`. The server records the target's real IP in its gag set
-and drops that user's channel/private messages network-wide; `-z` lifts it. The
+and refuses messages from local connections bound to that gagged IP; `-z` lifts
+it. This handler is local-node authority and does not itself prove mesh-wide
+replication of the gag table. The
 change is reflected back as `:<server> MODE <nick> +z`. This is the IRCX
 operator "gag"; it is a cross-user umode that only operators may set.
 

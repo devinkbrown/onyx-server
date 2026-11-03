@@ -5,19 +5,80 @@
 
 Release notes for the Onyx Server daemon. Newest first. Onyx Server is a clean-room,
 pure-Zig IRC/IRCX server with a post-quantum CRDT mesh, an in-house TLS 1.3
-stack, and session-preserving zero-downtime hot-upgrades. Version numbers track
+stack, and guarded session-preserving hot-upgrades on compatible listener sets. Version numbers track
 `build.zig.zon`. Dates on deployed lines are the deploy date to the live Onyx nodes.
 A source-only line is dated when the manifest changes and says so.
+
+---
+
+## 0.9.0 — accepted fleet release (2026-11-03)
+
+Both production nodes accepted `0.9.0+c730d9f37b01`, from clean source
+`c730d9f37b017a3e4c0a400c19cfa482a5198562`. The static Linux musl artifact
+reproduced byte-for-byte with SHA-256
+`5735c08b3f537ee27b4d0c22ac7a80e96a6efc5b5122ba666f3d8e6ca3be5e61`.
+This is a source/fleet release record, not a new GitHub release tag or asset.
+Current operational facts are maintained in [production paths](docs/ops/onyx-server-paths.md).
+
+- **Reusable-session regression fixed.** Threaded mesh webhook delivery now uses
+  retained signed MESSAGE_V2 admission and preserves message identity, time and
+  origin across delivery. Reserved synthetic sender identity and policy checks
+  prevent it from competing with real client nicknames.
+- **Transactional retry policy.** Slowmode timestamps commit with accepted
+  delivery; failed allocation/admission does not consume a retry window.
+- **Shutdown across Helix.** Linux stop requests survive the same-PID exec
+  boundary, while offline CLI and interactive setup retain their signal scope.
+  Incompatible handoff state is refused before replacing the predecessor.
+- **Recording and retained state.** Bounded recording work, strict carry guards,
+  receiver buffers and relevant failure paths were checked in the composed
+  release. Active recording/media transport state can still prevent Helix.
+- **Service kits.** OpenRC supervises the foreground daemon under its configured
+  identity; both kits validate the candidate before start/reload and bound stop
+  and restart behavior. The corrected systemd sandbox permits the protected
+  certificate loader. Host overrides preserve the public feed permissions.
+- **Acceptance.** Full Debug and ReleaseSafe production-source gates each
+  executed 11,547 cases: 11,234 passed, 313 skipped, no failures/leaks/log errors.
+  Four CA-verified TLS clients passed 13 exact-one channel/DM delivery and
+  reconnect checks. Durable account tokens issued before the cold restarts
+  recovered on both nodes; generated test accounts were removed.
+
+The configured production WebTransport listeners require cold upgrades, one
+node at a time. This acceptance does not establish production Helix continuity,
+arbitrary-node exact attachment restoration, preservation of old composite
+attachment tokens across cold restart, or global empty custody before shutdown.
+
+### Full release testing and documentation follow-up
+
+Test-only commit `2dffe556` adds stable test metadata, validated duration-balanced
+shards with exhaustive exact-name inventories, bounded RSA stress concurrency,
+and safe discovery of optional GnuTLS tooling. Full native POSIX release
+aggregates share the complete module/executable/CLI suite; cached filters avoid
+recompiling a root for each selection. Unsupported and cross graphs retain their
+reference paths.
+
+The complete Debug `all-checks` comparison improved from **1,327.794 to
+944.273 seconds** (22.1 to 15.7 minutes, **28.9% less elapsed time**) on the
+shared build host. The new run passed **11,236**, skipped **313**, and preserved
+all old names plus two TLS controls. This measures combined changes, not an
+isolated scheduler effect; cold ReleaseSafe compilation remains a cost.
+
+The documentation overhaul replaces conflicting live-version claims with the
+canonical deployment record, adds a source-backed feature index and development
+workflow, repairs current procedures, and retires obsolete overlapping plans.
+Historical evidence and old release results retain their original scope.
+See the [verification report](docs/audit/release-and-test-speed-2026-11-03.md),
+[testing guide](docs/guide/testing.md), and [documentation hub](docs/README.md).
 
 ---
 
 ## 0.8.0 (2026-10-17)
 
 Source version in `build.zig.zon`. This is not a fleet deploy, not a GitHub
-Release, and not a `v0.8.0` tag. The verified production pair remains
+Release, and not a `v0.8.0` tag. At this historical source milestone, the verified production pair remained
 `0.7.0+ae78d490` with SHA-256
 `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c`.
-The full `zig build test` suite has not been re-run green on this tree.
+At that milestone the full `zig build test` suite had not been re-run green;
+the accepted 0.9.0 release above supersedes that status.
 The last full Debug run had three failures and the last full ReleaseSafe run
 had two. Later focused filters passed: far ordinary-nick WHOIS and direct
 message, the Helix MARKREAD port case, and the delivery fan-out slice
@@ -62,9 +123,9 @@ Source version promoted from the `0.7.0-rc.1` stabilization line. Tracks
 `eshmaki.me` and `ircx.us` (`docs/ops/release-v0.7.0.md`). Not a GitHub
 Release asset or `v0.7.0` tag. The rc.1 notes below are the same contract.
 The post-release oper-display and oper-prefix follow-ups are recorded in
-[`docs/ops/release-v0.7.0-remote-oper-display.md`](docs/ops/release-v0.7.0-remote-oper-display.md)
-and [`docs/ops/release-v0.7.0-oper-prefix-ae.md`](docs/ops/release-v0.7.0-oper-prefix-ae.md).
-The currently running fleet is `0.7.0+ae78d490` with SHA-256
+[`docs/ops/release-v0.7.0-remote-oper-display.md`](https://github.com/devinkbrown/onyx-server/blob/3fa6e95021601c92d2a2b68869d8fa9f4047d391/docs/ops/release-v0.7.0-remote-oper-display.md)
+and [`docs/ops/release-v0.7.0-oper-prefix-ae.md`](https://github.com/devinkbrown/onyx-server/blob/3fa6e95021601c92d2a2b68869d8fa9f4047d391/docs/ops/release-v0.7.0-oper-prefix-ae.md).
+The fleet recorded at the September follow-up was `0.7.0+ae78d490` with SHA-256
 `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` on both
 nodes; the source tree may advance independently of that deployed image.
 
@@ -151,7 +212,7 @@ wave.
   before install; banner `0.5.7+b457c33` on `eshmaki.me` and `ircx.us`.
 
 Live activation evidence:
-[`docs/ops/release-v0.5.7-e2ee-group-control.md`](docs/ops/release-v0.5.7-e2ee-group-control.md),
+[`docs/ops/release-v0.5.7-e2ee-group-control.md`](https://github.com/devinkbrown/onyx-server/blob/3fa6e95021601c92d2a2b68869d8fa9f4047d391/docs/ops/release-v0.5.7-e2ee-group-control.md),
 [`docs/ops/e2ee-group-authority-v2-activation.md`](docs/ops/e2ee-group-authority-v2-activation.md).
 
 ## 0.5.6 (2026-07-19)
@@ -181,7 +242,7 @@ the secured mesh without knowing or replaying a session token.
   canonical rename-era fixtures remain explicit where the wire format is frozen.
 
 Live release evidence and rollback identifiers are recorded in
-[`docs/ops/deploy-v0.5.6-cert-session-resume.md`](docs/ops/deploy-v0.5.6-cert-session-resume.md).
+[`docs/ops/deploy-v0.5.6-cert-session-resume.md`](https://github.com/devinkbrown/onyx-server/blob/3fa6e95021601c92d2a2b68869d8fa9f4047d391/docs/ops/deploy-v0.5.6-cert-session-resume.md).
 
 ## 0.5.5 (2026-07-18)
 

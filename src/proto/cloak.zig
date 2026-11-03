@@ -22,13 +22,13 @@
 //! (ban an ASN) while the exact address stays masked. Unknown geo renders the
 //! placeholders `a0` / `xx`, keeping a stable shape.
 //!
-//! Shapes produced (with the default `ircxnet` suffix):
+//! Compatibility helper shapes (with the default `onyx` suffix):
 //!
-//!   IPv4  `a.b.c.d`      -> `<f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.ircxnet`
-//!   IPv6  `2001:db8::1`  -> `<f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.ircxnet`
+//!   IPv4  `a.b.c.d`      -> `<f/32>.<t/24>.<t/16>.<t/8>.a<asn>.<cc>.ip.onyx`
+//!   IPv6  `2001:db8::1`  -> `<f/128>.<t/64>.<t/56>.<t/48>.<t/32>.a<asn>.<cc>.ip6.onyx`
 //!   opaque (max privacy) -> `<32 hex>.opq.<suffix>` (v3, 128 bits, no subnet/geo)
 //!   anon epoch           -> `<32 hex>.opq.<suffix>` (`cloakOpaqueEpochV3`)
-//!   rDNS  `dsl-1.isp.com`-> `ircxnet-<token>.isp.com`
+//!   rDNS  `dsl-1.isp.com`-> `onyx-<token>.isp.com`
 //!   acct  `Kain` -> `kain.users.onyx`; lossy labels add an identity digest.
 //!
 //! The most specific token comes FIRST (leftmost), matching DNS semantics
@@ -52,7 +52,8 @@ pub const token_hex_len = 8;
 /// cloak.
 pub const full_token_hex_len = 16;
 /// Hex digits for the v3 public opaque token (128 bits, one DNS label).
-/// The v2 64-bit token stays for ban grace. v3 is what anonymous users show.
+/// The v2/v3 helpers support compatibility matching. The live anonymous cloak
+/// uses v4 with rotation provenance; see `cloakOpaqueEpochV4`.
 pub const wide_token_hex_len = 32;
 
 /// Default network-identifying suffix carried by every cloaked host so users

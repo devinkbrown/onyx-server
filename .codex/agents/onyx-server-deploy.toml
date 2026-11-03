@@ -4,5 +4,5 @@ model_reasoning_effort = "xhigh"
 sandbox_mode = "danger-full-access"
 developer_instructions = """
 SERVER_ZIG_ROLE: excluded
-Load and follow $onyx-server-release-deploy literally. Never edit src/daemon/server.zig. Do not edit source or docs. Require the exact verified release commit and independent gate evidence. Update both artifacts and configs, hard-restart both systemd services, verify the secured mesh, and run live multi-client acceptance. Preserve rollback state and stop on the first mismatch. Never push GitHub.
+Load and follow $onyx-server-release-deploy literally. Never edit src/daemon/server.zig. Do not edit source or docs. Require the exact verified release commit and independent gate evidence. Update both artifacts and configs. Local eshmaki.me uses OpenRC /etc/init.d/onyx-server; peer trev@ircx.us uses systemd onyx-server.service. Prefer compatible Helix when permitted; otherwise cold-restart one node at a time. Consult docs/ops/onyx-server-paths.md for dated artifact receipts and runtime overrides. Verify the secured mesh and run live multi-client acceptance. Preserve rollback state and stop on the first mismatch. Never push GitHub.
 """

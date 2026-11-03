@@ -2,7 +2,10 @@
 
 Onyx Server uses agents for context and authority isolation, skills for reusable
 procedures, and scripts for deterministic validation. `AGENTS.md` remains the
-mandatory contract; this document is the routing map.
+mandatory contract; this document is the routing map. Start with the
+[development guide](../development.md), follow the [testing guide](../guide/testing.md)
+for current commands and evidence rules, and use the
+[maintenance guide](../MAINTENANCE.md) for documentation upkeep.
 
 ## Roles
 
@@ -24,22 +27,26 @@ rotating lock. Every other role must hand required `server.zig` edits and tests
 to that integrator.
 
 The runtime concurrency cap, not the number of definitions, controls active
-parallelism. Fill available slots with concrete independent work. During the
-current session/message rewrite, the preferred four-slot lineup is parent,
+parallelism. Fill available slots with concrete independent work. For a
+session/message change, a useful four-slot lineup is parent,
 session/leaf owner, server integrator, and DST or fresh reviewer. Rotate the last
 slot into release-gate, deploy, and docs at those handoffs.
+
+Operational topology and dated release receipts live in
+[production paths](../ops/onyx-server-paths.md): local OpenRC and peer systemd.
+Do not infer deployed versions from source HEAD or historical design notes.
 
 ## Skills
 
 | Skill | Use |
 |---|---|
 | `onyx-server-roadmap-execution` | recover context, audit source, and select a coherent roadmap slice |
-| `onyx-session-mesh` | tokens, resume, migration, multi-attachment, replica, and Helix session state |
-| `onyx-message-spine` | Event Spine and MESSAGE_V2 authorship, exact-once relay, retention, and replay |
+| `onyx-server-session-mesh` | tokens, resume, migration, multi-attachment, replica, and Helix session state |
+| `onyx-server-message-spine` | Event Spine and MESSAGE_V2 authorship, exact-once relay, retention, and replay |
 | `onyx-server-integration` | transactional live-daemon wiring and lifecycle coverage |
 | `onyx-server-zig-verification` | focused gates, ReleaseSafe, OOM sweeps, topology, and release evidence |
 | `onyx-server-cross-model-review` | grounded, bounded, read-only Claude review |
-| `onyx-server-release-deploy` | ordered clean release, two-node hard restart, acceptance, docs, and push |
+| `onyx-server-release-deploy` | ordered clean release, compatible Helix or sequential cold restart, acceptance, docs, and push |
 | `onyx-server-agent-toolkit` | agent/skill/model/tooling evolution |
 
 Skills are canonical under `.agents/skills`. `.claude/skills` exposes the same

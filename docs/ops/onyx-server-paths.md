@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-11-03**. (Earlier rolls are recorded separately below.) eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-11-03**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -52,63 +52,20 @@ before diagnosis. An isolated A/B probe and all seven native service checks
 verified the corrected unit before retry. Its remaining sandbox is retained;
 see [service management](../guide/service-management.md).
 
-### Previous roll (2026-11-02, historical)
+## Refresh and day-2 operations
 
-This roll (2026-11-02, source `a11610c2`: all 90 local branches merged into
-main, full gate 11,112 pass / 312 skip / 0 fail) deployed cold restarts, local
-first; Helix remains blocked by the WebTransport listener. It also added the
-now-mandatory `[mesh] presence_store_path = "<runtime>/guest-presence.wal"`
-to both live configs (the merged guest-authority stack fails closed without
-it). Live acceptance: mesh health smoke green both ways and cross-node chat
-smoke passed both directions. Note: local OpenRC reports `starting` (state
-left by the first crashed start before the config fix) while the daemon,
-pidfile, metrics and mesh are all healthy. Rollback for this roll:
-`rollback-0.9.0-20261102T183408Z` in each node's runtime directory (previous
-image `0.9.0+066d9b8356be-dirty`, SHA-256
-`61d218f6682857eed5f3d4bb4007c2d99869fc723810f0df637961a417e5fe02`).
+The baseline above is a dated acceptance snapshot. PIDs are observational,
+not stable service identifiers. Before operating a node, resolve its current
+service child identity and inspect `/proc/<pid>/exe`, process start time,
+working directory, supervisor and executable SHA-256. Recheck identity before
+signaling or replacing a path; a stale PID file or a matching process name
+alone does not prove ownership. Confirm the on-disk candidate and running
+executable separately, because atomic replacement can leave an older image
+running. Keep config contents, environment values and keys private.
 
-### Previous roll (2026-10-23, historical)
-
-The accepted source was `2a7bbcb71348e2b61152bb8bfafb5ffbf425b8a6`. This roll
-used authorized cold restarts, local first. The predecessor's Helix capability
-probe attempted to open `/dev/null` read/write, which its inherited Landlock
-policy denied. The new image uses an immediately closed stdin pipe and a bounded
-probe deadline. Both staged binaries passed `--check-config` before rollout.
-
-The local config now enables persistent stderr logging; the remote config is
-unchanged and retains journald. Rollback directories contain the previous
-`onyx-server` and `onyx-server.local.toml`:
-
-- eshmaki: `/home/kain/onyx-server-run/rollback-2a7bbcb7-20261023T181147Z`.
-- ircx: `/home/trev/onyx-server-run/rollback-2a7bbcb7-20261023T181147Z`.
-
-Both previous images are `0.8.1+48891b338921`, SHA-256
-`258dadd825a05b5039fffa35306b781f463d7f1c69dcbf632a249fd5bb08737f`.
-
-Live acceptance passed protected-nickname rejection followed by fallback NICK
-and account registration on the same TLS socket, persisted-account login,
-fresh-token reconnect, and bidirectional cross-node TLS chat. Cold restart drops
-physical attachments; these checks do not establish recovery of old exact
-attachment tokens across that boundary.
-
-**Production Helix remains blocked by the configured WebTransport listener.**
-Both nodes have `[listen].webtransport = 4433`; the existing Linux continuity
-guard refuses handoff of this process-owned state. Local USR2 was refused before
-exec with `SessionReplicaConverging`; this generic error did not indicate a mesh
-partition. The PID and original TLS sockets stayed live. Stable tokens, channel
-membership, 14 reciprocal delivery rounds, and authenticated reconnect/resume
-passed after refusal. The remote node was not signaled. No successful production
-exec/adoption is claimed. Disabling this listener also requires a cold restart;
-there is no verified zero-drop operational workaround for this topology.
-
-The final full ReleaseSafe suite passed 10,181 tests with 322 skips and zero
-failures/leaks/log errors. Affected Debug gates passed 3,253 tests with 106 skips;
-the final full Debug suite is not claimed complete. The release reproduced
-byte-for-byte. Isolated plain/TLS/WSS and active-kTLS Helix rehearsals passed,
-without WebTransport configured. Details and remaining cleanup limitations:
-[nickname, logging, and Helix audit](../audit/nickname-logging-helix-2026-10-23.md).
-
-## Day-2 ops
+The commands below are operator actions; the restart examples require the
+[release runbook](../RUNBOOK.md) custody, rollback and recovery preconditions.
+Do not run both restarts together.
 
 ```bash
 # Status
@@ -160,3 +117,9 @@ stderr continues to the persistent systemd journal.
 
 - Live SPA root: `/home/kain/onyx/out` (nginx)  
 - Deploy only via `/home/kain/onyx/deploy.sh` (builds to `dist/`, syncs to `out/`)  
+
+Source of truth for the 2026-11-03 baseline: accepted daemon source `c730d9f3`,
+service kit `6131c4de`, the final deployment receipt, CA-verified four-client
+acceptance and public-feed checks recorded by the [release audit](../audit/release-and-test-speed-2026-11-03.md).
+Superseded deployment records are available in Git history; the table above
+is the accepted fleet baseline.

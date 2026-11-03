@@ -2,7 +2,7 @@
 
 *Stateless server-information queries, help, statistics, and registry introspection.*
 
-The `query.info` module registers the stateless server-information commands (`src/daemon/modules/query_info.zig:66`). The `user.query` module registers HELP/HELPOP (`src/daemon/modules/user_query.zig:72`). The `oper.security` module registers STATS/TRACE/ETRACE (`src/daemon/modules/oper_security.zig:143`). The `diag.introspect` module provides registry introspection (`src/daemon/modules/introspect.zig:210`). Command specs without an explicit `.access` use the registry default `.registered` (`src/daemon/registry.zig:249`).
+The `query.info` module registers the stateless server-information commands (`src/daemon/modules/query_info.zig`). The `user.query` module registers HELP/HELPOP (`src/daemon/modules/user_query.zig`). The `oper.security` module registers STATS/TRACE/ETRACE (`src/daemon/modules/oper_security.zig`). The `diag.introspect` module provides registry introspection (`src/daemon/modules/introspect.zig`). Command specs without an explicit `.access` use the registry default `.registered` (`src/daemon/registry.zig`).
 
 ## VERSION
 
@@ -13,7 +13,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_VERSION 351`, followed by `RPL_ISUPPORT 005`.
 - Errors: None specific.
 - Example: `VERSION`
-- Sources: `src/daemon/modules/query_info.zig:69`, `src/daemon/server.zig:468`, `src/daemon/server.zig:21985`, `src/daemon/server.zig:22000`, `build.zig:79`, `build.zig:790`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`, `build.zig`
 
 ## TIME
 
@@ -24,7 +24,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_TIME 391`.
 - Errors: None specific.
 - Example: `TIME`
-- Sources: `src/daemon/modules/query_info.zig:70`, `src/daemon/server.zig:341`, `src/daemon/server.zig:21963`, `src/proto/serverinfo.zig:140`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`, `src/proto/serverinfo.zig`
 
 ## ADMIN
 
@@ -35,7 +35,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_ADMINME 256` always; `RPL_ADMINLOC1 257` and `RPL_ADMINEMAIL 259` when configured. The shared ADMIN builder supports `RPL_ADMINLOC2 258` when `location2` is supplied, but the live handler currently passes only `location1` and `email`.
 - Errors: None specific.
 - Example: `ADMIN`
-- Sources: `src/daemon/modules/query_info.zig:71`, `src/daemon/server.zig:1394`, `src/daemon/server.zig:21972`, `src/daemon/server.zig:21977`, `src/proto/serverinfo.zig:177`, `src/proto/serverinfo.zig:213`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`, `src/proto/serverinfo.zig`
 
 ## INFO
 
@@ -46,7 +46,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: None specific.
 - Example: `INFO`
-- Sources: `src/daemon/modules/query_info.zig:72`, `src/daemon/server.zig:28308`, `src/daemon/server.zig:28337`, `src/daemon/server.zig:28341`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`
 
 ## DIRECTORY
 
@@ -57,7 +57,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: None specific.
 - Example: `DIRECTORY`
-- Sources: `src/daemon/modules/query_info.zig:73`, `src/daemon/server.zig:28374`, `src/daemon/server.zig:28388`, `src/daemon/server.zig:28415`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`
 
 ## CHANSTATS
 
@@ -67,7 +67,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: Server notices; no-data and disabled states are explicit.
 - Errors: Usage is returned as a notice; unregistered callers receive `ERR_NOTREGISTERED 451` when statistics are enabled.
 - Example: `CHANSTATS TOPUSERS #zig`
-- Sources: `src/daemon/modules/query_info.zig:84`, `src/daemon/server.zig:48799` (`handleChanstats`), `src/daemon/chanstats.zig`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig` (`handleChanstats`), `src/daemon/chanstats.zig`
 
 ## MOTD
 
@@ -78,7 +78,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_MOTDSTART 375`, `RPL_MOTD 372`, `RPL_ENDOFMOTD 376`.
 - Errors: None specific in the live handler. The shared MOTD builder can emit `ERR_NOMOTD 422` for an empty MOTD slice, but `handleMotd` supplies configured or built-in template lines.
 - Example: `MOTD`
-- Sources: `src/daemon/modules/query_info.zig:74`, `src/daemon/server.zig:21790`, `src/daemon/server.zig:21895`, `src/daemon/server.zig:21922`, `src/daemon/server.zig:21956`, `src/proto/motd.zig:85`, `src/proto/motd_template.zig:4`, `src/proto/motd_template.zig:78`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`, `src/proto/motd.zig`, `src/proto/motd_template.zig`
 
 ## LUSERS
 
@@ -89,7 +89,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_LUSERCLIENT 251`, `RPL_LUSEROP 252`, `RPL_LUSERUNKNOWN 253`, `RPL_LUSERCHANNELS 254`, `RPL_LUSERME 255`, `RPL_STATSCONN 250`, `RPL_LOCALUSERS 265`, `RPL_GLOBALUSERS 266`.
 - Errors: None specific.
 - Example: `LUSERS`
-- Sources: `src/daemon/modules/query_info.zig:75`, `src/daemon/server.zig:21703`, `src/daemon/server.zig:21735`, `src/proto/lusers.zig:61`, `src/proto/lusers.zig:85`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`, `src/proto/lusers.zig`
 
 ## USERS
 
@@ -100,7 +100,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_USERSSTART 392`, `RPL_USERS 393`, `RPL_ENDOFUSERS 394`, or `RPL_NOUSERS 395`.
 - Errors: None specific.
 - Example: `USERS`
-- Sources: `src/daemon/modules/query_info.zig:76`, `src/daemon/server.zig:28418`, `src/daemon/server.zig:28420`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`
 
 ## LINKS
 
@@ -111,7 +111,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_LINKS 364`, `RPL_ENDOFLINKS 365`.
 - Errors: None specific.
 - Example: `LINKS`
-- Sources: `src/daemon/modules/query_info.zig:77`, `src/daemon/server.zig:28438`, `src/daemon/server.zig:28446`, `src/daemon/server.zig:28469`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`
 
 ## MAP
 
@@ -122,7 +122,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_MAP 015`, `RPL_MAPEND 017`.
 - Errors: None specific.
 - Example: `MAP`
-- Sources: `src/daemon/modules/query_info.zig:78`, `src/daemon/server.zig:28606`, `src/daemon/server.zig:28614`, `src/daemon/server.zig:28625`
+- Sources: `src/daemon/modules/query_info.zig`, `src/daemon/server.zig`
 
 ## HELP
 
@@ -133,7 +133,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_HELPSTART 704`, `RPL_HELPTXT 705`, `RPL_ENDOFHELP 706`.
 - Errors: `ERR_HELPNOTFOUND 524` for unknown topics.
 - Example: `HELP JOIN`
-- Sources: `src/daemon/modules/user_query.zig:87`, `src/daemon/server.zig:21682`, `src/proto/help_db.zig:24`, `src/proto/help_db.zig:103`, `src/proto/help_db.zig:171`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`, `src/proto/help_db.zig`
 
 ## HELPOP
 
@@ -144,7 +144,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: Same as `HELP`.
 - Errors: Same as `HELP`.
 - Example: `HELPOP OPER`
-- Sources: `src/daemon/modules/user_query.zig:88`, `src/daemon/server.zig:21682`, `src/proto/help_db.zig:103`
+- Sources: `src/daemon/modules/user_query.zig`, `src/daemon/server.zig`, `src/proto/help_db.zig`
 
 ## STATS
 
@@ -156,7 +156,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Notes: `STATS Y` emits one `RPL_STATSYLINE 218` row per connection class as `Y <class>`, with trailing text containing `sendq`, `recvq`, `max_clients`, `max_per_ip`, `max_per_account`, `max_per_host`, `max_chan`, `max_targets`, `monitor`, `silence`, `ping`, `ping_timeout`, `reg_timeout`, `flood`, `require_tls`, `require_sasl`, `flood_exempt`, `nick_delay_exempt`, match summary fields `cidrs`, `tls_only`, `account_only`, `oper_only`, and `live` member count. `STATS l` emits one `RPL_STATSLLINE 211` row per established S2S peer link with `sendq_cap`, queued bytes, and `uptime` seconds.
 - Errors: `ERR_NEEDMOREPARAMS 461`; `ERR_NOPRIVILEGES 481` when a non-oper requests any letter except `p`.
 - Example: `STATS u`
-- Sources: `src/daemon/modules/oper_security.zig:173`, `src/daemon/server.zig:14052`, `src/daemon/server.zig:14063`, `src/daemon/server.zig:14069`, `src/daemon/server.zig:14206`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## TRACE
 
@@ -167,7 +167,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_TRACEUSER 205`, `RPL_ENDOFTRACE 262`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `TRACE`
-- Sources: `src/daemon/modules/oper_security.zig:171`, `src/daemon/server.zig:17063`, `src/daemon/server.zig:17075`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## ETRACE
 
@@ -178,7 +178,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: Numeric `709` rows, then `RPL_ENDOFTRACE 262`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `ETRACE`
-- Sources: `src/daemon/modules/oper_security.zig:172`, `src/daemon/server.zig:17130`, `src/daemon/server.zig:17154`
+- Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## MODULES
 
@@ -189,7 +189,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `MODULES`
-- Sources: `src/daemon/modules/introspect.zig:19`, `src/daemon/modules/introspect.zig:26`, `src/daemon/modules/introspect.zig:214`
+- Sources: `src/daemon/modules/introspect.zig`
 
 ## MODLIST
 
@@ -200,7 +200,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: Same as `MODULES`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `MODLIST`
-- Sources: `src/daemon/modules/introspect.zig:19`, `src/daemon/modules/introspect.zig:26`, `src/daemon/modules/introspect.zig:215`
+- Sources: `src/daemon/modules/introspect.zig`
 
 ## COMMANDS
 
@@ -211,7 +211,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: None specific; unknown detail query ends with `No such command`.
 - Example: `COMMANDS MESH`
-- Sources: `src/daemon/modules/introspect.zig:44`, `src/daemon/modules/introspect.zig:55`, `src/daemon/modules/introspect.zig:80`, `src/daemon/modules/introspect.zig:216`
+- Sources: `src/daemon/modules/introspect.zig`
 
 ## OROWASM
 
@@ -222,4 +222,4 @@ The `query.info` module registers the stateless server-information commands (`sr
 - Replies: `RPL_INFOSTART 373`, `RPL_INFO 371`, `RPL_ENDOFINFO 374`.
 - Errors: `ERR_NOPRIVILEGES 481` for non-opers.
 - Example: `OROWASM WIT`
-- Sources: `src/daemon/modules/introspect.zig:100`, `src/daemon/modules/introspect.zig:113`, `src/daemon/modules/introspect.zig:139`, `src/daemon/modules/introspect.zig:170`, `src/daemon/modules/introspect.zig:182`, `src/daemon/modules/introspect.zig:217`, `src/wasm/host/abi.zig:27`, `src/wasm/host/bridge.zig:36`
+- Sources: `src/daemon/modules/introspect.zig`, `src/wasm/host/abi.zig`, `src/wasm/host/bridge.zig`

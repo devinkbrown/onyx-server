@@ -2,8 +2,7 @@
 
 _Two IRCX channel visibility modes: `+x AUDITORIUM` hides ordinary members from each other, and `+h HIDDEN` hides the channel itself from listings._
 
-These are named channel modes, not commands. They live in Onyx Server's Zig channel
-model, not a C module. The mode letters and MODEX names are declared in
+These named channel modes live in the Zig channel model. The mode letters and MODEX names are declared in
 [`src/proto/chanmode_ext.zig`](../../../src/proto/chanmode_ext.zig); the
 auditorium visibility predicates are in
 [`src/proto/auditorium.zig`](../../../src/proto/auditorium.zig); enforcement is
@@ -57,3 +56,12 @@ MODE #townhall +x            ; audience can't see each other, only the panel
 MODE #townhall +h            ; keep it out of channel listings
 MODEX #townhall +AUDITORIUM  ; same as +x, by name
 ```
+
+## Privacy boundary
+
+AUDITORIUM and HIDDEN govern their implemented roster/listing surfaces; they do
+not encrypt channel traffic or make server operators unaware of physical
+connections. `membership-visibility=sealed` is a separate property contract, and
+user privacy modes have their own [mode reference](../protocol/modes.md). Check
+the exact reply path before treating one visibility mode as a universal metadata
+secrecy policy.

@@ -1,220 +1,96 @@
 # Onyx Server
 
-> A pure-Zig, clean-room IRC daemon — IRCv3 · IRCX · SASL · in-process services ·
-> browser WebSocket · voice/video — over a post-quantum cryptographic mesh, with no C interop.
+Onyx Server is a pure-Zig IRC/IRCX mesh daemon. It includes its own TLS stack,
+account services, persistent history, browser WebSocket transport, and media
+plane. **Onyx** is the network/client brand. The daemon uses native Undertow
+state replication over secured Mooring links rather than a tree S2S protocol.
+The production daemon has no C interop or external database dependency.
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Zig 0.17 dev](https://img.shields.io/badge/Zig-0.17--dev-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
-[![C interop: none](https://img.shields.io/badge/C%20interop-none-success.svg)](#design-pillars)
-[![Status: in production](https://img.shields.io/badge/status-in%20production-success.svg)](#status)
+[Quickstart](docs/guide/00-quickstart.md) · [Feature reference](docs/reference/features.md) ·
+[Documentation](docs/README.md) · [Development](docs/development.md) ·
+[News](NEWS.md) · [Security](SECURITY.md) · [AGPL-3.0-or-later](LICENSE)
 
-**Onyx Server** is a **100% clean-slate, fully Zig-native**
-IRC daemon built from first principles. The daemon *and its entire substrate* — the
-systems library and the crypto/TLS stack — are written from scratch in Zig with **no C
-interop**. It covers a full modern feature surface (IRCv3, IRCX, SASL, in-process
-services, WebSocket, CHATHISTORY,
-voice/video), adds class-based connection policy with bounded growable SendQ/RecvQ and
-nick-delay protection, and replaces the legacy TS6 server-to-server protocol with the
-native **Undertow + Mooring** cryptographic mesh.
+## Build and try it
 
-**Quick links:** [Download v0.5.6 (latest published)](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6) · source **0.8.0** (`build.zig.zon`) · [verified live fleet](docs/ops/onyx-server-paths.md) · [Quickstart](docs/guide/00-quickstart.md) · [Windows build and smoke](docs/guide/windows.md) ·
-[Documentation](docs/README.md) · [Architecture](docs/architecture/00-overview.md) ·
-[Command reference](docs/reference/commands/_index.md) ·
-[Contributing](CONTRIBUTING.md) · [Runbook](docs/RUNBOOK.md) ·
-[Security](SECURITY.md) · [License](LICENSE)
-
-## From clone to live chat
-
-Onyx Server is a single static binary with **zero external dependencies** — no database
-server, no OpenSSL, no runtime to install.
-
-**Docker (build from source).** There is no published registry image yet, so you
-build `onyx-server:latest` locally from the verified static binary:
+The accepted Linux release was built with **Zig 0.17.0**. Compiler identity,
+platform differences and build targets are documented in the
+[build guide](docs/guide/build.md). Use the pinned compiler described there;
+development compiler snapshots are not interchangeable.
 
 ```sh
-git clone https://github.com/devinkbrown/onyx-server && cd onyx-server
-packaging/release.sh                                   # reproducible static binary → dist/
-docker build -f packaging/Dockerfile -t onyx-server:latest .
-docker run -p 6667:6667 -p 8080:8080 -v onyx-server:/data onyx-server:latest
+git clone https://github.com/devinkbrown/onyx-server.git
+cd onyx-server
+zig build
+./zig-out/bin/onyx-server --check-config packaging/onyx-server.quickstart.toml
+./zig-out/bin/onyx-server packaging/onyx-server.quickstart.toml
 ```
 
-**Native (fastest to a running node).** Current source version is **0.8.0**
-(`build.zig.zon`). The latest published GitHub Release is still
-[`v0.5.6`](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6). The
-verified fleet is still `0.7.0+ae78d490`. Build the source tree locally for 0.8.0:
+The evaluation configuration listens on plaintext IRC `:6667` and WebSocket
+`:8080`. Relative account state uses the working directory; the automatically
+generated node key is stored beside the selected configuration file. Use a dedicated
+writable directory for persistent deployments. Configure certificates and TLS
+before public use; follow the [quickstart](docs/guide/00-quickstart.md) and
+[TLS guide](docs/guide/tls.md). For containers, release bundles, Alpine packages
+and verification, see [packaging](packaging/README.md).
+
+## Features and their boundaries
+
+| Surface | Behavior | Detailed documentation |
+|---|---|---|
+| IRC and IRCX | Registration, channels, modes, access lists, properties, events, monitoring, moderation and operator commands. | [Command index](docs/reference/commands/_index.md), [IRCX](docs/reference/ircx/README.md) |
+| Capabilities and history | IRCv3 negotiation, message IDs/timestamps, history and conversation tags. Advertised capabilities depend on runtime configuration. | [Capabilities](docs/reference/protocol/caps.md), [messaging](docs/reference/commands/messaging.md) |
+| Accounts and reusable sessions | Account authentication, SCRAM, certificate authentication, durable account tokens, exact attachment credentials and mesh session policy. These credential types have different recovery guarantees. | [Services](docs/reference/commands/accounts-services.md), [credential domains](docs/reference/credential-domains.md) |
+| Mesh and event delivery | Hybrid post-quantum secured links, signed-origin events, retained replay authority, retry and duplicate/equivocation handling. Cold-restart custody has explicit limits. | [Mesh](docs/guide/mesh.md), [MESSAGE_V2 contract](docs/design/message-v2-exact-once.md) |
+| TLS and cryptography | Armor TLS 1.3, hardened TLS 1.2, certificate tooling and configured kTLS offload; supported paths vary by platform and certificate policy. | [TLS](docs/guide/tls.md), [cryptography](docs/architecture/crypto.md) |
+| Browser and media | WebSocket, WebTransport, native media and WebRTC/SFU components, codecs and authenticated media paths. Active transport state can block upgrades. | [Media architecture](docs/architecture/03-media.md), [media commands](docs/reference/commands/media.md) |
+| Operations | Connection classes, bounded queues, anti-abuse policy, cloaking, metrics, status feeds, backups, diagnostics, setup plans and service kits. | [Configuration](docs/reference/config.md), [operators](docs/guide/operators.md), [runbook](docs/RUNBOOK.md) |
+| Helix upgrades | Guarded, transactional handoff where the platform, candidate and active listener/session state are compatible. Refusal preserves the predecessor. | [Upgrade guide](docs/guide/upgrade.md), [architecture](docs/architecture/04-upgrade-wasm.md) |
+
+The [complete feature index](docs/reference/features.md) connects the public
+surfaces to configuration, commands, source ownership and verification. A
+compiled primitive, a proposal, and an accepted deployed feature are separate
+claims; historical roadmaps do not establish support.
+
+## Current release status
+
+The source manifest is **0.9.0**. On **2026-11-03**, both production nodes
+accepted **`0.9.0+c730d9f37b01`** with the improved OpenRC/systemd kits. Exact
+running hashes, service paths, acceptance scope and rollback facts have one
+canonical home: [production status](docs/ops/onyx-server-paths.md).
+
+The deployed WebTransport listener blocks production Helix; that fleet uses
+cold restarts one node at a time. Saved durable account-token recovery was
+verified after both restarts. The acceptance does not claim preservation of
+old exact attachment tokens across a cold boundary.
+
+The latest published GitHub asset release, checked **2026-11-03**, is still
+[v0.5.6](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
+The source version, running image and published release tag are independent.
+See [NEWS](NEWS.md) for the accepted release and later test-only changes.
+
+## Development and testing
 
 ```sh
-git clone https://github.com/devinkbrown/onyx-server && cd onyx-server
-packaging/release.sh                                   # → dist/onyx-server-0.8.0-x86_64-linux-musl
-./dist/onyx-server-0.8.0-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
-./dist/onyx-server-0.8.0-x86_64-linux-musl packaging/onyx-server.quickstart.toml
+zig build check                          # semantic check
+zig build test-mod -Dtest-filter=ACCESS  # compile a focused selection
+zig build test-cached -- --test-filter="reusable session"
+zig build all-checks --summary all       # full deterministic Debug release gate
+zig build test -Doptimize=safe --summary all
 ```
 
-Or download the published **v0.5.6** prebuilt:
+On supported native POSIX hosts, unfiltered full gates cover all three test
+roots with bounded parallel workers. Cached lanes reuse a root binary for
+runtime selections; documentation-only commits no longer invalidate test
+version metadata. Windows and cross targets retain their documented graphs.
 
-```sh
-release=https://github.com/devinkbrown/onyx-server/releases/download/v0.5.6
-curl -fLO "$release/onyx-server-0.5.6-x86_64-linux-musl"
-curl -fLO "$release/onyx-server.quickstart.toml"
-curl -fLO "$release/SHA256SUMS"
-grep ' onyx-server-0.5.6-x86_64-linux-musl$' SHA256SUMS | sha256sum -c -
-chmod +x onyx-server-0.5.6-x86_64-linux-musl
-./onyx-server-0.5.6-x86_64-linux-musl onyx-server.quickstart.toml
-```
+The measured complete Debug gate fell from **22.1 to 15.7 minutes** after the
+combined test improvements, with all previous test names preserved and two
+controls added: **11,236 passed, 313 skipped, zero failures**. Cold ReleaseSafe
+compilation remains expensive. Exact provenance and measurement limits are in
+the [verification report](docs/audit/release-and-test-speed-2026-11-03.md).
 
-Either way you get a working Linux node — **`ws://localhost:8080`** for the Onyx browser
-client and **`irc://localhost:6667`** for any IRC client. The node's sovereign
-identity key and account store self-generate in the data directory on first run;
-nothing to configure. For production, swap the quickstart config for a TLS config
-(real certs or the built-in ACME client) and set `ws_plain = false`.
-
-The binary is **bit-for-bit reproducible** and ships a CycloneDX SBOM plus an SLSA
-provenance attestation — see [`packaging/`](packaging/README.md) to rebuild and
-verify it yourself (`packaging/verify-release.sh`).
-The current public release is checksum-verified but unsigned; the packaging guide
-states the exact trust boundary and independent rebuild path.
-
-### Current verified fleet
-
-As of **2026-09-06**, `eshmaki.me` and `ircx.us` are both running
-`0.7.0+ae78d490` from `onyx-server.service`. Their `/proc/<pid>/exe` files match
-SHA-256 `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c` and
-both report `links_active=1`, `peers_up=1`, `partitioned=0` on the loopback
-metrics endpoint. This is a live-deployment baseline, not a promise that a
-fresh clone is already deployed. Source version **0.8.0** is ahead of that
-image. The 2026-09-06 source baseline was `ae78d490`.
-
-## Highlights
-
-- **Pure Zig, top to bottom** — substrate, crypto, TLS, and daemon, with zero C dependencies.
-- **Post-quantum mesh** — a CRDT state mesh with durable exact-once message delivery over an X25519 + ML-KEM-768 forward-secret ratchet, replacing TS6.
-- **Full IRCv3 + IRCX + SASL** — including CHATHISTORY, the Event Spine, and in-process channel/nick services (no pseudo-clients).
-- **Passwordless + interop-friendly** — WebAuthn/passkey login (with attestation verification), named conversations (topics) inside a channel, and Discord-compatible plus Block-Kit-lite incoming webhooks.
-- **Browser-native** — a first-class WebSocket listener and a voice/video media plane.
-- **Operates like a daemon should** — class-based admission policy, layered anti-abuse, and session-preserving `USR2` hot-upgrades.
-
-## Design pillars
-
-- **Zig top to bottom, no C interop.** Substrate, crypto, daemon, and tooling are all
-  Zig; `comptime` powers the module machinery and generates wire codecs and
-  dispatch tables.
-- **Mesh, not tree.** **Undertow** (水脈) — a CRDT state mesh — over **Mooring** —
-  a post-quantum-hybrid (X25519 + ML-KEM-768) forward-secret ratchet. Live membership
-  repair re-bursts the local roster about every 30 seconds, and a direct link dies on
-  ping timeout. No TS6. Operator surfaces are network-wide: the Event Spine
-  (connect/quit/oper alerts and the targeted `EVENT OBSERVE` feed) fans every event to
-  all nodes rendered with the origin server, and a cross-node `MODE` shows the setter's
-  nick, not the server. Message delivery across the mesh is **durable exact-once** —
-  per-origin ordered replay, a per-hop retransmit-until-ACK outbox, and a signed
-  replay/equivocation guard — with custody preserved across a session-preserving
-  `USR2` hot-upgrade.
-- **Safety as a type.** `Secret(T)` makes a data-dependent branch on secret bytes a
-  compile error; TLS is **1.3 plus a hardened 1.2 profile** (AEAD/ECDHE-only; no RSA key
-  exchange, CBC, compression, or renegotiation) with **Extended Master Secret (RFC 7627)
-  required by default**, a single-shot suite-pinned HelloRetryRequest, and a 0-RTT
-  ticket-age freshness window.
-- **Trust through simulation.** Deterministic-simulation testing (the *Deterministic
-  Ocean* harness) drives the CRDT mesh and crypto via injected clock/net/RNG, so any
-  failure replays from a 64-bit seed.
-- **Policy at registration.** `[class.*]` connection classes match IPv4/IPv6 CIDR,
-  implicit TLS, SASL account state, oper state, ident, and host globs, then apply
-  per-class sendq/recvq, flood, admission, clone, channel, target, monitor, silence,
-  ping, and registration-timeout policy.
-- **Elastic queues, explicit bounds.** Outbound SendQ and inbound RecvQ stay inline on
-  the hot path and spill to heap overflow only when needed, bounded by the matched class.
-  Optional `[limits].nick_delay` holds released nicks after exit to reduce nick camping,
-  while `STATS Y`, `STATS l`, and richer `INFO` expose the live policy and mesh state.
-- **Layered anti-abuse.** A single per-connection flood guard (keep-alives free, commands
-  weighted, distinct-target spread throttle, decaying excess → disconnect) derived from
-  each class's policy; a `+j` join-throttle with a network-wide raid-guard default
-  (`[limits].raid_joins`) and one-shot operator raid alerts; operator-designated
-  spam-trap honeypots (`SPAMTRAP`); and first-class nick services (`RECOVER`/`RELEASE`,
-  per-account `SECURE`/`ENFORCE`) — all real server commands, no pseudo-clients.
-
-## Architecture
-
-| Package | Role |
-|---|---|
-| `src/substrate` | Undertow math (HLC/vector clocks, delta-state CRDTs, Merkle sync, Ripple, sketches), lock-free queues, allocators, and the Deterministic Ocean simulator. The production Ringlane ring lives in `src/daemon/ringlane.zig`. |
-| `src/crypto` | `Secret(T)`, SHA-2/HMAC/HKDF, AEADs, X25519 + ML-KEM key schedule, the Mooring ratchet, and the Armor TLS stack |
-| `src/proto` | zero-copy IRCv3 parser, CoilPack wire codec, CAP state machine, Undertow frame layer, SASL |
-| `src/daemon` | SerpentRegistry, the production Ringlane ring, ordinary guest presence, connection classes, growable SendQ/RecvQ, nick services, flood and raid guards, command dispatch, OroStore, `STATS`/`INFO`, and the live mesh server |
-
-See the [architecture overview](docs/architecture/00-overview.md) for subsystems, request
-flow, and a full source map.
-
-## Build & run
-
-Onyx Server targets **Zig 0.17.0-dev.1282+c0f9b51d8** on 64-bit Linux (the reactor uses `io_uring`).
-The full daemon also has OpenBSD and native Windows reactors. Windows uses
-IOCP for IRC, TLS, WebSocket, mesh, accounts, and the documented companion
-services. Native Windows Helix supports guarded `UPGRADE` handoff of live TCP
-sessions, mesh links, companion listeners and workers, the private account
-WAL, and idle WebTransport and pristine media UDP listeners. Active QUIC and
-media sessions currently block an upgrade before handoff; see the
-[Windows build and verification guide](docs/guide/windows.md) for the exact
-scope and acceptance checks.
-
-```sh
-zig build              # build the daemon (and the `armor` crypto CLI) into zig-out/bin
-zig build check        # fast semantic analysis, no binary
-zig build test         # run the full test suite
-zig build test-smoke   # fast roadmap gate: check + focused TLS/server/config suites
-zig build test-roadmap # server roadmap gate: check + focused daemon/protocol suites
-zig build all-checks   # deterministic pre-push gate: check + wasm + tests + fuzz + BoGo smokes
-zig build all-checks-verbose # same gate with per-test progress for long runs
-zig build release      # optimized, stripped ReleaseFast daemon -> zig-out/bin/onyx-server
-zig build package      # stage release binary + reference config + systemd unit
-zig build run          # run the daemon locally
-./tools/genroots.sh    # regenerate package-root imports from the files present
-```
-
-Start from the [quickstart](docs/guide/00-quickstart.md), then see the
-[operator guide](docs/guide/operators.md), [testing guide](docs/guide/testing.md),
-[runbook](docs/RUNBOOK.md), [TLS guide](docs/guide/tls.md), and
-[mesh guide](docs/guide/mesh.md). A complete, commented configuration reference lives in
-[`docs/reference/config.md`](docs/reference/config.md) and
-[`etc/onyx-server.reference.toml`](etc/onyx-server.reference.toml).
-
-## Documentation
-
-The [`docs/`](docs/README.md) tree is grounded in, and cites, the live source:
-
-- **[Guides](docs/guide/00-quickstart.md)** — quickstart, build, TLS, mesh, operators, persistence, upgrade.
-- **[Runbook](docs/RUNBOOK.md)** — staging, systemd install, config validation, health checks, hot-upgrade, rollback.
-- **[Architecture](docs/architecture/00-overview.md)** — reactor and threading, dispatch and modules, mesh, cryptography, media, upgrade.
-- **[Reference](docs/reference/commands/_index.md)** — every command, the config schema, IRCv3/IRCX, modes, numerics, and ISUPPORT.
-
-## Status
-
-**In production.** Onyx Server runs a live two-node post-quantum mesh with session-preserving
-`USR2` hot-upgrades, serving IRCv3/IRCX clients and a browser WebSocket client. The
-surface includes full IRCv3 + IRCX + SASL, in-process channel/nick services, class-based
-connection policy, a single runtime flood guard, `+j` network raid protection, and
-spam-trap honeypots. The checkout currently contains 857 tracked Zig files (848
-under `src/`, including 229 daemon files and 13 enabled dispatch modules) with a
-deterministic-simulation test suite, all building under Zig 0.17-dev. The exact
-unit names, paths, image hash, and mesh gauges are maintained in
-[`docs/ops/onyx-server-paths.md`](docs/ops/onyx-server-paths.md).
-
-## Contributing
-
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, and
-pull-request guidance. Report security issues privately per [SECURITY.md](SECURITY.md).
-
-## License
-
-Onyx Server is licensed under the **GNU Affero General Public License v3.0 or later
-(AGPL-3.0-or-later)**. See [`LICENSE`](LICENSE) for the full text; every source file
-carries an SPDX header.
-
-Onyx Server is clean-room — it does **not** derive from any prior daemon's code, so this license is
-chosen freely rather than inherited. AGPL is deliberate: Onyx Server is a network server, and
-§13 ("Remote Network Interaction") means **anyone who runs a modified Onyx Server as a network
-service — for example, operating an IRC network — must offer that service's users the
-complete corresponding source of their modifications.** Running a private, unmodified
-copy carries no such obligation; the requirement attaches only to changes you put into
-service. The daemon advertises its source location (the `INFO` source URL) to satisfy
-§13's prominent-offer requirement for interactive network users.
-
-Copyright © 2026 Devin Brown.
+Start with [development](docs/development.md), then use the detailed
+[testing guide](docs/guide/testing.md), [source map](docs/architecture/source-modules.md),
+and [contribution process](CONTRIBUTING.md). Documentation changes are checked
+with `python3 -B tools/check_docs.py`; [maintenance rules](docs/MAINTENANCE.md)
+explain how current references and historical evidence stay distinct.

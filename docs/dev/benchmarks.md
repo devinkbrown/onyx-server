@@ -1,228 +1,97 @@
-# Benchmarks — how to run and interpret `zig build bench`
+# Benchmarking Onyx Server
 
-> **Superseded / historical — preserved as evidence.** This document is a point-in-time record and does not describe the current source or fleet. Current truth: [docs hub](../README.md) and [production paths](../ops/onyx-server-paths.md). Do not execute it as a current procedure.
+Benchmarks measure a captured implementation on a particular machine. They do
+not replace correctness tests or live acceptance. Source:
+[offline harness](../../src/substrate/bench.zig),
+[wrapper](../../tools/bench.sh), [live harness](../../tools/bench_live.py), and
+[build graph](../../build.zig).
 
-*Developer guide for the 0.7 measurement harness (`src/substrate/bench.zig`), release plan P0-1. Reconciled 2026-09-06.*
+## Choose the measurement
 
-Before this harness, no performance claim about Onyx Server was falsifiable. That historical
-gap is now closed: `zig build bench` and `zig build bench-live` are real build steps and the
-accepted release artifacts live under `docs/audit/`. New claims still need a machine-specific
-artifact; the live fleet's runtime status is not a benchmark result.
+| Question | Harness | What the result can establish |
+|---|---|---|
+| Parser, outbound tag composition or framing cost | `zig build bench` | CPU/memory cost of isolated operations on its fixed corpus. |
+| Cross-shard handoff or loopback accept floor | `zig build bench` | Harness-local syscall/fabric cost; Linux-only rows do not prove another platform. |
+| Throwaway daemon latency and RSS | `zig build bench-live` | Its selected TLS/shard/ring cells, not fleet capacity. |
+| Controlled idle/burst/continuous SQPOLL comparison | `tools/bench_live.py --sqpoll-phases` | Exact-delivery and CPU windows for a pinned artifact/profile. |
+| Full test-suite latency | Source-bound full test gate | Its complete inventory, command, host, source, binary and logs; not general daemon throughput. |
+| Constant-time behavior | `zig build ct-check` | Statistical timing observations under its documented controls, separate from deterministic CI. |
 
-This harness establishes that baseline. It is **measurement only**. It deliberately does not
-touch `src/substrate/io/ring.zig`; wiring the modern io_uring feature set is P0-2, owned by
-onyx-server-reactor.
-
-## Running it
-
-```sh
-zig build bench                  # build ReleaseFast + run every row
-tools/bench.sh                   # same, twice, with machine provenance
-tools/bench.sh -o docs/audit/bench-baseline-<version>.md
-tools/bench.sh --quick           # smoke check, NOT a baseline
-zig build bench-live             # throwaway daemon: TLS / shards / ring axes
-zig build bench-live -- --quick  # one plaintext live cell
-tools/bench.sh --live -o docs/audit/bench-live-<version>.md
-```
-
-`zig build bench` compiles the harness as its own ReleaseFast module and installs it to
-`zig-out/bin/onyx-server-bench`, so you can also re-run the exact same binary under `taskset`
-or `nice` without going back through the build graph:
+## Offline examples
 
 ```sh
-taskset -c 2 ./zig-out/bin/onyx-server-bench
-```
-
-The step is **not** part of `zig build test`, and not part of `all-checks`. A wall-clock
-measurement is inherently noisy, and folding it into the full suite would make the suite
-flaky. Wiring the harness as a regression tripwire is future work, and only after a baseline
-has proven stable across machines. This is the same separation `zig build ct-check` uses.
-
-The offline step never boots the daemon or opens a fixed port — every socket that
-harness creates is loopback on an ephemeral port. Live axes use `zig build bench-live`
-(see below), which boots a throwaway node the same way.
-
-### Tuning
-
-All knobs are environment variables (read from `/proc/self/environ`; Zig 0.16 dropped
-`std.posix.getenv` on no-libc Linux, so non-Linux targets always use the defaults):
-
-| variable | meaning | default |
-| --- | --- | --- |
-| `ONYX_BENCH_SAMPLES` | independent timed samples per row | 25 |
-| `ONYX_BENCH_ITERS` | iterations per sample, CPU-bound rows | 4000 |
-| `ONYX_BENCH_ACCEPT_ITERS` | connections per sample, `accept` row | 500 |
-| `ONYX_BENCH_ONLY` | run only rows whose name contains this substring | all rows |
-| `ONYX_BENCH_JSON` | `1` appends a machine-readable JSON block | off |
-
-```sh
+zig build bench
+# Two consecutive measurements with machine provenance:
+tools/bench.sh --runs 2 -o .zig-cache/benchmark-baseline.md
+# A quick harness smoke, not a publishable throughput baseline:
+tools/bench.sh --quick
+# Select a smaller question; Linux environment tuning:
 ONYX_BENCH_ONLY=fanout ONYX_BENCH_SAMPLES=51 zig build bench
-ONYX_BENCH_JSON=1 zig build bench 2>&1 | sed -n '/^{/,$p' > bench.json
 ```
 
-The harness prints to **stderr** (`std.debug.print`), so redirect with `2>&1`.
+The build step compiles an optimized standalone harness; it does not start the
+production daemon. Output uses stderr, so capture both streams when saving it.
+The wrapper adds CPU, kernel, governor, load, compiler and revision information.
+The harness is separate from deterministic `test` and `all-checks` gates.
 
-## What each row measures
+| Linux environment setting | Default | Meaning |
+|---|---:|---|
+| `ONYX_BENCH_SAMPLES` | 25 | Timed samples per row. |
+| `ONYX_BENCH_ITERS` | 4000 | Iterations per sample for CPU rows. |
+| `ONYX_BENCH_ACCEPT_ITERS` | 500 | Connections per accept sample. |
+| `ONYX_BENCH_ONLY` | unset | Substring selection of row names. |
+| `ONYX_BENCH_JSON` | unset | `1` appends machine-readable output. |
 
-Five hot-path stages, each isolated so a regression points at one place.
+The environment is read through the Linux mechanism documented in the harness;
+other targets need their own validated invocation rather than assumed tuning.
 
-| row | measures | reported |
-| --- | --- | --- |
-| `inbound-parse` | `proto.irc_line.parseLine` over a mixed client-line corpus (plain, IRCv3-tagged, JOIN, long trailing, many-param MODE) — the per-received-line cost on every byte a client sends. Zero-allocation: `LineView` slices point into the caller's input. | ns/line, MiB/s |
-| `outbound-tags/all` | `proto.msgtags.composeOutbound` with all six tags negotiated (server-time, account, msgid, label, batch, bot): building one cap-variant of an outbound line into a caller-provided buffer. | ns/compose |
-| `outbound-tags/none` | The same call with an empty cap set — the bare line copy. **`/all` minus `/none` attributes how much of per-recipient framing is tag construction rather than the unavoidable copy.** | ns/compose |
-| `fanout-frame/w{1,8,64,512,4096}` | The channel fan-out shape at five widths, modelling the correct discipline: build each distinct cap-variant line **once per message**, then copy the selected variant into each recipient's inline send buffer. | ns/recipient, msgs/sec |
-| `fabric-handoff` | The cross-shard delivery fabric round-trip (`daemon.reactor_fabric`): `acquire` a pooled `DeliverBuf` → copy → `sendTo` the target shard's MPMC inbox → `wake` its eventfd → `drainWake` → `drain` a batch → `release`. Batched 64 per wake to match the real cadence (one eventfd write coalesces a burst; one drain clears it). Linux-only. | ns/message, MiB/s |
-| `accept` | Loopback connection-accept rate: `socket` → `connect` → `accept4` → close both, ephemeral port. A syscall-bound floor for the accept path with no daemon, no TLS, no io_uring. Linux-only. | accepts/sec |
+Rows separate inbound parsing, outbound tags with/without negotiated fields,
+fanout framing, cross-shard fabric handoff and loopback accept. Framing is not
+TLS record encryption or socket delivery. Compare variant-build counts across
+fanout widths: building one frame per recipient is a different algorithm from
+building each capability variant once and copying it to its recipients.
 
-### The falsifiable property in `fanout-frame`
-
-Each `fanout-frame` row prints `variant_builds_per_msg` in the notes block. It must stay at
-the variant count (**4**) at every width, including 4096. If a future change makes it scale
-with width, fan-out has become O(N) compose calls instead of O(N) memcpy plus O(V) builds —
-and this row will say so instead of the regression shipping silently. That is the single most
-useful assertion in the harness.
-
-## Reading the output
-
-Each row reports over `samples` independent timed samples of `ops` operations:
-
-- **`min`** — best observed ns/op: warm cache, no preemption. The cleanest read on the
-  *code's* cost, and the column to compare when the machine is not idle.
-- **`p50`** — median ns/op, the steady-state number. **Throughput columns are derived from
-  p50, never from min.**
-- **`p99`** — tail ns/op. A p99 far above p50 means scheduler noise, a cold cache, or a real
-  tail problem. Investigate before trusting any delta.
-
-Samples are deliberately short (single-digit milliseconds). A long sample spans many
-scheduler quanta, so on a busy box every sample absorbs preemption and the whole distribution
-shifts rather than just the tail — measured here as a 2–3x min-to-p50 smear at ~100 ms
-samples. With short samples the preemption lands in p99 where it belongs.
-
-**A large min-to-p50 gap is a signal about the machine, not the code.** If `min` and `p50`
-differ by more than ~1.5x in any row, the box was contended: trust `min`, and re-capture on an
-idle machine before recording a baseline.
-
-Rule of thumb: treat a p50 move under 5% as noise unless it reproduces across two runs.
-`tools/bench.sh` runs the harness twice for exactly that reason, which is also the release
-plan's acceptance criterion for P0-1 ("a stable baseline on two consecutive runs").
-
-A delta is only meaningful against a baseline captured on the **same machine, kernel, and CPU
-governor**. The harness header records arch, OS, CPU count, optimize mode, Zig version, and
-the daemon version+commit; `tools/bench.sh` adds CPU model, kernel, governor, and load
-average. Never compare a number across two different boxes.
-
-### The `layout` block
-
-After the table the harness prints `@sizeOf` for the structs copied or zero-initialized once
-per operation:
-
-```
-layout (@sizeOf, bytes) — structs copied or zero-initialized per operation
-  proto.irc_line.LineView              2384   returned by value per parsed line
-  daemon.deliver_handle.DeliverMsg      456   crosses the shard mailbox by value
-  daemon.deliver_handle.DeliverBuf     4120   pooled; 256 slots per shard
-```
-
-These are reported, not judged. `LineView` at 2384 bytes is returned **by value** from
-`parseLine` on every received line, so it is a direct per-line cost and a candidate for a
-later layout pass — but that is a finding for the owning agent, not something this harness
-changes.
-
-## Self-verification
-
-Every stage asserts a correctness invariant on its own output: the parse produced the expected
-command, the composed line carries its tags, every fan-out copy matches its variant, the
-fabric dropped nothing and leaked no pool slot, every connection was accepted. A violated
-invariant **exits non-zero** rather than reporting a fast wrong number. A benchmark that
-measures broken code is worse than no benchmark.
-
-## What this harness does NOT measure
-
-Named gaps. Do not write a claim about any of these from this harness:
-
-- **TLS and kTLS on/off.** The handshake and record path are not exercised; `outbound-tags`
-  and `fanout-frame` measure plaintext framing only.
-- **Steady-state RSS per connection.** Needs a live daemon under load — a separate artifact.
-- **`num_shards` scaling** and the `world.lockWrite` command-path ceiling. `fabric-handoff`
-  measures the handoff cost between two shards *single-threaded*; it says nothing about
-  multi-core command throughput. Do not write a "scales with shards" claim from it.
-- **End-to-end message round-trip latency** through a real socket and reactor.
-- **io_uring submit/complete cost** — deliberately untouched, P0-2.
-- **Live-daemon axes** — not this harness. Use `zig build bench-live` /
-  `tools/bench.sh --live` (`tools/bench_live.py`). That boots a throwaway
-  `onyx-server` on 127.0.0.1 with kernel-assigned ports (never 6667/6680/6697,
-  never a production service unit), `--check-config` before every boot.
-
-The full P0-1 acceptance criterion in the release plan also names connection-accept rate,
-per-message round-trip latency, fan-out throughput, and RSS per connection with TLS/kTLS and
-`num_shards` controls. This harness covers accept rate and fan-out framing throughput.
-`bench-live` covers register→001 latency, JOIN+PRIVMSG RTT, RSS idle vs N clients, and the
-TLS / `num_shards` / `ring_entries`×`cqe_batch` matrix. kTLS is the configured intent
-(`txrx`); the cell `note` records whether the kernel actually attached ULP.
-
-## Live-daemon recipe
+## Private live examples
 
 ```sh
 zig build bench-live -- --quick
-tools/bench.sh --live -o docs/audit/bench-live-<version>.md
-zig build bench-live -- --gap-x4 -o docs/audit/bench-gap-x4.md
-zig build bench-gap-x5 -- -o docs/audit/bench-gap-x5.md
+tools/bench.sh --live --quick
 ```
 
-Default matrix: plaintext at shards 1 and 2, `ring_entries` 32 vs 128, `cqe_batch`
-256 vs 512, plus userspace TLS and kTLS-intent on the default io pair. `--quick`
-is one plaintext cell (smoke, not a baseline). `--gap-x4` is the eight-cell Linux
-matrix: `[io] sqpoll` on and off, TLS off and userspace (`ktls = "off"`), and
-`num_shards` 1 and 4, at `ring_entries` 32 and `cqe_batch` 256. It does not
-enable `defer_taskrun` or kTLS `txrx`. A TLS cell that cannot handshake
-(for example Python `ssl` vs an Ed25519 bootstrap leaf) is recorded as a failed
-cell — never silently skipped. Do not fold `bench-live` into `zig build test`.
-
-`zig build bench-gap-x5` is a separate ReleaseFast binary. It prints
-`@sizeOf(ConnState)`, the client-table slot that holds one connection, and the
-microseconds to enqueue one plaintext line per fan-out recipient through
-`enqueuePlainFanout`. It does not shrink the connection and it does not bump
-the Helix clients capsule. The offline `fanout-frame` rows above are the
-framing model; they are not this measurement, and live RSS/client is not
-bytes per connection.
-
-## Recording a baseline
+These start temporary loopback daemons, preflight generated config and avoid
+production service units and the documented forbidden listener ports. The
+quick path checks the harness; its small cell is not a scale claim. Use a
+captured artifact for a controlled profile:
 
 ```sh
-tools/bench.sh -o docs/audit/bench-baseline-<version>.md
+python3 -B tools/bench_live.py --bin /absolute/path/to/captured-onyx-server \
+  --sqpoll-phases --phase-pilot --repetitions 1 --sqpoll-modes 10 \
+  --expected-sha256 <verified-artifact-sha256> \
+  --phase-json .zig-cache/sqpoll-pilot.json
 ```
 
-Do it on an idle machine with a known governor, and check the two runs agree before
-committing the artifact. The output block carries its own provenance table, so a future reader
-can tell whether their machine is comparable.
+Replace the SHA placeholder with the actual recorded artifact digest. The
+retained phase profile uses pinned TLS, persistent clients, exact ordered
+fanout receipts and distinct idle/burst/continuous CPU windows, including
+verified SQPOLL workers. A phase pilot proves the reduced profile's correctness,
+not throughput or a general SQPOLL win. See the tool's `--help` for profile axes.
 
+## Interpret and publish carefully
 
-### Signed inventory duplicate work — 2026-10-30 private measurement
+Record source revision and dirty state, compiler/archive identity, target,
+optimization, artifact hash, host/kernel, CPU/governor, contention, profile,
+iteration/sample counts and raw output. Use the same machine and controls for
+before/after comparisons and repeat measurements.
 
-A reviewed private benchmark measured the actual `Store.applySignedOffer` and
-`applySignedOfferMemoized` paths in ReleaseFast. The memo implementation matches
-integrated source manifest `2c2432ce`; benchmark-only build/source manifest is
-`ec1a5e22`. Nine cases produced36 timing rows: three samples for each working
-set, with256 warm cyclic rounds per sample. Actual production memo counters
-verified every hit or signature check, and both paths produced byte-identical
-Store checkpoints.
+`min`, `p50` and `p99` describe different parts of the sampled operation-cost
+distribution. The harness derives throughput from the median. A large gap can
+reflect scheduling and cache effects; it does not identify the cause by itself.
+Sampled operation-cost percentiles are not necessarily end-user message-latency
+percentiles. Layout sizes printed by the harness are observations, not proof
+of a memory bug.
 
-| Working set | Median ordinary ns/call | Median memo ns/call | Median paired ordinary/memo ratio |
-| --- | ---: | ---: | ---: |
-| 1 | 109160.8 | 3764.0 | 28.921 |
-| 4 | 109926.6 | 3898.0 | 28.201 |
-| 8 | 109320.4 | 109954.1 | 0.996 |
-
-The four-slot memo eliminates repeated signature checks for the fitting sets.
-The cyclic eight-offer set thrashes it and shows essentially no benefit. This
-is direct leaf work under fixed valid logical time, with a real monotonic
-execution timer. The ordinary arm always runs first on a shared host. Ordinary
-signature counts are source expectations, not instrumented observations. These
-numbers do not establish daemon, network, contention, or mesh capacity. The
-benchmark target remains private pending the next source integration batch.
-
-Source, complete rows and verified counts are retained in
-`.zig-cache/wave-123/session-memo-bench-v2.json` and
-`.zig-cache/wave-123/session-memo-bench-verification-v2.json`. The earlier failed
-build-argument API probe is preserved separately; it produced no measurements.
+Keep failures and missing measurements visible. Verify exact deliveries,
+cleanup and absence of overlapping benchmark processes before interpreting
+performance. Report regressions as well as gains and separate observed data
+from inference. Shared-host comparisons must say so, as the
+[full-suite timing report](../audit/release-and-test-speed-2026-11-03.md) does.

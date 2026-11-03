@@ -138,8 +138,8 @@ def main() -> int:
     print("git diff --check")
     if args.release:
         print("zig build all-checks")
-        print("zig build release -Doptimize=ReleaseFast")
-        print("zig build package -Doptimize=ReleaseFast")
+        print("zig build release -Doptimize=fast")
+        print("zig build package -Doptimize=fast")
         print("packaging/release.sh dist")
         print("packaging/verify-release.sh dist/SHA256SUMS")
     return 0

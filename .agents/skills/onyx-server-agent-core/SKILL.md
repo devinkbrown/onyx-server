@@ -14,7 +14,7 @@ description: >
 4. **Efficient** — no hot-path waste; measure before claiming perf wins.
 
 ## Repo facts
-- Path: `/home/kain/onyx-server`. Zig **0.17-dev**. No C interop.
+- Path: `/home/kain/onyx-server`. Zig **0.17.0**. No C interop.
 - Product: **Onyx Server** (engine/daemon). Client/network brand: **Onyx**.
 - Names: Ringlane, Armor, Undertow, Mooring, Helix, Event Spine, CadenceVox/Vis.
 - `onyx-server-integrator` is the **sole** `src/daemon/server.zig` writer.
@@ -22,24 +22,26 @@ description: >
   - Ed25519 ctx sign: `orochi-ed25519ctx-v1` with dual-verify of legacy `onyx-ed25519ctx-v1`
   - SPAKE: `orochi-spake2-*`; frozen tsumugi/MZ labels stay for interop only
 
-## Live dual-node (production mesh; verified 2026-09-06)
-| Node | Host | Runtime dir | Unit | Binary | Config |
-|------|------|-------------|------|--------|--------|
-| A | eshmaki.me (this box) | `/home/kain/onyx-server-run` | `onyx-server.service` | `…/onyx-server` | `onyx-server.local.toml` |
-| B | ircx.us | `/home/trev/onyx-server-run` (SSH `trev@ircx.us`) | `onyx-server.service` | `…/onyx-server` | `onyx-server.local.toml` |
+## Live dual-node
 
-- Metrics (loopback): `http://127.0.0.1:9130/metrics`
-- Gauges: `onyx_s2s_tcp_active` = open TCP slots; `onyx_s2s_links_active` = Mooring-established only
-- Journal success: `mesh S2S established (secured) peer=…`
-- Stuck `tcp_active>0` + `links_active=0` → AKE / trust-root / handshake skew (not "down" TCP)
-- Health: `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`
-- Current verified image on both nodes: `0.7.0+ae78d490`, SHA-256
-  `0f110e833bc96bd6540ad7df0a620af869526cf8b4dbc3fd4650aa8ada8ddf1c`.
-- Chat (optional): `tools/mesh_chat_smoke.py` — SASL via `MESH_SMOKE_SASL_*` or guest auto when unset
-- Prefer **Helix USR2** reload when image token allows; cold-restart only per RUNBOOK
-- Deploy checklist: `docs/ops/mesh-metrics-deploy-checklist.md` + `docs/RUNBOOK.md`
-- Packaged and live unit names are both `onyx-server.service`; do not infer current
-  topology from historical `orochi.service` records.
+Operational source of truth: [production paths](../../../docs/ops/onyx-server-paths.md)
+and [deployment checklist](../../../docs/ops/mesh-metrics-deploy-checklist.md).
+Read their dated artifact receipt before acting; source HEAD and the deployed
+artifact revision may differ after documentation or test-only commits.
+
+| Node | Runtime | Service manager |
+|------|---------|-----------------|
+| eshmaki.me (local) | `/home/kain/onyx-server-run` | OpenRC `/etc/init.d/onyx-server` |
+| `trev@ircx.us` | `/home/trev/onyx-server-run` | systemd `onyx-server.service` |
+
+- Metrics (loopback): `http://127.0.0.1:9130/metrics`.
+- `onyx_s2s_tcp_active` counts TCP slots; `onyx_s2s_links_active` counts established Mooring links.
+- `tcp_active>0` with `links_active=0` requires handshake/trust diagnosis.
+- Health: `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`.
+- Prefer Helix USR2 only when the image capabilities and runtime state permit it.
+  Otherwise follow the RUNBOOK cold-restart boundary, one node at a time.
+- Confirm actual service configuration, user, working directory and limits before changes.
+  Historical unit names and old artifact receipts are evidence, not deployment targets.
 
 ## Gates
 | Iterate | Ship |

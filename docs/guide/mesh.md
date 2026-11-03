@@ -16,11 +16,21 @@ s2s = 7700
 [mesh]
 realm = "example"
 mesh_pass = "env:ONYX_MESH_PASS"
+presence_store_path = "/var/lib/onyx-server/guest-presence.wal"
 ```
 
 ## Ordinary guests
 
-An account-less client publishes one mesh-presence v2 record. WHOIS and PRIVMSG for that nick follow the signed record, including across a node that is not directly linked to the guest's home. NOTICE does not. There is no second presence version and no new handshake bit. Authenticated clients and reusable sessions stay on their existing MESSAGE_V2 and session paths. The Helix world checkpoint stays version 2 and does not carry the guest id. See [mesh architecture](../architecture/mesh-s2s.md#ordinary-guest-presence). This behavior is in source. The full test suite has not been re-run green on it.
+An account-less client publishes one mesh-presence v2 record. WHOIS and PRIVMSG for that nick follow the signed record, including across a node that is not directly linked to the guest's home. NOTICE does not. There is no second presence version and no new handshake bit. Authenticated clients and reusable sessions stay on their existing MESSAGE_V2 and session paths. The Helix world checkpoint stays version 2 and does not carry the guest id. See [mesh architecture](../architecture/mesh-s2s.md#ordinary-guest-presence). Current release verification and the narrower live acceptance are recorded in
+[the release audit](../audit/release-and-test-speed-2026-11-03.md); neither is
+a blanket certification of every topology or platform.
+
+Identity-bearing production meshes must configure a private durable
+`[mesh].presence_store_path`; startup otherwise fails with
+`MissingMeshPresenceStorePath`. Preserve that store with the node identity.
+Guest-presence authority, account persistence and exact-session credentials
+are separate ownership domains. See [persistence](persistence.md) and
+[credential domains](../reference/credential-domains.md).
 
 ## MESSAGE_V2 bridge and activation
 
@@ -29,7 +39,13 @@ sent once as legacy and later replayed as V2. The safe default is
 `relay_v2_authoring = "compat"`: the node can receive, acknowledge, retain, and
 forward V2, but its own events remain legacy-only.
 
-Use these distinct passes for a rollout. Do not combine staging and activation
+The sequence below describes first activation of an eligible compat fleet.
+An already-active fleet must preserve its exact mode, epoch and roster digest;
+do not reset it to `compat` or repeat an old activation recipe. Use the
+[current production baseline](../ops/onyx-server-paths.md) and live status,
+and check the full current Helix token before selecting a reload path.
+
+Use these distinct passes for first activation. Do not combine staging and activation
 in one reload:
 
 1. Deploy the bridge-capable binary to every node while authoring remains
@@ -75,7 +91,7 @@ The roster is separate from `trust_roots`: the former is the complete mesh;
 the latter is the local node's direct-neighbor allowlist and, under a staged
 plan, its MESSAGE_V2 **custody membership** — the confirmed-node set each durable
 RVL2 accepted-event row collects ACKs from before it retires its retained wire
-(`src/daemon/config_format.zig:1855`, `src/daemon/relay_v2_event_log.zig:25`). It
+(`src/daemon/config_format.zig`, `src/daemon/relay_v2_event_log.zig`). It
 is also distinct from `admission_roots` (MeshPass signer roots). Onyx Server canonicalizes
 the full public keys into a roster digest and carries `{mode, epoch, digest}` in
 the mandatory MHLC v3 Helix checkpoint. Current handoff rejects an unstaged
@@ -116,31 +132,34 @@ The durable MESSAGE_V2 custody plane (accepted-event log RVL2, per-hop outbox
 RVO2, replay guard RVG2, and rendered-record spool ADS1) is a
 retransmit-until-ACK obligation that survives a **[Helix](../reference/glossary.md)
 (`SIGUSR2`) hot-upgrade only** — its checkpoints ride the in-memory upgrade
-capsule, not a disk write-ahead log. A systemd cold restart (`systemctl restart`)
+capsule, not a disk write-ahead log. A cold restart under either supervisor
 or power loss drops any in-flight custody obligation, so hard-restart a node only
 from a drained boundary. See the [MESSAGE_V2 exact-once
 design](../design/message-v2-exact-once.md) and [Helix upgrade](upgrade.md).
 
-`[listen].s2s` maps to `server.Config.s2s_port`; `0` disables the inbound S2S listener (`src/daemon/config_boot.zig:70`, `src/daemon/server.zig:1738`). The server binds it alongside the IRC listener when the value is non-zero (`src/daemon/server.zig:3298`, `src/daemon/server.zig:3299`).
+`[listen].s2s` maps to `server.Config.s2s_port`; `0` disables the inbound S2S listener (`src/daemon/config_boot.zig`, `src/daemon/server.zig`). The server binds it alongside the IRC listener when the value is non-zero (`src/daemon/server.zig`, `src/daemon/server.zig`).
 
 ## Secured vs. plaintext links
 
-Post-quantum-secured S2S is enabled by default when a node identity and CSPRNG are available. An explicit `[node].secret_key` takes precedence; otherwise `main.zig` loads or creates `onyx-server-node.key` beside the config path, derives the identity using `[mesh].realm`, sets `server.Config.node_identity`, and copies `mesh_pass` if configured (`src/main.zig:310`, `src/main.zig:323`, `src/main.zig:331`, `src/main.zig:338`, `src/main.zig:348`, `src/main.zig:351`). Only keyfile or identity setup failure leaves S2S plaintext (`src/main.zig:329`, `src/main.zig:335`, `src/main.zig:345`). The live secured check is `node_identity != null and crypto_io != null` (`src/daemon/server.zig:6177`, `src/daemon/server.zig:6179`).
+Post-quantum-secured S2S is enabled by default when a node identity and CSPRNG are available. An explicit `[node].secret_key` takes precedence; otherwise `main.zig` loads or creates `onyx-server-node.key` beside the config path, derives the identity using `[mesh].realm`, sets `server.Config.node_identity`, and copies `mesh_pass` if configured (`src/main.zig`, `src/main.zig`, `src/main.zig`, `src/main.zig`, `src/main.zig`, `src/main.zig`). Keyfile or identity failures must be treated as failed mesh readiness;
+`mesh.require_secured = true` prevents configured mesh operation from silently
+falling back to plaintext. The optional legacy plaintext path is a separate
+explicit policy (`src/main.zig`, `src/main.zig`, `src/main.zig`). The live secured check is `node_identity != null and crypto_io != null` (`src/daemon/server.zig`, `src/daemon/server.zig`).
 
-Outbound `CONNECT <host> <port>` is an operator command that requires `mesh_admin` (`src/daemon/server.zig:17161`, `src/daemon/server.zig:17165`). If the local server has secured S2S enabled, `CONNECT` starts a secured handshake; otherwise it starts a plaintext S2S link (`src/daemon/server.zig:17187`, `src/daemon/server.zig:17238`, `src/daemon/server.zig:17252`). `SQUIT <server>` tears down a peer link by handshake-learned server name and also requires `mesh_admin` (`src/daemon/server.zig:17312`, `src/daemon/server.zig:17315`, `src/daemon/server.zig:17343`, `src/daemon/server.zig:17345`).
+Outbound `CONNECT <host> <port>` is an operator command that requires `mesh_admin` (`src/daemon/server.zig`, `src/daemon/server.zig`). If the local server has secured S2S enabled, `CONNECT` starts a secured handshake; otherwise it starts a plaintext S2S link (`src/daemon/server.zig`, `src/daemon/server.zig`, `src/daemon/server.zig`). `SQUIT <server>` tears down a peer link by handshake-learned server name and also requires `mesh_admin` (`src/daemon/server.zig`, `src/daemon/server.zig`, `src/daemon/server.zig`, `src/daemon/server.zig`).
 
 ## Operator views
 
-The operator security module exposes the current mesh inspection commands (`src/daemon/modules/oper_security.zig:180`, `src/daemon/modules/oper_security.zig:183`):
+The operator security module exposes the current mesh inspection commands (`src/daemon/modules/oper_security.zig`, `src/daemon/modules/oper_security.zig`):
 
 | Command | View |
 |---|---|
-| `MESH` or `NETSTAT` | Direct S2S peer/link health, multi-hop reachability, partition summary, `MESH LOG`, `MESH ADMISSION`, and `MESH GRANTS` (`src/daemon/server.zig:28746`, `src/daemon/server.zig:28748`, `src/daemon/server.zig:28761`, `src/daemon/server.zig:28780`, `src/daemon/server.zig:28835`). |
-| `ROUTE` | Current routing view: local node plus established one-hop peers; multi-hop routing is noted as future substrate work (`src/daemon/server.zig:28909`, `src/daemon/server.zig:28918`). |
-| `NETHEALTH` | Lists this node and each established peer as alive with RTT and idle time; this is not a witness-quorum death decision. A pair loses the link on ping timeout (`src/daemon/server.zig:28931`, `src/daemon/server.zig:28943`, `src/daemon/server.zig:28961`). |
-| `CONNECT` | Opens outbound S2S to a peer (`src/daemon/server.zig:17161`, `src/daemon/server.zig:17180`). |
-| `SQUIT` | Tears down an S2S link by server name (`src/daemon/server.zig:17312`, `src/daemon/server.zig:17322`). |
+| `MESH` or `NETSTAT` | Direct S2S peer/link health, multi-hop reachability, partition summary, `MESH LOG`, `MESH ADMISSION`, and `MESH GRANTS` (`src/daemon/server.zig`, `src/daemon/server.zig`, `src/daemon/server.zig`, `src/daemon/server.zig`, `src/daemon/server.zig`). |
+| `ROUTE` | Current routing view: local node plus established one-hop peers; multi-hop routing is noted as future substrate work (`src/daemon/server.zig`, `src/daemon/server.zig`). |
+| `NETHEALTH` | Lists this node and each established peer as alive with RTT and idle time; this is not a witness-quorum death decision. A pair loses the link on ping timeout (`src/daemon/server.zig`, `src/daemon/server.zig`, `src/daemon/server.zig`). |
+| `CONNECT` | Opens outbound S2S to a peer (`src/daemon/server.zig`, `src/daemon/server.zig`). |
+| `SQUIT` | Tears down an S2S link by server name (`src/daemon/server.zig`, `src/daemon/server.zig`). |
 
-`MESH ADMISSION` reports [MeshPass](../reference/glossary.md) admission mode, secured-S2S status, signed-frame policy, root count, token presence, and minimum revocation epoch without exposing shared secret or token bytes (`src/daemon/server.zig:28759`, `src/daemon/server.zig:28763`, `src/daemon/server.zig:28773`).
+`MESH ADMISSION` reports [MeshPass](../reference/glossary.md) admission mode, secured-S2S status, signed-frame policy, root count, token presence, and minimum revocation epoch without exposing shared secret or token bytes (`src/daemon/server.zig`, `src/daemon/server.zig`, `src/daemon/server.zig`).
 
-`MESH` reflects both plaintext and secured S2S peers in the same report (`src/daemon/server.zig:28801`, `src/daemon/server.zig:28807`).
+`MESH` reflects both plaintext and secured S2S peers in the same report (`src/daemon/server.zig`, `src/daemon/server.zig`).

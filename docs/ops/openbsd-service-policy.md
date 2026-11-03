@@ -75,3 +75,5 @@ execution-policy enforcement.
 Current verification is bounded host compiler tests and cross-built OpenBSD
 assets. Actual target policy publication and the complete installed rcctl
 lifecycle/reboot journey remain required acceptance gates.
+
+Source of truth: the `native-service-policy` and `openbsd-service-assets` steps in `build.zig`, `src/native_service_policy_main.zig`, `src/daemon/native_service.zig`, and the OpenBSD managed-service helper. Current installed fleet facts live in [production paths](onyx-server-paths.md); platform-specific tests retain their recorded scope.

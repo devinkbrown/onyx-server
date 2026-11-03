@@ -9,7 +9,7 @@ running daemon retains its actual artifact revision.
 
 ## Release evidence
 
-Pinned compiler: Zig 0.17-dev, SHA-256
+Pinned compiler: Zig 0.17.0, SHA-256
 `7c61539af19fa4082c94848f1c2b57b89e76dc6cfd5bd4c57764c3caf8f82272`.
 The accepted production gates each executed 11,547 tests: 11,234 passed,
 313 skipped, zero failures/leaks/log errors. Debug `all-checks` took

@@ -1,217 +1,109 @@
 # The module system
 
-_SerpentRegistry: comptime module assembly and validation, dependency-ordered load, gated command dispatch, the typed module bus, the lifecycle driver, and `MODULES` introspection._
-
-This document covers how a daemon feature is packaged as a module, what the compiler proves about the module set before the binary exists, and what drives a module through its lifecycle at runtime. Local world state and the two-layer dispatch model are covered in [02-world-dispatch-modules.md](02-world-dispatch-modules.md); the Event Spine's typed oper/observer events are a separate system, see [event-spine.md](event-spine.md).
-
-## Why the registry is comptime
-
-The entire module set is assembled, validated, and flattened into static tables at compile time. There is no runtime module loader, no dynamic registration order, and no "module failed to register" boot path to reason about. A module set that would be ambiguous — two modules claiming `KICK`, a missing dependency, a dependency cycle, an alias shadowing another module's command — is a `@compileError`, not a startup failure.
-
-The manifest is the single list. Adding a module is one line; deleting the line dead-code-eliminates it. Evidence: `src/daemon/modules/manifest.zig:27`, `src/daemon/modules/manifest.zig:45`.
-
-Referencing `module_manifest.Live` from the server is what forces validation to run at build time. The eval branch quota is raised there because validation is O(commands²) across the full command surface. Evidence: `src/daemon/modules/manifest.zig:45`, `src/daemon/modules/manifest.zig:46`.
-
-## What a module declares
-
-A `Module` is a plain comptime struct. Every field defaults to empty, so a module declares only the surface it actually contributes. Evidence: `src/daemon/registry.zig:505`.
-
-| Field | Meaning | Evidence |
-| --- | --- | --- |
-| `id` | Unique module identifier, dotted (`core.ircx`, `diag.introspect`). | `src/daemon/registry.zig:506` |
-| `version` | `major.minor.patch`, surfaced by `MODULES`. | `src/daemon/registry.zig:477`, `src/daemon/registry.zig:507` |
-| `category` | `core`/`protocol`/`service`/`security`/`feature`/`media`/`diagnostic`. | `src/daemon/registry.zig:484` |
-| `priority` | `first`/`early`/`normal`/`late`/`last` — orders modules that have no dependency edge between them. | `src/daemon/registry.zig:495` |
-| `requires` | Hard dependencies. A missing one is a compile error. | `src/daemon/registry.zig:511` |
-| `optional_requires` | Soft edges: honoured for ordering when present, absent is fine. | `src/daemon/registry.zig:512` |
-| `conflicts` | Modules that must not be enabled alongside this one. | `src/daemon/registry.zig:513` |
-| `config_blocks` | `[modules.*]` TOML sections this module owns. | `src/daemon/registry.zig:514` |
-| `commands` | `CommandSpec` rows — the dispatch surface. | `src/daemon/registry.zig:372`, `src/daemon/registry.zig:516` |
-| `hooks` | `HookBinding` subscriptions to typed events. | `src/daemon/registry.zig:440`, `src/daemon/registry.zig:517` |
-| `caps`, `chanmodes`, `usermodes`, `numerics`, `isupport` | Protocol surface, uniqueness-checked across the whole set. | `src/daemon/registry.zig:518`–`src/daemon/registry.zig:522` |
-| `stats` | Counters and gauges contributed to `/STATS` and Prometheus. | `src/daemon/registry.zig:526` |
-| `on_register` … `on_deinit` | Lifecycle phases. | `src/daemon/registry.zig:540`–`src/daemon/registry.zig:550` |
-
-### CommandSpec
-
-A command is declared, not registered. The spec carries everything dispatch and introspection need, so the gate and the help text can never drift from the handler they describe. Evidence: `src/daemon/registry.zig:372`.
-
-| Field | Role | Evidence |
-| --- | --- | --- |
-| `name`, `min_params`, `handler` | Identity, arity floor, implementation. | `src/daemon/registry.zig:373`, `src/daemon/registry.zig:374`, `src/daemon/registry.zig:411` |
-| `access` | Minimum client authority, enforced by the dispatcher *before* the handler runs. | `src/daemon/registry.zig:51`, `src/daemon/registry.zig:377` |
-| `feature` | Config feature toggle; a disabled feature makes the command unavailable. | `src/daemon/registry.zig:381` |
-| `summary`, `category` | One-line description and grouping for `COMMANDS`. | `src/daemon/registry.zig:383`, `src/daemon/registry.zig:385` |
-| `oper_privilege` | Documents which oper privilege the handler enforces internally. Documentation only — the handler stays the sole authority. | `src/daemon/registry.zig:395` |
-| `aliases` | Alternate spellings resolving to this same spec. | `src/daemon/registry.zig:402` |
-| `help_long` | Multi-line help body, `\n`-separated, one numeric per line. | `src/daemon/registry.zig:405` |
-| `warden_class` | Declared anti-abuse cost class. | `src/daemon/registry.zig:407` |
-| `deprecated_by` | Names the replacement verb; dispatch is unaffected. | `src/daemon/registry.zig:410` |
-
-**Aliases share one spec.** An alias is not a second row with its own access level — it resolves to the canonical `CommandSpec`, so its gate, arity, feature toggle, and handler are the canonical ones by construction. An alias therefore cannot become a privilege side-door around the real verb. Aliases are hidden from the `COMMANDS` list form and are resolved by `lookupCommand`. Evidence: `src/daemon/registry.zig:402`, `src/daemon/registry.zig:773`, `src/daemon/registry.zig:815`.
-
-`MODLIST` is the worked example: it used to be a duplicate `CommandSpec` pointing at the same handler, which meant the two rows could silently drift apart. It is now an alias. Evidence: `src/daemon/modules/introspect.zig:326`.
-
-**`warden_class` is declarative today.** `WardenClass` maps a command to an anti-abuse cost class — `free` for keep-alives that must never be throttled, `normal` for ordinary verbs, `messaging` for fan-out, `channel_churn` for membership mutation. `Registry.wardenClassFor` resolves it through aliases and returns `null` for a verb the registry does not own, so a caller that gets `null` must fall back to its own default weight rather than treating the command as free. No `flood_guard` call site consumes it yet; wiring it is the follow-up described in [Not yet wired](#not-yet-wired). Evidence: `src/daemon/registry.zig:355`, `src/daemon/registry.zig:822`.
-
-## What the compiler proves
-
-`validate` runs over the module set and returns a `ValidationError` that `Registry` turns into a `@compileError`. Evidence: `src/daemon/registry.zig:600`, `src/daemon/registry.zig:654`, `src/daemon/registry.zig:753`.
-
-| Check | Rejected because | Evidence |
-| --- | --- | --- |
-| `duplicate_module` | Two modules share an `id`. | `src/daemon/registry.zig:890` |
-| `missing_dependency` | A `requires` entry names a module not in the set. | `src/daemon/registry.zig:891` |
-| `module_conflict` | Two mutually-exclusive modules are both enabled. | `src/daemon/registry.zig:892` |
-| `dependency_cycle` | `requires` edges form a cycle, so no load order exists. | `src/daemon/registry.zig:893` |
-| `duplicate_command` | Two modules claim the same verb. | `src/daemon/registry.zig:894` |
-| `duplicate_alias` | An alias collides with a canonical command or another alias, case-insensitively. | `src/daemon/registry.zig:895` |
-| `duplicate_cap` / `duplicate_channel_mode` / `duplicate_user_mode` / `duplicate_numeric` / `duplicate_stat` | Protocol surface collision. | `src/daemon/registry.zig:896`–`src/daemon/registry.zig:900` |
-
-Command and alias comparison is case-insensitive, matching IRC verb semantics: `MODLIST` and `modlist` are the same command, so declaring both is a collision rather than two commands.
-
-## Dependency-ordered load
-
-`loadOrder` is a comptime topological sort producing a permutation of manifest indices. Evidence: `src/daemon/registry.zig:1031`, `src/daemon/registry.zig:788`.
-
-Ordering rules, in precedence order:
-
-1. **Dependencies first.** A module never precedes anything in its `requires` (or a present `optional_requires`). This is the hard constraint — a cycle is a compile error rather than an arbitrary tiebreak.
-2. **Then `priority`.** Among modules whose dependencies are all satisfied, lower `Priority` wins: `first` before `early` before `normal` before `late` before `last`.
-3. **Then manifest order.** A stable, human-controlled final tiebreak, so the sequence is deterministic across builds.
-
-A dependency edge outranks priority: a `late` dependency still loads before its `first` dependent, because loading a dependent without its dependency is incorrect while running it slightly out of priority is merely unexpected.
-
-## Gated dispatch
-
-`dispatchGated` resolves a verb and enforces its declared contract before the handler is entered. Evidence: `src/daemon/registry.zig:831`.
-
-| Outcome | When | Evidence |
-| --- | --- | --- |
-| `.denied` | The caller does not meet `access`, or the command's `feature` is disabled. | `src/daemon/registry.zig:79`, `src/daemon/registry.zig:845` |
-| `.too_few_params` | Fewer parameters than `min_params`. | `src/daemon/registry.zig:89`, `src/daemon/registry.zig:848` |
-| `.not_found` | No canonical command or alias matches. | `src/daemon/registry.zig:86` |
-| handled | Everything checked; the handler ran. | `src/daemon/registry.zig:86` |
-
-Access and arity are enforced centrally, so a handler is only ever entered with its declared preconditions already true. Per-command privilege checks beyond `access` remain the handler's own responsibility — `oper_privilege` documents them, it does not enforce them.
-
-Lookup goes through a comptime `StaticStringMap` covering canonical names *and* aliases, so alias resolution costs the same as a canonical hit. Evidence: `src/daemon/registry.zig:773`.
-
-## The module bus
-
-`module_bus.Bus` is the typed event spine between modules: a module emits an event, subscribers see it in priority order, and no emitter needs to know who is listening. Evidence: `src/daemon/module_bus.zig:61`.
-
-Bindings are partitioned per `HookId` at comptime, so emitting an event iterates only that event's subscribers rather than filtering the whole hook table at runtime. Evidence: `src/daemon/module_bus.zig:69`, `src/daemon/module_bus.zig:199`.
-
-### Two dispatch functions, because errors mean different things
-
-The split is the reason this file exists rather than a single `emit`.
-
-| | `emit` | `approve` |
-| --- | --- | --- |
-| For | Informational events (`client_registered`, `mesh_peer_up`) | Veto-capable events (`message_pre_deliver`, `nick_pre_change`) |
-| Handler error | Counted and swallowed — a broken subscriber must not break the emitting path | **Fails closed**: the event is denied |
-| Denial | N/A | First denial wins and dispatch stops |
-| Wrong hook kind | — | **Compile error** |
-| Evidence | `src/daemon/module_bus.zig:88` | `src/daemon/module_bus.zig:123` |
-
-Passing an informational hook to `approve` is a compile error, because its payload has no `approved` field and the veto would be silently dropped. Evidence: `src/daemon/module_bus.zig:128`, `src/daemon/registry.zig:309`.
-
-**Veto finality.** `approve` returns at the first denial, so a later subscriber can never resurrect a denied event, and a handler that faults is treated as having denied it. Evidence: `src/daemon/module_bus.zig:138`, `src/daemon/module_bus.zig:146`.
-
-This is the behavioural difference from the older `Registry.callHook`, which is still what the live daemon calls. `callHook` propagates a handler error with `try`, aborting the emit and skipping every remaining subscriber. Evidence: `src/daemon/registry.zig:980`, `src/daemon/registry.zig:992`. At the `message_pre_deliver` site the error is caught and mapped to `.continue_`, then `approved` is read. Evidence: `src/daemon/server.zig:50487`, `src/daemon/server.zig:50489`. The consequence is fail-open: a subscriber that faults suppresses every veto that would have come after it, and the message is delivered. `Bus.approve` is the fail-closed replacement; the call sites have not been migrated yet ([Not yet wired](#not-yet-wired)).
-
-Per-hook counters (`emitted`, `vetoed`, `handler_errors`) are relaxed atomics read independently, so a concurrent emit may be reflected in some counters and not others. They are a statistics view and must never be used as a control input. Evidence: `src/daemon/module_bus.zig:43`, `src/daemon/module_bus.zig:157`.
-
-## The lifecycle driver
-
-`module_lifecycle.Lifecycle` drives phases, remembers how each module fared, and makes a configuration reload all-or-nothing. Evidence: `src/daemon/module_lifecycle.zig:160`.
-
-Like `Registry` and `Bus` it is a namespace over process-global state, not a handle: instantiating `Lifecycle(&manifest.enabled)` twice yields the same type and therefore the same health arrays, which is why the server can drive the phases and an introspection module can read the results without a pointer being threaded between them. Evidence: `src/daemon/module_lifecycle.zig:160`, `src/daemon/modules/introspect.zig:25`.
-
-### Phases
-
-| Phase | Driver | Order | Contract |
-| --- | --- | --- | --- |
-| `register` | `driveRegister` | dependency | Registration-time setup before any other phase. | 
-| `init` | `driveInit` | dependency | Startup work, before listeners are armed. |
-| `ready` | `driveReady` | dependency | After the server is accepting connections. |
-| `reload` | `driveReload` | dependency, with rollback | Re-derive cached policy from the new config. |
-| `deinit` | `driveDeinit` | **reverse** dependency | Teardown; cannot fail. |
-
-Evidence: `src/daemon/module_lifecycle.zig:46`, `src/daemon/module_lifecycle.zig:191`, `src/daemon/module_lifecycle.zig:196`, `src/daemon/module_lifecycle.zig:201`, `src/daemon/module_lifecycle.zig:254`, `src/daemon/module_lifecycle.zig:317`.
-
-Startup runs in dependency order so a module never initialises before something it requires; `deinit` runs in the exact reverse so a dependency outlives its dependents.
-
-**A failed phase quarantines the module.** A module whose phase returned an error is recorded `.failed` and skipped by every later phase: its invariants are unknown, so calling further phases on it would operate on state it never finished building. Registration deliberately does not fail the boot — refusing to start the daemon over one optional module's registration is a worse outcome than running without it. Evidence: `src/daemon/module_lifecycle.zig:187`, `src/daemon/module_lifecycle.zig:220`.
-
-### The REHASH contract
-
-A configuration reload is all-or-nothing across modules. If module N's `on_reload` fails, the driver restores the previous configuration through the caller's `RestoreFn` and re-invokes `on_reload` in reverse dependency order across every module that had already accepted it, leaving the daemon wholly on the old configuration rather than half-way between two. Evidence: `src/daemon/module_lifecycle.zig:254`, `src/daemon/module_lifecycle.zig:292`, `src/daemon/module_lifecycle.zig:144`.
-
-This is why **`on_reload` must be idempotent and must re-derive from configuration rather than apply a delta**: the rollback path calls it a second time with the configuration restored, and expects that to reproduce the prior state. Evidence: `src/daemon/module_lifecycle.zig:27`.
-
-Rollback deliberately continues past an error. A module left on the rejected configuration is worse than one that failed to rewind, so every module in the prefix is attempted and the first rewind failure is reported in `Failure.rollback_failed`. A non-null value there means the daemon could not be returned to a known-good state and the operator must restart rather than trust the running configuration. Evidence: `src/daemon/module_lifecycle.zig:248`, `src/daemon/module_lifecycle.zig:136`.
-
-`ReloadOutcome` reports which module refused, its error, how many modules were rewound, whether the restore callback ran, and whether any rewind itself failed. Evidence: `src/daemon/module_lifecycle.zig:108`, `src/daemon/module_lifecycle.zig:125`.
-
-REHASH must never drop or mutate live connections — it is a zero-disconnect operation. Evidence: `src/daemon/registry.zig:546`, `src/daemon/module_lifecycle.zig:253`.
-
-### What cannot hot-reload
-
-`on_reload` re-derives cached policy. It cannot change anything decided before or outside the module set:
-
-- **The module set itself.** Modules are a comptime list; enabling or disabling one is a rebuild, not a REHASH.
-- **Any comptime table** — commands, aliases, caps, modes, numerics, ISUPPORT, stats, hook bindings, load order. All are `const` in the binary.
-- **Listener sockets and the reactor topology** (`num_shards`), which are established at boot and owned by the reactor, not by a module.
-- **Anything a module captured by reference from the old configuration.** A module must value-copy the policy it caches; retaining a borrowed config slice across a REHASH leaves a dangling slice when the old configuration is freed.
-
-### Health
-
-Health is read by `MODULES` from any reactor thread while phases are driven single-threaded (startup and shutdown are pre/post-reactor; REHASH is primary-reactor-gated work). Every health field is therefore an independent relaxed atomic, and `last_error` is stored as an error *code* via `@intFromError` rather than a string, because an integer store is atomic where a `[]const u8` would not be. Evidence: `src/daemon/module_lifecycle.zig:32`, `src/daemon/module_lifecycle.zig:43`, `src/daemon/module_lifecycle.zig:395`.
-
-| `State` | Meaning | Evidence |
-| --- | --- | --- |
-| `unloaded` | No phase driven yet. | `src/daemon/module_lifecycle.zig:61` |
-| `registered` / `initialized` / `ready` | Passed that phase; `ready` is the steady state. | `src/daemon/module_lifecycle.zig:63`, `src/daemon/module_lifecycle.zig:65`, `src/daemon/module_lifecycle.zig:67` |
-| `failed` | A phase returned an error; `failed_phase` says which. | `src/daemon/module_lifecycle.zig:69` |
-| `stopped` | Torn down. | `src/daemon/module_lifecycle.zig:71` |
-
-`last_error` is deliberately **not** cleared by a later success, so an operator can still see that a past REHASH was rejected; `state` carries the current verdict. `reload_count` counts successful reloads only — rollback re-invocations are counted separately in `rollback_count` so they cannot inflate it. Evidence: `src/daemon/module_lifecycle.zig:88`, `src/daemon/module_lifecycle.zig:94`.
-
-`positionOf` is a comptime-built inverse of `load_order`, so mapping a manifest index to a load position is a table lookup with no scan and no `unreachable` — `load_order` is a permutation of `0..count` by construction. Evidence: `src/daemon/module_lifecycle.zig:377`, `src/daemon/module_lifecycle.zig:384`.
-
-## MODULES
-
-Oper-gated introspection over the whole system. `MODLIST` is an alias. Evidence: `src/daemon/modules/introspect.zig:326`, `src/daemon/modules/introspect.zig:329`.
-
-`MODULES` with no argument lists every module in dependency-resolved load order with its version, category, priority, runtime state and declared surface size, then a totals line covering modules, commands, aliases, hooks, and degraded count. A module in `.failed` is marked `DEGRADED`. Evidence: `src/daemon/modules/introspect.zig:118`, `src/daemon/modules/introspect.zig:133`, `src/daemon/modules/introspect.zig:145`.
-
-`MODULES <module-id>` shows one module's dependency edges, optional edges, conflicts, owned config blocks, full declared surface, and its lifecycle counters and last failure. Evidence: `src/daemon/modules/introspect.zig:61`, `src/daemon/modules/introspect.zig:98`.
-
-Gating is declarative, not hand-rolled in the handler: `access = .oper` makes the registry gate refuse a non-oper before `modules()` is ever entered, and the same field hides the verb from that caller's `COMMANDS` listing. Evidence: `src/daemon/modules/introspect.zig:327`, `src/daemon/modules/introspect.zig:162`.
-
-When no phase has been driven, every module reads `unloaded`. That is indistinguishable from "every module failed" if you only look at the state column, so `MODULES` emits an explicit note in that case rather than letting an operator misread a cold driver as a mass fault. Evidence: `src/daemon/module_lifecycle.zig:358`, `src/daemon/modules/introspect.zig:138`.
-
-## Test harness
-
-`module_harness.zig` builds synthetic modules whose lifecycle and hook behaviour is scripted by a `Probe`, so load order, REHASH rollback, and bus delivery are tested against a known graph rather than against whatever the real manifest happens to contain today. Evidence: `src/daemon/module_harness.zig:60`, `src/daemon/module_harness.zig:285`.
-
-The `Probe` records an ordered log of observable steps — `register`, `init`, `ready`, `reload`, `rewind`, `deinit`, `hook`, `restore` — and can inject a failure into a named module's phase or hook. It is fixed-capacity and allocation-free, and flags `overflowed` rather than silently truncating a sequence a test is about to assert on. Evidence: `src/daemon/module_harness.zig:36`, `src/daemon/module_harness.zig:60`.
-
-Distinguishing `reload` from `rewind` is what makes the rollback tests meaningful: both call the same `on_reload` handler, and only the probe's `in_rollback` flag tells them apart in the log. Evidence: `src/daemon/module_harness.zig:53`.
-
-Covered scenarios: dependency-ordered phases with reverse-ordered teardown; an `on_init` failure quarantining one module while the others proceed; a clean REHASH; a failed REHASH rolling back LIFO with config restore; a rollback that itself fails being reported without aborting the remaining rewinds; a REHASH with no restore hook reporting `restore_invoked=false`; informational bus delivery honouring priority and counting errors; veto finality and fail-closed handler errors on `approve`; and an empty subscriber set. Evidence: `src/daemon/module_harness.zig:316`, `src/daemon/module_harness.zig:368`, `src/daemon/module_harness.zig:414`, `src/daemon/module_harness.zig:546`, `src/daemon/module_harness.zig:592`, `src/daemon/module_harness.zig:617`.
-
-## Not yet wired
-
-The pieces below are implemented and tested but are not on the live daemon path. They are listed here so the gap is explicit rather than discovered.
-
-| Gap | Current live behaviour | What adoption requires |
-| --- | --- | --- |
-| Lifecycle driver | `server.zig` has its own inline walk that drives `on_init`/`on_ready` in **manifest** order, drives `on_deinit` in manifest order too, never calls `on_register` or `on_reload`, and records no health — so `MODULES` reports `unloaded`. Evidence: `src/daemon/server.zig:14424`, `src/daemon/server.zig:14437`. | Replace the body of `driveLifecycle`/`driveDeinit` with `Lifecycle.driveInit`/`driveReady`/`driveDeinit`, add `driveRegister` at boot, and call `driveReload` from the REHASH path with a `RestoreFn`. |
-| Module bus | Hook emission still goes through `Registry.callHook`, which aborts the chain on a handler error and is fail-open at the veto site. Evidence: `src/daemon/server.zig:14450`, `src/daemon/server.zig:50487`. | Route informational hooks through `Bus.emit` and `message_pre_deliver`/`nick_pre_change` through `Bus.approve`. The compile-time check on `approve` prevents mixing the two up. |
-| `warden_class` | No `flood_guard` call site consumes it; command weighting is unchanged. | Have the flood-guard weight lookup consult `Live.wardenClassFor(verb)` and fall back to its existing default on `null`. |
-| `config_blocks` | Declared and validated, but `[modules.*]` TOML sections are not yet routed to the owning module. | Route each parsed `[modules.<name>]` section to the module declaring it in `config_blocks`, and fail closed on a section no module owns. |
-
-Each of these is a `server.zig` edit, which is why they are staged separately from the module-side work.
+SerpentRegistry assembles the daemon command surface at compile time. A separate
+per-server runtime owns lifecycle health, reload staging, availability and hook
+counters. The [enabled manifest](../../src/daemon/modules/manifest.zig) lists the
+12 current modules; [the feature index](../reference/features.md) lists their
+commands and detailed references.
+
+## Declarations and compile-time validation
+
+[registry.zig](../../src/daemon/registry.zig) defines `Module`, `CommandSpec`,
+`HookBinding`, protocol metadata and stats-provider declarations. It rejects
+ambiguous command/alias ownership, duplicate modules and protocol identifiers,
+missing required dependencies, conflicts, cycles, invalid stat names and duplicate
+stats names/tokens. Dependencies precede dependents; priority and manifest order
+break independent ties.
+
+| Declaration | Meaning |
+|---|---|
+| `id`, `version`, `category`, `priority` | Stable identity, introspection and dependency-order tie breaking. |
+| `requires`, `optional_requires`, `conflicts` | Hard/soft ordering edges and incompatible module sets. |
+| `commands`, `hooks` | Typed dispatch and event subscriptions. |
+| `caps`, `chanmodes`, `usermodes`, `numerics`, `isupport` | Declared protocol metadata, checked for collisions. These do not replace the separate live CAP/ISUPPORT inventories. |
+| `stats` | Provider metadata and read callbacks; declaration support does not imply a live scrape integration. |
+| `config_blocks` | Module-owned config metadata; it does not create arbitrary accepted TOML keys. |
+| Lifecycle callbacks | Register/init/ready/deinit and configuration preparation/commit/abort contracts. |
+
+A command declares `name`, `min_params`, `access`, optional `feature`, `handler`,
+`aliases`, help/summary metadata and anti-abuse classification. Aliases resolve to
+the same spec, so they share the canonical arity, access and feature gates.
+`MODLIST` is an alias of `MODULES`. `oper_privilege` metadata does not replace the
+handler's privilege check. `warden_class` remains declarative: current daemon
+flood weighting does not call `Registry.wardenClassFor`.
+
+## Live runtime ownership
+
+[module_runtime.zig](../../src/daemon/module_runtime.zig) exposes `Runtime(mods)`
+as an instance with independent health rows, `Bus.Instance`, online state and
+configuration generation. Two server instances do not share those arrays. The
+older pure lifecycle helper in `module_lifecycle.zig` is useful for its own
+harness; it is not the live server's process-global health owner.
+
+`LinuxServer.ensureModuleRuntime` starts register, init and ready phases before
+command admission. Required-module failure stops startup and tears down initialized
+resources. Optional failures and dependent blocking remove those modules from
+availability; healthy modules can proceed. Shutdown runs teardown in reverse
+dependency order. Source: `Runtime.start`, `drivePhase`, `stop` and server startup.
+
+All registered daemon commands use `module_runtime.dispatch`, which combines
+module availability with access, feature and arity checks. `COMMANDS` lists only
+commands available to the caller; `COMMANDS <name>` gives one spec's metadata.
+A disabled or unavailable command cannot bypass its gate by using an alias.
+
+## Hooks and fail-closed approval
+
+[module_bus.zig](../../src/daemon/module_bus.zig) groups subscriptions by typed
+`HookId`. The live daemon calls `module_runtime.emit(.client_registered, ...)`
+for informational registration and `module_runtime.approve(.message_pre_deliver, ...)`
+for message approval.
+
+| Operation | Handler failure | Ordering and authority |
+|---|---|---|
+| `emit` | Counted; other eligible informational delivery can continue. | Informational notification, with runtime availability gates. |
+| `approve` | Denies the event. | First denial is final; a later subscriber cannot resurrect it. Wrong non-veto hook types fail at compile time. |
+
+The previous description of a live fail-open `Registry.callHook` message path is
+obsolete. The current `validateMessageText` path checks the runtime approval result
+before allowing delivery. Hook counters are observability, not authorization;
+relaxed atomic reads are not a transactional snapshot.
+
+## Configuration reload
+
+The World mutation lane serializes live command/hook policy and REHASH staging.
+`prepareModuleReload` prepares a candidate with a strictly advancing generation.
+`Runtime.prepareReload`, `commitReload` and `abortReload` provide the corresponding
+module transaction. Failed preparation must abort prepared callbacks and preserve
+the active configuration; successful publication advances the live generation.
+This lane does not itself pause all socket/background owners, so their separate
+ownership and reload contracts still apply.
+
+Module health belongs to the new runtime after Helix; it is not copied as stale
+process health. Adopted policy is validated separately before publication.
+Use the actual [config parser](../../src/daemon/config_format.zig) and
+[boot projection](../../src/daemon/config_boot.zig) to determine accepted sections.
+
+## Introspection and metrics
+
+`MODULES [id]` is operator-only and reports dependency order, state, availability,
+configuration generation, declared surfaces, reload/rollback counters and last
+failure. `OROWASM STATUS|ABI|WIT|PLUGINS` inspects the separate plugin host.
+Source: [introspect.zig](../../src/daemon/modules/introspect.zig).
+
+The metrics renderer exports runtime degradation/configuration-generation and
+hook-error/unavailable counters. The separate `Module.stats` provider table remains
+empty in the enabled manifest, and is not the current daemon scrape path; see the
+[stats-provider contract](../features/STATS-MODULES-UPGRADE.md).
+
+## Development and verification
+
+Declare a bounded module under `src/daemon/modules/`, add it to the manifest, and
+add explicit test references so its test blocks are discovered. Runtime integration
+must preserve the server's lock and lifecycle boundaries. The integrator owns
+`server.zig` changes. [module_harness.zig](../../src/daemon/module_harness.zig),
+`module_runtime.zig` and `module_bus.zig` cover ordering, required/optional startup
+failure, isolation, reload rollback, availability and veto behavior.
+
+Use [the testing guide](../guide/testing.md) for focused module/server checks and
+full ship gates. A registry compile success proves static declarations; it does
+not prove a callback's runtime effects or a new external capability's interoperability.

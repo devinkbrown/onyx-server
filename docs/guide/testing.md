@@ -225,3 +225,5 @@ When config files changed, also run:
 ```sh
 zig build run -- --check-config etc/onyx-server.reference.toml
 ```
+
+Source of truth: `build.zig`, `tools/parallel_tests.py`, `tools/verbose_test_runner.zig`, the gate receipts linked by the [release audit](../audit/release-and-test-speed-2026-11-03.md), and the emitted suite inventories. Current installed fleet facts live in [production paths](../ops/onyx-server-paths.md); platform-specific tests retain their recorded scope.

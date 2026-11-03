@@ -9,14 +9,14 @@ Status legend:
 
 | Status | Meaning |
 |---|---|
-| Implemented | Complete and live. |
+| Implemented | A source implementation exists at the listed surface; configuration, handler and client gates still apply. This is not full external-spec conformance certification. |
 | In-flight | Partially implemented or under active work. |
 | TODO | Planned, not yet started. |
 | Removed | Intentionally excluded (clean-room, no legacy). |
 
 | IRCv3 extension | Onyx Server | Status |
 |---|---|---|
-| capability-negotiation | `proto/cap.zig` | Implemented |
+| capability-negotiation | `proto/live_cap_metadata.zig` + `daemon/dispatch.zig` | Implemented |
 | message-tags | `proto/irc_line.zig` (parse) + `proto/msgtags.zig` (emit) | Implemented |
 | server-time | `proto/msgtags.zig` | Implemented |
 | account-tag | `proto/msgtags.zig` | Implemented |
@@ -55,15 +55,17 @@ Status legend:
 | utf8only | `proto/utf8_only.zig` (strict UTF-8 + UTF8ONLY isupport + FAIL) | Implemented (wired into dispatch) |
 | netsplit / netjoin | `proto/netsplit_batch.zig` + mesh peer drop/roster bursts | Implemented |
 | metadata-2 | `proto/metadata_store.zig` + `METADATA` handler | Implemented |
-| oper-tag | ties to clean-room `daemon/oper.zig` | TODO |
+| oper-tag | No live CAP advertisement in `live_cap_metadata.zig` | Not advertised |
 | network-icon | `[network] icon_url` -> `NETWORKICON` ISUPPORT | Implemented |
 | account-notify | `proto/account_notify.zig` | Implemented (wired into dispatch) |
 | webirc | — | Removed (clean-room: WebSocket only) |
 | deprecated: tls (STARTTLS), sasl-dh-* | — | Removed (TLS-native / modern SASL) |
 
-Notes: `metadata` (IRCv3) and IRCX `PROP` are two takes on the same idea — Onyx Server exposes one
-unified property system (lean IRCX `PROP` with a metadata-compatible view). `oper-tag` integrates with
-the SASL-only oper system. `labeled-response` rides the `batch` machinery.
+IRCv3 `METADATA` and IRCX `PROP` have separate command/store contracts; do not
+assume a write through one creates every view in the other. Account-derived
+operator authority is separate from advertising `oper-tag`. `labeled-response`
+uses BATCH framing. The [live CAP reference](protocol/caps.md) is authoritative
+for names the daemon actually advertises.
 
 ## WebSocket application protocols
 

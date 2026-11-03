@@ -1,21 +1,22 @@
 # Source-module ownership
 
-The stable entry files below expose canonical types and functions through aliases.
-Implementation files sit beside each entry in a same-named directory. A facade
-owns no duplicate mutable state. Command dispatch and runtime module registration
-are separate systems described in [World, dispatch and modules](02-world-dispatch-modules.md).
+The live import graph determines ownership. Several entry files now delegate to
+same-named directories; others still own their definitions despite adjacent
+extraction candidates. The existence of a directory or a matching struct does
+not establish that runtime callers use it. Command registry modules are a
+separate system described in [the module system](MODULE-SYSTEM.md).
 
 | Entry | Implementation boundaries | Ownership rule |
 | --- | --- | --- |
-| `src/daemon/server.zig` | Configuration values in `server_config.zig`; native upgrade value contracts in `native_upgrade_contracts.zig`; Linux keepalive values in `client_socket_policy.zig` | Runtime ownership and transaction bodies remain in the server. This is a partial extraction, with canonical aliases preserving callers. |
-| `src/daemon/config_format.zig` | Canonical model/defaults, resolver/error contracts, ordered TOML projection, typed value/authority/mesh/listener helpers, and topical tests | Keep one Config type and preserve allocation, validation, and error order in the projection transaction. Sibling helpers are not facade exports. |
+| `src/daemon/server.zig` | Live daemon configuration, lifecycle and transaction bodies; imports individual typed contracts/helpers as needed | Integrator is the sole writer. Do not assume a nearby candidate configuration file replaces the live `Config` definition. |
+| `src/daemon/config_format.zig` | Defines the actual live `Config`, defaults, resolver/error contracts, `parseToml` and tests | Its current implementation does not import `config_format/model.zig` or `projection.zig`. Those adjacent candidates can drift and are not the live configuration authority. |
 | `src/proto/dns.zig` | Wire/name validation, response interpretation, query deadlines and transport, configuration, result cache, confirmation | Results own their names and addresses; every socket and retry remains inside its absolute deadline. See [DNS](dns.md). |
 | `src/proto/lotus.zig` | Retained-message store, canonical types, checkpoint codec, and history/exact-once tests | Keep wire definitions canonical and preserve protocol identities. |
 | `src/proto/ircx_prop_store.zig` | Property contracts, storage operations, and codecs | Retain property authorization and canonical encoding at their existing boundaries. |
 | `src/daemon/store.zig` | Storage owner, records, WAL/snapshot codecs, platform file custody, and focused tests | Prepare fallible state before durable writes; publish prepared mutations without allocation. |
-| `src/daemon/services.zig` | One owner plus typed account, credential, channel, session, device, and operator domains | Domain contexts borrow original field addresses. They do not copy mutable fields before acquiring the original lock. |
+| `src/daemon/services.zig` | Live Services owner and account, credential, channel, session, device and operator implementation | Current entry still owns its definitions; the same-named extraction directory is not imported by it. Preserve the original lock and publication order. |
 | `src/daemon/relay_v2_event_log.zig` | Event-log owner, rows, checkpoint codec, and tests | Keep canonical event bytes and accepted custody together; decoding must not partially publish. |
-| `src/daemon/attachment_delivery_spool.zig` | Spool owner, record model, policy, strict checkpoint codec, and tests | Prepared batches and attachment transfers remain with the owning spool and its no-fail commit boundary. |
+| `src/daemon/attachment_delivery_spool.zig` | Live spool owner, record model, policy, strict checkpoint codec and tests | The entry owns its current definitions. Prepared batches/transfers must remain with the same spool and no-fail commit boundary. |
 | `src/daemon/mail_sender.zig` | One mail worker, message assembly, relay resolution, socket/TLS exchange, snapshots, and retained failure-journal checks | Accepted jobs and ambiguous failure receipts stay with the worker; private journal identity and publication order remain unchanged. |
 | `src/daemon/http_fetch.zig` | Request policy, URL parsing, TLS exchange, DNS resolution, native sockets, and Windows resolver ABI | Preserve resolved-address pinning, TLS identity, native callback lifetime, and owned socket cleanup. |
 

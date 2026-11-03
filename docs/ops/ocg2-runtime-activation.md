@@ -66,3 +66,5 @@ projects it. OCG1 `GRANT` / `REVOKE` stays display-only.
 
 Never place an authority private key in the TOML file. The configured tuple is
 public-only; authority identity is bound to the already-provisioned node key.
+
+Source of truth: `src/daemon/config_format.zig`, `src/daemon/ocg2_runtime.zig`, the OCG2 authority/projection leaves, and `[oper.ocg2]` in the [reference configuration](../../etc/onyx-server.reference.toml). Current installed fleet facts live in [production paths](onyx-server-paths.md); platform-specific tests retain their recorded scope.

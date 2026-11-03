@@ -1049,8 +1049,8 @@ fn loadFromTextImpl(
 
     // Role-based operator groups: build a transient registry from `[[oper_groups]]`
     // (each a named privilege set, optionally inheriting another). An oper's
-    // privileges are then resolved from its `class` group; an oper whose class
-    // names no group falls back to full privileges (back-compatible default).
+    // privileges are resolved from its `class` group, including inheritance.
+    // Empty/unknown groups and groups with no effective privileges are skipped.
     var groups = og_mod.Registry.init();
     defer groups.deinit(allocator);
     for (parsed.oper_groups) |g| {
@@ -1070,7 +1070,7 @@ fn loadFromTextImpl(
         // sees why the stale definition is still winning — instead of a silent
         // no-op at boot/REHASH. `DuplicateGroup` carries the offending name.
         groups.add(allocator, g.name, oper_mod.OperPrivileges.initMany(pbuf[0..pn]), if (g.inherits.len > 0) g.inherits else null) catch |err|
-            dlog.log("orochi: dropping oper group '{s}': {s}\n", .{ g.name, @errorName(err) });
+            dlog.log("onyx-server: dropping oper group '{s}': {s}\n", .{ g.name, @errorName(err) });
     }
 
     // Build the SASL-only operator registry from `[[opers]]` blocks.

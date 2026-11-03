@@ -2,14 +2,13 @@
 # SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Run the 0.7 measurement harness and print a baseline block for the current
-# build.zig.zon manifest version (release plan P0-1, wave W1-1).
+# Run the measurement harness and print a baseline for the current
+# build.zig.zon source version.
 #
 # The harness itself (src/substrate/bench.zig) knows nothing about the machine it
 # runs on beyond arch/OS/CPU-count. This wrapper adds the facts that make a
 # baseline comparable later — CPU model, kernel, CPU governor, load average — and
-# runs the harness TWICE, because the release plan's acceptance criterion is a
-# baseline that reproduces across two consecutive runs. A baseline is
+# runs the harness TWICE to make repeatability visible across consecutive runs. A baseline is
 # machine-specific: report deltas only against a same-machine baseline.
 #
 # Usage:
@@ -68,7 +67,7 @@ emit() {
   echo "# Benchmark baseline — onyx-server ${MANIFEST_VERSION}"
   echo
   echo "Produced by \`tools/bench.sh\` (\`zig build bench\`, harness:"
-  echo "\`src/substrate/bench.zig\`). Release plan P0-1 / wave W1-1."
+  echo "\`src/substrate/bench.zig\`). Capture provenance and compare only equivalent profiles."
   echo
   echo '## Provenance'
   echo

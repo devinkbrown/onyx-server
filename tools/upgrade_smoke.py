@@ -19,9 +19,9 @@ Usage:
 
 A two-argument run copies the predecessor into a private launch path, boots
 it, atomically replaces that path with the successor, then issues UPGRADE.
-That is the staged 0.5.8 → 0.7 Helix rehearsal. Set `ONYX_HELIX_TRIGGER=usr2`
+This exercises the supplied predecessor/successor pair. Set `ONYX_HELIX_TRIGGER=usr2`
 to send SIGUSR2 instead of the UPGRADE command (same `performUpgrade` path).
-Never touches orochi.service.
+Never touches an installed service or production runtime.
 
 Exit code 0 = PASS.
 """
@@ -482,7 +482,7 @@ def _run_smoke():
 
     if os.environ.get("ONYX_HELIX_TRIGGER", "upgrade").lower() == "usr2":
         os.kill(proc.pid, signal.SIGUSR2)
-        print("note: sent SIGUSR2 (same performUpgrade path as orochi.service reload)")
+        print("note: sent SIGUSR2 (same performUpgrade path as onyx-server.service reload)")
         b.close()
     else:
         b.sendall(b"UPGRADE\r\n")

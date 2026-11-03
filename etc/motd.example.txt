@@ -1,11 +1,7 @@
 {greeting}, {nick} — welcome to {network}!
 
-       ___                 _     _
-      / _ \ _ __ ___   ___| |__ (_)
-     | | | | '__/ _ \ / __| '_ \| |
-     | |_| | | | (_) | (__| | | | |
-      \___/|_|  \___/ \___|_| |_|_|    大蛇
-
+  O N Y X
+  Onyx Server — IRC and browser chat over a secured mesh.
   {if:place}Connecting from {city|somewhere}{if:region}, {region}{/if}{if:country} ({country}){/if}.
   {/if}{users} {plural:users:person:people} online{if:servers>1} across {servers} servers{/if}, {channels} {plural:channels:channel:channels} open.
   This node: {local_users} local, {opers} {plural:opers:operator:operators}. You have been here {online|0s}.

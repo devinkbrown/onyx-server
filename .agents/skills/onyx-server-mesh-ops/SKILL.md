@@ -26,7 +26,7 @@ curl -sS http://127.0.0.1:9130/metrics | grep -E 'onyx_s2s_(tcp_active|links_act
 MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics
 
 # Cross-node PRIVMSG (guest auto if SASL unset; force SASL with MESH_SMOKE_REQUIRE_SASL=1)
-MESH_SMOKE_B=ircx.us:6697 MESH_SMOKE_INSECURE_TLS=1 python3 tools/mesh_chat_smoke.py
+MESH_SMOKE_B=ircx.us:6697 MESH_SMOKE_INSECURE_TLS=0 python3 tools/mesh_chat_smoke.py
 # With credentials:
 # export MESH_SMOKE_SASL_USER=… MESH_SMOKE_SASL_PASS=…
 ```
@@ -40,7 +40,12 @@ MESH_SMOKE_B=ircx.us:6697 MESH_SMOKE_INSECURE_TLS=1 python3 tools/mesh_chat_smok
 | health green, chat fail | SASL required / guest blocked / channel ACL | chat smoke exit 2 vs 1 |
 
 ## Deploy slice for mesh-touching binaries
-1. `zig build -Doptimize=ReleaseSafe`
+
+Use the authorized release workflow and canonical `docs/ops/onyx-server-paths.md`
+receipt. Local service control is OpenRC; the peer uses systemd. These steps
+supplement the full gates and artifact provenance required by that workflow.
+
+1. `zig build -Doptimize=safe`
 2. `strings zig-out/bin/onyx-server | grep -E 'onyx_s2s_tcp_active|mesh S2S established'`
 3. Stage → `--check-config` per node → install → Helix or hard-restart **one node at a time**
 4. Wait AKE (metrics may show links=0 for a few seconds)

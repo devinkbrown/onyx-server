@@ -1,4 +1,4 @@
 interface:
   display_name: "Onyx Server Release and Deploy"
-  short_description: "Release and hard-restart both mesh nodes"
-  default_prompt: "Use $onyx-server-release-deploy to verify, deploy, hard-restart, accept, document, and publish Onyx Server in order."
+  short_description: "Release and accept both mesh nodes safely"
+  default_prompt: "Use $onyx-server-release-deploy to verify, deploy with the compatible restart strategy, accept, document, and publish Onyx Server in order."

@@ -380,3 +380,5 @@ media and native-media ports, advertised host, STUN settings, and WebSocket medi
 configuration are shown as configured values, not proof that any transport or
 fallback works. If the network requires a relay, provision and test a compatible
 relay separately.
+
+Source of truth: `src/main.zig`, `src/setup_review.zig`, `src/setup_workflow.zig`, `src/setup_bundle.zig`, `src/setup_maintenance_linux.zig` and `src/daemon/service_environment.zig`. Current installed fleet facts live in [production paths](../ops/onyx-server-paths.md); platform-specific tests retain their recorded scope.

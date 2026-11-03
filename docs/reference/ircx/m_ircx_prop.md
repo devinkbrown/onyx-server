@@ -11,7 +11,7 @@ property store, access ladder, and reply builders live in
 Computed user properties come from
 [`src/proto/ircx_prop_providers.zig`](../../../src/proto/ircx_prop_providers.zig).
 
-> **GOTCHA:** `PROP` is an IRCX-family command. The session must opt in with
+> `PROP` is an IRCX-family command. The session must opt in with
 > `IRCX`/`ISIRCX`/`MODE ISIRCX` first; otherwise the dispatch gate replies
 > `421 ERR_UNKNOWNCOMMAND` (`IRCX command requires ISIRCX`).
 
@@ -68,3 +68,12 @@ PROP #zig SUBJECT :             ; delete SUBJECT
 PROP #zig:alice ROLE :greeter   ; a member property
 PROP bob BIO :hi there          ; a user property (self only)
 ```
+
+## Policy and publication boundary
+
+A property name being accepted by a generic store does not guarantee that a live
+consumer enforces it. Computed built-ins, secret key reads, mode-linked writes and
+policy properties use their specific provider/handler rules. Mesh propagation
+must preserve the original signed fact and its revision; signing does not bypass
+write authorization. See [channel policy properties](m_ircx_prop_channel_builtins.md)
+and [mesh security](../../architecture/mesh-security.md).

@@ -220,3 +220,19 @@ FIFO bytes and relative order remain unchanged. Capture refuses an active job,
 and restore reconstructs runtime reservations from the validated FIFO. These
 repairs preserve the existing checkpoint layout and do not infer work ownership
 from timestamps or change the legacy cache's thirty-minute lifetime policy.
+
+## Worker integration example
+
+Use the stable `src/proto/dns.zig` entry from a resolver worker with a validated
+`ResolverConfig`:
+
+```zig
+const result = try dns.resolve(&resolver_config, "example.test", .a, .{});
+// Inspect result.outcome and validated TTL metadata before caching it.
+```
+
+The configured worker owns the deadline and native socket lifetime; calling this
+synchronously from a reactor still blocks that reactor. Do not treat NXDOMAIN,
+NODATA, timeout and an unconfirmed PTR observation as the same authoritative fact.
+The legacy `resolveForward` wrapper writes into caller-provided address storage;
+use the detailed result API when a consumer needs exact outcome/TTL distinctions.

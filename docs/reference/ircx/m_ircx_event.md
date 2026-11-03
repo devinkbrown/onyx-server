@@ -2,8 +2,7 @@
 
 _The IRCX `EVENT` command — client/operator subscription control over Onyx Server's typed event planes. Concise command reference; for the full model see [event-spine.md](../../architecture/event-spine.md)._
 
-Onyx Server has no `modules/` directory and no pseudo-clients. `EVENT` is a real
-server command registered in the SerpentRegistry module table
+`EVENT` is a built-in server command registered in the SerpentRegistry module table
 [`src/daemon/modules/ircx.zig`](../../../src/daemon/modules/ircx.zig) as a thin
 thunk over `LinuxServer.handleEvent` in
 [`src/daemon/server.zig`](../../../src/daemon/server.zig). It is an IRCX-family

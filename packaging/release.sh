@@ -16,7 +16,8 @@
 # against the manifest.
 #
 # Graceful degradation (no network, no hard tool deps):
-#   * cosign absent / unconfigured → signing is skipped with a note (never fails).
+#   * no signer configured → unsigned manifest with an explicit note.
+#   * signer configured but cosign absent → fail; never silently publish unsigned.
 #   * jq   absent                  → JSON validation is skipped with a note.
 # Requires `git`, `zig`, `sha256sum`, and Python 3.
 #
@@ -137,11 +138,10 @@ echo "release: SBOM → $OUT/onyx-server.cdx.json (0 external components)"
 # exact build command + toolchain), and BY WHOM (this script as the builder).
 # Timestamps are the commit's committer date, keeping the document reproducible.
 #
-# Trust level: this is SLSA-provenance-shaped and, once cosign-signs SHA256SUMS
-# (which lists this file's digest), AUTHENTICATED — the local-builder equivalent
-# of L2. Running the same steps on a hosted runner (e.g. the slsa-github-generator
-# GitHub Action) with an isolated builder identity is what elevates it to true
-# SLSA L2/L3; the field shapes here are drop-in compatible with that upgrade.
+# This local document records reproducible build inputs; it does not establish
+# a SLSA assurance level. A configured signature authenticates its manifest under
+# that signer identity. Hosted-builder isolation/identity need independent
+# verification; schema shape alone does not provide those guarantees.
 cat > "$OUT/onyx-server.provenance.json" <<JSON
 {
   "_type": "https://in-toto.io/Statement/v1",

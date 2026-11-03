@@ -1,14 +1,11 @@
 # Credential domains
 
-This is a source contract for the **0.9.0 source tree**, audited on
-2026-10-26 and refreshed against the integrated W53 source on 2026-10-29,
-then re-based on 2026-11-01. The recorded production image is now
-**0.9.0+066d9b8356be-dirty** on both nodes; confirm deployment separately against
-[the runtime paths record](../ops/onyx-server-paths.md). Tests linked below are
-source evidence, not a new test run or release acceptance receipt. The W52 and
-W53 recovery/storage corrections have separate focused Debug/Safe receipts in
-the [wave execution record](../ops/roadmap-wave-execution-2026-10-26.md); they do
-not establish a green full suite for the current candidate.
+This is a source contract for the **0.9.0 source tree**, reconciled on
+2026-11-03 after the accepted release. Both production nodes run
+`0.9.0+c730d9f37b01`; [the release audit](../audit/release-and-test-speed-2026-11-03.md)
+separates the daemon revision, service-kit correction and later test-only changes.
+Tests cited here explain invariants; they are not individual live acceptance
+receipts. Current runtime paths and hashes remain in [the operations record](../ops/onyx-server-paths.md).
 
 Credentials with similar names are not interchangeable. An account credential
 establishes an account; a resume credential selects retained session authority;
@@ -26,33 +23,33 @@ account, trust, lifecycle, and revocation checks.
 | `srm2m.<sealed>.<attachment>`, SRM2 | Issuer signs an attachment claim; the live receiver verifies it and restores only at the issuer or redirects. Envelope decoding alone does not verify the signature. | Signed account/group/AID/origin/destination/kind/time/nonce authority. Current exact-restore issuance binds destination to issuer; another node cannot restore a same-token local row. Default claim maximum is 12 hours in milliseconds. Destination countersignatures and consume replay/conflict handling exist separately in the codec and are not activated by this live path. |
 | `SESSIONTOKEN`, SASL `SESSION-TOKEN` (`sst_…`) | Account Services issues 16 random bytes encoded as `sst_` plus 32 lowercase hex characters. SASL callback validates account name, current durable binding, hash, account status, and expiry. | Account-login continuation, independent of attachment resume. Default TTL is 30 days in **Unix seconds**; rejected when `expires_unix <= now_unix`. Reissue rotates the account's current token. |
 
-Local identity and issuance: [sessions.zig:23](../../src/daemon/sessions.zig#L23),
-[row contract:165](../../src/daemon/sessions.zig#L165),
-[random minting:1912](../../src/daemon/sessions.zig#L1912),
-[authenticated command dispatch:53048](../../src/daemon/server.zig#L53048),
-[TOKEN rendering:53103](../../src/daemon/server.zig#L53103), and
-[resume dispatch:53280](../../src/daemon/server.zig#L53280).
+Local identity and issuance: [sessions.zig](../../src/daemon/sessions.zig),
+[row contract](../../src/daemon/sessions.zig),
+[random minting](../../src/daemon/sessions.zig),
+[authenticated command dispatch](../../src/daemon/server.zig),
+[TOKEN rendering](../../src/daemon/server.zig), and
+[resume dispatch](../../src/daemon/server.zig).
 Composite issuance is configurable and defaults off; do not infer the envelope
 from client capability alone
-([Config:2516](../../src/daemon/server.zig#L2516)).
-The [envelope codec:18](../../src/proto/session_resume_credential.zig#L18)
+([Config](../../src/daemon/server.zig)).
+The [envelope codec](../../src/proto/session_resume_credential.zig)
 requires canonical field structure and rejects zero credentials/AIDs.
 
 Portable issuance and clocks are in
-[server.zig:51529](../../src/daemon/server.zig#L51529),
-[SRM1 issuer:51562](../../src/daemon/server.zig#L51562), and
-[SRM2 issuer:51599](../../src/daemon/server.zig#L51599).
-The [SRM1 opener:240](../../src/proto/session_reclaim_mesh.zig#L240)
+[server.zig](../../src/daemon/server.zig),
+[SRM1 issuer](../../src/daemon/server.zig), and
+[SRM2 issuer](../../src/daemon/server.zig).
+The [SRM1 opener](../../src/proto/session_reclaim_mesh.zig)
 checks integrity and time. Current live SRM1 resumes are reusable within their
-TTL ([live reclaim handler:53526](../../src/daemon/server.zig#L53526)). The
-[replay ring:310](../../src/proto/session_reclaim_mesh.zig#L310) supports legacy
+TTL ([live reclaim handler](../../src/daemon/server.zig)). The
+[replay ring](../../src/proto/session_reclaim_mesh.zig) supports legacy
 consume handling; it does not make those current resumes one-shot
-([legacy convergence:54832](../../src/daemon/server.zig#L54832)). SRM2's codec uses distinct
+([legacy convergence](../../src/daemon/server.zig)). SRM2's codec uses distinct
 `onyx-session-reclaim-attachment-claim-v2` and
 `onyx-session-reclaim-attachment-consume-v2` signature domains and distinguishes
 `create_new` from `exact_restore`
-([codec:30](../../src/proto/session_reclaim_attachment.zig#L30)). The live
-[exact-reclaim handler:53450](../../src/daemon/server.zig#L53450) verifies the
+([codec](../../src/proto/session_reclaim_attachment.zig)). The live
+[exact-reclaim handler](../../src/daemon/server.zig) verifies the
 claim and trusted route, then restores locally or redirects; it does not call
 the codec's countersigned consume or replay-store admission. Codec replay and
 conflict tests therefore do not establish those live guarantees. Physical
@@ -65,22 +62,22 @@ replicas can contain it: a signature provides integrity, not encryption.
 Use protected client signaling and secured mesh transport; never log credential
 bytes. The local command entry shown above checks account authentication; it
 does **not** establish a universal TLS-only transport policy. In contrast,
-[account-token issuance:48520](../../src/daemon/server.zig#L48520) explicitly
+[account-token issuance](../../src/daemon/server.zig) explicitly
 requires `conn.is_tls` and obtains Unix wall time before rotating credentials.
 Account-token persistence stores SHA-256 token digests and the current-account
 binding, not the plaintext token
-([Services:2644](../../src/daemon/services.zig#L2644));
-[validation:2707](../../src/daemon/services.zig#L2707) refuses orphan records,
+([Services](../../src/daemon/services.zig));
+[validation](../../src/daemon/services.zig) refuses orphan records,
 expired tokens, suspended/forbidden accounts, and passkey-only accounts.
 
 Relevant tests:
-[account issue/hash/expiry:6603](../../src/daemon/services.zig#L6603),
-[orphan-record refusal:6625](../../src/daemon/services.zig#L6625),
-[actual account command/cold reopen:102004](../../src/daemon/server.zig#L102004),
-[non-TLS refusal:102085](../../src/daemon/server.zig#L102085),
-[SRM2 codec vectors:591](../../src/proto/session_reclaim_attachment.zig#L591),
-[time boundaries:752](../../src/proto/session_reclaim_attachment.zig#L752), and
-[physical replay isolation:790](../../src/proto/session_reclaim_attachment.zig#L790).
+[account issue/hash/expiry](../../src/daemon/services.zig),
+[orphan-record refusal](../../src/daemon/services.zig),
+[actual account command/cold reopen](../../src/daemon/server.zig),
+[non-TLS refusal](../../src/daemon/server.zig),
+[SRM2 codec vectors](../../src/proto/session_reclaim_attachment.zig),
+[time boundaries](../../src/proto/session_reclaim_attachment.zig), and
+[physical replay isolation](../../src/proto/session_reclaim_attachment.zig).
 
 ## Signed replica statements and permanent denials
 
@@ -91,52 +88,52 @@ account binding. The token embedded in a record remains secret.
 
 The current token-family codec has separate offer, ACK, and attachment-lease
 Ed25519 contexts
-([session_replica.zig:47](../../src/daemon/helix/session_replica.zig#L47)).
+([session_replica.zig](../../src/daemon/helix/session_replica.zig)).
 Frozen operations 1/2 remain upsert/remove; operation 3 carries explicit signed
 `resume_eligible`. False means inventory-only, with empty nick/restore snapshot;
 metadata, a positive lease, or an ACK cannot promote it into remote resume
 authority. Operation 4 is a terminal logical-group revoke. See
-[canonical validation:550](../../src/daemon/helix/session_replica.zig#L550) and
-[eligibility regression:6825](../../src/daemon/helix/session_replica.zig#L6825).
+[canonical validation](../../src/daemon/helix/session_replica.zig) and
+[eligibility regression](../../src/daemon/helix/session_replica.zig).
 The separate SRA3 physical-attachment family has its own offer/ACK/revoke/lease
 contexts; its version/capability negotiation does not authorize another family
-([session_replica_attachment.zig:32](../../src/daemon/helix/session_replica_attachment.zig#L32)).
+([session_replica_attachment.zig](../../src/daemon/helix/session_replica_attachment.zig)).
 
 Daemon offers use the 12-hour wall-clock horizon; positive attachment leases are
 90 seconds, renewed every 30 seconds. Store library defaults differ from daemon
 configuration and are not an issuance promise
-([daemon configuration:6290](../../src/daemon/server.zig#L6290),
-[lease contract:51529](../../src/daemon/server.zig#L51529),
-[Store defaults:835](../../src/daemon/helix/session_replica.zig#L835)).
+([daemon configuration](../../src/daemon/server.zig),
+[lease contract](../../src/daemon/server.zig),
+[Store defaults](../../src/daemon/helix/session_replica.zig)).
 Typed ACK 8 is current group-fence enforcement readiness, **not** physical
 inventory completeness; ACK 9 acknowledges durable group denial. Both bind
 membership epoch and full roster digest. Daemon readiness receipts last 90
 seconds; other group receipts last 30 seconds, with expiry checked before
 coverage is counted
-([receipt admission:52732](../../src/daemon/server.zig#L52732),
-[issuance:52766](../../src/daemon/server.zig#L52766)).
+([receipt admission](../../src/daemon/server.zig),
+[issuance](../../src/daemon/server.zig)).
 
 A retained group-denial fact is permanent even after its signed transport
 expiry: no newer offer/lease, account spelling change, GC, or replay may clear
 it. First canonical signed fact remains immutable. Persistence uses the
 existing private account OroStore namespace and a BLAKE3-derived token key;
 the value is signed wire containing private account/token data
-([durable adapter:35](../../src/daemon/session_group_revoke_durable.zig#L35),
-[write-once commit:68](../../src/daemon/session_group_revoke_durable.zig#L68)).
+([durable adapter](../../src/daemon/session_group_revoke_durable.zig),
+[write-once commit](../../src/daemon/session_group_revoke_durable.zig)).
 Retired-signing authority is an exact `(group_key, issuer_key, fact_digest)` pin,
 not permission to accept new signatures from that retired key. Required groups
 must survive both cold restore and Helix verification
-([authorization:95](../../src/daemon/session_group_revoke_durable.zig#L95),
-[restore:128](../../src/daemon/session_group_revoke_durable.zig#L128),
-[retained verification:158](../../src/daemon/session_group_revoke_durable.zig#L158)).
+([authorization](../../src/daemon/session_group_revoke_durable.zig),
+[restore](../../src/daemon/session_group_revoke_durable.zig),
+[retained verification](../../src/daemon/session_group_revoke_durable.zig)).
 The retirement fact digest has a separate fixed domain; these digests/public
 keys are exportable identifiers, not bearer credentials.
 
 Relevant tests:
-[permanent fence/OOM staging:6397](../../src/daemon/helix/session_replica.zig#L6397),
-[durable ambiguity:319](../../src/daemon/session_group_revoke_durable.zig#L319),
-[exact retired pins:401](../../src/daemon/session_group_revoke_durable.zig#L401),
-[missing required facts:490](../../src/daemon/session_group_revoke_durable.zig#L490).
+[permanent fence/OOM staging](../../src/daemon/helix/session_replica.zig),
+[durable ambiguity](../../src/daemon/session_group_revoke_durable.zig),
+[exact retired pins](../../src/daemon/session_group_revoke_durable.zig),
+[missing required facts](../../src/daemon/session_group_revoke_durable.zig).
 
 ## Media credentials
 
@@ -144,43 +141,43 @@ Candidate physical endpoint issuance requires the actual caller's membership,
 original routing owner, and protected signaling custody. Host candidates,
 stream IDs, codec advertisements, or a capability label do not prove membership
 or possession. Logical JOIN alone creates no MAC key/UDP offer
-([caller gate:58736](../../src/daemon/server.zig#L58736),
-[logical JOIN:70789](../../src/daemon/server.zig#L70789)).
+([caller gate](../../src/daemon/server.zig),
+[logical JOIN](../../src/daemon/server.zig)).
 
 Current native endpoint `NATIVE-MACKEY` reveals a private 32-byte master via the
 protected caller reply. It derives four keys bound to the issued nonzero stream:
 client→server/server→client frame and feedback purposes have different HMAC
 labels. Neither a master-direct tag nor the opposite direction's key is valid
 ingress authority
-([capability derivation:4](../../src/substrate/media_capability.zig#L4),
-[actual secret rendering:71132](../../src/daemon/server.zig#L71132),
-[ingress regression:3149](../../src/daemon/native_media_transport.zig#L3149)).
+([capability derivation](../../src/substrate/media_capability.zig),
+[actual secret rendering](../../src/daemon/server.zig),
+[ingress regression](../../src/daemon/native_media_transport.zig)).
 The older `(channel,participant)` derived MAC lane remains separately present
-([legacy derivation:248](../../src/substrate/cadence_frame.zig#L248)); do not
+([legacy derivation](../../src/substrate/cadence_frame.zig)); do not
 substitute that key for a current physical endpoint master.
 Browser `MACKEY` is also caller-only protected signaling output
-([issuer:58441](../../src/daemon/server.zig#L58441)); it is not a session credential.
+([issuer](../../src/daemon/server.zig)); it is not a session credential.
 
 ICE ufrag/password authenticate endpoint STUN checks; ufrag is a lookup name,
 password is secret. Allocation rotates old endpoint indexes, and STUN
 MESSAGE-INTEGRITY verifies against the selected endpoint password
-([allocation:370](../../src/substrate/media_transport.zig#L370),
-[verification:582](../../src/substrate/media_transport.zig#L582)).
+([allocation](../../src/substrate/media_transport.zig),
+[verification](../../src/substrate/media_transport.zig)).
 The WebRTC advertisement supplies either a DTLS certificate fingerprint or,
 for the SDES path, the secret SRTP group key; the two modes are checked
 separately
-([current renderer:71114](../../src/daemon/server.zig#L71114)).
+([current renderer](../../src/daemon/server.zig)).
 A fingerprint is a public certificate binding requiring possession/handshake
 verification, not a bearer key. No universal wall-clock media credential TTL
 is defined by these codec/issuance seams: use endpoint lifetime, replacement,
 teardown, and strict owner-bound Helix carry. Repeated authenticated feedback
 is allowed; MAC validity alone is explicitly **not freshness/replay protection**
-([media_capability.zig:43](../../src/substrate/media_capability.zig#L43)).
+([media_capability.zig](../../src/substrate/media_capability.zig)).
 
 Relevant tests:
-[directional actual workers:3408](../../src/daemon/native_media_transport.zig#L3408),
-[protected output rollback:143394](../../src/daemon/server.zig#L143394),
-[plaintext browser JOIN refusal:144436](../../src/daemon/server.zig#L144436).
+[directional actual workers](../../src/daemon/native_media_transport.zig),
+[protected output rollback](../../src/daemon/server.zig),
+[plaintext browser JOIN refusal](../../src/daemon/server.zig).
 
 ## TLS resumption tickets
 
@@ -190,8 +187,8 @@ server ticket contains suite, PSK, nonce, issue time, lifetime, age adjustment
 and early-data limits; it contains no Onyx account, logical-session token or
 client-certificate identity. The client stored-session envelope also contains
 the PSK and must be treated as sensitive credential material
-([ticket fields](../../src/crypto/tls_resumption.zig#L39),
-[client envelope](../../src/crypto/tls_resumption.zig#L58)).
+([ticket fields](../../src/crypto/tls_resumption.zig),
+[client envelope](../../src/crypto/tls_resumption.zig)).
 
 The daemon defaults resumption off and the early-data grant to zero. When
 enabled, its connections use process current/previous ticket keys and a shared
@@ -202,9 +199,9 @@ days. The live daemon supplies a clock for sealed-lifetime checks; generic
 engine callers without a clock have different limits. Client ticket age is
 caller-supplied, so codec checks do not prove an external client's persistent
 store expires credentials correctly
-([live configuration](../../src/daemon/server.zig#L8130),
-[acceptance checks](../../src/crypto/tls_server.zig#L2384),
-[client ticket loading](../../src/crypto/tls_client.zig#L905)).
+([live configuration](../../src/daemon/server.zig),
+[acceptance checks](../../src/crypto/tls_server.zig),
+[client ticket loading](../../src/crypto/tls_client.zig)).
 
 Ordinary 1-RTT resumption tickets remain reusable. The bounded 2,048-entry
 binder replay ring applies to accepted 0-RTT, not to all ticket use; eviction
@@ -213,8 +210,8 @@ protection. A rejected early-data attempt can still resume with 1-RTT.
 After HRR, an incompatible exact ticket suite now falls back to a full
 handshake with the committed suite. That transport fallback does not itself
 issue, rotate or revoke an application session credential
-([replay guard](../../src/crypto/tls_resumption.zig#L79),
-[HRR ticket decline](../../src/crypto/tls_server.zig#L2393)).
+([replay guard](../../src/crypto/tls_resumption.zig),
+[HRR ticket decline](../../src/crypto/tls_server.zig)).
 
 Certificate collection has a separate continuity gap. Current source exposes
 optional `request_client_cert`, accepts an empty certificate, and skips
@@ -226,9 +223,9 @@ CERTFP is derived from the current proven certificate, and SASL EXTERNAL
 requires a nonnull fingerprint and account binding; a ticket alone cannot
 supply either. Full-handshake recovery and a future identity/policy-bound
 ticket design remain integration work
-([optional request](../../src/crypto/tls_server.zig#L208),
-[resumed certificate path](../../src/crypto/tls_server.zig#L1231),
-[EXTERNAL gate](../../src/proto/sasl_mechrouter.zig#L258)).
+([optional request](../../src/crypto/tls_server.zig),
+[resumed certificate path](../../src/crypto/tls_server.zig),
+[EXTERNAL gate](../../src/proto/sasl_mechrouter.zig)).
 
 ## Account factors and operator authority
 
@@ -249,32 +246,32 @@ PBKDF2-HMAC-SHA256 and timing-safe comparison; SCRAM has a separate verifier
 store. CERTADD binds certificate fingerprints to an account; EXTERNAL needs the
 TLS client certificate and verified binding, not a hostname or client-supplied
 fingerprint text
-([password verifier:5459](../../src/daemon/services.zig#L5459),
-[SCRAM/cert companions:569](../../src/daemon/services.zig#L569),
-[certificate binding:2160](../../src/daemon/services.zig#L2160),
-[actual mutual-TLS test:114552](../../src/daemon/server.zig#L114552)).
+([password verifier](../../src/daemon/services.zig),
+[SCRAM/cert companions](../../src/daemon/services.zig),
+[certificate binding](../../src/daemon/services.zig),
+[actual mutual-TLS test](../../src/daemon/server.zig)).
 
 There is **no OPER password credential**: OPER is disabled; configured operator
 status is projected from the authenticated account. Passkey/recovery policy can
 require a live passkey or EXTERNAL factor, excluding password/session-token
 sessions. Reauthentication replaces prior authority before recomputation
-([OPER handler:931](../../src/daemon/oper_cmd.zig#L931),
-[factor gate:47043](../../src/daemon/server.zig#L47043),
-[projection:47073](../../src/daemon/server.zig#L47073)).
+([OPER handler](../../src/daemon/oper_cmd.zig),
+[factor gate](../../src/daemon/server.zig),
+[projection](../../src/daemon/server.zig)).
 
 Signed operator grants bind account, privilege bits, class/title, issuer,
 incarnation, issue time, and expiry; they are mesh assertions rather than
 client bearer passwords. Legacy grant verification rejects
 `now_ms >= expiry_ms`
-([oper_cred_share.zig:48](../../src/proto/oper_cred_share.zig#L48),
-[verification:235](../../src/proto/oper_cred_share.zig#L235)).
+([oper_cred_share.zig](../../src/proto/oper_cred_share.zig),
+[verification](../../src/proto/oper_cred_share.zig)).
 OCG2 uses `ONYX-OPER-GRANT-v2\0`, a maximum 24-hour grant TTL in milliseconds,
 and its own revision/replay model; its codec/durable image does not alone prove
 live activation. The live projection still explicitly consumes the sealed
 live-config binding; durable facts do not independently elevate a session
-([OCG2:255](../../src/proto/oper_cred_share.zig#L255),
-[authority image:22](../../src/daemon/durable_oper_authority.zig#L22),
-[projection seam:47092](../../src/daemon/server.zig#L47092)).
+([OCG2](../../src/proto/oper_cred_share.zig),
+[authority image](../../src/daemon/durable_oper_authority.zig),
+[projection seam](../../src/daemon/server.zig)).
 
 ## Email verification and password-reset codes
 
@@ -445,9 +442,9 @@ one-way domain-separated derivation from token+AID; group selector has a
 separate derivation. DROP/REVOKE still require authenticated account-scoped
 resolution. LIST ordinals and opaque mesh cursors depend on their connection's
 cached account/generation/lifetime; they are not transferable resume authority
-([SID:198](../../src/daemon/session_sid.zig#L198),
-[group selector:402](../../src/daemon/session_sid.zig#L402),
-[mesh paging:52905](../../src/daemon/server.zig#L52905)).
+([SID](../../src/daemon/session_sid.zig),
+[group selector](../../src/daemon/session_sid.zig),
+[mesh paging](../../src/daemon/server.zig)).
 Capability negotiation enables a format/operation; it does not authenticate an
 account, establish configured-root membership, or prove complete inventory.
 
