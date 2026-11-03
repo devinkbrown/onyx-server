@@ -26,14 +26,14 @@ substitutes for this table.
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.9.0+c730d9f37b01` | `0.9.0+c730d9f37b01` |
-| Executable SHA-256 | `5735c08b3f537ee27b4d0c22ac7a80e96a6efc5b5122ba666f3d8e6ca3be5e61` | same |
-| Process ID at acceptance | `34450` (supervisor `34449`) | `2818026` |
+| Running image | `0.9.0+5bdd9dc55d99` | `0.9.0+5bdd9dc55d99` |
+| Executable SHA-256 | `2dcc899051a71637116bbe270bf528fdff153b26ef4f68e136458eb56490c6c0` | same |
+| Process ID at acceptance | `774` (supervisor `773`) | `2822304` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
 
-The artifact is built from clean source `c730d9f37b017a3e4c0a400c19cfa482a5198562`
+The artifact is built from clean source `5bdd9dc55d99527a9195883b392f8a7e93d90a2e`
 and reproduces byte-for-byte. Service kits include the correction in `6131c4de`.
 Local OpenRC now uses `supervise-daemon`; peer systemd uses the canonical sandbox
 with an explicit host-path/account override. Both hosts preserve `UMask=0022`
@@ -46,7 +46,7 @@ origin resume. This does not establish arbitrary-node exact attachment restore
 or continuity of old composite tokens across cold restart. Helix remains blocked
 by WebTransport. See the [release and testing audit](../audit/release-and-test-speed-2026-11-03.md).
 
-The peer's first candidate start disabled TLS: systemd's separate
+The original `c730d9f3` rollout's first peer candidate start disabled TLS: systemd's separate
 `RestrictSUIDSGID` filter rejected `openat2` with `ENOSYS`. The peer was restored
 before diagnosis. An isolated A/B probe and all seven native service checks
 verified the corrected unit before retry. Its remaining sandbox is retained;
@@ -118,8 +118,8 @@ stderr continues to the persistent systemd journal.
 - Live SPA root: `/home/kain/onyx/out` (nginx)  
 - Deploy only via `/home/kain/onyx/deploy.sh` (builds to `dist/`, syncs to `out/`)  
 
-Source of truth for the 2026-11-03 baseline: accepted daemon source `c730d9f3`,
-service kit `6131c4de`, the final deployment receipt, CA-verified four-client
+Source of truth for the 2026-11-03 baseline: accepted daemon source `5bdd9dc5`,
+service kit `6131c4de`, the final deployment receipt under `.zig-cache/cloak-tmp/astra-release-5bdd9dc5/`, CA-verified four-client
 acceptance and public-feed checks recorded by the [release audit](../audit/release-and-test-speed-2026-11-03.md).
 Superseded deployment records are available in Git history; the table above
 is the accepted fleet baseline.

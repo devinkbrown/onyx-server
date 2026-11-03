@@ -7,16 +7,13 @@ This runbook describes the shipped tree. For full configuration details, use
 
 ## Verified fleet baseline (2026-11-03)
 
-Both production nodes run `0.9.0+c730d9f37b01` from their
-`onyx-server-run` directories: eshmaki.me under OpenRC
-(`/etc/init.d/onyx-server`), ircx.us under systemd (`onyx-server.service`).
-The executable SHA-256 on both nodes is
-`5735c08b3f537ee27b4d0c22ac7a80e96a6efc5b5122ba666f3d8e6ca3be5e61`.
-Loopback metrics show `tcp_active=1`, `links_active=1`, `peers_up=1`,
-`partitioned=0`, and one mesh component on each side. Both nodes run
-`[tls] ktls = "txrx"` and boot-log `kTLS TX+RX offload ACTIVE (txrx)`.
-The source manifest is **0.9.0**. The canonical paths/evidence table is
-[docs/ops/onyx-server-paths.md](ops/onyx-server-paths.md).
+The [production paths and acceptance record](ops/onyx-server-paths.md) owns
+the current image revision, executable hash, process observations and mesh
+metrics. Use that record before an operation; source HEAD does not identify
+the running image. eshmaki.me uses OpenRC (`/etc/init.d/onyx-server`), while
+ircx.us uses systemd (`onyx-server.service`). Both nodes use
+`[tls] ktls = "txrx"`; expect the boot line
+`kTLS TX+RX offload ACTIVE (txrx)` after restart.
 
 ## Operator Model
 

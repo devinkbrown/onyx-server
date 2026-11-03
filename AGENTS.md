@@ -70,8 +70,8 @@ After toolkit changes:
 
 Metrics: `:9130/metrics` — `links_active` = established Mooring; `tcp_active` = TCP only.  
 Health: `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`  
-As verified on 2026-11-03, both nodes run `0.9.0+c730d9f37b01` with artifact SHA-256
-`5735c08b3f537ee27b4d0c22ac7a80e96a6efc5b5122ba666f3d8e6ca3be5e61` and report
+As verified on 2026-11-03, both nodes run `0.9.0+5bdd9dc55d99` with artifact SHA-256
+`2dcc899051a71637116bbe270bf528fdff153b26ef4f68e136458eb56490c6c0` and report
 `links_active=1`, `peers_up=1`, and `partitioned=0`. The source manifest is
 `0.9.0` (`build.zig.zon`) and this image is deployed with `[tls] ktls="txrx"`
 on both nodes. Details and refresh commands:

@@ -53,9 +53,9 @@ claims; historical roadmaps do not establish support.
 
 ## Current release status
 
-The source manifest is **0.9.0**. On **2026-11-03**, both production nodes
-accepted **`0.9.0+c730d9f37b01`** with the improved OpenRC/systemd kits. Exact
-running hashes, service paths, acceptance scope and rollback facts have one
+The source manifest is **0.9.0**. Both production nodes use the improved
+OpenRC/systemd kits. Exact running revisions and hashes, service paths,
+acceptance scope and rollback facts have one
 canonical home: [production status](docs/ops/onyx-server-paths.md).
 
 The deployed WebTransport listener blocks production Helix; that fleet uses

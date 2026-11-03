@@ -13,6 +13,28 @@ A source-only line is dated when the manifest changes and says so.
 
 ## 0.9.0 — accepted fleet release (2026-11-03)
 
+### Latest fleet refresh
+
+Both nodes now run **`0.9.0+5bdd9dc55d99`**, from clean commit
+`5bdd9dc55d99527a9195883b392f8a7e93d90a2e`. Its independently rebuilt static
+artifact is byte-identical, SHA-256
+`2dcc899051a71637116bbe270bf528fdff153b26ef4f68e136458eb56490c6c0`.
+The corrected complete Debug gate passed **11,236 tests**, skipped **313**, and
+finished in **911.902 seconds**, with all 11,549 names retained and no failures,
+leaks or logged errors. Fresh targeted ReleaseSafe checks passed; the reviewed
+unchanged production code reuses its original full ReleaseSafe evidence. This
+is combined evidence, not a new full ReleaseSafe run of the refresh commit.
+
+Both service-manager cold restarts recovered durable tokens issued beforehand.
+Four CA-verified TLS clients passed 13 exact-one channel/DM events, local exact
+attachment resume, and peer redirect followed by origin resume. Both nodes
+report `links_active=1`, `peers_up=1`, `partitioned=0`; TLS, kTLS, WSS,
+WebTransport and public JSON feeds were checked. Generated test accounts were
+removed. The same cold-restart and custody limits described below still apply.
+Current image paths and hashes live in the [fleet record](docs/ops/onyx-server-paths.md).
+
+### Original production fix release
+
 Both production nodes accepted `0.9.0+c730d9f37b01`, from clean source
 `c730d9f37b017a3e4c0a400c19cfa482a5198562`. The static Linux musl artifact
 reproduced byte-for-byte with SHA-256
@@ -61,6 +83,13 @@ The complete Debug `all-checks` comparison improved from **1,327.794 to
 shared build host. The new run passed **11,236**, skipped **313**, and preserved
 all old names plus two TLS controls. This measures combined changes, not an
 isolated scheduler effect; cold ReleaseSafe compilation remains a cost.
+
+A later full-run failure exposed a TLS test observer race: removing the server
+connection row did not mean the peer had drained the accepted ciphertext.
+The clean-close fixture now deliberately delays peer reads until retirement,
+then drains authenticated records through EOF. It retains the exact prefix,
+single KeyUpdate reply and suffix ordering checks, and requires bytes read
+after retirement. This changes the test helper, not production TLS behavior.
 
 The documentation overhaul replaces conflicting live-version claims with the
 canonical deployment record, adds a source-backed feature index and development

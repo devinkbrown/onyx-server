@@ -1,8 +1,7 @@
 # Credential domains
 
 This is a source contract for the **0.9.0 source tree**, reconciled on
-2026-11-03 after the accepted release. Both production nodes run
-`0.9.0+c730d9f37b01`; [the release audit](../audit/release-and-test-speed-2026-11-03.md)
+2026-11-03 after the accepted release. [The release audit](../audit/release-and-test-speed-2026-11-03.md)
 separates the daemon revision, service-kit correction and later test-only changes.
 Tests cited here explain invariants; they are not individual live acceptance
 receipts. Current runtime paths and hashes remain in [the operations record](../ops/onyx-server-paths.md).
