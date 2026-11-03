@@ -69,8 +69,12 @@ zig build test-full-parallel -Doptimize=safe --summary all -- --logs=.zig-cache/
 zig build test-serial -Doptimize=safe --summary all
 ```
 
-Unfiltered `zig build test` uses this bounded parallel runner by default on supported
-native POSIX hosts. `test-full-parallel` invokes it explicitly. Compile-filtered
+Unfiltered `zig build test`, `test-verbose`, `all-checks`, and
+`all-checks-verbose` use this bounded parallel runner on supported native POSIX
+hosts. The release aggregates also run configuration compilation, WASM, bounded
+fuzz replay, and BoGo self-tests; they share the same complete three-root test
+dependency instead of launching an additional serial suite.
+`test-full-parallel` invokes the runner explicitly. Compile-filtered
 `zig build test -Dtest-filter=<text>`, Windows, and cross targets retain the reference
 graph. `test-serial` always selects that reference graph, running cases serially
 within each root. Both full graphs retain every module, executable, and CLI test.

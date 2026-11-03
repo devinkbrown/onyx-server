@@ -18,6 +18,15 @@ class RuntimeGraphControls(unittest.TestCase):
         cls.fixture = Path(cls.temp.name)
         for name in ("build.zig", "build.zig.zon"):
             shutil.copyfile(cls.root / name, cls.fixture / name)
+        # Stub only the aggregate's ancillary gates; execute its actual full
+        # test dependencies against tiny roots, including the otherwise easy
+        # to omit CLI root. Ancillary checks are verified in release gates.
+        graph = cls.fixture / "build.zig"
+        text = graph.read_text()
+        for aggregate in ("all_checks_step", "all_checks_verbose_step"):
+            for dependency in ("&check_exe.step", "wasm_step", "&run_fuzz_tests.step", "&run_bogo_shim_tests.step"):
+                text = text.replace(f"    {aggregate}.dependOn({dependency});\n", "")
+        graph.write_text(text)
         (cls.fixture / "tools").mkdir()
         for name in ("verbose_test_runner.zig", "parallel_tests.py"):
             shutil.copyfile(cls.root / "tools" / name, cls.fixture / "tools" / name)
@@ -61,6 +70,26 @@ class RuntimeGraphControls(unittest.TestCase):
                 self.assertNotIn("native supported POSIX", result.stdout)
                 self.assertNotIn("parallel suite summary:", result.stdout)
                 self.assertNotIn("onyx-tests-cached", result.stdout)
+
+    def test_release_aggregates_execute_all_three_parallel_roots(self):
+        for step in ("test-verbose", "all-checks", "all-checks-verbose"):
+            with self.subTest(step=step):
+                result = self.fixture_build(step)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout.count("parallel suite summary:"), 1)
+                self.assertIn("artifacts=3 discovered=6 executed=6 passed=6 skipped=0 failed=0", result.stdout)
+
+    def test_filtered_release_aggregate_preserves_serial_selection(self):
+        for step in ("all-checks", "all-checks-verbose"):
+            with self.subTest(step=step):
+                result = self.fixture_build(step, "-Dtest-filter=beta")
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn("parallel suite summary:", result.stdout)
+                if step.endswith("-verbose"):
+                    self.assertEqual(result.stdout.count("verbose test summary: 1 passed; 0 skipped; 0 failed;"), 3)
+                    self.assertNotIn(".test.alpha", result.stdout)
+                else:
+                    self.assertIn("3/3 tests passed", result.stdout)
 
     def build(self, *args):
         return subprocess.run([self.zig, "build", "--summary", "all", *args], cwd=self.root,

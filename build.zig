@@ -1145,9 +1145,13 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(serial_test_step);
     }
     const test_verbose_step = b.step("test-verbose", "Run full tests with per-test progress output");
-    test_verbose_step.dependOn(test_mod_verbose_step);
-    test_verbose_step.dependOn(&run_exe_tests_verbose.step);
-    test_verbose_step.dependOn(&run_cli_tests_verbose.step);
+    if (parallel_supported and test_filters.len == 0) {
+        test_verbose_step.dependOn(parallel_step);
+    } else {
+        test_verbose_step.dependOn(test_mod_verbose_step);
+        test_verbose_step.dependOn(&run_exe_tests_verbose.step);
+        test_verbose_step.dependOn(&run_cli_tests_verbose.step);
+    }
 
     // `zig build wasm` — compile the CadenceVox/CadenceVis codecs to a freestanding
     // WASM module for the in-browser client (#11/#32). Pure-integer +
@@ -1841,15 +1845,13 @@ pub fn build(b: *std.Build) void {
     const all_checks_step = b.step("all-checks", "Run deterministic pre-push checks: check, wasm, full tests, bounded fuzz replay, and BoGo shim self-tests");
     all_checks_step.dependOn(&check_exe.step);
     all_checks_step.dependOn(wasm_step);
-    all_checks_step.dependOn(&run_mod_tests.step);
-    all_checks_step.dependOn(&run_exe_tests.step);
+    all_checks_step.dependOn(test_step);
     all_checks_step.dependOn(&run_fuzz_tests.step);
     all_checks_step.dependOn(&run_bogo_shim_tests.step);
     const all_checks_verbose_step = b.step("all-checks-verbose", "Run deterministic pre-push checks with per-test progress output for the full suite");
     all_checks_verbose_step.dependOn(&check_exe.step);
     all_checks_verbose_step.dependOn(wasm_step);
-    all_checks_verbose_step.dependOn(&run_mod_tests_verbose.step);
-    all_checks_verbose_step.dependOn(&run_exe_tests_verbose.step);
+    all_checks_verbose_step.dependOn(test_verbose_step);
     all_checks_verbose_step.dependOn(&run_fuzz_tests.step);
     all_checks_verbose_step.dependOn(&run_bogo_shim_tests.step);
 
