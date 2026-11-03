@@ -50,6 +50,12 @@ zig build test-cached -Doptimize=safe --summary all -- --test-filter="ACCESS" --
 zig build test-exe-cached -- --list-tests
 ```
 
+Test modules, executable-root tests, CLI tests, and focused test leaves use the
+static `+test` build stamp. The outer gate receipt binds the real source context
+and command; suite evidence retains the emitted binary hashes. Documentation-only
+commits and dirty/clean status changes therefore reuse the same test artifacts;
+production modules and release binaries retain their real Git revision/version.
+
 The initial cached build compiles every test in that root. Later selections reuse
 that artifact when source, target, mode, and compiler are unchanged. Repeat runtime
 filters form a union; each matching case runs once. Empty filters and selections
@@ -80,20 +86,42 @@ graph. `test-serial` always selects that reference graph, running cases serially
 within each root. Both full graphs retain every module, executable, and CLI test.
 
 The parallel gate compiles one complete artifact for each of the module,
-executable, and CLI roots, then runs each artifact in at most four processes. Stable
-hashes of complete test names assign cases to shards. Before execution, the harness
-proves the shard inventories are disjoint and cover the complete artifact inventory
-exactly. It checks actual terminal counts, propagates every failed process/test/leak/
+executable, and CLI roots, then runs each artifact in at most four processes. On
+the first run, stable hashes of complete test names assign cases to shards.
+After a mechanically complete successful run of all three roots, the harness stores
+an advisory timing profile keyed by mode, target, and root identity under
+`.zig-cache/full-suite-profiles/`. Later runs assign the longest known cases first
+across four workers, with deterministic ties and a fallback cost for new names.
+Malformed or mismatched hints fall back to hash shards. A hint changes scheduling;
+it cannot omit tests, relax assertions, or grant release acceptance. Before execution,
+the harness proves the shard inventories are disjoint and cover the complete artifact inventory
+exactly. Duration plans use exact full-name manifests, so prefix collisions cannot
+select a second case. Duplicate, unknown, empty, or malformed selections fail before
+execution. It checks actual terminal counts, propagates every failed process/test/leak/
 log error, and retains inventories, binary hashes, per-shard logs, and aggregate counts
 in the new log directory. Without `--logs`, it creates and prints a unique directory
-under `.zig-cache/full-suite-runs/`; explicit paths must still be new. The final suite summary includes all three roots and
-is parsed by the source-bound gate ledger without adding overlapping counts.
+under `.zig-cache/full-suite-runs/`; explicit paths must still be new. The final suite
+summary includes all three roots and is parsed by the source-bound gate ledger without adding overlapping counts.
 Reusing an existing log directory fails to protect evidence. Each shard has a
 3600-second timeout (`--timeout=<seconds>`); timeout or interruption terminates
 and reaps its own process group and records terminal failure. Progress every
 30 seconds shows the latest test line. `--seed=<u32>` defaults to zero and is
 recorded with exact shard arguments and log hashes in the JSON evidence.
 All original tests and skips remain; this target accepts no test filter.
+
+To reuse a retained successful suite from another context, first convert its
+`suite.json` into a scheduling hint. Conversion verifies all three roots, terminal
+counts, zero failures/leaks/log errors, and the retained raw log hashes. Supply the
+mode and target from that suite's verified gate command/metadata:
+
+```sh
+python3 -B tools/parallel_tests.py --import-timings-suite=<retained-suite.json> --mode=debug --target=<recorded-target> --profile-output=<new-profile.json>
+zig build test -- --timings-profile=<new-profile.json>
+```
+
+Ordinary later `zig build test` runs reuse local complete profiles automatically.
+Failed, interrupted, partial, or hash-mismatched evidence cannot produce a hint.
+
 
 Run from the repository root: tests need `src/`, `etc/`, and `tools/bogo/` fixtures.
 Linux resource inspection found ephemeral bound listener ports and process-local
@@ -111,6 +139,16 @@ Validate harness changes with the small compiled fixture:
 ONYX_TEST_ZIG=/path/to/pinned/zig python3 -B tools/test_verbose_test_runner.py
 ONYX_TEST_ZIG=/path/to/pinned/zig python3 -B tools/test_test_build_graph.py
 ```
+
+The build-graph controls include a disposable Git checkout: initial clean build,
+dirty documentation, and a documentation-only commit must preserve all three cached
+test binaries byte-for-byte with unchanged modification times while the production
+binary refreshes its real version stamp.
+
+The blinded RSA PKCS1 stress case retains its baseline plus 25 independently blinded
+signatures. Four arithmetic workers produce separate signature/error/verification
+results; the parent joins every worker and checks all 26 verifications and 25 byte
+comparisons. Assertions and the testing allocator remain on the parent thread.
 
 The fixture covers filtering, empty selections, listing, deterministic exhaustive
 shards, failures, skip counts, warm artifact reuse, and a full-inventory runtime

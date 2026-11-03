@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var shard_count: usize = 1;
     var shard_index: usize = 0;
     var group: Group = .all;
+    var name_file: ?[]const u8 = null;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
             testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
@@ -51,6 +52,10 @@ pub fn main(init: std.process.Init.Minimal) void {
             }
             filters[filter_count] = filter;
             filter_count += 1;
+        } else if (std.mem.startsWith(u8, arg, "--test-name-file=")) {
+            const path = arg["--test-name-file=".len..];
+            if (path.len == 0 or name_file != null) invalidSelection("expected one nonempty exact-name manifest path");
+            name_file = path;
         } else if (std.mem.startsWith(u8, arg, "--test-shard-count=")) {
             shard_count = std.fmt.parseUnsigned(usize, arg["--test-shard-count=".len..], 10) catch 0;
         } else if (std.mem.startsWith(u8, arg, "--test-shard-index=")) {
@@ -72,10 +77,38 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(2);
     }
     const tests = builtin.test_functions;
+    var exact_names: std.StringHashMap(void) = .init(std.heap.page_allocator);
+    defer exact_names.deinit();
+    var name_bytes: ?[]u8 = null;
+    defer if (name_bytes) |bytes| std.heap.page_allocator.free(bytes);
+    if (name_file) |path| {
+        var selection_io: std.Io.Threaded = .init(std.heap.page_allocator, .{
+            .argv0 = .init(init.args),
+            .environ = init.environ,
+        });
+        defer selection_io.deinit();
+        const bytes = std.Io.Dir.cwd().readFileAlloc(selection_io.io(), path, std.heap.page_allocator, .limited(8 * 1024 * 1024)) catch
+            invalidSelection("unable to read exact-name manifest");
+        name_bytes = bytes;
+        if (bytes.len == 0 or bytes[bytes.len - 1] != '\n' or bytes[0] == '\n' or
+            std.mem.indexOf(u8, bytes, "\n\n") != null or std.mem.indexOfAny(u8, bytes, "\r\x00") != null)
+            invalidSelection("malformed or empty exact-name manifest");
+        var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
+        while (lines.next()) |name| {
+            const entry = exact_names.getOrPut(name) catch invalidSelection("unable to allocate exact-name selection");
+            if (entry.found_existing) invalidSelection("duplicate exact test name");
+        }
+        var known: usize = 0;
+        for (tests) |test_fn| {
+            if (exact_names.contains(test_fn.name)) known += 1;
+        }
+        if (known != exact_names.count()) invalidSelection("unknown exact test name");
+    }
+    const exact_selection: ?*const std.StringHashMap(void) = if (name_file != null) &exact_names else null;
     const selected_filters = filters[0..filter_count];
     var matched_count: usize = 0;
     for (tests) |test_fn| {
-        if (selected(test_fn.name, selected_filters, group, shard_index, shard_count)) matched_count += 1;
+        if (selected(test_fn.name, selected_filters, group, shard_index, shard_count, exact_selection)) matched_count += 1;
     }
     std.debug.print("test selection: {d} discovered; {d} matched; {d} excluded\n", .{
         tests.len, matched_count, tests.len - matched_count,
@@ -86,7 +119,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
     if (list_only) {
         for (tests) |test_fn| {
-            if (selected(test_fn.name, selected_filters, group, shard_index, shard_count)) std.debug.print("{s}\n", .{test_fn.name});
+            if (selected(test_fn.name, selected_filters, group, shard_index, shard_count, exact_selection)) std.debug.print("{s}\n", .{test_fn.name});
         }
         std.debug.print("listed {d} tests; executed 0\n", .{matched_count});
         return;
@@ -100,7 +133,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var slowest: [slowest_limit]SlowTest = @splat(.{});
 
     for (tests) |test_fn| {
-        if (!selected(test_fn.name, selected_filters, group, shard_index, shard_count)) continue;
+        if (!selected(test_fn.name, selected_filters, group, shard_index, shard_count, exact_selection)) continue;
         executed_count += 1;
         testing.allocator_instance = .init(std.heap.page_allocator, .{
             .canary = 0xc3a701ba,
@@ -159,6 +192,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (fail_count != 0 or leak_count != 0 or log_err_count != 0) std.process.exit(1);
 }
 
+fn invalidSelection(message: []const u8) noreturn {
+    std.debug.print("invalid exact test selection: {s}\n", .{message});
+    std.process.exit(2);
+}
+
 const Group = enum { all, parallel, serial };
 
 // Only source-audited arithmetic/hash primitives can share the runtime lane.
@@ -169,7 +207,10 @@ fn parallelSafe(name: []const u8) bool {
         !std.mem.startsWith(u8, name, "crypto.tls_server.test.");
 }
 
-fn selected(name: []const u8, filters: []const []const u8, group: Group, shard_index: usize, shard_count: usize) bool {
+fn selected(name: []const u8, filters: []const []const u8, group: Group, shard_index: usize, shard_count: usize, exact: ?*const std.StringHashMap(void)) bool {
+    if (exact) |names| {
+        if (!names.contains(name)) return false;
+    }
     if (!matches(name, filters)) return false;
     if (group != .all and parallelSafe(name) != (group == .parallel)) return false;
     return std.hash.Wyhash.hash(0, name) % shard_count == shard_index;

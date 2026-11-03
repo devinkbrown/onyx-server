@@ -140,6 +140,38 @@ pub fn build(b: *std.Build) void {
     const build_info_mod = build_info.createModule();
     mod.addImport("build_info", build_info_mod);
 
+    // Test binaries identify their source through the outer gate receipt. A
+    // static stamp keeps documentation/commit-only changes out of LLVM's test
+    // cache key; production modules below retain the real revision and version.
+    const test_info = b.addOptions();
+    test_info.addOption([]const u8, "git_commit", "test");
+    test_info.addOption([]const u8, "version", b.fmt("{s}+test", .{manifestVersion()}));
+    test_info.addOption(bool, "windows_rollover_smoke", false);
+    const test_info_mod = test_info.createModule();
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    test_mod.addImport("build_info", test_info_mod);
+    const test_exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+        .strip = strip_release,
+        .imports = &.{.{ .name = "onyx_server", .module = test_mod }},
+    });
+    const test_cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/armor_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+        .strip = strip_release,
+        .imports = &.{.{ .name = "onyx_server", .module = test_mod }},
+    });
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -353,7 +385,7 @@ pub fn build(b: *std.Build) void {
     };
 
     const entrypoint_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = test_exe_mod,
         .filters = test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -365,7 +397,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = needs_libc,
-        .imports = &.{.{ .name = "onyx_server", .module = mod }},
+        .imports = &.{.{ .name = "onyx_server", .module = test_mod }},
     });
     const maintenance_tests = b.addTest(.{ .root_module = maintenance_tests_mod, .filters = test_filters, .test_runner = verbose_test_runner });
     const maintenance_test_step = b.step("test-setup-maintenance", "Run existing-runtime maintenance wizard/backend tests");
@@ -374,9 +406,10 @@ pub fn build(b: *std.Build) void {
     // Custom test runners are their own @import("root"); bind this name
     // directly to the already tested module, preserving one file owner.
     mod.addImport("host_presentation_test_root", mod);
+    test_mod.addImport("host_presentation_test_root", test_mod);
     const host_exec_helper = b.addTest(.{
         .name = "host-presentation-exec-helper",
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = &.{"host presentation native helper anchor"},
         .test_runner = .{ .path = b.path("src/host_presentation_exec_helper.zig"), .mode = .simple },
     });
@@ -385,9 +418,10 @@ pub fn build(b: *std.Build) void {
     host_exec_helper_step.dependOn(&install_host_exec_helper.step);
 
     mod.addImport("issuer_production_test_root", mod);
+    test_mod.addImport("issuer_production_test_root", test_mod);
     const issuer_exec_helper = b.addTest(.{
         .name = "issuer-production-exec-helper",
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = &.{"issuer production native helper anchor"},
         .test_runner = .{ .path = b.path("src/issuer_production_exec_helper.zig"), .mode = .simple },
     });
@@ -396,9 +430,10 @@ pub fn build(b: *std.Build) void {
     issuer_exec_helper_step.dependOn(&install_issuer_exec_helper.step);
 
     mod.addImport("session_retry_test_root", mod);
+    test_mod.addImport("session_retry_test_root", test_mod);
     const retry_exec_helper = b.addTest(.{
         .name = "session-retry-exec-helper",
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = &.{"session retry native helper anchor"},
         .test_runner = .{ .path = b.path("src/session_retry_exec_helper.zig"), .mode = .simple },
     });
@@ -413,7 +448,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    spool_leaf_mod.addImport("build_info", build_info_mod);
+    spool_leaf_mod.addImport("build_info", test_info_mod);
     const spool_leaf_tests = b.addTest(.{
         .root_module = spool_leaf_mod,
         .filters = test_filters,
@@ -429,7 +464,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    boot_policy_mod.addImport("build_info", build_info_mod);
+    boot_policy_mod.addImport("build_info", test_info_mod);
     const boot_policy_tests = b.addTest(.{ .root_module = boot_policy_mod, .filters = test_filters, .test_runner = verbose_test_runner });
     const boot_policy_step = b.step("test-helix-boot-policy", "Run explicit Helix boot policy carry tests");
     boot_policy_step.dependOn(&b.addRunArtifact(boot_policy_tests).step);
@@ -440,7 +475,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    service_identity_mod.addImport("build_info", build_info_mod);
+    service_identity_mod.addImport("build_info", test_info_mod);
     const service_identity_tests = b.addTest(.{
         .root_module = service_identity_mod,
         .filters = test_filters,
@@ -456,7 +491,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    handoff_leaf_mod.addImport("build_info", build_info_mod);
+    handoff_leaf_mod.addImport("build_info", test_info_mod);
     const handoff_leaf_tests = b.addTest(.{
         .root_module = handoff_leaf_mod,
         .filters = test_filters,
@@ -473,7 +508,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    cloak_world_bridge_mod.addImport("build_info", build_info_mod);
+    cloak_world_bridge_mod.addImport("build_info", test_info_mod);
     const cloak_world_bridge_tests = b.addTest(.{
         .root_module = cloak_world_bridge_mod,
         .filters = test_filters,
@@ -489,7 +524,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    cloak_durable_mod.addImport("build_info", build_info_mod);
+    cloak_durable_mod.addImport("build_info", test_info_mod);
     const cloak_durable_tests = b.addTest(.{
         .root_module = cloak_durable_mod,
         .filters = test_filters,
@@ -505,7 +540,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    session_store_leaf_mod.addImport("build_info", build_info_mod);
+    session_store_leaf_mod.addImport("build_info", test_info_mod);
     const session_store_leaf_tests = b.addTest(.{
         .root_module = session_store_leaf_mod,
         .filters = test_filters,
@@ -522,7 +557,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    ringlane_leaf_mod.addImport("build_info", build_info_mod);
+    ringlane_leaf_mod.addImport("build_info", test_info_mod);
     const ringlane_leaf_tests = b.addTest(.{
         .root_module = ringlane_leaf_mod,
         .filters = test_filters,
@@ -539,7 +574,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    cloak_leaf_mod.addImport("build_info", build_info_mod);
+    cloak_leaf_mod.addImport("build_info", test_info_mod);
     const cloak_leaf_tests = b.addTest(.{
         .root_module = cloak_leaf_mod,
         .filters = test_filters,
@@ -556,7 +591,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    cloak_audit_leaf_mod.addImport("build_info", build_info_mod);
+    cloak_audit_leaf_mod.addImport("build_info", test_info_mod);
     const cloak_audit_leaf_tests = b.addTest(.{
         .root_module = cloak_audit_leaf_mod,
         .filters = test_filters,
@@ -573,7 +608,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = needs_libc,
     });
-    policy_list_audit_mod.addImport("build_info", build_info_mod);
+    policy_list_audit_mod.addImport("build_info", test_info_mod);
     const policy_list_audit_tests = b.addTest(.{
         .root_module = policy_list_audit_mod,
         .filters = test_filters,
@@ -586,7 +621,7 @@ pub fn build(b: *std.Build) void {
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the relevant field.
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = test_filters,
     });
 
@@ -594,7 +629,7 @@ pub fn build(b: *std.Build) void {
     // --test-filter reuses one complete artifact per source/target/mode.
     const cached_tests = b.addTest(.{
         .name = "onyx-tests-cached",
-        .root_module = mod,
+        .root_module = test_mod,
         .test_runner = verbose_test_runner,
     });
     const cached_run = b.addRunArtifact(cached_tests);
@@ -608,7 +643,7 @@ pub fn build(b: *std.Build) void {
     }
     const cached_exe_tests = b.addTest(.{
         .name = "onyx-exe-tests-cached",
-        .root_module = exe.root_module,
+        .root_module = test_exe_mod,
         .test_runner = verbose_test_runner,
     });
     const cached_exe_run = b.addRunArtifact(cached_exe_tests);
@@ -656,7 +691,7 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_mod_step = b.step("test-mod", "Run only the library/module test artifact; accepts -Dtest-filter=<text>");
     const mod_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -681,9 +716,9 @@ pub fn build(b: *std.Build) void {
     if (windows_full_shards) {
         for (shard_names, 0..) |name, index| {
             const filters: []const []const u8 = &.{b.fmt("{s}.", .{name})};
-            const compile = b.addTest(.{ .root_module = mod, .filters = filters });
+            const compile = b.addTest(.{ .root_module = test_mod, .filters = filters });
             const verbose_compile = b.addTest(.{
-                .root_module = mod,
+                .root_module = test_mod,
                 .filters = filters,
                 .test_runner = verbose_test_runner,
             });
@@ -709,7 +744,7 @@ pub fn build(b: *std.Build) void {
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = test_exe_mod,
         .filters = test_filters,
     });
 
@@ -718,7 +753,7 @@ pub fn build(b: *std.Build) void {
     const test_exe_step = b.step("test-exe", "Run only the daemon executable-root test artifact; accepts -Dtest-filter=<text>");
     test_exe_step.dependOn(&run_exe_tests.step);
     const exe_tests_verbose = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = test_exe_mod,
         .filters = test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -739,14 +774,14 @@ pub fn build(b: *std.Build) void {
         "exploit:",
     };
     const tls_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = tls_test_filters,
     });
     const run_tls_tests = b.addRunArtifact(tls_tests);
     const test_tls_step = b.step("test-tls", "Run focused Armor TLS, mTLS, ECH, RPK, DC, and record-size tests");
     test_tls_step.dependOn(&run_tls_tests.step);
     const tls_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = tls_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -768,14 +803,14 @@ pub fn build(b: *std.Build) void {
         "cloak",
     };
     const server_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = server_test_filters,
     });
     const run_server_tests = b.addRunArtifact(server_tests);
     const test_server_step = b.step("test-server", "Run focused daemon/server integration and auth tests");
     test_server_step.dependOn(&run_server_tests.step);
     const server_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = server_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -789,7 +824,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test`; this focused step (alias `test-attack`) runs just the
     // corpus with the count visible.
     const exploit_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = &.{"exploit:"},
     });
     const run_exploit_tests = b.addRunArtifact(exploit_tests);
@@ -806,14 +841,14 @@ pub fn build(b: *std.Build) void {
         "reference config",
     };
     const config_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = config_test_filters,
     });
     const run_config_tests = b.addRunArtifact(config_tests);
     const test_config_step = b.step("test-config", "Run focused TOML/config parsing, boot projection, and reference-config tests");
     test_config_step.dependOn(&run_config_tests.step);
     const config_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = config_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -832,14 +867,14 @@ pub fn build(b: *std.Build) void {
         "SACCESS",
     };
     const ircx_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = ircx_test_filters,
     });
     const run_ircx_tests = b.addRunArtifact(ircx_tests);
     const test_ircx_step = b.step("test-ircx", "Run focused IRCX, PROP, ACCESS, DATA, LISTX, MODEX, and SACCESS tests");
     test_ircx_step.dependOn(&run_ircx_tests.step);
     const ircx_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = ircx_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -857,14 +892,14 @@ pub fn build(b: *std.Build) void {
         "POLICY event",
     };
     const event_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = event_test_filters,
     });
     const run_event_tests = b.addRunArtifact(event_tests);
     const test_event_step = b.step("test-event-spine", "Run focused event-spine, EVENT, observe, and playback tests");
     test_event_step.dependOn(&run_event_tests.step);
     const event_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = event_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -885,14 +920,14 @@ pub fn build(b: *std.Build) void {
         "CONNECT opens",
     };
     const mesh_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = mesh_test_filters,
     });
     const run_mesh_tests = b.addRunArtifact(mesh_tests);
     const test_mesh_step = b.step("test-mesh", "Run focused Undertow mesh, S2S, repair, and secured-link tests");
     test_mesh_step.dependOn(&run_mesh_tests.step);
     const mesh_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = mesh_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -917,14 +952,14 @@ pub fn build(b: *std.Build) void {
         "RTCP",
     };
     const media_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = media_test_filters,
     });
     const run_media_tests = b.addRunArtifact(media_tests);
     const test_media_step = b.step("test-media", "Run focused media, DTLS-SRTP, SFU, native-media, WebTransport, RTP, and RTCP tests");
     test_media_step.dependOn(&run_media_tests.step);
     const media_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = media_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -946,14 +981,14 @@ pub fn build(b: *std.Build) void {
         "account",
     };
     const services_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = services_test_filters,
     });
     const run_services_tests = b.addRunArtifact(services_tests);
     const test_services_step = b.step("test-services", "Run focused services, account, SASL, TOTP, WebAuthn, session, and MEMO tests");
     test_services_step.dependOn(&run_services_tests.step);
     const services_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = services_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -978,14 +1013,14 @@ pub fn build(b: *std.Build) void {
         "replica",
     };
     const session_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = session_test_filters,
     });
     const run_session_tests = b.addRunArtifact(session_tests);
     const test_session_step = b.step("test-session", "Run reusable-session, migration, replica, World restore, and Helix session tests");
     test_session_step.dependOn(&run_session_tests.step);
     const session_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = session_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -1011,14 +1046,14 @@ pub fn build(b: *std.Build) void {
         "capability",
     };
     const helix_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = helix_test_filters,
     });
     const run_helix_tests = b.addRunArtifact(helix_tests);
     const test_helix_step = b.step("test-helix", "Run focused Helix upgrade, migration, resume, capsule, and handoff tests");
     test_helix_step.dependOn(&run_helix_tests.step);
     const helix_tests_verbose = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = helix_test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -1039,7 +1074,7 @@ pub fn build(b: *std.Build) void {
         "node reactor remains valid",
     };
     const dst_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = dst_test_filters,
     });
     const run_dst_tests = b.addRunArtifact(dst_tests);
@@ -1066,14 +1101,14 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(armor_exe);
 
     const cli_tests = b.addTest(.{
-        .root_module = armor_exe.root_module,
+        .root_module = test_cli_mod,
         .filters = test_filters,
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const test_cli_step = b.step("test-cli", "Run the armor CLI toolkit tests; accepts -Dtest-filter=<text>");
     test_cli_step.dependOn(&run_cli_tests.step);
     const cli_tests_verbose = b.addTest(.{
-        .root_module = armor_exe.root_module,
+        .root_module = test_cli_mod,
         .filters = test_filters,
         .test_runner = verbose_test_runner,
     });
@@ -1083,11 +1118,13 @@ pub fn build(b: *std.Build) void {
 
     const cached_cli_tests = b.addTest(.{
         .name = "onyx-cli-tests-cached",
-        .root_module = armor_exe.root_module,
+        .root_module = test_cli_mod,
         .test_runner = verbose_test_runner,
     });
     const parallel_full = b.addSystemCommand(&.{ "python3", "-B" });
     parallel_full.addFileArg(b.path("tools/parallel_tests.py"));
+    parallel_full.addArg(b.fmt("--mode={s}", .{@tagName(optimize)}));
+    parallel_full.addArg(b.fmt("--target={s}", .{target.result.zigTriple(b.allocator) catch @panic("unable to format test target")}));
     parallel_full.addFileArg(cached_tests.getEmittedBin());
     parallel_full.addFileArg(cached_exe_tests.getEmittedBin());
     parallel_full.addFileArg(cached_cli_tests.getEmittedBin());
@@ -1211,7 +1248,7 @@ pub fn build(b: *std.Build) void {
     // Native Windows gate: exercise the socket/IOCP lifetime cases and the
     // daemon entry point without compiling or running the full module suite.
     const windows_io_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = &.{
             "Windows socket descriptors preserve pointer-sized handles and retire stale ids",
             "Windows accepted TCP keepalive sets state and per-socket timing",
@@ -1375,7 +1412,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_windows_io_tests = b.addRunArtifact(windows_io_tests);
     const windows_exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = test_exe_mod,
         .filters = &.{},
     });
     const run_windows_exe_tests = b.addRunArtifact(windows_exe_tests);
@@ -1691,7 +1728,7 @@ pub fn build(b: *std.Build) void {
     // scopes the artifact to just the `cov-fuzz:` targets so `--fuzz` fuzzes the
     // TLS parsers in isolation rather than every fuzz test in the tree.
     const fuzz_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
         .filters = &.{"cov-fuzz:"},
     });
     const run_fuzz_tests = b.addRunArtifact(fuzz_tests);

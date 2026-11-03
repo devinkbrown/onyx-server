@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded real build-graph controls: unsupported runtime targets fail before compilation."""
 import os
+import hashlib
 from pathlib import Path
 import subprocess
 import shutil
@@ -70,6 +71,69 @@ class RuntimeGraphControls(unittest.TestCase):
                 self.assertNotIn("native supported POSIX", result.stdout)
                 self.assertNotIn("parallel suite summary:", result.stdout)
                 self.assertNotIn("onyx-tests-cached", result.stdout)
+
+    def test_documentation_commits_reuse_test_binaries_and_refresh_production_stamp(self):
+        with tempfile.TemporaryDirectory(prefix="onyx-test-stamp-") as directory:
+            root = Path(directory)
+            shutil.copyfile(self.root / "build.zig", root / "build.zig")
+            shutil.copyfile(self.root / "build.zig.zon", root / "build.zig.zon")
+            (root / "tools").mkdir()
+            for name in ("verbose_test_runner.zig", "parallel_tests.py"):
+                shutil.copyfile(self.root / "tools" / name, root / "tools" / name)
+            (root / "src" / "cli").mkdir(parents=True)
+            (root / "src" / "root.zig").write_text('''const std = @import("std");
+pub const git_commit = @import("build_info").git_commit;
+pub const version = @import("build_info").version;
+test "module stamp" { try std.testing.expectEqualStrings("test", git_commit); }
+''')
+            application = '''const std = @import("std");
+const core = @import("onyx_server");
+pub fn main() void { std.debug.print("{s}\\n", .{core.version}); }
+test "application stamp" { try std.testing.expectEqualStrings("test", core.git_commit); }
+'''
+            (root / "src" / "main.zig").write_text(application)
+            (root / "src" / "cli" / "armor_main.zig").write_text(application)
+            (root / ".gitignore").write_text(".zig-cache/\nzig-out/\n")
+            (root / "README.md").write_text("initial documentation\n")
+
+            def command(*args):
+                result = subprocess.run(args, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                return result.stdout
+
+            command("git", "init", "-q")
+            command("git", "config", "user.name", "Onyx test fixture")
+            command("git", "config", "user.email", "fixture@invalid.example")
+            command("git", "add", ".")
+            command("git", "commit", "-qm", "initial fixture")
+
+            def build_and_check(old_binaries=None):
+                output = command(self.zig, "build", "test", "-j2", "--summary", "all")
+                self.assertIn("artifacts=3 discovered=3 executed=3 passed=3 skipped=0 failed=0", output)
+                artifacts = {}
+                for name in ("onyx-tests-cached", "onyx-exe-tests-cached", "onyx-cli-tests-cached"):
+                    paths = list((root / ".zig-cache" / "o").glob(f"*/{name}"))
+                    self.assertEqual(len(paths), 1, paths)
+                    artifacts[name] = (paths[0].stat().st_mtime_ns, hashlib.sha256(paths[0].read_bytes()).hexdigest())
+                if old_binaries is not None:
+                    self.assertEqual(artifacts, old_binaries, output)
+                command(self.zig, "build", "-j2")
+                version = command(str(root / "zig-out" / "bin" / "onyx-server")).strip()
+                head = command("git", "rev-parse", "--short=12", "HEAD").strip()
+                self.assertIn("+" + head, version)
+                return artifacts, version
+
+            original, clean_version = build_and_check()
+            self.assertFalse(clean_version.endswith("-dirty"), clean_version)
+            (root / "README.md").write_text("documentation-only change\n")
+            _, dirty_version = build_and_check(original)
+            self.assertTrue(dirty_version.endswith("-dirty"), dirty_version)
+            command("git", "add", "README.md")
+            command("git", "commit", "-qm", "documentation only")
+            _, new_version = build_and_check(original)
+            self.assertNotEqual(clean_version, new_version)
+            self.assertFalse(new_version.endswith("-dirty"), new_version)
+            self.assertEqual(command("git", "status", "--porcelain"), "")
 
     def test_release_aggregates_execute_all_three_parallel_roots(self):
         for step in ("test-verbose", "all-checks", "all-checks-verbose"):

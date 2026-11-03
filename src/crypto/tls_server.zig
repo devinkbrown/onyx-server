@@ -8647,11 +8647,42 @@ test {
 // SkipZigTest when gnutls-cli (or socket plumbing) is unavailable so the
 // suite stays green in minimal environments.
 fn gnutlsRsaLeafHandshake(priority: ?[]const u8, verbose: bool) !bool {
+    return gnutlsRsaLeafHandshakeWithPath(std.testing.io, std.testing.environ.getPosix("PATH") orelse std.Io.Threaded.default_PATH, priority, verbose);
+}
+
+// Test-only optional-tool lookup. Match the pinned process backend's PATH
+// default/tokenization, but discover absence before spawn: that backend can
+// leak a child and its stdio pipes when exec reports ENOENT after fork.
+fn openOptionalInteropExecutable(io: std.Io, search_path: []const u8, name: []const u8) !std.Io.File {
+    var paths = std.mem.tokenizeScalar(u8, search_path, ':');
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    while (paths.next()) |path| {
+        const candidate = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ path, name }) catch continue;
+        // O_PATH pins metadata without blocking on a FIFO or opening a device.
+        const file = std.Io.Dir.cwd().openFile(io, candidate, .{ .path_only = true }) catch continue;
+        var retained = false;
+        defer if (!retained) file.close(io);
+        const stat = file.stat(io) catch continue;
+        if (stat.kind != .file) continue;
+        // Check the retained inode rather than the replaceable PATH entry.
+        // This helper and the real-client interop are Linux-only tests.
+        var fd_path_buf: [64]u8 = undefined;
+        const fd_path = try std.fmt.bufPrint(&fd_path_buf, "/proc/self/fd/{d}", .{file.handle});
+        std.Io.Dir.cwd().access(io, fd_path, .{ .execute = true }) catch continue;
+        retained = true;
+        return file;
+    }
+    return error.SkipZigTest;
+}
+
+fn gnutlsRsaLeafHandshakeWithPath(io: std.Io, search_path: []const u8, priority: ?[]const u8, verbose: bool) !bool {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const linux = std.os.linux;
     const posix = std.posix;
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    // Do this before certificate generation, sockets, or process allocation.
+    const executable = try openOptionalInteropExecutable(io, search_path, "gnutls-cli");
+    defer executable.close(io);
 
     const rsa_key = rsaTestPrivateKey();
     var cert_buf: [2048]u8 = undefined;
@@ -8709,12 +8740,16 @@ fn gnutlsRsaLeafHandshake(priority: ?[]const u8, verbose: bool) !bool {
     argc += 1;
 
     var child = std.process.spawn(io, .{
+        // Pin the checked executable across unlink/rename of its PATH entry.
+        // Other pre-exec failures remain subject to the pinned std backend;
+        // this is not a general process-spawn repair or child-reaping shim.
+        .exe = .{ .file = executable },
         .argv = argv_buf[0..argc],
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
     }) catch {
-        // gnutls-cli not installed (CI/sandbox): skip silently. A stray stderr
+        // Optional client unavailable: skip silently. A stray stderr
         // line here would make `zig build test` print a spurious "failed command"
         // (see daemon/dlog.zig); the skip is already surfaced by the test runner.
         return error.SkipZigTest;
@@ -8809,6 +8844,92 @@ fn drainFd(fd_opt: ?std.os.linux.fd_t, buf: []u8) usize {
         len += n;
     }
     return len;
+}
+
+const InteropSpawnWitness = struct {
+    threadlocal var calls: usize = 0;
+    threadlocal var unpinned_opens: usize = 0;
+
+    fn open(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        // Bound the FIFO negative control even if the helper regresses: never
+        // delegate a potentially blocking open, and fail the witness assertion.
+        if (!options.path_only) {
+            unpinned_opens += 1;
+            return error.Unexpected;
+        }
+        return std.testing.io.vtable.dirOpenFile(userdata, dir, path, options);
+    }
+
+    fn spawn(_: ?*anyopaque, _: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+        calls += 1;
+        return error.Unexpected;
+    }
+};
+
+test "gnutls-cli interop: unavailable executable skips before spawning" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var vtable = io.vtable.*;
+    vtable.processSpawn = InteropSpawnWitness.spawn;
+    vtable.dirOpenFile = InteropSpawnWitness.open;
+    const witnessed_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    InteropSpawnWitness.calls = 0;
+    InteropSpawnWitness.unpinned_opens = 0;
+    try std.testing.expectError(error.SkipZigTest, gnutlsRsaLeafHandshakeWithPath(witnessed_io, path, null, false));
+    // A present non-executable file and a directory must also be rejected
+    // before the backend can allocate pipes or fork a child.
+    {
+        const file = try tmp.dir.createFile(io, "gnutls-cli", .{});
+        defer file.close(io);
+        try file.setPermissions(io, .fromMode(0o600));
+    }
+    try std.testing.expectError(error.SkipZigTest, gnutlsRsaLeafHandshakeWithPath(witnessed_io, path, null, false));
+    try tmp.dir.deleteFile(io, "gnutls-cli");
+    try tmp.dir.createDir(io, "gnutls-cli", .default_dir);
+    try std.testing.expectError(error.SkipZigTest, gnutlsRsaLeafHandshakeWithPath(witnessed_io, path, null, false));
+    try tmp.dir.deleteDir(io, "gnutls-cli");
+    const linux = std.os.linux;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(tmp.dir.handle, "gnutls-cli", linux.S.IFIFO | 0o600, 0)));
+    try std.testing.expectError(error.SkipZigTest, gnutlsRsaLeafHandshakeWithPath(witnessed_io, path, null, false));
+    // Empty PATH components are ignored by the pinned backend, not '.' searches.
+    try std.testing.expectError(error.SkipZigTest, gnutlsRsaLeafHandshakeWithPath(witnessed_io, "::", null, false));
+    try std.testing.expectEqual(@as(usize, 0), InteropSpawnWitness.calls);
+    try std.testing.expectEqual(@as(usize, 0), InteropSpawnWitness.unpinned_opens);
+}
+
+test "gnutls-cli interop: checked executable remains pinned after PATH entry removal" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    // Use a real native executable with a bounded successful exit. No shell
+    // interpreter or optional GnuTLS installation is needed for this control.
+    const native = try openOptionalInteropExecutable(io, std.Io.Threaded.default_PATH, "true");
+    defer native.close(io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var native_path_buf: [64]u8 = undefined;
+    const native_path = try std.fmt.bufPrint(&native_path_buf, "/proc/self/fd/{d}", .{native.handle});
+    try tmp.dir.symLink(io, native_path, "gnutls-cli", .{});
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const executable = try openOptionalInteropExecutable(io, path, "gnutls-cli");
+    defer executable.close(io);
+    try tmp.dir.deleteFile(io, "gnutls-cli");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "gnutls-cli", .{}));
+    var child = try std.process.spawn(io, .{
+        .exe = .{ .file = executable },
+        // Some hosts implement true as a multicall binary selected by argv[0].
+        .argv = &.{"true"},
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    errdefer child.kill(io);
+    const term = try child.wait(io);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
 test "gnutls-cli interop: RSA-2048 leaf TLS 1.3 handshake (CertificateVerify accepted)" {

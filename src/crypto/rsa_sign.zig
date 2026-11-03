@@ -611,12 +611,45 @@ test "blinded PKCS1 signing verifies across many random blinding bases and stays
     const first_sig = try signPkcs1v15(priv, .sha256, &digest, &first);
     try testing.expect(rsa_verify.verifyPkcs1v15(pub_key, .sha256, &digest, first_sig));
 
-    var i: usize = 0;
-    while (i < 25) : (i += 1) {
-        var sig: [rsa_verify.max_bytes]u8 = undefined;
-        const got = try signPkcs1v15(priv, .sha256, &digest, &sig);
-        try testing.expect(rsa_verify.verifyPkcs1v15(pub_key, .sha256, &digest, got));
-        try testing.expectEqualSlices(u8, first_sig, got);
+    const Work = struct {
+        const worker_count = 4;
+        const Job = struct {
+            signature: [rsa_verify.max_bytes]u8 = undefined,
+            result: Error!usize = error.InvalidInput,
+            verified: bool = false,
+        };
+
+        fn run(jobs: *[25]Job, worker: usize, message_digest: []const u8) void {
+            const key = PrivateKey{ .n = &m2281_n, .e = &m2281_ed, .d = &m2281_ed };
+            const public = rsa_verify.PublicKey{ .n = key.n, .e = key.e };
+            var index = worker;
+            while (index < jobs.len) : (index += worker_count) {
+                const job = &jobs[index];
+                const got = signPkcs1v15(key, .sha256, message_digest, &job.signature) catch |err| {
+                    job.result = err;
+                    continue;
+                };
+                job.verified = rsa_verify.verifyPkcs1v15(public, .sha256, message_digest, got);
+                job.result = got.len;
+            }
+        }
+    };
+    // Preserve all 26 independently blinded signatures and comparisons. Only
+    // this arithmetic-only case uses workers: each owns disjoint stack-backed
+    // results, OS entropy has no shared DRBG, and assertions stay on this thread.
+    var jobs: [25]Work.Job = @splat(.{});
+    {
+        var threads: [Work.worker_count]std.Thread = undefined;
+        var spawned: usize = 0;
+        defer for (threads[0..spawned]) |thread| thread.join();
+        while (spawned < threads.len) : (spawned += 1) {
+            threads[spawned] = try std.Thread.spawn(.{}, Work.run, .{ &jobs, spawned, &digest });
+        }
+    }
+    for (&jobs) |*job| {
+        const len = try job.result;
+        try testing.expect(job.verified);
+        try testing.expectEqualSlices(u8, first_sig, job.signature[0..len]);
     }
 }
 
