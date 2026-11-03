@@ -27,6 +27,18 @@ const session_replica = @import("session_replica.zig");
 pub const Token = [16]u8;
 pub const Error = error{ Truncated, TooLong, TrailingBytes, InvalidMetadata };
 
+/// Snapshots carry the raw session token (replay authority), so snapshot
+/// allocations are secure-zeroed before every free. Split out so the wipe
+/// is testable on caller memory before the free.
+fn wipeBytes(bytes: []u8) void {
+    std.crypto.secureZero(u8, bytes);
+}
+
+fn freeSnapshotBytes(allocator: std.mem.Allocator, snapshot: []u8) void {
+    wipeBytes(snapshot);
+    allocator.free(snapshot);
+}
+
 /// Complete, atomic Helix checkpoint for `PendingMigrations`. This is separate
 /// from the S2S `Capsule` wire above: a hot upgrade must preserve the holding
 /// area's ordering/expiry metadata and consumed-token deny state, not merely
@@ -61,7 +73,13 @@ pub fn encode(allocator: std.mem.Allocator, cap: Capsule) (Error || std.mem.Allo
     if (cap.account.len > std.math.maxInt(u16)) return error.TooLong;
     if (cap.snapshot.len > std.math.maxInt(u32)) return error.TooLong;
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer {
+        wipeBytes(out.items);
+        out.deinit(allocator);
+    }
+    // Exact capacity: growth or a shrinking `toOwnedSlice` could release an
+    // earlier token+snapshot copy without wiping it.
+    try out.ensureTotalCapacityPrecise(allocator, 16 + 2 + cap.account.len + 4 + cap.snapshot.len);
     try out.appendSlice(allocator, &cap.token);
     var alen: [2]u8 = undefined;
     std.mem.writeInt(u16, &alen, @intCast(cap.account.len), .little);
@@ -71,7 +89,8 @@ pub fn encode(allocator: std.mem.Allocator, cap: Capsule) (Error || std.mem.Allo
     std.mem.writeInt(u32, &slen, @intCast(cap.snapshot.len), .little);
     try out.appendSlice(allocator, &slen);
     try out.appendSlice(allocator, cap.snapshot);
-    return out.toOwnedSlice(allocator);
+    std.debug.assert(out.items.len == out.capacity);
+    return out.items;
 }
 
 /// Decode a capsule, returning views that borrow `bytes`.
@@ -218,7 +237,7 @@ pub const PendingMigrations = struct {
         try checkpointAddLen(&total_len, upgrade_checkpoint_checksum_len);
 
         const out = try allocator.alloc(u8, total_len);
-        errdefer allocator.free(out);
+        errdefer freeSnapshotBytes(allocator, out);
         var writer = UpgradeCheckpointWriter{ .bytes = out };
         writer.writeBytes(&upgrade_checkpoint_magic);
         writer.writeByte(upgrade_checkpoint_version);
@@ -340,7 +359,7 @@ pub const PendingMigrations = struct {
             const account = try allocator.dupe(u8, account_view);
             errdefer allocator.free(account);
             const snapshot = try allocator.dupe(u8, snapshot_view);
-            errdefer allocator.free(snapshot);
+            errdefer freeSnapshotBytes(allocator, snapshot);
             restored.map.putAssumeCapacityNoClobber(token, .{
                 .account = account,
                 .snapshot = snapshot,
@@ -380,14 +399,40 @@ pub const PendingMigrations = struct {
         replacement.deinit();
     }
 
+    fn freeEntryBytes(self: *PendingMigrations, entry: Entry) void {
+        self.allocator.free(entry.account);
+        freeSnapshotBytes(self.allocator, entry.snapshot);
+    }
+
+    /// `fetchRemove` plus secure-zero of the token key slot, whose backing
+    /// storage stays allocated in the map after removal. The slot pointer
+    /// is captured before removal; removal does not move/free storage.
+    fn fetchRemoveWipingKey(self: *PendingMigrations, token: Token) ?Entry {
+        const key_ptr = self.map.getKeyPtr(token) orelse return null;
+        const kv = self.map.fetchRemove(token) orelse return null;
+        wipeBytes(key_ptr);
+        return kv.value;
+    }
+
+    fn removeConsumedWipingKey(self: *PendingMigrations, token: Token) bool {
+        const key_ptr = self.consumed.getKeyPtr(token) orelse return false;
+        if (!self.consumed.remove(token)) return false;
+        wipeBytes(key_ptr);
+        return true;
+    }
+
     pub fn deinit(self: *PendingMigrations) void {
-        var it = self.map.valueIterator();
-        while (it.next()) |e| {
-            self.allocator.free(e.account);
-            self.allocator.free(e.snapshot);
+        var it = self.map.iterator();
+        while (it.next()) |slot| {
+            self.allocator.free(slot.value_ptr.account);
+            freeSnapshotBytes(self.allocator, slot.value_ptr.snapshot);
+            wipeBytes(slot.key_ptr);
         }
         self.map.deinit(self.allocator);
+        var consumed_it = self.consumed.keyIterator();
+        while (consumed_it.next()) |key| wipeBytes(key);
         self.consumed.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Store a freshly-arrived capsule (copies the account + snapshot), stamped
@@ -425,17 +470,17 @@ pub const PendingMigrations = struct {
         const account = try self.allocator.dupe(u8, cap.account);
         errdefer self.allocator.free(account);
         const snapshot = try self.allocator.dupe(u8, cap.snapshot);
-        errdefer self.allocator.free(snapshot);
+        errdefer freeSnapshotBytes(self.allocator, snapshot);
         if (!replacing) try self.map.ensureUnusedCapacity(self.allocator, 1);
         // v3+ session credentials are reusable multi-attachment capabilities.
         // A freshly verified signed offer reactivates a token tombstoned by an
         // older one-shot peer during a rolling upgrade. Do this only after all
         // bounds/allocation checks pass so a failed stage preserves old state.
-        if (offer_epoch != 0) _ = self.consumed.remove(cap.token);
+        if (offer_epoch != 0) _ = self.removeConsumedWipingKey(cap.token);
         if (replacing) {
             const current = self.map.getPtr(cap.token).?;
             self.allocator.free(current.account);
-            self.allocator.free(current.snapshot);
+            freeSnapshotBytes(self.allocator, current.snapshot);
             current.* = .{ .account = account, .snapshot = snapshot, .staged_at_ms = now_ms, .offer_epoch = offer_epoch };
         } else {
             self.map.putAssumeCapacityNoClobber(cap.token, .{
@@ -472,10 +517,10 @@ pub const PendingMigrations = struct {
         const account = try self.allocator.dupe(u8, cap.account);
         errdefer self.allocator.free(account);
         const snapshot = try self.allocator.dupe(u8, cap.snapshot);
-        errdefer self.allocator.free(snapshot);
+        errdefer freeSnapshotBytes(self.allocator, snapshot);
         if (!replacing) try self.map.ensureUnusedCapacity(self.allocator, 1);
 
-        _ = self.consumed.remove(cap.token);
+        _ = self.removeConsumedWipingKey(cap.token);
         const replacement = Entry{
             .account = account,
             .snapshot = snapshot,
@@ -487,7 +532,7 @@ pub const PendingMigrations = struct {
         if (replacing) {
             const current = self.map.getPtr(cap.token).?;
             self.allocator.free(current.account);
-            self.allocator.free(current.snapshot);
+            freeSnapshotBytes(self.allocator, current.snapshot);
             current.* = replacement;
         } else {
             self.map.putAssumeCapacityNoClobber(cap.token, replacement);
@@ -501,9 +546,8 @@ pub const PendingMigrations = struct {
     pub fn removeReplica(self: *PendingMigrations, token: Token) bool {
         const current = self.map.get(token) orelse return false;
         if (current.replica_revision == null) return false;
-        const removed = self.map.fetchRemove(token) orelse return false;
-        self.allocator.free(removed.value.account);
-        self.allocator.free(removed.value.snapshot);
+        const removed = self.fetchRemoveWipingKey(token) orelse return false;
+        self.freeEntryBytes(removed);
         return true;
     }
 
@@ -523,9 +567,8 @@ pub const PendingMigrations = struct {
                 }
             }
             const token = expired orelse break;
-            const kv = self.map.fetchRemove(token) orelse continue;
-            self.allocator.free(kv.value.account);
-            self.allocator.free(kv.value.snapshot);
+            const entry = self.fetchRemoveWipingKey(token) orelse continue;
+            self.freeEntryBytes(entry);
             evicted += 1;
         }
         while (true) {
@@ -539,7 +582,7 @@ pub const PendingMigrations = struct {
                 }
             }
             const token = expired orelse break;
-            if (self.consumed.remove(token)) evicted += 1;
+            if (self.removeConsumedWipingKey(token)) evicted += 1;
         }
         return evicted;
     }
@@ -592,13 +635,11 @@ pub const PendingMigrations = struct {
     /// Modern attachment borrows with `get`. Caller owns the returned slices and
     /// releases them with `freeEntry`.
     pub fn take(self: *PendingMigrations, token: Token) ?Entry {
-        const e = self.map.fetchRemove(token) orelse return null;
-        return e.value;
+        return self.fetchRemoveWipingKey(token);
     }
 
     pub fn freeEntry(self: *PendingMigrations, e: Entry) void {
-        self.allocator.free(e.account);
-        self.allocator.free(e.snapshot);
+        self.freeEntryBytes(e);
     }
 
     pub fn count(self: *const PendingMigrations) usize {
@@ -619,14 +660,11 @@ pub const PendingMigrations = struct {
                 oldest_token = entry.key_ptr.*;
             }
         }
-        return if (oldest_token) |token| self.consumed.remove(token) else false;
+        return if (oldest_token) |token| self.removeConsumedWipingKey(token) else false;
     }
 
     fn removeLiveEntry(self: *PendingMigrations, token: Token) void {
-        if (self.map.fetchRemove(token)) |kv| {
-            self.allocator.free(kv.value.account);
-            self.allocator.free(kv.value.snapshot);
-        }
+        if (self.fetchRemoveWipingKey(token)) |entry| self.freeEntryBytes(entry);
     }
 
     fn countForAccount(self: *const PendingMigrations, account: []const u8) usize {
@@ -749,6 +787,34 @@ fn rewriteUpgradeCheckpointChecksum(bytes: []u8) void {
     const body_end = bytes.len - upgrade_checkpoint_checksum_len;
     const checksum = upgradeCheckpointDigest(bytes[0..body_end]);
     @memcpy(bytes[body_end..], &checksum);
+}
+
+test "snapshot wipe helper zeroes bytes and wiping removals keep the store usable" {
+    var buf = "snapshot-token-bytes".*;
+    wipeBytes(&buf);
+    for (buf) |b| try testing.expectEqual(@as(u8, 0), b);
+
+    const allocator = testing.allocator;
+    const token: Token = @splat(0x5a);
+    var pm = PendingMigrations.init(allocator);
+    defer pm.deinit();
+    try pm.put(.{ .token = token, .account = "alice", .snapshot = "snap-one" }, 100);
+    // Replacement wipes+frees the old snapshot; the token stays live.
+    try pm.put(.{ .token = token, .account = "alice", .snapshot = "snap-two" }, 200);
+    try testing.expectEqualStrings("snap-two", pm.get(token).?.snapshot);
+    // Wiping removal (take + freeEntry) must not corrupt the key slot for
+    // a later re-stage of the same token.
+    const taken = pm.take(token).?;
+    pm.freeEntry(taken);
+    try testing.expect(!pm.has(token));
+    try pm.put(.{ .token = token, .account = "alice", .snapshot = "snap-three" }, 300);
+    try testing.expectEqualStrings("snap-three", pm.get(token).?.snapshot);
+    // Consumed-tombstone key wipe: tombstone, then a verified re-stage.
+    try pm.markConsumed(token, 400);
+    try testing.expect(pm.isConsumed(token));
+    try pm.putAtEpoch(.{ .token = token, .account = "alice", .snapshot = "snap-four" }, 500, 7);
+    try testing.expect(!pm.isConsumed(token));
+    try testing.expectEqualStrings("snap-four", pm.get(token).?.snapshot);
 }
 
 test "migration capsule encode/decode round-trips" {

@@ -66,6 +66,10 @@ pub const default_max_response_bytes: usize = 256 * 1024;
 pub const default_max_steps: usize = 64;
 /// Default max bytes of an RFC 7807 problem body logged on error/debug.
 pub const default_error_body_preview_bytes: usize = 512;
+/// Hard ceiling on logged body-preview source bytes, regardless of config.
+/// The CA body is remote-controlled text: the preview is additionally
+/// escaped (see `escapedBodyPreview`) so it can never forge log lines.
+pub const max_error_body_preview_bytes: usize = 1024;
 /// Default max bytes read from /etc/resolv.conf by the built-in resolver.
 pub const default_resolv_conf_max_bytes: usize = 64 * 1024;
 /// Default UDP port used for the built-in resolver's DNS A-record lookups.
@@ -238,6 +242,50 @@ pub fn httpsRequest(
     return plaintext.toOwnedSlice(allocator);
 }
 
+/// Escaped, bounded preview of a remote-controlled response body for logs.
+pub const BodyPreview = struct {
+    text: []const u8,
+    truncated: bool,
+};
+
+/// Render at most `limit` source bytes (hard-capped at
+/// `max_error_body_preview_bytes`) of `body` into `buf` as a single log-safe
+/// line: newline/CR/tab/backslash get C-style escapes, every other control,
+/// DEL, or non-ASCII byte becomes `\xNN`. An escape is never split at the
+/// buffer boundary; `truncated` reports any omitted source bytes.
+pub fn escapedBodyPreview(body: []const u8, limit: usize, buf: []u8) BodyPreview {
+    const effective = @min(limit, max_error_body_preview_bytes);
+    const source = body[0..@min(body.len, effective)];
+    var truncated = body.len > source.len;
+    var out: usize = 0;
+    for (source) |c| {
+        var esc: [4]u8 = undefined;
+        const unit: []const u8 = switch (c) {
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            '\\' => "\\\\",
+            '"' => "\\\"",
+            0x20...0x21, 0x23...0x5b, 0x5d...0x7e => blk: {
+                esc[0] = c;
+                break :blk esc[0..1];
+            },
+            else => blk: {
+                const hex = "0123456789abcdef";
+                esc = .{ '\\', 'x', hex[c >> 4], hex[c & 0xf] };
+                break :blk esc[0..4];
+            },
+        };
+        if (out + unit.len > buf.len) {
+            truncated = true;
+            break;
+        }
+        @memcpy(buf[out..][0..unit.len], unit);
+        out += unit.len;
+    }
+    return .{ .text = buf[0..out], .truncated = truncated };
+}
+
 // ---------------------------------------------------------------------------
 // acme_client.Transport adapter
 // ---------------------------------------------------------------------------
@@ -290,8 +338,16 @@ pub const HttpsTransport = struct {
         // Trace every exchange under --debug; always surface error bodies (the
         // RFC 7807 problem document) so failures are diagnosable without --debug.
         if (self.debug or resp.status >= 300) {
-            const preview = resp.body[0..@min(resp.body.len, self.error_body_preview_bytes)];
-            dlog.log("acme<- {s} {s} -> {d} (body {d}B)\n  {s}\n", .{ method, url_str, resp.status, resp.body.len, preview });
+            var preview_buf: [4 * max_error_body_preview_bytes]u8 = undefined;
+            const preview = escapedBodyPreview(resp.body, self.error_body_preview_bytes, &preview_buf);
+            dlog.log("acme<- {s} {s} -> {d} (body {d}B) preview=\"{s}\"{s}\n", .{
+                method,
+                url_str,
+                resp.status,
+                resp.body.len,
+                preview.text,
+                if (preview.truncated) "...[truncated]" else "",
+            });
         }
         return .{
             .status = resp.status,
@@ -389,7 +445,7 @@ pub fn applyToml(cfg: *IssueConfig, doc: *const toml.Document) void {
         if (v != 0) cfg.max_response_bytes = @intCast(v);
     }
     if (doc.getUint("acme.error_body_preview_bytes")) |v| {
-        cfg.error_body_preview_bytes = @intCast(v);
+        cfg.error_body_preview_bytes = @intCast(@min(v, max_error_body_preview_bytes));
     }
     if (doc.getUint("acme.resolv_conf_max_bytes")) |v| {
         if (v != 0) cfg.resolv_conf_max_bytes = @intCast(v);
@@ -1457,6 +1513,57 @@ test "applyToml overlays runner acme tunables" {
     try std.testing.expectEqual(@as(usize, 1024), cfg.error_body_preview_bytes);
     try std.testing.expectEqual(@as(usize, 131072), cfg.resolv_conf_max_bytes);
     try std.testing.expectEqual(@as(u16, 5353), cfg.dns_port);
+}
+
+test "escapedBodyPreview escapes log-forging bytes and passes printable text" {
+    var buf: [256]u8 = undefined;
+    const body = "{\"detail\":\"bad\x0aforged\x0d\x09line\"}\x1b[31m\x00\x7f\xff\x5c";
+    const preview = escapedBodyPreview(body, default_error_body_preview_bytes, &buf);
+    try std.testing.expectEqualStrings(
+        "{\\\"detail\\\":\\\"bad\\nforged\\r\\tline\\\"}\\x1b[31m\\x00\\x7f\\xff\\\\",
+        preview.text,
+    );
+    try std.testing.expect(!preview.truncated);
+    for (preview.text) |c| try std.testing.expect(c >= 0x20 and c < 0x7f);
+}
+
+test "escapedBodyPreview bounds source bytes, hard-caps the limit, and never splits an escape" {
+    var buf: [8]u8 = undefined;
+    // Limit is clamped to the hard cap; a 4-byte escape that would cross the
+    // buffer boundary is omitted whole and reported as truncation.
+    var split_buf: [7]u8 = undefined;
+    const split = escapedBodyPreview("abcd\x01efgh", std.math.maxInt(usize), &split_buf);
+    try std.testing.expectEqualStrings("abcd", split.text);
+    try std.testing.expect(split.truncated);
+
+    var big_buf: [4 * max_error_body_preview_bytes]u8 = undefined;
+    const long_body: [max_error_body_preview_bytes + 64]u8 = @splat('x');
+    const capped = escapedBodyPreview(&long_body, std.math.maxInt(usize), &big_buf);
+    try std.testing.expectEqual(@as(usize, max_error_body_preview_bytes), capped.text.len);
+    try std.testing.expect(capped.truncated);
+
+    const limited = escapedBodyPreview("hello world", 5, &buf);
+    try std.testing.expectEqualStrings("hello", limited.text);
+    try std.testing.expect(limited.truncated);
+
+    const empty = escapedBodyPreview("", 512, &buf);
+    try std.testing.expectEqualStrings("", empty.text);
+    try std.testing.expect(!empty.truncated);
+}
+
+test "applyToml clamps error_body_preview_bytes to the hard cap" {
+    const allocator = std.testing.allocator;
+    var doc = try toml.parse(allocator, "[acme]\nerror_body_preview_bytes = 999999\n");
+    defer doc.deinit(allocator);
+
+    var cfg: IssueConfig = .{
+        .directory_url = "https://x/dir",
+        .domains = &.{"x.test"},
+        .trust_anchors = &.{},
+        .cert_out_path = "/p/c.pem",
+    };
+    applyToml(&cfg, &doc);
+    try std.testing.expectEqual(max_error_body_preview_bytes, cfg.error_body_preview_bytes);
 }
 
 test "applyToml leaves runner defaults when acme table absent" {

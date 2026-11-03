@@ -321,28 +321,40 @@ pub const Vapid = struct {
         return .{ .key_pair = ecdsa.KeyPair.fromSecretKey(sk) catch return error.InvalidVapidKey };
     }
 
+    /// Owner-only on platforms with POSIX modes. Windows uses the protected
+    /// DACL paths above and never reaches `loadOrCreate` for custody.
+    const key_permissions: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
+        .fromMode(0o600)
+    else
+        .default_file;
+
     /// Load the VAPID key from `sub_path`, or create + persist a fresh one.
     /// Format on disk: 64 lowercase hex chars of the P-256 secret scalar.
+    /// The read side is exactly `loadExisting` (heap text and stack secret
+    /// wiped); creation is exclusive with owner-only permissions from the
+    /// first byte, so a concurrent boot cannot clobber the key and no other
+    /// local user can read it in a permissive-mode window.
     pub fn loadOrCreate(io: std.Io, allocator: Allocator, dir: std.Io.Dir, sub_path: []const u8) !Vapid {
-        if (dir.readFileAlloc(io, sub_path, allocator, .limited(256))) |text| {
-            defer allocator.free(text);
-            const trimmed = std.mem.trim(u8, text, " \r\n\t");
-            if (trimmed.len == 64) {
-                var secret: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&secret, trimmed) catch return error.InvalidVapidKey;
-                const sk = ecdsa.SecretKey.fromBytes(secret) catch return error.InvalidVapidKey;
-                const kp = ecdsa.KeyPair.fromSecretKey(sk) catch return error.InvalidVapidKey;
-                return .{ .key_pair = kp };
-            }
-            return error.InvalidVapidKey;
+        if (loadExisting(io, allocator, dir, sub_path)) |existing| {
+            return existing;
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         }
 
-        const kp = ecdsa.KeyPair.generate(io);
-        const hex = std.fmt.bytesToHex(kp.secret_key.toBytes(), .lower);
-        try dir.writeFile(io, .{ .sub_path = sub_path, .data = &hex });
+        var kp = ecdsa.KeyPair.generate(io);
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+        var hex = std.fmt.bytesToHex(kp.secret_key.toBytes(), .lower);
+        defer std.crypto.secureZero(u8, &hex);
+        var file = dir.createFile(io, sub_path, .{ .exclusive = true, .permissions = key_permissions }) catch |err| switch (err) {
+            // Lost a create race against a concurrent boot: trust whoever won.
+            error.PathAlreadyExists => return loadExisting(io, allocator, dir, sub_path),
+            else => return err,
+        };
+        errdefer dir.deleteFile(io, sub_path) catch {};
+        defer file.close(io);
+        try file.writeStreamingAll(io, &hex);
+        try file.sync(io);
         return .{ .key_pair = kp };
     }
 
@@ -369,6 +381,32 @@ pub const Vapid = struct {
         return b64url.Encoder.encode(out, &sec1);
     }
 };
+
+/// Log-safe reference to a push endpoint. The endpoint path is an opaque
+/// per-subscription bearer token, so logs carry only the push-service host
+/// and a short hash that still correlates repeated failures for one
+/// subscription without disclosing the token.
+pub const EndpointLogRef = struct {
+    host: []const u8,
+    hash_hex: [16]u8,
+};
+
+pub fn endpointLogRef(endpoint: []const u8) EndpointLogRef {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(endpoint, &digest, .{});
+    const hash_hex = std.fmt.bytesToHex(digest[0..8], .lower);
+    const url = acme_runner.Url.parse(endpoint) catch
+        return .{ .host = "<invalid>", .hash_hex = hash_hex };
+    // Stored endpoints are not re-validated at decode time; refuse to echo a
+    // host carrying bytes that could forge log lines.
+    for (url.host) |c| {
+        const safe = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '-' or c == '_' or
+            c == ':' or c == '[' or c == ']';
+        if (!safe) return .{ .host = "<invalid>", .hash_hex = hash_hex };
+    }
+    return .{ .host = url.host, .hash_hex = hash_hex };
+}
 
 // ── Delivery worker ──────────────────────────────────────────────────────────
 
@@ -769,7 +807,8 @@ pub const Worker = struct {
             if (builtin.is_test) if (self.delivery_fixture) |fixture| fixture.beforeDelivery();
             self.deliver(&job) catch |err| {
                 self.failed +|= 1;
-                dlog.log("webpush: delivery to {s} failed: {s}\n", .{ job.endpoint, @errorName(err) });
+                const ref = endpointLogRef(job.endpoint);
+                dlog.log("webpush: delivery to host={s} ep={s} failed: {s}\n", .{ ref.host, &ref.hash_hex, @errorName(err) });
             };
         }
     }
@@ -868,7 +907,8 @@ pub const Worker = struct {
             return;
         }
         self.failed +|= 1;
-        dlog.log("webpush: {s} answered {d}\n", .{ job.endpoint, status });
+        const ref = endpointLogRef(job.endpoint);
+        dlog.log("webpush: host={s} ep={s} answered {d}\n", .{ ref.host, &ref.hash_hex, status });
     }
 };
 
@@ -915,6 +955,49 @@ test "webpush Windows VAPID key requires private parent and persists with privat
     var first_b64: [vapid_pub_b64_len]u8 = undefined;
     var second_b64: [vapid_pub_b64_len]u8 = undefined;
     try testing.expectEqualStrings(created.publicB64(&first_b64), restarted.publicB64(&second_b64));
+}
+
+test "webpush POSIX VAPID loadOrCreate creates owner-only (0o600) and never overwrites" {
+    if (comptime builtin.os.tag == .windows or std.posix.mode_t == u0) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var created = try Vapid.loadOrCreate(testing.io, testing.allocator, tmp.dir, "vapid.key");
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&created));
+
+    const st = try tmp.dir.statFile(testing.io, "vapid.key", .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    try testing.expectEqual(@as(std.posix.mode_t, 0), st.permissions.toMode() & 0o077);
+
+    // A second loadOrCreate returns the persisted key, never a fresh one.
+    var reloaded = try Vapid.loadOrCreate(testing.io, testing.allocator, tmp.dir, "vapid.key");
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&reloaded));
+    var first_b64: [vapid_pub_b64_len]u8 = undefined;
+    var second_b64: [vapid_pub_b64_len]u8 = undefined;
+    try testing.expectEqualStrings(created.publicB64(&first_b64), reloaded.publicB64(&second_b64));
+
+    // A corrupt keyfile fails closed and is left untouched for the operator.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "corrupt.key", .data = "not-a-key" });
+    try testing.expectError(error.InvalidVapidKey, Vapid.loadOrCreate(testing.io, testing.allocator, tmp.dir, "corrupt.key"));
+    const after = try tmp.dir.readFileAlloc(testing.io, "corrupt.key", testing.allocator, .limited(64));
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("not-a-key", after);
+}
+
+test "webpush endpointLogRef exposes host and hash only, never the endpoint token" {
+    const a = endpointLogRef("https://push.example.net/send/SECRET_TOKEN_A?x=1");
+    const b = endpointLogRef("https://push.example.net/send/SECRET_TOKEN_B");
+    try testing.expectEqualStrings("push.example.net", a.host);
+    try testing.expectEqualStrings("push.example.net", b.host);
+    try testing.expect(!std.mem.eql(u8, &a.hash_hex, &b.hash_hex));
+    try testing.expect(std.mem.indexOf(u8, a.host, "SECRET") == null);
+    try testing.expect(std.mem.indexOfScalar(u8, a.host, '/') == null);
+
+    const again = endpointLogRef("https://push.example.net/send/SECRET_TOKEN_A?x=1");
+    try testing.expectEqualStrings(&a.hash_hex, &again.hash_hex);
+
+    const invalid = endpointLogRef("not a url\nforged log line");
+    try testing.expectEqualStrings("<invalid>", invalid.host);
 }
 
 test "webpush Windows HTTPS delivers encrypted POST and records 201 and 410" {

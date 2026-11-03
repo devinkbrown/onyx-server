@@ -278,6 +278,11 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.media_reactions_max_token_bytes = @intCast(cfg.media.reactions_max_token_bytes);
     out.native_media_require_mac = cfg.media.native_media_require_mac;
     out.ws_media_relay = cfg.media.ws_media_relay;
+    out.media_recording_enabled = cfg.media.recording_enabled;
+    out.media_recording_dir = cfg.media.recording_dir;
+    out.media_recording_retention_days = cfg.media.recording_retention_days;
+    out.media_recording_max_total_bytes = cfg.media.recording_max_total_bytes;
+    out.media_recording_max_duration_secs = cfg.media.recording_max_duration_secs;
     out.ws_media_require_mac = cfg.media.ws_media_require_mac;
     out.media_dtls_srtp = cfg.media.dtls_srtp;
     out.media_dtls13 = cfg.media.dtls13;
@@ -327,6 +332,7 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.modes_per_line = cfg.limits.modes_per_line;
     out.monitorlimit = cfg.limits.monitorlimit;
     out.silencelimit = cfg.limits.silencelimit;
+    out.whowas_max_entries = cfg.limits.whowas_max_entries;
     if (cfg.limits.handshake_timeout_ms != 0) out.registration_timeout_ms = @intCast(cfg.limits.handshake_timeout_ms);
     if (cfg.limits.ping_interval_ms != 0) out.ping_interval_ms = @intCast(cfg.limits.ping_interval_ms);
     if (cfg.limits.ping_timeout_ms != 0) out.ping_timeout_ms = @intCast(cfg.limits.ping_timeout_ms);

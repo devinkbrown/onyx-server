@@ -26,6 +26,17 @@ const wasm_bridge = @import("../../wasm/host/bridge.zig");
 const freeStringList = @import("values.zig").freeStringList;
 const freeWasmRegistry = @import("wasm_values.zig").freeWasmRegistry;
 
+/// Credential-bearing config strings are secure-zeroed before free.
+/// Split out so the wipe is testable on caller memory before the free.
+fn wipeSecretBytes(value: []const u8) void {
+    std.crypto.secureZero(u8, @constCast(value));
+}
+
+fn freeSecret(allocator: std.mem.Allocator, value: []const u8) void {
+    wipeSecretBytes(value);
+    allocator.free(value);
+}
+
 const default_search_index_config = search_index_mod.SearchIndex.Config{};
 
 pub const acme_default_directory_url = "https://acme-v02.api.letsencrypt.org/directory";
@@ -410,6 +421,8 @@ pub const Config = struct {
         monitorlimit: u32 = 128,
         /// Max SILENCE masks per client (advertised as SILENCE).
         silencelimit: u32 = 32,
+        /// Max WHOWAS history entries returned per query.
+        whowas_max_entries: u32 = 20,
         max_clones_per_ip: u32 = 0,
         max_clones_per_net: u32 = 0,
         /// Nick-delay window (ms): how long a released nick is held against reuse
@@ -538,6 +551,14 @@ pub const Config = struct {
         /// otherwise it falls through to the hardened 1.2 path. Kept separate
         /// pending real-browser interop validation of the 1.3 handshake.
         dtls13: bool = false,
+        /// Strict call recording (packet journal). Off by default; when on,
+        /// `recording_dir` is mandatory and recording still requires
+        /// unanimous participant consent at runtime.
+        recording_enabled: bool = false,
+        recording_dir: ?[]const u8 = null,
+        recording_retention_days: u32 = 7,
+        recording_max_total_bytes: u64 = 512 * 1024 * 1024,
+        recording_max_duration_secs: u64 = 4 * 3600,
         /// STUN server (IPv4 literal) queried at boot for the reflexive media
         /// candidate; with stun_port set, overrides listen.media_host on success.
         stun_host: ?[]const u8 = null,
@@ -960,7 +981,7 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.node.public_key) |value| allocator.free(value);
-        if (self.node.secret_key) |value| allocator.free(value);
+        if (self.node.secret_key) |value| freeSecret(allocator, value);
         allocator.free(self.network.name);
         if (self.network.server_name) |v| allocator.free(v);
         if (self.network.description) |v| allocator.free(v);
@@ -1017,20 +1038,21 @@ pub const Config = struct {
         if (self.mail.relay_host) |value| allocator.free(value);
         if (self.mail.from) |value| allocator.free(value);
         if (self.mail.user) |value| allocator.free(value);
-        if (self.mail.pass) |value| allocator.free(value);
+        if (self.mail.pass) |value| freeSecret(allocator, value);
         if (self.mail.trust_store_path) |value| allocator.free(value);
         if (self.webauthn.rp_id) |value| allocator.free(value);
         freeStringList(allocator, self.webauthn.origins);
-        if (self.mesh.mesh_pass) |value| allocator.free(value);
-        if (self.mesh.admission_token) |value| allocator.free(value);
+        if (self.mesh.mesh_pass) |value| freeSecret(allocator, value);
+        if (self.mesh.admission_token) |value| freeSecret(allocator, value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
         if (self.sasl.oauth_issuer) |value| allocator.free(value);
         if (self.sasl.oauth_audience) |value| allocator.free(value);
         if (self.sasl.oauth_account_claim) |value| allocator.free(value);
-        if (self.sasl.oauth_hmac_key) |value| allocator.free(value);
+        if (self.sasl.oauth_hmac_key) |value| freeSecret(allocator, value);
         if (self.sasl.oauth_jwks_file) |value| allocator.free(value);
         if (self.sasl.oauth_pubkey) |value| allocator.free(value);
+        if (self.media.recording_dir) |value| allocator.free(value);
         if (self.media.stun_host) |value| allocator.free(value);
         allocator.free(self.stats.dir);
         allocator.free(self.stats.channel_dir);
@@ -1042,8 +1064,8 @@ pub const Config = struct {
         if (self.webhook.public_url_base) |value| allocator.free(value);
         allocator.free(self.geoip.database);
         allocator.free(self.geoip.asn_database);
-        if (self.cloak.secret) |value| allocator.free(value);
-        if (self.cloak.previous_secret) |value| allocator.free(value);
+        if (self.cloak.secret) |value| freeSecret(allocator, value);
+        if (self.cloak.previous_secret) |value| freeSecret(allocator, value);
         if (self.cloak.suffix) |value| allocator.free(value);
         if (self.cloak.mode) |value| allocator.free(value);
         allocator.free(self.tls.dns_name);
@@ -1069,3 +1091,9 @@ pub const Config = struct {
         self.* = .{};
     }
 };
+
+test "wipeSecretBytes zeroes credential bytes" {
+    var buf = "node-secret-hex-value".*;
+    wipeSecretBytes(&buf);
+    for (buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}

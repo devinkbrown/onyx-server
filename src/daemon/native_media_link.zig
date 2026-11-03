@@ -38,6 +38,76 @@ pub const TransportAddress = media_transport.TransportAddress;
 /// Result of registering: whether this was a fresh slot or an update.
 pub const RegisterError = error{ Full, BadId };
 
+/// Which transport produced a tapped packet.
+pub const TapTransport = enum { native_cadence, webrtc_rtp };
+
+/// Codec identity reported to a tap. Native cadence codecs come from the
+/// frame header; RTP codecs are resolved from the payload type (native and
+/// gateway codecs share dynamic PTs, so see the emitting transport's docs).
+pub const TapCodec = enum { cadencevox, cadencevis, opus, vp8, raw, unknown };
+
+/// Media kind reported to a tap (mirrors `MediaKind` plus `unknown` for RTP
+/// payload types the transport cannot classify).
+pub const TapKind = enum { voice, video, screen, unknown };
+
+/// One accepted, actually-forwarded media packet, as seen by a `MediaTap`.
+///
+/// Every slice is BORROWED: it is valid only for the duration of the tap
+/// callback. A tap that needs the data later must copy it during the call.
+/// `channel`/`participant` are empty when the emitting transport does not
+/// carry that identity at its forward point. `timestamp` is the cadence
+/// media-clock timestamp (native) or the 32-bit RTP timestamp zero-extended
+/// (WebRTC). `keyframe` is null when the transport cannot derive it without
+/// parsing codec payloads (RTP). `payload` is the encoded codec payload
+/// only — container/RTP headers are stripped.
+pub const TapEvent = struct {
+    transport: TapTransport,
+    channel: []const u8 = "",
+    participant: []const u8 = "",
+    /// Cadence `stream_id` (native) or RTP SSRC (WebRTC).
+    stream_id: u32 = 0,
+    codec: TapCodec = .unknown,
+    kind: TapKind = .unknown,
+    timestamp: ?u64 = null,
+    sequence: ?u32 = null,
+    keyframe: ?bool = null,
+    payload: []const u8,
+};
+
+/// Optional, default-off observation hook for forwarded media packets.
+///
+/// The callback runs SYNCHRONOUSLY on the media forwarding thread (the
+/// native media pump thread for `NativeMediaLink`, the `MediaPlane` pump
+/// thread for WebRTC) and therefore must NEVER block: no socket/file I/O,
+/// no lock that can be held across I/O, no unbounded allocation, and no
+/// re-entering the forwarding object that invoked it. The intended shape is
+/// "copy the event into the tap's own bounded queue and return". A slow or
+/// blocking callback directly stalls media forwarding for every call on
+/// that pump. The callback must not retain any slice from `TapEvent`.
+///
+/// A tap is process-local authority: it is never serialized into Helix
+/// snapshots, and a restored link/plane always starts with a null tap.
+pub const MediaTap = struct {
+    ctx: *anyopaque,
+    on_packet: *const fn (ctx: *anyopaque, event: TapEvent) void,
+};
+
+fn tapKindOf(kind: MediaKind) TapKind {
+    return switch (kind) {
+        .voice => .voice,
+        .video => .video,
+        .screen => .screen,
+    };
+}
+
+fn tapCodecOf(codec: cadence_frame.CodecTag) TapCodec {
+    return switch (codec) {
+        .cadencevox_audio => .cadencevox,
+        .cadencevis_video => .cadencevis,
+        .raw => .raw,
+    };
+}
+
 pub fn NativeMediaLink(comptime max_participants: usize) type {
     return struct {
         const Self = @This();
@@ -70,6 +140,14 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
         entries: [max_participants]Entry = undefined,
         len: usize = 0,
         max_participants_runtime: usize = max_participants,
+        /// Optional forwarded-packet tap; null (the default) is byte-identical
+        /// to no tap and costs one null check per forwarded frame. Excluded
+        /// from snapshots (process-local callback; see `MediaTap`).
+        tap: ?MediaTap = null,
+        /// Copied channel label reported to the tap; empty until the owner
+        /// calls `setTapChannel`. Copied so the label never dangles.
+        tap_channel_buf: [128]u8 = @splat(0),
+        tap_channel_len: usize = 0,
 
         pub const SnapshotEntry = struct {
             id: ParticipantId = .{},
@@ -245,6 +323,42 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             return self.len;
         }
 
+        /// Install (or clear, with null) the forwarded-packet tap. Not
+        /// internally synchronized: call it from the same thread that drives
+        /// `inbound`/`inboundFrom`, or before that pump starts. See
+        /// `MediaTap` for the non-blocking callback contract.
+        pub fn setTap(self: *Self, tap: ?MediaTap) void {
+            self.tap = tap;
+        }
+
+        /// Set the channel label reported in tap events (copied; a label
+        /// longer than the buffer is truncated). The link is per-call, so
+        /// the owning transport supplies the name once at setup.
+        pub fn setTapChannel(self: *Self, channel: []const u8) void {
+            const n = @min(channel.len, self.tap_channel_buf.len);
+            @memcpy(self.tap_channel_buf[0..n], channel[0..n]);
+            self.tap_channel_len = n;
+        }
+
+        /// Fire the tap once for a frame that `forwardView` actually
+        /// forwarded (non-empty recipient set). One null check when no tap
+        /// is installed.
+        inline fn emitTap(self: *Self, view: cadence_frame.FrameView, source: ParticipantId, kind: MediaKind) void {
+            const tap = self.tap orelse return;
+            tap.on_packet(tap.ctx, .{
+                .transport = .native_cadence,
+                .channel = self.tap_channel_buf[0..self.tap_channel_len],
+                .participant = source.slice(),
+                .stream_id = view.stream_id,
+                .codec = tapCodecOf(view.codec),
+                .kind = tapKindOf(kind),
+                .timestamp = view.timestamp,
+                .sequence = view.sequence,
+                .keyframe = view.keyframe,
+                .payload = view.payload,
+            });
+        }
+
         fn addrForId(self: *Self, id: ParticipantId) ?TransportAddress {
             if (self.findById(id)) |e| return e.addr;
             return null;
@@ -333,6 +447,13 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
                     n += 1;
                 }
             }
+            // Single post-acceptance tap point for the native leg: by here
+            // the frame decoded, its publisher is a registered participant
+            // (callers authenticate datagrams — MAC / address ownership —
+            // before `inboundFrom`), and the layer-selection decision kept
+            // at least one recipient. Unknown streams, spoofed sources and
+            // fully layer-dropped frames never reach this call.
+            if (n != 0) self.emitTap(view, source, src_kind);
             return n;
         }
     };
@@ -588,4 +709,119 @@ test "active media DTO native link next genuine cadence datagram preserves forwa
     try testing.expectEqual(@as(usize, 1), candidate.inboundFrom(packet, source, &b));
     try testing.expect(a[0].eql(receiver) and b[0].eql(receiver));
     try testing.expectEqualDeep(try old.capture(), try candidate.capture());
+}
+
+const TapProbe = struct {
+    calls: usize = 0,
+    transport: TapTransport = .webrtc_rtp,
+    channel_buf: [32]u8 = undefined,
+    channel_len: usize = 0,
+    participant_buf: [32]u8 = undefined,
+    participant_len: usize = 0,
+    stream_id: u32 = 0,
+    codec: TapCodec = .unknown,
+    kind: TapKind = .unknown,
+    timestamp: ?u64 = null,
+    sequence: ?u32 = null,
+    keyframe: ?bool = null,
+    payload_buf: [16]u8 = undefined,
+    payload_len: usize = 0,
+
+    fn onPacket(ctx: *anyopaque, event: TapEvent) void {
+        const self: *TapProbe = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.transport = event.transport;
+        self.channel_len = @min(event.channel.len, self.channel_buf.len);
+        @memcpy(self.channel_buf[0..self.channel_len], event.channel[0..self.channel_len]);
+        self.participant_len = @min(event.participant.len, self.participant_buf.len);
+        @memcpy(self.participant_buf[0..self.participant_len], event.participant[0..self.participant_len]);
+        self.stream_id = event.stream_id;
+        self.codec = event.codec;
+        self.kind = event.kind;
+        self.timestamp = event.timestamp;
+        self.sequence = event.sequence;
+        self.keyframe = event.keyframe;
+        self.payload_len = @min(event.payload.len, self.payload_buf.len);
+        @memcpy(self.payload_buf[0..self.payload_len], event.payload[0..self.payload_len]);
+    }
+
+    fn tap(self: *TapProbe) MediaTap {
+        return .{ .ctx = self, .on_packet = onPacket };
+    }
+};
+
+test "media tap fires exactly once per forwarded native frame with borrowed payload" {
+    var link = NativeMediaLink(8).init();
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
+    try link.register("alice", .voice, 100, mkAddr(1, 5000));
+    try link.register("bob", .voice, 200, mkAddr(2, 5000));
+    try link.register("carol", .voice, 300, mkAddr(3, 5000));
+    var probe: TapProbe = .{};
+    link.setTap(probe.tap());
+    link.setTapChannel("#tapchan");
+
+    var fbuf: [64]u8 = undefined;
+    var out: [8]TransportAddress = undefined;
+    // Forwarded to TWO recipients, but the tap is per-packet: exactly once.
+    try testing.expectEqual(@as(usize, 2), link.inbound(frame(100, floor, 7, true, &fbuf), &out));
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    try testing.expectEqual(TapTransport.native_cadence, probe.transport);
+    try testing.expectEqualStrings("#tapchan", probe.channel_buf[0..probe.channel_len]);
+    try testing.expectEqualStrings("alice", probe.participant_buf[0..probe.participant_len]);
+    try testing.expectEqual(@as(u32, 100), probe.stream_id);
+    try testing.expectEqual(TapCodec.cadencevox, probe.codec);
+    try testing.expectEqual(TapKind.voice, probe.kind);
+    try testing.expectEqual(@as(?u32, 7), probe.sequence);
+    try testing.expectEqual(@as(?bool, true), probe.keyframe);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC }, probe.payload_buf[0..probe.payload_len]);
+}
+
+test "media tap does not fire for rejected or dropped native frames" {
+    var link = NativeMediaLink(8).init();
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
+    try link.register("src", .video, 10, mkAddr(1, 6000));
+    try link.register("lowbw", .video, 11, mkAddr(2, 6000));
+    link.setSelection("lowbw", .{ .max_spatial = 0, .max_temporal = 0 });
+    var probe: TapProbe = .{};
+    link.setTap(probe.tap());
+
+    var fbuf: [64]u8 = undefined;
+    var out: [8]TransportAddress = undefined;
+    // Unknown stream_id: rejected before the forward decision.
+    try testing.expectEqual(@as(usize, 0), link.inbound(frame(999, floor, 1, false, &fbuf), &out));
+    // Malformed datagram: rejected at decode.
+    try testing.expectEqual(@as(usize, 0), link.inbound("not a frame", &out));
+    // Known publisher but layer-dropped for every recipient.
+    try testing.expectEqual(@as(usize, 0), link.inbound(frame(10, floor + 1, 2, false, &fbuf), &out));
+    try testing.expectEqual(@as(usize, 0), probe.calls);
+    // Same publisher at the base layer forwards, and only then taps.
+    try testing.expectEqual(@as(usize, 1), link.inbound(frame(10, floor, 3, false, &fbuf), &out));
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    // Spoofed source address after binding: refused, no tap.
+    try testing.expectEqual(@as(usize, 0), link.inboundFrom(frame(10, floor, 4, false, &fbuf), mkAddr(9, 6000), &out));
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "null media tap (default and after clearing) changes no forwarding behavior" {
+    var plain = NativeMediaLink(8).init();
+    var cleared = NativeMediaLink(8).init();
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
+    for ([_]*NativeMediaLink(8){ &plain, &cleared }) |link| {
+        try link.register("alice", .voice, 100, mkAddr(1, 5000));
+        try link.register("bob", .voice, 200, mkAddr(2, 5000));
+    }
+    var probe: TapProbe = .{};
+    cleared.setTap(probe.tap());
+    cleared.setTap(null);
+
+    var fbuf: [64]u8 = undefined;
+    const dgram = frame(100, floor, 1, false, &fbuf);
+    var out_a: [8]TransportAddress = undefined;
+    var out_b: [8]TransportAddress = undefined;
+    const na = plain.inbound(dgram, &out_a);
+    const nb = cleared.inbound(dgram, &out_b);
+    try testing.expectEqual(na, nb);
+    for (out_a[0..na], out_b[0..nb]) |a, b| try testing.expect(a.eql(b));
+    try testing.expectEqual(@as(usize, 0), probe.calls);
+    try testing.expectEqualDeep(try plain.capture(), try cleared.capture());
 }

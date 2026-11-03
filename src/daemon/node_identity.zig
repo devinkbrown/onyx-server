@@ -74,10 +74,10 @@ pub fn nodeIdFromPublicKey(pk: sign.PublicKey) [20]u8 {
     return nodeIdFromKey(pk);
 }
 
-fn kemSeed(seed: [32]u8) [32]u8 {
+fn kemSeed(seed: *const [32]u8) [32]u8 {
     var h = Blake3.init(.{});
     h.update("MZ-KEM");
-    h.update(&seed);
+    h.update(seed);
     var out: [32]u8 = undefined;
     h.final(&out);
     return out;
@@ -85,8 +85,14 @@ fn kemSeed(seed: [32]u8) [32]u8 {
 
 /// Derive a full identity from a raw 32-byte Ed25519 seed and a realm name.
 pub fn fromSeed(seed: [32]u8, realm: []const u8) Error!NodeIdentity {
-    const sign_kp = try sign.KeyPair.fromSeed(seed);
-    const kem_kp = try xwing.KeyPair.generateDeterministic(kemSeed(seed));
+    // Work from one mutable stack copy and wipe it (and the derived KEM
+    // seed) on every exit; by-value copies inside callees are theirs.
+    var seed_local = seed;
+    defer std.crypto.secureZero(u8, &seed_local);
+    var kem_seed = kemSeed(&seed_local);
+    defer std.crypto.secureZero(u8, &kem_seed);
+    const sign_kp = try sign.KeyPair.fromSeed(seed_local);
+    const kem_kp = try xwing.KeyPair.generateDeterministic(kem_seed);
     return .{
         .sign_kp = sign_kp,
         .kem_kp = kem_kp,
@@ -100,6 +106,7 @@ pub fn fromSeed(seed: [32]u8, realm: []const u8) Error!NodeIdentity {
 pub fn fromConfig(secret_hex: []const u8, realm: []const u8) Error!NodeIdentity {
     if (secret_hex.len != 64) return error.BadSeed;
     var seed: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
     _ = std.fmt.hexToBytes(&seed, secret_hex) catch return error.BadSeed;
     return fromSeed(seed, realm);
 }

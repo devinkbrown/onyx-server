@@ -149,6 +149,12 @@ pub fn Bus(comptime mods: []const registry.Module) type {
                 return total;
             }
 
+            pub fn totalUnavailable(self: *const Instance) u64 {
+                var total: u64 = 0;
+                for (&self.unavailable) |*counter| total +%= counter.load(.monotonic);
+                return total;
+            }
+
             /// Only use with no concurrent emitters (tests or before startup).
             pub fn resetStats(self: *Instance) void {
                 for (&self.emitted, &self.handler_errors, &self.vetoed, &self.unavailable) |*a, *b, *c, *d| {
@@ -186,6 +192,10 @@ pub fn Bus(comptime mods: []const registry.Module) type {
 
         pub fn totalHandlerErrors() u64 {
             return legacy.totalHandlerErrors();
+        }
+
+        pub fn totalUnavailable() u64 {
+            return legacy.totalUnavailable();
         }
 
         pub fn resetStats() void {
@@ -344,6 +354,11 @@ const faultingInfoModule = registry.Module{
     },
 };
 
+const faultingMessageModule = registry.Module{
+    .id = "bus.message-fault",
+    .hooks = &.{.{ .hook = .message_pre_deliver, .handler = faulting }},
+};
+
 test "emit delivers in priority order" {
     const B = Bus(&.{orderModule});
     var rec = Recorder{};
@@ -428,6 +443,39 @@ test "equal-priority subscribers run in dependency order, not manifest order" {
 
     _ = B.emit(.client_registered, &rec, &payload);
     try testing.expectEqualStrings("FL", rec.order());
+}
+
+test "message_pre_deliver records unavailable and handler failure on an instance bus" {
+    const B = Bus(&.{faultingMessageModule});
+    var bus: B.Instance = .{};
+    const GateState = struct {
+        allow: bool,
+        fn available(ctx: *const anyopaque, _: usize) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            return self.allow;
+        }
+    };
+    var state = GateState{ .allow = false };
+    const gate = registry.ModuleGate{ .ctx = &state, .available = GateState.available };
+    var recorder = Recorder{};
+    var payload = registry.MessagePreDeliverPayload{ .source_id = 1, .target = "#room", .text = "hello" };
+
+    try testing.expect(!bus.approve(.message_pre_deliver, &recorder, &payload, gate));
+    var stats = bus.stats(.message_pre_deliver);
+    try testing.expectEqual(@as(u64, 1), stats.unavailable);
+    try testing.expectEqual(@as(u64, 0), stats.handler_errors);
+    try testing.expectEqual(@as(u64, 1), stats.vetoed);
+
+    state.allow = true;
+    payload = .{ .source_id = 1, .target = "#room", .text = "hello" };
+    try testing.expect(!bus.approve(.message_pre_deliver, &recorder, &payload, gate));
+    try testing.expectEqualStrings("X", recorder.order());
+    stats = bus.stats(.message_pre_deliver);
+    try testing.expectEqual(@as(u64, 1), stats.unavailable);
+    try testing.expectEqual(@as(u64, 1), stats.handler_errors);
+    try testing.expectEqual(@as(u64, 2), stats.vetoed);
+    try testing.expectEqual(@as(u64, 1), bus.totalHandlerErrors());
+    try testing.expectEqual(@as(u64, 1), bus.totalUnavailable());
 }
 
 test "bindings partition the hook table by id" {

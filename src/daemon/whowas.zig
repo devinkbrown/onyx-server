@@ -17,6 +17,7 @@ pub const Params = struct {
     max_host_len: usize = 255,
     max_realname_len: usize = 255,
     max_account_len: usize = 64,
+    max_server_len: usize = 255,
 };
 
 /// Validation and storage errors for WHOWAS records.
@@ -27,11 +28,13 @@ pub const WhowasError = error{
     HostTooLong,
     RealnameTooLong,
     AccountTooLong,
+    ServerTooLong,
     InvalidNick,
     InvalidUser,
     InvalidHost,
     InvalidRealname,
     InvalidAccount,
+    InvalidServer,
     NegativeSignoffTime,
 };
 
@@ -46,6 +49,8 @@ pub const Record = struct {
     realname: []const u8,
     account: []const u8,
     signoff_time: i64,
+    /// Origin server for mesh-replicated records; empty means the local node.
+    server: []const u8 = "",
 };
 
 /// Bounded WHOWAS ring with fixed per-field storage.
@@ -143,11 +148,13 @@ pub fn Whowas(comptime params: Params) type {
             host: [params.max_host_len]u8 = undefined,
             realname: [params.max_realname_len]u8 = undefined,
             account: [params.max_account_len]u8 = undefined,
+            server: [params.max_server_len]u8 = undefined,
             nick_len: usize = 0,
             user_len: usize = 0,
             host_len: usize = 0,
             realname_len: usize = 0,
             account_len: usize = 0,
+            server_len: usize = 0,
             signoff_time: i64 = 0,
             nick_hash: u64 = 0,
 
@@ -157,6 +164,7 @@ pub fn Whowas(comptime params: Params) type {
                 self.host_len = source.host.len;
                 self.realname_len = source.realname.len;
                 self.account_len = source.account.len;
+                self.server_len = source.server.len;
                 self.signoff_time = source.signoff_time;
                 self.nick_hash = foldedHash(source.nick);
 
@@ -165,6 +173,7 @@ pub fn Whowas(comptime params: Params) type {
                 copyBytes(self.host[0..self.host_len], source.host);
                 copyBytes(self.realname[0..self.realname_len], source.realname);
                 copyBytes(self.account[0..self.account_len], source.account);
+                copyBytes(self.server[0..self.server_len], source.server);
                 for (source.nick, 0..) |ch, index| {
                     self.nick_folded[index] = foldNickByte(ch);
                 }
@@ -178,6 +187,7 @@ pub fn Whowas(comptime params: Params) type {
                     .realname = self.realname[0..self.realname_len],
                     .account = self.account[0..self.account_len],
                     .signoff_time = self.signoff_time,
+                    .server = self.server[0..self.server_len],
                 };
             }
 
@@ -201,10 +211,12 @@ fn validateRecord(comptime params: Params, record: Record) WhowasError!void {
     if (record.host.len > params.max_host_len) return WhowasError.HostTooLong;
     if (record.realname.len > params.max_realname_len) return WhowasError.RealnameTooLong;
     if (record.account.len > params.max_account_len) return WhowasError.AccountTooLong;
+    if (record.server.len > params.max_server_len) return WhowasError.ServerTooLong;
     if (!validSimpleField(record.user, false)) return WhowasError.InvalidUser;
     if (!validSimpleField(record.host, false)) return WhowasError.InvalidHost;
     if (!validSimpleField(record.realname, true)) return WhowasError.InvalidRealname;
     if (!validSimpleField(record.account, false)) return WhowasError.InvalidAccount;
+    if (!validSimpleField(record.server, false)) return WhowasError.InvalidServer;
     if (record.signoff_time < 0) return WhowasError.NegativeSignoffTime;
 }
 
@@ -307,6 +319,22 @@ test "record and query returns recent first" {
     try std.testing.expectEqual(@as(i64, 300), results[0].signoff_time);
     try std.testing.expectEqualStrings("u1", results[1].user);
     try std.testing.expectEqual(@as(i64, 100), results[1].signoff_time);
+}
+
+test "origin server round-trips for mesh-replicated records" {
+    var history = try TestHistory.init(std.testing.allocator);
+    defer history.deinit();
+
+    var remote = testRecord("carol", "u9", "host9", "Remote mesh user", "acct9", 400);
+    remote.server = "peer.example.test";
+    try history.addOnQuit(remote);
+    try history.addOnQuit(testRecord("carol", "u8", "host8", "Carol Local", "", 500));
+
+    var out: [2]Record = undefined;
+    const results = try history.query("carol", 2, &out);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("", results[0].server);
+    try std.testing.expectEqualStrings("peer.example.test", results[1].server);
 }
 
 test "multiple entries per nick obey query max" {

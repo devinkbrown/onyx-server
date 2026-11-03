@@ -95,6 +95,17 @@ pub const CapsuleKind = enum(u8) {
             // paths copy those tokens by value (`@memcpy` into
             // `sessions_mod.Token`) before capsule deinit, so wipe-on-deinit
             // cannot corrupt live state.
+            // `.pending_migration` (PMST checkpoint: raw tokens + snapshots)
+            // and `.session_tombstone` (raw consumed token) are replay
+            // authority. `.ws_session` partial framing can hold plaintext
+            // client bytes (incl. credentials in flight). Adopt copies out
+            // before capsule deinit in every case: PMST restore dupes
+            // account/snapshot and copies tokens by value, tombstones are
+            // rejected (no live copy) in the current whole handoff and
+            // `decodeTombstone` copies the token by value, and the WS
+            // adopt path `@memcpy`s the borrowed deframer/tx/binary slices
+            // into fixed adapter buffers before the deferred capsule
+            // deinit runs at the end of adoption.
             .clients,
             .sessions,
             .tls_session,
@@ -104,14 +115,14 @@ pub const CapsuleKind = enum(u8) {
             .mesh_checkpoint,
             .host_presentation,
             .local_guest_issuer,
+            .ws_session,
+            .pending_migration,
+            .session_tombstone,
             => true,
             .channels,
             .send_queue,
-            .ws_session,
-            .pending_migration,
             .monitor_list,
             .silence_list,
-            .session_tombstone,
             .history,
             .webhook_store,
             .handoff_manifest,
@@ -758,8 +769,13 @@ test "wipeSecretPayloads zeroes secret-bearing payloads and leaves plain ones" {
     // `.sessions` via `SessionEntry.token`.
     try std.testing.expect(CapsuleKind.clients.carriesSecrets());
     try std.testing.expect(CapsuleKind.sessions.carriesSecrets());
+    // PMST tokens+snapshots, consumed-token tombstones, and WS partial
+    // framing plaintext are secret-bearing; adopt copies out first (see
+    // `carriesSecrets`).
+    try std.testing.expect(CapsuleKind.pending_migration.carriesSecrets());
+    try std.testing.expect(CapsuleKind.session_tombstone.carriesSecrets());
+    try std.testing.expect(CapsuleKind.ws_session.carriesSecrets());
     try std.testing.expect(!CapsuleKind.channels.carriesSecrets());
-    try std.testing.expect(!CapsuleKind.ws_session.carriesSecrets());
 
     // Wipe proof on caller-owned STACK buffers (no free ⇒ no `undefined` poison
     // to mask the result). `deinit` calls `wipeSecretPayloads` on the same owned
@@ -769,22 +785,34 @@ test "wipeSecretPayloads zeroes secret-bearing payloads and leaves plain ones" {
     var mesh_buf = "history-private-key".*;
     var sessions_buf = "reclaim-token-bytes!".*;
     var clients_buf = "snapshot-token-tail!".*;
+    var pending_buf = "pmst-token-snapshot!".*;
+    var tombstone_buf = "consumed-token-bytes".*;
+    var ws_buf = "ws-partial-plaintext".*;
     var secret_field = [_]Field{.{ .ordinal = 1, .bytes = &secret_buf }};
     var plain_field = [_]Field{.{ .ordinal = 1, .bytes = &plain_buf }};
     var mesh_field = [_]Field{.{ .ordinal = 1, .bytes = &mesh_buf }};
     var sessions_field = [_]Field{.{ .ordinal = 1, .bytes = &sessions_buf }};
     var clients_field = [_]Field{.{ .ordinal = 1, .bytes = &clients_buf }};
+    var pending_field = [_]Field{.{ .ordinal = 1, .bytes = &pending_buf }};
+    var tombstone_field = [_]Field{.{ .ordinal = 1, .bytes = &tombstone_buf }};
+    var ws_field = [_]Field{.{ .ordinal = 1, .bytes = &ws_buf }};
 
     wipeSecretPayloads(.tls_session, &secret_field); // secret-bearing → wiped
     wipeSecretPayloads(.mesh_checkpoint, &mesh_field);
     wipeSecretPayloads(.sessions, &sessions_field); // reclaim token → wiped
     wipeSecretPayloads(.clients, &clients_field); // reclaim token → wiped
+    wipeSecretPayloads(.pending_migration, &pending_field); // PMST → wiped
+    wipeSecretPayloads(.session_tombstone, &tombstone_field); // token → wiped
+    wipeSecretPayloads(.ws_session, &ws_field); // partial plaintext → wiped
     wipeSecretPayloads(.channels, &plain_field); // plain → untouched
 
     for (secret_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
     for (mesh_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
     for (sessions_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
     for (clients_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (pending_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (tombstone_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (ws_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
     try std.testing.expectEqualStrings("world-checkpoint-state", &plain_buf);
 }
 

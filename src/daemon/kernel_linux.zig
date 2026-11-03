@@ -201,6 +201,15 @@ pub const SandboxDir = struct {
     allowed: u64,
 };
 
+/// Best-effort core-dump/ptrace hardening for the long-running daemon:
+/// PR_SET_DUMPABLE=0 keeps session tokens and key material out of core
+/// files and blocks same-user ptrace attach. Irreversible for practical
+/// purposes; called once from the daemon entry, never from library init.
+pub fn setNonDumpable() void {
+    if (comptime @import("builtin").os.tag != .linux) return;
+    _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+}
+
 pub fn restrictFilesystem(dirs: []const SandboxDir) error{Unexpected}!void {
     // landlock_restrict_self returns EPERM unless no_new_privs is set or the
     // caller holds CAP_SYS_ADMIN. The bit is irreversible and stays in this

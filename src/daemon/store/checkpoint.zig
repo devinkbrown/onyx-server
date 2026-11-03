@@ -23,6 +23,8 @@ const wal_epoch_len = @import("contracts.zig").wal_epoch_len;
 const OroStore = @import("engine.zig").OroStore;
 const PreparedBatch = @import("engine.zig").PreparedBatch;
 const encodeColdSnapshot = @import("engine.zig").encodeColdSnapshot;
+const private_file_permissions = @import("engine.zig").private_file_permissions;
+const restrictCreatedFilePermissions = @import("engine.zig").restrictCreatedFilePermissions;
 const ColdFile = @import("native_files.zig").ColdFile;
 const coldDirectoryIdentity = @import("native_files.zig").coldDirectoryIdentity;
 const coldOpenParent = @import("native_files.zig").coldOpenParent;
@@ -102,9 +104,9 @@ pub const FirstProvisionStage = struct {
         }
         try validateColdParent(store.io, store.dir, store.wal_path, self.directory, self.directory_identity, null);
         var atomic = if (comptime @import("builtin").os.tag == .windows)
-            try (std.Io.Dir{ .handle = self.directory.handle }).createFileAtomic(store.io, std.fs.path.basename(store.wal_path), .{ .replace = false })
+            try (std.Io.Dir{ .handle = self.directory.handle }).createFileAtomic(store.io, std.fs.path.basename(store.wal_path), .{ .replace = false, .permissions = private_file_permissions })
         else
-            try store.dir.createFileAtomic(store.io, store.wal_path, .{ .replace = false });
+            try store.dir.createFileAtomic(store.io, store.wal_path, .{ .replace = false, .permissions = private_file_permissions });
         errdefer deinitColdAtomic(store.io, &atomic, null);
         try validateColdParent(store.io, store.dir, store.wal_path, self.directory, self.directory_identity, &atomic);
         if (comptime @import("builtin").os.tag == .windows) {
@@ -116,6 +118,7 @@ pub const FirstProvisionStage = struct {
             else
                 try makeColdAtomicReadable(store.io, &atomic);
         }
+        try restrictCreatedFilePermissions(store.io, atomic.file);
         try atomic.file.writePositionalAll(store.io, &self.epoch, 0);
         try atomic.file.writePositionalAll(store.io, store.active_batch.?.record.?, cold_epoch_record_len);
         try atomic.file.sync(store.io);
@@ -443,13 +446,14 @@ pub const ColdRecoveryStage = struct {
         errdefer if (snapshot_atomic) |*file| deinitColdAtomic(store.io, file, null);
         if (snapshot_bytes) |bytes| {
             snapshot_atomic = if (comptime @import("builtin").os.tag == .windows)
-                try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(store.io, std.fs.path.basename(store.snapshot_path), .{ .replace = true })
+                try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(store.io, std.fs.path.basename(store.snapshot_path), .{ .replace = true, .permissions = private_file_permissions })
             else
-                try store.dir.createFileAtomic(store.io, store.snapshot_path, .{ .replace = true });
+                try store.dir.createFileAtomic(store.io, store.snapshot_path, .{ .replace = true, .permissions = private_file_permissions });
             if (comptime @import("builtin").os.tag == .windows)
                 try EngineAccess.secureColdAtomicWindows(store, &snapshot_atomic.?)
             else
                 try makeColdAtomicReadable(store.io, &snapshot_atomic.?);
+            try restrictCreatedFilePermissions(store.io, snapshot_atomic.?.file);
             try snapshot_atomic.?.file.writePositionalAll(store.io, bytes, 0);
             try snapshot_atomic.?.file.sync(store.io);
         }
@@ -457,13 +461,14 @@ pub const ColdRecoveryStage = struct {
         errdefer if (wal_atomic) |*file| deinitColdAtomic(store.io, file, null);
         const writer: std.Io.File = if (rotate) block: {
             wal_atomic = if (comptime @import("builtin").os.tag == .windows)
-                try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(store.io, std.fs.path.basename(store.wal_path), .{ .replace = true })
+                try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(store.io, std.fs.path.basename(store.wal_path), .{ .replace = true, .permissions = private_file_permissions })
             else
-                try store.dir.createFileAtomic(store.io, store.wal_path, .{ .replace = true });
+                try store.dir.createFileAtomic(store.io, store.wal_path, .{ .replace = true, .permissions = private_file_permissions });
             if (comptime @import("builtin").os.tag == .windows)
                 try EngineAccess.secureColdAtomicWindows(store, &wal_atomic.?)
             else
                 try makeColdAtomicReadable(store.io, &wal_atomic.?);
+            try restrictCreatedFilePermissions(store.io, wal_atomic.?.file);
             try wal_atomic.?.file.writePositionalAll(store.io, &record, 0);
             if (complete_record) |bytes| try wal_atomic.?.file.writePositionalAll(store.io, bytes, cold_epoch_record_len);
             try wal_atomic.?.file.sync(store.io);

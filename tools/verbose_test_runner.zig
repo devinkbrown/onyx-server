@@ -30,6 +30,12 @@ pub fn main(init: std.process.Init.Minimal) void {
     const args = init.args.toSlice(fba.allocator()) catch |err| {
         std.debug.panic("unable to parse command line args: {t}", .{err});
     };
+    var filters: [64][]const u8 = undefined;
+    var filter_count: usize = 0;
+    var list_only = false;
+    var shard_count: usize = 1;
+    var shard_index: usize = 0;
+    var group: Group = .all;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
             testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
@@ -37,12 +43,55 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else if (std.mem.startsWith(u8, arg, "--cache-dir=")) {
             // Accepted for compatibility with Zig's test invocation. This runner
             // does not drive coverage-guided fuzzing, so the cache path is unused.
+        } else if (std.mem.startsWith(u8, arg, "--test-filter=")) {
+            const filter = arg["--test-filter=".len..];
+            if (filter.len == 0 or filter_count == filters.len) {
+                std.debug.print("expected nonempty --test-filter (maximum {d} filters)\n", .{filters.len});
+                std.process.exit(2);
+            }
+            filters[filter_count] = filter;
+            filter_count += 1;
+        } else if (std.mem.startsWith(u8, arg, "--test-shard-count=")) {
+            shard_count = std.fmt.parseUnsigned(usize, arg["--test-shard-count=".len..], 10) catch 0;
+        } else if (std.mem.startsWith(u8, arg, "--test-shard-index=")) {
+            shard_index = std.fmt.parseUnsigned(usize, arg["--test-shard-index=".len..], 10) catch std.math.maxInt(usize);
+        } else if (std.mem.startsWith(u8, arg, "--test-group=")) {
+            group = std.meta.stringToEnum(Group, arg["--test-group=".len..]) orelse {
+                std.debug.print("invalid test group\n", .{});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, arg, "--list-tests")) {
+            list_only = true;
         } else {
             std.debug.panic("unrecognized verbose-test-runner argument: {s}", .{arg});
         }
     }
 
+    if (shard_count == 0 or shard_index >= shard_count) {
+        std.debug.print("invalid test shard: index must be smaller than positive count\n", .{});
+        std.process.exit(2);
+    }
     const tests = builtin.test_functions;
+    const selected_filters = filters[0..filter_count];
+    var matched_count: usize = 0;
+    for (tests) |test_fn| {
+        if (selected(test_fn.name, selected_filters, group, shard_index, shard_count)) matched_count += 1;
+    }
+    std.debug.print("test selection: {d} discovered; {d} matched; {d} excluded\n", .{
+        tests.len, matched_count, tests.len - matched_count,
+    });
+    if (matched_count == 0) {
+        std.debug.print("no tests matched; refusing empty success\n", .{});
+        std.process.exit(2);
+    }
+    if (list_only) {
+        for (tests) |test_fn| {
+            if (selected(test_fn.name, selected_filters, group, shard_index, shard_count)) std.debug.print("{s}\n", .{test_fn.name});
+        }
+        std.debug.print("listed {d} tests; executed 0\n", .{matched_count});
+        return;
+    }
+    var executed_count: usize = 0;
     var ok_count: usize = 0;
     var skip_count: usize = 0;
     var fail_count: usize = 0;
@@ -50,7 +99,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     var total_ns: u64 = 0;
     var slowest: [slowest_limit]SlowTest = @splat(.{});
 
-    for (tests, 0..) |test_fn, i| {
+    for (tests) |test_fn| {
+        if (!selected(test_fn.name, selected_filters, group, shard_index, shard_count)) continue;
+        executed_count += 1;
         testing.allocator_instance = .init(std.heap.page_allocator, .{
             .canary = 0xc3a701ba,
             .check_write_after_free = true,
@@ -62,7 +113,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         testing.log_level = .warn;
         testing.environ = init.environ;
 
-        std.debug.print("[{d}/{d}] {s} ... ", .{ i + 1, tests.len, test_fn.name });
+        std.debug.print("[{d}/{d}] {s} ... ", .{ executed_count, matched_count, test_fn.name });
         const started_ns = monotonicNanos();
         if (test_fn.func()) |_| {
             const elapsed_ns = monotonicNanos() - started_ns;
@@ -96,7 +147,8 @@ pub fn main(init: std.process.Init.Minimal) void {
         "verbose test summary: {d} passed; {d} skipped; {d} failed; {d} leaked; {d} log errors; elapsed {f}\n",
         .{ ok_count, skip_count, fail_count, leak_count, log_err_count, fmtDuration(total_ns) },
     );
-    if (tests.len != 0) {
+    std.debug.print("executed {d} tests; excluded {d} tests\n", .{ executed_count, tests.len - matched_count });
+    if (executed_count != 0) {
         std.debug.print("slowest tests:\n", .{});
         for (slowest) |entry| {
             if (entry.ns <= 0) break;
@@ -105,6 +157,32 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     if (fail_count != 0 or leak_count != 0 or log_err_count != 0) std.process.exit(1);
+}
+
+const Group = enum { all, parallel, serial };
+
+// Only source-audited arithmetic/hash primitives can share the runtime lane.
+// Daemon, transport, filesystem and unknown tests retain their original order.
+fn parallelSafe(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "crypto.") and
+        !std.mem.startsWith(u8, name, "crypto.tls.test.") and
+        !std.mem.startsWith(u8, name, "crypto.tls_server.test.");
+}
+
+fn selected(name: []const u8, filters: []const []const u8, group: Group, shard_index: usize, shard_count: usize) bool {
+    if (!matches(name, filters)) return false;
+    if (group != .all and parallelSafe(name) != (group == .parallel)) return false;
+    return std.hash.Wyhash.hash(0, name) % shard_count == shard_index;
+}
+
+// Multiple runtime filters form a union, exactly like Zig compile filters.
+// Anonymous import anchors do not bypass explicit runtime selection.
+fn matches(name: []const u8, filters: []const []const u8) bool {
+    if (filters.len == 0) return true;
+    for (filters) |filter| {
+        if (std.mem.indexOf(u8, name, filter) != null) return true;
+    }
+    return false;
 }
 
 fn recordSlow(slowest: *[slowest_limit]SlowTest, name: []const u8, ns: u64) void {
@@ -177,7 +255,7 @@ fn log(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
         log_err_count += 1;
     }
     std.debug.print(

@@ -41,6 +41,9 @@ pub const E2eeGroupRelayId = s2s_peer.E2eeGroupRelayId;
 pub const InboundE2eeGroup = s2s_peer.InboundE2eeGroup;
 pub const SignedOperEventV2 = s2s_peer.SignedOperEventV2;
 pub const InboundOperEventV2 = s2s_peer.InboundOperEventV2;
+pub const AccessEvent = s2s_peer.AccessEvent;
+pub const AccessEventId = s2s_peer.AccessEventId;
+pub const InboundAccessEventV1 = s2s_peer.InboundAccessEventV1;
 pub const InboundGuestFrame = s2s_peer.InboundGuestFrame;
 pub const InboundGuestFrontier = s2s_peer.InboundGuestFrontier;
 const channel_crdt = @import("../substrate/undertow/channel_crdt.zig");
@@ -905,6 +908,30 @@ pub const S2sLink = struct {
 
     pub fn takeRejectedOperEventV2Frames(self: *S2sLink) u64 {
         return self.peer.takeRejectedOperEventV2Frames();
+    }
+
+    pub fn supportsAccessEventV1(self: *const S2sLink) bool {
+        return self.peer.supportsAccessEventV1();
+    }
+
+    pub fn sendAccessEvent(self: *S2sLink, event: AccessEvent) !bool {
+        return self.peer.sendAccessEvent(self.sink(), event);
+    }
+
+    pub fn forwardAccessEventFrame(self: *S2sLink, wire: []const u8) !bool {
+        return self.peer.forwardAccessEventFrame(self.sink(), wire);
+    }
+
+    pub fn takeAccessEventFrames(self: *S2sLink) ![]InboundAccessEventV1 {
+        return self.peer.takeAccessEventFrames();
+    }
+
+    pub fn takeDroppedAccessEventFrames(self: *S2sLink) u64 {
+        return self.peer.takeDroppedAccessEventFrames();
+    }
+
+    pub fn takeRejectedAccessEventFrames(self: *S2sLink) u64 {
+        return self.peer.takeRejectedAccessEventFrames();
     }
 
     pub fn supportsGuestPresence(self: *const S2sLink) bool {

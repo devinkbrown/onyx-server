@@ -3,7 +3,7 @@
 Onyx Server's test suite is large, so the build graph exposes several lanes. Use the
 smallest lane that proves the change, then run a broader gate before pushing.
 
-The lane names below are synchronized with `zig build --help` on 2026-09-06.
+The lane names below are synchronized with `zig build --help` on 2026-11-03.
 
 ## Fast lanes
 
@@ -27,28 +27,101 @@ The lane names below are synchronized with `zig build --help` on 2026-09-06.
 | `zig build test-cli --summary all` | The `armor` toolkit, including x509/ocsp/crl/s_client and key utilities. |
 | `zig build test-smoke --summary all` | Inner-loop roadmap gate: `check` plus TLS/server/config focused suites. |
 | `zig build test-roadmap --summary all` | Server-roadmap gate: `check` plus server/config/IRCX/event/mesh/services/TLS focused suites. |
-| `zig build test-smoke -Doptimize=ReleaseSafe --summary all` | Optimized smoke gate for safety-checked release codegen paths. |
+| `zig build test-smoke -Doptimize=safe --summary all` | Optimized smoke gate for safety-checked release codegen paths. |
 
 Every focused lane has a `-verbose` twin, for example
 `zig build test-tls-verbose --summary all`. Use verbose lanes in CI, tmux, or
 any long run where silence looks like a hang; they print each test name before it
 executes, include per-test duration, and finish with the slowest tests.
 
-Focused filters are build options, not test-binary arguments:
+For the smallest first compile, use the existing build filters:
 
 ```sh
 zig build test-mod -Dtest-filter="mTLS:" --summary all
-zig build test-exe -Dtest-filter="threaded server:" --summary all
+zig build test-media-record-leaf -Doptimize=safe --summary all
+zig build test-message-relay-v2-leaf -Doptimize=safe --summary all
 ```
 
-Do not use `zig build test -- --test-filter ...`; that does not configure the
-build graph and can accidentally run the broad suite.
+When iterating across several tests, compile once and select at runtime:
+
+```sh
+zig build test-cached -Doptimize=safe --summary all -- --test-filter="reusable session"
+zig build test-cached -Doptimize=safe --summary all -- --test-filter="ACCESS" --test-filter="SACCESS"
+zig build test-exe-cached -- --list-tests
+```
+
+The initial cached build compiles every test in that root. Later selections reuse
+that artifact when source, target, mode, and compiler are unchanged. Repeat runtime
+filters form a union; each matching case runs once. Empty filters and selections
+matching no tests fail. Lists print names without running tests. Summaries distinguish
+discovered, matched, excluded, executed, passed, skipped, failed, leaked, and log errors.
+Runtime filters select full names; anonymous import anchors do not bypass selection.
+Keep `-Dtest-filter` for compile filtering on the original targets; it does not
+limit `test-cached`, `test-exe-cached`, or the full parallel gate. Windows cached
+roots fail before compilation; use the existing `test-mod[-verbose]` and
+`test-exe[-verbose]` targets, which retain Windows compile shards and stack setup.
+
+### Full suite runtime parallelism
+
+```sh
+zig build test -Doptimize=safe --summary all
+zig build test-full-parallel -Doptimize=safe --summary all -- --logs=.zig-cache/full-safe-unique --workers=4
+zig build test-serial -Doptimize=safe --summary all
+```
+
+Unfiltered `zig build test` uses this bounded parallel runner by default on supported
+native POSIX hosts. `test-full-parallel` invokes it explicitly. Compile-filtered
+`zig build test -Dtest-filter=<text>`, Windows, and cross targets retain the reference
+graph. `test-serial` always selects that reference graph, running cases serially
+within each root. Both full graphs retain every module, executable, and CLI test.
+
+The parallel gate compiles one complete artifact for each of the module,
+executable, and CLI roots, then runs each artifact in at most four processes. Stable
+hashes of complete test names assign cases to shards. Before execution, the harness
+proves the shard inventories are disjoint and cover the complete artifact inventory
+exactly. It checks actual terminal counts, propagates every failed process/test/leak/
+log error, and retains inventories, binary hashes, per-shard logs, and aggregate counts
+in the new log directory. Without `--logs`, it creates and prints a unique directory
+under `.zig-cache/full-suite-runs/`; explicit paths must still be new. The final suite summary includes all three roots and
+is parsed by the source-bound gate ledger without adding overlapping counts.
+Reusing an existing log directory fails to protect evidence. Each shard has a
+3600-second timeout (`--timeout=<seconds>`); timeout or interruption terminates
+and reaps its own process group and records terminal failure. Progress every
+30 seconds shows the latest test line. `--seed=<u32>` defaults to zero and is
+recorded with exact shard arguments and log hashes in the JSON evidence.
+All original tests and skips remain; this target accepts no test filter.
+
+Run from the repository root: tests need `src/`, `etc/`, and `tools/bogo/` fixtures.
+Linux resource inspection found ephemeral bound listener ports and process-local
+signals/limits; heavyweight mesh tests already hold their cross-process kernel lock.
+Keep those locks intact. The four-worker limit bounds host pressure. Runtime group
+cleanup requires a supported native POSIX host/target; unsupported and cross targets
+fail in the build graph before test compilation and retain the standard native gate. For a new
+shared host resource, `--policy=conservative` runs the noncrypto remainder and TLS
+transport fixtures serially while sharding source-audited crypto cases; `--workers=1` provides
+the same inventory/count checks serially. Platform-native acceptance remains required.
+
+Validate harness changes with the small compiled fixture:
+
+```sh
+ONYX_TEST_ZIG=/path/to/pinned/zig python3 -B tools/test_verbose_test_runner.py
+ONYX_TEST_ZIG=/path/to/pinned/zig python3 -B tools/test_test_build_graph.py
+```
+
+The fixture covers filtering, empty selections, listing, deterministic exhaustive
+shards, failures, skip counts, warm artifact reuse, and a full-inventory runtime
+comparison. Its speedup measures scheduling overhead and concurrency; production
+speedup must be measured on the real complete suite. Compare complete discovered,
+executed, passed, and skipped counts across modes and against prior source-bound
+full evidence before release acceptance. Use the existing gate ledger to reuse
+unchanged successful evidence; diagnose unchanged failures before scheduling reruns.
 
 ## Broad deterministic lanes
 
 | Command | Use it for |
 |---|---|
-| `zig build test --summary all` | Full module + executable-root tests. |
+| `zig build test --summary all` | Full module + executable-root + CLI tests; unfiltered native POSIX runs bounded runtime shards. |
+| `zig build test-serial --summary all` | Full reference graph with serial execution within each root. |
 | `zig build fuzz --summary all` | Bounded replay of coverage-fuzz seed corpora. |
 | `zig build bogo-shim-test --summary all` | Self-driven BoGo shim parse/framing/subprocess smokes. |
 | `tools/bogo.sh` | Pinned external BoringSSL runner: exact 24-pass/3-explicit-skip baseline; fails on drift, any unexpected failure, or an all-skip/vacuous result. Uses `.bogo/` or `BOGO_CACHE_DIR`, never `/tmp`. |
@@ -84,7 +157,7 @@ For daemon/TLS/server roadmap work, run:
 zig build test-smoke --summary all
 zig build test-roadmap-verbose --summary all
 zig build test -Dtest-filter="<feature keyword>" --summary all
-zig build test-smoke -Doptimize=ReleaseSafe --summary all
+zig build test-smoke -Doptimize=safe --summary all
 zig build all-checks --summary all
 ```
 

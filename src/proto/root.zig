@@ -145,6 +145,7 @@ pub const invite = @import("invite.zig");
 pub const irc_isupport = @import("irc_isupport.zig");
 pub const irc_line_props = @import("irc_line_props.zig");
 pub const irc_line = @import("irc_line.zig");
+pub const ircx_access_event = @import("ircx_access_event.zig");
 pub const ircx_access_store = @import("ircx_access_store.zig");
 pub const ircx_auth = @import("ircx_auth.zig");
 pub const ircx_create_cmd = @import("ircx_create_cmd.zig");
@@ -509,6 +510,7 @@ test {
     _ = irc_isupport;
     _ = irc_line_props;
     _ = irc_line;
+    _ = ircx_access_event;
     _ = ircx_access_store;
     _ = ircx_auth;
     _ = ircx_create_cmd;

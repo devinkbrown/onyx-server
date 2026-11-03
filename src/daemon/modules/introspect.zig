@@ -152,13 +152,15 @@ fn modules(ctx: *anyopaque, inv: registry.CommandInvocation) anyerror!void {
         try core.reply(.RPL_INFO, &.{}, "note: this server module runtime has not started");
     }
 
-    const summary = std.fmt.bufPrint(&buf, "{d} modules, {d} commands, {d} aliases, {d} hooks, {d} degraded, generation={d}", .{
+    const summary = std.fmt.bufPrint(&buf, "{d} modules, {d} commands, {d} aliases, {d} hooks, {d} degraded, generation={d}, hook_errors={d}, hook_unavailable={d}", .{
         module_manifest.enabled.len,
         module_manifest.Live.commands.len,
         module_manifest.Live.alias_count,
         module_manifest.Live.hooks.len,
         life.degradedCount(),
         life.generation(),
+        life.bus.totalHandlerErrors(),
+        life.bus.totalUnavailable(),
     }) catch "summary (format error)";
     try core.reply(.RPL_ENDOFINFO, &.{}, summary);
 }

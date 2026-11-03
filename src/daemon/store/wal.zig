@@ -46,6 +46,34 @@ pub fn coldEpoch(epoch: [wal_epoch_len]u8) [cold_epoch_record_len]u8 {
     return record;
 }
 
+/// Consecutive zero-byte positional writes tolerated before failing. A
+/// regular-file write that cannot make progress is expected to return an
+/// error; a writer that instead reports zero bytes forever would make the
+/// std `writePositionalAll` loop (`index += 0`) spin without bound.
+pub const max_zero_progress_writes: usize = 16;
+
+/// `writePositionalAll` with a zero-progress guard. Returns
+/// `StoreError.IoAmbiguous` after `max_zero_progress_writes` consecutive
+/// zero-byte writes, or if the writer claims more bytes than offered,
+/// because the durable prefix is then unknowable. Generic over the file
+/// type so tests can inject a zero-progress writer at this exact seam.
+pub fn writePositionalAllGuarded(io: std.Io, file: anytype, bytes: []const u8, offset: u64) !void {
+    var index: usize = 0;
+    var zero_streak: usize = 0;
+    while (index < bytes.len) {
+        const remaining = bytes[index..];
+        const written = try file.writePositional(io, &.{remaining}, offset + index);
+        if (written == 0) {
+            zero_streak += 1;
+            if (zero_streak > max_zero_progress_writes) return StoreError.IoAmbiguous;
+            continue;
+        }
+        if (written > remaining.len) return StoreError.IoAmbiguous;
+        zero_streak = 0;
+        index += written;
+    }
+}
+
 pub fn writeRecordAt(
     io: std.Io,
     file: std.Io.File,
@@ -74,7 +102,7 @@ pub fn writeRecordAt(
         @memcpy(payload[payload_header_len + key.len ..][0..value.len], value);
     writeU32(record[4..][0..4], checksum(payload));
 
-    try file.writePositionalAll(io, record, offset);
+    try writePositionalAllGuarded(io, file, record, offset);
     return offset + record.len;
 }
 
@@ -221,7 +249,7 @@ pub fn writeNextSeqRecordAt(
     writeU64(payload[1..9], next_seq);
     writeU32(record[4..][0..4], checksum(payload));
 
-    try file.writePositionalAll(io, record, offset);
+    try writePositionalAllGuarded(io, file, record, offset);
     return offset + record.len;
 }
 
@@ -240,7 +268,7 @@ pub fn writeWalEpochRecordAt(
     payload[0] = meta_kind_wal_epoch;
     @memcpy(payload[1..], epoch);
     writeU32(record[4..8], checksum(payload));
-    try file.writePositionalAll(io, record, offset);
+    try writePositionalAllGuarded(io, file, record, offset);
     return offset + record.len;
 }
 
@@ -268,7 +296,7 @@ pub fn writeSnapshotCoverageRecordAt(
         @memcpy(payload[start + 8 + wal_epoch_len .. start + snapshot_coverage_slot_len], &slot.digest);
     }
     writeU32(record[4..8], checksum(payload));
-    try file.writePositionalAll(io, record, offset);
+    try writePositionalAllGuarded(io, file, record, offset);
     return offset + record.len;
 }
 

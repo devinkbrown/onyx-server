@@ -50,11 +50,11 @@ Before installation, run the isolated service contract checks:
 PYTHONDONTWRITEBYTECODE=1 python3 tools/alpine_openrc_smoke.py
 ```
 
-The ten checks source the repository's service and configuration template in a
+The service checks source the repository's service and configuration template in a
 temporary workspace. They assert foreground supervision settings, the default
 five-second delay and three-respawn/60-second policy, operator overrides, private
 state-directory arguments, and refusal after invalid/missing configuration or
-state-directory failure. Configuration validation uses a stub daemon. When
+state-directory failure, plus validated reload ordering, effective identity launcher arguments and daemon working-directory use. Configuration validation uses a stub daemon. When
 installed, native OpenRC `checkpath` also creates and repairs temporary state
 to mode `0700` with the invoking user's ownership, and the installed supervisor
 shell adapter forwards the service arguments to an intercepted launcher. Native
@@ -62,8 +62,9 @@ checks are reported as skipped when those OpenRC components are unavailable.
 
 This harness never invokes `rc-service`, launches `supervise-daemon`, changes
 installed service files, or opens daemon listeners. It establishes the service
-script's contract and native helper behavior. It does not establish actual
-daemon configuration validation, service-account privilege transitions, or
+script's contract and native helper behavior. The cross-UID unreadable-config check runs only in an
+isolated root test environment and is skipped by normal non-root runs. The
+harness does not establish actual daemon configuration validation or
 runtime crash/respawn limits. Complete A03 acceptance still requires an isolated
 Alpine VM/container with the packaged daemon and provisioned account: confirm
 invalid config prevents start, valid config runs in the foreground, and repeated
@@ -134,9 +135,12 @@ daemon's metrics/doctor output and established secured links. A TCP-only peer
 is insufficient, and neither a successful package build nor a service status
 is a multi-client media or session acceptance test.
 
-Do not add a blind `reload` action that sends USR2. Helix requires a compatible
-verified target, complete mandatory state, rollback preparation, and the
-authorized release procedure. The current policy-state handoff boundary
+The shipped `reload` validates the candidate before asking the supervisor to
+signal its child with USR2. Success means a request was delivered; verify Helix
+completion separately. See [service management](service-management.md) for
+installation, migration, permissions and reload acceptance. Helix requires a
+compatible verified target, complete mandatory state, rollback preparation, and
+the authorized release procedure. The current policy-state handoff boundary
 rejects older producers before exec; upgrading across it may require a
 separately approved cold boundary.
 

@@ -1642,6 +1642,7 @@ fn initializeGuestIssuerOffline(init: std.process.Init, config_path: []const u8,
 }
 
 pub fn main(init: std.process.Init) !void {
+    onyx_server.daemon.kernel_linux.setNonDumpable();
     const allocator = init.gpa;
     var windows_service_worker: ?windows_scm.WorkerHandles = null;
     var windows_service_live = false;

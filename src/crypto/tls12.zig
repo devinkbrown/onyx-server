@@ -427,6 +427,7 @@ pub fn sealRecordAlloc(
         .aes_128_gcm => {
             var key: [Aes128Gcm.key_length]u8 = undefined;
             @memcpy(&key, keys.key[0..Aes128Gcm.key_length]);
+            defer std.crypto.secureZero(u8, &key);
             var tag: [Aes128Gcm.tag_length]u8 = undefined;
             Aes128Gcm.encrypt(ciphertext, &tag, plaintext, &aad, nonce, key);
             @memcpy(tag_out, &tag);
@@ -434,6 +435,7 @@ pub fn sealRecordAlloc(
         .aes_256_gcm => {
             var key: [Aes256Gcm.key_length]u8 = undefined;
             @memcpy(&key, keys.key[0..Aes256Gcm.key_length]);
+            defer std.crypto.secureZero(u8, &key);
             var tag: [Aes256Gcm.tag_length]u8 = undefined;
             Aes256Gcm.encrypt(ciphertext, &tag, plaintext, &aad, nonce, key);
             @memcpy(tag_out, &tag);
@@ -441,6 +443,7 @@ pub fn sealRecordAlloc(
         .chacha20_poly1305 => {
             var key: [ChaCha20Poly1305.key_length]u8 = undefined;
             @memcpy(&key, keys.key[0..ChaCha20Poly1305.key_length]);
+            defer std.crypto.secureZero(u8, &key);
             var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
             ChaCha20Poly1305.encrypt(ciphertext, &tag, plaintext, &aad, nonce, key);
             @memcpy(tag_out, &tag);
@@ -480,12 +483,16 @@ pub fn openRecordAlloc(
     } else makeNonce(suite, keys.iv, seq);
     var aad = makeAad(seq, parsed.content_type, @intCast(cipher_len));
     const plaintext = try allocator.alloc(u8, cipher_len);
-    errdefer allocator.free(plaintext);
+    errdefer {
+        std.crypto.secureZero(u8, plaintext);
+        allocator.free(plaintext);
+    }
 
     switch (suite.aead()) {
         .aes_128_gcm => {
             var key: [Aes128Gcm.key_length]u8 = undefined;
             @memcpy(&key, keys.key[0..Aes128Gcm.key_length]);
+            defer std.crypto.secureZero(u8, &key);
             var tag_arr: [Aes128Gcm.tag_length]u8 = undefined;
             @memcpy(&tag_arr, tag);
             Aes128Gcm.decrypt(plaintext, ciphertext, tag_arr, &aad, nonce, key) catch return error.AeadAuthFailed;
@@ -493,6 +500,7 @@ pub fn openRecordAlloc(
         .aes_256_gcm => {
             var key: [Aes256Gcm.key_length]u8 = undefined;
             @memcpy(&key, keys.key[0..Aes256Gcm.key_length]);
+            defer std.crypto.secureZero(u8, &key);
             var tag_arr: [Aes256Gcm.tag_length]u8 = undefined;
             @memcpy(&tag_arr, tag);
             Aes256Gcm.decrypt(plaintext, ciphertext, tag_arr, &aad, nonce, key) catch return error.AeadAuthFailed;
@@ -500,6 +508,7 @@ pub fn openRecordAlloc(
         .chacha20_poly1305 => {
             var key: [ChaCha20Poly1305.key_length]u8 = undefined;
             @memcpy(&key, keys.key[0..ChaCha20Poly1305.key_length]);
+            defer std.crypto.secureZero(u8, &key);
             var tag_arr: [ChaCha20Poly1305.tag_length]u8 = undefined;
             @memcpy(&tag_arr, tag);
             ChaCha20Poly1305.decrypt(plaintext, ciphertext, tag_arr, &aad, nonce, key) catch return error.AeadAuthFailed;

@@ -434,6 +434,311 @@ fn asciiUpper(ch: u8) u8 {
     };
 }
 
+/// Errors from the strict DCC offer parser. Shape only: whether an address,
+/// port, or token is *trusted* is server policy, deliberately not modeled here.
+pub const DccError = error{
+    InvalidDcc,
+    UnknownDccKind,
+    MissingField,
+    InvalidFilename,
+    InvalidAddress,
+    InvalidPort,
+    InvalidNumber,
+    TrailingGarbage,
+};
+
+/// DCC endpoint address in the three wire spellings seen in the wild.
+pub const DccAddress = union(enum) {
+    /// Dotted-quad IPv4, normalized to octets.
+    ipv4: [4]u8,
+    /// Legacy single-integer IPv4 (host-order u32 as sent by old clients).
+    ipv4_u32: u32,
+    /// IPv6 literal text (brackets stripped), borrowed from the input.
+    ipv6: []const u8,
+    /// Hostname token (some clients send one instead of a literal), borrowed.
+    host: []const u8,
+};
+
+/// Zero-copy parsed DCC offer. All slices borrow the CTCP argument.
+///
+/// Grammar (de-facto DCC):
+///   SEND   <filename> <addr> <port> [<size> [<token>]]
+///   CHAT   chat <addr> <port> [<token>]
+///   ACCEPT <filename> <port> <position> [<token>]
+///   RESUME <filename> <port> <position> [<token>]
+/// A filename containing spaces is double-quoted. Port 0 with a token is the
+/// passive (reverse) form; a token on ACCEPT/RESUME marks the passive pair.
+pub const DccOffer = struct {
+    kind: DccKind,
+    filename: ?[]const u8 = null,
+    filename_quoted: bool = false,
+    address: ?DccAddress = null,
+    port: u16,
+    file_size: ?u64 = null,
+    position: ?u64 = null,
+    token: ?[]const u8 = null,
+    passive: bool = false,
+};
+
+const DccTokens = struct {
+    text: []const u8,
+    cursor: usize = 0,
+
+    fn next(self: *DccTokens) ?[]const u8 {
+        self.cursor = skipSpaces(self.text, self.cursor);
+        if (self.cursor >= self.text.len) return null;
+        const start = self.cursor;
+        const end = findSpace(self.text, start) orelse self.text.len;
+        self.cursor = end;
+        return self.text[start..end];
+    }
+
+    fn required(self: *DccTokens) DccError![]const u8 {
+        return self.next() orelse error.MissingField;
+    }
+
+    fn finish(self: *DccTokens) DccError!void {
+        if (self.next() != null) return error.TrailingGarbage;
+    }
+
+    fn filename(self: *DccTokens, quoted: *bool) DccError![]const u8 {
+        self.cursor = skipSpaces(self.text, self.cursor);
+        if (self.cursor >= self.text.len) return error.MissingField;
+        if (self.text[self.cursor] == '"') {
+            const start = self.cursor + 1;
+            const end = findByte(self.text, start, '"') orelse return error.InvalidFilename;
+            if (end == start) return error.InvalidFilename;
+            if (end + 1 < self.text.len and self.text[end + 1] != ' ') return error.InvalidFilename;
+            self.cursor = end + 1;
+            quoted.* = true;
+            const name = self.text[start..end];
+            try validateDccText(name, error.InvalidFilename);
+            return name;
+        }
+        const name = try self.required();
+        if (findByte(name, 0, '"') != null) return error.InvalidFilename;
+        try validateDccText(name, error.InvalidFilename);
+        return name;
+    }
+};
+
+fn validateDccText(text: []const u8, err: DccError) DccError!void {
+    if (text.len == 0) return err;
+    for (text) |ch| {
+        switch (ch) {
+            0, '\r', '\n', delimiter, quote_byte => return err,
+            else => {},
+        }
+    }
+}
+
+fn parseDccNumber(token: []const u8, comptime T: type) DccError!T {
+    if (token.len == 0) return error.InvalidNumber;
+    var value: T = 0;
+    for (token) |ch| {
+        if (ch < '0' or ch > '9') return error.InvalidNumber;
+        const digit: T = @intCast(ch - '0');
+        value = std.math.mul(T, value, 10) catch return error.InvalidNumber;
+        value = std.math.add(T, value, digit) catch return error.InvalidNumber;
+    }
+    return value;
+}
+
+fn parseDccPort(token: []const u8) DccError!u16 {
+    const value = parseDccNumber(token, u32) catch return error.InvalidPort;
+    if (value > std.math.maxInt(u16)) return error.InvalidPort;
+    return @intCast(value);
+}
+
+fn parseDccAddress(token_raw: []const u8) DccError!DccAddress {
+    var token = token_raw;
+    var bracketed = false;
+    if (token.len >= 2 and token[0] == '[' and token[token.len - 1] == ']') {
+        token = token[1 .. token.len - 1];
+        bracketed = true;
+    } else if (findByte(token, 0, '[') != null or findByte(token, 0, ']') != null) {
+        return error.InvalidAddress;
+    }
+    if (token.len == 0) return error.InvalidAddress;
+
+    if (findByte(token, 0, ':') != null) {
+        // IPv6 literal: hex groups, colons, and an optional embedded IPv4 tail.
+        var colons: usize = 0;
+        for (token) |ch| {
+            switch (ch) {
+                ':' => colons += 1,
+                '0'...'9', 'a'...'f', 'A'...'F', '.' => {},
+                else => return error.InvalidAddress,
+            }
+        }
+        if (colons < 1) return error.InvalidAddress;
+        return .{ .ipv6 = token };
+    }
+    if (bracketed) return error.InvalidAddress;
+
+    if (findByte(token, 0, '.') != null) {
+        // All digit/dot tokens must be strict dotted quads, never hostnames.
+        var digits_dots = true;
+        for (token) |ch| {
+            if ((ch < '0' or ch > '9') and ch != '.') digits_dots = false;
+        }
+        if (digits_dots) {
+            var octets: [4]u8 = undefined;
+            var labels: usize = 0;
+            var start: usize = 0;
+            while (true) {
+                const end = findByte(token, start, '.') orelse token.len;
+                const label = token[start..end];
+                if (label.len == 0 or label.len > 3 or labels >= 4) return error.InvalidAddress;
+                const value = parseDccNumber(label, u32) catch return error.InvalidAddress;
+                if (value > 255) return error.InvalidAddress;
+                octets[labels] = @intCast(value);
+                labels += 1;
+                if (end == token.len) break;
+                start = end + 1;
+            }
+            if (labels != 4) return error.InvalidAddress;
+            return .{ .ipv4 = octets };
+        }
+        // Dotted quad when every label is numeric; otherwise a hostname.
+        var octets: [4]u8 = undefined;
+        var labels: usize = 0;
+        var start: usize = 0;
+        var numeric = true;
+        while (true) {
+            const end = findByte(token, start, '.') orelse token.len;
+            const label = token[start..end];
+            if (label.len == 0 or label.len > 3) {
+                numeric = false;
+            } else {
+                const value = parseDccNumber(label, u32) catch {
+                    numeric = false;
+                    break;
+                };
+                if (labels < 4) {
+                    if (value > 255) return error.InvalidAddress;
+                    octets[labels] = @intCast(value);
+                }
+            }
+            labels += 1;
+            if (end == token.len) break;
+            start = end + 1;
+        }
+        if (numeric) {
+            if (labels != 4) return error.InvalidAddress;
+            return .{ .ipv4 = octets };
+        }
+        try validateDccHost(token);
+        return .{ .host = token };
+    }
+
+    // Bare integer is the legacy u32 IPv4 spelling; anything else is a host.
+    if (parseDccNumber(token, u32)) |value| {
+        return .{ .ipv4_u32 = value };
+    } else |_| {}
+    try validateDccHost(token);
+    return .{ .host = token };
+}
+
+fn validateDccHost(token: []const u8) DccError!void {
+    try validateDccText(token, error.InvalidAddress);
+    for (token) |ch| {
+        switch (ch) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_' => {},
+            else => return error.InvalidAddress,
+        }
+    }
+}
+
+fn validDccToken(token: []const u8) DccError!void {
+    try validateDccText(token, error.InvalidDcc);
+    if (findByte(token, 0, '"') != null) return error.InvalidDcc;
+}
+
+/// Parse the argument of a CTCP DCC request (the text after `DCC `).
+/// Strict and allocation-free; unknown subcommands return `UnknownDccKind`
+/// so callers can still relay them opaquely under their own policy.
+pub fn parseDcc(arg: []const u8) DccError!DccOffer {
+    var tokens = DccTokens{ .text = arg };
+    const kind_token = try tokens.required();
+    const kind = classifyDcc(arg);
+    _ = kind_token;
+
+    switch (kind) {
+        .send => {
+            var quoted = false;
+            const filename = try tokens.filename(&quoted);
+            const address = try parseDccAddress(try tokens.required());
+            const port = try parseDccPort(try tokens.required());
+            var offer = DccOffer{
+                .kind = .send,
+                .filename = filename,
+                .filename_quoted = quoted,
+                .address = address,
+                .port = port,
+            };
+            if (tokens.next()) |size_token| {
+                offer.file_size = try parseDccNumber(size_token, u64);
+                if (tokens.next()) |token| {
+                    try validDccToken(token);
+                    offer.token = token;
+                }
+            }
+            try tokens.finish();
+            if (port == 0) {
+                // Passive SEND must carry the token the acceptor echoes back.
+                if (offer.token == null) return error.MissingField;
+                offer.passive = true;
+            }
+            return offer;
+        },
+        .chat => {
+            const protocol = try tokens.required();
+            if (!asciiEqlIgnoreCase(protocol, "chat")) return error.InvalidDcc;
+            const address = try parseDccAddress(try tokens.required());
+            const port = try parseDccPort(try tokens.required());
+            var offer = DccOffer{ .kind = .chat, .address = address, .port = port };
+            if (tokens.next()) |token| {
+                try validDccToken(token);
+                offer.token = token;
+            }
+            try tokens.finish();
+            if (port == 0) {
+                if (offer.token == null) return error.MissingField;
+                offer.passive = true;
+            }
+            return offer;
+        },
+        .accept, .resume_file => {
+            var quoted = false;
+            const filename = try tokens.filename(&quoted);
+            const port = try parseDccPort(try tokens.required());
+            const position = try parseDccNumber(try tokens.required(), u64);
+            var offer = DccOffer{
+                .kind = kind,
+                .filename = filename,
+                .filename_quoted = quoted,
+                .port = port,
+                .position = position,
+            };
+            if (tokens.next()) |token| {
+                try validDccToken(token);
+                offer.token = token;
+                offer.passive = true;
+            }
+            try tokens.finish();
+            return offer;
+        },
+        .unknown => return error.UnknownDccKind,
+    }
+}
+
+/// Parse a DCC offer directly from a parsed CTCP view.
+pub fn parseDccView(view: CtcpView) DccError!DccOffer {
+    if (view.id != .dcc) return error.InvalidDcc;
+    return parseDcc(view.argOrEmpty());
+}
+
 test "parses ACTION from PRIVMSG body" {
     const view = (try parseFirst(.privmsg, "\x01ACTION waves hello\x01")).?;
     try std.testing.expectEqual(Carrier.privmsg, view.carrier);
@@ -518,4 +823,66 @@ test "builders reject invalid bytes and small buffers" {
     try std.testing.expectError(error.InvalidByte, buildPayload("PING", "\x01", &buf));
     try std.testing.expectError(error.InvalidCommand, buildPayload("BAD CMD", null, &buf));
     try std.testing.expectError(error.InvalidTarget, buildRequest("bad target", "PING", null, &buf));
+}
+
+test "DCC SEND parses legacy u32, dotted, quoted, and passive forms" {
+    const legacy = try parseDcc("SEND file.txt 3232235777 1024 4096");
+    try std.testing.expectEqual(DccKind.send, legacy.kind);
+    try std.testing.expectEqualStrings("file.txt", legacy.filename.?);
+    try std.testing.expectEqual(@as(u32, 3232235777), legacy.address.?.ipv4_u32);
+    try std.testing.expectEqual(@as(u16, 1024), legacy.port);
+    try std.testing.expectEqual(@as(?u64, 4096), legacy.file_size);
+    try std.testing.expect(!legacy.passive);
+
+    const quoted = try parseDcc("SEND \"my file.txt\" 192.168.0.1 5000 12");
+    try std.testing.expectEqualStrings("my file.txt", quoted.filename.?);
+    try std.testing.expect(quoted.filename_quoted);
+    try std.testing.expectEqual([4]u8{ 192, 168, 0, 1 }, quoted.address.?.ipv4);
+
+    const passive = try parseDcc("SEND file.txt 10.0.0.1 0 99 12345");
+    try std.testing.expect(passive.passive);
+    try std.testing.expectEqualStrings("12345", passive.token.?);
+    try std.testing.expectError(error.MissingField, parseDcc("SEND file.txt 10.0.0.1 0 99"));
+}
+
+test "DCC CHAT, ACCEPT, RESUME, IPv6, and hostname forms parse" {
+    const chat = try parseDcc("CHAT chat [2001:db8::1] 4096");
+    try std.testing.expectEqual(DccKind.chat, chat.kind);
+    try std.testing.expectEqualStrings("2001:db8::1", chat.address.?.ipv6);
+
+    const chat6 = try parseDcc("CHAT chat 2001:db8::2 0 tok9");
+    try std.testing.expect(chat6.passive);
+    try std.testing.expectEqualStrings("tok9", chat6.token.?);
+
+    const host = try parseDcc("SEND f dcc.example.org 1024");
+    try std.testing.expectEqualStrings("dcc.example.org", host.address.?.host);
+
+    const accept = try parseDcc("ACCEPT file.txt 1024 2048");
+    try std.testing.expectEqual(DccKind.accept, accept.kind);
+    try std.testing.expectEqual(@as(?u64, 2048), accept.position);
+    try std.testing.expect(!accept.passive);
+
+    const resume_passive = try parseDcc("RESUME \"a b.bin\" 0 7 token42");
+    try std.testing.expectEqual(DccKind.resume_file, resume_passive.kind);
+    try std.testing.expect(resume_passive.passive);
+    try std.testing.expectEqualStrings("token42", resume_passive.token.?);
+}
+
+test "DCC parser rejects malformed offers fail-closed" {
+    try std.testing.expectError(error.UnknownDccKind, parseDcc("GET f 1.2.3.4 1"));
+    try std.testing.expectError(error.MissingField, parseDcc("SEND f 1.2.3.4"));
+    try std.testing.expectError(error.InvalidPort, parseDcc("SEND f 1.2.3.4 65536"));
+    try std.testing.expectError(error.InvalidPort, parseDcc("SEND f 1.2.3.4 -1"));
+    try std.testing.expectError(error.InvalidNumber, parseDcc("SEND f 1.2.3.4 1 99999999999999999999999"));
+    try std.testing.expectError(error.InvalidAddress, parseDcc("SEND f 999.1.1.1 1"));
+    try std.testing.expectError(error.InvalidAddress, parseDcc("SEND f 1.2.3 1"));
+    try std.testing.expectError(error.InvalidFilename, parseDcc("SEND \"unterminated 1.2.3.4 1"));
+    try std.testing.expectError(error.TrailingGarbage, parseDcc("CHAT chat 1.2.3.4 1 tok extra"));
+    try std.testing.expectError(error.InvalidDcc, parseDcc("CHAT schat 1.2.3.4 1"));
+    try std.testing.expectError(error.InvalidDcc, parseDccView((try parseFirst(.privmsg, "\x01VERSION\x01")).?));
+
+    const view = (try parseFirst(.privmsg, "\x01DCC SEND file.txt 1 2 3\x01")).?;
+    const offer = try parseDccView(view);
+    try std.testing.expectEqual(DccKind.send, offer.kind);
+    try std.testing.expectEqual(@as(u32, 1), offer.address.?.ipv4_u32);
 }

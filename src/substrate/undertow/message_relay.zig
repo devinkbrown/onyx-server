@@ -619,6 +619,15 @@ pub const SeenSet = struct {
         authenticated: bool,
     };
 
+    /// Fallible reservation result for a later no-fail observation commit.
+    /// Callers that publish another owned consequence (such as a daemon handoff
+    /// queue row) prepare both objects first, publish that consequence, and only
+    /// then commit this replay key. Abandoning `.prepared` is side-effect-free.
+    pub const Admission = union(enum) {
+        duplicate,
+        prepared: Key,
+    };
+
     allocator: std.mem.Allocator,
     capacity: usize,
     seen: std.AutoHashMapUnmanaged(Key, void) = .empty,
@@ -627,6 +636,47 @@ pub const SeenSet = struct {
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) SeenSet {
         return .{ .allocator = allocator, .capacity = capacity };
+    }
+
+    pub fn contains(self: *const SeenSet, origin_node: u64, hlc: u64) bool {
+        return self.containsClass(origin_node, hlc, true);
+    }
+
+    pub fn containsUnsigned(self: *const SeenSet, origin_node: u64, hlc: u64) bool {
+        return self.containsClass(origin_node, hlc, false);
+    }
+
+    /// Reserve every allocation needed to observe an authenticated relay. No
+    /// logical state changes until `commitAdmission`, so OOM or a later queue
+    /// admission failure leaves the exact relay retryable.
+    pub fn prepareAdmission(self: *SeenSet, origin_node: u64, hlc: u64) !Admission {
+        return self.prepareAdmissionClass(origin_node, hlc, true);
+    }
+
+    pub fn prepareUnsignedAdmission(self: *SeenSet, origin_node: u64, hlc: u64) !Admission {
+        return self.prepareAdmissionClass(origin_node, hlc, false);
+    }
+
+    /// Publish a prepared replay key without allocation. The owner must
+    /// serialize prepare/commit pairs; SeenSet is intentionally lock-free.
+    pub fn commitAdmission(self: *SeenSet, admission: Admission) void {
+        const key = switch (admission) {
+            .duplicate => return,
+            .prepared => |key| key,
+        };
+        if (self.capacity == 0 or self.seen.contains(key)) return;
+
+        if (self.order.items.len < self.capacity) {
+            self.order.appendAssumeCapacity(key);
+            self.seen.putAssumeCapacity(key, {});
+            return;
+        }
+
+        const evicted = self.order.items[self.next_evict];
+        _ = self.seen.remove(evicted);
+        self.order.items[self.next_evict] = key;
+        self.next_evict = (self.next_evict + 1) % self.capacity;
+        self.seen.putAssumeCapacity(key, {});
     }
 
     pub fn observe(self: *SeenSet, origin_node: u64, hlc: u64) bool {
@@ -641,23 +691,13 @@ pub const SeenSet = struct {
     }
 
     fn observeClass(self: *SeenSet, origin_node: u64, hlc: u64, authenticated: bool) bool {
-        if (self.capacity == 0) return false;
-
-        const key = Key{ .origin_node = origin_node, .hlc = hlc, .authenticated = authenticated };
-        if (self.seen.contains(key)) return true;
-        self.ensureCapacity() catch return true;
-
-        if (self.order.items.len < self.capacity) {
-            self.order.append(self.allocator, key) catch return true;
-            self.seen.put(self.allocator, key, {}) catch return true;
+        const admission = self.prepareAdmissionClass(origin_node, hlc, authenticated) catch
+            // The legacy MESSAGE guard is a bounded loop optimization, not a
+            // durable delivery authority. Allocation pressure must not turn a
+            // fresh event into a false duplicate or poison its later retry.
             return false;
-        }
-
-        const evicted = self.order.items[self.next_evict];
-        _ = self.seen.remove(evicted);
-        self.order.items[self.next_evict] = key;
-        self.next_evict = (self.next_evict + 1) % self.capacity;
-        self.seen.put(self.allocator, key, {}) catch return true;
+        if (admission == .duplicate) return true;
+        self.commitAdmission(admission);
         return false;
     }
 
@@ -670,6 +710,27 @@ pub const SeenSet = struct {
     fn ensureCapacity(self: *SeenSet) !void {
         try self.seen.ensureTotalCapacity(self.allocator, @intCast(self.capacity));
         try self.order.ensureTotalCapacity(self.allocator, self.capacity);
+    }
+
+    fn containsClass(self: *const SeenSet, origin_node: u64, hlc: u64, authenticated: bool) bool {
+        return self.seen.contains(.{
+            .origin_node = origin_node,
+            .hlc = hlc,
+            .authenticated = authenticated,
+        });
+    }
+
+    fn prepareAdmissionClass(
+        self: *SeenSet,
+        origin_node: u64,
+        hlc: u64,
+        authenticated: bool,
+    ) !Admission {
+        const key = Key{ .origin_node = origin_node, .hlc = hlc, .authenticated = authenticated };
+        if (self.capacity == 0) return .{ .prepared = key };
+        if (self.seen.contains(key)) return .duplicate;
+        try self.ensureCapacity();
+        return .{ .prepared = key };
     }
 };
 
@@ -1221,6 +1282,43 @@ test "unsigned dedup cannot poison the authenticated event namespace" {
     try std.testing.expect(seen.observeUnsigned(7, 11));
     try std.testing.expect(!seen.observe(7, 11));
     try std.testing.expect(seen.observe(7, 11));
+}
+
+test "seen set admission allocation failure is side-effect-free and retryable" {
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_at,
+        });
+        var seen = SeenSet.init(failing.allocator(), 2);
+
+        const admission = seen.prepareAdmission(41, 99) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(!seen.contains(41, 99));
+            try std.testing.expectEqual(@as(usize, 0), seen.order.items.len);
+            try std.testing.expectEqual(@as(usize, 0), seen.seen.count());
+
+            // The same exact event succeeds once allocation pressure clears;
+            // only the subsequent attempt is classified as a duplicate.
+            failing.fail_index = std.math.maxInt(usize);
+            const retry = try seen.prepareAdmission(41, 99);
+            try std.testing.expect(retry == .prepared);
+            seen.commitAdmission(retry);
+            try std.testing.expect(seen.contains(41, 99));
+            try std.testing.expect(seen.observe(41, 99));
+            seen.deinit();
+            continue;
+        };
+
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expect(admission == .prepared);
+        seen.commitAdmission(admission);
+        try std.testing.expect(seen.contains(41, 99));
+        try std.testing.expect(seen.observe(41, 99));
+        seen.deinit();
+        break;
+    }
 }
 
 // ---------------------------------------------------------------------------

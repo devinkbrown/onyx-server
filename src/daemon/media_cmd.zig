@@ -116,6 +116,7 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
             return;
         }
         if (!on and self.media_rooms.stopRecording(channel)) {
+            _ = self.stopMediaRecorder(channel);
             try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
         }
         try self.broadcastMediaEvent(channel, "CONSENT", nick, if (on) "on" else "off");
@@ -128,10 +129,15 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
         }
         if (parsed.param_count >= 3 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[2], "stop")) {
             if (self.media_rooms.stopRecording(channel)) {
+                _ = self.stopMediaRecorder(channel);
                 try self.broadcastMediaEvent(channel, "RECORD", nick, "stopped");
             } else {
                 try self.sendMediaEventReply(conn, "RECORD", channel, "active=0");
             }
+            return;
+        }
+        if (!self.config.media_recording_enabled) {
+            try self.failReply(conn, "MEDIA", "RECORDING_DISABLED", "Call recording is disabled on this server");
             return;
         }
         if (!self.media_rooms.allConsented(channel)) {
@@ -148,6 +154,11 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
         }
         if (!try self.media_rooms.startRecording(channel, nick)) {
             try self.failReply(conn, "MEDIA", "CONSENT_REQUIRED", "Every current member must consent before recording");
+            return;
+        }
+        if (!self.startMediaRecorder(channel)) {
+            _ = self.media_rooms.stopRecording(channel);
+            try self.failReply(conn, "MEDIA", "RECORDING_UNAVAILABLE", "Recording storage is unavailable");
             return;
         }
         try self.broadcastMediaEvent(channel, "RECORD", nick, "started");
@@ -316,6 +327,9 @@ pub fn handle(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void 
         }
         const text = parsed.paramSlice()[2];
         _ = self.transcript.push(channel, nick, text, platform.realtimeMillis()) catch {}; // retention is best-effort
+        // Captions are server-visible text: journal them on the caption
+        // track when this channel is being recorded.
+        self.recordMediaPacket(channel, nick, .caption, "text", 0, 0, 0, @max(platform.realtimeMillis(), 0) * 1000, 0, false, text);
         // Live fan-out via the MEDIA event plane (text is the trailing detail,
         // so spaces are preserved as the rest of the event body).
         try self.publishMediaEvent("CAPTION", channel, nick, text);

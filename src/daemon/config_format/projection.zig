@@ -289,6 +289,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.modes_per_line = @intCast(try uintField(doc, "limits.modes_per_line", cfg.limits.modes_per_line, 1, 20));
     cfg.limits.monitorlimit = @intCast(try uintField(doc, "limits.monitorlimit", cfg.limits.monitorlimit, 1, 100000));
     cfg.limits.silencelimit = @intCast(try uintField(doc, "limits.silencelimit", cfg.limits.silencelimit, 1, 256));
+    cfg.limits.whowas_max_entries = @intCast(try uintField(doc, "limits.whowas_max_entries", cfg.limits.whowas_max_entries, 1, 100));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));
     if (doc.getString("limits.nick_delay")) |s| cfg.limits.nick_delay_ms = try durationMs(s);
     cfg.limits.throttle_connects = @intCast(try uintField(doc, "limits.throttle_connects", cfg.limits.throttle_connects, 0, 1_000_000));
@@ -380,6 +381,12 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("media.ws_media_require_mac")) |b| cfg.media.ws_media_require_mac = b;
     if (doc.getBool("media.dtls_srtp")) |b| cfg.media.dtls_srtp = b;
     if (doc.getBool("media.dtls13")) |b| cfg.media.dtls13 = b;
+    if (doc.getBool("media.recording_enabled")) |b| cfg.media.recording_enabled = b;
+    try setOpt(allocator, resolver, doc.getString("media.recording_dir"), &cfg.media.recording_dir);
+    cfg.media.recording_retention_days = @intCast(try uintField(doc, "media.recording_retention_days", cfg.media.recording_retention_days, 0, 3650));
+    cfg.media.recording_max_total_bytes = try uintField(doc, "media.recording_max_total_bytes", cfg.media.recording_max_total_bytes, 65536, 64 * 1024 * 1024 * 1024);
+    cfg.media.recording_max_duration_secs = try uintField(doc, "media.recording_max_duration_secs", cfg.media.recording_max_duration_secs, 1, 7 * 24 * 3600);
+    if (cfg.media.recording_enabled and (cfg.media.recording_dir == null or cfg.media.recording_dir.?.len == 0)) return error.ParseError;
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
 
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);

@@ -590,6 +590,68 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
 
+    // Runtime selection is deliberately absent from Compile.filters: changing
+    // --test-filter reuses one complete artifact per source/target/mode.
+    const cached_tests = b.addTest(.{
+        .name = "onyx-tests-cached",
+        .root_module = mod,
+        .test_runner = verbose_test_runner,
+    });
+    const cached_run = b.addRunArtifact(cached_tests);
+    cached_run.addPassthruArgs();
+    const cached_step = b.step("test-cached", "Run reusable full module artifact; runtime --test-filter=<text> or --list-tests");
+    const cached_windows = os_tag == .windows or b.graph.host.result.os.tag == .windows;
+    if (cached_windows) {
+        cached_step.dependOn(&b.addFail("test-cached is unsupported on Windows: use test-mod or test-mod-verbose, which retain the required Windows compile shards").step);
+    } else {
+        cached_step.dependOn(&cached_run.step);
+    }
+    const cached_exe_tests = b.addTest(.{
+        .name = "onyx-exe-tests-cached",
+        .root_module = exe.root_module,
+        .test_runner = verbose_test_runner,
+    });
+    const cached_exe_run = b.addRunArtifact(cached_exe_tests);
+    cached_exe_run.addPassthruArgs();
+    const cached_exe_step = b.step("test-exe-cached", "Run reusable executable-root artifact; accepts runtime selection");
+    if (cached_windows) {
+        cached_exe_step.dependOn(&b.addFail("test-exe-cached is unsupported on Windows: use test-exe or test-exe-verbose with the existing Windows stack and code-generator setup").step);
+    } else {
+        cached_exe_step.dependOn(&cached_exe_run.step);
+    }
+
+    const record_leaf_mod = b.createModule(.{
+        .root_source_file = b.path("src/media_record_leaf_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    const record_leaf_tests = b.addTest(.{
+        .name = "media-record-leaf-tests",
+        .root_module = record_leaf_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const record_leaf_run = b.addRunArtifact(record_leaf_tests);
+    record_leaf_run.addPassthruArgs();
+    b.step("test-media-record-leaf", "Run isolated recording journal tests; accepts compile or runtime selection").dependOn(&record_leaf_run.step);
+
+    const relay_v2_leaf_mod = b.createModule(.{
+        .root_source_file = b.path("src/message_relay_v2_leaf_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = needs_libc,
+    });
+    const relay_v2_leaf_tests = b.addTest(.{
+        .name = "message-relay-v2-leaf-tests",
+        .root_module = relay_v2_leaf_mod,
+        .filters = test_filters,
+        .test_runner = verbose_test_runner,
+    });
+    const relay_v2_leaf_run = b.addRunArtifact(relay_v2_leaf_tests);
+    relay_v2_leaf_run.addPassthruArgs();
+    b.step("test-message-relay-v2-leaf", "Run isolated signed MESSAGE_V2 codec tests; integration gates remain required").dependOn(&relay_v2_leaf_run.step);
+
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_mod_step = b.step("test-mod", "Run only the library/module test artifact; accepts -Dtest-filter=<text>");
@@ -1019,6 +1081,33 @@ pub fn build(b: *std.Build) void {
     const test_cli_verbose_step = b.step("test-cli-verbose", "Run armor CLI tests with per-test progress output");
     test_cli_verbose_step.dependOn(&run_cli_tests_verbose.step);
 
+    const cached_cli_tests = b.addTest(.{
+        .name = "onyx-cli-tests-cached",
+        .root_module = armor_exe.root_module,
+        .test_runner = verbose_test_runner,
+    });
+    const parallel_full = b.addSystemCommand(&.{ "python3", "-B" });
+    parallel_full.addFileArg(b.path("tools/parallel_tests.py"));
+    parallel_full.addFileArg(cached_tests.getEmittedBin());
+    parallel_full.addFileArg(cached_exe_tests.getEmittedBin());
+    parallel_full.addFileArg(cached_cli_tests.getEmittedBin());
+    parallel_full.addPassthruArgs();
+    const parallel_step = b.step("test-full-parallel", "Run full module + executable + CLI tests in coverage-checked runtime shards; optional -- --logs=<new-dir>");
+    const parallel_host_supported = switch (b.graph.host.result.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+        else => false,
+    };
+    const parallel_native = target.result.os.tag == b.graph.host.result.os.tag and
+        target.result.cpu.arch == b.graph.host.result.cpu.arch and
+        target.result.abi == b.graph.host.result.abi;
+    const parallel_supported = parallel_host_supported and parallel_native and !cached_windows;
+    if (!parallel_supported) {
+        // A sibling failure would still launch compilers: attach only Fail,
+        // leaving every expensive artifact outside this selected step's graph.
+        parallel_step.dependOn(&b.addFail("test-full-parallel requires a native supported POSIX host/target; use test or test-verbose (Windows retains its existing compile shards)").step);
+    } else {
+        parallel_step.dependOn(&parallel_full.step);
+    }
     // Cross-compiled test runners are copied to the target machine explicitly.
     const test_artifacts = b.step("test-artifacts", "Build and install module, daemon, and CLI test runners without executing them");
     const test_exe_suffix = if (os_tag == .windows) ".exe" else "";
@@ -1043,13 +1132,18 @@ pub fn build(b: *std.Build) void {
     test_artifacts.dependOn(&exe_install.step);
     test_artifacts.dependOn(&cli_install.step);
 
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(test_mod_step);
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_cli_tests.step);
+    // Preserve the reference graph for serial execution within each root and
+    // every platform/compile-filter path that cannot use runtime sharding.
+    const serial_test_step = b.step("test-serial", "Run full module, executable, and CLI tests with the reference runner graph");
+    serial_test_step.dependOn(test_mod_step);
+    serial_test_step.dependOn(&run_exe_tests.step);
+    serial_test_step.dependOn(&run_cli_tests.step);
+    const test_step = b.step("test", "Run all tests; unfiltered native POSIX uses bounded runtime shards");
+    if (parallel_supported and test_filters.len == 0) {
+        test_step.dependOn(parallel_step);
+    } else {
+        test_step.dependOn(serial_test_step);
+    }
     const test_verbose_step = b.step("test-verbose", "Run full tests with per-test progress output");
     test_verbose_step.dependOn(test_mod_verbose_step);
     test_verbose_step.dependOn(&run_exe_tests_verbose.step);
@@ -1309,6 +1403,7 @@ pub fn build(b: *std.Build) void {
             helix_tests_verbose,    dst_tests,
             cli_tests,              cli_tests_verbose,
             windows_io_tests,       windows_exe_tests,
+            record_leaf_tests,      relay_v2_leaf_tests,
         };
         for (windows_test_steps) |step| {
             step.stack_size = 64 * 1024 * 1024;
@@ -1361,6 +1456,8 @@ pub fn build(b: *std.Build) void {
                 .{ .compile = dst_tests, .run = run_dst_tests },
                 .{ .compile = cli_tests, .run = run_cli_tests },
                 .{ .compile = cli_tests_verbose, .run = run_cli_tests_verbose },
+                .{ .compile = record_leaf_tests, .run = record_leaf_run },
+                .{ .compile = relay_v2_leaf_tests, .run = relay_v2_leaf_run },
                 .{ .compile = windows_io_tests, .run = run_windows_io_tests },
                 .{ .compile = windows_exe_tests, .run = run_windows_exe_tests },
             };

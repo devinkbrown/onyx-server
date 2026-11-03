@@ -59,6 +59,10 @@ pub const AccessError = error{
     InvalidRequester,
     LineTooLong,
     OutputTooSmall,
+    /// A remote fact's HLC is beyond the local wall clock plus the bounded
+    /// future-skew allowance; accepting it would poison every later local
+    /// write's rank and make the fact practically unrevocable.
+    FutureHlc,
 };
 
 pub const StoreError = AccessError || std.mem.Allocator.Error;
@@ -388,7 +392,10 @@ pub const AccessStore = struct {
     /// steps backwards: the counter never returns a value it has already issued.
     fn nextHlc(self: *AccessStore) u64 {
         const wall = self.now_seconds *| 1000;
-        self.hlc = @max(self.hlc + 1, wall);
+        // Saturating: a store restored with an extreme stamp must keep issuing
+        // that stamp, never panic on overflow or wrap to ~0 (which would make
+        // every future local write lose every LWW comparison).
+        self.hlc = @max(self.hlc +| 1, wall);
         return self.hlc;
     }
 
@@ -411,13 +418,17 @@ pub const AccessStore = struct {
     /// Drop every entry whose timeout has elapsed against the store clock,
     /// returning how many were removed. Called by the daemon on its timer tick;
     /// reads (`matchHostmask`/`list`) already skip expired entries, so this is a
-    /// bounded-memory reclaim, not a correctness dependency.
+    /// bounded-memory reclaim, not a correctness dependency. Each lapsed entry
+    /// leaves a tombstone at its own write stamp: without one, a peer that
+    /// retained the signed ADD wire could replay it after the lapse and the
+    /// timed grant would resurrect with a fresh lifetime.
     pub fn pruneExpired(self: *AccessStore) usize {
         var removed_count: usize = 0;
         var idx: usize = 0;
         while (idx < self.entries.items.len) {
             if (self.isExpired(self.entries.items[idx])) {
                 const removed = self.entries.orderedRemove(idx);
+                self.recordTombstone(removed.channel, removed.level, removed.mask, removed.hlc, removed.origin_node) catch {};
                 freeEntry(self.allocator, removed);
                 removed_count += 1;
             } else {
@@ -676,8 +687,11 @@ pub const AccessStore = struct {
             self.recordTombstone(channel, level, mask, stamp, self.local_node) catch {};
             return false;
         };
+        // Marker attempt precedes removal (best-effort: a local operator
+        // delete still proceeds under OOM, but the common path records the
+        // tombstone while the entry is intact).
+        self.recordTombstone(channel, level, mask, stamp, self.local_node) catch {};
         const removed = self.entries.orderedRemove(idx);
-        self.recordTombstone(removed.channel, removed.level, removed.mask, stamp, self.local_node) catch {};
         freeEntry(self.allocator, removed);
         return true;
     }
@@ -690,8 +704,9 @@ pub const AccessStore = struct {
         var idx: usize = 0;
         while (idx < self.entries.items.len) {
             if (selector.matches(self.entries.items[idx])) {
+                const entry = self.entries.items[idx];
+                self.recordTombstone(entry.channel, entry.level, entry.mask, stamp, self.local_node) catch {};
                 const removed = self.entries.orderedRemove(idx);
-                self.recordTombstone(removed.channel, removed.level, removed.mask, stamp, self.local_node) catch {};
                 freeEntry(self.allocator, removed);
                 removed_count += 1;
             } else {
@@ -700,6 +715,12 @@ pub const AccessStore = struct {
         }
         return removed_count;
     }
+
+    /// How far a remote fact's HLC (wall-clock milliseconds plus a per-write
+    /// counter, see `nextHlc`) may run ahead of this store's wall clock.
+    /// Matches the mesh-wide future-skew budget so a peer the rest of the
+    /// mesh accepts is not singled out here.
+    pub const max_future_hlc_skew_ms: u64 = 5 * 60 * 1000;
 
     /// Converge one replicated fact from a mesh peer. Last-writer-wins over
     /// `(hlc, origin_node)`, with delete markers so a re-broadcast ADD cannot
@@ -713,6 +734,34 @@ pub const AccessStore = struct {
         try validateMaskWith(.{}, fact.mask);
         if (fact.present) try validateSetByWith(.{}, fact.set_by);
 
+        // Freshness window, enforced before the stamp can fold into the local
+        // clock. A self-signed fact needs only its author's key, so without a
+        // bound one peer could stamp `maxInt(u64)`, poison every receiver's
+        // clock, and make its grant outrank every future write forever. A
+        // clock-agnostic store (`now_seconds` 0) keeps the historical
+        // unbounded behavior for pure-local callers and tests.
+        var origin_lapsed = false;
+        if (self.now_seconds != 0) {
+            const now_ms = self.now_seconds *| 1000;
+            if (fact.hlc > now_ms +| max_future_hlc_skew_ms) return error.FutureHlc;
+            // A timed grant whose origin-side lifetime already lapsed must
+            // not resurrect with a fresh local lifetime on replay. The HLC
+            // carries the author's wall time, so the origin expiry is
+            // derivable; the skew allowance absorbs clock disagreement. The
+            // fact still carries rank: below, a lapsed timed ADD that
+            // outranks the stored state converges as a tombstone at its own
+            // stamp instead of being dropped, which would leave a superseded
+            // predecessor grant live forever on this receiver.
+            if (fact.present) {
+                if (fact.duration) |duration| {
+                    if (duration != 0) {
+                        const origin_expiry_s = (fact.hlc / 1000) +| duration +| (max_future_hlc_skew_ms / 1000);
+                        if (self.now_seconds > origin_expiry_s) origin_lapsed = true;
+                    }
+                }
+            }
+        }
+
         self.observeHlc(fact.hlc);
 
         if (self.findTombstone(fact.channel, fact.level, fact.mask)) |marker| {
@@ -723,13 +772,17 @@ pub const AccessStore = struct {
         if (self.findIndex(fact.channel, fact.level, fact.mask)) |idx| {
             const current = self.entries.items[idx];
             if (!ranksAbove(fact.hlc, fact.origin_node, current.hlc, current.origin_node)) return .stale;
-            if (!fact.present) {
+            if (!fact.present or origin_lapsed) {
+                // Tombstone FIRST: if recording it fails, the entry is still
+                // present and unmodified, so the caller can retry the same
+                // fact without a leaked entry or a delete that applied
+                // locally but left no marker against re-broadcast.
+                try self.recordTombstone(fact.channel, fact.level, fact.mask, fact.hlc, fact.origin_node);
                 const removed = self.entries.orderedRemove(idx);
-                try self.recordTombstone(removed.channel, removed.level, removed.mask, fact.hlc, fact.origin_node);
                 freeEntry(self.allocator, removed);
                 return .deleted;
             }
-        } else if (!fact.present) {
+        } else if (!fact.present or origin_lapsed) {
             try self.recordTombstone(fact.channel, fact.level, fact.mask, fact.hlc, fact.origin_node);
             return .deleted;
         }
@@ -1746,6 +1799,123 @@ test "ACCESS applyRemote order does not change the converged state" {
     try std.testing.expectEqualStrings("b", rhs.set_by);
     try std.testing.expectEqual(@as(?EntryView, null), try forward.matchHostmask("#c", "n!u@2.test"));
     try std.testing.expectEqual(@as(?EntryView, null), try reverse.matchHostmask("#c", "n!u@2.test"));
+}
+
+test "ACCESS applyRemote refuses a far-future HLC without poisoning the local clock" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 1_700_000_000;
+
+    const poison = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .founder,
+        .mask = "*!*@evil.test",
+        .set_by = "mallory",
+        .hlc = std.math.maxInt(u64),
+        .origin_node = 9,
+    };
+    try std.testing.expectError(error.FutureHlc, store.applyRemote(poison));
+    // The local clock never folded the poison stamp, so the next local write
+    // is an ordinary wall-clock stamp — no overflow, no wrap to ~0.
+    try std.testing.expectEqual(@as(u64, 0), store.hlc);
+    try store.add("#mesh", .voice, "*!*@ok.test", "alice", null);
+    try std.testing.expect(store.hlc >= 1_700_000_000_000);
+    try std.testing.expect(store.hlc < 1_700_000_001_000);
+
+    // A fact inside the skew allowance still applies.
+    var near = poison;
+    near.level = .voice;
+    near.mask = "*!*@near.test";
+    near.hlc = 1_700_000_000_000 + AccessStore.max_future_hlc_skew_ms;
+    try std.testing.expectEqual(ApplyOutcome.applied, try store.applyRemote(near));
+}
+
+test "ACCESS applyRemote refuses a timed fact whose origin lifetime already lapsed" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 1_700_000_000;
+
+    // Authored two hours ago with a 60-second lifetime: replaying it now
+    // must not mint a fresh minute of access.
+    const lapsed = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .host,
+        .mask = "*!*@old.test",
+        .set_by = "alice",
+        .duration = 60,
+        .hlc = (1_700_000_000 - 7200) * 1000,
+        .origin_node = 4,
+    };
+    // Converges as a tombstone at its own stamp: absent, and ranked so an
+    // older predecessor arriving later cannot resurrect underneath it.
+    try std.testing.expectEqual(ApplyOutcome.deleted, try store.applyRemote(lapsed));
+    try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#mesh", "x!u@old.test"));
+
+    // The same shape inside its origin lifetime applies normally.
+    var live = lapsed;
+    live.mask = "*!*@live.test";
+    live.hlc = (1_700_000_000 - 30) * 1000;
+    try std.testing.expectEqual(ApplyOutcome.applied, try store.applyRemote(live));
+}
+
+test "ACCESS lapsed timed replacement retires its permanent predecessor" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 1_700_000_000;
+
+    const permanent = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .host,
+        .mask = "*!*@swap.test",
+        .set_by = "alice",
+        .hlc = (1_700_000_000 - 10_000) * 1000,
+        .origin_node = 4,
+    };
+    try std.testing.expectEqual(ApplyOutcome.applied, try store.applyRemote(permanent));
+
+    // A newer timed replacement was authored two hours ago with a 60-second
+    // lifetime and only reaches this receiver now. Dropping it as stale
+    // would leave the superseded permanent grant live forever here.
+    var timed = permanent;
+    timed.set_by = "bob";
+    timed.duration = 60;
+    timed.hlc = (1_700_000_000 - 7200) * 1000;
+    try std.testing.expectEqual(ApplyOutcome.deleted, try store.applyRemote(timed));
+    try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#mesh", "x!u@swap.test"));
+
+    // The permanent predecessor re-arriving later loses to the tombstone.
+    try std.testing.expectEqual(ApplyOutcome.stale, try store.applyRemote(permanent));
+    try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#mesh", "x!u@swap.test"));
+}
+
+test "ACCESS expired timed entry leaves a tombstone against ADD replay" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 1_700_000_000;
+
+    const grant = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .host,
+        .mask = "*!*@temp.test",
+        .set_by = "alice",
+        .duration = 60,
+        .hlc = 1_700_000_000_000,
+        .origin_node = 4,
+    };
+    try std.testing.expectEqual(ApplyOutcome.applied, try store.applyRemote(grant));
+
+    // Advance inside the replay-skew allowance but past the local expiry, so
+    // only the prune-time tombstone (not the origin-lifetime check) can stop
+    // the resurrection.
+    store.now_seconds = 1_700_000_000 + 120;
+    _ = store.pruneExpired();
+    try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#mesh", "x!u@temp.test"));
+    try std.testing.expectEqual(ApplyOutcome.stale, try store.applyRemote(grant));
+    try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#mesh", "x!u@temp.test"));
 }
 
 test "ACCESS applyRemote enforces field bounds on peer input" {

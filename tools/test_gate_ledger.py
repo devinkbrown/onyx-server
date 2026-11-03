@@ -189,6 +189,45 @@ class TestCountEvidence(unittest.TestCase):
                      "Build Summary: 4/4 steps succeeded; 85/86 tests passed (1 mystery)\n"):
             self.assertIsNone(self.parse(text))
 
+    def parallel_log(self):
+        return ("parallel artifact summary: index=0 discovered=3 executed=3 passed=2 skipped=1 failed=0 leaked=0 log_errors=0 complete=1\n"
+                "parallel artifact summary: index=1 discovered=2 executed=2 passed=2 skipped=0 failed=0 leaked=0 log_errors=0 complete=1\n"
+                "parallel artifact summary: index=2 discovered=1 executed=1 passed=0 skipped=0 failed=1 leaked=1 log_errors=2 complete=1\n"
+                "parallel suite summary: artifacts=3 discovered=6 executed=6 passed=4 skipped=1 failed=1 leaked=1 log_errors=2 complete=1\n")
+
+    def test_parallel_suite_balanced_all_artifacts(self):
+        counts = self.parse(self.parallel_log() + "Build Summary: 6/6 steps succeeded\n")
+        self.assertEqual("parallel_suite_summary", counts["provenance"])
+        self.assertEqual((6, 4, 1, 1, 1, 2), tuple(counts[key] for key in ("total", "passed", "skipped", "failed", "leaked", "log_errors")))
+
+    def test_parallel_suite_rejects_truncated_duplicate_and_inconsistent(self):
+        valid = self.parallel_log()
+        lines = valid.splitlines(keepends=True)
+        variants = ["".join(lines[:-1]), "".join(lines[1:]), valid + lines[-1],
+                    lines[-1] + "".join(lines[:-1]), valid + lines[0],
+                    valid.replace("index=2", "index=1"),
+                    valid.replace("artifacts=3", "artifacts=2"),
+                    valid.replace("discovered=6", "discovered=7"),
+                    valid.replace("executed=3", "executed=2"),
+                    valid.replace("complete=1", "complete=0", 1),
+                    valid.replace("complete=1\n", "complete=0\n"),
+                    valid.replace("parallel suite summary: artifacts=3", "parallel suite summary: broken=3"),
+                    valid + "verbose test summary: 6 passed; 0 skipped; 0 failed; 0 leaked; 0 log errors; elapsed 1s\n",
+                    valid + "Build Summary: 6/6 steps succeeded; 6/6 tests passed\n"]
+        for text in variants:
+            with self.subTest(text=text):
+                self.assertIsNone(self.parse(text))
+
+    def test_parallel_counts_cannot_override_process_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir(); (root / "src/x").write_text("x")
+            record = root / "parallel.json"
+            command = [sys.executable, "-c", f"print({self.parallel_log()!r}); raise SystemExit(7)"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(1, ledger.run(root, record, ["src"], command))
+                self.assertEqual("diagnose", ledger.decision(root, record)["action"])
+            self.assertEqual(6, json.loads(record.read_text())["test_counts"]["total"])
+
     def test_oversized_log_is_unknown(self):
         self.assertIsNone(self.parse("x" * (ledger.COUNT_LOG_LIMIT + 1)))
 

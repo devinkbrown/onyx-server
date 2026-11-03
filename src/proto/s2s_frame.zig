@@ -17,6 +17,19 @@ pub const length_len: usize = 4;
 /// (see `media_ws_relay.required_max_frame_size`) without widening the
 /// snapshot wire budget.
 pub const default_max_frame_size: usize = 1024 * 1024;
+/// MESSAGE/MESSAGE_V2 carry bounded IRC user-message fields whose current
+/// canonical encodings are well below this ceiling. Keep their wire allowance
+/// separate from the 1 MiB generic ceiling needed by state and migration
+/// frames, so an impossible PRIVMSG declaration fails from its five-byte
+/// header instead of buffering a near-maximum frame before the relay codec can
+/// reject it. MESSAGE_V2's immediate-hop signed envelope is included.
+///
+/// Verified against current relay bounds (`message_relay.zig`, reused by
+/// `message_relay_v2.validateBody`): text 4096 + tags 4094 + prefix 385 +
+/// target 200 + nick/account/recipient 192 + data tag 15 + origin key/sig 96
+/// + v2 route/guest ids 80 + CoilPack key/varint overhead stays under
+/// 10 KiB; adding the 96-byte `signed_frame` hop header keeps a >6x margin.
+pub const max_user_message_payload_len: usize = 64 * 1024;
 
 const endian = .little;
 
@@ -180,6 +193,12 @@ pub const FrameType = enum(u8) {
     /// Original signed complete guest-retirement frontier. Sent only after a
     /// distinct PING/PONG extension confirms the peer understands this frame.
     GUEST_FRONTIER = 0x2F,
+    /// Secured multi-hop IRCX channel ACCESS fact. The inner access-event
+    /// bytes retain the original author's self-contained signature and are
+    /// forwarded without rewriting; the signed-frame envelope authenticates
+    /// only the immediate transport peer. Rides the event-spine-v2 capability
+    /// because the one-byte handshake capability layout is full.
+    ACCESS_EVENT_V1 = 0x30,
 
     pub fn tag(self: FrameType) u8 {
         return @backingInt(self);
@@ -234,6 +253,7 @@ pub const FrameType = enum(u8) {
             @backingInt(FrameType.GUEST_DIRECT) => .GUEST_DIRECT,
             @backingInt(FrameType.WHOIS_PROFILE) => .WHOIS_PROFILE,
             @backingInt(FrameType.GUEST_FRONTIER) => .GUEST_FRONTIER,
+            @backingInt(FrameType.ACCESS_EVENT_V1) => .ACCESS_EVENT_V1,
             else => null,
         };
     }
@@ -391,6 +411,7 @@ pub const FrameSpec = struct {
     family: FrameFamily,
     auth: FrameAuth,
     capability_mask: u8 = 0,
+    max_payload_len: ?usize = null,
     summary: []const u8,
 };
 
@@ -403,7 +424,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .PONG, .token = "PONG", .family = .control, .auth = .unsigned, .summary = "Liveness probe response." },
     .{ .frame_type = .QUIT, .token = "QUIT", .family = .control, .auth = .unsigned, .summary = "Remote peer close notification." },
     .{ .frame_type = .MEMBERSHIP, .token = "MEMBERSHIP", .family = .membership, .auth = .signable, .summary = "Channel-member route fact; optional account and oper-info extensions are capability-gated." },
-    .{ .frame_type = .MESSAGE, .token = "MESSAGE", .family = .relay, .auth = .signed, .summary = "Cross-node PRIVMSG, NOTICE, TAGMSG, DATA, and WHISPER relay with self-contained origin signature." },
+    .{ .frame_type = .MESSAGE, .token = "MESSAGE", .family = .relay, .auth = .signed, .max_payload_len = max_user_message_payload_len, .summary = "Cross-node PRIVMSG, NOTICE, TAGMSG, DATA, and WHISPER relay with self-contained origin signature." },
     .{ .frame_type = .OPER_GRANT, .token = "OPER_GRANT", .family = .oper, .auth = .secured_signed, .summary = "Cross-mesh operator authorization grant verified against the secured peer identity." },
     .{ .frame_type = .CHANNEL_MODE_FLAGS, .token = "CHANNEL_MODE_FLAGS", .family = .membership, .auth = .signable, .summary = "Boolean channel-mode flag fact." },
     .{ .frame_type = .CHANNEL_LIST, .token = "CHANNEL_LIST", .family = .membership, .auth = .signable, .summary = "Channel list-mode fact for ban, exception, and invite-exception lists." },
@@ -427,7 +448,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .SESSION_REPLICA_OFFER, .token = "SESSION_REPLICA_OFFER", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed upsert offer." },
     .{ .frame_type = .SESSION_REPLICA_ACK, .token = "SESSION_REPLICA_ACK", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed acknowledgment and route observation." },
     .{ .frame_type = .SESSION_REPLICA_REVOKE, .token = "SESSION_REPLICA_REVOKE", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed removal tombstone." },
-    .{ .frame_type = .MESSAGE_V2, .token = "MESSAGE_V2", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured multi-hop user relay with immutable origin signature and routing scope." },
+    .{ .frame_type = .MESSAGE_V2, .token = "MESSAGE_V2", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .max_payload_len = max_user_message_payload_len, .summary = "Secured multi-hop user relay with immutable origin signature and routing scope." },
     .{ .frame_type = .SESSION_REPLICA_ATTACHMENT_LEASE, .token = "SESSION_REPLICA_ATTACHMENT_LEASE", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2 | cap_session_attachment_lease_v2, .summary = "SESSION_REPLICA v2 signed positive attachment lease." },
     .{ .frame_type = .OPER_EVENT_V2, .token = "OPER_EVENT_V2", .family = .oper, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .summary = "Secured multi-hop Event Spine notification with immutable origin signature." },
     .{ .frame_type = .MESSAGE_V2_ACK, .token = "MESSAGE_V2_ACK", .family = .relay, .auth = .secured_signed, .capability_mask = cap_secure_relay_v2, .summary = "Secured hop receipt for an admitted MESSAGE_V2 RelayId." },
@@ -442,6 +463,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .GUEST_DIRECT, .token = "GUEST_DIRECT", .family = .relay, .auth = .secured_signed, .summary = "Exact ordinary-guest direct message bound to both guest incarnations. Forward only toward the recipient." },
     .{ .frame_type = .WHOIS_PROFILE, .token = "WHOIS_PROFILE", .family = .membership, .auth = .signable, .summary = "Remote WHOIS session facts. Gated by a PING extension. rDNS is present only on a secured oper-info link." },
     .{ .frame_type = .GUEST_FRONTIER, .token = "GUEST_FRONTIER", .family = .relay, .auth = .secured_signed, .summary = "Original signed complete guest-retirement frontier; gated by its own PING/PONG extension." },
+    .{ .frame_type = .ACCESS_EVENT_V1, .token = "ACCESS_EVENT_V1", .family = .oper, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .max_payload_len = 1024, .summary = "Secured multi-hop IRCX channel ACCESS fact with immutable origin signature." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {
@@ -473,7 +495,13 @@ pub fn encodedLen(payload_len: usize) EncodeError!usize {
     return header_len + payload_len;
 }
 
+fn payloadExceedsTypeLimit(frame_type: FrameType, payload_len: usize) bool {
+    const max_payload_len = frameSpec(frame_type).max_payload_len orelse return false;
+    return payload_len > max_payload_len;
+}
+
 pub fn encode(frame_type: FrameType, payload: []const u8, out: []u8) EncodeError![]const u8 {
+    if (payloadExceedsTypeLimit(frame_type, payload.len)) return error.PayloadTooLarge;
     const total = try encodedLen(payload.len);
     if (out.len < total) return error.BufferTooSmall;
 
@@ -498,6 +526,11 @@ pub const Decoder = struct {
         const payload_len = std.mem.readInt(u32, bytes[1..][0..length_len], endian);
         const total = std.math.add(usize, header_len, payload_len) catch return error.OversizeFrame;
         if (total > max_frame_size) return error.OversizeFrame;
+        // Same header-time type bound as `next`: a checkpointed partial must
+        // not carry a user-message declaration the live decoder rejects.
+        if (FrameType.fromTag(bytes[0])) |known_type| {
+            if (payloadExceedsTypeLimit(known_type, payload_len)) return error.OversizeFrame;
+        }
         if (bytes.len >= total) return error.InvalidPartialFrame;
     }
 
@@ -545,9 +578,18 @@ pub const Decoder = struct {
 
             const total = header_len + payload_len;
             if (total > self.max_frame_size) return error.OversizeFrame;
+
+            const frame_type = FrameType.fromTag(tag_byte);
+            if (frame_type) |known_type| {
+                // Enforce the type-specific bound as soon as the complete
+                // header exists. In particular, do not wait for an impossible
+                // user-message body to arrive and occupy the generic
+                // state/snapshot allowance.
+                if (payloadExceedsTypeLimit(known_type, payload_len)) return error.OversizeFrame;
+            }
             if (self.accumulator.items.len < total) return null;
 
-            const frame_type = FrameType.fromTag(tag_byte) orelse {
+            const known_type = frame_type orelse {
                 // Unknown/newer frame tag. The frame is still length-delimited
                 // (and bounded by max_frame_size above), so skip it cleanly
                 // instead of tearing the whole secured link down — that
@@ -564,7 +606,7 @@ pub const Decoder = struct {
             self.discardPrefix(total);
 
             return .{
-                .frame_type = frame_type,
+                .frame_type = known_type,
                 .payload = self.payload_buf.items,
             };
         }
@@ -672,6 +714,122 @@ test "multiple complete frames drain in order" {
 
     try testing.expectEqual(@as(?Frame, null), try decoder.next());
     try decoder.finish();
+}
+
+test "fragmented PRIVMSG MESSAGE frame propagates between coalesced control frames" {
+    const allocator = testing.allocator;
+    const ping_payload = "before";
+    const message_payload = "PRIVMSG #undertow :split across the S2S stream";
+    const pong_payload = "after";
+
+    var ping_buf: [header_len + ping_payload.len]u8 = undefined;
+    var message_buf: [header_len + message_payload.len]u8 = undefined;
+    var pong_buf: [header_len + pong_payload.len]u8 = undefined;
+    const ping = try encode(.PING, ping_payload, &ping_buf);
+    const message = try encode(.MESSAGE, message_payload, &message_buf);
+    const pong = try encode(.PONG, pong_payload, &pong_buf);
+
+    var stream: [ping_buf.len + message_buf.len + pong_buf.len]u8 = undefined;
+    var stream_len: usize = 0;
+    for ([_][]const u8{ ping, message, pong }) |frame| {
+        @memcpy(stream[stream_len..][0..frame.len], frame);
+        stream_len += frame.len;
+    }
+    try testing.expectEqual(stream.len, stream_len);
+
+    var decoder = Decoder.init(allocator, default_max_frame_size);
+    defer decoder.deinit();
+
+    const expected_types = [_]FrameType{ .PING, .MESSAGE, .PONG };
+    const expected_payloads = [_][]const u8{ ping_payload, message_payload, pong_payload };
+    const chunk_sizes = [_]usize{ 1, 2, header_len, 3, 17, 4, 64 };
+    var offset: usize = 0;
+    var chunk_index: usize = 0;
+    var decoded_count: usize = 0;
+    while (offset < stream.len) : (chunk_index += 1) {
+        const end = @min(offset + chunk_sizes[chunk_index % chunk_sizes.len], stream.len);
+        try decoder.feed(stream[offset..end]);
+        offset = end;
+
+        while (try decoder.next()) |frame| {
+            try testing.expect(decoded_count < expected_types.len);
+            try testing.expectEqual(expected_types[decoded_count], frame.frame_type);
+            try testing.expectEqualSlices(u8, expected_payloads[decoded_count], frame.payload);
+            decoded_count += 1;
+        }
+    }
+
+    try testing.expectEqual(expected_types.len, decoded_count);
+    try decoder.finish();
+}
+
+test "user-message payload bounds reject from the header before body buffering" {
+    const allocator = testing.allocator;
+    const user_message_types = [_]FrameType{ .MESSAGE, .MESSAGE_V2 };
+    const oversized_payload = try allocator.alloc(u8, max_user_message_payload_len + 1);
+    defer allocator.free(oversized_payload);
+    var empty_out: [0]u8 = .{};
+
+    inline for (user_message_types) |frame_type| {
+        try testing.expectError(error.PayloadTooLarge, encode(frame_type, oversized_payload, &empty_out));
+
+        var decoder = Decoder.init(allocator, default_max_frame_size);
+        defer decoder.deinit();
+
+        var header: [header_len]u8 = undefined;
+        header[0] = frame_type.tag();
+        std.mem.writeInt(
+            u32,
+            header[1..][0..length_len],
+            @intCast(max_user_message_payload_len + 1),
+            endian,
+        );
+        try decoder.feed(&header);
+        try testing.expectError(error.OversizeFrame, decoder.next());
+        try testing.expectEqual(header_len, decoder.accumulator.items.len);
+        try testing.expectEqual(@as(usize, 0), decoder.payload_buf.items.len);
+
+        // The exact boundary is legal at the frame layer and waits for its
+        // body; the strict MESSAGE codec remains responsible for its contents.
+        decoder.reset();
+        std.mem.writeInt(
+            u32,
+            header[1..][0..length_len],
+            @intCast(max_user_message_payload_len),
+            endian,
+        );
+        try decoder.feed(&header);
+        try testing.expectEqual(@as(?Frame, null), try decoder.next());
+    }
+
+    // Large state/migration families keep the generic 1 MiB allowance.
+    var migration_decoder = Decoder.init(allocator, default_max_frame_size);
+    defer migration_decoder.deinit();
+    var migration_header: [header_len]u8 = undefined;
+    migration_header[0] = FrameType.SESSION_MIGRATE.tag();
+    std.mem.writeInt(
+        u32,
+        migration_header[1..][0..length_len],
+        @intCast(max_user_message_payload_len + 1),
+        endian,
+    );
+    try testing.expectError(error.BufferTooSmall, encode(.SESSION_MIGRATE, oversized_payload, &empty_out));
+    try migration_decoder.feed(&migration_header);
+    try testing.expectEqual(@as(?Frame, null), try migration_decoder.next());
+}
+
+test "validatePartial rejects over-bound user-message headers" {
+    var header: [header_len]u8 = undefined;
+    header[0] = FrameType.MESSAGE_V2.tag();
+    std.mem.writeInt(u32, header[1..][0..length_len], @intCast(max_user_message_payload_len + 1), endian);
+    try testing.expectError(error.OversizeFrame, Decoder.validatePartial(&header, default_max_frame_size));
+
+    // At-bound partial and a large migration partial stay valid checkpoints.
+    std.mem.writeInt(u32, header[1..][0..length_len], @intCast(max_user_message_payload_len), endian);
+    try Decoder.validatePartial(&header, default_max_frame_size);
+    header[0] = FrameType.SESSION_MIGRATE.tag();
+    std.mem.writeInt(u32, header[1..][0..length_len], @intCast(max_user_message_payload_len + 1), endian);
+    try Decoder.validatePartial(&header, default_max_frame_size);
 }
 
 test "oversize rejected" {
@@ -843,8 +1001,17 @@ test "secure relay v2 frame is secured and capability gated" {
     try testing.expectEqual(FrameFamily.relay, spec.family);
     try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
     try testing.expectEqual(cap_secure_relay_v2, spec.capability_mask);
+    try testing.expectEqual(max_user_message_payload_len, spec.max_payload_len.?);
     try testing.expectEqual(FrameType.MESSAGE_V2, frameSpecByTag(0x21).?.frame_type);
     try testing.expectEqual(FrameType.MESSAGE_V2, frameSpecByToken("MESSAGE_V2").?.frame_type);
+}
+
+test "legacy user-message frame retains its signed bounded relay contract" {
+    const spec = frameSpec(.MESSAGE);
+    try testing.expectEqual(FrameFamily.relay, spec.family);
+    try testing.expectEqual(FrameAuth.signed, spec.auth);
+    try testing.expectEqual(@as(u8, 0), spec.capability_mask);
+    try testing.expectEqual(max_user_message_payload_len, spec.max_payload_len.?);
 }
 
 test "event spine v2 frame is secured and capability gated" {
@@ -887,4 +1054,15 @@ test "guest frontier is a distinct secured-signed extension frame" {
     try testing.expectEqual(FrameType.GUEST_FRONTIER, frameSpecByTag(0x2F).?.frame_type);
     try testing.expectEqual(FrameType.GUEST_FRONTIER, frameSpecByToken("GUEST_FRONTIER").?.frame_type);
     try testing.expectEqual(FrameType.GUEST_FRONTIER, FrameType.fromTag(0x2F).?);
+}
+
+test "access event v1 frame is secured and capability gated" {
+    const spec = frameSpec(.ACCESS_EVENT_V1);
+    try testing.expectEqual(FrameFamily.oper, spec.family);
+    try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
+    try testing.expectEqual(cap_event_spine_v2, spec.capability_mask);
+    try testing.expectEqual(@as(?usize, 1024), spec.max_payload_len);
+    try testing.expectEqual(FrameType.ACCESS_EVENT_V1, frameSpecByTag(0x30).?.frame_type);
+    try testing.expectEqual(FrameType.ACCESS_EVENT_V1, frameSpecByToken("ACCESS_EVENT_V1").?.frame_type);
+    try testing.expectEqual(FrameType.ACCESS_EVENT_V1, FrameType.fromTag(0x30).?);
 }

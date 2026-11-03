@@ -45,6 +45,46 @@ const platform = @import("../substrate/platform.zig");
 const media_pacer = @import("../substrate/media_pacer.zig");
 const PriorityPacer = media_pacer.PriorityPacer;
 const sfu_srtp = @import("sfu_srtp.zig");
+const native_link = @import("native_media_link.zig");
+
+/// Shared forwarded-packet tap vocabulary (see `native_media_link.MediaTap`
+/// for the non-blocking, borrowed-slice callback contract).
+pub const MediaTap = native_link.MediaTap;
+pub const TapEvent = native_link.TapEvent;
+pub const TapTransport = native_link.TapTransport;
+pub const TapCodec = native_link.TapCodec;
+pub const TapKind = native_link.TapKind;
+
+/// Best-effort RTP codec identity from the payload type alone. Gateway
+/// codecs (Opus PT 111, VP8 PT 96) win via SDP; otherwise the bridge PT map
+/// resolves native cadence PTs. Native and gateway codecs share those
+/// dynamic PTs, so on a mixed call this is the gateway reading — exact only
+/// where the negotiated profile is gateway-only.
+fn tapCodecForPayloadType(pt: u7) TapCodec {
+    if (sdp.CodecTag.fromPayloadType(pt)) |gateway| return switch (gateway) {
+        .opus => .opus,
+        .vp8 => .vp8,
+        .cadencevox => .cadencevox,
+        .cadencevis => .cadencevis,
+        .raw => .raw,
+    };
+    var map = bridgePtMap();
+    if (map.codecForPt(pt)) |codec| return switch (codec) {
+        .cadencevox => .cadencevox,
+        .cadencevis => .cadencevis,
+        .raw => .raw,
+        _ => .unknown,
+    };
+    return .unknown;
+}
+
+fn tapKindForCodec(codec: TapCodec) TapKind {
+    return switch (codec) {
+        .cadencevox, .opus => .voice,
+        .cadencevis, .vp8 => .video,
+        .raw, .unknown => .unknown,
+    };
+}
 
 /// Playout budget for cached-retransmit recovery. No playout/jitter budget
 /// is configured at the retransmit serving sites, so the deadline is capped
@@ -355,6 +395,12 @@ pub const MediaPlane = struct {
     /// pump hands it here to also reach the channel's native members (rewrapped to
     /// cadence). Null = no native members / no bridging.
     cross: ?media_bridge.RtpCrossSink = null,
+    /// Optional forwarded-packet tap; null (the default) is byte-identical
+    /// to no tap and costs one null check per forwarded RTP packet. Guarded
+    /// by `mutex` (set via `setMediaTap`); invoked on the pump thread with
+    /// `mutex` NOT held. Process-local: never snapshotted, always null
+    /// after a Helix restore (see `MediaTap`).
+    media_tap: ?MediaTap = null,
     /// Opt-in DTLS-SRTP termination (RFC 5764). Set before `start`; when false
     /// the pump has no DTLS demux branch and is byte-identical to today.
     dtls_enabled: bool = false,
@@ -404,6 +450,39 @@ pub const MediaPlane = struct {
     rtcp_out_head: usize = 0,
     rtcp_out_len: usize = 0,
     rtcp_out_mutex: std.atomic.Mutex = .unlocked,
+
+    /// Install (or clear, with null) the forwarded-packet tap. Mutex-guarded
+    /// so it is safe from any thread, but the intended use is once, before
+    /// `start`. The callback then runs on the media pump thread and must
+    /// never block (see `MediaTap`).
+    pub fn setMediaTap(self: *MediaPlane, tap: ?MediaTap) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.media_tap = tap;
+    }
+
+    /// Emit one WebRTC RTP tap event for an already-accepted canonical
+    /// (post-SRTP-decrypt) packet that was forwarded to at least one
+    /// recipient. Callers fetch the tap first (one null check on the
+    /// no-tap path) so header decoding only happens when a tap exists.
+    /// `keyframe` is not derivable from the RTP header and stays null;
+    /// `payload` follows `rtp_profile`'s fixed 12-byte header convention.
+    fn emitTapRtp(tap: MediaTap, channel: []const u8, participant: []const u8, canonical: []const u8) void {
+        const decoded = rtp_profile.decodePacket(canonical) catch return;
+        const codec = tapCodecForPayloadType(decoded.packet.header.payload_type);
+        tap.on_packet(tap.ctx, .{
+            .transport = .webrtc_rtp,
+            .channel = channel,
+            .participant = participant,
+            .stream_id = decoded.packet.header.ssrc,
+            .codec = codec,
+            .kind = tapKindForCodec(codec),
+            .timestamp = decoded.packet.header.timestamp,
+            .sequence = decoded.packet.header.sequence,
+            .keyframe = null,
+            .payload = decoded.packet.payload,
+        });
+    }
 
     pub fn init(allocator: std.mem.Allocator) MediaPlane {
         return initFallible(allocator) catch @panic("media CSPRNG entropy unavailable");
@@ -2310,8 +2389,22 @@ pub const MediaPlane = struct {
         active.canonical_kind = kind;
         active.canonical_digest = routingPayloadDigest(canonical);
         active.authenticated = true; // issued only after actual source processing
+        const tap = self.media_tap;
         self.mutex.unlock();
-        return domain.publishWebrtcMedia(self, ordinal);
+        const result = try domain.publishWebrtcMedia(self, ordinal);
+        // Single post-authentication tap point for the routed WebRTC leg:
+        // SRTP prepare/validate/commit and profile validation already
+        // passed, and the domain fanout accepted the packet for at least
+        // one recipient (per-target enqueues inside publish are NOT tapped
+        // individually). Runs on this pump thread after publish returned,
+        // so no Domain or plane lock is held. The routed graph carries
+        // CallId/ClientId stamps, not channel/nick text, so those fields
+        // stay empty here; `stream_id` is the RTP SSRC. RTCP and cached
+        // NACK retransmits are not media frames and are never tapped.
+        if (kind == .rtp and result.accepted != 0) {
+            if (tap) |active_tap| emitTapRtp(active_tap, "", "", canonical);
+        }
+        return result;
     }
 
     pub fn inspectRoutingCanonicalLocked(self: *MediaPlane, domain: *routing.Domain, scope: *const routing.Locked, ordinal: u64) !AuthenticatedWebrtcFrame {
@@ -3334,6 +3427,8 @@ pub const MediaPlane = struct {
         var targets: [media_transport.max_forward]TransportAddress = undefined;
         var chanbuf: [256]u8 = undefined;
         var chanlen: usize = 0;
+        var partbuf: [64]u8 = undefined;
+        var partlen: usize = 0;
         lockSpin(&self.mutex);
         var cursor = self.transport.beginForwardFromSource(source, canonical, ssrc, seq);
         // Copy the source's channel out under the lock so the cross-leg sink can
@@ -3344,6 +3439,19 @@ pub const MediaPlane = struct {
                 chanlen = chan.len;
             }
         }
+        // Tap identity, copied only when a tap is installed (null-tap path
+        // pays one null check under this already-held lock).
+        const tap = self.media_tap;
+        if (tap != null) {
+            if (self.transport.compositeForSource(source)) |composite| {
+                if (std.mem.indexOfScalar(u8, composite, 0)) |sep| {
+                    const part = composite[sep + 1 ..];
+                    partlen = @min(part.len, partbuf.len);
+                    @memcpy(partbuf[0..partlen], part[0..partlen]);
+                }
+            }
+        }
+        var sent_any = false;
         var enc_buf: [media_socket.max_datagram + sfu_srtp.rtp_overhead]u8 = undefined;
         if (cursor) |*traversal| {
             while (true) {
@@ -3351,9 +3459,15 @@ pub const MediaPlane = struct {
                 if (n == 0) break;
                 for (targets[0..n]) |dst| {
                     switch (self.dtlsStateLocked(dst)) {
-                        .not_dtls => sock.sendTo(dst, canonical),
+                        .not_dtls => {
+                            sock.sendTo(dst, canonical);
+                            sent_any = true;
+                        },
                         .unavailable => {},
-                        .ready => if (self.srtp_hub.protectRtp(dst, canonical, &enc_buf)) |wire| sock.sendTo(dst, wire),
+                        .ready => if (self.srtp_hub.protectRtp(dst, canonical, &enc_buf)) |wire| {
+                            sock.sendTo(dst, wire);
+                            sent_any = true;
+                        },
                     }
                 }
             }
@@ -3361,8 +3475,22 @@ pub const MediaPlane = struct {
         self.mutex.unlock();
 
         // Bridge the same (plaintext) RTP frame to any native members.
+        var bridged = false;
         if (chanlen != 0) {
-            if (self.cross) |sink| sink.onRtpFrame(chanbuf[0..chanlen], canonical, false);
+            if (self.cross) |sink| {
+                sink.onRtpFrame(chanbuf[0..chanlen], canonical, false);
+                bridged = true;
+            }
+        }
+
+        // Single post-authentication tap point for the legacy WebRTC leg:
+        // SRTP auth/replay already passed above (or the source is a plain
+        // group-key peer), the source was admitted by
+        // `beginForwardFromSource`, and at least one recipient (WebRTC or
+        // bridged-native) actually got the packet. Fires once per inbound
+        // packet, on this pump thread, with `mutex` released.
+        if (tap) |active_tap| {
+            if (sent_any or bridged) emitTapRtp(active_tap, chanbuf[0..chanlen], partbuf[0..partlen], canonical);
         }
     }
 
@@ -3591,6 +3719,149 @@ const dtls13_messages = @import("../proto/dtls13_messages.zig");
 const dtls_kx = @import("../proto/dtls_keyexchange.zig");
 const srtp = @import("../proto/srtp.zig");
 const srtcp = @import("../proto/srtcp.zig");
+
+const TapProbeTest = struct {
+    calls: std.atomic.Value(usize) = .init(0),
+    transport: TapTransport = .native_cadence,
+    channel_buf: [32]u8 = undefined,
+    channel_len: usize = 0,
+    participant_buf: [32]u8 = undefined,
+    participant_len: usize = 0,
+    stream_id: u32 = 0,
+    codec: TapCodec = .unknown,
+    kind: TapKind = .unknown,
+    timestamp: ?u64 = null,
+    sequence: ?u32 = null,
+    keyframe: ?bool = true,
+    payload_buf: [32]u8 = undefined,
+    payload_len: usize = 0,
+
+    fn onPacket(ctx: *anyopaque, event: TapEvent) void {
+        const self: *TapProbeTest = @ptrCast(@alignCast(ctx));
+        self.transport = event.transport;
+        self.channel_len = @min(event.channel.len, self.channel_buf.len);
+        @memcpy(self.channel_buf[0..self.channel_len], event.channel[0..self.channel_len]);
+        self.participant_len = @min(event.participant.len, self.participant_buf.len);
+        @memcpy(self.participant_buf[0..self.participant_len], event.participant[0..self.participant_len]);
+        self.stream_id = event.stream_id;
+        self.codec = event.codec;
+        self.kind = event.kind;
+        self.timestamp = event.timestamp;
+        self.sequence = event.sequence;
+        self.keyframe = event.keyframe;
+        self.payload_len = @min(event.payload.len, self.payload_buf.len);
+        @memcpy(self.payload_buf[0..self.payload_len], event.payload[0..self.payload_len]);
+        _ = self.calls.fetchAdd(1, .release);
+    }
+
+    fn tap(self: *TapProbeTest) MediaTap {
+        return .{ .ctx = self, .on_packet = onPacket };
+    }
+
+    fn waitCalls(self: *TapProbeTest, expected: usize) !void {
+        const deadline = platform.monotonicMillis() + 2000;
+        while (self.calls.load(.acquire) < expected) {
+            if (platform.monotonicMillis() >= deadline) return error.TestUnexpectedResult;
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+test "media tap fires exactly once per forwarded WebRTC RTP packet and not for an unbound source" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    var probe: TapProbeTest = .{};
+    plane.setMediaTap(probe.tap());
+    try plane.start(loopback_be, 0);
+    const server_addr = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, plane.port);
+
+    var alice = try MediaSocket.bind(loopback_be, 0);
+    defer alice.deinit();
+    alice.setRecvTimeoutMs(2000);
+    var bob = try MediaSocket.bind(loopback_be, 0);
+    defer bob.deinit();
+    bob.setRecvTimeoutMs(2000);
+    var carol = try MediaSocket.bind(loopback_be, 0);
+    defer carol.deinit();
+    carol.setRecvTimeoutMs(2000);
+    try stunBindPeer(&alice, server_addr, plane.allocate("#tap", "alice") orelse return error.TestUnexpectedResult);
+    try stunBindPeer(&bob, server_addr, plane.allocate("#tap", "bob") orelse return error.TestUnexpectedResult);
+    try stunBindPeer(&carol, server_addr, plane.allocate("#tap", "carol") orelse return error.TestUnexpectedResult);
+
+    var pkt_buf: [64]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 96, .sequence = 7, .timestamp = 12345, .ssrc = 0xFA700001 }, .payload = "tap-payload" }, &pkt_buf);
+
+    // Rejected first: a source that never completed an ICE binding. The
+    // single pump thread processes it before alice's valid packet below, so
+    // observing exactly one tap call afterwards proves it never fired.
+    var stranger = try MediaSocket.bind(loopback_be, 0);
+    defer stranger.deinit();
+    stranger.sendTo(server_addr, packet);
+
+    alice.sendTo(server_addr, packet);
+    var recv_buf: [media_socket.max_datagram]u8 = undefined;
+    const got_bob = bob.recvFrom(&recv_buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, packet, got_bob.data);
+    const got_carol = carol.recvFrom(&recv_buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, packet, got_carol.data);
+
+    // Two recipients, exactly one tap call, with full identity/payload.
+    try probe.waitCalls(1);
+    try testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    try testing.expectEqual(TapTransport.webrtc_rtp, probe.transport);
+    try testing.expectEqualStrings("#tap", probe.channel_buf[0..probe.channel_len]);
+    try testing.expectEqualStrings("alice", probe.participant_buf[0..probe.participant_len]);
+    try testing.expectEqual(@as(u32, 0xFA700001), probe.stream_id);
+    try testing.expectEqual(TapCodec.vp8, probe.codec);
+    try testing.expectEqual(TapKind.video, probe.kind);
+    try testing.expectEqual(@as(?u64, 12345), probe.timestamp);
+    try testing.expectEqual(@as(?u32, 7), probe.sequence);
+    try testing.expectEqual(@as(?bool, null), probe.keyframe);
+    try testing.expectEqualSlices(u8, "tap-payload", probe.payload_buf[0..probe.payload_len]);
+}
+
+test "default null media tap forwards WebRTC RTP byte-identically" {
+    var plane = MediaPlane.init(testing.allocator);
+    defer plane.deinit();
+    try testing.expect(plane.media_tap == null);
+    try plane.start(loopback_be, 0);
+    const server_addr = try TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, plane.port);
+
+    var alice = try MediaSocket.bind(loopback_be, 0);
+    defer alice.deinit();
+    alice.setRecvTimeoutMs(2000);
+    var bob = try MediaSocket.bind(loopback_be, 0);
+    defer bob.deinit();
+    bob.setRecvTimeoutMs(2000);
+    try stunBindPeer(&alice, server_addr, plane.allocate("#notap", "alice") orelse return error.TestUnexpectedResult);
+    try stunBindPeer(&bob, server_addr, plane.allocate("#notap", "bob") orelse return error.TestUnexpectedResult);
+
+    var pkt_buf: [64]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 3, .timestamp = 960, .ssrc = 7001 }, .payload = "plain-forward" }, &pkt_buf);
+    alice.sendTo(server_addr, packet);
+    var recv_buf: [media_socket.max_datagram]u8 = undefined;
+    const got = bob.recvFrom(&recv_buf) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, packet, got.data);
+}
+
+test "media tap RTP event decodes header fields and payload (shared routed/legacy emitter)" {
+    var probe: TapProbeTest = .{};
+    var pkt_buf: [64]u8 = undefined;
+    const packet = try rtp_profile.encodePacket(.{ .header = .{ .payload_type = 111, .sequence = 42, .timestamp = 8000, .ssrc = 99 }, .payload = "opus-bytes" }, &pkt_buf);
+    MediaPlane.emitTapRtp(probe.tap(), "#c", "alice", packet);
+    try testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    try testing.expectEqualStrings("#c", probe.channel_buf[0..probe.channel_len]);
+    try testing.expectEqualStrings("alice", probe.participant_buf[0..probe.participant_len]);
+    try testing.expectEqual(@as(u32, 99), probe.stream_id);
+    try testing.expectEqual(TapCodec.opus, probe.codec);
+    try testing.expectEqual(TapKind.voice, probe.kind);
+    try testing.expectEqual(@as(?u64, 8000), probe.timestamp);
+    try testing.expectEqual(@as(?u32, 42), probe.sequence);
+    try testing.expectEqualSlices(u8, "opus-bytes", probe.payload_buf[0..probe.payload_len]);
+    // A truncated packet decodes to no event rather than a partial one.
+    MediaPlane.emitTapRtp(probe.tap(), "#c", "alice", packet[0..4]);
+    try testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+}
 
 test "MediaPlane: threaded pump answers a STUN check and binds the peer" {
     var plane = MediaPlane.init(testing.allocator);

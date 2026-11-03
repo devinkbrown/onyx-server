@@ -144,7 +144,11 @@ pub fn buildRepairRequest(allocator: Allocator, ranges: *const RepairRanges) !Re
         for (keys.items) |key| allocator.free(key);
         keys.deinit(allocator);
     }
-    for (ranges.ranges) |range| try keys.append(allocator, try allocator.dupe(u8, range.key));
+    for (ranges.ranges) |range| {
+        const key = try allocator.dupe(u8, range.key);
+        errdefer allocator.free(key);
+        try keys.append(allocator, key);
+    }
     return .{ .allocator = allocator, .keys = try keys.toOwnedSlice(allocator) };
 }
 
@@ -157,26 +161,47 @@ pub fn buildRepairResponse(allocator: Allocator, source: *const ChannelCrdt, req
         }
         records.deinit(allocator);
     }
-    for (request.keys) |key| if (try makeEntityRecord(allocator, source, key)) |record| try records.append(allocator, record);
+    for (request.keys) |key| {
+        if (try makeEntityRecord(allocator, source, key)) |record| {
+            errdefer {
+                allocator.free(record.key);
+                allocator.free(record.payload);
+            }
+            try records.append(allocator, record);
+        }
+    }
     return .{ .allocator = allocator, .hlc = source.hlc, .vv = source.vv, .records = try records.toOwnedSlice(allocator) };
 }
 
 pub fn applyRepairResponse(allocator: Allocator, target: *ChannelCrdt, response: *const RepairResponse) !void {
+    if (!validVersionVector(response.vv)) return error.InvalidRepairRecord;
+
     var incoming = ChannelCrdt.init(allocator, target.replica_id);
-    errdefer incoming.deinit();
+    defer incoming.deinit();
     incoming.hlc = response.hlc;
     try incoming.vv.merge(&response.vv);
-    for (response.records) |record| {
+    for (response.records, 0..) |record, record_idx| {
+        if (containsRepairKey(response.records[0..record_idx], record.key)) {
+            return error.InvalidRepairRecord;
+        }
         switch (record.kind) {
             .member => {
-                if (!std.mem.startsWith(u8, record.key, member_prefix)) return error.InvalidRepairRecord;
-                try readMemberPayload(allocator, &incoming, record.payload);
+                const member_id = memberIdFromKey(record.key) orelse return error.InvalidRepairRecord;
+                try readMemberPayload(allocator, &incoming, member_id, record.payload);
             },
             .mode => try readModePayload(&incoming, record.key, record.payload),
         }
     }
-    try target.merge(&incoming);
-    incoming.deinit();
+
+    // `ChannelCrdt.merge` validates capacity before publishing, but its later
+    // member/add appends can still fail allocation after mutating the receiver.
+    // Repair is a remote-input boundary, so merge into a complete clone and
+    // publish only after every validation and allocation has succeeded.
+    var staged = try target.clone();
+    errdefer staged.deinit();
+    try staged.merge(&incoming);
+    std.mem.swap(ChannelCrdt, target, &staged);
+    staged.deinit();
 }
 
 fn putBoolMode(summary: *Summary, key: []const u8, kind: ModeKind, reg: anytype) !void {
@@ -212,7 +237,7 @@ fn putDigest(summary: *Summary, key: []const u8, hash: Hash) !void {
 
 fn makeEntityRecord(allocator: Allocator, source: *const ChannelCrdt, key: []const u8) !?RepairRecord {
     if (std.mem.startsWith(u8, key, member_prefix)) {
-        const member_id = try std.fmt.parseInt(channel_crdt.MemberId, key[member_prefix.len..], 10);
+        const member_id = memberIdFromKey(key) orelse return error.InvalidRepairKey;
         for (source.members.items) |entry| {
             if (entry.member_id == member_id) {
                 var payload: [max_member_payload]u8 = undefined;
@@ -274,8 +299,13 @@ fn encodeMemberDense(out: []u8, hlc: Hlc, entry: anytype) ![]const u8 {
         .entity_id = &entity,
         .hlc = hlc,
     };
+    // `DeltaView.Add.value` stores borrowed slices. Keep their backing storage
+    // in this frame until `view.encode` has consumed it; putting the array in
+    // `fillAdds` leaves dangling stack slices after that helper returns (visible
+    // under ReleaseSafe even when Debug happens to preserve the old bytes).
+    var add_values: [codec_limits.max_adds][25]u8 = undefined;
     try fillContext(&view, entry.context);
-    try fillAdds(&view, entry.adds.items);
+    try fillAdds(&view, entry.adds.items, &add_values);
     try fillRemoves(&view);
     return view.encode(out);
 }
@@ -304,14 +334,16 @@ fn encodeMemberCompact(out: []u8, hlc: Hlc, entry: anytype) ![]const u8 {
     );
 }
 
-fn readMemberPayload(allocator: Allocator, target: *ChannelCrdt, bytes: []const u8) !void {
-    if (member_compact.matches(bytes)) return readMemberPayloadCompact(allocator, target, bytes);
+fn readMemberPayload(allocator: Allocator, target: *ChannelCrdt, expected_member_id: channel_crdt.MemberId, bytes: []const u8) !void {
+    if (member_compact.matches(bytes)) return readMemberPayloadCompact(allocator, target, expected_member_id, bytes);
     const view = try DeltaView.decode(bytes);
     if (view.family != .memberships or view.entity_id.len != 8) return error.InvalidRepairRecord;
+    if (readU64Le(view.entity_id) != expected_member_id) return error.InvalidRepairRecord;
     if (Hlc.compare(view.hlc, target.hlc) == .gt) target.hlc = view.hlc;
 
     var context = clock.VersionVector.init();
     for (view.context[0..view.context_len]) |dot| try observeDot(&context, dot);
+    if (!target.vv.dominates(&context)) return error.InvalidRepairRecord;
 
     var adds = std.ArrayList(@TypeOf(target.members.items[0].adds.items[0])).empty;
     errdefer adds.deinit(allocator);
@@ -329,14 +361,15 @@ fn readMemberPayload(allocator: Allocator, target: *ChannelCrdt, bytes: []const 
     }
 
     try target.members.append(allocator, .{
-        .member_id = readU64Le(view.entity_id),
+        .member_id = expected_member_id,
         .adds = adds,
         .context = context,
     });
 }
 
-fn readMemberPayloadCompact(allocator: Allocator, target: *ChannelCrdt, bytes: []const u8) !void {
+fn readMemberPayloadCompact(allocator: Allocator, target: *ChannelCrdt, expected_member_id: channel_crdt.MemberId, bytes: []const u8) !void {
     const view = try member_compact.decode(bytes);
+    if (view.member_id != expected_member_id) return error.InvalidRepairRecord;
     const hlc = hlcFromKey(view.hlc_key);
     if (Hlc.compare(hlc, target.hlc) == .gt) target.hlc = hlc;
 
@@ -347,6 +380,7 @@ fn readMemberPayloadCompact(allocator: Allocator, target: *ChannelCrdt, bytes: [
         single.len = 1;
         try context.merge(&single);
     }
+    if (!target.vv.dominates(&context)) return error.InvalidRepairRecord;
 
     var adds = std.ArrayList(@TypeOf(target.members.items[0].adds.items[0])).empty;
     errdefer adds.deinit(allocator);
@@ -365,7 +399,7 @@ fn readMemberPayloadCompact(allocator: Allocator, target: *ChannelCrdt, bytes: [
     }
 
     try target.members.append(allocator, .{
-        .member_id = view.member_id,
+        .member_id = expected_member_id,
         .adds = adds,
         .context = context,
     });
@@ -383,8 +417,7 @@ fn fillContext(view: *DeltaView, vv: clock.VersionVector) !void {
     sortDots(view.context[0..view.context_len]);
 }
 
-fn fillAdds(view: *DeltaView, adds: anytype) !void {
-    var values: [codec_limits.max_adds][25]u8 = undefined;
+fn fillAdds(view: *DeltaView, adds: anytype, values: *[codec_limits.max_adds][25]u8) !void {
     if (adds.len > codec_limits.max_adds) return error.Oversize;
 
     for (adds, 0..) |add, idx| {
@@ -395,7 +428,7 @@ fn fillAdds(view: *DeltaView, adds: anytype) !void {
     }
     view.adds_len = adds.len;
     view.add_dots_len = adds.len;
-    sortAdds(view, &values);
+    sortAdds(view, values);
 }
 
 fn fillRemoves(view: *DeltaView) !void {
@@ -422,6 +455,7 @@ fn encodeAddValue(out: []u8, dot: Dot, hlc: Hlc, status: channel_crdt.MemberStat
 
 fn decodeAddValue(bytes: []const u8) !AddValue {
     if (bytes.len != 25) return error.InvalidRepairRecord;
+    if ((bytes[24] & 0xf0) != 0) return error.InvalidRepairRecord;
     return .{
         .dot = .{ .replica = readU64Le(bytes[0..8]), .counter = readU64Le(bytes[8..16]) },
         .hlc = hlcFromKey(readU64Le(bytes[16..24])),
@@ -650,6 +684,32 @@ fn liveContains(view: *const DeltaView, dot: Dot) bool {
 fn dotEql(a: Dot, b: Dot) bool {
     return a.replica == b.replica and a.counter == b.counter;
 }
+fn memberIdFromKey(key: []const u8) ?channel_crdt.MemberId {
+    if (!std.mem.startsWith(u8, key, member_prefix)) return null;
+    const suffix = key[member_prefix.len..];
+    if (suffix.len == 0) return null;
+    const member_id = std.fmt.parseInt(channel_crdt.MemberId, suffix, 10) catch return null;
+    var canonical_buf: [32]u8 = undefined;
+    const canonical = std.fmt.bufPrint(&canonical_buf, member_prefix ++ "{d}", .{member_id}) catch return null;
+    if (!std.mem.eql(u8, key, canonical)) return null;
+    return member_id;
+}
+fn containsRepairKey(records: []const RepairRecord, key: []const u8) bool {
+    for (records) |record| {
+        if (std.mem.eql(u8, record.key, key)) return true;
+    }
+    return false;
+}
+fn validVersionVector(vv: clock.VersionVector) bool {
+    if (vv.len > vv.entries.len) return false;
+    for (vv.entries[0..vv.len], 0..) |entry, idx| {
+        if (entry.counter == 0) return false;
+        for (vv.entries[0..idx]) |prior| {
+            if (prior.replica == entry.replica) return false;
+        }
+    }
+    return true;
+}
 fn freeKeyList(allocator: Allocator, keys: [][]u8) void {
     for (keys) |key| allocator.free(key);
     allocator.free(keys);
@@ -683,6 +743,12 @@ fn exchangeBoth(allocator: Allocator, a: *ChannelCrdt, b: *ChannelCrdt) !struct 
     return .{ .to_a = resp_to_a.records.len, .to_b = resp_to_b.records.len, .a_entities = sa.entity_count, .b_entities = sb.entity_count };
 }
 fn repairOneWay(allocator: Allocator, dst: *ChannelCrdt, src: *const ChannelCrdt) !usize {
+    var resp = try buildOneWayResponse(allocator, dst, src);
+    defer resp.deinit();
+    try applyRepairResponse(allocator, dst, &resp);
+    return resp.records.len;
+}
+fn buildOneWayResponse(allocator: Allocator, dst: *const ChannelCrdt, src: *const ChannelCrdt) !RepairResponse {
     var sd = try summarize(allocator, dst);
     defer sd.deinit();
     var ss = try summarize(allocator, src);
@@ -691,10 +757,7 @@ fn repairOneWay(allocator: Allocator, dst: *ChannelCrdt, src: *const ChannelCrdt
     defer ranges.deinit();
     var req = try buildRepairRequest(allocator, &ranges);
     defer req.deinit();
-    var resp = try buildRepairResponse(allocator, src, &req);
-    defer resp.deinit();
-    try applyRepairResponse(allocator, dst, &resp);
-    return resp.records.len;
+    return buildRepairResponse(allocator, src, &req);
 }
 test "two divergent replicas repair to identical state exchanging only diffs" {
     const allocator = std.testing.allocator;
@@ -805,4 +868,161 @@ test "summarize and repair a member whose context exceeds the dense cap" {
     _ = try repairOneWay(allocator, &dst, &src);
     try std.testing.expect(ChannelCrdt.eql(&src, &dst));
     try std.testing.expect(dst.containsMember(77));
+}
+
+test "Undertow membership repair binds dense payload identity to its canonical key" {
+    const allocator = std.testing.allocator;
+    var src = ChannelCrdt.init(allocator, 1);
+    defer src.deinit();
+    discard(try src.localJoin(42, .{ .op = true }, 10));
+
+    var dst = ChannelCrdt.init(allocator, 2);
+    defer dst.deinit();
+    var before = try dst.clone();
+    defer before.deinit();
+    var response = try buildOneWayResponse(allocator, &dst, &src);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), response.records.len);
+    try std.testing.expectEqual(RecordKind.member, response.records[0].kind);
+    try std.testing.expect(!member_compact.matches(response.records[0].payload));
+
+    response.records[0].key[response.records[0].key.len - 1] = '3';
+    try std.testing.expectError(error.InvalidRepairRecord, applyRepairResponse(allocator, &dst, &response));
+    try std.testing.expect(ChannelCrdt.eql(&before, &dst));
+
+    // A clean retry of the same logical repair succeeds after the malformed
+    // key is corrected; the rejected frame consumed no causal state.
+    response.records[0].key[response.records[0].key.len - 1] = '2';
+    try applyRepairResponse(allocator, &dst, &response);
+    try std.testing.expect(ChannelCrdt.eql(&src, &dst));
+}
+
+test "Undertow membership repair binds compact payload identity to its canonical key" {
+    const allocator = std.testing.allocator;
+    var src = ChannelCrdt.init(allocator, 1);
+    defer src.deinit();
+    var i: u64 = 0;
+    while (i < codec_limits.max_context_dots + 1) : (i += 1) {
+        discard(try src.localJoin(77, .{ .voice = true }, 10 + i));
+        discard(try src.localPart(77));
+    }
+    discard(try src.localJoin(77, .{ .founder = true }, 1000));
+
+    var dst = ChannelCrdt.init(allocator, 2);
+    defer dst.deinit();
+    var before = try dst.clone();
+    defer before.deinit();
+    var response = try buildOneWayResponse(allocator, &dst, &src);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), response.records.len);
+    try std.testing.expect(member_compact.matches(response.records[0].payload));
+
+    response.records[0].key[response.records[0].key.len - 1] = '8';
+    try std.testing.expectError(error.InvalidRepairRecord, applyRepairResponse(allocator, &dst, &response));
+    try std.testing.expect(ChannelCrdt.eql(&before, &dst));
+}
+
+test "Undertow membership repair rejects duplicate records atomically" {
+    const allocator = std.testing.allocator;
+    var src = ChannelCrdt.init(allocator, 1);
+    defer src.deinit();
+    discard(try src.localJoin(9, .{ .owner = true }, 10));
+
+    var dst = ChannelCrdt.init(allocator, 2);
+    defer dst.deinit();
+    var before = try dst.clone();
+    defer before.deinit();
+    var response = try buildOneWayResponse(allocator, &dst, &src);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), response.records.len);
+
+    var duplicate_records = [_]RepairRecord{ response.records[0], response.records[0] };
+    const duplicate = RepairResponse{
+        .allocator = allocator,
+        .hlc = response.hlc,
+        .vv = response.vv,
+        .records = &duplicate_records,
+    };
+    try std.testing.expectError(error.InvalidRepairRecord, applyRepairResponse(allocator, &dst, &duplicate));
+    try std.testing.expect(ChannelCrdt.eql(&before, &dst));
+}
+
+test "Undertow membership repair rejects context beyond response vector atomically" {
+    const allocator = std.testing.allocator;
+    var src = ChannelCrdt.init(allocator, 1);
+    defer src.deinit();
+    discard(try src.localJoin(15, .{ .voice = true }, 10));
+
+    var dst = ChannelCrdt.init(allocator, 2);
+    defer dst.deinit();
+    var before = try dst.clone();
+    defer before.deinit();
+    var response = try buildOneWayResponse(allocator, &dst, &src);
+    defer response.deinit();
+    const valid_vv = response.vv;
+    response.vv = clock.VersionVector.init();
+
+    try std.testing.expectError(error.InvalidRepairRecord, applyRepairResponse(allocator, &dst, &response));
+    try std.testing.expect(ChannelCrdt.eql(&before, &dst));
+
+    response.vv = valid_vv;
+    try applyRepairResponse(allocator, &dst, &response);
+    try std.testing.expect(ChannelCrdt.eql(&src, &dst));
+}
+
+test "Undertow membership repair rejects a malformed response version vector atomically" {
+    const allocator = std.testing.allocator;
+    var src = ChannelCrdt.init(allocator, 1);
+    defer src.deinit();
+    discard(try src.localJoin(31, .{ .voice = true }, 10));
+
+    var dst = ChannelCrdt.init(allocator, 2);
+    defer dst.deinit();
+    var before = try dst.clone();
+    defer before.deinit();
+    var response = try buildOneWayResponse(allocator, &dst, &src);
+    defer response.deinit();
+    const valid_vv = response.vv;
+    try std.testing.expect(valid_vv.len >= 1);
+
+    // Duplicate replica entry.
+    response.vv.entries[1] = valid_vv.entries[0];
+    response.vv.len = 2;
+    try std.testing.expectError(error.InvalidRepairRecord, applyRepairResponse(allocator, &dst, &response));
+    try std.testing.expect(ChannelCrdt.eql(&before, &dst));
+
+    // Zero counter entry.
+    response.vv = valid_vv;
+    response.vv.entries[0].counter = 0;
+    try std.testing.expectError(error.InvalidRepairRecord, applyRepairResponse(allocator, &dst, &response));
+    try std.testing.expect(ChannelCrdt.eql(&before, &dst));
+
+    response.vv = valid_vv;
+    try applyRepairResponse(allocator, &dst, &response);
+    try std.testing.expect(ChannelCrdt.eql(&src, &dst));
+}
+
+test "Undertow membership repair is atomic across every allocation failure" {
+    const Sweep = struct {
+        fn run(allocator: Allocator) !void {
+            var src = ChannelCrdt.init(allocator, 1);
+            defer src.deinit();
+            discard(try src.localJoin(21, .{ .voice = true }, 10));
+            discard(try src.localJoin(22, .{ .op = true }, 11));
+
+            var dst = ChannelCrdt.init(allocator, 2);
+            defer dst.deinit();
+            var response = try buildOneWayResponse(allocator, &dst, &src);
+            defer response.deinit();
+            var before = try dst.clone();
+            defer before.deinit();
+
+            applyRepairResponse(allocator, &dst, &response) catch |err| {
+                try std.testing.expect(ChannelCrdt.eql(&before, &dst));
+                return err;
+            };
+            try std.testing.expect(ChannelCrdt.eql(&src, &dst));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
 }

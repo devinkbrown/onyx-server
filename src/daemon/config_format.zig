@@ -447,6 +447,8 @@ pub const Config = struct {
         monitorlimit: u32 = 128,
         /// Max SILENCE masks per client (advertised as SILENCE).
         silencelimit: u32 = 32,
+        /// Max WHOWAS history entries returned per query.
+        whowas_max_entries: u32 = 20,
         max_clones_per_ip: u32 = 0,
         max_clones_per_net: u32 = 0,
         /// Nick-delay window (ms): how long a released nick is held against reuse
@@ -577,6 +579,14 @@ pub const Config = struct {
         /// otherwise it falls through to the hardened 1.2 path. Kept separate
         /// pending real-browser interop validation of the 1.3 handshake.
         dtls13: bool = false,
+        /// Strict call recording (packet journal). Off by default; when on,
+        /// `recording_dir` is mandatory and recording still requires
+        /// unanimous participant consent at runtime.
+        recording_enabled: bool = false,
+        recording_dir: ?[]const u8 = null,
+        recording_retention_days: u32 = 7,
+        recording_max_total_bytes: u64 = 512 * 1024 * 1024,
+        recording_max_duration_secs: u64 = 4 * 3600,
         /// STUN server (IPv4 literal) queried at boot for the reflexive media
         /// candidate; with stun_port set, overrides listen.media_host on success.
         stun_host: ?[]const u8 = null,
@@ -997,7 +1007,7 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.node.public_key) |value| allocator.free(value);
-        if (self.node.secret_key) |value| allocator.free(value);
+        if (self.node.secret_key) |value| freeSecret(allocator, value);
         allocator.free(self.network.name);
         if (self.network.server_name) |v| allocator.free(v);
         if (self.network.description) |v| allocator.free(v);
@@ -1054,21 +1064,22 @@ pub const Config = struct {
         if (self.mail.relay_host) |value| allocator.free(value);
         if (self.mail.from) |value| allocator.free(value);
         if (self.mail.user) |value| allocator.free(value);
-        if (self.mail.pass) |value| allocator.free(value);
+        if (self.mail.pass) |value| freeSecret(allocator, value);
         if (self.mail.trust_store_path) |value| allocator.free(value);
         if (self.webauthn.rp_id) |value| allocator.free(value);
         freeStringList(allocator, self.webauthn.origins);
         if (self.mesh.presence_store_path) |value| allocator.free(value);
-        if (self.mesh.mesh_pass) |value| allocator.free(value);
-        if (self.mesh.admission_token) |value| allocator.free(value);
+        if (self.mesh.mesh_pass) |value| freeSecret(allocator, value);
+        if (self.mesh.admission_token) |value| freeSecret(allocator, value);
         if (self.sasl.realm) |value| allocator.free(value);
         if (self.sasl.account_db) |value| allocator.free(value);
         if (self.sasl.oauth_issuer) |value| allocator.free(value);
         if (self.sasl.oauth_audience) |value| allocator.free(value);
         if (self.sasl.oauth_account_claim) |value| allocator.free(value);
-        if (self.sasl.oauth_hmac_key) |value| allocator.free(value);
+        if (self.sasl.oauth_hmac_key) |value| freeSecret(allocator, value);
         if (self.sasl.oauth_jwks_file) |value| allocator.free(value);
         if (self.sasl.oauth_pubkey) |value| allocator.free(value);
+        if (self.media.recording_dir) |value| allocator.free(value);
         if (self.media.stun_host) |value| allocator.free(value);
         allocator.free(self.stats.dir);
         allocator.free(self.stats.channel_dir);
@@ -1080,8 +1091,8 @@ pub const Config = struct {
         if (self.webhook.public_url_base) |value| allocator.free(value);
         allocator.free(self.geoip.database);
         allocator.free(self.geoip.asn_database);
-        if (self.cloak.secret) |value| allocator.free(value);
-        if (self.cloak.previous_secret) |value| allocator.free(value);
+        if (self.cloak.secret) |value| freeSecret(allocator, value);
+        if (self.cloak.previous_secret) |value| freeSecret(allocator, value);
         if (self.cloak.suffix) |value| allocator.free(value);
         if (self.cloak.mode) |value| allocator.free(value);
         if (self.guest_presence.issuer_path) |value| allocator.free(value);
@@ -1434,6 +1445,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.limits.modes_per_line = @intCast(try uintField(doc, "limits.modes_per_line", cfg.limits.modes_per_line, 1, 20));
     cfg.limits.monitorlimit = @intCast(try uintField(doc, "limits.monitorlimit", cfg.limits.monitorlimit, 1, 100000));
     cfg.limits.silencelimit = @intCast(try uintField(doc, "limits.silencelimit", cfg.limits.silencelimit, 1, 256));
+    cfg.limits.whowas_max_entries = @intCast(try uintField(doc, "limits.whowas_max_entries", cfg.limits.whowas_max_entries, 1, 100));
     cfg.limits.reputation_refuse_threshold = @intCast(try uintField(doc, "limits.reputation_refuse_threshold", cfg.limits.reputation_refuse_threshold, 0, 1_000_000));
     if (doc.getString("limits.nick_delay")) |s| cfg.limits.nick_delay_ms = try durationMs(s);
     cfg.limits.throttle_connects = @intCast(try uintField(doc, "limits.throttle_connects", cfg.limits.throttle_connects, 0, 1_000_000));
@@ -1530,6 +1542,12 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("media.ws_media_require_mac")) |b| cfg.media.ws_media_require_mac = b;
     if (doc.getBool("media.dtls_srtp")) |b| cfg.media.dtls_srtp = b;
     if (doc.getBool("media.dtls13")) |b| cfg.media.dtls13 = b;
+    if (doc.getBool("media.recording_enabled")) |b| cfg.media.recording_enabled = b;
+    try setOpt(allocator, resolver, doc.getString("media.recording_dir"), &cfg.media.recording_dir);
+    cfg.media.recording_retention_days = @intCast(try uintField(doc, "media.recording_retention_days", cfg.media.recording_retention_days, 0, 3650));
+    cfg.media.recording_max_total_bytes = try uintField(doc, "media.recording_max_total_bytes", cfg.media.recording_max_total_bytes, 65536, 64 * 1024 * 1024 * 1024);
+    cfg.media.recording_max_duration_secs = try uintField(doc, "media.recording_max_duration_secs", cfg.media.recording_max_duration_secs, 1, 7 * 24 * 3600);
+    if (cfg.media.recording_enabled and (cfg.media.recording_dir == null or cfg.media.recording_dir.?.len == 0)) return error.ParseError;
     try setOpt(allocator, resolver, doc.getString("media.stun_host"), &cfg.media.stun_host);
 
     try setStr(allocator, resolver, doc.getString("stats.dir"), &cfg.stats.dir);
@@ -2245,6 +2263,12 @@ const retired_fence_config_fixture =
     "[[mesh.retired_session_group_fences]]\ngroup_key=\"" ++ "2222222222222222222222222222222222222222222222222222222222222222" ++ "\"\nissuer_key=\"" ++ "3333333333333333333333333333333333333333333333333333333333333333" ++ "\"\nfact_digest=\"" ++ "4444444444444444444444444444444444444444444444444444444444444444" ++ "\"\n" ++
     "[[mesh.retired_session_group_fences]]\ngroup_key=\"" ++ "1111111111111111111111111111111111111111111111111111111111111111" ++ "\"\nissuer_key=\"" ++ "3333333333333333333333333333333333333333333333333333333333333333" ++ "\"\nfact_digest=\"" ++ "5555555555555555555555555555555555555555555555555555555555555555" ++ "\"\n";
 
+test "wipeSecretBytes zeroes credential bytes" {
+    var buf = "cloak-secret-value!!".*;
+    wipeSecretBytes(&buf);
+    for (buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
 test "retired session fence config owns canonical grants and rejects ambiguous authority" {
     const allocator = std.testing.allocator;
     var parsed = try parseToml(allocator, retired_fence_config_fixture, .{});
@@ -2405,6 +2429,17 @@ fn durationMs(text: []const u8) TomlError!u64 {
 fn freeStringList(allocator: std.mem.Allocator, list: []const []const u8) void {
     for (list) |item| allocator.free(item);
     allocator.free(list);
+}
+
+/// Credential-bearing config strings are secure-zeroed before free.
+/// Split out so the wipe is testable on caller memory before the free.
+fn wipeSecretBytes(value: []const u8) void {
+    std.crypto.secureZero(u8, @constCast(value));
+}
+
+fn freeSecret(allocator: std.mem.Allocator, value: []const u8) void {
+    wipeSecretBytes(value);
+    allocator.free(value);
 }
 
 /// Ports of listeners Helix can carry only when that listener already existed

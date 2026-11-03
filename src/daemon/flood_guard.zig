@@ -639,6 +639,144 @@ fn saturatingAdd(a: u64, b: u64) u64 {
     return a + b;
 }
 
+/// Coarse command class for penalty charging. Mirrors `FloodGuard` weighting:
+/// `PING`/`PONG` are keepalives, messaging verbs and `JOIN` carry their own
+/// class, everything else is `other`.
+pub const CommandClass = enum { keepalive, message, join, other };
+
+pub fn commandClass(command: []const u8) CommandClass {
+    if (eqIgnoreCase(command, "PING") or eqIgnoreCase(command, "PONG")) return .keepalive;
+    if (eqIgnoreCase(command, "PRIVMSG") or eqIgnoreCase(command, "NOTICE") or
+        eqIgnoreCase(command, "TAGMSG")) return .message;
+    if (eqIgnoreCase(command, "JOIN")) return .join;
+    return .other;
+}
+
+/// Fake-lag penalty policy (mesh-modern `penalty` model): each admitted
+/// command advances a per-connection penalty clock, and a caller delays
+/// processing while that clock runs more than `max_ahead_ms` in front of now.
+/// Disabled by default; this leaf only computes delays — queueing, timer
+/// arming, and any disconnect escalation stay with the server.
+pub const PenaltyConfig = struct {
+    enabled: bool = false,
+    /// Keepalive-exempt policy: when true, `PING`/`PONG` are never charged
+    /// and never delayed, so liveness traffic cannot be fake-lagged. When
+    /// false, keepalives charge `default_penalty_ms` like other commands.
+    keepalive_exempt: bool = true,
+    message_penalty_ms: u64 = 2000,
+    join_penalty_ms: u64 = 2000,
+    default_penalty_ms: u64 = 1000,
+    /// Credit window: the penalty clock may run this far ahead of `now_ms`
+    /// before any delay is returned (normal chat pace stays delay-free).
+    max_ahead_ms: u64 = 10_000,
+    /// Hard clamp on one returned delay; the surplus penalty is dropped by
+    /// pulling the clock back, so a burst cannot bank unbounded lag.
+    max_delay_ms: u64 = 10_000,
+
+    pub fn validate(self: PenaltyConfig) GuardConfig.Error!void {
+        if (!self.enabled) return;
+        if (self.default_penalty_ms == 0) return GuardConfig.Error.InvalidFloodConfig;
+        if (self.max_delay_ms == 0) return GuardConfig.Error.InvalidFloodConfig;
+    }
+
+    pub fn penaltyFor(self: PenaltyConfig, class: CommandClass) u64 {
+        return switch (class) {
+            .keepalive => if (self.keepalive_exempt) 0 else self.default_penalty_ms,
+            .message => self.message_penalty_ms,
+            .join => self.join_penalty_ms,
+            .other => self.default_penalty_ms,
+        };
+    }
+};
+
+pub const PenaltyVerdict = struct {
+    /// `.allow` = process now; `.throttle` = process after `delay_ms`
+    /// (fake lag, not a drop). This leaf never returns `.disconnect`.
+    decision: Decision,
+    delay_ms: u64,
+    class: CommandClass,
+    /// True when the keepalive exemption applied (no charge, no delay).
+    exempt: bool,
+    /// Penalty clock after this observation, in caller monotonic ms.
+    penalty_until_ms: i64,
+};
+
+/// Deterministic, allocation-free fake-lag clock. Callers own one per
+/// connection alongside `FloodGuard` and pass the same monotonic `now_ms`.
+pub const PenaltyBox = struct {
+    config: PenaltyConfig,
+    penalty_until_ms: i64,
+
+    pub fn init(config: PenaltyConfig, now_ms: i64) PenaltyBox {
+        return .{ .config = config, .penalty_until_ms = now_ms };
+    }
+
+    pub fn reconfigure(self: *PenaltyBox, config: PenaltyConfig) void {
+        self.config = config;
+    }
+
+    /// Outstanding delay at `now_ms` without charging anything.
+    pub fn delayFor(self: *const PenaltyBox, now_ms: i64) u64 {
+        if (!self.config.enabled) return 0;
+        return delayBeyondCredit(self.config, self.penalty_until_ms, now_ms);
+    }
+
+    pub fn observeRaw(self: *PenaltyBox, now_ms: i64, raw_line: []const u8) PenaltyVerdict {
+        return self.observeParsed(now_ms, parseRaw(raw_line));
+    }
+
+    pub fn observeParsed(self: *PenaltyBox, now_ms: i64, line: ParsedLine) PenaltyVerdict {
+        return self.observeCommand(now_ms, line.command);
+    }
+
+    /// Charge one command and return how long the caller should fake-lag it.
+    /// An idle client (penalty clock behind `now_ms`) restarts from `now_ms`,
+    /// so long-idle connections never inherit stale lag.
+    pub fn observeCommand(self: *PenaltyBox, now_ms: i64, command: []const u8) PenaltyVerdict {
+        const class = commandClass(command);
+        const exempt = class == .keepalive and self.config.keepalive_exempt;
+        if (!self.config.enabled or exempt) {
+            return .{
+                .decision = .allow,
+                .delay_ms = 0,
+                .class = class,
+                .exempt = exempt,
+                .penalty_until_ms = self.penalty_until_ms,
+            };
+        }
+        const base = @max(self.penalty_until_ms, now_ms);
+        const cost = self.config.penaltyFor(class);
+        self.penalty_until_ms = saturatingAddMs(base, cost);
+        var delay = delayBeyondCredit(self.config, self.penalty_until_ms, now_ms);
+        if (delay > self.config.max_delay_ms) {
+            // Drop surplus penalty beyond the clamp instead of banking it.
+            delay = self.config.max_delay_ms;
+            self.penalty_until_ms = saturatingAddMs(saturatingAddMs(now_ms, self.config.max_ahead_ms), delay);
+        }
+        return .{
+            .decision = if (delay == 0) Decision.allow else .throttle,
+            .delay_ms = delay,
+            .class = class,
+            .exempt = false,
+            .penalty_until_ms = self.penalty_until_ms,
+        };
+    }
+
+    fn delayBeyondCredit(config: PenaltyConfig, penalty_until_ms: i64, now_ms: i64) u64 {
+        const ahead = @as(i128, penalty_until_ms) - @as(i128, now_ms) - @as(i128, config.max_ahead_ms);
+        if (ahead <= 0) return 0;
+        if (ahead > std.math.maxInt(u64)) return std.math.maxInt(u64);
+        return @intCast(ahead);
+    }
+
+    fn saturatingAddMs(base_ms: i64, delta_ms: u64) i64 {
+        const sum = @as(i128, base_ms) + @as(i128, delta_ms);
+        if (sum > std.math.maxInt(i64)) return std.math.maxInt(i64);
+        if (sum < std.math.minInt(i64)) return std.math.minInt(i64);
+        return @intCast(sum);
+    }
+};
+
 const testing = std.testing;
 
 fn testConfig() GuardConfig {
@@ -1022,4 +1160,78 @@ test "exploit: PRIVMSG flood is bounded work per classify (no unbounded growth)"
     // Same-target spam after the spray still classifies (target already known
     // or ring-evicted) without sticky failure beyond throttle.
     try testing.expectEqual(Decision.allow, guard.classifyRaw(0, "PRIVMSG #t0 :again\r\n"));
+}
+
+fn testPenaltyConfig() PenaltyConfig {
+    return .{
+        .enabled = true,
+        .message_penalty_ms = 2000,
+        .join_penalty_ms = 2000,
+        .default_penalty_ms = 1000,
+        .max_ahead_ms = 3000,
+        .max_delay_ms = 5000,
+    };
+}
+
+test "penalty box is inert when disabled and validates policy" {
+    var box = PenaltyBox.init(.{}, 0);
+    const verdict = box.observeRaw(0, "PRIVMSG #c :hi\r\n");
+    try testing.expectEqual(Decision.allow, verdict.decision);
+    try testing.expectEqual(@as(u64, 0), verdict.delay_ms);
+    try testing.expectEqual(@as(u64, 0), box.delayFor(0));
+
+    try testPenaltyConfig().validate();
+    var bad = testPenaltyConfig();
+    bad.default_penalty_ms = 0;
+    try testing.expectError(error.InvalidFloodConfig, bad.validate());
+}
+
+test "penalty box charges credit first, then deterministic fake lag" {
+    var box = PenaltyBox.init(testPenaltyConfig(), 0);
+    // Credit window 3000ms: 1st PRIVMSG (+2000) free, 2nd (+2000) lags 1000.
+    const first = box.observeCommand(0, "PRIVMSG");
+    try testing.expectEqual(Decision.allow, first.decision);
+    try testing.expectEqual(@as(i64, 2000), first.penalty_until_ms);
+    const second = box.observeCommand(0, "privmsg");
+    try testing.expectEqual(Decision.throttle, second.decision);
+    try testing.expectEqual(@as(u64, 1000), second.delay_ms);
+    try testing.expectEqual(CommandClass.message, second.class);
+    // Same inputs on a fresh box produce identical verdicts.
+    var replay = PenaltyBox.init(testPenaltyConfig(), 0);
+    _ = replay.observeCommand(0, "PRIVMSG");
+    const again = replay.observeCommand(0, "PRIVMSG");
+    try testing.expectEqual(second.delay_ms, again.delay_ms);
+    try testing.expectEqual(second.penalty_until_ms, again.penalty_until_ms);
+    // After the lag elapses, no outstanding delay remains.
+    try testing.expectEqual(@as(u64, 0), box.delayFor(1000));
+}
+
+test "penalty box keepalive exemption is policy, not hard-coded" {
+    var box = PenaltyBox.init(testPenaltyConfig(), 0);
+    _ = box.observeCommand(0, "PRIVMSG");
+    _ = box.observeCommand(0, "PRIVMSG");
+    const ping = box.observeCommand(0, "PING");
+    try testing.expect(ping.exempt);
+    try testing.expectEqual(@as(u64, 0), ping.delay_ms);
+    try testing.expectEqual(@as(i64, 4000), ping.penalty_until_ms); // unchanged
+
+    var strict_cfg = testPenaltyConfig();
+    strict_cfg.keepalive_exempt = false;
+    var strict = PenaltyBox.init(strict_cfg, 0);
+    const charged = strict.observeCommand(0, "PONG");
+    try testing.expect(!charged.exempt);
+    try testing.expectEqual(@as(i64, 1000), charged.penalty_until_ms);
+}
+
+test "penalty box clamps delay, drops surplus, and idles reset" {
+    var box = PenaltyBox.init(testPenaltyConfig(), 0);
+    var verdict = box.observeCommand(0, "WHOIS");
+    var i: usize = 0;
+    while (i < 20) : (i += 1) verdict = box.observeCommand(0, "WHOIS");
+    try testing.expectEqual(@as(u64, 5000), verdict.delay_ms); // max_delay clamp
+    try testing.expectEqual(@as(i64, 8000), verdict.penalty_until_ms); // now+ahead+delay
+    // Long idle: clock restarts from now, one default charge, no lag.
+    const fresh = box.observeCommand(1_000_000, "WHOIS");
+    try testing.expectEqual(Decision.allow, fresh.decision);
+    try testing.expectEqual(@as(i64, 1_001_000), fresh.penalty_until_ms);
 }

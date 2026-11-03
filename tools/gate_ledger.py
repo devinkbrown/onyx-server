@@ -61,6 +61,40 @@ COUNT_LOG_LIMIT = 16 * 1024 * 1024
 AGGREGATE = re.compile(rb"^Build Summary: [0-9]{1,20}/[0-9]{1,20} steps succeeded(?: \([0-9]{1,20} failed\))?; ([0-9]{1,20})/([0-9]{1,20}) tests passed(?: \(([^()]*)\))?$", re.M)
 VERBOSE = re.compile(rb"^verbose test summary: ([0-9]{1,20}) passed; ([0-9]{1,20}) skipped; ([0-9]{1,20}) failed; ([0-9]{1,20}) leaked; ([0-9]{1,20}) log errors; elapsed [^\r\n]+$", re.M)
 
+PARALLEL_FIELDS = rb"discovered=([0-9]{1,20}) executed=([0-9]{1,20}) passed=([0-9]{1,20}) skipped=([0-9]{1,20}) failed=([0-9]{1,20}) leaked=([0-9]{1,20}) log_errors=([0-9]{1,20}) complete=([01])"
+PARALLEL_SUITE = re.compile(rb"parallel suite summary: artifacts=([0-9]{1,20}) " + PARALLEL_FIELDS)
+PARALLEL_ARTIFACT = re.compile(rb"parallel artifact summary: index=([0-9]{1,20}) " + PARALLEL_FIELDS)
+
+
+def parallel_counts(raw: bytes) -> dict | None:
+    candidates = [line for line in raw.splitlines() if line.startswith((b"parallel suite summary:", b"parallel artifact summary:"))]
+    suites = [line for line in candidates if line.startswith(b"parallel suite summary:")]
+    artifacts = [line for line in raw.splitlines() if line.startswith(b"parallel artifact summary:")]
+    if len(suites) != 1 or candidates[-1] != suites[0]:
+        return None
+    suite = PARALLEL_SUITE.fullmatch(suites[0])
+    if not suite:
+        return None
+    number, *totals = map(int, suite.groups())
+    if number == 0 or len(artifacts) != number:
+        return None
+    values = []
+    for index, line in enumerate(artifacts):
+        match = PARALLEL_ARTIFACT.fullmatch(line)
+        if not match:
+            return None
+        ordinal, *counts = map(int, match.groups())
+        discovered, executed, passed, skipped, failed, leaked, errors, complete = counts
+        if ordinal != index or complete != 1 or discovered != executed or executed != passed + skipped + failed:
+            return None
+        values.append(counts)
+    if totals[-1] != 1 or [sum(counts[i] for counts in values) for i in range(7)] != totals[:-1]:
+        return None
+    discovered, executed, passed, skipped, failed, leaked, errors, _ = totals
+    return dict(scope="parallel_full_suite", provenance="parallel_suite_summary", passed=passed,
+                total=discovered, skipped=skipped, failed=failed, crashed=0, leaked=leaked, log_errors=errors)
+
+
 def test_counts(path: Path) -> dict | None:
     with path.open("rb") as stream:
         raw = stream.read(COUNT_LOG_LIMIT + 1)
@@ -69,6 +103,10 @@ def test_counts(path: Path) -> dict | None:
     # A malformed or repeated candidate is ambiguous, even if another parses.
     aggregates = [line for line in raw.splitlines() if line.startswith(b"Build Summary:") and b"tests passed" in line]
     verbose = [line for line in raw.splitlines() if line.startswith(b"verbose test summary:")]
+    if any(line.startswith((b"parallel suite summary:", b"parallel artifact summary:")) for line in raw.splitlines()):
+        if aggregates or verbose:
+            return None
+        return parallel_counts(raw)
     if aggregates:
         if len(aggregates) != 1:
             return None

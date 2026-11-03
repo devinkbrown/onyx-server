@@ -206,6 +206,7 @@ const e2ee_group_delivery = @import("../proto/e2ee_group_delivery.zig");
 const topic_tag = @import("../proto/topic_tag.zig");
 const ircx_prop_providers = @import("../proto/ircx_prop_providers.zig");
 const ircx_access_store = @import("../proto/ircx_access_store.zig");
+const ircx_access_event = @import("../proto/ircx_access_event.zig");
 const chanmode_ext = @import("../proto/chanmode_ext.zig");
 const ircx_modex = @import("../proto/ircx_modex.zig");
 const auditorium = @import("../proto/auditorium.zig");
@@ -277,9 +278,11 @@ const channel_list_event = @import("../proto/channel_list_event.zig");
 const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig");
 const usermode = @import("../proto/usermode.zig");
 const content_filter_mod = @import("content_filter.zig");
+const media_record = @import("media_record.zig");
 const media_room = @import("media_room.zig");
 const media_routing = @import("../substrate/media_routing.zig");
 const media_plane_mod = @import("media_plane.zig");
+const native_media_link = @import("native_media_link.zig");
 const dtls_fingerprint_mod = @import("../proto/dtls_fingerprint.zig");
 const dtls_peer_verify_mod = @import("../proto/dtls_peer_verify.zig");
 const native_media_mod = @import("native_media_transport.zig");
@@ -598,6 +601,7 @@ const MeshBurstStage = enum(u4) {
     topics,
     opers,
     wards,
+    access_entries,
     clones,
     keytrans,
 };
@@ -631,6 +635,9 @@ const PreparedMonitorTransition = struct {
 /// Bounded WHOWAS history ring shared by the live server. Field caps match the
 /// daemon's identity limits (NICKLEN=64) so live identities are never rejected.
 const WhowasStore = whowas.Whowas(.{ .capacity = 256, .max_nick_len = 64, .max_user_len = 64 });
+/// Hard ceiling on WHOWAS results per query; `[limits] whowas_max_entries`
+/// (1..100, default 20) narrows it per deployment.
+const max_whowas_results = 100;
 const list = @import("../proto/list.zig");
 const listx = @import("../proto/listx.zig");
 const who = @import("../proto/who.zig");
@@ -1540,6 +1547,13 @@ const ws_listener_companion_token: RingFdToken = .{ .slot = 9, .gen = 0 };
 /// inert until `installUpgradeSignalHandler` is called at boot, so tests (which
 /// never install it) never trip the poll.
 var upgrade_signal_requested = std.atomic.Value(bool).init(false);
+// TERM/INT request the existing cooperative stop and cleanup path. A handler
+// must never dereference a Server, acquire a lock, or perform teardown itself.
+var termination_signal_requested = std.atomic.Value(bool).init(false);
+
+fn onTerminationSignal(_: posix.SIG) callconv(.c) void {
+    termination_signal_requested.store(true, .seq_cst);
+}
 
 /// SIGUSR2 handler — async-signal-safe: records the request and returns. The
 /// re-exec runs later on reactor 0's loop (`onTimerTick`), so a shell-driven
@@ -1550,10 +1564,10 @@ fn onUpgradeSignal(_: posix.SIG) callconv(.c) void {
     upgrade_signal_requested.store(true, .seq_cst);
 }
 
-/// Install the SIGUSR2 → UPGRADE handler. Linux-only (UPGRADE itself is); a
-/// no-op elsewhere. Call once at boot. SA_RESTART keeps the signal from
-/// EINTR-storming the reactors' blocking syscalls — the upgrade is observed on
-/// the next ≤2s housekeeping tick, which is ample for a deploy.
+/// Install operational handlers at boot: USR2 requests Helix; TERM/INT request
+/// cooperative stop on the next reactor-0 housekeeping tick (≤2s). SA_RESTART
+/// keeps teardown outside signal context. Normal runtime joins and deinit then
+/// finalize owned resources; this does not promise a full client SendQ drain.
 pub fn installUpgradeSignalHandler() void {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return;
     const act = posix.Sigaction{
@@ -1562,6 +1576,13 @@ pub fn installUpgradeSignalHandler() void {
         .flags = posix.SA.RESTART,
     };
     posix.sigaction(posix.SIG.USR2, &act, null);
+    const stop_act = posix.Sigaction{
+        .handler = .{ .handler = onTerminationSignal },
+        .mask = posix.sigemptyset(),
+        .flags = posix.SA.RESTART,
+    };
+    posix.sigaction(posix.SIG.TERM, &stop_act, null);
+    posix.sigaction(posix.SIG.INT, &stop_act, null);
 }
 
 /// Set SIGPIPE's disposition to ignore (process-global, idempotent). A
@@ -1893,6 +1914,7 @@ const Numeric = enum(u16) {
     ERR_CANNOTSENDTOCHAN = 404,
     ERR_NORECIPIENT = 411,
     ERR_NOTEXTTOSEND = 412,
+    ERR_INPUTTOOLONG = 417,
     ERR_CHANNELISFULL = 471,
     ERR_INVITEONLYCHAN = 473,
     ERR_BANNEDFROMCHAN = 474,
@@ -2265,6 +2287,9 @@ pub const Config = struct {
     /// Max SILENCE masks per client (advertised as SILENCE, enforced by the
     /// silence Store). Configurable via `[limits] silencelimit`.
     silencelimit: u32 = 32,
+    /// Max WHOWAS history entries returned per query. Configurable via
+    /// `[limits] whowas_max_entries`.
+    whowas_max_entries: u32 = 20,
     /// draft/multiline inbound batch limits. Advertised through CAP LS 302 and
     /// enforced by the per-connection reassembler. Configurable via `[ircv3]`.
     multiline_max_bytes: usize = multiline.default_max_bytes,
@@ -2314,6 +2339,13 @@ pub const Config = struct {
     /// `(channel, participant)` key the native UDP leg uses. Prefer true with
     /// `ws_media_relay` in production.
     ws_media_require_mac: bool = false,
+    /// Strict call recording (packet journal to `media_recording_dir`).
+    /// Off by default; unanimous consent is still required per call.
+    media_recording_enabled: bool = false,
+    media_recording_dir: ?[]const u8 = null,
+    media_recording_retention_days: u32 = 7,
+    media_recording_max_total_bytes: u64 = 512 * 1024 * 1024,
+    media_recording_max_duration_secs: u64 = 4 * 3600,
     /// Terminate DTLS-SRTP (RFC 5764) on the WebRTC UDP media plane so standard
     /// browser/mobile endpoints can key the SRTP leg via a DTLS handshake
     /// alongside the signaled group key. Off by default; when off the media
@@ -3142,9 +3174,19 @@ pub const ConnState = struct {
     /// with the SendQ overflow). `pendingInbound` reads inline-or-overflow.
     recv_overflow: std.ArrayListUnmanaged(u8) = .empty,
     /// Inbound queue ceiling in bytes for this connection's class: the maximum
-    /// length of one unterminated line before the connection is dropped. Set by
-    /// `assignConnClass`; defaults to the physical inline buffer.
+    /// length of one unterminated line before the line is dropped with 417.
+    /// Set by `assignConnClass`; defaults to the physical inline buffer.
     recvq_cap: usize = default_recvq_cap,
+    /// True while discarding the remainder of an overlong line (417 already
+    /// sent): bytes are swallowed until the line's LF, storing nothing.
+    recvq_discarding: bool = false,
+    /// Transient: set only for the synchronous duration of a TLS
+    /// control-barrier input drive. Buffered plaintext released across a
+    /// KeyUpdate barrier that fails the line bound must terminally retire
+    /// the generation (the epoch's accepted plaintext cannot be safely
+    /// resynchronized), so `feedBytes` propagates LineTooLong there instead
+    /// of applying the ordinary 417 drop-line policy.
+    tls_barrier_strict_lines: bool = false,
     send_buf: [default_reply_bytes]u8 = undefined,
     send_len: usize = 0,
     send_offset: usize = 0,
@@ -4168,6 +4210,10 @@ const Reactor = struct {
     wake: ?reactor_wake.ReactorWake = null,
     wake_armed: bool = false,
     wake_count: std.atomic.Value(u32) = .init(0),
+    /// Published before a foreign reactor wakes this owner after retaining
+    /// complete secured S2S records in one of its links. Avoids an O(max_clients)
+    /// link scan on unrelated fabric, stop, and activation wakes.
+    retained_mesh_outbound_pending: std.atomic.Value(bool) = .init(false),
     accepted_count: std.atomic.Value(u64) = .init(0),
     windows_accepted: WindowsAcceptedQueue = if (builtin.os.tag == .windows) WindowsAcceptedQueue.init() else {},
     /// Published only after this actual owner completes a successful backend
@@ -5218,6 +5264,23 @@ pub const OrdinaryGuestPublicFacts = struct {
     }
 };
 
+/// One active strict-recording journal (see `LinuxServer.media_recorders`).
+const ActiveMediaRecorder = struct {
+    writer: media_record.Writer,
+    queue: media_record.Queue,
+    dir: std.Io.Dir,
+    channel: []u8,
+    next: ?*ActiveMediaRecorder = null,
+    retired: bool = false,
+    final_manifest: ?media_record.Manifest = null,
+    started_ms: i64,
+    track_keys: [media_record.max_tracks_hard]u64 = @splat(0),
+    track_ids: [media_record.max_tracks_hard]u16 = @splat(0),
+    tracks: [media_record.max_tracks_hard]media_record.Track = undefined,
+    track_last_pts: [media_record.max_tracks_hard]i64 = @splat(0),
+    track_count: usize = 0,
+};
+
 pub const LinuxServer = struct {
     pub const PublicFacts = OrdinaryGuestPublicFacts;
 
@@ -5266,6 +5329,12 @@ pub const LinuxServer = struct {
     /// (origin_node, hlc). Per-peer seen-sets miss cross-path duplicates in a
     /// cyclic mesh; this global set dedups deliver + re-forward across all paths.
     relay_seen: message_relay.SeenSet,
+    /// Daemon-global exact-wire replay guard for ACCESS_EVENT_V1 facts.
+    /// Per-link seen sets stop same-leg replays; this guard stops a fact
+    /// arriving by a second mesh path from being applied or forwarded twice.
+    /// Process-local by design: the store's own (hlc, origin) LWW remains the
+    /// durable convergence authority across restarts and Helix.
+    access_event_seen: message_relay_v2.SeenSet,
     /// Durable daemon-global replay/equivocation authority for signed
     /// MESSAGE_V2 floods. Per-link seen sets remain reflection optimizations;
     /// only this checkpointed full-key guard authorizes v2 delivery/history.
@@ -5413,6 +5482,9 @@ pub const LinuxServer = struct {
     /// Test-only deterministic fault seam. Protected by `relay_v2_replay_mu`;
     /// see RelayV2AckDropTestState.
     test_drop_relay_v2_ack: RelayV2AckDropTestState = .{},
+    /// Test-only positive admission witness. Updated at the no-fail MESSAGE_V2
+    /// authority commit boundary while `relay_v2_replay_mu` is held.
+    test_last_relay_v2_admitted: ?relay_v2_replay_guard.RelayId = null,
     /// Decoded `[mesh].admission_roots` MeshPass token signer roots. Empty keeps
     /// the shared-secret admission path; non-empty requires signed tokens.
     meshpass_roots: []meshpass.TrustRoot = &.{},
@@ -5480,6 +5552,16 @@ pub const LinuxServer = struct {
     upgrade_drain_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     world: world_model.World,
     whowas: WhowasStore,
+    /// Last accepted remote quit recorded into WHOWAS, so the per-channel
+    /// parted sidecars of one mesh quit produce exactly one history entry.
+    remote_whowas_quit_hash: u64 = 0,
+    remote_whowas_quit_at_ms: i64 = 0,
+    remote_whowas_quit_seen: bool = false,
+    /// Last remote identity fanned out as ACCOUNT, so the per-channel
+    /// identity sidecars of one mesh account change notify watchers once.
+    remote_account_notify_hash: u64 = 0,
+    remote_account_notify_at_ms: i64 = 0,
+    remote_account_notify_seen: bool = false,
     monitor: monitor.MonitorStore,
     read_markers: read_marker_store.DefaultStore,
     /// Account-only signed position frontier. Keys are account NUL target;
@@ -5978,6 +6060,16 @@ pub const LinuxServer = struct {
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Onyx Server media SFU control plane): who is in each call.
     media_rooms: media_room.MediaRooms,
+    /// One active strict-recording journal per channel, keyed by owned
+    /// channel name. Guarded by `media_recorder_mu`; the Writer itself is
+    /// only driven from the maintenance reactor (single consumer), while
+    /// packet producers push through the bounded Queue under the same mutex.
+    media_recorders: std.StringHashMapUnmanaged(*ActiveMediaRecorder) = .empty,
+    /// Lifetime list: stop removes producer authority immediately; maintenance
+    /// alone unlinks/finalizes entries after its current drain pass completes.
+    media_recorder_head: ?*ActiveMediaRecorder = null,
+    media_recorder_mu: std.atomic.Mutex = .unlocked,
+    media_recording_retention_swept: bool = false,
     /// Physical call memberships beneath nick-level MediaRooms presence. Multiple
     /// reusable-session attachments may share one rendered nick; first/last
     /// transitions alone mutate externally visible nick presence.
@@ -6403,6 +6495,8 @@ pub const LinuxServer = struct {
         errdefer clients.deinit();
         try clients.reserve(config.max_clients);
 
+        const wake = try initReactorWakeForMode(reuse_port, reactor_wake.ReactorWake.init);
+
         return .{
             .ring = ring,
             .held_mesh_recv = held_mesh_recv,
@@ -6417,10 +6511,9 @@ pub const LinuxServer = struct {
             .s2s_listener_companion_fd = s2s_listener_companion_fd,
             .tls_listener_companion_fd = tls_listener_companion_fd,
             .ws_listener_companion_fd = ws_listener_companion_fd,
-            // Best-effort: a daemon without eventfd simply runs un-wakeable (a
-            // single reactor never needs an external nudge; multi-reactor needs it
-            // for cross-shard delivery, so a failure there degrades to busier polls).
-            .wake = reactor_wake.ReactorWake.init() catch null,
+            // Nullable only in single-reactor mode. `reuse_port` is the exact
+            // init-time signal that the server requested multiple shards.
+            .wake = wake,
         };
     }
 
@@ -6805,6 +6898,7 @@ pub const LinuxServer = struct {
                 .disabled_plugins = config.wasm_disabled_plugins,
             }),
             .relay_seen = message_relay.SeenSet.init(allocator, 4096),
+            .access_event_seen = message_relay_v2.SeenSet.init(allocator, 4096),
             .relay_v2_replay_guard = relay_replay_guard,
             .relay_v2_outbox = relay_outbox,
             .relay_v2_event_log = relay_event_log,
@@ -7115,6 +7209,11 @@ pub const LinuxServer = struct {
         self.native_media.max_frame_bytes = @intCast(@min(self.config.media_max_frame_bytes, @as(u64, native_media_mod.max_datagram)));
         self.native_media.max_upload_bytes = self.config.media_max_upload_bytes;
         self.native_media.configureMac(&self.native_stream_key, self.config.native_media_require_mac);
+        if (self.config.media_recording_enabled) {
+            const tap = native_media_link.MediaTap{ .ctx = self, .on_packet = mediaRecordTap };
+            self.native_media.setMediaTap(tap);
+            self.media_plane.setMediaTap(tap);
+        }
         if (self.config.media_stun_port != 0) {
             const ip4 = parseIp4(self.config.media_stun_host) orelse return error.InvalidMediaStunAddress;
             self.media_plane.stun_server = try media_plane_mod.TransportAddress.fromBytes(&ip4, self.config.media_stun_port);
@@ -7884,6 +7983,12 @@ pub const LinuxServer = struct {
         try out.appendSlice(self.allocator, try self.diagnostics.renderMetricsWithCounters(&diagnostic_metrics, self.sessions.tokenPublicationStatsSnapshot(), self.media_plane.fir_pli_ssrc_budget.dropped));
         try writePromGauge(self.allocator, &out, "onyx_modules_degraded", "Modules unavailable after lifecycle failure", self.module_runtime.degradedCount());
         try writePromGauge(self.allocator, &out, "onyx_modules_config_generation", "Process-local committed module configuration generation", self.module_runtime.generation());
+        try out.appendSlice(self.allocator, "# HELP onyx_module_hook_unavailable_total Typed module hook subscribers skipped or denied because they were unavailable\n" ++
+            "# TYPE onyx_module_hook_unavailable_total counter\n");
+        try out.print(self.allocator, "onyx_module_hook_unavailable_total {d}\n", .{self.module_runtime.bus.totalUnavailable()});
+        try out.appendSlice(self.allocator, "# HELP onyx_module_hook_handler_errors_total Typed module hook handlers that returned an error\n" ++
+            "# TYPE onyx_module_hook_handler_errors_total counter\n");
+        try out.print(self.allocator, "onyx_module_hook_handler_errors_total {d}\n", .{self.module_runtime.bus.totalHandlerErrors()});
         try self.latency_stats.writePrometheus(self.allocator, &out);
         try self.writeNodeHealthPrometheus(self.allocator, &out);
         try self.writeReactorAcceptPrometheus(self.allocator, &out);
@@ -8316,22 +8421,34 @@ pub const LinuxServer = struct {
         const chan = post.channel();
         if (!world_model.isChannelName(chan)) return;
         if (!self.world.channelExists(chan)) return;
-        // Respect channel modes: a webhook bot holds no membership/voice, so a
-        // moderated (+m) channel drops the post (the HTTP request already 204'd).
-        if (self.world.channelHasFlag(chan, .moderated)) return;
-
         const nick = post.nick();
         if (nick.len == 0) return;
-        // Synthetic sender prefix `<nick>!webhook@<server>`. `nick` is sanitised
-        // (no space / CR / LF), so the prefix can never split or forge a line.
-        var prefix_buf: [webhook_mod.max_nick + 96]u8 = undefined;
-        const prefix = std.fmt.bufPrint(&prefix_buf, "{s}!webhook@{s}", .{
-            nick, self.serverName(),
+        // Active mesh webhooks occupy a namespace clients cannot register.
+        // Roster preflight alone cannot exclude a concurrent remote NICK. The
+        // marker remains part of the immutable signed prefix on every hop.
+        const active_v2 = self.authoredRelayV2Configured();
+        var prefix_buf: [webhook_mod.max_nick + 97]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "{s}{s}!webhook@{s}", .{
+            if (active_v2) "=" else "", nick, self.serverName(),
         }) catch return;
 
+        const rendered_nick = prefix[0..std.mem.indexOfScalar(u8, prefix, '!').?];
         var lines = std.mem.splitScalar(u8, post.body(), '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
+        while (lines.next()) |raw_line| {
+            if (raw_line.len == 0) continue;
+            // Apply the receiver's content and speech policy before minting an
+            // identity or publishing either delivery leg. External webhook
+            // authority bypasses only +n; it grants no account or voice modes.
+            if (!self.messageSatisfiesEncryptionPolicy(chan, post.clientTags(), raw_line, false)) continue;
+            var stripped: [default_reply_bytes]u8 = undefined;
+            const line = if (self.channelEncryptionPolicy(chan) != .required and
+                self.world.channelHasExtFlag(chan, .noformat) and color_strip.hasFormatting(raw_line))
+                stripFormattingPreserveNonEmpty(raw_line, &stripped)
+            else
+                raw_line;
+            const speech = self.relayChannelSpeechGate(chan, rendered_nick, prefix, "", line, false, 0, world_model.MemberModes.empty(), true, null);
+            if (speech == .deny) continue;
+            const delivery_rank: u8 = if (speech == .opmoderate) 2 else 0;
             // Allocate one mesh event identity BEFORE either delivery leg. The
             // same authenticated (origin, hlc) deterministically produces the
             // local + remote msgid/time, so a webhook post is one event across
@@ -8340,7 +8457,36 @@ pub const LinuxServer = struct {
             const hlc = self.nextMeshHlc();
             const event_time_ms = mesh_clock_mod.MeshClock.physicalOf(hlc);
             var msgid_buf: [msgid_mod.id_len]u8 = undefined;
-            const message_id = msgid_mod.fromMeshEvent(self.config.node_id, hlc, &msgid_buf);
+            var message_id = msgid_mod.fromMeshEvent(self.config.node_id, hlc, &msgid_buf);
+            var msg_buf: [default_reply_bytes]u8 = undefined;
+            const msg = formatMessage(&msg_buf, prefix, "PRIVMSG", &.{chan}, line) catch continue;
+            var accepted_v2: ?AcceptedAuthoredRelayV2 = null;
+            defer if (accepted_v2) |*accepted| accepted.deinit(self.allocator);
+            if (active_v2) {
+                var recipients: std.ArrayList(client_model.ClientId) = .empty;
+                defer recipients.deinit(self.allocator);
+                self.collectChannelDeliveryIds(chan, delivery_rank, null, post.clientTags(), &recipients, .speech) catch continue;
+                accepted_v2 = self.admitAuthoredRelayV2(
+                    .privmsg,
+                    chan,
+                    0,
+                    prefix,
+                    "",
+                    post.clientTags() orelse "",
+                    "",
+                    line,
+                    .channel,
+                    "",
+                    null,
+                    null,
+                    null,
+                    hlc,
+                    if (speech == .allow) .{ .target = chan, .sender = prefix, .text = line, .command = "PRIVMSG", .client_tags = post.clientTags(), .timestamp_ms = event_time_ms } else null,
+                    .{ .recipients = recipients.items, .line = msg, .is_bot = true },
+                ) catch continue;
+                const accepted = accepted_v2 orelse continue;
+                message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
+            }
             var time_buf: [40]u8 = undefined;
             const tags = MsgTags{
                 .time_value = serverTimeValueAt(&time_buf, event_time_ms),
@@ -8349,9 +8495,18 @@ pub const LinuxServer = struct {
                 .msgid = message_id,
                 .is_bot = true,
             };
-            var msg_buf: [default_reply_bytes]u8 = undefined;
-            const msg = formatMessage(&msg_buf, prefix, "PRIVMSG", &.{chan}, line) catch continue;
-            self.broadcastChannelTagged(chan, tags, msg, null, .ordinary) catch {};
+            const delivery_mode: TaggedDeliveryMode = if (accepted_v2) |accepted| accepted.deliveryMode() else .ordinary;
+            if (speech == .opmoderate)
+                self.broadcastChannelMinRank(chan, tags, msg, null, delivery_rank, delivery_mode) catch {}
+            else
+                self.broadcastChannelTagged(chan, tags, msg, null, delivery_mode) catch {};
+            if (accepted_v2) |accepted| {
+                // The configured neighbor custody set includes replicas before
+                // their legacy channel roster converges. Retain the immutable
+                // wire until receipt, and never emit a legacy twin.
+                self.forwardAcceptedRelayV2(accepted.wire);
+                continue;
+            }
 
             // Mesh relay so remote members of `chan` see the post too. Loop-guarded.
             var relay_msg = s2s_link.RelayMessage{
@@ -8374,7 +8529,8 @@ pub const LinuxServer = struct {
                 _ = self.relay_seen.observeUnsigned(self.config.node_id, hlc);
             _ = self.relayToPeers(relay_msg, .{ .channel = chan });
 
-            self.recordHistoryRelayAt(chan, prefix, message_id, "PRIVMSG", line, post.clientTags(), event_time_ms);
+            if (speech == .allow)
+                self.recordHistoryRelayAt(chan, prefix, message_id, "PRIVMSG", line, post.clientTags(), event_time_ms);
         }
     }
 
@@ -9498,6 +9654,7 @@ pub const LinuxServer = struct {
         self.allocator.destroy(self.geo);
         self.wasm.deinit();
         self.relay_seen.deinit();
+        self.access_event_seen.deinit();
         // Tear down every connection owned by every shard's reactor (each reactor
         // owns a disjoint slab). Single-reactor mode just walks `reactors[0]`.
         for (self.reactors) |*reactor| {
@@ -9679,6 +9836,7 @@ pub const LinuxServer = struct {
         // deinit() calls (which call it again) are safe.
         self.media_plane.shutdown();
         self.native_media.shutdown();
+        self.finalizeAllMediaRecorders();
         self.media_physical_attachments.deinit(self.allocator);
         self.media_rooms.deinit();
         self.media_plane.deinit();
@@ -9772,6 +9930,48 @@ pub const LinuxServer = struct {
         }
     }
 
+    const ReactorWakeInitFn = *const fn () error{ReactorWakeUnsupported}!reactor_wake.ReactorWake;
+
+    /// A single reactor can continue to use its timer/socket completions when
+    /// eventfd is unavailable. Multiple reactors cannot: cross-shard delivery,
+    /// retained mesh output, quiesce, and stop all require an addressable wake.
+    /// Keep the initializer injectable so the failure policy is deterministic in
+    /// tests instead of depending on exhausting process file descriptors.
+    fn initReactorWakeForMode(
+        multi_reactor: bool,
+        init_fn: ReactorWakeInitFn,
+    ) error{ReactorWakeUnsupported}!?reactor_wake.ReactorWake {
+        return init_fn() catch |err| {
+            if (multi_reactor) return err;
+            return null;
+        };
+    }
+
+    /// Multi-reactor workers may block only while their owner-addressable wake
+    /// poll is either already in flight or queued in the same submit-and-wait.
+    /// If control SQEs filled the userspace submission queue, flush them to the
+    /// kernel and retry. The attempt count is ring-bounded, so this neither spins
+    /// nor turns transient SQ pressure into a dead reactor. Do not require a
+    /// positive submit return: SQPOLL may validly report zero after consuming the
+    /// flushed entries asynchronously.
+    fn armRequiredWakeBeforeWait(self: *LinuxServer) !void {
+        std.debug.assert(self.reactors.len > 1);
+        if (self.rx().wake == null) return error.ReactorWakeUnsupported;
+        var attempts: usize = 0;
+        const max_attempts = @max(@as(usize, 1), @as(usize, self.config.ring_entries));
+        while (!self.rx().wake_armed) {
+            self.armWake() catch |err| switch (err) {
+                error.SubmissionQueueFull => {
+                    if (attempts >= max_attempts) return error.Unexpected;
+                    _ = try self.rx().ring.submit();
+                    attempts += 1;
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
     /// Wake this reactor from any thread: the in-flight wake poll completes, the
     /// loop runs, and (once the multi-reactor model lands) drains its mailbox.
     pub fn wakeReactor(self: *LinuxServer) void {
@@ -9813,6 +10013,8 @@ pub const LinuxServer = struct {
         self.drainSessionDropControls();
         self.drainFabric();
         self.drainAttachmentSpoolForCurrentReactor();
+        if (self.rx().retained_mesh_outbound_pending.swap(false, .acquire))
+            self.flushRetainedMeshOutboundForCurrentReactor();
         if (self.rx() == &self.reactors[0]) {
             self.flushPendingSecuredOutbound();
             self.retryRelayV2Outbox();
@@ -9821,6 +10023,29 @@ pub const LinuxServer = struct {
             self.e2ee_group_retry_requested.swap(false, .acq_rel))
             self.retryE2eeGroupCustody();
         self.abortPoisonedDeliveries();
+    }
+
+    /// A foreign reactor may encode complete S2S records into a link owned by
+    /// this shard, then wake us instead of touching the owner's socket SendQ.
+    /// Drain those retained bytes only here, through the existing whole-record
+    /// pager. Ordinary backpressure leaves the exact suffix in the link for a
+    /// later owner turn; it never crosses the generic chunked delivery fabric.
+    fn flushRetainedMeshOutboundForCurrentReactor(self: *LinuxServer) void {
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied) continue;
+            self.flushRetainedMeshOutboundForConn(&slot.value);
+        }
+    }
+
+    fn flushRetainedMeshOutboundForConn(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.closing) return;
+        if (conn.s2s_secured) |link| {
+            if (link.outbound().len != 0) _ = self.flushMeshBurstStage(conn);
+        } else if (conn.s2s) |link| {
+            // Plaintext output normally reaches the owner through the delivery
+            // fabric, but retry any locally-retained full stream here as well.
+            if (link.outbound().len != 0) _ = self.flushMeshBurstStage(conn);
+        }
     }
 
     /// Drain every cross-shard delivery addressed to THIS reactor's shard and
@@ -10476,6 +10701,13 @@ pub const LinuxServer = struct {
         self.media_retirement_defer_publication = true;
         defer self.media_retirement_defer_publication = previous_media_defer;
         self.rx().timer_armed = false;
+        // A stop request takes precedence over maintenance and Helix. Clearing
+        // the shared run flag wakes all shards; main's existing joined cleanup
+        // owns companion teardown, recording finalization, and file closure.
+        if (self.isMaintenanceReactor() and termination_signal_requested.swap(false, .seq_cst)) {
+            if (self.shutdown) |run| self.requestStop(run);
+            return;
+        }
         // The journal sweep is authoritative recovery for a missed control
         // mailbox hint and for a requester/owner that vanished before cleanup.
         self.sweepSessionDropTransactions();
@@ -10972,6 +11204,7 @@ pub const LinuxServer = struct {
             }
         }
         self.maybeRunBackups();
+        self.drainMediaRecorders();
         // Event Spine history snapshot, gated to reactor 0 (the ring is shared
         // across reactors, so a single writer avoids N redundant concurrent
         // snapshots racing the same target) and throttled to the stats cadence.
@@ -11170,6 +11403,330 @@ pub const LinuxServer = struct {
             const name = std.fmt.bufPrint(&name_buf, "chan_{s}.html", .{t.slug}) catch continue;
             writeStatsFileAtomic(io, dir, name, w.buffered());
         }
+    }
+
+    fn mediaRecordIo(self: *LinuxServer) ?std.Io {
+        return self.config.crypto_io;
+    }
+
+    fn openMediaRecordingDir(self: *LinuxServer, io: std.Io) !std.Io.Dir {
+        const path = self.config.media_recording_dir orelse return error.RecordingUnavailable;
+        if (path.len == 0) return error.RecordingUnavailable;
+        const base = std.fs.path.basename(path);
+        if (base.len == 0) return error.RecordingUnavailable;
+        if (std.fs.path.dirname(path)) |parent_path| {
+            var parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{});
+            defer parent.close(io);
+            return media_record.ensurePrivateDir(parent, io, base);
+        }
+        return media_record.ensurePrivateDir(std.Io.Dir.cwd(), io, base);
+    }
+
+    /// Delete owned journal segments/manifests older than the retention
+    /// window. Runs once per boot on the first recorder start; foreign
+    /// files in the directory are never touched.
+    fn sweepMediaRecordingRetention(self: *LinuxServer, io: std.Io, dir: std.Io.Dir) void {
+        if (self.media_recording_retention_swept) return;
+        self.media_recording_retention_swept = true;
+        const days = self.config.media_recording_retention_days;
+        if (days == 0) return;
+        const cutoff_sec = @divTrunc(platform.realtimeMillis(), 1000) - @as(i64, @intCast(days)) * 86_400;
+        var iterable = dir.openDir(io, ".", .{ .iterate = true }) catch return;
+        defer iterable.close(io);
+        var it = iterable.iterate();
+        while (it.next(io) catch return) |entry| {
+            if (entry.kind != .file) continue;
+            const owned = media_record.isOwnedSegmentName(entry.name) or
+                (std.mem.startsWith(u8, entry.name, "rec-") and std.mem.endsWith(u8, entry.name, ".manifest.json"));
+            if (!owned) continue;
+            const stat = dir.statFile(io, entry.name, .{}) catch continue;
+            if (stat.mtime.toSeconds() < cutoff_sec) dir.deleteFile(io, entry.name) catch {};
+        }
+    }
+
+    /// Create the packet journal for `channel`. Caller (`MEDIA RECORD`) has
+    /// already established unanimous consent in `media_rooms`.
+    pub fn startMediaRecorder(self: *LinuxServer, channel: []const u8) bool {
+        if (!self.config.media_recording_enabled) return false;
+        const io = self.mediaRecordIo() orelse return false;
+        lockSpin(&self.media_recorder_mu);
+        defer self.media_recorder_mu.unlock();
+        if (self.media_recorders.contains(channel)) return true;
+        var dir = self.openMediaRecordingDir(io) catch return false;
+        self.sweepMediaRecordingRetention(io, dir);
+        const active = self.allocator.create(ActiveMediaRecorder) catch {
+            dir.close(io);
+            return false;
+        };
+        const key = self.allocator.dupe(u8, channel) catch {
+            self.allocator.destroy(active);
+            dir.close(io);
+            return false;
+        };
+        var queue = media_record.Queue.init(self.allocator, 512, 8 * 1024 * 1024, 1024 * 1024) catch {
+            self.allocator.free(key);
+            self.allocator.destroy(active);
+            dir.close(io);
+            return false;
+        };
+        const writer = media_record.Writer.create(self.allocator, io, dir, .{
+            .config = .{
+                .max_segment_bytes = @min(64 * 1024 * 1024, self.config.media_recording_max_total_bytes),
+                .max_tracks = media_record.max_tracks_hard,
+                .max_total_bytes = self.config.media_recording_max_total_bytes,
+                .max_duration_us = @intCast(@min(self.config.media_recording_max_duration_secs, std.math.maxInt(i64) / 1_000_000) * 1_000_000),
+            },
+            .created_unix_ms = platform.realtimeMillis(),
+        }) catch {
+            queue.deinit();
+            self.allocator.free(key);
+            self.allocator.destroy(active);
+            dir.close(io);
+            return false;
+        };
+        active.* = .{ .writer = writer, .queue = queue, .dir = dir, .channel = key, .started_ms = self.nowMs() };
+        self.media_recorders.put(self.allocator, key, active) catch {
+            active.writer.abort();
+            active.queue.deinit();
+            active.dir.close(io);
+            self.allocator.free(key);
+            self.allocator.destroy(active);
+            return false;
+        };
+        active.next = self.media_recorder_head;
+        self.media_recorder_head = active;
+        return true;
+    }
+
+    /// Drain/finalize one retired recorder, owned exclusively by maintenance
+    /// (or shutdown after both media pumps stopped). No producer mutex is held.
+    fn finalizeActiveMediaRecorder(self: *LinuxServer, active: *ActiveMediaRecorder) bool {
+        const io = active.writer.io;
+        active.queue.close();
+        if (active.final_manifest == null) {
+            _ = active.writer.drainQueue(&active.queue, std.math.maxInt(usize)) catch |err| blk: {
+                // Retain custody of a sealed segment until its sidecar has
+                // published, including when the successor writer has failed.
+                if (err == error.OutOfMemory or active.writer.pending_manifest != null) return false;
+                break :blk 0;
+            };
+            if (active.writer.track_count == 0) {
+                active.writer.abort();
+            } else {
+                active.final_manifest = active.writer.finalize() catch |err| blk: {
+                    if (err == error.OutOfMemory or active.writer.pending_manifest != null or active.writer.final_manifest != null) return false;
+                    // A failed writer leaves its partial file for recovery.
+                    break :blk null;
+                };
+            }
+        }
+        if (active.final_manifest) |*manifest| {
+            media_record.writeManifestFile(self.allocator, io, active.dir, manifest) catch return false;
+            active.final_manifest = null;
+        }
+        active.writer.deinit();
+        active.queue.deinit();
+        active.dir.close(io);
+        return true;
+    }
+
+    /// Remove recording authority at the no-fail domain commit. The lifetime
+    /// list keeps its queue/writer alive until maintenance finalizes it outside
+    /// both the media mutex and the World transaction.
+    pub fn stopMediaRecorder(self: *LinuxServer, channel: []const u8) bool {
+        lockSpin(&self.media_recorder_mu);
+        defer self.media_recorder_mu.unlock();
+        const kv = self.media_recorders.fetchRemove(channel) orelse return false;
+        kv.value.retired = true;
+        return true;
+    }
+
+    fn reapRetiredMediaRecorders(self: *LinuxServer) void {
+        // Detach one bounded batch. Retry failures on a later tick, allowing
+        // every other retired recorder to progress despite one failing disk.
+        var batch: ?*ActiveMediaRecorder = null;
+        lockSpin(&self.media_recorder_mu);
+        var slot = &self.media_recorder_head;
+        while (slot.*) |active| {
+            if (active.retired) {
+                slot.* = active.next;
+                active.next = batch;
+                batch = active;
+            } else slot = &active.next;
+        }
+        self.media_recorder_mu.unlock();
+        while (batch) |active| {
+            batch = active.next;
+            if (self.finalizeActiveMediaRecorder(active)) {
+                self.allocator.free(active.channel);
+                self.allocator.destroy(active);
+            } else {
+                lockSpin(&self.media_recorder_mu);
+                active.next = self.media_recorder_head;
+                self.media_recorder_head = active;
+                self.media_recorder_mu.unlock();
+            }
+        }
+    }
+
+    fn finalizeAllMediaRecorders(self: *LinuxServer) void {
+        lockSpin(&self.media_recorder_mu);
+        var cursor = self.media_recorder_head;
+        while (cursor) |active| : (cursor = active.next) active.retired = true;
+        self.media_recorders.deinit(self.allocator);
+        self.media_recorders = .empty;
+        self.media_recorder_mu.unlock();
+        self.reapRetiredMediaRecorders();
+        // Shutdown cannot wait indefinitely for a failed filesystem. Keep
+        // artifacts on disk for recovery while releasing in-memory resources.
+        while (self.media_recorder_head) |active| {
+            self.media_recorder_head = active.next;
+            const io = active.writer.io;
+            active.writer.deinit();
+            active.queue.deinit();
+            active.dir.close(io);
+            self.allocator.free(active.channel);
+            self.allocator.destroy(active);
+        }
+    }
+
+    /// Producer seam for the native media tap and server-visible captions:
+    /// assign (or reuse) a journal track for `(participant, kind, codec)` and
+    /// queue one encoded packet. Never blocks; drops are silent here and
+    /// accounted inside the journal queue.
+    pub fn recordMediaPacket(
+        self: *LinuxServer,
+        channel: []const u8,
+        participant: []const u8,
+        kind: media_record.TrackKind,
+        codec: []const u8,
+        clock_rate: u32,
+        width: u32,
+        height: u32,
+        pts_us: i64,
+        duration_us: u32,
+        keyframe: bool,
+        payload: []const u8,
+    ) void {
+        if (payload.len == 0 or pts_us < 0) return;
+        if (!self.media_recorder_mu.tryLock()) return;
+        defer self.media_recorder_mu.unlock();
+        const active = self.media_recorders.get(channel) orelse return;
+        var key_buf: [256]u8 = undefined;
+        const key_text = std.fmt.bufPrint(&key_buf, "{s}\x00{d}\x00{s}", .{ participant, @backingInt(kind), codec }) catch return;
+        const key = std.hash.Wyhash.hash(0x4f4e5958, key_text);
+        var track_id: u16 = 0;
+        var track_slot: usize = 0;
+        for (active.track_keys[0..active.track_count], 0..) |existing, i| {
+            if (existing == key) {
+                track_id = active.track_ids[i];
+                track_slot = i;
+                break;
+            }
+        }
+        const new_track = track_id == 0;
+        var track: media_record.Track = undefined;
+        if (new_track) {
+            if (active.track_count >= active.track_keys.len) return;
+            const candidate: u16 = @intCast(active.track_count + 1);
+            track = media_record.Track.init(candidate, kind, codec, clock_rate) catch return;
+            if (kind == .video or kind == .screen) {
+                track = track.withDimensions(if (width == 0) 16 else width, if (height == 0) 16 else height) catch return;
+            }
+            track_slot = active.track_count;
+            track_id = candidate;
+        } else track = active.tracks[track_slot];
+        // Captions carry Unix time; RTP/cadence carry independent wrapping media
+        // clocks. Only this recorder-relative monotonic clock orders the journal.
+        const elapsed_ms = @max(@as(i64, 0), self.nowMs() - active.started_ms);
+        const relative_us = @min(elapsed_ms, @divTrunc(std.math.maxInt(i64), 1000)) * 1000;
+        const clamped_pts = @max(relative_us, active.track_last_pts[track_slot]);
+        const outcome = active.queue.tryPushTrack(track, .{
+            .track_id = track_id,
+            .pts_us = clamped_pts,
+            .duration_us = duration_us,
+            .keyframe = keyframe,
+            .payload = payload,
+        });
+        if (outcome == .queued) {
+            if (new_track) {
+                active.track_keys[track_slot] = key;
+                active.track_ids[track_slot] = track_id;
+                active.tracks[track_slot] = track;
+                active.track_count += 1;
+            }
+            active.track_last_pts[track_slot] = clamped_pts;
+        }
+    }
+
+    /// Native/WebRTC pump tap: runs on the forwarding thread, so it only
+    /// maps the event and queues it (`recordMediaPacket` never blocks).
+    /// Events without channel/participant identity (routed WebRTC graph)
+    /// cannot be attributed to a consented call and are not recorded.
+    fn mediaRecordTap(ctx: *anyopaque, event: native_media_link.TapEvent) void {
+        const self: *LinuxServer = @ptrCast(@alignCast(ctx));
+        if (event.channel.len == 0 or event.participant.len == 0 or event.payload.len == 0) return;
+        const kind: media_record.TrackKind = switch (event.kind) {
+            .voice => .audio,
+            .video => .video,
+            .screen => .screen,
+            .unknown => return,
+        };
+        const codec: []const u8 = switch (event.codec) {
+            .cadencevox => "cadencevox",
+            .cadencevis => "cadencevis",
+            .opus => "opus",
+            .vp8 => "vp8",
+            .raw => "raw",
+            .unknown => return,
+        };
+        const clock_rate: u32 = switch (event.codec) {
+            .cadencevox, .opus => 48000,
+            else => 90000,
+        };
+        const ts = event.timestamp orelse return;
+        const pts_us: i64 = @intCast(@min(@as(u128, ts) * 1_000_000 / clock_rate, @as(u128, std.math.maxInt(i64))));
+        // RTP cannot report keyframes without codec parsing; admit its
+        // packets (decoders resync at the next IDR) instead of gate-dropping
+        // the whole track. Native cadence reports real keyframe flags.
+        const keyframe = event.keyframe orelse (event.transport == .webrtc_rtp);
+        self.recordMediaPacket(event.channel, event.participant, kind, codec, clock_rate, 0, 0, pts_us, 0, keyframe, event.payload);
+    }
+
+    /// Maintenance is the only writer consumer. Keep recorder lifetimes until
+    /// this pass ends, and perform all disk I/O outside the producer mutex.
+    fn drainMediaRecorders(self: *LinuxServer) void {
+        if (!self.isMaintenanceReactor()) return;
+        lockSpin(&self.media_recorder_mu);
+        var cursor = self.media_recorder_head;
+        self.media_recorder_mu.unlock();
+        const now = self.nowMs();
+        const max_ms: i64 = @intCast(@min(self.config.media_recording_max_duration_secs, std.math.maxInt(i64) / 1000) * 1000);
+        while (cursor) |active| {
+            lockSpin(&self.media_recorder_mu);
+            cursor = active.next;
+            const retired = active.retired;
+            self.media_recorder_mu.unlock();
+            if (retired) continue;
+            var terminal = false;
+            _ = active.writer.drainQueue(&active.queue, 256) catch |err| blk: {
+                // Allocation pressure retains the exact head for retry. A
+                // filesystem/format failure terminates this recording visibly.
+                terminal = err != error.OutOfMemory;
+                break :blk 0;
+            };
+            if (!terminal and !active.queue.isClosed() and !(max_ms > 0 and now - active.started_ms >= max_ms)) continue;
+            lockSpin(&self.media_recorder_mu);
+            const still_active = !active.retired;
+            if (still_active) {
+                _ = self.media_recorders.remove(active.channel);
+                active.retired = true;
+            }
+            self.media_recorder_mu.unlock();
+            if (still_active and self.media_rooms.stopRecording(active.channel))
+                self.broadcastMediaEvent(active.channel, "RECORD", self.serverName(), "stopped") catch {};
+        }
+        self.reapRetiredMediaRecorders();
     }
 
     fn maybeRunBackups(self: *LinuxServer) void {
@@ -11787,7 +12344,10 @@ pub const LinuxServer = struct {
         // are deliberately staged below them so a full inherited population can
         // neither wedge accept/wake/timer nor drop quiet clients on SQ-full.
         try self.armAccept();
-        self.armWake() catch {}; // cross-reactor wake poll; non-fatal if it can't arm
+        if (self.reactors.len > 1)
+            try self.armRequiredWakeBeforeWait()
+        else
+            self.armWake() catch {}; // optional eventfd in single-reactor mode
         self.armTimer() catch {}; // periodic timeout sweep; non-fatal if it can't arm
         _ = try self.activatePendingSocketIo();
         if (self.rx() == &self.reactors[0]) {
@@ -11797,6 +12357,7 @@ pub const LinuxServer = struct {
                 if (!self.mesh_dials_booted) self.wakeReactor();
             }
         }
+        std.debug.assert(self.reactors.len <= 1 or self.rx().wake_armed);
         _ = try self.rx().ring.submitAndWait(1);
 
         var handler = CompletionHandler{ .server = self };
@@ -13699,37 +14260,7 @@ pub const LinuxServer = struct {
                 }
             }
         }
-        // Connection-rate throttle: too many new connects from one source IP in
-        // the window are refused. Skipped for loopback / trusted-proxy sources
-        // (a shared reverse proxy fronting WebSocket clients must not be
-        // throttled as one IP). Fails open on any allocator/tracking error.
-        if (!refuse and self.conn_throttle != null and !self.ipCloneExempt(conn)) {
-            if (conn.peer_addr) |addr| {
-                var ipbuf: [64]u8 = undefined;
-                if (addrText(addr, &ipbuf)) |ip| {
-                    const decision = self.conn_throttle.?.classifyConnect(self.nowMs(), ip) catch |err| switch (err) {
-                        // `ip` is a bounded, non-empty rendered address, so
-                        // EmptyIp/IpTooLong are unreachable here — treat them as
-                        // allow so an internal quirk never wrongly refuses a real
-                        // client. A saturated table is already reported as
-                        // `.connect_throttled` by the engine (fail-closed); an
-                        // allocation failure while recording a NEW source IP is
-                        // memory pressure, so it too fails TOWARD refuse. Never a
-                        // blanket fail-OPEN `catch .allow`.
-                        error.EmptyIp, error.IpTooLong => .allow,
-                        else => .connect_throttled,
-                    };
-                    switch (decision) {
-                        .allow => conn.throttle_counted = true,
-                        .connect_throttled, .clone_limited => {
-                            self.penalizePeer(conn, self.config.clone_refuse_penalty);
-                            self.publishSecurityAdmissionRefusal(conn, "CONNECTION_THROTTLE", if (decision == .connect_throttled) "connect rate exceeded" else "concurrent connection limit exceeded");
-                            refuse = true;
-                        },
-                    }
-                }
-            }
-        }
+        if (!refuse and self.connectionThrottleRefuses(conn)) refuse = true;
         if (!refuse) {
             if (conn.peer_addr) |addr| {
                 if (self.clone_limit.register(addr)) {
@@ -13764,6 +14295,42 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// Reserve the connection-rate slot for one accepted client. Returns true
+    /// only when the configured rate gate refuses it. Shared by silent
+    /// TLS/WS admission and plaintext admission so transport choice cannot
+    /// bypass the documented per-source connection rate. Skipped for
+    /// loopback / trusted-proxy sources (a shared reverse proxy fronting
+    /// WebSocket clients must not be throttled as one IP).
+    fn connectionThrottleRefuses(self: *LinuxServer, conn: *ConnState) bool {
+        const t = if (self.conn_throttle) |*tt| tt else return false;
+        if (self.ipCloneExempt(conn)) return false;
+        const addr = conn.peer_addr orelse return false;
+        var ipbuf: [64]u8 = undefined;
+        const ip = addrText(addr, &ipbuf) orelse return false;
+        const decision = t.classifyConnect(self.nowMs(), ip) catch |err| switch (err) {
+            // `ip` is a bounded, non-empty rendered address, so
+            // EmptyIp/IpTooLong are unreachable here — treat them as allow so
+            // an internal quirk never wrongly refuses a real client. A
+            // saturated table is already reported as `.connect_throttled` by
+            // the engine (fail-closed); an allocation failure while recording
+            // a NEW source IP is memory pressure, so it too fails TOWARD
+            // refuse. Never a blanket fail-OPEN `catch .allow`.
+            error.EmptyIp, error.IpTooLong => .allow,
+            else => .connect_throttled,
+        };
+        switch (decision) {
+            .allow => {
+                conn.throttle_counted = true;
+                return false;
+            },
+            .connect_throttled, .clone_limited => {
+                self.penalizePeer(conn, self.config.clone_refuse_penalty);
+                self.publishSecurityAdmissionRefusal(conn, "CONNECTION_THROTTLE", if (decision == .connect_throttled) "connect rate exceeded" else "concurrent connection limit exceeded");
+                return true;
+            },
+        }
+    }
+
     /// Release this connection's connection-rate throttle slot (if it holds one).
     /// Renders the same source-IP text used at `classifyConnect`. Used by both the
     /// refuse path and `closeConn`.
@@ -13776,9 +14343,37 @@ pub const LinuxServer = struct {
         if (addrText(addr, &ipbuf)) |ip| _ = t.disconnect(ip);
     }
 
+    /// Abort an accepted client before transport setup publishes it. No
+    /// receive can be armed when this runs, so transport objects, admission
+    /// accounting (clone limit + throttle reservations), the fd, and the
+    /// ClientTable slot unwind as one transaction. Covers delayed
+    /// trusted-PROXY admission, where handleAccept's errdefers are gone.
+    fn rollbackAcceptedTransport(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        if (conn.tls) |tls| {
+            tls.deinit();
+            self.allocator.destroy(tls);
+            conn.tls = null;
+        }
+        if (conn.ws) |ws| {
+            self.allocator.destroy(ws);
+            conn.ws = null;
+        }
+        if (conn.clone_counted) {
+            if (conn.peer_addr) |addr| self.clone_limit.release(addr);
+            conn.clone_counted = false;
+        }
+        self.releaseThrottle(conn);
+        self.noteClientRefusedBeforeLive(conn);
+        closeFd(conn.fd);
+        _ = self.rx().clients.free(id);
+    }
+
     fn startAcceptedTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, arm_recv: bool) !bool {
         if (self.refuseSilentClient(id, conn)) return false;
-        const tls = try self.allocator.create(tls_conn.TlsConn);
+        const tls = self.allocator.create(tls_conn.TlsConn) catch {
+            self.rollbackAcceptedTransport(id, conn);
+            return false;
+        };
         // Implicit-TLS IRC listener: honour the configured client-cert request
         // (mTLS for SASL EXTERNAL / CERTFP). Dedicated IRC clients can present a
         // cert here; the browser WS path forces this off (startAcceptedWs).
@@ -13788,9 +14383,7 @@ pub const LinuxServer = struct {
         } else {
             tls.* = tls_conn.TlsConn.initBorrowed(self.allocator, tls_cfg) catch {
                 self.allocator.destroy(tls);
-                self.noteClientRefusedBeforeLive(conn);
-                closeFd(conn.fd);
-                _ = self.rx().clients.free(id);
+                self.rollbackAcceptedTransport(id, conn);
                 return false;
             };
         }
@@ -13813,7 +14406,10 @@ pub const LinuxServer = struct {
 
     fn startAcceptedWs(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, arm_recv: bool) !bool {
         if (self.refuseSilentClient(id, conn)) return false;
-        const ws = try self.allocator.create(WsState);
+        const ws = self.allocator.create(WsState) catch {
+            self.rollbackAcceptedTransport(id, conn);
+            return false;
+        };
         ws.* = .{};
         errdefer {
             conn.ws = null;
@@ -13821,7 +14417,10 @@ pub const LinuxServer = struct {
         }
         conn.ws = ws;
         if (certReady(self.config)) {
-            const tls = try self.allocator.create(tls_conn.TlsConn);
+            const tls = self.allocator.create(tls_conn.TlsConn) catch {
+                self.rollbackAcceptedTransport(id, conn);
+                return false;
+            };
             // NEVER request a client cert on the browser WebSocket listener:
             // browsers cannot satisfy a TLS CertificateRequest on a script-
             // initiated WebSocket and abort the handshake (close 1006), which
@@ -13833,11 +14432,7 @@ pub const LinuxServer = struct {
             } else {
                 tls.* = tls_conn.TlsConn.initBorrowed(self.allocator, tls_cfg) catch {
                     self.allocator.destroy(tls);
-                    conn.ws = null;
-                    self.allocator.destroy(ws);
-                    self.noteClientRefusedBeforeLive(conn);
-                    closeFd(conn.fd);
-                    _ = self.rx().clients.free(id);
+                    self.rollbackAcceptedTransport(id, conn);
                     return false;
                 };
             }
@@ -13889,6 +14484,18 @@ pub const LinuxServer = struct {
                     return true;
                 }
             }
+        }
+        if (self.connectionThrottleRefuses(conn)) {
+            emitServerLine(conn, "ERROR :Connection rate exceeded; try again later");
+            conn.close_reason = "Connection throttle";
+            conn.closing = true;
+            self.armSendIfNeeded(conn) catch {
+                conn.io_activation_pending = true;
+                conn.activation_recv_required = false;
+                self.wakeReactor();
+            };
+            self.noteClientAccepted(conn);
+            return true;
         }
         if (conn.peer_addr) |addr| {
             if (self.clone_limit.register(addr)) {
@@ -14451,6 +15058,8 @@ pub const LinuxServer = struct {
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainOperEventsV2(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainAccessEventsV1(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         self.drainGuestFrames(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainObserveEvents(conn, link);
@@ -14978,6 +15587,8 @@ pub const LinuxServer = struct {
         // decrypted application bytes have no remaining command authority.
         if (decrypted and conn.closing) return;
         const id = idFromToken(conn.token);
+        conn.tls_barrier_strict_lines = true;
+        defer conn.tls_barrier_strict_lines = false;
         (if (!decrypted) self.driveTls(id, conn, bytes) else if (conn.ws != null)
             self.driveWs(id, conn, bytes)
         else
@@ -15515,6 +16126,11 @@ pub const LinuxServer = struct {
         }
         if (hold) return;
 
+        // A wake may have found this peer's SendQ full and left complete secured
+        // records retained in the link. The send completion is the next
+        // owner-local capacity transition, so retry the same whole-record pager
+        // before re-arming; otherwise that consumed wake could strand the record.
+        self.flushRetainedMeshOutboundForConn(conn);
         try self.armSendIfNeeded(conn);
         // Once the send stream is fully drained (armSendIfNeeded above re-armed if
         // the overflow still had data), a pending kTLS conn attaches TX offload.
@@ -16585,8 +17201,14 @@ pub const LinuxServer = struct {
         id: client_model.ClientId,
         client_tags: ?[]const u8,
     ) bool {
-        const tags = client_tags orelse return true;
         const conn = self.connFor(id) orelse return false;
+        // World teardown can trail the transport's closing transition by one
+        // reactor turn. Such a physical attachment is no longer a delivery
+        // participant: ordinary fanout already skips it, and retaining it in a
+        // durable MESSAGE_V2 batch makes renderTaggedRecord return
+        // ClientNotFound, aborting admission for every healthy recipient.
+        if (conn.closing) return false;
+        const tags = client_tags orelse return true;
         var visible: [irc_line.max_client_tags_raw_len]u8 = undefined;
         return clientTagsForSession(&conn.session, tags, &visible).len != 0;
     }
@@ -17056,13 +17678,21 @@ pub const LinuxServer = struct {
         var sent: usize = 0;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                if (!slot.occupied or slot.value.closing or !slot.value.isActiveMeshPeer()) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 if (slot.value.s2s_secured) |link| {
                     if (!link.established()) continue;
                     if (!relayWanted(link, scope) and !self.relayWantedBySessionReplica(link, scope)) continue;
+                    const foreign_owner = pid.shard != self.rx().shard_id;
                     link.sendMessage(msg) catch continue;
-                    if (!self.flushSecuredS2sOutboundTo(pid, link)) continue;
+                    if (!self.flushSecuredS2sOutboundTo(pid, link)) {
+                        // A foreign owner deliberately retains the complete
+                        // encrypted record and drains it from its wake turn.
+                        // `sendMessage` succeeding is therefore a successful
+                        // route even though no foreign thread touched SendQ.
+                        if (foreign_owner) sent += 1;
+                        continue;
+                    }
                     sent += 1;
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
@@ -17968,6 +18598,7 @@ pub const LinuxServer = struct {
             &candidate,
         );
         if (event_log_plan) |*plan| _ = plan.commit();
+        if (comptime builtin.is_test) self.test_last_relay_v2_admitted = relay_id;
         if (history) |row| {
             var thread_msgid_buf: [msgid_mod.id_len]u8 = undefined;
             const thread_msgid = msgid_mod.fromStableId(relay_id, &thread_msgid_buf);
@@ -18654,6 +19285,59 @@ pub const LinuxServer = struct {
         };
     }
 
+    const RelayV2MsgidAuthorityForTest = struct {
+        admitted: bool,
+        retained: bool,
+    };
+
+    fn relayV2MsgidAuthorityForTest(
+        self: *LinuxServer,
+        msgid: []const u8,
+    ) RelayV2MsgidAuthorityForTest {
+        if (comptime !builtin.is_test) return .{ .admitted = false, .retained = false };
+        if (msgid.len != msgid_mod.id_len) return .{ .admitted = false, .retained = false };
+        self.world.lockWrite();
+        defer self.world.unlockWrite();
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+
+        var rendered_buf: [msgid_mod.id_len]u8 = undefined;
+        var state = RelayV2MsgidAuthorityForTest{
+            .admitted = false,
+            .retained = false,
+        };
+        if (self.test_last_relay_v2_admitted) |relay_id| {
+            const rendered = msgid_mod.fromStableId(relay_id, &rendered_buf);
+            state.admitted = std.mem.eql(u8, rendered, msgid);
+        }
+        var index: usize = 0;
+        while (index < self.relay_v2_event_log.len()) : (index += 1) {
+            const rendered = msgid_mod.fromStableId(
+                self.relay_v2_event_log.viewAt(index).relay_id,
+                &rendered_buf,
+            );
+            if (std.mem.eql(u8, rendered, msgid)) {
+                state.retained = true;
+                return state;
+            }
+        }
+        for (self.relay_v2_outbox.items()) |entry| {
+            const rendered = msgid_mod.fromStableId(entry.relay_id, &rendered_buf);
+            if (std.mem.eql(u8, rendered, msgid)) {
+                state.retained = true;
+                return state;
+            }
+        }
+        for (self.relay_v2_outbox.receiptItems()) |receipt| {
+            const rendered = msgid_mod.fromStableId(receipt.relay_id, &rendered_buf);
+            if (std.mem.eql(u8, rendered, msgid)) {
+                state.retained = true;
+                return state;
+            }
+        }
+        return state;
+    }
+
     fn sessionReplicaChannelFromOriginForTest(
         self: *LinuxServer,
         token: session_migrate.Token,
@@ -18927,6 +19611,11 @@ pub const LinuxServer = struct {
         const signed_direct_residence = (msg.scope_kind == .direct or msg.scope_kind == .direct_guest) and
             msg.sender_route_id != null;
         const sender_home = self.relaySenderHome(source_nick, msg.origin_node);
+        const verified_webhook = message_relay_v2.isWebhookSourceNick(source_nick) and
+            msg.scope_kind == .channel and
+            msg.sender_route_id == null and msg.sender_member_modes == null and
+            msg.account.len == 0 and self.isVerifiedWebhookRelay(clean_msg, .verified);
+        if (verified_webhook and self.nickIsLiveLocal(source_nick)) return .permanent;
         // replica_proof is a portable session — it may override residence.
         // signed_member_modes is only the origin's assertion of mode bits: it
         // may skip the unknown-home retry (no residence yet), but must never
@@ -18937,7 +19626,7 @@ pub const LinuxServer = struct {
                     self.recordRelayHomeMismatch(clean_msg, home);
                     return .permanent;
                 },
-                .unknown => if (signed_member_modes == null and !signed_direct_residence)
+                .unknown => if (signed_member_modes == null and !signed_direct_residence and !verified_webhook)
                     return .{ .retry = .unknown_home_authority },
                 .match => {},
             }
@@ -18991,7 +19680,7 @@ pub const LinuxServer = struct {
                 // Topology is never channel-membership authority. A third-hop
                 // origin signature proves authorship, not +n bypass rights;
                 // only the separately authenticated webhook shape is external.
-                const allow_external = self.isVerifiedWebhookRelay(clean_msg, .verified);
+                const allow_external = verified_webhook;
                 if (self.world.channelHasFlag(msg.target, .no_external) and
                     !allow_external and replica_proof == null and signed_member_modes == null and
                     !self.remoteMemberOfChannelAtNode(msg.target, source_nick, msg.origin_node))
@@ -19032,11 +19721,7 @@ pub const LinuxServer = struct {
                     self.world.channelHasExtFlag(msg.target, .noformat) and
                     color_strip.hasFormatting(msg.text))
                 {
-                    effective_text = color_strip.stripFormattingWith(
-                        .{ .max_output_bytes = default_reply_bytes },
-                        msg.text,
-                        &noformat_buf,
-                    ) catch msg.text;
+                    effective_text = stripFormattingPreserveNonEmpty(msg.text, &noformat_buf);
                 }
                 if (local_sender_allowed and local_content_allowed) {
                     speech = self.relayChannelSpeechGate(
@@ -19217,6 +19902,7 @@ pub const LinuxServer = struct {
             .account = if (policy_account.len != 0) policy_account else null,
             .client_tags = safe_tags,
             .msgid = stable_msgid,
+            .is_bot = verified_webhook,
         };
         const relay_chatter = channelChatterOf(line);
 
@@ -19598,9 +20284,7 @@ pub const LinuxServer = struct {
                 self.world.channelHasExtFlag(clean_msg.target, .noformat) and
                 color_strip.hasFormatting(clean_msg.text))
             {
-                if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, clean_msg.text, &nf_text_buf)) |clean|
-                    eff_text = clean
-                else |_| {}
+                eff_text = stripFormattingPreserveNonEmpty(clean_msg.text, &nf_text_buf);
             }
             var channel_line_buf: [default_reply_bytes]u8 = undefined;
             const channel_line = if (clean_msg.verb == .tagmsg)
@@ -20118,6 +20802,9 @@ pub const LinuxServer = struct {
         // TOTP second-factor gate: lets the SASL completion path refuse a
         // knowledge-factor login (PLAIN/SCRAM) for a 2FA-active account.
         conn.session.sasl_totp_gate = .{ .ptr = self, .activeFn = totpGateActive };
+        // SCRAM rotation gate: bind only if the durable verifier still
+        // matches the fingerprint proved during the exchange.
+        conn.session.sasl_scram_gate = .{ .ptr = self, .matchesFn = scramCredentialGateMatches };
         // Account-status gate: refuses a SUSPENDED or FORBIDDEN account at SASL
         // success even when the mechanism verified (closes the SCRAM/OAUTHBEARER
         // status-bypass on the CAP AUTHENTICATE path).
@@ -20613,6 +21300,42 @@ pub const LinuxServer = struct {
             .realname = conn.session.realname(),
             .account = conn.session.account() orelse "",
             .signoff_time = @divTrunc(platform.realtimeMillis(), 1000),
+            .server = self.serverName(),
+        }) catch {};
+    }
+
+    /// Mesh-wide WHOWAS: an accepted remote quit records the same public
+    /// identity snapshot on every node that applies it, so WHOWAS answers do
+    /// not depend on which node homed the departed user. Only the public
+    /// host is retained, mirroring the local privacy rule. The delta's
+    /// realname field carries the quit reason on this path, so the generic
+    /// remote placeholder is stored instead of mislabeling the reason.
+    fn recordRemoteWhowas(self: *LinuxServer, delta: anytype) void {
+        if (delta.nick.len == 0 or delta.nick.len > client_model.MAX_NICK_BYTES) return;
+        var folded: [client_model.MAX_NICK_BYTES]u8 = undefined;
+        for (delta.nick, 0..) |byte, index| folded[index] = std.ascii.toLower(byte);
+        const hash = std.hash.Wyhash.hash(0, folded[0..delta.nick.len]);
+        const now_ms = self.nowMs();
+        if (self.remote_whowas_quit_seen and self.remote_whowas_quit_hash == hash and
+            now_ms >= self.remote_whowas_quit_at_ms and
+            now_ms - self.remote_whowas_quit_at_ms <= remote_quit_dedup_ms) return;
+        self.remote_whowas_quit_seen = true;
+        self.remote_whowas_quit_hash = hash;
+        self.remote_whowas_quit_at_ms = now_ms;
+        // A forwarded quit belongs to its accepted origin, never the ingress
+        // neighbor. Missing registry provenance remains explicitly unknown.
+        const origin_server = if (delta.source_provenance) |source|
+            self.relayOriginServerName(source.origin_node) orelse "unknown.mesh"
+        else
+            "unknown.mesh";
+        self.whowas.addOnQuit(.{
+            .nick = delta.nick,
+            .user = if (delta.username.len != 0) delta.username else world_projection.remote_user_placeholder,
+            .host = if (whowasHostOk(delta.host)) delta.host else default_host,
+            .realname = "Remote mesh user",
+            .account = delta.account,
+            .signoff_time = @divTrunc(platform.realtimeMillis(), 1000),
+            .server = origin_server,
         }) catch {};
     }
 
@@ -21287,7 +22010,12 @@ pub const LinuxServer = struct {
             self.assignConnClass(conn);
             if (self.enforceClassAdmission(conn)) return;
         }
-        try self.registerConnNick(id, conn);
+        self.registerConnNick(id, conn) catch {
+            emitServerLine(conn, "ERROR :Registration failed; try again later");
+            conn.close_reason = "Registration failed";
+            conn.closing = true;
+            return;
+        };
         if (conn.closing or conn.local_guest_registration_pending) return;
         // Complete the registration burst after the 001-005 numerics
         // (emitted by the dispatch welcome): LUSERS (251-255) then the
@@ -21376,10 +22104,17 @@ pub const LinuxServer = struct {
         for (bytes) |byte| {
             const line = (recvqPush(conn, byte) catch |err| switch (err) {
                 error.LineTooLong => {
+                    if (conn.tls_barrier_strict_lines) return error.LineTooLong;
+                    // Mesh-modern maxline policy: drop the overlong line with
+                    // 417 and keep the connection. The accumulator resets and
+                    // the rest of the line is discarded byte-by-byte (storing
+                    // nothing) until its LF.
                     logConnectionDiagnostic(conn, .recvq_limit, 0, err, .none);
-                    conn.closing = true;
                     self.stats.onError();
-                    return error.LineTooLong;
+                    recvqReset(conn);
+                    conn.recvq_discarding = byte != '\n';
+                    queueNumeric(conn, .ERR_INPUTTOOLONG, &.{}, "Input line too long") catch {};
+                    continue;
                 },
                 error.OutOfMemory => return error.OutOfMemory,
             }) orelse continue;
@@ -21421,6 +22156,15 @@ pub const LinuxServer = struct {
                 return;
             },
         };
+        // This prefix is reserved for authenticated server-authored webhooks.
+        // Preregistration dispatch has intentionally looser name validation,
+        // so enforce the reservation before it can stage NICK/USER or welcome.
+        if (std.ascii.eqlIgnoreCase(parsed.command, "NICK") and parsed.param_count != 0 and
+            std.mem.startsWith(u8, parsed.paramSlice()[0], "="))
+        {
+            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{parsed.paramSlice()[0]}, "Nickname reserved for webhooks");
+            return;
+        }
         const was_registered = conn.session.registered();
 
         // STATS m (RPL_STATSCOMMANDS): record this verb's usage. Counts every
@@ -21954,7 +22698,18 @@ pub const LinuxServer = struct {
     /// only inspect the published flag; a failed attempt is never retried over
     /// partially initialized module state. Detached drivers use this same path.
     fn ensureModuleRuntime(self: *LinuxServer) !void {
-        if (!self.module_runtime.engaged()) try self.module_runtime.start(self);
+        if (!self.module_runtime.engaged()) self.module_runtime.start(self) catch |err| {
+            if (self.module_runtime.startupFailure()) |failure| {
+                srvLog("onyx-server: module startup failed id={s} phase={s} error={s}\n", .{
+                    failure.id,
+                    if (failure.failed_phase) |phase| phase.token() else "unknown",
+                    if (failure.last_error) |cause| @errorName(cause) else @errorName(err),
+                });
+            } else {
+                srvLog("onyx-server: module startup failed error={s}\n", .{@errorName(err)});
+            }
+            return err;
+        };
         if (!self.module_runtime.online.load(.acquire)) return error.ModuleStartupFailed;
     }
 
@@ -22683,6 +23438,7 @@ pub const LinuxServer = struct {
                     .topics => self.sendTopicBurstTo(conn),
                     .opers => self.sendLocalOperBurstTo(conn),
                     .wards => self.sendMeshWardsTo(conn),
+                    .access_entries => self.sendAccessBurstTo(conn),
                     .clones => if (conn.s2s_secured) |link|
                         self.sendCloneAntiEntropy(conn, link)
                     else if (conn.s2s) |link|
@@ -22715,7 +23471,8 @@ pub const LinuxServer = struct {
                 .entity_props => .topics,
                 .topics => .opers,
                 .opers => .wards,
-                .wards => .clones,
+                .wards => .access_entries,
+                .access_entries => .clones,
                 .clones => .keytrans,
                 .keytrans => .idle,
             };
@@ -25384,11 +26141,12 @@ pub const LinuxServer = struct {
         conn.pending_identity_publication = null;
     }
 
-    fn appendRemoteIdentityChannel(self: *LinuxServer, output: *RemoteIdentityOutput, seen: *std.AutoHashMapUnmanaged(u64, void), channel: []const u8, bytes: []const u8, tag: []const u8) !void {
+    fn appendRemoteIdentityChannel(self: *LinuxServer, output: *RemoteIdentityOutput, seen: *std.AutoHashMapUnmanaged(u64, void), channel: []const u8, bytes: []const u8, tag: []const u8, required_cap: ?dispatch.CapId) !void {
         var members = self.world.memberIterator(channel) orelse return;
         while (members.next()) |member| {
             const id = clientIdFromWorld(member.*);
             const conn = self.connFor(id) orelse continue;
+            if (required_cap) |cap| if (!conn.session.hasCap(cap)) continue;
             if (conn.closing or conn.s2s != null or conn.s2s_secured != null or self.memberSkipsChatter(id, channelChatterOf(bytes))) continue;
             const entry = try seen.getOrPut(self.allocator, monitorIdFromClient(id));
             if (entry.found_existing) continue;
@@ -25420,7 +26178,7 @@ pub const LinuxServer = struct {
                 output.introduction = .{ .nick = delta.new_nick, .username = output.public.username, .host = output.public.host, .realname = delta.realname, .server = "", .server_info = null, .account = "", .real_host = "", .certfp = "", .origin_node = delta.origin_node, .roster_hlc = if (prior) |projection| projection.watermark else 0 };
                 const line = try std.fmt.bufPrint(&buffer, ":{s}!{s}@{s} NICK {s}\r\n", .{ delta.old_nick, output.public.username, output.public.host, delta.new_nick });
                 const tag = serverTimeTag(&tag_buffer);
-                for (delta.channels) |channel| try self.appendRemoteIdentityChannel(&output, &seen, channel, line, tag);
+                for (delta.channels) |channel| try self.appendRemoteIdentityChannel(&output, &seen, channel, line, tag, null);
             },
             .membership => |delta| {
                 const user = if (delta.username.len != 0) delta.username else world_projection.remote_user_placeholder;
@@ -25428,7 +26186,48 @@ pub const LinuxServer = struct {
                 switch (delta.kind) {
                     // Identity CHGHOST is already funded by the pre-route hook;
                     // the derived marker must never emit a second notification.
-                    .identity, .ghost_reclaim => {},
+                    .ghost_reclaim => {},
+                    .identity => {
+                        // IRCv3 account-notify for a remote identity change:
+                        // watchers on this node learn the mesh-propagated
+                        // account (login, or "*" on logout) exactly as they
+                        // would for a locally homed user. The CHGHOST itself
+                        // stays with the pre-route hook above.
+                        if (self.nickIsLiveLocal(delta.nick)) return output;
+                        if (delta.nick.len > client_model.MAX_NICK_BYTES) return output;
+                        // A login assertion is only ever rendered from a
+                        // residence-trusted roster account, never from a
+                        // relay-asserted display account. A logout ("*")
+                        // asserts less privilege and needs no proof.
+                        if (delta.account.len != 0) {
+                            const trusted = self.trustedRemoteAccountForNick(delta.nick) orelse return output;
+                            if (!std.ascii.eqlIgnoreCase(trusted, delta.account)) return output;
+                        }
+                        var key_buf: [client_model.MAX_NICK_BYTES + 1 + 64]u8 = undefined;
+                        const account_part = delta.account[0..@min(delta.account.len, 64)];
+                        for (delta.nick, 0..) |byte, index| key_buf[index] = std.ascii.toLower(byte);
+                        key_buf[delta.nick.len] = 0;
+                        @memcpy(key_buf[delta.nick.len + 1 ..][0..account_part.len], account_part);
+                        const hash = std.hash.Wyhash.hash(0, key_buf[0 .. delta.nick.len + 1 + account_part.len]);
+                        const now_ms = self.nowMs();
+                        if (self.remote_account_notify_seen and self.remote_account_notify_hash == hash and
+                            now_ms >= self.remote_account_notify_at_ms and
+                            now_ms - self.remote_account_notify_at_ms <= remote_quit_dedup_ms) return output;
+                        self.remote_account_notify_seen = true;
+                        self.remote_account_notify_hash = hash;
+                        self.remote_account_notify_at_ms = now_ms;
+                        const change: account_notify.AccountChange = if (delta.account.len == 0) .logout else .{ .login = delta.account };
+                        var body_buf: [512]u8 = undefined;
+                        const body = account_notify.buildAccountNotifyLine(&body_buf, .{ .nick = delta.nick, .user = user, .host = host }, change) catch return output;
+                        const line = try std.fmt.bufPrint(&buffer, "{s}\r\n", .{body});
+                        const tag = serverTimeTag(&tag_buffer);
+                        var channels = self.world.channelIterator();
+                        while (channels.next()) |channel| {
+                            const trigger = std.ascii.eqlIgnoreCase(channel.name, delta.channel);
+                            if (trigger or self.remoteNickInChannel(channel.name, delta.nick))
+                                try self.appendRemoteIdentityChannel(&output, &seen, channel.name, line, tag, .account_notify);
+                        }
+                    },
                     .joined => {
                         // Non-presence runs use the JOIN batch path. Preserve
                         // the existing legacy single-row fold's publication for
@@ -25436,7 +26235,7 @@ pub const LinuxServer = struct {
                         if (!legacy.hasClaim(delta.nick, delta.channel)) return output;
                         const line = try std.fmt.bufPrint(&buffer, ":{s}!{s}@{s} JOIN :{s}\r\n", .{ delta.nick, user, host, delta.channel });
                         const tag = serverTimeTag(&tag_buffer);
-                        try self.appendRemoteIdentityChannel(&output, &seen, delta.channel, line, tag);
+                        try self.appendRemoteIdentityChannel(&output, &seen, delta.channel, line, tag, null);
                         for (legacy.clients.items) |id| {
                             const entry = try seen.getOrPut(self.allocator, monitorIdFromClient(id));
                             if (!entry.found_existing) try output.append(self, id, line, tag);
@@ -25445,7 +26244,7 @@ pub const LinuxServer = struct {
                     .status => {
                         if (isPresenceChannel(delta.channel)) return output;
                         const line = try renderRemoteModeDiff(&buffer, delta.channel, delta.nick, server_host, delta.prev_status, delta.status, delta.setter);
-                        try self.appendRemoteIdentityChannel(&output, &seen, delta.channel, line, serverTimeTag(&tag_buffer));
+                        try self.appendRemoteIdentityChannel(&output, &seen, delta.channel, line, serverTimeTag(&tag_buffer), null);
                     },
                     .parted => {
                         const local = self.nickIsLiveLocal(delta.nick);
@@ -25468,11 +26267,11 @@ pub const LinuxServer = struct {
                             while (channels.next()) |channel| {
                                 const trigger = !isPresenceChannel(delta.channel) and std.ascii.eqlIgnoreCase(channel.name, delta.channel);
                                 if (trigger or self.remoteNickInChannel(channel.name, delta.nick))
-                                    try self.appendRemoteIdentityChannel(&output, &seen, channel.name, line, tag);
+                                    try self.appendRemoteIdentityChannel(&output, &seen, channel.name, line, tag, null);
                             }
                         } else if (!isPresenceChannel(delta.channel) or legacy_member) {
                             const line = try std.fmt.bufPrint(&buffer, ":{s}!{s}@{s} PART {s}\r\n", .{ delta.nick, user, host, delta.channel });
-                            try self.appendRemoteIdentityChannel(&output, &seen, delta.channel, line, serverTimeTag(&tag_buffer));
+                            try self.appendRemoteIdentityChannel(&output, &seen, delta.channel, line, serverTimeTag(&tag_buffer), null);
                         }
                     },
                 }
@@ -25587,7 +26386,11 @@ pub const LinuxServer = struct {
             .nick => |delta| self.retireRemoteVisibleIfDeparted(delta.old_nick),
             .membership => |*delta| {
                 if (delta.kind == .ghost_reclaim) self.reclaimGhostSession(delta);
-                if (delta.kind == .parted) self.retireRemoteVisibleIfDeparted(delta.nick);
+                if (delta.kind == .parted) {
+                    if (std.mem.eql(u8, delta.setter, mesh_quit_setter) and !self.nickIsLiveLocal(delta.nick))
+                        self.recordRemoteWhowas(delta);
+                    self.retireRemoteVisibleIfDeparted(delta.nick);
+                }
             },
         }
         // Prepared World/channel views end while their original delta strings
@@ -26626,6 +27429,7 @@ pub const LinuxServer = struct {
         if (!conn.ownsActiveMeshLink(link)) return false;
         if (link.outbound().len == 0) return true;
         if (id.shard != self.rx().shard_id) {
+            self.reactors[id.shard].retained_mesh_outbound_pending.store(true, .release);
             self.wakeShard(id.shard);
             return false;
         }
@@ -27710,7 +28514,11 @@ pub const LinuxServer = struct {
             // external metadata only after it succeeds so a failed JOIN cannot
             // destroy a prior incarnation's durable policy.
             self.props.clearChannel(join_target);
-            _ = self.access.clear(.{ .channel = join_target }) catch {};
+            self.access.now_seconds = self.accessNowSeconds();
+            self.syncAccessLocalNode();
+            const access_hlc_before = self.access.hlc;
+            if ((self.access.clear(.{ .channel = join_target }) catch null) != null)
+                self.broadcastAccessChangesSince(access_hlc_before, join_target);
             // KEEPTOPIC: restore a registered channel's saved topic on recreation,
             // so a topic the founder set isn't lost when the channel empties.
             if (self.account_services) |kt| {
@@ -28041,16 +28849,43 @@ pub const LinuxServer = struct {
                 if (self.rosterRefused(ch.name)) continue;
                 try self.sendNames(conn, ch.name);
             }
+            // A channel can be fully converged in the established S2S route
+            // rosters before this node has any local World row for it. Include
+            // that remote-only half of the mesh union too; the helper excludes
+            // World channels, so the two passes cannot emit a channel twice.
+            const remote_only = self.remoteOnlyChannelNames() catch &.{};
+            defer self.allocator.free(remote_only);
+            for (remote_only) |name| {
+                if (self.globalMemberCount(name, 0) == 0) continue;
+                if (self.rosterRefused(name)) continue;
+                if (!viewer_is_oper and self.remoteChannelSecret(name)) continue;
+                try self.sendNames(conn, name);
+            }
             return;
         }
 
         const channel = parsed.paramSlice()[0];
         if (!self.world.channelExists(channel)) {
-            if (world_model.isChannelName(channel)) {
-                try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
-            } else {
+            if (!world_model.isChannelName(channel)) {
                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
+                return;
             }
+            // Established route rosters are the authoritative remote membership
+            // projection. A nonempty roster makes this a real remote-only
+            // channel for NAMES even when no local member has materialized a
+            // World row yet. Remote +s still hides the roster fail-closed from
+            // non-opers; +p/+h state materializes World during mode convergence.
+            if (self.rosterRefused(channel)) {
+                try self.failReply(conn, "NAMES", "MEMBERSHIP_SEALED", "Channel roster is sealed");
+                return;
+            }
+            if (self.globalMemberCount(channel, 0) == 0 or
+                (!conn.session.isOper() and self.remoteChannelSecret(channel)))
+            {
+                try queueNumeric(conn, .RPL_ENDOFNAMES, &.{channel}, "End of /NAMES list");
+                return;
+            }
+            try self.sendNames(conn, channel);
             return;
         }
         // A sealed room has no clear member list, including for members and opers.
@@ -31139,7 +31974,14 @@ pub const LinuxServer = struct {
             .certfp = if (requester_is_oper and remote.certfp.len != 0) remote.certfp else null,
             .geo = special,
         };
-        whois.writeWhois(sink, self.serverName(), conn.session.displayName(), subject) catch return;
+        whois.writeWhois(sink, self.serverName(), conn.session.displayName(), subject) catch {
+            // Mirror the local path: never leave a remote WHOIS unterminated
+            // when the full burst cannot be built.
+            sink.reset();
+            whois.writeEndOfWhois(sink, self.serverName(), conn.session.displayName(), remote.nick) catch return;
+            for (sink.slice()) |line| try appendToConn(conn, line.bytes);
+            return;
+        };
         if (conn.reply_capture) |capture| if (capture.remote_introductions) |captured| try captured.prepare(remote, .public_host);
         var introduction = try self.prepareRemoteHostIntroduction(conn, remote, .public_host);
         defer introduction.deinit();
@@ -31447,17 +32289,18 @@ pub const LinuxServer = struct {
             return;
         }
         const target = parsed.paramSlice()[0];
+        const configured_max: usize = @min(@as(usize, @intCast(self.config.whowas_max_entries)), max_whowas_results);
         const requested_count = if (parsed.param_count >= 2)
-            std.fmt.parseInt(usize, parsed.paramSlice()[1], 10) catch 16
+            std.fmt.parseInt(usize, parsed.paramSlice()[1], 10) catch configured_max
         else
-            16;
-        const max_results = @min(requested_count, 16);
+            configured_max;
+        const max_results = @min(requested_count, configured_max);
 
-        var records: [16]whowas.Record = undefined;
+        var records: [max_whowas_results]whowas.Record = undefined;
         const found = self.whowas.query(target, max_results, &records) catch records[0..0];
         const n = found.len;
 
-        var entries: [16]whowas_reply.HistoryEntry = undefined;
+        var entries: [max_whowas_results]whowas_reply.HistoryEntry = undefined;
         for (found, 0..) |rec, i| {
             entries[i] = .{
                 .nick = rec.nick,
@@ -31466,7 +32309,7 @@ pub const LinuxServer = struct {
                 .realname = rec.realname,
                 .account = rec.account,
                 .signoff_time = rec.signoff_time,
-                .server = self.serverName(),
+                .server = if (rec.server.len != 0) rec.server else self.serverName(),
             };
         }
 
@@ -34628,6 +35471,14 @@ pub const LinuxServer = struct {
         return self.totpRequired(account);
     }
 
+    /// `sasl.ScramCredentialGate` adapter: re-checks the proved SCRAM
+    /// verifier fingerprint against the durable account store at bind time.
+    fn scramCredentialGateMatches(ptr: *anyopaque, account: []const u8, fingerprint: sasl.ScramCredentialFingerprint) bool {
+        const self: *LinuxServer = @ptrCast(@alignCast(ptr));
+        const svc = self.account_services orelse return false;
+        return svc.scramCredentialMatches(account, fingerprint);
+    }
+
     /// `sasl.AccountStatusGate` adapter: lets the SASL completion path (which
     /// holds only the session) refuse a SUSPENDED or FORBIDDEN account through an
     /// installed fat pointer. This is the chokepoint that closes the SCRAM /
@@ -37591,10 +38442,18 @@ pub const LinuxServer = struct {
             // connected-client guarantee.
             counts.clients_expected += 1;
             if (!e.value.session.registered()) continue;
+            // Older preregistration dispatch could admit this now-reserved
+            // synthetic namespace. Refuse capture until that client renames.
+            if (std.mem.startsWith(u8, e.value.session.displayName(), "=")) continue;
             // An open draft/multiline batch owns accepted chunks that are not
             // part of the session capsule. Refuse the whole upgrade until the
             // batch closes, instead of losing its prefix after COMMIT.
             if (e.value.multiline != null) continue;
+            // The current capsule does not carry discard-until-LF framing.
+            // Keep this transport live and refuse the whole upgrade until its
+            // oversized line ends; adopting its suffix as a fresh command would
+            // change the accepted input stream.
+            if (e.value.recvq_discarding) continue;
             var flood_carry: ?flood_guard.CarryState = null;
             if (e.value.flood_guard) |*guard| flood_carry = guard.exportCarry() catch continue;
             // A carried client's socket fd is the exact join key for every
@@ -38041,6 +38900,7 @@ pub const LinuxServer = struct {
         webpush_overflow_delivery,
         webtransport_listener,
         acme_companion,
+        media_recording,
         media_rooms,
         media_plane,
         native_media,
@@ -38088,6 +38948,13 @@ pub const LinuxServer = struct {
         }
         if (self.acme_reload_tls != null and (builtin.os.tag != .windows or self.acme_worker == null))
             return .acme_companion;
+        // Neither active journals nor retired writers awaiting a manifest
+        // have a Helix capsule. Room state can already be gone while retired
+        // custody remains, and Windows room carry does not carry these files.
+        lockSpin(&self.media_recorder_mu);
+        const owns_recording = self.media_recorder_head != null;
+        self.media_recorder_mu.unlock();
+        if (owns_recording) return .media_recording;
         const windows_media_checkpoint = builtin.os.tag == .windows and self.config.media_enabled;
         if (!windows_media_checkpoint and !self.media_rooms.upgradeContinuityReady()) return .media_rooms;
         // Windows seals a configured media Domain with both paused UDP owners
@@ -38120,6 +38987,7 @@ pub const LinuxServer = struct {
             .webpush_overflow_delivery => "accepted Webpush overflow delivery",
             .webtransport_listener => "WebTransport listener",
             .acme_companion => "ACME renewal companion",
+            .media_recording => "media recording journal or pending manifest",
             .media_rooms => "media room control state",
             .media_plane => "WebRTC media transport state",
             .native_media => "native media transport state",
@@ -42718,10 +43586,12 @@ pub const LinuxServer = struct {
             &self.e2ee_group_mesh_authority,
             &e2ee_group_replay_replacement,
         );
-        if (access_replacement) |*replacement|
-            std.mem.swap(ircx_access_store.AccessStore, &self.access, replacement)
-        else
-            unreachable;
+        if (access_replacement) |*replacement| {
+            std.mem.swap(ircx_access_store.AccessStore, &self.access, replacement);
+            // A checkpoint written before ACCESS mesh replication restores
+            // `local_node = 0`; rebind it so post-adopt writes can originate.
+            self.syncAccessLocalNode();
+        } else unreachable;
         if (saccess_replacement) |*replacement|
             std.mem.swap(ircx_saccess.ServerAccessStore, &self.saccess, replacement)
         else
@@ -43549,6 +44419,10 @@ pub const LinuxServer = struct {
     }
 
     fn adoptInheritedClientWithHost(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot, close_fd_on_failure: bool, host_row: ?host_presentation_snapshot.Row) bool {
+        if (std.mem.startsWith(u8, snap.nick, "=")) {
+            if (close_fd_on_failure) closeFd(snap.fd);
+            return false;
+        }
         const guest_id_present = !std.mem.allEqual(u8, &snap.guest_incarnation, 0);
         const guest_metadata_present = snap.guest_revision != 0 and
             snap.guest_claim_revision != 0 and snap.guest_claim_hlc != 0;
@@ -44912,14 +45786,59 @@ pub const LinuxServer = struct {
         const fd: linux.fd_t = if (builtin.os.tag == .openbsd or builtin.os.tag == .windows)
             os_runtime.openTruncateZ(path_buf[0..path.len :0], 0o600) catch return
         else blk: {
-            const opened = linux.open(path_buf[0..path.len :0], .{
-                .ACCMODE = .WRONLY,
-                .CREAT = true,
-                .TRUNC = true,
-                .CLOEXEC = true,
-            }, 0o600);
-            if (linux.errno(opened) != .SUCCESS) return;
-            break :blk @intCast(opened);
+            // Mirror the persistent daemon-log custody checks: never follow a
+            // symlink or truncate a shared, foreign-owned, non-regular, or
+            // loosely-moded inode that an operator path may have been pointed at.
+            const opened = while (true) {
+                const result = linux.open(path_buf[0..path.len :0], .{
+                    .ACCMODE = .WRONLY,
+                    .CREAT = true,
+                    .NOFOLLOW = true,
+                    .NONBLOCK = true,
+                    .CLOEXEC = true,
+                }, 0o600);
+                switch (linux.errno(result)) {
+                    .SUCCESS => break result,
+                    .INTR => continue,
+                    else => return,
+                }
+            };
+            const candidate: linux.fd_t = @intCast(opened);
+            var stat: linux.Statx = std.mem.zeroes(linux.Statx);
+            while (true) {
+                switch (linux.errno(linux.statx(candidate, "", linux.AT.EMPTY_PATH, .{
+                    .TYPE = true,
+                    .MODE = true,
+                    .UID = true,
+                    .NLINK = true,
+                }, &stat))) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => {
+                        os_runtime.close(candidate);
+                        return;
+                    },
+                }
+            }
+            if (!stat.mask.TYPE or !stat.mask.MODE or !stat.mask.UID or !stat.mask.NLINK or
+                (stat.mode & linux.S.IFMT) != linux.S.IFREG or
+                stat.uid != linux.geteuid() or stat.nlink != 1 or
+                (stat.mode & 0o7777) != 0o600)
+            {
+                os_runtime.close(candidate);
+                return;
+            }
+            while (true) {
+                switch (linux.errno(linux.ftruncate(candidate, 0))) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => {
+                        os_runtime.close(candidate);
+                        return;
+                    },
+                }
+            }
+            break :blk candidate;
         };
         defer os_runtime.close(fd);
 
@@ -48488,6 +49407,7 @@ pub const LinuxServer = struct {
         // Refresh the store clock so ADD stamps a correct absolute expiry and
         // LIST/CLEAR see currently-lapsed timed entries as gone.
         self.access.now_seconds = self.accessNowSeconds();
+        self.syncAccessLocalNode();
         const ctx = ircx_access_store.ReplyContext{ .server_name = self.serverName(), .requester = conn.session.displayName() };
         var buf: [default_reply_bytes]u8 = undefined;
         switch (req) {
@@ -48521,10 +49441,12 @@ pub const LinuxServer = struct {
                     const detail = std.fmt.bufPrint(&detail_buf, "ADD {s} {s}", .{ a.level.token(), a.mask }) catch "ADD";
                     self.auditOverrideUse(conn, "ACCESS", a.channel, detail);
                 }
+                const access_hlc_before = self.access.hlc;
                 self.access.add(a.channel, a.level, a.mask, conn.session.displayName(), a.timeout) catch {
                     try queueNumeric(conn, .ERR_NOPRIVILEGES, &.{a.channel}, "Cannot add ACCESS entry");
                     return;
                 };
+                self.broadcastAccessChangesSince(access_hlc_before, a.channel);
                 const ev = ircx_access_store.EntryView{
                     .channel = a.channel,
                     .level = a.level,
@@ -48549,7 +49471,12 @@ pub const LinuxServer = struct {
                     const detail = std.fmt.bufPrint(&detail_buf, "DELETE {s} {s}", .{ d.level.token(), d.mask }) catch "DELETE";
                     self.auditOverrideUse(conn, "ACCESS", d.channel, detail);
                 }
-                _ = self.access.remove(d.channel, d.level, d.mask) catch false;
+                const access_hlc_before = self.access.hlc;
+                // A missed DELETE still stamps a tombstone (it may retract an
+                // in-flight ADD), so originate whenever the store accepted
+                // the write, not only when a local row existed.
+                if ((self.access.remove(d.channel, d.level, d.mask) catch null) != null)
+                    self.broadcastAccessChangesSince(access_hlc_before, d.channel);
                 if (ircx_access_store.buildAccessDelete(&buf, ctx, d)) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
@@ -48570,7 +49497,9 @@ pub const LinuxServer = struct {
                         "CLEAR *";
                     self.auditOverrideUse(conn, "ACCESS", sel.channel, detail);
                 }
-                _ = self.access.clear(sel) catch 0;
+                const access_hlc_before = self.access.hlc;
+                if ((self.access.clear(sel) catch null) != null)
+                    self.broadcastAccessChangesSince(access_hlc_before, sel.channel);
                 if (ircx_access_store.buildAccessEnd(&buf, ctx, sel.channel)) |line| {
                     try appendToConn(conn, line);
                 } else |_| {}
@@ -48604,13 +49533,17 @@ pub const LinuxServer = struct {
                     const od = std.fmt.bufPrint(&od_buf, "COPY {s}", .{c.source}) catch "COPY";
                     self.auditOverrideUse(conn, "ACCESS", c.destination, od);
                 }
+                const access_hlc_before = self.access.hlc;
                 const result = self.access.copyFrom(c.destination, c.source, c.mode) catch {
-                    // Fail closed and SAY so: `copyFrom` sizes the template up
-                    // front, so a store that cannot fit it leaves the destination
-                    // untouched rather than half-copied.
+                    // A REPLACE copy clears the destination before its sizing
+                    // check can refuse, so this failure may already have
+                    // stamped local tombstones. Originate whatever actually
+                    // changed or the mesh would diverge permanently.
+                    self.broadcastAccessChangesSince(access_hlc_before, c.destination);
                     try self.failReply(conn, "ACCESS", "ACCESS_COPY_FAILED", "Cannot copy ACCESS template");
                     return;
                 };
+                self.broadcastAccessChangesSince(access_hlc_before, c.destination);
                 // Deliberately NO bare 805 here. A client folds 803 -> 804* -> 805
                 // and commits whatever it buffered, so an 805 with no preceding
                 // burst commits an EMPTY list — which is correct after CLEAR but
@@ -53871,6 +54804,13 @@ pub const LinuxServer = struct {
         // a previously issued MTOKEN cannot resurrect the deleted account from a
         // mesh replica.
         _ = self.removeAllTrackedSessions(account);
+        // Runtime authentication proofs are separate from the durable rows
+        // removed by Services.dropAccount. In particular, an email reset code
+        // must not carry over to a same-name re-registration, and lazily loaded
+        // verification/TOTP state must not survive the committed deletion.
+        _ = self.reset_store.cancel(account);
+        _ = self.account_verifies.cancel(account);
+        _ = self.totp.disable(account);
         // Hand any channels this account founded to their configured successors.
         self.promoteSuccessorsForDroppedFounder(account);
         var buf: [default_reply_bytes]u8 = undefined;
@@ -63912,8 +64852,10 @@ pub const LinuxServer = struct {
                     self.deliverOperEventV2Local(event, event_id, .service, .warn, event.subject);
                     self.meshBroadcastAuthoredOperEventV2(event);
                 } else {
+                    // No sovereign EventId was minted for this delivery, so
+                    // Mesh-modern authorship stops at local delivery: an
+                    // unsigned V1 copy must not originate here.
                     self.deliverOperEventLocal(delivery.origin, .service, .warn, webpush_mod.overflow_oper_message, webpush_mod.overflow_oper_message);
-                    self.meshBroadcastOperEvent(.service, .warn, webpush_mod.overflow_oper_message);
                 }
                 delivery.fanout_published = true;
             }
@@ -66337,6 +67279,24 @@ pub const LinuxServer = struct {
         try appendToConn(conn, line);
     }
 
+    /// Emit a message-delivery failure scoped to one target. A single
+    /// PRIVMSG may name several targets and earlier targets may already have
+    /// been accepted, so a target-less FAIL would falsely describe the whole
+    /// command as failed. Keep the target in both the negotiated standard
+    /// reply and the legacy server-NOTICE fallback.
+    fn messageFailReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, target: []const u8, reason: []const u8) !void {
+        if (dispatch.hasControlByte(command) or dispatch.hasControlByte(code) or dispatch.hasControlByte(target) or dispatch.hasControlByte(reason)) return;
+        if (!conn.session.hasCap(.standard_replies)) {
+            var notice_buf: [default_reply_bytes]u8 = undefined;
+            const notice = std.fmt.bufPrint(&notice_buf, "FAIL {s} {s} {s}: {s}", .{ command, code, target, reason }) catch return;
+            try self.noticeTo(conn, notice);
+            return;
+        }
+        var buf: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "FAIL {s} {s} {s} :{s}\r\n", .{ command, code, target, reason }) catch return;
+        try appendToConn(conn, line);
+    }
+
     /// Emit a retryable IRCv3 `WARN`. Unlike `FAIL`, clients must retain the
     /// credential/state needed to retry the operation.
     fn warnReply(self: *LinuxServer, conn: *ConnState, command: []const u8, code: []const u8, reason: []const u8) !void {
@@ -66694,6 +67654,32 @@ pub const LinuxServer = struct {
         self.publishOperEvent(.flood, .warn, msg) catch {};
     }
 
+    /// Best-effort operator telemetry for retryable PRIVMSG/NOTICE admission
+    /// rejection. Keep the record stable and bounded, omit the message body,
+    /// and scope it to the attempted target so ordinary Event Spine collapse and
+    /// subject filters bound repeated pressure without hiding distinct targets.
+    fn publishMessageBusyReject(
+        self: *LinuxServer,
+        conn: *const ConnState,
+        command: []const u8,
+        target: []const u8,
+        reason: []const u8,
+    ) void {
+        const actor = conn.session.displayName();
+        var buf: [event_history_mod.max_message_len]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &buf,
+            "MESSAGE_BUSY_REJECT actor={s} command={s} target={s} reason={s}",
+            .{
+                actor[0..@min(actor.len, 64)],
+                command[0..@min(command.len, 16)],
+                target[0..@min(target.len, 192)],
+                reason[0..@min(reason.len, 64)],
+            },
+        ) catch return;
+        self.publishOperEventSubject(.@"error", .notice, msg, target) catch {};
+    }
+
     /// `SPAMTRAP <ADD|DEL> <NICK|CHAN> <target>` / `SPAMTRAP LIST` — operators
     /// manage the honeypot registry. Oper-gated (client_moderate).
     pub fn handleSpamtrap(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -66740,11 +67726,13 @@ pub const LinuxServer = struct {
         }
 
         // A node without a sovereign signing identity cannot author OEVT v2.
-        // Retain deployed direct-leaf v1 behavior; peers never re-flood it.
+        // Mesh-modern: unsigned V1 authorship is retired, so the event is
+        // delivered locally (history, stats, subscribers, webhooks) and
+        // never originates onto the mesh. Receiving V1 from rolling-old
+        // peers stays in `drainOperEvents` as a terminal leaf.
         self.event_history.record(@backingInt(category), @backingInt(severity), platform.realtimeMillis(), self.serverName(), message);
         self.event_stats.record(@backingInt(category), @backingInt(severity));
         self.deliverOperEventLocal(self.serverName(), category, severity, subject, message);
-        self.meshBroadcastOperEvent(category, severity, message);
         self.deliverOutboundWebhooks(category, severity, message);
     }
 
@@ -66788,14 +67776,14 @@ pub const LinuxServer = struct {
             self.deliverOutboundWebhooks(category, severity, message);
             return .{ .accepted_v2 = event_id };
         }
-        // Existing direct local/v1 mode needs no sovereign EventId. Preserve
-        // its bounded legacy history representation and full local/direct-leaf
-        // delivery; do not invent exact-v2 replay guarantees or narrow its
-        // previously accepted server-name/body limits.
+        // Local-only mode needs no sovereign EventId. Preserve its bounded
+        // legacy history representation and full local delivery; do not
+        // invent exact-v2 replay guarantees or narrow its previously
+        // accepted server-name/body limits. Unsigned V1 mesh authorship is
+        // retired, so nothing originates onto the mesh from here.
         self.event_history.record(@backingInt(category), @backingInt(severity), platform.realtimeMillis(), self.serverName(), message);
         self.event_stats.record(@backingInt(category), @backingInt(severity));
         self.deliverOperEventLocal(self.serverName(), category, severity, subject, message);
-        self.meshBroadcastOperEvent(category, severity, message);
         self.deliverOutboundWebhooks(category, severity, message);
         return .accepted_legacy;
     }
@@ -67091,31 +68079,6 @@ pub const LinuxServer = struct {
                 } else if (slot.value.s2s) |link| {
                     if (!link.established()) continue;
                     link.sendOperEvent(event.category, event.severity, event.origin_server, event.message) catch continue;
-                    self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
-                    link.clearOutbound();
-                }
-            }
-        }
-    }
-
-    /// Fan a locally-raised Event-Spine event to every established mesh peer as a
-    /// signed OPER_EVENT, carrying our server name as the origin. Best-effort; a
-    /// send failure to one peer never blocks the others or the local delivery.
-    fn meshBroadcastOperEvent(self: *LinuxServer, category: event_spine.EventCategory, severity: event_spine.EventSeverity, message: []const u8) void {
-        const cat: u6 = @backingInt(category);
-        const sev: u8 = @backingInt(severity);
-        const origin = self.serverName();
-        for (self.reactors) |*reactor| {
-            for (reactor.clients.slots.items, 0..) |*slot, i| {
-                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
-                const pid = slotClientId(reactor, i, slot.gen);
-                if (slot.value.s2s_secured) |link| {
-                    if (!link.established()) continue;
-                    link.sendOperEvent(cat, sev, origin, message) catch continue;
-                    _ = self.flushSecuredS2sOutboundTo(pid, link);
-                } else if (slot.value.s2s) |link| {
-                    if (!link.established()) continue;
-                    link.sendOperEvent(cat, sev, origin, message) catch continue;
                     self.flushS2sOutboundTo(pid, link.outbound()) catch continue;
                     link.clearOutbound();
                 }
@@ -67827,6 +68790,279 @@ pub const LinuxServer = struct {
                 const link = slot.value.s2s_secured orelse continue;
                 if (!link.established() or !link.supportsEventSpineV2()) continue;
                 const emitted = link.forwardOperEventV2(wire) catch continue;
+                if (!emitted) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
+            }
+        }
+    }
+
+    /// Keep the ACCESS store's write-stamp origin aligned with the live node
+    /// identity. Stores restored from checkpoints written before mesh
+    /// replication carry `local_node = 0`; without this refresh their writes
+    /// could never be origin-signed (0 never equals the self-certifying
+    /// short id) and would silently stay node-local.
+    fn syncAccessLocalNode(self: *LinuxServer) void {
+        if (self.config.node_identity) |identity| self.access.local_node = identity.shortId();
+    }
+
+    /// Stamp one locally authored ACCESS fact with this node's self-contained
+    /// origin signature. `pk_buf`/`sig_buf` back the returned event's slices
+    /// and must outlive every encode/send of it. Null when this node has no
+    /// identity or the fact does not claim this node as its origin.
+    fn signAccessEvent(
+        self: *LinuxServer,
+        event: ircx_access_event.AccessEvent,
+        pk_buf: *[ircx_access_event.pubkey_len]u8,
+        sig_buf: *[ircx_access_event.sig_len]u8,
+    ) ?ircx_access_event.AccessEvent {
+        const identity = self.config.node_identity orelse return null;
+        if (event.origin_node != identity.shortId()) return null;
+        const transcript = ircx_access_event.originTranscript(self.allocator, event) catch return null;
+        defer self.allocator.free(transcript);
+        var signed = event;
+        ircx_access_event.signInPlace(&signed, &identity.sign_kp, transcript, pk_buf, sig_buf) catch return null;
+        return signed;
+    }
+
+    /// Record one signed fact's exact-wire identity in the daemon-global
+    /// guard so a copy returning by another mesh path is neither re-applied
+    /// nor re-forwarded. Best-effort: the guard is a loop-breaker, while the
+    /// store's (hlc, origin) LWW is the convergence authority.
+    fn observeAccessEventGuard(self: *LinuxServer, signed: ircx_access_event.AccessEvent) void {
+        const need = ircx_access_event.encodedLen(signed) catch return;
+        const buf = self.allocator.alloc(u8, need) catch return;
+        defer self.allocator.free(buf);
+        const wire = ircx_access_event.encode(signed, buf) catch return;
+        _ = self.access_event_seen.observe(s2s_peer_mod.S2sPeer.accessEventIdForWire(wire));
+    }
+
+    /// Flood one locally authored, not-yet-signed ACCESS fact to every
+    /// ACCESS_EVENT_V1-capable secured peer. Signing happens exactly once
+    /// here; relays forward the stamped byte image verbatim.
+    fn broadcastAccessEvent(self: *LinuxServer, event: ircx_access_event.AccessEvent) void {
+        var pk_buf: [ircx_access_event.pubkey_len]u8 = undefined;
+        var sig_buf: [ircx_access_event.sig_len]u8 = undefined;
+        const signed = self.signAccessEvent(event, &pk_buf, &sig_buf) orelse return;
+        self.observeAccessEventGuard(signed);
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsAccessEventV1()) continue;
+                const emitted = link.sendAccessEvent(signed) catch continue;
+                if (!emitted) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
+            }
+        }
+    }
+
+    /// One ACCESS change snapshotted out of the store before any link send.
+    /// Sends can page burst ciphertext (which re-reads the store through the
+    /// access burst stage), so the fact rows are owned copies, never borrows
+    /// of store memory held across a flush.
+    const AccessFactRow = struct {
+        present: bool,
+        hlc: u64,
+        channel: []u8,
+        level: ircx_access_store.Level,
+        mask: []u8,
+        set_by: []u8,
+        duration: u64,
+    };
+
+    /// Originate every locally authored ACCESS change stamped strictly after
+    /// `before_hlc` (the store clock captured before the mutation). Covers
+    /// adds and tombstones alike, including the multi-row clear/copy stamps,
+    /// without each call site enumerating rows. `channel_filter` scopes the
+    /// scan to the mutated channel when one is known.
+    fn broadcastAccessChangesSince(self: *LinuxServer, before_hlc: u64, channel_filter: ?[]const u8) void {
+        const identity = self.config.node_identity orelse return;
+        const local_node = identity.shortId();
+        if (local_node == 0) return;
+
+        var rows: std.ArrayList(AccessFactRow) = .empty;
+        defer {
+            for (rows.items) |row| {
+                self.allocator.free(row.channel);
+                self.allocator.free(row.mask);
+                self.allocator.free(row.set_by);
+            }
+            rows.deinit(self.allocator);
+        }
+
+        for (self.access.entries.items) |entry| {
+            if (entry.origin_node != local_node or entry.hlc <= before_hlc) continue;
+            if (channel_filter) |channel| {
+                if (!std.ascii.eqlIgnoreCase(channel, entry.channel)) continue;
+            }
+            const channel = self.allocator.dupe(u8, entry.channel) catch return;
+            const mask = self.allocator.dupe(u8, entry.mask) catch {
+                self.allocator.free(channel);
+                return;
+            };
+            const set_by = self.allocator.dupe(u8, entry.set_by) catch {
+                self.allocator.free(channel);
+                self.allocator.free(mask);
+                return;
+            };
+            rows.append(self.allocator, .{
+                .present = true,
+                .hlc = entry.hlc,
+                .channel = channel,
+                .level = entry.level,
+                .mask = mask,
+                .set_by = set_by,
+                .duration = entry.duration orelse 0,
+            }) catch {
+                self.allocator.free(channel);
+                self.allocator.free(mask);
+                self.allocator.free(set_by);
+                return;
+            };
+        }
+        for (self.access.tombstones.items) |marker| {
+            if (marker.origin_node != local_node or marker.hlc <= before_hlc) continue;
+            if (channel_filter) |channel| {
+                if (!std.ascii.eqlIgnoreCase(channel, marker.channel)) continue;
+            }
+            const channel = self.allocator.dupe(u8, marker.channel) catch return;
+            const mask = self.allocator.dupe(u8, marker.mask) catch {
+                self.allocator.free(channel);
+                return;
+            };
+            const set_by = self.allocator.dupe(u8, "") catch {
+                self.allocator.free(channel);
+                self.allocator.free(mask);
+                return;
+            };
+            rows.append(self.allocator, .{
+                .present = false,
+                .hlc = marker.hlc,
+                .channel = channel,
+                .level = marker.level,
+                .mask = mask,
+                .set_by = set_by,
+                .duration = 0,
+            }) catch {
+                self.allocator.free(channel);
+                self.allocator.free(mask);
+                self.allocator.free(set_by);
+                return;
+            };
+        }
+
+        for (rows.items) |row| {
+            self.broadcastAccessEvent(.{
+                .present = row.present,
+                .origin_node = local_node,
+                .hlc = row.hlc,
+                .channel = row.channel,
+                .level = row.level,
+                .mask = row.mask,
+                .set_by = row.set_by,
+                .duration = row.duration,
+            });
+        }
+    }
+
+    /// Ship this node's locally authored ACCESS entries and tombstones to one
+    /// freshly established (or anti-entropy refreshed) secured peer. Only
+    /// self-originated facts can be re-signed here; foreign-origin facts
+    /// reach a new peer when their origin bursts to any neighbor and the
+    /// drain path floods the exact wire onward. Timed entries ship with
+    /// their original authored duration (sign-once); each receiver derives
+    /// its own absolute expiry, and the store refuses timed facts whose
+    /// origin-side lifetime already lapsed.
+    fn sendAccessBurstTo(self: *LinuxServer, conn: *ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
+        const link = conn.s2s_secured orelse return true;
+        if (!link.established() or !link.supportsAccessEventV1()) return true;
+        const identity = self.config.node_identity orelse return true;
+        const local_node = identity.shortId();
+        if (local_node == 0) return true;
+
+        self.access.now_seconds = self.accessNowSeconds();
+        const now = self.access.now_seconds;
+        var pk_buf: [ircx_access_event.pubkey_len]u8 = undefined;
+        var sig_buf: [ircx_access_event.sig_len]u8 = undefined;
+
+        for (self.access.entries.items) |entry| {
+            if (entry.origin_node != local_node) continue;
+            if (entry.expires_at) |expires_at| {
+                if (now >= expires_at) continue;
+            }
+            // Ship the ORIGINAL authored duration, never a locally recomputed
+            // remainder: the origin signature is sign-once over immutable
+            // fields, and re-signing a mutated duration at the same
+            // (hlc, origin) rank would create two valid wires for one fact
+            // whose LWW winner is first-arriver — permanent divergence.
+            // Receivers derive their own absolute expiry from their clock.
+            const duration: u64 = entry.duration orelse 0;
+            const signed = self.signAccessEvent(.{
+                .present = true,
+                .origin_node = local_node,
+                .hlc = entry.hlc,
+                .channel = entry.channel,
+                .level = entry.level,
+                .mask = entry.mask,
+                .set_by = entry.set_by,
+                .duration = duration,
+            }, &pk_buf, &sig_buf) orelse return false;
+            _ = link.sendAccessEvent(signed) catch return false;
+            self.observeAccessEventGuard(signed);
+        }
+        for (self.access.tombstones.items) |marker| {
+            if (marker.origin_node != local_node) continue;
+            const signed = self.signAccessEvent(.{
+                .present = false,
+                .origin_node = local_node,
+                .hlc = marker.hlc,
+                .channel = marker.channel,
+                .level = marker.level,
+                .mask = marker.mask,
+            }, &pk_buf, &sig_buf) orelse return false;
+            _ = link.sendAccessEvent(signed) catch return false;
+            self.observeAccessEventGuard(signed);
+        }
+        return true;
+    }
+
+    /// Drain origin-verified ACCESS_EVENT_V1 frames from one secured link:
+    /// daemon-global replay admission, store apply (LWW over hlc/origin),
+    /// guard commit only after a successful apply, then byte-identical
+    /// flood. The peer layer already refused unsigned or mismatched origins;
+    /// applyRemote re-validates every field bound before retaining a fact.
+    fn drainAccessEventsV1(self: *LinuxServer, conn: *const ConnState, link: *secured_s2s_link.SecuredLink) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
+        _ = link.takeDroppedAccessEventFrames();
+        _ = link.takeRejectedAccessEventFrames();
+        const inbound = link.takeAccessEventFrames() catch return;
+        defer {
+            for (inbound) |*item| item.deinit(self.allocator);
+            self.allocator.free(inbound);
+        }
+        for (inbound) |item| {
+            if (self.access_event_seen.contains(item.event_id)) continue;
+            const event = ircx_access_event.decode(item.wire) catch continue;
+            self.access.now_seconds = self.accessNowSeconds();
+            _ = self.access.applyRemote(ircx_access_event.toRemoteFact(event)) catch continue;
+            _ = self.access_event_seen.observe(item.event_id);
+            self.meshForwardAccessEventFrame(item.wire);
+        }
+    }
+
+    /// Relay one accepted ACCESS_EVENT_V1 byte image to every capable
+    /// secured peer. `forwardAccessEventFrame` re-verifies the immutable
+    /// origin signature and never forwards back toward the origin node.
+    fn meshForwardAccessEventFrame(self: *LinuxServer, wire: []const u8) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established() or !link.supportsAccessEventV1()) continue;
+                const emitted = link.forwardAccessEventFrame(wire) catch continue;
                 if (!emitted) continue;
                 const pid = slotClientId(reactor, i, slot.gen);
                 _ = self.flushSecuredS2sOutboundTo(pid, link);
@@ -70976,16 +72212,16 @@ pub const LinuxServer = struct {
             }
         }
         // utf8only: reject malformed UTF-8 bodies with a standard-replies FAIL and
-        // drop the message (ISUPPORT advertises UTF8ONLY). NOTICE stays silent.
+        // drop the message (ISUPPORT advertises UTF8ONLY). Arbitrary standard
+        // replies require capability negotiation, so legacy PRIVMSG clients get
+        // failReply's server-NOTICE fallback. NOTICE stays silent.
         if (!utf8_guard.isValidMessageBody(text)) {
-            if (!is_notice) {
-                var fail_buf: [128]u8 = undefined;
-                if (utf8_guard.buildInvalidUtf8Fail(&fail_buf, command)) |line| {
-                    var crlf: [160]u8 = undefined;
-                    const out = std.fmt.bufPrint(&crlf, "{s}\r\n", .{line}) catch return false;
-                    try appendToConn(conn, out);
-                } else |_| {}
-            }
+            if (!is_notice) try self.failReply(
+                conn,
+                command,
+                utf8_guard.INVALID_UTF8_CODE,
+                utf8_guard.DEFAULT_INVALID_UTF8_DESCRIPTION,
+            );
             return false;
         }
         // Koshi content filter: block messages matching an oper-curated pattern.
@@ -71205,7 +72441,7 @@ pub const LinuxServer = struct {
         conn: *ConnState,
         command: []const u8,
         target: []const u8,
-        text: []const u8,
+        text_in: []const u8,
         client_tags: ?[]const u8,
     ) !void {
         // Spamtrap: a non-oper messaging an operator-designated honeypot nick
@@ -71250,13 +72486,26 @@ pub const LinuxServer = struct {
             }
         }
 
+        // DCC offers in a DM are rewritten to the sender's observed address
+        // before authorship (see rewriteDccOfferToSender); channel text and
+        // non-DCC text pass through byte-identical.
+        var dcc_rewrite_buf: [default_reply_bytes]u8 = undefined;
+        var text: []const u8 = text_in;
+        if (!world_model.isChannelName(chan)) {
+            const rewritten = rewriteDccOfferToSender(conn, text_in, &dcc_rewrite_buf) catch {
+                if (!is_notice) try self.messageFailReply(conn, command, "INPUT_TOO_LONG", target, "DCC offer rewrite exceeds the delivery limit");
+                return;
+            };
+            if (rewritten) |value| text = value;
+        }
+
         if (world_model.isChannelName(chan)) {
             if (!self.world.channelExists(chan)) {
                 if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
             if (!self.messageSatisfiesEncryptionPolicy(chan, clean_client_tags, text, false)) {
-                if (!is_notice) try self.failReply(conn, command, "E2EE_REQUIRED", "Channel requires encrypted messages");
+                if (!is_notice) try self.messageFailReply(conn, command, "E2EE_REQUIRED", target, "Channel requires encrypted messages");
                 return;
             }
         }
@@ -71286,15 +72535,6 @@ pub const LinuxServer = struct {
             if (speech == .deny) return;
             if (!is_notice and min_rank == 0 and self.captureFirstHold(conn, chan, text)) return;
             const opmod_route = speech == .opmoderate;
-            // Fantasy bot: a speaker's PRIVMSG beginning with '!' may invoke the
-            // weather/news bot. The message is still delivered to the channel
-            // normally below; this only posts the server's answer as a PRIVMSG.
-            // Required rooms never treat ciphertext as a bot command.
-            if (!is_notice and self.channelEncryptionPolicy(chan) != .required and
-                text.len > 1 and text[0] == '!')
-            {
-                self.handleFantasy(id, conn, chan, text);
-            }
             // +f noformat (IRCX NOFORMAT; chm_nocolour): strip mIRC
             // colour/formatting from the message body for every recipient.
             // Buffer sized to the deliverable body ceiling so an oversized
@@ -71307,16 +72547,15 @@ pub const LinuxServer = struct {
             if (self.channelEncryptionPolicy(chan) != .required and
                 self.world.channelHasExtFlag(chan, .noformat) and color_strip.hasFormatting(text))
             {
-                if (color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, text, &nf_text_buf)) |clean| {
+                const clean = stripFormattingPreserveNonEmpty(text, &nf_text_buf);
+                if (!std.mem.eql(u8, clean, text)) {
                     var nf_prefix_buf: ClientPrefixBuffer = undefined;
-                    {
-                        const pfx = clientPrefix(conn, &nf_prefix_buf);
-                        if (formatMessage(&nf_msg_buf, pfx, command, &.{target}, clean)) |rebuilt| {
-                            eff_text = clean;
-                            eff_msg = rebuilt;
-                        } else |_| {}
-                    }
-                } else |_| {}
+                    const pfx = clientPrefix(conn, &nf_prefix_buf);
+                    if (formatMessage(&nf_msg_buf, pfx, command, &.{target}, clean)) |rebuilt| {
+                        eff_text = clean;
+                        eff_msg = rebuilt;
+                    } else |_| {}
+                }
             }
             if (opmod_route) {
                 // +U is intentionally a local moderation side-channel: it has
@@ -71349,7 +72588,8 @@ pub const LinuxServer = struct {
                     &delivery_ids,
                     if (is_notice) .notice else .speech,
                 ) catch {
-                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                    self.publishMessageBusyReject(conn, command, target, "delivery-set-resolution");
+                    if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Could not resolve the complete attachment delivery set");
                     return;
                 };
                 var authored_prefix_buf: ClientPrefixBuffer = undefined;
@@ -71381,15 +72621,29 @@ pub const LinuxServer = struct {
                     history_plan,
                     .{ .recipients = delivery_ids.items, .line = eff_msg, .is_bot = conn.session.isBot() },
                 ) catch {
-                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; message not sent — check mesh peers and retry");
+                    self.publishMessageBusyReject(conn, command, target, "durable-admission");
+                    if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Mesh durable admit failed; message not sent — check mesh peers and retry");
                     return;
                 };
                 if (accepted_v2) |accepted| {
                     message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
                 } else {
-                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the message; not delivered — retry or contact opers");
+                    self.publishMessageBusyReject(conn, command, target, "authority-rejection");
+                    if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Mesh authority rejected the message; not delivered — retry or contact opers");
                     return;
                 }
+            }
+            // Fantasy dispatch is an accepted-message side effect. Run it only
+            // after complete delivery-set resolution and durable MESSAGE_V2
+            // admission, and never for +U held-only messages (which returned
+            // above without crossing the ordinary message authority). The
+            // message is still delivered to the channel normally below; this
+            // only posts the server's answer as a PRIVMSG. Required rooms
+            // never treat ciphertext as a bot command.
+            if (!is_notice and self.channelEncryptionPolicy(chan) != .required and
+                text.len > 1 and text[0] == '!')
+            {
+                self.handleFantasy(id, conn, chan, text);
             }
             const delivery_mode: TaggedDeliveryMode = if (accepted_v2) |accepted|
                 accepted.deliveryMode()
@@ -71500,7 +72754,8 @@ pub const LinuxServer = struct {
                 .none => null,
                 .exact => |token| token,
                 .unresolved => {
-                    if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Live recipient session authority is ambiguous or unreachable; message not sent");
+                    self.publishMessageBusyReject(conn, command, target, "route-resolution");
+                    if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Live recipient session authority is ambiguous or unreachable; message not sent");
                     return;
                 },
             };
@@ -71538,8 +72793,9 @@ pub const LinuxServer = struct {
                 const account_guest_v2 = self.authoredRelayV2Configured() and
                     conn.session.account() != null and active_recipient_token == null;
                 if (!account_guest_v2 and self.meshNickHomeNode(target) == null and route.next_hop != guest_home) {
+                    self.publishMessageBusyReject(conn, command, target, "route-resolution");
                     if (!is_notice)
-                        try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Far ordinary guests require a portable recipient route for direct messages");
+                        try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Far ordinary guests require a portable recipient route for direct messages");
                     return;
                 }
             }
@@ -71561,13 +72817,15 @@ pub const LinuxServer = struct {
                         return;
                     }
                     if (self.authoredRelayV2Configured() and recipient_token == null and trusted_target_account != null) {
-                        if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Live recipient has no unambiguous portable session route; message not sent");
+                        self.publishMessageBusyReject(conn, command, target, "route-resolution");
+                        if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Live recipient has no unambiguous portable session route; message not sent");
                         return;
                     }
                     var local_sender_ids: std.ArrayList(client_model.ClientId) = .empty;
                     defer local_sender_ids.deinit(self.allocator);
                     self.collectAttachedExactTokenClients(id, conn, &local_sender_ids) catch {
-                        if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session sender set");
+                        self.publishMessageBusyReject(conn, command, target, "sender-set-resolution");
+                        if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Could not resolve the complete session sender set");
                         return;
                     };
                     var delivery_ids: std.ArrayList(client_model.ClientId) = .empty;
@@ -71580,7 +72838,8 @@ pub const LinuxServer = struct {
                         null,
                         &delivery_ids,
                     ) catch {
-                        if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+                        self.publishMessageBusyReject(conn, command, target, "delivery-set-resolution");
+                        if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Could not resolve the complete attachment delivery set");
                         return;
                     };
                     const exact_sender_token: ?sessions_mod.Token = if (conn.session.account()) |account| blk: {
@@ -71598,7 +72857,8 @@ pub const LinuxServer = struct {
                     // Fail closed: durable admit required when authoring active.
                     if ((recipient_token != null or account_guest_v2) and self.authoredRelayV2Configured()) {
                         if (account_guest_v2 and (exact_sender_token == null or guest_recipient == null)) {
-                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Authenticated guest delivery lacks an exact signed route; message not sent");
+                            self.publishMessageBusyReject(conn, command, target, "route-resolution");
+                            if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Authenticated guest delivery lacks an exact signed route; message not sent");
                             return;
                         }
                         const admitted = if (guest_recipient) |guest|
@@ -71641,11 +72901,13 @@ pub const LinuxServer = struct {
                                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
                             );
                         accepted_v2 = admitted catch {
-                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; message not sent — check mesh peers and retry");
+                            self.publishMessageBusyReject(conn, command, target, "durable-admission");
+                            if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Mesh durable admit failed; message not sent — check mesh peers and retry");
                             return;
                         };
                         if (accepted_v2 == null) {
-                            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the message; not delivered — retry or contact opers");
+                            self.publishMessageBusyReject(conn, command, target, "authority-rejection");
+                            if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Mesh authority rejected the message; not delivered — retry or contact opers");
                             return;
                         }
                         if (accepted_v2) |accepted| {
@@ -71741,7 +73003,7 @@ pub const LinuxServer = struct {
         if (!is_notice and isBlockableCtcp(text)) {
             if (recipient_conn) |rconn| {
                 if (rconn.session.umodes.contains(.no_ctcp)) {
-                    try self.failReply(conn, command, "CTCP_BLOCKED", "Cannot message this user (+C: no CTCP)");
+                    try self.messageFailReply(conn, command, "CTCP_BLOCKED", target, "Cannot message this user (+C: no CTCP)");
                     return;
                 }
             }
@@ -71825,12 +73087,14 @@ pub const LinuxServer = struct {
         defer recipient_ids.deinit(self.allocator);
         if (recipient_conn) |rconn| {
             self.collectAttachedExactTokenClients(recipient_id, rconn, &recipient_ids) catch {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session recipient set");
+                self.publishMessageBusyReject(conn, command, target, "recipient-set-resolution");
+                if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Could not resolve the complete session recipient set");
                 return;
             };
         } else {
             recipient_ids.append(self.allocator, recipient_id) catch {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session recipient set");
+                self.publishMessageBusyReject(conn, command, target, "recipient-set-resolution");
+                if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Could not resolve the complete session recipient set");
                 return;
             };
         }
@@ -71851,7 +73115,8 @@ pub const LinuxServer = struct {
         defer sender_ids.deinit(self.allocator);
         if (!same_logical_session) {
             self.collectAttachedExactTokenClients(id, conn, &sender_ids) catch {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete session sender set");
+                self.publishMessageBusyReject(conn, command, target, "sender-set-resolution");
+                if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Could not resolve the complete session sender set");
                 return;
             };
         }
@@ -71865,7 +73130,8 @@ pub const LinuxServer = struct {
             null,
             &delivery_ids,
         ) catch {
-            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Could not resolve the complete attachment delivery set");
+            self.publishMessageBusyReject(conn, command, target, "delivery-set-resolution");
+            if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Could not resolve the complete attachment delivery set");
             return;
         };
         const recipient_account = if (recipient_conn) |rconn| rconn.session.account() else null;
@@ -71879,7 +73145,8 @@ pub const LinuxServer = struct {
             recipient_conn != null and !std.mem.allEqual(u8, &recipient_conn.?.guest_id, 0) and
             recipient_guest_route == null and recipient_exact_token == null)
         {
-            if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Local guest incarnation authority is unavailable; message not sent");
+            self.publishMessageBusyReject(conn, command, target, "route-resolution");
+            if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Local guest incarnation authority is unavailable; message not sent");
             return;
         }
         if ((recipient_exact_token != null or guest_v2) and self.authoredRelayV2Configured()) {
@@ -71941,7 +73208,8 @@ pub const LinuxServer = struct {
                 history_plan,
                 .{ .recipients = delivery_ids.items, .line = msg, .is_bot = conn.session.isBot() },
             )) catch {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh durable admit failed; message not sent — check mesh peers and retry");
+                self.publishMessageBusyReject(conn, command, target, "durable-admission");
+                if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Mesh durable admit failed; message not sent — check mesh peers and retry");
                 return;
             };
             if (accepted_direct_v2) |accepted| {
@@ -71951,7 +73219,8 @@ pub const LinuxServer = struct {
                     self.chanstatsMessage(key, authored_prefix, command, text);
                 }
             } else {
-                if (!is_notice) try self.failReply(conn, command, "TEMPORARILY_UNAVAILABLE", "Mesh authority rejected the message; not delivered — retry or contact opers");
+                self.publishMessageBusyReject(conn, command, target, "authority-rejection");
+                if (!is_notice) try self.messageFailReply(conn, command, "TEMPORARILY_UNAVAILABLE", target, "Mesh authority rejected the message; not delivered — retry or contact opers");
                 return;
             }
         }
@@ -72563,7 +73832,7 @@ pub const LinuxServer = struct {
         }
 
         // 353 visibility symbol: '@' for secret (+s), '=' otherwise.
-        const channel_status: u8 = if (self.world.channelHasFlag(channel, .secret)) '@' else '=';
+        const channel_status: u8 = if (self.world.channelHasFlag(channel, .secret) or self.remoteChannelSecret(channel)) '@' else '=';
 
         // Render the WHOLE burst into isolated bounded storage before touching
         // the live socket/capture. This prevents a SendQ limit or allocation
@@ -77953,7 +79222,8 @@ fn wasmReplyCb(ctx: *anyopaque, text: []const u8) void {
     emitReplyLine(core.conn, line) catch {};
 }
 fn wasmLogCb(_: *anyopaque, text: []const u8) void {
-    srvLog("onyx-server: wasm-plugin: {s}\n", .{text});
+    var escaped: [1024]u8 = undefined;
+    srvLog("onyx-server: wasm-plugin: {s}\n", .{diagnostics_mod.escapeBounded(text, 256, &escaped)});
 }
 fn wasmNowCb(_: *anyopaque) i64 {
     return platform.monotonicMillis();
@@ -78739,6 +80009,7 @@ const PreparedLogicalMediaJoin = struct {
         if (self.stops_recording) {
             const stopped = self.turn.server.media_rooms.stopRecording(self.turn.channel);
             std.debug.assert(stopped);
+            _ = self.turn.server.stopMediaRecorder(self.turn.channel);
         }
         self.done = true;
         self.turn.published = true;
@@ -79401,6 +80672,7 @@ const PreparedMediaBrowserJoin = struct {
         if (self.stops_recording) {
             const stopped = self.server.media_rooms.stopRecording(self.physical.requested.channelSlice());
             std.debug.assert(stopped);
+            _ = self.server.stopMediaRecorder(self.physical.requested.channelSlice());
         }
         self.done = true;
     }
@@ -79705,6 +80977,10 @@ fn pendingInbound(conn: *const ConnState) usize {
 /// many bots/scripts) — send LF-only. `irc_line.stripLineEnding` then drops the
 /// optional trailing `\r`, so both `\r\n` and `\n` framings dispatch identically.
 fn recvqPush(conn: *ConnState, byte: u8) error{ LineTooLong, OutOfMemory }!?[]const u8 {
+    if (conn.recvq_discarding) {
+        if (byte == '\n') conn.recvq_discarding = false;
+        return null;
+    }
     const spilled = conn.recv_overflow.items.len != 0;
     if (pendingInbound(conn) >= conn.recvq_cap) return error.LineTooLong;
 
@@ -80504,6 +81780,15 @@ test "GAP-V4 recording waits for every member and stops when one joins" {
     };
     defer server.deinit();
     current_reactor = &server.reactors[0];
+    // Recording is disabled by default; this lifecycle test opts in with a
+    // throwaway journal directory (same setup as the recorder unit test).
+    var rec_tmp = std.testing.tmpDir(.{});
+    defer rec_tmp.cleanup();
+    const rec_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/recordings", .{rec_tmp.sub_path});
+    defer allocator.free(rec_dir);
+    server.config.crypto_io = std.testing.io;
+    server.config.media_recording_dir = rec_dir;
+    server.config.media_recording_enabled = true;
     server.start();
 
     const alice_id = try addTestLocalClient(&server, "alice", null);
@@ -84876,6 +86161,21 @@ test "RecvQ: inline fast path, CRLF dispatch, and per-class cap drop" {
     for ("abcd") |b| try std.testing.expectEqual(@as(?[]const u8, null), try recvqPush(&conn, b));
     try std.testing.expectError(error.LineTooLong, recvqPush(&conn, 'e'));
     recvqReset(&conn);
+
+    // Discarding mode (the 417 path in feedBytes): the rest of the overlong
+    // line is swallowed without storage until its LF, then normal framing
+    // resumes on the next line.
+    conn.recvq_discarding = true;
+    for ("fghij") |b| try std.testing.expectEqual(@as(?[]const u8, null), try recvqPush(&conn, b));
+    try std.testing.expectEqual(@as(usize, 0), pendingInbound(&conn));
+    try std.testing.expectEqual(@as(?[]const u8, null), try recvqPush(&conn, '\n'));
+    try std.testing.expect(!conn.recvq_discarding);
+    conn.recvq_cap = default_recvq_cap;
+    var resumed: ?[]const u8 = null;
+    for ("PING :x\r\n") |b| resumed = try recvqPush(&conn, b);
+    try std.testing.expect(resumed != null);
+    try std.testing.expectEqualStrings("PING :x\r\n", resumed.?);
+    recvqReset(&conn);
 }
 
 test "RecvQ: a bare LF terminates a line (LF-only clients, e.g. some mIRC builds)" {
@@ -85012,6 +86312,14 @@ fn modexDirectExtFlag(change: ircx_modex.ModeChange) ?chanmode_ext.ExtChannelFla
     return null;
 }
 
+/// Apply channel NOFORMAT without turning a non-empty IRC message body into an
+/// empty trailing parameter. Formatting-only bodies keep their original bytes.
+fn stripFormattingPreserveNonEmpty(input: []const u8, out: []u8) []const u8 {
+    const stripped = color_strip.stripFormattingWith(.{ .max_output_bytes = default_reply_bytes }, input, out) catch return input;
+    if (input.len != 0 and stripped.len == 0) return input;
+    return stripped;
+}
+
 fn formatMessage(
     out_storage: []u8,
     prefix: []const u8,
@@ -85053,7 +86361,7 @@ test "UTF-8 IRC line budget ends before a split codepoint" {
 /// RFC-ish nick validation: 1..64 bytes, no space/comma/'*'/'?'/'!'/'@'/'.' and
 /// not a channel-name lead char; first char not a digit or '-'.
 fn isValidNick(nick: []const u8) bool {
-    if (nick.len == 0 or nick.len > 64) return false;
+    if (nick.len == 0 or nick.len > 64 or nick[0] == '=') return false;
     if (ident_utf8.containsIdentifierSpoof(nick)) return false;
     if (nick[0] == '-' or (nick[0] >= '0' and nick[0] <= '9')) return false;
     for (nick) |ch| {
@@ -85146,8 +86454,14 @@ fn formatRelativeAge(buf: []u8, age_ms: i64) []const u8 {
 fn trustedOrigin(link: anytype, claimed: []const u8) []const u8 {
     const authed = link.remoteName();
     if (authed.len == 0) return claimed; // pre-handshake: nothing better to trust
-    if (claimed.len != 0 and !std.mem.eql(u8, claimed, authed))
-        srvLog("s2s: event origin mismatch (claimed '{s}', authenticated peer '{s}'); using authenticated", .{ claimed, authed });
+    if (claimed.len != 0 and !std.mem.eql(u8, claimed, authed)) {
+        var claimed_buf: [256]u8 = undefined;
+        var authed_buf: [256]u8 = undefined;
+        srvLog("s2s: event origin mismatch (claimed '{s}', authenticated peer '{s}'); using authenticated", .{
+            diagnostics_mod.escapeBounded(claimed, 64, &claimed_buf),
+            diagnostics_mod.escapeBounded(authed, 64, &authed_buf),
+        });
+    }
     return authed;
 }
 
@@ -85349,8 +86663,110 @@ fn containsIrcFormatting(text: []const u8) bool {
     return false;
 }
 
-/// Whether `text` contains a CTCP request that `+C` should block. CTCP ACTION
-/// (/me) stays allowed, but only when the parsed command token is exactly ACTION.
+/// Rewrite every connectable DCC offer before origin signing. Replace only
+/// the address span, preserving filenames, passive offers, other CTCPs, and
+/// surrounding text. A rewrite that cannot fit must fail closed, not relay the
+/// original spoofed address or an incomplete prefix of a multi-offer message.
+fn rewriteDccOfferToSender(conn: *const ConnState, text: []const u8, out: []u8) error{OutputTooSmall}!?[]const u8 {
+    const ctcp = @import("../proto/ctcp.zig");
+    const sender = conn.peer_addr orelse return null;
+    var ip_buf: [64]u8 = undefined;
+    const ip = LinuxServer.addrText(sender, &ip_buf) orelse return null;
+    var addr_buf: [80]u8 = undefined;
+    const address = if (sender == .ipv6)
+        std.fmt.bufPrint(&addr_buf, "[{s}]", .{ip}) catch return error.OutputTooSmall
+    else
+        ip;
+    var iterator = ctcp.iterator(.privmsg, text);
+    var copied: usize = 0;
+    var used: usize = 0;
+    var changed = false;
+    while (iterator.cursor < text.len) {
+        const previous = iterator.cursor;
+        const view = (iterator.next() catch {
+            // A malformed complete segment cannot hide a later valid offer.
+            // An unterminated segment has no next boundary to resume at.
+            if (iterator.cursor <= previous) break;
+            continue;
+        }) orelse break;
+        if (view.id != .dcc) continue;
+        const offer = ctcp.parseDccView(view) catch continue;
+        if ((offer.kind != .send and offer.kind != .chat) or offer.passive) continue;
+        const advertised = offer.address orelse continue;
+        const already_sender = switch (advertised) {
+            .ipv4 => |octets| sender == .ipv4 and std.mem.eql(u8, &octets, &sender.ipv4),
+            .ipv4_u32 => |value| sender == .ipv4 and value == std.mem.readInt(u32, &sender.ipv4, .big),
+            .ipv6 => |literal| sender == .ipv6 and std.ascii.eqlIgnoreCase(literal, ip),
+            .host => false,
+        };
+        if (already_sender) continue;
+        const args = view.argOrEmpty();
+        var start: usize = if (offer.kind == .send) blk: {
+            const filename = offer.filename orelse continue;
+            break :blk @intFromPtr(filename.ptr) - @intFromPtr(text.ptr) + filename.len + @intFromBool(offer.filename_quoted);
+        } else blk: {
+            var words = std.mem.tokenizeScalar(u8, args, ' ');
+            _ = words.next(); // CHAT
+            _ = words.next(); // chat protocol
+            const token = words.next() orelse continue;
+            break :blk @intFromPtr(token.ptr) - @intFromPtr(text.ptr);
+        };
+        while (start < text.len and text[start] == ' ') : (start += 1) {}
+        var end = start;
+        while (end < text.len and text[end] != ' ' and text[end] != ctcp.delimiter) : (end += 1) {}
+        const prefix = text[copied..start];
+        if (prefix.len > out.len - used) return error.OutputTooSmall;
+        @memcpy(out[used..][0..prefix.len], prefix);
+        used += prefix.len;
+        if (address.len > out.len - used) return error.OutputTooSmall;
+        @memcpy(out[used..][0..address.len], address);
+        used += address.len;
+        copied = end;
+        changed = true;
+    }
+    if (!changed) return null;
+    const suffix = text[copied..];
+    if (suffix.len > out.len - used) return error.OutputTooSmall;
+    @memcpy(out[used..][0..suffix.len], suffix);
+    return out[0 .. used + suffix.len];
+}
+
+test "DCC rewrite: offers advertise only the sender observed address" {
+    var conn = ConnState.init(-1);
+    conn.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 7 } };
+    var out: [1024]u8 = undefined;
+
+    // A spoofed/other advertised address is replaced; port/size survive.
+    const send = (try rewriteDccOfferToSender(&conn, "\x01DCC SEND file.txt 192.0.2.99 5000 12345\x01", &out)).?;
+    try std.testing.expectEqualStrings("\x01DCC SEND file.txt 203.0.113.7 5000 12345\x01", send);
+    // Legacy u32 and hostname spellings are replaced too.
+    const legacy = (try rewriteDccOfferToSender(&conn, "\x01DCC CHAT chat 3232235521 4000\x01", &out)).?;
+    try std.testing.expectEqualStrings("\x01DCC CHAT chat 203.0.113.7 4000\x01", legacy);
+    const hosted = (try rewriteDccOfferToSender(&conn, "\x01DCC SEND \"my file.bin\" dcc.example.org 1024 10\x01", &out)).?;
+    try std.testing.expectEqualStrings("\x01DCC SEND \"my file.bin\" 203.0.113.7 1024 10\x01", hosted);
+
+    // Already advertising the observed address: untouched.
+    try std.testing.expect((try rewriteDccOfferToSender(&conn, "\x01DCC SEND f 203.0.113.7 5000 1\x01", &out)) == null);
+    try std.testing.expect((try rewriteDccOfferToSender(&conn, "\x01DCC SEND f 3405803783 5000 1\x01", &out)) == null);
+    // Passive offers, ACCEPT, non-DCC CTCP, and plain text pass through.
+    try std.testing.expect((try rewriteDccOfferToSender(&conn, "\x01DCC SEND f 192.0.2.1 0 10 token1\x01", &out)) == null);
+    try std.testing.expect((try rewriteDccOfferToSender(&conn, "\x01DCC ACCEPT f 5000 0\x01", &out)) == null);
+    try std.testing.expect((try rewriteDccOfferToSender(&conn, "\x01VERSION\x01", &out)) == null);
+    try std.testing.expect((try rewriteDccOfferToSender(&conn, "hello", &out)) == null);
+
+    const multiple = "before \x01VERSION\x01 \x01DCC SEND \"my file\" 192.0.2.1 4000 1\x01 between \x01DCC CHAT chat 192.0.2.2 5000\x01 after";
+    try std.testing.expectEqualStrings(
+        "before \x01VERSION\x01 \x01DCC SEND \"my file\" 203.0.113.7 4000 1\x01 between \x01DCC CHAT chat 203.0.113.7 5000\x01 after",
+        (try rewriteDccOfferToSender(&conn, multiple, &out)).?,
+    );
+    try std.testing.expectEqualStrings(
+        "\x01\x01\x01DCC SEND f 203.0.113.7 5000 1\x01",
+        (try rewriteDccOfferToSender(&conn, "\x01\x01\x01DCC SEND f 192.0.2.1 5000 1\x01", &out)).?,
+    );
+    var tiny: [20]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, rewriteDccOfferToSender(&conn, multiple, &tiny));
+}
+
 fn isBlockableCtcp(text: []const u8) bool {
     const ctcp = @import("../proto/ctcp.zig");
     var cursor: usize = 0;
@@ -89677,6 +91093,985 @@ test "MESSAGE_V2 replay and Lotus publish transactionally with one accepted iden
     try std.testing.expect((try server.relay_v2_replay_guard.admitMessage(conflict)) == .accepted);
 }
 
+test "active MESSAGE_V2 channel admission ignores a closing reusable attachment" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    var local_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xB1)), "relay-v2-closing-attachment");
+    defer local_identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xB2)), "relay-v2-closing-attachment");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(local_identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const trust_roots = [_][]const u8{&peer_root};
+    const relay_v2_roster = [_][]const u8{ &local_root, &peer_root };
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_identity = &local_identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &trust_roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const sender_id = try addTestLocalClient(server, "Sender", "senderacct");
+    const healthy_id = try addTestLocalClient(server, "Healthy", "healthyacct");
+    const closing_id = try addTestLocalClient(server, "Closing", "closingacct");
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const healthy = server.connFor(healthy_id) orelse return error.TestUnexpectedResult;
+    const closing = server.connFor(closing_id) orelse return error.TestUnexpectedResult;
+    sender.session.addCap(.standard_replies);
+    try std.testing.expect(server.attachmentHasReusableSession(healthy_id));
+    try std.testing.expect(server.attachmentHasReusableSession(closing_id));
+    _ = try server.world.join("#root", worldIdFromClient(sender_id));
+    _ = try server.world.join("#root", worldIdFromClient(healthy_id));
+    _ = try server.world.join("#root", worldIdFromClient(closing_id));
+    closing.closing = true;
+
+    var parsed = try irc_line.parseLine("PRIVMSG #root :survives closing attachment");
+    try server.handleMessage(sender_id, sender, &parsed, "PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOccurrences(healthy.send_buf[0..healthy.send_len], "PRIVMSG #root :survives closing attachment\r\n"),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, closing.send_buf[0..closing.send_len], "survives closing attachment") == null);
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+    const accepted = server.relay_v2_event_log.viewAt(0);
+    var decoded = try message_relay_v2.decode(allocator, accepted.wire);
+    defer decoded.deinit(allocator);
+    try std.testing.expect(switch (try server.relay_v2_replay_guard.probeMessage(decoded.msg)) {
+        .duplicate => |relay_id| std.mem.eql(u8, &relay_id, &accepted.relay_id),
+        else => false,
+    });
+    var history_rows: [2]lotus.Message = undefined;
+    const recorded = try server.history.latest("#root", history_rows.len, &history_rows);
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    var stable_msgid_buf: [msgid_mod.id_len]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        msgid_mod.fromStableId(accepted.relay_id, &stable_msgid_buf),
+        recorded[0].msgid,
+    );
+}
+
+test "threaded server: transport allocation failure rolls back admission accounting and ClientTable slot" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_clones_per_ip = 1,
+        .throttle_connects = 32,
+        .throttle_window_ms = 60_000,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.allocator = std.testing.allocator;
+        server.deinit();
+    }
+    current_reactor = &server.reactors[0];
+
+    const addr: dns.Address = .{ .ipv4 = .{ 198, 51, 100, 41 } };
+    const ip = "198.51.100.41";
+    const kinds = [_]AcceptKind{ .tls, .ws };
+    for (kinds) |kind| {
+        const id = try server.rx().clients.alloc(ConnState.init(-1));
+        const conn = server.rx().clients.get(id).?;
+        conn.token = try tokenFromId(id);
+        conn.overflow_allocator = std.testing.allocator;
+        conn.peer_addr = addr;
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        server.allocator = failing.allocator();
+        const admitted = switch (kind) {
+            .tls => server.startAcceptedTls(id, conn, false),
+            .ws => server.startAcceptedWs(id, conn, false),
+            .plain => unreachable,
+        } catch |err| {
+            server.allocator = std.testing.allocator;
+            return err;
+        };
+        const induced = failing.has_induced_failure;
+        server.allocator = std.testing.allocator;
+
+        try std.testing.expect(induced);
+        try std.testing.expect(!admitted);
+        try std.testing.expect(server.rx().clients.get(id) == null);
+        try std.testing.expectEqual(@as(u32, 0), server.clone_limit.countForIp(addr));
+        try std.testing.expectEqual(@as(usize, 0), server.conn_throttle.?.activeCount(ip));
+
+        // The failed transport must not poison the source IP: the exact same
+        // address can reserve both admission authorities on a clean retry.
+        const retry_id = try server.rx().clients.alloc(ConnState.init(-1));
+        const retry = server.rx().clients.get(retry_id).?;
+        retry.token = try tokenFromId(retry_id);
+        retry.overflow_allocator = std.testing.allocator;
+        retry.peer_addr = addr;
+        try std.testing.expect(!server.refuseSilentClient(retry_id, retry));
+        try std.testing.expectEqual(@as(u32, 1), server.clone_limit.countForIp(addr));
+        try std.testing.expectEqual(@as(usize, 1), server.conn_throttle.?.activeCount(ip));
+        server.rollbackAcceptedTransport(retry_id, retry);
+    }
+
+    // The TLS engine's own initialization refusal uses the same rollback path
+    // (this fixture deliberately has no certificate), including its table slot.
+    const tls_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const tls_conn_state = server.rx().clients.get(tls_id).?;
+    tls_conn_state.token = try tokenFromId(tls_id);
+    tls_conn_state.overflow_allocator = std.testing.allocator;
+    tls_conn_state.peer_addr = addr;
+    try std.testing.expect(!try server.startAcceptedTls(tls_id, tls_conn_state, false));
+    try std.testing.expect(server.rx().clients.get(tls_id) == null);
+    try std.testing.expectEqual(@as(u32, 0), server.clone_limit.countForIp(addr));
+    try std.testing.expectEqual(@as(usize, 0), server.conn_throttle.?.activeCount(ip));
+}
+
+test "threaded server: plain admission enforces connection-rate throttle" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .throttle_connects = 1,
+        .throttle_window_ms = 60_000,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const addr: dns.Address = .{ .ipv4 = .{ 203, 0, 113, 27 } };
+    const ip = "203.0.113.27";
+    var first = ConnState.init(-1);
+    first.overflow_allocator = std.testing.allocator;
+    first.peer_addr = addr;
+    try std.testing.expect(try server.startAcceptedPlain(&first, false));
+    try std.testing.expect(first.throttle_counted);
+    try std.testing.expectEqual(@as(usize, 1), server.conn_throttle.?.activeCount(ip));
+
+    // Model the first connection closing while retaining its recent-connect
+    // timestamp. The next plaintext connection in the same window is refused.
+    if (first.clone_counted) {
+        server.clone_limit.release(addr);
+        first.clone_counted = false;
+    }
+    server.releaseThrottle(&first);
+    var second = ConnState.init(-1);
+    second.overflow_allocator = std.testing.allocator;
+    second.peer_addr = addr;
+    try std.testing.expect(try server.startAcceptedPlain(&second, false));
+    try std.testing.expect(second.closing);
+    try std.testing.expect(!second.throttle_counted);
+    try expectContains(second.send_buf[0..second.send_len], "ERROR :Connection rate exceeded; try again later");
+    try std.testing.expectEqual(@as(usize, 0), server.conn_throttle.?.activeCount(ip));
+}
+
+test "mesh NAMES: remote-only rosters render explicitly and bare with secret and member dedup" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Keep one local World channel to prove the World + route-roster projection
+    // emits one logical nick and one channel even when the peer echoes both.
+    const local_id = try addTestLocalClient(&server, "Echo", null);
+    _ = try server.world.join("#local", worldIdFromClient(local_id));
+    const asker_id = try addTestLocalClient(&server, "Asker", null);
+    const asker = server.rx().clients.get(asker_id).?;
+
+    var peer: s2s_link.S2sLink = undefined;
+    try peer.init(.{
+        .allocator = alloc,
+        .local_node_id = 1,
+        .remote_node_id = 2,
+        .local_epoch_ms = 1000,
+        .server_name = "peer.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    defer peer.deinit();
+
+    const link = try alloc.create(s2s_link.S2sLink);
+    try link.init(.{
+        .allocator = alloc,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 1001,
+        .server_name = "self.onyx",
+        .config = .{ .require_signed_frames = false },
+    });
+    const link_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(link_id).?.s2s = link;
+
+    try peer.start(50);
+    try peer.sendMembership("#remote", "Ruri", 0, 100, true, .{ .username = "ruri", .host = "remote.mesh" }, "");
+    try peer.sendMembership("#remote", "Ralph", 0, 101, true, .{ .username = "ralph", .host = "remote.mesh" }, "");
+    try peer.sendMembership("#secret", "Shade", 0, 102, true, .{ .username = "shade", .host = "remote.mesh" }, "");
+    try peer.sendChannelModeFlags("#secret", Server.channel_secret_flag_bit, 103);
+    try peer.sendMembership("#local", "eCHO", 0, 104, true, .{ .username = "echo", .host = "remote.mesh" }, "");
+    try peer.sendMembership("#local", "MeshMate", 0, 105, true, .{ .username = "mate", .host = "remote.mesh" }, "");
+    try pumpLinkPair(&peer, link, alloc);
+
+    try std.testing.expect(link.established());
+    try std.testing.expect(!server.world.channelExists("#remote"));
+    try std.testing.expect(!server.world.channelExists("#secret"));
+
+    // Explicit remote-only NAMES renders the established route roster and
+    // terminates normally instead of returning the old empty 366-only reply.
+    const explicit = try irc_line.parseLine("NAMES #remote");
+    try server.handleNames(asker, &explicit);
+    {
+        const out = asker.send_buf[0..asker.send_len];
+        try expectContains(out, " 353 Asker = #remote :");
+        try expectContains(out, "Ruri");
+        try expectContains(out, "Ralph");
+        try expectContains(out, " 366 Asker #remote :End of /NAMES list");
+    }
+
+    // Bare NAMES enumerates the visible remote-only channel exactly once while
+    // omitting a remote-only +s channel from a non-oper's browse-all reply.
+    asker.send_len = 0;
+    asker.send_offset = 0;
+    const bare = try irc_line.parseLine("NAMES");
+    try server.handleNames(asker, &bare);
+    {
+        const out = asker.send_buf[0..asker.send_len];
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, " 353 Asker = #remote :"));
+        try expectContains(out, " 366 Asker #remote :End of /NAMES list");
+        try std.testing.expect(std.mem.indexOf(u8, out, "#secret") == null);
+    }
+
+    // An explicit probe for that remote +s channel stays fail-closed: completion
+    // only, with neither a member row nor the secret member's nick.
+    asker.send_len = 0;
+    asker.send_offset = 0;
+    const secret = try irc_line.parseLine("NAMES #secret");
+    try server.handleNames(asker, &secret);
+    {
+        const out = asker.send_buf[0..asker.send_len];
+        try expectContains(out, " 366 Asker #secret :End of /NAMES list");
+        try std.testing.expect(std.mem.indexOf(u8, out, " 353 ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "Shade") == null);
+    }
+
+    // Local and remote membership converge case-insensitively: the peer echo of
+    // Echo is suppressed while the genuinely remote member remains visible.
+    asker.send_len = 0;
+    asker.send_offset = 0;
+    const converged = try irc_line.parseLine("NAMES #local");
+    try server.handleNames(asker, &converged);
+    {
+        const out = asker.send_buf[0..asker.send_len];
+        try expectContains(out, " 353 Asker = #local :");
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "Echo"));
+        try std.testing.expect(std.mem.indexOf(u8, out, "eCHO") == null);
+        try expectContains(out, "MeshMate");
+        try expectContains(out, " 366 Asker #local :End of /NAMES list");
+    }
+    try std.testing.expectEqual(@as(usize, 2), server.globalMemberCount("#local", 1));
+}
+
+test "foreign-reactor legacy PRIVMSG wakes secured owner and flushes exactly once" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const previous_reactor = current_reactor;
+    defer current_reactor = previous_reactor;
+
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    var server = LinuxServer.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+
+    const peer_id = try server.reactors[0].clients.alloc(ConnState.init(-1));
+    const peer_conn = server.reactors[0].clients.get(peer_id).?;
+    peer_conn.overflow_allocator = alloc;
+    peer_conn.token = try tokenFromId(peer_id);
+    const busy_sendq: [4096]u8 = @splat('q');
+    peer_conn.sendq_cap = busy_sendq.len;
+    try rawAppendToConn(peer_conn, &busy_sendq);
+    peer_conn.send_armed = true;
+    peer_conn.send_submitted_len = busy_sendq.len;
+    peer_conn.send_submitted_offset = 0;
+    peer_conn.s2s_secured = &pair.a;
+    defer {
+        peer_conn.s2s_secured = null;
+        _ = server.reactors[0].clients.free(peer_id);
+    }
+
+    const legacy = s2s_link.RelayMessage{
+        .verb = .privmsg,
+        .target = "RemoteNick",
+        .source_nick = "Alice",
+        .source_prefix = "Alice!u@origin.test",
+        .text = "mailbox wake delivery",
+        .origin_node = pair.ida.shortId(),
+        .hlc = 41,
+    };
+
+    // Reactor 1 authors the relay, but the secured peer socket and SendQ belong
+    // to reactor 0. The exact encrypted record stays in SecuredLink until the
+    // owner processes its wake; retaining it still counts as one routed peer.
+    current_reactor = &server.reactors[1];
+    try std.testing.expectEqual(@as(usize, 1), server.relayLegacyToPeers(legacy, .all, false));
+    try std.testing.expect(pair.a.outbound().len != 0);
+    try std.testing.expect(server.reactors[0].retained_mesh_outbound_pending.load(.acquire));
+    const retained = try alloc.dupe(u8, pair.a.outbound());
+    defer alloc.free(retained);
+    try std.testing.expectEqual(busy_sendq.len, peer_conn.send_len);
+    try std.testing.expectEqualSlices(u8, &busy_sendq, peer_conn.send_buf[0..peer_conn.send_len]);
+    try std.testing.expectEqual(@as(usize, 0), peer_conn.send_overflow.items.len);
+
+    // The first owner turn finds no whole-record capacity. It must leave the
+    // ciphertext byte-identical and keep the healthy peer open for a later send
+    // completion instead of consuming the one wake and stranding the PRIVMSG.
+    current_reactor = &server.reactors[0];
+    server.onWakePoll();
+    try std.testing.expect(!server.reactors[0].retained_mesh_outbound_pending.load(.acquire));
+    try std.testing.expectEqualSlices(u8, retained, pair.a.outbound());
+    try std.testing.expect(!peer_conn.closing);
+    try std.testing.expectEqual(busy_sendq.len, peer_conn.send_len);
+
+    try server.handleSend(.{
+        .token = peer_conn.token,
+        .res = @intCast(busy_sendq.len),
+        .more = false,
+        .notif = false,
+    });
+    try std.testing.expectEqual(@as(usize, 0), pair.a.outbound().len);
+
+    const ciphertext = try copyTestSendQ(alloc, peer_conn);
+    defer alloc.free(ciphertext);
+    try std.testing.expect(ciphertext.len != 0);
+    try pair.b.feed(ciphertext, 100);
+    const inbound = try pair.b.takeInbound();
+    defer {
+        for (inbound) |*item| item.deinit(alloc);
+        alloc.free(inbound);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    try std.testing.expectEqual(s2s_link.RelayVerb.privmsg, inbound[0].msg.verb);
+    try std.testing.expectEqualStrings("RemoteNick", inbound[0].msg.target);
+    try std.testing.expectEqualStrings("mailbox wake delivery", inbound[0].msg.text);
+}
+
+test "reactor wake init failure is optional only for single-reactor mode" {
+    const FailingWakeInit = struct {
+        fn init() error{ReactorWakeUnsupported}!reactor_wake.ReactorWake {
+            return error.ReactorWakeUnsupported;
+        }
+    };
+
+    try std.testing.expect((try LinuxServer.initReactorWakeForMode(false, FailingWakeInit.init)) == null);
+    try std.testing.expectError(
+        error.ReactorWakeUnsupported,
+        LinuxServer.initReactorWakeForMode(true, FailingWakeInit.init),
+    );
+}
+
+test "multi-reactor wake poll submits a full SQ and arms before waiting" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .ring_entries = 8,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len != 2) return error.SkipZigTest;
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.rx().wake != null);
+    try std.testing.expect(!server.rx().wake_armed);
+
+    var long_timeout = linux.kernel_timespec{ .sec = 60, .nsec = 0 };
+    var filled = false;
+    for (0..64) |_| {
+        server.rx().ring.submitTimeout(timer_token, &long_timeout) catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                filled = true;
+                break;
+            },
+            else => return err,
+        };
+    }
+    try std.testing.expect(filled);
+
+    // The required arm observes SQ-full, submits the queued timeout controls,
+    // then queues the wake poll. Make the eventfd ready and prove that the next
+    // submit-and-wait returns through the ordinary owner completion path.
+    try server.armRequiredWakeBeforeWait();
+    try std.testing.expect(server.rx().wake_armed);
+    server.wakeReactor();
+    _ = try server.rx().ring.submitAndWait(1);
+    var handler = CompletionHandler{ .server = &server };
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    try server.rx().ring.reapCompletions(&cqes, 0, &handler);
+    if (handler.err) |err| return err;
+    // A multishot wake poll stays armed across completions (the handler
+    // clears `wake_armed` only when MORE is clear); a one-shot poll retires.
+    try std.testing.expectEqual(server.rx().ring.poll_multishot, server.rx().wake_armed);
+    try std.testing.expectEqual(@as(u32, 1), server.rx().wake_count.load(.monotonic));
+}
+
+test "live PRIVMSG MESSAGE_V2 outbox busy publishes bounded Event Spine rejection and defers fantasy" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const previous_reactor = current_reactor;
+    defer current_reactor = previous_reactor;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "busy-privmsg-live-test");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "busy-privmsg-live-test");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "busy-privmsg.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+        .geo_enabled = true,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    const sender_id = try addTestLocalClient(server, "BusyAuthor", "busy-author");
+    const recipient_id = try addTestLocalClient(server, "BusyMember", "busy-member");
+    const oper_id = try addTestLocalClient(server, "BusyOper", null);
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const recipient = server.connFor(recipient_id) orelse return error.TestUnexpectedResult;
+    const oper_conn = server.connFor(oper_id) orelse return error.TestUnexpectedResult;
+    sender.send_armed = true;
+    recipient.send_armed = true;
+    oper_conn.send_armed = true;
+    oper_conn.session.is_oper = true;
+    oper_conn.session.oper_priv = oper_mod.OperPrivileges.full;
+    oper_conn.session.setEventMask(event_spine.CategoryMask.only(.@"error"));
+    try oper_conn.session.setEventSubjectMask(.@"error", "#busy-spool");
+
+    _ = try server.world.join("#busy-spool", worldIdFromClient(sender_id));
+    _ = try server.world.join("#busy-spool", worldIdFromClient(recipient_id));
+    _ = try server.world.setMemberMode("#busy-spool", worldIdFromClient(sender_id), .op, true);
+
+    // Saturate the durable RVO2 outbox: on current main ADS1 spool pressure
+    // soft-fails, so the fail-closed busy surface is durable-admission
+    // capacity. The rejection must abort every staged authority.
+    var direct_peer: u64 = 0;
+    for (server.relay_v2_required_nodes) |node| {
+        if (node == server.config.node_id) continue;
+        direct_peer = node;
+        break;
+    }
+    try std.testing.expect(direct_peer != 0);
+    server.relay_v2_outbox.max_entries = 1;
+    try server.relay_v2_outbox.putBatchExcluding(
+        &.{direct_peer},
+        null,
+        @as(message_relay_v2.RelayId, @splat(0x31)),
+        "seed-wire",
+        server.meshWallMs(),
+        relay_v2_outbox.local_origin_exclusion,
+    );
+
+    const guard_before = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_before);
+    const history_before = try server.history.encodeCheckpoint(allocator);
+    defer allocator.free(history_before);
+    const event_log_before = try server.relay_v2_event_log.encodeCheckpoint(allocator);
+    defer allocator.free(event_log_before);
+    const outbox_before = try server.relay_v2_outbox.encodeCheckpoint(allocator);
+    defer allocator.free(outbox_before);
+    const spool_before = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
+    defer allocator.free(spool_before);
+
+    const rejected_body = "!setweather rejected-body-secret";
+    try server.messageOne(sender_id, sender, "PRIVMSG", "#busy-spool", rejected_body, null);
+    try expectContains(sender.send_buf[0..sender.send_len], "FAIL PRIVMSG TEMPORARILY_UNAVAILABLE");
+    try std.testing.expectEqualStrings("", server.metaValue("#busy-spool", "weather_location"));
+
+    const guard_after = try server.relay_v2_replay_guard.encodeCheckpoint(allocator);
+    defer allocator.free(guard_after);
+    const history_after = try server.history.encodeCheckpoint(allocator);
+    defer allocator.free(history_after);
+    const event_log_after = try server.relay_v2_event_log.encodeCheckpoint(allocator);
+    defer allocator.free(event_log_after);
+    const outbox_after = try server.relay_v2_outbox.encodeCheckpoint(allocator);
+    defer allocator.free(outbox_after);
+    const spool_after = try server.attachment_delivery_spool.encodeCheckpoint(allocator);
+    defer allocator.free(spool_after);
+    try std.testing.expectEqualSlices(u8, guard_before, guard_after);
+    try std.testing.expectEqualSlices(u8, history_before, history_after);
+    try std.testing.expectEqualSlices(u8, event_log_before, event_log_after);
+    try std.testing.expectEqualSlices(u8, outbox_before, outbox_after);
+    try std.testing.expectEqualSlices(u8, spool_before, spool_after);
+
+    var error_events: [4]event_history_mod.StoredEvent = undefined;
+    const error_count = server.event_history.collect(
+        @backingInt(event_spine.EventCategory.@"error"),
+        @backingInt(event_spine.EventSeverity.notice),
+        &error_events,
+    );
+    try std.testing.expectEqual(@as(usize, 1), error_count);
+    const rejection = error_events[0].message();
+    try std.testing.expect(rejection.len <= event_history_mod.max_message_len);
+    try std.testing.expectEqualStrings(
+        "MESSAGE_BUSY_REJECT actor=BusyAuthor command=PRIVMSG target=#busy-spool reason=authority-rejection",
+        rejection,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rejection, rejected_body) == null);
+    const oper_wire = oper_conn.send_buf[0..oper_conn.send_len];
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(oper_wire, "MESSAGE_BUSY_REJECT"));
+    try expectContains(oper_wire, " EVENT BusyOper MESSAGE_BUSY_REJECT actor=BusyAuthor command=PRIVMSG target=#busy-spool reason=authority-rejection");
+    try std.testing.expect(std.mem.indexOf(u8, oper_wire, rejected_body) == null);
+
+    // NOTICE gets the same operator telemetry but remains client-silent under
+    // RFC 1459: no automatic FAIL is generated for its busy rejection.
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    try server.messageOne(sender_id, sender, "NOTICE", "#busy-spool", "notice-body-secret", null);
+    try std.testing.expectEqual(@as(usize, 0), sender.send_len);
+    try expectContains(oper_conn.send_buf[0..oper_conn.send_len], "command=NOTICE target=#busy-spool reason=authority-rejection");
+    try std.testing.expect(std.mem.indexOf(u8, oper_conn.send_buf[0..oper_conn.send_len], "notice-body-secret") == null);
+
+    // Free the synthetic pressure and retry through the same live path. The
+    // accepted message now owns its durable authorities before fantasy mutates
+    // channel metadata, proving successful traffic still dispatches the bot.
+    server.relay_v2_outbox.max_entries = 4096;
+    try server.messageOne(sender_id, sender, "PRIVMSG", "#busy-spool", "!setweather accepted-location", null);
+    try std.testing.expectEqualStrings("accepted-location", server.metaValue("#busy-spool", "weather_location"));
+    var accepted_history: [4]lotus.Message = undefined;
+    const accepted_rows = server.history.latest("#busy-spool", accepted_history.len, &accepted_history) catch &.{};
+    try std.testing.expectEqual(@as(usize, 1), accepted_rows.len);
+    try std.testing.expectEqualStrings("!setweather accepted-location", accepted_rows[0].text);
+}
+
+test "busy PRIVMSG preserves spamtrap attempted-touch Event Spine telemetry" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const previous_reactor = current_reactor;
+    defer current_reactor = previous_reactor;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x73)), "busy-spamtrap-live-test");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x74)), "busy-spamtrap-live-test");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &peer_root, &local_root };
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = "busy-spamtrap.test",
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const attacker_id = try addTestLocalClient(server, "TrapToucher", "trap-toucher");
+    const honeypot_id = try addTestLocalClient(server, "Honeypot", "honeypot-account");
+    const oper_id = try addTestLocalClient(server, "TrapOper", null);
+    const attacker = server.connFor(attacker_id) orelse return error.TestUnexpectedResult;
+    const oper_conn = server.connFor(oper_id) orelse return error.TestUnexpectedResult;
+    attacker.send_armed = true;
+    (server.connFor(honeypot_id) orelse return error.TestUnexpectedResult).send_armed = true;
+    oper_conn.send_armed = true;
+    oper_conn.session.is_oper = true;
+    oper_conn.session.oper_priv = oper_mod.OperPrivileges.full;
+    oper_conn.session.setEventMask(event_spine.CategoryMask.fromCategories(&.{ .flood, .@"error" }));
+    try oper_conn.session.setEventSubjectMask(.flood, "*Honeypot*");
+    try oper_conn.session.setEventSubjectMask(.@"error", "Honeypot");
+
+    try server.spamtrap.addTrapNick("Honeypot");
+    server.spamtrap_active.store(true, .release);
+
+    // Saturate the durable RVO2 outbox so DM admission fails closed after
+    // the spamtrap touch has already been recorded.
+    var direct_peer: u64 = 0;
+    for (server.relay_v2_required_nodes) |node| {
+        if (node == server.config.node_id) continue;
+        direct_peer = node;
+        break;
+    }
+    try std.testing.expect(direct_peer != 0);
+    server.relay_v2_outbox.max_entries = 1;
+    try server.relay_v2_outbox.putBatchExcluding(
+        &.{direct_peer},
+        null,
+        @as(message_relay_v2.RelayId, @splat(0x41)),
+        "seed-wire",
+        server.meshWallMs(),
+        relay_v2_outbox.local_origin_exclusion,
+    );
+
+    const rejected_body = "spamtrap-private-body-secret";
+    try server.messageOne(attacker_id, attacker, "PRIVMSG", "Honeypot", rejected_body, null);
+    try expectContains(attacker.send_buf[0..attacker.send_len], "FAIL PRIVMSG TEMPORARILY_UNAVAILABLE");
+
+    var flood_events: [2]event_history_mod.StoredEvent = undefined;
+    const flood_count = server.event_history.collect(
+        @backingInt(event_spine.EventCategory.flood),
+        @backingInt(event_spine.EventSeverity.warn),
+        &flood_events,
+    );
+    try std.testing.expectEqual(@as(usize, 1), flood_count);
+    try expectContains(flood_events[0].message(), "spamtrap tripped: TrapToucher touched honeypot nick Honeypot");
+
+    var error_events: [2]event_history_mod.StoredEvent = undefined;
+    const error_count = server.event_history.collect(
+        @backingInt(event_spine.EventCategory.@"error"),
+        @backingInt(event_spine.EventSeverity.notice),
+        &error_events,
+    );
+    try std.testing.expectEqual(@as(usize, 1), error_count);
+    try std.testing.expectEqualStrings(
+        "MESSAGE_BUSY_REJECT actor=TrapToucher command=PRIVMSG target=Honeypot reason=authority-rejection",
+        error_events[0].message(),
+    );
+    const oper_wire = oper_conn.send_buf[0..oper_conn.send_len];
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(oper_wire, "spamtrap tripped"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(oper_wire, "MESSAGE_BUSY_REJECT"));
+    try std.testing.expect(std.mem.indexOf(u8, oper_wire, rejected_body) == null);
+}
+
+fn reserveTwoLoopbackPorts() ServerError!struct { u16, u16 } {
+    if (comptime builtin.os.tag == .linux) {
+        const fd1 = try createListener("127.0.0.1", 0, 8);
+        defer closeFd(fd1);
+        const fd2 = try createListener("127.0.0.1", 0, 8);
+        defer closeFd(fd2);
+        return .{ try socketPort(fd1), try socketPort(fd2) };
+    } else return error.Unsupported;
+}
+
+fn reserveThreeLoopbackPorts() ServerError!struct { u16, u16, u16 } {
+    if (comptime builtin.os.tag == .linux) {
+        const fd1 = try createListener("127.0.0.1", 0, 8);
+        defer closeFd(fd1);
+        const fd2 = try createListener("127.0.0.1", 0, 8);
+        defer closeFd(fd2);
+        const fd3 = try createListener("127.0.0.1", 0, 8);
+        defer closeFd(fd3);
+        return .{ try socketPort(fd1), try socketPort(fd2), try socketPort(fd3) };
+    } else return error.Unsupported;
+}
+
+test "threaded server: secured mesh two-node PRIVMSG e2e delivers once over MESSAGE_V2 (privmsg-v2-e2e)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const cross_process_lock = try acquireHeavyMeshAcceptanceTestLock();
+    defer closeFd(cross_process_lock);
+    const s2s_ports = reserveTwoLoopbackPorts() catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var ident1 = try node_identity.fromSeed(@as([32]u8, @splat(0xE1)), "privmsg-v2-e2e-test");
+    defer ident1.deinit();
+    var ident2 = try node_identity.fromSeed(@as([32]u8, @splat(0xE2)), "privmsg-v2-e2e-test");
+    defer ident2.deinit();
+    const root1 = std.fmt.bytesToHex(ident1.sign_kp.public_key, .lower);
+    const root2 = std.fmt.bytesToHex(ident2.sign_kp.public_key, .lower);
+    const roots_for_node1 = [_][]const u8{&root2};
+    const roots_for_node2 = [_][]const u8{&root1};
+    const relay_v2_roster = [_][]const u8{ &root1, &root2 };
+
+    const node2 = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[1],
+        .node_id = ident2.shortId(),
+        .server_name = "privmsg-node2.test",
+        .node_identity = &ident2,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "privmsg-v2-e2e-secret",
+        .mesh_trust_roots = &roots_for_node2,
+        .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_roster,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    }) catch |err| return switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => error.SkipZigTest,
+        else => err,
+    };
+    defer {
+        node2.deinit();
+        alloc.destroy(node2);
+    }
+    node2.start();
+    try std.testing.expect(node2.config.require_secured);
+    try std.testing.expect(node2.authoredRelayV2Configured());
+    const port2 = try node2.boundPort();
+
+    var peer_buf: [32]u8 = undefined;
+    const peer = try std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{s2s_ports[1]});
+    const peers = [_][]const u8{peer};
+    const node1 = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[0],
+        .node_id = ident1.shortId(),
+        .server_name = "privmsg-node1.test",
+        .node_identity = &ident1,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "privmsg-v2-e2e-secret",
+        .mesh_trust_roots = &roots_for_node1,
+        .require_secured = true,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &relay_v2_roster,
+        .mesh_connect = &peers,
+        .num_shards = 1,
+        .sweep_interval_ms = 100,
+    }) catch |err| return switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => error.SkipZigTest,
+        else => err,
+    };
+    defer {
+        node1.deinit();
+        alloc.destroy(node1);
+    }
+    node1.start();
+    try std.testing.expect(node1.config.require_secured);
+    try std.testing.expect(node1.authoredRelayV2Configured());
+    const port1 = try node1.boundPort();
+
+    var run1 = std.atomic.Value(bool).init(true);
+    var run2 = std.atomic.Value(bool).init(true);
+    const thr1 = try std.Thread.spawn(.{}, Server.runThreaded, .{ node1, &run1 });
+    var thr1_cleanup_owned = true;
+    errdefer if (thr1_cleanup_owned) stopThreadedServer(node1, &run1, thr1);
+    const thr2 = try std.Thread.spawn(.{}, Server.runThreaded, .{ node2, &run2 });
+    thr1_cleanup_owned = false;
+    defer {
+        node1.requestStop(&run1);
+        node2.requestStop(&run2);
+        stopThreadedServer(node1, &run1, thr1);
+        stopThreadedServer(node2, &run2, thr2);
+    }
+
+    const clients = try alloc.alloc(LiveClient, 3);
+    defer alloc.free(clients);
+    const fd_alice = try connectLoopback(port1);
+    defer closeFd(fd_alice);
+    const fd_carol = try connectLoopback(port1);
+    defer closeFd(fd_carol);
+    const fd_bob = try connectLoopback(port2);
+    defer closeFd(fd_bob);
+    clients[0] = .{ .fd = fd_alice };
+    clients[1] = .{ .fd = fd_carol };
+    clients[2] = .{ .fd = fd_bob };
+    const alice = &clients[0];
+    const carol = &clients[1];
+    const bob = &clients[2];
+    const caps = "message-tags server-time";
+    const Helpers = struct {
+        fn expectChannelMember(client: *LiveClient, nick: []const u8) !void {
+            for (0..120) |_| {
+                client.reset();
+                try writeAllFd(client.fd, "NAMES #privmsg-v2\r\nPING :privmsg-v2-roster\r\n");
+                recvUntil(client, "PONG", 80) catch {};
+                const got = client.written();
+                if (std.mem.indexOf(u8, got, " 353 ") != null and
+                    std.mem.indexOf(u8, got, nick) != null) return;
+                testSleepMs(25);
+            }
+            return error.TestTimeout;
+        }
+
+        fn expectRelayV2AuthorityRetired(
+            first_node: *Server,
+            second_node: *Server,
+            msgid: []const u8,
+        ) !void {
+            const deadline = platform.monotonicMillis() + 5000;
+            while (true) {
+                const node1_state = first_node.relayV2MsgidAuthorityForTest(msgid);
+                const node2_state = second_node.relayV2MsgidAuthorityForTest(msgid);
+                if (node1_state.admitted and node2_state.admitted and
+                    !node1_state.retained and !node2_state.retained) return;
+                if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+                testSleepMs(10);
+            }
+        }
+
+        fn fenceClientOutput(live_clients: []const *LiveClient, phase: []const u8) !void {
+            for (live_clients, 0..) |client, index| {
+                var token_buf: [96]u8 = undefined;
+                const token = try std.fmt.bufPrint(
+                    &token_buf,
+                    "privmsg-v2-{s}-fence-{d}",
+                    .{ phase, index },
+                );
+                var ping_buf: [128]u8 = undefined;
+                const ping = try std.fmt.bufPrint(&ping_buf, "PING :{s}\r\n", .{token});
+                try writeAllFd(client.fd, ping);
+                try recvUntil(client, token, 200);
+            }
+        }
+    };
+
+    try writeAllFd(fd_alice, "CAP REQ :message-tags server-time\r\nNICK Alice\r\nUSER alice 0 * :Alice\r\nCAP END\r\n");
+    try recvUntil(alice, " 001 Alice ", 200);
+    try expectContains(alice.written(), caps);
+    try expectMeshPeerVisible(alice, "privmsg-node2.test", 120);
+    try writeAllFd(fd_alice, "JOIN #privmsg-v2\r\n");
+    try recvUntil(alice, " 366 Alice #privmsg-v2 ", 200);
+    alice.reset();
+
+    try writeAllFd(fd_bob, "CAP REQ :message-tags server-time\r\nNICK Bob\r\nUSER bob 0 * :Bob\r\nCAP END\r\n");
+    try recvUntil(bob, " 001 Bob ", 200);
+    try expectContains(bob.written(), caps);
+    try expectMeshPeerVisible(bob, "privmsg-node1.test", 120);
+    try writeAllFd(fd_bob, "JOIN #privmsg-v2\r\n");
+    try recvUntil(bob, " 366 Bob #privmsg-v2 ", 200);
+    try Helpers.expectChannelMember(alice, "Bob");
+    try Helpers.expectChannelMember(bob, "Alice");
+
+    try writeAllFd(fd_carol, "CAP REQ :message-tags server-time\r\nNICK Carol\r\nUSER carol 0 * :Carol\r\nCAP END\r\n");
+    try recvUntil(carol, " 001 Carol ", 200);
+    try expectContains(carol.written(), caps);
+    try writeAllFd(fd_carol, "JOIN #privmsg-v2\r\n");
+    try recvUntil(carol, " 366 Carol #privmsg-v2 ", 200);
+    try Helpers.expectChannelMember(bob, "Carol");
+
+    alice.reset();
+    carol.reset();
+    bob.reset();
+    const outbound = "PRIVMSG #privmsg-v2 :alice-to-bob-v2";
+    try writeAllFd(fd_alice, "PRIVMSG #privmsg-v2 :alice-to-bob-v2\r\n");
+    try recvUntil(carol, outbound, 400);
+    try recvUntil(bob, outbound, 400);
+    const outbound_local = ircLineContaining(carol.written(), outbound) orelse return error.TestUnexpectedResult;
+    const outbound_remote = ircLineContaining(bob.written(), outbound) orelse return error.TestUnexpectedResult;
+    const outbound_msgid = extractMsgid(outbound_local) orelse return error.TestUnexpectedResult;
+    if (outbound_msgid.len != msgid_mod.id_len) return error.TestUnexpectedResult;
+    var outbound_msgid_copy: [msgid_mod.id_len]u8 = undefined;
+    @memcpy(&outbound_msgid_copy, outbound_msgid);
+    try std.testing.expectEqualStrings(
+        outbound_msgid,
+        extractMsgid(outbound_remote) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqualStrings(
+        extractTimeTag(outbound_local) orelse return error.TestUnexpectedResult,
+        extractTimeTag(outbound_remote) orelse return error.TestUnexpectedResult,
+    );
+    try Helpers.expectRelayV2AuthorityRetired(node1, node2, &outbound_msgid_copy);
+    try Helpers.fenceClientOutput(&.{ alice, carol, bob }, "forward");
+    try alice.readAvailable();
+    try carol.readAvailable();
+    try bob.readAvailable();
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(alice.written(), outbound));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(carol.written(), outbound));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(bob.written(), outbound));
+
+    alice.reset();
+    carol.reset();
+    bob.reset();
+    try writeAllFd(fd_bob, "CAP REQ :echo-message\r\n");
+    try recvUntil(bob, " ACK :echo-message", 200);
+    alice.reset();
+    carol.reset();
+    bob.reset();
+    const inbound = "PRIVMSG #privmsg-v2 :bob-to-alice-v2";
+    try writeAllFd(fd_bob, "PRIVMSG #privmsg-v2 :bob-to-alice-v2\r\n");
+    try recvUntil(alice, inbound, 400);
+    try recvUntil(carol, inbound, 400);
+    try recvUntil(bob, inbound, 400);
+    const inbound_local = ircLineContaining(bob.written(), inbound) orelse return error.TestUnexpectedResult;
+    const inbound_remote1 = ircLineContaining(alice.written(), inbound) orelse return error.TestUnexpectedResult;
+    const inbound_remote2 = ircLineContaining(carol.written(), inbound) orelse return error.TestUnexpectedResult;
+    const inbound_msgid = extractMsgid(inbound_local) orelse return error.TestUnexpectedResult;
+    if (inbound_msgid.len != msgid_mod.id_len) return error.TestUnexpectedResult;
+    var inbound_msgid_copy: [msgid_mod.id_len]u8 = undefined;
+    @memcpy(&inbound_msgid_copy, inbound_msgid);
+    try std.testing.expectEqualStrings(
+        inbound_msgid,
+        extractMsgid(inbound_remote1) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqualStrings(
+        inbound_msgid,
+        extractMsgid(inbound_remote2) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqualStrings(
+        extractTimeTag(inbound_local) orelse return error.TestUnexpectedResult,
+        extractTimeTag(inbound_remote1) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqualStrings(
+        extractTimeTag(inbound_local) orelse return error.TestUnexpectedResult,
+        extractTimeTag(inbound_remote2) orelse return error.TestUnexpectedResult,
+    );
+    try Helpers.expectRelayV2AuthorityRetired(node1, node2, &inbound_msgid_copy);
+    try Helpers.fenceClientOutput(&.{ alice, carol, bob }, "reverse");
+    try alice.readAvailable();
+    try carol.readAvailable();
+    try bob.readAvailable();
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(alice.written(), inbound));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(carol.written(), inbound));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(bob.written(), inbound));
+}
+
 test "MESSAGE_V2 durable admission fails closed without explicit direct-neighbor pins" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -92884,6 +95279,39 @@ fn addTestRelayHomes(
     for (nicks) |nick| try std.testing.expectEqual(origin_node, server.meshNickHomeNode(nick).?);
 }
 
+test "WHOWAS remote quit uses origin provenance and leaves unknown origins explicit" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(&server, &peer, 99, &.{"Resident"});
+    defer peer.deinit();
+    const Delta = struct {
+        nick: []const u8,
+        username: []const u8 = "remote",
+        host: []const u8 = "cloak.remote.test",
+        account: []const u8 = "",
+        source_provenance: ?struct { origin_node: u64 } = null,
+    };
+    server.recordRemoteWhowas(Delta{ .nick = "Departed", .source_provenance = .{ .origin_node = 99 } });
+    server.recordRemoteWhowas(Delta{ .nick = "Unknown", .source_provenance = .{ .origin_node = 123 } });
+    server.recordRemoteWhowas(Delta{ .nick = "Legacy" });
+    var records: [1]whowas.Record = undefined;
+    const departed = try server.whowas.query("Departed", 1, &records);
+    try std.testing.expectEqual(@as(usize, 1), departed.len);
+    try std.testing.expectEqualStrings("relay-origin.test", departed[0].server);
+    const unknown = try server.whowas.query("Unknown", 1, &records);
+    try std.testing.expectEqual(@as(usize, 1), unknown.len);
+    try std.testing.expectEqualStrings("unknown.mesh", unknown[0].server);
+    const legacy = try server.whowas.query("Legacy", 1, &records);
+    try std.testing.expectEqual(@as(usize, 1), legacy.len);
+    try std.testing.expectEqualStrings("unknown.mesh", legacy[0].server);
+}
+
 test "verified webhook residence bypass is restricted to server-authored channel PRIVMSG" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -93697,6 +96125,84 @@ test "UPGRADE logged-in client without exact session token is incomplete" {
     try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
     try std.testing.expectEqual(@as(usize, 0), counts.clients);
     try std.testing.expectEqual(@as(usize, 0), fd_count);
+}
+
+test "UPGRADE unfinished oversized IRC line refuses capture and resumes after LF" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    var sockets: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer closeFd(sockets[1]);
+    const id = server.rx().clients.alloc(ConnState.init(sockets[0])) catch |err| {
+        closeFd(sockets[0]);
+        return err;
+    };
+    const conn = server.connFor(id).?;
+    conn.overflow_allocator = alloc;
+    conn.token = try tokenFromId(id);
+    try conn.session.setNick("oversized");
+    conn.session.registration.registered = true;
+    conn.recvq_cap = 32;
+
+    // Drive the production parser with an overlong line without its LF. The
+    // socket remains live, but its remainder must never become another command.
+    try server.feedBytes(id, conn, &(@as([33]u8, @splat('x'))));
+    try expectContains(conn.send_buf[0..conn.send_len], " 417 oversized ");
+    try std.testing.expect(conn.recvq_discarding);
+    try std.testing.expectEqual(@as(usize, 0), pendingInbound(conn));
+    const queued_before = conn.send_len;
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var fds: [1]linux.fd_t = undefined;
+    var fd_count: usize = 0;
+    var counts = Server.SealCounts{};
+    server.sealShardClients(server.rx(), &pieces, &blobs, &fds, &fd_count, &counts);
+    try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
+    try std.testing.expectEqual(@as(usize, 0), counts.clients);
+    try std.testing.expectEqual(@as(usize, 0), fd_count);
+    try std.testing.expectEqual(@as(usize, 0), pieces.items.len);
+    try std.testing.expectEqual(queued_before, conn.send_len);
+    try std.testing.expect(conn.recvq_discarding and !conn.closing);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(conn.fd, posix.F.GETFD, 0)));
+
+    // Refusal preserves the predecessor's discard state. Only the command
+    // AFTER the LF executes; the same physical transport then seals normally.
+    try server.feedBytes(id, conn, "PING :discarded\r\nPING :after-discard\r\n");
+    const output = conn.send_buf[0..conn.send_len];
+    try std.testing.expect(std.mem.indexOf(u8, output, ":discarded") == null);
+    try expectContains(output, "PONG onyx.local :after-discard");
+    try std.testing.expect(!conn.recvq_discarding and !conn.closing);
+    // A predecessor may contain an old, loosely validated client nickname.
+    // Neither capture nor successor adoption may import the reserved namespace.
+    try conn.session.setNick("=oversized");
+    counts = .{};
+    server.sealShardClients(server.rx(), &pieces, &blobs, &fds, &fd_count, &counts);
+    try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
+    try std.testing.expectEqual(@as(usize, 0), counts.clients);
+    try std.testing.expectEqual(@as(usize, 0), fd_count);
+    try std.testing.expect(!server.adoptInheritedClient(.{ .fd = sockets[0], .nick = "=oversized", .realname = "old name" }, null, null, false));
+    try std.testing.expectEqual(@as(usize, 1), server.rx().clients.len());
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(conn.fd, posix.F.GETFD, 0)));
+    try conn.session.setNick("oversized");
+    counts = .{};
+    server.sealShardClients(server.rx(), &pieces, &blobs, &fds, &fd_count, &counts);
+    try std.testing.expectEqual(@as(usize, 1), counts.clients_expected);
+    try std.testing.expectEqual(@as(usize, 1), counts.clients);
+    try std.testing.expectEqual(@as(usize, 1), fd_count);
+    try std.testing.expectEqual(sockets[0], fds[0]);
 }
 
 test "UPGRADE oversized MONITOR sidecar makes registered client incomplete" {
@@ -96444,6 +98950,7 @@ test "TOTP atomic live poisoned services refuse in-flight cached SCRAM through e
     var scram = scram_mod.ScramStore.init(alloc);
     defer scram.deinit();
     try scram.storeWithSalt("kain", "correct horse battery staple", "0123456789abcdef", 4096);
+    services.attachScramStore(&scram);
     const server = try totpAtomicServerForTest(&services);
     defer std.testing.allocator.destroy(server);
     defer server.deinit();
@@ -104945,6 +107452,68 @@ test "history policy: channel PROP validates and tightens CHATHISTORY access" {
     } else return error.SkipZigTest;
 }
 
+test "module-dispatched multi-target PRIVMSG scopes FAIL to rejected target and NOTICE stays silent" {
+    if (comptime builtin.os.tag == .linux) {
+        var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        try server.ensureModuleRuntime();
+
+        const sender_id = try addTestLocalClient(&server, "Alice", null);
+        const recipient_id = try addTestLocalClient(&server, "Bob", null);
+        const sender = server.connFor(sender_id).?;
+        const recipient = server.connFor(recipient_id).?;
+        sender.session.registration.registered = true;
+        recipient.session.registration.registered = true;
+        _ = try server.world.join("#secure", worldIdFromClient(sender_id));
+        _ = try server.props.setProp(
+            .{ .kind = .channel, .id = "#secure" },
+            e2ee_policy.policy_prop,
+            "required",
+            .{ .id = "op", .access = .owner },
+        );
+
+        // The first target succeeds before the second target is rejected. A
+        // legacy client gets a human-readable fallback that still names only
+        // the failed target; it must not imply that Bob's delivery failed too.
+        var legacy = try irc_line.parseLine("PRIVMSG Bob,#secure :partial legacy");
+        try server.dispatchRegistered(sender_id, sender, &legacy, legacy.raw);
+        try expectContains(recipient.send_buf[0..recipient.send_len], "PRIVMSG Bob :partial legacy\r\n");
+        try expectContains(sender.send_buf[0..sender.send_len], "NOTICE Alice :FAIL PRIVMSG E2EE_REQUIRED #secure: Channel requires encrypted messages\r\n");
+
+        sender.send_len = 0;
+        sender.send_offset = 0;
+        recipient.send_len = 0;
+        recipient.send_offset = 0;
+        sender.session.addCap(.standard_replies);
+
+        // With standard-replies negotiated, the target is structured context
+        // between the code and description, while the successful target still
+        // receives its message.
+        var standard = try irc_line.parseLine("PRIVMSG Bob,#secure :partial standard");
+        try server.dispatchRegistered(sender_id, sender, &standard, standard.raw);
+        try expectContains(recipient.send_buf[0..recipient.send_len], "PRIVMSG Bob :partial standard\r\n");
+        try std.testing.expectEqualStrings(
+            "FAIL PRIVMSG E2EE_REQUIRED #secure :Channel requires encrypted messages\r\n",
+            sender.send_buf[0..sender.send_len],
+        );
+
+        sender.send_len = 0;
+        sender.send_offset = 0;
+        recipient.send_len = 0;
+        recipient.send_offset = 0;
+
+        // The same partial target set sent as NOTICE delivers the valid target
+        // but never generates FAIL or fallback output to the sender.
+        var notice = try irc_line.parseLine("NOTICE Bob,#secure :partial notice");
+        try server.dispatchRegistered(sender_id, sender, &notice, notice.raw);
+        try expectContains(recipient.send_buf[0..recipient.send_len], "NOTICE Bob :partial notice\r\n");
+        try std.testing.expectEqual(@as(usize, 0), sender.send_len);
+    } else return error.SkipZigTest;
+}
+
 test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
@@ -104971,11 +107540,12 @@ test "E2EE policy: channel PROP validates and required rooms reject plaintext" {
 
         const id = try addTestLocalClient(&server, "alice", null);
         const conn = server.connFor(id).?;
+        conn.session.addCap(.standard_replies);
         _ = try server.world.join("#secure", worldIdFromClient(id));
 
         conn.send_len = 0;
         try server.messageOne(id, conn, "PRIVMSG", "#secure", "plain", null);
-        try expectContains(conn.send_buf[0..conn.send_len], "FAIL PRIVMSG E2EE_REQUIRED");
+        try expectContains(conn.send_buf[0..conn.send_len], "FAIL PRIVMSG E2EE_REQUIRED #secure :Channel requires encrypted messages\r\n");
     } else return error.SkipZigTest;
 }
 
@@ -108623,6 +111193,424 @@ test "deliverRelay binds sender nick to home: legit delivers, mismatch and unkno
     try std.testing.expectEqual(@as(u64, 1), server.rejected_relay_unknown_home_v1);
 }
 
+test "MESSAGE_V2 webhook namespace survives local remote and unpropagated nick collisions" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x51)), "webhook-collision");
+    defer local.deinit();
+    var remote = try node_identity.fromSeed(@as([32]u8, @splat(0x52)), "webhook-collision");
+    defer remote.deinit();
+    const local_root = std.fmt.bytesToHex(local.sign_kp.public_key, .lower);
+    const remote_root = std.fmt.bytesToHex(remote.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&remote_root};
+    const roster = [_][]const u8{ &local_root, &remote_root };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "relay-origin.test",
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    try std.testing.expect(server.authoredRelayV2Configured());
+    const target_id = try addTestLocalClient(server, "LocalBot", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#webhook", worldIdFromClient(target_id));
+    var peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(server, &peer, remote.shortId(), &.{"RemoteBot"});
+    defer peer.deinit();
+    current_reactor = &server.reactors[0];
+    var post: webhook_mod.PendingPost = .{};
+    post.setChannel("#webhook");
+    post.setNick("LocalBot");
+    const body = "webhook cannot impersonate clients";
+    @memcpy(post.body_buf[0..body.len], body);
+    post.body_len = body.len;
+    const before = try server.relay_v2_replay_guard.encodeCheckpoint(alloc);
+    defer alloc.free(before);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    server.allocator = failing.allocator();
+    server.injectWebhookPost(&post);
+    server.allocator = alloc;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.len());
+    var history: [1]lotus.Message = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try server.history.latest("#webhook", 1, &history)).len);
+    const after = try server.relay_v2_replay_guard.encodeCheckpoint(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+
+    // Known local/remote identities never collide with a marked webhook.
+    // UnknownBot deliberately has no origin-side roster claim at all.
+    try std.testing.expect(server.meshNickHomeNode("UnknownBot") == null);
+    for ([_][]const u8{ "localbot", "remotebot", "UnknownBot" }, 0..) |nick, index| {
+        target.send_len = 0;
+        target.send_offset = 0;
+        post.setNick(nick);
+        server.injectWebhookPost(&post);
+        var prefix_buf: [96]u8 = undefined;
+        try expectContains(target.send_buf[0..target.send_len], try std.fmt.bufPrint(&prefix_buf, ":={s}!webhook@", .{nick}));
+        try std.testing.expectEqual(index + 1, server.relay_v2_event_log.len());
+    }
+    // A real receiver owns UnknownBot before any origin-side roster exists.
+    // Deliver the actual retained origin wire, preserving its signed identity.
+    const receiver_roots = [_][]const u8{&local_root};
+    const receiver = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = remote.shortId(),
+        .node_identity = &remote,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &receiver_roots,
+    });
+    defer alloc.destroy(receiver);
+    defer {
+        current_reactor = &receiver.reactors[0];
+        receiver.deinit();
+        current_reactor = &server.reactors[0];
+    }
+    current_reactor = &receiver.reactors[0];
+    const bot_id = try addTestLocalClient(receiver, "UnknownBot", null);
+    const bot = receiver.connFor(bot_id).?;
+    _ = try receiver.world.join("#webhook", worldIdFromClient(bot_id));
+    var receiver_peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(receiver, &receiver_peer, local.shortId(), &.{"Other"});
+    defer receiver_peer.deinit();
+    var delivered = false;
+    for (0..server.relay_v2_event_log.len()) |index| {
+        const row = server.relay_v2_event_log.viewAt(index);
+        var decoded = try message_relay_v2.decode(alloc, row.wire);
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.msg.sourceNick().?, "=UnknownBot")) continue;
+        try std.testing.expect(receiver.deliverRelayV2(decoded.msg, row.wire, local.shortId()) == .accepted);
+        try expectContains(bot.send_buf[0..bot.send_len], ":=UnknownBot!webhook@relay-origin.test PRIVMSG #webhook");
+        const delivered_len = bot.send_len;
+        try std.testing.expect(receiver.deliverRelayV2(decoded.msg, row.wire, local.shortId()) == .duplicate);
+        try std.testing.expectEqual(delivered_len, bot.send_len);
+        delivered = true;
+    }
+    try std.testing.expect(delivered);
+    // Exercise both live registration and registered rename boundaries. The
+    // generic preregistration dispatcher alone has a looser nickname grammar.
+    bot.send_len = 0;
+    bot.send_offset = 0;
+    var rename = try irc_line.parseLine("NICK =UnknownBot");
+    try receiver.handleNickChange(bot_id, bot, &rename);
+    try expectContains(bot.send_buf[0..bot.send_len], " 432 UnknownBot =UnknownBot ");
+    try std.testing.expectEqualStrings("UnknownBot", bot.session.displayName());
+    const fresh_id = try receiver.rx().clients.alloc(ConnState.init(-1));
+    const fresh = receiver.connFor(fresh_id).?;
+    fresh.overflow_allocator = alloc;
+    fresh.token = try tokenFromId(fresh_id);
+    try receiver.feedBytes(fresh_id, fresh, "NICK =UnknownBot\r\n");
+    try expectContains(fresh.send_buf[0..fresh.send_len], " 432 * =UnknownBot ");
+    try std.testing.expect(!fresh.session.registration.nick_seen and !fresh.session.registered());
+    try std.testing.expect(receiver.world.findNick("=UnknownBot") == null);
+}
+
+test "MESSAGE_V2 webhook origin and receiver enforce converged channel policy" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x61)), "webhook-policy");
+    defer origin.deinit();
+    var remote = try node_identity.fromSeed(@as([32]u8, @splat(0x62)), "webhook-policy");
+    defer remote.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const remote_root = std.fmt.bytesToHex(remote.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&remote_root};
+    const roster = [_][]const u8{ &origin_root, &remote_root };
+    const sender = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .server_name = "relay-origin.test",
+        .node_id = origin.shortId(),
+        .node_identity = &origin,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(sender);
+    defer sender.deinit();
+    const receiver_roots = [_][]const u8{&origin_root};
+    const receiver = try createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = remote.shortId(),
+        .node_identity = &remote,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &receiver_roots,
+    });
+    defer alloc.destroy(receiver);
+    defer {
+        current_reactor = &receiver.reactors[0];
+        receiver.deinit();
+        current_reactor = &sender.reactors[0];
+    }
+    var operators: [2]*ConnState = undefined;
+    var members: [2]*ConnState = undefined;
+    const servers = [_]*Server{ sender, receiver };
+    for (servers, 0..) |node, index| {
+        current_reactor = &node.reactors[0];
+        const op_id = try addTestLocalClient(node, "Operator", null);
+        const member_id = try addTestLocalClient(node, "Member", null);
+        _ = try node.world.join("#policy", worldIdFromClient(op_id));
+        _ = try node.world.join("#policy", worldIdFromClient(member_id));
+        operators[index] = node.connFor(op_id).?;
+        members[index] = node.connFor(member_id).?;
+        for ([_]*ConnState{ operators[index], members[index] }) |conn| {
+            conn.session.addCap(.message_tags);
+            conn.session.addCap(.server_time);
+        }
+        try std.testing.expect(node.world.channelHasFlag("#policy", .no_external));
+    }
+    var peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(receiver, &peer, origin.shortId(), &.{"Resident"});
+    defer peer.deinit();
+    var post: webhook_mod.PendingPost = .{};
+    post.setChannel("#policy");
+    post.setNick("Bot");
+    const entity = ircx_prop_store.Entity{ .kind = .channel, .id = "#policy" };
+    const Policy = enum { moderated, registered, authonly, banned, encrypted, nocolor, noctcp };
+    const replay_before = try sender.relay_v2_replay_guard.encodeCheckpoint(alloc);
+    defer alloc.free(replay_before);
+    const stamp_before = sender.mesh_clock.last_stamp;
+    const seq_before = sender.msg_seq;
+    for ([_]Policy{ .moderated, .registered, .authonly, .banned, .encrypted, .nocolor, .noctcp }) |policy| {
+        const body = switch (policy) {
+            .nocolor => "\x02blocked formatting\x02",
+            .noctcp => "\x01VERSION\x01",
+            else => "blocked webhook",
+        };
+        @memcpy(post.body_buf[0..body.len], body);
+        post.body_len = @intCast(body.len);
+        // Converged policies must refuse at the author, before any retained
+        // identity exists; a receiver-side drop plus ACK would be too late.
+        for (servers) |node| {
+            current_reactor = &node.reactors[0];
+            switch (policy) {
+                .moderated => {
+                    _ = try node.world.setChannelFlag("#policy", .moderated, true);
+                },
+                .registered => {
+                    _ = try node.world.setChannelFlag("#policy", .mod_reg, true);
+                },
+                .authonly => {
+                    _ = try node.world.setChannelExtFlag("#policy", .authonly, true);
+                },
+                .banned => {
+                    _ = try node.world.addBan("#policy", "=Bot!*@*", "Operator", 1);
+                },
+                .encrypted => {
+                    _ = try node.props.setProp(entity, e2ee_policy.policy_prop, "required", .{ .id = "op", .access = .owner });
+                },
+                .nocolor => {
+                    _ = try node.world.setChannelExtFlag("#policy", .nocolor, true);
+                },
+                .noctcp => {
+                    _ = try node.world.setChannelFlag("#policy", .no_ctcp, true);
+                },
+            }
+        }
+        current_reactor = &sender.reactors[0];
+        sender.injectWebhookPost(&post);
+        try std.testing.expectEqual(stamp_before, sender.mesh_clock.last_stamp);
+        try std.testing.expectEqual(seq_before, sender.msg_seq);
+        const replay_after = try sender.relay_v2_replay_guard.encodeCheckpoint(alloc);
+        defer alloc.free(replay_after);
+        try std.testing.expectEqualSlices(u8, replay_before, replay_after);
+        for (servers, 0..) |node, index| {
+            try std.testing.expectEqual(@as(usize, 0), operators[index].send_len);
+            try std.testing.expectEqual(@as(usize, 0), members[index].send_len);
+            try std.testing.expectEqual(@as(usize, 0), node.relay_v2_event_log.len());
+            try std.testing.expectEqual(@as(usize, 0), node.relay_v2_outbox.len());
+            var history: [1]lotus.Message = undefined;
+            try std.testing.expectEqual(@as(usize, 0), (try node.history.latest("#policy", 1, &history)).len);
+            current_reactor = &node.reactors[0];
+            _ = try node.world.setChannelFlag("#policy", .moderated, false);
+            _ = try node.world.setChannelFlag("#policy", .mod_reg, false);
+            _ = try node.world.setChannelExtFlag("#policy", .authonly, false);
+            _ = try node.world.removeBan("#policy", "=Bot!*@*");
+            _ = try node.props.setProp(entity, e2ee_policy.policy_prop, "off", .{ .id = "op", .access = .owner });
+            _ = try node.world.setChannelExtFlag("#policy", .nocolor, false);
+            _ = try node.world.setChannelFlag("#policy", .no_ctcp, false);
+        }
+    }
+    // +f transforms the body before both local admission and signed relay.
+    // +n remains enabled: verified webhook authority bypasses only that gate.
+    for (servers) |node| _ = try node.world.setChannelExtFlag("#policy", .noformat, true);
+    const formatted = "\x02one accepted webhook\x02";
+    @memcpy(post.body_buf[0..formatted.len], formatted);
+    post.body_len = formatted.len;
+    current_reactor = &sender.reactors[0];
+    sender.injectWebhookPost(&post);
+    try std.testing.expectEqual(@as(usize, 1), sender.relay_v2_event_log.len());
+    const row = sender.relay_v2_event_log.viewAt(0);
+    var decoded = try message_relay_v2.decode(alloc, row.wire);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("one accepted webhook", decoded.msg.text);
+    current_reactor = &receiver.reactors[0];
+    try std.testing.expect(receiver.deliverRelayV2(decoded.msg, row.wire, origin.shortId()) == .accepted);
+    const received_len = operators[1].send_len;
+    try std.testing.expect(receiver.deliverRelayV2(decoded.msg, row.wire, origin.shortId()) == .duplicate);
+    try std.testing.expectEqual(received_len, operators[1].send_len);
+    for (servers, 0..) |node, index| {
+        for ([_]*ConnState{ operators[index], members[index] }) |conn| {
+            const output = conn.send_buf[0..conn.send_len];
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "PRIVMSG #policy :one accepted webhook\r\n"));
+            try expectContains(output, ";bot");
+            for ([_][]const u8{ "msgid", "time" }) |key| {
+                try std.testing.expectEqualStrings(
+                    testMessageTagValue(operators[0].send_buf[0..operators[0].send_len], "one accepted webhook", key) orelse return error.TestUnexpectedResult,
+                    testMessageTagValue(output, "one accepted webhook", key) orelse return error.TestUnexpectedResult,
+                );
+            }
+        }
+        var history: [2]lotus.Message = undefined;
+        try std.testing.expectEqual(@as(usize, 1), (try node.history.latest("#policy", 2, &history)).len);
+        _ = try node.world.setChannelFlag("#policy", .mod_reg, true);
+        _ = try node.world.setChannelExtFlag("#policy", .opmoderate, true);
+    }
+    // +M with +z routes only to operators on both nodes, with no public history.
+    for (operators) |conn| resetTestSendQ(conn);
+    for (members) |conn| resetTestSendQ(conn);
+    const op_body = "operators only";
+    @memcpy(post.body_buf[0..op_body.len], op_body);
+    post.body_len = op_body.len;
+    current_reactor = &sender.reactors[0];
+    sender.injectWebhookPost(&post);
+    try std.testing.expectEqual(@as(usize, 2), sender.relay_v2_event_log.len());
+    var op_delivered = false;
+    for (0..sender.relay_v2_event_log.len()) |index| {
+        const op_row = sender.relay_v2_event_log.viewAt(index);
+        var op_decoded = try message_relay_v2.decode(alloc, op_row.wire);
+        defer op_decoded.deinit(alloc);
+        if (!std.mem.eql(u8, op_decoded.msg.text, op_body)) continue;
+        current_reactor = &receiver.reactors[0];
+        try std.testing.expect(receiver.deliverRelayV2(op_decoded.msg, op_row.wire, origin.shortId()) == .accepted);
+        op_delivered = true;
+    }
+    try std.testing.expect(op_delivered);
+    for (servers, 0..) |node, index| {
+        try expectContains(operators[index].send_buf[0..operators[index].send_len], "PRIVMSG #policy :operators only\r\n");
+        try std.testing.expectEqual(@as(usize, 0), members[index].send_len);
+        var history: [2]lotus.Message = undefined;
+        try std.testing.expectEqual(@as(usize, 1), (try node.history.latest("#policy", 2, &history)).len);
+    }
+}
+
+test "MESSAGE_V2 webhook admits exact signed server identity and rejects spoofed authority" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x41)), "webhook-authority");
+    defer local.deinit();
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x42)), "webhook-authority");
+    defer origin.deinit();
+    const root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&root};
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .mesh_trust_roots = &roots,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    const target_id = try addTestLocalClient(server, "Target", null);
+    const target = server.connFor(target_id).?;
+    _ = try server.world.join("#webhook", worldIdFromClient(target_id));
+    try std.testing.expect(server.world.channelHasFlag("#webhook", .no_external));
+    var peer: s2s_link.S2sLink = undefined;
+    try addTestRelayHomes(server, &peer, origin.shortId(), &.{"Resident"});
+    defer peer.deinit();
+    try std.testing.expect(server.meshNickHomeNode("Bot") == null);
+
+    const before = try server.relay_v2_replay_guard.encodeCheckpoint(alloc);
+    defer alloc.free(before);
+    const prefixes = [_][]const u8{
+        "=Bot!webhook@other-origin.test",
+        "=Bot!ordinary@relay-origin.test",
+        "Target!webhook@relay-origin.test",
+        "Bot!webhook@relay-origin.test",
+        "=Bot!webhook@relay-origin.test",
+        "Bot!webhook@relay-origin.test",
+        "Bot!webhook@relay-origin.test",
+    };
+    for (prefixes, 0..) |prefix, index| {
+        var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+        var signature: [message_relay_v2.sig_len]u8 = undefined;
+        var msg = message_relay_v2.RelayMessage{
+            .verb = .privmsg,
+            .target = "#webhook",
+            .source_prefix = prefix,
+            .account = if (index == 3) "forged-account" else "",
+            .sender_route_id = if (index == 5) @as(message_relay_v2.RouteId, @splat(0x5a)) else null,
+            .text = "forged webhook",
+            .scope_kind = .channel,
+            .origin_node = origin.shortId(),
+            .hlc = server.nextMeshHlc(),
+        };
+        try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+        if (index == 4) msg.text = "tampered after signing";
+        const wire = try message_relay_v2.encode(alloc, msg);
+        defer alloc.free(wire);
+        switch (server.deliverRelayV2(msg, wire, origin.shortId())) {
+            .accepted, .duplicate => return error.TestUnexpectedResult,
+            .retry, .permanent => {},
+        }
+        try std.testing.expectEqual(@as(usize, 0), target.send_len);
+        try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+        const after = try server.relay_v2_replay_guard.encodeCheckpoint(alloc);
+        defer alloc.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+    }
+
+    var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+    var signature: [message_relay_v2.sig_len]u8 = undefined;
+    var valid = message_relay_v2.RelayMessage{
+        .verb = .privmsg,
+        .target = "#webhook",
+        .source_prefix = "=Target!webhook@relay-origin.test",
+        .text = "verified webhook",
+        .scope_kind = .channel,
+        .origin_node = origin.shortId(),
+        .hlc = server.nextMeshHlc(),
+    };
+    try message_relay_v2.stampOrigin(alloc, &valid, &origin.sign_kp, &pubkey, &signature);
+    const wire = try message_relay_v2.encode(alloc, valid);
+    defer alloc.free(wire);
+    try std.testing.expect(server.deliverRelayV2(valid, wire, origin.shortId()) == .accepted);
+    try expectContains(target.send_buf[0..target.send_len], ":=Target!webhook@relay-origin.test PRIVMSG #webhook :verified webhook");
+    const delivered_len = target.send_len;
+    try std.testing.expect(server.deliverRelayV2(valid, wire, origin.shortId()) == .duplicate);
+    try std.testing.expectEqual(delivered_len, target.send_len);
+}
+
 test "MESSAGE_V2 unknown home retries then converges and delivers once" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -110729,7 +113717,12 @@ fn recvUntil(client: *LiveClient, needle: []const u8, max_polls: usize) !void {
         const deadline = platform.monotonicMillis() + budget_ms;
         while (true) {
             if (std.mem.indexOf(u8, client.written(), needle) != null) return;
-            if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+            if (platform.monotonicMillis() >= deadline) {
+                const received = client.written();
+                const tail = received[received.len - @min(received.len, 1024) ..];
+                std.debug.print("live client timeout fd={d} expected={s} received_bytes={d} tail={s}\n", .{ client.fd, needle, received.len, tail });
+                return error.TestTimeout;
+            }
             var fds = [_]posix.pollfd{.{ .fd = client.fd, .events = posix.POLL.IN, .revents = 0 }};
             const ready = posix.poll(&fds, 50) catch return error.Unexpected;
             if (ready == 0) continue;
@@ -115899,6 +118892,13 @@ test "threaded server: STATS m reports per-command usage to an oper" {
     admin.reset();
     try writeAllFd(fd_admin, "STATS i\r\n");
     try recvUntil(&admin, " 219 Oper i ", 200);
+
+    // A remote STATS target is refused honestly instead of receiving this
+    // node's local report under the remote server's name.
+    admin.reset();
+    try writeAllFd(fd_admin, "STATS u remote.example.test\r\n");
+    try recvUntil(&admin, " 402 Oper remote.example.test :No such server", 200);
+    try std.testing.expect(std.mem.indexOf(u8, admin.written(), " 242 ") == null);
 }
 
 test "threaded server: OROWASM reports ABI budgets and plugin registrations to opers" {
@@ -118737,14 +121737,14 @@ test "threaded server: user +C blocks direct CTCP except ACTION" {
     a.reset();
     b.reset();
     try writeAllFd(fd_a, "PRIVMSG B :\x01VERSION\x01\r\n");
-    try recvUntil(&a, "FAIL PRIVMSG CTCP_BLOCKED :Cannot message this user (+C: no CTCP)", 200);
+    try recvUntil(&a, "FAIL PRIVMSG CTCP_BLOCKED B :Cannot message this user (+C: no CTCP)", 200);
     try b.readAvailable();
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "\x01VERSION\x01") == null);
 
     a.reset();
     b.reset();
     try writeAllFd(fd_a, "PRIVMSG B :\x01ACTIONGRAB x\x01\r\n");
-    try recvUntil(&a, "FAIL PRIVMSG CTCP_BLOCKED :Cannot message this user (+C: no CTCP)", 200);
+    try recvUntil(&a, "FAIL PRIVMSG CTCP_BLOCKED B :Cannot message this user (+C: no CTCP)", 200);
     try b.readAvailable();
     try std.testing.expect(std.mem.indexOf(u8, b.written(), "\x01ACTIONGRAB x\x01") == null);
 
@@ -126154,7 +129154,8 @@ test "exploit: channel PRIVMSG durable admit capacity fails closed with TEMPORAR
 test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without authority drift" {
     // Direct path matches channel: true durable-admission failure emits
     // TEMPORARILY_UNAVAILABLE for PRIVMSG and stays silent for NOTICE. It never
-    // falls through to local or cross-shard recipient/sender-session delivery.
+    // falls through to local or cross-shard recipient/sender-session delivery;
+    // the sole fabric record is the bounded operator busy-reject telemetry.
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     defer current_reactor = null;
@@ -126330,7 +129331,19 @@ test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without au
     try std.testing.expectEqual(@as(usize, 0), sender_sibling.send_len);
     try std.testing.expectEqual(@as(usize, 0), target_sibling.send_len);
     var pending: [4]reactor_fabric.DeliverMsg = undefined;
-    try std.testing.expectEqual(@as(usize, 0), server.fabric.?.drain(1, &pending));
+    const busy_pending = server.fabric.?.drain(1, &pending);
+    try std.testing.expectEqual(@as(usize, 1), busy_pending);
+    try std.testing.expectEqual(
+        @as(?u6, @backingInt(event_spine.EventCategory.@"error")),
+        pending[0].broadcast_category,
+    );
+    try expectContains(pending[0].buf.data[0..pending[0].buf.len], "MESSAGE_BUSY_REJECT");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pending[0].buf.data[0..pending[0].buf.len],
+        "dm-must-not-fall-through",
+    ) == null);
+    server.fabric.?.release(1, pending[0].buf);
     var after_privmsg = try AuthoritySnapshot.capture(server, allocator);
     defer after_privmsg.deinit();
     try before.expectEqual(&after_privmsg);
@@ -126350,7 +129363,19 @@ test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without au
     try std.testing.expectEqual(@as(usize, 0), target.send_len);
     try std.testing.expectEqual(@as(usize, 0), sender_sibling.send_len);
     try std.testing.expectEqual(@as(usize, 0), target_sibling.send_len);
-    try std.testing.expectEqual(@as(usize, 0), server.fabric.?.drain(1, &pending));
+    const notice_busy_pending = server.fabric.?.drain(1, &pending);
+    try std.testing.expectEqual(@as(usize, 1), notice_busy_pending);
+    try std.testing.expectEqual(
+        @as(?u6, @backingInt(event_spine.EventCategory.@"error")),
+        pending[0].broadcast_category,
+    );
+    try expectContains(pending[0].buf.data[0..pending[0].buf.len], "command=NOTICE");
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pending[0].buf.data[0..pending[0].buf.len],
+        "notice-must-not-fall-through",
+    ) == null);
+    server.fabric.?.release(1, pending[0].buf);
     var after_notice = try AuthoritySnapshot.capture(server, allocator);
     defer after_notice.deinit();
     try before.expectEqual(&after_notice);
@@ -127688,6 +130713,19 @@ test "threaded server: MODEX NOFORMAT does not collide with channel forward +f" 
     a.reset();
     try writeAllFd(fd_b, "PRIVMSG #c :\x02bold\x02\r\n");
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #c :bold\r\n", 200);
+
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #c :\x0304red\x0f\r\n");
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #c :red\r\n", 200);
+
+    // A formatting-only non-empty body must not become an empty trailing
+    // parameter. Preserve the original bytes for both message verbs.
+    a.reset();
+    try writeAllFd(fd_b, "PRIVMSG #c :\x0304,12\x0f\r\n");
+    try recvUntil(&a, ":B!bob@localhost PRIVMSG #c :\x0304,12\x0f\r\n", 200);
+    a.reset();
+    try writeAllFd(fd_b, "NOTICE #c :\x02\x0f\r\n");
+    try recvUntil(&a, ":B!bob@localhost NOTICE #c :\x02\x0f\r\n", 200);
 
     try writeAllFd(fd_a, "JOIN #overflow\r\n");
     try recvUntil(&a, " 366 A #overflow ", 200);
@@ -139098,7 +142136,21 @@ fn expectDrainingRouteUsesSurvivor(operation: DrainingRouteOperation) !void {
         .ack_confirm => server.sendRelayV2AckConfirmToPeer(peer, relay_id),
         .e2ee_ack => try std.testing.expect(server.sendE2eeGroupAckToPeer(peer, relay_id)),
         .e2ee_confirm => server.sendE2eeGroupAckConfirmToPeer(peer, relay_id),
-        .oper_event => server.meshBroadcastOperEvent(.server_link, .notice, "survivor-only"),
+        .oper_event => {
+            var oper_pubkey: [oper_event.pubkey_len]u8 = undefined;
+            var oper_signature: [oper_event.sig_len]u8 = undefined;
+            var oper = oper_event.SignedOperEventV2{
+                .category = @backingInt(event_spine.EventCategory.server_link),
+                .severity = @backingInt(event_spine.EventSeverity.notice),
+                .origin_node = pairs[0].ida.shortId(),
+                .hlc = 700,
+                .origin_server = "replay-a.test",
+                .subject = "survivor-only",
+                .message = "survivor-only",
+            };
+            oper_event.stampOrigin(&oper, &pairs[0].ida.sign_kp, &oper_pubkey, &oper_signature) catch return error.TestUnexpectedResult;
+            server.meshBroadcastAuthoredOperEventV2(oper);
+        },
         .legacy_message => try std.testing.expectEqual(@as(usize, 1), server.relayToPeers(.{
             .verb = .privmsg,
             .target = "#draining-route",
@@ -139139,14 +142191,15 @@ fn expectDrainingRouteUsesSurvivor(operation: DrainingRouteOperation) !void {
             try std.testing.expectEqualSlices(u8, &relay_id, &receipts[0]);
         },
         .oper_event => {
-            const events = try pairs[1].b.takeOperEvents();
+            const events = try pairs[1].b.takeOperEventsV2();
             defer {
-                for (events) |event| alloc.free(event);
+                for (events) |*event| event.deinit(alloc);
                 alloc.free(events);
             }
             try std.testing.expectEqual(@as(usize, 1), events.len);
-            const event = try oper_event.decode(events[0]);
+            const event = try oper_event.decodeV2(events[0].wire);
             try std.testing.expectEqualStrings("survivor-only", event.message);
+            try std.testing.expectEqual(oper_event.VerifyOutcome.verified, oper_event.verifyOrigin(event));
         },
         .legacy_message => {
             const inbound = try pairs[1].b.takeInbound();
@@ -140297,6 +143350,181 @@ test "GAP-O8 mesh ban filter is exchanged before the authoritative list" {
     std.debug.print("GAP-O8 branch=filter exchanged before the ward list; a hit is re-checked and is not the authority\n", .{});
 }
 
+test "ACCESS_EVENT_V1 burst and drain converge an add then a tombstone across secured servers" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    // Non-vacuous topology: the exact capability the burst gates on.
+    try std.testing.expect(pair.a.supportsAccessEventV1());
+    try std.testing.expect(pair.b.supportsAccessEventV1());
+
+    var sender = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .server_name = "access-a.test",
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer sender.deinit();
+    current_reactor = &sender.reactors[0];
+
+    sender.syncAccessLocalNode();
+    try std.testing.expectEqual(pair.ida.shortId(), sender.access.local_node);
+    sender.access.now_seconds = 100;
+    const add_hlc_before = sender.access.hlc;
+    try sender.access.add("#MeshAccess", .host, "alice!*@example.test", "Founder", null);
+    const stamp = sender.access.lastStamp();
+    try std.testing.expectEqual(pair.ida.shortId(), stamp.origin_node);
+
+    // Origination with no peer slot attached still signs and commits the
+    // daemon-global guard, which is the exact-wire identity a returning
+    // copy is admitted against.
+    sender.broadcastAccessChangesSince(add_hlc_before, "#MeshAccess");
+    var pk_buf: [ircx_access_event.pubkey_len]u8 = undefined;
+    var sig_buf: [ircx_access_event.sig_len]u8 = undefined;
+    const signed_add = sender.signAccessEvent(.{
+        .present = true,
+        .origin_node = pair.ida.shortId(),
+        .hlc = stamp.hlc,
+        .channel = "#MeshAccess",
+        .level = .host,
+        .mask = "alice!*@example.test",
+        .set_by = "Founder",
+        .duration = 0,
+    }, &pk_buf, &sig_buf).?;
+    var wire_buf: [1024]u8 = undefined;
+    const add_wire = try ircx_access_event.encode(signed_add, &wire_buf);
+    const add_id = s2s_peer_mod.S2sPeer.accessEventIdForWire(add_wire);
+    try std.testing.expect(sender.access_event_seen.contains(add_id));
+
+    var link_conn_a = ConnState.init(-1);
+    link_conn_a.overflow_allocator = allocator;
+    link_conn_a.send_armed = true;
+    link_conn_a.s2s_secured = &pair.a;
+    defer link_conn_a.s2s_secured = null;
+    try std.testing.expect(sender.sendAccessBurstTo(&link_conn_a));
+    const burst_add = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(burst_add);
+    pair.a.clearOutbound();
+    try std.testing.expect(burst_add.len != 0);
+
+    var receiver = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.idb.shortId(),
+        .server_name = "access-b.test",
+        .node_identity = &pair.idb,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer receiver.deinit();
+    current_reactor = &receiver.reactors[0];
+
+    try pair.b.feed(burst_add, 800);
+    var link_conn_b = ConnState.init(-1);
+    link_conn_b.overflow_allocator = allocator;
+    link_conn_b.send_armed = true;
+    link_conn_b.s2s_secured = &pair.b;
+    defer link_conn_b.s2s_secured = null;
+    receiver.drainAccessEventsV1(&link_conn_b, &pair.b);
+
+    var views: [4]ircx_access_store.EntryView = undefined;
+    const got = try receiver.access.list("#meshaccess", &views);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expectEqual(ircx_access_store.Level.host, got[0].level);
+    try std.testing.expectEqualStrings("alice!*@example.test", got[0].mask);
+    try std.testing.expectEqualStrings("Founder", got[0].set_by);
+    try std.testing.expectEqual(pair.ida.shortId(), got[0].origin_node);
+    try std.testing.expectEqual(stamp.hlc, got[0].hlc);
+    try std.testing.expect(receiver.access_event_seen.contains(add_id));
+
+    // A timed entry bursts with its ORIGINAL authored duration verbatim
+    // (sign-once): a locally recomputed remaining lifetime would mint a
+    // second valid wire for the same (hlc, origin) rank.
+    current_reactor = &sender.reactors[0];
+    sender.access.now_seconds = 100;
+    try sender.access.add("#MeshTimed", .voice, "carol!*@example.test", "Founder", 2_000_000_000);
+    try std.testing.expect(sender.sendAccessBurstTo(&link_conn_a));
+    const burst_timed = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(burst_timed);
+    pair.a.clearOutbound();
+    try std.testing.expect(burst_timed.len != 0);
+    current_reactor = &receiver.reactors[0];
+    try pair.b.feed(burst_timed, 850);
+    receiver.drainAccessEventsV1(&link_conn_b, &pair.b);
+    const timed_got = try receiver.access.list("#MeshTimed", &views);
+    try std.testing.expectEqual(@as(usize, 1), timed_got.len);
+    try std.testing.expectEqual(@as(?u64, 2_000_000_000), timed_got[0].duration);
+
+    // Draining again with no new frames is a no-op, and the entry stays.
+    receiver.drainAccessEventsV1(&link_conn_b, &pair.b);
+    try std.testing.expectEqual(@as(usize, 1), (try receiver.access.list("#MeshAccess", &views)).len);
+
+    // Retract on the origin; the next burst ships the tombstone and the
+    // receiver converges on absence instead of resurrecting the grant.
+    current_reactor = &sender.reactors[0];
+    sender.access.now_seconds = 200;
+    try std.testing.expect(try sender.access.remove("#MeshAccess", .host, "alice!*@example.test"));
+    try std.testing.expect(sender.sendAccessBurstTo(&link_conn_a));
+    const burst_del = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(burst_del);
+    pair.a.clearOutbound();
+    try std.testing.expect(burst_del.len != 0);
+
+    current_reactor = &receiver.reactors[0];
+    try pair.b.feed(burst_del, 900);
+    receiver.drainAccessEventsV1(&link_conn_b, &pair.b);
+    try std.testing.expectEqual(@as(usize, 0), (try receiver.access.list("#MeshAccess", &views)).len);
+    try std.testing.expect(receiver.access.tombstoneCount() >= 1);
+
+    current_reactor = null;
+}
+
+test "SIGTERM and SIGINT handlers request cooperative stop only on reactor zero" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    // Invoke the signal-safe handler directly; never install or send process
+    // signals in a shared test runner. Preserve every process-global latch.
+    const previous_stop = termination_signal_requested.swap(false, .seq_cst);
+    defer termination_signal_requested.store(previous_stop, .seq_cst);
+    defer current_reactor = null;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .num_shards = 2 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var run = std.atomic.Value(bool).init(true);
+    server.shutdown = &run;
+    defer server.shutdown = null;
+    for ([_]posix.SIG{ posix.SIG.TERM, posix.SIG.INT }) |signal| {
+        run.store(true, .release);
+        onTerminationSignal(signal);
+        try std.testing.expect(run.load(.acquire)); // handler did no teardown
+        current_reactor = &server.reactors[1];
+        server.onTimerTick();
+        try std.testing.expect(run.load(.acquire));
+        try std.testing.expect(termination_signal_requested.load(.seq_cst));
+        current_reactor = &server.reactors[0];
+        server.onTimerTick();
+        try std.testing.expect(!run.load(.acquire));
+        try std.testing.expect(!termination_signal_requested.load(.seq_cst));
+        // No second stop request remains for another maintenance turn.
+        run.store(true, .release);
+        server.onTimerTick();
+        try std.testing.expect(run.load(.acquire));
+    }
+}
+
 test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         // Deterministic, execve-safe: drive the handler directly (it only stores the
@@ -140915,6 +144143,31 @@ test "threaded server: [mesh].connect auto-links two nodes without an oper" {
             }
         }
         try std.testing.expect(whois_seen);
+
+        // B-side MODE list witness: D (channel creator on node 2) sets a ban
+        // and an exempt there; C, joined to the same channel FROM NODE 1,
+        // must see node 2's masks in its +b/+e list queries (367/348) once
+        // the channel-list gossip converges — not an empty local list.
+        try writeAllFd(fd_d, "MODE #mesh +b *!*@banned.example\r\n");
+        try recvUntil(&d, "MODE #mesh +b", 200);
+        try writeAllFd(fd_d, "MODE #mesh +e *!*@exempt.example\r\n");
+        try recvUntil(&d, "MODE #mesh +e", 200);
+        try writeAllFd(fd_c, "JOIN #mesh\r\n");
+        try recvUntil(&c, "JOIN", 200);
+
+        var lists_seen = false;
+        probes = 0;
+        while (probes < 120 and !lists_seen) : (probes += 1) {
+            c.reset();
+            try writeAllFd(fd_c, "MODE #mesh +b\r\n");
+            recvUntil(&c, " 368 C #mesh ", 200) catch {};
+            if (std.mem.indexOf(u8, c.written(), " 367 C #mesh *!*@banned.example") == null) continue;
+            c.reset();
+            try writeAllFd(fd_c, "MODE #mesh +e\r\n");
+            recvUntil(&c, " 349 C #mesh ", 200) catch {};
+            if (std.mem.indexOf(u8, c.written(), " 348 C #mesh *!*@exempt.example") != null) lists_seen = true;
+        }
+        try std.testing.expect(lists_seen);
     } else return error.SkipZigTest;
 }
 
@@ -141828,7 +145081,14 @@ test "threaded server: one reusable session stays live and participatory across 
     try recvUntil(a, "PRIVMSG #mesh-session :webhook-for-all-attachments", 400);
     try recvUntil(b, "PRIVMSG #mesh-session :webhook-for-all-attachments", 400);
     try recvUntil(c, "PRIVMSG #mesh-session :webhook-for-all-attachments", 400);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(a.written(), "PRIVMSG #mesh-session :webhook-for-all-attachments"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(b.written(), "PRIVMSG #mesh-session :webhook-for-all-attachments"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(c.written(), "PRIVMSG #mesh-session :webhook-for-all-attachments"));
+    try expectContains(a.written(), ":=CI-Bot!webhook@");
+    try expectContains(b.written(), ":=CI-Bot!webhook@");
+    try expectContains(c.written(), ":=CI-Bot!webhook@");
     const webhook_msgid = extractMsgid(a.written()) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(node1.relayV2MsgidAuthorityForTest(webhook_msgid).admitted);
     const webhook_time = extractTimeTag(a.written()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(webhook_msgid, extractMsgid(b.written()) orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings(webhook_msgid, extractMsgid(c.written()) orelse return error.TestUnexpectedResult);
@@ -149019,6 +152279,182 @@ test "WHOWAS privacy: departing account retains visible host and account only" {
     try std.testing.expect(std.mem.indexOf(u8, out, "203.0.113.10") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "localhost") == null);
     std.debug.print("WHOWAS privacy: public visible host with account retained\n", .{});
+}
+
+test "media recorder lifecycle: journal finalizes with manifest at 0600" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rec_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/recordings", .{tmp.sub_path});
+    defer std.testing.allocator.free(rec_dir);
+    server.config.crypto_io = std.testing.io;
+    server.config.media_recording_dir = rec_dir;
+
+    // The minimum accepted total quota must support a real recording, even
+    // though it is smaller than the normal 64 MiB segment target.
+    server.config.media_recording_max_total_bytes = 64 * 1024;
+
+    // Disabled by default: no journal is created.
+    try std.testing.expect(!server.startMediaRecorder("#rec"));
+    server.config.media_recording_enabled = true;
+    try std.testing.expect(server.startMediaRecorder("#rec"));
+    try std.testing.expect(server.startMediaRecorder("#rec")); // idempotent
+
+    const active = server.media_recorders.get("#rec").?;
+    try std.testing.expect(server.media_rooms.upgradeContinuityReady());
+    const active_file = active.writer.file;
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.media_recording, server.upgradeContinuityBlockerLocked().?);
+    try std.testing.expectEqual(active_file, active.writer.file);
+    try std.testing.expect(server.media_recorders.get("#rec") == active and !active.retired);
+    const tap = native_media_link.TapEvent{
+        .transport = .native_cadence,
+        .channel = "#rec",
+        .participant = "alice",
+        .kind = .voice,
+        .codec = .cadencevox,
+        .timestamp = 0xfffffff0,
+        .payload = "audio-0",
+    };
+    LinuxServer.mediaRecordTap(&server, tap);
+    // The actual pump callback only owns queued memory: even the first track
+    // declaration waits for maintenance, and a contended lock drops promptly.
+    try std.testing.expectEqual(@as(usize, 0), active.writer.track_count);
+    lockSpin(&server.media_recorder_mu);
+    LinuxServer.mediaRecordTap(&server, tap);
+    server.media_recorder_mu.unlock();
+    server.drainMediaRecorders();
+    try std.testing.expectEqual(@as(usize, 1), active.writer.track_count);
+    try std.testing.expectEqual(@as(u64, 1), active.writer.stats.packets_written);
+
+    // A late caption has a different producer clock and a new track. It must
+    // rotate and progress rather than poison the queue behind an epoch PTS.
+    server.recordMediaPacket("#rec", "bob", .caption, "text", 0, 0, 0, platform.realtimeMillis() * 1000, 0, false, "hello captions");
+    server.recordMediaPacket("#other", "alice", .audio, "cadencevox", 48000, 0, 0, 0, 20000, false, "not-recorded");
+    server.drainMediaRecorders();
+    try std.testing.expectEqual(@as(u64, 2), active.writer.stats.packets_written);
+    try std.testing.expectEqual(@as(usize, 2), active.writer.track_count);
+    try std.testing.expect(server.stopMediaRecorder("#rec"));
+    try std.testing.expect(!server.stopMediaRecorder("#rec"));
+    try std.testing.expect(active.retired);
+    try std.testing.expect(active.writer.file != null); // no file I/O in stop
+    try std.testing.expectEqual(Server.UpgradeContinuityBlocker.media_recording, server.upgradeContinuityBlockerLocked().?);
+    LinuxServer.mediaRecordTap(&server, tap); // producer authority is gone
+    server.drainMediaRecorders();
+    try std.testing.expect(server.media_recorder_head == null);
+    try std.testing.expect(server.upgradeContinuityBlockerLocked() == null);
+
+    var dir = try tmp.dir.openDir(std.testing.io, "recordings", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var total_bytes: u64 = 0;
+    var segments: usize = 0;
+    var manifests: usize = 0;
+    var packets: u64 = 0;
+    var max_tracks: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        total_bytes += (try dir.statFile(std.testing.io, entry.name, .{})).size;
+        if (std.mem.endsWith(u8, entry.name, ".manifest.json")) manifests += 1;
+        try std.testing.expect(!std.mem.endsWith(u8, entry.name, ".part"));
+        if (!std.mem.endsWith(u8, entry.name, ".onyxrec")) continue;
+        segments += 1;
+        try std.testing.expect(media_record.isOwnedSegmentName(entry.name));
+        const bytes = try dir.readFileAlloc(std.testing.io, entry.name, std.testing.allocator, .limited(1 << 20));
+        defer std.testing.allocator.free(bytes);
+        const scanned = media_record.scan(bytes, null);
+        try std.testing.expect(scanned.finalized);
+        packets += scanned.packet_count;
+        max_tracks = @max(max_tracks, scanned.track_count);
+        try std.testing.expect((scanned.first_pts_us orelse return error.TestUnexpectedResult) < 60_000_000);
+        const stat = try dir.statFile(std.testing.io, entry.name, .{});
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o7777);
+    }
+    try std.testing.expect(total_bytes > 0 and total_bytes <= server.config.media_recording_max_total_bytes);
+    try std.testing.expectEqual(@as(usize, 2), segments);
+    try std.testing.expectEqual(segments, manifests);
+    try std.testing.expectEqual(@as(u64, 2), packets);
+    try std.testing.expectEqual(@as(usize, 2), max_tracks);
+}
+
+test "media recorder retirement retains pending and final manifests across allocation failure" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    const Fault = enum { end_frame, pending_rotation, final_manifest };
+    for ([_]Fault{ .end_frame, .pending_rotation, .final_manifest }) |fault| {
+        const pending_rotation = fault == .pending_rotation;
+        var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0, .tls_port = 0 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer server.deinit();
+        current_reactor = &server.reactors[0];
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const rec_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/recordings", .{tmp.sub_path});
+        defer alloc.free(rec_dir);
+        server.config.crypto_io = std.testing.io;
+        server.config.media_recording_dir = rec_dir;
+        server.config.media_recording_enabled = true;
+        try std.testing.expect(server.startMediaRecorder("#retry"));
+        const active = server.media_recorders.get("#retry").?;
+        server.recordMediaPacket("#retry", "alice", .audio, "opus", 48000, 0, 0, 0, 20000, false, "accepted-payload");
+        server.drainMediaRecorders();
+        if (pending_rotation) {
+            active.writer.pending_manifest = try active.writer.rotate();
+            server.recordMediaPacket("#retry", "alice", .audio, "opus", 48000, 0, 0, 1, 20000, false, "queued-before-stop");
+        }
+        try std.testing.expect(server.stopMediaRecorder("#retry"));
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        server.allocator = failing.allocator();
+        // Keep the writer allocator healthy when targeting the server's final
+        // sidecar; otherwise its earlier end-frame allocation fails first.
+        if (fault != .final_manifest) active.writer.allocator = failing.allocator();
+        server.drainMediaRecorders();
+        server.allocator = alloc;
+        active.writer.allocator = alloc;
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(server.media_recorders.get("#retry") == null);
+        try std.testing.expect(server.media_recorder_head == active);
+        try std.testing.expect(active.retired);
+        try std.testing.expectEqual(Server.UpgradeContinuityBlocker.media_recording, server.upgradeContinuityBlockerLocked().?);
+        if (pending_rotation) {
+            try std.testing.expect(active.writer.pending_manifest != null);
+            try std.testing.expect(!active.queue.isEmpty());
+        } else if (fault == .final_manifest) {
+            try std.testing.expect(active.final_manifest != null);
+        } else {
+            try std.testing.expect(active.final_manifest == null and active.writer.file != null);
+            try std.testing.expectEqual(@as(u64, 1), active.writer.stats.packets_written);
+        }
+        server.drainMediaRecorders();
+        try std.testing.expect(server.media_recorder_head == null);
+        try std.testing.expect(server.upgradeContinuityBlockerLocked() == null);
+        var dir = try tmp.dir.openDir(std.testing.io, "recordings", .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var segments: usize = 0;
+        var manifests: usize = 0;
+        var packets: u64 = 0;
+        var it = dir.iterate();
+        while (try it.next(std.testing.io)) |entry| {
+            if (std.mem.endsWith(u8, entry.name, ".manifest.json")) manifests += 1;
+            if (!std.mem.endsWith(u8, entry.name, ".onyxrec")) continue;
+            segments += 1;
+            const scanned = try media_record.scanFile(alloc, std.testing.io, dir, entry.name, null, 1 << 20);
+            try std.testing.expect(scanned.finalized);
+            packets += scanned.packet_count;
+        }
+        try std.testing.expectEqual(@as(usize, if (pending_rotation) 2 else 1), segments);
+        try std.testing.expectEqual(segments, manifests);
+        try std.testing.expectEqual(@as(u64, if (pending_rotation) 2 else 1), packets);
+    }
 }
 
 test "rotateTicketKey moves current to previous and generates a fresh key" {

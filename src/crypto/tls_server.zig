@@ -3762,7 +3762,10 @@ fn sealRecordBatchAlloc(allocator: Allocator, suite: CipherSuite, keys: *const T
 
 fn sealRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const TrafficKeys, seq: u64, typ: tls_record.ContentType, plaintext: []const u8) Error![]u8 {
     const inner = try allocator.alloc(u8, plaintext.len + 1);
-    defer allocator.free(inner);
+    defer {
+        secureZero(inner);
+        allocator.free(inner);
+    }
     const encoded = try tls_record.encodeInnerPlaintext(typ, plaintext, 0, inner);
     const encrypted_len = encoded.len + suite.tagLen();
     var out = try allocator.alloc(u8, tls_record.record_header_len + encrypted_len);
@@ -3772,19 +3775,22 @@ fn sealRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const Traffi
     const nonce = tls_record.deriveNonce(keys.iv, seq);
     switch (suite) {
         .tls_aes_128_gcm_sha256 => {
-            const key = keys.key[0..Aes128Gcm.key_length].*;
+            var key = keys.key[0..Aes128Gcm.key_length].*;
+            defer secureZero(&key);
             var tag: [Aes128Gcm.tag_length]u8 = undefined;
             Aes128Gcm.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
             @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
         },
         .tls_aes_256_gcm_sha384 => {
-            const key = keys.key[0..Aes256Gcm.key_length].*;
+            var key = keys.key[0..Aes256Gcm.key_length].*;
+            defer secureZero(&key);
             var tag: [Aes256Gcm.tag_length]u8 = undefined;
             Aes256Gcm.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
             @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
         },
         .tls_chacha20_poly1305_sha256 => {
-            const key = keys.key[0..ChaCha20Poly1305.key_length].*;
+            var key = keys.key[0..ChaCha20Poly1305.key_length].*;
+            defer secureZero(&key);
             var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
             ChaCha20Poly1305.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
             @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
@@ -3798,28 +3804,35 @@ fn openRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const Traffi
     if (parsed.encrypted_record.len < suite.tagLen()) return error.RecordAuthenticationFailed;
     const clen = parsed.encrypted_record.len - suite.tagLen();
     const inner = try allocator.alloc(u8, clen);
-    errdefer allocator.free(inner);
+    errdefer {
+        secureZero(inner);
+        allocator.free(inner);
+    }
     const aad = parsed.headerBytes();
     const nonce = tls_record.deriveNonce(keys.iv, seq);
     switch (suite) {
         .tls_aes_128_gcm_sha256 => {
-            const key = keys.key[0..Aes128Gcm.key_length].*;
+            var key = keys.key[0..Aes128Gcm.key_length].*;
+            defer secureZero(&key);
             const tag = parsed.encrypted_record[clen..][0..Aes128Gcm.tag_length].*;
             Aes128Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
         },
         .tls_aes_256_gcm_sha384 => {
-            const key = keys.key[0..Aes256Gcm.key_length].*;
+            var key = keys.key[0..Aes256Gcm.key_length].*;
+            defer secureZero(&key);
             const tag = parsed.encrypted_record[clen..][0..Aes256Gcm.tag_length].*;
             Aes256Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
         },
         .tls_chacha20_poly1305_sha256 => {
-            const key = keys.key[0..ChaCha20Poly1305.key_length].*;
+            var key = keys.key[0..ChaCha20Poly1305.key_length].*;
+            defer secureZero(&key);
             const tag = parsed.encrypted_record[clen..][0..ChaCha20Poly1305.tag_length].*;
             ChaCha20Poly1305.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
         },
     }
     const opened = try tls_record.decodeInnerPlaintext(inner);
     const content = try allocator.dupe(u8, opened.content);
+    secureZero(inner);
     allocator.free(inner);
     return .{ .content_type = opened.content_type, .content = content, .inner_len = clen };
 }

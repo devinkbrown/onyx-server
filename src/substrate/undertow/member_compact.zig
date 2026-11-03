@@ -59,9 +59,11 @@ pub const DecodeError = error{
     InvalidMember,
     TrailingBytes,
     VarintTooLong,
+    VarintOverflow,
+    NonCanonicalVarint,
 };
 
-pub const EncodeError = error{ BufferTooSmall, Oversize };
+pub const EncodeError = error{ BufferTooSmall, Oversize, InvalidMember };
 
 /// Decoded, alloc-free view. Add values point into the caller's decode buffer.
 pub const View = struct {
@@ -87,6 +89,47 @@ fn lessAdd(_: void, a: [add_value_len]u8, b: [add_value_len]u8) bool {
     return std.mem.order(u8, &a, &b) == .lt;
 }
 
+fn readAddU64(add: *const [add_value_len]u8, offset: usize) u64 {
+    var value: u64 = 0;
+    var idx: usize = 0;
+    while (idx < 8) : (idx += 1) {
+        value |= @as(u64, add[offset + idx]) << @as(u6, @intCast(idx * 8));
+    }
+    return value;
+}
+
+fn contextCounter(context: []const Entry, replica: u64) u64 {
+    for (context) |entry| {
+        if (entry.replica == replica) return entry.counter;
+    }
+    return 0;
+}
+
+fn validateContext(context: []const Entry) error{InvalidMember}!void {
+    var prev_replica: ?u64 = null;
+    for (context) |entry| {
+        if (entry.counter == 0) return error.InvalidMember;
+        if (prev_replica) |prev| {
+            // A VersionVector frontier carries one maximum counter per replica,
+            // so equal replicas are duplicates even when their counters differ.
+            if (entry.replica <= prev) return error.InvalidMember;
+        }
+        prev_replica = entry.replica;
+    }
+}
+
+fn validateAdds(context: []const Entry, adds: []const [add_value_len]u8) error{InvalidMember}!void {
+    for (adds, 0..) |*add, idx| {
+        const replica = readAddU64(add, 0);
+        const counter = readAddU64(add, 8);
+        if (counter == 0 or contextCounter(context, replica) < counter) return error.InvalidMember;
+        if (idx > 0) {
+            if (std.mem.order(u8, &adds[idx - 1], add) != .lt) return error.InvalidMember;
+            if (std.mem.eql(u8, adds[idx - 1][0..16], add[0..16])) return error.InvalidMember;
+        }
+    }
+}
+
 /// Encode a canonical compact member payload. The context frontier and add
 /// values are sorted so equal logical state ALWAYS yields identical bytes,
 /// regardless of the internal merge/delivery order of the caller's arrays. This
@@ -106,10 +149,12 @@ pub fn encode(
     var ctx: [max_context]Entry = undefined;
     @memcpy(ctx[0..context.len], context);
     std.mem.sort(Entry, ctx[0..context.len], {}, lessEntry);
+    try validateContext(ctx[0..context.len]);
 
     var av: [max_adds][add_value_len]u8 = undefined;
     for (adds, 0..) |a, i| av[i] = a;
     std.mem.sort([add_value_len]u8, av[0..adds.len], {}, lessAdd);
+    try validateAdds(ctx[0..context.len], av[0..adds.len]);
 
     var w = Writer{ .buf = out };
     try w.writeBytes(&magic);
@@ -143,16 +188,12 @@ pub fn decode(bytes: []const u8) DecodeError!View {
     while (i < cc) : (i += 1) {
         const replica = try r.readU64();
         const counter = try r.readU64();
-        // A frontier never carries a zero counter; reject fail-closed, mirroring
-        // the dense codec's `validateDot` rejection of counter-0 dots.
-        if (counter == 0) return error.InvalidMember;
         const entry = Entry{ .replica = replica, .counter = counter };
-        // Enforce the canonical strict-ascending order the encoder emits, so a
-        // non-canonical or duplicate-replica frame is rejected (parity with the
-        // dense codec's NonCanonicalOrder/DuplicateDot rules).
-        if (prev_entry) |p| {
-            if (!lessEntry({}, p, entry)) return error.InvalidMember;
-        }
+        // Enforce the canonical strict-replica order the encoder emits. A
+        // frontier has one maximum counter per replica; accepting two counters
+        // for one replica would admit multiple bytes for the same logical state.
+        if (entry.counter == 0) return error.InvalidMember;
+        if (prev_entry) |p| if (entry.replica <= p.replica) return error.InvalidMember;
         prev_entry = entry;
         v.context[i] = entry;
     }
@@ -164,14 +205,8 @@ pub fn decode(bytes: []const u8) DecodeError!View {
     while (i < ac) : (i += 1) {
         const slice = try r.readFixed(add_value_len);
         @memcpy(&v.adds[i], slice);
-        if (i > 0) {
-            // Strict ascending value order rejects duplicate/non-canonical adds…
-            if (std.mem.order(u8, &v.adds[i - 1], &v.adds[i]) != .lt) return error.InvalidMember;
-            // …and the dot prefix (first 16 bytes) must differ, mirroring the
-            // dense codec's DuplicateDot rule for two adds sharing one dot.
-            if (std.mem.eql(u8, v.adds[i - 1][0..16], v.adds[i][0..16])) return error.InvalidMember;
-        }
     }
+    try validateAdds(v.context[0..v.context_len], v.adds[0..v.adds_len]);
 
     if (!r.done()) return error.TrailingBytes;
     return v;
@@ -236,16 +271,28 @@ const Reader = struct {
         return value;
     }
     fn readVarint(self: *Reader) DecodeError!usize {
+        const start = self.pos;
+        var pos = self.pos;
         var value: u64 = 0;
         var i: usize = 0;
         while (i < varint_max) : (i += 1) {
-            const byte = try self.readU8();
-            value |= @as(u64, byte & 0x7f) << @as(u6, @intCast(i * 7));
+            if (pos >= self.buf.len) return error.Truncated;
+            const byte = self.buf[pos];
+            pos += 1;
+            const payload = byte & 0x7f;
+            if (i == varint_max - 1 and payload > 1) return error.VarintOverflow;
+            value |= @as(u64, payload) << @as(u6, @intCast(i * 7));
             if ((byte & 0x80) == 0) {
+                if (i + 1 != varintLen(value)) {
+                    self.pos = start;
+                    return error.NonCanonicalVarint;
+                }
                 if (value > std.math.maxInt(usize)) return error.Oversize;
+                self.pos = pos;
                 return @intCast(value);
             }
         }
+        self.pos = start;
         return error.VarintTooLong;
     }
     fn readFixed(self: *Reader, len: usize) DecodeError![]const u8 {
@@ -255,6 +302,13 @@ const Reader = struct {
         return bytes;
     }
 };
+
+fn varintLen(value: u64) usize {
+    var n = value;
+    var len: usize = 1;
+    while (n >= 0x80) : (len += 1) n >>= 7;
+    return len;
+}
 
 test "Undertow mesh member_compact round-trips context frontier and adds" {
     var ctx = [_]Entry{
@@ -324,7 +378,9 @@ test "Undertow mesh member_compact encode is canonical regardless of input order
     @memset(&add0, 0);
     @memset(&add1, 0);
     add0[0] = 1; // dot replica 1
+    add0[8] = 1; // dot counter 1
     add1[0] = 5; // dot replica 5
+    add1[8] = 1; // dot counter 1
     var adds_a = [_][add_value_len]u8{ add1, add0 };
     var adds_b = [_][add_value_len]u8{ add0, add1 };
 
@@ -357,11 +413,87 @@ test "Undertow mesh member_compact decode rejects non-canonical order" {
     try std.testing.expectError(error.InvalidMember, decode(w.written()));
 }
 
+test "Undertow mesh member_compact rejects duplicate frontier replicas" {
+    // A version-vector frontier has exactly one counter per replica. Distinct
+    // counters for the same replica are still a duplicate logical entry, not a
+    // valid strictly-ascending frontier.
+    var buf: [max_bytes]u8 = undefined;
+    var w = Writer{ .buf = &buf };
+    try w.writeBytes(&magic);
+    try w.writeU8(version);
+    try w.writeU64(9); // member_id
+    try w.writeU64(0); // hlc
+    try w.writeVarint(2); // context_len
+    try w.writeU64(5);
+    try w.writeU64(1);
+    try w.writeU64(5);
+    try w.writeU64(2);
+    try w.writeVarint(0); // adds
+    try std.testing.expectError(error.InvalidMember, decode(w.written()));
+}
+
+test "Undertow mesh member_compact rejects live adds outside the frontier" {
+    var buf: [max_bytes]u8 = undefined;
+    var w = Writer{ .buf = &buf };
+    try w.writeBytes(&magic);
+    try w.writeU8(version);
+    try w.writeU64(9);
+    try w.writeU64(0);
+    try w.writeVarint(1);
+    try w.writeU64(5); // context replica
+    try w.writeU64(7); // context counter
+    try w.writeVarint(1);
+    var add: [add_value_len]u8 = @splat(0);
+    add[0] = 5; // add replica
+    add[8] = 8; // add counter exceeds the frontier
+    try w.writeBytes(&add);
+    try std.testing.expectError(error.InvalidMember, decode(w.written()));
+}
+
+test "Undertow mesh member_compact rejects non-canonical and overflowing varints" {
+    var noncanonical_buf: [max_bytes]u8 = undefined;
+    var noncanonical = Writer{ .buf = &noncanonical_buf };
+    try noncanonical.writeBytes(&magic);
+    try noncanonical.writeU8(version);
+    try noncanonical.writeU64(9);
+    try noncanonical.writeU64(0);
+    try noncanonical.writeU8(0x80);
+    try noncanonical.writeU8(0x00); // overlong encoding of context_len = 0
+    try noncanonical.writeVarint(0); // adds
+    try std.testing.expectError(error.NonCanonicalVarint, decode(noncanonical.written()));
+
+    var overflow_buf: [max_bytes]u8 = undefined;
+    var overflow = Writer{ .buf = &overflow_buf };
+    try overflow.writeBytes(&magic);
+    try overflow.writeU8(version);
+    try overflow.writeU64(9);
+    try overflow.writeU64(0);
+    var i: usize = 0;
+    while (i < varint_max - 1) : (i += 1) try overflow.writeU8(0xff);
+    try overflow.writeU8(0x02); // tenth payload may contain at most bit 0
+    try std.testing.expectError(error.VarintOverflow, decode(overflow.written()));
+}
+
 test "Undertow mesh member_compact encode rejects oversize context and adds" {
     var buf: [max_bytes]u8 = undefined;
     var big_ctx: [max_context + 1]Entry = undefined;
     for (&big_ctx, 0..) |*e, i| e.* = .{ .replica = i, .counter = 1 };
     try std.testing.expectError(error.Oversize, encode(&buf, 1, 0, big_ctx[0..], &.{}));
+}
+
+test "Undertow mesh member_compact encode rejects invalid logical state" {
+    var buf: [max_bytes]u8 = undefined;
+    const duplicate_ctx = [_]Entry{
+        .{ .replica = 1, .counter = 1 },
+        .{ .replica = 1, .counter = 2 },
+    };
+    try std.testing.expectError(error.InvalidMember, encode(&buf, 1, 0, &duplicate_ctx, &.{}));
+
+    const ctx = [_]Entry{.{ .replica = 1, .counter = 5 }};
+    var outside: [add_value_len]u8 = @splat(0);
+    outside[0] = 1; // replica 1
+    outside[8] = 6; // counter 6 is not covered by frontier counter 5
+    try std.testing.expectError(error.InvalidMember, encode(&buf, 1, 0, &ctx, &.{outside}));
 }
 
 test "GAP-M1 65 replicas merge and round-trip member_compact" {

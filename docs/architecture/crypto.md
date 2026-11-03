@@ -800,6 +800,13 @@ does not debit credit (`src/proto/frame.zig:131`, `src/proto/frame.zig:132`,
 
 ## CoilPack canonical signing
 
+CoilPack is Onyx Server's canonical structured-serialization format and is
+the deliberate substitute for MessagePack/CBOR: there is no MessagePack
+dependency or wire format anywhere in the tree. Anything that needs a
+signature-stable structured encoding uses CoilPack's value layer instead,
+so the "adopt MessagePack" roadmap item is closed as substituted, not
+pending.
+
 CoilPack has two layers:
 
 | Layer | Purpose | Source |

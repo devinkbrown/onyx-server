@@ -81,6 +81,7 @@ pub const marker_durable = @import("marker_durable.zig");
 pub const media_bridge = @import("media_bridge.zig");
 pub const media_cmd = @import("media_cmd.zig");
 pub const media_plane = @import("media_plane.zig");
+pub const media_record = @import("media_record.zig");
 pub const media_room = @import("media_room.zig");
 pub const memo_durable = @import("memo_durable.zig");
 pub const memo_group = @import("memo_group.zig");
@@ -516,6 +517,7 @@ test {
     _ = media_bridge;
     _ = media_cmd;
     _ = media_plane;
+    _ = media_record;
     _ = media_room;
     _ = memo_durable;
     _ = memo_group;

@@ -683,6 +683,14 @@ pub const ClientSession = struct {
     /// factor SASL success (PLAIN/SCRAM) for a 2FA-active account is refused —
     /// the user must complete the second factor via IDENTIFY.
     sasl_totp_gate: ?sasl.TotpGate = null,
+    /// Injected SCRAM credential-rotation gate: re-checks, at SASL success,
+    /// that the account's durable SCRAM verifier still matches the exact
+    /// verifier the exchange proved against. Null = no checker installed
+    /// (e.g. unit fixtures); the live server always installs it with SASL.
+    sasl_scram_gate: ?sasl.ScramCredentialGate = null,
+    /// Fingerprint of the SCRAM verifier bound at the current login, retained
+    /// for audit/extban-style identity checks. Cleared on every login change.
+    sasl_scram_fingerprint: ?sasl.ScramCredentialFingerprint = null,
     /// Injected account-status gate: reports whether the just-authenticated
     /// account is SUSPENDED or FORBIDDEN. Consulted at SASL success for every
     /// non-guest mechanism so SCRAM / OAUTHBEARER cannot bind a locked account —
@@ -1133,6 +1141,7 @@ pub const ClientSession = struct {
         self.sasl_guest = false;
         self.sasl_oper_elevation_allowed = false;
         self.auth_factor = .none;
+        self.sasl_scram_fingerprint = null;
         // Server-managed +r: a logged-in identity is "registered". Set here so SASL,
         // IDENTIFY, REGISTER, EXTERNAL, and session restore all surface it uniformly.
         self.umodes.add(.registered);
@@ -1149,6 +1158,7 @@ pub const ClientSession = struct {
         self.sasl_guest = true;
         self.sasl_oper_elevation_allowed = false;
         self.auth_factor = .none;
+        self.sasl_scram_fingerprint = null;
         self.umodes.remove(.registered);
     }
 
@@ -1158,6 +1168,7 @@ pub const ClientSession = struct {
         self.sasl_guest = false;
         self.sasl_oper_elevation_allowed = false;
         self.auth_factor = .none;
+        self.sasl_scram_fingerprint = null;
         self.sasl_issue_session_token = false;
         self.account_store.len = 0;
         self.umodes.remove(.registered);
@@ -1942,7 +1953,17 @@ fn handleAuthenticate(ctx: DispatchCtx) DispatchError!void {
                         }
                     }
                 }
+                // SCRAM rotation gate: the verifier proved during the exchange
+                // must still be the account's durable verifier at bind time.
+                // A rotation (password change / credential re-issue) between
+                // client-first and now invalidates this proof.
+                if (result.scram_credential) |fingerprint| {
+                    if (ctx.session.sasl_scram_gate) |gate| {
+                        if (!gate.matches(account, fingerprint)) return saslFail(ctx, "SASL authentication failed");
+                    }
+                }
                 ctx.session.loginAs(account);
+                if (result.scram_credential) |fingerprint| ctx.session.sasl_scram_fingerprint = fingerprint;
                 ctx.session.sasl_oper_elevation_allowed = oper_elevation_allowed;
                 ctx.session.auth_factor = sessionAuthFactorFromSasl(mechanism);
                 ctx.session.sasl_issue_session_token = result.issue_session_token;
@@ -3156,6 +3177,18 @@ test "sasl reauth after registration emits 907" {
     try dispatchText(&session, &replies, "AUTHENTICATE PLAIN");
     try expectContains(replies.written(), " 907 ");
     try expectNotContains(replies.written(), " 462 ");
+
+    // After 907 the session is untouched: a follow-up AUTHENTICATE payload
+    // cannot re-authenticate or corrupt SASL state, the account binding is
+    // unchanged, and ordinary commands keep working on the same session.
+    const before = replies.written().len;
+    try dispatchText(&session, &replies, "AUTHENTICATE YWxpY2UAYWxpY2UAc2VjcmV0");
+    try expectContains(replies.written()[before..], " 907 ");
+    try std.testing.expectEqualStrings("alice", session.account().?);
+    try std.testing.expect(session.client.registration.sasl == .succeeded);
+    const ping_at = replies.written().len;
+    try dispatchText(&session, &replies, "PING :still-here");
+    try expectContains(replies.written()[ping_at..], "PONG");
 }
 
 test "ISUPPORT CHANMODES token is honest: every advertised letter is enforced" {
@@ -3645,6 +3678,91 @@ test "SASL SCRAM success is refused for a suspended account via the account gate
 
         try std.testing.expectEqualStrings("user", session.account().?);
         try expectContains(replies.written(), " 903 ");
+    }
+}
+
+const TestScramGate = struct {
+    record: sasl.ScramRecord,
+
+    fn matches(ptr: *anyopaque, account: []const u8, fingerprint: sasl.ScramCredentialFingerprint) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, account, "user")) return false;
+        const current = sasl.fingerprintScramCredential(.sha256, self.record.salt, self.record.iterations, &self.record.stored_key, &self.record.server_key) orelse return false;
+        return current.algorithm == fingerprint.algorithm and std.mem.eql(u8, &current.digest, &fingerprint.digest);
+    }
+};
+
+test "SASL SCRAM bind is refused when the verifier rotated mid-exchange" {
+    const salt = "saltSALTsalt";
+    const iterations: u32 = 4096;
+
+    // The exchange proves against the OLD verifier; by bind time the durable
+    // record has rotated (password change), so the fingerprint gate refuses
+    // with the same 904 surface as a bad credential.
+    {
+        var keys = try sasl.deriveScramKeys("pencil", salt, iterations);
+        defer keys.wipe();
+        var rotated = try sasl.deriveScramKeys("eraser", salt, iterations);
+        defer rotated.wipe();
+        var db = TestScramDb{ .record = .{
+            .salt = salt,
+            .iterations = iterations,
+            .stored_key = keys.stored_key,
+            .server_key = keys.server_key,
+        } };
+        var gate = TestScramGate{ .record = .{
+            .salt = salt,
+            .iterations = iterations,
+            .stored_key = rotated.stored_key,
+            .server_key = rotated.server_key,
+        } };
+
+        var session = ClientSession.init();
+        session.cap.negotiated.add(.sasl);
+        session.sasl_scram256 = .{ .ptr = &db, .lookupFn = TestScramDb.lookup };
+        session.sasl_server_nonce = "SERVERNONCE";
+        session.sasl_scram_gate = .{ .ptr = &gate, .matchesFn = TestScramGate.matches };
+
+        var storage: [2048]u8 = undefined;
+        var replies = ReplyCtx.init(&storage);
+        try runScramSuccessDispatch(&session, &replies, keys);
+
+        try std.testing.expect(session.account() == null);
+        try std.testing.expect(!session.logged_in);
+        try std.testing.expect(session.sasl_scram_fingerprint == null);
+        try expectContains(replies.written(), " 904 ");
+        try std.testing.expect(std.mem.indexOf(u8, replies.written(), " 903 ") == null);
+    }
+
+    // Control: gate record identical to the proved verifier binds and the
+    // session retains the fingerprint.
+    {
+        var keys = try sasl.deriveScramKeys("pencil", salt, iterations);
+        defer keys.wipe();
+        var db = TestScramDb{ .record = .{
+            .salt = salt,
+            .iterations = iterations,
+            .stored_key = keys.stored_key,
+            .server_key = keys.server_key,
+        } };
+        var gate = TestScramGate{ .record = db.record };
+
+        var session = ClientSession.init();
+        session.cap.negotiated.add(.sasl);
+        session.sasl_scram256 = .{ .ptr = &db, .lookupFn = TestScramDb.lookup };
+        session.sasl_server_nonce = "SERVERNONCE";
+        session.sasl_scram_gate = .{ .ptr = &gate, .matchesFn = TestScramGate.matches };
+
+        var storage: [2048]u8 = undefined;
+        var replies = ReplyCtx.init(&storage);
+        try runScramSuccessDispatch(&session, &replies, keys);
+
+        try std.testing.expectEqualStrings("user", session.account().?);
+        try expectContains(replies.written(), " 903 ");
+        const fp = session.sasl_scram_fingerprint.?;
+        try std.testing.expectEqual(sasl.ScramCredentialAlgorithm.sha256, fp.algorithm);
+        const want = sasl.fingerprintScramCredential(.sha256, salt, iterations, &keys.stored_key, &keys.server_key).?;
+        try std.testing.expectEqualSlices(u8, &want.digest, &fp.digest);
     }
 }
 

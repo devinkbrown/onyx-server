@@ -15,6 +15,7 @@ const cpv = @import("../../proto/coilpack_value.zig");
 const sign = @import("../../crypto/sign.zig");
 const signed_frame = @import("signed_frame.zig");
 const relay_v1 = @import("message_relay.zig");
+const utf8 = @import("../utf8.zig");
 
 pub const pubkey_len = sign.public_key_len;
 pub const sig_len = sign.signature_len;
@@ -145,18 +146,40 @@ fn guestOriginIsNull(origin: GuestOrigin) bool {
     return std.mem.allEqual(u8, &origin, 0);
 }
 
+/// Reserved synthetic source namespace, unavailable to client NICK under every
+/// supported casemapping. This checks grammar only, not webhook authority:
+/// receivers must bind the signed prefix's user/host to the authenticated origin.
+/// The leading '=' counts toward the unchanged protocol nick bound.
+pub fn isWebhookSourceNick(nick: []const u8) bool {
+    return nick.len > 1 and nick.len <= relay_v1.max_nick_len and nick[0] == '=' and
+        utf8.isValidNickWith(.utf8_only, nick[1..], .{ .max_nick_bytes = relay_v1.max_nick_len - 1 });
+}
+
 /// Enforce the v2 scope contract and reuse v1's hardened IRC grammar for all
 /// rendered fields. Signature presence is checked separately so an origin can
 /// validate the body before stamping it.
 fn validateBody(msg: RelayMessage) SemanticError!void {
     if (msg.wire_schema != 1 and msg.wire_schema != 2 and msg.wire_schema != 3) return error.InvalidSemantic;
     const nick = msg.sourceNick() orelse return error.InvalidSemantic;
+    const webhook_source = isWebhookSourceNick(nick);
+    if (webhook_source) {
+        if (msg.scope_kind != .channel or msg.verb != .privmsg or msg.min_rank != 0 or
+            msg.account.len != 0 or msg.sender_route_id != null or msg.sender_member_modes != null or
+            msg.recipient.len != 0 or msg.recipient_route_id != null or
+            msg.recipient_guest_origin != null or msg.recipient_guest_id != null or msg.data_tag.len != 0 or
+            msg.source_prefix.len > relay_v1.max_prefix_len)
+            return error.InvalidSemantic;
+    }
+    // Validate a borrowed grammar view only. The actual prefix, including '=',
+    // remains immutable in the wire and signature transcript. Legacy v1 and
+    // ordinary v2 client names retain their existing grammar unchanged. Older
+    // peers reject the reserved source until the fleet supports this form.
     relay_v1.validateSemantic(.{
         .verb = msg.verb,
         .target = msg.target,
         .min_rank = msg.min_rank,
-        .source_nick = nick,
-        .source_prefix = msg.source_prefix,
+        .source_nick = if (webhook_source) nick[1..] else nick,
+        .source_prefix = if (webhook_source) msg.source_prefix[1..] else msg.source_prefix,
         .account = msg.account,
         .tags = msg.tags,
         .text = msg.text,
@@ -772,6 +795,225 @@ test "secure relay v2 signed channel and direct scopes round-trip" {
     const direct_wire_again = try encode(allocator, direct.msg);
     defer allocator.free(direct_wire_again);
     try std.testing.expectEqualSlices(u8, direct_wire, direct_wire_again);
+}
+
+fn webhookSample(kp: *const sign.KeyPair) RelayMessage {
+    return .{
+        .verb = .privmsg,
+        .target = "#onyx",
+        .source_prefix = "=CI-Bot!webhook@origin.test",
+        .tags = "+draft/reply=42",
+        .text = "build passed",
+        .scope_kind = .channel,
+        .origin_node = signed_frame.originShortId(kp.public_key),
+        .hlc = 99,
+    };
+}
+
+test "secure relay v2 webhook source namespace is unavailable to client and legacy nicks" {
+    for ([_][]const u8{ "=CI-Bot", "=Alice", "=\u{00e9}quipe" }) |nick| {
+        try std.testing.expect(isWebhookSourceNick(nick));
+        inline for (.{ .ascii, .rfc1459, .utf8_only }) |mapping| {
+            try std.testing.expect(!utf8.isValidNickWith(mapping, nick, .{ .max_nick_bytes = relay_v1.max_nick_len }));
+        }
+    }
+    for ([_][]const u8{ "", "=", "==Bot", "=9Bot", "=Bad Nick", "=Bad!Nick", "=\xff", "CI-Bot" }) |nick|
+        try std.testing.expect(!isWebhookSourceNick(nick));
+    const legacy = relay_v1.RelayMessage{
+        .verb = .privmsg,
+        .target = "#onyx",
+        .source_nick = "=CI-Bot",
+        .source_prefix = "=CI-Bot!webhook@origin.test",
+        .text = "build passed",
+        .origin_node = 1,
+        .hlc = 99,
+    };
+    try std.testing.expectError(error.InvalidSemantic, relay_v1.validateSemantic(legacy));
+}
+
+test "secure relay v2 webhook signed prefix survives round-trip and remains immutable" {
+    const allocator = std.testing.allocator;
+    var kp = try testKeyPair(0x61);
+    defer kp.deinit();
+    var pubkey: [pubkey_len]u8 = undefined;
+    var signature: [sig_len]u8 = undefined;
+    var msg = webhookSample(&kp);
+    try stampOrigin(allocator, &msg, &kp, &pubkey, &signature);
+    const verified = try verifyAndRelayId(allocator, msg);
+    try std.testing.expect(verified == .verified);
+    const wire = try encode(allocator, msg);
+    defer allocator.free(wire);
+    var decoded = try decode(allocator, wire);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqualStrings(msg.source_prefix, decoded.msg.source_prefix);
+    try std.testing.expectEqualStrings("=CI-Bot", decoded.msg.sourceNick().?);
+    const decoded_id = try verifyAndRelayId(allocator, decoded.msg);
+    try std.testing.expect(decoded_id == .verified);
+    try std.testing.expectEqual(verified.verified, decoded_id.verified);
+    const wire_again = try encode(allocator, decoded.msg);
+    defer allocator.free(wire_again);
+    try std.testing.expectEqualSlices(u8, wire, wire_again);
+
+    // The borrowed grammar view must never become the signed representation.
+    // Each replacement is independently valid syntax but changes authenticated
+    // bytes, including removal of the reserved marker itself.
+    for ([_][]const u8{
+        "CI-Bot!webhook@origin.test",
+        "=Other!webhook@origin.test",
+        "=CI-Bot!webhook@other.test",
+        "=CI-Bot!different@origin.test",
+    }) |prefix| {
+        var changed = msg;
+        changed.source_prefix = prefix;
+        try validateSemantic(changed);
+        try std.testing.expectEqual(.bad_signature, try verifyAndRelayId(allocator, changed));
+    }
+    // Corrupt the encoded prefix without changing any framing: decode still
+    // succeeds, while the trust-boundary verifier refuses an identity.
+    const tampered = try allocator.dupe(u8, wire);
+    defer allocator.free(tampered);
+    const offset = std.mem.indexOf(u8, tampered, msg.source_prefix).?;
+    tampered[offset + 1] = 'X';
+    var forged = try decode(allocator, tampered);
+    defer forged.deinit(allocator);
+    try std.testing.expectEqual(.bad_signature, try verifyAndRelayId(allocator, forged.msg));
+}
+
+test "secure relay v2 webhook shape rejects authority routes verbs and reserved destinations" {
+    var kp = try testKeyPair(0x62);
+    defer kp.deinit();
+    const valid = webhookSample(&kp);
+    try validateBody(valid);
+    for ([_]Verb{ .notice, .tagmsg, .data, .request, .reply, .whisper }) |verb| {
+        var changed = valid;
+        changed.verb = verb;
+        // Supply the verb's otherwise-valid fields to isolate the restricted
+        // synthetic-author shape from ordinary command-specific grammar.
+        switch (verb) {
+            .tagmsg => changed.text = "",
+            .data, .request, .reply => changed.data_tag = "SYS.test",
+            .whisper => changed.recipient = "Alice",
+            else => {},
+        }
+        try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    }
+    for ([_]ScopeKind{ .direct, .channel_whisper, .direct_guest }) |scope| {
+        var changed = valid;
+        changed.scope_kind = scope;
+        changed.target = "Alice";
+        changed.recipient_route_id = @splat(1);
+        try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    }
+    inline for (.{ "min_rank", "sender_member_modes" }) |field| {
+        var changed = valid;
+        @field(changed, field) = 1;
+        try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    }
+    var changed = valid;
+    changed.sender_member_modes = 0; // even a present zero claims membership
+    try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    inline for (.{ "sender_route_id", "recipient_route_id", "recipient_guest_id" }) |field| {
+        changed = valid;
+        @field(changed, field) = @as([16]u8, @splat(1));
+        try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    }
+    changed = valid;
+    changed.recipient_guest_origin = @splat(1);
+    try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    inline for (.{ "account", "recipient", "data_tag" }) |field| {
+        changed = valid;
+        @field(changed, field) = "Alice";
+        try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    }
+    for ([_][]const u8{ "Alice", "=CI-Bot", "@#onyx", "#bad channel", "#bad\r\n" }) |target| {
+        changed = valid;
+        changed.target = target;
+        try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    }
+    // Real users also cannot direct-message or whisper to reserved names.
+    changed = valid;
+    changed.source_prefix = "Alice!u@host.test";
+    changed.scope_kind = .direct;
+    changed.target = "=CI-Bot";
+    changed.recipient_route_id = @splat(1);
+    try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+    changed.scope_kind = .channel_whisper;
+    changed.verb = .whisper;
+    changed.target = "#onyx";
+    changed.recipient = "=CI-Bot";
+    try std.testing.expectError(error.InvalidSemantic, validateBody(changed));
+}
+
+test "secure relay v2 webhook grammar keeps original rendering bounds and strict UTF8" {
+    var kp = try testKeyPair(0x63);
+    defer kp.deinit();
+    var msg = webhookSample(&kp);
+    for ([_][]const u8{
+        "=!webhook@host.test",         "==Bot!webhook@host.test",    "=9Bot!webhook@host.test",
+        "=Bot Nick!webhook@host.test", "=Bot\xff!webhook@host.test", "=Bot!webhook@host\xff",
+        "=Bot!webhook@host bad",       "=Bot!webhook@host!bad",      "=Bot!webhook@host@bad",
+        "=Bot!webhook@",               "=Bot!@host.test",            "=Bot!bad:user@host.test",
+        "=Bot!webhook@host\r\n",
+    }) |prefix| {
+        msg.source_prefix = prefix;
+        try std.testing.expectError(error.InvalidSemantic, validateBody(msg));
+    }
+    var nick: [relay_v1.max_nick_len + 1]u8 = @splat('n');
+    nick[0] = '=';
+    const user: [relay_v1.max_user_len + 1]u8 = @splat('u');
+    const host: [relay_v1.max_host_len + 1]u8 = @splat('h');
+    var prefix_buf: [relay_v1.max_prefix_len + 3]u8 = undefined;
+    msg.source_prefix = try std.fmt.bufPrint(&prefix_buf, "{s}!{s}@{s}", .{
+        nick[0..relay_v1.max_nick_len], user[0..relay_v1.max_user_len], host[0..relay_v1.max_host_len],
+    });
+    try std.testing.expectEqual(relay_v1.max_prefix_len, msg.source_prefix.len);
+    try validateBody(msg);
+    for (0..3) |oversize| {
+        msg.source_prefix = try std.fmt.bufPrint(&prefix_buf, "{s}!{s}@{s}", .{
+            nick[0 .. relay_v1.max_nick_len + @intFromBool(oversize == 0)],
+            user[0 .. relay_v1.max_user_len + @intFromBool(oversize == 1)],
+            host[0 .. relay_v1.max_host_len + @intFromBool(oversize == 2)],
+        });
+        try std.testing.expectError(error.InvalidSemantic, validateBody(msg));
+    }
+}
+
+test "secure relay v2 decoder rejects malformed webhook shape before owned publication" {
+    const allocator = std.testing.allocator;
+    var kp = try testKeyPair(0x64);
+    defer kp.deinit();
+    var pubkey: [pubkey_len]u8 = undefined;
+    var signature: [sig_len]u8 = undefined;
+    var msg = webhookSample(&kp);
+    try stampOrigin(allocator, &msg, &kp, &pubkey, &signature);
+    const wire = try encode(allocator, msg);
+    defer allocator.free(wire);
+    var doc = try cpv.Decoder.decode(allocator, wire);
+    defer doc.deinit(allocator);
+    const route: RouteId = @splat(1);
+    const cases = [_]cpv.MapEntry{
+        .{ .key = "verb", .value = .{ .unsigned = @backingInt(Verb.notice) } },
+        .{ .key = "scope_kind", .value = .{ .unsigned = @backingInt(ScopeKind.direct) } },
+        .{ .key = "account", .value = .{ .string = "Alice" } },
+        .{ .key = "sender_member_modes", .value = .{ .unsigned = 0 } },
+        .{ .key = "min_rank", .value = .{ .unsigned = 1 } },
+        .{ .key = "sender_route_id", .value = .{ .bytes = &route } },
+        .{ .key = "recipient_route_id", .value = .{ .bytes = &route } },
+        .{ .key = "recipient", .value = .{ .string = "Alice" } },
+        .{ .key = "data_tag", .value = .{ .string = "SYS.test" } },
+        .{ .key = "target", .value = .{ .string = "=CI-Bot" } },
+        .{ .key = "source_prefix", .value = .{ .string = "==CI-Bot!webhook@origin.test" } },
+    };
+    for (cases) |replacement| {
+        var entries: [17]cpv.MapEntry = undefined;
+        @memcpy(&entries, doc.map);
+        for (&entries) |*entry| {
+            if (std.mem.eql(u8, entry.key, replacement.key)) entry.value = replacement.value;
+        }
+        const invalid_wire = try cpv.Encoder.encode(allocator, .{ .map = &entries });
+        defer allocator.free(invalid_wire);
+        try std.testing.expectError(error.InvalidSemantic, decode(allocator, invalid_wire));
+    }
 }
 
 test "secure relay v2 signed guest-recipient scope round-trips exact identity" {

@@ -176,6 +176,14 @@ pub fn handleStats(self: anytype, conn: anytype, parsed: anytype) !void {
         try self.replyNumeric(conn, .ERR_NOPRIVILEGES, &.{"STATS"}, "Permission denied - STATS is operator-only (except STATS p)");
         return;
     }
+    // There is no signed remote STATS query yet. Never answer a remote target
+    // with this node's local data as though it were the target's report.
+    if (parsed.param_count >= 2 and parsed.paramSlice()[1].len != 0 and
+        !std.ascii.eqlIgnoreCase(parsed.paramSlice()[1], self.serverName()))
+    {
+        try self.replyNumeric(conn, .ERR_NOSUCHSERVER, &.{parsed.paramSlice()[1]}, "No such server");
+        return;
+    }
     switch (letter[0]) {
         'u' => {
             const up_secs: u64 = @intCast(@max(@as(i64, 0), @divTrunc(self.nowMs() - self.start_ms, 1000)));

@@ -7,8 +7,8 @@ const std = @import("std");
 const wt = @import("../webtransport_listener.zig");
 const codec = @import("native_windows_active_webtransport_snapshot.zig");
 const magic = "HXLW";
-const version: u16 = 1;
-const domain = "onyx-linux-active-webtransport-v1";
+const version: u16 = 2;
+const domain = "onyx-linux-active-webtransport-v2";
 pub const Error = codec.Error;
 pub const BridgeFd = wt.BridgeFd;
 pub const AcceptedIrcSocket = codec.AcceptedIrcSocket;
@@ -53,6 +53,11 @@ pub const Body = struct {
 
 fn validFd(fd: i32) bool {
     return fd > 0 and fd < 0x4000_0000;
+}
+
+fn validTransportAddress(address: wt.TransportAddress) bool {
+    if ((address.ip_len != 4 and address.ip_len != 16) or address.port == 0) return false;
+    return std.mem.allEqual(u8, address.ip[address.ip_len..], 0);
 }
 
 pub fn isCurrent(bytes: []const u8) bool {
@@ -127,7 +132,10 @@ pub fn validateWire(bytes: []const u8) Error!WireView {
             if (comptime std.mem.eql(u8, name, "slot")) continue;
             if (comptime std.mem.eql(u8, name, "bridge")) {
                 if (try codec.readFixed(&r, T)) |bridge| {
-                    if (bridge.source_socket == 0 or bridge.source_socket >= 0x4000_0000 or bridge.peer.port != base.irc_port) return error.InvalidSnapshot;
+                    if (bridge.source_socket == 0 or bridge.source_socket >= 0x4000_0000 or
+                        !validTransportAddress(bridge.local) or !validTransportAddress(bridge.peer) or
+                        bridge.local.ip_len != bridge.peer.ip_len or bridge.peer.port != base.irc_port)
+                        return error.InvalidSnapshot;
                     for (expected[0..expected_count]) |prior| {
                         if (prior.identity.source_socket == bridge.source_socket or
                             (wt.TransportAddress.eql(prior.identity.local, bridge.local) and wt.TransportAddress.eql(prior.identity.peer, bridge.peer))) return error.InvalidSnapshot;
@@ -232,4 +240,82 @@ test "Helix Linux WebTransport idle checkpoint rejects malformed wire and round-
     const invalid_fd = try codec.encodeFramed(Body, allocator, body, magic, version, domain);
     defer freeEncoded(allocator, invalid_fd);
     try std.testing.expectError(error.InvalidSnapshot, validateWire(invalid_fd));
+}
+
+test "Helix Linux WebTransport validates bridge endpoints before equality without allocation" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x37)));
+    var cert_buf: [1024]u8 = undefined;
+    const cert = try @import("../../proto/x509_selfsign.zig").buildSelfSigned(&cert_buf, .{
+        .common_name = "wt.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x51, 0x99 },
+        .key_pair = key,
+        .dns_names = &.{"wt.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{cert};
+    const tls: wt.TlsConfig = .{ .cert_chain = &chain, .signing_key = .{ .ed25519 = key } };
+    var owner = wt.WebTransportListener.init(allocator, tls, 6667);
+    defer owner.deinit();
+    try owner.prepareColdResources(std.testing.io, .{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    var active = try owner.captureUnstartedActive(allocator);
+    defer active.deinit(allocator);
+
+    const bridge_local = try wt.TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, 40000);
+    const bridge_peer = try wt.TransportAddress.fromBytes(&.{ 127, 0, 0, 1 }, 6667);
+    var rows: [2]wt.ActiveConnectionSnapshot = undefined;
+    for (&rows) |*row| {
+        @memset(std.mem.asBytes(row), 0);
+        // CipherSuite has no zero tag; raw-zero initialization is only used
+        // for inert wire fixture fields, so set its enum to a valid value.
+        row.quic.handshake.suite = .tls_aes_128_gcm_sha256;
+    }
+    rows[0].slot = 0;
+    rows[0].bridge = .{ .source_socket = 103, .local = bridge_local, .peer = bridge_peer };
+    rows[1].slot = 1;
+    rows[1].bridge = .{ .source_socket = 105, .local = bridge_local, .peer = bridge_peer };
+    const snapshot: wt.ActiveSnapshot = .{
+        .base = active.base,
+        .irc_host_digest = active.irc_host_digest,
+        .slot_count = 2,
+        .connections = &rows,
+    };
+    var bridges = [_]BridgeFd{
+        .{ .slot = 0, .fd = 103, .device = 1, .inode = 1 },
+        .{ .slot = 1, .fd = 105, .device = 2, .inode = 2 },
+    };
+    var accepted = [_]AcceptedIrcSocket{
+        .{ .fd = 104, .local = bridge_peer, .peer = bridge_local },
+        .{ .fd = 106, .local = bridge_peer, .peer = bridge_local },
+    };
+    const body: Body = .{ .snapshot = snapshot, .udp_fd = owner.socket.?.fd, .bridges = &bridges, .accepted = &accepted };
+
+    inline for (.{ true, false }) |bad_local| {
+        for (&rows) |*row| {
+            var malformed = row.bridge.?;
+            if (bad_local) {
+                malformed.local.ip_len = 17;
+            } else {
+                malformed.peer.ip_len = 17;
+            }
+            row.bridge = malformed;
+        }
+        {
+            // Deliberately bypass Body.validate so the checksum is correct and
+            // both untrusted rows reach the allocation-free wire validator.
+            // Equal malformed local/peer endpoints used to reach TransportAddress.eql
+            // on the second row and slice ip[0..17] before semantic validation.
+            const wire = try codec.encodeFramed(Body, allocator, body, magic, version, domain);
+            defer freeEncoded(allocator, wire);
+            try std.testing.expectError(error.InvalidSnapshot, validateWire(wire));
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+            try std.testing.expectError(error.InvalidSnapshot, decode(failing.allocator(), wire, tls));
+            try std.testing.expect(!failing.has_induced_failure);
+        }
+        rows[0].bridge = .{ .source_socket = 103, .local = bridge_local, .peer = bridge_peer };
+        rows[1].bridge = .{ .source_socket = 105, .local = bridge_local, .peer = bridge_peer };
+    }
 }

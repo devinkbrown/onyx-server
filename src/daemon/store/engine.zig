@@ -87,11 +87,29 @@ const readU32 = @import("wal.zig").readU32;
 const readU64 = @import("wal.zig").readU64;
 const recordSize = @import("wal.zig").recordSize;
 const writeNextSeqRecordAt = @import("wal.zig").writeNextSeqRecordAt;
+const writePositionalAllGuarded = @import("wal.zig").writePositionalAllGuarded;
 const writeRecordAt = @import("wal.zig").writeRecordAt;
 const writeSnapshotCoverageRecordAt = @import("wal.zig").writeSnapshotCoverageRecordAt;
 const writeU32 = @import("wal.zig").writeU32;
 const writeU64 = @import("wal.zig").writeU64;
 const writeWalEpochRecordAt = @import("wal.zig").writeWalEpochRecordAt;
+
+/// Owner-only (0o600) creation mode for daemon-created WAL/snapshot files on
+/// POSIX. Windows has no POSIX mode bits: `.default_file` keeps the native
+/// private-DACL custody paths (`private_windows_files`) unchanged.
+pub const private_file_permissions: std.Io.File.Permissions = if (std.posix.mode_t == u0 or @import("builtin").os.tag == .windows)
+    .default_file
+else
+    .fromMode(0o600);
+
+/// Pin an already-created file to exactly 0o600 on POSIX. The creation mode
+/// is umask-masked, so it alone cannot guarantee the exact final mode;
+/// setting permissions through the held descriptor can. No-op on Windows,
+/// where private files are governed by DACLs instead of mode bits.
+pub fn restrictCreatedFilePermissions(io: std.Io, file: std.Io.File) !void {
+    if (comptime std.posix.mode_t == u0 or @import("builtin").os.tag == .windows) return;
+    try file.setPermissions(io, private_file_permissions);
+}
 
 pub fn ColumnFamily(comptime store_family: Family) type {
     return struct {
@@ -216,6 +234,10 @@ pub const OroStore = struct {
     staged_write_file: ?std.Io.File = null,
     transferred_windows_wal: ?WindowsWalWitness = null,
     wal_offset: u64 = 0,
+    /// True while a WAL file created by `ensureWal` has not yet had its
+    /// parent directory synced. Cleared by any successful `syncDir`, and
+    /// retried by the next `ensureWal` if the first sync failed.
+    wal_dir_sync_pending: bool = false,
     // Headerless WALs predate epoch records. Give that format a deterministic
     // identity so snapshot coverage never serializes undefined bytes and can
     // still authenticate an intact legacy prefix after a truncate fault.
@@ -781,13 +803,13 @@ pub const OroStore = struct {
                 return StoreError.IoAmbiguous;
             },
             .short => {
-                file.writePositionalAll(self.io, record[0..@max(@as(usize, 1), record.len / 2)], offset) catch {};
+                writePositionalAllGuarded(self.io, file, record[0..@max(@as(usize, 1), record.len / 2)], offset) catch {};
                 self.poisonPreparedStore();
                 return StoreError.IoAmbiguous;
             },
             .none => {},
         }
-        file.writePositionalAll(self.io, record, offset) catch {
+        writePositionalAllGuarded(self.io, file, record, offset) catch {
             self.poisonPreparedStore();
             return StoreError.IoAmbiguous;
         };
@@ -859,20 +881,22 @@ pub const OroStore = struct {
         } };
         const snapshot_bytes = try encodeColdSnapshot(self, &coverage);
         defer self.allocator.free(snapshot_bytes);
-        var snapshot = try self.dir.createFileAtomic(self.io, self.snapshot_path, .{ .replace = true });
+        var snapshot = try self.dir.createFileAtomic(self.io, self.snapshot_path, .{ .replace = true, .permissions = private_file_permissions });
         defer deinitColdAtomic(self.io, &snapshot, null);
         try makeColdAtomicReadable(self.io, &snapshot);
+        try restrictCreatedFilePermissions(self.io, snapshot.file);
         const snapshot_identity = try cold_identity.statRegular(snapshot.file.handle);
         try validateColdParent(self.io, self.dir, self.snapshot_path, directory, directory_identity, &snapshot);
-        try snapshot.file.writePositionalAll(self.io, snapshot_bytes, 0);
+        try writePositionalAllGuarded(self.io, snapshot.file, snapshot_bytes, 0);
         if (self.prepared_io_fault.snapshot_sync) return StoreError.SnapshotSyncFailed;
         try snapshot.file.sync(self.io);
-        var epoch = try self.dir.createFileAtomic(self.io, self.wal_path, .{ .replace = true });
+        var epoch = try self.dir.createFileAtomic(self.io, self.wal_path, .{ .replace = true, .permissions = private_file_permissions });
         defer deinitColdAtomic(self.io, &epoch, null);
         try makeColdAtomicReadable(self.io, &epoch);
+        try restrictCreatedFilePermissions(self.io, epoch.file);
         const epoch_identity = try cold_identity.statRegular(epoch.file.handle);
         try validateColdParent(self.io, self.dir, self.wal_path, directory, directory_identity, &epoch);
-        try epoch.file.writePositionalAll(self.io, &epoch_bytes, 0);
+        try writePositionalAllGuarded(self.io, epoch.file, &epoch_bytes, 0);
         try epoch.file.sync(self.io);
         const writer: std.Io.File = .{ .handle = try cold_runtime.duplicate(epoch.file.handle), .flags = epoch.file.flags };
         var writer_owned = true;
@@ -956,9 +980,9 @@ pub const OroStore = struct {
         const rotated_coverage = CoverageSlot{ .covered_len = next_epoch_record.len, .epoch = next_epoch, .digest = next_digest };
         const coverage = SnapshotCoverage{ .slots = .{ old_coverage, rotated_coverage }, .count = 2 };
         var snapshot = if (private_windows)
-            try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(self.io, std.fs.path.basename(self.snapshot_path), .{ .replace = true })
+            try (std.Io.Dir{ .handle = directory.handle }).createFileAtomic(self.io, std.fs.path.basename(self.snapshot_path), .{ .replace = true, .permissions = private_file_permissions })
         else
-            try self.dir.createFileAtomic(self.io, self.snapshot_path, .{ .replace = true });
+            try self.dir.createFileAtomic(self.io, self.snapshot_path, .{ .replace = true, .permissions = private_file_permissions });
         var snapshot_identity: ?cold_identity.Identity = null;
         defer if (cold_posix or private_windows) deinitColdAtomic(self.io, &snapshot, snapshot_identity) else snapshot.deinit(self.io);
         snapshot_identity = if (private_windows)
@@ -971,13 +995,14 @@ pub const OroStore = struct {
         if (comptime @import("builtin").os.tag == .windows) {
             if (self.private_windows_files) try self.secureColdAtomicWindows(&snapshot);
         }
+        try restrictCreatedFilePermissions(self.io, snapshot.file);
 
         var offset: u64 = 0;
         offset = try writeNextSeqRecordAt(self.io, snapshot.file, offset, self.allocator, self.next_seq);
         if (self.batch_format_required) {
             var guard: [batch_guard_len]u8 = undefined;
             encodeBatchGuard(&guard);
-            try snapshot.file.writePositionalAll(self.io, &guard, offset);
+            try writePositionalAllGuarded(self.io, snapshot.file, &guard, offset);
             offset += guard.len;
         }
         for (families) |store_family| {
@@ -1111,18 +1136,50 @@ pub const OroStore = struct {
 
     fn ensureWal(self: *OroStore) !void {
         if (self.staged_read_only) return StoreError.ReadOnlyStore;
-        if (self.wal_file) |_| return;
+        if (self.wal_file) |_| {
+            // A creation whose directory sync failed stays pending; retry
+            // it here so a later admission cannot silently skip durability
+            // of the new directory entry.
+            if (self.wal_dir_sync_pending) try self.syncDir();
+            return;
+        }
+        var created = false;
         const file = if (comptime @import("builtin").os.tag == .windows) blk: {
             if (self.private_windows_files) {
                 break :blk cold_runtime.openExistingPrivateWindows(self.dir, self.wal_path, .remediate_read_write) catch |err| switch (err) {
-                    error.FileNotFound => try cold_runtime.createPrivateExclusiveWindows(self.dir, self.wal_path),
+                    error.FileNotFound => created_file: {
+                        created = true;
+                        break :created_file try cold_runtime.createPrivateExclusiveWindows(self.dir, self.wal_path);
+                    },
                     else => return err,
                 };
             }
-            break :blk try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
-        } else try self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false });
+            break :blk try self.createWalFile(&created);
+        } else try self.createWalFile(&created);
+        restrictCreatedFilePermissions(self.io, file) catch |err| {
+            file.close(self.io);
+            return err;
+        };
         self.wal_file = file;
+        // Set before syncing so a failed sync leaves the retry obligation
+        // recorded against the held descriptor, not lost with the error.
+        if (created) self.wal_dir_sync_pending = true;
         self.wal_offset = (try file.stat(self.io)).size;
+        // A newly created WAL is only reachable after restart if its
+        // directory entry is durable; file syncs alone do not cover it.
+        if (created) try self.syncDir();
+    }
+
+    /// Exclusive-create first so creation is known atomically, falling
+    /// back to the historical open-or-create for an existing WAL.
+    fn createWalFile(self: *OroStore, created: *bool) !std.Io.File {
+        if (self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false, .exclusive = true, .permissions = private_file_permissions })) |file| {
+            created.* = true;
+            return file;
+        } else |err| switch (err) {
+            error.PathAlreadyExists => return self.dir.createFile(self.io, self.wal_path, .{ .read = true, .truncate = false, .permissions = private_file_permissions }),
+            else => return err,
+        }
     }
 
     fn initializeEmptyWalAfterSnapshot(self: *OroStore) !void {
@@ -1556,6 +1613,7 @@ pub const OroStore = struct {
             try self.validateConfiguredWal();
             try self.syncHeldParent(directory, try coldDirectoryIdentity(directory.handle));
         } else try syncDirectory(self.io, directory);
+        self.wal_dir_sync_pending = false;
     }
 };
 

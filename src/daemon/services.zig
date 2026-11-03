@@ -633,6 +633,31 @@ pub const Services = struct {
         scram.password_gate = .{ .ptr = self, .allowed = scramPasswordGate };
     }
 
+    /// True only when the account's current durable SCRAM verifier (for the
+    /// fingerprint's algorithm) recomputes to exactly `expected`. Consulted
+    /// at SASL bind time so a credential rotation mid-exchange cannot bind
+    /// the session to a verifier that was never proved. Fails closed when
+    /// no SCRAM store is attached or the account has no such verifier.
+    pub fn scramCredentialMatches(self: *Services, account: []const u8, expected: sasl.ScramCredentialFingerprint) bool {
+        self.lock.lockShared();
+        const scram = self.scram;
+        self.lock.unlockShared();
+        const store = scram orelse return false;
+        const current: ?sasl.ScramCredentialFingerprint = switch (expected.algorithm) {
+            .sha256 => if (store.lookup(account)) |rec|
+                sasl.fingerprintScramCredential(.sha256, rec.salt, rec.iterations, &rec.stored_key, &rec.server_key)
+            else
+                null,
+            .sha512 => if (store.lookup512(account)) |rec|
+                sasl.fingerprintScramCredential(.sha512, rec.salt, rec.iterations, &rec.stored_key, &rec.server_key)
+            else
+                null,
+        };
+        const got = current orelse return false;
+        if (got.algorithm != expected.algorithm) return false;
+        return std.crypto.timing_safe.eql([std.crypto.hash.sha2.Sha256.digest_length]u8, got.digest, expected.digest);
+    }
+
     fn scramPasswordGate(ptr: *anyopaque, account: []const u8) bool {
         const self: *Services = @ptrCast(@alignCast(ptr));
         return self.passwordMechanismsAllowed(account);

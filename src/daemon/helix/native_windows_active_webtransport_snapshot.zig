@@ -10,10 +10,10 @@ const wt = @import("../webtransport_listener.zig");
 const udp = @import("native_windows_udp_socket.zig");
 
 const magic = "HXWT";
-const version: u16 = 2;
+const version: u16 = 3;
 const header_len: usize = 12;
 const digest_len: usize = 32;
-const digest_domain = "onyx-windows-active-webtransport-v2";
+const digest_domain = "onyx-windows-active-webtransport-v3";
 pub const max_wire_bytes: usize = 256 * 1024 * 1024;
 pub const max_alloc_bytes: usize = 512 * 1024 * 1024;
 const max_items: usize = 65_536;
@@ -23,7 +23,7 @@ pub const Error = std.mem.Allocator.Error || error{ InvalidSnapshot, Capacity };
 comptime {
     if (@sizeOf(usize) != 8) @compileError("active WebTransport checkpoint requires 64-bit target");
     if (@typeInfo(wt.ActiveSnapshot).@"struct".field_names.len != 4 or
-        @typeInfo(wt.ActiveConnectionSnapshot).@"struct".field_names.len != 15 or
+        @typeInfo(wt.ActiveConnectionSnapshot).@"struct".field_names.len != 16 or
         @typeInfo(wt.BridgeIdentity).@"struct".field_names.len != 3 or
         @typeInfo(wt.BridgeTransfer).@"struct".field_names.len != 4)
         @compileError("active WebTransport snapshot schema changed; review and bump HXWT version");

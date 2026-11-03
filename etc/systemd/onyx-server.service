@@ -1,92 +1,51 @@
-# =============================================================================
-# Onyx Server IRC daemon — systemd service unit
-# =============================================================================
-# Install to /etc/systemd/system/onyx-server.service (or let `zig build install`
-# stage it under <prefix>/lib/systemd/system/onyx-server.service and symlink it).
-#
-# Then:
-#   useradd --system --home-dir /var/lib/onyx-server --shell /usr/sbin/nologin onyx-server
-#   install -d -o onyx-server -g onyx-server /var/lib/onyx-server /etc/onyx-server
-#   install -m 0640 -o onyx-server -g onyx-server etc/onyx-server.reference.toml /etc/onyx-server/onyx-server.toml
-#   install -m 0755 zig-out/bin/onyx-server /usr/local/bin/onyx-server   # or package stage
-#   /usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
-#   systemctl daemon-reload && systemctl enable --now onyx-server
-# (enable/start also runs ExecStartPre=… --check-config …; a bad config fails closed.)
-#
-# HOT UPGRADE (the whole point — see ExecReload):
-#   # stage the freshly-built binary at the ExecStart path, --check-config, then:
-#   systemctl reload onyx-server          # -> kill -USR2 $MAINPID -> session-preserving execve
-# A plain `systemctl restart onyx-server` is the BOOTSTRAP / fallback path: it drops
-# sessions. SIGUSR2 (reload) re-execs in place, keeping the listener fd and all
-# live client sessions across the swap. Reload does NOT re-run ExecStartPre — always
-# --check-config yourself after a config change. See tools/upgrade_smoke.py.
-# =============================================================================
-
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Provision the dedicated account and private configuration before enabling.
+# Host path/account overrides belong in systemctl edit onyx-server.
+# See docs/guide/service-management.md for installation and upgrade acceptance.
 [Unit]
-Description=Onyx Server IRC daemon (Undertow + Mooring mesh)
+Description=Onyx Server secured IRC/IRCX mesh daemon
 Documentation=https://github.com/devinkbrown/onyx-server
 After=network-online.target
 Wants=network-online.target
-
-[Service]
-# No sd_notify in the daemon (no NOTIFY_SOCKET/READY=1 in src/), so Type=simple:
-# systemd considers the unit started as soon as the binary is exec'd. If/when the
-# daemon learns sd_notify, switch to Type=notify for accurate "started" state.
-Type=simple
-
-# Fail closed on a bad config. A parse/load error on the normal boot path can
-# fall through to the built-in DEFAULT identity (wrong name/ports/keys) instead
-# of refusing to start — so production MUST preflight. `--check-config` is the
-# real flag (src/main.zig): it parses, resolves env:/@file:, runs mesh cloak and
-# MESSAGE_V2 identity preflight, prints `config OK`, and exits 0/1 without
-# binding listeners or dialing mesh. systemd aborts the start if this fails.
-ExecStartPre=/usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
-
-# argv[1] is the config path (src/main.zig parses the config from argv[1]).
-ExecStart=/usr/local/bin/onyx-server /etc/onyx-server/onyx-server.toml
-
-# --- Hot upgrade: SIGUSR2 triggers the session-preserving execve handoff. -----
-# This is why a dedicated reload verb exists: `systemctl reload onyx-server` keeps the
-# bound socket and every live client session across the new image (a restart does
-# not). Stage the new binary at the ExecStart path first, then reload.
-ExecReload=/bin/kill -USR2 $MAINPID
-
-# Crash recovery (NOT used for upgrades — those are an in-place execve that keeps
-# the same PID, so systemd never sees an exit). Only restart on genuine failure.
-Restart=on-failure
-RestartSec=2s
-# Don't enter a tight crash loop: 5 failures in 60s -> give up (alert fires).
 StartLimitIntervalSec=60
 StartLimitBurst=5
-TimeoutStopSec=15s
-KillMode=mixed
 
-# --- Identity -----------------------------------------------------------------
-# Dedicated unprivileged service account (create it; see header). DynamicUser is
-# avoided because the daemon owns persistent state under /var/lib/onyx-server
-# (accounts.db WAL, oper grants, bootstrapped TLS key) that must survive restarts.
+[Service]
+# Process creation is not IRC/mesh readiness; there is no sd_notify protocol.
+Type=exec
 User=onyx-server
 Group=onyx-server
-
-# State directory: systemd creates/chowns /var/lib/onyx-server (0750) and exports it
-# as $STATE_DIRECTORY. House accounts.db, oper_grants.tsv, the bootstrapped TLS
-# leaf, and the news cache here.
-StateDirectory=onyx-server
-StateDirectoryMode=0750
 WorkingDirectory=/var/lib/onyx-server
+StateDirectory=onyx-server
+StateDirectoryMode=0700
+RuntimeDirectory=onyx-server
+RuntimeDirectoryMode=0700
+UMask=0077
 
-# --- Capabilities -------------------------------------------------------------
-# Needed only to bind privileged ports (6667/6697 < 1024). If you run Onyx Server on
-# high ports exclusively (e.g. 6680/16720 as in the configs), delete BOTH lines
-# below — the daemon then needs no capabilities at all.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# All commands run with the service identity, working directory and sandbox.
+ExecStartPre=/usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
+ExecStart=/usr/local/bin/onyx-server /etc/onyx-server/onyx-server.toml
+# A failed candidate preflight prevents the signal. This requests a Helix image
+# upgrade, not config-only REHASH. Completion is asynchronous: inspect daemon
+# upgrade results, client continuity and secured mesh before accepting a release.
+ExecReload=/usr/local/bin/onyx-server --check-config /etc/onyx-server/onyx-server.toml
+ExecReload=/bin/kill -USR2 $MAINPID
 
-# --- Sandboxing / hardening ---------------------------------------------------
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=onyx-server
+
+# Default IRC ports (6667/6697) are above 1023 and need no capability.
+# For an explicitly configured privileged port, review a capability drop-in.
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=true
-# ProtectSystem=strict makes the whole FS read-only except ReadWritePaths; the
-# StateDirectory is writable automatically. Add /etc/onyx-server as RW only if the
-# daemon must rewrite config in place (it does not by default — REHASH re-reads).
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
@@ -104,23 +63,13 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 RemoveIPC=true
-
-# Address families: AF_INET/AF_INET6 for IRC + the UDP media/mesh planes
-# (SFU/OPVOX media sockets and S2S all live on INET/INET6 — these are UDP and TCP
-# sockets, NOT a separate family, so AF_INET[6] covers them). AF_UNIX is kept for
-# systemd's own notify/log plumbing. NETLINK is NOT included; if GeoIP or DNS
-# resolution needs it on your libc, add AF_NETLINK here.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# IPC bind-mounts a private /dev; the daemon uses raw io_uring + sockets only.
 SystemCallArchitectures=native
-# Allow only the syscall groups a network daemon needs; @system-service already
-# covers io_uring setup/enter, socket(2), epoll, futex, mmap, and clock reads.
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @obsolete @clock @debug @mount @reboot @swap @cpu-emulation
+# io_uring and descriptor-based Helix execution must remain available. The
+# contents of systemd syscall groups vary by release; include these explicitly.
+SystemCallFilter=@system-service io_uring_setup io_uring_enter io_uring_register memfd_create execveat pidfd_open pidfd_send_signal
+SystemCallFilter=~@mount @reboot @swap @cpu-emulation @obsolete @debug @clock
 SystemCallErrorNumber=EPERM
-
-# UMask so the bootstrapped TLS key / accounts.db land 0640, not world-readable.
-UMask=0027
 
 [Install]
 WantedBy=multi-user.target

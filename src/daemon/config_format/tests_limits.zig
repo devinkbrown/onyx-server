@@ -523,3 +523,34 @@ test "parseToml: media sizing keys default, lift, and validate ranges" {
     defer allocator.free(too_many_participants);
     try testing.expectError(error.ParseError, parseToml(allocator, too_many_participants, .{}));
 }
+
+test "parseToml: [limits] whowas_max_entries projects with bounded range" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[limits]\nwhowas_max_entries = 42\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(u32, 42), cfg.limits.whowas_max_entries);
+
+    var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer omitted.deinit(allocator);
+    try testing.expectEqual(@as(u32, 20), omitted.limits.whowas_max_entries);
+
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[limits]\nwhowas_max_entries = 0\n", .{}));
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[limits]\nwhowas_max_entries = 101\n", .{}));
+}
+
+test "parseToml: [media] recording keys default off and require a directory when enabled" {
+    const allocator = testing.allocator;
+    var dflt = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
+    defer dflt.deinit(allocator);
+    try testing.expect(!dflt.media.recording_enabled);
+    try testing.expect(dflt.media.recording_dir == null);
+    try testing.expectEqual(@as(u32, 7), dflt.media.recording_retention_days);
+
+    var on = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[media]\nrecording_enabled = true\nrecording_dir = \"recordings\"\nrecording_retention_days = 3\n", .{});
+    defer on.deinit(allocator);
+    try testing.expect(on.media.recording_enabled);
+    try testing.expectEqualStrings("recordings", on.media.recording_dir.?);
+    try testing.expectEqual(@as(u32, 3), on.media.recording_retention_days);
+
+    try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[media]\nrecording_enabled = true\n", .{}));
+}

@@ -161,6 +161,13 @@ pub const Prepared = struct {
     }
 };
 
+/// Secure-zero an encoded capsule staging buffer iff its kind carries
+/// secrets, before the buffer is freed. Split out so the wipe is testable
+/// on caller memory before the free (safe-build free poison would mask it).
+pub fn wipeEncodedStaging(kind: capsule.CapsuleKind, encoded: []u8) void {
+    if (kind.carriesSecrets()) std.crypto.secureZero(u8, encoded);
+}
+
 /// Worker side of UPGRADE: create and seal the arena, serialize capsules,
 /// initialize the control socket, and advance the model to the pass-fds action.
 pub fn prepare(allocator: std.mem.Allocator, inputs: PrepareInputs) anyerror!Prepared {
@@ -183,7 +190,10 @@ pub fn prepare(allocator: std.mem.Allocator, inputs: PrepareInputs) anyerror!Pre
             var cap = capsule.make(piece.kind, fields[0..]);
             if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
             const encoded = try capsule.encode(allocator, cap);
-            defer allocator.free(encoded);
+            defer {
+                wipeEncodedStaging(piece.kind, encoded);
+                allocator.free(encoded);
+            }
             try arena.writeAll(encoded);
         }
         try arena.seal();
@@ -961,9 +971,15 @@ pub fn readArena(allocator: std.mem.Allocator, arena_fd: handoff.Fd) anyerror![]
     if (builtin.os.tag != .linux) return error.Unsupported;
 
     // Read the whole sealed memfd via positional reads (no size syscall needed).
+    // The whole arena is plaintext staging for secret-bearing capsules:
+    // wipe the read buffer (full capacity) and scratch before release.
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
+    defer {
+        std.crypto.secureZero(u8, buf.items.ptr[0..buf.capacity]);
+        buf.deinit(allocator);
+    }
     var tmp: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &tmp);
     var off: u64 = 0;
     while (true) {
         const rc = linux.pread(arena_fd, &tmp, tmp.len, @intCast(off));
@@ -1053,6 +1069,18 @@ fn fdListEnvEntry(allocator: std.mem.Allocator, name: []const u8, fds: []const h
         try text.appendSlice(allocator, std.fmt.bufPrint(&nbuf, "{d}", .{fd}) catch unreachable);
     }
     return try allocator.dupeSentinel(u8, text.items, 0);
+}
+
+test "wipeEncodedStaging zeroes secret-bearing staging and leaves plain staging" {
+    var secret_buf = "encoded-pmst-staging".*;
+    var ws_buf = "encoded-ws-staging!!".*;
+    var plain_buf = "encoded-channel-data".*;
+    wipeEncodedStaging(.pending_migration, &secret_buf);
+    wipeEncodedStaging(.ws_session, &ws_buf);
+    wipeEncodedStaging(.channels, &plain_buf);
+    for (secret_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (ws_buf) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    try std.testing.expectEqualStrings("encoded-channel-data", &plain_buf);
 }
 
 test "live prepare seals capsules and handoff passes fds" {

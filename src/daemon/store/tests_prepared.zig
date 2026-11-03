@@ -19,7 +19,9 @@ const readWalForTest = @import("tests_support.zig").readWalForTest;
 const refreshRecordChecksum = @import("tests_support.zig").refreshRecordChecksum;
 const rewriteTestFile = @import("tests_support.zig").rewriteTestFile;
 const checksum = @import("wal.zig").checksum;
+const max_zero_progress_writes = @import("wal.zig").max_zero_progress_writes;
 const writeNextSeqRecordAt = @import("wal.zig").writeNextSeqRecordAt;
+const writePositionalAllGuarded = @import("wal.zig").writePositionalAllGuarded;
 const writeRecordAt = @import("wal.zig").writeRecordAt;
 const writeU32 = @import("wal.zig").writeU32;
 
@@ -746,4 +748,135 @@ test "native Helix read-only store refuses torn WAL without repair and detects p
     defer allocator.free(after);
     try std.testing.expectEqualSlices(u8, before, after);
     try std.testing.expectError(error.FileNotFound, OroStore.openReadOnlyWithConfig(allocator, std.testing.io, tmp.dir, "absent.wal", .{}));
+}
+
+// --- srv-h15 residuals: zero-progress writes and WAL-creation dir sync ---
+
+const FakePositionalWriter = struct {
+    calls: usize = 0,
+    zeros_first: usize = 0,
+    overclaim: bool = false,
+    captured: [64]u8 = undefined,
+    captured_len: usize = 0,
+
+    pub fn writePositional(self: *@This(), io: std.Io, data: []const []const u8, offset: u64) !usize {
+        _ = io;
+        _ = offset;
+        self.calls += 1;
+        if (self.overclaim) return data[0].len + 1;
+        if (self.calls <= self.zeros_first) return 0;
+        self.captured[self.captured_len] = data[0][0];
+        self.captured_len += 1;
+        return 1;
+    }
+};
+
+test "STORE guarded positional write fails bounded on zero progress" {
+    var stuck = FakePositionalWriter{ .zeros_first = std.math.maxInt(usize) };
+    try std.testing.expectError(StoreError.IoAmbiguous, writePositionalAllGuarded(std.testing.io, &stuck, "record", 0));
+    try std.testing.expectEqual(max_zero_progress_writes + 1, stuck.calls);
+
+    var overclaiming = FakePositionalWriter{ .overclaim = true };
+    try std.testing.expectError(StoreError.IoAmbiguous, writePositionalAllGuarded(std.testing.io, &overclaiming, "record", 0));
+    try std.testing.expectEqual(@as(usize, 1), overclaiming.calls);
+
+    // Exactly the tolerated streak followed by 1-byte progress succeeds.
+    var recovering = FakePositionalWriter{ .zeros_first = max_zero_progress_writes };
+    try writePositionalAllGuarded(std.testing.io, &recovering, "record", 0);
+    try std.testing.expectEqualStrings("record", recovering.captured[0..recovering.captured_len]);
+}
+
+/// Io shim over `std.testing.io`: delegates everything except positional
+/// writes (zero-progress when armed) and syncs (counted).
+const HookedIo = struct {
+    var base_write_positional: @TypeOf(std.testing.io.vtable.fileWritePositional) = undefined;
+    var base_file_sync: @TypeOf(std.testing.io.vtable.fileSync) = undefined;
+    var zero_armed: bool = false;
+    var zero_calls: usize = 0;
+    var sync_calls: usize = 0;
+
+    vtable: std.Io.VTable,
+    io: std.Io,
+
+    fn init(self: *HookedIo) void {
+        base_write_positional = std.testing.io.vtable.fileWritePositional;
+        base_file_sync = std.testing.io.vtable.fileSync;
+        zero_armed = false;
+        zero_calls = 0;
+        sync_calls = 0;
+        self.vtable = std.testing.io.vtable.*;
+        self.vtable.fileWritePositional = hookedWritePositional;
+        self.vtable.fileSync = hookedFileSync;
+        self.io = .{ .vtable = &self.vtable, .userdata = std.testing.io.userdata };
+    }
+
+    fn hookedWritePositional(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+        if (zero_armed) {
+            zero_calls += 1;
+            return 0;
+        }
+        return base_write_positional(userdata, file, header, data, splat, offset);
+    }
+
+    fn hookedFileSync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        sync_calls += 1;
+        return base_file_sync(userdata, file);
+    }
+};
+
+test "STORE zero-progress WAL write poisons prepared commit instead of spinning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var hooked: HookedIo = undefined;
+    hooked.init();
+    defer HookedIo.zero_armed = false;
+
+    var store = try OroStore.open(std.testing.allocator, hooked.io, tmp.dir, "zero-progress.wal");
+    defer store.deinit();
+    try store.put(.accounts, "alice", "v1");
+
+    HookedIo.zero_armed = true;
+    var prepared = try store.preparePut(.accounts, "bob", "v2");
+    defer prepared.deinit();
+    try std.testing.expectError(StoreError.IoAmbiguous, prepared.commit());
+    HookedIo.zero_armed = false;
+    try std.testing.expectEqual(max_zero_progress_writes + 1, HookedIo.zero_calls);
+    try std.testing.expect(store.preparedWritesPoisoned());
+    try std.testing.expect(store.family(.accounts).get("bob") == null);
+    try std.testing.expectEqualStrings("v1", store.family(.accounts).get("alice").?);
+    try std.testing.expectError(StoreError.StorePoisoned, store.put(.accounts, "carol", "blocked"));
+}
+
+test "STORE ensureWal syncs parent directory only when it creates the WAL" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var hooked: HookedIo = undefined;
+    hooked.init();
+
+    var store = try OroStore.open(std.testing.allocator, hooked.io, tmp.dir, "ensure-dir-sync.wal");
+    defer store.deinit();
+    try store.put(.accounts, "alice", "v1");
+    try std.testing.expect(!store.wal_dir_sync_pending);
+
+    // Existing WAL: dropping and re-acquiring the descriptor must not
+    // sync anything (ensureWal itself never syncs the WAL file, so any
+    // counted sync would be a directory sync).
+    store.wal_file.?.close(hooked.io);
+    store.wal_file = null;
+    HookedIo.sync_calls = 0;
+    try EngineAccess.ensureWal(&store);
+    try std.testing.expectEqual(@as(usize, 0), HookedIo.sync_calls);
+    try std.testing.expect(!store.wal_dir_sync_pending);
+
+    // Newly created WAL: exactly the creation path must sync the parent
+    // directory so the new entry is durable.
+    store.wal_file.?.close(hooked.io);
+    store.wal_file = null;
+    try tmp.dir.deleteFile(std.testing.io, "ensure-dir-sync.wal");
+    HookedIo.sync_calls = 0;
+    try EngineAccess.ensureWal(&store);
+    try std.testing.expect(HookedIo.sync_calls >= 1);
+    try std.testing.expect(!store.wal_dir_sync_pending);
+    try std.testing.expectEqual(@as(u64, 0), store.wal_offset);
 }

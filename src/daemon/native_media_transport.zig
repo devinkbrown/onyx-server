@@ -100,6 +100,9 @@ pub const NativeMediaTransport = struct {
     physical_streams: NativeStreamMap = .empty,
     /// channel name (owned key) -> that call's forward link.
     channels: std.StringHashMapUnmanaged(Link) = .empty,
+    /// Optional recording tap installed on every per-channel link (and on
+    /// links created later). Process-local: never snapshotted.
+    media_tap: ?native_media_link.MediaTap = null,
     /// stream_id -> the channel key that owns the publisher (borrows a key from
     /// `channels`, so it is only valid while that channel entry exists).
     stream_index: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
@@ -145,6 +148,20 @@ pub const NativeMediaTransport = struct {
     /// Install the cross-leg sink (call before `start`, or while stopped).
     pub fn setCrossLegSink(self: *NativeMediaTransport, sink: media_bridge.CrossLegSink) void {
         self.cross = sink;
+    }
+
+    /// Install (or clear) the recording tap on all current and future
+    /// per-channel links. The callback contract is `MediaTap`'s: it runs on
+    /// the pump thread and must never block.
+    pub fn setMediaTap(self: *NativeMediaTransport, tap: ?native_media_link.MediaTap) void {
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        self.media_tap = tap;
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.setTapChannel(entry.key_ptr.*);
+            entry.value_ptr.setTap(tap);
+        }
     }
 
     pub fn configureMac(self: *NativeMediaTransport, stream_key: *const [16]u8, require_mac: bool) void {
@@ -1242,6 +1259,8 @@ pub const NativeMediaTransport = struct {
             };
             gop.key_ptr.* = key;
             gop.value_ptr.* = Link.initConfig(self.max_participants);
+            gop.value_ptr.setTapChannel(key);
+            gop.value_ptr.setTap(self.media_tap);
         }
         return gop.value_ptr;
     }

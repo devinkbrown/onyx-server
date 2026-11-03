@@ -203,6 +203,27 @@ pub const DetachedSnapshot = struct {
     snapshot: []u8,
 };
 
+/// Session snapshots and token copies are replay authority: secure-zero
+/// them before every free. Split out so the wipe is testable on caller
+/// memory before the free (safe-build free poison would mask it).
+fn wipeSecretBytes(bytes: []u8) void {
+    std.crypto.secureZero(u8, bytes);
+}
+
+fn wipeToken(token: *Token) void {
+    std.crypto.secureZero(u8, token);
+}
+
+fn freeTokenBindRows(allocator: std.mem.Allocator, rows: []TokenBindRowSnapshot) void {
+    for (rows) |*row| wipeToken(&row.token);
+    if (rows.len != 0) allocator.free(rows);
+}
+
+fn wipeListCapacity(list: anytype) void {
+    if (list.capacity != 0)
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(list.items.ptr[0..list.capacity]));
+}
+
 pub const PortableDetachedSnapshot = struct {
     account: []u8,
     token: Token,
@@ -210,7 +231,9 @@ pub const PortableDetachedSnapshot = struct {
 
     pub fn deinit(self: *PortableDetachedSnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.account);
+        wipeSecretBytes(self.snapshot);
         allocator.free(self.snapshot);
+        std.crypto.secureZero(u8, &self.token);
         self.* = undefined;
     }
 };
@@ -225,7 +248,9 @@ pub const PortableDetachedAttachmentSnapshot = struct {
 
     pub fn deinit(self: *PortableDetachedAttachmentSnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.account);
+        wipeSecretBytes(self.snapshot);
         allocator.free(self.snapshot);
+        std.crypto.secureZero(u8, &self.token);
         self.* = undefined;
     }
 };
@@ -235,6 +260,9 @@ const SessionList = struct {
 
     fn deinit(self: *SessionList, allocator: std.mem.Allocator) void {
         for (self.items.items) |*session| freeSessionOwned(allocator, session);
+        // Token copies also linger in spare capacity (swapRemove tails).
+        if (self.items.capacity != 0)
+            std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.items.items.ptr[0..self.items.capacity]));
         self.items.deinit(allocator);
     }
 
@@ -783,7 +811,7 @@ pub const PreparedBootstrapTokenAttach = struct {
     }
 
     fn destroyLockedRows(self: *PreparedBootstrapTokenAttach) void {
-        if (self.locked_account_rows.len != 0) self.store.allocator.free(self.locked_account_rows);
+        freeTokenBindRows(self.store.allocator, self.locked_account_rows);
         self.locked_account_rows = &.{};
     }
 };
@@ -1022,8 +1050,7 @@ pub const PreparedTokenBind = struct {
     }
 
     fn destroyLockedAccountRows(self: *PreparedTokenBind) void {
-        if (self.locked_account_rows.len == 0) return;
-        self.store.allocator.free(self.locked_account_rows);
+        freeTokenBindRows(self.store.allocator, self.locked_account_rows);
         self.locked_account_rows = &.{};
     }
 };
@@ -1215,7 +1242,7 @@ pub const PreparedAttachmentRebind = struct {
     }
 
     fn destroyLockedAccountRows(self: *PreparedAttachmentRebind) void {
-        if (self.locked_account_rows.len != 0) self.store.allocator.free(self.locked_account_rows);
+        freeTokenBindRows(self.store.allocator, self.locked_account_rows);
         self.locked_account_rows = &.{};
     }
 };
@@ -2313,10 +2340,14 @@ const LifecycleOwned = struct {
             }
         }
         // Remove every old locator before any emptied account key can retire.
-        for (self.indexes.items) |index| if (s.token_index.fetchRemove(index.token)) |old| {
-            var entry = old.value;
-            entry.deinit(s.allocator);
-        };
+        for (self.indexes.items) |index| {
+            const key_ptr = s.token_index.getKeyPtr(index.token);
+            if (s.token_index.fetchRemove(index.token)) |old| {
+                var entry = old.value;
+                entry.deinit(s.allocator);
+                if (key_ptr) |slot| wipeToken(slot);
+            }
+        }
         for (self.accounts.items) |a| if (a.old) |old| for (old.items.items) |row| {
             if (row.attachment_id) |id| std.debug.assert(s.attachment_index.remove(id.raw));
         };
@@ -2372,20 +2403,36 @@ const LifecycleOwned = struct {
         self.folded_updates.deinit(a);
         for (self.indexes.items) |*index| index.entry.deinit(a);
         self.accounts.deinit(a);
+        // These staging lists carry by-value token copies (rows, groups,
+        // indexes, admissions, physical facts, remaps, deltas): wipe their
+        // full backing capacity, including swap-remove tails.
+        wipeListCapacity(self.groups);
         self.groups.deinit(a);
+        wipeListCapacity(self.indexes);
         self.indexes.deinit(a);
+        wipeListCapacity(self.before);
         self.before.deinit(a);
+        wipeListCapacity(self.after);
         self.after.deinit(a);
+        wipeListCapacity(self.admissions);
         self.admissions.deinit(a);
+        wipeListCapacity(self.retired);
         self.retired.deinit(a);
+        wipeListCapacity(self.remaps);
         self.remaps.deinit(a);
+        wipeListCapacity(self.physical);
         self.physical.deinit(a);
+        wipeListCapacity(self.deltas);
         self.deltas.deinit(a);
         self.reasons.deinit(a);
         self.removed_reasons.deinit(a);
         self.final_lookup.deinit(a);
         self.old_bindings.deinit(a);
         self.account_lookup.deinit(a);
+        {
+            var keys = self.group_lookup.keyIterator();
+            while (keys.next()) |key| wipeToken(key);
+        }
         self.group_lookup.deinit(a);
         a.destroy(self);
     }
@@ -2764,8 +2811,12 @@ pub const SessionStore = struct {
         entry.local_projections = .{};
         if (keep_empty) return;
         entry.deinit(self.allocator);
+        // Wipe the token key slot: its backing storage stays allocated in
+        // the map after removal (removal does not move/free storage).
+        const key_ptr = self.token_index.getKeyPtr(session.token);
         const removed = self.token_index.remove(session.token);
         std.debug.assert(removed);
+        if (key_ptr) |slot| wipeToken(slot);
     }
 
     fn remapTokenRowLocatorLocked(
@@ -2794,8 +2845,11 @@ pub const SessionStore = struct {
             }
             self.folded_index.deinit();
             self.attachment_index.deinit();
-            var token_entries = self.token_index.valueIterator();
-            while (token_entries.next()) |entry| entry.deinit(self.allocator);
+            var token_entries = self.token_index.iterator();
+            while (token_entries.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+                wipeToken(entry.key_ptr);
+            }
             self.token_index.deinit();
             var it = self.accounts.iterator();
             while (it.next()) |entry| {
@@ -3410,7 +3464,7 @@ pub const SessionStore = struct {
             locked_row_count,
         ) catch return null;
         var rows_transferred = false;
-        defer if (!rows_transferred) self.allocator.free(locked_account_rows);
+        defer if (!rows_transferred) freeTokenBindRows(self.allocator, locked_account_rows);
         var locked_row_index: usize = 0;
         for (folded.keys.items) |key| {
             if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
@@ -3558,7 +3612,7 @@ pub const SessionStore = struct {
         const preview_count = std.math.add(usize, folded_row_count, 1) catch return null;
         const locked_account_rows = self.allocator.alloc(TokenBindRowSnapshot, preview_count) catch return null;
         var rows_transferred = false;
-        defer if (!rows_transferred) self.allocator.free(locked_account_rows);
+        defer if (!rows_transferred) freeTokenBindRows(self.allocator, locked_account_rows);
         var preview_index: usize = 0;
         // Staging a new exact-case account can reserve index capacity. Re-fetch
         // the selected group afterwards; an absent fold is valid for adoption.
@@ -3715,7 +3769,7 @@ pub const SessionStore = struct {
             locked_row_count,
         ) catch return null;
         var rows_transferred = false;
-        defer if (!rows_transferred) self.allocator.free(locked_account_rows);
+        defer if (!rows_transferred) freeTokenBindRows(self.allocator, locked_account_rows);
         var locked_row_index: usize = 0;
         for (folded.keys.items) |key| {
             if (builtin.is_test) _ = self.folded_key_visits.fetchAdd(1, .monotonic);
@@ -5110,7 +5164,11 @@ pub const SessionStore = struct {
             portable: bool = false,
         };
         var selections: std.AutoHashMapUnmanaged(Token, Selection) = .empty;
-        defer selections.deinit(allocator);
+        defer {
+            var keys = selections.keyIterator();
+            while (keys.next()) |key| wipeToken(key);
+            selections.deinit(allocator);
+        }
         var row_count: usize = 0;
         var count_it = self.accounts.valueIterator();
         while (count_it.next()) |list| row_count += list.items.items.len;
@@ -5170,7 +5228,11 @@ pub const SessionStore = struct {
         // Build group portability once. Calling tokenGroupStateLocked per row
         // would rescan the whole store and turn peer anti-entropy into O(N^2).
         var portable_tokens: std.AutoHashMapUnmanaged(Token, void) = .empty;
-        defer portable_tokens.deinit(allocator);
+        defer {
+            var keys = portable_tokens.keyIterator();
+            while (keys.next()) |key| wipeToken(key);
+            portable_tokens.deinit(allocator);
+        }
         var row_count: usize = 0;
         var rows = self.accounts.valueIterator();
         while (rows.next()) |list| row_count = std.math.add(usize, row_count, list.items.items.len) catch return error.OutOfMemory;
@@ -5629,7 +5691,10 @@ fn attachmentLocalWorkInSlice(
 }
 
 fn freeSnapshot(allocator: std.mem.Allocator, session: *Session) void {
-    if (session.snapshot) |bytes| allocator.free(bytes);
+    if (session.snapshot) |bytes| {
+        wipeSecretBytes(bytes);
+        allocator.free(bytes);
+    }
     session.snapshot = null;
 }
 
@@ -5649,6 +5714,9 @@ fn freeSessionOwned(allocator: std.mem.Allocator, session: *Session) void {
     session.local_channel_projections = null;
     if (session.attachment_channel_projections) |set| allocator.destroy(set);
     session.attachment_channel_projections = null;
+    // Every caller discards, overwrites, or swap-removes this row right
+    // after freeing its owned state (any live token was copied out first).
+    wipeToken(&session.token);
 }
 
 // ---------------------------------------------------------------------------
@@ -5680,6 +5748,26 @@ fn tokenNumber(value: u64) Token {
 
 fn lifecycleSelector(account: []const u8, s: Session) LifecycleSelector {
     return .{ .account = account, .exact = .{ .client = s.client, .token = s.token, .signon_ms = s.signon_ms, .attachment_id = s.attachment_id }, .attached = s.attached };
+}
+
+test "secret wipe helpers zero token and snapshot bytes; wiping removal keeps token reusable" {
+    var token = tok(0x7e);
+    wipeToken(&token);
+    for (token) |b| try testing.expectEqual(@as(u8, 0), b);
+    var snap = "restore-snapshot-bytes".*;
+    wipeSecretBytes(&snap);
+    for (snap) |b| try testing.expectEqual(@as(u8, 0), b);
+
+    var store = SessionStore.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.attachWithAttachment("alice", 11, tok(9), aid(9), 100);
+    try testing.expect(store.markDetachedWithSnapshot("alice", 11, "detached-restore"));
+    // Removal wipes the snapshot, the row token, and the token-index key
+    // slot; re-attaching the same token afterwards must still work.
+    try testing.expect(store.remove("alice", 11));
+    _ = try store.attachWithAttachment("alice", 12, tok(9), aid(10), 200);
+    var account_out: [64]u8 = undefined;
+    try testing.expect(store.findByTokenInto(tok(9), &account_out) != null);
 }
 
 test "Session lifecycle batch owns mixed candidate and commits without allocation" {

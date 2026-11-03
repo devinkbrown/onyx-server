@@ -6,12 +6,19 @@
 # command_user=onyx-server:onyx-server
 # directory=/var/lib/onyx-server
 
-# Service-specific defaults override OpenRC's global defaults; edit here to change them.
+# Set service-specific policy here; defaults preserve an explicit inherited override.
 # Permit at most three respawns in a 60-second period, with five seconds between.
-respawn_delay=5
-respawn_max=3
-respawn_period=60
+: "${respawn_delay:=5}"
+: "${respawn_max:=3}"
+: "${respawn_period:=60}"
 
 # Supervised stdout/stderr go to the configured syslog service by default.
 # output_logger="logger -t onyx-server -p daemon.info"
 # error_logger="logger -t onyx-server -p daemon.err"
+
+# Allow 30 seconds for cooperative cleanup before forced termination.
+# retry="TERM/30/KILL/5"
+# Prevent privilege gain during daemon and Helix successor execution.
+# no_new_privs=yes
+# reload validates the candidate before requesting Helix (USR2); it does not
+# wait for upgrade completion or prove session/mesh continuity. See the guide.

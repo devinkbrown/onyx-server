@@ -3,11 +3,17 @@
 
 description="Onyx Server secured IRC/IRCX mesh daemon"
 supervisor="supervise-daemon"
+extra_commands="checkconfig"
+extra_started_commands="reload"
+description_checkconfig="Validate the candidate configuration without starting listeners"
+description_reload="Validate and request a Helix upgrade; verify completion separately"
 
 : "${command:=/usr/bin/onyx-server}"
 : "${config:=/etc/onyx-server/onyx-server.toml}"
 : "${command_user:=onyx-server:onyx-server}"
 : "${directory:=/var/lib/onyx-server}"
+: "${retry:=TERM/30/KILL/5}"
+: "${no_new_privs:=yes}"
 : "${respawn_delay:=5}"
 : "${respawn_max:=3}"
 : "${respawn_period:=60}"
@@ -22,9 +28,29 @@ depend() {
 	use dns logger
 }
 
+checkconfig() {
+	# setpriv executes a one-shot command without daemon matching, PID files or
+	# supervisor bookkeeping. Preserve explicit primary and supplementary groups.
+	local runtime_user="${command_user%%:*}"
+	local runtime_group="${command_user#*:}"
+	if [ "${runtime_group}" = "${command_user}" ]; then
+		runtime_group="$(id -gn "${runtime_user}")" || return 1
+	fi
+	ebegin "Validating Onyx Server configuration as ${command_user}"
+	setpriv --reuid "${runtime_user}" --regid "${runtime_group}" --init-groups \
+		--no-new-privs /bin/sh -c 'cd "$1" && exec "$2" --check-config "$3"' \
+		onyx-config-check "${directory}" "${command}" "${config}"
+	eend $?
+}
+
 start_pre() {
 	checkpath --directory --mode 0700 --owner "${command_user}" "${directory}" || return 1
-	ebegin "Validating Onyx Server configuration"
-	"${command}" --check-config "${config}"
+	checkconfig
+}
+
+reload() {
+	checkconfig || return 1
+	ebegin "Requesting Onyx Server Helix upgrade (completion must be verified)"
+	supervise-daemon "${RC_SVCNAME}" --signal USR2
 	eend $?
 }

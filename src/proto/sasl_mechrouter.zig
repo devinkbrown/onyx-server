@@ -74,6 +74,11 @@ pub const Success = struct {
     final_data: ?[]const u8 = null,
     guest: bool = false,
     issue_session_token: bool = true,
+    /// Fingerprint of the exact durable SCRAM verifier this exchange proved
+    /// against (SCRAM mechanisms only). The session-binding layer re-checks
+    /// it against the account service before login so a mid-exchange
+    /// credential rotation cannot bind a different verifier.
+    scram_credential: ?sasl.ScramCredentialFingerprint = null,
 };
 
 pub const Outcome = union(enum) {
@@ -166,6 +171,9 @@ pub const Router = struct {
     decode_buf: [MAX_RAW_MESSAGE]u8 = undefined,
     account_buf: [MAX_ACCOUNT]u8 = undefined,
     account_len: usize = 0,
+    /// Fingerprint of the verifier fetched at SCRAM client-first, carried to
+    /// the success outcome at client-final. Cleared on every exchange reset.
+    pending_scram_fingerprint: ?sasl.ScramCredentialFingerprint = null,
 
     const State = union(enum) {
         idle,
@@ -328,6 +336,7 @@ pub const Router = struct {
                 const parsed = scram256.parseClientFirst(raw, &username_buf) catch return self.failReset(.invalid_message);
                 const lookup = self.callbacks.scram256 orelse return self.failReset(.unavailable);
                 const credential = lookup.lookup(parsed.username) orelse return self.failReset(.invalid_credentials);
+                self.pending_scram_fingerprint = sasl.fingerprintScramCredential(.sha256, credential.salt, credential.iterations, &credential.stored_key, &credential.server_key) orelse return self.failReset(.invalid_credentials);
                 var raw_out: [scram256.MAX_MESSAGE]u8 = undefined;
                 const first = server.receiveClientFirst(raw, credential, self.server_nonce, &raw_out) catch {
                     return self.failReset(.invalid_message);
@@ -341,7 +350,9 @@ pub const Router = struct {
                 const account = self.copyAccount(server.username()) orelse return self.failReset(.invalid_message);
                 const encoded = encodeBase64(final.server_final, out) catch return self.failReset(.output_too_small);
                 self.state = .idle;
-                return .{ .success = .{ .account = account, .final_data = encoded } };
+                const fingerprint = self.pending_scram_fingerprint;
+                self.pending_scram_fingerprint = null;
+                return .{ .success = .{ .account = account, .final_data = encoded, .scram_credential = fingerprint } };
             },
             .complete => return self.failReset(.invalid_state),
         }
@@ -354,6 +365,7 @@ pub const Router = struct {
                 const parsed = scram512.parseClientFirst(raw, &username_buf) catch return self.failReset(.invalid_message);
                 const lookup = self.callbacks.scram512 orelse return self.failReset(.unavailable);
                 const credential = lookup.lookup(parsed.username) orelse return self.failReset(.invalid_credentials);
+                self.pending_scram_fingerprint = sasl.fingerprintScramCredential(.sha512, credential.salt, credential.iterations, &credential.stored_key, &credential.server_key) orelse return self.failReset(.invalid_credentials);
                 var raw_out: [scram512.MAX_MESSAGE]u8 = undefined;
                 const first = server.receiveClientFirst(raw, credential, self.server_nonce, &raw_out) catch {
                     return self.failReset(.invalid_message);
@@ -367,7 +379,9 @@ pub const Router = struct {
                 const account = self.copyAccount(server.username()) orelse return self.failReset(.invalid_message);
                 const encoded = encodeBase64(final.server_final, out) catch return self.failReset(.output_too_small);
                 self.state = .idle;
-                return .{ .success = .{ .account = account, .final_data = encoded } };
+                const fingerprint = self.pending_scram_fingerprint;
+                self.pending_scram_fingerprint = null;
+                return .{ .success = .{ .account = account, .final_data = encoded, .scram_credential = fingerprint } };
             },
             .complete => return self.failReset(.invalid_state),
         }
@@ -389,6 +403,7 @@ pub const Router = struct {
         self.state = .idle;
         self.pending_len = 0;
         self.account_len = 0;
+        self.pending_scram_fingerprint = null;
     }
 };
 

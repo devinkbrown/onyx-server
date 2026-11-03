@@ -144,6 +144,20 @@ pub const TotpGate = struct {
     }
 };
 
+/// Injected predicate: does the account's CURRENT durable SCRAM verifier
+/// still fingerprint-match the verifier a just-completed SCRAM exchange
+/// proved against? Consulted at SASL success before the session binds, so a
+/// credential rotation between proof and binding cannot bind the session to
+/// a different verifier than the one that was actually verified.
+pub const ScramCredentialGate = struct {
+    ptr: *anyopaque,
+    matchesFn: *const fn (ptr: *anyopaque, account: []const u8, fingerprint: ScramCredentialFingerprint) bool,
+
+    pub fn matches(self: ScramCredentialGate, account: []const u8, fingerprint: ScramCredentialFingerprint) bool {
+        return self.matchesFn(self.ptr, account, fingerprint);
+    }
+};
+
 /// Injected predicate: is `account` SUSPENDED or FORBIDDEN and therefore barred
 /// from every credential path? Backed by the daemon's services account store.
 /// Consulted at SASL success so a mechanism whose verification never checks

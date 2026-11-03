@@ -477,6 +477,11 @@ Source: struct at `src/daemon/config_format.zig:446`, parsing at `src/daemon/con
 | `captions_max_speaker_bytes` | integer | `64` | `16..256` | Max speaker label length stored in the live transcript ring. |
 | `captions_ring_depth_per_channel` | integer | `128` | `16..4096` | Retained captions per channel before FIFO eviction. |
 | `captions_max_channels` | integer | `4096` | `64..1048576` | Max channels with a live transcript ring. |
+| `recording_enabled` | bool | `false` | `true` or `false` | Enables packet-journal recording after unanimous participant consent. Requires a nonempty `recording_dir`. |
+| `recording_dir` | string or null | unset | path | Private journal directory, created or verified as mode `0700`; its parent must exist. Segment and manifest names contain random recording IDs rather than channel or participant names. |
+| `recording_retention_days` | integer | `7` | `0..3650` | Removes expired owned journal files on the first recording start after boot. `0` disables this sweep. |
+| `recording_max_total_bytes` | integer | `536870912` | `65536..68719476736` | Total byte budget for one recording across its segments; exhaustion stops that recording. |
+| `recording_max_duration_secs` | integer | `14400` | `1..604800` | Maximum recording duration. All tracks use a common local monotonic recording clock. |
 | `media.sfu.max_breakout_label_bytes` | integer | `32` | `8..256` | Max `MEDIA BREAKOUT` label bytes retained by `MediaRooms`; longer labels are truncated in room state. |
 | `media.pins.max_per_channel` | integer | `50` | `1..1024` | Max msgids accepted in the live `PINS` channel prop. |
 | `media.pins.max_msgid_bytes` | integer | `64` | `8..256` | Max bytes per msgid token accepted in the live `PINS` channel prop. |
@@ -488,6 +493,11 @@ Source: struct at `src/daemon/config_format.zig:446`, parsing at `src/daemon/con
 | `dtls13` | bool | `false` | `true` or `false` | Additionally enable the DTLS 1.3 engine on the media plane. This is parsed independently, but only has an effect with `dtls_srtp` enabled (`src/daemon/config_format.zig:480`, `src/daemon/config_format.zig:1192`, `src/daemon/config_boot.zig:105`, `src/daemon/server.zig:3643`). |
 | `stun_host` | string or null | unset | any string | Optional STUN host mapped to media discovery config (`src/daemon/config_format.zig:483`, `src/daemon/config_boot.zig:106`, `src/daemon/server.zig:3623`). |
 | `stun_port` | port integer | `0` | `0..65535` | STUN port mapped when non-zero (`src/daemon/config_format.zig:484`, `src/daemon/config_format.zig:1219`, `src/daemon/config_boot.zig:107`). |
+
+Recording producers queue owned packet data without disk I/O. Maintenance writes
+strict `ONYXREC1` segments and manifests, rotates segments, and retries retained
+finalization work. Helix refuses while any active or retired recording still owns
+writer state; stop recording and allow finalization to complete before upgrading.
 
 ## `[stats]`
 
@@ -627,6 +637,15 @@ Browser [Web Push](web-push.md) delivery for offline direct messages (triggered 
 Source: struct `Webhook` in `src/daemon/config_format.zig`, parsing in `parseToml`, boot projection in `src/daemon/config_boot.zig`, HTTP listener in `src/daemon/webhook_http.zig`, payload rendering in `src/daemon/webhook_render.zig`, and live channel injection in `src/daemon/server.zig` `handleWebhook` / `injectWebhookPost`.
 
 Incoming channel webhooks are off by default. When enabled, channel operators and network operators can run `WEBHOOK CREATE <#channel> [name]` to mint a one-time URL of the form `/api/webhooks/<id>/<token>`. The token is stored only as a hash; `LIST` never reveals it again, and `DELETE <id>` removes the binding.
+
+With active MESSAGE_V2 authorship, webhook messages use the reserved sender
+`=<sanitized-name>!webhook@<origin-server>`. Clients cannot claim a nickname
+beginning with `=`. The authenticated origin and restricted webhook shape remain
+mandatory, and local delivery, mesh delivery, and history share one signed event
+identity. Compatibility mode retains the ordinary sanitized sender name.
+Upgrade every mesh node before enabling active webhooks: older peers reject the
+reserved sender form, although the MESSAGE_V2 schema and signature transcript
+are unchanged.
 
 The listener is a single-threaded, one-connection-at-a-time HTTP/1.1 accept loop and requires a valid `Content-Length` on every POST body — a body-bearing request without one is rejected immediately with `411 Length Required` rather than being awaited. Because a stalled or dribbled request still occupies the loop for up to `conn_read_timeout_sec` (5s), a non-loopback `bind` MUST sit behind a buffering reverse proxy (nginx/Caddy) that terminates TLS and always forwards a complete, `Content-Length`-framed request. Keep the default loopback bind unless such a proxy is in front.
 

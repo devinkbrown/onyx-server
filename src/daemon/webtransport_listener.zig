@@ -238,6 +238,10 @@ const Connection = struct {
     h3: *http3_conn.Http3Conn,
     /// Loopback TCP fd to the daemon's IRC listener, once a session establishes.
     irc_fd: ?TcpSocket = null,
+    /// Tail bytes consumed from the WebTransport stream but not yet accepted by
+    /// the nonblocking IRC socket. Kept per connection so a slow IRC client
+    /// cannot stall the shared UDP pump or cause already-read bytes to vanish.
+    pending_irc_write: std.ArrayList(u8) = .empty,
     /// Whether we already opened a server→client WT bidi stream for IRC output.
     /// We instead reuse the client's first WT bidi data stream; this records it.
     wt_stream_id: ?u64 = null,
@@ -277,6 +281,10 @@ pub const WebTransportListener = struct {
     /// the browser interop harness flips this on to validate the datagram path.
     echo_wt_datagrams: bool = false,
     max_connections: usize = default_max_connections,
+    /// Test-only override used to force a live IRC bridge into backpressure.
+    test_bridge_send_buffer: ?i32 = null,
+    /// Diagnostic latch set after any bridge yields to socket backpressure.
+    bridge_backpressure_seen: std.atomic.Value(bool) = .init(false),
 
     /// Retry policy (RFC 9000 §8.1.2). `.never` is the default fast path — a new
     /// Initial mints a connection directly (still anti-amplification-limited).
@@ -559,6 +567,8 @@ pub const WebTransportListener = struct {
                 logActiveSnapshotFailure("bridge observation", err);
                 return err;
             } else null;
+            const pending_irc_write = try allocator.dupe(u8, conn.pending_irc_write.items);
+            errdefer allocator.free(pending_irc_write);
             try rows.append(allocator, .{
                 .slot = slot,
                 .scid = canonicalCid(conn.scidSlice()),
@@ -573,6 +583,7 @@ pub const WebTransportListener = struct {
                 .bridge = bridge,
                 .wt_stream_id = conn.wt_stream_id,
                 .have_wt_stream = conn.have_wt_stream,
+                .pending_irc_write = pending_irc_write,
                 .quic = quic,
                 .h3 = h3,
             });
@@ -764,6 +775,8 @@ pub const WebTransportListener = struct {
             .wt_stream_id = row.wt_stream_id,
             .have_wt_stream = row.have_wt_stream,
         };
+        errdefer conn.pending_irc_write.deinit(self.allocator);
+        try conn.pending_irc_write.appendSlice(self.allocator, row.pending_irc_write);
         const qconn = try self.allocator.create(quic_conn.Conn);
         errdefer self.allocator.destroy(qconn);
         qconn.* = try quic_conn.Conn.restoreEstablishedServerSnapshot(self.allocator, &row.quic, .{
@@ -1220,6 +1233,14 @@ pub const WebTransportListener = struct {
             closeTcp(fd);
             return;
         }
+        if (self.test_bridge_send_buffer) |size| {
+            if (comptime builtin.os.tag != .windows) {
+                if (posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&size), @sizeOf(i32))) != .SUCCESS) {
+                    closeTcp(fd);
+                    return;
+                }
+            }
+        }
         conn.irc_fd = fd;
     }
 
@@ -1229,6 +1250,7 @@ pub const WebTransportListener = struct {
             closeTcp(fd);
             conn.irc_fd = null;
         }
+        conn.pending_irc_write.clearRetainingCapacity();
         conn.have_wt_stream = false;
         conn.wt_stream_id = null;
     }
@@ -1246,12 +1268,50 @@ pub const WebTransportListener = struct {
         var buf: [proxy_chunk_len]u8 = undefined;
 
         // WT stream → TCP (browser → IRC daemon).
-        while (true) {
-            const n = conn.h3.readWtStream(sid, &buf);
-            if (n == 0) break;
-            if (!writeAllFd(fd, buf[0..n])) {
-                self.teardownConnection(conn);
-                return false;
+        // First resume any tail left by a previous partial write. A blocked
+        // socket yields to the rest of the UDP pump; the bounded per-connection
+        // queue is retried on the next service iteration.
+        var can_read_wt = true;
+        if (conn.pending_irc_write.items.len > 0) {
+            switch (writeSomeFd(fd, conn.pending_irc_write.items)) {
+                .written => |n| consumePendingPrefix(&conn.pending_irc_write, n),
+                .blocked => {
+                    self.bridge_backpressure_seen.store(true, .release);
+                    can_read_wt = false;
+                },
+                .failed => {
+                    self.teardownConnection(conn);
+                    return false;
+                },
+            }
+            if (conn.pending_irc_write.items.len > 0) can_read_wt = false;
+        }
+        if (can_read_wt) {
+            while (true) {
+                const n = conn.h3.readWtStream(sid, &buf);
+                if (n == 0) break;
+                switch (writeSomeFd(fd, buf[0..n])) {
+                    .written => |written| if (written < n) {
+                        conn.pending_irc_write.appendSlice(self.allocator, buf[written..n]) catch {
+                            self.teardownConnection(conn);
+                            return false;
+                        };
+                        self.bridge_backpressure_seen.store(true, .release);
+                        break;
+                    },
+                    .blocked => {
+                        conn.pending_irc_write.appendSlice(self.allocator, buf[0..n]) catch {
+                            self.teardownConnection(conn);
+                            return false;
+                        };
+                        self.bridge_backpressure_seen.store(true, .release);
+                        break;
+                    },
+                    .failed => {
+                        self.teardownConnection(conn);
+                        return false;
+                    },
+                }
             }
         }
 
@@ -1427,6 +1487,7 @@ pub const WebTransportListener = struct {
         // slices by reference and encodes them lazily into EncryptedExtensions,
         // long after this function returns — a local `scid`/`init_dcid` would be a
         // dangling pointer by then).
+        conn.pending_irc_write = .empty;
         conn.scid = undefined;
         conn.scid_len = @intCast(scid.len);
         conn.init_dcid = undefined;
@@ -1551,6 +1612,7 @@ pub const WebTransportListener = struct {
 
     fn destroyConnection(self: *WebTransportListener, conn: *Connection) void {
         if (conn.irc_fd) |fd| closeTcp(fd);
+        conn.pending_irc_write.deinit(self.allocator);
         conn.h3.deinit();
         self.allocator.destroy(conn.h3);
         conn.conn.deinit();
@@ -1944,48 +2006,66 @@ fn writeAllFd(fd: TcpSocket, bytes: []const u8) bool {
         }
         return true;
     }
-    if (comptime builtin.os.tag != .linux) {
-        // A slow IRC peer cannot pin this single UDP pump indefinitely. Never
-        // replay already-sent bytes: failure tears down this bridge.
-        const deadline = nowNs() + std.time.ns_per_s;
-        var sent: usize = 0;
-        while (sent < bytes.len) {
-            if (nowNs() >= deadline) return false;
-            const rc = sys.send(fd, bytes[sent..].ptr, bytes.len - sent, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT);
-            switch (posix.errno(rc)) {
-                .SUCCESS => {
-                    if (rc <= 0) return false;
-                    sent += @intCast(rc);
-                },
-                .INTR => continue,
-                .AGAIN => {
-                    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-                    const now = nowNs();
-                    if (now >= deadline) return false;
-                    const remaining = @min((deadline - now) / std.time.ns_per_ms, 50);
-                    const ready = sys.poll(&fds, 1, @intCast(remaining));
-                    if (ready < 0 and posix.errno(ready) != .INTR) return false;
-                    if (fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
-                },
-                else => return false,
-            }
-        }
-        return true;
-    }
+    // Small one-shot writes (such as the optional PROXY header) also need a
+    // deadline. Stream data uses writeSomeFd below and is retained per peer.
+    const deadline = nowNs() + std.time.ns_per_s;
     var sent: usize = 0;
     while (sent < bytes.len) {
-        const rc = sys.write(fd, bytes[sent..].ptr, bytes.len - sent);
-        switch (posix.errno(rc)) {
-            .SUCCESS => {
-                const n: usize = @intCast(rc);
-                if (n == 0) return false;
-                sent += n;
+        switch (writeSomeFd(fd, bytes[sent..])) {
+            .written => |n| sent += n,
+            .failed => return false,
+            .blocked => {
+                const now = nowNs();
+                if (now >= deadline) return false;
+                var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                const remaining = @min((deadline - now) / std.time.ns_per_ms, 50);
+                const ready = sys.poll(&fds, 1, @intCast(remaining));
+                if (ready < 0 and posix.errno(ready) != .INTR) return false;
+                if (fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
             },
-            .INTR, .AGAIN => continue,
-            else => return false,
         }
     }
     return true;
+}
+
+const NonblockingWrite = union(enum) { written: usize, blocked, failed };
+
+/// Attempt one nonblocking stream write. The caller owns retry/queue policy;
+/// this helper never waits and never retries EAGAIN in a tight loop.
+fn writeSomeFd(fd: TcpSocket, bytes: []const u8) NonblockingWrite {
+    if (bytes.len == 0) return .{ .written = 0 };
+    if (comptime builtin.os.tag == .windows) {
+        const amount: i32 = @intCast(@min(bytes.len, std.math.maxInt(i32)));
+        const rc = win.send(fd, bytes.ptr, amount, 0);
+        if (rc > 0) return .{ .written = @intCast(rc) };
+        if (rc == 0) return .failed;
+        return switch (win.WSAGetLastError()) {
+            win.would_block, win.interrupted => .blocked,
+            else => .failed,
+        };
+    }
+    if (comptime builtin.os.tag == .linux) {
+        const rc = sys.sendto(fd, bytes.ptr, bytes.len, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT, null, 0);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => if (rc > 0) .{ .written = @intCast(rc) } else .failed,
+            .AGAIN, .INTR => .blocked,
+            else => .failed,
+        };
+    } else {
+        const rc = sys.send(fd, bytes.ptr, bytes.len, posix.MSG.NOSIGNAL | posix.MSG.DONTWAIT);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => if (rc > 0) .{ .written = @intCast(rc) } else .failed,
+            .AGAIN, .INTR => .blocked,
+            else => .failed,
+        };
+    }
+}
+
+fn consumePendingPrefix(pending: *std.ArrayList(u8), len: usize) void {
+    std.debug.assert(len <= pending.items.len);
+    const remaining = pending.items.len - len;
+    std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[len..]);
+    pending.items.len = remaining;
 }
 
 // ===========================================================================
@@ -2082,8 +2162,16 @@ const FakeIrcServer = struct {
     got: [256]u8 = undefined,
     got_len: std.atomic.Value(usize) = .init(0),
     reply: []const u8,
+    reply_ready: std.atomic.Value(bool) = .init(true),
+    allow_drain: std.atomic.Value(bool) = .init(true),
+    drain_after_reply_bytes: usize = 0,
+    drained_bytes: std.atomic.Value(usize) = .init(0),
 
     fn start(reply: []const u8) !*FakeIrcServer {
+        return startWithDrain(reply, 0);
+    }
+
+    fn startWithDrain(reply: []const u8, drain_after_reply_bytes: usize) !*FakeIrcServer {
         if (comptime builtin.os.tag == .windows) return startWindows(reply);
         const self = try testing.allocator.create(FakeIrcServer);
         errdefer testing.allocator.destroy(self);
@@ -2101,6 +2189,10 @@ const FakeIrcServer = struct {
         self.port = std.mem.bigToNative(u16, sa.port);
         self.got_len = .init(0);
         self.reply = reply;
+        self.reply_ready = .init(drain_after_reply_bytes == 0);
+        self.allow_drain = .init(drain_after_reply_bytes == 0);
+        self.drain_after_reply_bytes = drain_after_reply_bytes;
+        self.drained_bytes = .init(0);
         self.thread = try std.Thread.spawn(.{}, accept, .{self});
         return self;
     }
@@ -2127,6 +2219,10 @@ const FakeIrcServer = struct {
         self.port = std.mem.bigToNative(u16, bound.port);
         self.got_len = .init(0);
         self.reply = reply;
+        self.reply_ready = .init(true);
+        self.allow_drain = .init(true);
+        self.drain_after_reply_bytes = 0;
+        self.drained_bytes = .init(0);
         self.thread = try std.Thread.spawn(.{}, accept, .{self});
         return self;
     }
@@ -2139,7 +2235,11 @@ const FakeIrcServer = struct {
         if (posix.errno(cfd_rc) != .SUCCESS) return;
         const cfd: sys.fd_t = @intCast(cfd_rc);
         defer _ = sys.close(cfd);
-        const timeout = sys.timeval{ .sec = 2, .usec = 0 };
+        if (self.drain_after_reply_bytes != 0) {
+            const receive_buffer: i32 = 4096;
+            if (posix.errno(sys.setsockopt(cfd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&receive_buffer), @sizeOf(i32))) != .SUCCESS) return;
+        }
+        const timeout = sys.timeval{ .sec = if (self.drain_after_reply_bytes == 0) 2 else 10, .usec = 0 };
         if (posix.errno(sys.setsockopt(cfd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(@TypeOf(timeout)))) != .SUCCESS) return;
         var total: usize = 0;
         while (total < self.got.len) {
@@ -2149,7 +2249,30 @@ const FakeIrcServer = struct {
             if (std.mem.endsWith(u8, self.got[0..total], "NICK wtuser\r\n")) break;
         }
         self.got_len.store(total, .release);
+        while (!self.reply_ready.load(.acquire)) sleepMs(1);
         _ = writeAllFd(cfd, self.reply);
+        if (self.drain_after_reply_bytes != 0) {
+            while (!self.allow_drain.load(.acquire)) sleepMs(1);
+            var remaining = self.drain_after_reply_bytes;
+            var drained: usize = 0;
+            var scratch: [8192]u8 = undefined;
+            const deadline = nowNs() + 15 * std.time.ns_per_s;
+            while (remaining > 0 and nowNs() < deadline) {
+                const rc = sys.read(cfd, &scratch, @min(scratch.len, remaining));
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc == 0) break;
+                        const n: usize = @intCast(rc);
+                        remaining -= n;
+                        drained += n;
+                    },
+                    .AGAIN, .INTR => sleepMs(1),
+                    else => break,
+                }
+            }
+            self.drained_bytes.store(drained, .release);
+            return;
+        }
         // Hold the connection open briefly so the reply is flushed.
         sleepMs(50);
     }
@@ -2174,28 +2297,50 @@ const FakeIrcServer = struct {
         }
         self.got_len.store(total, .release);
         _ = writeAllFd(fd, self.reply);
+        if (self.drain_after_reply_bytes != 0) {
+            while (!self.allow_drain.load(.acquire)) sleepMs(1);
+            var remaining = self.drain_after_reply_bytes;
+            var drained: usize = 0;
+            var scratch: [8192]u8 = undefined;
+            while (remaining > 0) {
+                const received = win.recv(fd, &scratch, @intCast(@min(scratch.len, remaining)), 0);
+                if (received <= 0) break;
+                const n: usize = @intCast(received);
+                remaining -= n;
+                drained += n;
+            }
+            self.drained_bytes.store(drained, .release);
+            return;
+        }
         sleepMs(50);
     }
 
-    fn join(self: *FakeIrcServer) void {
+    fn join(self: *FakeIrcServer) usize {
         if (self.thread) |t| t.join();
+        const drained = self.drained_bytes.load(.acquire);
         if (comptime builtin.os.tag == .windows) {
             _ = win.closesocket(self.listen_fd);
             _ = win.WSACleanup();
         } else _ = sys.close(self.listen_fd);
         testing.allocator.destroy(self);
+        return drained;
     }
 };
 
 test "WebTransportListener: live UDP QUIC/H3/WT session bridges IRC bytes both ways" {
-    try exerciseLiveBridge(false, false);
+    try exerciseLiveBridge(false, false, false);
 }
 
 test "WebTransportListener: native IPv6 QUIC/H3/WT bridges IRC with mandatory PROXY header" {
-    try exerciseLiveBridge(true, true);
+    try exerciseLiveBridge(true, true, false);
 }
 
-fn exerciseLiveBridge(ipv6: bool, proxy: bool) !void {
+test "WebTransportListener: queued client bytes do not starve IRC replies" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try exerciseLiveBridge(false, false, true);
+}
+
+fn exerciseLiveBridge(ipv6: bool, proxy: bool, backpressure: bool) !void {
     // End-to-end over the DUAL-STACK socket: `lst.start` now binds an AF_INET6
     // socket with IPV6_V6ONLY=0, and the client below is a plain IPv4 loopback
     // `MediaSocket`. So this also proves the full QUIC/H3/WT handshake + IRC
@@ -2205,16 +2350,26 @@ fn exerciseLiveBridge(ipv6: bool, proxy: bool) !void {
     var keys: TestServerKeys = undefined;
     try keys.init();
 
-    // Fake IRC server the bridge will dial on loopback.
-    var irc = try FakeIrcServer.start(":server NOTICE * :hi from irc\r\n");
-    defer irc.join();
+    // Fake IRC server the bridge will dial on loopback. In the backpressure
+    // case it sends the marker while deliberately not reading the large client
+    // payload, then drains only after the test confirms the marker was relayed.
+    const reply = if (backpressure) ":server NOTICE * :while blocked\r\n" else ":server NOTICE * :hi from irc\r\n";
+    const backpressure_bytes: usize = if (backpressure) 64 * 1024 else 0;
+    var irc = try FakeIrcServer.startWithDrain(reply, backpressure_bytes);
+    var irc_joined = false;
 
     var lst = WebTransportListener.init(alloc, .{
         .cert_chain = &keys.cert_chain,
         .signing_key = .{ .ed25519 = keys.kp },
     }, irc.port);
     defer lst.deinit();
+    defer if (!irc_joined) {
+        irc.reply_ready.store(true, .release);
+        irc.allow_drain.store(true, .release);
+        _ = irc.join();
+    };
     lst.send_proxy_header = proxy;
+    if (backpressure) lst.test_bridge_send_buffer = 4096;
     try lst.startAddress(if (ipv6) .loopback_v6 else .{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
     const server_port = lst.port;
 
@@ -2282,6 +2437,46 @@ fn exerciseLiveBridge(ipv6: bool, proxy: bool) !void {
     try client.sendStream(data_stream, prefix, false);
     const irc_line = "NICK wtuser\r\n";
     try client.sendStream(data_stream, irc_line, false);
+
+    if (backpressure) {
+        round = 0;
+        while (round < 60 and irc.got_len.load(.acquire) == 0) : (round += 1) {
+            try sendQuic(alloc, &client, &cli_sock, server_addr);
+            try recvQuicAll(&client, &cli_sock);
+            sleepMs(2);
+        }
+        try testing.expect(irc.got_len.load(.acquire) > 0);
+
+        const payload = try alloc.alloc(u8, backpressure_bytes);
+        defer alloc.free(payload);
+        for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 17 + 3);
+        try client.sendStream(data_stream, payload, false);
+        round = 0;
+        while (round < 100 and !lst.bridge_backpressure_seen.load(.acquire)) : (round += 1) {
+            try sendQuic(alloc, &client, &cli_sock, server_addr);
+            try recvQuicAll(&client, &cli_sock);
+            sleepMs(2);
+        }
+        try testing.expect(lst.bridge_backpressure_seen.load(.acquire));
+
+        irc.reply_ready.store(true, .release);
+        var blocked_reply_buf: [256]u8 = undefined;
+        var blocked_reply_total: usize = 0;
+        round = 0;
+        while (round < 60 and blocked_reply_total < reply.len) : (round += 1) {
+            try sendQuic(alloc, &client, &cli_sock, server_addr);
+            try recvQuicAll(&client, &cli_sock);
+            blocked_reply_total += readWtBidi(&client, data_stream, blocked_reply_buf[blocked_reply_total..], session_id);
+            sleepMs(2);
+        }
+        try testing.expectEqualStrings(reply, blocked_reply_buf[0..blocked_reply_total]);
+
+        irc.allow_drain.store(true, .release);
+        const drained = irc.join();
+        irc_joined = true;
+        try testing.expectEqual(backpressure_bytes, drained);
+        return;
+    }
 
     // Pump until the fake IRC server has seen the forwarded bytes AND the client
     // has received the server's echoed reply over the WT data stream.
@@ -2971,6 +3166,112 @@ test "WebTransportListener: native bridge write failure retires a broken peer wi
     try testing.expect(!writeAllFd(-1, "invalid-peer"));
 }
 
+test "WebTransportListener: queued bridge writes resume exact bytes after backpressure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var pair: [2]sys.fd_t = undefined;
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.socketpair(posix.AF.UNIX, sys.SOCK.STREAM | sys.SOCK.CLOEXEC | sys.SOCK.NONBLOCK, 0, &pair)));
+    defer _ = sys.close(pair[0]);
+    defer _ = sys.close(pair[1]);
+
+    const payload = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 31 + 7);
+    const received = try testing.allocator.alloc(u8, payload.len);
+    defer testing.allocator.free(received);
+
+    var sent: usize = 0;
+    while (sent < payload.len) {
+        switch (writeSomeFd(pair[0], payload[sent..])) {
+            .written => |n| sent += n,
+            .blocked => break,
+            .failed => return error.BridgeWriteFailed,
+        }
+    }
+    try testing.expect(sent > 0 and sent < payload.len);
+
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(testing.allocator);
+    try pending.appendSlice(testing.allocator, payload[sent..]);
+    var received_len: usize = 0;
+    while (pending.items.len > 0) {
+        switch (writeSomeFd(pair[0], pending.items)) {
+            .written => |n| consumePendingPrefix(&pending, n),
+            .blocked => {
+                const before = received_len;
+                received_len += drainBridgeTestSocket(pair[1], received[received_len..]);
+                if (received_len == before) sleepMs(1);
+            },
+            .failed => return error.BridgeWriteFailed,
+        }
+    }
+    while (received_len < received.len) {
+        const n = drainBridgeTestSocket(pair[1], received[received_len..]);
+        if (n == 0) break;
+        received_len += n;
+    }
+    try testing.expectEqual(payload.len, received_len);
+    try testing.expectEqualSlices(u8, payload, received);
+}
+
+fn drainBridgeTestSocket(fd: sys.fd_t, out: []u8) usize {
+    var total: usize = 0;
+    while (total < out.len) {
+        const rc = sys.read(fd, out[total..].ptr, out.len - total);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return total;
+                total += @intCast(rc);
+            },
+            .AGAIN, .INTR => return total,
+            else => return total,
+        }
+    }
+    return total;
+}
+
+const BridgeBackpressureWrite = struct {
+    fd: sys.fd_t,
+    bytes: []const u8,
+    done: std.atomic.Value(bool) = .init(false),
+    result: bool = false,
+
+    fn run(self: *BridgeBackpressureWrite) void {
+        self.result = writeAllFd(self.fd, self.bytes);
+        self.done.store(true, .release);
+    }
+};
+
+test "WebTransportListener: one-shot bridge writes time out instead of spinning on EAGAIN" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var pair: [2]sys.fd_t = undefined;
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(sys.socketpair(posix.AF.UNIX, sys.SOCK.STREAM | sys.SOCK.CLOEXEC | sys.SOCK.NONBLOCK, 0, &pair)));
+    defer _ = sys.close(pair[0]);
+    defer _ = sys.close(pair[1]);
+
+    const payload = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer testing.allocator.free(payload);
+    @memset(payload, 0x5a);
+    var ctx: BridgeBackpressureWrite = .{ .fd = pair[0], .bytes = payload };
+    const thread = try std.Thread.spawn(.{}, BridgeBackpressureWrite.run, .{&ctx});
+    sleepMs(1200);
+    const completed_before_drain = ctx.done.load(.acquire);
+    if (!completed_before_drain) {
+        var scratch: [8192]u8 = undefined;
+        const deadline = nowNs() + 5 * std.time.ns_per_s;
+        while (!ctx.done.load(.acquire) and nowNs() < deadline) {
+            const rc = sys.read(pair[1], &scratch, scratch.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => if (rc == 0) break,
+                .AGAIN, .INTR => sleepMs(1),
+                else => break,
+            }
+        }
+    }
+    thread.join();
+    try testing.expect(completed_before_drain);
+    try testing.expect(!ctx.result);
+}
+
 pub const Execution = enum(u8) { unstarted = 0, paused = 1 };
 pub const Snapshot = struct {
     socket: dualstack_udp.Snapshot,
@@ -3153,12 +3454,16 @@ pub const ActiveConnectionSnapshot = struct {
     bridge: ?BridgeIdentity,
     wt_stream_id: ?u64,
     have_wt_stream: bool,
+    /// Bytes already consumed from H3 but awaiting a writable IRC bridge.
+    pending_irc_write: []u8,
     quic: quic_conn.ConnSnapshot,
     h3: http3_conn.Http3Snapshot,
 
     fn deinit(self: *ActiveConnectionSnapshot, allocator: std.mem.Allocator) void {
         self.h3.deinit(allocator);
         self.quic.deinit(allocator);
+        std.crypto.secureZero(u8, self.pending_irc_write);
+        allocator.free(self.pending_irc_write);
         self.* = undefined;
     }
 
@@ -3185,7 +3490,9 @@ pub const ActiveConnectionSnapshot = struct {
             !std.mem.allEqual(u8, self.orig_dcid[self.orig_dcid_len..], 0) or
             !std.mem.allEqual(u8, self.retry_scid[self.retry_scid_len..], 0) or
             !validAddress(self.peer) or
-            (self.have_wt_stream != (self.wt_stream_id != null))) return invalidActiveSnapshot("row shape");
+            (self.have_wt_stream != (self.wt_stream_id != null)) or
+            self.pending_irc_write.len > proxy_chunk_len) return invalidActiveSnapshot("row shape");
+        if (self.pending_irc_write.len != 0 and self.wt_stream_id == null) return invalidActiveSnapshot("pending bridge without WT stream");
         if (self.retry_scid_len == 0 and !std.mem.eql(u8, self.initDcidSlice(), self.origDcidSlice())) return invalidActiveSnapshot("row original CID relation");
         if (self.retryScidSlice()) |retry| if (!std.mem.eql(u8, retry, self.initDcidSlice())) return invalidActiveSnapshot("row retry CID relation");
         if (std.mem.readInt(u64, self.scid[0..8], .big) >= base.scid_counter) return invalidActiveSnapshot("row SCID counter");

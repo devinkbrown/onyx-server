@@ -1252,6 +1252,40 @@ pub const SecuredLink = struct {
         return link.takeRejectedOperEventV2Frames();
     }
 
+    pub fn supportsAccessEventV1(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsAccessEventV1();
+    }
+
+    pub fn sendAccessEvent(self: *SecuredLink, event: s2s_link.AccessEvent) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.sendAccessEvent(event);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn forwardAccessEventFrame(self: *SecuredLink, wire: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.forwardAccessEventFrame(wire);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn takeAccessEventFrames(self: *SecuredLink) anyerror![]s2s_link.InboundAccessEventV1 {
+        const link = self.inner orelse return self.allocator.alloc(s2s_link.InboundAccessEventV1, 0);
+        return link.takeAccessEventFrames();
+    }
+
+    pub fn takeDroppedAccessEventFrames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeDroppedAccessEventFrames();
+    }
+
+    pub fn takeRejectedAccessEventFrames(self: *SecuredLink) u64 {
+        const link = self.inner orelse return 0;
+        return link.takeRejectedAccessEventFrames();
+    }
+
     pub fn supportsGuestPresence(self: *const SecuredLink) bool {
         const link = self.inner orelse return false;
         return link.supportsGuestPresence();

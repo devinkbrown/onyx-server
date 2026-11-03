@@ -431,3 +431,35 @@ test "openWithConfig honours a smaller record limit" {
         store.family(.accounts).put("alice", "this value is definitely longer than sixteen bytes"),
     );
 }
+
+test "daemon-created WAL and snapshot files are owner-only (0o600) under a permissive umask" {
+    if (comptime @import("builtin").os.tag != .linux and @import("builtin").os.tag != .openbsd) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // Pin a permissive umask so any group/other bit would survive creation
+    // unless the store explicitly requests 0o600. The runner is
+    // single-threaded here, so the process-global umask pin is race-free.
+    const old_umask = if (comptime @import("builtin").os.tag == .openbsd) std.c.umask(0) else std.os.linux.syscall1(.umask, 0);
+    defer if (comptime @import("builtin").os.tag == .openbsd) {
+        _ = std.c.umask(old_umask);
+    } else {
+        _ = std.os.linux.syscall1(.umask, old_umask);
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try openTestStore(tmp, "private.wal");
+        defer store.deinit();
+        try store.family(.accounts).put("alice", "secret");
+        // Snapshot compaction creates a fresh snapshot inode and, on POSIX,
+        // a fresh WAL epoch inode; both must be owner-only too.
+        try store.snapshotAndTruncate();
+    }
+
+    inline for (.{ "private.wal", "private.wal.snap" }) |name| {
+        const st = try tmp.dir.statFile(io, name, .{});
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    }
+}

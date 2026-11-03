@@ -109,7 +109,7 @@ const openrc_template = Template{
     .working_directory = "/var/lib/onyx-server",
     .preflight_argv = &.{ "/usr/bin/onyx-server", "--check-config", "/etc/onyx-server/onyx-server.toml" },
     .start_argv = &.{ "/usr/bin/onyx-server", "/etc/onyx-server/onyx-server.toml" },
-    .preflight_policy = "template invokes preflight before start",
+    .preflight_policy = "start and Helix reload validate as command_user with its primary/supplementary groups in the working directory; requires util-linux setpriv",
     .restart = "supervise-daemon respawn: delay 5 seconds, maximum 3 per 60 seconds",
     .logging = "stdout/stderr use logger daemon.info/daemon.err; configurable in conf.d",
 };
@@ -121,9 +121,9 @@ const systemd_template = Template{
     .working_directory = "/var/lib/onyx-server",
     .preflight_argv = &.{ "/usr/local/bin/onyx-server", "--check-config", "/etc/onyx-server/onyx-server.toml" },
     .start_argv = &.{ "/usr/local/bin/onyx-server", "/etc/onyx-server/onyx-server.toml" },
-    .preflight_policy = "template invokes preflight before start",
-    .restart = "on failure after 2 seconds; SIGUSR2 reload is separately configured",
-    .logging = "systemd inherited stdout/stderr; actual journal routing unknown",
+    .preflight_policy = "start and Helix reload validate with the runtime identity, working directory and sandbox",
+    .restart = "on failure after 2 seconds, maximum 5 starts per 60 seconds; validated SIGUSR2 upgrade request is asynchronous",
+    .logging = "stdout/stderr use journal identifier onyx-server; actual retention is host policy",
 };
 const foreground_template = Template{
     .source = "foreground invocation; choose executable and config explicitly",

@@ -26,6 +26,7 @@ Exit code 0 = PASS.
 import argparse
 from contextlib import ExitStack
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -168,6 +169,8 @@ def fail(msg, proc=None, log=None):
 def main():
     parser = argparse.ArgumentParser(description="Cold-boot Onyx Server and exercise IRC over loopback")
     parser.add_argument("binary", nargs="?", default=DEFAULT_BIN, help="path to the onyx-server binary")
+    parser.add_argument("--stop-signal", choices=("TERM", "INT"), default="TERM",
+                        help="POSIX cooperative shutdown signal to verify")
     args = parser.parse_args()
     binary = args.binary
     if os.name == "nt" and not os.path.exists(binary) and os.path.exists(binary + ".exe"):
@@ -488,6 +491,16 @@ def main():
 
             if proc.poll() is not None:
                 fail("daemon died after serving the clients (should still be running)", proc, log)
+            if os.name != "nt":
+                stage = f"cooperative SIG{args.stop_signal} shutdown"
+                proc.send_signal(getattr(signal, "SIG" + args.stop_signal))
+                try:
+                    code = proc.wait(timeout=min(30.0, remaining()))
+                except subprocess.TimeoutExpired as exc:
+                    raise AssertionError("cooperative shutdown exceeded its deadline") from exc
+                if code != 0:
+                    raise AssertionError(f"shutdown exited {code}, expected orderly exit 0")
+                print(f"PASS: SIG{args.stop_signal} completed orderly shutdown (exit 0)")
         except Exception as exc:
             print(f"FAIL during {stage}: {type(exc).__name__}: {exc}")
             traceback.print_exc(file=sys.stdout)

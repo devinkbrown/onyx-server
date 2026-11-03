@@ -19,6 +19,11 @@
 # be provisioned with private configuration/state owned by uid/gid 10001.
 FROM alpine:3.20
 
+LABEL org.opencontainers.image.title="onyx-server" \
+      org.opencontainers.image.description="onyx-server pure-Zig IRC/IRCX daemon" \
+      org.opencontainers.image.source="https://github.com/devinkbrown/onyx-server" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+
 RUN adduser -D -u 10001 onyx-server \
     && mkdir -p /data \
     && chown onyx-server:onyx-server /data \

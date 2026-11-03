@@ -241,7 +241,7 @@ pub fn escapeNick(nick: []const u8, out: *[256]u8) []const u8 {
     return escapeBounded(nick, 64, out);
 }
 
-fn escapeBounded(input: []const u8, comptime max_bytes: usize, out: *[max_bytes * 4]u8) []const u8 {
+pub fn escapeBounded(input: []const u8, comptime max_bytes: usize, out: *[max_bytes * 4]u8) []const u8 {
     const hex = "0123456789abcdef";
     var n: usize = 0;
     for (input[0..@min(input.len, max_bytes)]) |byte| {
