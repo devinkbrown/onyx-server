@@ -125482,6 +125482,15 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
     }
     var small: i32 = 1024;
     try posix.setsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small));
+    if (clean_close) {
+        // Make the close observer race deterministic: TCP can accept this
+        // entire fixture before the peer application starts reading it.
+        var receive_capacity: i32 = 128 * 1024;
+        try posix.setsockopt(fixture.peer_fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&receive_capacity));
+        // The largest prefix is 32KiB; 64KiB also covers all TLS framing,
+        // the KeyUpdate reply and the accepted short suffix.
+        try std.testing.expect(try kernel_linux.readU32Option(fixture.peer_fd, posix.SOL.SOCKET, posix.SO.RCVBUF) >= 64 * 1024);
+    }
     const prefix = try a.alloc(u8, if (overflow) 32768 else 128);
     defer a.free(prefix);
     @memset(prefix, 'k');
@@ -125600,15 +125609,27 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
     defer suffix.deinit(a);
     var scratch: [1024]u8 = undefined;
     var complete = false;
+    var peer_eof = false;
+    var read_after_retirement = false;
     for (0..2000) |_| {
         _ = try fixture.server.rx().ring.submit();
         _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
         if (handler.err) |err| return err;
         _ = try fixture.server.activatePendingSocketIo();
+        if (clean_close and fixture.server.rx().clients.get(fixture.id) != null) {
+            // Retiring the sending row only proves kernel acceptance. Hold
+            // application reads until then, keeping the original 1ms/iteration
+            // budget, so success must drain ciphertext after physical removal.
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            continue;
+        }
         var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
         if (try posix.poll(&ready, 1) != 0) {
             const n = try readFd(fixture.peer_fd, &scratch);
-            if (n == 0) return error.TestUnexpectedResult;
+            if (n == 0) {
+                if (!clean_close) return error.TestUnexpectedResult;
+                peer_eof = true;
+            } else if (clean_close) read_after_retirement = true;
             try cipher.appendSlice(a, scratch[0..n]);
         }
         while (cipher.items.len >= 5) {
@@ -125634,10 +125655,16 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
             std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - len], cipher.items[len..]);
             cipher.shrinkRetainingCapacity(cipher.items.len - len);
         }
-        if (clean_close and fixture.server.rx().clients.get(fixture.id) == null) {
-            complete = plain.items.len == prefix.len and replies == 1 and
-                suffix.items.len == "new suffix held behind kernel prefix".len and cipher.items.len == 0;
-            break;
+        if (clean_close) {
+            // conn and t were freed when the row retired. Only the independent
+            // peer owns this observation now; EOF, not server-row removal,
+            // establishes that all accepted ciphertext has been observed.
+            if (peer_eof) {
+                complete = plain.items.len == prefix.len and replies == 1 and
+                    suffix.items.len == "new suffix held behind kernel prefix".len and cipher.items.len == 0;
+                break;
+            }
+            continue;
         }
         if (!conn.send_armed and sendq.wireBacklog(conn) == 0 and !t.tx_ku_reply_pending and
             t.control_phase == .none and plain.items.len == prefix.len and replies == 1 and
@@ -125647,10 +125674,15 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
             break;
         }
     }
-    if (!complete and fixture.server.rx().clients.get(fixture.id) != null) std.debug.print("kernel prefix suite={x} rx={} armed={} overflow={} plain={} replies={} phase={s} prefix={} credit={} wire={} sendarmed={}\n", .{ suite, kernel_rx, armed, overflow, plain.items.len, replies, @tagName(t.control_phase), conn.tls_kernel_prefix_remaining, conn.tls_control_charge, sendq.wireBacklog(conn), conn.send_armed });
+    if (!complete) {
+        const row_live = fixture.server.rx().clients.get(fixture.id) != null;
+        std.debug.print("kernel prefix observer suite={x} rx={} clean_close={} row_live={} eof={} after_retirement={} plain={}/{} replies={} suffix={} cipher={}\n", .{ suite, kernel_rx, clean_close, row_live, peer_eof, read_after_retirement, plain.items.len, prefix.len, replies, suffix.items.len, cipher.items.len });
+        if (row_live) std.debug.print("kernel prefix armed={} overflow={} phase={s} prefix={} credit={} wire={} sendarmed={}\n", .{ armed, overflow, @tagName(t.control_phase), conn.tls_kernel_prefix_remaining, conn.tls_control_charge, sendq.wireBacklog(conn), conn.send_armed });
+    }
     try std.testing.expect(complete);
     try std.testing.expectEqualStrings("new suffix held behind kernel prefix", suffix.items);
     if (clean_close) {
+        try std.testing.expect(read_after_retirement and peer_eof);
         try std.testing.expect(fixture.server.rx().clients.get(fixture.id) == null);
         var ready = [_]posix.pollfd{.{ .fd = fixture.peer_fd, .events = posix.POLL.IN, .revents = 0 }};
         if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
