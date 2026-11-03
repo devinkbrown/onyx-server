@@ -59,7 +59,10 @@ ProtectHostname=true
 ProtectProc=invisible
 RestrictNamespaces=true
 RestrictRealtime=true
-RestrictSUIDSGID=true
+# systemd's SUID/SGID filter returns ENOSYS for every openat2 call, including
+# the protected certificate reader. Keep its RESOLVE path guarantees available;
+# the dedicated identity, empty capabilities and NoNewPrivileges still apply.
+RestrictSUIDSGID=false
 LockPersonality=true
 MemoryDenyWriteExecute=true
 RemoveIPC=true

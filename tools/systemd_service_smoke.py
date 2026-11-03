@@ -5,14 +5,54 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import platform
 import shlex
 import shutil
 import subprocess
 import tempfile
 import unittest
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "etc/systemd/onyx-server.service"
+
+# Runs inside the transient service's private /tmp. Its public fixture exercises
+# the same openat2 flags/resolve values as kernel_linux.readFileResolved; no TLS
+# key, daemon config, listening socket or live state is accessed.
+TLS_OPENAT2_PROBE = r'''
+import ctypes, errno, os, tempfile
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+class OpenHow(ctypes.Structure):
+    _fields_ = [('flags', ctypes.c_uint64), ('mode', ctypes.c_uint64),
+                ('resolve', ctypes.c_uint64)]
+def openat2(fd, path, flags, resolve):
+    how = OpenHow(flags, 0, resolve)
+    result = libc.syscall(437, fd, ctypes.c_char_p(path), ctypes.byref(how), 24)
+    if result < 0:
+        raise OSError(ctypes.get_errno(), 'openat2')
+    return result
+with tempfile.TemporaryDirectory(prefix='onyx-cert-probe-') as directory:
+    content = b'public certificate loader fixture\n'
+    with open(os.path.join(directory, 'cert.pem'), 'wb') as fixture:
+        fixture.write(content)
+    parent = openat2(-100, os.fsencode(directory), os.O_DIRECTORY | os.O_CLOEXEC, 2)
+    try:
+        link_buffer = ctypes.create_string_buffer(8)
+        ctypes.set_errno(0)
+        result = libc.syscall(267, parent, ctypes.c_char_p(b'cert.pem'), link_buffer, 8)
+        if result != -1 or ctypes.get_errno() != errno.EINVAL:
+            raise RuntimeError('regular certificate readlinkat contract failed')
+        certificate = openat2(parent, b'cert.pem', os.O_CLOEXEC, 10)
+        try:
+            if os.read(certificate, 262144) != content:
+                raise RuntimeError('certificate bytes differ')
+        finally:
+            os.close(certificate)
+    finally:
+        os.close(parent)
+print('ONYX_TLS_OPENAT2_OK')
+'''
 
 
 def directives() -> dict[str, dict[str, list[str]]]:
@@ -103,6 +143,41 @@ printf 'signal\\n' >> "$TRACE"
         for syscall in ('io_uring_setup', 'io_uring_enter', 'io_uring_register',
                         'memfd_create', 'execveat', 'pidfd_open', 'pidfd_send_signal'):
             self.assertIn(syscall, allowed)
+
+    @unittest.skipUnless(os.environ.get('ONYX_SYSTEMD_RUNTIME_SMOKE') == '1',
+                         'opt-in native systemd sandbox probe')
+    def test_certificate_read_under_native_sandbox(self) -> None:
+        if (platform.system() != 'Linux' or platform.machine() != 'x86_64'
+                or os.geteuid() != 0 or not Path('/run/systemd/system').is_dir()
+                or not shutil.which('systemd-run') or not shutil.which('systemctl')
+                or not Path('/usr/bin/python3').is_file()):
+            self.skipTest('requires root on an x86-64 systemd host with Python 3')
+        service = directives()['Service']
+        # Copy the shipped sandbox. Omit lifecycle, installation paths, and the
+        # deployment account: the probe runs as nobody with no persistent data.
+        # Do not remove any preexisting IPC objects belonging to that account.
+        omitted = {'Type', 'User', 'Group', 'WorkingDirectory', 'StateDirectory',
+                   'StateDirectoryMode', 'RuntimeDirectory', 'RuntimeDirectoryMode',
+                   'ExecStartPre', 'ExecStart', 'ExecReload', 'Restart', 'RestartSec',
+                   'TimeoutStartSec', 'TimeoutStopSec', 'KillSignal', 'KillMode',
+                   'StandardOutput', 'StandardError', 'SyslogIdentifier', 'RemoveIPC'}
+        unit = f'onyx-cert-probe-{os.getpid()}-{uuid.uuid4().hex[:12]}.service'
+        command = ['systemd-run', '--quiet', '--wait', '--pipe', '--collect',
+                   f'--unit={unit}', '--property=Type=oneshot',
+                   '--property=User=nobody', '--property=WorkingDirectory=/',
+                   '--property=TimeoutStartSec=15s', '--property=TimeoutStopSec=2s']
+        for key, values in service.items():
+            if key not in omitted:
+                command.extend(f'--property={key}={value}' for value in values)
+        command.extend(['/usr/bin/python3', '-c', TLS_OPENAT2_PROBE])
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, timeout=25)
+        except subprocess.TimeoutExpired:
+            # This unique diagnostic unit is the only possible cleanup target.
+            subprocess.run(['systemctl', 'stop', unit], capture_output=True, timeout=8)
+            raise
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('ONYX_TLS_OPENAT2_OK', result.stdout)
 
     @unittest.skipUnless(shutil.which('systemd-analyze'), 'systemd-analyze unavailable')
     def test_native_unit_parser(self) -> None:

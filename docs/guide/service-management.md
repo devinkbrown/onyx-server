@@ -152,6 +152,13 @@ allowlist because syscall group membership varies by systemd release. Verify
 actual daemon startup and upgrade on the target kernel/systemd; a parser check
 alone does not exercise seccomp or kernel policy.
 
+Keep `RestrictSUIDSGID=false`: [systemd's SUID/SGID filter](https://github.com/systemd/systemd/blob/v257/src/shared/seccomp-util.c#L2165-L2176) blocks `openat2` with
+`ENOSYS`, including read-only certificate access. The certificate loader requires
+that syscall's protected path resolution and does not fall back to a weaker
+open. The dedicated service identity, empty capability sets, `NoNewPrivileges`
+and filesystem restrictions remain enabled. Adding `openat2` to
+`SystemCallFilter` cannot override this separate filter.
+
 ## Validated Helix requests and release acceptance
 
 `rc-service onyx-server reload` and `systemctl reload onyx-server` first run
@@ -178,6 +185,14 @@ explicit release fallback decision when Helix refuses an incompatible target.
 mkdir -p .zig-cache/cloak-tmp
 TMPDIR="$PWD/.zig-cache/cloak-tmp" python3 -B tools/alpine_openrc_smoke.py
 TMPDIR="$PWD/.zig-cache/cloak-tmp" python3 -B tools/systemd_service_smoke.py
+```
+
+On a disposable x86-64 Linux host running systemd, run the native sandbox
+regression as root (it starts one bounded, automatically collected transient
+probe, without starting the daemon or accessing live data):
+
+```sh
+sudo env ONYX_SYSTEMD_RUNTIME_SMOKE=1 python3 -B tools/systemd_service_smoke.py
 ```
 
 The OpenRC checks exercise shell functions, native checkpath and the installed
