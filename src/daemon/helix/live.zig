@@ -333,8 +333,12 @@ pub const predecessor_issuer_upgrade_capability_token = "ONYX_HELIX_UPGRADE_CAPS
 const predecessor_replica_core_upgrade_capability_caps =
     "attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v5,host-presentation-v1,local-guest-issuer-v1,physical-connection-relation-v2,canonical-mesh-admission-v1,remote-presentation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
 const predecessor_replica_core_upgrade_capability_token = "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_replica_core_upgrade_capability_caps;
-const upgrade_capability_caps =
+// Frozen predecessor had no kernel-pending TERM/INT polling contract. A
+// masked stop signal must never be handed to a successor that cannot observe it.
+const predecessor_pending_stop_capability_caps =
     "attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v5,host-presentation-v1,local-guest-issuer-v1,physical-connection-relation-v2,canonical-mesh-admission-v1,remote-presentation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-replica-core-checkpoint-v1,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2";
+const predecessor_pending_stop_capability_token = "ONYX_HELIX_UPGRADE_CAPS=" ++ predecessor_pending_stop_capability_caps;
+const upgrade_capability_caps = predecessor_pending_stop_capability_caps ++ ",pending-stop-v1";
 pub const upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
 /// Never emit a predecessor line whose mandatory state this image refuses.
@@ -2021,4 +2025,11 @@ test "issuer mandatory custody rejects preceding complete capability before exec
 test "Helix exact capability requires replica Core retry checkpoint before exec" {
     try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token));
     try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_replica_core_upgrade_capability_token));
+}
+
+// Both directions use exact complete-line matching before descriptor handoff.
+test "Helix pending stop capability refuses a successor that cannot observe blocked signals" {
+    try std.testing.expect(hasUpgradeCapabilityLine(upgrade_capability_token ++ "\n"));
+    try std.testing.expect(!hasUpgradeCapabilityLine(predecessor_pending_stop_capability_token ++ "\n"));
+    try std.testing.expect(!hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", predecessor_pending_stop_capability_token));
 }

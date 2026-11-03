@@ -13,7 +13,7 @@ starts in 60 seconds. Exhausted budgets require investigation and explicit
 recovery; do not automate a repeated reset of failed state. The 30-second
 termination grace allows normal SIGTERM shutdown before forced termination.
 
-On native POSIX builds, SIGTERM and SIGINT request orderly daemon cleanup,
+On native Linux builds, SIGTERM and SIGINT request orderly daemon cleanup,
 including joined workers and recording finalization. A cold restart still drops
 TCP attachments. Follow the [cold-restart custody contract](../RUNBOOK.md#cold-restart)
 before stopping an active MESSAGE_V2 node; process exit alone does not establish
@@ -38,7 +38,10 @@ the node's actual TOML and keys before enabling a service. Defaults are:
 Keep executables, service definitions and config parent directories owned by
 root. Keep config root-owned and group-readable by the service account
 (`0640`); keys must be accessible only to that account and administrators.
-Persistent state belongs to the service account. Both kits apply umask `0077`.
+Persistent state belongs to the service account. Both kits default to umask `0077`.
+Hosts publishing files for another service must explicitly preserve their required
+sharing policy (`umask` in OpenRC conf.d or `UMask` in a systemd drop-in) and verify
+the published files remain readable. The private working state directory stays `0700`.
 Relative data/key paths resolve from the working state directory. Resolve
 `env:` secrets in the service environment and `@file:` secrets with the
 service's actual read permissions. Avoid putting secrets in process arguments.

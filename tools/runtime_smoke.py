@@ -170,7 +170,7 @@ def main():
     parser = argparse.ArgumentParser(description="Cold-boot Onyx Server and exercise IRC over loopback")
     parser.add_argument("binary", nargs="?", default=DEFAULT_BIN, help="path to the onyx-server binary")
     parser.add_argument("--stop-signal", choices=("TERM", "INT"), default="TERM",
-                        help="POSIX cooperative shutdown signal to verify")
+                        help="Linux cooperative shutdown signal to verify")
     args = parser.parse_args()
     binary = args.binary
     if os.name == "nt" and not os.path.exists(binary) and os.path.exists(binary + ".exe"):
@@ -491,7 +491,7 @@ def main():
 
             if proc.poll() is not None:
                 fail("daemon died after serving the clients (should still be running)", proc, log)
-            if os.name != "nt":
+            if sys.platform.startswith("linux"):
                 stage = f"cooperative SIG{args.stop_signal} shutdown"
                 proc.send_signal(getattr(signal, "SIG" + args.stop_signal))
                 try:

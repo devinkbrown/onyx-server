@@ -1547,12 +1547,41 @@ const ws_listener_companion_token: RingFdToken = .{ .slot = 9, .gen = 0 };
 /// inert until `installUpgradeSignalHandler` is called at boot, so tests (which
 /// never install it) never trip the poll.
 var upgrade_signal_requested = std.atomic.Value(bool).init(false);
-// TERM/INT request the existing cooperative stop and cleanup path. A handler
-// must never dereference a Server, acquire a lock, or perform teardown itself.
+// This latch supports an already-dispatched request; Linux supervisor signals
+// normally remain blocked and kernel-pending until process exit instead.
 var termination_signal_requested = std.atomic.Value(bool).init(false);
 
 fn onTerminationSignal(_: posix.SIG) callconv(.c) void {
     termination_signal_requested.store(true, .seq_cst);
+}
+
+/// Called first in main, before daemon or lazy std.Io workers can spawn. Every
+/// worker inherits this permanent mask. Do not restore it during cleanup: a
+/// pending stop is retained authority, including across same-PID Helix exec.
+pub fn prepareTerminationSignals() void {
+    if (comptime builtin.os.tag != .linux) return;
+    var mask = posix.sigemptyset();
+    posix.sigaddset(&mask, .TERM);
+    posix.sigaddset(&mask, .INT);
+    posix.sigprocmask(posix.SIG.BLOCK, &mask, null);
+    // Background shells may pass SIGINT=SIG_IGN through exec. Ignored signals
+    // are discarded instead of becoming pending, so restore defaults only
+    // after blocking them, before any worker inherits the mask.
+    const action = posix.Sigaction{ .handler = .{ .handler = posix.SIG.DFL }, .mask = posix.sigemptyset(), .flags = 0 };
+    posix.sigaction(.TERM, &action, null);
+    posix.sigaction(.INT, &action, null);
+}
+
+/// A non-consuming probe closes the final check/exec race: a signal arriving
+/// after the last check remains pending in the kernel for the successor. No
+/// signal handler on a sibling thread can consume it into discarded memory.
+fn terminationSignalPending() bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    var pending = posix.sigemptyset();
+    const rc = linux.syscall2(.rt_sigpending, @intFromPtr(&pending), linux.NSIG / 8);
+    // Losing the ability to observe stop authority must fail closed.
+    if (linux.errno(rc) != .SUCCESS) return true;
+    return posix.sigismember(&pending, .TERM) or posix.sigismember(&pending, .INT);
 }
 
 /// SIGUSR2 handler — async-signal-safe: records the request and returns. The
@@ -1564,10 +1593,9 @@ fn onUpgradeSignal(_: posix.SIG) callconv(.c) void {
     upgrade_signal_requested.store(true, .seq_cst);
 }
 
-/// Install operational handlers at boot: USR2 requests Helix; TERM/INT request
-/// cooperative stop on the next reactor-0 housekeeping tick (≤2s). SA_RESTART
-/// keeps teardown outside signal context. Normal runtime joins and deinit then
-/// finalize owned resources; this does not promise a full client SendQ drain.
+/// Install USR2 at boot. Linux TERM/INT stay blocked from main's first operation
+/// and reactor zero observes their pending state; other platforms retain their
+/// existing TERM/INT disposition. Normal joined cleanup is not a SendQ drain.
 pub fn installUpgradeSignalHandler() void {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return;
     const act = posix.Sigaction{
@@ -1576,13 +1604,6 @@ pub fn installUpgradeSignalHandler() void {
         .flags = posix.SA.RESTART,
     };
     posix.sigaction(posix.SIG.USR2, &act, null);
-    const stop_act = posix.Sigaction{
-        .handler = .{ .handler = onTerminationSignal },
-        .mask = posix.sigemptyset(),
-        .flags = posix.SA.RESTART,
-    };
-    posix.sigaction(posix.SIG.TERM, &stop_act, null);
-    posix.sigaction(posix.SIG.INT, &stop_act, null);
 }
 
 /// Set SIGPIPE's disposition to ignore (process-global, idempotent). A
@@ -5546,6 +5567,7 @@ pub const LinuxServer = struct {
     upgrade_coordinator_resumed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Nonzero only in tests: pointer to a caller-owned capture buffer consumed
     /// by reactor 0 at the same end-of-CQE-batch safe point as real UPGRADE.
+    test_stop_after_upgrade_check: ?posix.SIG = null,
     test_live_upgrade_capture_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// Phase barrier released by the coordinator after every owner stopped
     /// socket input. Each sibling then drains its final fabric mailbox and parks.
@@ -8448,6 +8470,8 @@ pub const LinuxServer = struct {
                 raw_line;
             const speech = self.relayChannelSpeechGate(chan, rendered_nick, prefix, "", line, false, 0, world_model.MemberModes.empty(), true, null);
             if (speech == .deny) continue;
+            var slowmode_send = self.prepareRelaySlowmodeSend(chan, rendered_nick, "", world_model.MemberModes.empty()) catch continue;
+            defer slowmode_send.deinit();
             const delivery_rank: u8 = if (speech == .opmoderate) 2 else 0;
             // Allocate one mesh event identity BEFORE either delivery leg. The
             // same authenticated (origin, hlc) deterministically produces the
@@ -8487,6 +8511,7 @@ pub const LinuxServer = struct {
                 const accepted = accepted_v2 orelse continue;
                 message_id = msgid_mod.fromStableId(accepted.relay_id, &msgid_buf);
             }
+            slowmode_send.commit();
             var time_buf: [40]u8 = undefined;
             const tags = MsgTags{
                 .time_value = serverTimeValueAt(&time_buf, event_time_ms),
@@ -10704,7 +10729,7 @@ pub const LinuxServer = struct {
         // A stop request takes precedence over maintenance and Helix. Clearing
         // the shared run flag wakes all shards; main's existing joined cleanup
         // owns companion teardown, recording finalization, and file closure.
-        if (self.isMaintenanceReactor() and termination_signal_requested.swap(false, .seq_cst)) {
+        if (self.isMaintenanceReactor() and (terminationSignalPending() or termination_signal_requested.swap(false, .seq_cst))) {
             if (self.shutdown) |run| self.requestStop(run);
             return;
         }
@@ -12534,6 +12559,7 @@ pub const LinuxServer = struct {
             .client_target => |target| self.allocator.free(target.executable),
             else => {},
         };
+        self.ensureUpgradeNotStopping() catch return;
         self.performUpgrade(request) catch |err| {
             switch (request) {
                 .windows_descriptor_rollover => {
@@ -19656,6 +19682,8 @@ pub const LinuxServer = struct {
         var terminal_guest_target = false;
         var guest_target_route: ?guest_presence_route.SubjectView = null;
         var speech: ChannelSpeechResult = .deny;
+        var slowmode_send = PreparedRelaySlowmodeSend{ .server = self };
+        defer slowmode_send.deinit();
         var effective_text = msg.text;
         // Bound the strip buffer to the largest deliverable line body so an
         // oversized colour-formatted MESSAGE_V2 cannot fail the strip and fall
@@ -19736,6 +19764,12 @@ pub const LinuxServer = struct {
                         allow_external,
                         self.cloakRemoteContext(msg.origin_node, source_nick, msg.source_prefix, policy_account),
                     );
+                    if (speech != .deny) slowmode_send = self.prepareRelaySlowmodeSend(
+                        msg.target,
+                        source_nick,
+                        policy_account,
+                        effective_sender_modes,
+                    ) catch return .{ .retry = .transient };
                 }
                 if (speech != .deny and speech != .opmoderate and msg.min_rank == 0) {
                     const command: ?[]const u8 = switch (msg.verb) {
@@ -20001,6 +20035,7 @@ pub const LinuxServer = struct {
             .duplicate => |id| return .{ .duplicate = id },
             .rejected => return .permanent,
         };
+        slowmode_send.commit();
         std.debug.assert(std.mem.eql(u8, &relay_id, &predicted_relay_id));
         // The joint cut is published. Release the spool lane before the ordinary
         // fanout helpers encounter the now-exact-duplicate records and drain them.
@@ -20293,6 +20328,14 @@ pub const LinuxServer = struct {
                 std.fmt.bufPrint(&channel_line_buf, ":{s} {s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, render_target, clean_msg.data_tag, eff_text }) catch return
             else
                 std.fmt.bufPrint(&channel_line_buf, ":{s} {s} {s} :{s}\r\n", .{ clean_msg.source_prefix, verb, render_target, eff_text }) catch return;
+            var slowmode_send = self.prepareRelaySlowmodeSend(
+                clean_msg.target,
+                clean_msg.source_nick,
+                policy_account,
+                replica_modes orelse self.relaySenderModes(clean_msg.target, clean_msg.source_nick),
+            ) catch return;
+            defer slowmode_send.deinit();
+            slowmode_send.commit();
             const relay_rank: u8 = if (speech == .opmoderate) 2 else clean_msg.min_rank;
             if (clean_msg.verb == .tagmsg) {
                 const relay_chatter = channelChatterOf(channel_line);
@@ -25511,9 +25554,8 @@ pub const LinuxServer = struct {
         if (is_notice and !sender_op and self.world.channelHasFlag(channel, .no_notice)) return .deny;
         if (min_rank > 0 and modes.rank() < 1) return .deny;
 
-        const slow_exempt = self.remoteHasOverridePrefix(account) or
-            (self.channelSlowmodeVoiceExempt(channel) and modes.canSpeakModerated());
-        if (self.slowmodeDenies(channel, nick, slow_exempt)) return .deny;
+        const gap_ms = self.relaySlowmodeGap(channel, account, modes);
+        if (gap_ms != 0 and self.slowmodeTooSoon(channel, nick, gap_ms)) return .deny;
 
         return if (opmod_route) .opmoderate else .allow;
     }
@@ -34241,6 +34283,51 @@ pub const LinuxServer = struct {
         return now - last < gap_ms;
     }
 
+    fn relaySlowmodeGap(self: *LinuxServer, channel: []const u8, account: []const u8, modes: world_model.MemberModes) u64 {
+        const exempt = self.remoteHasOverridePrefix(account) or
+            (self.channelSlowmodeVoiceExempt(channel) and modes.canSpeakModerated());
+        return @max(if (exempt) 0 else self.channelSlowmodeGapMs(channel), self.channelLagGapMs(channel));
+    }
+
+    /// Reserve limiter storage without publishing a timestamp. World serializes
+    /// the caller through durable admission; commit is allocation-free and an
+    /// admission retry leaves both existing and absent timestamps unchanged.
+    const PreparedRelaySlowmodeSend = struct {
+        server: *LinuxServer,
+        existing: ?*u64 = null,
+        owned_key: ?[]u8 = null,
+        timestamp: u64 = 0,
+
+        fn deinit(self: *PreparedRelaySlowmodeSend) void {
+            if (self.owned_key) |key| self.server.allocator.free(key);
+            self.owned_key = null;
+        }
+
+        fn commit(self: *PreparedRelaySlowmodeSend) void {
+            if (self.existing) |slot| slot.* = self.timestamp;
+            if (self.owned_key) |key| {
+                self.server.slowmode_last.putAssumeCapacityNoClobber(key, self.timestamp);
+                self.owned_key = null;
+            }
+        }
+    };
+
+    fn prepareRelaySlowmodeSend(self: *LinuxServer, channel: []const u8, nick: []const u8, account: []const u8, modes: world_model.MemberModes) !PreparedRelaySlowmodeSend {
+        var prepared = PreparedRelaySlowmodeSend{ .server = self };
+        if (self.relaySlowmodeGap(channel, account, modes) == 0) return prepared;
+        var buf: [slowmode_key_max]u8 = undefined;
+        const key = slowmodeKey(channel, nick, &buf) orelse return error.InvalidSlowmodeKey;
+        prepared.timestamp = self.nowU64();
+        if (self.slowmode_last.getPtr(key)) |slot| {
+            prepared.existing = slot;
+            return prepared;
+        }
+        prepared.owned_key = try self.allocator.dupe(u8, key);
+        errdefer prepared.deinit();
+        try self.slowmode_last.ensureUnusedCapacity(self.allocator, 1);
+        return prepared;
+    }
+
     fn noteSlowmodeSend(self: *LinuxServer, channel: []const u8, nick: []const u8) bool {
         var buf: [slowmode_key_max]u8 = undefined;
         const key = slowmodeKey(channel, nick, &buf) orelse return false;
@@ -38795,7 +38882,23 @@ pub const LinuxServer = struct {
         };
     }
 
+    fn ensureUpgradeNotStopping(self: *const LinuxServer) !void {
+        if (terminationSignalPending() or termination_signal_requested.load(.seq_cst) or
+            (if (self.shutdown) |run| !run.load(.acquire) else false)) return error.ShutdownRequested;
+    }
+
+    fn commitUpgradeExecPlan(self: *LinuxServer, plan: *const helix_live.ExecPlan, executable_fd: linux.fd_t) !void {
+        try self.ensureUpgradeNotStopping();
+        // Test-only deterministic arrival at the exact final check/exec gap.
+        // Production never consumes a signal here; pending state crosses exec.
+        if (comptime builtin.is_test) if (self.test_stop_after_upgrade_check) |signal| {
+            _ = linux.kill(linux.getpid(), signal);
+        };
+        try plan.commitExecutableFd(self.allocator, executable_fd);
+    }
+
     fn performUpgrade(self: *LinuxServer, request: DeferredUpgradeRequest) !void {
+        try self.ensureUpgradeNotStopping();
         try self.config.helix_boot_policy.validate();
         if (comptime builtin.os.tag != .linux) {
             if (self.config.helix_boot_policy.requiresCapability()) return error.UnsupportedBootPolicy;
@@ -39006,6 +39109,7 @@ pub const LinuxServer = struct {
         executable_fd: linux.fd_t,
         exe_target: []const u8,
     ) !void {
+        try self.ensureUpgradeNotStopping();
 
         // The metrics listener is a separate socket owner. Park its accept
         // loop at an operation boundary before freezing reactors and World;
@@ -39331,6 +39435,7 @@ pub const LinuxServer = struct {
             if (self.config.native_upgrade_hooks) |hooks| hooks.abort(hooks.ctx);
         };
 
+        try self.ensureUpgradeNotStopping();
         // A new fact or an operator file edit may arrive after the first
         // execution preflight. Recheck the exact final frozen authority cut
         // before publishing progress or exporting any successor state.
@@ -40258,7 +40363,7 @@ pub const LinuxServer = struct {
             return;
         };
         defer plan.deinit(self.allocator);
-        plan.commitExecutableFd(self.allocator, executable_fd) catch |e| {
+        self.commitUpgradeExecPlan(&plan, executable_fd) catch |e| {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             restoreCloexec(listener_fds);
             _ = setCloexec(arena.fd, true);
@@ -111518,6 +111623,129 @@ test "MESSAGE_V2 webhook origin and receiver enforce converged channel policy" {
     }
 }
 
+test "MESSAGE_V2 webhook slowmode allocation retries preserve origin and receiver authority" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var origin = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "webhook-slowmode");
+    defer origin.deinit();
+    var remote = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "webhook-slowmode");
+    defer remote.deinit();
+    const origin_root = std.fmt.bytesToHex(origin.sign_kp.public_key, .lower);
+    const remote_root = std.fmt.bytesToHex(remote.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&remote_root};
+    const receiver_roots = [_][]const u8{&origin_root};
+    const roster = [_][]const u8{ &origin_root, &remote_root };
+    const key = "#retry\x00=bot";
+    const body = "retry retains slowmode opportunity";
+    for ([_]bool{ true, false }) |authoring| {
+        for ([_]bool{ false, true }) |existing| {
+            var completed = false;
+            var refusals: usize = 0;
+            for (0..512) |cut| {
+                errdefer std.debug.print("slowmode allocation failure authoring={any} existing={any} cut={d}\n", .{ authoring, existing, cut });
+                const server = try createTestServer(alloc, .{
+                    .host = "127.0.0.1",
+                    .port = 0,
+                    .server_name = "relay-origin.test",
+                    .node_id = if (authoring) origin.shortId() else remote.shortId(),
+                    .node_identity = if (authoring) &origin else &remote,
+                    .crypto_io = std.testing.io,
+                    .require_secured = true,
+                    .mesh_trust_roots = if (authoring) &roots else &receiver_roots,
+                    .relay_v2_authoring = if (authoring) .active else .compat,
+                    .relay_v2_activation_epoch = 1,
+                    .relay_v2_roster = &roster,
+                });
+                defer alloc.destroy(server);
+                defer server.deinit();
+                current_reactor = &server.reactors[0];
+                const target_id = try addTestLocalClient(server, "Observer", null);
+                const target = server.connFor(target_id).?;
+                _ = try server.world.join("#retry", worldIdFromClient(target_id));
+                _ = try server.props.setProp(.{ .kind = .channel, .id = "#retry" }, "LAG", "2", .{ .id = "op", .access = .owner });
+                if (existing) try server.slowmode_last.put(alloc, try alloc.dupe(u8, key), 0);
+                var peer: s2s_link.S2sLink = undefined;
+                if (!authoring) try addTestRelayHomes(server, &peer, origin.shortId(), &.{"Resident"});
+                defer if (!authoring) peer.deinit();
+                var post: webhook_mod.PendingPost = .{};
+                post.setChannel("#retry");
+                post.setNick("Bot");
+                @memcpy(post.body_buf[0..body.len], body);
+                post.body_len = body.len;
+                var msg = message_relay_v2.RelayMessage{
+                    .verb = .privmsg,
+                    .target = "#retry",
+                    .source_prefix = "=Bot!webhook@relay-origin.test",
+                    .text = body,
+                    .scope_kind = .channel,
+                    .origin_node = origin.shortId(),
+                    .hlc = server.nextMeshHlc(),
+                };
+                var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+                var signature: [message_relay_v2.sig_len]u8 = undefined;
+                try message_relay_v2.stampOrigin(alloc, &msg, &origin.sign_kp, &pubkey, &signature);
+                const wire = try message_relay_v2.encode(alloc, msg);
+                defer alloc.free(wire);
+                const replay_before = try server.relay_v2_replay_guard.encodeCheckpoint(alloc);
+                defer alloc.free(replay_before);
+                var fault = std.testing.FailingAllocator.init(alloc, .{ .fail_index = cut });
+                server.allocator = fault.allocator();
+                const accepted = if (authoring) blk: {
+                    server.injectWebhookPost(&post);
+                    break :blk server.relay_v2_event_log.len() != 0;
+                } else blk: {
+                    const outcome = server.deliverRelayV2(msg, wire, origin.shortId());
+                    switch (outcome) {
+                        .accepted => break :blk true,
+                        .retry => break :blk false,
+                        else => {
+                            server.allocator = alloc;
+                            std.debug.print("unexpected relay outcome={s} injected={any}\n", .{ @tagName(outcome), fault.has_induced_failure });
+                            return error.TestUnexpectedResult;
+                        },
+                    }
+                };
+                server.allocator = alloc;
+                // Successfully swapped RVG2/Lotus candidates retain the fault
+                // allocator. Disarm it too before the healthy retry/duplicate;
+                // changing only Server.allocator leaves those stores faulted.
+                fault.fail_index = std.math.maxInt(usize);
+                if (!accepted) {
+                    refusals += 1;
+                    try std.testing.expect(fault.has_induced_failure);
+                    try std.testing.expectEqual(@as(usize, @intFromBool(existing)), server.slowmode_last.count());
+                    try std.testing.expectEqual(if (existing) @as(?u64, 0) else null, server.slowmode_last.get(key));
+                    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+                    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+                    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.len());
+                    var empty_history: [1]lotus.Message = undefined;
+                    try std.testing.expectEqual(@as(usize, 0), (try server.history.latest("#retry", 1, &empty_history)).len);
+                    const replay_after = try server.relay_v2_replay_guard.encodeCheckpoint(alloc);
+                    defer alloc.free(replay_after);
+                    try std.testing.expectEqualSlices(u8, replay_before, replay_after);
+                    if (authoring) server.injectWebhookPost(&post) else try std.testing.expect(server.deliverRelayV2(msg, wire, origin.shortId()) == .accepted);
+                }
+                try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+                try std.testing.expect((server.slowmode_last.get(key) orelse return error.TestUnexpectedResult) != 0);
+                try std.testing.expectEqual(@as(usize, 1), countOccurrences(target.send_buf[0..target.send_len], body));
+                var history: [2]lotus.Message = undefined;
+                try std.testing.expectEqual(@as(usize, 1), (try server.history.latest("#retry", 2, &history)).len);
+                if (!authoring) {
+                    const delivered_len = target.send_len;
+                    try std.testing.expect(server.deliverRelayV2(msg, wire, origin.shortId()) == .duplicate);
+                    try std.testing.expectEqual(delivered_len, target.send_len);
+                }
+                if (!fault.has_induced_failure) {
+                    completed = true;
+                    break;
+                }
+            }
+            try std.testing.expect(completed and refusals > 0);
+        }
+    }
+}
+
 test "MESSAGE_V2 webhook admits exact signed server identity and rejects spoofed authority" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -143509,6 +143737,8 @@ test "SIGTERM and SIGINT handlers request cooperative stop only on reactor zero"
     for ([_]posix.SIG{ posix.SIG.TERM, posix.SIG.INT }) |signal| {
         run.store(true, .release);
         onTerminationSignal(signal);
+        server.deferUpgrade(.signal);
+        try std.testing.expectError(error.ShutdownRequested, server.performUpgrade(.signal));
         try std.testing.expect(run.load(.acquire)); // handler did no teardown
         current_reactor = &server.reactors[1];
         server.onTimerTick();
@@ -143518,11 +143748,140 @@ test "SIGTERM and SIGINT handlers request cooperative stop only on reactor zero"
         server.onTimerTick();
         try std.testing.expect(!run.load(.acquire));
         try std.testing.expect(!termination_signal_requested.load(.seq_cst));
+        // The latch is consumed, but the false run flag still prevents a
+        // deferred upgrade later in the same copied completion batch.
+        server.runDeferredUpgrade();
+        try std.testing.expect(server.reactors[0].deferred_upgrade == null);
+        try std.testing.expectError(error.ShutdownRequested, server.performUpgrade(.signal));
         // No second stop request remains for another maintenance turn.
         run.store(true, .release);
         server.onTimerTick();
         try std.testing.expect(run.load(.acquire));
     }
+}
+
+test "SIGTERM and SIGINT pending requests survive the final upgrade exec boundary" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // All mask/signal changes live in forked children. The parent runner keeps
+    // its original dispositions and mask, including when a child fails.
+    var server = try Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    const fd_rc = linux.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try std.testing.expect(linux.errno(fd_rc) == .SUCCESS);
+    const executable_fd: linux.fd_t = @intCast(fd_rc);
+    defer closeFd(executable_fd);
+    const plan = helix_live.ExecPlan{
+        .argv = &.{ "/proc/self/exe", "--test-filter=SIGTERM and SIGINT pending exec child" },
+        .envp = &.{"ONYX_TEST_PENDING_STOP=1"},
+        .arena_fd = -1,
+        .control_fd = -1,
+    };
+    const Worker = struct {
+        fn check(ok: *bool) void {
+            var inherited = posix.sigemptyset();
+            posix.sigprocmask(posix.SIG.BLOCK, null, &inherited);
+            ok.* = posix.sigismember(&inherited, .TERM) and posix.sigismember(&inherited, .INT);
+        }
+    };
+    const Arrival = enum { before, after, cleared };
+    for ([_]posix.SIG{ .TERM, .INT }) |signal| {
+        for ([_]Arrival{ .before, .after, .cleared }) |arrival| {
+            const child = linux.fork();
+            try std.testing.expect(linux.errno(child) == .SUCCESS);
+            if (child == 0) {
+                const ignored = posix.Sigaction{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
+                posix.sigaction(.TERM, &ignored, null);
+                posix.sigaction(.INT, &ignored, null);
+                prepareTerminationSignals();
+                var worker_mask_ok = false;
+                const worker = std.Thread.spawn(.{}, Worker.check, .{&worker_mask_ok}) catch linux.exit_group(10);
+                worker.join();
+                if (!worker_mask_ok or terminationSignalPending()) linux.exit_group(11);
+                // Suppress the nested runner's inventory; only this parent's
+                // test summary belongs to the release gate's exact counts.
+                const null_rc = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+                if (linux.errno(null_rc) != .SUCCESS) linux.exit_group(12);
+                const null_fd: linux.fd_t = @intCast(null_rc);
+                _ = linux.dup3(null_fd, 1, 0);
+                _ = linux.dup3(null_fd, 2, 0);
+                if (null_fd > 2) closeFd(null_fd);
+                server.allocator = std.heap.page_allocator;
+                if (arrival == .cleared) {
+                    // Negative control: consume a queued request deliberately.
+                    // The marked successor must fail, never turn absence into a
+                    // skipped test that the parent could mistake for success.
+                    _ = linux.kill(linux.getpid(), signal);
+                    var mask = posix.sigemptyset();
+                    posix.sigaddset(&mask, signal);
+                    const zero = linux.timespec{ .sec = 0, .nsec = 0 };
+                    const consumed = linux.syscall4(.rt_sigtimedwait, @intFromPtr(&mask), 0, @intFromPtr(&zero), linux.NSIG / 8);
+                    if (linux.errno(consumed) != .SUCCESS or terminationSignalPending()) linux.exit_group(18);
+                    server.commitUpgradeExecPlan(&plan, executable_fd) catch linux.exit_group(19);
+                    linux.exit_group(20);
+                } else if (arrival == .after) {
+                    server.test_stop_after_upgrade_check = signal;
+                    server.commitUpgradeExecPlan(&plan, executable_fd) catch linux.exit_group(13);
+                    linux.exit_group(14);
+                } else {
+                    if (linux.errno(linux.kill(linux.getpid(), signal)) != .SUCCESS) linux.exit_group(15);
+                    server.commitUpgradeExecPlan(&plan, executable_fd) catch |err| {
+                        if (err != error.ShutdownRequested or !terminationSignalPending()) linux.exit_group(16);
+                        linux.exit_group(0);
+                    };
+                    linux.exit_group(17);
+                }
+            }
+            const pid: linux.pid_t = @intCast(child);
+            var reaped = false;
+            defer if (!reaped) {
+                _ = linux.kill(pid, .KILL);
+                var ignored: i32 = 0;
+                while (linux.errno(linux.waitpid(pid, &ignored, 0)) == .INTR) {}
+            };
+            var status: i32 = 0;
+            for (0..10_000) |_| {
+                const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+                if (linux.errno(waited) == .INTR) continue;
+                try std.testing.expect(linux.errno(waited) == .SUCCESS);
+                if (waited != 0) {
+                    reaped = true;
+                    break;
+                }
+                sleepOneMillis();
+            }
+            const expected_status: i32 = if (arrival == .cleared) 1 << 8 else 0;
+            if (!reaped or status != expected_status) {
+                std.debug.print("pending-stop child signal={t} arrival={t} reaped={any} status={d}\n", .{ signal, arrival, reaped, status });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "SIGTERM and SIGINT pending exec child" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const env_rc = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try std.testing.expect(linux.errno(env_rc) == .SUCCESS);
+    const env_fd: linux.fd_t = @intCast(env_rc);
+    defer closeFd(env_fd);
+    var env: [64]u8 = undefined;
+    const env_len = linux.read(env_fd, &env, env.len);
+    try std.testing.expect(linux.errno(env_len) == .SUCCESS);
+    if (!std.mem.eql(u8, env[0..env_len], "ONYX_TEST_PENDING_STOP=1\x00")) return error.SkipZigTest;
+    try std.testing.expect(terminationSignalPending());
+    prepareTerminationSignals();
+    var server = try Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+    var run = std.atomic.Value(bool).init(true);
+    server.shutdown = &run;
+    defer server.shutdown = null;
+    try std.testing.expectError(error.ShutdownRequested, server.ensureUpgradeNotStopping());
+    server.onTimerTick();
+    try std.testing.expect(!run.load(.acquire));
+    // A non-consuming poll leaves stop authority pending through cleanup.
+    try std.testing.expect(terminationSignalPending());
 }
 
 test "SIGUSR2 handler sets the upgrade-request flag; reactor-0 consume is one-shot" {

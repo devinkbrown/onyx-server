@@ -19,7 +19,7 @@ description_reload="Validate and request a Helix upgrade; verify completion sepa
 : "${respawn_period:=60}"
 : "${output_logger:=logger -t onyx-server -p daemon.info}"
 : "${error_logger:=logger -t onyx-server -p daemon.err}"
-umask="0077"
+: "${umask:=0077}"
 command_args="\"${config}\""
 required_files="${config}"
 

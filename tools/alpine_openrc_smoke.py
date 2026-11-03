@@ -224,9 +224,10 @@ checkconfig
 
     def test_operator_overrides_survive(self) -> None:
         self.env.update(respawn_delay="7", respawn_max="2", respawn_period="90",
-                        output_logger="custom-out", error_logger="custom-err")
+                        output_logger="custom-out", error_logger="custom-err", umask="0022")
         self.passed(self.shell(r'''
 [ "$respawn_delay:$respawn_max:$respawn_period" = 7:2:90 ] &&
+[ "$umask" = 0022 ] &&
 [ "$output_logger:$error_logger" = custom-out:custom-err ] && start_pre
 '''))
 

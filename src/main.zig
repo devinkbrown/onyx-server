@@ -1641,7 +1641,33 @@ fn initializeGuestIssuerOffline(init: std.process.Init, config_path: []const u8,
     defer issuer.deinit();
 }
 
+fn daemonOwnsTerminationSignals(first: ?[]const u8) bool {
+    const arg = first orelse return true;
+    // These branches exit before a reactor exists. Keep their ordinary signal
+    // disposition so interactive stdin/network operations remain interruptible.
+    for ([_][]const u8{
+        "setup",              "cloak-audit",               "session-fences", "doctor",                   "acme-issue",                                         "delegated-credential",
+        "--init-private-dir", "--initialize-guest-issuer", "--check-config", "--check-service-identity", "--restore-drill",                                    "--version",
+        "-v",                 "-V",                        "--help",         "-h",                       onyx_server.daemon.helix.live.upgrade_capability_arg,
+    }) |offline| if (std.mem.eql(u8, arg, offline)) return false;
+    return true;
+}
+
+test "termination signal ownership excludes offline commands and retains daemon successors" {
+    for ([_][]const u8{ "setup", "doctor", "cloak-audit", "session-fences", "acme-issue", "delegated-credential", "--check-config", "--check-service-identity", "--restore-drill", "--help", "--version" }) |offline|
+        try std.testing.expect(!daemonOwnsTerminationSignals(offline));
+    for ([_]?[]const u8{ null, "onyx-server.local.toml", "--supervisor", "--strict-existing-identity" }) |daemon|
+        try std.testing.expect(daemonOwnsTerminationSignals(daemon));
+}
+
 pub fn main(init: std.process.Init) !void {
+    // POSIX argument iteration borrows argv without allocation or I/O. Classify
+    // before any operation can spawn a worker with an unblocked daemon mask.
+    if (comptime builtin.os.tag == .linux) {
+        var early_args = std.process.Args.iterate(init.minimal.args);
+        _ = early_args.next();
+        if (daemonOwnsTerminationSignals(early_args.next())) onyx_server.daemon.server.prepareTerminationSignals();
+    }
     onyx_server.daemon.kernel_linux.setNonDumpable();
     const allocator = init.gpa;
     var windows_service_worker: ?windows_scm.WorkerHandles = null;

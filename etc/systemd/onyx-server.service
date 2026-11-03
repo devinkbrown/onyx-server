@@ -67,7 +67,7 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 # io_uring and descriptor-based Helix execution must remain available. The
 # contents of systemd syscall groups vary by release; include these explicitly.
-SystemCallFilter=@system-service io_uring_setup io_uring_enter io_uring_register memfd_create execveat pidfd_open pidfd_send_signal
+SystemCallFilter=@system-service io_uring_setup io_uring_enter io_uring_register memfd_create execveat pidfd_open pidfd_send_signal rt_sigprocmask rt_sigpending
 SystemCallFilter=~@mount @reboot @swap @cpu-emulation @obsolete @debug @clock
 SystemCallErrorNumber=EPERM
 
