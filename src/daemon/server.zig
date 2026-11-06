@@ -35,6 +35,7 @@ const mesh_presence_authority = @import("mesh_presence_authority.zig");
 const mesh_presence_retained = @import("mesh_presence_retained.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
 const anti_entropy_mod = @import("../substrate/undertow/anti_entropy.zig");
+const anti_entropy_schedule = @import("../substrate/undertow/anti_entropy_schedule.zig");
 const message_relay = @import("../substrate/undertow/message_relay.zig");
 const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
 const channel_prop_event = @import("../proto/channel_prop_event.zig");
@@ -76,6 +77,7 @@ const event_spine = @import("event_spine.zig");
 const event_spine_replay_guard = @import("event_spine_replay_guard.zig");
 const relay_v2_replay_guard = @import("relay_v2_replay_guard.zig");
 const relay_v2_outbox = @import("relay_v2_outbox.zig");
+const mesh_backpressure = @import("mesh_backpressure.zig");
 const relay_v2_event_log = @import("relay_v2_event_log.zig");
 const relay_v2_activation = @import("relay_v2_activation.zig");
 const e2ee_group_mesh_authority = @import("e2ee_group_mesh_authority.zig");
@@ -116,6 +118,8 @@ const geo_fetch = @import("../proto/geo_fetch.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
+const mesh_config_compat = @import("mesh_config_compat.zig");
+const mesh_digest_sync = @import("mesh_digest_sync.zig");
 const partition_detector = @import("../substrate/undertow/partition_detector.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
 const event_history_mod = @import("event_history.zig");
@@ -123,6 +127,7 @@ const event_collapse_mod = @import("event_collapse.zig");
 const route_report = @import("../proto/route_report.zig");
 const ripple_report = @import("../proto/ripple_report.zig");
 const link_health_mod = @import("link_health.zig");
+const route_cost = @import("route_cost.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
 const session_reclaim_attachment = @import("../proto/session_reclaim_attachment.zig");
 const session_resume_credential = @import("../proto/session_resume_credential.zig");
@@ -130,6 +135,11 @@ const session_portability = @import("../proto/session_portability.zig");
 const migration_relay = @import("helix/migration_relay.zig");
 const session_migrate = @import("helix/session_migrate.zig");
 const session_replica_v2 = @import("helix/session_replica.zig");
+const offer_retry_reuse = @import("session_offer_retry_reuse.zig");
+const session_attachment_revoke = @import("session_attachment_revoke.zig");
+const session_replica_revocation = @import("helix/session_replica_revocation.zig");
+const session_credential_churn = @import("session_credential_churn.zig");
+const credential_redaction = @import("credential_redaction.zig");
 const session_group_durable = @import("session_group_revoke_durable.zig");
 const session_group_retired_policy = @import("session_group_retired_policy.zig");
 const oper_cred_share = @import("../proto/oper_cred_share.zig");
@@ -168,10 +178,15 @@ const msgid_mod = @import("../proto/msgid.zig");
 const draft_reply_relay = @import("../proto/draft_reply_relay.zig");
 const multiline = @import("../proto/multiline.zig");
 const meshpass = @import("../proto/meshpass.zig");
+const mesh_enrollment = @import("../proto/mesh_enrollment.zig");
+const mesh_enrollment_ledger = @import("mesh_enrollment_ledger.zig");
 const labeled_response = @import("../proto/labeled_response.zig");
 const secure_fns = @import("../proto/secure_fns.zig");
 const global_notice = @import("../proto/global_notice.zig");
 const help_db = @import("../proto/help_db.zig");
+const help_catalog = @import("help_catalog.zig");
+const existence_privacy = @import("existence_privacy.zig");
+const permission_explain = @import("permission_explain.zig");
 const lotus = @import("../proto/lotus.zig");
 const search_index_mod = @import("search_index.zig");
 const history_durable = @import("history_durable.zig");
@@ -187,7 +202,11 @@ const chathistory_cmd = @import("../proto/chathistory_cmd.zig");
 const chathistory_targets = @import("../proto/chathistory_targets.zig");
 const msgedit = @import("../proto/msgedit.zig");
 const warden = @import("warden.zig");
+const ward_preview = @import("ward_preview.zig");
+const moderation_undo = @import("moderation_undo.zig");
 const rehash_dry = @import("rehash_dry.zig");
+const config_change_preview = @import("config_change_preview.zig");
+const resource_limits = @import("resource_limits.zig");
 const whox = @import("../proto/whox.zig");
 const metadata_proto = @import("../proto/metadata.zig");
 const metadata_store = @import("../proto/metadata_store.zig");
@@ -269,6 +288,7 @@ const resolv_conf = @import("../proto/resolv_conf.zig");
 const chan_forward = @import("../proto/chan_forward.zig");
 const clone_limit_mod = @import("clone_limit.zig");
 const clone_detect_mod = @import("clone_detect.zig");
+const workload_quota_mod = @import("workload_quota.zig");
 const mesh_clones_mod = @import("mesh_clones.zig");
 const nick_delay_mod = @import("nick_delay.zig");
 const ip_reputation_mod = @import("ip_reputation.zig");
@@ -301,6 +321,7 @@ const helix_media_graph = @import("helix/media_graph_checkpoint.zig");
 const helix_active_media = @import("helix/native_windows_active_media_snapshot.zig");
 const handoff_relations = @import("helix/handoff_relations.zig");
 const physical_connection_relation = @import("helix/physical_connection_relation.zig");
+const maintenance_plan = @import("maintenance_plan.zig");
 const remote_presentation_snapshot = @import("helix/remote_presentation_snapshot.zig");
 const socket_owner_identity = @import("helix/socket_owner_identity.zig");
 const handoff_manifest = @import("helix/handoff_manifest.zig");
@@ -1031,6 +1052,7 @@ const io_backend = @import("io_backend.zig");
 const reactor_backend = @import("reactor_backend.zig");
 const os_runtime = @import("os_runtime.zig");
 const sendq = @import("sendq.zig");
+const output_class_budget = @import("output_class_budget.zig");
 const ws_output = @import("ws_output.zig");
 const search_cmd = @import("search_cmd.zig");
 const media_cmd = @import("media_cmd.zig");
@@ -1516,6 +1538,31 @@ const session_replica_dirty_retry_batch: usize = 8;
 /// from elapsed time: authenticated MEMBERSHIP_SYNC generations repair omissions
 /// in the inbound peer direction (see S2sPeer.recvMembershipSync).
 const stale_member_ttl_ms: i64 = 90_000;
+/// M02 cadence for the periodic per-link anti-entropy round
+/// (`resyncMeshStateToPeers`). The floor stays the historical 30s membership
+/// cadence: the divergence signal (`membership_divergence_applied`) also
+/// advances on live JOIN/PART applies, so a sub-30s floor would turn ordinary
+/// chat activity into repeated full-state bursts. Quiet links back off to 60s;
+/// backlog and mesh-wide load stretch toward that same ceiling, and at most four
+/// full bursts are admitted per round so a due-peer crowd cannot monopolize the
+/// send path. `tick_ms` is the scheduler's wake floor; real wakes are further
+/// quantized by the 2s maintenance sweep.
+const mesh_anti_entropy_bounds: anti_entropy_schedule.Bounds = .{
+    .min_interval_ms = @intCast(membership_resync_interval_ms),
+    .max_interval_ms = anti_entropy_mod.max_repair_interval_ms,
+    .tick_ms = 1_000,
+    .max_bursts_per_round = 4,
+    .backlog_soft_bytes = 256 * 1024,
+    .backlog_hard_bytes = 4 * 1024 * 1024,
+    .load_stretch_factor = 4,
+};
+comptime {
+    mesh_anti_entropy_bounds.validate() catch @compileError("invalid M02 anti-entropy bounds");
+    // Legacy plaintext receivers reap members not re-affirmed within
+    // `stale_member_ttl_ms`; every link must be re-burst well inside it.
+    if (mesh_anti_entropy_bounds.max_interval_ms >= @as(u64, @intCast(stale_member_ttl_ms)))
+        @compileError("M02 anti-entropy ceiling must stay below the stale-member TTL");
+}
 /// Max members per netsplit/netjoin IRCv3 BATCH chunk; a larger channel splits
 /// across multiple batches so members past a fixed cap are never silently lost.
 const mesh_batch_chunk: usize = 32;
@@ -2511,6 +2558,18 @@ pub const Config = struct {
     /// slots up front so ConnState buffers (targeted by in-flight io_uring I/O)
     /// never move; accepts past the cap are refused.
     max_clients: u31 = 1024,
+    /// M12 `[quota]` overrides for the per-shard workload governor. Read
+    /// once at reactor init (startup-only); quota state is process-local and
+    /// never carried through Helix (adopted connections hold no units).
+    workload_quota: workload_quota_mod.Overrides = .{},
+    /// `[resources].memory_budget_bytes` (startup-only; 0 = unlimited). Each
+    /// shard admits new client accepts within an equal share of this budget.
+    resource_memory_budget_bytes: u64 = 0,
+    /// Committed bytes per client for the budget: the explicit override or the
+    /// worst-case class SendQ+RecvQ plus `ConnState`. REHASH recomputes it.
+    resource_per_client_bytes: u64 = 0,
+    /// `[resources].per_client_memory_bytes` override (0 = derive from classes).
+    resource_per_client_override_bytes: u64 = 0,
     /// Requested number of worker reactor shards (one io_uring loop per shard).
     /// 1 = the single-reactor model. Values >1 are accepted and carried but
     /// currently clamped to 1 at `runThreaded` until the per-shard reactor array
@@ -2520,6 +2579,10 @@ pub const Config = struct {
     /// Drop a connection that has not completed registration (NICK+USER) within
     /// this many milliseconds (the io_uring timeout sweep enforces it).
     registration_timeout_ms: i64 = 30_000,
+    /// Close an inbound S2S socket that has not completed its Mooring
+    /// handshake within this many milliseconds, releasing its mesh-recovery
+    /// governor unit. Established links are governed by the liveness probe.
+    s2s_handshake_timeout_ms: i64 = 30_000,
     /// Grace window (ms) an unauthenticated user may hold a REGISTERED nick before
     /// being force-renamed to a Guest nick. 0 disables nick protection.
     nick_grace_ms: i64 = 60_000,
@@ -2752,6 +2815,11 @@ pub const Config = struct {
     /// on the plaintext S2S path.
     mesh_admission_roots: []const []const u8 = &.{},
     mesh_admission_min_revocation_epoch: u64 = 0,
+    /// W07 durable mesh-enrollment ledger file (consumed/revoked ticket ids,
+    /// revoked issuers, epoch floor). Empty disables `MESH ENROLL REDEEM`:
+    /// without a durable single-use guard a restart could reopen a consumed
+    /// ticket. Enrollment also needs a node identity and admission roots.
+    mesh_enrollment_ledger_path: []const u8 = "",
     /// MESSAGE_V2 is an explicit two-phase rollout. Compatibility nodes accept
     /// and forward V2 but author legacy only; active nodes author each V2-eligible
     /// mesh event as V2 only.
@@ -2864,6 +2932,11 @@ pub const Config = struct {
     /// re-reads and re-parses this file and swaps in the new oper registry. Null
     /// = REHASH acknowledges without reloading (e.g. defaults-only boot, tests).
     config_path: ?[]const u8 = null,
+    /// Exact TOML bytes this process booted from, borrowed from main for the
+    /// process lifetime. REHASH DRY classifies field changes against it; null
+    /// renders the preview as unavailable. Not carried by Helix: a successor
+    /// boots from its own read of the file and that read becomes its baseline.
+    boot_config_text: ?[]const u8 = null,
     /// Borrowed from the retained prepared-config owner; refresh together with
     /// config_path/config_resolver on config replacement. Never process env.
     helix_boot_policy: helix_live.BootPolicy = .{},
@@ -3361,6 +3434,12 @@ pub const ConnState = struct {
     session_mesh_announce_token_bound: bool = false,
     session_mesh_announce_requires_authority: bool = false,
     session_mesh_announce_token: sessions_mod.Token = @splat(0),
+    /// Reusable token this client already holds: published to it by SESSION
+    /// TOKEN or presented by it on a successful RESUME. A later SESSION TOKEN
+    /// for the same token is a reuse, not a fresh mint (T09 churn budget).
+    /// Process-local and not carried across Helix: after an upgrade the first
+    /// re-emission of a non-portable token is charged once as a fresh mint.
+    session_credential_held: sessions_mod.Token = @splat(0),
     session_mesh_announce_old_retracted: bool = false,
     session_mesh_announce_nick_change: bool = false,
     session_mesh_announce_old_nick_len: u8 = 0,
@@ -3453,6 +3532,11 @@ pub const ConnState = struct {
     /// True once this connection was admitted (recorded) by the connection-rate
     /// throttle, so its slot is released exactly once on close.
     throttle_counted: bool = false,
+    /// Workload-governor unit held while this connection is in its client
+    /// admission (pre-registration) or mesh-recovery (S2S handshake) phase.
+    /// Released once by `releaseWorkloadTicket`; process-local and never
+    /// carried by Helix, so adopted connections hold none.
+    workload_ticket: ?workload_quota_mod.Ticket = null,
     /// True once this connection was added to the network-wide clone aggregate;
     /// `mesh_clone_hash` is its salted-IP-hash, so close releases exactly one.
     mesh_clone_counted: bool = false,
@@ -3502,6 +3586,15 @@ pub const ConnState = struct {
     /// Monotonic ms of this connection's last periodic anti-entropy burst;
     /// 0 means none yet (first periodic burst is never backoff-gated).
     last_periodic_burst_ms: u64 = 0,
+    /// M03: baseline snapshot of this connection's peer-driver
+    /// `membership_divergence_applied` counter as of the last periodic
+    /// anti-entropy plan. `observeMeshAntiEntropyDivergence` compares the live
+    /// counter against this baseline to detect real inbound divergence on THIS
+    /// link since the previous plan and resets the peer's quiet-repair backoff
+    /// streak rather than growing it. 0 means no plan observed yet, matching a
+    /// peer driver that also starts its own counter at 0. Runtime-only, like
+    /// `last_periodic_burst_ms`: an adopted link restarts both at 0.
+    last_membership_divergence_applied: u64 = 0,
     /// An explicit RESYNC arrived while a previous/periodic burst was already
     /// past its first family. Its sealed ciphertext cannot be discarded without
     /// creating an AEAD counter gap, so finish that pass and then wrap once to a
@@ -4168,6 +4261,47 @@ const HeldMeshRecvLease = struct {
     staged: bool = false,
 };
 
+/// One published counter per output class and decision (M05).
+const output_class_counter_slots = std.enums.values(output_class_budget.Class).len * std.enums.values(output_class_budget.Decision).len;
+
+comptime {
+    // Every turn must carry one largest replay line and one largest media frame.
+    output_class_budget.TurnLimits.default.validate(default_reply_bytes, WsState.max_media_frame + 10) catch
+        @compileError("output class turn limits cannot carry one replay line or media frame");
+}
+
+/// Wire bytes one full-size line can cost after WebSocket framing (+10) and
+/// userspace TLS record overhead (+256), as `linewiseReplayRawBound` charges.
+const output_class_line_overhead: u64 = 10 + 256;
+/// M05 `--check-config` bound: one full-size chat line. A chat ceiling below
+/// it can poison a connection on a single long line.
+pub const output_class_chat_line_bytes: u64 = default_reply_bytes + output_class_line_overhead;
+/// M05 `--check-config` bound: the smallest CHATHISTORY page, one full-size
+/// line between its BATCH open and close lines (each under 512 bytes). A
+/// replay ceiling below it answers TEMPORARILY_UNAVAILABLE for long lines.
+pub const output_class_replay_page_bytes: u64 = default_reply_bytes + 2 * 512 + 3 * output_class_line_overhead;
+/// M05 `--check-config` bound: WebSocket header bytes added to one media datagram.
+pub const output_class_media_frame_overhead: u64 = 10;
+
+/// Per-shard workload governor quotas (M12): `[quota]` overrides over the
+/// defaults `workload_quota_mod.resolve` derives from `max_clients`. The
+/// config loader refuses any override set that does not validate
+/// (`config_boot.workloadQuotaError`), so a directly constructed `Config`
+/// with invalid overrides is the only way to reach the error here, and boot
+/// then fails instead of running unmetered. Null only for an explicit
+/// `enabled = false` or an override-free table too small for the reserve.
+fn workloadQuotaConfig(max_clients: u31, overrides: workload_quota_mod.Overrides) workload_quota_mod.ResolveError!?workload_quota_mod.Config {
+    return switch (try workload_quota_mod.resolve(max_clients, overrides)) {
+        .enabled => |config| config,
+        .disabled => null,
+    };
+}
+
+/// Governor peer key for a source address. Never `unidentified_peer_key`.
+fn workloadPeerKey(seed: u64, bytes: []const u8) u64 {
+    return std.hash.Wyhash.hash(seed, bytes) | 1;
+}
+
 const Reactor = struct {
     // Fixed metadata bound: one slot per existing 256-buffer target pool.
     // Rendered broadcast storage shares the daemon's existing global output
@@ -4236,6 +4370,15 @@ const Reactor = struct {
     /// link scan on unrelated fabric, stop, and activation wakes.
     retained_mesh_outbound_pending: std.atomic.Value(bool) = .init(false),
     accepted_count: std.atomic.Value(u64) = .init(0),
+    /// Owner-only output class budgets: per-turn replay/media credit plus
+    /// cumulative decision counters. Process-local, reset by Helix exec.
+    output_class_turn: output_class_budget.TurnLedger = .init(.default),
+    /// Owner-published copy of `output_class_turn.counters` for the metrics
+    /// scrape, refreshed on each timer tick.
+    output_class_published: [output_class_counter_slots]std.atomic.Value(u64) = @splat(.init(0)),
+    /// Owner-only admission/recovery governor; null when `max_clients` is too
+    /// small for the derived reserves. Process-local, never migrated.
+    quota: ?*workload_quota_mod.Governor = null,
     windows_accepted: WindowsAcceptedQueue = if (builtin.os.tag == .windows) WindowsAcceptedQueue.init() else {},
     /// Published only after this actual owner completes a successful backend
     /// loop turn. A Gate arrival/release is not an activation acknowledgment.
@@ -4367,6 +4510,8 @@ const Reactor = struct {
     /// The caller drains per-connection link/tls/multiline state first.
     fn deinit(self: *Reactor) void {
         if (self.held_mesh_recv.len != 0) self.held_mesh_allocator.free(self.held_mesh_recv);
+        // initReactor allocates the governor with the same allocator.
+        if (self.quota) |quota| self.held_mesh_allocator.destroy(quota);
         // io_uring may still own recv/send/connect storage embedded in a client
         // slot. Tear the ring down first so the kernel releases those references
         // before ClientTable frees/reuses its backing allocation.
@@ -5407,6 +5552,10 @@ pub const LinuxServer = struct {
     /// defeating its outbound reflection cache and retransmitting.
     relay_v2_deferred: [relay_v2_deferred_capacity]DeferredRelayV2 = undefined,
     relay_v2_deferred_len: usize = 0,
+    /// `relay_v2_deferred_len` as last published for the metrics scrape (M07).
+    /// Observability only: deferred occupancy never gates admission (see
+    /// `relayV2BackpressureAdmits`).
+    relay_v2_deferred_published: std.atomic.Value(usize) = .init(0),
     /// Count of inbound relayed MESSAGEs dropped in `deliverRelay` because their
     /// self-contained origin signature failed (bad Ed25519 signature, or a pubkey
     /// whose `originShortId` did not match the claimed `origin_node`). Such a
@@ -5500,6 +5649,20 @@ pub const LinuxServer = struct {
     /// A bounded repair sweep resumes after the last visited peer, so one down
     /// low-sorted neighbor cannot consume every frame/byte slot forever.
     relay_v2_peer_cursor: usize = 0,
+    /// M07 resend pacing per (direct peer, RVL2 origin head): a head is sent at
+    /// once, then re-sent only after an exponential RTO (1s..32s) until the
+    /// peer ACKs, instead of on every reactor-0 wake and ACK. Sized to the
+    /// immutable RVL2 membership, so every retry target fits and pacing never
+    /// silently switches off. Monotonic clock (node-local). Protected by
+    /// `relay_v2_replay_mu`; null without durable membership. Advisory and
+    /// runtime-only: not in the Helix capsule, so a successor starts with every
+    /// retained head immediately eligible, as on link re-establishment.
+    relay_v2_pressure: ?mesh_backpressure.PeerWindows = null,
+    /// M07 per-signed-origin RVL2 admission gate (local hysteresis plus shed
+    /// counters). Protected by `relay_v2_replay_mu`. Runtime-only: its only
+    /// state is the local hysteresis bit, which a successor recomputes from the
+    /// adopted RVL2 rows on its first admission.
+    relay_v2_gate: mesh_backpressure.AdmissionGate = .{},
     /// Test-only deterministic fault seam. Protected by `relay_v2_replay_mu`;
     /// see RelayV2AckDropTestState.
     test_drop_relay_v2_ack: RelayV2AckDropTestState = .{},
@@ -5511,6 +5674,18 @@ pub const LinuxServer = struct {
     meshpass_roots: []meshpass.TrustRoot = &.{},
     /// Decoded local `[mesh].admission_token` bytes sent in encrypted M1.
     mesh_admission_token: []u8 = &.{},
+    /// W07 node-local enrollment ledger, loaded at init from
+    /// `config.mesh_enrollment_ledger_path`; null when enrollment is not
+    /// configured. Guarded by `mesh_enrollment_mu` (oper commands run on any
+    /// shard). Not carried in the Helix capsule: every mutation is written
+    /// durably before success is reported, and the successor reloads the same
+    /// file at init, so the ledger is durable non-migrating state.
+    mesh_enrollment_ledger: ?mesh_enrollment_ledger.Ledger = null,
+    mesh_enrollment_mu: std.atomic.Mutex = .unlocked,
+    /// Effective revocation floor: max(`[mesh].admission_min_revocation_epoch`,
+    /// ledger floor). Any shard may raise it; only reactor 0 (which owns every
+    /// Mooring handshake reading `meshpass_roots`) copies it into the roots.
+    mesh_enrollment_epoch_floor: std.atomic.Value(u64) = .init(0),
     /// One-shot boot-dial latch. Written only by reactor 0's thread; the boot
     /// check confirms "this is reactor 0" before reading it, so no other shard
     /// ever touches the flag.
@@ -5644,9 +5819,17 @@ pub const LinuxServer = struct {
     geoip_asn_db: ?geoip.Database = null,
     geoip_asn_bytes: ?[]u8 = null,
     geoip_asn_tried: bool = false,
-    /// Last time the periodic membership anti-entropy re-burst ran (ms). Gates
-    /// `resyncMeshStateToPeers` so it fires on a coarse cadence, not every tick.
+    /// Last time the legacy stale-member reap ran (ms). Gates
+    /// `pruneStaleMeshMembers` so it fires on a coarse cadence, not every tick;
+    /// the periodic re-burst itself is scheduled by `anti_entropy_wake_ms`.
     last_membership_resync_ms: i64 = 0,
+    /// M02: monotonic ms at which reactor 0 next plans a periodic anti-entropy
+    /// round (`anti_entropy_schedule.nextWakeupMs`); 0 = first maintenance
+    /// turn. Runtime-only and deliberately not in the Helix capsule: a
+    /// successor starts at 0 with every adopted link's `last_periodic_burst_ms`
+    /// also 0 (never bursted), so its first rounds re-affirm every link within
+    /// the per-round budget, exactly as the pre-M02 first resync did.
+    anti_entropy_wake_ms: u64 = 0,
     /// Last ACCESS expiry-reminder sweep (ms). Hourly cadence with a one-hour
     /// lookahead window, so an expiring rule reminds its issuer about once.
     last_access_expiry_reminder_ms: i64 = 0,
@@ -5790,6 +5973,18 @@ pub const LinuxServer = struct {
     /// Operator-action audit ring: a bounded, queryable log of privileged actions
     /// (KILL, JUPE, WARD bans, override use) for accountability. Read via AUDIT.
     oper_audit: svc_operaudit.OperAudit,
+    /// Reversible moderation changes (ward/shun) paired 1:1 with `oper_audit`
+    /// entries, for `AUDIT UNDO`. Allocated on first record. Node-local and
+    /// non-migrating: Helix and restart start an empty ledger whose ids begin
+    /// at the wall clock, so a change id reported before the boundary resolves
+    /// to "unknown or evicted" and is never reused for a different change.
+    moderation_ledger: ?*moderation_undo.Ledger = null,
+    /// Reversible channel-list changes (MODE +b/+e/+I/+Z and removals) made on
+    /// this node, for `AUDIT UNDO`. A separate ring from `moderation_ledger`
+    /// so any chanop's list churn cannot evict operator ward/shun records; its
+    /// ids start at `moderation_undo.channel_list_id_base`. Allocated on first
+    /// record; node-local and non-migrating exactly like `moderation_ledger`.
+    moderation_list_ledger: ?*moderation_undo.Ledger = null,
     /// Network-wide clone aggregate: local + per-peer connection counts keyed by
     /// salted-IP-hash, for the `max_clones_per_ip_net` cap. Inert when that cap is 0.
     mesh_clones: mesh_clones_mod.MeshClones,
@@ -5955,6 +6150,15 @@ pub const LinuxServer = struct {
     /// direct-peer maps below, this store retains the original origin across a
     /// forwarded OFFER, which is what makes one token usable across a mesh line.
     session_replica_store: session_replica_v2.Store,
+    /// T09 per-account bound on credential churn: SASL SESSION-TOKEN reissue
+    /// is a rotation and first publication of a reusable SESSION TOKEN is a
+    /// fresh mint. Guarded by `session_credential_churn_mu` (any reactor).
+    /// Deliberately non-migrating across Helix and restart: it holds only
+    /// one-minute rate windows plus process-local Prometheus counters, so a
+    /// successor starts with empty windows (at most one extra window of
+    /// allowance per upgrade) and its counters restart like every counter.
+    session_credential_churn: session_credential_churn.Budget,
+    session_credential_churn_mu: std.atomic.Mutex = .unlocked,
     /// Process-local signature work only; never serialized as Helix authority.
     /// Received OFFER admission is serialized by the existing World owner lane.
     session_offer_signature_memo: session_replica_v2.OfferSignatureMemo = .{},
@@ -5969,6 +6173,20 @@ pub const LinuxServer = struct {
     /// Bumps whenever retained v2 authority/evidence changes, invalidating
     /// numeric replay cursors without retaining borrowed Store views.
     session_replica_store_generation: u64 = 1,
+    /// Process-local proof of which cohort accepted this node's own OFFER
+    /// revisions, read only on World's serialized publication lane. Never
+    /// checkpointed: after exec a retry republishes (counted `unproven`).
+    offer_retry_stamps: offer_retry_reuse.StampTable = .{},
+    /// Atomic retry-reason counters; reset on exec like the other publication
+    /// counters.
+    offer_retry_reason_stats: offer_retry_reuse.RetryReasonStats = .{},
+    /// Heap-allocated on first use (about 450 KiB). Helix carries it as the
+    /// strict SARS mesh checkpoint (live fences, replay identities, retained
+    /// SAR1 wires, sequence and the unfinished-close latch), so a sequential
+    /// upgrade keeps the bare-token rejoin fence for its whole window and the
+    /// successor re-enforces every live fence against adopted rows. A cold
+    /// restart still loses it; peers re-offer only still-live SAR1 wires.
+    session_attachment_revoke_state: ?*session_attachment_revoke.NodeState = null,
     /// Allocation-free retry cursor for PendingMigrations staging when an
     /// accepted Store entry has no local SessionStore row on this node yet.
     /// A row-backed dirty bit cannot represent that late-resume case, so reactor
@@ -6048,6 +6266,19 @@ pub const LinuxServer = struct {
     /// Per-S2S-peer link health (EWMA RTT, byte counters, state timestamps),
     /// keyed by remote server name, surfaced in the MESH peer table.
     peer_health: link_health_mod.Registry,
+    /// M04: hysteresis-stable ranking of direct mesh peers by measured link
+    /// cost (RTT, jitter, SendQ backlog, Ripple suspicion from `peer_health`).
+    /// Only orders emission across fan-out sets that custody already decided;
+    /// it never adds, drops, or substitutes a peer. Fixed storage (no
+    /// allocation). Process-local soft state, rebuilt from fresh RTT probes
+    /// after restart or Helix upgrade and deliberately not migrated. Written on
+    /// reactor 0; `route_rank_mu` covers cross-reactor metric reads.
+    route_rank: route_cost.PeerRanking = .{},
+    route_rank_mu: std.atomic.Mutex = .unlocked,
+    /// Monotonic ms of the last route-ranking refresh (reactor 0).
+    last_route_rank_refresh_ms: u64 = 0,
+    /// Nested per-connection SendQ ceilings for control > chat > replay > media.
+    output_class_policy: output_class_budget.Policy = .default,
     /// Monotonic ms of the last mesh RTT probe sweep (reactor 0).
     last_peer_rtt_probe_ms: i64 = 0,
     /// Recently-emitted synthetic oper-prefix (+Y/-Y) announcements, for
@@ -6134,6 +6365,13 @@ pub const LinuxServer = struct {
     /// all three are freed (and the prior generation replaced) on each REHASH and
     /// on deinit. Null/empty until the first successful REHASH.
     reload_parsed: ?config_format.Config = null,
+    /// Exact TOML bytes of the most recent committed REHASH (wiped on free).
+    /// The REHASH DRY preview compares reloadable fields against this text.
+    /// Process-local and not carried by Helix (see `Config.boot_config_text`).
+    applied_config_text: ?[]u8 = null,
+    /// W09: client accepts refused by `[resources].memory_budget_bytes`
+    /// (process-local diagnostic; not carried by Helix).
+    resource_budget_refusals: std.atomic.Value(u64) = .init(0),
     /// REHASH owns only its replacement policy; startup policy remains main-owned.
     reload_boot_policy: ?helix_live.OwnedBootPolicy = null,
     reload_bindings: []oper_mod.OperBinding = &.{},
@@ -6517,12 +6755,20 @@ pub const LinuxServer = struct {
         errdefer clients.deinit();
         try clients.reserve(config.max_clients);
 
+        const quota: ?*workload_quota_mod.Governor = if (try workloadQuotaConfig(config.max_clients, config.workload_quota)) |quota_config| blk: {
+            const governor = try allocator.create(workload_quota_mod.Governor);
+            governor.init(quota_config) catch unreachable; // validated by workloadQuotaConfig
+            break :blk governor;
+        } else null;
+        errdefer if (quota) |governor| allocator.destroy(governor);
+
         const wake = try initReactorWakeForMode(reuse_port, reactor_wake.ReactorWake.init);
 
         return .{
             .ring = ring,
             .held_mesh_recv = held_mesh_recv,
             .held_mesh_allocator = allocator,
+            .quota = quota,
             .clients = clients,
             .shard_id = shard_id,
             .listener_fd = listener_fd,
@@ -6807,6 +7053,11 @@ pub const LinuxServer = struct {
             srvLog("onyx-server: MESSAGE_V2 durable membership disabled: require a non-empty, fully valid, bounded direct-neighbor trust-root set\n", .{});
         }
         errdefer if (relay_v2_required_nodes.len != 0) allocator.free(relay_v2_required_nodes);
+        var relay_v2_pressure: ?mesh_backpressure.PeerWindows = if (relay_v2_required_nodes.len != 0)
+            try mesh_backpressure.PeerWindows.init(allocator, .{ .max_peers = relay_v2_required_nodes.len })
+        else
+            null;
+        errdefer if (relay_v2_pressure) |*pacing| pacing.deinit();
         if (relay_v2_activation_state.activation_epoch != 0 and
             relay_v2_required_nodes.len != mesh_trusted_node_keys.len + 1)
             return error.InvalidRelayV2ActivationPlan;
@@ -6846,6 +7097,22 @@ pub const LinuxServer = struct {
             mesh_admission_token = try decodeMeshAdmissionToken(allocator, config.mesh_admission_token);
         }
         errdefer if (mesh_admission_token.len != 0) allocator.free(mesh_admission_token);
+
+        var mesh_enrollment_state: ?mesh_enrollment_ledger.Ledger = null;
+        if (config.mesh_enrollment_ledger_path.len != 0) {
+            const io = config.crypto_io orelse return error.MeshEnrollmentRequiresSecuredS2s;
+            if (config.node_identity == null or meshpass_roots.len == 0)
+                return error.MeshEnrollmentRequiresSecuredS2s;
+            mesh_enrollment_state = try loadMeshEnrollmentLedger(allocator, io, config.mesh_enrollment_ledger_path);
+        }
+        errdefer if (mesh_enrollment_state) |*ledger| ledger.deinit();
+        // One effective floor for MeshPass verification and enrollment review:
+        // a floor raised by `MESH ENROLL FLOOR` survives restart via the ledger.
+        const mesh_enrollment_floor = @max(
+            config.mesh_admission_min_revocation_epoch,
+            if (mesh_enrollment_state) |*ledger| ledger.revokedEpochFloor() else 0,
+        );
+        for (meshpass_roots) |*root| root.min_revocation_epoch = mesh_enrollment_floor;
 
         const geo_ptr = try allocator.create(geo_services.Service);
         errdefer allocator.destroy(geo_ptr);
@@ -6892,6 +7159,12 @@ pub const LinuxServer = struct {
             .tombstone_ttl_ms = mesh_reclaim_ttl_ms,
         });
         errdefer prepared_replica_store.deinit();
+        // Refuse a replica shape that cannot keep the revocation invariants
+        // (nonzero caps, tombstone TTL covering every OFFER lifetime) before
+        // any authority can be restored into it.
+        try session_replica_revocation.validateRetentionConfig(prepared_replica_store.cfg.retention());
+        var prepared_credential_churn = try session_credential_churn.Budget.init(allocator, session_credential_churn.default_params);
+        errdefer prepared_credential_churn.deinit();
         var group_trust = SessionGroupTrustContext{
             .local = if (config.node_identity) |identity| identity.sign_kp.public_key else null,
             .roots = session_group_roster_keys,
@@ -6941,10 +7214,13 @@ pub const LinuxServer = struct {
             .mesh_trusted_node_keys = mesh_trusted_node_keys,
             .durable_guest_presence = durable_guest_presence,
             .relay_v2_required_nodes = relay_v2_required_nodes,
+            .relay_v2_pressure = relay_v2_pressure,
             .session_group_roster_keys = session_group_roster_keys,
             .relay_v2_activation_state = relay_v2_activation_state,
             .meshpass_roots = meshpass_roots,
             .mesh_admission_token = mesh_admission_token,
+            .mesh_enrollment_ledger = mesh_enrollment_state,
+            .mesh_enrollment_epoch_floor = .init(mesh_enrollment_floor),
             .pool = reactor_pool_mod.ReactorPool(*LinuxServer).init(allocator),
             .world = blk: {
                 var w = world_model.World.init(allocator);
@@ -7028,6 +7304,7 @@ pub const LinuxServer = struct {
                 .max_sessions_per_account = config.session_max_per_account,
             }),
             .session_replica_store = prepared_replica_store,
+            .session_credential_churn = prepared_credential_churn,
             .content_filter = content_filter_mod.ContentFilter.initWithConfig(allocator, config.content_filter_config),
             .media_rooms = media_room.MediaRooms.initConfig(allocator, .{
                 .max_participants = config.media_max_participants,
@@ -8014,10 +8291,17 @@ pub const LinuxServer = struct {
         try self.latency_stats.writePrometheus(self.allocator, &out);
         try self.writeNodeHealthPrometheus(self.allocator, &out);
         try self.writeReactorAcceptPrometheus(self.allocator, &out);
+        try self.writeOutputClassPrometheus(self.allocator, &out);
         try self.peer_health.writePrometheus(self.allocator, &out);
+        try self.writeRoutePreferencePrometheus(self.allocator, &out);
         try self.writeE2eeGroupPrometheus(self.allocator, &out);
+        try self.writeRelayV2BackpressurePrometheus(self.allocator, &out);
+        try self.writeResourceBudgetPrometheus(self.allocator, &out);
+        try self.writeSessionCredentialPrometheus(self.allocator, &out);
         const webpush_dropped: usize = if (self.webpush_worker) |worker| worker.dropped.load(.monotonic) else 0;
         try webpush_mod.appendDroppedSample(&out, self.allocator, webpush_dropped);
+        var offer_retry_metrics: [offer_retry_reuse.RetryReasonStats.max_render_len]u8 = undefined;
+        try out.appendSlice(self.allocator, try self.offer_retry_reason_stats.renderPrometheus(&offer_retry_metrics));
         try self.metrics_snapshot.set(out.items);
     }
 
@@ -8040,6 +8324,110 @@ pub const LinuxServer = struct {
         try writePromGauge(allocator, out, "onyx_mesh_components", "Mesh connected components known to this node", health.mesh_components);
         try writePromGauge(allocator, out, "onyx_mesh_peers_up", "Mesh peers currently established from this node", health.mesh_peers_up);
         try writePromGauge(allocator, out, "onyx_mesh_peers_total", "Mesh peers tracked by this node", health.mesh_peers_total);
+    }
+
+    /// M04 route-preference metrics: per direct peer ranked cost and
+    /// eligibility (bounded by `route_cost.max_ranked_peers`), plus hysteresis
+    /// counters. Copied under the lock; formatting happens outside it.
+    fn writeRoutePreferencePrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        const Row = struct { node: u64, ranked: ?u32 };
+        var rows: [route_cost.max_ranked_peers]Row = undefined;
+        lockSpin(&self.route_rank_mu);
+        const stats = self.route_rank.stats;
+        const tracked = self.route_rank.tracked();
+        for (tracked, rows[0..tracked.len]) |entry, *row| row.* = .{ .node = entry.node, .ranked = entry.ranked };
+        const row_count = tracked.len;
+        self.route_rank_mu.unlock();
+
+        const counters = [_]struct { name: []const u8, help: []const u8, value: u64 }{
+            .{ .name = "onyx_route_rank_changes_total", .help = "Ranked mesh peer cost changes (promotion, demotion, or sustained move beyond the margin)", .value = stats.changes },
+            .{ .name = "onyx_route_rank_demotions_total", .help = "Mesh peers demoted at once because their link became unusable", .value = stats.demotions },
+            .{ .name = "onyx_route_rank_promotions_total", .help = "Mesh peers promoted back to eligible after the hysteresis delay", .value = stats.promotions },
+            .{ .name = "onyx_route_rank_held_total", .help = "Mesh peer cost moves beyond the margin held back by hysteresis", .value = stats.held },
+            .{ .name = "onyx_route_rank_refused_total", .help = "Mesh peers left unranked because the bounded ranking table was full", .value = stats.refused },
+        };
+        for (counters) |counter| {
+            try out.print(allocator, "# HELP {s} {s}\n# TYPE {s} counter\n{s} {d}\n", .{ counter.name, counter.help, counter.name, counter.name, counter.value });
+        }
+        var eligible: usize = 0;
+        for (rows[0..row_count]) |row| {
+            if (row.ranked != null) eligible += 1;
+        }
+        try writePromGauge(allocator, out, "onyx_route_ranked_peers", "Direct mesh peers tracked by measured-cost route preference", row_count);
+        try writePromGauge(allocator, out, "onyx_route_eligible_peers", "Ranked direct mesh peers with a usable measured cost", eligible);
+        if (row_count == 0) return;
+        try out.appendSlice(allocator, "# HELP onyx_route_peer_cost Hysteresis-stable measured cost of a direct mesh peer (absent while ineligible)\n" ++
+            "# TYPE onyx_route_peer_cost gauge\n");
+        for (rows[0..row_count]) |row| {
+            const cost = row.ranked orelse continue;
+            try out.print(allocator, "onyx_route_peer_cost{{node=\"{x:0>16}\"}} {d}\n", .{ row.node, cost });
+        }
+        try out.appendSlice(allocator, "# HELP onyx_route_peer_eligible Whether a ranked direct mesh peer currently has a usable measured cost\n" ++
+            "# TYPE onyx_route_peer_eligible gauge\n");
+        for (rows[0..row_count]) |row| {
+            try out.print(allocator, "onyx_route_peer_eligible{{node=\"{x:0>16}\"}} {d}\n", .{ row.node, @intFromBool(row.ranked != null) });
+        }
+    }
+
+    /// M07 MESSAGE_V2 backpressure: paced resends, per-origin admission sheds
+    /// and stalled peers. One snapshot under `relay_v2_replay_mu`; rendering
+    /// happens after release.
+    fn writeRelayV2BackpressurePrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        lockSpin(&self.relay_v2_replay_mu);
+        const gate = self.relay_v2_gate;
+        const rows = self.relay_v2_event_log.len();
+        const pacing: struct { emitted: u64 = 0, suppressed: u64 = 0, window_full: u64 = 0, stalled: usize = 0 } =
+            if (self.relay_v2_pressure) |*p| .{
+                .emitted = p.resend_emitted,
+                .suppressed = p.resend_suppressed,
+                .window_full = p.window_full_deferred,
+                .stalled = p.stalledPeerCount(),
+            } else .{};
+        self.relay_v2_replay_mu.unlock();
+        const counters = [_]struct { name: []const u8, help: []const u8, value: u64 }{
+            .{ .name = "onyx_relay_v2_resend_total", .help = "MESSAGE_V2 retained heads re-sent after their paced RTO", .value = pacing.emitted },
+            .{ .name = "onyx_relay_v2_resend_suppressed_total", .help = "MESSAGE_V2 re-sends held back because the head's RTO had not elapsed", .value = pacing.suppressed },
+            .{ .name = "onyx_relay_v2_resend_window_full_total", .help = "MESSAGE_V2 heads deferred because the peer's in-flight window was full", .value = pacing.window_full },
+            .{ .name = "onyx_relay_v2_local_shed_total", .help = "Locally authored MESSAGE_V2 events refused because this origin's retained share was spent", .value = gate.local_shed },
+            .{ .name = "onyx_relay_v2_transit_shed_total", .help = "Transit MESSAGE_V2 events left unacknowledged because their origin's retained share was spent", .value = gate.transit_shed },
+            .{ .name = "onyx_relay_v2_transit_capacity_withheld_total", .help = "Transit MESSAGE_V2 events left unacknowledged after a store capacity failure", .value = gate.transit_capacity_withheld },
+        };
+        for (counters) |counter| {
+            try out.print(allocator, "# HELP {s} {s}\n# TYPE {s} counter\n{s} {d}\n", .{ counter.name, counter.help, counter.name, counter.name, counter.value });
+        }
+        try writePromGauge(allocator, out, "onyx_relay_v2_stalled_peers", "Direct peers whose MESSAGE_V2 head reached the resend backoff cap", pacing.stalled);
+        try writePromGauge(allocator, out, "onyx_relay_v2_retained_rows", "MESSAGE_V2 events retained until every required node confirms", rows);
+        try writePromGauge(allocator, out, "onyx_relay_v2_origin_rows_peak", "Peak retained MESSAGE_V2 rows of one origin seen at admission", gate.peak_origin.rows);
+        try writePromGauge(allocator, out, "onyx_relay_v2_deferred", "Inbound MESSAGE_V2 events waiting for authority before admission", self.relay_v2_deferred_published.load(.monotonic));
+        try writePromGauge(allocator, out, "onyx_relay_v2_deferred_capacity", "Inbound MESSAGE_V2 deferred queue bound; a full queue closes the feeding link", relay_v2_deferred_capacity);
+    }
+
+    /// W09 `[resources]` admission. The refusal counter is process-local and
+    /// restarts at zero after a Helix upgrade or restart (not carried; it is a
+    /// diagnostic, not state). Budget gauges are the boot values in force
+    /// (REHASH never changes them); 0 means `[resources]` admission is off.
+    fn writeResourceBudgetPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try out.print(allocator, "# HELP onyx_resource_budget_refusals_total Client accepts refused by the [resources] memory budget share of their shard\n" ++
+            "# TYPE onyx_resource_budget_refusals_total counter\nonyx_resource_budget_refusals_total {d}\n", .{self.resource_budget_refusals.load(.monotonic)});
+        const budget = self.config.resource_memory_budget_bytes;
+        try writePromGauge(allocator, out, "onyx_resource_memory_budget_bytes", "Configured [resources] memory budget for client connections (0 = admission off)", budget);
+        try writePromGauge(allocator, out, "onyx_resource_per_client_bytes", "Committed bytes per client used by [resources] admission (0 = admission off)", if (budget == 0) 0 else self.config.resource_per_client_bytes);
+    }
+
+    /// Publish this owner's output class counters for the metrics scrape.
+    fn publishOutputClassCounters(self: *LinuxServer) void {
+        const reactor = self.rx();
+        const flat: *const [output_class_counter_slots]u64 = @ptrCast(&reactor.output_class_turn.counters.values);
+        for (&reactor.output_class_published, flat) |*published, value| published.store(value, .monotonic);
+    }
+
+    fn writeOutputClassPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        var merged: output_class_budget.Counters = .{};
+        const flat: *[output_class_counter_slots]u64 = @ptrCast(&merged.values);
+        for (self.reactors) |*reactor| {
+            for (flat, &reactor.output_class_published) |*total, *published| total.* +|= published.load(.monotonic);
+        }
+        try merged.writePrometheus(allocator, out);
     }
 
     fn writeReactorAcceptPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
@@ -8214,6 +8602,26 @@ pub const LinuxServer = struct {
     /// opaque payloads, exact relay IDs, and origin keys; none of those cross
     /// this operational boundary. One mutex snapshot keeps the three gauges
     /// mutually coherent for a cold-restart drain decision.
+    /// T09 churn counters and T10 replica retention bounds. The Store is read
+    /// under the same world write lock as every other metrics-refresh read.
+    fn writeSessionCredentialPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        lockSpin(&self.session_credential_churn_mu);
+        const churn = self.session_credential_churn.snapshot();
+        self.session_credential_churn_mu.unlock();
+        var churn_buf: [2048]u8 = undefined;
+        try out.appendSlice(allocator, try session_credential_churn.renderPrometheus(&churn_buf, churn));
+        const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+        const report = self.session_replica_store.retentionReport(now_wall);
+        try writePromGauge(allocator, out, "onyx_session_replica_entries", "Live session replica entries retained", report.entries);
+        try writePromGauge(allocator, out, "onyx_session_replica_max_entries", "Configured live session replica entry cap", report.max_entries);
+        try writePromGauge(allocator, out, "onyx_session_replica_tombstones", "Session replica revocation tombstones retained", report.tombstones);
+        try writePromGauge(allocator, out, "onyx_session_replica_max_tombstones", "Configured soft cap for unknown-token revocation tombstones", report.max_tombstones);
+        try writePromGauge(allocator, out, "onyx_session_replica_soft_capped_tombstones", "Tombstones counted against the unknown-token soft cap", report.soft_capped_tombstones);
+        try writePromGauge(allocator, out, "onyx_session_replica_exported_tombstones", "Tombstones still exportable to peers by anti-entropy", report.exported_tombstones);
+        try writePromGauge(allocator, out, "onyx_session_replica_local_only_tombstones", "Tombstones retained locally after their signed REVOKE expired", report.local_only_tombstones);
+        try writePromGauge(allocator, out, "onyx_session_replica_worst_case_retained_bytes", "Worst-case bytes of signed replica wires under the combined entry and tombstone caps", report.worst_case_bytes);
+    }
+
     fn writeE2eeGroupPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         const state = self.e2eeGroupOperationalState();
         try writePromGauge(allocator, out, "onyx_e2ee_group_local_authoring_enabled", "Whether this node accepts new locally authored E2EEGROUP controls (1=yes, 0=quiesced)", @as(u8, if (state.authoring_enabled) 1 else 0));
@@ -9748,6 +10156,7 @@ pub const LinuxServer = struct {
         self.relay_v2_outbox.deinit();
         self.relay_v2_event_log.deinit();
         self.relay_v2_replay_guard.deinit();
+        if (self.relay_v2_pressure) |*pacing| pacing.deinit();
         self.e2ee_group_mesh_authority.deinit();
         // Every physical recipient fd above is now closed. Accepted ADS1
         // obligations can be retired only at this terminal-shutdown boundary.
@@ -9806,6 +10215,14 @@ pub const LinuxServer = struct {
         if (self.conn_throttle) |*t| t.deinit();
         self.login_throttle.deinit();
         self.oper_audit.deinit();
+        if (self.moderation_ledger) |ledger| {
+            ledger.deinit();
+            self.allocator.destroy(ledger);
+        }
+        if (self.moderation_list_ledger) |ledger| {
+            ledger.deinit();
+            self.allocator.destroy(ledger);
+        }
         self.mesh_clones.deinit();
         self.nick_delay.deinit();
         self.reputation.deinit();
@@ -9846,6 +10263,8 @@ pub const LinuxServer = struct {
         if (self.pending_migrations) |*pm| pm.deinit();
         self.session_offer_signature_memo.deinit();
         self.session_replica_store.deinit();
+        if (self.session_attachment_revoke_state) |state| self.allocator.destroy(state);
+        self.session_credential_churn.deinit();
         self.session_replica_routes.deinit(self.allocator);
         self.session_replica_identities.deinit(self.allocator);
         self.session_replica_nicks.deinit(self.allocator);
@@ -9878,6 +10297,10 @@ pub const LinuxServer = struct {
         self.allocator.free(self.reload_bindings);
         if (self.reload_class_registry) |*r| r.deinit();
         if (self.reload_parsed) |*p| p.deinit(self.allocator);
+        if (self.applied_config_text) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
         if (self.reload_boot_policy) |*policy| policy.deinit();
         // Free the server-owned TLS reload generations, if any (the current plus
         // the one-cycle-retained previous generation). The boot cert generation is
@@ -9928,6 +10351,7 @@ pub const LinuxServer = struct {
         if (self.relay_v2_required_nodes.len != 0) self.allocator.free(self.relay_v2_required_nodes);
         if (self.meshpass_roots.len != 0) self.allocator.free(self.meshpass_roots);
         if (self.mesh_admission_token.len != 0) self.allocator.free(self.mesh_admission_token);
+        if (self.mesh_enrollment_ledger) |*ledger| ledger.deinit();
         if (self.fabric) |*f| f.deinit();
         self.* = undefined;
     }
@@ -10284,6 +10708,24 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    /// Delivered plaintext to a client SendQ is the chat output class. Mesh
+    /// links, labeled-response captures, retained output-barrier lanes,
+    /// preframed media and close-after notices keep their own policies.
+    fn chatClassBudgeted(conn: *const ConnState, len: usize, exempt: bool) bool {
+        return !exempt and len != 0 and conn.s2s == null and conn.s2s_secured == null and
+            conn.reply_capture == null and conn.output_barrier_server == null;
+    }
+
+    /// Owner-reactor chat ceiling check. A refusal is counted here and keeps
+    /// the existing poison policy at the caller.
+    fn admitChatOutput(self: *LinuxServer, conn: *ConnState, len: usize) bool {
+        const turn = &self.rx().output_class_turn;
+        const decision = turn.decide(self.output_class_policy, .chat, sendq.backlog(conn), conn.sendq_cap, len);
+        if (decision == .admit) return true;
+        turn.record(.chat, decision);
+        return false;
+    }
+
     fn copyFabricRecord(self: *LinuxServer, id: client_model.ClientId, bytes: []const u8, preframed: bool) bool {
         const conn = self.connFor(id) orelse return true; // exact-generation terminal receipt
         // Source poison terminally refuses this logical record even while an
@@ -10292,6 +10734,11 @@ pub const LinuxServer = struct {
         if (self.abortDeliveryGapFor(id, conn)) return true;
         if (conn.fabric_terminal_refused) return true;
         if (conn.closing) return false;
+        const chat_class = chatClassBudgeted(conn, bytes.len, preframed);
+        if (chat_class and !self.admitChatOutput(conn, bytes.len)) {
+            self.poisonOwnedDelivery(conn);
+            return true;
+        }
         const copied = if (preframed) appendSecuredToConn(conn, bytes) else appendToConn(conn, bytes);
         copied catch |err| {
             if (conn.output_barrier_server != null and (err == error.OutOfMemory or err == error.OutputBarrierPending)) return false;
@@ -10300,6 +10747,7 @@ pub const LinuxServer = struct {
             self.poisonOwnedDelivery(conn);
             return true;
         };
+        if (chat_class) self.rx().output_class_turn.commit(.chat, bytes.len);
         // Bytes already have SendQ/ADS custody. Never append them twice merely
         // because the separate transport submission encounters a fatal error.
         self.armSendIfNeeded(conn) catch self.poisonOwnedDelivery(conn);
@@ -10588,6 +11036,13 @@ pub const LinuxServer = struct {
     /// Store expiry. If the key snapshot or any fail-closed projection cannot
     /// complete, retain the expired Store objects and retry on the next timer
     /// turn; this prevents the last retry key from disappearing under OOM.
+    /// Reactor-0 maintenance: drop elapsed per-account churn windows.
+    fn pruneSessionCredentialChurn(self: *LinuxServer) void {
+        lockSpin(&self.session_credential_churn_mu);
+        defer self.session_credential_churn_mu.unlock();
+        self.session_credential_churn.prune(self.nowMs());
+    }
+
     fn sweepSessionReplicaStore(self: *LinuxServer) void {
         const now_wall: i64 = @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
         // An expired local OFFER may be the only durable retry journal left
@@ -10632,6 +11087,9 @@ pub const LinuxServer = struct {
         if (swept.entries != 0 or swept.attachment_leases != 0 or swept.routes != 0 or
             swept.tombstones != 0 or swept.quarantines != 0)
             self.session_replica_store_generation +%= 1;
+        // T03: an expired own entry no longer backs its OFFER retry stamp.
+        if (swept.entries != 0 or swept.quarantines != 0)
+            _ = self.offer_retry_stamps.retainIf(self, offerRetryStampStillBacked);
         // Marker expiry can reveal an otherwise-live entry, so reconcile once
         // more against the post-sweep Store. A live authority remains available
         // to the ordinary retry cursor if this second pass hits allocation
@@ -10736,6 +11194,7 @@ pub const LinuxServer = struct {
         // The journal sweep is authoritative recovery for a missed control
         // mailbox hint and for a requester/owner that vanished before cleanup.
         self.sweepSessionDropTransactions();
+        if (self.isMaintenanceReactor()) self.enforceSessionAttachmentDenials();
         // A delivery gap is a stream-integrity failure, not ordinary timeout
         // work. Disconnect it before any timer-driven projection or retry can
         // enqueue a later event to that generation.
@@ -10783,6 +11242,8 @@ pub const LinuxServer = struct {
         self.retryLocalGuestCloses();
         self.retryFailedSessionHandoffs();
         if (comptime builtin.os.tag == .windows) self.retryWindowsClosingIo();
+        self.observeWorkloadQuota();
+        self.publishOutputClassCounters();
         self.sweepTimeouts();
         self.sweepDeferredSessionAutojoins();
         // Local channel projection is owner-reactor scoped: every shard applies
@@ -10809,6 +11270,7 @@ pub const LinuxServer = struct {
             // bounds what a signed peer can pin in memory. Reactor-0-gated
             // shared-state maintenance like the sweeps above.
             if (self.pending_migrations) |*pm| _ = pm.sweep(self.nowMs(), mesh_reclaim_ttl_ms);
+            self.pruneSessionCredentialChurn();
             self.sweepSessionReplicaStore();
             self.retryDeferredRelayV2();
             self.retryRelayV2Outbox();
@@ -10831,6 +11293,9 @@ pub const LinuxServer = struct {
         // established peer. Reactor-0-only (S2S links live here); cadence is short
         // enough for a live status page but well below CRDT anti-entropy load.
         if (self.isMaintenanceReactor()) self.maybeProbeMeshPeerRtt();
+        // M04: fold the same measurements into the hysteresis-stable peer
+        // ranking that orders MESSAGE_V2 emission. Reactor 0 owns the links.
+        if (self.isMaintenanceReactor()) self.refreshRouteRanking();
         // Publish the distinct-peer count for cross-shard LUSERS reads. Reactor 0
         // owns the peer links, so it is the only reactor that can compute this;
         // other shards read the published atomic. Converges within one tick of a
@@ -10841,8 +11306,9 @@ pub const LinuxServer = struct {
         // reconnect race converges within the cadence instead of staying out of
         // sync forever. Reactor-0-GATED: S2S peer links live only on reactor 0, so
         // both `resyncMeshStateToPeers` and `pruneStaleMeshMembers` walk reactor 0's
-        // slots and do nothing on any other reactor. The `last_membership_resync_ms`
-        // guard is shared server state, so it MUST only be advanced by the reactor
+        // slots and do nothing on any other reactor. The `anti_entropy_wake_ms` and
+        // `last_membership_resync_ms` guards are shared server state, so they MUST
+        // only be advanced by the reactor
         // that actually performs the re-burst: on a multi-reactor node, letting a
         // sibling reactor consume the guard (while doing no work, because it holds no
         // peer links) starves reactor 0's real re-burst below the intended cadence.
@@ -10886,9 +11352,17 @@ pub const LinuxServer = struct {
                 self.last_session_attachment_lease_refresh_ms = now;
                 self.refreshAttachedSessionReplicaLeases();
             }
+            // M02: the re-burst runs at the scheduler's planned wake. A wake
+            // further ahead than one ceiling can only follow a clock step
+            // back; re-plan immediately rather than starve every link.
+            const now_u = self.nowU64();
+            if (now_u >= self.anti_entropy_wake_ms or
+                self.anti_entropy_wake_ms - now_u > mesh_anti_entropy_bounds.max_interval_ms)
+            {
+                self.anti_entropy_wake_ms = self.resyncMeshStateToPeers(now_u);
+            }
             if (now - self.last_membership_resync_ms >= membership_resync_interval_ms) {
                 self.last_membership_resync_ms = now;
-                self.resyncMeshStateToPeers();
                 // Anti-entropy is additive (the re-burst only re-affirms PRESENT
                 // members), so a remote member whose PART/QUIT was never propagated
                 // would linger forever. Reap such stale projections from each peer's
@@ -11001,63 +11475,180 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// Re-send local mesh state to every established S2S peer. Membership is
-    /// HLC-keyed so re-affirming present members is idempotent; this fills gaps
-    /// (a member the peer never learned about). Mirrors the one-shot
-    /// link-establish burst (`sendMembershipBurstTo`) on a periodic cadence.
-    fn resyncMeshStateToPeers(self: *LinuxServer) void {
-        for (self.rx().clients.slots.items) |*slot| {
-            if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
-            const is_peer = slot.value.s2s_secured != null or slot.value.s2s != null;
-            if (!is_peer) continue;
-            const established = if (slot.value.s2s_secured) |l|
-                l.established()
-            else if (slot.value.s2s) |l|
-                l.established()
-            else
-                false;
-            if (!established) continue;
+    /// M03: read this connection's peer-driver inbound-divergence counter
+    /// (`s2s_peer.S2sPeer.membership_divergence_applied`), looking through a
+    /// secured link's lazily-created inner driver the same way
+    /// `carryRemoteMembershipPublicationContinuity` does. Null before a
+    /// secured link's inner driver exists (pre-AKE) or for a connection that
+    /// is not an S2S peer link at all.
+    fn connMembershipDivergenceApplied(conn: *ConnState) ?u64 {
+        if (conn.s2s_secured) |link| {
+            return if (link.inner) |inner| inner.peer.membership_divergence_applied else null;
+        }
+        if (conn.s2s) |link| return link.peer.membership_divergence_applied;
+        return null;
+    }
+
+    /// One established S2S link that the periodic anti-entropy round may
+    /// re-burst. Shared by planning, admission and wake computation so all
+    /// three see the same peer set.
+    fn meshAntiEntropyCandidate(conn: *const ConnState) bool {
+        if (!conn.isActiveMeshPeer()) return false;
+        if (conn.s2s_secured) |l| return l.established();
+        if (conn.s2s) |l| return l.established();
+        return false;
+    }
+
+    /// Scheduler input for one link. `peer_id` is the reactor-0 slot index, so
+    /// `planRound`'s ascending-id output is also slot order. The burst stamp is
+    /// per connection (0 = never bursted); the quiet streak and backlog come
+    /// from the peer's health entry (backlog falls back to this link's own queue
+    /// when no entry exists yet).
+    fn meshAntiEntropyInput(self: *LinuxServer, slot_index: usize, conn: *const ConnState) anti_entropy_schedule.PeerInput {
+        const health = if (establishedPeerName(conn)) |name| self.peer_health.get(name) else null;
+        return .{
+            .peer_id = slot_index,
+            .state = .{
+                .last_burst_ms = if (conn.last_periodic_burst_ms == 0) null else conn.last_periodic_burst_ms,
+                .quiet_streak = if (health) |h| h.anti_entropy_quiet_repairs else 0,
+                .divergence_mark = conn.last_membership_divergence_applied,
+            },
+            .send_backlog_bytes = if (health) |h| h.send_backlog_bytes else connSendBacklog(conn),
+        };
+    }
+
+    /// M03 divergence signal: a real inbound membership gap fill on THIS
+    /// connection since the last observation (the peer's burst changed our
+    /// RouteTable projection rather than re-affirming converged rows) resets
+    /// the peer's quiet streak, so the next repair falls back to the minimum
+    /// interval instead of backing off. Baselined per connection (like
+    /// `last_periodic_burst_ms`) so a second link to the same peer name can
+    /// never suppress this reset for the first.
+    fn observeMeshAntiEntropyDivergence(self: *LinuxServer, conn: *ConnState) void {
+        const divergence_now = connMembershipDivergenceApplied(conn) orelse return;
+        if (divergence_now == conn.last_membership_divergence_applied) return;
+        conn.last_membership_divergence_applied = divergence_now;
+        const name = establishedPeerName(conn) orelse return;
+        if (self.peer_health.get(name)) |h| h.anti_entropy_quiet_repairs = 0;
+    }
+
+    /// Plan one M02 round over every candidate link, in `max_round_peers`
+    /// slices, writing admitted slot indices (ascending) into `admitted` and
+    /// returning how many. The burst budget is shared across slices. A slice
+    /// whose decided count falls short of its input length resumes at the
+    /// first undecided peer instead of silently dropping it. Kept out of line
+    /// so its fixed scratch is not live across the burst sends.
+    noinline fn planMeshAntiEntropyRound(
+        self: *LinuxServer,
+        now_u: u64,
+        load_permille: u32,
+        admitted: []usize,
+    ) usize {
+        var inputs: [anti_entropy_schedule.max_round_peers]anti_entropy_schedule.PeerInput = undefined;
+        var decisions: [anti_entropy_schedule.max_round_peers]anti_entropy_schedule.Decision = undefined;
+        const slots = self.rx().clients.slots.items;
+        var admitted_len: usize = 0;
+        var cursor: usize = 0;
+        while (cursor < slots.len and admitted_len < admitted.len) {
+            var len: usize = 0;
+            while (cursor < slots.len and len < inputs.len) : (cursor += 1) {
+                const slot = &slots[cursor];
+                if (!slot.occupied or !meshAntiEntropyCandidate(&slot.value)) continue;
+                self.observeMeshAntiEntropyDivergence(&slot.value);
+                inputs[len] = self.meshAntiEntropyInput(cursor, &slot.value);
+                len += 1;
+            }
+            if (len == 0) break;
+            var bounds = mesh_anti_entropy_bounds;
+            bounds.max_bursts_per_round = admitted.len - admitted_len;
+            const decided = anti_entropy_schedule.planRound(inputs[0..len], now_u, bounds, load_permille, decisions[0..len]);
+            for (decisions[0..decided]) |d| {
+                if (!d.admitted) continue;
+                admitted[admitted_len] = @intCast(d.peer_id);
+                admitted_len += 1;
+            }
+            if (decided == 0) break;
+            if (decided < len) cursor = @intCast(inputs[decided].peer_id);
+        }
+        return admitted_len;
+    }
+
+    /// Next round time: the earliest any candidate link can be admitted under
+    /// the same bounds, backlog and load as `planRound`, clamped by
+    /// `nextWakeupMs` to `[now + tick, now + max_interval]`. With no links the
+    /// ceiling applies; a link established meanwhile already received its
+    /// one-shot establishment burst.
+    noinline fn nextMeshAntiEntropyWakeMs(self: *LinuxServer, now_u: u64, load_permille: u32) u64 {
+        var inputs: [anti_entropy_schedule.max_round_peers]anti_entropy_schedule.PeerInput = undefined;
+        const slots = self.rx().clients.slots.items;
+        var wake = anti_entropy_schedule.nextWakeupMs(&.{}, now_u, mesh_anti_entropy_bounds, load_permille);
+        var cursor: usize = 0;
+        while (cursor < slots.len) {
+            var len: usize = 0;
+            while (cursor < slots.len and len < inputs.len) : (cursor += 1) {
+                const slot = &slots[cursor];
+                if (!slot.occupied or !meshAntiEntropyCandidate(&slot.value)) continue;
+                inputs[len] = self.meshAntiEntropyInput(cursor, &slot.value);
+                len += 1;
+            }
+            if (len == 0) break;
+            wake = @min(wake, anti_entropy_schedule.nextWakeupMs(inputs[0..len], now_u, mesh_anti_entropy_bounds, load_permille));
+        }
+        return wake;
+    }
+
+    /// Re-send local mesh state to established S2S peers on the M02 adaptive
+    /// cadence and return the next round time. Membership is HLC-keyed so
+    /// re-affirming present members is idempotent; this fills gaps (a member
+    /// the peer never learned about). Mirrors the one-shot link-establish burst
+    /// (`sendMeshStateBurstTo`); establishment, RESYNC and repair bursts use
+    /// other callers and are never gated here.
+    ///
+    /// Admission is per connection: two links to one peer name share a health
+    /// entry, so a name-keyed gate would let the first link's burst suppress the
+    /// second. A never-bursted link is due at once; a quiet link backs off to the
+    /// 60s ceiling; one silent past the ceiling bypasses the hard-backlog gate.
+    /// Admission stamps `last_periodic_burst_ms` even when the burst stages
+    /// incomplete under queue pressure, so the staged remainder resumes at the
+    /// next due time instead of re-encoding every maintenance tick; only a
+    /// completed burst marks the peer synced and grows its quiet streak.
+    fn resyncMeshStateToPeers(self: *LinuxServer, now_u: u64) u64 {
+        const load = self.peer_health.backlogLoadPermille(mesh_anti_entropy_bounds.backlog_soft_bytes);
+        var admitted: [mesh_anti_entropy_bounds.max_bursts_per_round]usize = undefined;
+        const admitted_len = self.planMeshAntiEntropyRound(now_u, load, &admitted);
+        for (admitted[0..admitted_len]) |slot_index| {
+            // Re-resolve by index: a burst never frees or allocates reactor-0
+            // slots, but re-checking keeps a stale plan from touching a reused
+            // or demoted slot.
+            const slots = self.rx().clients.slots.items;
+            if (slot_index >= slots.len) continue;
+            const slot = &slots[slot_index];
+            if (!slot.occupied or !meshAntiEntropyCandidate(&slot.value)) continue;
+            const conn = &slot.value;
+            conn.last_periodic_burst_ms = now_u;
             // A long retained-object replay can span several maintenance turns.
-            // Do not let the periodic anti-entropy cadence bypass the same
+            // Do not let the periodic cadence bypass the same
             // authority-before-membership ordering as establishment/RESYNC;
             // coalesce it into the pending secured burst instead.
-            if (slot.value.s2s_secured != null and slot.value.session_replica_replay_pending) {
-                slot.value.session_replica_resync_burst_pending = true;
+            if (conn.s2s_secured != null and conn.session_replica_replay_pending) {
+                conn.session_replica_resync_burst_pending = true;
                 continue;
             }
-            const peer_name = establishedPeerName(&slot.value);
-            // M02 adaptive cadence: each completed periodic round grows
-            // the peer's quiet streak, backing its interval off toward
-            // the leaf's 60s bound (no divergence signal is wired yet, so
-            // the streak is not reset by divergence); a connection silent
-            // past that bound is always repaired. Establishment/RESYNC
-            // bursts use other callers and are never gated here.
-            // Backoff is per connection: two links to one peer name share
-            // a health entry, so a name-keyed gate would let the first
-            // link's burst suppress the second link in the same round.
-            // A connection's first periodic burst is never gated.
-            if (slot.value.last_periodic_burst_ms != 0) {
-                if (peer_name) |name| {
-                    if (self.peer_health.get(name)) |h| {
-                        if (h.anti_entropy_quiet_repairs > 0) {
-                            const now_u = self.nowU64();
-                            const stale = now_u -| slot.value.last_periodic_burst_ms >= anti_entropy_mod.max_repair_interval_ms;
-                            if (!stale and now_u -| slot.value.last_periodic_burst_ms < anti_entropy_mod.nextRepairIntervalMs(0, h.anti_entropy_quiet_repairs)) continue;
-                        }
-                    }
-                }
-            }
+            // M03: a digest-capable link offers digests first; the burst (of
+            // only what the peer needs) follows its DIGEST_NEED.
+            if (self.offerMeshDigestRound(conn)) continue;
+            const peer_name = establishedPeerName(conn);
             if (peer_name) |name| {
                 if (self.peer_health.get(name)) |h| h.value_sync = .syncing;
             }
-            if (self.sendMeshStateBurstTo(&slot.value)) {
-                slot.value.last_periodic_burst_ms = self.nowU64();
+            if (self.sendMeshStateBurstTo(conn)) {
                 if (peer_name) |name| {
                     self.notePeerAntiEntropy(name);
                     if (self.peer_health.get(name)) |h| h.anti_entropy_quiet_repairs +|= 1;
                 }
             }
         }
+        return self.nextMeshAntiEntropyWakeMs(now_u, load);
     }
 
     /// Reap stale (never-retracted) remote member projections from every
@@ -12244,6 +12835,9 @@ pub const LinuxServer = struct {
                 if (self.s2sPeerLivenessExpired(c, now)) {
                     self.logMeshEvent(.peer_down, establishedPeerName(c) orelse "pending-peer", "mesh liveness probe timed out");
                     self.closeConn(c.token, "Mesh liveness timeout") catch {};
+                } else if (self.s2sInboundHandshakeExpired(c, now)) {
+                    self.traceLog(.info, .s2s, "closed inbound S2S handshake (pre-AKE deadline)");
+                    self.closeConn(c.token, "Mesh handshake timeout") catch {};
                 }
                 continue;
             }
@@ -12365,6 +12959,7 @@ pub const LinuxServer = struct {
         // already bound its own shard before looping (so we never clobber it);
         // single-reactor callers and direct-test invocations bind shard 0 here.
         if (self.currentOwnedReactor() == null) current_reactor = &self.reactors[0];
+        self.rx().output_class_turn.beginTurn();
         // Control SQEs always win the turn. Helix activation and mesh connects
         // are deliberately staged below them so a full inherited population can
         // neither wedge accept/wake/timer nor drop quiet clients on SQ-full.
@@ -12643,6 +13238,8 @@ pub const LinuxServer = struct {
         // `sealShardClients` clears CLOEXEC incrementally. Always unwind the
         // exact accrued prefix, including failures before capture publication.
         errdefer restoreCloexec(carried_fds[0..carried_fd_count]);
+        const seal_inventory = try self.upgradeSealInventory();
+        defer self.allocator.free(seal_inventory);
         var counts = SealCounts{ .physical_relation_at_complete_cut = true };
         for (self.reactors) |*reactor|
             self.sealShardClients(reactor, &pieces, &blobs, carried_fds, &carried_fd_count, &counts);
@@ -12653,6 +13250,9 @@ pub const LinuxServer = struct {
             counts.clients != counts.clients_expected or
             carried_fd_count > TestLiveUpgradeCapture.max_state_fds)
             return error.SessionReplicaConverging;
+        // M10: same seal-time reconcile as `performUpgrade`, so every live
+        // capture test proves a successful seal always reconciles.
+        try self.reconcileUpgradeSeal(seal_inventory, pieces.items, carried_fd_count);
 
         var prepared = try helix_live.prepare(self.allocator, .{
             .epoch = @intCast(@max(0, self.nowMs())),
@@ -13595,6 +14195,19 @@ pub const LinuxServer = struct {
             closeFd(fd);
             return;
         }
+        // M12: new client accepts stop short of the recovery reserve.
+        if (!is_s2s and self.rx().clients.len() >= self.clientAdmissionSlotCap()) {
+            closeFd(fd);
+            return;
+        }
+        // W09 [resources].memory_budget_bytes: each shard admits new client
+        // accepts within an equal share of the budget at the per-client
+        // commitment. Mesh links and Helix-adopted attachments are exempt.
+        if (!is_s2s and !self.admitClientByMemoryBudget()) {
+            _ = self.resource_budget_refusals.fetchAdd(1, .monotonic);
+            closeFd(fd);
+            return;
+        }
 
         // [mesh].require_secured: refuse plaintext S2S peers. A plaintext link is
         // only ever stood up when secured S2S is unavailable, so a require_secured
@@ -13605,6 +14218,20 @@ pub const LinuxServer = struct {
             closeFd(fd);
             return;
         }
+        // An inbound S2S handshake is mesh-recovery work. Its node identity
+        // is unknown before the AKE, so the ticket is keyed by the kernel
+        // source address: idle sockets from one source exhaust only that
+        // source's per-peer units, never every other peer's inbound slot.
+        // Only an unreadable address falls back to the shared unidentified key.
+        const s2s_ticket: ?workload_quota_mod.Ticket = if (is_s2s)
+            self.tryWorkloadTicket(.mesh_recovery, .slot, workloadAddrPeerKey(socketPeerAddr(fd))) catch {
+                self.traceLog(.info, .s2s, "refused inbound S2S handshake (mesh recovery quota)");
+                closeFd(fd);
+                return;
+            }
+        else
+            null;
+        errdefer self.releaseWorkloadTicketValue(s2s_ticket);
 
         const id = try self.rx().clients.alloc(ConnState.init(fd));
         _ = self.rx().accepted_count.fetchAdd(1, .monotonic);
@@ -13612,6 +14239,7 @@ pub const LinuxServer = struct {
         // an occupied slot (which deinit would then try to tear down).
         errdefer _ = self.rx().clients.free(id);
         const conn = self.rx().clients.get(id).?;
+        conn.workload_ticket = s2s_ticket;
         conn.diagnostics_owner = &self.diagnostics;
         conn.diagnostics_shard = id.shard;
         conn.overflow_allocator = self.allocator; // backs the SendQ overflow heap
@@ -13744,26 +14372,31 @@ pub const LinuxServer = struct {
     /// users never see the raw address. Best-effort: any failure leaves the host
     /// fields empty and the prefix path falls back to the default host.
     fn captureClientHost(self: *LinuxServer, conn: *ConnState) void {
+        const addr = socketPeerAddr(conn.fd) orelse return;
+        self.applyAcceptedAddress(conn, addr);
+    }
+
+    /// Kernel peer address of an accepted socket, IPv4-mapped IPv6 unwrapped
+    /// to IPv4. Null when the address cannot be read.
+    fn socketPeerAddr(fd: linux.fd_t) ?dns.Address {
         if (comptime builtin.os.tag == .windows) {
-            const peer = io_backend.socketPeerAddress(conn.fd) catch return;
-            const addr: dns.Address = switch (peer) {
+            const peer = io_backend.socketPeerAddress(fd) catch return null;
+            return switch (peer) {
                 .ipv4 => |bytes| .{ .ipv4 = bytes },
                 .ipv6 => |bytes| if (isV4Mapped(bytes))
                     .{ .ipv4 = bytes[12..16].* }
                 else
                     .{ .ipv6 = bytes },
             };
-            self.applyAcceptedAddress(conn, addr);
-            return;
         }
         var storage: posix.sockaddr.storage = undefined;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         if (comptime builtin.os.tag == .linux) {
-            const rc = linux.getpeername(conn.fd, @ptrCast(&storage), &len);
-            if (posix.errno(rc) != .SUCCESS) return;
-        } else os_runtime.getpeername(conn.fd, &storage, &len) catch return;
+            const rc = linux.getpeername(fd, @ptrCast(&storage), &len);
+            if (posix.errno(rc) != .SUCCESS) return null;
+        } else os_runtime.getpeername(fd, &storage, &len) catch return null;
         const sa: *const posix.sockaddr = @ptrCast(@alignCast(&storage));
-        const addr: dns.Address = switch (sa.family) {
+        return switch (sa.family) {
             posix.AF.INET => blk: {
                 const in: *const posix.sockaddr.in = @ptrCast(@alignCast(&storage));
                 const b: [4]u8 = @bitCast(in.addr);
@@ -13781,9 +14414,8 @@ pub const LinuxServer = struct {
                 }
                 break :blk .{ .ipv6 = in6.addr };
             },
-            else => return,
+            else => null,
         };
-        self.applyAcceptedAddress(conn, addr);
     }
 
     /// Apply an already-authenticated client address (kernel peer or trusted
@@ -14286,7 +14918,7 @@ pub const LinuxServer = struct {
                 }
             }
         }
-        if (!refuse and self.connectionThrottleRefuses(conn)) refuse = true;
+        if (!refuse and self.sourceThenWorkloadAdmissionRefuses(conn)) refuse = true;
         if (!refuse) {
             if (conn.peer_addr) |addr| {
                 if (self.clone_limit.register(addr)) {
@@ -14319,6 +14951,16 @@ pub const LinuxServer = struct {
         closeFd(conn.fd);
         _ = self.rx().clients.free(id);
         return true;
+    }
+
+    /// Admission gates for one accepted client, per-source first. The
+    /// per-IP connection throttle refuses a source's excess connects on that
+    /// source's own budget before a client-admission ticket is taken, so one
+    /// flooding address never debits the shared per-shard admission GCRA that
+    /// every other source relies on. True refuses the connection.
+    fn sourceThenWorkloadAdmissionRefuses(self: *LinuxServer, conn: *ConnState) bool {
+        if (self.connectionThrottleRefuses(conn)) return true;
+        return self.workloadAdmissionRefuses(conn);
     }
 
     /// Reserve the connection-rate slot for one accepted client. Returns true
@@ -14511,7 +15153,7 @@ pub const LinuxServer = struct {
                 }
             }
         }
-        if (self.connectionThrottleRefuses(conn)) {
+        if (self.sourceThenWorkloadAdmissionRefuses(conn)) {
             emitServerLine(conn, "ERROR :Connection rate exceeded; try again later");
             conn.close_reason = "Connection throttle";
             conn.closing = true;
@@ -14580,6 +15222,15 @@ pub const LinuxServer = struct {
     const s2s_features: u128 = 0b1;
 
     /// True when PQ-secured S2S is configured (node identity + a CSPRNG io).
+    /// W09: may this shard admit one more client under its equal share of
+    /// `[resources].memory_budget_bytes`? Unset budget admits (prior behavior).
+    fn admitClientByMemoryBudget(self: *LinuxServer) bool {
+        const budget = self.config.resource_memory_budget_bytes;
+        if (budget == 0) return true;
+        const shards: u64 = @max(@as(u64, 1), @as(u64, @intCast(self.reactors.len)));
+        return resource_limits.admitByMemory(self.rx().clients.len(), self.config.resource_per_client_bytes, budget / shards);
+    }
+
     pub fn s2sSecured(self: *const LinuxServer) bool {
         return self.config.node_identity != null and self.config.crypto_io != null;
     }
@@ -14693,9 +15344,103 @@ pub const LinuxServer = struct {
         if (!self.relayV2DirectNeighbor(peer)) return;
         lockSpin(&self.relay_v2_replay_mu);
         _ = self.relay_v2_outbox.bindUnbound(peer);
+        // M07: a fresh secured link re-presents every retained head now rather
+        // than after backoff accumulated against the previous connection.
+        if (self.relay_v2_pressure) |*pacing| pacing.notePeerReset(peer);
         self.relay_v2_replay_mu.unlock();
         conn.relay_v2_unbound_bound = true;
         self.forwardAcceptedRelayV2(&.{});
+    }
+
+    /// M07: forget a torn-down direct peer's MESSAGE_V2 resend pacing. Nothing
+    /// retained is dropped: RVL2/RVO2 keep every unconfirmed head, and the next
+    /// established link re-presents them at once (as `notePeerReset` would).
+    /// Forgetting frees the peer's pacing slot and stops a gone peer from
+    /// counting in `onyx_relay_v2_stalled_peers`. Pacing is process-local and
+    /// never carried through Helix; a successor starts with an empty table.
+    fn forgetRelayV2PeerPacing(self: *LinuxServer, peer: u64) void {
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        if (self.relay_v2_pressure) |*pacing| pacing.forgetPeer(peer);
+    }
+
+    /// Claim one owner-reactor governor unit. Null means the governor is
+    /// disabled for this shard; the caller then proceeds unmetered.
+    fn tryWorkloadTicket(
+        self: *LinuxServer,
+        class: workload_quota_mod.Class,
+        resource: workload_quota_mod.Resource,
+        peer_key: u64,
+    ) error{WorkloadQuotaRefused}!?workload_quota_mod.Ticket {
+        const quota = self.rx().quota orelse return null;
+        return switch (quota.tryAcquire(class, resource, peer_key, self.nowU64())) {
+            .granted => |ticket| ticket,
+            .refused => error.WorkloadQuotaRefused,
+        };
+    }
+
+    /// Return a governor unit claimed on this reactor. Stale or repeated
+    /// tickets are generation-checked no-ops inside the governor.
+    fn releaseWorkloadTicketValue(self: *LinuxServer, ticket: ?workload_quota_mod.Ticket) void {
+        const held = ticket orelse return;
+        if (self.rx().quota) |quota| quota.release(held);
+    }
+
+    fn releaseWorkloadTicket(self: *LinuxServer, conn: *ConnState) void {
+        const ticket = conn.workload_ticket orelse return;
+        conn.workload_ticket = null;
+        self.releaseWorkloadTicketValue(ticket);
+    }
+
+    /// Session-recovery source key: the accepted address, never the token.
+    fn workloadConnPeerKey(conn: *const ConnState) u64 {
+        return workloadAddrPeerKey(conn.peer_addr);
+    }
+
+    /// Governor key for a source address; `unidentified_peer_key` only when
+    /// the address is unknown.
+    fn workloadAddrPeerKey(peer_addr: ?dns.Address) u64 {
+        const addr = peer_addr orelse return workload_quota_mod.unidentified_peer_key;
+        return switch (addr) {
+            .ipv4 => |bytes| workloadPeerKey(4, &bytes),
+            .ipv6 => |bytes| workloadPeerKey(6, &bytes),
+        };
+    }
+
+    /// Client accepts stop short of the governor's recovery reserve so a
+    /// reconnect storm cannot take the table slots mesh redials need.
+    fn clientAdmissionSlotCap(self: *LinuxServer) usize {
+        const quota = self.rx().quota orelse return self.config.max_clients;
+        return self.config.max_clients - quota.config.recovery_reserve_slots;
+    }
+
+    /// Hold one client-admission unit from accept until registration
+    /// completes or the connection closes. True refuses the connection.
+    fn workloadAdmissionRefuses(self: *LinuxServer, conn: *ConnState) bool {
+        if (conn.workload_ticket != null) return false;
+        conn.workload_ticket = self.tryWorkloadTicket(.client_admission, .slot, 0) catch {
+            self.publishSecurityAdmissionRefusal(conn, "WORKLOAD_QUOTA", "client admission quota exhausted");
+            return true;
+        };
+        return false;
+    }
+
+    /// One AIMD step per owner timer tick. Recovery backlog is the configured
+    /// mesh dials without a live endpoint; only the maintenance reactor dials.
+    fn observeWorkloadQuota(self: *LinuxServer) void {
+        const quota = self.rx().quota orelse return;
+        var backlog: u32 = 0;
+        if (self.isMaintenanceReactor()) {
+            for (self.mesh_dials) |dial| {
+                if (dial.token == null) backlog +|= 1;
+            }
+        }
+        quota.observe(.{
+            .occupancy = std.math.cast(u32, self.rx().clients.len()) orelse std.math.maxInt(u32),
+            .recovery_backlog = backlog,
+            .verify_queue = 0,
+            .p99_admit_latency_ms = 0,
+        });
     }
 
     /// Acquire this physical client's process-local gauge ownership exactly once.
@@ -14709,6 +15454,7 @@ pub const LinuxServer = struct {
     /// Release exactly this slot's active-gauge ownership. An uncounted
     /// pre-admission socket is a no-op and can never subtract another live slot.
     fn dropClientStats(self: *LinuxServer, conn: *ConnState) void {
+        self.releaseWorkloadTicket(conn);
         if (!conn.stats_client_counted) return;
         conn.stats_client_counted = false;
         self.stats.onClose(false, false);
@@ -14731,6 +15477,8 @@ pub const LinuxServer = struct {
 
     /// Count a mesh-routable peer once for metrics + journal. Idempotent per conn.
     fn noteS2sEstablished(self: *LinuxServer, conn: *ConnState, remote_name: []const u8, kind: []const u8) void {
+        // The handshake's mesh-recovery work is over once the link is routable.
+        self.releaseWorkloadTicket(conn);
         if (conn.s2s_established_counted) return;
         conn.s2s_established_counted = true;
         self.stats.onS2sEstablished();
@@ -15086,6 +15834,10 @@ pub const LinuxServer = struct {
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainAccessEventsV1(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainConfigCompat(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
+        self.drainMeshDigestSync(conn, link);
+        if (!conn.ownsActiveMeshLink(link)) return;
         self.drainGuestFrames(conn, link);
         if (!conn.ownsActiveMeshLink(link)) return;
         self.drainObserveEvents(conn, link);
@@ -15171,9 +15923,15 @@ pub const LinuxServer = struct {
             const n = oper_cred_share.sign(kp, fields, &buf) catch return false;
             link.sendOperGrant(buf[0..n]) catch return false;
         }
-        // Catch a live local oper whose grant was never minted (boot race /
-        // keyless→keyed transition). Real elevation still goes through
-        // mintOperGrant; this only fills a missing registry row once.
+        self.mintMissingLocalOperGrants(now);
+        return true;
+    }
+
+    /// Catch a live local oper whose grant was never minted (boot race /
+    /// keyless→keyed transition). Real elevation still goes through
+    /// mintOperGrant; this only fills a missing registry row once. Runs from
+    /// the opers burst stage, including an M03 round that skips that stage.
+    fn mintMissingLocalOperGrants(self: *LinuxServer, now: u64) void {
         for (self.reactors) |*reactor| {
             var clients = reactor.clients.iterator();
             while (clients.next()) |entry| {
@@ -15185,7 +15943,6 @@ pub const LinuxServer = struct {
                 self.mintOperGrant(account, client.session.oper_priv, client.session.operClass(), client.session.operTitle());
             }
         }
-        return true;
     }
 
     /// Ship every `mesh`-scope WARD this node currently holds to a freshly
@@ -16594,6 +17351,12 @@ pub const LinuxServer = struct {
             // A full send buffer is the RECIPIENT's fault (it stopped reading):
             // poison that exact recipient and report the outcome without faulting
             // the sender, so a fan-out continues to later healthy recipients.
+            // Chat stops at its class ceiling so the control reserve stays free.
+            const chat_class = chatClassBudgeted(conn, bytes.len, opts.preframed_secure or opts.close_after);
+            if (chat_class and !self.admitChatOutput(conn, bytes.len)) {
+                self.poisonOwnedDelivery(conn);
+                return .poisoned;
+            }
             const append_result = if (opts.preframed_secure)
                 appendSecuredToConn(conn, bytes)
             else
@@ -16604,6 +17367,7 @@ pub const LinuxServer = struct {
                 self.poisonOwnedDelivery(conn);
                 return .poisoned;
             };
+            if (chat_class) self.rx().output_class_turn.commit(.chat, bytes.len);
             self.armSendIfNeeded(conn) catch {
                 self.poisonOwnedDelivery(conn);
                 return .poisoned;
@@ -18545,6 +19309,11 @@ pub const LinuxServer = struct {
         if (outbox) |reservation| {
             const required_nodes = reservation.required_nodes orelse self.relay_v2_required_nodes;
             if (required_nodes.len < 2) return .rejected;
+            // M07: RVG2 says this RelayId is new, so it would take a fresh RVL2
+            // row. Shed before staging when its signed origin's share is spent.
+            // A transit shed withholds the ACK; the sender keeps the exact wire
+            // and re-presents it on its paced RTO, so nothing accepted is lost.
+            if (!self.relayV2BackpressureAdmits(msg.origin_node, reservation, required_nodes.len)) return .rejected;
             const prepared = self.relay_v2_event_log.prepareAccepted(
                 relay_id,
                 reservation.wire,
@@ -18553,6 +19322,10 @@ pub const LinuxServer = struct {
                 required_nodes,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.CapacityExceeded => {
+                    if (msg.origin_node != self.config.node_id) self.relay_v2_gate.noteTransitCapacityWithheld();
+                    return .rejected;
+                },
                 else => return .rejected,
             };
             event_log_plan = switch (prepared) {
@@ -18631,6 +19404,47 @@ pub const LinuxServer = struct {
             self.noteThreadFromTags(thread_msgid, row.client_tags);
         }
         return .{ .accepted = relay_id };
+    }
+
+    /// M07 admission for one new RVL2 row of signed `origin_node`: this node's
+    /// own origin takes the local gate (hysteresis), any other origin the
+    /// stateless transit gate. Each origin may hold
+    /// at most `1/membership` of RVL2's rows and bytes here, so rows that each
+    /// await a different full node can never fill every node at once; the
+    /// whole-store totals stay a fail-closed backstop. An unusable quota (log
+    /// bounds too small for the membership) sheds. Caller holds
+    /// `relay_v2_replay_mu`.
+    ///
+    /// The deferred queue is deliberately absent from `total` (its dimension
+    /// keeps the non-tripping default). Rows reach this gate only after
+    /// authority resolved, so they never enter that queue and gating them on
+    /// its occupancy cannot slow its inflow; and `retryDeferredRelayV2` drains
+    /// it only through this gate, so a full queue would shed every retry and
+    /// never drain. The queue keeps its own hard bound in `deferRelayV2` and
+    /// is exported as `onyx_relay_v2_deferred`.
+    fn relayV2BackpressureAdmits(
+        self: *LinuxServer,
+        origin_node: u64,
+        reservation: RelayV2OutboxReservation,
+        required_len: usize,
+    ) bool {
+        const log = &self.relay_v2_event_log;
+        const origins = @max(self.relay_v2_required_nodes.len, required_len);
+        const quota = mesh_backpressure.OriginQuota.forLog(log, origins) catch return false;
+        var total = mesh_backpressure.logOccupancy(log);
+        total.outbox_len = self.relay_v2_outbox.len();
+        total.outbox_max = self.relay_v2_outbox.max_entries;
+        const request: mesh_backpressure.Request = .{
+            .quota = quota,
+            .origin = mesh_backpressure.originUsage(log, origin_node),
+            .total = total,
+            .incoming_bytes = mesh_backpressure.rowFootprint(reservation.wire.len, required_len),
+        };
+        const decision = if (origin_node == self.config.node_id)
+            self.relay_v2_gate.classifyLocal(request)
+        else
+            self.relay_v2_gate.classifyTransit(request);
+        return decision == .admit;
     }
 
     fn probeRelayV2(
@@ -19094,6 +19908,7 @@ pub const LinuxServer = struct {
             .retries = 0,
         };
         self.relay_v2_deferred_len += 1;
+        self.relay_v2_deferred_published.store(self.relay_v2_deferred_len, .monotonic);
         item.* = undefined;
         return true;
     }
@@ -19137,6 +19952,24 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    /// ACK one accepted (or duplicate) ingress immediately. When the link
+    /// cannot take it yet (not active/negotiated, or congested), make the
+    /// durable receipt due now instead of after its initial backoff, so the
+    /// next outbox pass on link activity sends it. Under M07 pacing the
+    /// sender re-presents its head only after an RTO, so a first ACK that is
+    /// silently deferred by the receipt backoff would otherwise stall that
+    /// neighbor's per-origin head for the whole backoff.
+    fn ackRelayV2Ingress(self: *LinuxServer, peer: u64, relay_id: relay_v2_replay_guard.RelayId) void {
+        if (self.sendRelayV2AckToPeer(peer, relay_id)) return;
+        lockSpin(&self.relay_v2_replay_mu);
+        defer self.relay_v2_replay_mu.unlock();
+        for (self.relay_v2_outbox.mutableReceiptItems()) |*live| {
+            if (live.peer != peer or !std.mem.eql(u8, &live.relay_id, &relay_id)) continue;
+            live.retry_after_ms = 0;
+            return;
+        }
+    }
+
     fn sendRelayV2AckConfirmToPeer(
         self: *LinuxServer,
         peer: u64,
@@ -19170,6 +20003,7 @@ pub const LinuxServer = struct {
             // still needs another ACK_CONFIRM; the 128-bit ID came from the
             // authenticated neighbor and RVG2 remains the retired-ID authority.
             _ = self.relay_v2_outbox.acknowledge(peer, relay_id);
+            if (self.relay_v2_pressure) |*pacing| pacing.noteAck(peer, relay_id);
             return true;
         }
         var plan = self.relay_v2_event_log.prepareAuthenticatedDurableAck(
@@ -19179,6 +20013,7 @@ pub const LinuxServer = struct {
         defer plan.deinit();
         _ = self.relay_v2_outbox.acknowledge(peer, relay_id);
         _ = plan.commit();
+        if (self.relay_v2_pressure) |*pacing| pacing.noteAck(peer, relay_id);
         return true;
     }
 
@@ -19206,6 +20041,7 @@ pub const LinuxServer = struct {
         _ = self.relay_v2_outbox.acknowledge(peer, relay_id);
         _ = self.relay_v2_outbox.confirmReceipt(peer, relay_id);
         _ = plan.commit();
+        if (self.relay_v2_pressure) |*pacing| pacing.noteAck(peer, relay_id);
         return true;
     }
 
@@ -19410,6 +20246,7 @@ pub const LinuxServer = struct {
         if (work.len == 0 or self.relay_v2_required_nodes.len == 0) return 0;
         var work_len: usize = 0;
         var bytes_staged: usize = 0;
+        const pacing_now = self.nowU64();
 
         lockSpin(&self.relay_v2_replay_mu);
         defer self.relay_v2_replay_mu.unlock();
@@ -19429,6 +20266,11 @@ pub const LinuxServer = struct {
             const page_len = self.relay_v2_event_log.collectPageForNode(peer, &page) catch continue;
             if (page_len == 0) continue;
             const item = page[0];
+            // M07: an in-flight head waits out its RTO instead of being
+            // re-sent on every wake/ACK; the durable log still owns it.
+            if (self.relay_v2_pressure) |*pacing| {
+                if (pacing.shouldEmit(peer, item.relay_id, pacing_now) != .emit) continue;
+            }
             if (work_len != 0 and item.wire.len > relay_v2_retry_byte_budget - bytes_staged)
                 continue;
             const wire = self.allocator.dupe(u8, item.wire) catch continue;
@@ -19439,19 +20281,80 @@ pub const LinuxServer = struct {
         return work_len;
     }
 
-    fn retryRelayV2Outbox(self: *LinuxServer) void {
-        var work: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
-        const now = self.meshWallMs();
-        const work_len = self.collectRelayV2RetryWork(&work);
+    /// M04: emit this round's already-selected heads to the cheapest measured
+    /// peers first. A pure stable permutation of `work`: the set of (peer,
+    /// relay id, wire) items, and therefore every custody obligation, retry
+    /// budget, and exact-once outcome, is unchanged. Items for one peer keep
+    /// their relative order, so per-origin ordering on each link is preserved.
+    fn orderRelayV2RetryWorkByRoute(self: *LinuxServer, work: []RelayV2RetryWork) void {
+        self.orderRetryWorkByRoute(RelayV2RetryWork, relay_v2_retry_frame_budget, work);
+    }
 
-        defer for (work[0..work_len]) |item| self.allocator.free(item.wire);
-        for (work[0..work_len]) |item| {
-            _ = self.replayRelayV2WireToPeer(item.peer, item.wire);
+    /// Generic form for every bounded per-peer custody retry batch whose item
+    /// carries a direct-neighbor `peer`. A batch larger than `budget` is left
+    /// in its original order (ordering is advisory; it can never fail a send).
+    fn orderRetryWorkByRoute(self: *LinuxServer, comptime T: type, comptime budget: usize, work: []T) void {
+        if (work.len < 2) return;
+        const Keyed = struct { key: route_cost.RankKey, item: T };
+        var keyed: [budget]Keyed = undefined;
+        if (work.len > keyed.len) return;
+        lockSpin(&self.route_rank_mu);
+        for (work, keyed[0..work.len]) |item, *slot| slot.* = .{ .key = self.route_rank.key(item.peer), .item = item };
+        self.route_rank_mu.unlock();
+        const Ctx = struct {
+            fn less(_: void, a: Keyed, b: Keyed) bool {
+                return route_cost.RankKey.lessThan(a.key, b.key);
+            }
+        };
+        std.sort.insertion(Keyed, keyed[0..work.len], {}, Ctx.less);
+        for (keyed[0..work.len], work) |slot, *item| item.* = slot.item;
+    }
+
+    /// M04: one refresh pass over reactor 0's established secured mesh links,
+    /// feeding `route_cost.measuredLinkCost` from `peer_health`. Peers whose
+    /// link is absent or not established are demoted by `endRefresh`.
+    fn refreshRouteRanking(self: *LinuxServer) void {
+        const now = self.nowU64();
+        if (self.last_route_rank_refresh_ms != 0 and now -| self.last_route_rank_refresh_ms < route_rank_refresh_interval_ms) return;
+        self.last_route_rank_refresh_ms = now;
+        lockSpin(&self.route_rank_mu);
+        defer self.route_rank_mu.unlock();
+        self.route_rank.beginRefresh();
+        for (self.rx().clients.slots.items) |*slot| {
+            if (!slot.occupied or !slot.value.isActiveMeshPeer() or slot.value.s2s_dedup) continue;
+            const link = slot.value.s2s_secured orelse continue;
+            const node = link.remoteNodeId() orelse continue;
+            if (node == 0 or node == self.config.node_id) continue;
+            const cost: ?u32 = if (!link.established())
+                null
+            else if (self.peer_health.get(link.remoteName())) |health|
+                route_cost.measuredLinkCost(health, now)
+            else
+                null;
+            _ = self.route_rank.observe(node, cost, now);
         }
+        self.route_rank.endRefresh(now);
+    }
 
-        // Accepted inbound receipts use the same bounded, fair retry shape. ACK
-        // confirmation removes them; a lost ACK or confirmation cannot age the
-        // proof out behind unrelated messages.
+    /// Ranking refresh cadence. Link measurements change on RTT probes and
+    /// reads; one pass per second bounds the reactor-0 slot walk.
+    const route_rank_refresh_interval_ms: u64 = if (builtin.is_test) 0 else 1_000;
+
+    fn noteRoutePeerDown(self: *LinuxServer, node: u64) void {
+        const now = self.nowU64();
+        lockSpin(&self.route_rank_mu);
+        defer self.route_rank_mu.unlock();
+        self.route_rank.noteDown(node, now);
+    }
+
+    fn retryRelayV2Outbox(self: *LinuxServer) void {
+        const now = self.meshWallMs();
+        // Accepted inbound receipts first: an ACK is a few bytes and is the
+        // only thing that advances the neighbor's paced head (M07), so it
+        // must not wait behind this node's own head forwarding. They use the
+        // same bounded, fair retry shape. ACK confirmation removes them; a
+        // lost ACK or confirmation cannot age the proof out behind unrelated
+        // messages.
         var receipts: [relay_v2_retry_frame_budget]relay_v2_outbox.Receipt = undefined;
         lockSpin(&self.relay_v2_replay_mu);
         const receipt_len = self.relay_v2_outbox.collectDueReceipts(now, &receipts);
@@ -19467,6 +20370,21 @@ pub const LinuxServer = struct {
                 live.retry_after_ms = now +| (relay_v2_initial_retry_ms << shift);
                 break;
             }
+            self.relay_v2_replay_mu.unlock();
+        }
+
+        var work: [relay_v2_retry_frame_budget]RelayV2RetryWork = undefined;
+        const work_len = self.collectRelayV2RetryWork(&work);
+
+        defer for (work[0..work_len]) |item| self.allocator.free(item.wire);
+        self.orderRelayV2RetryWorkByRoute(work[0..work_len]);
+        const pacing_now = self.nowU64();
+        for (work[0..work_len]) |item| {
+            // Only a frame that reached the link's SendQ starts an RTO; an
+            // absent or congested link leaves the head immediately eligible.
+            if (!self.replayRelayV2WireToPeer(item.peer, item.wire)) continue;
+            lockSpin(&self.relay_v2_replay_mu);
+            if (self.relay_v2_pressure) |*pacing| pacing.noteEmitted(item.peer, item.relay_id, pacing_now);
             self.relay_v2_replay_mu.unlock();
         }
     }
@@ -19494,8 +20412,8 @@ pub const LinuxServer = struct {
                     index += 1;
                     continue;
                 },
-                .accepted => |id| _ = self.sendRelayV2AckToPeer(pending.inbound.via_peer, id),
-                .duplicate => |id| _ = self.sendRelayV2AckToPeer(pending.inbound.via_peer, id),
+                .accepted => |id| self.ackRelayV2Ingress(pending.inbound.via_peer, id),
+                .duplicate => |id| self.ackRelayV2Ingress(pending.inbound.via_peer, id),
                 .permanent => {},
             }
             pending.deinit(self.allocator);
@@ -19503,6 +20421,7 @@ pub const LinuxServer = struct {
             if (index != self.relay_v2_deferred_len)
                 self.relay_v2_deferred[index] = self.relay_v2_deferred[self.relay_v2_deferred_len];
         }
+        self.relay_v2_deferred_published.store(self.relay_v2_deferred_len, .monotonic);
     }
 
     fn drainRelayV2(
@@ -19523,11 +20442,11 @@ pub const LinuxServer = struct {
             }
             switch (self.deliverRelayV2(item.owned.msg, item.wire, item.via_peer)) {
                 .accepted => |id| {
-                    _ = self.sendRelayV2AckToPeer(item.via_peer, id);
+                    self.ackRelayV2Ingress(item.via_peer, id);
                     item.deinit(self.allocator);
                 },
                 .duplicate => |id| {
-                    _ = self.sendRelayV2AckToPeer(item.via_peer, id);
+                    self.ackRelayV2Ingress(item.via_peer, id);
                     item.deinit(self.allocator);
                 },
                 .permanent => item.deinit(self.allocator),
@@ -21139,6 +22058,9 @@ pub const LinuxServer = struct {
                 self.flushFlightRecorder(.s2s, "mooring link dropped");
                 const publish_peer_snapshot = !conn.s2s_dedup;
                 const dropped_node = link.peerShortId();
+                // M04: an unusable link is demoted at once (fail closed); the
+                // promotion delay damps a flapping reconnect.
+                if (!conn.s2s_dedup) if (dropped_node) |node| self.noteRoutePeerDown(node);
                 if (!conn.s2s_dedup and link.remoteName().len != 0) {
                     srvLog("onyx-server: mesh link down peer={s} reason={s}\n", .{ link.remoteName(), reason });
                     self.logMeshEvent(.peer_down, link.remoteName(), "secured link dropped");
@@ -21156,11 +22078,16 @@ pub const LinuxServer = struct {
                 // Drop this peer's network-wide clone contributions (keyed by the
                 // same node id `setRemote` used, so a dedup'd duplicate is skipped).
                 if (!conn.s2s_dedup) if (link.remoteNodeId()) |node| self.mesh_clones.dropNode(node);
+                // M07: SQUIT and every other teardown of the peer's active leg
+                // drop its MESSAGE_V2 resend pacing. A dedup'd duplicate is
+                // skipped so the surviving leg's pacing is never disturbed.
+                if (!conn.s2s_dedup) if (link.remoteNodeId()) |node| self.forgetRelayV2PeerPacing(node);
                 const was_est = conn.s2s_established_counted;
                 link.deinit();
                 self.allocator.destroy(link);
                 conn.s2s_secured = null;
                 if (!conn.s2s_dedup) self.updatePartitionTransitions(); // detect a split this drop caused
+                self.releaseWorkloadTicket(conn);
                 closeFd(conn.fd);
                 if (conn.stats_s2s_tcp_counted) {
                     conn.stats_s2s_tcp_counted = false;
@@ -21196,6 +22123,7 @@ pub const LinuxServer = struct {
                 self.allocator.destroy(link);
                 conn.s2s = null;
                 if (!conn.s2s_dedup) self.updatePartitionTransitions(); // detect a split this drop caused
+                self.releaseWorkloadTicket(conn);
                 closeFd(conn.fd);
                 if (conn.stats_s2s_tcp_counted) {
                     conn.stats_s2s_tcp_counted = false;
@@ -22038,6 +22966,8 @@ pub const LinuxServer = struct {
 
     /// Post-001 registration tail shared by NICK/USER and a passed challenge.
     fn completeLiveRegistration(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
+        // Admission work ends at 001; the table slot itself stays bounded by max_clients.
+        self.releaseWorkloadTicket(conn);
         // Re-apply the visible host now that the background resolver (kicked
         // off at connect) has had the handshake window to finish. With a
         // cloak key this re-cloaks the IP (rDNS never feeds the public cloak
@@ -23457,54 +24387,612 @@ pub const LinuxServer = struct {
         }
     }
 
+    // ---------------------------------------------------------------
+    // M03: digest exchange before the periodic anti-entropy burst
+    // (`mesh_digest_sync`). Only secured links that proved the
+    // digest-reconcile PING extension take this path; every other link
+    // keeps the unconditional full burst. All per-link state lives on the
+    // SecuredLink, is process-local and does not ride Helix: a resumed or
+    // re-established link starts empty and its first round sends every
+    // family. Every failure resolves toward sending more.
+
+    fn meshBurstStageFamily(stage: MeshBurstStage) ?mesh_digest_sync.Family {
+        return switch (stage) {
+            .idle => null,
+            inline else => |s| @field(mesh_digest_sync.Family, @tagName(s)),
+        };
+    }
+
+    comptime {
+        // Stage order and wire family ids must stay aligned.
+        for (std.meta.tags(mesh_digest_sync.Family)) |family| {
+            const stage = @field(MeshBurstStage, @tagName(family));
+            std.debug.assert(@backingInt(stage) == @backingInt(family) + 1);
+        }
+        std.debug.assert(std.meta.tags(MeshBurstStage).len == mesh_digest_sync.family_count + 1);
+    }
+
+    /// The secured link of `conn` when it negotiated the digest exchange.
+    fn meshDigestLink(conn: *ConnState) ?*secured_s2s_link.SecuredLink {
+        const link = conn.s2s_secured orelse return null;
+        if (!conn.ownsActiveMeshLink(link) or !link.supportsDigestSync()) return null;
+        return link;
+    }
+
+    /// Bucket filter of a digest-gated burst stage: false only for a row of a
+    /// bucket-scoped family whose bucket the peer already holds unchanged.
+    fn meshDigestRowWanted(conn: *const ConnState, family: mesh_digest_sync.Family, key: []const u8) bool {
+        const link = conn.s2s_secured orelse return true;
+        const state = link.digest_sync orelse return true;
+        return state.wantsRow(family, key);
+    }
+
+    /// Bounded row key of one channel PROP clock (channel, prop key).
+    fn meshDigestPropKey(channel: []const u8, key: []const u8) mesh_digest_sync.Hash {
+        var h = mesh_digest_sync.RowHasher.init(.channel_props);
+        h.bytes("key");
+        h.bytes(channel);
+        h.bytes(key);
+        return h.final();
+    }
+
+    /// Add one row whose identity is its full content: distinct records can
+    /// never collapse onto one key, and identical re-emits are one record.
+    fn addMeshDigestContentRow(rows: *mesh_digest_sync.Rows, h: *mesh_digest_sync.RowHasher) std.mem.Allocator.Error!void {
+        const digest = h.final();
+        try rows.add(&digest, 0, digest);
+    }
+
+    /// Canonical digest of one burst family exactly as this node would burst
+    /// it on `conn` now (every emitted record field except the per-burst HLC,
+    /// nonce and signature). Null when the family cannot be digested: on
+    /// allocation failure, or for membership while an attachment's mesh
+    /// announce is pending (that burst is incomplete by design). The caller
+    /// then sends the family whole and never lets the peer claim it held.
+    fn meshDigestFamily(self: *LinuxServer, conn: *ConnState, family: mesh_digest_sync.Family) ?mesh_digest_sync.FamilyDigest {
+        var rows = mesh_digest_sync.Rows.init(self.allocator, family) catch return null;
+        defer rows.deinit();
+        const complete = self.collectMeshDigestRows(conn, family, &rows) catch return null;
+        if (!complete) return null;
+        addMeshDigestCapabilityRow(conn, family, &rows) catch return null;
+        return rows.finish() catch null;
+    }
+
+    /// One row binding the link capabilities that change what a producer
+    /// emits (profile and oper-info variants, read markers, KEYTRANS, ACCESS,
+    /// guest presence). A capability refresh on a preserved link therefore
+    /// changes every family digest and the next round re-sends it whole.
+    fn addMeshDigestCapabilityRow(conn: *ConnState, family: mesh_digest_sync.Family, rows: *mesh_digest_sync.Rows) std.mem.Allocator.Error!void {
+        const link = conn.s2s_secured orelse return;
+        var h = mesh_digest_sync.RowHasher.init(family);
+        h.bytes("link-capabilities");
+        h.flag(link.established());
+        h.flag(link.supportsWhoisProfile());
+        h.flag(link.supportsMemberOperInfo());
+        h.flag(link.supportsReadMarkers());
+        h.flag(link.supportsKeyTransHead());
+        h.flag(link.supportsAccessEventV1());
+        h.flag(link.supportsGuestPresence());
+        h.flag(link.supportsEventSpineV2());
+        try addMeshDigestContentRow(rows, &h);
+    }
+
+    /// Row projection of each burst family. Each arm mirrors the predicates
+    /// of its producer (`sendMembershipBurstTo` ... `sendKeyTransHeadOn`) on a
+    /// secured link and hashes a superset of the fields that producer emits;
+    /// hashing more can only cause an extra re-send, never a skipped one.
+    fn collectMeshDigestRows(self: *LinuxServer, conn: *ConnState, family: mesh_digest_sync.Family, rows: *mesh_digest_sync.Rows) !bool {
+        const RowHasher = mesh_digest_sync.RowHasher;
+        const link = conn.s2s_secured orelse return false;
+        switch (family) {
+            .membership => {
+                var cit = self.world.channelIterator();
+                while (cit.next()) |cv| {
+                    var members = self.world.memberIterator(cv.name) orelse continue;
+                    while (members.next()) |member| {
+                        const mconn = self.connFor(clientIdFromWorld(member.*)) orelse continue;
+                        if (mconn.s2s != null or mconn.s2s_secured != null) continue;
+                        if (mconn.session_mesh_announce_pending) return false;
+                        const status: u4 = @truncate((self.world.memberModes(cv.name, member.*) orelse world_model.MemberModes.empty()).bits);
+                        var h = RowHasher.init(.membership);
+                        h.bytes("member");
+                        h.bytes(cv.name);
+                        h.bytes(mconn.session.displayName());
+                        h.int(status);
+                        h.any(membershipIdentityOf(mconn));
+                        try addMeshDigestContentRow(rows, &h);
+                    }
+                    const lists = [_]struct { tag: []const u8, entries: ?[]const world_model.ListEntry }{
+                        .{ .tag = "ban", .entries = self.world.bansOf(cv.name) },
+                        .{ .tag = "exempt", .entries = self.world.exemptsOf(cv.name) },
+                        .{ .tag = "invex", .entries = self.world.invexOf(cv.name) },
+                        .{ .tag = "quiet", .entries = self.world.mutesOf(cv.name) },
+                    };
+                    for (lists) |channel_list| {
+                        for (channel_list.entries orelse continue) |entry| {
+                            var h = RowHasher.init(.membership);
+                            h.bytes(channel_list.tag);
+                            h.bytes(cv.name);
+                            h.any(entry);
+                            try addMeshDigestContentRow(rows, &h);
+                        }
+                    }
+                }
+                for (self.reactors) |*reactor| {
+                    for (reactor.clients.slots.items) |*slot| {
+                        if (!slot.occupied) continue;
+                        const mc = &slot.value;
+                        if (mc.s2s != null or mc.s2s_secured != null) continue;
+                        if (!mc.session.registered()) continue;
+                        if (mc.session_mesh_announce_pending) return false;
+                        const pnick = mc.session.displayName();
+                        if (std.mem.eql(u8, pnick, "*")) continue;
+                        var h = RowHasher.init(.membership);
+                        h.bytes("presence");
+                        h.bytes(pnick);
+                        h.any(membershipIdentityOf(mc));
+                        // The same stage re-sends this user's WHOIS profile
+                        // (`sendOneWhoisProfile`). Hash it at a fixed revision
+                        // so only a real profile change (away, modes, idle,
+                        // TLS, class, rDNS) changes the row.
+                        if (whoisLinkSupportsProfile(conn)) {
+                            var whois_buf: [whois_profile.max_encoded_len]u8 = undefined;
+                            var whois_legacy_buf: [whois_profile.max_encoded_len]u8 = undefined;
+                            const wires = self.encodeUserWhoisPair(mc, whoisLinkOperInfo(conn), 1, &whois_buf, &whois_legacy_buf);
+                            h.flag(wires != null);
+                            if (wires) |w| {
+                                h.bytes(w.full);
+                                h.optBytes(w.legacy);
+                            }
+                        }
+                        try addMeshDigestContentRow(rows, &h);
+                    }
+                }
+            },
+            .mode_flags => {
+                var cit = self.world.channelIterator();
+                while (cit.next()) |cv| {
+                    var h = RowHasher.init(.mode_flags);
+                    h.bytes(cv.name);
+                    h.int(self.channelModeFlagBits(cv.name));
+                    try rows.add(cv.name, 0, h.final());
+                }
+            },
+            .mode_state => {
+                var cit = self.world.channelIterator();
+                while (cit.next()) |cv| {
+                    var h = RowHasher.init(.mode_state);
+                    h.any(self.channelModeStateEvent(cv.name, 0));
+                    try rows.add(cv.name, 0, h.final());
+                }
+            },
+            .channel_props => {
+                var cit = self.world.channelIterator();
+                while (cit.next()) |cv| {
+                    const entity = ircx_prop_store.Entity{ .kind = .channel, .id = cv.name };
+                    var views: [ircx_prop_store.default_max_props_per_entity]ircx_prop_store.EntryView = undefined;
+                    const listed = try self.props.listProps(entity, &views);
+                    for (listed) |entry| {
+                        // An unclocked prop is seeded (and then sent) by the
+                        // producer; its row differs from any committed one.
+                        if (self.channelPropClock(entry.entity.id, entry.key) != null) continue;
+                        var h = RowHasher.init(.channel_props);
+                        h.bytes("unclocked");
+                        h.bytes(entry.value);
+                        h.bytes(entry.owner);
+                        const key = meshDigestPropKey(entry.entity.id, entry.key);
+                        try rows.add(&key, 0, h.final());
+                    }
+                }
+                var it = self.channel_prop_clocks.iterator();
+                while (it.next()) |entry| {
+                    const clock = entry.value_ptr;
+                    var present = clock.present;
+                    var value: []const u8 = "";
+                    var owner: []const u8 = clock.owner;
+                    if (clock.present) {
+                        const entity = ircx_prop_store.Entity{ .kind = .channel, .id = clock.channel };
+                        if (self.props.getProp(entity, clock.key)) |ev| {
+                            value = ev.value;
+                            owner = ev.owner;
+                        } else |_| {
+                            present = false;
+                        }
+                    }
+                    var h = RowHasher.init(.channel_props);
+                    h.any(clock.*);
+                    h.flag(present);
+                    h.bytes(value);
+                    h.bytes(owner);
+                    const key = meshDigestPropKey(clock.channel, clock.key);
+                    try rows.add(&key, clock.hlc, h.final());
+                }
+            },
+            .entity_props => {
+                var it = self.entity_prop_clocks.iterator();
+                while (it.next()) |entry| {
+                    const clock = entry.value_ptr;
+                    if (isReadMarkerPropKey(clock.key)) continue;
+                    if (clock.kind == .user and account_identity.isReservedNamespace(clock.key)) continue;
+                    var present = clock.present;
+                    var value: []const u8 = "";
+                    var owner: []const u8 = clock.owner;
+                    if (clock.present) {
+                        const entity = ircx_prop_store.Entity{ .kind = clock.kind.toStoreKind(), .id = clock.entity };
+                        if (self.props.getProp(entity, clock.key)) |ev| {
+                            value = ev.value;
+                            owner = ev.owner;
+                        } else |_| {
+                            present = false;
+                        }
+                    }
+                    var h = RowHasher.init(.entity_props);
+                    h.any(clock.*);
+                    h.flag(present);
+                    h.bytes(value);
+                    h.bytes(owner);
+                    try addMeshDigestContentRow(rows, &h);
+                }
+                if (!self.read_marker_unavailable and link.supportsReadMarkers()) {
+                    var markers = self.read_marker_facts.valueIterator();
+                    while (markers.next()) |wire| {
+                        var h = RowHasher.init(.entity_props);
+                        h.bytes("read-marker");
+                        h.bytes(wire.*);
+                        try addMeshDigestContentRow(rows, &h);
+                    }
+                }
+            },
+            .topics => {
+                var cit = self.world.channelIterator();
+                while (cit.next()) |cv| {
+                    const info = self.world.topicInfo(cv.name) orelse continue;
+                    if (info.text.len == 0) continue;
+                    var h = RowHasher.init(.topics);
+                    h.bytes(cv.name);
+                    h.bytes(info.text);
+                    h.bytes(info.setter);
+                    h.any(info.set_at);
+                    try rows.add(cv.name, 0, h.final());
+                }
+            },
+            .opers => {
+                if (self.meshSignKey() == null) return true;
+                const me = protocol_inventory.currentServerName();
+                var it = self.oper_grants.liveIterator(self.grantNowU64());
+                while (it.next()) |fields| {
+                    if (!std.ascii.eqlIgnoreCase(fields.issuer_node, me)) continue;
+                    if (fields.privilege_bits == 0) continue;
+                    var h = RowHasher.init(.opers);
+                    h.any(fields);
+                    try addMeshDigestContentRow(rows, &h);
+                }
+            },
+            .wards => {
+                if (!link.established()) return true;
+                for (self.warden.all()) |w| {
+                    if (w.scope != .mesh) continue;
+                    var h = RowHasher.init(.wards);
+                    h.any(w);
+                    try addMeshDigestContentRow(rows, &h);
+                }
+            },
+            .access_entries => {
+                if (!link.established() or !link.supportsAccessEventV1()) return true;
+                const identity = self.config.node_identity orelse return true;
+                const local_node = identity.shortId();
+                if (local_node == 0) return true;
+                const now = self.accessNowSeconds();
+                for (self.access.entries.items) |entry| {
+                    if (entry.origin_node != local_node) continue;
+                    if (entry.expires_at) |expires_at| {
+                        if (now >= expires_at) continue;
+                    }
+                    var h = RowHasher.init(.access_entries);
+                    h.bytes("entry");
+                    h.any(entry);
+                    try addMeshDigestContentRow(rows, &h);
+                }
+                for (self.access.tombstones.items) |marker| {
+                    if (marker.origin_node != local_node) continue;
+                    var h = RowHasher.init(.access_entries);
+                    h.bytes("tombstone");
+                    h.any(marker);
+                    try addMeshDigestContentRow(rows, &h);
+                }
+                var foreign = self.access.signedFacts(now);
+                while (foreign.next()) |fact| {
+                    if (fact.origin_node == local_node) continue;
+                    if (fact.present and now -| fact.hlc / 1000 >= self.access.tombstone_ttl_seconds) continue;
+                    var h = RowHasher.init(.access_entries);
+                    h.bytes("foreign");
+                    h.any(fact);
+                    try addMeshDigestContentRow(rows, &h);
+                }
+            },
+            .clones => {
+                if (self.config.max_clones_per_ip_net == 0) return true;
+                var it = self.mesh_clones.localIterator();
+                while (it.next()) |e| {
+                    var h = RowHasher.init(.clones);
+                    h.int(e.key_ptr.*);
+                    h.int(e.value_ptr.*);
+                    try addMeshDigestContentRow(rows, &h);
+                }
+            },
+            .keytrans => {
+                // The producer emits nothing to a peer without the extension.
+                if (!link.supportsKeyTransHead()) return true;
+                var buf: [key_transparency.head_wire_len]u8 = undefined;
+                const wire = self.localKeyTransHeadWire(&buf) orelse return true;
+                var h = RowHasher.init(.keytrans);
+                h.bytes(wire);
+                try addMeshDigestContentRow(rows, &h);
+            },
+        }
+        return true;
+    }
+
+    /// Queue the digest of the family stage just encoded, ordered right
+    /// after its records, so the peer records exactly what it now holds. A
+    /// family that cannot be digested sends an invalidating commit so the
+    /// peer never keeps an older digest for it. False only when queueing
+    /// failed; the caller then retries the whole (idempotent) family.
+    ///
+    /// Only passes started by a DIGEST_NEED commit. Establishment, RESYNC,
+    /// Helix-resume and fallback bursts stay byte-identical to the pre-M03
+    /// wire; the first answered round after them finds an empty book and
+    /// needs every family, which is the full burst the periodic cadence
+    /// would have sent anyway, and its commits seed the book.
+    fn emitMeshDigestCommit(self: *LinuxServer, conn: *ConnState, family: mesh_digest_sync.Family) bool {
+        const link = meshDigestLink(conn) orelse return true;
+        const state = link.digest_sync orelse return true;
+        if (!state.plan_active) return true;
+        const digest = self.meshDigestFamily(conn, family);
+        const commit = mesh_digest_sync.Commit{
+            .id = @backingInt(family),
+            .digest = digest,
+            .buckets = if (digest) |d| mesh_digest_sync.commitCarriesBuckets(family, d.entry_count) else false,
+        };
+        var buf: [mesh_digest_sync.max_commit_len]u8 = undefined;
+        const body = mesh_digest_sync.encodeCommit(&commit, &buf) catch return false;
+        link.sendDigestFrame(.DIGEST_COMMIT, body) catch return false;
+        return true;
+    }
+
+    /// Before encoding one stage of a digest-gated burst: false when the peer
+    /// already holds the family (skip it); true to encode it, with a bucket
+    /// filter installed for a bucket-scoped family the peer held earlier.
+    /// Bursts not started from a DIGEST_NEED always encode every family.
+    fn prepareMeshDigestStage(self: *LinuxServer, conn: *ConnState, family: mesh_digest_sync.Family) bool {
+        const link = conn.s2s_secured orelse return true;
+        const state = link.digest_sync orelse return true;
+        state.active_family = null;
+        if (!state.plan_active) return true;
+        if (!state.plan.sends(family)) {
+            // A skipped stage still runs the side effects its producer
+            // performs besides emitting rows: membership drives the
+            // guest-presence side channel (own retry and frontier state);
+            // opers mints a grant for a live local oper that lacks one (the
+            // mint broadcasts it and changes the next opers digest).
+            switch (family) {
+                .membership => self.driveMeshBurstGuestPresence(conn),
+                .opers => if (self.meshSignKey() != null) self.mintMissingLocalOperGrants(self.grantNowU64()),
+                else => {},
+            }
+            return false;
+        }
+        const prev = state.plan.prevFor(family) orelse return true;
+        const current = self.meshDigestFamily(conn, family) orelse return true;
+        state.active_family = family;
+        state.active_buckets = mesh_digest_sync.differingBuckets(prev, &current);
+        return true;
+    }
+
+    fn clearMeshDigestStageFilter(conn: *ConnState) void {
+        const link = conn.s2s_secured orelse return;
+        const state = link.digest_sync orelse return;
+        state.active_family = null;
+    }
+
+    /// End of a burst pass (or a restart into a full one): the next pass is
+    /// full unless a new DIGEST_NEED starts it.
+    fn endMeshDigestPlan(conn: *ConnState) void {
+        const link = conn.s2s_secured orelse return;
+        const state = link.digest_sync orelse return;
+        state.plan_active = false;
+        state.active_family = null;
+    }
+
+    fn driveMeshBurstGuestPresence(self: *LinuxServer, conn: *ConnState) void {
+        const link = conn.s2s_secured orelse return;
+        if (!link.supportsGuestPresence()) return;
+        self.refreshOrdinaryGuests();
+        if (link.remoteNodeId()) |hop| if (hop != 0) self.driveGuestPresence(hop);
+    }
+
+    /// Periodic round on a digest-capable link: queue a DIGEST_OFFER instead
+    /// of the burst and return true; the burst follows the peer's NEED. An
+    /// offer still unanswered at the next due round (old, lost, malformed or
+    /// rate-limited answer) makes that round a full burst. A staged burst in
+    /// progress is always resumed first.
+    fn offerMeshDigestRound(self: *LinuxServer, conn: *ConnState) bool {
+        if (conn.mesh_burst_stage != .idle) return false;
+        const link = meshDigestLink(conn) orelse return false;
+        const state = link.digestSyncState() orelse return false;
+        if (state.offer_round != 0) {
+            state.offer_round = 0;
+            state.rounds_fallback +|= 1;
+            return false;
+        }
+        var offer = mesh_digest_sync.Offer{ .round = state.takeRound() };
+        var offered: mesh_digest_sync.FamilyMask = 0;
+        for (std.meta.tags(mesh_digest_sync.Family)) |family| {
+            const digest = self.meshDigestFamily(conn, family) orelse continue;
+            offer.entries[offer.len] = .{ .id = @backingInt(family), .entry_count = digest.entry_count, .root = digest.root };
+            offer.len += 1;
+            offered |= family.bit();
+        }
+        if (offered == 0) return false;
+        var buf: [mesh_digest_sync.max_offer_len]u8 = undefined;
+        const body = mesh_digest_sync.encodeOffer(&offer, &buf) catch return false;
+        link.sendDigestFrame(.DIGEST_OFFER, body) catch return false;
+        state.offer_round = offer.round;
+        state.offered = offered;
+        state.rounds_offered +|= 1;
+        _ = self.flushMeshBurstStage(conn);
+        return true;
+    }
+
+    /// Process this link's verified digest frames in arrival order: record
+    /// commits, answer offers, and run the burst a NEED asks for. A dropped
+    /// or undecodable commit forgets every accepted digest (the next round
+    /// then needs every family); an undecodable offer or NEED is ignored and
+    /// the sender falls back to the full burst at its next round.
+    fn drainMeshDigestSync(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink) void {
+        if (!conn.ownsActiveMeshLink(link)) return;
+        const lost = link.takeDigestFramesLost();
+        const frames = link.takeDigestFrames() catch {
+            if (link.digest_sync) |state| state.book.invalidateAll();
+            return;
+        };
+        defer {
+            for (frames) |f| self.allocator.free(f);
+            if (frames.len != 0) self.allocator.free(frames);
+        }
+        if (!lost and frames.len == 0) return;
+        const state = link.digestSyncState() orelse return;
+        if (lost) state.book.invalidateAll();
+        const now = self.nowU64();
+        var queued = false;
+        for (frames) |frame| {
+            if (frame.len == 0) continue;
+            const body = frame[1..];
+            const frame_type = s2s_frame.FrameType.fromTag(frame[0]) orelse continue;
+            switch (frame_type) {
+                .DIGEST_COMMIT => {
+                    const commit = mesh_digest_sync.decodeCommit(body) catch {
+                        state.book.invalidateAll();
+                        continue;
+                    };
+                    state.book.applyCommit(&commit, now);
+                },
+                .DIGEST_OFFER => {
+                    const offer = mesh_digest_sync.decodeOffer(body) catch continue;
+                    if (state.last_answer_ms) |last| {
+                        if (now >= last and now - last < mesh_digest_sync.min_answer_interval_ms) continue;
+                    }
+                    const out = self.allocator.alloc(u8, mesh_digest_sync.max_local_need_len) catch continue;
+                    defer self.allocator.free(out);
+                    const answer = state.book.answer(&offer, now, out) catch continue;
+                    link.sendDigestFrame(.DIGEST_NEED, answer) catch continue;
+                    state.last_answer_ms = now;
+                    queued = true;
+                },
+                .DIGEST_NEED => {
+                    const need = mesh_digest_sync.decodeNeed(body) catch continue;
+                    if (state.offer_round == 0 or need.round != state.offer_round) continue;
+                    state.offer_round = 0;
+                    self.runMeshDigestNeed(conn, state, &need);
+                    if (!conn.ownsActiveMeshLink(link)) return;
+                },
+                else => {},
+            }
+        }
+        if (queued) _ = self.flushMeshBurstStage(conn);
+    }
+
+    /// Sender side of one answered round. Converged peers exchanged only
+    /// digests; otherwise only the needed families (and buckets) are burst.
+    fn runMeshDigestNeed(self: *LinuxServer, conn: *ConnState, state: *mesh_digest_sync.LinkState, need: *const mesh_digest_sync.Need) void {
+        // A burst already in flight (establishment, RESYNC, an earlier
+        // round) covers this one; never splice a plan into it.
+        if (conn.mesh_burst_stage != .idle) return;
+        // Same authority-before-membership ordering as the periodic path.
+        if (conn.session_replica_replay_pending) {
+            conn.session_replica_resync_burst_pending = true;
+            return;
+        }
+        mesh_digest_sync.planFromNeed(need, state.offered, &state.plan);
+        const peer_name = establishedPeerName(conn);
+        if (state.plan.send == 0) {
+            state.rounds_converged +|= 1;
+            if (peer_name) |name| {
+                self.notePeerAntiEntropy(name);
+                if (self.peer_health.get(name)) |h| h.anti_entropy_quiet_repairs +|= 1;
+            }
+            return;
+        }
+        state.plan_active = true;
+        state.rounds_partial +|= 1;
+        if (peer_name) |name| {
+            if (self.peer_health.get(name)) |h| h.value_sync = .syncing;
+        }
+        if (self.sendMeshStateBurstTo(conn)) {
+            if (peer_name) |name| {
+                self.notePeerAntiEntropy(name);
+                if (self.peer_health.get(name)) |h| h.anti_entropy_quiet_repairs +|= 1;
+            }
+        }
+    }
+
     /// Burst all currently wired local mesh state to ONE peer link. This wrapper
     /// is shared by the one-shot link-establish burst and the periodic
     /// anti-entropy cadence so new state families have one re-sync hook.
+    /// A pass started from an M03 DIGEST_NEED skips the families the peer
+    /// already holds (`prepareMeshDigestStage`) and follows each encoded
+    /// family with its DIGEST_COMMIT; every other pass is unchanged.
     fn sendMeshStateBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         if (!conn.isActiveMeshPeer()) return false;
         if (conn.mesh_burst_stage == .idle) conn.mesh_burst_stage = .membership;
 
         while (conn.mesh_burst_stage != .idle) {
-            if (!conn.mesh_burst_stage_encoded) {
-                // A producer may have failed after emitting an earlier row of
-                // this family. Commit that complete-record prefix before retrying
-                // the family; re-emitted CRDT rows are idempotent, while silently
-                // advancing the stage would permanently omit the failed row.
-                if (!self.flushMeshBurstStage(conn)) return false;
-                const encoded = switch (conn.mesh_burst_stage) {
-                    .idle => unreachable,
-                    .membership => self.sendMembershipBurstTo(conn),
-                    .mode_flags => self.sendChannelModeFlagsBurstTo(conn),
-                    .mode_state => self.sendChannelModeStateBurstTo(conn),
-                    .channel_props => self.sendChannelPropBurstTo(conn),
-                    .entity_props => self.sendEntityPropBurstTo(conn),
-                    .topics => self.sendTopicBurstTo(conn),
-                    .opers => self.sendLocalOperBurstTo(conn),
-                    .wards => self.sendMeshWardsTo(conn),
-                    .access_entries => self.sendAccessBurstTo(conn),
-                    .clones => if (conn.s2s_secured) |link|
-                        self.sendCloneAntiEntropy(conn, link)
-                    else if (conn.s2s) |link|
-                        self.sendCloneAntiEntropy(conn, link)
-                    else
-                        true,
-                    .keytrans => if (conn.s2s_secured) |link|
-                        self.sendKeyTransHeadOn(link)
-                    else if (conn.s2s) |link|
-                        self.sendKeyTransHeadOn(link)
-                    else
-                        true,
-                };
-                if (!encoded) {
-                    // Preserve/flush any complete rows emitted before the
-                    // failure, but leave the family uncommitted for a full retry.
-                    _ = self.flushMeshBurstStage(conn);
-                    return false;
+            // `break :advance` skips a family the peer already holds.
+            advance: {
+                if (!conn.mesh_burst_stage_encoded) {
+                    // A producer may have failed after emitting an earlier row of
+                    // this family. Commit that complete-record prefix before retrying
+                    // the family; re-emitted CRDT rows are idempotent, while silently
+                    // advancing the stage would permanently omit the failed row.
+                    if (!self.flushMeshBurstStage(conn)) return false;
+                    const family = meshBurstStageFamily(conn.mesh_burst_stage).?;
+                    if (!self.prepareMeshDigestStage(conn, family)) break :advance;
+                    const encoded = switch (conn.mesh_burst_stage) {
+                        .idle => unreachable,
+                        .membership => self.sendMembershipBurstTo(conn),
+                        .mode_flags => self.sendChannelModeFlagsBurstTo(conn),
+                        .mode_state => self.sendChannelModeStateBurstTo(conn),
+                        .channel_props => self.sendChannelPropBurstTo(conn),
+                        .entity_props => self.sendEntityPropBurstTo(conn),
+                        .topics => self.sendTopicBurstTo(conn),
+                        .opers => self.sendLocalOperBurstTo(conn),
+                        .wards => self.sendMeshWardsTo(conn),
+                        .access_entries => self.sendAccessBurstTo(conn),
+                        .clones => if (conn.s2s_secured) |link|
+                            self.sendCloneAntiEntropy(conn, link)
+                        else if (conn.s2s) |link|
+                            self.sendCloneAntiEntropy(conn, link)
+                        else
+                            true,
+                        .keytrans => if (conn.s2s_secured) |link|
+                            self.sendKeyTransHeadOn(link)
+                        else if (conn.s2s) |link|
+                            self.sendKeyTransHeadOn(link)
+                        else
+                            true,
+                    };
+                    clearMeshDigestStageFilter(conn);
+                    if (!encoded or !self.emitMeshDigestCommit(conn, family)) {
+                        // Preserve/flush any complete rows emitted before the
+                        // failure, but leave the family uncommitted for a full retry.
+                        _ = self.flushMeshBurstStage(conn);
+                        return false;
+                    }
+                    conn.mesh_burst_stage_encoded = true;
                 }
-                conn.mesh_burst_stage_encoded = true;
+                if (!self.flushMeshBurstStage(conn)) return false;
+                conn.mesh_burst_stage_encoded = false;
             }
-            if (!self.flushMeshBurstStage(conn)) return false;
-            conn.mesh_burst_stage_encoded = false;
             conn.mesh_burst_stage = switch (conn.mesh_burst_stage) {
                 .idle => unreachable,
                 .membership => .mode_flags,
@@ -23519,9 +25007,13 @@ pub const LinuxServer = struct {
                 .clones => .keytrans,
                 .keytrans => .idle,
             };
-            if (conn.mesh_burst_stage == .idle and conn.mesh_burst_restart_pending) {
-                conn.mesh_burst_restart_pending = false;
-                conn.mesh_burst_stage = .membership;
+            if (conn.mesh_burst_stage == .idle) {
+                // A digest-gated pass ends here; a restart is always full.
+                endMeshDigestPlan(conn);
+                if (conn.mesh_burst_restart_pending) {
+                    conn.mesh_burst_restart_pending = false;
+                    conn.mesh_burst_stage = .membership;
+                }
             }
         }
         return true;
@@ -23760,6 +25252,7 @@ pub const LinuxServer = struct {
         const hlc = self.nextMeshHlc();
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
+            if (!meshDigestRowWanted(conn, .mode_flags, cv.name)) continue;
             const flags = self.channelModeFlagBits(cv.name);
             if (conn.s2s_secured) |link| {
                 link.sendChannelModeFlags(cv.name, flags, hlc) catch return false;
@@ -23860,6 +25353,7 @@ pub const LinuxServer = struct {
         const hlc = self.nextMeshHlc();
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
+            if (!meshDigestRowWanted(conn, .mode_state, cv.name)) continue;
             const ev = self.channelModeStateEvent(cv.name, hlc);
             if (conn.s2s_secured) |link| {
                 link.sendChannelModeState(ev) catch return false;
@@ -24923,6 +26417,8 @@ pub const LinuxServer = struct {
         var it = self.channel_prop_clocks.iterator();
         while (it.next()) |entry| {
             const clock = entry.value_ptr;
+            const digest_key = meshDigestPropKey(clock.channel, clock.key);
+            if (!meshDigestRowWanted(conn, .channel_props, &digest_key)) continue;
             var present = clock.present;
             var value: []const u8 = "";
             var owner: []const u8 = clock.owner;
@@ -26984,6 +28480,20 @@ pub const LinuxServer = struct {
     }
 
     fn applyRemoteChannelList(self: *LinuxServer, ch: anytype) bool {
+        const changed = self.applyRemoteChannelListFact(ch);
+        // A peer's write makes earlier local changes of this entry unsafe to
+        // undo (`AUDIT UNDO` refuses them as drift). An unchanged re-burst of
+        // state this node already holds marks nothing.
+        if (changed) {
+            if (self.moderation_list_ledger) |ledger| {
+                if (self.channelListEpoch(ch.channel)) |epoch|
+                    ledger.observeExternal(moderation_undo.FactKey.ofChannelList(ch.kind, ch.channel, ch.mask, epoch));
+            }
+        }
+        return changed;
+    }
+
+    fn applyRemoteChannelListFact(self: *LinuxServer, ch: anytype) bool {
         if (ch.present) {
             self.noteChannelClock();
             self.world.ensureRemoteListChannel(ch.channel) catch return false;
@@ -27427,6 +28937,7 @@ pub const LinuxServer = struct {
         if (!conn.isActiveMeshPeer()) return false;
         var cit = self.world.channelIterator();
         while (cit.next()) |cv| {
+            if (!meshDigestRowWanted(conn, .topics, cv.name)) continue;
             const info = self.world.topicInfo(cv.name) orelse continue;
             if (info.text.len == 0) continue;
             const hlc = self.nextMeshHlc();
@@ -28773,7 +30284,7 @@ pub const LinuxServer = struct {
     }
 
     fn partOne(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, channel: []const u8, reason: ?[]const u8) !void {
-        if (!self.world.channelExists(channel)) {
+        if (self.channelConcealedOrMissing(id, channel, false)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
@@ -29375,6 +30886,7 @@ pub const LinuxServer = struct {
                     arg_index += 1;
                     var policy_snap: ?PolicyUndo = self.snapshotBan() catch null;
                     defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
+                    const list_before = self.channelListSnapshot(channel, .ban, mask);
                     const changed = if (adding)
                         (self.world.addBan(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
@@ -29387,7 +30899,11 @@ pub const LinuxServer = struct {
                             self.commitPolicy(snap);
                             policy_snap = null;
                         }
-                        _ = self.recordOperAudit(list_setter, .other, mask, "ban change");
+                        const audit_mark = self.oper_audit.newestSeq();
+                        const ban_proof = self.recordOperAudit(list_setter, .other, mask, "ban change");
+                        const ban_seq = self.oper_audit.newestSeq() orelse 0;
+                        const paired_seq = if (audit_mark != null and audit_mark.? == ban_seq) 0 else ban_seq;
+                        self.recordChannelListChange(&list_before, conn.session.displayName(), paired_seq, if (ban_proof) |*pid| pid[0..] else "");
                         const sign: u8 = if (adding) '+' else '-';
                         appendParamMode(&applied, &targets, &emitted_sign, sign, 'b', mask);
                         self.announceChannelList(channel, .ban, mask, list_setter, list_set_at, adding);
@@ -29401,6 +30917,7 @@ pub const LinuxServer = struct {
                     }
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
+                    const list_before = self.channelListSnapshot(channel, .exempt, mask);
                     const changed = if (adding)
                         (self.world.addExempt(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
@@ -29409,6 +30926,7 @@ pub const LinuxServer = struct {
                     else
                         (self.world.removeExempt(channel, mask) catch continue);
                     if (changed) {
+                        self.recordChannelListChange(&list_before, conn.session.displayName(), 0, "");
                         appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'e', mask);
                         self.announceChannelList(channel, .exempt, mask, list_setter, list_set_at, adding);
                     }
@@ -29421,6 +30939,7 @@ pub const LinuxServer = struct {
                     }
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
+                    const list_before = self.channelListSnapshot(channel, .invex, mask);
                     const changed = if (adding)
                         (self.world.addInvex(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
@@ -29429,6 +30948,7 @@ pub const LinuxServer = struct {
                     else
                         (self.world.removeInvex(channel, mask) catch continue);
                     if (changed) {
+                        self.recordChannelListChange(&list_before, conn.session.displayName(), 0, "");
                         appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'I', mask);
                         self.announceChannelList(channel, .invex, mask, list_setter, list_set_at, adding);
                     }
@@ -29442,6 +30962,7 @@ pub const LinuxServer = struct {
                     }
                     const mask = parsed.paramSlice()[arg_index];
                     arg_index += 1;
+                    const list_before = self.channelListSnapshot(channel, .quiet, mask);
                     const changed = if (adding)
                         (self.world.addMute(channel, mask, list_setter, list_set_at) catch |e| {
                             try self.maybeListFull(conn, channel, mask, e);
@@ -29450,6 +30971,7 @@ pub const LinuxServer = struct {
                     else
                         (self.world.removeMute(channel, mask) catch continue);
                     if (changed) {
+                        self.recordChannelListChange(&list_before, conn.session.displayName(), 0, "");
                         appendParamMode(&applied, &targets, &emitted_sign, if (adding) '+' else '-', 'Z', mask);
                         self.announceChannelList(channel, .quiet, mask, list_setter, list_set_at, adding);
                     }
@@ -29486,7 +31008,7 @@ pub const LinuxServer = struct {
                         // must hold ops there — so you can't dump users into an
                         // arbitrary channel you don't run.
                         if (!conn.session.isOper()) {
-                            if (!self.world.channelExists(target)) {
+                            if (self.channelConcealedOrMissing(id, target, false)) {
                                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                                 continue;
                             }
@@ -29723,7 +31245,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"KICK"}, "Not enough parameters");
             return;
         };
-        if (!self.world.channelExists(args.channel)) {
+        if (self.channelConcealedOrMissing(id, args.channel, overrideActive(conn))) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{args.channel}, "No such channel");
             return;
         }
@@ -29960,6 +31482,23 @@ pub const LinuxServer = struct {
     fn channelHiddenFromWhois(self: *LinuxServer, channel: []const u8, viewer_wid: world_model.ClientId) bool {
         if (!self.world.channelHasFlag(channel, .secret) and !self.world.isPrivate(channel) and !self.world.isHidden(channel)) return false;
         return !self.world.isMember(channel, viewer_wid);
+    }
+
+    /// Q01: true when `channel` must answer client `id` exactly like a missing
+    /// channel: absent, or concealed (the `channelHiddenFromWhois` predicate)
+    /// from a non-member. `override_active` is only the carve-out the calling
+    /// site already honors for this action; it never revives a missing name.
+    fn channelConcealedOrMissing(self: *LinuxServer, id: client_model.ClientId, channel: []const u8, override_active: bool) bool {
+        return existence_privacy.gateChannel(.{
+            .exists = self.world.channelExists(channel),
+            .concealment = .{
+                .secret = self.world.channelHasFlag(channel, .secret),
+                .private = self.world.isPrivate(channel),
+                .hidden = self.world.isHidden(channel),
+            },
+            .member = self.world.isMember(channel, worldIdFromClient(id)),
+            .override_active = override_active,
+        }) == .no_such_channel;
     }
 
     /// Emit one RPL_WHOSPCRPL (354) row. Flags are `<H|G>[*][<prefix>]`: away,
@@ -32099,7 +33638,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NOSUCHNICK, &.{args.nick}, "No such nick");
             return;
         };
-        if (!self.world.channelExists(args.channel)) {
+        if (self.channelConcealedOrMissing(id, args.channel, conn.session.hasPriv(.oper_override))) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{args.channel}, "No such channel");
             return;
         }
@@ -32504,7 +34043,7 @@ pub const LinuxServer = struct {
         };
         const old = args.old_channel;
         const new = args.new_channel;
-        if (!self.world.channelExists(old)) {
+        if (self.channelConcealedOrMissing(id, old, false)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{old}, "No such channel");
             return;
         }
@@ -32860,7 +34399,7 @@ pub const LinuxServer = struct {
             return;
         }
         const channel = parsed.paramSlice()[0];
-        if (!world_model.isChannelName(channel) or !self.world.channelExists(channel)) {
+        if (!world_model.isChannelName(channel) or self.channelConcealedOrMissing(id, channel, conn.session.isOper())) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
@@ -33004,7 +34543,7 @@ pub const LinuxServer = struct {
         const params = parsed.paramSlice();
         const channel = params[0];
         const sub = params[1];
-        if (!self.world.channelExists(channel)) {
+        if (self.channelConcealedOrMissing(id, channel, false)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
@@ -34832,15 +36371,38 @@ pub const LinuxServer = struct {
             },
         }
 
-        const replay = self.renderHistoryReplayOwned(conn, "1", target, found, topic_filter) catch {
-            try self.failReply(conn, "CHATHISTORY", "REPLAY_TOO_LARGE", "History replay is too large; request fewer messages");
-            return;
-        };
-        defer self.allocator.free(replay);
-        appendHistoryReplay(conn, replay) catch {
-            self.poisonOwnedDelivery(conn);
-            return;
-        };
+        // Replay pages under its own budget: halve the page (keeping the end
+        // nearest the request anchor) until it fits, and never answer a
+        // nonempty page with an empty batch that would read as end-of-history.
+        const keep_head = req == .after or req == .between;
+        var page = found;
+        const turn = &self.rx().output_class_turn;
+        while (true) {
+            const replay = self.renderHistoryReplayOwned(conn, "1", target, page, topic_filter) catch {
+                try self.failReply(conn, "CHATHISTORY", "REPLAY_TOO_LARGE", "History replay is too large; request fewer messages");
+                return;
+            };
+            defer self.allocator.free(replay);
+            const websocket_open = if (conn.ws) |ws| ws.phase == .open else false;
+            const userspace_tls = if (conn.tls) |tls| tls.handshakeDone() and !conn.tls_tx_offloaded else false;
+            const charge = linewiseReplayRawBound(replay, websocket_open, userspace_tls) orelse replay.len;
+            const decision = turn.decide(self.output_class_policy, .replay, sendq.backlog(conn), conn.sendq_cap, charge);
+            if (decision == .admit) {
+                appendHistoryReplay(conn, replay) catch {
+                    self.poisonOwnedDelivery(conn);
+                    return;
+                };
+                turn.commit(.replay, charge);
+                return;
+            }
+            if (page.len <= 1) {
+                turn.record(.replay, decision);
+                try self.failReply(conn, "CHATHISTORY", "TEMPORARILY_UNAVAILABLE", "History replay is deferred while output drains; retry shortly");
+                return;
+            }
+            const keep = page.len / 2;
+            page = if (keep_head) page[0..keep] else page[page.len - keep ..];
+        }
     }
 
     /// A CHATHISTORY entry is a draft/event-playback EVENT (rather than an
@@ -36429,6 +37991,9 @@ pub const LinuxServer = struct {
     }
 
     fn finishDeferredSessionAutojoin(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, restored: bool) void {
+        // Every successful RESUME path reports `restored`; record it before the
+        // one-shot deferral latch can return early.
+        if (restored) self.noteSessionCredentialResumed(id, conn);
         if (!conn.resume_autojoin_deferred) return;
         conn.resume_autojoin_deferred = false;
         conn.resume_autojoin_deadline_ms = 0;
@@ -36437,6 +38002,36 @@ pub const LinuxServer = struct {
         // a stale WARN cannot refuse every later Helix UPGRADE indefinitely.
         conn.preserve_resume_credential_once = false;
         if (!restored) self.applyAutojoin(id, conn);
+    }
+
+    /// T09: a successful resume reused an existing credential instead of
+    /// minting one. The resumed token becomes the one this connection holds,
+    /// so a following SESSION TOKEN is a re-emission, not a fresh mint.
+    fn noteSessionCredentialResumed(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) void {
+        const account = conn.session.account() orelse return;
+        const handle = self.sessions.resumeHandleForClient(account, monitorIdFromClient(id)) orelse return;
+        if (tokenIsNull(handle.token)) return;
+        conn.session_credential_held = handle.token;
+        self.noteSessionCredentialReused();
+    }
+
+    fn noteSessionCredentialReused(self: *LinuxServer) void {
+        lockSpin(&self.session_credential_churn_mu);
+        defer self.session_credential_churn_mu.unlock();
+        self.session_credential_churn.noteReuse();
+    }
+
+    /// T09: SESSION TOKEN published `token`. Re-emitting the token this
+    /// connection already holds (resumed or previously published) is not
+    /// churn; publishing any other token counts one fresh mint. Publication is
+    /// counted, never withheld: the token was minted at registration, so
+    /// withholding it bounds nothing and would strand the client.
+    fn noteSessionCredentialPublished(self: *LinuxServer, conn: *ConnState, account: []const u8, token: sessions_mod.Token) void {
+        if (std.mem.eql(u8, &conn.session_credential_held, &token)) return;
+        conn.session_credential_held = token;
+        lockSpin(&self.session_credential_churn_mu);
+        defer self.session_credential_churn_mu.unlock();
+        self.session_credential_churn.noteFresh(account, self.nowMs());
     }
 
     fn sweepDeferredSessionAutojoins(self: *LinuxServer) void {
@@ -36577,6 +38172,7 @@ pub const LinuxServer = struct {
         }
         var policy_snap: ?PolicyUndo = self.snapshotWard() catch null;
         defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
+        const undo_before = self.moderationSnapshot(moderation_undo.FactKey.ofWard(match, pattern));
         const now = platform.realtimeMillis();
         const ward = warden.Ward{
             .match = match,
@@ -36603,13 +38199,15 @@ pub const LinuxServer = struct {
         // Act on already-connected clients now — a ban must bite during a live
         // raid, not only refuse the abuser's next reconnect.
         self.reapWardMatches();
-        const proof_id = self.recordOperAudit(conn.session.displayName(), audit_action, pattern, if (reason.len != 0) reason else "WARD ADD");
+        const receipt = self.recordModerationAudit(&undo_before, conn.session.displayName(), audit_action, if (reason.len != 0) reason else "WARD ADD");
+        const proof_id = receipt.proof_id;
         var b: [default_reply_bytes]u8 = undefined;
         const note = if (proof_id) |pid|
             std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s} proof={s}", .{ match.token(), pattern, scope.token(), action.token(), pid[0..] }) catch return
         else
             std.fmt.bufPrint(&b, "WARD ADD {s} {s} {s}/{s}", .{ match.token(), pattern, scope.token(), action.token() }) catch return;
-        try self.publishOperEvent(.oper_action, .notice, note);
+        var cb: [default_reply_bytes]u8 = undefined;
+        try self.publishOperEvent(.oper_action, .notice, withChangeId(&cb, note, receipt.change_id));
     }
 
     pub fn deleteWardLive(self: *LinuxServer, conn: *ConnState, match: warden.Match, pattern: []const u8) !void {
@@ -36629,6 +38227,7 @@ pub const LinuxServer = struct {
         else
             null;
         defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
+        const undo_before = self.moderationSnapshot(moderation_undo.FactKey.ofWard(match, pattern));
         const removed = self.warden.remove(match, pattern);
         if (removed) {
             if (policy_snap) |snap| {
@@ -36649,13 +38248,15 @@ pub const LinuxServer = struct {
             }
         }
         const status = if (removed) "removed" else "not found";
-        const proof_id = self.recordOperAudit(conn.session.displayName(), .ward_del, pattern, status);
+        const receipt = self.recordModerationAudit(&undo_before, conn.session.displayName(), .ward_del, status);
+        const proof_id = receipt.proof_id;
         var b: [default_reply_bytes]u8 = undefined;
         const note = if (proof_id) |pid|
             std.fmt.bufPrint(&b, "WARD DEL {s} {s}: {s} proof={s}", .{ match.token(), pattern, status, pid[0..] }) catch return
         else
             std.fmt.bufPrint(&b, "WARD DEL {s} {s}: {s}", .{ match.token(), pattern, status }) catch return;
-        try self.publishOperEvent(.oper_action, .notice, note);
+        var cb: [default_reply_bytes]u8 = undefined;
+        try self.publishOperEvent(.oper_action, .notice, withChangeId(&cb, note, receipt.change_id));
     }
 
     /// `WARD <ADD|DEL|LIST|TEST> …` — the unified network-ban command for admins
@@ -36666,7 +38267,11 @@ pub const LinuxServer = struct {
     ///   DEL  <match> <pattern>
     ///   LIST [match]
     ///   TEST <match> <value>
+    ///   PREVIEW <match> <pattern> [scope] [action] [secs] [reason] [-- subject...]
     pub fn handleWard(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const p = parsed.paramSlice();
+        if (p.len >= 1 and std.ascii.eqlIgnoreCase(p[0], "PREVIEW"))
+            return ward_preview.handle(self, conn, p[1..], platform.realtimeMillis());
         return oper_cmd.handleWard(self, conn, parsed);
     }
 
@@ -36782,6 +38387,8 @@ pub const LinuxServer = struct {
     /// handoff point. No socket custody moves until that image is challenged.
     pub fn handleUpgradeCommand(self: *LinuxServer, conn: *ConnState, params: []const []const u8) !void {
         if (!self.requirePriv(conn, .server_restart)) return;
+        // M10: `UPGRADE PLAN` is a read-only dry run; it never queues an upgrade.
+        if (params.len == 1 and std.ascii.eqlIgnoreCase(params[0], "PLAN")) return self.emitUpgradePlan(conn);
         if (params.len > 1 or (params.len == 1 and (builtin.os.tag != .windows or
             params[0].len < 3 or !std.ascii.isAlphabetic(params[0][0]) or
             params[0][1] != ':' or (params[0][2] != '\\' and params[0][2] != '/') or
@@ -36831,6 +38438,195 @@ pub const LinuxServer = struct {
             return;
         }
         self.deferUpgrade(.{ .client = idFromToken(conn.token) });
+    }
+
+    /// M10 `UPGRADE PLAN`: account for every occupied physical attachment on
+    /// every reactor (the caller's completion holds World's write lock, as the
+    /// continuity inventory requires) and report carry/resume/drop totals with
+    /// every known blocker. The exec-time capability probe has not run, so the
+    /// target is `unproven` and the verdict can never be `seamless`. Every
+    /// distinct continuity blocker is listed, in inventory order, so the first
+    /// continuity name is the refusal UPGRADE would give and the rest are what
+    /// an operator must also clear before a hot upgrade can proceed.
+    /// Read-only and process-local: nothing is queued, sealed or carried.
+    fn emitUpgradePlan(self: *LinuxServer, conn: *ConnState) !void {
+        var blockers: [2 + std.enums.values(UpgradeContinuityBlocker).len]maintenance_plan.Blocker = undefined;
+        var blocker_len: usize = 0;
+        blockers[blocker_len] = .target_probe_unproven;
+        blocker_len += 1;
+        if (self.upgradePlanPreflightBlocker()) |blocker| {
+            blockers[blocker_len] = blocker;
+            blocker_len += 1;
+        }
+        const continuity = self.upgradeContinuityBlockersLocked();
+        for (continuity.ordered()) |blocker| {
+            blockers[blocker_len] = upgradePlanContinuityBlocker(blocker);
+            blocker_len += 1;
+        }
+        var rows: std.ArrayList(maintenance_plan.AttachmentRow) = .empty;
+        defer rows.deinit(self.allocator);
+        for (self.reactors) |*reactor| {
+            var entries = reactor.clients.iterator();
+            while (entries.next()) |entry| {
+                if (rows.items.len == maintenance_plan.max_rows) {
+                    try self.noticeTo(conn, "UPGRADE PLAN refused: more physical attachments than one Helix relation can carry");
+                    return;
+                }
+                rows.append(self.allocator, self.upgradePlanRow(entry.id, entry.value)) catch {
+                    try self.noticeTo(conn, "UPGRADE PLAN refused: out of memory");
+                    return;
+                };
+            }
+        }
+        const scratch = self.allocator.alloc(maintenance_plan.Disposition, rows.items.len) catch {
+            try self.noticeTo(conn, "UPGRADE PLAN refused: out of memory");
+            return;
+        };
+        defer self.allocator.free(scratch);
+        const compat: maintenance_plan.Compatibility = .{ .target = .unproven, .blockers = blockers[0..blocker_len] };
+        const dispositions = maintenance_plan.build(rows.items, compat, scratch) catch |err| {
+            var buf: [128]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&buf, "UPGRADE PLAN refused: inconsistent attachment inventory ({s})", .{@errorName(err)}) catch "UPGRADE PLAN refused: inconsistent attachment inventory");
+            return;
+        };
+        const plan = maintenance_plan.summarize(dispositions, compat) catch {
+            try self.noticeTo(conn, "UPGRADE PLAN refused: inconsistent attachment inventory");
+            return;
+        };
+        plan.verifyAccounting() catch {
+            try self.noticeTo(conn, "UPGRADE PLAN refused: attachment accounting mismatch");
+            return;
+        };
+        var text: [maintenance_plan.max_rendered_lines * maintenance_plan.max_line_len]u8 = undefined;
+        const lines = maintenance_plan.renderLines(plan, compat.blockers, &text) catch {
+            try self.noticeTo(conn, "UPGRADE PLAN refused: blocker list does not fit");
+            return;
+        };
+        for (lines.slice()) |line| try self.noticeTo(conn, line);
+        try self.noticeTo(conn, "UPGRADE PLAN: dry run; nothing queued; the target probe runs only at UPGRADE and seamless requires carry=total with no blockers");
+    }
+
+    fn upgradePlanRow(self: *LinuxServer, id: client_model.ClientId, conn: *const ConnState) maintenance_plan.AttachmentRow {
+        const mesh = conn.s2s != null or conn.s2s_secured != null;
+        if (mesh) {
+            const canonical = self.canonicalMeshCaptureOwner(conn);
+            return .{
+                .old_client = monitorIdFromClient(id),
+                .role = if (canonical) .canonical_mesh else .unregistered,
+                .transport = .s2s,
+                .registered = canonical,
+                .resumable = false,
+                // Matches `sealShardClients`: only an established secured link
+                // owned by its canonical capture owner carries its fd. A
+                // plaintext or unestablished link re-dials instead.
+                .helix_carriable = canonical and conn.fd >= 0 and !conn.closing and
+                    (if (conn.s2s_secured) |link| link.established() else false),
+                .carry_gap = if (canonical) null else .non_canonical_mesh_owner,
+            };
+        }
+        const registered = conn.session.registered();
+        const carriable = conn.fd >= 0 and !conn.closing and (if (conn.ws) |ws| wsCarryable(ws) else true);
+        return .{
+            .old_client = monitorIdFromClient(id),
+            .role = .client,
+            .transport = if (conn.ws != null) .ws else if (conn.tls != null) .tls else .plain,
+            .registered = registered,
+            .resumable = registered and self.attachmentHasReusableSession(id),
+            .helix_carriable = carriable,
+            .carry_gap = if (carriable) null else .other,
+        };
+    }
+
+    /// M10 seal-time reconcile, step 1: the pre-seal `UPGRADE PLAN` inventory
+    /// of every occupied physical attachment on every reactor, built with the
+    /// same `upgradePlanRow` the dry run uses. Called at the parked complete
+    /// cut (siblings quiesced) immediately before the shard seal loop, so the
+    /// inventory and the seal observe the same connection set. Caller owns the
+    /// returned slice. More rows than one Helix relation can describe is
+    /// refused (the seal would refuse the fd manifest anyway).
+    fn upgradeSealInventory(self: *LinuxServer) ![]maintenance_plan.AttachmentRow {
+        // Count by the same iterator the fill uses (not a cached live count),
+        // so the two passes can only disagree if the parked cut moved.
+        var count: usize = 0;
+        for (self.reactors) |*reactor| {
+            var entries = reactor.clients.iterator();
+            while (entries.next()) |_| count += 1;
+        }
+        if (count > maintenance_plan.max_rows) return error.UpgradeInventoryTooLarge;
+        const rows = try self.allocator.alloc(maintenance_plan.AttachmentRow, count);
+        errdefer self.allocator.free(rows);
+        var len: usize = 0;
+        for (self.reactors) |*reactor| {
+            var entries = reactor.clients.iterator();
+            while (entries.next()) |entry| {
+                if (len == rows.len) return error.UpgradeInventoryMismatch;
+                rows[len] = self.upgradePlanRow(entry.id, entry.value);
+                len += 1;
+            }
+        }
+        if (len != rows.len) return error.UpgradeInventoryMismatch;
+        return rows;
+    }
+
+    /// M10 seal-time reconcile, step 2: prove the physical relation actually
+    /// sealed into `pieces` carries exactly the attachments the pre-seal
+    /// inventory says a compatible target carries — each once, with the right
+    /// role — and nothing else. The exec-time probe has already passed, so the
+    /// target is `compatible`; continuity blockers were refused earlier and do
+    /// not change per-row dispositions. Read-only over `pieces`; allocation
+    /// failure or any mismatch is an error and the caller refuses the upgrade.
+    /// A successful seal of every live attachment always reconciles, so this
+    /// never changes a successful upgrade.
+    fn reconcileUpgradeSeal(
+        self: *LinuxServer,
+        rows: []const maintenance_plan.AttachmentRow,
+        pieces: []const helix_live.StatePiece,
+        carried_fd_count: usize,
+    ) !void {
+        var wire: ?[]const u8 = null;
+        for (pieces) |piece| if (piece.kind == .physical_connection_relation) {
+            if (wire != null) return error.InvalidInheritedHandoff;
+            wire = piece.bytes;
+        };
+        const view = try physical_connection_relation.validateWire(wire orelse return error.InvalidInheritedHandoff, helix_live.max_inherited_state_fds, carried_fd_count);
+        var relation: std.ArrayList(physical_connection_relation.Entry) = .empty;
+        defer relation.deinit(self.allocator);
+        var it = view.iterator();
+        while (it.next()) |entry| {
+            if (relation.items.len == maintenance_plan.max_rows) return error.UpgradeInventoryTooLarge;
+            try relation.append(self.allocator, entry);
+        }
+        const compat: maintenance_plan.Compatibility = .{ .target = .compatible };
+        const dispositions = try self.allocator.alloc(maintenance_plan.Disposition, rows.len);
+        defer self.allocator.free(dispositions);
+        _ = try maintenance_plan.build(rows, compat, dispositions);
+        const plan = try maintenance_plan.summarize(dispositions, compat);
+        const scratch = try self.allocator.alloc(bool, relation.items.len);
+        defer self.allocator.free(scratch);
+        try maintenance_plan.reconcileSealed(plan, compat, rows, dispositions, relation.items, scratch);
+    }
+
+    /// Exhaustive by name: a new `UpgradeContinuityBlocker` tag without a
+    /// `maintenance_plan.Blocker` twin fails to compile instead of vanishing.
+    fn upgradePlanContinuityBlocker(blocker: UpgradeContinuityBlocker) maintenance_plan.Blocker {
+        return switch (blocker) {
+            inline else => |tag| @field(maintenance_plan.Blocker, @tagName(tag)),
+        };
+    }
+
+    /// Read-only twin of `upgradeRefusedForListenerChange` for `UPGRADE PLAN`:
+    /// the same checks in the same order, reported as a blocker, no NOTICE.
+    fn upgradePlanPreflightBlocker(self: *LinuxServer) ?maintenance_plan.Blocker {
+        const path = self.config.config_path orelse return null;
+        const io = self.config.crypto_io orelse return .config_unreadable;
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(config_format.max_config_bytes)) catch return .config_unreadable;
+        defer self.allocator.free(text);
+        var parsed = config_format.parseToml(self.allocator, text, self.config.config_resolver) catch return .config_unreadable;
+        defer parsed.deinit(self.allocator);
+        if (!session_group_retired_policy.same(parsed.mesh.retired_session_group_fences, self.config.retired_session_group_fences)) return .retired_fence_change;
+        self.validateProspectiveSessionReplicaAuthority(parsed) catch return .prospective_authority;
+        if (config_format.listenerChangeError(self.configuredListenerSet(), config_format.listenerSetFromConfig(parsed)) != null) return .listener_change;
+        return null;
     }
 
     /// Ports the process is actually serving. Zero means that listener is off.
@@ -38250,6 +40046,37 @@ pub const LinuxServer = struct {
             return null;
         };
 
+        // T07 attachment-revoke fences (Denials, ReplayGuard, retained SAR1
+        // wires and the unfinished-close latch) are security state: a
+        // successor without them would reopen bare-token rejoin for the rest
+        // of the fence window and keep a revoked live attachment that hit
+        // close contention. They ride the mesh_checkpoint family as SARS.
+        // A node that never armed a fence has no state and seals no piece;
+        // absence adopts as no fences, exactly the predecessor's state.
+        if (self.session_attachment_revoke_state) |revoke_state| {
+            const revoke_wire = session_attachment_revoke.encodeCheckpoint(
+                self.allocator,
+                revoke_state,
+                self.sessionAttachmentRevokeNow(),
+            ) catch |err| {
+                srvLog("onyx-server: UPGRADE attachment-revoke checkpoint seal failed ({s})\n", .{@errorName(err)});
+                return null;
+            };
+            blobs.append(self.allocator, revoke_wire) catch {
+                srvLog("onyx-server: UPGRADE attachment-revoke blob ownership append failed\n", .{});
+                self.allocator.free(revoke_wire);
+                return null;
+            };
+            pieces.append(self.allocator, .{
+                .kind = .mesh_checkpoint,
+                .bytes = revoke_wire,
+                .min_supported = 2,
+            }) catch {
+                srvLog("onyx-server: UPGRADE attachment-revoke piece append failed\n", .{});
+                return null;
+            };
+        }
+
         // Reply threads ride the same mesh_checkpoint family under a different
         // magic. Absence stays legal. An empty image is still sealed.
         const thread_wire = thread_snapshot.encodeFrom(self.allocator, &self.threads) catch |err| {
@@ -39019,63 +40846,114 @@ pub const LinuxServer = struct {
     /// serialize yet. The caller holds World's write lock, which is the server's
     /// mutation boundary for MediaRooms/signaling. Transport predicates take
     /// their own pump locks; bridge values are inspected under their owner lock.
+    /// Returns the FIRST blocker in inventory order: the one UPGRADE refuses with.
     fn upgradeContinuityBlockerLocked(self: *LinuxServer) ?UpgradeContinuityBlocker {
-        if (self.hasLocalQuitCapture()) return .remote_visible_identity;
-        for (self.reactors) |*reactor| if (reactor.retained_fabric_count != 0) return .pending_fabric_output;
+        var scan: UpgradeContinuityScan = .{ .stop_at_first = true };
+        self.scanUpgradeContinuityBlockersLocked(&scan);
+        return scan.first;
+    }
+
+    /// Every distinct continuity blocker, for the read-only `UPGRADE PLAN`.
+    /// Same predicates, same order and same locks as the refusal path; the
+    /// first member in inventory order equals `upgradeContinuityBlockerLocked`.
+    fn upgradeContinuityBlockersLocked(self: *LinuxServer) UpgradeContinuityScan {
+        var scan: UpgradeContinuityScan = .{ .stop_at_first = false };
+        self.scanUpgradeContinuityBlockersLocked(&scan);
+        return scan;
+    }
+
+    const UpgradeContinuityScan = struct {
+        stop_at_first: bool,
+        first: ?UpgradeContinuityBlocker = null,
+        all: std.EnumSet(UpgradeContinuityBlocker) = .empty,
+        /// Inventory order of first sightings (bounded by the tag count).
+        order: [std.enums.values(UpgradeContinuityBlocker).len]UpgradeContinuityBlocker = undefined,
+        order_len: usize = 0,
+
+        /// Records `blocker`; true tells the scan to stop.
+        fn note(scan: *UpgradeContinuityScan, blocker: UpgradeContinuityBlocker) bool {
+            if (scan.first == null) scan.first = blocker;
+            if (!scan.all.contains(blocker)) {
+                scan.all.insert(blocker);
+                scan.order[scan.order_len] = blocker;
+                scan.order_len += 1;
+            }
+            return scan.stop_at_first;
+        }
+
+        fn ordered(scan: *const UpgradeContinuityScan) []const UpgradeContinuityBlocker {
+            return scan.order[0..scan.order_len];
+        }
+    };
+
+    fn scanUpgradeContinuityBlockersLocked(self: *LinuxServer, scan: *UpgradeContinuityScan) void {
+        if (self.hasLocalQuitCapture()) if (scan.note(.remote_visible_identity)) return;
+        for (self.reactors) |*reactor| if (reactor.retained_fabric_count != 0) {
+            if (scan.note(.pending_fabric_output)) return;
+            break;
+        };
         // DROP reservations are RAM-only two-owner latches. Refuse rather than
         // serializing a half-committed identity transfer into the successor.
-        if (self.session_drop_journal.activeCount() != 0) return .session_drop_transaction;
+        if (self.session_drop_journal.activeCount() != 0) if (scan.note(.session_drop_transaction)) return;
         // The issuer family is carryable only after its coupled lease, bindings
         // and physical latches are frozen. Other platforms retain the refusal.
         if ((self.local_guest_bindings != null or self.config.guest_issuer_path.len != 0) and
-            (builtin.os.tag != .linux or !self.local_guest_upgrade_frozen)) return .local_guest_issuer;
+            (builtin.os.tag != .linux or !self.local_guest_upgrade_frozen))
+        {
+            if (scan.note(.local_guest_issuer)) return;
+        }
         // RPS1 carries presentation/frontiers. The typed accepted notification
         // registry still needs independent carry; never drop it with the image.
-        if (self.pendingRemoteHostRecordCount() != 0 or self.remote_departures != null) return .remote_visible_identity;
+        if (self.pendingRemoteHostRecordCount() != 0 or self.remote_departures != null) if (scan.note(.remote_visible_identity)) return;
         lockSpin(&self.attachment_delivery_mu);
         const pending_output = self.attachment_delivery_spool.hasUncheckpointedOutput();
         self.attachment_delivery_mu.unlock();
-        if (pending_output) return .remote_visible_identity;
+        if (pending_output) if (scan.note(.remote_visible_identity)) return;
         // Generic ADS1 owners are proved by the mandatory full physical
         // relation at seal/adopt; HSSN is not a prerequisite for an IRC guest.
-        for (self.reactors) |*reactor| for (reactor.clients.slots.items) |*slot| {
-            if (slot.occupied and self.meshRetainsIngress(&slot.value)) return .pending_remote_membership;
+        membership: for (self.reactors) |*reactor| for (reactor.clients.slots.items) |*slot| {
+            if (slot.occupied and self.meshRetainsIngress(&slot.value)) {
+                if (scan.note(.pending_remote_membership)) return;
+                break :membership;
+            }
         };
         // Deferred MESSAGE_V2 owns exact signed wire not yet published into
         // RVG2. Until it has a Helix capsule, exec must never discard it.
-        if (self.relay_v2_deferred_len != 0) return .relay_v2_deferred;
-        if (self.hasRetainedWebpushOverflow()) return .webpush_overflow_delivery;
+        if (self.relay_v2_deferred_len != 0) if (scan.note(.relay_v2_deferred)) return;
+        if (self.hasRetainedWebpushOverflow()) if (scan.note(.webpush_overflow_delivery)) return;
         if (self.config.webtransport_port != 0) {
             const owner = if (builtin.os.tag == .windows) self.windows_webtransport_owner else if (builtin.os.tag == .linux) self.linuxWebTransportOwner() else null;
-            if (owner == null or owner.?.port != self.config.webtransport_port) return .webtransport_listener;
+            if (owner == null or owner.?.port != self.config.webtransport_port) if (scan.note(.webtransport_listener)) return;
         }
         if (self.acme_reload_tls != null and (builtin.os.tag != .windows or self.acme_worker == null))
-            return .acme_companion;
+            if (scan.note(.acme_companion)) return;
         // Neither active journals nor retired writers awaiting a manifest
         // have a Helix capsule. Room state can already be gone while retired
         // custody remains, and Windows room carry does not carry these files.
         lockSpin(&self.media_recorder_mu);
         const owns_recording = self.media_recorder_head != null;
         self.media_recorder_mu.unlock();
-        if (owns_recording) return .media_recording;
+        if (owns_recording) if (scan.note(.media_recording)) return;
         const windows_media_checkpoint = builtin.os.tag == .windows and self.config.media_enabled;
-        if (!windows_media_checkpoint and !self.media_rooms.upgradeContinuityReady()) return .media_rooms;
+        if (!windows_media_checkpoint and !self.media_rooms.upgradeContinuityReady()) if (scan.note(.media_rooms)) return;
         // Windows seals a configured media Domain with both paused UDP owners
         // at the native transfer cut below. The pristine and active captures
         // each prove their own exact continuity before transfer.
         if (builtin.os.tag != .windows or !self.config.media_enabled) {
-            if (!self.media_plane.upgradeContinuityReady()) return .media_plane;
-            if (!self.native_media.upgradeContinuityReady()) return .native_media;
+            if (!self.media_plane.upgradeContinuityReady()) if (scan.note(.media_plane)) return;
+            if (!self.native_media.upgradeContinuityReady()) if (scan.note(.native_media)) return;
         }
         if (!windows_media_checkpoint) {
             lockSpin(&self.media_bridges_mu);
             defer self.media_bridges_mu.unlock();
             var bridges = self.media_bridges.valueIterator();
             while (bridges.next()) |bridge| {
-                if (!bridge.upgradeContinuityReady()) return .media_bridge;
+                if (!bridge.upgradeContinuityReady()) {
+                    _ = scan.note(.media_bridge);
+                    return;
+                }
             }
         }
-        return null;
     }
 
     fn upgradeContinuityBlockerName(blocker: UpgradeContinuityBlocker) []const u8 {
@@ -40109,6 +41987,14 @@ pub const LinuxServer = struct {
                 carried_fd_count += 1;
             }
         }
+        // M10: pre-seal inventory of every physical attachment at this same
+        // parked cut; reconciled against the sealed relation below.
+        const seal_inventory = self.upgradeSealInventory() catch |err| {
+            srvLog("onyx-server: UPGRADE refused — pre-seal attachment inventory failed ({s})\n", .{@errorName(err)});
+            self.deferredUpgradeNotice(request, "UPGRADE refused: pre-seal attachment inventory could not be taken");
+            return error.SessionReplicaConverging;
+        };
+        defer self.allocator.free(seal_inventory);
         var seal_counts = SealCounts{ .physical_relation_at_complete_cut = true };
         for (self.reactors) |*r| {
             const shard_before = seal_counts.clients;
@@ -40142,6 +42028,13 @@ pub const LinuxServer = struct {
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: carried state fd manifest exceeds hard limit") catch {};
             return error.SessionReplicaConverging;
         }
+        self.reconcileUpgradeSeal(seal_inventory, pieces.items, carried_fd_count) catch |err| {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
+            srvLog("onyx-server: UPGRADE refused — sealed physical relation does not match the pre-seal attachment inventory ({s})\n", .{@errorName(err)});
+            self.deferredUpgradeNotice(request, "UPGRADE refused: sealed physical relation does not match the pre-seal attachment inventory");
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: seal-time attachment reconcile mismatch") catch {};
+            return error.SessionReplicaConverging;
+        };
 
         // Seal the complete state arena. Any failure refuses UPGRADE and restores
         // descriptor hygiene; listener-only re-exec is RESTART-only.
@@ -42339,6 +44232,56 @@ pub const LinuxServer = struct {
 
         // Same at-most-once rule: a pre-thread arena lacks THRD and adopts with
         // an empty thread table. A malformed or duplicate image rejects the handoff.
+        // T07 attachment-revoke fences (SARS). At-most-once like the grant
+        // images: a predecessor that never armed a fence (or predates SARS)
+        // seals no piece and the successor starts with none. A present image
+        // is decoded strictly into a staged heap table now, so the allocation
+        // and every validation failure happen before anything is published.
+        var staged_revoke_state: ?*session_attachment_revoke.NodeState = null;
+        errdefer if (staged_revoke_state) |state| self.allocator.destroy(state);
+        for (caps) |c| {
+            if (c.header.kind != .mesh_checkpoint) continue;
+            var recognized = false;
+            for (c.fields) |field| {
+                if (session_attachment_revoke.isCheckpoint(field.bytes)) {
+                    recognized = true;
+                    break;
+                }
+            }
+            if (!recognized) continue;
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            if (staged_revoke_state != null or
+                c.header.schema_id != descriptor.schema_id or
+                c.header.version != descriptor.current_version or
+                c.header.min_supported != 2 or
+                c.header.max_supported != descriptor.max_supported or
+                c.fields.len != 1 or c.fields[0].ordinal != 1)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate attachment-revoke checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            const state = self.allocator.create(session_attachment_revoke.NodeState) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "attachment-revoke checkpoint allocation failed");
+                return error.InvalidInheritedHandoff;
+            };
+            state.* = .{};
+            session_attachment_revoke.decodeCheckpoint(c.fields[0].bytes, state) catch {
+                self.allocator.destroy(state);
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed attachment-revoke checkpoint");
+                return error.InvalidInheritedHandoff;
+            };
+            // Re-enforce every carried fence against the adopted local rows
+            // once: a revoked attachment carried as a physical connection
+            // must still be closed by the successor.
+            for (0..session_attachment_revoke.Denials.capacity) |index| {
+                if (state.denials.liveAt(index, self.sessionAttachmentRevokeNow()) != null) {
+                    state.enforce_pending = true;
+                    break;
+                }
+            }
+            staged_revoke_state = state;
+        }
+
         var thread_checkpoint: ?thread_snapshot.Snapshot = null;
         for (caps) |c| {
             if (c.header.kind != .mesh_checkpoint) continue;
@@ -42922,6 +44865,7 @@ pub const LinuxServer = struct {
         var adopted_ws: usize = 0;
         var matched_tls: usize = 0;
         var matched_ws: usize = 0;
+        var adoption_ordinal: usize = 0;
         for (caps) |c| {
             if (c.header.kind != .clients) continue;
             if (c.fields.len != 1 or c.fields[0].ordinal != 1) {
@@ -42965,13 +44909,14 @@ pub const LinuxServer = struct {
                 return error.InvalidInheritedHandoff;
             }
             if (ws_state != null) matched_ws += 1;
-            // Multi-shard: re-pin the client to its fd-derived shard by binding
-            // this (boot, pre-reactor-loop) thread to the target reactor for the
-            // adoption — every rx() inside adoptInheritedClient (slot alloc,
-            // recv arm on the shard's ring) then lands on that shard. The shard
-            // choice is deterministic in the fd; client ids never survive the
-            // swap (fd is the join key), so any consistent spread is correct.
-            current_reactor = &self.reactors[self.adoptShardForFd(snap.fd)];
+            // Multi-shard: re-pin the client to its adoption-order shard by
+            // binding this (boot, pre-reactor-loop) thread to the target
+            // reactor for the adoption — every rx() inside adoptInheritedClient
+            // (slot alloc, recv arm on the shard's ring) then lands on that
+            // shard. Client ids never survive the swap and successor lookups
+            // search every shard by fd, so any deterministic spread is correct.
+            current_reactor = &self.reactors[self.adoptShardForOrdinal(adoption_ordinal)];
+            adoption_ordinal += 1;
             const host_row = self.hostPresentationForFd(physical_relation, host_image.image.rows, snap.fd) orelse {
                 current_reactor = &self.reactors[0];
                 world_replacement.swapWorldInto(&self.world);
@@ -43947,6 +45892,14 @@ pub const LinuxServer = struct {
         self.inherited_mesh_redial_cursor = 0;
         self.inherited_event_history_restored = true;
 
+        // Publish the pre-validated, pre-allocated attachment-revoke table
+        // (SARS) at the same no-fail commit edge.
+        if (staged_revoke_state) |state| {
+            if (self.session_attachment_revoke_state) |prior| self.allocator.destroy(prior);
+            self.session_attachment_revoke_state = state;
+            staged_revoke_state = null;
+        }
+
         // Prime the carried cross-mesh oper-grant registry at the same no-fail
         // commit edge: fixed-capacity upserts of the pre-validated image cannot
         // fail, and the io loop (the only place a peer's post-RESYNC grant
@@ -44301,6 +46254,10 @@ pub const LinuxServer = struct {
         signon_ms: i64,
     ) ?sessions_mod.AttachOutcome {
         if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(token) != null) return null;
+        // T07: no fence check here. Helix carries live fences (SARS) and the
+        // successor re-arms `enforce_pending`, so the carried enforce sweep
+        // closes exactly the fenced attachment after adopt; refusing here
+        // would fail the whole account and drop its unfenced siblings.
         if (encoded_attachment_id) |raw| {
             const attachment_id = sessions_mod.AttachmentId.fromBytes(raw) catch return null;
             return self.sessions.attachWithAttachmentReportingEviction(
@@ -44381,15 +46338,17 @@ pub const LinuxServer = struct {
         return {};
     }
 
-    /// Deterministic shard for an adopted inherited connection: derived from
-    /// the (non-negative) socket fd so the spread is stable within one adoption
-    /// pass without widening any capsule. The original owning shard is NOT
+    /// Deterministic shard for the `ordinal`-th carried client of one
+    /// adoption pass: round-robin over the reactors in capsule order, so the
+    /// spread is stable within the pass and balanced to within one client per
+    /// shard without widening any capsule. The original owning shard is NOT
     /// preserved — client ids never survive the swap (the fd is the Helix join
-    /// key), so shard identity carries no cross-upgrade meaning; only a
-    /// consistent, balanced pinning matters.
-    fn adoptShardForFd(self: *LinuxServer, fd: i32) usize {
-        std.debug.assert(fd >= 0);
-        return @as(usize, @intCast(fd)) % self.reactors.len;
+    /// key, and `adoptedClientIdByFd` searches every shard), so shard identity
+    /// carries no cross-upgrade meaning. A previous fd-parity rule (`fd % n`)
+    /// was not balanced: inherited descriptors are allocated in runs, so two
+    /// carried clients could share a parity and therefore one shard.
+    fn adoptShardForOrdinal(self: *const LinuxServer, ordinal: usize) usize {
+        return ordinal % self.reactors.len;
     }
 
     /// Find the successor-side client id of an adopted connection by its
@@ -44540,7 +46499,7 @@ pub const LinuxServer = struct {
             if (close_fd_on_failure) closeFd(snap.fd);
             return false;
         }
-        // Per-SHARD cap (rx() is the fd-derived target shard): matches the
+        // Per-SHARD cap (rx() is the adoption-order target shard): matches the
         // accept path, whose cap is also per-shard — each reactor's table is
         // reserved to max_clients, so the bound protects buffer address
         // stability, not a global head-count. Failure cleans up this inherited
@@ -45310,6 +47269,10 @@ pub const LinuxServer = struct {
             self.traceLog(.info, .s2s, "skipped plaintext S2S dial ([mesh].require_secured)");
             return error.SecuredS2sRequired;
         }
+        // An outbound redial is mesh-recovery work keyed by its configured endpoint.
+        const dial_ticket = self.tryWorkloadTicket(.mesh_recovery, .slot, workloadPeerKey(addr.port, &addr.addr)) catch
+            return error.SocketUnavailable;
+        errdefer self.releaseWorkloadTicketValue(dial_ticket);
         // The logical dial/capsule address remains canonical in6. OpenBSD has
         // no mapped-v4 sockets: the backend translates that address for an
         // AF_INET socket before connect; real IPv6 uses AF_INET6 on both OSes.
@@ -45322,6 +47285,7 @@ pub const LinuxServer = struct {
         const id = try self.rx().clients.alloc(ConnState.init(fd));
         errdefer _ = self.rx().clients.free(id);
         const peer = self.rx().clients.get(id).?;
+        peer.workload_ticket = dial_ticket;
         peer.diagnostics_owner = &self.diagnostics;
         peer.diagnostics_shard = id.shard;
         peer.overflow_allocator = self.allocator; // backs the SendQ overflow heap
@@ -45971,10 +47935,14 @@ pub const LinuxServer = struct {
                 .msg = ev.message(),
                 .fields = fields[0..n],
             }, &line) catch continue;
-            if (written + rendered.len + 1 > flight_recorder_max_file_bytes) break;
-            if (!writeAllNative(fd, rendered)) return;
+            // T08: the fault file leaves the process; scrub bearer credentials
+            // (allocation-free, panic-path safe) before it reaches disk.
+            var safe_line: [line.len + 128]u8 = undefined;
+            const safe = credential_redaction.redactInto(rendered, &safe_line);
+            if (written + safe.len + 1 > flight_recorder_max_file_bytes) break;
+            if (!writeAllNative(fd, safe)) return;
             if (!writeAllNative(fd, "\n")) return;
-            written += rendered.len + 1;
+            written += safe.len + 1;
         }
     }
 
@@ -46007,7 +47975,7 @@ pub const LinuxServer = struct {
             return;
         };
         const channel = req.target.channel;
-        if (!self.world.channelExists(channel)) {
+        if (self.channelConcealedOrMissing(id, channel, overrideActive(conn))) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
@@ -47120,23 +49088,43 @@ pub const LinuxServer = struct {
     /// ward matches identically whether the subject is connecting now or already
     /// connected. Pure read of session fields — safe under `world.lockWrite`.
     fn wardMatch(self: *LinuxServer, conn: *ConnState) ?*const warden.Ward {
-        var mask_buf: ClientPrefixBuffer = undefined;
-        const mask = clientPrefix(conn, &mask_buf);
+        var scratch: WardFacetScratch = undefined;
+        const facets = self.wardFacets(conn, &scratch);
+        // Wards are stamped + expire on the WALL clock (addWardLive /
+        // applyRemoteWard use realtimeMillis, matching the WARD/TESTLINE oper
+        // commands). nowMs() is MONOTONIC (per-boot uptime); checking expiry
+        // against it would leave a wall-epoch expires_ms always in the "future"
+        // → a temporary ward would never expire for new connections.
+        const now_wall = platform.realtimeMillis();
+        return self.warden.check(facets, now_wall) orelse
+            self.wardContinuity(conn, facets, RegistryWardProbe{ .registry = &self.warden, .now_ms = now_wall });
+    }
+
+    /// Buffers the facets built by `wardFacets` borrow.
+    const WardFacetScratch = struct {
+        mask_buf: ClientPrefixBuffer,
+        asn_buf: [16]u8,
+    };
+
+    /// The subject's identity facets (address / host / mask / account /
+    /// realname / certfp / GeoIP country+asn), built identically for the
+    /// registration checkpoint, the live sweep and `WARD PREVIEW`.
+    fn wardFacets(self: *LinuxServer, conn: *ConnState, scratch: *WardFacetScratch) warden.Facets {
+        const mask = clientPrefix(conn, &scratch.mask_buf);
         // GeoIP country + ASN facets (e.g. `WARD ADD country RU ...` /
         // `WARD ADD asn 15169 ...`). Resolved only when a database is configured;
         // empty facets never match a ward.
         var country: []const u8 = "";
-        var asn_buf: [16]u8 = undefined;
         var asn_str: []const u8 = "";
         if (parseGeoIp(conn.session.realHost())) |gip| {
             if (self.ensureGeoip()) |db| {
                 if (db.lookupInfo(gip) catch null) |gi| {
                     country = gi.country_iso orelse "";
-                    if (gi.asn) |asn| asn_str = std.fmt.bufPrint(&asn_buf, "{d}", .{asn}) catch "";
+                    if (gi.asn) |asn| asn_str = std.fmt.bufPrint(&scratch.asn_buf, "{d}", .{asn}) catch "";
                 }
             }
         }
-        const facets = warden.Facets{
+        return .{
             .cloak_context = self.cloakMatchContext(conn),
             .address = conn.session.realHost(),
             .host = conn.session.host(),
@@ -47147,33 +49135,82 @@ pub const LinuxServer = struct {
             .country = country,
             .asn = asn_str,
         };
-        // Wards are stamped + expire on the WALL clock (addWardLive /
-        // applyRemoteWard use realtimeMillis, matching the WARD/TESTLINE oper
-        // commands). nowMs() is MONOTONIC (per-boot uptime); checking expiry
-        // against it would leave a wall-epoch expires_ms always in the "future"
-        // → a temporary ward would never expire for new connections.
-        const now_wall = platform.realtimeMillis();
-        return self.warden.check(facets, now_wall) orelse blk: {
-            // Rotatable cloak key: bans written against the PREVIOUS key's cloak
-            // still reference old host/mask tokens. Re-check the host + mask facets
-            // recomputed under the previous key so those bans survive a rotation
-            // for a grace window. Only the key-derived facets differ; address /
-            // account / country / asn / certfp / realname are key-independent.
-            var prev_host_buf: [cloak.max_cloak_len]u8 = undefined;
-            const prev_host = self.prevKeyCloakHost(conn, &prev_host_buf) orelse return self.cloakBanWard(conn, facets, now_wall);
+    }
+
+    /// Continuity probe over the live registry (enforcement).
+    const RegistryWardProbe = struct {
+        registry: *warden.Registry,
+        now_ms: i64,
+        const Hit = *const warden.Ward;
+        fn check(self: RegistryWardProbe, facets: warden.Facets) ?Hit {
+            return self.registry.check(facets, self.now_ms);
+        }
+    };
+
+    /// Continuity probe over one proposed ward (`WARD PREVIEW`); never reads
+    /// or prunes the registry.
+    const ProposalWardProbe = struct {
+        match: warden.Match,
+        pattern: []const u8,
+        const Hit = void;
+        fn check(self: ProposalWardProbe, facets: warden.Facets) ?Hit {
+            if (warden.matchesFacets(self.match, self.pattern, facets)) return {};
+            return null;
+        }
+    };
+
+    /// Host/mask continuity after a primary miss. Rotatable cloak key: bans
+    /// written against the PREVIOUS key's cloak still reference old host/mask
+    /// tokens, so the host + mask facets recomputed under the previous key are
+    /// probed for a grace window, then the ban-cloak alternates. Only the
+    /// key-derived facets differ; address / account / country / asn / certfp /
+    /// realname are key-independent.
+    fn wardContinuity(self: *LinuxServer, conn: *ConnState, facets: warden.Facets, probe: anytype) ?@TypeOf(probe).Hit {
+        var prev_host_buf: [cloak.max_cloak_len]u8 = undefined;
+        if (self.prevKeyCloakHost(conn, &prev_host_buf)) |prev_host| {
             var prev_mask_buf: ClientPrefixBuffer = undefined;
-            const prev_mask = clientPrefixParts(conn.session.displayName(), conn.session.username(), prev_host, &prev_mask_buf);
             var alt = facets;
             alt.host = prev_host;
-            alt.mask = prev_mask;
-            break :blk self.warden.check(alt, now_wall) orelse self.cloakBanWard(conn, facets, now_wall);
-        };
+            alt.mask = clientPrefixParts(conn.session.displayName(), conn.session.username(), prev_host, &prev_mask_buf);
+            if (probe.check(alt)) |hit| return hit;
+        }
+        return self.cloakBanWard(conn, facets, probe);
+    }
+
+    /// Stream every live, registered local client subject through a
+    /// `WARD PREVIEW` accumulator with the same facets, oper exemption and
+    /// host/mask continuity enforcement uses. Called by `ward_preview.handle`
+    /// only for an `oper_spy` caller, after its audit record. Same lock
+    /// discipline as `reapWardMatches` (WARD dispatch holds `world.lockWrite`);
+    /// read-only apart from the lazy GeoIP open enforcement also performs.
+    pub fn wardPreviewLiveSubjects(self: *LinuxServer, acc: *ward_preview.Accumulator) void {
+        const p = acc.proposal;
+        const key_derived = p.match == .host or p.match == .mask;
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const conn = &slot.value;
+                if (conn.s2s != null or conn.s2s_secured != null) continue;
+                if (conn.closing or !conn.session.registered()) continue;
+                var scratch: WardFacetScratch = undefined;
+                const facets = self.wardFacets(conn, &scratch);
+                const continuity = key_derived and !warden.matchesFacets(p.match, p.pattern, facets) and
+                    self.wardContinuity(conn, facets, ProposalWardProbe{ .match = p.match, .pattern = p.pattern }) != null;
+                _ = acc.add(.{
+                    .label = conn.session.displayName(),
+                    .facets = facets,
+                    .source = .live,
+                    .oper = conn.session.isOper(),
+                    .continuity_hit = continuity,
+                });
+            }
+        }
     }
 
     /// WARD host/mask also matches the stable hierarchical cloak and the
     /// previous public opaque tokens. The channel still sees only the current
     /// opaque or account host. A hostname is never turned into a ban cloak.
-    fn cloakBanWard(self: *LinuxServer, conn: *ConnState, facets: warden.Facets, now_wall: i64) ?*const warden.Ward {
+    fn cloakBanWard(self: *LinuxServer, conn: *ConnState, facets: warden.Facets, probe: anytype) ?@TypeOf(probe).Hit {
         const key = self.config.cloak_key orelse return null;
         const addr = conn.peer_addr orelse return null;
         var ipbuf: [64]u8 = undefined;
@@ -47183,22 +49220,22 @@ pub const LinuxServer = struct {
         var mask_buf: ClientPrefixBuffer = undefined;
         const opts = cloak.Options{ .suffix = self.config.cloak_suffix };
         if (self.banCloakHost(ip_text, &host_buf)) |host| {
-            if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+            if (self.wardOnAltHost(conn, facets, probe, host, &mask_buf)) |hit| return hit;
         }
         if (self.config.cloak_anon_epoch_secs != 0 and conn.session.account() == null) {
             const epoch = self.anonCloakEpoch();
             if (cloak.cloakOpaqueEpoch(&host_buf, &key, ip_text, epoch, opts)) |host| {
-                if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+                if (self.wardOnAltHost(conn, facets, probe, host, &mask_buf)) |hit| return hit;
             } else |_| {}
             if (cloak.cloakOpaqueEpochV3(&host_buf, &key, ip_text, epoch, opts)) |host| {
-                if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+                if (self.wardOnAltHost(conn, facets, probe, host, &mask_buf)) |hit| return hit;
             } else |_| {}
             if (epoch > 0) {
                 if (cloak.cloakOpaqueEpoch(&host_buf, &key, ip_text, epoch - 1, opts)) |host| {
-                    if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+                    if (self.wardOnAltHost(conn, facets, probe, host, &mask_buf)) |hit| return hit;
                 } else |_| {}
                 if (cloak.cloakOpaqueEpochV3(&host_buf, &key, ip_text, epoch - 1, opts)) |host| {
-                    if (self.wardOnAltHost(conn, facets, now_wall, host, &mask_buf)) |hit| return hit;
+                    if (self.wardOnAltHost(conn, facets, probe, host, &mask_buf)) |hit| return hit;
                 } else |_| {}
             }
         }
@@ -47209,16 +49246,17 @@ pub const LinuxServer = struct {
         self: *LinuxServer,
         conn: *const ConnState,
         facets: warden.Facets,
-        now_wall: i64,
+        probe: anytype,
         host: []const u8,
         mask_buf: *ClientPrefixBuffer,
-    ) ?*const warden.Ward {
+    ) ?@TypeOf(probe).Hit {
+        _ = self;
         if (host.len == 0 or std.mem.eql(u8, host, facets.host)) return null;
         const mask = clientPrefixParts(conn.session.displayName(), conn.session.username(), host, mask_buf);
         var alt = facets;
         alt.host = host;
         alt.mask = mask;
-        return self.warden.check(alt, now_wall);
+        return probe.check(alt);
     }
 
     fn subjectHitsMeshFilter(self: *const LinuxServer, conn: *const ConnState) bool {
@@ -47754,7 +49792,7 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, reply.text);
             return;
         };
-        if (!self.world.channelExists(req.channel)) {
+        if (self.channelConcealedOrMissing(id, req.channel, conn.session.isOper())) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{req.channel}, "No such channel");
             return;
         }
@@ -48039,7 +50077,7 @@ pub const LinuxServer = struct {
                 }
             }
         }
-        if (!world_model.isChannelName(target) or !self.world.channelExists(target)) {
+        if (!world_model.isChannelName(target) or self.channelConcealedOrMissing(id, target, kind == schedule_snapshot.kind_oper)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
             return;
         }
@@ -48095,7 +50133,7 @@ pub const LinuxServer = struct {
         };
         switch (cmd) {
             .add => |a| {
-                if (!self.world.channelExists(a.channel)) {
+                if (self.channelConcealedOrMissing(id, a.channel, conn.session.isOper())) {
                     try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{a.channel}, "No such channel");
                     return;
                 }
@@ -49308,12 +51346,12 @@ pub const LinuxServer = struct {
     /// Connection admission context is distinct from the direct JOIN decision;
     /// SACCESS GAG affects speech, and host GRANT does not override NOCHANNEL.
     fn handleAccessExplain(self: *LinuxServer, requester_id: client_model.ClientId, requester: *ConnState, params: []const []const u8) !void {
-        if (params.len != 2 and params.len != 3) {
+        const req = permission_explain.parseExplainRequest(params) orelse {
             try self.noticeTo(requester, "ACCESS EXPLAIN unavailable");
             return;
-        }
+        };
         const authorized = requester.session.hasPriv(.audit_read);
-        const named_other = params.len == 3 and !std.ascii.eqlIgnoreCase(params[2], requester.session.displayName());
+        const named_other = req.namedOther(requester.session.displayName());
         // No World/nick/channel lookup can occur before this capability gate.
         if (named_other and !authorized) {
             try self.noticeTo(requester, "ACCESS EXPLAIN unavailable");
@@ -49321,7 +51359,7 @@ pub const LinuxServer = struct {
         }
         const acquired = self.lockModulePolicy();
         defer self.unlockModulePolicy(acquired);
-        const channel = params[0];
+        const channel = req.channel;
         if (!world_model.isChannelName(channel) or channel.len > self.config.channellen or
             !self.world.channelExists(channel) or (self.channelHiddenFromWhois(channel, worldIdFromClient(requester_id)) and !(named_other and requester.session.hasPriv(.oper_spy))))
         {
@@ -49329,7 +51367,7 @@ pub const LinuxServer = struct {
             return;
         }
         const subject_id = if (named_other) blk: {
-            const wid = self.world.findNick(params[2]) orelse {
+            const wid = self.world.findNick(req.subject.named) orelse {
                 try self.noticeTo(requester, "ACCESS EXPLAIN unavailable");
                 return;
             };
@@ -49343,6 +51381,7 @@ pub const LinuxServer = struct {
             try self.noticeTo(requester, "ACCESS EXPLAIN unavailable");
             return;
         }
+        if (req.action == .speak) return self.explainSpeak(requester_id, requester, subject_id, subject, channel, named_other);
         const saccess_details = named_other and requester.session.hasPriv(.service_admin);
         const access_details = named_other and self.accessCanManage(requester_id, requester, channel, null);
         // Same single matcher as connection enforcement: GRANT, DENY, GAG.
@@ -49413,6 +51452,86 @@ pub const LinuxServer = struct {
             }
         }
         try self.emitJoinExplanation(requester, explanation, private_details);
+    }
+
+    /// Q04: explain whether `subject` may PRIVMSG `channel` now. Samples the
+    /// same facts `senderSilenced` and `channelSpeechGate` read; never records
+    /// a slowmode send, audits an override, or touches delivery state.
+    fn explainSpeak(
+        self: *LinuxServer,
+        requester_id: client_model.ClientId,
+        requester: *ConnState,
+        subject_id: client_model.ClientId,
+        subject: *ConnState,
+        channel: []const u8,
+        named_other: bool,
+    ) !void {
+        const wid = worldIdFromClient(subject_id);
+        const member_modes = self.world.memberModes(channel, wid) orelse world_model.MemberModes.empty();
+        var mask_buf: ClientPrefixBuffer = undefined;
+        const mask = clientPrefix(subject, &mask_buf);
+        var banned = false;
+        var muted = false;
+        if (mask.len != 0) {
+            var chan_buf: [64][]const u8 = undefined;
+            const ban_ctx = banContextFor(self, subject, wid, mask, &chan_buf);
+            banned = self.world.isBannedCtx(channel, ban_ctx);
+            muted = self.world.isMutedCtx(channel, ban_ctx);
+        }
+        // World matchers report only a bool, so matched entries carry no
+        // mask/issuer/reason and expiry stays `none_recorded`.
+        const facts: permission_explain.SpeakFacts = .{
+            .override_active = overrideActive(subject),
+            .silence = self.senderSilenceKind(subject),
+            .member = self.world.isMember(channel, wid),
+            .can_speak_moderated = member_modes.canSpeakModerated(),
+            .channel_operator = member_modes.isOperator(),
+            .network_oper = subject.session.isOper(),
+            .has_account = subject.session.account() != null,
+            .has_prefix = mask.len != 0,
+            .no_external = self.world.channelHasFlag(channel, .no_external),
+            .moderated = self.world.channelHasFlag(channel, .moderated),
+            .mod_reg = self.world.channelHasFlag(channel, .mod_reg),
+            .opmoderate = self.world.channelHasExtFlag(channel, .opmoderate),
+            .ban = if (banned) .{} else null,
+            .quiet = if (muted) .{} else null,
+            .nocolor = self.world.channelHasExtFlag(channel, .nocolor),
+            .no_ctcp = self.world.channelHasFlag(channel, .no_ctcp),
+            .no_notice = self.world.channelHasFlag(channel, .no_notice),
+            .e2ee_required = self.channelEncryptionPolicy(channel) == .required,
+            .pacing = .{
+                .slowmode_gap_ms = self.channelSlowmodeGapMs(channel),
+                .lag_gap_ms = self.channelLagGapMs(channel),
+                .slowvoice_exempt = self.channelSlowmodeVoiceExempt(channel),
+                .last_send = self.slowmodeLastSend(channel, subject.session.displayName()),
+            },
+        };
+        const view = permission_explain.explainSpeak(facts, .{
+            .named_other = named_other,
+            .source_read = named_other and self.accessCanManage(requester_id, requester, channel, null),
+            .audit_read = requester.session.hasPriv(.audit_read),
+        });
+        const wire: permission_explain.Wire = .{ .server_name = self.serverName(), .nick = requester.session.displayName() };
+        var line_buf: [permission_explain.max_line_bytes]u8 = undefined;
+        const summary = permission_explain.formatSpeakLine(&line_buf, wire, view, .summary) orelse {
+            try self.noticeTo(requester, "ACCESS EXPLAIN unavailable");
+            return;
+        };
+        try emitReplyLine(requester, summary);
+        inline for (.{ .context, .mask, .issuer, .reason }) |kind| {
+            if (permission_explain.formatSpeakLine(&line_buf, wire, view, kind)) |line| try emitReplyLine(requester, line);
+        }
+    }
+
+    /// Q04: read-only view of the slowmode/LAG limiter, with the same verdicts
+    /// as `slowmodeTooSoon`: an unusable key or clock regression denies.
+    fn slowmodeLastSend(self: *LinuxServer, channel: []const u8, nick: []const u8) permission_explain.LastSend {
+        var buf: [slowmode_key_max]u8 = undefined;
+        const key = slowmodeKey(channel, nick, &buf) orelse return .unknown;
+        const last = self.slowmode_last.get(key) orelse return .none;
+        const now = self.nowU64();
+        if (now < last) return .unknown;
+        return .{ .elapsed_ms = now - last };
     }
 
     /// P08: read-only moderation-impact preview. Evaluates a candidate
@@ -51620,7 +53739,7 @@ pub const LinuxServer = struct {
             try queueNumeric(conn, .ERR_NEEDMOREPARAMS, &.{"WHISPER"}, "Not enough parameters");
             return;
         };
-        if (!self.world.channelExists(args.channel)) {
+        if (self.channelConcealedOrMissing(id, args.channel, false)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{args.channel}, "No such channel");
             return;
         }
@@ -52001,9 +54120,10 @@ pub const LinuxServer = struct {
                 return;
             }
             // Clone the template's channel-level modes/limit/key/ext into the new
-            // (empty) target. A missing source is reported like any other missing
-            // channel and the target is NOT created.
-            if (!self.world.channelExists(source)) {
+            // (empty) target. A missing source, or one concealed from this
+            // non-member (Q01), is reported like any other missing channel and
+            // the target is NOT created.
+            if (self.channelConcealedOrMissing(id, source, false)) {
                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{source}, "No such channel");
                 return;
             }
@@ -52332,7 +54452,7 @@ pub const LinuxServer = struct {
         const channel = parsed.paramSlice()[0];
         const msgid = parsed.paramSlice()[1];
         const reason = if (parsed.param_count >= 3) parsed.paramSlice()[2] else null;
-        if (!self.world.channelExists(channel)) {
+        if (self.channelConcealedOrMissing(id, channel, false)) {
             try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{channel}, "No such channel");
             return;
         }
@@ -52399,7 +54519,7 @@ pub const LinuxServer = struct {
         var key_buf: [320]u8 = undefined;
         const store_target = self.historyKeyForTarget(conn, edit.target, &key_buf);
         if (world_model.isChannelName(edit.target)) {
-            if (!self.world.channelExists(edit.target)) {
+            if (self.channelConcealedOrMissing(id, edit.target, false)) {
                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{edit.target}, "No such channel");
                 return;
             }
@@ -52460,7 +54580,16 @@ pub const LinuxServer = struct {
             parsed.paramSlice()[0]
         else
             "HELP";
-        const reply = help_db.buildHelpLookupReply(self.allocator, self.serverName(), conn.session.displayName(), topic) catch return;
+        // Same gate inputs as live module dispatch, so HELP never promises a
+        // command that dispatch would refuse for this connection.
+        const caps = mod_registry.DispatchCaps{
+            .registered = conn.session.registered(),
+            .oper = conn.session.isOper(),
+            .ircx = conn.ircx,
+            .disabled_features = self.config.disabled_features,
+            .module_gate = self.module_runtime.gate(),
+        };
+        const reply = help_catalog.buildHelpReply(self.allocator, self.serverName(), conn.session.displayName(), topic, caps) catch return;
         defer self.allocator.free(reply);
         try appendToConn(conn, reply);
     }
@@ -53932,7 +56061,7 @@ pub const LinuxServer = struct {
         switch (wire.op) {
             .filter => return false,
             .remove => {
-                _ = self.warden.remove(wire.match, wire.pattern);
+                if (self.warden.remove(wire.match, wire.pattern)) self.observeExternalModeration(moderation_undo.FactKey.ofWard(wire.match, wire.pattern));
                 return false;
             },
             .add => {
@@ -53960,6 +56089,7 @@ pub const LinuxServer = struct {
                     self.traceLog(.warn, .s2s, note);
                     return false;
                 };
+                self.observeExternalModeration(moderation_undo.FactKey.ofWard(wire.match, wire.pattern));
                 // A freshly-installed network ban must bite already-connected
                 // clients here immediately (not one reconnect later). Signal the
                 // caller to sweep; the sweep is coalesced across the drain batch.
@@ -55506,7 +57636,33 @@ pub const LinuxServer = struct {
             platform.realtimeMillisChecked() orelse return self.failReply(conn, command, "TOKEN_ISSUE_FAILED", "Could not issue session token");
         const now_unix = @divTrunc(wall_ms, 1000);
         if (now_unix <= 0) return self.failReply(conn, command, "TOKEN_ISSUE_FAILED", "Could not issue session token");
+        // T09: issuance replaces the account's stored SASL session token, so it
+        // is a credential rotation. Past the per-account budget the rotation is
+        // held off and the current stored token stays valid.
+        const churn_now = self.nowMs();
+        lockSpin(&self.session_credential_churn_mu);
+        const rotation_admit = self.session_credential_churn.admitRotation(account, churn_now);
+        if (rotation_admit == .defer_ms) self.session_credential_churn.noteRefused();
+        self.session_credential_churn_mu.unlock();
+        switch (rotation_admit) {
+            .allow => {},
+            .defer_ms => |wait_ms| {
+                var limit_buf: [default_reply_bytes]u8 = undefined;
+                const reason = std.fmt.bufPrint(
+                    &limit_buf,
+                    "Session token rotation budget spent; the current token stays valid, retry in {d}s",
+                    .{@divTrunc(wait_ms + 999, 1000)},
+                ) catch "Session token rotation budget spent; the current token stays valid";
+                if (std.ascii.eqlIgnoreCase(command, "SESSIONTOKEN"))
+                    return self.failReply(conn, command, "RATE_LIMITED", reason);
+                return self.warnReply(conn, command, "RATE_LIMITED", reason);
+            },
+        }
         const issued = svc.issueSessionToken(account, now_unix) catch return self.failReply(conn, command, "TOKEN_ISSUE_FAILED", "Could not issue session token");
+        lockSpin(&self.session_credential_churn_mu);
+        const rotation_within_budget = self.session_credential_churn.noteRotation(account, churn_now);
+        self.session_credential_churn_mu.unlock();
+        if (!rotation_within_budget) srvLog("onyx-server: session token rotation committed past the per-account churn budget\n", .{});
         var buf: [default_reply_bytes]u8 = undefined;
         const line = std.fmt.bufPrint(
             &buf,
@@ -55850,6 +58006,8 @@ pub const LinuxServer = struct {
         var work: [e2ee_group_retry_frame_budget]E2eeGroupRetryWork = undefined;
         const work_len = self.collectE2eeGroupRetryWork(&work);
         defer for (work[0..work_len]) |item| self.allocator.free(item.wire);
+        // M04: cheapest measured neighbor first; same set, same per-peer order.
+        self.orderRetryWorkByRoute(E2eeGroupRetryWork, e2ee_group_retry_frame_budget, work[0..work_len]);
         for (work[0..work_len]) |item| {
             _ = item.relay_id;
             _ = self.replayE2eeGroupWireToPeer(item.peer, item.wire);
@@ -58899,7 +61057,7 @@ pub const LinuxServer = struct {
         const rows = self.sessions.copySessionsAlloc(self.allocator, account) catch return .blocked;
         defer self.allocator.free(rows);
         for (rows) |row| {
-            if (row.client == claimant or tokenIsNull(row.token)) continue;
+            if (row.client == claimant or tokenIsNull(row.token) or self.sessionAttachmentFenced(row.token, null)) continue;
             if (row.attached) {
                 const sibling = self.connFor(clientIdFromMonitor(row.client)) orelse continue;
                 const sibling_account = sibling.session.account() orelse continue;
@@ -58954,6 +61112,7 @@ pub const LinuxServer = struct {
             const page = self.session_replica_store.liveTokensAfter(now_wall, after, &page_buf);
             if (page.len == 0) break;
             for (page) |token| {
+                if (self.sessionAttachmentFenced(token, null)) continue;
                 const entry = self.sessionReplicaTrustedLiveIdentity(token, now_wall) orelse continue;
                 if (!std.mem.eql(u8, entry.account, account) or !std.mem.eql(u8, entry.nick, nick)) continue;
                 const staged = if (self.pending_migrations) |*pending|
@@ -59533,6 +61692,29 @@ pub const LinuxServer = struct {
             self.config.relay_v2_activation_epoch != 0 or self.config.relay_v2_roster.len != 0;
     }
 
+    fn currentOfferCohortStamp(self: *const LinuxServer) offer_retry_reuse.CohortStamp {
+        return .{
+            .declared = self.hasSessionReplicaCohort(),
+            .epoch = self.relay_v2_activation_state.activation_epoch,
+            .roster_digest = self.relay_v2_activation_state.roster_digest,
+        };
+    }
+
+    /// This node's own retained `current_ready` receipt for exactly
+    /// `revision`, latest expiry first. Receipts are the publication path's
+    /// readiness evidence; a reused OFFER may skip only a receipt still live.
+    fn ownCurrentReadyReceipt(self: *const LinuxServer, token: sessions_mod.Token, revision: session_replica_v2.Revision) ?offer_retry_reuse.OwnReceipt {
+        var best: ?offer_retry_reuse.OwnReceipt = null;
+        for (self.session_group_receipts) |receipt| if (receipt) |known| {
+            if (known.node != self.config.node_id or known.status != .current_ready or
+                !std.crypto.timing_safe.eql(sessions_mod.Token, known.token, token) or
+                !known.offered.eql(revision)) continue;
+            if (best == null or known.expires_at_ms > best.?.expires_at_ms)
+                best = .{ .offered = known.offered, .expires_at_ms = known.expires_at_ms };
+        };
+        return best;
+    }
+
     const ReplicaIssuerView = struct {
         declared: bool,
         epoch: u64,
@@ -59844,6 +62026,7 @@ pub const LinuxServer = struct {
         };
         const committed = ticket.commit();
         if (committed != .duplicate) self.session_replica_store_generation +%= 1;
+        self.offer_retry_stamps.forget(signed.offer.token);
         self.cancelSessionDropsForToken(signed.offer.account, signed.offer.token);
         for (rows) |row| {
             if (!std.crypto.timing_safe.eql(sessions_mod.Token, row.token, signed.offer.token)) continue;
@@ -59961,6 +62144,275 @@ pub const LinuxServer = struct {
         turn.candidate = candidate;
     }
 
+    fn sessionAttachmentRevokeNow(self: *const LinuxServer) i64 {
+        return @intCast(@min(self.meshWallMs(), @as(u64, std.math.maxInt(i64))));
+    }
+
+    /// A fence lives as long as any credential that could rebind the revoked
+    /// attachment: the mesh reclaim lifetime.
+    const session_attachment_fence_ttl_ms: i64 = @intCast(mesh_reclaim_ttl_ms);
+
+    fn sessionAttachmentRevokeNodeState(self: *LinuxServer) ?*session_attachment_revoke.NodeState {
+        if (self.session_attachment_revoke_state) |state| return state;
+        const state = self.allocator.create(session_attachment_revoke.NodeState) catch return null;
+        state.* = .{};
+        self.session_attachment_revoke_state = state;
+        return state;
+    }
+
+    /// Mandatory gate before binding a connection to `token`. `attachment_id`
+    /// names the exact existing attachment being resumed, or null when the
+    /// admission would mint a new attachment under the shared bearer token.
+    fn sessionAttachmentFenced(self: *const LinuxServer, token: sessions_mod.Token, attachment_id: ?[16]u8) bool {
+        const state = self.session_attachment_revoke_state orelse return false;
+        return state.denials.gateAttach(token, attachment_id, self.sessionAttachmentRevokeNow()) != .allow;
+    }
+
+    fn findLocalAttachmentRow(self: *LinuxServer, account: []const u8, token: sessions_mod.Token, attachment_id: [16]u8) !?sessions_mod.Session {
+        const rows = try self.sessions.copySessionsAlloc(self.allocator, account);
+        defer self.allocator.free(rows);
+        for (rows) |row| {
+            const aid = row.attachment_id orelse continue;
+            if (std.crypto.timing_safe.eql(sessions_mod.Token, row.token, token) and
+                std.crypto.timing_safe.eql([16]u8, aid.raw, attachment_id)) return row;
+        }
+        return null;
+    }
+
+    /// Close one fenced local row through the same exact-CAS paths as SESSION
+    /// DROP (successor nick handoff for attached rows). The journal requester
+    /// is the target itself because no local caller exists for a mesh request.
+    /// Contention leaves the fence armed for `enforceSessionAttachmentDenials`.
+    fn closeFencedAttachment(self: *LinuxServer, state: *session_attachment_revoke.NodeState, account: []const u8, row: sessions_mod.Session) bool {
+        const sid = session_sid.sidOf(row) orelse return false;
+        const outcome: ListedSessionRevoke = if (row.attached)
+            self.revokeAttachedSessionReserved(account, clientIdFromMonitor(row.client), row, .{ .sid = sid })
+        else if (self.removeTrackedSessionExact(account, row)) .removed else .stale;
+        if (outcome == .removed) return true;
+        state.enforce_pending = true;
+        return false;
+    }
+
+    /// Maintenance-reactor sweep: no local row may outlive a live fence on
+    /// this node. Runs only after a close could not complete immediately.
+    fn enforceSessionAttachmentDenials(self: *LinuxServer) void {
+        const state = self.session_attachment_revoke_state orelse return;
+        if (!state.enforce_pending) return;
+        state.enforce_pending = false;
+        const now = self.sessionAttachmentRevokeNow();
+        var account_buf: [session_replica_account_max]u8 = undefined;
+        for (0..session_attachment_revoke.Denials.capacity) |index| {
+            const pair = state.denials.liveAt(index, now) orelse continue;
+            const known = self.sessions.findByTokenInto(pair.token, &account_buf) orelse continue;
+            const row = (self.findLocalAttachmentRow(known.account, pair.token, pair.attachment_id) catch {
+                state.enforce_pending = true;
+                continue;
+            }) orelse continue;
+            _ = self.closeFencedAttachment(state, known.account, row);
+        }
+    }
+
+    /// Offer one signed SAR1 request on every established secured link. It
+    /// rides the opaque SESSION_MIGRATE_CONSUMED family: a peer without this
+    /// capability fails its consume-notice decode (distinct magic) and drops
+    /// it, so mixed meshes keep working. Retention, not socket success, is the
+    /// recovery boundary; receivers dedupe through their ReplayGuard.
+    fn broadcastSessionAttachmentRevoke(self: *LinuxServer, wire: []const u8, skip_peer: ?u64) void {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items, 0..) |*slot, i| {
+                if (!slot.occupied or !slot.value.isActiveMeshPeer()) continue;
+                const link = slot.value.s2s_secured orelse continue;
+                if (!link.established()) continue;
+                if (skip_peer) |node| if (link.peerShortId() == node) continue;
+                const pid = slotClientId(reactor, i, slot.gen);
+                link.sendSessionMigrateConsumed(wire) catch continue;
+                _ = self.flushSecuredS2sOutboundTo(pid, link);
+            }
+        }
+    }
+
+    /// Establishment/RESYNC anti-entropy for requests still inside their own
+    /// lifetime, so a link that was down when a request was admitted still
+    /// learns it (including multi-hop forwarding through this node).
+    fn offerRetainedSessionAttachmentRevokes(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink) void {
+        const state = self.session_attachment_revoke_state orelse return;
+        const now = self.sessionAttachmentRevokeNow();
+        for (0..session_attachment_revoke.Retained.capacity) |index| {
+            const wire = state.retained.liveAt(index, now) orelse continue;
+            link.sendSessionMigrateConsumed(wire) catch break;
+        }
+        _ = self.flushMeshBurstStage(conn);
+    }
+
+    /// Inbound SAR1: decode, verify signature and lifetime, require a
+    /// configured session-group signer, then admit allocation-free (replay
+    /// identity and fence commit together or not at all). Whichever node holds
+    /// the exact row closes only that attachment; every admitting node keeps
+    /// the fence and forwards the unchanged bytes once.
+    fn acceptSessionAttachmentRevoke(self: *LinuxServer, wire: []const u8, via_peer: ?u64) void {
+        if (!self.sessionGroupEnabled() or wire.len > session_attachment_revoke.max_wire_len) return;
+        const signed = session_attachment_revoke.decodeRequest(wire) catch return;
+        const now = self.sessionAttachmentRevokeNow();
+        session_attachment_revoke.verifyRequest(signed, now) catch return;
+        const trust = self.sessionGroupTrustContext();
+        session_attachment_revoke.authorize(signed, .{ .ctx = &trust, .allows = SessionGroupTrustContext.allows }) catch return;
+        const request = signed.request;
+        if (request.requester_node == self.config.node_id) return;
+        const state = self.sessionAttachmentRevokeNodeState() orelse return;
+        var account_buf: [session_replica_account_max]u8 = undefined;
+        var local_account: []const u8 = "";
+        var local_row: ?sessions_mod.Session = null;
+        if (self.sessions.findByTokenInto(request.token, &account_buf)) |known| {
+            local_account = known.account;
+            local_row = self.findLocalAttachmentRow(known.account, request.token, request.attachment_id) catch return;
+        }
+        const admission = session_attachment_revoke.admit(
+            &state.replay,
+            &state.denials,
+            signed,
+            self.config.node_id,
+            if (local_row != null) .{ .account = local_account } else null,
+            now +| session_attachment_fence_ttl_ms,
+            now,
+        ) catch |err| {
+            if (err == error.Equivocation)
+                self.traceLog(.warn, .s2s, "SESSION attachment revoke equivocation: one requester sequence signed over different content");
+            return;
+        };
+        switch (admission) {
+            .duplicate, .reject_self, .account_mismatch => return,
+            .drop, .already_absent, .not_owner => {},
+        }
+        state.retained.retain(wire, request.expires_at_ms, now);
+        if (admission == .drop) _ = self.closeFencedAttachment(state, local_account, local_row.?);
+        self.broadcastSessionAttachmentRevoke(wire, via_peer);
+    }
+
+    /// Sign one SAR1 request as this node, retain it for later links, and
+    /// offer it to every established peer. `admit_locally` installs this
+    /// node's own fence and replay identity first (remote target); a row
+    /// closed locally is already fenced through `Denials.deny`.
+    fn publishSessionAttachmentRevoke(
+        self: *LinuxServer,
+        state: *session_attachment_revoke.NodeState,
+        account: []const u8,
+        token: sessions_mod.Token,
+        attachment_id: [16]u8,
+        target_origin: u64,
+        now: i64,
+        admit_locally: bool,
+    ) error{ Unavailable, Full }!void {
+        const identity = self.config.node_identity orelse return error.Unavailable;
+        const wire = session_attachment_revoke.encodeRequest(self.allocator, .{
+            .account = account,
+            .token = token,
+            .attachment_id = attachment_id,
+            .target_origin = target_origin,
+            .requester_node = self.config.node_id,
+            .requester_sequence = state.nextSequence(self.meshWallMs()),
+            .issued_at_ms = now,
+            .expires_at_ms = now +| @as(i64, @intCast(session_attachment_revoke.max_request_ttl_ms)),
+        }, &identity.sign_kp) catch return error.Unavailable;
+        defer self.allocator.free(wire);
+        const signed = session_attachment_revoke.decodeRequest(wire) catch return error.Unavailable;
+        if (admit_locally) {
+            // Admission is evaluated as a non-requester node so the fence
+            // lands here even though this node signed the request.
+            _ = session_attachment_revoke.admit(&state.replay, &state.denials, signed, target_origin, null, now +| session_attachment_fence_ttl_ms, now) catch return error.Full;
+        }
+        state.retained.retain(wire, signed.request.expires_at_ms, now);
+        self.broadcastSessionAttachmentRevoke(wire, null);
+    }
+
+    /// `SESSION REVOKE group=<id> attachment=<id>`: close exactly one physical
+    /// attachment named by `SESSION LIST MESH`, wherever it lives, without
+    /// touching any sibling. A row held here is fenced, then closed through
+    /// the local DROP path (the caller's own attachment is refused first).
+    /// Otherwise a signed SAR1 request is admitted locally (fence and replay
+    /// identity, all or nothing), retained, then offered to every peer.
+    fn handleSessionAttachmentRevoke(
+        self: *LinuxServer,
+        id: client_model.ClientId,
+        conn: *ConnState,
+        account: []const u8,
+        selector: session_attachment_revoke.Selector,
+    ) !void {
+        if (!self.sessionGroupEnabled()) {
+            try self.failReply(conn, "SESSION", "UNSUPPORTED", "Attachment revoke requires durable accounts and the complete configured node set");
+            return;
+        }
+        const now = self.sessionAttachmentRevokeNow();
+        var resolver = session_attachment_revoke.Resolver.init(selector);
+        var cursor: ?session_replica_v2.InventoryCursor = null;
+        var rows: [32]session_replica_v2.InventoryRow = undefined;
+        while (true) {
+            const page = self.session_replica_store.accountInventoryPageInto(account, now, cursor, &rows);
+            if (!page.integrity_ok) {
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "Account inventory integrity check failed; retry after repair");
+                return;
+            }
+            resolver.consider(page.items);
+            if (page.complete) break;
+            cursor = page.next;
+        }
+        const target = switch (resolver.resolve()) {
+            .unique => |value| value,
+            .none, .group_mismatch => {
+                try self.failReply(conn, "SESSION", "NO_SUCH_SESSION", "No attachment in this account matches that group and attachment");
+                return;
+            },
+            .ambiguous => {
+                try self.failReply(conn, "SESSION", "AMBIGUOUS_SID", "Attachment selector is ambiguous; refuse to revoke");
+                return;
+            },
+            .revoked => {
+                try self.failReply(conn, "SESSION", "SESSION_REVOKED", "Logical session is revoked");
+                return;
+            },
+        };
+        const state = self.sessionAttachmentRevokeNodeState() orelse {
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "Could not stage attachment revocation; retry");
+            return;
+        };
+        const aid_hex = std.fmt.bytesToHex(target.attachment_id, .lower);
+        var line_buf: [default_reply_bytes]u8 = undefined;
+        const local_row = self.findLocalAttachmentRow(account, target.token, target.attachment_id) catch {
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "could not snapshot the session list");
+            return;
+        };
+        if (local_row) |row| {
+            if (row.client == monitorIdFromClient(id)) {
+                try self.failReply(conn, "SESSION", "CANNOT_DROP_CURRENT", "Cannot drop this connection; use LOGOUT or disconnect");
+                return;
+            }
+            state.denials.deny(target.token, target.attachment_id, session_attachment_revoke.accountKey(account), now +| session_attachment_fence_ttl_ms, now) catch {
+                try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "Too many pending attachment revocations; retry later");
+                return;
+            };
+            const closed = self.closeFencedAttachment(state, account, row);
+            // Fence the shared bearer token on every other node too, so the
+            // closed holder cannot rejoin elsewhere. Best effort: the local
+            // close above is already final.
+            _ = self.publishSessionAttachmentRevoke(state, account, target.token, target.attachment_id, self.config.node_id, now, false) catch {};
+            const line = std.fmt.bufPrint(&line_buf, "SESSION REVOKE {s} scope=attachment attachment={s}", .{ if (closed) "OK" else "PENDING", &aid_hex }) catch return;
+            try self.noticeTo(conn, line);
+            return;
+        }
+        if (target.origin_node == self.config.node_id) {
+            try self.failReply(conn, "SESSION", "STALE_LIST", "Attachment is no longer held here; list again");
+            return;
+        }
+        self.publishSessionAttachmentRevoke(state, account, target.token, target.attachment_id, target.origin_node, now, true) catch |err| {
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", switch (err) {
+                error.Unavailable => "Could not sign attachment revocation; retry",
+                error.Full => "Too many pending attachment revocations; retry later",
+            });
+            return;
+        };
+        const line = std.fmt.bufPrint(&line_buf, "SESSION REVOKE SENT scope=attachment attachment={s}; the node holding it closes only that attachment", .{&aid_hex}) catch return;
+        try self.noticeTo(conn, line);
+    }
+
     fn handleSessionGroupRevoke(self: *LinuxServer, conn: *ConnState, account: []const u8, group: session_sid.Sid) !void {
         if (!self.sessionGroupEnabled()) {
             try self.failReply(conn, "SESSION", "UNSUPPORTED", "Logical revoke requires durable accounts and the complete configured node set");
@@ -60041,11 +62493,15 @@ pub const LinuxServer = struct {
             try self.noticeTo(conn, "SESSION: you are not logged in to an account");
             return;
         };
+        // Exact-grammar pre-filter: only `REVOKE group=<id> attachment=<id>`;
+        // every other form stays with session_sid.parseCommand below.
+        if (session_attachment_revoke.parseCommand(parsed.paramSlice())) |selector|
+            return self.handleSessionAttachmentRevoke(id, conn, account, selector);
         // Validate the complete command before inventory, selector-cache, or
         // credential state can change. DROP has no implicit logical/ALL scope.
         const command = session_sid.parseCommand(parsed.paramSlice()) catch |err| {
             switch (err) {
-                error.UnknownSubcommand => try self.failReply(conn, "SESSION", "INVALID_SUBCOMMAND", "Use SESSION LIST [MESH], TOKEN, RESUME <credential>, DROP <sid|#n>, or REVOKE group=<id>"),
+                error.UnknownSubcommand => try self.failReply(conn, "SESSION", "INVALID_SUBCOMMAND", "Use SESSION LIST [MESH], TOKEN, RESUME <credential>, DROP <sid|#n>, or REVOKE group=<id> [attachment=<id>]"),
                 error.ExtraParameters => try self.failReply(conn, "SESSION", "INVALID_PARAMS", "Unexpected parameters; DROP selects one local attachment and accepts no ALL scope"),
                 error.MissingDropTarget => try self.failReply(conn, "SESSION", "NEED_MORE_PARAMS", "Usage: SESSION DROP <sid|#n>"),
                 error.MissingResumeCredential => try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token"),
@@ -60077,6 +62533,7 @@ pub const LinuxServer = struct {
                 conn.preserve_resume_credential_once = false;
                 if (!conn.resume_autojoin_deferred) conn.resume_autojoin_deadline_ms = 0;
                 try self.warnReply(conn, "SESSION", "RESUME_CREDENTIAL_PRESERVED", "retryable resume did not consume the stored credential; repeat SESSION TOKEN to replace it");
+                self.noteSessionCredentialReused();
                 return;
             }
             // Onyx sends RESUME then TOKEN in-order after 001. Reaching TOKEN with
@@ -60105,6 +62562,7 @@ pub const LinuxServer = struct {
                         ) catch return;
                     } else std.fmt.bufPrint(&buf, "SESSION TOKEN {s}", .{token_hex}) catch return;
                     try self.noticeTo(conn, line);
+                    self.noteSessionCredentialPublished(conn, account, handle.token);
                     // Also offer a mesh-sealed token usable to reclaim/redirect from
                     // ANY node in the mesh (only when a mesh shared key is set).
                     var mbuf: [1024]u8 = undefined;
@@ -60233,6 +62691,10 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "SESSION", "SESSION_REVOKED", "Logical session is revoked");
             return;
         }
+        if (self.sessionAttachmentFenced(token, attachment_id.raw)) {
+            try self.failReply(conn, "SESSION", "SESSION_REVOKED", "Session attachment is revoked");
+            return;
+        }
         const outcome = self.restoreExactAttachment(id, conn, account, token, attachment_id);
         switch (outcome) {
             .missing => {
@@ -60290,6 +62752,14 @@ pub const LinuxServer = struct {
             try self.failReply(conn, "SESSION", "INVALID_TOKEN", "RESUME requires a valid session token");
             return;
         }
+        // Credential verification is session-recovery work, rate-bounded per
+        // source address so one churning source cannot drain the class budget.
+        const verify_ticket = self.tryWorkloadTicket(.session_recovery, .verify, workloadConnPeerKey(conn)) catch {
+            self.markSessionResumeRetryable(conn);
+            try self.warnReply(conn, "SESSION", "TEMPORARILY_UNAVAILABLE", "session recovery is busy; retry the same token");
+            return;
+        };
+        defer self.releaseWorkloadTicketValue(verify_ticket);
         const raw_credential = params[1];
         if (std.mem.startsWith(u8, raw_credential, session_resume_credential.local_prefix ++ ".") or
             std.mem.startsWith(u8, raw_credential, session_resume_credential.mesh_prefix ++ "."))
@@ -60335,6 +62805,11 @@ pub const LinuxServer = struct {
         if (self.sessions.clientHasToken(account, cid, token)) {
             self.finishDeferredSessionAutojoin(id, conn, true);
             try self.noticeTo(conn, "SESSION RESUME: already attached to this session");
+            return;
+        }
+        // A bare token mints a new attachment; the revoked holder still has it.
+        if (self.sessionAttachmentFenced(token, null)) {
+            try self.failReply(conn, "SESSION", "SESSION_REVOKED", "An attachment of this session was revoked; resume with an exact credential");
             return;
         }
 
@@ -60569,6 +63044,10 @@ pub const LinuxServer = struct {
         if (self.sessions.clientHasToken(account, cid, migrate_token)) {
             self.finishDeferredSessionAutojoin(id, conn, true);
             try self.noticeTo(conn, "SESSION RESUME: already attached to this mesh session");
+            return;
+        }
+        if (self.sessionAttachmentFenced(migrate_token, null)) {
+            try self.failReply(conn, "SESSION", "SESSION_REVOKED", "An attachment of this session was revoked; resume with an exact credential");
             return;
         }
 
@@ -61492,7 +63971,11 @@ pub const LinuxServer = struct {
             .inserted, .conflict_replaced, .superseded => true,
             .duplicate, .conflict, .quarantined, .stale, .tombstoned => false,
         };
-        if (!accepted) return false;
+        if (!accepted) {
+            self.forgetStaleOfferRetryStamp(token);
+            return false;
+        }
+        self.offer_retry_stamps.record(token, signed.offer.revision, self.currentOfferCohortStamp());
         self.stats.onSessionPublication(.offer_mutation);
         self.session_replica_store_generation +%= 1;
         self.broadcastSessionReplicaV2(.offer, signed_wire, null);
@@ -61565,35 +64048,56 @@ pub const LinuxServer = struct {
         // The Store remains the sole owner of signed bytes. Compare every signed
         // authority field, plus the current signing key and renewal window;
         // explicit mutation/renewal callers always publish their own revision.
-        // Cohort activation epochs are not carried by OFFER itself. Keep those
-        // retries on the existing publication path rather than infer an epoch.
+        // Cohort activation epochs are not carried by OFFER itself, so a
+        // declared cohort additionally needs this process's stamp of the exact
+        // accepted revision under the unchanged cohort (and a live own receipt
+        // when readiness receipts are enabled). Every retry gets a reason.
         // World serializes this read with Store replacement and local mutation.
-        if (cause == .retry and attached and !self.hasSessionReplicaCohort() and self.sessions.tokenReplicaDirty(token)) {
-            if (self.session_replica_store.getOriginInventory(token, self.config.node_id)) |entry| {
-                const prior = session_replica_v2.decodeOffer(entry.wire) catch return false;
+        const cohort = self.currentOfferCohortStamp();
+        var retry_decision: ?offer_retry_reuse.Decision = null;
+        if (cause == .retry) {
+            const reuse_path_eligible = attached and self.sessions.tokenReplicaDirty(token);
+            retry_decision = if (self.session_replica_store.getOriginInventory(token, self.config.node_id)) |entry| blk: {
+                const prior = session_replica_v2.decodeOffer(entry.wire) catch {
+                    if (reuse_path_eligible) return false;
+                    break :blk .{ .publish_new = .content_changed };
+                };
                 const offer = prior.offer;
                 const lease = self.session_replica_store.getAttachmentLease(token, self.config.node_id);
-                const unpaired = lease == null or lease.?.revision.compare(offer.revision) != .gt;
-                const fresh = issued >= offer.issued_at_ms and
-                    issued - offer.issued_at_ms < session_replica_refresh_interval_ms and
-                    offer.expires_at_ms > issued and
-                    offer.expires_at_ms - offer.issued_at_ms == @as(i64, @intCast(mesh_reclaim_ttl_ms));
-                if (unpaired and fresh and self.sessionReplicaEntryTrusted(entry) and
-                    std.crypto.timing_safe.eql(crypto_sign.PublicKey, prior.signer, ident.sign_kp.public_key) and
-                    offer.revision.origin_node == self.config.node_id and
-                    offer.operation == (if (current) session_replica_v2.OfferOperation.inventory_upsert else .upsert) and
-                    offer.resume_eligible == (if (current) @as(?bool, !inventory_only) else null) and
-                    std.mem.eql(u8, offer.account, account) and
-                    std.mem.eql(u8, offer.nick, if (inventory_only) "" else nick) and
-                    std.mem.eql(u8, offer.snapshot, if (inventory_only) "" else snapshot) and
-                    std.mem.eql(u8, offer.inventory, inventory))
-                {
-                    // No borrow of entry/offer survives lease Store mutation.
-                    if (!self.publishSessionAttachmentLease(token)) return false;
-                    self.stats.onSessionPublication(.offer_retry_reused);
-                    _ = self.sessions.clearTokenReplicaDirty(token);
-                    return true;
-                }
+                break :blk offer_retry_reuse.decide(.{
+                    .prior_present = true,
+                    .lease_revision = if (lease) |known| known.revision else null,
+                    .issued_ms = issued,
+                    .offer_issued_ms = offer.issued_at_ms,
+                    .offer_expires_ms = offer.expires_at_ms,
+                    .refresh_interval_ms = session_replica_refresh_interval_ms,
+                    .ttl_ms = @intCast(mesh_reclaim_ttl_ms),
+                    .entry_trusted = self.sessionReplicaEntryTrusted(entry),
+                    .signer_matches = std.crypto.timing_safe.eql(crypto_sign.PublicKey, prior.signer, ident.sign_kp.public_key),
+                    .origin_matches = offer.revision.origin_node == self.config.node_id,
+                    .operation_matches = offer.operation == (if (current) session_replica_v2.OfferOperation.inventory_upsert else .upsert),
+                    .resume_eligible_matches = offer.resume_eligible == (if (current) @as(?bool, !inventory_only) else null),
+                    .content_matches = std.mem.eql(u8, offer.account, account) and
+                        std.mem.eql(u8, offer.nick, if (inventory_only) "" else nick) and
+                        std.mem.eql(u8, offer.snapshot, if (inventory_only) "" else snapshot) and
+                        std.mem.eql(u8, offer.inventory, inventory),
+                    .offer_revision = offer.revision,
+                    .current_cohort = cohort,
+                    .stamp = self.offer_retry_stamps.lookup(token),
+                    // sendSessionGroupReceipt is a no-op while groups are disabled.
+                    .receipt_required = self.sessionGroupEnabled(),
+                    .own_receipt = self.ownCurrentReadyReceipt(token, offer.revision),
+                    .receipt_refresh_margin_ms = session_group_readiness_ttl_ms / 2,
+                    .reuse_path_eligible = reuse_path_eligible,
+                });
+            } else .{ .publish_new = .no_prior };
+            if (retry_decision.? == .reuse) {
+                // No borrow of entry/offer survives lease Store mutation.
+                if (!self.publishSessionAttachmentLease(token)) return false;
+                self.stats.onSessionPublication(.offer_retry_reused);
+                self.offer_retry_reason_stats.note(.reuse, cohort.declared);
+                _ = self.sessions.clearTokenReplicaDirty(token);
+                return true;
             }
         }
         const signed_wire = session_replica_v2.encodeOffer(self.allocator, .{
@@ -61615,12 +64119,17 @@ pub const LinuxServer = struct {
             .inserted, .conflict_replaced, .superseded => true,
             .duplicate, .conflict, .quarantined, .stale, .tombstoned => false,
         };
-        if (!accepted) return false;
+        if (!accepted) {
+            self.forgetStaleOfferRetryStamp(token);
+            return false;
+        }
+        self.offer_retry_stamps.record(token, signed.offer.revision, cohort);
         self.stats.onSessionPublication(switch (cause) {
             .mutation => .offer_mutation,
             .renewal => .offer_renewal,
             .retry => .offer_retry_new,
         });
+        if (retry_decision) |decision| self.offer_retry_reason_stats.note(decision, cohort.declared);
         self.session_replica_store_generation +%= 1;
         // Store acceptance is the durability boundary. Socket fanout is
         // best-effort because the canonical signed object now participates in
@@ -61634,6 +64143,28 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// T03: drop the OFFER retry stamp for `token` unless this node's own
+    /// retained entry is still exactly the stamped revision and the token is
+    /// neither quarantined nor group-revoked (`getOriginInventory` hides
+    /// both). Stamps are revision-bound, so a stale one could never authorize
+    /// reuse; forgetting it promptly wipes the bearer token bytes and keeps
+    /// the retry counters honest (the next retry counts as unproven).
+    /// Same serialized lane as every other Store mutation; allocation-free.
+    fn forgetStaleOfferRetryStamp(self: *LinuxServer, token: session_migrate.Token) void {
+        const stamp = self.offer_retry_stamps.lookup(token) orelse return;
+        if (!offerRetryStampStillBacked(self, token, stamp.revision))
+            self.offer_retry_stamps.forget(token);
+    }
+
+    fn offerRetryStampStillBacked(
+        self: *LinuxServer,
+        token: session_migrate.Token,
+        revision: offer_retry_reuse.Revision,
+    ) bool {
+        const own = self.session_replica_store.getOriginInventory(token, self.config.node_id) orelse return false;
+        return own.revision.eql(revision);
+    }
+
     /// Close this node's authority for an exact reusable token. The signed
     /// tombstone is applied locally before fanout so reclaim stops immediately
     /// on this node and anti-entropy retains the same canonical REVOKE for peers
@@ -61642,14 +64173,24 @@ pub const LinuxServer = struct {
     fn publishSessionReplicaRevoke(self: *LinuxServer, token: session_migrate.Token) void {
         const ident = self.config.node_identity orelse return;
         if (ident.shortId() != self.config.node_id) return;
-        const issued_u = @min(self.meshWallMs(), @as(u64, std.math.maxInt(i64)) - mesh_reclaim_ttl_ms);
-        const issued: i64 = @intCast(issued_u);
+        // T10: the signed REVOKE window never regresses behind the high-water
+        // window of every revision it supersedes (backward wall-clock step),
+        // so no peer can hold an OFFER whose signed validity outlasts the
+        // REVOKE removing it. Issuance follows the superseded authority even
+        // ahead of this node's stepped-back clock: peers judge future skew by
+        // their own (unstepped) clocks, and this Store is applied at `issued`.
+        const lifetime = session_replica_revocation.revokeLifetime(
+            self.meshWallMs(),
+            self.session_replica_store.supersededAuthority(token, self.config.node_id),
+            mesh_reclaim_ttl_ms,
+        );
+        const issued: i64 = lifetime.issued_at_ms;
         const signed_wire = session_replica_v2.encodeOffer(self.allocator, .{
             .operation = .remove,
             .token = token,
             .revision = self.nextSessionReplicaRevision(),
             .issued_at_ms = issued,
-            .expires_at_ms = issued + @as(i64, @intCast(mesh_reclaim_ttl_ms)),
+            .expires_at_ms = lifetime.expires_at_ms,
         }, &ident.sign_kp) catch return;
         defer self.allocator.free(signed_wire);
         const signed = session_replica_v2.decodeOffer(signed_wire) catch return;
@@ -61659,6 +64200,7 @@ pub const LinuxServer = struct {
             .inserted, .duplicate, .conflict, .quarantined, .stale => false,
         };
         if (!advanced) return;
+        self.offer_retry_stamps.forget(token);
         self.session_replica_store_generation +%= 1;
         _ = self.projectBestSessionReplicaV2(token);
         self.broadcastSessionReplicaV2(.revoke, signed_wire, null);
@@ -61776,6 +64318,7 @@ pub const LinuxServer = struct {
         if (!establishment_pending and !conn.session_replica_resync_burst_pending) return;
 
         if (!self.sendMeshStateBurstTo(conn)) return;
+        self.offerRetainedSessionAttachmentRevokes(conn, link);
         conn.s2s_burst_done = true;
         conn.session_replica_resync_burst_pending = false;
     }
@@ -62082,6 +64625,10 @@ pub const LinuxServer = struct {
         defer self.allocator.free(notices);
         for (notices) |wire| {
             defer self.allocator.free(wire);
+            if (session_attachment_revoke.hasMagic(wire)) {
+                self.acceptSessionAttachmentRevoke(wire, link.peerShortId());
+                continue;
+            }
             const notice = session_reclaim_mesh.decodeConsumeNotice(wire) catch continue;
             if (notice.account.len == 0) continue;
             self.applySessionConsumedNotice(notice);
@@ -63075,8 +65622,12 @@ pub const LinuxServer = struct {
                         replica_resync_needed = true;
                     }
                     const quarantine_changed = result.disposition == .quarantined and !was_quarantined;
-                    if (advances or quarantine_changed)
+                    if (advances or quarantine_changed) {
                         self.session_replica_store_generation +%= 1;
+                        // T03: a peer-delivered tombstone or quarantine of this
+                        // node's own OFFER ends the authority its stamp proved.
+                        self.forgetStaleOfferRetryStamp(signed.offer.token);
+                    }
                     // Reconcile exact-token rows while their receiver-owned tag
                     // is still present. Clearing/rebinding the old nick first
                     // would make revoke, quarantine, and nick-change cleanup
@@ -63210,6 +65761,9 @@ pub const LinuxServer = struct {
         attachment_transfer: ?RestoreAttachmentTransfer,
     ) bool {
         if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(session_token) != null) return false;
+        // T07: an inbound migration capsule binds a new attachment under the
+        // shared token, so any live attachment fence on it refuses the bind.
+        if (self.sessionAttachmentFenced(session_token, null)) return false;
         const pm = if (self.pending_migrations) |*p| p else return false;
         const entry = pm.getLive(
             session_token,
@@ -63250,6 +65804,7 @@ pub const LinuxServer = struct {
         bind_kind: sessions_mod.TokenBindKind,
     ) bool {
         if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(session_token) != null) return false;
+        if (self.sessionAttachmentFenced(session_token, null)) return false;
         var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
         defer snap.deinit(self.allocator);
         return self.restoreAndBindMigrationSnapshot(id, conn, account, session_token, bind_kind, &snap);
@@ -63277,6 +65832,9 @@ pub const LinuxServer = struct {
         attachment_id: sessions_mod.AttachmentId,
     ) ExactAttachmentResumeOutcome {
         if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(session_token) != null) return .missing;
+        // T07: the exact named attachment is refused when it is fenced; an
+        // unfenced exact sibling of the same token stays resumable.
+        if (self.sessionAttachmentFenced(session_token, attachment_id.raw)) return .missing;
         const cid = monitorIdFromClient(id);
         if (self.sessions.clientHasAttachment(account, cid, session_token, attachment_id))
             return .already_attached;
@@ -63345,6 +65903,7 @@ pub const LinuxServer = struct {
         old_client: sessions_mod.ClientId,
     ) bool {
         if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(session_token) != null) return false;
+        if (self.sessionAttachmentFenced(session_token, null)) return false;
         var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
         defer snap.deinit(self.allocator);
         if (!self.migrationRestorePreflight(id, conn, account, &snap)) return false;
@@ -63381,6 +65940,7 @@ pub const LinuxServer = struct {
         old_client: sessions_mod.ClientId,
     ) bool {
         if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(session_token) != null) return false;
+        if (self.sessionAttachmentFenced(session_token, null)) return false;
         var token_ticket = self.sessions.prepareTokenBind(
             account,
             new_client,
@@ -63408,6 +65968,7 @@ pub const LinuxServer = struct {
         kind: sessions_mod.TokenBindKind,
     ) bool {
         if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(session_token) != null) return false;
+        if (self.sessionAttachmentFenced(session_token, null)) return false;
         var snap = migration_relay.Snapshot.decode(self.allocator, bytes) catch return false;
         defer snap.deinit(self.allocator);
         if (!self.migrationRestorePreflight(id, conn, account, &snap)) return false;
@@ -63441,6 +66002,7 @@ pub const LinuxServer = struct {
         session_token: sessions_mod.Token,
     ) bool {
         if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(session_token) != null) return false;
+        if (self.sessionAttachmentFenced(session_token, null)) return false;
         // Flush/check deferred authority before taking SessionStore's retained
         // lock. The snapshot itself is borrowed only after preparation, so its
         // pure identity validation happens separately below.
@@ -65927,7 +68489,20 @@ pub const LinuxServer = struct {
             if (recipient_ws.phase != .open or !wsAdmitsBinaryApplication(recipient_ws)) continue;
             // Deliver to actual call participants, not every channel member.
             if (!self.media_rooms.isParticipant(channel, mconn.session.displayName())) continue;
+            // Lossy media sheds under its own budget instead of crowding out
+            // control, chat, or replay. Foreign-shard recipients are charged
+            // by their owner's SendQ cap only; their backlog is not readable here.
+            const local_recipient = mid.shard == self.rx().shard_id;
+            if (local_recipient) {
+                const turn = &self.rx().output_class_turn;
+                const decision = turn.decide(self.output_class_policy, .media, sendq.backlog(mconn), mconn.sendq_cap, ws_frame.len);
+                if (decision != .admit) {
+                    turn.record(.media, decision);
+                    continue;
+                }
+            }
             self.enqueuePreframedSecureDelivery(mid, ws_frame) catch continue;
+            if (local_recipient) self.rx().output_class_turn.commit(.media, ws_frame.len);
         }
     }
 
@@ -67518,6 +70093,460 @@ pub const LinuxServer = struct {
         return null;
     }
 
+    /// The live ledger, created on first use with ids seeded from the wall
+    /// clock. Null only when that allocation fails (the change stays
+    /// unrecorded and so not undoable; the moderation action itself stands).
+    fn moderationLedger(self: *LinuxServer) ?*moderation_undo.Ledger {
+        if (self.moderation_ledger) |ledger| return ledger;
+        const ledger = self.allocator.create(moderation_undo.Ledger) catch return null;
+        ledger.* = moderation_undo.Ledger.init(self.allocator);
+        ledger.seedFirstId(moderation_undo.seedFor(false, platform.realtimeMillis()));
+        self.moderation_ledger = ledger;
+        return ledger;
+    }
+
+    /// The channel-list ledger, created on first use like `moderationLedger`.
+    fn moderationListLedger(self: *LinuxServer) ?*moderation_undo.Ledger {
+        if (self.moderation_list_ledger) |ledger| return ledger;
+        const ledger = self.allocator.create(moderation_undo.Ledger) catch return null;
+        ledger.* = moderation_undo.Ledger.init(self.allocator);
+        ledger.seedFirstId(moderation_undo.seedFor(true, platform.realtimeMillis()));
+        self.moderation_list_ledger = ledger;
+        return ledger;
+    }
+
+    /// The existing ledger that owns `change_id`, if it was ever created.
+    fn moderationLedgerFor(self: *LinuxServer, change_id: u64) ?*moderation_undo.Ledger {
+        return if (moderation_undo.isChannelListId(change_id)) self.moderation_list_ledger else self.moderation_ledger;
+    }
+
+    /// The incarnation of `channel` for channel-list fact keys: its object id
+    /// and creation second. Null when the channel does not exist.
+    fn channelListEpoch(self: *LinuxServer, channel: []const u8) ?u64 {
+        const oid = self.world.channelOid(channel) orelse return null;
+        const created: u64 = @bitCast(self.world.channelCreatedUnix(channel) orelse 0);
+        return (@as(u64, oid) << 32) | (created & 0xffff_ffff);
+    }
+
+    fn channelListEntries(self: *LinuxServer, channel: []const u8, kind: channel_list_event.ListKind) ?[]const world_model.ListEntry {
+        return switch (kind) {
+            .ban => self.world.bansOf(channel),
+            .exempt => self.world.exemptsOf(channel),
+            .invex => self.world.invexOf(channel),
+            .quiet => self.world.mutesOf(channel),
+        };
+    }
+
+    /// Apply one channel-list fact to the World. Returns whether it changed.
+    fn applyChannelListFact(self: *LinuxServer, channel: []const u8, kind: channel_list_event.ListKind, mask: []const u8, present: bool, setter: []const u8, set_at: i64) world_model.WorldError!bool {
+        if (present) return switch (kind) {
+            .ban => self.world.addBan(channel, mask, setter, set_at),
+            .exempt => self.world.addExempt(channel, mask, setter, set_at),
+            .invex => self.world.addInvex(channel, mask, setter, set_at),
+            .quiet => self.world.addMute(channel, mask, setter, set_at),
+        };
+        return switch (kind) {
+            .ban => self.world.removeBan(channel, mask),
+            .exempt => self.world.removeExempt(channel, mask),
+            .invex => self.world.removeInvex(channel, mask),
+            .quiet => self.world.removeMute(channel, mask),
+        };
+    }
+
+    /// Snapshot of one channel-list entry before a local MODE changes it.
+    /// `channel` and `mask` are borrowed for the snapshot's lifetime.
+    pub fn channelListSnapshot(self: *LinuxServer, channel: []const u8, kind: channel_list_event.ListKind, mask: []const u8) ModerationFact {
+        const epoch = self.channelListEpoch(channel) orelse return .{ .key = moderation_undo.FactKey.ofChannelList(kind, channel, mask, 0) };
+        return self.moderationSnapshot(moderation_undo.FactKey.ofChannelList(kind, channel, mask, epoch));
+    }
+
+    /// Record a local channel-list change that already happened, paired with
+    /// the audit entry `audit_seq`/`proof_id` when one was written (0/"" for
+    /// list kinds that write none). Never fails the MODE: a change the ledger
+    /// cannot represent (bounds, allocation) is simply not undoable.
+    fn recordChannelListChange(self: *LinuxServer, before: *const ModerationFact, actor: []const u8, audit_seq: u64, proof_id: []const u8) void {
+        if (!before.recordable) return;
+        var after = self.moderationFactState(before.key) orelse return;
+        if (!before.present and !after.present) return;
+        after.version = self.nextMeshHlc();
+        const ledger = self.moderationListLedger() orelse return;
+        _ = ledger.record(.{
+            .action = .mode,
+            .audit_seq = audit_seq,
+            .proof_id = proof_id,
+            .actor = actor,
+            .key = before.key,
+            .before = before.state(),
+            .after = after,
+            .at_ms = platform.realtimeMillis(),
+        }) catch {};
+    }
+
+    /// The live state of a ward or shun fact, borrowing store memory until the
+    /// next store mutation. `version` is 0: the stores keep no per-fact HLC,
+    /// and the ledger treats 0 as "no newer write" (drift is detected by
+    /// content, later records and `observeExternal`). A channel-list fact
+    /// reads as null when its channel no longer exists or is a different
+    /// incarnation than `key.epoch`; callers refuse that as drift.
+    fn moderationFactState(self: *LinuxServer, key: moderation_undo.FactKey) ?moderation_undo.FactState {
+        const absent = moderation_undo.FactState{ .present = false, .setter = "", .set_at = 0, .version = 0 };
+        switch (key.family) {
+            .ward => |match| return if (self.warden.find(match, key.mask)) |w| moderation_undo.FactState.ofWard(w.*, 0) else absent,
+            .shun => {
+                for (self.shuns.shuns.items) |sh| {
+                    if (std.mem.eql(u8, sh.mask, key.mask)) return moderation_undo.FactState.ofShun(sh, 0);
+                }
+                return absent;
+            },
+            .channel_list => |kind| {
+                const epoch = self.channelListEpoch(key.scope) orelse return null;
+                if (epoch != key.epoch) return null;
+                const entries = self.channelListEntries(key.scope, kind) orelse return null;
+                for (entries) |entry| {
+                    if (std.mem.eql(u8, entry.mask, key.mask))
+                        return .{ .present = true, .setter = entry.setter, .set_at = entry.set_at, .version = 0 };
+                }
+                return absent;
+            },
+        }
+    }
+
+    /// A fact's state copied out of its store before a mutation frees it.
+    /// `key` borrows the caller's command arguments.
+    pub const ModerationFact = struct {
+        key: moderation_undo.FactKey,
+        /// False when the fact cannot be represented in the ledger (content
+        /// over its bounds, or an unsupported family); the change is then
+        /// applied and audited but not recorded as undoable.
+        recordable: bool = false,
+        present: bool = false,
+        setter_buf: [channel_list_event.max_setter_len]u8 = undefined,
+        setter_len: usize = 0,
+        reason_buf: [moderation_undo.max_reason_len]u8 = undefined,
+        reason_len: usize = 0,
+        set_at: i64 = 0,
+        expires_ms: i64 = 0,
+        ward: ?moderation_undo.WardPolicy = null,
+
+        fn state(self: *const ModerationFact) moderation_undo.FactState {
+            return .{
+                .present = self.present,
+                .setter = self.setter_buf[0..self.setter_len],
+                .set_at = self.set_at,
+                .version = 0,
+                .reason = self.reason_buf[0..self.reason_len],
+                .expires_ms = self.expires_ms,
+                .ward = self.ward,
+            };
+        }
+    };
+
+    pub fn moderationSnapshot(self: *LinuxServer, key: moderation_undo.FactKey) ModerationFact {
+        var fact = ModerationFact{ .key = key };
+        const live = self.moderationFactState(key) orelse return fact;
+        if (live.setter.len > fact.setter_buf.len or live.reason.len > fact.reason_buf.len) return fact;
+        @memcpy(fact.setter_buf[0..live.setter.len], live.setter);
+        fact.setter_len = live.setter.len;
+        @memcpy(fact.reason_buf[0..live.reason.len], live.reason);
+        fact.reason_len = live.reason.len;
+        fact.present = live.present;
+        fact.set_at = live.set_at;
+        fact.expires_ms = live.expires_ms;
+        fact.ward = live.ward;
+        fact.recordable = true;
+        return fact;
+    }
+
+    pub const ModerationReceipt = struct {
+        proof_id: ?[proofmark.proof_id_hex_len]u8,
+        change_id: ?u64 = null,
+    };
+
+    /// Audit one ward/shun change exactly as `recordOperAudit` does, then
+    /// record it as undoable, paired with that audit entry. `before` was taken
+    /// before the store mutation; the after state is read live now. Nothing is
+    /// recorded when the audit entry was not written, the fact did not change,
+    /// or the ledger refuses (bounds, allocation): such a change is simply not
+    /// undoable.
+    pub fn recordModerationAudit(self: *LinuxServer, before: *const ModerationFact, oper: []const u8, action: svc_operaudit.Action, reason: []const u8) ModerationReceipt {
+        const audit_mark = self.oper_audit.newestSeq();
+        const proof_id = self.recordOperAudit(oper, action, before.key.mask, reason);
+        var receipt = ModerationReceipt{ .proof_id = proof_id };
+        const audit_seq = self.oper_audit.newestSeq() orelse return receipt;
+        if (audit_mark) |mark| if (mark == audit_seq) return receipt;
+        if (!before.recordable) return receipt;
+        var after = self.moderationFactState(before.key) orelse return receipt;
+        if (!before.present and !after.present) return receipt;
+        after.version = self.nextMeshHlc();
+        const ledger = self.moderationLedger() orelse return receipt;
+        receipt.change_id = ledger.record(.{
+            .action = action,
+            .audit_seq = audit_seq,
+            .proof_id = if (receipt.proof_id) |*pid| pid[0..] else "",
+            .actor = oper,
+            .key = before.key,
+            .before = before.state(),
+            .after = after,
+            .at_ms = platform.realtimeMillis(),
+        }) catch null;
+        return receipt;
+    }
+
+    /// `note` with ` change=<id>` appended when the change was recorded.
+    pub fn withChangeId(buf: []u8, note: []const u8, change_id: ?u64) []const u8 {
+        const id = change_id orelse return note;
+        return std.fmt.bufPrint(buf, "{s} change={d}", .{ note, id }) catch note;
+    }
+
+    /// An inbound mesh write touched `key`; earlier local changes of it can no
+    /// longer be undone safely.
+    fn observeExternalModeration(self: *LinuxServer, key: moderation_undo.FactKey) void {
+        if (self.moderation_ledger) |ledger| ledger.observeExternal(key);
+    }
+
+    fn moderationRefusalText(refusal: moderation_undo.Refusal) []const u8 {
+        return switch (refusal) {
+            .unknown_or_evicted => "unknown or no longer retained",
+            .unauthorized => "not authorized for this change",
+            .already_undone => "already undone",
+            .conflict_superseded => "a later change to the same fact is still in effect",
+            .conflict_state_drift => "the fact changed since (another operator, a peer, or expiry)",
+            .target_expired => "the state it would restore has already expired",
+        };
+    }
+
+    fn noticeUndoRefused(self: *LinuxServer, conn: *ConnState, change_id: u64, refusal: moderation_undo.Refusal) !void {
+        var b: [default_reply_bytes]u8 = undefined;
+        const line = std.fmt.bufPrint(&b, "AUDIT UNDO {d}: refused ({s}: {s})", .{ change_id, @tagName(refusal), moderationRefusalText(refusal) }) catch return;
+        try self.noticeTo(conn, line);
+    }
+
+    /// `AUDIT UNDO <change-id>`: reverse one recorded ward, shun or
+    /// channel-list (+b/+e/+I/+Z) change as a new, audited change. The
+    /// decision is staged without mutation, a mesh ward passes the two-person
+    /// gate, every allocation happens in `prepareUndo`, and only then is the
+    /// store changed; the `.undo` audit entry names the original and
+    /// `finishUndo` links it. History is never deleted. A channel-list undo is
+    /// published to peers as an ordinary CHANNEL_LIST fact with a fresh mesh
+    /// HLC, so no wire or capability change is involved and mixed-version
+    /// peers converge by the existing last-writer-wins rule.
+    /// `AUDIT UNDO <action>` names why that action kind is not reversible
+    /// (AKILL/GLINE: see `moderation_undo.nonReversibleReason`).
+    fn handleModerationUndo(self: *LinuxServer, conn: *ConnState, args: []const []const u8) !void {
+        if (!self.requirePriv(conn, .client_moderate)) return;
+        const change_id = if (args.len == 1) std.fmt.parseInt(u64, args[0], 10) catch null else null;
+        const id = change_id orelse {
+            // An action label instead of an id (e.g. `AUDIT UNDO akill`) gets
+            // the explicit reason that kind of action is not reversible.
+            if (args.len == 1) {
+                var label_buf: [24]u8 = undefined;
+                if (args[0].len <= label_buf.len) {
+                    const label = std.ascii.lowerString(&label_buf, args[0]);
+                    if (std.meta.stringToEnum(svc_operaudit.Action, label)) |action| {
+                        if (moderation_undo.nonReversibleReason(action)) |why| {
+                            var b: [default_reply_bytes]u8 = undefined;
+                            try self.noticeTo(conn, std.fmt.bufPrint(&b, "AUDIT UNDO: {s} is not reversible: {s}", .{ action.label(), why }) catch "AUDIT UNDO: not reversible");
+                            return;
+                        }
+                    }
+                }
+            }
+            try self.noticeTo(conn, "Usage: AUDIT UNDO <change-id> (see AUDIT CHANGES)");
+            return;
+        };
+        const ledger = self.moderationLedgerFor(id) orelse return self.noticeUndoRefused(conn, id, .unknown_or_evicted);
+        const original = ledger.find(id) orelse return self.noticeUndoRefused(conn, id, .unknown_or_evicted);
+        const requester = moderation_undo.Requester{
+            .identity = conn.session.displayName(),
+            .is_oper = conn.session.isOper(),
+            .chanop_of = "",
+        };
+        // Expiry clock of the fact's own store: wards stamp the wall clock,
+        // shuns the reactor clock (`handleShun` / `senderSilenced`).
+        const now_ms = switch (original.key.family) {
+            .shun => self.nowMs(),
+            .ward, .channel_list => platform.realtimeMillis(),
+        };
+        // A channel-list fact whose channel is gone or was re-created is
+        // drift: the list the change was made to no longer exists.
+        const current = self.moderationFactState(original.key) orelse return self.noticeUndoRefused(conn, id, .conflict_state_drift);
+        const plan = switch (ledger.planUndo(id, requester, current, now_ms)) {
+            .refusal => |r| return self.noticeUndoRefused(conn, id, r),
+            .ok => |ok| ok,
+        };
+        // A mesh-scope ward is network authority: reversing it needs the same
+        // two-person approval as the WARD ADD/DEL it amounts to.
+        const target_mesh = if (plan.target.ward) |w| plan.target.present and w.scope == .mesh else false;
+        const current_mesh = if (current.ward) |w| current.present and w.scope == .mesh else false;
+        if (target_mesh or current_mesh) {
+            const kind: TwoPersonKind = if (plan.target.present) .ward_add else .ward_del;
+            switch (try self.twoPersonAdmit(conn, kind, plan.key.mask)) {
+                .waiting => return,
+                .proceed, .confirmed => {},
+            }
+        }
+        const prep = ledger.prepareUndo(id, requester, current, self.nextMeshHlc(), now_ms) catch {
+            try self.noticeTo(conn, "AUDIT UNDO: temporarily unavailable");
+            return;
+        };
+        var prepared = switch (prep) {
+            .refused => |r| return self.noticeUndoRefused(conn, id, r),
+            .prepared => |p| p,
+        };
+        const key = prepared.key();
+        const target = prepared.target();
+        switch (key.family) {
+            .ward => |match| {
+                var policy_snap: ?PolicyUndo = self.snapshotWard() catch null;
+                defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
+                if (target.asWard(key)) |ward| {
+                    self.warden.add(ward) catch {
+                        ledger.abortUndo(&prepared);
+                        try self.noticeTo(conn, "AUDIT UNDO: could not restore ward (limit or invalid input)");
+                        return;
+                    };
+                    self.persistWardMirror(conn, ward);
+                    if (ward.scope == .mesh) self.broadcastMeshWard(ward, .add);
+                } else {
+                    _ = self.warden.remove(match, key.mask);
+                    self.deleteWardMirror(match, key.mask);
+                }
+                // A ward that leaves mesh scope is withdrawn from peers too.
+                if (current_mesh and !target_mesh)
+                    self.broadcastMeshWard(.{ .match = match, .pattern = key.mask, .scope = .mesh, .action = .expel }, .remove);
+                if (policy_snap) |snap| {
+                    self.commitPolicy(snap);
+                    policy_snap = null;
+                }
+                if (target.present) self.reapWardMatches();
+            },
+            .shun => {
+                if (target.asShun(key)) |sh| {
+                    self.shuns.add(sh) catch {
+                        ledger.abortUndo(&prepared);
+                        try self.noticeTo(conn, "AUDIT UNDO: could not restore shun (limit or invalid input)");
+                        return;
+                    };
+                } else {
+                    _ = self.shuns.remove(key.mask);
+                }
+                self.snapshotShuns();
+            },
+            .channel_list => |kind| {
+                var actor_prefix_buf: ClientPrefixBuffer = undefined;
+                const actor_prefix = clientPrefix(conn, &actor_prefix_buf);
+                // A restored entry keeps its original setter and set time; a
+                // removal is attributed to the operator who undid the add.
+                const setter = if (target.present) target.setter else actor_prefix;
+                const set_at = if (target.present) target.set_at else @divFloor(platform.realtimeMillis(), 1000);
+                var policy_snap: ?PolicyUndo = if (kind == .ban) self.snapshotBan() catch null else null;
+                defer if (policy_snap) |*snap| self.destroyPolicyUndo(snap);
+                const changed = self.applyChannelListFact(key.scope, kind, key.mask, target.present, setter, set_at) catch false;
+                if (!changed) {
+                    // Planned against the same locked World, so only a full
+                    // list or allocation failure lands here. Nothing changed.
+                    ledger.abortUndo(&prepared);
+                    try self.noticeTo(conn, "AUDIT UNDO: could not apply the channel list change (list full or out of memory)");
+                    return;
+                }
+                if (policy_snap) |snap| {
+                    self.commitPolicy(snap);
+                    policy_snap = null;
+                }
+                var mode_buf: [default_reply_bytes]u8 = undefined;
+                const sign: u8 = if (target.present) '+' else '-';
+                if (std.fmt.bufPrint(&mode_buf, ":{s} MODE {s} {c}{c} {s}\r\n", .{ actor_prefix, key.scope, sign, kind.letter(), key.mask })) |mode_line| {
+                    self.broadcastChannel(key.scope, mode_line, null) catch {};
+                } else |_| {}
+                // Same CHANNEL MODE event and event-playback record as a
+                // MODE command, so subscribers and replay see the undo.
+                var detail_buf: [default_reply_bytes]u8 = undefined;
+                if (std.fmt.bufPrint(&detail_buf, "{c}{c} {s}", .{ sign, kind.letter(), key.mask })) |detail| {
+                    self.publishChannelEventDetail("MODE", key.scope, detail) catch {};
+                } else |_| {}
+                var mode_ev_buf: [default_reply_bytes]u8 = undefined;
+                if (std.fmt.bufPrint(&mode_ev_buf, "{s} {c}{c} {s}", .{ key.scope, sign, kind.letter(), key.mask })) |mbody| {
+                    self.recordHistoryEvent(key.scope, conn, "MODE", mbody);
+                } else |_| {}
+                self.announceChannelList(key.scope, kind, key.mask, setter, set_at, target.present);
+            },
+        }
+        var reason_buf: [moderation_undo.max_undo_reason_len]u8 = undefined;
+        const audit_mark = self.oper_audit.newestSeq();
+        const proof_id = self.recordOperAudit(requester.identity, .undo, key.mask, prepared.auditReason(&reason_buf));
+        const audit_seq = self.oper_audit.newestSeq() orelse 0;
+        const paired_seq = if (audit_mark != null and audit_mark.? == audit_seq) 0 else audit_seq;
+        const new_id = ledger.finishUndo(&prepared, paired_seq, if (proof_id) |*pid| pid[0..] else "") catch {
+            try self.noticeTo(conn, "AUDIT UNDO: applied, but the ledger could not link it");
+            return;
+        };
+        const rec = ledger.find(new_id).?;
+        var target_buf: [moderation_target_text_len]u8 = undefined;
+        const target_text = moderationTargetText(&target_buf, rec.key);
+        var b: [default_reply_bytes]u8 = undefined;
+        const note = if (proof_id) |pid|
+            std.fmt.bufPrint(&b, "UNDO change={d} {s}: {s} change={d} proof={s}", .{ id, target_text, if (rec.after.present) "restored" else "removed", new_id, pid[0..] }) catch return
+        else
+            std.fmt.bufPrint(&b, "UNDO change={d} {s}: {s} change={d}", .{ id, target_text, if (rec.after.present) "restored" else "removed", new_id }) catch return;
+        try self.publishOperEvent(.oper_action, .notice, note);
+    }
+
+    const moderation_target_text_len = 16 + channel_list_event.max_channel_len + 1 + channel_list_event.max_mask_len;
+
+    /// `<facet> <pattern>` for a ward, `shun <mask>`, or `+<letter> <channel>
+    /// <mask>` for a channel-list entry.
+    fn moderationTargetText(buf: *[moderation_target_text_len]u8, key: moderation_undo.FactKey) []const u8 {
+        return switch (key.family) {
+            .ward => |m| std.fmt.bufPrint(buf, "{s} {s}", .{ m.token(), key.mask }),
+            .shun => std.fmt.bufPrint(buf, "shun {s}", .{key.mask}),
+            .channel_list => |kind| std.fmt.bufPrint(buf, "+{c} {s} {s}", .{ kind.letter(), key.scope, key.mask }),
+        } catch key.mask;
+    }
+
+    /// `AUDIT CHANGES [count]`: newest reversible moderation changes first.
+    fn handleModerationChanges(self: *LinuxServer, conn: *ConnState, args: []const []const u8) !void {
+        if (!self.requirePriv(conn, .audit_read)) return;
+        const want: usize = if (args.len >= 1) std.math.clamp(std.fmt.parseInt(usize, args[0], 10) catch 10, 1, 50) else 10;
+        var shown: usize = 0;
+        // Both rings, merged newest first by record time.
+        var gi: usize = if (self.moderation_ledger) |l| l.len() else 0;
+        var li: usize = if (self.moderation_list_ledger) |l| l.len() else 0;
+        while (shown < want and (gi > 0 or li > 0)) : (shown += 1) {
+            const g_rec: ?*const moderation_undo.ChangeRecord = if (gi > 0) self.moderation_ledger.?.at(gi - 1) else null;
+            const l_rec: ?*const moderation_undo.ChangeRecord = if (li > 0) self.moderation_list_ledger.?.at(li - 1) else null;
+            const take_list = if (g_rec) |g| (if (l_rec) |l| l.at_ms > g.at_ms else false) else true;
+            const rec = if (take_list) blk: {
+                li -= 1;
+                break :blk l_rec.?;
+            } else blk: {
+                gi -= 1;
+                break :blk g_rec.?;
+            };
+            var target_buf: [moderation_target_text_len]u8 = undefined;
+            const target_text = moderationTargetText(&target_buf, rec.key);
+            var undone_buf: [32]u8 = undefined;
+            const undone = if (rec.undone_by) |u| std.fmt.bufPrint(&undone_buf, "{d}", .{u}) catch "?" else "-";
+            var undoes_buf: [32]u8 = undefined;
+            const undoes = if (rec.undoes) |u| std.fmt.bufPrint(&undoes_buf, "{d}", .{u}) catch "?" else "-";
+            var b: [default_reply_bytes]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "CHANGE {d} {s} {s} {s}->{s} by {s} audit={d} undoes={s} undone_by={s}{s}", .{
+                rec.change_id,
+                rec.action.label(),
+                target_text,
+                if (rec.before.present) "present" else "absent",
+                if (rec.after.present) "present" else "absent",
+                rec.actor,
+                rec.audit_seq,
+                undoes,
+                undone,
+                if (rec.externally_changed) " (peer-changed)" else "",
+            }) catch continue;
+            try self.noticeTo(conn, line);
+        }
+        var eb: [64]u8 = undefined;
+        try self.noticeTo(conn, std.fmt.bufPrint(&eb, "CHANGE end of list ({d})", .{shown}) catch "CHANGE end of list");
+    }
+
     fn proofHashHex(hash: proofmark.Digest, out: *[proofmark.proof_id_hex_len]u8) []const u8 {
         const hex = std.fmt.bytesToHex(hash, .lower);
         @memcpy(out, &hex);
@@ -67684,7 +70713,12 @@ pub const LinuxServer = struct {
     /// recent first. A leading non-numeric arg filters to one operator's actions.
     /// Gated on the audit_read privilege (the same priv guarding the DEBUG flight
     /// recorder). `AUDIT PROOF [JSON] <id>` inspects one ProofMark record.
+    /// `AUDIT CHANGES [count]` lists reversible moderation changes and
+    /// `AUDIT UNDO <change-id>` reverses one as a new audited change.
     pub fn handleAudit(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
+        const p = parsed.paramSlice();
+        if (p.len >= 1 and std.ascii.eqlIgnoreCase(p[0], "UNDO")) return self.handleModerationUndo(conn, p[1..]);
+        if (p.len >= 1 and std.ascii.eqlIgnoreCase(p[0], "CHANGES")) return self.handleModerationChanges(conn, p[1..]);
         return oper_cmd.handleAudit(self, conn, parsed);
     }
 
@@ -67798,9 +70832,22 @@ pub const LinuxServer = struct {
         self: *LinuxServer,
         category: event_spine.EventCategory,
         severity: event_spine.EventSeverity,
-        message: []const u8,
-        subject: []const u8,
+        raw_message: []const u8,
+        raw_subject: []const u8,
     ) !void {
+        // T08: a locally authored event is signed, retained in history, fanned
+        // to every peer and posted to webhooks, so scrub bearer credentials at
+        // authorship. Received relays never pass here and stay byte-identical.
+        var safe_message_buf: [event_history_mod.max_message_len + 128]u8 = undefined;
+        var safe_subject_buf: [event_history_mod.max_message_len + 128]u8 = undefined;
+        const message = if (credential_redaction.containsBearer(raw_message))
+            credential_redaction.redactInto(raw_message, &safe_message_buf)
+        else
+            raw_message;
+        const subject = if (credential_redaction.containsBearer(raw_subject))
+            credential_redaction.redactInto(raw_subject, &safe_subject_buf)
+        else
+            raw_subject;
         // Deliver to THIS node's local oper subscribers (rendered with our server
         // name as the origin), then fan the same event to every mesh peer so opers
         // on OTHER nodes see it too — network-wide Event Spine. A peer renders it
@@ -69073,13 +72120,17 @@ pub const LinuxServer = struct {
     }
 
     /// Ship this node's locally authored ACCESS entries and tombstones to one
-    /// freshly established (or anti-entropy refreshed) secured peer. Only
-    /// self-originated facts can be re-signed here; foreign-origin facts
-    /// reach a new peer when their origin bursts to any neighbor and the
-    /// drain path floods the exact wire onward. Timed entries ship with
-    /// their original authored duration (sign-once); each receiver derives
-    /// its own absolute expiry, and the store refuses timed facts whose
-    /// origin-side lifetime already lapsed.
+    /// freshly established (or anti-entropy refreshed) secured peer, then
+    /// re-send every retained foreign-origin fact whose author signature the
+    /// store kept, byte-identical to the origin image. The re-send is how a
+    /// cold-restarted author (whose store starts empty) and a peer that links
+    /// after the author left re-learn its facts at their original stamp, so
+    /// every node lands on the same anchored expiry. Present foreign facts
+    /// older than the tombstone TTL are not re-sent: a retraction that old may
+    /// already be reclaimed elsewhere and must not be resurrected. Timed
+    /// entries ship with their original authored duration (sign-once); each
+    /// receiver derives the absolute expiry from `(hlc, duration)`, and the
+    /// store refuses timed facts whose lifetime already lapsed.
     fn sendAccessBurstTo(self: *LinuxServer, conn: *ConnState) bool {
         if (!conn.isActiveMeshPeer()) return false;
         const link = conn.s2s_secured orelse return true;
@@ -69131,7 +72182,71 @@ pub const LinuxServer = struct {
             _ = link.sendAccessEvent(signed) catch return false;
             self.observeAccessEventGuard(signed);
         }
+        var foreign = self.access.signedFacts(now);
+        while (foreign.next()) |fact| {
+            if (fact.origin_node == local_node) continue;
+            if (fact.present and now -| fact.hlc / 1000 >= self.access.tombstone_ttl_seconds) continue;
+            var wire_buf: [1024]u8 = undefined;
+            const wire = ircx_access_event.encode(ircx_access_event.fromSignedFact(&fact), &wire_buf) catch continue;
+            _ = link.resendAccessEventFrame(wire) catch |err| switch (err) {
+                // Deterministic for this retained image: skip it, never stall the burst family.
+                error.InvalidAccessEvent, error.BadOriginSignature, error.OriginMismatch, error.PayloadTooLarge => continue,
+                else => return false,
+            };
+            _ = self.access_event_seen.observe(s2s_peer_mod.S2sPeer.accessEventIdForWire(wire));
+        }
         return true;
+    }
+
+    /// This node's mesh config/cloak compatibility facts (M09). Borrows the
+    /// live config, including secret key material: never log the result.
+    fn configCompatProfile(self: *const LinuxServer) mesh_config_compat.LocalProfile {
+        return .{
+            .cloak_key = self.config.cloak_key,
+            .cloak_prev_key = self.config.cloak_prev_key,
+            .cloak_suffix = self.config.cloak_suffix,
+            .cloak_opaque = self.config.cloak_opaque,
+            .cloak_account = self.config.cloak_account,
+            .cloak_anon_epoch_secs = self.config.cloak_anon_epoch_secs,
+            .require_secured = self.config.require_secured,
+            .require_signed_frames = self.config.s2s_config.require_signed_frames,
+            .network_name = self.config.network_name,
+        };
+    }
+
+    /// Retain the peer's latest config-compat record and send this node's
+    /// record once per handshake after the peer proves the extension. A
+    /// failed send retries on the next drive. Peers without the extension
+    /// never receive the frame. The retained record and sent flag live on the
+    /// link and do not ride Helix: a resumed link re-sends and the report
+    /// reads `unknown` until the peer's next record (diagnostic only).
+    fn drainConfigCompat(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink) void {
+        if (self.sendConfigCompatDue(link)) _ = self.flushMeshBurstStage(conn);
+    }
+
+    /// True when this node's record was queued on `link` outbound.
+    fn sendConfigCompatDue(self: *LinuxServer, link: *secured_s2s_link.SecuredLink) bool {
+        if (link.takeConfigCompatReady()) link.config_compat_sent = false;
+        _ = link.absorbConfigCompat();
+        if (link.config_compat_sent or !link.supportsConfigCompat()) return false;
+        const profile = self.configCompatProfile();
+        link.sendConfigCompat(&profile) catch return false;
+        link.config_compat_sent = true;
+        return true;
+    }
+
+    /// Evaluate the peer's retained record against the live profile and
+    /// append operator diagnostics for anything but `compatible`.
+    fn configCompatStatus(self: *const LinuxServer, link: *const secured_s2s_link.SecuredLink, name: []const u8, details: *std.ArrayList(u8)) !mesh_report.Status.ConfigCompat {
+        const profile = self.configCompatProfile();
+        const report = link.configCompatReport(&profile) orelse return .unknown;
+        if (report.status != .compatible and name.len <= mesh_report.Status.max_name_bytes) {
+            var line_buf: [mesh_config_compat.max_render_len]u8 = undefined;
+            var line_writer = std.Io.Writer.fixed(&line_buf);
+            mesh_config_compat.renderReport(report, name, &line_writer) catch {};
+            try details.appendSlice(self.allocator, line_writer.buffered());
+        }
+        return report.meshStatus();
     }
 
     /// Drain origin-verified ACCESS_EVENT_V1 frames from one secured link:
@@ -69346,7 +72461,7 @@ pub const LinuxServer = struct {
         return cb.finish();
     }
 
-    pub fn emitRehashDry(self: *LinuxServer, conn: *ConnState, path: []const u8, parsed: *const config_format.Config) !void {
+    pub fn emitRehashDry(self: *LinuxServer, conn: *ConnState, path: []const u8, parsed: *const config_format.Config, proposed_text: []const u8) !void {
         var proposed_reg = self.proposedClassRegistry(parsed);
         defer if (proposed_reg) |*reg| reg.deinit();
         const lines = try rehash_dry.report(self.allocator, .{
@@ -69363,6 +72478,16 @@ pub const LinuxServer = struct {
         });
         defer rehash_dry.freeReport(self.allocator, lines);
         for (lines) |line| try self.noticeTo(conn, line);
+        // Q07: every changed field, classified reloadable / restart_required /
+        // startup_only / unclassified. Reloadable fields compare against the
+        // last committed REHASH text; every other class against boot text.
+        const field_lines = try config_change_preview.renderTexts(self.allocator, "REHASH DRY", .{
+            .boot = self.config.boot_config_text,
+            .applied = self.applied_config_text,
+            .proposed = proposed_text,
+        });
+        defer config_change_preview.freeLines(self.allocator, field_lines);
+        for (field_lines) |line| try self.noticeTo(conn, line);
         try queueNumeric(conn, .RPL_REHASHING, &.{path}, "dry-run; applied none");
     }
 
@@ -70729,6 +73854,10 @@ pub const LinuxServer = struct {
         var established: u64 = 0;
         var secured: u64 = 0;
         var plaintext: u64 = 0;
+        // Operator-only config/cloak compatibility diagnostics (M09); fixed
+        // tables plus the sanitized link name, never peer bytes or secrets.
+        var compat_details: std.ArrayList(u8) = .empty;
+        defer compat_details.deinit(self.allocator);
         for (self.reactors) |*reactor| for (reactor.clients.slots.items, 0..) |*slot, index| {
             if (!slot.occupied) continue;
             const conn = &slot.value;
@@ -70750,6 +73879,7 @@ pub const LinuxServer = struct {
                     row.session_group_v4 = if (link.supportsSessionGroupV4()) .available else .unavailable;
                     row.session_replica_v2 = if (link.supportsSessionReplicaV2()) .available else .unavailable;
                     row.session_attachment_lease_v2 = if (link.supportsSessionAttachmentLeaseV2()) .available else .unavailable;
+                    row.config_compat = try self.configCompatStatus(link, name, &compat_details);
                 }
             } else if (conn.s2s) |link| {
                 name = link.remoteName();
@@ -70777,6 +73907,7 @@ pub const LinuxServer = struct {
         if (self.peer_health.entries.items.len > mesh_report.Status.max_peers) return error.TooManyPeers;
         for (self.peer_health.entries.items) |entry| if (entry.name().len > mesh_report.Status.max_name_bytes) return error.NameTooLong;
         try self.peer_health.writeOperView(self.allocator, &next.health_details);
+        try next.health_details.appendSlice(self.allocator, compat_details.items);
         next.status = .{ .tcp_active = tcp, .established = established, .secured = secured, .plaintext = plaintext, .peers = next.rows.items };
         if (self.mesh_operational_health_observed) {
             const health = self.currentNodeHealth();
@@ -71048,6 +74179,20 @@ pub const LinuxServer = struct {
     /// restart as a half-open socket. Any bytes received on the already-authenticated
     /// stream clear awaiting_pong in handleRecv; until then the original probe
     /// timestamp is never extended.
+    /// An inbound S2S socket holds a mesh-recovery governor unit from accept
+    /// until `noteS2sEstablished`. The liveness probe only covers established
+    /// links, so without a deadline an idle pre-AKE socket would hold its
+    /// unit for as long as the kernel keeps the TCP connection open. Bound
+    /// the handshake by the registration window; the redialing peer simply
+    /// retries on a fresh socket.
+    fn s2sInboundHandshakeExpired(self: *const LinuxServer, conn: *const ConnState, now_ms: i64) bool {
+        if (conn.s2s_initiator) return false;
+        if (conn.workload_ticket == null) return false;
+        if (conn.s2s_established_counted) return false;
+        const deadline_ms = @max(@as(i64, 1), self.config.s2s_handshake_timeout_ms);
+        return now_ms - conn.connected_at_ms > deadline_ms;
+    }
+
     fn s2sPeerLivenessExpired(self: *const LinuxServer, conn: *const ConnState, now_ms: i64) bool {
         if (!conn.awaiting_pong) return false;
         if (establishedPeerName(conn) == null) return false;
@@ -71561,7 +74706,7 @@ pub const LinuxServer = struct {
         const echo = conn.session.hasCap(.echo_message);
 
         if (world_model.isChannelName(target)) {
-            if (!self.world.channelExists(target)) {
+            if (self.channelConcealedOrMissing(id, target, overrideActive(conn))) {
                 try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
@@ -72175,10 +75320,15 @@ pub const LinuxServer = struct {
     ///   * SHUN (network-wide silence; matches by IP, nick, or host-mask; opers
     ///     exempt)
     fn senderSilenced(self: *LinuxServer, conn: *ConnState) bool {
-        if (conn.gagged) return true;
+        return self.senderSilenceKind(conn) != .none;
+    }
+
+    /// Which network silence drops this sender's messages, in check order.
+    fn senderSilenceKind(self: *LinuxServer, conn: *ConnState) permission_explain.Silence {
+        if (conn.gagged) return .gag;
         const real_ip = conn.session.realHost();
-        if (real_ip.len > 0 and self.gags.count() > 0 and self.gags.contains(real_ip)) return true;
-        if (conn.session.isRestricted()) return true;
+        if (real_ip.len > 0 and self.gags.count() > 0 and self.gags.contains(real_ip)) return .gag;
+        if (conn.session.isRestricted()) return .restricted;
         if (self.shuns.count() > 0 and !conn.session.isOper()) {
             const now = self.nowMs();
             // A SHUN pattern may be an IP, a nick, or a nick!user@host glob — so
@@ -72186,15 +75336,15 @@ pub const LinuxServer = struct {
             // presents. Any match silences the sender.
             const nick = conn.session.displayName();
             const ip = conn.session.realHost();
-            if (nick.len > 0 and self.shuns.isShunned(nick, now)) return true;
-            if (ip.len > 0 and self.shuns.isShunned(ip, now)) return true;
+            if (nick.len > 0 and self.shuns.isShunned(nick, now)) return .shun;
+            if (ip.len > 0 and self.shuns.isShunned(ip, now)) return .shun;
             var hm_buf: ClientPrefixBuffer = undefined;
             {
                 const hm = clientPrefix(conn, &hm_buf);
-                if (self.shuns.isShunned(hm, now)) return true;
+                if (self.shuns.isShunned(hm, now)) return .shun;
             }
         }
-        return false;
+        return .none;
     }
 
     pub fn handleMessage(
@@ -72605,7 +75755,9 @@ pub const LinuxServer = struct {
         }
 
         if (world_model.isChannelName(chan)) {
-            if (!self.world.channelExists(chan)) {
+            // Q01: a concealed channel never accepts or refuses a non-member's
+            // speech differently from a missing name, even when it is -n.
+            if (self.channelConcealedOrMissing(id, chan, overrideActive(conn))) {
                 if (!is_notice) try queueNumeric(conn, .ERR_NOSUCHCHANNEL, &.{target}, "No such channel");
                 return;
             }
@@ -81687,6 +84839,166 @@ test "Q04 EXPLAIN throttle snapshot cannot consume a slot or alert and redirect 
     try std.testing.expect(!f.server.world.isMember("#explain", worldIdFromClient(f.subject_id)));
 }
 
+fn q04SubjectCommand(f: *Q04ExplainFixture, line: []const u8) ![]const u8 {
+    resetTestSendQ(f.subject());
+    try f.server.processLiveLine(f.subject_id, f.subject(), line);
+    return f.subject().send_buf[0..f.subject().send_len];
+}
+
+test "Q01 concealed channel replies equal missing channel for PART KICK INVITE PRIVMSG WHISPER PINS RENAME CREATE MODEX CHANBADWORDS DEFER" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var f = try Q04ExplainFixture.init();
+    defer f.deinit();
+    const a = std.testing.allocator;
+    _ = try f.server.world.join("#q01hide", worldIdFromClient(f.subject_id));
+    // -n: before Q01 a non-member PRIVMSG was silently accepted here.
+    _ = try f.server.world.setChannelFlag("#q01hide", .no_external, false);
+    const probes = .{
+        "PART {s}",
+        "KICK {s} Q04Subject",
+        "INVITE Q04Subject {s}",
+        "PRIVMSG {s} :q01probe",
+        "WHISPER {s} Q04Subject :q01probe",
+        "PINS {s}",
+        "RENAME {s} #q01moved",
+        "CREATE #q01clone +t {s}",
+        "MODEX {s}",
+        "CHANBADWORDS {s} LIST",
+        "DEFER AT 4102444800000 {s} :q01probe",
+    };
+    const flavors = [_]existence_privacy.Concealment{
+        .{ .secret = true, .private = false, .hidden = false },
+        .{ .secret = false, .private = true, .hidden = false },
+        .{ .secret = false, .private = false, .hidden = true },
+    };
+    for (flavors) |flavor| {
+        _ = try f.server.world.setChannelFlag("#q01hide", .secret, flavor.secret);
+        _ = try f.server.world.setPrivate("#q01hide", flavor.private);
+        _ = try f.server.world.setHidden("#q01hide", flavor.hidden);
+        inline for (probes) |probe| {
+            resetTestSendQ(f.subject());
+            var line_buf: [128]u8 = undefined;
+            const concealed = try a.dupe(u8, try f.command(try std.fmt.bufPrint(&line_buf, probe, .{"#q01hide"})));
+            defer a.free(concealed);
+            try expectContains(concealed, " 403 ");
+            const renamed = try std.mem.replaceOwned(u8, a, concealed, "#q01hide", "#q01none");
+            defer a.free(renamed);
+            try std.testing.expectEqualSlices(u8, renamed, try f.command(try std.fmt.bufPrint(&line_buf, probe, .{"#q01none"})));
+            // Nothing reached the member, and no channel was cloned or moved.
+            try std.testing.expect(std.mem.indexOf(u8, f.subject().send_buf[0..f.subject().send_len], "q01probe") == null);
+            try std.testing.expect(!f.server.world.channelExists("#q01clone"));
+            try std.testing.expect(!f.server.world.channelExists("#q01moved"));
+            try std.testing.expect(f.server.world.isMember("#q01hide", worldIdFromClient(f.subject_id)));
+        }
+        // NOTICE never replies, and a concealed channel drops it unseen.
+        resetTestSendQ(f.subject());
+        try std.testing.expectEqual(@as(usize, 0), (try f.command("NOTICE #q01hide :q01probe")).len);
+        try std.testing.expect(std.mem.indexOf(u8, f.subject().send_buf[0..f.subject().send_len], "q01probe") == null);
+    }
+
+    // A visible channel keeps its specific denial for a non-member.
+    _ = try f.server.world.setHidden("#q01hide", false);
+    try expectContains(try f.command("PART #q01hide"), " 442 ");
+    resetTestSendQ(f.subject());
+    _ = try f.command("PRIVMSG #q01hide :q01public");
+    try expectContains(f.subject().send_buf[0..f.subject().send_len], "q01public");
+
+    // A member of a concealed source still clones it.
+    _ = try f.server.world.setChannelFlag("#q01hide", .secret, true);
+    _ = try f.server.world.join("#q01hide", worldIdFromClient(f.viewer_id));
+    const cloned = try f.command("CREATE #q01clone +t #q01hide");
+    try std.testing.expect(std.mem.indexOf(u8, cloned, " 403 ") == null);
+    try std.testing.expect(f.server.world.channelExists("#q01clone"));
+    try std.testing.expect(f.server.world.channelHasFlag("#q01clone", .secret));
+}
+
+test "Q04 ACCESS EXPLAIN SPEAK matches the live speech gate for moderated and opmoderate channels" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var f = try Q04ExplainFixture.init();
+    defer f.deinit();
+    const a = std.testing.allocator;
+    _ = try f.server.world.join("#explain", worldIdFromClient(f.subject_id));
+    _ = try f.server.world.setChannelFlag("#explain", .moderated, true);
+    const own = try q04SubjectCommand(&f, "ACCESS #explain EXPLAIN * SPEAK");
+    try expectContains(own, ":ACCESS EXPLAIN action=speak result=policy_deny rule=moderated expiry=none_recorded details=redacted\r\n");
+    try expectContains(own, ":ACCESS EXPLAIN action=speak not_evaluated=none silence=not_disclosed\r\n");
+    try expectContains(try q04SubjectCommand(&f, "PRIVMSG #explain :q04moderated"), " 404 ");
+    // Legacy forms keep their JOIN meaning; malformed actions are unavailable.
+    try expectContains(try q04SubjectCommand(&f, "ACCESS #explain EXPLAIN"), "rule=already_member");
+    try expectContains(try q04SubjectCommand(&f, "ACCESS #explain EXPLAIN * TALK"), "ACCESS EXPLAIN unavailable");
+
+    _ = try f.server.world.setChannelExtFlag("#explain", .opmoderate, true);
+    try expectContains(try q04SubjectCommand(&f, "ACCESS #explain EXPLAIN * SPEAK"), "result=conditional_opmoderate rule=moderated");
+
+    // A named subject without audit_read is the same reply as an absent nick.
+    const named = try a.dupe(u8, try f.command("ACCESS #explain EXPLAIN Q04Subject SPEAK"));
+    defer a.free(named);
+    try expectContains(named, "ACCESS EXPLAIN unavailable");
+    try std.testing.expectEqualSlices(u8, named, try f.command("ACCESS #explain EXPLAIN Q04AbsentNick SPEAK"));
+    f.auditReader(false);
+    const traced = try f.command("ACCESS #explain EXPLAIN Q04Subject SPEAK");
+    try expectContains(traced, "result=conditional_opmoderate rule=moderated");
+    try expectContains(traced, "silence=none");
+    try std.testing.expectEqual(@as(usize, 0), f.server.oper_audit.count);
+}
+
+test "Q04 ACCESS EXPLAIN SPEAK hides network silence without audit_read and never touches slowmode" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var f = try Q04ExplainFixture.init();
+    defer f.deinit();
+    _ = try f.server.world.join("#explain", worldIdFromClient(f.subject_id));
+
+    try f.server.shuns.add(.{ .mask = "Q04Subject", .reason = "q04 stealth", .set_by = "test", .created_ms = 0 });
+    const own = try q04SubjectCommand(&f, "ACCESS #explain EXPLAIN * SPEAK");
+    try expectContains(own, "result=policy_allow rule=allow");
+    try expectContains(own, "silence=not_disclosed");
+    // The refactored senderSilenced still drops the shunned sender.
+    resetTestSendQ(f.viewer());
+    _ = try q04SubjectCommand(&f, "PRIVMSG #explain :q04shunned");
+    try std.testing.expect(std.mem.indexOf(u8, f.viewer().send_buf[0..f.viewer().send_len], "q04shunned") == null);
+    f.auditReader(false);
+    const audited = try f.command("ACCESS #explain EXPLAIN Q04Subject SPEAK");
+    try expectContains(audited, "result=policy_deny rule=silenced");
+    try expectContains(audited, "silence=shun");
+    try std.testing.expect(f.server.shuns.remove("Q04Subject"));
+    f.subject().gagged = true;
+    try expectContains(try f.command("ACCESS #explain EXPLAIN Q04Subject SPEAK"), "silence=gag");
+    f.subject().gagged = false;
+
+    _ = try f.server.props.setProp(.{ .kind = .channel, .id = "#explain" }, "SLOWMODE", "30", .{ .id = "test", .access = .host });
+    try expectContains(try q04SubjectCommand(&f, "ACCESS #explain EXPLAIN * SPEAK"), "result=policy_allow rule=allow");
+    try std.testing.expectEqual(@as(usize, 0), f.server.slowmode_last.count());
+    resetTestSendQ(f.viewer());
+    _ = try q04SubjectCommand(&f, "PRIVMSG #explain :q04first");
+    try expectContains(f.viewer().send_buf[0..f.viewer().send_len], "q04first");
+    try std.testing.expectEqual(@as(usize, 1), f.server.slowmode_last.count());
+    var key_buf: [Server.slowmode_key_max]u8 = undefined;
+    const key = Server.slowmodeKey("#explain", "Q04Subject", &key_buf).?;
+    const recorded = f.server.slowmode_last.get(key).?;
+    try expectContains(try q04SubjectCommand(&f, "ACCESS #explain EXPLAIN * SPEAK"), "result=policy_deny rule=slowmode");
+    try std.testing.expectEqual(@as(usize, 1), f.server.slowmode_last.count());
+    try std.testing.expectEqual(recorded, f.server.slowmode_last.get(key).?);
+    try expectContains(try q04SubjectCommand(&f, "PRIVMSG #explain :q04second"), "(slowmode)");
+}
+
+test "Q02 HELP is derived from the live command registry and searchable" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var f = try Q04ExplainFixture.init();
+    defer f.deinit();
+    // An alias with no hand-written topic resolves to its canonical command.
+    const alias = try f.command("HELP MODLIST");
+    try expectContains(alias, " 704 Q04Viewer MODULES ");
+    try expectContains(alias, "Unavailable: requires operator privileges.");
+    try expectContains(alias, " 706 Q04Viewer MODULES ");
+    try std.testing.expect(std.mem.indexOf(u8, alias, " 524 ") == null);
+    const found = try f.command("HELP ?discover");
+    try expectContains(found, "COMMANDS");
+    try std.testing.expect(std.mem.indexOf(u8, found, "?discover") == null);
+    try expectContains(try f.command("HELP Q02NOPE"), " 524 ");
+    f.auditReader(false);
+    try std.testing.expect(std.mem.indexOf(u8, try f.command("HELP MODULES"), "Unavailable:") == null);
+}
+
 test "GAP-O5 REHASH DRY prints diffs and applies none" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -81810,6 +85122,185 @@ test "GAP-O5 REHASH DRY prints diffs and applies none" {
     try std.testing.expect(server.warden.check(.{ .address = "203.0.113.9" }, 0) != null);
 
     std.debug.print("GAP-O5 branch=REHASH DRY named ward class limit and listener diffs, applied none, then a real REHASH applied the limit without moving the listener\n", .{});
+}
+
+test "Q07 REHASH DRY classifies field changes against boot and last applied text" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const boot_text =
+        \\[node]
+        \\id = 1
+        \\
+        \\[listen]
+        \\host = "127.0.0.1"
+        \\irc = 18983
+        \\
+        \\[limits]
+        \\nick_delay = "1s"
+        \\
+    ;
+    const proposed_text =
+        \\[node]
+        \\id = 1
+        \\
+        \\[listen]
+        \\host = "127.0.0.1"
+        \\irc = 18983
+        \\ws = 18984
+        \\
+        \\[limits]
+        \\nick_delay = "3s"
+        \\num_shards = 1
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "q07.toml", .data = proposed_text });
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/q07.toml", .{tmp.sub_path[0..]}) catch return error.TestUnexpectedResult;
+
+    server.config.config_path = path;
+    server.config.boot_config_text = boot_text;
+    server.config.crypto_io = std.testing.io;
+    server.config.port = 18983;
+    server.config.ws_enabled = false;
+    server.config.ws_port = 0;
+    server.config.tls_port = 0;
+    server.config.s2s_port = 0;
+    server.config.webtransport_port = 0;
+    server.config.media_port = 0;
+    server.config.native_media_port = 0;
+    server.config.nick_delay_ms = 1000;
+
+    const id = try addTestLocalClient(&server, "q07oper", null);
+    const conn = server.rx().clients.get(id).?;
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_rehash});
+
+    const dry = try irc_line.parseLine("REHASH DRY");
+    try server.handleRehashParsed(conn, &dry);
+    const first = try copyTestSendQ(allocator, conn);
+    defer allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "REHASH DRY field limits.nick_delay: reloadable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "REHASH DRY field listen.ws: restart_required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "REHASH DRY field limits.num_shards: startup_only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "REHASH DRY fields: 1 reloadable, 1 restart_required, 1 startup_only, 0 unclassified") != null);
+    try std.testing.expect(server.applied_config_text == null);
+    try std.testing.expectEqual(@as(u64, 1000), server.config.nick_delay_ms);
+    resetTestSendQ(conn);
+
+    // A committed REHASH becomes the reloadable baseline; restart-only fields
+    // still compare against the boot text because REHASH did not apply them.
+    try server.handleRehash(conn);
+    try std.testing.expectEqual(@as(u64, 3000), server.config.nick_delay_ms);
+    try std.testing.expectEqualStrings(proposed_text, server.applied_config_text.?);
+    resetTestSendQ(conn);
+    try server.handleRehashParsed(conn, &dry);
+    const second = try copyTestSendQ(allocator, conn);
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "field limits.nick_delay") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "REHASH DRY fields: 0 reloadable, 1 restart_required, 1 startup_only, 0 unclassified") != null);
+    resetTestSendQ(conn);
+
+    server.config.boot_config_text = null;
+    try server.handleRehashParsed(conn, &dry);
+    const third = try copyTestSendQ(allocator, conn);
+    defer allocator.free(third);
+    try std.testing.expect(std.mem.indexOf(u8, third, "REHASH DRY fields: unavailable (") != null);
+    std.debug.print("Q07 branch=REHASH DRY reloadable/restart_required/startup_only against boot then applied text\n", .{});
+}
+
+test "W09 memory budget admits accepts per shard share and REHASH refuses an unaffordable class" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var server = Server.init(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    try std.testing.expect(server.admitClientByMemoryBudget());
+    const id = try addTestLocalClient(&server, "w09oper", null);
+    const conn = server.rx().clients.get(id).?;
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_rehash});
+    _ = try addTestLocalClient(&server, "w09b", null);
+
+    const per: u64 = 8 << 20;
+    server.config.resource_per_client_bytes = per;
+    server.config.resource_memory_budget_bytes = 3 * per * server.reactors.len;
+    try std.testing.expect(server.admitClientByMemoryBudget());
+    _ = try addTestLocalClient(&server, "w09c", null);
+    try std.testing.expect(!server.admitClientByMemoryBudget());
+    server.config.resource_memory_budget_bytes = 0;
+    try std.testing.expect(server.admitClientByMemoryBudget());
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text =
+        \\[node]
+        \\id = 1
+        \\
+        \\[listen]
+        \\host = "127.0.0.1"
+        \\irc = 18985
+        \\
+        \\[class.big]
+        \\sendq = "64M"
+        \\match = ["10.0.0.0/8"]
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "w09.toml", .data = text });
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/w09.toml", .{tmp.sub_path[0..]}) catch return error.TestUnexpectedResult;
+    server.config.config_path = path;
+    server.config.crypto_io = std.testing.io;
+    server.config.port = 18985;
+    server.config.ws_enabled = false;
+    server.config.ws_port = 0;
+    server.config.tls_port = 0;
+    server.config.s2s_port = 0;
+    server.config.webtransport_port = 0;
+    server.config.media_port = 0;
+    server.config.native_media_port = 0;
+    server.config.max_clients = 4;
+    server.config.resource_memory_budget_bytes = 4 * per;
+    resetTestSendQ(conn);
+    try server.handleRehash(conn);
+    const refused = try copyTestSendQ(allocator, conn);
+    defer allocator.free(refused);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "REHASH: [resources].memory_budget_bytes cannot hold") != null);
+    try std.testing.expect(server.reload_parsed == null);
+    try std.testing.expectEqual(per, server.config.resource_per_client_bytes);
+
+    // Refusals reach the :9130 scrape as a counter, with the budget in force.
+    _ = server.resource_budget_refusals.fetchAdd(3, .monotonic);
+    server.refreshMetricsSnapshot();
+    const metrics_buf = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(metrics_buf);
+    const metrics = try server.metrics_snapshot.copyInto(metrics_buf);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "# TYPE onyx_resource_budget_refusals_total counter\nonyx_resource_budget_refusals_total 3\n") != null);
+    var expect_buf: [128]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, metrics, try std.fmt.bufPrint(&expect_buf, "onyx_resource_memory_budget_bytes {d}\n", .{4 * per})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, try std.fmt.bufPrint(&expect_buf, "onyx_resource_per_client_bytes {d}\n", .{per})) != null);
+    server.config.resource_memory_budget_bytes = 0;
+    server.refreshMetricsSnapshot();
+    const off = try server.metrics_snapshot.copyInto(metrics_buf);
+    try std.testing.expect(std.mem.indexOf(u8, off, "onyx_resource_memory_budget_bytes 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "onyx_resource_per_client_bytes 0\n") != null);
+    std.debug.print("W09 branch=accept admission bounded by budget share; REHASH refused 64M class under boot budget; refusals exported\n", .{});
 }
 
 fn joinTestMedia(server: *Server, id: client_model.ClientId, conn: *ConnState, line: []const u8) !void {
@@ -82256,6 +85747,54 @@ test "GAP-O3 a fault writes the tracelog to the named file" {
     try std.testing.expect(std.mem.indexOf(u8, dropped, "qlog") == null);
 
     std.debug.print("GAP-O3 branch=tracelog file on panic, reactor give-up, and mooring death\n", .{});
+}
+
+test "session credential redaction: fault file and authored oper events scrub bearer tokens" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    const server = try allocator.create(Server);
+    server.initInPlace(allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| {
+        allocator.destroy(server);
+        return switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => error.SkipZigTest,
+            else => err,
+        };
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    server.bindFlightPanicTarget();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try rehashTmpPath(allocator, tmp, "flight.log");
+    defer allocator.free(path);
+    server.config.flight_recorder_path = path;
+
+    const bearer = "sst_0123456789abcdef0123456789abcdef";
+    server.traceLog(.info, .reactor, "redaction marker SESSION TOKEN " ++ bearer);
+    flushFlightRecorderOnPanic("redaction fault SESSIONTOKEN alice " ++ bearer);
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "flight.log", allocator, .limited(flight_recorder_max_file_bytes + 1));
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "redaction marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "redaction fault") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, credential_redaction.redacted_marker) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "0123456789abcdef0123456789abcdef") == null);
+
+    // Locally authored oper events are scrubbed before history, mesh and
+    // webhooks; ordinary text is untouched.
+    try server.publishOperEvent(.service, .warn, "redaction event token=" ++ bearer);
+    try server.publishOperEvent(.service, .warn, "redaction plain event");
+    var events: [4]event_history_mod.StoredEvent = undefined;
+    const n = server.event_history.collect(null, 0, &events);
+    try std.testing.expect(n >= 2);
+    try std.testing.expectEqualStrings("redaction plain event", events[0].message());
+    try std.testing.expect(std.mem.indexOf(u8, events[1].message(), "redaction event") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events[1].message(), "0123456789abcdef") == null);
 }
 
 /// Real encrypted link pair for daemon-level retained-replay tests. Keeping the
@@ -82847,24 +86386,31 @@ test "DST GAP-A11 maintenance reactor re-bursts the local roster on the membersh
         _ = server.rx().clients.free(left_id);
         _ = server.rx().clients.free(right_id);
     }
+    // This test pins the GAP-A11 roster copy of the unconditional periodic
+    // burst. The M03 digest exchange (which defers the burst to the peer's
+    // DIGEST_NEED) is covered by the "mesh M03 digest exchange" tests.
+    (left.a.inner orelse return error.TestExpectedEqual).peer.peer_supports_digest_sync = false;
+    (right.a.inner orelse return error.TestExpectedEqual).peer.peer_supports_digest_sync = false;
 
-    // Inside the interval, reactor 0 does not copy the world.
+    // Before the planned wake, reactor 0 does not copy the world.
     gapA11HoldOtherCadences(&server);
     server.last_membership_resync_ms = server.nowMs();
-    const quiet = server.last_membership_resync_ms;
+    server.anti_entropy_wake_ms = server.nowU64() + 1_000;
+    const quiet = server.anti_entropy_wake_ms;
     gapA11ClearQueued(left_peer);
     gapA11ClearQueued(right_peer);
     server.onTimerTick();
-    try std.testing.expectEqual(quiet, server.last_membership_resync_ms);
+    try std.testing.expectEqual(quiet, server.anti_entropy_wake_ms);
     try std.testing.expectEqual(@as(usize, 0), left_peer.send_len);
     try std.testing.expectEqual(@as(usize, 0), right_peer.send_len);
 
-    // A sibling reactor must not consume the shared interval or emit the copy.
+    // A sibling reactor must not consume the shared wake or emit the copy.
     server.last_membership_resync_ms = server.nowMs() - membership_resync_interval_ms;
-    const planted = server.last_membership_resync_ms;
+    server.anti_entropy_wake_ms = server.nowU64();
+    const planted = server.anti_entropy_wake_ms;
     current_reactor = &server.reactors[1];
     server.onTimerTick();
-    try std.testing.expectEqual(planted, server.last_membership_resync_ms);
+    try std.testing.expectEqual(planted, server.anti_entropy_wake_ms);
     try std.testing.expectEqual(@as(usize, 0), left_peer.send_len);
     try std.testing.expectEqual(@as(usize, 0), right_peer.send_len);
 
@@ -82872,7 +86418,7 @@ test "DST GAP-A11 maintenance reactor re-bursts the local roster on the membersh
     current_reactor = &server.reactors[0];
     gapA11HoldOtherCadences(&server);
     server.onTimerTick();
-    try std.testing.expect(server.last_membership_resync_ms != planted);
+    try std.testing.expect(server.anti_entropy_wake_ms > planted);
     const left_wire = try gapA11QueuedWire(allocator, left_peer);
     defer allocator.free(left_wire);
     const right_wire = try gapA11QueuedWire(allocator, right_peer);
@@ -82895,15 +86441,173 @@ test "DST GAP-A11 maintenance reactor re-bursts the local roster on the membersh
     try std.testing.expect(gapA11RosterHas(right_members, "ReburstA"));
     try std.testing.expect(gapA11RosterHas(right_members, "ReburstB"));
 
-    // A later tick inside the same interval does not copy the world again.
-    const stamped = server.last_membership_resync_ms;
+    // A later tick before the planned wake does not copy the world again.
+    const stamped = server.anti_entropy_wake_ms;
     gapA11HoldOtherCadences(&server);
     gapA11ClearQueued(left_peer);
     gapA11ClearQueued(right_peer);
     server.onTimerTick();
-    try std.testing.expectEqual(stamped, server.last_membership_resync_ms);
+    try std.testing.expectEqual(stamped, server.anti_entropy_wake_ms);
     try std.testing.expectEqual(@as(usize, 0), left_peer.send_len);
     try std.testing.expectEqual(@as(usize, 0), right_peer.send_len);
+}
+
+fn m02QueuedLen(conn: *const ConnState) usize {
+    return (conn.send_len - conn.send_offset) + conn.send_overflow.items.len;
+}
+
+test "M02 mesh maintenance tick schedules per-link anti-entropy by quiet streak, divergence, and hard backlog" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var left = try SessionReplayTestPair.initWithSeedsAndNames(allocator, 0xB1, 0xB2, "m02-home-l.test", "m02-left.test");
+    defer left.deinit();
+    var right = try SessionReplayTestPair.initWithSeedsAndNames(allocator, 0xB3, 0xB4, "m02-home-r.test", "m02-right.test");
+    defer right.deinit();
+    left.a.clearOutbound();
+    left.b.clearOutbound();
+    right.a.clearOutbound();
+    right.b.clearOutbound();
+
+    var sim = reactor_mod.SimReactor.init(10_000_000);
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .node_id = left.ida.shortId(),
+        .server_name = "m02-home.test",
+        .node_identity = &left.ida,
+        .crypto_io = std.testing.io,
+        .mesh_pass = "session-replay-secret",
+        .reactor = sim.reactor(),
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    current_reactor = &server.reactors[0];
+
+    const alice = try addTestLocalClient(&server, "M02Alice", null);
+    _ = try server.world.join("#m02", worldIdFromClient(alice));
+    server.connFor(alice).?.session.registration.registered = true;
+    server.connFor(alice).?.last_activity_ms = server.nowMs();
+
+    const left_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const left_peer = server.rx().clients.get(left_id).?;
+    left_peer.overflow_allocator = allocator;
+    left_peer.token = try tokenFromId(left_id);
+    left_peer.send_armed = true;
+    left_peer.sendq_cap = default_sendq_cap;
+    left_peer.s2s_secured = &left.a;
+    left_peer.s2s_burst_done = true;
+    const right_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const right_peer = server.rx().clients.get(right_id).?;
+    right_peer.overflow_allocator = allocator;
+    right_peer.token = try tokenFromId(right_id);
+    right_peer.send_armed = true;
+    right_peer.sendq_cap = default_sendq_cap;
+    right_peer.s2s_secured = &right.a;
+    right_peer.s2s_burst_done = true;
+    defer {
+        left_peer.s2s_secured = null;
+        right_peer.s2s_secured = null;
+        _ = server.rx().clients.free(left_id);
+        _ = server.rx().clients.free(right_id);
+    }
+
+    const left_name = LinuxServer.establishedPeerName(left_peer) orelse return error.TestExpectedEqual;
+    const right_name = LinuxServer.establishedPeerName(right_peer) orelse return error.TestExpectedEqual;
+    try std.testing.expect(!std.mem.eql(u8, left_name, right_name));
+    server.markPeerHealth(left_name, .established);
+    server.markPeerHealth(right_name, .established);
+    const left_health = server.peer_health.get(left_name) orelse return error.TestExpectedEqual;
+    const right_health = server.peer_health.get(right_name) orelse return error.TestExpectedEqual;
+    const left_inner = left.a.inner orelse return error.TestExpectedEqual;
+    // This test pins the M02 cadence of the unconditional periodic burst.
+    // The M03 digest exchange (which defers the burst to the peer's
+    // DIGEST_NEED) is covered by the "mesh M03 digest exchange" tests.
+    left_inner.peer.peer_supports_digest_sync = false;
+    (right.a.inner orelse return error.TestExpectedEqual).peer.peer_supports_digest_sync = false;
+
+    // First wake: never-bursted links are both admitted and stamped.
+    gapA11HoldOtherCadences(&server);
+    gapA11ClearQueued(left_peer);
+    gapA11ClearQueued(right_peer);
+    const t0 = server.nowU64();
+    server.onTimerTick();
+    try std.testing.expect(m02QueuedLen(left_peer) > 0);
+    try std.testing.expect(m02QueuedLen(right_peer) > 0);
+    try std.testing.expectEqual(t0, left_peer.last_periodic_burst_ms);
+    try std.testing.expectEqual(t0, right_peer.last_periodic_burst_ms);
+    try std.testing.expectEqual(@as(u32, 1), left_health.anti_entropy_quiet_repairs);
+    try std.testing.expectEqual(@as(u32, 1), right_health.anti_entropy_quiet_repairs);
+    try std.testing.expectEqual(@as(?u64, t0), left_health.last_anti_entropy_ms);
+    // One quiet round doubles the 30s floor to the 60s ceiling; the daemon
+    // sleeps straight to it instead of the historical 30s poll.
+    try std.testing.expectEqual(t0 + 60_000, server.anti_entropy_wake_ms);
+
+    // Halfway to the wake nothing is re-burst and the wake is not consumed.
+    sim.advance(30_000);
+    gapA11ClearQueued(left_peer);
+    gapA11ClearQueued(right_peer);
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(usize, 0), m02QueuedLen(left_peer));
+    try std.testing.expectEqual(@as(usize, 0), m02QueuedLen(right_peer));
+    try std.testing.expectEqual(t0 + 60_000, server.anti_entropy_wake_ms);
+
+    // A real inbound divergence on the left link resets only its streak.
+    left_inner.peer.membership_divergence_applied +|= 1;
+    sim.advance(30_000);
+    const t1 = server.nowU64();
+    gapA11ClearQueued(left_peer);
+    gapA11ClearQueued(right_peer);
+    server.onTimerTick();
+    try std.testing.expect(m02QueuedLen(left_peer) > 0);
+    try std.testing.expect(m02QueuedLen(right_peer) > 0);
+    try std.testing.expectEqual(left_inner.peer.membership_divergence_applied, left_peer.last_membership_divergence_applied);
+    try std.testing.expectEqual(@as(u32, 1), left_health.anti_entropy_quiet_repairs);
+    try std.testing.expectEqual(@as(u32, 2), right_health.anti_entropy_quiet_repairs);
+    try std.testing.expectEqual(t1, left_peer.last_periodic_burst_ms);
+    try std.testing.expectEqual(t1 + 60_000, server.anti_entropy_wake_ms);
+
+    // Hard backlog holds a due, not-yet-stale link back, and the next wake
+    // jumps to its stale point instead of polling every tick.
+    left_inner.peer.membership_divergence_applied +|= 1;
+    left_health.noteSendBacklog(mesh_anti_entropy_bounds.backlog_hard_bytes);
+    server.anti_entropy_wake_ms = t1 + 30_000;
+    sim.advance(30_000);
+    gapA11ClearQueued(left_peer);
+    gapA11ClearQueued(right_peer);
+    server.onTimerTick();
+    try std.testing.expectEqual(@as(u32, 0), left_health.anti_entropy_quiet_repairs);
+    try std.testing.expectEqual(@as(usize, 0), m02QueuedLen(left_peer));
+    try std.testing.expectEqual(@as(usize, 0), m02QueuedLen(right_peer));
+    try std.testing.expectEqual(t1, left_peer.last_periodic_burst_ms);
+    try std.testing.expectEqual(t1 + 60_000, server.anti_entropy_wake_ms);
+
+    // Once stale, the backlogged link bypasses the load gate: no link waits
+    // past the 60s ceiling.
+    sim.advance(30_000);
+    const t2 = server.nowU64();
+    gapA11ClearQueued(left_peer);
+    gapA11ClearQueued(right_peer);
+    server.onTimerTick();
+    try std.testing.expect(m02QueuedLen(left_peer) > 0);
+    try std.testing.expect(m02QueuedLen(right_peer) > 0);
+    try std.testing.expectEqual(t2, left_peer.last_periodic_burst_ms);
+    try std.testing.expectEqual(t2, right_peer.last_periodic_burst_ms);
+
+    // A wake planned beyond one ceiling can only follow a clock step back;
+    // the next tick re-plans rather than starving every link.
+    server.anti_entropy_wake_ms = server.nowU64() + 10 * mesh_anti_entropy_bounds.max_interval_ms;
+    gapA11ClearQueued(left_peer);
+    gapA11ClearQueued(right_peer);
+    server.onTimerTick();
+    try std.testing.expect(server.anti_entropy_wake_ms <= server.nowU64() + mesh_anti_entropy_bounds.max_interval_ms);
+    try std.testing.expectEqual(@as(usize, 0), m02QueuedLen(left_peer));
+    try std.testing.expectEqual(@as(usize, 0), m02QueuedLen(right_peer));
 }
 
 test "isMaintenanceReactor is false off reactor 0 and onTimerTick leaves shared last_*_ms still" {
@@ -82931,6 +86635,7 @@ test "isMaintenanceReactor is false off reactor 0 and onTimerTick leaves shared 
 
     current_reactor = &server.reactors[1];
     try std.testing.expectEqual(@as(i64, 0), server.last_membership_resync_ms);
+    try std.testing.expectEqual(@as(u64, 0), server.anti_entropy_wake_ms);
     try std.testing.expectEqual(@as(i64, 0), server.last_oper_grant_refresh_ms);
     try std.testing.expectEqual(@as(i64, 0), server.last_peer_rtt_probe_ms);
     try std.testing.expectEqual(@as(i64, 0), server.last_session_replica_refresh_ms);
@@ -82940,6 +86645,7 @@ test "isMaintenanceReactor is false off reactor 0 and onTimerTick leaves shared 
     server.onTimerTick();
 
     try std.testing.expectEqual(@as(i64, 0), server.last_membership_resync_ms);
+    try std.testing.expectEqual(@as(u64, 0), server.anti_entropy_wake_ms);
     try std.testing.expectEqual(@as(i64, 0), server.last_oper_grant_refresh_ms);
     try std.testing.expectEqual(@as(i64, 0), server.last_peer_rtt_probe_ms);
     try std.testing.expectEqual(@as(i64, 0), server.last_session_replica_refresh_ms);
@@ -84066,6 +87772,64 @@ test "session replica orphaned final revoke survives encode Store OOM and checkp
     try std.testing.expect(server.session_replica_store.getOriginTombstone(store_token, ident.shortId()) != null);
 }
 
+test "session replica local REVOKE window never regresses behind the superseded OFFER after a backward clock step" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    current_reactor = null;
+    defer current_reactor = null;
+    const Clock = struct {
+        wall_ms: i64,
+        fn mono(_: *anyopaque) i64 {
+            return 10_000;
+        }
+        fn wall(ctx: *anyopaque) i64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.wall_ms;
+        }
+        const vtable = reactor_mod.Reactor.VTable{ .nowMillis = mono, .wallMillis = wall };
+    };
+    var clock = Clock{ .wall_ms = platform.realtimeMillis() };
+    var ident = try node_identity.fromSeed(@as([32]u8, @splat(0x7a)), "revoke-step.test");
+    defer ident.deinit();
+    const server = createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = ident.shortId(),
+        .server_name = "revoke-step.test",
+        .node_identity = &ident,
+        .crypto_io = std.testing.io,
+        .reactor = .{ .ptr = &clock, .vtable = &Clock.vtable },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    const token: session_migrate.Token = @splat(0x7a);
+    _ = try server.sessions.attach("alice", 1, token, 1);
+    try std.testing.expect(server.publishSessionReplicaUpsert(token, "alice", "Alice", "step", false, .resume_eligible));
+    const offer = server.session_replica_store.getOrigin(token, ident.shortId()) orelse return error.TestUnexpectedResult;
+    const offer_issued = offer.issued_at_ms;
+    const offer_expires = offer.expires_at_ms;
+    try std.testing.expect(server.sessions.remove("alice", 1));
+
+    // The wall clock steps back one hour before the origin revokes.
+    clock.wall_ms -= 60 * 60 * 1000;
+    server.publishSessionReplicaRevoke(token);
+    try std.testing.expect(server.session_replica_store.getOrigin(token, ident.shortId()) == null);
+    const tombstone = server.session_replica_store.getOriginTombstone(token, ident.shortId()) orelse
+        return error.TestUnexpectedResult;
+    const revoke = try session_replica_v2.decodeOffer(tombstone.wire);
+    try std.testing.expect(revoke.offer.issued_at_ms >= offer_issued);
+    try std.testing.expect(revoke.offer.expires_at_ms >= offer_expires);
+    try std.testing.expectEqual(@as(i64, @intCast(LinuxServer.mesh_reclaim_ttl_ms)), revoke.offer.expires_at_ms - revoke.offer.issued_at_ms);
+    const report = server.session_replica_store.retentionReport(revoke.offer.issued_at_ms);
+    try std.testing.expectEqual(@as(usize, 1), report.tombstones);
+    try std.testing.expectEqual(@as(usize, 1), report.exported_tombstones);
+}
+
 test "session replica sweep retains expired orphan until local revoke retry succeeds" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -84981,6 +88745,41 @@ test "session replica live fanout preserves retained ciphertext on a full peer S
     defer allocator.free(later);
     pair.a.clearOutbound();
     try pair.b.feed(later, 451);
+}
+
+test "MESSAGE_V2 ingress ACK that cannot be sent is due on the next outbox pass, not after its backoff (M07)" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    var server = LinuxServer.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    // An accepted ingress reserves its durable receipt with the initial
+    // backoff (the reservation path's `now + relay_v2_initial_retry_ms`).
+    const peer: u64 = 0x5151_5151_5151_5151;
+    const relay_id: relay_v2_replay_guard.RelayId = @splat(0x6c);
+    const now = server.meshWallMs();
+    try server.relay_v2_outbox.putBatch(&.{}, peer, relay_id, "wire", now +| relay_v2_initial_retry_ms);
+    var due: [4]relay_v2_outbox.Receipt = undefined;
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_outbox.collectDueReceipts(now, &due));
+
+    // No established link to that neighbor can take the ACK right now. The
+    // receipt must become due immediately so the first outbox pass after the
+    // link activates sends it, instead of the sender's paced head waiting out
+    // both its RTO and this receipt's backoff.
+    try std.testing.expect(!server.sendRelayV2AckToPeer(peer, relay_id));
+    server.ackRelayV2Ingress(peer, relay_id);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.collectDueReceipts(now, &due));
+    try std.testing.expectEqual(peer, due[0].peer);
+    try std.testing.expectEqualSlices(u8, &relay_id, &due[0].relay_id);
 }
 
 test "session replica secured receipt retry does not duplicate retained ciphertext" {
@@ -87383,6 +91182,40 @@ fn computeRelayV2ActivationState(
     hasher.final(&state.roster_digest);
     try relay_v2_activation.validate(state);
     return state;
+}
+
+/// Open the W07 enrollment ledger. A missing file is first provisioning (an
+/// empty ledger); any other read error or a corrupt/oversized/mismatched
+/// checkpoint refuses boot, because silently starting empty would reopen every
+/// consumed ticket and drop every revocation.
+fn loadMeshEnrollmentLedger(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !mesh_enrollment_ledger.Ledger {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(mesh_enrollment_ledger.hard_max_checkpoint_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return mesh_enrollment_ledger.Ledger.init(allocator, .{}),
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return mesh_enrollment_ledger.Ledger.decodeCheckpoint(allocator, .{}, bytes);
+}
+
+/// Domain-separated MeshPass signing key an admitting node uses for passes it
+/// mints from reviewed enrollment tickets. Derived from (never equal to) the
+/// node identity key, so a MeshPass signature can never be confused with a
+/// Mooring transcript or origin signature. Operators list its public key in
+/// every node's `[mesh].admission_roots`. The caller wipes the result.
+fn meshEnrollmentPassIssuer(identity: *const node_identity.NodeIdentity) !std.crypto.sign.Ed25519.KeyPair {
+    const secret = identity.sign_kp.secret_key.expose();
+    if (secret.len < std.crypto.sign.Ed25519.KeyPair.seed_length) return error.SecretPageUnavailable;
+    var kdf = std.crypto.hash.Blake3.initKdf("onyx-server 2026-11-06 mesh enrollment MeshPass issuer v1", .{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kdf));
+    kdf.update(secret[0..std.crypto.sign.Ed25519.KeyPair.seed_length]);
+    var seed: [std.crypto.sign.Ed25519.KeyPair.seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    kdf.final(&seed);
+    return std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+}
+
+fn wipeMeshEnrollmentPassIssuer(key: *std.crypto.sign.Ed25519.KeyPair) void {
+    std.crypto.secureZero(u8, std.mem.asBytes(&key.secret_key));
 }
 
 fn decodeMeshAdmissionToken(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -90867,6 +94700,114 @@ test "UPGRADE seal + adopt carries the cross-mesh oper-grant registry (grants, t
     try std.testing.expect(successor.grant_incarnation >= now + 5);
 }
 
+test "UPGRADE carries T07 attachment-revoke fences so a bare-token rejoin stays refused on the successor" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+
+    // A SESSION REVOKE armed a 12h fence on this node shortly before UPGRADE;
+    // its SAR1 lifetime (10 min) has long passed for peers, so nothing would
+    // re-offer it to the successor.
+    const token: sessions_mod.Token = @splat(0x5A);
+    const revoked: [16]u8 = @splat(0x61);
+    const sibling: [16]u8 = @splat(0x62);
+    const now = predecessor.sessionAttachmentRevokeNow();
+    const state = predecessor.sessionAttachmentRevokeNodeState() orelse return error.OutOfMemory;
+    try state.denials.deny(token, revoked, session_attachment_revoke.accountKey("victim"), now + Server.session_attachment_fence_ttl_ms, now);
+    try std.testing.expectEqual(session_attachment_revoke.ReplayGuard.Outcome.recorded, state.replay.record(7, 99, @splat(0x11), session_attachment_revoke.accountKey("victim"), now + 60_000, now));
+    state.last_sequence = 4242;
+    try std.testing.expect(predecessor.sessionAttachmentFenced(token, null));
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    var sars_pieces: usize = 0;
+    for (pieces.items) |piece| {
+        if (piece.kind == .mesh_checkpoint and session_attachment_revoke.isCheckpoint(piece.bytes)) sars_pieces += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), sars_pieces);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    const arena_fd = try adoptUpgradePiecesForTest(successor, pieces.items, "onyx-test-attachment-revoke");
+    _ = arena_fd;
+    current_reactor = null;
+
+    // The bare-token rejoin and the exact pair stay fenced; an unfenced
+    // sibling's exact resume stays allowed.
+    try std.testing.expect(successor.sessionAttachmentFenced(token, null));
+    try std.testing.expect(successor.sessionAttachmentFenced(token, revoked));
+    try std.testing.expect(!successor.sessionAttachmentFenced(token, sibling));
+    const carried = successor.session_attachment_revoke_state orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 4242), carried.last_sequence);
+    // The successor re-enforces carried fences against adopted rows once.
+    try std.testing.expect(carried.enforce_pending);
+    const later = successor.sessionAttachmentRevokeNow();
+    try std.testing.expectEqual(session_attachment_revoke.ReplayGuard.Outcome.duplicate, carried.replay.record(7, 99, @splat(0x11), session_attachment_revoke.accountKey("victim"), later + 60_000, later));
+}
+
+test "UPGRADE refuses a malformed T07 attachment-revoke checkpoint without publishing it" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    const config = Config{ .host = "127.0.0.1", .port = 0 };
+    const predecessor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(predecessor);
+    defer predecessor.deinit();
+    const now = predecessor.sessionAttachmentRevokeNow();
+    const state = predecessor.sessionAttachmentRevokeNodeState() orelse return error.OutOfMemory;
+    try state.denials.deny(@splat(0x5B), @splat(0x63), session_attachment_revoke.accountKey("victim"), now + 60_000, now);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    try appendCurrentMandatoryUpgradeStateForTest(predecessor, &pieces, &blobs);
+    // Corrupt the SARS version byte in place (the blob is owned by `blobs`).
+    var corrupted = false;
+    for (blobs.items) |blob| {
+        if (session_attachment_revoke.isCheckpoint(blob)) {
+            blob[session_attachment_revoke.checkpoint_magic.len] = 0xFF;
+            corrupted = true;
+        }
+    }
+    try std.testing.expect(corrupted);
+
+    const successor = createTestServer(alloc, config) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(successor);
+    defer successor.deinit();
+    _ = try rejectUpgradePiecesForTest(successor, pieces.items, "onyx-test-attachment-revoke-bad");
+    current_reactor = null;
+    try std.testing.expect(successor.session_attachment_revoke_state == null);
+}
+
 test "UPGRADE arena without an oper-grant checkpoint (pre-checkpoint predecessor) adopts with an empty registry" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -92822,6 +96763,559 @@ test "MESSAGE_V2 RVL2 retry sweep cannot starve a later direct neighbor" {
     try std.testing.expectEqual(@as(usize, 1), peer_b_count);
 }
 
+/// Move everything queued on `conn` into the remote end of its secured pair
+/// and return how many MESSAGE_V2 frames that end accepted for admission.
+fn m07DeliverV2ToRemote(alloc: std.mem.Allocator, conn: *ConnState, remote: *secured_s2s_link.SecuredLink) !usize {
+    const bytes = try copyTestSendQ(alloc, conn);
+    defer alloc.free(bytes);
+    resetTestSendQ(conn);
+    if (bytes.len != 0) try remote.feed(bytes, 100);
+    const v2 = try remote.takeInboundV2();
+    defer {
+        for (v2) |*item| item.deinit(alloc);
+        alloc.free(v2);
+    }
+    return v2.len;
+}
+
+test "M07 mesh MESSAGE_V2 retained head re-sends on a paced RTO, not per wake, and ACK or reconnect resets it" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair = try SessionReplayTestPair.init(alloc);
+    defer pair.deinit();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    try std.testing.expect(pair.a.supportsSecureRelayV2());
+
+    const peer_root = std.fmt.bytesToHex(pair.idb.sign_kp.public_key, .lower);
+    const local_root = std.fmt.bytesToHex(pair.ida.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+    var sim = reactor_mod.SimReactor.init(10_000_000);
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair.ida.shortId(),
+        .node_identity = &pair.ida,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+        .reactor = sim.reactor(),
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+    try std.testing.expect(server.relay_v2_pressure != null);
+
+    const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const peer_conn = server.rx().clients.get(peer_id).?;
+    peer_conn.overflow_allocator = alloc;
+    peer_conn.token = try tokenFromId(peer_id);
+    peer_conn.send_armed = true;
+    peer_conn.sendq_cap = default_sendq_cap;
+    peer_conn.s2s_secured = &pair.a;
+    defer {
+        peer_conn.s2s_secured = null;
+        _ = server.rx().clients.free(peer_id);
+    }
+    const peer = pair.idb.shortId();
+
+    var first = (try server.admitAuthoredRelayV2(.privmsg, "#paced", 0, "Alice!u@origin.test", "alice", "", "", "paced head", .channel, "", null, 0, null, server.nextMeshHlc(), null, null)) orelse
+        return error.TestUnexpectedResult;
+    defer first.deinit(alloc);
+
+    // Live authoring emits the new head at once.
+    server.forwardAcceptedRelayV2(first.wire);
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, peer_conn, &pair.b));
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_pressure.?.inFlightCount(peer));
+
+    // Wakes and unrelated ACK turns inside the RTO re-send nothing.
+    for (0..16) |_| server.retryRelayV2Outbox();
+    sim.advance(999);
+    server.retryRelayV2Outbox();
+    try std.testing.expectEqual(@as(usize, 0), try m07DeliverV2ToRemote(alloc, peer_conn, &pair.b));
+    try std.testing.expect(server.relay_v2_pressure.?.resend_suppressed >= 17);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+
+    // The unacknowledged head comes back after 1s, then after a doubled RTO.
+    sim.advance(1);
+    server.retryRelayV2Outbox();
+    server.retryRelayV2Outbox();
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, peer_conn, &pair.b));
+    sim.advance(1_999);
+    server.retryRelayV2Outbox();
+    try std.testing.expectEqual(@as(usize, 0), try m07DeliverV2ToRemote(alloc, peer_conn, &pair.b));
+    sim.advance(1);
+    server.retryRelayV2Outbox();
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, peer_conn, &pair.b));
+
+    // A fresh secured link re-presents the retained head immediately instead
+    // of waiting out the 4s backoff accumulated on the old connection.
+    peer_conn.relay_v2_unbound_bound = false;
+    server.bindRelayV2UnboundIfReady(peer_conn, &pair.a);
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, peer_conn, &pair.b));
+
+    // The authenticated ACK retires the row and its pacing entry; a later head
+    // is emitted at once, unaffected by the earlier backoff.
+    try std.testing.expect(server.commitRelayV2NeighborAck(peer, first.relay_id));
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_pressure.?.inFlightCount(peer));
+    resetTestSendQ(peer_conn);
+    pair.a.clearOutbound();
+    var second = (try server.admitAuthoredRelayV2(.privmsg, "#paced", 0, "Alice!u@origin.test", "alice", "", "", "next head", .channel, "", null, 0, null, server.nextMeshHlc(), null, null)) orelse
+        return error.TestUnexpectedResult;
+    defer second.deinit(alloc);
+    server.forwardAcceptedRelayV2(second.wire);
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, peer_conn, &pair.b));
+
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(alloc);
+    try server.writeRelayV2BackpressurePrometheus(alloc, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_relay_v2_resend_total 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_relay_v2_retained_rows 1\n") != null);
+}
+
+test "M04 mesh route preference orders MESSAGE_V2 retry heads by hysteresis-stable measured cost without changing the set" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0x95)), "m04-route-order-test");
+    defer local.deinit();
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    server.route_rank = route_cost.PeerRanking.init(.{ .abs_margin = 10, .rel_margin_pct = 0, .min_challenge_ms = 1_000, .min_dwell_ms = 2_000 });
+
+    // Two heads for peer 0xB0 (distinct origins) keep their relative order.
+    const peers = [_]u64{ 0xA0, 0xB0, 0xC0, 0xB0, 0xD0 };
+    var work: [peers.len]RelayV2RetryWork = undefined;
+    for (&work, peers, 0..) |*item, peer, i| {
+        item.* = .{ .peer = peer, .relay_id = @splat(@intCast(i + 1)), .wire = try std.fmt.allocPrint(alloc, "wire-{d}", .{i}) };
+    }
+    defer for (work) |item| alloc.free(item.wire);
+    const Snapshot = struct {
+        fn ids(items: []const RelayV2RetryWork) [peers.len]u8 {
+            var out: [peers.len]u8 = undefined;
+            for (items, &out) |item, *id| id.* = item.relay_id[0];
+            return out;
+        }
+    };
+
+    // Nothing ranked: order is untouched (all unranked, ties by node id keep
+    // the stable order within one peer).
+    server.orderRelayV2RetryWorkByRoute(&work);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4, 3, 5 }, &Snapshot.ids(&work));
+
+    _ = server.route_rank.observe(0xA0, 300, 0);
+    _ = server.route_rank.observe(0xB0, 40, 0);
+    _ = server.route_rank.observe(0xC0, 120, 0);
+    // 0xD0 has no measurement: unranked sorts after every eligible peer.
+    server.orderRelayV2RetryWorkByRoute(&work);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 4, 3, 1, 5 }, &Snapshot.ids(&work));
+    for (work) |item| {
+        // The (peer, relay id, wire) triples are preserved exactly.
+        try std.testing.expectEqual(peers[item.relay_id[0] - 1], item.peer);
+        var expect_buf: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect_buf, "wire-{d}", .{item.relay_id[0] - 1}), item.wire);
+    }
+
+    // Sub-margin and unsustained moves never reorder (no flap).
+    _ = server.route_rank.observe(0xC0, 112, 500);
+    _ = server.route_rank.observe(0xA0, 30, 600);
+    server.orderRelayV2RetryWorkByRoute(&work);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 4, 3, 1, 5 }, &Snapshot.ids(&work));
+    // Sustained beyond-margin improvement after dwell promotes 0xA0.
+    _ = server.route_rank.observe(0xA0, 30, 2_000);
+    server.orderRelayV2RetryWorkByRoute(&work);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4, 3, 5 }, &Snapshot.ids(&work));
+
+    // A dropped link is demoted at once but still emitted (custody unchanged).
+    server.noteRoutePeerDown(0xA0);
+    server.orderRelayV2RetryWorkByRoute(&work);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 4, 3, 5, 1 }, &Snapshot.ids(&work));
+    try std.testing.expectEqual(@as(u64, 1), server.route_rank.stats.demotions);
+
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(alloc);
+    try server.writeRoutePreferencePrometheus(alloc, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_route_ranked_peers 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_route_eligible_peers 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_route_peer_cost{node=\"00000000000000b0\"} 40\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_route_peer_eligible{node=\"00000000000000a0\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_route_rank_demotions_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_route_rank_held_total") != null);
+
+    // E2EE group custody retries use the same advisory ordering: cheapest
+    // eligible neighbor first, the demoted one last, every item kept.
+    var group_work: [3]E2eeGroupRetryWork = undefined;
+    for (&group_work, [_]u64{ 0xA0, 0xC0, 0xB0 }, 0..) |*item, peer, i| {
+        item.* = .{ .peer = peer, .relay_id = @splat(@intCast(i + 1)), .wire = work[i].wire };
+    }
+    server.orderRetryWorkByRoute(E2eeGroupRetryWork, e2ee_group_retry_frame_budget, &group_work);
+    try std.testing.expectEqual(@as(u64, 0xB0), group_work[0].peer);
+    try std.testing.expectEqual(@as(u64, 0xC0), group_work[1].peer);
+    try std.testing.expectEqual(@as(u64, 0xA0), group_work[2].peer);
+    try std.testing.expectEqual(@as(u8, 3), group_work[0].relay_id[0]);
+}
+
+test "M04 mesh route preference keeps MESSAGE_V2 exact-once fan-out to every direct neighbor while ranks change" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    var pair_b = try SessionReplayTestPair.initWithSeedsAndNames(alloc, 0x41, 0x42, "m04-a.test", "m04-b.test");
+    defer pair_b.deinit();
+    var pair_c = try SessionReplayTestPair.initWithSeedsAndNames(alloc, 0x41, 0x43, "m04-a.test", "m04-c.test");
+    defer pair_c.deinit();
+    for ([_]*SessionReplayTestPair{ &pair_b, &pair_c }) |pair| {
+        pair.a.clearOutbound();
+        pair.b.clearOutbound();
+        try std.testing.expect(pair.a.supportsSecureRelayV2());
+    }
+
+    const root_b = std.fmt.bytesToHex(pair_b.idb.sign_kp.public_key, .lower);
+    const root_c = std.fmt.bytesToHex(pair_c.idb.sign_kp.public_key, .lower);
+    const local_root = std.fmt.bytesToHex(pair_b.ida.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_b, &root_c };
+    const roster = [_][]const u8{ &local_root, &root_b, &root_c };
+    var sim = reactor_mod.SimReactor.init(10_000_000);
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = pair_b.ida.shortId(),
+        .node_identity = &pair_b.ida,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+        .reactor = sim.reactor(),
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    var conns: [2]*ConnState = undefined;
+    var ids: [2]client_model.ClientId = undefined;
+    for ([_]*SessionReplayTestPair{ &pair_b, &pair_c }, &conns, &ids) |pair, *conn_out, *id_out| {
+        const id = try server.rx().clients.alloc(ConnState.init(-1));
+        const conn = server.rx().clients.get(id).?;
+        conn.overflow_allocator = alloc;
+        conn.token = try tokenFromId(id);
+        conn.send_armed = true;
+        conn.sendq_cap = default_sendq_cap;
+        conn.s2s_secured = &pair.a;
+        conn_out.* = conn;
+        id_out.* = id;
+    }
+    defer for (conns, ids) |conn, id| {
+        conn.s2s_secured = null;
+        _ = server.rx().clients.free(id);
+    };
+    const node_b = pair_b.idb.shortId();
+    const node_c = pair_c.idb.shortId();
+
+    // Real measurements through peer_health: C is the cheaper link.
+    server.markPeerHealth(pair_b.a.remoteName(), .established);
+    server.markPeerHealth(pair_c.a.remoteName(), .established);
+    server.syncPeerRtt(pair_b.a.remoteName(), 250);
+    server.syncPeerRtt(pair_c.a.remoteName(), 15);
+    server.refreshRouteRanking();
+    try std.testing.expect(route_cost.RankKey.lessThan(server.route_rank.key(node_c), server.route_rank.key(node_b)));
+    try std.testing.expectEqual(@as(?u32, 15), server.route_rank.get(node_c).?.ranked);
+
+    var first = (try server.admitAuthoredRelayV2(.privmsg, "#route", 0, "Alice!u@origin.test", "alice", "", "", "ranked head", .channel, "", null, 0, null, server.nextMeshHlc(), null, null)) orelse
+        return error.TestUnexpectedResult;
+    defer first.deinit(alloc);
+    server.forwardAcceptedRelayV2(first.wire);
+    // Every direct neighbor receives exactly one copy; ordering never narrows.
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, conns[0], &pair_b.b));
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, conns[1], &pair_c.b));
+    for (0..8) |_| server.retryRelayV2Outbox();
+    try std.testing.expectEqual(@as(usize, 0), try m07DeliverV2ToRemote(alloc, conns[0], &pair_b.b));
+    try std.testing.expectEqual(@as(usize, 0), try m07DeliverV2ToRemote(alloc, conns[1], &pair_c.b));
+
+    // C's link drops out of the established set: demoted, B now ranks first,
+    // and the retained head is still owed to both neighbors until each ACKs.
+    try std.testing.expect(server.commitRelayV2NeighborAck(node_b, first.relay_id));
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
+    conns[1].s2s_secured = null;
+    server.refreshRouteRanking();
+    try std.testing.expectEqual(route_cost.RankClass.ineligible, server.route_rank.key(node_c).class);
+    try std.testing.expect(route_cost.RankKey.lessThan(server.route_rank.key(node_b), server.route_rank.key(node_c)));
+    conns[1].s2s_secured = &pair_c.a;
+    try std.testing.expect(server.commitRelayV2NeighborAck(node_c, first.relay_id));
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+
+    var second = (try server.admitAuthoredRelayV2(.privmsg, "#route", 0, "Alice!u@origin.test", "alice", "", "", "after rerank", .channel, "", null, 0, null, server.nextMeshHlc(), null, null)) orelse
+        return error.TestUnexpectedResult;
+    defer second.deinit(alloc);
+    server.forwardAcceptedRelayV2(second.wire);
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, conns[0], &pair_b.b));
+    try std.testing.expectEqual(@as(usize, 1), try m07DeliverV2ToRemote(alloc, conns[1], &pair_c.b));
+}
+
+/// Move an established test link onto the heap so `closeConn` can own and
+/// destroy it, the way the GAP-O3 mooring test does. The pair's stack copy is
+/// never deinited afterwards; its `b` side and identities still are.
+fn m07HeapLink(allocator: std.mem.Allocator, pair: *SessionReplayTestPair) !*secured_s2s_link.SecuredLink {
+    const link = try allocator.create(secured_s2s_link.SecuredLink);
+    link.* = pair.a;
+    return link;
+}
+
+fn m07ReleaseMovedPair(pair: *SessionReplayTestPair) void {
+    pair.b.deinit();
+    pair.ida.sign_kp.secret_key.page = null;
+    pair.idb.sign_kp.secret_key.page = null;
+    pair.ida.deinit();
+    pair.idb.deinit();
+}
+
+test "M07 mesh SQUIT or link teardown forgets MESSAGE_V2 pacing, but a dedup leg keeps the survivor's" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+
+    // Two links to the same remote identity (deterministic seeds): `survivor`
+    // owns the peer, `loser` is a collision-collapsed duplicate.
+    var survivor_pair = try SessionReplayTestPair.init(alloc);
+    var survivor_moved = false;
+    defer if (survivor_moved) m07ReleaseMovedPair(&survivor_pair) else survivor_pair.deinit();
+    var loser_pair = try SessionReplayTestPair.init(alloc);
+    var loser_moved = false;
+    defer if (loser_moved) m07ReleaseMovedPair(&loser_pair) else loser_pair.deinit();
+    try std.testing.expectEqual(survivor_pair.idb.shortId(), loser_pair.idb.shortId());
+
+    const peer_root = std.fmt.bytesToHex(survivor_pair.idb.sign_kp.public_key, .lower);
+    const local_root = std.fmt.bytesToHex(survivor_pair.ida.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+    var sim = reactor_mod.SimReactor.init(10_000_000);
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = survivor_pair.ida.shortId(),
+        .node_identity = &survivor_pair.ida,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+        .reactor = sim.reactor(),
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const peer = survivor_pair.idb.shortId();
+    try std.testing.expectEqual(@as(?u64, peer), survivor_pair.a.remoteNodeId());
+
+    // A head that reached the backoff cap: the peer reports as stalled.
+    const relay_id: mesh_backpressure.RelayId = @splat(0x5a);
+    {
+        lockSpin(&server.relay_v2_replay_mu);
+        defer server.relay_v2_replay_mu.unlock();
+        const pacing = &server.relay_v2_pressure.?;
+        for (0..mesh_backpressure.max_retry_shift + 1) |i| pacing.noteEmitted(peer, relay_id, 1000 * i);
+        try std.testing.expectEqual(@as(usize, 1), pacing.stalledPeerCount());
+    }
+
+    // Tearing down the dedup'd duplicate leaves the survivor's pacing alone.
+    const loser_link = try m07HeapLink(alloc, &loser_pair);
+    loser_moved = true;
+    const loser_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const loser_conn = server.rx().clients.get(loser_id).?;
+    loser_conn.overflow_allocator = alloc;
+    loser_conn.token = try tokenFromId(loser_id);
+    loser_conn.s2s_secured = loser_link;
+    loser_conn.s2s_dedup = true;
+    try server.closeConn(loser_conn.token, "duplicate link collapsed");
+    try std.testing.expect(server.rx().clients.get(loser_id) == null);
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_pressure.?.inFlightCount(peer));
+
+    // Tearing down the owning leg (SQUIT and every other close path) forgets it.
+    const survivor_link = try m07HeapLink(alloc, &survivor_pair);
+    survivor_moved = true;
+    const survivor_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const survivor_conn = server.rx().clients.get(survivor_id).?;
+    survivor_conn.overflow_allocator = alloc;
+    survivor_conn.token = try tokenFromId(survivor_id);
+    survivor_conn.s2s_secured = survivor_link;
+    try server.closeConn(survivor_conn.token, "SQUIT by oper");
+    try std.testing.expect(server.rx().clients.get(survivor_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_pressure.?.peerCount());
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_pressure.?.inFlightCount(peer));
+
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(alloc);
+    try server.writeRelayV2BackpressurePrometheus(alloc, &metrics);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_relay_v2_stalled_peers 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_relay_v2_deferred 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.items, "onyx_relay_v2_deferred_capacity 256\n") != null);
+}
+
+test "M07 mesh MESSAGE_V2 per-origin admission sheds a spent origin, withholds transit, and resumes after drain" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    defer current_reactor = null;
+    var local = try node_identity.fromSeed(@as([32]u8, @splat(0xc1)), "m07-admission-test");
+    defer local.deinit();
+    var peer_b = try node_identity.fromSeed(@as([32]u8, @splat(0xc2)), "m07-admission-test");
+    defer peer_b.deinit();
+    var peer_c = try node_identity.fromSeed(@as([32]u8, @splat(0xc3)), "m07-admission-test");
+    defer peer_c.deinit();
+    const root_local = std.fmt.bytesToHex(local.sign_kp.public_key, .lower);
+    const root_b = std.fmt.bytesToHex(peer_b.sign_kp.public_key, .lower);
+    const root_c = std.fmt.bytesToHex(peer_c.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{ &root_b, &root_c };
+    const roster = [_][]const u8{ &root_local, &root_b, &root_c };
+    const server = createTestServer(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = local.shortId(),
+        .node_identity = &local,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer alloc.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expectEqual(@as(usize, 3), server.relay_v2_required_nodes.len);
+    // Nine RVL2 rows over three origins: three per origin.
+    server.relay_v2_event_log.deinit();
+    server.relay_v2_event_log = try relay_v2_event_log.EventLog.init(alloc, .{ .max_rows = 9 });
+
+    // Local authoring stops at its 7/8 watermark: three rows, then shed with
+    // RVG2 untouched (the refused event is not admitted anywhere).
+    var local_ids: [3]relay_v2_replay_guard.RelayId = undefined;
+    for (&local_ids, 0..) |*id, index| {
+        var text_buf: [24]u8 = undefined;
+        const body = try std.fmt.bufPrint(&text_buf, "local-{d}", .{index});
+        var accepted = (try server.admitAuthoredRelayV2(.privmsg, "#m07", 0, "Alice!u@local.test", "alice", "", "", body, .channel, "", null, 0, null, server.nextMeshHlc(), null, null)) orelse
+            return error.TestUnexpectedResult;
+        id.* = accepted.relay_id;
+        accepted.deinit(alloc);
+    }
+    const shed_hlc = server.nextMeshHlc();
+    try std.testing.expect((try server.admitAuthoredRelayV2(.privmsg, "#m07", 0, "Alice!u@local.test", "alice", "", "", "refused", .channel, "", null, 0, null, shed_hlc, null, null)) == null);
+    try std.testing.expectEqual(@as(u64, 1), server.relay_v2_gate.local_shed);
+    try std.testing.expectEqual(@as(usize, 3), server.relay_v2_event_log.len());
+
+    // Another origin keeps its own share although local authoring is shed.
+    const Transit = struct {
+        fn admit(srv: *Server, a: std.mem.Allocator, origin: *const node_identity.NodeIdentity, via: u64, base_hlc: u64, index: usize) !struct { outcome: LinuxServer.RelayV2AdmitOutcome, wire: []u8 } {
+            var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
+            var signature: [message_relay_v2.sig_len]u8 = undefined;
+            var text_buf: [24]u8 = undefined;
+            var msg = message_relay_v2.RelayMessage{
+                .verb = .privmsg,
+                .target = "#m07",
+                .source_prefix = "Bob!u@peer-b.test",
+                .text = try std.fmt.bufPrint(&text_buf, "transit-{d}", .{index}),
+                .scope_kind = .channel,
+                .origin_node = origin.shortId(),
+                .hlc = base_hlc + index,
+            };
+            try message_relay_v2.stampOrigin(a, &msg, &origin.sign_kp, &pubkey, &signature);
+            const wire = try message_relay_v2.encode(a, msg);
+            errdefer a.free(wire);
+            const peers = try srv.collectRelayV2OutboxPeers(via, false);
+            defer a.free(peers);
+            const outcome = try srv.admitRelayV2Detailed(msg, null, .{
+                .peers = peers,
+                .receipt_peer = via,
+                .wire = wire,
+                .unbound_excluded_peer = via,
+            }, null);
+            return .{ .outcome = outcome, .wire = wire };
+        }
+    };
+    const transit_hlc = server.nextMeshHlc();
+    var transit_ids: [3]relay_v2_replay_guard.RelayId = undefined;
+    for (&transit_ids, 0..) |*id, index| {
+        const got = try Transit.admit(server, alloc, &peer_b, peer_b.shortId(), transit_hlc, index);
+        defer alloc.free(got.wire);
+        id.* = switch (got.outcome) {
+            .accepted => |accepted| accepted,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 6), server.relay_v2_event_log.len());
+
+    // B's share is spent: its next new event is withheld (no RVG2 admission,
+    // no ACK) while free rows remain for C, and an exact duplicate ingress of
+    // an already retained B row is still re-ACKable through C.
+    {
+        const got = try Transit.admit(server, alloc, &peer_b, peer_b.shortId(), transit_hlc, 3);
+        defer alloc.free(got.wire);
+        try std.testing.expect(got.outcome == .rejected);
+    }
+    try std.testing.expectEqual(@as(u64, 1), server.relay_v2_gate.transit_shed);
+    try std.testing.expectEqual(@as(usize, 6), server.relay_v2_event_log.len());
+    {
+        const replay = try Transit.admit(server, alloc, &peer_b, peer_b.shortId(), transit_hlc, 0);
+        defer alloc.free(replay.wire);
+        try std.testing.expect(replay.outcome == .duplicate);
+        try std.testing.expect(try server.retainRelayV2DuplicateIngress(transit_ids[0], replay.wire, peer_c.shortId()));
+    }
+
+    // Drain one B row (C confirms; B is its ingress, so local+B+C hold it):
+    // the withheld event is admitted on the sender's next presentation.
+    try std.testing.expect(server.commitRelayV2NeighborAck(peer_c.shortId(), transit_ids[0]));
+    try std.testing.expect(server.commitRelayV2IngressAckConfirm(peer_b.shortId(), transit_ids[0]));
+    try std.testing.expectEqual(@as(usize, 5), server.relay_v2_event_log.len());
+    {
+        const got = try Transit.admit(server, alloc, &peer_b, peer_b.shortId(), transit_hlc, 3);
+        defer alloc.free(got.wire);
+        try std.testing.expect(got.outcome == .accepted);
+    }
+
+    // Local authoring stays shed until its share falls below the 3/4 low
+    // watermark: one retired row (3 -> 2 of 3) reopens it.
+    try std.testing.expect(server.commitRelayV2NeighborAck(peer_b.shortId(), local_ids[0]));
+    try std.testing.expect(server.commitRelayV2NeighborAck(peer_c.shortId(), local_ids[0]));
+    try std.testing.expectEqual(@as(usize, 5), server.relay_v2_event_log.len());
+    var resumed = (try server.admitAuthoredRelayV2(.privmsg, "#m07", 0, "Alice!u@local.test", "alice", "", "", "resumed", .channel, "", null, 0, null, server.nextMeshHlc(), null, null)) orelse
+        return error.TestUnexpectedResult;
+    resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), server.relay_v2_gate.local_shed);
+    try std.testing.expectEqual(@as(usize, 6), server.relay_v2_event_log.len());
+}
+
 test "MESSAGE_V2 egress emits a >64 same-origin backlog old-HLC-before-new per neighbor" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -94492,6 +98986,160 @@ test "DST GAP-A7 listener add or remove refuses UPGRADE with cold restart requir
     try std.testing.expect(server.reactors[0].deferred_upgrade != null);
     server.reactors[0].deferred_upgrade = null;
     std.debug.print("GAP-A7 branch=refuse cold restart required before UPGRADE; unchanged listeners still queue\n", .{});
+}
+
+test "M10 UPGRADE PLAN accounts every attachment, never claims seamless, and queues nothing" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try rehashTmpPath(alloc, tmp, "plan.toml");
+    defer alloc.free(path);
+
+    var server = Server.init(alloc, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    server.config.port = 6667;
+
+    const oper_id = try addTestLocalClient(&server, "m10oper", "m10oper");
+    const conn = server.rx().clients.get(oper_id).?;
+    conn.session.is_oper = true;
+    conn.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_restart});
+    _ = try addTestLocalClient(&server, "m10user", null);
+    _ = try addTestLocalClient(&server, "m10acct", "m10acct");
+
+    const plan = try irc_line.parseLine("UPGRADE PLAN");
+    try server.handleUpgradeCommand(conn, plan.paramSlice());
+    try std.testing.expect(server.reactors[0].deferred_upgrade == null);
+    const first = try copyTestSendQ(alloc, conn);
+    defer alloc.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "UPGRADE PLAN: total=3 carry=0 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "target=unproven") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "verdict=seamless") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, maintenance_plan.blockerName(.target_probe_unproven)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "nothing queued") != null);
+    resetTestSendQ(conn);
+
+    // A listener change on disk is a hard preflight blocker: verdict=blocked.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plan.toml", .data = "[node]\nid = 1\n[listen]\nirc = 6668\n" });
+    server.config.config_path = path;
+    try server.handleUpgradeCommand(conn, plan.paramSlice());
+    try std.testing.expect(server.reactors[0].deferred_upgrade == null);
+    const blocked = try copyTestSendQ(alloc, conn);
+    defer alloc.free(blocked);
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "verdict=blocked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocked, maintenance_plan.blockerName(.listener_change)) != null);
+    resetTestSendQ(conn);
+
+    // Every continuity blocker has a plan twin (checked at compile time) and
+    // surfaces by name.
+    try std.testing.expectEqual(maintenance_plan.Blocker.media_recording, LinuxServer.upgradePlanContinuityBlocker(.media_recording));
+
+    // (g) Several continuity blockers at once: the plan lists every one, in
+    // inventory order, while UPGRADE still refuses with the first.
+    server.config.config_path = null;
+    server.reactors[0].retained_fabric_count = 1;
+    server.relay_v2_deferred_len = 1;
+    defer server.reactors[0].retained_fabric_count = 0;
+    defer server.relay_v2_deferred_len = 0;
+    try std.testing.expectEqual(LinuxServer.UpgradeContinuityBlocker.pending_fabric_output, server.upgradeContinuityBlockerLocked().?);
+    const scan = server.upgradeContinuityBlockersLocked();
+    try std.testing.expectEqual(@as(usize, 2), scan.ordered().len);
+    try std.testing.expectEqual(LinuxServer.UpgradeContinuityBlocker.pending_fabric_output, scan.ordered()[0]);
+    try std.testing.expectEqual(LinuxServer.UpgradeContinuityBlocker.relay_v2_deferred, scan.ordered()[1]);
+    try server.handleUpgradeCommand(conn, plan.paramSlice());
+    try std.testing.expect(server.reactors[0].deferred_upgrade == null);
+    const multi = try copyTestSendQ(alloc, conn);
+    defer alloc.free(multi);
+    const fabric_at = std.mem.indexOf(u8, multi, maintenance_plan.blockerName(.pending_fabric_output)).?;
+    const relay_at = std.mem.indexOf(u8, multi, maintenance_plan.blockerName(.relay_v2_deferred)).?;
+    try std.testing.expect(fabric_at < relay_at);
+    try std.testing.expect(std.mem.indexOf(u8, multi, maintenance_plan.blockerName(.target_probe_unproven)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, multi, "verdict=seamless") == null);
+    resetTestSendQ(conn);
+    std.debug.print("M10 branch=UPGRADE PLAN total=3 carry=0 target=unproven, listener change blocks, nothing queued\n", .{});
+}
+
+test "M10 seal-time upgrade reconcile refuses a sealed relation that disagrees with the pre-seal inventory" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+
+    // The inventory covers every occupied slot exactly once.
+    const a = try addTestLocalClient(&server, "m10seal_a", null);
+    const b = try addTestLocalClient(&server, "m10seal_b", null);
+    const inventory = try server.upgradeSealInventory();
+    defer alloc.free(inventory);
+    try std.testing.expectEqual(@as(usize, 2), inventory.len);
+    var saw_a = false;
+    var saw_b = false;
+    for (inventory) |row| {
+        if (row.old_client == monitorIdFromClient(a)) saw_a = true;
+        if (row.old_client == monitorIdFromClient(b)) saw_b = true;
+    }
+    try std.testing.expect(saw_a and saw_b);
+
+    const rows = [_]maintenance_plan.AttachmentRow{
+        .{ .old_client = 7, .role = .client, .transport = .tls, .registered = true, .resumable = false, .helix_carriable = true },
+        .{ .old_client = 9, .role = .canonical_mesh, .transport = .s2s, .registered = true, .resumable = false, .helix_carriable = true },
+        .{ .old_client = 11, .role = .unregistered, .transport = .s2s, .registered = false, .resumable = false, .helix_carriable = false, .carry_gap = .non_canonical_mesh_owner },
+    };
+    const Case = struct { entries: []const physical_connection_relation.Entry, fds: usize, err: ?anyerror };
+    const cases = [_]Case{
+        // Exact: the successful seal reconciles.
+        .{ .entries = &.{ .{ .old_client = 7, .fd_index = 0, .role = .client }, .{ .old_client = 9, .fd_index = 1, .role = .canonical_mesh } }, .fds = 2, .err = null },
+        // A carried attachment missing from the relation.
+        .{ .entries = &.{.{ .old_client = 7, .fd_index = 0, .role = .client }}, .fds = 2, .err = error.MissingFromRelation },
+        // A sealed row nobody planned to carry (the non-canonical link).
+        .{ .entries = &.{ .{ .old_client = 7, .fd_index = 0, .role = .client }, .{ .old_client = 9, .fd_index = 1, .role = .canonical_mesh }, .{ .old_client = 11, .fd_index = 2, .role = .canonical_mesh } }, .fds = 3, .err = error.ExtraRelationRow },
+        // Roles swapped.
+        .{ .entries = &.{ .{ .old_client = 7, .fd_index = 0, .role = .canonical_mesh }, .{ .old_client = 9, .fd_index = 1, .role = .client } }, .fds = 2, .err = error.RoleMismatch },
+    };
+    for (cases) |case| {
+        const wire = try physical_connection_relation.encode(alloc, case.entries, helix_live.max_inherited_state_fds);
+        defer alloc.free(wire);
+        const pieces = [_]helix_live.StatePiece{.{ .kind = .physical_connection_relation, .bytes = wire }};
+        if (case.err) |expected| {
+            try std.testing.expectError(expected, server.reconcileUpgradeSeal(&rows, &pieces, case.fds));
+        } else try server.reconcileUpgradeSeal(&rows, &pieces, case.fds);
+    }
+    // No relation at all, or two, fails closed.
+    try std.testing.expectError(error.InvalidInheritedHandoff, server.reconcileUpgradeSeal(&rows, &.{}, 2));
+    // Allocation failure anywhere in the reconcile is an error, never a pass.
+    const exact_wire = try physical_connection_relation.encode(alloc, cases[0].entries, helix_live.max_inherited_state_fds);
+    defer alloc.free(exact_wire);
+    const exact_pieces = [_]helix_live.StatePiece{.{ .kind = .physical_connection_relation, .bytes = exact_wire }};
+    const saved = server.allocator;
+    defer server.allocator = saved;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(saved, .{ .fail_index = fail_index });
+        server.allocator = failing.allocator();
+        const result = server.reconcileUpgradeSeal(&rows, &exact_pieces, 2);
+        server.allocator = saved;
+        if (failing.has_induced_failure) {
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else {
+            try result;
+            break;
+        }
+    }
+    std.debug.print("M10 branch=seal-time reconcile exact ok; missing, extra, role mismatch, absent relation and OOM refuse\n", .{});
 }
 
 fn gapP2Say(server: *Server, id: client_model.ClientId, conn: *ConnState, command: []const u8, text: []const u8) !void {
@@ -97602,28 +102250,29 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
     const alloc = std.testing.allocator;
     defer current_reactor = null;
 
-    // Two carried client sockets whose fd parities DIFFER, so the fd-derived
-    // re-pin (fd % num_shards) provably lands one client on each of the two
-    // shards. A socketpair's two ends are two distinct fds; pick the even end
-    // of one pair and the odd end of the other (the unpicked end stays with
-    // the test as that client's remote peer).
+    // Two carried client sockets whose fd parities are the SAME. The old
+    // fd-parity re-pin (fd % num_shards) put both on one shard; the
+    // adoption-order round-robin must still land one client on each of the
+    // two shards. A socketpair's two ends are two distinct fds; pick the even
+    // end of each pair (the unpicked end stays with the test as that client's
+    // remote peer).
     var sp_a: [2]i32 = undefined;
     if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp_a)) != .SUCCESS) return error.SkipZigTest;
     var sp_b: [2]i32 = undefined;
     if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp_b)) != .SUCCESS) return error.SkipZigTest;
     const even_a: ?usize = if (@mod(sp_a[0], 2) == 0) 0 else if (@mod(sp_a[1], 2) == 0) 1 else null;
-    const odd_b: ?usize = if (@mod(sp_b[0], 2) == 1) 0 else if (@mod(sp_b[1], 2) == 1) 1 else null;
-    if (even_a == null or odd_b == null) {
-        // Pathological fd numbering (both ends of a pair share parity) — the
-        // property under test is untestable with these fds; skip, don't fake.
+    const even_b: ?usize = if (@mod(sp_b[0], 2) == 0) 0 else if (@mod(sp_b[1], 2) == 0) 1 else null;
+    if (even_a == null or even_b == null) {
+        // Pathological fd numbering (both ends of a pair share odd parity) —
+        // the same-parity property is untestable with these fds; skip.
         for (sp_a) |fd| closeFd(fd);
         for (sp_b) |fd| closeFd(fd);
         return error.SkipZigTest;
     }
-    const carried_a = sp_a[even_a.?]; // adopts onto shard 0
+    const carried_a = sp_a[even_a.?]; // first in capsule order: shard 0
     const peer_a = sp_a[1 - even_a.?];
-    const carried_b = sp_b[odd_b.?]; // adopts onto shard 1
-    const peer_b = sp_b[1 - odd_b.?];
+    const carried_b = sp_b[even_b.?]; // second in capsule order: shard 1
+    const peer_b = sp_b[1 - even_b.?];
     defer closeFd(peer_a); // carried ends transfer to the server on adopt
     defer closeFd(peer_b);
 
@@ -97703,8 +102352,9 @@ test "multi-shard UPGRADE adopt re-pins carried clients across shards and serves
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(carried_a, posix.F.GETFD, 0)));
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(carried_b, posix.F.GETFD, 0)));
 
-    // Each client re-pinned to its fd-derived shard — including the NON-ZERO
-    // shard the pre-fix upgrade dropped entirely.
+    // Each client re-pinned to its adoption-order shard — including the
+    // NON-ZERO shard the pre-fix upgrade dropped entirely — even though both
+    // carried fds share one parity.
     try std.testing.expectEqual(@as(usize, 1), server.reactors[0].clients.len());
     try std.testing.expectEqual(@as(usize, 1), server.reactors[1].clients.len());
     var it1 = server.reactors[1].clients.iterator();
@@ -108576,6 +113226,166 @@ test "prometheus export includes mesh health and E2EEGROUP drain gauges" {
     } else return error.SkipZigTest;
 }
 
+test "threaded server: chat output stops at its class ceiling and the scrape reports it (M05)" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const id = try addTestLocalClient(&server, "ClassChat", null);
+    const conn = server.connFor(id).?;
+    conn.sendq_cap = 64 * 1024;
+    const limits = output_class_budget.ceilings(server.output_class_policy, conn.sendq_cap);
+    try std.testing.expect(limits.chat < limits.control);
+
+    // A small chat line fits and is counted as admitted.
+    try std.testing.expectEqual(Server.DeliveryOutcome.delivered, server.enqueueDeliveryMaybeClose(id, "PING :chat\r\n", false, ""));
+    try std.testing.expectEqual(@as(u64, 1), server.rx().output_class_turn.counters.get(.chat, .admit));
+
+    // Control output fills the queue to just under the chat ceiling. A chat
+    // line that would cross it is refused while the SendQ still has room, so
+    // the space above the chat ceiling stays reserved for control.
+    const filler = try std.testing.allocator.alloc(u8, @intCast(limits.chat - sendq.backlog(conn) - 8));
+    defer std.testing.allocator.free(filler);
+    @memset(filler, 'x');
+    try appendToConn(conn, filler);
+    try std.testing.expect(sendq.backlog(conn) + 64 < conn.sendq_cap);
+    const line = "PRIVMSG ClassChat :this chat line crosses the chat class ceiling\r\n";
+    try std.testing.expectEqual(Server.DeliveryOutcome.poisoned, server.enqueueDeliveryMaybeClose(id, line, false, ""));
+    try std.testing.expectEqual(@as(u64, 1), server.rx().output_class_turn.counters.get(.chat, .overflow));
+
+    server.publishOutputClassCounters();
+    server.refreshMetricsSnapshot();
+    var buf: [65536]u8 = undefined;
+    const text = try server.metrics_snapshot.copyInto(&buf);
+    try expectContains(text, "# TYPE onyx_output_class_overflow_total counter");
+    try expectContains(text, "onyx_output_class_overflow_total{class=\"chat\"} 1");
+    try expectContains(text, "onyx_output_class_admitted_total{class=\"chat\"} 1");
+    try expectContains(text, "onyx_output_class_shed_total{class=\"media\"} 0");
+}
+
+test "threaded server: workload quota keeps recovery reachable and bounds RESUME verification (M12)" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    // Every table large enough for the reserves derives a valid governor;
+    // invalid explicit overrides are an error, never a disabled governor.
+    try std.testing.expect(try workloadQuotaConfig(4, .{}) == null);
+    for (5..workload_quota_mod.max_pool_capacity + 2) |capacity|
+        try std.testing.expect(try workloadQuotaConfig(@intCast(capacity), .{}) != null);
+    try std.testing.expect(try workloadQuotaConfig(std.math.maxInt(u31), .{}) != null);
+    try std.testing.expect(try workloadQuotaConfig(1024, .{ .enabled = false }) == null);
+    try std.testing.expectError(error.InvalidMeshReserve, workloadQuotaConfig(1024, .{ .recovery_reserve_slots = 1 }));
+    try std.testing.expectError(error.ReserveExceedsCapacity, workloadQuotaConfig(4, .{ .recovery_reserve_slots = 4 }));
+
+    const quota = server.rx().quota orelse return error.TestUnexpectedResult;
+    try std.testing.expect(quota.config.recovery_reserve_slots > 0);
+    try std.testing.expectEqual(server.config.max_clients - quota.config.recovery_reserve_slots, server.clientAdmissionSlotCap());
+
+    const id = try addTestLocalClient(&server, "QuotaUser", "quota-acct");
+    const conn = server.connFor(id).?;
+    var held: std.ArrayList(workload_quota_mod.Ticket) = .empty;
+    defer held.deinit(allocator);
+    defer for (held.items) |ticket| server.releaseWorkloadTicketValue(ticket);
+
+    // An admission storm exhausts its own share and is refused...
+    while (server.tryWorkloadTicket(.client_admission, .slot, 0)) |ticket| {
+        try held.append(allocator, ticket.?);
+        if (held.items.len > quota.config.capacity) return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expect(held.items.len > 0);
+    try std.testing.expect(server.workloadAdmissionRefuses(conn));
+    try std.testing.expect(conn.workload_ticket == null);
+    // ...while mesh recovery still gets a unit from its reserve.
+    const mesh_ticket = try server.tryWorkloadTicket(.mesh_recovery, .slot, workloadPeerKey(7, "peer"));
+    try std.testing.expect(mesh_ticket != null);
+    server.releaseWorkloadTicketValue(mesh_ticket);
+
+    // A released admission unit admits the connection; registration returns it once.
+    server.releaseWorkloadTicketValue(held.pop().?);
+    try std.testing.expect(!server.workloadAdmissionRefuses(conn));
+    try std.testing.expect(conn.workload_ticket != null);
+    server.releaseWorkloadTicket(conn);
+    server.releaseWorkloadTicket(conn);
+    try std.testing.expect(conn.workload_ticket == null);
+
+    // Session recovery from one source is bounded: RESUME answers retryable
+    // TEMPORARILY_UNAVAILABLE instead of verifying while the source is saturated.
+    const source_key = Server.workloadConnPeerKey(conn);
+    var session_held: std.ArrayList(workload_quota_mod.Ticket) = .empty;
+    defer session_held.deinit(allocator);
+    defer for (session_held.items) |ticket| server.releaseWorkloadTicketValue(ticket);
+    while (server.tryWorkloadTicket(.session_recovery, .verify, source_key)) |ticket| {
+        try session_held.append(allocator, ticket.?);
+        if (session_held.items.len > quota.config.capacity) return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expect(session_held.items.len > 0);
+    var resume_line = try irc_line.parseLine("SESSION RESUME 0123456789abcdef0123456789abcdef");
+    conn.send_len = 0;
+    try server.handleSessionResume(id, conn, "quota-acct", &resume_line);
+    try expectContains(conn.send_buf[0..conn.send_len], "TEMPORARILY_UNAVAILABLE");
+    try std.testing.expect(conn.preserve_resume_credential_once);
+
+    for (session_held.items) |ticket| server.releaseWorkloadTicketValue(ticket);
+    session_held.clearRetainingCapacity();
+    conn.send_len = 0;
+    try server.handleSessionResume(id, conn, "quota-acct", &resume_line);
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], "session recovery is busy") == null);
+}
+
+test "threaded server: per-source throttle refuses before charging the shared admission quota (M12)" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .throttle_connects = 1,
+        .throttle_window_ms = 3_600_000,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const quota = server.rx().quota orelse return error.TestUnexpectedResult;
+
+    const first_id = try addTestLocalClient(&server, "FloodA", null);
+    const first = server.connFor(first_id).?;
+    first.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 9 } };
+    const second_id = try addTestLocalClient(&server, "FloodB", null);
+    const second = server.connFor(second_id).?;
+    second.peer_addr = .{ .ipv4 = .{ 203, 0, 113, 9 } };
+
+    // The first connect from the source is within its rate and takes one
+    // admission unit.
+    const before_first = quota.snapshot();
+    try std.testing.expect(!server.sourceThenWorkloadAdmissionRefuses(first));
+    try std.testing.expect(first.workload_ticket != null);
+    try std.testing.expectEqual(before_first.grants_total + 1, quota.snapshot().grants_total);
+
+    // The same source's excess connect is refused by its own throttle and
+    // never reaches the governor: no grant, no refusal, no GCRA debit.
+    const before = quota.snapshot();
+    try std.testing.expect(server.sourceThenWorkloadAdmissionRefuses(second));
+    try std.testing.expect(second.workload_ticket == null);
+    const after = quota.snapshot();
+    try std.testing.expectEqual(before.grants_total, after.grants_total);
+    try std.testing.expectEqual(before.refusals_total, after.refusals_total);
+
+    server.releaseThrottle(first);
+    server.releaseWorkloadTicket(first);
+}
+
 test "GAP-O1 merges reactor latency samples once into the metrics snapshot" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -114391,6 +119201,152 @@ test "SESSIONTOKEN live dispatch issues Unix expiry and survives durable cold re
     try std.testing.expect(bridge.lookup().verify(.{ .authcid = "alice", .token = token }, &account) == null);
 }
 
+test "SESSIONTOKEN session credential rotation past the churn budget is held off and keeps the current token" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    current_reactor = null;
+    defer current_reactor = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Clock = struct {
+        mono_ms: i64 = 10_000,
+        wall_ms: i64,
+        fn mono(ctx: *anyopaque) i64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.mono_ms;
+        }
+        fn wall(ctx: *anyopaque) i64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.wall_ms;
+        }
+        const vtable = reactor_mod.Reactor.VTable{ .nowMillis = mono, .wallMillis = wall };
+    };
+    var clock = Clock{ .wall_ms = platform.realtimeMillis() };
+    var store = try services_mod.OroStore.open(allocator, std.testing.io, tmp.dir, "sessiontoken-churn.wal");
+    defer store.deinit();
+    var services = services_mod.Services.init(&store, null);
+    var scratch: [1024]u8 = undefined;
+    _ = try services.registerAccount("alice", "session-token-churn-fixture", &scratch);
+    const server = try createTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+        .account_services = &services,
+        .reactor = .{ .ptr = &clock, .vtable = &Clock.vtable },
+    });
+    defer allocator.destroy(server);
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    const id = try server.rx().clients.alloc(ConnState.init(-1));
+    const conn = server.rx().clients.get(id).?;
+    conn.token = try tokenFromId(id);
+    conn.is_tls = true;
+    conn.session.loginAs("alice");
+    try server.processLiveLine(id, conn, "NICK ChurnUser");
+    try server.processLiveLine(id, conn, "USER churn 0 * :Churn User");
+
+    var current: [128]u8 = undefined;
+    var current_len: usize = 0;
+    const marker = " :SESSIONTOKEN alice ";
+    const max_rotations = session_credential_churn.default_params.max_rotations_per_window;
+    var i: u32 = 0;
+    while (i < max_rotations) : (i += 1) {
+        conn.send_len = 0;
+        conn.send_offset = 0;
+        try server.processLiveLine(id, conn, "SESSIONTOKEN");
+        const written = conn.send_buf[0..conn.send_len];
+        const start = (std.mem.indexOf(u8, written, marker) orelse return error.TestUnexpectedResult) + marker.len;
+        const end = std.mem.indexOfScalar(u8, written[start..], ' ') orelse return error.TestUnexpectedResult;
+        current_len = end;
+        @memcpy(current[0..end], written[start..][0..end]);
+    }
+    var bridge = @import("sasl_bridge.zig").ServicesSessionTokenLookup{ .services = &services };
+    var account: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("alice", bridge.lookup().verify(.{ .authcid = "alice", .token = current[0..current_len] }, &account) orelse return error.TestUnexpectedResult);
+
+    // One rotation past the budget is refused before the store changes.
+    const changes_before = store.changeCount();
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    try server.processLiveLine(id, conn, "SESSIONTOKEN");
+    try expectContains(conn.send_buf[0..conn.send_len], "FAIL SESSIONTOKEN RATE_LIMITED");
+    try std.testing.expect(std.mem.indexOf(u8, conn.send_buf[0..conn.send_len], marker) == null);
+    try std.testing.expectEqual(changes_before, store.changeCount());
+    try std.testing.expectEqualStrings("alice", bridge.lookup().verify(.{ .authcid = "alice", .token = current[0..current_len] }, &account) orelse return error.TestUnexpectedResult);
+    var stats = server.session_credential_churn.snapshot();
+    try std.testing.expectEqual(@as(u64, max_rotations), stats.rotations);
+    try std.testing.expectEqual(@as(u64, 0), stats.rotations_over_budget);
+    try std.testing.expectEqual(@as(u64, 1), stats.refused_over_budget);
+
+    // The next window admits a rotation again; metrics expose every counter.
+    clock.mono_ms += session_credential_churn.default_params.window_ms;
+    conn.send_len = 0;
+    conn.send_offset = 0;
+    try server.processLiveLine(id, conn, "SESSIONTOKEN");
+    try expectContains(conn.send_buf[0..conn.send_len], marker);
+    stats = server.session_credential_churn.snapshot();
+    try std.testing.expectEqual(@as(u64, max_rotations) + 1, stats.rotations);
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(allocator);
+    try server.writeSessionCredentialPrometheus(allocator, &metrics);
+    try expectContains(metrics.items, "onyx_session_credential_refused_over_budget_total 1\n");
+    try expectContains(metrics.items, "onyx_session_credential_rotations_over_budget_total 0\n");
+    try expectContains(metrics.items, "onyx_session_replica_tombstones 0\n");
+    try expectContains(metrics.items, "onyx_session_replica_worst_case_retained_bytes ");
+}
+
+test "SESSION TOKEN session credential churn counts one fresh publication and resume as reuse" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+
+    const account = "churn-account";
+    const target_id = try addTestLocalClient(&server, "ChurnTarget", account);
+    const target = server.connFor(target_id) orelse return error.TestUnexpectedResult;
+    const handle = server.sessions.resumeHandleForClient(account, monitorIdFromClient(target_id)) orelse
+        return error.TestUnexpectedResult;
+    const token_line = try irc_line.parseLine("SESSION TOKEN");
+    try server.handleSession(target_id, target, &token_line);
+    try expectContains(target.send_buf[0..target.send_len], "SESSION TOKEN ");
+    var stats = server.session_credential_churn.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.fresh_minted);
+    try std.testing.expectEqual(@as(u64, 0), stats.reused);
+
+    // Re-emitting the token this connection already holds is not churn.
+    target.send_len = 0;
+    try server.handleSession(target_id, target, &token_line);
+    try expectContains(target.send_buf[0..target.send_len], "SESSION TOKEN ");
+    stats = server.session_credential_churn.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.fresh_minted);
+
+    // A reconnecting attachment resumes with the same credential: reuse, and
+    // its following SESSION TOKEN re-emits the held token without a mint.
+    const claimant_id = try addTestLocalClient(&server, "ChurnClaimant", account);
+    const claimant = server.connFor(claimant_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(server.sessions.markDetached(account, monitorIdFromClient(target_id)));
+    const token_hex = std.fmt.bytesToHex(handle.token, .lower);
+    var command_buf: [128]u8 = undefined;
+    const resume_line = try irc_line.parseLine(try std.fmt.bufPrint(&command_buf, "SESSION RESUME {s}", .{&token_hex}));
+    try server.handleSessionResume(claimant_id, claimant, account, &resume_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "legacy session attached as a new attachment");
+    try std.testing.expectEqualSlices(u8, &handle.token, &claimant.session_credential_held);
+    stats = server.session_credential_churn.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.reused);
+    claimant.send_len = 0;
+    try server.handleSession(claimant_id, claimant, &token_line);
+    try expectContains(claimant.send_buf[0..claimant.send_len], "SESSION TOKEN ");
+    stats = server.session_credential_churn.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.fresh_minted);
+    try std.testing.expectEqual(@as(u64, 1), stats.reused);
+}
+
 test "threaded server: SESSIONTOKEN refuses non-TLS transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -118362,6 +123318,116 @@ test "atomic RESUME staged capsule adopts a rowless verified token" {
     try std.testing.expect(claimant.session_mesh_announce_pending);
     try std.testing.expect(claimant.session_mesh_announce_token_bound);
     try std.testing.expect(claimant.session_mesh_announce_requires_authority);
+}
+
+test "session attachment revoke: inbound migration restore of a fenced token fails closed while an unrelated fence does not block" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    server.pending_migrations = session_migrate.PendingMigrations.init(allocator);
+
+    const claimant_id = try addTestLocalClient(&server, "Before", "fence-acct");
+    const claimant = server.connFor(claimant_id).?;
+    const original = server.sessions.resumeHandleForClient("fence-acct", monitorIdFromClient(claimant_id)).?;
+    const fenced_token: session_migrate.Token = @splat(0xB7);
+    const other_token: session_migrate.Token = @splat(0xB8);
+    const encoded = try (migration_relay.Snapshot{
+        .nick = "AfterFence",
+        .umodes = "+i",
+        .channels = &.{},
+        .account = "fence-acct",
+    }).encode(allocator);
+    defer allocator.free(encoded);
+    const now: i64 = server.sessionAttachmentRevokeNow();
+    try server.pending_migrations.?.put(.{ .token = fenced_token, .account = "fence-acct", .snapshot = encoded }, now);
+
+    // A revoked attachment of the staged token fences every new attachment
+    // an inbound capsule could bind, on every restore entry point.
+    const state = server.sessionAttachmentRevokeNodeState().?;
+    const account_key = session_attachment_revoke.accountKey("fence-acct");
+    try state.denials.deny(fenced_token, @splat(0x5e), account_key, now + 60_000, now);
+    try std.testing.expect(!server.restoreStagedMigration(claimant_id, claimant, "fence-acct", fenced_token, .{ .adopt_verified = true }, null));
+    try std.testing.expect(!server.restoreEncodedMigrationSnapshot(claimant_id, claimant, "fence-acct", fenced_token, encoded, .join_existing));
+    try std.testing.expect(!server.restoreBootstrapLiveMigrationSnapshot(claimant_id, claimant, "fence-acct", fenced_token, encoded, .join_existing));
+    try std.testing.expect(!server.restoreBootstrapDetachedMigrationSnapshot(claimant_id, claimant, "fence-acct", fenced_token));
+    // The exact named attachment is refused; nothing was bound or renamed.
+    try std.testing.expectEqual(
+        LinuxServer.ExactAttachmentResumeOutcome.missing,
+        server.restoreExactAttachment(claimant_id, claimant, "fence-acct", fenced_token, .{ .raw = @splat(0x5e) }),
+    );
+    try std.testing.expect(!server.sessions.clientHasToken("fence-acct", monitorIdFromClient(claimant_id), fenced_token));
+    try std.testing.expectEqual(original.token, server.sessions.resumeHandleForClient("fence-acct", monitorIdFromClient(claimant_id)).?.token);
+    try std.testing.expectEqualStrings("Before", claimant.session.displayName());
+    try std.testing.expect(server.pending_migrations.?.has(fenced_token));
+
+    // A fence on a different token leaves this staged restore admissible.
+    try server.pending_migrations.?.put(.{ .token = other_token, .account = "fence-acct", .snapshot = encoded }, now);
+    try std.testing.expect(server.restoreStagedMigration(claimant_id, claimant, "fence-acct", other_token, .{ .adopt_verified = true }, null));
+    try std.testing.expect(server.sessions.clientHasToken("fence-acct", monitorIdFromClient(claimant_id), other_token));
+    try std.testing.expectEqualStrings("AfterFence", claimant.session.displayName());
+}
+
+test "session attachment revoke: a live fence never blocks UPGRADE and Helix adopt keeps every row for the carried enforce sweep" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .crypto_io = std.testing.io,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const blocker = struct {
+        fn get(s: *Server) ?Server.UpgradeContinuityBlocker {
+            s.world.lockWrite();
+            defer s.world.unlockWrite();
+            return s.upgradeContinuityBlockerLocked();
+        }
+    }.get;
+    try std.testing.expect(blocker(&server) == null);
+
+    const now: i64 = server.sessionAttachmentRevokeNow();
+    const fenced_token: sessions_mod.Token = @splat(0xC1);
+    const other_token: sessions_mod.Token = @splat(0xC2);
+    const fenced_aid: [16]u8 = @splat(0xC3);
+    const sibling_aid: [16]u8 = @splat(0xC4);
+    const state = server.sessionAttachmentRevokeNodeState().?;
+    // Allocating the empty state alone never blocks an upgrade.
+    try std.testing.expect(blocker(&server) == null);
+    try state.denials.deny(fenced_token, fenced_aid, session_attachment_revoke.accountKey("helix-acct"), now + 60_000, now);
+    // Helix carries the fence (SARS), so a live fence is not a continuity
+    // blocker and UPGRADE PLAN lists nothing for it.
+    try std.testing.expect(blocker(&server) == null);
+
+    // Adopt never refuses a fenced row: refusing would fail the whole account
+    // and drop its unfenced live siblings. The carried fence stays armed, so
+    // the enforce sweep closes exactly that attachment and every rejoin of
+    // the fenced token is still refused.
+    try std.testing.expect(server.restoreInheritedSessionAttachment("helix-acct", 901, fenced_token, fenced_aid, 10) != null);
+    try std.testing.expect(server.restoreInheritedSessionAttachment("helix-acct", 903, fenced_token, sibling_aid, 10) != null);
+    try std.testing.expect(server.restoreInheritedSessionAttachment("helix-acct", 904, other_token, null, 10) != null);
+    try std.testing.expect(server.sessions.clientHasToken("helix-acct", 901, fenced_token));
+    try std.testing.expect(server.sessions.clientHasToken("helix-acct", 903, fenced_token));
+    try std.testing.expect(server.sessions.clientHasToken("helix-acct", 904, other_token));
+    try std.testing.expect(server.sessionAttachmentFenced(fenced_token, fenced_aid));
+    try std.testing.expect(server.sessionAttachmentFenced(fenced_token, null));
+    try std.testing.expect(!server.sessionAttachmentFenced(fenced_token, sibling_aid));
+    try std.testing.expect(!server.sessionAttachmentFenced(other_token, null));
+
+    // Clearing the fence leaves the continuity inventory unchanged.
+    state.denials = .{};
+    try std.testing.expect(blocker(&server) == null);
+    try std.testing.expect(!server.sessionAttachmentFenced(fenced_token, null));
 }
 
 test "atomic legacy SRM1 staged capsule joins without consuming an existing ghost" {
@@ -128820,6 +133886,502 @@ test "exploit: SHUN list drops a CRLF-smuggled stored reason (oper handler, end-
     try expectContains(out, "SHUN: end of list");
 }
 
+/// The change id at the end of the newest complete ` change=<id>` line.
+fn awaitChangeId(client: *LiveClient) !u64 {
+    try recvUntil(client, " change=", 300);
+    const marker = " change=";
+    while (true) {
+        const text = client.written();
+        const start = (std.mem.lastIndexOf(u8, text, marker) orelse return error.TestUnexpectedResult) + marker.len;
+        if (std.mem.indexOfPos(u8, text, start, "\r\n")) |end| return std.fmt.parseInt(u64, text[start..end], 10);
+        try client.readAvailable();
+    }
+}
+
+test "threaded server: WARD PREVIEW samples live subjects only for oper_spy, audits it, and stores nothing" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const clients = try std.testing.allocator.alloc(LiveClient, 3);
+    defer std.testing.allocator.free(clients);
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_v = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_v);
+    clients[0] = .{ .fd = fd_a };
+    clients[1] = .{ .fd = fd_b };
+    clients[2] = .{ .fd = fd_v };
+    const a = &clients[0];
+    const b = &clients[1];
+    const v = &clients[2];
+
+    try saslPlainPrelude(fd_a, "admin", "onyx");
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :A\r\n");
+    try recvUntil(a, " 381 A ", 300);
+    try saslPlainPrelude(fd_b, "oper", "onyx");
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(b, " 381 B ", 300);
+    try writeAllFd(fd_v, "NICK V\r\nUSER v 0 * :previewme\r\n");
+    try recvUntil(v, " 001 V ", 300);
+
+    // client_moderate without oper_spy: synthetic-only, no live row or count.
+    b.reset();
+    try writeAllFd(fd_b, "WARD PREVIEW realname previewme node expel 600\r\n");
+    try recvUntil(b, "nothing was stored", 300);
+    try expectContains(b.written(), "live sampling requires the 'oper_spy' operator privilege");
+    try expectContains(b.written(), "matched 0/0 subject(s)");
+    try std.testing.expect(std.mem.indexOf(u8, b.written(), "live V") == null);
+
+    // oper_spy: every registered local client is sampled with real facets.
+    a.reset();
+    try writeAllFd(fd_a, "WARD PREVIEW realname previewme node quarantine 600 -- realname=previewme realname=someone\r\n");
+    try recvUntil(a, "nothing was stored", 300);
+    try expectContains(a.written(), "WARD PREVIEW realname previewme node/quarantine expires_ms=");
+    try expectContains(a.written(), "WARD PREVIEW: synthetic realname=previewme match=yes effect=quarantine");
+    try expectContains(a.written(), "WARD PREVIEW: synthetic realname=someone match=no effect=none");
+    try expectContains(a.written(), "WARD PREVIEW: live V match=yes effect=quarantine");
+    try expectContains(a.written(), "WARD PREVIEW: live A match=no effect=none");
+    try expectContains(a.written(), "WARD PREVIEW: live B match=no effect=none");
+    try expectContains(a.written(), "matched 2/5 subject(s); close=0 quarantine=2");
+
+    // Nothing was stored or enforced: no ward, the subject is untouched.
+    a.reset();
+    try writeAllFd(fd_a, "WARD TEST realname previewme\r\n");
+    try recvUntil(a, "WARD TEST: no match", 300);
+    try writeAllFd(fd_v, "PING :alive\r\n");
+    try recvUntil(v, "PONG", 300);
+    try std.testing.expect(std.mem.indexOf(u8, v.written(), "Banned") == null);
+
+    // Only the live read is audited, as the record of who looked.
+    a.reset();
+    try writeAllFd(fd_a, "AUDIT\r\n");
+    try recvUntil(a, "End of audit", 300);
+    try expectContains(a.written(), " A other previewme ");
+    try expectContains(a.written(), ":WARD PREVIEW realname live");
+    try std.testing.expect(std.mem.indexOf(u8, a.written(), " B other ") == null);
+}
+
+test "threaded server: AUDIT UNDO restores the exact ward, refuses superseded and repeated undo, and keeps history" {
+    var server = Server.init(std.testing.allocator, multiOperTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const clients = try std.testing.allocator.alloc(LiveClient, 3);
+    defer std.testing.allocator.free(clients);
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    const fd_b = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_b);
+    const fd_v = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_v);
+    clients[0] = .{ .fd = fd_a };
+    clients[1] = .{ .fd = fd_b };
+    clients[2] = .{ .fd = fd_v };
+    const a = &clients[0];
+    const b = &clients[1];
+    const v = &clients[2];
+
+    try saslPlainPrelude(fd_a, "admin", "onyx");
+    try writeAllFd(fd_a, "NICK A\r\nUSER a 0 * :A\r\n");
+    try recvUntil(a, " 381 A ", 300);
+    try saslPlainPrelude(fd_b, "oper", "onyx");
+    try writeAllFd(fd_b, "NICK B\r\nUSER b 0 * :B\r\n");
+    try recvUntil(b, " 381 B ", 300);
+    try writeAllFd(fd_v, "NICK V\r\nUSER v 0 * :V\r\n");
+    try recvUntil(v, " 001 V ", 300);
+
+    a.reset();
+    try writeAllFd(fd_a, "WARD ADD realname undome node quarantine 600 :first\r\n");
+    try recvUntil(a, "WARD ADD realname undome node/quarantine", 300);
+    const added = try awaitChangeId(a);
+    a.reset();
+    try writeAllFd(fd_a, "WARD DEL realname undome\r\n");
+    try recvUntil(a, "WARD DEL realname undome: removed", 300);
+    const deleted = try awaitChangeId(a);
+    try std.testing.expect(deleted > added);
+
+    var line: [96]u8 = undefined;
+    // The add is superseded by the still-effective delete.
+    b.reset();
+    try writeAllFd(fd_b, try std.fmt.bufPrint(&line, "AUDIT UNDO {d}\r\n", .{added}));
+    try recvUntil(b, "refused (conflict_superseded", 300);
+
+    // A different oper with only client_moderate reverses the delete.
+    b.reset();
+    try writeAllFd(fd_b, try std.fmt.bufPrint(&line, "AUDIT UNDO {d}\r\n", .{deleted}));
+    try recvUntil(b, "realname undome: restored", 300);
+    const restored = try awaitChangeId(b);
+    try std.testing.expect(restored > deleted);
+    a.reset();
+    try writeAllFd(fd_a, "WARD LIST realname\r\n");
+    try recvUntil(a, "WARD: end of list", 300);
+    try expectContains(a.written(), "WARD realname undome node/quarantine by A :first");
+    a.reset();
+    try writeAllFd(fd_a, "WARD TEST realname undome\r\n");
+    try recvUntil(a, "WARD TEST: matched realname undome (quarantine) :first", 300);
+
+    // An undo is applied once.
+    b.reset();
+    try writeAllFd(fd_b, try std.fmt.bufPrint(&line, "AUDIT UNDO {d}\r\n", .{deleted}));
+    try recvUntil(b, "refused (already_undone", 300);
+
+    // Redo is one more undo record.
+    a.reset();
+    try writeAllFd(fd_a, try std.fmt.bufPrint(&line, "AUDIT UNDO {d}\r\n", .{restored}));
+    try recvUntil(a, "realname undome: removed", 300);
+    const redone = try awaitChangeId(a);
+    a.reset();
+    try writeAllFd(fd_a, "WARD TEST realname undome\r\n");
+    try recvUntil(a, "WARD TEST: no match", 300);
+
+    // A non-oper cannot reach the command.
+    v.reset();
+    try writeAllFd(fd_v, try std.fmt.bufPrint(&line, "AUDIT UNDO {d}\r\n", .{redone}));
+    try recvUntil(v, " 481 V ", 300);
+
+    // History is appended, never deleted.
+    a.reset();
+    try writeAllFd(fd_a, "AUDIT 50\r\n");
+    try recvUntil(a, "End of audit", 300);
+    try expectContains(a.written(), " A ward_add undome ");
+    try expectContains(a.written(), " A ward_del undome ");
+    try expectContains(a.written(), " B undo undome ");
+    try expectContains(a.written(), " A undo undome ");
+    var reason: [64]u8 = undefined;
+    try expectContains(a.written(), try std.fmt.bufPrint(&reason, ":undo change={d} audit_seq=", .{deleted}));
+    a.reset();
+    try writeAllFd(fd_a, "AUDIT CHANGES\r\n");
+    try recvUntil(a, "CHANGE end of list (4)", 300);
+    var row: [128]u8 = undefined;
+    try expectContains(a.written(), try std.fmt.bufPrint(&row, "CHANGE {d} ward_del realname undome present->absent by A", .{deleted}));
+    try expectContains(a.written(), try std.fmt.bufPrint(&row, "undoes=- undone_by={d}", .{restored}));
+    try expectContains(a.written(), try std.fmt.bufPrint(&row, "CHANGE {d} undo realname undome present->absent by A", .{redone}));
+}
+
+test "AUDIT UNDO refuses a ward a peer rewrote and restores a replaced shun with its reason and expiry" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const id = try addTestLocalClient(server, "operator", null);
+    const conn = server.connFor(id).?;
+    try reconcileTestOper(&conn.session, oper_mod.OperPrivileges.initMany(&.{.client_moderate}), "ircop", "oper");
+    var cap_buf: [default_reply_bytes]u8 = undefined;
+    var capture = ReplyCapture{ .buf = &cap_buf };
+    conn.reply_capture = &capture;
+    defer conn.reply_capture = null;
+    var line: [64]u8 = undefined;
+
+    var undo_none = try irc_line.parseLine("AUDIT UNDO 1");
+    try server.handleAudit(conn, &undo_none);
+    try expectContains(capture.captured(), "AUDIT UNDO 1: refused (unknown_or_evicted");
+
+    var ward_add = try irc_line.parseLine("WARD ADD host peer.example node expel 0 :local");
+    try server.handleWard(conn, &ward_add);
+    const ledger = server.moderation_ledger orelse return error.TestUnexpectedResult;
+    const ward_change = ledger.at(ledger.len() - 1).?.change_id;
+    // A peer's mesh write on the same fact makes the local change unsafe to undo.
+    try std.testing.expect(server.applyRemoteWard(.{ .op = .add, .match = .host, .pattern = "peer.example", .action = .refuse, .reason = "peer", .set_by = "PeerOp", .created_ms = 1, .expires_ms = 0 }));
+    capture.len = 0;
+    var undo_ward = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{ward_change}));
+    try server.handleAudit(conn, &undo_ward);
+    try expectContains(capture.captured(), "refused (conflict_state_drift");
+    const kept = server.warden.find(.host, "peer.example") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("peer", kept.reason);
+    try std.testing.expectEqual(warden.Action.refuse, kept.action);
+
+    var shun_first = try irc_line.parseLine("SHUN quiet!*@x.example 600 :first");
+    try server.handleShun(conn, &shun_first, true);
+    const first_change = ledger.at(ledger.len() - 1).?.change_id;
+    var shun_second = try irc_line.parseLine("SHUN quiet!*@x.example :second");
+    try server.handleShun(conn, &shun_second, true);
+    const second_change = ledger.at(ledger.len() - 1).?.change_id;
+    try std.testing.expect(second_change > first_change);
+
+    var undo_second = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{second_change}));
+    try server.handleAudit(conn, &undo_second);
+    try std.testing.expectEqual(@as(usize, 1), server.shuns.count());
+    const restored = server.shuns.shuns.items[0];
+    try std.testing.expectEqualStrings("first", restored.reason);
+    try std.testing.expect(restored.expires_ms != 0);
+    // The undo is now the fact's newest effective change, so the first shun
+    // cannot be reversed past it.
+    capture.len = 0;
+    var undo_first = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{first_change}));
+    try server.handleAudit(conn, &undo_first);
+    try expectContains(capture.captured(), "refused (conflict_superseded");
+    try std.testing.expectEqual(@as(usize, 1), server.shuns.count());
+
+    var undo_records: usize = 0;
+    var undo_audits: usize = 0;
+    var i: usize = 0;
+    while (i < ledger.len()) : (i += 1) {
+        if (ledger.at(i).?.undoes != null) undo_records += 1;
+    }
+    i = 0;
+    while (i < server.oper_audit.len()) : (i += 1) {
+        if (server.oper_audit.at(i).?.action == .undo) undo_audits += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), undo_records);
+    try std.testing.expectEqual(@as(usize, 1), undo_audits);
+    try std.testing.expectEqual(@as(usize, 4), ledger.len());
+}
+
+test "AUDIT UNDO of a mesh ward waits for a second operator under the two-person rule" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const privs = oper_mod.OperPrivileges.initMany(&.{.client_moderate});
+    const op1 = server.connFor(try addTestLocalClient(server, "op1", "alpha")).?;
+    try reconcileTestOper(&op1.session, privs, "ircop", "oper");
+    const op2 = server.connFor(try addTestLocalClient(server, "op2", "beta")).?;
+    try reconcileTestOper(&op2.session, privs, "ircop", "oper");
+
+    try server.addWardLive(op1, .host, "mesh.example", .mesh, .expel, 0, "raid", .ward_add);
+    try server.deleteWardLive(op1, .host, "mesh.example");
+    const ledger = server.moderation_ledger orelse return error.TestUnexpectedResult;
+    const deleted = ledger.at(ledger.len() - 1).?.change_id;
+    server.config.two_person_rule = true;
+
+    var line: [64]u8 = undefined;
+    var undo = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{deleted}));
+    try server.handleAudit(op1, &undo);
+    try std.testing.expect(server.warden.find(.host, "mesh.example") == null);
+    try std.testing.expect(server.two_person_pending != null);
+    try std.testing.expectEqual(@as(?u64, null), ledger.find(deleted).?.undone_by);
+
+    try server.handleAudit(op2, &undo);
+    const restored = server.warden.find(.host, "mesh.example") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(warden.Scope.mesh, restored.scope);
+    try std.testing.expectEqualStrings("raid", restored.reason);
+    try std.testing.expect(ledger.find(deleted).?.undone_by != null);
+    try std.testing.expect(server.two_person_pending == null);
+}
+
+test "AUDIT UNDO reverses channel +b/+e/+I/+Z changes with their prior setter and refuses superseded, drifted, peer-changed and re-created lists" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const chanop_id = try addTestLocalClient(server, "chanop", null);
+    const chanop = server.connFor(chanop_id).?;
+    const oper_id = try addTestLocalClient(server, "operator", null);
+    const oper = server.connFor(oper_id).?;
+    try reconcileTestOper(&oper.session, oper_mod.OperPrivileges.initMany(&.{ .client_moderate, .audit_read }), "ircop", "oper");
+    var cap_buf: [4096]u8 = undefined;
+    var capture = ReplyCapture{ .buf = &cap_buf };
+    oper.reply_capture = &capture;
+    defer oper.reply_capture = null;
+    var line: [96]u8 = undefined;
+
+    _ = try server.world.join("#undo", worldIdFromClient(chanop_id));
+    const mask = "*!*@bad.example";
+
+    // +b then -b by the chanop: two channel-list records, ids in the list space.
+    var ban_add = try irc_line.parseLine("MODE #undo +b *!*@bad.example");
+    try server.handleMode(chanop_id, chanop, &ban_add);
+    const set_entry = (server.world.bansOf("#undo") orelse return error.TestUnexpectedResult)[0];
+    const orig_setter = try std.testing.allocator.dupe(u8, set_entry.setter);
+    defer std.testing.allocator.free(orig_setter);
+    const orig_set_at = set_entry.set_at;
+    const list_ledger = server.moderation_list_ledger orelse return error.TestUnexpectedResult;
+    try std.testing.expect(server.moderation_ledger == null);
+    const added = list_ledger.at(list_ledger.len() - 1).?;
+    const add_id = added.change_id;
+    try std.testing.expect(moderation_undo.isChannelListId(add_id));
+    try std.testing.expectEqual(svc_operaudit.Action.mode, added.action);
+    try std.testing.expect(!added.before.present and added.after.present);
+    // The +b is paired with the "ban change" audit entry it already writes.
+    try std.testing.expect(added.audit_seq != 0);
+    var ban_del = try irc_line.parseLine("MODE #undo -b *!*@bad.example");
+    try server.handleMode(chanop_id, chanop, &ban_del);
+    const del_id = list_ledger.at(list_ledger.len() - 1).?.change_id;
+    try std.testing.expect(del_id > add_id);
+    try std.testing.expectEqual(@as(usize, 0), server.world.bansOf("#undo").?.len);
+
+    var undo_add = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{add_id}));
+    try server.handleAudit(oper, &undo_add);
+    try expectContains(capture.captured(), "refused (conflict_superseded");
+
+    // Undoing the removal restores the exact entry: original setter and time.
+    chanop.send_len = 0;
+    var undo_del = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{del_id}));
+    try server.handleAudit(oper, &undo_del);
+    const restored = server.world.bansOf("#undo") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), restored.len);
+    try std.testing.expectEqualStrings(mask, restored[0].mask);
+    try std.testing.expectEqualStrings(orig_setter, restored[0].setter);
+    try std.testing.expectEqual(orig_set_at, restored[0].set_at);
+    // Local members see the change as a MODE line from the undoing operator.
+    try expectContains(chanop.send_buf[0..chanop.send_len], " MODE #undo +b *!*@bad.example");
+    try std.testing.expect(list_ledger.find(del_id).?.undone_by != null);
+
+    capture.len = 0;
+    try server.handleAudit(oper, &undo_del);
+    try expectContains(capture.captured(), "refused (already_undone");
+    try std.testing.expectEqual(@as(usize, 1), server.world.bansOf("#undo").?.len);
+
+    // +e changed afterwards by a path the ledger does not record: drift.
+    var ex_add = try irc_line.parseLine("MODE #undo +e *!*@friend.example");
+    try server.handleMode(chanop_id, chanop, &ex_add);
+    const ex_id = list_ledger.at(list_ledger.len() - 1).?.change_id;
+    try std.testing.expect(try server.world.removeExempt("#undo", "*!*@friend.example"));
+    capture.len = 0;
+    var undo_ex = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{ex_id}));
+    try server.handleAudit(oper, &undo_ex);
+    try expectContains(capture.captured(), "refused (conflict_state_drift");
+
+    // +I that a peer rewrote over the mesh: refused even though the peer put
+    // back identical-looking content.
+    var inv_add = try irc_line.parseLine("MODE #undo +I *!*@guest.example");
+    try server.handleMode(chanop_id, chanop, &inv_add);
+    const inv_id = list_ledger.at(list_ledger.len() - 1).?.change_id;
+    const inv_entry = server.world.invexOf("#undo").?[0];
+    const inv_setter = try std.testing.allocator.dupe(u8, inv_entry.setter);
+    defer std.testing.allocator.free(inv_setter);
+    const Delta = struct { present: bool, kind: channel_list_event.ListKind, channel: []const u8, mask: []const u8, setter: []const u8, set_at: i64 };
+    try std.testing.expect(server.applyRemoteChannelList(Delta{ .present = false, .kind = .invex, .channel = "#undo", .mask = "*!*@guest.example", .setter = "PeerOp", .set_at = 1 }));
+    try std.testing.expect(server.applyRemoteChannelList(Delta{ .present = true, .kind = .invex, .channel = "#undo", .mask = "*!*@guest.example", .setter = inv_setter, .set_at = inv_entry.set_at }));
+    // An unchanged re-burst marks nothing new and changes nothing.
+    try std.testing.expect(!server.applyRemoteChannelList(Delta{ .present = true, .kind = .invex, .channel = "#undo", .mask = "*!*@guest.example", .setter = inv_setter, .set_at = 1 }));
+    try std.testing.expect(list_ledger.find(inv_id).?.externally_changed);
+    capture.len = 0;
+    var undo_inv = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{inv_id}));
+    try server.handleAudit(oper, &undo_inv);
+    try expectContains(capture.captured(), "refused (conflict_state_drift");
+    try std.testing.expectEqual(@as(usize, 1), server.world.invexOf("#undo").?.len);
+
+    // +Z, then the channel is destroyed and re-created under the same name:
+    // the old change cannot be replayed into the new channel.
+    var quiet_add = try irc_line.parseLine("MODE #undo +Z *!*@loud.example");
+    try server.handleMode(chanop_id, chanop, &quiet_add);
+    const quiet_id = list_ledger.at(list_ledger.len() - 1).?.change_id;
+    try std.testing.expectEqual(@as(usize, 1), server.world.mutesOf("#undo").?.len);
+    try server.world.part("#undo", worldIdFromClient(chanop_id));
+    try std.testing.expect(!server.world.channelExists("#undo"));
+    _ = try server.world.join("#undo", worldIdFromClient(chanop_id));
+    capture.len = 0;
+    var undo_quiet = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{quiet_id}));
+    try server.handleAudit(oper, &undo_quiet);
+    try expectContains(capture.captured(), "refused (conflict_state_drift");
+    try std.testing.expectEqual(@as(usize, 0), server.world.bansOf("#undo").?.len);
+    try std.testing.expectEqual(@as(usize, 0), server.world.mutesOf("#undo").?.len);
+
+    // History: every change is listed, the undo links its original, and the
+    // .undo audit entry names it. Nothing was deleted.
+    capture.len = 0;
+    var changes = try irc_line.parseLine("AUDIT CHANGES 50");
+    try server.handleAudit(oper, &changes);
+    var row: [160]u8 = undefined;
+    try expectContains(capture.captured(), try std.fmt.bufPrint(&row, "CHANGE {d} mode +b #undo *!*@bad.example present->absent by chanop", .{del_id}));
+    try expectContains(capture.captured(), "+I #undo *!*@guest.example absent->present by chanop");
+    try expectContains(capture.captured(), "(peer-changed)");
+    try expectContains(capture.captured(), "CHANGE end of list (6)");
+    var undo_audits: usize = 0;
+    var i: usize = 0;
+    while (i < server.oper_audit.len()) : (i += 1) {
+        const entry = server.oper_audit.at(i).?;
+        if (entry.action != .undo) continue;
+        undo_audits += 1;
+        var reason: [64]u8 = undefined;
+        try std.testing.expect(std.mem.startsWith(u8, entry.reason, try std.fmt.bufPrint(&reason, "undo change={d} ", .{del_id})));
+    }
+    try std.testing.expectEqual(@as(usize, 1), undo_audits);
+    try std.testing.expectEqual(@as(usize, 6), list_ledger.len());
+}
+
+test "AUDIT UNDO answers AKILL and GLINE as explicitly non-reversible and keeps channel-list undo operator-only" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const server = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(server);
+    server.initInPlace(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const oper = server.connFor(try addTestLocalClient(server, "operator", null)).?;
+    try reconcileTestOper(&oper.session, oper_mod.OperPrivileges.initMany(&.{.client_moderate}), "ircop", "oper");
+    var cap_buf: [default_reply_bytes]u8 = undefined;
+    var capture = ReplyCapture{ .buf = &cap_buf };
+    oper.reply_capture = &capture;
+    defer oper.reply_capture = null;
+
+    var akill = try irc_line.parseLine("AUDIT UNDO akill");
+    try server.handleAudit(oper, &akill);
+    try expectContains(capture.captured(), "AUDIT UNDO: akill is not reversible: no AKILL/GLINE store exists");
+    try expectContains(capture.captured(), "mesh-scope WARDs");
+    capture.len = 0;
+    var gline = try irc_line.parseLine("AUDIT UNDO GLINE");
+    try server.handleAudit(oper, &gline);
+    try expectContains(capture.captured(), "AUDIT UNDO: gline is not reversible");
+    capture.len = 0;
+    var kill = try irc_line.parseLine("AUDIT UNDO kill");
+    try server.handleAudit(oper, &kill);
+    try expectContains(capture.captured(), "AUDIT UNDO: kill is not reversible");
+    // A reversible label is not an id.
+    capture.len = 0;
+    var label = try irc_line.parseLine("AUDIT UNDO ward_del");
+    try server.handleAudit(oper, &label);
+    try expectContains(capture.captured(), "Usage: AUDIT UNDO <change-id>");
+    // A channel-list id before any list change resolves to unknown, not to
+    // the ward ledger.
+    capture.len = 0;
+    var line: [96]u8 = undefined;
+    var list_id = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{moderation_undo.channel_list_id_base + 1}));
+    try server.handleAudit(oper, &list_id);
+    try expectContains(capture.captured(), "refused (unknown_or_evicted");
+    try std.testing.expect(server.moderation_ledger == null and server.moderation_list_ledger == null);
+
+    // A chanop without client_moderate cannot undo its own channel's changes.
+    const chanop_id = try addTestLocalClient(server, "chanop", null);
+    const chanop = server.connFor(chanop_id).?;
+    _ = try server.world.join("#own", worldIdFromClient(chanop_id));
+    var ban = try irc_line.parseLine("MODE #own +b *!*@x.example");
+    try server.handleMode(chanop_id, chanop, &ban);
+    const ledger = server.moderation_list_ledger orelse return error.TestUnexpectedResult;
+    const id = ledger.at(ledger.len() - 1).?.change_id;
+    chanop.send_len = 0;
+    var undo = try irc_line.parseLine(try std.fmt.bufPrint(&line, "AUDIT UNDO {d}", .{id}));
+    try server.handleAudit(chanop, &undo);
+    try expectContains(chanop.send_buf[0..chanop.send_len], " 481 ");
+    try std.testing.expectEqual(@as(usize, 1), server.world.bansOf("#own").?.len);
+    try std.testing.expectEqual(@as(?u64, null), ledger.find(id).?.undone_by);
+}
+
 // --- Exploit corpus (Part A / §1B, CWE-93): the fantasy-bot reply sink. Unlike
 // the per-conn reply builders (guarded by emitReplyLine), fantasyReply delivers
 // via `broadcastChannel` + mesh relay and reflects EXTERNAL-FEED content
@@ -132849,6 +138411,93 @@ test "threaded server: oper DEBUG dumps the flight recorder" {
     try std.testing.expectEqual(@as(u64, 1), server.diagnostics.count(.registered));
     var metrics: [4096]u8 = undefined;
     try expectContains(try server.diagnostics.renderMetrics(&metrics), "onyx_connection_diagnostics_total{event=\"registered\"} 1");
+}
+
+test "threaded server: oper DEBUG BUNDLE streams one redacted, verifiable diagnostic bundle" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const diagnostic_bundle = @import("diagnostic_bundle.zig");
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, operTestConfig(0)) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+    const fd_u = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_u);
+    var u = LiveClient{ .fd = fd_u };
+    try writeAllFd(fd_u, "NICK Bundle\r\nUSER bundle 0 * :Bundle\r\n");
+    try recvUntil(&u, " 001 Bundle ", 200);
+    u.reset();
+    try writeAllFd(fd_u, "DEBUG BUNDLE\r\n");
+    try recvUntil(&u, " 481 Bundle ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, u.written(), "DEBUG BUNDLE 1/") == null);
+
+    const fd_a = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_a);
+    var a = LiveClient{ .fd = fd_a };
+    try saslAdminPrelude(fd_a);
+    try writeAllFd(fd_a, "NICK Zqbundlenick\r\nUSER alice 0 * :Alice\r\n");
+    try recvUntil(&a, " 381 Zqbundlenick ", 200);
+    a.reset();
+    try writeAllFd(fd_a, "DEBUG BUNDLE\r\n");
+
+    // The stream can exceed one LiveClient buffer: consume whole lines as they arrive.
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(allocator);
+    const deadline = platform.monotonicMillis() + 20_000;
+    while (std.mem.indexOf(u8, stream.items, "End of DEBUG bundle parts=") == null or
+        !std.mem.endsWith(u8, stream.items, "\r\n"))
+    {
+        if (platform.monotonicMillis() >= deadline) return error.TestTimeout;
+        var fds = [_]posix.pollfd{.{ .fd = fd_a, .events = posix.POLL.IN, .revents = 0 }};
+        if ((posix.poll(&fds, 50) catch return error.Unexpected) == 0) continue;
+        var chunk: [4096]u8 = undefined;
+        const n = try readFd(fd_a, &chunk);
+        if (n == 0) return error.ConnectionReset;
+        try stream.appendSlice(allocator, chunk[0..n]);
+    }
+
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(allocator);
+    var parts: usize = 0;
+    var trailer: ?[]const u8 = null;
+    var lines = std.mem.splitSequence(u8, stream.items, "\r\n");
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "End of DEBUG bundle parts=")) |at| {
+            trailer = line[at..];
+            continue;
+        }
+        const at = std.mem.indexOf(u8, line, " :" ++ diagnostic_bundle.part_prefix) orelse continue;
+        const body = line[at + 2 + diagnostic_bundle.part_prefix.len ..];
+        const space = std.mem.indexOfScalar(u8, body, ' ') orelse return error.TestUnexpectedResult;
+        parts += 1;
+        var index_buf: [24]u8 = undefined;
+        try std.testing.expect(std.mem.startsWith(u8, body, try std.fmt.bufPrint(&index_buf, "{d}/", .{parts})));
+        try joined.appendSlice(allocator, body[space + 1 ..]);
+    }
+    try std.testing.expect(parts != 0);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(joined.items, &digest, .{});
+    var expect_buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&expect_buf, "End of DEBUG bundle parts={d} bytes={d} sha256={x}", .{ parts, joined.items.len, &digest }),
+        trailer.?,
+    );
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, joined.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(diagnostic_bundle.kind, parsed.value.object.get("kind").?.string);
+    try std.testing.expect(parsed.value.object.get("counters").?.object.get("connection_events") != null);
+    // Neither the client nick nor the peer address leaks.
+    try std.testing.expect(std.ascii.findIgnoreCase(joined.items, "zqbundlenick") == null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "127.0.0.1") == null);
 }
 
 test "threaded server: USERIP is oper-only and reports real peer IP" {
@@ -141004,6 +146653,119 @@ test "threaded server: live S2S listener completes a peer handshake" {
     } else return error.SkipZigTest;
 }
 
+/// Linux-only test connect from an explicit loopback source address.
+fn connectLoopbackFromForTest(source: []const u8, port: u16) ServerError!linux.fd_t {
+    if (comptime builtin.os.tag != .linux) return error.Unsupported;
+    const fd = try socketTcp();
+    errdefer closeFd(fd);
+    var src = try sockaddrIn(source, 0);
+    if (posix.errno(linux.bind(fd, @ptrCast(&src), @sizeOf(posix.sockaddr.in))) != .SUCCESS) return error.SocketUnavailable;
+    var addr = try sockaddrIn("127.0.0.1", port);
+    return switch (posix.errno(linux.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)))) {
+        .SUCCESS => fd,
+        .CONNREFUSED => error.ConnectionRefused,
+        else => error.Unexpected,
+    };
+}
+
+/// Wait up to `budget_ms` for the server to close `fd` (EOF or reset).
+fn awaitPeerCloseForTest(fd: linux.fd_t, budget_ms: i64) !bool {
+    var rx: [256]u8 = undefined;
+    var waited: i64 = 0;
+    while (waited < budget_ms) : (waited += 25) {
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&fds, 25) catch return error.Unexpected;
+        if (ready == 0) continue;
+        if ((fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) return true;
+        const n = readFd(fd, &rx) catch return true;
+        if (n == 0) return true;
+    }
+    return false;
+}
+
+test "threaded server: idle pre-AKE S2S sockets cannot starve other peers' inbound handshakes (M12)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // `s2s_port = 0` disables the S2S listener; reserve a real loopback port.
+    const s2s_ports = reserveTwoLoopbackPorts() catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    var server = Server.init(std.testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .s2s_port = s2s_ports[0],
+        .s2s_handshake_timeout_ms = 1_500,
+        .workload_quota = .{ .max_recovery_inflight_per_peer = 2 },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const s2s_port = server.s2sBoundPort() catch return error.SkipZigTest;
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        server.requestStop(&run);
+        thr.join();
+    }
+
+    // One source opens idle TCP connections and never sends M1. It holds
+    // every per-peer unit for its own address...
+    const idle1 = connectLoopback(s2s_port) catch return error.SkipZigTest;
+    defer closeFd(idle1);
+    const idle2 = connectLoopback(s2s_port) catch return error.SkipZigTest;
+    defer closeFd(idle2);
+    try std.testing.expect(!try awaitPeerCloseForTest(idle1, 100));
+    try std.testing.expect(!try awaitPeerCloseForTest(idle2, 100));
+    const refused = connectLoopback(s2s_port) catch return error.SkipZigTest;
+    defer closeFd(refused);
+    try std.testing.expect(try awaitPeerCloseForTest(refused, 1_000));
+
+    // ...but a real peer from another source still completes its handshake.
+    const fd = connectLoopbackFromForTest("127.0.0.2", s2s_port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    const alloc = std.testing.allocator;
+    const peer = try alloc.create(s2s_link.S2sLink);
+    defer alloc.destroy(peer);
+    try peer.init(.{
+        .allocator = alloc,
+        .local_node_id = 2,
+        .remote_node_id = 1,
+        .local_epoch_ms = 2000,
+        .server_name = "peer.test",
+    });
+    defer peer.deinit();
+    var now: u64 = 1;
+    try peer.start(now);
+    if (peer.outbound().len != 0) {
+        try writeAllFd(fd, peer.outbound());
+        peer.clearOutbound();
+    }
+    var rx: [4096]u8 = undefined;
+    var polls: usize = 0;
+    while (polls < 200 and !peer.established()) : (polls += 1) {
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&fds, 25) catch return error.Unexpected;
+        if (ready == 0 or (fds[0].revents & posix.POLL.IN) == 0) continue;
+        const n = try readFd(fd, &rx);
+        if (n == 0) return error.ConnectionReset;
+        now += 1;
+        try peer.feed(rx[0..n], now, 5);
+        if (peer.outbound().len != 0) {
+            try writeAllFd(fd, peer.outbound());
+            peer.clearOutbound();
+        }
+    }
+    try std.testing.expect(peer.established());
+
+    // The idle sockets are closed at the pre-AKE deadline, which returns
+    // their units instead of holding them for the TCP connection's lifetime.
+    try std.testing.expect(try awaitPeerCloseForTest(idle1, 6_000));
+    try std.testing.expect(try awaitPeerCloseForTest(idle2, 6_000));
+    // The established link is governed by liveness, not the handshake deadline.
+    try std.testing.expect(!try awaitPeerCloseForTest(fd, 100));
+}
+
 test "squit lookup finds secured peer entries" {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .openbsd) {
         const alloc = std.testing.allocator;
@@ -141033,6 +146795,7 @@ test "squit lookup finds secured peer entries" {
         secured.inbuf = .empty;
         secured.out = .empty;
         secured.rec_inbuf = .empty;
+        secured.digest_sync = null;
 
         const peer_id = try server.rx().clients.alloc(ConnState.init(-1));
         const peer = server.rx().clients.get(peer_id).?;
@@ -141078,6 +146841,7 @@ test "squit lookup finds reactor-zero peer from another shard" {
         secured.inbuf = .empty;
         secured.out = .empty;
         secured.rec_inbuf = .empty;
+        secured.digest_sync = null;
 
         const peer_id = try server.reactors[0].clients.alloc(ConnState.init(-1));
         const peer = server.reactors[0].clients.get(peer_id).?;
@@ -143751,6 +149515,593 @@ test "ACCESS_EVENT_V1 burst and drain converge an add then a tombstone across se
     current_reactor = null;
 }
 
+/// Heap-built (each server is ~2 MB and holds self-pointers): free with
+/// `accessTestServerFree`. Returns null when the host cannot open a server.
+fn accessTestServer(allocator: std.mem.Allocator, identity: *const node_identity.NodeIdentity, name: []const u8) !?*Server {
+    const server = try allocator.create(Server);
+    server.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .server_name = name,
+        .node_identity = identity,
+        .crypto_io = std.testing.io,
+    }) catch |err| {
+        allocator.destroy(server);
+        return switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => null,
+            else => err,
+        };
+    };
+    return server;
+}
+
+fn accessTestServerFree(allocator: std.mem.Allocator, server: *Server) void {
+    server.deinit();
+    allocator.destroy(server);
+}
+
+fn accessTestLinkConn(allocator: std.mem.Allocator, link: *secured_s2s_link.SecuredLink) ConnState {
+    var conn = ConnState.init(-1);
+    conn.overflow_allocator = allocator;
+    conn.send_armed = true;
+    conn.s2s_secured = link;
+    return conn;
+}
+
+/// Burst `from` over `out` and drain the ciphertext into `to` over `in`.
+fn accessTestBurst(allocator: std.mem.Allocator, from: *Server, out: *ConnState, to: *Server, in: *ConnState, now_ms: u64) !void {
+    current_reactor = &from.reactors[0];
+    try std.testing.expect(from.sendAccessBurstTo(out));
+    const bytes = try allocator.dupe(u8, out.s2s_secured.?.outbound());
+    defer allocator.free(bytes);
+    out.s2s_secured.?.clearOutbound();
+    current_reactor = &to.reactors[0];
+    try in.s2s_secured.?.feed(bytes, now_ms);
+    to.drainAccessEventsV1(in, in.s2s_secured.?);
+}
+
+test "ACCESS timed DENY survives its author's cold restart via peer re-send across Helix custody" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const host = "evil!user@bad.test";
+
+    // Link 1: author A (seed 0x31) to peer B (seed 0x32).
+    var link1 = try SessionReplayTestPair.init(allocator);
+    defer link1.deinit();
+    link1.rebindIdentities();
+    link1.a.clearOutbound();
+    link1.b.clearOutbound();
+    try std.testing.expect(link1.a.supportsAccessEventV1());
+    try std.testing.expect(link1.b.supportsAccessEventV1());
+    const author_node = link1.ida.shortId();
+
+    const peer_b = (try accessTestServer(allocator, &link1.idb, "access-b.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, peer_b);
+    var b_conn1 = accessTestLinkConn(allocator, &link1.b);
+    defer b_conn1.s2s_secured = null;
+
+    {
+        const author = (try accessTestServer(allocator, &link1.ida, "access-a.test")) orelse return error.SkipZigTest;
+        defer accessTestServerFree(allocator, author);
+        current_reactor = &author.reactors[0];
+        author.syncAccessLocalNode();
+        author.access.now_seconds = author.accessNowSeconds();
+        try author.access.add("#Timed", .deny, "*!*@bad.test", "Founder", 3600);
+        var a_conn1 = accessTestLinkConn(allocator, &link1.a);
+        defer a_conn1.s2s_secured = null;
+        try accessTestBurst(allocator, author, &a_conn1, peer_b, &b_conn1, 800);
+    }
+
+    const now_b = peer_b.accessNowSeconds();
+    const at_b = (try peer_b.access.matchHostmaskWithCloakAt("#timed", host, null, now_b)).?;
+    try std.testing.expectEqual(ircx_access_store.Level.deny, at_b.level);
+    try std.testing.expectEqual(author_node, at_b.origin_node);
+    const expires_at = at_b.expires_at.?;
+    const stamp = at_b.hlc;
+    try std.testing.expectEqual(stamp / 1000 + 3600, expires_at);
+
+    // B Helix-upgrades: the v2 capsule keeps the author's signature, so the
+    // adopted store can still re-send the fact byte-identical.
+    {
+        const wire = try access_checkpoint.encode(allocator, &peer_b.access);
+        defer allocator.free(wire);
+        var adopted = try access_checkpoint.decode(allocator, wire);
+        std.mem.swap(ircx_access_store.AccessStore, &peer_b.access, &adopted);
+        adopted.deinit();
+        try std.testing.expect(peer_b.access.entries.items[0].origin_proof != null);
+    }
+
+    // A cold-restarts with an empty store and re-links under the same identity.
+    var link2 = try SessionReplayTestPair.init(allocator);
+    defer link2.deinit();
+    link2.rebindIdentities();
+    link2.a.clearOutbound();
+    link2.b.clearOutbound();
+    try std.testing.expectEqual(author_node, link2.ida.shortId());
+    const restarted = (try accessTestServer(allocator, &link2.ida, "access-a.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, restarted);
+    restarted.syncAccessLocalNode();
+    try std.testing.expectEqual(@as(usize, 0), restarted.access.entries.items.len);
+    var b_conn2 = accessTestLinkConn(allocator, &link2.b);
+    defer b_conn2.s2s_secured = null;
+    var a_conn2 = accessTestLinkConn(allocator, &link2.a);
+    defer a_conn2.s2s_secured = null;
+    try accessTestBurst(allocator, peer_b, &b_conn2, restarted, &a_conn2, 900);
+
+    const at_a = (try restarted.access.matchHostmaskWithCloakAt("#Timed", host, null, now_b)).?;
+    try std.testing.expectEqual(ircx_access_store.Level.deny, at_a.level);
+    try std.testing.expectEqual(author_node, at_a.origin_node);
+    try std.testing.expectEqual(stamp, at_a.hlc);
+    try std.testing.expectEqual(@as(?u64, expires_at), at_a.expires_at);
+    try std.testing.expect((try restarted.access.matchHostmaskWithCloakAt("#Timed", host, null, expires_at - 1)) != null);
+    try std.testing.expect((try restarted.access.matchHostmaskWithCloakAt("#Timed", host, null, expires_at)) == null);
+    try std.testing.expect((try peer_b.access.matchHostmaskWithCloakAt("#Timed", host, null, expires_at)) == null);
+
+    // A re-burst over the same leg is suppressed by the per-link reflection cache.
+    current_reactor = &peer_b.reactors[0];
+    try std.testing.expect(peer_b.sendAccessBurstTo(&b_conn2));
+    try std.testing.expectEqual(@as(usize, 0), link2.b.outbound().len);
+
+    // A peer C that links only after A left also learns the fact from B.
+    var link3 = try SessionReplayTestPair.initWithSeeds(allocator, 0x32, 0x33);
+    defer link3.deinit();
+    link3.rebindIdentities();
+    link3.a.clearOutbound();
+    link3.b.clearOutbound();
+    const peer_c = (try accessTestServer(allocator, &link3.idb, "access-c.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, peer_c);
+    var b_conn3 = accessTestLinkConn(allocator, &link3.a);
+    defer b_conn3.s2s_secured = null;
+    var c_conn3 = accessTestLinkConn(allocator, &link3.b);
+    defer c_conn3.s2s_secured = null;
+    try accessTestBurst(allocator, peer_b, &b_conn3, peer_c, &c_conn3, 1000);
+    const at_c = (try peer_c.access.matchHostmaskWithCloakAt("#Timed", host, null, now_b)).?;
+    try std.testing.expectEqual(@as(?u64, expires_at), at_c.expires_at);
+    try std.testing.expectEqual(author_node, at_c.origin_node);
+}
+
+test "mesh config-compat: peers exchange records once per handshake and report actionable cloak mismatch" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pair = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    // `init` returned by value: re-point the links at the moved identities.
+    pair.rebindIdentities();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    try std.testing.expect(pair.a.supportsConfigCompat() and pair.b.supportsConfigCompat());
+
+    const node_a = (try accessTestServer(allocator, &pair.ida, "compat-a.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, node_a);
+    const node_b = (try accessTestServer(allocator, &pair.idb, "compat-b.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, node_b);
+    const secret_a: cloak.SecretKey = .init(@splat(0x44));
+    const secret_b: cloak.SecretKey = .init(@splat(0x55));
+    node_a.config.cloak_key = secret_a;
+    node_b.config.cloak_key = secret_b;
+
+    // Nothing received yet: unknown, no diagnostic lines.
+    var details: std.ArrayList(u8) = .empty;
+    defer details.deinit(allocator);
+    try std.testing.expectEqual(mesh_report.Status.ConfigCompat.unknown, try node_b.configCompatStatus(&pair.b, "compat-a.test", &details));
+    try std.testing.expectEqual(@as(usize, 0), details.items.len);
+
+    // Each side sends exactly once on the handshake's ready edge.
+    try std.testing.expect(node_a.sendConfigCompatDue(&pair.a));
+    try std.testing.expect(!node_a.sendConfigCompatDue(&pair.a));
+    try std.testing.expect(node_b.sendConfigCompatDue(&pair.b));
+    try std.testing.expect(!node_b.sendConfigCompatDue(&pair.b));
+    const a_out = try allocator.dupe(u8, pair.a.outbound());
+    defer allocator.free(a_out);
+    pair.a.clearOutbound();
+    const b_out = try allocator.dupe(u8, pair.b.outbound());
+    defer allocator.free(b_out);
+    pair.b.clearOutbound();
+    try pair.b.feed(a_out, 900);
+    try pair.a.feed(b_out, 900);
+    try std.testing.expect(!node_a.sendConfigCompatDue(&pair.a));
+    try std.testing.expect(!node_b.sendConfigCompatDue(&pair.b));
+
+    try std.testing.expectEqual(mesh_report.Status.ConfigCompat.mismatch, try node_b.configCompatStatus(&pair.b, "compat-a.test", &details));
+    try expectContains(details.items, "config-compat peer=compat-a.test status=mismatch findings=1\n");
+    try expectContains(details.items, "finding=cloak_secret_mismatch severity=breaks_identity fix=set the same [cloak] secret on every mesh node");
+    try std.testing.expect(std.mem.indexOf(u8, details.items, &secret_a.bytes) == null);
+    try std.testing.expect(std.mem.indexOf(u8, details.items, &secret_b.bytes) == null);
+    details.clearRetainingCapacity();
+    try std.testing.expectEqual(mesh_report.Status.ConfigCompat.mismatch, try node_a.configCompatStatus(&pair.a, "compat-b.test", &details));
+
+    // B adopts the shared secret (restart/Helix config): the retained record
+    // re-evaluates without A resending, and a clean peer adds no lines.
+    node_b.config.cloak_key = secret_a;
+    details.clearRetainingCapacity();
+    try std.testing.expectEqual(mesh_report.Status.ConfigCompat.compatible, try node_b.configCompatStatus(&pair.b, "compat-a.test", &details));
+    try std.testing.expectEqual(@as(usize, 0), details.items.len);
+}
+
+const DigestSyncTestNode = struct {
+    server: *Server,
+    conn: *ConnState,
+};
+
+fn digestSyncTestConn(allocator: std.mem.Allocator, link: *secured_s2s_link.SecuredLink) !*ConnState {
+    const conn = try allocator.create(ConnState);
+    conn.* = ConnState.init(-1);
+    conn.overflow_allocator = allocator;
+    conn.send_armed = true;
+    conn.s2s_secured = link;
+    return conn;
+}
+
+fn digestSyncTestConnFree(allocator: std.mem.Allocator, conn: *ConnState) void {
+    conn.s2s_secured = null;
+    if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(allocator);
+    allocator.destroy(conn);
+}
+
+/// Move everything `from` queued on its link (SendQ prefix, then the
+/// link-owned tail) into `to`'s secured link, in wire order.
+fn digestSyncTestShip(allocator: std.mem.Allocator, from: DigestSyncTestNode, to: DigestSyncTestNode, now_ms: u64) !usize {
+    const link = from.conn.s2s_secured.?;
+    const wire = try copySecuredConnOutputInWireOrder(allocator, from.conn, link);
+    defer allocator.free(wire);
+    resetTestSendQ(from.conn);
+    link.clearOutbound();
+    if (wire.len != 0) try to.conn.s2s_secured.?.feed(wire, now_ms);
+    return wire.len;
+}
+
+/// One answered digest round: `from` offers, `to` answers, `from` runs the
+/// burst the answer asks for. The burst itself is left queued on `from`.
+fn digestSyncTestRound(allocator: std.mem.Allocator, from: DigestSyncTestNode, to: DigestSyncTestNode, now_ms: u64) !void {
+    current_reactor = &from.server.reactors[0];
+    try std.testing.expect(from.server.offerMeshDigestRound(from.conn));
+    _ = try digestSyncTestShip(allocator, from, to, now_ms);
+    current_reactor = &to.server.reactors[0];
+    if (to.conn.s2s_secured.?.digest_sync) |state| state.last_answer_ms = null;
+    to.server.drainMeshDigestSync(to.conn, to.conn.s2s_secured.?);
+    _ = try digestSyncTestShip(allocator, to, from, now_ms + 1);
+    current_reactor = &from.server.reactors[0];
+    from.server.drainMeshDigestSync(from.conn, from.conn.s2s_secured.?);
+}
+
+/// `count` channels on both nodes; topics only on the author.
+fn digestSyncTestTopics(author: *Server, peer: *Server, count: usize) !void {
+    for (0..count) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "#m03c{d:0>3}", .{i});
+        try author.world.ensureRemoteListChannel(name);
+        try peer.world.ensureRemoteListChannel(name);
+        // -t on the receiver so it applies the relayed topics it is sent.
+        _ = try peer.world.setChannelFlag(name, .topic_ops, false);
+        try author.world.setTopic(name, "steady topic", "setter!u@h", 1_700_000_000);
+    }
+}
+
+test "mesh M03 digest exchange: converged peers exchange only digests and one divergent topic repairs only its bucket" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const pair = try allocator.create(SessionReplayTestPair);
+    defer allocator.destroy(pair);
+    pair.* = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.rebindIdentities();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+    try std.testing.expect(pair.a.supportsDigestSync() and pair.b.supportsDigestSync());
+
+    const server_a = (try accessTestServer(allocator, &pair.ida, "digest-a.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, server_a);
+    const server_b = (try accessTestServer(allocator, &pair.idb, "digest-b.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, server_b);
+    const a = DigestSyncTestNode{ .server = server_a, .conn = try digestSyncTestConn(allocator, &pair.a) };
+    defer digestSyncTestConnFree(allocator, a.conn);
+    const b = DigestSyncTestNode{ .server = server_b, .conn = try digestSyncTestConn(allocator, &pair.b) };
+    defer digestSyncTestConnFree(allocator, b.conn);
+    const channel_count = 40;
+    try digestSyncTestTopics(server_a, server_b, channel_count);
+    const peer_b = &pair.b.inner.?.peer;
+
+    // An establishment/RESYNC-style burst carries no commits: its wire is
+    // unchanged from the pre-M03 protocol.
+    current_reactor = &server_a.reactors[0];
+    try std.testing.expect(server_a.sendMeshStateBurstTo(a.conn));
+    _ = try digestSyncTestShip(allocator, a, b, 890);
+    try std.testing.expectEqual(@as(usize, 0), peer_b.digest_frames.items.len);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainTopicChanges(b.conn, &pair.b);
+
+    // Round 0: the receiver's book is empty, so the first answered round
+    // needs every family; that full burst commits each one.
+    try digestSyncTestRound(allocator, a, b, 899);
+    try std.testing.expectEqual(@as(u64, 1), pair.a.digest_sync.?.rounds_partial);
+    current_reactor = &server_a.reactors[0];
+    _ = try digestSyncTestShip(allocator, a, b, 900);
+    try std.testing.expectEqual(@as(usize, channel_count), peer_b.topic_changes.items.len);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainTopicChanges(b.conn, &pair.b);
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    const book = &pair.b.digest_sync.?.book;
+    for (book.slots) |slot| try std.testing.expect(slot.valid);
+    try std.testing.expectEqualStrings("steady topic", server_b.world.topicInfo("#m03c007").?.text);
+
+    // Round 1: nothing changed, so only OFFER and NEED cross the link and
+    // the answer starts no burst at all.
+    current_reactor = &server_a.reactors[0];
+    try std.testing.expect(server_a.offerMeshDigestRound(a.conn));
+    const offer_bytes = try digestSyncTestShip(allocator, a, b, 901);
+    current_reactor = &server_b.reactors[0];
+    // Rounds here are milliseconds apart; lift the receiver's answer spacing.
+    pair.b.digest_sync.?.last_answer_ms = null;
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    const need_bytes = try digestSyncTestShip(allocator, b, a, 902);
+    try std.testing.expect(offer_bytes > 0 and need_bytes > 0);
+    current_reactor = &server_a.reactors[0];
+    server_a.drainMeshDigestSync(a.conn, &pair.a);
+    const sender = pair.a.digest_sync.?;
+    try std.testing.expectEqual(@as(u64, 1), sender.rounds_converged);
+    try std.testing.expectEqual(@as(u64, 1), sender.rounds_partial);
+    try std.testing.expectEqual(MeshBurstStage.idle, a.conn.mesh_burst_stage);
+    try std.testing.expectEqual(@as(usize, 0), try digestSyncTestShip(allocator, a, b, 903));
+    // Digest frames are small: offer + need well under one family's burst.
+    try std.testing.expect(offer_bytes + need_bytes < 2048);
+
+    // Round 2: one divergent topic. Only the topics family is needed, and
+    // only the rows of the bucket holding that channel are re-sent.
+    current_reactor = &server_a.reactors[0];
+    try server_a.world.setTopic("#m03c007", "changed topic", "setter!u@h", 1_700_000_100);
+    var bucket_rows: usize = 0;
+    const changed_bucket = mesh_digest_sync.bucketOf(.topics, "#m03c007");
+    for (0..channel_count) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "#m03c{d:0>3}", .{i});
+        if (mesh_digest_sync.bucketOf(.topics, name) == changed_bucket) bucket_rows += 1;
+    }
+    try std.testing.expect(bucket_rows >= 1 and bucket_rows < channel_count);
+    // Rounds here are milliseconds apart; lift the receiver's answer spacing.
+    pair.b.digest_sync.?.last_answer_ms = null;
+    try std.testing.expect(server_a.offerMeshDigestRound(a.conn));
+    _ = try digestSyncTestShip(allocator, a, b, 904);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    _ = try digestSyncTestShip(allocator, b, a, 905);
+    current_reactor = &server_a.reactors[0];
+    server_a.drainMeshDigestSync(a.conn, &pair.a);
+    try std.testing.expectEqual(@as(u64, 2), sender.rounds_partial);
+    try std.testing.expectEqual(MeshBurstStage.idle, a.conn.mesh_burst_stage);
+    try std.testing.expect(!sender.plan_active);
+    const flags_before = peer_b.channel_mode_flag_changes.items.len;
+    const state_before = peer_b.channel_mode_state_changes.items.len;
+    _ = try digestSyncTestShip(allocator, a, b, 906);
+    try std.testing.expectEqual(bucket_rows, peer_b.topic_changes.items.len);
+    try std.testing.expectEqual(flags_before, peer_b.channel_mode_flag_changes.items.len);
+    try std.testing.expectEqual(state_before, peer_b.channel_mode_state_changes.items.len);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainTopicChanges(b.conn, &pair.b);
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    try std.testing.expectEqualStrings("changed topic", server_b.world.topicInfo("#m03c007").?.text);
+    try std.testing.expectEqualStrings("steady topic", server_b.world.topicInfo("#m03c008").?.text);
+    // The receiver now holds exactly the sender's current topics digest.
+    current_reactor = &server_a.reactors[0];
+    const current = server_a.meshDigestFamily(a.conn, .topics).?;
+    const held = book.slots[@backingInt(mesh_digest_sync.Family.topics)];
+    try std.testing.expect(held.valid);
+    try std.testing.expectEqualSlices(u8, &current.root, &held.digest.root);
+
+    // Round 3: converged again; digests only.
+    pair.b.digest_sync.?.last_answer_ms = null;
+    try std.testing.expect(server_a.offerMeshDigestRound(a.conn));
+    _ = try digestSyncTestShip(allocator, a, b, 907);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    _ = try digestSyncTestShip(allocator, b, a, 908);
+    current_reactor = &server_a.reactors[0];
+    server_a.drainMeshDigestSync(a.conn, &pair.a);
+    try std.testing.expectEqual(@as(u64, 2), sender.rounds_converged);
+    try std.testing.expectEqual(@as(usize, 0), try digestSyncTestShip(allocator, a, b, 909));
+}
+
+test "mesh M03 digest exchange: mixed-version peers fall back to the full burst and never skip unknown families" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const pair = try allocator.create(SessionReplayTestPair);
+    defer allocator.destroy(pair);
+    pair.* = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.rebindIdentities();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    const server_a = (try accessTestServer(allocator, &pair.ida, "digest-a.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, server_a);
+    const server_b = (try accessTestServer(allocator, &pair.idb, "digest-b.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, server_b);
+    const a = DigestSyncTestNode{ .server = server_a, .conn = try digestSyncTestConn(allocator, &pair.a) };
+    defer digestSyncTestConnFree(allocator, a.conn);
+    const b = DigestSyncTestNode{ .server = server_b, .conn = try digestSyncTestConn(allocator, &pair.b) };
+    defer digestSyncTestConnFree(allocator, b.conn);
+    const channel_count = 12;
+    try digestSyncTestTopics(server_a, server_b, channel_count);
+    const peer_a = &pair.a.inner.?.peer;
+    const peer_b = &pair.b.inner.?.peer;
+
+    // 1. A peer that never answered the extension probe (an older build):
+    // no offer, the periodic round is the unchanged full burst, and no
+    // digest frame is ever put on the wire for it.
+    peer_a.peer_supports_digest_sync = false;
+    current_reactor = &server_a.reactors[0];
+    try std.testing.expect(!server_a.offerMeshDigestRound(a.conn));
+    try std.testing.expectError(error.DigestSyncUnavailable, pair.a.sendDigestFrame(.DIGEST_OFFER, "x"));
+    try std.testing.expect(server_a.sendMeshStateBurstTo(a.conn));
+    _ = try digestSyncTestShip(allocator, a, b, 900);
+    try std.testing.expectEqual(@as(usize, channel_count), peer_b.topic_changes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), peer_b.digest_frames.items.len);
+    try std.testing.expect(pair.b.digest_sync == null);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainTopicChanges(b.conn, &pair.b);
+
+    // 2. Capable again; the first answered round needs every family and
+    // seeds the receiver's book with that burst's commits.
+    peer_a.peer_supports_digest_sync = true;
+    try digestSyncTestRound(allocator, a, b, 900);
+    current_reactor = &server_a.reactors[0];
+    _ = try digestSyncTestShip(allocator, a, b, 901);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainTopicChanges(b.conn, &pair.b);
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    const flags_seen = peer_b.channel_mode_flag_changes.items.len;
+
+    // 3. An answer from a peer whose build knows only families 0..4 (the
+    // topics family is unknown to it): known in-sync families are skipped,
+    // every unknown family is burst whole.
+    current_reactor = &server_a.reactors[0];
+    try std.testing.expect(server_a.offerMeshDigestRound(a.conn));
+    const sender = pair.a.digest_sync.?;
+    const need = mesh_digest_sync.Need{ .round = sender.offer_round, .known = 0b11111 };
+    sender.offer_round = 0;
+    server_a.runMeshDigestNeed(a.conn, sender, &need);
+    try std.testing.expect(!sender.plan.sends(.mode_flags));
+    try std.testing.expect(sender.plan.sends(.topics));
+    try std.testing.expect(sender.plan.sends(.keytrans));
+    _ = try digestSyncTestShip(allocator, a, b, 902);
+    try std.testing.expectEqual(@as(usize, channel_count), peer_b.topic_changes.items.len);
+    try std.testing.expectEqual(flags_seen, peer_b.channel_mode_flag_changes.items.len);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainTopicChanges(b.conn, &pair.b);
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+
+    // 4. An offer that is never answered (or answered for another round)
+    // makes the next due round a full burst.
+    current_reactor = &server_a.reactors[0];
+    try std.testing.expect(server_a.offerMeshDigestRound(a.conn));
+    const outstanding = sender.offer_round;
+    try std.testing.expect(outstanding != 0);
+    var stray: [mesh_digest_sync.max_local_need_len]u8 = undefined;
+    const stray_offer = mesh_digest_sync.Offer{ .round = outstanding +% 1000 };
+    const stray_need = try pair.b.digest_sync.?.book.answer(&stray_offer, 0, &stray);
+    current_reactor = &server_b.reactors[0];
+    try pair.b.sendDigestFrame(.DIGEST_NEED, stray_need);
+    _ = try digestSyncTestShip(allocator, a, b, 903);
+    _ = try digestSyncTestShip(allocator, b, a, 904);
+    current_reactor = &server_a.reactors[0];
+    server_a.drainMeshDigestSync(a.conn, &pair.a);
+    try std.testing.expectEqual(outstanding, sender.offer_round);
+    try std.testing.expect(!server_a.offerMeshDigestRound(a.conn));
+    try std.testing.expectEqual(@as(u64, 1), sender.rounds_fallback);
+    try std.testing.expectEqual(@as(u64, 0), sender.offer_round);
+    try std.testing.expect(server_a.sendMeshStateBurstTo(a.conn));
+    // B also drains the stray offer-less traffic; then it receives the burst.
+    current_reactor = &server_b.reactors[0];
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    server_b.drainTopicChanges(b.conn, &pair.b);
+    _ = try digestSyncTestShip(allocator, a, b, 905);
+    try std.testing.expectEqual(@as(usize, channel_count), peer_b.topic_changes.items.len);
+
+    // 5. A dropped digest frame (inbox bound) forgets every accepted digest,
+    // so the next answer needs every family.
+    server_b.drainTopicChanges(b.conn, &pair.b);
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    const book = &pair.b.digest_sync.?.book;
+    for (book.slots) |slot| try std.testing.expect(slot.valid);
+    peer_b.digest_frames_lost = true;
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    for (book.slots) |slot| try std.testing.expect(!slot.valid);
+
+    // 6. Allocation failure while digesting never lets the receiver keep an
+    // older digest: the family is left out of the offer (so it is sent) and
+    // its commit invalidates the receiver's slot.
+    try digestSyncTestRound(allocator, a, b, 905);
+    current_reactor = &server_a.reactors[0];
+    _ = try digestSyncTestShip(allocator, a, b, 906);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainTopicChanges(b.conn, &pair.b);
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    const topics_slot = &book.slots[@backingInt(mesh_digest_sync.Family.topics)];
+    try std.testing.expect(topics_slot.valid);
+    current_reactor = &server_a.reactors[0];
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const saved_allocator = server_a.allocator;
+    server_a.allocator = failing.allocator();
+    const oom_digest = server_a.meshDigestFamily(a.conn, .topics);
+    sender.plan_active = true; // commits are emitted only inside a NEED pass
+    const oom_commit = server_a.emitMeshDigestCommit(a.conn, .topics);
+    sender.plan_active = false;
+    server_a.allocator = saved_allocator;
+    try std.testing.expect(oom_digest == null);
+    try std.testing.expect(oom_commit);
+    try std.testing.expect(failing.has_induced_failure);
+    _ = try digestSyncTestShip(allocator, a, b, 907);
+    current_reactor = &server_b.reactors[0];
+    server_b.drainMeshDigestSync(b.conn, &pair.b);
+    try std.testing.expect(!topics_slot.valid);
+    try std.testing.expect(book.slots[@backingInt(mesh_digest_sync.Family.mode_flags)].valid);
+}
+
+test "mesh M03 digest exchange: profile changes, capability refresh and skipped-stage side effects are never hidden" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const pair = try allocator.create(SessionReplayTestPair);
+    defer allocator.destroy(pair);
+    pair.* = try SessionReplayTestPair.init(allocator);
+    defer pair.deinit();
+    pair.rebindIdentities();
+    pair.a.clearOutbound();
+    pair.b.clearOutbound();
+
+    const server_a = (try accessTestServer(allocator, &pair.ida, "digest-a.test")) orelse return error.SkipZigTest;
+    defer accessTestServerFree(allocator, server_a);
+    const conn_a = try digestSyncTestConn(allocator, &pair.a);
+    defer digestSyncTestConnFree(allocator, conn_a);
+    const peer_a = &pair.a.inner.?.peer;
+    current_reactor = &server_a.reactors[0];
+
+    // 1. The membership stage re-sends each local user's WHOIS profile, so
+    // a profile-only change (AWAY) must change the membership digest, and
+    // clearing it restores the earlier digest (no per-burst revision leaks
+    // into the row).
+    peer_a.peer_supports_whois_profile = true;
+    const id = try addTestLocalClient(server_a, "M03User", "m03acct");
+    const user = server_a.connFor(id).?;
+    user.session.registration.registered = true;
+    const before = server_a.meshDigestFamily(conn_a, .membership).?;
+    user.session.setAway("gone fishing");
+    const away = server_a.meshDigestFamily(conn_a, .membership).?;
+    try std.testing.expect(!std.mem.eql(u8, &before.root, &away.root));
+    user.session.clearAway();
+    const back = server_a.meshDigestFamily(conn_a, .membership).?;
+    try std.testing.expectEqualSlices(u8, &before.root, &back.root);
+
+    // 2. A link-capability change alters what producers emit, so every
+    // family digest changes with it.
+    const topics_before = server_a.meshDigestFamily(conn_a, .topics).?;
+    peer_a.peer_supports_keytrans_head = !peer_a.peer_supports_keytrans_head;
+    const topics_after = server_a.meshDigestFamily(conn_a, .topics).?;
+    try std.testing.expect(!std.mem.eql(u8, &topics_before.root, &topics_after.root));
+    peer_a.peer_supports_keytrans_head = !peer_a.peer_supports_keytrans_head;
+
+    // 3. A gated pass that skips the opers stage still mints the grant of a
+    // live local oper that lacks one (the producer's side effect).
+    try std.testing.expect(server_a.meshSignKey() != null);
+    {
+        user.session.is_oper = true;
+        user.session.oper_priv = oper_mod.OperPrivileges.initMany(&.{.server_rehash});
+        try std.testing.expect(server_a.oper_grants.lookup("m03acct", server_a.grantNowU64()) == null);
+        const state = pair.a.digestSyncState().?;
+        state.plan = .{ .send = mesh_digest_sync.all_families & ~mesh_digest_sync.Family.opers.bit() };
+        state.plan_active = true;
+        try std.testing.expect(!server_a.prepareMeshDigestStage(conn_a, .opers));
+        try std.testing.expect(server_a.oper_grants.lookup("m03acct", server_a.grantNowU64()) != null);
+        state.plan_active = false;
+        user.session.is_oper = false;
+    }
+    resetTestSendQ(conn_a);
+    pair.a.clearOutbound();
+}
+
 test "SIGTERM and SIGINT handlers request cooperative stop only on reactor zero" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     // Invoke the signal-safe handler directly; never install or send process
@@ -143802,8 +150153,37 @@ test "SIGTERM and SIGINT pending requests survive the final upgrade exec boundar
     try std.testing.expect(linux.errno(fd_rc) == .SUCCESS);
     const executable_fd: linux.fd_t = @intCast(fd_rc);
     defer closeFd(executable_fd);
+    // The exec'd image is this same test binary, so its entry point is the
+    // test runner, not the daemon. Zig 0.17's build-system runner accepts only
+    // --listen/--seed/--cache-dir (any other argument, such as a filter, is a
+    // panic, i.e. SIGABRT) and selects tests by index over stdin; the project's
+    // verbose runner selects by --test-filter. Address the marked successor
+    // test in whichever protocol the linked runner speaks.
+    const verbose_runner = @hasDecl(@import("root"), "onyx_verbose_test_runner");
+    const child_index: u32 = blk: {
+        var found: ?usize = null;
+        for (builtin.test_functions, 0..) |test_fn, i| {
+            if (!std.mem.endsWith(u8, test_fn.name, "test." ++ pending_stop_exec_child_test)) continue;
+            if (found != null) return error.TestUnexpectedResult;
+            found = i;
+        }
+        // The successor's name contains this test's name, so every filter that
+        // selects this test also links it; absence is a harness defect.
+        const index = found orelse {
+            std.debug.print("pending-stop successor test is not linked: {s}\n", .{pending_stop_exec_child_test});
+            return error.TestUnexpectedResult;
+        };
+        break :blk @intCast(index);
+    };
+    var run_request: [@sizeOf(std.zig.Client.Message.Header) + @sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, run_request[0..4], @backingInt(std.zig.Client.Message.Tag.run_test), .little);
+    std.mem.writeInt(u32, run_request[4..8], @sizeOf(u32), .little);
+    std.mem.writeInt(u32, run_request[8..12], child_index, .little);
     const plan = helix_live.ExecPlan{
-        .argv = &.{ "/proc/self/exe", "--test-filter=SIGTERM and SIGINT pending exec child" },
+        .argv = if (verbose_runner)
+            &.{ "/proc/self/exe", "--test-filter=" ++ pending_stop_exec_child_test }
+        else
+            &.{ "/proc/self/exe", "--listen=-" },
         .envp = &.{"ONYX_TEST_PENDING_STOP=1"},
         .arena_fd = -1,
         .control_fd = -1,
@@ -143837,6 +150217,17 @@ test "SIGTERM and SIGINT pending requests survive the final upgrade exec boundar
                 _ = linux.dup3(null_fd, 1, 0);
                 _ = linux.dup3(null_fd, 2, 0);
                 if (null_fd > 2) closeFd(null_fd);
+                // Successor stdin carries exactly one run_test request and then
+                // EOF, with no exit message: if the marked test ever returns to
+                // the build-system runner instead of exiting with its own
+                // verdict code, the runner's next receive fails and it aborts.
+                var stdin_pipe: [2]linux.fd_t = undefined;
+                if (linux.errno(linux.pipe2(&stdin_pipe, .{ .CLOEXEC = true })) != .SUCCESS) linux.exit_group(21);
+                const wrote = linux.write(stdin_pipe[1], &run_request, run_request.len);
+                if (linux.errno(wrote) != .SUCCESS or wrote != run_request.len) linux.exit_group(22);
+                closeFd(stdin_pipe[1]);
+                if (linux.errno(linux.dup3(stdin_pipe[0], 0, 0)) != .SUCCESS) linux.exit_group(23);
+                if (stdin_pipe[0] != 0) closeFd(stdin_pipe[0]);
                 server.allocator = std.heap.page_allocator;
                 if (arrival == .cleared) {
                     // Negative control: consume a queued request deliberately.
@@ -143881,7 +150272,15 @@ test "SIGTERM and SIGINT pending requests survive the final upgrade exec boundar
                 }
                 sleepOneMillis();
             }
-            const expected_status: i32 = if (arrival == .cleared) 1 << 8 else 0;
+            // `before` never execs. Exec'd successors report through their
+            // own exit codes, distinct from every runner status (0, 1, 2 or
+            // SIGABRT), so a runner that never reached the marked test, or a
+            // skip, cannot pass for the expected verdict.
+            const expected_status: i32 = switch (arrival) {
+                .before => 0,
+                .after => @as(i32, pending_stop_exec_child_pass) << 8,
+                .cleared => @as(i32, pending_stop_exec_child_fail) << 8,
+            };
             if (!reaped or status != expected_status) {
                 std.debug.print("pending-stop child signal={t} arrival={t} reaped={any} status={d}\n", .{ signal, arrival, reaped, status });
                 return error.TestUnexpectedResult;
@@ -143890,16 +150289,34 @@ test "SIGTERM and SIGINT pending requests survive the final upgrade exec boundar
     }
 }
 
-test "SIGTERM and SIGINT pending exec child" {
+/// Exact name of the exec'd successor test below. It must contain the parent
+/// test's name so every lane filter that links the parent also links it.
+const pending_stop_exec_child_test = "SIGTERM and SIGINT pending requests survive the final upgrade exec boundary (exec child)";
+const pending_stop_exec_child_pass: u8 = 90;
+const pending_stop_exec_child_fail: u8 = 91;
+
+test "SIGTERM and SIGINT pending requests survive the final upgrade exec boundary (exec child)" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!pendingStopExecChildMarked()) return error.SkipZigTest;
+    // Only an exec'd successor reaches here. Report the verdict as a distinct
+    // exit code after cleanup instead of returning into whichever test runner
+    // is linked (the build-system runner reports failures only over stdout).
+    pendingStopExecChildChecks() catch linux.exit_group(pending_stop_exec_child_fail);
+    linux.exit_group(pending_stop_exec_child_pass);
+}
+
+fn pendingStopExecChildMarked() bool {
     const env_rc = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    try std.testing.expect(linux.errno(env_rc) == .SUCCESS);
+    if (linux.errno(env_rc) != .SUCCESS) return false;
     const env_fd: linux.fd_t = @intCast(env_rc);
     defer closeFd(env_fd);
     var env: [64]u8 = undefined;
     const env_len = linux.read(env_fd, &env, env.len);
-    try std.testing.expect(linux.errno(env_len) == .SUCCESS);
-    if (!std.mem.eql(u8, env[0..env_len], "ONYX_TEST_PENDING_STOP=1\x00")) return error.SkipZigTest;
+    if (linux.errno(env_len) != .SUCCESS) return false;
+    return std.mem.eql(u8, env[0..env_len], "ONYX_TEST_PENDING_STOP=1\x00");
+}
+
+fn pendingStopExecChildChecks() !void {
     try std.testing.expect(terminationSignalPending());
     prepareTerminationSignals();
     var server = try Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 });
@@ -162457,6 +168874,124 @@ test "inventory paging: bounded next final replay and scope guards use the regis
     try std.testing.expectEqualSlices(u8, final_payload, conn.session_mesh_page_cache.payload);
 }
 
+test "session attachment revoke: one listed device is fenced or closed while sibling attachments stay live" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    current_reactor = null;
+    defer current_reactor = null;
+    var fixture: SessionMeshPagingFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const server = fixture.server;
+    const conn = server.connFor(fixture.owner).?;
+    const remote_token = SessionMeshPagingFixture.token;
+    const group = session_sid.formatSid(session_sid.deriveGroup(remote_token));
+
+    // Remote-held device: the requester fences the exact pair and refuses a
+    // bare-token rejoin locally, then retains one signed SAR1 for its peers.
+    var command_buf: [160]u8 = undefined;
+    const target_hex = std.fmt.bytesToHex(@as([16]u8, @splat(3)), .lower);
+    resetTestSendQ(conn);
+    try fixture.dispatch(fixture.owner, try std.fmt.bufPrint(&command_buf, "SESSION REVOKE group={s} attachment={s}", .{ group, target_hex }));
+    try expectContains(conn.send_buf[0..conn.send_len], "SESSION REVOKE SENT scope=attachment attachment=");
+    try std.testing.expect(server.sessionAttachmentFenced(remote_token, @splat(3)));
+    try std.testing.expect(!server.sessionAttachmentFenced(remote_token, @splat(4)));
+    try std.testing.expect(server.sessionAttachmentFenced(remote_token, null));
+    try std.testing.expect(server.session_replica_store.groupRevokeForToken(remote_token) == null);
+    const state = server.session_attachment_revoke_state.?;
+    var retained: usize = 0;
+    const now: i64 = server.sessionAttachmentRevokeNow();
+    for (0..session_attachment_revoke.Retained.capacity) |i| retained += @intFromBool(state.retained.liveAt(i, now) != null);
+    try std.testing.expectEqual(@as(usize, 1), retained);
+    // An id that no listed row carries changes nothing.
+    const absent_hex = std.fmt.bytesToHex(@as([16]u8, @splat(0x77)), .lower);
+    resetTestSendQ(conn);
+    try fixture.dispatch(fixture.owner, try std.fmt.bufPrint(&command_buf, "SESSION REVOKE group={s} attachment={s}", .{ group, absent_hex }));
+    try expectContains(conn.send_buf[0..conn.send_len], "NO_SUCH_SESSION");
+    try std.testing.expect(!server.sessionAttachmentFenced(remote_token, @splat(0x77)));
+
+    // Locally held devices: a peer's signed SAR1 closes exactly the named
+    // attachment, and its retry is an idempotent duplicate.
+    const dev_a = try addTestLocalClient(server, "DevA", "alice");
+    const dev_b = try addTestLocalClient(server, "DevB", "alice");
+    try assignTestSessionAttachment(server, "alice", dev_a, 0xd1);
+    try assignTestSessionAttachment(server, "alice", dev_b, 0xd2);
+    const a_cid = monitorIdFromClient(dev_a);
+    const b_cid = monitorIdFromClient(dev_b);
+    const local_token = server.sessions.resumeHandleForClient("alice", a_cid).?.token;
+    try std.testing.expect(server.sessions.joinTokenGroup("alice", b_cid, local_token));
+    // Same-token siblings render one shared identity (see SESSION DROP sid).
+    server.world.unregisterNick(worldIdFromClient(dev_b));
+    try server.connFor(dev_b).?.session.setNick("DevA");
+    const wire = try session_attachment_revoke.encodeRequest(std.testing.allocator, .{
+        .account = "ALICE",
+        .token = local_token,
+        .attachment_id = @splat(0xd1),
+        .target_origin = server.config.node_id,
+        .requester_node = fixture.remote.shortId(),
+        .requester_sequence = 1,
+        .issued_at_ms = now,
+        .expires_at_ms = now + 60_000,
+    }, &fixture.remote.sign_kp);
+    defer std.testing.allocator.free(wire);
+    server.acceptSessionAttachmentRevoke(wire, fixture.remote.shortId());
+    try std.testing.expect(!server.sessions.containsClient("alice", a_cid));
+    try std.testing.expect(server.sessions.containsClient("alice", b_cid));
+    try std.testing.expect(server.sessions.containsClient("alice", monitorIdFromClient(fixture.owner)));
+    try std.testing.expect(server.sessionAttachmentFenced(local_token, @splat(0xd1)));
+    try std.testing.expect(!server.sessionAttachmentFenced(local_token, @splat(0xd2)));
+    server.acceptSessionAttachmentRevoke(wire, fixture.remote.shortId());
+    try std.testing.expect(server.sessions.containsClient("alice", b_cid));
+
+    // A request this node signed never acts on its own echo, and an
+    // untrusted signer is ignored before any table changes.
+    var stranger = try node_identity.fromSeed(@splat(0xB9), "inventory-page");
+    defer stranger.deinit();
+    const forged = try session_attachment_revoke.encodeRequest(std.testing.allocator, .{
+        .account = "alice",
+        .token = local_token,
+        .attachment_id = @splat(0xd2),
+        .target_origin = server.config.node_id,
+        .requester_node = stranger.shortId(),
+        .requester_sequence = 1,
+        .issued_at_ms = now,
+        .expires_at_ms = now + 60_000,
+    }, &stranger.sign_kp);
+    defer std.testing.allocator.free(forged);
+    server.acceptSessionAttachmentRevoke(forged, stranger.shortId());
+    try std.testing.expect(server.sessions.containsClient("alice", b_cid));
+    try std.testing.expect(!server.sessionAttachmentFenced(local_token, @splat(0xd2)));
+
+    // A device held here is closed through the local DROP path and its fence
+    // is still offered mesh-wide (target = this node), so the closed holder
+    // cannot rejoin elsewhere with the shared bearer token.
+    server.connFor(dev_b).?.session.registration.registered = true;
+    try std.testing.expect(server.publishCurrentSessionReplicaToken(local_token));
+    const local_group = session_sid.formatSid(session_sid.deriveGroup(local_token));
+    const dev_b_hex = std.fmt.bytesToHex(@as([16]u8, @splat(0xd2)), .lower);
+    resetTestSendQ(conn);
+    try fixture.dispatch(fixture.owner, try std.fmt.bufPrint(&command_buf, "SESSION REVOKE group={s} attachment={s}", .{ local_group, dev_b_hex }));
+    try expectContains(conn.send_buf[0..conn.send_len], "SESSION REVOKE OK scope=attachment");
+    try std.testing.expect(!server.sessions.containsClient("alice", b_cid));
+    try std.testing.expect(server.sessions.containsClient("alice", monitorIdFromClient(fixture.owner)));
+    try std.testing.expect(server.sessionAttachmentFenced(local_token, null));
+    retained = 0;
+    var local_published = false;
+    for (0..session_attachment_revoke.Retained.capacity) |i| {
+        const retained_wire = state.retained.liveAt(i, now) orelse continue;
+        const decoded = try session_attachment_revoke.decodeRequest(retained_wire);
+        if (std.mem.eql(u8, &decoded.request.attachment_id, &@as([16]u8, @splat(0xd2)))) {
+            try std.testing.expectEqualSlices(u8, &local_token, &decoded.request.token);
+            try std.testing.expectEqual(server.config.node_id, decoded.request.target_origin);
+            try std.testing.expectEqual(server.config.node_id, decoded.request.requester_node);
+            local_published = true;
+        }
+        retained += 1;
+    }
+    // The remote-target request, the relayed peer request, and this one.
+    try std.testing.expect(local_published);
+    try std.testing.expectEqual(@as(usize, 3), retained);
+}
+
 test "inventory paging: labeled lost reply uses current label and WS custody owns the complete page" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     current_reactor = null;
@@ -177339,4 +183874,153 @@ test "session publication retry: elapsed renewal expiry and changed signing auth
     try std.testing.expectEqualSlices(u8, old_wire, core.session_replica_store.getOrigin(handle.token, identity.shortId()).?.wire);
     try std.testing.expectEqual(leases_before, core.stats.sessionPublicationCount(.lease_accepted));
     try std.testing.expect(core.sessions.tokenReplicaDirty(handle.token));
+}
+
+test "session publication retry: OFFER stamps are forgotten when this node's own OFFER is tombstoned, quarantined or swept" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xb9)), "publication-forget.test");
+    defer identity.deinit();
+    var core = try LinuxServer.init(a, .{ .host = "127.0.0.1", .port = 0, .node_id = identity.shortId(), .node_identity = &identity, .crypto_io = std.testing.io });
+    defer core.deinit();
+    current_reactor = &core.reactors[0];
+    const Clock = struct {
+        wall_ms: i64,
+        fn mono(_: *anyopaque) i64 {
+            return 1_000;
+        }
+        fn wall(ctx: *anyopaque) i64 {
+            return @as(*@This(), @ptrCast(@alignCast(ctx))).wall_ms;
+        }
+        const vtable = reactor_mod.Reactor.VTable{ .nowMillis = mono, .wallMillis = wall };
+    };
+    var clock = Clock{ .wall_ms = @intCast(core.meshWallMs()) };
+    core.reactor = .{ .ptr = &clock, .vtable = &Clock.vtable };
+    const id = try addTestLocalClient(&core, "Alice", "alice");
+    const conn = core.connFor(id).?;
+    const handle = core.sessions.resumeHandleForClient("alice", monitorIdFromClient(id)).?;
+    try std.testing.expect(core.sessions.markPortableResumeIssued("alice", monitorIdFromClient(id)));
+    const snapshot = core.encodeMigrationSnapshot(id, conn) orelse return error.TestUnexpectedResult;
+    defer a.free(snapshot);
+
+    // Exact own revision still retained: the stamp is kept.
+    try std.testing.expect(core.publishSessionReplicaUpsert(handle.token, "alice", "Alice", snapshot, false, .resume_eligible));
+    const offered = core.session_replica_store.getOrigin(handle.token, identity.shortId()).?.revision;
+    try std.testing.expect(core.offer_retry_stamps.lookup(handle.token).?.revision.eql(offered));
+    core.forgetStaleOfferRetryStamp(handle.token);
+    try std.testing.expect(core.offer_retry_stamps.lookup(handle.token) != null);
+
+    // A peer replays this node's own newer REVOKE (e.g. one minted before a
+    // restart): the tombstone ends the stamped authority.
+    const now: i64 = clock.wall_ms;
+    const revoke_wire = try session_replica_v2.encodeOffer(a, .{
+        .operation = .remove,
+        .token = handle.token,
+        .revision = core.nextSessionReplicaRevision(),
+        .issued_at_ms = now,
+        .expires_at_ms = now + 60_000,
+    }, &identity.sign_kp);
+    defer a.free(revoke_wire);
+    const revoked = try core.session_replica_store.applySignedOffer(try session_replica_v2.decodeOffer(revoke_wire), 9, now);
+    try std.testing.expect(revoked.disposition == .superseded or revoked.disposition == .tombstoned);
+    core.forgetStaleOfferRetryStamp(handle.token);
+    try std.testing.expect(core.offer_retry_stamps.lookup(handle.token) == null);
+
+    // A newer own OFFER is stamped again; once its signed window lapses the
+    // Store sweep removes it and the stamp goes with it.
+    try std.testing.expect(core.publishSessionReplicaUpsertFor(handle.token, "alice", "Alice", snapshot, false, .resume_eligible, .mutation));
+    try std.testing.expect(core.offer_retry_stamps.lookup(handle.token) != null);
+    clock.wall_ms += @as(i64, @intCast(LinuxServer.mesh_reclaim_ttl_ms)) + 1;
+    core.sweepSessionReplicaStore();
+    if (core.session_replica_store.getOriginInventory(handle.token, identity.shortId())) |own| {
+        // Allocation or projection retry kept the entry: the stamp must then
+        // still describe exactly that retained revision.
+        try std.testing.expect(core.offer_retry_stamps.lookup(handle.token).?.revision.eql(own.revision));
+    } else try std.testing.expect(core.offer_retry_stamps.lookup(handle.token) == null);
+}
+
+test "session publication retry: declared cohort reuses a stamped OFFER and counts cohort change and lost stamps apart" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xb7)), "publication-cohort.test");
+    defer identity.deinit();
+    var peer = try node_identity.fromSeed(@as([32]u8, @splat(0xb8)), "publication-cohort.test");
+    defer peer.deinit();
+    const local_hex = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_hex = std.fmt.bytesToHex(peer.sign_kp.public_key, .lower);
+    var core = try LinuxServer.init(a, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &.{&peer_hex},
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &.{ &local_hex, &peer_hex },
+    });
+    defer core.deinit();
+    current_reactor = &core.reactors[0];
+    // Declared cohort without session groups: the stamp alone proves reuse.
+    try std.testing.expect(core.hasSessionReplicaCohort());
+    try std.testing.expect(!core.sessionGroupEnabled());
+    const id = try addTestLocalClient(&core, "Alice", "alice");
+    const conn = core.connFor(id).?;
+    const handle = core.sessions.resumeHandleForClient("alice", monitorIdFromClient(id)).?;
+    try std.testing.expect(core.sessions.markPortableResumeIssued("alice", monitorIdFromClient(id)));
+    const snapshot = core.encodeMigrationSnapshot(id, conn) orelse return error.TestUnexpectedResult;
+    defer a.free(snapshot);
+    const Step = enum { reuse, cohort_changed, stamp_lost };
+    for ([_]Step{ .reuse, .cohort_changed, .stamp_lost }) |step| {
+        try std.testing.expect(core.publishSessionReplicaUpsert(handle.token, "alice", "Alice", snapshot, false, .resume_eligible));
+        const old = core.session_replica_store.getOrigin(handle.token, identity.shortId()).?;
+        const old_revision = old.revision;
+        const old_wire = try a.dupe(u8, old.wire);
+        defer a.free(old_wire);
+        try std.testing.expect(core.offer_retry_stamps.lookup(handle.token).?.revision.eql(old_revision));
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        core.allocator = fault.allocator();
+        try std.testing.expect(!core.publishSessionAttachmentLease(handle.token));
+        core.allocator = a;
+        const saved_digest = core.relay_v2_activation_state.roster_digest;
+        switch (step) {
+            .reuse => {},
+            .cohort_changed => core.relay_v2_activation_state.roster_digest[0] ^= 1,
+            // Exec and eviction lose the process-local stamp.
+            .stamp_lost => core.offer_retry_stamps.reset(),
+        }
+        core.retryDirtySessionReplicaTokens();
+        core.relay_v2_activation_state.roster_digest = saved_digest;
+        const current = core.session_replica_store.getOrigin(handle.token, identity.shortId()).?;
+        if (step == .reuse) {
+            try std.testing.expectEqualSlices(u8, old_wire, current.wire);
+            try std.testing.expect(current.revision.eql(old_revision));
+        } else {
+            try std.testing.expect(current.revision.compare(old_revision) == .gt);
+        }
+        try std.testing.expect(!core.sessions.tokenReplicaDirty(handle.token));
+        // Every accepted publication restamps under the cohort it saw.
+        try std.testing.expect(core.offer_retry_stamps.lookup(handle.token).?.revision.eql(current.revision));
+    }
+    try std.testing.expectEqual(@as(u64, 1), core.stats.sessionPublicationCount(.offer_retry_reused));
+    try std.testing.expectEqual(@as(u64, 2), core.stats.sessionPublicationCount(.offer_retry_new));
+    const reasons = core.offer_retry_reason_stats.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), reasons.reused_cohort);
+    try std.testing.expectEqual(@as(u64, 0), reasons.reused_no_cohort);
+    try std.testing.expectEqual(@as(u64, 1), reasons.count(.cohort_changed));
+    try std.testing.expectEqual(@as(u64, 1), reasons.classTotal(.required_rotation));
+    try std.testing.expectEqual(@as(u64, 1), reasons.count(.cohort_unstamped));
+    try std.testing.expectEqual(@as(u64, 1), reasons.classTotal(.unproven));
+    try std.testing.expectEqual(@as(u64, 0), reasons.classTotal(.duplicate_publication));
+    var rendered: [offer_retry_reuse.RetryReasonStats.max_render_len]u8 = undefined;
+    const metrics = try core.offer_retry_reason_stats.renderPrometheus(&rendered);
+    try expectContains(metrics, "onyx_session_offer_retry_reused_cohort_total 1\n");
+    try expectContains(metrics, "onyx_session_offer_retry_new_unproven_total 1\n");
+    try expectContains(metrics, "onyx_session_offer_retry_new_required_total 1\n");
+
+    // A revoke forgets the stamp, so no later retry can reuse across it.
+    core.publishSessionReplicaRevoke(handle.token);
+    try std.testing.expect(core.offer_retry_stamps.lookup(handle.token) == null);
 }

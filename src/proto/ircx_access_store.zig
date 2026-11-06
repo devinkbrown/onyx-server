@@ -221,6 +221,45 @@ pub const RemoteFact = struct {
     duration: ?u64 = null,
     hlc: u64,
     origin_node: u64,
+    /// The author's self-contained origin signature when the fact arrived
+    /// signed (`ircx_access_event.toRemoteFact`), else null. Retained opaque
+    /// so the exact fact can be re-flooded; see `OriginProof`.
+    origin_proof: ?OriginProof = null,
+};
+
+pub const origin_pubkey_len: usize = 32;
+pub const origin_sig_len: usize = 64;
+
+/// Opaque copy of an author's ACCESS origin signature (Ed25519 public key and
+/// signature; see `ircx_access_event`). The store never verifies it: the
+/// secured link verified the wire before `applyRemote`, and every re-flood is
+/// verified again by the link before it leaves this node. It is retained only
+/// on rows whose stored fields are EXACTLY the signed fields, so any node
+/// holding a fact can re-flood that fact unchanged (`signedFacts`). That is
+/// how an author that cold-restarted with an empty store re-learns the timed
+/// rules it signed, at their original stamp and therefore at the same
+/// anchored expiry as every other node. Fixed-width and inline: retaining it
+/// never allocates.
+pub const OriginProof = struct {
+    pubkey: [origin_pubkey_len]u8,
+    sig: [origin_sig_len]u8,
+};
+
+/// One retained origin-signed fact, borrowed from the store by
+/// `AccessStore.signedFacts`. `ircx_access_event.fromSignedFact` rebuilds the
+/// signed event from it. Valid until the next store mutation.
+pub const SignedFact = struct {
+    present: bool,
+    channel: []const u8,
+    level: Level,
+    mask: []const u8,
+    /// Empty for a delete marker, matching the signed delete transcript.
+    set_by: []const u8,
+    /// Null for a permanent write and for every delete marker.
+    duration: ?u64,
+    hlc: u64,
+    origin_node: u64,
+    proof: *const OriginProof,
 };
 
 /// What `applyRemote` did with a fact. Every outcome is a success — a `.stale`
@@ -253,11 +292,17 @@ const Entry = struct {
     /// (kept for wire-display stability). A value of 0 or null means permanent.
     duration: ?u64,
     /// Absolute expiry as wall-clock unix seconds; null when the entry never
-    /// expires. Derived from `duration` and the store clock at add time.
+    /// expires. `anchoredExpiry(_, hlc, duration)`: a function of the signed
+    /// write stamp, so every node stores the same instant for one fact.
     expires_at: ?u64,
     /// Write order stamp; see `EntryView.hlc`.
     hlc: u64 = 0,
     origin_node: u64 = 0,
+    /// Origin signature of the remote write that produced this row, when the
+    /// row's channel, level, mask, set_by, duration, hlc and origin are
+    /// byte-for-byte the signed fields. Null for local writes (the daemon
+    /// signs those itself) and for unsigned remote writes.
+    origin_proof: ?OriginProof = null,
 
     fn view(self: *const Entry) EntryView {
         return .{
@@ -283,6 +328,10 @@ const Tombstone = struct {
     origin_node: u64,
     /// Store-clock second the marker was recorded, for TTL reclaim.
     recorded_at: u64,
+    /// Origin signature of the signed remote DELETE that set this marker's
+    /// stamp; null for local deletes, expiry markers, and lapsed timed ADDs
+    /// (whose signed wire says `present`, not deleted).
+    origin_proof: ?OriginProof = null,
 };
 
 /// Exact Helix custody uses these owned row types to rebuild the store without
@@ -306,6 +355,33 @@ fn computeExpiry(now: u64, duration: ?u64) ?u64 {
     const d = duration orelse return null;
     if (d == 0) return null;
     return now +| d;
+}
+
+/// Absolute expiry of a timed write, as a pure function of its signed
+/// `(hlc, duration)` pair: `hlc / 1000 + duration`. `hlc` is the write stamp
+/// from `nextHlc` (local) or a peer's `RemoteFact.hlc` (remote), wall-clock
+/// milliseconds, so `hlc / 1000` is the stamp's wall-clock second.
+///
+/// Receive time never enters the result. A fact applied live, replayed late by
+/// mesh anti-entropy, or first received by a cold-restarted node lands on the
+/// SAME absolute instant on every node, which is what keeps timed ACCESS
+/// restrictions mesh-wide consistent and restart-survivable. A receiver-side
+/// `min(now, stamp)` clamp is deliberately absent: it would make a fact seen
+/// within the author's clock lead expire earlier than the same fact replayed
+/// after the lead, i.e. reintroduce receive-time divergence, while giving no
+/// durable bound (a late receiver computes the unclamped value anyway). The
+/// bound on a forward-skewed author is `AccessStore.max_future_hlc_skew_ms`,
+/// enforced by `applyRemote` before this function sees a remote stamp. The
+/// local author folds its own HLC lead out of the stored duration instead
+/// (see `AccessStore.stampDuration`), so it agrees with every receiver.
+///
+/// `now_s == 0` is a clock-agnostic store (pure-local callers and tests) and
+/// keeps the historical `computeExpiry(0, duration)` behavior.
+fn anchoredExpiry(now_s: u64, hlc: u64, duration: ?u64) ?u64 {
+    const d = duration orelse return null;
+    if (d == 0) return null;
+    if (now_s == 0) return computeExpiry(now_s, d);
+    return (hlc / 1000) +| d;
 }
 
 fn compareFieldIgnoreCase(a: []const u8, b: []const u8) std.math.Order {
@@ -406,6 +482,24 @@ pub const AccessStore = struct {
         self.hlc = @max(self.hlc, hlc_value);
     }
 
+    /// Duration to store and replicate for a LOCAL timed write stamped
+    /// `stamp`, so that `anchoredExpiry(stamp, result)` lands on the
+    /// requested `now_seconds + duration` instead of `stamp_s + duration`.
+    /// The two differ only when the local HLC leads the wall clock (it folded
+    /// a peer stamp from up to `max_future_hlc_skew_ms` ahead, or issued more
+    /// than 1000 stamps in one second); without this a 60-second local DENY
+    /// could live minutes longer on every node. Never returns 0 for a timed
+    /// write (0 means permanent): when the lead already covers the whole
+    /// lifetime the write keeps the 1-second minimum, bounded by the lead.
+    /// Permanent writes and clock-agnostic stores pass through unchanged.
+    fn stampDuration(self: *const AccessStore, duration: ?u64, stamp: u64) ?u64 {
+        const d = duration orelse return null;
+        if (d == 0 or self.now_seconds == 0) return duration;
+        const target = self.now_seconds +| d;
+        const stamp_s = stamp / 1000;
+        return if (target > stamp_s) target - stamp_s else 1;
+    }
+
     /// True when `entry` carries an expiry that the store clock has passed.
     fn isExpiredAt(entry: Entry, now_seconds: u64) bool {
         const at = entry.expires_at orelse return false;
@@ -428,7 +522,7 @@ pub const AccessStore = struct {
         while (idx < self.entries.items.len) {
             if (self.isExpired(self.entries.items[idx])) {
                 const removed = self.entries.orderedRemove(idx);
-                self.recordTombstone(removed.channel, removed.level, removed.mask, removed.hlc, removed.origin_node) catch {};
+                self.recordTombstone(removed.channel, removed.level, removed.mask, removed.hlc, removed.origin_node, null) catch {};
                 freeEntry(self.allocator, removed);
                 removed_count += 1;
             } else {
@@ -626,7 +720,7 @@ pub const AccessStore = struct {
         try validateSetByWith(.{}, set_by);
 
         const stamp = self.nextHlc();
-        try self.upsert(channel, level, mask, set_by, duration, stamp, self.local_node);
+        try self.upsert(channel, level, mask, set_by, self.stampDuration(duration, stamp), stamp, self.local_node, null);
         // A local ADD is an explicit re-grant: retire any marker that would make
         // the store treat this very entry as already-deleted.
         self.dropTombstone(channel, level, mask);
@@ -634,6 +728,9 @@ pub const AccessStore = struct {
 
     /// Add or replace an entry at a caller-chosen write stamp. Shared by the
     /// local `add` path and `applyRemote`; the caller owns rank resolution.
+    /// `proof` (null for local writes) replaces the row's retained origin
+    /// signature. Every allocation precedes the first mutation, so failure
+    /// leaves an existing row byte-identical.
     fn upsert(
         self: *AccessStore,
         channel: []const u8,
@@ -643,15 +740,34 @@ pub const AccessStore = struct {
         duration: ?u64,
         hlc_value: u64,
         origin_node: u64,
+        proof: ?OriginProof,
     ) StoreError!void {
         if (self.findIndex(channel, level, mask)) |idx| {
+            const row = &self.entries.items[idx];
+            // A signed write adopts the exact identity bytes it signed (rows
+            // match case-insensitively), so its retained proof rebuilds the
+            // same fact instead of one that fails origin verification.
+            const adopt = proof != null and !(std.mem.eql(u8, row.channel, channel) and std.mem.eql(u8, row.mask, mask));
+            const channel_copy: ?[]u8 = if (adopt) try self.allocator.dupe(u8, channel) else null;
+            errdefer if (channel_copy) |bytes| self.allocator.free(bytes);
+            const mask_copy: ?[]u8 = if (adopt) try self.allocator.dupe(u8, mask) else null;
+            errdefer if (mask_copy) |bytes| self.allocator.free(bytes);
             const set_by_copy = try self.allocator.dupe(u8, set_by);
-            self.allocator.free(self.entries.items[idx].set_by);
-            self.entries.items[idx].set_by = set_by_copy;
-            self.entries.items[idx].duration = duration;
-            self.entries.items[idx].expires_at = computeExpiry(self.now_seconds, duration);
-            self.entries.items[idx].hlc = hlc_value;
-            self.entries.items[idx].origin_node = origin_node;
+            if (channel_copy) |bytes| {
+                self.allocator.free(row.channel);
+                row.channel = bytes;
+            }
+            if (mask_copy) |bytes| {
+                self.allocator.free(row.mask);
+                row.mask = bytes;
+            }
+            self.allocator.free(row.set_by);
+            row.set_by = set_by_copy;
+            row.duration = duration;
+            row.expires_at = anchoredExpiry(self.now_seconds, hlc_value, duration);
+            row.hlc = hlc_value;
+            row.origin_node = origin_node;
+            row.origin_proof = proof;
             return;
         }
 
@@ -670,9 +786,10 @@ pub const AccessStore = struct {
             .mask = mask_copy,
             .set_by = set_by_copy,
             .duration = duration,
-            .expires_at = computeExpiry(self.now_seconds, duration),
+            .expires_at = anchoredExpiry(self.now_seconds, hlc_value, duration),
             .hlc = hlc_value,
             .origin_node = origin_node,
+            .origin_proof = proof,
         });
     }
 
@@ -684,13 +801,13 @@ pub const AccessStore = struct {
         const idx = self.findIndex(channel, level, mask) orelse {
             // Tombstone even a miss: the ADD this retracts may still be in
             // flight from a peer, and only a marker can outrank its arrival.
-            self.recordTombstone(channel, level, mask, stamp, self.local_node) catch {};
+            self.recordTombstone(channel, level, mask, stamp, self.local_node, null) catch {};
             return false;
         };
         // Marker attempt precedes removal (best-effort: a local operator
         // delete still proceeds under OOM, but the common path records the
         // tombstone while the entry is intact).
-        self.recordTombstone(channel, level, mask, stamp, self.local_node) catch {};
+        self.recordTombstone(channel, level, mask, stamp, self.local_node, null) catch {};
         const removed = self.entries.orderedRemove(idx);
         freeEntry(self.allocator, removed);
         return true;
@@ -705,7 +822,7 @@ pub const AccessStore = struct {
         while (idx < self.entries.items.len) {
             if (selector.matches(self.entries.items[idx])) {
                 const entry = self.entries.items[idx];
-                self.recordTombstone(entry.channel, entry.level, entry.mask, stamp, self.local_node) catch {};
+                self.recordTombstone(entry.channel, entry.level, entry.mask, stamp, self.local_node, null) catch {};
                 const removed = self.entries.orderedRemove(idx);
                 freeEntry(self.allocator, removed);
                 removed_count += 1;
@@ -744,25 +861,34 @@ pub const AccessStore = struct {
         if (self.now_seconds != 0) {
             const now_ms = self.now_seconds *| 1000;
             if (fact.hlc > now_ms +| max_future_hlc_skew_ms) return error.FutureHlc;
-            // A timed grant whose origin-side lifetime already lapsed must
-            // not resurrect with a fresh local lifetime on replay. The HLC
-            // carries the author's wall time, so the origin expiry is
-            // derivable; the skew allowance absorbs clock disagreement. The
-            // fact still carries rank: below, a lapsed timed ADD that
-            // outranks the stored state converges as a tombstone at its own
-            // stamp instead of being dropped, which would leave a superseded
-            // predecessor grant live forever on this receiver.
+            // A timed grant whose lifetime already lapsed must not
+            // resurrect with a fresh local lifetime on replay.
+            // `anchoredExpiry` derives the SAME absolute expiry every node
+            // stores for this fact, so the lapse test here is exactly the
+            // `isExpiredAt` test a node holding it live would apply now: no
+            // extra skew slack, so a lapsed fact is never (re)admitted as
+            // live. The fact still carries rank: below, a lapsed timed ADD
+            // that outranks the stored state converges as a tombstone at its
+            // own stamp instead of being dropped, which would leave a
+            // superseded predecessor grant live forever on this receiver.
             if (fact.present) {
-                if (fact.duration) |duration| {
-                    if (duration != 0) {
-                        const origin_expiry_s = (fact.hlc / 1000) +| duration +| (max_future_hlc_skew_ms / 1000);
-                        if (self.now_seconds > origin_expiry_s) origin_lapsed = true;
-                    }
+                if (anchoredExpiry(self.now_seconds, fact.hlc, fact.duration)) |anchored_at| {
+                    if (self.now_seconds >= anchored_at) origin_lapsed = true;
                 }
             }
         }
 
         self.observeHlc(fact.hlc);
+
+        // Retain the origin signature only where the stored row reproduces
+        // the signed fields exactly. A marker keeps no set_by/duration, so a
+        // signed DELETE carrying either (never minted by this daemon) and a
+        // lapsed timed ADD (signed as present) leave an unsigned marker.
+        const entry_proof: ?OriginProof = if (fact.present) fact.origin_proof else null;
+        const marker_proof: ?OriginProof = if (!fact.present and fact.set_by.len == 0 and fact.duration == null)
+            fact.origin_proof
+        else
+            null;
 
         if (self.findTombstone(fact.channel, fact.level, fact.mask)) |marker| {
             // A tombstone at or above the fact's rank wins: the entry stays gone.
@@ -777,13 +903,13 @@ pub const AccessStore = struct {
                 // present and unmodified, so the caller can retry the same
                 // fact without a leaked entry or a delete that applied
                 // locally but left no marker against re-broadcast.
-                try self.recordTombstone(fact.channel, fact.level, fact.mask, fact.hlc, fact.origin_node);
+                try self.recordTombstone(fact.channel, fact.level, fact.mask, fact.hlc, fact.origin_node, marker_proof);
                 const removed = self.entries.orderedRemove(idx);
                 freeEntry(self.allocator, removed);
                 return .deleted;
             }
         } else if (!fact.present or origin_lapsed) {
-            try self.recordTombstone(fact.channel, fact.level, fact.mask, fact.hlc, fact.origin_node);
+            try self.recordTombstone(fact.channel, fact.level, fact.mask, fact.hlc, fact.origin_node, marker_proof);
             return .deleted;
         }
 
@@ -795,9 +921,94 @@ pub const AccessStore = struct {
             fact.duration,
             fact.hlc,
             fact.origin_node,
+            entry_proof,
         );
         self.dropTombstone(fact.channel, fact.level, fact.mask);
         return .applied;
+    }
+
+    /// Borrowing iterator over every retained origin-signed fact; see
+    /// `signedFacts`.
+    pub const SignedFactIterator = struct {
+        store: *const AccessStore,
+        now_seconds: u64,
+        entry_idx: usize = 0,
+        tombstone_idx: usize = 0,
+
+        pub fn next(self: *SignedFactIterator) ?SignedFact {
+            const entries = self.store.entries.items;
+            while (self.entry_idx < entries.len) {
+                const entry = &entries[self.entry_idx];
+                self.entry_idx += 1;
+                const proof = if (entry.origin_proof) |*p| p else continue;
+                if (isExpiredAt(entry.*, self.now_seconds)) continue;
+                return .{
+                    .present = true,
+                    .channel = entry.channel,
+                    .level = entry.level,
+                    .mask = entry.mask,
+                    .set_by = entry.set_by,
+                    .duration = entry.duration,
+                    .hlc = entry.hlc,
+                    .origin_node = entry.origin_node,
+                    .proof = proof,
+                };
+            }
+            const markers = self.store.tombstones.items;
+            while (self.tombstone_idx < markers.len) {
+                const marker = &markers[self.tombstone_idx];
+                self.tombstone_idx += 1;
+                const proof = if (marker.origin_proof) |*p| p else continue;
+                return .{
+                    .present = false,
+                    .channel = marker.channel,
+                    .level = marker.level,
+                    .mask = marker.mask,
+                    .set_by = "",
+                    .duration = null,
+                    .hlc = marker.hlc,
+                    .origin_node = marker.origin_node,
+                    .proof = proof,
+                };
+            }
+            return null;
+        }
+    };
+
+    /// Every retained origin-signed fact a peer burst can re-flood unchanged:
+    /// rows still live at `now_seconds` first, then delete markers, in store
+    /// order. Lapsed timed rows are skipped (a receiver would only tombstone
+    /// them). Facts authored by this node are included when they came back
+    /// signed; the daemon's own re-signing burst already covers its local
+    /// writes, so callers normally skip `origin_node == local_node`.
+    /// Borrowed: do not mutate the store while iterating.
+    pub fn signedFacts(self: *const AccessStore, now_seconds: u64) SignedFactIterator {
+        return .{ .store = self, .now_seconds = now_seconds };
+    }
+
+    /// Re-derive every timed row's `expires_at` from its own `(hlc, duration)`
+    /// via `anchoredExpiry`, returning how many rows changed. Rows written by
+    /// this binary already satisfy it, so the call is idempotent. Run it after
+    /// adopting rows written by an older binary that anchored expiry to
+    /// arrival time (Helix `access_checkpoint` version 1 capsules): without
+    /// it such a node keeps an expiry that differs from what cold-started or
+    /// upgraded peers compute for the same signed fact. Every row converges
+    /// on the mesh-wide instant, including this node's own legacy rows, whose
+    /// signed `(hlc, duration)` peers already replay. A row can become
+    /// expired; reads already skip it and `pruneExpired` tombstones it.
+    /// Allocation-free and infallible, so it is safe inside a transactional
+    /// adopt after the staged decode. A clock-agnostic store (`now_seconds`
+    /// 0) is left unchanged; refresh the clock first.
+    pub fn reanchorTimedExpiries(self: *AccessStore) usize {
+        if (self.now_seconds == 0) return 0;
+        var changed: usize = 0;
+        for (self.entries.items) |*entry| {
+            const anchored = anchoredExpiry(self.now_seconds, entry.hlc, entry.duration);
+            if (anchored == entry.expires_at) continue;
+            entry.expires_at = anchored;
+            changed += 1;
+        }
+        return changed;
     }
 
     /// Snapshot the write stamp the store would replicate for one entry, so the
@@ -818,6 +1029,10 @@ pub const AccessStore = struct {
         return null;
     }
 
+    /// Record or raise the delete marker for one identity. `proof` (null for
+    /// every local marker) replaces the marker's retained origin signature
+    /// when the stamp is raised. Every allocation precedes the first
+    /// mutation, so failure leaves the marker set unchanged.
     fn recordTombstone(
         self: *AccessStore,
         channel: []const u8,
@@ -825,36 +1040,55 @@ pub const AccessStore = struct {
         mask: []const u8,
         hlc_value: u64,
         origin_node: u64,
+        proof: ?OriginProof,
     ) StoreError!void {
         for (self.tombstones.items) |*marker| {
             if (marker.level == level and
                 std.ascii.eqlIgnoreCase(marker.channel, channel) and
                 std.ascii.eqlIgnoreCase(marker.mask, mask))
             {
-                if (ranksAbove(hlc_value, origin_node, marker.hlc, marker.origin_node)) {
-                    marker.hlc = hlc_value;
-                    marker.origin_node = origin_node;
-                    marker.recorded_at = self.now_seconds;
+                if (!ranksAbove(hlc_value, origin_node, marker.hlc, marker.origin_node)) return;
+                // Same identity-byte adoption as `upsert`, for the same reason.
+                const adopt = proof != null and !(std.mem.eql(u8, marker.channel, channel) and std.mem.eql(u8, marker.mask, mask));
+                const channel_copy: ?[]u8 = if (adopt) try self.allocator.dupe(u8, channel) else null;
+                errdefer if (channel_copy) |bytes| self.allocator.free(bytes);
+                const mask_copy: ?[]u8 = if (adopt) try self.allocator.dupe(u8, mask) else null;
+                if (channel_copy) |bytes| {
+                    self.allocator.free(marker.channel);
+                    marker.channel = bytes;
                 }
+                if (mask_copy) |bytes| {
+                    self.allocator.free(marker.mask);
+                    marker.mask = bytes;
+                }
+                marker.hlc = hlc_value;
+                marker.origin_node = origin_node;
+                marker.recorded_at = self.now_seconds;
+                marker.origin_proof = proof;
                 return;
             }
         }
 
-        if (self.tombstones.items.len >= self.max_tombstones) self.evictOldestTombstone();
-        if (self.tombstones.items.len >= self.max_tombstones) return error.TooManyEntries;
-
+        if (self.max_tombstones == 0) return error.TooManyEntries;
+        // Allocate everything before evicting: an allocation failure must not
+        // lose an existing delete marker (applyRemote is failure-atomic).
         const channel_copy = try self.allocator.dupe(u8, channel);
         errdefer self.allocator.free(channel_copy);
         const mask_copy = try self.allocator.dupe(u8, mask);
         errdefer self.allocator.free(mask_copy);
+        try self.tombstones.ensureUnusedCapacity(self.allocator, 1);
 
-        try self.tombstones.append(self.allocator, .{
+        if (self.tombstones.items.len >= self.max_tombstones) self.evictOldestTombstone();
+        if (self.tombstones.items.len >= self.max_tombstones) return error.TooManyEntries;
+
+        self.tombstones.appendAssumeCapacity(.{
             .channel = channel_copy,
             .level = level,
             .mask = mask_copy,
             .hlc = hlc_value,
             .origin_node = origin_node,
             .recorded_at = self.now_seconds,
+            .origin_proof = proof,
         });
     }
 
@@ -1035,7 +1269,7 @@ pub const AccessStore = struct {
         var copied: usize = 0;
         for (staged.items) |row| {
             const stamp = self.nextHlc();
-            try self.upsert(destination, row.level, row.mask, row.set_by, row.duration, stamp, self.local_node);
+            try self.upsert(destination, row.level, row.mask, row.set_by, self.stampDuration(row.duration, stamp), stamp, self.local_node, null);
             self.dropTombstone(destination, row.level, row.mask);
             copied += 1;
         }
@@ -1891,6 +2125,562 @@ test "ACCESS lapsed timed replacement retires its permanent predecessor" {
     try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#mesh", "x!u@swap.test"));
 }
 
+test "ACCESS remote timed fact expiry is anchored to origin HLC not receive time" {
+    // Q06(A): the SAME fact (same hlc, same duration) must converge on the
+    // SAME absolute expires_at on every node, independent of when each node
+    // happens to apply it — live, replayed by anti-entropy, or caught up
+    // after a cold restart.
+    const origin_t: u64 = 1_700_000_000;
+    const fact = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .host,
+        .mask = "*!*@anchored.test",
+        .set_by = "alice",
+        .duration = 600,
+        .hlc = origin_t * 1000,
+        .origin_node = 4,
+    };
+
+    var soon = AccessStore.init(std.testing.allocator);
+    defer soon.deinit();
+    soon.now_seconds = origin_t + 10;
+    try std.testing.expectEqual(ApplyOutcome.applied, try soon.applyRemote(fact));
+
+    var late = AccessStore.init(std.testing.allocator);
+    defer late.deinit();
+    late.now_seconds = origin_t + 500;
+    try std.testing.expectEqual(ApplyOutcome.applied, try late.applyRemote(fact));
+
+    const soon_entry = (try soon.matchHostmaskWithCloakAt("#mesh", "x!u@anchored.test", null, origin_t + 10)).?;
+    const late_entry = (try late.matchHostmaskWithCloakAt("#mesh", "x!u@anchored.test", null, origin_t + 500)).?;
+    try std.testing.expectEqual(origin_t + 600, soon_entry.expires_at.?);
+    try std.testing.expectEqual(origin_t + 600, late_entry.expires_at.?);
+}
+
+test "ACCESS cold-restart replay does not extend a timed restriction" {
+    // Q06(A): a fresh (just-restarted) store that only now receives the fact
+    // must NOT mint a new full lifetime from its own clock.
+    const origin_t: u64 = 1_700_000_000;
+    const fact = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .host,
+        .mask = "*!*@restart.test",
+        .set_by = "alice",
+        .duration = 600,
+        .hlc = origin_t * 1000,
+        .origin_node = 4,
+    };
+
+    var fresh = AccessStore.init(std.testing.allocator);
+    defer fresh.deinit();
+    fresh.now_seconds = origin_t + 590;
+    try std.testing.expectEqual(ApplyOutcome.applied, try fresh.applyRemote(fact));
+    const entry = (try fresh.matchHostmaskWithCloakAt("#mesh", "x!u@restart.test", null, origin_t + 590)).?;
+    try std.testing.expectEqual(origin_t + 600, entry.expires_at.?);
+    try std.testing.expect(entry.expires_at.? != origin_t + 590 + 600);
+
+    fresh.now_seconds = origin_t + 601;
+    try std.testing.expectEqual(@as(?EntryView, null), try fresh.matchHostmask("#mesh", "x!u@restart.test"));
+}
+
+test "ACCESS future-skewed HLC within window anchors expiry identically on every receiver" {
+    // A forward-skewed author's fact must land on ONE absolute instant no
+    // matter whether a receiver applies it before or after its own clock
+    // reaches the stamp; a receive-time clamp would split the mesh.
+    const t: u64 = 1_700_000_000;
+    const skewed = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .voice,
+        .mask = "*!*@skew.test",
+        .set_by = "alice",
+        .duration = 120,
+        .hlc = t * 1000 + AccessStore.max_future_hlc_skew_ms,
+        .origin_node = 9,
+    };
+    const skew_s = AccessStore.max_future_hlc_skew_ms / 1000;
+
+    var behind = AccessStore.init(std.testing.allocator);
+    defer behind.deinit();
+    behind.now_seconds = t;
+    try std.testing.expectEqual(ApplyOutcome.applied, try behind.applyRemote(skewed));
+
+    var caught_up = AccessStore.init(std.testing.allocator);
+    defer caught_up.deinit();
+    caught_up.now_seconds = t + skew_s + 60;
+    try std.testing.expectEqual(ApplyOutcome.applied, try caught_up.applyRemote(skewed));
+
+    const lhs = (try behind.matchHostmask("#mesh", "x!u@skew.test")).?;
+    const rhs = (try caught_up.matchHostmask("#mesh", "x!u@skew.test")).?;
+    try std.testing.expectEqual(t + skew_s + 120, lhs.expires_at.?);
+    try std.testing.expectEqual(lhs.expires_at, rhs.expires_at);
+
+    // One millisecond past the skew budget is refused outright and never
+    // folds into the receiver clock.
+    var hostile = skewed;
+    hostile.mask = "*!*@hostile.test";
+    hostile.hlc += 1;
+    var fresh = AccessStore.init(std.testing.allocator);
+    defer fresh.deinit();
+    fresh.now_seconds = t;
+    try std.testing.expectError(error.FutureHlc, fresh.applyRemote(hostile));
+    try std.testing.expectEqual(@as(u64, 0), fresh.hlc);
+    try std.testing.expectEqual(@as(usize, 0), fresh.entries.items.len);
+}
+
+test "ACCESS local add folds HLC lead out of expiry so author and receivers agree" {
+    const t: u64 = 1_700_000_000;
+    var author = AccessStore.init(std.testing.allocator);
+    defer author.deinit();
+    author.now_seconds = t;
+    author.local_node = 2;
+
+    // A peer two minutes ahead pushes the author's HLC past its wall clock.
+    try std.testing.expectEqual(ApplyOutcome.applied, try author.applyRemote(.{
+        .present = true,
+        .channel = "#lead",
+        .level = .voice,
+        .mask = "*!*@peer.test",
+        .set_by = "peer",
+        .hlc = (t + 120) * 1000,
+        .origin_node = 7,
+    }));
+
+    try author.add("#mesh", .deny, "*!*@lead.test", "alice", 600);
+    const own = (try author.matchHostmask("#mesh", "x!u@lead.test")).?;
+    try std.testing.expect(own.hlc / 1000 == t + 120);
+    // Requested lifetime is honored against the author's wall clock, not
+    // extended by the two-minute HLC lead.
+    try std.testing.expectEqual(t + 600, own.expires_at.?);
+    try std.testing.expectEqual(@as(?u64, 480), own.duration);
+
+    // The replicated (hlc, duration) pair reproduces the same instant on a
+    // live receiver and on a cold-restarted one replaying it later.
+    const fact = RemoteFact{
+        .present = true,
+        .channel = own.channel,
+        .level = own.level,
+        .mask = own.mask,
+        .set_by = own.set_by,
+        .duration = own.duration,
+        .hlc = own.hlc,
+        .origin_node = own.origin_node,
+    };
+    for ([_]u64{ t + 1, t + 300, t + 599 }) |receiver_now| {
+        var receiver = AccessStore.init(std.testing.allocator);
+        defer receiver.deinit();
+        receiver.now_seconds = receiver_now;
+        try std.testing.expectEqual(ApplyOutcome.applied, try receiver.applyRemote(fact));
+        const got = (try receiver.matchHostmask("#mesh", "x!u@lead.test")).?;
+        try std.testing.expectEqual(t + 600, got.expires_at.?);
+    }
+
+    // A lead that covers the whole lifetime keeps the write TIMED (never the
+    // permanent 0) at the 1-second minimum past its stamp.
+    try author.add("#mesh", .deny, "*!*@short.test", "alice", 60);
+    const short = (try author.matchHostmask("#mesh", "x!u@short.test")).?;
+    try std.testing.expectEqual(@as(?u64, 1), short.duration);
+    try std.testing.expectEqual(t + 121, short.expires_at.?);
+}
+
+test "ACCESS copyFrom under HLC lead never extends a timed template row" {
+    const t: u64 = 1_700_000_000;
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = t;
+    try store.add("#template", .deny, "*!*@copy.test", "alice", 600);
+
+    store.now_seconds = t + 100;
+    _ = try store.applyRemote(.{
+        .present = true,
+        .channel = "#other",
+        .level = .voice,
+        .mask = "*!*@peer.test",
+        .set_by = "peer",
+        .hlc = (t + 250) * 1000,
+        .origin_node = 7,
+    });
+    const result = try store.copyFrom("#copy", "#template", .merge);
+    try std.testing.expectEqual(@as(usize, 1), result.copied);
+    const copied = (try store.matchHostmask("#copy", "x!u@copy.test")).?;
+    try std.testing.expectEqual(t + 600, copied.expires_at.?);
+    try std.testing.expectEqual(t + 600, (copied.hlc / 1000) + copied.duration.?);
+}
+
+test "ACCESS timed remote apply is allocation-failure atomic" {
+    const t: u64 = 1_700_000_000;
+    const first = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .host,
+        .mask = "*!*@oom.test",
+        .set_by = "alice",
+        .duration = 600,
+        .hlc = t * 1000,
+        .origin_node = 4,
+    };
+    var replacement = first;
+    replacement.set_by = "bob";
+    replacement.duration = 900;
+    replacement.hlc = (t + 10) * 1000;
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var store = AccessStore.init(failing.allocator());
+        defer store.deinit();
+        store.now_seconds = t + 20;
+
+        const first_ok = if (store.applyRemote(first)) |outcome| blk: {
+            try std.testing.expectEqual(ApplyOutcome.applied, outcome);
+            break :blk true;
+        } else |err| blk: {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
+            break :blk false;
+        };
+        if (!first_ok) continue;
+
+        if (store.applyRemote(replacement)) |outcome| {
+            try std.testing.expectEqual(ApplyOutcome.applied, outcome);
+            const got = (try store.matchHostmask("#mesh", "x!u@oom.test")).?;
+            try std.testing.expectEqualStrings("bob", got.set_by);
+            try std.testing.expectEqual(t + 10 + 900, got.expires_at.?);
+            try std.testing.expect(!failing.has_induced_failure);
+            break;
+        } else |err| {
+            // The failed replacement leaves the prior row byte-identical.
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+            const kept = store.entries.items[0];
+            try std.testing.expectEqualStrings("alice", kept.set_by);
+            try std.testing.expectEqual(@as(?u64, 600), kept.duration);
+            try std.testing.expectEqual(@as(?u64, t + 600), kept.expires_at);
+            try std.testing.expectEqual(t * 1000, kept.hlc);
+        }
+    }
+}
+
+test "ACCESS tombstone insert at full budget is allocation-failure atomic" {
+    const markers = [_]RemoteFact{
+        .{ .present = false, .channel = "#a", .level = .grant, .mask = "a!u@h", .hlc = 1_000, .origin_node = 7 },
+        .{ .present = false, .channel = "#b", .level = .grant, .mask = "b!u@h", .hlc = 2_000, .origin_node = 7 },
+    };
+    const incoming = RemoteFact{ .present = false, .channel = "#c", .level = .deny, .mask = "c!u@h", .hlc = 3_000, .origin_node = 8 };
+
+    const setup_allocs = blk: {
+        var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var store = AccessStore.init(counting.allocator());
+        defer store.deinit();
+        store.max_tombstones = markers.len;
+        store.now_seconds = 10;
+        for (markers) |fact| _ = try store.applyRemote(fact);
+        break :blk counting.alloc_index;
+    };
+    var extra: usize = 0;
+    while (true) : (extra += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = setup_allocs + extra });
+        var store = AccessStore.init(failing.allocator());
+        defer store.deinit();
+        store.max_tombstones = markers.len;
+        store.now_seconds = 10;
+        for (markers) |fact| _ = try store.applyRemote(fact);
+        try std.testing.expectEqual(markers.len, store.tombstoneCount());
+        if (store.applyRemote(incoming)) |_| {
+            try std.testing.expectEqual(markers.len, store.tombstoneCount());
+            try std.testing.expectEqualStrings("#b", store.tombstones.items[0].channel);
+            try std.testing.expectEqualStrings("#c", store.tombstones.items[1].channel);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(markers.len, store.tombstoneCount());
+            for (markers, store.tombstones.items) |want, got| {
+                try std.testing.expectEqualStrings(want.channel, got.channel);
+                try std.testing.expectEqual(want.hlc, got.hlc);
+                try std.testing.expectEqual(want.origin_node, got.origin_node);
+            }
+        }
+    }
+}
+
+test "ACCESS local add expiry equals now plus duration and checkpoint round trip preserves it" {
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 1_700_000_000;
+
+    try store.add("#mesh", .voice, "*!*@local.test", "alice", 300);
+    const entry = (try store.matchHostmask("#mesh", "x!u@local.test")).?;
+    try std.testing.expectEqual(store.now_seconds + 300, entry.expires_at.?);
+
+    // The owned row the Helix checkpoint custody path round-trips (see
+    // `access_checkpoint.zig`) carries the SAME absolute value, not the
+    // original duration.
+    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+    const checkpoint_row: CheckpointEntry = store.entries.items[0];
+    try std.testing.expectEqual(store.now_seconds + 300, checkpoint_row.expires_at.?);
+    try std.testing.expectEqual(@as(?u64, 300), checkpoint_row.duration);
+}
+
+test "ACCESS applyRemote timed fact already past anchored expiry converges as tombstone" {
+    // Tightened origin_lapsed: no skew cushion on top of `anchoredExpiry`,
+    // so a fact already past its anchored expiry is never (re)admitted as
+    // live, even inside the old 300-second allowance.
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = 1_700_000_000;
+
+    const lapsed = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .host,
+        .mask = "*!*@tight.test",
+        .set_by = "alice",
+        .duration = 60,
+        // Anchored expiry = (now - 200) + 60 = now - 140, already past "now".
+        // The OLD formula (origin_expiry_s + 300s skew) would have computed
+        // now + 160 here and NOT treated this as lapsed.
+        .hlc = (1_700_000_000 - 200) * 1000,
+        .origin_node = 4,
+    };
+    try std.testing.expectEqual(ApplyOutcome.deleted, try store.applyRemote(lapsed));
+    try std.testing.expectEqual(@as(?EntryView, null), try store.matchHostmask("#mesh", "x!u@tight.test"));
+    try std.testing.expectEqual(@as(usize, 1), store.tombstoneCount());
+}
+
+fn testProof(fill: u8) OriginProof {
+    var proof: OriginProof = undefined;
+    @memset(&proof.pubkey, fill);
+    @memset(&proof.sig, fill +% 1);
+    return proof;
+}
+
+fn testSignedCount(store: *const AccessStore, now_seconds: u64) usize {
+    var it = store.signedFacts(now_seconds);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    return count;
+}
+
+test "ACCESS origin proof is retained only where the row reproduces the signed fact" {
+    const t: u64 = 1_700_000_000;
+    var store = AccessStore.init(std.testing.allocator);
+    defer store.deinit();
+    store.now_seconds = t;
+    store.local_node = 2;
+
+    // Signed timed ADD: retained, re-floodable with every signed field.
+    try std.testing.expectEqual(ApplyOutcome.applied, try store.applyRemote(.{
+        .present = true,
+        .channel = "#mesh",
+        .level = .deny,
+        .mask = "*!*@kept.test",
+        .set_by = "alice",
+        .duration = 600,
+        .hlc = t * 1000,
+        .origin_node = 9,
+        .origin_proof = testProof(0x10),
+    }));
+    var it = store.signedFacts(t);
+    const kept = it.next().?;
+    try std.testing.expect(kept.present);
+    try std.testing.expectEqualStrings("*!*@kept.test", kept.mask);
+    try std.testing.expectEqualStrings("alice", kept.set_by);
+    try std.testing.expectEqual(@as(?u64, 600), kept.duration);
+    try std.testing.expectEqual(t * 1000, kept.hlc);
+    try std.testing.expectEqual(@as(u64, 9), kept.origin_node);
+    try std.testing.expectEqualSlices(u8, &testProof(0x10).pubkey, &kept.proof.pubkey);
+    try std.testing.expectEqual(@as(?SignedFact, null), it.next());
+    // Past its anchored expiry it is no longer offered for re-flood.
+    try std.testing.expectEqual(@as(usize, 0), testSignedCount(&store, t + 600));
+
+    // A local overwrite is this node's own write: the stale foreign proof
+    // must not survive on the replaced row.
+    try store.add("#mesh", .deny, "*!*@kept.test", "oper", null);
+    try std.testing.expectEqual(@as(usize, 0), testSignedCount(&store, t));
+
+    // A lapsed signed timed ADD converges as an UNSIGNED marker: its wire
+    // says present, so it cannot be re-flooded as a delete.
+    try std.testing.expectEqual(ApplyOutcome.deleted, try store.applyRemote(.{
+        .present = true,
+        .channel = "#mesh",
+        .level = .voice,
+        .mask = "*!*@lapsed.test",
+        .set_by = "alice",
+        .duration = 60,
+        .hlc = (t - 120) * 1000,
+        .origin_node = 9,
+        .origin_proof = testProof(0x20),
+    }));
+    // A signed delete whose transcript carries fields a marker cannot keep is
+    // likewise retained unsigned.
+    try std.testing.expectEqual(ApplyOutcome.deleted, try store.applyRemote(.{
+        .present = false,
+        .channel = "#mesh",
+        .level = .host,
+        .mask = "*!*@odd.test",
+        .set_by = "not-empty",
+        .hlc = t * 1000 + 1,
+        .origin_node = 9,
+        .origin_proof = testProof(0x30),
+    }));
+    try std.testing.expectEqual(@as(usize, 2), store.tombstoneCount());
+    try std.testing.expectEqual(@as(usize, 0), testSignedCount(&store, t));
+
+    // A canonical signed delete is retained; a later local delete of the same
+    // identity outranks it and clears the foreign proof.
+    try std.testing.expectEqual(ApplyOutcome.deleted, try store.applyRemote(.{
+        .present = false,
+        .channel = "#mesh",
+        .level = .owner,
+        .mask = "*!*@del.test",
+        .hlc = t * 1000 + 2,
+        .origin_node = 9,
+        .origin_proof = testProof(0x40),
+    }));
+    var marker_it = store.signedFacts(t);
+    const marker = marker_it.next().?;
+    try std.testing.expect(!marker.present);
+    try std.testing.expectEqualStrings("", marker.set_by);
+    try std.testing.expectEqual(@as(?u64, null), marker.duration);
+    try std.testing.expectEqual(t * 1000 + 2, marker.hlc);
+    try std.testing.expect(!(try store.remove("#mesh", .owner, "*!*@del.test")));
+    try std.testing.expectEqual(@as(usize, 0), testSignedCount(&store, t));
+}
+
+test "ACCESS signed replacement adopts signed identity bytes and is allocation-failure atomic" {
+    const t: u64 = 1_700_000_000;
+    const first = RemoteFact{
+        .present = true,
+        .channel = "#Mesh",
+        .level = .deny,
+        .mask = "*!*@Case.test",
+        .set_by = "alice",
+        .duration = 600,
+        .hlc = t * 1000,
+        .origin_node = 9,
+        .origin_proof = testProof(0x50),
+    };
+    var second = first;
+    second.channel = "#mesh";
+    second.mask = "*!*@case.test";
+    second.set_by = "bob";
+    second.hlc = t * 1000 + 7;
+    second.origin_proof = testProof(0x60);
+    var gone = second;
+    gone.present = false;
+    gone.channel = "#MESH";
+    gone.mask = "*!*@CASE.test";
+    gone.set_by = "";
+    gone.duration = null;
+    gone.hlc = t * 1000 + 9;
+    gone.origin_proof = testProof(0x70);
+    var regone = gone;
+    regone.channel = "#mEsh";
+    regone.hlc = t * 1000 + 11;
+    regone.origin_proof = testProof(0x80);
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var store = AccessStore.init(failing.allocator());
+        defer store.deinit();
+        store.now_seconds = t;
+        _ = store.applyRemote(first) catch continue;
+
+        if (store.applyRemote(second)) |outcome| {
+            try std.testing.expectEqual(ApplyOutcome.applied, outcome);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            const row = store.entries.items[0];
+            try std.testing.expectEqualStrings("#Mesh", row.channel);
+            try std.testing.expectEqualStrings("*!*@Case.test", row.mask);
+            try std.testing.expectEqualStrings("alice", row.set_by);
+            try std.testing.expectEqual(t * 1000, row.hlc);
+            try std.testing.expectEqualSlices(u8, &testProof(0x50).sig, &row.origin_proof.?.sig);
+            continue;
+        }
+        const row = store.entries.items[0];
+        try std.testing.expectEqualStrings("#mesh", row.channel);
+        try std.testing.expectEqualStrings("*!*@case.test", row.mask);
+        try std.testing.expectEqualStrings("bob", row.set_by);
+        try std.testing.expectEqualSlices(u8, &testProof(0x60).sig, &row.origin_proof.?.sig);
+
+        // The delete marker is recorded first (fresh), then raised by a
+        // later signed delete spelled differently: same adoption rule.
+        _ = store.applyRemote(gone) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 0), store.tombstoneCount());
+            continue;
+        };
+        try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
+        if (store.applyRemote(regone)) |outcome| {
+            try std.testing.expectEqual(ApplyOutcome.deleted, outcome);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            const kept = store.tombstones.items[0];
+            try std.testing.expectEqualStrings("#MESH", kept.channel);
+            try std.testing.expectEqual(t * 1000 + 9, kept.hlc);
+            try std.testing.expectEqualSlices(u8, &testProof(0x70).sig, &kept.origin_proof.?.sig);
+            continue;
+        }
+        const marker = store.tombstones.items[0];
+        try std.testing.expectEqualStrings("#mEsh", marker.channel);
+        try std.testing.expectEqualStrings("*!*@CASE.test", marker.mask);
+        try std.testing.expectEqual(t * 1000 + 11, marker.hlc);
+        try std.testing.expectEqualSlices(u8, &testProof(0x80).sig, &marker.origin_proof.?.sig);
+        try std.testing.expect(!failing.has_induced_failure);
+        break;
+    }
+}
+
+test "ACCESS reanchor normalizes arrival-anchored legacy expiries to the signed instant" {
+    const t: u64 = 1_700_000_000;
+    const fact = RemoteFact{
+        .present = true,
+        .channel = "#mesh",
+        .level = .deny,
+        .mask = "*!*@legacy.test",
+        .set_by = "alice",
+        .duration = 3 * 3600,
+        .hlc = t * 1000,
+        .origin_node = 9,
+    };
+    var adopted = AccessStore.init(std.testing.allocator);
+    defer adopted.deinit();
+    adopted.now_seconds = t + 2 * 3600;
+    try std.testing.expectEqual(ApplyOutcome.applied, try adopted.applyRemote(fact));
+    try adopted.add("#mesh", .voice, "*!*@perm.test", "oper", null);
+    // Simulate the rows a v1 checkpoint from the previous binary restores:
+    // the timed row anchored to its arrival two hours late.
+    adopted.entries.items[0].expires_at = t + 5 * 3600;
+    adopted.now_seconds = t + 2 * 3600 + 5;
+
+    try std.testing.expectEqual(@as(usize, 1), adopted.reanchorTimedExpiries());
+    try std.testing.expectEqual(@as(?u64, t + 3 * 3600), adopted.entries.items[0].expires_at);
+    try std.testing.expectEqual(@as(?u64, null), adopted.entries.items[1].expires_at);
+    try std.testing.expectEqual(@as(usize, 0), adopted.reanchorTimedExpiries());
+
+    // A cold-started peer applying the same signed fact agrees exactly.
+    var fresh = AccessStore.init(std.testing.allocator);
+    defer fresh.deinit();
+    fresh.now_seconds = t + 2 * 3600 + 5;
+    try std.testing.expectEqual(ApplyOutcome.applied, try fresh.applyRemote(fact));
+    try std.testing.expectEqual(fresh.entries.items[0].expires_at, adopted.entries.items[0].expires_at);
+    adopted.now_seconds = t + 3 * 3600;
+    try std.testing.expectEqual(@as(?EntryView, null), try adopted.matchHostmask("#mesh", "x!u@legacy.test"));
+
+    // Clock-agnostic stores are left untouched.
+    var agnostic = AccessStore.init(std.testing.allocator);
+    defer agnostic.deinit();
+    try agnostic.add("#mesh", .deny, "*!*@zero.test", "oper", 60);
+    agnostic.entries.items[0].expires_at = 61;
+    try std.testing.expectEqual(@as(usize, 0), agnostic.reanchorTimedExpiries());
+    try std.testing.expectEqual(@as(?u64, 61), agnostic.entries.items[0].expires_at);
+}
+
 test "ACCESS expired timed entry leaves a tombstone against ADD replay" {
     var store = AccessStore.init(std.testing.allocator);
     defer store.deinit();
@@ -2166,12 +2956,12 @@ test "expiry sweep cap truncates deterministically and empty store is empty" {
 test "expiry sweep pins window edges exactly" {
     var store = AccessStore.init(std.testing.allocator);
     defer store.deinit();
-    store.now_seconds = 1000;
-    try store.add("#a", .voice, "at-now!*@h.test", "oper", 0); // permanent via 0, excluded below
-    // Build exact expiries by moving the add clock.
+    // Build exact expiries by moving the add clock FORWARD only: a local
+    // write's expiry is anchored to its HLC stamp, which never steps back.
     store.now_seconds = 990;
     try store.add("#a", .voice, "at-now2!*@h.test", "oper", 10); // expires 1000 == now
     store.now_seconds = 1000;
+    try store.add("#a", .voice, "at-now!*@h.test", "oper", 0); // permanent via 0, excluded below
     try store.add("#a", .host, "at-edge!*@h.test", "oper", 100); // expires 1100 == now+window
     try store.add("#a", .owner, "past-edge!*@h.test", "oper", 101); // expires 1101
 

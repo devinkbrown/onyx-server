@@ -29,6 +29,7 @@ const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig"
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const meshpass = @import("../proto/meshpass.zig");
 const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
+const mesh_config_compat = @import("mesh_config_compat.zig");
 
 /// Cross-node relay message types (re-exported at module scope for the daemon).
 pub const RelayMessage = s2s_peer.RelayMessage;
@@ -787,6 +788,59 @@ pub const S2sLink = struct {
         return self.peer.takeOperGrants();
     }
 
+    /// Emit one opaque `mesh_config_compat` record. The peer driver refuses
+    /// (`error.ConfigCompatUnavailable`) unless the link is established with
+    /// both ends signing on an Event Spine v2 (Mooring) transport and the peer
+    /// answered the config-compat PING extension, so an older or plaintext
+    /// peer is never sent the frame. On any error nothing is appended.
+    pub fn sendConfigCompat(self: *S2sLink, record: []const u8) !void {
+        if (record.len == 0) return error.InvalidConfigCompat;
+        if (record.len > mesh_config_compat.max_record_len) return error.PayloadTooLarge;
+        try self.peer.sendConfigCompat(self.sink(), record);
+    }
+
+    /// Move the latest received config-compat record into `out` (latest wins;
+    /// the peer keeps one fixed slot, no allocation). Null when none is
+    /// pending. The bytes are untrusted until `mesh_config_compat.evaluate`
+    /// binds them to the authenticated peer key and Mooring session.
+    pub fn takeConfigCompat(self: *S2sLink, out: *[mesh_config_compat.max_record_len]u8) ?[]const u8 {
+        comptime std.debug.assert(s2s_peer.S2sPeer.max_config_compat_record_len == mesh_config_compat.max_record_len);
+        return self.peer.takeConfigCompat(out);
+    }
+
+    /// One-shot edge: true once per handshake when the peer first proves the
+    /// config-compat extension. The daemon (re)sends its record on this edge.
+    pub fn takeConfigCompatReady(self: *S2sLink) bool {
+        return self.peer.takeConfigCompatReady();
+    }
+
+    pub fn supportsConfigCompat(self: *const S2sLink) bool {
+        return self.peer.supportsConfigCompat();
+    }
+
+    /// Emit one M03 digest-exchange body (DIGEST_OFFER/NEED/COMMIT). The peer
+    /// driver refuses (`error.DigestSyncUnavailable`) unless the link is
+    /// established on a signed Event Spine v2 transport and the peer answered
+    /// the digest-reconcile PING extension. On any error nothing is appended.
+    pub fn sendDigestFrame(self: *S2sLink, frame_type: s2s_frame.FrameType, payload: []const u8) !void {
+        try self.peer.sendDigestFrame(self.sink(), frame_type, payload);
+    }
+
+    /// Verified digest frames (`[tag] ++ body`) in arrival order; the caller
+    /// owns and frees each slice and the outer slice.
+    pub fn takeDigestFrames(self: *S2sLink) ![][]u8 {
+        return self.peer.takeDigestFrames();
+    }
+
+    /// One-shot: a verified digest frame was dropped since the last call.
+    pub fn takeDigestFramesLost(self: *S2sLink) bool {
+        return self.peer.takeDigestFramesLost();
+    }
+
+    pub fn supportsDigestSync(self: *const S2sLink) bool {
+        return self.peer.supportsDigestSync();
+    }
+
     /// Ship a live-session migration capsule (`migration_relay` frame bytes) to
     /// the peer (best-effort; only meaningful once established).
     pub fn sendSessionMigrate(self: *S2sLink, frame_bytes: []const u8) !void {
@@ -920,6 +974,10 @@ pub const S2sLink = struct {
 
     pub fn forwardAccessEventFrame(self: *S2sLink, wire: []const u8) !bool {
         return self.peer.forwardAccessEventFrame(self.sink(), wire);
+    }
+
+    pub fn resendAccessEventFrame(self: *S2sLink, wire: []const u8) !bool {
+        return self.peer.resendAccessEventFrame(self.sink(), wire);
     }
 
     pub fn takeAccessEventFrames(self: *S2sLink) ![]InboundAccessEventV1 {
@@ -1934,4 +1992,98 @@ test "S2sLink.init threads peer driver config into live link state" {
     try std.testing.expectEqual(@as(usize, 2), link.peer.session.config.gossip_config.fanout);
     try std.testing.expectEqual(@as(usize, 4), link.peer.session.config.view_config.active_capacity);
     try std.testing.expectEqual(@as(usize, 12), link.peer.session.config.view_config.passive_capacity);
+}
+
+/// True once the hub driver carries CONFIG_COMPAT frames. Until then the
+/// config-compat link tests below report as skipped rather than passing.
+pub const config_compat_transport_ready = @hasDecl(s2s_peer.S2sPeer, "sendConfigCompat");
+
+fn initSignedConfigCompatPair(a: *S2sLink, b: *S2sLink, allocator: std.mem.Allocator, mooring: bool) !void {
+    const kp_a = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0xc1)));
+    const kp_b = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(0xc2)));
+    const a_short = signed_frame.originShortId(kp_a.public_key);
+    const b_short = signed_frame.originShortId(kp_b.public_key);
+    try a.init(.{ .allocator = allocator, .local_node_id = a_short, .remote_node_id = b_short, .local_epoch_ms = 1000, .server_name = "a.onyx", .signing_key = kp_a, .event_spine_v2_transport_enabled = mooring });
+    errdefer a.deinit();
+    try b.init(.{ .allocator = allocator, .local_node_id = b_short, .remote_node_id = a_short, .local_epoch_ms = 1001, .server_name = "b.onyx", .signing_key = kp_b, .event_spine_v2_transport_enabled = mooring });
+}
+
+test "s2s_link: config-compat is refused on a plaintext link in both directions" {
+    if (comptime config_compat_transport_ready) {
+        const allocator = std.testing.allocator;
+        var a: S2sLink = undefined;
+        try a.init(.{ .allocator = allocator, .local_node_id = 1, .remote_node_id = 2, .local_epoch_ms = 1000, .server_name = "a.onyx", .config = plaintext_link_config });
+        defer a.deinit();
+        var b: S2sLink = undefined;
+        try b.init(.{ .allocator = allocator, .local_node_id = 2, .remote_node_id = 1, .local_epoch_ms = 1001, .server_name = "b.onyx", .config = plaintext_link_config });
+        defer b.deinit();
+        try a.start(10);
+        try pumpLinks(&a, &b, allocator, 11);
+        try std.testing.expect(a.peer.established and b.peer.established);
+        try std.testing.expect(!a.supportsConfigCompat() and !a.takeConfigCompatReady());
+
+        // Sending refuses without touching the outbound buffer.
+        try std.testing.expectError(error.ConfigCompatUnavailable, a.sendConfigCompat("OCC1-record"));
+        try std.testing.expectEqual(@as(usize, 0), a.outbound().len);
+        const oversize: [mesh_config_compat.max_record_len + 1]u8 = @splat(0);
+        try std.testing.expectError(error.PayloadTooLarge, a.sendConfigCompat(&oversize));
+        try std.testing.expectError(error.InvalidConfigCompat, a.sendConfigCompat(""));
+        try std.testing.expectEqual(@as(usize, 0), a.outbound().len);
+
+        // A hostile plaintext peer injecting the frame is dropped, not queued.
+        var frame_buf: [64]u8 = undefined;
+        const frame = try s2s_frame.encode(.CONFIG_COMPAT, "OCC1-record", &frame_buf);
+        try b.feed(frame, 40, 7);
+        var out: [mesh_config_compat.max_record_len]u8 = undefined;
+        try std.testing.expect(b.takeConfigCompat(&out) == null);
+    } else return error.SkipZigTest;
+}
+
+test "s2s_link: config-compat requires the Mooring transport even when both ends sign" {
+    if (comptime config_compat_transport_ready) {
+        const allocator = std.testing.allocator;
+        var a: S2sLink = undefined;
+        var b: S2sLink = undefined;
+        try initSignedConfigCompatPair(&a, &b, allocator, false);
+        defer a.deinit();
+        defer b.deinit();
+        try a.start(10);
+        try pumpLinks(&a, &b, allocator, 11);
+        try std.testing.expect(a.peer.peer_supports_signing and b.peer.peer_supports_signing);
+        // The extension is never proven, so no edge fires and sends refuse.
+        try std.testing.expect(!a.supportsConfigCompat() and !b.supportsConfigCompat());
+        try std.testing.expect(!a.takeConfigCompatReady() and !b.takeConfigCompatReady());
+        try std.testing.expectError(error.ConfigCompatUnavailable, a.sendConfigCompat("OCC1-record"));
+        try std.testing.expectEqual(@as(usize, 0), a.outbound().len);
+    } else return error.SkipZigTest;
+}
+
+test "s2s_link: config-compat records cross a signed Event Spine v2 link, latest wins, edge fires once" {
+    if (comptime config_compat_transport_ready) {
+        const allocator = std.testing.allocator;
+        var a: S2sLink = undefined;
+        var b: S2sLink = undefined;
+        try initSignedConfigCompatPair(&a, &b, allocator, true);
+        defer a.deinit();
+        defer b.deinit();
+        try a.start(10);
+        try pumpLinks(&a, &b, allocator, 11);
+        try std.testing.expect(a.supportsConfigCompat() and b.supportsConfigCompat());
+        try std.testing.expect(a.takeConfigCompatReady() and b.takeConfigCompatReady());
+        try std.testing.expect(!a.takeConfigCompatReady() and !b.takeConfigCompatReady());
+
+        var out: [mesh_config_compat.max_record_len]u8 = undefined;
+        try std.testing.expect(b.takeConfigCompat(&out) == null);
+        try a.sendConfigCompat("OCC1-first");
+        try a.sendConfigCompat("OCC1-second");
+        try pumpLinks(&a, &b, allocator, 40);
+        try std.testing.expectEqualStrings("OCC1-second", b.takeConfigCompat(&out) orelse return error.TestUnexpectedResult);
+        try std.testing.expect(b.takeConfigCompat(&out) == null);
+
+        // An unsigned injection on a signing link is rejected, keeping the slot empty.
+        var frame_buf: [64]u8 = undefined;
+        const frame = try s2s_frame.encode(.CONFIG_COMPAT, "OCC1-forged", &frame_buf);
+        try b.feed(frame, 50, 7);
+        try std.testing.expect(b.takeConfigCompat(&out) == null);
+    } else return error.SkipZigTest;
 }

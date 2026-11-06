@@ -16,6 +16,10 @@ const SlowTest = struct {
     ns: u64 = 0,
 };
 
+/// Marker for tests that re-exec this binary (`@import("root")`): this runner
+/// selects tests with --test-filter, unlike Zig's build-system runner.
+pub const onyx_verbose_test_runner = true;
+
 var log_err_count: usize = 0;
 var fba_buffer: [8192]u8 = undefined;
 var fba: std.heap.FixedBufferAllocator = .init(&fba_buffer);

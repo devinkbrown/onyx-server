@@ -2,6 +2,13 @@
 
 //! Exact Helix custody for IRCX ACCESS policy and replay state. Entry and
 //! tombstone array positions are preserved because later mutation is ordered.
+//!
+//! Version 2 appends each row's retained origin proof (tag byte 0, or 1
+//! followed by the author's Ed25519 public key and signature) so a node keeps
+//! re-flooding foreign signed facts across an upgrade. Version 1 capsules from
+//! older binaries still decode: their rows carry no proof and their timed
+//! expiries, anchored to arrival time by those binaries, are re-anchored to
+//! the signed `(hlc, duration)` instant every other node computes.
 
 const std = @import("std");
 const access = @import("../../proto/ircx_access_store.zig");
@@ -10,11 +17,13 @@ pub const max_entries: usize = 4096;
 pub const max_tombstones: usize = 4096;
 pub const max_checkpoint_bytes: usize = 8 * 1024 * 1024;
 pub const checkpoint_magic = [_]u8{ 'A', 'C', 'C', 'S' };
-pub const checkpoint_version: u8 = 1;
+pub const checkpoint_version: u8 = 2;
+pub const legacy_checkpoint_version: u8 = 1;
 const header_len: usize = 4 + 1 + 3 + 4 + 2 + 2 + 2 + 2 + 8 + 8 + 8 + 8;
 const checksum_len: usize = 32;
-const entry_min_len: usize = 6 + 1 + 1 + 1 + 8 + 8;
-const tombstone_min_len: usize = 3 + 1 + 1 + 8 + 8 + 8;
+const entry_min_len_v1: usize = 6 + 1 + 1 + 1 + 8 + 8;
+const tombstone_min_len_v1: usize = 3 + 1 + 1 + 8 + 8 + 8;
+const proof_len: usize = access.origin_pubkey_len + access.origin_sig_len;
 const checksum_domain = "onyx-access-checkpoint-v1";
 const max_identities = max_entries + max_tombstones;
 const identity_table_len = max_identities * 2;
@@ -38,6 +47,7 @@ pub const Error = error{
 } || std.mem.Allocator.Error;
 
 const Header = struct {
+    version: u8,
     entry_count: usize,
     tombstone_count: usize,
     max_entries_value: usize,
@@ -63,6 +73,7 @@ const ParsedEntry = struct {
     expires_at: ?u64,
     hlc: u64,
     origin_node: u64,
+    origin_proof: ?access.OriginProof,
 };
 
 const ParsedTombstone = struct {
@@ -72,6 +83,7 @@ const ParsedTombstone = struct {
     hlc: u64,
     origin_node: u64,
     recorded_at: u64,
+    origin_proof: ?access.OriginProof,
 };
 
 pub fn isCheckpoint(bytes: []const u8) bool {
@@ -88,11 +100,11 @@ pub fn validateCheckpoint(bytes: []const u8) Error!void {
     @memset(&table, 0);
     var seen: usize = 0;
     for (0..header.entry_count) |_| {
-        const entry = try readEntry(&reader, header.hlc);
+        const entry = try readEntry(&reader, header);
         try insertIdentity(&table, &identities, &seen, .{ .channel = entry.channel, .level = entry.level, .mask = entry.mask });
     }
     for (0..header.tombstone_count) |_| {
-        const marker = try readTombstone(&reader, header.hlc);
+        const marker = try readTombstone(&reader, header);
         try insertIdentity(&table, &identities, &seen, .{ .channel = marker.channel, .level = marker.level, .mask = marker.mask });
     }
     if (reader.remaining() != 0) return error.TrailingBytes;
@@ -101,6 +113,14 @@ pub fn validateCheckpoint(bytes: []const u8) Error!void {
 /// Export the complete physical order and exact clocks. Source state that
 /// cannot fit the bounded format fails instead of being truncated.
 pub fn encode(allocator: std.mem.Allocator, store: *const access.AccessStore) Error![]u8 {
+    return encodeVersion(allocator, store, checkpoint_version);
+}
+
+/// `version` 1 omits origin proofs; only tests produce it, standing in for an
+/// older binary's capsule.
+fn encodeVersion(allocator: std.mem.Allocator, store: *const access.AccessStore, version: u8) Error![]u8 {
+    std.debug.assert(version == checkpoint_version or version == legacy_checkpoint_version);
+    const with_proofs = version != legacy_checkpoint_version;
     const entry_count = store.entries.items.len;
     const tombstone_count = store.tombstones.items.len;
     if (store.max_entries > max_entries or store.max_tombstones > max_tombstones or
@@ -113,19 +133,20 @@ pub fn encode(allocator: std.mem.Allocator, store: *const access.AccessStore) Er
         if (!validExpiry(entry.duration, entry.expires_at) or entry.hlc > store.hlc) return error.InvalidField;
         try addLen(&total_len, 6 + entry.channel.len + entry.mask.len + entry.set_by.len + 16 +
             (if (entry.duration != null) @as(usize, 8) else 0) +
-            (if (entry.expires_at != null) @as(usize, 8) else 0));
+            (if (entry.expires_at != null) @as(usize, 8) else 0) +
+            proofLen(with_proofs, entry.origin_proof));
     }
     for (store.tombstones.items) |marker| {
         access.validateCheckpointIdentity(marker.channel, marker.mask) catch return error.InvalidField;
         if (marker.hlc > store.hlc) return error.InvalidField;
-        try addLen(&total_len, 3 + marker.channel.len + marker.mask.len + 24);
+        try addLen(&total_len, 3 + marker.channel.len + marker.mask.len + 24 + proofLen(with_proofs, marker.origin_proof));
     }
 
     const out = try allocator.alloc(u8, total_len);
     errdefer allocator.free(out);
     var writer = Writer{ .bytes = out };
     writer.writeBytes(&checkpoint_magic);
-    writer.writeByte(checkpoint_version);
+    writer.writeByte(version);
     writer.writeBytes(&.{ 0, 0, 0 });
     writer.writeU32(@intCast(total_len - header_len - checksum_len));
     writer.writeU16(@intCast(entry_count));
@@ -150,6 +171,7 @@ pub fn encode(allocator: std.mem.Allocator, store: *const access.AccessStore) Er
         if (entry.expires_at) |value| writer.writeU64(value);
         writer.writeU64(entry.hlc);
         writer.writeU64(entry.origin_node);
+        if (with_proofs) writer.writeProof(entry.origin_proof);
     }
     for (store.tombstones.items) |marker| {
         writer.writeByte(@intCast(marker.channel.len));
@@ -160,6 +182,7 @@ pub fn encode(allocator: std.mem.Allocator, store: *const access.AccessStore) Er
         writer.writeU64(marker.hlc);
         writer.writeU64(marker.origin_node);
         writer.writeU64(marker.recorded_at);
+        if (with_proofs) writer.writeProof(marker.origin_proof);
     }
     std.debug.assert(writer.pos + checksum_len == out.len);
     var digest: [checksum_len]u8 = undefined;
@@ -186,7 +209,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!access.Acce
     try restored.tombstones.ensureTotalCapacityPrecise(allocator, header.tombstone_count);
     var reader = Reader{ .bytes = bytes[header_len .. bytes.len - checksum_len] };
     for (0..header.entry_count) |_| {
-        const entry = try readEntry(&reader, header.hlc);
+        const entry = try readEntry(&reader, header);
         const channel = try allocator.dupe(u8, entry.channel);
         errdefer allocator.free(channel);
         const mask = try allocator.dupe(u8, entry.mask);
@@ -202,10 +225,11 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!access.Acce
             .expires_at = entry.expires_at,
             .hlc = entry.hlc,
             .origin_node = entry.origin_node,
+            .origin_proof = entry.origin_proof,
         });
     }
     for (0..header.tombstone_count) |_| {
-        const marker = try readTombstone(&reader, header.hlc);
+        const marker = try readTombstone(&reader, header);
         const channel = try allocator.dupe(u8, marker.channel);
         errdefer allocator.free(channel);
         const mask = try allocator.dupe(u8, marker.mask);
@@ -217,9 +241,12 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!access.Acce
             .hlc = marker.hlc,
             .origin_node = marker.origin_node,
             .recorded_at = marker.recorded_at,
+            .origin_proof = marker.origin_proof,
         });
     }
     std.debug.assert(reader.remaining() == 0);
+    // Infallible and allocation-free, so the staged owner stays atomic.
+    if (header.version == legacy_checkpoint_version) _ = restored.reanchorTimedExpiries();
     return restored;
 }
 
@@ -227,7 +254,8 @@ fn parseHeader(bytes: []const u8) Error!Header {
     if (bytes.len < header_len + checksum_len) return error.Truncated;
     if (bytes.len > max_checkpoint_bytes) return error.CheckpointTooLarge;
     if (!isCheckpoint(bytes)) return error.BadMagic;
-    if (bytes[4] != checkpoint_version) return error.UnsupportedVersion;
+    const version = bytes[4];
+    if (version != checkpoint_version and version != legacy_checkpoint_version) return error.UnsupportedVersion;
     if (!std.mem.eql(u8, bytes[5..8], &.{ 0, 0, 0 })) return error.InvalidField;
     const body_len: usize = std.mem.readInt(u32, bytes[8..12], .little);
     if (body_len > max_checkpoint_bytes - header_len - checksum_len) return error.CheckpointTooLarge;
@@ -235,6 +263,7 @@ fn parseHeader(bytes: []const u8) Error!Header {
     if (bytes.len < expected_len) return error.Truncated;
     if (bytes.len > expected_len) return error.TrailingBytes;
     const header = Header{
+        .version = version,
         .entry_count = std.mem.readInt(u16, bytes[12..14], .little),
         .tombstone_count = std.mem.readInt(u16, bytes[14..16], .little),
         .max_entries_value = std.mem.readInt(u16, bytes[16..18], .little),
@@ -247,7 +276,8 @@ fn parseHeader(bytes: []const u8) Error!Header {
     if (header.max_entries_value > max_entries or header.max_tombstones_value > max_tombstones or
         header.entry_count > header.max_entries_value or header.tombstone_count > header.max_tombstones_value)
         return error.CheckpointTooLarge;
-    if (body_len < header.entry_count * entry_min_len + header.tombstone_count * tombstone_min_len)
+    const row_tag_len: usize = @intFromBool(version != legacy_checkpoint_version);
+    if (body_len < header.entry_count * (entry_min_len_v1 + row_tag_len) + header.tombstone_count * (tombstone_min_len_v1 + row_tag_len))
         return error.Truncated;
     var digest: [checksum_len]u8 = undefined;
     checkpointChecksum(bytes[0 .. bytes.len - checksum_len], &digest);
@@ -256,7 +286,7 @@ fn parseHeader(bytes: []const u8) Error!Header {
     return header;
 }
 
-fn readEntry(reader: *Reader, store_hlc: u64) Error!ParsedEntry {
+fn readEntry(reader: *Reader, header: Header) Error!ParsedEntry {
     const channel_len: usize = try reader.readByte();
     const mask_len: usize = try reader.readByte();
     const set_by_len: usize = try reader.readByte();
@@ -274,11 +304,12 @@ fn readEntry(reader: *Reader, store_hlc: u64) Error!ParsedEntry {
     if (!validExpiry(duration, expires_at)) return error.InvalidField;
     const hlc = try reader.readU64();
     const origin_node = try reader.readU64();
-    if (hlc > store_hlc) return error.InvalidField;
-    return .{ .channel = channel, .level = level, .mask = mask, .set_by = set_by, .duration = duration, .expires_at = expires_at, .hlc = hlc, .origin_node = origin_node };
+    if (hlc > header.hlc) return error.InvalidField;
+    const origin_proof = try readProof(reader, header.version);
+    return .{ .channel = channel, .level = level, .mask = mask, .set_by = set_by, .duration = duration, .expires_at = expires_at, .hlc = hlc, .origin_node = origin_node, .origin_proof = origin_proof };
 }
 
-fn readTombstone(reader: *Reader, store_hlc: u64) Error!ParsedTombstone {
+fn readTombstone(reader: *Reader, header: Header) Error!ParsedTombstone {
     const channel_len: usize = try reader.readByte();
     const mask_len: usize = try reader.readByte();
     const level = std.enums.fromInt(access.Level, try reader.readByte()) orelse return error.InvalidField;
@@ -288,8 +319,28 @@ fn readTombstone(reader: *Reader, store_hlc: u64) Error!ParsedTombstone {
     const hlc = try reader.readU64();
     const origin_node = try reader.readU64();
     const recorded_at = try reader.readU64();
-    if (hlc > store_hlc) return error.InvalidField;
-    return .{ .channel = channel, .level = level, .mask = mask, .hlc = hlc, .origin_node = origin_node, .recorded_at = recorded_at };
+    if (hlc > header.hlc) return error.InvalidField;
+    const origin_proof = try readProof(reader, header.version);
+    return .{ .channel = channel, .level = level, .mask = mask, .hlc = hlc, .origin_node = origin_node, .recorded_at = recorded_at, .origin_proof = origin_proof };
+}
+
+/// Version 2 row trailer: tag 0 (no proof) or 1 followed by the opaque proof.
+/// Version 1 rows have no trailer.
+fn readProof(reader: *Reader, version: u8) Error!?access.OriginProof {
+    if (version == legacy_checkpoint_version) return null;
+    return switch (try reader.readByte()) {
+        0 => null,
+        1 => .{
+            .pubkey = (try reader.take(access.origin_pubkey_len))[0..access.origin_pubkey_len].*,
+            .sig = (try reader.take(access.origin_sig_len))[0..access.origin_sig_len].*,
+        },
+        else => error.InvalidField,
+    };
+}
+
+fn proofLen(with_proofs: bool, proof: ?access.OriginProof) usize {
+    if (!with_proofs) return 0;
+    return 1 + (if (proof != null) proof_len else 0);
 }
 
 fn validExpiry(duration: ?u64, expires_at: ?u64) bool {
@@ -354,6 +405,12 @@ const Writer = struct {
     fn writeU64(self: *Writer, value: u64) void {
         std.mem.writeInt(u64, self.bytes[self.pos..][0..8], value, .little);
         self.pos += 8;
+    }
+    fn writeProof(self: *Writer, proof: ?access.OriginProof) void {
+        const value = proof orelse return self.writeByte(0);
+        self.writeByte(1);
+        self.writeBytes(&value.pubkey);
+        self.writeBytes(&value.sig);
     }
 };
 
@@ -464,13 +521,13 @@ test "ACCESS checkpoint rejects malformed rows and duplicate identities" {
 
     try std.testing.expect(!isCheckpoint("wrong"));
     try std.testing.expectError(error.Truncated, validateCheckpoint(wire[0 .. wire.len - 1]));
-    bad[4] = 2;
+    bad[4] = 3;
     try std.testing.expectError(error.UnsupportedVersion, validateCheckpoint(bad));
     @memcpy(bad, wire);
     bad[header_len + 6] = '&';
     try std.testing.expectError(error.ChecksumMismatch, validateCheckpoint(bad));
 
-    const first_row_len = 6 + 2 + "n!u@h".len + "owner".len + 16;
+    const first_row_len = 6 + 2 + "n!u@h".len + "owner".len + 16 + 1;
     const second_row = header_len + first_row_len;
     @memcpy(bad, wire);
     bad[second_row + 6 + 1] = 'a'; // same identity ignoring case
@@ -493,7 +550,12 @@ test "ACCESS checkpoint rejects malformed rows and duplicate identities" {
     try std.testing.expectError(error.CheckpointTooLarge, validateCheckpoint(bad));
 
     @memcpy(bad, wire);
-    std.mem.writeInt(u64, bad[header_len + first_row_len - 16 ..][0..8], source.hlc + 1, .little);
+    std.mem.writeInt(u64, bad[header_len + first_row_len - 17 ..][0..8], source.hlc + 1, .little);
+    testRechecksum(bad);
+    try std.testing.expectError(error.InvalidField, validateCheckpoint(bad));
+
+    @memcpy(bad, wire);
+    bad[header_len + first_row_len - 1] = 2; // proof tag is 0 or 1
     testRechecksum(bad);
     try std.testing.expectError(error.InvalidField, validateCheckpoint(bad));
 
@@ -538,6 +600,85 @@ test "ACCESS checkpoint staged decode is allocation failure atomic" {
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, DecodeSweep.run, .{wire});
+}
+
+test "ACCESS checkpoint v2 carries origin proofs on entries and tombstones" {
+    const alloc = std.testing.allocator;
+    var source = access.AccessStore.init(alloc);
+    defer source.deinit();
+    source.now_seconds = 1_000;
+    const entry_proof = access.OriginProof{ .pubkey = @splat(0x11), .sig = @splat(0x22) };
+    const marker_proof = access.OriginProof{ .pubkey = @splat(0x33), .sig = @splat(0x44) };
+    try source.add("#Local", .voice, "l!u@h", "owner", null);
+    try std.testing.expectEqual(access.ApplyOutcome.applied, try source.applyRemote(.{
+        .present = true,
+        .channel = "#Signed",
+        .level = .deny,
+        .mask = "s!u@h",
+        .set_by = "peer",
+        .duration = 600,
+        .hlc = 900_000,
+        .origin_node = 9,
+        .origin_proof = entry_proof,
+    }));
+    try std.testing.expectEqual(access.ApplyOutcome.deleted, try source.applyRemote(.{
+        .present = false,
+        .channel = "#Gone",
+        .level = .grant,
+        .mask = "g!u@h",
+        .hlc = 950_000,
+        .origin_node = 9,
+        .origin_proof = marker_proof,
+    }));
+    const wire = try encode(alloc, &source);
+    defer alloc.free(wire);
+    try std.testing.expectEqual(checkpoint_version, wire[4]);
+    var restored = try decode(alloc, wire);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(?access.OriginProof, null), restored.entries.items[0].origin_proof);
+    try std.testing.expectEqualDeep(@as(?access.OriginProof, entry_proof), restored.entries.items[1].origin_proof);
+    try std.testing.expectEqualDeep(@as(?access.OriginProof, marker_proof), restored.tombstones.items[0].origin_proof);
+    var it = restored.signedFacts(1_000);
+    try std.testing.expectEqualStrings("#Signed", it.next().?.channel);
+    try std.testing.expectEqualStrings("#Gone", it.next().?.channel);
+    try std.testing.expect(it.next() == null);
+    const reencoded = try encode(alloc, &restored);
+    defer alloc.free(reencoded);
+    try std.testing.expectEqualSlices(u8, wire, reencoded);
+}
+
+test "ACCESS checkpoint v1 decode drops proofs and re-anchors arrival-time expiries" {
+    const alloc = std.testing.allocator;
+    var source = access.AccessStore.init(alloc);
+    defer source.deinit();
+    source.now_seconds = 10_000;
+    try std.testing.expectEqual(access.ApplyOutcome.applied, try source.applyRemote(.{
+        .present = true,
+        .channel = "#Timed",
+        .level = .deny,
+        .mask = "t!u@h",
+        .set_by = "peer",
+        .duration = 3 * 3600,
+        .hlc = 9_000_000,
+        .origin_node = 9,
+        .origin_proof = .{ .pubkey = @splat(1), .sig = @splat(2) },
+    }));
+    // An older binary anchored expiry to arrival time (here two hours late).
+    source.entries.items[0].expires_at = 9_000 + 2 * 3600 + 3 * 3600;
+    const legacy = try encodeVersion(alloc, &source, legacy_checkpoint_version);
+    defer alloc.free(legacy);
+    try std.testing.expectEqual(legacy_checkpoint_version, legacy[4]);
+    var restored = try decode(alloc, legacy);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(?u64, 9_000 + 3 * 3600), restored.entries.items[0].expires_at);
+    try std.testing.expectEqual(@as(?access.OriginProof, null), restored.entries.items[0].origin_proof);
+
+    // A current capsule is exact custody: no re-anchoring on decode.
+    const current = try encode(alloc, &source);
+    defer alloc.free(current);
+    var exact = try decode(alloc, current);
+    defer exact.deinit();
+    try std.testing.expectEqual(source.entries.items[0].expires_at, exact.entries.items[0].expires_at);
 }
 
 fn testRechecksum(bytes: []u8) void {

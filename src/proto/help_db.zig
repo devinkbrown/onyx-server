@@ -133,8 +133,9 @@ pub const help_topics = [_]HelpTopic{
         .lines = &[_][]const u8{
             "ACCESS <#channel> <ADD|DELETE|LIST|CLEAR> [level [mask [timeout] [:reason]]]",
             "Channel object access for FOUNDER, OWNER, HOST, VOICE, DENY, and GRANT. A bare timeout is seconds.",
-            "ACCESS <#channel> EXPLAIN [nick]",
+            "ACCESS <#channel> EXPLAIN [nick|* [JOIN|SPEAK]]",
             "Read-only direct JOIN policy snapshot; no key supplied. Other subjects require audit_read.",
+            "SPEAK explains channel PRIVMSG now; content rules (+c/+C/+T, E2EE) are not evaluated. Network silence is shown only to audit_read.",
             "ACCESS <#channel> PREVIEW <level> <mask> [timeout] <subject...>",
             "Read-only candidate preview; never stores the rule. Cloak and precedence are not evaluated.",
             "Self replies hide masks, issuers and reasons. Hidden named tracing also requires oper_spy.",

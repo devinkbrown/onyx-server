@@ -49,6 +49,9 @@ pub const PreparedBoot = struct {
     loaded: boot.Loaded,
     identity: ?Prepared,
     env_bindings: live.ConfigEnvCollector,
+    /// Exact config bytes `loaded` was parsed from (wiped on free). The daemon
+    /// borrows them as its REHASH DRY preview baseline for the owner lifetime.
+    config_text: []u8,
     pub fn takeIdentity(self: *PreparedBoot) ?Prepared {
         const value = self.identity orelse return null;
         self.identity = null;
@@ -57,6 +60,7 @@ pub const PreparedBoot = struct {
     pub fn deinit(self: *PreparedBoot) void {
         if (self.identity) |*value| value.deinit();
         self.loaded.deinit(self.wiping.allocator());
+        self.wiping.allocator().free(self.config_text);
         self.env_bindings.deinit();
         const parent = self.wiping.parent;
         std.crypto.secureZero(u8, std.mem.asBytes(self));
@@ -182,7 +186,7 @@ pub fn loadPreparedBoot(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Di
     errdefer owner.env_bindings.deinit();
     const a = owner.wiping.allocator();
     const text = try readPrivate(a, io, cwd, config_path, format.max_config_bytes);
-    defer a.free(text);
+    errdefer a.free(text);
     var doc = try toml.parse(a, text);
     defer doc.deinit(a);
     if (doc.get("node.secret_key")) |value| if (value.* != .string) return error.InvalidNodeSecretType;
@@ -218,6 +222,7 @@ pub fn loadPreparedBoot(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Di
     }
     owner.loaded = loaded;
     owner.identity = prepared;
+    owner.config_text = text;
     return owner;
 }
 

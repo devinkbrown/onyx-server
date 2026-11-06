@@ -16,8 +16,13 @@
 //!   * lower revisions are stale only within the same origin authority;
 //!   * higher revisions supersede only that origin's entry or tombstone;
 //!   * every route is bound to the live revision of its authority origin;
-//!   * entries, routes, and tombstones have independent hard bounds; no live
-//!     authority is evicted merely to admit attacker-controlled input;
+//!   * entries and routes have independent hard bounds; brand-new tombstones
+//!     without live authority (soft-capped) are bounded by `max_tombstones`
+//!     apart from conversions, converting a live entry into its tombstone
+//!     always succeeds (it frees the slot it occupies), and every
+//!     origin slot stays within `max_entries + max_tombstones`
+//!     (`session_replica_revocation`); no live authority is evicted merely to
+//!     admit attacker-controlled input;
 //!   * peer removal and time sweeping are allocation-free once state exists.
 //!
 //! OFFER carries either a complete replica upsert (account, nick, snapshot) or
@@ -36,6 +41,7 @@ const session_portability = @import("../../proto/session_portability.zig");
 const session_replica_transport = @import("../../proto/session_replica_frame.zig");
 const mesh_clock = @import("../../substrate/undertow/mesh_clock.zig");
 const signed_frame = @import("../../substrate/undertow/signed_frame.zig");
+const session_replica_revocation = @import("session_replica_revocation.zig");
 
 pub const Token = [16]u8;
 pub const NodeId = u64;
@@ -992,6 +998,10 @@ pub const Store = struct {
     attachment_leases: std.AutoHashMapUnmanaged(OriginKey, AttachmentLeaseEntry) = .empty,
     routes: std.AutoHashMapUnmanaged(RouteKey, RouteValue) = .empty,
     tombstones: std.AutoHashMapUnmanaged(OriginKey, Tombstone) = .empty,
+    /// Count of `tombstones` with `soft_capped` set; the only quantity the
+    /// `max_tombstones` soft cap applies to. Maintained by `dropTombstone`,
+    /// `installTombstone`, and checkpoint restore.
+    soft_capped_tombstones: usize = 0,
     quarantines: std.AutoHashMapUnmanaged(Token, Quarantine) = .empty,
     group_revocations: std.AutoHashMapUnmanaged(Token, GroupRevocation) = .empty,
     account_index: std.AutoHashMapUnmanaged(Digest, AccountInventoryIndex) = .empty,
@@ -1015,6 +1025,18 @@ pub const Store = struct {
         max_account_bytes: usize = max_account_len,
         max_nick_bytes: usize = max_nick_len,
         max_snapshot_bytes: usize = max_snapshot_len,
+
+        /// The revocation/retention view of this config; see
+        /// `session_replica_revocation.validateRetentionConfig`.
+        pub fn retention(self: Config) session_replica_revocation.RetentionConfig {
+            return .{
+                .max_entries = self.max_entries,
+                .max_tombstones = self.max_tombstones,
+                .tombstone_ttl_ms = self.tombstone_ttl_ms,
+                .max_offer_lifetime_ms = self.max_offer_lifetime_ms,
+                .max_future_skew_ms = self.max_future_skew_ms,
+            };
+        }
     };
 
     pub const Entry = struct {
@@ -1037,6 +1059,25 @@ pub const Store = struct {
         /// Allocation-free deny marker used if full quarantine evidence cannot
         /// be installed under allocator or quarantine-capacity pressure.
         quarantine_until_ms: ?i64,
+        /// T10 superseded-authority high-water marks: the greatest signed
+        /// issuance and expiry of every revision of this (token, origin)
+        /// accepted while this entry (or the tombstone it replaced) was
+        /// retained. After a backward wall-clock step an older revision can
+        /// carry a later window than the current one; a REVOKE minted from
+        /// these marks, and the tombstone it leaves, outlive every such
+        /// revision. In-memory only: SRSTv3 checkpoints carry no marks, so a
+        /// restored entry starts from its own window (the pre-T10 bound).
+        /// Read through `authorityIssuedHighWater`/`authorityExpiresHighWater`.
+        authority_issued_hwm_ms: i64 = std.math.minInt(i64),
+        authority_expires_hwm_ms: i64 = std.math.minInt(i64),
+
+        pub fn authorityIssuedHighWater(self: Entry) i64 {
+            return @max(self.issued_at_ms, self.authority_issued_hwm_ms);
+        }
+
+        pub fn authorityExpiresHighWater(self: Entry) i64 {
+            return @max(self.expires_at_ms, self.authority_expires_hwm_ms);
+        }
     };
 
     pub const AttachmentLeaseEntry = struct {
@@ -1093,12 +1134,24 @@ pub const Store = struct {
         wire: []const u8,
         revision: Revision,
         removed_at_ms: i64,
+        /// Signed REVOKE expiry: the anti-entropy export horizon
+        /// (`session_replica_revocation.tombstoneExportable`).
         offer_expires_at_ms: i64,
+        /// Inclusive local resurrection-block horizon
+        /// (`session_replica_revocation.tombstoneRetainUntil`); never shorter
+        /// than the superseded authority's expiry. In-memory only: checkpoint
+        /// restore recomputes it from `removed_at_ms` and the signed REVOKE.
+        retain_until_ms: i64,
         digest: Digest,
         /// Binds a removed origin to the token's account identity while replay
         /// protection is active. Unknown-token removals have no identity yet.
         identity_digest: ?Digest,
         quarantine_until_ms: ?i64,
+        /// Installed without converting a live entry of this origin
+        /// (unknown-token churn, or a REVOKE delivered ahead of its OFFER), so
+        /// it counts against `max_tombstones`. A conversion never does; a
+        /// newer REVOKE replacing a tombstone in place inherits this flag.
+        soft_capped: bool,
     };
 
     pub const Quarantine = struct {
@@ -1615,8 +1668,11 @@ pub const Store = struct {
         else
             0;
         const group_count: usize = if (version >= upgrade_checkpoint_version) try reader.readU32() else 0;
+        // Live-entry conversions may legitimately grow tombstones past their
+        // soft cap, so restore enforces the same combined origin-slot bound
+        // the Store itself maintains rather than rejecting a valid image.
         if (group_count > cfg.max_group_revocations or entry_count > cfg.max_entries or
-            tombstone_count > cfg.max_tombstones or
+            entry_count +| tombstone_count > session_replica_revocation.combinedSlots(cfg.retention()) or
             quarantine_count > cfg.max_quarantines or
             attachment_lease_count > cfg.max_attachment_leases)
             return error.CapacityExceeded;
@@ -1965,7 +2021,7 @@ pub const Store = struct {
             }
             var tombstone_it = @constCast(&self.tombstones).iterator();
             while (tombstone_it.next()) |slot| {
-                if (now_ms > slot.value_ptr.offer_expires_at_ms) continue;
+                if (!session_replica_revocation.tombstoneExportable(now_ms, slot.value_ptr.offer_expires_at_ms)) continue;
                 considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
             }
             const token = candidate orelse break;
@@ -2026,8 +2082,7 @@ pub const Store = struct {
             }
             var tombstone_it = @constCast(&self.tombstones).iterator();
             while (tombstone_it.next()) |slot| {
-                const age = nonNegativeAge(now_ms, slot.value_ptr.removed_at_ms);
-                const object_expires = age >= self.cfg.tombstone_ttl_ms and now_ms > slot.value_ptr.offer_expires_at_ms;
+                const object_expires = !session_replica_revocation.tombstoneRetained(now_ms, slot.value_ptr.retain_until_ms);
                 const marker_expires = if (slot.value_ptr.quarantine_until_ms) |until_ms| now_ms > until_ms else false;
                 if (object_expires or marker_expires)
                     considerOrderedToken(slot.key_ptr.token, lower_bound, &candidate);
@@ -2215,6 +2270,43 @@ pub const Store = struct {
         return self.tombstones.count();
     }
 
+    /// The signed authority window a new REVOKE from `origin_node` would
+    /// supersede: the high-water window of its retained entry (resume
+    /// eligible or inventory-only, and regardless of group-revoke or
+    /// quarantine projection, so no retained revision is skipped), or its
+    /// current tombstone's signed REVOKE. Input to
+    /// `session_replica_revocation.revokeLifetime`.
+    pub fn supersededAuthority(self: *const Store, token: Token, origin_node: NodeId) ?session_replica_revocation.SupersededAuthority {
+        if (@constCast(self).getOriginMutable(token, origin_node)) |entry| return .{
+            .issued_at_ms = entry.authorityIssuedHighWater(),
+            .expires_at_ms = entry.authorityExpiresHighWater(),
+        };
+        const tombstone = self.getOriginTombstone(token, origin_node) orelse return null;
+        // Store-owned wires were canonically decoded and verified on install.
+        const revoke = decodeOffer(tombstone.wire) catch unreachable;
+        return .{ .issued_at_ms = revoke.offer.issued_at_ms, .expires_at_ms = revoke.offer.expires_at_ms };
+    }
+
+    /// Allocation-free retention/memory report (O(tombstones)).
+    pub fn retentionReport(self: *const Store, now_ms: i64) session_replica_revocation.Report {
+        var oldest: ?i64 = null;
+        var exported: usize = 0;
+        var it = @constCast(&self.tombstones).valueIterator();
+        while (it.next()) |tombstone| {
+            if (oldest == null or tombstone.retain_until_ms < oldest.?) oldest = tombstone.retain_until_ms;
+            if (session_replica_revocation.tombstoneExportable(now_ms, tombstone.offer_expires_at_ms)) exported += 1;
+        }
+        const tombstones = self.tombstones.count();
+        return session_replica_revocation.Report.build(
+            self.entries.count(),
+            tombstones,
+            self.soft_capped_tombstones,
+            oldest,
+            exported,
+            self.cfg.retention(),
+        );
+    }
+
     pub fn quarantineCount(self: *const Store) usize {
         return self.quarantines.count();
     }
@@ -2275,7 +2367,7 @@ pub const Store = struct {
         }
         var tombstone_it = @constCast(&self.tombstones).valueIterator();
         while (tombstone_it.next()) |tombstone| {
-            if (tombstone.quarantine_until_ms == null and now_ms <= tombstone.offer_expires_at_ms) count += 1;
+            if (tombstone.quarantine_until_ms == null and session_replica_revocation.tombstoneExportable(now_ms, tombstone.offer_expires_at_ms)) count += 1;
         }
         var lease_it = @constCast(&self.attachment_leases).valueIterator();
         while (lease_it.next()) |lease| {
@@ -2350,7 +2442,7 @@ pub const Store = struct {
         }
         var tombstone_it = @constCast(&self.tombstones).iterator();
         while (tombstone_it.next()) |slot| {
-            if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.offer_expires_at_ms) continue;
+            if (slot.value_ptr.quarantine_until_ms != null or !session_replica_revocation.tombstoneExportable(now_ms, slot.value_ptr.offer_expires_at_ms)) continue;
             if (seen < skip) {
                 seen += 1;
                 continue;
@@ -2425,7 +2517,7 @@ pub const Store = struct {
 
         var tombstone_it = @constCast(&self.tombstones).iterator();
         while (tombstone_it.next()) |slot| {
-            if (slot.value_ptr.quarantine_until_ms != null or now_ms > slot.value_ptr.offer_expires_at_ms) continue;
+            if (slot.value_ptr.quarantine_until_ms != null or !session_replica_revocation.tombstoneExportable(now_ms, slot.value_ptr.offer_expires_at_ms)) continue;
             considerRetainedObject(after, .{
                 .kind = .revoke,
                 .token = slot.key_ptr.token,
@@ -2600,8 +2692,9 @@ pub const Store = struct {
     }
 
     /// Sweep expired signed state, stale/expired routes, and mature tombstones.
-    /// Tombstones are retained until BOTH their configured TTL and the signed
-    /// remove offer's expiry pass, preventing replay resurrection.
+    /// Tombstones are retained until their configured TTL, the signed remove
+    /// offer's expiry, and the superseded authority's expiry all pass
+    /// (`Tombstone.retain_until_ms`), preventing replay resurrection.
     pub fn sweep(self: *Store, now_ms: i64) SweepResult {
         var result = SweepResult{};
         while (true) {
@@ -2676,17 +2769,13 @@ pub const Store = struct {
             var victim: ?OriginKey = null;
             var it = self.tombstones.iterator();
             while (it.next()) |slot| {
-                const age = nonNegativeAge(now_ms, slot.value_ptr.removed_at_ms);
-                if (age >= self.cfg.tombstone_ttl_ms and now_ms > slot.value_ptr.offer_expires_at_ms) {
+                if (!session_replica_revocation.tombstoneRetained(now_ms, slot.value_ptr.retain_until_ms)) {
                     victim = slot.key_ptr.*;
                     break;
                 }
             }
             const key = victim orelse break;
-            if (self.tombstones.fetchRemove(key)) |removed| {
-                freeTombstone(self.allocator, removed.value);
-                result.tombstones += 1;
-            }
+            if (self.dropTombstone(key)) result.tombstones += 1;
         }
 
         var entry_it = self.entries.valueIterator();
@@ -2788,7 +2877,12 @@ pub const Store = struct {
         const offer = signed.offer;
         const key = OriginKey{ .token = offer.token, .origin_node = offer.revision.origin_node };
         const replacing_entry = self.getOriginMutable(offer.token, offer.revision.origin_node) != null;
-        if (!replacing_entry and self.entries.count() >= self.cfg.max_entries) return error.EntryFull;
+        try session_replica_revocation.admitNewEntry(.{
+            .entries = self.entries.count(),
+            .tombstones = self.tombstones.count(),
+            .replacing_entry = replacing_entry,
+            .converting_tombstone = !replacing_entry and self.getOriginTombstoneMutable(offer.token, offer.revision.origin_node) != null,
+        }, self.cfg.retention());
 
         const route_key = RouteKey{ .token = offer.token, .destination = offer.revision.origin_node, .next_hop = via_peer };
         const removable_routes = self.routeCountForOrigin(offer.token, offer.revision.origin_node);
@@ -2813,6 +2907,20 @@ pub const Store = struct {
         if (add_account_origin) self.account_index.getPtr(accountDigest(offer.account)).?.origins.appendAssumeCapacity(key);
         if (add_account_origin or inventory_changed) self.bumpInventoryAccount(offer.account);
 
+        // T10: carry the superseded-authority high-water marks across the
+        // replacement (and across a tombstone this OFFER converts, whose
+        // REVOKE window and retention horizon already cover what it removed).
+        var issued_hwm: i64 = offer.issued_at_ms;
+        var expires_hwm: i64 = offer.expires_at_ms;
+        if (self.getOriginMutable(offer.token, offer.revision.origin_node)) |old| {
+            issued_hwm = @max(issued_hwm, old.authorityIssuedHighWater());
+            expires_hwm = @max(expires_hwm, old.authorityExpiresHighWater());
+        } else if (self.getOriginTombstoneMutable(offer.token, offer.revision.origin_node)) |tomb| {
+            const revoke = decodeOffer(tomb.wire) catch unreachable;
+            issued_hwm = @max(issued_hwm, revoke.offer.issued_at_ms);
+            expires_hwm = @max(expires_hwm, tomb.retain_until_ms);
+        }
+
         if (self.getOriginMutable(offer.token, offer.revision.origin_node)) |old| {
             // Expired authority may be rebound to a different account before
             // sweep removes it. Retire its old account index only after every
@@ -2834,6 +2942,8 @@ pub const Store = struct {
                 .digest = digest,
                 .ingress_peer = if (via_peer == 0) null else via_peer,
                 .quarantine_until_ms = null,
+                .authority_issued_hwm_ms = issued_hwm,
+                .authority_expires_hwm_ms = expires_hwm,
             };
         } else {
             self.entries.putAssumeCapacityNoClobber(key, .{
@@ -2850,9 +2960,11 @@ pub const Store = struct {
                 .digest = digest,
                 .ingress_peer = if (via_peer == 0) null else via_peer,
                 .quarantine_until_ms = null,
+                .authority_issued_hwm_ms = issued_hwm,
+                .authority_expires_hwm_ms = expires_hwm,
             });
         }
-        if (self.tombstones.fetchRemove(key)) |removed| freeTombstone(self.allocator, removed.value);
+        _ = self.dropTombstone(key);
         _ = self.removeRoutesForOrigin(offer.token, offer.revision.origin_node);
         if (wants_route) self.putRouteAssumeCapacity(route_key, offer.revision, now_ms);
     }
@@ -2861,8 +2973,21 @@ pub const Store = struct {
         const offer = signed.offer;
         const key = OriginKey{ .token = offer.token, .origin_node = offer.revision.origin_node };
         const existing_tombstone = self.getOriginTombstoneMutable(offer.token, offer.revision.origin_node);
+        const existing_entry = self.getOriginMutable(offer.token, offer.revision.origin_node);
+        std.debug.assert(existing_tombstone == null or existing_entry == null);
         const replacing = existing_tombstone != null;
-        if (!replacing and self.tombstones.count() >= self.cfg.max_tombstones) return error.TombstoneFull;
+        // Converting this origin's live entry can never fail on tombstone
+        // capacity: it frees the entry slot it now occupies. Only a brand-new
+        // tombstone (no live authority here) is soft-capped, and only other
+        // soft-capped tombstones count against that cap.
+        const soft_capped = if (existing_tombstone) |old| old.soft_capped else existing_entry == null;
+        try session_replica_revocation.admitTombstone(.{
+            .entries = self.entries.count(),
+            .tombstones = self.tombstones.count(),
+            .soft_capped_tombstones = self.soft_capped_tombstones,
+            .replacing = replacing,
+            .converting_live_entry = existing_entry != null,
+        }, self.cfg.retention());
 
         const wire = try ownSignedOffer(self.allocator, signed);
         errdefer self.allocator.free(wire);
@@ -2870,10 +2995,20 @@ pub const Store = struct {
 
         const identity_digest = if (existing_tombstone) |old|
             old.identity_digest orelse self.identityDigestForToken(offer.token)
-        else if (self.getOriginMutable(offer.token, offer.revision.origin_node)) |entry|
+        else if (existing_entry) |entry|
             accountDigest(entry.account)
         else
             self.identityDigestForToken(offer.token);
+        // Local retention never shortens below what it replaces: a converted
+        // live entry's high-water signed expiry (covering older revisions
+        // with later windows after a backward clock step), or the previous
+        // tombstone's horizon.
+        const superseded_expires_at_ms: ?i64 = if (existing_tombstone) |old|
+            old.retain_until_ms
+        else if (existing_entry) |entry|
+            entry.authorityExpiresHighWater()
+        else
+            null;
 
         if (self.entries.fetchRemove(key)) |removed| {
             self.removeAccountOrigin(removed.value.account, key);
@@ -2885,15 +3020,23 @@ pub const Store = struct {
             .revision = offer.revision,
             .removed_at_ms = now_ms,
             .offer_expires_at_ms = offer.expires_at_ms,
+            .retain_until_ms = session_replica_revocation.tombstoneRetainUntil(
+                now_ms,
+                offer.expires_at_ms,
+                superseded_expires_at_ms,
+                self.cfg.tombstone_ttl_ms,
+            ),
             .digest = digest,
             .identity_digest = identity_digest,
             .quarantine_until_ms = null,
+            .soft_capped = soft_capped,
         };
         if (self.getOriginTombstoneMutable(offer.token, offer.revision.origin_node)) |old| {
             freeTombstone(self.allocator, old.*);
             old.* = value;
         } else {
             self.tombstones.putAssumeCapacityNoClobber(key, value);
+            if (soft_capped) self.soft_capped_tombstones += 1;
         }
     }
 
@@ -3135,9 +3278,18 @@ pub const Store = struct {
                 }
             }
             const key = victim orelse break;
-            if (self.tombstones.fetchRemove(key)) |removed| freeTombstone(self.allocator, removed.value);
+            _ = self.dropTombstone(key);
         }
         _ = self.removeRoutesForToken(token);
+    }
+
+    /// The only tombstone removal path: frees it and keeps
+    /// `soft_capped_tombstones` exact. Allocation-free.
+    fn dropTombstone(self: *Store, key: OriginKey) bool {
+        const removed = self.tombstones.fetchRemove(key) orelse return false;
+        if (removed.value.soft_capped) self.soft_capped_tombstones -= 1;
+        freeTombstone(self.allocator, removed.value);
+        return true;
     }
 
     fn removeRoutesForToken(self: *Store, token: Token) usize {
@@ -3213,6 +3365,13 @@ pub const Store = struct {
 
         const key = OriginKey{ .token = signed.offer.token, .origin_node = signed.offer.revision.origin_node };
         if (self.entries.contains(key) or self.tombstones.contains(key)) return error.DuplicateState;
+        // SRSTv3 records no soft-cap flag. A live-entry conversion always
+        // binds the converted entry's account identity (and a replacing
+        // REVOKE keeps it), so a null identity can only be a soft-capped
+        // tombstone. Treating every bound tombstone as a conversion never
+        // over-counts, so a valid image never trips the soft cap here.
+        const soft_capped = identity_digest == null;
+        if (soft_capped and self.soft_capped_tombstones >= self.cfg.max_tombstones) return error.CapacityExceeded;
 
         const wire = try self.allocator.dupe(u8, borrowed_wire);
         errdefer self.allocator.free(wire);
@@ -3222,10 +3381,23 @@ pub const Store = struct {
             .revision = owned.offer.revision,
             .removed_at_ms = removed_at_ms,
             .offer_expires_at_ms = owned.offer.expires_at_ms,
+            // SRSTv3 records no superseded expiry (adding one is a layout and
+            // version change). Any authority this tombstone superseded was
+            // accepted at or before `removed_at_ms`, so the accepted-authority
+            // horizon bounds its expiry and restore never shortens the
+            // resurrection block the live Store kept.
+            .retain_until_ms = session_replica_revocation.tombstoneRetainUntil(
+                removed_at_ms,
+                owned.offer.expires_at_ms,
+                session_replica_revocation.acceptedAuthorityHorizon(removed_at_ms, self.cfg.retention()),
+                self.cfg.tombstone_ttl_ms,
+            ),
             .digest = digestBytes(owned.transcript),
             .identity_digest = identity_digest,
             .quarantine_until_ms = quarantine_until_ms,
+            .soft_capped = soft_capped,
         });
+        if (soft_capped) self.soft_capped_tombstones += 1;
     }
 
     fn restoreCheckpointQuarantine(
@@ -5378,6 +5550,297 @@ test "session replica tombstone bound at cap is fail closed without eviction" {
     try testing.expect(store.getTombstone(testToken(0x5a)).?.revision.eql(newer_first.decoded.offer.revision));
 }
 
+test "session replica revocation of a live entry succeeds when the tombstone table is full, and stale replay stays blocked" {
+    var kp = try testKey(0x70);
+    defer kp.deinit();
+    // TTL deliberately shorter than the superseded OFFER so the superseded
+    // expiry term alone determines how long resurrection stays blocked.
+    var store = Store.initWithConfig(testing.allocator, .{
+        .max_entries = 4,
+        .max_routes = 4,
+        .max_tombstones = 2,
+        .tombstone_ttl_ms = 100,
+        .max_offer_lifetime_ms = 20_000,
+    });
+    defer store.deinit();
+
+    const filler_a = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x70), 1, 1), &kp);
+    defer testing.allocator.free(filler_a.wire);
+    const filler_b = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x71), 1, 1), &kp);
+    defer testing.allocator.free(filler_b.wire);
+    _ = try store.applySignedOffer(filler_a.decoded, 0, 200);
+    _ = try store.applySignedOffer(filler_b.decoded, 0, 200);
+
+    const tok = testToken(0x72);
+    var live_offer = upsertOffer(&kp, tok, 1, 1, "live");
+    live_offer.expires_at_ms = 15_000;
+    const live = try signedOffer(testing.allocator, live_offer, &kp);
+    defer testing.allocator.free(live.wire);
+    _ = try store.applySignedOffer(live.decoded, 9, 200);
+    try testing.expectEqual(@as(usize, 2), store.tombstoneCount());
+
+    // Unknown-token churn is still refused at the soft cap, without mutation.
+    const unknown = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x73), 1, 1), &kp);
+    defer testing.allocator.free(unknown.wire);
+    try testing.expectError(error.TombstoneFull, store.applySignedOffer(unknown.decoded, 0, 201));
+    try testing.expectEqual(@as(usize, 1), store.entryCount());
+    try testing.expectEqual(@as(usize, 2), store.tombstoneCount());
+
+    // The real revocation of the live entry is never blocked by that cap.
+    const prior = store.supersededAuthority(tok, live.decoded.offer.revision.origin_node).?;
+    try testing.expectEqual(@as(i64, 15_000), prior.expires_at_ms);
+    const revoke = try signedOffer(testing.allocator, removeOffer(&kp, tok, 1, 2), &kp);
+    defer testing.allocator.free(revoke.wire);
+    try testing.expectEqual(ApplyDisposition.superseded, (try store.applySignedOffer(revoke.decoded, 0, 201)).disposition);
+    try testing.expect(store.getOrigin(tok, live.decoded.offer.revision.origin_node) == null);
+    try testing.expectEqual(@as(usize, 0), store.entryCount());
+    try testing.expectEqual(@as(usize, 0), store.routeCount());
+    try testing.expectEqual(@as(usize, 3), store.tombstoneCount());
+    const tombstone = store.getOriginTombstone(tok, live.decoded.offer.revision.origin_node).?;
+    try testing.expect(tombstone.revision.eql(revoke.decoded.offer.revision));
+    try testing.expectEqual(@as(i64, 15_000), tombstone.retain_until_ms);
+
+    // The REVOKE is the exported anti-entropy object for this origin.
+    var retained: [4]Store.RetainedObject = undefined;
+    const exported = store.retainedObjectsInto(201, &retained);
+    var revoke_exported = false;
+    for (retained[0..exported]) |object| {
+        if (tokenEql(object.token, tok)) {
+            try testing.expectEqual(Store.RetainedKind.revoke, object.kind);
+            try testing.expectEqualSlices(u8, revoke.wire, object.wire);
+            revoke_exported = true;
+        }
+    }
+    try testing.expect(revoke_exported);
+    const report = store.retentionReport(201);
+    try testing.expectEqual(@as(usize, 2), report.soft_capped_tombstones);
+    try testing.expectEqual(@as(usize, 3), report.exported_tombstones);
+    try testing.expectEqual(@as(?i64, 10_000), report.oldest_retain_until_ms);
+
+    // A Helix image drops the exact superseded expiry, yet the restored
+    // tombstone still blocks the superseded OFFER through its expiry.
+    const image = try store.encodeUpgradeCheckpoint(testing.allocator, 201);
+    defer testing.allocator.free(image);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, store.cfg, image, 201);
+    defer restored.deinit();
+    try testing.expect(restored.getOriginTombstone(tok, live.decoded.offer.revision.origin_node).?.retain_until_ms >= 15_000);
+    _ = restored.sweep(15_000);
+    try testing.expectEqual(ApplyDisposition.stale, (try restored.applySignedOffer(live.decoded, 9, 15_000)).disposition);
+    try testing.expectEqual(@as(usize, 0), restored.entryCount());
+
+    // Past the REVOKE's own expiry (10_000) it is no longer exported, but the
+    // superseded OFFER (valid through 15_000) can still not resurrect.
+    _ = store.sweep(10_001);
+    try testing.expectEqual(@as(usize, 1), store.tombstoneCount());
+    try testing.expectEqual(@as(usize, 0), store.retainedObjectsInto(10_001, &retained));
+    try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(live.decoded, 9, 10_001)).disposition);
+    try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(live.decoded, 9, 15_000)).disposition);
+    try testing.expectEqual(@as(usize, 0), store.sweep(15_000).tombstones);
+    try testing.expect(store.getOrigin(tok, live.decoded.offer.revision.origin_node) == null);
+    try testing.expectEqual(@as(usize, 1), store.sweep(15_001).tombstones);
+    // Once the block lapses the stale OFFER is itself expired.
+    try testing.expectError(error.Expired, store.applySignedOffer(live.decoded, 9, 15_001));
+    try testing.expectEqual(@as(usize, 0), store.entryCount());
+}
+
+test "session replica tombstone overflow is bounded by combined origin slots, and a new upsert then fails with EntryFull without mutation" {
+    var kp = try testKey(0x74);
+    defer kp.deinit();
+    const cfg: Store.Config = .{ .max_entries = 2, .max_routes = 4, .max_tombstones = 1 };
+    var store = Store.initWithConfig(testing.allocator, cfg);
+    defer store.deinit();
+
+    const unknown_a = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x74), 1, 1), &kp);
+    defer testing.allocator.free(unknown_a.wire);
+    const live_b = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0x75), 1, 1, "b"), &kp);
+    defer testing.allocator.free(live_b.wire);
+    const live_c = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0x76), 1, 1, "c"), &kp);
+    defer testing.allocator.free(live_c.wire);
+    const revoke_b = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x75), 1, 2), &kp);
+    defer testing.allocator.free(revoke_b.wire);
+    const revoke_c = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x76), 1, 2), &kp);
+    defer testing.allocator.free(revoke_c.wire);
+    const new_d = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0x77), 1, 1, "d"), &kp);
+    defer testing.allocator.free(new_d.wire);
+    const unknown_e = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x78), 1, 1), &kp);
+    defer testing.allocator.free(unknown_e.wire);
+    const newer_b = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0x75), 1, 3, "b2"), &kp);
+    defer testing.allocator.free(newer_b.wire);
+
+    _ = try store.applySignedOffer(unknown_a.decoded, 0, 200);
+    _ = try store.applySignedOffer(live_b.decoded, 0, 200);
+    _ = try store.applySignedOffer(live_c.decoded, 0, 200);
+    _ = try store.applySignedOffer(revoke_b.decoded, 0, 201);
+    try testing.expectEqual(@as(usize, 1), store.entryCount());
+    try testing.expectEqual(@as(usize, 2), store.tombstoneCount());
+
+    // entries < max_entries, but the combined bound is exhausted: a brand-new
+    // upsert fails closed with the Store byte-identical.
+    const before = try store.encodeUpgradeCheckpoint(testing.allocator, 300);
+    defer testing.allocator.free(before);
+    try testing.expectError(error.EntryFull, store.applySignedOffer(new_d.decoded, 0, 202));
+    const after = try store.encodeUpgradeCheckpoint(testing.allocator, 300);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    try testing.expect(store.get(testToken(0x77)) == null);
+
+    // Converting the last live entry reaches exactly the combined bound; an
+    // unknown-token REVOKE beyond it is refused.
+    _ = try store.applySignedOffer(revoke_c.decoded, 0, 203);
+    try testing.expectEqual(@as(usize, 0), store.entryCount());
+    try testing.expectEqual(session_replica_revocation.combinedSlots(cfg.retention()), store.tombstoneCount());
+    try testing.expectError(error.TombstoneFull, store.applySignedOffer(unknown_e.decoded, 0, 204));
+    try testing.expectError(error.EntryFull, store.applySignedOffer(new_d.decoded, 0, 204));
+    try testing.expectEqual(@as(usize, 3), store.tombstoneCount());
+
+    // A Helix image of the overflowed table restores under the same config
+    // and keeps blocking stale replay; it is not rejected for exceeding the
+    // tombstone soft cap.
+    const image = try store.encodeUpgradeCheckpoint(testing.allocator, 300);
+    defer testing.allocator.free(image);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, cfg, image, 300);
+    defer restored.deinit();
+    try testing.expectEqual(@as(usize, 3), restored.tombstoneCount());
+    const origin = live_b.decoded.offer.revision.origin_node;
+    try testing.expect(restored.getOriginTombstone(testToken(0x75), origin).?.retain_until_ms >=
+        store.getOriginTombstone(testToken(0x75), origin).?.retain_until_ms);
+    try testing.expectEqual(ApplyDisposition.stale, (try restored.applySignedOffer(live_b.decoded, 0, 301)).disposition);
+    // An image exceeding the combined bound is still refused.
+    try testing.expectError(error.CapacityExceeded, Store.restoreUpgradeCheckpoint(testing.allocator, .{
+        .max_entries = 1,
+        .max_routes = 4,
+        .max_tombstones = 1,
+    }, image, 300));
+
+    // A strictly newer OFFER may convert its own tombstone back to a live
+    // entry: it frees that tombstone's slot in the same operation.
+    try testing.expectEqual(ApplyDisposition.superseded, (try store.applySignedOffer(newer_b.decoded, 0, 205)).disposition);
+    try testing.expectEqual(@as(usize, 1), store.entryCount());
+    try testing.expectEqual(@as(usize, 2), store.tombstoneCount());
+}
+
+test "session replica conversion tombstones never exhaust the soft cap, so an unknown-token REVOKE still blocks its stale OFFER" {
+    var kp = try testKey(0x7b);
+    defer kp.deinit();
+    const cfg: Store.Config = .{ .max_entries = 8, .max_routes = 8, .max_tombstones = 2 };
+    var store = Store.initWithConfig(testing.allocator, cfg);
+    defer store.deinit();
+    const origin = revisionFor(&kp, 1, 1).origin_node;
+
+    // Honest revocation volume: two live-entry conversions fill tombstones to
+    // max_tombstones while entries stay well below max_entries.
+    for ([_]u8{ 0x7b, 0x7c }) |byte| {
+        const live = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(byte), 1, 1, "live"), &kp);
+        defer testing.allocator.free(live.wire);
+        const revoke = try signedOffer(testing.allocator, removeOffer(&kp, testToken(byte), 1, 2), &kp);
+        defer testing.allocator.free(revoke.wire);
+        _ = try store.applySignedOffer(live.decoded, 9, 200);
+        _ = try store.applySignedOffer(revoke.decoded, 0, 201);
+    }
+    const bystander = try signedOffer(testing.allocator, upsertOffer(&kp, testToken(0x7d), 1, 1, "bystander"), &kp);
+    defer testing.allocator.free(bystander.wire);
+    _ = try store.applySignedOffer(bystander.decoded, 9, 201);
+    try testing.expectEqual(cfg.max_tombstones, store.tombstoneCount());
+    try testing.expectEqual(@as(usize, 1), store.entryCount());
+    try testing.expectEqual(@as(usize, 0), store.retentionReport(201).soft_capped_tombstones);
+
+    // A partitioned node first receives REVOKE r2 for a token it never saw
+    // live; it is retained, not refused with TombstoneFull.
+    const tok = testToken(0x7e);
+    const r1 = try signedOffer(testing.allocator, upsertOffer(&kp, tok, 1, 1, "stale"), &kp);
+    defer testing.allocator.free(r1.wire);
+    const r2 = try signedOffer(testing.allocator, removeOffer(&kp, tok, 1, 2), &kp);
+    defer testing.allocator.free(r2.wire);
+    _ = try store.applySignedOffer(r2.decoded, 0, 202);
+    try testing.expect(store.getOriginTombstone(tok, origin).?.revision.eql(r2.decoded.offer.revision));
+    try testing.expectEqual(@as(usize, 1), store.retentionReport(202).soft_capped_tombstones);
+
+    // The stale OFFER r1 later relayed by a peer that missed r2 is refused.
+    try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(r1.decoded, 9, 203)).disposition);
+    try testing.expect(store.getOrigin(tok, origin) == null);
+    try testing.expectEqual(@as(usize, 1), store.entryCount());
+
+    // A Helix image restores the soft-capped count from identity binding:
+    // conversions stay uncounted, the unknown-token tombstone is counted,
+    // and the soft cap still refuses pure unknown-token growth past it.
+    const image = try store.encodeUpgradeCheckpoint(testing.allocator, 204);
+    defer testing.allocator.free(image);
+    var restored = try Store.restoreUpgradeCheckpoint(testing.allocator, cfg, image, 204);
+    defer restored.deinit();
+    try testing.expectEqual(@as(usize, 1), restored.retentionReport(204).soft_capped_tombstones);
+    try testing.expectEqual(ApplyDisposition.stale, (try restored.applySignedOffer(r1.decoded, 9, 204)).disposition);
+    const unknown_y = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x7f), 1, 1), &kp);
+    defer testing.allocator.free(unknown_y.wire);
+    const unknown_z = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x80), 1, 1), &kp);
+    defer testing.allocator.free(unknown_z.wire);
+    _ = try restored.applySignedOffer(unknown_y.decoded, 0, 205);
+    try testing.expectEqual(@as(usize, 2), restored.retentionReport(205).soft_capped_tombstones);
+    try testing.expectError(error.TombstoneFull, restored.applySignedOffer(unknown_z.decoded, 0, 205));
+    try testing.expectEqual(@as(usize, 4), restored.tombstoneCount());
+    // An image with more unbound tombstones than the soft cap is refused.
+    const over_cap = try restored.encodeUpgradeCheckpoint(testing.allocator, 205);
+    defer testing.allocator.free(over_cap);
+    try testing.expectError(error.CapacityExceeded, Store.restoreUpgradeCheckpoint(testing.allocator, .{
+        .max_entries = 8,
+        .max_routes = 8,
+        .max_tombstones = 1,
+    }, over_cap, 205));
+
+    // A strictly newer OFFER converting the soft-capped tombstone back to a
+    // live entry releases its soft-cap slot; sweeping releases the rest.
+    const r3 = try signedOffer(testing.allocator, upsertOffer(&kp, tok, 1, 3, "fresh"), &kp);
+    defer testing.allocator.free(r3.wire);
+    try testing.expectEqual(ApplyDisposition.superseded, (try store.applySignedOffer(r3.decoded, 9, 206)).disposition);
+    try testing.expectEqual(@as(usize, 0), store.retentionReport(206).soft_capped_tombstones);
+    _ = restored.sweep(std.math.maxInt(i64));
+    try testing.expectEqual(@as(usize, 0), restored.tombstoneCount());
+    try testing.expectEqual(@as(usize, 0), restored.retentionReport(std.math.maxInt(i64)).soft_capped_tombstones);
+}
+
+test "session replica live-entry revoke at a full tombstone table is allocation-failure atomic" {
+    var kp = try testKey(0x79);
+    defer kp.deinit();
+    const tok = testToken(0x7a);
+    const filler = try signedOffer(testing.allocator, removeOffer(&kp, testToken(0x79), 1, 1), &kp);
+    defer testing.allocator.free(filler.wire);
+    const live = try signedOffer(testing.allocator, upsertOffer(&kp, tok, 1, 1, "live"), &kp);
+    defer testing.allocator.free(live.wire);
+    const revoke = try signedOffer(testing.allocator, removeOffer(&kp, tok, 1, 2), &kp);
+    defer testing.allocator.free(revoke.wire);
+
+    var failures: usize = 0;
+    var cut: usize = 0;
+    while (true) : (cut += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var store = Store.initWithConfig(failing.allocator(), .{ .max_entries = 2, .max_routes = 4, .max_tombstones = 1 });
+        defer store.deinit();
+        _ = try store.applySignedOffer(filler.decoded, 0, 200);
+        _ = try store.applySignedOffer(live.decoded, 9, 200);
+        const before = try store.encodeUpgradeCheckpoint(testing.allocator, 300);
+        defer testing.allocator.free(before);
+        failing.fail_index = failing.alloc_index + cut;
+        const result = store.applySignedOffer(revoke.decoded, 0, 201);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |applied| {
+            try testing.expectEqual(ApplyDisposition.superseded, applied.disposition);
+            try testing.expectEqual(@as(usize, 0), store.entryCount());
+            try testing.expectEqual(@as(usize, 2), store.tombstoneCount());
+            try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(live.decoded, 9, 202)).disposition);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            const after = try store.encodeUpgradeCheckpoint(testing.allocator, 300);
+            defer testing.allocator.free(after);
+            try testing.expectEqualSlices(u8, before, after);
+            // Retry after the injected failure succeeds and is not stale.
+            try testing.expectEqual(ApplyDisposition.superseded, (try store.applySignedOffer(revoke.decoded, 0, 201)).disposition);
+            try testing.expectEqual(@as(usize, 2), store.tombstoneCount());
+        }
+    }
+    try testing.expect(failures != 0);
+}
+
 test "session replica tombstone TTL expiry requires both TTL and signed expiry" {
     var kp = try testKey(0x5b);
     defer kp.deinit();
@@ -6499,7 +6962,9 @@ test "session replica upgrade checkpoint sweeps at restore time and tolerates wa
     const quarantine_mallory = try signedOffer(testing.allocator, quarantine_mallory_offer, &mallory_key);
     defer testing.allocator.free(quarantine_mallory.wire);
 
-    const cfg = Store.Config{ .tombstone_ttl_ms = 5_000 };
+    // Restored tombstones retain through the accepted-authority horizon
+    // (removed + lifetime + skew = 202 + 2_000) as well as the TTL window.
+    const cfg = Store.Config{ .tombstone_ttl_ms = 5_000, .max_offer_lifetime_ms = 1_000, .max_future_skew_ms = 1_000 };
     var source = Store.initWithConfig(testing.allocator, cfg);
     defer source.deinit();
     _ = try source.applySignedOffer(live.decoded, 901, 200);
@@ -7900,4 +8365,106 @@ test "session replica offer memo production stats are value observations cold wi
     try testing.expectEqualDeep(OfferSignatureMemo.Stats{}, cold.stats());
     _ = try restored.applySignedOfferMemoized(signed.decoded, 10, 201, &cold, authority);
     try testing.expectEqualDeep(OfferSignatureMemo.Stats{ .signature_checks = 1 }, cold.stats());
+}
+
+test "session replica T10 high-water: an older revision with a later window after a backward clock step stays covered by the REVOKE and its tombstone" {
+    var kp = try testKey(0x7a);
+    defer kp.deinit();
+    var store = Store.initWithConfig(testing.allocator, .{
+        .max_entries = 4,
+        .max_routes = 4,
+        .max_tombstones = 4,
+        .tombstone_ttl_ms = 100,
+        .max_offer_lifetime_ms = 20_000,
+    });
+    defer store.deinit();
+    const tok = testToken(0x7a);
+    const origin = signed_frame.originShortId(kp.public_key);
+
+    // r1 signed before the wall clock stepped back by 5 s.
+    var r1_offer = upsertOffer(&kp, tok, 1, 1, "r1");
+    r1_offer.issued_at_ms = 10_000;
+    r1_offer.expires_at_ms = 30_000;
+    const r1 = try signedOffer(testing.allocator, r1_offer, &kp);
+    defer testing.allocator.free(r1.wire);
+    try testing.expectEqual(ApplyDisposition.inserted, (try store.applySignedOffer(r1.decoded, 0, 10_000)).disposition);
+
+    // r2 (newer revision) signed after the step: an earlier window.
+    var r2_offer = upsertOffer(&kp, tok, 1, 2, "r2");
+    r2_offer.issued_at_ms = 5_000;
+    r2_offer.expires_at_ms = 25_000;
+    const r2 = try signedOffer(testing.allocator, r2_offer, &kp);
+    defer testing.allocator.free(r2.wire);
+    _ = try store.applySignedOffer(r2.decoded, 0, 5_000);
+    try testing.expect(store.getOrigin(tok, origin).?.revision.eql(r2.decoded.offer.revision));
+
+    // The superseded window is the high-water of r1 and r2, not r2 alone.
+    const sup = store.supersededAuthority(tok, origin).?;
+    try testing.expectEqual(@as(i64, 10_000), sup.issued_at_ms);
+    try testing.expectEqual(@as(i64, 30_000), sup.expires_at_ms);
+
+    const lifetime = session_replica_revocation.revokeLifetime(5_001, sup, 20_000);
+    try testing.expect(lifetime.expires_at_ms >= r1_offer.expires_at_ms);
+    var revoke_offer = removeOffer(&kp, tok, 1, 3);
+    revoke_offer.issued_at_ms = lifetime.issued_at_ms;
+    revoke_offer.expires_at_ms = lifetime.expires_at_ms;
+    const revoke = try signedOffer(testing.allocator, revoke_offer, &kp);
+    defer testing.allocator.free(revoke.wire);
+    try testing.expectEqual(ApplyDisposition.superseded, (try store.applySignedOffer(revoke.decoded, 0, 5_001)).disposition);
+    const tomb = store.getOriginTombstone(tok, origin).?;
+    try testing.expect(tomb.retain_until_ms >= r1_offer.expires_at_ms);
+
+    // Once r2's window has passed, the tombstone is still retained and still
+    // exportable, so replaying r1 (valid until 30 000) is refused.
+    _ = store.sweep(25_001);
+    try testing.expect(store.getOriginTombstone(tok, origin) != null);
+    try testing.expect(session_replica_revocation.tombstoneExportable(25_001, store.getOriginTombstone(tok, origin).?.offer_expires_at_ms));
+    try testing.expectEqual(ApplyDisposition.stale, (try store.applySignedOffer(r1.decoded, 9, 25_001)).disposition);
+    try testing.expect(store.getOrigin(tok, origin) == null);
+}
+
+test "session replica T10 high-water: marks survive a tombstone-converting OFFER and never exceed what was accepted" {
+    var kp = try testKey(0x7b);
+    defer kp.deinit();
+    var store = Store.initWithConfig(testing.allocator, .{
+        .max_entries = 4,
+        .max_routes = 4,
+        .max_tombstones = 4,
+        .tombstone_ttl_ms = 100,
+        .max_offer_lifetime_ms = 20_000,
+    });
+    defer store.deinit();
+    const tok = testToken(0x7b);
+    const origin = signed_frame.originShortId(kp.public_key);
+
+    var first = upsertOffer(&kp, tok, 1, 1, "a");
+    first.issued_at_ms = 1_000;
+    first.expires_at_ms = 21_000;
+    const a = try signedOffer(testing.allocator, first, &kp);
+    defer testing.allocator.free(a.wire);
+    _ = try store.applySignedOffer(a.decoded, 0, 1_000);
+    // Ordinary forward progress: marks equal the current window.
+    try testing.expectEqual(@as(i64, 1_000), store.supersededAuthority(tok, origin).?.issued_at_ms);
+    try testing.expectEqual(@as(i64, 21_000), store.supersededAuthority(tok, origin).?.expires_at_ms);
+
+    var rm = removeOffer(&kp, tok, 1, 2);
+    rm.issued_at_ms = 2_000;
+    rm.expires_at_ms = 22_000;
+    const r = try signedOffer(testing.allocator, rm, &kp);
+    defer testing.allocator.free(r.wire);
+    _ = try store.applySignedOffer(r.decoded, 0, 2_000);
+    const retain = store.getOriginTombstone(tok, origin).?.retain_until_ms;
+
+    // A newer OFFER converting the tombstone after a backward step inherits
+    // the REVOKE issuance and the tombstone horizon as its marks.
+    var back = upsertOffer(&kp, tok, 1, 3, "b");
+    back.issued_at_ms = 500;
+    back.expires_at_ms = 20_500;
+    const b = try signedOffer(testing.allocator, back, &kp);
+    defer testing.allocator.free(b.wire);
+    _ = try store.applySignedOffer(b.decoded, 0, 500);
+    const sup = store.supersededAuthority(tok, origin).?;
+    try testing.expectEqual(@as(i64, 2_000), sup.issued_at_ms);
+    try testing.expectEqual(retain, sup.expires_at_ms);
+    try testing.expect(store.getOrigin(tok, origin).?.revision.eql(b.decoded.offer.revision));
 }

@@ -319,6 +319,9 @@ pub const Status = struct {
     pub const Security = enum { unknown, plaintext, secured };
     pub const Capability = enum { unknown, unavailable, available };
     pub const Readiness = enum { unknown, degraded, ready };
+    /// Outcome of the peer's config/cloak compatibility record. `unknown`
+    /// covers "not received", undecodable and misbound records alike.
+    pub const ConfigCompat = enum { unknown, compatible, advisory, mismatch };
     pub const Peer = struct {
         name: []const u8,
         state: PeerState,
@@ -326,6 +329,7 @@ pub const Status = struct {
         session_group_v4: Capability = .unknown,
         session_replica_v2: Capability = .unknown,
         session_attachment_lease_v2: Capability = .unknown,
+        config_compat: ConfigCompat = .unknown,
     };
     freshness: Freshness = .unknown,
     tcp_active: ?u64 = null,
@@ -371,7 +375,7 @@ pub fn renderStatus(status: Status, w: anytype) !void {
     for (status.peers) |peer| {
         try w.writeAll("mesh peer name=");
         for (peer.name) |c| try w.writeByte(if (c >= 33 and c <= 126 and c != '=') c else '?');
-        try w.print(" state={s} security={s} session_group_v4={s} session_replica_v2={s} session_attachment_lease_v2={s}\n", .{ peerStateWord(peer.state), @tagName(peer.security), @tagName(peer.session_group_v4), @tagName(peer.session_replica_v2), @tagName(peer.session_attachment_lease_v2) });
+        try w.print(" state={s} security={s} session_group_v4={s} session_replica_v2={s} session_attachment_lease_v2={s} config_compat={s}\n", .{ peerStateWord(peer.state), @tagName(peer.security), @tagName(peer.session_group_v4), @tagName(peer.session_replica_v2), @tagName(peer.session_attachment_lease_v2), @tagName(peer.config_compat) });
     }
 }
 
@@ -400,4 +404,23 @@ test "mesh status rejects overlong inputs before writing" {
     const peer = [_]Status.Peer{.{ .name = &name, .state = .down }};
     try std.testing.expectError(error.NameTooLong, renderStatus(.{ .peers = &peer }, &w));
     try std.testing.expectEqual(@as(usize, 0), w.buffered().len);
+}
+
+test "mesh status renders per-peer config compatibility without inferring it" {
+    const peers = [_]Status.Peer{
+        .{ .name = "old", .state = .established, .security = .secured },
+        .{ .name = "ok", .state = .established, .security = .secured, .config_compat = .compatible },
+        .{ .name = "skew", .state = .established, .security = .secured, .config_compat = .advisory },
+        .{ .name = "bad", .state = .established, .security = .secured, .config_compat = .mismatch },
+    };
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderStatus(.{ .freshness = .current, .peers = &peers }, &w);
+    const out = w.buffered();
+    for ([_][]const u8{
+        "mesh peer name=old state=established security=secured session_group_v4=unknown session_replica_v2=unknown session_attachment_lease_v2=unknown config_compat=unknown\n",
+        "mesh peer name=ok state=established security=secured session_group_v4=unknown session_replica_v2=unknown session_attachment_lease_v2=unknown config_compat=compatible\n",
+        "name=skew state=established security=secured session_group_v4=unknown session_replica_v2=unknown session_attachment_lease_v2=unknown config_compat=advisory\n",
+        "name=bad state=established security=secured session_group_v4=unknown session_replica_v2=unknown session_attachment_lease_v2=unknown config_compat=mismatch\n",
+    }) |expected| try std.testing.expect(std.mem.indexOf(u8, out, expected) != null);
 }

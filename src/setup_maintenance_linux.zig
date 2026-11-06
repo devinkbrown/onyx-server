@@ -250,9 +250,9 @@ fn fsync(fd: Fd) !void {
 
 // Helper output can contain configuration text. Wipe the entire allocation on
 // release, including partial outputs and allocator-growth failure paths.
-const WipingAllocator = struct {
+pub const WipingAllocator = struct {
     parent: Allocator,
-    fn allocator(self: *WipingAllocator) Allocator {
+    pub fn allocator(self: *WipingAllocator) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
     }
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
@@ -265,6 +265,43 @@ const WipingAllocator = struct {
         self.parent.rawFree(bytes, alignment, ra);
     }
 };
+
+/// Live configuration bytes for the maintenance config editor, under the same
+/// custody rules as review: absolute, trusted ancestry, no symlink, private
+/// single-link regular file, bounded, unchanged while read. The review binding
+/// later hashes the file again; callers must compare digests before trusting.
+pub fn readLiveConfig(allocator: Allocator, path: []const u8) ![]u8 {
+    const fd = try openSafe(path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true });
+    defer close(fd);
+    try privateFile(fd, false);
+    return readOwned(allocator, fd, onyx.daemon.config_format.max_config_bytes);
+}
+
+/// Saved candidate custody: same file rules as the live configuration and
+/// exactly the saved digest. Drift is an error, never a silent re-read.
+pub fn requireCandidate(allocator: Allocator, path: []const u8, sha256: Digest) !void {
+    var wipe: WipingAllocator = .{ .parent = allocator };
+    const a = wipe.allocator();
+    const bytes = try readLiveConfig(a, path);
+    defer a.free(bytes);
+    var actual: Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+    if (!std.crypto.timing_safe.eql(Digest, actual, sha256)) return error.CandidateChanged;
+}
+
+/// Publish a reviewed candidate as a NEW private 0600 file inside a trusted
+/// directory (no symlink components, not writable by others). Never replaces
+/// an existing path; the live configuration is never a target of this call.
+/// Names reserved for maintenance recovery custody are refused.
+pub fn saveCandidate(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    const name = std.fs.path.basename(path);
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or !std.mem.endsWith(u8, path, name) or
+        std.mem.startsWith(u8, name, ".onyx-maintenance")) return error.InvalidCandidatePath;
+    const parent = std.fs.path.dirname(path) orelse return error.AbsolutePathRequired;
+    const dir = try openSafe(parent, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer close(dir);
+    try @import("setup_workflow.zig").publish(io, .{ .handle = dir }, name, bytes);
+}
 
 const StaticResolver = struct {
     io: std.Io,
@@ -664,17 +701,28 @@ pub const Session = struct {
         }
         try requireLive(self.pidfd);
     }
-    fn targetPreflight(self: *Session, binding: types.Binding, identity_only: bool) !bool {
+    const Probe = union(enum) {
+        live_config,
+        identity,
+        /// Saved maintenance candidate, checked against the live file.
+        candidate: []const u8,
+    };
+    fn targetPreflight(self: *Session, binding: types.Binding, probe: Probe) !bool {
         try self.revalidate(binding);
         var fd_path_buf: [64]u8 = undefined;
         const fd_path = try std.fmt.bufPrint(&fd_path_buf, "/proc/self/fd/{d}", .{self.target_fd});
         const config_argv = [_][]const u8{ fd_path, "--check-config", self.selection.config, "--against", self.selection.config };
         const identity_argv = [_][]const u8{ fd_path, "--check-service-identity", self.selection.config };
+        const candidate_argv = [_][]const u8{ fd_path, "--check-config", if (probe == .candidate) probe.candidate else "", "--against", self.selection.config };
         var environment = std.process.Environ.Map.init(self.allocator);
         defer environment.deinit();
         const deadline = (std.Io.Timeout{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } }).toDeadline(self.io);
         var child = try std.process.spawn(self.io, .{
-            .argv = if (identity_only) &identity_argv else &config_argv,
+            .argv = switch (probe) {
+                .live_config => &config_argv,
+                .identity => &identity_argv,
+                .candidate => &candidate_argv,
+            },
             .cwd = .{ .dir = .{ .handle = self.cwd_fd } },
             .environ_map = &environment,
             .stdin = .pipe,
@@ -734,11 +782,25 @@ pub const Session = struct {
         self.identity_digest = identity;
         try self.revalidate(binding);
         if (identity == null) return .{ .current_capabilities = if (current_capable) .passed else .refused, .target_capabilities = if (target_capable) .passed else .refused, .candidate_config = .unavailable, .existing_identity = .unavailable, .environment_bound = false };
-        const config_ok = try self.targetPreflight(binding, false);
-        const identity_ok = try self.targetPreflight(binding, true);
+        const config_ok = try self.targetPreflight(binding, .live_config);
+        const identity_ok = try self.targetPreflight(binding, .identity);
         self.static_passed = capable and config_ok and identity_ok;
         try self.revalidate(binding);
         return .{ .current_capabilities = if (current_capable) .passed else .refused, .target_capabilities = if (target_capable) .passed else .refused, .candidate_config = if (config_ok) .passed else .refused, .existing_identity = if (identity_ok) .passed else .refused, .environment_bound = false };
+    }
+    /// Ask the selected target executable to validate a saved maintenance
+    /// candidate as a successor of the live file (`--check-config <candidate>
+    /// --against <live>`, which includes the Helix listener guard). Runs only
+    /// after environment-independent static checks passed; otherwise the
+    /// result is `unavailable`, never a pass. The candidate must hold private
+    /// custody and the exact saved digest before and after the probe.
+    pub fn checkCandidate(self: *Session, path: []const u8, sha256: Digest) !types.Check {
+        const binding = self.initial orelse return error.BindingMissing;
+        if (!self.static_passed) return .unavailable;
+        try requireCandidate(self.allocator, path, sha256);
+        const ok = try self.targetPreflight(binding, .{ .candidate = path });
+        try requireCandidate(self.allocator, path, sha256);
+        return if (ok) .passed else .refused;
     }
     pub fn checkBackup(self: *Session) !types.BackupChecks {
         const binding = self.initial orelse return error.BindingMissing;
@@ -1003,4 +1065,61 @@ test "maintenance manifest binding rejects same-length rewritten parsed contents
     std.crypto.hash.sha2.Sha256.hash(rewritten, &rewritten_digest, .{});
     try t.expect(manifestMatches(parsed_digest, parsed_digest));
     try t.expect(!manifestMatches(parsed_digest, rewritten_digest));
+}
+
+test "maintenance live config read keeps custody and refuses broad symlinked or linked files" {
+    const t = std.testing;
+    const workflow = @import("setup_workflow.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = t.allocator;
+    const parent = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    defer a.free(parent);
+    const path = try std.fs.path.join(a, &.{ parent, "config.toml" });
+    defer a.free(path);
+    try workflow.publish(t.io, tmp.dir, "config.toml", "[listen]\nirc = 6680\n");
+    // Ancestry outside this test's control (for example a group-writable
+    // home) is legitimately refused; the private-file rules still apply.
+    const bytes = readLiveConfig(a, path) catch |err| switch (err) {
+        error.CustodyUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer a.free(bytes);
+    try t.expectEqualStrings("[listen]\nirc = 6680\n", bytes);
+    try t.expectError(error.AbsolutePathRequired, readLiveConfig(a, "config.toml"));
+    try tmp.dir.symLink(t.io, "config.toml", "link.toml", .{});
+    const link = try std.fs.path.join(a, &.{ parent, "link.toml" });
+    defer a.free(link);
+    if (readLiveConfig(a, link)) |unexpected| {
+        a.free(unexpected);
+        return error.TestExpectedError;
+    } else |_| {}
+    try tmp.dir.hardLink("config.toml", tmp.dir, "hard.toml", t.io, .{});
+    try t.expectError(error.InsecureFile, readLiveConfig(a, path));
+    try tmp.dir.deleteFile(t.io, "hard.toml");
+    try tmp.dir.setFilePermissions(t.io, "config.toml", .fromMode(0o644), .{});
+    try t.expectError(error.InsecureFile, readLiveConfig(a, path));
+
+    // Saved candidates are new private files and never replace a path.
+    const saved = try std.fs.path.join(a, &.{ parent, "candidate.toml" });
+    defer a.free(saved);
+    try saveCandidate(t.io, saved, "[listen]\nirc = 7000\n");
+    try t.expectError(error.PathAlreadyExists, saveCandidate(t.io, saved, "replacement"));
+    try t.expectError(error.PathAlreadyExists, saveCandidate(t.io, path, "replacement"));
+    const stat = try tmp.dir.statFile(t.io, "candidate.toml", .{});
+    try t.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o7777)));
+    try t.expectError(error.InvalidCandidatePath, saveCandidate(t.io, "/", "x"));
+    const reserved = try std.fs.path.join(a, &.{ parent, ".onyx-maintenance-previous" });
+    defer a.free(reserved);
+    try t.expectError(error.InvalidCandidatePath, saveCandidate(t.io, reserved, "x"));
+
+    // Candidate custody binds the exact saved digest; replay of other bytes fails.
+    var want: Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash("[listen]\nirc = 7000\n", &want, .{});
+    try requireCandidate(a, saved, want);
+    var other: Digest = want;
+    other[0] ^= 1;
+    try t.expectError(error.CandidateChanged, requireCandidate(a, saved, other));
+    try tmp.dir.setFilePermissions(t.io, "candidate.toml", .fromMode(0o640), .{});
+    try t.expectError(error.InsecureFile, requireCandidate(a, saved, want));
 }

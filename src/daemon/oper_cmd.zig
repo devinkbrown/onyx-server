@@ -9,7 +9,10 @@ const builtin = @import("builtin");
 const client_model = @import("client.zig");
 const cloak = @import("../proto/cloak.zig");
 const command_usage = @import("command_usage.zig");
+const config_boot = @import("config_boot.zig");
 const config_format = @import("config_format.zig");
+const credential_redaction = @import("credential_redaction.zig");
+const diagnostic_bundle = @import("diagnostic_bundle.zig");
 const helix_live = @import("helix/live.zig");
 const retired_fences = @import("session_group_retired_policy.zig");
 const windows_config_proof = @import("helix/native_windows_config_proof.zig");
@@ -17,6 +20,7 @@ const global_notice = @import("../proto/global_notice.zig");
 const kill_relay = @import("../proto/kill_relay.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
+const moderation_undo = @import("moderation_undo.zig");
 const oper_mod = @import("oper.zig");
 const oper_motd_mod = @import("../proto/oper_motd.zig");
 const partition_detector = @import("../substrate/undertow/partition_detector.zig");
@@ -457,16 +461,18 @@ pub fn handleShun(self: anytype, conn: anytype, parsed: anytype, adding: bool) !
     }
     const mask = p[0];
     if (!adding) {
+        const undo_before = self.moderationSnapshot(moderation_undo.FactKey.ofShun(mask));
         const removed = self.shuns.remove(mask);
         if (removed) self.snapshotShuns();
         const status = if (removed) "removed" else "not found";
-        const proof_id = self.recordOperAudit(conn.session.displayName(), .unshun, mask, status);
+        const receipt = self.recordModerationAudit(&undo_before, conn.session.displayName(), .unshun, status);
         var b: [Server.reply_scratch_bytes]u8 = undefined;
-        const note = if (proof_id) |pid|
+        const note = if (receipt.proof_id) |pid|
             std.fmt.bufPrint(&b, "UNSHUN {s}: {s} proof={s}", .{ mask, status, pid[0..] }) catch return
         else
             std.fmt.bufPrint(&b, "UNSHUN {s}: {s}", .{ mask, status }) catch return;
-        try self.publishOperEvent(.oper_action, .notice, note);
+        var cb: [Server.reply_scratch_bytes]u8 = undefined;
+        try self.publishOperEvent(.oper_action, .notice, Server.withChangeId(&cb, note, receipt.change_id));
         return;
     }
     // Reject over-broad shun masks (e.g. *!*@*) so a shun can't mute everyone.
@@ -481,6 +487,7 @@ pub fn handleShun(self: anytype, conn: anytype, parsed: anytype, adding: bool) !
     }
     if (p.len >= 3) reason = p[2];
     const now = self.nowMs();
+    const undo_before = self.moderationSnapshot(moderation_undo.FactKey.ofShun(mask));
     self.shuns.add(.{
         .mask = mask,
         .reason = reason,
@@ -492,13 +499,14 @@ pub fn handleShun(self: anytype, conn: anytype, parsed: anytype, adding: bool) !
         return;
     };
     self.snapshotShuns();
-    const proof_id = self.recordOperAudit(conn.session.displayName(), .shun, mask, reason);
+    const receipt = self.recordModerationAudit(&undo_before, conn.session.displayName(), .shun, reason);
     var b: [Server.reply_scratch_bytes]u8 = undefined;
-    const note = if (proof_id) |pid|
+    const note = if (receipt.proof_id) |pid|
         std.fmt.bufPrint(&b, "SHUN {s} proof={s}", .{ mask, pid[0..] }) catch return
     else
         std.fmt.bufPrint(&b, "SHUN {s}", .{mask}) catch return;
-    try self.publishOperEvent(.oper_action, .notice, note);
+    var cb: [Server.reply_scratch_bytes]u8 = undefined;
+    try self.publishOperEvent(.oper_action, .notice, Server.withChangeId(&cb, note, receipt.change_id));
 }
 
 pub fn handleGlobal(self: anytype, id: anytype, conn: anytype, parsed: anytype) !void {
@@ -539,7 +547,7 @@ pub fn handleWard(self: anytype, conn: anytype, parsed: anytype) !void {
     // Operator gate enforced by the registry (access=.oper).
     const p = parsed.paramSlice();
     if (p.len < 1) {
-        try self.noticeTo(conn, "Usage: WARD <ADD|DEL|LIST|TEST> …");
+        try self.noticeTo(conn, "Usage: WARD <ADD|DEL|LIST|TEST|PREVIEW> …");
         return;
     }
     const sub = p[0];
@@ -892,8 +900,10 @@ pub fn handleSquit(self: anytype, conn: anytype, parsed: anytype) !void {
 pub fn handleDebug(self: anytype, conn: anytype, parsed: anytype) !void {
     if (!self.requirePriv(conn, .audit_read)) return;
     if (parsed.param_count != 0) {
+        if (parsed.param_count == 1 and std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "BUNDLE"))
+            return diagnostic_bundle.sendNotices(self, conn, .{ .wall_ms = @intCast(@max(0, platform.realtimeMillis())) });
         if (parsed.param_count != 1 or !std.ascii.eqlIgnoreCase(parsed.paramSlice()[0], "DIAGNOSTICS")) {
-            try self.noticeTo(conn, "Usage: DEBUG [DIAGNOSTICS]");
+            try self.noticeTo(conn, "Usage: DEBUG [DIAGNOSTICS|BUNDLE]");
             return;
         }
         const diagnostics = @import("diagnostics.zig");
@@ -912,7 +922,12 @@ pub fn handleDebug(self: anytype, conn: anytype, parsed: anytype) !void {
     const events = self.trace_recorder.dump(&buf);
     var line_buf: [320]u8 = undefined;
     for (events) |ev| {
-        const l = std.fmt.bufPrint(&line_buf, "[{s}/{s}] {s}", .{ ev.level.token(), ev.category.token(), ev.message() }) catch continue;
+        // Defense in depth on the egress side: the flight recorder should
+        // already carry redacted messages (traceLog redacts at ingress), but
+        // never forward a raw credential to an oper NOTICE regardless.
+        var msg_buf: [tracelog.max_recorded_msg_len]u8 = undefined;
+        const safe_msg = credential_redaction.redactInto(ev.message(), &msg_buf);
+        const l = std.fmt.bufPrint(&line_buf, "[{s}/{s}] {s}", .{ ev.level.token(), ev.category.token(), safe_msg }) catch continue;
         try self.noticeTo(conn, l);
     }
     try self.noticeTo(conn, "End of DEBUG flight recorder");
@@ -1339,11 +1354,40 @@ fn rehashFromConnWithClassAllocator(
             return;
         }
     }
+    // [resources] stay at boot values; a class or max_clients change that the
+    // boot memory budget cannot hold is refused before any commit.
+    const next_per_client = config_boot.rehashResourcePerClientBytes(
+        self.config.resource_memory_budget_bytes,
+        self.config.resource_per_client_override_bytes,
+        self.config.max_clients,
+        parsed,
+    );
+    if (next_per_client == null) {
+        self.noticeTo(conn, "REHASH: [resources].memory_budget_bytes cannot hold limits.max_clients at the new per-client commitment; keeping current config") catch |err| {
+            parsed.deinit(self.allocator);
+            return err;
+        };
+        if (!dry) {
+            parsed.deinit(self.allocator);
+            return;
+        }
+    }
     if (dry) {
         defer parsed.deinit(self.allocator);
-        try self.emitRehashDry(conn, path, &parsed);
+        try self.emitRehashDry(conn, path, &parsed, text);
         return;
     }
+    // Stage the applied-text snapshot before the first fallible preparation so
+    // the commit below is a no-fail pointer swap.
+    var next_applied: ?[]u8 = self.allocator.dupe(u8, text) catch {
+        parsed.deinit(self.allocator);
+        try self.noticeTo(conn, "REHASH: out of memory; keeping current config");
+        return;
+    };
+    defer if (next_applied) |bytes| {
+        std.crypto.secureZero(u8, bytes);
+        self.allocator.free(bytes);
+    };
     var next_boot_policy: ?helix_live.OwnedBootPolicy = if (comptime helix_live.supportsBootPolicyOn(builtin.os.tag)) helix_live.OwnedBootPolicy.init(self.allocator, .{
         .strict_existing_identity = self.config.helix_boot_policy.strict_existing_identity,
         .config_env = env_collector.view(),
@@ -1428,6 +1472,7 @@ fn rehashFromConnWithClassAllocator(
     self.allocator.free(self.reload_bindings);
     if (self.reload_parsed) |*p| p.deinit(self.allocator);
     self.reload_parsed = parsed;
+    self.config.resource_per_client_bytes = next_per_client.?;
     if (comptime helix_live.supportsBootPolicyOn(builtin.os.tag)) {
         var previous_boot_policy = self.reload_boot_policy;
         self.reload_boot_policy = next_boot_policy.?;
@@ -1444,12 +1489,25 @@ fn rehashFromConnWithClassAllocator(
     // and atomically swap the live `config.tls_*` fields so NEW TLS handshakes
     // present the rotated leaf. Established sessions are untouched (no
     // renegotiation). Any failure keeps the current certs and only NOTICEs.
+    var tls_reload_failed = false;
     const tls_outcome = self.reloadTlsCertsForRehash(io, &self.reload_parsed.?.tls, rebind_live_source) catch |err| blk: {
+        tls_reload_failed = true;
         var ebuf: [Server.reply_scratch_bytes]u8 = undefined;
         const msg = std.fmt.bufPrint(&ebuf, "REHASH: TLS cert reload failed ({s}); keeping current certificates", .{@errorName(err)}) catch "REHASH: TLS cert reload failed; keeping current certificates";
         try self.noticeTo(conn, msg);
         break :blk Server.TlsReloadOutcome.kept;
     };
+    // The preview baseline advances only when the whole file took effect. After
+    // a kept-certificate failure the previous text remains: the serving
+    // certificate generation still matches it, and a retry still shows tls.*.
+    if (!tls_reload_failed) {
+        if (self.applied_config_text) |previous| {
+            std.crypto.secureZero(u8, previous);
+            self.allocator.free(previous);
+        }
+        self.applied_config_text = next_applied;
+        next_applied = null;
+    }
 
     // Rotate the session-ticket key: the current key becomes PREVIOUS (so
     // tickets issued before this REHASH still resume for one more window) and
@@ -1721,5 +1779,62 @@ test "UNREJECT mapped IPv6 addresses clear the same IPv4 reputation key" {
     try testing.expect(rep.clear(ipv6));
     for ([_][]const u8{ "", "::ffff:198.51.100.999", "::ffff:198.51.100.153junk", "::ffff:198.51.100.153%1", "2001::db8::1", "198.51.100.153:42" }) |bad| {
         try testing.expect(unrejectAddress(bad) == null);
+    }
+}
+
+test "DEBUG flight recorder dump never emits a canary bearer token" {
+    const testing = std.testing;
+    const canary = "sst_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    const FakeRecorder = struct {
+        event: tracelog.RecordedEvent,
+
+        pub fn dump(self: *const @This(), out: []tracelog.RecordedEvent) []const tracelog.RecordedEvent {
+            out[0] = self.event;
+            return out[0..1];
+        }
+    };
+
+    const FakeServer = struct {
+        trace_recorder: FakeRecorder,
+        notices: std.ArrayList([]const u8) = .empty,
+        allocator: std.mem.Allocator,
+
+        pub fn requirePriv(self: *@This(), conn: anytype, cap: anytype) bool {
+            _ = self;
+            _ = conn;
+            _ = cap;
+            return true;
+        }
+
+        pub fn noticeTo(self: *@This(), conn: anytype, text: []const u8) !void {
+            _ = conn;
+            try self.notices.append(self.allocator, try self.allocator.dupe(u8, text));
+        }
+    };
+
+    const allocator = testing.allocator;
+    var fake = FakeServer{
+        .trace_recorder = .{
+            .event = tracelog.RecordedEvent.fromEvent(.{
+                .level = .err,
+                .category = .auth,
+                .ts_mono_ns = 0,
+                .hlc = 0,
+                .msg = "token leak check: " ++ canary,
+            }),
+        },
+        .allocator = allocator,
+    };
+    defer {
+        for (fake.notices.items) |n| allocator.free(n);
+        fake.notices.deinit(allocator);
+    }
+
+    try handleDebug(&fake, @as(u8, 0), .{ .param_count = @as(usize, 0) });
+
+    try testing.expect(fake.notices.items.len >= 1);
+    for (fake.notices.items) |n| {
+        try testing.expect(std.mem.indexOf(u8, n, canary) == null);
     }
 }

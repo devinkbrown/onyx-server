@@ -1739,6 +1739,13 @@ pub fn main(init: std.process.Init) !void {
     defer if (native_executable) |path| allocator.free(path);
     var strict_owner: ?*onyx_server.service_identity_preflight.PreparedBoot = null;
     defer if (strict_owner) |owner| owner.deinit();
+    // Q07: exact boot config bytes for the REHASH DRY preview baseline. Lives
+    // on main's frame (outlives the server, which borrows it); wiped on exit.
+    var boot_config_text: ?[]u8 = null;
+    defer if (boot_config_text) |bytes| {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    };
     var held: ?onyx_server.daemon.config_boot.Loaded = null;
     defer if (held) |*h| {
         if (strict_owner == null) h.deinit(allocator);
@@ -2239,6 +2246,28 @@ pub fn main(init: std.process.Init) !void {
                         };
                         std.debug.print("config OCG2: {s}\n", .{@tagName(role)});
                     }
+                    // M12: a governor that is off is reported, never silent.
+                    // Invalid [quota] values were already refused by the loader.
+                    if (onyx_server.daemon.config_boot.workloadQuotaDisabledReason(l.parsed)) |why| {
+                        std.debug.print("config WARNING in {s}: {s}\n", .{ path, why });
+                    }
+                    // M05: classes whose SendQ cap is too small for a full-size
+                    // item of an output class. Warn only; existing small caps
+                    // keep booting with the per-class runtime behaviour named.
+                    var output_cap_buf: [onyx_server.daemon.config_boot.max_output_class_cap_warnings]onyx_server.daemon.config_boot.OutputClassCapWarning = undefined;
+                    for (onyx_server.daemon.config_boot.outputClassCapWarnings(l.parsed, &output_cap_buf)) |warning| {
+                        std.debug.print(
+                            "config WARNING in {s}: class {s} sendq {d} bytes leaves the {s} output ceiling at {d} bytes, below {d}: {s}\n",
+                            .{ path, warning.name, warning.sendq, @tagName(warning.class), warning.ceiling, warning.needed, warning.effect() },
+                        );
+                    }
+                    // W09: state what [resources] enforces (contradictions were
+                    // already refused by loadFromText with their reason).
+                    {
+                        var resources_buf: [onyx_server.daemon.config_boot.max_resources_report_bytes]u8 = undefined;
+                        const report = onyx_server.daemon.config_boot.resourcesCheckReport(l.parsed, &resources_buf) catch "config WARNING: [resources] report truncated\n";
+                        if (report.len != 0) std.debug.print("{s}", .{report});
+                    }
                     if (against_path) |base_path| {
                         const base_text = std.Io.Dir.cwd().readFileAlloc(init.io, base_path, allocator, .limited(onyx_server.daemon.config_format.max_config_bytes)) catch |err| {
                             std.debug.print("config ERROR: cannot read {s}: {s}\n", .{ base_path, @errorName(err) });
@@ -2257,36 +2286,17 @@ pub fn main(init: std.process.Init) !void {
                             std.debug.print("config ERROR in {s}: {s}\n", .{ path, why });
                             std.process.exit(1);
                         }
-                        // Q07 preview: classify every proven-field change
-                        // without printing values. Unclassified fields are
-                        // not guessed; the listener check above already
-                        // refuses the one change class proven fatal.
-                        preview: {
-                            var base_doc = onyx_server.proto.toml.parse(allocator, base_text) catch {
-                                std.debug.print("config preview: unavailable (base re-parse failed); classified changes not shown\n", .{});
-                                break :preview;
-                            };
-                            defer base_doc.deinit(allocator);
-                            var proposed_doc = onyx_server.proto.toml.parse(allocator, text) catch {
-                                std.debug.print("config preview: unavailable (candidate re-parse failed); classified changes not shown\n", .{});
-                                break :preview;
-                            };
-                            defer proposed_doc.deinit(allocator);
-                            var reloadable: usize = 0;
-                            var restart: usize = 0;
-                            var startup: usize = 0;
-                            for (onyx_server.daemon.config_format.classified_config_fields) |field| {
-                                if (!onyx_server.daemon.config_format.configFieldChanged(&base_doc, &proposed_doc, field)) continue;
-                                const class = onyx_server.daemon.config_format.configFieldClass(field);
-                                std.debug.print("config change: {s} ({s})\n", .{ field, @tagName(class) });
-                                switch (class) {
-                                    .reloadable => reloadable += 1,
-                                    .restart_required => restart += 1,
-                                    .startup_only => startup += 1,
-                                }
-                            }
-                            std.debug.print("config preview: {d} reloadable, {d} restart-required, {d} startup-only classified changed field(s); unclassified fields are not counted\n", .{ reloadable, restart, startup });
-                        }
+                        // Q07 preview: every changed field, classified
+                        // reloadable / restart_required / startup_only /
+                        // unclassified (counted as restart_required). Values
+                        // are never printed.
+                        const preview_lines = onyx_server.daemon.config_change_preview.renderTexts(allocator, "config preview", .{ .boot = base_text, .proposed = text }) catch {
+                            std.debug.print("config preview fields: unavailable (out of memory); treat every change as restart_required\n", .{});
+                            std.debug.print("config OK: {s}\n", .{path});
+                            return;
+                        };
+                        defer onyx_server.daemon.config_change_preview.freeLines(allocator, preview_lines);
+                        for (preview_lines) |line| std.debug.print("{s}\n", .{line});
                     }
                     std.debug.print("config OK: {s}\n", .{path});
                     return;
@@ -2444,6 +2454,7 @@ pub fn main(init: std.process.Init) !void {
         srv_cfg.num_shards = loaded.num_shards;
         srv_cfg.config_path = path;
         srv_cfg.config_resolver = resolver;
+        srv_cfg.boot_config_text = owner.config_text;
         srv_cfg.helix_boot_policy = .{ .strict_existing_identity = true, .config_env = owner.env_bindings.view() };
         try srv_cfg.helix_boot_policy.validate();
         if (loaded.parsed.logging.stderr_file) |log_path| {
@@ -2573,6 +2584,10 @@ pub fn main(init: std.process.Init) !void {
                     srv_cfg.num_shards = loaded.num_shards;
                     srv_cfg.config_path = path;
                     srv_cfg.config_resolver = resolver;
+                    // Preview baseline only: OOM leaves it null (REHASH DRY
+                    // then reports fields unavailable) and never fails boot.
+                    boot_config_text = allocator.dupe(u8, text) catch null;
+                    srv_cfg.boot_config_text = boot_config_text;
                     if (comptime builtin.os.tag == .linux) {
                         srv_cfg.helix_boot_policy = .{ .config_env = ordinary_env.view() };
                         try srv_cfg.helix_boot_policy.validate();

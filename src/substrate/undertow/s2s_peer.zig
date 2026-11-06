@@ -202,6 +202,22 @@ const whois_profile_extension_reply = "onyx-xcap-whois-profile-1!";
 const max_whois_profiles: usize = 1024;
 const read_marker_extension_probe = "onyx-xcap-read-marker-1?";
 const read_marker_extension_reply = "onyx-xcap-read-marker-1!";
+/// CONFIG_COMPAT rides its own probe on a signed Event Spine v2 link, so an
+/// older or plaintext peer is never sent tag 0x31.
+const config_compat_extension_probe = "onyx-xcap-config-compat-1?";
+const config_compat_extension_reply = "onyx-xcap-config-compat-1!";
+/// M03 digest exchange (DIGEST_OFFER/NEED/COMMIT, tags 0x32-0x34) rides its
+/// own probe on the same signed Event Spine v2 transport as CONFIG_COMPAT, so
+/// an older or plaintext peer is never sent those tags and keeps the full
+/// periodic burst.
+const digest_sync_extension_probe = "onyx-xcap-digest-reconcile-1?";
+const digest_sync_extension_reply = "onyx-xcap-digest-reconcile-1!";
+/// Bounds on verified digest frames waiting for the daemon. Overflow drops
+/// the frame and latches `digest_frames_lost`, which the daemon treats as a
+/// lost commit (it forgets every accepted digest, so the next round sends
+/// every family).
+const max_digest_frames: usize = 32;
+const max_digest_frame_bytes: usize = 512 * 1024;
 const read_marker_namespace = "read.marker/";
 
 fn isReadMarkerKey(key: []const u8) bool {
@@ -744,6 +760,22 @@ pub const S2sPeer = struct {
     /// Set on the false-to-true edge so the daemon publishes the local roster
     /// once, including when the probe reply arrives after the membership burst.
     whois_profile_ready: bool = false,
+    /// Remote answered the config-compat probe on an eligible link.
+    peer_supports_config_compat: bool = false,
+    /// False-to-true edge of `peer_supports_config_compat`, once per handshake.
+    config_compat_ready: bool = false,
+    /// Latest verified CONFIG_COMPAT record (latest wins, no allocation).
+    /// Opaque here; the daemon binds it to the peer key and Mooring session.
+    config_compat_slot: [max_config_compat_record_len]u8 = undefined,
+    config_compat_slot_len: usize = 0,
+    /// Remote answered the M03 digest-exchange probe on an eligible link.
+    peer_supports_digest_sync: bool = false,
+    /// Verified DIGEST_* frames in arrival order, each `[tag] ++ payload`,
+    /// owned until the daemon takes them. Opaque here.
+    digest_frames: std.ArrayListUnmanaged([]u8) = .empty,
+    digest_frame_bytes: usize = 0,
+    /// A verified digest frame was dropped (bound or allocation failure).
+    digest_frames_lost: bool = false,
     /// Remote advertised frame signing plus the explicit event-spine-v2 bit.
     peer_supports_event_spine_v2: bool = false,
     /// Daemon-supplied residence-proof verifier (Design C / F1). Null (default,
@@ -795,6 +827,15 @@ pub const S2sPeer = struct {
     /// (anti-entropy re-bursts) never enqueue here, so no duplicate JOINs.
     membership_changes: std.ArrayListUnmanaged(MembershipDelta) = .empty,
     membership_identity_preparer: ?MembershipIdentityPreparer = null,
+    /// Monotonically increasing count of `applyMembershipPayload` calls whose
+    /// RouteTable apply outcome was `joined`/`parted`/`status_changed` — i.e. the
+    /// peer's anti-entropy burst filled a real gap rather than re-affirming
+    /// already-converged state. M02 adaptive anti-entropy scheduling reads this
+    /// as the per-peer divergence signal: an advance resets the quiet streak and
+    /// forces the next repair to the minimum interval. Saturates rather than
+    /// wraps; a wrapped counter would look like "no divergence" to a caller
+    /// snapshotting it across a wrap, silently disabling the fast-repair path.
+    membership_divergence_applied: u64 = 0,
     /// Wire/application order shared by MEMBERSHIP and NICKCHANGE deltas. The
     /// payloads remain in their long-standing typed queues for compatibility;
     /// these markers let the daemon drain an identity transition atomically in
@@ -1210,6 +1251,8 @@ pub const S2sPeer = struct {
         self.search_replies.deinit(self.allocator);
         for (self.keytrans_heads.items) |m| self.allocator.free(m);
         self.keytrans_heads.deinit(self.allocator);
+        for (self.digest_frames.items) |m| self.allocator.free(m);
+        self.digest_frames.deinit(self.allocator);
         for (self.guest_presence.items) |*frame| frame.deinit(self.allocator);
         self.guest_presence.deinit(self.allocator);
         for (self.guest_directs.items) |*frame| frame.deinit(self.allocator);
@@ -1561,6 +1604,12 @@ pub const S2sPeer = struct {
                 }
                 if (std.mem.eql(u8, frame.payload, whois_profile_extension_probe))
                     try emitFrame(self.allocator, sink, .PONG, whois_profile_extension_reply);
+                if (std.mem.eql(u8, frame.payload, config_compat_extension_probe) and
+                    self.configCompatTransport())
+                    try emitFrame(self.allocator, sink, .PONG, config_compat_extension_reply);
+                if (std.mem.eql(u8, frame.payload, digest_sync_extension_probe) and
+                    self.configCompatTransport())
+                    try emitFrame(self.allocator, sink, .PONG, digest_sync_extension_reply);
             },
             .PONG => {
                 self.pong_rx_count += 1;
@@ -1607,6 +1656,15 @@ pub const S2sPeer = struct {
                     if (!self.peer_supports_whois_profile) self.whois_profile_ready = true;
                     self.peer_supports_whois_profile = true;
                 }
+                if (std.mem.eql(u8, frame.payload, config_compat_extension_reply) and
+                    self.configCompatTransport())
+                {
+                    if (!self.peer_supports_config_compat) self.config_compat_ready = true;
+                    self.peer_supports_config_compat = true;
+                }
+                if (std.mem.eql(u8, frame.payload, digest_sync_extension_reply) and
+                    self.configCompatTransport())
+                    self.peer_supports_digest_sync = true;
             },
             .QUIT => self.closeRemote(),
             .MEMBERSHIP => if (self.supportsSessionReplicaV2())
@@ -1653,6 +1711,8 @@ pub const S2sPeer = struct {
             .GUEST_DIRECT => self.recvGuestDirect(frame.payload),
             .GUEST_FRONTIER => self.recvGuestFrontier(frame.payload),
             .WHOIS_PROFILE => self.recvWhoisProfile(frame.payload),
+            .CONFIG_COMPAT => self.recvConfigCompat(frame.payload),
+            .DIGEST_OFFER, .DIGEST_NEED, .DIGEST_COMMIT => self.recvDigestFrame(frame.frame_type, frame.payload),
             .RESYNC => {
                 self.resync_requested = true;
                 // RESYNC is also the one-shot capability-refresh request for a
@@ -2308,6 +2368,20 @@ pub const S2sPeer = struct {
         return true;
     }
 
+    /// Burst-only anti-entropy re-send of one retained foreign ACCESS fact,
+    /// byte-identical to its signed origin image. Same strict decode, origin
+    /// verification, reflection cache and frame bound as
+    /// `forwardAccessEventFrame`, without its origin-direction guard: a
+    /// cold-restarted author re-learns the facts it signed only from a
+    /// neighbor that still holds them. Never used for live relay.
+    pub fn resendAccessEventFrame(self: *S2sPeer, sink: ByteSink, wire: []const u8) !bool {
+        try self.requireAccessEventV1();
+        const verified = try self.verifyAccessWire(wire);
+        if (self.seen_access_event.contains(verified.event_id)) return false;
+        try self.sendAccessEventWire(sink, wire, verified.event_id);
+        return true;
+    }
+
     fn sendAccessEventWire(self: *S2sPeer, sink: ByteSink, wire: []const u8, event_id: AccessEventId) !void {
         const framed_len = s2s_frame.header_len + signed_frame.header_len + wire.len;
         if (framed_len > self.config.max_frame_size) return error.PayloadTooLarge;
@@ -2503,6 +2577,107 @@ pub const S2sPeer = struct {
         const ready = self.whois_profile_ready;
         self.whois_profile_ready = false;
         return ready;
+    }
+
+    pub const max_config_compat_record_len: usize = 512;
+
+    /// Config-compat needs a signed Mooring (Event Spine v2) transport at both
+    /// ends; plaintext and unsigned links never probe, answer or accept it.
+    fn configCompatTransport(self: *const S2sPeer) bool {
+        return self.event_spine_v2_transport_enabled and self.signing_key != null and
+            self.peer_supports_signing and self.peer_supports_event_spine_v2;
+    }
+
+    fn recvConfigCompat(self: *S2sPeer, frame_payload: []const u8) void {
+        if (!self.established or !self.configCompatTransport()) return;
+        const payload = self.verifiedPayload(.CONFIG_COMPAT, frame_payload) orelse return;
+        if (payload.len == 0 or payload.len > max_config_compat_record_len) return;
+        @memcpy(self.config_compat_slot[0..payload.len], payload);
+        self.config_compat_slot_len = payload.len;
+    }
+
+    /// Emit one opaque config-compat record to the authenticated peer.
+    /// Refused until the peer answered the probe on an eligible link.
+    pub fn sendConfigCompat(self: *S2sPeer, sink: ByteSink, record: []const u8) !void {
+        if (!self.supportsConfigCompat()) return error.ConfigCompatUnavailable;
+        if (record.len == 0) return error.InvalidConfigCompat;
+        if (record.len > max_config_compat_record_len) return error.PayloadTooLarge;
+        try self.emitSignable(sink, .CONFIG_COMPAT, record);
+    }
+
+    /// Move the latest pending record into `out`; null when none is pending.
+    pub fn takeConfigCompat(self: *S2sPeer, out: *[max_config_compat_record_len]u8) ?[]const u8 {
+        const len = self.config_compat_slot_len;
+        if (len == 0) return null;
+        self.config_compat_slot_len = 0;
+        @memcpy(out[0..len], self.config_compat_slot[0..len]);
+        return out[0..len];
+    }
+
+    /// One-shot edge: the peer just proved the config-compat extension.
+    pub fn takeConfigCompatReady(self: *S2sPeer) bool {
+        const ready = self.config_compat_ready;
+        self.config_compat_ready = false;
+        return ready;
+    }
+
+    pub fn supportsConfigCompat(self: *const S2sPeer) bool {
+        return self.established and self.configCompatTransport() and self.peer_supports_config_compat;
+    }
+
+    fn recvDigestFrame(self: *S2sPeer, frame_type: s2s_frame.FrameType, frame_payload: []const u8) void {
+        if (!self.established or !self.configCompatTransport()) return;
+        const payload = self.verifiedPayload(frame_type, frame_payload) orelse return;
+        if (payload.len == 0) return;
+        if (self.digest_frames.items.len >= max_digest_frames or
+            payload.len + 1 > max_digest_frame_bytes - @min(self.digest_frame_bytes, max_digest_frame_bytes))
+        {
+            self.digest_frames_lost = true;
+            return;
+        }
+        self.digest_frames.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.digest_frames_lost = true;
+            return;
+        };
+        const owned = self.allocator.alloc(u8, payload.len + 1) catch {
+            self.digest_frames_lost = true;
+            return;
+        };
+        owned[0] = frame_type.tag();
+        @memcpy(owned[1..], payload);
+        self.digest_frames.appendAssumeCapacity(owned);
+        self.digest_frame_bytes += owned.len;
+    }
+
+    /// Emit one M03 digest-exchange body to the authenticated peer. Refused
+    /// until the peer answered the probe on an eligible link.
+    pub fn sendDigestFrame(self: *S2sPeer, sink: ByteSink, frame_type: s2s_frame.FrameType, payload: []const u8) !void {
+        switch (frame_type) {
+            .DIGEST_OFFER, .DIGEST_NEED, .DIGEST_COMMIT => {},
+            else => return error.InvalidDigestFrame,
+        }
+        if (!self.supportsDigestSync()) return error.DigestSyncUnavailable;
+        if (payload.len == 0) return error.InvalidDigestFrame;
+        try self.emitSignable(sink, frame_type, payload);
+    }
+
+    /// Move every pending verified digest frame (`[tag] ++ payload`, owned by
+    /// the caller) out in arrival order.
+    pub fn takeDigestFrames(self: *S2sPeer) ![][]u8 {
+        const out = try self.digest_frames.toOwnedSlice(self.allocator);
+        self.digest_frame_bytes = 0;
+        return out;
+    }
+
+    /// One-shot: a verified digest frame was dropped since the last call.
+    pub fn takeDigestFramesLost(self: *S2sPeer) bool {
+        const lost = self.digest_frames_lost;
+        self.digest_frames_lost = false;
+        return lost;
+    }
+
+    pub fn supportsDigestSync(self: *const S2sPeer) bool {
+        return self.established and self.configCompatTransport() and self.peer_supports_digest_sync;
     }
 
     /// Established secured links that already sign. No second capability bit
@@ -4113,6 +4288,7 @@ pub const S2sPeer = struct {
             .status_changed => .status,
             .unchanged => return,
         };
+        self.membership_divergence_applied +|= 1;
         self.queueMembershipDelta(&ev, kind, res.prev_status, surfaced_nick, session_token, store_account_trusted) catch return; // best-effort
     }
 
@@ -5069,6 +5245,9 @@ pub const S2sPeer = struct {
         self.peer_supports_keytrans_head = false;
         self.peer_supports_whois_profile = false;
         self.whois_profile_ready = false;
+        self.peer_supports_config_compat = false;
+        self.config_compat_ready = false;
+        self.peer_supports_digest_sync = false;
         self.peer_supports_event_spine_v2 = self.peer_supports_signing and (hs.caps & cap_event_spine_v2) != 0;
         if (self.signedFramesRequired() and !self.peer_supports_signing) {
             return error.SignedFramesRequired;
@@ -5102,6 +5281,10 @@ pub const S2sPeer = struct {
         if (self.signing_key != null and self.peer_supports_signing)
             try emitFrame(self.allocator, sink, .PING, read_marker_extension_probe);
         try emitFrame(self.allocator, sink, .PING, whois_profile_extension_probe);
+        if (self.configCompatTransport())
+            try emitFrame(self.allocator, sink, .PING, config_compat_extension_probe);
+        if (self.configCompatTransport())
+            try emitFrame(self.allocator, sink, .PING, digest_sync_extension_probe);
     }
 
     fn rememberRemote(self: *S2sPeer, hs: Handshake, now_ms: u64) !void {
@@ -11106,7 +11289,8 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
         .MESSAGE_V2_ACK,      .MEDIA_WS_DATAGRAM,      .E2EE_GROUP,               .E2EE_GROUP_ACK,                   .MEMBERSHIP_SYNC,
         .SEARCH_QUERY,        .SEARCH_REPLY,           .KEYTRANS_HEAD,            .GUEST_PRESENCE,                   .GUEST_DIRECT,
-        .WHOIS_PROFILE,       .GUEST_FRONTIER,         .ACCESS_EVENT_V1,
+        .WHOIS_PROFILE,       .GUEST_FRONTIER,         .ACCESS_EVENT_V1,          .CONFIG_COMPAT,                    .DIGEST_OFFER,
+        .DIGEST_NEED,         .DIGEST_COMMIT,
     };
 
     // Boundary payloads that target the integer-overflow / length-confusion bug
@@ -12054,4 +12238,78 @@ test "nick audience signed coalesced nick and part survive funding retry on lega
         try receiver.retryPendingMembership(reverse.sink(), 12, 23);
         try std.testing.expectEqual(@as(usize, 1), receiver.nick_changes.items.len);
     }
+}
+
+test "s2s_peer: membership_divergence_applied increments on joined/parted/status_changed apply and not on unchanged re-affirm" {
+    const allocator = std.testing.allocator;
+    var clock = TestClock{ .now_ms = 10 };
+    var state = ChannelCrdt.init(allocator, 1);
+    defer state.deinit();
+    var peer = try newPeer(allocator, &state, &clock, 1, 2, 1000, "test");
+    defer peer.deinit();
+
+    var buf: [membership_event.max_encoded_len]u8 = undefined;
+
+    // A fresh JOIN fills a real gap: joined -> counter advances.
+    const join = try membership_event.encode(.{
+        .present = true,
+        .status = 0,
+        .origin_node = 2,
+        .hlc = 10,
+        .channel = "#ops",
+        .nick = "diverge",
+    }, &buf);
+    try peer.applyMembershipPayload(join, 10);
+    try std.testing.expectEqual(@as(u64, 1), peer.membership_divergence_applied);
+
+    // An exact re-affirmation at the same (stale) hlc is a no-op apply:
+    // unchanged -> counter must NOT advance.
+    const reaffirm = try membership_event.encode(.{
+        .present = true,
+        .status = 0,
+        .origin_node = 2,
+        .hlc = 10,
+        .channel = "#ops",
+        .nick = "diverge",
+    }, &buf);
+    try peer.applyMembershipPayload(reaffirm, 11);
+    try std.testing.expectEqual(@as(u64, 1), peer.membership_divergence_applied);
+
+    // A newer event that changes status closes a real gap: status_changed ->
+    // counter advances.
+    const status_change = try membership_event.encode(.{
+        .present = true,
+        .status = 1,
+        .origin_node = 2,
+        .hlc = 20,
+        .channel = "#ops",
+        .nick = "diverge",
+    }, &buf);
+    try peer.applyMembershipPayload(status_change, 12);
+    try std.testing.expectEqual(@as(u64, 2), peer.membership_divergence_applied);
+
+    // A PART that actually removes the live member: parted -> counter advances.
+    const part = try membership_event.encode(.{
+        .present = false,
+        .status = 0,
+        .origin_node = 2,
+        .hlc = 30,
+        .channel = "#ops",
+        .nick = "diverge",
+    }, &buf);
+    try peer.applyMembershipPayload(part, 13);
+    try std.testing.expectEqual(@as(u64, 3), peer.membership_divergence_applied);
+
+    // Re-sending the same PART again is a stale/no-op re-affirmation for an
+    // absent member: unchanged -> counter must NOT advance.
+    const part_again = try membership_event.encode(.{
+        .present = false,
+        .status = 0,
+        .origin_node = 2,
+        .hlc = 30,
+        .channel = "#ops",
+        .nick = "diverge",
+    }, &buf);
+    try peer.applyMembershipPayload(part_again, 14);
+    try std.testing.expectEqual(@as(u64, 3), peer.membership_divergence_applied);
 }

@@ -14,6 +14,7 @@ pub const audio_mix = @import("audio_mix.zig");
 pub const backoff = @import("backoff.zig");
 pub const bbr = @import("bbr.zig");
 pub const bech32 = @import("bech32.zig");
+pub const bench_session_memo = @import("bench_session_memo.zig");
 pub const bench_x5_linux = @import("bench_x5_linux.zig");
 pub const bench_x5 = @import("bench_x5.zig");
 pub const bloom = @import("bloom.zig");
@@ -161,6 +162,7 @@ test {
     _ = backoff;
     _ = bbr;
     _ = bech32;
+    _ = bench_session_memo;
     _ = bench_x5_linux;
     _ = bench_x5;
     _ = bloom;
@@ -198,6 +200,7 @@ test {
     _ = gcra;
     _ = geoip;
     _ = gf256;
+    _ = guest_membership_assembly;
     _ = hdr_histogram;
     _ = hyperloglog;
     _ = ice_agent;

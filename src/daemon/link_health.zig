@@ -263,6 +263,25 @@ pub const Registry = struct {
         return &self.entries.items[self.entries.items.len - 1].health;
     }
 
+    /// Fraction (0..1000 permille) of established, non-partitioned peers whose
+    /// outbound backlog is at or above `soft_bytes`. This is the mesh-wide load
+    /// signal the adaptive anti-entropy scheduler stretches its cadence by.
+    /// Down, dialing and partitioned entries are excluded from both sides: a
+    /// stale backlog noted before a link died must not stretch healthy links,
+    /// and dead entries must not dilute a real overload. No live peer is idle
+    /// (0). Pure and allocation-free.
+    pub fn backlogLoadPermille(self: *const Registry, soft_bytes: u64) u32 {
+        var total: usize = 0;
+        var loaded: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.health.state != .established or entry.health.partitioned) continue;
+            total += 1;
+            if (entry.health.send_backlog_bytes >= soft_bytes) loaded += 1;
+        }
+        if (total == 0) return 0;
+        return @intCast(loaded * 1000 / total);
+    }
+
     /// Remove the record for `name`. Returns true if a peer was dropped.
     pub fn remove(self: *Registry, name: []const u8) bool {
         for (self.entries.items, 0..) |entry, i| {
@@ -566,4 +585,44 @@ test "GAP-O2 peer facts stay distinct and a stale HLC still counts as present" {
     try testing.expect(std.mem.indexOf(u8, text, "onyx_peer_value_sync{peer=\"slow\"} 1\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "peer=slow rtt_ms=800 send_backlog=4096 anti_entropy_ms=50 partitioned=0 down=0 ripple=suspect value_sync=syncing\n") != null);
     std.debug.print("GAP-O2 branch=peer rtt backlog anti-entropy partitioned-vs-down; hlc does not gate liveness\n", .{});
+}
+
+test "registry backlogLoadPermille counts peers at or above the soft backlog" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    try testing.expectEqual(@as(u32, 0), reg.backlogLoadPermille(0));
+
+    const backlogs = [_]u64{ 0, 999, 1000, std.math.maxInt(u64) };
+    for ([_][]const u8{ "a", "b", "c", "d" }, backlogs) |name, bytes| {
+        const h = try reg.upsert(name, 0);
+        h.transition(.established, 0);
+        h.noteSendBacklog(bytes);
+    }
+    try testing.expectEqual(@as(u32, 500), reg.backlogLoadPermille(1000));
+    try testing.expectEqual(@as(u32, 750), reg.backlogLoadPermille(999));
+    try testing.expectEqual(@as(u32, 1000), reg.backlogLoadPermille(0));
+    try testing.expectEqual(@as(u32, 250), reg.backlogLoadPermille(std.math.maxInt(u64)));
+}
+
+test "registry backlogLoadPermille ignores down, dialing and partitioned entries" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    // Upsert first: a later upsert may move every record.
+    for ([_][]const u8{ "live", "d1", "d2", "dialing" }) |name| _ = try reg.upsert(name, 0);
+    reg.get("live").?.transition(.established, 0);
+    reg.get("live").?.noteSendBacklog(5 * 1024 * 1024);
+    reg.get("d1").?.transition(.down, 0);
+    reg.get("d2").?.transition(.down, 0);
+    try testing.expectEqual(@as(u32, 1000), reg.backlogLoadPermille(1024));
+
+    // A dead link's stale backlog must not stretch an idle healthy one.
+    reg.get("live").?.noteSendBacklog(0);
+    for ([_][]const u8{ "dead", "cut" }) |name| _ = try reg.upsert(name, 0);
+    reg.get("dead").?.noteSendBacklog(5 * 1024 * 1024);
+    reg.get("dead").?.transition(.down, 0);
+    const cut = reg.get("cut").?;
+    cut.transition(.established, 0);
+    cut.partitioned = true;
+    cut.noteSendBacklog(5 * 1024 * 1024);
+    try testing.expectEqual(@as(u32, 0), reg.backlogLoadPermille(1024));
 }

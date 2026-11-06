@@ -97,6 +97,7 @@ pub const schedule_snapshot = @import("schedule_snapshot.zig");
 pub const session_migrate = @import("session_migrate.zig");
 pub const session_replica = @import("session_replica.zig");
 pub const session_replica_attachment = @import("session_replica_attachment.zig");
+pub const session_replica_revocation = @import("session_replica_revocation.zig");
 pub const migration_relay = @import("migration_relay.zig");
 pub const prop_checkpoint = @import("prop_checkpoint.zig");
 // S2S migration support modules (fsm + signed token + journal + policy + metrics).

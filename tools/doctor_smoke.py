@@ -107,7 +107,8 @@ def run(binary: Path) -> dict:
         code, offline, raw = invoke(binary, root, config, "offline")
         require(code == 0, "offline doctor failed")
         require(offline.get("observations", "missing") is None, "offline observations must be null")
-        require(offline.get("readiness") == "unknown", "doctor readiness must remain unknown")
+        require(offline.get("readiness") == "unknown" and offline.get("readiness_reason") == "metrics_not_configured",
+                "doctor readiness without metrics must remain unknown")
         environment = offline.get("service_environment")
         require(isinstance(environment, dict) and environment.get("manager_hint") in ("openrc", "systemd", "unknown") and
                 all(environment.get(key) in ("present", "absent", "unknown") for key in
@@ -150,7 +151,10 @@ def run(binary: Path) -> dict:
         require(events.get("recv_eof") == 17 and events.get("closed") is None,
                 "diagnostic allowlist observations are incorrect")
         require(online.get("report_build_version") == offline["report_build_version"], "build identity changed")
-        require(online.get("readiness") == "unknown", "metrics cannot establish readiness")
+        # A05: a live loopback fetch is the only readiness evidence; 1 of 2
+        # peers established is degraded in every supervisor mode.
+        require(online.get("readiness") == "degraded" and online.get("readiness_reason") == "mesh_peers_down",
+                "live loopback metrics must yield the shared degraded verdict")
 
         ambiguous = b"onyx_s2s_tcp_active 1\nonyx_s2s_tcp_active 2\nonyx_s2s_links_active 0\nonyx_mesh_partitioned 1\n"
         with metrics_endpoint(ambiguous) as (url, handler):

@@ -179,6 +179,41 @@ const common_steps = [_][]const u8{
     "After an authorized start, verify metrics, secured mesh links, and real client participation; preview does not prove readiness or Internet reachability.",
 };
 
+const service_readiness_mod = @import("onyx_server").daemon.service_readiness;
+
+/// Setup's view of the shared readiness verdict. Setup never starts the
+/// daemon or fetches metrics, so its evidence is the static validation it
+/// already ran plus `metrics = not_configured`; the verdict is therefore
+/// never `ready`. Mode follows the same precedence as doctor.
+pub const SetupReadiness = struct {
+    state: service_readiness_mod.State,
+    reason: service_readiness_mod.Reason,
+    detail: []const u8,
+    mode: service_readiness_mod.Mode,
+    supervisor_evidence: []const u8,
+
+    pub fn from(report: service_readiness_mod.Report) SetupReadiness {
+        return .{
+            .state = report.verdict.state,
+            .reason = report.verdict.reason,
+            .detail = report.verdict.detail(),
+            .mode = report.mode,
+            .supervisor_evidence = report.supervisor_evidence,
+        };
+    }
+};
+
+/// The shared verdict for a rendered setup plan. Every rendered plan has
+/// passed typed configuration load and static startup checks (main exits
+/// before rendering otherwise), which is the config preflight evidence;
+/// no metrics source is ever consulted.
+pub fn setupReadiness(environment: @import("onyx_server").daemon.service_environment.Environment, requested: ?@import("onyx_server").daemon.service_environment.Service) SetupReadiness {
+    return SetupReadiness.from(service_readiness_mod.assess(service_readiness_mod.modeFor(environment, requested), .{
+        .config_preflight = .pass,
+        .metrics = .not_configured,
+    }));
+}
+
 /// Nonsecret values from the authoritative boot projection of an existing file.
 pub const ExistingSummary = struct {
     network: []const u8,
@@ -200,6 +235,11 @@ pub const Plan = struct {
     service_basis: []const u8,
     validation: []const u8 = "typed configuration and static startup checks passed",
     readiness: []const u8 = "unknown",
+    /// A05 shared readiness verdict (the same `service_readiness` verdict doctor
+    /// reports). Additive: `readiness` above keeps its legacy string, and
+    /// `render` always fills this field, so older readers that ignore it and
+    /// older JSON without it both keep working.
+    service_readiness: ?SetupReadiness = null,
     changes_applied: bool = false,
     profile: workflow.Profile = .existing,
     purpose: []const u8 = "existing_network_review",
@@ -255,6 +295,7 @@ pub fn render(allocator: std.mem.Allocator, plan: Plan, json: bool, color: bool)
         .auto => null,
     } else null;
     output_plan.service_plan = service_env.servicePlan(plan.service_environment, requested);
+    output_plan.service_readiness = setupReadiness(plan.service_environment, requested);
     output_plan.effective_profile = if (plan.settings) |settings| workflow.effectiveProfile(plan.profile, settings) else null;
     if (output_plan.media_assessment == null) output_plan.media_assessment = if (plan.settings) |settings|
         media_assessment.assess(plan.profile, settings.media_port)
@@ -294,6 +335,8 @@ pub fn render(allocator: std.mem.Allocator, plan: Plan, json: bool, color: bool)
         plan.service_guidance,
     }) catch return error.OutOfMemory;
     out.writer.print("Service plan (shipped template facts, host state unknown): {s}\n", .{service_plan}) catch return error.OutOfMemory;
+    const verdict = output_plan.service_readiness.?;
+    out.writer.print("Readiness verdict: {s} ({s}); {s}\nReadiness mode: {s}; {s}\n", .{ @tagName(verdict.state), @tagName(verdict.reason), verdict.detail, @tagName(verdict.mode), verdict.supervisor_evidence }) catch return error.OutOfMemory;
     if (existing) out.writer.print("Existing configuration summary: {s}\n", .{if (plan.existing_summary == null) "not available" else existing_summary}) catch return error.OutOfMemory;
     out.writer.print("Network assessment: {s}\n", .{if (plan.network_assessment == null) "not available" else network}) catch return error.OutOfMemory;
     out.writer.print("Media assessment: {s}\n", .{media}) catch return error.OutOfMemory;
@@ -354,6 +397,67 @@ test "setup text and headless plan retain recovery and escape untrusted paths" {
     try std.testing.expect(std.mem.indexOfScalar(u8, json, 0x1b) == null);
     for (plan.steps) |step| try std.testing.expect(std.mem.indexOf(u8, text, step) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, decoded.value.recovery) != null);
+}
+
+test "setup plan carries the shared readiness verdict additively and never claims ready" {
+    const a = std.testing.allocator;
+    const service_environment = @import("onyx_server").daemon.service_environment;
+    const Case = struct { requested: Service, env: service_environment.Environment, mode: service_readiness_mod.Mode };
+    const cases = [_]Case{
+        .{ .requested = .auto, .env = .{ .manager_hint = .openrc }, .mode = .openrc },
+        .{ .requested = .auto, .env = .{ .manager_hint = .systemd, .container_marker = .present }, .mode = .systemd },
+        .{ .requested = .auto, .env = .{ .container_marker = .present }, .mode = .container },
+        .{ .requested = .auto, .env = .{}, .mode = .foreground },
+        .{ .requested = .systemd, .env = .{ .manager_hint = .openrc }, .mode = .systemd },
+    };
+    for (cases) |case| {
+        var plan = Plan.init("candidate.toml", case.requested, false, false);
+        plan.service_environment = case.env;
+        const json = try render(a, plan, true, false);
+        defer a.free(json);
+        // Legacy string field is unchanged; the verdict is a new sibling object.
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqualStrings("unknown", object.get("readiness").?.string);
+        try std.testing.expectEqual(@as(i64, 4), object.get("schema_version").?.integer);
+        const verdict = object.get("service_readiness").?.object;
+        try std.testing.expectEqualStrings("unknown", verdict.get("state").?.string);
+        try std.testing.expectEqualStrings("metrics_not_configured", verdict.get("reason").?.string);
+        try std.testing.expectEqualStrings(@tagName(case.mode), verdict.get("mode").?.string);
+        // Same mode and verdict doctor computes for this evidence.
+        const requested: ?service_environment.Service = switch (case.requested) {
+            .auto => null,
+            .openrc => .openrc,
+            .systemd => .systemd,
+            .foreground => .foreground,
+        };
+        const shared = service_readiness_mod.assess(service_readiness_mod.modeFor(case.env, requested), .{ .config_preflight = .pass, .metrics = .not_configured });
+        try std.testing.expectEqualStrings(shared.supervisor_evidence, verdict.get("supervisor_evidence").?.string);
+        try std.testing.expectEqualStrings(shared.verdict.detail(), verdict.get("detail").?.string);
+        // A manager mode always matches the plan's selected manager.
+        const selected = object.get("service_plan").?.object.get("selected").?.string;
+        if (case.mode != .container) try std.testing.expectEqualStrings(@tagName(case.mode), selected);
+        // Typed decode still round-trips, including the new field.
+        const typed = try std.json.parseFromSlice(Plan, a, json, .{});
+        defer typed.deinit();
+        try std.testing.expectEqual(service_readiness_mod.State.unknown, typed.value.service_readiness.?.state);
+        const text = try render(a, plan, false, false);
+        defer a.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Readiness: unknown\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Readiness verdict: unknown (metrics_not_configured)") != null);
+    }
+    // Older JSON without the field still decodes.
+    const legacy = try render(a, Plan.init("candidate.toml", .openrc, false, false), true, false);
+    defer a.free(legacy);
+    const start = std.mem.indexOf(u8, legacy, "  \"service_readiness\"").?;
+    const end = std.mem.indexOfPos(u8, legacy, start, "},\n").? + 3;
+    const stripped = try std.mem.concat(a, u8, &.{ legacy[0..start], legacy[end..] });
+    defer a.free(stripped);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "service_readiness") == null);
+    const old = try std.json.parseFromSlice(Plan, a, stripped, .{});
+    defer old.deinit();
+    try std.testing.expect(old.value.service_readiness == null);
 }
 
 fn allocationProbe(allocator: std.mem.Allocator) !void {

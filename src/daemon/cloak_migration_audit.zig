@@ -143,6 +143,8 @@ pub fn auditAccess(allocator: std.mem.Allocator, bytes: []const u8, witnesses: [
             const owned = try allocator.dupe(u8, mask);
             allocator.free(row.mask);
             row.mask = owned;
+            // The author signed the old mask; a stale proof must not be re-flooded.
+            row.origin_proof = null;
         }
     }
     // Existing codec rejects duplicate replacement identities; never merge

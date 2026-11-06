@@ -176,6 +176,21 @@ fn serviceFields(w: *std.Io.Writer, choice: workflow.Service, width: usize) !voi
     try serviceTemplateFields(w, "container example; not a selected supervisor", plan.container_template, width);
     try field(w, "Host and runtime", "unknown; template paths, access, supervisor, daemon, network and host resource ceilings are not verified", width);
 }
+/// A05: the same shared verdict doctor reports. Choices are not validated
+/// yet and no metrics are read, so the evidence is preflight not_run and the
+/// verdict is always unknown. Mode follows the shared precedence.
+fn readinessFields(w: *std.Io.Writer, service: workflow.Service, width: usize) !void {
+    const readiness = @import("onyx_server").daemon.service_readiness;
+    const report = readiness.assess(readiness.modeFor(.{}, switch (service) {
+        .auto => null,
+        .openrc => .openrc,
+        .systemd => .systemd,
+        .foreground => .foreground,
+    }), .{});
+    var verdict_buf: [256]u8 = undefined;
+    try field(w, "Readiness verdict", try std.fmt.bufPrint(&verdict_buf, "{s} ({s}); {s}", .{ @tagName(report.verdict.state), @tagName(report.verdict.reason), report.verdict.detail() }), width);
+    if (service != .auto) try field(w, "Supervisor evidence", report.supervisor_evidence, width);
+}
 pub fn render(allocator: std.mem.Allocator, profile: workflow.Profile, previous: workflow.Profile, reviewing: bool, settings: workflow.Settings, service: workflow.Service, action: Action, artifact: ?[]const u8, color: bool, raw_width: usize) ![]u8 {
     return renderAssessed(allocator, profile, previous, reviewing, settings, service, action, artifact, color, raw_width, null, null);
 }
@@ -203,6 +218,7 @@ pub fn renderAssessed(allocator: std.mem.Allocator, profile: workflow.Profile, p
         try field(w, "Constrained networks", media.fallback, width);
         try mediaConfiguredFields(w, media, width);
         try field(w, "Readiness", "unknown; no network checks", width);
+        try readinessFields(w, service, width);
         try field(w, "Next", if (reviewing) "done continues; back edits; cancel exits" else "set config <path>; review; back selects a profile; cancel exits", width);
         return out.toOwnedSlice();
     }
@@ -257,6 +273,7 @@ pub fn renderAssessed(allocator: std.mem.Allocator, profile: workflow.Profile, p
     try section(w, "Validation and readiness", color, width);
     try field(w, "Current status", "choices only; validation pending", width);
     try field(w, "Readiness", "unknown; no network checks", width);
+    try readinessFields(w, service, width);
     if (reviewing) {
         try field(w, "Next", if (action == .draft) "done or save continues; back edits; cancel exits" else "done continues; back edits; cancel exits", width);
     } else {
@@ -274,6 +291,8 @@ test "setup review effective defaults overrides and safe narrow output" {
     try std.testing.expect(std.mem.indexOf(u8, plain, "Action\n  preview only\n") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, plain, 0x1b) == null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Readiness\n  unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Readiness verdict\n  unknown (config_not_checked);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Supervisor evidence") == null);
     try std.testing.expect(std.mem.startsWith(u8, plain, "\nChoices\n"));
     try std.testing.expect(std.mem.indexOf(u8, plain, "limits.max_clients: 128 -> 1024") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "review continues") != null);
@@ -290,6 +309,7 @@ test "setup review effective defaults overrides and safe narrow output" {
     try std.testing.expect(std.mem.startsWith(u8, output, "\nReview\n"));
     try std.testing.expect(std.mem.indexOf(u8, output, "media.enabled: false -> true") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "done continues") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Supervisor evidence\n  shipped template:") != null);
     const masked = try render(a, .community, .private, true, selected, .auto, .preview, null, false, 38);
     defer a.free(masked);
     try std.testing.expect(std.mem.indexOf(u8, masked, "No effective profile changes.") != null);

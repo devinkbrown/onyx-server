@@ -117,9 +117,16 @@ pub const AccessEvent = struct {
     mask: []const u8,
     /// Setter display name, echoed in ACCESS LIST replies on every node.
     set_by: []const u8 = "",
-    /// Requested timeout in seconds as the author recorded it; 0 is permanent.
-    /// Receivers derive their own absolute expiry from their own clock, so a
-    /// skewed peer cannot pin an entry live past its intended lifetime.
+    /// Timed lifetime in seconds relative to `hlc`'s wall-clock second; 0 is
+    /// permanent. Every node stores the SAME absolute expiry
+    /// `hlc / 1000 + duration` (`ircx_access_store.anchoredExpiry`), never
+    /// one derived from its own arrival time, so a fact applied live,
+    /// replayed by anti-entropy, or first seen by a cold-restarted node
+    /// expires at one mesh-wide instant. The author folds any lead of its
+    /// HLC over its wall clock out of this value, so it normally equals the
+    /// requested timeout. A forward-skewed author can stretch its own facts
+    /// by at most `AccessStore.max_future_hlc_skew_ms`; anything further
+    /// ahead is refused as `error.FutureHlc`.
     duration: u64 = 0,
     /// SELF-CONTAINED multi-hop origin signature: the origin node's 32-byte
     /// Ed25519 public key, minted ONCE by the author and forwarded VERBATIM by
@@ -258,9 +265,18 @@ fn readField(bytes: []const u8, i: *usize, max_len: usize) Error![]const u8 {
     return field;
 }
 
+comptime {
+    if (pubkey_len != access_store.origin_pubkey_len or sig_len != access_store.origin_sig_len)
+        @compileError("ircx_access_event: store OriginProof widths must match Ed25519");
+}
+
 /// Project a decoded event onto the store's remote-apply record. Borrows the
-/// event's slices, so the backing frame bytes must outlive the apply call.
+/// event's slices, so the backing frame bytes must outlive the apply call. A
+/// signed event also hands the store an opaque copy of its origin signature,
+/// which the store retains only on rows that reproduce the signed fields
+/// exactly (see `access_store.OriginProof`).
 pub fn toRemoteFact(ev: AccessEvent) access_store.RemoteFact {
+    const signed = ev.origin_pubkey.len == pubkey_len and ev.origin_sig.len == sig_len;
     return .{
         .present = ev.present,
         .channel = ev.channel,
@@ -270,6 +286,32 @@ pub fn toRemoteFact(ev: AccessEvent) access_store.RemoteFact {
         .duration = if (ev.duration == 0) null else ev.duration,
         .hlc = ev.hlc,
         .origin_node = ev.origin_node,
+        .origin_proof = if (signed) .{
+            .pubkey = ev.origin_pubkey[0..pubkey_len].*,
+            .sig = ev.origin_sig[0..sig_len].*,
+        } else null,
+    };
+}
+
+/// Rebuild the signed event for one fact retained by the store
+/// (`AccessStore.signedFacts`), so a node can re-flood a fact it did not
+/// author, unchanged. The inverse of `toRemoteFact` for every field the
+/// signature covers; the result encodes canonically, so a wire produced by
+/// this daemon is rebuilt byte for byte. The caller must still put the
+/// result through `verifyOrigin` (the link's forward path does) and must not
+/// mutate the store while the returned slices are in use: they borrow it.
+pub fn fromSignedFact(fact: *const access_store.SignedFact) AccessEvent {
+    return .{
+        .present = fact.present,
+        .origin_node = fact.origin_node,
+        .hlc = fact.hlc,
+        .channel = fact.channel,
+        .level = fact.level,
+        .mask = fact.mask,
+        .set_by = fact.set_by,
+        .duration = fact.duration orelse 0,
+        .origin_pubkey = &fact.proof.pubkey,
+        .origin_sig = &fact.proof.sig,
     };
 }
 
@@ -596,4 +638,201 @@ test "IRCX ACCESS event: projects onto a store remote fact" {
     try testing.expectEqual(@as(?u64, null), fact.duration);
     try testing.expectEqual(@as(u64, 77), fact.hlc);
     try testing.expectEqualStrings("#c", fact.channel);
+}
+
+test "IRCX ACCESS event: signed timed fact expires at one instant on every receiver" {
+    var seed: sign.Seed = undefined;
+    @memset(&seed, 0x6B);
+    const kp = try sign.KeyPair.fromSeed(seed);
+    const t: u64 = 1_700_000_000;
+
+    var ev = AccessEvent{
+        .present = true,
+        .origin_node = originShortId(kp.public_key),
+        .hlc = t * 1000,
+        .channel = "#ops",
+        .level = .deny,
+        .mask = "*!*@timed.test",
+        .set_by = "boss",
+        .duration = 600,
+    };
+    const transcript = try originTranscript(testing.allocator, ev);
+    defer testing.allocator.free(transcript);
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    try signInPlace(&ev, &kp, transcript, &pk_buf, &sig_buf);
+    var buf: [512]u8 = undefined;
+    const got = try decode(try encode(ev, &buf));
+    try testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(testing.allocator, got));
+
+    // Stretching the lifetime after signing (a relay keeping a DENY or a
+    // grant alive longer) is caught by the origin signature.
+    var stretched = got;
+    stretched.duration = 6000;
+    try testing.expectEqual(VerifyOutcome.bad_signature, try verifyOrigin(testing.allocator, stretched));
+    var restamped = got;
+    restamped.hlc += 3_600_000;
+    try testing.expectEqual(VerifyOutcome.bad_signature, try verifyOrigin(testing.allocator, restamped));
+
+    // A live receiver and a cold-restarted receiver replaying the same wire
+    // later store the identical absolute expiry; past it the replay is a
+    // tombstone, not a fresh lifetime.
+    for ([_]u64{ t + 1, t + 599 }) |receiver_now| {
+        var store = access_store.AccessStore.init(testing.allocator);
+        defer store.deinit();
+        store.now_seconds = receiver_now;
+        try testing.expectEqual(access_store.ApplyOutcome.applied, try store.applyRemote(toRemoteFact(got)));
+        const entry = (try store.matchHostmask("#ops", "x!u@timed.test")).?;
+        try testing.expectEqual(t + 600, entry.expires_at.?);
+    }
+    var late = access_store.AccessStore.init(testing.allocator);
+    defer late.deinit();
+    late.now_seconds = t + 600;
+    try testing.expectEqual(access_store.ApplyOutcome.deleted, try late.applyRemote(toRemoteFact(got)));
+    try testing.expectEqual(@as(?access_store.EntryView, null), try late.matchHostmask("#ops", "x!u@timed.test"));
+}
+
+fn testSignWire(kp: *const sign.KeyPair, ev_in: AccessEvent, out: []u8) ![]const u8 {
+    var ev = ev_in;
+    const transcript = try originTranscript(testing.allocator, ev);
+    defer testing.allocator.free(transcript);
+    var pk_buf: [pubkey_len]u8 = undefined;
+    var sig_buf: [sig_len]u8 = undefined;
+    try signInPlace(&ev, kp, transcript, &pk_buf, &sig_buf);
+    return encode(ev, out);
+}
+
+test "IRCX ACCESS event: cold-restarted author re-learns its timed DENY from a peer re-flood" {
+    var seed: sign.Seed = undefined;
+    @memset(&seed, 0xA1);
+    const kp = try sign.KeyPair.fromSeed(seed);
+    const node_a = originShortId(kp.public_key);
+    const t: u64 = 1_700_000_000;
+
+    // Node A authors a one-hour DENY and a delete; both travel signed.
+    var author = access_store.AccessStore.init(testing.allocator);
+    defer author.deinit();
+    author.now_seconds = t;
+    author.local_node = node_a;
+    try author.add("#c", .deny, "*!*@bad.test", "boss", 3600);
+    const own = (try author.matchHostmask("#c", "x!u@bad.test")).?;
+    var add_buf: [512]u8 = undefined;
+    const add_wire = try testSignWire(&kp, .{
+        .present = true,
+        .origin_node = node_a,
+        .hlc = own.hlc,
+        .channel = own.channel,
+        .level = own.level,
+        .mask = own.mask,
+        .set_by = own.set_by,
+        .duration = own.duration.?,
+    }, &add_buf);
+    var del_buf: [512]u8 = undefined;
+    const del_wire = try testSignWire(&kp, .{
+        .present = false,
+        .origin_node = node_a,
+        .hlc = own.hlc + 1,
+        .channel = "#c",
+        .level = .voice,
+        .mask = "*!*@gone.test",
+    }, &del_buf);
+
+    var peer = access_store.AccessStore.init(testing.allocator);
+    defer peer.deinit();
+    peer.now_seconds = t + 10;
+    peer.local_node = 77;
+    try testing.expectEqual(access_store.ApplyOutcome.applied, try peer.applyRemote(toRemoteFact(try decode(add_wire))));
+    try testing.expectEqual(access_store.ApplyOutcome.deleted, try peer.applyRemote(toRemoteFact(try decode(del_wire))));
+
+    // A cold-restarts: empty store. The peer re-floods every retained signed
+    // fact, byte-identical to what A originally signed.
+    var restarted = access_store.AccessStore.init(testing.allocator);
+    defer restarted.deinit();
+    restarted.now_seconds = t + 20;
+    restarted.local_node = node_a;
+    var it = peer.signedFacts(t + 20);
+    var reflooded: usize = 0;
+    while (it.next()) |fact| {
+        const ev = fromSignedFact(&fact);
+        try testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(testing.allocator, ev));
+        var buf: [512]u8 = undefined;
+        const wire = try encode(ev, &buf);
+        try testing.expectEqualSlices(u8, if (fact.present) add_wire else del_wire, wire);
+        _ = try restarted.applyRemote(toRemoteFact(try decode(wire)));
+        reflooded += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), reflooded);
+
+    const relearned = (try restarted.matchHostmask("#c", "x!u@bad.test")).?;
+    const at_peer = (try peer.matchHostmask("#c", "x!u@bad.test")).?;
+    try testing.expectEqual(access_store.Level.deny, relearned.level);
+    try testing.expectEqual(t + 3600, relearned.expires_at.?);
+    try testing.expectEqual(at_peer.expires_at, relearned.expires_at);
+    try testing.expectEqual(own.hlc, relearned.hlc);
+    try testing.expectEqual(@as(usize, 1), restarted.tombstoneCount());
+    // The author's clock folded its own stamp back in, so its next write
+    // still outranks the re-learned fact.
+    try testing.expect(restarted.hlc >= own.hlc + 1);
+
+    restarted.now_seconds = t + 3600;
+    peer.now_seconds = t + 3600;
+    try testing.expectEqual(@as(?access_store.EntryView, null), try restarted.matchHostmask("#c", "x!u@bad.test"));
+    try testing.expectEqual(@as(?access_store.EntryView, null), try peer.matchHostmask("#c", "x!u@bad.test"));
+    // Past expiry only the delete remains offered for re-flood.
+    var late = peer.signedFacts(t + 3600);
+    try testing.expect(!late.next().?.present);
+    try testing.expectEqual(@as(?access_store.SignedFact, null), late.next());
+}
+
+test "IRCX ACCESS event: re-flood after a differently cased signed overwrite still verifies" {
+    var seed: sign.Seed = undefined;
+    @memset(&seed, 0xB2);
+    const kp = try sign.KeyPair.fromSeed(seed);
+    const node = originShortId(kp.public_key);
+    const t: u64 = 1_700_000_000;
+
+    var first_buf: [512]u8 = undefined;
+    const first = try testSignWire(&kp, .{
+        .present = true,
+        .origin_node = node,
+        .hlc = t * 1000,
+        .channel = "#Chan",
+        .level = .host,
+        .mask = "*!*@X.test",
+        .set_by = "a",
+        .duration = 600,
+    }, &first_buf);
+    var second_buf: [512]u8 = undefined;
+    const second = try testSignWire(&kp, .{
+        .present = true,
+        .origin_node = node,
+        .hlc = t * 1000 + 1,
+        .channel = "#chan",
+        .level = .host,
+        .mask = "*!*@x.test",
+        .set_by = "b",
+    }, &second_buf);
+
+    var store = access_store.AccessStore.init(testing.allocator);
+    defer store.deinit();
+    store.now_seconds = t + 1;
+    _ = try store.applyRemote(toRemoteFact(try decode(first)));
+    _ = try store.applyRemote(toRemoteFact(try decode(second)));
+    var it = store.signedFacts(t + 1);
+    const fact = it.next().?;
+    const ev = fromSignedFact(&fact);
+    try testing.expectEqual(VerifyOutcome.verified, try verifyOrigin(testing.allocator, ev));
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualSlices(u8, second, try encode(ev, &buf));
+    try testing.expectEqual(@as(?access_store.SignedFact, null), it.next());
+
+    // An unsigned fact never yields a re-floodable proof.
+    var unsigned_store = access_store.AccessStore.init(testing.allocator);
+    defer unsigned_store.deinit();
+    var plain = try decode(second);
+    plain.origin_pubkey = "";
+    plain.origin_sig = "";
+    _ = try unsigned_store.applyRemote(toRemoteFact(plain));
+    var none = unsigned_store.signedFacts(t + 1);
+    try testing.expectEqual(@as(?access_store.SignedFact, null), none.next());
 }

@@ -26,6 +26,34 @@ gen() {
           ;;
       esac
     fi
+    # The setup-wizard tree (src/setup*.zig) and session_retirement_cli.zig
+    # are a closed, mutually-importing cluster reachable only from
+    # `src/main.zig`'s own root module (directly or transitively through each
+    # other). Re-exporting any one of them from src/root.zig (the
+    # `onyx_server` library module) assigns that file to two modules, which
+    # `zig build` rejects — the same hazard the src/cli and bench.zig
+    # exclusions below guard against. Exclude the whole cluster, not just
+    # main.zig's direct imports, since a transitively-reachable member (e.g.
+    # setup_account.zig, only reached via setup_bundle.zig) trips the same
+    # two-module error the moment genroots exports it on its own.
+    if [ "$dir" = "$SRC" ]; then
+      case "$b" in
+        session_retirement_cli.zig | setup.zig | setup_*.zig)
+          continue
+          ;;
+      esac
+      # Top-level standalone build roots. build.zig compiles each of these as
+      # its own module root (leaf test lanes, private acceptance fixtures) or
+      # as the custom test_runner over the onyx_server test module (the
+      # production Helix exec helpers). Exporting any of them from src/root.zig
+      # places the file in two modules and breaks that build step. `_*.zig`
+      # files are local scratch roots and must never become public API.
+      case "$b" in
+        _*.zig | *_tests.zig | *_fixture.zig | *_exec_helper.zig)
+          continue
+          ;;
+      esac
+    fi
     entries+=("${b%.zig}|$b")
   done
   for sub in "$dir"/*/; do

@@ -204,11 +204,7 @@ pub const Registry = struct {
     pub fn check(self: *Registry, facets: Facets, now_ms: i64) ?*const Ward {
         self.pruneExpired(now_ms);
         for (self.wards.items) |*w| {
-            const value = facets.facet(w.match);
-            if (value.len == 0) continue;
-            if (w.match == .host or w.match == .mask) {
-                if (cloak_match.match(w.pattern, value, facets.cloak_context)) return w;
-            } else if (matchValue(w.match, w.pattern, value)) return w;
+            if (matchesFacets(w.match, w.pattern, facets)) return w;
         }
         return null;
     }
@@ -576,6 +572,27 @@ pub fn addressPatternValid(match: Match, pattern: []const u8) bool {
     return true;
 }
 
+/// Whether one Ward axis (match, pattern) applies to a subject. This is the
+/// exact per-ward predicate `Registry.check` uses, exposed so a read-only
+/// preview evaluates a proposed rule identically to enforcement. An absent or
+/// empty facet never matches; host/mask honour the subject's cloak context.
+pub fn matchesFacets(match: Match, pattern: []const u8, facets: Facets) bool {
+    const value = facets.facet(match);
+    if (value.len == 0) return false;
+    if (match == .host or match == .mask) return cloak_match.match(pattern, value, facets.cloak_context);
+    return matchValue(match, pattern, value);
+}
+
+/// Absolute wall-clock expiry for a Ward created at `now_ms` lasting `secs`.
+/// `secs <= 0` is permanent (0). Arithmetic saturates so a hostile duration
+/// cannot overflow, and a positive duration never collapses onto the
+/// permanent sentinel 0 (only reachable with a pre-epoch clock).
+pub fn expiryMs(now_ms: i64, secs: i64) i64 {
+    if (secs <= 0) return 0;
+    const at = now_ms +| (secs *| 1000);
+    return if (at == 0) 1 else at;
+}
+
 /// Match a facet value against a Ward pattern. An `.address` pattern that
 /// contains a `/` is an IPv4 **or** IPv6 CIDR network; every other facet — and a
 /// bare or wildcard address pattern such as `192.0.2.*` (no `/`) — uses
@@ -730,6 +747,35 @@ test "expiry prunes and stops matching" {
     try std.testing.expect(reg.check(.{ .host = "x.bad" }, 999) != null);
     try std.testing.expect(reg.check(.{ .host = "x.bad" }, 1000) == null);
     try std.testing.expectEqual(@as(usize, 0), reg.count());
+}
+
+test "ward expiryMs is permanent for non-positive secs and saturates" {
+    try std.testing.expectEqual(@as(i64, 0), expiryMs(5_000, 0));
+    try std.testing.expectEqual(@as(i64, 0), expiryMs(5_000, -30));
+    try std.testing.expectEqual(@as(i64, 65_000), expiryMs(5_000, 60));
+    const max = std.math.maxInt(i64);
+    try std.testing.expectEqual(max, expiryMs(5_000, max));
+    try std.testing.expectEqual(max, expiryMs(max, 1));
+    // A positive duration never becomes the permanent sentinel.
+    try std.testing.expectEqual(@as(i64, 1), expiryMs(-1_000, 1));
+}
+
+test "ward matchesFacets is the Registry.check predicate" {
+    var reg = Registry.init(std.testing.allocator, .{});
+    defer reg.deinit();
+    try reg.add(mkWard(.address, "2001:db8::/32", .refuse));
+    const cases = [_]Facets{
+        .{ .address = "2001:db8::7" },
+        .{ .address = "192.0.2.7" },
+        .{},
+        .{ .account = "" },
+    };
+    for (cases) |f| {
+        try std.testing.expectEqual(reg.check(f, 0) != null, matchesFacets(.address, "2001:db8::/32", f));
+    }
+    try std.testing.expect(!matchesFacets(.account, "*", .{ .account = null }));
+    try std.testing.expect(!matchesFacets(.account, "*", .{ .account = "" }));
+    try std.testing.expect(matchesFacets(.mask, "*!*@*.evil.example", .{ .mask = "n!u@h.evil.example" }));
 }
 
 test "add replaces on same match+pattern; remove + list" {

@@ -53,6 +53,10 @@ pub const Action = enum {
     forceop,
     forcedeop,
     forcetopic,
+    /// A new, explicitly authorized moderation event that reverses one
+    /// prior reversible change. Never deletes or rewrites the original
+    /// audit entry; see `moderation_undo.zig`.
+    undo,
     other,
 
     /// Stable lowercase label used when rendering audit lines.
@@ -86,6 +90,7 @@ pub const Action = enum {
             .forceop => "forceop",
             .forcedeop => "forcedeop",
             .forcetopic => "forcetopic",
+            .undo => "undo",
             .other => "other",
         };
     }
@@ -121,6 +126,7 @@ pub const Action = enum {
             .forcedeop => 26,
             .forcetopic => 27,
             .access_copy => 28,
+            .undo => 29,
             .other => 255,
         };
     }
@@ -155,6 +161,7 @@ pub const Action = enum {
             26 => .forcedeop,
             27 => .forcetopic,
             28 => .access_copy,
+            29 => .undo,
             255 => .other,
             else => null,
         };
@@ -367,6 +374,15 @@ pub const OperAudit = struct {
     /// Number of live entries.
     pub fn len(self: *const OperAudit) usize {
         return self.count;
+    }
+
+    /// Sequence number of the newest retained entry, or null when empty.
+    /// Callers that pair another record with the entry they just appended
+    /// (for example `moderation_undo.ChangeInput.audit_seq`) compare this
+    /// before and after the append to learn whether it succeeded.
+    pub fn newestSeq(self: *const OperAudit) ?u64 {
+        if (self.count == 0) return null;
+        return self.at(self.count - 1).?.seq;
     }
 
     /// Borrow the entry at logical position `i` (0 == oldest). Returns null
@@ -1006,6 +1022,141 @@ test "action labels round-trip" {
     try testing.expectEqualStrings("kill", Action.kill.label());
     try testing.expectEqualStrings("akill", Action.akill.label());
     try testing.expectEqualStrings("other", Action.other.label());
+}
+
+test "Action.undo label, proofCode, and fromProofCode round-trip without disturbing other codes" {
+    try testing.expectEqualStrings("undo", Action.undo.label());
+    try testing.expectEqual(@as(u8, 29), Action.undo.proofCode());
+    try testing.expectEqual(Action.undo, Action.fromProofCode(29).?);
+
+    // Existing codes 1..28 and 255 are untouched by the new variant.
+    const expected = [_]struct { code: u8, action: Action }{
+        .{ .code = 1, .action = .kill },
+        .{ .code = 2, .action = .kline },
+        .{ .code = 3, .action = .shun },
+        .{ .code = 4, .action = .jupe },
+        .{ .code = 5, .action = .mode },
+        .{ .code = 6, .action = .akill },
+        .{ .code = 7, .action = .unkline },
+        .{ .code = 8, .action = .gline },
+        .{ .code = 9, .action = .kick },
+        .{ .code = 10, .action = .oper_up },
+        .{ .code = 11, .action = .rehash },
+        .{ .code = 12, .action = .die },
+        .{ .code = 13, .action = .restart },
+        .{ .code = 14, .action = .ward_add },
+        .{ .code = 15, .action = .unshun },
+        .{ .code = 16, .action = .ward_del },
+        .{ .code = 17, .action = .connect },
+        .{ .code = 18, .action = .squit },
+        .{ .code = 19, .action = .redact },
+        .{ .code = 20, .action = .access_add },
+        .{ .code = 21, .action = .access_delete },
+        .{ .code = 22, .action = .access_clear },
+        .{ .code = 23, .action = .forcejoin },
+        .{ .code = 24, .action = .forcepart },
+        .{ .code = 25, .action = .forceop },
+        .{ .code = 26, .action = .forcedeop },
+        .{ .code = 27, .action = .forcetopic },
+        .{ .code = 28, .action = .access_copy },
+        .{ .code = 255, .action = .other },
+    };
+    for (expected) |e| {
+        try testing.expectEqual(e.code, e.action.proofCode());
+        try testing.expectEqual(e.action, Action.fromProofCode(e.code).?);
+    }
+    try testing.expect(Action.fromProofCode(30) == null);
+}
+
+test "recording .undo after an original entry keeps the chain intact and grows the ring without deleting history" {
+    var audit = OperAudit.init(testing.allocator);
+    defer audit.deinit();
+
+    const original_seq = try audit.record(100, "alice", .kline, "*@bad.example", "abuse");
+    try testing.expectEqual(@as(usize, 1), audit.len());
+    const original_before = audit.at(0).?.*;
+
+    const undo_seq = try audit.recordWithProof(
+        200,
+        "alice",
+        .undo,
+        "*@bad.example",
+        "undo of change=1 proof=deadbeef",
+        "cafebabe",
+    );
+    try testing.expectEqual(@as(usize, 2), audit.len());
+    try testing.expect(undo_seq > original_seq);
+
+    // History is retained byte-identical; the original entry is unchanged.
+    const original_after = audit.at(0).?.*;
+    try testing.expectEqualStrings(original_before.oper, original_after.oper);
+    try testing.expectEqualStrings(original_before.target, original_after.target);
+    try testing.expectEqualStrings(original_before.reason, original_after.reason);
+    try testing.expectEqual(original_before.action, original_after.action);
+    try testing.expectEqual(original_before.seq, original_after.seq);
+
+    const undone = audit.at(1).?;
+    try testing.expectEqual(Action.undo, undone.action);
+    try testing.expectEqualStrings("undo", undone.action.label());
+    try testing.expectEqual(@as(u8, 29), undone.action.proofCode());
+
+    // The hash chain still links the new entry to the previous one.
+    try testing.expect(!std.mem.allEqual(u8, &undone.chain_prev, 0));
+}
+
+test "svc_operaudit: newestSeq tracks the newest retained entry across eviction" {
+    var audit = OperAudit.init(testing.allocator);
+    defer audit.deinit();
+
+    try testing.expectEqual(@as(?u64, null), audit.newestSeq());
+    const first = try audit.record(1, "op", .kline, "*@a", "");
+    try testing.expectEqual(@as(?u64, first), audit.newestSeq());
+    var last: u64 = first;
+    var i: usize = 0;
+    while (i < OperAudit.cap) : (i += 1) {
+        last = try audit.record(@intCast(2 + i), "op", .mode, "#c", "");
+    }
+    try testing.expectEqual(OperAudit.cap, audit.len());
+    try testing.expectEqual(@as(?u64, last), audit.newestSeq());
+}
+
+test "svc_operaudit: persisted chain round-trips an .undo entry beside the original" {
+    var audit = OperAudit.init(testing.allocator);
+    defer audit.deinit();
+
+    const proof_bytes: [proofmark.proof_id_hex_len]u8 = @splat('c');
+    const proof = &proof_bytes;
+    _ = try audit.recordWithProof(100, "alice", .shun, "*@bad.example", "abuse", proof);
+    _ = try audit.recordWithProof(200, "bob", .undo, "*@bad.example", "undo change=1 audit_seq=1 proof=" ++ proof, "");
+
+    const blob = try audit.writeChain(testing.allocator);
+    defer testing.allocator.free(blob);
+    var restored = OperAudit.init(testing.allocator);
+    defer restored.deinit();
+    try restored.readChain(blob);
+
+    try testing.expectEqual(@as(usize, 2), restored.len());
+    try testing.expectEqual(Action.shun, restored.at(0).?.action);
+    try testing.expectEqualStrings(proof, restored.at(0).?.proof_id);
+    const undo = restored.at(1).?;
+    try testing.expectEqual(Action.undo, undo.action);
+    try testing.expectEqual(Action.undo.proofCode(), undo.proof_action);
+    try testing.expectEqualStrings("bob", undo.oper);
+    try testing.expectEqualStrings("undo change=1 audit_seq=1 proof=" ++ proof, undo.reason);
+    try testing.expectEqualSlices(u8, &audit.at(1).?.chain_prev, &undo.chain_prev);
+    try testing.expectEqual(audit.chainHead(), restored.chainHead());
+
+    // Strict decode still rejects the next unassigned action code: 29 is
+    // the only newly accepted value. The first entry's action byte follows
+    // the fixed header and its seq/ts words.
+    const action_off = chain_magic.len + 1 + 1 + 2 + 8 + 32 + 64 + 32 + 8 + 8;
+    try testing.expectEqual(Action.shun.proofCode(), blob[action_off]);
+    const bad = try testing.allocator.dupe(u8, blob);
+    defer testing.allocator.free(bad);
+    bad[action_off] = 30;
+    var rejected = OperAudit.init(testing.allocator);
+    defer rejected.deinit();
+    try testing.expectError(error.Corrupt, rejected.readChain(bad));
 }
 
 test "GAP-K3 a removed entry breaks the signed proof chain" {

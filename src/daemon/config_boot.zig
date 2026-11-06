@@ -16,6 +16,7 @@ const config_format = @import("config_format.zig");
 const server = @import("server.zig");
 const oper_mod = @import("oper.zig");
 const conn_class = @import("conn_class.zig");
+const cidr_mod = @import("../proto/cidr.zig");
 const og_mod = @import("operator_groups.zig");
 const event_spine = @import("event_spine.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
@@ -27,6 +28,9 @@ const durable_oper_authority = @import("durable_oper_authority.zig");
 const durable_oper_authority_boot = @import("durable_oper_authority_boot.zig");
 const node_identity = @import("node_identity.zig");
 const store_mod = @import("store.zig");
+const resource_limits = @import("resource_limits.zig");
+const workload_quota = @import("workload_quota.zig");
+const output_class_budget = @import("output_class_budget.zig");
 
 /// The derived web writer uses a 1024-byte path buffer. Its longest filename
 /// is `chan_` + a 64-byte slug + `.html`.
@@ -320,6 +324,12 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     if (cfg.geoip.asn_database.len != 0) out.geoip_asn_db_path = cfg.geoip.asn_database;
     out.backlog = cfg.limits.backlog;
     out.max_clients = cfg.limits.max_clients;
+    out.workload_quota = cfg.quota;
+    // [resources] memory admission. Overflow cannot reach here with a budget
+    // set (resourceLimitsError refuses it first); maxInt fails closed anyway.
+    out.resource_memory_budget_bytes = cfg.resources.memory_budget_bytes;
+    out.resource_per_client_override_bytes = cfg.resources.per_client_memory_bytes;
+    out.resource_per_client_bytes = resource_limits.perClientBytes(cfg.resources, resourceLimitsContext(cfg)) orelse std.math.maxInt(u64);
     out.topiclen = cfg.limits.topiclen;
     out.awaylen = cfg.limits.awaylen;
     out.kicklen = cfg.limits.kicklen;
@@ -945,6 +955,240 @@ pub fn unsecuredMeshPeerError(connect_count: usize, require_secured: bool) ?[]co
     return null;
 }
 
+/// True when `conn_class.Builder.add` would accept `c`. Mirrors its checks so the
+/// resource context describes the registry boot actually builds (rejected classes
+/// are skipped there with a warning). `accepted` holds earlier accepted classes.
+fn classAccepted(accepted: []const config_format.Config.ClassDef, c: config_format.Config.ClassDef) bool {
+    if (accepted.len >= conn_class.max_classes) return false;
+    if (c.name.len == 0 or c.name.len > conn_class.max_name_len) return false;
+    for (accepted) |a| {
+        if (std.ascii.eqlIgnoreCase(a.name, c.name)) return false;
+    }
+    if (c.match_texts.len > conn_class.max_cidrs_per_class) return false;
+    for (c.match_texts) |t| {
+        _ = cidr_mod.Cidr.parse(t) catch return false;
+    }
+    if (c.ident_glob) |g| if (g.len > conn_class.max_glob_len) return false;
+    if (c.host_glob) |g| if (g.len > conn_class.max_glob_len) return false;
+    return true;
+}
+
+fn classQueueBytes(p: conn_class.Policy) u64 {
+    return std.math.add(u64, p.sendq, p.recvq) catch std.math.maxInt(u64);
+}
+
+/// Cross-section inputs for `[resources]`: `[limits]`, `[mesh].connect`, the
+/// worst-case client queue ceilings and the real connection-record size.
+///
+/// The per-client worst case is the largest SendQ+RecvQ over every class a
+/// client can land in under `conn_class.Registry.classFor`: each accepted class
+/// that declares match criteria (whatever its name; a criteria-bearing `server`
+/// class still matches clients) plus the `user` fallback (name compared
+/// case-insensitively; builtin defaults when no accepted `[class.user]`).
+/// Classes the Builder rejects are ignored and criteria-less classes cannot
+/// win. The `server` link policy does not size clients.
+pub fn resourceLimitsContext(parsed: config_format.Config) resource_limits.Context {
+    var user: conn_class.Policy = .{};
+    var matched: ?conn_class.Policy = null;
+    var accepted: [conn_class.max_classes]config_format.Config.ClassDef = undefined;
+    var n: usize = 0;
+    for (parsed.classes) |c| {
+        if (!classAccepted(accepted[0..n], c)) continue;
+        accepted[n] = c;
+        n += 1;
+        if (std.ascii.eqlIgnoreCase(c.name, "user")) user = c.policy;
+        const has_criteria = c.match_texts.len != 0 or c.match_tls or c.match_account or
+            c.match_oper or c.ident_glob != null or c.host_glob != null;
+        if (!has_criteria) continue;
+        if (matched == null or classQueueBytes(c.policy) > classQueueBytes(matched.?)) matched = c.policy;
+    }
+    const worst = if (matched) |m| (if (classQueueBytes(m) > classQueueBytes(user)) m else user) else user;
+    return .{
+        .max_clients = parsed.limits.max_clients,
+        .num_shards = parsed.limits.num_shards,
+        .mesh_connect_len = parsed.mesh.connect.len,
+        .sendq_cap_bytes = worst.sendq,
+        .recvq_cap_bytes = worst.recvq,
+        .conn_fixed_bytes = @sizeOf(server.ConnState),
+    };
+}
+
+/// Refusal shared by `--check-config`, doctor and normal boot for
+/// contradictory `[resources]` limits. Null admits (always for default config).
+pub fn resourceLimitsError(parsed: config_format.Config) ?[]const u8 {
+    const v = resource_limits.validate(parsed.resources, resourceLimitsContext(parsed)) orelse return null;
+    return resource_limits.violationReason(v);
+}
+
+/// M12: the cross-field check for `[quota]` against the `max_clients` every
+/// shard's governor is built from. Shared by `--check-config`, doctor and
+/// boot (via `loadFromText`), so an override set that would not validate is
+/// refused before any reactor exists instead of disabling the governor.
+pub fn workloadQuotaError(parsed: config_format.Config) ?workload_quota.ResolveError {
+    _ = workload_quota.resolve(parsed.limits.max_clients, parsed.quota) catch |err| return err;
+    return null;
+}
+
+/// Operator-facing explanation for a `workloadQuotaError`.
+pub fn workloadQuotaErrorReason(err: workload_quota.ResolveError) []const u8 {
+    return switch (err) {
+        error.ZeroCapacity => "limits.max_clients is zero",
+        error.CapacityTooLarge => "capacity exceeds the governor bound",
+        error.ZeroReserve => "recovery_reserve_slots must be at least 1",
+        error.ReserveExceedsCapacity => "recovery_reserve_slots must be below limits.max_clients (and every quota field needs a table above 4 slots unless set explicitly to fit)",
+        error.InvalidMeshReserve => "mesh_reserve_slots must be at least 1 and below recovery_reserve_slots",
+        error.ZeroFloor => "admission_floor_slots must be at least 1",
+        error.FloorExceedsShareCeiling => "admission_floor_slots must not exceed max_clients minus recovery_reserve_slots",
+        error.ZeroPerPeerCap => "max_recovery_inflight_per_peer must be at least 1",
+        error.ZeroRate => "every rate must be at least 1",
+        error.ZeroBurst => "every burst must be at least 1",
+        error.InvalidPercent => "a percentage is outside 1-100",
+        error.AdmissionBurstBelowPressureCeiling => "admission_burst must be at least 9",
+        error.PeerRateNotBelowClassRate => "each *_peer_rate_per_sec must be below its class rate_per_sec",
+        error.PeerBurstNotBelowClassBurst => "each *_peer_burst must be below its class burst",
+        error.RecoveryRateRowsExceeded => "recovery burst + rate * peer_burst / peer_rate exceeds the per-peer table bound (512)",
+        error.ExplicitFieldsWhileDisabled => "enabled = false cannot be combined with explicit quota values",
+    };
+}
+
+/// Why `[quota]` leaves the governor off, or null when every shard runs one.
+/// `--check-config` prints it as a warning; it is not a refusal, because
+/// small tables (tests, private nodes) have always run unmetered.
+pub fn workloadQuotaDisabledReason(parsed: config_format.Config) ?[]const u8 {
+    const resolution = workload_quota.resolve(parsed.limits.max_clients, parsed.quota) catch return null;
+    return switch (resolution) {
+        .enabled => null,
+        .disabled => |why| switch (why) {
+            .operator_disabled => "[quota] enabled = false: admission and recovery quotas are off; a reconnect storm can take the slots mesh redials and session recovery need",
+            .table_too_small => "limits.max_clients is 4 or less: the derived recovery reserve does not fit, so admission and recovery quotas are off (set [quota] values explicitly to govern a small table)",
+        },
+    };
+}
+
+/// M05: one connection class whose SendQ cap is too small for a full-size
+/// item of `class`. Never a refusal: the runtime sheds media, defers replay
+/// and poisons chat overage as before; this only makes the effect visible.
+pub const OutputClassCapWarning = struct {
+    /// Class name; borrowed from the parsed config, or "user" (builtin default).
+    name: []const u8,
+    sendq: u64,
+    class: output_class_budget.Class,
+    ceiling: u64,
+    needed: u64,
+
+    pub fn effect(self: OutputClassCapWarning) []const u8 {
+        return switch (self.class) {
+            .chat => "one full-size chat line can exceed it and close the connection as SendQ overflow",
+            .replay => "CHATHISTORY answers TEMPORARILY_UNAVAILABLE for full-size lines instead of replaying them",
+            .media => "media frames up to media.max_frame_bytes can be dropped for these clients",
+            .control => "control output can exceed it",
+        };
+    }
+};
+
+/// Upper bound on `outputClassCapWarnings` entries: three output classes for
+/// every class plus the builtin `user` fallback.
+pub const max_output_class_cap_warnings = (conn_class.max_classes + 1) * 3;
+
+/// M05: every client-facing class (the ones `resourceLimitsContext` sizes:
+/// criteria-bearing accepted classes and the `user` fallback) whose per-class
+/// output ceilings under `output_class_budget.Policy.default` cannot carry one
+/// full-size chat line, replay page or (with `[media] enabled`) media frame.
+pub fn outputClassCapWarnings(parsed: config_format.Config, out: *[max_output_class_cap_warnings]OutputClassCapWarning) []OutputClassCapWarning {
+    var n: usize = 0;
+    var accepted: [conn_class.max_classes]config_format.Config.ClassDef = undefined;
+    var accepted_len: usize = 0;
+    var user_seen = false;
+    for (parsed.classes) |c| {
+        if (!classAccepted(accepted[0..accepted_len], c)) continue;
+        accepted[accepted_len] = c;
+        accepted_len += 1;
+        const is_user = std.ascii.eqlIgnoreCase(c.name, "user");
+        if (is_user) user_seen = true;
+        const has_criteria = c.match_texts.len != 0 or c.match_tls or c.match_account or
+            c.match_oper or c.ident_glob != null or c.host_glob != null;
+        if (!is_user and !has_criteria) continue;
+        n = appendOutputClassCapWarnings(parsed, c.name, c.policy.sendq, out, n);
+    }
+    if (!user_seen) n = appendOutputClassCapWarnings(parsed, "user", (conn_class.Policy{}).sendq, out, n);
+    return out[0..n];
+}
+
+/// Warning text goes to a terminal; never echo control or non-ASCII bytes.
+fn printableClassName(name: []const u8) bool {
+    for (name) |b| if (b < 0x21 or b > 0x7e) return false;
+    return true;
+}
+
+fn appendOutputClassCapWarnings(
+    parsed: config_format.Config,
+    name: []const u8,
+    sendq: u64,
+    out: *[max_output_class_cap_warnings]OutputClassCapWarning,
+    start: usize,
+) usize {
+    var n = start;
+    const c = output_class_budget.ceilings(output_class_budget.Policy.default, sendq);
+    const media_needed = parsed.media.max_frame_bytes +| server.output_class_media_frame_overhead;
+    const checks = [_]struct { class: output_class_budget.Class, ceiling: u64, needed: u64, applies: bool }{
+        .{ .class = .chat, .ceiling = c.chat, .needed = server.output_class_chat_line_bytes, .applies = true },
+        .{ .class = .replay, .ceiling = c.replay, .needed = server.output_class_replay_page_bytes, .applies = true },
+        .{ .class = .media, .ceiling = c.media, .needed = media_needed, .applies = parsed.media.enabled },
+    };
+    for (checks) |check| {
+        if (!check.applies or check.ceiling >= check.needed or n >= out.len) continue;
+        out[n] = .{ .name = if (printableClassName(name)) name else "(unprintable name)", .sendq = sendq, .class = check.class, .ceiling = check.ceiling, .needed = check.needed };
+        n += 1;
+    }
+    return n;
+}
+
+/// Maximum bytes `resourcesCheckReport` writes (four bounded lines).
+pub const max_resources_report_bytes: usize = 1024;
+
+/// W09 `--check-config` report for `[resources]`, written into `buf` as
+/// newline-terminated lines (empty when every `[resources]` value is unset).
+/// Contradictions are refused earlier by `resourceLimitsError` at load; this
+/// states what an accepted table actually enforces, so an operator is never
+/// left believing an advisory value is a runtime limit. Never prints basis
+/// text. `buf` must hold `max_resources_report_bytes`.
+pub fn resourcesCheckReport(parsed: config_format.Config, buf: []u8) error{NoSpaceLeft}![]const u8 {
+    std.debug.assert(buf.len >= max_resources_report_bytes);
+    const r = parsed.resources;
+    var w: std.Io.Writer = .fixed(buf);
+    if (r.memory_budget_bytes != 0) {
+        const per = resource_limits.perClientBytes(r, resourceLimitsContext(parsed)) orelse std.math.maxInt(u64);
+        const admits = if (per == 0) std.math.maxInt(u64) else r.memory_budget_bytes / per;
+        w.print("config resources: memory_budget_bytes={d} per_client_bytes={d} admits_clients={d} max_clients={d}; each shard admits its equal share; mesh links and Helix-adopted clients are exempt\n", .{ r.memory_budget_bytes, per, admits, parsed.limits.max_clients }) catch return error.NoSpaceLeft;
+    }
+    if (r.cpu_max_shards != 0)
+        w.print("config resources: cpu_max_shards={d} bounds [limits].num_shards only; host CPU count is not checked\n", .{r.cpu_max_shards}) catch return error.NoSpaceLeft;
+    if (r.net_ingress_bytes_per_sec != 0)
+        w.writeAll("config WARNING: resources.net_ingress_bytes_per_sec is accepted but not enforced or estimated by this build\n") catch return error.NoSpaceLeft;
+    if (r.net_egress_bytes_per_sec != 0)
+        w.writeAll("config WARNING: resources.net_egress_bytes_per_sec only bounds capacity estimates; this build does not rate-limit egress\n") catch return error.NoSpaceLeft;
+    return w.buffered();
+}
+
+/// REHASH keeps `[resources]` and `[limits].max_clients` at their boot values
+/// (startup-only) but may change connection classes. Returns the per-client
+/// commitment for the candidate classes under the boot budget, or null when
+/// that budget cannot hold the live `max_clients` at it (REHASH then refuses
+/// before any commit).
+pub fn rehashResourcePerClientBytes(boot_budget_bytes: u64, boot_override_bytes: u64, live_max_clients: u32, candidate: config_format.Config) ?u64 {
+    const boot: resource_limits.Config = .{ .memory_budget_bytes = boot_budget_bytes, .per_client_memory_bytes = boot_override_bytes };
+    var ctx = resourceLimitsContext(candidate);
+    ctx.max_clients = live_max_clients;
+    if (resource_limits.validate(boot, ctx) != null) return null;
+    return resource_limits.perClientBytes(boot, ctx) orelse if (boot_budget_bytes == 0) std.math.maxInt(u64) else null;
+}
+
+/// Capacity estimate for the loaded config. It exists only when the operator
+/// supplied `[resources.basis]`; the result always names that basis.
+pub fn capacityEstimate(parsed: config_format.Config, host: resource_limits.Host) resource_limits.EstimateError!resource_limits.Estimate {
+    return resource_limits.estimate(parsed.resources, resourceLimitsContext(parsed), host);
+}
+
 /// Listener snapshot `--check-config` compares. Same value `UPGRADE` builds
 /// from the running `Server.Config` plus `listenerSetFromConfig` on the file.
 pub fn listenerSetFromParsed(parsed: config_format.Config) config_format.ListenerSet {
@@ -1046,6 +1290,14 @@ fn loadFromTextImpl(
 ) !Loaded {
     var parsed = try config_format.parseToml(allocator, text, resolver);
     errdefer parsed.deinit(allocator);
+    if (resourceLimitsError(parsed)) |reason| {
+        if (!quiet) dlog.log("onyx-server: refusing config: {s}\n", .{reason});
+        return error.ResourceLimitsInvalid;
+    }
+    if (workloadQuotaError(parsed)) |err| {
+        if (!quiet) dlog.log("onyx-server: refusing config: [quota] {s}: {s}\n", .{ @errorName(err), workloadQuotaErrorReason(err) });
+        return error.WorkloadQuotaInvalid;
+    }
 
     // Role-based operator groups: build a transient registry from `[[oper_groups]]`
     // (each a named privilege set, optionally inheriting another). An oper's
@@ -1890,6 +2142,156 @@ test "limits overlay reputation knobs" {
     try testing.expectEqual(@as(i64, 90_000), loaded.config.reputation_half_life_ms);
 }
 
+test "resources: default config boots unchanged and exposes no estimate without a basis" {
+    var loaded = try loadFromText(testing.allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{ .port = 6680 }, .{});
+    defer loaded.deinit(testing.allocator);
+    try testing.expect(resourceLimitsError(loaded.parsed) == null);
+    try testing.expectEqual(resource_limits.Config{}, loaded.parsed.resources);
+    try testing.expectError(error.MissingBenchmarkBasis, capacityEstimate(loaded.parsed, .{}));
+}
+
+test "resources: --check-config report states what an accepted [resources] table enforces" {
+    const head = "[node]\nid=1\n[listen]\nirc=6680\n";
+    var buf: [max_resources_report_bytes]u8 = undefined;
+    var plain = try loadFromText(testing.allocator, head, .{ .port = 6680 }, .{});
+    defer plain.deinit(testing.allocator);
+    try testing.expectEqualStrings("", try resourcesCheckReport(plain.parsed, &buf));
+
+    var full = try loadFromText(testing.allocator, head ++ "[limits]\nmax_clients=100\nnum_shards=2\n[resources]\nmemory_budget_bytes=4194304\nper_client_memory_bytes=32768\ncpu_max_shards=4\nnet_ingress_bytes_per_sec=1000\nnet_egress_bytes_per_sec=2000\n", .{ .port = 6680 }, .{});
+    defer full.deinit(testing.allocator);
+    const report = try resourcesCheckReport(full.parsed, &buf);
+    try testing.expect(std.mem.indexOf(u8, report, "config resources: memory_budget_bytes=4194304 per_client_bytes=32768 admits_clients=128 max_clients=100;") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "cpu_max_shards=4 bounds [limits].num_shards only") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "config WARNING: resources.net_ingress_bytes_per_sec is accepted but not enforced") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "config WARNING: resources.net_egress_bytes_per_sec only bounds capacity estimates") != null);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, report, "\n"));
+    // Contradictions never reach the report: load refuses them first.
+    try testing.expectError(error.ResourceLimitsInvalid, loadFromText(testing.allocator, head ++ "[limits]\nmax_clients=100\n[resources]\nmemory_budget_bytes=4194304\n", .{ .port = 6680 }, .{}));
+}
+
+test "resources: contradictory limits are refused at load and named by the shared predicate" {
+    const head = "[node]\nid=1\n[listen]\nirc=6680\n";
+    // 100 clients at 1 MiB sendq cannot fit a 4 MiB budget.
+    try testing.expectError(error.ResourceLimitsInvalid, loadFromText(testing.allocator, head ++ "[limits]\nmax_clients=100\n[resources]\nmemory_budget_bytes=4194304\n", .{ .port = 6680 }, .{}));
+    // Explicit smaller per-client commitment makes the same budget valid.
+    var ok = try loadFromText(testing.allocator, head ++ "[limits]\nmax_clients=100\n[resources]\nmemory_budget_bytes=4194304\nper_client_memory_bytes=32768\n", .{ .port = 6680 }, .{});
+    ok.deinit(testing.allocator);
+    // cpu_max_shards below [limits].num_shards.
+    try testing.expectError(error.ResourceLimitsInvalid, loadFromText(testing.allocator, head ++ "[limits]\nnum_shards=4\n[resources]\ncpu_max_shards=2\n", .{ .port = 6680 }, .{}));
+    // mesh.connect longer than net_max_s2s_peers.
+    const mesh = "[mesh]\nrequire_secured=true\nconnect=[\"10.0.0.1:6900\",\"10.0.0.2:6900\"]\n";
+    try testing.expectError(error.ResourceLimitsInvalid, loadFromText(testing.allocator, head ++ mesh ++ "[resources]\nnet_max_s2s_peers=1\n", .{ .port = 6680 }, .{}));
+    var peers = try loadFromText(testing.allocator, head ++ mesh ++ "[resources]\nnet_max_s2s_peers=2\n", .{ .port = 6680 }, .{});
+    defer peers.deinit(testing.allocator);
+    try testing.expect(resourceLimitsError(peers.parsed) == null);
+    // The shared predicate reports the reason text for a hand-built contradiction.
+    var bad = peers.parsed;
+    bad.resources.net_max_s2s_peers = 1;
+    try testing.expect(std.mem.indexOf(u8, resourceLimitsError(bad).?, "net_max_s2s_peers") != null);
+}
+
+test "resources: the user class and real ConnState size feed the per-client commitment" {
+    const head = "[node]\nid=1\n[listen]\nirc=6680\n";
+    var dflt = try loadFromText(testing.allocator, head, .{ .port = 6680 }, .{});
+    defer dflt.deinit(testing.allocator);
+    const base = resourceLimitsContext(dflt.parsed);
+    try testing.expectEqual(@as(u64, @sizeOf(server.ConnState)), base.conn_fixed_bytes);
+    try testing.expectEqual(@as(u64, (conn_class.Policy{}).sendq), base.sendq_cap_bytes);
+    var classed = try loadFromText(testing.allocator, head ++ "[class.user]\nsendq=\"2M\"\nrecvq=\"16K\"\n", .{ .port = 6680 }, .{});
+    defer classed.deinit(testing.allocator);
+    const ctx = resourceLimitsContext(classed.parsed);
+    try testing.expectEqual(@as(u64, 2 << 20), ctx.sendq_cap_bytes);
+    try testing.expectEqual(@as(u64, 16 << 10), ctx.recvq_cap_bytes);
+}
+
+test "resources: per-client worst case spans every class a client can land in" {
+    const head = "[node]\nid=1\n[listen]\nirc=6680\n";
+    // A criteria-bearing custom class larger than `user` sizes the worst case, so
+    // 1024 clients x 64 MiB cannot hide under a 2 GiB budget.
+    const trusted = head ++ "[limits]\nmax_clients=1024\n[class.trusted]\nsendq=\"64M\"\nrecvq=\"1M\"\nmatch=[\"10.0.0.0/8\"]\n";
+    try testing.expectError(error.ResourceLimitsInvalid, loadFromText(testing.allocator, trusted ++ "[resources]\nmemory_budget_bytes=2147483648\n", .{ .port = 6680 }, .{}));
+    var big = try loadFromText(testing.allocator, trusted ++ "[resources]\nmemory_budget_bytes=137438953472\n", .{ .port = 6680 }, .{});
+    defer big.deinit(testing.allocator);
+    const ctx = resourceLimitsContext(big.parsed);
+    try testing.expectEqual(@as(u64, 64 << 20), ctx.sendq_cap_bytes);
+    try testing.expectEqual(@as(u64, 1 << 20), ctx.recvq_cap_bytes);
+
+    // `user` is case-insensitive, exactly as Builder.ensureBuiltin matches it.
+    var upper = try loadFromText(testing.allocator, head ++ "[class.USER]\nsendq=\"64M\"\n", .{ .port = 6680 }, .{});
+    defer upper.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 64 << 20), resourceLimitsContext(upper.parsed).sendq_cap_bytes);
+
+    // A criteria-less custom class never wins in classFor, so it adds nothing.
+    var inert = try loadFromText(testing.allocator, head ++ "[class.inert]\nsendq=\"99M\"\n", .{ .port = 6680 }, .{});
+    defer inert.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, (conn_class.Policy{}).sendq), resourceLimitsContext(inert.parsed).sendq_cap_bytes);
+
+    // A shrunken `user` still yields to a larger matching class.
+    var mixed = try loadFromText(testing.allocator, head ++ "[class.user]\nsendq=\"64K\"\n[class.tls]\nsendq=\"8M\"\nmatch_tls=true\n", .{ .port = 6680 }, .{});
+    defer mixed.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 8 << 20), resourceLimitsContext(mixed.parsed).sendq_cap_bytes);
+
+    // The server-link class sizes no client unless it declares match criteria.
+    var srv = try loadFromText(testing.allocator, head ++ "[class.server]\nsendq=\"32M\"\n", .{ .port = 6680 }, .{});
+    defer srv.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, (conn_class.Policy{}).sendq), resourceLimitsContext(srv.parsed).sendq_cap_bytes);
+    var srv_match = try loadFromText(testing.allocator, head ++ "[class.server]\nsendq=\"32M\"\nmatch_oper=true\n", .{ .port = 6680 }, .{});
+    defer srv_match.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 32 << 20), resourceLimitsContext(srv_match.parsed).sendq_cap_bytes);
+}
+
+test "resources: classes the Builder rejects do not size clients" {
+    var base: config_format.Config = .{ .node = .{ .id = 1 }, .listen = .{ .irc = 6680 } };
+    const huge: conn_class.Policy = .{ .sendq = 64 << 20 };
+    const small: conn_class.Policy = .{ .sendq = 2 << 20 };
+    const ten: []const []const u8 = &.{"10.0.0.0/8"};
+    const bad_cidr: []const []const u8 = &.{"not-a-cidr"};
+    const long_name: []const u8 = &@as([conn_class.max_name_len + 1]u8, @splat('x'));
+    const long_glob: []const u8 = &@as([conn_class.max_glob_len + 1]u8, @splat('g'));
+    var rejected = [_]config_format.Config.ClassDef{
+        .{ .name = "badcidr", .policy = huge, .match_texts = bad_cidr },
+        .{ .name = "", .policy = huge, .match_texts = ten },
+        .{ .name = long_name, .policy = huge, .match_texts = ten },
+        .{ .name = "longglob", .policy = huge, .ident_glob = long_glob },
+        .{ .name = "hostglob", .policy = huge, .host_glob = long_glob },
+        // First of a case-insensitive pair wins; the later duplicate is dropped.
+        .{ .name = "Dup", .policy = small, .match_texts = ten },
+        .{ .name = "dup", .policy = huge, .match_texts = ten },
+    };
+    base.classes = &rejected;
+    try testing.expectEqual(@as(u64, 2 << 20), resourceLimitsContext(base).sendq_cap_bytes);
+
+    // A user class dropped by the Builder leaves the builtin default in force.
+    var user_bad = [_]config_format.Config.ClassDef{
+        .{ .name = "user", .policy = huge, .match_texts = bad_cidr },
+    };
+    base.classes = &user_bad;
+    try testing.expectEqual(@as(u64, (conn_class.Policy{}).sendq), resourceLimitsContext(base).sendq_cap_bytes);
+
+    // Past `max_classes` accepted entries the Builder stops adding.
+    var names: [conn_class.max_classes + 1][3]u8 = undefined;
+    var defs: [conn_class.max_classes + 1]config_format.Config.ClassDef = undefined;
+    for (&defs, &names, 0..) |*d, *nm, i| {
+        nm.* = .{ 'c', 'a' + @as(u8, @intCast(i / 26)), 'a' + @as(u8, @intCast(i % 26)) };
+        d.* = .{ .name = nm, .policy = if (i == conn_class.max_classes) huge else small, .match_texts = ten };
+    }
+    base.classes = &defs;
+    try testing.expectEqual(@as(u64, 2 << 20), resourceLimitsContext(base).sendq_cap_bytes);
+}
+
+test "resources: capacity estimate from a parsed basis names the basis and binds on the config cap" {
+    const text = "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nmax_clients=500\n[resources.basis]\nname=\"pilot\"\nharness=\"tools/bench_live.py --quick\"\nrevision=\"abc123\"\nmeasured_clients=1000\nrss_per_client_bytes=65536\n";
+    var loaded = try loadFromText(testing.allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(testing.allocator);
+    const e = try capacityEstimate(loaded.parsed, .{ .memory_bytes = 1 << 40, .fd_limit = 1 << 20 });
+    try testing.expectEqual(resource_limits.Constraint.config_max_clients, e.binding);
+    try testing.expectEqual(@as(u64, 500), e.max_clients);
+    var buf: [512]u8 = undefined;
+    const line = try resource_limits.formatEstimate(&buf, e);
+    try testing.expect(std.mem.indexOf(u8, line, "basis=pilot") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "revision=abc123") != null);
+}
+
 test "num_shards lifts onto the boot config and defaults to 1" {
     const allocator = testing.allocator;
     const text =
@@ -2504,4 +2906,125 @@ test "setup quiet loader preserves typed boot projection and rejected input" {
     try testing.expectEqual(normal.oper_bindings.len, quiet.oper_bindings.len);
     try testing.expectEqual(@as(usize, 0), quiet.oper_bindings.len);
     try testing.expectError(error.InvalidSyntax, loadFromTextQuiet(allocator, "[listen\n", .{ .port = 6680 }, .{}));
+}
+
+test "M12 quota: default config derives the governor and loads unchanged" {
+    var loaded = try loadFromText(testing.allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{ .port = 6680 }, .{});
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(workload_quota.Overrides{}, loaded.parsed.quota);
+    try testing.expectEqual(workload_quota.Overrides{}, loaded.config.workload_quota);
+    try testing.expect(workloadQuotaError(loaded.parsed) == null);
+    try testing.expect(workloadQuotaDisabledReason(loaded.parsed) == null);
+}
+
+test "M12 quota: explicit values project into the boot config and take effect" {
+    const text = "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nmax_clients=256\n[quota]\nrecovery_reserve_slots=20\nmesh_reserve_slots=8\nadmission_burst=64\nsession_recovery_peer_rate_per_sec=100\n";
+    var loaded = try loadFromText(testing.allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u32, 20), loaded.config.workload_quota.recovery_reserve_slots);
+    const resolved = (try workload_quota.resolve(loaded.config.max_clients, loaded.config.workload_quota)).enabled;
+    try testing.expectEqual(@as(u32, 20), resolved.recovery_reserve_slots);
+    try testing.expectEqual(@as(u32, 8), resolved.mesh_reserve_slots);
+    try testing.expectEqual(@as(u64, 64), resolved.admission_burst);
+    try testing.expectEqual(@as(u64, 100), resolved.session_recovery_peer_rate_per_sec);
+}
+
+test "M12 quota: invalid settings are refused at load, never a silently disabled governor" {
+    const head = "[node]\nid=1\n[listen]\nirc=6680\n";
+    const refused = [_][]const u8{
+        // Cross-field rules (workloadQuotaError).
+        "[quota]\nrecovery_reserve_slots=1\n",
+        "[quota]\nmesh_reserve_slots=32\n",
+        "[quota]\nadmission_floor_slots=1000\n",
+        "[quota]\nadmission_burst=8\n",
+        "[quota]\nsession_recovery_peer_rate_per_sec=128\n",
+        "[quota]\nmesh_recovery_burst=100\n",
+        "[quota]\nenabled=false\nadmission_burst=64\n",
+        "[limits]\nmax_clients=4\n[quota]\nrecovery_reserve_slots=4\n",
+        "[limits]\nmax_clients=100\n[quota]\nrecovery_reserve_slots=100\n",
+    };
+    for (refused) |body| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const text = try std.mem.concat(arena.allocator(), u8, &.{ head, body });
+        var parsed = try config_format.parseToml(testing.allocator, text, .{});
+        defer parsed.deinit(testing.allocator);
+        try testing.expect(workloadQuotaError(parsed) != null);
+        try testing.expect(workloadQuotaErrorReason(workloadQuotaError(parsed).?).len != 0);
+        try testing.expectError(error.WorkloadQuotaInvalid, loadFromText(testing.allocator, text, .{ .port = 6680 }, .{}));
+    }
+    // Shape errors fail the parse itself.
+    const malformed = [_][]const u8{
+        "[quota]\nrecovery_reserve_slot=8\n", // typo
+        "[quota]\nrecovery_reserve_slots=0\n",
+        "[quota]\nrecovery_reserve_slots=-3\n",
+        "[quota]\nrecovery_reserve_slots=\"8\"\n",
+        "[quota]\nrecovery_reserve_slots=4096\n",
+        "[quota]\nadmission_rate_per_sec=99999999999\n",
+        "[quota]\nenabled=1\n",
+    };
+    for (malformed) |body| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const text = try std.mem.concat(arena.allocator(), u8, &.{ head, body });
+        try testing.expectError(error.quota, loadFromText(testing.allocator, text, .{ .port = 6680 }, .{}));
+    }
+    // A top-level scalar named quota is not a table.
+    try testing.expectError(error.quota, loadFromText(testing.allocator, "quota=3\n" ++ head, .{ .port = 6680 }, .{}));
+}
+
+test "M12 quota: an off governor is reported with its reason" {
+    var small = try loadFromText(testing.allocator, "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nmax_clients=4\n", .{ .port = 6680 }, .{});
+    defer small.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, workloadQuotaDisabledReason(small.parsed).?, "max_clients is 4 or less") != null);
+    var off = try loadFromText(testing.allocator, "[node]\nid=1\n[listen]\nirc=6680\n[quota]\nenabled=false\n", .{ .port = 6680 }, .{});
+    defer off.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, workloadQuotaDisabledReason(off.parsed).?, "enabled = false") != null);
+    // Explicit values govern a small table instead of leaving it off.
+    var governed = try loadFromText(testing.allocator, "[node]\nid=1\n[listen]\nirc=6680\n[limits]\nmax_clients=4\n[quota]\nrecovery_reserve_slots=2\nmesh_reserve_slots=1\n", .{ .port = 6680 }, .{});
+    defer governed.deinit(testing.allocator);
+    try testing.expect(workloadQuotaDisabledReason(governed.parsed) == null);
+}
+
+test "M05 output caps: default classes warn about nothing" {
+    var loaded = try loadFromText(testing.allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{ .port = 6680 }, .{});
+    defer loaded.deinit(testing.allocator);
+    var buf: [max_output_class_cap_warnings]OutputClassCapWarning = undefined;
+    try testing.expectEqual(@as(usize, 0), outputClassCapWarnings(loaded.parsed, &buf).len);
+    var media = loaded.parsed;
+    media.media.enabled = true;
+    try testing.expectEqual(@as(usize, 0), outputClassCapWarnings(media, &buf).len);
+}
+
+test "M05 output caps: small SendQ classes still load and are named per output class" {
+    const text = "[node]\nid=1\n[listen]\nirc=6680\n[class.user]\nsendq=\"4K\"\n[class.tiny]\nsendq=\"12K\"\nmatch_tls=true\n[class.big]\nsendq=\"8M\"\nmatch_account=true\n[class.inert]\nsendq=\"1K\"\n";
+    var loaded = try loadFromText(testing.allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(testing.allocator);
+    var buf: [max_output_class_cap_warnings]OutputClassCapWarning = undefined;
+    const warnings = outputClassCapWarnings(loaded.parsed, &buf);
+    var user_chat = false;
+    var user_replay = false;
+    var tiny_replay = false;
+    for (warnings) |w| {
+        // Criteria-less non-user classes never size a client; big fits.
+        try testing.expect(!std.mem.eql(u8, w.name, "inert") and !std.mem.eql(u8, w.name, "big"));
+        try testing.expect(w.ceiling < w.needed);
+        try testing.expect(w.class != .media); // media is off
+        if (std.mem.eql(u8, w.name, "user") and w.class == .chat) user_chat = true;
+        if (std.mem.eql(u8, w.name, "user") and w.class == .replay) user_replay = true;
+        if (std.mem.eql(u8, w.name, "tiny") and w.class == .replay) tiny_replay = true;
+        try testing.expect(w.effect().len != 0);
+    }
+    try testing.expect(user_chat and user_replay and tiny_replay);
+
+    // With media on, a class whose media ceiling cannot carry one
+    // max_frame_bytes frame is named too.
+    var media = loaded.parsed;
+    media.media.enabled = true;
+    media.media.max_frame_bytes = 64 * 1024;
+    var media_warned = false;
+    for (outputClassCapWarnings(media, &buf)) |w| {
+        if (w.class == .media and std.mem.eql(u8, w.name, "tiny")) media_warned = true;
+    }
+    try testing.expect(media_warned);
 }

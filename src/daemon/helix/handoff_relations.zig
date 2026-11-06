@@ -35,6 +35,7 @@ const native_windows_rdns = @import("native_windows_rdns.zig");
 const native_windows_dnsbl = @import("native_windows_dnsbl.zig");
 const svc_login_throttle = @import("../svc_login_throttle.zig");
 const nick_delay = @import("../nick_delay.zig");
+const session_attachment_revoke = @import("../session_attachment_revoke.zig");
 const svc_tempmode = @import("../svc_tempmode.zig");
 const raid_shield = @import("../raid_shield.zig");
 const slowmode_checkpoint = @import("slowmode_checkpoint.zig");
@@ -148,6 +149,8 @@ pub const Error = error{
     DuplicateOperGrants,
     InvalidOperGrants,
     DuplicateBotGrants,
+    DuplicateAttachmentRevoke,
+    InvalidAttachmentRevoke,
     InvalidBotGrants,
     DuplicateThreads,
     InvalidThreads,
@@ -270,6 +273,7 @@ pub const Summary = struct {
     mesh_clock: usize = 0,
     oper_grants: usize = 0,
     bot_grants: usize = 0,
+    attachment_revoke: usize = 0,
     threads: usize = 0,
     schedules: usize = 0,
     clone_detector: usize = 0,
@@ -688,6 +692,15 @@ fn validateCurrentBody(capsules: []const capsule.Capsule, state_fds: []const i32
             bot_grant_snapshot.validateCheckpoint(bytes) catch return error.InvalidBotGrants;
             if (summary.bot_grants != 0) return error.DuplicateBotGrants;
             summary.bot_grants = 1;
+            continue;
+        }
+        // SARS (T07 attachment-revoke fences) is at-most-once: a node that
+        // never armed a fence seals no piece.
+        if (session_attachment_revoke.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2) return error.InvalidAttachmentRevoke;
+            session_attachment_revoke.validateCheckpoint(bytes) catch return error.InvalidAttachmentRevoke;
+            if (summary.attachment_revoke != 0) return error.DuplicateAttachmentRevoke;
+            summary.attachment_revoke = 1;
             continue;
         }
         // THRD is at-most-once, like bot grants. A pre-thread arena has no

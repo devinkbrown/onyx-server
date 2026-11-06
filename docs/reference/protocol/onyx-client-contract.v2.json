@@ -86,6 +86,15 @@
       "session_resume": "snapshot or live-sibling attach; original JOIN/PART/QUIT live commands are not replayed"
     }
   },
+  "error_privacy": {
+    "roadmap": "Q01",
+    "invariant": "permission and privacy failures are not channel or account existence oracles",
+    "concealed_channel": "a secret, private or hidden channel the caller is not a member of",
+    "reply": "every channel command against a concealed channel answers exactly as for a missing channel at the same call site, normally 403 ERR_NOSUCHCHANNEL",
+    "replaces": ["442 ERR_NOTONCHANNEL", "404 ERR_CANNOTSENDTOCHAN", "482 ERR_CHANOPRIVSNEEDED", "443 ERR_USERONCHANNEL", "FAIL PRIVMSG E2EE_REQUIRED"],
+    "unchanged_for": "channel members, visible channels, and operator spy/override carve-outs",
+    "client_handling": "treat 403 for a channel as not found or not visible; never infer existence from a more specific numeric"
+  },
   "e2ee_group": {
     "content_envelope": "ONYXROOM1",
     "message_tag": "+onyx/e2ee=mls",

@@ -51,6 +51,7 @@ pub const tls12_server = @import("tls12_server.zig");
 pub const tls12 = @import("tls12.zig");
 pub const tls_client = @import("tls_client.zig");
 pub const tls_fuzz = @import("tls_fuzz.zig");
+pub const tls_handshake_reassembly = @import("tls_handshake_reassembly.zig");
 pub const tls_kat = @import("tls_kat.zig");
 pub const tls_props = @import("tls_props.zig");
 pub const tls_record = @import("tls_record.zig");
@@ -68,6 +69,7 @@ pub const x509_props = @import("x509_props.zig");
 pub const x509_verify = @import("x509_verify.zig");
 pub const x509 = @import("x509.zig");
 pub const xwing = @import("xwing.zig");
+pub const zig_compat = @import("zig_compat.zig");
 // gen:mods:end
 
 pub const Secret = secret.Secret;
@@ -121,6 +123,7 @@ test {
     _ = tls12;
     _ = tls_client;
     _ = tls_fuzz;
+    _ = tls_handshake_reassembly;
     _ = tls_kat;
     _ = tls_props;
     _ = tls_record;
@@ -138,5 +141,6 @@ test {
     _ = x509_verify;
     _ = x509;
     _ = xwing;
+    _ = zig_compat;
     // gen:tests:end
 }

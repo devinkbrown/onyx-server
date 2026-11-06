@@ -409,7 +409,7 @@ test "setup search includes existing network and nonsecret settings" {
 /// correlation, not authorization or credentials; the backend owns all guards.
 pub const MaintenanceWizard = struct {
     review_id: ?[32]u8 = null,
-    pub const Action = enum { review, back, cancel, apply, change_restore, invalid };
+    pub const Action = enum { review, back, cancel, apply, change_restore, edit_config, preview_config, discard_config, save_config, invalid };
     pub fn enterReview(self: *MaintenanceWizard, id: [32]u8) void {
         self.review_id = id;
     }
@@ -425,6 +425,10 @@ pub const MaintenanceWizard = struct {
         }
         if (std.mem.eql(u8, text, "review") and self.review_id == null) return .review;
         if (self.review_id == null and maintenanceRestorePath(text) != null) return .change_restore;
+        if (std.mem.eql(u8, text, "preview")) return .preview_config;
+        if (self.review_id == null and maintenanceConfigEdit(text) != null) return .edit_config;
+        if (self.review_id == null and std.mem.eql(u8, text, "discard")) return .discard_config;
+        if (self.review_id == null and maintenanceSavePath(text) != null) return .save_config;
         if (self.review_id) |id| {
             if (text.len == 6 + id.len and std.mem.startsWith(u8, text, "apply ") and std.mem.eql(u8, text[6..], &id)) return .apply;
         }
@@ -454,6 +458,54 @@ pub fn maintenanceRestorePath(raw: []const u8) ?[]const u8 {
     const path = text[prefix.len..];
     for (path) |byte| if (byte < 0x20 or byte == 0x7f) return null;
     return path;
+}
+
+/// Maintenance config edit, using the same `set <key> <value>` keys as the
+/// new-install wizard. `restore-into` is a custody choice, not configuration.
+pub const ConfigEdit = struct { key: []const u8, value: []const u8 };
+pub fn maintenanceConfigEdit(raw: []const u8) ?ConfigEdit {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    if (!std.mem.startsWith(u8, text, "set ")) return null;
+    const pair = std.mem.trim(u8, text[4..], " \t");
+    const separator = std.mem.indexOfAny(u8, pair, " \t") orelse return null;
+    const key = pair[0..separator];
+    const value = std.mem.trim(u8, pair[separator + 1 ..], " \t");
+    if (value.len == 0 or std.mem.eql(u8, key, "restore-into")) return null;
+    for (pair) |byte| if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return null;
+    return .{ .key = key, .value = value };
+}
+
+/// New private candidate path for `save-config`; never the live file.
+pub fn maintenanceSavePath(raw: []const u8) ?[]const u8 {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    const prefix = "save-config ";
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+    const path = std.mem.trim(u8, text[prefix.len..], " \t");
+    if (path.len == 0 or path[0] != '/') return null;
+    for (path) |byte| if (byte < 0x20 or byte == 0x7f) return null;
+    return path;
+}
+
+test "maintenance wizard routes config edits preview discard and save only outside review" {
+    var wizard: MaintenanceWizard = .{};
+    try std.testing.expectEqual(MaintenanceWizard.Action.edit_config, wizard.command("set irc-port 7000"));
+    try std.testing.expectEqualStrings("irc-port", maintenanceConfigEdit("set  irc-port   7000 ").?.key);
+    try std.testing.expectEqualStrings("7000", maintenanceConfigEdit("set irc-port 7000").?.value);
+    try std.testing.expect(maintenanceConfigEdit("set irc-port") == null);
+    try std.testing.expect(maintenanceConfigEdit("set hostname a\x1b[2J") == null);
+    try std.testing.expect(maintenanceConfigEdit("set restore-into /x") == null);
+    try std.testing.expectEqual(MaintenanceWizard.Action.change_restore, wizard.command("set restore-into /x"));
+    try std.testing.expectEqual(MaintenanceWizard.Action.preview_config, wizard.command("preview"));
+    try std.testing.expectEqual(MaintenanceWizard.Action.discard_config, wizard.command("discard"));
+    try std.testing.expectEqual(MaintenanceWizard.Action.save_config, wizard.command("save-config /private/candidate.toml"));
+    try std.testing.expect(maintenanceSavePath("save-config relative.toml") == null);
+    try std.testing.expect(maintenanceSavePath("save-config /bad\x07path") == null);
+    wizard.enterReview(@splat('a'));
+    try std.testing.expectEqual(MaintenanceWizard.Action.invalid, wizard.command("set irc-port 7001"));
+    try std.testing.expectEqual(MaintenanceWizard.Action.invalid, wizard.command("discard"));
+    try std.testing.expectEqual(MaintenanceWizard.Action.invalid, wizard.command("save-config /private/c.toml"));
+    try std.testing.expectEqual(MaintenanceWizard.Action.preview_config, wizard.command("preview"));
+    try std.testing.expect(wizard.review_id != null);
 }
 
 test "maintenance wizard changes retained scratch only from choices" {

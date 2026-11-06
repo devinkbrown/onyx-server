@@ -199,6 +199,21 @@ pub const FrameType = enum(u8) {
     /// only the immediate transport peer. Rides the event-spine-v2 capability
     /// because the one-byte handshake capability layout is full.
     ACCESS_EVENT_V1 = 0x30,
+    /// One bounded config/cloak compatibility record (`mesh_config_compat`)
+    /// addressed to the authenticated peer on this Mooring session. Gated by
+    /// its own PING extension on a signed Event Spine v2 link; never relayed.
+    CONFIG_COMPAT = 0x31,
+    /// M03 digest offer: one `(family, rows, root)` digest per burst family
+    /// the sender would re-send this anti-entropy round. Single hop, never
+    /// relayed; gated by its own PING extension on a signed Event Spine v2
+    /// link, so peers without it keep receiving the full periodic burst.
+    DIGEST_OFFER = 0x32,
+    /// M03 answer to one DIGEST_OFFER: the families the receiver needs (with
+    /// its previous bucket roots when held) and the family set it knows.
+    DIGEST_NEED = 0x33,
+    /// M03 digest of the burst records of one family, queued right after
+    /// them on the ordered link; the receiver records it as held.
+    DIGEST_COMMIT = 0x34,
 
     pub fn tag(self: FrameType) u8 {
         return @backingInt(self);
@@ -254,6 +269,10 @@ pub const FrameType = enum(u8) {
             @backingInt(FrameType.WHOIS_PROFILE) => .WHOIS_PROFILE,
             @backingInt(FrameType.GUEST_FRONTIER) => .GUEST_FRONTIER,
             @backingInt(FrameType.ACCESS_EVENT_V1) => .ACCESS_EVENT_V1,
+            @backingInt(FrameType.CONFIG_COMPAT) => .CONFIG_COMPAT,
+            @backingInt(FrameType.DIGEST_OFFER) => .DIGEST_OFFER,
+            @backingInt(FrameType.DIGEST_NEED) => .DIGEST_NEED,
+            @backingInt(FrameType.DIGEST_COMMIT) => .DIGEST_COMMIT,
             else => null,
         };
     }
@@ -415,6 +434,18 @@ pub const FrameSpec = struct {
     summary: []const u8,
 };
 
+/// Upper bounds of the M03 digest-exchange bodies (`mesh_digest_sync`
+/// asserts its codec matches them): at most 64 family entries.
+pub const max_digest_offer_body_len: usize = 4 + 1 + 8 + 1 + 64 * (1 + 8 + 32);
+pub const max_digest_need_body_len: usize = 4 + 1 + 8 + 8 + 1 + 64 * (2 + 32 * 64);
+pub const max_digest_commit_body_len: usize = 4 + 1 + 1 + 1 + 8 + 32 + 32 * 64;
+/// Frame payload limits leave room for the 96-byte signed-frame envelope
+/// (public key + signature) that wraps every body on a signing link.
+const digest_envelope_headroom: usize = 128;
+pub const max_digest_offer_payload_len: usize = max_digest_offer_body_len + digest_envelope_headroom;
+pub const max_digest_need_payload_len: usize = max_digest_need_body_len + digest_envelope_headroom;
+pub const max_digest_commit_payload_len: usize = max_digest_commit_body_len + digest_envelope_headroom;
+
 pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .HANDSHAKE, .token = "HANDSHAKE", .family = .handshake, .auth = .unsigned, .summary = "Exchanges node id, epoch, server name, description, and negotiated S2S capabilities." },
     .{ .frame_type = .BURST, .token = "BURST", .family = .crdt, .auth = .unsigned, .summary = "Initial serialized channel CRDT state burst." },
@@ -464,6 +495,10 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .WHOIS_PROFILE, .token = "WHOIS_PROFILE", .family = .membership, .auth = .signable, .summary = "Remote WHOIS session facts. Gated by a PING extension. rDNS is present only on a secured oper-info link." },
     .{ .frame_type = .GUEST_FRONTIER, .token = "GUEST_FRONTIER", .family = .relay, .auth = .secured_signed, .summary = "Original signed complete guest-retirement frontier; gated by its own PING/PONG extension." },
     .{ .frame_type = .ACCESS_EVENT_V1, .token = "ACCESS_EVENT_V1", .family = .oper, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .max_payload_len = 1024, .summary = "Secured multi-hop IRCX channel ACCESS fact with immutable origin signature." },
+    .{ .frame_type = .CONFIG_COMPAT, .token = "CONFIG_COMPAT", .family = .control, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .max_payload_len = 1024, .summary = "Single-hop config/cloak compatibility record bound to this Mooring session; gated by a PING extension." },
+    .{ .frame_type = .DIGEST_OFFER, .token = "DIGEST_OFFER", .family = .control, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .max_payload_len = max_digest_offer_payload_len, .summary = "Single-hop M03 per-family burst digest offered before the periodic anti-entropy burst; gated by a PING extension." },
+    .{ .frame_type = .DIGEST_NEED, .token = "DIGEST_NEED", .family = .control, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .max_payload_len = max_digest_need_payload_len, .summary = "Single-hop M03 answer naming the burst families (and differing buckets) the receiver needs." },
+    .{ .frame_type = .DIGEST_COMMIT, .token = "DIGEST_COMMIT", .family = .control, .auth = .secured_signed, .capability_mask = cap_event_spine_v2, .max_payload_len = max_digest_commit_payload_len, .summary = "Single-hop M03 digest of the burst records of one family, ordered after them." },
 };
 
 pub fn frameSpec(frame_type: FrameType) FrameSpec {
@@ -1065,4 +1100,23 @@ test "access event v1 frame is secured and capability gated" {
     try testing.expectEqual(FrameType.ACCESS_EVENT_V1, frameSpecByTag(0x30).?.frame_type);
     try testing.expectEqual(FrameType.ACCESS_EVENT_V1, frameSpecByToken("ACCESS_EVENT_V1").?.frame_type);
     try testing.expectEqual(FrameType.ACCESS_EVENT_V1, FrameType.fromTag(0x30).?);
+}
+
+test "M03 digest frames are single-hop secured control frames with bounded bodies" {
+    try testing.expectEqual(FrameType.DIGEST_OFFER, FrameType.fromTag(0x32).?);
+    try testing.expectEqual(FrameType.DIGEST_NEED, frameSpecByTag(0x33).?.frame_type);
+    try testing.expectEqual(FrameType.DIGEST_COMMIT, frameSpecByToken("DIGEST_COMMIT").?.frame_type);
+    try testing.expect(FrameType.fromTag(0x35) == null);
+    inline for (.{ FrameType.DIGEST_OFFER, FrameType.DIGEST_NEED, FrameType.DIGEST_COMMIT }) |ft| {
+        const spec = frameSpec(ft);
+        // Not `.repair`: that family is the unsigned cap_repair_frames
+        // REPAIR_* set; these ride signed Event Spine v2 like CONFIG_COMPAT.
+        try testing.expectEqual(FrameFamily.control, spec.family);
+        try testing.expectEqual(FrameAuth.secured_signed, spec.auth);
+        try testing.expectEqual(cap_event_spine_v2, spec.capability_mask);
+        try testing.expect(spec.max_payload_len.? < default_max_frame_size);
+    }
+    var out: [16]u8 = undefined;
+    var big: [max_digest_offer_payload_len + 1]u8 = @splat(0);
+    try testing.expectError(error.PayloadTooLarge, encode(.DIGEST_OFFER, &big, &out));
 }

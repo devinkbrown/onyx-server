@@ -30,6 +30,8 @@ const mooring_session = @import("../crypto/mooring_session.zig");
 const hs = @import("../crypto/mooring_handshake.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 const s2s_link = @import("s2s_link.zig");
+const mesh_config_compat = @import("mesh_config_compat.zig");
+const mesh_digest_sync = @import("mesh_digest_sync.zig");
 const session_replica = @import("helix/session_replica.zig");
 const s2s_frame = @import("../proto/s2s_frame.zig");
 const session_replica_frame = @import("../proto/session_replica_frame.zig");
@@ -182,6 +184,19 @@ pub const SecuredLink = struct {
     /// byte stream, so partial records carry across `feedInner` calls here.
     rec_inbuf: std.ArrayList(u8) = .empty,
     record_stream_poisoned: bool = false,
+    /// Peer's latest config-compat record, retained so it can be re-evaluated
+    /// after a local reload (`configCompatReport`). Fixed slot, no allocation;
+    /// zero length means none received on this link.
+    config_compat_peer: [mesh_config_compat.max_record_len]u8 = undefined,
+    config_compat_peer_len: std.math.IntFittingRange(0, mesh_config_compat.max_record_len) = 0,
+    /// Daemon bookkeeping: this node's record was sent on the current
+    /// handshake. Not carried by Helix; a resumed link simply sends again.
+    config_compat_sent: bool = false,
+    /// M03 digest-exchange bookkeeping for this link (both directions),
+    /// allocated on first use and freed with the link. Process-local: not
+    /// carried by Helix, so a resumed link starts empty and its first
+    /// periodic round re-sends every family.
+    digest_sync: ?*mesh_digest_sync.LinkState = null,
 
     /// Collect `expected_remote` + `expected_remotes` into one owned pin
     /// table. Never truncates: exceeding `max_expected_remotes` is
@@ -355,6 +370,7 @@ pub const SecuredLink = struct {
         self.out.deinit(self.allocator);
         self.rec_inbuf.deinit(self.allocator);
         self.allocator.free(self.expected_remotes);
+        if (self.digest_sync) |state| self.allocator.destroy(state);
         self.* = undefined;
     }
 
@@ -1084,6 +1100,131 @@ pub const SecuredLink = struct {
         return link.takeOperGrants();
     }
 
+    /// Send this node's config/cloak compatibility record. The record is bound
+    /// to the local node signing key, this link's Mooring-authenticated peer
+    /// key, a fresh nonce from the link RNG and the binding derived from this
+    /// Mooring session's root key, so it verifies only at this peer on this
+    /// session. Fails closed with `error.ConfigCompatUnavailable` before the
+    /// AKE establishes. An encode error queues nothing. If sealing fails after
+    /// the inner frame is queued, `out` gains no partial record and the frame
+    /// stays queued for the next drain; a retry only adds a newer record,
+    /// which the peer's latest-wins slot absorbs.
+    pub fn sendConfigCompat(self: *SecuredLink, profile: *const mesh_config_compat.LocalProfile) anyerror!void {
+        const link = self.inner orelse return error.ConfigCompatUnavailable;
+        var buf: [mesh_config_compat.max_record_len]u8 = undefined;
+        const record = try self.sealConfigCompat(profile, &buf);
+        try link.sendConfigCompat(record);
+        try self.drainInner();
+    }
+
+    /// Move the latest pending peer record (if any) into this link's retained
+    /// slot and evaluate it against `profile`. Null when no new record
+    /// arrived. The returned report holds no peer bytes.
+    pub fn takeConfigCompatReport(self: *SecuredLink, profile: *const mesh_config_compat.LocalProfile) ?mesh_config_compat.Report {
+        const link = self.inner orelse return null;
+        var buf: [mesh_config_compat.max_record_len]u8 = undefined;
+        const record = link.takeConfigCompat(&buf) orelse return null;
+        self.retainConfigCompat(record);
+        return self.configCompatReport(profile);
+    }
+
+    /// Move a pending peer record (if any) into the retained slot without
+    /// evaluating it. True when a new record arrived.
+    pub fn absorbConfigCompat(self: *SecuredLink) bool {
+        const link = self.inner orelse return false;
+        var buf: [mesh_config_compat.max_record_len]u8 = undefined;
+        const record = link.takeConfigCompat(&buf) orelse return false;
+        self.retainConfigCompat(record);
+        return true;
+    }
+
+    /// One-shot edge: the peer proved the config-compat extension on this
+    /// handshake, so this node's record must be (re)sent.
+    pub fn takeConfigCompatReady(self: *SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.takeConfigCompatReady();
+    }
+
+    pub fn supportsConfigCompat(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsConfigCompat();
+    }
+
+    /// Queue one M03 digest-exchange body on the secured stream. Fails closed
+    /// with `error.DigestSyncUnavailable` before the AKE or without the
+    /// peer's extension proof. Like `sendConfigCompat`, a seal failure after
+    /// the inner frame is queued leaves it for the next drain.
+    pub fn sendDigestFrame(self: *SecuredLink, frame_type: s2s_frame.FrameType, payload: []const u8) anyerror!void {
+        const link = self.inner orelse return error.DigestSyncUnavailable;
+        try link.sendDigestFrame(frame_type, payload);
+        try self.drainInner();
+    }
+
+    pub fn takeDigestFrames(self: *SecuredLink) ![][]u8 {
+        const link = self.inner orelse return &.{};
+        return link.takeDigestFrames();
+    }
+
+    pub fn takeDigestFramesLost(self: *SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.takeDigestFramesLost();
+    }
+
+    pub fn supportsDigestSync(self: *const SecuredLink) bool {
+        const link = self.inner orelse return false;
+        return link.supportsDigestSync();
+    }
+
+    /// This link's digest-exchange state, allocated on first use. Null only
+    /// on allocation failure; callers then take the full-burst path.
+    pub fn digestSyncState(self: *SecuredLink) ?*mesh_digest_sync.LinkState {
+        if (self.digest_sync) |state| return state;
+        const state = self.allocator.create(mesh_digest_sync.LinkState) catch return null;
+        state.* = .{};
+        self.digest_sync = state;
+        return state;
+    }
+
+    /// Re-evaluate the peer's last received record against `profile` without
+    /// consuming it, e.g. after a local config reload, so a fix on this node
+    /// is reflected without the peer resending. Null when no record has been
+    /// retained on this link (the slot does not ride a Helix capsule; the
+    /// caller then keeps its previous report until the peer sends again).
+    pub fn configCompatReport(self: *const SecuredLink, profile: *const mesh_config_compat.LocalProfile) ?mesh_config_compat.Report {
+        if (self.config_compat_peer_len == 0) return null;
+        const record = self.config_compat_peer[0..self.config_compat_peer_len];
+        const peer_key = self.peerNodeKey() orelse return .unknown(.misbound);
+        var binding = self.configCompatBinding() orelse return .unknown(.misbound);
+        defer std.crypto.secureZero(u8, &binding);
+        return mesh_config_compat.evaluate(profile, self.identity.sign_kp.public_key, peer_key, &binding, record);
+    }
+
+    /// Encode this node's record for the authenticated peer on this session.
+    fn sealConfigCompat(self: *SecuredLink, profile: *const mesh_config_compat.LocalProfile, out: *[mesh_config_compat.max_record_len]u8) anyerror![]const u8 {
+        const peer_key = self.peerNodeKey() orelse return error.ConfigCompatUnavailable;
+        var binding = self.configCompatBinding() orelse return error.ConfigCompatUnavailable;
+        defer std.crypto.secureZero(u8, &binding);
+        var nonce: [mesh_config_compat.nonce_len]u8 = undefined;
+        self.rng.random(&nonce);
+        return mesh_config_compat.encodeRecord(profile, self.identity.sign_kp.public_key, peer_key, &binding, nonce, out);
+    }
+
+    /// Latest wins. The bytes arrived inside this session's AEAD records from
+    /// the authenticated peer; `evaluate` still checks their addressing and
+    /// session binding on every read.
+    fn retainConfigCompat(self: *SecuredLink, record: []const u8) void {
+        std.debug.assert(record.len != 0 and record.len <= mesh_config_compat.max_record_len);
+        @memcpy(self.config_compat_peer[0..record.len], record);
+        self.config_compat_peer_len = @intCast(record.len);
+    }
+
+    /// Per-session binding from the Mooring root key (live or Helix-resumed).
+    /// Secret: the caller wipes it. Null before establishment.
+    fn configCompatBinding(self: *const SecuredLink) ?[mesh_config_compat.link_binding_len]u8 {
+        if (self.inner == null) return null;
+        return mesh_config_compat.deriveLinkBinding(self.establishedKeys().root_key.expose());
+    }
+
     /// Ship a live-session migration capsule (`migration_relay` frame bytes) to
     /// the peer over the secured CRDT link (no-op until established). The capsule
     /// carries sensitive session state, so it only rides the authenticated,
@@ -1267,6 +1408,13 @@ pub const SecuredLink = struct {
     pub fn forwardAccessEventFrame(self: *SecuredLink, wire: []const u8) anyerror!bool {
         const link = self.inner orelse return error.NotEstablished;
         const emitted = try link.forwardAccessEventFrame(wire);
+        if (emitted) try self.drainInner();
+        return emitted;
+    }
+
+    pub fn resendAccessEventFrame(self: *SecuredLink, wire: []const u8) anyerror!bool {
+        const link = self.inner orelse return error.NotEstablished;
+        const emitted = try link.resendAccessEventFrame(wire);
         if (emitted) try self.drainInner();
         return emitted;
     }
@@ -3461,4 +3609,223 @@ test "secured record in-place good then tampered coalesced records retain only a
     try testing.expectError(error.RecordStreamPoisoned, p.b.feed(&.{}, 204));
     try testing.expectError(error.RecordStreamPoisoned, p.b.exportOuterChecked());
     try testing.expect(p.b.snapshotInner() == null);
+}
+
+fn establishConfigCompatPair(
+    ida: *const node_identity.NodeIdentity,
+    idb: *const node_identity.NodeIdentity,
+    rng: *DeterministicIo,
+) !struct { a: SecuredLink, b: SecuredLink } {
+    var a = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = ida,
+        .local_prekey = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1),
+        .cfg = cfgFor(ida.realm, ""),
+        .rng = rng.io(),
+        .server_name = "a.onyx",
+    });
+    errdefer a.deinit();
+    var b = try SecuredLink.init(.{
+        .allocator = testing.allocator,
+        .role = .responder,
+        .identity = idb,
+        .local_prekey = try idb.signedPrekey(2, 10, 1000, 0b1111, 0b1),
+        .cfg = cfgFor(idb.realm, ""),
+        .rng = rng.io(),
+        .server_name = "b.onyx",
+    });
+    errdefer b.deinit();
+    return .{ .a = a, .b = b };
+}
+
+test "secured link: config-compat records evaluate over the encrypted link and fail closed before AKE" {
+    if (comptime s2s_link.config_compat_transport_ready) {
+        var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
+        defer ida.deinit();
+        var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
+        defer idb.deinit();
+        var rng = DeterministicIo{ .s = 0xC0FFEE };
+        var pair = try establishConfigCompatPair(&ida, &idb, &rng);
+        defer pair.a.deinit();
+        defer pair.b.deinit();
+
+        const shared: mesh_config_compat.LocalProfile = .{ .cloak_key = .init(@splat(0x44)), .cloak_suffix = "onyx", .network_name = "Onyx" };
+        var other = shared;
+        other.cloak_key = .init(@splat(0x55));
+
+        // Before the AKE nothing is sent or reported.
+        try testing.expectError(error.ConfigCompatUnavailable, pair.a.sendConfigCompat(&shared));
+        try testing.expect(pair.b.takeConfigCompatReport(&shared) == null);
+
+        try pump(&pair.a, &pair.b, false);
+        try testing.expect(pair.a.established() and pair.b.established());
+
+        try pair.a.sendConfigCompat(&shared);
+        try pair.b.sendConfigCompat(&other);
+        try pump(&pair.a, &pair.b, false);
+
+        const at_b = pair.b.takeConfigCompatReport(&shared) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(mesh_config_compat.Status.compatible, at_b.status);
+        try testing.expect(pair.b.takeConfigCompatReport(&shared) == null);
+
+        const at_a = pair.a.takeConfigCompatReport(&shared) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(mesh_config_compat.Status.mismatch, at_a.status);
+        try testing.expect(at_a.findings.contains(.cloak_secret_mismatch));
+        try testing.expectEqual(@as(usize, 1), at_a.findings.count());
+
+        // Latest record wins: a corrected config replaces the stale report.
+        try pair.b.sendConfigCompat(&shared);
+        try pump(&pair.a, &pair.b, false);
+        const fixed = pair.a.takeConfigCompatReport(&shared) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(mesh_config_compat.Status.compatible, fixed.status);
+    } else return error.SkipZigTest;
+}
+
+const compat_shared: mesh_config_compat.LocalProfile = .{ .cloak_key = .init(@splat(0x44)), .cloak_suffix = "onyx", .network_name = "Onyx" };
+const compat_other: mesh_config_compat.LocalProfile = .{ .cloak_key = .init(@splat(0x55)), .cloak_suffix = "onyx", .network_name = "Onyx" };
+
+test "secured link: config-compat binding comes from the Mooring root key and rejects a prior session's record" {
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
+    defer ida.deinit();
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
+    defer idb.deinit();
+
+    var rng1 = DeterministicIo{ .s = 0xC0FFEE };
+    var first = try establishConfigCompatPair(&ida, &idb, &rng1);
+    defer first.a.deinit();
+    defer first.b.deinit();
+    var buf: [mesh_config_compat.max_record_len]u8 = undefined;
+    try testing.expectError(error.ConfigCompatUnavailable, first.a.sealConfigCompat(&compat_shared, &buf));
+    try testing.expect(first.a.configCompatBinding() == null);
+    try pump(&first.a, &first.b, false);
+    try testing.expect(first.a.established() and first.b.established());
+
+    // Both endpoints derive the same binding, and it is the root-key HMAC.
+    const bind_a = first.a.configCompatBinding().?;
+    try testing.expectEqualSlices(u8, &bind_a, &first.b.configCompatBinding().?);
+    try testing.expectEqualSlices(u8, &mesh_config_compat.deriveLinkBinding(first.a.establishedKeys().root_key.expose()), &bind_a);
+
+    var old_buf: [mesh_config_compat.max_record_len]u8 = undefined;
+    const old_record = try first.a.sealConfigCompat(&compat_shared, &old_buf);
+    first.b.retainConfigCompat(old_record);
+    try testing.expectEqual(mesh_config_compat.Status.compatible, first.b.configCompatReport(&compat_shared).?.status);
+
+    // Reconnect with the same identities: a fresh AKE yields a fresh root key.
+    var rng2 = DeterministicIo{ .s = 0xBADC0DE };
+    var second = try establishConfigCompatPair(&ida, &idb, &rng2);
+    defer second.a.deinit();
+    defer second.b.deinit();
+    try pump(&second.a, &second.b, false);
+    try testing.expect(second.a.established() and second.b.established());
+    try testing.expect(!std.mem.eql(u8, &bind_a, &second.b.configCompatBinding().?));
+
+    // The earlier session's correctly addressed record is stale here.
+    try testing.expect(second.b.configCompatReport(&compat_shared) == null);
+    second.b.retainConfigCompat(old_record);
+    const stale = second.b.configCompatReport(&compat_shared).?;
+    try testing.expectEqual(mesh_config_compat.Status.unknown, stale.status);
+    try testing.expectEqual(mesh_config_compat.UnknownReason.stale_session, stale.reason);
+    try testing.expectEqual(@as(usize, 0), stale.findings.count());
+
+    // A record sealed on the current session is accepted.
+    const fresh = try second.a.sealConfigCompat(&compat_shared, &buf);
+    second.b.retainConfigCompat(fresh);
+    try testing.expectEqual(mesh_config_compat.Status.compatible, second.b.configCompatReport(&compat_shared).?.status);
+}
+
+test "secured link: retained config-compat record re-evaluates after a local reload without a resend" {
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
+    defer ida.deinit();
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
+    defer idb.deinit();
+    var rng = DeterministicIo{ .s = 0x7E57 };
+    var pair = try establishConfigCompatPair(&ida, &idb, &rng);
+    defer pair.a.deinit();
+    defer pair.b.deinit();
+    try pump(&pair.a, &pair.b, false);
+
+    // B's record reaches A while A still runs a different cloak secret.
+    var buf: [mesh_config_compat.max_record_len]u8 = undefined;
+    pair.a.retainConfigCompat(try pair.b.sealConfigCompat(&compat_shared, &buf));
+    const before = pair.a.configCompatReport(&compat_other).?;
+    try testing.expectEqual(mesh_config_compat.Status.mismatch, before.status);
+    try testing.expect(before.findings.contains(.cloak_secret_mismatch));
+
+    // A reloads with the shared secret; re-evaluation needs no new record and
+    // does not consume the retained one.
+    for (0..2) |_| {
+        const after = pair.a.configCompatReport(&compat_shared).?;
+        try testing.expectEqual(mesh_config_compat.Status.compatible, after.status);
+        try testing.expectEqual(@as(usize, 0), after.findings.count());
+    }
+    try testing.expectEqual(mesh_config_compat.Status.mismatch, pair.a.configCompatReport(&compat_other).?.status);
+
+    // A smaller later record fully replaces the slot (latest wins, no tail).
+    var short: mesh_config_compat.LocalProfile = compat_shared;
+    short.cloak_key = null;
+    pair.a.retainConfigCompat(try pair.b.sealConfigCompat(&short, &buf));
+    try testing.expect(pair.a.configCompatReport(&compat_shared).?.findings.contains(.cloak_secret_missing_peer));
+    try testing.expectEqual(mesh_config_compat.Status.compatible, pair.a.configCompatReport(&short).?.status);
+}
+
+test "secured link: Helix-resumed link keeps the config-compat session binding" {
+    var ida = try node_identity.fromSeed(@as([32]u8, @splat(0x11)), "local");
+    defer ida.deinit();
+    var idb = try node_identity.fromSeed(@as([32]u8, @splat(0x22)), "local");
+    defer idb.deinit();
+    const pre_a = try ida.signedPrekey(1, 10, 1000, 0b1111, 0b1);
+    var rng = DeterministicIo{ .s = 0x4E11 };
+    var pair = try establishConfigCompatPair(&ida, &idb, &rng);
+    var a_live = true;
+    defer if (a_live) pair.a.deinit();
+    defer pair.b.deinit();
+    try pump(&pair.a, &pair.b, false);
+
+    var buf: [mesh_config_compat.max_record_len]u8 = undefined;
+    pair.b.retainConfigCompat(try pair.a.sealConfigCompat(&compat_shared, &buf));
+    pair.a.retainConfigCompat(try pair.b.sealConfigCompat(&compat_shared, &buf));
+
+    var outer = pair.a.exportOuter();
+    defer outer.established.deinit();
+    var est_buf: [hs.Established.serialized_len]u8 = undefined;
+    outer.established.serialize(&est_buf);
+    defer std.crypto.secureZero(u8, &est_buf);
+    const inner_hdr = pair.a.snapshotInner().?;
+    const remote_name = try testing.allocator.dupe(u8, pair.a.snapshotInnerRemoteName());
+    defer testing.allocator.free(remote_name);
+    pair.a.deinit();
+    a_live = false;
+
+    var a2 = try SecuredLink.resumeOuter(.{
+        .allocator = testing.allocator,
+        .role = .initiator,
+        .identity = &ida,
+        .local_prekey = pre_a,
+        .cfg = cfgFor(ida.realm, ""),
+        .rng = rng.io(),
+        .server_name = "a.onyx",
+    }, .{
+        .established = hs.Established.deserialize(&est_buf),
+        .send_counter = outer.send_counter,
+        .recv_counter = outer.recv_counter,
+        .feed_seq = outer.feed_seq,
+        .inner = inner_hdr,
+        .remote_name = remote_name,
+        .rec_inbuf = &.{},
+        .now_ms = 1000,
+        .rng_seed = 0x5151,
+    });
+    defer a2.deinit();
+    try testing.expect(a2.established());
+
+    // Same session, same binding: records cross the upgrade in both directions.
+    try testing.expectEqualSlices(u8, &pair.b.configCompatBinding().?, &a2.configCompatBinding().?);
+    try testing.expectEqual(mesh_config_compat.Status.compatible, pair.b.configCompatReport(&compat_shared).?.status);
+    pair.b.retainConfigCompat(try a2.sealConfigCompat(&compat_shared, &buf));
+    try testing.expectEqual(mesh_config_compat.Status.compatible, pair.b.configCompatReport(&compat_shared).?.status);
+    // The retained slot does not ride the capsule; the caller keeps its report.
+    try testing.expect(a2.configCompatReport(&compat_shared) == null);
+    a2.retainConfigCompat(try pair.b.sealConfigCompat(&compat_shared, &buf));
+    try testing.expectEqual(mesh_config_compat.Status.compatible, a2.configCompatReport(&compat_shared).?.status);
 }

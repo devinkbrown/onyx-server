@@ -40,6 +40,37 @@ pub const wasm_host = @import("wasm/host/root.zig");
 /// `wasm/transport_shim.zig`; this is the std-only, natively-tested core (#32).
 pub const browser_transport = @import("wasm/browser_transport.zig");
 
+test "standalone build roots and scratch files are never onyx_server exports" {
+    // build.zig compiles the production Helix exec helpers as custom
+    // test_runner roots over this module, and leaf lanes/fixtures as their
+    // own module roots. Exporting one from here puts its file in two modules
+    // and breaks that build step; `_`-prefixed files are local scratch.
+    // tools/genroots.sh excludes these patterns; this pins the contract.
+    const standalone_roots = [_][]const u8{
+        "host_presentation_exec_helper",
+        "issuer_production_exec_helper",
+        "session_retry_exec_helper",
+        "_tmp_m08_root",
+        "spool_leaf_tests",
+        "handoff_leaf_tests",
+        "session_store_leaf_tests",
+        "ringlane_leaf_tests",
+        "cloak_leaf_tests",
+        "media_record_leaf_tests",
+        "message_relay_v2_leaf_tests",
+        "helix_boot_policy_tests",
+        "service_identity_preflight_tests",
+        "cloak_world_audit_tests",
+        "cloak_durable_audit_tests",
+        "cloak_migration_audit_tests",
+        "cloak_policy_list_audit_tests",
+        "cloak_audit_fixture",
+        "cloak_policy_audit_fixture",
+        "cloak_world_audit_fixture",
+    };
+    inline for (standalone_roots) |name| try std.testing.expect(!@hasDecl(@This(), name));
+}
+
 test {
     // 0.16 dropped refAllDeclsRecursive; reference each package so its tests run.
     std.testing.refAllDecls(@This());

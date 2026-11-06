@@ -9,6 +9,7 @@ const x509 = @import("../crypto/x509.zig");
 const http_fetch = @import("http_fetch.zig");
 const http1 = @import("../proto/http1_client.zig");
 const diagnostics = @import("diagnostics.zig");
+const service_readiness = @import("service_readiness.zig");
 
 pub const EventCount = struct {
     event: diagnostics.Event,
@@ -155,6 +156,9 @@ pub const Result = struct {
     capabilities: CapabilitySummary = .{},
     cadence_detail: ?[]u8 = null,
     service_environment: @import("service_environment.zig").Environment = .{},
+    /// A05 shared supervisor-mode readiness. Defaults to unknown for reports
+    /// (cloak comparison) that gather no readiness evidence.
+    readiness: service_readiness.Report = service_readiness.assess(.foreground, .{}),
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
         allocator.free(self.lines);
         allocator.free(self.checks);
@@ -188,7 +192,9 @@ pub const Result = struct {
         return std.json.Stringify.valueAlloc(allocator, .{
             .schema_version = @as(u8, 1),
             .mode = "preflight",
-            .readiness = "unknown",
+            .readiness = @tagName(self.readiness.verdict.state),
+            .readiness_reason = @tagName(self.readiness.verdict.reason),
+            .readiness_mode = @tagName(self.readiness.mode),
             // Reporting binary, not an assertion about a remote metrics source.
             .report_build_version = @import("build_info").version,
             .failed = self.failed,
@@ -279,6 +285,10 @@ pub fn report(allocator: std.mem.Allocator, io: std.Io, loaded: *const config_bo
     defer if (owned_body) |body| allocator.free(body);
     var body = metrics_body;
     var fetch_error: ?[]const u8 = null;
+    // A05: config checks above are the preflight evidence; capture them before
+    // metrics-derived failures are added.
+    const preflight_failed = failed;
+    var metrics_source: service_readiness.MetricsSource = if (metrics_body != null) .unverified else .not_configured;
     if (metrics_url) |url| {
         if (fetch) |get| {
             owned_body = get(allocator, url) catch |err| blk: {
@@ -286,9 +296,11 @@ pub fn report(allocator: std.mem.Allocator, io: std.Io, loaded: *const config_bo
                 break :blk null;
             };
             body = owned_body;
+            metrics_source = if (owned_body == null) .unreachable_source else if (isLoopbackMetricsUrl(url)) .live_local_fetch else .unverified;
         } else {
             fetch_error = "no fetch function";
             body = null;
+            metrics_source = .unreachable_source;
         }
     }
     var observations: ?Observations = null;
@@ -315,9 +327,12 @@ pub fn report(allocator: std.mem.Allocator, io: std.Io, loaded: *const config_bo
     }
     try line(&out, &checks, allocator, &failed, "skipped", "mesh_transport_security", "metrics", "unknown; established links may be secured or plaintext");
     try line(&out, &checks, allocator, &failed, "skipped", "mesh_capabilities", "metrics", "unknown; negotiated peer capabilities are not exposed by these gauges");
-    try line(&out, &checks, allocator, &failed, "skipped", "service_readiness", "metrics", "unknown; these observations do not prove service readiness or freshness");
     const service_env = @import("service_environment.zig").detect(io);
     const service_plan = @import("service_environment.zig").servicePlan(service_env, null);
+    const readiness = readinessFor(service_env, preflight_failed, metrics_source, observations);
+    if (observations) |*o| o.service_readiness = readiness.verdict.detail();
+    try line(&out, &checks, allocator, &failed, readinessStatus(readiness.verdict.state), "service_readiness", @tagName(readiness.verdict.reason), readiness.verdict.detail());
+    try line(&out, &checks, allocator, &failed, "skipped", "service_readiness_mode", @tagName(readiness.mode), readiness.supervisor_evidence);
     try line(&out, &checks, allocator, &failed, "skipped", "service_plan_manager", "shipped template; host status unknown", @tagName(service_plan.selected));
     try line(&out, &checks, allocator, &failed, "skipped", "service_plan_executable", "shipped template; host status unknown", service_plan.template.executable);
     try line(&out, &checks, allocator, &failed, "skipped", "service_plan_config", "shipped template; host status unknown", service_plan.template.config);
@@ -333,7 +348,49 @@ pub fn report(allocator: std.mem.Allocator, io: std.Io, loaded: *const config_bo
     try line(&out, &checks, allocator, &failed, "skipped", "service_plan_logging", "shipped template; host status unknown", service_plan.template.logging);
     const lines = try out.toOwnedSlice(allocator);
     errdefer allocator.free(lines);
-    return .{ .lines = lines, .checks = try checks.toOwnedSlice(allocator), .failed = failed, .observations = observations, .capabilities = capabilitySummary(loaded), .cadence_detail = cadence_detail, .service_environment = service_env };
+    return .{ .lines = lines, .checks = try checks.toOwnedSlice(allocator), .failed = failed, .observations = observations, .capabilities = capabilitySummary(loaded), .cadence_detail = cadence_detail, .service_environment = service_env, .readiness = readiness };
+}
+
+/// Only an IP-literal loopback endpoint counts as the local daemon: a name
+/// (even `localhost`) or any other address leaves the sample unverified.
+fn isLoopbackMetricsUrl(url: []const u8) bool {
+    const target = http_fetch.parseUrl(url) catch return false;
+    var host = target.host;
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
+    const addr = std.Io.net.IpAddress.parse(host, target.port) catch return false;
+    return switch (addr) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| std.mem.eql(u8, &a.bytes, &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }),
+    };
+}
+
+/// A05: one readiness verdict for OpenRC, systemd, container and foreground.
+/// The mode only selects supervisor evidence text; the verdict never depends on it.
+fn readinessFor(env: @import("service_environment.zig").Environment, preflight_failed: bool, source: service_readiness.MetricsSource, observations: ?Observations) service_readiness.Report {
+    const o = observations orelse Observations{};
+    return service_readiness.assess(service_readiness.modeFor(env, null), .{
+        .config_preflight = if (preflight_failed) .fail else .pass,
+        .metrics = source,
+        .gauges = .{
+            .tcp_active = o.tcp_active,
+            .established_links = o.established_links,
+            .peers_up = o.peers_up,
+            .peers_total = o.peers_total,
+            .quorum = o.quorum,
+            .partitioned = o.partitioned,
+        },
+    });
+}
+
+fn readinessStatus(state: service_readiness.State) []const u8 {
+    return switch (state) {
+        .ready => "pass",
+        .not_ready => "fail",
+        // Check status vocabulary is pass/warn/fail/skipped; the
+        // degraded state itself stays in the top-level `readiness` field.
+        .degraded => "warn",
+        .unknown => "skipped",
+    };
 }
 
 /// Privileged, offline comparison of two already-resolved configurations.
@@ -750,4 +807,49 @@ test "doctor observations distinguish established links from unknown transport s
     const invalid = try observeMetrics("onyx_mesh_quorum 2\nonyx_mesh_partitioned 3\n");
     try std.testing.expectEqual(@as(?u64, null), invalid.quorum);
     try std.testing.expectEqual(@as(?u64, null), invalid.partitioned);
+}
+
+test "A05 doctor readiness: offline body never ready, loopback live fetch is the only ready path" {
+    const allocator = std.testing.allocator;
+    var loaded = try config_boot.loadFromTextQuiet(allocator, "[node]\nid=1\n[listen]\nirc=6680\n", .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    const healthy = "onyx_s2s_tcp_active 1\nonyx_s2s_links_active 1\nonyx_mesh_partitioned 0\nonyx_mesh_peers_up 1\nonyx_mesh_peers_total 1\nonyx_mesh_quorum 1\n";
+    const Live = struct {
+        fn fetch(a: std.mem.Allocator, _: []const u8) ![]u8 {
+            return a.dupe(u8, healthy);
+        }
+    };
+    const offline = try report(allocator, std.testing.io, &loaded, null, healthy, null);
+    defer offline.deinit(allocator);
+    try std.testing.expectEqual(service_readiness.State.unknown, offline.readiness.verdict.state);
+    try std.testing.expectEqual(service_readiness.Reason.metrics_unverified, offline.readiness.verdict.reason);
+    try std.testing.expect(std.mem.indexOf(u8, offline.lines, "doctor skipped service_readiness metrics_unverified") != null);
+
+    const remote = try report(allocator, std.testing.io, &loaded, "http://192.0.2.7:9130/metrics", null, Live.fetch);
+    defer remote.deinit(allocator);
+    try std.testing.expectEqual(service_readiness.Reason.metrics_unverified, remote.readiness.verdict.reason);
+    const named = try report(allocator, std.testing.io, &loaded, "http://localhost:9130/metrics", null, Live.fetch);
+    defer named.deinit(allocator);
+    try std.testing.expectEqual(service_readiness.Reason.metrics_unverified, named.readiness.verdict.reason);
+
+    inline for (.{ "http://127.0.0.1:9130/metrics", "http://[::1]:9130/metrics" }) |url| {
+        const live = try report(allocator, std.testing.io, &loaded, url, null, Live.fetch);
+        defer live.deinit(allocator);
+        try std.testing.expectEqual(service_readiness.State.ready, live.readiness.verdict.state);
+        try std.testing.expect(!live.failed);
+        try std.testing.expect(std.mem.indexOf(u8, live.lines, "doctor pass service_readiness healthy") != null);
+        const json = try live.toJson(allocator);
+        defer allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("ready", parsed.value.object.get("readiness").?.string);
+        try std.testing.expectEqualStrings(@tagName(live.readiness.mode), parsed.value.object.get("readiness_mode").?.string);
+    }
+
+    var bad = try config_boot.loadFromTextQuiet(allocator, "[node]\nid=1\n[listen]\nirc=6680\n[io]\nsqpoll=true\ndefer_taskrun=true\n", .{ .port = 6680 }, .{});
+    defer bad.deinit(allocator);
+    const refused = try report(allocator, std.testing.io, &bad, "http://127.0.0.1:9130/metrics", null, Live.fetch);
+    defer refused.deinit(allocator);
+    try std.testing.expectEqual(service_readiness.State.not_ready, refused.readiness.verdict.state);
+    try std.testing.expectEqual(service_readiness.Reason.config_preflight_failed, refused.readiness.verdict.reason);
 }

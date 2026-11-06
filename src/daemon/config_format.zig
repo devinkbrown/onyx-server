@@ -34,6 +34,8 @@ const search_index_mod = @import("search_index.zig");
 const relay_v2_activation = @import("relay_v2_activation.zig");
 const relay_v2_event_log = @import("relay_v2_event_log.zig");
 const retired_fences = @import("session_group_retired_policy.zig");
+const resource_limits = @import("resource_limits.zig");
+const workload_quota = @import("workload_quota.zig");
 pub const max_config_bytes = @import("config_limits.zig").max_source_bytes;
 pub const default_sqpoll_idle_ms = @import("ringlane.zig").default_sqpoll_idle_ms;
 const node_identity = @import("node_identity.zig");
@@ -44,6 +46,7 @@ const wasm_bridge = @import("../wasm/host/bridge.zig");
 const default_search_index_config = search_index_mod.SearchIndex.Config{};
 
 comptime {
+    if (resource_limits.max_cpu_shards != shard.max_shards) @compileError("resource_limits shard ceiling drifted from shard.max_shards");
     if (@bitSizeOf(usize) != 64) @compileError("config_format requires a 64-bit target");
 }
 
@@ -83,6 +86,13 @@ pub const Config = struct {
     classes: []ClassDef = &.{},
     mesh: Mesh = .{},
     limits: Limits = .{},
+    /// `[resources]`: explicit memory/CPU/network limits and the named benchmark
+    /// basis of capacity estimates. Defaults are unset and change no behaviour.
+    resources: resource_limits.Config = .{},
+    /// `[quota]` (M12): explicit per-shard workload governor values. Unset
+    /// fields derive from `limits.max_clients`; `config_boot` refuses any set
+    /// that does not validate, so a bad value can never switch the governor off.
+    quota: workload_quota.Overrides = .{},
     io: Io = .{},
     reputation: Reputation = .{},
     sessions: Sessions = .{},
@@ -1116,6 +1126,10 @@ pub const Config = struct {
         allocator.free(self.webpush.vapid_key_path);
         if (self.acme.domain) |value| allocator.free(value);
         if (self.acme.contact) |value| allocator.free(value);
+        // Basis text is heap-owned only when non-empty (the default is a literal).
+        if (self.resources.basis.name.len != 0) allocator.free(self.resources.basis.name);
+        if (self.resources.basis.harness.len != 0) allocator.free(self.resources.basis.harness);
+        if (self.resources.basis.revision.len != 0) allocator.free(self.resources.basis.revision);
         self.* = .{};
     }
 };
@@ -1129,6 +1143,8 @@ pub const Config = struct {
 pub const TomlError = toml.ParseError || error{
     ParseError,
     @"listen.trusted_proxies",
+    /// `[quota]`: unknown key, wrong type, or a value outside its range.
+    quota,
     cloak,
     @"cloak.secret",
     @"cloak.previous_secret",
@@ -1459,6 +1475,12 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getString("limits.reputation_half_life")) |s| cfg.limits.reputation_half_life_ms = try durationMs(s);
     if (doc.getString("limits.sweep_interval")) |s| cfg.limits.sweep_interval_ms = try durationMs(s);
     cfg.limits.sasl_decode_max_bytes = @intCast(try uintField(doc, "limits.sasl_decode_max_bytes", cfg.limits.sasl_decode_max_bytes, 64, sasl_mechrouter.MAX_RAW_MESSAGE));
+
+    // [resources]
+    try parseResources(allocator, doc, &cfg.resources);
+
+    // [quota]
+    try parseQuota(doc, &cfg.quota);
 
     // [io]
     cfg.io.ring_entries = @intCast(try uintField(doc, "io.ring_entries", cfg.io.ring_entries, 8, 4096));
@@ -2393,6 +2415,105 @@ fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!v
     if (cfg.link.view_config.shuffle_passive_count > cfg.link.view_config.passive_capacity) return error.ParseError;
 }
 
+/// Integer that is either `0` (unset) or within `min..max`; non-integers fail.
+fn resourceUint(doc: toml.Document, path: []const u8, current: u64, min: u64, max: u64) TomlError!u64 {
+    if (doc.get(path)) |v| if (v.* != .integer) return error.ParseError;
+    const v = try uintField(doc, path, current, 0, max);
+    if (v != 0 and v < min) return error.ParseError;
+    return v;
+}
+
+fn resourceKeyAllowed(key: []const u8, allowed: []const []const u8) bool {
+    for (allowed) |name| if (std.mem.eql(u8, key, name)) return true;
+    return false;
+}
+
+fn resourceBasisText(allocator: std.mem.Allocator, doc: toml.Document, path: []const u8) TomlError![]const u8 {
+    const v = doc.get(path) orelse return "";
+    if (v.* != .string or !resource_limits.validBasisText(v.string)) return error.ParseError;
+    return try allocator.dupe(u8, v.string);
+}
+
+/// Project `[resources]` / `[resources.basis]`. Unknown keys, wrong types and
+/// out-of-range values fail closed (a silently ignored limit is worse than a
+/// refused boot). The basis is all-or-nothing and its text is owned copies;
+/// `out` is only mutated once every field has parsed.
+fn parseResources(allocator: std.mem.Allocator, doc: toml.Document, out: *resource_limits.Config) TomlError!void {
+    const root = doc.get("resources") orelse return;
+    if (root.* != .table) return error.ParseError;
+    const keys = [_][]const u8{
+        "memory_budget_bytes",      "per_client_memory_bytes", "cpu_max_shards", "net_ingress_bytes_per_sec",
+        "net_egress_bytes_per_sec", "net_max_s2s_peers",       "fd_reserve",     "basis",
+    };
+    var it = root.table.iterator();
+    while (it.next()) |entry| if (!resourceKeyAllowed(entry.key_ptr.*, &keys)) return error.ParseError;
+
+    var next = out.*;
+    next.memory_budget_bytes = try resourceUint(doc, "resources.memory_budget_bytes", next.memory_budget_bytes, 1 << 20, 1 << 50);
+    next.per_client_memory_bytes = try resourceUint(doc, "resources.per_client_memory_bytes", next.per_client_memory_bytes, 1024, 1 << 30);
+    next.cpu_max_shards = @intCast(try resourceUint(doc, "resources.cpu_max_shards", next.cpu_max_shards, 1, shard.max_shards));
+    next.net_ingress_bytes_per_sec = try resourceUint(doc, "resources.net_ingress_bytes_per_sec", next.net_ingress_bytes_per_sec, 1, 1 << 40);
+    next.net_egress_bytes_per_sec = try resourceUint(doc, "resources.net_egress_bytes_per_sec", next.net_egress_bytes_per_sec, 1, 1 << 40);
+    next.net_max_s2s_peers = @intCast(try resourceUint(doc, "resources.net_max_s2s_peers", next.net_max_s2s_peers, 1, 65535));
+    if (doc.get("resources.fd_reserve")) |v| if (v.* != .integer) return error.ParseError;
+    next.fd_reserve = @intCast(try uintField(doc, "resources.fd_reserve", next.fd_reserve, 0, 65535));
+
+    if (doc.get("resources.basis")) |bv| {
+        if (bv.* != .table) return error.ParseError;
+        const basis_keys = [_][]const u8{ "name", "harness", "revision", "measured_clients", "rss_per_client_bytes", "egress_bytes_per_sec_per_client" };
+        var bit = bv.table.iterator();
+        while (bit.next()) |entry| if (!resourceKeyAllowed(entry.key_ptr.*, &basis_keys)) return error.ParseError;
+        var basis: resource_limits.BenchmarkBasis = .{};
+        basis.measured_clients = @intCast(try resourceUint(doc, "resources.basis.measured_clients", 0, 1, 1_000_000));
+        basis.rss_per_client_bytes = try resourceUint(doc, "resources.basis.rss_per_client_bytes", 0, 1, 1 << 30);
+        basis.egress_bytes_per_sec_per_client = try resourceUint(doc, "resources.basis.egress_bytes_per_sec_per_client", 0, 1, 1 << 30);
+        basis.name = try resourceBasisText(allocator, doc, "resources.basis.name");
+        errdefer if (basis.name.len != 0) allocator.free(basis.name);
+        basis.harness = try resourceBasisText(allocator, doc, "resources.basis.harness");
+        errdefer if (basis.harness.len != 0) allocator.free(basis.harness);
+        basis.revision = try resourceBasisText(allocator, doc, "resources.basis.revision");
+        errdefer if (basis.revision.len != 0) allocator.free(basis.revision);
+        resource_limits.checkBasis(basis) catch return error.ParseError;
+        next.basis = basis;
+    }
+    out.* = next;
+}
+
+/// Largest accepted `[quota]` rate or burst. Far above any useful value and
+/// small enough that the governor's GCRA arithmetic cannot overflow.
+const quota_max_rate: u64 = 1 << 24;
+
+/// Project `[quota]`. Unknown keys, wrong types, zero, negative and
+/// out-of-range values fail closed with `error.quota`; `out` is only mutated
+/// once every field has parsed. Cross-field rules are `config_boot`'s
+/// `workloadQuotaError`.
+fn parseQuota(doc: toml.Document, out: *workload_quota.Overrides) TomlError!void {
+    const root = doc.get("quota") orelse return;
+    if (root.* != .table) return error.quota;
+    const info = @typeInfo(workload_quota.Overrides).@"struct";
+    var it = root.table.iterator();
+    keys: while (it.next()) |entry| {
+        inline for (info.field_names) |name| if (std.mem.eql(u8, entry.key_ptr.*, name)) continue :keys;
+        return error.quota;
+    }
+    var next: workload_quota.Overrides = .{};
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (root.table.getPtr(name)) |v| {
+            if (T == bool) {
+                if (v.* != .boolean) return error.quota;
+                @field(next, name) = v.boolean;
+            } else {
+                if (v.* != .integer or v.integer < 1) return error.quota;
+                const Int = @typeInfo(T).optional.child;
+                const max: u64 = if (Int == u32) workload_quota.max_pool_capacity else quota_max_rate;
+                if (@as(u64, @intCast(v.integer)) > max) return error.quota;
+                @field(next, name) = @intCast(v.integer);
+            }
+        }
+    }
+    out.* = next;
+}
+
 fn uintField(doc: toml.Document, path: []const u8, current: u64, min: u64, max: u64) TomlError!u64 {
     const v = doc.getInt(path) orelse return current;
     if (v < 0) return error.ParseError;
@@ -2560,6 +2681,17 @@ const startup_only_config_fields = [_][]const u8{
     "cloak.anon_epoch_secs",
     // Reactor topology is fixed when the pool is spun up at startup.
     "limits.num_shards",
+    // Resource limits are read once into the boot projection and admission state.
+    "resources.memory_budget_bytes",
+    "resources.per_client_memory_bytes",
+    "resources.cpu_max_shards",
+    "resources.net_ingress_bytes_per_sec",
+    "resources.net_egress_bytes_per_sec",
+    "resources.net_max_s2s_peers",
+    "resources.fd_reserve",
+    "resources.basis",
+    // M12 governors are built once per reactor at startup.
+    "quota",
     // OCG2 owns process-lifetime state; REHASH reports it restart-only.
     "oper_ocg2.enabled",
     "oper_ocg2.projection_enabled",
@@ -4352,6 +4484,103 @@ test "parseToml: [io] / [reputation] / sweep_interval lift" {
     try testing.expect(flagged.io.sqpoll);
     // Cannot promise SASL payloads beyond the compiled router buffer.
     try testing.expectError(error.ParseError, parseToml(allocator, "[node]\nid=1\n[listen]\nirc=1\n[limits]\nsasl_decode_max_bytes=4096\n", .{}));
+}
+
+test "parseToml: [resources] table projects into Config.resources and rejects out-of-range values" {
+    const allocator = testing.allocator;
+    const head = "[node]\nid=1\n[listen]\nirc=1\n";
+    var dflt = try parseToml(allocator, head, .{});
+    defer dflt.deinit(allocator);
+    try testing.expectEqual(resource_limits.Config{}, dflt.resources);
+
+    var cfg = try parseToml(allocator, head ++
+        \\[resources]
+        \\memory_budget_bytes = 536870912
+        \\per_client_memory_bytes = 65536
+        \\cpu_max_shards = 4
+        \\net_ingress_bytes_per_sec = 1000000
+        \\net_egress_bytes_per_sec = 2000000
+        \\net_max_s2s_peers = 3
+        \\fd_reserve = 128
+        \\[resources.basis]
+        \\name = "pilot-1"
+        \\harness = "tools/bench_live.py --quick"
+        \\revision = "0.9.0+5bdd9dc55d99"
+        \\measured_clients = 1000
+        \\rss_per_client_bytes = 65536
+        \\
+    , .{});
+    defer cfg.deinit(allocator);
+    const r = cfg.resources;
+    try testing.expectEqual(@as(u64, 536870912), r.memory_budget_bytes);
+    try testing.expectEqual(@as(u64, 65536), r.per_client_memory_bytes);
+    try testing.expectEqual(@as(u16, 4), r.cpu_max_shards);
+    try testing.expectEqual(@as(u64, 1000000), r.net_ingress_bytes_per_sec);
+    try testing.expectEqual(@as(u64, 2000000), r.net_egress_bytes_per_sec);
+    try testing.expectEqual(@as(u32, 3), r.net_max_s2s_peers);
+    try testing.expectEqual(@as(u32, 128), r.fd_reserve);
+    try testing.expectEqualStrings("pilot-1", r.basis.name);
+    try testing.expectEqualStrings("tools/bench_live.py --quick", r.basis.harness);
+    try testing.expectEqualStrings("0.9.0+5bdd9dc55d99", r.basis.revision);
+    try testing.expectEqual(@as(u32, 1000), r.basis.measured_clients);
+    try resource_limits.checkBasis(r.basis);
+
+    const bad = [_][]const u8{
+        "[resources]\nmemory_budget_bytes = -1\n",
+        "[resources]\nmemory_budget_bytes = 1024\n", // below 1 MiB floor
+        "[resources]\nmemory_budget_bytes = \"big\"\n", // wrong type
+        "[resources]\nper_client_memory_bytes = 10\n",
+        "[resources]\ncpu_max_shards = 4097\n",
+        "[resources]\ncpu_max_shards = -2\n",
+        "[resources]\nnet_max_s2s_peers = 70000\n",
+        "[resources]\nfd_reserve = 70000\n",
+        "[resources]\nfd_reserve = true\n",
+        "[resources]\nmemory_budget = 1048576\n", // unknown key (typo)
+        "[resources]\nbasis = 3\n",
+        "[resources.basis]\nname = \"a\"\n", // partial basis
+        "[resources.basis]\nname = \"a\"\nharness = \"h\"\nrevision = \"r\"\nmeasured_clients = 1\n", // no rss
+        "[resources.basis]\nname = \"a\\nb\"\nharness = \"h\"\nrevision = \"r\"\nmeasured_clients = 1\nrss_per_client_bytes = 1\n",
+        "[resources.basis]\nname = \"\"\nharness = \"h\"\nrevision = \"r\"\nmeasured_clients = 1\nrss_per_client_bytes = 1\n",
+        "[resources.basis]\nname = \"a\"\nharness = \"h\"\nrevision = \"r\"\nmeasured_clients = 1\nrss_per_client_bytes = 1\nextra = 1\n",
+    };
+    // A non-table `resources` must precede every table header to be top-level.
+    try testing.expectError(error.ParseError, parseToml(allocator, "resources = 5\n" ++ head, .{}));
+    for (bad) |frag| {
+        const text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ head, frag });
+        defer allocator.free(text);
+        try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
+}
+
+fn resourcesBasisAllocationProbe(allocator: std.mem.Allocator) !void {
+    var cfg = try parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 1
+        \\[resources]
+        \\cpu_max_shards = 2
+        \\[resources.basis]
+        \\name = "n"
+        \\harness = "h"
+        \\revision = "r"
+        \\measured_clients = 5
+        \\rss_per_client_bytes = 7
+        \\
+    , .{});
+    cfg.deinit(allocator);
+}
+
+test "parseToml: [resources] basis ownership survives every allocation failure and a rejected basis leaks nothing" {
+    try testing.checkAllAllocationFailures(testing.allocator, resourcesBasisAllocationProbe, .{});
+    // The basis text is allocated before the incomplete-basis refusal.
+    try testing.expectError(error.ParseError, parseToml(testing.allocator, "[node]\nid=1\n[listen]\nirc=1\n[resources.basis]\nname=\"a\"\nharness=\"h\"\nrevision=\"r\"\nmeasured_clients=1\n", .{}));
+}
+
+test "configFieldClass: resources fields classify startup_only explicitly" {
+    for ([_][]const u8{ "resources.memory_budget_bytes", "resources.cpu_max_shards", "resources.basis", "resources.fd_reserve" }) |field| {
+        try testing.expectEqual(ConfigFieldClass.startup_only, configFieldClass(field));
+    }
 }
 
 test "parseToml: num_shards lifts and defaults to 1" {
