@@ -11,6 +11,31 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.10.2 — Linux Helix restored (2026-11-06)
+
+Helix live upgrades had not worked on Linux since 0.9.0. Two bugs combined:
+
+- **The successor could not read its handoff.** The daemon marks itself
+  non-dumpable at startup to keep keys out of core dumps. After that, Linux
+  refuses the process access to its own `/proc/self/environ`, which is where
+  the Helix successor looked for its handoff. Every successor therefore
+  cold-booted and dropped all clients. With WebTransport configured, it then
+  failed to bind the UDP port the predecessor still held, and exited. The
+  successor now reads the handoff from the environment passed to `main`.
+- **Guests who logged in became un-adoptable.** When a guest bound an account,
+  its guest id was cleared but its guest revision fields were not. The next
+  Helix refused that client, which aborted the whole adoption. The fields are
+  now cleared at account bind, and a successor ignores such stale metadata
+  from older predecessors.
+
+WebTransport was not the cause; it only made the failure fatal. Smoke tests
+(`tools/upgrade_smoke.py`, `tools/linux_helix_webtransport_smoke.py`) now keep
+TCP, TLS, mid-frame WSS and a real browser WebTransport stream through two
+consecutive Helix execs, including an upgrade from a 0.10.1 predecessor. A
+refused client snapshot is now logged with its fd and transport.
+
+---
+
 ## 0.10.1 — content filter rename (2026-11-06)
 
 - **Koshi is now the content filter.** The `[filter]` keys are

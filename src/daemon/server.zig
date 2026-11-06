@@ -44933,6 +44933,13 @@ pub const LinuxServer = struct {
                 adopted += 1;
                 if (tls_state != null) adopted_tls += 1;
                 if (ws_state != null) adopted_ws += 1;
+            } else {
+                srvLog("onyx-server: UPGRADE resume could not adopt client fd={d} nick_len={d} oper={} tls={} ws={} guest={} account={}\n", .{
+                    snap.fd,               snap.nick.len,
+                    snap.is_oper,          snap.was_secured,
+                    snap.was_websocket,    !std.mem.allEqual(u8, &snap.guest_incarnation, 0),
+                    snap.account.len != 0,
+                });
             }
         }
         if (adopted != client_capsule_count) {
@@ -46490,11 +46497,12 @@ pub const LinuxServer = struct {
         const guest_id_present = !std.mem.allEqual(u8, &snap.guest_incarnation, 0);
         const guest_metadata_present = snap.guest_revision != 0 and
             snap.guest_claim_revision != 0 and snap.guest_claim_hlc != 0;
-        const guest_metadata_empty = snap.guest_revision == 0 and
-            snap.guest_claim_revision == 0 and snap.guest_claim_hlc == 0;
-        if ((guest_id_present and (!guest_metadata_present or snap.account.len != 0 or
-            snap.nick.len == 0 or std.mem.eql(u8, snap.nick, "*"))) or
-            (!guest_id_present and !guest_metadata_empty))
+        // Without a guest incarnation the revision fields describe nothing:
+        // predecessors before 0.10.2 left them set when a guest bound an
+        // account. They are dropped below rather than refused, so those
+        // sessions stay adoptable; they cannot confer any guest authority.
+        if (guest_id_present and (!guest_metadata_present or snap.account.len != 0 or
+            snap.nick.len == 0 or std.mem.eql(u8, snap.nick, "*")))
         {
             if (close_fd_on_failure) closeFd(snap.fd);
             return false;
@@ -46517,9 +46525,9 @@ pub const LinuxServer = struct {
         conn.diagnostics_shard = id.shard;
         conn.overflow_allocator = self.allocator; // backs the SendQ overflow heap
         conn.guest_id = snap.guest_incarnation;
-        conn.guest_revision = snap.guest_revision;
-        conn.guest_claim_revision = snap.guest_claim_revision;
-        conn.guest_claim_hlc = snap.guest_claim_hlc;
+        conn.guest_revision = if (guest_id_present) snap.guest_revision else 0;
+        conn.guest_claim_revision = if (guest_id_present) snap.guest_claim_revision else 0;
+        conn.guest_claim_hlc = if (guest_id_present) snap.guest_claim_hlc else 0;
         conn.gagged = snap.gagged;
         conn.ircx = snap.ircx;
         conn.unfurl_opt_in = snap.unfurl_opt_in;
@@ -71655,6 +71663,12 @@ pub const LinuxServer = struct {
         if (std.mem.allEqual(u8, &conn.guest_id, 0)) return true;
         if (!self.retireOrdinaryGuest(conn)) return false;
         conn.guest_id = @splat(0);
+        // The revision fields only describe the retired incarnation. Leaving
+        // them set made the next Helix seal an account session with guest
+        // metadata but no guest id, which strict adoption refuses.
+        conn.guest_revision = 0;
+        conn.guest_claim_revision = 0;
+        conn.guest_claim_hlc = 0;
         return true;
     }
 
@@ -174044,6 +174058,11 @@ test "ordinary guest witness real Core callback error releases Store and leaves 
     try std.testing.expectEqual(@as(usize, 2), probe.called);
     try std.testing.expectEqual(old_serial, server.guest_serial);
     try std.testing.expect(std.mem.allEqual(u8, &server.connFor(fixture.guest).?.guest_id, 0));
+    // The retired incarnation's revisions go with it, so a later Helix seal
+    // carries no guest metadata for this account session.
+    try std.testing.expectEqual(@as(u64, 0), server.connFor(fixture.guest).?.guest_revision);
+    try std.testing.expectEqual(@as(u64, 0), server.connFor(fixture.guest).?.guest_claim_revision);
+    try std.testing.expectEqual(@as(u64, 0), server.connFor(fixture.guest).?.guest_claim_hlc);
     try std.testing.expect(server.guest_presence == null);
 }
 
@@ -174648,6 +174667,11 @@ test "ordinary guest binding actual witness reserve and fresh commit retain stab
     try std.testing.expect(core.guest_presence == null);
     try std.testing.expectEqual(@as(u64, 0), core.guest_serial);
     try std.testing.expect(std.mem.allEqual(u8, &core.connFor(fixture.guest).?.guest_id, 0));
+    // The retired incarnation's revisions go with it, so a later Helix seal
+    // carries no guest metadata for this account session.
+    try std.testing.expectEqual(@as(u64, 0), core.connFor(fixture.guest).?.guest_revision);
+    try std.testing.expectEqual(@as(u64, 0), core.connFor(fixture.guest).?.guest_claim_revision);
+    try std.testing.expectEqual(@as(u64, 0), core.connFor(fixture.guest).?.guest_claim_hlc);
 }
 
 test "ordinary guest binding rejects fresh public class and origin changes while reserved numbers stay burned" {

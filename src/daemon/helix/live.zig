@@ -946,6 +946,31 @@ pub fn resumeFromEnv() ?Resume {
     return resumeFromEnvBlock(env);
 }
 
+/// Read the Helix handoff from the environment the kernel passed to this
+/// process image, without `/proc`. The daemon entry calls
+/// `kernel_linux.setNonDumpable()` before it looks for a handoff; a
+/// non-dumpable process cannot open its own `/proc/self/environ` (EACCES), so
+/// `resumeFromEnv` would always report no handoff and the successor would
+/// cold-boot instead of adopting. Only the `ONYX_HELIX_*` handoff names are
+/// copied; an over-long set fails closed exactly like a missing handoff.
+pub fn resumeFromEnvMap(map: *const std.process.Environ.Map) ?Resume {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [64 * 1024]u8 = undefined;
+    var len: usize = 0;
+    inline for (.{ env_arena_fd, env_control_fd, env_listen_fd, env_listen_fds, env_state_fds }) |name| {
+        if (map.get(name)) |value| {
+            const need = name.len + 1 + value.len + 1;
+            if (len + need > buf.len) return null;
+            @memcpy(buf[len..][0..name.len], name);
+            buf[len + name.len] = '=';
+            @memcpy(buf[len + name.len + 1 ..][0..value.len], value);
+            buf[len + need - 1] = 0;
+            len += need;
+        }
+    }
+    return resumeFromEnvBlock(buf[0..len]);
+}
+
 fn resumeFromEnvBlock(env: []const u8) ?Resume {
     // ONYX_ Helix env names only (Onyx brand only).
     const arena_fd = readFdFromEnvBlock(env, env_arena_fd);
@@ -1131,6 +1156,31 @@ test "live prepare seals capsules and handoff passes fds" {
 
 test "resumeFromEnv returns null when fd variables are absent" {
     try std.testing.expectEqual(@as(?Resume, null), resumeFromEnv());
+}
+
+test "resumeFromEnvMap reads the handoff without /proc and ignores unrelated variables" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var map = std.process.Environ.Map.init(a);
+    defer map.deinit();
+    try map.put("PATH", "/usr/bin");
+    try std.testing.expectEqual(@as(?Resume, null), resumeFromEnvMap(&map));
+
+    try map.put(env_arena_fd, "5");
+    try map.put(env_listen_fd, "6");
+    try map.put(env_listen_fds, "6,9,12");
+    try map.put("ONYX_HELIX_UNRELATED", "ignored");
+    const r = resumeFromEnvMap(&map) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?handoff.Fd, 5), r.arena_fd);
+    try std.testing.expectEqual(@as(?handoff.Fd, 6), r.listen_fd);
+    try std.testing.expectEqual(@as(usize, 3), r.listen_fd_count);
+    try std.testing.expectEqualSlices(handoff.Fd, &.{ 6, 9, 12 }, r.listenFds());
+
+    // The map path must parse exactly what the /proc block path parses.
+    const block = "ONYX_HELIX_ARENA_FD=5\x00ONYX_HELIX_LISTEN_FD=6\x00ONYX_HELIX_LISTEN_FDS=6,9,12\x00";
+    const from_block = resumeFromEnvBlock(block) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(from_block.arena_fd, r.arena_fd);
+    try std.testing.expectEqual(from_block.listen_fd_count, r.listen_fd_count);
 }
 
 test "readArena round-trips the sealed capsule stream" {

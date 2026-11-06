@@ -1913,7 +1913,7 @@ pub fn main(init: std.process.Init) !void {
         // state + mesh re-dial hints); otherwise it boots normally.
         if (std.mem.eql(u8, first, "--supervisor")) {
             if (comptime builtin.os.tag == .linux) {
-                if (onyx_server.daemon.helix.live.resumeFromEnv()) |r| {
+                if (onyx_server.daemon.helix.live.resumeFromEnvMap(init.environ_map)) |r| {
                     if (r.listen_fd) |lfd| {
                         // Adopt the inherited listening socket so the port stays
                         // bound across the upgrade (no connection-refused window).
