@@ -1138,20 +1138,34 @@ pub const MediaPlane = struct {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
         if (self.pump_failed.load(.acquire)) return false;
+        // Queued or in-flight routed egress is the only process-owned state a
+        // routing binding adds. Lock order matches `latchRoutingTerminal`.
+        if (self.routing_egress) |queue| {
+            lockSpin(&queue.mutex);
+            const egress_idle = queue.len == 0 and queue.inflight == null and !queue.poisoned;
+            queue.mutex.unlock();
+            if (!egress_idle) return false;
+        }
         lockSpin(&self.fp_mutex);
         defer self.fp_mutex.unlock();
         lockSpin(&self.rtcp_out_mutex);
         defer self.rtcp_out_mutex.unlock();
 
-        // The server installs a routing binding even when media is disabled.
-        // That inert binding has no process-owned transport state to preserve.
-        const binding_idle = self.routing_binding == null or
-            (self.routing_egress == null and self.cross == null and self.socket == null);
-        if (!binding_idle or self.routing_inbound != null or self.physical_pending != 0 or
+        // The server installs a routing binding whenever media is configured.
+        // With an idle egress queue (checked above) that binding, the bound
+        // socket and a configured cross-leg sink are process configuration:
+        // the socket is CLOEXEC, so exec releases its port, and the successor
+        // rebinds from config. Clients learn media host/port per call, so an
+        // idle plane on a fresh ephemeral port strands no carried client.
+        if (self.routing_inbound != null or self.physical_pending != 0 or
             self.physical_rows.count() != 0 or self.physical_ufrags.count() != 0 or
             self.physical_groups.count() != 0) return false;
         for (self.physical_ssrcs) |entry| if (entry.live) return false;
         for (self.routing_crypto) |entry| if (entry.live) return false;
+        // Same SRTP association test as `requireRoutingReleasable`: a live
+        // per-address context is call state even before its endpoint rows.
+        for (self.srtp_hub.peers) |peer| if (peer.active) return false;
+        for (self.srtp_hub.owners) |owner| if (owner.active) return false;
         return self.transport.endpoints.count() == 0 and
             self.transport.by_ufrag.count() == 0 and
             self.transport.by_addr.count() == 0 and

@@ -461,11 +461,10 @@ pub const NativeMediaTransport = struct {
     pub fn upgradeContinuityReady(self: *NativeMediaTransport) bool {
         lockSpin(&self.mutex);
         defer self.mutex.unlock();
-        // A configured binding alone is inert when media is disabled. The
-        // successor reconstructs that binding from configuration.
-        const binding_idle = self.routing_binding == null or
-            (self.cross == null and self.socket == null);
-        return binding_idle and self.active_ingress == null and !self.legacy_joining and
+        // A routing binding, bound socket and configured cross-leg sink are
+        // process configuration, not call state: the socket is CLOEXEC, so
+        // exec releases its port, and the successor rebinds from config.
+        return self.active_ingress == null and !self.legacy_joining and
             self.channels.count() == 0 and self.stream_index.count() == 0 and
             self.physical_pending == 0 and self.physical_endpoints.count() == 0 and
             self.physical_streams.count() == 0;

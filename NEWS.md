@@ -28,6 +28,15 @@ Helix live upgrades had not worked on Linux since 0.9.0. Two bugs combined:
   now cleared at account bind, and a successor ignores such stale metadata
   from older predecessors.
 
+- **Configured media blocked every upgrade.** With `[media]` enabled, the
+  server always installs a routing binding, and the WebRTC and native media
+  continuity checks then treated the bound UDP socket itself as live call
+  state. Helix was refused even with no call in progress. A bound socket,
+  routing binding and cross-leg sink now count as configuration: the sockets
+  are close-on-exec and the successor rebinds them. Queued routed egress, ICE,
+  DTLS, SSRC and endpoint state still block, as before. Because the old process
+  runs this check, moving off 0.10.1 still needs one cold restart.
+
 WebTransport was not the cause; it only made the failure fatal. Smoke tests
 (`tools/upgrade_smoke.py`, `tools/linux_helix_webtransport_smoke.py`) now keep
 TCP, TLS, mid-frame WSS and a real browser WebTransport stream through two
