@@ -37,6 +37,14 @@ Helix live upgrades had not worked on Linux since 0.9.0. Two bugs combined:
   DTLS, SSRC and endpoint state still block, as before. Because the old process
   runs this check, moving off 0.10.1 still needs one cold restart.
 
+**Still blocked in production:** a node with a durable mesh presence store
+(`mesh.presence_store_path`, required on every active mesh node) cannot be
+carried by Helix yet. A successor refused to boot with it, but the predecessor
+did not check first, so `reload` dropped every client and the supervisor
+restarted the daemon. Reload now refuses before exec with "durable mesh
+presence store (no Helix carry yet)" and the predecessor keeps serving. Use
+cold restarts on mesh nodes until the presence store gains a Helix carry.
+
 WebTransport was not the cause; it only made the failure fatal. Smoke tests
 (`tools/upgrade_smoke.py`, `tools/linux_helix_webtransport_smoke.py`) now keep
 TCP, TLS, mid-frame WSS and a real browser WebTransport stream through two

@@ -40840,6 +40840,7 @@ pub const LinuxServer = struct {
         pending_remote_membership,
         pending_fabric_output,
         unmappable_attachment_delivery,
+        mesh_presence_store,
     };
 
     /// Fail-closed inventory for process-owned continuity that Helix does not
@@ -40892,6 +40893,12 @@ pub const LinuxServer = struct {
             if (scan.note(.pending_fabric_output)) return;
             break;
         };
+        // The durable mesh presence authority has no Helix carry yet: a successor
+        // refuses to boot with an inherited arena while it is configured
+        // (`MeshPresenceHotCheckpointRequired`). Refuse here, before exec, so
+        // the predecessor keeps serving instead of every client dropping.
+        if (self.durable_guest_presence != null or self.config.mesh_presence_store_path.len != 0)
+            if (scan.note(.mesh_presence_store)) return;
         // DROP reservations are RAM-only two-owner latches. Refuse rather than
         // serializing a half-committed identity transfer into the successor.
         if (self.session_drop_journal.activeCount() != 0) if (scan.note(.session_drop_transaction)) return;
@@ -40960,6 +40967,7 @@ pub const LinuxServer = struct {
         return switch (blocker) {
             .session_drop_transaction => "SESSION DROP transaction",
             .local_guest_issuer => "local guest issuer and unpublished physical bindings",
+            .mesh_presence_store => "durable mesh presence store (no Helix carry yet)",
             .remote_visible_identity => "remote visible identity and physical notification frontiers",
             .pending_remote_membership => "pending authenticated membership proposal",
             .pending_fabric_output => "accepted fabric delivery awaiting physical custody",

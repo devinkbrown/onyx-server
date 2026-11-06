@@ -99,7 +99,7 @@ pub const AttachmentRow = struct {
 };
 
 /// Mirrors `server.zig`'s `UpgradeContinuityBlocker` one-to-one (the first
-/// 15 tags, in its declaration order) plus the preflight and target-probe
+/// 16 tags, in its declaration order) plus the preflight and target-probe
 /// refusals that have no continuity-blocker counterpart because they stop
 /// the command before any continuity inventory is even taken.
 pub const Blocker = enum(u8) {
@@ -119,6 +119,7 @@ pub const Blocker = enum(u8) {
     pending_remote_membership,
     pending_fabric_output,
     unmappable_attachment_delivery,
+    mesh_presence_store,
     // --- preflight / target-probe refusals with no continuity-blocker twin ---
     /// `upgradeRefusedForListenerChange`: the on-disk listener set changed.
     listener_change,
@@ -155,6 +156,7 @@ pub fn blockerName(b: Blocker) []const u8 {
         .pending_remote_membership => "pending authenticated membership proposal",
         .pending_fabric_output => "accepted fabric delivery awaiting physical custody",
         .unmappable_attachment_delivery => "pending physical delivery without a mandatory HSSN mapping",
+        .mesh_presence_store => "durable mesh presence store (no Helix carry yet)",
         .listener_change => "on-disk listener set changed",
         .retired_fence_change => "retired session fence policy changed",
         .prospective_authority => "target identity or cohort cannot preserve carried session authority",
