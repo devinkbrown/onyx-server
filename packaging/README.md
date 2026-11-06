@@ -14,11 +14,11 @@ run is the one from source.
 | `zig build package --prefix <dir>` | staged daemon + reference config + target-specific deployment assets | Production install from a built tree |
 | `packaging/release.sh` | `dist/onyx-server-<version>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance | Reproducible attested static binary |
 
-Current source version is **0.9.0**, declared by `build.zig.zon`. Build a
+Current source version is **0.10.0**, declared by `build.zig.zon`. Build a
 candidate from a clean checkout and verify its exact source/compiler inputs
 with the release scripts. The accepted production artifact, service-kit revision,
 full Debug/ReleaseSafe results and native multi-client acceptance are recorded
-in the [current release audit](../docs/audit/release-and-test-speed-2026-11-03.md).
+in the [current release record](../docs/audit/release-0.10.0-2026-11-06.md).
 The [production paths](../docs/ops/onyx-server-paths.md) page owns current node,
 supervisor, version and executable-hash facts. A new local build is a separate
 candidate until its gates and intended-host acceptance pass.
@@ -54,12 +54,12 @@ certificate loading or every intended listener; verify real runtime readiness.
 
 ## Quickstart (native)
 
-**Build current source (0.9.0):**
+**Build current source (0.10.0):**
 
 ```sh
 packaging/release.sh
-./dist/onyx-server-0.9.0-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
-./dist/onyx-server-0.9.0-x86_64-linux-musl packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.10.0-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
+./dist/onyx-server-0.10.0-x86_64-linux-musl packaging/onyx-server.quickstart.toml
 ```
 
 For a prebuilt download, use the asset version and checksum manifest from the

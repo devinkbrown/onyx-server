@@ -5,7 +5,7 @@
 This runbook describes the shipped tree. For full configuration details, use
 [reference/config.md](reference/config.md) and `etc/onyx-server.reference.toml`.
 
-## Verified fleet baseline (2026-11-03)
+## Verified fleet baseline (2026-11-06)
 
 The [production paths and acceptance record](ops/onyx-server-paths.md) owns
 the current image revision, executable hash, process observations and mesh
@@ -114,7 +114,7 @@ before opening the listeners.
 
 ## Hot Upgrade
 
-> **Current fleet (2026-11-03):** Helix reload is blocked on both production
+> **Current fleet (2026-11-06):** Helix reload is blocked on both production
 > nodes by the configured WebTransport listener (`[listen].webtransport = 4433`).
 > Production upgrades there are cold restarts, one node at a time:
 > `sudo rc-service onyx-server restart` (eshmaki.me, OpenRC) and

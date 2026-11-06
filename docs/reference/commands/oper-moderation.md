@@ -17,13 +17,13 @@ The `oper.security` module registers the core oper and moderation commands (`src
 
 ## REHASH
 
-- Syntax: `REHASH`
-- Description: Reloads configuration/state through the server rehash handler.
+- Syntax: `REHASH` or `REHASH DRY`
+- Description: Reloads configuration/state through the server rehash handler. `REHASH DRY` parses the boot config file and lists each changed field as `reloadable`, `restart_required`, `startup_only`, or `unclassified`, then returns without applying anything. Reloadable fields are compared with the last applied document; other fields with the boot document. Values are never printed, only key names (`src/daemon/config_change_preview.zig`).
 - Privileges: Oper plus `server_rehash` privilege.
-- Parameters: None.
-- Replies: `RPL_REHASHING 382` and/or server notices from handler.
+- Parameters: None, or `DRY`.
+- Replies: `RPL_REHASHING 382` and/or server notices from handler; `REHASH DRY field <name>: <class>` notices.
 - Errors: `ERR_NOPRIVILEGES 481`.
-- Example: `REHASH`
+- Example: `REHASH DRY`
 - Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`
 
 ## GRANT
@@ -70,9 +70,10 @@ The `oper.security` module registers the core oper and moderation commands (`src
 
 ## AUDIT
 
-- Syntax: `AUDIT [JSON] [oper] [count] | AUDIT PROOF [JSON] <proof-id>`
+- Syntax: `AUDIT [JSON] [oper] [count] | AUDIT PROOF [JSON] <proof-id> | AUDIT CHANGES [count] | AUDIT UNDO <change-id>`
 - Description: Lists recent privileged actions from the bounded oper audit ring. Signed records and signed Event Spine moderation notices include `proof=<id>` for covered actions including `KILL`, `JUPE`, native `WARD ADD`/`WARD DEL`, `SHUN`, `UNSHUN`, `CONNECT`, `SQUIT`, `REDACT`, IRCX `ACCESS` add/delete/clear mutations, and FORCE* channel actions. `AUDIT JSON` streams stable audit objects, and `AUDIT PROOF JSON <proof-id>` returns the stored ProofMark policy fields, reason hash, public key, detached signature, and a `valid=true|false` verification result.
-- Privileges: Oper holding the `audit_read` privilege.
+  `AUDIT CHANGES [count]` lists the newest reversible moderation changes with their change ids. `AUDIT UNDO <change-id>` reverses one recorded ward (including KLINE/DLINE/XLINE), shun, or channel-list (`+b/+e/+I/+Z`) change as a new audited change; history is never deleted. The undo is staged and conflict-checked before any store changes, a mesh-scope ward still needs two-person approval, and a channel-list undo is published to peers as an ordinary CHANNEL_LIST fact. AKILL and GLINE are not reversible, and `AUDIT UNDO` says why. The change ledger is node-local (`src/daemon/moderation_undo.zig`).
+- Privileges: Oper holding the `audit_read` privilege; `AUDIT UNDO` requires `client_moderate`.
 - Parameters: Optional oper filter and count for record listing; ProofMark id for proof inspection.
 - Replies: Event Spine lines: `:<server> EVENT <oper> AUDIT ...`.
 - Errors: `ERR_NOPRIVILEGES 481`; usage or missing proof reports are server notices.
@@ -135,11 +136,11 @@ The `oper.security` module registers the core oper and moderation commands (`src
 
 ## WARD
 
-- Syntax: `WARD ADD <match> <pattern> [scope] [action] [secs] [:reason] | WARD DEL <match> <pattern> | WARD LIST [match] | WARD TEST <match> <value>`
+- Syntax: `WARD ADD <match> <pattern> [scope] [action] [secs] [:reason] | WARD DEL <match> <pattern> | WARD LIST [match] | WARD TEST <match> <value> | WARD PREVIEW <match> <pattern> [scope] [action] [secs] [reason] [-- subject...]`
 - Description: Unified Warden network-ban registry. A Ward is `Match x Scope x Action`: match facets are `address`, `host`, `mask`, `account`, `realname`, `certfp`, `country`, and `asn`; scopes are `node` or `mesh`; actions are `refuse`, `expel`, `quarantine`, or `require_auth`. The canonical English surface is `WARD`; the live registry also carries compatibility aliases `KLINE`, `DLINE`, and `XLINE` into Warden, with no separate `GLINE`, `ZLINE`, or `QLINE` commands registered.
 - Privileges: Oper plus `client_moderate` privilege.
 - Parameters: Subcommand-specific Warden axes and optional duration/reason.
-- Replies: Server notices and oper events. `WARD ADD` and `WARD DEL` oper events include `proof=<id>` when the node has a signing identity. `WARD TEST` reports match/no-match by notice.
+- Replies: Server notices and oper events. `WARD ADD` and `WARD DEL` oper events include `proof=<id>` when the node has a signing identity. `WARD TEST` reports match/no-match by notice. `WARD PREVIEW` applies the same validation as `WARD ADD` and reports which subjects the proposed ward would hit, without storing, relaying or enforcing it. Synthetic subjects follow `--` as `facet=value[,facet=value...]`; live connected subjects are sampled only for an oper with `oper_spy`, and that read is audited (`src/daemon/ward_preview.zig`).
 - Errors: `ERR_NOPRIVILEGES 481`; usage and validation failures are server notices.
 - Example: `WARD ADD address 203.0.113.0/24 mesh refuse 3600 :abuse`
 - Sources: `src/daemon/modules/oper_security.zig`, `src/daemon/server.zig`, `src/daemon/warden.zig`
@@ -289,10 +290,10 @@ The `oper.security` module registers the core oper and moderation commands (`src
 
 ## DEBUG
 
-- Syntax: `DEBUG`
-- Description: Dumps the flight recorder as server notices.
+- Syntax: `DEBUG [DIAGNOSTICS|BUNDLE]`
+- Description: Dumps the flight recorder as server notices. `DEBUG BUNDLE` returns one bounded, minified JSON document (`kind` `onyx-diagnostic-bundle`, `schema_version` 1) with build identity, CAP names, connection-diagnostic and module counters, recent flight-recorder events and connection-history records. Redaction is allowlist-only: messages that are not proven server literals are replaced by `null`. Session tokens and resume credentials are also scrubbed from every `DEBUG` dump, the daemon log and crash artifacts (`src/daemon/diagnostic_bundle.zig`, `src/daemon/credential_redaction.zig`).
 - Privileges: Oper plus `audit_read` privilege.
-- Parameters: None.
+- Parameters: None, `DIAGNOSTICS`, or `BUNDLE`.
 - Replies: Server notices and final `End of DEBUG flight recorder`.
 - Errors: `ERR_NOPRIVILEGES 481`.
 - Example: `DEBUG`

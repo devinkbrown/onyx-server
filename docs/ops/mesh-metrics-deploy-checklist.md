@@ -46,6 +46,19 @@ Expect both sides to report established links and peers, with no partition.
 Neither the aggregate link gauge nor a successful TCP connect alone proves
 secured authentication, whole-network convergence or client delivery.
 
+Metric families added in 0.10.0, useful when you diagnose a slow or diverging
+link:
+
+| Family | Meaning |
+|---|---|
+| `onyx_relay_v2_resend_*`, `onyx_relay_v2_stalled_peers`, `onyx_relay_v2_*_shed_total`, `onyx_relay_v2_deferred*` | Paced MESSAGE_V2 resends to slow neighbours and per-origin admission backpressure. A rising shed or stalled count means a neighbour is not ACKing. |
+| `onyx_route_peer_cost`, `onyx_route_rank_*`, `onyx_route_eligible_peers` | Measured next-hop cost and hysteresis decisions (promotions, demotions, held, refused). |
+| `onyx_output_class_{admitted,deferred,shed,overflow}_total` | Per-class SendQ budgets (control, chat, replay, media). |
+| `onyx_session_credential_*` | Credential reuse versus fresh mint, rotations and the churn budget. `..._table_overflow_total` replaces `..._table_evictions_total`. |
+| `onyx_session_offer_retry_*` | SESSION_REPLICA OFFER retry decisions (reused cohort, required rotation, duplicates). |
+| `onyx_session_replica_{entries,tombstones,...}` | Replica table and tombstone occupancy against their caps. |
+| `onyx_resource_*` | `[resources]` memory budget and refusals. |
+
 For a supplementary CA/hostname-verified cross-node chat smoke:
 
 ```sh
@@ -57,4 +70,4 @@ MESH_SMOKE_A=eshmaki.me:6697 MESH_SMOKE_A_TLS=1 \
 Chat smoke supplements exact-event/session acceptance; retain the bounded receipt
 and clean up only the accounts/channels created by that fixture. The latest
 accepted release's scope and rollback results are in the
-[release audit](../audit/release-and-test-speed-2026-11-03.md).
+[release record](../audit/release-0.10.0-2026-11-06.md).

@@ -11,6 +11,102 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.10.0 — roadmap-wave fleet release (2026-11-06)
+
+Both nodes run **`0.10.0+ef2230805c16`**, from clean commit `ef223080`. The
+static x86_64-linux-musl artifact was rebuilt independently and is
+byte-identical, SHA-256
+`b9cee11f55b563ebb226fa0a470584d2772f5a3cfe7b922abd94e17d0cda082f`.
+The full Debug gate discovered **12,086** tests: **11,773 passed**, 313 skipped,
+none failed, leaked or logged errors. ReleaseSafe `test-session`, `test-helix`
+and `test-mesh` passed 3,181 tests, and all 13 leaf lanes passed. Both nodes
+were cold-restarted one at a time and re-established the secured mesh
+(`links_active=1`, `peers_up=1`, `partitioned=0`). A CA-verified cross-node chat
+smoke delivered in both directions. See the
+[release record](docs/audit/release-0.10.0-2026-11-06.md).
+
+### Mesh
+
+- **Digest anti-entropy (M03).** Before the periodic state re-burst, peers swap
+  per-family digests (`DIGEST_OFFER`/`DIGEST_NEED`/`DIGEST_COMMIT`) and resend
+  only the families, and buckets, that differ. It is negotiated per link with
+  the `onyx-xcap-digest-reconcile-1` probe; older peers keep the full burst.
+- **Adaptive anti-entropy schedule (M02).** Quiet peers back off, busy links
+  stretch the interval, and idle mesh cost has a fixed upper bound.
+- **Measured route cost (M04).** Next hops are ranked by measured link cost
+  with time-based hysteresis (`onyx_route_*` metrics). Cost is not yet gossiped
+  past direct neighbours.
+- **Bounded backpressure.** MESSAGE_V2 resends to a slow neighbour are paced,
+  and relay capacity is split by signed origin so one origin cannot starve
+  transit (`onyx_relay_v2_*`).
+- **Config compatibility check.** Secured peers exchange a bounded record of
+  cloak and ban-relevant config and report mismatches. Secrets travel only as
+  HMAC proofs bound to the link.
+- **S2S admission hardening (M12).** Handshake tickets are keyed per source
+  address, so one source cannot exhaust another's slot. The per-IP throttle
+  runs before admission, and S2S handshakes time out after 30 seconds.
+- **Exact-once fixes.** The MESSAGE_V2 ACK is ordered after ingress commit,
+  which fixes a rare three-node MARKREAD flake. Helix shard placement for
+  adopted clients is now round-robin.
+
+### Sessions
+
+- **Credential churn budget (T09).** A reconnect that presents a still-valid
+  credential reuses it. Rotations are counted and bounded
+  (`onyx_session_credential_*`).
+- **Single-attachment revoke.** `SESSION REVOKE group=<id> attachment=<id>`
+  removes one physical attachment, on any node, without touching the session's
+  other attachments. The revoke fence survives a Helix upgrade (T07).
+- **Replica revocation.** A full tombstone table can no longer block a REVOKE.
+  Converting a live entry always frees its own slot.
+- **OFFER retry reuse.** An interrupted publication on a cohort node can reuse
+  the accepted OFFER instead of minting a new revision
+  (`onyx_session_offer_retry_*`).
+
+### Operators and moderation
+
+- **`AUDIT CHANGES` / `AUDIT UNDO <change-id>`.** Reverses a recorded ward, shun
+  or channel-list (`+b/+e/+I/+Z`) change as a new audited change; history is
+  never rewritten. AKILL/GLINE cannot be undone, and the undo ledger is
+  node-local.
+- **`WARD PREVIEW`.** Shows which live or synthetic subjects a proposed ward
+  would hit, without storing or enforcing anything.
+- **`ACCESS <#channel> EXPLAIN`.** Explains why JOIN or SPEAK is allowed or
+  denied, without revealing details the caller may not see.
+- **Existence privacy.** A concealed channel answers every channel command the
+  same way a missing channel does.
+- **`REHASH DRY`, `UPGRADE PLAN`, `DEBUG BUNDLE`.** Preview which config fields
+  are reloadable, which attachments a Helix upgrade would carry, resume or
+  drop, and produce one redacted JSON diagnostic bundle.
+- **Searchable HELP.** `HELP ?query` searches the live command and capability
+  registry. An unavailable command says which support is missing.
+- **Credential redaction.** Session tokens and resume credentials are scrubbed
+  from logs, the flight recorder, crash artifacts and `DEBUG` output.
+
+### Configuration
+
+- **`[resources]`.** An explicit memory budget for client admission, a shard
+  cap and capacity estimates tied to a named benchmark. `--check-config`
+  reports what each value actually enforces.
+- **`[quota]`.** A per-shard workload governor that reserves capacity for
+  session and mesh recovery during reconnect storms.
+- **Output-class budgets.** Control, chat, replay and media traffic get nested
+  SendQ ceilings, so slow media or replay cannot starve control lines
+  (`onyx_output_class_*`).
+
+### Upgrade notes
+
+- The metric `onyx_session_credential_table_evictions_total` was renamed to
+  `onyx_session_credential_table_overflow_total`.
+- The S2S handshake timeout (30 s) has no TOML key yet.
+- Digest sync accepts a hidden-loss window of up to 10 minutes before the
+  periodic full repair catches a divergence.
+- Helix remains blocked on the production nodes by WebTransport, so this rollout
+  used cold restarts. Token resume was not exercised by a dedicated fixture for
+  this rollout; a live client reconnected after each restart.
+
+---
+
 ## 0.9.0 — accepted fleet release (2026-11-03)
 
 ### Latest fleet refresh

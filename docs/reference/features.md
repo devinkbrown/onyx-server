@@ -1,8 +1,8 @@
 # Feature and interface index
 
-This is the source-backed entry point for the 0.9.0 feature surface, reconciled
-on 2026-11-03. It links canonical detailed references instead of maintaining a
-second implementation manual. The [release audit](../audit/release-and-test-speed-2026-11-03.md)
+This is the source-backed entry point for the 0.10.0 feature surface, reconciled
+on 2026-11-06. It links canonical detailed references instead of maintaining a
+second implementation manual. The [release record](../audit/release-0.10.0-2026-11-06.md)
 separately records accepted Linux fleet behavior. Source availability, configured
 enablement, client support and live acceptance are distinct claims.
 
@@ -107,5 +107,5 @@ Follow [development](../development.md), [testing](../guide/testing.md),
 cached filters accelerate iteration; only complete source-bound full-suite
 receipts establish a ship gate. External interoperability checks and native
 platform acceptance have separate scopes. The production revision and test-only
-revision need not be the same; the [release audit](../audit/release-and-test-speed-2026-11-03.md)
+revision need not be the same; the [release record](../audit/release-0.10.0-2026-11-06.md)
 records both rather than implying that every later documentation commit was deployed.

@@ -53,17 +53,18 @@ claims; historical roadmaps do not establish support.
 
 ## Current release status
 
-The source manifest is **0.9.0**. Both production nodes use the improved
-OpenRC/systemd kits. Exact running revisions and hashes, service paths,
+The source manifest is **0.10.0**, deployed to both production nodes on
+**2026-11-06**. Both nodes use the improved OpenRC/systemd kits. Exact running revisions and hashes, service paths,
 acceptance scope and rollback facts have one
 canonical home: [production status](docs/ops/onyx-server-paths.md).
 
 The deployed WebTransport listener blocks production Helix; that fleet uses
-cold restarts one node at a time. Saved durable account-token recovery was
-verified after both restarts. The acceptance does not claim preservation of
-old exact attachment tokens across a cold boundary.
+cold restarts one node at a time. The 0.9.0 acceptance verified saved durable
+account-token recovery after both restarts; the 0.10.0 rollout re-verified the
+secured mesh and cross-node delivery but did not repeat the token fixture.
+Neither claims preservation of old exact attachment tokens across a cold boundary.
 
-The latest published GitHub asset release, checked **2026-11-03**, is still
+The latest published GitHub asset release, checked **2026-11-06**, is still
 [v0.5.6](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
 The source version, running image and published release tag are independent.
 See [NEWS](NEWS.md) for the accepted release and later test-only changes.
@@ -83,11 +84,11 @@ roots with bounded parallel workers. Cached lanes reuse a root binary for
 runtime selections; documentation-only commits no longer invalidate test
 version metadata. Windows and cross targets retain their documented graphs.
 
-The measured complete Debug gate fell from **22.1 to 15.7 minutes** after the
-combined test improvements, with all previous test names preserved and two
-controls added: **11,236 passed, 313 skipped, zero failures**. Cold ReleaseSafe
-compilation remains expensive. Exact provenance and measurement limits are in
-the [verification report](docs/audit/release-and-test-speed-2026-11-03.md).
+The complete Debug gate for 0.10.0 discovered **12,086 tests: 11,773 passed,
+313 skipped, zero failures**, in about 14 minutes. Cold ReleaseSafe
+compilation remains expensive. Exact provenance and limits are in the
+[0.10.0 release record](docs/audit/release-0.10.0-2026-11-06.md); the earlier test-speed
+measurements are in the [2026-11-03 report](docs/audit/release-and-test-speed-2026-11-03.md).
 
 Start with [development](docs/development.md), then use the detailed
 [testing guide](docs/guide/testing.md), [source map](docs/architecture/source-modules.md),

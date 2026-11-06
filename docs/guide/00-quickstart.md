@@ -2,7 +2,7 @@
 
 *Build Onyx Server, write a minimal config, and start the daemon.*
 
-Onyx Server is a pure-Zig IRC/IRCX mesh daemon. The source manifest is **0.9.0**. The accepted fleet image is recorded in [production paths](../ops/onyx-server-paths.md); a fresh build of this tree is a separate candidate. The build package declares
+Onyx Server is a pure-Zig IRC/IRCX mesh daemon. The source manifest is **0.10.0**. The accepted fleet image is recorded in [production paths](../ops/onyx-server-paths.md); a fresh build of this tree is a separate candidate. The build package declares
 Zig `0.17.0` as the minimum compiler, and the
 daemon build rejects 32-bit targets. The browser WASM artifacts are the only
 deliberate 32-bit exception.

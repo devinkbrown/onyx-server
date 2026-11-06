@@ -1,9 +1,11 @@
 # Current release evidence
 
 The accepted release is documented in
-[release and test-speed verification, 2026-11-03](release-and-test-speed-2026-11-03.md).
-It records source revisions, test inventories, artifact reproduction, measured
-runtime, deployment acceptance and explicit limits.
+[release verification, 0.10.0, 2026-11-06](release-0.10.0-2026-11-06.md).
+It records the source revision, test inventory, artifact reproduction,
+deployment acceptance and explicit limits. The previous
+[0.9.0 release and test-speed verification](release-and-test-speed-2026-11-03.md)
+retains the measured runtime and the token-recovery acceptance.
 
 [Production status](../ops/onyx-server-paths.md) owns current fleet identity;
 [testing](../guide/testing.md) owns the verification workflow. Neither a dated

@@ -72,10 +72,11 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 
 ## UPGRADE
 
-- Syntax: `UPGRADE` or, on Windows, `UPGRADE :<absolute-path-to-onyx-server.exe>`
+- Syntax: `UPGRADE`, `UPGRADE PLAN`, or, on Windows, `UPGRADE :<absolute-path-to-onyx-server.exe>`
 - Description: Helix hot in-place upgrade preserves listeners, clients, and the converged mesh view (including each link's remote-member roster and the cross-mesh oper-grant registry). Mandatory state and candidate capability must validate before adoption. A Linux pre-exec refusal leaves the predecessor serving; after successful exec it no longer exists, and strict-adoption failure can terminate the successor and require recovery. This differs from Windows two-process commit. See the [handoff recovery boundary](../../architecture/04-upgrade-wasm.md). On Linux, the handler seals a memfd arena, probes the configured executable path's exact capability token (falling back to `/proc/self/exe` only when no path was recorded), and re-execs the pinned image with `--supervisor`. On Windows, it launches a native successor from the current executable path or an explicitly staged image, passes authenticated state and socket custody, and commits only after candidate validation. The Windows path requires a config file with explicit `[node].secret_key` and `[cloak].secret`; a staged image must be an absolute local `onyx-server*.exe` path beside the running image. See the [Windows guide](../../guide/windows.md#guarded-windows-helix-upgrade) for the handoff rules and smoke coverage.
 - Privileges: Registered command with a `server_restart` oper privilege check inside the handler; other clients receive `ERR_NOPRIVILEGES 481`.
-- Parameters: None by default; on Windows, one optional staged executable path.
+- Parameters: None by default; `PLAN` for a dry run; on Windows, one optional staged executable path.
+- `UPGRADE PLAN`: read-only dry run. It inventories every attachment on every reactor and reports how many would keep their live descriptor (carry), lose it but keep a resumable session (resume), or be dropped, plus every continuity blocker in the order `UPGRADE` would refuse. The exec-time capability probe has not run, so the verdict is never `seamless`. Nothing is queued, sealed or carried (`src/daemon/maintenance_plan.zig`).
 - Replies: Server notices such as sealed-session count or fail-closed refusal messages.
 - Errors: `ERR_NOPRIVILEGES 481`; notices for state, capability, config, seal, plan, or process-launch failures.
 - Example: `UPGRADE` or `UPGRADE :C:\onyx\onyx-server-next.exe` on Windows.

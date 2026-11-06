@@ -494,6 +494,45 @@ Source: struct at `src/daemon/config_format.zig`, parsing at `src/daemon/config_
 
 On Linux, boot also arms provided-buffer multishot receive and zero-copy send. There is no key for either one. The daemon copies each selected receive into the connection buffer and replenishes the pool slice. A zero-copy send holds the send buffer until the kernel notification. kTLS, and a ring that cannot install the buffer group, stay on the copy path. Fixed files are not registered. A kernel that refuses zero-copy drops that ring back to copy send.
 
+## `[resources]`
+
+Source: `src/daemon/resource_limits.zig`, parsing at `src/daemon/config_format.zig` (`parseResources`), cross-checks at `src/daemon/config_boot.zig`.
+
+Every key defaults to unset (`0`), so a config without `[resources]` behaves exactly as before. Unknown keys, wrong types, out-of-range values and limits that contradict `[limits]` or `[mesh]` fail closed at load. `--check-config` prints one `config resources:` line for each value it enforces, and a `config WARNING:` line for each value it accepts but does not enforce.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `memory_budget_bytes` | integer | `0` (off) | `1 MiB..2^50` | Total bytes client admission may commit. Each shard admits its equal share. Mesh links and Helix-adopted clients are exempt. Refusals count in `onyx_resource_budget_refusals_total`. |
+| `per_client_memory_bytes` | integer | `0` (derived) | `1024..1 GiB` | Committed bytes per client for budget admission. `0` derives it from the class SendQ/RecvQ ceilings and the fixed connection record. |
+| `cpu_max_shards` | integer | `0` | `1..max_shards` | Upper bound on `[limits].num_shards`. The host CPU count is not checked. |
+| `net_ingress_bytes_per_sec` | integer | `0` | `1..2^40` | Accepted but not enforced or estimated by this build; `--check-config` warns. |
+| `net_egress_bytes_per_sec` | integer | `0` | `1..2^40` | Bounds capacity estimates only; this build does not rate-limit egress. |
+| `net_max_s2s_peers` | integer | `0` (unlimited) | `1..65535` | Cap on the number of `[mesh].connect` peers. |
+| `fd_reserve` | integer | `64` | `0..65535` | File descriptors held back from the client count for listeners, logs, stores and mesh links. |
+
+`[resources.basis]` names the measurement a capacity estimate extrapolates from, for example a `tools/bench_live.py` run. It is all-or-nothing: `name`, `harness` and `revision` (text), plus `measured_clients` (`1..1000000`), `rss_per_client_bytes` (`1..1 GiB`) and `egress_bytes_per_sec_per_client` (`1..1 GiB`). Without a basis the daemon gives no estimate. An estimate beyond twice the measured client count is flagged as an extrapolation. Basis text is never printed.
+
+## `[quota]`
+
+Source: `src/daemon/workload_quota.zig`, parsing at `src/daemon/config_format.zig` (`parseQuota`), cross-checks at `src/daemon/config_boot.zig` (`workloadQuotaError`).
+
+A per-shard admission governor with three work classes: new client admission, session recovery (RESUME and reclaim token checks), and mesh recovery (redials, inbound S2S accept and AKE). It holds back a recovery reserve, so a client reconnect storm cannot take the slots that mesh and session recovery need. Under pressure, the client admission share shrinks toward its floor and grows back when pressure clears. Values not set are derived from `[limits].max_clients`. On a very small table the governor stays off, and `--check-config` warns when that happens.
+
+| Key | Type | Valid range | Meaning |
+|---|---|---|---|
+| `enabled` | bool | — | `false` turns the governor off on every shard. Setting any other key together with `false` is refused. |
+| `recovery_reserve_slots` | integer | `1..2048`, below `max_clients` | Slots client admission can never use. |
+| `mesh_reserve_slots` | integer | `1..2048`, below `recovery_reserve_slots` | Part of the reserve that only mesh recovery may use. |
+| `admission_floor_slots` | integer | `1..2048`, at most `max_clients - recovery_reserve_slots` | Lowest client admission share under pressure. |
+| `max_recovery_inflight_per_peer` | integer | `1..2048` | In-flight recovery units for one peer, so a flapping peer cannot take every unit. |
+| `admission_rate_per_sec`, `admission_burst` | integer | `1..2^24`; burst at least `9` | Client admission token bucket. |
+| `session_recovery_rate_per_sec`, `session_recovery_burst` | integer | `1..2^24` | Session recovery token bucket. |
+| `session_recovery_peer_rate_per_sec`, `session_recovery_peer_burst` | integer | `1..2^24`, below the class value | Per-peer session recovery bucket. |
+| `mesh_recovery_rate_per_sec`, `mesh_recovery_burst` | integer | `1..2^24` | Mesh recovery token bucket. |
+| `mesh_recovery_peer_rate_per_sec`, `mesh_recovery_peer_burst` | integer | `1..2^24`, below the class value | Per-peer mesh recovery bucket. |
+
+The governor never exceeds a capacity of 2048 per shard. The S2S handshake timeout (30 s) has no TOML key in this release.
+
 ## `[reputation]`
 
 Source: struct at `src/daemon/config_format.zig`, parsing at `src/daemon/config_format.zig`, mapping at `src/daemon/config_boot.zig`.

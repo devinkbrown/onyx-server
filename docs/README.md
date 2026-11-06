@@ -1,7 +1,7 @@
 # Onyx Server documentation
 
 Use the task index below to reach the current contract. The source manifest is
-**0.9.0**; the accepted November 3 deployment and its exact artifact/service
+**0.10.0**; the accepted November 6 deployment and its exact artifact/service
 identity live in [production status](ops/onyx-server-paths.md). Source, running
 image, public release tag and proposed work are separate facts.
 
@@ -16,7 +16,7 @@ image, public release tag and proposed work are separate facts.
 | Configure accounts, history or media | [Feature index](reference/features.md) | [Account commands](reference/commands/accounts-services.md), [messaging](reference/commands/messaging.md), [media](architecture/03-media.md) |
 | Develop or review a change | [Development guide](development.md) | [Source map](architecture/source-modules.md), [testing](guide/testing.md), [contributing](../CONTRIBUTING.md) |
 | Understand architecture and invariants | [Architecture overview](architecture/00-overview.md) | [Mesh security](architecture/mesh-security.md), [credentials](reference/credential-domains.md), [Helix](architecture/04-upgrade-wasm.md) |
-| Package or verify a release | [Packaging](../packaging/README.md) | [Runbook](RUNBOOK.md), [release verification](audit/release-and-test-speed-2026-11-03.md) |
+| Package or verify a release | [Packaging](../packaging/README.md) | [Runbook](RUNBOOK.md), [release verification](audit/release-0.10.0-2026-11-06.md) |
 | Maintain these documents | [Maintenance rules](MAINTENANCE.md) | `python3 -B tools/check_docs.py` |
 
 ## Public contracts
@@ -46,8 +46,9 @@ Ringlane and the other subsystem names to source.
 
 Read [NEWS](../NEWS.md) for changes and
 [production status](ops/onyx-server-paths.md) for the accepted running fleet.
-The [latest release/test-speed report](audit/release-and-test-speed-2026-11-03.md)
-records counts, timings, reproduction and acceptance limits. Native platform
+The [latest release record](audit/release-0.10.0-2026-11-06.md)
+records counts, reproduction, deployment and acceptance limits; the
+[2026-11-03 report](audit/release-and-test-speed-2026-11-03.md) keeps the test-speed measurements. Native platform
 claims require their own evidence; a compiler pass is not a running-system test.
 
 Dated [audits](audit/README.md), [developer records](dev/README.md), and old

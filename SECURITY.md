@@ -50,7 +50,7 @@ particular vulnerability class is covered. Historical coverage planning lives in
 ## Supported versions
 
 Onyx Server is developed on a rolling basis; fixes land on `main`. The source
-release line is **0.9.0** (`build.zig.zon`). A source version, a public release tag
+release line is **0.10.0** (`build.zig.zon`). A source version, a public release tag
 and a deployed artifact are separate facts. Include the exact affected revision
 when reporting an issue or assessing whether a fix is present.
 
