@@ -2649,7 +2649,7 @@ pub const Config = struct {
     /// Runtime draft/search inverted-index limits. Configurable via
     /// `[history.search]`.
     search_index_config: search_index_mod.SearchIndex.Config = .{},
-    /// Runtime Koshi content-filter limits. Configurable via `[filter]`.
+    /// Runtime content-filter limits. Configurable via `[filter]`.
     content_filter_config: content_filter_mod.Config = .{},
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not
@@ -6309,7 +6309,7 @@ pub const LinuxServer = struct {
     /// under this mutex instead of traversing another reactor's mutable SlotMap
     /// or borrowing link memory.
     mesh_peer_identity_mu: std.atomic.Mutex = .unlocked,
-    /// Koshi content filter: oper-curated patterns that block matching messages.
+    /// Content filter: oper-curated patterns that block matching messages.
     content_filter: content_filter_mod.ContentFilter,
     /// Per-channel media rooms (Onyx Server media SFU control plane): who is in each call.
     media_rooms: media_room.MediaRooms,
@@ -35190,10 +35190,10 @@ pub const LinuxServer = struct {
         };
     }
 
-    fn snapshotKoshi(self: *LinuxServer) void {
+    fn snapshotContentFilter(self: *LinuxServer) void {
         const svc = self.account_services orelse return;
-        abuse_durable.replaceKoshi(svc.store, &self.content_filter) catch |err| {
-            srvLog("onyx-server: koshi durable snapshot failed ({s})\n", .{@errorName(err)});
+        abuse_durable.replaceContentFilter(svc.store, &self.content_filter) catch |err| {
+            srvLog("onyx-server: content filter durable snapshot failed ({s})\n", .{@errorName(err)});
         };
     }
 
@@ -35226,8 +35226,8 @@ pub const LinuxServer = struct {
         } else |err| {
             srvLog("onyx-server: spamtrap durable restore failed closed ({s})\n", .{@errorName(err)});
         }
-        abuse_durable.restoreKoshi(svc.store, &self.content_filter) catch |err| {
-            srvLog("onyx-server: koshi durable restore failed closed ({s})\n", .{@errorName(err)});
+        abuse_durable.restoreContentFilter(svc.store, &self.content_filter) catch |err| {
+            srvLog("onyx-server: content filter durable restore failed closed ({s})\n", .{@errorName(err)});
         };
         abuse_durable.restoreReputation(svc.store, &self.reputation) catch |err| {
             srvLog("onyx-server: reputation durable restore failed closed ({s})\n", .{@errorName(err)});
@@ -69474,7 +69474,7 @@ pub const LinuxServer = struct {
         try self.noticeTo(conn, note);
     }
 
-    /// `FILTER ADD|DEL|LIST [pattern]` — oper-only Koshi content-filter control.
+    /// `FILTER ADD|DEL|LIST [pattern]` — oper-only content-filter control.
     /// ADD/DEL manage case-insensitive substring patterns; LIST reports them.
     /// Matching messages from non-opers are blocked in the message path.
     pub fn handleFilter(self: *LinuxServer, conn: *ConnState, parsed: *const irc_line.LineView) !void {
@@ -69515,7 +69515,7 @@ pub const LinuxServer = struct {
                 policy_snap = null;
             }
             _ = self.recordOperAudit(conn.session.displayName(), .other, pattern, "filter add");
-            self.snapshotKoshi();
+            self.snapshotContentFilter();
             try self.noticeTo(conn, "FILTER: pattern added");
         } else if (std.ascii.eqlIgnoreCase(sub, "DEL")) {
             var policy_snap: ?PolicyUndo = self.snapshotFilter() catch null;
@@ -69530,7 +69530,7 @@ pub const LinuxServer = struct {
                 policy_snap = null;
             }
             _ = self.recordOperAudit(conn.session.displayName(), .other, pattern, "filter del");
-            self.snapshotKoshi();
+            self.snapshotContentFilter();
             try self.noticeTo(conn, "FILTER: pattern removed");
         } else {
             try self.failReply(conn, "FILTER", "INVALID_SUBCOMMAND", "Use ADD, DEL, or LIST");
@@ -75420,7 +75420,7 @@ pub const LinuxServer = struct {
     }
 
     /// Body-dependent veto gates shared by PRIVMSG/NOTICE and reassembled
-    /// draft/multiline: the message_pre_deliver hook, utf8only, and the Koshi
+    /// draft/multiline: the message_pre_deliver hook, utf8only, and the
     /// content filter. Returns true if delivery may proceed; on a drop it emits
     /// the appropriate FAIL (PRIVMSG) or stays silent (NOTICE) and returns
     /// false. Callers apply gag/shun and parameter checks beforehand.
@@ -75479,10 +75479,10 @@ pub const LinuxServer = struct {
             );
             return false;
         }
-        // Koshi content filter: block messages matching an oper-curated pattern.
+        // Content filter: block messages matching an oper-curated pattern.
         // Opers are exempt; NOTICE drops silently (no auto-reply), PRIVMSG FAILs.
         // Match both the raw text AND a formatting-stripped copy so a filtered
-        // word can't be smuggled past Koshi via embedded mIRC color/format codes.
+        // word can't be smuggled past the content filter via embedded mIRC color/format codes.
         // The strip buffer matches the largest deliverable body so an oversized
         // colour-formatted message still gets a full strip (not a silent skip
         // that would leave only the raw-text match — CWE-693 policy bypass).
@@ -93787,7 +93787,7 @@ test "DST GAP-D4 oper ABUSE explains live throttle and abuse rows survive the dr
     const next_note = std.fmt.bufPrint(&next_score, "account d4acct score={d}", .{account_score}) catch unreachable;
     try std.testing.expect(std.mem.indexOf(u8, why_new, next_note) != null);
 
-    std.debug.print("GAP-D4 branch=oper ABUSE explains throttle shun dnsbl reputation from RAM; shun spamtrap koshi reputation and account score reload after the process image is dropped; account score survives reconnect and the new connection guard starts full\n", .{});
+    std.debug.print("GAP-D4 branch=oper ABUSE explains throttle shun dnsbl reputation from RAM; shun spamtrap content-filter reputation and account score reload after the process image is dropped; account score survives reconnect and the new connection guard starts full\n", .{});
 
     first.deinit();
     alloc.destroy(first);
@@ -93812,7 +93812,7 @@ test "DST GAP-D4 oper ABUSE explains live throttle and abuse rows survive the dr
     try std.testing.expectEqual(@as(u32, 0), second.account_abuse.score("d4oper"));
 }
 
-test "GAP-D4 same-image USR2 keeps shun spamtrap Koshi reputation and the account score" {
+test "GAP-D4 same-image USR2 keeps shun spamtrap content-filter reputation and the account score" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     defer current_reactor = null;
@@ -93938,7 +93938,7 @@ test "GAP-D4 same-image USR2 keeps shun spamtrap Koshi reputation and the accoun
     try second.processLiveLine(back_id, back, "NOTICE d4oper :fresh\r\n");
     try std.testing.expectEqual(flood_guard.Decision.allow, back.last_flood);
     try std.testing.expectEqual(account_score, second.account_abuse.score("d4acct"));
-    std.debug.print("GAP-D4 branch=same-image USR2 kept shun spamtrap Koshi reputation and account score; the new connection guard started full\n", .{});
+    std.debug.print("GAP-D4 branch=same-image USR2 kept shun spamtrap content-filter reputation and account score; the new connection guard started full\n", .{});
 }
 
 test "UPGRADE GAP-D5 restart keeps SCRAM and CertFP and invalidates recovery tokens" {

@@ -327,8 +327,8 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.bouncer.memo_max_accounts = try uintField(doc, "bouncer.memo_max_accounts", cfg.bouncer.memo_max_accounts, 1024, 1048576);
 
     // [filter]
-    cfg.filter.koshi_max_patterns = try uintField(doc, "filter.koshi_max_patterns", cfg.filter.koshi_max_patterns, 16, 4096);
-    cfg.filter.koshi_pattern_max_len = try uintField(doc, "filter.koshi_pattern_max_len", cfg.filter.koshi_pattern_max_len, 16, 1024);
+    cfg.filter.max_patterns = try uintField(doc, "filter.max_patterns", cfg.filter.max_patterns, 16, 4096);
+    cfg.filter.max_pattern_len = try uintField(doc, "filter.max_pattern_len", cfg.filter.max_pattern_len, 16, 1024);
 
     // [storage]
     cfg.storage.max_record_bytes = @intCast(try uintField(doc, "storage.max_record_bytes", cfg.storage.max_record_bytes, 65536, 268435456));

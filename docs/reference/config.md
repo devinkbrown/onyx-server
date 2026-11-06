@@ -569,14 +569,14 @@ Per-account bouncer/offline-message retention limits. These values construct the
 
 ## `[filter]`
 
-Source: struct `Filter` in `src/daemon/config_format.zig`, parsing in `parseToml`, mapping in `src/daemon/config_boot.zig`, live Koshi content-filter construction in `src/daemon/server.zig`.
+Source: struct `Filter` in `src/daemon/config_format.zig`, parsing in `parseToml`, mapping in `src/daemon/config_boot.zig`, live content-filter construction in `src/daemon/server.zig`.
 
-Oper-managed Koshi moderation filter sizing. These values construct the live content-filter store at daemon boot.
+Oper-managed content filter sizing. These values construct the live content-filter store at daemon boot. The retired key names `koshi_max_patterns` and `koshi_pattern_max_len` are refused with an error naming the replacement.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `koshi_max_patterns` | integer | `256` | `16..4096` | Max oper-curated Koshi filter patterns. |
-| `koshi_pattern_max_len` | integer | `256` | `16..1024` | Max length of a single Koshi pattern. |
+| `max_patterns` | integer | `256` | `16..4096` | Max oper-curated content filter patterns. |
+| `max_pattern_len` | integer | `256` | `16..1024` | Max length of a single content filter pattern. |
 
 ## `[storage]`
 

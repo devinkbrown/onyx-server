@@ -11,6 +11,23 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.10.1 — content filter rename (2026-11-06)
+
+- **Koshi is now the content filter.** The `[filter]` keys are
+  `max_patterns` and `max_pattern_len`. The retired `koshi_max_patterns` and
+  `koshi_pattern_max_len` are refused at load, with an error naming the
+  replacement, instead of being silently ignored. Durable filter patterns keep
+  their on-disk record prefix, so patterns saved by earlier releases restore.
+- **Live config cleanup.** Both production configs were also using two other
+  retired names, `[mesh.sazanami]` and `[bouncer] tegami_*`. The daemon was
+  silently ignoring them. They are now `[mesh.ripple]` and `memo_*`, with
+  unchanged values that equal the defaults, so behaviour is the same.
+- **Features enabled on both nodes:** `[trace] file` (fault dump of the flight
+  recorder), `[limits] nick_delay = "60s"` (anti nick-camping), and
+  consent-gated `[media]` recording with a private `recording_dir`.
+
+---
+
 ## 0.10.0 — roadmap-wave fleet release (2026-11-06)
 
 Both nodes run **`0.10.0+ef2230805c16`**, from clean commit `ef223080`. The

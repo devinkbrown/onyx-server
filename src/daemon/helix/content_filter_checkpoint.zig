@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Exact Helix custody for ordered Koshi patterns and matcher availability.
+//! Exact Helix custody for ordered content filter patterns and matcher availability.
 
 const std = @import("std");
 const content_filter = @import("../content_filter.zig");

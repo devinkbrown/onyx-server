@@ -201,7 +201,7 @@ test "parseToml: [sessions] registry and composite issuance parse with safe defa
     , .{}));
 }
 
-test "parseToml: [filter] koshi limits project with bounded policy ranges" {
+test "parseToml: [filter] content filter limits project with bounded policy ranges" {
     const allocator = testing.allocator;
     const text =
         \\[node]
@@ -209,19 +209,19 @@ test "parseToml: [filter] koshi limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[filter]
-        \\koshi_max_patterns = 512
-        \\koshi_pattern_max_len = 128
+        \\max_patterns = 512
+        \\max_pattern_len = 128
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
     defer cfg.deinit(allocator);
-    try testing.expectEqual(@as(u64, 512), cfg.filter.koshi_max_patterns);
-    try testing.expectEqual(@as(u64, 128), cfg.filter.koshi_pattern_max_len);
+    try testing.expectEqual(@as(u64, 512), cfg.filter.max_patterns);
+    try testing.expectEqual(@as(u64, 128), cfg.filter.max_pattern_len);
 
     var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
     defer omitted.deinit(allocator);
-    try testing.expectEqual(@as(u64, content_filter_mod.default_max_patterns), omitted.filter.koshi_max_patterns);
-    try testing.expectEqual(@as(u64, content_filter_mod.default_max_pattern_len), omitted.filter.koshi_pattern_max_len);
+    try testing.expectEqual(@as(u64, content_filter_mod.default_max_patterns), omitted.filter.max_patterns);
+    try testing.expectEqual(@as(u64, content_filter_mod.default_max_pattern_len), omitted.filter.max_pattern_len);
 
     try testing.expectError(error.ParseError, parseToml(allocator,
         \\[node]
@@ -229,7 +229,7 @@ test "parseToml: [filter] koshi limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[filter]
-        \\koshi_max_patterns = 15
+        \\max_patterns = 15
         \\
     , .{}));
     try testing.expectError(error.ParseError, parseToml(allocator,
@@ -238,7 +238,7 @@ test "parseToml: [filter] koshi limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[filter]
-        \\koshi_pattern_max_len = 1025
+        \\max_pattern_len = 1025
         \\
     , .{}));
 }

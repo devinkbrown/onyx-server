@@ -293,7 +293,7 @@ test "full upgrade round-trip preserves state and descriptors" {
             .fd_index = 2,
             .caps = (@as(u128, 1) << 127),
             .flags = .{ .registered = true, .is_tls = false, .ircx = true },
-            .nick = "Koshi",
+            .nick = "Sieve",
             .user = "ident2",
             .realname = "Spine",
             .host = "node2.onyx",

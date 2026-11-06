@@ -6,7 +6,7 @@
 //! This module is intentionally pure: it stores channel-local patterns, parses
 //! real server commands, and returns actions for the daemon to enforce with
 //! normal IRC commands/numerics. It does not model ChanServ/NickServ/OperServ
-//! pseudo-clients and it is separate from the global Koshi content filter.
+//! pseudo-clients and it is separate from the global content filter.
 const std = @import("std");
 
 pub const hard_max_channel_len: usize = 256;

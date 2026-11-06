@@ -494,7 +494,7 @@ pub const Config = struct {
     /// Runtime draft/search inverted-index limits. Configurable via
     /// `[history.search]`.
     search_index_config: search_index_mod.SearchIndex.Config = .{},
-    /// Runtime Koshi content-filter limits. Configurable via `[filter]`.
+    /// Runtime content-filter limits. Configurable via `[filter]`.
     content_filter_config: content_filter_mod.Config = .{},
     features: RingFeatureSet = RingFeatureSet.baseline,
     /// Optional SASL PLAIN verifier. Injected (not owned) so the Server does not

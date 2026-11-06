@@ -398,8 +398,8 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
         .max_accounts = @intCast(cfg.bouncer.memo_max_accounts),
     };
     out.content_filter_config = .{
-        .max_patterns = @intCast(cfg.filter.koshi_max_patterns),
-        .max_pattern_len = @intCast(cfg.filter.koshi_pattern_max_len),
+        .max_patterns = @intCast(cfg.filter.max_patterns),
+        .max_pattern_len = @intCast(cfg.filter.max_pattern_len),
     };
     if (cfg.node.id != 0) out.node_id = cfg.node.id;
     if (cfg.node.public_key) |v| out.node_public_key = v;
@@ -1466,8 +1466,8 @@ test "config text overlays the server config" {
         \\memo_mailbox_depth = 16
         \\memo_max_accounts = 4096
         \\[filter]
-        \\koshi_max_patterns = 512
-        \\koshi_pattern_max_len = 128
+        \\max_patterns = 512
+        \\max_pattern_len = 128
         \\[backup]
         \\dir = "/var/backups/onyx"
         \\interval = "6h"

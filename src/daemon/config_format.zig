@@ -671,10 +671,10 @@ pub const Config = struct {
 
     /// `[filter]` — oper-managed moderation filter sizing.
     pub const Filter = struct {
-        /// Max oper-curated Koshi filter patterns.
-        koshi_max_patterns: u64 = content_filter_mod.default_max_patterns,
-        /// Max length of a single Koshi pattern (bytes).
-        koshi_pattern_max_len: u64 = content_filter_mod.default_max_pattern_len,
+        /// Max oper-curated content filter patterns.
+        max_patterns: u64 = content_filter_mod.default_max_patterns,
+        /// Max length of a single content filter pattern (bytes).
+        max_pattern_len: u64 = content_filter_mod.default_max_pattern_len,
     };
 
     /// Discord-compatible incoming webhook endpoint (Gateway interop). OFF by
@@ -1145,6 +1145,10 @@ pub const TomlError = toml.ParseError || error{
     @"listen.trusted_proxies",
     /// `[quota]`: unknown key, wrong type, or a value outside its range.
     quota,
+    /// Retired `[filter]` key names. They are refused rather than ignored so
+    /// a stale config cannot silently fall back to defaults.
+    @"filter.koshi_max_patterns was renamed to filter.max_patterns",
+    @"filter.koshi_pattern_max_len was renamed to filter.max_pattern_len",
     cloak,
     @"cloak.secret",
     @"cloak.previous_secret",
@@ -1510,8 +1514,10 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.bouncer.memo_max_accounts = try uintField(doc, "bouncer.memo_max_accounts", cfg.bouncer.memo_max_accounts, 1024, 1048576);
 
     // [filter]
-    cfg.filter.koshi_max_patterns = try uintField(doc, "filter.koshi_max_patterns", cfg.filter.koshi_max_patterns, 16, 4096);
-    cfg.filter.koshi_pattern_max_len = try uintField(doc, "filter.koshi_pattern_max_len", cfg.filter.koshi_pattern_max_len, 16, 1024);
+    if (doc.get("filter.koshi_max_patterns") != null) return error.@"filter.koshi_max_patterns was renamed to filter.max_patterns";
+    if (doc.get("filter.koshi_pattern_max_len") != null) return error.@"filter.koshi_pattern_max_len was renamed to filter.max_pattern_len";
+    cfg.filter.max_patterns = try uintField(doc, "filter.max_patterns", cfg.filter.max_patterns, 16, 4096);
+    cfg.filter.max_pattern_len = try uintField(doc, "filter.max_pattern_len", cfg.filter.max_pattern_len, 16, 1024);
 
     // [storage]
     cfg.storage.max_record_bytes = @intCast(try uintField(doc, "storage.max_record_bytes", cfg.storage.max_record_bytes, 65536, 268435456));
@@ -3778,7 +3784,7 @@ test "parseToml: [sessions] registry and composite issuance parse with safe defa
     , .{}));
 }
 
-test "parseToml: [filter] koshi limits project with bounded policy ranges" {
+test "parseToml: [filter] content filter limits project with bounded policy ranges" {
     const allocator = testing.allocator;
     const text =
         \\[node]
@@ -3786,19 +3792,19 @@ test "parseToml: [filter] koshi limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[filter]
-        \\koshi_max_patterns = 512
-        \\koshi_pattern_max_len = 128
+        \\max_patterns = 512
+        \\max_pattern_len = 128
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
     defer cfg.deinit(allocator);
-    try testing.expectEqual(@as(u64, 512), cfg.filter.koshi_max_patterns);
-    try testing.expectEqual(@as(u64, 128), cfg.filter.koshi_pattern_max_len);
+    try testing.expectEqual(@as(u64, 512), cfg.filter.max_patterns);
+    try testing.expectEqual(@as(u64, 128), cfg.filter.max_pattern_len);
 
     var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
     defer omitted.deinit(allocator);
-    try testing.expectEqual(@as(u64, content_filter_mod.default_max_patterns), omitted.filter.koshi_max_patterns);
-    try testing.expectEqual(@as(u64, content_filter_mod.default_max_pattern_len), omitted.filter.koshi_pattern_max_len);
+    try testing.expectEqual(@as(u64, content_filter_mod.default_max_patterns), omitted.filter.max_patterns);
+    try testing.expectEqual(@as(u64, content_filter_mod.default_max_pattern_len), omitted.filter.max_pattern_len);
 
     try testing.expectError(error.ParseError, parseToml(allocator,
         \\[node]
@@ -3806,7 +3812,7 @@ test "parseToml: [filter] koshi limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[filter]
-        \\koshi_max_patterns = 15
+        \\max_patterns = 15
         \\
     , .{}));
     try testing.expectError(error.ParseError, parseToml(allocator,
@@ -3815,7 +3821,27 @@ test "parseToml: [filter] koshi limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[filter]
-        \\koshi_pattern_max_len = 1025
+        \\max_pattern_len = 1025
+        \\
+    , .{}));
+
+    // The retired Koshi key names are refused, never silently ignored.
+    try testing.expectError(error.@"filter.koshi_max_patterns was renamed to filter.max_patterns", parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[filter]
+        \\koshi_max_patterns = 256
+        \\
+    , .{}));
+    try testing.expectError(error.@"filter.koshi_pattern_max_len was renamed to filter.max_pattern_len", parseToml(allocator,
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[filter]
+        \\koshi_pattern_max_len = 256
         \\
     , .{}));
 }

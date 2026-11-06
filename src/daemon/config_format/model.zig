@@ -633,10 +633,10 @@ pub const Config = struct {
 
     /// `[filter]` — oper-managed moderation filter sizing.
     pub const Filter = struct {
-        /// Max oper-curated Koshi filter patterns.
-        koshi_max_patterns: u64 = content_filter_mod.default_max_patterns,
-        /// Max length of a single Koshi pattern (bytes).
-        koshi_pattern_max_len: u64 = content_filter_mod.default_max_pattern_len,
+        /// Max oper-curated content filter patterns.
+        max_patterns: u64 = content_filter_mod.default_max_patterns,
+        /// Max length of a single content filter pattern (bytes).
+        max_pattern_len: u64 = content_filter_mod.default_max_pattern_len,
     };
 
     /// Discord-compatible incoming webhook endpoint (Gateway interop). OFF by

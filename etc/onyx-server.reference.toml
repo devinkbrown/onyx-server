@@ -626,10 +626,10 @@ memo_mailbox_depth = 64       # offline messages per account (8..1024)
 memo_max_accounts = 65536     # accounts with offline mailboxes (1024..1048576)
 
 
-# --- [filter] — oper-managed Koshi moderation filter sizing ------------------
+# --- [filter] — oper-managed content filter sizing ---------------------------
 [filter]
-koshi_max_patterns = 256        # oper-curated filter patterns (16..4096)
-koshi_pattern_max_len = 256     # bytes per filter pattern (16..1024)
+max_patterns = 256              # oper-curated filter patterns (16..4096)
+max_pattern_len = 256           # bytes per filter pattern (16..1024)
 
 
 # --- [storage] — OroStore WAL/snapshot limits --------------------------------

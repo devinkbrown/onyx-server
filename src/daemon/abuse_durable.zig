@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shun, spamtrap, Koshi, reputation, and per-account abuse rows in the
+//! Shun, spamtrap, content filter, reputation, and per-account abuse rows in the
 //! OroStore `bans` family. Each prefix has its own generation, published
 //! after the records, so one snapshot cannot clobber another namespace
 //! (`gag:`, `ward:`, `saccess:` stay untouched).
@@ -28,7 +28,11 @@ const Meta = struct {
 
 const shun_meta = "shun:meta";
 const spam_meta = "spam:meta";
-const koshi_meta = "koshi:meta";
+// The content filter's durable rows keep their original on-disk key prefix
+// ("koshi") so patterns persisted by earlier releases still restore. It is a
+// frozen storage label, not a product name.
+const content_filter_meta = "koshi:meta";
+const content_filter_record_prefix = "koshi";
 const rep_meta = "rep:meta";
 const acct_meta = "acct:meta";
 
@@ -190,21 +194,21 @@ pub fn restoreSpam(store: *OroStore, traps: anytype) !void {
     staged.deinit();
 }
 
-pub fn replaceKoshi(store: *OroStore, filter: *const content_filter_mod.ContentFilter) !void {
-    const generation = readMeta(store, koshi_meta).generation + 1;
+pub fn replaceContentFilter(store: *OroStore, filter: *const content_filter_mod.ContentFilter) !void {
+    const generation = readMeta(store, content_filter_meta).generation + 1;
     for (filter.list(), 0..) |pattern, seq| {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(store.allocator);
         try body.append(store.allocator, 1);
         try appendStr(&body, store.allocator, pattern);
         var key_buf: [64]u8 = undefined;
-        try store.put(.bans, recordKey("koshi", generation, @intCast(seq), &key_buf), body.items);
+        try store.put(.bans, recordKey(content_filter_record_prefix, generation, @intCast(seq), &key_buf), body.items);
     }
-    try writeMeta(store, koshi_meta, .{ .generation = generation, .count = filter.list().len });
+    try writeMeta(store, content_filter_meta, .{ .generation = generation, .count = filter.list().len });
 }
 
-pub fn restoreKoshi(store: *OroStore, filter: *content_filter_mod.ContentFilter) !void {
-    const meta = readMeta(store, koshi_meta);
+pub fn restoreContentFilter(store: *OroStore, filter: *content_filter_mod.ContentFilter) !void {
+    const meta = readMeta(store, content_filter_meta);
     if (meta.generation == 0) return;
     while (filter.list().len > 0) {
         const last = filter.list()[filter.list().len - 1];
@@ -213,7 +217,7 @@ pub fn restoreKoshi(store: *OroStore, filter: *content_filter_mod.ContentFilter)
     var seq: u64 = 0;
     while (seq < meta.count) : (seq += 1) {
         var key_buf: [64]u8 = undefined;
-        const raw = store.get(.bans, recordKey("koshi", meta.generation, seq, &key_buf)) orelse return error.MissingRecord;
+        const raw = store.get(.bans, recordKey(content_filter_record_prefix, meta.generation, seq, &key_buf)) orelse return error.MissingRecord;
         var cur = Cursor{ .raw = raw };
         if (try cur.u8b() != 1) return error.BadRecord;
         const pattern = try cur.str();

@@ -288,7 +288,7 @@ a trailing description.
 
 | Token | Builder / emitter | Shape | Current uses | Evidence |
 | --- | --- | --- | --- | --- |
-| `FAIL` | `standard_replies.fail`, `standard_replies_emit.fail`, and `LinuxServer.failReply`. | `FAIL <command> <code> [context...] :<description>` | CHATHISTORY parse failures, invalid UTF-8, Koshi content filter, multiline failures, media/service failures. | `src/proto/standard_replies.zig`, `src/proto/standard_replies_emit.zig`, `src/daemon/server.zig` |
+| `FAIL` | `standard_replies.fail`, `standard_replies_emit.fail`, and `LinuxServer.failReply`. | `FAIL <command> <code> [context...] :<description>` | CHATHISTORY parse failures, invalid UTF-8, content filter, multiline failures, media/service failures. | `src/proto/standard_replies.zig`, `src/proto/standard_replies_emit.zig`, `src/daemon/server.zig` |
 | `WARN` | `standard_replies.warn` / `standard_replies_emit.warn`. | `WARN <command> <code> [context...] :<description>` | Cataloged builder support; no live `server.zig` emission found in current source. | `src/proto/standard_replies.zig`, `src/proto/standard_replies_emit.zig` |
 
 The shared standard-replies catalog currently contains these code tokens:

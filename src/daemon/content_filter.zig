@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Onyx Server content filter (Koshi) — operator-curated message screening.
+//! Onyx Server content filter — operator-curated message screening.
 //!
 //! An Onyx Server-native moderation primitive (not a clone of any other daemon's
 //! "spamfilter"): a small set of oper-curated patterns is matched against
@@ -18,7 +18,7 @@ pub const Error = std.mem.Allocator.Error;
 pub const default_max_patterns: usize = 256;
 pub const default_max_pattern_len: usize = 256;
 
-/// Runtime-tunable Koshi filter limits. Defaults preserve the historical
+/// Runtime-tunable content filter limits. Defaults preserve the historical
 /// hardcoded behaviour; the orchestrator overlays the `[filter]` TOML section
 /// via `Config.applyToml` before constructing a `ContentFilter`.
 pub const Config = struct {
@@ -30,10 +30,10 @@ pub const Config = struct {
     /// Overlay `[filter]` keys from a parsed TOML document onto `cfg`. Missing
     /// keys leave the current value untouched. Pure: no I/O, never fails.
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
-        if (doc.getUint("filter.koshi_max_patterns")) |v| {
+        if (doc.getUint("filter.max_patterns")) |v| {
             if (v >= 1) cfg.max_patterns = @intCast(v);
         }
-        if (doc.getUint("filter.koshi_pattern_max_len")) |v| {
+        if (doc.getUint("filter.max_pattern_len")) |v| {
             if (v >= 1) cfg.max_pattern_len = @intCast(v);
         }
     }
@@ -194,10 +194,10 @@ test "Config defaults preserve historical limits" {
     try testing.expectEqual(default_max_pattern_len, cfg.max_pattern_len);
 }
 
-test "Config.applyToml overlays [filter] koshi keys" {
+test "Config.applyToml overlays [filter] content filter keys" {
     var doc = try toml.parse(
         testing.allocator,
-        "[filter]\nkoshi_max_patterns = 16\nkoshi_pattern_max_len = 32\n",
+        "[filter]\nmax_patterns = 16\nmax_pattern_len = 32\n",
     );
     defer doc.deinit(testing.allocator);
 
