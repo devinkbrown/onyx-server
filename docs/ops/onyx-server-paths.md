@@ -26,12 +26,23 @@ substitutes for this table.
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.10.0+ef2230805c16` | `0.10.0+ef2230805c16` |
-| Executable SHA-256 | `b9cee11f55b563ebb226fa0a470584d2772f5a3cfe7b922abd94e17d0cda082f` | same |
-| Process ID at acceptance | `7907` | `2964471` |
+| Running image | `0.10.1+0200fe471693` | `0.10.1+0200fe471693` |
+| Executable SHA-256 | `d9fb312e191da46b203337b6ab9cbd1e80b082a9172ff33198f56da27d2592fa` | same |
+| Process ID at acceptance | `8616` | `2967193` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
+
+0.10.1 (`0200fe47`) followed the same procedure the same day. It renames the
+Koshi content filter keys to `[filter] max_patterns` / `max_pattern_len` and
+refuses the retired names. Both live configs were updated with it. The same
+rollout renamed the silently ignored `[mesh.sazanami]` and `[bouncer] tegami_*`
+sections to `[mesh.ripple]` and `memo_*`, and enabled `[trace] file`,
+`[limits] nick_delay = "60s"` and consent-gated `[media]` recording. Pre-change
+configs are kept as `onyx-server.local.toml.bak-0.10.0-20261106` and
+`.bak-0.10.0-koshi`, and the 0.10.0 binary as `onyx-server.0.10.0-ef223080`.
+Both nodes passed `--check-config`, the mesh health smoke and the cross-node
+chat smoke after their cold restarts.
 
 The artifact is built from clean source `ef223080` (static ReleaseFast
 x86_64-linux-musl) and `packaging/verify-release.sh` rebuilt it byte-for-byte.
