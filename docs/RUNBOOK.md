@@ -26,7 +26,7 @@ Onyx Server runs as a long-lived network daemon with:
 - state under `/var/lib/onyx-server` in the packaged unit;
 - ReleaseFast production binaries from `zig build release` or `zig build package`;
 - session-preserving reload via SIGUSR2/Helix where the listener set allows it
-  (on the current fleet the configured WebTransport listener blocks Helix, so
+  (on the current fleet the durable mesh presence store blocks Helix, so
   upgrades are cold restarts: `rc-service onyx-server restart` on eshmaki.me,
   `systemctl restart onyx-server.service` on ircx.us).
 
@@ -115,11 +115,15 @@ before opening the listeners.
 ## Hot Upgrade
 
 > **Current fleet (2026-11-06):** Helix reload is blocked on both production
-> nodes by the configured WebTransport listener (`[listen].webtransport = 4433`).
+> nodes by the durable mesh presence store (`mesh.presence_store_path`), which
+> has no Helix carry yet. Since 0.10.2 reload refuses before exec with
+> `durable mesh presence store (no Helix carry yet)` and the daemon keeps
+> serving; earlier builds exec'd and dropped every client. WebTransport, media
+> and kTLS no longer block Helix (NEWS 0.10.2).
 > Production upgrades there are cold restarts, one node at a time:
 > `sudo rc-service onyx-server restart` (eshmaki.me, OpenRC) and
 > `sudo systemctl restart onyx-server.service` (ircx.us). The Helix procedure
-> below applies to listener sets without that blocker. Both fleet nodes run
+> below applies to nodes without that blocker. Both fleet nodes run
 > `[tls] ktls = "txrx"`; expect the boot line
 > `kTLS TX+RX offload ACTIVE (txrx)` after restart.
 

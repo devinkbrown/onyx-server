@@ -26,12 +26,19 @@ substitutes for this table.
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.10.1+0200fe471693` | `0.10.1+0200fe471693` |
-| Executable SHA-256 | `d9fb312e191da46b203337b6ab9cbd1e80b082a9172ff33198f56da27d2592fa` | same |
-| Process ID at acceptance | `8616` | `2967193` |
+| Running image | `0.10.2+6ad83624e1a1` | `0.10.2+6ad83624e1a1` |
+| Executable SHA-256 | `f96c483ba99058ddf56c61364b2c1da28a6f893672bf34eee044f5ec6e90ec8e` | same |
+| Process ID at acceptance | `40047` | `2975020` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
+
+0.10.2 (`6ad83624`) restores Linux Helix handoff and adoption and makes reload
+refuse before exec while the durable mesh presence store is configured. Both
+nodes were cold-restarted onto it. A live `reload` on each then refused with
+`durable mesh presence store (no Helix carry yet)`, kept the same PID, and a
+held TLS client answered PING afterwards. The 0.10.1 binary is kept as
+`onyx-server.0.10.1-0200fe47`.
 
 0.10.1 (`0200fe47`) followed the same procedure the same day. It renames the
 Koshi content filter keys to `[filter] max_patterns` / `max_pattern_len` and
@@ -53,7 +60,7 @@ one node at a time (eshmaki.me first). Each restart re-established
 The previous `0.9.0+5bdd9dc55d99` binary is kept beside each live binary as
 `onyx-server.0.9.0-5bdd9dc5` for rollback. A live client reconnected after the
 restart; token resume was not exercised by a dedicated fixture for this rollout.
-Helix remains blocked by WebTransport.
+Helix is blocked by the durable mesh presence store (see NEWS 0.10.2).
 
 The 2026-11-03 `0.9.0` acceptance (durable token recovery across cold restart,
 four-client exact-event checks) is in the
