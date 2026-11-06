@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-11-03**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-11-06**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -21,30 +21,32 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-03)
+## Verified fleet baseline (2026-11-06)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.9.0+5bdd9dc55d99` | `0.9.0+5bdd9dc55d99` |
-| Executable SHA-256 | `2dcc899051a71637116bbe270bf528fdff153b26ef4f68e136458eb56490c6c0` | same |
-| Process ID at acceptance | `774` (supervisor `773`) | `2822304` |
+| Running image | `0.10.0+ef2230805c16` | `0.10.0+ef2230805c16` |
+| Executable SHA-256 | `b9cee11f55b563ebb226fa0a470584d2772f5a3cfe7b922abd94e17d0cda082f` | same |
+| Process ID at acceptance | `7907` | `2964471` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
 
-The artifact is built from clean source `5bdd9dc55d99527a9195883b392f8a7e93d90a2e`
-and reproduces byte-for-byte. Service kits include the correction in `6131c4de`.
-Local OpenRC now uses `supervise-daemon`; peer systemd uses the canonical sandbox
-with an explicit host-path/account override. Both hosts preserve `UMask=0022`
-for their public status/backup feeds; packaged defaults remain private.
+The artifact is built from clean source `ef223080` (static ReleaseFast
+x86_64-linux-musl) and `packaging/verify-release.sh` rebuilt it byte-for-byte.
+Both nodes passed `--check-config` with the new binary before a cold restart,
+one node at a time (eshmaki.me first). Each restart re-established
+`mesh S2S established (secured)`, and a CA-verified cross-node chat smoke
+(`tools/mesh_chat_smoke.py`, guest, `#root`) delivered PRIVMSG in both directions.
+The previous `0.9.0+5bdd9dc55d99` binary is kept beside each live binary as
+`onyx-server.0.9.0-5bdd9dc5` for rollback. A live client reconnected after the
+restart; token resume was not exercised by a dedicated fixture for this rollout.
+Helix remains blocked by WebTransport.
 
-Both cold restarts recovered durable account tokens issued before deployment.
-Four TLS clients then passed channel/DM exact-event checks, matching message IDs
-and timestamps, local exact attachment resume, and peer redirect followed by
-origin resume. This does not establish arbitrary-node exact attachment restore
-or continuity of old composite tokens across cold restart. Helix remains blocked
-by WebTransport. See the [release and testing audit](../audit/release-and-test-speed-2026-11-03.md).
+The 2026-11-03 `0.9.0` acceptance (durable token recovery across cold restart,
+four-client exact-event checks) is in the
+[release and testing audit](../audit/release-and-test-speed-2026-11-03.md).
 
 The original `c730d9f3` rollout's first peer candidate start disabled TLS: systemd's separate
 `RestrictSUIDSGID` filter rejected `openat2` with `ENOSYS`. The peer was restored
@@ -118,8 +120,8 @@ stderr continues to the persistent systemd journal.
 - Live SPA root: `/home/kain/onyx/out` (nginx)  
 - Deploy only via `/home/kain/onyx/deploy.sh` (builds to `dist/`, syncs to `out/`)  
 
-Source of truth for the 2026-11-03 baseline: accepted daemon source `5bdd9dc5`,
-service kit `6131c4de`, the final deployment receipt under `.zig-cache/cloak-tmp/astra-release-5bdd9dc5/`, CA-verified four-client
-acceptance and public-feed checks recorded by the [release audit](../audit/release-and-test-speed-2026-11-03.md).
+Source of truth for the 2026-11-06 baseline: accepted daemon source `ef223080`,
+service kit `6131c4de`, and the reproducible release manifest built from that commit.
+The 2026-11-03 `0.9.0` acceptance is recorded by the [release audit](../audit/release-and-test-speed-2026-11-03.md).
 Superseded deployment records are available in Git history; the table above
 is the accepted fleet baseline.
