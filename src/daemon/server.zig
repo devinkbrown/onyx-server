@@ -3410,6 +3410,10 @@ pub const ConnState = struct {
     /// Explicit abort disposition; a healthy close-after delivery still drains
     /// its admitted control and application FIFO before ordinary final teardown.
     tls_terminal_failure: bool = false,
+    /// The TLS input ended with the peer's close_notify (RFC 8446 §6.1 /
+    /// RFC 5246 §7.2.1): a graceful end of input, answered with our own
+    /// close_notify, never a fatal alert.
+    tls_peer_close_notify: bool = false,
     /// The TLS handshake on this connection completed (or it was adopted
     /// already connected). Later record faults are not handshake failures.
     tls_handshake_finished: bool = false,
@@ -10154,7 +10158,32 @@ pub const LinuxServer = struct {
     }
 
     fn captureLinuxWebTransport(self: *LinuxServer, token: @import("runtime_pause.zig").Token) !linux_wt_checkpoint.Body {
-        return self.linux_webtransport.capture(self.allocator, token, self.linuxWebTransportAcceptedSockets());
+        var body = try self.linux_webtransport.capture(self.allocator, token, self.linuxWebTransportAcceptedSockets());
+        // Carry the QUIC session-ticket keys (RFC 9001 sec. 4.5) so tickets
+        // issued before the upgrade still resume on the successor. Without a
+        // key the checkpoint stays in the rollback-compatible v2 frame.
+        if (self.linuxWebTransportOwner()) |listener| body.quic_ticket_keys = quicTicketKeysOf(listener);
+        return body;
+    }
+
+    fn quicTicketKeysOf(listener: *const managed_wt.WebTransportListener) linux_wt_checkpoint.QuicTicketKeys {
+        const current = listener.quic_ticket_key orelse return .{};
+        return .{ .current = current, .previous = listener.quic_previous_ticket_key };
+    }
+
+    /// Install carried QUIC ticket keys into the parked successor listener
+    /// before its worker is released. Strict: carried keys require resumption
+    /// to be enabled here (the same rule as the TCP ticket-key authority); an
+    /// older (v2) predecessor carries none and the fresh boot key is kept.
+    fn adoptQuicTicketKeys(listener: *managed_wt.WebTransportListener, resumption: bool, keys: linux_wt_checkpoint.QuicTicketKeys) !void {
+        const current = keys.current orelse {
+            if (keys.previous != null) return error.InvalidInheritedHandoff;
+            return;
+        };
+        if (!resumption or listener.quic_ticket_key == null) return error.InvalidInheritedHandoff;
+        if (listener.quic_ticket_key) |*fresh| std.crypto.secureZero(u8, fresh);
+        listener.quic_ticket_key = current;
+        listener.quic_previous_ticket_key = keys.previous;
     }
 
     fn validateLinuxWebTransportAcceptedJoin(self: *LinuxServer, body: *const linux_wt_checkpoint.Body) !void {
@@ -10166,6 +10195,11 @@ pub const LinuxServer = struct {
             .irc = try self.boundPort(),
             .webtransport = self.config.webtransport_port,
         }, body, tls, self.config.webtransport_quic);
+        const listener = self.linuxWebTransportOwner() orelse return error.InvalidRuntime;
+        adoptQuicTicketKeys(listener, self.config.webtransport_quic.resumption, body.quic_ticket_keys) catch |err| {
+            self.linux_webtransport.rollbackCandidate();
+            return err;
+        };
     }
 
     /// The WebTransport bridge's connected loopback socket must have exactly
@@ -10475,6 +10509,11 @@ pub const LinuxServer = struct {
                     self.releaseUnpublishedLocalGuestBinding(&slot.value, null) catch
                         @panic("unpublished guest binding custody must settle before Server destruction");
                     self.abortMultiline(&slot.value);
+                    // Terminal shutdown closes the client: best-effort
+                    // close_notify first (RFC 8446 §6.1). Never reached after a
+                    // committed Helix handoff (that predecessor _exits without
+                    // deinit), so this never writes into an adopted stream.
+                    _ = sendTlsCloseNotify(&slot.value);
                     if (slot.value.tls) |t| {
                         t.deinit();
                         self.allocator.destroy(t);
@@ -16948,6 +16987,26 @@ pub const LinuxServer = struct {
 
     fn failTls(self: *LinuxServer, conn: *ConnState, failure: anyerror) void {
         const t = conn.tls orelse return;
+        if (failure == error.TlsAlert and !conn.tls_terminal_failure and conn.tls_handshake_finished and t.peerSentCloseNotify()) {
+            // RFC 8446 §6.1 / RFC 5246 §7.2.1: close_notify is the peer's
+            // graceful end of input, classified like a TCP EOF (no tls_error
+            // diagnostic, no "TLS peer alert" reason). Input after it is
+            // ignored; pending writes are discarded (RFC 5246 §7.2.1) and the
+            // final teardown answers with our own close_notify.
+            logConnectionDiagnostic(conn, .recv_eof, 0, null, .none);
+            conn.tls_peer_close_notify = true;
+            conn.tls_terminal_failure = true;
+            conn.closing = true;
+            discardTlsUnsealedTail(conn);
+            conn.tls_discard_unsent = true;
+            if (!conn.send_armed) {
+                discardPoisonedSendTail(conn);
+                conn.tls_discard_unsent = false;
+            }
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = false;
+            return;
+        }
         if (!conn.tls_terminal_failure and !conn.tls_handshake_finished) self.tls_stats.onHandshakeFailure(failure);
         if (!conn.tls_terminal_failure) logConnectionDiagnostic(conn, .tls_error, 0, failure, .none);
         conn.tls_terminal_failure = true;
@@ -22059,6 +22118,22 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    /// Graceful TLS closure (RFC 8446 §6.1, RFC 5246 §7.2.1) immediately before
+    /// the transport is shut down: one close_notify, userspace-sealed or as a
+    /// kTLS control record. Best-effort and non-blocking. Only for a client
+    /// (never a mesh link) whose every accepted TX byte already reached the
+    /// socket with no armed SEND, so the alert is the exact next record; never
+    /// after a fatal alert, a TLS/record failure, a send failure or a delivery
+    /// gap. The single answerable terminal input is the peer's close_notify.
+    fn sendTlsCloseNotify(conn: *ConnState) tls_conn.TlsConn.CloseNotifyOutcome {
+        const t = conn.tls orelse return .not_applicable;
+        if (conn.fd < 0 or conn.s2s != null or conn.s2s_secured != null) return .not_applicable;
+        if (conn.tls_terminal_failure and !conn.tls_peer_close_notify) return .not_applicable;
+        if (conn.send_terminal_failure or conn.tls_discard_unsent or conn.delivery_gap.load(.acquire)) return .not_applicable;
+        if (hasUnsentOutput(conn)) return .not_applicable;
+        return t.sendCloseNotify(conn.fd);
+    }
+
     inline fn kernelOwnsConnStorage(conn: *const ConnState) bool {
         return conn.recv_armed or conn.send_armed or conn.connect_armed;
     }
@@ -22354,6 +22429,8 @@ pub const LinuxServer = struct {
             // quiet recv/connect to complete, and recycle only after every exact
             // ownership latch has been cleared by its matching handler.
             if (kernelOwnsConnStorage(conn)) {
+                // The shutdown below is the end of this TLS write direction.
+                _ = sendTlsCloseNotify(conn);
                 if (conn.tls != null) {
                     conn.tls_terminal_failure = true;
                     conn.tls_discard_unsent = true;
@@ -22413,6 +22490,7 @@ pub const LinuxServer = struct {
             if (ordinary_media_owner) {
                 conn.closing = true;
                 if (conn.fd >= 0) {
+                    _ = sendTlsCloseNotify(conn);
                     if (comptime builtin.os.tag == .linux)
                         _ = linux.shutdown(conn.fd, linux.SHUT.RDWR)
                     else
@@ -40886,6 +40964,7 @@ pub const LinuxServer = struct {
             // refused before exec. A TLS socket must never reach the successor
             // without its crypto state.
             var tls_blob: ?[]u8 = null;
+            var tls_blob_version: u16 = tls_snapshot.schema_version;
             if (e.value.tls) |t| {
                 if (e.value.tls_ingress_active or e.value.tls_progress_active or e.value.tls_alert_pending or e.value.tls_discard_unsent) {
                     skip = "TLS record processing or alert in progress";
@@ -40907,7 +40986,12 @@ pub const LinuxServer = struct {
                     .kernel_tx_prefix_remaining = e.value.tls_kernel_prefix_remaining,
                 }) catch continue;
                 defer capture.deinit();
-                tls_blob = tls_snapshot.encode(self.allocator, tlsCaptureSnapshot(e.value, &capture)) catch continue;
+                // Helix rollback: write the lowest exact schema (v3 unless the
+                // row carries a TLS 1.2 binding/offload) so a v3-only
+                // successor (0.10.4) still adopts the common case.
+                const tls_row = tlsCaptureSnapshot(e.value, &capture);
+                tls_blob_version = tls_snapshot.minimalVersion(tls_row);
+                tls_blob = tls_snapshot.encodeVersion(self.allocator, tls_row, tls_blob_version) catch continue;
             }
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
@@ -41044,7 +41128,7 @@ pub const LinuxServer = struct {
                     self.allocator.free(blob);
                     continue;
                 };
-                pieces.append(self.allocator, .{ .kind = .tls_session, .bytes = tb }) catch {
+                pieces.append(self.allocator, .{ .kind = .tls_session, .bytes = tb, .version = tls_blob_version }) catch {
                     self.allocator.free(blob);
                     continue;
                 };
@@ -80384,7 +80468,8 @@ test "managed leased core: every actual recovery factory allocation failure rele
     try read.release();
     try original.discardLeasedCold();
     closed = true;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedLeasedRecoveryAllocationCampaign, .{ inputs, storage, binding, store_id, event_id });
+    var backing: DeterministicSweepBacking = .{ .parent = std.testing.allocator };
+    try std.testing.checkAllAllocationFailures(backing.allocator(), managedLeasedRecoveryAllocationCampaign, .{ inputs, storage, binding, store_id, event_id });
     // A normal final recovery demonstrates the same source namespace remains
     // usable after the complete constructor/installation failure sweep.
     const retry = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
@@ -80397,6 +80482,57 @@ test "managed leased core: every actual recovery factory allocation failure rele
 }
 
 const ManagedLeasedProvisionFaults = struct { before_commit: usize = 0, retained_journal: usize = 0 };
+
+/// Backing allocator for exhaustive allocation-failure sweeps whose code under
+/// test shrinks or grows buffers in place (`Writer.Allocating.toOwnedSlice`,
+/// `ArrayList.toOwnedSlice`, growth via `remap`). `std.testing.allocator`
+/// (`SafeAllocator`) answers an in-place shrink according to the current
+/// bucket fill, i.e. according to every earlier allocation in the process, so
+/// the same request can be satisfied in place in one run and need a fresh
+/// alloc+copy in the next. `checkAllAllocationFailures` counts only `alloc`
+/// calls, so that history dependence surfaces as NondeterministicMemoryUsage
+/// whenever binary layout or test order changes. Refusing every resize/remap
+/// (permitted by the Allocator contract) makes each run take the same
+/// alloc+copy+free path, so the sweep injects a failure at every allocation the
+/// fallback path performs, deterministically.
+const DeterministicSweepBacking = struct {
+    parent: std.mem.Allocator,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.parent.rawAlloc(len, alignment, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, alignment, ra);
+    }
+};
+
+test "deterministic sweep backing: in-place shrink never depends on prior allocation history" {
+    // Regression for the managed leased provision sweep: the same
+    // toOwnedSlice shrink must cost exactly one extra allocation on every run,
+    // independent of how the parent allocator's buckets were filled before.
+    var backing: DeterministicSweepBacking = .{ .parent = std.testing.allocator };
+    var counts: [3]usize = undefined;
+    for (&counts, 0..) |*count, run| {
+        // Perturb the parent's bucket fill differently before each run.
+        const noise = try std.testing.allocator.alloc(u8, 1 + run * 37);
+        defer std.testing.allocator.free(noise);
+        var failing = std.testing.FailingAllocator.init(backing.allocator(), .{});
+        var writer = std.Io.Writer.Allocating.init(failing.allocator());
+        errdefer writer.deinit();
+        try writer.writer.splatByteAll('x', 9);
+        try writer.ensureUnusedCapacity(126);
+        const owned = try writer.toOwnedSlice();
+        defer failing.allocator().free(owned);
+        try std.testing.expectEqual(@as(usize, 9), owned.len);
+        count.* = failing.alloc_index;
+    }
+    try std.testing.expectEqual(counts[0], counts[1]);
+    try std.testing.expectEqual(counts[0], counts[2]);
+}
 
 fn managedLeasedProvisionAllocationCampaign(allocator: std.mem.Allocator, identity: *const node_identity.NodeIdentity, binding: RuntimeCreatedBindings, faults: *ManagedLeasedProvisionFaults) !void {
     // Each injected index gets a genuinely new protected namespace. Namespace
@@ -80452,7 +80588,8 @@ test "managed leased core: every provision allocation failure preserves explicit
     defer resolver.deinit();
     const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
     var faults: ManagedLeasedProvisionFaults = .{};
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedLeasedProvisionAllocationCampaign, .{ &identity, binding, &faults });
+    var backing: DeterministicSweepBacking = .{ .parent = std.testing.allocator };
+    try std.testing.checkAllAllocationFailures(backing.allocator(), managedLeasedProvisionAllocationCampaign, .{ &identity, binding, &faults });
     try std.testing.expect(faults.before_commit != 0);
     try std.testing.expect(faults.retained_journal != 0);
 }
@@ -93253,8 +93390,7 @@ fn encodeUpgradeStreamWithWidenedHeaderForTest(
     var accumulator = handoff_manifest.Accumulator.init();
     for (pieces) |piece| {
         var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-        var cap = helix_capsule.make(piece.kind, &fields);
-        if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+        var cap = helix_live.pieceCapsule(piece, &fields);
         if (piece.kind == widened_kind) cap.header.max_supported +|= 1;
         try accumulator.add(.{
             .header = .{
@@ -93292,8 +93428,7 @@ fn encodeUpgradeStreamWithLegacyV3SessionsForTest(
     var accumulator = handoff_manifest.Accumulator.init();
     for (pieces) |piece| {
         var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-        var cap = helix_capsule.make(piece.kind, &fields);
-        if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+        var cap = helix_live.pieceCapsule(piece, &fields);
         if (piece.kind == .sessions) {
             cap.header.version = 3;
             cap.header.min_supported = 1;
@@ -131009,6 +131144,30 @@ const DaemonOutputTestPair = struct {
         }
         return decoded.toOwnedSlice(a);
     }
+
+    /// Decode a gracefully closed stream: application records followed by
+    /// exactly one authenticated close_notify as the final record (RFC 8446
+    /// §6.1). Anything after it, or a missing alert, fails.
+    fn decodeClosed(self: *DaemonOutputTestPair, bytes: []const u8) ![]u8 {
+        var at: usize = 0;
+        while (true) {
+            if (bytes.len - at < 5) return error.MissingCloseNotify;
+            const len = 5 + @as(usize, std.mem.readInt(u16, bytes[at..][3..5], .big));
+            if (len > bytes.len - at) return error.TestUnexpectedResult;
+            if (at + len == bytes.len) break;
+            at += len;
+        }
+        const plain = try self.decode(bytes[0..at]);
+        errdefer std.testing.allocator.free(plain);
+        switch (self.client) {
+            .tls13 => |*client| {
+                try std.testing.expectError(error.TlsAlert, client.decrypt(bytes[at..]));
+                try std.testing.expectEqual(@import("../proto/tls_alert.zig").AlertDescription.close_notify, client.last_alert.?.description);
+            },
+            .tls12 => |*client| try std.testing.expectError(error.TlsAlert, client.decrypt(bytes[at..])),
+        }
+        return plain;
+    }
 };
 
 fn daemonOutputQueued(a: std.mem.Allocator, conn: *const ConnState) ![]u8 {
@@ -131591,6 +131750,7 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
     var complete = false;
     var peer_eof = false;
     var read_after_retirement = false;
+    var close_notify_seen = false;
     for (0..2000) |_| {
         _ = try fixture.server.rx().ring.submit();
         _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
@@ -131615,7 +131775,18 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
         while (cipher.items.len >= 5) {
             const len = 5 + @as(usize, std.mem.readInt(u16, cipher.items[3..5], .big));
             if (cipher.items.len < len) break;
-            switch (try fixture.pair.client.tls13.decryptApp(cipher.items[0..len])) {
+            // A clean close ends with one kernel control close_notify
+            // (RFC 8446 §6.1); nothing may follow it.
+            try std.testing.expect(!close_notify_seen);
+            const read = fixture.pair.client.tls13.decryptApp(cipher.items[0..len]) catch |err| {
+                if (err != error.TlsAlert or !clean_close) return err;
+                try std.testing.expectEqual(@import("../proto/tls_alert.zig").AlertDescription.close_notify, fixture.pair.client.tls13.last_alert.?.description);
+                close_notify_seen = true;
+                std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - len], cipher.items[len..]);
+                cipher.shrinkRetainingCapacity(cipher.items.len - len);
+                continue;
+            };
+            switch (read) {
                 .application_data => |bytes| {
                     defer a.free(bytes);
                     if (replies == 0) try plain.appendSlice(a, bytes) else {
@@ -131640,7 +131811,7 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
             // peer owns this observation now; EOF, not server-row removal,
             // establishes that all accepted ciphertext has been observed.
             if (peer_eof) {
-                complete = plain.items.len == prefix.len and replies == 1 and
+                complete = plain.items.len == prefix.len and replies == 1 and close_notify_seen and
                     suffix.items.len == "new suffix held behind kernel prefix".len and cipher.items.len == 0;
                 break;
             }
@@ -132177,7 +132348,10 @@ fn tls3ServerBufferedRetirement(suite: u16, closing_before: bool) !void {
     try std.testing.expectEqual(@as(u64, 0), usage.joins);
     try std.testing.expectEqual(@as(u64, if (closing_before) 0 else 1), usage.pings);
     try std.testing.expect(!fixture.server.world.channelExists("#after-close"));
-    const plain = try fixture.pair.decode(wire.items);
+    // A healthy close ends with exactly one close_notify (RFC 8446 §6.1); the
+    // terminal-failure variant never sends one after a failure. (Before
+    // graceful closure existed, both ended in a bare FIN.)
+    const plain = if (closing_before) try fixture.pair.decodeClosed(wire.items) else try fixture.pair.decode(wire.items);
     defer a.free(plain);
     // Healthy close completes every accepted output. Terminal IRC policy
     // disposes unsent output rather than publishing a response after failure.
@@ -132192,6 +132366,88 @@ test "TLS3: buffered overlong input terminally disposes a second held KU and its
 test "TLS3: drain-close completes requested KU without dispatching buffered application commands" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| try tls3ServerBufferedRetirement(suite, true);
+}
+
+fn tls3PeerReadAll(fd: i32, out: *std.ArrayList(u8)) !void {
+    var scratch: [2048]u8 = undefined;
+    while (true) {
+        var ready = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2_000) == 0) return error.TestTimeout;
+        const n = try readFd(fd, &scratch);
+        if (n == 0) return;
+        try out.appendSlice(std.testing.allocator, scratch[0..n]);
+    }
+}
+
+test "TLS close_notify: a peer close_notify is a clean EOF answered with our close_notify" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    conn.tls_handshake_finished = true;
+    const failures_before = fixture.server.tls_stats.failureCount(server_stats.TlsStats.classifyFailure(error.TlsAlert));
+    const bye = try fixture.pair.client.tls13.closeNotify();
+    defer a.free(bye);
+    try fixture.server.driveTls(fixture.id, conn, bye);
+    // RFC 8446 §6.1: graceful end of input, not the "TLS peer alert" error
+    // path and not a handshake failure.
+    try std.testing.expect(conn.closing and conn.tls_peer_close_notify);
+    try std.testing.expect(!std.mem.eql(u8, conn.close_reason, "TLS peer alert"));
+    try std.testing.expectEqual(failures_before, fixture.server.tls_stats.failureCount(server_stats.TlsStats.classifyFailure(error.TlsAlert)));
+    try fixture.server.closeConn(conn.token, conn.close_reason);
+    try std.testing.expect(fixture.server.connFor(fixture.id) == null);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    try tls3PeerReadAll(fixture.peer_fd, &wire);
+    const plain = try fixture.pair.decodeClosed(wire.items);
+    defer a.free(plain);
+    try std.testing.expectEqual(@as(usize, 0), plain.len);
+}
+
+test "TLS close_notify: a peer fatal alert keeps the error path and gets no close_notify" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    conn.tls_handshake_finished = true;
+    const fatal = fixture.pair.client.tls13.takeAlert(error.BadHandshake) orelse return error.TestUnexpectedResult;
+    defer a.free(fatal);
+    try fixture.server.driveTls(fixture.id, conn, fatal);
+    try std.testing.expect(conn.closing and conn.tls_terminal_failure and !conn.tls_peer_close_notify);
+    try std.testing.expectEqualStrings("TLS peer alert", conn.close_reason);
+    try fixture.server.closeConn(conn.token, conn.close_reason);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    try tls3PeerReadAll(fixture.peer_fd, &wire);
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+}
+
+test "TLS close_notify: terminal Server shutdown sends close_notify to a drained TLS client" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(0x1302);
+    current_reactor = &fixture.server.reactors[0];
+    // Tear the Server down by hand so the peer can be read after deinit.
+    fixture.server.deinit();
+    a.destroy(fixture.server);
+    current_reactor = null;
+    defer {
+        closeFd(fixture.peer_fd);
+        fixture.pair.destroy();
+    }
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    try tls3PeerReadAll(fixture.peer_fd, &wire);
+    const plain = try fixture.pair.decodeClosed(wire.items);
+    defer a.free(plain);
+    try std.testing.expectEqual(@as(usize, 0), plain.len);
 }
 
 const Tls3DrainFault = enum { metadata, tls, sendq };
@@ -132308,7 +132564,10 @@ fn tls3ServerSoftwareCloseRetry(suite: u16, point: Tls3DrainFault, kernel_rx: bo
     try std.testing.expect(eof);
     try std.testing.expect(fixture.server.connFor(fixture.id) == null);
     try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
-    const plain = try fixture.pair.decode(wire.items);
+    // A clean drain-close now ends with one close_notify after the complete
+    // accepted plaintext (RFC 8446 §6.1); previously the stream ended in a
+    // bare TCP FIN, which this assertion encoded.
+    const plain = try fixture.pair.decodeClosed(wire.items);
     defer a.free(plain);
     try std.testing.expectEqual(prefix.len + suffix.len, plain.len);
     try std.testing.expectEqualStrings(prefix, plain[0..prefix.len]);
@@ -169301,6 +169560,47 @@ test "server DATA origin is the server name and client DATA keeps its nick" {
     try Gate.has(ann, " 432 ");
     try std.testing.expectEqualStrings("Ann", ann.session.displayName());
     try std.testing.expect(!std.mem.eql(u8, ann.session.displayName(), origin));
+}
+
+test "Linux WebTransport Helix carries QUIC ticket keys strictly and keeps the fresh key without them" {
+    const allocator = std.testing.allocator;
+    var cert_buf: [2048]u8 = undefined;
+    const keys = try mintRehashTlsLeaf(&cert_buf, 0x5a, "wt-ticket.test");
+    const chain = [_][]const u8{keys.der};
+    const tls: managed_wt.TlsConfig = .{ .cert_chain = &chain, .signing_key = .{ .ed25519 = keys.kp } };
+    // Predecessor: resumption on, rotated once.
+    var source = managed_wt.WebTransportListener.init(allocator, tls, 6667);
+    defer source.deinit();
+    try source.applyQuicPolicy(.{ .resumption = true });
+    source.quic_previous_ticket_key = @splat(0x77);
+    const carried = Server.quicTicketKeysOf(&source);
+    try std.testing.expectEqualSlices(u8, &source.quic_ticket_key.?, &carried.current.?);
+    try std.testing.expectEqualSlices(u8, &source.quic_previous_ticket_key.?, &carried.previous.?);
+    // Successor: its fresh boot key is replaced by the carried keys, so a
+    // ticket sealed before the upgrade opens afterwards.
+    var successor = managed_wt.WebTransportListener.init(allocator, tls, 6667);
+    defer successor.deinit();
+    try successor.applyQuicPolicy(.{ .resumption = true });
+    try Server.adoptQuicTicketKeys(&successor, true, carried);
+    try std.testing.expectEqualSlices(u8, &carried.current.?, &successor.quic_ticket_key.?);
+    try std.testing.expectEqualSlices(u8, &carried.previous.?, &successor.quic_previous_ticket_key.?);
+    // A v2 predecessor (no keys) keeps the successor's fresh key.
+    var fresh = managed_wt.WebTransportListener.init(allocator, tls, 6667);
+    defer fresh.deinit();
+    try fresh.applyQuicPolicy(.{ .resumption = true });
+    const boot_key = fresh.quic_ticket_key.?;
+    try Server.adoptQuicTicketKeys(&fresh, true, .{});
+    try std.testing.expectEqualSlices(u8, &boot_key, &fresh.quic_ticket_key.?);
+    // Strict: carried keys into a resumption-disabled successor, or an orphan
+    // previous key, refuse the handoff.
+    var disabled = managed_wt.WebTransportListener.init(allocator, tls, 6667);
+    defer disabled.deinit();
+    try disabled.applyQuicPolicy(.{});
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.adoptQuicTicketKeys(&disabled, false, carried));
+    try std.testing.expect(disabled.quic_ticket_key == null);
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.adoptQuicTicketKeys(&fresh, true, .{ .previous = @splat(1) }));
+    // Resumption off on the predecessor: nothing to carry (v2 frame).
+    try std.testing.expect(Server.quicTicketKeysOf(&disabled).current == null);
 }
 
 test "Linux WebTransport Helix server adoption requires exact configured custody and preserves idle owner" {

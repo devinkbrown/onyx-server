@@ -37,7 +37,30 @@ pub const StatePiece = struct {
     /// the registry default; exact state checkpoints use this to make rollback
     /// fail closed instead of being accepted and silently mis-decoded.
     min_supported: ?u16 = null,
+    /// Stamp an older exact representation of a rolling family (e.g. a
+    /// `.tls_session` row with no v4-only data written as v3). The header then
+    /// reads `{version, min, version}`, so `negotiate` on both an older binary
+    /// (Helix rollback) and this one yields exactly `version`. Null = current.
+    version: ?u16 = null,
 };
+
+/// The exact capsule header a StatePiece is sealed with: the registry
+/// default plus the piece's `min_supported` / `version` overrides. Every
+/// sealing site and the handoff manifest use this one rule.
+pub fn pieceHeader(piece: StatePiece) capsule.Header {
+    var header = capsule.Header.init(piece.kind);
+    if (piece.min_supported) |minimum| header.min_supported = minimum;
+    if (piece.version) |exact| {
+        header.version = exact;
+        header.max_supported = exact;
+    }
+    return header;
+}
+
+/// One-field StatePiece capsule with `pieceHeader`.
+pub fn pieceCapsule(piece: StatePiece, fields: []capsule.Field) capsule.Capsule {
+    return .{ .header = pieceHeader(piece), .fields = fields };
+}
 
 /// Owned predecessor view containing the original state pieces followed by one
 /// canonical whole-handoff manifest. The manifest bytes remain valid until
@@ -63,14 +86,14 @@ pub fn appendHandoffManifest(
     var accumulator = handoff_manifest.Accumulator.init();
     for (pieces) |piece| {
         if (piece.kind == .handoff_manifest) return error.DuplicateManifest;
-        const descriptor = capsule.descriptor(piece.kind);
+        const header = pieceHeader(piece);
         try accumulator.add(.{
             .header = .{
-                .schema_id = descriptor.schema_id,
+                .schema_id = header.schema_id,
                 .kind = @backingInt(piece.kind),
-                .version = descriptor.current_version,
-                .min_supported = piece.min_supported orelse descriptor.min_supported,
-                .max_supported = descriptor.max_supported,
+                .version = header.version,
+                .min_supported = header.min_supported,
+                .max_supported = header.max_supported,
             },
             .bytes = piece.bytes,
         });
@@ -187,8 +210,7 @@ pub fn prepare(allocator: std.mem.Allocator, inputs: PrepareInputs) anyerror!Pre
     if (runtime.arena) |*arena| {
         for (manifested.pieces) |piece| {
             var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-            var cap = capsule.make(piece.kind, fields[0..]);
-            if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+            const cap = pieceCapsule(piece, fields[0..]);
             const encoded = try capsule.encode(allocator, cap);
             defer {
                 wipeEncodedStaging(piece.kind, encoded);
@@ -1406,6 +1428,47 @@ test "mesh state pieces advertise ordinary overlap and exact property requiremen
         error.VersionUnsupported,
         capsule.negotiate(legacy, caps[1].header),
     );
+}
+
+test "tls_session rows stamped v3 are adopted by a v3-only successor and by this binary" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const pieces = [_]StatePiece{
+        .{ .kind = .tls_session, .bytes = "v3-representable-row", .version = 3 },
+        .{ .kind = .tls_session, .bytes = "row-needing-v4" },
+    };
+    var prepared = try prepare(allocator, .{
+        .epoch = 9,
+        .now_ms = 3,
+        .timeout_ms = 1000,
+        .arena_name = "helix-tls-session-rollback",
+        .pieces = pieces[0..],
+        .fds = &.{},
+    });
+    defer prepared.deinit();
+    const caps = try readArena(allocator, prepared.runtime.arena.?.fd);
+    defer {
+        for (caps) |*c| c.deinit(allocator);
+        allocator.free(caps);
+    }
+    try std.testing.expectEqual(@as(usize, 3), caps.len);
+    // The manifest commits to the exact stamped headers.
+    try verifyHandoffManifest(caps);
+    try std.testing.expectEqual(pieceHeader(pieces[0]), caps[0].header);
+    try std.testing.expectEqual(@as(u16, 3), caps[0].header.version);
+    try std.testing.expectEqual(@as(u16, 3), caps[0].header.max_supported);
+    try std.testing.expectEqual(@as(u16, 4), caps[1].header.version);
+    // Adoption requires negotiate(local, header) == header.version.
+    var deployed = capsule.descriptor(.tls_session); // 0.10.4: exact 3..3
+    deployed.current_version = 3;
+    deployed.min_supported = 3;
+    deployed.max_supported = 3;
+    const current = capsule.descriptor(.tls_session);
+    try std.testing.expectEqual(@as(u16, 3), try capsule.negotiate(deployed, caps[0].header));
+    try std.testing.expectEqual(@as(u16, 3), try capsule.negotiate(current, caps[0].header));
+    // A row that needs v4 still refuses the v3-only successor (cold restart).
+    try std.testing.expect((try capsule.negotiate(deployed, caps[1].header)) != caps[1].header.version);
+    try std.testing.expectEqual(@as(u16, 4), try capsule.negotiate(current, caps[1].header));
 }
 
 test "exec plan with listener carries the listen fd env entry" {

@@ -338,9 +338,12 @@ test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane match
         if (std.mem.startsWith(u8, line, "PASS ")) pass += 1;
         if (std.mem.startsWith(u8, line, "SKIP ")) skip += 1;
     }
-    // Armor wave 3 conformance: 202 exact passes (121 after wave 2a, 24 before
-    // the interop shim work) plus the 3 pinned skips.
-    try std.testing.expectEqual(@as(usize, 202), pass);
+    // Armor wave 4: 207 exact passes (202 after wave 3, 121 after wave 2a, 24
+    // before the interop shim work) plus the 3 pinned skips.
+    try std.testing.expectEqual(@as(usize, 207), pass);
+    // Out-of-order first flight is unexpected_message (RFC 8446 §6.2).
+    try std.testing.expect(std.mem.indexOf(u8, baseline, "PASS WrongMessageType-ClientHello-TLS\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline, "PASS PartialClientKeyExchangeWithClientHello\n") != null);
     try std.testing.expectEqual(@as(usize, 3), skip);
     // HelloRetryRequest and PSK-binder cases are now exercised, not disabled.
     try std.testing.expect(std.mem.indexOf(u8, baseline, "PASS SendHelloRetryRequest-TLS13\n") != null);

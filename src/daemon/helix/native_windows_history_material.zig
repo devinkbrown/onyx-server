@@ -282,8 +282,7 @@ test "HXHL arena preflight requires one canonical checkpoint and whole manifest"
             }
             for (manifested.pieces) |piece| {
                 var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-                var item = capsule.make(piece.kind, &fields);
-                if (piece.min_supported) |minimum| item.header.min_supported = minimum;
+                const item = live.pieceCapsule(piece, &fields);
                 const encoded = try capsule.encode(a, item);
                 defer {
                     std.crypto.secureZero(u8, encoded);

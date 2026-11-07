@@ -159,8 +159,42 @@ pub fn validate(snap: Snapshot) Error!void {
     }
 }
 
+/// True when `snap` has an exact v3 representation that a v3-only binary
+/// (0.10.4, the Helix rollback target) adopts: every TLS 1.3 row (the v3 and
+/// v4 TLS 1.3 layouts are identical), and a TLS 1.2 row with no v4-only data —
+/// no RFC 9266 binding to carry, no kTLS offload, and none of the control /
+/// deferred-output state the v3 validator refused for TLS 1.2.
+pub fn representableAsV3(snap: Snapshot) bool {
+    return switch (snap.state.engine) {
+        .tls13 => true,
+        .tls12 => snap.tls12_channel_binding == null and !snap.tx_offloaded and !snap.rx_offloaded and
+            snap.state.rx_open_control_type == 0 and snap.state.alert_prefix_len == 0 and
+            !snap.state.tx_ku_reply_pending and snap.state.barrier_phase == .none and
+            snap.state.held_record_len == 0 and snap.control_charge == 0 and
+            snap.deferred_plain.len == 0 and snap.deferred_ciphertext_charge == 0,
+    };
+}
+
+/// The lowest schema that carries `snap` exactly. The Helix writer stamps the
+/// capsule with this version so a rollback to a v3-only successor keeps every
+/// connection whose row needs nothing newer; v4 is used only when required.
+pub fn minimalVersion(snap: Snapshot) u16 {
+    return if (representableAsV3(snap)) min_schema_version else schema_version;
+}
+
+/// Encode `snap` in the current (v4) layout.
 pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Allocator.Error)![]u8 {
+    return encodeVersion(allocator, snap, schema_version);
+}
+
+/// Encode `snap` in exactly `version`'s layout. v3 omits the TLS 1.2
+/// channel-binding tail and refuses (BadState) any row with v4-only data, so a
+/// v3 blob is never a lossy rendering of live state.
+pub fn encodeVersion(allocator: std.mem.Allocator, snap: Snapshot, version: u16) (Error || std.mem.Allocator.Error)![]u8 {
+    if (version != schema_version and version != min_schema_version) return error.UnsupportedVersion;
     try validate(snap);
+    const tls12_tail = version >= 4;
+    if (!tls12_tail and !representableAsV3(snap)) return error.BadState;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try appendInt(&out, allocator, i32, snap.fd);
@@ -211,7 +245,7 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
         try out.append(allocator, @intFromBool(rs.exporter_master_secret_ready));
         try out.append(allocator, rs.ku_prefix_len);
         try out.appendSlice(allocator, &rs.ku_prefix);
-    } else {
+    } else if (tls12_tail) {
         try out.append(allocator, @intFromBool(snap.tls12_channel_binding != null));
         try out.appendSlice(allocator, &(snap.tls12_channel_binding orelse @as([32]u8, @splat(0))));
     }
@@ -819,4 +853,50 @@ test "TLS4: TLS 1.2 kTLS offload rows validate; KeyUpdate state and v3 offload a
     @memcpy(v3[0..flag_at], wire[0..flag_at]);
     @memcpy(v3[flag_at..], wire[flag_at + 33 ..]);
     try testing.expectError(error.BadState, decode(v3, 3));
+}
+
+test "TLS4 rollback: rows without v4-only data encode as v3 and decode under v3 and v4 rules" {
+    const a = testing.allocator;
+    // TLS 1.2 without binding/offload: exact v3 row (the v4 row minus the tail).
+    const plain12: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 31, .state = .{ .engine = .{ .tls12 = v4Tls12State() }, .barrier_phase = .none, .held_record_len = 0 } };
+    try testing.expectEqual(@as(u16, 3), minimalVersion(plain12));
+    const v3 = try encodeVersion(a, plain12, minimalVersion(plain12));
+    defer a.free(v3);
+    const v4 = try encode(a, plain12);
+    defer a.free(v4);
+    try testing.expectEqual(v4.len - 33, v3.len);
+    const flag_at = tls12BindingOffset(v4);
+    try testing.expectEqualSlices(u8, v4[0..flag_at], v3[0..flag_at]);
+    try testing.expectEqualSlices(u8, v4[flag_at + 33 ..], v3[flag_at..]);
+    // A v3 reader (layout without the tail) adopts it unchanged.
+    const got = try decode(v3, 3);
+    try testing.expect(got.tls12_channel_binding == null and got.fd == 31);
+    if (decode(v3, 4)) |_| return error.TestUnexpectedResult else |_| {}
+
+    // TLS 1.3 rows have one layout in v3 and v4: always written as v3.
+    const s13 = tls_server.Server.ResumeState{ .suite = 0x1302, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 3, .app_write_seq = 4, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(5), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) };
+    const row13: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 32, .state = .{ .engine = .{ .tls13 = s13 }, .barrier_phase = .none, .held_record_len = 0 } };
+    try testing.expectEqual(@as(u16, 3), minimalVersion(row13));
+    const w13v3 = try encodeVersion(a, row13, 3);
+    defer a.free(w13v3);
+    const w13v4 = try encode(a, row13);
+    defer a.free(w13v4);
+    try testing.expectEqualSlices(u8, w13v4, w13v3);
+    _ = try decode(w13v3, 3);
+}
+
+test "TLS4 rollback: v4 is used only when the row needs it and v3 never drops data" {
+    const a = testing.allocator;
+    const binding: [32]u8 = @splat(0x5c);
+    const bound: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 33, .state = .{ .engine = .{ .tls12 = v4Tls12State() }, .barrier_phase = .none, .held_record_len = 0 }, .tls12_channel_binding = binding };
+    try testing.expectEqual(@as(u16, 4), minimalVersion(bound));
+    try testing.expectError(error.BadState, encodeVersion(a, bound, 3));
+    const offloaded: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 34, .state = .{ .engine = .{ .tls12 = v4Tls12State() }, .barrier_phase = .none, .held_record_len = 0 }, .tx_offloaded = true };
+    try testing.expectEqual(@as(u16, 4), minimalVersion(offloaded));
+    try testing.expectError(error.BadState, encodeVersion(a, offloaded, 3));
+    const wire = try encodeVersion(a, bound, minimalVersion(bound));
+    defer a.free(wire);
+    try testing.expectEqualSlices(u8, &binding, &(try decode(wire, 4)).tls12_channel_binding.?);
+    try testing.expectError(error.UnsupportedVersion, encodeVersion(a, bound, 2));
+    try testing.expectError(error.UnsupportedVersion, encodeVersion(a, bound, 5));
 }

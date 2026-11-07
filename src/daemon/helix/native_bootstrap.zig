@@ -143,8 +143,7 @@ pub const Driver = struct {
         }
         for (manifested.pieces) |piece| {
             var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-            var cap = capsule.make(piece.kind, &fields);
-            if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+            const cap = live.pieceCapsule(piece, &fields);
             const encoded = try capsule.encode(self.allocator, cap);
             defer {
                 std.crypto.secureZero(u8, encoded);
