@@ -336,7 +336,8 @@ pub const Config = struct {
     /// client that offers the `delegated_credential` extension AND accepts the
     /// DC's `dc_cert_verify_algorithm`. The DC is bound to the DEFAULT
     /// `cert_chain[0]` leaf key (which must carry the DelegationUsage extension);
-    /// it is NOT presented for an SNI-selected certificate. When presented, the
+    /// it is NOT presented for an SNI-selected certificate (an SNI entry carries
+    /// its own optional `SniCert.delegated_credential`). When presented, the
     /// leaf CertificateEntry carries the DC and CertificateVerify is signed with
     /// the DC's private key (not the leaf key). Null (default) ⇒ the handshake is
     /// byte-identical to a non-DC server; even when set, a client that does not
@@ -462,6 +463,13 @@ pub const SniCert = struct {
     rsa_signing_key: ?rsa_sign.PrivateKey = null,
     /// Optional DER OCSPResponse to staple for this cert (like `Config.ocsp_staple`).
     ocsp_staple: []const u8 = &.{},
+    /// Optional RFC 9345 delegated credential bound to THIS entry's
+    /// `cert_chain[0]` leaf key (same contract as `Config.delegated_credential`,
+    /// validated at init against this entry's signing key). Presented only when
+    /// this entry is the SNI-selected certificate and the client's
+    /// `delegated_credential` extension accepts its scheme. Null (default) ⇒
+    /// this entry never presents a DC (the pre-existing behaviour).
+    delegated_credential: ?DelegatedCredential = null,
 };
 
 pub const SigningKey = union(enum) {
@@ -917,18 +925,13 @@ pub const Server = struct {
         // only key that could have signed a DC bound to `cert_chain[0]`).
         var dc_scheme: ?u16 = null;
         if (config.delegated_credential) |dc| {
-            // The DC rides a u16-length CertificateEntry extension; the codec's SPKI
-            // vector is a u24, so cap here rather than let `writeCertificate`'s
-            // `@intCast(dc.wire.len)` truncate (ReleaseFast) / panic (safe modes).
-            if (dc.wire.len > std.math.maxInt(u16)) return error.BadDelegatedCredential;
-            const parsed = delegated_credential.parse(dc.wire) catch return error.BadDelegatedCredential;
-            if (!signingKeyMatchesScheme(dc.private_key, parsed.dc_cert_verify_algorithm)) {
-                return error.LeafKeyMismatch;
-            }
-            if (!signingKeyMatchesScheme(default_key, parsed.algorithm)) {
-                return error.BadDelegatedCredential;
-            }
-            dc_scheme = parsed.dc_cert_verify_algorithm;
+            dc_scheme = try validateDelegatedCredential(dc, default_key);
+        }
+        // The same checks for each SNI entry's own DC, against that entry's key
+        // (the only key that could have signed a DC bound to its leaf).
+        for (config.sni_certs) |entry| {
+            const dc = entry.delegated_credential orelse continue;
+            _ = try validateDelegatedCredential(dc, sniEntrySigningKey(entry).?);
         }
         // ECH (roadmap 5.1): every configured key must parse to one supported
         // ECHConfig whose public key the private key recovers to (fail-fast so a
@@ -2360,7 +2363,7 @@ pub const Server = struct {
         var psk_ext: ?[]const u8 = null;
         var offered_early_data = false;
         var offered_record_size_limit = false; // RFC 8449: echo only when offered
-        var dc_accepted = false; // RFC 9345: client's delegated_credential accepts our DC's scheme
+        var dc_offer: ?[]const u8 = null; // RFC 9345: client's delegated_credential SignatureSchemeList
         // Re-capture the sig-alg lists fresh per ClientHello (so a CH2 that drops
         // an extension is reflected, not left stale from CH1).
         if (self.client_sig_algs) |old| {
@@ -2468,15 +2471,10 @@ pub const Server = struct {
                 },
                 .delegated_credential => {
                     // RFC 9345: the body is a SignatureSchemeList of the schemes the
-                    // client will accept as a DC's dc_cert_verify_algorithm. Present
-                    // our configured DC only if the client accepts its scheme; a
-                    // malformed list `offers` nothing (fail-closed). No DC configured
-                    // ⇒ `dc_scheme` is null and this is a no-op (byte-identical).
-                    if (self.dc_scheme) |scheme| {
-                        if (tls_signature_scheme.offers(ext.data, tls_signature_scheme.SignatureScheme.fromInt(scheme))) {
-                            dc_accepted = true;
-                        }
-                    }
+                    // client will accept as a DC's dc_cert_verify_algorithm. It is
+                    // matched against the DC of the certificate SNI selects, which
+                    // is only known after this loop (see below).
+                    dc_offer = ext.data;
                 },
                 .early_data => {
                     if (ext.data.len != 0) return error.BadHandshake;
@@ -2521,8 +2519,6 @@ pub const Server = struct {
         self.cert_compression = offered_cert_compression;
         self.server_cert_type_rpk = offered_rpk;
         self.client_cert_type_rpk = offered_client_rpk;
-        // RFC 9345: re-derived fresh per ClientHello (so ClientHello2 re-reads it).
-        self.client_accepts_dc = dc_accepted;
         // SNI (RFC 6066): pin the cert on ClientHello1. On ClientHello2 the SNI
         // MUST be unchanged (RFC 8446 §4.1.2 — it is not among the fields a client
         // may alter across a HelloRetryRequest), so verify CH2's host_name digest
@@ -2534,6 +2530,16 @@ pub const Server = struct {
         } else {
             self.ch1_sni_digest = sniDigest(sni_name);
             self.sni_cert = self.selectSniCert(sni_name);
+        }
+        // RFC 9345: re-derived fresh per ClientHello (so ClientHello2 re-reads it)
+        // against the DC bound to the selected certificate. Present it only if
+        // the client accepts its scheme; a malformed list `offers` nothing
+        // (fail-closed). No DC for that cert => a no-op (byte-identical).
+        self.client_accepts_dc = false;
+        if (dc_offer) |offer| {
+            if (self.selectedDelegatedCredentialScheme()) |scheme| {
+                self.client_accepts_dc = tls_signature_scheme.offers(offer, tls_signature_scheme.SignatureScheme.fromInt(scheme));
+            }
         }
         self.resumed = false;
         self.record_size_limit_offered = offered_record_size_limit;
@@ -3132,11 +3138,31 @@ pub const Server = struct {
         return null;
     }
 
+    /// RFC 9345: the DC configured for the selected certificate — the SNI entry's
+    /// own `delegated_credential` when an SNI cert was selected, else the
+    /// default `Config.delegated_credential`. Never the default DC for an SNI
+    /// cert: a DC is bound to one leaf key and must not ride another leaf.
+    fn selectedDelegatedCredential(self: *const Server) ?DelegatedCredential {
+        if (self.sni_cert) |i| return self.config.sni_certs[i].delegated_credential;
+        return self.config.delegated_credential;
+    }
+
+    /// The `dc_cert_verify_algorithm` of `selectedDelegatedCredential`, or null.
+    /// The wire was validated at init, so a parse failure here cannot happen;
+    /// it still maps to null (no DC) rather than presenting anything.
+    fn selectedDelegatedCredentialScheme(self: *const Server) ?u16 {
+        if (self.sni_cert == null) return self.dc_scheme;
+        const dc = self.selectedDelegatedCredential() orelse return null;
+        const parsed = delegated_credential.parse(dc.wire) catch return null;
+        return parsed.dc_cert_verify_algorithm;
+    }
+
     /// RFC 9345: the delegated credential to present this handshake, or null.
-    /// Presented only when (1) a DC is configured, (2) the client's
-    /// `delegated_credential` extension accepted its scheme, and (3) no SNI cert
-    /// was selected — the DC is bound to the default `cert_chain[0]` leaf key, so
-    /// it must not ride an SNI-swapped certificate. `writeCertificate` (attaches
+    /// Presented only when (1) a DC is configured for the selected certificate
+    /// (the default cert's, or the SNI entry's own), and (2) the client's
+    /// `delegated_credential` extension accepted its scheme. The default DC is
+    /// bound to the default `cert_chain[0]` leaf key, so it never rides an
+    /// SNI-swapped certificate. `writeCertificate` (attaches
     /// the DC) and `writeCertificateVerify` (signs with the DC key) call this and,
     /// because no state changes between them, agree. When it returns null the wire
     /// is byte-identical to a non-DC server.
@@ -3149,9 +3175,8 @@ pub const Server = struct {
         // RPK and delegated_credential gets an RPK cert but a DC-key CertVerify,
         // and the (fail-closed) signature check aborts the handshake.
         if (self.server_cert_type_rpk) return null;
-        if (self.sni_cert != null) return null;
         if (!self.client_accepts_dc) return null;
-        return self.config.delegated_credential;
+        return self.selectedDelegatedCredential();
     }
 
     fn writeCertificate(self: *Server, out: *std.ArrayList(u8)) Error!void {
@@ -3808,6 +3833,23 @@ fn activeSigningKey(config: Config) ?SigningKey {
     if (config.ecdsa_p256_signing_key) |key| return .{ .ecdsa_p256 = key };
     if (config.signing_key) |key| return .{ .ed25519 = key };
     return null;
+}
+
+/// RFC 9345 config validation (invariant (e): reject bad config BEFORE any
+/// handshake wires it). Returns the DC's `dc_cert_verify_algorithm`.
+fn validateDelegatedCredential(dc: DelegatedCredential, leaf_key: SigningKey) Error!u16 {
+    // The DC rides a u16-length CertificateEntry extension; the codec's SPKI
+    // vector is a u24, so cap here rather than let `writeCertificate`'s
+    // `@intCast(dc.wire.len)` truncate (ReleaseFast) / panic (safe modes).
+    if (dc.wire.len > std.math.maxInt(u16)) return error.BadDelegatedCredential;
+    const parsed = delegated_credential.parse(dc.wire) catch return error.BadDelegatedCredential;
+    if (!signingKeyMatchesScheme(dc.private_key, parsed.dc_cert_verify_algorithm)) {
+        return error.LeafKeyMismatch;
+    }
+    if (!signingKeyMatchesScheme(leaf_key, parsed.algorithm)) {
+        return error.BadDelegatedCredential;
+    }
+    return parsed.dc_cert_verify_algorithm;
 }
 
 /// The signing key an `SniCert` entry would present, with the same
@@ -6331,6 +6373,143 @@ test "delegated_credential: not presented for an SNI-selected certificate" {
     defer alloc.free(cv_msg);
     const scheme = (@as(u16, cv_msg[4]) << 8) | cv_msg[5];
     try std.testing.expectEqual(tls_signature_scheme.SignatureScheme.ed25519.toInt(), scheme);
+}
+
+test "delegated_credential: an SNI certificate presents its OWN DC (RFC 9345) and the client completes under it" {
+    const tls_client = @import("tls_client.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+
+    const not_before: i64 = 1_704_067_200;
+    const now: i64 = not_before + 3600;
+    // Default cert: Ed25519, no DC.
+    const default_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3a)));
+    var default_buf: [1024]u8 = undefined;
+    const default_der = try x509_selfsign.buildSelfSigned(&default_buf, .{
+        .common_name = "default.example",
+        .not_before = not_before,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x3a, 0x01 },
+        .key_pair = default_kp,
+        .dns_names = &.{"default.example"},
+    });
+    // SNI cert: P-256 with DelegationUsage, and a DC bound to it.
+    const sni_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var sni_buf: [1024]u8 = undefined;
+    const sni_der = try x509_selfsign.buildSelfSignedEcdsaP256(&sni_buf, .{
+        .common_name = "alt.example",
+        .not_before = not_before,
+        .not_after = not_before + 365 * 24 * 60 * 60,
+        .serial = &.{ 0x3b, 0x01 },
+        .key_pair = sni_kp,
+        .dns_names = &.{"alt.example"},
+        .delegation_usage = true,
+        .key_usage_digital_signature = true,
+    });
+    const dc_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var spki_buf: [dc_test_p256_spki_prefix.len + ecdsa_p256.sec1_uncompressed_length]u8 = undefined;
+    const dc_spki = dcTestP256Spki(&spki_buf, dc_kp);
+    var dc_wire_buf: [512]u8 = undefined;
+    const dc_wire = try dcTestMintWire(&dc_wire_buf, sni_der, dc_spki, 86_400, .ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = sni_kp });
+
+    const cfg: Config = .{
+        .cert_chain = &.{default_der},
+        .signing_key = default_kp,
+        .sni_certs = &.{.{
+            .server_names = &.{"alt.example"},
+            .cert_chain = &.{sni_der},
+            .ecdsa_p256_signing_key = sni_kp,
+            .delegated_credential = .{ .wire = dc_wire, .private_key = .{ .ecdsa_p256 = dc_kp } },
+        }},
+    };
+
+    // SNI = alt.example with a DC-offering client: the entry's DC is presented
+    // and CertificateVerify is signed by the DC key. Before per-SNI DC support
+    // the DC was never presented for an SNI cert (`dc_verified_key` null).
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        var client = try tls_client.Client.init(alloc, .{
+            .server_name = "alt.example",
+            .trust_anchors = &.{sni_der},
+            .now_unix_seconds = now,
+        });
+        defer client.deinit();
+        client.offerDelegatedCredentials();
+        const ch = try client.start();
+        defer alloc.free(ch);
+        const sflight = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer alloc.free(sflight);
+        try std.testing.expectEqual(@as(?usize, 0), server.sni_cert);
+        try std.testing.expect(server.client_accepts_dc);
+        const cfin = switch (try client.feed(sflight)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer alloc.free(cfin);
+        try std.testing.expect(client.handshakeDone());
+        try std.testing.expect(client.dc_verified_key != null);
+        _ = try server.feed(cfin);
+        try std.testing.expect(server.handshakeDone());
+    }
+
+    // SNI = default.example: the default cert has no DC, and the SNI entry's DC
+    // must not ride the default leaf.
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        var client = try tls_client.Client.init(alloc, .{
+            .server_name = "default.example",
+            .trust_anchors = &.{default_der},
+            .now_unix_seconds = now,
+        });
+        defer client.deinit();
+        client.offerDelegatedCredentials();
+        const ch = try client.start();
+        defer alloc.free(ch);
+        const sflight = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer alloc.free(sflight);
+        try std.testing.expectEqual(@as(?usize, null), server.sni_cert);
+        try std.testing.expect(!server.client_accepts_dc);
+        try std.testing.expect(server.activeDelegatedCredential() == null);
+        const cfin = switch (try client.feed(sflight)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer alloc.free(cfin);
+        try std.testing.expect(client.handshakeDone());
+        try std.testing.expect(client.dc_verified_key == null);
+    }
+
+    // Init validates an SNI entry's DC against THAT entry's key: an outer
+    // algorithm (ecdsa) the Ed25519-keyed entry cannot have produced is refused.
+    try std.testing.expectError(error.BadDelegatedCredential, Server.init(alloc, .{
+        .cert_chain = &.{default_der},
+        .signing_key = default_kp,
+        .sni_certs = &.{.{
+            .server_names = &.{"alt.example"},
+            .cert_chain = &.{default_der},
+            .signing_key = default_kp,
+            .delegated_credential = .{ .wire = dc_wire, .private_key = .{ .ecdsa_p256 = dc_kp } },
+        }},
+    }));
+    // ...and a malformed SNI DC wire is refused.
+    try std.testing.expectError(error.BadDelegatedCredential, Server.init(alloc, .{
+        .cert_chain = &.{default_der},
+        .signing_key = default_kp,
+        .sni_certs = &.{.{
+            .server_names = &.{"alt.example"},
+            .cert_chain = &.{sni_der},
+            .ecdsa_p256_signing_key = sni_kp,
+            .delegated_credential = .{ .wire = dc_wire[0 .. dc_wire.len - 3], .private_key = .{ .ecdsa_p256 = dc_kp } },
+        }},
+    }));
 }
 
 test "delegated_credential: init rejects a malformed or mismatched DC config" {
@@ -12180,7 +12359,9 @@ test "conformance (RFC 8446 §6.1): closeNotify emits one encrypted close_notify
         try std.testing.expect(server.handshakeDone());
         const record = try server.closeNotify();
         defer alloc.free(record);
-        try std.testing.expectError(error.TlsAlert, client.decryptApp(record));
+        // RFC 8446 §6.1: close_notify is a clean EOF for the client (this test
+        // previously encoded the old error.TlsAlert behaviour).
+        try std.testing.expectError(error.EndOfStream, client.decryptApp(record));
         try std.testing.expectEqual(tls_alert.AlertDescription.close_notify, client.last_alert.?.description);
         try std.testing.expectError(error.BadState, server.closeNotify());
         try std.testing.expectError(error.BadState, server.encrypt("after close"));

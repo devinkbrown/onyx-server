@@ -124,3 +124,133 @@ test "TLS client fatal transport: HTTP POST response failure never opens a fallb
     try std.testing.expect(worker.request_seen and worker.alert_seen);
     try std.testing.expect(!worker.fallback_seen);
 }
+
+const CloseMode = enum { truncated_length, close_delimited_notify, close_delimited_eof, framed_notify };
+
+/// One real TLS 1.3 exchange through `get`: the server answers with `body`,
+/// then closes per `mode`. Returns `get`'s result and whether the server read
+/// the client's close_notify.
+fn closeExchange(mode: CloseMode, response: []const u8) !struct { result: Error![]u8, peer_close_notify: bool } {
+    const a = std.testing.allocator;
+    const runtime = @import("../os_runtime.zig");
+    const metrics = @import("../metrics_http.zig");
+    const tls_server = @import("../../crypto/tls_server.zig");
+    const tls_alert = @import("../../proto/tls_alert.zig");
+    var snapshot = metrics.MetricsSnapshot.init(a);
+    defer snapshot.deinit();
+    var listener = try metrics.MetricsServer.init(&snapshot, 0);
+    defer listener.shutdown();
+    const peer = try tls_client_failure.TestPeer.init(a);
+    defer peer.deinit();
+    peer.server.deinit();
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x7c));
+    peer.server = try tls_server.Server.init(a, .{ .cert_chain = &peer.chain, .signing_key = kp });
+    const Worker = struct {
+        listener: i32,
+        peer: *tls_client_failure.TestPeer,
+        mode: CloseMode,
+        response: []const u8,
+        peer_close_notify: bool = false,
+        failure: ?anyerror = null,
+
+        fn record(fd: i32, buffer: []u8) ![]u8 {
+            try tls_client_failure.testReadExact(fd, buffer[0..5]);
+            const n = 5 + @as(usize, std.mem.readInt(u16, buffer[3..5], .big));
+            if (n > buffer.len) return error.TestUnexpectedResult;
+            try tls_client_failure.testReadExact(fd, buffer[5..n]);
+            return buffer[0..n];
+        }
+
+        fn run(self: *@This()) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn exchange(self: *@This()) !void {
+            var polls = [_]posix.pollfd{.{ .fd = self.listener, .events = posix.POLL.IN, .revents = 0 }};
+            if (sys.poll(&polls, 1, 2000) <= 0) return error.TestUnexpectedResult;
+            const rc = sys.accept(self.listener, null, null);
+            if (posix.errno(rc) != .SUCCESS) return error.TestUnexpectedResult;
+            const fd: i32 = @intCast(rc);
+            defer runtime.close(fd);
+            try setBlocking(fd);
+            try setRecvTimeout(fd, 1000);
+            var buffer: [max_tls_record]u8 = undefined;
+            const engine = &self.peer.server;
+            while (!engine.handshakeDone()) {
+                switch (try engine.feed(try record(fd, &buffer))) {
+                    .bytes_to_send => |bytes| {
+                        defer std.testing.allocator.free(bytes);
+                        try writeAll(fd, bytes);
+                    },
+                    .need_more => {},
+                }
+            }
+            const request = try engine.decrypt(try record(fd, &buffer));
+            std.testing.allocator.free(request);
+            const wire = try engine.encrypt(self.response);
+            defer std.testing.allocator.free(wire);
+            try writeAll(fd, wire);
+            switch (self.mode) {
+                .truncated_length, .close_delimited_eof => return, // TCP close, no close_notify
+                .close_delimited_notify, .framed_notify => {
+                    const close = try engine.closeNotify();
+                    defer std.testing.allocator.free(close);
+                    try writeAll(fd, close);
+                },
+            }
+            // The client answers (or, for a framed body, ends) with its own
+            // close_notify (RFC 8446 §6.1).
+            const reply = record(fd, &buffer) catch return;
+            if (engine.decrypt(reply)) |pt| {
+                std.testing.allocator.free(pt);
+            } else |err| {
+                if (err == error.TlsAlert and engine.peer_alert.?.description == tls_alert.AlertDescription.close_notify) self.peer_close_notify = true;
+            }
+        }
+    };
+    var worker = Worker{ .listener = listener.listen_fd, .peer = peer, .mode = mode, .response = response };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    const request = "GET /feed HTTP/1.1\r\nHost: irc.test\r\n\r\n";
+    const result = get(a, "127.0.0.1", listener.port, true, request, .{ .insecure_skip_verify = true, .recv_timeout_ms = 1000 });
+    thread.join();
+    if (worker.failure) |err| {
+        if (result) |bytes| a.free(bytes) else |_| {}
+        return err;
+    }
+    return .{ .result = result, .peer_close_notify = worker.peer_close_notify };
+}
+
+test "http_fetch TLS close (RFC 8446 §6.1): close_notify ends a close-delimited body and is answered" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nfull body";
+    const got = try closeExchange(.close_delimited_notify, response);
+    const bytes = try got.result;
+    defer a.free(bytes);
+    // Before the fix the loop stopped at the header block and dropped the body.
+    try std.testing.expectEqualStrings(response, bytes);
+    try std.testing.expect(got.peer_close_notify);
+}
+
+test "http_fetch TLS close (RFC 8446 §6.1): a framed response is accepted and our close_notify is sent" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const got = try closeExchange(.framed_notify, response);
+    const bytes = try got.result;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings(response, bytes);
+    try std.testing.expect(got.peer_close_notify);
+}
+
+test "http_fetch TLS truncation (RFC 8446 §6.1): transport EOF before the framed or close-delimited end is refused" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    // Content-Length promises 10 bytes; 3 arrive, then a bare TCP close.
+    const short = try closeExchange(.truncated_length, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc");
+    try std.testing.expectError(error.ConnectionClosed, short.result);
+    // No framing and no close_notify: the body may have been truncated.
+    const eof = try closeExchange(.close_delimited_eof, "HTTP/1.1 200 OK\r\n\r\nmaybe-cut");
+    try std.testing.expectError(error.ConnectionClosed, eof.result);
+}
