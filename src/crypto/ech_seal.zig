@@ -95,7 +95,7 @@ pub const Error = error{
 /// Result of `seal`: the HPKE encapsulated key (`enc`) placed in the outer ECH
 /// extension of ClientHello1, and the AEAD ciphertext (`payload`, owned by the
 /// caller). Only ClientHello1 carries a non-empty `enc`; an HRR retry reuses the
-/// same context and sends an empty `enc` (a deferred follow-up).
+/// same context and sends an empty `enc` (see `Sealer.sealNext`).
 pub const SealResult = struct {
     enc: [hpke.enc_len]u8,
     payload: []u8,
@@ -155,11 +155,23 @@ pub const Sealer = struct {
     /// ClientHelloOuterAAD). Single-use: the context is wiped afterward. Returns
     /// the owned ciphertext payload.
     pub fn seal(self: *Sealer, allocator: Allocator, aad: []const u8, pt: []const u8) Error![]u8 {
+        const ct = try self.sealNext(allocator, aad, pt);
+        self.wipe();
+        return ct;
+    }
+
+    /// Seal `pt` under `aad` and KEEP the context for a further message. The
+    /// HPKE sequence number advances, so the next call uses a fresh nonce.
+    /// draft-ietf-tls-esni §6.1.5: after a HelloRetryRequest the client seals
+    /// the second EncodedClientHelloInner "as a second message with the
+    /// previous HPKE context" (and sends an empty `enc`), so the first
+    /// ClientHello uses this and the context lives until the ServerHello. The
+    /// caller wipes it (`wipe`) once no further ClientHello can follow.
+    pub fn sealNext(self: *Sealer, allocator: Allocator, aad: []const u8, pt: []const u8) Error![]u8 {
         const ct = switch (self.ctx) {
             .chacha20_poly1305 => |*c| try c.seal(allocator, aad, pt),
             .aes128_gcm => |*c| try c.seal(allocator, aad, pt),
         };
-        self.wipe();
         return ct.bytes;
     }
 
@@ -392,6 +404,37 @@ test "seal round-trips: a test 'server' opens the ECH payload" {
     const opened = try hpke.openBase(allocator, sealed.enc, kp.secret_key, info, aad, sealed.payload);
     defer opened.deinit(allocator);
     try testing.expectEqualSlices(u8, encoded_inner, opened.bytes);
+}
+
+test "sealNext keeps the HPKE context: the HRR second inner opens only as message two (draft-ietf-tls-esni §6.1.5)" {
+    const allocator = testing.allocator;
+    const kp = try hpke.KeyPair.generateDeterministic(@splat(0x52));
+    var list_buf: [600]u8 = undefined;
+    const cfg = try testConfig(&list_buf, 4, &kp.public_key, "cover.example");
+
+    var sealer = try beginSeal(allocator, cfg, @splat(0x63));
+    defer sealer.wipe();
+    const ct1 = try sealer.sealNext(allocator, "aad one", "inner one");
+    defer allocator.free(ct1);
+    const ct2 = try sealer.sealNext(allocator, "aad two", "inner two");
+    defer allocator.free(ct2);
+
+    const info = try buildInfo(allocator, cfg);
+    defer allocator.free(info);
+    var ss = try hpke.decap(sealer.enc, kp.secret_key);
+    var ctx = hpke.ChaCha20Poly1305.Context.setupBaseR(ss, info);
+    @memset(&ss, 0);
+    defer ctx.wipe();
+    const pt1 = try ctx.open(allocator, "aad one", ct1);
+    defer pt1.deinit(allocator);
+    try testing.expectEqualStrings("inner one", pt1.bytes);
+    const pt2 = try ctx.open(allocator, "aad two", ct2);
+    defer pt2.deinit(allocator);
+    try testing.expectEqualStrings("inner two", pt2.bytes);
+
+    // A fresh (sequence 0) receiver context cannot open the second message:
+    // its nonce is bound to sequence number 1.
+    try testing.expectError(error.AuthenticationFailed, hpke.openBase(allocator, sealer.enc, kp.secret_key, info, "aad two", ct2));
 }
 
 test "seal rejects wrong AAD (bound to ClientHelloOuterAAD)" {

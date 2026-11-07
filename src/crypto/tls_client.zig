@@ -66,6 +66,7 @@ const tls_finished = @import("../proto/tls_finished.zig");
 const tls_psk = @import("../proto/tls_psk.zig");
 const tls_session_ticket = @import("../proto/tls_session_ticket.zig");
 const tls_alpn = @import("../proto/tls_alpn.zig");
+const tls_grease = @import("../proto/tls_grease.zig");
 const toml = @import("../proto/toml.zig");
 const x509_selfsign = @import("../proto/x509_selfsign.zig");
 
@@ -144,7 +145,10 @@ pub const Error = error{
     DelegatedCredentialSchemeMismatch,
     EmptyCertificateChain,
     FinishedMismatch,
-    HelloRetryRequestUnsupported,
+    /// draft-ietf-tls-esni §6.1.5: the server confirmed ECH acceptance in its
+    /// HelloRetryRequest but the ServerHello that followed does not carry a
+    /// matching acceptance confirmation (an inconsistent ECH negotiation).
+    EchInconsistent,
     /// Certificate Transparency presence policy (`Options.require_sct`) was not
     /// met: the leaf did not present at least `require_sct` embedded SCTs that
     /// each verify against a DISTINCT pinned CT log. Distinct from `BadSct`,
@@ -224,6 +228,22 @@ pub const Options = struct {
     /// resumption offer or 0-RTT is configured (ECH-over-PSK is a follow-up).
     /// Borrowed for the call; the client copies it.
     ech_config_list: ?[]const u8 = null,
+    /// RFC 8701 GREASE. When true (as browsers do), every ClientHello carries
+    /// reserved GREASE values, drawn per connection from OS entropy: one in
+    /// cipher_suites, supported_groups, signature_algorithms,
+    /// supported_versions and (when offered) ALPN, a 1-byte GREASE key_share,
+    /// and two GREASE extensions (one empty, one 1-byte). A server that
+    /// negotiates any GREASE value is rejected regardless (RFC 8701 §3.1).
+    /// Default false keeps the ClientHello byte-identical to the pre-GREASE
+    /// wire until a caller opts in.
+    grease: bool = false,
+    /// draft-ietf-tls-esni §6.2 "GREASE ECH": when true and no usable
+    /// `ech_config_list` makes this handshake offer real ECH, the ClientHello
+    /// carries an `encrypted_client_hello` extension with a plausible random
+    /// payload, so ECH and non-ECH connections look alike on the wire. Any
+    /// `retry_configs` the server answers with are checked for syntax and
+    /// otherwise ignored. Default false (no such extension is sent).
+    ech_grease: bool = false,
     /// Optional `signature_algorithms_cert` list (RFC 8446 §4.2.3): the signature
     /// schemes the client will accept on the CERTIFICATES in the server's chain,
     /// as distinct from `signature_algorithms` (which governs the CertificateVerify
@@ -511,6 +531,25 @@ pub const Client = struct {
     /// the retry_configs) is then authenticated by the public_name certificate, so
     /// the caller may safely adopt these for the NEXT connection. Null otherwise.
     ech_retry_configs: ?[]u8 = null,
+    /// draft-ietf-tls-esni §6.1.5: the HPKE sender context ClientHello1 sealed
+    /// under. Retained (sequence number now 1) so a ClientHello2 after a
+    /// HelloRetryRequest seals its inner as the second message of the SAME
+    /// context with an empty `enc`. Wiped once the ServerHello arrives.
+    ech_sealer: ?ech.Sealer = null,
+    /// draft-ietf-tls-esni §7.2.1: whether the HelloRetryRequest carried a
+    /// valid "hrr ech accept confirmation". Null unless ECH was active and an
+    /// HRR was received. Decides which ClientHello (inner or outer) the
+    /// post-HRR transcript follows; the ServerHello must then agree.
+    ech_hrr_accepted: ?bool = null,
+    /// RFC 8701 per-connection GREASE seed; null when `Options.grease` is off.
+    /// Fixed for the connection so ClientHello2 repeats ClientHello1's values.
+    grease: ?tls_grease.Seed = null,
+    /// `Options.ech_grease`.
+    ech_grease: bool = false,
+    /// Owned body of the GREASE `encrypted_client_hello` extension sent in
+    /// ClientHello1 (draft-ietf-tls-esni §6.2), re-sent byte-for-byte in a
+    /// ClientHello2. Null unless a GREASE ECH extension was sent.
+    ech_grease_ext: ?[]u8 = null,
 
     selected_suite: ?CipherSuite = null,
     selected_alpn: ?[]const u8 = null,
@@ -710,6 +749,12 @@ pub const Client = struct {
         try osEntropy(&random);
         var ech_inner_random: [32]u8 = undefined;
         try osEntropy(&ech_inner_random);
+        var grease_seed: ?tls_grease.Seed = null;
+        if (options.grease) {
+            var bytes: [8]u8 = undefined;
+            try osEntropy(&bytes);
+            grease_seed = .{ .bytes = bytes };
+        }
 
         const name = try allocator.dupe(u8, options.server_name);
         errdefer allocator.free(name);
@@ -741,6 +786,8 @@ pub const Client = struct {
             .ech_config_list = ech_list_owned,
             .cert_signature_schemes = cert_sig_owned,
             .ech_inner_random = ech_inner_random,
+            .grease = grease_seed,
+            .ech_grease = options.ech_grease,
             .ct_logs = ct_logs_owned,
             .enforce_sct = options.enforce_sct,
             .require_sct = options.require_sct,
@@ -794,6 +841,8 @@ pub const Client = struct {
         if (self.ech_public_name) |p| self.allocator.free(p);
         if (self.ech_inner_hello) |h| self.allocator.free(h);
         if (self.ech_retry_configs) |r| self.allocator.free(r);
+        if (self.ech_grease_ext) |g| self.allocator.free(g);
+        if (self.ech_sealer) |*s| s.wipe();
         freeCtLogs(self.allocator, self.ct_logs);
         self.* = undefined;
     }
@@ -1455,12 +1504,157 @@ pub const Client = struct {
         return true;
     }
 
+    /// RFC 8701 GREASE value for `slot`, or null when GREASE is off.
+    fn greaseValue(self: *const Client, slot: tls_grease.Slot) ?u16 {
+        const seed = self.grease orelse return null;
+        return seed.value(slot);
+    }
+
+    /// RFC 8701 §3.1: a GREASE extension. Following browser practice the first
+    /// is empty and the second carries one zero byte, so both an empty and a
+    /// non-empty unknown extension are exercised. No-op when GREASE is off.
+    fn appendGreaseExtension(self: *const Client, eb: *tls_extension.Builder, slot: tls_grease.Slot) Error!void {
+        const value = self.greaseValue(slot) orelse return;
+        const data: []const u8 = if (slot == .extension2) &[_]u8{0} else &.{};
+        try eb.add(value, data);
+    }
+
+    /// supported_versions body (RFC 8446 §4.2.1): TLS 1.3, preceded by a GREASE
+    /// version when enabled (RFC 8701 §3.1).
+    fn supportedVersionsBody(self: *const Client, buf: *[8]u8) Error![]const u8 {
+        var list: [2]u16 = undefined;
+        var n: usize = 0;
+        if (self.greaseValue(.version)) |g| {
+            list[n] = g;
+            n += 1;
+        }
+        list[n] = tls_supported_versions.tls13;
+        n += 1;
+        return tls_supported_versions.buildClient(buf, list[0..n]);
+    }
+
+    /// supported_groups body (RFC 8446 §4.2.7): the post-quantum hybrid first,
+    /// then X25519 and P-256 (or a test-forced single group), preceded by a
+    /// GREASE group when enabled (RFC 8701 §3.1).
+    fn supportedGroupsBody(self: *const Client, buf: *[16]u8) Error![]const u8 {
+        var list: [4]supported_groups.NamedGroup = undefined;
+        var n: usize = 0;
+        if (self.greaseValue(.group)) |g| {
+            list[n] = supported_groups.NamedGroup.fromInt(g);
+            n += 1;
+        }
+        const real: []const supported_groups.NamedGroup = if (self.force_p256_only_for_test)
+            &.{.secp256r1}
+        else if (self.force_hybrid_only_for_test)
+            &.{.x25519mlkem768}
+        else
+            &.{ .x25519mlkem768, .x25519, .secp256r1 };
+        @memcpy(list[n..][0..real.len], real);
+        n += real.len;
+        return supported_groups.build(buf, list[0..n]);
+    }
+
+    /// signature_algorithms body (RFC 8446 §4.2.3), preceded by a GREASE scheme
+    /// when enabled (RFC 8701 §3.1).
+    fn signatureAlgorithmsBody(self: *const Client, buf: *[16]u8) Error![]const u8 {
+        const real = [_]tls_signature_scheme.SignatureScheme{
+            .rsa_pss_rsae_sha256,
+            .ecdsa_secp256r1_sha256,
+            .ecdsa_secp384r1_sha384,
+            .ed25519,
+            .rsa_pkcs1_sha256,
+        };
+        var list: [real.len + 1]tls_signature_scheme.SignatureScheme = undefined;
+        var n: usize = 0;
+        if (self.greaseValue(.signature_algorithm)) |g| {
+            list[n] = tls_signature_scheme.SignatureScheme.fromInt(g);
+            n += 1;
+        }
+        @memcpy(list[n..][0..real.len], &real);
+        n += real.len;
+        return tls_signature_scheme.build(buf, list[0..n]);
+    }
+
+    /// key_share body (RFC 8446 §4.2.8). ClientHello1: a 1-byte GREASE share
+    /// when enabled (RFC 8701 §3.1), then the hybrid, X25519 and P-256 shares
+    /// (or a test-forced subset). ClientHello2 after a HelloRetryRequest:
+    /// exactly one share, for the requested group (RFC 8446 §4.1.2), so no
+    /// GREASE share there.
+    fn keySharesBody(self: *const Client, buf: *[1400]u8, hybrid_share: []const u8) Error![]const u8 {
+        var entries: [4]tls_keyshare.Entry = undefined;
+        var n: usize = 0;
+        if (self.retry_key_share_group) |g| {
+            entries[0] = switch (g) {
+                .x25519 => .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
+                .secp256r1 => .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
+                .x25519mlkem768 => .{ .group = .x25519mlkem768, .key_exchange = hybrid_share },
+                else => return error.UnsupportedGroup,
+            };
+            return tls_keyshare.buildClientShares(buf, entries[0..1]);
+        }
+        if (self.greaseValue(.group)) |g| {
+            entries[n] = .{ .group = tls_keyshare.NamedGroup.fromInt(g), .key_exchange = &[_]u8{0} };
+            n += 1;
+        }
+        if (self.force_no_shares_for_test) {
+            // Advertise the groups only, so the server must HelloRetryRequest.
+        } else if (self.force_p256_only_for_test) {
+            entries[n] = .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 };
+            n += 1;
+        } else if (self.force_hybrid_only_for_test) {
+            entries[n] = .{ .group = .x25519mlkem768, .key_exchange = hybrid_share };
+            n += 1;
+        } else {
+            entries[n] = .{ .group = .x25519mlkem768, .key_exchange = hybrid_share };
+            entries[n + 1] = .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key };
+            entries[n + 2] = .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 };
+            n += 3;
+        }
+        return tls_keyshare.buildClientShares(buf, entries[0..n]);
+    }
+
+    /// ALPN (RFC 7301) when protocols are configured, led by a GREASE
+    /// identifier when enabled (RFC 8701 §2/§3.1). No-op without protocols.
+    fn appendAlpnExtension(self: *const Client, eb: *tls_extension.Builder) Error!void {
+        if (self.alpn_protocols.len == 0) return;
+        var alpn_buf: [512]u8 = undefined;
+        var alpn_builder = try tls_alpn.Builder.begin(&alpn_buf);
+        if (self.grease) |seed| {
+            const g = seed.alpn();
+            try alpn_builder.add(&g);
+        }
+        for (self.alpn_protocols) |proto| try alpn_builder.add(proto);
+        try eb.addTyped(.alpn, try alpn_builder.finish());
+    }
+
+    /// Echo a HelloRetryRequest cookie (RFC 8446 §4.2.2) in ClientHello2. The
+    /// cookie extension body is opaque cookie<1..2^16-1>.
+    fn appendCookieExtension(self: *const Client, eb: *tls_extension.Builder) Error!void {
+        const cookie = self.cookie orelse return;
+        var cookie_ext: [514]u8 = undefined;
+        std.mem.writeInt(u16, cookie_ext[0..2], @intCast(cookie.len), .big);
+        @memcpy(cookie_ext[2..][0..cookie.len], cookie);
+        try eb.addTyped(.cookie, cookie_ext[0 .. 2 + cookie.len]);
+    }
+
+    fn hybridShareBytes(self: *const Client) [kx.HybridKx.mlkem_public_len + kx.X25519Kx.public_len]u8 {
+        // X25519MLKEM768 client key_share = ml-kem_ek(1184) || x25519_pub(32).
+        var hybrid_share: [kx.HybridKx.mlkem_public_len + kx.X25519Kx.public_len]u8 = undefined;
+        const hy_pub = self.hybrid_pair.publicShare();
+        @memcpy(hybrid_share[0..kx.HybridKx.mlkem_public_len], &hy_pub.mlkem_public_key);
+        @memcpy(hybrid_share[kx.HybridKx.mlkem_public_len..], &hy_pub.x25519_public_key);
+        return hybrid_share;
+    }
+
     /// Append a ClientHello *body* (legacy_version … extensions, no handshake
     /// header) for the ECH path. `sni`, `session_id`, and `random` differ between
     /// the inner and outer hellos; `ech_ext_data` is the `encrypted_client_hello`
     /// extension body (the 1-byte inner marker, or the serialized outer body).
     /// Mirrors the non-PSK, non-test extension set of `writeClientHello`, so an
-    /// accepted ClientHelloInner is a well-formed ordinary ClientHello.
+    /// accepted ClientHelloInner is a well-formed ordinary ClientHello. After a
+    /// HelloRetryRequest it applies the same changes as `writeClientHello`
+    /// (single retry-group share, echoed cookie) to both inner and outer
+    /// (draft-ietf-tls-esni §6.1.5: both are regenerated).
     fn appendEchHelloBody(
         self: *Client,
         body: *std.ArrayList(u8),
@@ -1486,59 +1680,34 @@ pub const Client = struct {
         defer a.free(ext_buf);
         var eb = try tls_extension.Builder.begin(ext_buf);
 
+        try self.appendGreaseExtension(&eb, .extension1);
+
         var sni_buf: [512]u8 = undefined;
         const sni_body = try buildSniBody(&sni_buf, server_name);
         try eb.addTyped(.server_name, sni_body);
 
         var versions_buf: [8]u8 = undefined;
-        const versions = try tls_supported_versions.buildClient(&versions_buf, &[_]u16{tls_supported_versions.tls13});
-        try eb.addTyped(.supported_versions, versions);
+        try eb.addTyped(.supported_versions, try self.supportedVersionsBody(&versions_buf));
 
         var groups_buf: [16]u8 = undefined;
-        const groups = try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{ .x25519mlkem768, .x25519, .secp256r1 });
-        try eb.addTyped(.supported_groups, groups);
+        try eb.addTyped(.supported_groups, try self.supportedGroupsBody(&groups_buf));
 
         var sigs_buf: [16]u8 = undefined;
-        const sigs = try tls_signature_scheme.build(&sigs_buf, &[_]tls_signature_scheme.SignatureScheme{
-            .rsa_pss_rsae_sha256,
-            .ecdsa_secp256r1_sha256,
-            .ecdsa_secp384r1_sha384,
-            .ed25519,
-            .rsa_pkcs1_sha256,
-        });
-        try eb.addTyped(.signature_algorithms, sigs);
+        try eb.addTyped(.signature_algorithms, try self.signatureAlgorithmsBody(&sigs_buf));
         try self.appendCertSigAlgs(&eb);
 
         var rsl_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &rsl_buf, self.receive_record_size_limit, .big);
         try eb.addTyped(.record_size_limit, &rsl_buf);
 
-        var hybrid_share: [kx.HybridKx.mlkem_public_len + kx.X25519Kx.public_len]u8 = undefined;
-        const hy_pub = self.hybrid_pair.publicShare();
-        @memcpy(hybrid_share[0..kx.HybridKx.mlkem_public_len], &hy_pub.mlkem_public_key);
-        @memcpy(hybrid_share[kx.HybridKx.mlkem_public_len..], &hy_pub.x25519_public_key);
+        const hybrid_share = self.hybridShareBytes();
         var keyshare_buf: [1400]u8 = undefined;
         // `force_no_shares_for_test` withholds all key_shares (advertising the
-        // groups only) so a test can drive the server to a HelloRetryRequest through
-        // the ECH path — exercising the ECH×HRR fail-closed abort. Off in production
-        // (the default), so the inner/outer bodies stay byte-identical.
-        const keyshares = if (self.force_no_shares_for_test)
-            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{})
-        else
-            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-                .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
-                .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
-                .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
-            });
-        try eb.addTyped(.key_share, keyshares);
+        // groups only) so a test can drive the server to a HelloRetryRequest
+        // through the ECH path. Off in production (the default).
+        try eb.addTyped(.key_share, try self.keySharesBody(&keyshare_buf, &hybrid_share));
 
-        if (self.alpn_protocols.len != 0) {
-            var alpn_buf: [512]u8 = undefined;
-            var alpn_builder = try tls_alpn.Builder.begin(&alpn_buf);
-            for (self.alpn_protocols) |proto| try alpn_builder.add(proto);
-            const alpn_body = try alpn_builder.finish();
-            try eb.addTyped(.alpn, alpn_body);
-        }
+        try self.appendAlpnExtension(&eb);
 
         try eb.add(ext_status_request, &[_]u8{ 1, 0, 0, 0, 0 });
         // RFC 6962 §3.3: request TLS-delivered SCTs with an EMPTY extension, only
@@ -1550,8 +1719,11 @@ pub const Client = struct {
         if (self.offer_cert_compression) {
             try eb.addTyped(.compress_certificate, &[_]u8{ 2, 0x00, 0x01 });
         }
+        try self.appendCookieExtension(&eb);
+        try self.appendGreaseExtension(&eb, .extension2);
 
         // The encrypted_client_hello extension: inner marker or outer body.
+        // Kept last so the outer payload ends the ClientHello.
         try eb.add(ech.extension_type, ech_ext_data);
 
         const extensions = try eb.finish();
@@ -1590,13 +1762,14 @@ pub const Client = struct {
     fn buildOuterEchBody(
         self: *Client,
         cfg: ech_config.Config,
+        aead_id: u16,
         enc: []const u8,
         payload: []const u8,
     ) Error![]u8 {
         const a = self.allocator;
         const ech_body = try a.alloc(u8, ech.outerExtBodyLen(enc.len, payload.len));
         defer a.free(ech_body);
-        _ = try ech.writeOuterExtBody(ech_body, cfg.config_id, enc, payload);
+        _ = try ech.writeOuterExtBodyForSuite(ech_body, cfg.config_id, enc, payload, aead_id);
         var body: std.ArrayList(u8) = .empty;
         errdefer body.deinit(a);
         try self.appendEchHelloBody(&body, self.ech_public_name.?, &self.legacy_session_id, &self.client_random, ech_body);
@@ -1605,6 +1778,13 @@ pub const Client = struct {
 
     /// Assemble the ClientHelloOuter (with the sealed ClientHelloInner inside) and
     /// append it to `out`. Precondition: `prepareEch()` returned true.
+    ///
+    /// ClientHello1 sets up a fresh HPKE sender context and carries its `enc`.
+    /// ClientHello2 (after a HelloRetryRequest) seals the regenerated inner as
+    /// the second message of that SAME context and sends an EMPTY `enc`
+    /// (draft-ietf-tls-esni §5 and §6.1.5; reusing the context defeats the
+    /// §10.12.2 attack). The ClientHelloOuterAAD is recomputed over the second
+    /// outer (§5.2). The new inner replaces `ech_inner_hello`.
     fn writeClientHelloOuterEch(self: *Client, out: *std.ArrayList(u8)) Error!void {
         const a = self.allocator;
         const cfg = self.ech_selected orelse return error.BadState;
@@ -1624,11 +1804,20 @@ pub const Client = struct {
         try encoded.appendNTimes(a, 0, pad);
 
         // 3. HPKE sender context; `enc` is known before the AAD is built.
-        var eph_seed: [32]u8 = undefined;
-        try osEntropy(&eph_seed);
-        defer secureZero(&eph_seed);
-        var sealer = try ech.beginSeal(a, cfg, eph_seed);
-        errdefer sealer.wipe(); // `seal` wipes it on the success path
+        const fresh = self.ech_sealer == null;
+        if (fresh) {
+            if (self.hrr_seen) return error.BadState; // CH2 must reuse CH1's context
+            var eph_seed: [32]u8 = undefined;
+            try osEntropy(&eph_seed);
+            defer secureZero(&eph_seed);
+            self.ech_sealer = try ech.beginSeal(a, cfg, eph_seed);
+        }
+        errdefer if (fresh) {
+            self.ech_sealer.?.wipe();
+            self.ech_sealer = null;
+        };
+        const sealer = &self.ech_sealer.?;
+        const enc: []const u8 = if (fresh) &sealer.enc else &.{};
 
         // 4. ClientHelloOuterAAD: the header-less outer ClientHello body with a
         //    zeroed payload placeholder of the exact sealed length.
@@ -1636,26 +1825,53 @@ pub const Client = struct {
         const zero_payload = try a.alloc(u8, payload_len);
         defer a.free(zero_payload);
         @memset(zero_payload, 0);
-        const aad_body = try self.buildOuterEchBody(cfg, &sealer.enc, zero_payload);
+        const aad_body = try self.buildOuterEchBody(cfg, sealer.aead_id, enc, zero_payload);
         defer a.free(aad_body);
 
-        // 5. Seal the padded encoded inner, authenticating the AAD.
-        const payload = try sealer.seal(a, aad_body, encoded.items);
+        // 5. Seal the padded encoded inner, authenticating the AAD. The context
+        //    is kept for a possible ClientHello2 and wiped at the ServerHello.
+        const payload = try sealer.sealNext(a, aad_body, encoded.items);
         defer a.free(payload);
         if (payload.len != payload_len) return error.BadHandshake;
 
         // 6. Final ClientHelloOuter body — identical to the AAD body except the
         //    real payload replaces the zeros — wrapped into the handshake message
         //    and appended to `out`.
-        const outer_body = try self.buildOuterEchBody(cfg, &sealer.enc, payload);
+        const outer_body = try self.buildOuterEchBody(cfg, sealer.aead_id, enc, payload);
         defer a.free(outer_body);
         try writeHandshake(a, out, .client_hello, outer_body);
 
-        // Commit (last statement — no fallible op follows). Free any prior inner
-        // hello so a re-entrant start() (e.g. retried after a mid-start OOM) stays
-        // free-once; the idempotent `prepareEch` makes this unreachable in normal use.
+        // Commit (last statement — no fallible op follows). Free the prior inner
+        // hello (ClientHelloInner1 when this is the HRR retry).
         if (self.ech_inner_hello) |old| a.free(old);
         self.ech_inner_hello = inner_hello;
+    }
+
+    /// draft-ietf-tls-esni §6.2: build (once) the GREASE `encrypted_client_hello`
+    /// extension body sent when no real ECH is offered. cipher_suite is the
+    /// mandatory HKDF-SHA256/AES-128-GCM, config_id and the 32-byte X25519
+    /// `enc` are random, and the payload is random with the length a real
+    /// offer would have: the padded EncodedClientHelloInner (§6.1.3) plus the
+    /// AEAD tag. A ClientHello2 re-sends the identical bytes (§6.2).
+    fn echGreaseBody(self: *Client) Error![]const u8 {
+        if (self.ech_grease_ext) |body| return body;
+        const a = self.allocator;
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(a);
+        try self.appendEchHelloBody(&encoded, self.server_name, &.{}, &self.ech_inner_random, &ech.inner_ext_body);
+        const payload_len = encoded.items.len + ech.paddingLen(encoded.items.len, self.server_name.len, 0) + ech.tag_len;
+        const payload = try a.alloc(u8, payload_len);
+        defer a.free(payload);
+        try osEntropy(payload);
+        var enc: [ech.hpke_public_key_len]u8 = undefined;
+        try osEntropy(&enc);
+        var config_id: [1]u8 = undefined;
+        try osEntropy(&config_id);
+        const body = try a.alloc(u8, ech.outerExtBodyLen(enc.len, payload.len));
+        errdefer a.free(body);
+        _ = try ech.writeOuterExtBodyForSuite(body, config_id[0], &enc, payload, ech.aead_id_aes128_gcm);
+        self.ech_grease_ext = body;
+        return body;
     }
 
     /// Verify the ECH acceptance confirmation in ServerHello.random[24..32]
@@ -1663,20 +1879,35 @@ pub const Client = struct {
     /// from ClientHelloOuter to ClientHelloInner. Must run after `parseServerHello`
     /// (so the suite is known) and before ServerHello is folded into the
     /// transcript / the handshake keys are derived.
+    ///
+    /// After a HelloRetryRequest the decision was already made by the HRR's
+    /// "hrr ech accept confirmation" (§7.2.1) and the transcript already
+    /// follows the chosen ClientHello. If the HRR accepted ECH, the ServerHello
+    /// MUST confirm over Transcript-Hash(ClientHelloInner1, HRR,
+    /// ClientHelloInner2, ServerHelloECHConf), else the negotiation is
+    /// inconsistent and the client aborts (§6.1.5). If the HRR rejected ECH the
+    /// handshake stays on the outer transcript.
     fn checkEchAcceptance(self: *Client, sh_raw: []const u8) Error!void {
         const inner = self.ech_inner_hello orelse return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
         // ServerHello = header(4) + legacy_version(2) + random(32) + …; the
         // confirmation is random[24..32] = sh_raw[30..38].
         if (sh_raw.len < 38) return error.BadHandshake;
+        const after_hrr = self.hrr_seen;
+        if (after_hrr and !(self.ech_hrr_accepted orelse false)) {
+            self.ech_accepted = false;
+            return;
+        }
 
-        // Confirmation transcript = ClientHelloInner || ServerHelloECHConf, where
-        // ServerHelloECHConf is this ServerHello with random[24..32] set to zero.
+        // Confirmation transcript = <ClientHelloInner | post-HRR inner transcript>
+        // || ServerHelloECHConf, where ServerHelloECHConf is this ServerHello
+        // with random[24..32] set to zero.
+        const prefix: []const u8 = if (after_hrr) self.transcript.items else inner;
         var conf: std.ArrayList(u8) = .empty;
         defer conf.deinit(self.allocator);
-        try conf.appendSlice(self.allocator, inner);
+        try conf.appendSlice(self.allocator, prefix);
         try conf.appendSlice(self.allocator, sh_raw);
-        @memset(conf.items[inner.len + 30 .. inner.len + 38], 0);
+        @memset(conf.items[prefix.len + 30 .. prefix.len + 38], 0);
 
         var expected: [ech.confirmation_len]u8 = undefined;
         switch (suite.hashAlg()) {
@@ -1692,6 +1923,11 @@ pub const Client = struct {
 
         const accepted = ctBytesEqual(&expected, sh_raw[30..38]);
         secureZero(&expected);
+        if (after_hrr) {
+            if (!accepted) return error.EchInconsistent;
+            self.ech_accepted = true;
+            return;
+        }
         self.ech_accepted = accepted;
         if (accepted) {
             // The server accepted ECH: the handshake proceeds over the inner
@@ -1699,6 +1935,41 @@ pub const Client = struct {
             self.transcript.clearRetainingCapacity();
             try self.appendTranscript(inner);
         }
+    }
+
+    /// draft-ietf-tls-esni §7.2.1: whether a HelloRetryRequest confirms ECH
+    /// acceptance. `hrr_raw` is the HRR handshake message; `conf_off` is the
+    /// offset in it of the 8-byte `encrypted_client_hello` payload. The
+    /// expected value is
+    ///   HKDF-Expand-Label(HKDF-Extract(0, ClientHelloInner1.random),
+    ///                     "hrr ech accept confirmation",
+    ///                     Transcript-Hash(ClientHelloInner1, HelloRetryRequestECHConf), 8)
+    /// where HelloRetryRequestECHConf has that payload zeroed and the
+    /// transcript applies RFC 8446 §4.4.1's message_hash rule to
+    /// ClientHelloInner1. Must run once `selected_suite` holds the HRR suite.
+    fn hrrConfirmsEch(self: *Client, hrr_raw: []const u8, conf_off: usize) Error!bool {
+        const inner = self.ech_inner_hello orelse return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        if (conf_off + ech.confirmation_len > hrr_raw.len) return error.BadHandshake;
+        var expected: [ech.confirmation_len]u8 = undefined;
+        defer secureZero(&expected);
+        switch (suite.hashAlg()) {
+            inline else => |alg| {
+                const KS = if (alg == .sha256) Sha256 else Sha384;
+                const inner_hash = KS.transcriptHash(inner);
+                var conf: std.ArrayList(u8) = .empty;
+                defer conf.deinit(self.allocator);
+                try conf.append(self.allocator, 0xFE);
+                try appendU24(self.allocator, &conf, KS.hash_len);
+                try conf.appendSlice(self.allocator, &inner_hash);
+                const hrr_start = conf.items.len;
+                try conf.appendSlice(self.allocator, hrr_raw);
+                @memset(conf.items[hrr_start + conf_off ..][0..ech.confirmation_len], 0);
+                const th = KS.transcriptHash(conf.items);
+                try ech.acceptConfirmation(KS, &self.ech_inner_random, &th, .hello_retry_request, &expected);
+            },
+        }
+        return ctBytesEqual(&expected, hrr_raw[conf_off..][0..ech.confirmation_len]);
     }
 
     /// Emit the opt-in `signature_algorithms_cert` extension (RFC 8446 §4.2.3)
@@ -1721,7 +1992,11 @@ pub const Client = struct {
         const forced = @as(u8, @intFromBool(aes128)) + @intFromBool(self.force_chacha_only_for_test) + @intFromBool(self.force_aes256_only_for_test);
         if (forced > 1) return error.BadState;
         const suites: []const u16 = if (aes128) &.{0x1301} else if (self.force_chacha_only_for_test) &.{0x1303} else if (self.force_aes256_only_for_test) &.{0x1302} else &.{ 0x1302, 0x1303, 0x1301 };
-        try appendU16(self.allocator, body, @intCast(suites.len * 2));
+        // RFC 8701 §3.1: a GREASE cipher suite leads the list when enabled.
+        const grease = self.greaseValue(.cipher_suite);
+        const count = suites.len + @intFromBool(grease != null);
+        try appendU16(self.allocator, body, @intCast(count * 2));
+        if (grease) |g| try appendU16(self.allocator, body, g);
         for (suites) |suite| try appendU16(self.allocator, body, suite);
     }
 
@@ -1741,36 +2016,29 @@ pub const Client = struct {
         try body.append(self.allocator, 1);
         try body.append(self.allocator, 0);
 
-        var ext_storage: [4096]u8 = undefined;
-        var ext_builder = try tls_extension.Builder.begin(&ext_storage);
+        // draft-ietf-tls-esni §6.2 GREASE ECH (opt-in, only without real ECH).
+        const grease_ech: ?[]const u8 = if (self.ech_grease and !self.ech_active) try self.echGreaseBody() else null;
+        const ext_cap = 4096 + if (grease_ech) |g| g.len + tls_extension.header_len else 0;
+        const ext_storage = try self.allocator.alloc(u8, ext_cap);
+        defer self.allocator.free(ext_storage);
+        var ext_builder = try tls_extension.Builder.begin(ext_storage);
+
+        // RFC 8701: an empty GREASE extension first.
+        try self.appendGreaseExtension(&ext_builder, .extension1);
 
         var sni_buf: [512]u8 = undefined;
         const sni_body = try buildSniBody(&sni_buf, self.server_name);
         try ext_builder.addTyped(.server_name, sni_body);
 
         var versions_buf: [8]u8 = undefined;
-        const versions = try tls_supported_versions.buildClient(&versions_buf, &[_]u16{tls_supported_versions.tls13});
-        try ext_builder.addTyped(.supported_versions, versions);
+        try ext_builder.addTyped(.supported_versions, try self.supportedVersionsBody(&versions_buf));
 
+        // Prefer the post-quantum hybrid, then classical x25519 / P-256.
         var groups_buf: [16]u8 = undefined;
-        const groups = if (self.force_p256_only_for_test)
-            try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{.secp256r1})
-        else if (self.force_hybrid_only_for_test)
-            try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{.x25519mlkem768})
-        else
-            // Prefer the post-quantum hybrid, then classical x25519 / P-256.
-            try supported_groups.build(&groups_buf, &[_]supported_groups.NamedGroup{ .x25519mlkem768, .x25519, .secp256r1 });
-        try ext_builder.addTyped(.supported_groups, groups);
+        try ext_builder.addTyped(.supported_groups, try self.supportedGroupsBody(&groups_buf));
 
         var sigs_buf: [16]u8 = undefined;
-        const sigs = try tls_signature_scheme.build(&sigs_buf, &[_]tls_signature_scheme.SignatureScheme{
-            .rsa_pss_rsae_sha256,
-            .ecdsa_secp256r1_sha256,
-            .ecdsa_secp384r1_sha384,
-            .ed25519,
-            .rsa_pkcs1_sha256,
-        });
-        try ext_builder.addTyped(.signature_algorithms, sigs);
+        try ext_builder.addTyped(.signature_algorithms, try self.signatureAlgorithmsBody(&sigs_buf));
         try self.appendCertSigAlgs(&ext_builder);
 
         // RFC 8449 record_size_limit: advertise the largest TLSInnerPlaintext we
@@ -1779,54 +2047,13 @@ pub const Client = struct {
         std.mem.writeInt(u16, &rsl_buf, self.receive_record_size_limit, .big);
         try ext_builder.addTyped(.record_size_limit, &rsl_buf);
 
-        // X25519MLKEM768 client key_share = ml-kem_ek(1184) || x25519_pub(32).
-        var hybrid_share: [kx.HybridKx.mlkem_public_len + kx.X25519Kx.public_len]u8 = undefined;
-        const hy_pub = self.hybrid_pair.publicShare();
-        @memcpy(hybrid_share[0..kx.HybridKx.mlkem_public_len], &hy_pub.mlkem_public_key);
-        @memcpy(hybrid_share[kx.HybridKx.mlkem_public_len..], &hy_pub.x25519_public_key);
-
-        // Sized for the hybrid share (1216B) + x25519 (32B) + P-256 (65B) + headers.
+        // Sized for GREASE (5B) + hybrid share (1220B) + x25519 (36B) + P-256
+        // (69B) + the list length.
+        const hybrid_share = self.hybridShareBytes();
         var keyshare_buf: [1400]u8 = undefined;
-        const keyshares = if (self.retry_key_share_group) |g|
-            // ClientHello2 after a HelloRetryRequest: exactly one share, for the
-            // group the server requested (RFC 8446 §4.1.2).
-            switch (g) {
-                .x25519 => try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-                    .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
-                }),
-                .secp256r1 => try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-                    .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
-                }),
-                .x25519mlkem768 => try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-                    .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
-                }),
-                else => return error.UnsupportedGroup,
-            }
-        else if (self.force_no_shares_for_test)
-            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{})
-        else if (self.force_p256_only_for_test)
-            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-                .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
-            })
-        else if (self.force_hybrid_only_for_test)
-            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-                .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
-            })
-        else
-            try tls_keyshare.buildClientShares(&keyshare_buf, &[_]tls_keyshare.Entry{
-                .{ .group = .x25519mlkem768, .key_exchange = &hybrid_share },
-                .{ .group = .x25519, .key_exchange = &self.x25519_pair.public_key },
-                .{ .group = .secp256r1, .key_exchange = &self.p256_pair.public_sec1 },
-            });
-        try ext_builder.addTyped(.key_share, keyshares);
+        try ext_builder.addTyped(.key_share, try self.keySharesBody(&keyshare_buf, &hybrid_share));
 
-        if (self.alpn_protocols.len != 0) {
-            var alpn_buf: [512]u8 = undefined;
-            var alpn_builder = try tls_alpn.Builder.begin(&alpn_buf);
-            for (self.alpn_protocols) |proto| try alpn_builder.add(proto);
-            const alpn_body = try alpn_builder.finish();
-            try ext_builder.addTyped(.alpn, alpn_body);
-        }
+        try self.appendAlpnExtension(&ext_builder);
 
         // RFC 6066 / RFC 8446 OCSP stapling request:
         // status_type=ocsp(1), empty responder_id_list, empty request_extensions.
@@ -1879,14 +2106,13 @@ pub const Client = struct {
             try ext_builder.add(delegated_credential.extension_type, dc_body);
         }
 
-        // Echo a HelloRetryRequest cookie in the retried ClientHello. The cookie
-        // extension body is opaque cookie<1..2^16-1>: a u16 length then the bytes.
-        if (self.cookie) |cookie| {
-            var cookie_ext: [514]u8 = undefined;
-            std.mem.writeInt(u16, cookie_ext[0..2], @intCast(cookie.len), .big);
-            @memcpy(cookie_ext[2..][0..cookie.len], cookie);
-            try ext_builder.addTyped(.cookie, cookie_ext[0 .. 2 + cookie.len]);
-        }
+        // Echo a HelloRetryRequest cookie in the retried ClientHello.
+        try self.appendCookieExtension(&ext_builder);
+
+        if (grease_ech) |g| try ext_builder.add(ech.extension_type, g);
+        // RFC 8701: the second (1-byte) GREASE extension, still before any
+        // pre_shared_key (RFC 8446 §4.2.11: that one MUST be last).
+        try self.appendGreaseExtension(&ext_builder, .extension2);
 
         var binder_offset: ?usize = null;
         var binder_len: usize = 0;
@@ -1987,7 +2213,6 @@ pub const Client = struct {
 
                 if (isHelloRetryRequest(msg.body)) {
                     if (self.hrr_seen) return error.BadHandshake;
-                    if (self.ech_active) return error.HelloRetryRequestUnsupported;
                     const ch2 = try self.handleHelloRetryRequest(msg.body, msg.raw);
                     self.server_hello_reassembly.consume(message_len);
                     self.retry_hello = ch2;
@@ -1996,6 +2221,11 @@ pub const Client = struct {
 
                 var selected = try self.parseServerHello(msg.body);
                 if (self.ech_active) try self.checkEchAcceptance(msg.raw);
+                // No further ClientHello can follow: retire the ECH HPKE context.
+                if (self.ech_sealer) |*s| {
+                    s.wipe();
+                    self.ech_sealer = null;
+                }
                 try self.appendTranscript(msg.raw);
                 try self.deriveHandshakeKeys(selected.buf[0..selected.len]);
                 secureZero(&selected.buf);
@@ -2023,6 +2253,13 @@ pub const Client = struct {
     /// Process a HelloRetryRequest (RFC 8446 §4.1.4): apply the cookie, rewrite
     /// the transcript with the synthetic message_hash, and produce the second
     /// ClientHello to send. Returns the plaintext handshake record (caller owns).
+    ///
+    /// With ECH offered (draft-ietf-tls-esni §6.1.5 / §7.2.1) the HRR's
+    /// `encrypted_client_hello` confirmation decides whether the server is
+    /// following ClientHelloInner1 (accepted) or ClientHelloOuter1 (rejected).
+    /// The transcript continues from that ClientHello, ClientHello2 regenerates
+    /// both inner and outer (the inner sealed under the same HPKE context, empty
+    /// `enc`), and the transcript then takes the matching second ClientHello.
     fn handleHelloRetryRequest(self: *Client, body: []const u8, raw: []const u8) Error![]u8 {
         var c = Cursor.init(body);
         if (try c.readU16() != tls_record.legacy_record_version) return error.ProtocolVersion;
@@ -2037,8 +2274,22 @@ pub const Client = struct {
         var selected_version = false;
         var hrr_group: ?u16 = null;
         var cookie_bytes: ?[]const u8 = null;
+        var ech_conf_off: ?usize = null;
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
+            // RFC 8701 §3.1: a server never echoes a GREASE extension.
+            if (tls_grease.isGrease(ext.ext_type)) return error.BadHandshake;
+            if (ext.ext_type == ech.extension_type) {
+                // draft-ietf-tls-esni §7.2.1 / §6.2: the HRR ECH extension is an
+                // 8-byte confirmation; anything else is a decode_error. It is
+                // only legal when we offered ECH (real or GREASE) — otherwise it
+                // is an unsolicited extension (RFC 8446 §4.1.4).
+                if (!self.ech_active and self.ech_grease_ext == null) return error.BadHandshake;
+                if (ext.data.len != ech.confirmation_len) return error.BadHandshake;
+                if (ech_conf_off != null) return error.BadHandshake;
+                ech_conf_off = @intFromPtr(ext.data.ptr) - @intFromPtr(raw.ptr);
+                continue;
+            }
             switch (ext.typed()) {
                 .supported_versions => {
                     if (try tls_supported_versions.parseServer(ext.data) != tls_supported_versions.tls13) {
@@ -2068,6 +2319,7 @@ pub const Client = struct {
         // already offer a key_share for (a change-nothing HRR is illegal). By
         // default we share every group we support, so any group-change request is
         // non-compliant — but a test that withheld shares legitimately retries.
+        // A GREASE group is never supported (RFC 8701 §3.1).
         if (hrr_group) |g| {
             const ng = supported_groups.NamedGroup.fromInt(g);
             if (!self.supportsGroup(ng)) return error.UnsupportedGroup;
@@ -2081,8 +2333,22 @@ pub const Client = struct {
             self.cookie = self.cookie_buf[0..cb.len];
         }
 
+        // draft-ietf-tls-esni §7.2.1: with ECH offered, the HRR confirmation
+        // tells us which ClientHello1 the server is following. A missing or
+        // mismatching confirmation means ECH was rejected.
+        var ech_hrr_accepted = false;
+        if (self.ech_active) {
+            if (ech_conf_off) |off| ech_hrr_accepted = try self.hrrConfirmsEch(raw, off);
+            self.ech_hrr_accepted = ech_hrr_accepted;
+        }
+
         // Replace ClientHello1 in the transcript with the synthetic message_hash
         // (handshake type 254): 0xFE || uint24(Hash.length) || Hash(ClientHello1).
+        // With ECH accepted at HRR, ClientHello1 is the inner one.
+        if (ech_hrr_accepted) {
+            self.transcript.clearRetainingCapacity();
+            try self.appendTranscript(self.ech_inner_hello.?);
+        }
         var ch1_hash: [max_hash_len]u8 = undefined;
         const hlen = self.transcriptHash(&ch1_hash);
         self.transcript.clearRetainingCapacity();
@@ -2094,11 +2360,18 @@ pub const Client = struct {
 
         // Build ClientHello2 (same random/session-id; key_share now the single
         // requested group when the HRR changed groups, plus any cookie) and fold
-        // it into the transcript before sending.
+        // it into the transcript before sending. Under ECH the wire carries the
+        // second ClientHelloOuter; the transcript takes ClientHelloInner2 when
+        // the HRR accepted ECH, else ClientHelloOuter2.
         var hs: std.ArrayList(u8) = .empty;
         defer hs.deinit(self.allocator);
-        try self.writeClientHello(&hs);
-        try self.appendTranscript(hs.items);
+        if (self.ech_active) {
+            try self.writeClientHelloOuterEch(&hs);
+            try self.appendTranscript(if (ech_hrr_accepted) self.ech_inner_hello.? else hs.items);
+        } else {
+            try self.writeClientHello(&hs);
+            try self.appendTranscript(hs.items);
+        }
         return writePlainRecord(self.allocator, .handshake, hs.items);
     }
 
@@ -2233,6 +2506,8 @@ pub const Client = struct {
         var selected_psk: ?u16 = null;
         var it = tls_extension.Iterator.init(extensions_block);
         while (try it.next()) |ext| {
+            // RFC 8701 §3.1: a server never negotiates a GREASE extension.
+            if (tls_grease.isGrease(ext.ext_type)) return error.BadHandshake;
             switch (ext.typed()) {
                 .supported_versions => {
                     if (try tls_supported_versions.parseServer(ext.data) != tls_supported_versions.tls13) {
@@ -2323,9 +2598,16 @@ pub const Client = struct {
             if (ext.ext_type == ech.extension_type) {
                 if (self.ech_active and !(self.ech_accepted orelse false) and self.ech_retry_configs == null) {
                     self.ech_retry_configs = try self.allocator.dupe(u8, ext.data);
+                } else if (!self.ech_active and self.ech_grease_ext != null) {
+                    // draft-ietf-tls-esni §6.2: after GREASE ECH the client MUST
+                    // check retry_configs syntactically (decode_error if bad)
+                    // and MUST NOT save them.
+                    ech_config.validateList(ext.data) catch return error.BadHandshake;
                 }
                 continue;
             }
+            // RFC 8701 §3.1: a server never negotiates a GREASE extension.
+            if (tls_grease.isGrease(ext.ext_type)) return error.BadHandshake;
             switch (ext.typed()) {
                 .alpn => {
                     var names = try tls_alpn.Iterator.fromBlock(ext.data);
@@ -3041,6 +3323,19 @@ fn sealRecordBatchAlloc(allocator: Allocator, suite: CipherSuite, keys: *const T
     return .{ .bytes = out, .next_seq = layout.next_seq };
 }
 
+/// The `tls_record` AEAD backing each TLS 1.3 suite. Every protected record
+/// this client seals or opens goes through `tls_record.sealEncodedRecord` /
+/// `tls_record.openParsedRecord` with this algorithm: the same audited code
+/// `tls_server` uses and that the record-layer exploit corpus and RFC 8448
+/// known-answer tests drive (Armor audit Phase 2 item 1).
+fn recordAeadAlg(comptime suite: CipherSuite) tls_record.AeadAlg {
+    return switch (suite) {
+        .tls_aes_128_gcm_sha256 => .aes128_gcm,
+        .tls_aes_256_gcm_sha384 => .aes256_gcm,
+        .tls_chacha20_poly1305_sha256 => .chacha20_poly1305,
+    };
+}
+
 fn sealRecordAlloc(
     allocator: Allocator,
     suite: CipherSuite,
@@ -3049,34 +3344,23 @@ fn sealRecordAlloc(
     typ: tls_record.ContentType,
     plaintext: []const u8,
 ) Error![]u8 {
-    const inner_len = plaintext.len + 1;
-    const inner = try allocator.alloc(u8, inner_len);
-    defer allocator.free(inner);
+    const inner = try allocator.alloc(u8, plaintext.len + 1);
+    defer {
+        secureZero(inner);
+        allocator.free(inner);
+    }
     const encoded = try tls_record.encodeInnerPlaintext(typ, plaintext, 0, inner);
     const encrypted_len = encoded.len + suite.tagLen();
-    var out = try allocator.alloc(u8, tls_record.record_header_len + encrypted_len);
+    const out = try allocator.alloc(u8, tls_record.record_header_len + encrypted_len);
     errdefer allocator.free(out);
-    const aad = tls_record.makeAdditionalData(@intCast(encrypted_len));
-    @memcpy(out[0..tls_record.record_header_len], &aad);
-    const nonce = tls_record.deriveNonce(keys.iv, seq);
     switch (suite) {
-        .tls_aes_128_gcm_sha256 => {
-            const key = keys.key[0..Aes128Gcm.key_length].*;
-            var tag: [Aes128Gcm.tag_length]u8 = undefined;
-            Aes128Gcm.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
-            @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
-        },
-        .tls_aes_256_gcm_sha384 => {
-            const key = keys.key[0..Aes256Gcm.key_length].*;
-            var tag: [Aes256Gcm.tag_length]u8 = undefined;
-            Aes256Gcm.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
-            @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
-        },
-        .tls_chacha20_poly1305_sha256 => {
-            const key = keys.key[0..ChaCha20Poly1305.key_length].*;
-            var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
-            ChaCha20Poly1305.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
-            @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
+        inline else => |s| {
+            const alg = comptime recordAeadAlg(s);
+            const A = tls_record.Aead(alg);
+            var cipher = A.init(keys.key[0..A.key_length].*);
+            defer cipher.deinit();
+            const sealed = try tls_record.sealEncodedRecord(alg, &cipher, keys.iv, seq, encoded, out);
+            std.debug.assert(sealed.len == out.len);
         },
     }
     return out;
@@ -3093,30 +3377,141 @@ fn openRecordAlloc(
     if (parsed.encrypted_record.len < suite.tagLen()) return error.RecordAuthenticationFailed;
     const clen = parsed.encrypted_record.len - suite.tagLen();
     const inner = try allocator.alloc(u8, clen);
-    errdefer allocator.free(inner);
-    const aad = parsed.headerBytes();
-    const nonce = tls_record.deriveNonce(keys.iv, seq);
-    switch (suite) {
-        .tls_aes_128_gcm_sha256 => {
-            const key = keys.key[0..Aes128Gcm.key_length].*;
-            const tag = parsed.encrypted_record[clen..][0..Aes128Gcm.tag_length].*;
-            Aes128Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
-        },
-        .tls_aes_256_gcm_sha384 => {
-            const key = keys.key[0..Aes256Gcm.key_length].*;
-            const tag = parsed.encrypted_record[clen..][0..Aes256Gcm.tag_length].*;
-            Aes256Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
-        },
-        .tls_chacha20_poly1305_sha256 => {
-            const key = keys.key[0..ChaCha20Poly1305.key_length].*;
-            const tag = parsed.encrypted_record[clen..][0..ChaCha20Poly1305.tag_length].*;
-            ChaCha20Poly1305.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
-        },
+    errdefer {
+        secureZero(inner);
+        allocator.free(inner);
     }
-    const opened = try tls_record.decodeInnerPlaintext(inner);
+    const opened = switch (suite) {
+        inline else => |s| blk: {
+            const alg = comptime recordAeadAlg(s);
+            const A = tls_record.Aead(alg);
+            var cipher = A.init(keys.key[0..A.key_length].*);
+            defer cipher.deinit();
+            break :blk tls_record.openParsedRecord(alg, &cipher, keys.iv, seq, parsed, inner) catch |err| return switch (err) {
+                error.AuthFailed => error.RecordAuthenticationFailed,
+                else => err,
+            };
+        },
+    };
     const content = try allocator.dupe(u8, opened.content);
+    secureZero(inner);
     allocator.free(inner);
     return .{ .content_type = opened.content_type, .content = content, .inner_len = clen };
+}
+
+/// Independent reference for one protected TLS 1.3 record, written straight
+/// against std.crypto (RFC 8446 section 5.2/5.3) without any `tls_record`
+/// sealing code, so the client's production path is checked against a second
+/// encoding.
+fn referenceSealForTest(comptime Impl: type, key: [Impl.key_length]u8, iv: tls_record.Nonce96, seq: u64, typ: tls_record.ContentType, plaintext: []const u8, out: []u8) []u8 {
+    const inner_len = plaintext.len + 1;
+    const total = 5 + inner_len + Impl.tag_length;
+    out[0] = 23;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    std.mem.writeInt(u16, out[3..5], @intCast(inner_len + Impl.tag_length), .big);
+    var inner: [64]u8 = undefined;
+    @memcpy(inner[0..plaintext.len], plaintext);
+    inner[plaintext.len] = @backingInt(typ);
+    var nonce = iv;
+    var seq_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seq_be, seq, .big);
+    for (nonce[4..], seq_be) |*n, b| n.* ^= b;
+    var tag: [Impl.tag_length]u8 = undefined;
+    Impl.encrypt(out[5..][0..inner_len], &tag, inner[0..inner_len], out[0..5], nonce, key);
+    @memcpy(out[5 + inner_len ..][0..Impl.tag_length], &tag);
+    return out[0..total];
+}
+
+test "record path: tls_client seal equals tls_record.sealRecord and an independent encoding for all three suites" {
+    const alloc = std.testing.allocator;
+    const iv = hexConst("0f0e0d0c0b0a090807060504");
+    const plaintexts = [_][]const u8{ "", "x", "PRIVMSG #onyx :client record parity" };
+    const types = [_]tls_record.ContentType{ .application_data, .handshake, .alert };
+    const seqs = [_]u64{ 0, 1, 0x0102030405060708, std.math.maxInt(u64) - 1 };
+    inline for (.{ CipherSuite.tls_aes_128_gcm_sha256, CipherSuite.tls_aes_256_gcm_sha384, CipherSuite.tls_chacha20_poly1305_sha256 }) |suite| {
+        const alg = comptime recordAeadAlg(suite);
+        const A = tls_record.Aead(alg);
+        const Impl = switch (suite) {
+            .tls_aes_128_gcm_sha256 => Aes128Gcm,
+            .tls_aes_256_gcm_sha384 => Aes256Gcm,
+            .tls_chacha20_poly1305_sha256 => ChaCha20Poly1305,
+        };
+        var keys: TrafficKeys = .{};
+        for (&keys.key, 0..) |*b, i| b.* = @intCast(0x5C ^ i);
+        keys.iv = iv;
+        defer keys.wipe();
+        try std.testing.expectEqual(A.key_length, suite.keyLen());
+        try std.testing.expectEqual(A.tag_length, suite.tagLen());
+
+        var cipher = A.init(keys.key[0..A.key_length].*);
+        defer cipher.deinit();
+        for (plaintexts) |pt| for (types) |typ| for (seqs) |seq| {
+            const client_rec = try sealRecordAlloc(alloc, suite, &keys, seq, typ, pt);
+            defer alloc.free(client_rec);
+
+            var inner: [64]u8 = undefined;
+            var lib_buf: [128]u8 = undefined;
+            const lib_rec = try tls_record.sealRecord(alg, &cipher, keys.iv, seq, typ, pt, 0, &inner, &lib_buf);
+            try std.testing.expectEqualSlices(u8, lib_rec, client_rec);
+
+            var ref_buf: [128]u8 = undefined;
+            const ref_rec = referenceSealForTest(Impl, keys.key[0..Impl.key_length].*, keys.iv, seq, typ, pt, &ref_buf);
+            try std.testing.expectEqualSlices(u8, ref_rec, client_rec);
+
+            const opened = try openRecordAlloc(alloc, suite, &keys, seq, client_rec);
+            defer alloc.free(opened.content);
+            try std.testing.expectEqual(typ, opened.content_type);
+            try std.testing.expectEqualSlices(u8, pt, opened.content);
+            try std.testing.expectEqual(pt.len + 1, opened.inner_len);
+        };
+    }
+}
+
+test "record path: tls_client seal/open reproduce RFC 8448 AES-128-GCM records byte for byte" {
+    const alloc = std.testing.allocator;
+    for (tls_record.rfc8448_records) |v| {
+        var keys: TrafficKeys = .{};
+        defer keys.wipe();
+        @memcpy(keys.key[0..v.key.len], &v.key);
+        keys.iv = v.iv;
+        const sealed = try sealRecordAlloc(alloc, .tls_aes_128_gcm_sha256, &keys, v.seq, v.content_type, v.payload);
+        defer alloc.free(sealed);
+        try std.testing.expectEqualSlices(u8, v.record, sealed);
+        const opened = try openRecordAlloc(alloc, .tls_aes_128_gcm_sha256, &keys, v.seq, v.record);
+        defer alloc.free(opened.content);
+        try std.testing.expectEqual(v.content_type, opened.content_type);
+        try std.testing.expectEqualSlices(u8, v.payload, opened.content);
+    }
+}
+
+test "record path: tls_client open maps forgery, wrong seq and short records to RecordAuthenticationFailed" {
+    const alloc = std.testing.allocator;
+    inline for (.{ CipherSuite.tls_aes_128_gcm_sha256, CipherSuite.tls_aes_256_gcm_sha384, CipherSuite.tls_chacha20_poly1305_sha256 }) |suite| {
+        var keys: TrafficKeys = .{};
+        defer keys.wipe();
+        @memset(&keys.key, 0x3c);
+        keys.iv = @splat(0x4d);
+        const rec = try sealRecordAlloc(alloc, suite, &keys, 9, .application_data, "fail closed");
+        defer alloc.free(rec);
+
+        try std.testing.expectError(error.RecordAuthenticationFailed, openRecordAlloc(alloc, suite, &keys, 10, rec));
+        rec[rec.len - 1] ^= 0x80;
+        try std.testing.expectError(error.RecordAuthenticationFailed, openRecordAlloc(alloc, suite, &keys, 9, rec));
+        rec[rec.len - 1] ^= 0x80;
+        rec[tls_record.record_header_len] ^= 0x01;
+        try std.testing.expectError(error.RecordAuthenticationFailed, openRecordAlloc(alloc, suite, &keys, 9, rec));
+        rec[tls_record.record_header_len] ^= 0x01;
+
+        // Shorter than the tag: refused before any allocation or AEAD call.
+        var short: [5 + 15]u8 = @splat(0);
+        short[0..5].* = tls_record.makeAdditionalData(15);
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try std.testing.expectError(error.RecordAuthenticationFailed, openRecordAlloc(failing.allocator(), suite, &keys, 9, &short));
+
+        // change_cipher_spec is never a protected inner type: refused at seal.
+        try std.testing.expectError(error.InvalidContentType, sealRecordAlloc(alloc, suite, &keys, 9, .change_cipher_spec, &.{1}));
+    }
 }
 
 fn deriveTrafficKeys(suite: CipherSuite, secret_bytes: []const u8, out: *TrafficKeys) Error!void {
@@ -8467,5 +8862,368 @@ test "TLS AES128-only fixture rejects conflicting suite offers" {
         client.force_aes256_only_for_test = variant != 1;
         client.force_chacha_only_for_test = variant != 0;
         try std.testing.expectError(error.BadState, client.start());
+    }
+}
+
+// ── RFC 8701 GREASE / draft-ietf-tls-esni §6.2 GREASE ECH (client) ─────────
+
+const GreaseScan = struct {
+    suites_first: ?u16 = null,
+    grease_suites: usize = 0,
+    groups_first: ?u16 = null,
+    grease_groups: usize = 0,
+    share_groups: [8]u16 = undefined,
+    share_lens: [8]usize = undefined,
+    shares: usize = 0,
+    sigs_first: ?u16 = null,
+    grease_sigs: usize = 0,
+    versions_first: ?u16 = null,
+    grease_versions: usize = 0,
+    alpn_first: ?[]const u8 = null,
+    grease_alpn: usize = 0,
+    grease_exts: [4]u16 = undefined,
+    grease_ext_lens: [4]usize = undefined,
+    grease_ext_count: usize = 0,
+    first_ext: u16 = 0,
+    ech_ext: ?[]const u8 = null,
+};
+
+/// Walk a plaintext ClientHello record and collect where GREASE appears.
+fn scanClientHelloGrease(record: []const u8) !GreaseScan {
+    var out: GreaseScan = .{};
+    const rec = (try completePlainRecord(record)) orelse return error.TestUnexpectedResult;
+    var off: usize = 0;
+    const msg = try parseHandshake(rec.fragment, &off);
+    var c = Cursor.init(msg.body);
+    _ = try c.take(2 + 32);
+    _ = try c.take(try c.readU8());
+    const suites = try c.take(try c.readU16());
+    var i: usize = 0;
+    while (i < suites.len) : (i += 2) {
+        const v = std.mem.readInt(u16, suites[i..][0..2], .big);
+        if (i == 0) out.suites_first = v;
+        if (tls_grease.isGrease(v)) out.grease_suites += 1;
+    }
+    _ = try c.take(try c.readU8());
+    var it = tls_extension.Iterator.init(try c.take(try c.readU16()));
+    var first = true;
+    while (try it.next()) |ext| {
+        if (first) out.first_ext = ext.ext_type;
+        first = false;
+        if (tls_grease.isGrease(ext.ext_type)) {
+            out.grease_exts[out.grease_ext_count] = ext.ext_type;
+            out.grease_ext_lens[out.grease_ext_count] = ext.data.len;
+            out.grease_ext_count += 1;
+            continue;
+        }
+        if (ext.ext_type == ech.extension_type) {
+            out.ech_ext = ext.data;
+            continue;
+        }
+        switch (ext.typed()) {
+            .supported_groups => {
+                var g = try supported_groups.parse(ext.data);
+                var n: usize = 0;
+                while (g.nextRaw()) |v| : (n += 1) {
+                    if (n == 0) out.groups_first = v;
+                    if (tls_grease.isGrease(v)) out.grease_groups += 1;
+                }
+            },
+            .key_share => {
+                var s = try tls_keyshare.parseClientShares(ext.data);
+                while (try s.next()) |e| {
+                    out.share_groups[out.shares] = e.group.toInt();
+                    out.share_lens[out.shares] = e.key_exchange.len;
+                    out.shares += 1;
+                }
+            },
+            .signature_algorithms => {
+                var s = try tls_signature_scheme.parse(ext.data);
+                var n: usize = 0;
+                while (s.nextRaw()) |v| : (n += 1) {
+                    if (n == 0) out.sigs_first = v;
+                    if (tls_grease.isGrease(v)) out.grease_sigs += 1;
+                }
+            },
+            .supported_versions => {
+                var s = try tls_supported_versions.parseClient(ext.data);
+                var n: usize = 0;
+                while (s.next()) |v| : (n += 1) {
+                    if (n == 0) out.versions_first = v;
+                    if (tls_grease.isGrease(v)) out.grease_versions += 1;
+                }
+            },
+            .alpn => {
+                var names = try tls_alpn.Iterator.fromBlock(ext.data);
+                var n: usize = 0;
+                while (try names.next()) |name| : (n += 1) {
+                    if (n == 0) out.alpn_first = name;
+                    if (tls_grease.isGreaseAlpn(name)) out.grease_alpn += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    return out;
+}
+
+test "GREASE (RFC 8701 §3.1): the ClientHello carries GREASE in every listed position" {
+    const allocator = std.testing.allocator;
+    var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .alpn_protocols = &.{"irc"}, .grease = true });
+    defer client.deinit();
+    const seed = client.grease.?;
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const scan = try scanClientHelloGrease(ch);
+
+    try std.testing.expectEqual(seed.value(.cipher_suite), scan.suites_first.?);
+    try std.testing.expectEqual(@as(usize, 1), scan.grease_suites);
+    try std.testing.expectEqual(seed.value(.group), scan.groups_first.?);
+    try std.testing.expectEqual(@as(usize, 1), scan.grease_groups);
+    // key_share: a 1-byte GREASE entry first, then the three real shares.
+    try std.testing.expectEqual(@as(usize, 4), scan.shares);
+    try std.testing.expectEqual(seed.value(.group), scan.share_groups[0]);
+    try std.testing.expectEqual(@as(usize, 1), scan.share_lens[0]);
+    try std.testing.expectEqual(seed.value(.signature_algorithm), scan.sigs_first.?);
+    try std.testing.expectEqual(@as(usize, 1), scan.grease_sigs);
+    try std.testing.expectEqual(seed.value(.version), scan.versions_first.?);
+    try std.testing.expectEqual(@as(usize, 1), scan.grease_versions);
+    try std.testing.expectEqualSlices(u8, &seed.alpn(), scan.alpn_first.?);
+    try std.testing.expectEqual(@as(usize, 1), scan.grease_alpn);
+    // Two GREASE extensions, distinct types: the first extension is the empty
+    // one, the other carries one byte.
+    try std.testing.expectEqual(@as(usize, 2), scan.grease_ext_count);
+    try std.testing.expect(scan.grease_exts[0] != scan.grease_exts[1]);
+    try std.testing.expectEqual(seed.value(.extension1), scan.first_ext);
+    try std.testing.expectEqual(@as(usize, 0), scan.grease_ext_lens[0]);
+    try std.testing.expectEqual(@as(usize, 1), scan.grease_ext_lens[1]);
+    try std.testing.expect(scan.ech_ext == null); // ECH GREASE is opt-in
+}
+
+test "GREASE: off by default; grease=false sends no reserved value anywhere" {
+    const allocator = std.testing.allocator;
+    const defaults = Options{ .server_name = "irc.test", .trust_anchors = &.{} };
+    try std.testing.expect(!defaults.grease);
+    try std.testing.expect(!defaults.ech_grease);
+    var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .alpn_protocols = &.{"irc"}, .grease = false });
+    defer client.deinit();
+    try std.testing.expect(client.grease == null);
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const scan = try scanClientHelloGrease(ch);
+    try std.testing.expectEqual(@as(usize, 0), scan.grease_suites + scan.grease_groups + scan.grease_sigs + scan.grease_versions + scan.grease_alpn + scan.grease_ext_count);
+    try std.testing.expectEqual(@as(usize, 3), scan.shares);
+    for (scan.share_groups[0..scan.shares]) |g| try std.testing.expect(!tls_grease.isGrease(g));
+}
+
+test "GREASE values are drawn per connection" {
+    const allocator = std.testing.allocator;
+    var seen: [16]bool = @splat(false);
+    var distinct: usize = 0;
+    for (0..32) |_| {
+        var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .grease = true });
+        defer client.deinit();
+        const v = client.grease.?.value(.cipher_suite);
+        const idx = v >> 12;
+        if (!seen[idx]) distinct += 1;
+        seen[idx] = true;
+    }
+    // 32 draws over 16 values landing on one value has probability 16^-31.
+    try std.testing.expect(distinct > 1);
+}
+
+test "GREASE after HelloRetryRequest: ClientHello2 repeats the GREASE values and sends one real key_share (RFC 8446 §4.1.2)" {
+    const server_mod = @import("tls_server.zig");
+    const allocator = std.testing.allocator;
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x74)));
+    var cert_buf: [1024]u8 = undefined;
+    const cert = try x509_selfsign.buildSelfSigned(&cert_buf, .{ .common_name = "irc.test", .not_before = 1_704_067_200, .not_after = 4_102_444_800, .serial = &.{ 0x74, 1 }, .key_pair = kp, .dns_names = &.{"irc.test"}, .is_ca = true });
+    var server = try server_mod.Server.init(allocator, .{ .cert_chain = &.{cert}, .signing_key = kp });
+    defer server.deinit();
+    var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{cert}, .ech_grease = true, .grease = true });
+    defer client.deinit();
+    client.offerNoSharesForTest();
+    const ch1 = try client.start();
+    defer allocator.free(ch1);
+    const scan1 = try scanClientHelloGrease(ch1);
+    try std.testing.expectEqual(@as(usize, 1), scan1.shares); // only the GREASE share
+    try std.testing.expect(tls_grease.isGrease(scan1.share_groups[0]));
+    const hrr = switch (try server.feed(ch1)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(hrr);
+    const ch2 = switch (try client.feed(hrr)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(ch2);
+    const scan2 = try scanClientHelloGrease(ch2);
+    try std.testing.expectEqual(scan1.suites_first, scan2.suites_first);
+    try std.testing.expectEqual(scan1.groups_first, scan2.groups_first);
+    try std.testing.expectEqual(scan1.sigs_first, scan2.sigs_first);
+    try std.testing.expectEqual(scan1.versions_first, scan2.versions_first);
+    try std.testing.expectEqualSlices(u16, scan1.grease_exts[0..2], scan2.grease_exts[0..2]);
+    try std.testing.expectEqual(@as(usize, 1), scan2.shares);
+    try std.testing.expectEqual(supported_groups.NamedGroup.x25519mlkem768.toInt(), scan2.share_groups[0]);
+    // draft-ietf-tls-esni §6.2: the GREASE ECH extension is copied verbatim.
+    try std.testing.expectEqualSlices(u8, scan1.ech_ext.?, scan2.ech_ext.?);
+}
+
+test "GREASE (RFC 8701 §3.1): the client rejects a server that negotiates a GREASE value" {
+    const allocator = std.testing.allocator;
+    // A GREASE cipher suite in ServerHello.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{} });
+        defer client.deinit();
+        const body = try buildTestServerHelloBody(allocator, &client.legacy_session_id, 0x2a2a, supported_groups.NamedGroup.x25519.toInt(), &client.x25519_pair.public_key);
+        defer allocator.free(body);
+        try std.testing.expectError(error.UnsupportedCipherSuite, client.parseServerHello(body));
+    }
+    // A GREASE group in the ServerHello key_share.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{}, .grease = true });
+        defer client.deinit();
+        const body = try buildTestServerHelloBody(allocator, &client.legacy_session_id, 0x1301, client.grease.?.value(.group), &.{0});
+        defer allocator.free(body);
+        try std.testing.expectError(error.BadHandshake, client.parseServerHello(body));
+    }
+    // A GREASE extension echoed in ServerHello.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "example.com", .trust_anchors = &.{}, .grease = true });
+        defer client.deinit();
+        const good = try buildTestServerHelloBody(allocator, &client.legacy_session_id, 0x1301, supported_groups.NamedGroup.x25519.toInt(), &client.x25519_pair.public_key);
+        defer allocator.free(good);
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        try body.appendSlice(allocator, good);
+        // Append a GREASE extension and grow the extensions length (the last
+        // u16 length field before the extensions sits right after compression).
+        try body.appendSlice(allocator, &.{ 0x0a, 0x0a, 0x00, 0x00 });
+        const ext_len_pos = 2 + 32 + 1 + client.legacy_session_id.len + 2 + 1;
+        const old = std.mem.readInt(u16, body.items[ext_len_pos..][0..2], .big);
+        std.mem.writeInt(u16, body.items[ext_len_pos..][0..2], old + 4, .big);
+        try std.testing.expectError(error.BadHandshake, client.parseServerHello(body.items));
+    }
+    // A HelloRetryRequest asking for a GREASE group.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .grease = true });
+        defer client.deinit();
+        const ch1 = try client.start();
+        defer allocator.free(ch1);
+        var g: [2]u8 = undefined;
+        std.mem.writeInt(u16, &g, client.grease.?.value(.group), .big);
+        const hrr = try buildTestHrrWithExt(allocator, &client.legacy_session_id, @backingInt(tls_extension.ExtensionType.key_share), &g);
+        defer allocator.free(hrr);
+        try std.testing.expectError(error.UnsupportedGroup, client.feed(hrr));
+    }
+}
+
+/// A HelloRetryRequest record with supported_versions plus one extra extension.
+fn buildTestHrrWithExt(allocator: Allocator, session_id: []const u8, ext_type: u16, data: []const u8) ![]u8 {
+    var ext: std.ArrayList(u8) = .empty;
+    defer ext.deinit(allocator);
+    try appendU16(allocator, &ext, @backingInt(tls_extension.ExtensionType.supported_versions));
+    try appendU16(allocator, &ext, 2);
+    try appendU16(allocator, &ext, tls_supported_versions.tls13);
+    try appendU16(allocator, &ext, ext_type);
+    try appendU16(allocator, &ext, @intCast(data.len));
+    try ext.appendSlice(allocator, data);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendU16(allocator, &body, tls_record.legacy_record_version);
+    try body.appendSlice(allocator, &hello_retry_request_random);
+    try body.append(allocator, @intCast(session_id.len));
+    try body.appendSlice(allocator, session_id);
+    try appendU16(allocator, &body, @backingInt(CipherSuite.tls_aes_128_gcm_sha256));
+    try body.append(allocator, 0);
+    try appendU16(allocator, &body, @intCast(ext.items.len));
+    try body.appendSlice(allocator, ext.items);
+
+    var hs: std.ArrayList(u8) = .empty;
+    defer hs.deinit(allocator);
+    try writeHandshake(allocator, &hs, .server_hello, body.items);
+    return writePlainRecord(allocator, .handshake, hs.items);
+}
+
+test "ECH GREASE (draft-ietf-tls-esni §6.2): off by default; when on, a plausible outer extension" {
+    const allocator = std.testing.allocator;
+    {
+        var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{} });
+        defer client.deinit();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        try std.testing.expect((try scanClientHelloGrease(ch)).ech_ext == null);
+    }
+    var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .ech_grease = true });
+    defer client.deinit();
+    const ch = try client.start();
+    defer allocator.free(ch);
+    try std.testing.expect(!client.echOffered());
+    const data = (try scanClientHelloGrease(ch)).ech_ext orelse return error.TestUnexpectedResult;
+    var c = Cursor.init(data);
+    try std.testing.expectEqual(@as(u8, 0), try c.readU8()); // outer
+    try std.testing.expectEqual(ech.kdf_id, try c.readU16());
+    try std.testing.expectEqual(ech.aead_id_aes128_gcm, try c.readU16());
+    _ = try c.readU8(); // random config_id
+    try std.testing.expectEqual(@as(usize, 32), (try c.take(try c.readU16())).len);
+    const payload = try c.take(try c.readU16());
+    // A padded EncodedClientHelloInner is a multiple of 32 (§6.1.3), plus the tag.
+    try std.testing.expectEqual(@as(usize, 0), (payload.len - ech.tag_len) % 32);
+    try std.testing.expect(payload.len > 200);
+    try c.expectEmpty();
+}
+
+test "ECH GREASE: with a usable ECH config the real offer is sent, not GREASE" {
+    const allocator = std.testing.allocator;
+    const kp = try ech_hpke.KeyPair.generateDeterministic(@splat(0x47));
+    var list_buf: [600]u8 = undefined;
+    const list = buildEchTestList(&list_buf, 3, ech.kem_id, &kp.public_key, "cover.example");
+    var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .ech_grease = true, .ech_config_list = list });
+    defer client.deinit();
+    const ch = try client.start();
+    defer allocator.free(ch);
+    try std.testing.expect(client.echOffered());
+    try std.testing.expect(client.ech_grease_ext == null);
+}
+
+test "ECH in a HelloRetryRequest: legal only after an ECH offer and only as an 8-byte confirmation" {
+    const allocator = std.testing.allocator;
+    const conf: [8]u8 = @splat(0x5e);
+    // Never offered ECH (no config, no GREASE): unsolicited ⇒ fatal.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{} });
+        defer client.deinit();
+        const ch1 = try client.start();
+        defer allocator.free(ch1);
+        const hrr = try buildTestHrrWithExt(allocator, &client.legacy_session_id, ech.extension_type, &conf);
+        defer allocator.free(hrr);
+        try std.testing.expectError(error.BadHandshake, client.feed(hrr));
+    }
+    // GREASE ECH: a well-formed confirmation is checked and ignored.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .ech_grease = true });
+        defer client.deinit();
+        const ch1 = try client.start();
+        defer allocator.free(ch1);
+        const hrr = try buildTestHrrWithExt(allocator, &client.legacy_session_id, ech.extension_type, &conf);
+        defer allocator.free(hrr);
+        const ch2 = switch (try client.feed(hrr)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(ch2);
+        try std.testing.expect(client.ech_hrr_accepted == null);
+    }
+    // GREASE ECH: a confirmation of the wrong length is a decode_error.
+    {
+        var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .ech_grease = true });
+        defer client.deinit();
+        const ch1 = try client.start();
+        defer allocator.free(ch1);
+        const hrr = try buildTestHrrWithExt(allocator, &client.legacy_session_id, ech.extension_type, conf[0..7]);
+        defer allocator.free(hrr);
+        try std.testing.expectError(error.BadHandshake, client.feed(hrr));
     }
 }

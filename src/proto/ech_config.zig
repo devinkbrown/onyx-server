@@ -252,6 +252,47 @@ pub fn parse(entry: RawEntry) Error!Config {
     };
 }
 
+/// Syntax-only check of an ECHConfigList (draft-ietf-tls-esni §4:
+/// `ECHConfig ECHConfigList<4..2^16-1>`): the list is non-empty, every entry is
+/// framed exactly, and every `0xfe0d` entry parses. Unknown-version entries are
+/// only length-checked. Used for the §6.2 rule that a client which sent GREASE
+/// ECH MUST check `retry_configs` syntactically (aborting with decode_error)
+/// and otherwise ignore it.
+pub fn validateList(list_bytes: []const u8) Error!void {
+    var list = try List.init(list_bytes);
+    var count: usize = 0;
+    while (try list.next()) |entry| {
+        count += 1;
+        if (entry.version == version_draft13) _ = try parse(entry);
+    }
+    if (count == 0) return error.Malformed;
+}
+
+test "validateList accepts well-formed lists and rejects empty or broken ones" {
+    // version 0xfe0d entry: config_id 1, kem 0x0020, pk(1)=0xaa, suites(4),
+    // max_name 0, public_name "a", no extensions.
+    const fixed = [_]u8{
+        0x00, 0x15, // list length 21
+        0xfe, 0x0d, 0x00, 0x11, // version, contents length 17
+        0x01, // config_id
+        0x00, 0x20, // kem_id
+        0x00, 0x01, 0xaa, // public_key<1..>
+        0x00, 0x04, 0x00, 0x01, 0x00, 0x03, // cipher_suites
+        0x00, // maximum_name_length
+        0x01, 'a', // public_name
+        0x00, 0x00, // extensions
+    };
+    try validateList(&fixed);
+    // An unknown-version entry is only framed, never parsed.
+    try validateList(&.{ 0x00, 0x05, 0x12, 0x34, 0x00, 0x01, 0xff });
+    try std.testing.expectError(error.Malformed, validateList(&.{ 0x00, 0x00 }));
+    try std.testing.expectError(error.Malformed, validateList(&.{ 0x00, 0x05, 0x12, 0x34, 0x00, 0x02, 0xff }));
+    try std.testing.expectError(error.Malformed, validateList("garbage"));
+    var broken = fixed;
+    broken[10] = 0x00; // public_key length 0: an illegal empty key
+    try std.testing.expectError(error.Malformed, validateList(&broken));
+}
+
 /// Select the first usable ECHConfig from a list: a `0xfe0d` entry whose
 /// `kem_id` matches, that advertises the `{kdf_id, aead_id}` suite, whose
 /// `public_name` is a valid host name, and that carries no unsupported mandatory
