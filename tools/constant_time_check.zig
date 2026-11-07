@@ -25,7 +25,17 @@
 //! would. A PASS here is evidence for — not a proof of — the constant-time claim.
 //!
 //! Covered secret-dependent operations:
-//!   * ECDSA-P256 sign  — secret = the signing scalar (nonce derivation + k·G).
+//!   * ECDSA-P256 sign — secrets = the private scalar d AND the nonce k. The
+//!     message is the SAME constant in both classes, and the nonce is derived
+//!     deterministically from (d, H(m)). So the fixed class repeats one (d, k)
+//!     pair and the random class gets a fresh (d, k) pair every sample. Only
+//!     secrets differ between the classes. The hashed input length, the
+//!     message bytes and the allocator do not, so they cannot cause a
+//!     difference. Varying the message under a fixed key would be the weaker
+//!     test: it changes k, but it never repeats a secret, so the classes would
+//!     not differ in what the branch predictor and caches can learn.
+//!   * ECDSA-P256 key derivation — secret = the private scalar (d·G), via the
+//!     constant-time `keyPairFromSecretKey`.
 //!   * X25519 scalarmult — secret = the private scalar (Montgomery ladder).
 //!   * RSA-2048 private op (PKCS#1 v1.5 sign, CRT + base blinding). RSA key
 //!     generation is not exposed here, so we cannot randomize the KEY across the
@@ -35,9 +45,21 @@
 //!     the private exponentiation's timing is independent of its input. This is
 //!     an honest narrowing of the axis and is called out in the report.
 //!
+//! ECDSA history (2026-11-07): this check failed for ECDSA sign with
+//! |t| ~ 100-540 (native) and ~ 18-22 (-Dcpu=baseline). The fixed class ran
+//! ~2 us faster than the random class out of ~320 us. That was a REAL
+//! leak, not a harness artifact. Isolating the steps put almost all of it in
+//! `std.crypto.ecc.P256.mul`. Fixed vs random scalar gave |t| ~ 870, while
+//! scalar inversion was clean and two interleaved fixed scalars were nearly
+//! equal. Under ReleaseFast, LLVM had compiled std's mask-based selects,
+//! including the secret-nibble table lookup, into conditional jumps, so the
+//! branch predictor sped up a repeated scalar. `ecdsa_p256.sign` now runs on
+//! `src/crypto/p256_ct.zig`, which keeps those selects branch-free, and the
+//! check passes with |t| < 3.
+//!
 //! Tunable via environment variables:
-//!   * CT_ITERS      — samples per class for ECDSA/X25519 (default 50000).
-//!   * CT_RSA_ITERS  — samples per class for RSA          (default 1500).
+//!   * CT_ITERS      — samples per class for ECDSA/X25519 (default 25000).
+//!   * CT_RSA_ITERS  — samples per class for RSA          (default 500).
 
 const std = @import("std");
 const onyx_server = @import("onyx_server");
@@ -82,6 +104,7 @@ pub fn main() !void {
     var all_pass = true;
 
     all_pass = (try runEcdsa(alloc, &drbg, ec_iters)) and all_pass;
+    all_pass = (try runEcdsaKeygen(alloc, &drbg, ec_iters)) and all_pass;
     all_pass = (try runX25519(alloc, &drbg, ec_iters)) and all_pass;
     all_pass = (try runRsa(alloc, &drbg, rsa_iters)) and all_pass;
 
@@ -106,7 +129,7 @@ fn runEcdsa(alloc: std.mem.Allocator, drbg: *random.Drbg, count: usize) !bool {
         0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
     };
     const fixed_sk = try ecdsa.SecretKey.fromBytes(fixed_scalar);
-    const fixed_kp = try ecdsa.KeyPair.fromSecretKey(fixed_sk);
+    const fixed_kp = try ecdsa.keyPairFromSecretKey(fixed_sk);
 
     // Random class: a distinct fresh keypair per measurement.
     const random_kps = try alloc.alloc(ecdsa.KeyPair, count);
@@ -152,7 +175,7 @@ fn runEcdsa(alloc: std.mem.Allocator, drbg: *random.Drbg, count: usize) !bool {
         }
     }
 
-    return report(alloc, "ECDSA-P256 sign      (secret = signing scalar)", fixed_t, random_t);
+    return report(alloc, "ECDSA-P256 sign      (secrets = key d + nonce k)", fixed_t, random_t);
 }
 
 fn randomEcdsaKeyPair(drbg: *random.Drbg) !ecdsa.KeyPair {
@@ -160,9 +183,61 @@ fn randomEcdsaKeyPair(drbg: *random.Drbg) !ecdsa.KeyPair {
         var scalar: [32]u8 = undefined;
         try drbg.fillPublic(&scalar);
         const sk = ecdsa.SecretKey.fromBytes(scalar) catch continue;
-        const kp = ecdsa.KeyPair.fromSecretKey(sk) catch continue;
+        // Rejects d outside [1, n-1], so `sign` can never fail on these keys.
+        const kp = ecdsa.keyPairFromSecretKey(sk) catch continue;
         return kp;
     }
+}
+
+// -- ECDSA-P256 key derivation ----------------------------------------------
+
+fn runEcdsaKeygen(alloc: std.mem.Allocator, drbg: *random.Drbg, count: usize) !bool {
+    // Same fixed scalar as the sign check. Random class: a fresh valid scalar
+    // per measurement.
+    const fixed_sk = try ecdsa.SecretKey.fromBytes(.{
+        0x3b, 0x9a, 0xca, 0x00, 0x11, 0x22, 0x33, 0x44,
+        0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+        0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05,
+        0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+    });
+    const random_sks = try alloc.alloc(ecdsa.SecretKey, count);
+    defer alloc.free(random_sks);
+    for (random_sks) |*sk| sk.* = (try randomEcdsaKeyPair(drbg)).secret_key;
+
+    const fixed_t = try alloc.alloc(u64, count);
+    defer alloc.free(fixed_t);
+    const random_t = try alloc.alloc(u64, count);
+    defer alloc.free(random_t);
+
+    const schedule = try buildSchedule(alloc, drbg, count);
+    defer alloc.free(schedule);
+
+    var w: usize = 0;
+    while (w < 512) : (w += 1) {
+        std.mem.doNotOptimizeAway(ecdsa.keyPairFromSecretKey(fixed_sk) catch unreachable);
+    }
+
+    // Hot reused slot, as in the sign loop.
+    var work: ecdsa.SecretKey = undefined;
+    var fi: usize = 0;
+    var ri: usize = 0;
+    for (schedule) |is_fixed| {
+        work = if (is_fixed) fixed_sk else random_sks[ri];
+        std.mem.doNotOptimizeAway(&work);
+        const t0 = monotonicNanos();
+        const kp = ecdsa.keyPairFromSecretKey(work) catch |e| std.debug.panic("ecdsa keygen: {s}", .{@errorName(e)});
+        const t1 = monotonicNanos();
+        std.mem.doNotOptimizeAway(kp);
+        if (is_fixed) {
+            fixed_t[fi] = t1 -% t0;
+            fi += 1;
+        } else {
+            random_t[ri] = t1 -% t0;
+            ri += 1;
+        }
+    }
+
+    return report(alloc, "ECDSA-P256 keygen    (secret = private scalar, d*G)", fixed_t, random_t);
 }
 
 // -- X25519 scalar multiplication --------------------------------------------
