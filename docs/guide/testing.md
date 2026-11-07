@@ -175,7 +175,7 @@ unchanged successful evidence; diagnose unchanged failures before scheduling rer
 | `zig build test-serial --summary all` | Full reference graph with serial execution within each root. |
 | `zig build fuzz --summary all` | Bounded replay of coverage-fuzz seed corpora. |
 | `zig build bogo-shim-test --summary all` | Self-driven BoGo shim parse/framing/subprocess smokes. |
-| `tools/bogo.sh` | Pinned external BoringSSL runner: exact 121-pass/3-explicit-skip baseline; fails on drift, any unexpected failure, or an all-skip/vacuous result. Uses `.bogo/` or `BOGO_CACHE_DIR`, never `/tmp`. See [TCP TLS interop](#tcp-tls-interop). |
+| `tools/bogo.sh` | Pinned external BoringSSL runner: exact 207-pass/3-explicit-skip baseline; fails on drift, any unexpected failure, or an all-skip/vacuous result. Uses `.bogo/` or `BOGO_CACHE_DIR`, never `/tmp`. See [TCP TLS interop](#tcp-tls-interop). |
 | `zig build all-checks --summary all` | Deterministic pre-push gate: `check`, WASM build, full tests, bounded fuzz, and BoGo shim self-tests. |
 | `zig build all-checks-verbose --summary all` | Same gate, with per-test progress for the full suite. |
 
@@ -208,23 +208,27 @@ They need external tools, so they stay out of `zig build test`.
 
 | Command | Peer | What must hold |
 |---|---|---|
-| `tools/bogo.sh` | BoringSSL `ssl/test/runner`, pinned commit | Exact pass/skip baseline in `tools/bogo/expected-baseline.txt` (121 pass, 3 skip). |
-| `tools/bogo.sh -test '*'` | same | Exploratory full run, for triage. It fails while known Armor defects remain (listed below). |
+| `tools/bogo.sh` | BoringSSL `ssl/test/runner`, pinned commit | Exact pass/skip baseline in `tools/bogo/expected-baseline.txt` (207 pass, 3 skip). |
+| `tools/bogo.sh -test '*'` | same | Exploratory full run, for triage. On 2026-11-07 it had no failures (see below). |
 | `tools/openssl_interop.sh [onyx-server]` | system `openssl` 3.x, `s_client` and `s_server` | 34 cases pass and 1 is `KNOWN` (the ALPN mismatch, see below). With `ONYX_INTEROP_STRICT=1`, any `SKIP` counts as a failure. |
 | `python3 tools/browser_tls_smoke.py [onyx-server]` | headless Chromium over `wss://` | The IRC session registers, and the NetLog shows TLS 1.3 with group `X25519MLKEM768` (4588). |
 
 **BoGo.** The shim (`tools/bogo_shim.zig`) drives the daemon's `TlsConn`, the
 1.3 server plus the hardened 1.2 server, through these runner flags:
-`-resume-count`, `-expect-session-miss`, `-ocsp-response` and `-async`. Server
-resumption therefore runs for real: every connection in one invocation shares
-a ticket key. Any other flag exits 89, which the runner reports as skipped.
+`-resume-count`, `-expect-session-miss`, `-ocsp-response`, `-async`,
+`-expect-hrr` and `-expect-no-hrr`. Server resumption therefore runs for real:
+every connection in one invocation shares a ticket key. The shim turns on the
+strict RFC 7301 §3.2 ALPN refusal (`alpn_mismatch_fatal`); the daemon
+listeners leave it off. Any other flag exits 89, which the runner reports as skipped.
 
-`DisabledTests` in `tools/bogo/config.json` lists only two kinds of case:
+`DisabledTests` in `tools/bogo/config.json` lists three kinds of case:
 
 - the deliberate modern-only posture: no TLS 1.0 or 1.1, no static RSA, no CBC,
   no SHA-1, no P-384 or P-521 signing, no ML-DSA, EMS required in TLS 1.2, and
   no session-ID cache;
-- behavior that the RFCs leave optional, where BoringSSL happens to be strict.
+- behavior that the RFCs leave optional, where BoringSSL happens to be strict;
+- families the shim does not drive yet (0-RTT, client certificates, ECH,
+  delegated credentials).
 
 Genuine defects stay enabled. They are simply absent from the baseline.
 
@@ -287,53 +291,41 @@ fails closed when requested:
   host must be able to execute the target.
 - `ONYX_RELEASE_BOGO=1` runs `tools/bogo.sh`.
 
-**BoGo triage (pinned runner, 2026-11-07).** The full run gives 121 passed,
-2891 skipped and 80 failed. The failures fall into these classes:
+**BoGo triage (pinned runner `5ac7567c`, 2026-11-07).** The full
+`-test '*'` run now gives 207 passed and 0 failed. The exact baseline is 207
+PASS and 3 SKIP. The skipped cases are `CheckClientCertificateTypes`,
+`ClientCertificateTypes` and `SendFallbackSCSV`. `tools/bogo.sh` runs in CI
+(the `bogo` job). The GAP-K6 guard in `src/crypto/tls.zig`
+pins the exact PASS count of the baseline file, so it must change whenever the
+baseline is regenerated.
 
-- **TLS 1.3 CertificateVerify ignores the client's `signature_algorithms`.**
-  The server always signs with its key's single scheme (RFC 8446 §4.2.3,
-  §4.4.3). Seen in `Server-SignDefault-*`, `ServerAuth-*` and `RSA-PSS-Large`.
-- **TLS 1.2 ServerKeyExchange ignores `signature_algorithms`.** It always uses
-  `*_sha256` (RFC 5246 §7.4.1.4.1).
-- **Version negotiation is wrong in three ways:**
-  - The 1.3 path requires `legacy_version == 0x0303`, which violates RFC 8446
-    §4.2.1.
-  - The 1.2 path rejects a higher `legacy_version` that comes without
-    `supported_versions` (RFC 5246 Appendix E.1).
-  - A `supported_versions` of `[1.2]` alongside `legacy_version` 1.1 is
-    rejected.
-- **TLS 1.2 rejects a client Finished that spans several records** (RFC 5246
-  §6.2.1). Seen in `*-SplitHandshakeRecords`.
-- **TLS 1.2 echoes the client's session_id on a full handshake.** After a
-  rejected ticket, the client takes this as resumption and aborts (RFC 5246
-  §7.4.1.3, RFC 5077 §3.4). Seen in `CorruptTicket-TLS-TLS12` and
-  `Resume-Server-UnofferedCipher`.
-- **TLS 1.3 PSK failures fall back to a full handshake instead of aborting.**
-  An invalid, missing or wrong-length binder, a binder count mismatch, or PSK
-  without `psk_key_exchange_modes` should abort (RFC 8446 §4.2.11, §4.2.9).
-  Separately, a ClientHello that offers more than one PSK identity is never
-  resumed.
-- **ClientHello parsing is too loose.** The parser accepts all of these:
-  - trailing bytes after the extensions (1.3 path);
-  - a compression list longer than one byte (1.3 path, RFC 8446 §4.1.2);
-  - duplicate extensions (1.2 path);
-  - an empty ALPN protocol name (RFC 7301 §3.1);
-  - trailing data in SNI (RFC 6066 §3);
-  - trailing data in key_share;
-  - `ec_point_formats` without the uncompressed format (RFC 8422 §5.1.2).
+History: the audit started from 24 passing cases. Driving TLS 1.3 server
+resumption and OCSP raised that to 121, with 80 genuine failures in the full
+run. Wave 2b fixed every class of those failures in `tls_server.zig`,
+`tls12_server.zig` and the shim (202 passed, 5 failed):
 
-  Separately, TLS 1.2 rejects a valid compression list that contains null
-  among other methods.
-- **A missing key_share sends a HelloRetryRequest instead of
-  `missing_extension`** (RFC 8446 §9.2).
-- **Alert codes are wrong in several places:**
-  - out-of-order messages get `decode_error` instead of `unexpected_message`;
-  - a bad compression list or a misplaced `pre_shared_key` gets `decode_error`
-    instead of `illegal_parameter`;
-  - a missing `supported_groups` gets `handshake_failure` instead of
-    `missing_extension`.
-- **API gap: the engines do not expose a received alert's description.** As a
-  result, the shim cannot fail `Alert`, `DoubleAlert` or `FragmentAlert`.
+- TLS 1.3 CertificateVerify and TLS 1.2 ServerKeyExchange ignored the
+  client's `signature_algorithms`;
+- version negotiation (`legacy_version`, `supported_versions`);
+- a TLS 1.2 client Finished spanning several records;
+- a TLS 1.2 full handshake echoing the client's session_id;
+- TLS 1.3 PSK failures falling back instead of aborting, and multiple PSK
+  identities;
+- loose ClientHello, ALPN, SNI and key_share parsing;
+- an HRR instead of `missing_extension`;
+- wrong alert codes;
+- the shim could not see a received alert.
+
+Wave 2c fixed the last 5 (`tls_conn.zig`): a first flight that is not a lone
+ClientHello is now `unexpected_message`, not `decode_error`.
+
+`DisabledTests` in `tools/bogo/config.json` holds 53 patterns. Most are the
+modern-only posture described above. Some are RFC-optional behavior, for example
+`DuplicateKeyShares-TLS13` and `Resume-Server-OmitAllPSKsOnSecondClientHello`.
+The rest are features the shim does not drive yet: `*EarlyData*`,
+`*ClientAuth*`, `*ECH*` and `*DelegatedCredential*`. Those families have no
+BoGo coverage, so the unit tests and the OpenSSL lane are their only interop
+evidence.
 
 ## Roadmap-change default
 

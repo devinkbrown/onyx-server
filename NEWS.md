@@ -11,71 +11,280 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
-## Unreleased — Armor hardening
+## 0.11.0 — Armor hardening (source, 2026-11-07)
 
-Work from the Armor security and feature audit
-([`docs/audit/armor-2026-11-07.md`](docs/audit/armor-2026-11-07.md)). IDs match
-the audit's findings. Only items marked **merged** are in source; the rest are
-planned and may change before release.
+This release works through the Armor security and feature audit
+([`docs/audit/armor-2026-11-07.md`](docs/audit/armor-2026-11-07.md)) in
+waves 1, 2a, 2b and 2c, and adds a rollback-safe Helix. Finding IDs (A1–A10)
+match the audit. It is a source release: production still runs 0.10.4.
 
 **Security fixes**
-- **A1, QUIC handshake cap (merged, High).** The QUIC/WebTransport handshake
-  used to buffer every in-order CRYPTO byte before authentication, waiting on a
+- **A1, QUIC handshake cap (High).** The QUIC/WebTransport handshake used to
+  buffer every in-order CRYPTO byte before authentication, waiting on a
   declared message length of up to 16 MiB. Buffers and declared lengths are now
   capped at 64 KiB and fail with `HandshakeTooLarge`, for the server and for our
   QUIC client. A regression test streams an in-order 16 MiB ClientHello.
-- **A2, post-quantum hybrid preferred (merged).** The TCP TLS 1.3 and QUIC
-  servers now prefer X25519MLKEM768, then X25519, then P-256, both for the key
-  share they select and for the group an HRR requests. Clients that send hybrid
-  and X25519 shares (Chrome, Firefox) now get the PQ exchange.
-- **A3, RSA-CRT fault check (planned).** `rsa_sign.privateOp` will verify
-  `s^e mod n == m` before returning a CRT signature and fail with a typed error
-  on mismatch, closing the Bellcore fault attack on RSA certificate keys.
-- **A5, ECDSA key wipe (planned).** `ecdsa_p256` gains key wiping, and
-  `armor genpkey -algorithm ec` will wipe every copy of the private scalar.
-- **A6, HPKE RFC 9180 label (planned, ECH wire change).** HPKE's DHKEM will use
-  the RFC 9180 `"eae_prk"` label instead of `"dh"`, so standard ECH clients can
-  interoperate. ECH configs from older builds will not open under the fixed
-  label, so the change is gated behind a new ECH config version; republish ECH
-  configs after upgrading.
-- **A7, duplicate QUIC transport parameters (planned).** Rejected with
-  TRANSPORT_PARAMETER_ERROR (RFC 9000 §18.1) instead of keeping the last value.
-- **A8, QUIC client connection-ID checks (planned).** Our QUIC client will
-  compare `original_destination_connection_id` and
-  `initial_source_connection_id`. The production server already sends both.
-- **A9, TLS 1.2 conformance (planned).** Enforce the `record_size_limit` upper
-  bound in the TLS 1.2 server.
-- **A10, rename (planned).** `skipServerCertVerifyForTest` becomes
-  `disableServerCertVerification`, because operator `insecure_skip_verify`
-  reaches it in production `http_fetch`.
+- **A2, post-quantum hybrid preferred.** The TCP TLS 1.3 and QUIC servers now
+  prefer X25519MLKEM768, then X25519, then P-256, both for the key share they
+  select and for the group an HRR requests. Chrome and Firefox now get the PQ
+  exchange.
+- **A3, RSA-CRT fault check.** `rsa_sign.privateOp` recomputes `s^e mod n`
+  after every private operation and fails with `SignatureFault`, with the
+  output wiped, on a mismatch. This closes the Bellcore fault attack on RSA
+  certificate keys. The CRT intermediates are zeroed.
+- **A4, verified news TLS.** The news fetch now verifies against
+  `[geo].news_ca_bundle` (default `/etc/ssl/certs/ca-certificates.crt`, bound
+  by `news_ca_bundle_max_bytes`, 4 MiB). A missing, oversize or anchor-free
+  bundle disables the live fetch with an error. It never falls back to
+  insecure. `news_insecure_tls` now defaults to `false` and logs a boot warning
+  when set.
+- **A5, ECDSA key wipe.** `ecdsa_p256` gains `wipeSecretKey`/`wipeKeyPair`, and
+  `armor genpkey -algorithm ec` wipes every copy of the private scalar.
+- **A6, HPKE RFC 9180 label (ECH wire change).** DHKEM now uses the RFC 9180
+  `"eae_prk"` label, so standard ECH clients interoperate. The ECHConfig
+  version stays `0xfe0d`. Payloads sealed by older Onyx builds no longer open,
+  and the server falls back to ClientHelloOuter for them.
+- **A7, duplicate QUIC transport parameters** are rejected with
+  TRANSPORT_PARAMETER_ERROR (RFC 9000 §18.1).
+- **A8, QUIC client connection-ID checks.** Our QUIC client authenticates
+  `original_destination_connection_id`, `initial_source_connection_id` and
+  `retry_source_connection_id` (RFC 9000 §7.3).
+- **A9, TLS 1.2 conformance.** Every client `certificate_list` entry is framed
+  and bounded, and empty entries are refused. `record_size_limit` above
+  2^14+1 is clamped, not refused, because RFC 8449 §4 forbids a server from
+  enforcing the upper bound.
+- **A10, rename.** `skipServerCertVerifyForTest` is now
+  `disableServerCertVerification`. Operator `insecure_skip_verify` reaches it
+  in production `http_fetch`.
+- **Constant-time P-256.** `zig build ct-check` found a real timing leak in
+  ECDSA-P256 signing: LLVM lowered std's masked selects to branches. The new
+  `src/crypto/p256_ct.zig` (Montgomery field, complete RCB formulas, masked
+  fixed-window table scan) now handles every secret-dependent P-256 operation:
+  ECDSA signing and key derivation, ECDH, and DTLS 1.2 ECDHE. Signatures stay
+  byte-identical to std's. A secret key outside `[1, n-1]` is refused (std
+  accepted `d = 0` and `d = n+1`).
+- **Helix nonce guard.** `aead.CounterNonce.resumeFrom` refuses an exhausted
+  snapshot or a counter below a monotonic floor.
+- **SNI name lifetime.** SNI generations now own their server names. A failed
+  second REHASH used to leave SNI selection and `/metrics` reading freed
+  memory.
 
-**Assurance (planned)**
-- Record-layer unification: production TLS 1.3 record protection moves onto one
-  audited seal/open path, so the tamper, truncation and overflow corpus tests
-  the code that ships, including AES-128-GCM.
-- Wycheproof corpora for AES-GCM, ChaCha20-Poly1305, X25519, ECDH-P256,
-  ECDSA-P256, RSA-PSS and HKDF; known-answer tests for X-Wing, X25519MLKEM768
-  and ECH.
-- End-to-end fuzzing of the TLS 1.3 server and client engines, QUIC Initial
-  handling and DTLS.
+**TLS conformance (BoGo 24 → 207 passing, 3 skipped)**
+- The pinned BoringSSL runner (`5ac7567c`) now drives TLS 1.3 server
+  resumption and OCSP, HRR expectations, and the 1.2 server. The exact baseline
+  in `tools/bogo/expected-baseline.txt` is 207 PASS and 3 SKIP, and the full
+  `-test '*'` run has no failures. The `bogo` CI job runs it.
+- Fixed TLS 1.3 server defects:
+  - CertificateVerify follows the client's `signature_algorithms`.
+  - `legacy_version` is ignored once `supported_versions` selects 1.3.
+  - PSK structure, binder and mode errors abort instead of falling back.
+  - Identities are tried in order.
+  - No second compatibility CCS after an HRR.
+  - `missing_extension` replaces an HRR when `key_share` or
+    `supported_groups` is absent.
+  - Stricter ClientHello, ALPN and SNI parsing.
+  - Correct `unexpected_message`, `illegal_parameter` and
+    `missing_extension` alerts.
+- Fixed TLS 1.2 server defects:
+  - ServerKeyExchange follows `signature_algorithms`, including ECDSA
+    SHA-384/512.
+  - An empty `session_id` on full handshakes.
+  - The client Finished is reassembled across records.
+  - Version negotiation follows RFC 5246 Appendix E.1.
+  - Duplicate extensions are refused.
+  - The compression and `ec_point_formats` rules.
+- An out-of-order first flight is `unexpected_message`.
+- ALPN mismatch stays lenient on the daemon listeners (`alpn_mismatch_fatal`
+  defaults to false). The BoGo shim opts into the strict RFC 7301 §3.2
+  refusal.
 
-**Features and operations (planned)**
-- ALPN on the IRC listener, and a TOML knob for RFC 8879 certificate
-  compression.
-- ECH `retry_configs`. The engine supports them, but the daemon does not send
-  them today.
-- Hot reload of SNI certificates and ECH keys on REHASH and ACME renewal.
-- TLS metrics beyond `onyx_tls_handshake_us`: failures by reason, version,
-  suite and group, resumption and 0-RTT, kTLS, OCSP staple state and
-  certificate expiry.
+**Outbound TLS client**
+- **RFC 5280 §6 path building.** Both clients now build a path from the leaf.
+  Chains with a trailing cross-signed root, out-of-order bags or an extraneous
+  expired certificate verify against a system bundle; they failed with
+  `UnknownCa` before. Search is bounded: 16 presented certificates, 10 per
+  path, 96 signature checks. Issuer and subject chaining uses RFC 5280 §7.1
+  name comparison. OCSP, CRL and CT use the issuer on the validated path.
+- **GREASE on by default** (RFC 8701) for `tls_client`. Outbound
+  ACME, `http_fetch` and mail clients send GREASE. ECH GREASE is available but
+  off for them.
+- **close_notify.** The clients send close_notify, and an authenticated
+  close_notify from the peer is `EndOfStream`, not an error. `http_fetch`
+  refuses a truncated Content-Length, chunked or close-delimited body.
 
-**Documentation**
-- `docs/architecture/crypto.md` and `docs/guide/tls.md` now give the hybrid-first
-  group order. They name `[tls].mooring_max_meshpass_len` correctly and note
-  that the daemon never applies it. They state that ECH `retry_configs` are
-  engine-only and that `early_data_age_skew_ms` is not a TOML key, and they cite
-  RFC 8446 for HRR. The `src/daemon/tls_certs.zig` header now lists ECDSA-P256
-  keys and the 365-day bootstrap leaf.
+**Server close_notify**
+- The daemon sends one best-effort close_notify before closing a drained TLS
+  client (QUIT, KILL, ERROR or shutdown): engine-sealed in userspace, or a
+  kernel control record under kTLS. It never sends one after a fatal alert or
+  a delivery gap, or on mesh links. A peer close_notify is a clean EOF and is
+  answered. Once TX is in the kernel, the engines refuse userspace sealing
+  (`markTxOffloaded`), so a kernel-owned nonce is never reused.
+
+**ECH and TLS 1.3 engine**
+- ECH with HelloRetryRequest (draft-ietf-tls-esni §6.1.5, §7.1.1, §7.2.1):
+  HRR confirmation, ClientHelloOuter2 sealed under the retained HPKE context,
+  and fail-closed server checks. ECH GREASE for clients.
+- ECH `retry_configs` are sent. The new `daemon/tls_ech_load.zig` builds them.
+- Production TLS 1.3 record protection, server and client, runs through
+  `tls_record` (now including AES-128-GCM). The tamper and overflow corpus
+  therefore tests the code that ships.
+
+**QUIC / WebTransport**
+- Server HRR with a configurable group order.
+- Session tickets and PSK resumption (`[webtransport] resumption`,
+  `ticket_lifetime`).
+- 0-RTT, **off by default** (`[webtransport] early_data`). A time-bounded
+  replay guard rejects early data rather than evicting when full, and every
+  listener start, cold or Helix, opens a quiet window.
+- Static stateless resets (`stateless_reset_key`, or HKDF of the TLS signing
+  key).
+- Key update for `TLS_AES_256_GCM_SHA384`.
+- Ticket keys are per node, so a foreign node's ticket never resumes.
+- Linux WebTransport Helix carries the QUIC ticket keys (checkpoint v3 frame),
+  so tickets survive an upgrade. With resumption off it still writes the v2
+  frame.
+
+**TLS 1.2**
+- RFC 5705 exporter and the RFC 9266 `tls-exporter` binding on EMS sessions.
+  SCRAM `-PLUS` now works over TLS 1.2. The binding crosses Helix.
+- kTLS TX/RX for TLS 1.2 AEAD suites under `[tls] ktls`, on Linux and FreeBSD.
+  Under kernel RX, an alert or renegotiation is demultiplexed.
+
+**ACME**
+- Separate persistent account key at `[acme].account_key_path` (default
+  `acme-account.key.pem` beside `[tls].key_path`, mode 0600). It is refused if
+  readable by group or other, and never replaced. An account key equal to the
+  certificate key is refused.
+- `[acme].challenge = "http-01" | "dns-01" | "tls-alpn-01"`. dns-01 runs the
+  `[acme].dns_hook` program directly, without a shell, with a timeout and with
+  cleanup on every exit. tls-alpn-01 (RFC 8737) is served on the TLS listener
+  with the challenge certificate only.
+- The provisioning step now runs before the challenge POST, which also fixes
+  an http-01 race.
+
+**Delegated credentials (RFC 9345)**
+- `[tls].delegated_credentials` turns on automatic rotation from the default
+  leaf. Every candidate is probe-validated, re-minted when the leaf changes and
+  retired only after borrowing handshakes finish. The key stays in memory only;
+  `key_out_dir` is refused.
+- The engine accepts a credential per SNI certificate
+  (`SniCert.delegated_credential`).
+- `armor dc mint|inspect|validate`.
+
+**Configuration and operations**
+- New `[tls]` keys:
+  - `groups`: validated at parse; the QUIC listener uses the subset it
+    implements.
+  - `alpn`: default `["irc"]`.
+  - `cert_compression`, `enforce_cert_signature_algorithms` and
+    `ticket_lifetime`.
+- New keys in other sections: `[geo].news_ca_bundle` and
+  `news_ca_bundle_max_bytes`; `[acme]` `account_key_path`, `challenge` and
+  `dns_hook`; `[webtransport]` `resumption`, `early_data`, `ticket_lifetime`
+  and `stateless_reset_key`.
+- `tls.mooring_max_meshpass_len` and `tls.debug_log` now apply at boot.
+  `tls.ratchet_max_skip` and `tls.treekem_max_members` never applied and are
+  **refused at load** by name.
+- REHASH reloads `[[tls.sni]]` and `[[tls.ech_keys]]` with the default
+  certificate in one transaction. ACME renewal reloads only the default
+  certificate and keeps the serving SNI/ECH generations.
+- TLS metrics on `/metrics`:
+  - handshake failures by reason;
+  - handshakes by version, suite and group;
+  - resumption and 0-RTT;
+  - kTLS offloads and active gauges, including `onyx_tls_ktls12_active`;
+  - OCSP staple state;
+  - certificate and delegated-credential expiry;
+  - QUIC resumptions, 0-RTT and stateless resets.
+- `src/daemon/server_config.zig`'s `Config` is now an alias of
+  `server.Config`. The unbuilt `config_format/model.zig` and `projection.zig`
+  are guarded by a test against becoming a second parser.
+
+**News catalogue**
+- Every feed was re-probed the way the daemon fetches it. Broken, frozen,
+  redirecting and non-TLS-1.3 feeds were replaced, among them ABC, WSJ, The
+  Hill and about 30 country feeds.
+- CNN is removed (no live HTTPS feed). ESPN is replaced by BBC Sport.
+- Every feed must serve UTF-8.
+- `tools/news_update.sh` carries the same tables and gains `--check`.
+
+**Helix**
+- `tls_session` capsule v4 carries the TLS 1.2 RFC 9266 binding and kTLS
+  state. A minimal-version writer stamps every row at the lowest exact schema.
+  TLS 1.3 rows and plain TLS 1.2 rows stay v3, and v3 predecessors are adopted.
+- **Rollback-safe upgrade.** A current image answers the probe with extra
+  `ONYX_HELIX_STATE_CAP=tls-session-v4` and `=quic-wide-key-update-v1` lines
+  beside the unchanged base token. When the target lacks them, as 0.10.4 does,
+  the predecessor works before exec:
+  - It writes v3 rows.
+  - It drops TLS 1.2 channel bindings and QUIC ticket keys.
+  - It refuses UPGRADE, with connections intact, for a kTLS-offloaded TLS 1.2
+    session or a live WebTransport `TLS_AES_256_GCM_SHA384` connection.
+- UPGRADE is also refused before exec when the target config sets
+  `[tls] enable_tls12 = false` while TLS 1.2 sessions are attached.
+
+**Assurance**
+- The upstream Wycheproof corpus (3026 vectors) runs through Armor's own APIs
+  for AES-GCM, ChaCha20-Poly1305, X25519, ECDH-P256, ECDSA-P256, RSA PKCS#1
+  and PSS, HKDF and Ed25519. No vector disagrees with upstream.
+- RFC 9180 HPKE vectors, and KATs for X-Wing, X25519MLKEM768 and ECH.
+- Deterministic whole-engine fuzzing of the TLS 1.3 server and client, QUIC
+  Initial handling and DTLS. Coverage-guided `zig build fuzz --fuzz` works
+  again (LLVM backend).
+- An OpenSSL interop lane in both directions and a headless-Chromium smoke,
+  with opt-in release gates (`ONYX_RELEASE_CT_CHECK`, `_INTEROP`, `_BOGO`).
+  `ct-check` builds for the shipped target.
+- `armor` CLI: live `s_client -connect` and `s_server`, `enc` (ARMORENC v1,
+  Argon2id), `ech-gen`, and `ocsp -fetch`.
+
+**Operator notes**
+- **Upgrade from 0.10.4 is Helix-compatible.** The base probe token is
+  unchanged, v3 `tls_session` rows are adopted, and new config fields at their
+  defaults leave the companion config digest unchanged.
+- **Rollback to 0.10.4:** follow
+  [`docs/ops/onyx-server-paths.md`](docs/ops/onyx-server-paths.md#helix-rollback-to-0104).
+  Under `ktls = "txrx"`, TLS 1.2 sessions are now kTLS-offloaded, which blocks a
+  hot rollback until they close:
+  1. Set `ktls = "off"` and UPGRADE to the current image.
+  2. Wait for `onyx_tls_ktls12_active` to reach 0.
+  3. UPGRADE to 0.10.4.
+
+  Keep `enable_tls12 = true` through every Helix step while TLS 1.2 clients are
+  connected.
+- Remove `tls.ratchet_max_skip` and `tls.treekem_max_members` from configs
+  before upgrading. A successor refuses to load a config that has them.
+- Both live configs set `news_insecure_tls = true`. Flip it to `false` once
+  `[geo].news_ca_bundle` resolves on each host.
+- ACME: the first renewal creates and stores an account key and registers a new
+  account. Older releases never stored their throwaway account keys, so no
+  keyChange is possible.
+- ECH: standard RFC 9180 clients now work. Payloads from pre-0.11.0 Onyx
+  builds fall back to ClientHelloOuter.
+
+**Known gaps**
+- Server close_notify is sent on Linux only. TLS 1.3 half-close after a peer
+  close_notify is not implemented: the server answers and closes.
+- tls-alpn-01 has no end-to-end test and no Let's Encrypt staging run.
+- The QUIC 0-RTT replay guard is per process. Cross-node replay is impossible
+  because ticket keys are per node. QUIC ticket-key carry is Linux WebTransport
+  Helix only.
+- RFC 4518 name comparison is the reduced ASCII form.
+- The Windows chain-policy change is only compile-verified. FreeBSD kTLS for
+  TLS 1.2 is only compile- and unit-verified.
+- Native Windows and OpenBSD Helix paths assume a target of the same version.
+  They are not rollback-guarded.
+- Test-only P-256 key generation still uses std. `ecdsa_p256.KeyPair` is
+  std's type, so the leaky std path stays callable.
+- `tools/news_update.sh --check` is not wired into a gate. ESPN was dropped
+  because AWS WAF challenges the daemon's ClientHello fingerprint.
+- The TLS 1.2 server's client-auth CertificateVerify accepts only SHA-256
+  schemes (`ecdsa_secp256r1_sha256`, `rsa_pkcs1_sha256`).
+- The rollback refusal for the WebTransport AES-256 key update has no
+  seal-level test.
+- Daemon delegated-credential rotation covers the default leaf only. Per-SNI
+  credentials exist in the engine but have no config key.
+- Live dual-node acceptance and the `news_insecure_tls = false` flip are
+  pending. Nothing is deployed yet; production still runs 0.10.4.
 
 ---
 
