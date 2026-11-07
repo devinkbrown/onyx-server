@@ -19,6 +19,16 @@
 //! requiring any other suite is rejected up front (the caller then omits ECH —
 //! a byte-identical ClientHello).
 //!
+//! ECH wire change (Armor audit A6, 2026-11-07): `hpke.zig` now derives the
+//! DHKEM shared secret with the RFC 9180 label `"eae_prk"` (previously the
+//! non-standard `"dh"`). ECH payloads sealed here are therefore RFC 9180 /
+//! draft-ietf-tls-esni conformant and open on standard ECH servers, but a
+//! pre-A6 Onyx server cannot open them (nor can this build open a pre-A6
+//! client's payload; the server then falls back to ClientHelloOuter, which
+//! is the draft's ECH-rejection path). The ECHConfig version stays `0xfe0d`:
+//! a private version would not be understood by any standard peer. Pinned by
+//! `ech_kat.zig` (OpenSSL-derived seal vectors) and hpke.zig's RFC 9180 KATs.
+//!
 //! References: draft-ietf-tls-esni §5.2 (encryption + `info`), §6.1.3 (padding),
 //! §7.2 (acceptance confirmation).
 const std = @import("std");
