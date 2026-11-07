@@ -3,10 +3,10 @@
 
 //! Out-of-band delegated credential inspection/validation tooling.
 //!
-//! This intentionally does not mint delegated credentials: production minting
-//! needs private-key loading, DC private-key output, and rotation policy.  The
-//! command here validates ready-made RFC 9345 wire bytes with the same codec and
-//! signature primitives the TLS stack already consumes.
+//! The command here validates ready-made RFC 9345 wire bytes with the same codec
+//! and signature primitives the TLS stack already consumes. Minting and the
+//! short-lived rotation policy live in `crypto/dc_mint.zig`, re-exported below
+//! as `dc_mint` so the daemon and the `armor dc mint` verb share one minter.
 
 // This leaf stays inside the onyx_server module. A second `@import("onyx_server")`
 // from the executable would put the same file in both modules, which Zig rejects.
@@ -24,7 +24,10 @@ const pem = @import("../proto/pem.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 
-const max_dc_file_bytes: usize = 256 * 1024;
+/// RFC 9345 minting + rotation (`dc_mint.mint`, `dc_mint.RotationPolicy`).
+pub const dc_mint = @import("../crypto/dc_mint.zig");
+
+pub const max_dc_file_bytes: usize = 256 * 1024;
 
 pub const Options = struct {
     command: Command = .inspect,
@@ -139,15 +142,28 @@ pub fn validate(
     cert_path: ?[]const u8,
     now_override: ?i64,
 ) Error!Validation {
-    const dc = try delegated_credential.parse(dc_wire);
-    var result = Validation{ .dc = dc };
-    const path = cert_path orelse return result;
+    const path = cert_path orelse return .{ .dc = try delegated_credential.parse(dc_wire) };
 
     const chain = try tls_certs.loadCertChain(allocator, io, path);
     defer {
         for (chain) |der| allocator.free(der);
         allocator.free(chain);
     }
+    return validateChain(allocator, dc_wire, chain, now_override);
+}
+
+/// `validate` over an already-loaded leaf-first chain (only `chain[0]` is used).
+/// The RFC 9345 §4.1.3 checks: DelegationUsage + digitalSignature on the leaf,
+/// expiry not passed, at most seven days ahead, before the leaf's notAfter, and
+/// the leaf-key signature over the reconstructed message.
+pub fn validateChain(
+    allocator: std.mem.Allocator,
+    dc_wire: []const u8,
+    chain: []const []const u8,
+    now_override: ?i64,
+) Error!Validation {
+    const dc = try delegated_credential.parse(dc_wire);
+    var result = Validation{ .dc = dc };
     if (chain.len == 0) return error.EmptyCertificateChain;
     const leaf_der = chain[0];
     const leaf = try x509.parse(leaf_der);
@@ -240,7 +256,7 @@ fn printValidation(validation: Validation) void {
     }
 }
 
-fn schemeName(raw: u16) []const u8 {
+pub fn schemeName(raw: u16) []const u8 {
     return switch (tls_signature_scheme.SignatureScheme.fromInt(raw)) {
         .ed25519 => "ed25519",
         .ecdsa_secp256r1_sha256 => "ecdsa_secp256r1_sha256",
@@ -256,6 +272,38 @@ fn schemeName(raw: u16) []const u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test {
+    _ = dc_mint;
+}
+
+test "delegated credential CLI validates a dc_mint credential" {
+    const allocator = testing.allocator;
+    const leaf_kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x61)));
+    const not_before: i64 = 1_704_067_200;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try x509_selfsign.buildSelfSigned(&leaf_buf, .{
+        .common_name = "dc.example.test",
+        .not_before = not_before,
+        .not_after = not_before + 30 * 24 * 3600,
+        .serial = &.{0x61},
+        .key_pair = leaf_kp,
+        .delegation_usage = true,
+        .key_usage_digital_signature = true,
+    });
+    const now = not_before + 100;
+    var minted = try dc_mint.mint(allocator, testing.io, .{
+        .leaf_der = leaf,
+        .leaf_key = .{ .ed25519 = leaf_kp },
+        .now_unix = now,
+        .lifetime_seconds = 6 * 3600,
+    });
+    defer minted.deinit(allocator);
+    const ok = try validateChain(allocator, minted.wire, &.{leaf}, now);
+    try testing.expect(ok.cert_checked);
+    try testing.expectEqual(minted.expiry_unix, ok.expiry_unix);
+    try testing.expectError(error.Expired, validateChain(allocator, minted.wire, &.{leaf}, minted.expiry_unix + 1));
+}
 
 test "delegated credential CLI parseArgs" {
     try testing.expectError(error.UnknownArgument, parseArgs(&.{"bogus"}));

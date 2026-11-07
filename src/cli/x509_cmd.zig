@@ -197,7 +197,7 @@ fn writeIssuerName(tbs_der: []const u8, out: *Writer) !void {
 
 /// Render an X.501 Name TLV as `attr=value, ...`. Only the value formatting is
 /// local; structure walking uses the substrate DerReader (bounds-checked).
-fn writeNameTlv(name_der: []const u8, out: *Writer) !void {
+pub fn writeNameTlv(name_der: []const u8, out: *Writer) !void {
     var top = x509.DerReader.init(name_der);
     const name = top.readExpected(x509.Tag.sequence) catch return out.writeAll("<unparsed>");
     var rdns = top.child(name) catch return out.writeAll("<unparsed>");
