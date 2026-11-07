@@ -141,6 +141,59 @@ ssh trev@ircx.us 'sudo -n journalctl -u onyx-server.service --since "30 minutes 
 tools/era2_acceptance_smoke.sh
 ```
 
+## Helix rollback to 0.10.4
+
+`0.10.4` (`e202c6cf`) adopts `.tls_session` rows at schema v3 only. Later
+images write v4 for any TLS 1.2 row that carries the RFC 9266 channel binding,
+uses TLS 1.2 kTLS offload, or holds TLS 1.2 control state. Before this guard,
+a Helix UPGRADE back to `0.10.4` passed the capability probe and executed the
+old image. The old successor then rejected the handoff ("noncanonical
+TLS-session capsule") and dropped every client on the node.
+
+The predecessor now reads the target's rolling state capabilities from its
+probe answer. A current image prints extra lines after the unchanged base
+token. `0.10.4` prints neither line:
+
+- `ONYX_HELIX_STATE_CAP=tls-session-v4`
+- `ONYX_HELIX_STATE_CAP=quic-wide-key-update-v1`
+
+When the target lacks them, the predecessor does this before exec:
+
+- TLS 1.3 rows and plain TLS 1.2 rows are written as exact v3.
+- A bound but not offloaded TLS 1.2 row drops only its channel binding and is
+  written as v3. `0.10.4` never offers SCRAM `-PLUS` on TLS 1.2, so the
+  successor loses nothing it could use. The log counts these rows.
+- A kTLS-offloaded TLS 1.2 row has no v3 form. UPGRADE is refused with
+  `UPGRADE refused: target binary cannot adopt N kTLS TLS 1.2 session(s)
+  (tls-session-v4) ...`. Every connection stays up and nothing is executed.
+- WebTransport: QUIC session-ticket keys are dropped, so the checkpoint is
+  the v2 frame. Tickets issued before the swap fall back to a full handshake.
+  A live `TLS_AES_256_GCM_SHA384` WebTransport connection refuses UPGRADE
+  (`quic-wide-key-update-v1`) and stays connected.
+
+Hot rollback procedure (one node at a time):
+
+1. Set `[tls] ktls = "off"`. Then Helix UPGRADE to the **current** image.
+   The successor reads the new config. Existing connections are carried, and
+   offloaded rows keep their offload. New TLS 1.2 sessions are no longer
+   offloaded.
+   Do **not** set `enable_tls12 = false` for this step. A successor with TLS
+   1.2 disabled has no TLS 1.2 config, so it cannot resume any carried TLS 1.2
+   row. This build's predecessor reads the target config before exec and
+   refuses such an UPGRADE ("target config sets [tls] enable_tls12 = false
+   but N TLS 1.2 session(s) are attached"), keeping every connection. A
+   `0.10.4` predecessor has no such check: its successor would reject the whole
+   handoff and drop every client on the node. Keep `enable_tls12 = true` through every
+   Helix step while TLS 1.2 clients are connected.
+2. Wait until `onyx_tls_ktls12_active` on `:9130/metrics` reaches `0`. You can
+   also ask the remaining TLS 1.2 clients to reconnect, or disconnect them.
+3. Point the service binary at `0.10.4` and Helix UPGRADE. A refusal leaves
+   the node serving. Read the NOTICE or log line, fix the cause, and retry.
+4. If you cannot wait, cold-restart onto `0.10.4`. Clients reconnect.
+
+There is no TLS-1.2-only offload switch yet. `ktls = "off"` also stops TLS 1.3
+offload, but TLS 1.3 rows are rollback-safe either way.
+
 ## Log retention (eshmaki)
 
 OpenRC `onyx-logrotate` is started and enabled in the default runlevel. It checks

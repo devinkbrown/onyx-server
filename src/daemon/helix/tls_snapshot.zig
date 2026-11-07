@@ -175,6 +175,19 @@ pub fn representableAsV3(snap: Snapshot) bool {
     };
 }
 
+/// The row a predecessor hands a successor that lacks `tls-session-v4`
+/// (0.10.4, which negotiates `.tls_session` exactly [3,3]). The TLS 1.2
+/// RFC 9266 binding is the only v4 datum that may be dropped: a [3,3] reader
+/// never offers SCRAM -PLUS on TLS 1.2, so it cannot use the value. Every
+/// other v4-only datum (kTLS offload, TLS 1.2 control/deferred state) is live
+/// transport state; null then means the row has no exact v3 form and the
+/// caller must refuse the UPGRADE before exec.
+pub fn forV3Target(snap: Snapshot) ?Snapshot {
+    var out = snap;
+    if (out.state.engine == .tls12) out.tls12_channel_binding = null;
+    return if (representableAsV3(out)) out else null;
+}
+
 /// The lowest schema that carries `snap` exactly. The Helix writer stamps the
 /// capsule with this version so a rollback to a v3-only successor keeps every
 /// connection whose row needs nothing newer; v4 is used only when required.
@@ -899,4 +912,38 @@ test "TLS4 rollback: v4 is used only when the row needs it and v3 never drops da
     try testing.expectEqualSlices(u8, &binding, &(try decode(wire, 4)).tls12_channel_binding.?);
     try testing.expectError(error.UnsupportedVersion, encodeVersion(a, bound, 2));
     try testing.expectError(error.UnsupportedVersion, encodeVersion(a, bound, 5));
+}
+
+test "TLS4 rollback: forV3Target drops only the TLS 1.2 binding and refuses offloaded or control rows" {
+    const a = testing.allocator;
+    const binding: [32]u8 = @splat(0x6d);
+    // Bound, not offloaded: the binding is the only v4 datum -> exact v3 row.
+    const bound: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 35, .state = .{ .engine = .{ .tls12 = v4Tls12State() }, .barrier_phase = .none, .held_record_len = 0 }, .tls12_channel_binding = binding };
+    const legacy = forV3Target(bound) orelse return error.TestUnexpectedResult;
+    try testing.expect(legacy.tls12_channel_binding == null);
+    try testing.expectEqual(@as(u16, 3), minimalVersion(legacy));
+    const v3 = try encodeVersion(a, legacy, 3);
+    defer a.free(v3);
+    const got = try decode(v3, 3);
+    try testing.expect(got.tls12_channel_binding == null and got.fd == 35);
+    try testing.expectEqual(bound.state.engine.tls12.app_write_seq, got.state.engine.tls12.app_write_seq);
+    // Offloaded (either direction) or with TLS 1.2 control state: no v3 form.
+    var tx = bound;
+    tx.tx_offloaded = true;
+    try testing.expect(forV3Target(tx) == null);
+    var rx = bound;
+    rx.rx_offloaded = true;
+    try testing.expect(forV3Target(rx) == null);
+    var held = rx;
+    held.state.barrier_phase = .kernel_control_read_held;
+    held.state.rx_open_control_type = 21;
+    held.state.alert_prefix_len = 1;
+    held.state.alert_prefix_byte = 2;
+    try validate(held);
+    try testing.expect(forV3Target(held) == null);
+    // TLS 1.3 rows are unchanged (identical v3/v4 layout, even when offloaded).
+    const s13 = tls_server.Server.ResumeState{ .suite = 0x1301, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 3, .app_write_seq = 4, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(5), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) };
+    const row13: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 36, .state = .{ .engine = .{ .tls13 = s13 }, .barrier_phase = .none, .held_record_len = 0 }, .tx_offloaded = true, .rx_offloaded = true };
+    const same = forV3Target(row13) orelse return error.TestUnexpectedResult;
+    try testing.expect(same.tx_offloaded and same.rx_offloaded);
 }

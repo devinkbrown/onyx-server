@@ -363,9 +363,60 @@ const predecessor_pending_stop_capability_token = "ONYX_HELIX_UPGRADE_CAPS=" ++ 
 const upgrade_capability_caps = predecessor_pending_stop_capability_caps ++ ",pending-stop-v1";
 pub const upgrade_capability_token =
     "ONYX_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
+/// Rolling per-row state capabilities, each advertised as its own complete
+/// line next to the base token. The base token above stays byte-identical to
+/// the 0.10.4 (e202c6cf) contract so a 0.10.4 predecessor still upgrades INTO
+/// this image (it requires its exact line), while a predecessor running this
+/// image learns from the ABSENCE of these lines that the target is a 0.10.4-
+/// class successor and must be handed the older exact row forms -- or refused
+/// before exec when a live row has no such form.
+///
+/// `tls-session-v4`: the target adopts `.tls_session` v4 rows (TLS 1.2
+/// RFC 9266 channel-binding tail, TLS 1.2 kTLS offload / control state).
+/// 0.10.4 negotiates `.tls_session` exactly [3,3] and aborts the whole adopt
+/// on any v4 row ("noncanonical TLS-session capsule").
+pub const tls_session_v4_capability_token = "ONYX_HELIX_STATE_CAP=tls-session-v4";
+/// `quic-wide-key-update-v1`: the target adopts a TLS_AES_256_GCM_SHA384
+/// WebTransport QUIC connection captured with `key_update.ready == true`, and
+/// the HXLW v3 frame carrying QUIC session-ticket keys. 0.10.4 requires
+/// `ready == false` for that suite under the unchanged v2 HXLW layout and has
+/// no v3 frame.
+pub const quic_wide_key_update_capability_token = "ONYX_HELIX_STATE_CAP=quic-wide-key-update-v1";
 /// Never emit a predecessor line whose mandatory state this image refuses.
 /// Probe success must imply that the target can accept the sender's handoff.
-pub const upgrade_capability_advertisement = upgrade_capability_token;
+/// Multi-line: the exact base contract followed by every rolling state
+/// capability this image adopts.
+pub const upgrade_capability_advertisement = upgrade_capability_token ++ "\n" ++
+    tls_session_v4_capability_token ++ "\n" ++
+    quic_wide_key_update_capability_token;
+
+/// What a probed upgrade target adopts beyond the exact base contract. A
+/// target that answers only the base token (0.10.4) gets all-false: the
+/// predecessor then writes the older exact row forms or refuses before exec.
+pub const TargetStateCaps = struct {
+    tls_session_v4: bool = false,
+    quic_wide_key_update: bool = false,
+
+    /// This image's own capabilities. Used where no probe runs (native
+    /// same-image handoff) and as the in-process default.
+    pub const current: TargetStateCaps = .{ .tls_session_v4 = true, .quic_wide_key_update = true };
+    /// A 0.10.4-class target: only the exact base token.
+    pub const legacy: TargetStateCaps = .{};
+
+    pub fn fromOutput(output: []const u8) TargetStateCaps {
+        return .{
+            .tls_session_v4 = hasCompleteOutputLine(output, tls_session_v4_capability_token),
+            .quic_wide_key_update = hasCompleteOutputLine(output, quic_wide_key_update_capability_token),
+        };
+    }
+
+    fn merge(a: TargetStateCaps, b: TargetStateCaps) TargetStateCaps {
+        return .{
+            .tls_session_v4 = a.tls_session_v4 or b.tls_session_v4,
+            .quic_wide_key_update = a.quic_wide_key_update or b.quic_wide_key_update,
+        };
+    }
+};
 
 fn hasCompleteOutputLine(output: []const u8, expected: []const u8) bool {
     var lines = std.mem.splitScalar(u8, output, '\n');
@@ -403,6 +454,17 @@ pub fn probeUpgradeExecutableFdWithBootPolicy(
     executable_fd: handoff.Fd,
     policy: BootPolicy,
 ) !bool {
+    return (try probeUpgradeExecutableFdStateCaps(allocator, io, executable_fd, policy)) != null;
+}
+
+/// As `probeUpgradeExecutableFdWithBootPolicy`, but also reports the target's
+/// rolling state capabilities. Null = incompatible (refuse before exec).
+pub fn probeUpgradeExecutableFdStateCaps(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable_fd: handoff.Fd,
+    policy: BootPolicy,
+) !?TargetStateCaps {
     try policy.validate();
     if (builtin.os.tag != .linux) return error.Unsupported;
     if (executable_fd < 0) return error.InvalidExecutableFd;
@@ -468,9 +530,11 @@ pub fn probeUpgradeExecutableFdWithBootPolicy(
     const term = try child.wait(io);
     const stdout = output.reader(0).buffered();
     const stderr = output.reader(1).buffered();
-    return term.success() and
+    const compatible = term.success() and
         (hasUpgradeCapabilityLine(stdout) or hasUpgradeCapabilityLine(stderr)) and
         (!policy.requiresCapability() or hasCompleteOutputLine(stdout, boot_policy_capability_token) or hasCompleteOutputLine(stderr, boot_policy_capability_token));
+    if (!compatible) return null;
+    return TargetStateCaps.fromOutput(stdout).merge(TargetStateCaps.fromOutput(stderr));
 }
 
 /// Borrowed from the retained prepared-config owner. Only actual resolved
@@ -1469,6 +1533,41 @@ test "tls_session rows stamped v3 are adopted by a v3-only successor and by this
     // A row that needs v4 still refuses the v3-only successor (cold restart).
     try std.testing.expect((try capsule.negotiate(deployed, caps[1].header)) != caps[1].header.version);
     try std.testing.expectEqual(@as(u16, 4), try capsule.negotiate(current, caps[1].header));
+}
+
+/// Frozen 0.10.4 (e202c6cf) probe answer: the single base line, no rolling
+/// state-capability lines. Literal on purpose — never derive it from current.
+const release_0_10_4_probe_output =
+    "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,config-source-2m-v1,e2ee-group-authority-v2,handoff-manifest-v5,host-presentation-v1,local-guest-issuer-v1,physical-connection-relation-v2,canonical-mesh-admission-v1,remote-presentation-v1,history-v1,mandatory-policy-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,read-marker-mesh-v1,relay-v2-event-log-v1,relay-v2-outbox-v2,ring-sqpoll-idle-v1,s2s-inner-carry-v6,session-group-fence-v1,session-group-retired-facts-v1,session-replica-checkpoint-v3,session-replica-core-checkpoint-v1,session-resume-eligibility-v1,sessions-v4,state-fd-manifest-v2,webtransport-linux-v1,webtransport-tls-generation-v1,webhook-store-v1,world-v2,pending-stop-v1\n" ++
+    "ONYX_HELIX_BOOT_POLICY=1\n";
+
+test "Helix rollback probe: a 0.10.4 target is compatible but lacks tls-session-v4 and quic-wide-key-update-v1" {
+    // Rollback (this image -> 0.10.4): the base line still matches, so the
+    // predecessor does not refuse outright; it learns the target is legacy.
+    try std.testing.expect(hasUpgradeCapabilityLine(release_0_10_4_probe_output));
+    try std.testing.expect(hasUpgradeCapabilityForBootPolicy(release_0_10_4_probe_output, .{ .strict_existing_identity = true }));
+    const legacy = TargetStateCaps.fromOutput(release_0_10_4_probe_output);
+    try std.testing.expectEqual(TargetStateCaps.legacy, legacy);
+    try std.testing.expect(!legacy.tls_session_v4 and !legacy.quic_wide_key_update);
+    // Same image / newer: every rolling capability is advertised.
+    const output = upgrade_capability_advertisement ++ "\n" ++ boot_policy_capability_token ++ "\n";
+    try std.testing.expect(hasUpgradeCapabilityLine(output));
+    try std.testing.expectEqual(TargetStateCaps.current, TargetStateCaps.fromOutput(output));
+    // Capabilities split across stdout/stderr merge; substrings never count.
+    try std.testing.expectEqual(TargetStateCaps.current, TargetStateCaps.fromOutput(tls_session_v4_capability_token ++ "\n").merge(TargetStateCaps.fromOutput(quic_wide_key_update_capability_token ++ "\r\n")));
+    try std.testing.expectEqual(TargetStateCaps.legacy, TargetStateCaps.fromOutput("x" ++ tls_session_v4_capability_token ++ "\n" ++ quic_wide_key_update_capability_token ++ " y\n"));
+}
+
+test "Helix forward probe: a 0.10.4 predecessor still finds its exact line in this image's advertisement" {
+    // 0.10.4 requires its complete base line; the rolling lines must not
+    // replace or alter it, or the forward upgrade 0.10.4 -> this image breaks.
+    const base_line = release_0_10_4_probe_output[0..std.mem.indexOfScalar(u8, release_0_10_4_probe_output, '\n').?];
+    try std.testing.expectEqualStrings(base_line, upgrade_capability_token);
+    try std.testing.expect(hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", base_line));
+    try std.testing.expect(hasCompleteOutputLine(upgrade_capability_advertisement, tls_session_v4_capability_token));
+    try std.testing.expect(hasCompleteOutputLine(upgrade_capability_advertisement, quic_wide_key_update_capability_token));
+    // The probe output limit (4096 per stream) still holds with headroom.
+    try std.testing.expect(upgrade_capability_advertisement.len + boot_policy_capability_token.len + 2 < 4096);
 }
 
 test "exec plan with listener carries the listen fd env entry" {

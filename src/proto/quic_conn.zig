@@ -746,6 +746,17 @@ pub const ConnSnapshot = struct {
         self.* = undefined;
     }
 
+    /// True when only a successor advertising `quic-wide-key-update-v1` can
+    /// adopt this row: a TLS_AES_256_GCM_SHA384 connection captured ready for
+    /// key update. The wire layout is unchanged, but a binary predating
+    /// SHA-384 key update (0.10.4) requires `ready == false` for this suite
+    /// and aborts the whole transactional adopt. The legacy idle form is not
+    /// synthesized (it would drop the RFC 9001 §6.6 AEAD-limit accounting), so
+    /// the predecessor refuses such an UPGRADE before exec instead.
+    pub fn requiresWideKeyUpdateAdopter(self: *const ConnSnapshot) bool {
+        return self.handshake.suite == .tls_aes_256_gcm_sha384 and self.key_update.ready;
+    }
+
     pub fn validate(self: *const ConnSnapshot) SnapshotError!void {
         self.handshake.validate() catch |err| {
             logServerSnapshotFailure("handshake validation", err);
@@ -5456,6 +5467,35 @@ test "quic conn snapshot — a SHA-384 connection round-trips after a key update
     try testing.expectError(error.InvalidSnapshot, snap.validate());
     snap.key_update.write_secret[0] = 0;
     try snap.validate();
+}
+
+test "quic conn snapshot — only a ready SHA-384 capture requires a quic-wide-key-update-v1 adopter" {
+    const alloc = testing.allocator;
+    var fp: FeatPair = undefined;
+    try fp.init();
+    var server: Conn = undefined;
+    var client: Conn = undefined;
+    try sha384Pair(alloc, &fp, &server, &client);
+    defer server.deinit();
+    defer client.deinit();
+    var snap = try server.captureEstablishedServerSnapshot(alloc);
+    defer snap.deinit(alloc);
+    // This build always captures SHA-384 as key-update ready: a 0.10.4-class
+    // successor (ready must be false for this suite) cannot adopt it.
+    try testing.expect(snap.requiresWideKeyUpdateAdopter());
+    // The legacy idle form is what such a successor expects.
+    snap.key_update = .{};
+    snap.key_update.next_read = zeroSnapshotPacketKeys();
+    try testing.expect(!snap.requiresWideKeyUpdateAdopter());
+
+    // SHA-256 suites were always ready on both sides of the boundary.
+    const lb = try Loopback.init(alloc);
+    defer lb.deinit(alloc);
+    try driveHandshake(alloc, lb);
+    var narrow = try lb.server.captureEstablishedServerSnapshot(alloc);
+    defer narrow.deinit(alloc);
+    try testing.expect(narrow.handshake.suite != .tls_aes_256_gcm_sha384);
+    try testing.expect(narrow.key_update.ready and !narrow.requiresWideKeyUpdateAdopter());
 }
 
 test "quic conn client honours a Stateless Reset carrying the advertised token and ignores forgeries" {
