@@ -3,15 +3,19 @@
 
 //! ACME (RFC 8555) certificate-issuance orchestration state machine.
 //!
-//! Conductor for a Let's Encrypt http-01 issuance flow. Owns no sockets, clock,
-//! or RNG: every interaction is injected. The caller calls `step` repeatedly;
-//! each call advances the machine by one round-trip (or one local decision) and
-//! returns a `Progress` plus zero-or-more `Effect`s the caller must act on (serve
-//! an http-01 token, write the issued certificate).
+//! Conductor for a Let's Encrypt issuance flow answering http-01 (RFC 8555
+//! §8.3), dns-01 (RFC 8555 §8.4) or tls-alpn-01 (RFC 8737) challenges. Owns no
+//! sockets, clock, or RNG: every interaction is injected. The caller calls
+//! `step` repeatedly; each call advances the machine by one round-trip (or one
+//! local decision) and returns a `Progress` plus zero-or-more `Effect`s the
+//! caller must act on (provision a challenge response, write the issued
+//! certificate).
 //!
 //! Flow (RFC 8555 §7): directory -> newNonce -> newAccount -> newOrder(domains)
-//! -> per authorization: GET authz, pick http-01, provision key-auth, POST
-//! challenge, poll until valid -> finalize with CSR -> poll order -> download.
+//! -> per authorization: GET authz, pick the configured challenge type, emit
+//! the provisioning effect, [caller provisions], POST challenge (RFC 8555
+//! §7.5.1: only once the response is in place), poll until valid -> finalize
+//! with CSR -> poll order -> download.
 //!
 //! Injection: `Transport` (ctx + `get`/`postJws` fn pointers returning
 //! `HttpResponse`); `Signer` (ctx + `sign(signing_input) -> signature`). The
@@ -43,8 +47,29 @@ comptime {
 /// one retry, but we allow a small margin.
 const max_nonce_retries: u8 = 3;
 
-/// The http-01 challenge type token used to select a challenge from an authz.
-const http01_type = "http-01";
+/// Challenge types this client can answer (RFC 8555 §8.3/§8.4, RFC 8737 §3).
+pub const ChallengeType = enum {
+    http_01,
+    dns_01,
+    tls_alpn_01,
+
+    /// The `type` string the CA uses in a challenge object.
+    pub fn wireName(self: ChallengeType) []const u8 {
+        return switch (self) {
+            .http_01 => "http-01",
+            .dns_01 => "dns-01",
+            .tls_alpn_01 => "tls-alpn-01",
+        };
+    }
+
+    /// Parse the operator / wire spelling (`http-01`, `dns-01`, `tls-alpn-01`).
+    pub fn fromString(text: []const u8) ?ChallengeType {
+        for ([_]ChallengeType{ .http_01, .dns_01, .tls_alpn_01 }) |t| {
+            if (std.mem.eql(u8, text, t.wireName())) return t;
+        }
+        return null;
+    }
+};
 
 /// JOSE `alg` for the account key. ES256 (ECDSA P-256 + SHA-256) is the
 /// algorithm Let's Encrypt accepts; it rejects EdDSA on accounts.
@@ -116,8 +141,11 @@ pub const Config = struct {
     signer: Signer,
     /// Certificate key — signs the CSR and becomes the issued cert's key. MUST be
     /// a distinct key from `signer`; Let's Encrypt rejects a CSR whose public key
-    /// equals the account key.
+    /// equals the account key. The first `step` fails with
+    /// `error.AccountKeyReuse` if they are equal.
     cert_signer: Signer,
+    /// Which challenge type to answer for every authorization.
+    challenge: ChallengeType = .http_01,
 };
 
 /// Effects the caller MUST act on when returned from `step`.
@@ -125,6 +153,16 @@ pub const Effect = union(enum) {
     /// Provision the http-01 challenge: serve `key_authorization` (as the body)
     /// at `/.well-known/acme-challenge/<token>` until issuance completes.
     serve_http01: struct { token: []const u8, key_authorization: []const u8 },
+    /// Provision the dns-01 challenge (RFC 8555 §8.4): publish a TXT record
+    /// at `fqdn` (`_acme-challenge.<domain>`) whose value is `txt_value`
+    /// (base64url(SHA-256(keyAuth))), and wait for it to propagate, before the
+    /// next `step` (which tells the CA to validate).
+    provision_dns01: struct { fqdn: []const u8, txt_value: []const u8 },
+    /// Provision the tls-alpn-01 challenge (RFC 8737 §3): answer TLS
+    /// handshakes for `domain` that offer only ALPN `acme-tls/1` with a
+    /// certificate carrying the critical acmeIdentifier extension over
+    /// SHA-256(`key_authorization`), before the next `step`.
+    provision_tls_alpn01: struct { domain: []const u8, key_authorization: []const u8 },
     /// The issued certificate chain (PEM). Persist it.
     write_cert: struct { pem: []const u8 },
 };
@@ -142,7 +180,8 @@ pub const State = enum {
     start, // fetch directory
     account, // ensure nonce, create account
     order, // create order
-    authorizing, // fetch the next authorization
+    authorizing, // fetch the next authorization, emit the provisioning effect
+    responding, // caller provisioned; POST the challenge (RFC 8555 §7.5.1)
     polling_authz, // challenge POSTed; poll authz until valid
     finalizing, // finalize order with CSR
     polling_order, // poll order until it carries a certificate URL
@@ -157,7 +196,10 @@ pub const Error = error{
     UnexpectedStatus, // unexpected HTTP status / problem document
     MissingAccountUrl, // newAccount lacked a Location header
     MissingOrderUrl, // newOrder lacked a Location header
-    NoHttp01Challenge, // authz offered no http-01 challenge
+    NoChallenge, // authz offered no challenge of the configured type
+    UnexpectedIdentifier, // authz identifier is not one we ordered
+    InvalidToken, // challenge token is not RFC 8555 §8.1 base64url
+    AccountKeyReuse, // account key == certificate key
     OrderFailed, // order reached a terminal non-valid state
     AuthzFailed, // authz reached a terminal non-valid state
     TooManyNonceRetries, // badNonce retried past the limit
@@ -183,14 +225,18 @@ pub const Acme = struct {
     /// Authorization URLs remaining to process (owned).
     authz_urls: [][]u8 = &.{},
     authz_index: usize = 0,
-    /// URL of the challenge we POSTed (owned), used to poll the authz.
+    /// URL of the authz being answered (owned), used to poll it.
     current_authz_url: ?[]u8 = null,
+    /// URL of the challenge to POST once the caller has provisioned (owned).
+    current_challenge_url: ?[]u8 = null,
 
     /// Effect scratch storage, valid until the next step.
     effect_buf: [2]Effect = undefined,
     /// Backing storage for effect string fields.
     token_buf: [256]u8 = undefined,
     keyauth_buf: [512]u8 = undefined,
+    name_buf: [challenge.dns01_label.len + challenge.max_dns_name_len]u8 = undefined,
+    txt_buf: [64]u8 = undefined,
     pem_buf: ?[]u8 = null,
 
     /// badNonce retry counter for the in-flight signed request.
@@ -208,6 +254,7 @@ pub const Acme = struct {
         if (self.finalize_url) |u| self.allocator.free(u);
         if (self.cert_url) |u| self.allocator.free(u);
         if (self.current_authz_url) |u| self.allocator.free(u);
+        if (self.current_challenge_url) |u| self.allocator.free(u);
         for (self.authz_urls) |u| self.allocator.free(u);
         self.allocator.free(self.authz_urls);
         if (self.pem_buf) |p| self.allocator.free(p);
@@ -221,6 +268,7 @@ pub const Acme = struct {
             .account => self.stepAccount(transport),
             .order => self.stepOrder(transport),
             .authorizing => self.stepAuthorizing(transport),
+            .responding => self.stepResponding(transport),
             .polling_authz => self.stepPollAuthz(transport),
             .finalizing => self.stepFinalize(transport),
             .polling_order => self.stepPollOrder(transport),
@@ -310,6 +358,14 @@ pub const Acme = struct {
     // --- per-state handlers ------------------------------------------------
 
     fn stepStart(self: *Acme, transport: Transport) Error!Progress {
+        // Account key and certificate key MUST differ (RFC 8555 §11.1: the
+        // account key is not to be reused for other purposes; Let's Encrypt
+        // rejects such a CSR with badCSR).
+        if (std.mem.eql(u8, &self.config.signer.public_key_x, &self.config.cert_signer.public_key_x) and
+            std.mem.eql(u8, &self.config.signer.public_key_y, &self.config.cert_signer.public_key_y))
+        {
+            return self.fail(error.AccountKeyReuse);
+        }
         const resp = transport.get(self.config.directory_url) catch return self.fail(error.UnexpectedStatus);
         if (!isOk(resp.status)) return self.fail(error.UnexpectedStatus);
         try self.setNonce(resp.nonce);
@@ -402,8 +458,17 @@ pub const Acme = struct {
             return self.fail(error.AuthzFailed);
         }
 
-        const chal = order_mod.findChallenge(authz, http01_type) orelse
-            return self.fail(error.NoHttp01Challenge);
+        // Only answer for an identifier we actually ordered (RFC 8555 §7.1.4:
+        // a wildcard order's authz carries the base domain).
+        if (!std.mem.eql(u8, authz.identifier.type, "dns") or
+            !self.orderedIdentifier(authz.identifier.value))
+        {
+            return self.fail(error.UnexpectedIdentifier);
+        }
+
+        const chal = order_mod.findChallenge(authz, self.config.challenge.wireName()) orelse
+            return self.fail(error.NoChallenge);
+        if (!challenge.validateToken(chal.token)) return self.fail(error.InvalidToken);
 
         var thumb_buf: [jwk.thumbprint_b64_len]u8 = undefined;
         var thumb_digest: [32]u8 = undefined;
@@ -412,22 +477,60 @@ pub const Acme = struct {
 
         const key_auth = challenge.keyAuthorization(chal.token, thumb, &self.keyauth_buf) catch
             return self.fail(error.OutOfMemory);
-        if (chal.token.len > self.token_buf.len) return self.fail(error.OutOfMemory);
-        @memcpy(self.token_buf[0..chal.token.len], chal.token);
-        const token = self.token_buf[0..chal.token.len];
 
-        self.effect_buf[0] = .{ .serve_http01 = .{ .token = token, .key_authorization = key_auth } };
+        switch (self.config.challenge) {
+            .http_01 => {
+                if (chal.token.len > self.token_buf.len) return self.fail(error.OutOfMemory);
+                @memcpy(self.token_buf[0..chal.token.len], chal.token);
+                const token = self.token_buf[0..chal.token.len];
+                self.effect_buf[0] = .{ .serve_http01 = .{ .token = token, .key_authorization = key_auth } };
+            },
+            .dns_01 => {
+                const fqdn = challenge.dns01RecordName(authz.identifier.value, &self.name_buf) catch
+                    return self.fail(error.UnexpectedIdentifier);
+                const txt = challenge.dns01TxtValue(key_auth, &self.txt_buf) catch
+                    return self.fail(error.OutOfMemory);
+                self.effect_buf[0] = .{ .provision_dns01 = .{ .fqdn = fqdn, .txt_value = txt } };
+            },
+            .tls_alpn_01 => {
+                const v = authz.identifier.value;
+                if (v.len > self.name_buf.len) return self.fail(error.UnexpectedIdentifier);
+                @memcpy(self.name_buf[0..v.len], v);
+                self.effect_buf[0] = .{ .provision_tls_alpn01 = .{ .domain = self.name_buf[0..v.len], .key_authorization = key_auth } };
+            },
+        }
 
+        const authz_copy = try self.allocator.dupe(u8, authz_url);
+        errdefer self.allocator.free(authz_copy);
+        const chal_copy = try self.allocator.dupe(u8, chal.url);
         if (self.current_authz_url) |old| self.allocator.free(old);
-        self.current_authz_url = try self.allocator.dupe(u8, authz_url);
+        self.current_authz_url = authz_copy;
+        if (self.current_challenge_url) |old| self.allocator.free(old);
+        self.current_challenge_url = chal_copy;
 
-        const chal_url = try self.allocator.dupe(u8, chal.url);
-        defer self.allocator.free(chal_url);
+        // The CA is told to validate only on the NEXT step, after the caller
+        // has acted on the provisioning effect (RFC 8555 §7.5.1: the client
+        // responds to the challenge once it has provisioned the response).
+        self.state = .responding;
+        return .{ .state = self.state, .done = false, .effects = self.effect_buf[0..1] };
+    }
+
+    fn stepResponding(self: *Acme, transport: Transport) Error!Progress {
+        const chal_url = self.current_challenge_url orelse return self.fail(error.AuthzFailed);
         const trig = try self.postSigned(transport, chal_url, "{}", false);
         if (!isOk(trig.status)) return self.fail(error.UnexpectedStatus);
-
         self.state = .polling_authz;
-        return .{ .state = self.state, .done = false, .effects = self.effect_buf[0..1] };
+        return self.noEffects();
+    }
+
+    /// Whether `value` (an authz identifier) is one of the ordered domains,
+    /// compared case-insensitively; a configured `*.base` matches `base`.
+    fn orderedIdentifier(self: *const Acme, value: []const u8) bool {
+        for (self.config.domains) |d| {
+            if (std.ascii.eqlIgnoreCase(d, value)) return true;
+            if (std.mem.startsWith(u8, d, "*.") and std.ascii.eqlIgnoreCase(d[2..], value)) return true;
+        }
+        return false;
     }
 
     fn stepPollAuthz(self: *Acme, transport: Transport) Error!Progress {
@@ -624,6 +727,14 @@ fn makeSigner(calls: *usize) Signer {
     };
 }
 
+/// A certificate-key signer whose public key differs from `makeSigner`'s.
+fn makeCertSigner(calls: *usize) Signer {
+    var s = makeSigner(calls);
+    s.public_key_x = @as([32]u8, @splat(3));
+    s.public_key_y = @as([32]u8, @splat(5));
+    return s;
+}
+
 /// Run the machine to a terminal state, collecting emitted effect tags.
 fn driveToEnd(acme: *Acme, t: Transport, saw_serve: *bool, saw_cert: *bool) !State {
     var guard: usize = 0;
@@ -631,7 +742,7 @@ fn driveToEnd(acme: *Acme, t: Transport, saw_serve: *bool, saw_cert: *bool) !Sta
         if (guard > 64) return error.TestExpectedEqual;
         const prog = try acme.step(t);
         for (prog.effects) |eff| switch (eff) {
-            .serve_http01 => saw_serve.* = true,
+            .serve_http01, .provision_dns01, .provision_tls_alpn01 => saw_serve.* = true,
             .write_cert => saw_cert.* = true,
         };
     }
@@ -694,7 +805,7 @@ test "full http-01 issuance flow drives machine to done and emits effects" {
         .domains = &.{"example.com"},
         .contacts = &.{"mailto:admin@example.com"},
         .signer = makeSigner(&sign_calls),
-        .cert_signer = makeSigner(&sign_calls),
+        .cert_signer = makeCertSigner(&sign_calls),
     });
     defer acme.deinit();
 
@@ -738,7 +849,7 @@ test "badNonce on newAccount is retried with the fresh nonce then succeeds" {
         .directory_url = "https://ca/directory",
         .domains = &.{"example.com"},
         .signer = makeSigner(&sign_calls),
-        .cert_signer = makeSigner(&sign_calls),
+        .cert_signer = makeCertSigner(&sign_calls),
     });
     defer acme.deinit();
 
@@ -763,11 +874,190 @@ test "stepping a terminal machine returns error.Terminal" {
         .directory_url = "x",
         .domains = &.{"example.com"},
         .signer = makeSigner(&sign_calls),
-        .cert_signer = makeSigner(&sign_calls),
+        .cert_signer = makeCertSigner(&sign_calls),
     });
     defer acme.deinit();
     acme.state = .done;
 
     // Act / Assert
     try testing.expectError(error.Terminal, acme.step(mock.transport()));
+}
+
+const test_dir_json =
+    \\{"newNonce":"https://ca/nonce","newAccount":"https://ca/acct",
+    \\"newOrder":"https://ca/order","revokeCert":"https://ca/revoke",
+    \\"keyChange":"https://ca/keychange"}
+;
+const test_order_json =
+    \\{"status":"pending","identifiers":[{"type":"dns","value":"example.com"}],
+    \\"authorizations":["https://ca/authz/1"],"finalize":"https://ca/finalize/1"}
+;
+const test_authz_pending_all =
+    \\{"status":"pending","identifier":{"type":"dns","value":"example.com"},
+    \\"challenges":[{"type":"http-01","url":"https://ca/chal/h","token":"tokH","status":"pending"},
+    \\{"type":"dns-01","url":"https://ca/chal/d","token":"tokD","status":"pending"},
+    \\{"type":"tls-alpn-01","url":"https://ca/chal/t","token":"tokT","status":"pending"}]}
+;
+
+/// Drive start -> account -> order -> authorizing and return the progress of
+/// the authorizing step (the provisioning effect).
+fn driveToProvision(acme: *Acme, t: Transport) !Progress {
+    _ = try acme.step(t); // start
+    _ = try acme.step(t); // account
+    _ = try acme.step(t); // order
+    return acme.step(t); // authorizing -> effect
+}
+
+test "dns-01 emits _acme-challenge TXT effect before the challenge POST" {
+    var entries = [_]Canned{
+        .{ .url = "https://ca/directory", .body = test_dir_json, .nonce = "n0" },
+        .{ .url = "https://ca/acct", .status = 201, .body = "{}", .location = "https://ca/acct/1" },
+        .{ .url = "https://ca/order", .status = 201, .body = test_order_json, .location = "https://ca/order/1" },
+        .{ .url = "https://ca/authz/1", .body = test_authz_pending_all },
+        .{ .url = "https://ca/chal/d", .body = "{}" },
+    };
+    var sign_calls: usize = 0;
+    var mock = MockTransport{ .entries = &entries, .sign_calls = &sign_calls };
+    var acme = Acme.init(testing.allocator, .{
+        .directory_url = "https://ca/directory",
+        .domains = &.{"example.com"},
+        .signer = makeSigner(&sign_calls),
+        .cert_signer = makeCertSigner(&sign_calls),
+        .challenge = .dns_01,
+    });
+    defer acme.deinit();
+
+    const prog = try driveToProvision(&acme, mock.transport());
+    try testing.expectEqual(State.responding, prog.state);
+    try testing.expectEqual(@as(usize, 1), prog.effects.len);
+    const eff = prog.effects[0].provision_dns01;
+    try testing.expectEqualStrings("_acme-challenge.example.com", eff.fqdn);
+
+    // Expected TXT = base64url(SHA-256("tokD." ++ thumbprint(account key))).
+    var thumb_digest: [32]u8 = undefined;
+    jwk.thumbprintEc(@as([32]u8, @splat(7)), @as([32]u8, @splat(9)), &thumb_digest);
+    var thumb_buf: [jwk.thumbprint_b64_len]u8 = undefined;
+    const thumb = std.base64.url_safe_no_pad.Encoder.encode(&thumb_buf, &thumb_digest);
+    var ka_buf: [128]u8 = undefined;
+    const ka = try challenge.keyAuthorization("tokD", thumb, &ka_buf);
+    var txt_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(try challenge.dns01TxtValue(ka, &txt_buf), eff.txt_value);
+
+    // The CA has NOT been told to validate yet (RFC 8555 §7.5.1 ordering).
+    try testing.expect(!entries[4].used);
+    const next = try acme.step(mock.transport());
+    try testing.expectEqual(State.polling_authz, next.state);
+    try testing.expect(entries[4].used);
+}
+
+test "tls-alpn-01 emits domain + key authorization effect for the identifier" {
+    var entries = [_]Canned{
+        .{ .url = "https://ca/directory", .body = test_dir_json, .nonce = "n0" },
+        .{ .url = "https://ca/acct", .status = 201, .body = "{}", .location = "https://ca/acct/1" },
+        .{ .url = "https://ca/order", .status = 201, .body = test_order_json, .location = "https://ca/order/1" },
+        .{ .url = "https://ca/authz/1", .body = test_authz_pending_all },
+        .{ .url = "https://ca/chal/t", .body = "{}" },
+    };
+    var sign_calls: usize = 0;
+    var mock = MockTransport{ .entries = &entries, .sign_calls = &sign_calls };
+    var acme = Acme.init(testing.allocator, .{
+        .directory_url = "https://ca/directory",
+        .domains = &.{"EXAMPLE.com"},
+        .signer = makeSigner(&sign_calls),
+        .cert_signer = makeCertSigner(&sign_calls),
+        .challenge = .tls_alpn_01,
+    });
+    defer acme.deinit();
+
+    const prog = try driveToProvision(&acme, mock.transport());
+    const eff = prog.effects[0].provision_tls_alpn01;
+    try testing.expectEqualStrings("example.com", eff.domain);
+    try testing.expect(std.mem.startsWith(u8, eff.key_authorization, "tokT."));
+    try testing.expect(!entries[4].used);
+    _ = try acme.step(mock.transport());
+    try testing.expect(entries[4].used);
+}
+
+test "authz without the configured challenge type fails closed" {
+    const authz_http_only =
+        \\{"status":"pending","identifier":{"type":"dns","value":"example.com"},
+        \\"challenges":[{"type":"http-01","url":"https://ca/chal/h","token":"tokH","status":"pending"}]}
+    ;
+    var entries = [_]Canned{
+        .{ .url = "https://ca/directory", .body = test_dir_json, .nonce = "n0" },
+        .{ .url = "https://ca/acct", .status = 201, .body = "{}", .location = "https://ca/acct/1" },
+        .{ .url = "https://ca/order", .status = 201, .body = test_order_json, .location = "https://ca/order/1" },
+        .{ .url = "https://ca/authz/1", .body = authz_http_only },
+    };
+    var sign_calls: usize = 0;
+    var mock = MockTransport{ .entries = &entries, .sign_calls = &sign_calls };
+    var acme = Acme.init(testing.allocator, .{
+        .directory_url = "https://ca/directory",
+        .domains = &.{"example.com"},
+        .signer = makeSigner(&sign_calls),
+        .cert_signer = makeCertSigner(&sign_calls),
+        .challenge = .dns_01,
+    });
+    defer acme.deinit();
+    try testing.expectError(error.NoChallenge, driveToProvision(&acme, mock.transport()));
+    try testing.expectEqual(State.failed, acme.state);
+}
+
+test "authz for an identifier we did not order fails closed; wildcard base matches" {
+    const authz_other =
+        \\{"status":"pending","identifier":{"type":"dns","value":"evil.example"},
+        \\"challenges":[{"type":"dns-01","url":"https://ca/chal/d","token":"tokD","status":"pending"}]}
+    ;
+    var entries = [_]Canned{
+        .{ .url = "https://ca/directory", .body = test_dir_json, .nonce = "n0" },
+        .{ .url = "https://ca/acct", .status = 201, .body = "{}", .location = "https://ca/acct/1" },
+        .{ .url = "https://ca/order", .status = 201, .body = test_order_json, .location = "https://ca/order/1" },
+        .{ .url = "https://ca/authz/1", .body = authz_other },
+    };
+    var sign_calls: usize = 0;
+    var mock = MockTransport{ .entries = &entries, .sign_calls = &sign_calls };
+    var acme = Acme.init(testing.allocator, .{
+        .directory_url = "https://ca/directory",
+        .domains = &.{"example.com"},
+        .signer = makeSigner(&sign_calls),
+        .cert_signer = makeCertSigner(&sign_calls),
+        .challenge = .dns_01,
+    });
+    defer acme.deinit();
+    try testing.expectError(error.UnexpectedIdentifier, driveToProvision(&acme, mock.transport()));
+
+    // RFC 8555 §7.1.4: a "*.example.com" order's authz names "example.com".
+    var wild = Acme.init(testing.allocator, .{
+        .directory_url = "x",
+        .domains = &.{"*.example.com"},
+        .signer = makeSigner(&sign_calls),
+        .cert_signer = makeCertSigner(&sign_calls),
+    });
+    defer wild.deinit();
+    try testing.expect(wild.orderedIdentifier("example.com"));
+    try testing.expect(wild.orderedIdentifier("Example.COM"));
+    try testing.expect(!wild.orderedIdentifier("sub.example.com"));
+}
+
+test "account key equal to certificate key is refused before any request" {
+    var entries = [_]Canned{.{ .url = "https://ca/directory", .body = test_dir_json }};
+    var sign_calls: usize = 0;
+    var mock = MockTransport{ .entries = &entries, .sign_calls = &sign_calls };
+    var acme = Acme.init(testing.allocator, .{
+        .directory_url = "https://ca/directory",
+        .domains = &.{"example.com"},
+        .signer = makeSigner(&sign_calls),
+        .cert_signer = makeSigner(&sign_calls),
+    });
+    defer acme.deinit();
+    try testing.expectError(error.AccountKeyReuse, acme.step(mock.transport()));
+    try testing.expect(!entries[0].used);
+}
+
+test "ChallengeType round-trips its wire names" {
+    try testing.expectEqual(ChallengeType.http_01, ChallengeType.fromString("http-01").?);
+    try testing.expectEqual(ChallengeType.dns_01, ChallengeType.fromString("dns-01").?);
+    try testing.expectEqual(ChallengeType.tls_alpn_01, ChallengeType.fromString("tls-alpn-01").?);
+    try testing.expect(ChallengeType.fromString("tls-sni-01") == null);
+    try testing.expect(ChallengeType.fromString("HTTP-01") == null);
 }

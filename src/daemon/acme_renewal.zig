@@ -9,6 +9,13 @@
 //! `acme_runner.issue` when the configured threshold is reached, then only
 //! signals the server reactor to hot-reload the same `[tls]` cert/key paths
 //! REHASH uses.
+//!
+//! The ACME account key is persisted at `[acme].account_key_path` (default:
+//! `acme-account.key.pem` beside `[tls].key_path`), created once with mode
+//! 0600 and reused for every renewal; each renewal mints a fresh certificate
+//! key. For `challenge = "tls-alpn-01"` the worker publishes challenge
+//! certificates into `tls_alpn01`, which the TLS listener must consult (see
+//! `tlsAlpn01Store`).
 
 const std = @import("std");
 const runtime_pause = @import("runtime_pause.zig");
@@ -51,6 +58,15 @@ pub const Service = struct {
     next_check_ms: i64 = 0,
     completed_checks: u64 = 0,
     last_outcome: Outcome = .none,
+    /// Live tls-alpn-01 challenge certificates (empty outside an issuance).
+    tls_alpn01: acme_runner.TlsAlpn01Store = .{},
+
+    /// The store the TLS listener consults for `acme-tls/1` handshakes
+    /// (`selectForClientHello` on a connection's first record). Stable for the
+    /// Service's lifetime; safe to call from any thread.
+    pub fn tlsAlpn01Store(self: *Service) *acme_runner.TlsAlpn01Store {
+        return &self.tls_alpn01;
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -266,19 +282,36 @@ pub const Service = struct {
         if (anchors.items.len == 0) return error.NoTrustAnchors;
         dlog.log("onyx-server: acme loaded {d} trust anchors from {s}\n", .{ anchors.items.len, self.acme.ca_bundle_path });
 
-        const account_key = ecdsa_p256.KeyPair.generate(self.io);
-        const cert_key = ecdsa_p256.KeyPair.generate(self.io);
+        // Persistent account key, separate from the per-renewal cert key.
+        const derived_account_path = try acme_runner.defaultAccountKeyPath(self.allocator, key_path);
+        defer self.allocator.free(derived_account_path);
+        const account_path = self.acme.account_key_path orelse derived_account_path;
+        try acme_runner.checkAccountKeyPath(account_path, cert_path, key_path);
+        var account = try acme_runner.loadOrCreateAccountKey(self.io, std.Io.Dir.cwd(), account_path);
+        defer account.wipe();
+        if (account.created) {
+            dlog.log("onyx-server: acme created account key {s}; registering a new ACME account (RFC 8555 §7.3)\n", .{account_path});
+        }
+        var cert_key = ecdsa_p256.KeyPair.generate(self.io);
+        defer ecdsa_p256.wipeKeyPair(&cert_key);
 
         var store = http01.TokenStore.init(self.allocator);
         defer store.deinit();
-        var challenge = try listener.ChallengeServer.initWithConfig(&store, self.acme.challenge_port, .{
-            .listen_backlog = @intCast(self.acme.http01_listen_backlog),
-            .accept_poll_ms = self.acme.http01_accept_poll_ms,
-            .conn_read_timeout_sec = self.acme.http01_conn_read_timeout_sec,
-        });
-        try challenge.spawn();
-        defer challenge.shutdown();
-        dlog.log("onyx-server: acme HTTP-01 listener on 127.0.0.1:{d}\n", .{challenge.port});
+        var challenge: ?listener.ChallengeServer = null;
+        defer if (challenge) |*c| c.shutdown();
+        if (self.acme.challenge == .http_01) {
+            challenge = try listener.ChallengeServer.initWithConfig(&store, self.acme.challenge_port, .{
+                .listen_backlog = @intCast(self.acme.http01_listen_backlog),
+                .accept_poll_ms = self.acme.http01_accept_poll_ms,
+                .conn_read_timeout_sec = self.acme.http01_conn_read_timeout_sec,
+            });
+            // spawn() shuts the listener down itself on failure.
+            challenge.?.spawn() catch |err| {
+                challenge = null;
+                return err;
+            };
+            dlog.log("onyx-server: acme HTTP-01 listener on 127.0.0.1:{d}\n", .{challenge.?.port});
+        }
 
         const domains = [_][]const u8{domain};
         var contacts_storage: [1][]const u8 = undefined;
@@ -300,7 +333,11 @@ pub const Service = struct {
             .error_body_preview_bytes = @intCast(self.acme.error_body_preview_bytes),
             .resolv_conf_max_bytes = @intCast(self.acme.resolv_conf_max_bytes),
             .dns_port = self.acme.dns_port,
-        }, account_key, cert_key, &store, null);
+            .challenge = self.acme.challenge,
+            .dns_hook = if (self.acme.dns_hook) |h| .{ .path = h, .timeout_ms = self.acme.dns_hook_timeout_ms } else null,
+            .dns_propagation_delay_ms = self.acme.dns_propagation_delay_ms,
+            .tls_alpn01_store = &self.tls_alpn01,
+        }, account.key_pair, cert_key, if (self.acme.challenge == .http_01) &store else null, null);
         return result.cert_written;
     }
 };
@@ -441,14 +478,114 @@ fn validateConfig(acme: config_format.Config.Acme) !void {
     if (acme.check_interval_ms == 0 or acme.check_interval_ms > std.math.maxInt(i64) or acme.http01_accept_poll_ms == 0 or
         acme.http01_conn_read_timeout_sec == 0 or acme.max_steps == 0 or acme.max_response_bytes == 0 or
         acme.ca_bundle_max_bytes == 0 or acme.resolv_conf_max_bytes == 0 or acme.http01_listen_backlog > std.math.maxInt(u31)) return error.InvalidConfig;
+    if (acme.challenge == .dns_01) {
+        const hook = acme.dns_hook orelse return error.InvalidConfig;
+        if (!std.fs.path.isAbsolute(hook) or acme.dns_hook_timeout_ms == 0) return error.InvalidConfig;
+    }
+    if (acme.account_key_path) |p| if (p.len == 0) return error.InvalidConfig;
 }
+
+/// `Config.Acme` fields added after the version-1 companion digest. They are
+/// hashed only when they differ from their defaults, so a deployment that does
+/// not use them keeps the exact digest an older binary computed and a Helix
+/// handoff across the upgrade still validates (`Snapshot.validate`); setting
+/// any of them changes the digest, which correctly refuses a handoff to or
+/// from a binary that would ignore them.
+const post_v1_acme_fields = [_][]const u8{
+    "account_key_path",
+    "challenge",
+    "dns_hook",
+    "dns_hook_timeout_ms",
+    "dns_propagation_delay_ms",
+};
+
+fn isPostV1AcmeField(comptime name: []const u8) bool {
+    inline for (post_v1_acme_fields) |f| if (comptime std.mem.eql(u8, f, name)) return true;
+    return false;
+}
+
+fn fieldIsDefault(comptime name: []const u8, value: anytype) bool {
+    const default = @field(config_format.Config.Acme{}, name);
+    return switch (@typeInfo(@TypeOf(value))) {
+        .optional => if (value) |v| (if (default) |d| std.mem.eql(u8, v, d) else false) else default == null,
+        else => value == default,
+    };
+}
+
 pub fn configDigest(acme: config_format.Config.Acme, tls: *const config_format.Config.Tls) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("onyx/companion/acme/config/1");
-    try runtime_pause.hashConfigValue(&hash, acme);
+    // Version-1 fields, in declaration order (identical bytes to hashing the
+    // version-1 struct whole).
+    inline for (@typeInfo(config_format.Config.Acme).@"struct".field_names) |name| {
+        if (comptime isPostV1AcmeField(name)) continue;
+        try runtime_pause.hashConfigValue(&hash, @field(acme, name));
+    }
     try runtime_pause.hashOptional(&hash, tls.cert_path);
     try runtime_pause.hashOptional(&hash, tls.key_path);
+    inline for (post_v1_acme_fields) |name| {
+        if (!fieldIsDefault(name, @field(acme, name))) {
+            hash.update("onyx/companion/acme/config/ext/");
+            hash.update(name);
+            try runtime_pause.hashConfigValue(&hash, @field(acme, name));
+        }
+    }
     return hash.finalResult();
+}
+
+test "acme configDigest is unchanged for default post-v1 fields and covers them when set" {
+    // Version-1 field layout, verbatim, hashed the way the previous binary did.
+    const V1 = struct {
+        enabled: bool,
+        directory_url: []const u8,
+        domain: ?[]const u8,
+        contact: ?[]const u8,
+        renew_before_days: u16,
+        check_interval_ms: u64,
+        ca_bundle_path: []const u8,
+        ca_bundle_max_bytes: u64,
+        challenge_port: u16,
+        max_steps: u32,
+        debug: bool,
+        max_response_bytes: u64,
+        error_body_preview_bytes: u64,
+        resolv_conf_max_bytes: u64,
+        dns_port: u16,
+        http01_listen_backlog: u32,
+        http01_accept_poll_ms: u32,
+        http01_conn_read_timeout_sec: u32,
+    };
+    const tls: config_format.Config.Tls = .{ .cert_path = "/c.pem", .key_path = "/k.pem" };
+    var acme: config_format.Config.Acme = .{ .enabled = true, .domain = "irc.example.test", .contact = "mailto:a@b" };
+    var v1: V1 = undefined;
+    inline for (@typeInfo(V1).@"struct".field_names) |name| @field(v1, name) = @field(acme, name);
+    var legacy = std.crypto.hash.sha2.Sha256.init(.{});
+    legacy.update("onyx/companion/acme/config/1");
+    try runtime_pause.hashConfigValue(&legacy, v1);
+    try runtime_pause.hashOptional(&legacy, tls.cert_path);
+    try runtime_pause.hashOptional(&legacy, tls.key_path);
+    const base = try configDigest(acme, &tls);
+    try std.testing.expectEqualSlices(u8, &legacy.finalResult(), &base);
+
+    acme.challenge = .dns_01;
+    const with_challenge = try configDigest(acme, &tls);
+    try std.testing.expect(!std.mem.eql(u8, &base, &with_challenge));
+    acme.dns_hook = "/usr/local/bin/hook";
+    try std.testing.expect(!std.mem.eql(u8, &with_challenge, &try configDigest(acme, &tls)));
+    acme = .{ .enabled = true, .domain = "irc.example.test", .contact = "mailto:a@b", .account_key_path = "/k/acct.pem" };
+    try std.testing.expect(!std.mem.eql(u8, &base, &try configDigest(acme, &tls)));
+}
+
+test "acme validateConfig requires an absolute dns_hook for dns-01" {
+    var acme: config_format.Config.Acme = .{ .enabled = true, .challenge = .dns_01 };
+    try std.testing.expectError(error.InvalidConfig, validateConfig(acme));
+    acme.dns_hook = "relative/hook";
+    try std.testing.expectError(error.InvalidConfig, validateConfig(acme));
+    acme.dns_hook = "/usr/local/bin/hook";
+    try validateConfig(acme);
+    acme.account_key_path = "";
+    try std.testing.expectError(error.InvalidConfig, validateConfig(acme));
+    try validateConfig(.{ .enabled = true, .challenge = .tls_alpn_01 });
 }
 
 test "companion runtime acme retained worker carries deadline and actual skipped outcome" {
