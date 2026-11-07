@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -51,6 +52,8 @@ printf 'fixture:%s:%s' "$target" "$cpu" > "$prefix/bin/onyx-server"
         self.env['PATH'] = str(self.root / 'bin') + os.pathsep + os.defpath
         self.env.pop('COSIGN_KEY', None)
         self.env.pop('COSIGN_EXPERIMENTAL', None)
+        for gate in ('ONYX_RELEASE_CT_CHECK', 'ONYX_RELEASE_INTEROP', 'ONYX_RELEASE_BOGO'):
+            self.env.pop(gate, None)
         self.env['TMPDIR'] = str(self.root)
 
     def stub(self, name, content):
@@ -125,6 +128,37 @@ printf 'fixture:%s:%s' "$target" "$cpu" > "$prefix/bin/onyx-server"
         self.env['TEST_DIRTY'] = ' M tracked'
         self.assertNotEqual(self.invoke('release.sh', self.root / 'dirty').returncode, 0)
         self.assertNotEqual(self.invoke('verify-release.sh', out / 'SHA256SUMS').returncode, 0)
+
+    def ct_check_stub(self, rc):
+        # Record every ct-check invocation; exit with `rc` for it.
+        stub = (self.root / 'bin' / 'zig').read_text().replace(
+            '[ "$1" = build ] || exit 1\n',
+            '[ "$1" = build ] || exit 1\n'
+            'if [ "$2" = ct-check ]; then echo ct-check >> "$TMPDIR/ct-check.calls"; exit %d; fi\n' % rc)
+        self.stub('zig', stub)
+
+    def test_ct_check_gate_is_opt_in(self):
+        self.ct_check_stub(0)
+        self.release('x86_64-linux-musl')
+        self.assertFalse((self.root / 'ct-check.calls').exists())
+
+    def test_ct_check_gate_runs_and_fails_closed(self):
+        self.env['ONYX_RELEASE_CT_CHECK'] = '1'
+        self.ct_check_stub(0)
+        self.release('x86_64-linux-musl')
+        self.assertEqual((self.root / 'ct-check.calls').read_text(), 'ct-check\n')
+        self.ct_check_stub(1)
+        failed = self.invoke('release.sh', self.root / 'ct-fail', 'x86_64-linux-musl')
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b'ct-check gate failed', failed.stderr)
+        self.assertFalse((self.root / 'ct-fail' / 'SHA256SUMS').exists())
+
+    def test_interop_gate_refuses_foreign_target(self):
+        self.env['ONYX_RELEASE_INTEROP'] = '1'
+        foreign = 'aarch64-linux-musl' if platform.machine() != 'aarch64' else 'x86_64-linux-musl'
+        failed = self.invoke('release.sh', self.root / 'interop-foreign', foreign)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b'cannot run', failed.stderr)
 
 if __name__ == '__main__':
     unittest.main()

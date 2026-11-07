@@ -175,7 +175,7 @@ unchanged successful evidence; diagnose unchanged failures before scheduling rer
 | `zig build test-serial --summary all` | Full reference graph with serial execution within each root. |
 | `zig build fuzz --summary all` | Bounded replay of coverage-fuzz seed corpora. |
 | `zig build bogo-shim-test --summary all` | Self-driven BoGo shim parse/framing/subprocess smokes. |
-| `tools/bogo.sh` | Pinned external BoringSSL runner: exact 24-pass/3-explicit-skip baseline; fails on drift, any unexpected failure, or an all-skip/vacuous result. Uses `.bogo/` or `BOGO_CACHE_DIR`, never `/tmp`. |
+| `tools/bogo.sh` | Pinned external BoringSSL runner: exact 121-pass/3-explicit-skip baseline; fails on drift, any unexpected failure, or an all-skip/vacuous result. Uses `.bogo/` or `BOGO_CACHE_DIR`, never `/tmp`. See [TCP TLS interop](#tcp-tls-interop). |
 | `zig build all-checks --summary all` | Deterministic pre-push gate: `check`, WASM build, full tests, bounded fuzz, and BoGo shim self-tests. |
 | `zig build all-checks-verbose --summary all` | Same gate, with per-test progress for the full suite. |
 
@@ -199,6 +199,134 @@ These helpers run a real daemon binary, not only `test` blocks:
 
 Run them after `zig build` or against a staged release binary when validating an
 operator-facing change.
+
+## TCP TLS interop
+
+These lanes test Armor's TCP TLS stack against independent implementations.
+They need external tools, so they stay out of `zig build test`.
+`packaging/release.sh` can run them as opt-in gates (see below).
+
+| Command | Peer | What must hold |
+|---|---|---|
+| `tools/bogo.sh` | BoringSSL `ssl/test/runner`, pinned commit | Exact pass/skip baseline in `tools/bogo/expected-baseline.txt` (121 pass, 3 skip). |
+| `tools/bogo.sh -test '*'` | same | Exploratory full run, for triage. It fails while known Armor defects remain (listed below). |
+| `tools/openssl_interop.sh [onyx-server]` | system `openssl` 3.x, `s_client` and `s_server` | All 35 cases pass. |
+| `python3 tools/browser_tls_smoke.py [onyx-server]` | headless Chromium over `wss://` | The IRC session registers, and the NetLog shows TLS 1.3 with group `X25519MLKEM768` (4588). |
+
+**BoGo.** The shim (`tools/bogo_shim.zig`) drives the daemon's `TlsConn`, the
+1.3 server plus the hardened 1.2 server, through these runner flags:
+`-resume-count`, `-expect-session-miss`, `-ocsp-response` and `-async`. Server
+resumption therefore runs for real: every connection in one invocation shares
+a ticket key. Any other flag exits 89, which the runner reports as skipped.
+
+`DisabledTests` in `tools/bogo/config.json` lists only two kinds of case:
+
+- the deliberate modern-only posture: no TLS 1.0 or 1.1, no static RSA, no CBC,
+  no SHA-1, no P-384 or P-521 signing, no ML-DSA, EMS required in TLS 1.2, and
+  no session-ID cache;
+- behavior that the RFCs leave optional, where BoringSSL happens to be strict.
+
+Genuine defects stay enabled. They are simply absent from the baseline.
+
+Go is not vendored. Any Go toolchain new enough for the pinned runner works, for
+example one unpacked into a scratch directory. `BOGO_CACHE_DIR` moves the
+BoringSSL checkout.
+
+**OpenSSL.** The script boots a private daemon with a temporary config, a
+temporary CA, an ECDSA P-256 leaf and then an RSA-2048 leaf, all on loopback
+ports. It then runs `s_client` for these cases:
+
+- each TLS 1.3 cipher suite;
+- each group: x25519, secp256r1 and X25519MLKEM768, skipped if the local
+  OpenSSL lacks one;
+- a HelloRetryRequest from secp384r1 to x25519, confirmed in the `-msg` trace;
+- six TLS 1.2 ECDHE suites;
+- TLS 1.3 and TLS 1.2 resumption with `-sess_out` and `-sess_in`;
+- ALPN `irc`;
+- an ALPN mismatch;
+- `-status`.
+
+Every handshake verifies the chain and carries `NICK`/`USER` through to `001`.
+
+For the client direction, the script builds `tools/openssl_interop_client.zig`.
+This is the daemon's real `http_fetch` outbound path: the TLS 1.3 client, with
+the 1.2 fallback. It fetches from `openssl s_server -www` pinned to each suite,
+group and version. The response page names the parameters that OpenSSL
+negotiated.
+
+Two server behaviors show up in the output:
+
+- On an ALPN mismatch the daemon continues without selecting a protocol. RFC
+  7301 §3.2 says a server SHALL send a `no_application_protocol` alert, so this
+  leniency is recorded as observed behavior.
+- With no OCSP responder configured, the daemon does not staple a response.
+
+`INTEROP_KEEP=1` keeps the logs.
+
+**Browser.** Chromium has no Ed25519 certificate support. The smoke therefore
+issues an ECDSA leaf from a throwaway CA. It trusts that leaf only through
+`--ignore-certificate-errors-spki-list`, and restricts host resolution to
+loopback. A NetLog `SSL_CONNECT` result counts only when its socket connected
+to the daemon's `wss` port. Exit 77 means chromium or openssl is missing.
+
+**Constant time.** `zig build ct-check` is the dudect harness. It reports a
+Welch |t| per primitive and gates at 10.
+
+**Release gates** in `packaging/release.sh` are all off by default. Each one
+fails closed when requested:
+
+- `ONYX_RELEASE_CT_CHECK=1` runs `zig build ct-check`.
+- `ONYX_RELEASE_INTEROP=1` runs the OpenSSL and browser lanes against the
+  freshly built artifact. The host must be able to execute the target.
+- `ONYX_RELEASE_BOGO=1` runs `tools/bogo.sh`.
+
+**BoGo triage (pinned runner, 2026-11-07).** The full run gives 121 passed,
+2891 skipped and 80 failed. The failures fall into these classes:
+
+- **TLS 1.3 CertificateVerify ignores the client's `signature_algorithms`.**
+  The server always signs with its key's single scheme (RFC 8446 §4.2.3,
+  §4.4.3). Seen in `Server-SignDefault-*`, `ServerAuth-*` and `RSA-PSS-Large`.
+- **TLS 1.2 ServerKeyExchange ignores `signature_algorithms`.** It always uses
+  `*_sha256` (RFC 5246 §7.4.1.4.1).
+- **Version negotiation is wrong in three ways:**
+  - The 1.3 path requires `legacy_version == 0x0303`, which violates RFC 8446
+    §4.2.1.
+  - The 1.2 path rejects a higher `legacy_version` that comes without
+    `supported_versions` (RFC 5246 Appendix E.1).
+  - A `supported_versions` of `[1.2]` alongside `legacy_version` 1.1 is
+    rejected.
+- **TLS 1.2 rejects a client Finished that spans several records** (RFC 5246
+  §6.2.1). Seen in `*-SplitHandshakeRecords`.
+- **TLS 1.2 echoes the client's session_id on a full handshake.** After a
+  rejected ticket, the client takes this as resumption and aborts (RFC 5246
+  §7.4.1.3, RFC 5077 §3.4). Seen in `CorruptTicket-TLS-TLS12` and
+  `Resume-Server-UnofferedCipher`.
+- **TLS 1.3 PSK failures fall back to a full handshake instead of aborting.**
+  An invalid, missing or wrong-length binder, a binder count mismatch, or PSK
+  without `psk_key_exchange_modes` should abort (RFC 8446 §4.2.11, §4.2.9).
+  Separately, a ClientHello that offers more than one PSK identity is never
+  resumed.
+- **ClientHello parsing is too loose.** The parser accepts all of these:
+  - trailing bytes after the extensions (1.3 path);
+  - a compression list longer than one byte (1.3 path, RFC 8446 §4.1.2);
+  - duplicate extensions (1.2 path);
+  - an empty ALPN protocol name (RFC 7301 §3.1);
+  - trailing data in SNI (RFC 6066 §3);
+  - trailing data in key_share;
+  - `ec_point_formats` without the uncompressed format (RFC 8422 §5.1.2).
+
+  Separately, TLS 1.2 rejects a valid compression list that contains null
+  among other methods.
+- **A missing key_share sends a HelloRetryRequest instead of
+  `missing_extension`** (RFC 8446 §9.2).
+- **Alert codes are wrong in several places:**
+  - out-of-order messages get `decode_error` instead of `unexpected_message`;
+  - a bad compression list or a misplaced `pre_shared_key` gets `decode_error`
+    instead of `illegal_parameter`;
+  - a missing `supported_groups` gets `handshake_failure` instead of
+    `missing_extension`.
+- **API gap: the engines do not expose a received alert's description.** As a
+  result, the shim cannot fail `Alert`, `DoubleAlert` or `FragmentAlert`.
 
 ## Roadmap-change default
 

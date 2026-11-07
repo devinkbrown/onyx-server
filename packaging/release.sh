@@ -81,6 +81,36 @@ mkdir -p "$OUT"
 cp "$CACHE/out/bin/onyx-server" "$OUT/$ARTIFACT"
 chmod 755 "$OUT/$ARTIFACT"
 
+# --- Opt-in release gates ------------------------------------------------------
+# Off by default so a plain release build keeps its current inputs and runtime.
+# Each gate, when requested, must PASS or the release aborts (fail closed: a gate
+# that cannot run — missing tool, wrong host arch — is a failure, not a skip).
+#   ONYX_RELEASE_CT_CHECK=1  dudect constant-time harness (`zig build ct-check`,
+#                            Welch |t| < 10 per primitive; CT_ITERS/CT_RSA_ITERS)
+#   ONYX_RELEASE_INTEROP=1   tools/openssl_interop.sh + tools/browser_tls_smoke.py
+#                            against THIS artifact (needs openssl, chromium, and a
+#                            host that can execute $TARGET)
+#   ONYX_RELEASE_BOGO=1      tools/bogo.sh exact BoGo baseline (needs go + network)
+if [ "${ONYX_RELEASE_CT_CHECK:-0}" = "1" ]; then
+  echo "release: gate ct-check (dudect constant-time harness)…"
+  "$ZIG_BIN" build ct-check --cache-dir "$CACHE" || { echo "release: FATAL — ct-check gate failed" >&2; exit 1; }
+fi
+if [ "${ONYX_RELEASE_INTEROP:-0}" = "1" ]; then
+  if [ "$(uname -m)" != "$ARCH" ]; then
+    echo "release: FATAL — interop gate requested but this host cannot run $TARGET" >&2
+    exit 1
+  fi
+  echo "release: gate OpenSSL interop…"
+  tools/openssl_interop.sh "$OUT/$ARTIFACT" || { echo "release: FATAL — OpenSSL interop gate failed" >&2; exit 1; }
+  echo "release: gate headless-Chromium wss/TLS smoke…"
+  # Exit 77 (SKIP: no chromium/openssl) is a failure when the gate was requested.
+  python3 tools/browser_tls_smoke.py "$OUT/$ARTIFACT" || { echo "release: FATAL — browser TLS gate failed" >&2; exit 1; }
+fi
+if [ "${ONYX_RELEASE_BOGO:-0}" = "1" ]; then
+  echo "release: gate BoGo baseline…"
+  tools/bogo.sh || { echo "release: FATAL — BoGo gate failed" >&2; exit 1; }
+fi
+
 SIZE="$(stat -c%s "$OUT/$ARTIFACT")"
 DIGEST="$(sha256sum "$OUT/$ARTIFACT" | cut -d' ' -f1)"
 
