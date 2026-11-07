@@ -1590,9 +1590,15 @@ pub const TlsConn = struct {
             pos += wire;
             self.version_detection_scanned = pos;
             const message_len = self.version_detection.completeLen() orelse continue;
-            if (message_len != self.version_detection.bytes.items.len) return error.BadHandshake;
+            // RFC 8446 §5.1 / RFC 5246 §7.4: the first flight is exactly one
+            // ClientHello. Trailing handshake bytes coalesced after it, or any
+            // other first handshake type, are an out-of-order message, i.e.
+            // unexpected_message (RFC 8446 §6.2), not a decode failure. This
+            // matches the engines' own first-flight checks
+            // (tls12_server: client_hello_reassembly).
+            if (message_len != self.version_detection.bytes.items.len) return error.UnexpectedMessage;
             const message = self.version_detection.bytes.items;
-            if (message[0] != 1) return error.BadHandshake; // must be client_hello
+            if (message[0] != 1) return error.UnexpectedMessage; // must be client_hello
             const detected = classifyClientHello(message[4..message_len]);
             self.version_detection.deinit(self.allocator);
             self.version_detection = .{};
@@ -3474,6 +3480,29 @@ test "version-dispatch: dual TlsConn applies the shared total handshake bound" {
     const record = try tls12.writePlainRecord(alloc, .handshake, &oversized);
     defer alloc.free(record);
     try std.testing.expectError(error.BadHandshake, conn.onInbound(record));
+}
+
+test "version-dispatch: out-of-order first flight is unexpected_message, not decode_error" {
+    // RFC 8446 §6.2 / RFC 5246 §7.2.2: a non-ClientHello first message, or a
+    // ClientHello coalesced with a following handshake message in the same
+    // flight before any ServerHello, is an unexpected message (alert 10).
+    // BoGo: WrongMessageType-*ClientHello-TLS, PartialClientKeyExchangeWithClientHello.
+    const alloc = std.testing.allocator;
+    const minimal_hello = [_]u8{ 1, 0, 0, 0 };
+    const cke_first = [_]u8{ 16, 0, 0, 0 };
+    const hello_then_partial = minimal_hello ++ [_]u8{ 16, 0, 0 };
+    for ([_][]const u8{ &cke_first, &hello_then_partial }) |flight| {
+        var conn = TlsConn.initDual(alloc, .{ .cert_chain = &.{} }, .{ .cert_chain = &.{}, .ecdsa_p256_signing_key = null });
+        defer conn.deinit();
+        const record = try tls12.writePlainRecord(alloc, .handshake, flight);
+        defer alloc.free(record);
+        try std.testing.expectError(error.UnexpectedMessage, conn.onInbound(record));
+        const alert = conn.takeAlert(error.UnexpectedMessage) orelse return error.TestUnexpectedResult;
+        defer alloc.free(alert);
+        // Plaintext alert record: type 21, fatal(2), unexpected_message(10).
+        try std.testing.expectEqual(@as(u8, 21), alert[0]);
+        try std.testing.expectEqualSlices(u8, &.{ 2, 10 }, alert[alert.len - 2 ..]);
+    }
 }
 
 test "version-dispatch: dual TlsConn rejects oversized plaintext record payload" {

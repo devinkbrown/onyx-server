@@ -96,8 +96,11 @@ PASS OCSPStapling-Server-TLS13-TLS-Sync-SplitHandshakeRecords
 PASS PackedEncryptedHandshake-TLS13
 PASS PartialClientFinishedWithClientHello
 PASS PartialClientFinishedWithClientHello-NoCCS
+PASS PartialClientFinishedWithClientHello-TLS12-Resume
 PASS PartialClientFinishedWithSecondClientHello
 PASS PartialClientFinishedWithSecondClientHello-NoCCS
+PASS PartialClientKeyExchangeWithClientHello
+PASS PartialSecondClientHelloAfterFirst
 PASS PointFormat-Server-Missing
 PASS PointFormat-Server-MissingUncompressed
 PASS PointFormat-Server-Tolerance
@@ -212,5 +215,7 @@ PASS VersionNegotiationExtension-TLS13-TLS
 PASS VersionTolerance-TLS13
 PASS VersionTooLow
 PASS WrongMessageType-ClientFinished-TLS
+PASS WrongMessageType-ClientHello-TLS
 PASS WrongMessageType-ClientKeyExchange-TLS
 PASS WrongMessageType-TLS13-ClientFinished-TLS
+PASS WrongMessageType-TLS13-ClientHello-TLS
