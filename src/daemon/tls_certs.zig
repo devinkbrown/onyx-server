@@ -7,15 +7,21 @@
 //! handshake needs, from one of two sources:
 //!   * **On-disk material** — when both `cert_path` and `key_path` are supplied,
 //!     the files are read and decoded. Each accepts either PEM (a
-//!     `-----BEGIN CERTIFICATE-----`, `-----BEGIN PRIVATE KEY-----`, or
-//!     `-----BEGIN RSA PRIVATE KEY-----` block) or raw DER, detected by sniffing
-//!     for the PEM armor. Private keys may be Ed25519 PKCS#8 or RSA PKCS#1/PKCS#8.
+//!     `-----BEGIN CERTIFICATE-----`, `-----BEGIN PRIVATE KEY-----`,
+//!     `-----BEGIN RSA PRIVATE KEY-----`, or `-----BEGIN EC PRIVATE KEY-----`
+//!     block) or raw DER, detected by sniffing for the PEM armor. Private keys
+//!     may be Ed25519 PKCS#8, ECDSA-P256 (SEC1 or PKCS#8), or RSA
+//!     PKCS#1/PKCS#8.
 //!   * **Self-signed bootstrap** — when no paths are given and TLS is enabled,
 //!     a fresh Ed25519 keypair is generated (seeded from the OS CSPRNG) and a
-//!     short-lived self-signed leaf is minted with `dns_name` as its subject.
+//!     self-signed leaf is minted with `dns_name` as its subject. It is
+//!     backdated one hour and valid for 365 days (`bootstrap_lifetime_s`). The
+//!     WebTransport bootstrap (`loadOrBootstrapWebTransport`) instead mints an
+//!     ECDSA-P256 leaf valid for 7 days (`webtransport_bootstrap_lifetime_s`).
 //!
-//! The returned `Loaded` shape mirrors `crypto/tls_server.Config`
-//! (`cert_chain` + an Ed25519 `signing_key`); the live listener is wired by
+//! The returned `Loaded` shape mirrors `crypto/tls_server.Config`: `cert_chain`
+//! plus exactly one of the Ed25519 `signing_key`, `ecdsa_p256_signing_key` or
+//! `rsa_signing_key`, tagged by `key_kind`. The live listener is wired by
 //! `main.zig`, which owns the handshake. The cert chain bytes are caller-owned —
 //! call `Loaded.deinit` to release them.
 const std = @import("std");
