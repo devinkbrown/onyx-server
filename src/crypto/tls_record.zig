@@ -48,18 +48,21 @@ const record_aead = struct {
     pub const AeadAlg = enum {
         chacha20_poly1305,
         aes256_gcm,
+        /// TLS_AES_128_GCM_SHA256, the default TLS 1.3 suite (16-byte key).
+        aes128_gcm,
 
-        fn Impl(comptime alg: AeadAlg) type {
+        fn Impl(comptime alg: @This()) type {
             return switch (alg) {
                 .chacha20_poly1305 => std.crypto.aead.chacha_poly.ChaCha20Poly1305,
                 .aes256_gcm => std.crypto.aead.aes_gcm.Aes256Gcm,
+                .aes128_gcm => std.crypto.aead.aes_gcm.Aes128Gcm,
             };
         }
     };
 
     pub const Nonce96 = [12]u8;
 
-    pub fn Aead(comptime alg: AeadAlg) type {
+    pub fn Aead(comptime alg: record_aead.AeadAlg) type {
         const Impl = alg.Impl();
         return struct {
             const Self = @This();
@@ -111,6 +114,11 @@ const record_aead = struct {
 
 pub const ContentType = tls.ContentType;
 pub const Nonce96 = aead.Nonce96;
+/// The record AEAD surface: `Aead(alg)` with `init`/`deinit`/`seal`/`open`.
+/// Production TLS 1.3 (`tls_server.zig`) seals and opens every protected
+/// record through `sealRecord` / `openRecord` with these types.
+pub const AeadAlg = aead.AeadAlg;
+pub const Aead = aead.Aead;
 
 pub const record_header_len = tls.record_header_len;
 pub const max_plaintext_len = tls.max_plaintext_len;
@@ -318,8 +326,23 @@ pub fn sealRecord(
     inner_scratch: []u8,
     record_out: []u8,
 ) Error![]u8 {
-    const A = aead.Aead(alg);
     const inner = try encodeInnerPlaintext(content_type, plaintext, padding_len, inner_scratch);
+    return sealEncodedRecord(alg, cipher, write_iv, seq, inner, record_out);
+}
+
+/// Seal an already-encoded TLSInnerPlaintext (`encodeInnerPlaintext` output)
+/// into one TLSCiphertext in `record_out`: header/AAD, per-record nonce, AEAD,
+/// trailing tag. `sealRecord` and production `tls_server.zig` both reach the
+/// cipher only through here.
+pub fn sealEncodedRecord(
+    comptime alg: aead.AeadAlg,
+    cipher: *const aead.Aead(alg),
+    write_iv: Nonce96,
+    seq: u64,
+    inner: []const u8,
+    record_out: []u8,
+) Error![]u8 {
+    const A = aead.Aead(alg);
     const encrypted_len = inner.len + A.tag_length;
     if (encrypted_len > max_ciphertext_len) return error.RecordOverflow;
     if (record_out.len < record_header_len + encrypted_len) return error.OutputTooSmall;
@@ -343,8 +366,22 @@ pub fn openRecord(
     record: []const u8,
     plaintext_out: []u8,
 ) Error!OpenedPlaintext {
+    return openParsedRecord(alg, cipher, write_iv, seq, try parseCiphertext(record), plaintext_out);
+}
+
+/// Open one record already accepted by `parseCiphertext`: AEAD-verify under
+/// the per-record nonce and header AAD, then strip TLSInnerPlaintext padding.
+/// `openRecord` and production `tls_server.zig` both reach the cipher only
+/// through here. A record shorter than the tag is `error.BadRecordHeader`.
+pub fn openParsedRecord(
+    comptime alg: aead.AeadAlg,
+    cipher: *const aead.Aead(alg),
+    write_iv: Nonce96,
+    seq: u64,
+    parsed: TLSCiphertext,
+    plaintext_out: []u8,
+) Error!OpenedPlaintext {
     const A = aead.Aead(alg);
-    const parsed = try parseCiphertext(record);
     if (parsed.encrypted_record.len < A.tag_length) return error.BadRecordHeader;
     const ciphertext_len = parsed.encrypted_record.len - A.tag_length;
     if (plaintext_out.len < ciphertext_len) return error.OutputTooSmall;
@@ -480,6 +517,125 @@ test "padding strip returns content before type byte" {
     try testing.expectEqual(ContentType.handshake, opened.content_type);
     try testing.expectEqualSlices(u8, "ping", opened.content);
     try testing.expectEqual(@as(usize, 4), opened.padding_len);
+}
+
+/// RFC 8448 section 3 ("Simple 1-RTT Handshake") protected records, all
+/// TLS_AES_128_GCM_SHA256. Shared with `tls_server.zig`'s production-path KAT.
+pub const Rfc8448Record = struct {
+    key: [16]u8,
+    iv: Nonce96,
+    seq: u64,
+    content_type: ContentType,
+    payload: []const u8,
+    record: []const u8,
+};
+
+const rfc8448_app_payload = hex("000102030405060708090a0b0c0d0e0f" ++
+    "101112131415161718191a1b1c1d1e1f" ++
+    "202122232425262728292a2b2c2d2e2f3031");
+
+pub const rfc8448_records = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk [_]Rfc8448Record{
+        // {client} send handshake record (Finished) under client handshake keys.
+        .{
+            .key = hex("dbfaa693d1762c5b666af5d950258d01"),
+            .iv = hex("5bd3c71b836e0b76bb73265f"),
+            .seq = 0,
+            .content_type = .handshake,
+            .payload = &hex("14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"),
+            .record = &hex("1703030035" ++
+                "75ec4dc238cce60b298044a71e219c56cc77b0517fe9b93c7a4bfc44d87f38f8" ++
+                "0338ac98fc46deb384bd1caeacab6867d726c40546"),
+        },
+        // {client} send application_data record (first client app record).
+        .{
+            .key = hex("17422dda596ed5d9acd890e3c63f5051"),
+            .iv = hex("5b78923dee08579033e523d9"),
+            .seq = 0,
+            .content_type = .application_data,
+            .payload = &rfc8448_app_payload,
+            .record = &hex("1703030043" ++
+                "a23f7054b62c94d0affafe8228ba55cbefacea42f914aa66bcab3f2b9819a8a5" ++
+                "b46b395bd54a9a20441e2b62974e1f5a6292a2977014bd1e3deae63aeebb2169" ++
+                "4915e4"),
+        },
+        // {server} send application_data record (after NewSessionTicket, seq 1).
+        .{
+            .key = hex("9f02283b6c9c07efc26bb9f2ac92e356"),
+            .iv = hex("cf782b88dd83549aadf1e984"),
+            .seq = 1,
+            .content_type = .application_data,
+            .payload = &rfc8448_app_payload,
+            .record = &hex("1703030043" ++
+                "2e937e11ef4ac740e538ad36005fc4a46932fc3225d05f82aa1b36e30efaf97d" ++
+                "90e6dffc602dcb501a59a8fcc49c4bf2e5f0a21c0047c2abf332540dd032e167" ++
+                "c2955d"),
+        },
+        // {client} send alert record (close_notify), seq 1.
+        .{
+            .key = hex("17422dda596ed5d9acd890e3c63f5051"),
+            .iv = hex("5b78923dee08579033e523d9"),
+            .seq = 1,
+            .content_type = .alert,
+            .payload = &hex("0100"),
+            .record = &hex("1703030013c9872760655666b74d7ff1153efd6db6d0b0e3"),
+        },
+        // {server} send alert record (close_notify), seq 2.
+        .{
+            .key = hex("9f02283b6c9c07efc26bb9f2ac92e356"),
+            .iv = hex("cf782b88dd83549aadf1e984"),
+            .seq = 2,
+            .content_type = .alert,
+            .payload = &hex("0100"),
+            .record = &hex("1703030013b58fd67166ebf599d24720cfbe7efa7a8864a9"),
+        },
+    };
+};
+
+test "RFC 8448 AES-128-GCM records: sealRecord is byte-exact and openRecord recovers the payload" {
+    const A = Aead(.aes128_gcm);
+    for (rfc8448_records) |v| {
+        var cipher = A.init(v.key);
+        defer cipher.deinit();
+        var inner: [64]u8 = undefined;
+        var out: [128]u8 = undefined;
+        const record = try sealRecord(.aes128_gcm, &cipher, v.iv, v.seq, v.content_type, v.payload, 0, &inner, &out);
+        try std.testing.expectEqualSlices(u8, v.record, record);
+
+        var opened_buf: [64]u8 = undefined;
+        const opened = try openRecord(.aes128_gcm, &cipher, v.iv, v.seq, v.record, &opened_buf);
+        try std.testing.expectEqual(v.content_type, opened.content_type);
+        try std.testing.expectEqualSlices(u8, v.payload, opened.content);
+        try std.testing.expectEqual(@as(usize, 0), opened.padding_len);
+
+        // Fail closed: the wrong sequence and a flipped tag bit never open.
+        try std.testing.expectError(error.AuthFailed, openRecord(.aes128_gcm, &cipher, v.iv, v.seq + 1, v.record, &opened_buf));
+        var tampered: [128]u8 = undefined;
+        @memcpy(tampered[0..v.record.len], v.record);
+        tampered[v.record.len - 1] ^= 0x01;
+        try std.testing.expectError(error.AuthFailed, openRecord(.aes128_gcm, &cipher, v.iv, v.seq, tampered[0..v.record.len], &opened_buf));
+    }
+}
+
+test "every record AEAD round-trips with padding and rejects a short record before open" {
+    inline for (.{ AeadAlg.aes128_gcm, AeadAlg.aes256_gcm, AeadAlg.chacha20_poly1305 }) |alg| {
+        const A = Aead(alg);
+        var cipher = A.init(@as(A.Key, @splat(0x5c)));
+        defer cipher.deinit();
+        const iv = hex("a0a1a2a3a4a5a6a7a8a9aaab");
+        var inner: [64]u8 = undefined;
+        var out: [96]u8 = undefined;
+        const record = try sealRecord(alg, &cipher, iv, 3, .handshake, "suite", 7, &inner, &out);
+        try std.testing.expectEqual(@as(usize, record_header_len + 5 + 1 + 7 + A.tag_length), record.len);
+        var opened_buf: [64]u8 = undefined;
+        const opened = try openRecord(alg, &cipher, iv, 3, record, &opened_buf);
+        try std.testing.expectEqualSlices(u8, "suite", opened.content);
+        try std.testing.expectEqual(@as(usize, 7), opened.padding_len);
+
+        const short = makeAdditionalData(A.tag_length - 1) ++ @as([A.tag_length - 1]u8, @splat(0));
+        try std.testing.expectError(error.BadRecordHeader, openRecord(alg, &cipher, iv, 3, &short, &opened_buf));
+    }
 }
 
 // ---------------------------------------------------------------------------

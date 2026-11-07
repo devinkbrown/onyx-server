@@ -3762,6 +3762,18 @@ fn sealRecordBatchAlloc(allocator: Allocator, suite: CipherSuite, keys: *const T
     return .{ .bytes = out, .next_seq = layout.next_seq };
 }
 
+/// The `tls_record` AEAD backing each TLS 1.3 suite. Every protected record
+/// this server seals or opens goes through `tls_record.sealEncodedRecord` /
+/// `tls_record.openParsedRecord` with this algorithm — the same code the
+/// record-layer exploit corpus and RFC 8448 known-answer tests drive.
+fn recordAeadAlg(comptime suite: CipherSuite) tls_record.AeadAlg {
+    return switch (suite) {
+        .tls_aes_128_gcm_sha256 => .aes128_gcm,
+        .tls_aes_256_gcm_sha384 => .aes256_gcm,
+        .tls_chacha20_poly1305_sha256 => .chacha20_poly1305,
+    };
+}
+
 fn sealRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const TrafficKeys, seq: u64, typ: tls_record.ContentType, plaintext: []const u8) Error![]u8 {
     const inner = try allocator.alloc(u8, plaintext.len + 1);
     defer {
@@ -3770,32 +3782,16 @@ fn sealRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const Traffi
     }
     const encoded = try tls_record.encodeInnerPlaintext(typ, plaintext, 0, inner);
     const encrypted_len = encoded.len + suite.tagLen();
-    var out = try allocator.alloc(u8, tls_record.record_header_len + encrypted_len);
+    const out = try allocator.alloc(u8, tls_record.record_header_len + encrypted_len);
     errdefer allocator.free(out);
-    const aad = tls_record.makeAdditionalData(@intCast(encrypted_len));
-    @memcpy(out[0..tls_record.record_header_len], &aad);
-    const nonce = tls_record.deriveNonce(keys.iv, seq);
     switch (suite) {
-        .tls_aes_128_gcm_sha256 => {
-            var key = keys.key[0..Aes128Gcm.key_length].*;
-            defer secureZero(&key);
-            var tag: [Aes128Gcm.tag_length]u8 = undefined;
-            Aes128Gcm.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
-            @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
-        },
-        .tls_aes_256_gcm_sha384 => {
-            var key = keys.key[0..Aes256Gcm.key_length].*;
-            defer secureZero(&key);
-            var tag: [Aes256Gcm.tag_length]u8 = undefined;
-            Aes256Gcm.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
-            @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
-        },
-        .tls_chacha20_poly1305_sha256 => {
-            var key = keys.key[0..ChaCha20Poly1305.key_length].*;
-            defer secureZero(&key);
-            var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
-            ChaCha20Poly1305.encrypt(out[5..][0..encoded.len], &tag, encoded, &aad, nonce, key);
-            @memcpy(out[5 + encoded.len ..][0..tag.len], &tag);
+        inline else => |s| {
+            const alg = comptime recordAeadAlg(s);
+            const A = tls_record.Aead(alg);
+            var cipher = A.init(keys.key[0..A.key_length].*);
+            defer cipher.deinit();
+            const sealed = try tls_record.sealEncodedRecord(alg, &cipher, keys.iv, seq, encoded, out);
+            std.debug.assert(sealed.len == out.len);
         },
     }
     return out;
@@ -3810,33 +3806,149 @@ fn openRecordAlloc(allocator: Allocator, suite: CipherSuite, keys: *const Traffi
         secureZero(inner);
         allocator.free(inner);
     }
-    const aad = parsed.headerBytes();
-    const nonce = tls_record.deriveNonce(keys.iv, seq);
-    switch (suite) {
-        .tls_aes_128_gcm_sha256 => {
-            var key = keys.key[0..Aes128Gcm.key_length].*;
-            defer secureZero(&key);
-            const tag = parsed.encrypted_record[clen..][0..Aes128Gcm.tag_length].*;
-            Aes128Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
+    const opened = switch (suite) {
+        inline else => |s| blk: {
+            const alg = comptime recordAeadAlg(s);
+            const A = tls_record.Aead(alg);
+            var cipher = A.init(keys.key[0..A.key_length].*);
+            defer cipher.deinit();
+            break :blk tls_record.openParsedRecord(alg, &cipher, keys.iv, seq, parsed, inner) catch |err| return switch (err) {
+                error.AuthFailed => error.RecordAuthenticationFailed,
+                else => err,
+            };
         },
-        .tls_aes_256_gcm_sha384 => {
-            var key = keys.key[0..Aes256Gcm.key_length].*;
-            defer secureZero(&key);
-            const tag = parsed.encrypted_record[clen..][0..Aes256Gcm.tag_length].*;
-            Aes256Gcm.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
-        },
-        .tls_chacha20_poly1305_sha256 => {
-            var key = keys.key[0..ChaCha20Poly1305.key_length].*;
-            defer secureZero(&key);
-            const tag = parsed.encrypted_record[clen..][0..ChaCha20Poly1305.tag_length].*;
-            ChaCha20Poly1305.decrypt(inner, parsed.encrypted_record[0..clen], tag, &aad, nonce, key) catch return error.RecordAuthenticationFailed;
-        },
-    }
-    const opened = try tls_record.decodeInnerPlaintext(inner);
+    };
     const content = try allocator.dupe(u8, opened.content);
     secureZero(inner);
     allocator.free(inner);
     return .{ .content_type = opened.content_type, .content = content, .inner_len = clen };
+}
+
+/// Independent reference for one protected TLS 1.3 record, written straight
+/// against std.crypto (RFC 8446 section 5.2/5.3) without any `tls_record`
+/// sealing code, so the production path is checked against a second encoding.
+fn referenceSealForTest(comptime Impl: type, key: [Impl.key_length]u8, iv: tls_record.Nonce96, seq: u64, typ: tls_record.ContentType, plaintext: []const u8, out: []u8) []u8 {
+    const inner_len = plaintext.len + 1;
+    const total = 5 + inner_len + Impl.tag_length;
+    out[0] = 23;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    std.mem.writeInt(u16, out[3..5], @intCast(inner_len + Impl.tag_length), .big);
+    var inner: [64]u8 = undefined;
+    @memcpy(inner[0..plaintext.len], plaintext);
+    inner[plaintext.len] = @backingInt(typ);
+    var nonce = iv;
+    var seq_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seq_be, seq, .big);
+    for (nonce[4..], seq_be) |*n, b| n.* ^= b;
+    var tag: [Impl.tag_length]u8 = undefined;
+    Impl.encrypt(out[5..][0..inner_len], &tag, inner[0..inner_len], out[0..5], nonce, key);
+    @memcpy(out[5 + inner_len ..][0..Impl.tag_length], &tag);
+    return out[0..total];
+}
+
+test "record path: tls_server seal equals tls_record.sealRecord and an independent encoding for all three suites" {
+    const alloc = std.testing.allocator;
+    const iv = hexToBytes("0f0e0d0c0b0a090807060504");
+    const plaintexts = [_][]const u8{ "", "x", "PRIVMSG #onyx :record layer parity" };
+    const types = [_]tls_record.ContentType{ .application_data, .handshake, .alert };
+    const seqs = [_]u64{ 0, 1, 0x0102030405060708, std.math.maxInt(u64) - 1 };
+    inline for (.{ CipherSuite.tls_aes_128_gcm_sha256, CipherSuite.tls_aes_256_gcm_sha384, CipherSuite.tls_chacha20_poly1305_sha256 }) |suite| {
+        const alg = comptime recordAeadAlg(suite);
+        const A = tls_record.Aead(alg);
+        const Impl = switch (suite) {
+            .tls_aes_128_gcm_sha256 => Aes128Gcm,
+            .tls_aes_256_gcm_sha384 => Aes256Gcm,
+            .tls_chacha20_poly1305_sha256 => ChaCha20Poly1305,
+        };
+        var keys: TrafficKeys = .{};
+        for (&keys.key, 0..) |*b, i| b.* = @intCast(0xA0 ^ i);
+        keys.iv = iv;
+        defer keys.wipe();
+        try std.testing.expectEqual(A.key_length, suite.keyLen());
+        try std.testing.expectEqual(A.tag_length, suite.tagLen());
+
+        var cipher = A.init(keys.key[0..A.key_length].*);
+        defer cipher.deinit();
+        for (plaintexts) |pt| for (types) |typ| for (seqs) |seq| {
+            const server_rec = try sealRecordAlloc(alloc, suite, &keys, seq, typ, pt);
+            defer alloc.free(server_rec);
+
+            var inner: [64]u8 = undefined;
+            var lib_buf: [128]u8 = undefined;
+            const lib_rec = try tls_record.sealRecord(alg, &cipher, keys.iv, seq, typ, pt, 0, &inner, &lib_buf);
+            try std.testing.expectEqualSlices(u8, lib_rec, server_rec);
+
+            var ref_buf: [128]u8 = undefined;
+            const ref_rec = referenceSealForTest(Impl, keys.key[0..Impl.key_length].*, keys.iv, seq, typ, pt, &ref_buf);
+            try std.testing.expectEqualSlices(u8, ref_rec, server_rec);
+
+            const opened = try openRecordAlloc(alloc, suite, &keys, seq, server_rec);
+            defer alloc.free(opened.content);
+            try std.testing.expectEqual(typ, opened.content_type);
+            try std.testing.expectEqualSlices(u8, pt, opened.content);
+            try std.testing.expectEqual(pt.len + 1, opened.inner_len);
+        };
+    }
+}
+
+test "record path: tls_server seal/open reproduce RFC 8448 AES-128-GCM records byte for byte" {
+    const alloc = std.testing.allocator;
+    for (tls_record.rfc8448_records) |v| {
+        var keys: TrafficKeys = .{};
+        defer keys.wipe();
+        @memcpy(keys.key[0..v.key.len], &v.key);
+        keys.iv = v.iv;
+        const sealed = try sealRecordAlloc(alloc, .tls_aes_128_gcm_sha256, &keys, v.seq, v.content_type, v.payload);
+        defer alloc.free(sealed);
+        try std.testing.expectEqualSlices(u8, v.record, sealed);
+        const opened = try openRecordAlloc(alloc, .tls_aes_128_gcm_sha256, &keys, v.seq, v.record);
+        defer alloc.free(opened.content);
+        try std.testing.expectEqual(v.content_type, opened.content_type);
+        try std.testing.expectEqualSlices(u8, v.payload, opened.content);
+    }
+
+    // End to end on live code: the RFC 8448 client application traffic secret
+    // through `deriveTrafficKeys`, then `sealRecordAlloc`, yields the RFC record.
+    var keys: TrafficKeys = .{};
+    defer keys.wipe();
+    const client_ap_secret = hexToBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5");
+    try deriveTrafficKeys(.tls_aes_128_gcm_sha256, &client_ap_secret, &keys);
+    const v = tls_record.rfc8448_records[1];
+    try std.testing.expectEqualSlices(u8, &v.key, keys.key[0..16]);
+    try std.testing.expectEqualSlices(u8, &v.iv, &keys.iv);
+    const sealed = try sealRecordAlloc(alloc, .tls_aes_128_gcm_sha256, &keys, v.seq, v.content_type, v.payload);
+    defer alloc.free(sealed);
+    try std.testing.expectEqualSlices(u8, v.record, sealed);
+}
+
+test "record path: tls_server open maps forgery, wrong seq and short records to RecordAuthenticationFailed" {
+    const alloc = std.testing.allocator;
+    inline for (.{ CipherSuite.tls_aes_128_gcm_sha256, CipherSuite.tls_aes_256_gcm_sha384, CipherSuite.tls_chacha20_poly1305_sha256 }) |suite| {
+        var keys: TrafficKeys = .{};
+        defer keys.wipe();
+        @memset(&keys.key, 0x33);
+        keys.iv = @splat(0x44);
+        const rec = try sealRecordAlloc(alloc, suite, &keys, 9, .application_data, "fail closed");
+        defer alloc.free(rec);
+
+        try std.testing.expectError(error.RecordAuthenticationFailed, openRecordAlloc(alloc, suite, &keys, 10, rec));
+        rec[rec.len - 1] ^= 0x80;
+        try std.testing.expectError(error.RecordAuthenticationFailed, openRecordAlloc(alloc, suite, &keys, 9, rec));
+        rec[rec.len - 1] ^= 0x80;
+        rec[tls_record.record_header_len] ^= 0x01;
+        try std.testing.expectError(error.RecordAuthenticationFailed, openRecordAlloc(alloc, suite, &keys, 9, rec));
+        rec[tls_record.record_header_len] ^= 0x01;
+
+        // Shorter than the tag: refused before any allocation or AEAD call.
+        var short: [5 + 15]u8 = @splat(0);
+        short[0..5].* = tls_record.makeAdditionalData(15);
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try std.testing.expectError(error.RecordAuthenticationFailed, openRecordAlloc(failing.allocator(), suite, &keys, 9, &short));
+
+        // change_cipher_spec is never a protected inner type: refused at seal.
+        try std.testing.expectError(error.InvalidContentType, sealRecordAlloc(alloc, suite, &keys, 9, .change_cipher_spec, &.{1}));
+    }
 }
 
 fn deriveTrafficKeys(suite: CipherSuite, secret_bytes: []const u8, out: *TrafficKeys) Error!void {
