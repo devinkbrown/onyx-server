@@ -237,7 +237,7 @@ fn k6HelloExtensions(record: []const u8) ![]const u8 {
     return body[i..];
 }
 
-test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane stays 24/3" {
+test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane matches its baseline" {
     const allocator = std.testing.allocator;
     const cert_compression = @import("../proto/cert_compression.zig");
     const supported_groups = @import("../proto/supported_groups.zig");
@@ -286,6 +286,11 @@ test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane stays
     defer client.deinit();
     const hello = try client.start();
     defer allocator.free(hello);
+    // RFC 8701: the default client now GREASEs (one reserved group, one
+    // 1-byte reserved key share); the real offer is unchanged.
+    try std.testing.expect(defaults.grease);
+    try std.testing.expect(client.grease != null);
+    const grease_group = client.grease.?.value(.group);
     const extensions = try k6HelloExtensions(hello);
     const groups = (try tls_extension.find(extensions, @backingInt(tls_extension.ExtensionType.supported_groups))) orelse return error.TestUnexpectedResult;
     const shares = (try tls_extension.find(extensions, @backingInt(tls_extension.ExtensionType.key_share))) orelse return error.TestUnexpectedResult;
@@ -297,17 +302,27 @@ test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane stays
     try std.testing.expect(!supported_groups.offers(groups, supported_groups.NamedGroup.fromInt(0x0019)));
     var group_it = try supported_groups.parse(groups);
     var group_count: usize = 0;
-    while (group_it.nextRaw()) |_| group_count += 1;
+    var grease_groups: usize = 0;
+    while (group_it.nextRaw()) |id| {
+        if (id == grease_group) grease_groups += 1 else group_count += 1;
+    }
     try std.testing.expectEqual(@as(usize, 3), group_count);
+    try std.testing.expectEqual(@as(usize, 1), grease_groups);
     var share_it = try tls_keyshare.parseClientShares(shares);
     var share_count: usize = 0;
+    var grease_shares: usize = 0;
     while (try share_it.next()) |entry| {
-        share_count += 1;
         try std.testing.expect(entry.key_exchange.len != 0);
         const id = entry.group.toInt();
+        if (id == grease_group) {
+            grease_shares += 1;
+            continue;
+        }
+        share_count += 1;
         try std.testing.expect(id == 0x001d or id == 0x0017 or id == 0x11ec);
     }
     try std.testing.expectEqual(@as(usize, 3), share_count);
+    try std.testing.expectEqual(@as(usize, 1), grease_shares);
 
     // Repo-layout fixture: runners outside a checkout (e.g. a bare Windows
     // guest executing a shipped test binary) have no BoGo tree to read.
@@ -323,8 +338,14 @@ test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane stays
         if (std.mem.startsWith(u8, line, "PASS ")) pass += 1;
         if (std.mem.startsWith(u8, line, "SKIP ")) skip += 1;
     }
-    try std.testing.expectEqual(@as(usize, 24), pass);
+    // Armor wave 3 conformance: 202 exact passes (121 after wave 2a, 24 before
+    // the interop shim work) plus the 3 pinned skips.
+    try std.testing.expectEqual(@as(usize, 202), pass);
     try std.testing.expectEqual(@as(usize, 3), skip);
+    // HelloRetryRequest and PSK-binder cases are now exercised, not disabled.
+    try std.testing.expect(std.mem.indexOf(u8, baseline, "PASS SendHelloRetryRequest-TLS13\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline, "PASS Resume-Server-InvalidPSKBinder-SecondBinder\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline, "PASS Server-SignDefault-RSA_PSS_SHA384-TLS13\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, baseline, "SKIP CheckClientCertificateTypes\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, baseline, "SKIP SendFallbackSCSV\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, baseline, "SKIP ClientCertificateTypes\n") != null);
@@ -344,18 +365,21 @@ test "GAP-K6 unfinished TLS interop stays refused and the pinned BoGo lane stays
         reasons += 1;
     }
     try std.testing.expect(reasons >= 20);
+    // Deliberate exclusions that must stay disabled. HelloRetryRequest and
+    // resumption are no longer blanket-disabled: the shim drives them
+    // (-expect-hrr, -resume-count) and the baseline pins their passes.
     const required = [_][]const u8{
         "*ECH*",
-        "*HRR*",
-        "*HelloRetryRequest*",
         "*DelegatedCredential*",
         "*P-384*",
         "*P-521*",
         "*DTLS*",
-        "*Resume*",
         "*EarlyData*",
         "*ClientAuth*",
     };
+    for ([_][]const u8{ "*HRR*", "*HelloRetryRequest*", "*Resume*" }) |key| {
+        try std.testing.expect(disabled.object.get(key) == null);
+    }
     for (required) |key| {
         const value = disabled.object.get(key) orelse return error.TestUnexpectedResult;
         try std.testing.expect(value == .string);

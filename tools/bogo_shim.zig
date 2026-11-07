@@ -33,9 +33,13 @@
 //! SCOPED SUBSET (onyx is modern-only). Handled flags:
 //!   -server, -port, -shim-id, -cert-file, -key-file, -min-version, -max-version,
 //!   -expect-version, -curves (client: 23→P-256, 4588→X25519MLKEM768),
-//!   -select-alpn (server), -expect-alpn (server).
-//! Everything else — including TLS<1.2, DTLS, resumption (-resume-count), 0-RTT,
-//! mTLS, HelloRetryRequest, -shim-writes-first/-shim-shuts-down, and every
+//!   -select-alpn (server), -expect-alpn (server), -resume-count (server),
+//!   -expect-session-miss, -ocsp-response (server), -async (no-op),
+//!   -expect-hrr / -expect-no-hrr (server: RFC 8446 §4.1.4 HelloRetryRequest).
+//! After the handshake only a peer close_notify ends the echo cleanly; any other
+//! alert (or a malformed alert record) is reported as an error.
+//! Everything else — including TLS<1.2, DTLS, client-role resumption, 0-RTT,
+//! mTLS, -shim-writes-first/-shim-shuts-down, and every
 //! -expect-*/-curves value not listed above — exits 89. See the roadmap 0.3 row
 //! and the design doc for the full in/out-of-scope matrix; the external
 //! BoringSSL `runner` harness (with a `-shim-config` DisabledTests/ErrorMap) is
@@ -142,6 +146,10 @@ pub const Flags = struct {
     resume_count: u8 = 0,
     /// `-expect-session-miss`: resumption connections must run a FULL handshake.
     expect_session_miss: bool = false,
+    /// `-expect-hrr` / `-expect-no-hrr` (server role): whether the TLS 1.3
+    /// server must (or must not) have sent a HelloRetryRequest (RFC 8446
+    /// §4.1.4) on every connection of the invocation.
+    expect_hrr: ?bool = null,
     /// `-ocsp-response <base64>` (server role only): decoded OCSPResponse bytes
     /// to staple (RFC 8446 §4.4.2.1 / RFC 6066 §8). Stored inline so parsing
     /// stays allocation-free.
@@ -206,6 +214,12 @@ pub const Flags = struct {
             } else if (eql(a, "-expect-session-miss")) {
                 f.expect_session_miss = true;
                 i += 1;
+            } else if (eql(a, "-expect-hrr")) {
+                f.expect_hrr = true;
+                i += 1;
+            } else if (eql(a, "-expect-no-hrr")) {
+                f.expect_hrr = false;
+                i += 1;
             } else if (eql(a, "-ocsp-response")) {
                 const b64 = try takeVal(args, &i);
                 const dec = std.base64.standard.Decoder;
@@ -239,6 +253,7 @@ pub const Flags = struct {
         // Client-side resumption (ticket storage + PSK offer) is not driven.
         if (!f.server and (f.resume_count != 0 or f.expect_session_miss)) return error.Unimplemented;
         if (!f.server and f.ocsp_len != 0) return error.Unimplemented; // server-only
+        if (!f.server and f.expect_hrr != null) return error.Unimplemented; // asserted via server state
         return f;
     }
 
@@ -464,6 +479,13 @@ fn runServerRole(alloc: std.mem.Allocator, fd: Socket, setup: *const ServerSetup
 
     try checkServerExpect(&conn, flags);
     try checkSessionReuse(serverResumed(&conn), is_resume, flags.expect_session_miss);
+    if (flags.expect_hrr) |want| {
+        const sent = switch (conn.engine) {
+            .tls13 => |*s| s.hrr_sent,
+            .undecided, .tls12 => false,
+        };
+        if (sent != want) return if (want) error.ExpectedHelloRetryRequest else error.UnexpectedHelloRetryRequest;
+    }
     if (early_app.items.len != 0) try xorEchoServer(fd, &conn, early_app.items);
     try echoServer(alloc, fd, &conn);
 }
@@ -524,10 +546,12 @@ fn echoServer(alloc: std.mem.Allocator, fd: Socket, conn: *TlsConn) !void {
         const n = try sockReadSome(fd, &buf);
         if (n == 0) return; // clean TCP EOF ⇒ done (exit 0).
         const outcome = conn.onInbound(buf[0..n]) catch |e| {
-            // A peer close_notify surfaces as a decrypt/parse error post-handshake
-            // (the server engine collapses an inner alert to BadRecord); treat it
-            // as an orderly end of the exchange rather than a shim failure.
-            if (e == error.TlsAlert or e == error.BadRecord) return;
+            // Only a peer close_notify (RFC 8446 §6.1 / RFC 5246 §7.2.1) ends the
+            // exchange cleanly. Any other alert is an error the runner expects
+            // the shim to report (BoGo Alert), and a malformed alert record —
+            // fragmented or coalesced, RFC 8446 §5.1 — fails as BadRecord
+            // (BoGo FragmentAlert / DoubleAlert).
+            if (e == error.TlsAlert and peerSentCloseNotify(conn)) return;
             return e;
         };
         // Post-handshake control replies (e.g. a KeyUpdate response, RFC 8446
@@ -539,6 +563,17 @@ fn echoServer(alloc: std.mem.Allocator, fd: Socket, conn: *TlsConn) !void {
             try xorEchoServer(fd, conn, xored);
         }
     }
+}
+
+/// Whether the alert that just failed the engine with `TlsAlert` was the
+/// peer's close_notify (both engines record the parsed alert in `peer_alert`).
+fn peerSentCloseNotify(conn: *const TlsConn) bool {
+    const alert = switch (conn.engine) {
+        .undecided => return false,
+        .tls13 => |*s| s.peer_alert,
+        .tls12 => |*s| s.peer_alert,
+    } orelse return false;
+    return alert.description == .close_notify;
 }
 
 /// XOR every byte of `data` (in place) with 0xff and send it back encrypted.
