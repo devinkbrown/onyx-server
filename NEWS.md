@@ -11,6 +11,49 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.11.1 — Helix and registration fixes after the 0.11.0 rollout (2026-11-07)
+
+Fixes for problems seen while rolling out 0.11.0 on the two-node mesh.
+
+- **Registration:** a nick already held anywhere on the mesh now gets `433`
+  before `001`, and the connection stays open for a `NICK` retry
+  (RFC 2812 §3.1.2). Before, the client got the welcome burst and then a
+  closed socket. The Onyx web client always registers as `guest`, so after a
+  node cold restart (the previous guest is held for the reconnect grace
+  window) every reconnect looped until that identity expired.
+- **Helix adoption no longer aborts the whole handoff** on states 0.11.0 can
+  legitimately seal:
+  - a guest whose presence record was never admitted (id with no metadata);
+  - an oper who elevated after registration and still carries the user-class
+    flood guard (the successor's oper class is flood-exempt);
+  - a demoted oper whose carried TLS backlog exceeds the new class SendQ cap
+    (admitted, then bounded by the new cap);
+  - a `tls_only` class losing its flood guard/SendQ cap because the class was
+    chosen before the TLS engine was rebuilt.
+  Every adoption rejection now logs a typed reason, and the predecessor
+  applies the same admissibility checks before exec and refuses the UPGRADE
+  with connections intact instead of exec'ing into a handoff the successor
+  rejects.
+- **Guest identity:** guest ids come from durable 256-id blocks in the mesh
+  presence issuer space, so neither Helix nor a cold restart can reissue an id
+  a peer still holds. Duplicate carried ids are reduced to one holder; carried
+  unpublished ids, legacy epoch-1 ids and ids whose record was retired by a
+  reissued holder are re-incarnated. Carried published guests continue their
+  revision history under a fresh claim, so peers update instead of
+  quarantining them; claim changes compare nicks exactly. A refused id
+  reservation is logged and exposed as `onyx_guest_presence_unpublished_no_id`
+  and `onyx_guest_id_reserve_failures_total`.
+- **Helix continuity:** a ping-timeout close whose output was diverted through
+  the delivery spool no longer strands the connection (and the
+  "remote visible identity" UPGRADE refusal) until TCP fails; the owner
+  quiesce also drains transient diverted output into the carried SendQ. The
+  refusal names its sub-condition and `onyx_helix_continuity_*` gauges expose
+  it.
+
+**Operator notes:** Helix-compatible from 0.11.0 and 0.10.4. Adopted legacy
+guests get a new guest id on their first publish (nick-addressed traffic is
+unaffected; DMs addressed to the old guest id resolve terminal).
+
 ## 0.11.0 — Armor hardening (2026-11-07)
 
 This release works through the Armor security and feature audit
