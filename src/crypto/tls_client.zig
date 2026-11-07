@@ -1024,10 +1024,14 @@ pub const Client = struct {
         self.client_key_pair = null;
     }
 
-    /// Test-only: skip the server-certificate chain and DNS-name checks. The
-    /// leaf public key is still parsed and the server CertificateVerify is
-    /// still verified. Lets the mTLS loopback use CN-only self-signed leaves.
-    pub fn skipServerCertVerifyForTest(self: *Client) void {
+    /// SECURITY: disable server-certificate chain and DNS-name verification.
+    /// The leaf public key is still parsed and the server CertificateVerify is
+    /// still verified, but any certificate is accepted, so an on-path attacker
+    /// can impersonate the server. Used by tests (e.g. the mTLS loopback with
+    /// CN-only self-signed leaves) and by production outbound clients ONLY when
+    /// the operator explicitly sets `insecure_skip_verify` (http_fetch,
+    /// mail_sender). Never call it on any other path.
+    pub fn disableServerCertVerification(self: *Client) void {
         self.skip_cert_verify_for_test = true;
     }
 
@@ -4883,7 +4887,7 @@ test "leaf RSA key survives the hs_plain consume (regression: copied, not borrow
 
     var client = try Client.init(a, .{ .server_name = "rsa.test", .trust_anchors = &.{} });
     defer client.deinit();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
     try client.parseAndVerifyCertificate(body.items);
 
     const lk = client.leaf_key.?;
@@ -5237,7 +5241,7 @@ test "delegated_credential: a valid DC is accepted and CertificateVerify uses th
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     // The DC verifies: leaf key signed it, DelegationUsage present, in window.
     try client.parseAndVerifyCertificate(cert_msg);
@@ -5301,7 +5305,7 @@ test "delegated_credential: CertificateVerify scheme must equal dc_cert_verify_a
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
     try client.parseAndVerifyCertificate(cert_msg);
 
     // A CertificateVerify claiming ed25519 while the DC binds P-256 is rejected
@@ -5330,7 +5334,7 @@ test "delegated_credential: absent DC leaves the normal cert-key path (dc_verifi
     });
     defer client.deinit();
     client.offerDelegatedCredentials(); // opted in, but the server sent no DC
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try client.parseAndVerifyCertificate(cert_msg);
     try std.testing.expect(client.dc_verified_key == null);
@@ -5359,7 +5363,7 @@ test "delegated_credential: reject when the leaf lacks the DelegationUsage exten
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try std.testing.expectError(error.DelegatedCredentialNoDelegationUsage, client.parseAndVerifyCertificate(cert_msg));
     try std.testing.expect(client.dc_verified_key == null);
@@ -5386,7 +5390,7 @@ test "delegated_credential: reject a tampered DC signature" {
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try std.testing.expectError(error.BadSignature, client.parseAndVerifyCertificate(cert_msg));
     try std.testing.expect(client.dc_verified_key == null);
@@ -5415,7 +5419,7 @@ test "delegated_credential: reject an expired credential" {
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try std.testing.expectError(error.DelegatedCredentialExpired, client.parseAndVerifyCertificate(cert_msg));
     try std.testing.expect(client.dc_verified_key == null);
@@ -5449,7 +5453,7 @@ test "delegated_credential: accept a large valid_time whose REMAINING lifetime i
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try client.parseAndVerifyCertificate(cert_msg); // accepted despite valid_time = 31 days
     try std.testing.expect(client.dc_verified_key != null);
@@ -5479,7 +5483,7 @@ test "delegated_credential: reject when the REMAINING lifetime exceeds the 7-day
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try std.testing.expectError(error.DelegatedCredentialLifetimeTooLong, client.parseAndVerifyCertificate(cert_msg));
     try std.testing.expect(client.dc_verified_key == null);
@@ -5511,7 +5515,7 @@ test "delegated_credential: reject when the DC would outlive the delegation cert
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try std.testing.expectError(error.DelegatedCredentialOutlivesCertificate, client.parseAndVerifyCertificate(cert_msg));
     try std.testing.expect(client.dc_verified_key == null);
@@ -5558,7 +5562,7 @@ test "delegated_credential: reject a dc_cert_verify_algorithm we did not adverti
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try std.testing.expectError(error.UnsupportedSignatureScheme, client.parseAndVerifyCertificate(cert_msg));
     try std.testing.expect(client.dc_verified_key == null);
@@ -5585,7 +5589,7 @@ test "delegated_credential: reject when no clock is available to enforce the win
     });
     defer client.deinit();
     client.offerDelegatedCredentials();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     try std.testing.expectError(error.DelegatedCredentialNoClock, client.parseAndVerifyCertificate(cert_msg));
     try std.testing.expect(client.dc_verified_key == null);

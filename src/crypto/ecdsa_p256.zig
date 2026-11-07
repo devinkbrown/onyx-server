@@ -61,6 +61,21 @@ pub const Sec1Error = error{
     InvalidSec1Point,
 };
 
+// -- Secret-key hygiene ------------------------------------------------------
+
+/// Securely zero a P-256 secret scalar in place. The std `SecretKey` is a plain
+/// value type with no destructor, so every holder of one must call this (or
+/// `wipeKeyPair`) when the scalar is no longer needed.
+pub fn wipeSecretKey(sk: *SecretKey) void {
+    std.crypto.secureZero(u8, &sk.bytes);
+}
+
+/// Securely zero the secret half of `kp` in place. The public key is left
+/// intact so callers may still read it after wiping.
+pub fn wipeKeyPair(kp: *KeyPair) void {
+    wipeSecretKey(&kp.secret_key);
+}
+
 // -- Signing / verification --------------------------------------------------
 
 /// Sign `msg` with `key_pair`. Uses the primitive's deterministic (null-noise)
@@ -333,4 +348,19 @@ test "parsePublicKeySec1 rejects a bad prefix" {
 test "parsePublicKeySec1 rejects a wrong length" {
     // Arrange / Act / Assert
     try testing.expectError(error.InvalidSec1Length, parsePublicKeySec1(&[_]u8{ 0x04, 0x00, 0x01 }));
+}
+
+test "wipeKeyPair zeroes the secret scalar and keeps the public key" {
+    const seed: [KeyPair.seed_length]u8 = @splat(0x42);
+    var kp = try KeyPair.generateDeterministic(seed);
+    const public_before = kp.public_key.toUncompressedSec1();
+    try std.testing.expect(!std.mem.allEqual(u8, &kp.secret_key.bytes, 0));
+
+    wipeKeyPair(&kp);
+    try std.testing.expect(std.mem.allEqual(u8, &kp.secret_key.bytes, 0));
+    try std.testing.expectEqualSlices(u8, &public_before, &kp.public_key.toUncompressedSec1());
+
+    var sk = try SecretKey.fromBytes(@splat(0x11));
+    wipeSecretKey(&sk);
+    try std.testing.expect(std.mem.allEqual(u8, &sk.toBytes(), 0));
 }

@@ -424,7 +424,7 @@ fn runClientRole(alloc: std.mem.Allocator, fd: Socket, flags: Flags) !void {
     // custom-verify default; BoGo opts INTO verification with flags this subset
     // does not yet handle). The leaf key is still parsed and CertificateVerify
     // still checked.
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
     if (flags.client_curve) |c| switch (c) {
         .p256 => client.offerOnlyP256ForTest(),
         .hybrid => client.offerOnlyHybridForTest(),
@@ -861,7 +861,7 @@ fn peerClientVerifyEcho(alloc: std.mem.Allocator, afd: Socket, alpn: []const []c
         .alpn_protocols = alpn,
     });
     defer client.deinit();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     const ch = try client.start();
     {

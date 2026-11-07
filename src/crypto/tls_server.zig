@@ -7637,7 +7637,7 @@ test "loopback: RFC 8879 cert compression — server sends CompressedCertificate
     // Opt into RFC 8879 compression and skip chain-to-anchor validation so the
     // duplicated self-signed chain passes.
     client.offerCertCompression();
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
 
     const ch = try client.start();
     defer alloc.free(ch);

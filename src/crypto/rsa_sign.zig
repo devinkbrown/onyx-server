@@ -14,8 +14,16 @@
 //! multiply, reduction, inverse, and exponentiation routines remain
 //! variable-time; blinding is the primary defense against remote timing leakage
 //! from secret-exponent private operations.
+//!
+//! Fault posture: every private operation (CRT and non-CRT) is re-verified
+//! before the signature leaves this module. The unblinded signature `s` is
+//! raised to the public exponent and compared with the encoded representative;
+//! on mismatch the output buffer is wiped and `error.SignatureFault` is
+//! returned. This closes the Bellcore/Lenstra attack in which a single induced
+//! fault in one CRT branch yields gcd(s^e - m, n) = p or q.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const crypto_random = @import("random.zig");
 const rsa_verify = @import("rsa_verify.zig");
 
@@ -29,7 +37,22 @@ pub const Error = rsa_verify.Error || crypto_random.Error || error{
     /// The digest/salt/message representative is invalid for the requested
     /// signature scheme and key size.
     InvalidInput,
+    /// The private operation produced a signature that does not verify under
+    /// the public key (s^e mod n != m). Either the key material is
+    /// inconsistent or a computational fault occurred; the faulty signature is
+    /// never released because it could leak a prime factor.
+    SignatureFault,
 };
+
+/// Test-only fault injection point for the private operation. Production
+/// builds compile this to `void`, so no fault can be injected outside tests.
+const FaultInjection = enum { none, crt_m1, crt_m2, non_crt };
+threadlocal var test_fault: if (builtin.is_test) FaultInjection else void =
+    if (builtin.is_test) .none else {};
+
+fn injectedFault() FaultInjection {
+    return if (builtin.is_test) test_fault else .none;
+}
 
 /// Big-endian RSA private key material.
 ///
@@ -160,6 +183,24 @@ fn privateOp(priv: PrivateKey, representative: []const u8, out: []u8) Error![]co
     var unblinded = s_prime.mul(&rinv);
     unblinded = unblinded.mod(&n_big);
     unblinded.toBytesBE(out[0..k]);
+
+    // Bellcore/Lenstra fault check: recompute s^e mod n with the public
+    // exponent and refuse to release s unless it maps back to the exact
+    // representative. Covers CRT and non-CRT paths and the unblinding step.
+    var check: [rsa_verify.max_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &check);
+    modExpMont(out[0..k], priv.e, priv.n, check[0..k]) catch |err| {
+        std.crypto.secureZero(u8, out[0..k]);
+        return err;
+    };
+    const check_big = Big.fromBytesBE(check[0..k]) catch |err| {
+        std.crypto.secureZero(u8, out[0..k]);
+        return err;
+    };
+    if (check_big.cmp(&m_big) != .eq) {
+        std.crypto.secureZero(u8, out[0..k]);
+        return error.SignatureFault;
+    }
     return out[0..k];
 }
 
@@ -171,6 +212,7 @@ fn privateOpRaw(priv: PrivateKey, representative: []const u8, out: []u8) Error!v
         try privateOpCrt(priv, representative, out[0..k]);
     } else {
         try modExpMont(representative, priv.d, priv.n, out[0..k]);
+        if (injectedFault() == .non_crt) out[k - 1] ^= 0x01;
     }
 }
 
@@ -332,9 +374,16 @@ fn privateOpCrt(priv: PrivateKey, representative: []const u8, out: []u8) Error!v
     const qinv = priv.qinv.?;
 
     var m1_bytes: [rsa_verify.max_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &m1_bytes);
     var m2_bytes: [rsa_verify.max_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &m2_bytes);
     try modExpMont(representative, dp, p, m1_bytes[0..p.len]);
     try modExpMont(representative, dq, q, m2_bytes[0..q.len]);
+    switch (injectedFault()) {
+        .crt_m1 => m1_bytes[p.len - 1] ^= 0x01,
+        .crt_m2 => m2_bytes[q.len - 1] ^= 0x01,
+        else => {},
+    }
 
     const p_big = try Big.fromBytesBE(p);
     const q_big = try Big.fromBytesBE(q);
@@ -724,4 +773,50 @@ test "modular inverse returns rinv where r * rinv mod n is one" {
         product = product.mod(&n);
         try testing.expectEqual(std.math.Order.eq, product.cmp(&one));
     }
+}
+
+fn expectFaultRefused(priv: PrivateKey, fault: FaultInjection) !void {
+    const digest = hexToBytes("24ddade2122077b86a4ea8ed269ec44c16e3c7105d30c28c3a7060bc718f89a5");
+    const salt: [32]u8 = @splat(0x5a);
+    test_fault = fault;
+    defer test_fault = .none;
+
+    var sig: [rsa_verify.max_bytes]u8 = @splat(0xee);
+    try testing.expectError(error.SignatureFault, signPkcs1v15(priv, .sha256, &digest, &sig));
+    // The faulty signature must not leak through the output buffer.
+    for (sig[0..priv.n.len]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+
+    @memset(&sig, 0xee);
+    try testing.expectError(error.SignatureFault, signPss(priv, .sha256, &digest, &salt, &sig));
+    for (sig[0..priv.n.len]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "A3: CRT fault in m1 or m2 is detected and the signature is withheld" {
+    const priv = testPrivateKey();
+    try expectFaultRefused(priv, .crt_m1);
+    try expectFaultRefused(priv, .crt_m2);
+
+    // Without an injected fault the same key still signs and verifies.
+    const digest = hexToBytes("24ddade2122077b86a4ea8ed269ec44c16e3c7105d30c28c3a7060bc718f89a5");
+    var sig: [rsa_verify.max_bytes]u8 = undefined;
+    const got = try signPkcs1v15(priv, .sha256, &digest, &sig);
+    try testing.expect(rsa_verify.verifyPkcs1v15(.{ .n = priv.n, .e = priv.e }, .sha256, &digest, got));
+}
+
+test "A3: non-CRT private-op fault is detected and the signature is withheld" {
+    const priv = testPrivateKey();
+    const non_crt = PrivateKey{ .n = priv.n, .e = priv.e, .d = priv.d };
+    try expectFaultRefused(non_crt, .non_crt);
+}
+
+test "A3: inconsistent CRT parameters are refused instead of signed" {
+    // A wrong dp is indistinguishable from a persistent fault in the m1 branch;
+    // without the check the signer would emit a factor-leaking signature.
+    var bad_dp = rsa_dp;
+    bad_dp[bad_dp.len - 1] ^= 0x02;
+    var priv = testPrivateKey();
+    priv.dp = &bad_dp;
+    const digest = hexToBytes("24ddade2122077b86a4ea8ed269ec44c16e3c7105d30c28c3a7060bc718f89a5");
+    var sig: [rsa_verify.max_bytes]u8 = undefined;
+    try testing.expectError(error.SignatureFault, signPkcs1v15(priv, .sha256, &digest, &sig));
 }

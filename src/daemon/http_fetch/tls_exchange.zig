@@ -40,7 +40,7 @@ pub fn getTls12(
         .require_crl = opts.require_crl,
     });
     defer tc.deinit();
-    if (opts.insecure_skip_verify) tc.skipServerCertVerifyForTest();
+    if (opts.insecure_skip_verify) tc.disableServerCertVerification();
 
     {
         const hello = try tc.start();
@@ -122,7 +122,7 @@ pub fn getTls(
         .require_sct = opts.require_sct,
     });
     defer tc.deinit();
-    if (opts.insecure_skip_verify) tc.skipServerCertVerifyForTest();
+    if (opts.insecure_skip_verify) tc.disableServerCertVerification();
 
     {
         const hello = try tc.start();

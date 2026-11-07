@@ -120,8 +120,13 @@ pub fn parseInspectArgs(args: []const []const u8) common.Error!InspectOptions {
 /// SEC1 ECPrivateKey DER for a P-256 key pair (RFC 5915), the layout nginx and
 /// openssl both accept. Fixed 121-byte template; mirrors the file-private
 /// encoder in src/daemon/acme_runner.zig.
-pub fn ecPrivateKeyDer(kp: ecdsa_p256.KeyPair) [121]u8 {
-    const priv = kp.secret_key.toBytes();
+///
+/// Takes the key pair by pointer so no extra copy of the secret scalar is made;
+/// the local scalar copy is wiped before returning. The returned DER contains
+/// the scalar, so the caller must secure-zero it.
+pub fn ecPrivateKeyDer(kp: *const ecdsa_p256.KeyPair) [121]u8 {
+    var priv = kp.secret_key.toBytes();
+    defer std.crypto.secureZero(u8, &priv);
     const sec1 = kp.public_key.toUncompressedSec1();
     var der: [121]u8 = .{
         0x30, 0x77, 0x02, 0x01, 0x01, 0x04, 0x20,
@@ -151,8 +156,9 @@ pub fn ed25519Pkcs8Der(seed: [32]u8) [48]u8 {
 pub fn generatePem(io: std.Io, alg: Algorithm, buf: []u8) ![]const u8 {
     switch (alg) {
         .ec => {
-            const kp = ecdsa_p256.KeyPair.generate(io);
-            var der = ecPrivateKeyDer(kp);
+            var kp = ecdsa_p256.KeyPair.generate(io);
+            defer ecdsa_p256.wipeKeyPair(&kp);
+            var der = ecPrivateKeyDer(&kp);
             defer std.crypto.secureZero(u8, &der);
             return pem.encode(buf, "EC PRIVATE KEY", &der);
         },
@@ -205,8 +211,10 @@ pub fn inspectPem(text: []const u8) !KeyInfo {
     if (pem.decode(text, "EC PRIVATE KEY", &der_buf)) |der| {
         var scalar = try ec_pkcs.parseScalar(der);
         defer std.crypto.secureZero(u8, &scalar);
-        const sk = try ecdsa_p256.SecretKey.fromBytes(scalar);
-        const kp = try ecdsa_p256.KeyPair.fromSecretKey(sk);
+        var sk = try ecdsa_p256.SecretKey.fromBytes(scalar);
+        defer ecdsa_p256.wipeSecretKey(&sk);
+        var kp = try ecdsa_p256.KeyPair.fromSecretKey(sk);
+        defer ecdsa_p256.wipeKeyPair(&kp);
         var info = KeyInfo{ .kind = .ec, .public = undefined, .public_len = ecdsa_p256.sec1_uncompressed_length };
         const sec1 = kp.public_key.toUncompressedSec1();
         @memcpy(info.public[0..sec1.len], &sec1);

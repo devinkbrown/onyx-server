@@ -87,10 +87,46 @@ pub const CounterNonce = struct {
         return .{ .base = base, .counter = 0 };
     }
 
-    /// Resume from a known (base, counter) pair, e.g. after a hot-upgrade
-    /// snapshot import. The next `next()` will emit `counter` then advance.
-    pub fn resumeFrom(base: [nonce_base_len]u8, counter: u32) CounterNonce {
-        return .{ .base = base, .counter = counter };
+    /// Errors from `resumeFrom`. Kept separate from `Error` so existing
+    /// exhaustive switches over the AEAD error set are unaffected.
+    pub const ResumeError = error{
+        /// The snapshot says the final nonce under this base was already
+        /// emitted; resuming would re-emit it. Rekey instead.
+        NonceCounterExhausted,
+        /// The restored counter is below the caller's monotonic floor, so the
+        /// next `next()` would re-emit a nonce already used under this base.
+        NonceCounterRewound,
+    };
+
+    /// Portable nonce position for a hot-upgrade (Helix) snapshot. Export with
+    /// `snapshot()` and restore with `resumeFrom` so exhaustion survives the
+    /// round trip.
+    pub const Snapshot = struct {
+        base: [nonce_base_len]u8,
+        counter: u32,
+        exhausted: bool = false,
+    };
+
+    /// Capture the current position for a snapshot.
+    pub fn snapshot(self: *const CounterNonce) Snapshot {
+        return .{ .base = self.base, .counter = self.counter, .exhausted = self.exhausted };
+    }
+
+    /// Resume from a snapshot, e.g. after a hot-upgrade import. The next
+    /// `next()` will emit `snap.counter` then advance.
+    ///
+    /// Fails closed when resuming would reuse a nonce:
+    ///   * an exhausted snapshot is refused (the maxint nonce was already
+    ///     emitted, and a fresh `exhausted = false` would emit it again);
+    ///   * `floor` is the lowest counter value the caller can independently
+    ///     prove has NOT been emitted under `snap.base` (for example the
+    ///     highest sequence number observed on the wire, plus one, or a
+    ///     persisted high-water mark). A snapshot counter below it is refused.
+    ///     Pass 0 when no independent record exists.
+    pub fn resumeFrom(snap: Snapshot, floor: u32) ResumeError!CounterNonce {
+        if (snap.exhausted) return ResumeError.NonceCounterExhausted;
+        if (snap.counter < floor) return ResumeError.NonceCounterRewound;
+        return .{ .base = snap.base, .counter = snap.counter };
     }
 
     /// The nonce for the current counter value, without advancing.
@@ -344,7 +380,7 @@ test "counter nonce composes base + big-endian u32 and advances" {
 }
 
 test "counter nonce refuses to wrap" {
-    var cn = CounterNonce.resumeFrom(@as([nonce_base_len]u8, @splat(0xFF)), std.math.maxInt(u32) - 1);
+    var cn = try CounterNonce.resumeFrom(.{ .base = @as([nonce_base_len]u8, @splat(0xFF)), .counter = std.math.maxInt(u32) - 1 }, 0);
 
     // counter = max-1 : usable
     const a = try cn.next();
@@ -368,10 +404,43 @@ test "random base nonce starts at counter zero and advances" {
 }
 
 test "resumeFrom restores a known counter position" {
-    var cn = CounterNonce.resumeFrom(@as([nonce_base_len]u8, @splat(0xAB)), 42);
+    var cn = try CounterNonce.resumeFrom(.{ .base = @as([nonce_base_len]u8, @splat(0xAB)), .counter = 42 }, 0);
     const n = try cn.next();
     try testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, n[nonce_base_len..][0..4], .big));
     try testing.expectEqual(@as(u32, 43), cn.counter);
+}
+
+test "resumeFrom round-trips a snapshot and continues without reuse" {
+    var cn = CounterNonce.init(@as([nonce_base_len]u8, @splat(0x5C)));
+    _ = try cn.next();
+    const last = try cn.next();
+    const snap = cn.snapshot();
+    // The highest emitted counter (1) plus one is a legitimate floor.
+    const floor = std.mem.readInt(u32, last[nonce_base_len..][0..4], .big) + 1;
+    var resumed = try CounterNonce.resumeFrom(snap, floor);
+    const n = try resumed.next();
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, n[nonce_base_len..][0..4], .big));
+}
+
+test "resumeFrom refuses an exhausted snapshot instead of re-emitting the maxint nonce" {
+    var cn = try CounterNonce.resumeFrom(.{ .base = @as([nonce_base_len]u8, @splat(0x01)), .counter = std.math.maxInt(u32) }, 0);
+    _ = try cn.next();
+    try testing.expectError(Error.NonceCounterExhausted, cn.next());
+    const snap = cn.snapshot();
+    try testing.expect(snap.exhausted);
+    try testing.expectError(CounterNonce.ResumeError.NonceCounterExhausted, CounterNonce.resumeFrom(snap, 0));
+}
+
+test "resumeFrom refuses a counter rewound below the caller's monotonic floor" {
+    const base: [nonce_base_len]u8 = @splat(0x77);
+    try testing.expectError(
+        CounterNonce.ResumeError.NonceCounterRewound,
+        CounterNonce.resumeFrom(.{ .base = base, .counter = 9 }, 10),
+    );
+    // Equal to the floor is the first unused counter: accepted.
+    var cn = try CounterNonce.resumeFrom(.{ .base = base, .counter = 10 }, 10);
+    const n = try cn.next();
+    try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, n[nonce_base_len..][0..4], .big));
 }
 
 // --- Published KAT: RFC 8439 §2.8.2 ChaCha20-Poly1305 AEAD ---------------

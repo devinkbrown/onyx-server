@@ -817,7 +817,7 @@ pub const Sender = struct {
             .now_unix_seconds = wallClockSeconds(),
         });
         errdefer tc.deinit();
-        if (self.config.insecure_skip_verify) tc.skipServerCertVerifyForTest();
+        if (self.config.insecure_skip_verify) tc.disableServerCertVerification();
 
         const hello = try tc.start();
         defer self.allocator.free(hello);

@@ -583,7 +583,10 @@ pub const Client = struct {
         self.force_chacha_only_for_test = false;
     }
 
-    pub fn skipServerCertVerifyForTest(self: *Client) void {
+    /// SECURITY: disable server-certificate chain and DNS-name verification
+    /// (any certificate is accepted). Used by tests and by production
+    /// `http_fetch` ONLY when the operator sets `insecure_skip_verify`.
+    pub fn disableServerCertVerification(self: *Client) void {
         self.skip_cert_verify_for_test = true;
     }
 

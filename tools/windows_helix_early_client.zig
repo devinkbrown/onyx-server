@@ -117,7 +117,7 @@ fn run(init: std.process.Init) !void {
     defer client.deinit();
     // The disposable fixture uses an OS-generated self-signed leaf. The engine
     // still verifies CertificateVerify and the resumed PSK binder.
-    client.skipServerCertVerifyForTest();
+    client.disableServerCertVerification();
     if (ticket.len > 0) try client.setSessionTicket(ticket, ticket_age_ms);
     if (early.len > 0) try client.setEarlyData(early);
     const first_flight = try client.start();
